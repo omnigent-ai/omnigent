@@ -99,6 +99,13 @@ follows the existing PR's remediation and publication rules.
   generic publisher overlay: the agent commits locally, prepares no PR body, and
   the workflow suppresses publication.
 
+For authored PRs, Resolve reviews the added comments and, when available, runs
+the advisory PR hygiene check on the final diff and description. It flags
+comment blocks longer than three lines, descriptions over 600 visible words,
+and repeated prose. It does not delete necessary safety explanations or block
+publication. The internal publisher repeats the check before creating a PR,
+including when the target checkout predates the checker.
+
 Because direct publication may **push and open a PR**, and review mode may comment
 on an existing PR,
 `dev/resolve.py` asks you to confirm before it launches the agent (skip with
@@ -127,7 +134,8 @@ is the review gate after the fact.
      setup/import failure is a verification blocker, not a product regression.
    - **No fix PR** → the author path below, using the same baseline proof.
 4. *(author path)* Root-causes, implements the fix, and adds targeted
-   unit/integration tests at the layer it changed, each fail→pass on the bug.
+   unit/integration tests at the layer it changed. Tests of the bug go fail→pass;
+   checks protecting previously correct behavior can pass on both revisions.
 5. *(author path)* Re-runs the whole set to prove every live facet goes fail→pass
    (not just a loosened test), and — when the fix touches env-derived defaults —
    **re-runs new tests with ambient vars set** to prove the fixtures are hermetic,
@@ -173,21 +181,61 @@ is the review gate after the fact.
    (`ci_status`, `polly_review`, `ui_preview`, `validation_prompt`,
    `maintainer_review`).
 
-It does **not** merge. See `AGENTS.md` for the full operating procedure.
+It does **not** merge. [AGENTS.md](AGENTS.md) contains the role, mode selection,
+essential constraints, and completion contract. Detailed procedures live in
+[skills/](skills/) and load only for the current phase:
+
+| Phase | Skill |
+| --- | --- |
+| Input, preflight, and existing-fix discovery | `resolve-inputs` (mode-specific resources) |
+| Inherited repro and behavioral baseline | `resolve-repro-audit` |
+| Final diff, consumers, focused checks, and evidence | `resolve-impact-assessment` |
+| Author or review | `resolve-author-fix` / `resolve-review-pr` |
+| Commit and selected publication mode | `resolve-publish` |
+| Open PR: CI, Polly, preview, and human validation | `resolve-drive-pr` (substep resources) |
+| Complete output contract | `resolve-handoff` |
+
+The CLI transports these files with the agent bundle. They need not exist in
+the target checkout. Claude loads them through its native Skill tool; other
+tool paths use `load_skill` and `read_skill_file`. The main prompt lists the
+required phase order without expanding all the procedures at startup.
+
+### Change-impact assessment
+
+Every resolution path checks the full final diff for regression risks, including
+existing-PR reviews, ticket-only fixes, review remediation, local-only commits,
+and workflow-owned publication. The `impact_assessment` handoff maps changed
+behavior and affected consumers to an invariant, a focused check, its observed
+result, and retained evidence. It records base/head revisions, tested worktree
+changes, and uncovered boundaries. For example, a fix to a shared configuration
+decoder needs coverage of its startup consumers, not just a passing repro or a
+unit test supplied with an already-decoded object.
+
+Checks follow concrete risks across module boundaries while broad validation
+stays in CI. A new head, retry, changed assertions, or changed dependencies or
+environment requires reassessment and rerunning affected checks. An unrun or
+skipped required check remains a gap; it cannot support `fixed` or approval.
+Partly verified fixes preserve their work and explain what remains in
+`remaining_work`. This does not require an inherited repro in ticket-only or
+review-remediation mode or change who may publish.
 
 ### Verification limits
 
-The shared audit is an instruction-level requirement, not an execution gate.
+The shared audit and impact assessment are instruction-level requirements, not
+execution gates.
 The external `omnigent-ai/omnigent-internal` repository owns those CI checks:
 `.github/workflows/resolve-agent.yml` uses `validate_handoff` in
 `.github/scripts/resolve_handoff.py` and `checkpoint_delivery_ready` in
 `.github/scripts/restore_resolve_retry.py`. They can accept a `fixed` claim
 without test evidence when their identity and publication-shape checks pass.
-Neither test restoration nor a `test_audit` narrative proves that the agent
-executed the same assertions before and after the fix.
+Neither test restoration nor a `test_audit` or `impact_assessment` narrative
+proves that the agent executed the claimed checks against the claimed candidate.
 
 Mechanically checking that requirement needs a separate change: retain actual
 verification executions, identify the tested code/assertions and environment,
 carry results through retries, and detect missing or stale proof before delivery.
+This includes changes made after the agent exits, such as the publisher replaying
+a checkpoint onto a newer base; an assessment of the old head cannot certify
+that replay.
 Until then, inspect retained tool output as well as the handoff when assessing
 a run; configuration and prompt tests do not establish model compliance.

@@ -20,9 +20,8 @@ export const SIDE_CHAT_COMMAND_PREFIX = "/side ";
  * "Ask in side chat" action all gate on this. Side chat is now generic — every
  * harness forks the conversation and continues it in a rail tab — so this is
  * on for all of them. Codex uses its native ephemeral fork
- * (:func:`usesNativeSideChatFork`); the rest fork server-side via
- * `POST /v1/sessions/{id}/side-chat`, degrading gracefully when the host can't
- * drive the fork. To withhold side chat from a future harness, gate it here.
+ * (:func:`usesNativeSideChatFork`); the rest fork server-side and run in the
+ * parent's workspace. To withhold side chat from a future harness, gate it here.
  */
 export function supportsSideChat(harness: string | null | undefined): boolean {
   return typeof harness === "string" && harness.length > 0;

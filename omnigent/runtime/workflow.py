@@ -38,6 +38,10 @@ from omnigent.errors import (
     StaleCursorError,
     restart_on_stale_cursor,
 )
+from omnigent.inner.model_egress import (
+    UCODE_SIGNER_BINDING_ID,
+    registered_model_provider_binding,
+)
 from omnigent.llms import Client as LLMClient
 from omnigent.models.model_catalog import resolve_catalog_model
 from omnigent.models.model_resolver import ModelResolutionError
@@ -346,6 +350,71 @@ def configure_agent_harness_with_ucode(
             config.catalog_family,
             context=f"ucode {harness_type!r} gateway",
         )
+
+
+def _configure_brokered_codex_with_ucode(
+    env: dict[str, str],
+    spec: AgentSpec,
+    provider: ProviderEntry,
+) -> None:
+    """Bind the supported Databricks Codex route to signer-only authority."""
+    profile = provider.profile
+    if os.environ.get("HARNESS_CODEX_GATEWAY_AUTH_COMMAND"):
+        raise OmnigentError(
+            "signer-backed Codex conflicts with HARNESS_CODEX_GATEWAY_AUTH_COMMAND",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    sandbox = spec.os_env.sandbox if spec.os_env is not None else None
+    if sandbox is None or sandbox.type == "none":
+        raise OmnigentError(
+            "signer-backed Codex requires an active os_env sandbox",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    if not spec.model_egress:
+        raise OmnigentError(
+            "signer-backed Codex requires an explicit model_egress grant",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    if sandbox.egress_rules:
+        raise OmnigentError(
+            "signer-backed Codex does not support os_env.sandbox.egress_rules; "
+            "brokered sessions are model-only",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    if not profile:
+        raise OmnigentError(
+            "signer-backed Codex requires an explicit Databricks profile",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    workspace_url = get_workspace_url_for_profile(profile)
+    state = read_ucode_state(workspace_url) if workspace_url is not None else None
+    agent_state = state.agent("codex") if state is not None else None
+    endpoint = agent_state.base_url if agent_state is not None else None
+    if state is None or endpoint is None:
+        raise OmnigentError(
+            "signer-backed Codex requires configured ucode Codex state; run `ucode configure`",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    assert agent_state is not None
+    try:
+        registered_model_provider_binding(
+            binding_id=UCODE_SIGNER_BINDING_ID,
+            trusted_session_endpoint=endpoint,
+            trusted_host=state.workspace_host,
+        )
+    except ValueError as exc:
+        raise OmnigentError(str(exc), code=ErrorCode.INVALID_INPUT) from exc
+    if "HARNESS_CODEX_MODEL" not in env:
+        env["HARNESS_CODEX_MODEL"] = agent_state.model or _resolve_catalog_default_model(
+            "databricks",
+            "openai",
+            context="ucode 'codex' signer",
+        )
+    env["HARNESS_CODEX_SIGNER_PROVIDER"] = UCODE_SIGNER_BINDING_ID
+    env["HARNESS_CODEX_SIGNER_ENDPOINT"] = endpoint
+    env["HARNESS_CODEX_GATEWAY_HOST"] = state.workspace_host
+    env["HARNESS_CODEX_DATABRICKS_PROFILE"] = profile
+    env["HARNESS_CODEX_MODEL_EGRESS"] = json.dumps(spec.model_egress)
 
 
 def _inject_ucode_agent_state(
@@ -1401,7 +1470,10 @@ def _build_codex_spawn_env(
     # unchanged.
     provider = _resolve_provider_for_build(spec, harness_type="codex", for_launch=True)
     if provider is not None:
-        configure_agent_harness_with_provider(env, provider, harness_type="codex")
+        if provider.kind == DATABRICKS_KIND:
+            _configure_brokered_codex_with_ucode(env, spec, provider)
+        else:
+            configure_agent_harness_with_provider(env, provider, harness_type="codex")
     elif codex_config_provider_dismissed(load_config()):
         # No credential resolved. If the user Removed codex's custom
         # ~/.codex/config.toml provider (dismissed), pin the built-in ``openai``
@@ -1484,6 +1556,8 @@ def _build_pi_spawn_env(
     # Always set so the harness wrap doesn't fall back to ``"all"``
     # and override an explicit ``skills: none`` from the spec.
     env["HARNESS_PI_SKILLS_FILTER"] = json.dumps(spec.skills_filter)
+    env["HARNESS_PI_CONTEXT_FILES"] = json.dumps(spec.executor.config.get("context_files", True))
+    env["HARNESS_PI_SYSTEM_PROMPT_MODE"] = spec.executor.config.get("system_prompt_mode", "append")
     if spec.name:
         env["HARNESS_PI_AGENT_NAME"] = spec.name
     if cwd is not None:
@@ -1738,8 +1812,8 @@ def _build_acp_spawn_env(
     Like Goose, a generic ACP agent owns its own auth, so this wires **no**
     provider/gateway credential. A ``databricks-*`` model is dropped (not a valid
     third-party model id); the agent's own configured model (or a flag in its
-    command) then applies. When the slug is missing/unknown, falls back to the
-    first configured agent so a bare ``acp`` id still launches something.
+    command) then applies. A bare ``acp`` id uses the first configured agent;
+    an explicit unknown name fails instead of launching a different agent.
 
     :param spec: The agent spec.
     :param workdir: Accepted for signature parity with the other builders; the
@@ -1811,6 +1885,12 @@ def _build_acp_spawn_env(
         )
     else:
         agent = resolve_acp_agent(slug) if slug else None
+        if raw_harness.startswith("acp:") and agent is None:
+            raise OmnigentError(
+                f"ACP agent {slug!r} is not configured on this runner. "
+                "Check the selected host's ACP configuration.",
+                code=ErrorCode.INVALID_INPUT,
+            )
         if agent is None:
             agents = acp_agents()
             agent = agents[0] if agents else None

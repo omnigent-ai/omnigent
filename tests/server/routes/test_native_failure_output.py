@@ -94,6 +94,28 @@ async def test_wire_failure_reason_wins_over_stored_text() -> None:
 
 
 @pytest.mark.asyncio
+async def test_harness_failure_detail_wins_over_stored_prose() -> None:
+    result = await _enrich(
+        {
+            "status": "failed",
+            "response_id": "resp_failed",
+            "failure_detail": " API Error: 500 Overloaded ",
+        },
+        [_message("assistant", "Now add the block on the new branch:", "resp_failed")],
+    )
+    assert result["output"] == "API Error: 500 Overloaded"
+
+
+@pytest.mark.asyncio
+async def test_blank_failure_detail_falls_back_to_the_store() -> None:
+    result = await _enrich(
+        {"status": "failed", "response_id": "resp_failed", "failure_detail": "  "},
+        [_message("assistant", "Provider rejected this turn", "resp_failed")],
+    )
+    assert result["output"] == "Provider rejected this turn"
+
+
+@pytest.mark.asyncio
 async def test_idle_enrichment_retains_its_existing_behavior() -> None:
     result = await _enrich(
         {"status": "idle"},

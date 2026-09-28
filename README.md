@@ -11,7 +11,7 @@ Omnigent is an open-source **meta-harness** that gives you a common orchestratio
 [![Discord](https://img.shields.io/badge/Discord-join-5865F2?logo=discord&logoColor=white)](https://discord.gg/omnigent)
 ![Status: alpha](https://img.shields.io/badge/status-alpha-orange.svg)
 
-[omnigent.ai](https://omnigent.ai) · **[⬇️ Download the macOS desktop app](https://omnigent.ai/download/mac)**
+[omnigent.ai](https://omnigent.ai) · **[⬇️ Download the macOS desktop app](https://omnigent.ai/quickstart/install#install-the-desktop-app)**
 
 </div>
 
@@ -263,7 +263,7 @@ also launches a local web UI at `http://localhost:6767` that shows the same
 session in the browser, or on a phone on your network (step 4). The
 [desktop app](https://omnigent.ai/docs/interact/desktop) wraps that same UI
 in a native window and adds OS notifications (with a configurable sound) and a dock badge —
-[download it for macOS](https://omnigent.ai/download/mac).
+[download it for macOS](https://omnigent.ai/quickstart/install#install-the-desktop-app).
 
 > [!NOTE]
 > The install puts two names for the same CLI on your PATH: `omnigent` and

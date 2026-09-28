@@ -1,0 +1,469 @@
+"""E2E: a transient runner-tunnel outage must not fail an active turn.
+
+This test drives the production process topology: a real Omnigent server, a
+real runner connected through the production WebSocket tunnel, and a real
+openai-agents turn blocked inside the mock LLM. A TCP ingress proxy then cuts
+the established runner tunnel and returns HTTP 503 for 45 seconds before
+recovering. The runner keeps executing the turn while its tunnel reconnects.
+
+The 45-second blackout is deliberately longer than any fixed disconnect grace
+the server has shipped (10 s historically, 20 s on current main) and longer
+than a mere constant bump to 30 s would cover, yet well inside the 90 s runner
+liveness lease (``RUNNER_LIVENESS_TTL_S``). It reproduces the production
+false-fatal that a laptop Wi-Fi roam, a VPN stall, or a sleep/resume produces:
+the runner is alive the whole time and reconnects, but the server marks the
+mid-turn session ``failed`` with ``runner_disconnected`` and discards the
+in-flight turn.
+
+On unchanged main the server publishes ``runner_disconnected`` ~20 s into the
+outage, so this test fails. Riding the drop out for the liveness lease, the
+same runner reconnects, the original turn's answer is delivered, and the
+session never shows a failed edge or a persisted ``runner_disconnected`` label.
+
+No relay, runner, or server function is patched. The only injected fault is at
+the TCP boundary in front of the runner WebSocket, matching a transient ingress
+outage in production.
+
+Run::
+
+    uv run --no-sync pytest \
+        tests/e2e/test_runner_tunnel_mid_turn_reconnect_grace_e2e.py -v
+"""
+
+from __future__ import annotations
+
+import contextlib
+import json
+import os
+import re
+import signal
+import socket
+import socketserver
+import subprocess
+import sys
+import threading
+import time
+import uuid
+from collections.abc import Callable, Iterator
+from pathlib import Path
+
+import httpx
+import pytest
+
+from omnigent.runner.identity import token_bound_runner_id
+from tests._helpers.compat import apply_runner_env, apply_server_env
+from tests.e2e.conftest import (
+    _REPO_ROOT,
+    configure_mock_llm,
+    create_runner_bound_session,
+    find_free_port,
+    register_inline_agent,
+    release_mock_gate,
+    reset_mock_llm,
+)
+
+# Longer than main's 20 s disconnect grace, longer than a 30 s bump, shorter
+# than the 90 s liveness lease: only riding the drop out for the lease keeps
+# the turn alive, so this proves the lease-based fix rather than a bigger grace.
+_BLACKOUT_S = 45.0
+_ANSWER = "RUNNER_RECONNECT_GRACE_E2E_COMPLETED"
+# Both server paths that fail a turn on a runner drop log through the same
+# "session turn failed" line: the relay give-up stamps
+# origin=runner_disconnected_mid_turn and the per-runner disconnect timer stamps
+# origin=runner_offline_sweep. Reject either, so a regression in one path cannot
+# hide behind the other.
+_FAILURE_SIGNATURE = re.compile(
+    r"session turn failed for \S+ \(origin=\S+ code=runner_disconnected"
+)
+_HEALTH_TIMEOUT_S = 90.0
+
+pytestmark = [pytest.mark.timeout(300, method="signal")]
+
+
+def _ambient_free_environ() -> dict[str, str]:
+    """Return an environment without an outer Omnigent session identity."""
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith(("OMNIGENT_RUNNER_", "OMNIGENT_HOST_"))
+        and key not in ("RUNNER_SERVER_URL", "OMNIGENT_REMOTE_AUTH_TOKEN")
+    }
+    env["NO_PROXY"] = "127.0.0.1,localhost"
+    env["no_proxy"] = env["NO_PROXY"]
+    for name in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
+        env.pop(name, None)
+    return env
+
+
+def _terminate(proc: subprocess.Popen[bytes] | None) -> None:
+    """Best-effort SIGTERM then SIGKILL for a spawned process."""
+    if proc is None or proc.poll() is not None:
+        return
+    proc.send_signal(signal.SIGTERM)
+    try:
+        proc.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait(timeout=5)
+
+
+def _poll_until(condition: Callable[[], bool], *, timeout: float, what: str) -> None:
+    """Poll *condition* until it succeeds or raise a useful failure."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if condition():
+            return
+        time.sleep(0.2)
+    raise AssertionError(f"Timed out after {timeout:.0f}s waiting for {what}")
+
+
+class _TunnelIngressProxy:
+    """TCP proxy that can cut live sockets and temporarily answer HTTP 503."""
+
+    def __init__(self, backend_host: str, backend_port: int) -> None:
+        self._backend = (backend_host, backend_port)
+        self._lock = threading.Lock()
+        self._reject = False
+        self._live_sockets: set[socket.socket] = set()
+        self.rejected_connections = 0
+        proxy = self
+
+        class _Handler(socketserver.BaseRequestHandler):
+            def handle(self) -> None:
+                proxy._handle(self.request)
+
+        class _Server(socketserver.ThreadingTCPServer):
+            allow_reuse_address = True
+            daemon_threads = True
+
+        self._server = _Server(("127.0.0.1", 0), _Handler)
+        self.port = int(self._server.server_address[1])
+        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
+        self._thread.start()
+
+    def _track(self, sock: socket.socket) -> None:
+        with self._lock:
+            self._live_sockets.add(sock)
+
+    def _untrack(self, sock: socket.socket) -> None:
+        with self._lock:
+            self._live_sockets.discard(sock)
+
+    @staticmethod
+    def _close_socket(sock: socket.socket) -> None:
+        with contextlib.suppress(OSError):
+            sock.shutdown(socket.SHUT_RDWR)
+        with contextlib.suppress(OSError):
+            sock.close()
+
+    def _pipe(self, source: socket.socket, destination: socket.socket) -> None:
+        try:
+            while chunk := source.recv(65536):
+                destination.sendall(chunk)
+        except OSError:
+            # Expected when begin_blackout() or teardown cuts a socket mid-pipe;
+            # the finally block closes both ends either way.
+            return
+        finally:
+            self._close_socket(source)
+            self._close_socket(destination)
+
+    def _handle(self, client: socket.socket) -> None:
+        self._track(client)
+        with self._lock:
+            reject = self._reject
+            if reject:
+                self.rejected_connections += 1
+        if reject:
+            with contextlib.suppress(OSError):
+                client.sendall(
+                    b"HTTP/1.1 503 Service Unavailable\r\n"
+                    b"Content-Length: 0\r\n"
+                    b"Connection: close\r\n\r\n"
+                )
+            self._close_socket(client)
+            self._untrack(client)
+            return
+
+        upstream: socket.socket | None = None
+        try:
+            upstream = socket.create_connection(self._backend, timeout=5.0)
+            upstream.settimeout(None)
+            client.settimeout(None)
+            self._track(upstream)
+            forward = threading.Thread(
+                target=self._pipe,
+                args=(client, upstream),
+                daemon=True,
+            )
+            forward.start()
+            self._pipe(upstream, client)
+            forward.join(timeout=1.0)
+        except OSError:
+            self._close_socket(client)
+            if upstream is not None:
+                self._close_socket(upstream)
+        finally:
+            self._untrack(client)
+            if upstream is not None:
+                self._untrack(upstream)
+
+    def begin_blackout(self) -> None:
+        """Reject new handshakes and sever every established tunnel socket."""
+        with self._lock:
+            self._reject = True
+            sockets = list(self._live_sockets)
+        for sock in sockets:
+            self._close_socket(sock)
+
+    def end_blackout(self) -> None:
+        """Resume byte-for-byte forwarding to the real server."""
+        with self._lock:
+            self._reject = False
+
+    def close(self) -> None:
+        """Stop the proxy and close all active sockets."""
+        self.end_blackout()
+        with self._lock:
+            sockets = list(self._live_sockets)
+        for sock in sockets:
+            self._close_socket(sock)
+        self._server.shutdown()
+        self._server.server_close()
+        self._thread.join(timeout=5.0)
+
+
+class _ReconnectStack:
+    """Dedicated server, ingress proxy, and runner for the reconnect journey."""
+
+    def __init__(self, mock_llm_server_url: str, tmp_path: Path) -> None:
+        self._mock_base = f"{mock_llm_server_url}/v1"
+        self._port = find_free_port()
+        self.base_url = f"http://127.0.0.1:{self._port}"
+        self._binding_token = uuid.uuid4().hex + uuid.uuid4().hex
+        self.runner_id = token_bound_runner_id(self._binding_token)
+        self._database_uri = f"sqlite:///{tmp_path / 'reconnect.db'}"
+        self._artifact_dir = tmp_path / "artifacts"
+        self._artifact_dir.mkdir()
+        self.server_log = tmp_path / "server.log"
+        self.runner_log = tmp_path / "runner.log"
+        self._server_handle = self.server_log.open("w")
+        self._runner_handle = self.runner_log.open("w")
+        self._server_proc: subprocess.Popen[bytes] | None = None
+        self._runner_proc: subprocess.Popen[bytes] | None = None
+        self.proxy: _TunnelIngressProxy | None = None
+        self.client = httpx.Client(base_url=self.base_url, timeout=30.0, trust_env=False)
+
+    def _server_env(self) -> dict[str, str]:
+        env = {
+            **_ambient_free_environ(),
+            "OPENAI_API_KEY": "mock-key",
+            "OPENAI_BASE_URL": self._mock_base,
+            "OMNIGENT_RUNNER_TUNNEL_TOKEN": self._binding_token,
+        }
+        apply_server_env(env, _REPO_ROOT)
+        return env
+
+    def start(self) -> None:
+        """Start the server, proxy, and runner, then wait for registration."""
+        self._server_proc = subprocess.Popen(
+            [
+                sys.executable,
+                "-m",
+                "omnigent.cli",
+                "server",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                str(self._port),
+                "--database-uri",
+                self._database_uri,
+                "--artifact-location",
+                str(self._artifact_dir),
+            ],
+            env=self._server_env(),
+            stdout=self._server_handle,
+            stderr=subprocess.STDOUT,
+        )
+        _poll_until(
+            self._server_healthy,
+            timeout=_HEALTH_TIMEOUT_S,
+            what="the real Omnigent server to become healthy",
+        )
+        self.proxy = _TunnelIngressProxy("127.0.0.1", self._port)
+        proxy_url = f"http://127.0.0.1:{self.proxy.port}"
+        runner_env = apply_runner_env(
+            {
+                **self._server_env(),
+                "OMNIGENT_RUNNER_ID": self.runner_id,
+                "OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN": self._binding_token,
+                "OMNIGENT_RUNNER_PARENT_PID": str(os.getpid()),
+                "RUNNER_SERVER_URL": proxy_url,
+            }
+        )
+        self._runner_proc = subprocess.Popen(
+            [sys.executable, "-m", "omnigent.runner._entry"],
+            env=runner_env,
+            stdout=self._runner_handle,
+            stderr=subprocess.STDOUT,
+        )
+        self.wait_runner_online()
+
+    def _server_healthy(self) -> bool:
+        try:
+            return self.client.get("/health", timeout=2.0).status_code == 200
+        except httpx.HTTPError:
+            return False
+
+    def _runner_online(self) -> bool:
+        try:
+            response = self.client.get(f"/v1/runners/{self.runner_id}/status", timeout=2.0)
+            return response.status_code == 200 and response.json().get("online") is True
+        except httpx.HTTPError:
+            return False
+
+    def wait_runner_online(self) -> None:
+        """Wait until the server sees the real runner tunnel as online."""
+        _poll_until(
+            self._runner_online,
+            timeout=_HEALTH_TIMEOUT_S,
+            what="the runner WebSocket tunnel to register",
+        )
+
+    def teardown(self) -> None:
+        """Stop processes, proxy, HTTP client, and log handles."""
+        _terminate(self._runner_proc)
+        if self.proxy is not None:
+            self.proxy.close()
+        _terminate(self._server_proc)
+        self.client.close()
+        self._runner_handle.close()
+        self._server_handle.close()
+
+
+@pytest.fixture
+def reconnect_stack(
+    mock_llm_server_url: str,
+    tmp_path: Path,
+) -> Iterator[_ReconnectStack]:
+    """Yield a dedicated real server/runner stack behind a fault proxy."""
+    stack = _ReconnectStack(mock_llm_server_url, tmp_path)
+    stack.start()
+    try:
+        yield stack
+    finally:
+        stack.teardown()
+
+
+def _gate_pending(mock_url: str) -> bool:
+    response = httpx.get(f"{mock_url}/gate/pending", timeout=5.0, trust_env=False)
+    response.raise_for_status()
+    return bool(response.json().get("pending"))
+
+
+def _session_snapshot(client: httpx.Client, session_id: str) -> dict:
+    response = client.get(f"/v1/sessions/{session_id}")
+    response.raise_for_status()
+    return response.json()
+
+
+def _session_blob(client: httpx.Client, session_id: str) -> str:
+    return json.dumps(_session_snapshot(client, session_id).get("items", []))
+
+
+def _send_user_message(client: httpx.Client, session_id: str) -> None:
+    response = client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={
+            "type": "message",
+            "data": {
+                "role": "user",
+                "content": [{"type": "input_text", "text": "Finish after reconnecting."}],
+            },
+        },
+    )
+    response.raise_for_status()
+
+
+def test_mid_turn_tunnel_blackout_recovers_without_failed_edge(
+    reconnect_stack: _ReconnectStack,
+    mock_llm_server_url: str,
+) -> None:
+    """A 45-second ingress outage must not fail or discard the active turn."""
+    stack = reconnect_stack
+    proxy = stack.proxy
+    assert proxy is not None
+    reset_mock_llm(mock_llm_server_url)
+    model = f"runner-reconnect-{uuid.uuid4().hex[:8]}"
+    configure_mock_llm(
+        mock_llm_server_url,
+        [{"text": _ANSWER, "block": True}],
+        key=model,
+    )
+    agent_name = register_inline_agent(
+        stack.client,
+        name=f"runner-reconnect-{uuid.uuid4().hex[:8]}",
+        harness="openai-agents",
+        model=model,
+        profile="",
+        prompt="Return the configured answer.",
+        mock_llm_base_url=f"{mock_llm_server_url}/v1",
+    )
+    session_id = create_runner_bound_session(
+        stack.client,
+        agent_name=agent_name,
+        runner_id=stack.runner_id,
+    )
+    _send_user_message(stack.client, session_id)
+    _poll_until(
+        lambda: _gate_pending(mock_llm_server_url),
+        timeout=60.0,
+        what="the real turn to block inside the mock LLM",
+    )
+
+    blackout_started = time.monotonic()
+    proxy.begin_blackout()
+    try:
+        _poll_until(
+            lambda: proxy.rejected_connections > 0,
+            timeout=10.0,
+            what="the real runner to attempt a reconnect through the 503 ingress",
+        )
+        remaining = _BLACKOUT_S - (time.monotonic() - blackout_started)
+        if remaining > 0:
+            time.sleep(remaining)
+    finally:
+        proxy.end_blackout()
+
+    stack.wait_runner_online()
+    release_mock_gate(mock_llm_server_url)
+    _poll_until(
+        lambda: _ANSWER in _session_blob(stack.client, session_id),
+        timeout=60.0,
+        what="the original in-flight turn to complete after runner reconnect",
+    )
+
+    server_log = stack.server_log.read_text()
+    assert _FAILURE_SIGNATURE.search(server_log) is None, (
+        f"The server failed session {session_id} during a {_BLACKOUT_S:.0f}s transient "
+        "runner-tunnel outage even though the same runner reconnected and the original "
+        "turn completed. This reproduces the production false-fatal path.\n"
+        f"Rejected reconnect handshakes: {proxy.rejected_connections}.\n"
+        f"Server log tail:\n{server_log[-5000:]}"
+    )
+
+    # The failed edge is an SSE event that vanishes on reload; the durable
+    # proof is the reload-visible snapshot. A recovered session must read a
+    # non-failed status and carry no persisted runner_disconnected label, or
+    # the user reopens the session to a red card with a Retry button next to
+    # a turn that actually finished.
+    snapshot = _session_snapshot(stack.client, session_id)
+    assert snapshot.get("status") != "failed", (
+        f"Session {session_id} reads 'failed' after a transient outage it recovered from; "
+        f"snapshot={json.dumps(snapshot)[:2000]}"
+    )
+    snapshot_text = json.dumps(snapshot)
+    assert "runner_disconnected" not in snapshot_text, (
+        f"Session {session_id} still carries a persisted runner_disconnected label after "
+        f"recovery; snapshot={snapshot_text[:2000]}"
+    )

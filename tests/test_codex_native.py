@@ -6582,7 +6582,10 @@ def _capture_handler(posted: list[dict[str, Any]]) -> Callable[[httpx.Request], 
 
 
 async def _replay_completed_item(
-    item: dict[str, Any], handler: Callable[..., httpx.Response]
+    item: dict[str, Any],
+    handler: Callable[..., httpx.Response],
+    *,
+    bridge_dir: Path = Path("/tmp"),
 ) -> None:
     """
     Drive one Codex ``item/completed`` notification through the forwarder.
@@ -6598,7 +6601,7 @@ async def _replay_completed_item(
         await codex_native_forwarder._handle_event(
             client,
             session_id="conv_123",
-            bridge_dir=Path("/tmp"),
+            bridge_dir=bridge_dir,
             usage_coalescer=_usage_coalescer(client),
             elicitation_tracker=_elicitation_tracker(),
             event={
@@ -6863,6 +6866,99 @@ def test_forwarder_posts_codex_file_change_tool_call() -> None:
     }
     # Output summarizes each change as "<kind> <path>" from real fields.
     assert posted[1]["data"]["item_data"]["output"] == "add /repo/greeting.py"
+
+
+def test_forwarder_sends_file_change_to_observer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A completed fileChange reaches the non-git workspace registry relay."""
+    (tmp_path / "tool_relay.json").write_text(
+        json.dumps({"url": "http://relay.local", "token": "relay-secret"}),
+        encoding="utf-8",
+    )
+    observed: list[dict[str, Any]] = []
+
+    class Response:
+        def __enter__(self) -> Response:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def read(self) -> bytes:
+            return b"{}"
+
+    def urlopen(request: Any, *, timeout: float) -> Response:
+        assert request.full_url == "http://relay.local/hook/observe-tool"
+        assert request.headers["Authorization"] == "Bearer relay-secret"
+        assert timeout == 2
+        observed.append(json.loads(request.data))
+        return Response()
+
+    monkeypatch.setattr(codex_native_forwarder.urllib.request, "urlopen", urlopen)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path != "/hook/observe-tool"
+        return httpx.Response(202, json={"queued": False})
+
+    asyncio.run(
+        _replay_completed_item(
+            {
+                "type": "fileChange",
+                "id": "call_patch",
+                "changes": [
+                    {"path": "/repo/new.py", "kind": {"type": "add"}, "diff": "new"},
+                    {"path": "/repo/old.py", "kind": {"type": "delete"}, "diff": "old"},
+                ],
+                "status": "completed",
+            },
+            handler,
+            bridge_dir=tmp_path,
+        )
+    )
+
+    assert observed == [
+        {
+            "hook_event_name": "PostToolUse",
+            "tool_name": "apply_patch",
+            "tool_input": {
+                "changes": [
+                    {"path": "/repo/new.py", "kind": {"type": "add"}},
+                    {"path": "/repo/old.py", "kind": {"type": "delete"}},
+                ]
+            },
+            "tool_response": {"type": "success"},
+        }
+    ]
+
+
+@pytest.mark.parametrize("status", ["failed", "declined"])
+def test_forwarder_does_not_observe_unsuccessful_file_change(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, status: str
+) -> None:
+    """Failed or declined patches must not create phantom change records."""
+    (tmp_path / "tool_relay.json").write_text(
+        json.dumps({"url": "http://relay.local", "token": "relay-secret"}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        codex_native_forwarder.urllib.request,
+        "urlopen",
+        lambda *_args, **_kwargs: pytest.fail("unsuccessful patch reached file observer"),
+    )
+
+    asyncio.run(
+        _replay_completed_item(
+            {
+                "type": "fileChange",
+                "id": f"call_patch_{status}",
+                "changes": [{"path": "/repo/not-applied.py", "kind": {"type": "add"}}],
+                "status": status,
+            },
+            lambda _request: httpx.Response(202, json={"queued": False}),
+            bridge_dir=tmp_path,
+        )
+    )
 
 
 def test_forwarder_posts_codex_web_search_tool_call() -> None:
@@ -12188,6 +12284,254 @@ def test_rollout_records_includes_compacted_entry_from_compaction_item() -> None
         and r["payload"].get("content") == [{"type": "input_text", "text": "after compaction"}]
     ]
     assert len(post_items) == 1
+
+
+def test_rollout_records_preserve_function_call_completed_after_compaction() -> None:
+    """A delayed tool output keeps its pre-compaction function call."""
+    records = codex_native._codex_rollout_records_from_session_items(
+        [
+            {
+                "id": "fc_abandoned",
+                "response_id": "codex_turn_abandoned",
+                "type": "function_call",
+                "name": "exec_command",
+                "arguments": '{"cmd":"abandoned-command"}',
+                "call_id": "call_abandoned",
+            },
+            {
+                "id": "fc_slow",
+                "response_id": "codex_turn_slow",
+                "type": "function_call",
+                "name": "exec_command",
+                "arguments": '{"cmd":"slow-command"}',
+                "call_id": "call_slow",
+            },
+            {
+                "id": "cmp_1",
+                "response_id": "compact_1",
+                "type": "compaction",
+                "summary": "slow command still running",
+                "compacted_messages": [
+                    {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "run it"}],
+                    }
+                ],
+            },
+            {
+                "id": "fco_slow",
+                "response_id": "codex_turn_slow",
+                "type": "function_call_output",
+                "call_id": "call_slow",
+                "output": "finished after compaction",
+            },
+        ],
+        session_id="conv_test",
+        external_session_id="019f-thread",
+        cwd=Path("/tmp/test"),
+        model_provider="openai",
+        cli_version="0.154.0",
+    )
+
+    replacement_history = next(record for record in records if record["type"] == "compacted")[
+        "payload"
+    ]["replacement_history"]
+    calls = [item for item in replacement_history if item.get("type") == "function_call"]
+    assert calls == [
+        {
+            "id": "fc_slow",
+            "type": "function_call",
+            "name": "exec_command",
+            "arguments": '{"cmd":"slow-command"}',
+            "call_id": "call_slow",
+        }
+    ]
+    outputs = [
+        record["payload"]
+        for record in records
+        if record["type"] == "response_item"
+        and record["payload"].get("type") == "function_call_output"
+    ]
+    assert outputs == [
+        {
+            "id": "fco_slow",
+            "type": "function_call_output",
+            "call_id": "call_slow",
+            "output": "finished after compaction",
+        }
+    ]
+
+
+def test_rollout_records_do_not_duplicate_function_call_in_compaction() -> None:
+    """A compaction snapshot that already has the open call remains unchanged."""
+    function_call = {
+        "id": "fc_slow",
+        "type": "function_call",
+        "name": "exec_command",
+        "arguments": '{"cmd":"slow-command"}',
+        "call_id": "call_slow",
+    }
+    records = codex_native._codex_rollout_records_from_session_items(
+        [
+            {**function_call, "response_id": "codex_turn_slow"},
+            {
+                "id": "cmp_1",
+                "response_id": "compact_1",
+                "type": "compaction",
+                "summary": "slow command still running",
+                "compacted_messages": [function_call],
+            },
+            {
+                "id": "fco_slow",
+                "response_id": "codex_turn_slow",
+                "type": "function_call_output",
+                "call_id": "call_slow",
+                "output": "finished after compaction",
+            },
+        ],
+        session_id="conv_test",
+        external_session_id="019f-thread",
+        cwd=Path("/tmp/test"),
+        model_provider="openai",
+        cli_version="0.154.0",
+    )
+
+    replacement_history = next(record for record in records if record["type"] == "compacted")[
+        "payload"
+    ]["replacement_history"]
+    assert [
+        item.get("call_id") for item in replacement_history if item.get("type") == "function_call"
+    ] == ["call_slow"]
+
+
+def test_rollout_records_preserve_function_call_across_repeated_compactions() -> None:
+    """An open call survives every compaction before its delayed output."""
+    records = codex_native._codex_rollout_records_from_session_items(
+        [
+            {
+                "id": "fc_slow",
+                "response_id": "codex_turn_slow",
+                "type": "function_call",
+                "name": "exec_command",
+                "arguments": '{"cmd":"slow-command"}',
+                "call_id": "call_slow",
+            },
+            {
+                "id": "cmp_1",
+                "response_id": "compact_1",
+                "type": "compaction",
+                "summary": "slow command still running",
+                "compacted_messages": [
+                    {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "run it"}],
+                    }
+                ],
+            },
+            {
+                "id": "cmp_2",
+                "response_id": "compact_2",
+                "type": "compaction",
+                "summary": "slow command is still running",
+                "compacted_messages": [
+                    {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "run it"}],
+                    }
+                ],
+            },
+            {
+                "id": "fco_slow",
+                "response_id": "codex_turn_slow",
+                "type": "function_call_output",
+                "call_id": "call_slow",
+                "output": "finished after both compactions",
+            },
+        ],
+        session_id="conv_test",
+        external_session_id="019f-thread",
+        cwd=Path("/tmp/test"),
+        model_provider="openai",
+        cli_version="0.154.0",
+    )
+
+    compacted_records = [record for record in records if record["type"] == "compacted"]
+    assert len(compacted_records) == 1
+    replacement_history = compacted_records[0]["payload"]["replacement_history"]
+    assert [
+        item.get("call_id") for item in replacement_history if item.get("type") == "function_call"
+    ] == ["call_slow"]
+    assert [
+        record["payload"].get("call_id")
+        for record in records
+        if record["type"] == "response_item"
+        and record["payload"].get("type") == "function_call_output"
+    ] == ["call_slow"]
+
+
+def test_rollout_records_do_not_carry_interrupted_call_across_compaction() -> None:
+    """An interrupted tool interaction is absent from resumed history."""
+    records = codex_native._codex_rollout_records_from_session_items(
+        [
+            {
+                "id": "fc_cancelled",
+                "response_id": "codex_turn_cancelled",
+                "type": "function_call",
+                "name": "exec_command",
+                "arguments": '{"cmd":"cancelled-command"}',
+                "call_id": "call_cancelled",
+            },
+            {
+                "id": "cmp_1",
+                "response_id": "compact_1",
+                "type": "compaction",
+                "summary": "cancelled command was still running",
+                "compacted_messages": [
+                    {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "run it"}],
+                    }
+                ],
+            },
+            {
+                "id": "fco_cancelled",
+                "response_id": "codex_turn_cancelled",
+                "type": "function_call_output",
+                "call_id": "call_cancelled",
+                "output": "finished after cancellation",
+            },
+            {
+                "id": "msg_cancelled",
+                "response_id": "codex_turn_cancelled",
+                "type": "message",
+                "role": "assistant",
+                "interrupted": True,
+                "content": [{"type": "output_text", "text": "cancelled"}],
+            },
+        ],
+        session_id="conv_test",
+        external_session_id="019f-thread",
+        cwd=Path("/tmp/test"),
+        model_provider="openai",
+        cli_version="0.154.0",
+    )
+
+    replacement_history = next(record for record in records if record["type"] == "compacted")[
+        "payload"
+    ]["replacement_history"]
+    assert not any(
+        item.get("call_id") == "call_cancelled"
+        for item in replacement_history
+        if isinstance(item, dict)
+    )
+    assert not any(
+        record["type"] == "response_item" and record["payload"].get("call_id") == "call_cancelled"
+        for record in records
+    )
 
 
 def test_rollout_records_downgrade_image_stripped_by_compaction_storage() -> None:

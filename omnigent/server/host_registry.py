@@ -293,6 +293,11 @@ class HostConnection:
     connected_at: float
     last_frame_at: float
     account_generation: str | None = None
+    # True when this tunnel authenticated with a valid managed-sandbox launch
+    # token, i.e. a server-provisioned sandbox proving itself on connect — not a
+    # user machine reusing a managed host's id under ordinary login. Read by the
+    # default-public policy so only genuine sandboxes count as managed.
+    registered_with_managed_token: bool = False
     pending_launches: dict[str, asyncio.Future[dict[str, str | None]]] = field(
         default_factory=dict,
     )
@@ -383,6 +388,7 @@ class HostRegistry:
         hello: HostHelloFrame,
         owner: str | None,
         workspace_id: int | None = None,
+        registered_with_managed_token: bool = False,
     ) -> HostConnection:
         """Register a host connection (newest wins).
 
@@ -406,6 +412,9 @@ class HostRegistry:
             (``0`` in single-tenant deployments); captured into the
             connection so ``send_text`` need not read request context
             from the sender loop.
+        :param registered_with_managed_token: ``True`` when the tunnel
+            authenticated with a valid managed-sandbox launch token, so
+            the default-public policy can treat it as a genuine sandbox.
         :returns: The new :class:`HostConnection`. Its ``host_id`` is
             the canonical form (see :func:`_canonical_host_id`).
         """
@@ -422,6 +431,7 @@ class HostRegistry:
             outbound_queue=asyncio.Queue(),
             connected_at=now,
             last_frame_at=now,
+            registered_with_managed_token=registered_with_managed_token,
         )
         with self._lock:
             key = (ws_id, host_id)

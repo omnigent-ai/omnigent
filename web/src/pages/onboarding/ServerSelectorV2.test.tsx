@@ -71,6 +71,23 @@ describe("ServerSelectorV2", () => {
     expect(screen.queryByRole("radiogroup")).not.toBeInTheDocument();
   });
 
+  it("'Show all servers' from the preset detail reveals the full list (presets + recents)", () => {
+    render(
+      <ServerSelectorV2
+        setup={makeSetup({
+          managedServers: ["https://field-eng-omni.aws.databricksapps.com"],
+          recentServers: ["https://team.example.com/"],
+        })}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: /join your team \(field-eng-omni\)/i }));
+    fireEvent.click(screen.getByRole("button", { name: /show all servers/i }));
+    // Now on the full list: both sections present, so recents are reachable.
+    expect(screen.getByText(/^Recents$/)).toBeInTheDocument();
+    expect(screen.getByText(/preset \(by your organization\)/i)).toBeInTheDocument();
+    expect(screen.getByText("team.example.com")).toBeInTheDocument();
+  });
+
   it("opens directly on the server step when a connect error is present", () => {
     render(
       <ServerSelectorV2
@@ -97,5 +114,46 @@ describe("ServerSelectorV2", () => {
       screen.getByRole("menuitem", { name: /switch to legacy selector experience/i }),
     );
     expect(onSwitchToLegacy).toHaveBeenCalledOnce();
+  });
+
+  it("disables 'Switch to legacy' when the selector is env-forced", () => {
+    const onSwitchToLegacy = vi.fn();
+    render(
+      <ServerSelectorV2 setup={makeSetup({ onSwitchToLegacy, switchToLegacyDisabled: true })} />,
+    );
+    fireEvent.pointerDown(screen.getByRole("button", { name: /server selector settings/i }), {
+      button: 0,
+    });
+    const item = screen.getByRole("menuitem", { name: /switch to legacy selector experience/i });
+    expect(item).toHaveAttribute("aria-disabled", "true");
+    fireEvent.click(item);
+    expect(onSwitchToLegacy).not.toHaveBeenCalled();
+  });
+
+  it("sets a real color scheme from the Appearance radios", () => {
+    const onSetColorScheme = vi.fn();
+    render(<ServerSelectorV2 setup={makeSetup({ onSetColorScheme })} />);
+    fireEvent.pointerDown(screen.getByRole("button", { name: /server selector settings/i }), {
+      button: 0,
+    });
+    fireEvent.click(screen.getByRole("menuitemradio", { name: "Dark" }));
+    expect(onSetColorScheme).toHaveBeenCalledWith("dark");
+  });
+
+  it("seeds the Appearance radio from the shell's current scheme", () => {
+    // Returning to setup after the app set Dark: the radio reflects Dark, not
+    // the "system" default.
+    render(
+      <ServerSelectorV2
+        setup={makeSetup({ onSetColorScheme: vi.fn(), initialColorScheme: "dark" })}
+      />,
+    );
+    fireEvent.pointerDown(screen.getByRole("button", { name: /server selector settings/i }), {
+      button: 0,
+    });
+    expect(screen.getByRole("menuitemradio", { name: "Dark" })).toHaveAttribute(
+      "aria-checked",
+      "true",
+    );
   });
 });

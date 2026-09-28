@@ -2200,6 +2200,40 @@ async def test_install_signal_handlers_records_signal_reason() -> None:
     assert reasons == ["received SIGTERM"]
 
 
+@pytest.mark.asyncio
+@pytest.mark.skipif(
+    not hasattr(signal, "SIGTERM") or sys.platform == "win32",
+    reason="POSIX signal delivery required",
+)
+async def test_install_signal_handlers_marks_shutting_down() -> None:
+    """A shutdown signal marks the runner shutting-down state before teardown.
+
+    ``_publish_terminal_exit`` reads this state to tell an intentional stop
+    (SIGTERM/SIGINT, whose teardown races the terminal watcher) from a real
+    terminal crash — it must be set as soon as the signal is handled, not
+    after any teardown. Delivers a real SIGTERM to this process.
+
+    :returns: None.
+    """
+    from omnigent.runner._entry import _install_signal_handlers
+
+    stop_event = asyncio.Event()
+    marked: list[bool] = []
+    _install_signal_handlers(
+        stop_event,
+        mark_shutting_down=lambda: marked.append(True),
+    )
+    try:
+        os.kill(os.getpid(), signal.SIGTERM)
+        await asyncio.wait_for(stop_event.wait(), timeout=2.0)
+    finally:
+        loop = asyncio.get_running_loop()
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            loop.remove_signal_handler(sig)
+
+    assert marked == [True]
+
+
 def test_install_crash_logging_is_idempotent() -> None:
     """Installing the crash hook twice does not stack wrappers.
 

@@ -52,7 +52,6 @@ const {
   isDatabricksManagedServerUrl,
   databricksWorkspaceUiUrl,
   PRE_MANIFEST_BASELINE,
-  LOCAL_HOSTS,
 } = require("./url");
 const { parseOmnigentDeepLink, chooseDeepLinkStrategy } = require("./deepLink");
 const { registerWorkspaceChromeHide } = require("./workspace-chrome");
@@ -69,6 +68,7 @@ const {
   getManagedServerUrls,
 } = require("./managed_preferences");
 const arca = require("./arca");
+const cliInstall = require("./cli_install");
 const isaac = require("./isaac");
 const { createArcaConnectFlow } = require("./arca_connect_window");
 const { registerSessionExpiryReload } = require("./session-expiry");
@@ -2888,28 +2888,6 @@ function registerIpc() {
       const target = await expandDatabricksWorkspaceUrl(normalized, { signal });
       signal.throwIfAborted();
 
-      // Guard against navigating to (and pinning as trusted) a non-Omnigent site
-      // the user typed by mistake. Managed choices are pre-validated; local hosts
-      // are the user's own machine — both skip the check. For a remote URL we
-      // probe the well-known manifest; if it doesn't look like an Omnigent server
-      // and the user hasn't confirmed, ask the page to warn before proceeding.
-      // Soft (not a hard block): older Omnigent servers predate the manifest, so
-      // a second click must still let them through. force skips the re-probe.
-      //
-      // ONLY when the server selector is active: the classic static setup page
-      // calls setServerUrl(url) with no opts and can't handle a {needsConfirm}
-      // reply (it just expects navigation), so guarding it there would silently
-      // swallow the connect. The server selector is the only caller that
-      // understands the confirm handshake.
-      const isLocal = LOCAL_HOSTS.has(new URL(target).hostname);
-      if (serverSelectorV2Enabled() && !managedTarget && !isLocal && !opts?.force) {
-        const manifest = await fetchServerManifest(target, { signal });
-        signal.throwIfAborted();
-        if (manifest.manifestVersion < 1) {
-          return { needsConfirm: true, url: target };
-        }
-      }
-
       // Multi-server windows connect without touching the saved server —
       // the connection lives and dies with the window.
       const ephemeral = Boolean(win && windows.get(win)?.ephemeral);
@@ -3025,6 +3003,16 @@ function registerIpc() {
       throw new Error("get-managed-servers is only available to the setup page");
     }
     return managedServerUrls();
+  });
+
+  // Setup page → capabilities that gate wizard chrome. `v2Forced` means the env
+  // var pins the selector on, so "Switch to legacy" can't take effect and the
+  // menu item is disabled.
+  ipcMain.handle("omnigent:get-setup-capabilities", (event) => {
+    if (!isSetupPageSender(event)) {
+      throw new Error("get-setup-capabilities is only available to the setup page");
+    }
+    return { v2Forced: serverSelectorV2EnvForced() };
   });
 
   ipcMain.handle("omnigent:copy-setup-text", (event, text) => {
@@ -3259,6 +3247,9 @@ function registerIpc() {
     return {
       ...(await omnigentCli.getCliStatus(loadSettings().omnigent_path)),
       customizationDisabled: databricksInternalFeaturesEnabled(),
+      // In-app install is macOS-only; the renderer must not route connect/local
+      // through an install step on platforms where it can't run.
+      installSupported: process.platform === "darwin",
     };
   });
 
@@ -3315,6 +3306,34 @@ function registerIpc() {
       }
     };
     return serverManager.startLocalServer(cliPath, onLine);
+  });
+
+  // Setup page → install the omnigent CLI (macOS). Runs the bundled
+  // install_oss.sh (ensuring uv first) and streams its output to the page, then
+  // re-probes status so the caller learns whether the binary is now resolvable.
+  // Single-flight guard: a duplicate cli-install (e.g. a renderer effect that
+  // re-fired) joins the in-flight install instead of spawning a second one.
+  let cliInstallInFlight = null;
+  ipcMain.handle("omnigent:cli-install", async (event) => {
+    if (!isSetupPageSender(event)) {
+      throw new Error("cli-install is only available to the setup page");
+    }
+    if (cliInstallInFlight) return cliInstallInFlight;
+    const onOutput = (text) => {
+      try {
+        event.sender.send("omnigent:cli-install-log", { line: text });
+      } catch {
+        /* window torn down mid-install */
+      }
+    };
+    cliInstallInFlight = (async () => {
+      const result = await cliInstall.installCli({ onOutput });
+      const status = await omnigentCli.getCliStatus(loadSettings().omnigent_path);
+      return { ...result, installed: status.installed === true };
+    })().finally(() => {
+      cliInstallInFlight = null;
+    });
+    return cliInstallInFlight;
   });
 
   // SPA → this machine's identity: is the CLI installed, and its host id. Both
@@ -3381,6 +3400,44 @@ function registerIpc() {
     if (!isPinnedOriginSender(event)) return;
     if (scheme === "light" || scheme === "dark" || scheme === "system") {
       nativeTheme.themeSource = scheme;
+    }
+  });
+
+  // Setup page ↔ live color-scheme override (System/Light/Dark) for the wizard.
+  // Separate sender gate from the SPA handler above: the setup page isn't a
+  // pinned origin. themeSource is process-global and NOT persisted, so it may
+  // still hold a value the connected SPA set earlier this run — the wizard must
+  // read it on load rather than assume "system".
+
+  // Read the current source + effective appearance so the wizard can seed its
+  // radio and `.dark` class on mount (the wizard's dark styles key off the
+  // class, not the OS media query). Mirrors update_overlay's initial send.
+  ipcMain.handle("omnigent:setup-get-color-scheme", (event) => {
+    if (!isSetupPageSender(event)) return null;
+    return {
+      source: nativeTheme.themeSource,
+      effective: nativeTheme.shouldUseDarkColors ? "dark" : "light",
+    };
+  });
+
+  ipcMain.on("omnigent:setup-set-color-scheme", (event, scheme) => {
+    if (!isSetupPageSender(event)) return;
+    if (scheme !== "light" && scheme !== "dark" && scheme !== "system") return;
+    nativeTheme.themeSource = scheme;
+    event.sender.send("omnigent:setup-theme", nativeTheme.shouldUseDarkColors ? "dark" : "light");
+  });
+
+  // Track OS appearance changes once, and push to every WebContents CURRENTLY
+  // on the setup page — re-checked per send, since setup and the connected SPA
+  // share one reused WebContents (a destroyed-only cleanup would leak the push
+  // into the SPA after navigation). "System" thus restyles live.
+  nativeTheme.on("updated", () => {
+    const theme = nativeTheme.shouldUseDarkColors ? "dark" : "light";
+    for (const win of BrowserWindow.getAllWindows()) {
+      const wc = win.webContents;
+      if (wc && !wc.isDestroyed() && isSetupPageUrl(wc.getURL())) {
+        wc.send("omnigent:setup-theme", theme);
+      }
     }
   });
 

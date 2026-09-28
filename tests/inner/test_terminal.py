@@ -404,6 +404,24 @@ async def test_duplicate_exit_capture_preserves_good_snapshot(
         await asyncio.gather(primary, *([duplicate] if duplicate is not None else []))
 
 
+def test_client_interaction_within_reports_recency(tmp_path: Path) -> None:
+    """
+    No interaction ever reads False; a fresh stamp reads True only inside the window.
+    """
+    instance = TerminalInstance(
+        name="claude",
+        session_key="main",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path,
+        running=True,
+    )
+
+    assert not instance.client_interaction_within(60.0)
+    instance.note_client_interaction()
+    assert instance.client_interaction_within(60.0)
+    assert not instance.client_interaction_within(0.0)
+
+
 def test_tmux_gone_diagnostics_summarizes_available_signals(tmp_path: Path) -> None:
     """The exit-diagnostics summary folds in every signal it has."""
     instance = TerminalInstance(
@@ -1784,14 +1802,15 @@ async def test_is_alive_false_when_probe_communication_fails(
 
 
 @pytest.mark.skipif(shutil.which("tmux") is None, reason="requires a real tmux binary")
+@pytest.mark.parametrize("exit_status", [0, 255])
 @pytest.mark.asyncio
 async def test_server_survives_inner_process_exit_real_tmux(
-    tmp_path: Path, short_tmp_parent: Path
+    tmp_path: Path, short_tmp_parent: Path, exit_status: int
 ) -> None:
     """
     The private tmux server outlives an inner-process exit (issue #540).
 
-    Launches a real tmux terminal whose inner command exits immediately. With
+    Launches a real tmux terminal whose inner command prints then exits. With
     the default ``exit-empty on`` the server would vanish and every later
     control command would fail with ``no server running``. With
     ``remain-on-exit on`` / ``exit-empty off`` the server and session must stay
@@ -1800,6 +1819,7 @@ async def test_server_survives_inner_process_exit_real_tmux(
 
     :param tmp_path: Temporary directory for the real tmux socket.
     """
+    exit_signal = tmp_path / "exit-signal"
     instance = TerminalInstance(
         name="bash",
         session_key="s1",
@@ -1808,11 +1828,26 @@ async def test_server_survives_inner_process_exit_real_tmux(
         socket_path=short_tmp_parent / "tmux.sock",
         private_dir=tmp_path,
         command="sh",
-        args=["-c", "exit 0"],
+        args=[
+            "-c",
+            'printf "terminal-final-output\\n"; '
+            'while [ ! -e "$1" ]; do sleep 0.02; done; '
+            f"exit {exit_status}",
+            "sh",
+            str(exit_signal),
+        ],
         keep_alive_after_exit=True,
     )
     try:
         await instance.launch(cwd=tmp_path)
+        for _ in range(250):
+            frame = await instance._tmux_output("capture-pane", "-t", instance.tmux_target, "-p")
+            if "terminal-final-output" in frame:
+                break
+            await asyncio.sleep(0.02)
+        else:
+            raise AssertionError("terminal never rendered output")
+        exit_signal.touch()
 
         # Wait for the inner `sh` to exit. is_alive() flips running -> False
         # once the pane is dead.
@@ -1843,6 +1878,12 @@ async def test_server_survives_inner_process_exit_real_tmux(
             "exit-empty/remain-on-exit were not applied: "
             f"{probe.stderr.decode().strip()!r}"
         )
+        assert instance._pane_is_dead() is True
+        assert instance.last_exit_status() == exit_status
+        final_frame = await instance._tmux_output(
+            "capture-pane", "-t", instance.tmux_target, "-p", "-S", "-100"
+        )
+        assert "terminal-final-output" in final_frame
     finally:
         await instance.close()
 
@@ -2199,7 +2240,7 @@ async def test_launch_omits_keep_alive_options_by_default(
     """
     Keeping the server alive past exit is opt-in: a default terminal must NOT
     set remain-on-exit / exit-empty, preserving the ``has-session``-means-alive
-    contract for codex / cursor / REPL / generic terminals.
+    contract for cursor / REPL / generic terminals.
 
     :param tmp_path: Temporary directory for the fake tmux socket.
     :param monkeypatch: Pytest monkeypatch fixture.
@@ -3328,3 +3369,34 @@ def test_apply_utf8_locale_default_noop_on_windows(
     _apply_utf8_locale_default(env)
     assert "LC_ALL" not in env
     assert env["LANG"] == ""
+
+
+@pytest.mark.asyncio
+async def test_read_join_wrapped_asks_tmux_to_join_wrapped_rows(tmp_path: Path) -> None:
+    """
+    ``read(join_wrapped=True)`` captures with ``-J`` so a token wider than the
+    80-column pane (a sign-in address) reads back as one line; the default
+    read is unchanged.
+    """
+    instance = TerminalInstance(
+        name="runtime",
+        session_key="main",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path,
+        running=True,
+    )
+    calls: list[tuple[str, ...]] = []
+
+    async def _tmux_output(*args: str) -> str:
+        calls.append(args)
+        return "open https://signin.example.com/device?user_code=ABCDEFGH"
+
+    instance._tmux_output = _tmux_output  # type: ignore[method-assign]
+
+    plain = await instance.read()
+    joined = await instance.read(join_wrapped=True)
+
+    assert calls[0] == ("capture-pane", "-t", instance.tmux_target, "-p")
+    assert calls[1] == ("capture-pane", "-t", instance.tmux_target, "-p", "-J")
+    assert plain["screen"] == joined["screen"]
+    assert "https://signin.example.com/device?user_code=ABCDEFGH" in joined["screen"]

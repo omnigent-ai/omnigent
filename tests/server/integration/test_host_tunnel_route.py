@@ -899,3 +899,69 @@ async def test_invalid_managed_token_refused_before_accept(
     assert registry.get(_HOST_ID) is None
     host = store.get_host(_HOST_ID)
     assert host is None or host.status == "offline"
+
+
+class _FakeSenderWebSocket:
+    """Minimal ``send_text`` stand-in for ``_sender_loop`` unit tests.
+
+    :param raises: Exception ``send_text`` raises, or ``None`` to
+        record the frame instead.
+    :param application_state: Post-raise state, mimicking Starlette's
+        synchronous state flip when a concurrent close wins the race.
+    """
+
+    def __init__(
+        self,
+        *,
+        raises: Exception | None = None,
+        application_state: object = None,
+    ) -> None:
+        from starlette.websockets import WebSocketState
+
+        self._raises = raises
+        self.application_state = (
+            application_state if application_state is not None else WebSocketState.CONNECTED
+        )
+        self.sent: list[str] = []
+
+    async def send_text(self, data: str) -> None:
+        if self._raises is not None:
+            raise self._raises
+        self.sent.append(data)
+
+
+async def test_host_sender_loop_swallows_send_after_close_race() -> None:
+    """A send racing a concurrent close (socket already DISCONNECTED)
+    ends the sender loop quietly instead of raising into the route."""
+    from types import SimpleNamespace
+
+    from starlette.websockets import WebSocketState
+
+    from omnigent.server.routes import host_tunnel
+
+    ws = _FakeSenderWebSocket(
+        raises=RuntimeError('Cannot call "send" once a close message has been sent.'),
+        application_state=WebSocketState.DISCONNECTED,
+    )
+    conn = SimpleNamespace(host_id=_HOST_ID, outbound_queue=asyncio.Queue())
+    conn.outbound_queue.put_nowait("frame")
+    await host_tunnel._sender_loop(ws, conn)  # returns without raising
+
+
+async def test_host_sender_loop_reraises_send_failure_while_connected() -> None:
+    """The same RuntimeError while the socket is still CONNECTED is a
+    real error and must propagate to the route's error-logging path."""
+    from types import SimpleNamespace
+
+    from starlette.websockets import WebSocketState
+
+    from omnigent.server.routes import host_tunnel
+
+    ws = _FakeSenderWebSocket(
+        raises=RuntimeError('Cannot call "send" once a close message has been sent.'),
+        application_state=WebSocketState.CONNECTED,
+    )
+    conn = SimpleNamespace(host_id=_HOST_ID, outbound_queue=asyncio.Queue())
+    conn.outbound_queue.put_nowait("frame")
+    with pytest.raises(RuntimeError):
+        await host_tunnel._sender_loop(ws, conn)

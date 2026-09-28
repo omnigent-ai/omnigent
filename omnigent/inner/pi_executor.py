@@ -46,7 +46,7 @@ import tempfile
 from asyncio import Queue, Task
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
-from typing import Any, NotRequired, TypeAlias, TypedDict, cast
+from typing import Any, NotRequired, Protocol, TypeAlias, TypedDict, cast
 from urllib.parse import urlparse as _urlparse
 
 from omnigent.harnesses.pi_native.credentials import (
@@ -126,13 +126,18 @@ def _fetch_shell_command_token(command: str) -> str | None:
     return token
 
 
-# Tool-server callback provided by ``Session._wire_sdk_executor``. Invoked
-# with a tool name and argument dict; may return the result dict directly
-# or a coroutine/future yielding one.
-ToolExecutor: TypeAlias = Callable[  # type: ignore[explicit-any]
-    [str, dict[str, Any]],
-    Awaitable[dict[str, Any]] | dict[str, Any],
-]
+class ToolExecutor(Protocol):
+    """Tool bridge callback carrying Pi's ID independently of stdout event order."""
+
+    def __call__(  # type: ignore[explicit-any]
+        self,
+        name: str,
+        args: dict[str, Any],
+        /,
+        *,
+        call_id: str | None = None,
+    ) -> Awaitable[dict[str, Any]] | dict[str, Any]: ...
+
 
 # Native-tool policy gate wired by :class:`PiExecutor`. Invoked with a native
 # (non-bridged) tool name + argument dict; returns ``{"block": bool, "reason":
@@ -294,7 +299,9 @@ class _ToolServer:
                     verdict = await self._evaluate_policy(raw_tool_name, tool_args)
                     response = {"id": raw_req_id, "verdict": verdict}
                 else:
-                    response = await self._execute(raw_tool_name, tool_args)
+                    raw_call_id = request.get("call_id")
+                    call_id = raw_call_id if isinstance(raw_call_id, str) and raw_call_id else None
+                    response = await self._execute(raw_tool_name, tool_args, call_id=call_id)
                     response["id"] = raw_req_id
                 # Serialize defensively: a tool result may carry a value
                 # ``json.dumps`` can't encode (e.g. ``datetime``/``set``).
@@ -327,11 +334,17 @@ class _ToolServer:
         self,
         name: str,
         args: dict[str, Any],
+        *,
+        call_id: str | None = None,
     ) -> dict[str, Any]:
         if self._tool_executor is None:
             return {"error": f"No tool executor for '{name}'"}
         try:
-            raw = self._tool_executor(name, args)
+            raw = (
+                self._tool_executor(name, args, call_id=call_id)
+                if call_id is not None
+                else self._tool_executor(name, args)
+            )
             resolved = await raw if asyncio.iscoroutine(raw) or asyncio.isfuture(raw) else raw
             if not isinstance(resolved, dict):
                 resolved = {"result": resolved}
@@ -460,7 +473,7 @@ const PORT = {port};
 const TOKEN = {token_json};
 
 /** Send a tool call request over TCP and return the result. */
-function callTool(toolName, args) {{
+function callTool(toolName, args, callId) {{
   return new Promise((resolve) => {{
     // Idempotent settle: a tool call must resolve exactly once. Route every
     // resolve through finish() so a late "close" after a real "data" response
@@ -474,7 +487,8 @@ function callTool(toolName, args) {{
     }});
     const client = net.createConnection({{ port: PORT, host: "127.0.0.1" }}, () => {{
       const id = Math.random().toString(36).slice(2);
-      const req = JSON.stringify({{ id, token: TOKEN, tool: toolName, args }}) + "\\n";
+      const frame = {{ id, token: TOKEN, tool: toolName, args, call_id: callId }};
+      const req = JSON.stringify(frame) + "\\n";
       let buf = "";
       client.on("data", (chunk) => {{
         buf += chunk.toString();
@@ -573,8 +587,8 @@ module.exports = function(pi) {{
       description: tool.description,
       promptSnippet: tool.promptSnippet || tool.description,
       parameters: tool.parameters || {{ type: "object", properties: {{}} }},
-      async execute(_toolCallId, _params, _signal, _onUpdate, _ctx) {{
-        return callTool(tool.name, _params);
+      async execute(toolCallId, _params, _signal, _onUpdate, _ctx) {{
+        return callTool(tool.name, _params, toolCallId);
       }},
     }});
   }}
@@ -1016,6 +1030,7 @@ class _PiRpcSession:
         cwd: str | None = None,
         model: str | None = None,
         system_prompt: str | None = None,
+        system_prompt_mode: str = "append",
         thinking: str | None = None,
         extra_args: list[str] | None = None,
     ) -> None:
@@ -1034,8 +1049,10 @@ class _PiRpcSession:
         :param model: Pi model selector, e.g.
             ``"databricks-anthropic/gateway-model-id"``.
             ``None`` lets Pi pick its default.
-        :param system_prompt: Text appended to Pi's default system
-            prompt via ``--append-system-prompt``. ``None`` skips it.
+        :param system_prompt: Omnigent's composed instructions. ``None`` skips
+            injection in append mode; replace mode requires non-empty text.
+        :param system_prompt_mode: Append instructions to Pi's base prompt,
+            or replace it using ``--system-prompt``.
         :param thinking: Pi thinking level in Pi's own vocabulary
             (``off``/``minimal``/.../``max``), passed as ``--thinking``.
             ``None`` omits the flag so Pi's model default applies.
@@ -1055,11 +1072,13 @@ class _PiRpcSession:
             )
         if thinking:
             args.extend(["--thinking", thinking])
-        if system_prompt:
-            # Use --append-system-prompt instead of --system-prompt so Pi
-            # keeps its default prompt (which includes tool descriptions from
-            # promptSnippet and guidelines).  Using --system-prompt would
-            # replace the default prompt entirely, stripping tool awareness.
+        if system_prompt_mode == "replace":
+            if not system_prompt or not system_prompt.strip():
+                raise ValueError("system_prompt_mode='replace' requires non-empty instructions")
+            # An explicit empty append input suppresses APPEND_SYSTEM.md discovery.
+            args.extend(["--system-prompt", system_prompt, "--append-system-prompt", ""])
+        elif system_prompt:
+            # Keep Pi's tool snippets and default guidance in append mode.
             args.extend(["--append-system-prompt", system_prompt])
         if extra_args:
             args.extend(extra_args)
@@ -1729,11 +1748,17 @@ class PiExecutor(Executor):
         bundle_dir: pathlib.Path | None = None,
         agent_name: str | None = None,
         skills_filter: str | list[str] = "all",
+        context_files: bool = True,
+        system_prompt_mode: str = "append",
         preserve_model_ids: bool = False,
     ) -> None:
         """Create a PiExecutor.
 
         :param cwd: Working directory for the Pi subprocess.
+        :param context_files: Allow Pi to automatically load context files such
+            as AGENTS.md and CLAUDE.md. Explicit agent instructions are unaffected.
+        :param system_prompt_mode: ``append`` retains Pi's base prompt;
+            ``replace`` uses Omnigent's composed instructions as the base.
         :param os_env: Optional OS environment / sandbox spec.  When set, the
             Pi subprocess is wrapped in the same sandbox other
             harnesses use.
@@ -1789,6 +1814,9 @@ class PiExecutor(Executor):
             ``--skill`` for each named bundle skill — names not
             present in the bundle are silently skipped.
         """
+        if system_prompt_mode not in ("append", "replace"):
+            raise ValueError("system_prompt_mode must be 'append' or 'replace'")
+        self._system_prompt_mode = system_prompt_mode
         resolved_pi = pi_path or _find_pi_cli()
         if not resolved_pi:
             raise ImportError(
@@ -1833,6 +1861,8 @@ class PiExecutor(Executor):
         from omnigent.harnesses.pi_native.main import pi_supports_approve
 
         self._extra_args: list[str] = ["--no-tools"]
+        if not context_files:
+            self._extra_args.append("--no-context-files")
         if pi_supports_approve(self._pi_path):
             # Pre-accept the project-folder trust dialog. Pi 0.79+ shows a
             # blocking TUI prompt on first launch in a directory with .pi/
@@ -2388,6 +2418,7 @@ class PiExecutor(Executor):
             cwd=self._cwd,
             model=pi_model or None,
             system_prompt=system_prompt or None,
+            system_prompt_mode=self._system_prompt_mode,
             thinking=thinking,
             extra_args=extra_args or None,
         )
@@ -2573,13 +2604,22 @@ class PiExecutor(Executor):
                         yield ReasoningChunk(delta=raw_delta, event_type="reasoning_text")
                 continue
 
-            # Tool execution events.
+            # Both lifecycle events must retain the same Pi-owned correlation ID.
+            call_id = event.get("toolCallId")
+            if event_type in {"tool_execution_start", "tool_execution_end"}:
+                if not isinstance(call_id, str) or not call_id:
+                    continue
+
             if event_type == "tool_execution_start":
                 tool_name = event.get("toolName", "unknown")
                 args = event.get("args", {})
                 yield ToolCallRequest(
                     name=tool_name,
                     args=args if isinstance(args, dict) else {},
+                    metadata={
+                        "call_id": call_id,
+                        "internally_executed": not any(t.get("name") == tool_name for t in tools),
+                    },
                 )
                 continue
 
@@ -2653,6 +2693,7 @@ class PiExecutor(Executor):
                     status=status,
                     result=result,
                     error=result_str if (is_error or is_blocked) else "",
+                    metadata={"call_id": call_id},
                 )
                 continue
 

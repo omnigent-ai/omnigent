@@ -10,6 +10,7 @@ import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
+  DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 
@@ -53,6 +54,7 @@ export function LandingStep({
               onClick={() => onJoinManaged(managedServers[0])}
               className="flex-1 py-5 rounded-tr-none rounded-br-none border-none"
             >
+              <Users className="size-4" />
               <span>
                 Join your team (
                 <span className="opacity-80 font-normal">{shortName(managedServers[0])}</span>)
@@ -73,10 +75,15 @@ export function LandingStep({
                     {url.replace(/^https?:\/\//i, "").replace(/\/$/, "")}
                   </DropdownMenuItem>
                 ))}
+                {/* Escape hatch to the full list (presets + recents), which is
+                    otherwise unreachable from the MDM landing. */}
+                <DropdownMenuSeparator />
+                <DropdownMenuItem onSelect={onJoinServer}>Show all servers…</DropdownMenuItem>
               </DropdownMenuContent>
             </DropdownMenu>
           </div>
           <Button variant="outline" onClick={onGetStarted} className="py-5">
+            <Laptop className="size-4" />
             Get started locally
           </Button>
         </>

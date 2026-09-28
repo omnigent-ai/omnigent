@@ -7322,20 +7322,23 @@ function failUnavailableStream(set: Setter, error: string): void {
 // within the connect-grace + relaunch window.
 const RUNNER_UNAVAILABLE_CODE = "runner_unavailable";
 
+// Replace only the server's no-context fallback; preserve phase-specific detail.
+const RUNNER_UNAVAILABLE_TERSE_MESSAGE = "No runner bound for session";
+
 /**
  * Turn a thrown send failure into user-facing banner text + a code.
  *
- * The runner-unavailable 503 gets self-explanatory copy (and no raw code in
- * the banner title) so a slow/never-online runner reads as a clear, retryable
- * message rather than the server's terse "No runner bound for session". Other
- * failures fall back to the error's own message, carrying the machine code
- * when present for debuggability.
+ * Keep the runner-unavailable code and any phase-specific detail. Replace
+ * only the server's no-context message with friendly copy.
  */
 function describeSendFailure(err: unknown): { message: string; code: string } {
   if (err instanceof ApiError && err.code === RUNNER_UNAVAILABLE_CODE) {
+    const informative = err.message && err.message !== RUNNER_UNAVAILABLE_TERSE_MESSAGE;
     return {
-      message: "The runner didn't come online in time. Please try again.",
-      code: "",
+      message: informative
+        ? err.message
+        : "The runner didn't come online in time. Please try again.",
+      code: RUNNER_UNAVAILABLE_CODE,
     };
   }
   if (err instanceof ApiError) {

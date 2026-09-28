@@ -775,6 +775,73 @@ async def test_get_terminal_by_id(
 
 
 @pytest.mark.asyncio
+async def test_sign_in_link_reports_the_prompt_a_running_pane_shows(
+    client: httpx.AsyncClient,
+    registry: TerminalRegistry,
+    tmp_path: Path,
+) -> None:
+    """
+    GET /sign-in-link lifts the live sign-in prompt from the agent's own pane,
+    reading it with wrapped rows joined so a wide address comes back whole. A
+    saved link in an old error card is bound to a launcher process that has
+    moved on; the web asks here at click time instead. Only the native agent's
+    pane counts: a shell the person opened alongside it cannot supply the
+    address, however sign-in-like its output looks.
+    """
+    instance = _make_instance("codex", "main", tmp_path)
+    _seed_registry(registry, "conv_abc", [instance])
+    shell = registry.get("conv_abc", "bash", "s1")
+    assert shell is not None
+
+    async def _shell_read(scrollback: int = 0, *, join_wrapped: bool = False) -> dict[str, object]:
+        del scrollback, join_wrapped
+        return {
+            "screen": (
+                "! First copy your one-time code: 1A2B-3C4D\n"
+                "Press Enter to open https://github.com/login/device in your browser...\n"
+            )
+        }
+
+    shell.read = _shell_read  # type: ignore[method-assign]
+    reads: list[bool] = []
+
+    async def _read(scrollback: int = 0, *, join_wrapped: bool = False) -> dict[str, object]:
+        del scrollback
+        reads.append(join_wrapped)
+        return {
+            "screen": (
+                "Logging in via SSO...\n"
+                "please open the following URL:\n"
+                "\thttps://signin.example.com/oauth2/v1/authorize?client_id=abc&state=xyz\n"
+                "code: HQ7M-2KPD\n"
+            )
+        }
+
+    instance.read = _read  # type: ignore[method-assign]
+
+    resp = await client.get("/v1/sessions/conv_abc/sign-in-link")
+
+    assert resp.status_code == 200
+    assert resp.json() == {
+        "pending": True,
+        "url": "https://signin.example.com/oauth2/v1/authorize?client_id=abc&state=xyz",
+        "code": "HQ7M-2KPD",
+        "terminal_id": "terminal_codex_main",
+    }
+    assert reads == [True]
+
+
+@pytest.mark.asyncio
+async def test_sign_in_link_reports_nothing_pending_without_a_prompt(
+    client: httpx.AsyncClient,
+) -> None:
+    """Panes showing no address (or none running) answer ``pending: false``."""
+    resp = await client.get("/v1/sessions/conv_abc/sign-in-link")
+    assert resp.status_code == 200
+    assert resp.json() == {"pending": False, "url": None, "code": None}
+
+
+@pytest.mark.asyncio
 async def test_get_terminal_by_id_returns_404_when_tmux_exited(
     client: httpx.AsyncClient,
     registry: TerminalRegistry,

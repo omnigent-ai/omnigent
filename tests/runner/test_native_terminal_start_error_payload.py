@@ -82,6 +82,71 @@ def test_other_causes_keep_generic_startup_failure_code() -> None:
     assert "agent is no longer available" not in payload["message"]
 
 
+def test_generic_cause_names_errno_without_free_form_text() -> None:
+    """The generic startup-defect message now names a structured errno cause.
+
+    Production telemetry for these failures only carries this message, so an
+    environmental cause (e.g. disk-full) must be legible without the runner
+    log — but only via structured facts, never the raw exception text.
+    """
+    payload = _native_terminal_start_error_payload(
+        OSError(28, "No space left on device"),
+        "Codex",
+        session_id="conv_1",
+    )
+
+    assert (
+        "Native Codex terminal failed to start (OSError errno 28 ENOSPC); "
+        "see the runner log for details:"
+    ) in payload["message"]
+    assert "No space left on device" not in payload["message"]
+
+
+def test_cause_includes_errno_name_for_os_errors() -> None:
+    """An ``OSError`` cause names its errno, never its free-form strerror text."""
+    exc = OSError(28, "No space left on device")
+
+    assert orchestration._native_terminal_start_failure_cause(exc) == "OSError errno 28 ENOSPC"
+
+
+def test_cause_names_direct_cause_type_for_chained_exception() -> None:
+    """A wrapping exception names its direct cause's type, not any message text."""
+    exc = RuntimeError("private launch configuration detail")
+    exc.__cause__ = httpx.ReadTimeout("private upstream URL")
+
+    cause = orchestration._native_terminal_start_failure_cause(exc)
+
+    assert cause == "RuntimeError (cause ReadTimeout)"
+
+
+def test_cause_never_includes_exception_message_text() -> None:
+    """No part of the exception's message — secrets or multi-line text — ever appears."""
+    exc = RuntimeError("token=super-secret-value andmultiline\nsecond line with more detail")
+
+    cause = orchestration._native_terminal_start_failure_cause(exc)
+
+    assert cause == "RuntimeError"
+    assert "secret" not in cause
+    assert "token" not in cause
+    assert "\n" not in cause
+
+
+def test_cause_is_class_name_only_when_no_structured_facts_available() -> None:
+    """An exception with a message but no errno/code/cause is class-name only."""
+    assert orchestration._native_terminal_start_failure_cause(RuntimeError()) == "RuntimeError"
+
+
+def test_cause_names_omnigent_error_code() -> None:
+    """An ``OmnigentError`` cause names its structured error code, not its message."""
+    exc = OmnigentError("some internal detail", code=ErrorCode.INTERNAL_ERROR)
+
+    assert (
+        orchestration._native_terminal_start_failure_cause(exc)
+        == f"OmnigentError code {ErrorCode.INTERNAL_ERROR}"
+    )
+    assert "internal detail" not in orchestration._native_terminal_start_failure_cause(exc)
+
+
 def test_codex_early_exit_with_unknown_status_does_not_invent_one(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -182,6 +247,9 @@ def test_startup_failure_diagnostics_belong_to_failing_child(
     else:
         assert attributes["exception_cause_type"] == "ReadTimeout"
         assert "ReadTimeout" in str(row["stack_trace"])
+        # The generic startup-defect branch names the direct cause's type as
+        # a structured, non-sensitive fact — never the free-form message.
+        assert "(cause ReadTimeout)" in payload["message"]
 
 
 def test_ensure_response_and_diagnostic_share_error_and_session_ids(
@@ -204,3 +272,6 @@ def test_ensure_response_and_diagnostic_share_error_and_session_ids(
     assert attributes["exception_type"] == "OSError"
     assert "private launch path" not in str(attributes)
     assert "private launch path" not in payload["message"]
+    # This ``OSError`` has no numeric errno (single-arg constructor), so the
+    # structured cause is the class name only.
+    assert "(OSError)" in payload["message"]

@@ -2699,6 +2699,47 @@ def _normalize_daemon_target(server_url: str | None) -> str:
     return _normalize_daemon_target_impl(server_url)
 
 
+def _daemon_host_status_probe(
+    record: _HostDaemonRecord, *, timeout_s: float = 2.0
+) -> _HostHttpResult | None:
+    """
+    Fetch the server's view of a daemon's host row.
+
+    :param record: Daemon record to probe.
+    :param timeout_s: Per-request HTTP timeout in seconds, e.g. ``2.0``.
+    :returns: The HTTP result — status ``0`` means the request never got an
+        HTTP answer and the body carries the transport failure — or ``None``
+        when the record has no host id or no server URL to probe.
+    """
+    from omnigent.harnesses.claude_native.bridge import url_component
+
+    host_id = record.host_id or _load_existing_host_id()
+    if host_id is None:
+        return None
+    base_url = _daemon_base_url(record)
+    if base_url is None:
+        return None
+    return _host_http_json(
+        base_url=base_url,
+        method="GET",
+        path=f"/v1/hosts/{url_component(host_id)}",
+        timeout_s=timeout_s,
+        host_id=host_id,
+    )
+
+
+def _host_status_reports_online(result: _HostHttpResult | None) -> bool:
+    """
+    Report whether a host-row probe result says the host is online.
+
+    :param result: Probe result from :func:`_daemon_host_status_probe`.
+    :returns: ``True`` only on a 200 whose body reports ``"online"``.
+    """
+    if result is None or result.status_code != 200 or not isinstance(result.body, dict):
+        return False
+    return result.body.get("status") == "online"
+
+
 def _daemon_host_online(record: _HostDaemonRecord, *, timeout_s: float = 2.0) -> bool:
     """
     Probe whether a daemon's host is currently online on its server.
@@ -2717,24 +2758,7 @@ def _daemon_host_online(record: _HostDaemonRecord, *, timeout_s: float = 2.0) ->
         as ``"online"``; ``False`` if the host id is unknown, the server
         is unreachable, or the host reports offline.
     """
-    from omnigent.harnesses.claude_native.bridge import url_component
-
-    host_id = record.host_id or _load_existing_host_id()
-    if host_id is None:
-        return False
-    base_url = _daemon_base_url(record)
-    if base_url is None:
-        return False
-    result = _host_http_json(
-        base_url=base_url,
-        method="GET",
-        path=f"/v1/hosts/{url_component(host_id)}",
-        timeout_s=timeout_s,
-        host_id=host_id,
-    )
-    if result.status_code != 200 or not isinstance(result.body, dict):
-        return False
-    return result.body.get("status") == "online"
+    return _host_status_reports_online(_daemon_host_status_probe(record, timeout_s=timeout_s))
 
 
 def _daemon_registry_dir() -> Path:
@@ -8754,22 +8778,112 @@ def _background_host_log_detail(log_path: str | None) -> str:
     return detail
 
 
+def _registration_target_display(record: _HostDaemonRecord) -> str:
+    """Return the user-facing URL of the server a daemon must register with.
+
+    The result reaches terminal output and persistent exception text, and a
+    configured server URL may carry basic-auth userinfo
+    (``https://user:token@host``) that daemon-target normalization preserves.
+    Strip the userinfo the same way ``omnigent.cli_auth._safe_log_url`` does,
+    so registration diagnostics never echo embedded credentials. The query is
+    kept: ``ServerUrl`` strips arbitrary queries from the API base, and the
+    display form only re-adds the non-secret ``?o=<workspace>`` selector.
+    """
+    from urllib.parse import urlsplit, urlunsplit
+
+    from omnigent.util.server_url import display_server_url
+
+    base_url = _daemon_base_url(record)
+    if not base_url:
+        return "the configured server"
+    display = display_server_url(base_url)
+    try:
+        parts = urlsplit(display)
+        host = parts.hostname
+    except ValueError:
+        return "the configured server"
+    if not parts.scheme or not host:
+        return "the configured server"
+    # Drop only the userinfo, keeping the rest of the authority verbatim so
+    # an IPv6 literal retains its brackets (``http://[::1]:6767``).
+    netloc = parts.netloc.rpartition("@")[2]
+    return urlunsplit((parts.scheme, netloc, parts.path, parts.query, ""))
+
+
+def _background_registration_timeout(
+    record: _HostDaemonRecord,
+    *,
+    server_responded: bool,
+    transport_error: str | None,
+) -> click.ClickException:
+    """Build the error for a registration wait that exhausted its grace.
+
+    :param record: Registry record of the daemon that never registered.
+    :param server_responded: Whether any status probe got an HTTP answer.
+    :param transport_error: Last probe transport failure, e.g.
+        ``"ConnectError: [Errno 111] Connection refused"``.
+    :returns: The exception to raise — an unreachable server is named
+        together with its transport failure instead of the generic
+        registration-timeout wording.
+    """
+    from omnigent.cli_diagnostics import SUPPRESS_RECOVERY_HINT_ATTR
+
+    target = _registration_target_display(record)
+    log_detail = _background_host_log_detail(record.log_path)
+    if not server_responded and transport_error is not None:
+        exc = click.ClickException(
+            f"Could not reach the Omnigent server at {target} within "
+            f"{_BACKGROUND_HOST_REGISTRATION_GRACE_S:.0f}s ({transport_error}). "
+            "Check that the server is running and that your `server` config "
+            f"points at the right URL.{log_detail}"
+        )
+        # A server nothing answered at cannot be a stale-host HTTP 401
+        # tunnel rejection, so the recovery hint would mislead here.
+        setattr(exc, SUPPRESS_RECOVERY_HINT_ATTR, True)
+        return exc
+    return click.ClickException(
+        "The host daemon started but did not register with the server at "
+        f"{target} within {_BACKGROUND_HOST_REGISTRATION_GRACE_S:.0f}s."
+        f"{log_detail}"
+    )
+
+
 def _confirm_background_host_registered(record: _HostDaemonRecord) -> None:
     """Wait until the detached daemon completes server registration."""
     deadline = time.monotonic() + _BACKGROUND_HOST_REGISTRATION_GRACE_S
+    announced = False
+    server_responded = False
+    last_transport_error: str | None = None
     while True:
         if not _pid_alive(record.pid):
             raise click.ClickException(
                 "The host daemon exited before registering with the server."
                 f"{_background_host_log_detail(record.log_path)}"
             )
-        if _daemon_host_online(record, timeout_s=1.0):
+        result = _daemon_host_status_probe(record, timeout_s=1.0)
+        if result is not None and result.status_code == 0:
+            last_transport_error = str(result.body)
+        elif result is not None:
+            server_responded = True
+        if _host_status_reports_online(result):
             return
+        if not announced:
+            # Not registered on the first probe: name what the otherwise
+            # silent wait is for before polling out the grace period. On
+            # stderr, like the nearby progress output, so scripts capturing
+            # the command's result never receive the waiting line.
+            click.echo(
+                "Waiting for the host daemon to register with "
+                f"{_registration_target_display(record)} "
+                f"(up to {_BACKGROUND_HOST_REGISTRATION_GRACE_S:.0f}s)...",
+                err=True,
+            )
+            announced = True
         if time.monotonic() >= deadline:
-            raise click.ClickException(
-                "The host daemon started but did not register with the server "
-                f"within {_BACKGROUND_HOST_REGISTRATION_GRACE_S:.0f}s."
-                f"{_background_host_log_detail(record.log_path)}"
+            raise _background_registration_timeout(
+                record,
+                server_responded=server_responded,
+                transport_error=last_transport_error,
             )
         time.sleep(0.2)
 
@@ -12454,7 +12568,7 @@ def login(server_url: str) -> None:
     # hosted omnigent) means Databricks fronts the server. This
     # lets one CLI command handle every posture without a flag.
     try:
-        probe = _httpx.get(f"{server}/v1/me", timeout=10.0)
+        probe = _httpx.get(f"{server}/v1/me", timeout=10.0, trust_env=_trust_env_for(server))
     except _httpx.HTTPError as exc:
         raise click.ClickException(
             f"Could not reach {server}/v1/me: {exc}\nIs the server running?"
@@ -12491,20 +12605,36 @@ def login(server_url: str) -> None:
         _remember_default_server(server)
         return
 
-    # Fall through: OIDC mode (or unknown — let the ticket endpoint's
-    # error message guide the user).
+    if probe.status_code != 401:
+        # Not an Omnigent auth answer (an env proxy's block page, a gateway
+        # error): falling into the OIDC ticket flow would blame the wrong
+        # endpoint, so fail on the probe itself.
+        raise click.ClickException(
+            f"Unexpected response from {server}/v1/me: HTTP {probe.status_code}. "
+            "This is not an Omnigent auth answer; the server may be erroring, "
+            "or something other than the server may have replied."
+            f"{_proxy_interference_hint(server)}"
+        )
+
+    # Fall through: OIDC mode (or a 401 without a recognized login_url —
+    # older OIDC servers and auth middlewares answer 401 without the JSON
+    # ``login_url`` payload, so the ticket flow stays the compatibility
+    # path for any 401 and its endpoint's error message guides the user).
     import webbrowser
 
     from omnigent.cli_auth import store_token
 
     # Step 1: Request a CLI login ticket.
     try:
-        resp = _httpx.post(f"{server}/auth/cli-login", timeout=10.0)
+        resp = _httpx.post(
+            f"{server}/auth/cli-login", timeout=10.0, trust_env=_trust_env_for(server)
+        )
         resp.raise_for_status()
     except _httpx.HTTPError as exc:
         raise click.ClickException(
             f"Could not reach {server}/auth/cli-login: {exc}\n"
             f"Is the server running with OMNIGENT_AUTH_PROVIDER=oidc?"
+            f"{_proxy_interference_hint(server)}"
         ) from exc
 
     data = resp.json()
@@ -12524,7 +12654,7 @@ def login(server_url: str) -> None:
     while _time.time() < deadline:
         _time.sleep(2)
         try:
-            poll_resp = _httpx.get(poll_url, timeout=10.0)
+            poll_resp = _httpx.get(poll_url, timeout=10.0, trust_env=_trust_env_for(server))
         except _httpx.HTTPError:
             continue
 
@@ -12558,6 +12688,54 @@ def login(server_url: str) -> None:
 
 
 _CLI_LOGIN_TIMEOUT_SECONDS = 300  # 5 minutes
+
+# The proxy env vars httpx consults for each target scheme: only the
+# matching scheme's proxy (or the scheme-agnostic ALL_PROXY) can route a
+# request, so a hint must never blame e.g. HTTPS_PROXY for an http:// target.
+_PROXY_ENV_VARS_BY_SCHEME = {
+    "http": ("HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"),
+    "https": ("HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"),
+}
+
+
+def _proxy_interference_hint(base_url: str) -> str:
+    """A NO_PROXY hint when an env-configured proxy could answer for *base_url*.
+
+    Tracks httpx's actual routing: only proxy variables that apply to the
+    target's scheme count, and ``NO_PROXY`` entries — bare hostnames or
+    port-qualified ``host:port`` forms — that exclude the target suppress
+    the hint.
+
+    :param base_url: Server base URL, e.g. ``"http://omni.internal:6767"``.
+    :returns: A newline-prefixed hint, or ``""`` when no env proxy applies.
+    """
+    if not _trust_env_for(base_url):
+        return ""
+    from urllib.parse import urlsplit
+
+    parts = urlsplit(base_url)
+    scheme = (parts.scheme or "http").lower()
+    relevant_vars = _PROXY_ENV_VARS_BY_SCHEME.get(scheme, ("ALL_PROXY", "all_proxy"))
+    if not any(os.environ.get(var) for var in relevant_vars):
+        return ""
+    # Runtime-only stdlib helper (present in CPython, absent from typeshed);
+    # it implements the NO_PROXY list matching we need here.
+    from urllib.request import proxy_bypass_environment  # type: ignore[missing-module-attribute]
+
+    # NO_PROXY may already exclude this host (as a bare hostname or a
+    # port-qualified host:port entry, both of which httpx honors), in which
+    # case the answer really came from the server and blaming a proxy would
+    # misdirect. Pass host:port only when the URL carries an explicit port,
+    # mirroring httpx's port matching.
+    host = parts.hostname
+    bypass_target = f"{host}:{parts.port}" if host and parts.port else host
+    if bypass_target and proxy_bypass_environment(bypass_target):
+        return ""
+    return (
+        "\nA proxy from your environment (HTTP_PROXY/HTTPS_PROXY) may be "
+        "answering instead of the server; add the server host to NO_PROXY "
+        "to bypass it."
+    )
 
 
 def _accounts_login(server: str) -> None:
@@ -12597,6 +12775,7 @@ def _accounts_login(server: str) -> None:
             f"{server}/auth/login",
             json={"username": username, "password": password, "issue_refresh": True},
             timeout=10.0,
+            trust_env=_trust_env_for(server),
         )
     except _httpx.HTTPError as exc:
         raise click.ClickException(f"Could not reach {server}/auth/login: {exc}") from exc

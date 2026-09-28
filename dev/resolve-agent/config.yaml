@@ -52,7 +52,10 @@ description: >-
   that PR with the same audited test, journey, and diff review; otherwise it
   root-causes and implements the fix, adds targeted
   unit/regression tests at the layer it changed, re-runs the set to confirm every
-  live facet goes fail→pass, re-records the repro drivers on the fixed tree so
+  live facet goes fail→pass, and assesses the final diff's impact on other
+  consumers in every resolution mode. It records focused checks, revision context,
+  evidence, and uncovered boundaries in impact_assessment before claiming fixed.
+  It re-records the repro drivers on the fixed tree so
   the before/after footage pair lands in the PR's Demo section (and on the
   Linear ticket when a key is available), then commits, pushes, and opens a
   ready-for-review pull request. It can also remediate trusted human change
@@ -70,7 +73,7 @@ executor:
     harness: claude-sdk
     permission_mode: bypassPermissions
 
-# The full operating procedure lives in AGENTS.md, read at startup.
+# AGENTS.md routes phases to bundled skills; detailed procedures load on demand.
 instructions: AGENTS.md
 
 # Grant sys_session_share authority to grant the __public__ sentinel (anonymous

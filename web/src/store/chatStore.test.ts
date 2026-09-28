@@ -1153,6 +1153,28 @@ describe("chatStore — switchTo", () => {
     expect(useChatStore.getState().blocks).toHaveLength(1);
   });
 
+  it("scopes the background-task pill state to the active conversation", async () => {
+    seedSession("conv_with_task", []);
+    seedSession("conv_empty", []);
+
+    await useChatStore.getState().switchTo("conv_with_task");
+    handleSessionEvent({
+      type: "session_status",
+      conversationId: "conv_with_task",
+      status: "idle",
+      backgroundTaskCount: 1,
+      backgroundTasks: [{ description: "Wait for CI" }],
+    });
+    expect(useChatStore.getState().backgroundTaskCount).toBe(1);
+
+    await useChatStore.getState().switchTo("conv_empty");
+    expect(useChatStore.getState().backgroundTaskCount).toBe(0);
+
+    await useChatStore.getState().switchTo("conv_with_task");
+    expect(useChatStore.getState().backgroundTaskCount).toBe(1);
+    expect(useChatStore.getState().backgroundTasks).toEqual([{ description: "Wait for CI" }]);
+  });
+
   it("revalidates a retained live conversation on revisit, recovering items its stream never delivered", async () => {
     // The stale-revisit bug: a session stream can be open yet deliver nothing
     // (on a sharded deployment an unkeyed open routes to the wrong replica and
@@ -2889,15 +2911,49 @@ describe("chatStore — send (first-send ordering)", () => {
     expect(state.pendingUserMessages).toEqual([]);
     expect(state.status).toBe("idle");
     expect(state.sessionStatus).toBe("idle");
-    // A standalone error block is appended carrying the friendly, retryable
-    // copy — NOT the server's terse "No runner bound for session" — and no
-    // raw code in the banner (code "" → clean "Error" title).
+    // Use friendly copy for the no-context fallback, but retain its code.
     const errorBlocks = state.blocks.filter((b) => b.type === "error");
     expect(errorBlocks).toHaveLength(1);
     expect(errorBlocks[0]).toMatchObject({
       type: "error",
       message: "The runner didn't come online in time. Please try again.",
-      code: "",
+      code: "runner_unavailable",
+    });
+  });
+
+  it("surfaces the server's runner-unavailable cause verbatim when it names one", async () => {
+    // Preserve the server's phase-specific detail in the error block.
+    const causefulDetail =
+      "The host launched runner runner_token_abc123 for this session, but it " +
+      "never connected to the server within 30s — the runner process may be " +
+      "hung or unable to reach the server. Check the runner log on the host.";
+    useChatStore.setState({
+      conversationId: "conv_existing",
+      abortController: new AbortController(),
+      status: "idle",
+      sessionStatus: "running",
+      blocks: [],
+      pendingUserMessages: [],
+    });
+    fetchMock.mockImplementation((input, init) => {
+      const url = String(input);
+      if (url.endsWith("/v1/sessions/conv_existing/events")) {
+        return mockResponse(
+          { error: { code: "runner_unavailable", message: causefulDetail } },
+          { ok: false, status: 503 },
+        );
+      }
+      return defaultFetchHandler(input, init);
+    });
+
+    await useChatStore.getState().send("hi", "agent_xyz");
+
+    const errorBlocks = useChatStore.getState().blocks.filter((b) => b.type === "error");
+    expect(errorBlocks).toHaveLength(1);
+    expect(errorBlocks[0]).toMatchObject({
+      type: "error",
+      message: causefulDetail,
+      code: "runner_unavailable",
     });
   });
 
@@ -15273,5 +15329,67 @@ describe("beginLocalConversation — optimistic model seed", () => {
     });
     const state = useChatStore.getState();
     expect(state.sessionReasoningEffort).toBe("low");
+  });
+});
+
+describe("chatStore — one error card per failed turn", () => {
+  const error = {
+    code: "databricks_sign_in_pending",
+    message: "Codex is waiting for a sign-in in this session's terminal.",
+  };
+  const errorBlocks = () => useChatStore.getState().blocks.filter((b) => b.type === "error");
+
+  async function failOneTurn(): Promise<void> {
+    seedSession("conv_one_card", []);
+    await useChatStore.getState().switchTo("conv_one_card");
+    // The stream reducer already rendered the harness's response.failed as an
+    // error block for this response; the status edge arrives right after it.
+    useChatStore.setState({
+      blocks: [
+        {
+          type: "error",
+          ctx: {
+            agent: null,
+            depth: 0,
+            turn: 0,
+            timestamp: 0,
+            responseId: "resp_pending",
+            itemId: "item_failed",
+          },
+          message: error.message,
+          source: "harness",
+          code: error.code,
+        },
+      ],
+    });
+    expect(errorBlocks()).toHaveLength(1);
+  }
+
+  it("does not add a second card when the failed status repeats the harness error", async () => {
+    // The runner publishes the harness error's own code and message on the
+    // failed status edge, so the edge is recognised as the same failure.
+    await failOneTurn();
+    handleSessionEvent({
+      type: "session_status",
+      conversationId: "conv_one_card",
+      status: "failed",
+      responseId: "resp_pending",
+      error,
+    });
+    expect(errorBlocks()).toHaveLength(1);
+  });
+
+  it("adds a card when the failed status names a different failure", async () => {
+    // A status edge whose code differs (the pre-fix generic host-setup code)
+    // reads as a separate failure and renders a second card.
+    await failOneTurn();
+    handleSessionEvent({
+      type: "session_status",
+      conversationId: "conv_one_card",
+      status: "failed",
+      responseId: "resp_pending",
+      error: { code: "runner_error", message: error.message },
+    });
+    expect(errorBlocks()).toHaveLength(2);
   });
 });

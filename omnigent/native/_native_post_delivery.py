@@ -176,6 +176,7 @@ async def post_external_session_status(
     background_task_count: int | None = None,
     background_tasks: list[dict[str, object]] | None = None,
     response_id: str | None = None,
+    failure_detail: str | None = None,
 ) -> None:
     """Post one ``external_session_status`` event to the Sessions API.
 
@@ -204,11 +205,17 @@ async def post_external_session_status(
         what makes native forwarded tool cards render LIVE (spinner + elapsed
         timer) rather than as static completed cards. ``None`` (the default)
         preserves status edges that don't map to a turn.
+    :param failure_detail: Optional harness-reported reason for a ``"failed"``
+        edge, e.g. ``"API Error: 500 Internal server error"``. Unlike
+        ``output`` it keeps the harness-neutral failure code, and servers
+        that predate it ignore it. Ignored when falsy.
     :raises httpx.HTTPError: If the Omnigent request fails or is rejected.
     """
     data: dict[str, object] = {"status": status}
     if output:
         data["output"] = output
+    if failure_detail:
+        data["failure_detail"] = failure_detail
     if background_task_count is not None:
         data["background_task_count"] = background_task_count
     if background_tasks is not None:
