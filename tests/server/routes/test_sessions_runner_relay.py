@@ -10,6 +10,7 @@ from collections.abc import AsyncIterator
 from types import SimpleNamespace, TracebackType
 from typing import Any
 
+import httpx
 import pytest
 
 from omnigent.stores.conversation_store.sqlalchemy_store import (
@@ -1186,6 +1187,89 @@ async def test_relay_completion_idle_clears_only_a_disconnect_failure(
         sessions_module._runner_relay_tasks.clear()
         sessions_module._session_status_cache.pop(session_id, None)
         session_stream.close(session_id)
+
+
+class _RegisteredRunnerHttpErrorClient:
+    """Fake runner client whose transport says the runner is present but every stream open fails.
+
+    Models a connected tunnel whose ``GET /stream`` keeps returning an HTTP
+    error: the relay must keep its interval backoff here, because the
+    runner-absence waiter resolves immediately for a registered runner.
+    """
+
+    class _Transport:
+        async def wait_for_runner(self, timeout_s: float) -> bool:
+            del timeout_s
+            return True
+
+    def __init__(self, gate: asyncio.Event) -> None:
+        self.calls = 0
+        self._gate = gate
+        self._transport = self._Transport()
+
+    def stream(self, method: str, path: str, *, timeout: Any) -> Any:
+        del method, path, timeout
+        self.calls += 1
+        if self.calls == 1:
+            # First open: heartbeat so the relay reports ready, then drop.
+            return _ScriptedThenDropStreamResponse([], self._gate)
+        request = httpx.Request("GET", "http://runner/v1/sessions/x/stream")
+        response = httpx.Response(503, request=request)
+        raise httpx.HTTPStatusError("503", request=request, response=response)
+
+
+@pytest.mark.asyncio
+async def test_relay_backs_off_when_a_registered_runner_rejects_the_stream(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A registered runner that rejects the stream gets interval retries, not a storm.
+
+    The relay parks on runner re-registration during an outage. For a runner
+    that is still registered, that wait returns at once, so an HTTP error from
+    a healthy tunnel must fall back to the interval sleep or the relay would
+    re-open the stream as fast as the loop turns.
+    """
+    from omnigent.server.routes import sessions as sessions_module
+
+    monkeypatch.setattr(
+        "omnigent.server.routes._sessions.orchestration.RUNNER_DISCONNECT_GRACE_S",
+        0.5,
+    )
+    monkeypatch.setattr(
+        "omnigent.server.routes._sessions.orchestration._RELAY_RETRY_INTERVAL_S",
+        0.1,
+    )
+    sessions_module._runner_relay_tasks.clear()
+    gate = asyncio.Event()
+    fake_runner = _RegisteredRunnerHttpErrorClient(gate)
+    store = _RecordingLabelStore(live_status="idle")
+    session_id = "e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0"
+    try:
+        handle = await sessions_module._ensure_runner_relay_ready(
+            session_id,
+            "runner_http_error_storm",
+            fake_runner,  # type: ignore[arg-type]
+            conversation_store=store,  # type: ignore[arg-type]
+        )
+        assert handle is not None
+        gate.set()
+        await asyncio.wait_for(handle.task, timeout=_TASK_TIMEOUT_S)
+        # 0.5s grace / 0.1s interval bounds the attempts to a handful; a
+        # storm makes hundreds.
+        assert fake_runner.calls <= 8, (
+            f"relay re-opened the stream {fake_runner.calls} times against a registered "
+            "runner within a 0.5s grace: the runner-absence wait is short-circuiting the backoff"
+        )
+    finally:
+        gate.set()
+        handle = sessions_module._runner_relay_tasks.get(session_id)
+        if handle is not None and not handle.task.done():
+            handle.task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError):
+                await asyncio.wait_for(handle.task, timeout=_TASK_TIMEOUT_S)
+        sessions_module._runner_relay_tasks.clear()
+        sessions_module._session_status_cache.pop(session_id, None)
 
 
 @pytest.mark.asyncio

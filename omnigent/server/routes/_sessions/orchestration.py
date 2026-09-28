@@ -7256,15 +7256,16 @@ async def _relay_runner_stream(
                     deadline - now,
                     extra={"session_id": session_id},
                 )
-                # Park until the runner re-registers rather than re-opening the
-                # stream every interval: one attempt per outage, resolved the
-                # instant the tunnel is back. A client without a tunnel
-                # transport (in-process tests) keeps the interval sleep.
+                # An absent runner: park until it re-registers rather than
+                # re-opening the stream every interval, so an outage costs one
+                # attempt, resolved the instant the tunnel is back. A runner
+                # that is still registered failed the stream for another
+                # reason (an HTTP error), so keep the interval backoff: the
+                # waiter would return at once and spin. A client without a
+                # tunnel transport (in-process tests) also keeps the interval.
                 transport = getattr(runner_client, "_transport", None)
                 wait = getattr(transport, "wait_for_runner", None)
-                if wait is not None:
-                    await wait(deadline - now)
-                else:
+                if wait is None or await wait(deadline - now):
                     await asyncio.sleep(_RELAY_RETRY_INTERVAL_S)
                 continue
             if lost.intentional:
