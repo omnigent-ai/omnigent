@@ -19,6 +19,7 @@ Run::
 
 from __future__ import annotations
 
+import json
 import re
 from pathlib import Path
 
@@ -45,7 +46,26 @@ def _pnpm_versions(name: str) -> set[str]:
     """
     text = (_REPO_ROOT / "pnpm-lock.yaml").read_text(encoding="utf-8")
     pattern = re.compile(rf"(?<![\w./-]){re.escape(name)}@(\d[\w.\-]*)")
-    return set(pattern.findall(text))
+    return set(pattern.findall(text)) - _floor_alias_versions(name)
+
+
+def _floor_alias_versions(name: str) -> set[str]:
+    """Versions of *name* present only via intentional dev-only ``*-floor``
+    aliases in web/package.json (``npm:<name>@<ver>``) — type-check stubs pinned
+    to the embed host's react-router floor (see web/tsconfig.embed-floor.json).
+    Never bundled or executed, so exempt from the vulnerable-pin guard. Dev-only
+    by design: a ``*-floor`` alias in prod dependencies would ship and is not
+    exempt, so it stays flagged."""
+    dev_deps = json.loads((_REPO_ROOT / "web" / "package.json").read_text(encoding="utf-8")).get(
+        "devDependencies", {}
+    )
+    out: set[str] = set()
+    for alias, spec in dev_deps.items():
+        if alias.endswith("-floor"):
+            m = re.fullmatch(rf"npm:{re.escape(name)}@(\d[\w.\-]*)", spec)
+            if m:
+                out.add(m.group(1))
+    return out
 
 
 def _uv_versions(name: str) -> list[str]:
