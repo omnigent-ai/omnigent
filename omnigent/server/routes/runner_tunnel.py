@@ -20,6 +20,7 @@ import logging
 import time
 from collections.abc import Awaitable, Callable, Mapping
 from ipaddress import ip_address
+from typing import TypedDict
 
 from fastapi import APIRouter, Request, WebSocket, WebSocketDisconnect
 
@@ -54,6 +55,25 @@ _ON_RUNNER_CONNECT_TIMEOUT_SEC = 30.0
 # via its token factory, so a compromised sandbox's credential is usable
 # only briefly, while a live session refreshes indefinitely with no cap.
 _MANAGED_RUNNER_TOKEN_TTL_S = 1800
+
+
+class _TunnelConnectionAttrs(TypedDict):
+    """Debug-log attributes joining a tunnel row to one runner connection.
+
+    :param runner_id: Runner the tunnel belongs to.
+    :param ended_by: Name of the helper task that observed the end, or
+        ``None`` while the connection is live.
+    :param connection_id: Runner-minted id from the hello frame, shared with
+        the runner's own rows for this socket.
+    :param connection_age_s: Seconds since the tunnel registered.
+    :param last_frame_age_s: Seconds since the runner's last frame.
+    """
+
+    runner_id: str
+    ended_by: str | None
+    connection_id: str | None
+    connection_age_s: float | None
+    last_frame_age_s: float | None
 
 
 def _is_loopback_websocket_client(ws: WebSocket) -> bool:
@@ -448,6 +468,22 @@ def create_runner_tunnel_router(
 
         await ws.accept()
         session: RunnerSession | None = None
+        ended_by: str | None = None
+
+        def _connection_attrs() -> _TunnelConnectionAttrs:
+            now = time.time()
+            return {
+                "runner_id": runner_id,
+                "ended_by": ended_by,
+                "connection_id": session.hello.connection_id if session is not None else None,
+                "connection_age_s": (
+                    round(now - session.connected_at, 3) if session is not None else None
+                ),
+                "last_frame_age_s": (
+                    round(now - session.last_frame_at, 3) if session is not None else None
+                ),
+            }
+
         try:
             # 3. Receive hello frame.
             raw = await ws.receive_text()
@@ -484,6 +520,7 @@ def create_runner_tunnel_router(
                     phase="connected",
                     runner_id=runner_id,
                     version=frame.runner_version,
+                    connection_id=frame.connection_id,
                 ),
             )
 
@@ -538,6 +575,9 @@ def create_runner_tunnel_router(
                     {sender_task, ping_task, receive_task},
                     return_when=asyncio.FIRST_COMPLETED,
                 )
+                # Every helper that had finished, by role: a server-declared
+                # ping timeout may or may not already carry the peer's close.
+                ended_by = ",".join(sorted(t.get_name().split(":", 1)[0] for t in done))
                 for task in done:
                     task_name = task.get_name()
                     if task.cancelled():
@@ -577,6 +617,15 @@ def create_runner_tunnel_router(
                             ),
                         )
                     raise task_error
+                # Every finished helper ended cleanly: a server-side close (ping
+                # timeout, replaced generation) with no peer close yet, so no
+                # ``disconnected`` row follows. Record it.
+                _logger.info(
+                    "Runner %s tunnel closed (%s ended)",
+                    runner_id,
+                    ended_by,
+                    extra=debug_event("runner_tunnel", phase="closed", **_connection_attrs()),
+                )
             finally:
                 for task in (sender_task, ping_task, receive_task, keepalive_task):
                     task.cancel()
@@ -607,8 +656,9 @@ def create_runner_tunnel_router(
                 extra=debug_event(
                     "runner_tunnel",
                     phase="disconnected",
-                    runner_id=runner_id,
                     code=getattr(exc, "code", None),
+                    reason=getattr(exc, "reason", None),
+                    **_connection_attrs(),
                 ),
             )
             if on_runner_disconnect is not None:
@@ -623,7 +673,7 @@ def create_runner_tunnel_router(
             _logger.exception(
                 "Tunnel error for runner %s",
                 runner_id,
-                extra=debug_event("runner_tunnel", phase="error", runner_id=runner_id),
+                extra=debug_event("runner_tunnel", phase="error", **_connection_attrs()),
             )
             if session is not None:
                 registry.deregister(runner_id, session)
@@ -798,6 +848,10 @@ async def _ping_loop(
                 elapsed,
                 extra=debug_event(
                     "runner_ping_timeout",
+                    runner_id=runner_id,
+                    connection_id=session.hello.connection_id,
+                    connection_age_s=round(time.time() - session.connected_at, 3),
+                    silent_s=round(elapsed, 3),
                     error_category=ErrorCategory.RUNNER.value,
                     error_impact=ErrorImpact.BLOCKING.value,
                     error_phase=ErrorPhase.UNKNOWN.value,

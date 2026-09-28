@@ -725,7 +725,7 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
       data-role="user"
       data-user-message-id={bubble.itemId}
       data-message-id={bubble.itemId}
-      className="max-w-[640px]"
+      className={cn("max-w-[640px]", bubble.pending && "animate-user-message-enter")}
     >
       <div className="ml-auto flex w-fit max-w-full flex-col items-end">
         {/* w-fit + ml-auto shrink-wrap the row so the author avatar sits

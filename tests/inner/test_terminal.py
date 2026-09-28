@@ -404,6 +404,24 @@ async def test_duplicate_exit_capture_preserves_good_snapshot(
         await asyncio.gather(primary, *([duplicate] if duplicate is not None else []))
 
 
+def test_client_interaction_within_reports_recency(tmp_path: Path) -> None:
+    """
+    No interaction ever reads False; a fresh stamp reads True only inside the window.
+    """
+    instance = TerminalInstance(
+        name="claude",
+        session_key="main",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path,
+        running=True,
+    )
+
+    assert not instance.client_interaction_within(60.0)
+    instance.note_client_interaction()
+    assert instance.client_interaction_within(60.0)
+    assert not instance.client_interaction_within(0.0)
+
+
 def test_tmux_gone_diagnostics_summarizes_available_signals(tmp_path: Path) -> None:
     """The exit-diagnostics summary folds in every signal it has."""
     instance = TerminalInstance(
@@ -3351,3 +3369,34 @@ def test_apply_utf8_locale_default_noop_on_windows(
     _apply_utf8_locale_default(env)
     assert "LC_ALL" not in env
     assert env["LANG"] == ""
+
+
+@pytest.mark.asyncio
+async def test_read_join_wrapped_asks_tmux_to_join_wrapped_rows(tmp_path: Path) -> None:
+    """
+    ``read(join_wrapped=True)`` captures with ``-J`` so a token wider than the
+    80-column pane (a sign-in address) reads back as one line; the default
+    read is unchanged.
+    """
+    instance = TerminalInstance(
+        name="runtime",
+        session_key="main",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path,
+        running=True,
+    )
+    calls: list[tuple[str, ...]] = []
+
+    async def _tmux_output(*args: str) -> str:
+        calls.append(args)
+        return "open https://signin.example.com/device?user_code=ABCDEFGH"
+
+    instance._tmux_output = _tmux_output  # type: ignore[method-assign]
+
+    plain = await instance.read()
+    joined = await instance.read(join_wrapped=True)
+
+    assert calls[0] == ("capture-pane", "-t", instance.tmux_target, "-p")
+    assert calls[1] == ("capture-pane", "-t", instance.tmux_target, "-p", "-J")
+    assert plain["screen"] == joined["screen"]
+    assert "https://signin.example.com/device?user_code=ABCDEFGH" in joined["screen"]

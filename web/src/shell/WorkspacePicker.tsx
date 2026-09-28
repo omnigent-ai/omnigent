@@ -1,17 +1,13 @@
 import {
   FolderDotIcon,
-  FolderIcon,
   FolderPlusIcon,
-  FileIcon,
   ArrowLeftIcon,
-  ChevronRightIcon,
   EyeIcon,
   EyeOffIcon,
   CheckIcon,
   XIcon,
   AlertTriangleIcon,
   SearchIcon,
-  GitBranchIcon,
 } from "lucide-react";
 import { type ReactNode, useEffect, useRef, useState } from "react";
 
@@ -26,6 +22,7 @@ import {
   WORKTREE_RADIO_SPACIOUS_ROW_CLASS,
   WorktreeRadioRow,
 } from "./WorktreeRadioRow";
+import { WorkspacePickerEntry } from "./WorkspacePickerEntry";
 
 /** True for Windows drive-letter paths such as `C:/Users/me` or `C:\\Users\\me`. */
 export function isWindowsDrivePath(path: string): boolean {
@@ -330,16 +327,18 @@ function PickerIconButton({
           }}
         >
           <span className="shrink-0">
-            <button
+            <Button
               type="button"
+              variant="ghost"
+              size="icon"
               onClick={onClick}
               disabled={disabled}
               aria-label={label}
-              className="block rounded-md p-1.5 text-muted-foreground transition-colors hover:bg-muted hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-30"
+              className="text-muted-foreground"
               data-testid={testId}
             >
               {icon}
-            </button>
+            </Button>
           </span>
         </TooltipTrigger>
         <TooltipContent side="bottom">{label}</TooltipContent>
@@ -353,7 +352,7 @@ interface WorkspacePickerProps {
   hostId: string | null;
   /**
    * Called with the current directory's absolute path when the user
-   * clicks "Use this folder". ``undefined`` hides that button.
+   * clicks "Confirm". ``undefined`` hides that button.
    */
   onSelect?: (path: string) => void;
   /**
@@ -404,11 +403,11 @@ interface WorkspacePickerProps {
  * controls, while a dedicated search row filters the current directory.
  * Clicking a folder navigates into it; files stay visible but disabled because
  * workspaces must be directories. Commit-style callers get the persistent
- * Cancel / "Use this folder" footer, while live ``onNavigate`` callers retain a
- * compact popover height and no commit actions.
+ * Cancel / Confirm footer. The picker always uses the canonical full-frame
+ * geometry; live ``onNavigate`` remains available only for primitive tests.
  *
  * @param hostId Host whose filesystem to browse.
- * @param onSelect Fired with the current directory on "Use this folder".
+ * @param onSelect Fired with the current directory on "Confirm".
  *   Omit to hide that button.
  * @param onClose Fired when the ✕ button is clicked.
  * @param onNavigate Fired with the current directory on every navigation,
@@ -702,19 +701,11 @@ export function WorkspacePicker({
 
   return (
     <div
-      className={cn(
-        "flex min-h-0 flex-col overflow-hidden border border-border bg-background",
-        hasCommitActions
-          ? "h-[min(520px,calc(100dvh-4rem))] w-[min(800px,calc(100vw-2rem))] max-h-full justify-self-center rounded-[20px] shadow-xl"
-          : "max-h-80 rounded-md",
-      )}
+      className="flex h-[min(600px,calc(100dvh-4rem))] max-h-full min-h-0 w-[min(800px,calc(100vw-2rem))] flex-col justify-self-center overflow-hidden rounded-[20px] border border-border bg-background shadow-xl"
       data-testid="workspace-picker"
     >
       <div
-        className={cn(
-          "flex min-h-14 shrink-0 items-center gap-1 border-b px-4 py-2",
-          hasCommitActions && "min-h-12 px-4 py-1",
-        )}
+        className="flex h-12 min-h-12 shrink-0 items-center gap-1 border-b px-3 py-0"
         data-testid="workspace-picker-header"
       >
         <PickerIconButton
@@ -733,10 +724,7 @@ export function WorkspacePicker({
             testId="workspace-picker-workspace"
           />
         )}
-        <div
-          className={cn("min-w-0 flex-1 px-2", showGitDialog && "px-3")}
-          data-testid="workspace-picker-breadcrumbs"
-        >
+        <div className="min-w-0 flex-1 px-1" data-testid="workspace-picker-breadcrumbs">
           {!pathEditing && (
             <div
               className={cn(
@@ -816,15 +804,13 @@ export function WorkspacePicker({
             data-testid="workspace-picker-path-input"
           />
         </div>
-        {showGitDialog && (
-          <PickerIconButton
-            label="New folder"
-            icon={<FolderPlusIcon className="size-4" />}
-            onClick={openNewFolder}
-            disabled={!canCreateFolder}
-            testId="workspace-picker-new-folder"
-          />
-        )}
+        <PickerIconButton
+          label="New folder"
+          icon={<FolderPlusIcon className="size-4" />}
+          onClick={openNewFolder}
+          disabled={!canCreateFolder}
+          testId="workspace-picker-new-folder"
+        />
         <PickerIconButton
           label={showHidden ? "Hide hidden files" : "Show hidden files"}
           icon={
@@ -857,21 +843,17 @@ export function WorkspacePicker({
       >
         <div className="flex min-h-0 min-w-0 flex-col">
           <div
-            className={cn(
-              "flex min-h-12 shrink-0 items-center gap-2 border-b px-4",
-              showGitDialog && "min-h-10 border-b-0 px-3 py-1",
-            )}
+            className="flex min-h-12 shrink-0 items-center gap-2 border-b-0 px-2 py-2"
+            data-testid="workspace-picker-search-row"
           >
             <div
-              className={cn(
-                "flex min-w-0 flex-1 items-center gap-2",
-                showGitDialog &&
-                  "h-8 rounded-lg border border-border bg-muted/45 px-2 shadow-sm focus-within:border-ring focus-within:ring-2 focus-within:ring-ring/25",
-              )}
+              className="flex h-8 min-w-0 flex-1 items-center gap-2 rounded-lg border border-input bg-transparent px-2.5 transition-colors focus-within:border-ring focus-within:ring-3 focus-within:ring-ring/50 dark:bg-input/30"
+              data-testid="workspace-picker-search-field"
             >
               <SearchIcon
-                className={cn("size-5 shrink-0 text-muted-foreground", showGitDialog && "size-4")}
+                className="size-4 shrink-0 text-muted-foreground"
                 aria-hidden
+                data-testid="workspace-picker-search-icon"
               />
               <input
                 type="search"
@@ -887,22 +869,10 @@ export function WorkspacePicker({
                 aria-label="Search folders and files"
                 autoComplete="off"
                 spellCheck={false}
-                className={cn(
-                  "min-w-0 flex-1 bg-transparent text-base text-foreground outline-none placeholder:text-muted-foreground",
-                  showGitDialog && "leading-[1.6]",
-                )}
+                className="min-w-0 flex-1 bg-transparent text-ui text-foreground outline-none placeholder:text-muted-foreground"
                 data-testid="workspace-picker-search-input"
               />
             </div>
-            {!showGitDialog && (
-              <PickerIconButton
-                label="New folder"
-                icon={<FolderPlusIcon className="size-4.5" />}
-                onClick={openNewFolder}
-                disabled={!canCreateFolder}
-                testId="workspace-picker-new-folder"
-              />
-            )}
           </div>
           {newFolderName !== null && (
             <div
@@ -988,7 +958,10 @@ export function WorkspacePicker({
             </div>
           )}
           <div
-            className={cn("min-h-0 flex-1 overflow-y-auto py-2", showGitDialog && "px-3 pt-0 pb-3")}
+            className={cn(
+              "min-h-0 flex-1 space-y-px overflow-y-auto px-2 py-2",
+              showGitDialog && "pt-0 pb-3",
+            )}
             aria-busy={navigationPending || undefined}
             data-testid="workspace-picker-listing"
           >
@@ -1014,45 +987,14 @@ export function WorkspacePicker({
               </div>
             )}
             {!navigationPending &&
-              entries.map((entry) => {
-                const isDir = entry.type === "directory";
-                return (
-                  <button
-                    key={entry.path}
-                    type="button"
-                    disabled={!isDir}
-                    // preventDefault keeps focus on the path input so a click while
-                    // a filter is typed doesn't blur → commit → re-sort the list out
-                    // from under the click. onClick still does the navigation (and
-                    // fires for keyboard activation, where mousedown doesn't).
-                    onMouseDown={(e) => e.preventDefault()}
-                    onClick={() => isDir && navigateTo(entry.path)}
-                    className={cn(
-                      "flex min-h-11 w-full items-center gap-2.5 px-5 py-2 text-left text-base transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring",
-                      showGitDialog && "min-h-[27px] gap-2 rounded-md px-2 py-[3px] leading-[1.6]",
-                      isDir
-                        ? "cursor-pointer text-foreground hover:bg-muted"
-                        : "cursor-not-allowed text-muted-foreground opacity-55",
-                    )}
-                    data-testid={`workspace-picker-entry-${entry.name}`}
-                  >
-                    {isDir ? (
-                      <FolderIcon
-                        className={cn(
-                          "size-5 shrink-0 text-muted-foreground",
-                          showGitDialog && "size-4",
-                        )}
-                      />
-                    ) : (
-                      <FileIcon className={cn("size-5 shrink-0", showGitDialog && "size-4")} />
-                    )}
-                    <span className="flex-1 truncate">{entry.name}</span>
-                    {isDir && (
-                      <ChevronRightIcon className="size-4 shrink-0 text-muted-foreground" />
-                    )}
-                  </button>
-                );
-              })}
+              entries.map((entry) => (
+                <WorkspacePickerEntry
+                  key={entry.path}
+                  entry={entry}
+                  onOpen={navigateTo}
+                  variant="compact"
+                />
+              ))}
             {!navigationPending && data?.truncated && (
               <div
                 className="px-5 py-2 text-sm text-muted-foreground"
@@ -1075,17 +1017,18 @@ export function WorkspacePicker({
             <div
               className={cn(
                 "flex min-h-12 shrink-0 items-center border-b px-4 text-base font-medium",
-                showGitDialog && "min-h-10 gap-2 border-b-0 px-4 font-normal leading-[1.6]",
+                showGitDialog &&
+                  "h-12 min-h-12 border-b-0 px-4 text-xs font-medium text-muted-foreground",
               )}
+              data-testid="workspace-picker-worktrees-label"
             >
-              {showGitDialog && <GitBranchIcon className="size-4 text-muted-foreground" />}
               Worktrees
             </div>
             <TooltipProvider>
               <div
                 className={cn(
                   "min-h-0 flex-1 space-y-1 overflow-y-auto p-3",
-                  showGitDialog && "space-y-0.5 px-3 pt-0 pb-3",
+                  showGitDialog && "space-y-px px-2 pt-0 pb-3",
                 )}
                 role="radiogroup"
                 aria-label="Choose a worktree"
@@ -1153,10 +1096,7 @@ export function WorkspacePicker({
       </div>
       {hasCommitActions && (
         <div
-          className={cn(
-            "flex min-h-16 shrink-0 items-center justify-end gap-2 border-t px-5 py-3",
-            hasCommitActions && "min-h-16 px-5 py-2",
-          )}
+          className="flex min-h-16 shrink-0 items-center justify-end gap-2 border-t px-5 py-2"
           data-testid="workspace-picker-footer"
         >
           {onClose && (
@@ -1182,11 +1122,11 @@ export function WorkspacePicker({
                 Boolean(error)
               }
               onClick={handleSelect}
-              title={`Use this folder: ${basename(selectedWorktreePath ?? currentAbsolute)}`}
+              title={`Confirm folder: ${basename(selectedWorktreePath ?? currentAbsolute)}`}
               className="shrink-0 rounded-lg px-3 font-normal"
               data-testid="workspace-picker-select"
             >
-              Use this folder
+              Confirm
             </Button>
           )}
         </div>

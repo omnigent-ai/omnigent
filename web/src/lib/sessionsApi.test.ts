@@ -13,6 +13,7 @@ import {
   bindOnlyOnlineRunner,
   createBundledSession,
   createSession,
+  createSideChat,
   exportSessionTranscript,
   fetchSessionItemsPage,
   forkSession,
@@ -534,6 +535,117 @@ describe("forkSession", () => {
   it("surfaces a non-ok response as a thrown error (e.g. 403 no access)", async () => {
     fetchMock.mockResolvedValueOnce(mockJsonResponse({}, { ok: false, status: 403 }));
     await expect(forkSession("conv_src")).rejects.toThrow(/403/);
+  });
+});
+
+describe("createSideChat", () => {
+  const source = {
+    id: "conv_source",
+    agent_id: "agent_source",
+    status: "idle",
+    created_at: 1704067200,
+    host_id: "host_mac",
+    workspace: "/Users/alice/project",
+    runner_id: "runner_source",
+    runner_online: true,
+    host_online: true,
+  };
+  const fork = {
+    id: "conv_side",
+    agent_id: "agent_fork",
+    status: "idle",
+    created_at: 1704067200,
+  };
+
+  it.each(["worktree-from-another-machine", "main", null])(
+    "uses the current workspace without requiring saved branch %s",
+    async (gitBranch) => {
+      fetchMock
+        .mockResolvedValueOnce(mockJsonResponse({ ...source, git_branch: gitBranch }))
+        .mockResolvedValueOnce(mockJsonResponse(fork))
+        .mockResolvedValueOnce(mockJsonResponse({ runner_id: "runner_side" }));
+
+      await expect(createSideChat(source.id)).resolves.toEqual({ childSessionId: fork.id });
+
+      const [forkUrl, forkInit] = fetchMock.mock.calls[1] as [string, RequestInit];
+      expect(forkUrl).toBe(`/v1/sessions/${source.id}/fork`);
+      expect(JSON.parse(forkInit.body as string)).toEqual({ title: "Side chat", side_chat: true });
+      const [launchUrl, launchInit] = fetchMock.mock.calls[2] as [string, RequestInit];
+      expect(launchUrl).toBe("/v1/hosts/host_mac/runners");
+      expect(JSON.parse(launchInit.body as string)).toEqual({
+        session_id: fork.id,
+        workspace: source.workspace,
+      });
+      expect(fetchMock).toHaveBeenCalledTimes(3);
+    },
+  );
+
+  it.each([{ host_id: null, workspace: null }, { host_online: false }])(
+    "uses the parent's online runner when its host cannot launch (%j)",
+    async (placement) => {
+      fetchMock
+        .mockResolvedValueOnce(mockJsonResponse({ ...source, ...placement }))
+        .mockResolvedValueOnce(mockJsonResponse(fork))
+        .mockResolvedValueOnce(mockJsonResponse({ ...fork, runner_id: source.runner_id }));
+
+      await expect(createSideChat(source.id)).resolves.toEqual({ childSessionId: fork.id });
+
+      const [url, init] = fetchMock.mock.calls[2] as [string, RequestInit];
+      expect(url).toBe(`/v1/sessions/${fork.id}`);
+      expect(init.method).toBe("PATCH");
+      expect(JSON.parse(init.body as string)).toEqual({ runner_id: source.runner_id });
+      expect(fetchMock).toHaveBeenCalledTimes(3);
+    },
+  );
+
+  it("allows an in-process session to use normal dispatch without a host or runner id", async () => {
+    fetchMock
+      .mockResolvedValueOnce(
+        mockJsonResponse({ ...source, host_id: null, workspace: null, runner_id: null }),
+      )
+      .mockResolvedValueOnce(mockJsonResponse(fork));
+
+    await expect(createSideChat(source.id)).resolves.toEqual({ childSessionId: fork.id });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("wakes a resumable host and refreshes its placement before starting a side chat", async () => {
+    fetchMock
+      .mockResolvedValueOnce(
+        mockJsonResponse({
+          ...source,
+          host_resumable: true,
+          host_online: false,
+          runner_online: false,
+        }),
+      )
+      .mockResolvedValueOnce(mockJsonResponse({ recovered: true, recovery: "runner_relaunched" }))
+      .mockResolvedValueOnce(
+        mockJsonResponse({ ...source, host_id: "host_awake", workspace: "/resumed/workspace" }),
+      )
+      .mockResolvedValueOnce(mockJsonResponse(fork))
+      .mockResolvedValueOnce(mockJsonResponse({ runner_id: "runner_side" }));
+
+    await expect(createSideChat(source.id)).resolves.toEqual({ childSessionId: fork.id });
+
+    const [retryUrl, retryInit] = fetchMock.mock.calls[1] as [string, RequestInit];
+    expect(retryUrl).toBe(`/v1/sessions/${source.id}/events`);
+    expect(JSON.parse(retryInit.body as string)).toMatchObject({ type: "retry_session" });
+    const [launchUrl, launchInit] = fetchMock.mock.calls[4] as [string, RequestInit];
+    expect(launchUrl).toBe("/v1/hosts/host_awake/runners");
+    expect(JSON.parse(launchInit.body as string)).toEqual({
+      session_id: fork.id,
+      workspace: "/resumed/workspace",
+    });
+  });
+
+  it("does not create an orphan fork when neither the host nor runner is available", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockJsonResponse({ ...source, host_online: false, runner_online: false }),
+    );
+
+    await expect(createSideChat(source.id)).rejects.toThrow("This session is disconnected.");
+    expect(fetchMock).toHaveBeenCalledOnce();
   });
 });
 

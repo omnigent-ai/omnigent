@@ -145,6 +145,25 @@ describe("MessageResponse", () => {
 });
 
 describe("MessageResponse code-block copy", () => {
+  it("wraps code by default and exposes the wrap state through the toggle", async () => {
+    const { container } = render(
+      <MessageResponse>{"```ts\nconst value = 'horizontalScrolling';\n```"}</MessageResponse>,
+    );
+
+    const toggle = await screen.findByRole("button", { name: "Toggle word wrap" });
+    const block = container.querySelector(".chat-code-block");
+    expect(toggle).toHaveAttribute("aria-pressed", "true");
+    expect(block).toHaveClass("chat-code-wrap");
+
+    fireEvent.click(toggle);
+    expect(toggle).toHaveAttribute("aria-pressed", "false");
+    expect(block).not.toHaveClass("chat-code-wrap");
+
+    fireEvent.click(toggle);
+    expect(toggle).toHaveAttribute("aria-pressed", "true");
+    expect(block).toHaveClass("chat-code-wrap");
+  });
+
   it("copies the exact fenced code text through the fallback path", async () => {
     const copiedText: string[] = [];
     Object.defineProperty(Navigator.prototype, "clipboard", {

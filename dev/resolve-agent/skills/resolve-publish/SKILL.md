@@ -107,8 +107,17 @@ Once the set is genuinely green:
    to confirm the staged set is only the fix + test. If a recording or handoff
    file already landed in an earlier commit on this branch, remove it (e.g.
    `git rm --cached`) so it never reaches the PR.
+   Read the staged diff for redundant comments and docstrings, including tests
+   carried over from repro. Keep only short explanations of non-obvious
+   constraints; move investigation history to the handoff. If a safety
+   explanation runs long, consider clearer code or a focused docstring first.
    Refresh the shared impact assessment against the committed deliverable. If a
    hook changed tested files, rerun their affected checks before the handoff.
+   After committing, if the target checkout has the advisory checker, run
+   `python .github/scripts/pr-template/hygiene.py --base origin/main` (using the
+   target's default branch). Review any long added comment blocks and trim only
+   redundant text. If the checker is unavailable, inspect the diff manually;
+   the workflow-owned publisher runs its own copy before creating a PR.
 2. **If the input has `skip_push: true`, stop here** — the fix is committed
    locally; do **not** push and do **not** open a PR. Report the branch name in
    your output (`pushed_branch`) so a human can inspect, push, and PR it. The
@@ -140,10 +149,12 @@ Once the set is genuinely green:
      instructions for optional sections such as Changelog. Do not replace the
      standard structure with custom `Root Cause`, `Validation`, or `Issues`
      sections.
-   - In **Summary**, lead with the user-visible problem and result, then explain
-     the cause and implementation in 1–3 short bullets or paragraphs. Use
-     complete sentences. For a non-trivial change, include the template's ELI5
-     explanation and a small diagram.
+   - In **Summary**, start non-trivial changes with a 1–2 sentence ELI5 of the
+     user-visible problem and result, inline rather than in a separate section.
+     Then explain the cause and implementation in 1–3 short bullets or
+     paragraphs. Use complete sentences and plain language. Add a small diagram
+     when a relationship or sequence is hard to follow in prose. Never include
+     placeholder diagrams or empty sections.
    - In **Test Plan**, group the proof into short, scannable bullets. Name the
      command or test, what failed before the fix, and what passes now. Do not
      paste `facets`, `test_transition`, other handoff fields, or a long comma-
@@ -151,9 +162,13 @@ Once the set is genuinely green:
    - Keep workflow/session URLs and machine-oriented publication details out of
      the narrative. The internal workflow links those separately. Never paste
      the JSON handoff into the PR description.
+   - Aim for fewer than 600 visible words, including the template. This is a
+     review prompt, not a hard cap: retain necessary safety or migration details,
+     but leave investigation history and repeated proof in the handoff.
    - Read the finished Markdown once as rendered prose. Split run-on sentences,
      expand unexplained internal shorthand, and remove repeated evidence before
-     opening the PR.
+     opening the PR. Compare Test Plan and Demo claims with the diff, test output,
+     and available footage.
 
    If the target repository provides the template validator, validate the body
    locally before publishing it:
@@ -184,6 +199,20 @@ Once the set is genuinely green:
    was blocked, explain why and include the available evidence. When the bug
    is a Linear ticket and a Linear key is available, also attach both recordings
    to the ticket (GraphQL `fileUpload` + `attachmentCreate`).
+
+   If the target checkout has `.github/scripts/pr-template/hygiene.py`, run it
+   on the committed diff and finished body before publication:
+
+   ```bash
+   python .github/scripts/pr-template/hygiene.py \
+     --base origin/main --body-file .omnigent/pr-body.md
+   ```
+
+   Use the target's default branch when it is not `main`. Review warnings about
+   long comments, body length, or repeated prose; trim redundant text while
+   keeping necessary safety explanations. Warnings are advisory and do not
+   replace template validation. If the checker is unavailable, review the body
+   manually; the workflow-owned publisher runs its own copy before PR creation.
 5. **Emit an interim handoff now — the moment the PR is open.** As soon as
    `gh pr create` succeeds, print the full handoff json block (the Output schema)
    with `pr_url` set and `outcome` at its current best assessment, *before* you

@@ -298,6 +298,9 @@ def create_host_tunnel_router(
                 ws,
                 frame,
                 owner=tunnel_owner,
+                # A resolved launch token is proof this is a server-provisioned
+                # sandbox, not a user machine reconnecting on a managed host id.
+                registered_with_managed_token=managed_token is not None,
             )
             # Delivered on the handshake, never persisted: a replica that just
             # started learns the host's gateway backing here, so a server

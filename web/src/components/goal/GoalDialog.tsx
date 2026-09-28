@@ -324,7 +324,7 @@ function GoalActions({
         loading={clearing}
         data-testid="goal-clear"
       >
-        Clear
+        Delete goal
       </Button>
       {showPause && (
         <Button

@@ -74,7 +74,7 @@ from omnigent.server.background_session_titles import (
     BackgroundTitleRequest,
 )
 from omnigent.server.bundles import validate_agent_bundle
-from omnigent.server.creation_logging import creation_metadata, session_created
+from omnigent.server.creation_logging import creation_metadata, creation_stage, session_created
 from omnigent.server.host_registry import HostRegistry, RunnerExitReports
 from omnigent.server.permissions import check_session_access
 from omnigent.server.routes._auth_helpers import (
@@ -131,6 +131,7 @@ from omnigent.server.routes._sessions.helpers import (
     _filesystem_attachment_in_history,
     _forward_session_change_to_runner,
     _get_runner_client,
+    _grant_default_public,
     _invalidate_runner_backed_snapshot_state,
     _multipart_missing_detail,
     _native_coding_agent_for_agent,
@@ -484,6 +485,7 @@ def register_core_routes(
         host_id: str,
         workspace: str | None,
         harness: str | None,
+        conversation: Conversation | None = None,
     ) -> tuple[str, bool] | None:
         """
         Bind a just-created session to a caller-supplied host and launch.
@@ -517,6 +519,9 @@ def register_core_routes(
             requires it with ``host_id``) and raises.
         :param harness: Canonical harness for the host-side
             configuration check, or ``None`` to skip it.
+        :param conversation: Optional authoritative row already returned by
+            session creation, used to avoid re-reading it during launch
+            authorization. Its id must match ``session_id``.
         :returns: ``(runner_id, launch_failed)`` after the bind, or
             ``None`` when the server has no host registry/store wired
             (minimal test wirings — nothing was attempted).
@@ -535,16 +540,18 @@ def register_core_routes(
         from omnigent.runner.identity import token_bound_runner_id
         from omnigent.server.routes._host_launch import resolve_host_launch
 
-        target = await asyncio.to_thread(
-            resolve_host_launch,
-            user_id=user_id,
-            host_id=host_id,
-            session_id=session_id,
-            host_store=host_store_inst,
-            host_registry=host_registry,
-            conversation_store=conversation_store,
-            permission_store=permission_store,
-        )
+        with creation_stage("create_acl_ms"):
+            target = await asyncio.to_thread(
+                resolve_host_launch,
+                user_id=user_id,
+                host_id=host_id,
+                session_id=session_id,
+                host_store=host_store_inst,
+                host_registry=host_registry,
+                conversation_store=conversation_store,
+                permission_store=permission_store,
+                conversation=conversation,
+            )
         conn = target.conn
         await host_registry.admit_launch(conn, session_id)
         binding_token = secrets.token_urlsafe(32)
@@ -713,7 +720,7 @@ def register_core_routes(
             raise HTTPException(status_code=422, detail=exc.errors(include_context=False)) from exc
 
         creation_metadata(parent_session_id=body.parent_session_id, host_type=body.host_type)
-        resp = await _create_session_from_existing_agent(
+        resp, conv = await _create_session_from_existing_agent(
             conversation_store,
             agent_store,
             runner_router,
@@ -732,7 +739,6 @@ def register_core_routes(
         # the spec and cache sub_agent_name before the first turn.
         # Without this, the runner doesn't know this session exists
         # until the first forwarded event.
-        conv = conversation_store.get_conversation(resp.id)
         # Mark the terminal spin-up flag at creation — the earliest
         # possible point — for a host-launched terminal-first session
         # (claude-native / codex-native). The runner's own pending emit
@@ -752,7 +758,11 @@ def register_core_routes(
         )
         if _terminal_first_create:
             _publish_terminal_pending(resp.id, True)
-        _rc = await _get_runner_client(resp.id, runner_router)
+        _rc = await _get_runner_client(
+            resp.id,
+            runner_router,
+            conversation=conv,
+        )
         if _rc is not None and conv is not None:
             # Send the full session-init envelope (not the legacy id-only body)
             # so the runner seeds the first spawn from current session state —
@@ -802,9 +812,16 @@ def register_core_routes(
         # POST /v1/hosts/{host_id}/runners via resolve_host_launch)
         # sees the grant.
         if permission_store is not None and user_id is not None:
-            await asyncio.to_thread(permission_store.ensure_user, user_id)
-            await asyncio.to_thread(permission_store.grant, user_id, resp.id, LEVEL_OWNER)
-            resp.permission_level = await _get_permission_level(user_id, resp.id, permission_store)
+            with creation_stage("create_identity_ms"):
+                await asyncio.to_thread(permission_store.ensure_user, user_id)
+            with creation_stage("create_acl_ms"):
+                grant = await asyncio.to_thread(
+                    permission_store.grant,
+                    user_id,
+                    resp.id,
+                    LEVEL_OWNER,
+                )
+            resp.permission_level = grant.level
         # Push the new session to this user's other open tabs (see the
         # multipart path above for the rationale).
         _announce_session_added(user_id, resp.id)
@@ -844,6 +861,7 @@ def register_core_routes(
                 workspace=resp.workspace,
                 # Already canonical (see _resolve_harness).
                 harness=resp.harness,
+                conversation=conv,
             )
             if launched is not None:
                 runner_id, launch_failed = launched
@@ -856,6 +874,18 @@ def register_core_routes(
                 resp.runner_id = runner_id
                 resp.host_id = launch_host_id
 
+        # Default-public grant only once every launch step has been accepted, so a
+        # rejected request never leaves a public session behind. Sub-agent
+        # children follow their parent's grants instead.
+        if user_id is not None and body.parent_session_id is None:
+            await _grant_default_public(
+                request.app.state,
+                permission_store,
+                resp.id,
+                managed=body.host_type == "managed",
+                workspace=conv.workspace if conv is not None else None,
+                host_id=launch_host_id,
+            )
         add_audit_attrs(session_id=resp.id, agent=resp.agent_id)
         return resp
 
@@ -970,18 +1000,19 @@ def register_core_routes(
             user_id,
             conversation_store,
         )
-        result = await asyncio.to_thread(
-            _create_session_from_bundle,
-            conversation_store,
-            artifact_store,
-            parsed_metadata,
-            bundle_bytes,
-            inherited_runner_id,
-            spec,
-            inference_snapshot,
-            inference_model,
-            created_by=user_id,
-        )
+        with creation_stage("create_persistence_ms"):
+            result = await asyncio.to_thread(
+                _create_session_from_bundle,
+                conversation_store,
+                artifact_store,
+                parsed_metadata,
+                bundle_bytes,
+                inherited_runner_id,
+                spec,
+                inference_snapshot,
+                inference_model,
+                created_by=user_id,
+            )
         session_created(result.session_id, inherited_runner_id)
         # Top-level creates (no inherited runner) skip the notify —
         # their runner registers itself later.
@@ -997,10 +1028,12 @@ def register_core_routes(
         # the just-persisted session unowned and thus invisible to the
         # caller. Push to the caller's other open tabs, too.
         if permission_store is not None and user_id is not None:
-            await asyncio.to_thread(permission_store.ensure_user, user_id)
-            await asyncio.to_thread(
-                permission_store.grant, user_id, result.session_id, LEVEL_OWNER
-            )
+            with creation_stage("create_identity_ms"):
+                await asyncio.to_thread(permission_store.ensure_user, user_id)
+            with creation_stage("create_acl_ms"):
+                await asyncio.to_thread(
+                    permission_store.grant, user_id, result.session_id, LEVEL_OWNER
+                )
         _announce_session_added(user_id, result.session_id)
         # Managed bundle create: provision a sandbox host for the
         # just-uploaded session-scoped agent (same background launch as
@@ -1039,6 +1072,18 @@ def register_core_routes(
                 host_id=parsed_metadata.host_id,
                 workspace=parsed_metadata.workspace,
                 harness=canonicalize_harness(raw_harness) or raw_harness,
+            )
+        # Default-public grant only after the launch steps were accepted (see the
+        # JSON path). Sub-agent children follow their parent's grants, whether or
+        # not they inherited its runner.
+        if user_id is not None and parsed_metadata.parent_session_id is None:
+            await _grant_default_public(
+                request.app.state,
+                permission_store,
+                result.session_id,
+                managed=parsed_metadata.host_type == "managed",
+                workspace=parsed_metadata.workspace,
+                host_id=parsed_metadata.host_id,
             )
         return result
 
@@ -2926,7 +2971,7 @@ def register_core_routes(
 
         Deep-copies the source session's conversation items and
         clones the agent into a new session. When ``body.agent_id``
-        is set, the fork binds that built-in agent instead of the
+        is set, the fork binds that agent instead of the
         source's — switching harness (e.g. Claude-SDK → Claude Code,
         or Claude → Codex). The source's model settings carry over
         only within the same provider family; a same-family native
@@ -2973,9 +3018,10 @@ def register_core_routes(
         :param body: The validated :class:`SessionForkRequest`.
         :returns: A :class:`SessionResponse` describing the newly
             created fork (status ``"idle"``).
-        :raises OmnigentError: 404 if *source_id* does not exist
-            or ``body.agent_id`` is not a bindable built-in agent;
-            403 if the caller lacks read access; 400 if the source
+        :raises OmnigentError: 404 if *source_id* does not exist or
+            ``body.agent_id`` names no agent; 403/404 if the caller
+            lacks read access on the source, or on the session that
+            owns a session-scoped ``body.agent_id``; 400 if the source
             has no agent binding, ``body.up_to_response_id`` names
             no response in the source session, or a managed fork asks
             for a sandbox this server has not configured.
@@ -3025,21 +3071,23 @@ def register_core_routes(
 
         # By default the fork clones the source's agent (same harness). When
         # ``body.agent_id`` names a different agent, the fork SWITCHES to it
-        # — e.g. fork a Claude-SDK session into Claude Code. Only built-in
-        # agents (``session_id IS NULL``) are bindable: a session-scoped
-        # agent belongs to one conversation (possibly another user's) and
-        # must never be cloned across sessions.
+        # — e.g. fork a Claude-SDK session into Claude Code. A session-scoped
+        # target is bindable if the caller can read the session that owns it.
         base_agent = source_agent
         target_agent_id = body.agent_id
         switching_agent = target_agent_id is not None and target_agent_id != source.agent_id
         if target_agent_id is not None and switching_agent:
-            target_agent = await asyncio.to_thread(agent_store.get, target_agent_id)
-            if target_agent is None or target_agent.session_id is not None:
-                raise OmnigentError(
-                    f"Agent not found or not bindable: {target_agent_id!r}",
-                    code=ErrorCode.NOT_FOUND,
-                )
-            base_agent = target_agent
+            from omnigent.server.routes._session_create_validation import (
+                validate_session_agent,
+            )
+
+            base_agent = await validate_session_agent(
+                user_id=user_id,
+                agent_id=target_agent_id,
+                agent_store=agent_store,
+                permission_store=permission_store,
+                conversation_store=conversation_store,
+            )
 
         if source.inference_snapshot is not None and switching_agent:
             from omnigent.harness_aliases import canonicalize_harness
@@ -3491,6 +3539,18 @@ def register_core_routes(
                 user_id=user_id,
                 sandbox_provider=body.sandbox_provider,
                 workspaces=fork_workspaces,
+            )
+        # Default-public grant only after the managed launch was accepted (see
+        # the create paths). A side chat is a private scratch fork of the
+        # caller's own view.
+        if user_id is not None and not body.side_chat:
+            await _grant_default_public(
+                request.app.state,
+                permission_store,
+                new_conv.id,
+                managed=body.host_type == "managed",
+                workspace=new_conv.workspace,
+                host_id=new_conv.host_id,
             )
 
         # Bound the response like the GET-session snapshot: newest item page,

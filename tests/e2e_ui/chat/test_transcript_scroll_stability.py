@@ -1,22 +1,4 @@
-"""E2E: scrolling back through history must not fight the reader.
-
-A history page prepends above what the reader is looking at. The transcript
-is virtualized — its rows are absolutely positioned — so the browser's native
-scroll anchoring cannot hold the read position across a prepend; the transcript
-holds it itself, writing the scroll offset through stick-to-bottom so the write
-is not mistaken for a reader gesture. What must be true, then, is not that
-nothing writes ``scrollTop`` but that nothing the reader sees moves except by
-the reader's own scrolling.
-
-None of that is visible below a browser. jsdom has no layout, no scroll
-anchoring and no compositor, and the scrollbar's thumb has no size there at all.
-
-So these tests drive a real paginated transcript: park at the bottom, escape the
-stick-to-bottom lock, then wheel up far enough to pull in older pages while
-watching, per painted frame, whether any mounted row moves on screen by more
-than the reader's own scrolling accounts for, and whether the scrollbar thumb
-behaves as the visible share of the loaded document.
-"""
+"""Full-stack coverage reserved for pagination and live streaming."""
 
 from __future__ import annotations
 
@@ -29,16 +11,9 @@ from playwright.sync_api import Page, expect
 
 from tests.e2e_ui.conftest import _server_state, configure_mock_llm
 
-# Each turn is 2 items, so this must stay comfortably past
-# INITIAL_WINDOW_ITEMS (100) — otherwise the open loads the whole transcript,
-# nothing is left to page, and the scroll-up this test watches never happens.
 _TURNS = 80
 _NEWEST_REPLY = f"reply number {_TURNS - 1}"
-
 _VIEWPORT = {"width": 1280, "height": 480}
-
-# Park at the bottom and tag the scroller: the tallest scrollable descendant
-# of the log region, same shape the other transcript tests use.
 _TAG_SCROLLER = """
 () => {
   const log = document.querySelector('[role="log"]');
@@ -55,9 +30,6 @@ _TAG_SCROLLER = """
 }
 """
 
-# Installed only after the reader has already scrolled up, so the
-# stick-to-bottom lock is released. Every programmatic scroll write is logged
-# with the offset it produced, so a frame's motion can be attributed.
 _WATCH = """
 () => {
   const el = document.querySelector('[data-pw-scroller]');
@@ -65,16 +37,11 @@ _WATCH = """
   window.__writes = [];
   window.__thumbHeights = [];
   const log = (from, to) => window.__writes.push([
-    performance.now(), Math.round(from), Math.round(to), Math.round(desc.get.call(el)),
-  ]);
+    performance.now(), Math.round(from), Math.round(to), Math.round(desc.get.call(el))]);
   Object.defineProperty(el, 'scrollTop', {
     configurable: true,
     get() { return desc.get.call(this); },
-    set(v) {
-      const from = desc.get.call(this);
-      desc.set.call(this, v);
-      log(from, v);
-    },
+    set(v) { const from = desc.get.call(this); desc.set.call(this, v); log(from, v); },
   });
   const origScrollTo = el.scrollTo.bind(el);
   el.scrollTo = (...args) => {
@@ -87,8 +54,7 @@ _WATCH = """
     const thumb = document.querySelector('[data-testid="transcript-scrollbar-thumb"]');
     if (thumb) {
       const h = Math.round(thumb.getBoundingClientRect().height);
-      const last = window.__thumbHeights[window.__thumbHeights.length - 1];
-      if (last !== h) window.__thumbHeights.push(h);
+      if (window.__thumbHeights.at(-1) !== h) window.__thumbHeights.push(h);
     }
     requestAnimationFrame(sample);
   };
@@ -96,22 +62,17 @@ _WATCH = """
 }
 """
 
-# Per painted frame: every mounted row's on-screen top by key, plus scrollTop,
-# so a frame's scroll delta can be split into the reader's part and the code's.
 _TRACK_ROWS = """
 () => {
   const el = document.querySelector('[data-pw-scroller]');
   window.__rowSamples = [];
   const sample = () => {
     const rows = {};
-    for (const r of el.querySelectorAll('[data-index]')) {
-      rows[r.getAttribute('data-bubble-key')] = Math.round(r.getBoundingClientRect().top);
-    }
+    for (const row of el.querySelectorAll('[data-index]'))
+      rows[row.getAttribute('data-bubble-key')] = Math.round(row.getBoundingClientRect().top);
     window.__rowSamples.push([performance.now(), Math.round(el.scrollTop), rows]);
   };
   const tick = () => {
-    // Observe after the application's layout observers, before this frame paints.
-    // A timer can instead sample a later React commit before its layout settles.
     const observer = new ResizeObserver(() => { sample(); observer.disconnect(); });
     observer.observe(el);
     requestAnimationFrame(tick);
@@ -123,29 +84,17 @@ _TRACK_ROWS = """
 _READING = """
 () => {
   const el = document.querySelector('[data-pw-scroller]');
-  return {
-  writes: window.__writes,
-  rowSamples: window.__rowSamples,
-  thumbHeights: window.__thumbHeights,
-  trackHeight: document.querySelector('[data-testid="transcript-scrollbar"]')
-    .getBoundingClientRect().height,
-  scrollHeight: el.scrollHeight,
-  clientHeight: el.clientHeight,
-  rendered: document.querySelectorAll('[data-user-message-id]').length,
-  };
+  return { writes: window.__writes, rowSamples: window.__rowSamples,
+    thumbHeights: window.__thumbHeights,
+    trackHeight: document.querySelector('[data-testid="transcript-scrollbar"]')
+      .getBoundingClientRect().height,
+    scrollHeight: el.scrollHeight, clientHeight: el.clientHeight };
 }
 """
 
 
 def _seed_turns(session_id: str) -> None:
-    """Write *_TURNS* committed exchanges straight into the store.
-
-    Bypasses the runner and the model the same way
-    :func:`tests.e2e_ui.conftest.seed_committed_turn` does — this test is about
-    scrolling a settled transcript, not about producing one.
-
-    :param session_id: Session to append to, e.g. ``"conv_abc123"``.
-    """
+    """Seed long settled history for the retained streaming integration test."""
     from omnigent.entities import MessageData, NewConversationItem
     from omnigent.stores.conversation_store.sqlalchemy_store import (
         SqlAlchemyConversationStore,
@@ -154,50 +103,39 @@ def _seed_turns(session_id: str) -> None:
     items: list[NewConversationItem] = []
     for turn in range(_TURNS):
         response_id = f"resp_scroll_{turn:03d}"
-        items.append(
-            NewConversationItem(
-                type="message",
-                response_id=response_id,
-                data=MessageData(
-                    role="user",
-                    content=[{"type": "input_text", "text": f"prompt number {turn}"}],
+        items.extend(
+            [
+                NewConversationItem(
+                    type="message",
+                    response_id=response_id,
+                    data=MessageData(
+                        role="user",
+                        content=[{"type": "input_text", "text": f"prompt number {turn}"}],
+                    ),
                 ),
-            )
-        )
-        items.append(
-            NewConversationItem(
-                type="message",
-                response_id=response_id,
-                data=MessageData(
-                    role="assistant",
-                    # Several lines so a handful of turns overflow the short
-                    # viewport and the wheel has somewhere to travel.
-                    content=[
-                        {
-                            "type": "output_text",
-                            "text": f"reply number {turn}\n\n"
-                            + "\n\n".join(f"detail line {turn}.{line}" for line in range(6)),
-                        }
-                    ],
-                    agent="hello_world",
+                NewConversationItem(
+                    type="message",
+                    response_id=response_id,
+                    data=MessageData(
+                        role="assistant",
+                        content=[
+                            {
+                                "type": "output_text",
+                                "text": f"reply number {turn}\n\n"
+                                + "\n\n".join(f"detail line {turn}.{line}" for line in range(6)),
+                            }
+                        ],
+                        agent="hello_world",
+                    ),
                 ),
-            )
+            ]
         )
     SqlAlchemyConversationStore(str(_server_state["database_uri"])).append(session_id, items)
 
 
 def _row_moves(
-    samples: list[list[Any]],
-    writers: list[list[float]],
-    since: float,
+    samples: list[list[Any]], writers: list[list[float]], since: float
 ) -> list[tuple[float, int]]:
-    """On-screen moves of the mounted rows after *since* that the reader did not make.
-
-    Per painted frame, the scroll delta minus the code's own writes is the
-    reader's scrolling, which moves every row by the same amount the other way.
-    The median leftover across rows present in both frames is content shifting
-    under the reader.
-    """
     moves: list[tuple[float, int]] = []
     for (t0, st0, rows0), (t1, st1, rows1) in pairwise(samples):
         if t1 < since:
@@ -205,13 +143,14 @@ def _row_moves(
         common = [key for key in rows0 if key in rows1]
         if not common:
             continue
-        programmatic = sum(int(w[3]) - int(w[1]) for w in writers if t0 < w[0] <= t1)
+        programmatic = sum(
+            int(write[3]) - int(write[1]) for write in writers if t0 < write[0] <= t1
+        )
         reader = (st1 - st0) - programmatic
         leftovers = sorted((rows1[key] - rows0[key]) + reader for key in common)
         unexplained = leftovers[len(leftovers) // 2]
-        if abs(unexplained) <= 4:
-            continue
-        moves.append((t1, unexplained))
+        if abs(unexplained) > 4:
+            moves.append((t1, unexplained))
     return moves
 
 
@@ -219,32 +158,25 @@ def test_scrolling_back_through_history_never_moves_the_offset(
     page: Page,
     seeded_session: tuple[str, str],
 ) -> None:
-    """Paging older text turns moves nothing on screen, and the thumb only shrinks as they land."""
+    """Paged history holds the reader and sizes the thumb to the loaded share."""
     base_url, session_id = seeded_session
     _seed_turns(session_id)
     page_fetches: list[str] = []
-    page.on("request", lambda r: page_fetches.append(r.url) if "after=" in r.url else None)
-
+    page.on(
+        "request",
+        lambda request: page_fetches.append(request.url) if "after=" in request.url else None,
+    )
     page.set_viewport_size(_VIEWPORT)
     page.goto(f"{base_url}/c/{session_id}")
     expect(page.get_by_text(_NEWEST_REPLY).first).to_be_visible(timeout=30_000)
-
     assert page.evaluate(_TAG_SCROLLER), "transcript did not overflow; seed more turns"
     page.wait_for_timeout(500)
-
-    # Break the bottom lock first, so what we watch afterwards is only the
-    # history path.
     page.mouse.move(_VIEWPORT["width"] // 2, _VIEWPORT["height"] // 2)
     page.mouse.wheel(0, -400)
     page.wait_for_timeout(400)
-
     page.evaluate(_WATCH)
     page.evaluate(_TRACK_ROWS)
-    t_start = page.evaluate("() => performance.now()")
-
-    # Wheel up in bursts, giving each fetch room to land mid-scroll — the
-    # moment the old correction fired. The transcript is virtualized, so the
-    # count of mounted rows says nothing about paging; the requests do.
+    started = page.evaluate("() => performance.now()")
     for _ in range(40):
         for _ in range(10):
             page.mouse.wheel(0, -240)
@@ -252,22 +184,10 @@ def test_scrolling_back_through_history_never_moves_the_offset(
         page.wait_for_timeout(250)
         if len(page_fetches) >= 2:
             break
-
     page.wait_for_timeout(1500)
     reading = page.evaluate(_READING)
-
-    # The scroll must actually have pulled in older history, or the rest of
-    # this proves nothing.
     assert len(page_fetches) >= 2, page_fetches
-
-    # The point of the change: whatever holds the read position across a
-    # prepend, nothing the reader sees moves except by the reader's own
-    # scrolling — pages landing mid-flick included.
-    moves = _row_moves(reading["rowSamples"], reading["writes"], t_start)
-    assert moves == [], (moves, reading["writes"][:10])
-
-    # The thumb is the visible share of the loaded document: it only shrinks as
-    # pages lengthen the document, and ends up sized to what is loaded now.
+    assert _row_moves(reading["rowSamples"], reading["writes"], started) == []
     heights = reading["thumbHeights"]
     assert heights == sorted(heights, reverse=True), reading
     expected = max(

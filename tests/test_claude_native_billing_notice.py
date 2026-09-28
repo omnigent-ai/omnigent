@@ -63,7 +63,7 @@ def _terminal(monkeypatch: pytest.MonkeyPatch, frames: list[str]) -> Mock:
     remaining = iter(frames)
     current = frames[-1]
 
-    def capture(*_args: object) -> str:
+    def capture(*_args: object, **_kwargs: object) -> str:
         nonlocal current
         current = next(remaining, current)
         return current
@@ -354,7 +354,7 @@ def test_permission_mode_change_acknowledges_notice_before_or_during_switch(
     state = {"mode": "default", "notice": not notice_after_switch, "acknowledged": False}
     dismiss_at: float | None = None
 
-    def capture(*_args: object) -> str:
+    def capture(*_args: object, **_kwargs: object) -> str:
         if dismiss_at is not None and clock.now >= dismiss_at:
             state["notice"] = False
         if state["notice"]:

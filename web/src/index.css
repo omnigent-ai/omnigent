@@ -531,9 +531,53 @@
   padding: 1px;
 }
 
-/* Compact icon-only buttons use the full 16px glyph inside that box. */
-.button-standard-icons[data-size="icon-xs"] svg:not([data-icon-size]) {
+/* Small and standard icon buttons use the full 16px glyph. */
+.button-standard-icons:is([data-size="icon-xs"], [data-size="icon-sm"], [data-size="icon"])
+  svg:not([data-icon-size]) {
   padding: 0;
+}
+
+/* Large icon buttons step up to a 24px glyph. */
+.button-standard-icons[data-size="icon-lg"] svg:not([data-icon-size]) {
+  width: 24px;
+  height: 24px;
+  padding: 0;
+}
+
+/* The desktop workspace rail stays mounted through its exit so its content
+   can fade and slide as one stable sibling of the session surface. */
+.workspace-panel-motion {
+  min-width: 0;
+  overflow: hidden;
+  opacity: 0;
+  transform: translateX(12px);
+  transition:
+    width 300ms ease-in-out,
+    opacity 300ms ease-in-out,
+    transform 300ms ease-in-out;
+  pointer-events: none;
+}
+
+.workspace-panel-motion[data-state="open"] {
+  opacity: 1;
+  transform: translateX(0);
+  pointer-events: auto;
+}
+
+.workspace-panel-motion[data-resizing] {
+  transition: none;
+}
+
+[data-workspace-panel-resizing] .chat-header {
+  transition: none;
+}
+
+@starting-style {
+  .workspace-panel-motion[data-state="open"] {
+    width: 0 !important;
+    opacity: 0;
+    transform: translateX(12px);
+  }
 }
 
 /* The transparent <main> shows the palette canvas through. */
@@ -1404,6 +1448,56 @@ aside[aria-label="Workspace"][data-maximized] {
 
 .dark .animate-message-highlight {
   --message-highlight: color-mix(in oklch, var(--warning) 24%, transparent);
+}
+
+@keyframes user-message-enter {
+  from {
+    opacity: 0;
+    transform: translateY(20px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.animate-user-message-enter {
+  animation: user-message-enter 300ms ease-out both;
+}
+
+/* File-tree children fade without animating geometry. Height or position
+   transitions fight the virtualizer and make long lists visibly drift. */
+@keyframes file-tree-row-expand {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@keyframes file-tree-row-collapse {
+  from {
+    opacity: 1;
+  }
+  to {
+    opacity: 0;
+  }
+}
+
+.file-tree-row-enter,
+.file-tree-row-exit {
+  overflow: hidden;
+  will-change: opacity;
+}
+
+.file-tree-row-enter {
+  animation: file-tree-row-expand 180ms cubic-bezier(0.4, 0, 0.2, 1) both;
+}
+
+.file-tree-row-exit {
+  pointer-events: none;
+  animation: file-tree-row-collapse 180ms cubic-bezier(0.4, 0, 0.2, 1) both;
 }
 
 /* Workspace navigation keeps its compact outline highlight. */

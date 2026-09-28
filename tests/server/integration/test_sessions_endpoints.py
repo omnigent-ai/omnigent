@@ -498,7 +498,10 @@ async def test_initial_item_schedules_background_semantic_title(
     async def get_runner_client(
         _session_id: str,
         _runner_router: object,
+        *,
+        conversation: Any = None,
     ) -> httpx.AsyncClient:
+        assert conversation is None or conversation.id == _session_id
         return fake_runner
 
     monkeypatch.setattr(
@@ -635,6 +638,89 @@ async def test_native_transcript_preserves_browser_title_preference(
                 "Debug authentication timeout" if enabled else prompt
             )
             assert not pending_inputs.has_pending(session_id)
+        finally:
+            for pending in pending_inputs.snapshot_for(session_id):
+                pending_inputs.resolve(session_id, pending["pending_id"])
+
+
+async def test_native_message_repeat_with_same_stable_id_forwards_once(
+    client: httpx.AsyncClient,
+    app: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A resend that reuses the web client's stable message id is answered with
+    the entry already queued and is not forwarded to the runner again. The
+    first forward reached the host; a second would run the prompt twice.
+    """
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes import sessions as sessions_module
+
+    pending_inputs.reset_for_tests()
+    forwarded: list[httpx.Request] = []
+
+    def _runner(request: httpx.Request) -> httpx.Response:
+        forwarded.append(request)
+        return httpx.Response(202, json={})
+
+    monkeypatch.setattr(
+        sessions_module,
+        "_ensure_native_terminal_ready",
+        AsyncMock(return_value=_NativeTerminalEnsureOutcome(error=None)),
+    )
+    monkeypatch.setattr(
+        sessions_module, "_ensure_runner_session_initialized", AsyncMock(return_value=True)
+    )
+    message = {
+        "type": "message",
+        "data": {
+            "role": "user",
+            "content": [{"type": "input_text", "text": "set up the worktree"}],
+            "stable_id": "7f3a9c1e5b2d4f6a8c0e1d2b3a4f5c6d",
+        },
+    }
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_runner), base_url="http://runner"
+    ) as runner:
+        monkeypatch.setattr(sessions_module, "_get_runner_client", AsyncMock(return_value=runner))
+        monkeypatch.setattr(
+            "omnigent.server.routes._sessions.orchestration._get_runner_client",
+            AsyncMock(return_value=runner),
+        )
+        agent = await create_test_agent(client, name="claude-native-ui")
+        created = await client.post(
+            "/v1/sessions",
+            json={
+                "agent_id": agent["id"],
+                "labels": {
+                    "omnigent.ui": "terminal",
+                    "omnigent.wrapper": "claude-code-native-ui",
+                },
+            },
+        )
+        assert created.status_code == 201, created.text
+        session_id = created.json()["id"]
+        try:
+
+            def message_forwards() -> int:
+                return sum(1 for r in forwarded if r.url.path.endswith("/events"))
+
+            first = await client.post(f"/v1/sessions/{session_id}/events", json=message)
+            assert first.status_code == 202, first.text
+            assert message_forwards() == 1
+            # The runner learns the message's id so a failed turn can name it.
+            forwarded_body = json.loads(
+                next(r for r in forwarded if r.url.path.endswith("/events")).content
+            )
+            assert forwarded_body["stable_id"] == "7f3a9c1e5b2d4f6a8c0e1d2b3a4f5c6d"
+
+            second = await client.post(f"/v1/sessions/{session_id}/events", json=message)
+            assert second.status_code == 202, second.text
+            # Same queued entry, no second message forward (the idempotent
+            # terminal ensure may still probe), still exactly one queued message.
+            assert second.json()["pending_id"] == first.json()["pending_id"]
+            assert message_forwards() == 1
+            assert len(pending_inputs.snapshot_for(session_id)) == 1
         finally:
             for pending in pending_inputs.snapshot_for(session_id):
                 pending_inputs.resolve(session_id, pending["pending_id"])
@@ -2028,6 +2114,8 @@ async def test_skill_slash_command_persists_visible_item_and_hidden_meta_message
     async def _fake_get_runner_client(
         session_id: str,
         runner_router: object,
+        *,
+        conversation: Any = None,
     ) -> httpx.AsyncClient:
         """
         Resolve every session to the fake runner client.
@@ -2036,6 +2124,7 @@ async def test_skill_slash_command_persists_visible_item_and_hidden_meta_message
         :param runner_router: Real app runner router, unused here.
         :returns: The fake runner client.
         """
+        assert conversation is None or conversation.id == session_id
         del session_id, runner_router
         return fake_runner
 
@@ -2160,6 +2249,8 @@ async def test_skill_slash_command_keeps_existing_title(
     async def _fake_get_runner_client(
         session_id: str,
         runner_router: object,
+        *,
+        conversation: Any = None,
     ) -> httpx.AsyncClient:
         """
         Resolve every session to the fake runner client.
@@ -2168,6 +2259,7 @@ async def test_skill_slash_command_keeps_existing_title(
         :param runner_router: Real app runner router, unused here.
         :returns: The fake runner client.
         """
+        assert conversation is None or conversation.id == session_id
         del session_id, runner_router
         return fake_runner
 
@@ -2227,8 +2319,14 @@ async def test_skill_slash_command_non_json_resolve_surfaces_controlled_error(
         base_url="http://runner",
     )
 
-    async def _fake_get_runner_client(session_id: str, runner_router: object) -> httpx.AsyncClient:
+    async def _fake_get_runner_client(
+        session_id: str,
+        runner_router: object,
+        *,
+        conversation: Any = None,
+    ) -> httpx.AsyncClient:
         """Resolve every session to the fake runner."""
+        assert conversation is None or conversation.id == session_id
         del session_id, runner_router
         return fake_runner
 
@@ -2293,8 +2391,14 @@ async def test_skill_slash_command_missing_session_agent_returns_typed_410(
         base_url="http://runner",
     )
 
-    async def _fake_get_runner_client(session_id: str, runner_router: object) -> httpx.AsyncClient:
+    async def _fake_get_runner_client(
+        session_id: str,
+        runner_router: object,
+        *,
+        conversation: Any = None,
+    ) -> httpx.AsyncClient:
         """Resolve every session to the fake runner."""
+        assert conversation is None or conversation.id == session_id
         del session_id, runner_router
         return fake_runner
 
@@ -4644,26 +4748,30 @@ async def test_post_external_session_status_publishes_session_status(
     assert "response_id" not in published[0][1]
 
 
+@pytest.mark.parametrize(
+    ("harness", "expected_code"),
+    [
+        ("codex-native", "codex_reauth_required"),
+        ("opencode-native", "native_turn_error"),
+    ],
+)
 async def test_post_external_session_status_failed_surfaces_output_and_reauth(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
+    harness: str,
+    expected_code: str,
 ) -> None:
-    """
-    A ``failed`` edge with ``output`` surfaces a typed error on the stream (#1108).
-
-    A native forwarder (e.g. codex-native on an expired login) posts the
-    terminal failure reason as ``data.output`` and flags ``reauth_required``.
-    The handler must surface it as the ``session.status`` edge's ``error`` so a
-    *top-level* session sees the reason — not only the sub-agent parent path.
-    ``reauth_required`` selects the ``codex_reauth_required`` code.
-    """
+    """The reauth flag selects a Codex error code only for Codex sessions."""
     published: list[tuple[str, dict[str, Any]]] = []
 
     monkeypatch.setattr(
         "omnigent.server.routes.sessions.session_stream.publish",
         lambda session_id, event: published.append((session_id, event)),
     )
-    agent = await create_test_agent(client)
+    agent = await create_test_agent(
+        client,
+        executor={"type": "omnigent", "config": {"harness": harness}},
+    )
     session = await _create_session(client, agent["id"])
 
     resp = await client.post(
@@ -4682,7 +4790,7 @@ async def test_post_external_session_status_failed_surfaces_output_and_reauth(
     assert published[0][1]["status"] == "failed"
     error = published[0][1]["error"]
     assert error is not None
-    assert error["code"] == "codex_reauth_required"
+    assert error["code"] == expected_code
     assert "401 Unauthorized" in error["message"]
 
 
@@ -4912,6 +5020,8 @@ async def test_patch_runner_rebind_clears_stale_failed_status(
     async def _get_runner_client(
         _session_id: str,
         _runner_router: Any,
+        *,
+        conversation: Any = None,
     ) -> _RecoveringRunnerClient:
         """
         Return the recovering runner client for the patched session.
@@ -4920,6 +5030,7 @@ async def test_patch_runner_rebind_clears_stale_failed_status(
         :param _runner_router: Ignored runner router placeholder.
         :returns: Runner client stub.
         """
+        assert conversation is None or conversation.id == _session_id
         return runner_client
 
     async def _ensure_runner_relay_ready(
@@ -5041,6 +5152,8 @@ async def test_post_external_session_status_idle_forwards_persisted_assistant_ou
     async def _fake_get_runner_client(
         session_id: str,
         runner_router: object,
+        *,
+        conversation: Any = None,
     ) -> httpx.AsyncClient:
         """
         Resolve the session to the fake runner client.
@@ -5049,6 +5162,7 @@ async def test_post_external_session_status_idle_forwards_persisted_assistant_ou
         :param runner_router: Real app runner router, unused here.
         :returns: The fake runner client.
         """
+        assert conversation is None or conversation.id == session_id
         del session_id, runner_router
         return fake_runner
 
@@ -5152,6 +5266,8 @@ async def test_post_external_session_status_failed_forwards_persisted_assistant_
     async def _fake_get_runner_client(
         session_id: str,
         runner_router: object,
+        *,
+        conversation: Any = None,
     ) -> httpx.AsyncClient:
         """
         Resolve the session to the fake runner client.
@@ -5160,6 +5276,7 @@ async def test_post_external_session_status_failed_forwards_persisted_assistant_
         :param runner_router: Real app runner router, unused here.
         :returns: The fake runner client.
         """
+        assert conversation is None or conversation.id == session_id
         del session_id, runner_router
         return fake_runner
 
@@ -5220,37 +5337,62 @@ async def test_post_external_session_status_failed_forwards_persisted_assistant_
     assert "selected model" in error["message"]
 
 
-async def test_post_external_session_status_failed_keeps_wire_output_and_codex_code(
+@pytest.mark.parametrize(
+    ("spec_harness", "harness_override", "expected_code"),
+    [
+        ("codex-native", None, "codex_turn_error"),
+        ("opencode-native", None, "native_turn_error"),
+        ("claude-native", None, "native_turn_error"),
+        ("pi-native", None, "native_turn_error"),
+        ("codex-native", "opencode-native", "native_turn_error"),
+        ("opencode-native", "codex-native", "codex_turn_error"),
+    ],
+)
+async def test_post_external_session_status_failed_keeps_wire_output_and_harness_code(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
+    spec_harness: str,
+    harness_override: str | None,
+    expected_code: str,
 ) -> None:
-    """
-    A forwarder-sent ``output`` stays verbatim under codex's error code.
-
-    The store-side enrichment must never clobber a detail the forwarder
-    attached itself, and a wire-carried detail keeps the ``codex_turn_error``
-    code existing clients already see.
-    """
+    """Wire output retains its detail and uses the session's resolved harness."""
     published: list[tuple[str, dict[str, Any]]] = []
     monkeypatch.setattr(
         "omnigent.server.routes.sessions.session_stream.publish",
         lambda session_id, event: published.append((session_id, event)),
     )
-    agent = await create_test_agent(client)
-    session = await _create_session(client, agent["id"])
+    agent = await create_test_agent(
+        client,
+        executor={"type": "omnigent", "config": {"harness": spec_harness}},
+    )
+    session_resp = await client.post(
+        "/v1/sessions",
+        json={"agent_id": agent["id"], "harness_override": harness_override},
+    )
+    assert session_resp.status_code == 201, session_resp.text
+    session = session_resp.json()
+    assert session["harness"] == (harness_override or spec_harness)
+    detail = "Model provider rejected the request."
 
     resp = await client.post(
         f"/v1/sessions/{session['id']}/events",
         json={
             "type": "external_session_status",
-            "data": {"status": "failed", "output": "You've hit your usage limit."},
+            "data": {"status": "failed", "output": detail},
         },
     )
     assert resp.status_code == 202, resp.text
     error = published[0][1]["error"]
     assert error is not None
-    assert error["code"] == "codex_turn_error"
-    assert error["message"] == "You've hit your usage limit."
+    assert error["code"] == expected_code
+    assert error["message"] == detail
+
+    snapshot_resp = await client.get(f"/v1/sessions/{session['id']}")
+    assert snapshot_resp.status_code == 200, snapshot_resp.text
+    snapshot_error = snapshot_resp.json()["last_task_error"]
+    assert snapshot_error is not None
+    assert snapshot_error["code"] == expected_code
+    assert snapshot_error["message"] == detail
 
 
 @pytest.mark.parametrize("wire_output", [False, True])
@@ -5358,6 +5500,8 @@ async def test_post_external_session_status_propagates_runner_delivery_failure(
     async def _fake_get_runner_client(
         session_id: str,
         runner_router: object,
+        *,
+        conversation: Any = None,
     ) -> httpx.AsyncClient:
         """
         Resolve every session to the fake runner client.
@@ -5366,6 +5510,7 @@ async def test_post_external_session_status_propagates_runner_delivery_failure(
         :param runner_router: Real app runner router, unused here.
         :returns: The fake runner client.
         """
+        assert conversation is None or conversation.id == session_id
         del session_id, runner_router
         return fake_runner
 
@@ -9907,8 +10052,11 @@ async def test_interrupt_forward_failure_lifts_stop_fence(
     async def _fake_get_runner_client(
         session_id: str,
         runner_router: object,
+        *,
+        conversation: Any = None,
     ) -> httpx.AsyncClient | None:
         """Resolve every session to the failing fake runner (or to none)."""
+        assert conversation is None or conversation.id == session_id
         del session_id, runner_router
         return None if failure_mode == "no_runner_client" else fake_runner
 
@@ -9964,8 +10112,11 @@ async def test_interrupt_forward_success_keeps_stop_fence(
     async def _fake_get_runner_client(
         session_id: str,
         runner_router: object,
+        *,
+        conversation: Any = None,
     ) -> httpx.AsyncClient:
         """Resolve every session to the accepting fake runner."""
+        assert conversation is None or conversation.id == session_id
         del session_id, runner_router
         return fake_runner
 
@@ -11752,7 +11903,10 @@ async def test_message_forward_failure_surfaces_runner_unavailable(
     async def _fake_get_runner_client(
         session_id: str,
         runner_router: object,
+        *,
+        conversation: Any = None,
     ) -> httpx.AsyncClient | None:
+        assert conversation is None or conversation.id == session_id
         del session_id, runner_router
         return fake_runner
 
@@ -11813,7 +11967,10 @@ async def test_message_forward_rejection_surfaces_failed_with_reason(
     async def _fake_get_runner_client(
         session_id: str,
         runner_router: object,
+        *,
+        conversation: Any = None,
     ) -> httpx.AsyncClient | None:
+        assert conversation is None or conversation.id == session_id
         del session_id, runner_router
         return fake_runner
 
@@ -11910,16 +12067,28 @@ async def test_create_session_notifies_runner_with_init_envelope(
     async def _fake_get_runner_client(
         _session_id: str,
         _runner_router: object,
+        *,
+        conversation: Any = None,
     ) -> httpx.AsyncClient:
+        assert conversation is None or conversation.id == _session_id
         return fake_runner
 
     monkeypatch.setattr(sessions_module, "_get_runner_client", _fake_get_runner_client)
     try:
         resp = await client.post(
             "/v1/sessions",
-            json={"agent_id": agent["id"], "model_override": "model-x"},
+            json={
+                "agent_id": agent["id"],
+                "model_override": "model-x",
+                "labels": {"test.long": "x" * 257},
+            },
         )
         assert resp.status_code == 201, f"create failed: {resp.status_code} {resp.text}"
+        created_body = resp.json()
+        assert created_body["labels"]["test.long"] == "x" * 256
+        reread = await client.get(f"/v1/sessions/{created_body['id']}")
+        assert reread.status_code == 200, reread.text
+        assert reread.json()["labels"]["test.long"] == "x" * 256
     finally:
         await fake_runner.aclose()
 
@@ -11931,6 +12100,7 @@ async def test_create_session_notifies_runner_with_init_envelope(
     )
     envelope = parse_runner_session_init_envelope(body)
     assert envelope is not None
+    assert envelope.snapshot.labels["test.long"] == "x" * 256
     assert envelope.snapshot.model_override == "model-x", (
         "the init envelope must carry the persisted /model override so the "
         "runner seeds it into the first spawn; got "
