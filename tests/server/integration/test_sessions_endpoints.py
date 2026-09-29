@@ -10084,6 +10084,88 @@ async def test_interrupt_forward_failure_lifts_stop_fence(
         await fake_runner.aclose()
 
 
+@pytest.mark.parametrize(
+    "case", ["request", "request_idle", "cache", "idle", "missing", "invalid", "failure"]
+)
+async def test_interrupt_codex_side_chat_targets_its_turn_on_parent_runner(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    case: str,
+) -> None:
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.routes._sessions.common import (
+        _interrupt_fenced_sessions,
+        _session_active_response_cache,
+        _session_status_cache,
+    )
+    from omnigent.server.routes.sessions import routes_events
+
+    agent = await create_test_agent(client)
+    parent = await _create_session(
+        client, agent["id"], labels={"omnigent.wrapper": "codex-native-ui"}
+    )
+    child_response = await client.post(
+        f"/v1/sessions/{parent['id']}/events",
+        json={
+            "type": "external_codex_subagent_start",
+            "data": {"thread_id": "thread_side", "agent_nickname": "Side chat"},
+        },
+    )
+    assert child_response.status_code == 202, child_response.text
+    child_id = child_response.json()["child_session_id"]
+    try:
+        _session_status_cache[child_id] = "idle" if case in ("idle", "request_idle") else "running"
+        if case == "cache":
+            _session_active_response_cache[child_id] = "codex_turn_side"
+        forwarded: list[tuple[str, dict[str, Any]]] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            forwarded.append((request.url.path, json.loads(request.content)))
+            return httpx.Response(503 if case == "failure" else 204)
+
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler), base_url="http://runner"
+        ) as runner:
+            get_runner = AsyncMock(return_value=runner)
+            monkeypatch.setattr(sessions_module, "_get_runner_client", get_runner)
+            data = {}
+            if case in ("request", "request_idle", "failure"):
+                data["response_id"] = "codex_turn_side"
+            elif case == "invalid":
+                data["response_id"] = "unrelated_response"
+            with patch.object(routes_events, "_publish_interrupted") as publish_interrupted:
+                response = await client.post(
+                    f"/v1/sessions/{child_id}/events", json={"type": "interrupt", "data": data}
+                )
+            publish_interrupted.assert_not_called()
+
+        expected_status = {"missing": 409, "invalid": 400, "failure": 503}.get(case, 202)
+        assert response.status_code == expected_status, response.text
+        if case in ("request", "request_idle", "cache", "failure"):
+            assert get_runner.await_args.args[0] == parent["id"]
+            assert forwarded == [
+                (
+                    f"/v1/sessions/{parent['id']}/events",
+                    {
+                        "type": "interrupt",
+                        "codex_side_thread_id": "thread_side",
+                        "codex_side_turn_id": "turn_side",
+                    },
+                )
+            ]
+        else:
+            get_runner.assert_not_awaited()
+            assert forwarded == []
+        if case == "idle":
+            assert response.json() == {"queued": False}
+        assert parent["id"] not in _interrupt_fenced_sessions
+        assert child_id not in _interrupt_fenced_sessions
+    finally:
+        _interrupt_fenced_sessions.discard(child_id)
+        _session_active_response_cache.pop(child_id, None)
+        _session_status_cache.pop(child_id, None)
+
+
 async def test_interrupt_forward_success_keeps_stop_fence(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,

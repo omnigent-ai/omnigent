@@ -2101,6 +2101,98 @@ async def test_events_interrupt_on_codex_native_uses_turn_interrupt_without_mark
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("case", ["running", "idle", "newer_turn", "missing_turn", "rpc_failure"])
+async def test_events_interrupt_codex_side_chat_leaves_parent_turn_running(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    case: str,
+) -> None:
+    from omnigent.harnesses.codex_native import app_server as codex_native_app_server
+
+    conv_id = "acbeddbbce38421b921a7abbe82f7176"
+    monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path / "codex-bridge")
+    bridge_dir = codex_native_bridge.bridge_dir_for_bridge_id(conv_id)
+    codex_native_bridge.write_bridge_state(
+        bridge_dir,
+        codex_native_bridge.CodexNativeBridgeState(
+            session_id=conv_id,
+            socket_path="ws://127.0.0.1:43210",
+            thread_id="thread_parent",
+            codex_home=str(tmp_path / "codex-home"),
+            active_turn_id="turn_parent",
+        ),
+    )
+    fake_client = _RecordingCodexAppServerClient(
+        transport="ws://127.0.0.1:43210", client_name="omnigent-codex-native-runner"
+    )
+    original_request = fake_client.request
+
+    async def request(method: str, params: dict[str, Any]) -> dict[str, Any]:
+        result = await original_request(method, params)
+        message = {
+            "idle": "no active turn to interrupt",
+            "newer_turn": "expected active turn id turn_side but found turn_new",
+            "rpc_failure": "thread-store internal error",
+        }.get(case)
+        if message is not None:
+            raise codex_native_app_server.CodexAppServerResponseError(
+                {"code": -32603 if case == "rpc_failure" else -32600, "message": message}
+            )
+        return result
+
+    monkeypatch.setattr(fake_client, "request", request)
+    monkeypatch.setattr(
+        codex_native_app_server, "client_for_transport", lambda *_args, **_kwargs: fake_client
+    )
+    spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "codex-native"}),
+    )
+
+    async def resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        return spec
+
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    payload = {"type": "interrupt", "codex_side_thread_id": "thread_side"}
+    if case != "missing_turn":
+        payload["codex_side_turn_id"] = "turn_side"
+    async with _runner_client(app) as client:
+        created = await client.post(
+            "/v1/sessions", json={"session_id": conv_id, "agent_id": "agent_side"}
+        )
+        assert created.status_code == 201, created.text
+        if case == "rpc_failure":
+            with pytest.raises(
+                codex_native_app_server.CodexAppServerResponseError,
+                match="thread-store internal error",
+            ) as error:
+                await client.post(f"/v1/sessions/{conv_id}/events", json=payload)
+            assert error.value.code == -32603
+        else:
+            response = await client.post(f"/v1/sessions/{conv_id}/events", json=payload)
+            assert response.status_code == (400 if case == "missing_turn" else 202), response.text
+
+    assert fake_client.connected == (case != "missing_turn")
+    assert fake_client.closed == (case != "missing_turn")
+    assert fake_client.requests == (
+        []
+        if case == "missing_turn"
+        else [("turn/interrupt", {"threadId": "thread_side", "turnId": "turn_side"})]
+    )
+    parent_state = codex_native_bridge.read_bridge_state(bridge_dir)
+    assert parent_state is not None and parent_state.active_turn_id == "turn_parent"
+    assert pm.cancelled == []
+    assert pm.released == []
+    assert conv_id not in app.state.interrupted_sessions
+
+
+@pytest.mark.asyncio
 async def test_events_stop_session_on_codex_native_uses_turn_interrupt_without_marker(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

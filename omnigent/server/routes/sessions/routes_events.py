@@ -92,6 +92,7 @@ from omnigent.server.routes._errors import session_not_found as _session_not_fou
 from omnigent.server.routes._sessions.common import (
     _ALLOWED_EVENT_TYPES,
     _APPROVAL_TYPE,
+    _CODEX_NATIVE_SUBAGENT_THREAD_ID_LABEL_KEY,
     _COMPACT_TYPE,
     _EXTERNAL_ACP_SUBAGENT_START_TYPE,
     _EXTERNAL_ANTIGRAVITY_SUBAGENT_START_TYPE,
@@ -135,8 +136,10 @@ from omnigent.server.routes._sessions.common import (
     _interrupt_fenced_sessions,
     _logger,
     _pushed_model_options_cache,
+    _session_active_response_cache,
     _session_mcp_startup_cache,
     _session_sandbox_status_cache,
+    _session_status_cache,
     get_server_runner_router,
     set_server_runner_router,
 )
@@ -1148,19 +1151,56 @@ def register_events_routes(
             return wake_conv, _client
 
         if body.type == _INTERRUPT_TYPE:
-            _publish_interrupted(session_id)
-            # Fence the cancelled turn (see _interrupt_fenced_sessions).
-            _interrupt_fenced_sessions.add(session_id)
+            target_session_id = session_id
+            interrupt_payload: dict[str, Any] = {"type": "interrupt"}
+            codex_child = conv.kind == "sub_agent" and _is_codex_native_subagent(conv)
+            response_id = None
+            if codex_child:
+                # Native child boundaries come from the Codex forwarder.
+                child_thread_id = (conv.labels or {}).get(
+                    _CODEX_NATIVE_SUBAGENT_THREAD_ID_LABEL_KEY
+                )
+                response_id = body.data.get("response_id") or _session_active_response_cache.get(
+                    session_id
+                )
+                if response_id is None:
+                    status = _session_status_cache.get(session_id, conv.live_status)
+                    if status in ("running", "waiting"):
+                        raise OmnigentError(
+                            "The side chat's active turn is not available yet. Try interrupting again.",
+                            code=ErrorCode.CONFLICT,
+                        )
+                    return {"queued": False}
+                if (
+                    not isinstance(response_id, str)
+                    or not response_id.startswith("codex_")
+                    or response_id in ("codex_", "codex_native")
+                    or not conv.parent_conversation_id
+                    or not child_thread_id
+                ):
+                    raise OmnigentError(
+                        "Cannot identify the Codex side-chat turn to interrupt.",
+                        code=ErrorCode.INVALID_INPUT,
+                    )
+                target_session_id = conv.parent_conversation_id
+                interrupt_payload.update(
+                    codex_side_thread_id=child_thread_id,
+                    codex_side_turn_id=response_id.removeprefix("codex_"),
+                )
+            else:
+                _publish_interrupted(session_id)
+                # Fence the cancelled turn (see _interrupt_fenced_sessions).
+                _interrupt_fenced_sessions.add(session_id)
             runner_client = await _get_runner_client(
-                session_id,
+                target_session_id,
                 runner_router,
             )
             interrupt_delivered = False
             if runner_client is not None:
                 try:
                     interrupt_resp = await runner_client.post(
-                        f"/v1/sessions/{session_id}/events",
-                        json={"type": "interrupt"},
+                        f"/v1/sessions/{target_session_id}/events",
+                        json=interrupt_payload,
                         timeout=5.0,
                     )
                     interrupt_delivered = interrupt_resp.status_code < 400
@@ -1171,6 +1211,11 @@ def register_events_routes(
                         session_id,
                     )
             if not interrupt_delivered:
+                if codex_child:
+                    raise OmnigentError(
+                        "Couldn't interrupt the side chat. Please try again.",
+                        code=ErrorCode.RUNNER_UNAVAILABLE,
+                    )
                 # The turn keeps running and nothing else lifts the fence —
                 # remove it so the turn's remaining output isn't dropped.
                 _interrupt_fenced_sessions.discard(session_id)

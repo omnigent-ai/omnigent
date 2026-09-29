@@ -1464,9 +1464,13 @@ export function openSessionStream(
  * `session.interrupted` (transient) and `response.incomplete` (with
  * `incomplete_details.reason == "user_interrupt"`) on the live
  * stream — clients can mark the bubble interrupted from either.
+ * Native side chats include their observed response id to target the exact turn.
  */
-export function interrupt(sessionId: string): Promise<PostEventResponse> {
-  return postEvent(sessionId, { type: "interrupt", data: {} });
+export function interrupt(sessionId: string, responseId?: string): Promise<PostEventResponse> {
+  return postEvent(sessionId, {
+    type: "interrupt",
+    data: responseId ? { response_id: responseId } : {},
+  });
 }
 
 /**

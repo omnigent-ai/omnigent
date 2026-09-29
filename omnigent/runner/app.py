@@ -10131,25 +10131,34 @@ def create_runner_app(
         )
         _side_thread_id = body.get("codex_side_thread_id") if isinstance(body, dict) else None
         if _side_thread_id:
-            # Codex /side follow-up: the server redirected a side-chat child's
-            # message here (this endpoint's conversation_id is the PARENT), tagged
-            # with the child Codex thread id. Drive it on that thread via the
-            # parent's bridge, isolated from the parent's turn buffer/active-turn
-            # state on purpose so the main conversation is untouched.
+            # Side-chat controls use the parent's bridge but target the child's
+            # thread, leaving the parent's turn and message buffer untouched.
             from omnigent.harnesses.codex_native import side_chat
             from omnigent.harnesses.codex_native.app_server import client_for_transport
 
-            _side_text = _side_chat_text_from_content(
-                body.get("content") if isinstance(body, dict) else None
-            )
-            if not _side_text:
-                return JSONResponse(
-                    status_code=400,
-                    content={
-                        "error": "invalid_request",
-                        "detail": "side chat message had no text",
-                    },
+            _side_turn_id = body.get("codex_side_turn_id")
+            _side_text = ""
+            if body_type == "interrupt":
+                if not isinstance(_side_turn_id, str) or not _side_turn_id:
+                    return JSONResponse(
+                        status_code=400,
+                        content={
+                            "error": "invalid_request",
+                            "detail": "Missing side-chat turn id.",
+                        },
+                    )
+            else:
+                _side_text = _side_chat_text_from_content(
+                    body.get("content") if isinstance(body, dict) else None
                 )
+                if not _side_text:
+                    return JSONResponse(
+                        status_code=400,
+                        content={
+                            "error": "invalid_request",
+                            "detail": "side chat message had no text",
+                        },
+                    )
             _side_state = await _codex_native_bridge_state_for_session(
                 conversation_id, action="side chat turn"
             )
@@ -10166,7 +10175,14 @@ def create_runner_app(
             )
             try:
                 await _side_client.connect()
-                await side_chat.submit_side_turn(_side_client, str(_side_thread_id), _side_text)
+                if body_type == "interrupt":
+                    await side_chat.interrupt_side_turn(
+                        _side_client, str(_side_thread_id), _side_turn_id
+                    )
+                else:
+                    await side_chat.submit_side_turn(
+                        _side_client, str(_side_thread_id), _side_text
+                    )
             finally:
                 await _side_client.close()
             return Response(status_code=202)
