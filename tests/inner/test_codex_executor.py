@@ -3417,6 +3417,139 @@ def test_populate_codex_skills_copy_mode_never_materializes_linked_skills(
     assert [path for path in regular_files if canary in path.read_text()] == []
 
 
+@pytest.mark.parametrize("linked_entry", ["skill_dir", "skills_root"])
+@pytest.mark.parametrize("copy_skills", [False, True])
+def test_populate_codex_skills_uses_junction_fallback_for_linked_skills(
+    tmp_path: Path, linked_entry: str, copy_skills: bool
+) -> None:
+    """Linked skills use the directory-link fallback, never a materializing copy."""
+    from omnigent.inner import codex_staging
+    from omnigent.inner.codex_executor import _populate_codex_skills
+
+    source = tmp_path / "source"
+    skill = _make_skill_dir(source, "alpha")
+    linked_path = skill if linked_entry == "skill_dir" else source
+    target = tmp_path / "granted"
+    junctions: list[tuple[str, str]] = []
+    with (
+        patch.object(Path, "is_junction", lambda path: path == linked_path),
+        patch.object(Path, "symlink_to", side_effect=OSError(1314, "privilege not held")),
+        patch.object(codex_staging, "sys", SimpleNamespace(platform="win32")),
+        patch.dict(
+            sys.modules,
+            {
+                "_winapi": SimpleNamespace(
+                    CreateJunction=lambda src, dst: junctions.append((src, dst))
+                )
+            },
+        ),
+        patch("omnigent.inner.codex_executor.shutil.copytree") as copy,
+    ):
+        _populate_codex_skills(target, "all", [source], copy_skills=copy_skills)
+
+    assert junctions == [(str(skill.resolve()), str(target / "alpha"))]
+    copy.assert_not_called()
+
+
+@pytest.mark.parametrize("copy_skills", [False, True])
+def test_populate_codex_skills_never_copies_linked_sources_when_links_fail(
+    tmp_path: Path, copy_skills: bool
+) -> None:
+    """Failure to preserve a directory link cannot authorize copying its target."""
+    from omnigent.inner import codex_staging
+    from omnigent.inner.codex_executor import _populate_codex_skills
+
+    source = tmp_path / "source"
+    skill = _make_skill_dir(source, "alpha")
+    with (
+        patch.object(Path, "is_junction", lambda path: path == skill),
+        patch.object(Path, "symlink_to", side_effect=OSError("links unavailable")),
+        patch.object(codex_staging, "sys", SimpleNamespace(platform="linux")),
+        patch("omnigent.inner.codex_executor.shutil.copytree") as copy,
+    ):
+        _populate_codex_skills(tmp_path / "granted", "all", [source], copy_skills=copy_skills)
+
+    copy.assert_not_called()
+
+
+@pytest.mark.parametrize("relative_path", ["linked", "resources/linked", "resources/deep/linked"])
+def test_populate_codex_skills_copy_mode_skips_junctions_at_every_depth(
+    tmp_path: Path, relative_path: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A traversable directory marked as a junction is excluded before copying."""
+    from omnigent.inner.codex_executor import _populate_codex_skills
+
+    source = tmp_path / "source"
+    skill = _make_skill_dir(source, "alpha")
+    junction = skill / relative_path
+    junction.mkdir(parents=True)
+    (junction / "private.txt").write_text("junction-target-canary")
+    target = tmp_path / "granted"
+    with patch.object(Path, "is_junction", lambda path: path == junction):
+        _populate_codex_skills(target, "all", [source], copy_skills=True)
+
+    assert (target / "alpha" / "SKILL.md").is_file()
+    assert not (target / "alpha" / relative_path).exists()
+    assert "junction" in caplog.text
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="directory junctions are Windows-only")
+@pytest.mark.parametrize("linked_entry", ["skill_dir", "skills_root"])
+def test_populate_codex_skills_preserves_linked_junctions_without_symlink_privilege(
+    tmp_path: Path, linked_entry: str
+) -> None:
+    """Real Windows junction-backed skills remain discoverable without symlink privilege."""
+    import _winapi
+
+    from omnigent.inner.codex_executor import _populate_codex_skills
+
+    external = tmp_path / "external"
+    skill = _make_skill_dir(external, "alpha")
+    (skill / "private.txt").write_text("external-canary")
+    source = tmp_path / "source"
+    if linked_entry == "skill_dir":
+        source.mkdir()
+        _winapi.CreateJunction(str(skill), str(source / "alpha"))
+    else:
+        _winapi.CreateJunction(str(external), str(source))
+    target = tmp_path / "granted"
+    with patch.object(Path, "symlink_to", side_effect=OSError(1314, "privilege not held")):
+        _populate_codex_skills(target, "all", [source], copy_skills=True)
+
+    staged = target / "alpha"
+    assert staged.is_junction()
+    assert (staged / "SKILL.md").resolve() == (skill / "SKILL.md").resolve()
+    assert (staged / "private.txt").resolve() == (skill / "private.txt").resolve()
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="directory junctions are Windows-only")
+@pytest.mark.parametrize("relative_path", ["linked", "resources/deep/linked"])
+def test_populate_codex_skills_copy_mode_skips_nested_junctions(
+    tmp_path: Path, relative_path: str
+) -> None:
+    """Copying an ordinary skill never traverses a real nested Windows junction."""
+    import _winapi
+
+    from omnigent.inner.codex_executor import _populate_codex_skills
+
+    external = tmp_path / "external"
+    external.mkdir()
+    canary = external / "private.txt"
+    canary.write_text("outside-canary")
+    source = tmp_path / "source"
+    skill = _make_skill_dir(source, "alpha")
+    junction = skill / relative_path
+    junction.parent.mkdir(parents=True, exist_ok=True)
+    _winapi.CreateJunction(str(external), str(junction))
+    target = tmp_path / "granted"
+    with patch.object(Path, "symlink_to", side_effect=OSError(1314, "privilege not held")):
+        _populate_codex_skills(target, "all", [source], copy_skills=True)
+
+    assert (target / "alpha" / "SKILL.md").is_file()
+    assert not (target / "alpha" / relative_path).exists()
+    assert canary.read_text() == "outside-canary"
+
+
 def test_populate_codex_skills_from_bundle_sources_from_codex_home(tmp_path: Path) -> None:
     """
     ``source_codex_home`` reads host skills from the resolved ``$CODEX_HOME``.

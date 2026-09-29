@@ -69,38 +69,44 @@ def prepare_codex_skills_dir(path: Path) -> Path:
     """
     root = path.parent.resolve() / path.name
     root_stat = root.lstat()
-    if not root.name.startswith(CODEX_SKILLS_PREFIX) or not stat.S_ISDIR(root_stat.st_mode):
+    if (
+        not root.name.startswith(CODEX_SKILLS_PREFIX)
+        or not stat.S_ISDIR(root_stat.st_mode)
+        or root.is_junction()
+    ):
         raise OSError("Codex skills must use a dedicated session staging directory")
     if hasattr(os, "getuid") and (
         root_stat.st_uid != os.getuid() or stat.S_IMODE(root_stat.st_mode) != 0o700
     ):
         raise OSError("Codex skills staging directory must be private to the current user")
     for child in root.iterdir():
-        if child.is_symlink() or not child.is_dir():
+        if child.is_junction():
+            child.rmdir()
+        elif child.is_symlink() or not child.is_dir():
             child.unlink()
         else:
             shutil.rmtree(child)
     return root
 
 
-def link_codex_skills_dir(home_skills: Path, skills_dir: Path) -> None:
-    """Point a private home's ``skills`` entry at the session's granted directory.
+def link_codex_skills_dir(link_path: Path, skills_dir: Path) -> None:
+    """Link a skill-discovery entry to a directory without copying its target.
 
-    Codex publishes resolved skill paths, so the link keeps them inside the grant.
+    Codex publishes resolved skill paths, keeping read grants tied to the target.
 
-    :param home_skills: ``<codex_home>/skills``; must not exist yet.
-    :param skills_dir: The session's granted skills directory.
+    :param link_path: Home-level ``skills`` entry or individual skill; must not exist yet.
+    :param skills_dir: Session-owned skills directory or selected source directory.
     :raises OSError: When the platform can create neither a symlink nor, on
         Windows, a directory junction.
     """
     try:
-        home_skills.symlink_to(skills_dir, target_is_directory=True)
+        link_path.symlink_to(skills_dir, target_is_directory=True)
     except OSError:
         if sys.platform == "win32":
             # Windows refuses symlinks without Developer Mode or the symlink
             # privilege; a junction needs neither and resolves the same way.
             import _winapi
 
-            _winapi.CreateJunction(str(skills_dir), str(home_skills))
+            _winapi.CreateJunction(str(skills_dir), str(link_path))
         else:
             raise

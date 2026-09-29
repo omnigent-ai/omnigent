@@ -189,3 +189,44 @@ def test_skills_link_junction_resolves_into_the_granted_directory(
 
     assert home_skills.is_junction()
     assert (home_skills / "SKILL.md").resolve() == (skills_dir / "SKILL.md").resolve()
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="directory junctions are Windows-only")
+@pytest.mark.parametrize("relative_path", ["linked", "nested/linked"])
+def test_skills_refresh_does_not_follow_junctions(tmp_path: Path, relative_path: str) -> None:
+    """Refreshing the grant removes junctions without deleting their outside targets."""
+    import _winapi
+
+    _, skills_dir = _skills_link_paths(tmp_path)
+    identity = skills_dir.stat().st_ino
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    marker = outside / "keep.txt"
+    marker.write_text("keep")
+    junction = skills_dir / relative_path
+    junction.parent.mkdir(parents=True, exist_ok=True)
+    _winapi.CreateJunction(str(outside), str(junction))
+
+    prepare_codex_skills_dir(skills_dir)
+
+    assert marker.read_text() == "keep"
+    assert skills_dir.stat().st_ino == identity
+    assert list(skills_dir.iterdir()) == []
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="directory junctions are Windows-only")
+def test_skills_refresh_rejects_junction_root(tmp_path: Path) -> None:
+    """A junction cannot stand in for the private directory owned by this session."""
+    import _winapi
+
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    marker = outside / "keep.txt"
+    marker.write_text("keep")
+    root = tmp_path / f"{CODEX_SKILLS_PREFIX}session"
+    _winapi.CreateJunction(str(outside), str(root))
+
+    with pytest.raises(OSError):
+        prepare_codex_skills_dir(root)
+
+    assert marker.read_text() == "keep"

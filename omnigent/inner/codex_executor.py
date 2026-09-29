@@ -812,6 +812,16 @@ def _is_linked_skill_dir(skill_dir: Path) -> bool:
     return any(path.is_symlink() or path.is_junction() for path in (skill_dir, skill_dir.parent))
 
 
+def _ignore_codex_skill_junctions(directory: str, names: list[str]) -> list[str]:
+    """Skip junctions before copytree can traverse them, including in nested directories."""
+    junctions = [name for name in names if (Path(directory) / name).is_junction()]
+    for name in junctions:
+        logger.warning(
+            "skipping directory junction %s while copying Codex skills", Path(directory) / name
+        )
+    return junctions
+
+
 def _populate_codex_skills(
     target_dir: Path,
     skills_filter: str | list[str],
@@ -850,7 +860,8 @@ def _populate_codex_skills(
         target is outside the mounted subtree dangles inside the tool
         namespace. A skill whose directory or skills root is itself a
         link is still linked, never copied: copying would materialize
-        the link's target, which no sandbox grant covers.
+        the link's target, which no sandbox grant covers. Nested directory
+        junctions are skipped rather than traversed.
     """
     if skills_filter == "none":
         return
@@ -862,13 +873,13 @@ def _populate_codex_skills(
         link_path = target_dir / name
         if link_path.exists() or link_path.is_symlink():
             continue
-        keep_link = copy_skills and _is_linked_skill_dir(skill_dir)
+        keep_link = _is_linked_skill_dir(skill_dir)
         if not copy_skills or keep_link:
             try:
                 # Resolve to absolute so the symlink doesn't break when
                 # the source was a relative path (relative symlinks resolve
                 # against the link's parent, not the original cwd).
-                link_path.symlink_to(skill_dir.resolve())
+                link_codex_skills_dir(link_path, skill_dir.resolve())
                 continue
             except OSError as exc:
                 if keep_link:
@@ -889,11 +900,11 @@ def _populate_codex_skills(
                     exc,
                 )
         try:
-            # ``symlinks=True``: copy links as links. Dereferencing would
-            # materialize out-of-bundle targets (e.g. a link to a host
-            # credential) into a tree sandboxes re-expose; a copied escaping
-            # link merely dangles inside the mount namespace.
-            shutil.copytree(skill_dir, link_path, symlinks=True)
+            # Preserve symlinks and skip junctions so outside targets never
+            # become regular files in the session's readable directory.
+            shutil.copytree(
+                skill_dir, link_path, symlinks=True, ignore=_ignore_codex_skill_junctions
+            )
         except OSError as copy_exc:
             # Copying can fail too (unreadable source, race) — skip this
             # one skill rather than abort the whole session boot.
