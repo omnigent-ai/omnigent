@@ -12,64 +12,22 @@ name: CI
 on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
-    paths:
-      - 'omnigent/**'
-      - 'sdks/python-client/**'
-      - 'sdks/ui/**'
-      - 'examples/**'
-      - 'integrations/**'
-      - 'tests/**'
-      - '!tests/e2e_ui/**'
-      - '!tests/browser_ui/**'
-      - 'tests/e2e_ui/timings.py'
-      - 'dev/**'
-      - 'deploy/**'
-      - 'scripts/**'
-      - 'openapi.json'
-      - '.pre-commit-config.yaml'
-      - 'web/src/lib/attachments.ts'
-      - 'pyproject.toml'
-      - 'setup.py'
-      - 'uv.lock'
-      - 'uv.toml'
-      - '.python-version'
-      - 'package.json'
-      - 'pnpm-lock.yaml'
-      - 'pnpm-workspace.yaml'
-      - '.npmrc'
-      - '.github/**'
+    paths-ignore:
+      - 'docs/**'
+      - 'designs/**'
+      - 'CHANGELOG.md'
+      - 'tests/browser_ui/**'
   push:
     branches:
       - main
       # Release branches: release.yml's green-CI gate reads check runs off the
       # branch head, so cherry-picks and release-bump commits must run CI.
       - 'release/v[0-9]*'
-    paths:
-      - 'omnigent/**'
-      - 'sdks/python-client/**'
-      - 'sdks/ui/**'
-      - 'examples/**'
-      - 'integrations/**'
-      - 'tests/**'
-      - '!tests/e2e_ui/**'
-      - '!tests/browser_ui/**'
-      - 'tests/e2e_ui/timings.py'
-      - 'dev/**'
-      - 'deploy/**'
-      - 'scripts/**'
-      - 'openapi.json'
-      - '.pre-commit-config.yaml'
-      - 'web/src/lib/attachments.ts'
-      - 'pyproject.toml'
-      - 'setup.py'
-      - 'uv.lock'
-      - 'uv.toml'
-      - '.python-version'
-      - 'package.json'
-      - 'pnpm-lock.yaml'
-      - 'pnpm-workspace.yaml'
-      - '.npmrc'
-      - '.github/**'
+    paths-ignore:
+      - 'docs/**'
+      - 'designs/**'
+      - 'CHANGELOG.md'
+      - 'tests/browser_ui/**'
 
 permissions:
   contents: read
