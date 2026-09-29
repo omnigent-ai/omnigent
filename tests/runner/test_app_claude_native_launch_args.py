@@ -461,6 +461,7 @@ def test_routed_spawn_launch_args_gate_is_off_without_auto_harness() -> None:
         (["--permission-mode"], None),
         (["--model", "opus"], None),
         (["--permission-mode", "auto", "--permission-mode="], "auto"),
+        (["--dangerously-skip-permissions"], "bypassPermissions"),
     ],
 )
 def test_claude_launch_permission_mode_logs_only_known_values(

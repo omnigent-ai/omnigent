@@ -7737,10 +7737,16 @@ _CLAUDE_LAUNCH_PERMISSION_MODES = frozenset(
 
 
 def _claude_launch_permission_mode(args: list[str] | None) -> str | None:
-    """Return a known ``--permission-mode`` value without logging arbitrary args."""
-    from omnigent.harnesses.claude_native.bridge import _arg_value
+    """Return the effective known launch mode without logging arbitrary args."""
+    from omnigent.harnesses.claude_native.bridge import (
+        _arg_value,
+        _args_request_bypass_permissions,
+    )
 
-    candidate = _arg_value(tuple(args or ()), "--permission-mode")
+    launch_args = tuple(args or ())
+    if _args_request_bypass_permissions(launch_args):
+        return "bypassPermissions"
+    candidate = _arg_value(launch_args, "--permission-mode")
     return candidate if candidate in _CLAUDE_LAUNCH_PERMISSION_MODES else None
 
 
