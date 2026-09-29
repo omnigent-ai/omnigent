@@ -61,7 +61,13 @@ class Evidence:
         if not isinstance(body, dict) or isinstance(body.get("data"), list):
             return None
         sid = body.get("id")
-        if isinstance(sid, str) and sid and not sid.startswith("temp:") and "/" not in sid:
+        if (
+            isinstance(sid, str)
+            and sid
+            and sid not in {".", ".."}
+            and not sid.startswith("temp:")
+            and "/" not in sid
+        ):
             return sid
         return None
 
@@ -312,24 +318,15 @@ class Evidence:
             self.capture("trace_start", start_trace, context_id=key, phase="context_created")
             start, stop = context.tracing.start, context.tracing.stop
 
-            def caller_stop(*args, **kwargs):
+            def stop_trace(phase, *args, **kwargs):
                 # pytest-playwright stops tracing even with --tracing=off.
                 # Save its discarded chunk, then preserve the caller's stop result.
                 if not state["trace_active"]:
                     return stop(*args, **kwargs)
-                diagnostic = {"context_id": key, "phase": "caller_stop"}
+                diagnostic = {"context_id": key, "phase": phase}
 
                 def requested_stop():
-                    try:
-                        result = stop(*args, **kwargs)
-                    except Exception as exc:
-                        self.journal.emit(
-                            "collection_error",
-                            **self.journal.failure(
-                                "trace_stop", exc, **diagnostic, test_id=self.node
-                            ),
-                        )
-                        raise
+                    result = stop(*args, **kwargs)
                     state["tracing"] = False
                     state["trace_active"] = False
                     return result
@@ -357,9 +354,32 @@ class Evidence:
                     if temporary is not None:
                         self.capture("trace_cleanup", temporary.cleanup, **diagnostic)
 
+            def caller_stop(*args, **kwargs):
+                try:
+                    return stop_trace("caller_stop", *args, **kwargs)
+                except Exception as exc:
+                    self.journal.emit(
+                        "collection_error",
+                        **self.journal.failure(
+                            "trace_stop",
+                            exc,
+                            context_id=key,
+                            phase="caller_stop",
+                            test_id=self.node,
+                        ),
+                    )
+                    raise
+
+            state["stop_trace"] = stop_trace
+
             def caller_start(*args, **kwargs):
                 if state["tracing"]:
-                    self.capture("trace_stop", caller_stop, context_id=key, phase="owner_handoff")
+                    self.capture(
+                        "trace_stop",
+                        lambda: stop_trace("owner_handoff"),
+                        context_id=key,
+                        phase="owner_handoff",
+                    )
                     self.emit(
                         "trace_owner",
                         context_id=state["id"],
@@ -407,7 +427,7 @@ class Evidence:
                 if state["tracing"]:
                     self.capture(
                         "trace_stop",
-                        context.tracing.stop,
+                        lambda: state["stop_trace"]("before_browser_close"),
                         context_id=state["id"],
                         phase="before_browser_close",
                     )

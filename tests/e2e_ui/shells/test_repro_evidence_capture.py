@@ -363,6 +363,7 @@ def test_caller_stop_exception_is_preserved_with_optional_chunk_capture(
 
     monkeypatch.setattr(tracing_type, "stop", stop)
     collector = Evidence(tmp_path / "saved")
+    collector.node = "caller-stop-test"
     try:
         collector.install_browser()
         with browser.new_context() as context:
@@ -373,15 +374,50 @@ def test_caller_stop_exception_is_preserved_with_optional_chunk_capture(
                 assert collector.contexts[context]["trace_active"]
             finally:
                 fail_stop = False
-        assert any(
-            e["operation"] == "trace_stop" and e.get("detail") == "caller stop failed"
+        errors = [
+            e
             for e in collector.journal.errors
-        )
+            if e["operation"] == "trace_stop" and e.get("detail") == "caller stop failed"
+        ]
+        assert len(errors) == 1
+        assert errors[0]["test_id"] == "caller-stop-test"
     finally:
         collector.patch.undo()
 
 
-def test_optional_chunk_failure_does_not_change_caller_stop(tmp_path, browser, monkeypatch):
+def test_collector_close_records_native_stop_failure_once(tmp_path, browser, monkeypatch):
+    with browser.new_context() as probe:
+        tracing_type = type(probe.tracing)
+
+    def fail(tracing, *, path=None):
+        raise RuntimeError("native stop failed")
+
+    monkeypatch.setattr(tracing_type, "stop", fail)
+    collector = Evidence(tmp_path / "saved")
+    try:
+        collector.install_browser()
+        with browser.new_context() as context:
+            context.new_page().set_content("<p>observed</p>")
+        errors = [e for e in collector.journal.errors if e.get("detail") == "native stop failed"]
+        assert len(errors) == 1
+        assert errors[0]["phase"] == "before_browser_close"
+        saved_errors = [
+            e
+            for e in events(collector.directory)
+            if e["kind"] == "collection_error" and e.get("detail") == "native stop failed"
+        ]
+        assert len(saved_errors) == 1
+        assert context not in collector.contexts
+        assert list(collector.directory.glob("trace-*.zip"))
+        assert list(collector.directory.glob("screen-*.png"))
+    finally:
+        collector.patch.undo()
+
+
+@pytest.mark.parametrize("caller_stop", [False, True])
+def test_optional_chunk_failure_does_not_change_caller_stop(
+    tmp_path, browser, monkeypatch, caller_stop
+):
     collector = Evidence(tmp_path / "saved")
     try:
         collector.install_browser()
@@ -392,12 +428,16 @@ def test_optional_chunk_failure_does_not_change_caller_stop(tmp_path, browser, m
                 raise OSError("chunk storage unavailable")
 
             monkeypatch.setattr(context.tracing, "stop_chunk", fail)
-            context.tracing.stop()
-            assert not collector.contexts[context]["trace_active"]
-        assert any(
-            e["operation"] == "trace_stop" and e.get("detail") == "chunk storage unavailable"
+            if caller_stop:
+                context.tracing.stop()
+                assert not collector.contexts[context]["trace_active"]
+        errors = [
+            e
             for e in collector.journal.errors
-        )
+            if e["operation"] == "trace_stop" and e.get("detail") == "chunk storage unavailable"
+        ]
+        assert len(errors) == 1
+        assert errors[0]["phase"] == ("caller_stop" if caller_stop else "before_browser_close")
         assert list(collector.directory.glob("screen-*.png"))
     finally:
         collector.patch.undo()

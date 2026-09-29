@@ -1222,6 +1222,25 @@ def test_session_discovery_requires_matching_identity(tmp_path, sid):
     assert set(collector.sessions) == {("http://localhost", sid), ("http://localhost", "second")}
 
 
+@pytest.mark.parametrize("sid", [".", ".."])
+@pytest.mark.parametrize("route", ["/v1/sessions", "/v1/sessions/{sid}", "/c/{sid}"])
+def test_dot_only_session_identity_cannot_trigger_normalized_snapshot(
+    tmp_path, monkeypatch, sid, route
+):
+    reads = []
+
+    def send(client, request, **kwargs):
+        reads.append(str(request.url))
+        return httpx.Response(404, request=request)
+
+    monkeypatch.setattr(httpx.Client, "send", send)
+    collector = Evidence(tmp_path)
+    collector.session("http://localhost" + route.format(sid=sid.replace(".", "%2E")), {"id": sid})
+    collector.snapshot("test")
+    assert not collector.sessions
+    assert not reads
+
+
 @pytest.mark.parametrize("delete_status", [204, 403])
 def test_delete_snapshots_only_target_and_classifies_later_absence(
     tmp_path, monkeypatch, delete_status
