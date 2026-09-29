@@ -7,6 +7,7 @@
 
 import { type CSSProperties, useEffect, useState } from "react";
 import { createRoot } from "react-dom/client";
+import type { Runner } from "./pages/onboarding/RunnerStep";
 import { ServerSelectorV2, type ServerSelectorV2Setup } from "./pages/onboarding/ServerSelectorV2";
 import { maybeMockSetup } from "./pages/onboarding/mockSetup";
 import "./index.css";
@@ -21,7 +22,9 @@ interface OmnigentSetup {
   getManagedServers: () => Promise<string[]>;
   getRecentServers: () => Promise<string[]>;
   forgetRecentServer?: (url: string) => Promise<string[]>;
-  getRunnerOptions?: (url: string) => Promise<{ remote?: boolean } | null>;
+  getRunnerOptions?: (url: string) => Promise<{ remote?: boolean; bundledCli?: boolean } | null>;
+  connectRunner?: (url: string, runner: Runner) => Promise<{ ok?: boolean; error?: string }>;
+  onRunnerConnectLog?: (cb: (line: string) => void) => () => void;
   checkServer?: (url: string) => Promise<{ status: "ok" | "reachable" | "unreachable" }>;
   copyText: (text: string) => Promise<unknown>;
   setServerSelectorV2?: (enabled: boolean) => Promise<unknown>;
@@ -226,9 +229,23 @@ function BridgeSetupApp() {
       : undefined,
     // Older shells omit it → the runner step offers this laptop only.
     getRunnerOptions: setupBridge()?.getRunnerOptions
-      ? async (url) => ({
-          remote: (await setupBridge()?.getRunnerOptions?.(url))?.remote === true,
-        })
+      ? async (url) => {
+          const options = await setupBridge()?.getRunnerOptions?.(url);
+          return { remote: options?.remote === true, bundledCli: options?.bundledCli === true };
+        }
+      : undefined,
+    onConnectRunner: setupBridge()?.connectRunner
+      ? async (url, runner) => {
+          try {
+            const result = await setupBridge()?.connectRunner?.(url, runner);
+            return { ok: result?.ok === true, error: result?.error };
+          } catch (e) {
+            return { ok: false, error: e instanceof Error ? e.message : String(e) };
+          }
+        }
+      : undefined,
+    onRunnerLog: setupBridge()?.onRunnerConnectLog
+      ? (cb) => setupBridge()?.onRunnerConnectLog?.(cb) ?? (() => {})
       : undefined,
     // Only offered when the shell exposes the forget method (newer shells).
     onRemoveServer: setupBridge()?.forgetRecentServer

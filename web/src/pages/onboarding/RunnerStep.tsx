@@ -50,7 +50,7 @@ export function RunnerStep({
           {remoteAvailable && (
             <SelectItem value="remote">
               <Cloud className="size-4" aria-hidden />
-              Remote environment
+              Arca
             </SelectItem>
           )}
           <SelectItem value="local">

@@ -68,6 +68,7 @@ export function maybeMockSetup(params: URLSearchParams): ServerSelectorV2Setup |
   // onInstallLog registers the sink; onInstallCli emits into it and resolves
   // when the stream finishes.
   let installLog: ((line: string) => void) | null = null;
+  let runnerLog: ((line: string) => void) | null = null;
 
   return {
     initialUrl: recentServers[0] ?? managedServers[0] ?? "http://localhost:6767",
@@ -116,7 +117,38 @@ export function maybeMockSetup(params: URLSearchParams): ServerSelectorV2Setup |
     },
     getRunnerOptions: async (url) => {
       log("getRunnerOptions", url);
-      return { remote };
+      return { remote, bundledCli: remote };
+    },
+    onConnectRunner: (url, runner) => {
+      log("onConnectRunner", { url, runner });
+      const lines =
+        runner === "remote"
+          ? [
+              `$ remote-env host --server ${url}`,
+              "Starting the remote environment…",
+              "Host is running",
+            ]
+          : [
+              `$ omnigent host --server ${url}`,
+              "Signing in to the server if needed…",
+              "Connected this laptop.",
+            ];
+      return new Promise((resolve) => {
+        let i = 0;
+        const timer = setInterval(() => {
+          if (i < lines.length) runnerLog?.(lines[i++]);
+          else {
+            clearInterval(timer);
+            resolve({ ok: true });
+          }
+        }, 300);
+      });
+    },
+    onRunnerLog: (cb) => {
+      runnerLog = cb;
+      return () => {
+        if (runnerLog === cb) runnerLog = null;
+      };
     },
     onRemoveServer: (url) => log("onRemoveServer", url),
     onCopy: (text) => log("onCopy", text),

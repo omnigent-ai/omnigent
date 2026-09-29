@@ -3022,20 +3022,57 @@ function registerIpc() {
     };
   });
 
-  // Setup page → runners the onboarding runner step offers for `url`. The
-  // remote environment follows the same gate as the host picker's, plus the
-  // arca CLI being installed here.
+  // Setup page → runners the onboarding step offers for `url`: the remote
+  // environment behind the host picker's gate plus its CLI; `bundledCli` means
+  // the host CLI brings its own Omnigent, so onboarding skips the install.
   ipcMain.handle("omnigent:get-runner-options", (event, url) => {
     if (!isSetupPageSender(event)) {
       throw new Error("get-runner-options is only available to the setup page");
     }
-    return {
-      remote:
-        typeof url === "string" &&
-        databricksInternalFeaturesEnabled() &&
-        isDatabricksManagedServerUrl(url) &&
-        arca.resolveArcaPath() !== null,
+    const internal =
+      typeof url === "string" &&
+      databricksInternalFeaturesEnabled() &&
+      isDatabricksManagedServerUrl(url);
+    return { remote: internal && arca.resolveArcaPath() !== null, bundledCli: internal };
+  });
+
+  // Setup page → connect the runner picked in onboarding to `url`, streaming
+  // output, before the window opens the server. The Install click on this
+  // bundled page is the user's consent, so no enrollment dialog here.
+  ipcMain.handle("omnigent:connect-runner", async (event, url, runner) => {
+    if (!isSetupPageSender(event)) {
+      throw new Error("connect-runner is only available to the setup page");
+    }
+    if (runner !== "local" && runner !== "remote") throw new TypeError("unknown runner");
+    const managedTarget = managedServerUrls().find((candidate) => candidate === url);
+    const target = await expandDatabricksWorkspaceUrl(managedTarget ?? normalizeUrl(url));
+    const log = (line) => {
+      try {
+        event.sender.send("omnigent:runner-connect-log", { line });
+      } catch {
+        /* window torn down mid-connect */
+      }
     };
+    if (runner === "remote") {
+      if (!databricksInternalFeaturesEnabled() || !isDatabricksManagedServerUrl(target)) {
+        return { ok: false, error: "A remote environment isn't available for this server." };
+      }
+      const run = arca.startArcaConnect(target, { onOutput: log });
+      if (run.command) log(`$ ${run.command}`);
+      return run.promise;
+    }
+    const cliCommand = hostCliCommand(target);
+    if (!cliCommand) {
+      return { ok: false, error: "The Omnigent CLI was not found. Install it and try again." };
+    }
+    log(`$ ${omnigentCli.cliCommandParts(cliCommand).displayName} host --server ${target}`);
+    log("Signing in to the server if needed…");
+    const auth = await serverManager.ensureServerAuth(cliCommand, target);
+    if (!auth.ok) return { ok: false, error: auth.error };
+    const result = await serverManager.ensureHostConnected(cliCommand, target);
+    broadcastHostStatus();
+    if (result.ok) log("Connected this laptop.");
+    return { ok: result.ok, error: result.error };
   });
 
   ipcMain.handle("omnigent:copy-setup-text", (event, text) => {
