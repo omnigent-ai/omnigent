@@ -76,6 +76,8 @@ async def _connect_route(
     await communicator.send_input({"type": "websocket.connect"})
     accepted = await communicator.receive_output(timeout=budget(1.0))
     assert accepted["type"] == "websocket.accept", f"Expected {path} to accept; got {accepted!r}"
+    headers = dict(accepted.get("headers", []))
+    assert headers.get(b"server-timing", b"").startswith(b"omnigent-host-auth;dur=")
     return communicator
 
 

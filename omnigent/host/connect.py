@@ -24,11 +24,9 @@ from collections import OrderedDict
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
+from types import ModuleType
 from typing import TYPE_CHECKING, Literal, SupportsIndex, SupportsInt, TypeVar, cast
 
-import click
-import httpx
-import psutil
 import websockets.asyncio.client
 from websockets.exceptions import ConnectionClosed, InvalidStatus, InvalidURI
 
@@ -47,9 +45,12 @@ from omnigent.debug_logging import (
     runner_log_scope,
 )
 from omnigent.errors import ErrorCategory, ErrorImpact, ErrorPhase
-from omnigent.gateway_inference import gateway_inference_map
-from omnigent.harness_aliases import canonicalize_harness, is_claude_sdk_harness_name
 from omnigent.harness_availability import HARNESS_BINARY_MISSING, HarnessAvailability
+from omnigent.harness_tmp import (
+    HARNESS_TMP_PARENT_ENV_VAR,
+    absolute_harness_tmp_parent,
+    resolve_harness_tmp_parent,
+)
 from omnigent.host import HOST_FATAL_EXIT_CODE
 from omnigent.host.daemon_lifecycle import DaemonLifecycleLock
 from omnigent.host.frames import (
@@ -113,23 +114,8 @@ from omnigent.host.git_worktree import (
 from omnigent.host.identity import HostIdentity, load_or_create_host_identity
 from omnigent.host.maintenance import HostMaintenanceJanitor
 from omnigent.host.runner_zygote import ZygoteManager, ZygoteRunnerProc, ZygoteUnavailable
+from omnigent.host.startup_timing import HostStartupTiming, server_auth_timing_ms
 from omnigent.inner import _proc
-from omnigent.onboarding.harness_auth import (
-    adopt_env_credential,
-    detect_adoptable_credentials,
-    store_harness_credential,
-)
-from omnigent.onboarding.harness_install import (
-    harness_cli_installed,
-    harness_setup_hint,
-    try_install_harness_cli,
-    ui_install_key,
-)
-from omnigent.onboarding.harness_readiness import (
-    configured_harness_map,
-    harness_is_configured,
-)
-from omnigent.onboarding.provider_config import ANTHROPIC_FAMILY, OPENAI_FAMILY
 from omnigent.process_logging import (
     LOG_TTY_FD_ENV_VAR,
     PROCESS_LOG_FILE_ENV_VAR,
@@ -163,17 +149,6 @@ from omnigent.runner.transports.ws_tunnel.frames import (
     decode_frame,
     encode_frame,
 )
-from omnigent.runtime.harnesses.paths import (
-    HARNESS_TMP_PARENT_ENV_VAR,
-    absolute_harness_tmp_parent,
-    resolve_harness_tmp_parent,
-)
-from omnigent.runtime.websocket_metrics import (
-    record_websocket_connected,
-    record_websocket_disconnected,
-    websocket_close_code,
-    websocket_close_reason,
-)
 from omnigent.util.env_credentials import env_names_with_omnigent_prefix
 from omnigent.util.suspend_watch import watch_for_resume
 from omnigent.util.tls import client_ssl_context
@@ -182,8 +157,22 @@ from omnigent.util.tunnel_limits import (
     TUNNEL_KEEPALIVE_PING_TIMEOUT_S,
 )
 from omnigent.version import VERSION
+from omnigent.websocket_metrics import (
+    record_websocket_connect_bootstrap,
+    record_websocket_connected,
+    record_websocket_disconnected,
+    websocket_close_code,
+    websocket_close_reason,
+)
 
 if TYPE_CHECKING:
+    import httpx
+
+    from omnigent.onboarding.harness_auth import (
+        CredentialKind,
+        DetectedCredential,
+        StoreCredentialResult,
+    )
     from omnigent.workspace_fs import WorkspaceReader
 
 # Workspaces whose fs reader (and change registry) stay warm between requests.
@@ -231,6 +220,91 @@ def _harness_now_configured(harness: str) -> bool:
     _quick_probe_cache[harness] = now
     _quick_probe_cached[harness] = verdict
     return verdict
+
+
+def harness_is_configured(harness: str) -> bool:
+    """Import and run one readiness check off the connect import path."""
+    from omnigent.onboarding.harness_readiness import harness_is_configured as check
+
+    return check(harness)
+
+
+def configured_harness_map() -> dict[str, HarnessAvailability]:
+    """Import and run readiness discovery off the host's connect path."""
+    from omnigent.onboarding.harness_readiness import configured_harness_map
+
+    return configured_harness_map()
+
+
+def gateway_inference_map() -> dict[str, bool]:
+    """Import and build gateway metadata off the host's connect path."""
+    from omnigent.gateway_inference import gateway_inference_map
+
+    return gateway_inference_map()
+
+
+def harness_cli_installed(key: str) -> bool:
+    """Lazily check whether a UI-installable harness CLI exists."""
+    from omnigent.onboarding.harness_install import harness_cli_installed as check
+
+    return check(key)
+
+
+def harness_setup_hint(harness: str) -> str:
+    """Lazily build the user-facing harness setup hint."""
+    from omnigent.onboarding.harness_install import harness_setup_hint as hint
+
+    return hint(harness)
+
+
+def try_install_harness_cli(key: str) -> tuple[bool, str | None]:
+    """Lazily invoke the UI harness installer."""
+    from omnigent.onboarding.harness_install import try_install_harness_cli as install
+
+    return install(key)
+
+
+def ui_install_key(harness: str) -> str | None:
+    """Lazily map a harness name to its UI installer key."""
+    from omnigent.onboarding.harness_install import ui_install_key as resolve
+
+    return resolve(harness)
+
+
+def detect_adoptable_credentials() -> list[DetectedCredential]:
+    """Lazily discover non-secret ambient credential descriptors."""
+    from omnigent.onboarding.harness_auth import detect_adoptable_credentials as detect
+
+    return detect()
+
+
+def adopt_env_credential(*, family: str, env_var: str) -> StoreCredentialResult:
+    """Lazily persist one detected environment credential."""
+    from omnigent.onboarding.harness_auth import adopt_env_credential as adopt
+
+    return adopt(family=family, env_var=env_var)
+
+
+def store_harness_credential(
+    *,
+    family: str,
+    kind: CredentialKind,
+    secret: str,
+    base_url: str | None = None,
+    default_model: str | None = None,
+    wire_api: str | None = None,
+) -> StoreCredentialResult:
+    """Lazily persist one explicitly supplied harness credential."""
+    from omnigent.onboarding.harness_auth import store_harness_credential as store
+
+    return store(
+        family=family,
+        kind=kind,
+        secret=secret,
+        base_url=base_url,
+        default_model=default_model,
+        wire_api=wire_api,
+    )
 
 
 def _unavailable_harness_became_ready(
@@ -1084,6 +1158,8 @@ class HostProcess:
         server_url: str,
         lifecycle_lock: DaemonLifecycleLock | None = None,
         interactive_shells: list[str] | None = None,
+        startup_setup: Callable[[], None] | None = None,
+        startup_timing: HostStartupTiming | None = None,
     ) -> None:
         """Initialize the host process.
 
@@ -1094,6 +1170,11 @@ class HostProcess:
             and self-terminates once the record is deleted or reassigned.
         :param interactive_shells: Optional shell inventory override for tests.
             By default the host discovers its installed shells once at startup.
+        :param startup_setup: Optional host credential/configuration preparation.
+            It starts after the first accepted upgrade and is awaited before
+            initial capability discovery and the first runner launch.
+        :param startup_timing: Cold auto-daemon milestones, when this host was
+            launched through the lifecycle claim path.
         """
         self._identity = identity
         self._server_url = server_url.rstrip("/")
@@ -1111,6 +1192,13 @@ class HostProcess:
             self._interactive_shells = ["bash"]
         self._harness_tmp_parent = resolve_harness_tmp_parent()
         self._runners: dict[str, _RunnerHandle] = {}
+        self._startup_setup = startup_setup
+        self._startup_timing = startup_timing
+        self._startup_setup_task: asyncio.Task[None] | None = None
+        self._startup_setup_complete = asyncio.Event()
+        if startup_setup is None:
+            self._startup_setup_complete.set()
+        self._telemetry_import_task: asyncio.Task[ModuleType] | None = None
         from omnigent.host.skills import HostSkillDiscovery
 
         self._skill_discovery = HostSkillDiscovery(self._fetch_skill_bundle)
@@ -1286,6 +1374,8 @@ class HostProcess:
     @staticmethod
     def _orphan_child_pids() -> list[int]:
         """Snapshot direct children without consuming any exit status."""
+        import psutil
+
         try:
             return [child.pid for child in psutil.Process().children()]
         except psutil.Error:
@@ -1374,6 +1464,18 @@ class HostProcess:
 
         task.add_done_callback(_release)
         return await asyncio.shield(task)
+
+    async def _complete_startup_setup(self) -> None:
+        """Run deferred host setup and release initial capability discovery."""
+        assert self._startup_setup is not None
+        try:
+            await self._run_host_subprocess_in_thread(self._startup_setup)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            self._startup_setup_complete.set()
+            raise
+        self._startup_setup_complete.set()
 
     def _alive_runner_ids(self) -> list[str]:
         """Return IDs of runners that are still alive.
@@ -1783,6 +1885,10 @@ class HostProcess:
             ``"failed"`` result. Deterministic preflight refusals
             include a machine-readable ``error_code``.
         """
+        if self._startup_setup_task is not None:
+            with contextlib.suppress(Exception):
+                await asyncio.shield(self._startup_setup_task)
+
         # Refuse to spawn for a harness this machine can't actually run —
         # otherwise the runner starts, the session looks alive, and the
         # first turn dies confusingly inside the executor. ``None`` (an
@@ -1808,6 +1914,7 @@ class HostProcess:
                 harness_is_configured, frame.harness
             )
         if not harness_ready:
+            assert frame.harness is not None
             return self._launch_failed(
                 frame,
                 (
@@ -2930,6 +3037,8 @@ class HostProcess:
         :returns: Result with ``status`` ``"ok"``/``"failed"``, refreshed
             readiness on success, and a non-secret reason on failure.
         """
+        from omnigent.onboarding.provider_config import ANTHROPIC_FAMILY, OPENAI_FAMILY
+
         # Resolve the harness to a provider family, re-checking the allowlist.
         # claude→anthropic, codex→openai; pi consumes both and prefers anthropic
         # (its first fallback family), so a typed pi key lands on anthropic.
@@ -3185,6 +3294,8 @@ class HostProcess:
         """Read the bound session bundle using this host's existing credentials."""
         from urllib.parse import quote
 
+        import httpx
+
         path = quote(frame.session_id or "", safe="")
         return httpx.get(
             f"{self._server_url}/v1/sessions/{path}/agent/contents",
@@ -3288,6 +3399,10 @@ class HostProcess:
         resolves its own catalog at launch, and the in-session picker
         re-reads that authoritative snapshot after bind.
         """
+        import click
+
+        from omnigent.harness_aliases import canonicalize_harness, is_claude_sdk_harness_name
+
         harness = canonicalize_harness(frame.harness) or frame.harness
         with_source = functools.partial(_with_model_configuration_source, harness=harness)
         if harness == "codex-native":
@@ -3730,6 +3845,12 @@ class HostProcess:
         """Collect startup metadata before registration, with bounded fallback."""
         if self._capabilities_initialized:
             return
+        # Managed-host setup materializes the Databricks profile and broker
+        # sidecar used by gateway/readiness resolution. It cannot begin until
+        # the upgrade has authenticated, so keep pre-upgrade discovery pending
+        # rather than publishing an authoritative false snapshot from the
+        # unconfigured filesystem.
+        await self._startup_setup_complete.wait()
         generation = self._capability_generation
         try:
             configured, gateway = await asyncio.wait_for(
@@ -3841,6 +3962,14 @@ class HostProcess:
             authorization / outdated server, or a loopback server that
             kept refusing connections (the local server is gone).
         """
+        # Import telemetry beside the network dial, but install its process-wide
+        # instrumentation only after the upgrade so auth construction never
+        # races monkey-patching by an instrumentor.
+        self._telemetry_import_task = asyncio.create_task(
+            asyncio.to_thread(_load_host_telemetry),
+            name="host-telemetry-import",
+        )
+
         # Reap orphaned harness/tool grandchildren that reparent here when a
         # runner dies (this host is PID 1 in a container, or a subreaper
         # otherwise). Without this they pile up as <defunct> zombies and can
@@ -4096,6 +4225,14 @@ class HostProcess:
                 with contextlib.suppress(asyncio.CancelledError, Exception):
                     await self._capability_init_task
                 self._capability_init_task = None
+            if self._startup_setup_task is not None:
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await self._startup_setup_task
+                self._startup_setup_task = None
+            if self._telemetry_import_task is not None:
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await self._telemetry_import_task
+                self._telemetry_import_task = None
             if self._zygote_prestart_task is not None:
                 self._zygote_prestart_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError, Exception):
@@ -4185,11 +4322,16 @@ class HostProcess:
         # Fresh per-connection markers for the silent-connect streak.
         self._conn_upgrade_accepted = False
         self._conn_frame_received = False
+        startup_timing = self._startup_timing
+        if startup_timing is not None and not startup_timing.reported:
+            startup_timing.mark("attempt_started")
         url = self._tunnel_url()
         # Credential discovery may invoke the Databricks CLI. Keep it off the
         # event loop so startup capability discovery can make progress at the
         # same time instead of starting only after authentication completes.
         headers = await self._run_host_subprocess_in_thread(self._build_connect_headers)
+        if startup_timing is not None and not startup_timing.reported:
+            startup_timing.mark("headers_ready")
 
         _logger.info("Connecting to %s", url)
         # Build a verifying SSL context from a real CA bundle for wss:// — a bare
@@ -4197,7 +4339,11 @@ class HostProcess:
         # (no OpenSSL default cert path), which fails handshake verification.
         # ``ssl=None`` for ws:// is the library default (no TLS).
         ssl_ctx = client_ssl_context() if url.startswith("wss://") else None
+        if startup_timing is not None and not startup_timing.reported:
+            startup_timing.mark("tls_ready")
         try:
+            if startup_timing is not None and not startup_timing.reported:
+                startup_timing.mark("upgrade_started")
             ws_cm = websockets.asyncio.client.connect(
                 url,
                 additional_headers=headers,
@@ -4224,6 +4370,16 @@ class HostProcess:
             if fatal is not None:
                 raise fatal from exc
             raise
+        if startup_timing is not None and not startup_timing.reported:
+            startup_timing.mark("upgrade_accepted")
+        # Credential/config preparation can write Databricks auth files, so it
+        # starts only after the upgrade's token resolution is complete. Initial
+        # capability discovery and the first runner launch both join it.
+        if self._startup_setup is not None and self._startup_setup_task is None:
+            self._startup_setup_task = asyncio.create_task(
+                self._complete_startup_setup(),
+                name="host-startup-setup",
+            )
         # An accepted upgrade proves the credentials work: login redirects
         # from here on are server restarts, not an unauthenticated host.
         reconnect = self._ever_connected
@@ -4236,9 +4392,38 @@ class HostProcess:
         # A completed upgrade proves the endpoint healthy — the next drop's
         # prompt reconnect is wanted again.
         self._recycle_streak = 0
-        record_websocket_connected("host", reconnect=reconnect)
         disconnect_error: BaseException | None = None
         try:
+            if self._telemetry_import_task is not None:
+                # The import survives caller cancellation, but cancellation of
+                # the host connection itself must still reach run() shutdown.
+                with contextlib.suppress(Exception):
+                    telemetry = await asyncio.shield(self._telemetry_import_task)
+                    telemetry.init("omni-host")
+            record_websocket_connected("host", reconnect=reconnect)
+            if startup_timing is not None and not startup_timing.reported:
+                response = getattr(ws, "response", None)
+                server_auth_ms = server_auth_timing_ms(getattr(response, "headers", None))
+                phases_ms = startup_timing.durations_ms(server_auth_ms=server_auth_ms)
+                startup_timing.reported = True
+                record_websocket_connect_bootstrap(phases_ms)
+                _logger.info(
+                    "Cold host bootstrap reached accepted WebSocket upgrade",
+                    extra=debug_event(
+                        "host_bootstrap",
+                        phase="upgrade_accepted",
+                        identity_config_ms=phases_ms.get("identity_config"),
+                        daemon_record_ms=phases_ms.get("daemon_record"),
+                        host_connect_import_ms=phases_ms.get("host_connect_import"),
+                        connect_headers_ms=phases_ms.get("connect_headers"),
+                        tls_context_ms=phases_ms.get("tls_context"),
+                        client_bootstrap_ms=phases_ms.get("client_bootstrap"),
+                        upgrade_wait_ms=phases_ms.get("upgrade_wait"),
+                        server_auth_upgrade_ms=phases_ms.get("server_auth_upgrade"),
+                        network_handshake_ms=phases_ms.get("network_handshake"),
+                        claim_to_upgrade_ms=phases_ms.get("claim_to_upgrade"),
+                    ),
+                )
             await self._ensure_owner_user_id(headers=headers)
             await self._serve_frames(ws)
         except BaseException as exc:
@@ -4807,6 +4992,36 @@ def _generate_ucode_configs() -> None:
     )
 
 
+def _load_host_telemetry() -> ModuleType:
+    """Import host telemetry beside the dial without instrumenting concurrently."""
+    from omnigent.runtime import telemetry
+
+    return telemetry
+
+
+def _configure_host_runtime(server_url: str, host_id: str) -> None:
+    """Prepare host-owned credentials/config before the first runner launch."""
+    try:
+        from omnigent.git_credential_github import (
+            configure_host_gh,
+            configure_host_git,
+            start_host_gh_refresh,
+        )
+
+        configure_host_git(server_url, host_id)
+        configure_host_gh(server_url, host_id)
+        start_host_gh_refresh(server_url, host_id)
+    except Exception:
+        _logger.exception("Failed to configure host GitHub credentials")
+    try:
+        from omnigent.host.databricks_credential import configure_host_databricks
+
+        configure_host_databricks(server_url, host_id)
+        _generate_ucode_configs()
+    except Exception:
+        _logger.exception("Failed to configure host Databricks credentials")
+
+
 def run_host_process(
     server_url: str,
     config_path: Path | None = None,
@@ -4814,6 +5029,9 @@ def run_host_process(
     daemon_target: str | None = None,
     lifecycle_lock: DaemonLifecycleLock | None = None,
     interactive_shells: list[str] | None = None,
+    identity: HostIdentity | None = None,
+    host_log_path: Path | None = None,
+    startup_timing: HostStartupTiming | None = None,
 ) -> None:
     """Entry point for ``omnigent host``.
 
@@ -4833,35 +5051,36 @@ def run_host_process(
         for the host process lifetime instead of acquiring another handle.
     :param interactive_shells: Optional shell inventory override for tests.
         By default the host discovers its installed shells once at startup.
+    :param identity: Identity already loaded by the auto-daemon entrypoint.
+        Foreground hosts leave this unset and load it here.
+    :param host_log_path: Log path already configured by the auto-daemon
+        entrypoint. Foreground hosts leave this unset.
+    :param startup_timing: Cold auto-daemon milestones from its lifecycle
+        claim, or ``None`` for a foreground host.
     :raises SystemExit: With :data:`HOST_FATAL_EXIT_CODE` when the tunnel
         fails permanently (auth / authorization / outdated server, or a
         loopback server that is gone). The actionable cause is printed
         to stderr first.
     """
-    host_log_path = configure_process_logging(
-        "host",
-        log_to_stderr=should_log_to_stderr() or sys.stderr.isatty(),
-    )
-    # Initialize tracing so the host daemon exports its own spans
-    # (e.g. handling launch_runner / stat / list_dir frames) into the
-    # same distributed trace as the server that requested them. The
-    # daemon inherits OTEL_*/MLFLOW_* config from the launching CLI.
-    from omnigent.runtime import telemetry
-
-    telemetry.init("omni-host")
+    if host_log_path is None:
+        host_log_path = configure_process_logging(
+            "host",
+            log_to_stderr=should_log_to_stderr() or sys.stderr.isatty(),
+        )
 
     from omnigent.host.identity import host_config_path
 
     path = host_config_path(config_path)
-    try:
-        identity = load_or_create_host_identity(path)
-    except ValueError as exc:
-        print(
-            f"\n✗ Could not start host.\n{exc}",
-            file=sys.stderr,
-            flush=True,
-        )
-        raise SystemExit(HOST_FATAL_EXIT_CODE) from None
+    if identity is None:
+        try:
+            identity = load_or_create_host_identity(path)
+        except ValueError as exc:
+            print(
+                f"\n✗ Could not start host.\n{exc}",
+                file=sys.stderr,
+                flush=True,
+            )
+            raise SystemExit(HOST_FATAL_EXIT_CODE) from None
     if not path.exists():
         print(f"Auto-generated {path} ({identity.host_id}, name: {identity.name})")
     # User-facing: the display form (workspace /omnigent URL with ?o= when
@@ -4884,36 +5103,6 @@ def run_host_process(
     if _cli_log is not None and _cli_log != host_log_path:
         print(f"CLI diagnostics: {display_log_path(_cli_log)}")
 
-    # Executor-agnostic GitHub setup: point git at the server's credential
-    # broker and attribute commits to the owner. Best-effort; the host runs in
-    # every executor and holds the launch token, so no launcher needs to inject
-    # anything GitHub-specific.
-    from omnigent.git_credential_github import (
-        configure_host_gh,
-        configure_host_git,
-        start_host_gh_refresh,
-    )
-
-    configure_host_git(server_url, identity.host_id)
-    # gh CLI ignores git's credential.helper for its own API calls, so also
-    # materialize the owner's brokered token into gh's hosts.yml, then keep it
-    # fresh: git re-fetches per op via the broker, but gh reads a static
-    # hosts.yml, so a background thread re-writes it before the GitHub token
-    # expires (~8h). All three are no-ops outside a managed sandbox; the refresher
-    # runs regardless of the startup write (its ticks re-fetch, so a transient
-    # broker blip at startup can't strand a connected owner for the whole session).
-    configure_host_gh(server_url, identity.host_id)
-    start_host_gh_refresh(server_url, identity.host_id)
-
-    # Executor-agnostic Databricks setup: when the owner has linked a workspace,
-    # materialize their per-user token as a ``~/.databrickscfg`` profile so the
-    # agent's model serving + MCP route through their Databricks AI Gateway.
-    # Best-effort; a no-op when Databricks isn't connected/configured.
-    from omnigent.host.databricks_credential import configure_host_databricks
-
-    configure_host_databricks(server_url, identity.host_id)
-    _generate_ucode_configs()
-
     if lifecycle_lock is None and daemon_target is not None:
         lifecycle_lock = DaemonLifecycleLock.for_target(daemon_target)
     host = HostProcess(
@@ -4921,6 +5110,8 @@ def run_host_process(
         server_url,
         lifecycle_lock=lifecycle_lock,
         interactive_shells=interactive_shells,
+        startup_setup=functools.partial(_configure_host_runtime, server_url, identity.host_id),
+        startup_timing=startup_timing,
     )
     try:
         asyncio.run(host.run())

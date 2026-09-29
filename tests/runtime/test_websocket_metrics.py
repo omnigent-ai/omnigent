@@ -10,6 +10,7 @@ from opentelemetry.util.types import Attributes
 from websockets.exceptions import ConnectionClosedError
 
 from omnigent.runtime.websocket_metrics import (
+    CONNECT_BOOTSTRAP_DURATION_METRIC_NAME,
     CONNECTIONS_METRIC_NAME,
     DISCONNECTIONS_METRIC_NAME,
     ClientWebSocketMetrics,
@@ -41,10 +42,22 @@ class _Counter:
 
 
 @dataclass
+class _Histogram:
+    """Fake OpenTelemetry histogram."""
+
+    records: list[_Record] = field(default_factory=list)
+
+    def record(self, amount: int | float, attributes: Attributes = None) -> None:
+        """Record one histogram observation."""
+        self.records.append(_Record(amount, attributes))
+
+
+@dataclass
 class _Meter:
     """Fake OpenTelemetry meter."""
 
     counters: dict[str, _Counter] = field(default_factory=dict)
+    histograms: dict[str, _Histogram] = field(default_factory=dict)
 
     def create_counter(
         self,
@@ -57,6 +70,18 @@ class _Meter:
         counter = _Counter()
         self.counters[name] = counter
         return counter
+
+    def create_histogram(
+        self,
+        name: str,
+        unit: str = "",
+        description: str = "",
+    ) -> _Histogram:
+        """Create a named fake histogram."""
+        del unit, description
+        histogram = _Histogram()
+        self.histograms[name] = histogram
+        return histogram
 
 
 @dataclass(frozen=True)
@@ -147,6 +172,19 @@ def test_records_normalized_disconnect_and_close_code() -> None:
     ]
 
 
+def test_records_cold_host_bootstrap_phases() -> None:
+    """Bootstrap durations use a bounded phase label on one histogram."""
+    meter = _Meter()
+    metrics = ClientWebSocketMetrics(meter)
+
+    metrics.record_connect_bootstrap({"client_bootstrap": 123.4, "network_handshake": 45.6})
+
+    assert meter.histograms[CONNECT_BOOTSTRAP_DURATION_METRIC_NAME].records == [
+        _Record(123.4, {"tunnel.kind": "host", "bootstrap.phase": "client_bootstrap"}),
+        _Record(45.6, {"tunnel.kind": "host", "bootstrap.phase": "network_handshake"}),
+    ]
+
+
 def test_public_recorders_respect_telemetry_opt_in(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -154,7 +192,7 @@ def test_public_recorders_respect_telemetry_opt_in(
     calls: list[ClientWebSocketMetrics] = []
     monkeypatch.delenv("OMNIGENT_TELEMETRY_ENABLED", raising=False)
     monkeypatch.setattr(
-        "omnigent.runtime.websocket_metrics._default_metrics",
+        "omnigent.websocket_metrics._default_metrics",
         lambda: calls.append(ClientWebSocketMetrics(_Meter())) or calls[-1],
     )
 

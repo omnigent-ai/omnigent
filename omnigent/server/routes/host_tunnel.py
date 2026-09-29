@@ -157,6 +157,7 @@ def create_host_tunnel_router(
         7. Start sender, receiver, and ping loops.
         8. On disconnect: deregister, set offline in DB.
         """
+        pre_accept_started = time.monotonic()
         # Legacy hosts dial in with ``host_<hex>`` — normalise to the stored
         # bare form. Malformed ids are refused here because WebSocket routes
         # bypass the app's StatementError→404 handler.
@@ -258,7 +259,15 @@ def create_host_tunnel_router(
                 )
                 return
 
-        await ws.accept()
+        auth_upgrade_ms = max(0.0, (time.monotonic() - pre_accept_started) * 1000)
+        await ws.accept(
+            headers=[
+                (
+                    b"server-timing",
+                    f"omnigent-host-auth;dur={auth_upgrade_ms:.1f}".encode("ascii"),
+                )
+            ]
+        )
         conn: HostConnection | None = None
         host_persisted = False
         stage = "hello"

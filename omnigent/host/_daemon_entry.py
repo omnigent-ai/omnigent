@@ -72,9 +72,13 @@ def main() -> None:
         return
 
     try:
+        from omnigent.host.startup_timing import HostStartupTiming
+
+        startup_timing = HostStartupTiming()
         from omnigent.host.identity import load_or_create_host_identity
 
         identity = load_or_create_host_identity()
+        startup_timing.mark("identity_ready")
         mode = "local" if args.local else "server"
         record = HostDaemonRecord(
             pid=os.getpid(),
@@ -87,6 +91,7 @@ def main() -> None:
             config_sig=os.environ.get(DAEMON_CONFIG_SIG_ENV_VAR),
         )
         write_daemon_record(record, update_legacy_pidfile=True)
+        startup_timing.mark("record_written")
 
         if args.local:
             # The daemon owns the local server: start/reuse it, then connect.
@@ -96,12 +101,18 @@ def main() -> None:
         else:
             server_url = args.server
 
+        startup_timing.mark("connect_import_started")
         from omnigent.host.connect import run_host_process
+
+        startup_timing.mark("connect_imported")
 
         run_host_process(
             server_url=server_url,
             daemon_target=daemon_target,
             lifecycle_lock=lifecycle_lock,
+            identity=identity,
+            host_log_path=log_path,
+            startup_timing=startup_timing,
         )
     finally:
         lifecycle_lock.release()

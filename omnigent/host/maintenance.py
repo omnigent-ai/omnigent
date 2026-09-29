@@ -106,11 +106,11 @@ class HostMaintenanceJanitor:
         harness_tmp_parent: Path | None = None,
     ) -> HostMaintenanceJanitor:
         """Build the machine-global cleanup stages for a host daemon."""
-        from omnigent.process_logging import data_dir
-        from omnigent.runtime.harnesses.paths import (
+        from omnigent.harness_tmp import (
             absolute_harness_tmp_parent,
             resolve_harness_tmp_parent,
         )
+        from omnigent.process_logging import data_dir
 
         resolved_harness_tmp_parent = (
             absolute_harness_tmp_parent(harness_tmp_parent)

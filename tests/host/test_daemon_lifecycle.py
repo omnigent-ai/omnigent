@@ -236,9 +236,20 @@ def test_background_daemon_claims_record_before_connecting(
 
     connected: list[str] = []
 
-    def _run(*, server_url: str, daemon_target: str, lifecycle_lock: object) -> None:
+    def _run(
+        *,
+        server_url: str,
+        daemon_target: str,
+        lifecycle_lock: object,
+        identity: HostIdentity,
+        host_log_path: Path,
+        startup_timing: object,
+    ) -> None:
         assert record_flock_is_held(daemon_record_path(target, base_dir=tmp_path)) is True
         assert lifecycle_lock is not None
+        assert identity.host_id == "host_elected"
+        assert host_log_path == log_path
+        assert startup_timing is not None
         connected.append(f"{server_url}|{daemon_target}")
 
     monkeypatch.setattr("omnigent.host.connect.run_host_process", _run)
