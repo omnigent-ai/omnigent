@@ -157,21 +157,20 @@ def _get_cost_policy_oldest_period(specs: list[PolicySpec]) -> str | None:
     def period_start_date(period: str) -> datetime:
         if period == "day":
             return datetime.combine(dt.date(), datetime.min.time(), tzinfo=timezone.utc)
-        elif period == "week":
+        if period == "week":
             # ISO week starts on Monday
             start = dt.date() - timedelta(days=dt.weekday())
             return datetime.combine(start, datetime.min.time(), tzinfo=timezone.utc)
-        elif period == "month":
+        if period == "month":
             return datetime(dt.year, dt.month, 1, tzinfo=timezone.utc)
-        elif period == "quarter":
+        if period == "quarter":
             quarter = (dt.month - 1) // 3 + 1
             start_month = (quarter - 1) * 3 + 1
             return datetime(dt.year, start_month, 1, tzinfo=timezone.utc)
-        elif period == "year":
+        if period == "year":
             return datetime(dt.year, 1, 1, tzinfo=timezone.utc)
-        else:
-            # Unknown period, treat as day
-            return datetime.combine(dt.date(), datetime.min.time(), tzinfo=timezone.utc)
+        # Unknown period, treat as day
+        return datetime.combine(dt.date(), datetime.min.time(), tzinfo=timezone.utc)
 
     # Find the period with the oldest start date
     oldest_period = min(periods, key=period_start_date)
@@ -195,8 +194,6 @@ def _needs_subtree_usage(specs: list[PolicySpec]) -> bool:
         and s.function.path == _SUBAGENT_COST_POLICY_PATH
         for s in specs
     )
-
-
 
 
 def _normalize_usage_for_engine(usage: dict[str, float]) -> dict[str, float]:
