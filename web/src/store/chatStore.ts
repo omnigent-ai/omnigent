@@ -4425,11 +4425,11 @@ function reconnectStatusPatch(
   } else if (
     session.status === "running" &&
     session.activeResponseId != null &&
-    s.activeResponse?.responseId !== session.activeResponseId
+    (s.activeResponse?.responseId !== session.activeResponseId || isStaleCompletedResponse(s))
   ) {
     // Mid-turn (re)connect: reopen the streaming lifecycle from the snapshot.
-    // Guarded on a differing responseId so we never downgrade a live
-    // activeResponse that already matches (e.g. one cancelled in this tab).
+    // A stale completion of this same id must not suppress a continuing turn;
+    // leave a locally cancelled response with the same id untouched.
     patch.activeResponse = {
       responseId: session.activeResponseId,
       state: "streaming",
@@ -5529,13 +5529,10 @@ async function* tapLiveDeltas(
     }
     if (ev.type === "text_delta" && ev.messageId !== undefined) {
       if (!isConversationDisposed(id) && !ignored.has(ev.messageId)) {
-        // A scheduled wake streams its first deltas ahead of the batch
-        // that names the new turn. They must not preview into the
-        // PREVIOUS turn's bubble (anonymous blocks glue to the trailing
-        // group — killing its fold and inflating its worked-for span):
-        // ignore the rest of the message so its text renders only via the
-        // authoritative item, which lands in the new turn's bubble.
-        if (isStaleCompletedResponse(get())) {
+        // An unnamed scheduled wake must not preview into a completed turn.
+        // A running snapshot proves work resumed even if the restarted server
+        // lost its active response id; its preview gets a synthetic bubble.
+        if (isStaleCompletedResponse(get()) && get().sessionStatus !== "running") {
           ignored.add(ev.messageId);
           continue;
         }

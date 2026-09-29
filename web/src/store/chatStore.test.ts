@@ -10943,6 +10943,154 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     await loop;
   });
 
+  it("reopens a stale completed native turn when its running snapshot has the same id", async () => {
+    seedSession("conv_stale_running", []);
+    const sinks = routeStreamOpens(["server-a", "server-b"]);
+    const normalFetch = fetchMock.getMockImplementation()!;
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url.startsWith("/v1/sessions/conv_stale_running?") && (init?.method ?? "GET") === "GET") {
+        return mockResponse({
+          id: "conv_stale_running",
+          agent_id: "agent_xyz",
+          status: "running",
+          active_response_id: "resp_same",
+          created_at: 0,
+          items: [],
+          labels: { "omnigent.wrapper": "claude-code-native-ui" },
+        });
+      }
+      return normalFetch(input, init);
+    });
+    const controller = new AbortController();
+    const bound = bindConversationForTest("conv_stale_running", {
+      abortController: controller,
+      sessionStatus: "running",
+      isNativeTerminalSession: true,
+      activeResponse: {
+        responseId: "resp_same",
+        state: "completed",
+        error: null,
+        completedAt: Date.now() - 60_000,
+      },
+    });
+    const loop = startStreamPump("conv_stale_running", controller, bound.set, bound.get);
+    try {
+      await vi.advanceTimersByTimeAsync(1);
+      sinks[0]!.close();
+      await vi.advanceTimersByTimeAsync(6000);
+      expect(sinks).toHaveLength(2);
+      expect(bound.get().activeResponse?.state).toBe("streaming");
+
+      sinks[1]!.push(
+        sse("response.output_text.delta", { message_id: "m1", index: 1, delta: "resumed" }),
+      );
+      await vi.advanceTimersByTimeAsync(20);
+      expect(bound.get().blocks.find((b) => b.ctx.itemId === "live:m1")).toMatchObject({
+        fullText: "resumed",
+      });
+    } finally {
+      controller.abort();
+      const last = sinks[sinks.length - 1];
+      if (last) {
+        last.push("data: [DONE]\n\n");
+        last.close();
+      }
+      await vi.advanceTimersByTimeAsync(20);
+      await loop;
+    }
+  });
+
+  it("shows native deltas when a restarted server lost the active response id", async () => {
+    seedSession("conv_stale_no_id", []);
+    const sinks = routeStreamOpens(["server-a", "server-b"]);
+    const normalFetch = fetchMock.getMockImplementation()!;
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url.startsWith("/v1/sessions/conv_stale_no_id?") && (init?.method ?? "GET") === "GET") {
+        return mockResponse({
+          id: "conv_stale_no_id",
+          agent_id: "agent_xyz",
+          status: "running",
+          active_response_id: null,
+          created_at: 0,
+          items: [],
+          labels: { "omnigent.wrapper": "claude-code-native-ui" },
+        });
+      }
+      return normalFetch(input, init);
+    });
+    const controller = new AbortController();
+    const bound = bindConversationForTest("conv_stale_no_id", {
+      abortController: controller,
+      sessionStatus: "running",
+      isNativeTerminalSession: true,
+      activeResponse: {
+        responseId: "resp_same",
+        state: "completed",
+        error: null,
+        completedAt: Date.now() - 60_000,
+      },
+    });
+    const loop = startStreamPump("conv_stale_no_id", controller, bound.set, bound.get);
+    try {
+      await vi.advanceTimersByTimeAsync(1);
+      sinks[0]!.close();
+      await vi.advanceTimersByTimeAsync(6000);
+      expect(sinks).toHaveLength(2);
+      expect(bound.get().sessionStatus).toBe("running");
+      sinks[1]!.push(
+        sse("response.output_text.delta", { message_id: "m1", index: 1, delta: "resumed" }),
+      );
+      await vi.advanceTimersByTimeAsync(20);
+      expect(bound.get().blocks.find((b) => b.ctx.itemId === "live:m1")).toMatchObject({
+        fullText: "resumed",
+        ctx: { responseId: "live:m1" },
+      });
+    } finally {
+      controller.abort();
+      const last = sinks[sinks.length - 1];
+      if (last) {
+        last.push("data: [DONE]\n\n");
+        last.close();
+      }
+      await vi.advanceTimersByTimeAsync(20);
+      await loop;
+    }
+  });
+
+  it("still suppresses a stale native delta while the session is idle", async () => {
+    seedSession("conv_stale_idle", []);
+    const sinks = routeStreamOpens();
+    const controller = new AbortController();
+    const bound = bindConversationForTest("conv_stale_idle", {
+      abortController: controller,
+      sessionStatus: "idle",
+      isNativeTerminalSession: true,
+      activeResponse: {
+        responseId: "resp_old",
+        state: "completed",
+        error: null,
+        completedAt: Date.now() - 60_000,
+      },
+    });
+    const loop = startStreamPump("conv_stale_idle", controller, bound.set, bound.get);
+    try {
+      await vi.advanceTimersByTimeAsync(1);
+      sinks[0]!.push(
+        sse("response.output_text.delta", { message_id: "old", index: 0, delta: "stale" }),
+      );
+      await vi.advanceTimersByTimeAsync(20);
+      expect(bound.get().blocks.some((b) => b.ctx.itemId === "live:old")).toBe(false);
+    } finally {
+      controller.abort();
+      sinks[0]!.push("data: [DONE]\n\n");
+      sinks[0]!.close();
+      await vi.advanceTimersByTimeAsync(20);
+      await loop;
+    }
+  });
+
   it("suppresses delayed previews after snapshot-only completion recovery", async () => {
     seedSession("conv_native_tombstone", []);
     const sinks = routeStreamOpens();
