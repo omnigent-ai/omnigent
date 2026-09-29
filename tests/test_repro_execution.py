@@ -1360,18 +1360,34 @@ sys.exit(7)
 
 
 @pytest.mark.parametrize("status", [200, 403, 404])
-def test_known_session_subresources_keep_test_and_browser_association(tmp_path, status):
+@pytest.mark.parametrize("surface", ["items", "responses"])
+def test_known_session_subresources_keep_test_and_browser_association(tmp_path, status, surface):
     collector = Evidence(tmp_path)
     collector.node = "first-test"
     collector.session("http://localhost/v1/sessions/known", {"id": "known"})
     collector.node = "second-test"
     state = {"sessions": set()}
     collector.session(
-        "http://localhost/v1/sessions/known/items", {"data": []}, state=state, status=status
+        f"http://localhost/v1/sessions/known/{surface}", {"data": []}, state=state, status=status
     )
     collector.session("http://localhost/v1/sessions/projects/items", {"data": []}, state=state)
     assert collector.sessions == {("http://localhost", "known"): {"first-test", "second-test"}}
     assert state["sessions"] == {("http://localhost", "known")}
+
+
+@pytest.mark.parametrize("surface", ["items", "responses"])
+def test_subresource_only_traffic_does_not_discover_external_session(tmp_path, surface):
+    collector = Evidence(tmp_path)
+    collector.node = "observer-test"
+    state = {"sessions": set()}
+    collector.session(
+        f"http://localhost/v1/sessions/external/{surface}",
+        {"id": "item-1", "data": []},
+        state=state,
+    )
+    assert not collector.sessions
+    assert not state["sessions"]
+    assert not any(e["kind"] == "product_session" for e in events(tmp_path))
 
 
 def test_failure_details_survive_unserializable_context(tmp_path):

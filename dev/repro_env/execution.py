@@ -344,8 +344,7 @@ def run(
             "Agent-workspace observations, not an independent verifier.",
             "Only wrapped commands and supported pytest/browser paths are instrumented.",
             "No observed event does not prove an action was absent.",
-            "Background processes may outlive the command; "
-            "their final journal flush is not guaranteed.",
+            "Background processes may outlive the command and fail to flush their journals.",
         ],
     }
 
