@@ -246,8 +246,7 @@ async def test_waiting_event_consumer_settles_on_client_close() -> None:
                 "client.close() — teardown leaves consumers hanging"
             )
             assert consumer.exception() is not None, (
-                "a closed client's consumer must terminate or raise, "
-                "not fabricate a notification"
+                "a closed client's consumer must terminate or raise, not fabricate a notification"
             )
         finally:
             await _cancel_quietly(consumer)

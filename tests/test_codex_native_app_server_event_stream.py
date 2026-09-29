@@ -69,8 +69,7 @@ async def test_reconnected_client_streams_live_events() -> None:
             await client.notify("probe/disconnect")
             done, _ = await asyncio.wait({first}, timeout=_SETTLE_DEADLINE)
             assert first in done, (
-                f"event consumer still blocked {_SETTLE_DEADLINE}s after the "
-                "app-server disconnect"
+                f"event consumer still blocked {_SETTLE_DEADLINE}s after the app-server disconnect"
             )
         finally:
             first.cancel()
