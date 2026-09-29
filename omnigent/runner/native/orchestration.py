@@ -5400,17 +5400,6 @@ async def _auto_create_codex_terminal(
         _AUTO_CODEX_APP_SERVERS.pop(session_id, None)
         raise
 
-    if launch_config.external_session_id is not None:
-        _logger.info(
-            "Codex native input ready",
-            extra=debug_event(
-                "native_input_ready",
-                session_id=session_id,
-                harness="codex-native",
-                stage="native_input",
-            ),
-        )
-
     # Known-thread resumes publish bridge state before the terminal starts;
     # only fresh discovery needs to extend the executor's state wait.
     if launch_config.external_session_id is None and thread_start_timeout_seconds is not None:
@@ -5967,16 +5956,6 @@ async def _codex_discover_thread_and_forward(
                 # The session workspace: without it the executor falls back
                 # to the runner process's own cwd when starting turns.
                 cwd=workspace,
-            ),
-        )
-
-        _logger.info(
-            "Codex native input ready",
-            extra=debug_event(
-                "native_input_ready",
-                session_id=session_id,
-                harness="codex-native",
-                stage="native_input",
             ),
         )
 

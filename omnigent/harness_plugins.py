@@ -107,6 +107,9 @@ class NativeHarnessProvider:
     stop_handler: str | None = None
     materialize_agent_spec: str | None = None  # built-in agent seeding
     bridge_dir: str | None = None  # cost-popup bridge-dir lookup
+    # ``(session_id, instance) -> bool`` polled by the runner's terminal watcher
+    # until the native TUI accepts input, which then logs ``native_input_ready``.
+    input_ready_probe: str | None = None
 
 
 @dataclass(frozen=True)
@@ -271,6 +274,11 @@ HERMES_NATIVE_CODING_AGENT = NativeCodingAgent(
 # handled as a spawn-env special case rather than a plain label read.
 _BRIDGE_ID_LABEL_HARNESSES: frozenset[str] = frozenset({"codex", "opencode", "antigravity"})
 
+# Native harnesses whose ``.bridge`` module exports ``native_input_ready``.
+# ``tests/test_harness_plugins.py`` pins the harnesses without one, so a new
+# built-in harness has to either add a probe or opt out explicitly.
+_INPUT_READY_PROBE_HARNESSES: frozenset[str] = frozenset({"claude", "codex", "pi"})
+
 
 def _builtin_native_provider(key: str) -> NativeHarnessProvider:
     """Build a built-in provider row from the ``omnigent.<key>_native`` module.
@@ -296,6 +304,9 @@ def _builtin_native_provider(key: str) -> NativeHarnessProvider:
             f"omnigent.{key}_native.bridge_id" if key in _BRIDGE_ID_LABEL_HARNESSES else None
         ),
         materialize_agent_spec=f"{module}:_materialize_{key}_agent_spec",
+        input_ready_probe=(
+            f"{pkg}.bridge:native_input_ready" if key in _INPUT_READY_PROBE_HARNESSES else None
+        ),
     )
 
 

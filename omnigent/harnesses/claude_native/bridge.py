@@ -80,6 +80,7 @@ if TYPE_CHECKING:
 
     from omnigent.inner.datamodel import OSEnvSandboxSpec
     from omnigent.inner.os_env import OSEnvironment
+    from omnigent.inner.terminal import TerminalInstance
     from omnigent.llms.context_window import ModelPricing
 
 from omnigent.inner.hook_scripts.subagent_router import (
@@ -5293,6 +5294,18 @@ def claude_pane_text_ready(pane: str) -> bool:
     if any(text in pane for text in _CONFIRM_DIALOG_HINTS):
         return False
     return _claude_prompt_rendered(pane)
+
+
+def native_input_ready(session_id: str, instance: TerminalInstance) -> bool:
+    """Provider ``input_ready_probe``: Claude's composer is on screen.
+
+    :param session_id: Omnigent conversation id (unused; the pane is enough).
+    :param instance: The live Claude terminal.
+    :returns: Whether the watcher's last captured pane shows the prompt.
+    """
+    del session_id
+    # The watcher already captured this live pane; no extra tmux query.
+    return claude_pane_text_ready(instance.last_pane_text() or "")
 
 
 def _user_prompt_visible(pane: str) -> bool:
