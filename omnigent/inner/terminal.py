@@ -1087,6 +1087,20 @@ class TerminalInstance:
     # session"). ``None`` until such a probe fails.
     _last_capture_probe_error: str | None = field(default=None, repr=False)
     _last_session_probe_error: str | None = field(default=None, repr=False)
+    # Launch-time diagnostics for the "tmux unavailable" path.
+    # ``_started_at``: monotonic clock at the end of a successful :meth:`launch`.
+    # ``_tmux_server_pid``: pid of the tmux server process, queried once at launch.
+    # ``_private_dir_inode_at_launch``: inode of the private socket dir at launch;
+    #   a changed inode at exit time means the dir was recreated (tmp-cleaner cycle).
+    # ``_last_pane_pid``: most recently observed pane foreground process pid, cached
+    #   by :meth:`pane_pid_sync` for retrieval after the server has vanished.
+    # ``_tmux_unavailable_logged``: prevents duplicate log rows when both the async
+    #   and threaded watchers observe the same outage concurrently.
+    _started_at: float | None = field(default=None, repr=False)
+    _tmux_server_pid: int | None = field(default=None, repr=False)
+    _private_dir_inode_at_launch: int | None = field(default=None, repr=False)
+    _last_pane_pid: int | None = field(default=None, repr=False)
+    _tmux_unavailable_logged: bool = field(default=False, repr=False)
 
     @property
     def tmux_target(self) -> str:
@@ -1290,7 +1304,16 @@ class TerminalInstance:
         :param exit_callback_present: Whether an ``on_exit`` callback is wired
             to classify and publish this exit.
         """
+        # Best-effort dedup: the async and threaded watchers share the same
+        # instance, so a concurrent outage can reach this method from both.
+        # The first caller sets the flag and logs; the second returns immediately.
+        # No lock — a tiny race window may produce two rows, but is rare in practice.
+        if self._tmux_unavailable_logged:
+            return
+        self._tmux_unavailable_logged = True
+
         socket_attributes: dict[str, object] = {}
+        private_dir_info: os.stat_result | None = None
         for name, path in (("socket", self.socket_path), ("private_dir", self.private_dir)):
             try:
                 info = path.stat()
@@ -1309,6 +1332,44 @@ class TerminalInstance:
                 )
                 socket_attributes[f"{name}_uid"] = info.st_uid
                 socket_attributes[f"{name}_mode"] = oct(stat.S_IMODE(info.st_mode))
+                if name == "private_dir":
+                    private_dir_info = info
+        # Boolean existence fields: only emitted when the state is definitively
+        # known. ``stat_failed`` means existence is unknown (e.g. EACCES), so
+        # the field is omitted rather than reporting a misleading True.
+        for _field, _state_key in (
+            ("socket_path_exists", "socket_state"),
+            ("socket_dir_exists", "private_dir_state"),
+        ):
+            _state = socket_attributes.get(_state_key)
+            if _state == "missing":
+                socket_attributes[_field] = False
+            elif _state is not None and _state != "stat_failed":
+                socket_attributes[_field] = True
+        # Detect a recycled socket dir (tmp-cleaner removed and recreated it).
+        if self._private_dir_inode_at_launch is not None and private_dir_info is not None:
+            socket_attributes["socket_dir_inode_changed"] = (
+                private_dir_info.st_ino != self._private_dir_inode_at_launch
+            )
+        # Terminal age and process-alive checks for server and pane.
+        if self._started_at is not None:
+            socket_attributes["terminal_age_s"] = round(time.monotonic() - self._started_at)
+        if self._tmux_server_pid is not None:
+            socket_attributes["tmux_server_pid"] = self._tmux_server_pid
+            socket_attributes["tmux_server_pid_alive"] = _process_alive(self._tmux_server_pid)
+        if self._last_pane_pid is not None:
+            socket_attributes["pane_pid"] = self._last_pane_pid
+            socket_attributes["pane_pid_alive"] = _process_alive(self._last_pane_pid)
+        # Derive the human-readable socket-existence hint from the stats already
+        # collected so _tmux_gone_diagnostics does not re-stat the same paths.
+        _dir_state = socket_attributes.get("private_dir_state")
+        _sock_state = socket_attributes.get("socket_state")
+        if _dir_state == "missing":
+            _socket_hint: str | None = "socket dir: missing (tmp-cleaner or manual rm?)"
+        elif _sock_state == "missing":
+            _socket_hint = "socket: missing (server exited or killed)"
+        else:
+            _socket_hint = None
         extra = self._probe_log_extra(
             "terminal_unavailable",
             consecutive_failures,
@@ -1325,12 +1386,12 @@ class TerminalInstance:
             consecutive_failures,
             self.name,
             self.session_key,
-            self._tmux_gone_diagnostics(),
+            self._tmux_gone_diagnostics(socket_hint=_socket_hint),
             json.dumps(extra["attributes"]),
             extra=extra,
         )
 
-    def _tmux_gone_diagnostics(self) -> str:
+    def _tmux_gone_diagnostics(self, *, socket_hint: str | None = None) -> str:
         """Summarize why tmux vanished, for the "tmux unavailable" exit log.
 
         The bare exit message can't tell an expected teardown (user quit, the
@@ -1340,6 +1401,10 @@ class TerminalInstance:
         stderr, how long since a web client last touched the terminal, any
         recorded pane exit status, and the tail of the last captured pane.
 
+        :param socket_hint: Optional pre-computed socket/dir existence note,
+            e.g. ``"socket dir: missing (tmp-cleaner or manual rm?)"`` derived
+            from the stat results already collected by the caller. When ``None``,
+            no existence hint is appended.
         :returns: A single-line, ``; ``-joined diagnostic summary.
         """
         parts: list[str] = []
@@ -1355,6 +1420,10 @@ class TerminalInstance:
         else:
             idle_s = time.monotonic() - last_interaction
             parts.append(f"{idle_s:.0f}s since web client interaction")
+        # Reuse the hint from the caller's stat results so this method does not
+        # re-stat the same paths and potentially disagree with the structured fields.
+        if socket_hint is not None:
+            parts.append(socket_hint)
         # The bottom of the pane is the most telling: a shell prompt or
         # "[Process exited]" reads as clean teardown; a traceback as a fault.
         tail = self.last_pane_text()
@@ -1637,6 +1706,28 @@ class TerminalInstance:
 
         self.running = True
         self.launch_cwd = effective_cwd
+        self._started_at = time.monotonic()
+        # Record the private dir's inode and the tmux server pid immediately
+        # after a successful launch, while the socket is known to be live.
+        # Both are used later by _log_tmux_unavailable to distinguish a
+        # recycled/restarted dir (inode changed) from a simple server crash.
+        with contextlib.suppress(OSError):
+            self._private_dir_inode_at_launch = self.private_dir.stat().st_ino
+        # Capture the tmux server pid in a thread so the event loop is not blocked.
+        with contextlib.suppress(OSError, subprocess.SubprocessError, ValueError):
+            result = cast(
+                subprocess.CompletedProcess[str],
+                await asyncio.to_thread(
+                    subprocess.run,
+                    [*self._tmux_base_cmd(), "display-message", "-p", "#{pid}"],
+                    capture_output=True,
+                    text=True,
+                    timeout=2,
+                    check=False,
+                ),
+            )
+            if result.returncode == 0:
+                self._tmux_server_pid = int(result.stdout.strip())
 
     async def send(
         self,
@@ -2323,9 +2414,11 @@ class TerminalInstance:
         if not first:
             return None
         try:
-            return int(first[0])
+            pid = int(first[0])
         except ValueError:
             return None
+        self._last_pane_pid = pid
+        return pid
 
     def _fire_watch_callback(self, callback: Callable[[], None], kind: str) -> bool:
         """
