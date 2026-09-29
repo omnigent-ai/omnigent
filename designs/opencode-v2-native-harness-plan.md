@@ -1,5 +1,9 @@
 # OpenCode v2 Native Harness Implementation Plan
 
+> **Implemented.** Kept as the record of how the harness was built. Stage 0's
+> recon script and `recon-findings.md` were throwaway and are not in the repo;
+> the findings are in the [design](opencode-v2-native-harness.md).
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Make the `opencode-native` harness drive OpenCode 2.0.x (replacing 1.17/1.18 support) with live text, reasoning, and tool-output streaming.

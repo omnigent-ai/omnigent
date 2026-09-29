@@ -1,6 +1,8 @@
 # OpenCode v2 support for `opencode-native`
 
-**Status:** implemented · **Date:** 2026-09-25 · **Harness:** `opencode-native`
+**Status:** implemented · **Date:** 2026-09-25 · **Harness:** `opencode-native` ·
+**Plan:** [`opencode-v2-native-harness-plan.md`](opencode-v2-native-harness-plan.md) ·
+**User guide:** [`docs/opencode-native.md`](../docs/opencode-native.md)
 
 ## Goal
 
@@ -239,10 +241,11 @@ running cost/tokens, last seen model.
   `GET /api/session/{id}/message`, parsing the v2 `content[]` model. The live
   store is never opened read-write: OpenCode 2.x resumes suspended sessions at
   startup, so serving it directly could re-run a user's in-flight turn.
-- Docs: OpenCode section in `docs/` and the omnigent.ai configuration page
-  (supported 2.0.x, `@opencode/cli`, `opencode auth login`, YAML example);
-  fix the stale e2e docstring citing a vendored 1.17.7 OpenAPI; `CHANGELOG.md`
-  notes the v1 drop.
+- Docs: user guide at `docs/opencode-native.md`, mirrored on the omnigent.ai
+  configuration page (supported 2.0.x, `@opencode/cli`, optional
+  `opencode auth login`, YAML example); fix the stale e2e docstring citing a
+  vendored 1.17.7 OpenAPI. The PR's `## Changelog` section notes the v1 drop,
+  since `CHANGELOG.md` is generated from it at release time.
 - Testing:
   - Recon fixtures under `tests/fixtures/opencode_v2/`: OpenAPI dump and an
     `/api/event` NDJSON capture of one turn with text, reasoning, a tool call,
@@ -277,3 +280,26 @@ exists but is project-scoped). The live spike confirms them and resolves:
 2. Whether the relay's MCP calls raise `permission.asked` with `codemode:false`,
    and what `resources`/`metadata` they carry.
 3. Whether the per-session `AGENTS.md` reaches the model as system context.
+
+## Recon results (OpenCode 2.0.18, live)
+
+A live spike against `opencode serve` 2.0.18 captured the wire fixtures in
+`tests/fixtures/opencode_v2/` and answered the open items:
+
+- `prompt {resume: false}` records the text without running a turn, so
+  `seed_context` needs `/synthetic` only as a fallback.
+- Config `instructions` does not reach the model as a system prompt; the
+  per-session `AGENTS.md` carries it.
+- No built-in tool streams incremental progress output. `shell` progress
+  metadata carries only `shellID` and `toolCalls`.
+- MCP calls raise `permission.asked` under the `<server>_<tool>` name when the
+  server entry sets `codemode: false`. Code Mode's builtins
+  (`opencode_list_mcp_resources`, `opencode_read_mcp_resource`) still reach
+  every server, so the safety policy gates them as OS tools.
+- Permission and form replies return 204, `POST .../compact` returns 200 and
+  ends with `session.compaction.ended`, and a turn ends with
+  `session.execution.succeeded`.
+- `session list --format json` is available.
+
+The capture used a hosted model; a second provider produced the same event
+families.
