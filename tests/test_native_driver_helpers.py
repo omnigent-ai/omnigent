@@ -10,7 +10,6 @@ from tests.e2e_ui.native_driver import (
     LogWindow,
     inject_child_start,
     send_message,
-    wait_child_task,
     wait_claude_completion,
     wait_native_delegation,
 )
@@ -67,6 +66,10 @@ def test_native_proof_requires_exact_call_and_link(missing):
     child = {
         "id": "child",
         "parent_session_id": "parent",
+        # The child-summary endpoint no longer exposes task identity.
+        "current_task_id": None,
+        "current_task_status": "completed",
+        "busy": False,
         "labels": {"omnigent.claude_native.tool_use_id": "call"},
     }
     if missing == "invocation":
@@ -94,36 +97,6 @@ def test_native_proof_requires_exact_call_and_link(missing):
                 ).child_id
                 == "child"
             )
-
-
-@pytest.mark.parametrize(
-    "task,status,busy,passes",
-    [
-        ("old-task", "completed", False, False),
-        ("task", None, False, False),
-        ("task", "in_progress", False, False),
-        ("task", "failed", False, False),
-        ("task", "completed", True, False),
-        ("task", "completed", False, True),
-    ],
-)
-def test_completion_requires_exact_successful_task(task, status, busy, passes):
-    child = {
-        "id": "child",
-        "parent_session_id": "parent",
-        "current_task_id": task,
-        "current_task_status": status,
-        "busy": busy,
-    }
-    with httpx.Client(
-        base_url="http://test",
-        transport=httpx.MockTransport(lambda _: httpx.Response(200, json={"data": [child]})),
-    ) as client:
-        if passes:
-            assert wait_child_task(client, "parent", "child", "task", timeout=0) == child
-        else:
-            with pytest.raises(AssertionError):
-                wait_child_task(client, "parent", "child", "task", timeout=0)
 
 
 def test_logs_require_attempt_window_and_all_exact_identifiers(tmp_path):
@@ -250,8 +223,12 @@ def test_native_synchronous_completion_rejects_errors(is_error, reply):
     [
         "worker reply",
         "<task-notification><result>worker reply</result></task-notification>",
-        "<task-notification><tool-use-id>call</tool-use-id><status>completed</status>"
-        "<result>worker reply</task-notification>",
+        "".join(
+            (
+                "<task-notification><tool-use-id>call</tool-use-id><status>completed</status>",
+                "<result>worker reply</task-notification>",
+            )
+        ),
     ],
 )
 def test_plain_or_malformed_notification_is_not_completion(text):
@@ -267,8 +244,12 @@ def test_plain_or_malformed_notification_is_not_completion(text):
 @pytest.mark.parametrize(
     "notification",
     [
-        "<task-notification><tool-use-id>other</tool-use-id><status>completed</status>"
-        "<result>worker reply</result></task-notification>",
+        "".join(
+            (
+                "<task-notification><tool-use-id>other</tool-use-id><status>completed</status>",
+                "<result>worker reply</result></task-notification>",
+            )
+        ),
         "<task-notification><result>unescaped & content</result></task-notification>",
     ],
 )

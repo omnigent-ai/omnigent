@@ -59,9 +59,10 @@ queues so title requests containing the same nonce cannot consume their replies.
 
 `native_driver.py` provides accepted-message and synthetic child-event helpers,
 exact call/child observations, and `navigate_to_child` (no navigation fallback).
-For task-backed children, `wait_child_task` requires the exact task to complete
-successfully. Native transcript children may have no task ID: require the
-matching tool result, the child's expected reply, and settled UI state instead.
+Child summaries do not expose task IDs. Use `wait_claude_completion` to require
+the exact native call's reply or completed notification, then check the linked
+child's expected reply and settled UI state. An idle child alone is not proof
+of successful completion.
 Start `LogWindow` immediately before the action and finish after the observed
 outcome; it matches session and optional turn fields together inside that byte
 window. A missing log match establishes absence only in that file and interval.

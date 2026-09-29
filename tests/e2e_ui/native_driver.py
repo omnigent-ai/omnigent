@@ -291,37 +291,6 @@ def wait_claude_completion(
         time.sleep(min(0.2, max(0, deadline - time.monotonic())))
 
 
-def wait_child_task(
-    client: httpx.Client,
-    parent_id: str,
-    child_id: str,
-    task_id: str,
-    *,
-    timeout: float = 60,
-) -> dict:
-    """Require successful completion of the requested task, never mere idle/items."""
-    deadline = time.monotonic() + timeout
-    while True:
-        children = _list(client, f"/v1/sessions/{parent_id}/child_sessions")
-        child = next(
-            (
-                row
-                for row in children
-                if row["id"] == child_id and row["parent_session_id"] == parent_id
-            ),
-            None,
-        )
-        if child and child.get("current_task_id") == task_id:
-            status = child.get("current_task_status")
-            if status in {"failed", "cancelled", "incomplete"}:
-                raise AssertionError(f"Child {child_id} task {task_id}: {status}")
-            if status == "completed" and child.get("busy") is False:
-                return child
-        if time.monotonic() >= deadline:
-            raise AssertionError(f"Child {child_id} task {task_id} did not complete: {child}")
-        time.sleep(min(0.2, max(0, deadline - time.monotonic())))
-
-
 def navigate_to_child(page: Page, child_id: str) -> None:
     """Click the exact Agents row and prove the navigation, with no URL fallback."""
     from tests.e2e_ui.conftest import open_right_rail
