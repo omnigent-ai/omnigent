@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import logging
 import threading
+import time
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
 from functools import partial
@@ -1842,3 +1843,135 @@ async def test_sender_loop_ends_quietly_when_a_close_wins_mid_send() -> None:
     await asyncio.wait_for(frame_in_transport.wait(), timeout=5)
     await ws.close(code=4000)
     await asyncio.wait_for(sender, timeout=5)  # returns instead of raising
+
+
+# ── runner_tunnel_closed structured event ────────────────────────────────────
+
+
+async def _wait_for_tunnel_closed_row(
+    caplog: pytest.LogCaptureFixture,
+    connection_id: str,
+    *,
+    timeout_s: float = 2.0,
+) -> dict[str, object]:
+    """Poll caplog until a ``runner_tunnel_closed`` row arrives for *connection_id*.
+
+    :param caplog: Pytest log capture fixture.
+    :param connection_id: Runner-minted connection id to match on.
+    :param timeout_s: Maximum seconds to wait.
+    :returns: The ``attributes`` dict from the matching row.
+    :raises AssertionError: If no matching row arrives before the deadline.
+    """
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        for r in caplog.records:
+            if (
+                getattr(r, "event_name", None) == "runner_tunnel_closed"
+                and r.attributes.get("connection_id") == connection_id
+            ):
+                return r.attributes  # type: ignore[return-value]
+        await asyncio.sleep(0.01)
+    raise AssertionError(
+        f"runner_tunnel_closed row for connection_id={connection_id!r} never appeared "
+        f"within {timeout_s}s"
+    )
+
+
+async def test_tunnel_closed_row_peer_close(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A peer-initiated disconnect produces a runner_tunnel_closed row with
+    close_initiator, WS close code, tunnel age, and session counts."""
+    caplog.set_level(logging.INFO, logger="omnigent.server.routes.runner_tunnel")
+    runner_id = "runner-peer-close-test"
+    route_app = _tunnel_route_app()
+
+    communicator = await _connect_route(route_app.app, f"/v1/runners/{runner_id}/tunnel")
+    await _send_hello(
+        communicator, route_app.registry, runner_id=runner_id, connection_id="conn-peer-1"
+    )
+
+    # Peer closes the socket with a specific code.
+    await communicator.send_input({"type": "websocket.disconnect", "code": 1001})
+    with contextlib.suppress(asyncio.TimeoutError):
+        await communicator.wait(timeout=budget(2.0))
+
+    row = await _wait_for_tunnel_closed_row(caplog, "conn-peer-1")
+
+    assert row["close_initiator"] == "peer_closed"
+    assert row["ws_close_code"] == 1001
+    assert row["runner_id"] == runner_id
+    assert row["runner_version"] == "0.1.0-test"
+    assert row["connection_id"] == "conn-peer-1"
+    assert row["tunnel_age_s"] >= 0
+    assert row["last_frame_age_s"] >= 0
+    assert row["last_pong_age_s"] is None  # no pong was sent
+    assert row["in_flight_requests"] == 0
+    assert row["ws_channels"] == 0
+    assert row["exception_type"] is None
+
+
+async def test_tunnel_closed_row_ping_timeout_websocket_disconnect(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A WebSocketDisconnect received after ping_timeout_declared is set is
+    labelled server_ping_timeout, not peer_closed."""
+    caplog.set_level(logging.INFO, logger="omnigent.server.routes.runner_tunnel")
+    runner_id = "runner-ping-timeout-ws-disconnect"
+    route_app = _tunnel_route_app()
+
+    communicator = await _connect_route(route_app.app, f"/v1/runners/{runner_id}/tunnel")
+    await _send_hello(
+        communicator,
+        route_app.registry,
+        runner_id=runner_id,
+        connection_id="conn-ping-timeout",
+    )
+
+    # Simulate the state the ping loop sets before closing the socket.
+    session = route_app.registry.get(runner_id)
+    assert session is not None
+    session.ping_timeout_declared = True
+
+    # The peer's close acknowledgment arrives as a WebSocketDisconnect.
+    await communicator.send_input({"type": "websocket.disconnect", "code": 4003})
+    with contextlib.suppress(asyncio.TimeoutError):
+        await communicator.wait(timeout=budget(2.0))
+
+    row = await _wait_for_tunnel_closed_row(caplog, "conn-ping-timeout")
+
+    assert row["close_initiator"] == "server_ping_timeout"
+    assert row["ws_close_code"] == 4003
+    assert row["runner_id"] == runner_id
+
+
+async def test_tunnel_closed_row_replaced_by_newer_tunnel(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A tunnel retired by a newer registration for the same runner id
+    produces a runner_tunnel_closed row labelled replaced_by_newer_tunnel."""
+    caplog.set_level(logging.INFO, logger="omnigent.server.routes.runner_tunnel")
+    runner_id = "runner-replaced-test"
+    route_app = _tunnel_route_app()
+
+    # First tunnel connects.
+    comm1 = await _connect_route(route_app.app, f"/v1/runners/{runner_id}/tunnel")
+    await _send_hello(comm1, route_app.registry, runner_id=runner_id, connection_id="conn-first")
+
+    # Second tunnel for the same runner_id replaces the first.
+    comm2 = await _connect_route(route_app.app, f"/v1/runners/{runner_id}/tunnel")
+    await _send_hello(comm2, route_app.registry, runner_id=runner_id, connection_id="conn-second")
+
+    # Wait for the first tunnel's runner_tunnel_closed row.
+    first_row = await _wait_for_tunnel_closed_row(caplog, "conn-first")
+
+    assert first_row["close_initiator"] == "replaced_by_newer_tunnel"
+    assert first_row["runner_id"] == runner_id
+    assert first_row["runner_version"] == "0.1.0-test"
+    assert first_row["tunnel_age_s"] >= 0
+    assert first_row["in_flight_requests"] == 0
+
+    # Teardown the second tunnel.
+    await comm2.send_input({"type": "websocket.disconnect", "code": 1000})
+    with contextlib.suppress(asyncio.TimeoutError):
+        await comm2.wait(timeout=budget(2.0))

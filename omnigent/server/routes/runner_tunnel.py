@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import sys
 import time
 import weakref
 from collections.abc import Awaitable, Callable, Mapping
@@ -476,6 +477,11 @@ def create_runner_tunnel_router(
         await ws.accept()
         session: RunnerSession | None = None
         ended_by: str | None = None
+        # Tracking variables for the unified runner_tunnel_closed row.
+        _close_initiator: str = "unknown"
+        _ws_close_code: int | None = None
+        _ws_close_reason: str | None = None
+        _exception_type: str | None = None
 
         def _connection_attrs() -> _TunnelConnectionAttrs:
             now = time.time()
@@ -601,7 +607,12 @@ def create_runner_tunnel_router(
                         continue
                     task_error = task.exception()
                     if task_error is None:
-                        _logger.warning(
+                        # A task returning normally (no exception) is either a
+                        # session replaced by a newer tunnel or the ping loop
+                        # returning after declaring the runner dead. Both are
+                        # handled paths already logged at their origin; INFO here
+                        # provides context without duplicate WARNINGs.
+                        _logger.info(
                             "Tunnel helper task ended for runner %s: %s",
                             runner_id,
                             task_name,
@@ -617,6 +628,16 @@ def create_runner_tunnel_router(
                             getattr(task_error, "code", None),
                             getattr(task_error, "reason", None),
                         )
+                        _ws_close_code = getattr(task_error, "code", None)
+                        _ws_close_reason = getattr(task_error, "reason", None)
+                        # A WebSocketDisconnect arriving after the ping loop
+                        # already declared the runner dead is the peer's
+                        # acknowledgment of the server's close frame, not a
+                        # spontaneous peer close.
+                        if session is not None and session.ping_timeout_declared:
+                            _close_initiator = "server_ping_timeout"
+                        else:
+                            _close_initiator = "peer_closed"
                     else:
                         _logger.warning(
                             "Tunnel helper task failed for runner %s: %s",
@@ -628,10 +649,17 @@ def create_runner_tunnel_router(
                                 task_error.__traceback__,
                             ),
                         )
+                        _close_initiator = "exception"
+                        _exception_type = type(task_error).__name__
                     raise task_error
                 # Every finished helper ended cleanly: a server-side close (ping
                 # timeout, replaced generation) with no peer close yet, so no
-                # ``disconnected`` row follows. Record it.
+                # ``disconnected`` row follows. Identify the initiator from
+                # session state set by the respective loop.
+                if session is not None and session.ping_timeout_declared:
+                    _close_initiator = "server_ping_timeout"
+                else:
+                    _close_initiator = "replaced_by_newer_tunnel"
                 _logger.info(
                     "Runner %s tunnel closed (%s ended)",
                     runner_id,
@@ -648,6 +676,41 @@ def create_runner_tunnel_router(
                     keepalive_task,
                     return_exceptions=True,
                 )
+                # Attribute a server-side cancellation (e.g. graceful shutdown)
+                # only when no more specific initiator was already set.
+                if _close_initiator == "unknown":
+                    exc_cls = sys.exc_info()[0]
+                    if exc_cls is not None and issubclass(exc_cls, asyncio.CancelledError):
+                        _close_initiator = "server_shutdown"
+                # Capture in-flight counts before deregister aborts and clears them.
+                if session is not None:
+                    _in_flight_count = len(session.in_flight)
+                    _ws_channel_count = len(session.ws_channels)
+                    now = time.time()
+                    _logger.info(
+                        "Runner %s tunnel closed (initiator=%s)",
+                        runner_id,
+                        _close_initiator,
+                        extra=debug_event(
+                            "runner_tunnel_closed",
+                            runner_id=runner_id,
+                            runner_version=session.hello.runner_version,
+                            connection_id=session.hello.connection_id,
+                            close_initiator=_close_initiator,
+                            tunnel_age_s=round(now - session.connected_at, 3),
+                            last_frame_age_s=round(now - session.last_frame_at, 3),
+                            last_pong_age_s=(
+                                round(now - session.last_pong_at, 3)
+                                if session.last_pong_at is not None
+                                else None
+                            ),
+                            ws_close_code=_ws_close_code,
+                            ws_close_reason=_ws_close_reason,
+                            exception_type=_exception_type,
+                            in_flight_requests=_in_flight_count,
+                            ws_channels=_ws_channel_count,
+                        ),
+                    )
                 registry.deregister(runner_id, session)
                 if on_runner_disconnect is not None:
                     try:
@@ -857,6 +920,7 @@ async def _receive_loop(
                 continue
             if isinstance(resp_frame, PongFrame):
                 # Any frame (including pong) renews the tunnel's liveness.
+                session.last_pong_at = time.time()
                 _logger.debug(
                     "runner %s tunnel keepalive: pong rtt=%dms",
                     runner_id,
@@ -938,6 +1002,7 @@ async def _ping_loop(
         if elapsed > PING_INTERVAL_S * PING_MISS_THRESHOLD:
             # Runner tunnel went silent past the liveness window: the runner or
             # its network died, blocking sessions on it until it reconnects.
+            session.ping_timeout_declared = True
             _logger.warning(
                 "Runner %s missed %d ping intervals (%.0fs since last frame); declaring dead",
                 runner_id,

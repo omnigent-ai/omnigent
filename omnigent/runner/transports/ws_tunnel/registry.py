@@ -112,6 +112,13 @@ class RunnerSession:
     # 8-char hex channel ids; values hold the inbound queue consumed
     # by whichever side terminated the attach.
     ws_channels: dict[str, WSChannelState] = field(default_factory=dict)
+    # Epoch float of the most recent pong received from this runner;
+    # None until the first pong arrives. Used for disconnect diagnostics.
+    last_pong_at: float | None = None
+    # Set by the ping loop just before it closes the socket for a
+    # keepalive timeout, so the tunnel close path can label the row
+    # close_initiator="server_ping_timeout" instead of "unknown".
+    ping_timeout_declared: bool = False
 
 
 @dataclass
