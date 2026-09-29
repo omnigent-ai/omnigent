@@ -173,8 +173,7 @@ def _get_cost_policy_oldest_period(specs: list[PolicySpec]) -> str | None:
         return datetime.combine(dt.date(), datetime.min.time(), tzinfo=timezone.utc)
 
     # Find the period with the oldest start date
-    oldest_period = min(periods, key=period_start_date)
-    return oldest_period
+    return min(periods, key=period_start_date)
 
 
 def _needs_subtree_usage(specs: list[PolicySpec]) -> bool:
