@@ -124,6 +124,52 @@ def test_codex_native_approval_mode_switch_persists(
     expect(page.get_by_test_id("composer-permission-chip")).to_contain_text("Approve for me")
 
 
+def test_codex_native_bypass_switch_persists(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """The running-session picker offers bypass and PATCHes it like a preset.
+
+    "Bypass approvals & sandbox" is the picker's last row (after Codex's own
+    ``/permissions`` presets). Selecting it sends ``{"approval_mode":
+    "bypass"}`` — the request that drives the popup's Full Access row and arms
+    the bypass label on the server — and the pill then shows the stamped
+    read-back label.
+
+    :param page: Playwright page fixture.
+    :param seeded_session: ``(base_url, session_id)`` for a real server-backed
+        session; the browser snapshot is patched to a codex-native session
+        that has not switched modes yet.
+    :returns: None.
+    """
+    base_url, session_id = seeded_session
+    patch_bodies = _patch_session_as_codex_native(page, session_id)
+
+    page.goto(f"{base_url}/c/{session_id}")
+
+    picker = page.get_by_test_id("composer-permission-chip")
+    expect(picker).to_be_visible(timeout=15_000)
+    picker.click()
+    option = page.get_by_test_id("composer-permission-option-bypass")
+    expect(option).to_have_text("Bypass approvals & sandbox")
+    with page.expect_response(
+        lambda response: (
+            response.request.method == "PATCH"
+            and urlparse(response.url).path == f"/v1/sessions/{session_id}"
+            and response.status == 200
+        )
+    ):
+        option.click()
+
+    assert patch_bodies[-1] == {"approval_mode": "bypass"}
+
+    expect(picker).to_contain_text("Bypass approvals & sandbox")
+    page.reload()
+    expect(page.get_by_test_id("composer-permission-chip")).to_contain_text(
+        "Bypass approvals & sandbox"
+    )
+
+
 def test_codex_native_approval_mode_starts_from_label(
     page: Page,
     seeded_session: tuple[str, str],
