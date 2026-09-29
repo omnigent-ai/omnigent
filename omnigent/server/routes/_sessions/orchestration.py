@@ -7035,6 +7035,7 @@ async def _dispatch_session_event_to_runner_impl(
 RUNNER_DISCONNECT_GRACE_S: float = float(RUNNER_LIVENESS_TTL_S)
 # Delay between relay stream reconnect attempts inside the grace window.
 _RELAY_RETRY_INTERVAL_S: float = 0.5
+_RELAY_SESSION_STATUS_VALUES = frozenset({"idle", "launching", "running", "waiting", "failed"})
 # A tunnel that drops mid-ensure usually belongs to a runner that is alive but
 # stalled and re-registers once it can (observed: 24 s). Hold the message that
 # long before failing it instead of discarding it on a drop the runner outlives.
@@ -7410,6 +7411,23 @@ async def _relay_runner_stream_once(
     # flushed at tool-call boundaries (the boundary event carries no model).
     current_model: str | None = None
     failure_agent_name: str | None = None
+    invalid_frame_kinds_logged: set[str] = set()
+
+    def _log_invalid_frame(kind: str, message: str, **attributes: object) -> None:
+        """Log the first invalid frame of each kind without recording its payload."""
+        if kind in invalid_frame_kinds_logged:
+            return
+        invalid_frame_kinds_logged.add(kind)
+        extra = debug_event(kind, session_id=session_id)
+        event_attributes = cast(dict[str, object], extra["attributes"])
+        event_attributes["suppressed_after_first"] = True
+        event_attributes.update(attributes)
+        _logger.warning(
+            message,
+            session_id,
+            extra=extra,
+        )
+
     # Wall-clock time when the current turn's response.in_progress arrived,
     # used to compute per-turn latency in TurnEndEvent.
     _turn_start_s: float | None = None
@@ -7462,9 +7480,42 @@ async def _relay_runner_stream_once(
                         return
                     try:
                         event = json.loads(payload)
-                    except json.JSONDecodeError:
+                    except RecursionError:
+                        _log_invalid_frame(
+                            "runner_stream_json_recursion",
+                            "Relay: excessively nested runner stream JSON for session=%s",
+                            payload_length=len(payload),
+                        )
                         continue
-                    evt_type = event.get("type", "")
+                    except json.JSONDecodeError as exc:
+                        _log_invalid_frame(
+                            "runner_stream_malformed_json",
+                            "Relay: malformed runner stream JSON for session=%s",
+                            payload_length=len(payload),
+                            decoder_line=exc.lineno,
+                            decoder_column=exc.colno,
+                            decoder_position=exc.pos,
+                        )
+                        continue
+                    if not isinstance(event, dict):
+                        _log_invalid_frame(
+                            "runner_stream_non_object_json",
+                            "Relay: non-object runner stream JSON for session=%s",
+                            payload_length=len(payload),
+                            json_type=type(event).__name__,
+                        )
+                        continue
+                    event = cast(dict[str, Any], event)
+                    raw_evt_type = event.get("type")
+                    if not isinstance(raw_evt_type, str) or not raw_evt_type:
+                        _log_invalid_frame(
+                            "runner_stream_invalid_event_type",
+                            "Relay: invalid runner stream event type for session=%s",
+                            payload_length=len(payload),
+                            json_type=type(raw_evt_type).__name__,
+                        )
+                        continue
+                    evt_type = raw_evt_type
                     # The runner emits session.status events
                     # directly.
                     # Re-publish via _publish_status so the event
@@ -7503,7 +7554,19 @@ async def _relay_runner_stream_once(
                             continue
 
                     if evt_type == "session.status":
-                        status = event.get("status", "")
+                        raw_status = event.get("status")
+                        if (
+                            not isinstance(raw_status, str)
+                            or raw_status not in _RELAY_SESSION_STATUS_VALUES
+                        ):
+                            _log_invalid_frame(
+                                "runner_stream_invalid_session_status",
+                                "Relay: invalid runner session status for session=%s",
+                                payload_length=len(payload),
+                                json_type=type(raw_status).__name__,
+                            )
+                            continue
+                        status = raw_status
                         if status:
                             # Forward the runner's failure detail on a
                             # ``failed`` transition so a SETUP-phase
@@ -7511,11 +7574,18 @@ async def _relay_runner_stream_once(
                             # surfaces a real error message downstream
                             # instead of ending the turn silently.
                             raw_err = event.get("error")
-                            status_error = (
-                                ErrorDetail.model_validate(raw_err)
-                                if isinstance(raw_err, dict)
-                                else None
-                            )
+                            if isinstance(raw_err, dict):
+                                try:
+                                    status_error = ErrorDetail.model_validate(raw_err)
+                                except ValidationError:
+                                    _log_invalid_frame(
+                                        "runner_stream_invalid_status_error",
+                                        "Relay: invalid runner status error for session=%s",
+                                        payload_length=len(payload),
+                                    )
+                                    status_error = None
+                            else:
+                                status_error = None
                             if status == "failed" and status_error is not None:
                                 await _persist_session_status_error_labels(
                                     session_id,
@@ -7616,7 +7686,16 @@ async def _relay_runner_stream_once(
                     # events so persisted items share one id.
                     if evt_type == "response.in_progress":
                         _turn_start_s = time.monotonic()
-                        resp_obj = event.get("response", {})
+                        raw_resp_obj = event.get("response")
+                        if not isinstance(raw_resp_obj, dict):
+                            _log_invalid_frame(
+                                "runner_stream_invalid_response",
+                                "Relay: invalid runner response object for session=%s",
+                                payload_length=len(payload),
+                                event_type=evt_type,
+                            )
+                            continue
+                        resp_obj = raw_resp_obj
                         _rid = resp_obj.get("id")
                         if isinstance(_rid, str) and _rid:
                             current_response_id = _rid
@@ -7876,11 +7955,21 @@ async def _relay_runner_stream_once(
                         # policy callables can read
                         # event["context"]["usage"]["total_cost_usd"] and the
                         # subtree roll-up below sees the new totals.
-                        _accumulate_session_usage(
-                            event.get("response", {}),
-                            session_id,
-                            conversation_store,
-                        )
+                        completed_response = event.get("response")
+                        if isinstance(completed_response, dict):
+                            _accumulate_session_usage(
+                                completed_response,
+                                session_id,
+                                conversation_store,
+                            )
+                        else:
+                            _log_invalid_frame(
+                                "runner_stream_invalid_response",
+                                "Relay: invalid runner response object for session=%s",
+                                payload_length=len(payload),
+                                event_type=evt_type,
+                            )
+                            continue
                     if evt_type in _TERMINAL_RESPONSE_EVENT_TYPES:
                         _turn_status = evt_type.split(".", 1)[1]  # "completed" etc.
                         _latency_ms: float | None = None
@@ -8053,13 +8142,17 @@ async def _relay_runner_stream_once(
                         session_stream.publish(session_id, event)
                         elicitation_id = event.get("elicitation_id")
                         if isinstance(elicitation_id, str) and elicitation_id:
+                            raw_action = event.get("action")
+                            action = raw_action if isinstance(raw_action, str) else None
+                            raw_reason = event.get("reason")
+                            reason = raw_reason if isinstance(raw_reason, str) else None
                             await asyncio.to_thread(
                                 _publish_elicitation_resolved_to_ancestors,
                                 conversation_store,
                                 session_id,
                                 elicitation_id,
-                                event.get("action"),
-                                reason=event.get("reason"),
+                                action,
+                                reason=reason,
                             )
                         continue
                     session_stream.publish(session_id, event)
@@ -8191,13 +8284,46 @@ def _ensure_runner_relay(
         # Clear our slot only if it still holds this task — a
         # later rebind may have replaced us.
         current = _runner_relay_tasks.get(session_id)
-        if current is not None and current.task is t:
+        is_current = current is not None and current.task is t
+        if is_current:
             _runner_relay_tasks.pop(session_id, None)
             # A deny marker is only consumable by this relay's flushes;
             # drop any leftover so the (unbounded) marker dict cannot
             # leak entries for relays that died before their terminal
             # flush. A replacement relay re-records on the next verdict.
             _llm_response_denied_turns.pop(session_id, None)
+        if t.cancelled():
+            return
+        exc = t.exception()
+        if exc is None or isinstance(exc, asyncio.CancelledError):
+            return
+        traceback = exc.__traceback__
+        while traceback is not None and traceback.tb_next is not None:
+            traceback = traceback.tb_next
+        failure_module = (
+            traceback.tb_frame.f_globals.get("__name__") if traceback is not None else None
+        )
+        failure_function = traceback.tb_frame.f_code.co_name if traceback is not None else None
+        failure_line = traceback.tb_lineno if traceback is not None else None
+        log = _logger.error if is_current else _logger.warning
+        log(
+            "Relay: task failed for session=%s runner=%s (%s at %s:%s)",
+            session_id,
+            runner_id,
+            type(exc).__name__,
+            failure_function,
+            failure_line,
+            extra=debug_event(
+                "runner_stream_task_failed",
+                session_id=session_id,
+                runner_id=runner_id,
+                exception_type=type(exc).__name__,
+                failure_module=failure_module,
+                failure_function=failure_function,
+                failure_line=failure_line,
+                superseded=not is_current,
+            ),
+        )
 
     task.add_done_callback(_on_done)
     return handle
