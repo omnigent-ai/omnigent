@@ -65,7 +65,7 @@ export function slashCommandMatches(name: string, query: string): boolean {
  * order. Returns the ranked, slash-prefixed names.
  *
  * Prefix-priority matters because the first match is auto-highlighted and
- * Tab/Enter acts on it — executing no-arg built-ins immediately. Without
+ * Tab completes it and Enter can execute no-arg built-ins. Without
  * it a short query like `e` would highlight `/context` (it contains "e")
  * ahead of `/effort` (a prefix), so Enter could run an unrelated command
  * as a side effect. Shared by the menu render filter here and the two
