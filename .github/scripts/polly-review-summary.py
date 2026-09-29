@@ -80,8 +80,8 @@ def diff_stats(diff: Path) -> dict:
     lines += [
         "",
         "Shares use additions + deletions, including generated text and lockfiles. "
-        "Binary files have no line count. Tests include fixtures/helpers under test paths "
-        "and colocated test/spec files; categories are path-based, not coverage measurements.",
+        + "Binary files have no line count. Tests include fixtures/helpers under test paths "
+        + "and colocated test/spec files; categories are path-based, not coverage measurements.",
     ]
     return {"markdown": "\n".join(lines), "test_files": test_files}
 
