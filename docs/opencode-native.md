@@ -132,6 +132,8 @@ replays the history as a text preamble instead.
 - *Harness is outdated*: install `@opencode/cli@~2.0.18` as shown above.
 - *Auth-shaped turn error*: the model's provider needs a sign-in. Run
   `opencode auth login` on the host, or pick a free `opencode/…` model.
-- Diagnostics: see [harness-diagnostics.md](harness-diagnostics.md). The
-  per-conversation bridge directory holds `opencode.json`, the policy plugin, and
-  `opencode-serve.log` (the server's stderr from the latest launch).
+- Diagnostics: set `OMNIGENT_HARNESS_STDERR_ENABLED=1` before starting the host
+  to copy OpenCode's server logs, redacted, into the runner log; startup errors
+  then quote the last lines. See [harness-diagnostics.md](harness-diagnostics.md).
+  The per-conversation bridge directory holds `opencode.json`, the policy
+  plugin, and OpenCode's own log under `xdg-data/opencode/log/`.

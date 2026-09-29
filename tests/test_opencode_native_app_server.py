@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import io
+import logging
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -23,6 +25,7 @@ from omnigent.harnesses.opencode_native.app_server import (
     opencode_terminal_env,
     parse_opencode_version,
 )
+from omnigent.process_logging import HARNESS_STDERR_ENABLED_ENV_VAR
 
 
 class _FakeStdin:
@@ -296,52 +299,107 @@ async def test_start_launches_stdio_server_with_stdin_pipe(
     assert server.process.pid == 4242
 
 
-async def test_start_captures_stderr_in_bridge_dir_log(
+class _StderrProc(_FakeProc):
+    """``_FakeProc`` with a readable stderr pipe, as ``stderr=PIPE`` gives."""
+
+    def __init__(self, stderr: bytes, *, returncode: int | None = None) -> None:
+        super().__init__()
+        self.stderr = io.BytesIO(stderr)
+        self.returncode = returncode
+
+
+def _capture_popen(
+    monkeypatch: pytest.MonkeyPatch, proc: _FakeProc, started: dict[str, Any]
+) -> None:
+    def fake_popen(argv, **kwargs):  # type: ignore[no-untyped-def]
+        started["argv"] = argv
+        started.update(kwargs)
+        return proc
+
+    monkeypatch.setattr(appsrv.subprocess, "Popen", fake_popen)
+
+
+async def test_stderr_discarded_when_diagnostics_are_off(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """Boot failures need a log: stderr goes to a fresh 0600 file in the bridge dir."""
+    """Without the opt-in flag, stderr goes nowhere and OpenCode keeps its own log."""
+    monkeypatch.delenv(HARNESS_STDERR_ENABLED_ENV_VAR, raising=False)
     server = _server(monkeypatch, tmp_path)
-    log_path = tmp_path / appsrv.OPENCODE_SERVE_LOG_NAME
-    log_path.write_text("previous launch\n", encoding="utf-8")
     started: dict[str, Any] = {}
-
-    def fake_popen(argv, **kwargs):  # type: ignore[no-untyped-def]
-        started.update(kwargs)
-        kwargs["stderr"].write(b"booting\n")
-        return _FakeProc()
+    _capture_popen(monkeypatch, _FakeProc(), started)
 
     async def fake_wait(self: OpenCodeNativeServer) -> None:
         return None
 
-    monkeypatch.setattr(appsrv.subprocess, "Popen", fake_popen)
     monkeypatch.setattr(OpenCodeNativeServer, "_wait_until_ready", fake_wait)
     await server.start()
-    assert started["stdout"] == subprocess.DEVNULL
-    assert Path(started["stderr"].name) == log_path
-    assert log_path.stat().st_mode & 0o777 == 0o600
+    assert started["stderr"] == subprocess.DEVNULL
+    assert appsrv.OPENCODE_PRINT_LOGS_FLAG not in started["argv"]
+    assert server._stderr_excerpt() == ""
     await server.close()
-    assert started["stderr"].closed
-    assert log_path.read_bytes() == b"booting\n"
 
 
-async def test_start_closes_stderr_log_when_readiness_fails(
+async def test_stderr_exported_redacted_when_diagnostics_are_on(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """With the flag, OpenCode prints its logs to stderr and they reach the runner log redacted."""
+    monkeypatch.setenv(HARNESS_STDERR_ENABLED_ENV_VAR, "1")
+    monkeypatch.setattr(appsrv.shutil, "which", lambda name: f"/usr/bin/{name}")
+    server = OpenCodeNativeServer(
+        bridge_dir=tmp_path,
+        workspace=tmp_path,
+        port=49231,
+        verify_version=False,
+        opencode_args=[appsrv.OPENCODE_PRINT_LOGS_FLAG],
+        session_id="conv_diag",
+    )
+    started: dict[str, Any] = {}
+    proc = _StderrProc(b"level=INFO message=booting\npassword synthetic-secret\n")
+    _capture_popen(monkeypatch, proc, started)
+
+    async def fake_wait(self: OpenCodeNativeServer) -> None:
+        return None
+
+    monkeypatch.setattr(OpenCodeNativeServer, "_wait_until_ready", fake_wait)
+    with caplog.at_level(logging.INFO, logger=appsrv._logger.name):
+        await server.start()
+        await server.close()
+    assert started["stderr"] == subprocess.PIPE
+    # A user-supplied --print-logs is not duplicated.
+    assert started["argv"].count(appsrv.OPENCODE_PRINT_LOGS_FLAG) == 1
+    assert list(server.recent_stderr) == [
+        "level=INFO message=booting",
+        "password synthetic-secret",
+    ]
+    exported = [r for r in caplog.records if "OpenCode diagnostic output" in r.getMessage()]
+    assert exported, caplog.text
+    text = "\n".join(r.getMessage() for r in exported)
+    assert "session=conv_diag" in text
+    assert "message=booting" in text
+    assert "synthetic-secret" not in text
+
+
+async def test_startup_error_quotes_redacted_stderr_only_when_diagnostics_are_on(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    server = _server(monkeypatch, tmp_path)
-    started: dict[str, Any] = {}
-
-    def fake_popen(argv, **kwargs):  # type: ignore[no-untyped-def]
-        started.update(kwargs)
-        return _FakeProc()
-
-    async def failing_wait(self: OpenCodeNativeServer) -> None:
-        raise RuntimeError("opencode serve did not become ready")
-
-    monkeypatch.setattr(appsrv.subprocess, "Popen", fake_popen)
-    monkeypatch.setattr(OpenCodeNativeServer, "_wait_until_ready", failing_wait)
-    with pytest.raises(RuntimeError):
-        await server.start()
-    assert started["stderr"].closed
+    """An early exit names what OpenCode printed, redacted, and only under the opt-in flag."""
+    stderr = b"Error: bad provider config\npassword synthetic-secret\n"
+    messages: dict[str, str] = {}
+    _mock_http(monkeypatch, lambda request: httpx.Response(503))
+    for enabled in (True, False):
+        if enabled:
+            monkeypatch.setenv(HARNESS_STDERR_ENABLED_ENV_VAR, "1")
+        else:
+            monkeypatch.delenv(HARNESS_STDERR_ENABLED_ENV_VAR, raising=False)
+        server = _server(monkeypatch, tmp_path)
+        _capture_popen(monkeypatch, _StderrProc(stderr, returncode=1), {})
+        with pytest.raises(RuntimeError) as exc_info:
+            await server.start()
+        messages[str(enabled)] = str(exc_info.value)
+    assert "exited early with code 1" in messages["True"]
+    assert "Error: bad provider config" in messages["True"]
+    assert "synthetic-secret" not in messages["True"]
+    assert messages["False"] == "opencode serve exited early with code 1"
 
 
 async def test_start_closes_process_when_readiness_is_cancelled(

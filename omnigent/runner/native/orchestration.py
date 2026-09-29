@@ -1796,6 +1796,7 @@ async def _auto_create_opencode_terminal(
         bridge_dir=bridge_dir,
         workspace=launch_config.workspace,
         extra_env=policy_env or None,
+        session_id=session_id,
     )
     await server.start()
     _AUTO_OPENCODE_SERVERS[session_id] = server

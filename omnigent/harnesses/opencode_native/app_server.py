@@ -34,13 +34,21 @@ import re
 import shutil
 import socket
 import subprocess
+import threading
+from collections import deque
 from collections.abc import Mapping, Sequence
 from pathlib import Path
-from typing import BinaryIO
+from typing import IO
 
 import httpx
 from packaging.version import InvalidVersion, Version
 
+from omnigent.harnesses.diagnostics import (
+    MAX_STDERR_RECORD_BYTES,
+    HarnessStderrExporter,
+    bounded_diagnostic_tail,
+    report_stderr_capture_start_failure,
+)
 from omnigent.harnesses.opencode_native.bridge import (
     OPENCODE_DB_ENV_VAR,
     OPENCODE_PASSWORD_ENV_VAR,
@@ -56,6 +64,7 @@ from omnigent.harnesses.opencode_native.client import (
     OPENCODE_MIN_VERSION,
     OpenCodeClient,
 )
+from omnigent.process_logging import harness_stderr_capture_enabled
 
 _logger = logging.getLogger(__name__)
 
@@ -100,8 +109,14 @@ _ENV_OPENCODE_DENYLIST = frozenset(
 )
 # How long a ``--stdio`` server gets to exit after its stdin closes.
 _STDIN_CLOSE_GRACE_S = 3.0
-# ``opencode serve`` stderr, kept in the bridge dir so boot failures can be diagnosed.
-OPENCODE_SERVE_LOG_NAME = "opencode-serve.log"
+# Opt-in stderr diagnostics (OMNIGENT_HARNESS_STDERR_ENABLED); see docs/harness-diagnostics.md.
+OPENCODE_PRINT_LOGS_FLAG = "--print-logs"
+_STDERR_SOURCE_KIND = "opencode_serve_stderr"
+_STDERR_THREAD_PREFIX = "opencode-stderr-diagnostics"
+_STDERR_RECENT_LINES = 20
+_STDERR_EXCERPT_LINES = 5
+_STDERR_LINE_CHARS = 16 * 1024
+_STDERR_READER_JOIN_S = 1.0
 
 _VERSION_RE = re.compile(r"(\d+\.\d+\.\d+(?:[-.][0-9A-Za-z]+)*)")
 
@@ -357,6 +372,8 @@ class OpenCodeNativeServer:
     :param extra_env: Provider env merged into the launch environment.
     :param opencode_args: Extra ``serve`` pass-through args.
     :param verify_version: Whether to version-check the CLI on start.
+    :param session_id: Omnigent conversation id, used to label exported
+        diagnostics, e.g. ``"conv_ab12"``; ``None`` leaves them unlabelled.
     """
 
     def __init__(
@@ -370,8 +387,10 @@ class OpenCodeNativeServer:
         extra_env: Mapping[str, str] | None = None,
         opencode_args: Sequence[str] = (),
         verify_version: bool = True,
+        session_id: str | None = None,
     ) -> None:
         self.bridge_dir = bridge_dir
+        self.session_id = session_id
         self.workspace = workspace
         self.hostname = hostname
         self._explicit_port = port
@@ -385,8 +404,12 @@ class OpenCodeNativeServer:
         self.port: int | None = port
         self.process: subprocess.Popen[bytes] | None = None
         self.version: str | None = None
-        self.log_path = bridge_dir / OPENCODE_SERVE_LOG_NAME
-        self._log_file: BinaryIO | None = None
+        # Raw recent stderr lines; only redacted excerpts ever leave the process.
+        self.recent_stderr: deque[str] = deque(maxlen=_STDERR_RECENT_LINES)
+        self.stderr_capture_error_type: str | None = None
+        self._stderr_capture = False
+        self._stderr_reader: threading.Thread | None = None
+        self._stderr_exporter: HarnessStderrExporter | None = None
 
     @property
     def base_url(self) -> str:
@@ -418,12 +441,16 @@ class OpenCodeNativeServer:
         """
         if self.port is None:
             raise RuntimeError("OpenCode server port not allocated")
+        opencode_args = list(self._opencode_args)
+        if self._stderr_capture and OPENCODE_PRINT_LOGS_FLAG not in opencode_args:
+            # OpenCode logs to its own file unless asked to print to stderr.
+            opencode_args.append(OPENCODE_PRINT_LOGS_FLAG)
         return [
             self.opencode_path,
             *build_opencode_serve_args(
                 hostname=self.hostname,
                 port=self.port,
-                opencode_args=self._opencode_args,
+                opencode_args=opencode_args,
             ),
         ]
 
@@ -448,6 +475,7 @@ class OpenCodeNativeServer:
                 check_opencode_version(self.version)
         if self.port is None:
             self.port = self._explicit_port or allocate_loopback_port()
+        self._stderr_capture = harness_stderr_capture_enabled()
         argv = self.build_argv()
         _logger.info(
             "Launching opencode serve: port=%s workspace=%s xdg_data=%s",
@@ -455,20 +483,18 @@ class OpenCodeNativeServer:
             self.workspace,
             self.xdg_data_home,
         )
-        self._log_file = self._open_log()
-        try:
-            self.process = subprocess.Popen(
-                argv,
-                cwd=str(self.workspace),
-                env=self.env,
-                # ``--stdio`` serves until stdin closes; keep the pipe open.
-                stdin=subprocess.PIPE,
-                stdout=subprocess.DEVNULL,
-                stderr=self._log_file,
-            )
-        except BaseException:
-            self._close_log()
-            raise
+        self.recent_stderr.clear()
+        self.process = subprocess.Popen(
+            argv,
+            cwd=str(self.workspace),
+            env=self.env,
+            # ``--stdio`` serves until stdin closes; keep the pipe open.
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE if self._stderr_capture else subprocess.DEVNULL,
+        )
+        if self._stderr_capture and self.process.stderr is not None:
+            self._start_stderr_capture(self.process.stderr, pid=self.process.pid)
         try:
             await self._wait_until_ready()
         except BaseException:
@@ -476,21 +502,95 @@ class OpenCodeNativeServer:
             await self.close()
             raise
 
-    def _open_log(self) -> BinaryIO:
-        """Open the stderr log ``0600``, truncated so it holds only this launch."""
+    def _start_stderr_capture(self, stream: IO[bytes], *, pid: int) -> None:
+        """Drain stderr on a daemon thread and export it while diagnostics are on."""
+        exporter: HarnessStderrExporter | None = None
+        self.stderr_capture_error_type = None
+        try:
+            exporter = HarnessStderrExporter(
+                logger=_logger,
+                label="OpenCode",
+                harness="opencode-native",
+                source_kind=_STDERR_SOURCE_KIND,
+                thread_prefix=_STDERR_THREAD_PREFIX,
+                pid=pid,
+                session_id=lambda: self.session_id,
+            )
+        except Exception as exc:  # noqa: BLE001 - capture must never stop pipe draining
+            self.stderr_capture_error_type = type(exc).__name__[:128]
+            report_stderr_capture_start_failure(
+                logger=_logger,
+                label="OpenCode",
+                harness="opencode-native",
+                source_kind=_STDERR_SOURCE_KIND,
+                thread_prefix="opencode-stderr",
+                session_id=self.session_id,
+                pid=pid,
+                error_type=self.stderr_capture_error_type,
+            )
+        self._stderr_exporter = exporter
+        # Always drain: an unread pipe would stall the server once it fills.
+        reader = threading.Thread(
+            target=self._drain_stderr,
+            args=(stream, exporter),
+            name=f"opencode-stderr-reader-{pid}",
+            daemon=True,
+        )
+        self._stderr_reader = reader
+        reader.start()
 
-        def _private_opener(path: str, flags: int) -> int:
-            fd = os.open(path, flags, 0o600)
-            os.fchmod(fd, 0o600)
-            return fd
+    def _drain_stderr(self, stream: IO[bytes], exporter: HarnessStderrExporter | None) -> None:
+        """Split stderr into records for the recent-lines buffer and the exporter."""
+        pending = bytearray()
+        omitted_bytes = 0
 
-        return open(self.log_path, "wb", opener=_private_opener)
+        def record_line(*, newline: bool) -> None:
+            text = pending[:_STDERR_LINE_CHARS].decode("utf-8", errors="replace").rstrip()
+            if omitted_bytes or len(pending) > _STDERR_LINE_CHARS:
+                text = f"{text}...[truncated]"
+            self.recent_stderr.append(text)
+            if exporter is not None:
+                exporter.submit(
+                    bytes(pending) + (b"\n" if newline else b""), bytes_omitted=omitted_bytes
+                )
 
-    def _close_log(self) -> None:
-        log_file, self._log_file = self._log_file, None
-        if log_file is not None:
-            with contextlib.suppress(OSError):
-                log_file.close()
+        try:
+            while chunk := stream.read1(8 * 1024):  # type: ignore[attr-defined]
+                parts = chunk.split(b"\n")
+                for index, part in enumerate(parts):
+                    remaining = MAX_STDERR_RECORD_BYTES - len(pending)
+                    pending.extend(part[:remaining])
+                    omitted_bytes += max(0, len(part) - remaining)
+                    if index < len(parts) - 1:
+                        record_line(newline=True)
+                        pending.clear()
+                        omitted_bytes = 0
+        except (OSError, ValueError):
+            pass  # The pipe closed under us during teardown.
+        finally:
+            if pending or omitted_bytes:
+                record_line(newline=False)
+            if exporter is not None:
+                exporter.finish()
+
+    def _stderr_excerpt(self) -> str:
+        """Return a redacted tail of recent stderr for startup errors, or ``""`` when off."""
+        if not self._stderr_capture:
+            return ""
+        tail = bounded_diagnostic_tail(list(self.recent_stderr)[-_STDERR_EXCERPT_LINES:])
+        text = str(tail["tail"]).replace("\n", " | ")
+        return f"; stderr: {text}" if text else ""
+
+    async def _stop_stderr_capture(self) -> None:
+        """Let the reader reach EOF, then flush the exporter; both waits are bounded."""
+        reader, self._stderr_reader = self._stderr_reader, None
+        exporter, self._stderr_exporter = self._stderr_exporter, None
+        if reader is not None:
+            # A descendant can keep the pipe open after the server exits.
+            await asyncio.to_thread(reader.join, _STDERR_READER_JOIN_S)
+        if exporter is not None:
+            with contextlib.suppress(Exception):
+                await asyncio.to_thread(exporter.close)
 
     async def _wait_until_ready(self, *, attempts: int = 60, delay: float = 0.5) -> None:
         """
@@ -512,9 +612,13 @@ class OpenCodeNativeServer:
         ) as client:
             for _ in range(attempts):
                 if self.process is not None and self.process.poll() is not None:
+                    reader = self._stderr_reader
+                    if reader is not None:
+                        # Let the reader collect the exit output before quoting it.
+                        await asyncio.to_thread(reader.join, _STDERR_READER_JOIN_S)
                     raise RuntimeError(
                         f"opencode serve exited early with code {self.process.returncode}"
-                        f" (see {self.log_path})"
+                        f"{self._stderr_excerpt()}"
                     )
                 try:
                     response = await client.get("/api/info")
@@ -529,7 +633,7 @@ class OpenCodeNativeServer:
                     last_error = f"HTTP {response.status_code}"
                 await asyncio.sleep(delay)
         raise RuntimeError(
-            f"opencode serve did not become ready: {last_error} (see {self.log_path})"
+            f"opencode serve did not become ready: {last_error}{self._stderr_excerpt()}"
         )
 
     def _record_info(self, response: httpx.Response) -> None:
@@ -567,7 +671,7 @@ class OpenCodeNativeServer:
         """Stop the server: close stdin (graceful ``--stdio`` exit), then escalate."""
         process = self.process
         if process is None:
-            self._close_log()
+            await self._stop_stderr_capture()
             return
         if process.stdin is not None:
             with contextlib.suppress(OSError):
@@ -583,7 +687,7 @@ class OpenCodeNativeServer:
                     process.kill()
                     await asyncio.to_thread(process.wait)
         self.process = None
-        self._close_log()
+        await self._stop_stderr_capture()
 
 
 def client_for_state(
