@@ -507,9 +507,11 @@ when *every* sub-symptom is fixed is the overall verdict `already_fixed`.
 
 ## Step 3 — Identify the smallest reliable regression coverage
 
-Search existing tests and fixtures before writing a test. Prefer reusing an
-existing check or extending a nearby scenario with the missing assertion. If
-new coverage is needed, choose the lowest layer that still exposes the observed
+Search existing tests by behavior and fixture, and read the nearest scenarios.
+If one already drives the relevant setup and state transition, fold the missing
+assertion into it before creating another test body. Prefer reusing an existing
+check unchanged when sufficient. If new coverage is needed, choose the lowest
+layer that still exposes the observed
 bug. Do not replace a failing production boundary with mocks or already-correct
 objects merely to make the test smaller.
 

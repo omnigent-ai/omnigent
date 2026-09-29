@@ -63,10 +63,15 @@ to make it pass; the *code* must change to satisfy it.
 
 ### 2B.4 — Select permanent regression coverage
 
-Choose which tests belong in the final PR. Search existing tests and fixtures
-first: reuse an unchanged test, extend an existing scenario, or add a focused
-test only for a demonstrated gap. There is no requirement for a new test file
-or both a new e2e and a smaller test.
+Choose which tests belong in the final PR. Search existing tests by behavior
+and fixture, and read the nearest scenarios. If one already drives the relevant
+setup and state transition, fold the missing assertions into it; parameterize
+configuration variants when useful. Apply this to recovered Repro tests too:
+archive the original, then consolidate its regression assertions into the
+existing scenario. Keep a separate test when a distinct ordering or boundary
+would make that extension misleading. Keep investigation history in evidence
+and test comments short. Reuse unchanged coverage when sufficient; there is no
+requirement for a new test file or both a new e2e and a smaller test.
 
 Retain an e2e when it protects a distinct production boundary that lower-level
 coverage would miss, and explain that boundary briefly in `test_audit`. Do not
