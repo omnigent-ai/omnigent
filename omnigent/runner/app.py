@@ -251,10 +251,13 @@ _CODEX_POPUP_RENDER_S = 0.7
 _CODEX_PERMISSION_CONFIRM_BUDGET_S = 4.0
 
 # Budget for the /permissions popup to render its option rows before we read
-# them to find the target preset's menu digit. Row positions are not fixed
-# across codex builds/platforms (Read Only, for one, is absent from the popup on
-# macOS/Linux), so the digit is discovered from the popup rather than hardcoded.
-_CODEX_PERMISSION_MENU_BUDGET_S = 2.0
+# them to find the target preset's menu digit. The popup can be slow to draw
+# mid-session (a busy TUI, MCP still starting), so give it room; if it still
+# can't be read we fall back to the preset's conventional menu position rather
+# than failing the switch. Which rows the popup lists is codex-config-dependent
+# (Read Only appears only with a read-only permission profile), so the digit is
+# read from the live popup when possible rather than hardcoded.
+_CODEX_PERMISSION_MENU_BUDGET_S = 5.0
 
 
 def _warn_unresolved_sub_agent(session_id: str | None, sub_agent_name: str) -> None:
@@ -6217,10 +6220,9 @@ def create_runner_app(
                 },
             )
         if not offered:
-            # The popup rendered but had no row for this preset. On macOS/Linux
-            # Codex's /permissions popup omits Read Only entirely (it lists it
-            # only on Windows, or when a permission profile is active), so point
-            # the user at the reachable path instead of a phantom switch.
+            # The popup was read but had no row for this preset. Codex lists Read
+            # Only only when the session runs with a read-only permission profile,
+            # so point the user at the reachable path instead of a phantom switch.
             if preset.value == "read-only":
                 detail = (
                     "Codex's /permissions popup doesn't offer Read Only on this "
@@ -7290,18 +7292,20 @@ def create_runner_app(
         needs_confirm: bool,
     ) -> bool:
         # Drive Codex's /permissions popup: open it, read its rows to find the
-        # digit that selects *label*, then press it. Row positions vary by codex
-        # build/platform (Read Only, for one, is absent from the popup on
-        # macOS/Linux), so we discover the digit off the live popup instead of
-        # hardcoding it. Full Access opens a "Yes, continue anyway" sub-dialog
-        # whose first option (digit 1) confirms. A settle pause between keystrokes
-        # is required — each screen draws asynchronously, and typing the command
-        # then pressing Enter back-to-back races the slash-menu so the command
-        # never submits.
+        # digit that selects *label*, then press it. Which rows the popup lists
+        # depends on the session's codex config (Read Only shows only with a
+        # read-only permission profile) and their order can vary, so the digit is
+        # read from the live popup. If the popup can't be read in time (a busy
+        # TUI, a slow draw), fall back to the preset's conventional menu position
+        # rather than failing the switch. Full Access opens a "Yes, continue
+        # anyway" sub-dialog whose first option (digit 1) confirms. A settle pause
+        # between keystrokes is required — each screen draws asynchronously, and
+        # typing the command then pressing Enter back-to-back races the slash-menu
+        # so the command never submits.
         #
-        # Returns True once the target row's digit is pressed, False when the
-        # popup rendered without a row for *label*. Raises RuntimeError if the
-        # popup never renders any rows.
+        # Returns True once a digit is pressed for *label* (from the live popup,
+        # or its conventional position on fallback); False when the popup was read
+        # but lists no row for *label*.
         from omnigent.codex_approval_modes import (
             CODEX_NATIVE_PERMISSION_PRESETS,
             codex_permissions_menu,
@@ -7317,37 +7321,53 @@ def create_runner_app(
         time.sleep(_CODEX_POPUP_RENDER_S)
         _run_tmux(socket_path, "send-keys", "-t", target, "Enter")
 
-        # Wait for the popup to draw, then map *label* to its digit. Anchor on
-        # seeing at least two known preset rows (every popup variant lists Ask for
-        # approval and Full Access) rather than any numbered line, so a numbered
-        # list still visible in the transcript above can't be mistaken for the
-        # rendered popup.
+        # Wait for the popup to draw. Anchor on seeing at least two known preset
+        # rows (every popup variant lists Ask for approval and Full Access)
+        # rather than any numbered line, so a numbered list still visible in the
+        # transcript above can't be mistaken for the rendered popup.
         known_labels = {preset.label for preset in CODEX_NATIVE_PERMISSION_PRESETS}
 
-        def _codex_menu_digit() -> tuple[dict[str, str], str | None]:
-            options = codex_permissions_menu(_capture_pane(socket_path, target))
-            return options, options.get(label)
+        def _read_menu() -> dict[str, str]:
+            return codex_permissions_menu(_capture_pane(socket_path, target))
 
         deadline = time.monotonic() + _CODEX_PERMISSION_MENU_BUDGET_S
+        options: dict[str, str] = {}
         while True:
             time.sleep(_CODEX_POPUP_RENDER_S)
-            options, digit = _codex_menu_digit()
+            options = _read_menu()
             if len(options.keys() & known_labels) >= 2:
                 break
             if time.monotonic() >= deadline:
-                # Close whatever opened so the TUI isn't stranded in a popup.
+                options = {}
+                break
+
+        if options:
+            # The live popup was read: trust it. A missing row means this
+            # session's codex genuinely doesn't offer the preset (e.g. Read Only
+            # without a read-only permission profile). Re-read once to tolerate a
+            # partially-drawn popup before concluding the row is absent.
+            digit = options.get(label)
+            if digit is None:
+                time.sleep(_CODEX_POPUP_RENDER_S)
+                digit = _read_menu().get(label)
+            if digit is None:
+                # Close the popup so the TUI isn't stranded in it.
                 _run_tmux(socket_path, "send-keys", "-t", target, "Escape")
-                raise RuntimeError("Codex's /permissions popup did not open")
-        if digit is None:
-            # Guard a partially-drawn popup: settle once more and re-read before
-            # concluding the row is absent.
-            time.sleep(_CODEX_POPUP_RENDER_S)
-            _, digit = _codex_menu_digit()
-        if digit is None:
-            # Popup rendered without a row for this preset (e.g. Read Only on
-            # macOS/Linux). Close the popup so the TUI isn't stranded in it.
-            _run_tmux(socket_path, "send-keys", "-t", target, "Escape")
-            return False
+                return False
+        else:
+            # The popup couldn't be read within the budget (a busy or slow TUI).
+            # Fall back to the preset's conventional menu position and let the
+            # confirmation echo gate correctness, rather than failing the switch.
+            digit = next(
+                (
+                    str(position)
+                    for position, preset in enumerate(CODEX_NATIVE_PERMISSION_PRESETS, start=1)
+                    if preset.label == label
+                ),
+                None,
+            )
+            if digit is None:
+                return False
         _run_tmux(socket_path, "send-keys", "-l", "-t", target, digit)
         if needs_confirm:
             time.sleep(_CODEX_POPUP_RENDER_S)
