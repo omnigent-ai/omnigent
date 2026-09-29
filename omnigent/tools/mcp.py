@@ -423,7 +423,9 @@ def _cache_key(config: MCPServerConfig, cwd: Path | None = None) -> str:
     # static ``headers`` map doesn't show it. A profile name is not
     # a secret; keyed verbatim.
     profile_part = config.databricks_profile or ""
-    return f"http:{config.name}:{config.url}:{profile_part}:{headers_part}"
+    # OAuth likewise changes who the server sees as the caller.
+    oauth_part = "oauth" if config.oauth else ""
+    return f"http:{config.name}:{config.url}:{profile_part}:{oauth_part}:{headers_part}"
 
 
 def clear_discovery_cache() -> None:

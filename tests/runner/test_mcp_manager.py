@@ -261,6 +261,16 @@ def test_compute_server_hash_distinguishes_oauth() -> None:
     assert compute_server_hash(cfg_plain) != compute_server_hash(cfg_oauth)
 
 
+def test_compute_spec_hash_distinguishes_oauth() -> None:
+    """Toggling ``oauth`` on a spec's server must change the spec hash, or the
+    manager would keep serving the spec entry built for the other setting."""
+    cfg_plain = _make_config("svc")
+    cfg_oauth = _make_config("svc")
+    cfg_oauth.oauth = True
+
+    assert compute_spec_hash([cfg_plain]) != compute_spec_hash([cfg_oauth])
+
+
 @pytest.mark.asyncio
 async def test_shared_server_reused_across_different_specs(
     patch_connection: dict[str, Any],

@@ -135,6 +135,7 @@ def compute_spec_hash(configs: list[MCPServerConfig], cwd: Path | None = None) -
                     "url": c.url,
                     "headers": dict(c.headers or {}),
                     "databricks_profile": c.databricks_profile,
+                    "oauth": c.oauth,
                     "command": c.command,
                     "args": list(c.args or []),
                     "env": dict(c.env or {}),

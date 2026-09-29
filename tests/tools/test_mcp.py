@@ -283,6 +283,14 @@ def test_cache_key_http_headers_and_profile_change_key() -> None:
     )
 
 
+def test_cache_key_http_oauth_changes_key() -> None:
+    """An OAuth-authenticated connection sees the server as a signed-in
+    user, so its tools/list must not be shared with an anonymous one."""
+    plain = MCPServerConfig(name="svc", url="https://mcp.example.com/mcp")
+    oauth = MCPServerConfig(name="svc", url="https://mcp.example.com/mcp", oauth=True)
+    assert _cache_key(plain) != _cache_key(oauth)
+
+
 def test_cache_key_stdio_and_http_do_not_collide() -> None:
     """
     A stdio server named ``my-mcp`` and an HTTP server named
