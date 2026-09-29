@@ -3070,6 +3070,8 @@ function registerIpc() {
     if (runner !== "local" && runner !== "remote") throw new TypeError("unknown runner");
     if (typeof url !== "string") throw new TypeError("connect-runner requires a URL string");
     const target = await resolveConnectTarget(url);
+    // Resolving can probe the network; don't start anything for a closed window.
+    if (event.sender.isDestroyed()) return { ok: false, canceled: true };
     const log = (line) => {
       try {
         event.sender.send("omnigent:runner-connect-log", { line });

@@ -59,6 +59,12 @@ export function RunnerStep({
           </SelectItem>
         </SelectContent>
       </Select>
+      {runner === "local" && (
+        // Onboarding connects this laptop without the host-enrollment prompt, so say what it grants.
+        <p className="mt-2 text-center text-sm text-muted-foreground">
+          The server will be able to run agents on this laptop.
+        </p>
+      )}
 
       <p className="mx-auto mt-4 max-w-sm flex-1 text-center text-base text-muted-foreground">
         Automatically carry over your existing setup. Share sessions with your teammates. Use from
