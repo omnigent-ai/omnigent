@@ -117,12 +117,15 @@ function createUpdateOverlay({
 
   function position(parent, overlay, height) {
     if (!parent || parent.isDestroyed() || overlay.isDestroyed()) return;
+    // A zero-height window geometry is an xdg-shell protocol error that
+    // Chromium's Wayland backend traps on, so the collapsed sliver stays 1px.
+    const nativeHeight = Math.max(1, height);
     const content = parent.getContentBounds();
     overlay.setBounds({
       x: content.x + content.width - OVERLAY_WIDTH - OVERLAY_INSET,
-      y: content.y + content.height - height - OVERLAY_INSET,
+      y: content.y + content.height - nativeHeight - OVERLAY_INSET,
       width: OVERLAY_WIDTH,
-      height,
+      height: nativeHeight,
     });
   }
 
@@ -197,7 +200,7 @@ function createUpdateOverlay({
       );
     });
 
-    const reposition = () => position(parent, overlay, heights.get(overlay) ?? 1);
+    const reposition = () => position(parent, overlay, heights.get(overlay) ?? 0);
     parent.on("resize", reposition);
     parent.on("move", reposition);
     // Electron does NOT auto-close child windows when their parent closes, so
