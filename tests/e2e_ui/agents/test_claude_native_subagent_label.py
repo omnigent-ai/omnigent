@@ -8,7 +8,6 @@ import httpx
 from playwright.sync_api import Page, expect
 
 from tests.e2e_ui.conftest import open_right_rail
-from tests.e2e_ui.native_driver import inject_child_start, navigate_to_child
 
 _HEX_SUBAGENT_ID = "a09d1dd1d8dbc0151"
 _NAMESPACED_SUBAGENT_ID = "a361e6a6aa05689cb"
@@ -21,17 +20,22 @@ def _register_subagent(
     subagent_id: str,
     agent_type: str,
     description: str,
-) -> str:
+) -> None:
     """Post the forwarder's ``external_subagent_start`` for one Task spawn."""
-    with httpx.Client(base_url=base_url, timeout=10) as client:
-        return inject_child_start(
-            client,
-            session_id,
-            subagent_id=subagent_id,
-            agent_type=agent_type,
-            description=description,
-            tool_use_id=f"toolu_{subagent_id}",
-        )
+    resp = httpx.post(
+        f"{base_url}/v1/sessions/{session_id}/events",
+        json={
+            "type": "external_subagent_start",
+            "data": {
+                "subagent_id": subagent_id,
+                "agent_type": agent_type,
+                "description": description,
+                "tool_use_id": f"toolu_{subagent_id}",
+            },
+        },
+        timeout=10.0,
+    )
+    assert resp.status_code in (200, 202), resp.text
 
 
 def test_claude_subagent_rows_show_names_not_hex_ids(
@@ -56,7 +60,7 @@ def test_claude_subagent_rows_show_names_not_hex_ids(
     )
     assert patched.status_code == 200, patched.text
 
-    child_id = _register_subagent(
+    _register_subagent(
         base_url,
         session_id,
         subagent_id=_HEX_SUBAGENT_ID,
@@ -82,5 +86,3 @@ def test_claude_subagent_rows_show_names_not_hex_ids(
     expect(rows.filter(has_text="debug-lead")).to_have_count(1)
     expect(rows.filter(has_text=_HEX_SUBAGENT_ID)).to_have_count(0)
     expect(rows.filter(has_text=_NAMESPACED_SUBAGENT_ID)).to_have_count(0)
-
-    navigate_to_child(page, child_id)

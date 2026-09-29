@@ -193,22 +193,11 @@ def test_independent_content_queues_and_title_isolation(monkeypatch, endpoint, t
                 body = {"model": "any-model", "input": marker}
             # A title request sees the same user nonce but lacks agent tools.
             assert client.post(endpoint, json=body).status_code == 200
-            queues = client.get("/mock/queues").json()["queues"]
-            assert queues[key]["remaining"] == 1
+            assert mock_llm_server._state.queues[key].index == 0
             response = client.post(endpoint, json={**body, "tools": [tool]})
             assert response.status_code == 200
             assert marker in response.text
-            selection = client.get("/mock/selections").json()["selections"][-1]
-            assert selection["key"] == key
-            assert selection["response_index"] == 0
-            assert selection["response"]["tool_calls"][0]["call_id"] == marker
-            request = client.get("/mock/requests").json()["requests"][selection["request_index"]]
-            assert request["tools"] == [tool]
-        assert all(
-            client.get("/mock/queues").json()["queues"][key]["remaining"] == 0 for key in keys
-        )
-        client.post("/mock/reset")
-        assert client.get("/mock/selections").json() == {"selections": []}
+        assert all(mock_llm_server._state.queues[key].index == 1 for key in keys)
 
 
 @pytest.mark.parametrize("key", [None, "default", "custom-model"])
@@ -222,7 +211,7 @@ def test_explicit_keys_and_unrouted_default_still_replace(monkeypatch, key):
             assert client.post("/mock/configure", json=body).status_code == 200
         response = client.post("/v1/responses", json={"input": "nonce"})
         assert response.json()["output"][0]["content"][0]["text"] == "new"
-        assert len(client.get("/mock/queues").json()["queues"]) == 1
+        assert len(mock_llm_server._state.queues) == 1
 
 
 def test_tool_guard_cannot_be_bypassed_by_model_or_default(monkeypatch):
@@ -240,10 +229,7 @@ def test_tool_guard_cannot_be_bypassed_by_model_or_default(monkeypatch):
         for model in ("unknown", "native-model"):
             response = client.post("/v1/responses", json={"model": model, "input": "title"})
             assert "protected" not in response.text
-        assert all(
-            queue["remaining"] == 1
-            for queue in client.get("/mock/queues").json()["queues"].values()
-        )
+        assert all(queue.index == 0 for queue in mock_llm_server._state.queues.values())
 
 
 @pytest.mark.parametrize("key,model", [("default", "unknown"), ("native-model", "native-model")])
@@ -267,7 +253,11 @@ def test_tool_guard_protects_configured_fallback(monkeypatch, key, model):
             response = client.post("/v1/responses", json={**request, "tools": tools})
             response.raise_for_status()
             assert response.json()["output"][0]["content"][0]["text"] == expected
-            assert client.get("/mock/queues").json()["queues"][key]["remaining"] == remaining
+            assert (
+                len(mock_llm_server._state.queues[key].responses)
+                - mock_llm_server._state.queues[key].index
+                == remaining
+            )
 
 
 @pytest.mark.parametrize(
@@ -278,7 +268,7 @@ def test_invalid_routing_is_rejected_before_replacing_queue(monkeypatch, invalid
     with TestClient(mock_llm_server.app) as client:
         client.post("/mock/configure", json={"responses": [{"text": "kept"}]})
         assert client.post("/mock/configure", json=invalid).status_code == 400
-        assert client.get("/mock/queues").json()["queues"]["default"]["remaining"] == 1
+        assert mock_llm_server._state.queues["default"].index == 0
 
 
 def test_tool_results_cannot_steal_parent_content_routing():

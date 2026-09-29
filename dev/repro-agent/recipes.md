@@ -87,7 +87,6 @@ actual routing/configuration conflicts in the supported sandbox.
 | Reported path | Existing starting point | Boundary to preserve |
 | --- | --- | --- |
 | Claude-native chat/terminal | `native_claude_mock_session`; `tests/e2e_ui/messages/test_native_claude_render_parity.py` | Real Claude CLI; drive the reported composer or terminal action. A synthetic hook is not native tool execution. |
-| Native delegation/child navigation | [native_driver.py](../../tests/e2e_ui/native_driver.py); [test_native_delegation.py](../../tests/e2e_ui/agents/test_native_delegation.py) | Real native tool invocation, linked child and completion; click the Agents row with no direct-navigation fallback. |
 | Codex-native chat/terminal | `native_codex_mock_session`; `tests/e2e_ui/messages/test_native_codex_render_parity.py` | Real Codex CLI; native slash commands must be typed into the terminal. An SDK call does not exercise that path. |
 | Pi-native terminal | `omnigent/harnesses/pi_native/main.py` for launch/resume; browser input helpers below | Real Pi CLI; the Claude fixture and its local pane reader do not configure or capture Pi. |
 | OpenAI Agents web journey | `custom_agent_session`; `tests/e2e_ui/messages/test_message_render_parity.py` | Real web composer and executor; a direct Python helper bypasses the user journey. |

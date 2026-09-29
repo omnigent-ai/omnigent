@@ -872,7 +872,6 @@ class MockState:
     def __init__(self) -> None:
         self.queues: dict[str, _ResponseQueue] = {}
         self.captured_requests: list[dict] = []
-        self.selections: list[dict] = []
         self.request_count: int = 0
         self.pending_gates: list[QueuedResponse] = []
         # Ids ``GET /v1/models`` reports; see ``POST /mock/served_models``.
@@ -1016,27 +1015,6 @@ class MockState:
             return _ResponseQueue()
         return queue
 
-    def select(self, parsed: object, accepted_at_ns: int) -> tuple[QueuedResponse, dict]:
-        """Capture selection separately from delivery (a gate may still be blocked)."""
-        queue = self.resolve_queue_for_request(parsed)
-        key = next((key for key, value in self.queues.items() if value is queue), None)
-        index = queue.index if queue.index < len(queue.responses) else None
-        response = queue.next()
-        selection = {
-            "request_index": len(self.captured_requests) - 1,
-            "accepted_at_ns": accepted_at_ns,
-            "key": key,
-            "response_index": index,
-            "source": "queue" if index is not None else "fallback",
-            "response": {
-                "text": response.text,
-                "tool_calls": response.tool_calls,
-                "error": response.error,
-            },
-        }
-        self.selections.append(selection)
-        return response, selection
-
     def reset(self, *, record_evidence: bool = True) -> None:
         """Clear all state (queues, captured requests, gates).
 
@@ -1063,7 +1041,6 @@ class MockState:
         if record_evidence:
             _record_evidence("reset", accepted_at_ns=_time_mod.time_ns())
         self.captured_requests.clear()
-        self.selections.clear()
         self.request_count = 0
         self.served_models = []
 
@@ -1094,10 +1071,10 @@ async def create_response(
         accepted_at_ns = _time_mod.time_ns()
         _state.request_count += 1
         _state.captured_requests.append(parsed)
-        qr, selection = _state.select(parsed, accepted_at_ns)
+        queue = _state.resolve_queue_for_request(parsed)
+        qr = queue.next()
 
     await _record_evidence_async("request", parsed, accepted_at_ns)
-    await _record_evidence_async("selection", selection, accepted_at_ns)
 
     # Fixed wall-clock pause the mock owns (see QueuedResponse.delay).
     if qr.delay:
@@ -1173,10 +1150,10 @@ async def create_message(
         accepted_at_ns = _time_mod.time_ns()
         _state.request_count += 1
         _state.captured_requests.append(parsed)
-        qr, selection = _state.select(parsed, accepted_at_ns)
+        queue = _state.resolve_queue_for_request(parsed)
+        qr = queue.next()
 
     await _record_evidence_async("request", parsed, accepted_at_ns)
-    await _record_evidence_async("selection", selection, accepted_at_ns)
 
     # Fixed wall-clock pause the mock owns (see QueuedResponse.delay).
     if qr.delay:
@@ -1294,10 +1271,10 @@ async def create_chat_completion(
         _state.request_count += 1
         _state.captured_requests.append(parsed)
         model = parsed.get("model") if isinstance(parsed, dict) else None
-        qr, selection = _state.select(parsed, accepted_at_ns)
+        queue = _state.resolve_queue_for_request(parsed)
+        qr = queue.next()
 
     await _record_evidence_async("request", parsed, accepted_at_ns)
-    await _record_evidence_async("selection", selection, accepted_at_ns)
 
     # Fixed wall-clock pause the mock owns (see QueuedResponse.delay).
     if qr.delay:
@@ -1502,7 +1479,6 @@ async def configure(request: Request) -> dict[str, object]:
                 )
             )
         count = len(queue.responses)
-    await _record_evidence_async("configure", {**body, "key": key})
     return {"configured": True, "key": key, "count": count}
 
 
@@ -1546,28 +1522,6 @@ async def reset() -> dict[str, bool]:
         _state.reset(record_evidence=False)
     await _record_evidence_async("reset", accepted_at_ns=accepted_at_ns)
     return {"reset": True}
-
-
-@app.get("/mock/queues")
-async def get_queues() -> dict:
-    """Inspect installed queues before triggering a native turn."""
-    return {
-        "queues": {
-            key: {
-                "match": queue.match,
-                "required_tools": sorted(queue.required_tools),
-                "count": len(queue.responses),
-                "remaining": len(queue.responses) - queue.index,
-            }
-            for key, queue in _state.queues.items()
-        }
-    }
-
-
-@app.get("/mock/selections")
-async def get_selections() -> dict:
-    """Selected responses, linked to zero-based /mock/requests indices."""
-    return {"selections": _state.selections}
 
 
 @app.get("/mock/requests")

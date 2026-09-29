@@ -559,14 +559,6 @@ def test_mock_recording_runs_off_event_loop_and_outside_state_lock(tmp_path, mon
 
     monkeypatch.setenv("OMNIGENT_REPRO_ATTEMPT_DIR", str(tmp_path))
     observed = []
-    state = mock.MockState()
-    monkeypatch.setattr(mock, "_state", state)
-    state.get_queue("fixture-model").responses = [
-        mock.QueuedResponse(
-            tool_calls=[{"call_id": f"call-{index}", "name": "Read", "arguments": "{}"}]
-        )
-        for index in range(3)
-    ]
 
     async def check():
         owner = threading.get_ident()
@@ -591,15 +583,7 @@ def test_mock_recording_runs_off_event_loop_and_outside_state_lock(tmp_path, mon
                 assert response.status_code == 200
 
     asyncio.run(check())
-    assert [args[0] for args in observed] == ["request", "selection"] * 3 + ["reset"]
-    for index in range(3):
-        request, selection = observed[index * 2 : index * 2 + 2]
-        assert request[2] == selection[2] == selection[1]["accepted_at_ns"]
-        assert selection[1]["request_index"] == index
-        assert selection[1]["key"] == "fixture-model"
-        assert selection[1]["response_index"] == index
-        assert selection[1]["source"] == "queue"
-        assert selection[1]["response"]["tool_calls"][0]["call_id"] == f"call-{index}"
+    assert [args[0] for args in observed] == ["request", "request", "request", "reset"]
 
 
 def test_unsanitizable_trace_is_explicitly_unavailable(tmp_path):
@@ -844,9 +828,6 @@ def test_mock_acceptance_order_survives_reordered_writes(tmp_path, monkeypatch):
     from tests.server.integration import mock_llm_server as mock
 
     monkeypatch.setenv("OMNIGENT_REPRO_ATTEMPT_DIR", str(tmp_path))
-    state = mock.MockState()
-    monkeypatch.setattr(mock, "_state", state)
-    state.get_queue("default").responses = [mock.QueuedResponse(text="accepted before reset")]
     request_waiting = threading.Event()
     reset_written = threading.Event()
     record = mock._record_evidence
@@ -869,9 +850,7 @@ def test_mock_acceptance_order_survives_reordered_writes(tmp_path, monkeypatch):
             try:
                 assert await asyncio.to_thread(request_waiting.wait, 5)
                 assert (await client.post("/mock/reset")).status_code == 200
-                response = await request
-                assert response.status_code == 200
-                assert "accepted before reset" in response.text
+                assert (await request).status_code == 200
             finally:
                 reset_written.set()
                 response = await request
@@ -879,15 +858,8 @@ def test_mock_acceptance_order_survives_reordered_writes(tmp_path, monkeypatch):
 
     asyncio.run(check())
     saved = events(tmp_path)
-    assert [e["action"] for e in saved] == ["reset", "request", "selection"]
-    reset, request, selection = saved
-    assert request["accepted_at_ns"] == selection["accepted_at_ns"] < reset["accepted_at_ns"]
-    assert selection["body"]["accepted_at_ns"] == request["accepted_at_ns"]
-    assert selection["body"]["request_index"] == 0
-    assert selection["body"]["key"] == "default"
-    assert selection["body"]["response_index"] == 0
-    assert selection["body"]["response"]["text"] == "accepted before reset"
-    assert state.selections == []  # reset cannot erase the immutable journal record
+    assert [e["action"] for e in saved] == ["reset", "request"]
+    assert saved[1]["accepted_at_ns"] < saved[0]["accepted_at_ns"]
     assert all(e["accepted_at_ns"] <= e["time_ns"] for e in saved)
 
 
@@ -931,16 +903,8 @@ def test_runtime_mock_module_records_without_pythonpath(tmp_path):
                 assert client.post("/v1/responses", json={"stream": False}).status_code == 200
                 assert client.post("/mock/reset").status_code == 200
             saved = events(tmp_path / "execution/service")
-            assert [e["action"] for e in saved] == ["request", "selection", "reset"]
-            request, selection, reset = saved
-            assert (
-                request["accepted_at_ns"] == selection["accepted_at_ns"] < reset["accepted_at_ns"]
-            )
-            assert selection["body"]["request_index"] == 0
-            assert selection["body"]["key"] == "default"
-            assert selection["body"]["source"] == "fallback"
-            assert selection["body"]["response_index"] is None
-            assert selection["body"]["response"]["text"] == "Mock LLM response"
+            assert [e["action"] for e in saved] == ["request", "reset"]
+            assert saved[0]["accepted_at_ns"] < saved[1]["accepted_at_ns"]
         finally:
             process.terminate()
             try:
