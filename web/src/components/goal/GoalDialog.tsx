@@ -76,7 +76,7 @@ function GoalSummary({ loading, goal }: GoalSummaryProps) {
         <span className="font-medium text-foreground">{formatGoalStatus(goal.status)}</span>
         <span className="shrink-0 text-muted-foreground">{formatGoalUsage(goal)}</span>
       </div>
-      <p className="text-ui leading-5 whitespace-pre-wrap">{goal.objective}</p>
+      <p className="text-ui leading-5 wrap-anywhere whitespace-pre-wrap">{goal.objective}</p>
     </div>
   );
 }
