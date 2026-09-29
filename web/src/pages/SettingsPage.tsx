@@ -1189,6 +1189,7 @@ function AppearanceSection() {
             </div>
           </SettingsGroup>
 
+
           <SettingsGroup title="Code typography" testId="settings-group-code-type">
             <UiCodeFontSizeControl />
             <div className="mt-4 border-t border-border pt-4">
@@ -1198,6 +1199,17 @@ function AppearanceSection() {
               <UiCodeFontWeightControl />
             </div>
           </SettingsGroup>
+
+          <SettingsGroup
+            title="Touch & mobile"
+            description="Settings for phones, tablets and other touch screens."
+            descriptionClassName="text-sm"
+          >
+            <div className="flex flex-col gap-8">
+              <SwipeActionsControl />
+            </div>
+          </SettingsGroup>
+        </div>
         </div>
 
         <SettingsGroup title="Settings data" testId="settings-group-data">
