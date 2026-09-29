@@ -64,6 +64,7 @@ from .codex_staging import (
     CODEX_HOME_PREFIX,
     CODEX_SKILLS_PREFIX,
     codex_home_staging_root,
+    link_codex_skills_dir,
     prepare_codex_skills_dir,
 )
 from .codex_worker import (
@@ -800,6 +801,17 @@ def select_codex_skill_dirs(
     return {n: available[n] for n in names}
 
 
+def _is_linked_skill_dir(skill_dir: Path) -> bool:
+    """
+    Return whether a selected skill directory or its skills root is a link.
+
+    :param skill_dir: A ``<skills_root>/<name>`` directory from
+        :func:`select_codex_skill_dirs`.
+    :returns: ``True`` when either entry is a symlink or a Windows junction.
+    """
+    return any(path.is_symlink() or path.is_junction() for path in (skill_dir, skill_dir.parent))
+
+
 def _populate_codex_skills(
     target_dir: Path,
     skills_filter: str | list[str],
@@ -836,7 +848,9 @@ def _populate_codex_skills(
         symlinking it. Used for sandbox-exposed staging, where the
         ``skills/`` subtree must be self-contained — a symlink whose
         target is outside the mounted subtree dangles inside the tool
-        namespace.
+        namespace. A skill whose directory or skills root is itself a
+        link is still linked, never copied: copying would materialize
+        the link's target, which no sandbox grant covers.
     """
     if skills_filter == "none":
         return
@@ -848,7 +862,8 @@ def _populate_codex_skills(
         link_path = target_dir / name
         if link_path.exists() or link_path.is_symlink():
             continue
-        if not copy_skills:
+        keep_link = copy_skills and _is_linked_skill_dir(skill_dir)
+        if not copy_skills or keep_link:
             try:
                 # Resolve to absolute so the symlink doesn't break when
                 # the source was a relative path (relative symlinks resolve
@@ -856,6 +871,14 @@ def _populate_codex_skills(
                 link_path.symlink_to(skill_dir.resolve())
                 continue
             except OSError as exc:
+                if keep_link:
+                    logger.warning(
+                        "could not link skill %r into %s (%s); skipping",
+                        name,
+                        target_dir,
+                        exc,
+                    )
+                    continue
                 # Filesystems without symlink support (e.g. some Windows
                 # configs) — fall back to a copy. Don't crash the harness
                 # boot over a skill-discovery convenience.
@@ -2816,7 +2839,17 @@ class _CodexAppServerSession:
             self._owned_skills_dir = tempfile.TemporaryDirectory(prefix=CODEX_SKILLS_PREFIX)
             self._skills_dir = Path(self._owned_skills_dir.name)
         self._skills_dir = prepare_codex_skills_dir(self._skills_dir)
-        (self._codex_home_dir / "skills").symlink_to(self._skills_dir, target_is_directory=True)
+        try:
+            link_codex_skills_dir(self._codex_home_dir / "skills", self._skills_dir)
+        except OSError as exc:
+            # Skills are then copied into the home itself: still discoverable,
+            # but outside the session's grant, so restricted reads can't open them.
+            logger.warning(
+                "could not link %s to the session skills directory (%s); sandboxed "
+                "tools with restricted reads cannot open this session's skills",
+                self._codex_home_dir / "skills",
+                exc,
+            )
         populate_codex_skills_from_bundle(
             self._codex_home_dir,
             self._bundle_dir,

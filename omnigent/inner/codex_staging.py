@@ -9,6 +9,7 @@ from __future__ import annotations
 import os
 import shutil
 import stat
+import sys
 import tempfile
 from pathlib import Path
 
@@ -80,3 +81,26 @@ def prepare_codex_skills_dir(path: Path) -> Path:
         else:
             shutil.rmtree(child)
     return root
+
+
+def link_codex_skills_dir(home_skills: Path, skills_dir: Path) -> None:
+    """Point a private home's ``skills`` entry at the session's granted directory.
+
+    Codex publishes resolved skill paths, so the link keeps them inside the grant.
+
+    :param home_skills: ``<codex_home>/skills``; must not exist yet.
+    :param skills_dir: The session's granted skills directory.
+    :raises OSError: When the platform can create neither a symlink nor, on
+        Windows, a directory junction.
+    """
+    try:
+        home_skills.symlink_to(skills_dir, target_is_directory=True)
+    except OSError:
+        if sys.platform == "win32":
+            # Windows refuses symlinks without Developer Mode or the symlink
+            # privilege; a junction needs neither and resolves the same way.
+            import _winapi
+
+            _winapi.CreateJunction(str(skills_dir), str(home_skills))
+        else:
+            raise

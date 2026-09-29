@@ -4,15 +4,19 @@ from __future__ import annotations
 
 import os
 import stat
+import sys
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
+from omnigent.inner import codex_staging
 from omnigent.inner.codex_staging import (
     CODEX_SKILLS_PREFIX,
     _staging_root_path,
     codex_home_staging_root,
+    link_codex_skills_dir,
     prepare_codex_skills_dir,
 )
 
@@ -128,3 +132,60 @@ def test_skills_refresh_rejects_unrelated_directory(tmp_path: Path) -> None:
     with pytest.raises(OSError):
         prepare_codex_skills_dir(tmp_path)
     assert marker.read_text() == "keep"
+
+
+def _refuse_symlink(*_args: object, **_kwargs: object) -> None:
+    # What Windows raises without Developer Mode or the symlink privilege.
+    raise OSError(1314, "A required privilege is not held by the client")
+
+
+def _skills_link_paths(root: Path) -> tuple[Path, Path]:
+    skills_dir = root / f"{CODEX_SKILLS_PREFIX}session"
+    skills_dir.mkdir(mode=0o700)
+    home = root / "home"
+    home.mkdir()
+    return home / "skills", skills_dir
+
+
+def test_skills_link_falls_back_to_a_junction_when_symlinks_are_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home_skills, skills_dir = _skills_link_paths(tmp_path)
+    junctions: list[tuple[str, str]] = []
+    monkeypatch.setattr(Path, "symlink_to", _refuse_symlink)
+    monkeypatch.setattr(codex_staging, "sys", SimpleNamespace(platform="win32"))
+    monkeypatch.setitem(
+        sys.modules,
+        "_winapi",
+        SimpleNamespace(CreateJunction=lambda target, link: junctions.append((target, link))),
+    )
+
+    link_codex_skills_dir(home_skills, skills_dir)
+
+    assert junctions == [(str(skills_dir), str(home_skills))]
+
+
+def test_skills_link_raises_off_windows_when_symlinks_are_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home_skills, skills_dir = _skills_link_paths(tmp_path)
+    monkeypatch.setattr(Path, "symlink_to", _refuse_symlink)
+    monkeypatch.setattr(codex_staging, "sys", SimpleNamespace(platform="linux"))
+
+    with pytest.raises(OSError, match="privilege"):
+        link_codex_skills_dir(home_skills, skills_dir)
+    assert not home_skills.exists()
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="directory junctions are Windows-only")
+def test_skills_link_junction_resolves_into_the_granted_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home_skills, skills_dir = _skills_link_paths(tmp_path)
+    (skills_dir / "SKILL.md").write_text("body")
+    monkeypatch.setattr(Path, "symlink_to", _refuse_symlink)
+
+    link_codex_skills_dir(home_skills, skills_dir)
+
+    assert home_skills.is_junction()
+    assert (home_skills / "SKILL.md").resolve() == (skills_dir / "SKILL.md").resolve()

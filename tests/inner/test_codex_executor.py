@@ -6,10 +6,13 @@ import contextlib
 import json
 import os
 import stat
+import sys
 import tempfile
 import unittest
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, patch
 
@@ -3375,6 +3378,45 @@ def test_populate_codex_skills_copy_mode_keeps_skill_symlinks_as_links(
     )
 
 
+@pytest.mark.skipif(not hasattr(os, "symlink"), reason="requires symlink support")
+@pytest.mark.parametrize("linked_entry", ["skill_dir", "skills_root"])
+def test_populate_codex_skills_copy_mode_never_materializes_linked_skills(
+    tmp_path: Path, linked_entry: str
+) -> None:
+    """A linked skill directory or skills root stays a link in copy mode.
+
+    ``copytree`` follows a linked *source*, which would copy an external
+    directory's private files into the tree sandboxes are granted.
+    """
+    from omnigent.inner.codex_executor import _populate_codex_skills
+
+    external = tmp_path / "external"
+    _make_skill_dir(external, "alpha")
+    canary = "external-canary-must-not-be-materialized"
+    (external / "alpha" / "private.txt").write_text(canary)
+    bundle_skills = tmp_path / "bundle" / "skills"
+    if linked_entry == "skill_dir":
+        bundle_skills.mkdir(parents=True)
+        (bundle_skills / "alpha").symlink_to(external / "alpha", target_is_directory=True)
+    else:
+        bundle_skills.parent.mkdir()
+        bundle_skills.symlink_to(external, target_is_directory=True)
+
+    target = tmp_path / "granted"
+    _populate_codex_skills(target, "all", [bundle_skills], copy_skills=True)
+
+    staged = target / "alpha"
+    assert staged.is_symlink()
+    assert (staged / "SKILL.md").resolve() == (external / "alpha" / "SKILL.md").resolve()
+    regular_files = [
+        Path(parent, name)
+        for parent, _, names in os.walk(target)
+        for name in names
+        if not Path(parent, name).is_symlink()
+    ]
+    assert [path for path in regular_files if canary in path.read_text()] == []
+
+
 def test_populate_codex_skills_from_bundle_sources_from_codex_home(tmp_path: Path) -> None:
     """
     ``source_codex_home`` reads host skills from the resolved ``$CODEX_HOME``.
@@ -4838,15 +4880,13 @@ class TestCodexAppServerSessionHomeStaging(unittest.TestCase):
             dir_used = self._run_start_and_capture_mkdtemp_dir(writable_dir)
             self.assertEqual(dir_used, _tempfile.gettempdir())
 
-    def test_start_stages_empty_skills_before_worker_spawn_when_disabled(self):
-        """Disabled skills still have a real directory to mount read-only."""
+    def _start_until_worker_spawn(
+        self, check_codex_home: Callable[[Path], None], **session_kwargs: Any
+    ) -> None:
+        """Run ``start()`` up to the worker spawn, handing its CODEX_HOME to *check_codex_home*."""
 
         async def _stop_before_spawn(*args: Any, **kwargs: Any) -> None:
-            skills = Path(kwargs["env"]["CODEX_HOME"]) / "skills"
-            self.assertTrue(skills.is_dir())
-            self.assertTrue(skills.is_symlink())
-            self.assertTrue(skills.resolve().name.startswith("omnigent-codex-skills-"))
-            self.assertEqual(list(skills.iterdir()), [])
+            check_codex_home(Path(kwargs["env"]["CODEX_HOME"]))
             raise RuntimeError("stop before worker spawn")
 
         async def _t() -> None:
@@ -4856,7 +4896,7 @@ class TestCodexAppServerSessionHomeStaging(unittest.TestCase):
                     cwd=workspace,
                     env={},
                     tool_executor=None,
-                    skills_filter="none",
+                    **session_kwargs,
                 )
                 with (
                     patch("omnigent.inner.codex_executor._populate_codex_home_config"),
@@ -4875,6 +4915,65 @@ class TestCodexAppServerSessionHomeStaging(unittest.TestCase):
                     spawn.assert_awaited_once()
 
         _run(_t())
+
+    def test_start_stages_empty_skills_before_worker_spawn_when_disabled(self):
+        """Disabled skills still have a real directory to mount read-only."""
+
+        def _check(codex_home: Path) -> None:
+            skills = codex_home / "skills"
+            self.assertTrue(skills.is_dir())
+            self.assertTrue(skills.is_symlink())
+            self.assertTrue(skills.resolve().name.startswith("omnigent-codex-skills-"))
+            self.assertEqual(list(skills.iterdir()), [])
+
+        self._start_until_worker_spawn(_check, skills_filter="none")
+
+    @unittest.skipUnless(hasattr(os, "getuid"), "a POSIX symlink stands in for the junction")
+    def test_start_links_skills_through_a_junction_when_symlinks_are_refused(self):
+        """Windows without Developer Mode refuses symlinks. Startup must still
+        succeed, with the published skill path inside the session's grant.
+        """
+        from omnigent.inner import codex_staging
+
+        def _junction(target: str, link: str) -> None:
+            os.symlink(target, link, target_is_directory=True)
+
+        def _check(codex_home: Path) -> None:
+            manifest = (codex_home / "skills" / "alpha" / "SKILL.md").resolve()
+            self.assertTrue(manifest.is_file())
+            self.assertTrue(manifest.parents[1].name.startswith("omnigent-codex-skills-"))
+
+        with tempfile.TemporaryDirectory() as root:
+            bundle = Path(root) / "bundle"
+            _mk_codex_skill(bundle / "skills", "alpha")
+            with (
+                patch.object(Path, "symlink_to", side_effect=OSError(1314, "privilege not held")),
+                patch.object(codex_staging, "sys", SimpleNamespace(platform="win32")),
+                patch.dict(sys.modules, {"_winapi": SimpleNamespace(CreateJunction=_junction)}),
+            ):
+                self._start_until_worker_spawn(_check, bundle_dir=bundle, skills_filter=["alpha"])
+
+    def test_start_copies_skills_into_the_home_when_no_link_is_possible(self):
+        """Without any directory link, Codex must still start and discover the
+        bundle's skills, and the degraded sandbox visibility must be reported.
+        """
+        from omnigent.inner import codex_staging
+
+        def _check(codex_home: Path) -> None:
+            skills = codex_home / "skills"
+            self.assertFalse(skills.is_symlink())
+            self.assertTrue((skills / "alpha" / "SKILL.md").is_file())
+
+        with tempfile.TemporaryDirectory() as root:
+            bundle = Path(root) / "bundle"
+            _mk_codex_skill(bundle / "skills", "alpha")
+            with (
+                patch.object(Path, "symlink_to", side_effect=OSError(1314, "privilege not held")),
+                patch.object(codex_staging, "sys", SimpleNamespace(platform="linux")),
+                self.assertLogs("omnigent.inner.codex_executor", level="WARNING") as logs,
+            ):
+                self._start_until_worker_spawn(_check, bundle_dir=bundle, skills_filter=["alpha"])
+        self.assertTrue(any("restricted reads" in line for line in logs.output), logs.output)
 
 
 def test_run_turn_cli_config_passes_no_model_to_thread_create():
