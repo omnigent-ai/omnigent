@@ -1,7 +1,7 @@
 name: Open Code Review
 
 on:
-  # Use trusted base-branch configuration, including for fork PRs.
+  # Use trusted base-branch configuration for automatic reviews.
   pull_request_target:
     types: [opened, reopened, ready_for_review]
   issue_comment:
@@ -54,6 +54,10 @@ jobs:
             if (context.eventName === 'pull_request_target') {
               const pr = context.payload.pull_request;
               if (pr.draft || pr.state !== 'open') return;
+              if (pr.head.repo?.full_name !== `${owner}/${repo}`) {
+                core.notice('Skipping automatic OCR for a fork PR; use an authorized /ocr command.');
+                return;
+              }
               number = pr.number;
             } else if (context.eventName === 'issue_comment') {
               const comment = context.payload.comment;

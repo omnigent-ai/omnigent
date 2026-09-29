@@ -9,13 +9,14 @@ comments. It does not approve PRs or request changes.
 
 ## Triggers
 
-- Automatically when a PR is opened, reopened, or marked ready for review,
-  matching Polly's lifecycle triggers. Draft PRs are skipped. Fork PRs are
-  included; the workflow uses trusted base-branch configuration.
+- Automatically when a same-repository PR is opened, reopened, or marked ready
+  for review, matching Polly's lifecycle triggers. Draft and fork PRs are
+  skipped. OCR does not automatically run after maintainer approval of a fork PR.
 - Comment `/ocr` on its own line. The commenter needs repository write access
   or an entry in the existing `REVIEW_ALLOWLIST` JSON-array repository variable.
   Accepted commands receive an 👀 reaction before entering the review queue.
   A reaction API failure does not prevent the review from starting.
+  Authorized commands can still review fork PRs.
 - Comment `/ocr force` to rerun a completed review of the same commit.
 - Actions → Open Code Review → Run workflow, using the default branch and a PR
   number. The optional `force` checkbox reruns an already-reviewed commit.
@@ -67,8 +68,8 @@ editing the ignore rules.
 The workflow runs from trusted base/default-branch context. The upstream
 action reads the PR head through Git objects and does not run PR-authored code
 or install the PR's dependencies. Automatic reviews use `pull_request_target`
-so fork PRs can be reviewed with the base repository's credentials. Manual
-comment triggers still require an authorized `/ocr` request.
+for trusted workflow configuration and accept only same-repository PRs. Fork
+PRs require an authorized `/ocr` command or manual workflow dispatch.
 
 Upstream artifact uploads are disabled. The workflow uploads separate copies
 of the result JSON and stderr with gateway credentials, URL, and origin
@@ -79,8 +80,9 @@ the upstream action publishes PR comments before it runs.
 
 ## Verify after merging
 
-1. Open a non-draft PR (including one from a fork) and confirm OCR starts
-   without a command. Open a draft and confirm no review starts until it is
+1. Open a non-draft, same-repository PR and confirm OCR starts without a
+   command. Open a fork PR and confirm OCR skips it; reopening or marking it
+   ready must also skip it. Open a draft and confirm no review starts until it is
    marked ready for review. Reopen an already-reviewed PR and confirm OCR skips
    the completed commit. Push a new commit and confirm OCR does not start.
    For a manual run, use

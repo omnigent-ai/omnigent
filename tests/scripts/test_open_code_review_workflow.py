@@ -198,7 +198,12 @@ class OpenCodeReviewWorkflowTest(unittest.TestCase):
                 "number": 7878,
                 "draft": draft,
                 "state": state,
-                "head": {"repo": {"fork": fork}},
+                "head": {
+                    "repo": {
+                        "fork": fork,
+                        "full_name": "contributor/omnigent" if fork else "omnigent-ai/omnigent",
+                    }
+                },
             },
         }
         return context
@@ -216,9 +221,19 @@ class OpenCodeReviewWorkflowTest(unittest.TestCase):
                     context = self.pull_request(action=action, fork=fork)
                     result = self.run_script(context)
                     self.assertNotIn("error", result)
-                    self.assertEqual(result["outputs"], {"pr": "7878"})
+                    self.assertEqual(result["outputs"], {} if fork else {"pr": "7878"})
                     self.assertEqual(result["calls"], [])
                     self.assertEqual(self.acknowledge(context)["calls"], [])
+
+    def test_automatic_reviews_require_the_head_repository_to_match(self):
+        for repo in (None, {"fork": False, "full_name": "another/repo"}):
+            with self.subTest(repo=repo):
+                context = self.pull_request()
+                context["payload"]["pull_request"]["head"]["repo"] = repo
+                result = self.run_script(context)
+                self.assertNotIn("error", result)
+                self.assertEqual(result["outputs"], {})
+                self.assertEqual(result["calls"], [])
 
     def test_draft_and_closed_pr_events_do_not_enter_review_queue(self):
         for context in (self.pull_request(draft=True), self.pull_request(state="closed")):
