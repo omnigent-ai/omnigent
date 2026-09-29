@@ -223,7 +223,7 @@ def _commit_updated_ats(repo_root: str, heads: list[str | None]) -> dict[str, in
     return timestamps
 
 
-def list_worktrees(*, repo_path: str) -> list[WorktreeInfo]:
+def list_worktrees(*, repo_path: str, for_cleanup: bool = False) -> list[WorktreeInfo]:
     """List the git worktrees of the repository containing ``repo_path``.
 
     Resolves the main work tree first (so a linked worktree resolves the
@@ -234,16 +234,19 @@ def list_worktrees(*, repo_path: str) -> list[WorktreeInfo]:
     :param repo_path: Absolute path inside a git repository — the
         directory the user picked, e.g. ``"/Users/alice/myrepo"``.
         If removed or replaced by a file, resolve from a surviving parent.
+    :param for_cleanup: Recover a stored canonical workspace without following
+        replacement symlinks. The caller must verify the recorded cleanup root.
     :returns: One :class:`WorktreeInfo` per worktree, main first.
     :raises WorktreeError: If ``repo_path`` is not a directory or not
         inside a git work tree, or if ``git worktree list`` fails.
     """
     search_path = Path(repo_path)
-    # A replaced directory must not redirect Git discovery through its symlink target.
-    for ancestor in reversed((search_path, *search_path.parents)):
-        if ancestor.is_symlink():
-            search_path = ancestor.parent
-            break
+    # Picker paths may use symlinks; stored cleanup paths were already canonicalized.
+    if for_cleanup:
+        for ancestor in reversed((search_path, *search_path.parents)):
+            if ancestor.is_symlink():
+                search_path = ancestor.parent
+                break
     while not search_path.is_dir() and search_path.parent != search_path:
         search_path = search_path.parent
     repo_root = _main_work_tree(str(search_path))

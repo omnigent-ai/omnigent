@@ -9425,6 +9425,7 @@ async def _remove_session_worktree_best_effort(
                 host_registry=host_registry,
                 host_conn=host_conn,
                 repo_path=worktree_path,
+                for_cleanup=True,
             )
             # Missing directories can resolve inside an unrelated enclosing repository.
             expected_root = expected_root_fingerprint or worktree_root_fingerprint(worktree_path)

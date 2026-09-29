@@ -631,3 +631,12 @@ def test_remove_worktree_rejects_replaced_root(git_repo: Path, replacement: str)
     assert Path(target.worktree_path).is_dir()
     assert _branch_exists(git_repo, "original")
     assert _branch_exists(git_repo, "target")
+
+
+def test_worktree_picker_accepts_symlinked_prefix(git_repo: Path) -> None:
+    """Picker paths may include a legitimate symlink such as macOS /tmp."""
+    alias = git_repo.parent / "alias"
+    alias.symlink_to(git_repo.parent, target_is_directory=True)
+    created = create_worktree(repo_path=str(git_repo), branch_name="feature")
+    trees = list_worktrees(repo_path=str(alias / git_repo.name))
+    assert [tree.path for tree in trees] == [str(git_repo), created.worktree_path]

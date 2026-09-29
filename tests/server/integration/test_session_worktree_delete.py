@@ -681,8 +681,12 @@ async def test_delete_worktree_after_workspace_disappears(
 
     removed: list[str] = []
 
-    async def list_on_host(*, repo_path: str, **_kwargs: object) -> list[dict[str, object]]:
-        return [asdict(tree) for tree in list_worktrees(repo_path=repo_path)]
+    async def list_on_host(
+        *, repo_path: str, for_cleanup: bool = False, **_kwargs: object
+    ) -> list[dict[str, object]]:
+        return [
+            asdict(tree) for tree in list_worktrees(repo_path=repo_path, for_cleanup=for_cleanup)
+        ]
 
     async def remove_on_host(
         *, worktree_path: str, branch: str, delete_branch: bool, **_kwargs: object
@@ -805,9 +809,14 @@ async def test_delete_does_not_remove_enclosing_worktree(
     shutil.rmtree(created.worktree_path)
     removed: list[str] = []
 
-    async def list_on_host(*, repo_path: str, **_kwargs: object) -> list[dict[str, object]]:
+    async def list_on_host(
+        *, repo_path: str, for_cleanup: bool = False, **_kwargs: object
+    ) -> list[dict[str, object]]:
         try:
-            return [asdict(tree) for tree in list_worktrees(repo_path=repo_path)]
+            return [
+                asdict(tree)
+                for tree in list_worktrees(repo_path=repo_path, for_cleanup=for_cleanup)
+            ]
         except WorktreeError as exc:
             raise WorktreeProxyError(str(exc)) from exc
 

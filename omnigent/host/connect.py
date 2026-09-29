@@ -3633,6 +3633,7 @@ class HostProcess:
                 worktrees = await asyncio.to_thread(
                     list_worktrees,
                     repo_path=frame.repo_path,
+                    for_cleanup=frame.for_cleanup,
                 )
         except WorktreeError as exc:
             return HostListWorktreesResultFrame(

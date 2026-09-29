@@ -1338,7 +1338,8 @@ def test_remove_worktree_result_frame_round_trip() -> None:
 # ── host.list_worktrees frames ──────────────────────────
 
 
-def test_list_worktrees_frame_round_trip() -> None:
+@pytest.mark.parametrize("for_cleanup", [True, False])
+def test_list_worktrees_frame_round_trip(for_cleanup: bool) -> None:
     """Verify HostListWorktreesFrame survives encode → decode.
 
     A garbled repo_path would list the wrong repository's worktrees.
@@ -1346,6 +1347,7 @@ def test_list_worktrees_frame_round_trip() -> None:
     original = HostListWorktreesFrame(
         request_id="req_wt_ls_1",
         repo_path="/Users/alice/myrepo",
+        for_cleanup=for_cleanup,
     )
     decoded = decode_host_frame(encode_host_frame(original))
     assert isinstance(decoded, HostListWorktreesFrame)
@@ -1890,3 +1892,12 @@ def test_workspace_missing_message_is_the_host_spelling() -> None:
     assert classify_launch_refusal(None, workspace_missing_message("/w"), "/w") == (
         WORKSPACE_MISSING_ERROR_CODE
     )
+
+
+def test_list_worktrees_legacy_request_defaults_to_picker_mode() -> None:
+    """Old servers do not send the cleanup-only recovery flag."""
+    frame = decode_host_frame(
+        '{"kind":"host.list_worktrees","request_id":"old", "repo_path":"/repo"}'
+    )
+    assert isinstance(frame, HostListWorktreesFrame)
+    assert frame.for_cleanup is False

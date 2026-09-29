@@ -631,10 +631,12 @@ class HostListWorktreesFrame:
     :param request_id: Correlates the result, e.g. ``"req_wt_ls_1"``.
     :param repo_path: Absolute path inside the repo (the picked dir or
         a subdir), e.g. ``"/Users/alice/myrepo"``.
+    :param for_cleanup: Avoid replacement symlinks in a stored canonical workspace.
     """
 
     request_id: str
     repo_path: str
+    for_cleanup: bool = False
 
 
 @dataclass
@@ -1368,6 +1370,7 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "kind": HostFrameKind.LIST_WORKTREES.value,
                 "request_id": frame.request_id,
                 "repo_path": frame.repo_path,
+                "for_cleanup": frame.for_cleanup,
             }
         )
     if isinstance(frame, HostListWorktreesResultFrame):
@@ -2059,6 +2062,7 @@ def _decode_list_worktrees(msg: _JsonObject) -> HostListWorktreesFrame:
     return HostListWorktreesFrame(
         request_id=_required_str(msg, "request_id"),
         repo_path=_required_str(msg, "repo_path"),
+        for_cleanup=msg.get("for_cleanup") is True,
     )
 
 

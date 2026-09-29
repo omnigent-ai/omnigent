@@ -591,17 +591,29 @@ async def test_launch_runner_rollback_preserves_existing_branch(
 
 
 @pytest.mark.parametrize("launch_status", ["launched", "failed"])
+@pytest.mark.parametrize("inherited_identity", [True, False])
 async def test_launch_runner_preserves_subdirectory_and_rolls_back_root(
     register_host: RegisterHost,
     client: httpx.AsyncClient,
     db_uri: str,
     launch_status: str,
+    inherited_identity: bool,
 ) -> None:
     """Launch in the selected subdirectory, but remove the whole worktree on failure."""
     root = f"{_SOURCE_REPO}-worktrees/feature-subdir"
     workspace = f"{root}/packages/app"
     cap = register_host(workspace=workspace, launch_status=launch_status)
     session_id = await _bare_session(client, "subdirectory-launch-agent")
+    from omnigent.server.routes._host_worktree import (
+        WORKTREE_ROOT_LABEL_KEY,
+        worktree_root_fingerprint,
+    )
+
+    previous_root = worktree_root_fingerprint(_SOURCE_REPO) if inherited_identity else None
+    if previous_root is not None:
+        SqlAlchemyConversationStore(db_uri).set_labels(
+            session_id, {WORKTREE_ROOT_LABEL_KEY: previous_root}
+        )
     response = await client.post(
         f"/v1/hosts/{_HOST_ID}/runners",
         json={
@@ -617,13 +629,39 @@ async def test_launch_runner_preserves_subdirectory_and_rolls_back_root(
     assert conv is not None
     if launch_status == "launched":
         assert conv.workspace == workspace
-        from omnigent.server.routes._host_worktree import (
-            WORKTREE_ROOT_LABEL_KEY,
-            worktree_root_fingerprint,
-        )
-
         assert conv.labels[WORKTREE_ROOT_LABEL_KEY] == worktree_root_fingerprint(root)
         assert cap.remove == []
     else:
         assert conv.workspace is None
         assert cap.remove[0].worktree_path == root
+        assert conv.labels.get(WORKTREE_ROOT_LABEL_KEY) == previous_root
+
+
+async def test_bind_existing_subdirectory_preserves_inherited_cleanup_root(
+    register_host: RegisterHost, client: httpx.AsyncClient, db_uri: str
+) -> None:
+    """Binding a fork in the same directory keeps its source's cleanup identity."""
+    from omnigent.server.routes._host_worktree import (
+        WORKTREE_ROOT_LABEL_KEY,
+        worktree_root_fingerprint,
+    )
+
+    cap = register_host()
+    session_id = await _bare_session(client, "bind-existing-subdir")
+    store = SqlAlchemyConversationStore(db_uri)
+    expected = worktree_root_fingerprint(_SOURCE_REPO)
+    store.set_labels(session_id, {WORKTREE_ROOT_LABEL_KEY: expected})
+    response = await client.post(
+        f"/v1/hosts/{_HOST_ID}/runners",
+        json={
+            "session_id": session_id,
+            "workspace": f"{_SOURCE_REPO}/web",
+            "git": {"branch_name": "feature/login", "existing_worktree": True},
+        },
+    )
+    assert response.status_code == 200, response.text
+    conv = store.get_conversation(session_id)
+    assert conv is not None
+    assert conv.labels[WORKTREE_ROOT_LABEL_KEY] == expected
+    assert conv.workspace == f"{_SOURCE_REPO}/web"
+    assert cap.create == []

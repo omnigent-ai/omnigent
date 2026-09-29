@@ -264,6 +264,7 @@ async def list_worktrees_on_host(
     host_registry: HostRegistry,
     host_conn: HostConnection,
     repo_path: str,
+    for_cleanup: bool = False,
 ) -> list[dict[str, object]]:
     """
     Send a ``host.list_worktrees`` frame and await the result.
@@ -274,6 +275,7 @@ async def list_worktrees_on_host(
     :param repo_path: Absolute path inside the source repo on the
         host — the canonical picked directory, e.g.
         ``"/Users/alice/myrepo"``.
+    :param for_cleanup: Recover a canonical workspace without following replacement symlinks.
     :returns: One dict per worktree with keys ``path``, ``branch``,
         ``is_main``, ``detached``, and optional ``updated_at``
         (main first).
@@ -286,6 +288,7 @@ async def list_worktrees_on_host(
         HostListWorktreesFrame(
             request_id=request_id,
             repo_path=repo_path,
+            for_cleanup=for_cleanup,
         )
     )
     result = await _await_host_worktree_result(

@@ -891,7 +891,25 @@ def create_hosts_router(
                 ),
             )
             await asyncio.to_thread(conversation_store.clear_host_binding, body.session_id)
-            await _rollback_worktree()
+            try:
+                if worktree is not None:
+                    from omnigent.server.routes._host_worktree import WORKTREE_ROOT_LABEL_KEY
+
+                    previous_root = target.conv.labels.get(WORKTREE_ROOT_LABEL_KEY)
+                    if previous_root is None:
+                        await asyncio.to_thread(
+                            conversation_store.delete_label,
+                            body.session_id,
+                            WORKTREE_ROOT_LABEL_KEY,
+                        )
+                    else:
+                        await asyncio.to_thread(
+                            conversation_store.set_labels,
+                            body.session_id,
+                            {WORKTREE_ROOT_LABEL_KEY: previous_root},
+                        )
+            finally:
+                await _rollback_worktree()
 
         binding_token = secrets.token_urlsafe(32)
         runner_id = token_bound_runner_id(binding_token)
@@ -963,13 +981,13 @@ def create_hosts_router(
 
             async def persist_binding() -> None:
                 """Record cleanup identity before making the new binding visible."""
-                if git_branch is not None:
+                if worktree is not None:
                     from omnigent.server.routes._host_worktree import (
                         WORKTREE_ROOT_LABEL_KEY,
                         worktree_root_fingerprint,
                     )
 
-                    root = worktree.worktree_path if worktree is not None else workspace
+                    root = worktree.worktree_path
                     await asyncio.to_thread(
                         conversation_store.set_labels,
                         body.session_id,
