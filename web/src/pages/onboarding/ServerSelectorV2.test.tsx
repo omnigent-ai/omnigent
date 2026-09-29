@@ -249,6 +249,71 @@ describe("ServerSelectorV2", () => {
     expect(screen.getAllByRole("option").map((o) => o.textContent)).toEqual(["My laptop"]);
   });
 
+  it("a slow runner lookup can't replace a newer pick", async () => {
+    let resolveFirst: (v: { remote: boolean }) => void = () => {};
+    const getRunnerOptions = vi
+      .fn()
+      .mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            resolveFirst = resolve;
+          }),
+      )
+      .mockResolvedValue({ remote: false });
+    const onConnect = vi.fn().mockResolvedValue({});
+    render(
+      <ServerSelectorV2
+        setup={makeSetup({
+          installed: true,
+          managedServers: ["https://team.example.com/"],
+          getRunnerOptions,
+          onConnect,
+        })}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: /join your team \(team\)/i }));
+    openPresetDropdown();
+    fireEvent.change(screen.getByLabelText("Server URL"), {
+      target: { value: "https://typed.example.com" },
+    });
+    fireEvent.keyDown(screen.getByLabelText("Server URL"), { key: "Enter" });
+    const runner = await screen.findByRole("combobox", { name: "Runner" });
+    resolveFirst({ remote: true });
+    await waitFor(() => expect(getRunnerOptions).toHaveBeenCalledTimes(2));
+    expect(runner).toHaveTextContent("My laptop");
+    fireEvent.click(screen.getByRole("button", { name: "Open Omnigent" }));
+    await waitFor(() => expect(onConnect).toHaveBeenCalledWith("https://typed.example.com/"));
+  });
+
+  it("a failed runner lookup still opens the runner step, laptop only", async () => {
+    render(
+      <ServerSelectorV2
+        setup={makeSetup({
+          managedServers: ["https://team.example.com/"],
+          getRunnerOptions: vi.fn().mockRejectedValue(new Error("ipc down")),
+        })}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: /join your team \(team\)/i }));
+    fireEvent.click(await screen.findByRole("combobox", { name: "Runner" }));
+    expect(screen.getAllByRole("option").map((o) => o.textContent)).toEqual(["My laptop"]);
+  });
+
+  it("the runner step shows a direct connect's error", async () => {
+    render(
+      <ServerSelectorV2
+        setup={makeSetup({
+          installed: true,
+          managedServers: ["https://team.example.com/"],
+          onConnect: vi.fn().mockResolvedValue({ error: "unreachable" }),
+        })}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: /join your team \(team\)/i }));
+    fireEvent.click(await screen.findByRole("button", { name: "Open Omnigent" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("unreachable");
+  });
+
   it("defaults the runner to the remote environment when offered", async () => {
     render(
       <ServerSelectorV2

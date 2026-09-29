@@ -224,9 +224,12 @@ function BridgeSetupApp() {
     onInstallLog: setupBridge()?.onCliInstallLog
       ? (cb) => setupBridge()?.onCliInstallLog?.(cb) ?? (() => {})
       : undefined,
-    getRunnerOptions: async (url) => ({
-      remote: (await setupBridge()?.getRunnerOptions?.(url))?.remote === true,
-    }),
+    // Older shells omit it → the runner step offers this laptop only.
+    getRunnerOptions: setupBridge()?.getRunnerOptions
+      ? async (url) => ({
+          remote: (await setupBridge()?.getRunnerOptions?.(url))?.remote === true,
+        })
+      : undefined,
     // Only offered when the shell exposes the forget method (newer shells).
     onRemoveServer: setupBridge()?.forgetRecentServer
       ? (url) => {

@@ -5,7 +5,7 @@
  * `omnigentSetup` bridge via the `setup` prop.
  */
 
-import { type CSSProperties, useState } from "react";
+import { type CSSProperties, useRef, useState } from "react";
 import { Settings } from "lucide-react";
 import { AnimatedOmnigentPanel } from "@/components/onboarding/AnimatedOmnigentPanel";
 import {
@@ -144,9 +144,16 @@ export function ServerSelectorV2({ setup }: { setup: ServerSelectorV2Setup }) {
   // The server picked on the MDM landing, and whether its runner step offers
   // the remote environment.
   const [runnerTarget, setRunnerTarget] = useState<{ url: string; remote: boolean } | null>(null);
+  const [runnerError, setRunnerError] = useState<string>();
+  // Bumped per pick, so a slow lookup can't replace a newer pick's runner step.
+  const runnerPick = useRef(0);
   const pickRunnerFor = async (url: string) => {
+    const pick = ++runnerPick.current;
+    // A failed lookup falls back to this laptop only.
     const options = await setup.getRunnerOptions?.(url).catch(() => undefined);
+    if (pick !== runnerPick.current) return;
     setRunnerTarget({ url, remote: options?.remote === true });
+    setRunnerError(undefined);
     setStep("runner");
   };
   // What the terminal step should run after any install: start the local server
@@ -303,8 +310,13 @@ export function ServerSelectorV2({ setup }: { setup: ServerSelectorV2Setup }) {
           <RunnerStep
             remoteAvailable={runnerTarget.remote}
             installed={setup.installed}
+            error={runnerError}
             onBack={() => setStep("landing")}
-            onInstall={() => connect(runnerTarget.url, "runner")}
+            onInstall={async () => {
+              setRunnerError(undefined);
+              const result = await connect(runnerTarget.url, "runner");
+              if (result.error) setRunnerError(result.error);
+            }}
           />
         )}
         {step === "terminal" && (

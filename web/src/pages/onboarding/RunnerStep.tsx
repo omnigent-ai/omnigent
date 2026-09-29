@@ -23,6 +23,7 @@ export type Runner = "remote" | "local";
 export function RunnerStep({
   remoteAvailable,
   installed,
+  error,
   onBack,
   onInstall,
 }: {
@@ -30,6 +31,8 @@ export function RunnerStep({
   remoteAvailable: boolean;
   /** Returning user (CLI installed) → "Open Omnigent"; new → "Install Omnigent". */
   installed?: boolean;
+  /** A connect error to show above the actions. */
+  error?: string;
   onBack: () => void;
   onInstall: (runner: Runner) => void;
 }) {
@@ -61,6 +64,13 @@ export function RunnerStep({
         Automatically carry over your existing setup. Share sessions with your teammates. Use from
         any device. Keep sessions running in the cloud.
       </p>
+
+      {error && (
+        <div role="alert" className="text-base text-destructive">
+          <span className="font-medium">Couldn&apos;t connect to the server: </span>
+          {error}
+        </div>
+      )}
 
       <OnboardingRail>
         <OnboardingBackButton onClick={onBack} />

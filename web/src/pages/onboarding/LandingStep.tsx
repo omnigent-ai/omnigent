@@ -1,8 +1,6 @@
 // Onboarding step 1: the hero landing. Without MDM presets: "Get started
-// locally" opens deployment-mode select and "Join your team" opens server
-// select. With MDM presets: "Join your team (<name>)" is the only CTA — a split
-// button whose dropdown lists the other presets and recent servers, plus an
-// inline server URL field. Rendered inside the card body below the animated panel.
+// locally" / "Join your team". With presets: one "Join your team (<name>)" split
+// button; its dropdown lists other presets, recents, and a server URL field.
 
 import { useState } from "react";
 import { ArrowRight, ChevronDown, Laptop, Users } from "lucide-react";
