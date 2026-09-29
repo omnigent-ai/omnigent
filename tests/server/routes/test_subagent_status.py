@@ -306,13 +306,18 @@ async def test_subagent_idle_validates_optional_response_id(
     assert route.forwarded == []
 
 
-@pytest.mark.parametrize("status", ["idle", "running", "failed"])
+@pytest.mark.parametrize(
+    ("status", "turn_outcome"),
+    [("idle", None), ("running", None), ("failed", None), ("idle", "cancelled")],
+)
 async def test_external_session_status_still_forwards_to_runner(
-    status_route: _StatusRoute, status: str
+    status_route: _StatusRoute, status: str, turn_outcome: str | None
 ) -> None:
     route = status_route
     sid = route.child_id
     data = {"status": status, "output": "authoritative result"}
+    if turn_outcome is not None:
+        data["turn_outcome"] = turn_outcome
     response = await route.client.post(
         f"/v1/sessions/{sid}/events", json={"type": "external_session_status", "data": data}
     )

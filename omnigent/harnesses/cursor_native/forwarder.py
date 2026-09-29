@@ -24,8 +24,8 @@ here: the runner's PTY-activity watcher owns those ``session.status`` edges for
 cursor-native (see ``_publish_turn_status`` in :mod:`omnigent.runner.app`),
 exactly as for claude-native and pi-native. That watcher drives only the web
 "Working…" spinner, though — it never wakes a parent orchestrator. So this
-forwarder additionally POSTs an ``external_session_status: idle`` event once per
-completed turn (the cursor ``stop`` hook's turn-end markers, tailed via
+forwarder additionally POSTs an ``external_session_status`` event carrying the
+turn's outcome (the cursor ``stop`` hook's turn-end markers, tailed via
 :mod:`omnigent.harnesses.cursor_native.status`) — the SAME server contract
 claude-/codex-/opencode-native use to mark a sub-agent turn terminal and wake its
 parent's inbox.
@@ -757,12 +757,12 @@ async def _patch_external_session_id(
 
 
 async def _post_external_session_status(
-    client: httpx.AsyncClient, *, session_id: str, status: str
+    client: httpx.AsyncClient, *, session_id: str, status: str, turn_outcome: str
 ) -> None:
     """POST one ``external_session_status`` event to the Sessions API.
 
-    For a sub-agent conversation the server maps an ``idle`` edge to a terminal
-    completion that wakes the parent orchestrator's inbox — the SAME contract
+    For a sub-agent conversation the server maps the outcome to a terminal
+    event that wakes the parent orchestrator's inbox — the SAME contract
     claude-/codex-/opencode-native use (see their ``_post_external_session_status``
     / ``_post_status``). cursor-agent exposes turn completion only through its
     ``stop`` hook, which records a marker
@@ -775,7 +775,10 @@ async def _post_external_session_status(
     """
     resp = await client.post(
         f"/v1/sessions/{session_id}/events",
-        json={"type": "external_session_status", "data": {"status": status}},
+        json={
+            "type": "external_session_status",
+            "data": {"status": status, "turn_outcome": turn_outcome},
+        },
     )
     resp.raise_for_status()
 
@@ -951,6 +954,7 @@ async def forward_cursor_store_to_session(
     # logging an unstructured ERROR per poll, then notes recovery.
     fd_exhausted_since: float | None = None
     fd_exhaustion_last_warn = 0.0
+    pending_turn_end: int | None = None
     timeout = httpx.Timeout(_POST_TIMEOUT_S)
     async with httpx.AsyncClient(
         base_url=base_url, headers=headers, auth=auth, timeout=timeout
@@ -959,9 +963,14 @@ async def forward_cursor_store_to_session(
             try:
                 # Snapshot completion before reading its transcript. A turn
                 # finishing during this poll must wait for the next read.
-                total_turn_ends = await asyncio.to_thread(
-                    cursor_native_status.count_turn_ends, bridge_dir
-                )
+                if pending_turn_end is None:
+                    total_turn_ends = await asyncio.to_thread(
+                        cursor_native_status.count_turn_ends, bridge_dir
+                    )
+                    if total_turn_ends > await asyncio.to_thread(
+                        cursor_native_status.read_posted_count, bridge_dir
+                    ):
+                        pending_turn_end = total_turn_ends
                 retrying_items = False
                 if store_path is None or not store_path.exists():
                     # On cold resume the runner pre-seeds the bridge state with
@@ -1196,26 +1205,22 @@ async def forward_cursor_store_to_session(
                             state=model_state,
                             model=observed_model,
                         )
-                # Turn over the cursor ``stop`` hook's turn-completion markers to
-                # an ``external_session_status: idle`` edge — the signal that wakes
-                # a parent orchestrator (the PTY watcher's spinner status never
-                # does). This block sits at the poll-loop body level, deliberately
-                # OUTSIDE the ``if store_path`` mirroring branch above: the stop
-                # hook writes turn-end markers independently of the SQLite store,
-                # so a turn-end is never missed even on a poll where the store is
-                # unbound or empty. Deduped against a persisted posted-count so a
-                # supervisor restart never re-wakes the parent for a turn it
-                # already reported. Best-effort: a failed post leaves the count
-                # unadvanced so the next poll retries.
-                if not retrying_items and total_turn_ends > await asyncio.to_thread(
-                    cursor_native_status.read_posted_count, bridge_dir
-                ):
+                # Deliver the hook outcome after its transcript, even without a
+                # bound store. Failed posts retain this snapshot for the next poll.
+                if not retrying_items and pending_turn_end is not None:
+                    outcome = await asyncio.to_thread(
+                        cursor_native_status.read_turn_outcome, bridge_dir, pending_turn_end
+                    )
                     await _post_external_session_status(
-                        client, session_id=session_id, status="idle"
+                        client,
+                        session_id=session_id,
+                        status="failed" if outcome == "failed" else "idle",
+                        turn_outcome=outcome,
                     )
                     await asyncio.to_thread(
-                        cursor_native_status.write_posted_count, bridge_dir, total_turn_ends
+                        cursor_native_status.write_posted_count, bridge_dir, pending_turn_end
                     )
+                    pending_turn_end = None
                 if fd_exhausted_since is not None:
                     _logger.info(
                         "cursor forwarder polling recovered after fd exhaustion (%.1fs); "

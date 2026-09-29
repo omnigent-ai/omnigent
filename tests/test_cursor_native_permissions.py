@@ -698,13 +698,31 @@ async def test_supervise_transcript_yolo_times_out_then_surfaces_card(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """A visible gate that never clears falls back once its retry time expires."""
-    monkeypatch.setattr(cnp, "_YOLO_ACCEPT_RETRY_S", 0.0)
-    monkeypatch.setattr(cnp, "_YOLO_ACCEPT_TIMEOUT_S", 0.03)
     # Stays pending no matter how many times we accept it.
     pending_now = [_SHELL_CALL]
     posts, keys_sent = _install_supervisor_fakes(
         monkeypatch, tmp_path, pending=pending_now, pane=_ACCEPT_PANE
     )
+    polls = 0
+    sent_at: list[float] = []
+
+    def read_pending(_store: Path) -> list[CursorPendingToolCall]:
+        nonlocal polls
+        polls += 1
+        return pending_now
+
+    clock = SimpleNamespace(time=lambda: float(polls - 1))
+    async_facade = SimpleNamespace(**vars(asyncio))
+    async_facade.get_running_loop = lambda: clock
+    send_keys = cnp._send_cursor_keys
+
+    async def send_with_clock(bridge: Path, session: str, *keys: str) -> bool:
+        sent_at.append(clock.time())
+        return await send_keys(bridge, session, *keys)
+
+    monkeypatch.setattr(cnp, "asyncio", async_facade)
+    monkeypatch.setattr(cnp, "read_cursor_pending_tool_calls", read_pending)
+    monkeypatch.setattr(cnp, "_send_cursor_keys", send_with_clock)
 
     task = _start_supervisor(tmp_path, session_id="conv_yolo_cap", auto_accept_approvals=True)
     assert await _wait_for(lambda: bool(_hook_posts(posts)))
@@ -714,9 +732,45 @@ async def test_supervise_transcript_yolo_times_out_then_surfaces_card(
     await asyncio.sleep(0.1)
     await _stop(task)
 
-    assert sent_before_card
+    assert sent_at == [0, 2, 6, 11, 16, 21, 26]
     assert keys_sent == sent_before_card
     assert len(_hook_posts(posts)) == 1, posts
+
+
+@pytest.mark.parametrize(
+    ("capture_gap", "expected"),
+    [
+        pytest.param("", cnp._YoloAccept.SURFACE_CARD, id="capture-failure"),
+        pytest.param(" \n ", cnp._YoloAccept.SURFACE_CARD, id="blank-frame"),
+        pytest.param(_IDLE_PANE, cnp._YoloAccept.SENT, id="confirmed-idle"),
+    ],
+)
+async def test_yolo_auto_accept_capture_gap_preserves_retry_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capture_gap: str,
+    expected: cnp._YoloAccept,
+) -> None:
+    """Failed captures cannot restart the deadline; a confirmed idle pane can."""
+    _, keys_sent = _install_supervisor_fakes(
+        monkeypatch, tmp_path, pending=[_SHELL_CALL], pane=_ACCEPT_PANE
+    )
+    panes = iter([_ACCEPT_PANE, capture_gap, _ACCEPT_PANE])
+    monkeypatch.setattr(cnp, "capture_cursor_pane", lambda _bridge: next(panes))
+    attempts: dict[str, cnp._YoloAcceptRetry] = {}
+    outcomes = [
+        await cnp._yolo_auto_accept(
+            _SHELL_CALL,
+            bridge_dir=tmp_path,
+            session_id="conv_capture_gap",
+            now=now,
+            attempts_by_call=attempts,
+            allow_send=True,
+        )
+        for now in (0.0, 2.0, 30.0)
+    ]
+    assert outcomes == [cnp._YoloAccept.SENT, cnp._YoloAccept.SKIP, expected]
+    assert keys_sent == [("y",)] * (2 if expected is cnp._YoloAccept.SENT else 1)
 
 
 async def test_supervise_transcript_yolo_never_types_when_no_prompt_on_screen(

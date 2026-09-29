@@ -112,7 +112,8 @@ opposite default of the rest of this design, so the accept is deliberately fail-
 - **Bounded retries with backoff.** A visible gate gets 30 seconds from its first accept attempt,
   with delays of 2, 4, then 5 seconds between retries. The delay applies across pending markers
   in the same pane, so several calls cannot send a burst of keys. When the prompt
-  disappears, its retry state resets.
+  disappears, its retry state resets. Empty or failed captures preserve the deadline. The last
+  accept gets its full retry delay before fallback, so the 30-second limit is approximate.
 - **Falls back to the card.** A dead pane, a send tmux rejects, or a gate still **visible** after
   the retry budget surfaces the ordinary ApprovalCard. No further auto-accept runs while a
   surfaced prompt is awaiting an answer.
@@ -121,6 +122,15 @@ opposite default of the rest of this design, so the accept is deliberately fail-
   an argument preview at INFO: that line is the only record Omnigent approved the call.
 
 The attempt counters are in-memory, so a runner restart re-tries a call that is still pending.
+
+### Interrupts and the parent's result
+
+An Escape sent to Cursor requests an interruption; it does not prove the turn stopped. The
+runner waits for Cursor's [`stop` hook](https://cursor.com/docs/agent/hooks#stop) to report
+`completed`, `aborted`, or `error`, and the forwarder carries that outcome to the parent's inbox.
+A child that finishes despite Escape keeps its result. An aborted child is reported as
+cancelled, retaining any partial output. Explicitly stopping the session still kills the
+terminal and reports cancellation immediately.
 
 ### AskQuestion specifics
 

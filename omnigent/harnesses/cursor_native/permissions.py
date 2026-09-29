@@ -725,8 +725,9 @@ async def _yolo_auto_accept(
     """Try to answer one gated call in-pane, or hand it back to the card path.
 
     Retry visible prompts with backoff for ``_YOLO_ACCEPT_TIMEOUT_S`` after
-    the first send. A pending checkpoint without an on-screen prompt can be
-    stale or still rendering; it neither consumes retries nor surfaces a card.
+    the first send, allowing the final send its full backoff interval. A pending
+    checkpoint without an on-screen prompt can be stale or still rendering;
+    it neither consumes retries nor surfaces a card.
 
     :param attempts_by_call: In-memory retry state, keyed by tool_call_id.
     :param allow_send: Whether the pane is available for another approval.
@@ -748,6 +749,10 @@ async def _yolo_auto_accept(
             call.tool_call_id.splitlines()[0],
         )
         return _YoloAccept.SURFACE_CARD
+    if not pane.strip():
+        # Capture failures return an empty frame; only a usable capture can
+        # confirm that the prompt disappeared and reset its retry deadline.
+        return _YoloAccept.SKIP
     if not _pane_shows_accept_prompt(pane):
         attempts_by_call.pop(call.tool_call_id, None)
         return _YoloAccept.SKIP
