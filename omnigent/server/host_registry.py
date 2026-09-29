@@ -324,6 +324,9 @@ class HostConnection:
     # user machine reusing a managed host's id under ordinary login. Read by the
     # default-public policy so only genuine sandboxes count as managed.
     registered_with_managed_token: bool = False
+    # Set by the ping loop just before it closes the socket with 4003, so the
+    # close row can tell a server ping timeout from a peer close.
+    ping_timeout_declared: bool = False
     pending_launches: dict[str, asyncio.Future[dict[str, str | None]]] = field(
         default_factory=dict,
     )

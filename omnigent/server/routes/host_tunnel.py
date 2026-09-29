@@ -367,6 +367,10 @@ def create_host_tunnel_router(
                         host_id,
                     )
 
+            close_initiator = "unknown"
+            ws_close_code: int | None = None
+            ws_close_reason: str | None = None
+            exception_type: str | None = None
             try:
                 done, _pending = await asyncio.wait(
                     {sender_task, ping_task, receive_task},
@@ -375,7 +379,25 @@ def create_host_tunnel_router(
                 for task in done:
                     exc = task.exception() if not task.cancelled() else None
                     if exc is not None:
+                        if isinstance(exc, WebSocketDisconnect):
+                            ws_close_code = exc.code
+                            ws_close_reason = exc.reason
+                            # A disconnect after our own 4003 close is the peer's ack.
+                            close_initiator = (
+                                "server_ping_timeout"
+                                if conn.ping_timeout_declared
+                                else "peer_closed"
+                            )
+                        else:
+                            close_initiator = "exception"
+                            exception_type = type(exc).__name__
                         raise exc
+                if conn.ping_timeout_declared:
+                    close_initiator = "server_ping_timeout"
+            except asyncio.CancelledError:
+                if close_initiator == "unknown":
+                    close_initiator = "server_shutdown"
+                raise
             finally:
                 for task in (sender_task, ping_task, receive_task):
                     task.cancel()
@@ -387,7 +409,29 @@ def create_host_tunnel_router(
                 )
                 # If the host already reconnected, this handler's connection
                 # was replaced; only the current one may mark it offline.
-                if host_registry.deregister(host_id, conn=conn):
+                still_current = host_registry.deregister(host_id, conn=conn)
+                if close_initiator == "unknown" and not still_current:
+                    close_initiator = "replaced_by_newer_connection"
+                now = time.time()
+                _logger.info(
+                    "Host %s tunnel closed (initiator=%s)",
+                    host_id,
+                    close_initiator,
+                    extra=debug_event(
+                        "host_tunnel_closed",
+                        host_id=host_id,
+                        host_name=conn.hello.name,
+                        host_version=conn.hello.version,
+                        close_initiator=close_initiator,
+                        ws_close_code=ws_close_code,
+                        ws_close_reason=ws_close_reason,
+                        tunnel_age_s=round(now - conn.connected_at, 3),
+                        last_frame_age_s=round(now - conn.last_frame_at, 3),
+                        registered_with_managed_token=conn.registered_with_managed_token,
+                        exception_type=exception_type,
+                    ),
+                )
+                if still_current:
                     await asyncio.to_thread(host_store.set_offline, host_id)
                 if on_host_disconnect is not None:
                     try:
@@ -939,11 +983,20 @@ async def _ping_loop(
         await asyncio.sleep(PING_INTERVAL_S)
         elapsed = time.time() - conn.last_frame_at
         if elapsed > PING_INTERVAL_S * PING_MISS_THRESHOLD:
+            conn.ping_timeout_declared = True
             _logger.warning(
                 "Host %s missed %d ping intervals (%.0fs); declaring dead",
                 host_id,
                 PING_MISS_THRESHOLD,
                 elapsed,
+                extra=debug_event(
+                    "host_tunnel",
+                    phase="ping_timeout",
+                    host_id=host_id,
+                    ws_close_code=4003,
+                    tunnel_age_s=round(time.time() - conn.connected_at, 3),
+                    last_frame_age_s=round(elapsed, 3),
+                ),
             )
             with contextlib.suppress(RuntimeError):
                 await ws.close(code=4003, reason="ping timeout")

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import logging
+import time
 
 import pytest
 from asgiref.testing import ApplicationCommunicator
@@ -1222,3 +1224,128 @@ async def test_host_sender_loop_reraises_send_failure_while_connected() -> None:
     conn.outbound_queue.put_nowait("frame")
     with pytest.raises(RuntimeError):
         await host_tunnel._sender_loop(ws, conn)
+
+
+# -- host_tunnel_closed structured event --------------------------------------
+
+
+async def _closed_row(
+    caplog: pytest.LogCaptureFixture, *, timeout_s: float = 2.0
+) -> dict[str, object]:
+    """Wait for the ``host_tunnel_closed`` row and return its attributes.
+
+    :param caplog: Pytest log capture fixture.
+    :param timeout_s: Maximum seconds to wait, e.g. ``2.0``.
+    :returns: The ``attributes`` dict of the first matching row.
+    """
+    deadline = time.monotonic() + budget(timeout_s)
+    while time.monotonic() < deadline:
+        for r in caplog.records:
+            if getattr(r, "event_name", None) == "host_tunnel_closed":
+                return r.attributes  # type: ignore[attr-defined,no-any-return]
+        await asyncio.sleep(0.01)
+    raise AssertionError("host_tunnel_closed row never appeared")
+
+
+def _closed_rows(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    return [r for r in caplog.records if getattr(r, "event_name", None) == "host_tunnel_closed"]
+
+
+async def test_host_tunnel_closed_row_peer_close_with_reason(
+    host_app: tuple[FastAPI, HostRegistry, HostStore],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A peer close (1000 + reason) yields one row carrying code, reason and ages."""
+    caplog.set_level(logging.INFO, logger="omnigent.server.routes.host_tunnel")
+    app, registry, _store = host_app
+    comm = await _connect_route(app, _TUNNEL_PATH)
+    await _send_hello_and_wait(comm, registry, name="managed-abc")
+
+    await comm.send_input({"type": "websocket.disconnect", "code": 1000, "reason": "bye"})
+    row = await _closed_row(caplog)
+    await asyncio.wait_for(_wait_deregistered(registry, _HOST_ID), timeout=budget(2.0))
+
+    assert row["close_initiator"] == "peer_closed"
+    assert row["ws_close_code"] == 1000
+    assert row["ws_close_reason"] == "bye"
+    assert row["host_id"] == _HOST_ID
+    assert row["host_name"] == "managed-abc"
+    assert row["host_version"] == "0.1.0-test"
+    assert row["registered_with_managed_token"] is False
+    assert row["exception_type"] is None
+    assert row["tunnel_age_s"] >= 0  # type: ignore[operator]
+    assert row["last_frame_age_s"] >= 0  # type: ignore[operator]
+    assert len(_closed_rows(caplog)) == 1
+
+
+async def test_host_tunnel_closed_row_abrupt_drop(
+    host_app: tuple[FastAPI, HostRegistry, HostStore],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An abrupt drop (1006) is reported as a peer close with no reason."""
+    caplog.set_level(logging.INFO, logger="omnigent.server.routes.host_tunnel")
+    app, registry, _store = host_app
+    comm = await _connect_route(app, _TUNNEL_PATH)
+    await _send_hello_and_wait(comm, registry)
+
+    await comm.send_input({"type": "websocket.disconnect", "code": 1006})
+    row = await _closed_row(caplog)
+
+    assert row["close_initiator"] == "peer_closed"
+    assert row["ws_close_code"] == 1006
+    assert row["ws_close_reason"] in (None, "")
+    assert len(_closed_rows(caplog)) == 1
+
+
+async def test_host_tunnel_closed_row_ping_timeout(
+    host_app: tuple[FastAPI, HostRegistry, HostStore],
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A ping timeout logs age fields on the 4003 row and closes as server_ping_timeout."""
+    import omnigent.server.routes.host_tunnel as tunnel_mod
+
+    monkeypatch.setattr(tunnel_mod, "PING_INTERVAL_S", 0.02)
+    monkeypatch.setattr(tunnel_mod, "PING_MISS_THRESHOLD", 1)
+    caplog.set_level(logging.INFO, logger="omnigent.server.routes.host_tunnel")
+    app, registry, _store = host_app
+    comm = await _connect_route(app, _TUNNEL_PATH)
+    await _send_hello_and_wait(comm, registry)
+
+    row = await _closed_row(caplog)
+    await comm.send_input({"type": "websocket.disconnect", "code": 4003})
+
+    assert row["close_initiator"] == "server_ping_timeout"
+    timeout_rows = [
+        r.attributes  # type: ignore[attr-defined]
+        for r in caplog.records
+        if getattr(r, "event_name", None) == "host_tunnel"
+        and r.attributes.get("phase") == "ping_timeout"  # type: ignore[attr-defined]
+    ]
+    assert len(timeout_rows) == 1
+    assert timeout_rows[0]["ws_close_code"] == 4003
+    assert timeout_rows[0]["tunnel_age_s"] >= 0
+    assert timeout_rows[0]["last_frame_age_s"] > 0
+
+
+async def test_host_tunnel_closed_row_replaced_by_newer_connection(
+    host_app: tuple[FastAPI, HostRegistry, HostStore],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The older tunnel logs replaced_by_newer_connection when the host reconnects."""
+    caplog.set_level(logging.INFO, logger="omnigent.server.routes.host_tunnel")
+    app, registry, _store = host_app
+    first = await _connect_route(app, _TUNNEL_PATH)
+    await _send_hello_and_wait(first, registry)
+    old_conn = registry.get(_HOST_ID)
+
+    second = await _connect_route(app, _TUNNEL_PATH)
+    await second.send_input({"type": "websocket.receive", "text": _make_hello()})
+    deadline = time.monotonic() + budget(2.0)
+    while registry.get(_HOST_ID) is old_conn and time.monotonic() < deadline:
+        await asyncio.sleep(0.01)
+
+    row = await _closed_row(caplog)
+    assert row["close_initiator"] == "replaced_by_newer_connection"
+    assert registry.get(_HOST_ID) is not None
+    await second.send_input({"type": "websocket.disconnect", "code": 1000})
