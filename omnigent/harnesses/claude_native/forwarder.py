@@ -225,6 +225,20 @@ def _last_observer_hook_name(bridge_dir: Path) -> str | None:
     return value if isinstance(value, str) and value else None
 
 
+def _observer_stderr_head(bridge_dir: Path, max_chars: int) -> str | None:
+    """Return the first non-empty line of observer-hook stderr, bounded to max_chars.
+
+    Returns ``None`` when the file is absent, empty, or blank.
+    """
+    path = bridge_dir / OBSERVER_HOOK_STDERR_FILE
+    try:
+        raw = path.read_bytes()[: max_chars + 100]
+    except OSError:
+        return None
+    first_line = raw.decode("utf-8", errors="replace").split("\n", 1)[0].strip()
+    return first_line[:max_chars] if first_line else None
+
+
 def _observe_transcript_discovery(
     *,
     bridge_dir: Path,
@@ -268,10 +282,19 @@ def _observe_transcript_discovery(
         "observer_stderr_bytes=%s hook_settings=%s"
     )
     if escalate:
+        stderr_head = _observer_stderr_head(bridge_dir, 300)
+        error_extra: dict[str, object] = {"session_id": session_id}
+        error_detail = detail
+        error_args: tuple[object, ...] = args
+        if stderr_head is not None:
+            error_detail += " observer_stderr_head=%s"
+            error_args = (*args, stderr_head)
+            error_extra["observer_stderr_head"] = stderr_head
         _logger.error(
-            "Claude transcript forwarding has not started: no observer hook reported a " + detail,
-            *args,
-            extra={"session_id": session_id},
+            "Claude transcript forwarding has not started: no observer hook reported a "
+            + error_detail,
+            *error_args,
+            extra=error_extra,
         )
         diagnostics.error_logged = True
         diagnostics.warning_logged = True
@@ -895,10 +918,13 @@ class _PostRetryEntry:
     :param attempts: Number of failed post attempts observed.
     :param next_attempt_at: Monotonic timestamp before which the
         forwarder should not retry this event.
+    :param first_failure_at: Monotonic timestamp of the first failure
+        recorded for this key; used to report elapsed retry time.
     """
 
     attempts: int = 0
     next_attempt_at: float = 0.0
+    first_failure_at: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -912,12 +938,14 @@ class _PostRetryDecision:
     :param exhausted: Whether the applicable retry budget was exhausted.
     :param permanent: Whether the failure is classified as a
         permanent HTTP rejection.
+    :param elapsed_retry_s: Seconds since the first failure for this key.
     """
 
     attempts: int
     delay_s: float
     exhausted: bool
     permanent: bool
+    elapsed_retry_s: float = 0.0
 
 
 class _PostRetryTracker:
@@ -1012,11 +1040,13 @@ class _PostRetryTracker:
         # Count every failed post (transient or permanent) so a sustained
         # outage escalates once to a degraded-sync signal (#1120).
         _note_forward_failure(key, exc, session_id=session_id)
+        now = time.monotonic()
         entry = self._entries.get(key)
         if entry is None:
-            entry = _PostRetryEntry()
+            entry = _PostRetryEntry(first_failure_at=now)
             self._entries[key] = entry
         entry.attempts += 1
+        elapsed_retry_s = now - entry.first_failure_at
         permanent = _is_permanent_http_error(exc)
         not_confirmed = _is_subagent_delivery_not_confirmed(exc)
         give_up = (
@@ -1036,18 +1066,20 @@ class _PostRetryTracker:
                 delay_s=0.0,
                 exhausted=True,
                 permanent=permanent,
+                elapsed_retry_s=elapsed_retry_s,
             )
         exponent = min(max(0, entry.attempts - 1), _HTTP_POST_RETRY_MAX_BACKOFF_EXPONENT)
         delay_s = min(
             self._base_delay_s * (2**exponent),
             self._max_delay_s,
         )
-        entry.next_attempt_at = time.monotonic() + delay_s
+        entry.next_attempt_at = now + delay_s
         return _PostRetryDecision(
             attempts=entry.attempts,
             delay_s=delay_s,
             exhausted=False,
             permanent=permanent,
+            elapsed_retry_s=elapsed_retry_s,
         )
 
 
@@ -1218,6 +1250,12 @@ async def forward_claude_transcript_to_session(
     task_statuses: dict[str, str] = {}
     task_order: list[str] = []
     subagent_task: asyncio.Task[SubagentForwardState] | None = None
+    # Consecutive-failure counter for the child-history worker task.  Tracks
+    # failures across poll cycles; resets on success.  Escalates to ERROR once
+    # it reaches _FORWARD_DEGRADED_THRESHOLD (same constant as HTTP degraded
+    # sync) and stays silent until the next recovery.
+    worker_consecutive_failures: int = 0
+    worker_failure_escalated: bool = False
     observer_stderr_offset = 0
     transcript_diagnostics = _TranscriptDiscoveryDiagnostics(started_at=time.monotonic())
     timeout = httpx.Timeout(_POST_TIMEOUT_S)
@@ -1245,13 +1283,40 @@ async def forward_claude_transcript_to_session(
                 if subagent_task is not None and subagent_task.done():
                     try:
                         subagent_state = subagent_task.result()
-                    except Exception:
-                        _logger.exception(
-                            "Claude child-history worker failed; restarting from its "
-                            "durable checkpoint; session=%s",
-                            session_id,
-                            extra={"session_id": session_id},
-                        )
+                        if worker_failure_escalated:
+                            _logger.info(
+                                "Claude child-history worker recovered after %s consecutive "
+                                "failures; session=%s",
+                                worker_consecutive_failures,
+                                session_id,
+                                extra={"session_id": session_id},
+                            )
+                        worker_consecutive_failures = 0
+                        worker_failure_escalated = False
+                    except Exception as exc:
+                        worker_consecutive_failures += 1
+                        if not worker_failure_escalated:
+                            if worker_consecutive_failures >= _FORWARD_DEGRADED_THRESHOLD:
+                                _logger.error(
+                                    "Claude child-history worker has failed %s consecutive "
+                                    "times; restarting from durable checkpoint; "
+                                    "session=%s exc_type=%s",
+                                    worker_consecutive_failures,
+                                    session_id,
+                                    type(exc).__name__,
+                                    exc_info=True,
+                                    extra={"session_id": session_id},
+                                )
+                                worker_failure_escalated = True
+                            else:
+                                _logger.warning(
+                                    "Claude child-history worker failed; restarting from its "
+                                    "durable checkpoint; session=%s exc_type=%s",
+                                    session_id,
+                                    type(exc).__name__,
+                                    exc_info=True,
+                                    extra={"session_id": session_id},
+                                )
                         subagent_state = await asyncio.to_thread(
                             _read_subagent_forward_state, bridge_dir
                         )
@@ -2189,11 +2254,14 @@ async def _forward_one_subagent(
                     _logger.error(
                         "Dropping claude-native sub-agent transcript batch after "
                         "transient delivery retries were exhausted; child=%s items=%s "
-                        "attempts=%s http_status=%s",
+                        "attempts=%s http_status=%s exc_type=%s elapsed_retry_s=%.1f exc=%s",
                         entry.child_conversation_id,
                         len(batch),
                         decision.attempts,
                         _http_status_for_log(exc),
+                        type(exc).__name__,
+                        decision.elapsed_retry_s,
+                        str(exc)[:200],
                         extra={
                             "session_id": entry.child_conversation_id,
                             "event_name": "claude_subagent_transcript_dropped",
@@ -2204,6 +2272,8 @@ async def _forward_one_subagent(
                                 "http_status": _http_status_for_log(exc),
                                 "attempts": decision.attempts,
                                 "exception_type": type(exc).__name__,
+                                "exc_message": str(exc)[:200],
+                                "elapsed_retry_s": decision.elapsed_retry_s,
                             },
                         },
                     )
