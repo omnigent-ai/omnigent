@@ -16,6 +16,7 @@ Codex exit-screen telemetry.
 | --- | --- | --- |
 | Codex native | App-server stderr pipe; bounded terminal output on startup exit | Stderr continuously throughout the app-server lifetime; terminal evidence before startup cleanup |
 | Claude native | An Omnigent-owned Claude `--debug-file` | Continuously while the transcript forwarder runs, plus a bounded final drain on shutdown or launch failure |
+| OpenCode native | `opencode serve` stderr, with `--print-logs` added | Continuously throughout the server lifetime; the last lines are quoted in startup errors |
 
 The flag is shared across harnesses and lifecycle phases. Codex captures the
 app-server's stderr, including startup and runtime diagnostics. A separate
@@ -314,6 +315,20 @@ quota. The next enabled launch in the same bridge directory removes the prior
 owned file and its rotated predecessor. Other user debug files are never read
 or deleted.
 
+## OpenCode continuous diagnostics
+
+`opencode serve` writes its logs to its own file,
+`<bridge_dir>/xdg-data/opencode/log/opencode.log`, and leaves stderr empty.
+Enabled capture adds `--print-logs` to the server's arguments so those log lines
+reach stderr; a user-supplied `--print-logs` is kept as is. Omnigent drains the
+pipe and exports the redacted lines through the same batched INFO path as Codex,
+as `harness_diagnostic_output` events with `harness=opencode-native` and
+`source_kind=opencode_serve_stderr`. If the server exits or never becomes ready,
+the startup error quotes a redacted excerpt of its last lines.
+
+When disabled, the server's stderr goes to `/dev/null` and Omnigent reads
+nothing. OpenCode's own log file is written either way; Omnigent never reads it.
+
 ## Verification
 
 ```sh
@@ -325,6 +340,7 @@ uv run --no-sync pytest -q tests/e2e/test_codex_continuous_diagnostics_e2e.py
 uv run --no-sync pytest -q tests/e2e/test_codex_native_runtime_diagnostics_e2e.py
 uv run --no-sync pytest -q tests/e2e_ui/chat/test_codex_early_tui_startup_error.py
 uv run --no-sync pytest -q tests/test_claude_native_diagnostics.py tests/test_claude_native_diagnostics_integration.py
+uv run --no-sync pytest -q tests/test_opencode_native_app_server.py -k stderr
 ```
 
 These tests inject a startup timeout and an ended event stream, inspect the

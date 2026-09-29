@@ -2326,7 +2326,8 @@ def test_overview_descriptions_map_to_their_rows(isolated_config, monkeypatch) -
     assert desc_by_name["Claude"] == "Open to add a credential."
     assert desc_by_name["Codex"] == "Open to add a credential."
     assert desc_by_name["Cursor"] == ""
-    assert desc_by_name["OpenCode"] == "Open to sign in (opencode auth login)."
+    # No provider signed in still runs OpenCode's free models, so the row is ready.
+    assert desc_by_name["OpenCode"] == ""
     assert desc_by_name["Hermes"] == "Open to configure with `hermes model`."
     assert desc_by_name["Pi"] == "Open to add a credential."
     assert (

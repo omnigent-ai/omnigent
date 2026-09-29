@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import sqlite3
+from collections.abc import AsyncIterator
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -14,6 +17,8 @@ from omnigent.harnesses.kiro_native.session_forwarder import (
     KiroConversationMessage,
     parse_kiro_jsonl_line,
 )
+from omnigent.harnesses.opencode_native.app_server import OpenCodeCliNotFoundError
+from omnigent.harnesses.opencode_native.client import OpenCodeSession
 from omnigent.session_import import local as local_import
 from omnigent.session_import.local import (
     list_recent_local_session_ids,
@@ -26,6 +31,7 @@ from omnigent.session_import.local import (
     load_qwen_session,
 )
 from omnigent.session_import.models import LocalSessionImport, SessionImportNotFoundError
+from tests.opencode_v2_fixtures import load_messages
 
 
 def test_import_adapters_use_stable_forwarder_parser_contracts(tmp_path: Path) -> None:
@@ -171,106 +177,318 @@ def test_long_source_ids_get_distinct_bounded_response_ids(
     assert all(len(response_id) <= 64 for response_id in response_ids)
 
 
-def test_list_recent_opencode_sessions_uses_public_cli(
+class _FakeImportClient:
+    """Stand-in for the import server's OpenCode client."""
+
+    def __init__(
+        self,
+        *,
+        sessions: list[OpenCodeSession] | None = None,
+        session: OpenCodeSession | None = None,
+        messages: list[dict[str, Any]] | None = None,
+    ) -> None:
+        self._sessions = sessions or []
+        self._session = session
+        self._messages = messages or []
+        self.list_limits: list[int] = []
+
+    async def list_root_sessions(self, *, limit: int = 100) -> list[OpenCodeSession]:
+        self.list_limits.append(limit)
+        return self._sessions
+
+    async def get_session(self, session_id: str) -> OpenCodeSession | None:
+        return self._session if self._session and self._session.id == session_id else None
+
+    async def list_messages(
+        self, session_id: str, *, after_id: str | None = None
+    ) -> list[dict[str, Any]]:
+        return self._messages
+
+
+def _use_import_client(monkeypatch: pytest.MonkeyPatch, fake: _FakeImportClient) -> None:
+    @contextlib.asynccontextmanager
+    async def _fake_cm() -> AsyncIterator[_FakeImportClient]:
+        yield fake
+
+    monkeypatch.setattr(local_import, "_opencode_import_client", _fake_cm)
+    monkeypatch.setattr(local_import, "_opencode_user_store_exists", lambda: True)
+
+
+def _session(session_id: str, *, updated: int, parent: str | None = None) -> OpenCodeSession:
+    return OpenCodeSession(
+        id=session_id,
+        parent_id=parent,
+        raw={"id": session_id, "time": {"created": 1, "updated": updated}},
+    )
+
+
+def test_list_recent_opencode_sessions_uses_server_listing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """OpenCode batch discovery uses its supported JSON listing command."""
-    calls: list[tuple[str, ...]] = []
-
-    def fake_run(
-        *arguments: str, opencode_path: str | None = None, empty_ok: bool = False
-    ) -> object:
-        assert opencode_path is None
-        calls.append(arguments)
-        return [
-            {"id": "ses_old", "updated": 10, "directory": "/old"},
-            {"id": "ses_child", "updated": 30, "parentID": "ses_parent"},
-            {"id": "ses_new", "updated": 20, "directory": "/new"},
+    """Batch discovery lists top-level sessions across projects, newest first."""
+    fake = _FakeImportClient(
+        sessions=[
+            _session("ses_old", updated=10),
+            _session("ses_child", updated=30, parent="ses_parent"),
+            _session("ses_new", updated=20),
+            _session("--help", updated=40),
         ]
-
-    monkeypatch.setattr(local_import, "_run_opencode_json", fake_run)
+    )
+    _use_import_client(monkeypatch, fake)
 
     assert list_recent_local_session_ids("opencode", limit=2) == ("ses_new", "ses_old")
-    assert calls == [("session", "list", "--format", "json", "--pure")]
+    assert fake.list_limits == [2]
 
 
-def test_list_recent_opencode_sessions_rejects_schema_drift(
+def test_list_recent_opencode_sessions_without_store_skips_server(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A changed public listing schema reports a contract error."""
-    monkeypatch.setattr(local_import, "_run_opencode_json", lambda *arguments, **kwargs: {})
+    """No local OpenCode DB means no sessions, without starting a server."""
 
-    with pytest.raises(SessionImportNotFoundError, match="invalid session list"):
-        list_recent_local_session_ids("opencode", limit=1)
+    @contextlib.asynccontextmanager
+    async def _fail_cm() -> AsyncIterator[_FakeImportClient]:
+        raise AssertionError("the import server must not start without a store")
+        yield  # pragma: no cover
 
-
-def test_list_recent_opencode_sessions_treats_empty_output_as_none(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """With no sessions OpenCode prints nothing (exit 0) — not an error."""
-    from types import SimpleNamespace
-
-    monkeypatch.setattr(local_import, "find_opencode_cli", lambda path: "/fake/opencode")
-    monkeypatch.setattr(
-        local_import.subprocess,
-        "run",
-        lambda *a, **k: SimpleNamespace(returncode=0, stdout="", stderr=""),
-    )
+    monkeypatch.setattr(local_import, "_opencode_import_client", _fail_cm)
+    monkeypatch.setattr(local_import, "_opencode_user_store_exists", lambda: False)
 
     assert list_recent_local_session_ids("opencode", limit=5) == ()
 
 
-def test_load_opencode_session_preserves_messages_files_and_tools(
+def test_opencode_user_store_exists(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.delenv("OPENCODE_DB", raising=False)
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
+    assert local_import._opencode_user_store_exists() is False
+    (tmp_path / "opencode").mkdir()
+    (tmp_path / "opencode" / "opencode.db").write_bytes(b"")
+    assert local_import._opencode_user_store_exists() is True
+
+
+def test_opencode_user_store_exists_honours_opencode_db(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Discovery checks the same DB the import snapshots, even outside the data dir."""
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    custom = tmp_path / "elsewhere" / "custom.db"
+    monkeypatch.setenv("OPENCODE_DB", str(custom))
+    assert local_import._opencode_user_store_exists() is False
+    custom.parent.mkdir()
+    custom.write_bytes(b"")
+    assert local_import._opencode_user_store_exists() is True
+
+
+def test_opencode_import_client_reports_missing_cli(monkeypatch: pytest.MonkeyPatch) -> None:
+    def _missing(_path: str | None = None) -> str:
+        raise OpenCodeCliNotFoundError("opencode CLI not found on PATH")
+
+    monkeypatch.setattr(local_import, "find_opencode_cli", _missing)
+
+    async def _open() -> None:
+        async with local_import._opencode_import_client():
+            pass
+
+    with pytest.raises(SessionImportNotFoundError, match="not found"):
+        local_import._run_opencode_import(_open())
+
+
+class _FakeImportServer:
+    """Records how the import server is built, started, and stopped."""
+
+    instances: list[_FakeImportServer] = []
+
+    def __init__(self, **kwargs: Any) -> None:
+        self.kwargs = kwargs
+        self.base_url = "http://127.0.0.1:1"
+        self.auth_secret = "pw"
+        self.started = False
+        self.closed = False
+        _FakeImportServer.instances.append(self)
+
+    async def start(self) -> None:
+        self.started = True
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+class _FakeHttpClient:
+    def __init__(self, *, fail_close: bool = False) -> None:
+        self.fail_close = fail_close
+        self.closed = False
+
+    async def aclose(self) -> None:
+        self.closed = True
+        if self.fail_close:
+            raise RuntimeError("aclose failed")
+
+
+def _patch_import_server(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    snapshot_ok: bool,
+    client: _FakeHttpClient | None = None,
+) -> list[tuple[Path, Path]]:
+    snapshots: list[tuple[Path, Path]] = []
+
+    def _snapshot(source: Path, dest_bridge_dir: Path) -> bool:
+        snapshots.append((source, dest_bridge_dir))
+        return snapshot_ok
+
+    _FakeImportServer.instances = []
+    monkeypatch.setattr(local_import, "find_opencode_cli", lambda _path=None: "/fake/opencode")
+    monkeypatch.setattr(local_import, "snapshot_opencode_database", _snapshot)
+    monkeypatch.setattr(local_import, "OpenCodeNativeServer", _FakeImportServer)
+    monkeypatch.setattr(
+        local_import, "client_for_state", lambda **_kwargs: client or _FakeHttpClient()
+    )
+    return snapshots
+
+
+def test_opencode_import_client_serves_a_snapshot_of_the_user_db(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The import server boots on a copy, never on the user's live store."""
+    user_db = tmp_path / "custom.db"
+    monkeypatch.setenv("OPENCODE_DB", str(user_db))
+    snapshots = _patch_import_server(monkeypatch, snapshot_ok=True)
+
+    async def _open() -> None:
+        async with local_import._opencode_import_client():
+            pass
+
+    local_import._run_opencode_import(_open())
+
+    [server] = _FakeImportServer.instances
+    assert snapshots == [(user_db, server.kwargs["bridge_dir"])]
+    assert "user_data_store" not in server.kwargs
+    assert server.started and server.closed
+
+
+def test_opencode_import_client_reports_failed_snapshot(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The public export maps ordered parts to durable Omnigent items."""
-    export = {
-        "info": {
-            "id": "ses_import",
-            "directory": "/repo",
-            "title": "OpenCode session title",
-            "version": "1.17.18",
-        },
-        "messages": [
+    _patch_import_server(monkeypatch, snapshot_ok=False)
+
+    async def _open() -> None:
+        async with local_import._opencode_import_client():
+            pass
+
+    with pytest.raises(SessionImportNotFoundError, match="could not be copied"):
+        local_import._run_opencode_import(_open())
+    assert _FakeImportServer.instances == []
+
+
+def test_opencode_import_client_stops_server_when_client_close_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _FakeHttpClient(fail_close=True)
+    _patch_import_server(monkeypatch, snapshot_ok=True, client=client)
+
+    async def _open() -> None:
+        async with local_import._opencode_import_client():
+            pass
+
+    with pytest.raises(RuntimeError, match="aclose failed"):
+        local_import._run_opencode_import(_open())
+    [server] = _FakeImportServer.instances
+    assert client.closed and server.closed
+
+
+_V2_MESSAGES: list[dict[str, Any]] = [
+    {
+        "id": "msg_user",
+        "type": "user",
+        "text": "inspect TODO.md",
+        "files": [
             {
-                "info": {"id": "msg_user", "role": "user"},
-                "parts": [
-                    {"type": "text", "text": "inspect TODO.md"},
-                    {
-                        "type": "file",
-                        "mime": "image/png",
-                        "url": "data:image/png;base64,AAAA",
-                    },
-                ],
+                "data": "AAAA",
+                "mime": "image/png",
+                "source": {"type": "inline"},
+                "name": "shot.png",
             },
             {
-                "info": {"id": "msg_assistant", "role": "assistant"},
-                "parts": [
-                    {"type": "reasoning", "text": "private reasoning"},
-                    {"type": "text", "text": "Checking."},
-                    {
-                        "type": "tool",
-                        "callID": "call_1",
-                        "tool": "bash",
-                        "state": {
-                            "status": "completed",
-                            "input": {"command": "rg TODO"},
-                            "output": "",
-                            "metadata": {"output": "TODO.md:1:item"},
-                        },
-                    },
-                    {"type": "text", "text": "Done."},
-                ],
+                "data": "Zm9v",
+                "mime": "text/plain",
+                "source": {"type": "inline"},
+                "name": "notes.txt",
             },
         ],
-    }
+        "time": {"created": 1},
+    },
+    {
+        "id": "msg_model",
+        "type": "model-switched",
+        "model": {"id": "m", "providerID": "p"},
+        "time": {"created": 2},
+    },
+    {
+        "id": "msg_assistant",
+        "type": "assistant",
+        "agent": "build",
+        "model": {"id": "claude-sonnet-4-5", "providerID": "anthropic"},
+        "time": {"created": 3, "completed": 4},
+        "content": [
+            {"type": "reasoning", "text": "private reasoning"},
+            {"type": "text", "text": "Checking."},
+            {
+                "type": "tool",
+                "id": "call_1",
+                "name": "shell",
+                "state": {
+                    "status": "completed",
+                    "input": {"command": "rg TODO"},
+                    "content": [{"type": "text", "text": "TODO.md:1:item"}],
+                    "metadata": {},
+                },
+                "time": {"created": 3},
+            },
+            {"type": "text", "text": "Done."},
+        ],
+    },
+    {"id": "msg_seed", "type": "synthetic", "text": "seeded context", "time": {"created": 5}},
+    {
+        "id": "msg_failed",
+        "type": "assistant",
+        "agent": "build",
+        "model": {"id": "claude-sonnet-4-5", "providerID": "anthropic"},
+        "time": {"created": 6},
+        "content": [
+            {
+                "type": "tool",
+                "id": "call_2",
+                "name": "edit",
+                "state": {
+                    "status": "error",
+                    "input": {"path": "a.py"},
+                    "error": {"type": "permission", "message": "denied by policy"},
+                },
+                "time": {"created": 6},
+            },
+            {
+                "type": "tool",
+                "id": "call_3",
+                "name": "shell",
+                "state": {"status": "streaming", "input": '{"command": "l'},
+                "time": {"created": 6},
+            },
+        ],
+    },
+]
 
-    def fake_run(*arguments: str, opencode_path: str | None = None) -> object:
-        assert arguments == ("export", "ses_import", "--pure")
-        assert opencode_path is None
-        return export
 
-    monkeypatch.setattr(local_import, "_run_opencode_json", fake_run)
+def test_load_opencode_session_maps_v2_messages(monkeypatch: pytest.MonkeyPatch) -> None:
+    """v2 typed messages map to ordered Omnigent items."""
+    fake = _FakeImportClient(
+        session=OpenCodeSession(
+            id="ses_import",
+            title="OpenCode session title",
+            directory="/repo",
+            raw={"id": "ses_import", "location": {"directory": "/repo"}},
+        ),
+        messages=_V2_MESSAGES,
+    )
+    _use_import_client(monkeypatch, fake)
 
     imported = load_opencode_session("ses_import")
     dumped = [item.data.model_dump(mode="json", exclude_none=True) for item in imported.items]
@@ -279,51 +497,84 @@ def test_load_opencode_session_preserves_messages_files_and_tools(
     assert imported.external_session_id == "ses_import"
     assert imported.workspace == "/repo"
     assert imported.native_title == "OpenCode session title"
-    assert imported.title == "OpenCode session title"
     assert [item.type for item in imported.items] == [
         "message",
         "message",
         "function_call",
         "function_call_output",
         "message",
+        "function_call",
+        "function_call_output",
+        "function_call",
     ]
     assert dumped[0] == {
         "role": "user",
         "content": [
             {"type": "input_text", "text": "inspect TODO.md"},
             {"type": "input_image", "image_url": "data:image/png;base64,AAAA"},
+            {"type": "input_text", "text": "[attachment: notes.txt]"},
         ],
     }
-    assert dumped[1]["content"] == [{"type": "output_text", "text": "Checking."}]
-    assert dumped[1]["agent"] == "opencode-native-ui"
+    assert dumped[1] == {
+        "role": "assistant",
+        "agent": "opencode-native-ui",
+        "content": [{"type": "output_text", "text": "Checking."}],
+    }
     assert dumped[2] == {
         "agent": "opencode-native-ui",
-        "name": "bash",
+        "name": "shell",
         "arguments": '{"command":"rg TODO"}',
         "call_id": "call_1",
     }
     assert dumped[3] == {"call_id": "call_1", "output": "TODO.md:1:item"}
     assert dumped[4]["content"] == [{"type": "output_text", "text": "Done."}]
-    assert {item.response_id for item in imported.items[1:]} == {"opencode:msg_assistant"}
+    assert dumped[6] == {"call_id": "call_2", "output": "[error] denied by policy"}
+    assert dumped[7]["arguments"] == '{"command": "l'
+    assert {item.response_id for item in imported.items[1:5]} == {"opencode:msg_assistant"}
 
 
-def test_load_opencode_session_rejects_invalid_or_mismatched_ids(
+def test_load_opencode_session_parses_captured_fixture(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The recon capture of a real 2.0.x turn imports with a shell call."""
+    messages = load_messages()["data"]
+    fake = _FakeImportClient(
+        session=OpenCodeSession(id="ses_fixture", raw={"id": "ses_fixture"}),
+        messages=messages,
+    )
+    _use_import_client(monkeypatch, fake)
+
+    imported = load_opencode_session("ses_fixture")
+
+    kinds = [item.type for item in imported.items]
+    assert kinds[0] == "message"
+    assert "function_call" in kinds
+    calls = [
+        item.data.model_dump(mode="json")
+        for item in imported.items
+        if item.type == "function_call"
+    ]
+    assert any(call["name"] == "shell" for call in calls)
+
+
+def test_load_opencode_session_rejects_unsafe_or_missing_ids(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Unsafe CLI arguments and mismatched exports cannot claim an import id."""
+    """Unsafe ids and unknown sessions are reported as not found."""
     with pytest.raises(SessionImportNotFoundError, match="was not found"):
         load_opencode_session("--help")
 
-    monkeypatch.setattr(
-        local_import,
-        "_run_opencode_json",
-        lambda *arguments, opencode_path=None: {
-            "info": {"id": "ses_other"},
-            "messages": [],
-        },
+    _use_import_client(monkeypatch, _FakeImportClient(session=None))
+    with pytest.raises(SessionImportNotFoundError, match="was not found"):
+        load_opencode_session("ses_missing")
+
+
+def test_load_opencode_session_without_history(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake = _FakeImportClient(
+        session=OpenCodeSession(id="ses_empty", raw={"id": "ses_empty"}),
+        messages=[{"id": "msg_s", "type": "synthetic", "text": "x", "time": {"created": 1}}],
     )
-    with pytest.raises(SessionImportNotFoundError, match="did not match"):
-        load_opencode_session("ses_expected")
+    _use_import_client(monkeypatch, fake)
+    with pytest.raises(SessionImportNotFoundError, match="no importable history"):
+        load_opencode_session("ses_empty")
 
 
 def test_load_claude_session_normalizes_parent_transcript(tmp_path: Path) -> None:

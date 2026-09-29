@@ -76,14 +76,20 @@ _GOOSE_NATIVE_OS_TOOLS = frozenset(
     }
 )
 
-# opencode-native permission CATEGORIES (the ``permission`` field of a
-# ``permission.asked`` event, mapped to the policy-event tool name by the SSE
-# forwarder — live-verified against 1.17.7). opencode collapses write/edit/patch
-# into ``edit``; ``bash`` is its shell tool (``ShellID.ToolID``). ``bash`` /
-# ``read`` / ``edit`` overlap the lowercase pi set above, but list them
-# explicitly so opencode coverage does not silently depend on that set, and add
-# the file-search categories (``grep`` / ``glob``) pi lacks.
-_OPENCODE_NATIVE_OS_TOOLS = frozenset({"bash", "edit", "read", "grep", "glob"})
+# opencode 2.x ``permission.asked`` actions (write/patch collapse into ``edit``).
+# The ``opencode_*`` MCP resource builtins reach MCP servers under no relay tool
+# name and have no config switch, so they are gated as OS tools too.
+_OPENCODE_NATIVE_OS_TOOLS = frozenset(
+    {
+        "shell",
+        "edit",
+        "read",
+        "grep",
+        "glob",
+        "opencode_list_mcp_resources",
+        "opencode_read_mcp_resource",
+    }
+)
 
 # Codex in-process harness tool names surfaced as observational
 # ``ToolCallRequest`` events. The codex app-server executor translates
@@ -259,8 +265,8 @@ def ask_on_os_tools(event: PolicyEvent) -> PolicyResponse:
     - **Hermes Agent tools** (``terminal``, ``execute_code``,
       ``read_file``, ``write_file``, ``search_files``) — surfaced
       via the ``pre_tool_call`` shell hook.
-    - **opencode native tools** (``bash``, ``edit``, ``read``,
-      ``grep``, ``glob``) — opencode's permission CATEGORIES, surfaced
+    - **opencode native actions** (``shell``, ``edit``, ``read``,
+      ``grep``, ``glob``) — opencode's permission actions, surfaced
       via the SSE forwarder's ``permission.asked`` → policy-evaluate
       path. opencode collapses write/edit/patch into ``edit``.
 
@@ -365,6 +371,9 @@ _SKILL_TOOLS = frozenset({"load_skill", "read_skill_file"})
 # The tool takes a ``skill`` argument with the skill name.
 _NATIVE_SKILL_TOOL = "Skill"
 
+# opencode's ``skill`` permission action; the forwarder passes the skill id as ``skill``.
+_OPENCODE_SKILL_ACTION = "skill"
+
 
 def block_skills(blocked: list[str]) -> PolicyCallable:
     """Factory: deny skill loading for specific skill names.
@@ -453,9 +462,9 @@ def block_skills(blocked: list[str]) -> PolicyCallable:
                     }
                 return _ALLOW
 
-            # Path 2: Claude Code / Codex native Skill tool.
-            # Fired via PreToolUse hook → Omnigent /policies/evaluate.
-            if tool == _NATIVE_SKILL_TOOL:
+            # Path 2: Claude Code / Codex native Skill tool, or opencode's
+            # ``skill`` permission action; both carry the name as ``skill``.
+            if tool in (_NATIVE_SKILL_TOOL, _OPENCODE_SKILL_ACTION):
                 skill_name = args.get("skill")
                 if skill_name and _is_blocked(skill_name):
                     return {
@@ -777,7 +786,7 @@ POLICY_REGISTRY: list[dict[str, object]] = [
         "covers Omnigent sys_os_* tools, Claude Code and Codex native tools "
         "(Bash, Read, Write, Edit, MultiEdit, NotebookEdit, Glob, Grep), "
         "Cursor native tools (Shell), Pi native tools (read, bash, write, edit), "
-        "opencode native tools (bash, edit, read, grep, glob), "
+        "opencode native tools (shell, edit, read, grep, glob), "
         "Goose native tools (developer__shell and the developer__* file tools), "
         "and Hermes Agent tools (terminal, execute_code, read_file, write_file, search_files)",
         "params_schema": None,

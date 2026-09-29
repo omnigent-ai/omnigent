@@ -3,8 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import io
+import logging
+import subprocess
 from pathlib import Path
+from typing import Any
 
+import httpx
 import pytest
 
 from omnigent.harnesses.opencode_native import app_server as appsrv
@@ -12,31 +17,81 @@ from omnigent.harnesses.opencode_native.app_server import (
     OpenCodeCliNotFoundError,
     OpenCodeNativeServer,
     OpenCodeVersionError,
-    build_opencode_attach_args,
     build_opencode_serve_args,
+    build_tui_command,
     check_opencode_version,
     filtered_server_env,
     find_opencode_cli,
     opencode_terminal_env,
     parse_opencode_version,
 )
+from omnigent.process_logging import HARNESS_STDERR_ENABLED_ENV_VAR
+
+
+class _FakeStdin:
+    """Stdin pipe stand-in; closing it can end the fake process."""
+
+    def __init__(self, proc: _FakeProc) -> None:
+        self._proc = proc
+        self.closed = False
+
+    def close(self) -> None:
+        self.closed = True
+        if self._proc.exits_on_stdin_close:
+            self._proc.returncode = 0
+
+
+class _FakeProc:
+    """``Popen`` stand-in for a ``--stdio`` server."""
+
+    pid = 4242
+
+    def __init__(self, *, exits_on_stdin_close: bool = True) -> None:
+        self.returncode: int | None = None
+        self.terminated = False
+        self.exits_on_stdin_close = exits_on_stdin_close
+        self.stdin = _FakeStdin(self)
+
+    def poll(self) -> int | None:
+        return self.returncode
+
+    def wait(self, timeout: float | None = None) -> int:
+        if self.returncode is None:
+            raise subprocess.TimeoutExpired("opencode", timeout or 0)
+        return self.returncode
+
+    def terminate(self) -> None:
+        self.terminated = True
+        self.returncode = -15
+
+    def kill(self) -> None:
+        self.returncode = -9
+
+
+def _mock_http(monkeypatch: pytest.MonkeyPatch, handler: object) -> None:
+    """Route the readiness probe's ``httpx.AsyncClient`` to *handler*."""
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(
+        appsrv.httpx,
+        "AsyncClient",
+        lambda **kw: real_client(transport=httpx.MockTransport(handler), **kw),  # type: ignore[arg-type]
+    )
 
 
 def test_parse_opencode_version() -> None:
-    assert parse_opencode_version("opencode 1.17.7") == "1.17.7"
-    assert parse_opencode_version("1.17.7") == "1.17.7"
-    assert parse_opencode_version("v1.17.7-beta.1") == "1.17.7-beta.1"
+    assert parse_opencode_version("opencode v2.0.18") == "2.0.18"
+    assert parse_opencode_version("2.0.18") == "2.0.18"
+    assert parse_opencode_version("v2.1.0-beta.1") == "2.1.0-beta.1"
     assert parse_opencode_version("no version here") is None
 
 
 def test_check_version_in_range() -> None:
-    check_opencode_version("1.17.7")
-    check_opencode_version("1.17.99")
-    check_opencode_version("1.18.0")
-    check_opencode_version("1.18.16")
+    check_opencode_version("2.0.0")
+    check_opencode_version("2.0.18")
+    check_opencode_version("2.9.99")
 
 
-@pytest.mark.parametrize("version", ["1.16.0", "1.19.0", "2.0.0"])
+@pytest.mark.parametrize("version", ["1.17.7", "1.18.16", "1.99.0", "3.0.0"])
 def test_check_version_out_of_range_raises(version: str) -> None:
     with pytest.raises(OpenCodeVersionError):
         check_opencode_version(version)
@@ -58,36 +113,28 @@ def test_find_opencode_cli_resolved(monkeypatch: pytest.MonkeyPatch) -> None:
     assert find_opencode_cli() == "/usr/bin/opencode"
 
 
-def test_build_serve_args_has_explicit_host_port() -> None:
+def test_build_serve_args_uses_stdio() -> None:
     args = build_opencode_serve_args(hostname="127.0.0.1", port=49231)
-    assert args == ["serve", "--hostname", "127.0.0.1", "--port", "49231"]
+    assert args == ["serve", "--hostname", "127.0.0.1", "--port", "49231", "--stdio"]
 
 
-def test_build_attach_args() -> None:
-    args = build_opencode_attach_args(
-        server_url="http://127.0.0.1:49231",
-        workspace="/repo",
+def test_build_tui_command() -> None:
+    assert build_tui_command(
+        "/usr/bin/opencode",
+        base_url="http://127.0.0.1:49231",
         session_id="ses_1",
-    )
-    assert args == [
-        "attach",
+        workspace="/repo",
+        extra_args=("--log-level", "debug"),
+    ) == [
+        "/usr/bin/opencode",
+        "--server",
         "http://127.0.0.1:49231",
-        "--dir",
-        "/repo",
         "--session",
         "ses_1",
+        "/repo",
+        "--log-level",
+        "debug",
     ]
-
-
-def test_build_attach_args_without_session() -> None:
-    args = build_opencode_attach_args(
-        server_url="http://127.0.0.1:49231",
-        workspace="/repo",
-        session_id=None,
-        opencode_args=("--extra",),
-    )
-    assert "--session" not in args
-    assert args[-1] == "--extra"
 
 
 def test_filtered_server_env_sets_xdg_and_password(
@@ -98,8 +145,9 @@ def test_filtered_server_env_sets_xdg_and_password(
     env = filtered_server_env(bridge_dir=tmp_path, auth_secret="pw")
     assert env["XDG_DATA_HOME"] == str(tmp_path / "xdg-data")
     assert env["XDG_CONFIG_HOME"] == str(tmp_path / "xdg-config")
+    assert env["OPENCODE_PASSWORD"] == "pw"
     assert env["OPENCODE_SERVER_PASSWORD"] == "pw"
-    assert env["OPENCODE_SERVER_USERNAME"] == "opencode"
+    assert "OPENCODE_SERVER_USERNAME" not in env
     assert env["ANTHROPIC_API_KEY"] == "secret-key"  # provider env passes through
     assert "RANDOM_UNRELATED" not in env  # unrelated env filtered out
 
@@ -146,6 +194,41 @@ def test_filtered_server_env_drops_global_opencode_config(
     assert env["XDG_CONFIG_HOME"] == str(tmp_path / "xdg-config")
 
 
+def test_filtered_server_env_sets_per_session_db(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    env = filtered_server_env(bridge_dir=tmp_path, auth_secret="pw")
+    assert env["OPENCODE_DB"] == str(tmp_path / "opencode.db")
+
+
+def test_filtered_server_env_drops_inherited_opencode_state(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A parent's config dir, DB, or password never reach the isolated server."""
+    monkeypatch.setenv("OPENCODE_CONFIG_DIR", "/home/user/.config/opencode")
+    monkeypatch.setenv("OPENCODE_DB", "/home/user/.local/share/opencode/opencode.db")
+    monkeypatch.setenv("OPENCODE_PASSWORD", "parent-secret")
+    monkeypatch.setenv("OPENCODE_SERVER_PASSWORD", "parent-secret")
+    monkeypatch.setenv(
+        "OMNIGENT_RUNNER_ENV_PASSTHROUGH", "OPENCODE_CONFIG_DIR,OPENCODE_DB,OPENCODE_PASSWORD"
+    )
+    env = filtered_server_env(bridge_dir=tmp_path, auth_secret="pw")
+    assert "OPENCODE_CONFIG_DIR" not in env
+    assert env["OPENCODE_DB"] == str(tmp_path / "opencode.db")
+    assert env["OPENCODE_PASSWORD"] == "pw"
+    assert env["OPENCODE_SERVER_PASSWORD"] == "pw"
+
+
+def test_filtered_server_env_extra_env_may_set_opencode_config(tmp_path: Path) -> None:
+    """Launcher-supplied OpenCode env is applied after the parent filter."""
+    env = filtered_server_env(
+        bridge_dir=tmp_path,
+        auth_secret="pw",
+        extra_env={"OPENCODE_CONFIG": str(tmp_path / "opencode.json")},
+    )
+    assert env["OPENCODE_CONFIG"] == str(tmp_path / "opencode.json")
+
+
 def _server(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> OpenCodeNativeServer:
     monkeypatch.setattr(appsrv.shutil, "which", lambda name: f"/usr/bin/{name}")
     return OpenCodeNativeServer(
@@ -161,7 +244,7 @@ def test_build_argv(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     server.port = 49231
     argv = server.build_argv()
     assert argv[0] == "/usr/bin/opencode"
-    assert argv[1:] == ["serve", "--hostname", "127.0.0.1", "--port", "49231"]
+    assert argv[1:] == ["serve", "--hostname", "127.0.0.1", "--port", "49231", "--stdio"]
 
 
 def test_base_url_and_auth_headers(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -170,25 +253,34 @@ def test_base_url_and_auth_headers(monkeypatch: pytest.MonkeyPatch, tmp_path: Pa
     assert server.auth_headers["Authorization"].startswith("Basic ")
 
 
-def test_terminal_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    server = _server(monkeypatch, tmp_path)
-    env = opencode_terminal_env(server)
-    assert env["OPENCODE_SERVER_PASSWORD"] == server.auth_secret
-    assert env["XDG_DATA_HOME"] == str(server.xdg_data_home)
+def test_terminal_env_carries_password_under_both_names(tmp_path: Path) -> None:
+    env = opencode_terminal_env(
+        "pw", xdg_data_home=tmp_path / "data", xdg_config_home=tmp_path / "config"
+    )
+    assert env == {
+        "OPENCODE_PASSWORD": "pw",
+        "OPENCODE_SERVER_PASSWORD": "pw",
+        "XDG_DATA_HOME": str(tmp_path / "data"),
+        "XDG_CONFIG_HOME": str(tmp_path / "config"),
+    }
 
 
-async def test_start_polls_until_ready(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+def test_terminal_env_without_xdg_dirs() -> None:
+    assert opencode_terminal_env("pw") == {
+        "OPENCODE_PASSWORD": "pw",
+        "OPENCODE_SERVER_PASSWORD": "pw",
+    }
+
+
+async def test_start_launches_stdio_server_with_stdin_pipe(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     server = _server(monkeypatch, tmp_path)
     started: dict[str, object] = {}
 
-    class _FakeProc:
-        pid = 4242
-
-        def poll(self) -> None:
-            return None
-
     def fake_popen(argv, **kwargs):  # type: ignore[no-untyped-def]
         started["argv"] = argv
+        started["stdin"] = kwargs.get("stdin")
         started["env"] = kwargs.get("env")
         return _FakeProc()
 
@@ -200,8 +292,114 @@ async def test_start_polls_until_ready(monkeypatch: pytest.MonkeyPatch, tmp_path
     await server.start()
     assert started["ready"] is True
     assert started["argv"][1] == "serve"
+    assert "--stdio" in started["argv"]
+    assert started["stdin"] == subprocess.PIPE
+    assert started["env"]["OPENCODE_DB"] == str(tmp_path / "opencode.db")
     assert server.process is not None
     assert server.process.pid == 4242
+
+
+class _StderrProc(_FakeProc):
+    """``_FakeProc`` with a readable stderr pipe, as ``stderr=PIPE`` gives."""
+
+    def __init__(self, stderr: bytes, *, returncode: int | None = None) -> None:
+        super().__init__()
+        self.stderr = io.BytesIO(stderr)
+        self.returncode = returncode
+
+
+def _capture_popen(
+    monkeypatch: pytest.MonkeyPatch, proc: _FakeProc, started: dict[str, Any]
+) -> None:
+    def fake_popen(argv, **kwargs):  # type: ignore[no-untyped-def]
+        started["argv"] = argv
+        started.update(kwargs)
+        return proc
+
+    monkeypatch.setattr(appsrv.subprocess, "Popen", fake_popen)
+
+
+async def test_stderr_discarded_when_diagnostics_are_off(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Without the opt-in flag, stderr goes nowhere and OpenCode keeps its own log."""
+    monkeypatch.delenv(HARNESS_STDERR_ENABLED_ENV_VAR, raising=False)
+    server = _server(monkeypatch, tmp_path)
+    started: dict[str, Any] = {}
+    _capture_popen(monkeypatch, _FakeProc(), started)
+
+    async def fake_wait(self: OpenCodeNativeServer) -> None:
+        return None
+
+    monkeypatch.setattr(OpenCodeNativeServer, "_wait_until_ready", fake_wait)
+    await server.start()
+    assert started["stderr"] == subprocess.DEVNULL
+    assert appsrv.OPENCODE_PRINT_LOGS_FLAG not in started["argv"]
+    assert server._stderr_excerpt() == ""
+    await server.close()
+
+
+async def test_stderr_exported_redacted_when_diagnostics_are_on(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """With the flag, OpenCode prints its logs to stderr and they reach the runner log redacted."""
+    monkeypatch.setenv(HARNESS_STDERR_ENABLED_ENV_VAR, "1")
+    monkeypatch.setattr(appsrv.shutil, "which", lambda name: f"/usr/bin/{name}")
+    server = OpenCodeNativeServer(
+        bridge_dir=tmp_path,
+        workspace=tmp_path,
+        port=49231,
+        verify_version=False,
+        opencode_args=[appsrv.OPENCODE_PRINT_LOGS_FLAG],
+        session_id="conv_diag",
+    )
+    started: dict[str, Any] = {}
+    proc = _StderrProc(b"level=INFO message=booting\npassword synthetic-secret\n")
+    _capture_popen(monkeypatch, proc, started)
+
+    async def fake_wait(self: OpenCodeNativeServer) -> None:
+        return None
+
+    monkeypatch.setattr(OpenCodeNativeServer, "_wait_until_ready", fake_wait)
+    with caplog.at_level(logging.INFO, logger=appsrv._logger.name):
+        await server.start()
+        await server.close()
+    assert started["stderr"] == subprocess.PIPE
+    # A user-supplied --print-logs is not duplicated.
+    assert started["argv"].count(appsrv.OPENCODE_PRINT_LOGS_FLAG) == 1
+    assert list(server.recent_stderr) == [
+        "level=INFO message=booting",
+        "password synthetic-secret",
+    ]
+    exported = [r for r in caplog.records if "OpenCode diagnostic output" in r.getMessage()]
+    assert exported, caplog.text
+    text = "\n".join(r.getMessage() for r in exported)
+    assert "session=conv_diag" in text
+    assert "message=booting" in text
+    assert "synthetic-secret" not in text
+
+
+async def test_startup_error_quotes_redacted_stderr_only_when_diagnostics_are_on(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """An early exit names what OpenCode printed, redacted, and only under the opt-in flag."""
+    stderr = b"Error: bad provider config\npassword synthetic-secret\n"
+    messages: dict[str, str] = {}
+    _mock_http(monkeypatch, lambda request: httpx.Response(503))
+    for enabled in (True, False):
+        if enabled:
+            monkeypatch.setenv(HARNESS_STDERR_ENABLED_ENV_VAR, "1")
+        else:
+            monkeypatch.delenv(HARNESS_STDERR_ENABLED_ENV_VAR, raising=False)
+        server = _server(monkeypatch, tmp_path)
+        _capture_popen(monkeypatch, _StderrProc(stderr, returncode=1), {})
+        with pytest.raises(RuntimeError) as exc_info:
+            await server.start()
+        messages[str(enabled)] = str(exc_info.value)
+    assert "exited early with code 1" in messages["True"]
+    assert "Error: bad provider config" in messages["True"]
+    assert "synthetic-secret" not in messages["True"]
+    assert messages["False"] == "opencode serve exited early with code 1"
 
 
 async def test_start_closes_process_when_readiness_is_cancelled(
@@ -210,25 +408,7 @@ async def test_start_closes_process_when_readiness_is_cancelled(
     """Cancelling the readiness wait must reap the OpenCode server."""
     server = _server(monkeypatch, tmp_path)
 
-    class _FakeProc:
-        returncode: int | None = None
-        terminated = False
-
-        def poll(self) -> int | None:
-            return self.returncode
-
-        def terminate(self) -> None:
-            self.terminated = True
-            self.returncode = -15
-
-        def wait(self, _timeout: float | None = None) -> int:
-            assert self.returncode is not None
-            return self.returncode
-
-        def kill(self) -> None:
-            self.returncode = -9
-
-    process = _FakeProc()
+    process = _FakeProc(exits_on_stdin_close=False)
     readiness_started = asyncio.Event()
 
     async def parked_wait(self: OpenCodeNativeServer) -> None:
@@ -245,6 +425,7 @@ async def test_start_closes_process_when_readiness_is_cancelled(
         await start_task
 
     assert process.terminated is True
+    assert process.stdin.closed is True
     assert server.process is None
 
 
@@ -254,25 +435,7 @@ async def test_start_closes_process_when_readiness_fails(
     """A readiness probe that gives up must not leave ``opencode serve`` running."""
     server = _server(monkeypatch, tmp_path)
 
-    class _FakeProc:
-        returncode: int | None = None
-        terminated = False
-
-        def poll(self) -> int | None:
-            return self.returncode
-
-        def terminate(self) -> None:
-            self.terminated = True
-            self.returncode = -15
-
-        def wait(self, _timeout: float | None = None) -> int:
-            assert self.returncode is not None
-            return self.returncode
-
-        def kill(self) -> None:
-            self.returncode = -9
-
-    process = _FakeProc()
+    process = _FakeProc(exits_on_stdin_close=False)
 
     async def failing_wait(self: OpenCodeNativeServer) -> None:
         raise RuntimeError("opencode serve did not become ready")
@@ -284,6 +447,7 @@ async def test_start_closes_process_when_readiness_fails(
         await server.start()
 
     assert process.terminated is True
+    assert process.stdin.closed is True
     assert server.process is None
 
 
@@ -291,7 +455,7 @@ async def test_start_raises_on_unsupported_version_without_env(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     monkeypatch.setattr(appsrv.shutil, "which", lambda name: f"/usr/bin/{name}")
-    monkeypatch.setattr(appsrv, "resolve_opencode_version", lambda _path: "1.19.0")
+    monkeypatch.setattr(appsrv, "resolve_opencode_version", lambda _path: "1.18.16")
     monkeypatch.delenv("OMNIGENT_OPENCODE_SKIP_VERSION_CHECK", raising=False)
     server = OpenCodeNativeServer(
         bridge_dir=tmp_path,
@@ -319,7 +483,7 @@ async def test_start_skips_version_gate_when_env_set(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     monkeypatch.setattr(appsrv.shutil, "which", lambda name: f"/usr/bin/{name}")
-    monkeypatch.setattr(appsrv, "resolve_opencode_version", lambda _path: "1.19.0")
+    monkeypatch.setattr(appsrv, "resolve_opencode_version", lambda _path: "1.18.16")
     monkeypatch.setenv("OMNIGENT_OPENCODE_SKIP_VERSION_CHECK", "1")
     server = OpenCodeNativeServer(
         bridge_dir=tmp_path,
@@ -340,7 +504,7 @@ async def test_start_skips_version_gate_when_env_set(
     monkeypatch.setattr(appsrv.subprocess, "Popen", lambda argv, **kwargs: _FakeProc())
     monkeypatch.setattr(OpenCodeNativeServer, "_wait_until_ready", fake_wait)
     await server.start()
-    assert server.version == "1.19.0"
+    assert server.version == "1.18.16"
     assert server.process is not None
 
 
@@ -357,9 +521,9 @@ def test_resolve_opencode_version_parses(monkeypatch: pytest.MonkeyPatch) -> Non
     monkeypatch.setattr(
         appsrv.subprocess,
         "run",
-        lambda *a, **k: subprocess.CompletedProcess(a, 0, stdout="opencode 1.17.7\n", stderr=""),
+        lambda *a, **k: subprocess.CompletedProcess(a, 0, stdout="opencode v2.0.18\n", stderr=""),
     )
-    assert appsrv.resolve_opencode_version("/x/opencode") == "1.17.7"
+    assert appsrv.resolve_opencode_version("/x/opencode") == "2.0.18"
 
 
 def test_resolve_opencode_version_run_error_raises(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -383,30 +547,67 @@ def test_resolve_opencode_version_unparseable_raises(monkeypatch: pytest.MonkeyP
         appsrv.resolve_opencode_version("/x/opencode")
 
 
-def test_list_opencode_cli_model_options(monkeypatch: pytest.MonkeyPatch) -> None:
-    import subprocess
+async def test_wait_until_ready_polls_api_info_and_records_version(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    server = _server(monkeypatch, tmp_path)
+    server.process = _FakeProc()  # type: ignore[assignment]
+    seen: list[tuple[str, str]] = []
+    statuses = iter([503, 200])
 
-    monkeypatch.setattr(appsrv, "find_opencode_cli", lambda _path=None: "/x/opencode")
-
-    captured: dict[str, object] = {}
-
-    def _fake_run(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
-        captured["env"] = kwargs.get("env")
-        return subprocess.CompletedProcess(
-            args,
-            0,
-            stdout="\x1b[32mopencode-go/glm-5.2\x1b[0m\nopencode-go/kimi-k2.7-code\n",
-            stderr="",
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append((request.url.path, request.headers.get("authorization", "")))
+        status = next(statuses)
+        if status != 200:
+            return httpx.Response(status, json={"code": "service_starting"})
+        return httpx.Response(
+            200, json={"version": "2.0.18", "pid": 1, "urls": [], "paths": {"tmp": "/tmp"}}
         )
 
-    monkeypatch.setattr(appsrv.subprocess, "run", _fake_run)
+    _mock_http(monkeypatch, handler)
+    await server._wait_until_ready(attempts=3, delay=0)
+    assert [path for path, _ in seen] == ["/api/info", "/api/info"]
+    assert seen[0][1].startswith("Basic ")
+    assert server.version == "2.0.18"
 
-    options = appsrv.list_opencode_cli_model_options(
-        env={"XDG_DATA_HOME": "/xdg/data", "XDG_CONFIG_HOME": "/xdg/config"},
-    )
 
-    assert [option["id"] for option in options] == [
-        "opencode-go/glm-5.2",
-        "opencode-go/kimi-k2.7-code",
-    ]
-    assert captured["env"] == {"XDG_DATA_HOME": "/xdg/data", "XDG_CONFIG_HOME": "/xdg/config"}
+async def test_wait_until_ready_fails_fast_on_rejected_password(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    server = _server(monkeypatch, tmp_path)
+    server.process = _FakeProc()  # type: ignore[assignment]
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.url.path)
+        return httpx.Response(401, json={"_tag": "UnauthorizedError", "message": "no"})
+
+    _mock_http(monkeypatch, handler)
+    with pytest.raises(RuntimeError, match="rejected the per-session password"):
+        await server._wait_until_ready(attempts=5, delay=0)
+    assert calls == ["/api/info"]
+
+
+async def test_close_stops_server_by_closing_stdin(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    server = _server(monkeypatch, tmp_path)
+    process = _FakeProc()
+    server.process = process  # type: ignore[assignment]
+    await server.close()
+    assert process.stdin.closed is True
+    assert process.terminated is False
+    assert process.returncode == 0
+    assert server.process is None
+
+
+async def test_close_terminates_when_stdin_close_is_ignored(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    server = _server(monkeypatch, tmp_path)
+    process = _FakeProc(exits_on_stdin_close=False)
+    server.process = process  # type: ignore[assignment]
+    await server.close()
+    assert process.stdin.closed is True
+    assert process.terminated is True
+    assert server.process is None

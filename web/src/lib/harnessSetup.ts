@@ -182,6 +182,11 @@ export function isNativeCursorHarness(harness: string): boolean {
   return harness === "cursor-native" || harness === "native-cursor";
 }
 
+/** Whether *harness* is an OpenCode spelling (bare, native, or reversed). */
+export function isNativeOpenCodeHarness(harness: string): boolean {
+  return harness === "opencode-native" || harness === "native-opencode" || harness === "opencode";
+}
+
 /**
  * Why *harness* can't run on *host* right now, or ``null`` when it's ready
  * (or readiness is unknown / no host selected). Drives the picker "needs setup"

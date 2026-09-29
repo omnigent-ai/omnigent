@@ -370,3 +370,30 @@ def test_hermes_and_hermes_native_deliver_differently() -> None:
 def test_kiro_native_is_not_delivered() -> None:
     caps = harness_capabilities()
     assert caps["kiro-native"].instruction_delivery is InstructionDelivery.NOT_DELIVERED
+
+
+def test_opencode_native_declares_v2_session_capabilities() -> None:
+    """OpenCode 2.x streams deltas and exposes steer/queue, images and compaction."""
+    capability = harness_capabilities()["opencode-native"]
+    assert capability.integration_mode is IntegrationMode.NATIVE_SERVER
+    assert capability.streaming is True
+    assert capability.steering is True
+    assert capability.live_queue is True
+    assert capability.images is True
+    assert capability.compaction is True
+    # Native fork is attempted when the source DB is reachable; otherwise
+    # history rides as a preamble.
+    assert capability.fork_history is ForkHistory.PREAMBLE
+    # v2 has no per-prompt system field; instructions ride the launch config.
+    assert capability.instruction_delivery is InstructionDelivery.COMPOSED_SESSION_SNAPSHOT
+    catalog = capability.as_dict()
+    assert catalog["streaming"] is True
+    assert catalog["instruction_delivery"] == "composed-session-snapshot"
+
+
+def test_opencode_native_streaming_claim_is_backed_by_v2_deltas() -> None:
+    """The streaming=True claim rests on real v2 delta events, not snapshots."""
+    from tests.opencode_v2_fixtures import events_of_type
+
+    assert events_of_type("session.text.delta"), "fixture lost its text deltas"
+    assert events_of_type("session.reasoning.delta"), "fixture lost its reasoning deltas"

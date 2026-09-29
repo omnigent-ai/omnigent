@@ -12,7 +12,9 @@ both codex-native (WS JSON-RPC) and opencode-native (HTTP + SSE):
   transport, and yields ``TurnComplete`` — streaming is the forwarder's
   job, matching codex-native's injection/completion split.
 - ``interrupt_session`` and ``enqueue_session_message`` route through the
-  transport's ``abort`` / ``send_prompt``.
+  transport's ``abort`` / ``send_prompt``; enqueued prompts carry
+  ``metadata["delivery"] = "queue"`` so the native server runs them after
+  the active turn.
 """
 
 from __future__ import annotations
@@ -222,9 +224,9 @@ class NativeServerHarness(Executor):
         """
         Inject a mid-session message (steer-or-queue).
 
-        OpenCode has no live-steer endpoint, so the message is admitted as
-        a new prompt; the native server's own queue promotes it when the
-        active turn finishes.
+        The prompt is marked ``metadata["delivery"] = "queue"`` so a native
+        server with an inbox (OpenCode) runs it after the active turn instead
+        of steering it.
 
         :param session_key: Adapter session key (unused).
         :param content: User-supplied content.
@@ -234,6 +236,7 @@ class NativeServerHarness(Executor):
         prompt = self._build_prompt(content)
         if prompt is None or prompt.is_empty():
             return False
+        prompt = _with_queue_delivery(prompt)
         async with self._inject_lock:
             # Promoted queued messages have no system_prompt of their own —
             # reuse the value cached by the most recent normal run_turn call
@@ -293,3 +296,15 @@ def _with_system_prompt(prompt: NativePrompt, system_prompt: str) -> NativePromp
     import dataclasses
 
     return dataclasses.replace(prompt, system_prompt=system_prompt)
+
+
+def _with_queue_delivery(prompt: NativePrompt) -> NativePrompt:
+    """
+    Return a copy of *prompt* marked for queued delivery.
+
+    :param prompt: The prompt to copy.
+    :returns: A prompt whose ``metadata["delivery"]`` is ``"queue"``.
+    """
+    import dataclasses
+
+    return dataclasses.replace(prompt, metadata={**prompt.metadata, "delivery": "queue"})

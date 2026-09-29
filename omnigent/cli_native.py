@@ -507,7 +507,7 @@ def register_native_commands(cli: click.Group) -> None:
         # :param resume: None, picker sentinel, or a conversation id.
         # :param session_id: Legacy ``--session`` id; mutually exclusive with ``--resume``.
         # :param model: OpenCode model id pinned on the wrapper spec.
-        # :param opencode_args: Pass-through args persisted for the ``opencode attach`` TUI.
+        # :param opencode_args: Pass-through args persisted for the ``opencode --server`` TUI.
         # NOTE: no ``--command`` flag — override the opencode binary via
         # ``OMNIGENT_OPENCODE_PATH`` or ``harness.opencode-native.command`` config.
         # (opencode-native resolves its binary on the runner side; if a spec/env

@@ -1707,6 +1707,48 @@ async def test_fork_cursor_pi_native_carry_gating(
 
 
 @pytest.mark.parametrize(
+    "harness,expect_resume_source",
+    [
+        # cursor's conversation is server-backed: it can never clone the source.
+        ("cursor-native", False),
+        # opencode clones the source session natively when the source DB is
+        # reachable, so the route keeps the source-session directive for it.
+        ("opencode-native", True),
+    ],
+)
+@pytest.mark.asyncio
+async def test_fork_preamble_harness_source_directive(
+    monkeypatch: pytest.MonkeyPatch,
+    harness: str,
+    expect_resume_source: bool,
+) -> None:
+    """A same-agent opencode fork keeps the source native session directive."""
+    conv = _make_conversation()
+    conv_store = _ConversationStore(
+        conversations={"e9f8f58523cec9a57d3bdf93be543e8c": conv},
+        items_by_conv={
+            "e9f8f58523cec9a57d3bdf93be543e8c": [
+                _make_item("9980c8a9248139f14f4165e5d53088aa", "Hi")
+            ]
+        },
+    )
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.get_agent_cache",
+        lambda: _StubAgentCache({"087b7cb7ac30abf4debfaa578d052ec6": harness}),
+    )
+    client = TestClient(_build_app(conv_store))
+
+    resp = client.post("/v1/sessions/e9f8f58523cec9a57d3bdf93be543e8c/fork", json={})
+
+    assert resp.status_code == 201, f"Expected 201, got {resp.status_code}: {resp.text}"
+    fork_call = conv_store.fork_calls[0]
+    assert fork_call["carry_history_into_native"] is True
+    assert fork_call["resume_source_native_session"] is expect_resume_source, (
+        f"A {harness} fork should pass resume_source_native_session={expect_resume_source}."
+    )
+
+
+@pytest.mark.parametrize(
     "harness,expect_carry",
     [
         # Reversed native spellings ("native-claude" / "native-codex") are

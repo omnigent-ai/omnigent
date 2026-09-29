@@ -496,6 +496,9 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         shell_tool_prompt=_BASH_PROMPT,
         instruction_delivery=_ID.NOT_DELIVERED,
     ),
+    # OpenCode 2.x: streaming is backed by session.text.delta /
+    # session.reasoning.delta events (see tests/fixtures/opencode_v2/events.ndjson).
+    # Prompts carry delivery "steer" or "queue"; files carry images; /compact is native.
     "opencode-native": _C(
         _IM.NATIVE_SERVER,
         _EL.SSE_PERMISSION,
@@ -506,10 +509,15 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         subagents=True,
         interrupt=True,
         streaming=True,
+        steering=True,
+        live_queue=True,
+        images=True,
+        compaction=True,
         fork_history=_FH.PREAMBLE,
         # NATIVE_SERVER, not driven by the bench's native-tui tool probe, so
         # shell_tool_* stay None.
-        instruction_delivery=_ID.COMPOSED_PER_TURN,
+        # The composed prompt is written once per launch to the per-session AGENTS.md.
+        instruction_delivery=_ID.COMPOSED_SESSION_SNAPSHOT,
     ),
     # devin-native wraps the resident `devin` TUI. Every axis below was
     # live-verified against devin 3000.10.21:

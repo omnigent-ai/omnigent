@@ -5936,6 +5936,15 @@ describe("NewChatLandingScreen", () => {
       warning: "Pi has an outdated CLI on machine-1 — run omni setup",
     },
     {
+      id: "a_opencode",
+      name: "opencode-native-ui",
+      displayName: "OpenCode",
+      harness: "opencode-native",
+      readiness: "version-too-low",
+      badgeName: "outdated",
+      warning: "OpenCode needs OpenCode 2.0 on machine-1 — run npm i -g @opencode/cli@~2.0.18",
+    },
+    {
       id: "a_polly",
       name: "polly",
       displayName: "Polly",

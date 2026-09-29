@@ -294,6 +294,10 @@ omnigent copilot                     # GitHub Copilot (SDK harness, via `omnigen
 `omnigent agy` requires agy 1.1.13 or newer. When `GEMINI_API_KEY` is set,
 direct Gemini API authentication takes precedence over agy's saved OAuth login.
 
+`omnigent opencode` requires OpenCode 2.0.x (`npm i -g @opencode/cli@~2.0.18`).
+Its free models need no sign-in; run `opencode auth login` to add your own
+providers. See the [OpenCode harness guide](docs/opencode-native.md).
+
 Using OpenClaw? See the [OpenClaw integration guide](docs/openclaw.md) to import
 its coding agents or drive a live OpenClaw Gateway session over ACP.
 

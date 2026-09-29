@@ -8254,12 +8254,12 @@ def _agent_carries_native_fork_history_impl(agent: Agent) -> bool:
 def _agent_carries_cursor_fork_history(agent: Agent) -> bool:
     """Return whether *agent*'s native harness carries FORK history via preamble.
 
-    Cursor's conversation is server-backed and opencode has no history-import
-    API, so neither can seed a local store for a rebuilt resume; instead the
-    runner replays prior turns as a text preamble on the fork (cursor: the
-    first message; opencode: a ``noReply`` context message). Fork-only —
-    switch-agent does not call this, so switching into one still launches fresh.
-    Returns ``False`` when the bundle can't be loaded.
+    Cursor's conversation is server-backed and opencode keeps one store per
+    conversation, so neither can seed a local store for a rebuilt resume; the
+    runner replays prior turns as a text preamble on the fork (opencode first
+    tries a native fork of the source session). Fork-only — switch-agent does
+    not call this, so switching into one still launches fresh. Returns
+    ``False`` when the bundle can't be loaded.
 
     :param agent: The agent whose harness to classify.
     :returns: ``True`` for the cursor-native / opencode-native harnesses.
@@ -8275,6 +8275,25 @@ def _agent_carries_cursor_fork_history(agent: Agent) -> bool:
     except Exception:  # noqa: BLE001
         return False
     return canonicalize_harness(spec.executor.harness_kind) in _CURSOR_FORK_HISTORY_HARNESSES
+
+
+def _agent_forks_opencode_native_session(agent: Agent) -> bool:
+    """Return whether *agent* runs opencode-native, which can fork the source natively.
+
+    :param agent: The fork target agent.
+    :returns: ``True`` when the target harness is ``opencode-native``.
+    """
+    from omnigent.harness_aliases import canonicalize_harness
+
+    try:
+        spec = (
+            get_agent_cache()
+            .load(agent.id, agent.bundle_location, expand_env=agent.session_id is None)
+            .spec
+        )
+    except Exception:  # noqa: BLE001
+        return False
+    return canonicalize_harness(spec.executor.harness_kind) == "opencode-native"
 
 
 def _filesystem_attachment_in_history(
@@ -11340,6 +11359,7 @@ __all__ = [
     "_agent_carries_cursor_fork_history",
     "_agent_carries_native_fork_history",
     "_agent_carries_native_fork_history_impl",
+    "_agent_forks_opencode_native_session",
     "_agent_is_native",
     "_agent_is_native_impl",
     "_agent_provider_family",

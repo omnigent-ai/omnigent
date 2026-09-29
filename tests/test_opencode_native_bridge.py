@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
+import sqlite3
 import threading
 from pathlib import Path
 
@@ -16,10 +18,14 @@ from omnigent.harnesses.opencode_native.bridge import (
     bridge_dir_for_bridge_id,
     build_opencode_native_spawn_env,
     clear_bridge_state,
+    copy_opencode_database_for_fork,
     ensure_auth_secret,
+    opencode_db_path_for_bridge_dir,
     prepare_bridge_dir,
     read_bridge_state,
+    snapshot_opencode_database,
     update_active_message_id,
+    update_last_applied_model,
     update_last_event_id,
     update_model_override,
     user_opencode_config_path,
@@ -155,21 +161,133 @@ def test_write_cost_popup_config_writes_ap_routing(bridge_dir: Path) -> None:
     assert json.loads(path.read_text()) == {"ap_server_url": "http://h:1", "ap_auth_headers": {}}
 
 
-def test_write_opencode_policy_plugin(bridge_dir: Path) -> None:
+def test_write_opencode_policy_plugin_is_v2_package(bridge_dir: Path) -> None:
     path = write_opencode_policy_plugin(bridge_dir)
-    assert path.name == "omnigent-policy.js"
-    src = path.read_text(encoding="utf-8")
-    # The two phase hooks the reactive permission path can't reach.
-    assert '"chat.message"' in src  # REQUEST phase
-    assert '"tool.execute.after"' in src  # TOOL_RESULT phase
-    # Posts the proto phases + reads its coordinates from env.
+    # opencode 2.x only loads configured local plugins that are directories.
+    assert path == bridge_dir / "omnigent-policy"
+    assert path.is_dir()
+    package = json.loads((path / "package.json").read_text(encoding="utf-8"))
+    assert package["type"] == "module"
+    src = (path / "server.js").read_text(encoding="utf-8")
+    assert "export default" in src and 'id: "omnigent-policy"' in src
+    assert 'ctx.session.hook("prompt"' in src
+    assert 'ctx.tool.hook("execute.after"' in src
     assert "PHASE_REQUEST" in src and "PHASE_TOOL_RESULT" in src
     assert "OMNIGENT_POLICY_URL" in src and "OMNIGENT_SESSION_ID" in src
+    assert "OMNIGENT_POLICY_HEADERS" in src and "...POLICY_HEADERS" in src
     assert "/policies/evaluate" in src
-    # A function export so opencode's Object.values(mod) loader picks it up.
-    assert "export const OmnigentPolicyPlugin" in src
-    # Idempotent overwrite (re-launch ships fresh code, no error).
+    # No v1 shapes and no unresolved package import from a bare bridge dir.
+    for v1 in (
+        '"chat.message"',
+        "export const OmnigentPolicyPlugin",
+        "require(",
+        "@opencode/plugin",
+    ):
+        assert v1 not in src
+    # Idempotent overwrite.
     assert write_opencode_policy_plugin(bridge_dir) == path
+
+
+_PLUGIN_HARNESS = r"""
+import path from "node:path"
+import { pathToFileURL } from "node:url"
+const [, , pluginDir, verdictJson, mode] = process.argv
+const calls = []
+globalThis.fetch = async (url, init) => {
+  calls.push({ url, body: JSON.parse(init.body) })
+  if (mode === "throw") throw new Error("connection refused")
+  return { ok: true, json: async () => JSON.parse(verdictJson) }
+}
+const modUrl = pathToFileURL(path.join(pluginDir, "server.js")).href
+const mod = await import(modUrl)
+const hooks = {}
+const register = (domain) => async (name, cb) => {
+  hooks[domain + "." + name] = cb
+  return { dispose: async () => {} }
+}
+await mod.default.setup({
+  session: { hook: register("session") },
+  tool: { hook: register("tool") },
+})
+const out = { id: mod.default.id, hooks: Object.keys(hooks).sort() }
+try {
+  await hooks["session.prompt"]({
+    sessionID: "s",
+    messageID: "m",
+    prompt: { text: "hi" },
+    delivery: "steer",
+  })
+  out.prompt = "allowed"
+} catch (e) {
+  out.prompt = "blocked: " + e.message
+}
+const ev = {
+  tool: "shell",
+  sessionID: "s",
+  status: "completed",
+  result: { content: "secret", output: { x: 1 } },
+}
+await hooks["tool.execute.after"](ev)
+out.result = ev.result
+out.calls = calls
+console.log(JSON.stringify(out))
+"""
+
+
+def _run_plugin(tmp_path: Path, plugin_dir: Path, verdict: dict, mode: str) -> dict:
+    import shutil
+    import subprocess
+
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is not installed")
+    harness = tmp_path / "harness.mjs"
+    harness.write_text(_PLUGIN_HARNESS, encoding="utf-8")
+    env = {
+        **os.environ,
+        "OMNIGENT_POLICY_URL": "http://srv/",
+        "OMNIGENT_SESSION_ID": "conv_1",
+        "OMNIGENT_RELAY_FILE": "",
+    }
+    proc = subprocess.run(
+        [node, str(harness), str(plugin_dir), json.dumps(verdict), mode],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=30,
+        check=True,
+    )
+    return json.loads(proc.stdout)
+
+
+def test_policy_plugin_denies_prompt_and_withholds_tool_result(
+    bridge_dir: Path, tmp_path: Path
+) -> None:
+    out = _run_plugin(
+        tmp_path,
+        write_opencode_policy_plugin(bridge_dir),
+        {"result": "POLICY_ACTION_DENY", "reason": "nope"},
+        "ok",
+    )
+    assert out["id"] == "omnigent-policy"
+    assert out["hooks"] == ["session.prompt", "tool.execute.after"]
+    assert out["prompt"] == "blocked: Omnigent policy blocked this prompt: nope"
+    assert out["result"] == {"content": "[Omnigent policy withheld this tool result: nope]"}
+    assert out["calls"][0] == {
+        "url": "http://srv/v1/sessions/conv_1/policies/evaluate",
+        "body": {"event": {"type": "PHASE_REQUEST", "target": "", "data": {"text": "hi"}}},
+    }
+    assert out["calls"][1]["body"]["event"] == {
+        "type": "PHASE_TOOL_RESULT",
+        "target": "shell",
+        "data": {"result": "secret"},
+    }
+
+
+def test_policy_plugin_fails_open_on_transport_error(bridge_dir: Path, tmp_path: Path) -> None:
+    out = _run_plugin(tmp_path, write_opencode_policy_plugin(bridge_dir), {}, "throw")
+    assert out["prompt"] == "allowed"
+    assert out["result"] == {"content": "secret", "output": {"x": 1}}
 
 
 def test_update_last_event_id(bridge_dir: Path) -> None:
@@ -211,6 +329,26 @@ def test_spawn_env_points_at_bridge_dir(monkeypatch: pytest.MonkeyPatch, tmp_pat
     assert env["HARNESS_OPENCODE_NATIVE_REQUEST_SESSION_ID"] == "conv_abc"
 
 
+def test_bridge_root_follows_omnigent_data_dir(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(bridge, "_BRIDGE_ROOT", None)
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data"))
+    assert bridge.bridge_root() == tmp_path / "data" / "opencode-native"
+    assert bridge_dir_for_bridge_id("conv_abc").parent == tmp_path / "data" / "opencode-native"
+    env = build_opencode_native_spawn_env("conv_abc")
+    assert env["HARNESS_OPENCODE_NATIVE_BRIDGE_DIR"].startswith(str(tmp_path / "data"))
+
+
+def test_bridge_root_defaults_to_home_omnigent(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(bridge, "_BRIDGE_ROOT", None)
+    monkeypatch.delenv("OMNIGENT_DATA_DIR", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    assert bridge.bridge_root() == tmp_path / ".omnigent" / "opencode-native"
+
+
 def test_spawn_env_bridge_id_override(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setattr(bridge, "_BRIDGE_ROOT", tmp_path / "opencode-native")
     env = build_opencode_native_spawn_env("conv_abc", bridge_id="bridge_xyz")
@@ -218,30 +356,91 @@ def test_spawn_env_bridge_id_override(monkeypatch: pytest.MonkeyPatch, tmp_path:
     assert env["HARNESS_OPENCODE_NATIVE_REQUEST_SESSION_ID"] == "conv_abc"
 
 
+def _user_share(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
+    share = tmp_path / "user-share"
+    (share / "opencode").mkdir(parents=True)
+    monkeypatch.setenv("XDG_DATA_HOME", str(share))
+    monkeypatch.delenv("OPENCODE_DB", raising=False)
+    monkeypatch.setattr(bridge, "_BRIDGE_ROOT", tmp_path / "opencode-native")
+    return share
+
+
 def test_seed_opencode_auth_copies_user_auth(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """The user's auth.json is copied into the per-session XDG_DATA_HOME (0600)."""
-    user_data = tmp_path / "user-share"
-    (user_data / "opencode").mkdir(parents=True)
-    (user_data / "opencode" / "auth.json").write_text('{"anthropic": {"type": "api"}}')
-    monkeypatch.setenv("XDG_DATA_HOME", str(user_data))
-
+    share = _user_share(monkeypatch, tmp_path)
+    (share / "opencode" / "auth.json").write_text('{"anthropic": {"type": "api", "key": "k"}}')
     bridge_dir = bridge.prepare_bridge_dir("conv_seed")
     dest = bridge.seed_opencode_auth(bridge_dir)
-    assert dest is not None and dest.is_file()
     assert dest == bridge.xdg_data_home_for_bridge_dir(bridge_dir) / "opencode" / "auth.json"
-    assert "anthropic" in dest.read_text()
+    assert json.loads(dest.read_text()) == {"anthropic": {"type": "api", "key": "k"}}
     assert (os.stat(dest).st_mode & 0o777) == 0o600
+    assert bridge.seeded_provider_ids(bridge_dir) == frozenset({"anthropic"})
+
+
+def test_seed_opencode_auth_merges_v2_db_credentials(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """v2-only logins live in SQLite; they are written in legacy shape so the
+    per-session DB's one-time import picks them up."""
+    share = _user_share(monkeypatch, tmp_path)
+    (share / "opencode" / "auth.json").write_text(
+        '{"anthropic": {"type": "api", "key": "stale"}, "groq": {"type": "api", "key": "g"}}'
+    )
+    monkeypatch.setattr(
+        "omnigent.onboarding.opencode_auth.stored_v2_credentials",
+        lambda db_path=None: {"anthropic": {"type": "api", "key": "fresh"}},
+    )
+    bridge_dir = bridge.prepare_bridge_dir("conv_merge")
+    dest = bridge.seed_opencode_auth(bridge_dir)
+    assert dest is not None
+    assert json.loads(dest.read_text()) == {
+        "anthropic": {"type": "api", "key": "fresh"},
+        "groq": {"type": "api", "key": "g"},
+    }
+
+
+def test_seed_opencode_auth_merges_real_v2_db(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A real v2 SQLite ``credential`` row (no mocking) merges into the seeded file."""
+    import sqlite3
+
+    share = _user_share(monkeypatch, tmp_path)
+    (share / "opencode" / "auth.json").write_text('{"groq": {"type": "api", "key": "g"}}')
+    db_path = share / "opencode" / "opencode.db"
+    conn = sqlite3.connect(db_path)
+    conn.execute(
+        "CREATE TABLE credential (id TEXT PRIMARY KEY, integration_id TEXT, label TEXT NOT NULL,"
+        " value TEXT NOT NULL, connector_id TEXT, method_id TEXT, active INTEGER,"
+        " time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL)"
+    )
+    conn.execute(
+        "INSERT INTO credential VALUES ('cred_0', 'anthropic', 'x', ?, NULL, NULL, 1, 0, 1)",
+        (json.dumps({"type": "key", "key": "fresh"}),),
+    )
+    conn.commit()
+    conn.close()
+
+    bridge_dir = bridge.prepare_bridge_dir("conv_real_db")
+    dest = bridge.seed_opencode_auth(bridge_dir)
+    assert dest is not None
+    assert json.loads(dest.read_text()) == {
+        "anthropic": {"type": "api", "key": "fresh"},
+        "groq": {"type": "api", "key": "g"},
+    }
 
 
 def test_seed_opencode_auth_noop_without_source(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """No user auth.json → no-op (returns None), e.g. on a remote runner."""
+    """No auth.json and no v2 DB → None (e.g. on a remote runner)."""
     monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "empty-share"))
+    monkeypatch.delenv("OPENCODE_DB", raising=False)
+    monkeypatch.setattr(bridge, "_BRIDGE_ROOT", tmp_path / "opencode-native")
     bridge_dir = bridge.prepare_bridge_dir("conv_noseed")
     assert bridge.seed_opencode_auth(bridge_dir) is None
+    assert bridge.seeded_provider_ids(bridge_dir) == frozenset()
 
 
 def test_user_opencode_config_path_default_location(
@@ -296,22 +495,6 @@ def test_user_opencode_config_path_prefers_jsonc(
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "pref"))
     path = user_opencode_config_path()
     assert path is not None and path.name == "opencode.jsonc"
-
-
-def test_policy_plugin_merges_routing_headers(bridge_dir: Path) -> None:
-    """The generated policy plugin merges OMNIGENT_POLICY_HEADERS into its
-    /policies/evaluate POST.
-
-    The runner bakes the full routing header map (bearer + workspace / deployment
-    selectors) into that env var, so the out-of-process plugin's callbacks reach
-    the same server instance as the runner instead of a different one.
-    """
-    src = write_opencode_policy_plugin(bridge_dir).read_text(encoding="utf-8")
-    assert "OMNIGENT_POLICY_HEADERS" in src
-    # The routing map is spread into the request headers.
-    assert "...POLICY_HEADERS" in src
-    # The old bearer-only env var is fully removed.
-    assert "OMNIGENT_POLICY_AUTH" not in src
 
 
 # ── owner-pid marker + orphan prune (bridge-dir reaping) ────────────────────
@@ -417,3 +600,223 @@ def test_prune_orphaned_bridge_dirs_only_removes_dead_owners(
     assert not dead_dir.exists()
     assert live_dir.exists()
     assert unmarked_dir.exists()
+
+
+def test_last_applied_model_round_trips(bridge_dir: Path) -> None:
+    write_bridge_state(bridge_dir, _state(bridge_dir, last_applied_model="acme/model-a"))
+    loaded = read_bridge_state(bridge_dir)
+    assert loaded is not None
+    assert loaded.last_applied_model == "acme/model-a"
+    raw = json.loads((bridge_dir / "state.json").read_text(encoding="utf-8"))
+    assert raw["last_applied_model"] == "acme/model-a"
+
+
+def test_last_applied_model_absent_in_older_state_reads_none(bridge_dir: Path) -> None:
+    write_bridge_state(bridge_dir, _state(bridge_dir))
+    path = bridge_dir / "state.json"
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    raw.pop("last_applied_model")
+    path.write_text(json.dumps(raw), encoding="utf-8")
+    loaded = read_bridge_state(bridge_dir)
+    assert loaded is not None
+    assert loaded.last_applied_model is None
+
+
+def test_update_last_applied_model(bridge_dir: Path) -> None:
+    assert update_last_applied_model(bridge_dir, "acme/model-a") is False  # no state yet
+    write_bridge_state(bridge_dir, _state(bridge_dir, model_override="openai/gpt-5.5"))
+    loaded = read_bridge_state(bridge_dir)
+    assert loaded is not None
+    assert loaded.last_applied_model is None
+
+    assert update_last_applied_model(bridge_dir, " openai/gpt-5.5 ") is True
+    loaded = read_bridge_state(bridge_dir)
+    assert loaded is not None
+    assert loaded.last_applied_model == "openai/gpt-5.5"
+    assert loaded.model_override == "openai/gpt-5.5"
+
+    assert update_last_applied_model(bridge_dir, None) is True
+    loaded = read_bridge_state(bridge_dir)
+    assert loaded is not None
+    assert loaded.last_applied_model is None
+
+
+class _KeyClient:
+    def __init__(self, *, fail: str | None = None) -> None:
+        self.calls: list[tuple[str, str]] = []
+        self._fail = fail
+
+    async def connect_provider_key(self, provider_id: str, api_key: str) -> bool:
+        self.calls.append((provider_id, api_key))
+        if provider_id == self._fail:
+            raise RuntimeError("boom")
+        return True
+
+
+async def test_connect_env_provider_keys_skips_stored_and_failures() -> None:
+    client = _KeyClient(fail="groq")
+    connected = await bridge.connect_env_provider_keys(
+        client,
+        stored={"anthropic"},
+        environ={
+            "ANTHROPIC_API_KEY": "a",
+            "OPENAI_API_KEY": " o ",
+            "GEMINI_API_KEY": "g1",
+            "GOOGLE_GENERATIVE_AI_API_KEY": "g2",
+            "GROQ_API_KEY": "q",
+        },
+    )
+    assert connected == ["openai", "google"]
+    # google connects once (first matching var); groq failed and is skipped.
+    assert client.calls == [("openai", "o"), ("google", "g1"), ("groq", "q")]
+
+
+async def test_connect_env_provider_keys_noop_without_env() -> None:
+    client = _KeyClient()
+    assert await bridge.connect_env_provider_keys(client, environ={}) == []
+    assert client.calls == []
+
+
+def _make_opencode_db(path: Path, *, claimed: bool) -> None:
+    """Create a minimal v2-shaped OpenCode DB with one session row."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(path) as conn:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("CREATE TABLE session_v2 (id TEXT PRIMARY KEY, time_suspended INTEGER)")
+        conn.execute(
+            "INSERT INTO session_v2 (id, time_suspended) VALUES (?, ?)",
+            ("ses_src", 1_700_000_000_000 if claimed else None),
+        )
+    conn.close()
+
+
+def test_copy_opencode_database_for_fork_releases_claims(tmp_path: Path) -> None:
+    source_dir = tmp_path / "source"
+    dest_dir = tmp_path / "dest"
+    dest_dir.mkdir()
+    source = opencode_db_path_for_bridge_dir(source_dir)
+    source.parent.mkdir(parents=True, exist_ok=True)
+    # Hold the writer connection open, as a live opencode server would, so the
+    # copy must read the session while the source WAL is still uncheckpointed.
+    writer = sqlite3.connect(source)
+    writer.execute("PRAGMA journal_mode=WAL")
+    writer.execute("CREATE TABLE session_v2 (id TEXT PRIMARY KEY, time_suspended INTEGER)")
+    writer.execute(
+        "INSERT INTO session_v2 (id, time_suspended) VALUES (?, ?)",
+        ("ses_src", 1_700_000_000_000),
+    )
+    writer.commit()
+
+    assert copy_opencode_database_for_fork(source_dir, dest_dir) is True
+
+    dest = opencode_db_path_for_bridge_dir(dest_dir)
+    with sqlite3.connect(dest) as conn:
+        rows = conn.execute("SELECT id, time_suspended FROM session_v2").fetchall()
+    conn.close()
+    assert rows == [("ses_src", None)], "a copied in-flight claim would re-run the source turn"
+    assert (dest.stat().st_mode & 0o777) == 0o600
+    # The source keeps its own claim; only the copy is released.
+    assert writer.execute("SELECT time_suspended FROM session_v2").fetchone()[0] is not None
+    writer.close()
+
+
+def test_copy_opencode_database_for_fork_preserves_uncheckpointed_source_wal(
+    tmp_path: Path,
+) -> None:
+    """A crashed server's WAL is never checkpointed by closing a connection on it."""
+    source_dir = tmp_path / "source"
+    dest_dir = tmp_path / "dest"
+    dest_dir.mkdir()
+    source = opencode_db_path_for_bridge_dir(source_dir)
+    source.parent.mkdir(parents=True, exist_ok=True)
+
+    # Build the WAL contents on a scratch file, then snapshot its raw bytes to
+    # `source` while the writer is still open. Closing the writer afterwards
+    # only checkpoints the scratch file, not the copied `source` files, so
+    # `source` ends up exactly like a crashed server: main db + uncheckpointed
+    # -wal/-shm and no live connection.
+    scratch = tmp_path / "scratch.db"
+    writer = sqlite3.connect(scratch)
+    writer.execute("PRAGMA journal_mode=WAL")
+    writer.execute("PRAGMA wal_autocheckpoint=0")
+    writer.execute("CREATE TABLE session_v2 (id TEXT PRIMARY KEY, time_suspended INTEGER)")
+    writer.execute("INSERT INTO session_v2 (id, time_suspended) VALUES ('ses_src', NULL)")
+    writer.commit()
+    for suffix in ("", "-wal", "-shm"):
+        shutil.copy2(
+            scratch.with_name(scratch.name + suffix), source.with_name(source.name + suffix)
+        )
+    writer.close()
+
+    before = {
+        suffix: source.with_name(source.name + suffix).stat()
+        for suffix in ("", "-wal", "-shm")
+        if source.with_name(source.name + suffix).exists()
+    }
+    assert "-wal" in before, "the fixture must leave rows sitting in an uncheckpointed WAL"
+
+    assert copy_opencode_database_for_fork(source_dir, dest_dir) is True
+
+    with sqlite3.connect(opencode_db_path_for_bridge_dir(dest_dir)) as conn:
+        rows = conn.execute("SELECT id FROM session_v2").fetchall()
+    conn.close()
+    assert rows == [("ses_src",)]
+    # The main db and -wal hold the durable data and must be byte-for-byte
+    # untouched. The -shm reader-lock index is expected to be re-touched by
+    # any connection (even read-only) but its size never changes.
+    for suffix in ("", "-wal"):
+        after = source.with_name(source.name + suffix).stat()
+        assert after.st_size == before[suffix].st_size
+        assert after.st_mtime == before[suffix].st_mtime
+    assert source.with_name(source.name + "-shm").stat().st_size == before["-shm"].st_size
+
+
+def test_copy_opencode_database_for_fork_missing_source(tmp_path: Path) -> None:
+    (tmp_path / "dest").mkdir()
+    assert copy_opencode_database_for_fork(tmp_path / "source", tmp_path / "dest") is False
+    assert not opencode_db_path_for_bridge_dir(tmp_path / "dest").exists()
+
+
+def test_copy_opencode_database_for_fork_unknown_schema_leaves_no_copy(tmp_path: Path) -> None:
+    source_dir = tmp_path / "source"
+    source_dir.mkdir()
+    dest_dir = tmp_path / "dest"
+    dest_dir.mkdir()
+    with sqlite3.connect(opencode_db_path_for_bridge_dir(source_dir)) as conn:
+        conn.execute("CREATE TABLE unrelated (id TEXT)")
+    conn.close()
+
+    assert copy_opencode_database_for_fork(source_dir, dest_dir) is False
+    assert not opencode_db_path_for_bridge_dir(dest_dir).exists()
+
+
+def test_snapshot_opencode_database_copies_any_source_path(tmp_path: Path) -> None:
+    """Session import snapshots the user's own DB, which is not in a bridge dir."""
+    user_db = tmp_path / "share" / "opencode" / "custom.db"
+    _make_opencode_db(user_db, claimed=True)
+    dest_dir = tmp_path / "import-bridge"
+
+    assert snapshot_opencode_database(user_db, dest_dir) is True
+
+    with sqlite3.connect(opencode_db_path_for_bridge_dir(dest_dir)) as conn:
+        rows = conn.execute("SELECT id, time_suspended FROM session_v2").fetchall()
+    conn.close()
+    assert rows == [("ses_src", None)]
+    with sqlite3.connect(user_db) as conn:
+        claim = conn.execute("SELECT time_suspended FROM session_v2").fetchone()[0]
+    conn.close()
+    assert claim is not None, "the user's live store must never be modified"
+
+
+def test_snapshot_opencode_database_source_path_with_uri_special_chars(tmp_path: Path) -> None:
+    """A source path containing '#', '%' must not break the sqlite URI."""
+    user_db = tmp_path / "weird #dir% here" / "custom.db"
+    _make_opencode_db(user_db, claimed=True)
+    dest_dir = tmp_path / "import-bridge"
+
+    assert snapshot_opencode_database(user_db, dest_dir) is True
+
+    with sqlite3.connect(opencode_db_path_for_bridge_dir(dest_dir)) as conn:
+        rows = conn.execute("SELECT id, time_suspended FROM session_v2").fetchall()
+    conn.close()
+    assert rows == [("ses_src", None)]

@@ -14,6 +14,11 @@ import omnigent._platform as _platform
 from omnigent.onboarding import harness_install as hi
 from omnigent.onboarding.provider_config import ANTHROPIC_FAMILY, GEMINI_FAMILY, OPENAI_FAMILY
 
+# Captured before the autouse fixture below monkeypatches ``subprocess.run``
+# (on the shared module object), so tests that need a real subprocess call
+# can bypass that stub.
+_REAL_SUBPROCESS_RUN = subprocess.run
+
 
 @pytest.fixture(autouse=True)
 def _stub_cli_fallback_dirs(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -773,6 +778,101 @@ def test_install_harness_cli_runs_npm_then_rechecks(monkeypatch: pytest.MonkeyPa
     assert calls == [["npm", "install", "-g", "@openai/codex"]]
 
 
+def test_opencode_install_spec_pins_v2_cli() -> None:
+    """OpenCode installs the v2 ``@opencode/cli`` package, pinned to 2.0.x."""
+    spec = hi.harness_install_spec(hi.OPENCODE_KEY)
+    assert spec is not None
+    assert spec.binary == "opencode"
+    assert spec.package == "@opencode/cli@~2.0.18"
+
+
+def test_opencode_install_never_removes_v1_package() -> None:
+    """Omnigent doesn't remove packages: it checks for v1 ``opencode-ai``
+    and stops with a message instead of uninstalling it."""
+    argv = hi.harness_install_command(hi.OPENCODE_KEY)
+    assert argv[:2] == ["bash", "-c"]
+    script = argv[2]
+    assert "npm rm -g opencode-ai >" not in script
+    assert script.index("npm ls -g opencode-ai") < script.index(
+        "npm install -g @opencode/cli@~2.0.18"
+    )
+    assert hi.harness_install_display(hi.OPENCODE_KEY) == ("npm install -g @opencode/cli@~2.0.18")
+
+
+def test_install_harness_cli_runs_opencode_guard_and_install(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The one-click install runs the v1 guard and the v2 install in one argv."""
+    calls: list[list[str]] = []
+    state = {"installed": False}
+
+    def _which(name: str) -> str | None:
+        if name == "bash":
+            return "/bin/bash"
+        if name == "opencode" and state["installed"]:
+            return "/usr/local/bin/opencode"
+        return None
+
+    def _run(argv: list[str], *, check: bool = False, timeout: float | None = None):
+        calls.append(argv)
+        state["installed"] = True
+        return subprocess.CompletedProcess(args=argv, returncode=0)
+
+    monkeypatch.setattr(hi.shutil, "which", _which)
+    monkeypatch.setattr(hi.subprocess, "run", _run)
+
+    assert hi.install_harness_cli(hi.OPENCODE_KEY) is True
+    assert calls == [["bash", "-c", hi._OPENCODE_INSTALL_SCRIPT]]
+
+
+def test_opencode_install_script_blocks_when_v1_present(tmp_path: Path) -> None:
+    """Run the real install script through bash with a fake npm that reports
+    ``opencode-ai`` installed: it must exit 1, print the message on stderr,
+    and never invoke ``npm rm`` or ``npm install``."""
+    npm_log = tmp_path / "npm-calls.log"
+    fake_npm = tmp_path / "npm"
+    fake_npm.write_text(
+        f'#!/bin/bash\necho "$*" >> "{npm_log}"\nif [ "$1" = "ls" ]; then exit 0; fi\nexit 0\n'
+    )
+    fake_npm.chmod(0o755)
+
+    result = _REAL_SUBPROCESS_RUN(
+        ["bash", "-c", hi._OPENCODE_INSTALL_SCRIPT],
+        env={**os.environ, "PATH": f"{tmp_path}:{os.environ['PATH']}"},
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 1
+    assert "opencode-ai" in result.stderr
+    assert "Omnigent does not remove packages" in result.stderr
+    calls = npm_log.read_text().splitlines() if npm_log.exists() else []
+    assert not any(call.startswith("rm") for call in calls)
+    assert not any(call.startswith("install") for call in calls)
+
+
+def test_opencode_install_script_installs_when_v1_absent(tmp_path: Path) -> None:
+    """When ``npm ls -g opencode-ai`` fails (not installed), the script
+    proceeds straight to ``npm install -g @opencode/cli@~2.0.18``."""
+    npm_log = tmp_path / "npm-calls.log"
+    fake_npm = tmp_path / "npm"
+    fake_npm.write_text(
+        f'#!/bin/bash\necho "$*" >> "{npm_log}"\nif [ "$1" = "ls" ]; then exit 1; fi\nexit 0\n'
+    )
+    fake_npm.chmod(0o755)
+
+    result = _REAL_SUBPROCESS_RUN(
+        ["bash", "-c", hi._OPENCODE_INSTALL_SCRIPT],
+        env={**os.environ, "PATH": f"{tmp_path}:{os.environ['PATH']}"},
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0
+    calls = npm_log.read_text().splitlines()
+    assert any(call.startswith("install -g @opencode/cli@~2.0.18") for call in calls)
+
+
 def test_install_harness_cli_runs_hermes_installer_then_rechecks(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1296,7 +1396,7 @@ def test_ui_setup_steps_generic_for_non_installable() -> None:
 @pytest.mark.parametrize(
     "key,min_version,max_version_exclusive",
     [
-        (hi.OPENCODE_KEY, "1.17.7", "1.19.0"),
+        (hi.OPENCODE_KEY, "2.0.0", "3.0.0"),
         (hi.CURSOR_KEY, "2026.06.02", None),
         (hi.KIMI_KEY, "0.7.0", None),
         (ANTHROPIC_FAMILY, "2.1.161", None),
@@ -1322,11 +1422,11 @@ def test_versioned_specs_declare_bounds(
 @pytest.mark.parametrize(
     "version,expected",
     [
-        ("1.17.6", False),  # below min
-        ("1.19.0", False),  # at max exclusive
-        ("2.0.0", False),  # above max
-        ("1.17.8", True),  # inside range
-        ("1.18.16", True),  # inside range (1.18.x)
+        ("1.18.16", False),  # v1 line, below min
+        ("3.0.0", False),  # at max exclusive
+        ("3.1.0", False),  # above max
+        ("2.0.0", True),  # min inclusive
+        ("opencode v2.0.18", True),  # real v2 --version output
     ],
 )
 def test_harness_cli_installed_checks_version_for_versioned_specs(
@@ -1338,7 +1438,7 @@ def test_harness_cli_installed_checks_version_for_versioned_specs(
 
     def _run(argv: list[str], **k: object) -> subprocess.CompletedProcess[str]:
         if len(argv) >= 2 and argv[1] == "--version":
-            # OpenCode's supported range is [1.17.7, 1.19.0).
+            # OpenCode's supported range is [2.0.0, 3.0.0).
             return subprocess.CompletedProcess(
                 args=argv, returncode=0, stdout=f"{version}\n", stderr=""
             )
@@ -1511,7 +1611,7 @@ def test_harness_cli_installed_true_when_version_in_range(
 
     def _run(argv: list[str], **k: object) -> subprocess.CompletedProcess[str]:
         if len(argv) >= 2 and argv[1] == "--version":
-            out = "1.17.8\n"
+            out = "opencode v2.0.18\n"
             return subprocess.CompletedProcess(args=argv, returncode=0, stdout=out, stderr="")
         raise AssertionError(f"unexpected subprocess: {argv!r}")
 

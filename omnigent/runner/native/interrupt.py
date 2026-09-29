@@ -19,11 +19,10 @@ interrupt (MCP-startup + app-server ``turn/interrupt``) keep dedicated methods
 (so nine interrupt handlers total); claude stop is likewise special-cased and
 codex/pi alias stop to their interrupt handler (so seven stop handlers total).
 
-Coverage note: antigravity-native and opencode-native have no handler here and
-:meth:`interrupt` / :meth:`stop` return ``None`` for them, so the caller falls
-through to the in-process turn cancel — unchanged from before this seam. Wiring
-their native interrupt (agy ``interrupt_turn`` / opencode ``client.abort``) is a
-deferred follow-up.
+Coverage note: antigravity-native has no handler here and :meth:`interrupt` /
+:meth:`stop` return ``None`` for it, so the caller falls through to the
+in-process turn cancel. opencode-native interrupts through its server's
+``POST /api/session/{id}/interrupt`` and aliases stop to interrupt.
 """
 
 from __future__ import annotations
@@ -293,8 +292,8 @@ def native_cancel_capability(wrapper_label: str | None) -> str:
     wrapper label:
 
     * ``"stop"`` — Claude's dedicated stop, or a key in :data:`_UNIFORM_STOP`
-    * ``"best_effort"`` — remaining native agents (Codex/Pi alias stop to
-      interrupt; Antigravity/OpenCode have no stop handler)
+    * ``"best_effort"`` — remaining native agents (Codex/Pi/OpenCode alias
+      stop to interrupt; Antigravity has no stop handler)
     * ``"inprocess"`` — no native agent for this label
 
     :param wrapper_label: The work entry's ``omnigent.wrapper`` value.
@@ -337,7 +336,7 @@ class NativeInterruptRunner:
 
         :returns: A response when this harness has an interrupt handler, else
             ``None`` so the caller falls through to the in-process turn cancel
-            (antigravity/opencode).
+            (antigravity).
         """
         agent = native_coding_agent_for_harness(harness_name)
         if agent is None:
@@ -347,6 +346,8 @@ class NativeInterruptRunner:
             return await self._claude_interrupt(conv_id)
         if key == "codex":
             return await self._codex_interrupt(conv_id)
+        if key == "opencode":
+            return await self._opencode_interrupt(conv_id)
         spec = _UNIFORM_INTERRUPT.get(key)
         if spec is None:
             return None
@@ -367,7 +368,7 @@ class NativeInterruptRunner:
         key = agent.key
         if key == "claude":
             return await self._claude_stop(conv_id)
-        if key in ("codex", "pi"):
+        if key in ("codex", "pi", "opencode"):
             return await self.interrupt(harness_name, conv_id)
         spec = _UNIFORM_STOP.get(key)
         if spec is None:
@@ -649,5 +650,42 @@ class NativeInterruptRunner:
         finally:
             with contextlib.suppress(Exception):
                 await codex_client.close()
+        self._wake_parent_after_native_interrupt(conv_id)
+        return Response(status_code=204)
+
+    async def _opencode_interrupt(self, conv_id: str) -> Response | None:
+        from omnigent.harnesses.opencode_native import app_server as opencode_app_server
+        from omnigent.harnesses.opencode_native import bridge as opencode_bridge
+        from omnigent.harnesses.opencode_native.client import OpenCodeClientError
+
+        state = opencode_bridge.read_bridge_state(
+            opencode_bridge.bridge_dir_for_bridge_id(conv_id)
+        )
+        if state is None:
+            return None
+        client = opencode_app_server.client_for_state(
+            base_url=state.server_base_url,
+            auth_secret=state.auth_secret,
+            directory=state.workspace,
+        )
+        try:
+            await client.interrupt(state.opencode_session_id)
+        except (OpenCodeClientError, httpx.HTTPError) as exc:
+            self._logger.warning(
+                "OpenCode-native interrupt failed for session=%s", conv_id, exc_info=True
+            )
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "opencode_native_interrupt_failed",
+                    "detail": self._client_safe_error_detail(
+                        exc, context="opencode-native interrupt"
+                    ),
+                },
+            )
+        finally:
+            with contextlib.suppress(Exception):
+                await client.aclose()
+        # The forwarder publishes the idle edge from session.execution.interrupted.
         self._wake_parent_after_native_interrupt(conv_id)
         return Response(status_code=204)

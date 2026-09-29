@@ -13,26 +13,25 @@ an injected ``client_factory`` (tests), a running
 from __future__ import annotations
 
 import logging
-from collections.abc import AsyncIterator, Callable, Mapping
+from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from pathlib import Path
-from typing import TypeAlias
+from typing import TypeAlias, TypedDict
 
 from omnigent.harnesses.opencode_native.app_server import (
     OpenCodeNativeServer,
-    build_opencode_attach_args,
     client_for_state,
-    opencode_terminal_env,
 )
-from omnigent.harnesses.opencode_native.bridge import read_bridge_state
+from omnigent.harnesses.opencode_native.bridge import (
+    read_bridge_state,
+    update_last_applied_model,
+)
 from omnigent.harnesses.opencode_native.client import OpenCodeClient
 from omnigent.native.native_server_transport import (
     NativeEvent,
     NativeLaunchConfig,
-    NativePermissionDecision,
     NativePrompt,
     NativeServerHandle,
 )
-from omnigent.util.json_types import JsonObject as _JsonObject
 
 _logger = logging.getLogger(__name__)
 
@@ -44,86 +43,95 @@ _JsonMapping: TypeAlias = Mapping[str, object]
 # annotation for ``OpenCodeHttpTransport(client_factory=...)``; export it so the
 # alias reads as intended public API (its only other use is a PEP 563 stringified
 # annotation, which static analysis can't see as a load).
-__all__ = ["ClientFactory", "OpenCodeHttpTransport", "build_prompt_payload"]
+__all__ = [
+    "ClientFactory",
+    "OpenCodeHttpTransport",
+    "PromptPayload",
+    "build_prompt_payload",
+    "split_model_id",
+]
 
 
-def build_prompt_payload(prompt: NativePrompt) -> _JsonObject:
+class PromptPayload(TypedDict):
+    """Keyword arguments for :meth:`OpenCodeClient.prompt`."""
+
+    text: str
+    files: list[dict[str, str]]
+    delivery: str
+
+
+def build_prompt_payload(
+    text: str,
+    attachments: Sequence[Mapping[str, object]],
+    *,
+    delivery: str = "steer",
+) -> PromptPayload:
     """
-    Build an OpenCode prompt request body from a :class:`NativePrompt`.
+    Build the ``POST /api/session/{id}/prompt`` fields for one prompt.
 
-    :param prompt: The normalized prompt.
-    :returns: A ``{"parts": [...], ...}`` body for ``POST
-        /session/{id}/message`` or ``/prompt_async``.
+    Attachments carrying a ``data:`` URI become ``files`` entries; OpenCode
+    decodes them server-side (images and PDFs as media, ``text/plain``
+    inlined as text). The system prompt and model are not prompt fields in
+    v2: instructions ship in the config and the model is switched per session.
+
+    :param text: User text.
+    :param attachments: ``input_image`` / ``input_file`` content blocks.
+    :param delivery: ``"steer"`` for a normal turn, ``"queue"`` for an
+        enqueued one.
+    :returns: ``{"text": ..., "files": [{"uri": ..., "name"?: ...}], "delivery": ...}``.
     """
-    parts: list[_JsonObject] = []
-    if prompt.text:
-        parts.append({"type": "text", "text": prompt.text})
-    for attachment in prompt.attachments:
-        part = _attachment_to_part(attachment)
-        if part is not None:
-            parts.append(part)
-    payload: _JsonObject = {"parts": parts}
-    if prompt.system_prompt:
-        payload["system"] = prompt.system_prompt
-    model = _split_model(prompt.model)
-    if model is not None:
-        payload["model"] = model
-    return payload
+    files: list[dict[str, str]] = []
+    for attachment in attachments:
+        entry = _attachment_to_file(attachment)
+        if entry is not None:
+            files.append(entry)
+    return {"text": text, "files": files, "delivery": delivery}
 
 
-def _attachment_to_part(attachment: _JsonMapping) -> _JsonObject | None:
+def _attachment_to_file(attachment: Mapping[str, object]) -> dict[str, str] | None:
     """
-    Convert an Omnigent attachment block into an OpenCode file part.
+    Convert an Omnigent attachment block into an OpenCode ``files`` entry.
 
     :param attachment: An ``input_image`` / ``input_file`` content block.
-    :returns: A ``FilePartInput`` dict, or ``None`` when unconvertible.
+    :returns: ``{"uri": "data:...", "name"?: ...}``, or ``None`` when the block
+        has no inline ``data:`` URI (OpenCode reads only ``data:`` and local
+        ``file:`` URIs, and a runner-side path is meaningless to it).
     """
     block_type = attachment.get("type")
     if block_type == "input_image":
-        url = attachment.get("image_url")
-        if isinstance(url, str) and url:
-            mime = _mime_from_data_uri(url) or "image/png"
-            return {"type": "file", "mime": mime, "url": url}
-    if block_type == "input_file":
-        url = attachment.get("file_data") or attachment.get("url")
-        if isinstance(url, str) and url:
-            mime = _mime_from_data_uri(url) or "application/octet-stream"
-            part: _JsonObject = {"type": "file", "mime": mime, "url": url}
-            filename = attachment.get("filename")
-            if isinstance(filename, str) and filename:
-                part["filename"] = filename
-            return part
-    return None
-
-
-def _mime_from_data_uri(uri: str) -> str | None:
-    """
-    Extract the MIME type from a ``data:`` URI.
-
-    :param uri: A data URI, e.g. ``"data:image/png;base64,..."``.
-    :returns: The MIME type, or ``None``.
-    """
-    if not uri.startswith("data:"):
+        uri = attachment.get("image_url")
+    elif block_type == "input_file":
+        uri = attachment.get("file_data") or attachment.get("url")
+    else:
         return None
-    head = uri[len("data:") :].split(",", 1)[0]
-    mime = head.split(";", 1)[0]
-    return mime or None
-
-
-def _split_model(model: str | None) -> dict[str, str] | None:
-    """
-    Split a ``provider/model`` id into the OpenCode prompt model object.
-
-    :param model: A model id, e.g. ``"anthropic/claude-opus-4"``; ``None``
-        means no pin.
-    :returns: ``{"providerID": ..., "modelID": ...}`` or ``None``.
-    """
-    if not model:
+    if not isinstance(uri, str) or not uri.startswith("data:"):
         return None
-    provider, sep, model_id = model.partition("/")
-    if sep and provider and model_id:
-        return {"providerID": provider, "modelID": model_id}
-    return None
+    entry = {"uri": uri}
+    filename = attachment.get("filename")
+    if isinstance(filename, str) and filename:
+        entry["name"] = filename
+    return entry
+
+
+def split_model_id(model: str) -> tuple[str, str, str | None] | None:
+    """
+    Split a qualified model ref into provider, model id, and optional variant.
+
+    The provider splits off at the first ``/`` (so a provider whose own model
+    id contains slashes, e.g. ``"openrouter/acme/model-x"``, keeps them); the
+    remainder then splits at the LAST ``#`` for an optional variant suffix.
+
+    :param model: e.g. ``"openrouter/acme/model-x#high"``.
+    :returns: ``("openrouter", "acme/model-x", "high")``, or ``None`` when
+        *model* has no provider prefix.
+    """
+    provider, sep, rest = model.partition("/")
+    if not sep or not provider or not rest:
+        return None
+    model_id, hash_sep, variant = rest.rpartition("#")
+    if not hash_sep:
+        return provider, rest, None
+    return provider, model_id, variant or None
 
 
 class OpenCodeHttpTransport:
@@ -151,6 +159,9 @@ class OpenCodeHttpTransport:
         self._server = server
         self._client_factory = client_factory
         self._directory = directory
+        # Fallback for when self._bridge_dir is None (e.g. tests using
+        # client_factory): the last model pushed via POST /model.
+        self._last_applied_model: str | None = None
 
     def _client(self) -> OpenCodeClient:
         """
@@ -203,39 +214,82 @@ class OpenCodeHttpTransport:
                 if existing is not None:
                     return existing.id
             created = await client.create_session(
-                {"title": f"omnigent:{launch.omnigent_session_id}"}
+                title=f"omnigent:{launch.omnigent_session_id}",
+                directory=launch.workspace,
             )
             return created.id
         finally:
             await client.aclose()
 
     async def send_prompt(self, session_id: str, prompt: NativePrompt) -> _JsonMapping:
-        """Inject a prompt via ``POST /session/{id}/prompt_async``."""
+        """Switch the model if needed, then inject via ``POST /api/session/{id}/prompt``."""
+        delivery = "queue" if prompt.metadata.get("delivery") == "queue" else "steer"
+        payload = build_prompt_payload(prompt.text, prompt.attachments, delivery=delivery)
         client = self._client()
         try:
-            return await client.prompt_async(session_id, build_prompt_payload(prompt))
+            if prompt.model:
+                await self._apply_model(client, session_id, prompt.model)
+            return await client.prompt(
+                session_id,
+                text=payload["text"],
+                files=payload["files"],
+                delivery=payload["delivery"],
+            )
         finally:
             await client.aclose()
 
+    async def _apply_model(self, client: OpenCodeClient, session_id: str, model: str) -> None:
+        """
+        Switch the OpenCode session to *model* when it differs from the last one applied.
+
+        The last applied model lives in bridge state so a respawned harness
+        process does not resend an unchanged switch every turn.
+
+        :param client: Open client for the session's server.
+        :param session_id: OpenCode session id.
+        :param model: Qualified ``provider/model`` id, e.g. ``"opencode/big-pickle"``.
+        :raises OpenCodeClientError: When OpenCode rejects the switch.
+        """
+        split = split_model_id(model)
+        if split is None:
+            _logger.warning("opencode-native: ignoring unqualified model id %r", model)
+            return
+        state = read_bridge_state(self._bridge_dir) if self._bridge_dir is not None else None
+        last_applied = state.last_applied_model if state is not None else self._last_applied_model
+        if last_applied == model:
+            return
+        provider_id, model_id, variant = split
+        await client.set_model(
+            session_id, provider_id=provider_id, model_id=model_id, variant=variant
+        )
+        self._last_applied_model = model
+        if self._bridge_dir is not None:
+            update_last_applied_model(self._bridge_dir, model)
+
     async def abort(self, session_id: str) -> bool:
-        """Abort active work via ``POST /session/{id}/abort``."""
+        """Interrupt active work via ``POST /api/session/{id}/interrupt``."""
         client = self._client()
         try:
-            return await client.abort(session_id)
+            return await client.interrupt(session_id)
         finally:
             await client.aclose()
 
     async def events(self, session_id: str) -> AsyncIterator[NativeEvent]:
-        """Stream native events, filtered to *session_id*."""
+        """Stream native events from ``GET /api/event`` (unfiltered)."""
         del session_id
         client = self._client()
         try:
-            async for event in client.events():
+            async for event in client.stream_events():
                 yield NativeEvent(
                     id=event.id,
                     type=event.type,
-                    payload=event.properties,
-                    raw=event.raw,
+                    payload=event.data,
+                    raw={
+                        "id": event.id,
+                        "type": event.type,
+                        "data": event.data,
+                        "location": event.location,
+                    },
                 )
         finally:
             await client.aclose()
@@ -249,39 +303,10 @@ class OpenCodeHttpTransport:
             await client.aclose()
 
     async def fork(self, session_id: str, *, at_message_id: str | None = None) -> str:
-        """Fork the session via ``POST /session/{id}/fork``."""
+        """Fork the session via ``POST /api/session/{id}/fork``."""
         client = self._client()
         try:
-            payload = {"messageID": at_message_id} if at_message_id else None
-            forked = await client.fork(session_id, payload)
+            forked = await client.fork(session_id, before=at_message_id)
             return forked.id
         finally:
             await client.aclose()
-
-    async def reply_permission(self, decision: NativePermissionDecision) -> None:
-        """Relay a permission decision via ``POST /permission/{id}/reply``."""
-        reply_map = {"allow_once": "once", "allow_always": "always", "reject": "reject"}
-        client = self._client()
-        try:
-            await client.reply_permission(
-                decision.request_id,
-                {"reply": reply_map[decision.decision], "message": decision.message or ""},
-            )
-        finally:
-            await client.aclose()
-
-    def build_tui_attach_command(
-        self, launch: NativeLaunchConfig, session_id: str
-    ) -> tuple[list[str], Mapping[str, str]]:
-        """Build the ``opencode attach`` argv + env for a TUI takeover."""
-        server_url = launch.server_url or (self._server.base_url if self._server else "")
-        argv = build_opencode_attach_args(
-            server_url=server_url,
-            workspace=launch.workspace,
-            session_id=session_id,
-            opencode_args=launch.terminal_launch_args,
-        )
-        env: Mapping[str, str] = (
-            opencode_terminal_env(self._server) if self._server is not None else {}
-        )
-        return argv, env

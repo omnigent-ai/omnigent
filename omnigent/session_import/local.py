@@ -2,15 +2,17 @@
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import json
 import os
 import re
 import sqlite3
-import subprocess
-from collections.abc import Sequence
+import tempfile
+from collections.abc import AsyncIterator, Coroutine, Sequence
 from hashlib import sha256
 from pathlib import Path
-from typing import get_args
+from typing import Any, TypeVar, get_args
 
 from omnigent.entities import NewConversationItem, parse_item_data
 from omnigent.harnesses.claude_native.bridge import (
@@ -29,9 +31,17 @@ from omnigent.harnesses.kiro_native.session_forwarder import (
 )
 from omnigent.harnesses.opencode_native.app_server import (
     OpenCodeCliNotFoundError,
+    OpenCodeNativeServer,
+    client_for_state,
     find_opencode_cli,
 )
-from omnigent.harnesses.opencode_native.forwarder import opencode_tool_output_text
+from omnigent.harnesses.opencode_native.bridge import snapshot_opencode_database
+from omnigent.harnesses.opencode_native.client import (
+    OpenCodeClient,
+    OpenCodeClientError,
+    OpenCodeSession,
+)
+from omnigent.onboarding.opencode_auth import opencode_db_path
 from omnigent.session_import.models import (
     ImportSource,
     LocalSessionImport,
@@ -42,7 +52,8 @@ _PI_IMPORT_SESSION_ID_RE = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9]
 _OPENCODE_IMPORT_SESSION_ID_RE = re.compile(r"ses_[A-Za-z0-9_-]+")
 _MAX_EXTERNAL_SESSION_ID_LENGTH = 128
 _MAX_RESPONSE_ID_LENGTH = 64
-_OPENCODE_COMMAND_TIMEOUT_SECONDS = 120
+_OPENCODE_IMPORT_START_TIMEOUT_SECONDS = 120.0
+_T = TypeVar("_T")
 
 # Transcript byte size past which an import is trimmed to the last compaction
 # boundary instead of the full history. Below it the whole transcript imports
@@ -149,41 +160,68 @@ def _is_safe_opencode_import_session_id(session_id: str) -> bool:
     )
 
 
-def _run_opencode_json(
-    *arguments: str,
-    opencode_path: str | None = None,
-    empty_ok: bool = False,
-) -> object:
-    """Run one public OpenCode JSON command and decode stdout.
+def _opencode_user_store_exists() -> bool:
+    """Whether the OpenCode database the import would snapshot exists."""
+    db = opencode_db_path()
+    return db is not None and db.is_file()
 
-    With no sessions, ``session list`` prints nothing (exit 0) rather than
-    ``[]``; ``empty_ok`` treats that empty stdout as an empty result instead of
-    an "invalid JSON" error.
+
+@contextlib.asynccontextmanager
+async def _opencode_import_client() -> AsyncIterator[OpenCodeClient]:
+    """Start a short-lived ``opencode serve`` on a snapshot of the user's DB.
+
+    The server runs fully isolated on a read-only copy, so it never writes to
+    or resumes turns in the user's live store; it is stopped on exit.
     """
     try:
-        cli = find_opencode_cli(opencode_path)
+        opencode_path = find_opencode_cli(None)
     except OpenCodeCliNotFoundError as exc:
         raise SessionImportNotFoundError(str(exc)) from exc
-    try:
-        completed = subprocess.run(
-            [cli, *arguments],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=_OPENCODE_COMMAND_TIMEOUT_SECONDS,
-        )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        raise SessionImportNotFoundError(f"OpenCode export could not run: {exc}") from exc
-    if completed.returncode != 0:
-        detail = completed.stderr.strip().splitlines()
-        suffix = f": {detail[-1]}" if detail else ""
-        raise SessionImportNotFoundError(f"OpenCode command failed{suffix}")
-    if empty_ok and not completed.stdout.strip():
-        return []
-    try:
-        return json.loads(completed.stdout)
-    except ValueError as exc:
-        raise SessionImportNotFoundError("OpenCode returned invalid JSON") from exc
+    with tempfile.TemporaryDirectory(prefix="omnigent-opencode-import-") as scratch:
+        bridge_dir = Path(scratch)
+        user_db = opencode_db_path()
+        if user_db is None or not snapshot_opencode_database(user_db, bridge_dir):
+            raise SessionImportNotFoundError("OpenCode database could not be copied")
+        try:
+            server = OpenCodeNativeServer(
+                bridge_dir=bridge_dir,
+                workspace=Path.home(),
+                opencode_path=opencode_path,
+            )
+            await asyncio.wait_for(server.start(), timeout=_OPENCODE_IMPORT_START_TIMEOUT_SECONDS)
+        except (OSError, RuntimeError, TimeoutError) as exc:
+            raise SessionImportNotFoundError(f"OpenCode server could not start: {exc}") from exc
+        client = client_for_state(base_url=server.base_url, auth_secret=server.auth_secret)
+        try:
+            yield client
+        finally:
+            try:
+                await client.aclose()
+            finally:
+                await server.close()
+
+
+def _run_opencode_import(coro: Coroutine[Any, Any, _T]) -> _T:
+    """Run one import coroutine from synchronous import code (CLI or worker thread)."""
+    return asyncio.run(coro)
+
+
+async def _list_opencode_root_sessions(limit: int) -> list[tuple[str, float]]:
+    """Return ``(session_id, updated_ms)`` for the user's newest top-level sessions."""
+    async with _opencode_import_client() as client:
+        try:
+            sessions = await client.list_root_sessions(limit=limit)
+        except OpenCodeClientError as exc:
+            raise SessionImportNotFoundError(f"OpenCode session list failed: {exc}") from exc
+    recent: list[tuple[str, float]] = []
+    for session in sessions:
+        if session.parent_id or not _is_safe_opencode_import_session_id(session.id):
+            continue
+        time_info = session.raw.get("time")
+        updated = time_info.get("updated") if isinstance(time_info, dict) else None
+        recent.append((session.id, float(updated) if isinstance(updated, (int, float)) else 0.0))
+    recent.sort(key=lambda entry: (entry[1], entry[0]), reverse=True)
+    return recent[:limit]
 
 
 def _qwen_session_locator(path: Path) -> str:
@@ -279,34 +317,9 @@ def _recent_local_sessions_with_recency(
         return _recent_unique_sessions_with_recency(candidates, limit=limit)
 
     if source == "opencode":
-        payload = _run_opencode_json(
-            "session",
-            "list",
-            "--format",
-            "json",
-            "--pure",
-            empty_ok=True,
-        )
-        if not isinstance(payload, list):
-            raise SessionImportNotFoundError("OpenCode returned an invalid session list")
-        updated_by_id: dict[str, int | float] = {}
-        for entry in payload:
-            if not isinstance(entry, dict) or isinstance(entry.get("parentID"), str):
-                continue
-            session_id = entry.get("id")
-            updated = entry.get("updated")
-            if not isinstance(session_id, str) or not _is_safe_opencode_import_session_id(
-                session_id
-            ):
-                continue
-            timestamp = updated if isinstance(updated, (int, float)) else 0
-            updated_by_id[session_id] = max(updated_by_id.get(session_id, 0), timestamp)
-        ordered = sorted(
-            updated_by_id,
-            key=lambda session_id: (updated_by_id[session_id], session_id),
-            reverse=True,
-        )
-        return [(session_id, float(updated_by_id[session_id])) for session_id in ordered[:limit]]
+        if not _opencode_user_store_exists():
+            return []
+        return _run_opencode_import(_list_opencode_root_sessions(limit))
 
     if source == "pi":
         configured_home = os.environ.get("PI_CODING_AGENT_DIR")
@@ -1329,27 +1342,95 @@ def load_kimi_session(
     )
 
 
-def _opencode_file_content(
-    part: dict[str, object],
-    *,
-    role: str,
-) -> dict[str, object] | None:
-    """Convert one exported OpenCode file part to a durable content block."""
-    mime = part.get("mime")
-    url = part.get("url")
-    if isinstance(mime, str) and mime.startswith("image/") and isinstance(url, str) and url:
-        return {
-            "type": "input_image" if role == "user" else "output_image",
-            "image_url": url,
-        }
-    filename = part.get("filename")
-    label = filename if isinstance(filename, str) and filename else mime
+def _opencode_user_file_content(attachment: dict[str, object]) -> dict[str, object]:
+    """Convert one v2 user ``FileAttachment`` to a durable content block."""
+    mime = attachment.get("mime")
+    data = attachment.get("data")
+    if isinstance(mime, str) and mime.startswith("image/") and isinstance(data, str) and data:
+        return {"type": "input_image", "image_url": f"data:{mime};base64,{data}"}
+    name = attachment.get("name")
+    label = name if isinstance(name, str) and name else mime
     if not isinstance(label, str) or not label:
         label = "attachment"
-    return {
-        "type": "input_text" if role == "user" else "output_text",
-        "text": f"[attachment: {label}]",
-    }
+    return {"type": "input_text", "text": f"[attachment: {label}]"}
+
+
+def _opencode_tool_content_text(content: object) -> str:
+    """Flatten v2 tool ``content`` (``Tool.TextContent`` / ``Tool.FileContent``)."""
+    if not isinstance(content, list):
+        return ""
+    parts: list[str] = []
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        if block.get("type") == "text" and isinstance(block.get("text"), str):
+            parts.append(block["text"])
+        elif block.get("type") == "file":
+            label = block.get("name") or block.get("mime") or "file"
+            parts.append(f"[file: {label}]")
+    return "\n".join(part for part in parts if part)
+
+
+def _opencode_tool_items(
+    tool: dict[str, object], *, response_id: str
+) -> tuple[NewConversationItem, ...]:
+    """Normalize one v2 assistant ``tool`` content block into call (+ output) items."""
+    call_id = tool.get("id")
+    name = tool.get("name")
+    state = tool.get("state")
+    if (
+        not isinstance(call_id, str)
+        or not call_id
+        or not isinstance(name, str)
+        or not name
+        or not isinstance(state, dict)
+    ):
+        return ()
+    arguments = state.get("input")
+    serialized_arguments = (
+        arguments
+        if isinstance(arguments, str)
+        else json.dumps(
+            arguments if arguments is not None else {},
+            separators=(",", ":"),
+            ensure_ascii=True,
+        )
+    )
+    items = [
+        NewConversationItem(
+            type="function_call",
+            response_id=response_id,
+            data=parse_item_data(
+                "function_call",
+                {
+                    "agent": "opencode-native-ui",
+                    "name": name,
+                    "arguments": serialized_arguments,
+                    "call_id": call_id,
+                },
+            ),
+        )
+    ]
+    status = state.get("status")
+    output: str | None = None
+    if status == "completed":
+        output = _opencode_tool_content_text(state.get("content"))
+    elif status == "error":
+        error = state.get("error")
+        message = error.get("message") if isinstance(error, dict) else None
+        output = f"[error] {message}" if message else "[error]"
+    if output is not None:
+        items.append(
+            NewConversationItem(
+                type="function_call_output",
+                response_id=response_id,
+                data=parse_item_data(
+                    "function_call_output",
+                    {"call_id": call_id, "output": output},
+                ),
+            )
+        )
+    return tuple(items)
 
 
 def _opencode_message_items(
@@ -1357,141 +1438,93 @@ def _opencode_message_items(
     *,
     message_number: int,
 ) -> tuple[NewConversationItem, ...]:
-    """Normalize one exported OpenCode message while preserving part order."""
-    info = message.get("info")
-    parts = message.get("parts")
-    if not isinstance(info, dict) or not isinstance(parts, list):
+    """Normalize one v2 ``Session.Message.Info`` while preserving content order."""
+    message_type = message.get("type")
+    if message_type not in {"user", "assistant"}:
         return ()
-    role = info.get("role")
-    if role not in {"user", "assistant"}:
-        return ()
-    message_id = info.get("id")
+    message_id = message.get("id")
     native_id = message_id if isinstance(message_id, str) and message_id else str(message_number)
     response_id = _bounded_response_id(f"opencode:{native_id}")
-    items: list[NewConversationItem] = []
-    pending_content: list[dict[str, object]] = []
 
-    def flush_content() -> None:
-        if not pending_content:
+    if message_type == "user":
+        content: list[dict[str, object]] = []
+        text = message.get("text")
+        if isinstance(text, str) and text:
+            content.append({"type": "input_text", "text": text})
+        files = message.get("files")
+        for attachment in files if isinstance(files, list) else []:
+            if isinstance(attachment, dict):
+                content.append(_opencode_user_file_content(attachment))
+        if not content:
+            return ()
+        return (
+            NewConversationItem(
+                type="message",
+                response_id=response_id,
+                data=parse_item_data("message", {"role": "user", "content": content}),
+            ),
+        )
+
+    items: list[NewConversationItem] = []
+    pending_text: list[dict[str, object]] = []
+
+    def flush_text() -> None:
+        if not pending_text:
             return
-        data: dict[str, object] = {"role": role, "content": list(pending_content)}
-        if role == "assistant":
-            data["agent"] = "opencode-native-ui"
         items.append(
             NewConversationItem(
                 type="message",
                 response_id=response_id,
-                data=parse_item_data("message", data),
-            )
-        )
-        pending_content.clear()
-
-    for raw_part in parts:
-        if not isinstance(raw_part, dict):
-            continue
-        part: dict[str, object] = raw_part
-        part_type = part.get("type")
-        if part_type == "text":
-            text = part.get("text")
-            if isinstance(text, str) and text:
-                pending_content.append(
-                    {
-                        "type": "input_text" if role == "user" else "output_text",
-                        "text": text,
-                    }
-                )
-            continue
-        if part_type == "file":
-            content = _opencode_file_content(part, role=role)
-            if content is not None:
-                pending_content.append(content)
-            continue
-        if part_type == "step-finish":
-            flush_content()
-            continue
-        if part_type != "tool" or role != "assistant":
-            continue
-        flush_content()
-        call_id = part.get("callID")
-        name = part.get("tool")
-        state = part.get("state")
-        if (
-            not isinstance(call_id, str)
-            or not call_id
-            or not isinstance(name, str)
-            or not name
-            or not isinstance(state, dict)
-        ):
-            continue
-        arguments = state.get("input")
-        serialized_arguments = (
-            arguments
-            if isinstance(arguments, str)
-            else json.dumps(
-                arguments if arguments is not None else {},
-                separators=(",", ":"),
-                ensure_ascii=True,
-            )
-        )
-        items.append(
-            NewConversationItem(
-                type="function_call",
-                response_id=response_id,
                 data=parse_item_data(
-                    "function_call",
+                    "message",
                     {
+                        "role": "assistant",
                         "agent": "opencode-native-ui",
-                        "name": name,
-                        "arguments": serialized_arguments,
-                        "call_id": call_id,
+                        "content": list(pending_text),
                     },
                 ),
             )
         )
-        status = state.get("status")
-        output: str | None = None
-        if status == "completed":
-            output = opencode_tool_output_text(state)
-        elif status == "error":
-            error = state.get("error")
-            output = f"[error] {error}" if error else "[error]"
-        if output is not None:
-            items.append(
-                NewConversationItem(
-                    type="function_call_output",
-                    response_id=response_id,
-                    data=parse_item_data(
-                        "function_call_output",
-                        {"call_id": call_id, "output": output},
-                    ),
-                )
-            )
-    flush_content()
+        pending_text.clear()
+
+    blocks = message.get("content")
+    for block in blocks if isinstance(blocks, list) else []:
+        if not isinstance(block, dict):
+            continue
+        block_type = block.get("type")
+        if block_type == "text":
+            text = block.get("text")
+            if isinstance(text, str) and text:
+                pending_text.append({"type": "output_text", "text": text})
+        elif block_type == "tool":
+            flush_text()
+            items.extend(_opencode_tool_items(block, response_id=response_id))
+    flush_text()
     return tuple(items)
 
 
-def load_opencode_session(
+async def _fetch_opencode_session(
     session_id: str,
-    *,
-    opencode_path: str | None = None,
-) -> LocalSessionImport:
-    """Load one session through OpenCode's supported JSON export command."""
+) -> tuple[OpenCodeSession, list[dict[str, object]]]:
+    """Read one session and its full message history from the import server."""
+    async with _opencode_import_client() as client:
+        try:
+            session = await client.get_session(session_id)
+            if session is None:
+                raise SessionImportNotFoundError(f"OpenCode session {session_id!r} was not found")
+            messages = await client.list_messages(session_id)
+        except OpenCodeClientError as exc:
+            raise SessionImportNotFoundError(
+                f"OpenCode session {session_id!r} could not be read: {exc}"
+            ) from exc
+    return session, messages
+
+
+def load_opencode_session(session_id: str) -> LocalSessionImport:
+    """Load one session from the user's OpenCode store via ``GET /api/session/{id}/message``."""
     if not _is_safe_opencode_import_session_id(session_id):
         raise SessionImportNotFoundError(f"OpenCode session {session_id!r} was not found")
-    payload = _run_opencode_json("export", session_id, "--pure", opencode_path=opencode_path)
-    if not isinstance(payload, dict):
-        raise SessionImportNotFoundError(
-            f"OpenCode session {session_id!r} returned an invalid export"
-        )
-    info = payload.get("info")
-    exported_id = info.get("id") if isinstance(info, dict) else None
-    if exported_id != session_id:
-        raise SessionImportNotFoundError(
-            f"OpenCode export id {exported_id!r} did not match {session_id!r}"
-        )
-    messages = payload.get("messages")
-    if not isinstance(messages, list):
-        messages = []
+    session, messages = _run_opencode_import(_fetch_opencode_session(session_id))
     items = tuple(
         item
         for message_number, message in enumerate(messages, start=1)
@@ -1502,14 +1535,8 @@ def load_opencode_session(
         raise SessionImportNotFoundError(
             f"OpenCode session {session_id!r} has no importable history"
         )
-    workspace_value = info.get("directory") if isinstance(info, dict) else None
-    workspace = workspace_value.strip() if isinstance(workspace_value, str) else None
-    # OpenCode auto-generates a session title (info.title); carry it as the
-    # native title instead of synthesizing from the first message.
-    title_value = info.get("title") if isinstance(info, dict) else None
-    native_title = (
-        title_value.strip() if isinstance(title_value, str) and title_value.strip() else None
-    )
+    workspace = session.directory.strip() if session.directory else None
+    native_title = session.title.strip() if session.title and session.title.strip() else None
     return LocalSessionImport(
         source="opencode",
         external_session_id=session_id,

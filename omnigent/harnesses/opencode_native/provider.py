@@ -1,20 +1,17 @@
-"""Synthesize OpenCode provider config for the native-server harness.
+"""Synthesize the OpenCode 2.x ``opencode.json`` for the native-server harness.
 
-Unlike codex/claude/pi — which consume ``HARNESS_*_GATEWAY_*`` env vars that
-their CLIs translate into provider config — OpenCode reads its provider/auth
-from its own config file under the per-session ``XDG_CONFIG_HOME``. So routing
-opencode-native through the Databricks AI gateway (or any OpenAI-compatible
-endpoint) means writing an ``opencode.json`` into the runner-owned
-``opencode serve``'s config dir at spawn, declaring a custom
-``@ai-sdk/openai-compatible`` provider pointed at ``{host}/serving-endpoints``.
-
-The model is then referenced as ``<provider_id>/<endpoint>`` per prompt.
+The runner-owned ``opencode serve`` reads its config from the per-session
+``XDG_CONFIG_HOME``. This module emits the v2 keys: ``providers`` (an
+OpenAI-compatible gateway declared with the native
+``@opencode/ai/providers/openai-compatible`` package), ``model``
+(``provider/model``), an ask-all ``permissions`` ruleset, ``mcp.servers``,
+``plugins`` and ``instructions``.
 
 Security: the file carries a bearer token, so it is written ``0600`` into the
 per-session XDG dir (never the user's global ``~/.config/opencode``). The token
 is resolved at spawn; a resumed session re-spawns the server and re-resolves, so
-short-lived gateway tokens refresh on resume (documented limitation: a token
-that expires mid-session is not refreshed in place).
+short-lived gateway tokens refresh on resume (a token that expires mid-session
+is not refreshed in place).
 """
 
 from __future__ import annotations
@@ -22,6 +19,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import subprocess
 import tempfile
 from collections.abc import Mapping, Sequence
@@ -30,6 +28,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from omnigent.models import model_catalog
+from omnigent.process_logging import DATA_DIR_ENV_VAR
 
 if TYPE_CHECKING:
     from databricks.sdk.core import Config
@@ -49,6 +48,12 @@ _SERVING_ENDPOINTS_PATH = "serving-endpoints"
 # catalog. Set it in the runner env to steer every session at one endpoint
 # (e.g. ``databricks-kimi-k3``).
 DATABRICKS_GATEWAY_DEFAULT_MODEL_ENV_VAR = "OMNIGENT_DATABRICKS_GATEWAY_MODEL"
+
+OPENCODE_CONFIG_SCHEMA = "https://opencode.ai/config.json"
+# Native provider package bundled with opencode 2.x (no npm install at runtime).
+OPENAI_COMPATIBLE_PACKAGE = "@opencode/ai/providers/openai-compatible"
+# Every tool call raises ``permission.asked`` so the forwarder can apply Omnigent policy.
+ASK_ALL_PERMISSIONS: list[dict[str, str]] = [{"action": "*", "resource": "*", "effect": "ask"}]
 
 
 @dataclass(frozen=True)
@@ -117,47 +122,95 @@ def resolve_bound_opencode_gateway(
     )
 
 
-def build_opencode_model_default_config(model: str) -> dict[str, object]:
+def build_opencode_provider_block(
+    resolution: OpenCodeGatewayResolution,
+) -> dict[str, dict[str, object]]:
     """
-    Build a minimal ``opencode.json`` that only pins the default model.
+    Build the ``providers`` entry for an OpenAI-compatible gateway.
 
-    Used when the user's own provider auth (``opencode auth login`` /
-    provider env keys) already supplies credentials, but a default model has
-    been chosen — via ``omni opencode --model`` or the ``omni setup`` OpenCode
-    default — so the per-session TUI (and the first turn) launch on that model
-    instead of OpenCode's built-in default (``opencode/big-pickle``). No
-    provider block: OpenCode resolves the provider from the model id's prefix
-    against its own ``auth.json``.
-
-    :param model: A ``provider/model`` id, e.g. ``"anthropic/claude-sonnet-4-5"``.
-    :returns: A config dict ready to serialize to ``opencode.json``.
-    """
-    return {"$schema": "https://opencode.ai/config.json", "model": model}
-
-
-def build_opencode_provider_config(resolution: OpenCodeGatewayResolution) -> dict[str, object]:
-    """
-    Build the ``opencode.json`` declaring a custom OpenAI-compatible provider.
-
-    :param resolution: The resolved gateway (base URL + key + model).
-    :returns: A config dict ready to serialize to ``opencode.json``.
+    :param resolution: The resolved gateway (base URL + key + models).
+    :returns: ``{provider_id: {name, package, settings, models}}``.
     """
     return {
-        "$schema": "https://opencode.ai/config.json",
-        "provider": {
-            resolution.provider_id: {
-                "npm": "@ai-sdk/openai-compatible",
-                "name": resolution.provider_name,
-                "options": {
-                    "baseURL": resolution.base_url,
-                    "apiKey": resolution.api_key,
-                },
-                "models": {
-                    mid: {"name": mid} for mid in (resolution.model_ids or (resolution.model_id,))
-                },
-            }
-        },
+        resolution.provider_id: {
+            "name": resolution.provider_name,
+            "package": OPENAI_COMPATIBLE_PACKAGE,
+            "settings": {
+                "baseURL": resolution.base_url,
+                "apiKey": resolution.api_key,
+                "provider": resolution.provider_id,
+            },
+            "models": {
+                mid: {"name": mid} for mid in (resolution.model_ids or (resolution.model_id,))
+            },
+        }
     }
+
+
+def _permission_rules(extra: Sequence[Mapping[str, str]] | None) -> list[dict[str, str]]:
+    """Ask-all first, then caller ``deny`` rules; other effects would bypass the gate."""
+    rules = [dict(rule) for rule in ASK_ALL_PERMISSIONS]
+    for rule in extra or ():
+        if rule.get("effect") == "deny":
+            rules.append(dict(rule))
+        else:
+            _logger.info("opencode config: dropping non-deny permission rule %r", dict(rule))
+    return rules
+
+
+def build_opencode_config(
+    *,
+    model: str | None,
+    gateway: OpenCodeGatewayResolution | None,
+    mcp_servers: Mapping[str, Mapping[str, object]],
+    plugin_paths: Sequence[str],
+    instructions: str | None,
+    permissions: Sequence[Mapping[str, str]] | None = None,
+    extra_providers: Mapping[str, Mapping[str, object]] | None = None,
+) -> dict[str, object]:
+    """
+    Build the per-session v2 ``opencode.json``.
+
+    :param model: Default ``provider/model``; replaced by the gateway's model when set.
+        Dropped (with a log line) when it lacks a ``provider/`` prefix — v2 only
+        accepts ``provider/model``.
+    :param gateway: Resolved OpenAI-compatible gateway, or ``None``. Wins over
+        *model* and *extra_providers* on a provider id collision.
+    :param mcp_servers: ``mcp.servers`` map (see :func:`build_opencode_mcp_block`).
+    :param plugin_paths: Plugin package directories, in load order; de-duplicated.
+    :param instructions: Path of an already-written instructions file (e.g. the
+        per-session ``AGENTS.md``). This is NOT the system prompt:
+        opencode 2.0.18 parses ``instructions`` but never reads it at runtime, so
+        this only records the key when the caller explicitly passes a path — no
+        prompt content is derived from it here.
+    :param permissions: Extra rules; only ``deny`` rules are kept, appended after
+        the mandatory ask-all rule (an ``allow``/``ask`` rule after ask-all would
+        let a tool run without ``permission.asked``).
+    :param extra_providers: Already-v2 provider entries (e.g. the managed ucode
+        config), merged before the gateway's own provider block.
+    :returns: The config dict.
+    """
+    config: dict[str, object] = {
+        "$schema": OPENCODE_CONFIG_SCHEMA,
+        "permissions": _permission_rules(permissions),
+    }
+    providers: dict[str, object] = {k: dict(v) for k, v in (extra_providers or {}).items()}
+    if gateway is not None:
+        providers.update(build_opencode_provider_block(gateway))
+        model = gateway.qualified_model
+    if providers:
+        config["providers"] = providers
+    if model and "/" in model:
+        config["model"] = model
+    elif model:
+        _logger.info("opencode config: ignoring model %r without a provider prefix", model)
+    if mcp_servers:
+        config["mcp"] = {"servers": {name: dict(entry) for name, entry in mcp_servers.items()}}
+    if plugin_paths:
+        config["plugins"] = list(dict.fromkeys(plugin_paths))
+    if instructions:
+        config["instructions"] = [instructions]
+    return config
 
 
 def write_opencode_provider_config(xdg_config_home: Path, config: Mapping[str, object]) -> Path:
@@ -165,8 +218,7 @@ def write_opencode_provider_config(xdg_config_home: Path, config: Mapping[str, o
     Atomically write ``<xdg_config_home>/opencode/opencode.json`` (``0600``).
 
     :param xdg_config_home: The per-session ``XDG_CONFIG_HOME`` the server uses.
-    :param config: The provider config dict (see
-        :func:`build_opencode_provider_config`).
+    :param config: The v2 config dict (see :func:`build_opencode_config`).
     :returns: The path written.
     """
     cfg_dir = xdg_config_home / "opencode"
@@ -185,23 +237,73 @@ def write_opencode_provider_config(xdg_config_home: Path, config: Mapping[str, o
     return path
 
 
+_INSTRUCTIONS_FILE = "AGENTS.md"
+
+
+def _user_agents_md() -> str | None:
+    """The user's global ``~/.config/opencode/AGENTS.md`` text, if any."""
+    xdg = os.environ.get("XDG_CONFIG_HOME", "").strip()
+    base = Path(xdg) if xdg else Path.home() / ".config"
+    try:
+        text = (base / "opencode" / _INSTRUCTIONS_FILE).read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return None
+    return text.strip() or None
+
+
+def write_opencode_instructions(xdg_config_home: Path, instructions: str | None) -> Path | None:
+    """
+    Write the per-session global ``AGENTS.md`` opencode loads as ambient instructions.
+
+    opencode 2.0 parses the config ``instructions`` key but does not apply it; the
+    global ``AGENTS.md`` under its config dir is always read. The user's own
+    global ``AGENTS.md`` comes first so the per-session config dir does not hide it.
+
+    :param xdg_config_home: The per-session ``XDG_CONFIG_HOME``.
+    :param instructions: Raw author instructions, or ``None``.
+    :returns: The written path, or ``None`` (and any stale file removed) when empty.
+    """
+    cfg_dir = xdg_config_home / "opencode"
+    path = cfg_dir / _INSTRUCTIONS_FILE
+    parts = [part for part in (_user_agents_md(), (instructions or "").strip()) if part]
+    if not parts:
+        path.unlink(missing_ok=True)
+        return None
+    cfg_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=f"{_INSTRUCTIONS_FILE}.", dir=str(cfg_dir))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write("\n\n".join(parts) + "\n")
+        os.chmod(tmp_name, 0o600)
+        os.replace(tmp_name, path)
+    finally:
+        if os.path.exists(tmp_name):
+            os.unlink(tmp_name)
+    return path
+
+
+def _mcp_timeout(seconds: object) -> dict[str, int] | None:
+    """Convert an ``MCPServerConfig.timeout`` in seconds to v2 ``{catalog, execution}`` ms."""
+    if isinstance(seconds, bool) or not isinstance(seconds, (int, float)) or seconds <= 0:
+        return None
+    millis = int(seconds * 1000)
+    return {"catalog": millis, "execution": millis}
+
+
 def build_opencode_mcp_block(
     servers: Sequence[MCPServerConfig],
 ) -> dict[str, dict[str, object]]:
     """
-    Translate Omnigent MCP server declarations into opencode.json's ``mcp`` block.
+    Translate Omnigent MCP server declarations into v2 ``mcp.servers`` entries.
 
-    Mirrors how codex/claude expose the agent's MCP servers, but via opencode's
-    own config (no relay): ``stdio`` → ``{type:"local", command:[cmd, *args],
-    environment, enabled}``; ``http`` → ``{type:"remote", url, headers,
-    enabled}``. A ``databricks_profile`` resolves a bearer token into the
-    ``Authorization`` header at spawn (re-resolved on resume, like the gateway
-    provider). Entries opencode can't represent (missing command / url) are
-    skipped.
+    ``stdio`` → ``{type:"local", command:[cmd, *args], environment}``; ``http`` →
+    ``{type:"remote", url, headers}``. A ``databricks_profile`` resolves a bearer
+    token into ``Authorization`` at spawn. Every entry sets ``codemode: false`` so
+    each tool keeps its name and is individually permission-gated. Entries
+    without a command / url are skipped.
 
     :param servers: The agent spec's ``mcp_servers``.
-    :returns: An opencode ``mcp`` block keyed by server name (empty when none
-        are representable).
+    :returns: A ``mcp.servers`` map keyed by server name.
     """
     block: dict[str, dict[str, object]] = {}
     for server in servers:
@@ -215,7 +317,7 @@ def build_opencode_mcp_block(
             entry: dict[str, object] = {
                 "type": "local",
                 "command": [command, *getattr(server, "args", [])],
-                "enabled": True,
+                "codemode": False,
             }
             env = dict(getattr(server, "env", {}) or {})
             if env:
@@ -230,13 +332,14 @@ def build_opencode_mcp_block(
                 token = _databricks_bearer_token(profile)
                 if token:
                     headers["Authorization"] = f"Bearer {token}"
-            entry = {"type": "remote", "url": url, "enabled": True}
+            entry = {"type": "remote", "url": url, "codemode": False}
             if headers:
                 entry["headers"] = headers
-        timeout = getattr(server, "timeout", None)
-        if isinstance(timeout, (int, float)) and not isinstance(timeout, bool) and timeout > 0:
-            # MCPServerConfig.timeout is seconds; opencode's mcp entry wants ms.
-            entry["timeout"] = int(timeout * 1000)
+            if "Authorization" in headers:
+                entry["oauth"] = False
+        timeout = _mcp_timeout(getattr(server, "timeout", None))
+        if timeout is not None:
+            entry["timeout"] = timeout
         block[str(name)] = entry
     return block
 
@@ -262,7 +365,7 @@ def build_opencode_omnigent_mcp_server(
         + ``tool_relay.json``).
     :param python_executable: Python to run ``serve-mcp`` with; ``None`` uses the
         runner interpreter (has ``omnigent`` importable).
-    :returns: A one-entry ``mcp`` block ``{"omnigent": {type:"local", …}}``.
+    :returns: A one-entry ``mcp.servers`` map ``{"omnigent": {type:"local", codemode: False, …}}``.
     """
     from omnigent.harnesses.claude_native.bridge import (
         _TOOL_RELAY_POST_TIMEOUT_S,
@@ -289,15 +392,11 @@ def build_opencode_omnigent_mcp_server(
     entry: dict[str, object] = {
         "type": "local",
         "command": [command, *args],
-        "enabled": True,
-        # opencode's mcp timeout is in MILLISECONDS and flows straight into the
-        # MCP SDK's per-request deadline (default 60 s). Give the client more
-        # headroom than the bridge's outer relay hop so the relay's own clean
-        # timeout error always arrives before opencode kills the call. This is
-        # server-wide, so a hung local (non-relay) tool also gets this window
-        # before the client kills it — an accepted trade-off; local tools get
-        # no heartbeat, so they stay killable at this deadline.
-        "timeout": int((_TOOL_RELAY_POST_TIMEOUT_S + 30.0) * 1000),
+        # Relay tools keep their names so each call raises its own permission.asked.
+        "codemode": False,
+        # Execution deadline in ms: longer than the bridge's outer relay hop so the
+        # relay's own timeout error arrives before opencode kills the call.
+        "timeout": {"execution": int((_TOOL_RELAY_POST_TIMEOUT_S + 30.0) * 1000)},
     }
     env_value = server.get("env")
     if env_value is None:
@@ -308,6 +407,11 @@ def build_opencode_omnigent_mcp_server(
         env = dict(env_value)
     else:
         raise ValueError("Claude MCP server environment is malformed")
+    # opencode serve drops OMNIGENT_* env; serve-mcp needs the same data dir to
+    # accept a bridge dir under a custom OMNIGENT_DATA_DIR.
+    data_dir_value = os.environ.get(DATA_DIR_ENV_VAR)
+    if data_dir_value:
+        env[DATA_DIR_ENV_VAR] = data_dir_value
     if env:
         entry["environment"] = env
     return {str(name): entry}
@@ -546,118 +650,247 @@ def _strip_trailing_commas(text: str) -> str:
     return "".join(result)
 
 
-def maybe_merge_user_provider_config(config: dict[str, object]) -> dict[str, object]:
-    """
-    Merge the user's global OpenCode provider definitions into *config*.
+_AISDK_PREFIX = "aisdk:"
 
-    OpenCode reads ``XDG_CONFIG_HOME/opencode/opencode.json(c)`` for custom
-    provider definitions (e.g. OpenAI-compatible endpoints with custom base
-    URLs). When running under Omnigent, the per-session ``XDG_CONFIG_HOME``
-    override hides this global config. This function reads the user's real
-    config and merges any ``provider`` block into *config* so the spawned
-    server sees both the user's providers (with their custom base URLs) and
-    any Omnigent-synthesized providers (e.g. Databricks gateway).
 
-    ``provider`` entries are merged, and the user's top-level ``plugin``
-    entries are appended after any synthesized ones (synthesized policy
-    plugins stay first; duplicate paths are dropped) so plugin-based
-    provider auth keeps working in native sessions. The user config's
-    ``model`` default is adopted **only when the synthesized config pins
-    none** — for the other keys it sets (model, mcp, permission, etc.) the
-    synthesized config still takes precedence. The ``model`` carry-over
-    matters because when
-    neither a gateway nor a spec-supplied ``model_override`` is present, the
-    synthesized config has no ``model`` key, and opencode-native would otherwise
-    pick its own default over the merged models map (e.g. landing on a served
-    Gemini endpoint even though the user's config defaults to Claude).
-
-    :param config: The synthesized config dict (may be empty).
-    :returns: *config* with user's ``provider`` entries (and, if unset, the
-        user's default ``model``) merged in.
-    """
+def _read_user_opencode_config() -> dict[str, object] | None:
+    """Parse the user's global ``opencode.json(c)``; ``None`` when absent or invalid."""
     from omnigent.harnesses.opencode_native.bridge import user_opencode_config_path
 
     user_path = user_opencode_config_path()
     if user_path is None:
-        return config
-
+        return None
     try:
         raw = user_path.read_text(encoding="utf-8")
-        # Try plain JSON first (handles .json files without comments).
-        # If that fails, strip JSONC comments and trailing commas, then
-        # retry (handles .jsonc).
         try:
-            user_config = json.loads(raw)
+            parsed = json.loads(raw)
         except json.JSONDecodeError:
-            cleaned = _strip_jsonc_comments(raw)
-            cleaned = _strip_trailing_commas(cleaned)
-            user_config = json.loads(cleaned)
+            parsed = json.loads(_strip_trailing_commas(_strip_jsonc_comments(raw)))
     except (OSError, UnicodeDecodeError):
-        return config
+        return None
     except json.JSONDecodeError:
-        _logger.warning(
-            "Failed to parse user OpenCode config at %s — ignoring user providers",
-            user_path,
-        )
+        _logger.warning("Failed to parse user OpenCode config at %s — ignoring it", user_path)
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _string_map(value: object) -> dict[str, str]:
+    if not isinstance(value, Mapping):
+        return {}
+    return {str(k): v for k, v in value.items() if isinstance(v, str)}
+
+
+def _v1_model_to_v2(model: Mapping[str, object]) -> dict[str, object]:
+    """Subset of opencode's v1 model migration (``migrate.ts:304-354``)."""
+    out: dict[str, object] = {}
+    if isinstance(model.get("name"), str):
+        out["name"] = model["name"]
+    if isinstance(model.get("id"), str):
+        out["modelID"] = model["id"]
+    headers = _string_map(model.get("headers"))
+    if headers:
+        out["headers"] = headers
+    options = model.get("options")
+    if isinstance(options, Mapping) and options:
+        out["settings"] = dict(options)
+    limit = model.get("limit")
+    if isinstance(limit, Mapping):
+        limits = {
+            key: int(limit[key])
+            for key in ("context", "input", "output")
+            if isinstance(limit.get(key), (int, float)) and not isinstance(limit.get(key), bool)
+        }
+        if limits:
+            out["limit"] = limits
+    return out
+
+
+def v1_provider_to_v2(entry: Mapping[str, object]) -> dict[str, object]:
+    """
+    Convert a v1 ``provider.<id>`` entry to a v2 ``providers.<id>`` entry.
+
+    Mirrors opencode's own migration (``migrate.ts:247-260``): ``npm`` becomes an
+    ``aisdk:``-prefixed ``package``, ``options`` becomes ``settings`` with
+    ``headers``/``body`` lifted out, and ``api`` becomes ``settings.baseURL``.
+
+    :param entry: The v1 provider object.
+    :returns: The v2 provider object.
+    """
+    out: dict[str, object] = {}
+    if isinstance(entry.get("name"), str):
+        out["name"] = entry["name"]
+    env = entry.get("env")
+    if isinstance(env, list) and all(isinstance(item, str) for item in env):
+        out["env"] = list(env)
+    npm = entry.get("npm")
+    if isinstance(npm, str) and npm:
+        out["package"] = npm if npm.startswith(_AISDK_PREFIX) else _AISDK_PREFIX + npm
+    options = entry.get("options")
+    options = options if isinstance(options, Mapping) else {}
+    settings = {str(k): v for k, v in options.items() if k not in ("headers", "body")}
+    if isinstance(entry.get("api"), str):
+        settings["baseURL"] = entry["api"]
+    if settings:
+        out["settings"] = settings
+    headers = _string_map(options.get("headers"))
+    if headers:
+        out["headers"] = headers
+    body = options.get("body")
+    if isinstance(body, Mapping) and body:
+        out["body"] = dict(body)
+    models = entry.get("models")
+    if isinstance(models, Mapping):
+        out["models"] = {
+            str(mid): _v1_model_to_v2(model)
+            for mid, model in models.items()
+            if isinstance(model, Mapping)
+        }
+    return out
+
+
+def _user_providers(user: Mapping[str, object]) -> dict[str, object]:
+    providers: dict[str, object] = {}
+    legacy = user.get("provider")
+    if isinstance(legacy, Mapping):
+        for pid, entry in legacy.items():
+            if isinstance(entry, Mapping):
+                providers[str(pid)] = v1_provider_to_v2(entry)
+    native = user.get("providers")
+    if isinstance(native, Mapping):
+        for pid, entry in native.items():
+            if isinstance(entry, Mapping):
+                providers[str(pid)] = dict(entry)
+    return providers
+
+
+def _user_model(user: Mapping[str, object]) -> str | None:
+    model = user.get("model")
+    if isinstance(model, str) and "/" in model:
+        return model
+    if isinstance(model, Mapping):
+        provider_id, model_id = model.get("providerID"), model.get("model")
+        if isinstance(provider_id, str) and isinstance(model_id, str):
+            variant = model.get("variant")
+            suffix = f"#{variant}" if isinstance(variant, str) and variant else ""
+            return f"{provider_id}/{model_id}{suffix}"
+    return None
+
+
+def _user_plugins(user: Mapping[str, object]) -> list[object]:
+    plugins: list[object] = []
+    legacy = user.get("plugin")
+    for item in legacy if isinstance(legacy, list) else []:
+        if isinstance(item, str) and item:
+            plugins.append(item)
+        elif (
+            isinstance(item, list)
+            and len(item) == 2
+            and isinstance(item[0], str)
+            and isinstance(item[1], Mapping)
+        ):
+            plugins.append({"package": item[0], "options": dict(item[1])})
+    native = user.get("plugins")
+    for item in native if isinstance(native, list) else []:
+        if isinstance(item, str) and item:
+            plugins.append(item)
+        elif isinstance(item, Mapping) and isinstance(item.get("package"), str):
+            plugins.append(dict(item))
+    return plugins
+
+
+def _v1_mcp_to_v2(entry: Mapping[str, object]) -> dict[str, object]:
+    """Subset of opencode's v1 MCP migration (``migrate.ts:202-227``)."""
+    out = {str(k): v for k, v in entry.items() if k not in ("enabled", "timeout")}
+    enabled = entry.get("enabled")
+    if isinstance(enabled, bool):
+        out["disabled"] = not enabled
+    timeout = entry.get("timeout")
+    if isinstance(timeout, int) and not isinstance(timeout, bool) and timeout > 0:
+        out["timeout"] = {"catalog": timeout, "execution": timeout}
+    return out
+
+
+def _user_mcp_servers(user: Mapping[str, object]) -> dict[str, object]:
+    mcp = user.get("mcp")
+    if not isinstance(mcp, Mapping):
+        return {}
+    servers: dict[str, object] = {}
+    for name, entry in mcp.items():
+        if not isinstance(entry, Mapping):
+            continue
+        if entry.get("type") in ("local", "remote"):
+            servers[str(name)] = _v1_mcp_to_v2(entry)
+    native = mcp.get("servers")
+    if isinstance(native, Mapping) and native.get("type") not in ("local", "remote"):
+        for name, entry in native.items():
+            if isinstance(entry, Mapping):
+                servers[str(name)] = dict(entry)
+    # Keep merged servers out of Code Mode so each call is asked as `<server>_<tool>`.
+    for entry in servers.values():
+        if isinstance(entry, dict):
+            entry["codemode"] = False
+    return servers
+
+
+def maybe_merge_user_provider_config(config: dict[str, object]) -> dict[str, object]:
+    """
+    Merge the user's global OpenCode config into the synthesized v2 config.
+
+    The per-session ``XDG_CONFIG_HOME`` hides ``~/.config/opencode``, so carry over
+    the user's providers, default model, plugins and MCP servers. Both v1
+    (``provider``, ``plugin``, flat ``mcp``) and v2 (``providers``, ``plugins``,
+    ``mcp.servers``) spellings are read; the result uses v2 keys only.
+    Synthesized entries always win; the user's model applies only when none is set.
+
+    :param config: The synthesized config dict.
+    :returns: A new dict with the user's entries merged in.
+    """
+    user = _read_user_opencode_config()
+    if user is None:
         return config
-
-    if not isinstance(user_config, dict):
-        return config
-
-    # Adopt the user's default ``model`` when the synthesized config pins none.
-    # ``setdefault`` keeps the synthesized value authoritative (gateway /
-    # spec-supplied ``model_override`` win); it only fills the gap where both
-    # were absent, so opencode-native launches on the user's chosen default
-    # instead of picking its own over the merged models map.
-    def _carry_model(target: dict[str, object]) -> None:
-        user_model = user_config.get("model")
-        if isinstance(user_model, str) and user_model:
-            target.setdefault("model", user_model)
-
-    def _merge_plugins(target: dict[str, object]) -> None:
-        """Preserve user plugins while retaining synthesized policy hooks."""
-        user_plugins = user_config.get("plugin")
-        if not isinstance(user_plugins, list):
-            return
-        existing = target.get("plugin")
-        merged: list[object] = list(existing) if isinstance(existing, list) else []
-        for plugin in user_plugins:
-            # Plugin entries are paths/identifiers; skip anything that isn't a
-            # non-empty string so we never emit a config OpenCode would reject.
-            if not isinstance(plugin, str) or not plugin:
-                continue
-            if plugin not in merged:
-                merged.append(plugin)
-        if merged:
-            target["plugin"] = merged
-
-    user_providers = user_config.get("provider")
-    if not isinstance(user_providers, dict) or not user_providers:
-        # No custom providers to merge, but the user's default model still
-        # applies when the synthesized config didn't pin one.
-        result = dict(config)
-        _carry_model(result)
-        _merge_plugins(result)
-        return result
-
     result = dict(config)
-    existing = result.get("provider")
-    if isinstance(existing, dict):
-        # Merge user's providers alongside existing ones; don't clobber
-        # synthesized providers (Omnigent's keys like "databricks-gateway"
-        # take priority).
-        merged = dict(existing)
-        for key, value in user_providers.items():
-            if key not in merged:
-                merged[key] = value
-        result["provider"] = merged
-    else:
-        result["provider"] = dict(user_providers)
 
-    _carry_model(result)
-    _merge_plugins(result)
-    result.setdefault("$schema", "https://opencode.ai/config.json")
+    user_providers = _user_providers(user)
+    if user_providers:
+        existing = result.get("providers")
+        merged = dict(existing) if isinstance(existing, Mapping) else {}
+        for pid, entry in user_providers.items():
+            merged.setdefault(pid, entry)
+        result["providers"] = merged
 
+    user_model = _user_model(user)
+    if user_model:
+        result.setdefault("model", user_model)
+
+    user_plugins = _user_plugins(user)
+    if user_plugins:
+        existing_plugins = result.get("plugins")
+        plugins: list[object] = (
+            list(existing_plugins) if isinstance(existing_plugins, list) else []
+        )
+        for plugin in user_plugins:
+            if plugin not in plugins:
+                plugins.append(plugin)
+        result["plugins"] = plugins
+
+    user_servers = _user_mcp_servers(user)
+    if user_servers:
+        mcp = result.get("mcp")
+        if isinstance(mcp, Mapping) and "servers" not in mcp:
+            # A v1-shaped flat ``mcp`` map (server entries at the top level):
+            # lift it under ``servers`` so the written config is v2-shaped.
+            mcp_block: dict[str, object] = {}
+            servers = dict(mcp)
+        else:
+            mcp_block = dict(mcp) if isinstance(mcp, Mapping) else {}
+            current = mcp_block.get("servers")
+            servers = dict(current) if isinstance(current, Mapping) else {}
+        for name, entry in user_servers.items():
+            servers.setdefault(name, entry)
+        mcp_block["servers"] = servers
+        result["mcp"] = mcp_block
+
+    result.setdefault("$schema", OPENCODE_CONFIG_SCHEMA)
     return result
 
 
@@ -699,24 +932,123 @@ def _configure_opencode_on_demand() -> None:
         _logger.info("opencode on-demand ucode configure failed", exc_info=True)
 
 
-def _provider_base_urls_match_host(config: Mapping[str, object], workspace_host: str) -> bool:
-    """True when every opencode provider base URL is HTTPS and shares
-    *workspace_host*'s network location.
+UCODE_AUTH_PLUGIN_ID = "omnigent-ucode-auth"
+# Tolerates a trailing ``;`` and a multi-line array literal.
+_UCODE_AUTH_COMMAND_RE = re.compile(
+    r"^const AUTH_COMMAND = (\[[^\]]*\])\s*;?[ \t]*$", re.MULTILINE
+)
 
-    Guards the managed-connect path: a broker bearer is forwarded to whatever
-    ``provider.<id>.options.baseURL`` the on-disk config names, so a stale/other
-    origin must not be trusted. Requires at least one base URL (a provider block
-    with none is not a usable gateway target).
+_UCODE_AUTH_PLUGIN_JS = """// Databricks token refresh (generated by Omnigent; do not edit).
+// Mints via ucode's auth-token command and stamps each model HTTP request.
+import { execFile } from "node:child_process"
+import { promisify } from "node:util"
+
+const PROVIDERS = __PROVIDERS__
+const AUTH_COMMAND = __AUTH_COMMAND__
+const REFRESH_SKEW_MS = 120_000
+const run = promisify(execFile)
+
+let accessToken
+let expiresAt = 0
+let refreshPromise
+
+function cacheToken(value) {
+  accessToken = value
+  expiresAt = Infinity
+  try {
+    const claims = JSON.parse(Buffer.from(value.split(".")[1], "base64url").toString())
+    if (typeof claims.exp === "number") expiresAt = claims.exp * 1000
+  } catch {}
+}
+
+async function mintToken() {
+  try {
+    const { stdout } = await run(AUTH_COMMAND[0], AUTH_COMMAND.slice(1), { encoding: "utf8" })
+    const token = stdout.trim()
+    if (!token) throw new Error("returned an empty token")
+    cacheToken(token)
+  } catch (error) {
+    const detail = String(error.stderr || error.message || "").trim()
+    throw new Error("ucode auth-token failed" + (detail ? ": " + detail : ""))
+  }
+}
+
+function refreshToken() {
+  if (!refreshPromise) refreshPromise = mintToken().finally(() => { refreshPromise = undefined })
+  return refreshPromise
+}
+
+export default {
+  id: "omnigent-ucode-auth",
+  setup: async (ctx) => {
+    for (const providerID of PROVIDERS) {
+      await ctx.session.hook(
+        "http.request",
+        async (event) => {
+          if (!accessToken || expiresAt <= Date.now() + REFRESH_SKEW_MS) await refreshToken()
+          const headers = new Headers(event.request.headers)
+          headers.set("Authorization", "Bearer " + accessToken)
+          event.request = new Request(event.request, { headers })
+        },
+        { providerID },
+      )
+      // A 401 means the cached token is stale; the next retry mints a fresh one.
+      await ctx.session.hook(
+        "http.response",
+        (event) => {
+          if (event.response.status === 401) expiresAt = 0
+        },
+        { providerID },
+      )
+    }
+  },
+}
+"""
+
+
+def render_ucode_auth_plugin(*, providers: Sequence[str], auth_command: Sequence[str]) -> str:
+    """
+    Render the v2 plugin that stamps ucode-minted Databricks tokens on model requests.
+
+    :param providers: opencode provider ids to authenticate, e.g. ``["databricks-oss"]``.
+    :param auth_command: ucode's mint argv, e.g. ``["ucode", "auth-token", "--force-refresh"]``.
+    :returns: The ``server.js`` source.
+    """
+    return _UCODE_AUTH_PLUGIN_JS.replace("__PROVIDERS__", json.dumps(list(providers))).replace(
+        "__AUTH_COMMAND__", json.dumps(list(auth_command))
+    )
+
+
+def _ucode_auth_command(plugin_source: str) -> list[str] | None:
+    """Extract ``AUTH_COMMAND`` from ucode's generated (v1) ``ucode-auth.js``."""
+    match = _UCODE_AUTH_COMMAND_RE.search(plugin_source)
+    if match is None:
+        return None
+    try:
+        argv = json.loads(match.group(1))
+    except ValueError:
+        return None
+    if not isinstance(argv, list) or not argv or not all(isinstance(a, str) for a in argv):
+        return None
+    return argv
+
+
+def _provider_base_urls_match_host(config: Mapping[str, object], workspace_host: str) -> bool:
+    """True when every v2 provider ``settings.baseURL`` is HTTPS on *workspace_host*.
+
+    Guards the managed-connect path: a broker bearer is forwarded to whatever base
+    URL the on-disk config names, so a stale/other origin must not be trusted.
+    Requires at least one base URL.
     """
     from omnigent.host.databricks_credential import https_url_on_workspace_host
 
-    providers = config.get("provider")
+    providers = config.get("providers")
     if not isinstance(providers, Mapping):
         return False
     saw_url = False
     for provider in providers.values():
-        options = provider.get("options") if isinstance(provider, Mapping) else None
-        base_url = options.get("baseURL") if isinstance(options, Mapping) else None
+        settings = provider.get("settings") if isinstance(provider, Mapping) else None
+        base_url = settings.get("baseURL") if isinstance(settings, Mapping) else None
         if not isinstance(base_url, str) or not base_url:
             continue
         saw_url = True
@@ -725,27 +1057,23 @@ def _provider_base_urls_match_host(config: Mapping[str, object], workspace_host:
     return saw_url
 
 
-def managed_connect_opencode_config(xdg_config_home: Path) -> dict[str, object] | None:
-    """Consume ucode's generated opencode config on a managed connect host.
+def managed_connect_opencode_config(
+    xdg_config_home: Path, bridge_dir: Path
+) -> dict[str, object] | None:
+    """Build v2 config fragments from ucode's opencode output on a managed connect host.
 
-    The opencode counterpart to Claude reading ``read_ucode_state``: on a managed
-    connect host, ``ucode configure --agents opencode`` (run at host boot) writes
-    ``~/.config/opencode/opencode.json`` (provider block + served-model selectors)
-    and a ``plugin/ucode-auth.js`` that mints a fresh Databricks token per request
-    via ``ucode auth-token`` (→ the broker). omnigent isolates opencode to a
-    per-session ``XDG_CONFIG_HOME``, so this reuses ucode's output: it returns
-    ucode's config (to seed the session ``opencode.json``) after copying the auth
-    plugin into the session plugin dir and pointing ``plugin`` at the copy.
+    ucode (run at host boot) writes a v1 ``opencode.json`` and a v1
+    ``plugin/ucode-auth.js``. The provider blocks are converted to v2 and an
+    Omnigent-owned v2 auth plugin reusing ucode's ``AUTH_COMMAND`` is written into
+    *bridge_dir*. The caller must forward ``DATABRICKS_BEARER_COMMAND`` into the
+    opencode env so ``ucode auth-token`` can mint.
 
-    Reuse over reinvention — the same ucode artifact serves OSS connect sandboxes
-    here, lakebox (via ``ucode opencode``), and ucode's own users; refresh comes
-    from ucode's plugin, not a static omnigent-minted token.
-
-    Returns ``None`` off a managed connect host (no broker sidecar) or when ucode
-    did not generate an opencode config — so laptop and non-connect launches are
-    untouched. The caller must also forward ``DATABRICKS_BEARER_COMMAND`` into the
-    opencode process env so the plugin's ``ucode auth-token`` can mint.
+    :param xdg_config_home: Per-session ``XDG_CONFIG_HOME`` (stale v1 plugin copies removed here).
+    :param bridge_dir: Bridge dir that receives the ``omnigent-ucode-auth`` plugin package.
+    :returns: ``{"model"?, "providers", "plugins"}``, or ``None`` off a managed host
+        or when ucode's output is unusable.
     """
+    from omnigent.harnesses.opencode_native.bridge import write_plugin_package
     from omnigent.host.databricks_credential import _read_sidecar, _sidecar_path
 
     sidecar = _read_sidecar(_sidecar_path())
@@ -757,29 +1085,28 @@ def managed_connect_opencode_config(xdg_config_home: Path) -> dict[str, object] 
     ucode_config_dir = Path.home() / ".ucode" / "opencode-xdg" / "opencode"
     ucode_config = ucode_config_dir / "opencode.json"
     if not ucode_config.exists():
-        # The boot-time configure_ucode_for_sandbox runs in the background and may
-        # not have written opencode's config yet when this launch resolves. Unlike
-        # claude/codex/pi, opencode has no working hand-built fallback on the
-        # connect path, so configure it on demand here (a few seconds, off the
-        # runner's dial-back path). Best-effort; a failure just declines below.
+        # The boot-time configure may not have run yet; configure on demand.
         _configure_opencode_on_demand()
     try:
-        config = json.loads(ucode_config.read_text(encoding="utf-8"))
+        raw = json.loads(ucode_config.read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
         _logger.info("opencode managed config: unreadable ucode config %s: %r", ucode_config, exc)
         return None
-    if not isinstance(config, dict) or "provider" not in config:
+    raw_providers = raw.get("provider") if isinstance(raw, dict) else None
+    if not isinstance(raw_providers, Mapping) or not raw_providers:
         _logger.info(
             "opencode managed config: ucode did not configure opencode (no provider block in %s); "
             "opencode falls back to its own login.",
             ucode_config,
         )
-        return None  # ucode did not configure opencode (e.g. not in --agents)
-    # Security: the config on disk carries the provider base URL, and we forward a
-    # freshly-minted broker bearer to it. A stale config (left from a previous
-    # workspace connection) or a locally-modified file could aim that bearer at a
-    # different origin. Only trust it when every provider base URL is HTTPS and
-    # targets the sidecar's current workspace host.
+        return None
+    providers = {
+        str(pid): v1_provider_to_v2(entry)
+        for pid, entry in raw_providers.items()
+        if isinstance(entry, Mapping)
+    }
+    config: dict[str, object] = {"providers": providers}
+    # Security: only forward a broker bearer to HTTPS base URLs on the sidecar's host.
     if not _provider_base_urls_match_host(config, workspace_host):
         _logger.warning(
             "opencode managed config: provider base URL is not HTTPS on the connected "
@@ -791,19 +1118,27 @@ def managed_connect_opencode_config(xdg_config_home: Path) -> dict[str, object] 
 
     ucode_plugin = ucode_config_dir / "plugin" / "ucode-auth.js"
     try:
-        plugin_src = ucode_plugin.read_text(encoding="utf-8")
+        auth_command = _ucode_auth_command(ucode_plugin.read_text(encoding="utf-8"))
     except OSError as exc:
+        _logger.info("opencode managed config: unreadable ucode plugin %s (%r)", ucode_plugin, exc)
+        auth_command = None
+    if auth_command is None:
         _logger.info(
-            "opencode managed config: provider block present but the refresh plugin %s is "
-            "unreadable (%r); declining so no static bearer is used.",
+            "opencode managed config: no AUTH_COMMAND in %s; declining so no static bearer is "
+            "used.",
             ucode_plugin,
-            exc,
         )
-        return None  # provider block without the refresh plugin is not usable
-    session_plugin_dir = xdg_config_home / "opencode" / "plugin"
-    session_plugin_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-    session_plugin = session_plugin_dir / "ucode-auth.js"
-    session_plugin.write_text(plugin_src, encoding="utf-8")
-    # Point at the session copy; the caller appends its own policy plugin.
-    config["plugin"] = [str(session_plugin)]
+        return None
+
+    # A v1 copy from an older launch would be auto-discovered and fail to load.
+    (xdg_config_home / "opencode" / "plugin" / "ucode-auth.js").unlink(missing_ok=True)
+    plugin_dir = write_plugin_package(
+        bridge_dir,
+        UCODE_AUTH_PLUGIN_ID,
+        source=render_ucode_auth_plugin(providers=list(providers), auth_command=auth_command),
+    )
+    config["plugins"] = [str(plugin_dir)]
+    model = raw.get("model")
+    if isinstance(model, str) and "/" in model:
+        config["model"] = model
     return config
