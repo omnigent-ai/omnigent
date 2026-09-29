@@ -6,7 +6,7 @@ name: E2E Tests
 #
 # Triggers:
 #   schedule            09:00 UTC daily (alongside nightly.yml).
-#   workflow_dispatch   manual run. Inputs: `branch` (non-main ref) and
+#   workflow_dispatch   manual run on the selected workflow ref. Input:
 #                       `parallelism` (pytest `-n` worker count).
 #   pull_request        PR gate for ALL PRs -- same-repo AND fork. This suite
 #                       runs entirely against the in-process mock LLM (no
@@ -26,10 +26,6 @@ on:
     paths-ignore: ['web/**', 'tests/e2e_ui/**', 'CHANGELOG.md']
   workflow_dispatch:
     inputs:
-      branch:
-        description: "Branch to run e2e tests against"
-        required: false
-        default: "main"
       parallelism:
         description: "Number of pytest workers per shard (-n flag). Default 2 keeps per-shard concurrency low so the 4 shards * 2 workers = 8 concurrent gateway calls stays below the nightly's pain point (20 concurrent triggered 429s)."
         required: false
@@ -39,7 +35,7 @@ concurrency:
   # PRs key by number, dispatch by branch (so re-runs cancel); schedule keys
   # by SHA so each merge to `main` gets its own run. Label events append the
   # label name so they get an isolated slot and never cancel a code-push run.
-  group: e2e-${{ github.workflow }}-${{ github.event.pull_request.number || github.event.inputs.branch || github.sha }}-${{ (github.event.action == 'labeled' || github.event.action == 'unlabeled') && github.event.label.name || 'run' }}
+  group: e2e-${{ github.workflow }}-${{ github.event.pull_request.number || (github.event_name == 'workflow_dispatch' && github.ref) || github.sha }}-${{ (github.event.action == 'labeled' || github.event.action == 'unlabeled') && github.event.label.name || 'run' }}
   cancel-in-progress: true
 
 permissions:
@@ -116,12 +112,9 @@ jobs:
 
     steps:
       - name: Checkout
+        # The default is the PR merge commit for pull_request and the workflow
+        # ref for schedule/dispatch, keeping checked-out code in its cache scope.
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
-        with:
-          # PRs (same-repo and fork) test the merge result (refs/pull/N/merge --
-          # absent when the PR conflicts, so a conflicted PR fails checkout by
-          # design). Schedule / dispatch fall back to the branch / ref.
-          ref: ${{ github.event.pull_request.number && format('refs/pull/{0}/merge', github.event.pull_request.number) || github.event.inputs.branch || github.ref }}
 
       # Steps below are shared verbatim with server-compat.yml's backcompat-e2e
       # job via the composite action, so the two never drift. server_version

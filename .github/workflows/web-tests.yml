@@ -44,12 +44,18 @@ jobs:
       - name: Set up pnpm
         uses: ./.github/actions/setup-pnpm
 
+      - name: Run Electron storage-isolation unit test
+        run: node --test web/electron/test/browserViewRegistry_storage_isolation.test.js
+
       - name: Install dependencies
         # Pin the npm registry to the npmjs default; limit to the web package
         # so the Electron package's large native devDependencies are not fetched.
         env:
           NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
         run: pnpm install --frozen-lockfile --filter web
+
+      - name: Run Electron Design-mode unit regressions
+        run: node --test web/electron/test/designModeScript.test.js
 
       - name: Check formatting
         run: pnpm --filter web run format:check

@@ -25,11 +25,13 @@ from fastapi import Request
 
 from omnigent.db.utils import shared_read_scope
 from omnigent.entities import Conversation
+from omnigent.entities.agent import Agent
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.auth import (
     LEVEL_OWNER,
     RESERVED_USER_LOCAL,
     AuthProvider,
+    local_single_user_enabled,
 )
 from omnigent.server.permissions import (
     check_session_access,
@@ -408,3 +410,106 @@ def get_session_owner_id(
         if g.level >= LEVEL_OWNER:
             return g.user_id
     return None
+
+
+def _can_mutate_agent(
+    user_id: str | None,
+    agent: Agent,
+    permission_store: PermissionStore | None,
+) -> bool:
+    """Whether the caller satisfies the agent-ownership mutation gate."""
+    if permission_store is None or local_single_user_enabled():
+        return True
+    if user_id is not None and permission_store.is_admin(user_id):
+        return True
+    return agent.created_by is not None and user_id == agent.created_by
+
+
+def can_mutate_session_agent(
+    user_id: str | None,
+    conversation_id: str,
+    agent: Agent,
+    permission_store: PermissionStore | None,
+    conversation_store: ConversationStore,
+    *,
+    conversation: Conversation | None = None,
+) -> bool:
+    """Return whether the caller may mutate this session's agent bundle.
+
+    The capability requires both effective session ownership (including a
+    child session's parent chain) and ownership of the bound agent. It mirrors
+    the two authorization gates used by bundle and MCP mutations, while
+    preserving auth-disabled, local-single-user, and administrator behavior.
+
+    :param user_id: The authenticated caller, or ``None`` when auth is off.
+    :param conversation_id: Session whose agent would be mutated.
+    :param agent: Agent bound to the session.
+    :param permission_store: Permission store, or ``None`` when auth is off.
+    :param conversation_store: Store used for parent-chain resolution.
+    :param conversation: Optional already-loaded authoritative session row.
+    :returns: ``True`` when both mutation gates allow the caller.
+    """
+    if agent.session_id is None:
+        return False
+    if permission_store is None:
+        return True
+    if not check_session_access(
+        user_id,
+        conversation_id,
+        LEVEL_OWNER,
+        permission_store,
+        conversation_store,
+        conversation=conversation,
+    ):
+        return False
+    return _can_mutate_agent(user_id, agent, permission_store)
+
+
+def require_agent_owner(
+    user_id: str | None,
+    agent: Agent,
+    permission_store: PermissionStore | None,
+) -> None:
+    """Authorize mutation of a session-scoped agent: owner or admin only.
+
+    A session-scoped agent's bundle carries code that later runs with the
+    runner's authority, so only the user who created it (or a workspace
+    admin) may replace or edit it. A ``LEVEL_EDIT`` grant on the *request's*
+    session is deliberately insufficient: session sharing hands out EDIT to
+    collaborators, and agent reuse lets several sessions with different owners
+    reference one agent row.
+
+    A legacy row (``created_by`` NULL — created before ownership tracking, or
+    minted by a switch) records no trustworthy owner, and the reverse lookup to
+    an owning session is not dependable (reuse spreads the agent across roots,
+    and sessions can be deleted). Such rows are therefore admin-only: the owner
+    regains a mutable agent by re-uploading the bundle, which creates a fresh
+    row stamped with their identity.
+
+    Assumes the caller already rejected template agents (``session_id is
+    None``) as read-only, so this only sees session-scoped agents.
+
+    :param user_id: The authenticated caller, or ``None`` when auth is off.
+    :param agent: The session-scoped agent being mutated. Its ``created_by``
+        is the authoritative owner when set; a ``None`` value is admin-only.
+    :param permission_store: Permission store, or ``None`` when auth is off.
+    :raises OmnigentError: 403 when the caller is neither the owner nor an
+        admin.
+    """
+    # Auth disabled, local single-user, and workspace admins bypass.
+    if _can_mutate_agent(user_id, agent, permission_store):
+        return
+    # Legacy / unowned row: admins only (handled above); everyone else denied.
+    if agent.created_by is None:
+        raise OmnigentError(
+            f"agent {agent.id!r} predates ownership tracking; it can only be "
+            "updated by an admin, or re-uploaded by its owner",
+            code=ErrorCode.FORBIDDEN,
+        )
+    # Explicit owner.
+    if user_id is not None and user_id == agent.created_by:
+        return
+    raise OmnigentError(
+        f"{user_id!r} is not the owner of agent {agent.id!r}",
+        code=ErrorCode.FORBIDDEN,
+    )

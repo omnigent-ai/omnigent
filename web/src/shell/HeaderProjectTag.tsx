@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { FolderIcon, FolderPlusIcon } from "lucide-react";
+import { FolderPlusIcon } from "lucide-react";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -7,8 +7,7 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { useMoveToProject } from "@/hooks/useConversations";
-import { cn } from "@/lib/utils";
-import { ProjectPicker } from "./ProjectPicker";
+import { ProjectPicker, ProjectRowIcon } from "./ProjectPicker";
 
 /**
  * The breadcrumb's leading folder segment, as a Slack-style "Move
@@ -19,16 +18,17 @@ import { ProjectPicker } from "./ProjectPicker";
  * mobile shells hide the breadcrumb.
  *
  * Filed sessions show `[folder] /` with a "Currently in: ‹project›" tooltip;
- * unfiled ones show a faint add-to-project folder that only fully reveals on
- * hover, with a "Move session" tooltip — an entry point for an empty state
- * without cluttering the title.
+ * unfiled ones show an add-to-project folder with a "Move session" tooltip.
  */
 export function HeaderProjectTag({
   conversationId,
   projectName,
+  projectIcon,
 }: {
   conversationId: string;
   projectName: string | null;
+  /** The filed project's emoji icon, or `null`/absent for the folder glyph. */
+  projectIcon?: string | null;
 }) {
   const moveToProject = useMoveToProject();
   const [open, setOpen] = useState(false);
@@ -52,13 +52,10 @@ export function HeaderProjectTag({
                   type="button"
                   data-testid="header-project-tag"
                   aria-label={projectName ? `Project: ${projectName}` : "Add to project"}
-                  className={cn(
-                    "breadcrumb-folder flex shrink-0 cursor-pointer items-center rounded text-muted-foreground transition-opacity hover:opacity-100 focus-visible:opacity-100 data-[state=open]:opacity-100 focus-visible:outline-none",
-                    projectName ? "opacity-40" : "opacity-30",
-                  )}
+                  className="breadcrumb-folder flex size-6 shrink-0 cursor-pointer items-center justify-center rounded-md text-muted-foreground opacity-100 transition-colors hover:bg-muted hover:text-foreground focus-visible:outline-none"
                 >
                   {projectName ? (
-                    <FolderIcon className="size-4" />
+                    <ProjectRowIcon icon={projectIcon} className="size-4 text-[16px]" />
                   ) : (
                     <FolderPlusIcon className="size-4" />
                   )}

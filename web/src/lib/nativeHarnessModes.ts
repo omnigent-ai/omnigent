@@ -16,6 +16,56 @@ export interface NativeHarnessMode {
   args: string[];
 }
 
+export type PermissionModeConcept =
+  "manual" | "automatic" | "edit-automatic" | "read-only" | "deny" | "full-access" | "default";
+
+const PERMISSION_MODE_CONCEPTS: Record<string, Record<string, PermissionModeConcept>> = {
+  "claude-native": {
+    default: "manual",
+    auto: "automatic",
+    acceptEdits: "edit-automatic",
+    plan: "read-only",
+    dontAsk: "deny",
+    bypassPermissions: "full-access",
+  },
+  "codex-native": {
+    default: "automatic",
+    "full-access": "full-access",
+    "read-only": "read-only",
+    bypass: "full-access",
+  },
+  "cursor-native": {
+    default: "manual",
+    "auto-review": "automatic",
+    plan: "read-only",
+    ask: "read-only",
+    yolo: "full-access",
+  },
+  "antigravity-native": {
+    default: "manual",
+    skip: "full-access",
+  },
+};
+
+const PERMISSION_HARNESS_ALIASES: Record<string, string> = {
+  "native-claude": "claude-native",
+  "native-codex": "codex-native",
+  "native-cursor": "cursor-native",
+  "native-antigravity": "antigravity-native",
+  "agy-native": "antigravity-native",
+  "native-agy": "antigravity-native",
+};
+
+/** Shared permission concept for presentation across native harness vocabularies. */
+export function permissionModeConcept(
+  harness: string | null | undefined,
+  value: string | null | undefined,
+): PermissionModeConcept {
+  if (!harness || !value) return "default";
+  const canonicalHarness = PERMISSION_HARNESS_ALIASES[harness] ?? harness;
+  return PERMISSION_MODE_CONCEPTS[canonicalHarness]?.[value] ?? "default";
+}
+
 // Antigravity (agy) permission control. agy exposes exactly ONE pre-emptive
 // knob — `--dangerously-skip-permissions`, an all-or-nothing bypass — with no
 // per-tool equivalent of acceptEdits/plan, so this is a two-value toggle rather
@@ -81,6 +131,40 @@ export const CURSOR_NATIVE_EXEC_MODES: NativeHarnessMode[] = [
     label: "Yolo",
     description: "Runs everything without prompts or safety checks",
     args: ["--yolo"],
+  },
+];
+
+// Devin's own permission vocabulary (`devin --help`), deliberately NOT Claude's:
+// Devin's rungs differ, and it reads them from `--permission-mode`. "auto" is
+// Devin's own default, so it sends no flag. Keep in sync with `devin --help`.
+// Values are Devin's CANONICAL names (it also accepts `auto` for `normal` and
+// `bypass`/`yolo` for `dangerous`), because a mid-session switch stores the mode
+// the pane confirmed — which is always the canonical one.
+export const DEVIN_NATIVE_DEFAULT_PERMISSION_MODE = "normal";
+export const DEVIN_NATIVE_PERMISSION_MODES: NativeHarnessMode[] = [
+  {
+    value: "normal",
+    label: "Normal",
+    description: "Auto-approves read-only tools; prompts for anything else",
+    args: [],
+  },
+  {
+    value: "accept-edits",
+    label: "Accept edits",
+    description: "Also auto-approves edits inside the workspace",
+    args: ["--permission-mode", "accept-edits"],
+  },
+  {
+    value: "smart",
+    label: "Smart",
+    description: "Also auto-runs actions a fast model judges safe",
+    args: ["--permission-mode", "smart"],
+  },
+  {
+    value: "dangerous",
+    label: "Dangerous",
+    description: "Auto-approves every tool, with no prompts",
+    args: ["--permission-mode", "dangerous"],
   },
 ];
 

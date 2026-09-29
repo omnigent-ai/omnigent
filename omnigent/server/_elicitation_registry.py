@@ -2,7 +2,11 @@
 
 The sessions route uses these to bridge a client-issued elicitation
 verdict (PATCH on the session) to the in-flight Future an upstream
-caller is awaiting. Keyed by ``elicitation_id``.
+caller is awaiting. Keyed by ``elicitation_id`` — but harness-supplied
+ids are deterministic (derived from the session and request), and
+imported sessions share a ``conversation_id`` across workspaces, so the
+key is namespaced by workspace to keep one tenant's verdict from
+resolving another's parked Future.
 """
 
 from __future__ import annotations
@@ -11,14 +15,17 @@ import asyncio
 from dataclasses import dataclass
 from typing import Any
 
+from omnigent.db.workspace_cache import WorkspaceScopedCache
 from omnigent.server.schemas import ElicitationResult
 
-_harness_elicitation_registry: dict[str, asyncio.Future[ElicitationResult]] = {}
+_harness_elicitation_registry: WorkspaceScopedCache[str, asyncio.Future[ElicitationResult]] = (
+    WorkspaceScopedCache()
+)
 
 # Maps ``elicitation_id`` to the conversation id that issued it, so
 # the PATCH handler can verify the caller owns the elicitation
 # before resolving the Future.
-_harness_elicitation_owners: dict[str, str] = {}
+_harness_elicitation_owners: WorkspaceScopedCache[str, str] = WorkspaceScopedCache()
 
 
 @dataclass
@@ -48,12 +55,19 @@ class _ParkedHarnessElicitation:
         application-level signal is needed because
         ``request.is_disconnected()`` does not fire promptly behind the
         Databricks Apps proxy's idle-connection heartbeats.
+    :param request_fingerprint: Digest of the elicitation's request
+        params, e.g. a sha256 hex string. Copied onto a verdict
+        tombstone written while this waiter may be a zombie, so a
+        re-park only adopts the verdict for the SAME logical question
+        (harness ids can be reused across distinct requests). ``None``
+        when the caller supplied no params to fingerprint.
     """
 
     session_id: str
     tool_name: str | None
     tool_input: dict[str, Any] | None
     resolved_elsewhere: asyncio.Event
+    request_fingerprint: str | None = None
 
 
 @dataclass(frozen=True)
@@ -73,23 +87,39 @@ class _PreResolvedHarnessElicitation:
     :param result: Web verdict to hand a re-parking hook, e.g.
         ``ElicitationResult(action="accept")``, or ``None`` for a
         terminal-side resolution.
+    :param request_fingerprint: Digest of the request params the verdict
+        answered, copied from the parked waiter when the resolve found
+        one still registered (or digested from the pending prompt on the
+        nothing-parked gap path). A re-park adopts a verdict-carrying
+        tombstone only when its own params produce the same digest, so a
+        LATER, different question that reuses the same harness id
+        (harness request ids recur) can never inherit a stale approval.
+        ``None`` when the producer had no params to fingerprint; a
+        verdict-carrying tombstone without a fingerprint fails closed at
+        consume time (dropped, prompt re-published) rather than falling
+        back to adopt-by-id.
     """
 
     session_id: str
     created_at: float
     result: ElicitationResult | None = None
+    request_fingerprint: str | None = None
 
 
 # Maps ``elicitation_id`` to its parked-elicitation state. Populated
 # while a harness hook long-poll is parked; popped when it returns.
-_harness_parked_elicitations: dict[str, _ParkedHarnessElicitation] = {}
+_harness_parked_elicitations: WorkspaceScopedCache[str, _ParkedHarnessElicitation] = (
+    WorkspaceScopedCache()
+)
 
 # Maps deterministic ``elicitation_id`` values to the session that
 # resolved them before the harness hook registered its parked wait. The
 # hook consumes the tombstone at registration time, which closes the
 # race between a native client answering instantly and the Omnigent hook
 # request reaching this process.
-_harness_pre_resolved_elicitations: dict[str, _PreResolvedHarnessElicitation] = {}
+_harness_pre_resolved_elicitations: WorkspaceScopedCache[str, _PreResolvedHarnessElicitation] = (
+    WorkspaceScopedCache()
+)
 
 
 def reset_for_tests() -> None:

@@ -66,7 +66,7 @@ def test_run_resume_picker_cancel_exits_cleanly(monkeypatch: pytest.MonkeyPatch)
         invoked.append("run_claude_native")
 
     monkeypatch.setattr(
-        "omnigent.claude_native.run_claude_native",
+        "omnigent.harnesses.claude_native.main.run_claude_native",
         _fail_if_called,
     )
 
@@ -109,7 +109,7 @@ def test_dispatch_by_runtime_claude_native_remote_routes_to_wrapper(
         """
         captured.update(kwargs)
 
-    monkeypatch.setattr("omnigent.claude_native.run_claude_native", _capture)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.main.run_claude_native", _capture)
 
     resume_dispatch._dispatch_by_runtime(
         target="4e92b5a0c0ee6db3f874f9c4a3f855a5",
@@ -151,7 +151,7 @@ def test_dispatch_by_runtime_opencode_native_routes_to_wrapper(
         """
         captured.update(kwargs)
 
-    monkeypatch.setattr("omnigent.opencode_native.run_opencode_native", _capture)
+    monkeypatch.setattr("omnigent.harnesses.opencode_native.main.run_opencode_native", _capture)
 
     resume_dispatch._dispatch_by_runtime(
         target="4e92b5a0c0ee6db3f874f9c4a3f855a5",
@@ -188,7 +188,7 @@ def test_dispatch_by_runtime_codex_native_remote_routes_to_wrapper(
         """
         captured.update(kwargs)
 
-    monkeypatch.setattr("omnigent.codex_native.run_codex_native", _capture)
+    monkeypatch.setattr("omnigent.harnesses.codex_native.main.run_codex_native", _capture)
 
     resume_dispatch._dispatch_by_runtime(
         target="4e92b5a0c0ee6db3f874f9c4a3f855a5",
@@ -225,7 +225,7 @@ def test_dispatch_by_runtime_codex_native_local_routes_to_wrapper(
         """
         captured.update(kwargs)
 
-    monkeypatch.setattr("omnigent.codex_native.run_codex_native", _capture)
+    monkeypatch.setattr("omnigent.harnesses.codex_native.main.run_codex_native", _capture)
 
     resume_dispatch._dispatch_by_runtime(
         target="415c9954e2fe4b9276083a4d2c66f689",
@@ -251,7 +251,7 @@ def test_dispatch_by_runtime_kiro_native_remote_routes_to_wrapper(
     def _capture(**kwargs: Any) -> None:
         captured.update(kwargs)
 
-    monkeypatch.setattr("omnigent.kiro_native.run_kiro_native", _capture)
+    monkeypatch.setattr("omnigent.harnesses.kiro_native.main.run_kiro_native", _capture)
 
     resume_dispatch._dispatch_by_runtime(
         target="823dbd1aab969b5a813fac59bb977a77",
@@ -292,7 +292,9 @@ def test_dispatch_by_runtime_antigravity_native_remote_routes_to_wrapper(
         """
         captured.update(kwargs)
 
-    monkeypatch.setattr("omnigent.antigravity_native.run_antigravity_native", _capture)
+    monkeypatch.setattr(
+        "omnigent.harnesses.antigravity_native.main.run_antigravity_native", _capture
+    )
 
     resume_dispatch._dispatch_by_runtime(
         target="a8bcbee631c58ddb98fb5e3f54a1592a",
@@ -329,7 +331,9 @@ def test_dispatch_by_runtime_antigravity_native_local_routes_to_wrapper(
         """
         captured.update(kwargs)
 
-    monkeypatch.setattr("omnigent.antigravity_native.run_antigravity_native", _capture)
+    monkeypatch.setattr(
+        "omnigent.harnesses.antigravity_native.main.run_antigravity_native", _capture
+    )
 
     resume_dispatch._dispatch_by_runtime(
         target="e85224ee39457def1d20bcce5b74ed8c",
@@ -366,7 +370,7 @@ def test_dispatch_by_runtime_claude_native_local_still_routes_to_wrapper(
         """
         captured.update(kwargs)
 
-    monkeypatch.setattr("omnigent.claude_native.run_claude_native", _capture)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.main.run_claude_native", _capture)
 
     resume_dispatch._dispatch_by_runtime(
         target="64a784c3aa907d1774f44313546947c6",
@@ -411,7 +415,7 @@ def test_dispatch_by_runtime_accepts_id_with_paste_punctuation(
         """Record the kwargs ``run_codex_native`` was called with."""
         captured.update(kwargs)
 
-    monkeypatch.setattr("omnigent.codex_native.run_codex_native", _capture)
+    monkeypatch.setattr("omnigent.harnesses.codex_native.main.run_codex_native", _capture)
 
     resume_dispatch._dispatch_by_runtime(target=pasted, server=None)
 
@@ -469,7 +473,7 @@ def test_dispatch_by_runtime_legacy_prefixed_id_canonicalized_to_bare_hex(
         """Record the kwargs ``run_codex_native`` was called with."""
         captured.update(kwargs)
 
-    monkeypatch.setattr("omnigent.codex_native.run_codex_native", _capture)
+    monkeypatch.setattr("omnigent.harnesses.codex_native.main.run_codex_native", _capture)
 
     resume_dispatch._dispatch_by_runtime(
         target="conv_415c9954e2fe4b9276083a4d2c66f689",
@@ -504,7 +508,7 @@ def test_dispatch_by_runtime_remote_forwards_non_uuid_id(
         """Record the kwargs ``run_claude_native`` was called with."""
         captured.update(kwargs)
 
-    monkeypatch.setattr("omnigent.claude_native.run_claude_native", _capture)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.main.run_claude_native", _capture)
 
     resume_dispatch._dispatch_by_runtime(
         target="2048200000527758",
@@ -599,7 +603,7 @@ def test_dispatch_by_runtime_non_claude_native_remote_raises_with_hint(
         del kwargs
         raise AssertionError("run_claude_native invoked on non-claude conv")
 
-    monkeypatch.setattr("omnigent.claude_native.run_claude_native", _fail_if_called)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.main.run_claude_native", _fail_if_called)
 
     with pytest.raises(click.ClickException) as excinfo:
         resume_dispatch._dispatch_by_runtime(

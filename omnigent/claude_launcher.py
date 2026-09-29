@@ -2,7 +2,7 @@
 
 The native Claude terminal is normally spawned as ``claude <args>`` -- the
 ``command`` defaults to ``"claude"`` in both launch paths:
-:func:`omnigent.claude_native._claude_terminal_request` (local CLI) and
+:func:`omnigent.harnesses.claude_native.main._claude_terminal_request` (local CLI) and
 ``_auto_create_claude_terminal`` in :mod:`omnigent.runner.app` (managed-host
 runner). Downstream integrations need to launch that *same* Claude Code process
 through a wrapper binary so the wrapper's process-level setup -- auth, telemetry,

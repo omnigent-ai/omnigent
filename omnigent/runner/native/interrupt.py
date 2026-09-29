@@ -39,17 +39,20 @@ from typing import TYPE_CHECKING, Protocol
 import httpx
 from fastapi.responses import JSONResponse, Response
 
-from omnigent.native_coding_agents import native_coding_agent_for_harness
+from omnigent.native.native_coding_agents import native_coding_agent_for_harness
 from omnigent.runner.native.orchestration import (
     _cancel_auto_forwarder_task,
     _claude_native_bridge_id_for_session,
     _session_labels_for_runner_spawn,
 )
-from omnigent.runner.resource_registry import SessionResourceRegistry
+from omnigent.runner.resource_registry import (
+    _STATUS_EMITTING_TERMINAL_ROLES,
+    SessionResourceRegistry,
+)
 
 if TYPE_CHECKING:
-    from omnigent.codex_native_bridge import CodexNativeBridgeState
     from omnigent.harness_plugins import NativeCodingAgent
+    from omnigent.harnesses.codex_native.bridge import CodexNativeBridgeState
 
 
 class SubagentDeliveryAck(Protocol):
@@ -101,7 +104,7 @@ class CodexBridgeStateForSession(Protocol):
 class _UniformInterrupt:
     """Descriptor for a uniform bridge-inject interrupt handler.
 
-    :param module: The harness bridge module, e.g. ``"omnigent.pi_native_bridge"``.
+    :param module: The harness bridge module, e.g. ``"omnigent.harnesses.pi_native.bridge"``.
     :param inject_fn: The bridge control function name — ``"inject_interrupt"``
         for the TUI harnesses, ``"enqueue_interrupt"`` for pi.
     :param error_code: The structured error code returned on failure, e.g.
@@ -140,12 +143,12 @@ class _UniformStop:
     display_name: str
 
 
-# The seven uniform interrupt harnesses (claude/codex are special-cased). pi uses
+# The eight uniform interrupt harnesses (claude/codex are special-cased). pi uses
 # enqueue_interrupt + OSError and no timeout; the rest inject_interrupt +
 # RuntimeError + timeout_s.
 _UNIFORM_INTERRUPT: dict[str, _UniformInterrupt] = {
     "pi": _UniformInterrupt(
-        "omnigent.pi_native_bridge",
+        "omnigent.harnesses.pi_native.bridge",
         "enqueue_interrupt",
         "pi_native_interrupt_failed",
         "pi-native interrupt",
@@ -154,7 +157,7 @@ _UNIFORM_INTERRUPT: dict[str, _UniformInterrupt] = {
         log_on_error=True,
     ),
     "cursor": _UniformInterrupt(
-        "omnigent.cursor_native_bridge",
+        "omnigent.harnesses.cursor_native.bridge",
         "inject_interrupt",
         "cursor_native_interrupt_failed",
         "cursor-native interrupt",
@@ -162,7 +165,7 @@ _UNIFORM_INTERRUPT: dict[str, _UniformInterrupt] = {
         True,
     ),
     "goose": _UniformInterrupt(
-        "omnigent.goose_native_bridge",
+        "omnigent.harnesses.goose_native.bridge",
         "inject_interrupt",
         "goose_native_interrupt_failed",
         "goose-native interrupt",
@@ -170,7 +173,7 @@ _UNIFORM_INTERRUPT: dict[str, _UniformInterrupt] = {
         True,
     ),
     "kiro": _UniformInterrupt(
-        "omnigent.kiro_native_bridge",
+        "omnigent.harnesses.kiro_native.bridge",
         "inject_interrupt",
         "kiro_native_interrupt_failed",
         "kiro-native interrupt",
@@ -178,7 +181,7 @@ _UNIFORM_INTERRUPT: dict[str, _UniformInterrupt] = {
         True,
     ),
     "kimi": _UniformInterrupt(
-        "omnigent.kimi_native_bridge",
+        "omnigent.harnesses.kimi_native.bridge",
         "inject_interrupt",
         "kimi_native_interrupt_failed",
         "kimi-native interrupt",
@@ -186,7 +189,7 @@ _UNIFORM_INTERRUPT: dict[str, _UniformInterrupt] = {
         True,
     ),
     "hermes": _UniformInterrupt(
-        "omnigent.hermes_native_bridge",
+        "omnigent.harnesses.hermes_native.bridge",
         "inject_interrupt",
         "hermes_native_interrupt_failed",
         "hermes-native interrupt",
@@ -194,53 +197,67 @@ _UNIFORM_INTERRUPT: dict[str, _UniformInterrupt] = {
         True,
     ),
     "qwen": _UniformInterrupt(
-        "omnigent.qwen_native_bridge",
+        "omnigent.harnesses.qwen_native.bridge",
         "inject_interrupt",
         "qwen_native_interrupt_failed",
         "qwen-native interrupt",
         (RuntimeError,),
         True,
     ),
+    "devin": _UniformInterrupt(
+        "omnigent.harnesses.devin_native.bridge",
+        "inject_interrupt",
+        "devin_native_interrupt_failed",
+        "devin-native interrupt",
+        (RuntimeError,),
+        True,
+    ),
 }
 
-# The six uniform stop harnesses (claude has a special stop; codex/pi have no
+# The seven uniform stop harnesses (claude has a special stop; codex/pi have no
 # distinct stop — they route to interrupt, handled in ``stop``).
 _UNIFORM_STOP: dict[str, _UniformStop] = {
     "cursor": _UniformStop(
-        "omnigent.cursor_native_bridge",
+        "omnigent.harnesses.cursor_native.bridge",
         "cursor_native_stop_failed",
         "cursor-native stop",
         "Cursor",
     ),
     "goose": _UniformStop(
-        "omnigent.goose_native_bridge",
+        "omnigent.harnesses.goose_native.bridge",
         "goose_native_stop_failed",
         "goose-native stop",
         "Goose",
     ),
     "kiro": _UniformStop(
-        "omnigent.kiro_native_bridge",
+        "omnigent.harnesses.kiro_native.bridge",
         "kiro_native_stop_failed",
         "kiro-native stop",
         "Kiro",
     ),
     "kimi": _UniformStop(
-        "omnigent.kimi_native_bridge",
+        "omnigent.harnesses.kimi_native.bridge",
         "kimi_native_stop_failed",
         "kimi-native stop",
         "Kimi",
     ),
     "hermes": _UniformStop(
-        "omnigent.hermes_native_bridge",
+        "omnigent.harnesses.hermes_native.bridge",
         "hermes_native_stop_failed",
         "hermes-native stop",
         "Hermes",
     ),
     "qwen": _UniformStop(
-        "omnigent.qwen_native_bridge",
+        "omnigent.harnesses.qwen_native.bridge",
         "qwen_native_stop_failed",
         "qwen-native stop",
         "Qwen",
+    ),
+    "devin": _UniformStop(
+        "omnigent.harnesses.devin_native.bridge",
+        "devin_native_stop_failed",
+        "devin-native stop",
+        "Devin",
     ),
 }
 
@@ -253,7 +270,7 @@ def native_agent_for_cancel(wrapper_label: str | None) -> NativeCodingAgent | No
     :returns: The matching :class:`~omnigent.harness_plugins.NativeCodingAgent`,
         or ``None`` when the label is missing or not native.
     """
-    from omnigent.native_coding_agents import (
+    from omnigent.native.native_coding_agents import (
         NATIVE_CODING_AGENTS,
         native_coding_agent_for_wrapper_label,
     )
@@ -333,7 +350,7 @@ class NativeInterruptRunner:
         spec = _UNIFORM_INTERRUPT.get(key)
         if spec is None:
             return None
-        return await self._uniform_interrupt(spec, conv_id)
+        return await self._uniform_interrupt(spec, conv_id, terminal_role=agent.harness)
 
     async def stop(self, harness_name: str | None, conv_id: str) -> Response | None:
         """Dispatch a stop_session to the harness's bridge.
@@ -401,7 +418,9 @@ class NativeInterruptRunner:
                 publish_event=self._publish_event,
             )
 
-    async def _uniform_interrupt(self, spec: _UniformInterrupt, conv_id: str) -> Response:
+    async def _uniform_interrupt(
+        self, spec: _UniformInterrupt, conv_id: str, *, terminal_role: str | None = None
+    ) -> Response:
         module = importlib.import_module(spec.module)
         bridge_dir = module.bridge_dir_for_session_id(conv_id)
         inject = getattr(module, spec.inject_fn)
@@ -422,6 +441,12 @@ class NativeInterruptRunner:
                     "detail": self._client_safe_error_detail(exc, context=spec.context),
                 },
             )
+        # A harness excluded from PTY-derived status owns its own cancel edge: an
+        # interrupt fires no lifecycle hook, so without this the web spins forever.
+        # The ones still on the watcher get their idle from pane quiescence, which
+        # is why publishing here would double it.
+        if terminal_role is not None and terminal_role not in _STATUS_EMITTING_TERMINAL_ROLES:
+            self._publish_event(conv_id, {"type": "session.status", "status": "idle"})
         self._wake_parent_after_native_interrupt(conv_id)
         return Response(status_code=204)
 
@@ -464,7 +489,10 @@ class NativeInterruptRunner:
         return Response(status_code=204)
 
     async def _claude_interrupt(self, conv_id: str) -> Response:
-        from omnigent.claude_native_bridge import bridge_dir_for_bridge_id, inject_interrupt
+        from omnigent.harnesses.claude_native.bridge import (
+            bridge_dir_for_bridge_id,
+            inject_interrupt,
+        )
 
         bridge_id = await _claude_native_bridge_id_for_session(
             server_client=self._server_client,
@@ -487,7 +515,7 @@ class NativeInterruptRunner:
         return Response(status_code=204)
 
     async def _claude_stop(self, conv_id: str) -> Response:
-        from omnigent.claude_native_bridge import (
+        from omnigent.harnesses.claude_native.bridge import (
             TmuxSessionNotAdvertised,
             bridge_dir_for_bridge_id,
             kill_session,
@@ -529,8 +557,8 @@ class NativeInterruptRunner:
         return Response(status_code=204)
 
     async def _codex_interrupt(self, conv_id: str) -> Response:
-        from omnigent.codex_native_app_server import client_for_transport
-        from omnigent.codex_native_bridge import (
+        from omnigent.harnesses.codex_native.app_server import client_for_transport
+        from omnigent.harnesses.codex_native.bridge import (
             CODEX_NATIVE_BRIDGE_ID_LABEL_KEY,
             bridge_dir_for_bridge_id,
             cancel_pending_mcp_startup,

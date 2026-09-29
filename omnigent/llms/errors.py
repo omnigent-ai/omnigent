@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from omnigent.errors import OmnigentError
+from omnigent.errors import ErrorCategory, ErrorImpact, ErrorPhase, OmnigentError
 
 # Provider ``exc.code`` / ``exc.body.error.code`` values that signal
 # a context-window overflow.  Currently OpenAI-origin codes; add
@@ -54,6 +54,35 @@ def is_context_length_exceeded(exc: BaseException) -> bool:
     return False
 
 
+def llm_error_category(code: str) -> ErrorCategory:
+    """Fault attribution for an LLM adapter error code.
+
+    LLM codes are a separate namespace from :class:`~omnigent.errors.ErrorCode`
+    (HTTP-status strings plus sentinel words), so they resolve here rather than
+    through ``category_for_code``.
+
+    :param code: The ``code`` on a :class:`RetryableLLMError` /
+        :class:`PermanentLLMError`, e.g. ``"429"``, ``"timeout"``,
+        ``"context_length_exceeded"``.
+    :returns: The mapped :class:`~omnigent.errors.ErrorCategory`.
+    """
+    if code in CONTEXT_EXCEEDED_CODES:
+        return ErrorCategory.USER
+    if code in ("timeout", "connection_error"):
+        # Transport failure. A provider-side network error/timeout is upstream; a
+        # runner tunnel disconnect is really ours, but the code alone can't tell
+        # them apart, so bias away from over-booking SERVER.
+        return ErrorCategory.UPSTREAM
+    if code.isdigit():
+        status = int(code)
+        if status in (401, 403):
+            return ErrorCategory.CONFIG  # bad provider key / gateway
+        if status == 429 or 500 <= status <= 599:
+            return ErrorCategory.UPSTREAM
+        return ErrorCategory.UNKNOWN  # other 4xx: our bad request vs provider policy
+    return ErrorCategory.UNKNOWN
+
+
 @dataclass
 class LLMErrorDetail:
     """
@@ -101,6 +130,22 @@ class RetryableLLMError(OmnigentError):
         super().__init__(message, code=code)
         self.detail = detail
 
+    @property
+    def category(self) -> ErrorCategory:
+        """Resolve attribution from the LLM code namespace, not ``ErrorCode``."""
+        return llm_error_category(self.code)
+
+    @property
+    def impact(self) -> ErrorImpact:
+        """Retryable by definition: transient unless retries exhaust and the turn
+        fails, which the turn's terminal outcome records as blocking."""
+        return ErrorImpact.TRANSIENT
+
+    @property
+    def phase(self) -> ErrorPhase:
+        """LLM calls happen while a turn is running."""
+        return ErrorPhase.TURN
+
 
 class PermanentLLMError(OmnigentError):
     """
@@ -125,6 +170,27 @@ class PermanentLLMError(OmnigentError):
     ) -> None:
         super().__init__(message, code=code)
         self.detail = detail
+
+    @property
+    def category(self) -> ErrorCategory:
+        """Resolve attribution from the LLM code namespace, not ``ErrorCode``.
+
+        ``ContextWindowExceededError`` inherits this; its
+        ``context_length_exceeded`` code resolves to ``USER``.
+        """
+        return llm_error_category(self.code)
+
+    @property
+    def impact(self) -> ErrorImpact:
+        """Not retried, so blocking by default. ``ContextWindowExceededError``
+        overrides this back to transient (it recovers via compaction)."""
+        return ErrorImpact.BLOCKING
+
+    @property
+    def phase(self) -> ErrorPhase:
+        """LLM calls happen while a turn is running (inherited by the context
+        overflow subclass)."""
+        return ErrorPhase.TURN
 
 
 class ContextWindowExceededError(PermanentLLMError):
@@ -163,3 +229,10 @@ class ContextWindowExceededError(PermanentLLMError):
         super().__init__(message, code=code, detail=detail)
         self.max_context_tokens = max_context_tokens
         self.actual_tokens = actual_tokens
+
+    @property
+    def impact(self) -> ErrorImpact:
+        """Recoverable by compacting the history and retrying, so transient. The
+        turn's terminal outcome still records blocking if the workflow does not
+        catch it and the turn fails."""
+        return ErrorImpact.TRANSIENT

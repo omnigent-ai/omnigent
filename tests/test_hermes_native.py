@@ -5,7 +5,7 @@ from __future__ import annotations
 import click
 import pytest
 
-from omnigent import hermes_native as hn
+from omnigent.harnesses.hermes_native import main as hn
 
 
 def test_resolve_hermes_executable_found() -> None:
@@ -73,7 +73,7 @@ def test_native_coding_agent_resolves() -> None:
         WRAPPER_LABEL_KEY,
     )
     from omnigent.harness_plugins import HERMES_NATIVE_CODING_AGENT
-    from omnigent.native_coding_agents import native_coding_agent_for_harness
+    from omnigent.native.native_coding_agents import native_coding_agent_for_harness
 
     agent = native_coding_agent_for_harness("native-hermes")
     assert agent is HERMES_NATIVE_CODING_AGENT

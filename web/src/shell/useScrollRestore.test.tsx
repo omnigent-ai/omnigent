@@ -11,19 +11,28 @@
 //   6. Saving resumes once the restore settles.
 //   7. A null key disables persistence entirely.
 
-import { useRef } from "react";
+import { startTransition, StrictMode, Suspense, useRef } from "react";
 import { act, cleanup, fireEvent, render } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   SCROLL_RESTORE_BUDGET_MS,
+  attachEditorScrollRestore,
   getSavedScrollTop,
   saveScrollTop,
   useScrollRestore,
 } from "./useScrollRestore";
 
-function Scroller({ scrollKey, ready }: { scrollKey: string | null; ready: boolean }) {
+function Scroller({
+  scrollKey,
+  ready,
+  restore = true,
+}: {
+  scrollKey: string | null;
+  ready: boolean;
+  restore?: boolean;
+}) {
   const ref = useRef<HTMLDivElement | null>(null);
-  const onScroll = useScrollRestore(ref, scrollKey, ready);
+  const onScroll = useScrollRestore(ref, scrollKey, ready, restore);
   return <div ref={ref} data-testid="scroller" onScroll={onScroll} />;
 }
 
@@ -113,16 +122,27 @@ describe("useScrollRestore", () => {
     expect(getSavedScrollTop("view:slow")).toBe(140);
   });
 
-  it("settles as soon as the target is reachable", async () => {
+  it("suppresses programmatic scroll saves through the budget even when reachable", async () => {
+    // The offset fits immediately, but the restore intentionally does NOT
+    // settle on first reach: a virtualized tree measures its rows after mount
+    // and shifts scrollTop, and that programmatic adjustment must not overwrite
+    // the saved offset. So a non-user scroll within the budget is ignored;
+    // only the budget expiring (or a user gesture) re-enables saving.
     saveScrollTop("view:reachable", 50);
     const { el } = mount("view:reachable");
-    // Tall content: the offset fits, so no budget needs to be spent.
     Object.defineProperty(el, "scrollHeight", { configurable: true, value: 1000 });
     await nextFrame();
 
+    // A measurement-driven (non-user) scroll mid-restore is not persisted.
     el.scrollTop = 60;
     fireEvent.scroll(el);
-    expect(getSavedScrollTop("view:reachable")).toBe(60);
+    expect(getSavedScrollTop("view:reachable")).toBe(50);
+
+    // Once the budget expires, saving resumes.
+    await settleRestore();
+    el.scrollTop = 75;
+    fireEvent.scroll(el);
+    expect(getSavedScrollTop("view:reachable")).toBe(75);
   });
 
   it("stops fighting the user when they scroll during a pending restore", async () => {
@@ -134,6 +154,20 @@ describe("useScrollRestore", () => {
     fireEvent.scroll(el);
 
     expect(getSavedScrollTop("view:wheel")).toBe(12);
+  });
+
+  it("stops fighting a keyboard / assistive-tech scroll during a pending restore", async () => {
+    // Keyboard scrolling (PageDown/arrows/Space) and AT scroll-into-view fire
+    // keydown, not wheel/pointer — the restore must yield to them too, or it
+    // snaps the reader back for the whole budget.
+    saveScrollTop("view:keydown", 300);
+    const { el } = mount("view:keydown");
+
+    fireEvent.keyDown(el, { key: "PageDown" });
+    el.scrollTop = 42;
+    fireEvent.scroll(el);
+
+    expect(getSavedScrollTop("view:keydown")).toBe(42);
   });
 
   it("saves again once the restore has settled", async () => {
@@ -161,4 +195,102 @@ describe("useScrollRestore", () => {
 
     expect(getSavedScrollTop("null")).toBeUndefined();
   });
+
+  it("keeps the restore armed under StrictMode's mount/cleanup/mount replay", () => {
+    // StrictMode replays setup → cleanup → setup on one commit. The effect's
+    // cleanup must NOT settle the pending restore, or the replay would leave it
+    // disarmed and a clamp-induced scroll event (scrollTop forced to 0 before
+    // content is tall) would overwrite the saved offset.
+    saveScrollTop("view:strict", 200);
+    const view = render(
+      <StrictMode>
+        <Scroller scrollKey="view:strict" ready />
+      </StrictMode>,
+    );
+    const el = view.getByTestId("scroller");
+
+    // A clamp to 0 (short content) fires a scroll during the still-pending
+    // restore; it must be ignored, not saved.
+    el.scrollTop = 0;
+    fireEvent.scroll(el);
+    expect(getSavedScrollTop("view:strict")).toBe(200);
+  });
 });
+
+it("lets explicit source navigation cancel a pending Monaco scroll restore", async () => {
+  const key = "monaco-cited-position";
+  saveScrollTop(key, 500);
+  let onScroll: ((event: { scrollTop: number }) => void) | undefined;
+  const editor = {
+    setScrollTop: vi.fn(),
+    onDidScrollChange: (listener: typeof onScroll) => {
+      onScroll = listener;
+      return { dispose: () => {} };
+    },
+  };
+  const cancel = attachEditorScrollRestore(
+    editor,
+    () => key,
+    () => true,
+  );
+  expect(editor.setScrollTop).toHaveBeenCalledWith(500);
+  cancel();
+  editor.setScrollTop.mockClear();
+  onScroll?.({ scrollTop: 900 });
+  await nextFrame();
+  expect(editor.setScrollTop).not.toHaveBeenCalled();
+  expect(getSavedScrollTop(key)).toBe(900);
+});
+
+it("saves new DOM scroll positions when explicit navigation overrides restoration", async () => {
+  const key = "source-cited-position";
+  saveScrollTop(key, 500);
+  const { view, el } = mount(key);
+  view.rerender(<Scroller scrollKey={key} ready restore={false} />);
+  el.scrollTop = 900;
+  fireEvent.scroll(el);
+  await nextFrame();
+  expect(el.scrollTop).toBe(900);
+  expect(getSavedScrollTop(key)).toBe(900);
+});
+
+it.each(["same file", "another file"])(
+  "keeps the committed scroll restore when navigation to %s suspends",
+  async (destination) => {
+    const key = `suspended-navigation:${destination}`;
+    saveScrollTop(key, 500);
+    const pending = new Promise<void>(() => {});
+    const attempted = vi.fn();
+    function Suspend({ blocked }: { blocked: boolean }) {
+      if (blocked) {
+        attempted();
+        throw pending;
+      }
+      return null;
+    }
+    const tree = (scrollKey: string, restore: boolean) => (
+      <Suspense fallback={<div>Loading navigation</div>}>
+        <Scroller scrollKey={scrollKey} ready restore={restore} />
+        <Suspend blocked={!restore} />
+      </Suspense>
+    );
+    const view = render(tree(key, true));
+    const el = view.getByTestId("scroller");
+
+    act(() => {
+      startTransition(() => {
+        view.rerender(tree(destination === "same file" ? key : `${key}:next`, false));
+      });
+    });
+    expect(attempted).toHaveBeenCalled();
+    expect(view.queryByText("Loading navigation")).toBeNull();
+    expect(view.getByTestId("scroller")).toBe(el);
+
+    el.scrollTop = 0;
+    fireEvent.scroll(el);
+    await nextFrame();
+    expect(el.scrollTop).toBe(500);
+    expect(getSavedScrollTop(key)).toBe(500);
+    view.rerender(tree(key, true));
+  },
+);

@@ -141,6 +141,9 @@ describe("nativeCodingAgentForSubagentWrapper", () => {
     expect(nativeCodingAgentForSubagentWrapper("antigravity-native-ui-subagent")?.displayName).toBe(
       "Antigravity",
     );
+    expect(nativeCodingAgentForSubagentWrapper("devin-native-ui-subagent")?.displayName).toBe(
+      "Devin",
+    );
   });
 
   it("does not resolve parent wrappers or unknown labels", () => {

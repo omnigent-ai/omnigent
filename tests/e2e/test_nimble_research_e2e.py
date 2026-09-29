@@ -17,9 +17,9 @@ Usage::
 
 from __future__ import annotations
 
+import atexit
 import json
 import os
-import socket
 import threading
 import uuid
 from collections.abc import Iterator
@@ -34,23 +34,6 @@ from tests.e2e.conftest import (
     register_inline_agent,
     send_user_message_to_session,
 )
-
-
-def _reserve_port() -> int:
-    """Reserve a free localhost port for the Agent API stub.
-
-    There is a small close-to-rebind window; acceptable for a
-    single-process opt-in e2e run.
-    """
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.bind(("127.0.0.1", 0))
-    port = int(sock.getsockname()[1])
-    sock.close()
-    return port
-
-
-_STUB_PORT = _reserve_port()
-os.environ["OMNIGENT_NIMBLE_RESEARCH_BASE_URL"] = f"http://127.0.0.1:{_STUB_PORT}"
 
 _E2E_AGENT_ID = "wsa_e2e00000-0000-4000-8000-000000000000"
 _E2E_RUN_ID = "task_run_e2e00000-0000-4000-8000-000000000000"
@@ -141,19 +124,28 @@ class _AgentV2StubHandler(BaseHTTPRequestHandler):
         del args
 
 
+# Keep the port bound from collection until process exit, including across
+# pytest-rerunfailures fixture invocations.
+_AGENT_V2_STUB_SERVER = HTTPServer(("127.0.0.1", 0), _AgentV2StubHandler)
+atexit.register(_AGENT_V2_STUB_SERVER.server_close)
+os.environ["OMNIGENT_NIMBLE_RESEARCH_BASE_URL"] = (
+    f"http://127.0.0.1:{_AGENT_V2_STUB_SERVER.server_port}"
+)
+
+
 @pytest.fixture
 def agent_v2_stub() -> Iterator[list[dict[str, object]]]:
     """Run the local Agent API v2 stub for the duration of the test."""
     _received_requests.clear()
     _poll_count["n"] = 0
-    server = HTTPServer(("127.0.0.1", _STUB_PORT), _AgentV2StubHandler)
+    server = _AGENT_V2_STUB_SERVER
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
         yield _received_requests
     finally:
         server.shutdown()
-        server.server_close()
+        thread.join()
 
 
 def test_nimble_research_v2_happy_path(

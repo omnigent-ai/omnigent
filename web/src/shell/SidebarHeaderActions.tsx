@@ -79,9 +79,9 @@ export function SidebarHeaderActions({
             is open; panel-left-open as "bring it back" once it is collapsed or
             merely peeking. */}
             {expanded ? (
-              <PanelRightOpenIcon className="ui-icon" />
+              <PanelRightOpenIcon className="size-4" />
             ) : (
-              <PanelLeftOpenIcon className="ui-icon" />
+              <PanelLeftOpenIcon className="size-4" />
             )}
           </Button>
         </TooltipTrigger>
@@ -104,7 +104,7 @@ export function SidebarHeaderActions({
 const SIDEBAR_FLOAT_BUTTON =
   "sidebar-glass-chip size-6 text-muted-foreground hover:text-foreground max-md:size-11 max-md:rounded-full max-md:text-foreground";
 
-const SIDEBAR_FLOAT_ICON = "ui-icon max-md:size-[22px]";
+const SIDEBAR_FLOAT_ICON = "size-4 max-md:size-[22px]";
 
 /**
  * Search (command palette) icon button.
@@ -165,21 +165,23 @@ export function SidebarSettingsButton({
   testId?: string;
 }) {
   return (
-    <Tooltip>
+    <Tooltip delayDuration={750}>
       <TooltipTrigger asChild>
         <Button
           asChild
           variant="ghost"
           size="icon-xs"
           aria-label="Settings"
-          className={cn(SIDEBAR_FLOAT_BUTTON, className)}
+          className={cn(SIDEBAR_FLOAT_BUTTON, "rounded-[8px] bg-transparent", className)}
         >
           <Link to="/settings" onClick={onSettingsClick} data-testid={testId}>
             <SettingsIcon className={SIDEBAR_FLOAT_ICON} />
           </Link>
         </Button>
       </TooltipTrigger>
-      <TooltipContent side="bottom">Settings</TooltipContent>
+      <TooltipContent side="bottom" sideOffset={14}>
+        Settings
+      </TooltipContent>
     </Tooltip>
   );
 }

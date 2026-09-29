@@ -15,30 +15,46 @@ Everything else below — which surface to drive, how to stand the recorder up, 
 the per-surface mechanics — is identical for both. Each agent's own AGENTS.md says
 which clip `kind` it produces and where it goes; this file is the how.
 
-## What is expected to yield a recording
+## When to record
 
-A `web` / `mobile` / `terminal` / `cli` / `desktop` facet is expected to yield a recording:
-drive it on that surface and film it. Only an `api` facet — a failure no user
-observes on any surface (a wrong value in a response, an internal state a pytest
-asserts) — legitimately has no recording; `recordings: []` is correct there and is
-not a gap. Tests may drive and verify the journey, but the clip itself must show
-the product surface and user-visible outcome, never the test process, pytest
-output, assertions, logs, or a synthetic evidence-summary slide.
+Record the user action and the product's response:
 
-**One verdict-appropriate clip per facet — nothing else.** Every recording must
-correspond to a facet, and its `kind` must match that facet's verdict. Do **not**
-add a "contrast"/"control" clip of a *different*, working journey next to a
-reproduced facet — an unrequested extra video with no facet behind it only
-confuses the reader.
+- **Web, mobile, or desktop:** show the user interacting with the product and
+  the result on screen.
+- **CLI or terminal output:** record the real command and its output, even if the
+  output is only an error message, hint, or status line.
+- **Internal/API-only results:** written evidence is enough when no user
+  interface shows the result. Set `recordings: []`, describe what you observed,
+  and explain how you checked it.
 
-Recording is **best-effort**: if the tooling below is missing, or a user-facing
-facet's state is genuinely unreachable in this harness, keep `recordings: []` for
-that facet and **name the specific blocker** in `recording_unavailable_reason` —
-an empty recordings list on a `web`/`mobile`/`terminal`/`cli`/`desktop` facet must
-always come with a concrete reason, never a silent skip. Never let recording block
-or distort the work itself, and never fabricate a hollow journey that doesn't
-reach the failure just to produce a video. Missing or rejected footage never
-blocks the verdict, fix, or PR.
+For example, if `omnigent host` prints the wrong error after login expires,
+record running that command with an expired login and showing its output. See
+the `cli` section below for setup steps.
+
+## What the clip must show
+
+- Show the actual product behavior. Tests may drive the interaction and verify
+  the result, but the clip must show the product itself.
+- Do not substitute a video of pytest output, assertions, test source, debug
+  logs, or a slide describing what happened. Do not invent a different journey
+  just to produce a video.
+- Record one clip per facet, with a `kind` that matches its verdict. Do not add
+  unrelated working examples as extra clips.
+
+## If recording is blocked
+
+Recording is **best-effort**:
+
+- If a required tool is missing or the product cannot reach the state you need
+  to show, set `recordings: []` for that facet. Name the specific blocker in
+  `recording_unavailable_reason`, such as missing `vhs` or `ttyd`, or a server
+  that cannot start.
+- Text-only CLI output is not a reason to skip recording. A missing recording
+  from an earlier run is not a reason either.
+- Do not block the verdict, fix, or PR because footage is missing or rejected.
+  Explain the gap and continue with the available evidence.
+
+## File names and capture modes
 
 Every declared recording includes `capture_mode`, which records how the product
 surface was filmed. Use `playwright_ui` for browser-page capture, `electron` for

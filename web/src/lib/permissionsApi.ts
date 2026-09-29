@@ -14,6 +14,19 @@ import { authenticatedFetch } from "./identity";
  */
 export const LEVEL_OWNER = 4;
 
+export function workspaceSharingBlocked(workspace: string | null | undefined): boolean {
+  if (!workspace?.startsWith("/")) return false;
+
+  const parts: string[] = [];
+  for (const part of workspace.split("/")) {
+    if (part === "..") parts.pop();
+    else if (part && part !== ".") parts.push(part);
+  }
+  const prefix = workspace.startsWith("//") && !workspace.startsWith("///") ? "//" : "/";
+  const path = prefix + parts.join("/");
+  return /^(?:\/|\/root|\/(?:home|Users|var\/home)\/[^/]+)$/.test(path);
+}
+
 /**
  * Return whether a permission level denotes the session owner.
  *

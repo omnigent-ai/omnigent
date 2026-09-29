@@ -24,22 +24,30 @@ When to use each implementation:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+import uuid
 from collections.abc import Callable
 from typing import cast
 
 import httpx
 
-from omnigent.json_types import JsonObject as _JsonObject
 from omnigent.runner import pending_approvals
+from omnigent.runner.mcp_execution_registry import (
+    MCP_OPERATION_ID_PARAM,
+    RUNNER_MCP_EXECUTION_DETACHED_CODE,
+    McpExecutionRegistry,
+)
 from omnigent.runner.mcp_manager import McpSchemasResult
 from omnigent.runner.tool_dispatch import MCP_PROXY_CALL_TIMEOUT_S
 from omnigent.spec.types import AgentSpec
+from omnigent.util.json_types import JsonObject as _JsonObject
 
 _logger = logging.getLogger(__name__)
 
 _EventPublisher = Callable[[str, _JsonObject], None]
+_SERVER_RECONNECT_WAIT_S = 120.0
 
 
 def _json_object(value: object) -> _JsonObject | None:
@@ -56,6 +64,71 @@ def _response_json_object(response: httpx.Response) -> _JsonObject:
     if result is None:
         raise ValueError("MCP proxy response must be a JSON object")
     return result
+
+
+def _input_response(
+    verdict: pending_approvals.Verdict,
+    input_request: _JsonObject | None,
+) -> _JsonObject:
+    """
+    Build the MRTR ``inputResponses`` entry for one resolved elicitation.
+
+    Carries the person's ``content`` when the prompt collected fields, so a
+    server that asked "which environment?" is told which one rather than
+    only that someone said yes. The content arrives from a browser, so it is
+    validated against the request's ``requestedSchema`` first — an answer
+    that does not fit (undeclared keys, wrong types, values outside an enum)
+    is not forwarded across the trust boundary; the entry declines rather
+    than smuggling unvalidated fields or substituting an answer nobody gave.
+
+    :param verdict: The resolved verdict for this elicitation.
+    :param input_request: The ``inputRequests`` entry this verdict answers,
+        carrying ``params.requestedSchema``; ``None`` when unavailable.
+    :returns: The wire object for this elicitation id.
+    """
+    from omnigent.tools._elicitation_schema import (
+        build_accept_content_from_schema,
+        schema_requires_fields,
+        validate_content_against_schema,
+    )
+
+    if not verdict.approved:
+        return {"action": "decline"}
+    # The Omnigent server always populates ``params.requestedSchema`` on its
+    # InputRequiredResult; a missing schema with supplied content fails closed.
+    params = _json_object(input_request.get("params")) if input_request else None
+    schema = _json_object(params.get("requestedSchema")) if params else None
+    schema_dict = cast("dict[str, object]", schema) if schema is not None else None
+    content = validate_content_against_schema(verdict.content, schema_dict)
+    if content is None and verdict.content:
+        # An answer WAS given but does not conform — fail closed instead of
+        # forwarding it or letting the server act on a value nobody chose.
+        _logger.warning(
+            "MCP proxy elicitation answer does not conform to the "
+            "requestedSchema — declining instead of forwarding it"
+        )
+        return {"action": "decline"}
+    if content is None and schema_requires_fields(schema_dict):
+        # Nobody chose, but the server requires fields — the surface
+        # collected none (a bare approve card, or the REPL's y/n prompt).
+        # Fall back to the schema auto-fill the inline path uses, so a
+        # consent-shaped schema (e.g. the policy-ASK required boolean)
+        # still accepts instead of inverting the person's answer.
+        content = build_accept_content_from_schema(schema_dict) if schema_dict else None
+        if content is None:
+            # Nothing to fall back on either (e.g. a required free-form
+            # field): an accept without the fields the server requires is
+            # malformed — it rejects it and the MRTR retry loop spins — so
+            # decline, matching the inline path's required-aware gate.
+            _logger.info(
+                "MCP proxy elicitation accepted with no content for a schema "
+                "that requires fields — declining instead"
+            )
+            return {"action": "decline"}
+    response: _JsonObject = {"action": "accept"}
+    if content is not None:
+        response["content"] = cast(object, content)
+    return response
 
 
 def _json_object_list(value: object) -> list[_JsonObject]:
@@ -86,6 +159,7 @@ class ProxyMcpManager:
         session_id: str,
         ap_client: httpx.AsyncClient,
         publish_event: _EventPublisher | None = None,
+        execution_registry: McpExecutionRegistry | None = None,
     ) -> None:
         """Create a proxy manager bound to one session.
 
@@ -97,10 +171,13 @@ class ProxyMcpManager:
             when the user decides (keeps the approval-badge counter in
             sync).  Pass ``None`` only in test contexts where the badge
             is irrelevant.
+        :param execution_registry: Runner-owned MCP operations that a new
+            server generation can reattach to after a tunnel replacement.
         """
         self._session_id = session_id
         self._omnigent_client = ap_client
         self._publish_event = publish_event
+        self._execution_registry = execution_registry
 
     @property
     def _mcp_url(self) -> str:
@@ -248,15 +325,65 @@ class ProxyMcpManager:
         """
         del spec  # Omnigent server resolves spec from session context
 
-        payload: _JsonObject = {
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "tools/call",
-            "params": {"name": tool_name, "arguments": arguments},
-        }
+        operation_id = f"mcpop_{uuid.uuid4().hex}"
+        registry = self._execution_registry
+        if registry is not None:
+            registry.retain_operation(self._session_id, operation_id)
+        try:
+            return await self._call_tool_with_operation(tool_name, arguments, operation_id)
+        finally:
+            if registry is not None:
+                registry.release_operation(self._session_id, operation_id)
 
-        # At most two iterations: initial call + one approval retry.
-        for _attempt in range(2):
+    async def _call_tool_with_operation(
+        self,
+        tool_name: str,
+        arguments: _JsonObject,
+        operation_id: str,
+    ) -> str:
+        """Run one proxy call under an already-retained operation id."""
+        request_id = 1
+
+        def _initial_payload() -> _JsonObject:
+            return {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "method": "tools/call",
+                "params": {
+                    "name": tool_name,
+                    "arguments": arguments,
+                    MCP_OPERATION_ID_PARAM: operation_id,
+                },
+            }
+
+        async def _wait_to_reattach(
+            request_generation: int,
+            cause: BaseException | None = None,
+        ) -> None:
+            registry = self._execution_registry
+            if registry is None or not registry.has_operation(self._session_id, operation_id):
+                raise RuntimeError(
+                    f"MCP proxy call for tool {tool_name!r} in session "
+                    f"{self._session_id!r} lost its server without a reserved "
+                    "runner operation"
+                ) from cause
+            try:
+                await pending_approvals.wait_for_server_reconnect(
+                    request_generation,
+                    timeout_seconds=_SERVER_RECONNECT_WAIT_S,
+                )
+            except asyncio.TimeoutError as reconnect_exc:
+                raise RuntimeError(
+                    f"MCP proxy call for tool {tool_name!r} in session "
+                    f"{self._session_id!r} lost its server and no replacement "
+                    f"connected within {_SERVER_RECONNECT_WAIT_S:.0f}s"
+                ) from reconnect_exc
+
+        payload = _initial_payload()
+        approval_retries = 0
+
+        while True:
+            request_generation = pending_approvals.current_server_generation()
             try:
                 resp = await self._omnigent_client.post(
                     self._mcp_url,
@@ -274,6 +401,14 @@ class ProxyMcpManager:
                 )
                 resp.raise_for_status()
                 data = _response_json_object(resp)
+            except httpx.TransportError as exc:
+                await _wait_to_reattach(request_generation, exc)
+                # Reattach the new server generation to the same runner-owned
+                # operation. A fresh JSON-RPC id distinguishes this transport
+                # attempt; the operation id prevents external work from replaying.
+                request_id += 1
+                payload = cast("_JsonObject", {**payload, "id": request_id})
+                continue
             except Exception as exc:
                 raise RuntimeError(
                     f"MCP proxy call failed for tool {tool_name!r} in session "
@@ -288,6 +423,11 @@ class ProxyMcpManager:
                     )
                 code = err.get("code")
                 msg = err.get("message", "")
+                if code == RUNNER_MCP_EXECUTION_DETACHED_CODE:
+                    await _wait_to_reattach(request_generation)
+                    request_id += 1
+                    payload = cast("_JsonObject", {**payload, "id": request_id})
+                    continue
                 # -32000 is the MCP convention for server-defined errors (tool
                 # denials, tool errors).  Return as a JSON error string so the
                 # harness feeds the refusal back to the LLM rather than raising.
@@ -307,7 +447,7 @@ class ProxyMcpManager:
             # Park for user approval and retry with inputResponses per the
             # MCP Multi Round-Trip Requests spec.
             if result.get("resultType") == "input_required":
-                if _attempt >= 1:
+                if approval_retries >= 1:
                     # Guard against unexpected re-elicitation after one retry.
                     return json.dumps({"error": "Approval loop exceeded"})
 
@@ -330,25 +470,39 @@ class ProxyMcpManager:
                     if self._publish_event is not None
                     else (lambda _s, _e: None)
                 )
-                approved = await pending_approvals.wait_for_user_approval(
-                    elicitation_id=elicitation_id,
-                    conversation_id=self._session_id,
-                    publish_event=publisher,
-                )
+                try:
+                    verdict = await pending_approvals.wait_for_user_verdict(
+                        elicitation_id=elicitation_id,
+                        conversation_id=self._session_id,
+                        publish_event=publisher,
+                        retry_on_server_reconnect=True,
+                    )
+                except pending_approvals.ServerReconnected:
+                    # requestState and its elicitation id belong to the server
+                    # generation that issued them. Re-run the original call so
+                    # the connected generation can create an answerable gate.
+                    request_id += 1
+                    payload = _initial_payload()
+                    continue
 
+                request_id += 1
                 payload = {
                     "jsonrpc": "2.0",
-                    "id": 2,  # MRTR spec: retry MUST use a different id
+                    "id": request_id,  # MRTR retry MUST use a different id
                     "method": "tools/call",
                     "params": {
                         "name": tool_name,
                         "arguments": arguments,
+                        MCP_OPERATION_ID_PARAM: operation_id,
                         "requestState": request_state,
                         "inputResponses": {
-                            elicitation_id: {"action": "accept" if approved else "decline"}
+                            elicitation_id: _input_response(
+                                verdict, _json_object(input_requests.get(elicitation_id))
+                            ),
                         },
                     },
                 }
+                approval_retries += 1
                 continue
 
             # ── Normal result (ALLOW or post-approval execution) ──────────
@@ -368,8 +522,6 @@ class ProxyMcpManager:
                     return json.dumps({"error": text})
                 return text if text else json.dumps(result)
             return json.dumps(result)
-
-        return json.dumps({"error": "Approval retry loop exhausted"})
 
     async def prewarm(self, spec: AgentSpec) -> None:
         """No-op — the Omnigent server warms connections lazily via ServerMcpPool.

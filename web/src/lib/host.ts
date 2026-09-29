@@ -1,5 +1,7 @@
 import type { ReactNode } from "react";
 
+import { getBasePath, withBasePath } from "./basePath.ts";
+
 /**
  * Embed host integration seam.
  *
@@ -93,6 +95,8 @@ export type OmnigentAnalyticsEvent =
     };
 
 export interface OmnigentHostConfig {
+  /** Stable server/workspace identity used to scope browser-local extension storage. */
+  serverIdentity?: string;
   /**
    * Maps an web API path (always starting with `/v1`, `/health`, or
    * `/api/...`) to a `Response`. The host implementation is responsible for
@@ -169,6 +173,14 @@ let hostConfig: OmnigentHostConfig = {};
 let hostConfigGeneration = 0;
 let embedRoot: HTMLElement | null = null;
 let embedScopeRoot: HTMLElement | null = null;
+
+export function getOmnigentServerIdentity(): string | null {
+  if (hostConfig.serverIdentity?.trim()) return hostConfig.serverIdentity.trim();
+  // Standalone has one same-origin server. Embedded hosts can proxy many
+  // backends behind one origin and must provide an explicit stable identity.
+  if (hostConfig.fetcher) return null;
+  return typeof window === "undefined" ? "server" : window.location.origin;
+}
 
 export function setOmnigentHostConfig(config: OmnigentHostConfig): void {
   // Guard: never clobber an already-installed fetcher with an empty config.
@@ -294,9 +306,11 @@ export function getThemeRoots(): HTMLElement[] {
  */
 export function hostFetch(path: string, init?: RequestInit): Promise<Response> {
   if (hostConfig.fetcher) {
+    // The host owns path rebasing (it proxies onto its own API surface), so
+    // the path is passed through untouched — `withBasePath` is standalone-only.
     return hostConfig.fetcher(path, init);
   }
-  return fetch(path, init);
+  return fetch(withBasePath(path), init);
 }
 
 export function resolveWebSocketUrl(path: string): string {
@@ -304,15 +318,15 @@ export function resolveWebSocketUrl(path: string): string {
     return hostConfig.resolveWebSocketUrl(path);
   }
   const scheme = window.location.protocol === "https:" ? "wss:" : "ws:";
-  return `${scheme}//${window.location.host}${path}`;
+  return `${scheme}//${window.location.host}${withBasePath(path)}`;
 }
 
 /**
  * Full server URL for CLI `--server` flags shown in in-product docs.
- * Returns `window.location.origin` plus the optional
- * {@link OmnigentHostConfig.cliServerUrlSuffix}.
+ * Returns `window.location.origin` plus the configured base path plus the
+ * optional {@link OmnigentHostConfig.cliServerUrlSuffix}.
  */
 export function getCliServerUrl(): string {
   const origin = typeof window !== "undefined" ? window.location.origin : "";
-  return origin + (hostConfig.cliServerUrlSuffix ?? "");
+  return origin + getBasePath() + (hostConfig.cliServerUrlSuffix ?? "");
 }

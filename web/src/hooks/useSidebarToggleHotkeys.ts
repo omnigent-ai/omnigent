@@ -1,7 +1,8 @@
 // ⌘⌥[ / ⌘⌥] (Ctrl+Alt+[ / Ctrl+Alt+] on Win/Linux) toggle the left
 // (Conversations) and right (Workspace) sidebars. Siblings to the session-switch
-// (⌘↑/↓) and approve (⌘↵) hotkeys; like them they fire even inside a focused
-// text field, so a panel can be collapsed mid-compose.
+// (⌘[ / ⌘]) and approve (⌘↵) hotkeys; like them they fire even inside a focused
+// text field, so a panel can be collapsed mid-compose. Platform-aware: only the
+// ⌘ chord fires on macOS and only the Ctrl chord on Win/Linux.
 //
 // Why this chord: the bare ⌘[ / ⌘] are the browser's Back/Forward gestures, and
 // single ⌘+punctuation combos (e.g. ⌘\) get swallowed by global hotkey utilities
@@ -12,6 +13,8 @@
 
 import { useEffect, useRef } from "react";
 
+import { hasCommandModifier, isMacPlatform } from "@/lib/hotkeys";
+
 export interface SidebarToggleHandlers {
   /** Flip the left (Conversations) sidebar. Bound to ⌘/Ctrl + ⌥/Alt + [. */
   onToggleLeft: () => void;
@@ -19,7 +22,10 @@ export interface SidebarToggleHandlers {
   onToggleRight: () => void;
 }
 
-export function useSidebarToggleHotkeys(handlers: SidebarToggleHandlers): void {
+export function useSidebarToggleHotkeys(
+  handlers: SidebarToggleHandlers,
+  isMac = isMacPlatform(),
+): void {
   // Held in a ref so the bound handler always calls the latest closures without
   // re-registering each render.
   const latest = useRef(handlers);
@@ -27,9 +33,9 @@ export function useSidebarToggleHotkeys(handlers: SidebarToggleHandlers): void {
 
   useEffect(() => {
     const handler = (e: globalThis.KeyboardEvent): void => {
-      // Require Cmd/Ctrl AND Alt (the ⌘⌥ message-nav chord) and additionally
-      // reject Shift, so ⌘⌥⇧ combos stay free for future bindings.
-      if (!(e.metaKey || e.ctrlKey) || !e.altKey || e.shiftKey) return;
+      // Require the platform command modifier AND Alt (the ⌘⌥ message-nav chord)
+      // and additionally reject Shift, so ⌘⌥⇧ combos stay free for future bindings.
+      if (!hasCommandModifier(e, isMac) || !e.altKey || e.shiftKey) return;
       // AltGr often reports as Ctrl+Alt; ignore it so intl-layout typing doesn't
       // accidentally toggle sidebars while focused in an editor/composer. Guard
       // the call: not every environment implements getModifierState, and an
@@ -54,5 +60,5 @@ export function useSidebarToggleHotkeys(handlers: SidebarToggleHandlers): void {
 
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
-  }, []);
+  }, [isMac]);
 }

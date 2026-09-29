@@ -4,7 +4,7 @@ The native ``kiro-native`` ("Kiro") wrapper is terminal-first: the ``kiro-cli``
 TUI runs in the session terminal, the SPA's **Terminal** view attaches to that
 live TUI over a WebSocket, and the SPA's **Chat** view renders the SAME canonical
 transcript the TUI prints. A native forwarder
-(:mod:`omnigent.kiro_native_session_forwarder`) tails Kiro's structured session
+(:mod:`omnigent.harnesses.kiro_native.session_forwarder`) tails Kiro's structured session
 JSONL and mirrors the transcript back OUT as conversation items; web-composer
 messages are injected INTO the TUI's tmux pane by
 :class:`omnigent.inner.kiro_native_executor.KiroNativeExecutor`. This suite is the

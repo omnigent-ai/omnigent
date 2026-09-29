@@ -26,13 +26,14 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import contextlib
 import email.policy
-import functools
 import hmac
 import ipaddress
 import logging
 import socket
 import ssl
+from collections.abc import Callable
 from dataclasses import dataclass
 from email.message import Message
 from email.parser import BytesParser
@@ -43,6 +44,7 @@ from urllib.parse import urlparse
 from omnigent.inner.credential_proxy import (
     SYNTHETIC_CREDENTIAL_PREFIX,
     CredentialRewriteRule,
+    CredentialSourceUnavailable,
 )
 from omnigent.inner.egress.certs import HostCertCache
 from omnigent.inner.egress.rules import (
@@ -55,6 +57,7 @@ from omnigent.inner.egress.rules import (
 logger = logging.getLogger(__name__)
 
 _CONNECT_RESPONSE = b"HTTP/1.1 200 Connection Established\r\n\r\n"
+_HTTP2_PREFACE_FIRST_LINE = b"PRI * HTTP/2.0\r\n"
 _BUF_SIZE = 65536
 _HEADER_MAX = 65536
 # S6 (security): the smallest printable ASCII byte (SP). Any byte below
@@ -113,12 +116,14 @@ class _AuthRewriteResult:
         when a synthetic placeholder matched, otherwise the input bytes
         unchanged.
     :param error: A human-readable reason to reject the request with
-        ``403`` (a placeholder was sent to the wrong host or is unknown),
+        ``403`` (placeholder misuse) or ``502`` (credential source failure),
         or ``None`` when the request may proceed.
+    :param status_code: HTTP error status when ``error`` is set.
     """
 
     headers: bytes
     error: str | None
+    status_code: int = 403
 
 
 # S2 (security): CSP-internal endpoints that present as globally
@@ -235,8 +240,11 @@ class EgressProxy:
         # agent-controlled trust store entirely.
         if upstream_ca_bundle is not None:
             self._upstream_ssl_ctx = ssl.create_default_context(cafile=str(upstream_ca_bundle))
+            self._upstream_h2_ssl_ctx = ssl.create_default_context(cafile=str(upstream_ca_bundle))
         else:
             self._upstream_ssl_ctx = ssl.create_default_context()
+            self._upstream_h2_ssl_ctx = ssl.create_default_context()
+        self._upstream_h2_ssl_ctx.set_alpn_protocols(["h2"])
         self._block_private_destinations = block_private_destinations
         self._auth_token = auth_token
         # Two indexes over the rewrite rules:
@@ -246,16 +254,16 @@ class EgressProxy:
         #   injects the real credential. Exactly one rule per host — the
         #   parser rejects duplicate-host bindings, so this map never
         #   silently drops a rule.
-        # - ``_cred_by_synthetic``: the opt-in placeholder path. Only
-        #   entries that injected an ``oa_cred_*`` env var register here;
-        #   the synthetic is globally unique so it alone identifies the
-        #   rule (and thus the bound host) for the swap + leak guard.
+        # - ``_cred_by_synthetic``: the opt-in placeholder path. One
+        #   placeholder may intentionally serve several configured hosts.
         self._cred_by_host: dict[str, CredentialRewriteRule] = {}
-        self._cred_by_synthetic: dict[str, CredentialRewriteRule] = {}
+        self._cred_by_synthetic: dict[str, dict[str, CredentialRewriteRule]] = {}
+        self._credential_resolutions: dict[tuple[int, int], asyncio.Future[str]] = {}
         for rule in credential_rewrites or []:
-            self._cred_by_host[rule.host.lower()] = rule
+            host = rule.host.lower()
+            self._cred_by_host[host] = rule
             if rule.synthetic is not None:
-                self._cred_by_synthetic[rule.synthetic] = rule
+                self._cred_by_synthetic.setdefault(rule.synthetic, {})[host] = rule
         # Precompute the expected header bytes ONCE so the per-request
         # comparison is a constant-time memcmp instead of repeating
         # the base64 round-trip on every connection. Stored as bytes
@@ -509,6 +517,11 @@ class EgressProxy:
         await writer.drain()
 
         ssl_ctx = self._cert_cache.get_ssl_context(host)
+        self._configure_server_ssl_context(host, ssl_ctx)
+        if self._allows_http2_passthrough(host):
+            ssl_ctx.set_alpn_protocols(["h2", "http/1.1"])
+        else:
+            ssl_ctx.set_alpn_protocols(["http/1.1"])
 
         # Wire the post-handshake reader / protocol *before* calling
         # ``start_tls`` and pass them in directly, rather than calling
@@ -564,96 +577,96 @@ class EgressProxy:
             return
 
         tls_writer = asyncio.StreamWriter(tls_transport, tls_protocol, tls_reader, loop)
+        self._tls_handshake_completed(tls_writer)
 
         try:
-            inner_first = await asyncio.wait_for(tls_reader.readline(), timeout=30)
-            if not inner_first:
-                return
+            while True:
+                inner_first = await asyncio.wait_for(tls_reader.readline(), timeout=30)
+                if not inner_first:
+                    return
 
-            inner_line = inner_first.decode("latin-1", errors="replace").strip()
+                if inner_first == _HTTP2_PREFACE_FIRST_LINE:
+                    if not self._allows_unrestricted_host(host):
+                        logger.warning(
+                            "BLOCKED-H2 https://%s — HTTP/2 requires an unrestricted host rule",
+                            host,
+                        )
+                        await self._send_forbidden(
+                            tls_writer, "HTTP/2 requires an unrestricted host rule"
+                        )
+                        return
+                    if host.lower() in self._cred_by_host:
+                        logger.warning(
+                            "BLOCKED-H2-CREDENTIAL https://%s — opaque HTTP/2 "
+                            "cannot rewrite credentials",
+                            host,
+                        )
+                        await self._send_forbidden(
+                            tls_writer, "HTTP/2 cannot use a credential rewrite rule"
+                        )
+                        return
+                    logger.info("ALLOW-H2 https://%s/**", host)
+                    await self._forward_http2(tls_reader, tls_writer, host, port, inner_first)
+                    return
 
-            # S6 (security): a sandboxed agent controls these
-            # MITM-decrypted bytes, so the policy parse and the bytes we
-            # forward upstream MUST NOT be able to diverge. The primary
-            # guard is re-serializing the forwarded request line from the
-            # parsed (method, path) below — that makes the upstream
-            # receive byte-for-byte what the policy authorized, no matter
-            # how ``str.split()`` tokenized the line. (``str.split()`` with
-            # no argument splits on *any* Unicode whitespace, which after
-            # the ``latin-1`` decode includes not just bare
-            # ``\r``/``\t``/``\v``/``\f`` but also NEL ``0x85`` and NBSP
-            # ``0xa0`` — so a control-byte filter alone would be
-            # insufficient.) As defense in depth we additionally reject
-            # any control byte (< SP) here, which gives a clean 403 for
-            # the classic bare-``\r``/``\t`` request-line smuggle instead
-            # of silently normalizing it.
-            if any(ord(ch) < _MIN_PRINTABLE_BYTE for ch in inner_line):
-                logger.warning(
-                    "REJECT-CONTROL-CHAR CONNECT %s — inner request line contains a control byte",
+                try:
+                    inner_method, inner_path = self._parse_inner_request_line(inner_first)
+                    inner_headers_raw = await self._read_headers(tls_reader)
+                    content_length = self._parse_inner_content_length(inner_headers_raw)
+                except ValueError:
+                    await self._send_forbidden(tls_writer, "malformed inner request")
+                    return
+
+                if not check_request(self._rules, inner_method, host, inner_path):
+                    logger.warning("BLOCKED %s https://%s%s", inner_method, host, inner_path)
+                    msg = f"{inner_method} https://{host}{inner_path} denied by policy"
+                    await self._send_forbidden(tls_writer, msg)
+                    return
+
+                logger.info("ALLOW %s https://%s%s", inner_method, host, inner_path)
+
+                # Forward a request line re-serialized from the parsed
+                # method/path rather than the raw ``inner_first`` bytes, so
+                # the upstream always receives exactly the (method, path)
+                # the policy authorized. Mirrors the plain-HTTP path in
+                # ``_handle_http`` (``relative_line``); closes the
+                # policy-vs-forwarded byte differential.
+                inner_request_line = f"{inner_method} {inner_path} HTTP/1.1\r\n".encode("latin-1")
+
+                # Max-Forwards conformance (RFC 7231 §5.1.2): terminate an
+                # exhausted TRACE / OPTIONS at the proxy over the MITM tunnel
+                # (never forwarding it into the credential-injection path);
+                # decrement a positive budget on the forwarded headers.
+                terminate, inner_headers_raw = self._apply_max_forwards(
+                    inner_method, inner_headers_raw
+                )
+                if terminate:
+                    logger.info(
+                        "MAX-FORWARDS-TERMINATE %s https://%s%s", inner_method, host, inner_path
+                    )
+                    await self._send_max_forwards_reply(
+                        tls_writer, inner_method, inner_request_line, inner_headers_raw
+                    )
+                    return
+
+                body = b""
+                if content_length > 0:
+                    body = await asyncio.wait_for(
+                        tls_reader.readexactly(content_length), timeout=30
+                    )
+
+                keep_alive = await self._forward_https(
+                    tls_writer,
                     host,
+                    port,
+                    inner_method,
+                    inner_path,
+                    inner_request_line,
+                    inner_headers_raw,
+                    body,
                 )
-                await self._send_forbidden(
-                    tls_writer, "inner request line contains forbidden character"
-                )
-                return
-
-            inner_parts = inner_line.split()
-            if len(inner_parts) < 2:
-                return
-
-            inner_method = inner_parts[0].upper()
-            inner_path = inner_parts[1]
-
-            inner_headers_raw = await self._read_headers(tls_reader)
-            inner_headers = self._parse_header_dict(inner_headers_raw)
-
-            if not check_request(self._rules, inner_method, host, inner_path):
-                logger.warning("BLOCKED %s https://%s%s", inner_method, host, inner_path)
-                msg = f"{inner_method} https://{host}{inner_path} denied by policy"
-                await self._send_forbidden(tls_writer, msg)
-                return
-
-            logger.info("ALLOW %s https://%s%s", inner_method, host, inner_path)
-
-            # Forward a request line re-serialized from the parsed
-            # method/path rather than the raw ``inner_first`` bytes, so
-            # the upstream always receives exactly the (method, path)
-            # the policy authorized. Mirrors the plain-HTTP path in
-            # ``_handle_http`` (``relative_line``); closes the
-            # policy-vs-forwarded byte differential.
-            inner_request_line = f"{inner_method} {inner_path} HTTP/1.1\r\n".encode("latin-1")
-
-            # Max-Forwards conformance (RFC 7231 §5.1.2): terminate an
-            # exhausted TRACE / OPTIONS at the proxy over the MITM tunnel
-            # (never forwarding it into the credential-injection path);
-            # decrement a positive budget on the forwarded headers.
-            terminate, inner_headers_raw = self._apply_max_forwards(
-                inner_method, inner_headers_raw
-            )
-            if terminate:
-                logger.info(
-                    "MAX-FORWARDS-TERMINATE %s https://%s%s", inner_method, host, inner_path
-                )
-                await self._send_max_forwards_reply(
-                    tls_writer, inner_method, inner_request_line, inner_headers_raw
-                )
-                return
-
-            content_length = int(inner_headers.get("content-length", "0"))
-            body = b""
-            if content_length > 0:
-                body = await asyncio.wait_for(tls_reader.readexactly(content_length), timeout=30)
-
-            await self._forward_https(
-                tls_writer,
-                host,
-                port,
-                inner_method,
-                inner_path,
-                inner_request_line,
-                inner_headers_raw,
-                body,
-            )
+                if not keep_alive:
+                    return
         except asyncio.TimeoutError:
             # WARNING (was DEBUG) so this is visible without raising
             # caplog levels: with the protocol-swap race fixed above,
@@ -674,11 +687,99 @@ class EgressProxy:
         except Exception:
             logger.exception("Error handling CONNECT inner request for %s", host)
         finally:
+            self._tls_connection_closed()
             try:
                 tls_writer.close()
                 await asyncio.wait_for(tls_writer.wait_closed(), timeout=2)
             except Exception:  # noqa: BLE001 — TLS close is best-effort
                 pass
+
+    def _allows_unrestricted_host(self, host: str) -> bool:
+        """Return whether one rule allows every method and path for *host*."""
+        return any(rule.allows_all_requests_to(host) for rule in self._rules)
+
+    def _configure_server_ssl_context(self, host: str, ssl_ctx: ssl.SSLContext) -> None:
+        """Allow a specialized relay to observe its inbound TLS handshake."""
+        del host, ssl_ctx
+
+    def _tls_handshake_completed(self, writer: asyncio.StreamWriter) -> None:
+        """Notify a specialized relay after inbound TLS is established."""
+        del writer
+
+    def _tls_connection_closed(self) -> None:
+        """Notify a specialized relay when the inbound TLS tunnel ends."""
+
+    @staticmethod
+    def _parse_inner_request_line(raw: bytes) -> tuple[str, str]:
+        """Parse the generic proxy's inner HTTP request line."""
+        line = raw.decode("latin-1", errors="replace").strip()
+        if any(ord(char) < _MIN_PRINTABLE_BYTE for char in line):
+            raise ValueError("inner request line contains a control byte")
+        parts = line.split()
+        if len(parts) < 2:
+            raise ValueError("inner request line is malformed")
+        return parts[0].upper(), parts[1]
+
+    @staticmethod
+    def _parse_inner_content_length(headers_raw: bytes) -> int:
+        """Parse body framing for the generic proxy."""
+        headers = EgressProxy._parse_header_dict(headers_raw)
+        return int(headers.get("content-length", "0"))
+
+    def _allows_http2_passthrough(self, host: str) -> bool:
+        """Return whether opaque HTTP/2 relay is safe for *host*."""
+        return self._allows_unrestricted_host(host) and host.lower() not in self._cred_by_host
+
+    async def _forward_http2(
+        self,
+        client_reader: asyncio.StreamReader,
+        client_writer: asyncio.StreamWriter,
+        host: str,
+        port: int,
+        initial_data: bytes,
+    ) -> None:
+        """Relay an opaque HTTP/2 connection for an unrestricted host."""
+        try:
+            pinned_ip = await self._assert_destination_allowed(host, port)
+        except PermissionError as exc:
+            logger.warning("BLOCKED-DEST h2://%s:%d - %s", host, port, exc)
+            return
+
+        connect_host = pinned_ip or host
+        try:
+            upstream_reader, upstream_writer = await asyncio.wait_for(
+                asyncio.open_connection(
+                    connect_host,
+                    port,
+                    ssl=self._upstream_h2_ssl_ctx,
+                    server_hostname=host,
+                ),
+                timeout=30,
+            )
+        except Exception as exc:  # noqa: BLE001 — closing the h2 stream signals failure
+            logger.warning("Cannot connect HTTP/2 upstream %s:%d - %s", host, port, exc)
+            return
+
+        async def relay(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+            while data := await reader.read(_BUF_SIZE):
+                writer.write(data)
+                await writer.drain()
+
+        try:
+            upstream_writer.write(initial_data)
+            await upstream_writer.drain()
+            tasks = {
+                asyncio.create_task(relay(client_reader, upstream_writer)),
+                asyncio.create_task(relay(upstream_reader, client_writer)),
+            }
+            done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*done, *pending, return_exceptions=True)
+        finally:
+            upstream_writer.close()
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(upstream_writer.wait_closed(), timeout=2)
 
     async def _forward_https(
         self,
@@ -690,14 +791,14 @@ class EgressProxy:
         request_line: bytes,
         headers_raw: bytes,
         body: bytes,
-    ) -> None:
+    ) -> bool:
         """Open a real TLS connection to the target and relay."""
         try:
             pinned_ip = await self._assert_destination_allowed(host, port)
         except PermissionError as exc:
             logger.warning("BLOCKED-DEST https://%s:%d - %s", host, port, exc)
             await self._send_forbidden(client_writer, str(exc))
-            return
+            return False
         # Reuse the context pinned at construction. Do NOT rebuild from
         # a cafile here — that re-read of a (potentially sandbox-writable)
         # file on every request was the vulnerability this guards against.
@@ -716,11 +817,14 @@ class EgressProxy:
             method=method, host=host, headers_raw=headers_raw
         )
         if rewrite.error is not None:
+            if rewrite.status_code == 502:
+                await self._send_bad_gateway(client_writer, rewrite.error)
+                return False
             logger.warning(
                 "BLOCKED-CREDENTIAL %s https://%s%s — %s", method, host, path, rewrite.error
             )
             await self._send_forbidden(client_writer, rewrite.error)
-            return
+            return False
         # Single-shot the upstream so ``_relay_response`` gets a prompt EOF
         # instead of blocking on a keep-alive socket — and so pipelining
         # clients (git's libcurl) don't stall waiting to reuse a tunnel the
@@ -739,7 +843,7 @@ class EgressProxy:
         except Exception as exc:  # noqa: BLE001 — upstream connect failure maps to 502
             logger.warning("Cannot connect to %s:%d - %s", host, port, exc)
             await self._send_bad_gateway(client_writer, str(exc))
-            return
+            return False
 
         try:
             upstream_writer.write(request_line)
@@ -779,6 +883,7 @@ class EgressProxy:
                 await upstream_writer.wait_closed()
             except Exception:  # noqa: BLE001 — upstream close is best-effort
                 pass
+        return False
 
     # ------------------------------------------------------------------
     # Plain HTTP handling
@@ -871,6 +976,9 @@ class EgressProxy:
             method=method, host=host, headers_raw=headers_raw
         )
         if rewrite.error is not None:
+            if rewrite.status_code == 502:
+                await self._send_bad_gateway(writer, rewrite.error)
+                return
             logger.warning(
                 "BLOCKED-CREDENTIAL %s http://%s%s — %s", method, host, path, rewrite.error
             )
@@ -1143,12 +1251,9 @@ class EgressProxy:
         """
         Async wrapper around :meth:`_rewrite_authorization`.
 
-        A refreshing credential source (e.g. a Databricks OAuth profile)
-        may re-mint a token via a blocking SDK/CLI call when its throttle
-        window elapses. That would stall the proxy's event loop, so the
-        rewrite runs in the default executor. The common case — no
-        credential rules configured — short-circuits inline with no
-        executor hop.
+        Resolve matching secrets off-loop. Concurrent requests share one
+        in-flight resolution per provider, including its failure; waiting
+        requests do not occupy executor threads.
 
         :param method: HTTP method (case-insensitive), e.g. ``"GET"``.
         :param host: Upstream request host (case-insensitive).
@@ -1157,16 +1262,63 @@ class EgressProxy:
         """
         if not self._cred_by_host:
             return _AuthRewriteResult(headers=headers_raw, error=None)
-        loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(
-            None,
-            functools.partial(
-                self._rewrite_authorization, method=method, host=host, headers_raw=headers_raw
-            ),
+        pending: dict[int, CredentialRewriteRule] = {}
+
+        def defer_auth(rule: CredentialRewriteRule) -> str:
+            pending[id(rule)] = rule
+            return ""
+
+        result = self._rewrite_authorization(
+            method=method, host=host, headers_raw=headers_raw, format_auth=defer_auth
         )
+        if result.error is not None or not pending:
+            return result
+        try:
+            auth_values = {
+                key: self._format_real_auth(rule, secret=await self._resolve_credential(rule))
+                for key, rule in pending.items()
+            }
+            return self._rewrite_authorization(
+                method=method,
+                host=host,
+                headers_raw=headers_raw,
+                format_auth=lambda rule: auth_values[id(rule)],
+            )
+        except CredentialSourceUnavailable:
+            logger.warning("CREDENTIAL-REFRESH-FAILED %s %s", method, host)
+            return _AuthRewriteResult(
+                headers=b"", error="Credential source unavailable", status_code=502
+            )
+
+    async def _resolve_credential(self, rule: CredentialRewriteRule) -> str:
+        provider = rule.secret_provider
+        if provider is None:
+            return rule.resolve_secret()
+        key = (
+            id(getattr(provider, "__self__", provider)),
+            id(getattr(provider, "__func__", None)),
+        )
+        future = self._credential_resolutions.get(key)
+        if future is None:
+            future = asyncio.get_running_loop().run_in_executor(None, rule.resolve_secret)
+            self._credential_resolutions[key] = future
+
+            def completed(result: asyncio.Future[str]) -> None:
+                if self._credential_resolutions.get(key) is result:
+                    self._credential_resolutions.pop(key)
+                if not result.cancelled():
+                    result.exception()
+
+            future.add_done_callback(completed)
+        return await asyncio.shield(future)
 
     def _rewrite_authorization(
-        self, *, method: str, host: str, headers_raw: bytes
+        self,
+        *,
+        method: str,
+        host: str,
+        headers_raw: bytes,
+        format_auth: Callable[[CredentialRewriteRule], str] | None = None,
     ) -> _AuthRewriteResult:
         """
         Attach the real credential to a bound-host request.
@@ -1211,6 +1363,7 @@ class EgressProxy:
         if not self._cred_by_host:
             return _AuthRewriteResult(headers=headers_raw, error=None)
 
+        format_auth = format_auth or self._format_real_auth
         host_key = host.lower()
         host_rule = self._cred_by_host.get(host_key)
         msg = _parse_http_headers(headers_raw)
@@ -1225,8 +1378,9 @@ class EgressProxy:
                     # leave it alone (and don't also inject over it).
                     rewritten.append(value)
                     continue
-                rule = self._cred_by_synthetic.get(synthetic)
-                if rule is None or rule.host != host_key:
+                rules = self._cred_by_synthetic.get(synthetic)
+                rule = rules.get(host_key) if rules is not None else None
+                if rule is None:
                     # A value carrying our placeholder prefix that we don't
                     # recognise for this host. Refuse rather than forward —
                     # this is the leak guard for a compromised sandbox that
@@ -1235,7 +1389,7 @@ class EgressProxy:
                         headers=headers_raw,
                         error="synthetic credential is not allowed for this host",
                     )
-                rewritten.append(self._format_real_auth(rule))
+                rewritten.append(format_auth(rule))
                 changed = True
             if changed:
                 del msg["Authorization"]
@@ -1244,7 +1398,7 @@ class EgressProxy:
         elif host_rule is not None:
             # Swap-on-access: the request reached a bound host with no
             # Authorization header, so attach the real credential now.
-            msg["Authorization"] = self._format_real_auth(host_rule)
+            msg["Authorization"] = format_auth(host_rule)
             changed = True
         if not changed:
             # Nothing matched — forward the client's bytes untouched rather
@@ -1284,7 +1438,7 @@ class EgressProxy:
         return candidate if candidate.startswith(SYNTHETIC_CREDENTIAL_PREFIX) else None
 
     @staticmethod
-    def _format_real_auth(rule: CredentialRewriteRule) -> str:
+    def _format_real_auth(rule: CredentialRewriteRule, *, secret: str | None = None) -> str:
         """
         Format the real ``Authorization`` value for a matched rule.
 
@@ -1301,7 +1455,7 @@ class EgressProxy:
             ``"Basic <base64(username:real)>"``.
         :raises ValueError: If the rule carries an unsupported scheme.
         """
-        real_secret = rule.resolve_secret()
+        real_secret = rule.resolve_secret() if secret is None else secret
         if rule.scheme == "bearer":
             return f"Bearer {real_secret}"
         if rule.scheme == "token":

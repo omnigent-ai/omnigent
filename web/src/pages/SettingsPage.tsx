@@ -11,7 +11,8 @@
  *
  * - **General** — app-wide behavior preferences.
  * - **Appearance** — theme mode (System / Light / Dark), terminal theme,
- *   default transcript view, Workspace panel default, and UI/code font controls.
+ *   default transcript view, Workspace panel and tab defaults, and UI/code font
+ *   controls.
  * - **Git** — Git behavior: the global "always use a random worktree" default
  *   and the default base branch pre-filled when naming a new worktree branch.
  * - **Keyboard shortcuts** — the full shortcuts reference, shown inline.
@@ -29,6 +30,7 @@
  */
 
 import {
+  type ComponentType,
   lazy,
   type CSSProperties,
   type ReactNode,
@@ -40,10 +42,15 @@ import {
   useRef,
   useState,
 } from "react";
+import GithubMono from "@lobehub/icons/es/Github/components/Mono";
+import { useViewerId } from "@/hooks/useViewerId";
 import {
   ArchiveRestoreIcon,
   AlertTriangleIcon,
+  BotIcon,
   DownloadIcon,
+  FileDiffIcon,
+  FilesIcon,
   KeyRoundIcon,
   Loader2Icon,
   LaptopMinimalIcon,
@@ -97,7 +104,20 @@ import {
 import { MOD_KEY } from "@/components/KeyboardShortcut";
 import { KeyboardShortcutsList } from "@/components/KeyboardShortcutsDialog";
 import { changePassword, logout } from "@/lib/accountsApi";
-import { getCurrentIsAdmin, getCurrentUserId, resolveIdentity } from "@/lib/identity";
+import { withBasePath } from "@/lib/basePath";
+import {
+  beginGithubConnect,
+  disconnectGithub,
+  fetchGithubStatus,
+  type GithubConnectionStatus,
+} from "@/lib/githubIntegration";
+import {
+  beginDatabricksConnect,
+  disconnectDatabricks,
+  fetchDatabricksStatus,
+  type DatabricksConnectionStatus,
+} from "@/lib/databricksIntegration";
+import { getCurrentIsAdmin, resolveIdentity } from "@/lib/identity";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { useOmnigentAnalytics, useOmnigentPageView } from "@/lib/analytics";
 import {
@@ -154,6 +174,13 @@ import {
   type TerminalThemeMode,
 } from "@/lib/terminalThemePreferences";
 import {
+  canRememberTerminalClipboardPreference,
+  readTerminalClipboardPreference,
+  subscribeTerminalClipboardPreference,
+  writeTerminalClipboardPreference,
+  type TerminalClipboardPreference,
+} from "@/lib/terminalClipboardPreferences";
+import {
   readWorkspacePanelDefault,
   WORKSPACE_PANEL_DEFAULT,
   writeWorkspacePanelDefault,
@@ -165,6 +192,12 @@ import {
   writeTranscriptViewDefault,
   type TranscriptViewDefault,
 } from "@/lib/transcriptViewPreferences";
+import {
+  DEFAULT_WORKSPACE_TAB,
+  readDefaultWorkspaceTab,
+  writeDefaultWorkspaceTab,
+  type DefaultWorkspaceTab,
+} from "@/lib/workspaceTabPreferences";
 import { readDefaultBaseBranch, writeDefaultBaseBranch } from "@/lib/baseBranchPreferences";
 import { readAlwaysSteer, writeAlwaysSteer } from "@/lib/alwaysSteerPreferences";
 import {
@@ -213,11 +246,18 @@ import {
   getCliStatus,
   isElectronShell,
   resetCliPath,
+  supportsBrowser,
   type UpdateConfig,
   type UpdateMode,
   updateBridge,
 } from "@/lib/nativeBridge";
+import { readOpenLinksInApp, writeOpenLinksInApp } from "@/lib/linkOpenPreferences";
 import { cn } from "@/lib/utils";
+import {
+  readBackgroundSessionTitlesEnabled,
+  writeBackgroundSessionTitlesEnabled,
+} from "@/lib/backgroundSessionTitlesPreferences";
+import { SettingsCustomizeSection } from "./settings/SettingsCustomizeSection";
 
 // Admin-only management surfaces, rendered as the Members / Policies settings
 // sub-categories. Visible to admins in all modes (accounts, OIDC, single-user).
@@ -233,34 +273,6 @@ const SharingPage = lazy(() =>
 );
 
 /**
- * The current viewer's user id, resolved reactively. Uses `getCurrentUserId`
- * (NOT `getCurrentAuthorId`): ownership compares against the session's `owner`
- * grant, which in single-user mode is the reserved `"local"` id — and
- * `getCurrentAuthorId` nulls `"local"` out (it's for author labels), which
- * would make the viewer's own sessions read as shared and vanish from the
- * default "My sessions" tab. `getCurrentUserId` keeps `"local"` and is the
- * identical real email in multi-user mode. It is synchronous (populated once
- * `resolveIdentity` has run — which `main.tsx` kicks off at boot), but on a
- * cold mount it can still be null for a tick, so we also await
- * `resolveIdentity()` and re-render when it lands. Keeping this reactive
- * (rather than a bare module read) means the My/Shared split settles correctly
- * the moment identity is known, without a manual refresh.
- */
-function useViewerId(): string | null {
-  const [viewerId, setViewerId] = useState<string | null>(() => getCurrentUserId());
-  useEffect(() => {
-    let cancelled = false;
-    void resolveIdentity().then(() => {
-      if (!cancelled) setViewerId(getCurrentUserId());
-    });
-    return () => {
-      cancelled = true;
-    };
-  }, []);
-  return viewerId;
-}
-
-/**
  * Settings content panel. The section nav lives in the sidebar card
  * (SettingsSidebarBody); this renders only the selected section into the
  * AppShell main outlet. The active section is read from the URL so the two
@@ -272,7 +284,7 @@ export function SettingsPage() {
   // A login session exists (accounts OR OIDC) when the server advertises a
   // login_url; gates the Account section so SSO users get it too.
   const hasAuthSession = info !== "loading" && info.login_url !== null;
-  const { section } = useSettingsRoute();
+  const { section, subSection } = useSettingsRoute();
   // Per-section page view: `settings.appearance`, `settings.account`, etc. The
   // hook re-keys on pathname, so switching sections re-fires under the new id.
   // `section` is a closed SettingsSectionId union (no PII / unbounded values).
@@ -299,11 +311,19 @@ export function SettingsPage() {
     );
   }
 
+  // Nested sections own their own layout. useSettingsRoute only sets
+  // subSection for a valid, feature-enabled customize route, so no extra
+  // flag check is needed here.
+  if (section === "customize" && subSection) {
+    return <SettingsCustomizeSection subSection={subSection} />;
+  }
+
   return (
     <PageScroll contentClassName="px-8" extraBottom="2.5rem">
       {section === "appearance" && <AppearanceSection />}
       {section === "general" && <GeneralSection />}
       {section === "git" && <GitSection />}
+      {section === "integrations" && <IntegrationsSection />}
       {section === "shortcuts" && <ShortcutsSection />}
       {section === "import" && <ImportSection />}
       {section === "account" && hasAuthSession && <AccountSection />}
@@ -369,11 +389,22 @@ const workspacePanelCards: {
   { value: "collapsed", label: "Collapsed", icon: PanelRightCloseIcon },
 ];
 
+const workspaceTabCards: {
+  value: DefaultWorkspaceTab;
+  label: string;
+  icon: ComponentType<{ className?: string }>;
+}[] = [
+  { value: "files", label: "Files", icon: FilesIcon },
+  { value: "changes", label: "Changes", icon: FileDiffIcon },
+  { value: "github", label: "GitHub", icon: GithubMono },
+  { value: "subagents", label: "Agents", icon: BotIcon },
+];
+
 /** Centered icon + label body shared by the Mode and Terminal theme cards. */
-function iconCardBody(Icon: typeof SunIcon, label: string) {
+function iconCardBody(Icon: ComponentType<{ className?: string }>, label: string) {
   return (
     <>
-      <Icon className="size-6 text-muted-foreground" />
+      <Icon aria-hidden="true" className="size-6 text-muted-foreground" />
       <span className="text-ui font-medium">{label}</span>
     </>
   );
@@ -534,6 +565,36 @@ function WorkspacePanelDefaultControl() {
   );
 }
 
+/** Fallback tab for sessions without a remembered Workspace tab. */
+function WorkspaceTabDefaultControl() {
+  const [value, setValue] = useState(() => readDefaultWorkspaceTab());
+  const labelId = useId();
+  const choose = useCallback((next: DefaultWorkspaceTab) => {
+    setValue(next);
+    writeDefaultWorkspaceTab(next);
+  }, []);
+  return (
+    <ThemeSubsection
+      labelId={labelId}
+      title="Default Workspace tab"
+      helper="Shown first in Workspace. Changing this also updates existing chats when reopened or refreshed. Later tab choices are remembered. File links still open the linked file."
+    >
+      <CardRadioGroup<DefaultWorkspaceTab>
+        labelledBy={labelId}
+        value={value}
+        onSelect={choose}
+        className="grid grid-cols-2 gap-3 sm:grid-cols-4"
+        cardClassName="items-center gap-2 p-4"
+        items={workspaceTabCards.map((card) => ({
+          value: card.value,
+          testId: `workspace-tab-default-${card.value}`,
+          body: iconCardBody(card.icon, card.label),
+        }))}
+      />
+    </ThemeSubsection>
+  );
+}
+
 function ColorThemeControl() {
   // Render each chip in the currently-resolved mode so it matches the app now
   // (honoring the embed's forced theme, not just next-themes' resolvedTheme).
@@ -595,7 +656,7 @@ function ColorThemeControl() {
       title="Color theme"
       helper="Choose a preset, then tune it across light and dark mode."
     >
-      <div className="overflow-hidden rounded-xl border bg-card/55 shadow-xs">
+      <div className="overflow-hidden rounded-xl border bg-card/55">
         <div className="flex flex-col gap-3 border-b bg-muted/30 p-4 sm:flex-row sm:items-center sm:justify-between">
           <div className="flex min-w-0 items-center gap-3">
             <div className="w-28 shrink-0 overflow-hidden rounded-lg shadow-sm">
@@ -775,6 +836,8 @@ function AppearanceSection() {
 
     writeWorkspacePanelDefault(WORKSPACE_PANEL_DEFAULT);
 
+    writeDefaultWorkspaceTab(DEFAULT_WORKSPACE_TAB);
+
     writeHideUnconfiguredHarnesses(DEFAULT_HIDE_UNCONFIGURED_HARNESSES);
 
     applyDesktopUiFontSize(UI_FONT_SIZE_DEFAULT);
@@ -801,6 +864,7 @@ function AppearanceSection() {
           "omnigent:custom-theme",
           "omnigent:default-transcript-view",
           "omnigent:default-workspace-panel",
+          "omnigent:default-workspace-tab",
           "omnigent:hide-unconfigured-harnesses",
         ]) {
           window.localStorage.removeItem(key);
@@ -884,6 +948,8 @@ function AppearanceSection() {
         <TranscriptViewDefaultControl />
 
         <WorkspacePanelDefaultControl />
+
+        <WorkspaceTabDefaultControl />
 
         <HideUnconfiguredHarnessesControl />
 
@@ -1016,11 +1082,183 @@ function AppearanceSection() {
 function GitSection() {
   return (
     <Section title="Git" description="Configure how Omnigent works with Git.">
-      <div className="flex flex-col gap-8">
-        <AlwaysUseWorktreeControl />
-        <DefaultBaseBranchControl />
+      <div className="flex flex-col gap-3">
+        <h2 className="text-ui font-medium">Worktrees</h2>
+        <div className="rounded-xl border border-border bg-card p-4">
+          <AlwaysUseWorktreeControl />
+          <div className="mt-4 border-t border-border pt-4">
+            <DefaultBaseBranchControl />
+          </div>
+        </div>
       </div>
     </Section>
+  );
+}
+
+/** GitHub brand mark (lucide dropped brand icons, so inline the glyph). */
+function GithubMark({ className }: { className?: string }) {
+  return (
+    <svg viewBox="0 0 16 16" aria-hidden className={className} fill="currentColor">
+      <path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z" />
+    </svg>
+  );
+}
+
+/**
+/**
+ * Which panel connects/disconnects each provider. The server's
+ * ``enabled_connections`` list says WHICH panels to show; this map says HOW to
+ * render each. Adding a provider is one entry here plus one string server-side.
+ */
+const CONNECTION_PANELS: Record<string, ComponentType> = {
+  github: GithubIntegrationControl,
+  databricks: DatabricksIntegrationControl,
+};
+
+/**
+ * Sandbox Integrations settings. Renders one connect/disconnect panel per
+ * provider the server reports in ``enabled_connections``, in that order. The
+ * nav hides the section entirely when the list is empty.
+ */
+function IntegrationsSection() {
+  const info = useServerInfo();
+  const providers = info === "loading" ? [] : (info.enabled_connections ?? []);
+  return (
+    <Section
+      title="Sandbox Integrations"
+      description="External accounts your sandboxes use on your behalf."
+    >
+      {providers.map((provider) => {
+        const Panel = CONNECTION_PANELS[provider];
+        return Panel ? <Panel key={provider} /> : null;
+      })}
+    </Section>
+  );
+}
+
+/**
+ * Connect / disconnect a GitHub account. Once connected, a managed
+ * sandbox launched by this user authenticates ``gh`` / git as them and
+ * receives their public SSH keys (so they can SSH into their own box).
+ * The connect action is a full-page redirect to GitHub; on return the
+ * callback lands back here with ``?github=connected|error``.
+ */
+function GithubIntegrationControl() {
+  const [status, setStatus] = useState<GithubConnectionStatus | null | "loading">("loading");
+  const [busy, setBusy] = useState(false);
+  const [notice, setNotice] = useState<"connected" | "error" | null>(null);
+
+  const refresh = useCallback(async () => {
+    try {
+      setStatus(await fetchGithubStatus());
+    } catch {
+      setStatus(null);
+    }
+  }, []);
+
+  useEffect(() => {
+    void refresh();
+    // Surface the callback outcome carried back in the URL, then strip it
+    // so a reload doesn't re-show the banner.
+    const params = new URLSearchParams(window.location.search);
+    const outcome = params.get("github");
+    if (outcome === "connected" || outcome === "error") {
+      setNotice(outcome);
+      params.delete("github");
+      const qs = params.toString();
+      window.history.replaceState({}, "", `${window.location.pathname}${qs ? `?${qs}` : ""}`);
+    }
+  }, [refresh]);
+
+  const onDisconnect = useCallback(async () => {
+    setBusy(true);
+    try {
+      await disconnectGithub();
+      await refresh();
+    } finally {
+      setBusy(false);
+    }
+  }, [refresh]);
+
+  const returnTo = `${window.location.pathname}${window.location.search}`;
+
+  if (status === "loading") {
+    return <p className="text-sm text-muted-foreground">Checking…</p>;
+  }
+  if (status === null) {
+    return <p className="text-sm text-muted-foreground">GitHub status is unavailable.</p>;
+  }
+
+  return (
+    <div className="flex flex-col gap-4">
+      {notice === "connected" && (
+        <div
+          role="status"
+          className="rounded-md border border-success/40 bg-success/10 px-3 py-2 text-sm"
+        >
+          GitHub account connected.
+        </div>
+      )}
+      {notice === "error" && (
+        <div
+          role="alert"
+          className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive"
+        >
+          Couldn't connect your GitHub account. Please try again.
+        </div>
+      )}
+
+      <div className="flex flex-wrap items-center justify-between gap-x-6 gap-y-3">
+        <div className="flex min-w-0 flex-1 flex-col">
+          <span className="text-sm font-medium">GitHub</span>
+          <span className="text-sm text-muted-foreground">
+            {status.connected && status.login
+              ? `Connected as ${status.login}. New sandboxes authenticate gh and git as you, and your public SSH keys are added so you can SSH in.`
+              : "Connect your GitHub account so new sandboxes authenticate gh and git as you, and your public SSH keys are injected."}
+          </span>
+        </div>
+        <div className="flex shrink-0 items-center gap-2">
+          {status.connected ? (
+            <Button
+              variant="ghost"
+              size="sm"
+              className="h-9"
+              disabled={busy}
+              data-testid="github-disconnect"
+              onClick={() => void onDisconnect()}
+            >
+              Disconnect
+            </Button>
+          ) : (
+            <Button
+              size="sm"
+              className="h-9 gap-2"
+              disabled={busy}
+              data-testid="github-connect"
+              onClick={() => beginGithubConnect(returnTo)}
+            >
+              <GithubMark className="size-4" />
+              Connect GitHub
+            </Button>
+          )}
+        </div>
+      </div>
+
+      {status.install_url && (
+        <p className="text-xs text-muted-foreground">
+          The app may need to be installed on your repositories.{" "}
+          <a
+            href={status.install_url}
+            target="_blank"
+            rel="noreferrer"
+            className="underline underline-offset-2"
+          >
+            Manage installation
+          </a>
+          .
+        </p>
+      )}
+    </div>
   );
 }
 
@@ -1056,6 +1294,131 @@ function AlwaysUseWorktreeControl() {
         className="mt-0.5 shrink-0"
         componentId="settings.git.always_use_worktree"
       />
+    </div>
+  );
+}
+
+/**
+ * Connect / disconnect a Databricks workspace. Once connected, a managed
+ * sandbox launched by this user reaches the Databricks AI Gateway (MCP + model
+ * serving) as them, using their per-user OAuth token. Databricks is
+ * multi-workspace, so the user supplies their workspace URL. The connect action
+ * is a full-page redirect to the workspace OAuth consent; on return the callback
+ * lands here with ``?databricks=connected|error``.
+ */
+function DatabricksIntegrationControl() {
+  const [status, setStatus] = useState<DatabricksConnectionStatus | null | "loading">("loading");
+  const [busy, setBusy] = useState(false);
+  const [notice, setNotice] = useState<"connected" | "error" | null>(null);
+  const [workspace, setWorkspace] = useState("");
+
+  const refresh = useCallback(async () => {
+    try {
+      setStatus(await fetchDatabricksStatus());
+    } catch {
+      setStatus(null);
+    }
+  }, []);
+
+  useEffect(() => {
+    void refresh();
+    const params = new URLSearchParams(window.location.search);
+    const outcome = params.get("databricks");
+    if (outcome === "connected" || outcome === "error") {
+      setNotice(outcome);
+      params.delete("databricks");
+      const qs = params.toString();
+      window.history.replaceState({}, "", `${window.location.pathname}${qs ? `?${qs}` : ""}`);
+    }
+  }, [refresh]);
+
+  const onDisconnect = useCallback(async () => {
+    setBusy(true);
+    try {
+      await disconnectDatabricks();
+      await refresh();
+    } finally {
+      setBusy(false);
+    }
+  }, [refresh]);
+
+  const returnTo = `${window.location.pathname}${window.location.search}`;
+
+  // Feature not configured on this server: render nothing (like a build without it).
+  if (status !== "loading" && status !== null && !status.enabled) {
+    return null;
+  }
+  if (status === "loading") {
+    return <p className="text-sm text-muted-foreground">Checking…</p>;
+  }
+  if (status === null) {
+    return <p className="text-sm text-muted-foreground">Databricks status is unavailable.</p>;
+  }
+
+  return (
+    <div className="flex flex-col gap-4">
+      {notice === "connected" && (
+        <div
+          role="status"
+          className="rounded-md border border-success/40 bg-success/10 px-3 py-2 text-sm"
+        >
+          Databricks workspace connected.
+        </div>
+      )}
+      {notice === "error" && (
+        <div
+          role="alert"
+          className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive"
+        >
+          Couldn't connect your Databricks workspace. Please try again.
+        </div>
+      )}
+
+      <div className="flex flex-wrap items-center justify-between gap-x-6 gap-y-3">
+        <div className="flex min-w-0 flex-1 flex-col">
+          <span className="text-sm font-medium">Databricks</span>
+          <span className="text-sm text-muted-foreground">
+            {status.connected && status.workspace_host
+              ? `Connected to ${status.workspace_host}${status.databricks_user ? ` as ${status.databricks_user}` : ""}. New sandboxes reach the Databricks AI Gateway (MCP + model serving) as you.`
+              : "Connect your Databricks workspace so new sandboxes reach its AI Gateway (MCP + model serving) as you."}
+          </span>
+        </div>
+        <div className="flex shrink-0 items-center gap-2">
+          {status.connected ? (
+            <Button
+              variant="ghost"
+              size="sm"
+              className="h-9"
+              disabled={busy}
+              data-testid="databricks-disconnect"
+              onClick={() => void onDisconnect()}
+            >
+              Disconnect
+            </Button>
+          ) : (
+            <>
+              <Input
+                type="text"
+                inputMode="url"
+                placeholder="workspace-host.cloud.databricks.com"
+                className="h-9 w-64"
+                value={workspace}
+                onChange={(e) => setWorkspace(e.target.value)}
+                data-testid="databricks-workspace"
+              />
+              <Button
+                size="sm"
+                className="h-9"
+                disabled={busy || workspace.trim() === ""}
+                data-testid="databricks-connect"
+                onClick={() => beginDatabricksConnect(workspace.trim(), returnTo)}
+              >
+                Connect Databricks
+              </Button>
+            </>
+          )}
+        </div>
+      </div>
     </div>
   );
 }
@@ -1126,6 +1489,148 @@ function ComposerSendShortcutControl() {
   );
 }
 
+/**
+ * Where a plain click on a web link in chat content opens — desktop shells
+ * with the embedded browser only. Off keeps the current behavior (the
+ * default external browser); on routes the link into the conversation's
+ * in-app Browser tab. Modified clicks always stay external.
+ */
+function OpenLinksInAppControl() {
+  const [enabled, setEnabled] = useState(readOpenLinksInApp);
+  const labelId = useId();
+  const descriptionId = useId();
+  const toggle = useCallback((next: boolean) => {
+    setEnabled(next);
+    writeOpenLinksInApp(next);
+  }, []);
+
+  return (
+    <div className="flex items-start justify-between gap-6">
+      <div className="flex min-w-0 flex-1 flex-col">
+        <span id={labelId} className="text-ui font-medium">
+          Open links in the in-app browser
+        </span>
+        <span id={descriptionId} className="text-ui text-muted-foreground">
+          Open web links from chat in this conversation&apos;s Browser tab instead of your default
+          browser. {MOD_KEY}+click always opens the external browser.
+        </span>
+      </div>
+      <Switch
+        aria-labelledby={labelId}
+        aria-describedby={descriptionId}
+        checked={enabled}
+        onCheckedChange={toggle}
+        data-testid="open-links-in-app-toggle"
+        className="mt-0.5 shrink-0"
+        componentId="settings.general.open_links_in_app"
+      />
+    </div>
+  );
+}
+
+function BackgroundSessionTitlesControl() {
+  const [enabled, setEnabled] = useState(readBackgroundSessionTitlesEnabled);
+  const labelId = useId();
+  const descriptionId = useId();
+
+  const toggle = useCallback((next: boolean) => {
+    setEnabled(next);
+    writeBackgroundSessionTitlesEnabled(next);
+  }, []);
+
+  return (
+    <div className="flex items-start justify-between gap-6">
+      <div className="flex min-w-0 flex-1 flex-col">
+        <span id={labelId} className="text-ui font-medium">
+          Automatically name new sessions
+        </span>
+        <span id={descriptionId} className="text-ui text-muted-foreground">
+          Generate a concise title in the background after the first message. Turn this off to keep
+          the default session name.
+        </span>
+      </div>
+      <Switch
+        aria-labelledby={labelId}
+        aria-describedby={descriptionId}
+        checked={enabled}
+        onCheckedChange={toggle}
+        data-testid="background-session-titles-toggle"
+        className="mt-0.5 shrink-0"
+        componentId="settings.general.background_session_titles"
+      />
+    </div>
+  );
+}
+
+function TerminalClipboardControl() {
+  const labelId = useId();
+  const descriptionId = useId();
+  const canRemember = canRememberTerminalClipboardPreference();
+  const [preference, setPreference] = useState<TerminalClipboardPreference>(
+    readTerminalClipboardPreference,
+  );
+  const [saveFailed, setSaveFailed] = useState(false);
+
+  useEffect(
+    () =>
+      subscribeTerminalClipboardPreference((value) => {
+        setPreference(value);
+        setSaveFailed(false);
+      }),
+    [],
+  );
+
+  const update = (value: string) => {
+    if (!canRemember) return;
+    if (value !== "ask" && value !== "allow" && value !== "block") return;
+    const saved = writeTerminalClipboardPreference(value);
+    if (saved) setPreference(value);
+    setSaveFailed(!saved);
+  };
+
+  return (
+    <div className="flex flex-wrap items-start justify-between gap-x-6 gap-y-3">
+      <div className="flex min-w-0 flex-1 flex-col gap-1">
+        <span id={labelId} className="text-ui font-medium">
+          Copying from terminals
+        </span>
+        <span id={descriptionId} className="text-sm text-muted-foreground">
+          {canRemember
+            ? "Controls copying text from all sessions and terminals on this server in this browser or app. Allowing copying also lets terminal programs silently replace your clipboard with text or commands you didn’t intend to paste."
+            : "This connection can’t remember clipboard permissions. You can still allow or block copying for each open terminal."}
+        </span>
+        {saveFailed && (
+          <span role="alert" className="text-sm text-destructive">
+            Couldn&apos;t save this preference in this browser or app. Your previous setting is
+            unchanged.
+          </span>
+        )}
+      </div>
+      <Select
+        value={preference}
+        disabled={!canRemember}
+        onValueChange={update}
+        componentId="settings.general.terminal_clipboard"
+        valueHasNoPii
+      >
+        <SelectTrigger
+          aria-labelledby={labelId}
+          aria-describedby={descriptionId}
+          data-testid="terminal-clipboard-preference-select"
+          className="w-48 shrink-0"
+        >
+          <SelectValue />
+        </SelectTrigger>
+        <SelectContent>
+          <SelectItem value="ask">Ask before copying</SelectItem>
+          <SelectItem value="allow">Allow copying</SelectItem>
+          <SelectItem value="block">Block copying</SelectItem>
+        </SelectContent>
+      </Select>
+    </div>
+  );
+}
+
 /** App-wide behavior settings. */
 function GeneralSection() {
   return (
@@ -1138,6 +1643,22 @@ function GeneralSection() {
             <AlwaysSteerControl />
           </div>
         </div>
+        <h2 className="mt-3 text-ui font-medium">Sessions</h2>
+        <div className="rounded-xl border border-border bg-card p-4">
+          <BackgroundSessionTitlesControl />
+        </div>
+        <h2 className="mt-3 text-ui font-medium">Terminal</h2>
+        <div className="rounded-xl border border-border bg-card p-4">
+          <TerminalClipboardControl />
+        </div>
+        {supportsBrowser() && (
+          <>
+            <h2 className="mt-3 text-ui font-medium">Links</h2>
+            <div className="rounded-xl border border-border bg-card p-4">
+              <OpenLinksInAppControl />
+            </div>
+          </>
+        )}
       </div>
     </Section>
   );
@@ -1583,7 +2104,7 @@ function StepperButton({
 function ShortcutsSection() {
   return (
     <Section title="Keyboard shortcuts" description="Speed up common actions with the keyboard.">
-      <KeyboardShortcutsList />
+      <KeyboardShortcutsList variant="settings" />
     </Section>
   );
 }
@@ -1878,14 +2399,14 @@ function AccountSection() {
       // the SPA login form.
       await logout();
       // Hard navigation so the chat store / react-query cache reset.
-      window.location.href = "/login";
+      window.location.href = withBasePath("/login");
       return;
     }
     // OIDC: logout is a server-side GET redirect at /auth/logout that clears
     // the session cookie (and honors the IdP end-session endpoint when
     // configured). A hard navigation lets the browser follow it and resets
     // client caches.
-    window.location.href = "/auth/logout";
+    window.location.href = withBasePath("/auth/logout");
   }, [accountsEnabled]);
 
   const resetPwForm = useCallback(() => {
@@ -2114,9 +2635,14 @@ function ImportSection() {
   return (
     <Section
       title="Import sessions"
-      description="Pull your recent local chats from a machine you're running into Omnigent. Sessions already imported are skipped."
+      description="Pull local chats from a machine you're running into Omnigent. Sessions already imported are skipped."
     >
-      <ImportSessionsPanel />
+      <div className="flex flex-col gap-3">
+        <h2 className="text-ui font-medium">Import from a machine</h2>
+        <div className="rounded-xl border border-border bg-card p-4">
+          <ImportSessionsPanel />
+        </div>
+      </div>
     </Section>
   );
 }
@@ -2152,8 +2678,16 @@ function ArchivedSection() {
     }
   }, [project, projectNames, namesQuery.isSuccess, namesQuery.isFetching]);
 
-  // The visible list, filtered server-side via ?project= when one is picked.
-  const listQuery = useConversations("", true, undefined, project);
+  // Named projects need the owner-scoped "all" query, including archived rows.
+  // The unfiltered view can request only archives across all accessible sessions.
+  // Keep includeArchived for older servers that ignore visibility.
+  const listQuery = useConversations(
+    "",
+    true,
+    undefined,
+    project,
+    project === undefined ? "archived" : undefined,
+  );
   const archived = useMemo(
     () => (listQuery.data?.pages ?? []).flatMap((p) => p.data).filter((c) => c.archived === true),
     [listQuery.data],

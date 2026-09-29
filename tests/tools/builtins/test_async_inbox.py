@@ -27,6 +27,7 @@ from typing import Any
 
 import pytest
 
+from omnigent.runtime.prompt import SUBAGENT_WAKE_NOTICE_SHAPE
 from omnigent.spec import AgentSpec
 from omnigent.tools.builtins.async_inbox import (
     SysCallAsyncTool,
@@ -266,6 +267,16 @@ def test_call_async_description_names_handle_id(tool: SysCallAsyncTool) -> None:
     desc = tool.description()
     assert "handle_id" in desc
     assert "sys_cancel_async" in desc
+
+
+def test_read_inbox_description_names_wake_notice(read_tool: SysReadInboxTool) -> None:
+    """
+    ``sys_read_inbox`` names the runtime wake notice it answers, so a model
+    that just received one knows this is the expected response.
+    """
+    desc = read_tool.description()
+    assert SUBAGENT_WAKE_NOTICE_SHAPE in desc
+    assert "not from a person" in desc
 
 
 def test_sys_cancel_task_schema_keeps_task_id_contract() -> None:

@@ -141,6 +141,28 @@ def test_list_item_embeds_viewer_read_state() -> None:
     assert item.viewer_unread is True  # type: ignore[attr-defined]
 
 
+def test_list_item_reports_a_booting_session_as_running() -> None:
+    """A parked first message or an in-flight dispatch reads as ``running``."""
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes._sessions import orchestration
+
+    conv = _make_conversation("conv_boot")
+    assert _build_item("u1", conv).status == "idle"  # type: ignore[attr-defined]
+
+    pending_id = pending_inputs.record(
+        "conv_boot", [{"type": "input_text", "text": "hi"}], created_by=None
+    )
+    try:
+        assert _build_item("u1", conv).status == "running"  # type: ignore[attr-defined]
+    finally:
+        pending_inputs.resolve("conv_boot", pending_id)
+    assert _build_item("u1", conv).status == "idle"  # type: ignore[attr-defined]
+
+    with orchestration._mark_dispatch_in_flight("conv_boot"):
+        assert _build_item("u1", conv).status == "running"  # type: ignore[attr-defined]
+    assert _build_item("u1", conv).status == "idle"  # type: ignore[attr-defined]
+
+
 def test_list_item_defaults_when_user_never_saw_session() -> None:
     """A session the user never touched has no baseline and reads as seen."""
     item = _build_item(None, _make_conversation("conv_untouched"))

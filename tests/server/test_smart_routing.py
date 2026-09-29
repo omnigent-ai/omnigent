@@ -21,6 +21,7 @@ from omnigent.server.smart_routing import (
     _AUTO_ROUTING_HARNESSES,
     LLMRoutingClient,
     RoutingResult,
+    TaskV1RouteOptionSource,
     _build_rubric,
     fetch_runner_models,
     harness_bars_model,
@@ -275,7 +276,7 @@ def test_model_family_agrees_with_the_shared_token_rule(model: str, expected: st
     :param model: Model id under test.
     :param expected: The family it must land in.
     """
-    from omnigent.model_override import model_family_mismatch
+    from omnigent.models.model_override import model_family_mismatch
     from omnigent.server.smart_routing import _model_family
 
     assert _model_family(model) == expected
@@ -2097,6 +2098,51 @@ def test_route_option_source_offers_only_the_catalog_for_another_router() -> Non
     assert [o.model for o in options] == ["gpt-5-4"]
 
 
+def test_build_route_options_sends_canonical_harness_names() -> None:
+    """Native/SDK harness ids go out as the router's codex/claude vocabulary."""
+    source = TaskV1RouteOptionSource(router_name="task_v3")
+    options = source.build_route_options(
+        ["codex-native", "claude-native", "claude-sdk"],
+        {
+            "codex-native": ["system.ai.glm-5-3"],
+            "claude-native": ["system.ai.claude-sonnet-5"],
+            "claude-sdk": ["databricks-claude-opus-4-8"],
+        },
+    )
+    assert [(o.model, o.harness) for o in options] == [
+        ("glm-5-3", "codex"),
+        ("claude-sonnet-5", "claude"),
+        ("claude-opus-4-8", "claude"),
+    ]
+
+
+def test_injected_menu_arms_carry_canonical_harness_names() -> None:
+    """Arms the task_v1 menu injects are tagged codex/claude, not native ids."""
+    source = TaskV1RouteOptionSource()
+    options = source.build_route_options(["codex-native"], {"codex-native": ["system.ai.glm-5-3"]})
+    assert len(options) > 1, "the codex scenario menu should inject arms"
+    assert {o.harness for o in options} == {"codex"}
+
+
+def test_pi_options_are_tagged_by_the_models_own_family() -> None:
+    """The multi-model pi harness tags each option by its model's family."""
+    source = TaskV1RouteOptionSource(router_name="task_v3")
+    options = source.build_route_options(
+        ["pi"], {"pi": ["databricks-claude-sonnet-5", "databricks-gpt-5-5"]}
+    )
+    assert [(o.model, o.harness) for o in options] == [
+        ("claude-sonnet-5", "claude"),
+        ("gpt-5-5", "codex"),
+    ]
+
+
+def test_a_harness_with_no_known_family_keeps_its_tag() -> None:
+    """A tag outside the family table passes through for routers that ignore it."""
+    source = TaskV1RouteOptionSource(router_name="task_v3")
+    options = source.build_route_options(["self"], {"self": ["acme-model"]})
+    assert [o.harness for o in options] == ["self"]
+
+
 def test_route_option_source_rejects_never_offered_pick() -> None:
     from omnigent.server.smart_routing import RoutePick, TaskV1RouteOptionSource
 
@@ -2413,8 +2459,8 @@ def test_task_v1_claude_arms_follows_a_configured_menu() -> None:
 
 
 def test_parse_routing_tables_reads_every_table() -> None:
-    from omnigent.reasoning_effort import ModelEffortCaps
     from omnigent.server.smart_routing import parse_routing_tables
+    from omnigent.util.reasoning_effort import ModelEffortCaps
 
     tables = parse_routing_tables(
         {

@@ -27,7 +27,7 @@ from omnigent.host.daemon_launch import (
     wait_for_host_online,
     wait_for_runner_online,
 )
-from omnigent.native_terminal import bind_session_runner
+from omnigent.native.native_terminal import bind_session_runner
 from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN
 from tests._helpers.compat import apply_runner_env, compat_runner_cwd, runner_executable
 from tests._helpers.live_server import find_free_port
@@ -220,9 +220,13 @@ class NativeTuiDriver:
     to come online, and creates a native session bound to that host. The
     ``run_*`` methods drive turns over the same HTTP surface the full-server
     driver uses; the runner mirrors them into the tmux vendor TUI.
+
+    This transport does not accept a model override: ``_provision`` creates
+    the session without one, and the vendor CLI keeps its own model.
     """
 
     transport = "native-tui"
+    applied_model_override = False
 
     def __init__(self, profile: BenchProfile, *, databricks_profile: str | None) -> None:
         self._profile = profile

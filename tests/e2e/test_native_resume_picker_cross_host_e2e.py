@@ -137,7 +137,7 @@ def _python() -> str:
 
 def _wrapper_bundle() -> bytes:
     """Bundle the exact terminal-first spec ``omnigent claude`` ships."""
-    from omnigent.claude_native import _materialize_claude_agent_spec
+    from omnigent.harnesses.claude_native.main import _materialize_claude_agent_spec
 
     with tempfile.TemporaryDirectory() as tmp:
         yaml_text = _materialize_claude_agent_spec(Path(tmp)).read_text()
@@ -379,13 +379,15 @@ def test_sdk_session_list_preserves_host_id(cross_host_env: _CrossHostEnv) -> No
 
     async def _list():
         async with OmnigentClient(base_url=url) as client:
-            return await client.sessions.list(limit=50, order="desc")
+            return await client.sessions.list(visibility="all", limit=50, order="desc")
 
     rows = asyncio.run(_list())
     with _client() as c:
         raw = {
             row["id"]: row.get("host_id")
-            for row in c.get(f"{url}/v1/sessions", params={"limit": 50}).json()["data"]
+            for row in c.get(
+                f"{url}/v1/sessions", params={"visibility": "all", "limit": 50}
+            ).json()["data"]
         }
     assert raw[cross_host_env.session_a] == cross_host_env.host_a_id
     assert raw[cross_host_env.session_b] == cross_host_env.host_b_id

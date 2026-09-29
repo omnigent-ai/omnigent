@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 
@@ -19,13 +21,14 @@ from omnigent.runner.resource_registry import (
     _TERMINAL_EXIT_OUTPUT_MAX_CHARS,
     CLAUDE_NATIVE_TERMINAL_ROLE,
     CODEX_NATIVE_TERMINAL_ROLE,
+    PI_NATIVE_TERMINAL_ROLE,
     SessionResourceRegistry,
     TerminalExitEvent,
     TerminalLifecycle,
     _sanitize_session_id,
     _session_workspace,
     _terminal_exit_diagnostics,
-    _trim_terminal_exit_output,
+    trim_terminal_output,
 )
 from omnigent.terminals import TerminalRegistry
 from tests.runner.helpers import make_test_terminal_instance
@@ -151,6 +154,7 @@ def test_list_resources_filters_by_type(tmp_path: Path) -> None:
 async def test_terminal_resource_role_is_private_and_cleared_on_close(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """
     Terminal role markers stay private and follow close lifecycle.
@@ -222,10 +226,19 @@ async def test_terminal_resource_role_is_private_and_cleared_on_close(
     assert "command" not in view.metadata
     assert "args" not in view.metadata
 
-    closed = await registry.close_terminal("conv_codex", view.id)
+    with caplog.at_level(logging.INFO, logger="omnigent.runner.resource_registry"):
+        closed = await registry.close_terminal("conv_codex", view.id)
 
     assert closed is True
     assert registry.terminal_resource_role("conv_codex", view.id) is None
+    record = next(
+        record
+        for record in caplog.records
+        if getattr(record, "event_name", None) == "terminal_close_requested"
+    )
+    assert record.session_id == "conv_codex"
+    assert record.attributes["terminal_id"] == view.id
+    assert record.attributes["terminal_instance_id"] == instance.diagnostic_id
 
 
 @pytest.mark.asyncio
@@ -311,8 +324,11 @@ async def test_terminal_lifecycle_cannot_change_after_observe(tmp_path: Path) ->
 
 
 @pytest.mark.asyncio
-async def test_auxiliary_terminal_exit_publishes_resource_exit_only(tmp_path: Path) -> None:
+async def test_auxiliary_terminal_exit_publishes_resource_exit_only(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
     """Auxiliary terminal exit is reported with auxiliary lifecycle metadata."""
+    caplog.set_level(logging.INFO, logger="omnigent.runner.resource_registry")
     terminal_registry = TerminalRegistry()
     registry = SessionResourceRegistry(terminal_registry=terminal_registry)
     instance = make_test_terminal_instance("sidecar", "s1", tmp_path)
@@ -359,6 +375,87 @@ async def test_auxiliary_terminal_exit_publishes_resource_exit_only(tmp_path: Pa
     assert exits[0].cwd == str(tmp_path)
     assert exits[0].last_output == "startup failed\nretry login"
     assert terminal_registry.get("conv_exit", "sidecar", "s1") is None
+    record = next(
+        record
+        for record in caplog.records
+        if getattr(record, "event_name", None) == "terminal_exit_observed"
+    )
+    assert record.session_id == "conv_exit"
+    assert record.attributes["terminal_lifecycle"] == "auxiliary"
+    assert record.attributes["terminal_instance_id"] == instance.diagnostic_id
+    assert record.attributes["session_status_before_exit"] == "unknown"
+    assert record.attributes["superseded"] is False
+    # A non-Codex terminal keeps the guarantee: no pane contents, no cwd in
+    # the lifecycle-event attributes.
+    assert record.attributes["terminal_last_output"] is None
+    assert "startup failed" not in str(record.attributes)
+    assert str(tmp_path) not in str(record.attributes)
+
+
+@pytest.mark.asyncio
+async def test_auxiliary_codex_exit_persists_redacted_final_screen(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A Codex (auxiliary) exit records a redacted final-screen excerpt on the event.
+
+    The exit publisher drops ``last_output`` for auxiliary terminals, so the
+    ``terminal_exit_observed`` debug event is the only durable path to the final
+    screen; it must carry a credential-redacted excerpt.
+    """
+    caplog.set_level(logging.INFO, logger="omnigent.runner.resource_registry")
+    terminal_registry = TerminalRegistry()
+    registry = SessionResourceRegistry(terminal_registry=terminal_registry)
+    instance = make_test_terminal_instance("codex", "main", tmp_path)
+    instance._remember_pane_snapshot(
+        "gateway ready\napi_key=sk-supersecretvalue1234\n> Ask Codex to do anything"
+    )
+    terminal_registry._by_conversation.setdefault("conv_codex", {})[("codex", "main")] = instance
+    exits: list[TerminalExitEvent] = []
+    exit_published = asyncio.Event()
+    callbacks: dict[str, object] = {}
+
+    def _publish_exit(event: TerminalExitEvent) -> None:
+        exits.append(event)
+        exit_published.set()
+
+    def _capture_watcher(
+        on_idle: object | None = None,
+        *,
+        on_activity: object | None = None,
+        on_exit: object | None = None,
+        on_tick: object | None = None,
+        idle_threshold_s: float | None = None,
+        poll_interval_s: float | None = None,
+        replace: bool = False,
+    ) -> None:
+        del on_idle, on_activity, on_tick, idle_threshold_s, poll_interval_s, replace
+        callbacks["on_exit"] = on_exit
+
+    instance.start_idle_watcher_thread = _capture_watcher  # type: ignore[method-assign]
+    registry.set_terminal_exit_publisher(_publish_exit)
+
+    await registry.observe_auxiliary_terminal(
+        "conv_codex", "codex", "main", instance, resource_role=CODEX_NATIVE_TERMINAL_ROLE
+    )
+    on_exit = callbacks["on_exit"]
+    assert callable(on_exit)
+    on_exit()
+    await asyncio.wait_for(exit_published.wait(), timeout=1.0)
+
+    # The published event is dropped for auxiliary terminals and still carries
+    # the raw screen; the persisted debug event must carry a redacted excerpt.
+    assert exits[0].lifecycle == TerminalLifecycle.AUXILIARY
+    assert "sk-supersecretvalue1234" in (exits[0].last_output or "")
+    record = next(
+        record
+        for record in caplog.records
+        if getattr(record, "event_name", None) == "terminal_exit_observed"
+    )
+    excerpt = record.attributes["terminal_last_output"]
+    assert "gateway ready" in excerpt
+    assert "Ask Codex to do anything" in excerpt
+    assert "sk-supersecretvalue1234" not in excerpt
+    assert "[REDACTED]" in excerpt
 
 
 async def _observe_native_agent_terminal_and_capture(
@@ -516,12 +613,13 @@ async def test_pane_publishes_no_status_while_the_file_owns_it(tmp_path: Path) -
     freshness window to arbitrate — so while the file is readable it decides,
     and the pane's edges are dropped.
     """
-    callbacks, statuses, pollers, _registry = await _observe_native_with_fake_poller(
+    callbacks, statuses, pollers, registry = await _observe_native_with_fake_poller(
         tmp_path, "conv_file_owns"
     )
     poller = pollers[0]
     poller.active = True
 
+    initial_activity = registry.session_activity_epoch("conv_file_owns")
     poller.emit("running")
     callbacks["on_activity"]()  # pane redraws mid-turn — no second edge
     await asyncio.sleep(0)
@@ -532,6 +630,8 @@ async def test_pane_publishes_no_status_while_the_file_owns_it(tmp_path: Path) -
     callbacks["on_idle"]()  # nor does a quiet pane re-assert idle
     await asyncio.sleep(0)
     assert statuses == ["running", "idle"]
+
+    assert registry.session_activity_epoch("conv_file_owns") > initial_activity
 
 
 @pytest.mark.asyncio
@@ -579,14 +679,22 @@ async def test_hook_status_resyncs_watcher_dedup(tmp_path: Path) -> None:
         tmp_path, "conv_resync"
     )
     poller = pollers[0]
+    on_activity = callbacks["on_activity"]
+    assert callable(on_activity)
+    on_activity()
+    assert registry.session_activity_epoch("conv_resync") == 0
+    assert not registry.session_turn_is_active("conv_resync")
     poller.active = True
 
     poller.emit("running")
     await asyncio.sleep(0)
     assert statuses == ["running"]
+    assert registry.session_activity_epoch("conv_resync") > 0
+    assert registry.session_turn_is_active("conv_resync")
 
     # The forwarder posts Stop → idle straight to the server.
     registry.note_external_session_status("conv_resync", "idle")
+    assert not registry.session_turn_is_active("conv_resync")
 
     # The file catches up moments later with the same edge — deduped away, so
     # the user sees one idle rather than a flicker.
@@ -675,7 +783,9 @@ async def test_pty_edges_drive_status_when_poller_inactive(tmp_path: Path) -> No
 
 
 @pytest.mark.asyncio
-async def test_required_terminal_exit_while_idle_is_clean_shutdown(tmp_path: Path) -> None:
+async def test_required_terminal_exit_while_idle_is_clean_shutdown(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
     """A required terminal that exits after going idle is not a failure.
 
     The native agent terminal is long-lived: it goes ``idle`` when its turn
@@ -689,6 +799,7 @@ async def test_required_terminal_exit_while_idle_is_clean_shutdown(tmp_path: Pat
     terminal_registry = TerminalRegistry()
     registry = SessionResourceRegistry(terminal_registry=terminal_registry)
     instance = make_test_terminal_instance("claude", "main", tmp_path)
+    caplog.set_level(logging.INFO, logger="omnigent.runner.resource_registry")
     terminal_registry._by_conversation.setdefault("conv_idle", {})[("claude", "main")] = instance
     exits: list[TerminalExitEvent] = []
     exit_published = asyncio.Event()
@@ -702,7 +813,8 @@ async def test_required_terminal_exit_while_idle_is_clean_shutdown(tmp_path: Pat
         registry, terminal_registry, instance, "conv_idle"
     )
 
-    # The agent worked, then its turn completed (pane quiesced → idle).
+    initial_activity = registry.session_activity_epoch("conv_idle")
+    # The agent worked, then its turn completed (pane became quiet → idle).
     on_activity = callbacks["on_activity"]
     on_idle = callbacks["on_idle"]
     assert callable(on_activity) and callable(on_idle)
@@ -717,10 +829,21 @@ async def test_required_terminal_exit_while_idle_is_clean_shutdown(tmp_path: Pat
     assert len(exits) == 1
     assert exits[0].lifecycle == TerminalLifecycle.REQUIRED
     assert exits[0].session_was_idle is True
+    assert registry.session_activity_epoch("conv_idle") == initial_activity
+    record = next(
+        record
+        for record in caplog.records
+        if getattr(record, "event_name", None) == "terminal_exit_observed"
+    )
+    assert record.session_id == "conv_idle"
+    assert record.attributes["terminal_lifecycle"] == "required"
+    assert record.attributes["session_status_before_exit"] == "idle"
 
 
 @pytest.mark.asyncio
-async def test_required_terminal_exit_while_running_is_failure(tmp_path: Path) -> None:
+async def test_required_terminal_exit_while_running_is_failure(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
     """A required terminal that vanishes mid-turn is still a failure.
 
     When the last PTY-status edge was ``running``, the pane disappeared while
@@ -732,6 +855,7 @@ async def test_required_terminal_exit_while_running_is_failure(tmp_path: Path) -
     terminal_registry = TerminalRegistry()
     registry = SessionResourceRegistry(terminal_registry=terminal_registry)
     instance = make_test_terminal_instance("claude", "main", tmp_path)
+    caplog.set_level(logging.INFO, logger="omnigent.runner.resource_registry")
     terminal_registry._by_conversation.setdefault("conv_run", {})[("claude", "main")] = instance
     exits: list[TerminalExitEvent] = []
     exit_published = asyncio.Event()
@@ -755,15 +879,21 @@ async def test_required_terminal_exit_while_running_is_failure(tmp_path: Path) -
 
     assert len(exits) == 1
     assert exits[0].session_was_idle is False
+    record = next(
+        record
+        for record in caplog.records
+        if getattr(record, "event_name", None) == "terminal_exit_observed"
+    )
+    assert record.attributes["session_status_before_exit"] == "running"
 
 
-def test_trim_terminal_exit_output_drops_whole_leading_lines() -> None:
+def test_trim_terminal_output_drops_whole_leading_lines() -> None:
     # Over the char budget: the first surviving line must be a WHOLE line, never
     # a mid-word fragment (the "rity reasons" cut). The final line — the one that
     # matters — stays intact.
     filler = "\n".join(f"line {i} " + "x" * 80 for i in range(200))
     text = filler + "\n--dangerously-skip-permissions cannot be run for security reasons"
-    trimmed = _trim_terminal_exit_output(text)
+    trimmed = trim_terminal_output(text)
     assert trimmed is not None
     assert len(trimmed) <= _TERMINAL_EXIT_OUTPUT_MAX_CHARS + 60  # + the omitted-lines marker
     assert trimmed.startswith("... omitted ")
@@ -774,11 +904,11 @@ def test_trim_terminal_exit_output_drops_whole_leading_lines() -> None:
     assert first_content.startswith("line ")
 
 
-def test_trim_terminal_exit_output_hard_clips_single_overlong_line() -> None:
+def test_trim_terminal_output_hard_clips_single_overlong_line() -> None:
     # A single line longer than the budget has no line boundary to snap to, so
     # it's clipped from the tail as a last resort.
     line = "y" * (_TERMINAL_EXIT_OUTPUT_MAX_CHARS + 500)
-    trimmed = _trim_terminal_exit_output(line)
+    trimmed = trim_terminal_output(line)
     assert trimmed is not None
     assert len(trimmed) == _TERMINAL_EXIT_OUTPUT_MAX_CHARS
 
@@ -892,6 +1022,7 @@ async def test_required_terminal_exit_after_new_turn_is_failure(tmp_path: Path) 
 
     assert len(exits) == 1
     assert exits[0].session_was_idle is False
+    assert not registry.session_turn_is_active("conv_turn")
 
 
 @pytest.mark.asyncio
@@ -904,10 +1035,14 @@ async def test_cleanup_session_clears_status_memo(tmp_path: Path) -> None:
     registry = SessionResourceRegistry()
     registry.note_session_turn_started("conv_cleanup")
     assert "conv_cleanup" in registry._last_session_status
+    assert registry.session_activity_epoch("conv_cleanup") > 0
+    assert registry.session_turn_is_active("conv_cleanup")
 
     await registry.cleanup_session("conv_cleanup")
 
     assert "conv_cleanup" not in registry._last_session_status
+    assert registry.session_activity_epoch("conv_cleanup") == 0
+    assert not registry.session_turn_is_active("conv_cleanup")
 
 
 @pytest.mark.asyncio
@@ -959,6 +1094,9 @@ async def test_transfer_terminal_moves_status_memo(
     assert moved is not None
     assert "conv_src" not in registry._last_session_status
     assert registry._last_session_status.get("conv_dst") == "running"
+    assert not registry.session_turn_is_active("conv_src")
+    assert registry.session_turn_is_active("conv_dst")
+    assert registry.session_activity_epoch("conv_dst") > 0
 
 
 def test_get_resource_finds_default() -> None:
@@ -1524,3 +1662,267 @@ def test_sanitize_session_id_keeps_traversal_out_of_the_workspace_path(
     resolved = Path(_session_workspace("../../../../etc")).resolve()
 
     assert resolved.is_relative_to(tmp_path.resolve()), f"escaped the root: {resolved}"
+
+
+# ── native bridge-dir reaping: live-session regression ──────────────────────
+
+
+@pytest.mark.asyncio
+async def test_cleanup_session_preserves_live_native_bridge_dir(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """cleanup_session must NOT delete a live session's native bridge dir.
+
+    Bridge-dir deletion is deliberately kept OUT of cleanup_session because
+    the in-place agent-switch reset (reset_session_state) reuses
+    cleanup_session while the session — and its bridge — lives on. Wiring a
+    reap in here would rmtree a live session's ``bridge.json`` +
+    ``permission_hook.json`` and break approval routing until cold launch.
+    This guard fails if any such deletion is ever wired back in.
+
+    :param tmp_path: Pytest temp dir.
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :returns: None.
+    """
+    import omnigent.harnesses.claude_native.bridge as claude_bridge
+
+    monkeypatch.setattr(claude_bridge, "_BRIDGE_ROOT", tmp_path / "claude-native")
+    monkeypatch.setattr(claude_bridge, "_TRUSTED_PARENT", tmp_path)
+
+    # A live session's bridge dir: current-process owner.pid + the token and
+    # permission-hook files that must survive an agent-switch reset.
+    bridge_dir = claude_bridge.prepare_bridge_dir("conv_live", workspace=tmp_path)
+    permission_hook = bridge_dir / "permission_hook.json"
+    permission_hook.write_text("{}", encoding="utf-8")
+    assert (bridge_dir / "bridge.json").exists()
+    assert (bridge_dir / "owner.pid").exists()
+
+    registry = SessionResourceRegistry()
+    await registry.cleanup_session("conv_live")
+
+    assert bridge_dir.exists()
+    assert (bridge_dir / "bridge.json").exists()
+    assert permission_hook.exists()
+
+
+@pytest.mark.asyncio
+async def test_claude_native_logs_input_ready_once_from_existing_snapshot(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OMNIGENT_RUNNER_PRIMARY_SESSION_ID", "parent")
+    caplog.set_level(logging.INFO, logger="omnigent.runner.resource_registry")
+    callbacks, _, pollers, registry = await _observe_native_with_fake_poller(tmp_path, "child")
+    instance = registry.terminal_registry.get("child", "claude", "main")
+    assert instance is not None
+    on_tick = callbacks["on_tick"]
+    assert callable(on_tick)
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            "omnigent.harnesses.claude_native.bridge.claude_pane_text_ready",
+            Mock(side_effect=RuntimeError("readiness observation failed")),
+        )
+        watcher_continues = instance._fire_watch_callback(on_tick, "tick")
+        assert watcher_continues
+        assert pollers[0].ticks == 1
+    instance._remember_pane_snapshot("Sign in to Claude")
+    on_tick()
+    assert not any(getattr(r, "event_name", None) == "native_input_ready" for r in caplog.records)
+    instance._remember_pane_snapshot("────────────────────\n❯ \n────────────────────")
+    on_tick()
+    on_tick()
+    events = [r for r in caplog.records if getattr(r, "event_name", None) == "native_input_ready"]
+    assert len(events) == 1
+    assert events[0].session_id == "child"
+    assert events[0].attributes["harness"] == "claude-native"
+    assert events[0].attributes["terminal_instance_id"] == instance.diagnostic_id
+
+
+_AUTO_MODE_BILLING_NOTICE_PANE = """────────────────────────────────────────
+  We're changing auto mode to no longer charge for classifier requests in Claude Code.
+  However, this session isn't eligible because your requests go through
+  gateway.example.com, which isn't compatible with this update.
+  Nothing breaks: auto mode keeps working, and its classifier requests are billed as before.
+  To fix it and access the new version of auto mode, ask your gateway to implement:
+  https://code.claude.com/docs/en/auto-mode-classifier-billing
+  Enter to continue · Esc to cancel
+"""
+_CLAUDE_READY_PANE = "────────────────────\n❯ \n────────────────────"
+
+
+@pytest.mark.asyncio
+async def test_claude_native_acknowledges_billing_notice_after_input_was_ready(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import omnigent.harnesses.claude_native.bridge as claude_bridge
+
+    callbacks, _, pollers, registry = await _observe_native_with_fake_poller(tmp_path, "child")
+    instance = registry.terminal_registry.get("child", "claude", "main")
+    assert instance is not None
+    on_tick = callbacks["on_tick"]
+    assert callable(on_tick)
+    bridge_dir = tmp_path / "child-bridge"
+    resolve_bridge = Mock(return_value=bridge_dir)
+    acknowledge = Mock(return_value=False)
+    monkeypatch.setattr(claude_bridge, "bridge_dir_for_conversation_id", resolve_bridge)
+    monkeypatch.setattr(claude_bridge, "acknowledge_auto_mode_billing_notice", acknowledge)
+    send_keys = Mock(side_effect=AssertionError("watcher must delegate guarded input"))
+    monkeypatch.setattr(claude_bridge, "_run_tmux", send_keys)
+
+    instance._remember_pane_snapshot(_CLAUDE_READY_PANE)
+    on_tick()
+    resolve_bridge.assert_not_called()
+    acknowledge.assert_not_called()
+
+    # A mid-turn notice still gets checked after the one-time readiness edge.
+    # Repeated cached matches may already be stale; the bridge rechecks them.
+    instance._remember_pane_snapshot(_AUTO_MODE_BILLING_NOTICE_PANE)
+    on_tick()
+    on_tick()
+
+    assert acknowledge.call_count == 2
+    acknowledge.assert_called_with(
+        bridge_dir,
+        expected_socket_path=str(instance.socket_path),
+        expected_tmux_target=instance.tmux_target,
+    )
+    resolve_bridge.assert_called_with("child")
+    send_keys.assert_not_called()
+    assert pollers[0].ticks == 3
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("transfer", [False, True])
+async def test_claude_native_billing_acknowledgement_uses_original_launch_bridge(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    transfer: bool,
+) -> None:
+    import omnigent.harnesses.claude_native.bridge as claude_bridge
+
+    callbacks, _, _, registry = await _observe_native_with_fake_poller(tmp_path, "source")
+    instance = registry.terminal_registry.get("source", "claude", "main")
+    assert instance is not None
+    original_bridge = tmp_path / "cli-direct-bridge"
+    instance.args = ["--settings", str(original_bridge / "claude-settings.json")]
+    resolve_conversation_bridge = Mock(side_effect=AssertionError("wrong bridge identity"))
+    acknowledge = Mock(return_value=True)
+    monkeypatch.setattr(
+        claude_bridge, "bridge_dir_for_conversation_id", resolve_conversation_bridge
+    )
+    monkeypatch.setattr(claude_bridge, "acknowledge_auto_mode_billing_notice", acknowledge)
+
+    if transfer:
+        moved = await registry.transfer_terminal("source", "target", "terminal_claude_main")
+        assert moved is not None
+        assert registry.terminal_registry.get("target", "claude", "main") is instance
+    on_tick = callbacks["on_tick"]
+    assert callable(on_tick)
+    instance._remember_pane_snapshot(_AUTO_MODE_BILLING_NOTICE_PANE)
+    on_tick()
+
+    acknowledge.assert_called_once_with(
+        original_bridge,
+        expected_socket_path=str(instance.socket_path),
+        expected_tmux_target=instance.tmux_target,
+    )
+    resolve_conversation_bridge.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "pane",
+    [
+        "",
+        _CLAUDE_READY_PANE,
+        "────────────────────\nDo you want to run this command?\nEnter to select · Esc to cancel",
+        _AUTO_MODE_BILLING_NOTICE_PANE + _CLAUDE_READY_PANE,
+    ],
+)
+async def test_claude_native_ignores_other_panes_without_attempting_acknowledgement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    pane: str,
+) -> None:
+    import omnigent.harnesses.claude_native.bridge as claude_bridge
+
+    callbacks, _, _, registry = await _observe_native_with_fake_poller(tmp_path, "child")
+    instance = registry.terminal_registry.get("child", "claude", "main")
+    assert instance is not None
+    on_tick = callbacks["on_tick"]
+    assert callable(on_tick)
+    resolve_bridge = Mock()
+    acknowledge = Mock()
+    monkeypatch.setattr(claude_bridge, "bridge_dir_for_conversation_id", resolve_bridge)
+    monkeypatch.setattr(claude_bridge, "acknowledge_auto_mode_billing_notice", acknowledge)
+
+    instance._remember_pane_snapshot(pane)
+    on_tick()
+
+    resolve_bridge.assert_not_called()
+    acknowledge.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_claude_native_billing_acknowledgement_error_preserves_watcher(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    import omnigent.harnesses.claude_native.bridge as claude_bridge
+
+    callbacks, _, pollers, registry = await _observe_native_with_fake_poller(tmp_path, "child")
+    instance = registry.terminal_registry.get("child", "claude", "main")
+    assert instance is not None
+    on_tick = callbacks["on_tick"]
+    assert callable(on_tick)
+    acknowledge = Mock(side_effect=RuntimeError("capture unavailable"))
+    monkeypatch.setattr(claude_bridge, "acknowledge_auto_mode_billing_notice", acknowledge)
+    caplog.set_level(logging.DEBUG, logger="omnigent.runner.resource_registry")
+
+    instance._remember_pane_snapshot(_AUTO_MODE_BILLING_NOTICE_PANE)
+    assert instance._fire_watch_callback(on_tick, "tick")
+    instance._remember_pane_snapshot(_CLAUDE_READY_PANE)
+    assert instance._fire_watch_callback(on_tick, "tick")
+
+    assert pollers[0].ticks == 2
+    acknowledge.assert_called_once()
+    failure = next(
+        r for r in caplog.records if "billing notice acknowledgement failed" in r.message
+    )
+    assert failure.session_id == "child"
+    assert any(getattr(r, "event_name", None) == "native_input_ready" for r in caplog.records)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("role", [None, PI_NATIVE_TERMINAL_ROLE])
+async def test_non_claude_terminal_never_acknowledges_billing_notice(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    role: str | None,
+) -> None:
+    import omnigent.harnesses.claude_native.bridge as claude_bridge
+
+    terminal_registry = TerminalRegistry()
+    registry = SessionResourceRegistry(terminal_registry=terminal_registry)
+    instance = make_test_terminal_instance("shell", "main", tmp_path)
+    instance._remember_pane_snapshot(_AUTO_MODE_BILLING_NOTICE_PANE)
+    start_watcher = Mock()
+    monkeypatch.setattr(instance, "start_idle_watcher_thread", start_watcher)
+    acknowledge = Mock()
+    monkeypatch.setattr(claude_bridge, "acknowledge_auto_mode_billing_notice", acknowledge)
+    registry.set_session_status_publisher(lambda _sid, _status, _reason=None: None)
+    registry.set_terminal_activity_publisher(lambda _sid, _rid: None)
+
+    await registry.observe_required_terminal(
+        "child", "shell", "main", instance, resource_role=role
+    )
+    start_watcher.assert_called_once()
+    on_tick = start_watcher.call_args.kwargs.get("on_tick")
+    if on_tick is not None:
+        on_tick()
+
+    acknowledge.assert_not_called()

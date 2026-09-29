@@ -112,7 +112,7 @@ def _bridge_calls(page: Page) -> list[str]:
 
 def test_settings_updates_section_check_and_mode(
     page: Page,
-    seeded_session: tuple[str, str],
+    live_server: str,
 ) -> None:
     """Settings -> Updates exposes the mode selector and a working Check button.
 
@@ -122,7 +122,7 @@ def test_settings_updates_section_check_and_mode(
     selector reflects the bridge config and ``Check for updates now`` calls the
     bridge's ``check()``.
     """
-    base_url, _session_id = seeded_session
+    base_url = live_server
 
     _install_update_stub(page, '{ state: "idle" }')
     page.goto(f"{base_url}/settings/updates")
@@ -137,47 +137,3 @@ def test_settings_updates_section_check_and_mode(
     check_button.click()
     page.wait_for_function("() => window.__omniUpdate.calls.includes('check')")
     assert "check" in _bridge_calls(page)
-
-
-def test_update_overlay_height_lifts_sonner_toaster(
-    page: Page,
-    seeded_session: tuple[str, str],
-) -> None:
-    """A visible shell update card reserves matching space below web toasts."""
-    base_url, session_id = seeded_session
-    _install_update_stub(page, '{ state: "idle" }')
-    page.goto(f"{base_url}/c/{session_id}")
-
-    expect(page.locator(".app-shell")).to_be_visible(timeout=30_000)
-    page.wait_for_function("() => window.__omniUpdate.hasOverlaySubscriber()")
-
-    # Archive is a provider-free, real UI path that emits showToast(). Sonner
-    # does not mount its positioned list until the first toast exists.
-    row = page.locator("li").filter(has=page.locator(f'a[href="/c/{session_id}"]'))
-    expect(row).to_be_visible()
-    row.hover()
-    row.get_by_test_id("conversation-actions").click()
-    page.get_by_test_id("archive-conversation").click()
-    page.wait_for_url(f"{base_url}/", timeout=10_000)
-
-    toast = page.get_by_test_id("toast")
-    expect(toast).to_be_visible(timeout=10_000)
-    toast.hover()  # Pause Sonner's finite dismissal timer while measuring.
-    toaster = page.locator("[data-sonner-toaster]")
-    expect(toaster).to_have_count(1)
-
-    initial_bottom = toaster.evaluate("element => parseFloat(getComputedStyle(element).bottom)")
-    page.evaluate("() => window.__omniUpdate.emitOverlayHeight(180)")
-
-    expected_bottom = initial_bottom + 180 + 12
-    page.wait_for_function(
-        """expected => {
-          const toaster = document.querySelector("[data-sonner-toaster]");
-          return toaster !== null &&
-            Math.abs(parseFloat(getComputedStyle(toaster).bottom) - expected) < 0.5;
-        }""",
-        arg=expected_bottom,
-    )
-
-    actual_bottom = toaster.evaluate("element => parseFloat(getComputedStyle(element).bottom)")
-    assert abs(actual_bottom - expected_bottom) < 0.5

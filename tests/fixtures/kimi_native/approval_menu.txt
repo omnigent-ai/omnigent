@@ -1,0 +1,36 @@
+ │  ▐█████▌  Send /help for help information.                                                                         │
+ │                                                                                                                    │
+ │  Directory: <scratch>/kimi-fixture-local3                                                                       │
+ │  Session:   <session-id>                                                           │
+ │  Model:     dummy                                                                                                  │
+ │  Version:   0.34.0                                                                                                 │
+ │                                                                                                                    │
+ ╰────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+
+ ✦ Use Kimi K3 with High thinking effort - for the best balance between token spend and capability
+   Run /model to switch to K3 and set thinking effort to High
+
+   No session yet — one will be created on your first message.
+   tmux extended-keys is off. Modified Enter keys may not work. Add `set -g extended-keys on` to ~/.tmux.conf and
+ restart tmux.
+
+ ✨ Run the shell command now.
+
+ ● Running a command
+   $ printf approval-fixture
+   Press Ctrl+B to run in background
+ ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+   ▶ Run this command?
+
+   cwd: <scratch>/kimi-fixture-local3
+   $ printf approval-fixture
+
+   ▶ 1. Approve once
+     2. Approve for this session
+     3. Reject
+     4. Reject with feedback
+
+   ↑/↓ select · 1/2/3/4 choose · ↵ confirm
+ ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ dummy  <scratch>/kimi-fixture-local3       ! to run a shell command | /compact compresses context when it gets long
+                                                                                                  context: 1% (11/256k)

@@ -118,7 +118,7 @@ def _create_codex_session_with_workspace(
         UI_MODE_TERMINAL_VALUE,
         WRAPPER_LABEL_KEY,
     )
-    from omnigent.codex_native import _materialize_codex_agent_spec
+    from omnigent.harnesses.codex_native.main import _materialize_codex_agent_spec
 
     with tempfile.TemporaryDirectory() as _tmp:
         spec_path = _materialize_codex_agent_spec(Path(_tmp), model=None)

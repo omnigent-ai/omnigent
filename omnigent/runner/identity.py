@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import os
 import signal
 import uuid
@@ -11,6 +12,9 @@ from pathlib import Path
 
 RUNNER_ID_ENV_VAR = "OMNIGENT_RUNNER_ID"
 RUNNER_PARENT_PID_ENV_VAR = "OMNIGENT_RUNNER_PARENT_PID"
+# Host-launched runners delegate machine-global stale-process cleanup to the
+# host daemon. CLI-local runners leave this unset and retain standalone cleanup.
+RUNNER_HOST_OWNS_GLOBAL_CLEANUP_ENV_VAR = "OMNIGENT_RUNNER_HOST_OWNS_GLOBAL_CLEANUP"
 # Signal the CLI sends to "adopt" a runner: stop watching the parent
 # pid so the runner survives an intentional CLI exit (tmux detach) and
 # keeps serving the web UI. SIGUSR1 is unused elsewhere in the runner.
@@ -35,6 +39,9 @@ RUNNER_SLICE_KEY_ENV_VAR = "OMNIGENT_RUNNER_SLICE_KEY"
 # can start harness-specific prewarms before session init arrives. Absent
 # for CLI-local runners and hosts that predate the stamp.
 RUNNER_LAUNCH_HARNESS_ENV_VAR = "OMNIGENT_RUNNER_LAUNCH_HARNESS"
+# JSON-encoded ordered shell inventory discovered by the host daemon. The
+# runner uses this exact snapshot for native wrapper terminal declarations.
+RUNNER_INTERACTIVE_SHELLS_ENV_VAR = "OMNIGENT_RUNNER_INTERACTIVE_SHELLS"
 RUNNER_TUNNEL_TOKEN_HEADER = "X-Omnigent-Runner-Tunnel-Token"
 # Sentinel ``Origin`` header that the project's own non-browser WebSocket
 # clients (runner -> server tunnel, host/daemon -> server tunnel,
@@ -49,6 +56,10 @@ OMNIGENT_INTERNAL_WS_ORIGIN = "omnigent://internal"
 # gets its own subdirectory. Set by shared-host servers; single-user
 # CLI flows leave it unset (agent sees the project root directly).
 RUNNER_ISOLATE_SESSION_ENV_VAR = "OMNIGENT_RUNNER_ISOLATE_SESSION"
+
+# Set by a launching host for its first-connect watchdog; absent for CLI-local
+# runners, which have no host watching them.
+RUNNER_CONNECT_MARKER_ENV_VAR = "OMNIGENT_RUNNER_CONNECT_MARKER"
 
 # Marker env var stamped into every agent-facing environment so any
 # process launched inside an Omnigent agent session can detect it is
@@ -74,6 +85,24 @@ RUNNER_AUTH_SECRET_ENV_VARS: frozenset[str] = frozenset(
         RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR,
     }
 )
+
+
+def touch_connect_marker(env: Mapping[str, str] | None = None) -> None:
+    """Mark a host-launched tunnel connect, if configured.
+
+    Reconnects may touch the same file; failure must not block the tunnel.
+    """
+    source = os.environ if env is None else env
+    path = source.get(RUNNER_CONNECT_MARKER_ENV_VAR)
+    if not path:
+        return
+    try:
+        Path(path).touch()
+    except OSError:
+        # A failed touch only affects the host's diagnostic.
+        logging.getLogger(__name__).warning(
+            "could not touch runner connect marker %s", path, exc_info=True
+        )
 
 
 def strip_runner_auth_secrets(env: Mapping[str, str]) -> dict[str, str]:

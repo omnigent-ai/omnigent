@@ -97,6 +97,19 @@ interface NativeShellApi {
    * fallback so a newer SPA can still ask an older shell to hide the switcher.
    */
   setSidebarOpen?: (open: boolean) => void;
+  /** Control root-document scrolling; nested web scrollers remain independent. */
+  setDocumentScrollEnabled?: (enabled: boolean) => void;
+  /**
+   * Current server origin + managed/recent choices, or null on a foreign page.
+   * Optional: shells older than the sidebar server picker lack it — the SPA
+   * then falls back to that shell's own selection chrome (the floating pill on
+   * older iOS shells).
+   */
+  getServerPicker?: () => Promise<ServerPickerInfo | null>;
+  /** Re-point this window/shell to a server URL returned by the picker. */
+  switchServer?: (url: string) => Promise<void>;
+  /** Return to the shell's "connect to server" setup page. */
+  openServerSetup?: () => void;
   /**
    * Drive the native Chat/Terminal bar's visibility (iOS). The web app owns
    * the truth and only ever pushes it hidden now that the switcher lives in
@@ -116,6 +129,9 @@ interface NativeShellApi {
    * hardcoding them. Absent on older shells. Returns an unsubscribe.
    */
   onNativeInsets?: (callback: (insets: NativeInsets) => void) => () => void;
+  /** Area above the docked iOS keyboard; floating keyboard controls do not shrink it. */
+  getKeyboardViewport?: () => { width: number; height: number } | null;
+  onKeyboardViewportChanged?: (callback: () => void) => () => void;
 }
 
 export type ThemeSource = "light" | "dark" | "system";
@@ -157,12 +173,8 @@ interface ElectronDesktopApi extends NativeShellApi {
    * idle, so the web never shows a (duplicate) banner. Absent on older shells.
    */
   updates?: ElectronUpdateBridge;
-  /** Current server origin + managed/recent choices, or null on a foreign page. */
-  getServerPicker?: () => Promise<ServerPickerInfo | null>;
-  /** Re-point this window to a server URL returned by the picker. */
-  switchServer?: (url: string) => Promise<void>;
-  /** Return this window to the shell's "connect to server" setup page. */
-  openServerSetup?: () => void;
+  /** Reveal one of this machine's files in the OS file manager. */
+  revealFile?: (hostId: string, path: string) => Promise<boolean>;
   /** This machine's identity (CLI installed + host id) — fast, no subprocess. */
   getHostIdentity?: () => Promise<HostIdentity | null>;
   /** Start / stop / restart this machine's host daemon for the window's server. */
@@ -468,6 +480,24 @@ export function isIOSShell(): boolean {
 }
 
 /**
+ * True when the surrounding shell exposes the complete server-picker bridge —
+ * data ({@link getServerPicker}) plus both actions the picker offers
+ * ({@link switchServer}, {@link openServerSetup}). Shells with the picker
+ * surface server selection in the sidebar; shells without it (older iOS
+ * builds) fall back to their own selection chrome, the floating pill. All
+ * three methods are required so a partial/version-skewed shell never hides
+ * its own pill while the sidebar offers actions it cannot perform.
+ */
+export function supportsNativeServerPicker(): boolean {
+  const native = nativeApi();
+  return (
+    typeof native?.getServerPicker === "function" &&
+    typeof native.switchServer === "function" &&
+    typeof native.openServerSetup === "function"
+  );
+}
+
+/**
  * True when running inside the native Android WebView shell. A sibling to
  * {@link isIOSShell} — deliberately NOT folded into it, since the iOS-only
  * chrome (viewport lock, native keyboard inset, server switcher) keys off
@@ -699,52 +729,96 @@ export function onNativeInsets(callback: (insets: NativeInsets) => void): () => 
   }
 }
 
+/** Prevent native focus scrolling while the app shell owns keyboard layout. */
+export function setIOSDocumentScrollEnabled(enabled: boolean): void {
+  const native = nativeApi();
+  if (native?.kind !== "ios") return;
+  try {
+    native.setDocumentScrollEnabled?.(enabled);
+  } catch (err) {
+    console.warn("[nativeBridge] native setDocumentScrollEnabled failed:", err);
+  }
+}
+
+/** UIKit's visible height, or null for older shells and pending orientation updates. */
+export function getIOSKeyboardViewportHeight(): number | null {
+  if (!isIOSShell()) return null;
+  try {
+    const viewport = nativeApi()?.getKeyboardViewport?.();
+    if (
+      !viewport ||
+      !Number.isFinite(viewport.width) ||
+      !Number.isFinite(viewport.height) ||
+      Math.abs(viewport.width - window.innerWidth) > 1 ||
+      viewport.height <= 0
+    ) {
+      return null;
+    }
+    // WebKit can temporarily shrink innerHeight during a keyboard transition.
+    // Only reconcile subpixel rounding; UIKit owns the usable app height.
+    return Math.abs(viewport.height - window.innerHeight) <= 1
+      ? Math.min(viewport.height, window.innerHeight)
+      : viewport.height;
+  } catch {
+    return null;
+  }
+}
+
+export function onNativeKeyboardViewportChanged(callback: () => void): () => void {
+  try {
+    return nativeApi()?.onKeyboardViewportChanged?.(callback) ?? (() => {});
+  } catch {
+    return () => {};
+  }
+}
+
 /**
- * Fetch server picker data from the Electron shell: the current origin plus
- * organization-provided and recently-connected server lists.
+ * Fetch server picker data from the native shell (Electron or iOS): the
+ * current origin plus organization-provided and recently-connected server
+ * lists.
  *
- * Resolves `null` outside the Electron shell, under a shell too old to
- * support the picker, or on a page the shell doesn't recognize as a
- * connected server — callers hide the picker in all of those cases.
+ * Resolves `null` outside a native shell, under a shell too old to support
+ * the picker, or on a page the shell doesn't recognize as a connected
+ * server — callers hide the picker in all of those cases.
  */
 export async function getServerPicker(): Promise<ServerPickerInfo | null> {
-  const electron = electronApi();
-  if (!electron?.getServerPicker) return null;
+  const native = nativeApi();
+  if (!native?.getServerPicker) return null;
   try {
-    return await electron.getServerPicker();
+    return await native.getServerPicker();
   } catch (err) {
-    console.warn("[nativeBridge] electron getServerPicker failed:", err);
+    console.warn("[nativeBridge] native getServerPicker failed:", err);
     return null;
   }
 }
 
 /**
- * Ask the Electron shell to re-point this window to another URL returned in
+ * Ask the native shell to re-point this window to another URL returned in
  * `ServerPickerInfo.managedServers` or `recentServers`. The shell navigates the
  * whole window, so on success this page unloads.
  */
 export async function switchServer(url: string): Promise<void> {
-  const electron = electronApi();
-  if (!electron?.switchServer) return;
+  const native = nativeApi();
+  if (!native?.switchServer) return;
   try {
-    await electron.switchServer(url);
+    await native.switchServer(url);
   } catch (err) {
-    console.warn("[nativeBridge] electron switchServer failed:", err);
+    console.warn("[nativeBridge] native switchServer failed:", err);
   }
 }
 
 /**
- * Ask the Electron shell to return this window to its "connect to server"
+ * Ask the native shell to return this window to its "connect to server"
  * setup page (the picker's "+ Connect to new server…" action). The window
  * navigates away on success.
  */
 export function openServerSetup(): void {
-  const electron = electronApi();
-  if (!electron?.openServerSetup) return;
+  const native = nativeApi();
+  if (!native?.openServerSetup) return;
   try {
-    electron.openServerSetup();
+    native.openServerSetup();
   } catch (err) {
-    console.warn("[nativeBridge] electron openServerSetup failed:", err);
+    console.warn("[nativeBridge] native openServerSetup failed:", err);
   }
 }
 
@@ -865,5 +939,19 @@ export async function resetCliPath(): Promise<CliStatus | null> {
   } catch (err) {
     console.warn("[nativeBridge] electron resetCliPath failed:", err);
     return null;
+  }
+}
+
+/** True when the desktop shell can reveal this machine's files in the OS file manager. */
+export function supportsFileReveal(): boolean {
+  return typeof electronApi()?.revealFile === "function";
+}
+
+/** Ask the desktop shell to reveal ``path``; resolves false if it could not. */
+export async function revealFile(hostId: string, path: string): Promise<boolean> {
+  try {
+    return (await electronApi()?.revealFile?.(hostId, path)) ?? false;
+  } catch {
+    return false;
   }
 }

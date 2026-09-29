@@ -8,7 +8,7 @@ this single function.
 
 from __future__ import annotations
 
-from omnigent.entities import ResolvedAccess
+from omnigent.entities import Conversation, ResolvedAccess
 from omnigent.server.auth import LEVEL_MANAGE, LEVEL_OWNER
 from omnigent.stores.conversation_store import ConversationStore
 from omnigent.stores.permission_store import PermissionStore
@@ -20,6 +20,7 @@ def check_session_access(
     required_level: int,
     permission_store: PermissionStore,
     conversation_store: ConversationStore,
+    conversation: Conversation | None = None,
 ) -> bool:
     """Check whether *user_id* may perform an action on a session.
 
@@ -39,12 +40,18 @@ def check_session_access(
     :param permission_store: Store for permission lookups.
     :param conversation_store: Store for conversation lookups
         (needed for sub-agent parent delegation).
+    :param conversation: Optional authoritative row already loaded for
+        ``conversation_id``. A mismatched row is rejected rather than used for
+        authorization. Parent delegation still loads the parent normally.
     :returns: ``True`` if access is allowed, ``False`` otherwise.
     """
+    if conversation is not None and conversation.id != conversation_id:
+        return False
+
     if user_id is not None and permission_store.is_admin(user_id):
         return True
 
-    conv = conversation_store.get_conversation(conversation_id)
+    conv = conversation or conversation_store.get_conversation(conversation_id)
     if conv is None:
         return False
 

@@ -67,6 +67,7 @@ function makeWebContents({ canBack = false, canForward = false } = {}) {
     reload: () => calls.push("reload"),
     isDevToolsOpened: () => devtoolsOpen,
     isDestroyed: () => false,
+    getURL: () => "https://example.com/restored",
     getZoomFactor: () => 1,
     executeJavaScript: (js) => {
       calls.push(`executeJavaScript:${String(js).slice(0, 40)}`);
@@ -144,6 +145,24 @@ function setup({ pinned = true, conversationId = "conv_1", webContents } = {}) {
   });
   return { ipcMain, registry, wc, sent, event };
 }
+
+it("restores the URL and history state for the requested browser tab only", () => {
+  const viewId = "browser-tab:conv_1:tab-two";
+  const { ipcMain, event } = setup({
+    conversationId: viewId,
+    webContents: makeWebContents({ canBack: true }),
+  });
+  assert.deepEqual(ipcMain.invoke("omnigent:browser-has-view", event, { conversationId: viewId }), {
+    exists: true,
+    url: "https://example.com/restored",
+    canGoBack: true,
+    canGoForward: false,
+  });
+  assert.deepEqual(
+    ipcMain.invoke("omnigent:browser-has-view", event, { conversationId: "conv_1" }),
+    { exists: false },
+  );
+});
 
 describe("browserIpc — trust gate", () => {
   it("registers every browser-* channel", () => {

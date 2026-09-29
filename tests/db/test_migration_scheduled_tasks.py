@@ -58,6 +58,7 @@ def test_scheduled_tasks_columns(db_engine: Engine) -> None:
         "rrule",
         "user_id",
         "agent_id",
+        "account_generation",
         "model_override",
         "reasoning_effort",
         "permission_mode",

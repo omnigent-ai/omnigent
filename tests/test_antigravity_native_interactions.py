@@ -1,6 +1,6 @@
 """Tests for the agy interaction bridge (detect → elicit → deliver loop).
 
-These exercise :func:`omnigent.antigravity_native_interactions.bridge_interaction`
+These exercise :func:`omnigent.harnesses.antigravity_native.interactions.bridge_interaction`
 with fakes for its three injectable seams (``get_steps``,
 ``request_elicitation``, ``deliver``) so the timeout/re-read logic is unit-tested
 WITHOUT a live agy server.
@@ -34,13 +34,13 @@ from typing import Any
 
 import pytest
 
-from omnigent.antigravity_native_interactions import (
+from omnigent.harnesses.antigravity_native.interactions import (
     _freshest_waiting,
     agy_elicitation_id,
     bridge_interaction,
 )
-from omnigent.antigravity_native_rpc import AntigravityRpcError
-from omnigent.antigravity_native_steps import PendingInteraction
+from omnigent.harnesses.antigravity_native.rpc import AntigravityRpcError
+from omnigent.harnesses.antigravity_native.steps import PendingInteraction
 from omnigent.server.schemas import ElicitationRequestParams, ElicitationResult
 
 _CASCADE = "test-cascade-id"
@@ -59,7 +59,7 @@ def _question_step(
     Build a WAITING ask_question step dict at a given trajectory index.
 
     Mirrors the live RPC shape consumed by
-    :func:`omnigent.antigravity_native_steps.pending_interaction`:
+    :func:`omnigent.harnesses.antigravity_native.steps.pending_interaction`:
     ``status``, ``requestedInteraction.askQuestion``, and the
     ``metadata.sourceTrajectoryStepInfo`` ids.
 
@@ -729,8 +729,8 @@ def test_tui_injector_for_binds_an_explicit_bridge_dir(
     """
     import asyncio
 
-    import omnigent.antigravity_native_bridge as bridge_mod
-    from omnigent.antigravity_native_interactions import tui_injector_for
+    import omnigent.harnesses.antigravity_native.bridge as bridge_mod
+    from omnigent.harnesses.antigravity_native.interactions import tui_injector_for
 
     monkeypatch.delenv("HARNESS_ANTIGRAVITY_NATIVE_BRIDGE_DIR", raising=False)
     calls: list[tuple[Any, tuple[str, ...]]] = []

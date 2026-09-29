@@ -33,7 +33,7 @@ from pathlib import Path
 import httpx
 import pytest
 
-from omnigent.codex_model_vocabulary import codex_spawn_model
+from omnigent.models.codex_model_vocabulary import codex_spawn_model
 from omnigent.runner.subagent_routing import ROUTING_DECISION_LABEL_KEY
 from omnigent.runner.turn_routing import MARKER_FILE
 from tests.e2e.routing._helpers import (

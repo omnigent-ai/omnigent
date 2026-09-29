@@ -1,3 +1,6 @@
+import type { HarnessReadiness } from "@/lib/harnessSetup";
+import { nativeCodingAgentForHarness } from "@/lib/nativeCodingAgents";
+
 // Persisted, app-global preference for which brain harness override the
 // new-session landing composer starts on, keyed by agent id.
 //
@@ -6,7 +9,6 @@
 // This store remembers the last pick per agent so returning users start on
 // the harness they used last. A stale value (harness removed server-side)
 // is sent as `harness_override` and rejected by the server at create time.
-
 const STORAGE_KEY = "omnigent:last-harness-by-agent";
 
 type HarnessMap = Record<string, string>;
@@ -55,4 +57,62 @@ export function writeLastHarness(agentId: string | null | undefined, harness: st
   } catch {
     // localStorage quota or access errors shouldn't break the composer.
   }
+}
+
+export interface HarnessPreferenceCandidate<T = unknown> {
+  harness: string;
+  readiness: HarnessReadiness;
+  value: T;
+}
+
+export type HarnessPreferenceResolutionSource = "preferred" | "default" | "fallback" | "none";
+
+export interface HarnessPreferenceResolution<T = unknown> {
+  candidate: HarnessPreferenceCandidate<T> | null;
+  source: HarnessPreferenceResolutionSource;
+  preferredHarness: string | null;
+  rejectedPreference: HarnessPreferenceCandidate<T> | null;
+}
+
+function sameHarness(left: string, right: string): boolean {
+  const leftSpec = nativeCodingAgentForHarness(left);
+  const rightSpec = nativeCodingAgentForHarness(right);
+  if (leftSpec && rightSpec) return leftSpec.key === rightSpec.key;
+  return left === right;
+}
+
+/**
+ * Choose a New Session harness from picker-ordered candidates.
+ *
+ * A runnable explicit preference wins, including native aliases. Otherwise the
+ * first runnable candidate is the deterministic fallback. Candidate order stays
+ * owned by the caller so product ranking and recency remain presentation policy.
+ */
+export function resolveHarnessPreference<T>(
+  candidates: readonly HarnessPreferenceCandidate<T>[],
+  preferredHarness: string | null | undefined,
+): HarnessPreferenceResolution<T> {
+  const preferred = preferredHarness?.trim() || null;
+  const preferredCandidate = preferred
+    ? (candidates.find((candidate) => sameHarness(candidate.harness, preferred)) ?? null)
+    : null;
+  if (preferredCandidate?.readiness.selectable) {
+    return {
+      candidate: preferredCandidate,
+      source: "preferred",
+      preferredHarness: preferred,
+      rejectedPreference: null,
+    };
+  }
+
+  const canFallback = preferredCandidate === null || preferredCandidate.readiness.fallbackRelevant;
+  const candidate = canFallback
+    ? (candidates.find((entry) => entry.readiness.selectable) ?? null)
+    : null;
+  return {
+    candidate,
+    source: candidate === null ? "none" : preferred === null ? "default" : "fallback",
+    preferredHarness: preferred,
+    rejectedPreference: preferredCandidate,
+  };
 }

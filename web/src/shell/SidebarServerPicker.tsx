@@ -37,7 +37,8 @@ function originOf(url: string): string | null {
 }
 
 /**
- * Server picker for the Electron desktop shell, pinned to the sidebar's bottom.
+ * Server picker for the native shells (Electron desktop and iOS), pinned to
+ * the sidebar's bottom.
  *
  * A sidebar row (server glyph + current host + an upward chevron) that opens a
  * menu of organization-provided and recently-connected servers — selecting one
@@ -45,22 +46,20 @@ function originOf(url: string): string | null {
  * which returns the window to the shell's setup page.
  *
  * This deliberately lives at the bottom of the sidebar rather than in the
- * window's title bar. The macOS shell hides the native title bar (titleBarStyle
- * "hiddenInset"), and the previous picker filled that freed strip with a
- * centered "<thread> — <host>" label. But the chat header occupies the same
- * strip (`absolute top-0`, and taller at h-14), so on a narrow window the
- * centered label ran into the header's action cluster. Docking the picker here
- * takes it out of that contested space; the drag strip and the sidebar's
- * traffic-light top margin stay exactly as they were, since those are what keep
- * the OS window controls off the sidebar card.
+ * chat surface's top strip. The macOS shell hides the native title bar
+ * (titleBarStyle "hiddenInset"), and the previous picker filled that freed
+ * strip with a centered "<thread> — <host>" label. But the chat header
+ * occupies the same strip (`absolute top-0`, and taller at h-14), so on a
+ * narrow window the centered label ran into the header's action cluster. The
+ * iOS shell repeated the same mistake with its floating pill, which crowded
+ * the chat header's title and floating controls on a notched iPhone. Docking
+ * the picker here takes it out of that contested space on both shells.
  *
  * Renders nothing until the shell confirms this page is a connected server
  * (getServerPicker resolves non-null) — so it's absent in plain browsers, under
- * shells too old for the picker IPC, and on foreign pages. That single check is
- * the whole gate: no platform sniffing, matching how the rest of nativeBridge
- * degrades (one bundle, many runtimes, decided at runtime). Note this reaches
- * every Electron platform, where the old title-bar picker was macOS-only —
- * Windows and Linux desktop users previously had no in-app picker at all.
+ * shells too old for the picker bridge, and on foreign pages. That single check
+ * is the whole gate: no platform sniffing, matching how the rest of
+ * nativeBridge degrades (one bundle, many runtimes, decided at runtime).
  */
 export function SidebarServerPicker() {
   const [info, setInfo] = useState<ServerPickerInfo | null>(null);
@@ -123,8 +122,14 @@ export function SidebarServerPicker() {
           </Button>
         </DropdownMenuTrigger>
         {/* side="top" — the trigger sits at the bottom of the window, so the
-            menu must grow upward rather than off-screen. */}
-        <DropdownMenuContent side="top" align="start" className="min-w-56">
+            menu must grow upward rather than off-screen. max-w caps the width so
+            a long host (the default menu is w-max) truncates in place instead of
+            overflowing the viewport on a narrow phone. */}
+        <DropdownMenuContent
+          side="top"
+          align="start"
+          className="min-w-56 max-w-[min(20rem,calc(100vw-1rem))]"
+        >
           {managed.length > 0 ? (
             <>
               <DropdownMenuLabel className="text-muted-foreground">
@@ -144,7 +149,7 @@ export function SidebarServerPicker() {
                     ) : (
                       <span className="size-4 shrink-0" aria-hidden="true" />
                     )}
-                    <span className={cn("truncate", isCurrent && "font-medium")}>
+                    <span className={cn("min-w-0 truncate", isCurrent && "font-medium")}>
                       {hostOf(url)}
                     </span>
                   </DropdownMenuItem>
@@ -159,7 +164,7 @@ export function SidebarServerPicker() {
               {!currentIsManaged ? (
                 <DropdownMenuItem disabled className="gap-2 opacity-100">
                   <CheckIcon className="size-4 shrink-0" />
-                  <span className="truncate font-medium">{currentHost}</span>
+                  <span className="min-w-0 truncate font-medium">{currentHost}</span>
                 </DropdownMenuItem>
               ) : null}
               {recentOthers.map((url) => (
@@ -169,7 +174,7 @@ export function SidebarServerPicker() {
                   onSelect={() => void switchServer(url)}
                 >
                   <span className="size-4 shrink-0" aria-hidden="true" />
-                  <span className="truncate">{hostOf(url)}</span>
+                  <span className="min-w-0 truncate">{hostOf(url)}</span>
                 </DropdownMenuItem>
               ))}
             </>

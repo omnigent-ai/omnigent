@@ -27,8 +27,8 @@ from types import SimpleNamespace as N
 
 import pytest
 
-import omnigent.claude_native_bridge as claude_native_bridge
-from omnigent.opencode_native_provider import (
+import omnigent.harnesses.claude_native.bridge as claude_native_bridge
+from omnigent.harnesses.opencode_native.provider import (
     build_opencode_mcp_block,
     build_opencode_omnigent_mcp_server,
 )
@@ -56,7 +56,7 @@ def test_build_omnigent_mcp_server_emits_timeout(monkeypatch: pytest.MonkeyPatch
                     "command": "/usr/bin/python3",
                     "args": [
                         "-m",
-                        "omnigent.claude_native_bridge",
+                        "omnigent.harnesses.claude_native.bridge",
                         "serve-mcp",
                         "--bridge-dir",
                         str(bridge_dir),

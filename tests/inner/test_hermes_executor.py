@@ -155,7 +155,7 @@ class TestSetupHermesHome:
 
         Returns (home, bridge_dir): the credential-bearing HERMES_HOME (a private
         tempdir) and the deterministic bridge dir (runner rendezvous)."""
-        import omnigent.hermes_native_bridge as hnb
+        import omnigent.harnesses.hermes_native.bridge as hnb
 
         monkeypatch.setattr(hnb, "_BRIDGE_ROOT", tmp_path)
         monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:6767")
@@ -187,7 +187,7 @@ class TestSetupHermesHome:
         assert omnigent_mcp["args"][:4] == [
             "-I",
             "-m",
-            "omnigent.claude_native_bridge",
+            "omnigent.harnesses.claude_native.bridge",
             "serve-mcp",
         ]
         assert "serve-mcp" in omnigent_mcp["args"]

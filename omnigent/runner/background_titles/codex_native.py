@@ -20,7 +20,7 @@ _logger = logging.getLogger("omnigent.runner.background_titles.codex_native")
 
 async def generate_background_title(context: BackgroundTitleContext) -> str | None:
     """Generate a title with an isolated native Codex exec process."""
-    from omnigent.codex_native_app_server import (
+    from omnigent.harnesses.codex_native.app_server import (
         build_codex_native_server,
         resolve_native_codex_launch,
     )
@@ -31,6 +31,7 @@ async def generate_background_title(context: BackgroundTitleContext) -> str | No
         materialize_codex_provider_config,
     )
     from omnigent.runner.native.orchestration import _codex_native_model_from_spec
+    from omnigent.util.reasoning_effort import CODEX_NATIVE_EFFORTS
 
     model = (
         context.title_model
@@ -49,8 +50,11 @@ async def generate_background_title(context: BackgroundTitleContext) -> str | No
             codex_home,
             _codex_home_config_source_from_env(),
             minimal_config=True,
+            supported_efforts=CODEX_NATIVE_EFFORTS,
         )
-        native_server = build_codex_native_server(
+        # Profile/model discovery can block in SDK initialization; keep the runner responsive.
+        native_server = await asyncio.to_thread(
+            build_codex_native_server,
             socket_path=temp_root / "unused.sock",
             codex_home=codex_home,
             cwd=title_workdir,

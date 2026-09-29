@@ -101,6 +101,8 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
   openServerSetup: () => {
     ipcRenderer.send("omnigent:open-server-setup");
   },
+  /** Reveal one of this machine's files in the OS file manager. */
+  revealFile: (hostId, path) => ipcRenderer.invoke("omnigent:reveal-file", hostId, path),
   /**
    * This machine's identity — `{ cliInstalled, hostId }` — read from local
    * config with no subprocess, so it's instant. Lets the SPA recognize "this
@@ -432,14 +434,39 @@ contextBridge.exposeInMainWorld("omnigentSetup", {
   /**
    * Persist + navigate to a server URL. Connecting this machine as a runner is
    * a separate, explicit action from the host menu — not a connect-time choice.
-   * Resolves `{needsConfirm:true, url}` when a remote URL doesn't look like an
-   * Omnigent server; re-call with `{force:true}` to proceed anyway.
    * @param {string} url
-   * @param {{force?: boolean}} [opts]
+   * @param {{requestId?: string}} [opts]
    */
   setServerUrl: (url, opts) => ipcRenderer.invoke("omnigent:set-server-url", url, opts),
+  /** Cancel only this setup window's matching connection attempt. */
+  cancelServerConnection: (requestId) =>
+    ipcRenderer.invoke("omnigent:cancel-server-connection", requestId),
+  /** Subscribe to connecting/authenticating phases for a request ID. */
+  onConnectionProgress: (callback) => {
+    const listener = (_event, progress) => callback(progress);
+    ipcRenderer.on("omnigent:connection-progress", listener);
+    return () => ipcRenderer.removeListener("omnigent:connection-progress", listener);
+  },
   /** Organization-provided server URLs from macOS Managed Preferences. */
   getManagedServers: () => ipcRenderer.invoke("omnigent:get-managed-servers"),
+  /** Wizard capabilities, e.g. `{v2Forced}` — v2Forced disables "Switch to
+   *  legacy" because the env var pins the selector on. */
+  getSetupCapabilities: () => ipcRenderer.invoke("omnigent:get-setup-capabilities"),
+  /** Live color-scheme override for the wizard (System/Light/Dark). Not
+   *  persisted — resets to the OS default on relaunch.
+   *  @param {"light"|"dark"|"system"} scheme */
+  setColorScheme: (scheme) => ipcRenderer.send("omnigent:setup-set-color-scheme", scheme),
+  /** Current color scheme: `{source, effective}` — the persisted-for-the-session
+   *  source (system/light/dark) and the resolved appearance. Seeds the wizard's
+   *  radio + `.dark` class on load (themeSource may hold a value set earlier). */
+  getColorScheme: () => ipcRenderer.invoke("omnigent:setup-get-color-scheme"),
+  /** Subscribe to the wizard's effective theme ("dark"/"light") so the renderer
+   *  can sync its `.dark` class; fires on set and on OS changes. */
+  onColorScheme: (callback) => {
+    const listener = (_event, theme) => callback(theme);
+    ipcRenderer.on("omnigent:setup-theme", listener);
+    return () => ipcRenderer.removeListener("omnigent:setup-theme", listener);
+  },
   /** Recently-connected server URLs, most recent first. */
   getRecentServers: () => ipcRenderer.invoke("omnigent:get-recent-servers"),
   /** Drop one recent server from the saved list; resolves the remaining ones. */
@@ -487,5 +514,19 @@ contextBridge.exposeInMainWorld("omnigentSetup", {
     const listener = (_event, payload) => callback(payload?.line ?? "");
     ipcRenderer.on("omnigent:local-server-setup-log", listener);
     return () => ipcRenderer.removeListener("omnigent:local-server-setup-log", listener);
+  },
+  /**
+   * Install the omnigent CLI (macOS). Resolves `{ok, error?, installed}` once
+   * the installer finishes; output streams via onCliInstallLog.
+   */
+  installCli: () => ipcRenderer.invoke("omnigent:cli-install"),
+  /**
+   * Subscribe to the CLI installer's output lines. Returns an unsubscribe fn.
+   * @param {(line: string) => void} callback
+   */
+  onCliInstallLog: (callback) => {
+    const listener = (_event, payload) => callback(payload?.line ?? "");
+    ipcRenderer.on("omnigent:cli-install-log", listener);
+    return () => ipcRenderer.removeListener("omnigent:cli-install-log", listener);
   },
 });

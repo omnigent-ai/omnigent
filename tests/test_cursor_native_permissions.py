@@ -33,9 +33,9 @@ from pathlib import Path
 import httpx
 import pytest
 
-from omnigent import cursor_native_bridge as cnb
-from omnigent import cursor_native_permissions as cnp
-from omnigent.cursor_native_permissions import (
+from omnigent.harnesses.cursor_native import bridge as cnb
+from omnigent.harnesses.cursor_native import permissions as cnp
+from omnigent.harnesses.cursor_native.permissions import (
     CursorApprovalPrompt,
     CursorPendingToolCall,
     cursor_tool_call_elicitation_id,

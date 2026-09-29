@@ -2,14 +2,19 @@ from pathlib import Path
 from typing import Any
 
 import httpx
+import pytest
 import respx
 from omnigent_slack.models import ThreadKey, UserConfig
 from omnigent_slack.omnigent import OmnigentClientPool
 from omnigent_slack.setup import (
     ACTION_SETUP_START,
+    AGENT_ACTION,
     AGENT_BLOCK,
     CALLBACK_SETUP_INFO,
+    HOST_ACTION,
     HOST_BLOCK,
+    MANAGED_HOST_VALUE,
+    WORKSPACE_ACTION,
     WORKSPACE_BLOCK,
     SetupFlow,
     connecting_modal,
@@ -17,6 +22,7 @@ from omnigent_slack.setup import (
     no_agents_modal,
     no_host_modal,
     select_modal,
+    setup_failed_modal,
 )
 from omnigent_slack.store import SQLiteStore
 
@@ -88,14 +94,46 @@ class SlackResponseSetupClient(FakeSetupClient):
         return SlackResponseLike({"channel": SlackResponseLike({"id": "D123"})})
 
 
+def _mock_info(*, managed: bool = False, provider: str | None = None) -> None:
+    """Mock ``GET /v1/info``, the managed-sandbox capability probe ``validate`` reads.
+
+    Every setup path that validates the server hits this, so each respx test that
+    drives ``_begin_setup`` past ``/health`` declares it. Defaults to a server
+    with no managed sandboxes — the pre-existing behavior.
+    """
+    respx.get(_SERVER + "/v1/info").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "managed_sandboxes_enabled": managed,
+                "sandbox_provider": provider,
+            },
+        )
+    )
+
+
 async def _store(tmp_path: Path) -> SQLiteStore:
     store = SQLiteStore(tmp_path / "store.sqlite3")
     await store.initialize()
     return store
 
 
-def _flow(store: SQLiteStore, pool: OmnigentClientPool, auth: Any = None) -> SetupFlow:
-    return SetupFlow(store=store, pool=pool, server_url=_SERVER, auth_manager=auth)
+def _flow(
+    store: SQLiteStore,
+    pool: OmnigentClientPool,
+    auth: Any = None,
+    *,
+    default_agent_id: str | None = None,
+    default_host_type: str | None = None,
+) -> SetupFlow:
+    return SetupFlow(
+        store=store,
+        pool=pool,
+        server_url=_SERVER,
+        auth_manager=auth,
+        default_agent_id=default_agent_id,
+        default_host_type=default_host_type,
+    )
 
 
 def test_select_modal_lists_agents_and_hosts() -> None:
@@ -123,6 +161,55 @@ def test_select_modal_lists_agents_and_hosts() -> None:
     assert workspace_el["initial_value"]
 
 
+def test_select_modal_offers_the_managed_sandbox_alongside_real_hosts() -> None:
+    from omnigent_slack.omnigent import ValidatedServer
+
+    view = select_modal(
+        _SERVER,
+        ValidatedServer(
+            agents=[{"id": "ag_1", "name": "Helper"}],
+            online_hosts=[{"host_id": "h1", "name": "Host One"}],
+            managed_hosts=True,
+            managed_host_provider="modal",
+        ),
+    )
+    blocks = {b["block_id"]: b for b in view["blocks"] if "block_id" in b}
+    host_opts = blocks[HOST_BLOCK]["element"]["options"]
+    # The managed sandbox leads the menu, so a user with nothing online sees a
+    # usable choice first; their own hosts follow.
+    assert [o["value"] for o in host_opts] == [MANAGED_HOST_VALUE, "h1"]
+    assert "modal" in host_opts[0]["text"]["text"]
+    # The workspace field stops being required — a managed sandbox has no path.
+    assert blocks[WORKSPACE_BLOCK]["optional"] is True
+
+
+def test_select_modal_omits_managed_option_when_server_provisions_none() -> None:
+    from omnigent_slack.omnigent import ValidatedServer
+
+    view = select_modal(
+        _SERVER,
+        ValidatedServer(
+            agents=[{"id": "ag_1", "name": "Helper"}],
+            online_hosts=[{"host_id": "h1", "name": "Host One"}],
+        ),
+    )
+    blocks = {b["block_id"]: b for b in view["blocks"] if "block_id" in b}
+    assert [o["value"] for o in blocks[HOST_BLOCK]["element"]["options"]] == ["h1"]
+
+
+def test_select_modal_leaves_workspace_blank_with_no_host_to_seed_it_from() -> None:
+    # With only a managed sandbox on offer there is no host home to probe, and
+    # the bot's own cwd names nothing the session can reach — so no default.
+    from omnigent_slack.omnigent import ValidatedServer
+
+    view = select_modal(
+        _SERVER,
+        ValidatedServer(agents=[{"id": "ag_1"}], online_hosts=[], managed_hosts=True),
+    )
+    blocks = {b["block_id"]: b for b in view["blocks"] if "block_id" in b}
+    assert "initial_value" not in blocks[WORKSPACE_BLOCK]["element"]
+
+
 def _last_update(client: FakeSetupClient) -> dict[str, Any]:
     assert client.updated_views, "expected a views_update"
     return client.updated_views[-1]["view"]
@@ -147,6 +234,7 @@ async def test_setup_advances_to_select_modal_with_host_home_workspace(
             json={"data": [{"name": ".bashrc", "path": "/home/bob/.bashrc", "type": "file"}]},
         )
     )
+    _mock_info()
     pool = OmnigentClientPool()
     flow = _flow(await _store(tmp_path), pool)
     client = FakeSetupClient()
@@ -165,6 +253,8 @@ async def test_setup_advances_to_select_modal_with_host_home_workspace(
 
 @respx.mock
 async def test_setup_shows_no_host_guidance_when_no_online_host(tmp_path: Path) -> None:
+    # No online host of the user's own AND no managed sandboxes on the server:
+    # nothing can run a session, so the guidance screen is still the right end.
     respx.get(_SERVER + "/health").mock(return_value=httpx.Response(200, json={"status": "ok"}))
     respx.get(_SERVER + "/v1/agents").mock(
         return_value=httpx.Response(200, json={"data": [{"id": "ag_1", "name": "Helper"}]})
@@ -172,6 +262,7 @@ async def test_setup_shows_no_host_guidance_when_no_online_host(tmp_path: Path) 
     respx.get(_SERVER + "/v1/hosts").mock(
         return_value=httpx.Response(200, json={"hosts": [{"host_id": "h", "status": "offline"}]})
     )
+    _mock_info(managed=False)
     pool = OmnigentClientPool()
     flow = _flow(await _store(tmp_path), pool)
     client = FakeSetupClient()
@@ -190,6 +281,37 @@ async def test_setup_shows_no_host_guidance_when_no_online_host(tmp_path: Path) 
 
 
 @respx.mock
+async def test_setup_offers_managed_sandbox_instead_of_dead_end(tmp_path: Path) -> None:
+    # The reported failure: a user with no host of their own was hard-stopped and
+    # told to run `omni host` on their own machine. With managed sandboxes on the
+    # server, setup must reach the picker instead, offering the sandbox.
+    respx.get(_SERVER + "/health").mock(return_value=httpx.Response(200, json={"status": "ok"}))
+    respx.get(_SERVER + "/v1/agents").mock(
+        return_value=httpx.Response(200, json={"data": [{"id": "ag_1", "name": "Helper"}]})
+    )
+    respx.get(_SERVER + "/v1/hosts").mock(
+        return_value=httpx.Response(200, json={"hosts": [{"host_id": "h", "status": "offline"}]})
+    )
+    _mock_info(managed=True, provider="modal")
+    pool = OmnigentClientPool()
+    flow = _flow(await _store(tmp_path), pool)
+    client = FakeSetupClient()
+
+    try:
+        await flow._begin_setup(client, team_id="T1", user_id="U1", view_id="V1")
+    finally:
+        await pool.aclose_all()
+
+    view = _last_update(client)
+    assert view["callback_id"] == "omnigent_setup_select"
+    blocks = {b["block_id"]: b for b in view["blocks"] if "block_id" in b}
+    # The sandbox is the only host on offer, and no `omni host` guidance is shown.
+    host_opts = blocks[HOST_BLOCK]["element"]["options"]
+    assert [o["value"] for o in host_opts] == [MANAGED_HOST_VALUE]
+    assert "omni host --server" not in str(view)
+
+
+@respx.mock
 async def test_setup_shows_no_agents_guidance_when_server_has_no_agents(tmp_path: Path) -> None:
     respx.get(_SERVER + "/health").mock(return_value=httpx.Response(200, json={"status": "ok"}))
     respx.get(_SERVER + "/v1/agents").mock(return_value=httpx.Response(200, json={"data": []}))
@@ -198,6 +320,7 @@ async def test_setup_shows_no_agents_guidance_when_server_has_no_agents(tmp_path
             200, json={"hosts": [{"host_id": "h1", "name": "H", "status": "online"}]}
         )
     )
+    _mock_info()
     pool = OmnigentClientPool()
     flow = _flow(await _store(tmp_path), pool)
     client = FakeSetupClient()
@@ -250,6 +373,7 @@ async def test_setup_shows_login_in_modal_and_advances_on_approval(tmp_path: Pat
             200, json={"data": [{"name": ".x", "path": "/home/bob/.x", "type": "file"}]}
         )
     )
+    _mock_info()
     authorize_route = respx.post(_SERVER + "/oauth/device/authorize").mock(
         return_value=httpx.Response(
             200,
@@ -517,6 +641,7 @@ async def test_post_enrollment_advance_uses_freshly_stored_token(tmp_path: Path)
             json={"data": [{"name": ".bashrc", "path": "/home/bob/.bashrc", "type": "file"}]},
         )
     )
+    _mock_info()
 
     def _url(team_id: str, user_id: str, email: str, team_name: str = "") -> str:
         return "https://bot/callback"
@@ -674,6 +799,99 @@ async def test_select_submit_persists_config(tmp_path: Path) -> None:
     assert client.posts and "set up" in client.posts[0]["text"].lower()
 
 
+async def test_select_submit_persists_managed_choice_without_a_workspace(tmp_path: Path) -> None:
+    # Picking the managed sandbox stores host_type="managed" with no host id and
+    # no workspace — the server chooses both. The stale path left in the (now
+    # optional) workspace box must not be persisted or block the submit.
+    store = await _store(tmp_path)
+    pool = OmnigentClientPool()
+    flow = _flow(store, pool)
+    ack = FakeAck()
+    client = FakeSetupClient()
+
+    view = {
+        "state": {
+            "values": {
+                AGENT_BLOCK: {
+                    "agent_select": {
+                        "selected_option": {
+                            "text": {"type": "plain_text", "text": "Helper"},
+                            "value": "ag_1",
+                        }
+                    }
+                },
+                HOST_BLOCK: {
+                    "host_select": {
+                        "selected_option": {
+                            "text": {"type": "plain_text", "text": "Managed sandbox (modal)"},
+                            "value": MANAGED_HOST_VALUE,
+                        }
+                    }
+                },
+                WORKSPACE_BLOCK: {"workspace_input": {"value": "/left/over/path"}},
+            }
+        },
+    }
+    body = {"team": {"id": "T1"}, "user": {"id": "U1"}}
+
+    try:
+        await flow._handle_select_submit(ack, body, view, client)
+    finally:
+        await pool.aclose_all()
+
+    assert ack.calls == [{}]  # saved, not an inline error
+    config = await store.get_user_config("T1", "U1")
+    assert config is not None
+    assert config.host_type == "managed"
+    assert config.host_id is None
+    assert config.workspace == ""
+    assert client.posts and "sandbox" in client.posts[0]["text"].lower()
+
+
+async def test_select_submit_still_requires_a_path_for_a_real_host(tmp_path: Path) -> None:
+    # Making the workspace input optional is for the managed sandbox only — an
+    # external host still can't start a runner without an absolute path.
+    store = await _store(tmp_path)
+    pool = OmnigentClientPool()
+    flow = _flow(store, pool)
+    ack = FakeAck()
+    client = FakeSetupClient()
+
+    view = {
+        "state": {
+            "values": {
+                AGENT_BLOCK: {
+                    "agent_select": {
+                        "selected_option": {
+                            "text": {"type": "plain_text", "text": "Helper"},
+                            "value": "ag_1",
+                        }
+                    }
+                },
+                HOST_BLOCK: {
+                    "host_select": {
+                        "selected_option": {
+                            "text": {"type": "plain_text", "text": "Host One"},
+                            "value": "h1",
+                        }
+                    }
+                },
+                WORKSPACE_BLOCK: {"workspace_input": {"value": ""}},
+            }
+        },
+    }
+    body = {"team": {"id": "T1"}, "user": {"id": "U1"}}
+
+    try:
+        await flow._handle_select_submit(ack, body, view, client)
+    finally:
+        await pool.aclose_all()
+
+    assert ack.calls[0]["response_action"] == "errors"
+    assert WORKSPACE_BLOCK in ack.calls[0]["errors"]
+    assert await store.get_user_config("T1", "U1") is None
+
+
 async def test_select_submit_requires_a_host(tmp_path: Path) -> None:
     store = await _store(tmp_path)
     pool = OmnigentClientPool()
@@ -707,6 +925,78 @@ async def test_select_submit_requires_a_host(tmp_path: Path) -> None:
     assert ack.calls[0]["response_action"] == "errors"
     assert HOST_BLOCK in ack.calls[0]["errors"]
     assert await store.get_user_config("T1", "U1") is None
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"user": {"id": "U1"}},
+        {"team": {"id": "T1"}, "user": {}},
+    ],
+    ids=["missing-team", "missing-user"],
+)
+async def test_select_submit_fails_closed_on_missing_team_or_user(
+    tmp_path: Path, body: dict[str, Any]
+) -> None:
+    # A submission Slack can't attribute to a (team, user) can't be stored, so
+    # the modal must say so instead of closing like a save. Every field below
+    # is valid: the identity, not the form, is what fails.
+    store = await _store(tmp_path)
+    pool = OmnigentClientPool()
+    flow = _flow(store, pool)
+    ack = FakeAck()
+    client = FakeSetupClient()
+
+    view = {
+        "state": {
+            "values": {
+                AGENT_BLOCK: {
+                    "agent_select": {
+                        "selected_option": {
+                            "text": {"type": "plain_text", "text": "Helper"},
+                            "value": "ag_1",
+                        }
+                    }
+                },
+                HOST_BLOCK: {
+                    "host_select": {
+                        "selected_option": {
+                            "text": {"type": "plain_text", "text": "Host One"},
+                            "value": "h1",
+                        }
+                    }
+                },
+                WORKSPACE_BLOCK: {"workspace_input": {"value": "/home/me/project"}},
+            }
+        },
+    }
+
+    try:
+        await flow._handle_select_submit(ack, body, view, client)
+    finally:
+        await pool.aclose_all()
+
+    # The modal names the failure instead of closing like a save.
+    assert len(ack.calls) == 1
+    assert ack.calls[0]["response_action"] == "update"
+    failed = ack.calls[0]["view"]["blocks"][0]["text"]["text"]
+    assert "wasn't saved" in failed
+    assert "/omnigent" in failed
+    # Nothing stored under either key a blank half would collapse to.
+    assert await store.get_user_config("", "U1") is None
+    assert await store.get_user_config("T1", "") is None
+    # And no "You're set up!" DM claiming otherwise.
+    assert client.posts == []
+
+
+def test_setup_failed_modal_shows_guidance() -> None:
+    view = setup_failed_modal("Slack didn't say who you are.")
+    assert view["callback_id"] == CALLBACK_SETUP_INFO
+    # No submit — the picker is gone, so there is nothing left to resubmit.
+    assert "submit" not in view
+    body = view["blocks"][0]["text"]["text"]
+    assert "Slack didn't say who you are." in body
+    assert "/omnigent" in body
 
 
 def test_no_host_modal_shows_guidance() -> None:
@@ -804,6 +1094,7 @@ async def test_setup_settles_modal_before_first_update(tmp_path: Path, monkeypat
     respx.get(_SERVER + "/v1/hosts/h1/filesystem").mock(
         return_value=httpx.Response(200, json={"data": []})
     )
+    _mock_info()
 
     events: list[str] = []
 
@@ -932,3 +1223,577 @@ async def test_prompt_relogin_reports_when_dm_cannot_open(tmp_path: Path) -> Non
 
     assert delivered is False
     assert client.posts == []
+
+
+# ── Operator-set setup defaults ──────────────────────────────────────
+
+
+def _validated(
+    *,
+    agents: list[dict[str, Any]] | None = None,
+    managed: bool = False,
+    managed_support_known: bool = True,
+) -> Any:
+    from omnigent_slack.omnigent import ValidatedServer
+
+    return ValidatedServer(
+        agents=agents if agents is not None else [{"id": "ag_1", "name": "Helper"}],
+        online_hosts=[{"host_id": "h1", "name": "Host One"}],
+        managed_hosts=managed,
+        managed_host_provider="modal" if managed else None,
+        managed_support_known=managed_support_known,
+    )
+
+
+def _element(view: dict[str, Any], block_id: str) -> dict[str, Any]:
+    blocks = {b["block_id"]: b for b in view["blocks"] if "block_id" in b}
+    element: dict[str, Any] = blocks[block_id]["element"]
+    return element
+
+
+def _notes(view: dict[str, Any]) -> list[str]:
+    """Text of every context note the modal carries (the unavailable-default ones)."""
+    return [
+        str(element.get("text", ""))
+        for block in view["blocks"]
+        if block.get("type") == "context"
+        for element in block.get("elements", [])
+    ]
+
+
+# The token the setup tests authenticate with. Against a fake that ignores
+# credentials an unauthenticated client (the pool's ``auth=None`` path) is
+# indistinguishable from a real one, so auth-gated listings are gated here too.
+_BEARER = "at"
+
+
+def _bearer_gated(payload: dict[str, Any]) -> Any:
+    """respx side_effect serving ``payload`` only to a request carrying ``_BEARER``."""
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        if request.headers.get("authorization") != f"Bearer {_BEARER}":
+            return httpx.Response(401)
+        return httpx.Response(200, json=payload)
+
+    return _handler
+
+
+async def _authenticated_pool(tmp_path: Path, *, token: str | None = _BEARER) -> Any:
+    """A pool whose resolver hands out ``token`` for (T1, U1) on ``_SERVER``."""
+    from cryptography.fernet import Fernet
+    from omnigent_slack.auth_manager import AuthManager
+    from omnigent_slack.tokens import EncryptedTokenStore
+
+    token_store = EncryptedTokenStore(tmp_path / "tok.sqlite3", Fernet.generate_key().decode())
+    await token_store.initialize()
+    if token is not None:
+        await token_store.put("T1", "U1", _SERVER, access_token=token, refresh_token="rt")
+    pool = OmnigentClientPool()
+    auth = AuthManager(token_store)
+    pool.set_auth_resolver(auth.resolve_auth)
+    return pool, auth
+
+
+def _state_as_submitted(
+    view: dict[str, Any],
+    *,
+    agent: dict[str, Any] | None = None,
+    host: dict[str, Any] | None = None,
+    workspace: str | None = None,
+) -> dict[str, Any]:
+    """The ``view.state`` Slack posts back for ``view``, honoring its pre-selections.
+
+    An untouched ``static_select`` submits its ``initial_option``; ``agent`` /
+    ``host`` stand in for the user picking something else instead. Derived from
+    the rendered view rather than hand-written, so a lost pre-selection shows up
+    here as an empty submission instead of passing anyway.
+    """
+    values: dict[str, Any] = {}
+    for block_id, action_id, override in (
+        (AGENT_BLOCK, AGENT_ACTION, agent),
+        (HOST_BLOCK, HOST_ACTION, host),
+    ):
+        values[block_id] = {
+            action_id: {
+                "selected_option": override or _element(view, block_id).get("initial_option")
+            }
+        }
+    typed = (
+        workspace
+        if workspace is not None
+        else _element(view, WORKSPACE_BLOCK).get("initial_value", "")
+    )
+    values[WORKSPACE_BLOCK] = {WORKSPACE_ACTION: {"value": typed}}
+    return {"state": {"values": values}}
+
+
+def test_select_modal_renders_the_unchanged_payload_when_no_defaults_are_set() -> None:
+    """The guard that matters most: configuring nothing changes nothing.
+
+    Checked as payload equivalence, not just "no initial_option" — the block
+    sequence, the modal's own keys, and the absence of the string anywhere in
+    the serialized view, so any block this feature might add shows up here.
+    """
+    import json
+
+    view = select_modal(_SERVER, _validated(managed=True))
+    assert [b["type"] for b in view["blocks"]] == ["section", "input", "input", "input"]
+    assert [b.get("block_id") for b in view["blocks"]] == [
+        None,
+        AGENT_BLOCK,
+        HOST_BLOCK,
+        WORKSPACE_BLOCK,
+    ]
+    assert set(view) == {"type", "callback_id", "title", "submit", "close", "blocks"}
+    assert "initial_option" not in json.dumps(view)
+    assert _notes(view) == []
+
+
+def test_select_modal_preselects_the_configured_default_agent() -> None:
+    view = select_modal(
+        _SERVER,
+        _validated(agents=[{"id": "ag_1", "name": "Helper"}, {"id": "ag_2", "name": "Other"}]),
+        default_agent_id="ag_2",
+    )
+    element = _element(view, AGENT_BLOCK)
+    assert element["initial_option"]["value"] == "ag_2"
+    # Slack only accepts an initial_option that is one of the menu's options.
+    assert element["initial_option"] in element["options"]
+    # Nothing is skipped or removed — the user can still pick the other agent.
+    assert [o["value"] for o in element["options"]] == ["ag_1", "ag_2"]
+    assert view["submit"]["text"] == "Save"
+    assert _notes(view) == []
+
+
+def test_select_modal_preselects_the_managed_sandbox_when_configured() -> None:
+    view = select_modal(_SERVER, _validated(managed=True), default_host_type="managed")
+    element = _element(view, HOST_BLOCK)
+    assert element["initial_option"]["value"] == MANAGED_HOST_VALUE
+    assert element["initial_option"] in element["options"]
+    # The user's own host is still on offer.
+    assert [o["value"] for o in element["options"]] == [MANAGED_HOST_VALUE, "h1"]
+    assert _notes(view) == []
+
+
+def test_select_modal_leaves_agent_blank_when_the_default_is_not_offered() -> None:
+    # The configured agent isn't among the ones this user is offered: say so and
+    # leave the menu blank. Substituting a different agent would silently put
+    # someone on the wrong one.
+    view = select_modal(_SERVER, _validated(), default_agent_id="ag_missing")
+    element = _element(view, AGENT_BLOCK)
+    assert "initial_option" not in element
+    assert [o["value"] for o in element["options"]] == ["ag_1"]
+    assert any("ag_missing" in note for note in _notes(view))
+
+
+def test_select_modal_leaves_host_blank_when_the_server_provisions_no_sandbox() -> None:
+    # Managed capability gates the pre-selection: a server with no managed
+    # sandboxes offers no such option, so there is nothing to pre-select.
+    view = select_modal(_SERVER, _validated(managed=False), default_host_type="managed")
+    element = _element(view, HOST_BLOCK)
+    assert "initial_option" not in element
+    assert MANAGED_HOST_VALUE not in [o["value"] for o in element["options"]]
+    # The server answered "no", so saying so is a fact we established.
+    assert any("doesn't provision one" in note for note in _notes(view))
+
+
+def test_select_modal_keeps_the_usable_default_when_the_other_is_unavailable() -> None:
+    # A partly-honorable config still honors the part it can.
+    view = select_modal(
+        _SERVER,
+        _validated(managed=False),
+        default_agent_id="ag_1",
+        default_host_type="managed",
+    )
+    assert _element(view, AGENT_BLOCK)["initial_option"]["value"] == "ag_1"
+    assert "initial_option" not in _element(view, HOST_BLOCK)
+    assert len(_notes(view)) == 1
+
+
+def test_select_modal_does_not_preselect_an_agent_beyond_the_option_cap() -> None:
+    # Slack caps a static_select at 100 options, so agent 101 is not in the menu
+    # and cannot be pre-selected. That is the unavailable case (blank + a note),
+    # not a silent no-op the operator has no way to notice.
+    agents = [{"id": f"ag_{n}", "name": f"Agent {n}"} for n in range(101)]
+    view = select_modal(_SERVER, _validated(agents=agents), default_agent_id="ag_100")
+    element = _element(view, AGENT_BLOCK)
+    assert len(element["options"]) == 100
+    assert "initial_option" not in element
+    assert any("ag_100" in note for note in _notes(view))
+
+
+@respx.mock
+async def test_setup_preselects_defaults_resolved_as_the_authenticated_user(
+    tmp_path: Path,
+) -> None:
+    respx.get(_SERVER + "/health").mock(return_value=httpx.Response(200, json={"status": "ok"}))
+    # Auth-gated exactly as the real listing endpoints are: an unauthenticated
+    # client sees a 401, so reaching the picker at all proves the user's own
+    # token resolved before the defaults were matched against anything.
+    respx.get(_SERVER + "/v1/agents").mock(
+        side_effect=_bearer_gated(
+            {"data": [{"id": "ag_1", "name": "Helper"}, {"id": "ag_2", "name": "Other"}]}
+        )
+    )
+    respx.get(_SERVER + "/v1/hosts").mock(
+        side_effect=_bearer_gated({"hosts": [{"host_id": "h1", "name": "H", "status": "online"}]})
+    )
+    respx.get(_SERVER + "/v1/hosts/h1/filesystem").mock(
+        side_effect=_bearer_gated(
+            {"data": [{"name": ".x", "path": "/home/bob/.x", "type": "file"}]}
+        )
+    )
+    _mock_info(managed=True, provider="modal")
+    pool, auth = await _authenticated_pool(tmp_path)
+    flow = _flow(
+        await _store(tmp_path), pool, auth, default_agent_id="ag_2", default_host_type="managed"
+    )
+    client = FakeSetupClient()
+
+    try:
+        await flow._begin_setup(client, team_id="T1", user_id="U1", view_id="V1")
+    finally:
+        await pool.aclose_all()
+
+    view = _last_update(client)
+    assert view["callback_id"] == "omnigent_setup_select"
+    assert _element(view, AGENT_BLOCK)["initial_option"]["value"] == "ag_2"
+    assert _element(view, HOST_BLOCK)["initial_option"]["value"] == MANAGED_HOST_VALUE
+
+
+@respx.mock
+async def test_setup_defaults_are_resolved_after_the_user_logs_in(tmp_path: Path) -> None:
+    """The default is matched against the listing fetched as the logged-in user.
+
+    The pre-login probe 401s and lists nothing, so a default resolved before
+    auth could only ever come back "unavailable". Pre-selection appearing after
+    approval is what proves it is resolved on the post-login listing.
+    """
+    import asyncio
+
+    respx.get(_SERVER + "/health").mock(return_value=httpx.Response(200, json={"status": "ok"}))
+    respx.get(_SERVER + "/v1/me").mock(
+        return_value=httpx.Response(401, json={"login_url": "/login"})
+    )
+    # Gated on the bearer rather than on call ordering: the pre-login probe 401s
+    # because it carries no token, and the post-login listing succeeds because
+    # the device grant stored one. A fake that ignored credentials would pass
+    # even if the pooled client were never given the user's auth at all.
+    respx.get(_SERVER + "/v1/agents").mock(
+        side_effect=_bearer_gated({"data": [{"id": "ag_1", "name": "Helper"}]})
+    )
+    respx.get(_SERVER + "/v1/hosts").mock(
+        side_effect=_bearer_gated({"hosts": [{"host_id": "h1", "name": "H", "status": "online"}]})
+    )
+    respx.get(_SERVER + "/v1/hosts/h1/filesystem").mock(
+        side_effect=_bearer_gated(
+            {"data": [{"name": ".x", "path": "/home/bob/.x", "type": "file"}]}
+        )
+    )
+    _mock_info()
+    respx.post(_SERVER + "/oauth/device/authorize").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "device_code": "dc",
+                "user_code": "ABCD-2345",
+                "verification_uri": _SERVER + "/oauth/device",
+                "verification_uri_complete": (_SERVER + "/oauth/device?user_code=ABCD-2345"),
+                "expires_in": 600,
+                "interval": 0,
+            },
+        )
+    )
+    respx.post(_SERVER + "/oauth/token").mock(
+        return_value=httpx.Response(
+            200, json={"access_token": _BEARER, "refresh_token": "rt", "expires_in": 3600}
+        )
+    )
+    # No token stored up front — the device grant above is what puts one there.
+    pool, auth = await _authenticated_pool(tmp_path, token=None)
+    flow = _flow(await _store(tmp_path), pool, auth, default_agent_id="ag_1")
+    client = FakeSetupClient()
+
+    try:
+        await flow._begin_setup(client, team_id="T1", user_id="U1", view_id="V1")
+        for _ in range(50):
+            if len(client.updated_views) >= 2:
+                break
+            await asyncio.sleep(0.05)
+    finally:
+        await pool.aclose_all()
+
+    view = _last_update(client)
+    assert view["callback_id"] == "omnigent_setup_select"
+    assert _element(view, AGENT_BLOCK)["initial_option"]["value"] == "ag_1"
+    assert _notes(view) == []
+
+
+@respx.mock
+async def test_unreachable_server_is_not_reported_as_an_unavailable_default(
+    tmp_path: Path,
+) -> None:
+    # A network failure says nothing about whether the configured agent exists,
+    # so it must still be the try-again screen — never "your default is gone".
+    respx.get(_SERVER + "/health").mock(return_value=httpx.Response(500))
+    pool = OmnigentClientPool()
+    flow = _flow(
+        await _store(tmp_path), pool, default_agent_id="ag_1", default_host_type="managed"
+    )
+    client = FakeSetupClient()
+
+    try:
+        await flow._begin_setup(client, team_id="T1", user_id="U1", view_id="V1")
+    finally:
+        await pool.aclose_all()
+
+    view = _last_update(client)
+    assert view["callback_id"] == CALLBACK_SETUP_INFO
+    body = view["blocks"][0]["text"]["text"]
+    assert "reach" in body.lower()
+    assert "ag_1" not in str(view)
+
+
+@respx.mock
+async def test_a_server_with_no_agents_still_shows_the_no_agents_screen(tmp_path: Path) -> None:
+    # Nothing to pick means nothing to default to: keep the existing guidance
+    # screen rather than a picker whose only content is a warning.
+    respx.get(_SERVER + "/health").mock(return_value=httpx.Response(200, json={"status": "ok"}))
+    respx.get(_SERVER + "/v1/agents").mock(return_value=httpx.Response(200, json={"data": []}))
+    respx.get(_SERVER + "/v1/hosts").mock(
+        return_value=httpx.Response(
+            200, json={"hosts": [{"host_id": "h1", "name": "H", "status": "online"}]}
+        )
+    )
+    _mock_info()
+    pool = OmnigentClientPool()
+    flow = _flow(await _store(tmp_path), pool, default_agent_id="ag_1")
+    client = FakeSetupClient()
+
+    try:
+        await flow._begin_setup(client, team_id="T1", user_id="U1", view_id="V1")
+    finally:
+        await pool.aclose_all()
+
+    view = _last_update(client)
+    assert view["callback_id"] == CALLBACK_SETUP_INFO
+    assert "no agents available" in view["blocks"][0]["text"]["text"]
+
+
+async def test_submitting_the_preselected_managed_default_stores_no_host_or_workspace(
+    tmp_path: Path,
+) -> None:
+    # Accepting both defaults untouched must persist exactly what a hand-picked
+    # managed sandbox does: no host id, no workspace (the server owns both).
+    store = await _store(tmp_path)
+    pool = OmnigentClientPool()
+    flow = _flow(store, pool, default_agent_id="ag_1", default_host_type="managed")
+    view = select_modal(
+        _SERVER,
+        _validated(managed=True),
+        workspace_default="/home/bob",
+        default_agent_id=flow._default_agent_id,
+        default_host_type=flow._default_host_type,
+    )
+    ack = FakeAck()
+    client = FakeSetupClient()
+
+    try:
+        await flow._handle_select_submit(
+            ack, {"team": {"id": "T1"}, "user": {"id": "U1"}}, _state_as_submitted(view), client
+        )
+    finally:
+        await pool.aclose_all()
+
+    config = await store.get_user_config("T1", "U1")
+    assert config is not None
+    assert config.agent_id == "ag_1"
+    assert config.host_type == "managed"
+    assert config.host_id is None
+    assert config.workspace == ""
+
+
+async def test_an_explicit_user_choice_wins_over_the_preselected_defaults(
+    tmp_path: Path,
+) -> None:
+    """A submitted choice beats the operator's default — on a flow that HAS one.
+
+    The flow itself is configured with both defaults, so a submit handler that
+    preferred ``self._default_agent_id`` over the submitted option would have
+    something to prefer, and this test would catch it. Built without them, it
+    could not.
+    """
+    store = await _store(tmp_path)
+    pool = OmnigentClientPool()
+    flow = _flow(store, pool, default_agent_id="ag_1", default_host_type="managed")
+    view = select_modal(
+        _SERVER,
+        _validated(
+            agents=[{"id": "ag_1", "name": "Helper"}, {"id": "ag_2", "name": "Other"}],
+            managed=True,
+        ),
+        default_agent_id=flow._default_agent_id,
+        default_host_type=flow._default_host_type,
+    )
+    # The defaults really are pre-selected — otherwise "the user overrode them"
+    # would be a claim about a modal that never offered them.
+    assert _element(view, AGENT_BLOCK)["initial_option"]["value"] == "ag_1"
+    assert _element(view, HOST_BLOCK)["initial_option"]["value"] == MANAGED_HOST_VALUE
+
+    agent_options = _element(view, AGENT_BLOCK)["options"]
+    host_options = _element(view, HOST_BLOCK)["options"]
+    state = _state_as_submitted(
+        view,
+        agent=next(o for o in agent_options if o["value"] == "ag_2"),
+        host=next(o for o in host_options if o["value"] == "h1"),
+        workspace="/home/me/project",
+    )
+    ack = FakeAck()
+    client = FakeSetupClient()
+
+    try:
+        await flow._handle_select_submit(
+            ack, {"team": {"id": "T1"}, "user": {"id": "U1"}}, state, client
+        )
+    finally:
+        await pool.aclose_all()
+
+    config = await store.get_user_config("T1", "U1")
+    assert config is not None
+    assert config.agent_id == "ag_2"
+    assert config.host_id == "h1"
+    assert config.host_type == "external"
+    assert config.workspace == "/home/me/project"
+
+
+async def test_switching_off_the_managed_default_still_requires_a_workspace_path(
+    tmp_path: Path,
+) -> None:
+    # Moving off the pre-selected sandbox to a real host re-imposes the absolute
+    # path requirement; the defaults path must not loosen it.
+    store = await _store(tmp_path)
+    pool = OmnigentClientPool()
+    flow = _flow(store, pool, default_agent_id="ag_1", default_host_type="managed")
+    view = select_modal(
+        _SERVER,
+        _validated(managed=True),
+        default_agent_id=flow._default_agent_id,
+        default_host_type=flow._default_host_type,
+    )
+    host_options = _element(view, HOST_BLOCK)["options"]
+    state = _state_as_submitted(
+        view, host=next(o for o in host_options if o["value"] == "h1"), workspace="relative/path"
+    )
+    ack = FakeAck()
+    client = FakeSetupClient()
+
+    try:
+        await flow._handle_select_submit(
+            ack, {"team": {"id": "T1"}, "user": {"id": "U1"}}, state, client
+        )
+    finally:
+        await pool.aclose_all()
+
+    assert ack.calls[-1]["response_action"] == "errors"
+    assert WORKSPACE_BLOCK in ack.calls[-1]["errors"]
+    assert await store.get_user_config("T1", "U1") is None
+
+
+def test_an_unreadable_capability_probe_is_not_reported_as_non_support() -> None:
+    # An unreadable `/v1/info` is not the server answering "no". The option is
+    # still withheld (offering one the server would 422 is worse), but the modal
+    # must not report the failure to ask as a finding about the server.
+    view = select_modal(
+        _SERVER,
+        _validated(managed=False, managed_support_known=False),
+        default_host_type="managed",
+    )
+    element = _element(view, HOST_BLOCK)
+    assert "initial_option" not in element
+    assert MANAGED_HOST_VALUE not in [o["value"] for o in element["options"]]
+    notes = _notes(view)
+    assert any("couldn't be checked" in note for note in notes)
+    assert not any("doesn't provision one" in note for note in notes)
+
+
+def test_an_agent_past_the_option_cap_is_named_as_a_menu_limit() -> None:
+    # Agent 101 exists on the server and is perfectly usable — it just didn't fit
+    # the menu. Saying "this server doesn't offer it" would be a false diagnosis.
+    agents = [{"id": f"ag_{n}", "name": f"Agent {n}"} for n in range(101)]
+    view = select_modal(_SERVER, _validated(agents=agents), default_agent_id="ag_100")
+    note = next(n for n in _notes(view) if "ag_100" in n)
+    assert "isn't available in this menu" in note
+    assert "first 100 of 101 agents" in note
+
+
+def test_each_unavailable_default_note_follows_its_own_picker() -> None:
+    # Each note says "above", so each must sit AFTER the picker it refers to and
+    # before the next one — otherwise the wording sends the reader the wrong way.
+    view = select_modal(
+        _SERVER,
+        _validated(managed=False),
+        default_agent_id="ag_missing",
+        default_host_type="managed",
+    )
+    assert len(_notes(view)) == 2
+    assert all("above" in note and "below" not in note for note in _notes(view))
+
+    def _at(predicate: Any) -> int:
+        return next(i for i, block in enumerate(view["blocks"]) if predicate(block))
+
+    def _note_saying(text: str) -> Any:
+        return lambda b: b["type"] == "context" and text in str(b)
+
+    agent_picker = _at(lambda b: b.get("block_id") == AGENT_BLOCK)
+    host_picker = _at(lambda b: b.get("block_id") == HOST_BLOCK)
+    agent_note = _at(_note_saying("ag_missing"))
+    host_note = _at(_note_saying("managed sandbox"))
+    # Each note is below its own picker…
+    assert agent_picker < agent_note
+    assert host_picker < host_note
+    # …and the agent's note stays above the host picker, so it can't be read as
+    # belonging to the menu underneath it.
+    assert agent_note < host_picker
+
+
+@respx.mock
+async def test_an_unreachable_capability_probe_does_not_claim_non_support(
+    tmp_path: Path,
+) -> None:
+    """The reviewer's reproduction: everything works except `/v1/info`.
+
+    Health, agents and an online external host all succeed, so setup reaches the
+    picker — but the managed capability was never established. The modal must
+    not diagnose the operator's server from a probe we could not read.
+    """
+    respx.get(_SERVER + "/health").mock(return_value=httpx.Response(200, json={"status": "ok"}))
+    respx.get(_SERVER + "/v1/agents").mock(
+        return_value=httpx.Response(200, json={"data": [{"id": "ag_1", "name": "Helper"}]})
+    )
+    respx.get(_SERVER + "/v1/hosts").mock(
+        return_value=httpx.Response(
+            200, json={"hosts": [{"host_id": "h1", "name": "H", "status": "online"}]}
+        )
+    )
+    respx.get(_SERVER + "/v1/hosts/h1/filesystem").mock(
+        return_value=httpx.Response(
+            200, json={"data": [{"name": ".x", "path": "/home/bob/.x", "type": "file"}]}
+        )
+    )
+    respx.get(_SERVER + "/v1/info").mock(return_value=httpx.Response(500))
+    pool = OmnigentClientPool()
+    flow = _flow(await _store(tmp_path), pool, default_host_type="managed")
+    client = FakeSetupClient()
+
+    try:
+        await flow._begin_setup(client, team_id="T1", user_id="U1", view_id="V1")
+    finally:
+        await pool.aclose_all()
+
+    view = _last_update(client)
+    assert view["callback_id"] == "omnigent_setup_select"
+    notes = _notes(view)
+    assert any("couldn't be checked" in note for note in notes)
+    assert not any("doesn't provision one" in note for note in notes)
+    # The option is still withheld — a create against it would 422.
+    assert MANAGED_HOST_VALUE not in [o["value"] for o in _element(view, HOST_BLOCK)["options"]]

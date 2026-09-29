@@ -66,6 +66,10 @@ class ToolMetadata:
         ``pydantic.TypeAdapter``. ``None`` if the function has no
         return annotation (executor falls back to
         ``json.dumps(value, default=str)``).
+    :param uses_tool_state: Whether the function declared a
+        ``tool_state`` parameter. Recorded at decoration time so
+        the framework can gate per-conversation state-directory
+        creation without re-inspecting the function signature.
     """
 
     name: str
@@ -73,6 +77,7 @@ class ToolMetadata:
     json_schema: dict[str, Any]
     strict: bool
     return_annotation: type[Any] | None
+    uses_tool_state: bool = False
 
 
 P = ParamSpec("P")
@@ -150,6 +155,7 @@ def tool(
             json_schema=schema_result.parameters_json_schema,
             strict=strict,
             return_annotation=schema_result.return_annotation,
+            uses_tool_state=schema_result.uses_tool_state,
         )
         # Attach metadata via setattr (the dynamic attribute name
         # is intentional — it's the framework's discovery contract,

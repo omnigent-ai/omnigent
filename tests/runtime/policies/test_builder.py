@@ -1865,11 +1865,20 @@ def test_engine_refuses_a_tree_assembled_across_a_change(
         def __getattr__(self, name: str):
             return getattr(self._inner, name)
 
-    # One row per page, so the tree genuinely pages.
+    # One row per page, so the tree genuinely pages. A switch survives the
+    # walk and is caught by the paged-tree guard ("moved"). A delete of the
+    # evaluated row invalidates the page cursor, so the walk restarts and the
+    # clean re-read observes the row is genuinely gone ("disappeared") — a
+    # different guard, same fail-closed refusal.
+    expected = (
+        "moved while its spawn tree"
+        if mutation == "switch"
+        else "disappeared while building its policy engine"
+    )
     original_page_size = builder_mod._SUBTREE_USAGE_PAGE_SIZE
     builder_mod._SUBTREE_USAGE_PAGE_SIZE = 1
     try:
-        with pytest.raises(OmnigentError, match="moved while its spawn tree"):
+        with pytest.raises(OmnigentError, match=expected):
             build_policy_engine(
                 spec=AgentSpec(spec_version=1, name="x"),
                 conversation_id=child.id,

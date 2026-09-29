@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+import uuid
 from pathlib import Path, PurePosixPath, PureWindowsPath
 
 from omnigent.stores.artifact_store import ArtifactStore
@@ -73,8 +75,13 @@ class LocalArtifactStore(ArtifactStore):
         """
         Write bytes to a file under the root directory.
 
-        Creates intermediate directories as needed. Overwrites
-        the file if it already exists.
+        Creates intermediate directories as needed. Overwrites the file
+        if it already exists. Writes to a sibling temp file first and
+        ``os.replace``s it into place: a concurrent :meth:`get` of the
+        same key (e.g. a re-``put`` of a builtin/managed agent racing an
+        in-flight cache load of the same bundle) always observes either
+        the old complete content or the new complete content, never a
+        truncated read from a plain overwrite-in-place.
 
         :param key: Forward-slash-separated artifact key,
             e.g. ``"agents/agent_abc123/bundle.tar.gz"``.
@@ -82,7 +89,13 @@ class LocalArtifactStore(ArtifactStore):
         """
         path = self._resolve(key)
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(data)
+        tmp_path = path.with_name(f"{path.name}.{uuid.uuid4().hex}.tmp")
+        try:
+            tmp_path.write_bytes(data)
+            os.replace(tmp_path, path)
+        except BaseException:
+            tmp_path.unlink(missing_ok=True)
+            raise
 
     def get(self, key: str) -> bytes:
         """

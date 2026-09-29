@@ -243,24 +243,28 @@ def catalog_session(
 
 
 def _expand_list_models_tool_call(page: Page) -> None:
-    """Expand the ``sys_list_models`` tool call in the transcript.
-
-    A lone call renders directly as a ``sys_list_models(...)`` trigger;
-    completed multi-step turns fold calls into a collapsed "Called N tools"
-    group — expand groups when present, then click the call trigger so its
-    output preview (the catalog JSON) is on screen.
+    """Expand the completed turn, tool group, and model-listing output.
 
     :param page: The Playwright page, on the parent session.
     """
-    direct = page.get_by_role("button", name=re.compile(r"^sys_list_models\("))
-    if not direct.count():
-        groups = page.get_by_text(re.compile(r"^Called \d+ tools?$"))
-        expect(groups.first).to_be_visible(timeout=30_000)
-        for group in groups.all():
-            group.click()
-        direct = page.get_by_role("button", name=re.compile(r"sys_list_models"))
-    expect(direct.first).to_be_visible(timeout=30_000)
-    direct.first.click()
+    worked = page.get_by_test_id("turn-worked-fold")
+    expect(worked).to_be_visible(timeout=30_000)
+    worked_trigger = worked.get_by_role("button", name=re.compile(r"^Worked"))
+    # The fold mounts open to animate shut after idle; wait before opening it.
+    expect(worked_trigger).to_have_attribute("aria-expanded", "false", timeout=30_000)
+    worked_trigger.click()
+    expect(worked_trigger).to_have_attribute("aria-expanded", "true")
+
+    group = worked.get_by_role("button", name="Called 1 tool", exact=True)
+    expect(group).to_be_visible(timeout=30_000)
+    expect(group).to_have_attribute("aria-expanded", "false")
+    group.click()
+    expect(group).to_have_attribute("aria-expanded", "true")
+
+    direct = worked.get_by_role("button", name=re.compile(r"^sys_list_models"))
+    expect(direct).to_be_visible(timeout=30_000)
+    direct.click()
+    expect(direct).to_have_attribute("aria-expanded", "true")
 
 
 def _cursor_catalog_row(base_url: str, session_id: str) -> dict[str, object]:
@@ -324,9 +328,7 @@ def test_cursor_native_worker_row_not_source_none(
     expect(
         page.locator(_ASSISTANT, has_text=f"Catalog reported. Marker: {chat.routing_token}").first
     ).to_be_visible(timeout=_TURN_TIMEOUT_MS)
-    # The final text item can render just before the terminal response settles
-    # the turn and folds its tool calls. Wait for the authoritative session
-    # status UI to go idle so the trigger cannot be replaced mid-click.
+    # The completed-turn fold appears after the working indicator clears.
     expect(page.get_by_test_id("working-indicator")).to_be_hidden(timeout=30_000)
 
     # Put the catalog on screen the way a user reads it (and the video shows it).

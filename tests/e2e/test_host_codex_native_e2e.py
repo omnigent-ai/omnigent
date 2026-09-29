@@ -30,13 +30,13 @@ from pathlib import Path
 import httpx
 import pytest
 
-from omnigent.codex_native_bridge import (
+from omnigent.entities.session_resources import terminal_resource_id
+from omnigent.harnesses.codex_native.bridge import (
     bridge_dir_for_bridge_id,
     read_bridge_state,
     update_active_turn_id,
 )
-from omnigent.entities.session_resources import terminal_resource_id
-from omnigent.native_coding_agents import CODEX_NATIVE_AGENT_NAME
+from omnigent.native.native_coding_agents import CODEX_NATIVE_AGENT_NAME
 from tests._helpers.compat import apply_runner_env, compat_runner_cwd, runner_executable
 from tests.e2e.helpers import POLL_INTERVAL_S
 

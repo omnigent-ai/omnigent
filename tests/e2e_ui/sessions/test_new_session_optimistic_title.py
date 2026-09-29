@@ -21,7 +21,6 @@ from __future__ import annotations
 
 import json
 import re
-import time
 
 import httpx
 from playwright.sync_api import Page, Route, expect
@@ -102,6 +101,15 @@ def test_new_session_shows_first_prompt_optimistically(
 
     page.route("**/v1/sessions/*/events", handle_events)
     page.route("**/v1/hosts", handle_hosts)
+    # The fake host has no catalog or worktrees; this journey tests title handoff.
+    page.route(
+        "**/v1/hosts/host_e2e/harnesses/*/model-options",
+        lambda route: route.fulfill(json={"models": []}),
+    )
+    page.route(
+        "**/v1/hosts/host_e2e/worktrees?*",
+        lambda route: route.fulfill(json={"data": []}),
+    )
     page.route("**/v1/agents", handle_agents)
     page.route(_SESSIONS_RE, handle_sessions)
 
@@ -133,10 +141,16 @@ def test_new_session_shows_first_prompt_optimistically(
     prompt_input = page.get_by_test_id("new-chat-landing-input")
     prompt_input.wait_for(state="visible", timeout=15_000)
     prompt_input.fill(_PROMPT)
-    # Playwright auto-waits for Send to be actionable (enabled): it
-    # enables only once message + host + agent + workspace are all set,
-    # so this also confirms the seeded workspace chip auto-filled.
-    page.get_by_test_id("new-chat-landing-submit").click()
+    # Send auto-waits for message, host, agent, and workspace readiness.
+    # Register the response wait first so Playwright can dispatch the routed POST.
+    with page.expect_response(
+        lambda response: (
+            response.url == f"{base_url}/v1/sessions/{session_a}/events"
+            and response.request.method == "POST"
+        ),
+        timeout=15_000,
+    ):
+        page.get_by_test_id("new-chat-landing-submit").click()
 
     page.wait_for_url(re.compile(rf"/c/{re.escape(session_a)}"))
 
@@ -147,9 +161,6 @@ def test_new_session_shows_first_prompt_optimistically(
 
     # Sanity: the real auto-send handoff ran (its POST was intercepted),
     # so a green run isn't a composer that silently never sent.
-    deadline = time.monotonic() + 15
-    while time.monotonic() < deadline and _PROMPT not in event_texts:
-        time.sleep(0.05)
     assert _PROMPT in event_texts, (
         f"the initial prompt was never POSTed to the session's /events "
         f"(observed: {event_texts}) — the auto-send path did not run"

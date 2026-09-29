@@ -11,8 +11,12 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import shlex
+import subprocess
 import sys
 import types
+from pathlib import Path
 from types import SimpleNamespace
 
 import click
@@ -32,6 +36,7 @@ from omnigent.onboarding.sandboxes.kubernetes import (
     build_job_manifest,
     build_token_secret_manifest,
 )
+from omnigent.onboarding.sandboxes.types import RepoWorkspace
 
 _TOKEN = "launch-token-xyz"
 _MANIFEST_KW = {
@@ -51,6 +56,9 @@ _MANIFEST_KW = {
 
 # Minimal valid host_config exercised by the injection tests below.
 _HOST_CONFIG: dict[str, object] = {"providers": {"litellm": {"kind": "gateway"}}}
+
+# The writable-HOME emptyDir as rendered with the default sizeLimit.
+_BOUNDED_HOME_VOLUME = {"name": "home", "emptyDir": {"sizeLimit": k8s._HOME_SIZE_LIMIT_DEFAULT}}
 
 
 def _pod_spec(manifest: dict) -> dict:
@@ -101,9 +109,10 @@ def test_build_job_manifest_has_no_liveness_probe() -> None:
 def test_build_job_manifest_init_container_prepares_and_clones_workspace() -> None:
     """The init container makes the workspace and clones the repo before the host."""
     manifest = build_job_manifest(
-        **{**_MANIFEST_KW, "clone_dir": "/home/omnigent/workspace/repo"},
-        repo_url="https://github.com/org/repo.git",
-        repo_branch="main",
+        **_MANIFEST_KW,
+        repos=[
+            RepoWorkspace(url="https://github.com/org/repo.git", branch="main", repo_name="repo")
+        ],
     )
     init = _pod_spec(manifest)["initContainers"]
     assert len(init) == 1
@@ -112,21 +121,671 @@ def test_build_job_manifest_init_container_prepares_and_clones_workspace() -> No
     assert "mkdir -p /home/omnigent/workspace" in script
     assert "git clone --branch main --single-branch -- " in script
     assert "https://github.com/org/repo.git /home/omnigent/workspace/repo" in script
+    # The per-user broker is wired before the clone, and the init container gets
+    # the launch token (secretKeyRef) so it can reach the broker.
+    assert "configure_clone_credentials" in script
+    assert script.index("configure_clone_credentials") < script.index("git clone")
+    init_env = init[0]["env"]
+    assert any(
+        e["name"] == "OMNIGENT_HOST_TOKEN" and "secretKeyRef" in e.get("valueFrom", {})
+        for e in init_env
+    )
+
+
+def test_build_job_manifest_clones_multiple_repos_as_parallel_siblings() -> None:
+    """Several repos → each clones into its own sibling dir, backgrounded (parallel)."""
+    manifest = build_job_manifest(
+        **_MANIFEST_KW,
+        repos=[
+            RepoWorkspace(url="https://github.com/org/a.git", branch=None, repo_name="a"),
+            RepoWorkspace(url="https://github.com/org/b.git", branch="main", repo_name="b"),
+        ],
+    )
+    script = _pod_spec(manifest)["initContainers"][0]["command"][2]
+    assert "https://github.com/org/a.git /home/omnigent/workspace/a" in script
+    assert (
+        "--branch main --single-branch -- https://github.com/org/b.git "
+        "/home/omnigent/workspace/b" in script
+    )
+    # Both clones are backgrounded and joined, and the broker is wired ONCE
+    # (a single `python3 -c` line configures the helper for every clone).
+    assert script.count(" & pids=") == 2
+    assert 'for p in $pids; do wait "$p" || rc=1; done' in script
+    assert script.count("python3 -c") == 1
+
+
+def _run_failed_clone_with_credential_probe(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    wire_mutation: str | None = None,
+    cwd: Path | None = None,
+    host_token: str = "test-launch-token-sentinel",
+) -> tuple[subprocess.CompletedProcess[str], list[list[str]], list[str], list[str], Path]:
+    """Run workspace prep with a recording git that rejects the clone."""
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    argv_log = tmp_path / "git-argv.jsonl"
+    helper_argv_log = tmp_path / "helper-argv.jsonl"
+    config_log = tmp_path / "git-config-snapshots"
+    path_log = tmp_path / "git-config-paths"
+    mode_log = tmp_path / "git-config-modes"
+    for log in (argv_log, helper_argv_log, config_log, path_log, mode_log):
+        log.touch(mode=0o600)
+    fake_python = fake_bin / "python3"
+    fake_python.write_text(
+        f"#!{sys.executable}\n"
+        + """import json
+import os
+from pathlib import Path
+import sys
+
+if sys.argv[1:2] == ["-c"]:
+    mutation = os.environ.get("WIRE_MUTATION")
+    if not mutation:
+        os.execv(sys.executable, [sys.executable, *sys.argv[1:]])
+    prefix = "import omnigent.git_credential_github as g; "
+    if mutation == "renamed_installer":
+        prefix += (
+            "del g._install_broker_helper; "
+            "g.configure_clone_credentials=lambda *_args:True; "
+        )
+    elif mutation == "missing_git_config":
+        prefix += "del g._git_config; "
+    elif mutation == "failed_config_write":
+        prefix += "g._git_config=lambda *_args:None; "
+    elif mutation == "failed_reset_write":
+        prefix += (
+            "orig=g._git_config; "
+            "g._git_config=lambda *args:None if args[0]=='--replace-all' else orig(*args); "
+        )
+    elif mutation == "unexpected_none":
+        prefix += "g.configure_clone_credentials=lambda *_args:None; "
+    elif mutation == "truthy_non_bool":
+        prefix += (
+            "configure=g.configure_clone_credentials; "
+            "g.configure_clone_credentials=lambda *args:configure(*args) and 1; "
+        )
+    elif mutation == "disconnected_broker":
+        prefix += "g.configure_clone_credentials=lambda *_args:False; "
+    os.execv(sys.executable, [sys.executable, "-c", prefix + sys.argv[2]])
+with Path(os.environ["HELPER_ARGV_LOG"]).open("a") as handle:
+    handle.write(json.dumps(sys.argv[1:]) + "\\n")
+os.execv(sys.executable, [sys.executable, *sys.argv[1:]])
+"""
+    )
+    fake_python.chmod(0o755)
+    fake_git = fake_bin / "git"
+    fake_git.write_text(
+        f"#!{sys.executable}\n"
+        + """import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+
+args = sys.argv[1:]
+with Path(os.environ["ARGV_LOG"]).open("a") as handle:
+    handle.write(json.dumps(args) + "\\n")
+if args[:3] == ["config", "--global", "--get-all"]:
+    path = Path(os.environ["GIT_CONFIG_GLOBAL"])
+    key = args[3]
+    values = []
+    for line in path.read_text().splitlines():
+        config_args = json.loads(line)
+        if len(config_args) >= 3 and config_args[1] == key:
+            values.append(config_args[-1])
+    if os.environ.get("WIRE_MUTATION") == "extra_helper":
+        values.append("!unsafe-helper")
+    print("\\n".join(values))
+    raise SystemExit(0 if values else 1)
+if args[:2] == ["config", "--global"]:
+    path = Path(os.environ.get("GIT_CONFIG_GLOBAL", Path(os.environ["HOME"]) / ".gitconfig"))
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o666)
+    with os.fdopen(fd, "a") as handle:
+        handle.write(json.dumps(args[2:]) + "\\n")
+    with Path(os.environ["CONFIG_LOG"]).open("a") as handle:
+        handle.write(path.read_text())
+    with Path(os.environ["PATH_LOG"]).open("a") as handle:
+        handle.write(str(path) + "\\n")
+    raise SystemExit(0)
+if args and args[0] == "clone":
+    config_path = Path(
+        os.environ.get("GIT_CONFIG_GLOBAL", Path(os.environ["HOME"]) / ".gitconfig")
+    )
+    helper = json.loads(config_path.read_text().splitlines()[-1])[-1]
+    subprocess.run(
+        ["bash", "-c", helper.removeprefix("!") + " get"],
+        input="protocol=https\\nhost=github.com\\n\\n",
+        text=True,
+        check=True,
+    )
+    print("simulated clone failure", file=sys.stderr)
+    raise SystemExit(1)
+raise SystemExit(128)
+"""
+    )
+    fake_git.chmod(0o755)
+    home = tmp_path / "home"
+    home.mkdir()
+    if wire_mutation == "disconnected_broker":
+        fallback_log = tmp_path / "fallback-used"
+        (home / ".gitconfig").write_text(
+            json.dumps(
+                [
+                    "--add",
+                    "credential.https://github.com.helper",
+                    '!f() { [ "$1" = get ] || return 0; '
+                    '[ -n "$GIT_TOKEN" ] || return 1; '
+                    'printf used > "$FALLBACK_LOG"; }; f',
+                ]
+            )
+            + "\n"
+        )
+        monkeypatch.setenv("FALLBACK_LOG", str(fallback_log))
+        monkeypatch.setenv("GIT_TOKEN", "shared-token-sentinel")
+    workspace = home / "workspace"
+    monkeypatch.setenv("ARGV_LOG", str(argv_log))
+    monkeypatch.setenv("HELPER_ARGV_LOG", str(helper_argv_log))
+    monkeypatch.setenv("CONFIG_LOG", str(config_log))
+    monkeypatch.setenv("PATH_LOG", str(path_log))
+    monkeypatch.setenv("MODE_LOG", str(mode_log))
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("OMNIGENT_HOST_TOKEN", host_token)
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    monkeypatch.setenv("PATH", f"{fake_bin}{os.pathsep}{os.environ['PATH']}")
+    if wire_mutation is None:
+        monkeypatch.delenv("WIRE_MUTATION", raising=False)
+    else:
+        monkeypatch.setenv("WIRE_MUTATION", wire_mutation)
+    command = k8s._render_workspace_prep_command(
+        str(workspace),
+        [
+            RepoWorkspace(
+                url="https://github.com/org/private.git", branch=None, repo_name="private"
+            )
+        ],
+        ":",
+        "host-test",
+    )
+    mode_probe = f"""
+mktemp() {{
+  credential_path=$(command mktemp "$@") || return
+  {shlex.quote(sys.executable)} - "$credential_path" "$MODE_LOG" <<'PY'
+import stat
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+mode = oct(stat.S_IMODE(path.stat().st_mode)) if path.exists() else "missing"
+with Path(sys.argv[2]).open("a") as handle:
+    handle.write(mode + "\\n")
+PY
+  printf '%s\n' "$credential_path"
+}}
+"""
+    result = subprocess.run(
+        ["bash", "-c", "umask 022\n" + mode_probe + command[2]],
+        capture_output=True,
+        text=True,
+        env=os.environ.copy(),
+        cwd=cwd,
+    )
+    argv = [
+        json.loads(line)
+        for log in (argv_log, helper_argv_log)
+        for line in log.read_text().splitlines()
+    ]
+    paths = path_log.read_text().splitlines()
+    modes = mode_log.read_text().splitlines()
+    return result, argv, paths, modes, config_log
+
+
+def test_failed_clone_removes_scoped_credential_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A clone failure leaves no credential helper configuration behind."""
+    result, _argv, paths, _modes, _config_log = _run_failed_clone_with_credential_probe(
+        tmp_path, monkeypatch
+    )
+    assert result.returncode != 0
+    assert paths
+    assert all(not Path(path).exists() for path in paths)
+    assert not (tmp_path / "home" / ".gitconfig").exists()
+
+
+def test_clone_credentials_keep_launch_token_out_of_argv_and_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The clone helper reads the launch token without persisting or execing it."""
+    _result, argv, _paths, _modes, config_log = _run_failed_clone_with_credential_probe(
+        tmp_path, monkeypatch
+    )
+    token = os.environ["OMNIGENT_HOST_TOKEN"]
+    assert all(token not in argument for call in argv for argument in call)
+    assert token not in config_log.read_text()
+
+
+def test_clone_credential_config_is_private_at_creation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The clone-scoped credential config is private before Git writes it."""
+    _result, _argv, _paths, modes, _config_log = _run_failed_clone_with_credential_probe(
+        tmp_path, monkeypatch
+    )
+    assert modes == ["0o600"]
+
+
+@pytest.mark.parametrize(
+    "wire_mutation",
+    [
+        "renamed_installer",
+        "missing_git_config",
+        "failed_config_write",
+        "failed_reset_write",
+        "extra_helper",
+        "unexpected_none",
+        "truthy_non_bool",
+    ],
+)
+def test_credential_wiring_drift_aborts_before_clone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, wire_mutation: str
+) -> None:
+    """Missing private hooks or an unwritable config abort before clone."""
+    result, argv, _paths, _modes, _config_log = _run_failed_clone_with_credential_probe(
+        tmp_path, monkeypatch, wire_mutation=wire_mutation
+    )
+    assert result.returncode != 0
+    assert not any(call and call[0] == "clone" for call in argv)
+
+
+def test_empty_launch_token_aborts_before_clone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An empty launch token cannot silently fall back to ambient credentials."""
+    result, argv, _paths, _modes, _config_log = _run_failed_clone_with_credential_probe(
+        tmp_path, monkeypatch, host_token=""
+    )
+    assert result.returncode != 0
+    assert not any(call and call[0] == "clone" for call in argv)
+
+
+def test_disconnected_broker_keeps_ambient_git_token_helper(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A disconnected broker leaves the image's shared Git helper active."""
+    result, argv, paths, _modes, _config_log = _run_failed_clone_with_credential_probe(
+        tmp_path, monkeypatch, wire_mutation="disconnected_broker"
+    )
+    assert result.returncode != 0
+    assert any(call and call[0] == "clone" for call in argv)
+    assert paths == []
+    assert (tmp_path / "fallback-used").read_text() == "used"
+
+
+def test_credential_python_ignores_workspace_package_shadow(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Credential imports cannot be shadowed by the init container's working directory."""
+    shadow_dir = tmp_path / "shadow"
+    package = shadow_dir / "omnigent"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text("")
+    marker = tmp_path / "shadow-imported"
+    (package / "git_credential_github.py").write_text(
+        'import os\nfrom pathlib import Path\nPath(os.environ["SHADOW_MARKER"]).touch()\n'
+    )
+    monkeypatch.setenv("SHADOW_MARKER", str(marker))
+
+    _run_failed_clone_with_credential_probe(tmp_path, monkeypatch, cwd=shadow_dir)
+
+    assert not marker.exists()
+
+
+def test_credential_python_ignores_pythonpath_package_shadow(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Credential wiring cannot import a package planted on PYTHONPATH."""
+    shadow_dir = tmp_path / "shadow"
+    package = shadow_dir / "omnigent"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text("")
+    marker = tmp_path / "shadow-imported"
+    (package / "git_credential_github.py").write_text(
+        'import os\nfrom pathlib import Path\nPath(os.environ["SHADOW_MARKER"]).touch()\n'
+    )
+    monkeypatch.setenv("PYTHONPATH", str(shadow_dir))
+    monkeypatch.setenv("SHADOW_MARKER", str(marker))
+
+    _run_failed_clone_with_credential_probe(tmp_path, monkeypatch)
+
+    assert not marker.exists()
+
+
+def _run_workspace_clone(
+    workspace: Path, monkeypatch: pytest.MonkeyPatch
+) -> tuple[subprocess.CompletedProcess[str], Path, list[str]]:
+    """Run the real renderer with Git probing intact and clone side effects faked."""
+    target = workspace / "repo"
+    clone_log = workspace.parent / f"{workspace.name}-clone-log"
+    command = k8s._render_workspace_prep_command(
+        str(workspace),
+        [RepoWorkspace(url="https://github.com/org/repo.git", branch=None, repo_name="repo")],
+        ":",
+        "host-test",
+    )
+    script = (
+        'python3() { if [ "$1" = "-c" ]; then return 0; fi; command python3 "$@"; }\n'
+        "git() {\n"
+        '  if [ "$1" = "-C" ]; then command git "$@"; return; fi\n'
+        '  printf "%s\\n" "$*" >> "$CLONE_LOG"\n'
+        '  clone_dir="${@: -1}"\n'
+        '  mkdir -p "$clone_dir/.git"\n'
+        '  printf "ref: refs/heads/main\\n" > "$clone_dir/.git/HEAD"\n'
+        "}\n" + command[2]
+    )
+    monkeypatch.setenv("CLONE_LOG", str(clone_log))
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", "/dev/null")
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    result = subprocess.run(
+        ["bash", "-c", script], capture_output=True, text=True, env=os.environ.copy()
+    )
+    clones = clone_log.read_text().splitlines() if clone_log.exists() else []
+    return result, target, clones
+
+
+def _workspace_snapshot(workspace: Path) -> dict[str, tuple[str, bytes | str]]:
+    """Capture files and links for byte-exact refusal and preservation checks."""
+    snapshot = {}
+    for path in workspace.rglob("*"):
+        relative = str(path.relative_to(workspace))
+        if path.is_symlink():
+            snapshot[relative] = ("link", os.readlink(path))
+            resolved = path.resolve()
+            if resolved.is_dir():
+                for linked_path in resolved.rglob("*"):
+                    linked_relative = f"{relative}=>{linked_path.relative_to(resolved)}"
+                    if linked_path.is_symlink():
+                        snapshot[linked_relative] = ("link", os.readlink(linked_path))
+                    elif linked_path.is_file():
+                        snapshot[linked_relative] = ("file", linked_path.read_bytes())
+        elif path.is_file():
+            snapshot[relative] = ("file", path.read_bytes())
+    return snapshot
+
+
+@pytest.mark.parametrize(
+    ("shape", "expected"),
+    [
+        ("git_directory", "preserve"),
+        ("gitfile", "preserve"),
+        ("real_worktree", "refuse"),
+        ("separate_git_dir", "refuse"),
+        ("symlink_checkout", "preserve"),
+        ("missing_head", "refuse"),
+        ("ancestor_checkout", "clone"),
+        ("git_dir", "clone"),
+        ("git_dir_work_tree", "clone"),
+        ("symlink_empty", "refuse"),
+        ("plain_empty", "clone"),
+        ("bare", "refuse"),
+        ("ancestor_core_worktree", "clone"),
+        ("gitfile_to_ancestor_core_worktree", "refuse"),
+        ("gitfile_to_ancestor", "refuse"),
+        ("ambient_work_tree_malformed", "refuse"),
+    ],
+)
+def test_workspace_prep_classifies_checkout_at_target(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    shape: str,
+    expected: str,
+) -> None:
+    """Only a target-local checkout is preserved; occupied unsafe targets are refused."""
+    monkeypatch.delenv("GIT_DIR", raising=False)
+    monkeypatch.delenv("GIT_WORK_TREE", raising=False)
+    workspace = tmp_path / "workspace"
+    if shape in {
+        "ancestor_checkout",
+        "ancestor_core_worktree",
+        "gitfile_to_ancestor",
+        "gitfile_to_ancestor_core_worktree",
+    }:
+        ancestor = tmp_path / "ancestor"
+        subprocess.run(["git", "init", "-q", str(ancestor)], check=True)
+        workspace = ancestor / "workspace"
+    target = workspace / "repo"
+
+    if shape == "git_directory":
+        subprocess.run(["git", "init", "-q", str(target)], check=True)
+    elif shape == "gitfile":
+        subprocess.run(["git", "init", "-q", str(target)], check=True)
+        separate_git_dir = target / ".git-data"
+        (target / ".git").rename(separate_git_dir)
+        (target / ".git").write_text(f"gitdir: {separate_git_dir}\n")
+    elif shape == "real_worktree":
+        main_checkout = tmp_path / "main-checkout"
+        subprocess.run(["git", "init", "-q", str(main_checkout)], check=True)
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(main_checkout),
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "Initial commit",
+            ],
+            check=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(main_checkout), "worktree", "add", "-q", "-b", "test", str(target)],
+            check=True,
+        )
+    elif shape == "separate_git_dir":
+        separate_git_dir = tmp_path / "explicit-separate.git"
+        subprocess.run(
+            ["git", "init", "-q", "--separate-git-dir", str(separate_git_dir), str(target)],
+            check=True,
+        )
+    elif shape == "symlink_checkout":
+        checkout = tmp_path / "checkout"
+        subprocess.run(["git", "init", "-q", str(checkout)], check=True)
+        workspace.mkdir(parents=True)
+        target.symlink_to(checkout, target_is_directory=True)
+    elif shape == "missing_head":
+        subprocess.run(["git", "init", "-q", str(target)], check=True)
+        (target / ".git" / "HEAD").unlink()
+        (target / "keep.txt").write_text("preserve me\n")
+    elif shape in {"gitfile_to_ancestor", "gitfile_to_ancestor_core_worktree"}:
+        target.mkdir(parents=True)
+        if shape == "gitfile_to_ancestor_core_worktree":
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(tmp_path / "ancestor"),
+                    "config",
+                    "core.worktree",
+                    str(target),
+                ],
+                check=True,
+            )
+        (target / ".git").write_text(f"gitdir: {tmp_path / 'ancestor' / '.git'}\n")
+        (target / "keep.txt").write_text("preserve me\n")
+    elif shape in {"ancestor_checkout", "plain_empty", "ancestor_core_worktree"}:
+        target.mkdir(parents=True)
+        if shape == "ancestor_core_worktree":
+            subprocess.run(
+                ["git", "-C", str(tmp_path / "ancestor"), "config", "core.worktree", str(target)],
+                check=True,
+            )
+    elif shape in {"git_dir", "git_dir_work_tree"}:
+        target.mkdir(parents=True)
+        ambient = tmp_path / "ambient"
+        subprocess.run(["git", "init", "-q", str(ambient)], check=True)
+        monkeypatch.setenv("GIT_DIR", str(ambient / ".git"))
+        if shape == "git_dir_work_tree":
+            monkeypatch.setenv("GIT_WORK_TREE", str(target))
+    elif shape == "ambient_work_tree_malformed":
+        (target / ".git").mkdir(parents=True)
+        (target / ".git" / "config").write_text("incomplete repository\n")
+        (target / "keep.txt").write_text("preserve me\n")
+        ambient_git_dir = target / ".ambient-git"
+        subprocess.run(["git", "init", "--bare", "-q", str(ambient_git_dir)], check=True)
+        monkeypatch.setenv("GIT_DIR", str(ambient_git_dir))
+        monkeypatch.setenv("GIT_WORK_TREE", str(target))
+    elif shape == "symlink_empty":
+        empty = tmp_path / "empty"
+        empty.mkdir()
+        workspace.mkdir(parents=True)
+        target.symlink_to(empty, target_is_directory=True)
+    elif shape == "bare":
+        subprocess.run(["git", "init", "--bare", "-q", str(target)], check=True)
+
+    before = _workspace_snapshot(workspace)
+    result, target, clones = _run_workspace_clone(workspace, monkeypatch)
+
+    if expected == "clone":
+        assert result.returncode == 0, result.stderr
+        assert len(clones) == 1
+        assert (target / ".git" / "HEAD").read_text() == "ref: refs/heads/main\n"
+    elif expected == "preserve":
+        assert result.returncode == 0, result.stderr
+        assert clones == []
+        assert _workspace_snapshot(workspace) == before
+    else:
+        assert result.returncode != 0
+        assert "refusing to overwrite" in result.stderr
+        assert clones == []
+        assert _workspace_snapshot(workspace) == before
+
+
+def test_workspace_prep_refuses_malformed_directory_repo(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A malformed directory-shaped Git checkout is refused without edits."""
+    workspace = tmp_path / "workspace"
+    clone_dir = workspace / "repo"
+    git_dir = clone_dir / ".git"
+    git_dir.mkdir(parents=True)
+    (git_dir / "HEAD").write_text("malformed head\n")
+    (clone_dir / "keep.txt").write_text("preserve me\n")
+    before = {path: path.read_bytes() for path in workspace.rglob("*") if path.is_file()}
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", "/dev/null")
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    command = k8s._render_workspace_prep_command(
+        str(workspace),
+        [RepoWorkspace(url="https://github.com/org/repo.git", branch=None, repo_name="repo")],
+        ":",
+        "host-test",
+    )
+    result = subprocess.run(command, capture_output=True, text=True, env=os.environ.copy())
+    assert result.returncode != 0
+    assert "refusing to overwrite" in result.stderr
+    assert {path: path.read_bytes() for path in workspace.rglob("*") if path.is_file()} == before
+
+
+def test_workspace_prep_refuses_concurrent_target_writer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A writer populating the destination during clone makes placement fail."""
+    workspace = tmp_path / "workspace"
+    target = workspace / "repo"
+    monkeypatch.setenv("RACE_TARGET", str(target))
+    command = k8s._render_workspace_prep_command(
+        str(workspace),
+        [RepoWorkspace(url="https://github.com/org/repo.git", branch=None, repo_name="repo")],
+        ":",
+        "host-test",
+    )
+    script = (
+        'python3() { if [ "$1" = "-c" ]; then return 0; fi; command python3 "$@"; }\n'
+        "git() {\n"
+        '  if [ "$1" = "-C" ]; then return 128; fi\n'
+        '  clone_dir="${@: -1}"\n'
+        '  mkdir -p "$clone_dir/.git" "$RACE_TARGET/.git"\n'
+        '  printf "ref: refs/heads/main\\n" > "$clone_dir/.git/HEAD"\n'
+        '  printf "foreign\\n" > "$RACE_TARGET/.git/HEAD"\n'
+        "}\n" + command[2]
+    )
+    result = subprocess.run(["bash", "-c", script], capture_output=True, text=True)
+    assert result.returncode != 0
+    assert (target / ".git" / "HEAD").read_text() == "foreign\n"
+    assert not (target / "clone").exists()
+
+
+def test_build_job_manifest_disambiguates_same_named_repos() -> None:
+    """Two repos with the same last-segment name clone into owner-qualified dirs,
+    not one colliding directory that would fail the concurrent clone."""
+    manifest = build_job_manifest(
+        **_MANIFEST_KW,
+        repos=[
+            RepoWorkspace(url="https://github.com/org-a/api", branch=None, repo_name="api"),
+            RepoWorkspace(url="https://github.com/org-b/api", branch=None, repo_name="api"),
+        ],
+    )
+    script = _pod_spec(manifest)["initContainers"][0]["command"][2]
+    assert "https://github.com/org-a/api /home/omnigent/workspace/org-a__api" in script
+    assert "https://github.com/org-b/api /home/omnigent/workspace/org-b__api" in script
+    assert "workspace/api " not in script  # no plain colliding dir
+
+
+def test_build_job_manifest_staging_never_collides_with_sibling_destination() -> None:
+    """Repo ``foo`` must not stage through ``foo.tmp`` when a sibling repo is
+    literally named ``foo.tmp`` — the staging-cleanup branch would refuse the
+    launch against that sibling's checkout, or remove it outright if it carried
+    a root-level ownership marker."""
+    manifest = build_job_manifest(
+        **_MANIFEST_KW,
+        repos=[
+            RepoWorkspace(url="https://github.com/org/foo.git", branch=None, repo_name="foo"),
+            RepoWorkspace(
+                url="https://github.com/org/foo.tmp.git", branch=None, repo_name="foo.tmp"
+            ),
+        ],
+    )
+    script = _pod_spec(manifest)["initContainers"][0]["command"][2]
+    # foo stages through the suffixed name, not the sibling's destination.
+    assert "mkdir -- /home/omnigent/workspace/foo.tmp2\n" in script
+    assert (
+        "replace_empty_dir /home/omnigent/workspace/foo.tmp2/clone "
+        "/home/omnigent/workspace/foo " in script
+    )
+    # No cleanup fragment ever targets the sibling's checkout directory.
+    assert "rm -rf -- /home/omnigent/workspace/foo.tmp\n" not in script
+    # The sibling still clones into its own destination via its own staging.
+    assert (
+        "replace_empty_dir /home/omnigent/workspace/foo.tmp.tmp/clone "
+        "/home/omnigent/workspace/foo.tmp " in script
+    )
 
 
 def test_build_job_manifest_without_repo_has_no_clone() -> None:
     """No repo → the init container only makes the workspace, no git clone."""
     manifest = build_job_manifest(**_MANIFEST_KW)
-    script = _pod_spec(manifest)["initContainers"][0]["command"][2]
+    init = _pod_spec(manifest)["initContainers"][0]
+    script = init["command"][2]
     assert "mkdir -p /home/omnigent/workspace" in script
     assert "git clone" not in script
+    # No repo → no broker wiring, and the launch token is NOT exposed to the
+    # workspace-less init container.
+    assert "configure_clone_credentials" not in script
+    assert all(e["name"] != "OMNIGENT_HOST_TOKEN" for e in init["env"])
 
 
 def test_build_job_manifest_host_config_is_written_by_init_container() -> None:
     """host_config rides the init container script, after mkdir/clone, before the host."""
     manifest = build_job_manifest(
-        **{**_MANIFEST_KW, "clone_dir": "/home/omnigent/workspace/repo"},
-        repo_url="https://github.com/org/repo.git",
+        **_MANIFEST_KW,
+        repos=[
+            RepoWorkspace(url="https://github.com/org/repo.git", branch=None, repo_name="repo")
+        ],
         host_config=_HOST_CONFIG,
     )
     spec = _pod_spec(manifest)
@@ -273,6 +932,27 @@ def test_build_job_manifest_node_selector_can_override_arch() -> None:
     assert selector["disktype"] == "ssd"
 
 
+def test_build_job_manifest_omits_tolerations_by_default() -> None:
+    """No tolerations → no tolerations key: byte-compatible with pre-tolerations manifests."""
+    manifest = build_job_manifest(**_MANIFEST_KW)
+    assert "tolerations" not in _pod_spec(manifest)
+
+
+def test_build_job_manifest_tolerations_land_on_the_pod_spec_verbatim() -> None:
+    """Normalized toleration entries reach spec.tolerations verbatim."""
+    tolerations = [
+        {
+            "key": "sei.io/node-role",
+            "operator": "Equal",
+            "value": "omnigent-sandbox",
+            "effect": "NoSchedule",
+        },
+        {"operator": "Exists"},
+    ]
+    manifest = build_job_manifest(**{**_MANIFEST_KW, "tolerations": tolerations})
+    assert _pod_spec(manifest)["tolerations"] == tolerations
+
+
 def test_build_job_manifest_omits_runtime_class_by_default() -> None:
     """No runtime_class → no runtimeClassName key: the cluster default runtime."""
     manifest = build_job_manifest(**_MANIFEST_KW)
@@ -283,6 +963,66 @@ def test_build_job_manifest_runtime_class_sets_runtime_class_name() -> None:
     """An operator runtime_class lands verbatim as spec.runtimeClassName."""
     manifest = build_job_manifest(**{**_MANIFEST_KW, "runtime_class": "kata"})
     assert _pod_spec(manifest)["runtimeClassName"] == "kata"
+
+
+def test_build_job_manifest_home_emptydir_is_bounded_by_default() -> None:
+    """
+    The writable-HOME emptyDir carries a sizeLimit (8Gi) out of the box: an
+    unbounded emptyDir lets one sandbox push its node into disk pressure, and
+    the kubelet then evicts by node-wide ranking — innocent Pods first.
+    """
+    manifest = build_job_manifest(**_MANIFEST_KW)
+    volumes = {v["name"]: v for v in _pod_spec(manifest)["volumes"]}
+    assert volumes["home"] == {"name": "home", "emptyDir": {"sizeLimit": "8Gi"}}
+    assert k8s._HOME_SIZE_LIMIT_DEFAULT == "8Gi"
+
+
+def test_build_job_manifest_home_size_limit_override_lands_on_the_emptydir() -> None:
+    """An operator home_size_limit replaces the default sizeLimit verbatim."""
+    manifest = build_job_manifest(**_MANIFEST_KW, home_size_limit="20Gi")
+    volumes = {v["name"]: v for v in _pod_spec(manifest)["volumes"]}
+    assert volumes["home"] == {"name": "home", "emptyDir": {"sizeLimit": "20Gi"}}
+
+
+def test_build_job_manifest_home_size_limit_none_renders_unbounded_emptydir() -> None:
+    """An explicit None (config `home_size_limit: null`) restores the unbounded emptyDir."""
+    manifest = build_job_manifest(**_MANIFEST_KW, home_size_limit=None)
+    volumes = {v["name"]: v for v in _pod_spec(manifest)["volumes"]}
+    assert volumes["home"] == {"name": "home", "emptyDir": {}}
+
+
+def test_resolve_pod_resources_defaults_leave_ephemeral_storage_unset() -> None:
+    """No built-in ephemeral-storage: an omitted field stays out of the manifest
+    so a namespace LimitRange can default it."""
+    resources = k8s._resolve_pod_resources(None)
+    assert resources == {
+        "requests": {"cpu": k8s._SANDBOX_CPU_REQUEST, "memory": k8s._SANDBOX_MEMORY_REQUEST},
+        "limits": {"cpu": k8s._SANDBOX_CPU_LIMIT, "memory": k8s._SANDBOX_MEMORY_LIMIT},
+    }
+    assert "ephemeral-storage" not in resources["requests"]
+    assert "ephemeral-storage" not in resources["limits"]
+
+
+def test_resolve_pod_resources_forwards_ephemeral_storage_in_both_tiers() -> None:
+    """A configured ephemeral-storage request / limit reaches the container resources."""
+    manifest = build_job_manifest(
+        **_MANIFEST_KW,
+        resources={
+            "requests": {"ephemeral-storage": "2Gi"},
+            "limits": {"memory": "8Gi", "ephemeral-storage": "8Gi"},
+        },
+    )
+    host = _pod_spec(manifest)["containers"][0]
+    assert host["resources"]["requests"] == {
+        "cpu": k8s._SANDBOX_CPU_REQUEST,
+        "memory": k8s._SANDBOX_MEMORY_REQUEST,
+        "ephemeral-storage": "2Gi",
+    }
+    assert host["resources"]["limits"] == {
+        "cpu": k8s._SANDBOX_CPU_LIMIT,
+        "memory": "8Gi",
+        "ephemeral-storage": "8Gi",
+    }
 
 
 def test_build_job_manifest_pvc_mounts_land_on_host_container_only() -> None:
@@ -296,7 +1036,7 @@ def test_build_job_manifest_pvc_mounts_land_on_host_container_only() -> None:
     )
     spec = _pod_spec(manifest)
     volumes = {v["name"]: v for v in spec["volumes"]}
-    assert volumes["home"] == {"name": "home", "emptyDir": {}}
+    assert volumes["home"] == _BOUNDED_HOME_VOLUME
     assert volumes["pvc-0"]["persistentVolumeClaim"] == {
         "claimName": "omnigent-datasets",
         "readOnly": True,
@@ -318,7 +1058,7 @@ def test_build_job_manifest_without_pvc_mounts_is_unchanged() -> None:
     """No pvc_mounts → the single home emptyDir, exactly as before."""
     manifest = build_job_manifest(**_MANIFEST_KW)
     spec = _pod_spec(manifest)
-    assert spec["volumes"] == [{"name": "home", "emptyDir": {}}]
+    assert spec["volumes"] == [_BOUNDED_HOME_VOLUME]
     assert spec["containers"][0]["volumeMounts"] == [
         {"name": "home", "mountPath": "/home/omnigent"}
     ]
@@ -335,7 +1075,7 @@ def test_build_job_manifest_secret_mounts_land_on_host_container_only() -> None:
     )
     spec = _pod_spec(manifest)
     volumes = {v["name"]: v for v in spec["volumes"]}
-    assert volumes["home"] == {"name": "home", "emptyDir": {}}
+    assert volumes["home"] == _BOUNDED_HOME_VOLUME
     assert volumes["secret-0"]["secret"] == {
         "secretName": "git-token",
         "optional": False,
@@ -380,7 +1120,7 @@ def test_build_job_manifest_without_secret_mounts_is_unchanged() -> None:
     """No secret_mounts → the single home emptyDir, exactly as before."""
     manifest = build_job_manifest(**_MANIFEST_KW)
     spec = _pod_spec(manifest)
-    assert spec["volumes"] == [{"name": "home", "emptyDir": {}}]
+    assert spec["volumes"] == [_BOUNDED_HOME_VOLUME]
     assert spec["containers"][0]["volumeMounts"] == [
         {"name": "home", "mountPath": "/home/omnigent"}
     ]
@@ -455,26 +1195,29 @@ def test_build_job_manifest_is_restricted_and_least_privilege() -> None:
 
 
 @pytest.mark.parametrize(
-    ("clone_dir", "repo_url", "repo_branch", "expect_clone", "expect_branch"),
+    ("repos", "expect_clone", "expect_branch"),
     [
-        (None, None, None, False, False),
-        ("/ws/repo", "https://x/y.git", None, True, False),
-        ("/ws/repo", "https://x/y.git", "release-1.2", True, True),
+        ([], False, False),
+        ([RepoWorkspace(url="https://x/y.git", branch=None, repo_name="y")], True, False),
+        ([RepoWorkspace(url="https://x/y.git", branch="release-1.2", repo_name="y")], True, True),
     ],
 )
 def test_render_workspace_prep_command(
-    clone_dir: str | None,
-    repo_url: str | None,
-    repo_branch: str | None,
+    repos: list[RepoWorkspace],
     expect_clone: bool,
     expect_branch: bool,
 ) -> None:
     """The init command always mkdir's the workspace and clones only when asked."""
-    command = k8s._render_workspace_prep_command("/ws", clone_dir, repo_url, repo_branch)
+    command = k8s._render_workspace_prep_command(
+        "/ws", repos, "http://srv.example.com", "host_abc"
+    )
     script = command[2]
     assert "mkdir -p /ws" in script
     assert ("git clone" in script) is expect_clone
     assert ("--branch release-1.2 --single-branch" in script) is expect_branch
+    # The per-user broker is wired (connected-gated at runtime) only when cloning.
+    assert ("configure_clone_credentials" in script) is expect_clone
+    assert script.count("python3 -c") == (1 if expect_clone else 0)
 
 
 def test_new_pod_name_and_token_secret_name() -> None:
@@ -777,6 +1520,68 @@ def test_launch_host_threads_pvc_mounts_into_the_job(
     } in pod_spec["volumes"]
 
 
+def test_launch_host_threads_tolerations_into_the_job(
+    fake_clients: tuple[_FakeCore, _FakeBatch],
+) -> None:
+    """A launcher built with tolerations creates Jobs whose Pod spec carries them."""
+    core, batch = fake_clients
+    _setup_pod_discovery(core)
+    tolerations = [
+        {
+            "key": "sei.io/node-role",
+            "operator": "Equal",
+            "value": "omnigent-sandbox",
+            "effect": "NoSchedule",
+        }
+    ]
+    launcher = KubernetesSandboxLauncher(
+        in_cluster=True,
+        namespace="omnigent-sandboxes",
+        secret_name="omnigent-creds",
+        env=(),
+        tolerations=tolerations,
+    )
+    launcher.start_host(
+        "omnigent-job-1",
+        token=_TOKEN,
+        host_id="host_1",
+        host_name="managed-1",
+        server_url="http://srv.example.com",
+    )
+    pod_spec = batch.created_jobs[0]["spec"]["template"]["spec"]
+    assert pod_spec["tolerations"] == tolerations
+
+
+@pytest.mark.parametrize(
+    ("home_size_limit", "expected_empty_dir"),
+    [("20Gi", {"sizeLimit": "20Gi"}), (None, {})],
+)
+def test_launch_host_threads_home_size_limit_into_the_job(
+    fake_clients: tuple[_FakeCore, _FakeBatch],
+    home_size_limit: str | None,
+    expected_empty_dir: dict[str, str],
+) -> None:
+    """A launcher built with home_size_limit creates Jobs whose HOME emptyDir carries it."""
+    core, batch = fake_clients
+    _setup_pod_discovery(core)
+    launcher = KubernetesSandboxLauncher(
+        in_cluster=True,
+        namespace="omnigent-sandboxes",
+        secret_name="omnigent-creds",
+        env=(),
+        home_size_limit=home_size_limit,
+    )
+    launcher.start_host(
+        "omnigent-job-1",
+        token=_TOKEN,
+        host_id="host_1",
+        host_name="managed-1",
+        server_url="http://srv.example.com",
+    )
+    pod_spec = batch.created_jobs[0]["spec"]["template"]["spec"]
+    assert {"name": "home", "emptyDir": expected_empty_dir} in pod_spec["volumes"]
+
+
 def test_launch_host_threads_secret_mounts_into_the_job(
     fake_clients: tuple[_FakeCore, _FakeBatch],
 ) -> None:
@@ -842,7 +1647,7 @@ def test_launch_host_without_agent_label_keeps_reserved_labels(
 def test_launch_host_with_repo_returns_clone_dir(
     fake_clients: tuple[_FakeCore, _FakeBatch],
 ) -> None:
-    """With a repo, the returned workspace is the cloned directory under the workspace."""
+    """With one repo, the returned workspace is the cloned directory under the workspace."""
     core, _batch = fake_clients
     _setup_pod_discovery(core)
     workspace = _launcher().start_host(
@@ -851,10 +1656,31 @@ def test_launch_host_with_repo_returns_clone_dir(
         host_id="host_2",
         host_name="managed-2",
         server_url="http://srv.example.com",
-        repo_url="https://github.com/org/repo.git",
-        repo_name="repo",
+        repos=[
+            RepoWorkspace(url="https://github.com/org/repo.git", branch=None, repo_name="repo")
+        ],
     )
     assert workspace == "/home/omnigent/workspace/repo"
+
+
+def test_launch_host_with_multiple_repos_returns_parent_workspace(
+    fake_clients: tuple[_FakeCore, _FakeBatch],
+) -> None:
+    """With several repos, the returned workspace is the parent that holds them all."""
+    core, _batch = fake_clients
+    _setup_pod_discovery(core)
+    workspace = _launcher().start_host(
+        "omnigent-job-2b",
+        token=_TOKEN,
+        host_id="host_2b",
+        host_name="managed-2b",
+        server_url="http://srv.example.com",
+        repos=[
+            RepoWorkspace(url="https://github.com/org/a.git", branch=None, repo_name="a"),
+            RepoWorkspace(url="https://github.com/org/b.git", branch=None, repo_name="b"),
+        ],
+    )
+    assert workspace == "/home/omnigent/workspace"
 
 
 def test_launch_host_cleans_up_on_create_failure(
@@ -923,8 +1749,7 @@ def test_launch_host_fast_fails_on_clone_failure_with_log_tail(
             host_id="host_4",
             host_name="managed-4",
             server_url="http://srv.example.com",
-            repo_url="https://x/y.git",
-            repo_name="y",
+            repos=[RepoWorkspace(url="https://x/y.git", branch=None, repo_name="y")],
         )
     assert "workspace prep failed (exit 128" in exc.value.message
     assert "repository 'https://x/y.git' not found" in exc.value.message

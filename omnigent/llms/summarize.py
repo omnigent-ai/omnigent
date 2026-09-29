@@ -10,6 +10,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from omnigent.inner.native_attachments import expand_framework_notices
+
 _SUMMARIZATION_BASE_PROMPT = (
     "Summarize the conversation above so that a future assistant can continue\n"
     "the work without access to the original messages.\n\n"
@@ -93,9 +95,10 @@ def build_summarization_input(
         or a copy of *messages* unchanged if it already ends with
         a user message.
     """
-    if messages and messages[-1].get("role") == "user":
-        return list(messages)
-    return [*messages, {"role": "user", "content": _SUMMARIZATION_TRIGGER_MESSAGE}]
+    normalized = expand_framework_notices(messages)
+    if normalized and normalized[-1].get("role") == "user":
+        return normalized
+    return [*normalized, {"role": "user", "content": _SUMMARIZATION_TRIGGER_MESSAGE}]
 
 
 def extract_summary_text(resp: Any) -> str:

@@ -25,7 +25,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import cast
 
-from omnigent.json_types import JsonObject as _JsonObject
+from omnigent.util.json_types import JsonObject as _JsonObject
 
 
 class FrameKind(str, Enum):
@@ -71,6 +71,10 @@ class HelloFrame:
     :param direct_attach_token: Per-process bearer token guarding the
         direct-attach listener. Only meaningful alongside
         *direct_attach_port*; both travel together or not at all.
+    :param capabilities: Optional build features; omitted by older runners.
+    :param connection_id: Runner-minted identifier for this connection
+        attempt, stamped on both ends' tunnel debug-log rows. ``None``
+        from runners that predate it.
     """
 
     runner_version: str
@@ -80,6 +84,8 @@ class HelloFrame:
     telemetry_opt_out: bool = False
     direct_attach_port: int | None = None
     direct_attach_token: str | None = None
+    capabilities: list[str] = field(default_factory=list)
+    connection_id: str | None = None
 
 
 @dataclass
@@ -116,9 +122,16 @@ class ResponseBodyFrame:
 
 @dataclass
 class ResponseEndFrame:
-    """Runner → server: end of response."""
+    """Runner → server: end of response.
+
+    :param error: When set, the stream ended abnormally (e.g. a
+        mid-stream generator raise).  The server routes this as an
+        abort so the consumer receives an exception rather than a
+        clean EOF after partial body.
+    """
 
     id: str
+    error: str | None = None
 
 
 @dataclass
@@ -218,6 +231,10 @@ def encode_frame(frame: Frame) -> str:
             "envs": list(frame.envs),
             "telemetry_opt_out": frame.telemetry_opt_out,
         }
+        if frame.capabilities:
+            payload["capabilities"] = list(frame.capabilities)
+        if frame.connection_id:
+            payload["connection_id"] = frame.connection_id
         # Emitted only when the listener is actually up, so old servers
         # (which ignore unknown keys) and advert-less runners share one
         # wire shape.
@@ -258,7 +275,10 @@ def encode_frame(frame: Frame) -> str:
             }
         )
     if isinstance(frame, ResponseEndFrame):
-        return json.dumps({"kind": FrameKind.RESPONSE_END.value, "id": frame.id})
+        d: dict[str, object] = {"kind": FrameKind.RESPONSE_END.value, "id": frame.id}
+        if frame.error is not None:
+            d["error"] = frame.error
+        return json.dumps(d)
     if isinstance(frame, RequestCancelFrame):
         return json.dumps(
             {
@@ -364,7 +384,10 @@ def _decode_known_frame(kind: FrameKind, msg: _JsonObject) -> Frame:
         case FrameKind.RESPONSE_BODY:
             return _decode_response_body(msg)
         case FrameKind.RESPONSE_END:
-            return ResponseEndFrame(id=_required_str(msg, "id"))
+            return ResponseEndFrame(
+                id=_required_str(msg, "id"),
+                error=msg.get("error") if isinstance(msg.get("error"), str) else None,
+            )
         case FrameKind.REQUEST_CANCEL:
             return _decode_request_cancel(msg)
         case FrameKind.PING:
@@ -406,6 +429,8 @@ def _decode_hello(msg: _JsonObject) -> HelloFrame:
         telemetry_opt_out=_optional_bool(msg, "telemetry_opt_out", False),
         direct_attach_port=direct_port,
         direct_attach_token=direct_token,
+        capabilities=_optional_str_list(msg, "capabilities"),
+        connection_id=_optional_str(msg, "connection_id", "") or None,
     )
 
 

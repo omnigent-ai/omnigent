@@ -72,10 +72,12 @@ def _to_agent_object(agent: Agent, agent_cache: AgentCache) -> AgentObject:
         # Declared terminal names, in spec order (mirrors the
         # session-agent endpoint so both report it consistently).
         terminals = list(loaded.spec.terminals or {})
-        # Bundled skills only — host-discovered skills are runner-owned
-        # and unknowable here (no session, no runner). The new-session
-        # composer uses this list for its "/" menu.
-        skills = [SkillSummary(name=s.name, description=s.description) for s in loaded.spec.skills]
+        # Bundled suggestions stay available while the host catalog loads.
+        skills = [
+            SkillSummary(name=s.name, description=s.description)
+            for s in loaded.spec.skills
+            if s.user_invocable
+        ]
         mcp_servers = [
             MCPServerSummary(
                 name=srv.name,

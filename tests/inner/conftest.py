@@ -12,8 +12,11 @@ import json
 import logging
 import os
 import pathlib
+import shutil
 import sys
+import tempfile
 import time
+from collections.abc import Iterator
 from types import SimpleNamespace
 
 import pytest
@@ -22,14 +25,43 @@ import pytest_asyncio
 from tests import _model_pools
 
 
+@pytest.fixture
+def short_tmp_parent() -> Iterator[pathlib.Path]:
+    """A short-pathed temp dir under ``/tmp`` for Unix-socket-binding tests.
+
+    macOS caps an ``AF_UNIX`` path at ~103 bytes and its ``$TMPDIR`` is already
+    ~48 bytes, so pytest's ``tmp_path`` (which embeds the test name) overflows
+    before a socket filename is appended (issue #4279). Tests that bind a real
+    Unix socket — the private tmux server, the egress proxy — must place it
+    under a short parent. Production sockets already live under a short
+    ``$TMPDIR/omnigent-...`` path, so this is a test-path artifact only.
+    """
+    parent = pathlib.Path(tempfile.mkdtemp(prefix="omni-inner-", dir="/tmp"))
+    try:
+        yield parent
+    finally:
+        shutil.rmtree(parent, ignore_errors=True)
+
+
 @pytest.fixture(autouse=True)
 def _stub_executor_catalog_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Keep executor unit tests deterministic without catalog network access."""
+    """Keep executor unit tests deterministic without catalog auth or network access."""
+
+    from omnigent.models.model_catalog import ModelListing
 
     def _resolve(provider_name: str, *, family: str, **kwargs: object) -> SimpleNamespace:
         return SimpleNamespace(model_id=f"catalog-{provider_name}-{family}-default")
 
-    monkeypatch.setattr("omnigent.model_catalog.resolve_catalog_model", _resolve)
+    def _listing(_provider: object) -> ModelListing:
+        return ModelListing(
+            source="none",
+            verified=False,
+            models=(),
+            note="stubbed for executor unit tests",
+        )
+
+    monkeypatch.setattr("omnigent.models.model_catalog.resolve_catalog_model", _resolve)
+    monkeypatch.setattr("omnigent.models.model_catalog.listing_for_provider", _listing)
 
 
 # Diagnostic: dump every thread's stack every 90s. The dispatcher's

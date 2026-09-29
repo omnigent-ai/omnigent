@@ -16,6 +16,8 @@ independent of any live turn.
 from __future__ import annotations
 
 import json
+import os
+from pathlib import Path
 
 import httpx
 import pytest
@@ -44,7 +46,15 @@ def _publish_native_status(
     response.raise_for_status()
 
 
-def _seed_error_item(session_id: str, *, code: str, message: str) -> None:
+def _seed_error_item(
+    session_id: str,
+    *,
+    code: str,
+    message: str,
+    level: str | None = None,
+    title: str | None = None,
+    remediation: str | None = None,
+) -> None:
     """Append a committed ``error`` transcript item to the session's store.
 
     Mirrors ``seed_committed_turn`` but writes an error banner item, so the
@@ -54,6 +64,9 @@ def _seed_error_item(session_id: str, *, code: str, message: str) -> None:
     :param session_id: Session to append to, e.g. ``"conv_abc123"``.
     :param code: Error classifier, e.g. ``"required_terminal_exited"``.
     :param message: Raw error message stored alongside the code.
+    :param level: ``"info"`` seeds a neutral notice instead of a failure.
+    :param title: Optional card headline, e.g. ``"Signed in to Databricks"``.
+    :param remediation: Optional next step shown in the expanded body.
     :raises RuntimeError: If the server under test isn't one we spawned.
     """
     from omnigent.entities import ErrorData, NewConversationItem
@@ -73,10 +86,93 @@ def _seed_error_item(session_id: str, *, code: str, message: str) -> None:
             NewConversationItem(
                 type="error",
                 response_id="resp_seeded_error",
-                data=ErrorData(source="execution", code=code, message=message),
+                data=ErrorData(  # type: ignore[arg-type]
+                    source="execution",
+                    code=code,
+                    message=message,
+                    level=level,
+                    title=title,
+                    remediation=remediation,
+                ),
             ),
         ],
     )
+
+
+def _install_error_stream(page: Page, session_id: str) -> None:
+    """Replace this session's SSE stream with a browser-controlled stream."""
+    page.add_init_script(
+        """
+        (sessionId => {
+          const originalFetch = window.fetch.bind(window);
+          window.fetch = (input, init) => {
+            const url = typeof input === "string" ? input : input.url;
+            const streamPath = `/v1/sessions/${sessionId}/stream`;
+            if (new URL(url, window.location.origin).pathname === streamPath) {
+              const body = new ReadableStream({
+                start(controller) {
+                  window.__errorStreamController = controller;
+                },
+              });
+              return Promise.resolve(new Response(body, {
+                status: 200,
+                headers: { "content-type": "text/event-stream" },
+              }));
+            }
+            return originalFetch(input, init);
+          };
+        })(__SESSION_ID__)
+        """.replace("__SESSION_ID__", json.dumps(session_id))
+    )
+
+
+def _push_error_event(page: Page, payload: dict[str, object]) -> None:
+    """Publish one response.error frame to the browser-controlled stream."""
+    page.wait_for_function("window.__errorStreamController !== undefined")
+    page.evaluate(
+        """
+        payload => {
+          const frame = `event: response.error\\ndata: ${JSON.stringify(payload)}\\n\\n`;
+          window.__errorStreamController.enqueue(new TextEncoder().encode(frame));
+        }
+        """,
+        payload,
+    )
+
+
+def test_provider_auth_recovery_command_copies_to_clipboard(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """A provider-auth failure exposes and copies its safe recovery command."""
+    base_url, session_id = seeded_session
+    page.context.grant_permissions(["clipboard-read", "clipboard-write"], origin=base_url)
+    _install_error_stream(page, session_id)
+    page.goto(f"{base_url}/c/{session_id}")
+    expect(page.get_by_role("textbox", name="Message the agent")).to_be_visible(timeout=15_000)
+
+    _push_error_event(
+        page,
+        {
+            "source": "execution",
+            "error": {
+                "code": "PROVIDER_AUTH_REQUIRED",
+                "message": "Your Databricks model credential is unavailable or expired.",
+                "title": "Sign in to continue",
+                "cause": "Omnigent could not obtain a model credential for this session.",
+                "remediation": "ucode configure",
+            },
+        },
+    )
+
+    pill = page.get_by_test_id("error-pill")
+    expect(pill).to_contain_text("Sign in to continue", timeout=10_000)
+    pill.click()
+    copy_button = pill.get_by_role("button", name="Copy recovery command")
+    expect(copy_button).to_be_visible()
+    copy_button.click()
+    expect(pill.get_by_role("button", name="Recovery command copied")).to_be_visible()
+    assert page.evaluate("() => navigator.clipboard.readText()") == "ucode configure"
 
 
 def test_runner_disconnect_card_clears_when_the_runner_reports_a_live_status(
@@ -113,7 +209,7 @@ def test_runner_disconnect_card_clears_when_the_runner_reports_a_live_status(
     page.goto(f"{base_url}/c/{session_id}")
 
     pills = page.get_by_test_id("error-pill")
-    expect(pills).to_have_count(2, timeout=15_000)
+    expect(pills).to_have_count(1, timeout=15_000)
     disconnect_pill = page.get_by_test_id("error-pill").filter(
         has_text="The connection to the host dropped unexpectedly"
     )
@@ -189,6 +285,94 @@ def test_live_native_failure_status_surfaces_each_turn(
     second_pill = pills.nth(1)
     second_pill.locator('button[aria-expanded="false"]').click()
     expect(second_pill.get_by_test_id("error-message-content")).to_contain_text(message)
+
+
+@pytest.mark.parametrize("status_includes_output", [False, True], ids=["stored", "forwarded"])
+def test_databricks_rate_limit_is_retryable_live_and_after_reload(
+    page: Page,
+    seeded_session: tuple[str, str],
+    status_includes_output: bool,
+) -> None:
+    """A native 429 keeps its Retry action after reloading the failed turn."""
+    base_url, session_id = seeded_session
+    prompt = "Which parts are missing from this today?"
+    response_id = "native_turn_rate_limit"
+    message = (
+        "API Error: Request rejected (429) · REQUEST_LIMIT_EXCEEDED: Exceeded "
+        "workspace input tokens per minute rate limit for databricks-test-model. "
+        "Work with your Databricks account team to request a higher FMAPI rate limit tier."
+    )
+    seed_committed_turn(session_id, prompt=prompt, reply=message, response_id=response_id)
+
+    page.goto(f"{base_url}/c/{session_id}")
+    composer = page.get_by_role("textbox", name="Message the agent")
+    expect(composer).to_be_visible(timeout=15_000)
+
+    _publish_native_status(base_url, session_id, "running", response_id=response_id)
+    _publish_native_status(
+        base_url,
+        session_id,
+        "failed",
+        response_id=response_id,
+        output=message if status_includes_output else None,
+    )
+    pill = page.get_by_test_id("error-pill")
+    headline = "The model's rate limit was reached. You can retry this turn."
+    expect(pill).to_contain_text(headline, timeout=15_000)
+    expect(pill.get_by_role("button", name="Retry", exact=True)).to_be_visible()
+    pill.get_by_role("button", name=headline, exact=False).click()
+    expect(pill.get_by_test_id("error-message-content")).to_contain_text(message)
+
+    page.reload()
+    expect(pill).to_contain_text(headline, timeout=15_000)
+    expect(pill.get_by_role("button", name="Retry", exact=True)).to_be_visible()
+
+    if screenshot_dir := os.environ.get("E2E_SCREENSHOT_DIR"):
+        Path(screenshot_dir).mkdir(parents=True, exist_ok=True)
+        suffix = "forwarded" if status_includes_output else "stored"
+        page.screenshot(path=str(Path(screenshot_dir) / f"rate-limit-retry-{suffix}.png"))
+
+    retry_payloads: list[dict[str, object]] = []
+
+    def _continue_turn(route: Route) -> None:
+        payload = route.request.post_data_json
+        if not isinstance(payload, dict) or payload.get("type") not in {
+            "message",
+            "retry_session",
+        }:
+            route.continue_()
+            return
+        retry_payloads.append(payload)
+        route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps({"queued": True}),
+        )
+
+    page.route(f"**/v1/sessions/{session_id}/events", _continue_turn)
+    composer.fill("Keep this unsent draft.")
+    pill.get_by_role("button", name="Retry", exact=True).click()
+    expect(pill).to_have_count(0)
+    assert retry_payloads == [
+        {
+            "type": "message",
+            "data": {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": (
+                            "Please continue from where you left off before the rate limit error."
+                        ),
+                    }
+                ],
+            },
+        }
+    ]
+    expect(composer).to_have_value("Keep this unsent draft.")
+    expect(
+        page.locator('[data-testid="message-bubble"][data-role="user"]').filter(has_text=prompt)
+    ).to_have_count(1)
 
 
 def test_failed_turn_surfaces_error_as_pill_not_raw_text(
@@ -308,7 +492,7 @@ def test_persisted_failure_expands_retries_and_dismisses_locally(
     )
 
     # Retry triggers recovery and removes the pill rather than expanding it.
-    pill.get_by_role("button", name="Retry").click()
+    pill.get_by_role("button", name="Resume session").click()
     expect(pill).to_have_count(0)
     assert retry_payloads == [{"type": "retry_session", "data": {}}]
 
@@ -403,3 +587,134 @@ def test_error_row_divider_aligns_with_message_edges(
         f"dashed rule ends at {edges['dividerRight']:.0f}px but its row ends at "
         f"{edges['rowRight']:.0f}px"
     )
+
+
+def test_info_level_error_item_renders_as_notice_pill(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """A persisted ``error`` item with ``level: "info"`` renders as a neutral notice.
+
+    This is the codex fresh-thread fallback's notice: same pill, no failure tone,
+    headline derived from the code, and it survives reload because it is an item.
+
+    :param page: Playwright page fixture.
+    :param seeded_session: ``(base_url, session_id)`` from the local server.
+    :returns: None.
+    """
+    base_url, session_id = seeded_session
+    _seed_error_item(
+        session_id,
+        code="codex_thread_reset",
+        message="Codex could not load this session's saved transcript.",
+        level="info",
+    )
+
+    page.goto(f"{base_url}/c/{session_id}")
+
+    pill = page.locator('[data-testid="error-pill"][data-level="info"]')
+    expect(pill).to_be_visible(timeout=15_000)
+    expect(pill).to_contain_text("Codex hit an error reloading", timeout=15_000)
+    expect(page.locator('[data-testid="error-pill"][data-level="error"]')).to_have_count(0)
+
+
+def test_sign_in_card_opens_the_live_link_and_reports_when_none_is_pending(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """
+    The Databricks sign-in card fetches the link from the host at click time.
+
+    A launcher parked on a sign-in prompt fails the turn with
+    ``databricks_sign_in_pending``. The card never stores the one-time address:
+    its button asks the host what the terminal shows now. With a prompt on
+    screen it opens that address in a new tab; once nothing is pending (here,
+    the real server-to-runner round trip for a session with no terminal) it
+    closes the tab it pre-opened and says so.
+
+    :param page: Playwright page fixture.
+    :param seeded_session: ``(base_url, session_id)`` from the local server.
+    :returns: None.
+    """
+    base_url, session_id = seeded_session
+    _seed_error_item(
+        session_id,
+        code="databricks_sign_in_pending",
+        message="Codex is waiting for a sign-in in this session's terminal.",
+        title="Codex can't start until you sign in to Databricks",
+        remediation=(
+            "Open the sign-in link and sign in. Codex continues on its own once the "
+            "sign-in completes; then send your message again."
+        ),
+    )
+    page.goto(f"{base_url}/c/{session_id}")
+    pill = page.locator('[data-testid="error-pill"][data-level="error"]')
+    expect(pill).to_be_visible(timeout=15_000)
+    expect(pill.get_by_test_id("error-headline")).to_have_text(
+        "Codex can't start until you sign in to Databricks"
+    )
+    open_link = pill.get_by_role("button", name="Open sign-in link")
+    expect(open_link).to_be_visible()
+
+    # While the terminal shows a prompt, the click opens the live address.
+    live_link = f"{base_url}/v1/info"
+    pattern = f"**/v1/sessions/{session_id}/sign-in-link"
+    page.route(
+        pattern,
+        lambda route: route.fulfill(
+            json={"pending": True, "url": live_link, "code": None, "terminal_id": "t1"}
+        ),
+    )
+    with page.context.expect_page() as popup_info:
+        open_link.click()
+    popup = popup_info.value
+    popup.wait_for_url(live_link, timeout=15_000)
+    popup.close()
+    page.unroute(pattern)
+
+    # Nothing pending any more: the real host answer closes the tab and explains.
+    with page.context.expect_page() as popup_info:
+        open_link.click()
+    expect(pill.get_by_test_id("error-sign-in-note")).to_have_text(
+        "No sign-in is pending in the terminal any more. Try sending your message again.",
+        timeout=15_000,
+    )
+    closed_tab = popup_info.value
+    if not closed_tab.is_closed():
+        closed_tab.wait_for_event("close", timeout=15_000)
+    assert closed_tab.is_closed()
+
+
+def test_sign_in_completed_notice_shows_its_line_without_a_click(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """
+    The "Signed in to Databricks" notice shows what to do next without expanding.
+
+    The runner posts this ``level: "info"`` item once the launcher moved past
+    its sign-in prompt and the agent is ready. Notice pills render collapsed,
+    so this one carries its single line of body on its face; the headline
+    alone would not tell the person to resend.
+
+    :param page: Playwright page fixture.
+    :param seeded_session: ``(base_url, session_id)`` from the local server.
+    :returns: None.
+    """
+    base_url, session_id = seeded_session
+    _seed_error_item(
+        session_id,
+        code="databricks_sign_in_completed",
+        message="Codex is ready. Send your message again.",
+        level="info",
+        title="Signed in to Databricks",
+    )
+    page.goto(f"{base_url}/c/{session_id}")
+    pill = page.locator('[data-testid="error-pill"][data-level="info"]')
+    expect(pill).to_be_visible(timeout=15_000)
+    expect(pill.get_by_test_id("error-headline")).to_have_text("Signed in to Databricks")
+    expect(pill.get_by_test_id("error-notice-body")).to_have_text(
+        "Codex is ready. Send your message again."
+    )
+    expect(pill.get_by_role("button", name="Open sign-in link")).to_have_count(0)
+    expect(page.locator('[data-testid="error-pill"][data-level="error"]')).to_have_count(0)

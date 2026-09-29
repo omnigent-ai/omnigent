@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from decimal import Decimal
+from urllib.error import HTTPError
 
 import pytest
 
@@ -11,6 +12,7 @@ from issue_prioritization.github import (
     GitHubClient,
     GitHubLegacyPriorityOwnership,
     GitHubMutationSink,
+    GitHubNotFound,
 )
 from issue_prioritization.labels import LabelDefinition, LabelManifest
 from issue_prioritization.mutations import (
@@ -230,6 +232,58 @@ def test_apply_checkpoints_successful_writes_after_a_later_failure() -> None:
     assert [state.issue_number for state in states.updated] == [1]
 
 
+def test_apply_skips_an_issue_deleted_from_github() -> None:
+    # The bronze snapshot lags GitHub: #2 was deleted/transferred since
+    # ingestion, so its live re-check 404s. It must be skipped, not abort the
+    # whole apply — #1 still gets written.
+    first = BotState(1, "P2-medium", ("comp:server",))
+    second = BotState(2, "P2-medium", ("comp:server",))
+    states = FakeStates({1: first, 2: second})
+    manifest = _manifest()
+    planner = MutationPlanner(manifest, states)
+    targets = (
+        MutationPlan(MutationTarget(1, "P1-high", ("comp:db",)), (), (), (), first),
+        MutationPlan(MutationTarget(2, "P1-high", ("comp:db",)), (), (), (), second),
+    )
+    run = PipelineRun("run", PipelineMode.APPLY, datetime.now(UTC), (), 0, targets)
+
+    class DeletedIssueClient(FakeClient):
+        def issue_labels(self, issue_number):
+            if issue_number == 2:
+                raise GitHubNotFound("GitHub API GET /issues/2 failed: 404 Not Found")
+            return super().issue_labels(issue_number)
+
+    plans = GitHubMutationSink(DeletedIssueClient(), manifest, planner, states).apply_with_plans(
+        run
+    )
+
+    assert [plan.target.issue_number for plan in plans] == [1]
+    assert [state.issue_number for state in states.updated] == [1]
+
+
+def test_request_maps_404_to_not_found_and_keeps_other_errors_generic(monkeypatch) -> None:
+    import io
+
+    from issue_prioritization import github as github_module
+
+    def raise_http(code):
+        def _open(request, timeout=0):
+            raise HTTPError(request.full_url, code, "boom", {}, io.BytesIO(b"{}"))
+
+        return _open
+
+    client = GitHubClient("token", "org/repo")
+
+    monkeypatch.setattr(github_module, "urlopen", raise_http(404))
+    with pytest.raises(GitHubNotFound):
+        client.issue_data(6863)
+
+    monkeypatch.setattr(github_module, "urlopen", raise_http(500))
+    with pytest.raises(RuntimeError) as exc:
+        client.issue_data(6863)
+    assert not isinstance(exc.value, GitHubNotFound)
+
+
 def test_legacy_priority_uses_the_latest_label_actor() -> None:
     events = [
         {
@@ -349,6 +403,81 @@ def test_client_lists_and_closes_labeled_open_issues() -> None:
         "/issues/7",
         {"state": "closed", "state_reason": "not_planned"},
     ) in calls
+
+
+def test_client_lists_corpus_counts_load_and_filters_pull_requests() -> None:
+    calls = []
+
+    def transport(method, path, body):
+        calls.append((method, path, body))
+        if "state=all" in path:
+            return [
+                {"number": 1, "assignees": []},
+                {"number": 2, "pull_request": {}, "assignees": []},
+            ]
+        if "state=open" in path:
+            return [
+                {"number": 1, "assignees": [{"login": "owner"}]},
+                {"number": 2, "pull_request": {}, "assignees": [{"login": "owner"}]},
+            ]
+        raise AssertionError(path)
+
+    client = GitHubClient("token", "org/repo", transport)
+
+    assert [issue["number"] for issue in client.issue_corpus()] == [1]
+    assert client.assignee_load() == {"owner": 1}
+
+
+def test_client_posts_a_duplicate_comment_only_once() -> None:
+    comments = []
+
+    def transport(method, path, body):
+        if method == "GET":
+            return comments
+        comments.append({"id": 1, "body": body["body"]})
+        return comments[-1]
+
+    client = GitHubClient("token", "org/repo", transport)
+
+    assert client.comment_on_issue_once(7, "<!-- marker -->", "<!-- marker -->\nFirst")
+    assert not client.comment_on_issue_once(7, "<!-- marker -->", "<!-- marker -->\nSecond")
+    assert len(comments) == 1
+
+
+def test_client_assigns_and_closes_with_github_duplicate_metadata() -> None:
+    calls = []
+
+    def transport(method, path, body):
+        calls.append((method, path, body))
+        if method == "GET" and path == "/issues/7":
+            return {"node_id": "issue-node"}
+        if method == "GET" and path == "/issues/3":
+            return {"node_id": "duplicate-node"}
+        return {}
+
+    client = GitHubClient("token", "org/repo", transport)
+    client.assign_issue(7, "owner")
+    client.close_as_duplicate(7, 3)
+
+    assert ("POST", "/issues/7/assignees", {"assignees": ["owner"]}) in calls
+    graphql = next(call for call in calls if call[1] == "/graphql")
+    assert graphql[2]["variables"]["input"] == {
+        "issueId": "issue-node",
+        "stateReason": "DUPLICATE",
+        "duplicateIssueId": "duplicate-node",
+    }
+
+
+def test_client_surfaces_graphql_duplicate_closure_errors() -> None:
+    def transport(method, path, body):
+        if method == "GET":
+            return {"node_id": f"node-{path.rsplit('/', 1)[-1]}"}
+        return {"errors": [{"message": "target is unavailable"}]}
+
+    client = GitHubClient("token", "org/repo", transport)
+
+    with pytest.raises(RuntimeError, match="target is unavailable"):
+        client.close_as_duplicate(7, 3)
 
 
 def test_client_strips_token_whitespace() -> None:

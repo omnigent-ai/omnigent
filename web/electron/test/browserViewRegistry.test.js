@@ -52,6 +52,21 @@ describe("browserViewRegistry — first-navigate activation signal", () => {
     ctx = makeRegistry();
   });
 
+  it("keeps the agent view and two user tabs independent through switch and close", () => {
+    const ids = ["conv_1", "browser-tab:conv_1:first", "browser-tab:conv_1:second"];
+    for (const id of ids) ctx.registry.openOrNavigate(id, "https://example.com");
+    const views = ids.map((id) => ctx.registry.get(id).view);
+    assert.equal(new Set(views).size, 3);
+    ctx.registry.setActive(ids[1]);
+    ctx.registry.setActive(ids[2]);
+    assert.deepEqual(ctx.detached, [views[1]]);
+    ctx.registry.close(ids[1]);
+    assert.equal(ctx.registry.get(ids[1]), null);
+    assert.equal(ctx.registry.get(ids[0]).view, views[0]);
+    assert.equal(ctx.registry.get(ids[2]).view, views[2]);
+    assert.equal(ctx.registry.activeConversationId(), ids[2]);
+  });
+
   it("emits browser-view-created on first openOrNavigate for a fresh conversation", () => {
     const r = ctx.registry.openOrNavigate("conv_1", "https://example.com");
     assert.equal(r.ok, true);

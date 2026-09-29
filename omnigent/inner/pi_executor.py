@@ -46,18 +46,19 @@ import tempfile
 from asyncio import Queue, Task
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
-from typing import Any, NotRequired, TypeAlias, TypedDict, cast
+from typing import Any, NotRequired, Protocol, TypeAlias, TypedDict, cast
 from urllib.parse import urlparse as _urlparse
 
-from omnigent import model_catalog
+from omnigent.harnesses.pi_native.credentials import (
+    _databricks_workspace_url_for_gateway,
+    _is_databricks_ai_gateway_url,
+)
 from omnigent.inner.agent_env import clean_agent_env
 from omnigent.inner.native_attachments import parse_data_uri
-from omnigent.json_types import JsonObject as _JsonObject
-from omnigent.json_types import JsonValue
 from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
-from omnigent.model_metadata import ModelWireAPI
-from omnigent.onboarding.provider_config import CHAT_WIRE_API, RESPONSES_WIRE_API
-from omnigent.pi_model_compatibility import (
+from omnigent.models import model_catalog
+from omnigent.models.model_metadata import ModelWireAPI
+from omnigent.models.pi_model_compatibility import (
     SYSTEM_AI_RESPONSES_KEYWORDS,
     databricks_model_aliases,
     enrich_databricks_model_catalog,
@@ -65,19 +66,18 @@ from omnigent.pi_model_compatibility import (
     pi_model_json_entry,
     unsupported_in_pi,
 )
-from omnigent.pi_native_credentials import (
-    _databricks_workspace_url_for_gateway,
-    _is_databricks_ai_gateway_url,
-)
-from omnigent.reasoning_effort import (
+from omnigent.onboarding.provider_config import CHAT_WIRE_API, RESPONSES_WIRE_API
+from omnigent.runner.identity import OMNIGENT_SESSION_ENV_VAR
+from omnigent.spec.types import RetryPolicy
+from omnigent.util.json_types import JsonObject as _JsonObject
+from omnigent.util.json_types import JsonValue
+from omnigent.util.reasoning_effort import (
     EFFORT_CLEAR_VALUES,
     PI_EFFORTS,
     nearest_pi_thinking_level,
     to_pi_thinking_level,
     validate_effort,
 )
-from omnigent.runner.identity import OMNIGENT_SESSION_ENV_VAR
-from omnigent.spec.types import RetryPolicy
 
 from ._subprocess_lifecycle import close_subprocess_transport
 from .async_utils import run_sync_on_thread
@@ -126,13 +126,18 @@ def _fetch_shell_command_token(command: str) -> str | None:
     return token
 
 
-# Tool-server callback provided by ``Session._wire_sdk_executor``. Invoked
-# with a tool name and argument dict; may return the result dict directly
-# or a coroutine/future yielding one.
-ToolExecutor: TypeAlias = Callable[  # type: ignore[explicit-any]
-    [str, dict[str, Any]],
-    Awaitable[dict[str, Any]] | dict[str, Any],
-]
+class ToolExecutor(Protocol):
+    """Tool bridge callback carrying Pi's ID independently of stdout event order."""
+
+    def __call__(  # type: ignore[explicit-any]
+        self,
+        name: str,
+        args: dict[str, Any],
+        /,
+        *,
+        call_id: str | None = None,
+    ) -> Awaitable[dict[str, Any]] | dict[str, Any]: ...
+
 
 # Native-tool policy gate wired by :class:`PiExecutor`. Invoked with a native
 # (non-bridged) tool name + argument dict; returns ``{"block": bool, "reason":
@@ -294,7 +299,9 @@ class _ToolServer:
                     verdict = await self._evaluate_policy(raw_tool_name, tool_args)
                     response = {"id": raw_req_id, "verdict": verdict}
                 else:
-                    response = await self._execute(raw_tool_name, tool_args)
+                    raw_call_id = request.get("call_id")
+                    call_id = raw_call_id if isinstance(raw_call_id, str) and raw_call_id else None
+                    response = await self._execute(raw_tool_name, tool_args, call_id=call_id)
                     response["id"] = raw_req_id
                 # Serialize defensively: a tool result may carry a value
                 # ``json.dumps`` can't encode (e.g. ``datetime``/``set``).
@@ -327,11 +334,17 @@ class _ToolServer:
         self,
         name: str,
         args: dict[str, Any],
+        *,
+        call_id: str | None = None,
     ) -> dict[str, Any]:
         if self._tool_executor is None:
             return {"error": f"No tool executor for '{name}'"}
         try:
-            raw = self._tool_executor(name, args)
+            raw = (
+                self._tool_executor(name, args, call_id=call_id)
+                if call_id is not None
+                else self._tool_executor(name, args)
+            )
             resolved = await raw if asyncio.iscoroutine(raw) or asyncio.isfuture(raw) else raw
             if not isinstance(resolved, dict):
                 resolved = {"result": resolved}
@@ -460,7 +473,7 @@ const PORT = {port};
 const TOKEN = {token_json};
 
 /** Send a tool call request over TCP and return the result. */
-function callTool(toolName, args) {{
+function callTool(toolName, args, callId) {{
   return new Promise((resolve) => {{
     // Idempotent settle: a tool call must resolve exactly once. Route every
     // resolve through finish() so a late "close" after a real "data" response
@@ -474,7 +487,8 @@ function callTool(toolName, args) {{
     }});
     const client = net.createConnection({{ port: PORT, host: "127.0.0.1" }}, () => {{
       const id = Math.random().toString(36).slice(2);
-      const req = JSON.stringify({{ id, token: TOKEN, tool: toolName, args }}) + "\\n";
+      const frame = {{ id, token: TOKEN, tool: toolName, args, call_id: callId }};
+      const req = JSON.stringify(frame) + "\\n";
       let buf = "";
       client.on("data", (chunk) => {{
         buf += chunk.toString();
@@ -573,8 +587,8 @@ module.exports = function(pi) {{
       description: tool.description,
       promptSnippet: tool.promptSnippet || tool.description,
       parameters: tool.parameters || {{ type: "object", properties: {{}} }},
-      async execute(_toolCallId, _params, _signal, _onUpdate, _ctx) {{
-        return callTool(tool.name, _params);
+      async execute(toolCallId, _params, _signal, _onUpdate, _ctx) {{
+        return callTool(tool.name, _params, toolCallId);
       }},
     }});
   }}
@@ -640,6 +654,16 @@ _STREAM_READ_CHUNK_SIZE = 65536
 # _executor_adapter must be >= this value so the slice never fires first and
 # inject a CancelledError that bypasses the SIGKILL path.
 _RPC_SESSION_CLOSE_REAP_TIMEOUT_S = 2.0
+
+# Idle budget for one stdout read during a turn. Expiry alone never ends
+# the turn (a long tool call may stay silent past it); only a real stdout
+# EOF does. Module-level so tests can patch it.
+_TURN_STDOUT_IDLE_TIMEOUT_S = 120.0
+
+# Post-error drain budget: after an errored message the only line left to
+# consume is the already-emitted ``agent_end``. Module-level so tests can
+# patch it.
+_TURN_STDOUT_ERROR_DRAIN_TIMEOUT_S = 10.0
 
 # CLI flags whose values are sensitive (e.g. the full system prompt) and must
 # not be written to logs verbatim. The value following these flags is replaced
@@ -1006,6 +1030,7 @@ class _PiRpcSession:
         cwd: str | None = None,
         model: str | None = None,
         system_prompt: str | None = None,
+        system_prompt_mode: str = "append",
         thinking: str | None = None,
         extra_args: list[str] | None = None,
     ) -> None:
@@ -1024,8 +1049,10 @@ class _PiRpcSession:
         :param model: Pi model selector, e.g.
             ``"databricks-anthropic/gateway-model-id"``.
             ``None`` lets Pi pick its default.
-        :param system_prompt: Text appended to Pi's default system
-            prompt via ``--append-system-prompt``. ``None`` skips it.
+        :param system_prompt: Omnigent's composed instructions. ``None`` skips
+            injection in append mode; replace mode requires non-empty text.
+        :param system_prompt_mode: Append instructions to Pi's base prompt,
+            or replace it using ``--system-prompt``.
         :param thinking: Pi thinking level in Pi's own vocabulary
             (``off``/``minimal``/.../``max``), passed as ``--thinking``.
             ``None`` omits the flag so Pi's model default applies.
@@ -1045,11 +1072,13 @@ class _PiRpcSession:
             )
         if thinking:
             args.extend(["--thinking", thinking])
-        if system_prompt:
-            # Use --append-system-prompt instead of --system-prompt so Pi
-            # keeps its default prompt (which includes tool descriptions from
-            # promptSnippet and guidelines).  Using --system-prompt would
-            # replace the default prompt entirely, stripping tool awareness.
+        if system_prompt_mode == "replace":
+            if not system_prompt or not system_prompt.strip():
+                raise ValueError("system_prompt_mode='replace' requires non-empty instructions")
+            # An explicit empty append input suppresses APPEND_SYSTEM.md discovery.
+            args.extend(["--system-prompt", system_prompt, "--append-system-prompt", ""])
+        elif system_prompt:
+            # Keep Pi's tool snippets and default guidance in append mode.
             args.extend(["--append-system-prompt", system_prompt])
         if extra_args:
             args.extend(extra_args)
@@ -1167,12 +1196,28 @@ class _PiRpcSession:
                 self._line_queue.put_nowait(line)
         return result
 
-    async def read_line(self, timeout: float = 120.0) -> str | None:
-        """Read the next JSONL line from Pi's stdout. Returns None on EOF."""
+    async def read_line(self, timeout: float = _TURN_STDOUT_IDLE_TIMEOUT_S) -> str | None:
+        """Read the next JSONL line from Pi's stdout.
+
+        Returns ``None`` on EOF **or** timeout; callers that must tell
+        the two apart check :meth:`stdout_at_eof`.
+        """
         try:
             return await asyncio.wait_for(self._line_queue.get(), timeout=timeout)
         except asyncio.TimeoutError:
             return None
+
+    def stdout_at_eof(self) -> bool:
+        """Whether Pi's stdout is exhausted (process exited / pipe closed).
+
+        The background reader runs until EOF and pushes the ``None``
+        sentinel from its ``finally``, so a finished (or never-started)
+        reader means no further stdout lines can arrive, while a live
+        reader means a ``read_line`` ``None`` was only an idle timeout.
+        Also requires an empty queue so already-buffered lines are
+        drained before the stream is declared exhausted.
+        """
+        return (self._read_task is None or self._read_task.done()) and self._line_queue.empty()
 
     async def close(self) -> None:
         for task in (self._read_task, self._stderr_task):
@@ -1703,14 +1748,22 @@ class PiExecutor(Executor):
         bundle_dir: pathlib.Path | None = None,
         agent_name: str | None = None,
         skills_filter: str | list[str] = "all",
+        context_files: bool = True,
+        system_prompt_mode: str = "append",
+        preserve_model_ids: bool = False,
     ) -> None:
         """Create a PiExecutor.
 
         :param cwd: Working directory for the Pi subprocess.
+        :param context_files: Allow Pi to automatically load context files such
+            as AGENTS.md and CLAUDE.md. Explicit agent instructions are unaffected.
+        :param system_prompt_mode: ``append`` retains Pi's base prompt;
+            ``replace`` uses Omnigent's composed instructions as the base.
         :param os_env: Optional OS environment / sandbox spec.  When set, the
             Pi subprocess is wrapped in the same sandbox other
             harnesses use.
         :param model: Override the model name, e.g. ``"gateway-model-id"``.
+        :param preserve_model_ids: Keep exact IDs from a saved inference profile.
         :param pi_path: Absolute path to a ``pi`` CLI binary.  When ``None``
             the executor searches ``PATH``.
         :param gateway: When ``True``, write a ``models.json`` pointing Pi
@@ -1761,6 +1814,9 @@ class PiExecutor(Executor):
             ``--skill`` for each named bundle skill — names not
             present in the bundle are silently skipped.
         """
+        if system_prompt_mode not in ("append", "replace"):
+            raise ValueError("system_prompt_mode must be 'append' or 'replace'")
+        self._system_prompt_mode = system_prompt_mode
         resolved_pi = pi_path or _find_pi_cli()
         if not resolved_pi:
             raise ImportError(
@@ -1771,6 +1827,7 @@ class PiExecutor(Executor):
         self._cwd = cwd
         self._os_env_spec = os_env
         self._model_override = model
+        self._preserve_model_ids = preserve_model_ids
         self._gateway = gateway
         self._databricks_profile = databricks_profile
         self._gateway_host_override = gateway_host.rstrip("/") if gateway_host else None
@@ -1801,9 +1858,11 @@ class PiExecutor(Executor):
         # off (they don't route through Omnigent policies / history and
         # can 400 against the Databricks Responses API), and the bridge
         # extension's tools are explicitly allowlisted.
-        from omnigent.pi_native import pi_supports_approve
+        from omnigent.harnesses.pi_native.main import pi_supports_approve
 
         self._extra_args: list[str] = ["--no-tools"]
+        if not context_files:
+            self._extra_args.append("--no-context-files")
         if pi_supports_approve(self._pi_path):
             # Pre-accept the project-folder trust dialog. Pi 0.79+ shows a
             # blocking TUI prompt on first launch in a directory with .pi/
@@ -1999,7 +2058,7 @@ class PiExecutor(Executor):
             return model_id
         # Strip bracket suffixes (e.g. "[1m]") — context-window hints accepted
         # by the direct Anthropic API but not by the Databricks AI Gateway.
-        if model and self._gateway:
+        if model and self._gateway and not self._preserve_model_ids:
             model = re.sub(r"\[.*?\]$", "", model)
         return model
 
@@ -2359,6 +2418,7 @@ class PiExecutor(Executor):
             cwd=self._cwd,
             model=pi_model or None,
             system_prompt=system_prompt or None,
+            system_prompt_mode=self._system_prompt_mode,
             thinking=thinking,
             extra_args=extra_args or None,
         )
@@ -2477,8 +2537,20 @@ class PiExecutor(Executor):
         while True:
             # After an errored message the only thing left to drain is the
             # already-emitted agent_end, so don't wait the full idle budget.
-            line = await rpc.read_line(timeout=120.0 if pending_error is None else 10.0)
+            line = await rpc.read_line(
+                timeout=_TURN_STDOUT_IDLE_TIMEOUT_S
+                if pending_error is None
+                else _TURN_STDOUT_ERROR_DRAIN_TIMEOUT_S
+            )
             if line is None:
+                if pending_error is None and not rpc.stdout_at_eof():
+                    # Idle timeout, not process death: pi's stdout reader is
+                    # still running — e.g. a long tool call silent past the
+                    # idle budget. Keep waiting; a dead pi process delivers
+                    # a real EOF (reader finishes) instead. True hangs are
+                    # bounded by the harness-level idle watchdog.
+                    logger.debug("PiExecutor: stdout idle past budget; pi still running, waiting")
+                    continue
                 if pending_error is not None:
                     yield ExecutorError(message=pending_error)
                 elif not streamed_any and not response_text:
@@ -2532,13 +2604,22 @@ class PiExecutor(Executor):
                         yield ReasoningChunk(delta=raw_delta, event_type="reasoning_text")
                 continue
 
-            # Tool execution events.
+            # Both lifecycle events must retain the same Pi-owned correlation ID.
+            call_id = event.get("toolCallId")
+            if event_type in {"tool_execution_start", "tool_execution_end"}:
+                if not isinstance(call_id, str) or not call_id:
+                    continue
+
             if event_type == "tool_execution_start":
                 tool_name = event.get("toolName", "unknown")
                 args = event.get("args", {})
                 yield ToolCallRequest(
                     name=tool_name,
                     args=args if isinstance(args, dict) else {},
+                    metadata={
+                        "call_id": call_id,
+                        "internally_executed": not any(t.get("name") == tool_name for t in tools),
+                    },
                 )
                 continue
 
@@ -2612,6 +2693,7 @@ class PiExecutor(Executor):
                     status=status,
                     result=result,
                     error=result_str if (is_error or is_blocked) else "",
+                    metadata={"call_id": call_id},
                 )
                 continue
 

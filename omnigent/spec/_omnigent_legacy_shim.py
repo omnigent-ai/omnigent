@@ -44,9 +44,9 @@ import json
 from collections.abc import Awaitable, Mapping
 from typing import Protocol, cast
 
-from omnigent.json_types import JsonObject as _JsonObject
 from omnigent.policies.types import EvaluationContext
 from omnigent.spec.types import Phase
+from omnigent.util.json_types import JsonObject as _JsonObject
 
 # Parameter names that identify a legacy omnigent policy
 # callable — the first two positional parameters must be exactly
@@ -69,6 +69,10 @@ class _PolicyCallable(Protocol):
 class _AsyncPolicyCallable(Protocol):
     def __call__(self, *args: object, **kwargs: object) -> Awaitable[object]:
         raise NotImplementedError
+
+
+# Shared with the translator and handler allowlist.
+BUILD_PATH = f"{__name__}.build"
 
 
 # Maps Omnigent' :class:`Phase` enum to the string literal

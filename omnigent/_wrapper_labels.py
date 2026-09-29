@@ -12,7 +12,7 @@ The values are tiny string constants that need to match across at
 least four call sites. Centralizing them here lets us:
 
 * keep ``omnigent.repl._resume_picker`` decoupled from the
-  ``omnigent.claude_native`` import graph (which pulls in tmux /
+  ``omnigent.harnesses.claude_native.main`` import graph (which pulls in tmux /
   websocket code); the picker just imports this module instead;
 * fail fast in CI if a refactor diverges any of the call sites
   (see ``tests/test_wrapper_labels.py``);
@@ -77,6 +77,10 @@ QWEN_NATIVE_WRAPPER_VALUE = "qwen-native-ui"
 # Value the ``omnigent kimi`` wrapper writes into
 # ``conversations.labels[WRAPPER_LABEL_KEY]``.
 KIMI_NATIVE_WRAPPER_VALUE = "kimi-native-ui"
+
+# Value the ``omnigent devin`` wrapper writes into
+# ``conversations.labels[WRAPPER_LABEL_KEY]``.
+DEVIN_NATIVE_WRAPPER_VALUE = "devin-native-ui"
 # Value the ``omnigent hermes`` wrapper writes into
 # ``conversations.labels[WRAPPER_LABEL_KEY]``.
 HERMES_NATIVE_WRAPPER_VALUE = "hermes-native-ui"
