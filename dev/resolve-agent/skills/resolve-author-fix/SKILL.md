@@ -80,6 +80,13 @@ before writing new setup. For each separate scenario retained, name the nearest
 existing test in `test_audit` and explain why extending or parameterizing it
 would lose the required assertion, ordering, or boundary.
 
+Extend an existing scenario's seed data or inputs when that preserves its journey;
+different fixture data alone does not require a separate test. Cover an input or
+edge-case matrix once at the lowest reliable layer. Add checks at other layers
+only for a distinct failure boundary, not to repeat the same outcomes through a
+helper, store, API, and browser. Before retaining each new check, state what
+regression would escape the other selected checks if it were omitted.
+
 Retain an e2e when it protects a distinct production boundary that lower-level
 coverage would miss, and explain that boundary briefly in `test_audit`. Do not
 mock away the failure, skip configurations, or supply already-correct objects

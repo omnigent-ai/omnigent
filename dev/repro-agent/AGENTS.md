@@ -527,6 +527,9 @@ objects merely to make the test smaller.
 Assert the specific behavior observed in Step 2. Name tests by behavior, not a
 ticket number. Keep scenario-specific assertions near the test and reuse
 existing helpers; do not build a new framework for one reproduction.
+Extend an existing scenario's seed data or inputs when its journey already fits.
+Keep input/edge-case matrices at the lowest reliable layer; another layer needs
+a distinct boundary to justify repeating the same outcomes.
 For instruction-only changes, reuse applicable contract/bundle checks when
 sufficient; do not create a module that matches prose verbatim or invent a
 behavioral failure. If the journey remains unverified, report that honestly.
