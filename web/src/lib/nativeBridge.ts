@@ -164,6 +164,8 @@ export interface NativeViewModeParams {
  */
 interface ElectronDesktopApi extends NativeShellApi {
   kind: "electron";
+  /** The runner picked during onboarding for this server, returned once. */
+  takeOnboardingRunner?: () => Promise<"local" | "remote" | null>;
   /**
    * Desktop auto-update bridge — CONFIG ONLY on current shells. Update
    * notifications are shell-owned (native corner overlay + Server menu); this
@@ -842,6 +844,18 @@ export async function getHostIdentity(): Promise<HostIdentity | null> {
     return await electron.getHostIdentity();
   } catch (err) {
     console.warn("[nativeBridge] electron getHostIdentity failed:", err);
+    return null;
+  }
+}
+
+/**
+ * The runner ("local" | "remote") picked during desktop onboarding for this
+ * server, handed over once; null otherwise or outside Electron.
+ */
+export async function takeOnboardingRunner(): Promise<"local" | "remote" | null> {
+  try {
+    return (await electronApi()?.takeOnboardingRunner?.()) ?? null;
+  } catch {
     return null;
   }
 }

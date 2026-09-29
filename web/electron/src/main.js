@@ -1224,6 +1224,24 @@ function resolveConnectTarget(url, options) {
 }
 
 /**
+ * Persist the runner connected during onboarding for `serverUrl`'s origin, for
+ * the server page to take once (omnigent:take-onboarding-runner).
+ *
+ * @param {string} serverUrl
+ * @param {"local" | "remote"} runner
+ */
+function rememberOnboardingRunner(serverUrl, runner) {
+  const origin = originOf(serverUrl);
+  if (!origin) return;
+  const settings = loadSettings();
+  settings.onboarding_runner = { origin, runner, at: Date.now() };
+  saveSettings(settings);
+}
+
+/** How long a recorded onboarding runner waits for its server page to take it. */
+const ONBOARDING_RUNNER_TTL_MS = 10 * 60 * 1000;
+
+/**
  * CLI command for desktop host enrollment on `serverUrl`. Databricks-internal
  * windows use `isaac omni` behind the same effective gate as Arca (MDM flag +
  * Databricks-managed HTTPS server); every other window keeps the configured /
@@ -3213,6 +3231,7 @@ function registerIpc() {
       event.sender.once("destroyed", cancel);
       const result = await run.promise;
       event.sender.removeListener("destroyed", cancel);
+      if (result.ok) rememberOnboardingRunner(target, runner);
       return result;
     }
     const cliCommand = hostCliCommand(target);
@@ -3223,7 +3242,10 @@ function registerIpc() {
     if (!auth.ok) return { ok: false, error: auth.error };
     const result = await serverManager.ensureHostConnected(cliCommand, target);
     broadcastHostStatus();
-    if (result.ok) log("Connected this laptop.");
+    if (result.ok) {
+      log("Connected this laptop.");
+      rememberOnboardingRunner(target, runner);
+    }
     return { ok: result.ok, error: result.error };
   });
 
@@ -3581,6 +3603,22 @@ function registerIpc() {
       cliInstalled: Boolean(hostCliCommand(senderServerUrl(event))),
       hostId: omnigentCli.localHostId(),
     };
+  });
+
+  // SPA → the runner picked during onboarding for this window's server, handed
+  // over once so the new-session picker can preselect it.
+  ipcMain.handle("omnigent:take-onboarding-runner", (event) => {
+    if (!isPinnedOriginSender(event)) return null;
+    const settings = loadSettings();
+    const pending = settings.onboarding_runner;
+    if (pending?.origin !== pinnedOrigin(BrowserWindow.fromWebContents(event.sender))) return null;
+    delete settings.onboarding_runner;
+    saveSettings(settings);
+    // A choice the page never took (the user quit onboarding) goes stale.
+    if (!(typeof pending.at === "number" && Date.now() - pending.at < ONBOARDING_RUNNER_TTL_MS)) {
+      return null;
+    }
+    return pending.runner === "local" || pending.runner === "remote" ? pending.runner : null;
   });
 
   // SPA (in-app Settings → Local CLI) → is the CLI installed and runnable,

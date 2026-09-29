@@ -1088,6 +1088,18 @@ describe("managed server preference wiring", () => {
     );
   });
 
+  it("records the onboarding runner only after a successful connect", () => {
+    assert.match(
+      preloadSource,
+      /takeOnboardingRunner:\s*\(\)\s*=>\s*ipcRenderer\.invoke\("omnigent:take-onboarding-runner"\)/,
+    );
+    assert.match(liveCode, /if \(result\.ok\) rememberOnboardingRunner\(target, runner\);/);
+    assert.match(
+      liveCode,
+      /log\("Connected this laptop\."\);\s*rememberOnboardingRunner\(target, runner\);/,
+    );
+  });
+
   it("preserves a managed path while still expanding bare workspace roots", () => {
     assert.match(
       liveCode,
@@ -1933,4 +1945,36 @@ describe("onboarding runner IPC", () => {
       assert.deepEqual(plain(await pending), { ok: false, canceled: true });
     });
   }
+
+  describe("handing the runner to the server page", () => {
+    const pageEvent = (h) => ({ sender: h.webContents, senderFrame: { url: server } });
+    const settings = (h) => JSON.parse(fs.readFileSync(h.settingsPath, "utf8"));
+    const record = (h, entry) =>
+      fs.writeFileSync(h.settingsPath, JSON.stringify({ onboarding_runner: entry }));
+
+    it("hands a fresh choice to its own server once", (t) => {
+      const h = harness(t);
+      record(h, { origin: new URL(server).origin, runner: "remote", at: Date.now() });
+      const take = h.ipc.get("omnigent:take-onboarding-runner");
+      assert.equal(take(pageEvent(h)), "remote");
+      assert.equal(settings(h).onboarding_runner, undefined);
+      assert.equal(take(pageEvent(h)), null);
+    });
+
+    it("keeps another server's choice, and drops a stale one", (t) => {
+      const h = harness(t);
+      const take = h.ipc.get("omnigent:take-onboarding-runner");
+      record(h, { origin: "https://other.example", runner: "local", at: Date.now() });
+      assert.equal(take(pageEvent(h)), null);
+      assert.equal(settings(h).onboarding_runner.origin, "https://other.example");
+
+      record(h, {
+        origin: new URL(server).origin,
+        runner: "local",
+        at: Date.now() - 60 * 60 * 1000,
+      });
+      assert.equal(take(pageEvent(h)), null);
+      assert.equal(settings(h).onboarding_runner, undefined);
+    });
+  });
 });

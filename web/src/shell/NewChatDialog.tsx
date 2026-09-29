@@ -242,6 +242,7 @@ import {
 import { fetchHosts, useHostModelOptions, useHosts, type Host } from "@/hooks/useHosts";
 import { sandboxModelOptionsKey, useSandboxModelOptions } from "@/hooks/useSandboxModelOptions";
 import { useSkills } from "@/hooks/useSkills";
+import { useOnboardingRunnerHost } from "@/hooks/useOnboardingRunnerHost";
 import { readArcaHostId, writeArcaHostId } from "@/lib/arcaHost";
 import {
   connectArcaHost,
@@ -2386,6 +2387,8 @@ export function NewChatLandingScreen() {
   // Desktop-shell host status for THIS machine (null outside Electron), so the
   // picker can tag the current machine and offer to auto-connect it.
   const [desktopHost, setDesktopHost] = useState<HostIdentity | null>(null);
+  // The runner picked during desktop onboarding, preselected once it's online.
+  const onboardingHost = useOnboardingRunnerHost(hosts, desktopHost?.hostId);
   const [connectingThisMachine, setConnectingThisMachine] = useState(false);
   // Error surfaced when "Run on this machine" fails (sign-in needed, enrollment
   // declined, server unreachable). Rendered in the composer body with a retry,
@@ -2784,6 +2787,12 @@ export function NewChatLandingScreen() {
     if (!prefillSettled) return;
     if (sandboxSelected) return;
     if (selectedHostId !== null) return;
+    if (onboardingHost.pending) return;
+    if (onboardingHost.hostId) {
+      writeLastHostChoice(onboardingHost.hostId);
+      setSelectedHostId(onboardingHost.hostId);
+      return;
+    }
 
     // Read the persisted pick once, as a mount-time seed — deliberately NOT a
     // dependency: it only matters until the slot is filled, and re-running on
@@ -2831,6 +2840,8 @@ export function NewChatLandingScreen() {
     info,
     prefillSettled,
     defaultSandboxProvider,
+    onboardingHost.pending,
+    onboardingHost.hostId,
   ]);
 
   // Fall back to the host's home directory when it has no recorded recents, so

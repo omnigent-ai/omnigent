@@ -87,6 +87,9 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
     ipcRenderer.on("omnigent:open-path", listener);
     return () => ipcRenderer.removeListener("omnigent:open-path", listener);
   },
+  /** The runner picked during onboarding for this server ("local" |
+   *  "remote"), returned once, else null. */
+  takeOnboardingRunner: () => ipcRenderer.invoke("omnigent:take-onboarding-runner"),
   /**
    * Server picker data: the current origin plus organization-provided and
    * recently-connected server URLs. Resolves null off a connected server.
