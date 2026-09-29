@@ -7738,13 +7738,9 @@ _CLAUDE_LAUNCH_PERMISSION_MODES = frozenset(
 
 def _claude_launch_permission_mode(args: list[str] | None) -> str | None:
     """Return a known ``--permission-mode`` value without logging arbitrary args."""
-    launch_args = args or []
-    candidate: str | None = None
-    for index, arg in enumerate(launch_args):
-        if arg == "--permission-mode":
-            candidate = launch_args[index + 1] if index + 1 < len(launch_args) else None
-        elif arg.startswith("--permission-mode="):
-            candidate = arg.partition("=")[2]
+    from omnigent.harnesses.claude_native.bridge import _arg_value
+
+    candidate = _arg_value(tuple(args or ()), "--permission-mode")
     return candidate if candidate in _CLAUDE_LAUNCH_PERMISSION_MODES else None
 
 
@@ -7911,7 +7907,7 @@ async def _load_legacy_claude_launch_metadata(
             "claude_launch_config_loaded",
             session_id=session_id,
             metadata_source="legacy_fetch",
-            permission_mode=permission_mode,
+            **({"permission_mode": permission_mode} if permission_mode is not None else {}),
         ),
     )
     return metadata
@@ -7942,7 +7938,7 @@ async def _load_claude_launch_metadata(
             "claude_launch_config_loaded",
             session_id=session_id,
             metadata_source="init_envelope",
-            permission_mode=permission_mode,
+            **({"permission_mode": permission_mode} if permission_mode is not None else {}),
         ),
     )
     return metadata
