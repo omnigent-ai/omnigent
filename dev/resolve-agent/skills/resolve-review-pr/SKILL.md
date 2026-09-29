@@ -71,11 +71,13 @@ of the test. A passing repro alone does not prove the PR fixes the bug.
    For each change, ask whether removing it would leave the intended fix
    incomplete, incorrect, unsafe, or inadequately tested or documented.
    Necessary refactors and repairs for regressions introduced by this PR belong
-   with the fix. Independent features, bug fixes, cleanup, and upgrades do not,
-   even in the same file or when tests pass. Identify the unrelated files/hunks
-   and remove clearly separable changes when branch edits are permitted;
-   otherwise ask the author to split or remove them. Do not guess when changes
-   are entangled. Carry only in-scope work into any fork takeover.
+   with the fix. Apply **Keep the fix focused and complete** from the main
+   instructions, including its allowance for small incidental correctness or
+   robustness improvements. Other independent features, bug fixes, cleanup, and
+   upgrades do not belong, even in the same file or when tests pass. Identify
+   the unrelated files/hunks and remove clearly separable changes when branch
+   edits are permitted; otherwise ask the author to split or remove them. Do not
+   guess when changes are entangled. Carry only in-scope work into any fork takeover.
 
    Address Polly's scope findings through the ordinary review process in Step
    4.3 before approving this existing PR. Keep your own edits within the same
@@ -87,7 +89,7 @@ of the test. A passing repro alone does not prove the PR fixes the bug.
    record its `pr_url` in your output. The `outcome` reflects what you found
    (`fixed` when the PR resolves every live facet, the shared impact assessment
    has no unresolved required checks, the diff is sound, and the changes stay
-   within the reported problem;
+   within the scope rule above;
    `partially_fixed` / `not_fixed` otherwise, with specifics). **Default to
    commenting, not competing** — if the PR is close and its approach is sound,
    review it and let the author iterate; don't open a rival PR over fixable nits.

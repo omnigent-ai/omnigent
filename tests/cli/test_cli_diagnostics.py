@@ -589,6 +589,47 @@ def test_does_not_suppress_hint_for_ordinary_errors() -> None:
     assert cli_diagnostics.suppresses_recovery_hint(click.ClickException("bad")) is False
 
 
+def test_suppresses_hint_for_usage_errors() -> None:
+    """A parse-time ``click.UsageError`` (unknown command, bad flag) is never a
+    tunnel rejection, so the ``omnigent stop`` hint is withheld."""
+    import click
+
+    unknown_command = click.UsageError("No such command 'x'.")
+    assert cli_diagnostics.suppresses_recovery_hint(unknown_command) is True
+    assert cli_diagnostics.suppresses_recovery_hint(click.BadParameter("bad")) is True
+    assert cli_diagnostics.suppresses_recovery_hint(click.NoSuchOption("--bogus")) is True
+
+
+def test_main_reports_unknown_command_without_recovery_hint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``main()`` on a mistyped subcommand exits 2 with Click's usage error and
+    no stale-host recovery hint."""
+    import contextlib
+    import io
+
+    import click
+
+    import omnigent.cli as cli
+
+    monkeypatch.setattr("omnigent.cli_diagnostics.setup_cli_logging", lambda argv: None)
+
+    def _unknown_command(*_args: object, **_kwargs: object) -> None:
+        raise click.UsageError("No such command 'copilto'.")
+
+    monkeypatch.setattr(cli, "cli", _unknown_command)
+    monkeypatch.setattr(sys, "argv", ["omnigent", "copilto"])
+
+    stderr = io.StringIO()
+    with contextlib.redirect_stderr(stderr), pytest.raises(SystemExit) as excinfo:
+        cli.main()
+
+    assert excinfo.value.code == 2
+    output = stderr.getvalue()
+    assert "No such command 'copilto'." in output
+    assert "stale host processes" not in output
+
+
 def test_daemon_exit_error_carries_server_log_tail(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
