@@ -154,3 +154,16 @@ def codex_pane_confirms_permission_label(pane: str, label: str) -> bool:
     if marker_at < 0:
         return False
     return flat[marker_at + len(_PERMISSION_UPDATE_MARKER) :].lstrip().startswith(label)
+
+
+def codex_pane_shows_running_turn(pane: str) -> bool:
+    """Whether a captured Codex pane shows a turn in progress.
+
+    Codex's status row reads ``Working (12s • esc to interrupt)`` while a turn
+    runs, so an Escape sent then cancels the turn instead of closing a popup.
+    An open popup replaces that row, so the check is false while one is up.
+
+    :param pane: Visible pane text, e.g. from ``tmux capture-pane -p``.
+    :returns: ``True`` when the busy status row is visible.
+    """
+    return "esc to interrupt" in pane.lower()

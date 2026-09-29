@@ -8,6 +8,7 @@ from omnigent.codex_approval_modes import (
     CODEX_NATIVE_PERMISSION_PRESETS,
     CODEX_NATIVE_PERMISSION_VALUES,
     codex_pane_confirms_permission_label,
+    codex_pane_shows_running_turn,
     codex_permission_preset,
     codex_permission_preset_from_thread_settings,
 )
@@ -140,3 +141,13 @@ def test_pane_confirms_label_with_codex_suffix() -> None:
 def test_pane_without_echo_does_not_confirm() -> None:
     """No echo on screen means the switch is unconfirmed."""
     assert not codex_pane_confirms_permission_label("› Use /skills\n", "Ask for approval")
+
+
+def test_running_turn_detected_from_status_row() -> None:
+    """Codex's mid-turn status row marks the pane busy; an idle pane is not."""
+    busy = (
+        "• Working (26s • esc to interrupt) · 1 background terminal running\n"
+        "› Write tests for @filename\n"
+    )
+    assert codex_pane_shows_running_turn(busy)
+    assert not codex_pane_shows_running_turn(_WIDE_PANE)

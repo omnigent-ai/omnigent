@@ -7266,14 +7266,21 @@ def create_runner_app(
         # (digit 1) confirms. A settle pause between keystrokes is required — each
         # screen draws asynchronously, and typing the command then pressing Enter
         # back-to-back races the slash-menu so the command never submits.
-        from omnigent.harnesses.claude_native.bridge import _exit_pane_mode, _run_tmux
+        from omnigent.codex_approval_modes import codex_pane_shows_running_turn
+        from omnigent.harnesses.claude_native.bridge import (
+            _capture_pane,
+            _exit_pane_mode,
+            _run_tmux,
+        )
 
         # Reset to a clean composer so the command submits: leave tmux copy mode
         # (a scrolled-back pane), close any stray menu/popup, then clear the
         # line. C-u also wipes any text the TUI user was mid-typing — a rare,
-        # accepted cost for reliable injection.
+        # accepted cost for reliable injection. Mid-turn, Escape would cancel the
+        # turn instead, and /permissions opens fine without it.
         _exit_pane_mode(socket_path, target)
-        _run_tmux(socket_path, "send-keys", "-t", target, "Escape")
+        if not codex_pane_shows_running_turn(_capture_pane(socket_path, target)):
+            _run_tmux(socket_path, "send-keys", "-t", target, "Escape")
         _run_tmux(socket_path, "send-keys", "-t", target, "C-u")
         _run_tmux(socket_path, "send-keys", "-l", "-t", target, "/permissions")
         time.sleep(_CODEX_POPUP_RENDER_S)
