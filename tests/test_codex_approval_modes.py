@@ -9,6 +9,7 @@ from omnigent.codex_approval_modes import (
     CODEX_NATIVE_PERMISSION_VALUES,
     codex_permission_preset,
     codex_permission_preset_from_thread_settings,
+    codex_permission_switch_confirmed,
     codex_permissions_menu,
 )
 
@@ -172,3 +173,16 @@ def test_menu_digit_linux_default_read_only_absent() -> None:
 def test_menu_digit_windows_read_only_first() -> None:
     """On Windows, Read Only is row 1 (with a `` (current)`` suffix)."""
     assert codex_permissions_menu(_WINDOWS_POPUP)["Read Only"] == "1"
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "• Permissions updated to Full Access",
+        "• Permission selection requested: Full Access",
+    ],
+)
+def test_permission_switch_confirmation_messages(message: str) -> None:
+    """Both Codex confirmation spellings identify the selected label."""
+    assert codex_permission_switch_confirmed(message, "Full Access")
+    assert not codex_permission_switch_confirmed(message, "Read Only")

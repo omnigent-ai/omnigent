@@ -7355,14 +7355,12 @@ def create_runner_app(
         return True
 
     def _codex_permission_mode_confirmed(socket_path: str, target: str, label: str) -> bool:
+        from omnigent.codex_approval_modes import codex_permission_switch_confirmed
         from omnigent.harnesses.claude_native.bridge import _capture_pane
 
-        marker = "Permissions updated to "
         deadline = time.monotonic() + _CODEX_PERMISSION_CONFIRM_BUDGET_S
         while True:
-            pane = _capture_pane(socket_path, target)
-            updates = [line for line in pane.splitlines() if marker in line]
-            if updates and updates[-1].split(marker, 1)[1].strip() == label:
+            if codex_permission_switch_confirmed(_capture_pane(socket_path, target), label):
                 return True
             if time.monotonic() >= deadline:
                 return False

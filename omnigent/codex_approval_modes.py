@@ -84,6 +84,10 @@ def codex_permission_preset(value: str) -> CodexPermissionPreset | None:
 
 _MENU_ROW_RE = re.compile(r"^\s*(?:›\s*)?(\d+)\.\s+(.*)$")
 _CURRENT_SUFFIX_RE = re.compile(r"\s*\(current\)\s*$", re.IGNORECASE)
+_CONFIRMATION_MARKERS = (
+    "Permissions updated to ",
+    "Permission selection requested: ",
+)
 
 
 def codex_permissions_menu(pane_text: str) -> dict[str, str]:
@@ -99,6 +103,17 @@ def codex_permissions_menu(pane_text: str) -> dict[str, str]:
         if label:
             rows[label] = digit
     return rows
+
+
+def codex_permission_switch_confirmed(pane_text: str, label: str) -> bool:
+    """Return whether Codex acknowledged the latest permission selection."""
+    confirmations = [
+        line.split(marker, 1)[1].strip()
+        for line in pane_text.splitlines()
+        for marker in _CONFIRMATION_MARKERS
+        if marker in line
+    ]
+    return bool(confirmations) and confirmations[-1] == label
 
 
 # Sandbox ``type`` spellings Codex uses (the app-server ``thread/settings/updated``
