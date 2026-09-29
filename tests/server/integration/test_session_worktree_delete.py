@@ -26,8 +26,17 @@ from omnigent.host.frames import (
     HostRemoveWorktreeFrame,
     decode_host_frame,
 )
-from omnigent.host.git_worktree import create_worktree, list_worktrees, remove_worktree
+from omnigent.host.git_worktree import (
+    WorktreeError,
+    create_worktree,
+    list_worktrees,
+    remove_worktree,
+)
 from omnigent.server.auth import RESERVED_USER_LOCAL
+from omnigent.server.routes._host_worktree import (
+    WORKTREE_ROOT_LABEL_KEY,
+    worktree_root_fingerprint,
+)
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
@@ -111,12 +120,15 @@ async def _register_fake_host(
 _WORKTREE_PATH = "/Users/alice/myrepo-worktrees/feature-login"
 
 
-def _make_worktree_conversation(db_uri: str, workspace: str = _WORKTREE_PATH) -> str:
+def _make_worktree_conversation(
+    db_uri: str, workspace: str = _WORKTREE_PATH, worktree_root: str | None = _WORKTREE_PATH
+) -> str:
     """Create a session row that looks like a server-created worktree.
 
     :param db_uri: DB URI for the conversation store.
     :param workspace: Worktree path to record; defaults to the shared
         fixture path so two calls produce two sessions in one directory.
+    :param worktree_root: Recorded cleanup root, or None for a legacy session.
     :returns: The new conversation id.
     """
     conv_store = SqlAlchemyConversationStore(db_uri)
@@ -125,6 +137,11 @@ def _make_worktree_conversation(db_uri: str, workspace: str = _WORKTREE_PATH) ->
         host_id=_HOST_ID,
         workspace=workspace,
         git_branch="feature/login",
+        labels=(
+            {WORKTREE_ROOT_LABEL_KEY: worktree_root_fingerprint(worktree_root)}
+            if worktree_root is not None
+            else None
+        ),
     )
     return conv.id
 
@@ -624,7 +641,9 @@ async def test_delete_with_flag_still_succeeds_on_host_git_failure(
     assert get_resp.status_code == 404
 
 
-@pytest.mark.parametrize("change", ["rename", "delete", "replace-with-file"])
+@pytest.mark.parametrize(
+    "change", ["rename", "delete", "replace-with-file", "symlink", "symlink-to-repo"]
+)
 async def test_delete_worktree_after_workspace_disappears(
     app: FastAPI,
     client: httpx.AsyncClient,
@@ -643,7 +662,7 @@ async def test_delete_worktree_after_workspace_disappears(
     _git(repo, "add", ".")
     _git(repo, "commit", "-qm", "init")
     created = create_worktree(repo_path=str(source), branch_name="feature/login")
-    session_id = _make_worktree_conversation(db_uri, created.workspace)
+    session_id = _make_worktree_conversation(db_uri, created.workspace, created.worktree_path)
     root = Path(created.worktree_path)
     packages = root / "packages"
     if change == "rename":
@@ -652,6 +671,13 @@ async def test_delete_worktree_after_workspace_disappears(
         shutil.rmtree(packages)
         if change == "replace-with-file":
             packages.write_text("now a file")
+        elif change.startswith("symlink"):
+            target = (tmp_path / "external").resolve()
+            target.mkdir()
+            (target / "keep.txt").write_text("unrelated data")
+            if change == "symlink-to-repo":
+                _git(target, "init", "-q", "-b", "main")
+            packages.symlink_to(target, target_is_directory=True)
 
     removed: list[str] = []
 
@@ -675,12 +701,15 @@ async def test_delete_worktree_after_workspace_disappears(
     assert removed == [created.worktree_path]
     assert not root.exists()
     assert not _branch_exists(repo, created.branch)
+    if change.startswith("symlink"):
+        assert (tmp_path / "external" / "keep.txt").read_text() == "unrelated data"
 
 
 @pytest.mark.parametrize(
     ("root", "other", "in_use"),
     [
         ("/repo-worktrees/feature", "/repo-worktrees/feature/web", True),
+        ("/repo-worktrees/feature", "/repo-worktrees/Feature/web", False),
         ("/repo-worktrees/feature", "/repo-worktrees/feature-other/web", False),
         ("/repo-worktrees/feature_%", "/repo-worktrees/feature_%/web", True),
         ("/repo-worktrees/feature_%", "/repo-worktrees/feature-abc/web", False),
@@ -730,8 +759,8 @@ async def test_delete_unc_worktree_preserves_sharers_and_cleans_up_last_session(
 ) -> None:
     """UNC subdirectories share a cleanup root even with mixed separators and casing."""
     captured = await _register_fake_host(app, db_uri, worktree_path=root)
-    first = _make_worktree_conversation(db_uri, root)
-    second = _make_worktree_conversation(db_uri, workspace)
+    first = _make_worktree_conversation(db_uri, root, root)
+    second = _make_worktree_conversation(db_uri, workspace, root)
     response = await client.delete(f"/v1/sessions/{first}?delete_branch=true")
     assert response.status_code == 200, response.text
     assert captured == []
@@ -740,3 +769,69 @@ async def test_delete_unc_worktree_preserves_sharers_and_cleans_up_last_session(
     assert len(captured) == 1
     assert captured[0].worktree_path == root
     assert captured[0].delete_branch is True
+
+
+@pytest.mark.parametrize("record_root", [True, False])
+async def test_delete_does_not_remove_enclosing_worktree(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    db_uri: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    record_root: bool,
+) -> None:
+    """A missing nested checkout must never transfer cleanup to its enclosing repo."""
+    from omnigent.server.routes._host_worktree import WorktreeProxyError
+
+    await _register_fake_host(app, db_uri)
+    repo = (tmp_path / "outer").resolve()
+    repo.mkdir()
+    (repo / "keep.txt").write_text("outer data")
+    _git(repo, "init", "-q", "-b", "main")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-qm", "outer")
+    outer = create_worktree(repo_path=str(repo), branch_name="feature/login")
+    inner = Path(outer.worktree_path) / "inner"
+    source = inner / "web"
+    source.mkdir(parents=True)
+    (source / "README").write_text("inner")
+    _git(inner, "init", "-q", "-b", "main")
+    _git(inner, "add", ".")
+    _git(inner, "commit", "-qm", "inner")
+    created = create_worktree(repo_path=str(source), branch_name="feature/login")
+    session_id = _make_worktree_conversation(
+        db_uri, created.workspace, created.worktree_path if record_root else None
+    )
+    shutil.rmtree(created.worktree_path)
+    removed: list[str] = []
+
+    async def list_on_host(*, repo_path: str, **_kwargs: object) -> list[dict[str, object]]:
+        try:
+            return [asdict(tree) for tree in list_worktrees(repo_path=repo_path)]
+        except WorktreeError as exc:
+            raise WorktreeProxyError(str(exc)) from exc
+
+    async def remove_on_host(*, worktree_path: str, **_kwargs: object) -> None:
+        removed.append(worktree_path)
+
+    monkeypatch.setattr(
+        "omnigent.server.routes._host_worktree.list_worktrees_on_host", list_on_host
+    )
+    monkeypatch.setattr(
+        "omnigent.server.routes._host_worktree.remove_worktree_on_host", remove_on_host
+    )
+    response = await client.delete(f"/v1/sessions/{session_id}?delete_branch=true")
+    assert response.status_code == 200, response.text
+    assert removed == []
+    assert (Path(outer.worktree_path) / "keep.txt").exists()
+
+
+async def test_legacy_root_session_still_cleans_up(
+    app: FastAPI, client: httpx.AsyncClient, db_uri: str
+) -> None:
+    """Older sessions lack a fingerprint but may still remove their exact root."""
+    captured = await _register_fake_host(app, db_uri)
+    session_id = _make_worktree_conversation(db_uri, worktree_root=None)
+    response = await client.delete(f"/v1/sessions/{session_id}?delete_branch=true")
+    assert response.status_code == 200, response.text
+    assert [frame.worktree_path for frame in captured] == [_WORKTREE_PATH]

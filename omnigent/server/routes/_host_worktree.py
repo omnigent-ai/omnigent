@@ -10,9 +10,11 @@ host (not the server) runs git. See designs/SESSION_GIT_WORKTREE.md.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import secrets
 from dataclasses import dataclass
+from pathlib import PureWindowsPath
 
 from omnigent.host.frames import (
     HostCreateWorktreeFrame,
@@ -27,6 +29,20 @@ _logger = logging.getLogger(__name__)
 # Above the host's own git timeout (120 s) so the host's specific error
 # surfaces instead of a generic server-side timeout.
 _WORKTREE_TIMEOUT_S: float = 150.0
+
+
+WORKTREE_ROOT_LABEL_KEY = "omnigent.git.worktree_root_sha256"
+
+
+def worktree_root_fingerprint(path: str) -> str:
+    """Identify a canonical host root within the 256-character label limit.
+
+    :param path: Canonical absolute worktree root returned by the host.
+    :returns: Stable digest, normalizing Windows casing and separators.
+    """
+    if PureWindowsPath(path).is_absolute():
+        path = path.replace("\\", "/").lower()
+    return hashlib.sha256(path.rstrip("/").encode()).hexdigest()
 
 
 class WorktreeProxyError(Exception):

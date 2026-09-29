@@ -960,15 +960,30 @@ def create_hosts_router(
                     status_code=400,
                     detail="session already has a runner bound",
                 )
-            persist_task = asyncio.create_task(
-                asyncio.to_thread(
+
+            async def persist_binding() -> None:
+                """Record cleanup identity before making the new binding visible."""
+                if git_branch is not None:
+                    from omnigent.server.routes._host_worktree import (
+                        WORKTREE_ROOT_LABEL_KEY,
+                        worktree_root_fingerprint,
+                    )
+
+                    root = worktree.worktree_path if worktree is not None else workspace
+                    await asyncio.to_thread(
+                        conversation_store.set_labels,
+                        body.session_id,
+                        {WORKTREE_ROOT_LABEL_KEY: worktree_root_fingerprint(root)},
+                    )
+                await asyncio.to_thread(
                     conversation_store.set_host_id,
                     body.session_id,
                     host_id,
                     workspace,
                     git_branch,
                 )
-            )
+
+            persist_task = asyncio.create_task(persist_binding())
             try:
                 await asyncio.shield(persist_task)
             except BaseException as exc:

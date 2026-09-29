@@ -617,6 +617,12 @@ async def test_launch_runner_preserves_subdirectory_and_rolls_back_root(
     assert conv is not None
     if launch_status == "launched":
         assert conv.workspace == workspace
+        from omnigent.server.routes._host_worktree import (
+            WORKTREE_ROOT_LABEL_KEY,
+            worktree_root_fingerprint,
+        )
+
+        assert conv.labels[WORKTREE_ROOT_LABEL_KEY] == worktree_root_fingerprint(root)
         assert cap.remove == []
     else:
         assert conv.workspace is None

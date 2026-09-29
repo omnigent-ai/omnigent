@@ -9331,6 +9331,7 @@ async def _remove_session_worktree_best_effort(
     conversation_store: ConversationStore | None = None,
     exclude_conversation_id: str | None = None,
     fail_if_unavailable: bool = False,
+    expected_root_fingerprint: str | None = None,
 ) -> None:
     """
     Best-effort removal of a session's git worktree.
@@ -9360,6 +9361,8 @@ async def _remove_session_worktree_best_effort(
     :param exclude_conversation_id: The conversation whose delete triggered
         this removal, excluded from that check. Required with
         *conversation_store*.
+    :param expected_root_fingerprint: Recorded root identity; absent legacy sessions
+        may only remove their exact stored workspace.
     :param fail_if_unavailable: When ``True``, raise ``CONFLICT`` if the
         host cannot be reached to run git. Create-rollback leaves this
         ``False`` so a failed create still surfaces its original error.
@@ -9369,6 +9372,7 @@ async def _remove_session_worktree_best_effort(
         WorktreeProxyError,
         list_worktrees_on_host,
         remove_worktree_on_host,
+        worktree_root_fingerprint,
     )
     from omnigent.server.routes._workspace_validation import _is_subpath_of
 
@@ -9422,12 +9426,15 @@ async def _remove_session_worktree_best_effort(
                 host_conn=host_conn,
                 repo_path=worktree_path,
             )
+            # Missing directories can resolve inside an unrelated enclosing repository.
+            expected_root = expected_root_fingerprint or worktree_root_fingerprint(worktree_path)
             # Keep worktrees that have been repurposed for another branch or detached HEAD.
             roots = [
                 path
                 for tree in worktrees
                 if isinstance(path := tree.get("path"), str)
                 and _is_subpath_of(worktree_path, path)
+                and worktree_root_fingerprint(path) == expected_root
                 and tree.get("branch") == branch
                 and not tree.get("is_main", True)
             ]
@@ -9908,6 +9915,13 @@ def _reject_server_reserved_label_seed(labels: dict[str, str] | None) -> None:
     """
     if not labels:
         return
+    from omnigent.server.routes._host_worktree import WORKTREE_ROOT_LABEL_KEY
+
+    if WORKTREE_ROOT_LABEL_KEY in labels:
+        raise OmnigentError(
+            f"label {WORKTREE_ROOT_LABEL_KEY!r} is server-internal and cannot be set by clients",
+            code=ErrorCode.INVALID_INPUT,
+        )
     if _TURN_ACTOR_LABEL in labels:
         raise OmnigentError(
             f"label {_TURN_ACTOR_LABEL!r} is server-internal and cannot be set by clients",

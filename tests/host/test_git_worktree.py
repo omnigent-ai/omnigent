@@ -177,7 +177,9 @@ def test_create_worktree_resolves_repo_root_from_subdir(git_repo: Path, linked: 
     assert (Path(created.workspace) / "README.md").read_text() == "nested project"
     assert _current_branch(Path(created.workspace)) == "wip"
 
-    remove_worktree(worktree_path=created.workspace, branch="wip", delete_branch=True)
+    with pytest.raises(WorktreeError, match="expected worktree root"):
+        remove_worktree(worktree_path=created.workspace, branch="wip", delete_branch=True)
+    remove_worktree(worktree_path=created.worktree_path, branch="wip", delete_branch=True)
     assert not Path(created.worktree_path).exists()
     assert not _branch_exists(git_repo, "wip")
 
@@ -579,3 +581,53 @@ def test_validate_branch_name_rejects_bad(bad: str) -> None:
 def test_validate_branch_name_accepts_good(good: str) -> None:
     """Well-formed branch names pass validation."""
     validate_branch_name(good)  # must not raise
+
+
+@pytest.mark.parametrize("branch_has_directory", [True, False])
+def test_existing_branch_directory_probe_ignores_same_named_tag(
+    git_repo: Path, branch_has_directory: bool
+) -> None:
+    """Directory validation must inspect the branch that worktree add checks out."""
+    before = _rev_parse(git_repo)
+    source = git_repo / "web"
+    source.mkdir()
+    (source / "index.txt").write_text("tracked")
+    _git(git_repo, "add", ".")
+    _git(git_repo, "commit", "-m", "add web")
+    after = _rev_parse(git_repo)
+    _git(git_repo, "branch", "feature", after if branch_has_directory else before)
+    _git(git_repo, "tag", "feature", before if branch_has_directory else after)
+    if branch_has_directory:
+        created = create_worktree(
+            repo_path=str(source), branch_name="feature", existing_branch=True
+        )
+        assert Path(created.workspace).is_dir()
+        assert (
+            next(
+                tree.branch
+                for tree in list_worktrees(repo_path=created.worktree_path)
+                if tree.path == created.worktree_path
+            )
+            == "feature"
+        )
+    else:
+        with pytest.raises(WorktreeError, match="does not exist"):
+            create_worktree(repo_path=str(source), branch_name="feature", existing_branch=True)
+
+
+@pytest.mark.parametrize("replacement", ["file", "symlink"])
+def test_remove_worktree_rejects_replaced_root(git_repo: Path, replacement: str) -> None:
+    """A stale cleanup path must not remove a symlink target or raise an unhandled OS error."""
+    original = create_worktree(repo_path=str(git_repo), branch_name="original")
+    target = create_worktree(repo_path=str(git_repo), branch_name="target")
+    remove_worktree(worktree_path=original.worktree_path)
+    path = Path(original.worktree_path)
+    if replacement == "file":
+        path.write_text("replacement")
+    else:
+        path.symlink_to(target.worktree_path, target_is_directory=True)
+    with pytest.raises(WorktreeError):
+        remove_worktree(worktree_path=str(path), branch="original", delete_branch=True)
+    assert Path(target.worktree_path).is_dir()
+    assert _branch_exists(git_repo, "original")
+    assert _branch_exists(git_repo, "target")

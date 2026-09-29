@@ -502,3 +502,25 @@ async def test_create_preserves_selected_subdirectory(
     detail = await client.get(f"/v1/sessions/{response.json()['id']}")
     assert detail.status_code == 200, detail.text
     assert detail.json()["workspace"] == workspace
+    from omnigent.server.routes._host_worktree import (
+        WORKTREE_ROOT_LABEL_KEY,
+        worktree_root_fingerprint,
+    )
+
+    assert detail.json()["labels"][WORKTREE_ROOT_LABEL_KEY] == worktree_root_fingerprint(
+        f"{_SOURCE_REPO}-worktrees/worktree-1234abcd"
+    )
+
+
+async def test_create_rejects_forged_worktree_identity(
+    client: httpx.AsyncClient,
+) -> None:
+    """Clients cannot redirect the server-owned cleanup identity."""
+    from omnigent.server.routes._host_worktree import WORKTREE_ROOT_LABEL_KEY
+
+    agent = await create_test_agent(client, name="forged-root-agent")
+    response = await client.post(
+        "/v1/sessions",
+        json={"agent_id": agent["id"], "labels": {WORKTREE_ROOT_LABEL_KEY: "forged"}},
+    )
+    assert response.status_code == 400, response.text

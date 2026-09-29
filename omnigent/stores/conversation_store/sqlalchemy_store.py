@@ -5022,9 +5022,11 @@ class SqlAlchemyConversationStore(ConversationStore):
             if PureWindowsPath(workspace).is_absolute():
                 workspace = workspace.replace("\\", "/").lower()
                 workspace_column = func.lower(func.replace(workspace_column, "\\", "/"))
+            prefix = workspace.rstrip("/") + "/"
             workspace_match = or_(
                 workspace_column == workspace,
-                workspace_column.startswith(workspace.rstrip("/") + "/", autoescape=True),
+                # SQLite LIKE ignores ASCII case even for case-sensitive POSIX paths.
+                func.substr(workspace_column, 1, len(prefix)) == prefix,
             )
         with self._session("check_workspace_used_by_other_session") as meta_sess:
             candidate_ids = list(

@@ -239,6 +239,11 @@ def list_worktrees(*, repo_path: str) -> list[WorktreeInfo]:
         inside a git work tree, or if ``git worktree list`` fails.
     """
     search_path = Path(repo_path)
+    # A replaced directory must not redirect Git discovery through its symlink target.
+    for ancestor in reversed((search_path, *search_path.parents)):
+        if ancestor.is_symlink():
+            search_path = ancestor.parent
+            break
     while not search_path.is_dir() and search_path.parent != search_path:
         search_path = search_path.parent
     repo_root = _main_work_tree(str(search_path))
@@ -467,7 +472,7 @@ def create_worktree(
     if base_branch is not None:
         _ensure_base_resolvable(repo_root, base_branch)
     if relative_directory:
-        revision = branch_name if existing_branch else (base_branch or "HEAD")
+        revision = f"refs/heads/{branch_name}" if existing_branch else (base_branch or "HEAD")
         directory = _run_git(
             ["cat-file", "-t", f"{revision}:{relative_directory.rstrip('/')}"], cwd=repo_root
         )
@@ -544,8 +549,8 @@ def remove_worktree(
     still checked out in a linked worktree. ``git worktree remove``
     refuses to remove the main work tree.
 
-    :param worktree_path: Absolute path inside the worktree to remove,
-        e.g. ``"/Users/alice/myrepo-worktrees/feature-login/web"``.
+    :param worktree_path: Canonical absolute root of the worktree to remove,
+        e.g. ``"/Users/alice/myrepo-worktrees/feature-login"``.
     :param branch: Branch to delete when ``delete_branch`` is
         ``True``, e.g. ``"feature/login"``. ``None`` skips branch
         deletion.
@@ -554,10 +559,16 @@ def remove_worktree(
     :raises WorktreeError: If the worktree path is missing/invalid, or
         a git command fails.
     """
+    if not Path(worktree_path).exists():
+        raise WorktreeError(f"worktree path does not exist: {worktree_path}")
+    if not Path(worktree_path).is_dir():
+        raise WorktreeError(f"worktree path is not a directory: {worktree_path}")
     main_repo = _main_repo_for_worktree(worktree_path)
     root = _run_git(["rev-parse", "--show-toplevel"], cwd=worktree_path)
     if root.returncode != 0:
         raise _git_error("could not resolve worktree root", root)
+    if os.path.normcase(root.stdout.strip()) != os.path.normcase(os.path.abspath(worktree_path)):
+        raise WorktreeError(f"path is not the expected worktree root: {worktree_path}")
     remove_result = _run_git(
         ["worktree", "remove", "--force", root.stdout.strip()],
         cwd=main_repo,
