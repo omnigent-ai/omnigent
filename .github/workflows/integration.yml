@@ -16,11 +16,12 @@ on:
     # Security Gate via rerun-security-gate.yml, so label churn need not re-run
     # the heavy integration suite. (#399 added these for the gate; superseded.)
     types: [opened, synchronize, reopened, ready_for_review]
-    paths-ignore: ['web/**', 'tests/e2e_ui/**']
+    paths-ignore: ['web/**', 'tests/e2e_ui/**', 'tests/browser_ui/**', 'CHANGELOG.md']
   workflow_dispatch:
 
 permissions:
   contents: read
+  pull-requests: read
 
 env:
   # No web SPA build during `uv sync`: this job never serves the bundle
@@ -44,11 +45,14 @@ jobs:
   gate:
     uses: ./.github/workflows/security-gate.yml
 
-  # Harness matrix (integration-matrix.sh). Fork PRs run by default; draft PRs
-  # resolve to an empty matrix.
+  select-suites:
+    needs: gate
+    uses: ./.github/workflows/select-test-suites.yml
+
+  # Empty matrices skip draft PRs and known automation-only diffs.
   setup:
     name: setup
-    needs: gate
+    needs: select-suites
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
@@ -66,6 +70,7 @@ jobs:
       - name: Compute integration matrix
         id: matrix
         env:
+          RUN_PRODUCT: ${{ needs.select-suites.outputs.product }}
           EVENT_NAME: ${{ github.event_name }}
           IS_DRAFT: ${{ github.event.pull_request.draft }}
         run: bash .github/scripts/ci/integration-matrix.sh

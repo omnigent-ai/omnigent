@@ -4,22 +4,21 @@
 # -- the point of the indirection: a job-level `if:` skip would instead leave a
 # check-run with an unexpanded `E2E Tests (shard ${{ matrix.shard_id }}/...)` name.
 #
-# Skips only draft PRs. These suites are mock-LLM (no secrets), so fork PRs run
-# directly, like CI.
+# Skips draft PRs and known automation-only changes. Mock suites also run on forks.
 #
-# Env in:  EVENT_NAME, IS_DRAFT, NUM_SHARDS.
+# Env in:  RUN_PRODUCT (defaults to true), EVENT_NAME, IS_DRAFT, NUM_SHARDS.
 # Shared by e2e.yml and e2e-ui.yml (differ in NUM_SHARDS).
 
 set -euo pipefail
 
 skip=false
-if [[ "${IS_DRAFT:-false}" == "true" ]]; then
+if [[ "${IS_DRAFT:-false}" == "true" || "${RUN_PRODUCT:-true}" == "false" ]]; then
   skip=true
 fi
 
 if [[ "$skip" == "true" ]]; then
   echo 'matrix={"include":[]}' >> "$GITHUB_OUTPUT"
-  echo "skip: empty matrix (event=$EVENT_NAME draft=${IS_DRAFT:-})"
+  echo "skip: empty matrix (event=$EVENT_NAME draft=${IS_DRAFT:-} product=${RUN_PRODUCT:-true})"
   exit 0
 fi
 

@@ -23,7 +23,7 @@ on:
     # (rerun-security-gate-run.yml falls back to this trigger). The concurrency
     # group key isolates label events so they never cancel a code-push run.
     types: [opened, synchronize, reopened, ready_for_review, labeled, unlabeled]
-    paths-ignore: ['web/**', 'tests/e2e_ui/**', 'CHANGELOG.md']
+    paths-ignore: ['web/**', 'tests/e2e_ui/**', 'tests/browser_ui/**', 'CHANGELOG.md']
   workflow_dispatch:
     inputs:
       parallelism:
@@ -40,6 +40,7 @@ concurrency:
 
 permissions:
   contents: read
+  pull-requests: read
 
 env:
   # No web SPA build during `uv sync`: this job never serves the
@@ -64,11 +65,14 @@ jobs:
       github.event.label.name == 'skip-security-scan'
     uses: ./.github/workflows/security-gate.yml
 
-  # Shard matrix (e2e-shard-matrix.sh, shared with e2e-ui.yml). Fork PRs run by
-  # default; draft PRs resolve to an empty matrix.
+  select-suites:
+    needs: gate
+    uses: ./.github/workflows/select-test-suites.yml
+
+  # Empty matrices skip draft PRs and known automation-only diffs.
   setup:
     name: setup
-    needs: gate
+    needs: select-suites
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
@@ -84,6 +88,7 @@ jobs:
       - name: Compute shard matrix
         id: matrix
         env:
+          RUN_PRODUCT: ${{ needs.select-suites.outputs.product }}
           EVENT_NAME: ${{ github.event_name }}
           IS_DRAFT: ${{ github.event.pull_request.draft }}
           NUM_SHARDS: "4"

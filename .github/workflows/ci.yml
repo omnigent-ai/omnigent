@@ -23,6 +23,7 @@ on:
 
 permissions:
   contents: read
+  pull-requests: read
 
 env:
   # No web SPA build during `uv sync`; this job never serves the bundle.
@@ -40,10 +41,37 @@ jobs:
   gate:
     uses: ./.github/workflows/security-gate.yml
 
+  select-suites:
+    needs: gate
+    uses: ./.github/workflows/select-test-suites.yml
+
+  polly-script-tests:
+    name: Polly script tests
+    needs: select-suites
+    if: ${{ !github.event.pull_request.draft && needs.select-suites.outputs.product == 'false' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version-file: ".python-version"
+      - uses: ./.github/actions/setup-uv
+      - name: Install locked test dependencies
+        run: uv sync --locked --only-group test
+      - name: Test Polly review automation
+        run: >-
+          uv run --no-sync pytest --confcutdir=tests/scripts -o addopts=
+          tests/scripts/test_polly_review_summary.py
+          tests/scripts/test_polly_review_prompt.py
+          tests/scripts/test_polly_review_output.py
+          tests/scripts/test_polly_review_trigger.py
+          -q
+
   pytest:
     name: Pytest (${{ matrix.group }})
-    needs: gate
-    if: ${{ !github.event.pull_request.draft }}
+    needs: select-suites
+    if: ${{ !github.event.pull_request.draft && needs.select-suites.outputs.product != 'false' }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     strategy:
@@ -253,8 +281,8 @@ jobs:
 
   stores-postgres:
     name: Pytest (stores-postgres)
-    needs: gate
-    if: ${{ !github.event.pull_request.draft }}
+    needs: select-suites
+    if: ${{ !github.event.pull_request.draft && needs.select-suites.outputs.product != 'false' }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     services:
@@ -301,8 +329,8 @@ jobs:
   # postgres/mysql lanes. The full version matrix runs locally via `just crdb-test`.
   stores-cockroachdb:
     name: Pytest (stores-crdb-${{ matrix.crdb_version }})
-    needs: gate
-    if: ${{ !github.event.pull_request.draft }}
+    needs: select-suites
+    if: ${{ !github.event.pull_request.draft && needs.select-suites.outputs.product != 'false' }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     strategy:
@@ -350,8 +378,8 @@ jobs:
 
   stores-mysql:
     name: Pytest (stores-mysql)
-    needs: gate
-    if: ${{ !github.event.pull_request.draft }}
+    needs: select-suites
+    if: ${{ !github.event.pull_request.draft && needs.select-suites.outputs.product != 'false' }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     services:
@@ -398,8 +426,8 @@ jobs:
 
   codex-parity:
     name: Pytest (codex-parity)
-    needs: gate
-    if: ${{ !github.event.pull_request.draft }}
+    needs: select-suites
+    if: ${{ !github.event.pull_request.draft && needs.select-suites.outputs.product != 'false' }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
