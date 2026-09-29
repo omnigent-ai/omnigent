@@ -114,3 +114,39 @@ def test_title_then_tool_turn_over_http(mock_http_url, endpoint, stream, tool_na
         assert "toolu_skill" not in wrapup.text
         captured = client.get("/mock/requests").json()["requests"]
         assert captured == [title_body, agent_body, agent_body]
+
+
+@pytest.mark.parametrize("guard", [{}, {"required_tools": ["probe__echo"]}])
+def test_unadvertised_tool_still_reaches_allowlist_test_over_http(mock_http_url, guard):
+    """Allowlist tests must receive their deliberately unadvertised tool call."""
+    with httpx.Client(base_url=mock_http_url, trust_env=False, timeout=5.0) as client:
+        client.post("/mock/reset").raise_for_status()
+        client.post(
+            "/mock/configure",
+            json={
+                "key": "sidecar-allowlist",
+                **guard,
+                "responses": [
+                    {
+                        "tool_calls": [
+                            {
+                                "call_id": "forbidden-call",
+                                "name": "probe__danger",
+                                "arguments": "{}",
+                            }
+                        ]
+                    }
+                ],
+            },
+        ).raise_for_status()
+        request = {"model": "sidecar-allowlist", "input": "Run the tool on this turn."}
+        title = client.post("/v1/responses", json=request)
+        title.raise_for_status()
+        assert "forbidden-call" not in title.text
+        agent = client.post(
+            "/v1/responses",
+            json={**request, "tools": [{"type": "function", "name": "probe__echo"}]},
+        )
+        agent.raise_for_status()
+        assert "forbidden-call" in agent.text
+        assert "probe__danger" in agent.text

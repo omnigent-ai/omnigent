@@ -844,17 +844,18 @@ class _ResponseQueue:
         self.required_tools: frozenset[str] | None = None
 
     def accepts_tools(self, tool_names: set[str]) -> bool:
-        """Keep the next tool response for a caller that can execute it.
+        """Keep scripted tool calls out of requests without any tools.
 
         Explicit guards cover the whole queue; an empty guard deliberately
-        permits unavailable tool calls. Otherwise infer from only the next
-        entry, leaving text, errors and exhausted-queue fallbacks unrestricted.
+        permits calls even without tools. Otherwise only require a tool surface:
+        negative tests may deliberately call an unadvertised tool. Text, errors
+        and exhausted-queue fallbacks remain unrestricted.
         """
         if self.required_tools is not None:
             return self.required_tools <= tool_names
         if self.index < len(self.responses):
             calls = self.responses[self.index].tool_calls or []
-            return {call["name"] for call in calls} <= tool_names
+            return not calls or bool(tool_names)
         return True
 
     def next(self) -> QueuedResponse:
@@ -1452,11 +1453,12 @@ async def configure(request: Request) -> dict[str, object]:
     If the model/default queue fails the guard, return the generic
     "Mock LLM response" without consuming that queue.
 
-    When ``required_tools`` is omitted, infer a guard from the next response's
-    ``tool_calls`` so a no-tools title request cannot consume an agent's call.
-    This does not guard text entries or the fallback. Set ``required_tools: []``
-    to opt out when deliberately testing calls to unadvertised tools; a nonempty
-    explicit guard still takes precedence over inference.
+    When ``required_tools`` is omitted, the next ``tool_calls`` response requires
+    a request with at least one advertised tool, so a no-tools title request
+    cannot consume it. Names need not match: negative tests can still call an
+    excluded tool. This does not guard text entries or the fallback. Set
+    ``required_tools: []`` to also permit calls on requests with no tools.
+    A nonempty explicit guard still takes precedence over inference.
 
     Multiple calls with different keys accumulate queues; use
     ``POST /mock/reset`` to clear all keys.

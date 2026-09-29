@@ -680,8 +680,8 @@ def configure_mock_llm(
         content-based routing (in addition to model-name routing).
     :param required_tools: Only consume responses when these tools are advertised.
         Use this to exclude title-generation requests containing the same nonce.
-        When omitted, the server guards the next scripted tool call using its
-        tool names. Pass an empty list to allow intentionally unadvertised calls.
+        When omitted, the next scripted tool call requires a request with any
+        tools. Pass an empty list to allow calls even on requests without tools.
     """
     body: dict[str, Any] = {"responses": responses}
     if key is not None:

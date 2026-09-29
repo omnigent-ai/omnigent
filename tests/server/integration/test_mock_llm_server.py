@@ -346,8 +346,8 @@ def test_unspecified_guard_preserves_next_tool_call_for_capable_request(monkeypa
             },
         ).json()["key"]
         body = {"model": "native-model", "input": "user-nonce"}
-        for tools in ([], [{"name": "Read"}]):
-            response = client.post("/v1/responses", json={**body, "tools": tools})
+        for no_tools in ({}, {"tools": []}):
+            response = client.post("/v1/responses", json={**body, **no_tools})
             assert "skill-call" not in response.text
             assert mock_llm_server._state.queues[key].index == 0
         response = client.post("/v1/responses", json={**body, "tools": [{"name": "Skill"}]})
@@ -377,19 +377,20 @@ def test_explicit_guard_allows_intentionally_unadvertised_tool(monkeypatch, requ
         assert "bad-call" in response.text
 
 
-def test_inferred_guard_requires_all_tools_and_tracks_next_response():
+def test_inferred_guard_preserves_unadvertised_calls_and_tracks_next_response():
     state = MockState()
     queue = state.get_queue("default")
     queue.responses = [
         mock_llm_server.QueuedResponse(tool_calls=[{"name": "Read"}, {"name": "Write"}]),
         mock_llm_server.QueuedResponse(tool_calls=[{"name": "Skill"}]),
     ]
-    assert state.resolve_queue_for_request({"tools": [{"name": "Read"}]}) is not queue
+    assert state.resolve_queue_for_request({"tools": []}) is not queue
     assert queue.index == 0
-    first = state.resolve_queue_for_request({"tools": [{"name": "Read"}, {"name": "Write"}]})
+    # Deliberately unavailable calls still reach tests of tool-not-found behavior.
+    first = state.resolve_queue_for_request({"tools": [{"name": "Read"}]})
     assert first is queue
     first.next()
-    assert state.resolve_queue_for_request({"tools": [{"name": "Read"}]}) is not queue
+    assert state.resolve_queue_for_request({"tools": []}) is not queue
     assert state.resolve_queue_for_request({"tools": [{"name": "Skill"}]}) is queue
 
 
