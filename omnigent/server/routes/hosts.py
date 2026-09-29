@@ -892,7 +892,7 @@ def create_hosts_router(
             )
             await asyncio.to_thread(conversation_store.clear_host_binding, body.session_id)
             try:
-                if worktree is not None:
+                if worktree is not None or (body.git is not None and body.git.existing_worktree):
                     from omnigent.server.routes._host_worktree import WORKTREE_ROOT_LABEL_KEY
 
                     previous_root = target.conv.labels.get(WORKTREE_ROOT_LABEL_KEY)
@@ -993,6 +993,22 @@ def create_hosts_router(
                         body.session_id,
                         {WORKTREE_ROOT_LABEL_KEY: worktree_root_fingerprint(root)},
                     )
+                elif body.git is not None and body.git.existing_worktree:
+                    from omnigent.server.routes._host_worktree import (
+                        WORKTREE_ROOT_LABEL_KEY,
+                        recorded_worktree_root,
+                    )
+
+                    fingerprint = target.conv.labels.get(WORKTREE_ROOT_LABEL_KEY)
+                    if (
+                        fingerprint is not None
+                        and recorded_worktree_root(workspace, fingerprint) is None
+                    ):
+                        await asyncio.to_thread(
+                            conversation_store.delete_label,
+                            body.session_id,
+                            WORKTREE_ROOT_LABEL_KEY,
+                        )
                 await asyncio.to_thread(
                     conversation_store.set_host_id,
                     body.session_id,

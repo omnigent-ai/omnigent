@@ -844,3 +844,36 @@ async def test_legacy_root_session_still_cleans_up(
     response = await client.delete(f"/v1/sessions/{session_id}?delete_branch=true")
     assert response.status_code == 200, response.text
     assert [frame.worktree_path for frame in captured] == [_WORKTREE_PATH]
+
+
+async def test_cleanup_uses_one_sharing_lookup_for_recorded_root(
+    app: FastAPI, client: httpx.AsyncClient, db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Root recovery must reuse the existing sharer lookup rather than add a second scan."""
+    captured = await _register_fake_host(app, db_uri)
+    session_id = _make_worktree_conversation(db_uri, f"{_WORKTREE_PATH}/web")
+    calls: list[tuple[str, bool]] = []
+    original = SqlAlchemyConversationStore.has_other_live_session_in_workspace
+
+    def check(
+        self: SqlAlchemyConversationStore,
+        *,
+        host_id: str,
+        workspace: str,
+        exclude_conversation_id: str,
+        include_subdirectories: bool = False,
+    ) -> bool:
+        calls.append((workspace, include_subdirectories))
+        return original(
+            self,
+            host_id=host_id,
+            workspace=workspace,
+            exclude_conversation_id=exclude_conversation_id,
+            include_subdirectories=include_subdirectories,
+        )
+
+    monkeypatch.setattr(SqlAlchemyConversationStore, "has_other_live_session_in_workspace", check)
+    response = await client.delete(f"/v1/sessions/{session_id}?delete_branch=true")
+    assert response.status_code == 200, response.text
+    assert calls == [(_WORKTREE_PATH, True)]
+    assert len(captured) == 1

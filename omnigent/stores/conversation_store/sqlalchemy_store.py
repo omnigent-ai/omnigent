@@ -5013,7 +5013,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         table (Omnigent DB) while ``archived`` lives on ``conversations`` (AP
         DB, which may be a separate engine), so they cannot be joined. They
         are ordered so the overwhelmingly common answer — nothing else is in
-        the directory — costs a single indexed query and returns before the AP
+        the directory — costs a single metadata query and returns before the AP
         DB is touched at all.
         """
         workspace_column: ColumnElement[str | None] = SqlConversationMetadata.workspace.expression

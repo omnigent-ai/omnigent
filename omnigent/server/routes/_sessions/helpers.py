@@ -9371,6 +9371,7 @@ async def _remove_session_worktree_best_effort(
         WorktreeHostUnavailableError,
         WorktreeProxyError,
         list_worktrees_on_host,
+        recorded_worktree_root,
         remove_worktree_on_host,
         worktree_root_fingerprint,
     )
@@ -9383,11 +9384,18 @@ async def _remove_session_worktree_best_effort(
     # reachability so an offline host does not 409 a delete that would not
     # have touched the directory anyway.
     if conversation_store is not None and exclude_conversation_id is not None:
+        cleanup_root = recorded_worktree_root(worktree_path, expected_root_fingerprint)
+        if cleanup_root is None:
+            _logger.warning(
+                "Workspace %s no longer matches its recorded cleanup root", worktree_path
+            )
+            return
         shared = await asyncio.to_thread(
             conversation_store.has_other_live_session_in_workspace,
             host_id=host_id,
-            workspace=worktree_path,
+            workspace=cleanup_root,
             exclude_conversation_id=exclude_conversation_id,
+            include_subdirectories=True,
         )
         if shared:
             _logger.info(
@@ -9445,16 +9453,6 @@ async def _remove_session_worktree_best_effort(
                 )
                 return
             worktree_path = max(roots, key=len)
-            shared = await asyncio.to_thread(
-                conversation_store.has_other_live_session_in_workspace,
-                host_id=host_id,
-                workspace=worktree_path,
-                exclude_conversation_id=exclude_conversation_id,
-                include_subdirectories=True,
-            )
-            if shared:
-                _logger.info("Keeping worktree %s: another session uses it", worktree_path)
-                return
         await remove_worktree_on_host(
             host_registry=host_registry,
             host_conn=host_conn,

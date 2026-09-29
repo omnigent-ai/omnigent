@@ -14,7 +14,7 @@ import hashlib
 import logging
 import secrets
 from dataclasses import dataclass
-from pathlib import PureWindowsPath
+from pathlib import PurePosixPath, PureWindowsPath
 
 from omnigent.host.frames import (
     HostCreateWorktreeFrame,
@@ -43,6 +43,30 @@ def worktree_root_fingerprint(path: str) -> str:
     if PureWindowsPath(path).is_absolute():
         path = path.replace("\\", "/").lower()
     return hashlib.sha256(path.rstrip("/").encode()).hexdigest()
+
+
+def recorded_worktree_root(workspace: str, fingerprint: str | None) -> str | None:
+    """Recover the recorded root from canonical workspace ancestors.
+
+    :param workspace: Stored canonical session directory on the host.
+    :param fingerprint: Recorded root digest, absent for legacy root sessions.
+    :returns: Matching root, or None when the directory belongs to another worktree.
+    """
+    if fingerprint is None:
+        return workspace
+    path = (
+        PureWindowsPath(workspace)
+        if PureWindowsPath(workspace).is_absolute()
+        else PurePosixPath(workspace)
+    )
+    return next(
+        (
+            str(parent)
+            for parent in (path, *path.parents)
+            if worktree_root_fingerprint(str(parent)) == fingerprint
+        ),
+        None,
+    )
 
 
 class WorktreeProxyError(Exception):

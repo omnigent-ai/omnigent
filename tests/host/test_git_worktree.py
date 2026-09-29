@@ -682,3 +682,49 @@ def test_directory_validation_survives_revision_moving(
         assert Path(created.workspace).is_dir()
         assert _rev_parse(Path(created.worktree_path)) == validated
     assert moved
+
+
+@pytest.mark.parametrize("auto_track", ["true", "false", "always", "simple", "inherit"])
+def test_subdirectory_creation_preserves_remote_tracking(git_repo: Path, auto_track: str) -> None:
+    """Pinned checkouts retain Git's native tracking policy for the requested start ref."""
+    source = git_repo / "web"
+    source.mkdir()
+    (source / "index.txt").write_text("tracked")
+    _git(git_repo, "add", ".")
+    _git(git_repo, "commit", "-m", "web")
+    _git(git_repo, "remote", "add", "origin", str(git_repo))
+    _git(git_repo, "fetch", "origin")
+    _git(git_repo, "config", "branch.autoSetupMerge", auto_track)
+    root_created = create_worktree(
+        repo_path=str(git_repo), branch_name="root-pick", base_branch="origin/main"
+    )
+    nested_created = create_worktree(
+        repo_path=str(source), branch_name="nested-pick", base_branch="origin/main"
+    )
+    root_upstream = _rev_parse(Path(root_created.worktree_path), "@{upstream}")
+    nested_upstream = _rev_parse(Path(nested_created.worktree_path), "@{upstream}")
+    assert nested_upstream == root_upstream
+    assert Path(nested_created.workspace).is_dir()
+
+
+def test_failed_pinned_checkout_removes_new_worktree_and_branch(
+    git_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Failure to populate a new checkout must not leave a branch or worktree behind."""
+    source = git_repo / "web"
+    source.mkdir()
+    (source / "index.txt").write_text("tracked")
+    _git(git_repo, "add", ".")
+    _git(git_repo, "commit", "-m", "web")
+    real_run = git_worktree_module._run_git
+
+    def fail_checkout(args: list[str], *, cwd: str) -> subprocess.CompletedProcess[str]:
+        if args[:2] == ["checkout", "--force"]:
+            return subprocess.CompletedProcess(args, 1, "", "checkout failed")
+        return real_run(args, cwd=cwd)
+
+    monkeypatch.setattr(git_worktree_module, "_run_git", fail_checkout)
+    with pytest.raises(WorktreeError, match="could not check out validated"):
+        create_worktree(repo_path=str(source), branch_name="new")
+    assert not _branch_exists(git_repo, "new")
+    assert len(list_worktrees(repo_path=str(git_repo))) == 1

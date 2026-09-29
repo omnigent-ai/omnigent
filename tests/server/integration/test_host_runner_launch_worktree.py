@@ -637,8 +637,14 @@ async def test_launch_runner_preserves_subdirectory_and_rolls_back_root(
         assert conv.labels.get(WORKTREE_ROOT_LABEL_KEY) == previous_root
 
 
+@pytest.mark.parametrize("different_worktree", [True, False])
+@pytest.mark.parametrize("launch_status", ["launched", "failed"])
 async def test_bind_existing_subdirectory_preserves_inherited_cleanup_root(
-    register_host: RegisterHost, client: httpx.AsyncClient, db_uri: str
+    register_host: RegisterHost,
+    client: httpx.AsyncClient,
+    db_uri: str,
+    different_worktree: bool,
+    launch_status: str,
 ) -> None:
     """Binding a fork in the same directory keeps its source's cleanup identity."""
     from omnigent.server.routes._host_worktree import (
@@ -646,7 +652,8 @@ async def test_bind_existing_subdirectory_preserves_inherited_cleanup_root(
         worktree_root_fingerprint,
     )
 
-    cap = register_host()
+    cap = register_host(launch_status=launch_status)
+    workspace = "/other-worktree" if different_worktree else f"{_SOURCE_REPO}/web"
     session_id = await _bare_session(client, "bind-existing-subdir")
     store = SqlAlchemyConversationStore(db_uri)
     expected = worktree_root_fingerprint(_SOURCE_REPO)
@@ -655,13 +662,16 @@ async def test_bind_existing_subdirectory_preserves_inherited_cleanup_root(
         f"/v1/hosts/{_HOST_ID}/runners",
         json={
             "session_id": session_id,
-            "workspace": f"{_SOURCE_REPO}/web",
+            "workspace": workspace,
             "git": {"branch_name": "feature/login", "existing_worktree": True},
         },
     )
-    assert response.status_code == 200, response.text
+    assert response.status_code == (200 if launch_status == "launched" else 502), response.text
     conv = store.get_conversation(session_id)
     assert conv is not None
-    assert conv.labels[WORKTREE_ROOT_LABEL_KEY] == expected
-    assert conv.workspace == f"{_SOURCE_REPO}/web"
+    if different_worktree and launch_status == "launched":
+        assert WORKTREE_ROOT_LABEL_KEY not in conv.labels
+    else:
+        assert conv.labels[WORKTREE_ROOT_LABEL_KEY] == expected
+    assert conv.workspace == (workspace if launch_status == "launched" else None)
     assert cap.create == []
