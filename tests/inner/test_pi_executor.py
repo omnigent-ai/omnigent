@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
+from urllib.parse import urlparse
 
 import pytest
 
@@ -29,9 +30,11 @@ from omnigent.inner.executor import (
 )
 from omnigent.inner.pi_executor import (
     PiExecutor,
+    PiSubprocessConfig,
     _build_models_json,
     _databricks_model_wire_catalog,
     _generate_extension_js,
+    _only_configured_family,
     _pi_provider_for_model,
     _PiRpcSession,
     _redact_argv_for_log,
@@ -737,6 +740,127 @@ def test_openai_only_family_routes_claude_named_model_to_openai_surface():
     assert "claude-k2.7" in completions_ids
     anthropic_ids = [e.get("id") for e in p["databricks-anthropic"]["models"]]
     assert "claude-k2.7" not in anthropic_ids
+
+
+def test_databricks_claude_only_gateway_keeps_gpt_on_responses_surface():
+    # The cli-config Databricks path serializes only the gateway's Anthropic
+    # surface (workflow._apply_cli_config_databricks_to_pi), yet the same
+    # workspace serves GPT on the derived /ai-gateway/codex/v1 Responses
+    # surface. One *serialized* family is not one *served* surface there, so
+    # a lone Databricks URL must not pin an explicit GPT override onto the
+    # Anthropic Messages endpoint.
+    result = _build_models_json(
+        "https://ws.cloud.databricks.com",
+        "tok",
+        {"claude": "https://ws.cloud.databricks.com/ai-gateway/anthropic"},
+        model="databricks-gpt-5-5",
+    )
+    p = result["providers"]
+    responses_ids = [e.get("id") for e in p["databricks-openai"]["models"]]
+    assert "databricks-gpt-5-5" in responses_ids
+    assert (
+        p["databricks-openai"]["baseUrl"] == "https://ws.cloud.databricks.com/ai-gateway/codex/v1"
+    )
+    anthropic_ids = [e.get("id") for e in p["databricks-anthropic"]["models"]]
+    assert "databricks-gpt-5-5" not in anthropic_ids
+    # Claude keeps the configured gateway surface.
+    assert (
+        p["databricks-anthropic"]["baseUrl"]
+        == "https://ws.cloud.databricks.com/ai-gateway/anthropic"
+    )
+
+
+@pytest.mark.parametrize(
+    ("base_urls", "expected"),
+    [
+        # Generic single-family vendors pin, in both directions.
+        ({"claude": "https://api.moonshot.ai/anthropic"}, "claude"),
+        ({"openai": "https://gw.example.com/v1"}, "openai"),
+        # Both families (or neither) configured: routing unchanged.
+        ({"claude": "https://a.example.com", "openai": "https://b.example.com/v1"}, None),
+        ({"claude": ""}, None),
+        ({}, None),
+        (None, None),
+        # A lone Databricks gateway URL never pins: workspace-hosted path form
+        # and dedicated ai-gateway host form.
+        ({"claude": "https://ws.cloud.databricks.com/ai-gateway/anthropic"}, None),
+        ({"openai": "https://ws.cloud.databricks.com/ai-gateway/codex/v1"}, None),
+        ({"claude": "https://ws.ai-gateway.cloud.databricks.com/anthropic"}, None),
+    ],
+)
+def test_only_configured_family_pins_generic_vendors_only(base_urls, expected):
+    assert _only_configured_family(base_urls) == expected
+
+
+@pytest.mark.parametrize(
+    ("base_urls", "model", "expected_provider"),
+    [
+        # Generic anthropic-only vendor fronting a non-Claude id.
+        (
+            {"claude": "https://api.moonshot.ai/anthropic"},
+            "kimi-k2.7-code",
+            "databricks-anthropic",
+        ),
+        # Generic openai-only passthrough serving a Claude-named id.
+        ({"openai": "https://gw.example.com/v1"}, "claude-k2.7", "databricks-completions"),
+        # Databricks cli-config shape: lone claude URL, explicit GPT override
+        # stays on the Responses surface.
+        (
+            {"claude": "https://ws.cloud.databricks.com/ai-gateway/anthropic"},
+            "databricks-gpt-5-5",
+            "databricks-openai",
+        ),
+    ],
+)
+def test_ensure_rpc_launch_selector_matches_registration(base_urls, model, expected_provider):
+    """The launch-time ``provider/<model>`` selector agrees with models.json.
+
+    Drives the REAL ``_ensure_rpc`` for a gateway executor with only the
+    subprocess spawn stubbed and checks the selector handed to
+    ``_PiRpcSession.start`` names the same provider ``_build_models_json``
+    registered the model under, so the two decision points cannot drift.
+    """
+    lone_url = next(iter(base_urls.values()))
+    parsed = urlparse(lone_url)
+    host = f"{parsed.scheme}://{parsed.netloc}"
+
+    registered = _build_models_json(host, "tok", base_urls, model=model)["providers"]
+    assert model in [e.get("id") for e in registered[expected_provider]["models"]]
+    for name, provider in registered.items():
+        if name != expected_provider:
+            assert model not in [e.get("id") for e in provider["models"]], name
+
+    with (
+        patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"),
+        patch("omnigent.inner.pi_executor._fetch_shell_command_token", return_value="tok"),
+    ):
+        executor = PiExecutor(
+            gateway=True,
+            gateway_host=host,
+            base_urls_override=base_urls,
+            gateway_auth_command="printf tok",
+        )
+
+    seen: dict[str, object] = {}
+
+    async def fake_start(self, pi_path, **kwargs):
+        seen["model"] = kwargs.get("model")
+
+    async def _test():
+        with (
+            patch.object(_PiRpcSession, "start", fake_start),
+            patch.object(executor, "_load_gateway_model_wire_apis", AsyncMock(return_value={})),
+            patch.object(
+                executor,
+                "_build_env_and_dir",
+                return_value=PiSubprocessConfig(env={}, tmp_dir="", extra_args=[]),
+            ),
+        ):
+            await executor._ensure_rpc("session", "system", model, [])
+
+    _run(_test())
+
+    assert seen["model"] == f"{expected_provider}/{model}"
 
 
 class TestGenerateExtensionJs(unittest.TestCase):
