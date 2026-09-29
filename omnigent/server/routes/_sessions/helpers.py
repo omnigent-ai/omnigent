@@ -40,7 +40,10 @@ from fastapi.responses import Response
 from pydantic import ValidationError
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError, StatementError
 
-from omnigent.codex_approval_modes import CODEX_NATIVE_PERMISSION_VALUES
+from omnigent.codex_approval_modes import (
+    CODEX_NATIVE_PERMISSION_VALUES,
+    codex_permission_preset,
+)
 from omnigent.db.utils import generate_task_id
 from omnigent.db.workspace_cache import WorkspaceScopedCache
 from omnigent.debug_logging import debug_event, runner_log_scope
@@ -4645,9 +4648,13 @@ def _require_codex_approval_mode_forward(
     :raises OmnigentError: If no runner was reachable or the runner rejected the
         live approval-mode update.
     """
+    # Prefer the human popup label ("Read Only") over the wire slug ("read-only")
+    # in the banner; fall back to the raw value for an unknown mode.
+    preset = codex_permission_preset(mode)
+    mode_label = preset.label if preset is not None else mode
     if runner_result is None:
         raise OmnigentError(
-            f"Could not switch to {mode} approval mode: no live Codex runner is "
+            f"Could not switch to {mode_label} approval mode: no live Codex runner is "
             f"available for session {session_id!r}. Reconnect the session and try again.",
             code=ErrorCode.RUNNER_UNAVAILABLE,
         )
@@ -4663,7 +4670,7 @@ def _require_codex_approval_mode_forward(
         if isinstance(payload, dict) and isinstance(payload.get("detail"), str):
             detail = f" {payload['detail']}"
         raise OmnigentError(
-            f"Could not switch to {mode} approval mode for session {session_id!r}.{detail}",
+            f"Could not switch to {mode_label} approval mode for session {session_id!r}.{detail}",
             code=ErrorCode.RUNNER_UNAVAILABLE,
         )
 
