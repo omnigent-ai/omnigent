@@ -12,11 +12,14 @@ import sys
 import tempfile
 import time
 from pathlib import Path
-from typing import TypedDict
+from typing import TYPE_CHECKING, TypedDict
 
 from omnigent._platform import stable_user_id
 from omnigent.harnesses.claude_native import bridge as claude_bridge
 from omnigent.util.json_types import JsonObject as _JsonObject
+
+if TYPE_CHECKING:
+    from omnigent.inner.terminal import TerminalInstance
 
 
 class _McpServerEntry(TypedDict):
@@ -806,3 +809,13 @@ def inject_model_command(
             return
         time.sleep(_POLL_INTERVAL_S)
     raise RuntimeError(f"kiro-native did not confirm the model switch to {model!r}")
+
+
+def native_input_ready(session_id: str, instance: TerminalInstance) -> bool:
+    """Provider ``input_ready_probe``: Kiro's input region shows a prompt marker.
+
+    :param session_id: Omnigent conversation id (unused; the pane is enough).
+    :param instance: The live terminal; the watcher already captured its pane.
+    """
+    del session_id
+    return _kiro_input_ready(instance.last_pane_text() or "")

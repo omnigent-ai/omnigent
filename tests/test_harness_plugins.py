@@ -291,35 +291,10 @@ def test_builtin_native_provider_paths_resolve() -> None:
             "auto_create_terminal",
             "spawn_env_builder",
             "materialize_agent_spec",
+            "input_ready_probe",
         ):
             resolved = native_dispatch.resolve_hook(provider, hook)
             assert callable(resolved), f"{provider.key}.{hook} did not resolve to a callable"
-        if provider.input_ready_probe is not None:
-            probe = native_dispatch.resolve_hook(provider, "input_ready_probe")
-            assert callable(probe), f"{provider.key}.input_ready_probe did not resolve"
-
-
-# Built-in native harnesses that do not log ``native_input_ready`` yet. Adding a
-# harness here is an explicit opt-out; prefer exporting
-# ``native_input_ready(session_id, instance)`` from its bridge module instead.
-_NATIVE_HARNESSES_WITHOUT_INPUT_READY_PROBE = frozenset(
-    {"antigravity", "cursor", "devin", "goose", "hermes", "kimi", "kiro", "opencode", "qwen"}
-)
-
-
-def test_builtin_native_providers_declare_input_ready_probe() -> None:
-    """New built-in native harnesses must decide how ``native_input_ready`` is logged.
-
-    The terminal watcher emits the event from ``input_ready_probe``; a harness
-    without one silently never reports input readiness, which is how pi-native
-    went unlogged.
-    """
-    without_probe = {
-        provider.key
-        for provider in hp._BUILTIN_NATIVE_PROVIDERS
-        if provider.input_ready_probe is None
-    }
-    assert without_probe == _NATIVE_HARNESSES_WITHOUT_INPUT_READY_PROBE
 
 
 def test_builtin_native_provider_bridge_id_label_keys_match_constants() -> None:

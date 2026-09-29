@@ -290,9 +290,9 @@ def _native_input_ready_probe(
 
     :param resource_role: Runner-private terminal role, e.g.
         :data:`PI_NATIVE_TERMINAL_ROLE`, or ``None`` for a generic terminal.
-    :returns: The probe, or ``None`` for generic terminals, harnesses without a
-        probe, or a probe that fails to import (readiness logging is best-effort
-        and must not block the terminal watcher).
+    :returns: The probe, or ``None`` for generic terminals or a probe that fails
+        to import (logged loudly, but readiness logging must not block the
+        terminal watcher).
     """
     agent = native_coding_agent_for_harness(resource_role)
     if agent is None:
@@ -300,7 +300,11 @@ def _native_input_ready_probe(
     try:
         return resolve_hook_for_key(agent.key, "input_ready_probe")
     except Exception:  # noqa: BLE001 - see docstring.
-        _logger.debug("Native input-ready probe unavailable for %s", resource_role, exc_info=True)
+        _logger.warning(
+            "Native input-ready probe unavailable for %s; native_input_ready will not be logged",
+            resource_role,
+            exc_info=True,
+        )
         return None
 
 
