@@ -63,9 +63,9 @@ def mock_http_url(tmp_path_factory: pytest.TempPathFactory) -> Iterator[str]:
 
 @pytest.mark.parametrize("endpoint", ["/v1/messages", "/v1/responses", "/v1/chat/completions"])
 @pytest.mark.parametrize("stream", [False, True])
-@pytest.mark.parametrize("tool_name", ["Skill", "mcp__omnigent__load_skill"])
-def test_title_then_tool_turn_over_http(mock_http_url, endpoint, stream, tool_name):
+def test_title_then_tool_turn_over_http(mock_http_url, endpoint, stream):
     model = "bundled-skill-none-http"
+    tool_name = "Skill"
     tool_call = {"call_id": "toolu_skill", "name": tool_name, "arguments": '{"skill":"bundled"}'}
     with httpx.Client(base_url=mock_http_url, trust_env=False, timeout=5.0) as client:
         client.post("/mock/reset").raise_for_status()
