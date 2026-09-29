@@ -3222,6 +3222,52 @@ def test_augment_claude_args_injects_mcp_and_hooks(tmp_path: Path) -> None:
     assert "--disallowedTools" not in args
 
 
+def test_generated_claude_subprocesses_pin_runner_tmpdir(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """MCP and Python hooks use the temp root that created the bridge."""
+    runner_tmpdir = tmp_path / "runner-tmp"
+    bridge_dir = (
+        runner_tmpdir
+        / f"omnigent-{claude_native_bridge.stable_user_id()}"
+        / "claude-native"
+        / "session"
+    )
+    bridge_dir.mkdir(parents=True)
+    inherited_tmpdir = tmp_path / "shell-tmp"
+    inherited_tmpdir.mkdir()
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT",
+        runner_tmpdir,
+    )
+    monkeypatch.setenv("TMPDIR", str(inherited_tmpdir))
+
+    args = augment_claude_args(
+        (),
+        bridge_dir=bridge_dir,
+        python_executable="/venv/bin/python",
+        ap_server_url="http://127.0.0.1:8787",
+        subagent_router_dir=bridge_dir,
+        turn_routing=True,
+    )
+    mcp_config = json.loads(args[args.index("--mcp-config") + 1])
+    settings = _load_invocation_settings(args)
+
+    server_env = mcp_config["mcpServers"]["omnigent"]["env"]
+    assert server_env["TMPDIR"] == str(runner_tmpdir)
+    python_commands = [
+        hook["command"]
+        for entries in settings["hooks"].values()
+        for entry in entries
+        for hook in entry["hooks"]
+        if "/venv/bin/python" in hook["command"]
+    ]
+    assert len(python_commands) == 18
+    expected_tmpdir = f"env TMPDIR={shlex.quote(str(runner_tmpdir))}"
+    assert all(expected_tmpdir in command for command in python_commands)
+
+
 def test_augment_claude_args_observes_worktree_moves(tmp_path: Path) -> None:
     """
     ``EnterWorktree`` / ``ExitWorktree`` PostToolUse events reach the observer hook.

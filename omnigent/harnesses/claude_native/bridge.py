@@ -2102,10 +2102,24 @@ def build_mcp_config(bridge_dir: Path, *, python_executable: str | None = None) 
                 ],
                 "env": {
                     "PYTHONUNBUFFERED": "1",
+                    # The bridge root is derived from tempfile at import time.
+                    # Keep it aligned with the runner when Claude inherits a
+                    # different TMPDIR from the user's shell.
+                    "TMPDIR": str(_TRUSTED_PARENT),
                 },
             }
         }
     }
+
+
+def _pin_runner_tmpdir(command: str) -> str:
+    """Run a generated command with the runner's temp root."""
+    return f"env TMPDIR={shlex.quote(str(_TRUSTED_PARENT))} {command}"
+
+
+def _python_hook_command(parts: list[str]) -> str:
+    """Build a Python hook command pinned to the runner's temp root."""
+    return _pin_runner_tmpdir(shlex.join(parts))
 
 
 def build_hook_settings(
@@ -2194,7 +2208,7 @@ def build_hook_settings(
     # Claude owns command-hook stderr, so it does not reach the runner logs.
     # Persist it for the forwarder to relay with the Omnigent session id.
     observer_stderr = shlex.quote(str(bridge_dir / OBSERVER_HOOK_STDERR_FILE))
-    command = f"{shlex.join(command_parts)} 2>> {observer_stderr}"
+    command = f"{_python_hook_command(command_parts)} 2>> {observer_stderr}"
     hook = {"type": "command", "command": command}
     framework_context_parts = [
         python,
@@ -2207,7 +2221,7 @@ def build_hook_settings(
     ]
     framework_context_hook = {
         "type": "command",
-        "command": f"{shlex.join(framework_context_parts)} 2>> {observer_stderr}",
+        "command": f"{_python_hook_command(framework_context_parts)} 2>> {observer_stderr}",
     }
     session_start_hook = {
         "type": "command",
@@ -2279,9 +2293,9 @@ def build_hook_settings(
     }
     from omnigent.native.tool_observer_hook import hook_settings
 
-    hooks["PostToolUse"].append(
-        {"hooks": [hook_settings(bridge_dir, python, "omnigent.harnesses.claude_native.hook")]}
-    )
+    observer_hook = hook_settings(bridge_dir, python, "omnigent.harnesses.claude_native.hook")
+    observer_hook["command"] = _pin_runner_tmpdir(cast(str, observer_hook["command"]))
+    hooks["PostToolUse"].append({"hooks": [observer_hook]})
     if turn_routing:
         hooks["UserPromptSubmit"].append({"hooks": [_claude_route_turn_hook(bridge_dir, python)]})
     if ap_server_url:
@@ -2312,7 +2326,7 @@ def build_hook_settings(
         ]
         permission_hook: _JsonObject = {
             "type": "command",
-            "command": shlex.join(permission_command_parts),
+            "command": _python_hook_command(permission_command_parts),
             # Wait up to a day for the verdict. Claude Code's default
             # command-hook timeout (~60s) would otherwise kill the hook
             # subprocess long before the user answers, putting the
@@ -2336,7 +2350,7 @@ def build_hook_settings(
         # path and the phase-aware fail-closed contract — exactly the
         # pre-curl behavior.
         relay_env_quoted = shlex.quote(str(bridge_dir / _TOOL_RELAY_ENV_FILE))
-        evaluate_policy_python = shlex.join(
+        evaluate_policy_python = _python_hook_command(
             [
                 python,
                 "-I",
@@ -2401,7 +2415,7 @@ def build_hook_settings(
 
         router_hook: _JsonObject = {
             "type": "command",
-            "command": shlex.join(router_command_parts),
+            "command": _python_hook_command(router_command_parts),
             # Outermost hop of the routing timeout budget documented in
             # ``omnigent.runner.subagent_routing``: derived from the hook
             # script's own request budget so it always exceeds it and the
@@ -2471,7 +2485,7 @@ def _claude_route_turn_hook(bridge_dir: Path, python: str) -> _JsonObject:
 
     return {
         "type": "command",
-        "command": shlex.join(
+        "command": _python_hook_command(
             [
                 python,
                 "-I",

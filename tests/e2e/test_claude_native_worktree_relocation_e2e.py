@@ -814,7 +814,10 @@ def test_terminal_approved_enter_worktree_clears_the_web_approval_card(
         )
         # Hook subprocesses run with ``python -I`` (no PYTHONPATH), so they
         # import the installed omnigent, as in production.
-        hook_env = _localhost_env({"HOME": str(tmp_path / "home")})
+        # A conflicting TMPDIR reproduces the runner/hook bridge-root mismatch.
+        hook_tmpdir = tmp_path / "hook-tmp"
+        hook_tmpdir.mkdir()
+        hook_env = _localhost_env({"HOME": str(tmp_path / "home"), "TMPDIR": str(hook_tmpdir)})
         hook_env.pop("PYTHONPATH", None)
 
         observed = asyncio.run(

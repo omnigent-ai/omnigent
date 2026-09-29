@@ -1630,6 +1630,8 @@ class _SubagentWorkEntry:
         terminal status, or ``None`` while running.
     :param delivered: Whether the terminal payload has been pushed to
         the parent's inbox.
+    :param cancellation_confirmed: Whether a native terminal edge confirmed
+        an abort, rather than an interrupt merely being requested.
     """
 
     parent_session_id: str
@@ -1644,6 +1646,7 @@ class _SubagentWorkEntry:
     created_at: float = dataclasses.field(default_factory=time.time)
     completed_at: float | None = None
     delivered: bool = False
+    cancellation_confirmed: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -2642,7 +2645,7 @@ def _session_status_to_task_status(status: object) -> str | None:
 
     :param status: A ``session.status`` value, e.g. ``"running"``.
     :returns: ``"launching"`` / ``"in_progress"`` / ``"completed"`` /
-        ``"failed"``, or ``None`` for an unrecognized status (caller
+        ``"failed"`` / ``"cancelled"``, or ``None`` for an unrecognized status (caller
         omits the field).
     """
     if status == "launching":
@@ -2651,8 +2654,8 @@ def _session_status_to_task_status(status: object) -> str | None:
         return "in_progress"
     if status == "idle":
         return "completed"
-    if status == "failed":
-        return "failed"
+    if status in ("failed", "cancelled"):
+        return str(status)
     return None
 
 
@@ -3305,13 +3308,9 @@ def create_runner_app(
     ) -> _JsonObject | None:
         if status in ("running", "waiting"):
             mark_subagent_work_started(session_id)
-        # ``failed`` is sticky against a trailing ``idle``, mirroring the
-        # server invariant (see ``omnigent/server/routes/_sessions/helpers.py``):
-        # a failed native turn's pane goes quiet, so the PTY-activity watcher
-        # emits a trailing ``idle`` ~1s later — republishing the child as
-        # ``completed`` would show a green child for a turn that died. A later
-        # ``running``/``waiting`` edge (new activity) clears it normally.
-        if status == "idle" and meta.last_task_status == "failed":
+        # A trailing pane-idle edge must not turn a failed or aborted task
+        # into success. A new running/waiting edge clears the terminal outcome.
+        if status == "idle" and meta.last_task_status in ("failed", "cancelled"):
             return None
         busy = status in ("running", "waiting")
         task_status = _session_status_to_task_status(status)
@@ -10395,21 +10394,43 @@ def create_runner_app(
             output = forwarded_output if isinstance(forwarded_output, str) else None
             delivery_ack: _SubagentDeliveryAck | None = None
             recovered_entry: _SubagentWorkEntry | None = None
+            terminal_status = None
+            if status in ("idle", "failed"):
+                recovered_entry = get_subagent_work(conversation_id)
+                turn_outcome = data.get("turn_outcome") if isinstance(data, dict) else None
+                if turn_outcome in ("completed", "cancelled", "failed"):
+                    recovered_entry = await _ensure_subagent_work_entry(conversation_id)
+                    terminal_status = turn_outcome
+                    if turn_outcome == "cancelled" and recovered_entry is not None:
+                        recovered_entry.cancellation_confirmed = True
+                elif (
+                    status == "idle"
+                    and recovered_entry is not None
+                    and recovered_entry.status == "cancelled"
+                    and recovered_entry.cancellation_confirmed
+                ):
+                    # A bare idle retry cannot overwrite a confirmed abort
+                    # while its parent inbox is still unavailable.
+                    terminal_status = "cancelled"
+                    output = recovered_entry.output
             if status in ("running", "waiting", "idle", "failed"):
                 # Forwarders report these edges straight to the server, so record
                 # them here too; the idle watchdog reads them for native turns.
                 _native_pane_status[conversation_id] = status
                 resource_registry.note_external_session_status(conversation_id, status)
+                child_status = (
+                    "idle" if terminal_status == "completed" else terminal_status or status
+                )
                 _fan_out_child_delta_to_parent(
                     conversation_id,
-                    {"type": "session.status", "status": status},
+                    {"type": "session.status", "status": child_status},
                     latest_assistant_text=output,
                     allow_history_preview_fallback=False,
                 )
             turn_completed = data.get("turn_completed") if isinstance(data, dict) else None
             interrupt_pending = False
             interrupt_work_id: str | None = None
-            if status == "idle" and turn_completed is not True:
+            if status == "idle" and terminal_status is None and turn_completed is not True:
                 # An unconfirmed idle following an interrupt settles the
                 # dispatch: the turn stopped early, so report ``cancelled``
                 # with whatever output the edge carried instead of guessing
@@ -10427,11 +10448,23 @@ def create_runner_app(
                 )
             ambiguous_idle = (
                 status == "idle"
+                and terminal_status is None
                 and turn_completed is not True
                 and not interrupt_pending
                 and _native_turn_outcome_is_forwarder_confirmed(conversation_id)
             )
-            if ambiguous_idle:
+            if terminal_status is not None:
+                _native_interrupt_runner.clear_pending_interrupt(conversation_id)
+                if terminal_status == "cancelled":
+                    output = output or "[System: sub-agent interrupted]"
+                elif terminal_status == "failed":
+                    output = output or "Error: native sub-agent turn failed"
+                delivery_ack = _mark_subagent_terminal_and_wake(
+                    conversation_id,
+                    status=terminal_status,
+                    output=output if output is not None else "",
+                )
+            elif ambiguous_idle:
                 # This harness's forwarder marks genuine turn completions
                 # (``turn_completed``), so a bare quiescence idle proves
                 # nothing about the turn's outcome: record the pane status

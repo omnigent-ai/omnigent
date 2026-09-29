@@ -579,7 +579,10 @@ class NativeInterruptRunner:
         # is why publishing here would double it.
         if terminal_role is not None and terminal_role not in _STATUS_EMITTING_TERMINAL_ROLES:
             self._publish_event(conv_id, {"type": "session.status", "status": "idle"})
-        self._defer_parent_wake_after_native_interrupt(conv_id)
+        # Cursor's stop hook owns the outcome; a timer-based cancellation
+        # would discard a result that arrives after its grace window.
+        if terminal_role != "cursor-native":
+            self._defer_parent_wake_after_native_interrupt(conv_id)
         return Response(status_code=204)
 
     async def _uniform_stop(self, spec: _UniformStop, conv_id: str) -> Response:

@@ -841,7 +841,22 @@ class _ResponseQueue:
         # the #523 cross-test contamination, fixed without per-test
         # servers. ``None`` preserves the default model/"default" routing.
         self.match: str | None = None
-        self.required_tools: frozenset[str] = frozenset()
+        self.required_tools: frozenset[str] | None = None
+
+    def accepts_tools(self, tool_names: set[str]) -> bool:
+        """Keep scripted tool calls out of requests without any tools.
+
+        Explicit guards cover the whole queue; an empty guard deliberately
+        permits calls even without tools. Otherwise only require a tool surface:
+        negative tests may deliberately call an unadvertised tool. Text, errors
+        and exhausted-queue fallbacks remain unrestricted.
+        """
+        if self.required_tools is not None:
+            return self.required_tools <= tool_names
+        if self.index < len(self.responses):
+            calls = self.responses[self.index].tool_calls or []
+            return not calls or bool(tool_names)
+        return True
 
     def next(self) -> QueuedResponse:
         """Consume the next response, or return the fallback / default."""
@@ -858,7 +873,7 @@ class _ResponseQueue:
         self.responses.clear()
         self.index = 0
         self.match = None
-        self.required_tools = frozenset()
+        self.required_tools = None
 
 
 class MockState:
@@ -999,7 +1014,7 @@ class MockState:
             best: _ResponseQueue | None = None
             best_score = (-1, -1)
             for queue in self.queues.values():
-                if not queue.match or not queue.required_tools <= tool_names:
+                if not queue.match or not queue.accepts_tools(tool_names):
                     continue
                 position = user_text.rfind(queue.match)
                 score = (len(queue.match), position)
@@ -1010,8 +1025,8 @@ class MockState:
                 return best
         model = parsed.get("model") if isinstance(parsed, dict) else None
         queue = self.resolve_queue(model)
-        # A model/default lookup must not bypass an explicit purpose guard.
-        if not queue.required_tools <= tool_names:
+        # Model/default lookup must respect both explicit and inferred guards.
+        if not queue.accepts_tools(tool_names):
             return _ResponseQueue()
         return queue
 
@@ -1438,6 +1453,13 @@ async def configure(request: Request) -> dict[str, object]:
     If the model/default queue fails the guard, return the generic
     "Mock LLM response" without consuming that queue.
 
+    When ``required_tools`` is omitted, the next ``tool_calls`` response requires
+    a request with at least one advertised tool, so a no-tools title request
+    cannot consume it. Names need not match: negative tests can still call an
+    excluded tool. This does not guard text entries or the fallback. Set
+    ``required_tools: []`` to also permit calls on requests with no tools.
+    A nonempty explicit guard still takes precedence over inference.
+
     Multiple calls with different keys accumulate queues; use
     ``POST /mock/reset`` to clear all keys.
     """
@@ -1452,14 +1474,15 @@ async def configure(request: Request) -> dict[str, object]:
         raise HTTPException(400, "match must be a nonempty string")
     # Only implicit content queues get independent identities. Explicit keys
     # retain replacement semantics, including an explicit key="default".
-    route = json.dumps([match, sorted(set(required_tools))]).encode()
+    guard = frozenset(required_tools) if "required_tools" in body else None
+    route = json.dumps([match, sorted(guard) if guard is not None else None]).encode()
     implicit_key = f"content-{hashlib.sha256(route).hexdigest()[:24]}" if match else _DEFAULT_KEY
     key = body.get("key", implicit_key)
     async with _state._lock:
         queue = _state.get_queue(key)
         queue.reset()
         queue.match = match
-        queue.required_tools = frozenset(required_tools)
+        queue.required_tools = guard
         for entry in body.get("responses", []):
             queue.responses.append(
                 QueuedResponse(
