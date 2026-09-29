@@ -45,7 +45,7 @@ import subprocess
 import tarfile
 import tempfile
 import time
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -137,12 +137,17 @@ def start_live_server(
     db_path: Path,
     artifact_dir: Path,
     log_path: Path,
+    extra_env: Mapping[str, str] | None = None,
 ) -> tuple[subprocess.Popen[bytes], str]:
     """
     Spawn an ``omnigent.cli server`` subprocess and wait for
     health.
 
     :param creds: Harness credentials to thread into the subprocess.
+    :param extra_env: Environment overrides for the server subprocess
+        only, applied after the harness credentials, e.g.
+        ``{"OMNIGENT_DISABLE_CATALOG_LOOKUP": "0"}``. The test
+        process's own environment is left untouched.
     :param db_path: Filesystem path for the server's SQLite DB,
         e.g. ``Path("/tmp/test/db.sqlite")``. Absolute path
         recommended so the server doesn't pollute the test's CWD.
@@ -158,7 +163,7 @@ def start_live_server(
     """
     port = find_free_port()
     harness_env = _compute_harness_env(creds)
-    env = {**os.environ, **harness_env}
+    env = {**os.environ, **harness_env, **(extra_env or {})}
     # Force the subprocess to import from the worktree, not whatever's
     # installed in the venv — otherwise a branch with schema/model changes
     # runs against a stale installed copy and fails with cryptic "no such
