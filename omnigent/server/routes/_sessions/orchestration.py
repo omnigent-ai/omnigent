@@ -7113,26 +7113,48 @@ def _runner_stamp_is_live_elsewhere(
     *,
     stamp: int | None,
     reference_stamp: int | None,
+    outage_start_epoch: int | None = None,
 ) -> bool:
-    """Return whether *stamp* is fresh evidence written by another replica."""
-    return (
-        stamp is not None
-        and runner_seen_is_fresh(stamp)
-        and (reference_stamp is None or stamp > reference_stamp)
-    )
+    """Return whether *stamp* is fresh evidence written by another replica.
+
+    When *outage_start_epoch* is given, any stamp strictly after that epoch
+    second is accepted regardless of *reference_stamp*. This handles the case
+    where the local ping loop continues stamping during the retry window and
+    overwrites a remote replica's stamp with an equal or newer value, making
+    the plain ``stamp > reference_stamp`` comparison falsely fail.
+    """
+    if stamp is None or not runner_seen_is_fresh(stamp):
+        return False
+    if outage_start_epoch is not None:
+        return stamp > outage_start_epoch
+    return reference_stamp is None or stamp > reference_stamp
 
 
 def _runner_live_on_another_replica_from_conversations(
     conversations: Sequence[Conversation],
     runner_id: str,
     reference_stamp: int | None,
+    outage_start_epoch: int | None = None,
 ) -> bool:
-    """Check already-loaded runner-bound rows for a fresher replica's stamp."""
+    """Check already-loaded runner-bound rows for a fresher replica's stamp.
+
+    :param conversations: Already-loaded conversation rows to inspect.
+    :param runner_id: Runner id to match against each row.
+    :param reference_stamp: This replica's own last liveness stamp for
+        *runner_id*, used as the baseline when *outage_start_epoch* is not
+        provided.
+    :param outage_start_epoch: Wall-clock epoch second when the outage began;
+        when given, any stamp strictly after this value confirms the runner is
+        live elsewhere, regardless of *reference_stamp*.
+    :returns: ``True`` when a matching row has a stamp proving the runner is
+        live on another replica.
+    """
     return any(
         conv.runner_id == runner_id
         and _runner_stamp_is_live_elsewhere(
             stamp=conv.runner_last_seen,
             reference_stamp=reference_stamp,
+            outage_start_epoch=outage_start_epoch,
         )
         for conv in conversations
     )
@@ -7184,7 +7206,8 @@ async def _runner_drop_interrupted_turn(
 async def _relay_runner_live_elsewhere(
     session_id: str,
     conversation_store: ConversationStore,
-) -> bool:
+    outage_start_epoch: int | None,
+) -> tuple[bool, int | None]:
     """
     Resolve this relay's bound runner and check it against another replica.
 
@@ -7197,8 +7220,15 @@ async def _relay_runner_live_elsewhere(
 
     :param session_id: Session/conversation identifier.
     :param conversation_store: Store used to read the session row.
-    :returns: ``True`` when the bound runner is confirmed live on
-        another replica; ``False`` when unbound, unreadable, or not.
+    :param outage_start_epoch: Wall-clock epoch second when the current
+        outage window opened; used as the comparison baseline so a stamp
+        written by a remote replica after the outage began is accepted
+        even when the local ping loop overwrites it with an equal value.
+        Pass ``None`` to fall back to the reference-stamp comparison (used
+        when the runner is still registered locally).
+    :returns: ``(True, runner_last_seen)`` when the bound runner is confirmed
+        live on another replica; ``(False, runner_last_seen or None)`` when
+        unbound, unreadable, or not confirmed elsewhere.
     """
     try:
         row = await asyncio.to_thread(conversation_store.get_conversation, session_id)
@@ -7209,15 +7239,18 @@ async def _relay_runner_live_elsewhere(
             exc_info=True,
             extra={"session_id": session_id},
         )
-        return False
+        return False, None
     if row is None:
-        return False
+        return False, None
     handle = _runner_relay_tasks.get(session_id)
     runner_id = handle.runner_id if handle is not None else row.runner_id
     if runner_id is None:
-        return False
+        return False, row.runner_last_seen
     reference_stamp = session_live_state.last_liveness_stamp(runner_id)
-    return _runner_live_on_another_replica_from_conversations([row], runner_id, reference_stamp)
+    result = _runner_live_on_another_replica_from_conversations(
+        [row], runner_id, reference_stamp, outage_start_epoch
+    )
+    return result, row.runner_last_seen
 
 
 async def _relay_runner_stream(
@@ -7255,7 +7288,12 @@ async def _relay_runner_stream(
     loop = asyncio.get_running_loop()
     deadline: float | None = None
     outage_started = 0.0
+    # Wall-clock epoch second when the current outage window opened, used as
+    # the baseline for the cross-replica liveness check at grace expiry.
+    outage_start_epoch = 0
     retries = 0
+    transport = getattr(runner_client, "_transport", None)
+    _wait_for_runner = getattr(transport, "wait_for_runner", None)
     while True:
         started = loop.time()
         try:
@@ -7273,6 +7311,7 @@ async def _relay_runner_stream(
             if deadline is None or now - started > RUNNER_DISCONNECT_GRACE_S:
                 deadline = now + RUNNER_DISCONNECT_GRACE_S
                 outage_started = now
+                outage_start_epoch = int(time.time())
                 retries = 0
                 _logger.info(
                     "Relay: runner transport lost for session=%s (intentional=%s, grace=%.1fs)",
@@ -7302,21 +7341,45 @@ async def _relay_runner_stream(
                 # reason (an HTTP error), so keep the interval backoff: the
                 # waiter would return at once and spin. A client without a
                 # tunnel transport (in-process tests) also keeps the interval.
-                transport = getattr(runner_client, "_transport", None)
-                wait = getattr(transport, "wait_for_runner", None)
-                if wait is None or await wait(deadline - now):
+                if _wait_for_runner is None or await _wait_for_runner(deadline - now):
                     await asyncio.sleep(_RELAY_RETRY_INTERVAL_S)
                 continue
+            # Collect diagnostic info for the decision log before any
+            # async DB reads so the fields are current at the same instant.
+            _diag_handle = _runner_relay_tasks.get(session_id)
+            _diag_runner_id = _diag_handle.runner_id if _diag_handle is not None else None
+            _reference_stamp = (
+                session_live_state.last_liveness_stamp(_diag_runner_id)
+                if _diag_runner_id is not None
+                else None
+            )
+            _runner_registered_locally = False
+            if _wait_for_runner is not None:
+                _runner_registered_locally = await _wait_for_runner(0)
+            _last_error_type = (
+                type(lost.__cause__).__name__ if lost.__cause__ is not None else None
+            )
             if lost.intentional:
                 decision = "intentional_stop"
+                _row_runner_last_seen: int | None = None
             elif shutdown_state.server_shutting_down():
                 decision = "server_shutdown"
-            elif await _relay_runner_live_elsewhere(session_id, conversation_store):
-                decision = "live_elsewhere"
-            elif await _runner_drop_interrupted_turn(session_id, conversation_store):
-                decision = "failed_mid_turn"
+                _row_runner_last_seen = None
             else:
-                decision = "idle_no_failure"
+                # Use the outage-epoch shortcut only when the runner is absent
+                # locally; if still registered here the local ping loop also
+                # writes runner_last_seen > outage_start_epoch, so we'd falsely
+                # relinquish a live turn. Fall back to reference_stamp instead.
+                _eff_outage_epoch = outage_start_epoch if not _runner_registered_locally else None
+                _live_elsewhere, _row_runner_last_seen = await _relay_runner_live_elsewhere(
+                    session_id, conversation_store, _eff_outage_epoch
+                )
+                if _live_elsewhere:
+                    decision = "live_elsewhere"
+                elif await _runner_drop_interrupted_turn(session_id, conversation_store):
+                    decision = "failed_mid_turn"
+                else:
+                    decision = "idle_no_failure"
             # One row per outage outcome: which branch below fired, how long the
             # runner was gone against the grace, and how many retries it got.
             _logger.warning(
@@ -7332,7 +7395,13 @@ async def _relay_runner_stream(
                     decision=decision,
                     grace_s=RUNNER_DISCONNECT_GRACE_S,
                     outage_s=round(now - outage_started, 3),
+                    outage_start_epoch=outage_start_epoch,
                     retries=retries,
+                    bound_runner_id=_diag_runner_id,
+                    row_runner_last_seen=_row_runner_last_seen,
+                    reference_stamp=_reference_stamp,
+                    runner_registered_locally=_runner_registered_locally,
+                    last_error_type=_last_error_type,
                 ),
             )
             if decision == "intentional_stop":

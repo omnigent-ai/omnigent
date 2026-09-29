@@ -612,6 +612,29 @@ class _TunnelCloseRunnerClient:
         return _TunnelCloseStreamResponse(self._gate)
 
 
+class _LocallyRegisteredTransport:
+    """Fake transport that reports the runner as locally registered."""
+
+    async def wait_for_runner(self, timeout_s: float) -> bool:
+        """Runner is always present in this fake local registry."""
+        return True
+
+
+class _LocallyRegisteredRunnerClient(_TunnelCloseRunnerClient):
+    """Fake runner client that claims the runner is still in the local registry.
+
+    Inherits the stream-close behaviour and adds a ``_transport`` whose
+    ``wait_for_runner`` returns ``True``, simulating the case where the
+    runner's WebSocket is still registered on this replica at grace expiry.
+
+    :param gate: Event that gates the ``ConnectionError``.
+    """
+
+    def __init__(self, gate: asyncio.Event) -> None:
+        super().__init__(gate)
+        self._transport = _LocallyRegisteredTransport()
+
+
 @pytest.mark.parametrize("failure_path", ["relay", "sweep", "sweep_after_restart"])
 @pytest.mark.parametrize("terminal_response", [False, True])
 @pytest.mark.asyncio
@@ -704,6 +727,12 @@ async def test_relay_publishes_failed_status_on_tunnel_close(
             assert record.attributes["cached_session_status"] == "running"
             assert record.attributes["decision"] == "failed_mid_turn"
             assert record.exc_info is not None
+            # Diagnostic fields added for cross-replica outage investigation.
+            assert "outage_start_epoch" in record.attributes
+            assert isinstance(record.attributes["outage_start_epoch"], int)
+            assert record.attributes["retries"] == 0
+            assert record.attributes["runner_registered_locally"] is False
+            assert record.attributes["last_error_type"] == "ConnectionError"
     finally:
         gate.set()
         if collector is not None:
@@ -1909,9 +1938,9 @@ async def test_relay_stays_quiet_when_runner_is_live_on_another_replica(
 
     The runner may reconnect elsewhere before this replica's grace expires
     (ingress recycle, a 4003 close after a silent stretch). That replica's
-    fresh ``runner_last_seen`` stamp means it now owns the turn, so this
-    drop must publish no ``failed`` status and persist no
-    ``runner_disconnected`` labels — mirroring the idle-session case.
+    fresh ``runner_last_seen`` stamp — strictly newer than the outage epoch
+    — means it now owns the turn, so this drop must publish no ``failed``
+    status and persist no ``runner_disconnected`` labels.
     """
     import time
 
@@ -1929,19 +1958,16 @@ async def test_relay_stays_quiet_when_runner_is_live_on_another_replica(
     runner_id = "runner_live_elsewhere"
     session_id = "d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6"
     now = int(time.time())
-    # This replica's own last stamp is a minute old; the row's fresh stamp can
-    # only come from the replica the runner re-tunnelled to.
-    monkeypatch.setattr(
-        "omnigent.server.session_live_state.last_liveness_stamp",
-        lambda _runner_id: now - 60,
-    )
+    # The row stamp is 1s in the future relative to when this test constructs
+    # ``now``. The outage_start_epoch captured inside the relay will be ≈ now,
+    # so ``runner_last_seen (now + 1) > outage_start_epoch (≈ now)`` is True.
     store = _RecordingLabelStore(
         connectivity={
             session_id: SessionConnectivity(
                 runner_id=runner_id,
                 host_id=None,
                 needs_workspace=False,
-                runner_last_seen=now,
+                runner_last_seen=now + 1,
             )
         }
     )
@@ -1977,6 +2003,172 @@ async def test_relay_stays_quiet_when_runner_is_live_on_another_replica(
         session_stream.close(session_id)
 
 
+@pytest.mark.asyncio
+async def test_relay_live_elsewhere_when_reference_stamp_equals_row_stamp(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A fresh row stamp equals the local reference stamp but is still live-elsewhere.
+
+    Production root cause: the local ping loop keeps running during the retry
+    window and writes ``runner_last_seen = T`` to the DB, overwriting the remote
+    replica's stamp (also T). The old ``stamp > reference_stamp`` check falsely
+    returned False because both stamps were T. The fix uses ``outage_start_epoch``
+    (captured once when the outage begins) as the threshold instead, so any stamp
+    strictly after the outage second is accepted regardless of reference_stamp.
+    """
+    import time as _time_module
+    from types import SimpleNamespace
+
+    from omnigent.runtime import session_stream
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.stores.conversation_store import SessionConnectivity
+
+    monkeypatch.setattr(
+        "omnigent.server.routes._sessions.orchestration.RUNNER_DISCONNECT_GRACE_S",
+        0.0,
+    )
+    sessions_module._runner_relay_tasks.clear()
+    gate = asyncio.Event()
+    fake_runner = _TunnelCloseRunnerClient(gate)
+    runner_id = "runner_reference_stamp_edge"
+    session_id = "e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6b7"
+    now = int(_time_module.time())
+    # Make outage_start_epoch = now - 1 by patching time.time in the orchestration
+    # module. The row stamp is ``now`` so ``now > (now - 1)`` is True; with the
+    # old reference_stamp check (``now > now``) it would be False.
+    monkeypatch.setattr(
+        "omnigent.server.routes._sessions.orchestration.time",
+        SimpleNamespace(time=lambda: float(now - 1)),
+    )
+    monkeypatch.setattr(
+        "omnigent.server.session_live_state.last_liveness_stamp",
+        lambda _runner_id: now,  # reference_stamp equals the row stamp
+    )
+    store = _RecordingLabelStore(
+        connectivity={
+            session_id: SessionConnectivity(
+                runner_id=runner_id,
+                host_id=None,
+                needs_workspace=False,
+                runner_last_seen=now,  # stamp == reference_stamp; old code fails here
+            )
+        }
+    )
+    sessions_module._session_status_cache[session_id] = "running"
+    sessions_module._session_active_response_cache[session_id] = "response-ref-edge"
+
+    try:
+        handle = await sessions_module._ensure_runner_relay_ready(
+            session_id,
+            runner_id,
+            fake_runner,  # type: ignore[arg-type]
+            conversation_store=store,  # type: ignore[arg-type]
+        )
+        assert handle is not None
+        gate.set()
+        await asyncio.wait_for(handle.task, timeout=_TASK_TIMEOUT_S)
+
+        assert session_id not in store.labels, "should not persist failure labels"
+        assert sessions_module._session_status_cache.get(session_id) is None
+        assert sessions_module._session_active_response_cache.get(session_id) is None
+    finally:
+        gate.set()
+        handle = sessions_module._runner_relay_tasks.get(session_id)
+        if handle is not None and not handle.task.done():
+            handle.task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError):
+                await asyncio.wait_for(handle.task, timeout=_TASK_TIMEOUT_S)
+        sessions_module._runner_relay_tasks.clear()
+        sessions_module._session_status_cache.pop(session_id, None)
+        sessions_module._session_active_response_cache.pop(session_id, None)
+        session_stream.close(session_id)
+
+
+@pytest.mark.asyncio
+async def test_relay_fails_mid_turn_when_runner_still_registered_locally(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A locally-registered runner with row stamp > outage_start_epoch is NOT
+    treated as live-elsewhere — the turn must still fail with cause.
+
+    When the runner's WebSocket is still in this replica's registry at grace
+    expiry, the local ping loop is also stamping runner_last_seen, so any DB
+    stamp that looks "newer than the outage epoch" might just be our own ping.
+    The outage-epoch shortcut is skipped; the legacy reference_stamp comparison
+    applies instead. With stamp == reference_stamp the check returns False
+    and the session is failed rather than silently relinquished.
+    """
+    import time as _time_module
+    from types import SimpleNamespace
+
+    from omnigent.runtime import session_stream
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.stores.conversation_store import SessionConnectivity
+
+    monkeypatch.setattr(
+        "omnigent.server.routes._sessions.orchestration.RUNNER_DISCONNECT_GRACE_S",
+        0.0,
+    )
+    sessions_module._runner_relay_tasks.clear()
+    gate = asyncio.Event()
+    # Use the locally-registered client so _runner_registered_locally = True.
+    fake_runner = _LocallyRegisteredRunnerClient(gate)
+    runner_id = "runner_locally_registered"
+    session_id = "f3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8"
+    now = int(_time_module.time())
+    # outage_start_epoch = now - 1 < row stamp = now, but local ping loop also
+    # can write runner_last_seen = now = reference_stamp.
+    monkeypatch.setattr(
+        "omnigent.server.routes._sessions.orchestration.time",
+        SimpleNamespace(time=lambda: float(now - 1)),
+    )
+    monkeypatch.setattr(
+        "omnigent.server.session_live_state.last_liveness_stamp",
+        lambda _runner_id: now,  # reference_stamp == row stamp
+    )
+    store = _RecordingLabelStore(
+        connectivity={
+            session_id: SessionConnectivity(
+                runner_id=runner_id,
+                host_id=None,
+                needs_workspace=False,
+                runner_last_seen=now,  # > outage_start_epoch but == reference_stamp
+            )
+        }
+    )
+    sessions_module._session_status_cache[session_id] = "running"
+
+    try:
+        handle = await sessions_module._ensure_runner_relay_ready(
+            session_id,
+            runner_id,
+            fake_runner,  # type: ignore[arg-type]
+            conversation_store=store,  # type: ignore[arg-type]
+        )
+        assert handle is not None
+        gate.set()
+        await asyncio.wait_for(handle.task, timeout=_TASK_TIMEOUT_S)
+
+        # Runner is locally registered and no strictly-newer stamp exists →
+        # the turn must be failed, not silently relinquished.
+        assert sessions_module._session_status_cache.get(session_id) == "failed"
+        persisted = sessions_module._last_task_error_from_labels(store.labels[session_id])
+        assert persisted is not None
+        assert persisted["code"] == "runner_disconnected"
+    finally:
+        gate.set()
+        handle = sessions_module._runner_relay_tasks.get(session_id)
+        if handle is not None and not handle.task.done():
+            handle.task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError):
+                await asyncio.wait_for(handle.task, timeout=_TASK_TIMEOUT_S)
+        sessions_module._runner_relay_tasks.clear()
+        sessions_module._session_status_cache.pop(session_id, None)
+        session_stream.close(session_id)
+
+
 def test_runner_live_elsewhere_uses_preloaded_conversation_stamps() -> None:
     """The grace path can detect a newer replica from already-loaded rows."""
     import time
@@ -1989,6 +2181,7 @@ def test_runner_live_elsewhere_uses_preloaded_conversation_stamps() -> None:
     now = int(time.time())
     conversations = [SimpleNamespace(runner_id="runner_a", runner_last_seen=now)]
 
+    # Legacy path (no outage_start_epoch): stamp > reference_stamp required.
     assert _runner_live_on_another_replica_from_conversations(conversations, "runner_a", now - 1)
     assert not _runner_live_on_another_replica_from_conversations(conversations, "runner_a", now)
     assert not _runner_live_on_another_replica_from_conversations(
@@ -1996,6 +2189,16 @@ def test_runner_live_elsewhere_uses_preloaded_conversation_stamps() -> None:
         "runner_a",
         now - 100,
     )
+
+    # Relay path (outage_start_epoch provided): stamp > outage_start_epoch wins
+    # even when stamp == reference_stamp (the local ping loop edge case where
+    # 4v9nv's ping loop overwrites the remote replica's stamp with an equal value).
+    assert _runner_live_on_another_replica_from_conversations(
+        conversations, "runner_a", now, outage_start_epoch=now - 1
+    ), "stamp == reference_stamp but stamp > outage_start_epoch should be live_elsewhere"
+    assert not _runner_live_on_another_replica_from_conversations(
+        conversations, "runner_a", now - 1, outage_start_epoch=now
+    ), "stamp not newer than outage_start_epoch means no evidence of reconnect"
 
 
 @pytest.mark.asyncio
