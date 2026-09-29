@@ -553,8 +553,17 @@ jobs:
           changes or unresolved scope questions with file/line evidence, or explicitly
           say none were found. Do not turn uncertain scope into a blocking conclusion.
 
-          Do NOT comment on code style, formatting, naming conventions, or other cosmetic issues — omit them entirely.
+          Do NOT comment on code style, formatting, naming conventions, or other
+          cosmetic issues, except the source-comment conciseness check below.
           Do not restate the diff. Focus on what matters.
+
+          **Source comments:** Check comments added or modified in the diff for
+          conciseness. Prefer one short sentence, usually one or two lines, explaining
+          a non-obvious reason or constraint. Flag lengthy narration of obvious code,
+          duplicated explanations, and change-history commentary under Non-blocking
+          notes; cite the comment and suggest a short replacement or removal. Keep
+          extra detail only when needed to explain a non-obvious invariant or tradeoff.
+          Do not flag unchanged comments or line wrapping alone.
 
           **Writing style:**
           - Keep sentences concise and to the point. Use plain words.
