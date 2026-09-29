@@ -268,11 +268,11 @@ def test_project_header_action_is_clickable_on_touch_tablet(
         context.close()
 
 
-def test_project_menu_is_keyboard_accessible_on_desktop(
+def test_project_actions_are_keyboard_accessible_on_desktop(
     page: Page,
     seeded_session: tuple[str, str],
 ) -> None:
-    """Tab reveals the desktop menu and Enter opens a project-scoped session."""
+    """The desktop shortcut opens a session; the menu omits the duplicate."""
     base_url, session_id = seeded_session
     page.set_viewport_size({"width": 1280, "height": 800})
     project = f"Keyboard project {uuid.uuid4().hex[:6]}"
@@ -284,22 +284,28 @@ def test_project_menu_is_keyboard_accessible_on_desktop(
 
     header = page.get_by_role("button", name=project, exact=True)
     kebab = page.get_by_role("button", name=f"Project actions for {project}")
-    actions = kebab.locator("xpath=..")
+    shortcut = page.get_by_role("link", name=f"New session in {project}", exact=True)
+    actions = kebab.locator("xpath=../..")
     expect(actions).to_have_css("opacity", "0")
     header.hover()
     expect(actions).to_have_css("opacity", "1")
     page.mouse.move(1279, 0)
     expect(actions).to_have_css("opacity", "0")
 
-    # Start at the folder, then use the browser's real Tab order to reach ⋯.
+    # The shortcut precedes the menu in the browser's real Tab order.
     header.focus()
     page.keyboard.press("Tab")
-    expect(kebab).to_be_focused()
+    expect(shortcut).to_be_focused()
     expect(actions).to_have_css("opacity", "1")
-    expect(page.get_by_test_id("project-new-session")).to_have_count(0)
+    page.keyboard.press("Tab")
+    expect(kebab).to_be_focused()
     page.keyboard.press("Enter")
-    new_session = page.get_by_test_id("project-new-session-menu")
-    expect(new_session).to_be_focused()
+    expect(page.get_by_test_id("project-new-session-menu")).to_be_hidden()
+    expect(page.get_by_test_id("rename-project")).to_be_focused()
+    page.keyboard.press("Escape")
+    expect(kebab).to_be_focused()
+    page.keyboard.press("Shift+Tab")
+    expect(shortcut).to_be_focused()
     page.keyboard.press("Enter")
     expect(page).to_have_url(f"{base_url}/?project={project.replace(' ', '%20')}")
 
@@ -327,7 +333,7 @@ def test_project_menu_is_visible_without_hover(
     page.goto(f"{base_url}/c/{session_id}")
     _move_to_new_project(page, _row(page, session_id), project)
     page.get_by_role("button", name=project, exact=True).hover()
-    expect(page.get_by_test_id("project-new-session")).to_have_count(0)
+    expect(page.get_by_role("link", name=f"New session in {project}", exact=True)).to_be_visible()
 
     context = browser.new_context(viewport=viewport, has_touch=has_touch)
     touch = context.new_page()
@@ -335,7 +341,13 @@ def test_project_menu_is_visible_without_hover(
         touch.goto(f"{base_url}/c/{session_id}?sidebar=open")
         header = touch.get_by_role("button", name=project, exact=True)
         expect(header).to_be_visible()
-        expect(touch.get_by_test_id("project-new-session")).to_have_count(0)
+        shortcut = touch.get_by_role(
+            "link", name=f"New session in {project}", exact=True, include_hidden=True
+        )
+        if has_touch:
+            expect(shortcut).to_be_hidden()
+        else:
+            expect(shortcut).to_be_visible()
         kebab = touch.get_by_role("button", name=f"Project actions for {project}")
 
         for expanded in [True, False]:
@@ -353,7 +365,7 @@ def test_project_menu_is_visible_without_hover(
                 );
             }""")
             title_box = header.locator("span.truncate").bounding_box()
-            action_box = kebab.bounding_box()
+            action_box = (kebab if has_touch else shortcut).bounding_box()
             assert title_box is not None and action_box is not None
             assert title_box["x"] + title_box["width"] <= action_box["x"]
 
@@ -363,14 +375,18 @@ def test_project_menu_is_visible_without_hover(
         else:
             kebab.click()
         menu_item = touch.get_by_test_id("project-new-session-menu")
-        expect(menu_item).to_be_visible()
+        if has_touch:
+            expect(menu_item).to_be_visible()
+        else:
+            expect(menu_item).to_be_hidden()
         expect(
             touch.get_by_role("button", name=project, exact=True, include_hidden=True)
         ).to_have_attribute("aria-expanded", before)
         if has_touch:
             menu_item.tap()
         else:
-            menu_item.click()
+            touch.keyboard.press("Escape")
+            shortcut.click()
         expect(touch).to_have_url(f"{base_url}/?project={project.replace(' ', '%20')}")
         if viewport["width"] < 768:
             expect(touch.get_by_role("button", name="Open sidebar", exact=True)).to_be_visible()

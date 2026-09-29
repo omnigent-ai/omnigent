@@ -2436,14 +2436,16 @@ describe("Sidebar project sections", () => {
     );
   });
 
-  it("keeps the project menu visible on touch and folds New session into it", async () => {
+  it("offers a desktop New session shortcut while keeping the touch menu accessible", async () => {
     projectsMock.push("Customer X");
     mockConversations([
       conv("conv_filed", "Claude Code", { labels: { omni_project: "Customer X" } }),
     ]);
     renderSidebar();
 
-    expect(screen.queryByTestId("project-new-session")).not.toBeInTheDocument();
+    const shortcut = screen.getByRole("link", { name: "New session in Customer X" });
+    expect(shortcut).toHaveAttribute("href", "/?project=Customer%20X");
+    expect(shortcut).toHaveClass("hidden", "[@media((hover:hover)_and_(pointer:fine))]:flex");
     const menuButton = screen.getByTestId("project-actions");
     expect(menuButton).not.toHaveClass("hidden");
     expect(menuButton).not.toHaveClass("sr-only");
@@ -2453,6 +2455,7 @@ describe("Sidebar project sections", () => {
     });
     const menuItem = await screen.findByTestId("project-new-session-menu");
     expect(menuItem).not.toHaveClass("hidden");
+    expect(menuItem).toHaveClass("[@media((hover:hover)_and_(pointer:fine))]:hidden");
     expect(menuItem.closest("a")).toHaveAttribute("href", "/?project=Customer%20X");
   });
 
@@ -2667,7 +2670,11 @@ describe("Sidebar collapsed project marker", () => {
     // rows' dots.
     expect(slot).toHaveClass("w-6", "justify-center");
     // Visible touch controls get their own column beside the marker.
-    expect(slot).toHaveClass("mr-7", "[@media((hover:hover)_and_(pointer:fine))]:md:-mr-1");
+    expect(slot).toHaveClass(
+      "mr-7",
+      "[@media((hover:hover)_and_(pointer:fine))]:mr-14",
+      "[@media((hover:hover)_and_(pointer:fine))]:md:-mr-1",
+    );
     expect(slot).toHaveClass(
       "[@media((hover:hover)_and_(pointer:fine))]:md:group-hover/section:opacity-0",
       "[@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-state=open]]/header:opacity-0",
