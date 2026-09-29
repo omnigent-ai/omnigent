@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import re
+import signal
 import subprocess
 import sys
 import threading
@@ -282,6 +283,11 @@ _RUNNER_WATCH_INTERVAL_S = 0.5
 # The server's 30s send wait handles user feedback; this host check also
 # covers create-time launches and stays inside the 5m triage window.
 _RUNNER_CONNECT_DEADLINE_S = 120.0
+
+# Shared runner-wait budget for signal-initiated stops. Fits inside the CLI's
+# 5s grace (_HOST_DAEMON_STOP_GRACE_S). Note: an in-flight stop_runner frame
+# can still add up to ~10s in _quiesce_frame_tasks (shielded thread, pre-existing).
+_SIGNAL_RUNNER_KILL_TIMEOUT_S = 2.0
 
 
 def _connect_marker_path(log_path: Path) -> Path:
@@ -1266,6 +1272,23 @@ class HostProcess:
         self._lifecycle_lock = lifecycle_lock
         self._lifecycle_task: asyncio.Task[None] | None = None
         self._lifecycle_lost = asyncio.Event()
+        # Shutdown cause recorded once (first cause wins) before the
+        # host_shutdown structured log row is emitted in run()'s finally block.
+        self._shutdown_reason: str | None = None
+        # Signal number when the cause is a POSIX signal; used by
+        # run_host_process to compute the conventional 128+signum exit code.
+        self._shutdown_signal_num: int | None = None
+        # Construction timestamp for computing uptime_s in host_shutdown.
+        self._start_time: float = time.monotonic()
+
+    def _record_shutdown_reason(self, reason: str) -> None:
+        """Set the shutdown reason; first cause wins.
+
+        :param reason: Human-readable cause, e.g. ``"received SIGTERM"``.
+        :returns: None.
+        """
+        if self._shutdown_reason is None:
+            self._shutdown_reason = reason
 
     def _tracked_runner_pids(self) -> set[int]:
         """Return child PIDs whose exit status still belongs to a process handle.
@@ -3846,9 +3869,12 @@ class HostProcess:
     async def run(self) -> None:
         """Run the host process with reconnection.
 
-        Connects to the server, sends hello, and enters the
-        receive loop. Reconnects with exponential backoff on
-        disconnect. Ctrl-C / SIGTERM exit cleanly.
+        Connects to the server, sends hello, and enters the receive loop.
+        Reconnects with exponential backoff on disconnect. Ctrl-C exits
+        cleanly; SIGTERM and SIGHUP install asyncio signal handlers that
+        trigger the same graceful teardown path (runners terminated, lock
+        released) before the process exits with 128+signum (SIGTERM → 143,
+        SIGHUP → 129).
 
         :returns: None. Runs until the process is terminated.
         :raises HostConnectError: On a permanent failure — auth /
@@ -3896,6 +3922,35 @@ class HostProcess:
                 asyncio.to_thread(self._ensure_zygote_started),
                 name="host-zygote-prestart",
             )
+        # Install SIGTERM/SIGHUP handlers on the running loop so an OS signal
+        # triggers the same graceful teardown as Ctrl-C instead of killing the
+        # process outright (which skips the finally block and orphans runners).
+        # Degrades silently when handlers cannot be installed — non-main thread,
+        # Windows, or a misconfigured wakeup fd; the process still exits, just
+        # without the graceful runner teardown.
+        _sigloop = asyncio.get_running_loop()
+        _installed_sigs: list[int] = []
+
+        def _on_shutdown_signal(sig: int) -> None:
+            _was_first = self._shutdown_reason is None
+            self._record_shutdown_reason(f"received {signal.Signals(sig).name}")
+            if _was_first:
+                self._shutdown_signal_num = sig
+            self._lifecycle_lost.set()
+            self._abort_live_tunnel()
+
+        for _sig in [signal.SIGTERM] + ([signal.SIGHUP] if hasattr(signal, "SIGHUP") else []):
+            try:
+                with contextlib.suppress(NotImplementedError):
+                    _sigloop.add_signal_handler(_sig, _on_shutdown_signal, _sig)
+                    _installed_sigs.append(_sig)
+            except RuntimeError:
+                _logger.debug(
+                    "Could not install %s handler; continuing without it",
+                    signal.Signals(_sig).name,
+                    exc_info=True,
+                )
+
         backoff = _RECONNECT_BASE_S
         try:
             # Warm the pre-launch model listings once for the host lifetime so a
@@ -3906,22 +3961,30 @@ class HostProcess:
             self._start_capability_discovery()
             while True:
                 if self._lifecycle_lost.is_set():
+                    self._record_shutdown_reason("lifecycle lost")
                     break
                 try:
                     await self._connect_and_serve()
                     backoff = _RECONNECT_BASE_S
-                except (KeyboardInterrupt, asyncio.CancelledError):
+                except (KeyboardInterrupt, asyncio.CancelledError) as _exc:
+                    self._record_shutdown_reason(
+                        "received SIGINT"
+                        if isinstance(_exc, KeyboardInterrupt)
+                        else "task cancelled"
+                    )
                     break
                 except HostConnectError:
                     # Permanent failure (auth / authorization / outdated
                     # server). Do NOT back off and retry — propagate so
                     # ``run_host_process`` can fail loud.
+                    self._record_shutdown_reason("connection error: HostConnectError")
                     raise
                 except Exception as exc:
                     if self._lifecycle_lost.is_set():
                         # The lifecycle monitor aborted the tunnel to retire this
                         # stale daemon; the resulting disconnect is expected, so
                         # exit cleanly rather than logging a spurious reconnect.
+                        self._record_shutdown_reason("lifecycle lost")
                         break
                     if not isinstance(exc, InvalidURI):
                         # Any non-redirect failure (5xx bounce, network
@@ -3953,6 +4016,7 @@ class HostProcess:
                                 self._server_url,
                                 self._refused_streak,
                             )
+                            self._record_shutdown_reason("connection error: HostConnectError")
                             raise HostConnectError(
                                 f"The server at {self._server_url} refused "
                                 f"{self._refused_streak} consecutive connection "
@@ -4066,9 +4130,37 @@ class HostProcess:
                             backoff * 2 * (1 + random.random() * _RECONNECT_JITTER),
                             _RECONNECT_CAP_S,
                         )
-        except (KeyboardInterrupt, asyncio.CancelledError):
-            pass
+        except (KeyboardInterrupt, asyncio.CancelledError) as _exc:
+            self._record_shutdown_reason(
+                "received SIGINT" if isinstance(_exc, KeyboardInterrupt) else "task cancelled"
+            )
         finally:
+            # Fallback attribution for any exit path not explicitly covered above.
+            self._record_shutdown_reason("unknown")
+            # Emit ONE structured row before _cleanup_runners so it is the
+            # row that precedes the per-runner "Terminating runner ... on
+            # shutdown" INFO lines in the structured log stream.
+            _runner_count = len(self._runners)
+            _bound_session_count = sum(1 for _h in self._runners.values() if _h.session_id)
+            _uptime_s = time.monotonic() - self._start_time
+            _logger.log(
+                logging.WARNING if _runner_count > 0 else logging.INFO,
+                "Host shutting down (reason=%s, uptime=%.1fs, runners=%d, "
+                "bound_sessions=%d, host=%s)",
+                self._shutdown_reason,
+                _uptime_s,
+                _runner_count,
+                _bound_session_count,
+                self._identity.host_id,
+                extra=debug_event(
+                    "host_shutdown",
+                    reason=self._shutdown_reason,
+                    uptime_s=round(_uptime_s, 1),
+                    runner_count=_runner_count,
+                    bound_session_count=_bound_session_count,
+                    host_id=self._identity.host_id,
+                ),
+            )
             model_options_prewarm_task = self._model_options_prewarm_task
             if model_options_prewarm_task is not None:
                 model_options_prewarm_task.cancel()
@@ -4120,7 +4212,12 @@ class HostProcess:
             for watcher in list(self._watcher_tasks):
                 with contextlib.suppress(asyncio.CancelledError, Exception):
                     await watcher
-            self._cleanup_runners()
+            # Use a shared total-wait budget for signal stops so runner
+            # cleanup finishes well inside the CLI's 5s stop grace window.
+            _is_signal_stop = self._shutdown_signal_num is not None
+            self._cleanup_runners(
+                total_wait_s=_SIGNAL_RUNNER_KILL_TIMEOUT_S if _is_signal_stop else None
+            )
             # Final drain: _cleanup_runners has just reaped the tracked
             # runners via Popen, so any of their still-orphaned tool
             # grandchildren are now reapable and no tracked pid can be stolen.
@@ -4136,6 +4233,12 @@ class HostProcess:
             # old-host/new-host handoff a deterministic startup-sweep barrier.
             if self._lifecycle_lock is not None:
                 self._lifecycle_lock.release()
+            # Remove SIGTERM/SIGHUP handlers last so a second signal during
+            # teardown is a no-op (handlers already idempotent) rather than
+            # reverting to the default POSIX disposition (immediate kill).
+            for _sig in _installed_sigs:
+                with contextlib.suppress(Exception):
+                    _sigloop.remove_signal_handler(_sig)
 
     def _on_resume_from_suspend(self, gap_s: float) -> None:
         """Force-drop the tunnel after a detected wake from system suspend.
@@ -4174,20 +4277,34 @@ class HostProcess:
             with contextlib.suppress(Exception):
                 transport.abort()
 
-    def _cleanup_runners(self) -> None:
+    def _cleanup_runners(self, *, total_wait_s: float | None = None) -> None:
         """Terminate all live runners on shutdown.
 
+        :param total_wait_s: Shared deadline in seconds across all runners.
+            When ``None`` each runner gets an independent 5 s window (the
+            default for non-signal stops). For signal-initiated stops pass
+            :data:`_SIGNAL_RUNNER_KILL_TIMEOUT_S` so the total wait fits
+            inside the CLI's stop grace even with many runners.
         :returns: None.
         """
         for runner_id, handle in self._runners.items():
             if handle.proc.poll() is None:
                 _logger.info("Terminating runner %s on shutdown", runner_id)
                 handle.proc.terminate()
-        for handle in self._runners.values():
-            try:
-                handle.proc.wait(timeout=5.0)
-            except subprocess.TimeoutExpired:
-                handle.proc.kill()
+        if total_wait_s is not None:
+            deadline = time.monotonic() + total_wait_s
+            for handle in self._runners.values():
+                remaining = max(0.0, deadline - time.monotonic())
+                try:
+                    handle.proc.wait(timeout=remaining)
+                except subprocess.TimeoutExpired:
+                    handle.proc.kill()
+        else:
+            for handle in self._runners.values():
+                try:
+                    handle.proc.wait(timeout=5.0)
+                except subprocess.TimeoutExpired:
+                    handle.proc.kill()
         self._runners.clear()
 
     async def _connect_and_serve(self) -> None:
@@ -4950,3 +5067,9 @@ def run_host_process(
             flush=True,
         )
         raise SystemExit(HOST_FATAL_EXIT_CODE) from exc
+    # A signal-initiated graceful exit must report the shell-standard exit code
+    # (128 + signum) so supervisors treat it as a deliberate stop.
+    # SIGTERM → 143 (HOST_SIGTERM_EXIT_CODE, treated as deliberate by
+    # omnigent/onboarding/sandboxes/base.py); SIGHUP → 129.
+    if host._shutdown_signal_num is not None:
+        raise SystemExit(128 + host._shutdown_signal_num)
