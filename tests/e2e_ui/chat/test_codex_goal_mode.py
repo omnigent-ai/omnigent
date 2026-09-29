@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import json
 import re
+import sys
 from urllib.parse import urlparse
 
 import pytest
-from playwright.sync_api import Page, Route, expect
+from playwright.sync_api import Error, Page, Route, expect
 
 from tests.e2e_ui.conftest import MockedCodexNativeSession, fetch_with_retry
 from tests.e2e_ui.messages.test_message_render_parity import (
@@ -52,7 +53,15 @@ def test_codex_goal_mode_processes_first_message_with_untrusted_hooks(
     runner_online = {"value": True}
 
     def _patch_health(route: Route) -> None:
-        response = fetch_with_retry(route)
+        try:
+            response = fetch_with_retry(route)
+        except Error as exc:
+            # Playwright swallows handler exceptions, so a dead upstream would
+            # wedge the test until the pytest timeout. Log + abort instead:
+            # the poll rejects and the next assertion fails on its own terms.
+            print(f"_patch_health: upstream fetch failed: {exc}", file=sys.stderr, flush=True)
+            route.abort()
+            return
         payload = response.json()
         live = {"runner_online": runner_online["value"], "host_online": True}
         if isinstance(payload.get("sessions"), dict):
@@ -83,9 +92,10 @@ def test_codex_goal_mode_processes_first_message_with_untrusted_hooks(
     assert requests[0]["body"]["model"] == "mock-model"
     assert "Bootstrap the mocked goal-mode e2e thread." in str(requests[0]["body"]["input"])
 
-    goal_toggle = page.get_by_test_id("goal-toggle")
+    page.get_by_test_id("composer-attach").click()
+    goal_toggle = page.get_by_test_id("composer-goal-action")
     expect(goal_toggle).to_be_visible(timeout=30_000)
-    expect(goal_toggle).to_have_attribute("aria-label", "Set Codex goal")
+    expect(goal_toggle).to_contain_text("Goal")
 
     with page.expect_response(_goal_response(session.session_id, "GET")):
         goal_toggle.click()
@@ -107,13 +117,17 @@ def test_codex_goal_mode_processes_first_message_with_untrusted_hooks(
     expect(current_goal).to_contain_text("paused", timeout=30_000)
     expect(current_goal).to_contain_text(objective)
     expect(current_goal).to_contain_text("0 / 12,345 tokens")
-    expect(page.get_by_test_id("composer-goal-mode")).to_contain_text("Goal paused")
+    expect(page.get_by_test_id("composer-goal-mode")).to_have_attribute(
+        "aria-label", f"Goal paused: {objective}"
+    )
     expect(page.get_by_test_id("goal-resume")).to_be_visible()
 
     with page.expect_response(_goal_response(session.session_id, "PATCH", "/status")):
         page.get_by_test_id("goal-resume").click()
     expect(current_goal).to_contain_text("active", timeout=30_000)
-    expect(page.get_by_test_id("composer-goal-mode")).to_contain_text("Goal active")
+    expect(page.get_by_test_id("composer-goal-mode")).to_have_attribute(
+        "aria-label", f"Goal active: {objective}"
+    )
     expect(page.get_by_test_id("goal-pause")).to_be_visible()
 
     runner_online["value"] = False
@@ -121,12 +135,14 @@ def test_codex_goal_mode_processes_first_message_with_untrusted_hooks(
     with page.expect_response(_goal_response(session.session_id, "GET"), timeout=30_000):
         runner_online["value"] = True
         page.wait_for_timeout(12_000)
-    expect(page.get_by_test_id("composer-goal-mode")).to_contain_text(
-        "Goal active", timeout=30_000
+    expect(page.get_by_test_id("composer-goal-mode")).to_have_attribute(
+        "aria-label", f"Goal active: {objective}", timeout=30_000
     )
 
     with page.expect_response(_goal_response(session.session_id, "DELETE")):
         page.get_by_test_id("goal-clear").click()
     expect(page.get_by_test_id("goal-empty")).to_be_visible(timeout=30_000)
     expect(page.get_by_test_id("composer-goal-mode")).to_have_count(0)
-    expect(goal_toggle).to_have_attribute("aria-label", "Set Codex goal")
+    page.keyboard.press("Escape")
+    page.get_by_test_id("composer-attach").click()
+    expect(goal_toggle).to_contain_text("Goal")

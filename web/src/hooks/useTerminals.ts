@@ -57,6 +57,7 @@ export const AGENT_TERMINAL_IDS: ReadonlySet<string> = new Set([
   "terminal_antigravity_main",
   "terminal_kimi_main",
   "terminal_hermes_main",
+  "terminal_devin_main",
 ]);
 
 /**

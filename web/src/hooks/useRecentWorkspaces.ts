@@ -40,6 +40,10 @@ function writeAll(map: RecentMap): void {
   }
 }
 
+export function readRecentWorkspaces(hostId: string | null): string[] {
+  return hostId === null ? [] : (readAll()[hostId] ?? []);
+}
+
 export interface RecentWorkspaces {
   /** Most-recent-first absolute paths used on this host. */
   recent: string[];
@@ -70,7 +74,7 @@ export function useRecentWorkspaces(hostId: string | null): RecentWorkspaces {
   // previous host's paths right after a host switch (a cross-host leak).
   const recent = useMemo(() => {
     void revision;
-    return hostId === null ? [] : (readAll()[hostId] ?? []);
+    return readRecentWorkspaces(hostId);
   }, [hostId, revision]);
 
   const addRecent = useCallback(

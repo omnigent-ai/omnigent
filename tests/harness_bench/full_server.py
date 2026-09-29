@@ -283,7 +283,9 @@ class SharedFullServer:
     def create_session(self, agent_name: str) -> str:
         """Create a runner-bound session for a registered agent name."""
         assert self.client is not None
-        listing = self.client.get("/v1/sessions", params={"agent_name": agent_name, "limit": 1})
+        listing = self.client.get(
+            "/v1/sessions", params={"visibility": "all", "agent_name": agent_name, "limit": 1}
+        )
         listing.raise_for_status()
         agent_id = str(listing.json()["data"][0]["agent_id"])
         created = self.client.post("/v1/sessions", json={"agent_id": agent_id})

@@ -8,6 +8,7 @@ spec's guardrails and returns the correct verdict.
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, field
 from typing import Any
 from unittest.mock import patch
@@ -17,7 +18,10 @@ import pytest
 from omnigent.entities import Conversation, ConversationItem
 from omnigent.entities.agent import Agent, LoadedAgent
 from omnigent.entities.conversation import FunctionCallData
-from omnigent.policies.types import PolicyAction, PolicyResult
+from omnigent.policies.types import EvaluationContext, PolicyAction, PolicyResult
+from omnigent.server.routes._sessions.orchestration import (
+    _evaluate_policy_with_fresh_engine,
+)
 from omnigent.server.routes.sessions import (
     _build_evaluation_context,
     _build_skill_slash_command_policy_body,
@@ -210,6 +214,47 @@ _CACHE_PATCH = "omnigent.server.routes.sessions.get_agent_cache"
 _ENGINE_PATCH = "omnigent.server.routes.sessions.build_policy_engine"
 _HOLD_GATE_PATCH = "omnigent.server.routes.sessions._hold_native_ask_gate"
 _STREAM_PATCH = "omnigent.server.routes.sessions.session_stream"
+
+
+@pytest.mark.asyncio
+async def test_fresh_policy_engines_are_serialized_per_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Concurrent deployed tool calls cannot race persisted policy state."""
+    active = 0
+    max_active = 0
+
+    class _Engine:
+        async def evaluate(self, _ctx: Any) -> PolicyResult:
+            nonlocal active, max_active
+            active += 1
+            max_active = max(max_active, active)
+            await asyncio.sleep(0)
+            active -= 1
+            return PolicyResult(action=PolicyAction.ALLOW)
+
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions._build_policy_engine_from_spec",
+        lambda *_args: _Engine(),
+    )
+    conversation_store = _FakeConversationStore()
+    conv = conversation_store.get_conversation("sess_serialized")
+    ctx = EvaluationContext(phase=Phase.TOOL_CALL, content={}, tool_name="tool")
+
+    await asyncio.gather(
+        *(
+            _evaluate_policy_with_fresh_engine(
+                "sess_serialized",
+                _make_spec_no_guardrails(),
+                conversation_store,
+                conv,
+                ctx,
+            )
+            for _ in range(5)
+        )
+    )
+
+    assert max_active == 1
 
 
 @pytest.mark.asyncio

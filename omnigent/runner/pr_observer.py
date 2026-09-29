@@ -17,14 +17,28 @@ from omnigent.policies.builtins._shell import (
 from omnigent.runner.session_prs import PullRequestRef, SessionPrRegistry, observation_key
 
 _logger = logging.getLogger(__name__)
+_PR_WRITES = {
+    "create",
+    "edit",
+    "merge",
+    "close",
+    "reopen",
+    "ready",
+    "lock",
+    "unlock",
+    "update-branch",
+}
+_MCP_REVIEWS = {
+    "create_pull_request_review",
+    "submit_pending_pull_request_review",
+    "pull_request_review_write",
+}
 _MCP_ACTIONS = {
     "create_pull_request",
     "update_pull_request",
     "merge_pull_request",
     "update_pull_request_branch",
-    "create_pull_request_review",
-    "submit_pending_pull_request_review",
-    "pull_request_review_write",
+    *_MCP_REVIEWS,
 }
 
 
@@ -241,16 +255,67 @@ def _api_endpoint(tokens: list[str]) -> str | None:
     return None
 
 
+def _api_method(tokens: list[str]) -> str:
+    method = _flag(tokens, "--method", "-X")
+    if method is None:
+        method = (
+            "POST" if _flag(tokens, "--field", "--raw-field", "-f", "-F", "--input") else "GET"
+        )
+    return method.upper()
+
+
+def _api_field(tokens: list[str], field: str) -> str | None:
+    flags = ("--field", "--raw-field", "-f", "-F")
+    index = 0
+    while index < len(tokens):
+        value = _flag(tokens[index : index + 2], *flags)
+        if value is not None:
+            key, separator, content = value.partition("=")
+            if key == field and separator:
+                return content
+            if tokens[index] in flags:
+                index += 1
+        index += 1
+    return None
+
+
+def _changes_review_state(event: object) -> bool:
+    return isinstance(event, str) and event.upper() in {"APPROVE", "REQUEST_CHANGES"}
+
+
+def _tracks_pr(tokens: list[str]) -> bool:
+    """Track PR changes, excluding reads and comment-only interactions."""
+    if tokens[0] == "pr":
+        if len(tokens) < 2:
+            return False
+        if tokens[1] == "review":
+            return bool({"--approve", "-a", "--request-changes", "-r"}.intersection(tokens[2:]))
+        return tokens[1] in _PR_WRITES
+    if tokens[0] != "api" or _api_method(tokens) not in {"POST", "PATCH", "PUT", "DELETE"}:
+        return False
+    endpoint = (_api_endpoint(tokens[1:]) or "").split("?", 1)[0]
+    path = endpoint.strip("/").split("/")
+    # GraphQL POSTs can be queries or comment mutations; HTTP method alone is insufficient.
+    if path[0] != "repos" or len(path) < 4:
+        return False
+    resource = path[3:]
+    if "comments" in resource:
+        return False
+    if "reviews" in resource:
+        return _changes_review_state(_api_field(tokens, "event"))
+    return True
+
+
 def _creates_pr(tokens: list[str]) -> bool:
     if tokens[:2] == ["pr", "create"]:
         return True
     if tokens[0] != "api":
         return False
-    method = _flag(tokens, "--method", "-X")
-    if method is None:
-        method = "POST" if _flag(tokens, "--field", "--raw-field", "-f", "-F") else "GET"
     endpoint = (_api_endpoint(tokens[1:]) or "").split("?", 1)[0]
-    return method == "POST" and re.fullmatch(r"/?repos/[^/]+/[^/]+/pulls/?", endpoint) is not None
+    return (
+        _api_method(tokens) == "POST"
+        and re.fullmatch(r"/?repos/[^/]+/[^/]+/pulls/?", endpoint) is not None
+    )
 
 
 def _positional_target(tokens: list[str]) -> str | None:
@@ -372,6 +437,19 @@ def _content_only(tokens: list[str]) -> bool:
     )
 
 
+def _created_pr_metadata(result: object) -> PullRequestRef | None:
+    """Read Claude's creation identity from tool metadata, never rendered stdout."""
+    if not isinstance(result, dict):
+        return None
+    operation = result.get("gitOperation")
+    if not isinstance(operation, dict):
+        return None
+    pr = operation.get("pr")
+    if not isinstance(pr, dict) or pr.get("action") != "created":
+        return None
+    return _reference(pr.get("url"))
+
+
 def _mcp_prs(
     arguments: dict[str, object], result: object, *, created: bool
 ) -> list[PullRequestRef]:
@@ -422,18 +500,29 @@ def extract_prs(
         if not isinstance(command, str) or len(command) > 100_000:
             return [], False
         # Unrelated setup commands do not affect PR associations.
-        commands = [
+        gh_commands = [
             tokens for tokens in _gh_commands(command) if tokens and tokens[0] in {"pr", "api"}
         ]
+        commands = [tokens for tokens in gh_commands if _tracks_pr(tokens)]
         if not commands:
             return [], False
         text = _output_text(result)
-        if re.search(r"\[exit code: [1-9]|Process exited with code [1-9]", text):
+        if re.search(
+            r"(?:^|\n)(?:\[exit code: -?[1-9][0-9]*\]"
+            r"|Process exited with code -?[1-9][0-9]*)\s*\Z",
+            text,
+        ):
             return [], False
-        # Mixed reads/writes still associate PRs, but cannot establish creation.
         created = all(_creates_pr(tokens) for tokens in commands)
         references = [ref for tokens in commands if (ref := _command_target(tokens))]
-        if len(commands) > 1 or not _content_only(commands[0]):
+        if any(_creates_pr(tokens) for tokens in commands) and (
+            ref := _created_pr_metadata(result)
+        ):
+            references.append(ref)
+        # Shared stdout cannot attribute a result to a write when reads/comments also ran.
+        if len(commands) == len(gh_commands) and (
+            len(commands) > 1 or not _content_only(commands[0])
+        ):
             for obj in _objects(result):
                 if ref := _reference(obj.get("html_url", obj.get("url"))):
                     references.append(ref)
@@ -459,6 +548,8 @@ def extract_prs(
             if isinstance(params, dict):
                 arguments = {**params, "owner": params.get("owner", params.get("org"))}
         if name not in _MCP_ACTIONS:
+            return [], False
+        if name in _MCP_REVIEWS and not _changes_review_state(arguments.get("event")):
             return [], False
         created = name == "create_pull_request"
         references = _mcp_prs(arguments, result, created=created)

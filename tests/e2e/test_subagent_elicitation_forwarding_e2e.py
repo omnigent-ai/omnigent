@@ -703,7 +703,9 @@ def test_subagent_prompt_surfaces_on_parent_and_resolves_via_child(
 
         baseline = {
             s.get("id")
-            for s in _get(local_server, "/v1/sessions?order=desc&limit=60", token).get("data", [])
+            for s in _get(
+                local_server, "/v1/sessions?order=desc&limit=60&visibility=all", token
+            ).get("data", [])
         }
         log = open(log_path, "w")  # noqa: SIM115 — lives for the run subprocess lifetime
         run_proc = subprocess.Popen(
@@ -738,7 +740,9 @@ def test_subagent_prompt_surfaces_on_parent_and_resolves_via_child(
         #    polling the full turn budget).
         parent_deadline = time.monotonic() + _PARENT_DISCOVER_TIMEOUT_SEC
         while time.monotonic() < parent_deadline and parent_id is None:
-            for s in _get(local_server, "/v1/sessions?order=desc&limit=60", token).get("data", []):
+            for s in _get(
+                local_server, "/v1/sessions?order=desc&limit=60&visibility=all", token
+            ).get("data", []):
                 if s.get("id") not in baseline and (
                     (s.get("agent_name") or "").lower() == "ask-mode-supervisor"
                 ):

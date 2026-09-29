@@ -113,7 +113,7 @@ A profile's `transport` is a harness-family marker. The resolved driver is:
 | **Policy DENY** | A tool-call policy blocks the call. | P0 |
 | **Policy ALLOW** | A tool call proceeds while an explicit allow policy is attached. | P1 |
 | **Policy ASK** | An ask policy raises an approval elicitation. | P1 |
-| **Model override** | The harness accepts and completes with the requested model. | P0 |
+| **Model override** | The harness accepts and completes with the requested model; `SKIPPED` when the transport never applies it (native-tui). | P0 |
 | **Cost tracking** | A completed turn reports priced cost (`SUPPORTED`) or tokens only (`PARTIAL`). | P1 |
 | **Interrupt** | A running turn stops after interruption. | P0 |
 

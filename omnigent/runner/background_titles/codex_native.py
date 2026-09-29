@@ -31,6 +31,7 @@ async def generate_background_title(context: BackgroundTitleContext) -> str | No
         materialize_codex_provider_config,
     )
     from omnigent.runner.native.orchestration import _codex_native_model_from_spec
+    from omnigent.util.reasoning_effort import CODEX_NATIVE_EFFORTS
 
     model = (
         context.title_model
@@ -49,6 +50,7 @@ async def generate_background_title(context: BackgroundTitleContext) -> str | No
             codex_home,
             _codex_home_config_source_from_env(),
             minimal_config=True,
+            supported_efforts=CODEX_NATIVE_EFFORTS,
         )
         # Profile/model discovery can block in SDK initialization; keep the runner responsive.
         native_server = await asyncio.to_thread(

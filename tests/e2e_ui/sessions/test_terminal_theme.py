@@ -136,16 +136,14 @@ def test_dark_terminal_under_light_app(page: Page, terminal_session: tuple[str, 
     assert not _html_has_dark(page), "app theme must stay light while the terminal is dark"
 
 
-def test_terminal_theme_control_defaults_and_persists(
-    page: Page, seeded_session: tuple[str, str]
-) -> None:
+def test_terminal_theme_control_defaults_and_persists(page: Page, live_server: str) -> None:
     """Match-app is the default; a pick persists and survives a reload.
 
     A fast, shell-free check of the control itself: fresh context selects "Match
     app" with nothing stored; picking Light persists "light" and re-selects after
     a full reload (so the choice a terminal reads at mount is durable).
     """
-    base_url, _session_id = seeded_session
+    base_url = live_server
     _open_appearance(page, base_url)
 
     # Fresh context → "Match app" (auto) is the selected default, nothing stored.

@@ -13,21 +13,28 @@ from omnigent.server.managed_hosts import (
     ManagedSandboxDeployment,
     _launcher_for_teardown,
 )
-from omnigent.stores.host_store import Host, HostStore, host_is_live
+from omnigent.stores.host_store import (
+    Host,
+    HostStore,
+    ManagedSandboxScanCursor,
+    ManagedSandboxScanRow,
+    host_is_live,
+)
 
 _logger = logging.getLogger(__name__)
 
 _SECONDS_PER_DAY = 24 * 60 * 60
+_DEFAULT_SCAN_BATCH_SIZE = 500
 
 
 class ManagedSandboxReaper:
     """Reap stale generations and retry pending provider cleanup.
 
-    Each loop covers the whole configured deployment. A sweep discovers every
-    workspace containing an active or pending managed sandbox, then queries
-    candidates within that workspace. Offline age comes from the host heartbeat
-    row, which is the persisted source of truth for when the sandbox was last
-    online.
+    Each loop traverses both persisted sandbox-id slots in bounded keyset pages.
+    The traversal is deterministic and complete rather than random: every
+    current or pending generation present when its page is reached is examined.
+    Offline age comes from the host heartbeat row, which is the persisted source
+    of truth for when the sandbox was last online.
 
     Reaping detaches only the stale provider generation. The session transcript
     and durable host row remain, allowing a fresh sandbox to launch while failed
@@ -40,10 +47,14 @@ class ManagedSandboxReaper:
         host_store: HostStore,
         sandbox_config: ManagedSandboxDeployment,
         clock: Callable[[], int] = now_epoch,
+        scan_batch_size: int = _DEFAULT_SCAN_BATCH_SIZE,
     ) -> None:
+        if scan_batch_size <= 0:
+            raise ValueError("scan_batch_size must be positive")
         self._host_store = host_store
         self._sandbox_config = sandbox_config
         self._clock = clock
+        self._scan_batch_size = scan_batch_size
         self._task: asyncio.Task[None] | None = None
 
     async def start(self) -> None:
@@ -68,23 +79,12 @@ class ManagedSandboxReaper:
     async def sweep_once(self, *, now: int | None = None) -> int:
         """Run one complete cross-workspace sweep and return the reap count."""
         reference_time = self._clock() if now is None else now
-        workspace_ids = await asyncio.to_thread(
-            self._host_store.list_managed_sandbox_workspace_ids
+        cutoff = (
+            reference_time
+            - self._sandbox_config.reaper.terminate_after_offline_days * _SECONDS_PER_DAY
         )
-        reaped = 0
-        for workspace_id in workspace_ids:
-            try:
-                reaped += await self._sweep_current_workspace(
-                    workspace_id,
-                    reference_time,
-                )
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                _logger.exception(
-                    "Managed sandbox reaper failed for workspace %s; continuing",
-                    workspace_id,
-                )
+        reaped = await self._sweep_terminating_slot(cutoff=cutoff, now=reference_time)
+        reaped += await self._sweep_current_slot(cutoff=cutoff, now=reference_time)
         return reaped
 
     async def _run(self) -> None:
@@ -99,22 +99,65 @@ class ManagedSandboxReaper:
                 _logger.exception("Managed sandbox reaper sweep failed; retrying later")
             await asyncio.sleep(self._sandbox_config.reaper.sweep_interval_s)
 
-    async def _sweep_current_workspace(self, workspace_id: int, now: int) -> int:
-        cutoff = now - self._sandbox_config.reaper.terminate_after_offline_days * _SECONDS_PER_DAY
-        hosts = await asyncio.to_thread(
-            self._list_stale_managed_sandbox_hosts,
-            workspace_id,
-            cutoff,
-        )
-        grouped: dict[str, list[Host]] = {}
-        for host in hosts:
+    async def _sweep_terminating_slot(self, *, cutoff: int, now: int) -> int:
+        cursor: ManagedSandboxScanCursor | None = None
+        reaped = 0
+        while True:
+            page = await asyncio.to_thread(
+                self._host_store.list_terminating_managed_sandbox_hosts_page,
+                after=cursor,
+                limit=self._scan_batch_size,
+            )
+            if not page:
+                break
+            workspace_id, last = page[-1]
+            terminating_sandbox_id = last.terminating_sandbox_id
+            assert terminating_sandbox_id is not None
+            cursor = (terminating_sandbox_id, workspace_id, last.host_id)
+            reaped += await self._reap_page(page, cutoff=cutoff, now=now, current_slot=False)
+            if len(page) < self._scan_batch_size:
+                break
+        return reaped
+
+    async def _sweep_current_slot(self, *, cutoff: int, now: int) -> int:
+        cursor: ManagedSandboxScanCursor | None = None
+        reaped = 0
+        while True:
+            page = await asyncio.to_thread(
+                self._host_store.list_current_managed_sandbox_hosts_page,
+                after=cursor,
+                limit=self._scan_batch_size,
+            )
+            if not page:
+                break
+            workspace_id, last = page[-1]
+            sandbox_id = last.sandbox_id
+            assert sandbox_id is not None
+            cursor = (sandbox_id, workspace_id, last.host_id)
+            reaped += await self._reap_page(page, cutoff=cutoff, now=now, current_slot=True)
+            if len(page) < self._scan_batch_size:
+                break
+        return reaped
+
+    async def _reap_page(
+        self,
+        page: list[ManagedSandboxScanRow],
+        *,
+        cutoff: int,
+        now: int,
+        current_slot: bool,
+    ) -> int:
+        grouped: dict[tuple[int, str], list[Host]] = {}
+        for workspace_id, host in sorted(page, key=self._page_reap_order):
+            if current_slot and host.terminating_sandbox_id is not None:
+                continue
             if not self._is_reap_candidate(host, cutoff=cutoff, now=now):
                 continue
             assert host.sandbox_provider is not None
-            grouped.setdefault(host.sandbox_provider, []).append(host)
+            grouped.setdefault((workspace_id, host.sandbox_provider), []).append(host)
 
         reaped = 0
-        for provider, candidates in grouped.items():
+        for (workspace_id, provider), candidates in grouped.items():
             try:
                 reaped += await asyncio.to_thread(
                     self._reap_group,
@@ -134,13 +177,11 @@ class ManagedSandboxReaper:
                 )
         return reaped
 
-    def _list_stale_managed_sandbox_hosts(
-        self,
-        workspace_id: int,
-        cutoff: int,
-    ) -> list[Host]:
-        with workspace_scope(workspace_id):
-            return self._host_store.list_stale_managed_sandbox_hosts(cutoff)
+    @staticmethod
+    def _page_reap_order(row: ManagedSandboxScanRow) -> tuple[int, int, str]:
+        workspace_id, host = row
+        relevant_at = host.deleted_at if host.deleted_at is not None else host.updated_at
+        return relevant_at, workspace_id, host.host_id
 
     def _reap_group(
         self,

@@ -7,7 +7,9 @@ the parent session: the gate reads the parent's effective model
 child's ``model_override``. Inheritance is best-effort and skips quietly
 when the sub-agent spec pins its own model, the child harness has no
 override plumbing, the parent model's family cannot run on the child
-harness, or the parent snapshot is unavailable.
+harness, the child is a multi-model harness (pi, opencode, …) unlike the
+parent's harness (and no inference binding validates the id), or the
+parent snapshot is unavailable.
 """
 
 from __future__ import annotations
@@ -37,6 +39,19 @@ def _spec_with_worker(
     if worker_model is not None:
         executor.model = worker_model
     return SimpleNamespace(sub_agents=[SimpleNamespace(name="worker", executor=executor)])
+
+
+def _stub_worker_launchable(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Let a native-harness dispatch pass preflight in a CLI-less test env.
+
+    The dispatch rejects a worker whose harness CLI is missing; stub that probe
+    present so the inheritance gate — not the binary — is what the test drives.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    from omnigent.onboarding import harness_install
+
+    monkeypatch.setattr(harness_install, "missing_harness_cli", lambda _harness: None)
 
 
 async def _dispatch_without_model(
@@ -128,6 +143,7 @@ async def test_child_inherits_parent_model_override(
         parent_snapshot={
             "id": "conv_parent_inherit_override",
             "agent_id": "ag_parent",
+            "harness": "claude-sdk",
             "model_override": "databricks-claude-sonnet-4-6",
             "llm_model": "databricks-claude-opus-4-8",
         },
@@ -152,6 +168,7 @@ async def test_child_inherits_parent_llm_model_when_no_override(
         parent_snapshot={
             "id": "conv_parent_inherit_llm",
             "agent_id": "ag_parent",
+            "harness": "claude-sdk",
             "model_override": None,
             "llm_model": "databricks-claude-sonnet-4-6",
         },
@@ -299,3 +316,269 @@ async def test_unreachable_parent_snapshot_skips_inheritance(
         parent_snapshot=None,
     )
     assert "model_override" not in bodies[0]
+
+
+@pytest.mark.asyncio
+async def test_child_of_different_parent_harness_skips(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A child on a different harness vendor (opencode) than the parent (claude)
+    runs its own default: opencode resolves the parent's Claude id against its
+    own provider, where it need not be servable. The child is created with no
+    ``model_override``.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    _stub_worker_launchable(monkeypatch)
+    bodies = await _dispatch_without_model(
+        monkeypatch,
+        agent_spec=_spec_with_worker("opencode-native"),
+        conv_id="conv_parent_opencode_foreign",
+        parent_snapshot={
+            "id": "conv_parent_opencode_foreign",
+            "agent_id": "ag_parent",
+            "harness": "claude-native",
+            "model_override": "claude-opus-5",
+            "llm_model": None,
+        },
+    )
+    assert "model_override" not in bodies[0]
+
+
+@pytest.mark.asyncio
+async def test_multi_model_child_of_different_multi_parent_skips(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A multi-model child (pi) dispatched from a *different* multi-model parent
+    (opencode) still runs its own default — "accepts any id" does not mean the
+    parent's id is servable on pi's configured provider.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    _stub_worker_launchable(monkeypatch)
+    bodies = await _dispatch_without_model(
+        monkeypatch,
+        agent_spec=_spec_with_worker("pi"),
+        conv_id="conv_parent_pi_foreign",
+        parent_snapshot={
+            "id": "conv_parent_pi_foreign",
+            "agent_id": "ag_parent",
+            "harness": "opencode-native",
+            "model_override": "anthropic/claude-sonnet-4-5",
+            "llm_model": None,
+        },
+    )
+    assert "model_override" not in bodies[0]
+
+
+@pytest.mark.asyncio
+async def test_multi_model_child_same_harness_as_parent_inherits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A multi-model child inherits when it is the *same* harness as the parent:
+    a pi parent's selection shares pi's provider vocabulary, so the pi child
+    keeps it.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    _stub_worker_launchable(monkeypatch)
+    bodies = await _dispatch_without_model(
+        monkeypatch,
+        agent_spec=_spec_with_worker("pi"),
+        conv_id="conv_parent_pi_same",
+        parent_snapshot={
+            "id": "conv_parent_pi_same",
+            "agent_id": "ag_parent",
+            "harness": "pi",
+            "model_override": "databricks-claude-opus-5",
+            "llm_model": None,
+        },
+    )
+    assert bodies[0]["model_override"] == "databricks-claude-opus-5"
+
+
+@pytest.mark.asyncio
+async def test_multi_model_child_native_variant_of_parent_inherits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Same vendor across the native/SDK split still inherits: a ``pi-native``
+    parent and a ``pi`` child share Pi's provider vocabulary, so the ``-native``
+    distinction must not make them count as different harnesses.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    _stub_worker_launchable(monkeypatch)
+    bodies = await _dispatch_without_model(
+        monkeypatch,
+        agent_spec=_spec_with_worker("pi"),
+        conv_id="conv_parent_pi_native",
+        parent_snapshot={
+            "id": "conv_parent_pi_native",
+            "agent_id": "ag_parent",
+            "harness": "pi-native",
+            "model_override": "databricks-claude-opus-5",
+            "llm_model": None,
+        },
+    )
+    assert bodies[0]["model_override"] == "databricks-claude-opus-5"
+
+
+@pytest.mark.asyncio
+async def test_child_shares_parent_vendor_across_sdk_native_split_inherits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A ``claude-sdk`` child of a ``claude-native`` parent inherits: the SDK and
+    native spellings of one vendor share a provider vocabulary, so the ``-native``
+    vs ``-sdk`` difference must not count them as foreign harnesses.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    bodies = await _dispatch_without_model(
+        monkeypatch,
+        agent_spec=_spec_with_worker("claude-sdk"),
+        conv_id="conv_parent_claude_variants",
+        parent_snapshot={
+            "id": "conv_parent_claude_variants",
+            "agent_id": "ag_parent",
+            "harness": "claude-native",
+            "model_override": "databricks-claude-opus-5",
+            "llm_model": None,
+        },
+    )
+    assert bodies[0]["model_override"] == "databricks-claude-opus-5"
+
+
+@pytest.mark.asyncio
+async def test_opencode_worker_with_binding_inherits_bare_bound_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A binding-validated bare id is inherited without a prefix or profile.
+
+    An inference binding owns the harness's model namespace — launch resolves
+    ids through ``resolve_bound_model`` — so the prefix/profile restriction
+    does not apply. The inherited model deliberately differs from the
+    binding's default: inheritance must carry the parent's selection rather
+    than fall back to the worker default.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    _stub_worker_launchable(monkeypatch)
+    config: dict[str, Any] = {
+        "providers": {"gw": {}},
+        "inference": {
+            "harnesses": {
+                "opencode-native": {
+                    "provider": "gw",
+                    "default_model": "claude-sonnet-4-6",
+                    "model_allowlist": ["claude-sonnet-4-6", "claude-opus-4-8"],
+                }
+            }
+        },
+    }
+    monkeypatch.setattr(
+        "omnigent.inference_config.load_runtime_inference_config",
+        lambda base_config=None: config,
+    )
+    bodies = await _dispatch_without_model(
+        monkeypatch,
+        agent_spec=_spec_with_worker("opencode-native"),
+        conv_id="conv_parent_opencode_binding",
+        parent_snapshot={
+            "id": "conv_parent_opencode_binding",
+            "agent_id": "ag_parent",
+            "model_override": "claude-opus-4-8",
+            "llm_model": None,
+        },
+    )
+    assert bodies[0]["model_override"] == "claude-opus-4-8"
+
+
+@pytest.mark.asyncio
+async def test_opencode_worker_with_binding_skips_unlisted_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A parent model outside the binding's allowlist is not inherited.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    _stub_worker_launchable(monkeypatch)
+    config: dict[str, Any] = {
+        "providers": {"gw": {}},
+        "inference": {
+            "harnesses": {
+                "opencode-native": {
+                    "provider": "gw",
+                    "default_model": "claude-sonnet-4-6",
+                    "model_allowlist": ["claude-sonnet-4-6"],
+                }
+            }
+        },
+    }
+    monkeypatch.setattr(
+        "omnigent.inference_config.load_runtime_inference_config",
+        lambda base_config=None: config,
+    )
+    bodies = await _dispatch_without_model(
+        monkeypatch,
+        agent_spec=_spec_with_worker("opencode-native"),
+        conv_id="conv_parent_opencode_unlisted",
+        parent_snapshot={
+            "id": "conv_parent_opencode_unlisted",
+            "agent_id": "ag_parent",
+            "model_override": "claude-opus-4-8",
+            "llm_model": None,
+        },
+    )
+    assert "model_override" not in bodies[0]
+
+
+@pytest.mark.asyncio
+async def test_binding_lets_foreign_multi_model_child_inherit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    An inference binding overrides the foreign-multi-model skip: it owns the
+    harness's model namespace (launch resolves ids through ``resolve_bound_model``
+    and ``_dispatch_model_mismatch`` has vetted the id against the allowlist), so
+    a binding-validated id is inherited even onto a different-harness pi child.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    _stub_worker_launchable(monkeypatch)
+    config: dict[str, Any] = {
+        "providers": {"gw": {}},
+        "inference": {
+            "harnesses": {
+                "pi": {
+                    "provider": "gw",
+                    "default_model": "databricks-claude-sonnet-4-6",
+                    "model_allowlist": [
+                        "databricks-claude-sonnet-4-6",
+                        "databricks-claude-opus-5",
+                    ],
+                }
+            }
+        },
+    }
+    monkeypatch.setattr(
+        "omnigent.inference_config.load_runtime_inference_config",
+        lambda base_config=None: config,
+    )
+    bodies = await _dispatch_without_model(
+        monkeypatch,
+        agent_spec=_spec_with_worker("pi"),
+        conv_id="conv_parent_pi_binding",
+        parent_snapshot={
+            "id": "conv_parent_pi_binding",
+            "agent_id": "ag_parent",
+            "harness": "claude-native",
+            "model_override": "databricks-claude-opus-5",
+            "llm_model": None,
+        },
+    )
+    assert bodies[0]["model_override"] == "databricks-claude-opus-5"

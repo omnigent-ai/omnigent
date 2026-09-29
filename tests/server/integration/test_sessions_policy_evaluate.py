@@ -24,6 +24,7 @@ Uses the shared ``client`` fixture from ``tests/server/conftest.py``
 from __future__ import annotations
 
 import asyncio
+import logging
 from pathlib import Path
 from typing import Any
 
@@ -357,6 +358,55 @@ async def test_tool_call_deny_with_default_policy(
     )
     assert resp2.status_code == 200
     assert resp2.json()["result"] == "POLICY_ACTION_ALLOW"
+
+
+async def test_deny_verdict_log_carries_deciding_policy_workspace_id(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """
+    The DENY verdict log names the *deciding policy's own* workspace id.
+
+    The denying policy carries ``workspace_id`` (as ``_stored_policy_to_spec``
+    stamps it from the stored row). The value logged is sourced from the
+    policy, not the ambient request — proven here by giving the policy a
+    distinctive id while the request context stays at the OSS default (0).
+    """
+    deny_bash_policy = FunctionPolicySpec(
+        name="admin__deny_bash",
+        on=None,
+        # Stand in for a stored row owned by this workspace; distinct from
+        # the request's current_workspace_id() (0) so the source is provable.
+        workspace_id=7780,
+        function=FunctionRef(path=f"{__name__}._deny_bash_tool"),
+    )
+    original_caps = get_caps()
+    patched_caps = RuntimeCaps(
+        execution_timeout=original_caps.execution_timeout,
+        default_policies=[deny_bash_policy],
+    )
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.get_caps",
+        lambda: patched_caps,
+    )
+
+    agent = await create_test_agent(client)
+    session_id = await _create_session(client, agent["id"])
+
+    with caplog.at_level(logging.INFO, logger="omnigent.server.routes.sessions"):
+        resp = await client.post(
+            f"/v1/sessions/{session_id}/policies/evaluate",
+            json=_tool_call_request("Bash"),
+        )
+    assert resp.status_code == 200
+    assert resp.json()["result"] == "POLICY_ACTION_DENY"
+
+    verdict_logs = [
+        r.getMessage() for r in caplog.records if "policy_eval_verdict" in r.getMessage()
+    ]
+    assert verdict_logs, "expected a policy_eval_verdict log for the DENY"
+    assert "policy_workspace=7780" in verdict_logs[0], verdict_logs[0]
 
 
 async def test_tool_result_deny_with_default_policy(

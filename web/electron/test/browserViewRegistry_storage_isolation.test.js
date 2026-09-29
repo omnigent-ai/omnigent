@@ -183,24 +183,24 @@ describe("agent partition permission hardening wiring (src/main.js)", () => {
   // Agent views moved off session.defaultSession onto per-conversation
   // partitions, so the shell's defaultSession permission handlers no longer
   // cover them — and an Electron session with NO handler auto-grants every
-  // permission request. Guard that main.js wires deny-all handlers for each
+  // permission request. Guard that main.js wires the consent policy for each
   // agent partition before constructing the view. Comment-stripped source
   // match (same technique as main.test.js): proves the calls exist as live
   // code, which the unit tests above cannot see.
   const mainSource = readFileSync(path.join(__dirname, "../src/main.js"), "utf8");
   const liveCode = mainSource.replace(/\/\*[\s\S]*?\*\//g, "").replace(/(^|[^:])\/\/.*$/gm, "$1");
 
-  it("registers deny-all permission handlers on each agent partition", () => {
+  it("registers the browser permission policy on each agent partition", () => {
     assert.match(
       liveCode,
-      /function hardenAgentPartition[\s\S]{0,600}session\.fromPartition\(partition\)[\s\S]{0,300}setPermissionRequestHandler\([\s\S]{0,120}callback\(false\)\)[\s\S]{0,200}setPermissionCheckHandler\(\(\) => false\)/,
+      /function hardenAgentPartition[\s\S]{0,200}session\.fromPartition\(partition\)[\s\S]{0,100}registerBrowserPermissions\(ses,/,
     );
   });
 
-  it("hardens the partition before the WebContentsView is constructed", () => {
+  it("hardens the partition before construction and binds the policy to the new view", () => {
     assert.match(
       liveCode,
-      /hardenAgentPartition\(opts && opts\.webPreferences && opts\.webPreferences\.partition\);[\s\S]{0,120}new WebContentsView\(opts\)/,
+      /hardenAgentPartition\(opts\.webPreferences\.partition, win, canPrompt,[\s\S]{0,100}const view = new WebContentsView\(opts\);\s*policy\.attach\(view\.webContents\)/,
     );
   });
 });

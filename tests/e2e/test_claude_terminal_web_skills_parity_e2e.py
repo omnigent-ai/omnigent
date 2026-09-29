@@ -2,7 +2,7 @@
 terminal's loaded skills.
 
 For a claude-family session the web composer's slash-command menu is fed by
-``GET /v1/sessions/{id}/skills`` (``_resolve_session_skills`` →
+``GET /v1/skills?session_id={id}`` (``resolve_session_skills`` →
 ``resolve_harness_skills``), while the embedded terminal's menu is whatever
 the real Claude Code CLI discovers itself. Live-verified against Claude Code
 v2.1.212, the two disagree in both directions:
@@ -35,6 +35,8 @@ from typing import Any
 import httpx
 import pytest
 
+from omnigent.host.frames import HostSkillsFrame
+from omnigent.host.skills import HostSkillDiscovery
 from omnigent.runner import create_runner_app
 from omnigent.runner.app import ResolvedSpec
 from omnigent.spec.types import SkillSpec
@@ -141,20 +143,17 @@ def _make_app(harness: str, workspace: Path) -> Any:
     )
 
 
-async def _menu_names(app: Any, session_id: str) -> list[str]:
-    """
-    Fetch the composer skill menu for *session_id* from the runner app.
+def _menu_names(harness: str, workspace: Path) -> list[str]:
+    """Read the menu catalog on the host, independently of invocation."""
 
-    :param app: The runner FastAPI app.
-    :param session_id: Session id to query (unique per call — the runner
-        caches per-session skill resolutions).
-    :returns: The skill names ``GET /v1/sessions/{id}/skills`` returned.
-    """
-    transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://runner") as c:
-        resp = await c.get(f"/v1/sessions/{session_id}/skills")
-    assert resp.status_code == 200, resp.text
-    return [s["name"] for s in resp.json()["skills"]]
+    def unexpected_bundle(_: HostSkillsFrame) -> httpx.Response:
+        raise AssertionError("Directory discovery must not fetch a session bundle")
+
+    discovery = HostSkillDiscovery(unexpected_bundle)
+    return [
+        s["name"]
+        for s in discovery.discover(HostSkillsFrame("menu", harness, str(workspace)), workspace)
+    ]
 
 
 async def _client(app: Any) -> AsyncIterator[httpx.AsyncClient]:
@@ -198,8 +197,7 @@ async def test_claude_web_menu_lists_only_terminal_loadable_workspace_skills(
     workspace.mkdir()
     _seed_workspace(workspace)
 
-    app = _make_app("claude-native", workspace)
-    names = await _menu_names(app, "conv_claude_parity_ws")
+    names = _menu_names("claude-native", workspace)
 
     # Precondition (passes on the broken build too): the tier both surfaces
     # agree on is listed.
@@ -246,8 +244,7 @@ async def test_claude_web_menu_sources_user_skills_from_claude_config_dir(
     workspace.mkdir()
     _seed_workspace(workspace)
 
-    app = _make_app("claude-native", workspace)
-    names = await _menu_names(app, "conv_claude_parity_cfg")
+    names = _menu_names("claude-native", workspace)
 
     # THE BUG (other direction): the terminal's slash menu lists this skill
     # as "(user)"; the web menu must list it too or the surfaces diverge.

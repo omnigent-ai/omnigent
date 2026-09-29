@@ -215,6 +215,48 @@ def test_main_uses_explicit_coords_path(
     assert capsys.readouterr().out.strip() == "dbx-tok"
 
 
+@pytest.mark.parametrize("workspace", ["https://ws.example", "https://ws.example/"])
+def test_main_prints_bearer_only_for_the_saved_workspace(
+    workspace: str,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _connected(monkeypatch)
+    assert dc.configure_host_databricks("https://omni.example", "h") is True
+    capsys.readouterr()
+    assert (
+        dc.main(["token", "--coords", str(tmp_path / dc._SIDECAR_NAME), "--workspace", workspace])
+        == 0
+    )
+    assert capsys.readouterr().out.strip() == "dbx-tok"
+
+
+def test_main_withholds_bearer_when_saved_workspace_differs_from_sidecar(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    called = _connected(monkeypatch)
+    assert dc.configure_host_databricks("https://omni.example", "h") is True
+    called.clear()
+    capsys.readouterr()
+    assert (
+        dc.main(
+            [
+                "token",
+                "--coords",
+                str(tmp_path / dc._SIDECAR_NAME),
+                "--workspace",
+                "https://saved-workspace.example",
+            ]
+        )
+        == 1
+    )
+    output = capsys.readouterr()
+    assert output.out == ""
+    assert "dbx-tok" not in output.err
+    assert called == {}
+
+
 def test_main_silent_without_sidecar(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -244,3 +286,74 @@ def test_main_ignores_unknown_operation(
     capsys.readouterr()  # discard configure-time log output
     assert dc.main(["store"]) == 0
     assert capsys.readouterr().out == ""
+
+
+@pytest.mark.parametrize("pinned_workspace", [False, True])
+def test_main_withholds_token_when_broker_workspace_changed(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    pinned_workspace: bool,
+) -> None:
+    """Reconnect edge: the sidecar pins workspace A, but the owner has since
+    reconnected to workspace B, so the broker now vends B's bearer. main() must
+    withhold it rather than present B's token to the A-pinned gateway base URL."""
+    _connected(monkeypatch)  # sidecar pinned to https://ws.example
+    assert dc.configure_host_databricks("https://omni.example", "h") is True
+    _patch_get(
+        monkeypatch,
+        _Resp(
+            200,
+            {"connected": True, "token": "dbx-tok-B", "workspace_host": "https://ws-b.example"},
+        ),
+    )
+    capsys.readouterr()  # discard configure-time log output
+    argv = ["token", "--workspace", "https://ws.example"] if pinned_workspace else ["token"]
+    assert dc.main(argv) == 0
+    assert capsys.readouterr().out == ""  # withheld: workspace mismatch
+
+
+def test_https_url_on_workspace_host(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Only HTTPS URLs on the workspace host's netloc are accepted; other schemes,
+    other hosts, and empty inputs are refused. A scheme-less workspace host is
+    treated as HTTPS."""
+    ok = dc.https_url_on_workspace_host
+    assert ok("https://ws.example/ai-gateway/anthropic", "https://ws.example") is True
+    assert ok("https://ws.example/x", "ws.example") is True  # scheme-less host
+    assert ok("http://ws.example/x", "https://ws.example") is False  # not HTTPS
+    assert ok("https://evil.example/x", "https://ws.example") is False  # other host
+    assert ok("", "https://ws.example") is False
+    assert ok("https://ws.example/x", "") is False
+
+
+def test_api_key_auth_precludes_broker(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An explicit ApiKeyAuth — spec-level OR the global ``auth:`` block — suppresses
+    the managed-connect broker fallback. A spec's own explicit key wins; when the
+    spec declares no auth (or there is no spec, e.g. pi), the global block decides.
+    A DatabricksAuth or no key anywhere lets the broker run.
+    """
+    from types import SimpleNamespace
+
+    from omnigent.spec.types import ApiKeyAuth, DatabricksAuth
+
+    key_spec = SimpleNamespace(executor=SimpleNamespace(auth=ApiKeyAuth(api_key="sk-x")))
+    dbx_spec = SimpleNamespace(executor=SimpleNamespace(auth=DatabricksAuth(profile="p")))
+    bare_spec = SimpleNamespace(executor=SimpleNamespace(auth=None))
+
+    # No global auth configured: only a spec-level key precludes.
+    monkeypatch.setattr("omnigent.runtime.workflow._load_global_auth", lambda: None)
+    assert dc.api_key_auth_precludes_broker(key_spec) is True
+    assert dc.api_key_auth_precludes_broker(dbx_spec) is False
+    assert dc.api_key_auth_precludes_broker(bare_spec) is False
+    assert dc.api_key_auth_precludes_broker(None) is False
+
+    # A GLOBAL ApiKeyAuth must also preclude the broker — including in the spec
+    # branch when the spec declares no auth of its own (the reroute bug this guards).
+    monkeypatch.setattr(
+        "omnigent.runtime.workflow._load_global_auth", lambda: ApiKeyAuth(api_key="sk-g")
+    )
+    assert dc.api_key_auth_precludes_broker(None) is True
+    assert dc.api_key_auth_precludes_broker(bare_spec) is True
+    # A spec-level DatabricksAuth is authoritative and is not a key, so the broker
+    # still runs even when a global key exists.
+    assert dc.api_key_auth_precludes_broker(dbx_spec) is False

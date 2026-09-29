@@ -1,5 +1,6 @@
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { TooltipProvider } from "@/components/ui/tooltip";
 import { BlockStream } from "@/lib/blockStream";
 import { buildBubbles } from "@/lib/renderItems";
 import { parseEventLines } from "@/lib/sse";
@@ -1429,5 +1430,113 @@ describe("ApprovalCard — ExitPlanMode plan review", () => {
     expect(screen.getByTestId("plan-rejection-feedback").textContent).toContain(
       "Too risky, split it up.",
     );
+  });
+});
+
+describe("ApprovalCard — resolved-elsewhere pill", () => {
+  const props = {
+    elicitationId: "elic_auto",
+    message: "Cursor wants approval to run a shell command",
+    phase: "pre_tool_use",
+    policyName: "cursor_native_permission",
+    contentPreview: "Bash({})",
+    requestedSchema: {},
+    status: "responded",
+    response: { action: "auto_resolved" },
+  } as const;
+
+  it("explains the status from the info icon's accessible label", () => {
+    render(
+      <TooltipProvider>
+        <ApprovalCard {...props} />
+      </TooltipProvider>,
+    );
+
+    expect(screen.getByText("Resolved elsewhere")).toBeDefined();
+    const trigger = screen.getByLabelText(/answered outside this view/i);
+    expect(trigger).toBeDefined();
+    expect(trigger.getAttribute("aria-label")?.toLowerCase()).not.toBe("resolved elsewhere");
+  });
+
+  it("opens the explanation when the trigger takes keyboard focus", async () => {
+    render(
+      <TooltipProvider>
+        <ApprovalCard {...props} />
+      </TooltipProvider>,
+    );
+
+    const trigger = screen.getByLabelText(/answered outside this view/i);
+    expect(trigger.getAttribute("tabindex")).toBe("0");
+    fireEvent.focus(trigger);
+    expect(await screen.findByRole("tooltip")).toHaveTextContent(/answered outside this view/i);
+  });
+});
+
+describe("ApprovalCard — cancel verdict", () => {
+  it("renders a cancel as Cancelled, not Rejected", () => {
+    // A prompt dismissed without a decision (turn aborted, prompt
+    // withdrawn on another surface) is not a rejection — labelling it
+    // "Rejected" implies a verdict the user never gave.
+    render(
+      <ApprovalCard
+        elicitationId="elic_cancel"
+        message="Claude wants to call **Bash**"
+        phase="pre_tool_use"
+        policyName="claude_native_permission"
+        contentPreview="Bash({})"
+        requestedSchema={{}}
+        status="responded"
+        response={{ action: "cancel" }}
+      />,
+    );
+
+    expect(screen.getByText(/Cancelled/)).toBeDefined();
+    expect(screen.queryByText(/Rejected/)).toBeNull();
+  });
+});
+
+describe("ApprovalCard — prompt expired", () => {
+  it("says the prompt expired and how to resume instead of 'Resolved elsewhere'", () => {
+    // The server's deferred clear fires when the hook stopped waiting and
+    // nobody answered. "Resolved elsewhere" implied someone had, which
+    // left the session looking ambiguously stuck.
+    render(
+      <ApprovalCard
+        elicitationId="elic_expired"
+        message="Claude wants to call **Bash**"
+        phase="pre_tool_use"
+        policyName="claude_native_permission"
+        contentPreview="Bash({})"
+        requestedSchema={{}}
+        status="responded"
+        response={{ action: "auto_resolved", reason: "unanswered" }}
+      />,
+    );
+
+    expect(screen.getByText(/Prompt expired/)).toBeDefined();
+    expect(screen.getByTestId("prompt-expired-hint").textContent).toContain(
+      "Send a message to continue",
+    );
+    expect(screen.queryByText(/Resolved elsewhere/)).toBeNull();
+  });
+
+  it("keeps the neutral pill for an auto-resolve with no reason", () => {
+    render(
+      <TooltipProvider>
+        <ApprovalCard
+          elicitationId="elic_neutral"
+          message="Claude wants to call **Bash**"
+          phase="pre_tool_use"
+          policyName="claude_native_permission"
+          contentPreview="Bash({})"
+          requestedSchema={{}}
+          status="responded"
+          response={{ action: "auto_resolved" }}
+        />
+      </TooltipProvider>,
+    );
+
+    expect(screen.getByText(/Resolved elsewhere/)).toBeDefined();
+    expect(screen.queryByTestId("prompt-expired-hint")).toBeNull();
   });
 });

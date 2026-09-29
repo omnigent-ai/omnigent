@@ -1,7 +1,7 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
 import { userEvent, within } from "storybook/test";
 import { StoryQueryRouter } from "@/storybook/StoryProviders";
-import { WorkspacePicker } from "./WorkspacePicker";
+import { WorkspacePickerDialog } from "./WorkspacePickerDialog";
 import {
   seedFilesystem,
   storyDirectory,
@@ -19,17 +19,28 @@ const projectEntries = [
   storyFile(`${workspaceStoryProjects}/README.md`, 2048),
 ];
 
+function storyBody(canvasElement: HTMLElement) {
+  return within(canvasElement.ownerDocument.body);
+}
+
 const meta = {
-  title: "Components/Workspace/WorkspacePicker",
-  component: WorkspacePicker,
+  title: "Components/Workspace/WorkspacePickerDialog",
+  component: WorkspacePickerDialog,
   tags: ["visual-snapshot"],
   args: {
+    open: true,
+    onOpenChange: () => undefined,
     hostId: workspaceStoryHost,
     initialPath: workspaceStoryProjects,
-    onSelect: () => undefined,
+    onConfirm: () => undefined,
+  },
+  play: async ({ canvasElement }) => {
+    await userEvent.click(
+      await storyBody(canvasElement).findByTestId("workspace-picker-search-input"),
+    );
   },
   decorators: [
-    (Story) => (
+    (Story, context) => (
       <StoryQueryRouter
         seed={(queryClient) => {
           seedFilesystem(queryClient, workspaceStoryProjects, projectEntries);
@@ -37,31 +48,80 @@ const meta = {
             storyDirectory(`${workspaceStoryHome}/projects`),
             storyDirectory(`${workspaceStoryHome}/Downloads`),
           ]);
+          queryClient.setQueryData(
+            ["host-worktrees", workspaceStoryHost, workspaceStoryProjects],
+            context.name === "Full Single Pane"
+              ? []
+              : [
+                  {
+                    path: workspaceStoryProjects,
+                    branch: "main",
+                    is_main: true,
+                    detached: false,
+                  },
+                  ...(context.name === "Main Checkout Only"
+                    ? []
+                    : [
+                        {
+                          path: `${workspaceStoryHome}/worktrees/agentic-layouts`,
+                          branch: "agentic/layouts",
+                          is_main: false,
+                          detached: false,
+                          updated_at: 1_700_000_000,
+                        },
+                        {
+                          path: `${workspaceStoryHome}/worktrees/command-palette`,
+                          branch: "feature/command-palette",
+                          is_main: false,
+                          detached: false,
+                          updated_at: 1_699_992_800,
+                        },
+                        {
+                          path: `${workspaceStoryHome}/worktrees/streaming-status`,
+                          branch: "feature/streaming-status",
+                          is_main: false,
+                          detached: false,
+                          updated_at: 1_699_913_600,
+                        },
+                      ]),
+                ],
+          );
         }}
       >
-        <div className="w-[440px] rounded-xl border bg-card p-2">
-          <Story />
-        </div>
+        <Story />
       </StoryQueryRouter>
     ),
   ],
-} satisfies Meta<typeof WorkspacePicker>;
+} satisfies Meta<typeof WorkspacePickerDialog>;
 
 export default meta;
 type Story = StoryObj<typeof meta>;
 
 export const PopulatedWithConflict: Story = {
   args: {
-    onClose: () => undefined,
     workspacePath: `${workspaceStoryProjects}/app`,
     occupancyForPath: (path) => (path === workspaceStoryProjects ? 2 : 0),
   },
 };
 
+export const FullTwoPane: Story = {};
+
+export const FullSinglePane: Story = {};
+
+export const MainCheckoutOnly: Story = {};
+
+export const LinkedWorktreeSelected: Story = {
+  play: async ({ canvasElement }) => {
+    const body = storyBody(canvasElement);
+    await userEvent.click(await body.findByRole("radio", { name: "Use worktree command-palette" }));
+    await userEvent.click(await body.findByTestId("workspace-picker-search-input"));
+  },
+};
+
 export const TypedFilter: Story = {
   play: async ({ canvasElement }) => {
-    const input = within(canvasElement).getByTestId("workspace-picker-path-input");
+    const input = await storyBody(canvasElement).findByTestId("workspace-picker-search-input");
     await userEvent.clear(input);
-    await userEvent.type(input, `${workspaceStoryProjects}/ap`);
+    await userEvent.type(input, "ap");
   },
 };

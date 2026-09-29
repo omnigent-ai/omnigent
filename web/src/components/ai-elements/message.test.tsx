@@ -1,11 +1,14 @@
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { setEmbedRoot } from "@/lib/host";
 import { Message, MessageAction, MessageActions, MessageContent, MessageResponse } from "./message";
 
 const clipboardDescriptor = Object.getOwnPropertyDescriptor(Navigator.prototype, "clipboard");
 const execCommandDescriptor = Object.getOwnPropertyDescriptor(Document.prototype, "execCommand");
 
 afterEach(() => {
+  setEmbedRoot(null);
+  vi.unstubAllGlobals();
   cleanup();
   vi.restoreAllMocks();
   if (clipboardDescriptor) {
@@ -70,6 +73,26 @@ describe("MessageActions", () => {
   });
 });
 
+// Streamdown renders a diagram only once an IntersectionObserver reports it
+// visible; report every observed element visible so diagrams render in jsdom.
+class VisibleIntersectionObserver {
+  private readonly callback: IntersectionObserverCallback;
+  constructor(callback: IntersectionObserverCallback) {
+    this.callback = callback;
+  }
+  observe(target: Element) {
+    this.callback(
+      [{ isIntersecting: true, target } as IntersectionObserverEntry],
+      this as unknown as IntersectionObserver,
+    );
+  }
+  unobserve() {}
+  disconnect() {}
+  takeRecords(): IntersectionObserverEntry[] {
+    return [];
+  }
+}
+
 describe("MessageResponse", () => {
   it("blocks external image markdown and renders a placeholder", async () => {
     render(<MessageResponse>{"![leak](https://attacker.example/pixel.png)"}</MessageResponse>);
@@ -92,6 +115,22 @@ describe("MessageResponse", () => {
     });
   });
 
+  it("explains an invalid mermaid fence instead of dumping the parser error", async () => {
+    vi.stubGlobal("IntersectionObserver", VisibleIntersectionObserver);
+    render(
+      <MessageResponse>
+        {
+          "```mermaid\nsequenceDiagram\n    A->>B: hi\n    Note over A,B: once; twice\n    A=>B: again\n```"
+        }
+      </MessageResponse>,
+    );
+
+    const card = await screen.findByTestId("mermaid-error", {}, { timeout: 10_000 });
+    expect(card.textContent).toContain("Mermaid couldn't parse line 3");
+    expect(card.querySelector("code")?.textContent).toBe("Note over A,B: once; twice");
+    expect(card.textContent).toContain("#59;");
+  }, 15_000);
+
   it("gives prose a break opportunity for an unbroken run (OMNI-2900)", () => {
     const { container } = render(<MessageResponse>same text</MessageResponse>);
 
@@ -107,7 +146,55 @@ describe("MessageResponse", () => {
   });
 });
 
+describe("MessageResponse table fullscreen", () => {
+  const tableMarkdown = "| Name | Value |\n| --- | --- |\n| Alpha | One |";
+
+  it("opens inside the embed root and closes from the fullscreen control", async () => {
+    const embedRoot = document.createElement("div");
+    document.body.appendChild(embedRoot);
+    setEmbedRoot(embedRoot);
+    render(<MessageResponse>{tableMarkdown}</MessageResponse>);
+
+    fireEvent.click(await screen.findByRole("button", { name: "View fullscreen" }));
+
+    const dialog = within(embedRoot).getByRole("dialog", { name: "View fullscreen" });
+    expect(within(dialog).getByRole("cell", { name: "Alpha" })).toBeInTheDocument();
+
+    fireEvent.click(within(dialog).getByRole("button", { name: "Exit fullscreen" }));
+    expect(within(embedRoot).queryByRole("dialog", { name: "View fullscreen" })).toBeNull();
+    embedRoot.remove();
+  });
+
+  it("closes the fullscreen table with Escape", async () => {
+    render(<MessageResponse>{tableMarkdown}</MessageResponse>);
+    fireEvent.click(await screen.findByRole("button", { name: "View fullscreen" }));
+
+    expect(screen.getByRole("dialog", { name: "View fullscreen" })).toBeInTheDocument();
+    fireEvent.keyDown(document, { key: "Escape" });
+    expect(screen.queryByRole("dialog", { name: "View fullscreen" })).toBeNull();
+  });
+});
+
 describe("MessageResponse code-block copy", () => {
+  it("wraps code by default and exposes the wrap state through the toggle", async () => {
+    const { container } = render(
+      <MessageResponse>{"```ts\nconst value = 'horizontalScrolling';\n```"}</MessageResponse>,
+    );
+
+    const toggle = await screen.findByRole("button", { name: "Toggle word wrap" });
+    const block = container.querySelector(".chat-code-block");
+    expect(toggle).toHaveAttribute("aria-pressed", "true");
+    expect(block).toHaveClass("chat-code-wrap");
+
+    fireEvent.click(toggle);
+    expect(toggle).toHaveAttribute("aria-pressed", "false");
+    expect(block).not.toHaveClass("chat-code-wrap");
+
+    fireEvent.click(toggle);
+    expect(toggle).toHaveAttribute("aria-pressed", "true");
+    expect(block).toHaveClass("chat-code-wrap");
+  });
+
   it("copies the exact fenced code text through the fallback path", async () => {
     const copiedText: string[] = [];
     Object.defineProperty(Navigator.prototype, "clipboard", {

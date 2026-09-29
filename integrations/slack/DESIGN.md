@@ -89,13 +89,35 @@ The stream never sends `[DONE]` and never closes on its own; the server sends
 `session.heartbeat` roughly every 15s. So the **only** condition not signalled by
 an event is a dead (half-open) socket. The loop treats "no event of any kind for
 `idle_grace_seconds`" (default 600s — comfortably above the 15s heartbeat) as a
-dead connection and ends. This is the one justified client-side heuristic: a dead
-connection by definition can't send a signal.
+dead connection and ends. This is the one place the client infers an end with no
+signal from the server: a dead connection by definition can't send one.
 
 Timing note: the read is bounded with `asyncio.wait` (not `wait_for`) — cancelling
 the generator's `__anext__` would kill it — and the in-flight read is awaited in
 `finally` before the stream context closes, or httpx raises "aclose(): async
 generator already running".
+
+### Mid-turn stream reconnect
+
+A proxy max-duration cap severs the long-lived stream while the turn keeps running
+server-side. Databricks-App-hosted servers sit behind a ~5-minute cutoff of exactly
+that kind. The client re-opens the stream and the server replays the turn so far;
+`_reconcile_delta` de-dups the replayed text so nothing renders twice.
+
+The budget counts **consecutive attempts that make no progress**, not total ones. A
+leg that forwards a genuinely new event resets the counter, so a long healthy turn
+rides through any number of caps. A second hard cap on *total* reconnects stops a
+"replay one byte, then drop" loop. Between legs the client reads
+`GET /v1/sessions/{id}`. An `idle`/`failed` status ends the turn cleanly, and the
+end-of-turn reconcile recovers the committed text.
+
+A **refused re-open** spends that same budget. A connect failure inside the
+reconnect window is the same transient blip, one step earlier in the request
+lifecycle, and the turn still runs. Only the **first** connection of a turn
+fails fast, because nothing is running yet to rejoin. The cost lands on a server
+that really goes down mid-turn. The user hears "unreachable" after the budget runs
+out, not on the first refusal. Worst case that is 6 stream opens, 15s of backoff,
+and one connect timeout per open and per status read.
 
 ### `_AnswerReply` / `_LiveReply` invariants (`streaming.py`)
 
@@ -216,17 +238,24 @@ in place.
 
 ## Errors
 
-`_turn_error_text` is the single source of truth mapping known errors to
+`_classify_turn_error` is the single source of truth mapping known errors to
 user-facing messages, shared by the session-startup and mid-turn paths:
 
 - **401** → "log in again" (`/omnigent`).
-- **Unreachable** → "reconfigure" (`/omnigent`).
+- **Unreachable** → "reconfigure" (`/omnigent`). Mid-turn this fires only after the
+  reconnect budget runs out, not on the first transport failure.
 - **No online host** → the `omni host --server …` command.
 - **412 `harness_not_configured`** → the server's *curated* `error.message` (run
   `omnigent setup` on the host). Server error bodies are otherwise **not** echoed
   to the channel (they can leak internal paths/stack traces) — only this specific,
   actionable code's message is surfaced; everything else is logged server-side and
   shown as a generic failure.
+- **503 `runner_unavailable`** → "try again in a moment", worded by the turn's
+  `host_type`: a managed session's sandbox isn't ready (the server raises the
+  same code while it is still provisioning AND when its launch failed, and the
+  client discards the discriminating server message — so the managed wording is
+  cause-neutral and escalates to the operator when it keeps happening); an
+  external host has no runner bound and launching one didn't recover it.
 
 ## Authentication (per-user, delegated)
 

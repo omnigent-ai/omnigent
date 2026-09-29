@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING
 
 from omnigent.harnesses.claude_native.bridge import (
     BRIDGE_ID_LABEL_KEY,
+    CLAUDE_FRAMEWORK_CONTEXT_FILE,
     approval_wait_marker_path,
     hold_approval_wait_marker,
     read_active_session_id,
@@ -192,11 +193,17 @@ def main(argv: list[str] | None = None) -> int:
     if raw_argv and raw_argv[0] == "permission-request":
         return _main_permission_request(raw_argv[1:])
     if raw_argv and raw_argv[0] == "ask-user-question":
-        return _main_ask_user_question(raw_argv[1:])
+        # Retired PreToolUse forwarder: settings written before the upgrade
+        # still name it until the terminal restarts. Exit 0 with no output so
+        # Claude proceeds to the PermissionRequest hook. Remove in 0.16.0.
+        sys.stdin.read()
+        return 0
     if raw_argv and raw_argv[0] == "evaluate-policy":
         return _main_evaluate_policy(raw_argv[1:])
     if raw_argv and raw_argv[0] == "route-turn":
         return _main_route_turn(raw_argv[1:])
+    if raw_argv and raw_argv[0] == "framework-context":
+        return _main_framework_context(raw_argv[1:])
     # Backwards compat: older bridge dirs may still reference the
     # pre-tool-use subcommand before the terminal is restarted.
     if raw_argv and raw_argv[0] == "pre-tool-use":
@@ -734,7 +741,7 @@ def _post_hook_with_reattach(
     :param payload: Hook payload to POST. Not mutated; the re-attach id
         rides on a copy.
     :param hook_label: Diagnostic prefix for stderr lines, e.g.
-        ``"permission"`` or ``"ask-user-question"``.
+        ``"claude permission"``.
     :param reauth: Optional callable that re-mints fresh auth headers when the
         server bounces the POST to its OAuth login flow (Apps 302→``/oidc/``)
         or returns ``401`` — i.e. the one-shot ``ap_auth_headers`` token lapsed.
@@ -931,115 +938,6 @@ def _main_permission_request(argv: list[str]) -> int:
     return 0
 
 
-def _main_ask_user_question(argv: list[str]) -> int:
-    """
-    Handle a ``PreToolUse`` hook for Claude's built-in ``AskUserQuestion`` tool.
-
-    In ``bypassPermissions`` mode the ``PermissionRequest`` hook never fires,
-    so ``AskUserQuestion`` questions are silently swallowed — the web UI never
-    sees them. This handler intercepts the tool via ``PreToolUse`` (which fires
-    in all permission modes), POSTs the same payload to the Omnigent server's
-    ``/hooks/permission-request`` endpoint, waits for the user's web-UI answer,
-    and converts the ``PermissionRequest``-format response into a
-    ``PreToolUse``-format output (``updatedInput``) so Claude receives the
-    answers and skips its own TUI picker.
-
-    When ``permission_mode`` is anything other than ``"bypassPermissions"``
-    (including absent/unknown), this is a no-op: the ``PermissionRequest`` hook
-    will handle the call, and returning empty output here prevents a duplicate
-    elicitation from appearing.
-
-    :param argv: CLI argv after the ``ask-user-question`` subcommand,
-        e.g. ``["--bridge-dir", "/tmp/x"]``.
-    :returns: Process exit code. Returns ``0`` on any failure so Claude Code
-        falls back to its terminal TUI prompt rather than blocking.
-    """
-    from omnigent.native.native_policy_hook import policy_hook_reauth
-
-    args = _parse_permission_args(argv)
-    raw = sys.stdin.read()
-    try:
-        payload = json.loads(raw or "{}")
-    except json.JSONDecodeError as exc:
-        print(f"omnigent ask-user-question hook: malformed JSON: {exc}", file=sys.stderr)
-        return 0
-    if not isinstance(payload, dict):
-        print("omnigent ask-user-question hook: expected JSON object", file=sys.stderr)
-        return 0
-    # Only intercept in bypassPermissions mode. In any other mode the
-    # PermissionRequest hook fires independently and owns the elicitation;
-    # returning empty output here is "no opinion" so Claude's own flow
-    # continues unimpeded and we avoid surfacing the form twice.
-    if payload.get("permission_mode") != "bypassPermissions":
-        return 0
-    bridge_dir = Path(args.bridge_dir)
-    session_id = read_active_session_id(bridge_dir)
-    if not session_id:
-        print("omnigent ask-user-question hook: active session missing", file=sys.stderr)
-        return 0
-    config = read_permission_hook_config(bridge_dir)
-    ap_server_url = args.omnigent_server_url or config.get("ap_server_url")
-    if not isinstance(ap_server_url, str) or not ap_server_url:
-        print("omnigent ask-user-question hook: Omnigent server URL missing", file=sys.stderr)
-        return 0
-    headers = _parse_headers(args.omnigent_auth_headers_json)
-    if not headers:
-        raw_headers = config.get("ap_auth_headers")
-        if isinstance(raw_headers, dict):
-            headers = {str(key): str(value) for key, value in raw_headers.items()}
-    # Same as the permission-request hook: the elicitation parks in the pod-local
-    # registry on the session's tunnel replica, so key the POST from the
-    # runner-env host_id or an off-replica landing silently drops the prompt.
-    from omnigent.cli_auth import databricks_request_headers
-
-    headers.update(databricks_request_headers(ap_server_url))
-    url = (
-        f"{ap_server_url.rstrip('/')}/v1/sessions/"
-        f"{url_component(session_id)}/hooks/permission-request"
-    )
-    resp = _post_hook_with_reattach(
-        url,
-        headers,
-        payload,
-        "ask-user-question",
-        reauth=policy_hook_reauth(ap_server_url, headers),
-        wait_marker=approval_wait_marker_path(session_id, bridge_dir=bridge_dir),
-    )
-    if resp is None or not resp.content:
-        return 0
-    # The Omnigent server returns a PermissionRequest-shaped response:
-    #   {"hookSpecificOutput": {"hookEventName": "PermissionRequest",
-    #                           "decision": {"behavior": "allow",
-    #                                        "updatedInput": {...}}}}
-    # Convert to PreToolUse format so Claude applies updatedInput:
-    #   {"hookSpecificOutput": {"hookEventName": "PreToolUse",
-    #                           "permissionDecision": "allow",
-    #                           "updatedInput": {...}}}
-    try:
-        body = resp.json()
-    except ValueError as exc:
-        print(f"omnigent ask-user-question hook: invalid JSON from AP: {exc}", file=sys.stderr)
-        return 0
-    decision = (
-        body.get("hookSpecificOutput", {}).get("decision", {}) if isinstance(body, dict) else {}
-    )
-    behavior = decision.get("behavior") if isinstance(decision, dict) else None
-    if behavior not in ("allow", "deny"):
-        # Unexpected shape — return empty output so Claude falls back to TUI.
-        return 0
-    pre_tool_use_output: dict[str, object] = {
-        "hookSpecificOutput": {
-            "hookEventName": "PreToolUse",
-            "permissionDecision": behavior,
-        },
-    }
-    updated_input = decision.get("updatedInput") if isinstance(decision, dict) else None
-    if isinstance(updated_input, dict):
-        pre_tool_use_output["hookSpecificOutput"]["updatedInput"] = updated_input  # type: ignore[index]
-    sys.stdout.write(json.dumps(pre_tool_use_output))
-    return 0
-
-
 def _main_evaluate_policy(argv: list[str]) -> int:
     """
     Evaluate a Claude Code ``PreToolUse`` / ``PostToolUse`` /
@@ -1202,6 +1100,30 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--bridge-dir", required=True)
     parser.add_argument("--conversation-url")
     return parser.parse_args(argv)
+
+
+def _main_framework_context(argv: list[str]) -> int:
+    """Add pending framework context to one submitted prompt."""
+    args = _parse_evaluate_policy_args(argv)
+    sys.stdin.read()
+    path = Path(args.bridge_dir) / CLAUDE_FRAMEWORK_CONTEXT_FILE
+    try:
+        text = path.read_text(encoding="utf-8")
+        path.unlink(missing_ok=True)
+    except OSError:
+        return 0
+    if text:
+        sys.stdout.write(
+            json.dumps(
+                {
+                    "hookSpecificOutput": {
+                        "hookEventName": "UserPromptSubmit",
+                        "additionalContext": text,
+                    }
+                }
+            )
+        )
+    return 0
 
 
 def _parse_evaluate_policy_args(argv: list[str]) -> argparse.Namespace:

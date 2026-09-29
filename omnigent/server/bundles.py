@@ -7,6 +7,7 @@ import tempfile
 from pathlib import Path, PurePosixPath, PureWindowsPath
 
 from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.inner.datamodel import OSEnvSpec
 from omnigent.spec import AgentSpec, ExtractionError, ToolRuntime, load
 
 
@@ -66,6 +67,26 @@ def _cwd_escapes_workspace(spec_cwd: str) -> bool:
     """
     posix, win = PurePosixPath(spec_cwd), PureWindowsPath(spec_cwd)
     return posix.is_absolute() or win.is_absolute() or ".." in posix.parts or ".." in win.parts
+
+
+def _reject_escaping_cwd(cwd: str | None) -> None:
+    """Reject an absolute or escaping working directory in an uploaded spec."""
+    if cwd not in (None, ".", "./") and _cwd_escapes_workspace(cwd):
+        raise OmnigentError(
+            "agent os_env.cwd must be a relative path within the workspace "
+            f"(no absolute paths or '..'); got {cwd!r}",
+            code=ErrorCode.INVALID_INPUT,
+        )
+
+
+def _reject_uploaded_escaping_cwd(spec: AgentSpec) -> None:
+    """Validate working directories in the agent, its terminals, and all sub-agents."""
+    _reject_escaping_cwd(spec.os_env.cwd if spec.os_env is not None else None)
+    for terminal in (spec.terminals or {}).values():
+        if isinstance(terminal.os_env, OSEnvSpec):
+            _reject_escaping_cwd(terminal.os_env.cwd)
+    for sub in spec.sub_agents:
+        _reject_uploaded_escaping_cwd(sub)
 
 
 def validate_agent_bundle(
@@ -136,23 +157,8 @@ def validate_agent_bundle(
     # the operator legitimately controls cwd and Python callable tools (they
     # already have code execution), so neither restriction applies there.
     if enforce_handler_allowlist:
-        # Untrusted uploads may not pin an absolute or escaping os_env.cwd
-        # (GHSA-p8rw-8qj3-hf33): on a runner without OMNIGENT_RUNNER_WORKSPACE
-        # it becomes the agent environment root and copytree source, exposing
-        # the host filesystem. (Trusted local runs keep the documented
-        # absolute-cwd behavior — designs/SESSION_WORKSPACE_SELECTION.md.)
-        os_env = getattr(spec, "os_env", None)
-        spec_cwd = getattr(os_env, "cwd", None) if os_env is not None else None
-        if (
-            spec_cwd is not None
-            and spec_cwd not in (".", "./")
-            and _cwd_escapes_workspace(spec_cwd)
-        ):
-            raise OmnigentError(
-                "agent os_env.cwd must be a relative path within the workspace "
-                f"(no absolute paths or '..'); got {spec_cwd!r}",
-                code=ErrorCode.INVALID_INPUT,
-            )
+        # Terminals and nested agents can override the session working directory.
+        _reject_uploaded_escaping_cwd(spec)
 
         # Untrusted uploads may not declare server-side Python ``callable:``
         # tools (GHSA-756x-9hf6-q4h4): the runner imports the dotted path and

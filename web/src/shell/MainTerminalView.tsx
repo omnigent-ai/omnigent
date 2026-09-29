@@ -177,15 +177,8 @@ export function MainTerminalView({
   );
 
   return (
-    // Outer wrapper fills the main column. `pt-14` clears the 56px
-    // absolute-positioned AppShell header on desktop. The workspace rail now
-    // extends beside that header at the outer inset; this main-column surface
-    // still clears it. iOS native gets a safe-area-aware override in index.css.
-    // `px-3` gives a
-    // 12px gutter on
-    // the sides. The card stretches to full width and height of the
-    // available area. The ConnectionIndicator band renders just below
-    // this wrapper in ChatPage's MainAgentSurface.
+    // The terminal sits below the title bar and fills the remaining main
+    // column. The ConnectionIndicator band renders just below this wrapper.
     <div
       ref={setSurfaceElement}
       data-testid="main-terminal-view"
@@ -195,9 +188,9 @@ export function MainTerminalView({
       // Distinguishes the revealed surface from the hidden pre-warmed
       // mount for tests — both are in the DOM.
       data-visible={visible}
-      className="main-terminal-view flex min-h-0 flex-1 flex-col px-3 pt-14 pb-1.5"
+      className="main-terminal-view flex min-h-0 flex-1 flex-col pt-12"
     >
-      <div className="flex min-h-0 w-full flex-1 flex-col overflow-hidden rounded-lg border border-border bg-card p-3 shadow-sm">
+      <div className="flex min-h-0 w-full flex-1 flex-col overflow-hidden">
         {activeTerminal === null ? (
           startingUp ? (
             // Passive startup state: same centered geometry as the stopped

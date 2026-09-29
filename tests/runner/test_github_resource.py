@@ -17,6 +17,7 @@ from pathlib import Path
 
 import pytest
 
+from omnigent.errors import OmnigentError
 from omnigent.runner import github_resource
 from omnigent.runner.github_resource import (
     _summarize_checks,
@@ -542,6 +543,188 @@ def test_github_file_diff_deleted(repo: Path) -> None:
     """A deleted file shows base content as before and None as after."""
     diff = github_file_diff(str(repo), "main", "fileB.py")
     assert diff["before"] == "B base"
+    assert diff["after"] is None
+
+
+@pytest.fixture
+def diverged_repo(tmp_path: Path) -> Path:
+    """Two branch tips share a base with an older parent for shallow-clone tests."""
+    source = tmp_path / "source"
+    source.mkdir()
+    _run(["git", "init", "-b", "main"], source)
+    for content in ("A old", "A base"):
+        (source / "fileA.py").write_text(content)
+        _run(["git", "add", "fileA.py"], source)
+        _run(["git", "commit", "-m", content], source)
+    _run(["git", "checkout", "-b", "feature"], source)
+    (source / "fileA.py").write_text("A changed")
+    _run(["git", "commit", "-am", "feature"], source)
+    _run(["git", "checkout", "main"], source)
+    (source / "fileA.py").write_text("A main advanced")
+    _run(["git", "commit", "-am", "main advanced"], source)
+    _run(["git", "checkout", "feature"], source)
+    return source
+
+
+@pytest.mark.parametrize("recovery", ["--deepen=1", "--unshallow"])
+def test_github_file_diff_shallow_missing_merge_base(
+    diverged_repo: Path, tmp_path: Path, recovery: str
+) -> None:
+    """Missing shallow ancestry raises with recovery advice instead of comparing tips."""
+    clone = tmp_path / "clone"
+    _run(
+        [
+            "git",
+            "clone",
+            "--depth=1",
+            "--no-single-branch",
+            diverged_repo.as_uri(),
+            str(clone),
+        ],
+        tmp_path,
+    )
+
+    with pytest.raises(OmnigentError, match="shallow") as exc:
+        github_file_diff(str(clone), "main", "fileA.py")
+    assert "origin/main" in str(exc.value)
+    assert "git fetch --deepen=" in str(exc.value)
+    assert "git fetch --unshallow" in str(exc.value)
+
+    _run(["git", "fetch", recovery, "origin"], clone)
+    diff = github_file_diff(str(clone), "main", "fileA.py")
+    assert diff["before"] == "A base"
+    assert diff["after"] == "A changed"
+
+
+def test_github_file_diff_shallow_with_merge_base(diverged_repo: Path, tmp_path: Path) -> None:
+    """A shallow clone with the shared ancestor available still gives the correct diff."""
+    clone = tmp_path / "clone"
+    _run(
+        [
+            "git",
+            "clone",
+            "--depth=2",
+            "--no-single-branch",
+            diverged_repo.as_uri(),
+            str(clone),
+        ],
+        tmp_path,
+    )
+    assert (
+        github_resource._git(["rev-parse", "--is-shallow-repository"], cwd=str(clone))[1].strip()
+        == "true"
+    )
+
+    diff = github_file_diff(str(clone), "main", "fileA.py")
+    assert diff["before"] == "A base"
+    assert diff["after"] == "A changed"
+
+
+def test_github_file_diff_full_history_without_merge_base(repo: Path) -> None:
+    """Unrelated full-history branches retain the existing base-tip fallback."""
+    _run(["git", "checkout", "--orphan", "unrelated"], repo)
+    _run(["git", "rm", "-rf", "."], repo)
+    (repo / "fileA.py").write_text("A unrelated")
+    _run(["git", "add", "fileA.py"], repo)
+    _run(["git", "commit", "-m", "unrelated root"], repo)
+    _run(["git", "checkout", "feature"], repo)
+
+    diff = github_file_diff(str(repo), "unrelated", "fileA.py")
+    assert diff["before"] == "A unrelated"
+    assert diff["after"] == "A changed"
+
+
+@pytest.mark.parametrize("shallow", [False, True])
+def test_github_file_diff_missing_base_in_single_branch_clone(
+    diverged_repo: Path, tmp_path: Path, shallow: bool
+) -> None:
+    """An unfetched base is not an absent file, with or without shallow history."""
+    clone = tmp_path / "clone"
+    _run(
+        [
+            "git",
+            "clone",
+            "--single-branch",
+            "--branch=feature",
+            *(["--depth=1"] if shallow else []),
+            diverged_repo.as_uri(),
+            str(clone),
+        ],
+        tmp_path,
+    )
+    with pytest.raises(OmnigentError, match=r"base.*not available locally") as exc:
+        github_file_diff(str(clone), "main", "fileA.py")
+    assert "fetch" in str(exc.value)
+    assert "main" in str(exc.value)
+
+    _run(
+        [
+            "git",
+            "fetch",
+            *(["--unshallow"] if shallow else []),
+            "origin",
+            "refs/heads/main:refs/remotes/origin/main",
+            "refs/heads/feature:refs/remotes/origin/feature",
+        ],
+        clone,
+    )
+    diff = github_file_diff(str(clone), "main", "fileA.py")
+    assert diff["before"] == "A base"
+    assert diff["after"] == "A changed"
+
+
+def test_github_file_diff_partial_blob_fetch_failure(repo: Path) -> None:
+    """An unavailable promised blob must not turn a modification into an addition."""
+    _run(["git", "config", "uploadpack.allowFilter", "true"], repo)
+    clone = repo / "partial-clone"
+    _run(["git", "clone", "--filter=blob:none", repo.as_uri(), str(clone)], repo)
+    old_blob = github_resource._git(["rev-parse", "origin/main:fileA.py"], cwd=str(clone))[
+        1
+    ].strip()
+    missing = github_resource._git(
+        ["rev-list", "--objects", "--all", "--missing=print"], cwd=str(clone)
+    )[1].splitlines()
+    assert f"?{old_blob}" in missing
+    _run(["git", "remote", "set-url", "origin", (repo / "unavailable").as_uri()], clone)
+
+    with pytest.raises(OmnigentError, match="content") as exc:
+        github_file_diff(str(clone), "main", "fileA.py")
+    assert "partial clone" in str(exc.value)
+    assert "access" in str(exc.value)
+    # A genuinely absent base path remains valid even while the remote is unavailable.
+    added = github_file_diff(str(clone), "main", "newfile.py")
+    assert added["before"] is None
+    assert added["after"] == "new content"
+
+    _run(["git", "remote", "set-url", "origin", repo.as_uri()], clone)
+    diff = github_file_diff(str(clone), "main", "fileA.py")
+    assert diff["before"] == "A base"
+    assert diff["after"] == "A changed"
+
+
+@pytest.mark.parametrize("side", ["before", "after"])
+@pytest.mark.parametrize("returncode", [None, 128], ids=["timeout", "git-error"])
+def test_github_file_diff_content_failure(
+    repo: Path, monkeypatch: pytest.MonkeyPatch, side: str, returncode: int | None
+) -> None:
+    """Timeouts and read failures on either side cannot masquerade as absent paths."""
+    git = github_resource._git
+    ref = git(["rev-parse", "main"], cwd=str(repo))[1].strip() if side == "before" else "HEAD"
+
+    def fail_show(args: list[str], *, cwd: str) -> tuple[int | None, str, str]:
+        if args == ["show", f"{ref}:fileA.py"]:
+            return returncode, "", "timed out" if returncode is None else "authentication failed"
+        return git(args, cwd=cwd)
+
+    monkeypatch.setattr(github_resource, "_git", fail_show)
+    with pytest.raises(OmnigentError, match="content"):
+        github_file_diff(str(repo), "main", "fileA.py")
+
+
+def test_github_file_diff_missing_path(repo: Path) -> None:
+    """A path absent from both trees remains a valid empty diff."""
+    diff = github_file_diff(str(repo), "main", "missing.py")
+    assert diff["before"] is None
     assert diff["after"] is None
 
 

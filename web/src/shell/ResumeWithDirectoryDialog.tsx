@@ -17,12 +17,8 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import {
-  WorkspacePicker,
-  isNavigablePath,
-  resolveWorkspacePath,
-  useResolvedHostHome,
-} from "./WorkspacePicker";
+import { resolveWorkspacePath, useResolvedHostHome } from "./WorkspacePicker";
+import { WorkspacePickerDialog } from "./WorkspacePickerDialog";
 import { WorkspacePathField } from "./WorkspacePathField";
 import { CliCommandBlock } from "./CliCommandBlock";
 import { HostLabel } from "./HostLabel";
@@ -63,6 +59,8 @@ import { getSessionSlim, launchRunner } from "@/lib/sessionsApi";
  *   host/workspace/branch). Ignored when ``sourceSessionId`` is set.
  * @param serverUrl - Origin for the CLI fallback command.
  * @param wrapper - The session's ``omnigent.wrapper`` label (CLI fallback).
+ * @param harness - The session's canonical harness; the CLI fallback uses it
+ *   to pick the native resume verb when no wrapper label is present.
  * @param onBound - Called after a successful bind so the caller can
  *   replay the message the user was trying to send.
  */
@@ -74,6 +72,7 @@ export function ResumeWithDirectoryDialog({
   prefill,
   serverUrl,
   wrapper,
+  harness,
   onBound,
 }: {
   open: boolean;
@@ -83,6 +82,7 @@ export function ResumeWithDirectoryDialog({
   prefill?: { hostId?: string | null; workspace?: string | null; gitBranch?: string | null };
   serverUrl: string;
   wrapper?: string | null;
+  harness?: string | null;
   onBound?: () => void;
 }) {
   const queryClient = useQueryClient();
@@ -126,7 +126,6 @@ export function ResumeWithDirectoryDialog({
   const [branchName, setBranchName] = useState("");
   const [baseBranch, setBaseBranch] = useState("");
   const [browsing, setBrowsing] = useState(false);
-  const [browseNonce, setBrowseNonce] = useState(0);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -218,7 +217,6 @@ export function ResumeWithDirectoryDialog({
   function commitWorkspacePath(path: string): void {
     setWorkspace(path);
     setBrowsing(true);
-    setBrowseNonce((n) => n + 1);
   }
 
   async function handleBind(): Promise<void> {
@@ -294,6 +292,7 @@ export function ResumeWithDirectoryDialog({
                 conversationId: sessionId,
                 serverUrl,
                 wrapper,
+                harness,
                 // The source's host is offline here. With a host binding the
                 // owner re-registers the host (`omnigent host`); without one
                 // the runner is relaunched directly via the wrapper's resume
@@ -338,18 +337,13 @@ export function ResumeWithDirectoryDialog({
                     recent={recent}
                     dropdownDisabled={browsing}
                   />
-                  {browsing && (
-                    <WorkspacePicker
-                      key={browseNonce}
-                      hostId={selectedHostId}
-                      initialPath={isNavigablePath(workspaceTrimmed) ? workspaceTrimmed : undefined}
-                      onSelect={(path) => {
-                        setWorkspace(path);
-                        setBrowsing(false);
-                      }}
-                      onClose={() => setBrowsing(false)}
-                    />
-                  )}
+                  <WorkspacePickerDialog
+                    open={browsing}
+                    onOpenChange={setBrowsing}
+                    hostId={selectedHostId}
+                    initialPath={workspaceTrimmed}
+                    onConfirm={setWorkspace}
+                  />
                   {showConflictHint && (
                     <p
                       className="flex items-start gap-1.5 text-sm text-warning"

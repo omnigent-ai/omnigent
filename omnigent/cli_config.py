@@ -2618,6 +2618,79 @@ def _manage_kiro_harness() -> None:
                 status = "✗ kiro-cli binary not found"
 
 
+def _manage_devin_harness() -> None:
+    """Run the level-2 loop for Devin: install the CLI and drive ``devin auth login``.
+
+    Devin ships a real login (``devin auth login``, browser or manual token) and
+    — unlike most native CLIs here — a genuine status probe (``devin auth status``
+    exits 0 only while logged in), so this drill-in can report the live auth
+    state and offer sign-out. Omnigent stores no Devin credential: the CLI writes
+    its own credential file and reads it back at spawn.
+
+    Like the other CLI-backed harnesses, a missing CLI gates the drill-in —
+    there is nothing to configure for a harness you can't run.
+
+    :returns: None. Side effects: may run ``devin auth login`` / ``devin auth
+        logout`` in the foreground.
+    """
+    from omnigent.onboarding.harness_install import (
+        DEVIN_KEY,
+        harness_cli_installed,
+        harness_cli_logged_in,
+        harness_install_spec,
+        harness_login,
+    )
+    from omnigent.onboarding.interactive import console, select
+
+    # Gate on the CLI. Devin ships a single binary via a curl installer (not
+    # npm), so there is no in-process auto-install — name the command and let
+    # the user run it, then re-open.
+    if not harness_cli_installed(DEVIN_KEY):
+        spec = harness_install_spec(DEVIN_KEY)
+        hint = (spec.install_hint if spec else None) or "see Devin CLI docs"
+        console.print(
+            "\n  [bold]Devin CLI not found.[/bold] Install it, then re-open this menu:\n"
+            f"    {hint}\n"
+        )
+        return
+
+    status = ""
+    while True:
+        logged_in = harness_cli_logged_in(DEVIN_KEY)
+        rows = [
+            _HarnessMenuRow(
+                "Sign out" if logged_in else "Sign in with `devin auth login`",
+                action="logout" if logged_in else "login",
+            ),
+            _HarnessMenuRow("← Back", action="back"),
+        ]
+        idx = select(
+            "Devin",
+            [r.label for r in rows],
+            clear_on_exit=True,
+            status=status or ("✓ Signed in" if logged_in else "✗ Not signed in"),
+        )
+        if idx < 0:
+            return
+        action = rows[idx].action
+        if action == "back":
+            return
+        if action == "login":
+            status = (
+                "✓ devin auth login completed"
+                if harness_login(DEVIN_KEY)
+                else "✗ devin auth login did not complete"
+            )
+        elif action == "logout":
+            import subprocess
+
+            try:
+                subprocess.run(["devin", "auth", "logout"], check=False)
+                status = "✓ devin auth logout completed"
+            except FileNotFoundError:
+                status = "✗ devin binary not found"
+
+
 def _print_kimi_auth_help() -> None:
     """Print Kimi Code's authentication options.
 
@@ -3538,6 +3611,7 @@ def _run_configure_harnesses_interactive() -> None:
     from omnigent.onboarding.harness_install import (
         COPILOT_KEY,
         CURSOR_KEY,
+        DEVIN_KEY,
         GOOSE_KEY,
         HERMES_KEY,
         KIMI_KEY,
@@ -3602,6 +3676,8 @@ def _run_configure_harnesses_interactive() -> None:
     # Sentinel marking the Kiro row — like Goose/Hermes it owns its own auth (via
     # ``kiro-cli login``) and is installed via Kiro's curl installer, so it
     # dispatches to its own drill-in rather than a provider family.
+    _DEVIN = "\x00devin"
+
     _KIRO = "\x00kiro"
     # Sentinel marking the Kimi Code row — like Cursor/Antigravity/Qwen it is
     # not a provider family. Auth lives entirely in the kimi CLI (``kimi login``
@@ -3893,6 +3969,42 @@ def _run_configure_harnesses_interactive() -> None:
                     (_GOOSE, "Goose", "Not configured", "warn", "Open to run `goose configure`."),
                 )
 
+        # Devin — native TUI (`omnigent devin`), own auth via `devin auth login`.
+        # Unlike Kiro, Devin ships a real status probe (`devin auth status` exits
+        # 0 only while logged in), so an installed-but-signed-out CLI reads
+        # yellow and a signed-in one reads green. Rendered in the slot Devin's
+        # former builtin-ACP row occupied, so the overview ordering users know is
+        # unchanged by the move to a native harness.
+        if harness_cli_installed(DEVIN_KEY):
+            if harness_cli_logged_in(DEVIN_KEY):
+                rows.append((_DEVIN, "Devin", "Signed in", "ready", ""))
+            else:
+                rows.append(
+                    (
+                        _DEVIN,
+                        "Devin",
+                        "Not configured",
+                        "warn",
+                        "Sign in with `devin auth login`.",
+                    )
+                )
+        else:
+            devin_spec = harness_install_spec(DEVIN_KEY)
+            devin_hint = (
+                devin_spec.install_hint
+                if devin_spec and devin_spec.install_hint
+                else "curl -fsSL https://cli.devin.ai/install.sh | bash"
+            )
+            rows.append(
+                (
+                    _DEVIN,
+                    "Devin",
+                    _cli_absence_label(DEVIN_KEY),
+                    "missing",
+                    _install_hint(devin_hint),
+                )
+            )
+
         # Builtin ACP CLI harnesses (omnigent/acp_cli_harnesses.py) — vendor CLIs
         # that speak ACP on stdio. Derived from the catalog so adding a row there
         # surfaces it here too; without this they were addressable via
@@ -4138,6 +4250,8 @@ def _run_configure_harnesses_interactive() -> None:
             _show_acp_cli_harness(selected_target[len(_ACP_CLI_PREFIX) :])
         elif selected_target == _HERMES:
             _manage_hermes_harness()
+        elif selected_target == _DEVIN:
+            _manage_devin_harness()
         elif selected_target == _KIRO:
             _manage_kiro_harness()
         elif selected_target == _KIMI:

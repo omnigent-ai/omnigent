@@ -278,6 +278,11 @@ class PolicyEngine:
             deciding = getattr(result, "deciding_policies", None)
             if deciding:
                 evaluate_span.set_attribute("policy.deciding_policies", list(deciding))
+            # Attribute the decision to the deciding policy's owning workspace
+            # (only set for a workspace-scoped stored row; None on ALLOW or for
+            # YAML / agent-spec policies).
+            if result.deciding_policy_workspace_id is not None:
+                evaluate_span.set_attribute("workspace.id", result.deciding_policy_workspace_id)
             return result
 
     async def _evaluate_composed(
@@ -333,6 +338,9 @@ class PolicyEngine:
         accumulated_state: list[StateUpdate] = []
         ask_reasons: list[str] = []
         deciding_ask_policies: list[str] = []
+        # Owning workspace of the first ASKing policy, mirroring
+        # ``deciding_ask_policies[0]`` (None for non-workspace-scoped specs).
+        first_ask_workspace_id: int | None = None
         # Sequentially accumulated data: each policy that returns data
         # has its output fed back into ctx.content so the next policy
         # in the chain transforms the already-transformed payload rather
@@ -366,6 +374,7 @@ class PolicyEngine:
                     result.reason,
                     accumulated,
                     accumulated_state,
+                    deciding_policy_workspace_id=getattr(policy.spec, "workspace_id", None),
                     read_only=read_only,
                 )
             if result.data is not None:
@@ -377,6 +386,8 @@ class PolicyEngine:
                 ask_reasons.append(
                     f"{policy.spec.name}: {result.reason or 'approval required'}",
                 )
+                if not deciding_ask_policies:
+                    first_ask_workspace_id = getattr(policy.spec, "workspace_id", None)
                 deciding_ask_policies.append(policy.spec.name)
 
         if ask_reasons:
@@ -391,6 +402,7 @@ class PolicyEngine:
                 set_labels=dict(accumulated) if accumulated else None,
                 state_updates=list(accumulated_state) if accumulated_state else None,
                 deciding_policies=deciding_ask_policies,
+                deciding_policy_workspace_id=first_ask_workspace_id,
                 data=composed_data,
             )
         if not read_only:
@@ -411,6 +423,7 @@ class PolicyEngine:
         accumulated: dict[str, str],
         accumulated_state: list[StateUpdate],
         *,
+        deciding_policy_workspace_id: int | None = None,
         read_only: bool = False,
     ) -> PolicyResult:
         """
@@ -430,6 +443,9 @@ class PolicyEngine:
         :param accumulated_state: :class:`StateUpdate` operations
             gathered across every policy up to and including
             the DENYing one.
+        :param deciding_policy_workspace_id: Owning workspace id
+            of the DENYing policy row, or ``None`` for a
+            non-workspace-scoped (YAML / agent-spec) policy.
         :param read_only: When ``True``, skip persistent side
             effects (label writes and state updates). The
             returned result still carries ``set_labels`` so the
@@ -445,6 +461,7 @@ class PolicyEngine:
             set_labels=dict(accumulated) if accumulated else None,
             state_updates=list(accumulated_state) if accumulated_state else None,
             deciding_policies=[deciding_policy],
+            deciding_policy_workspace_id=deciding_policy_workspace_id,
         )
 
     def _should_fire(
@@ -605,12 +622,14 @@ class PolicyEngine:
             approved = float(value)
         except (TypeError, ValueError):
             return
-        owner = self._store.get_session_owner(self._conversation_id)
+        owner = self._store.get_session_owner_authority(self._conversation_id)
         if owner is None:
             return
+        from omnigent.db.account_authority import target_account_scope
         from omnigent.db.utils import now_epoch, utc_day
 
-        self._store.set_daily_ask_approved(owner, utc_day(now_epoch()), approved)
+        with target_account_scope(owner.user_id, owner.generation):
+            self._store.set_daily_ask_approved(owner.user_id, utc_day(now_epoch()), approved)
         # Keep the in-memory snapshot current so any later evaluate() on
         # this engine sees the approval and doesn't re-ASK the checkpoint
         # the user just approved — mirroring how the session policy's

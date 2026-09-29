@@ -7,6 +7,13 @@ import { useSessionHostOnline } from "@/hooks/RunnerHealthProvider";
 import { sandboxOptionLabel } from "@/lib/capabilities";
 import { SwitchHostDialog } from "@/shell/SwitchHostDialog";
 import { cn } from "@/lib/utils";
+import { ComposerHostTrigger } from "@/components/composer/ComposerControls";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 
 export type HostBadgeStatus = "online" | "offline" | "unknown";
 
@@ -61,37 +68,20 @@ const STATUS_WORD: Record<HostBadgeStatus, string> = {
 const RECONNECT_WORD = "offline — click to reconnect";
 
 /**
- * Host indicator for the open conversation, rendered in the composer's
- * status-line tray, immediately left of the worktree branch
- * (ComposerStatusLine). Reads its own data and renders nothing when the
- * session isn't host-bound — same self-contained shape as PresenceAvatars.
- * Shows the friendly host name (or sandbox-provider label) plus a status
- * circle: green online, red offline, neutral while liveness is still unknown.
- *
- * The name + dot is the ONLY shape this badge takes — a disconnected host
- * keeps its name so the user always reads which machine dropped. When the
- * host tunnel is down and reconnecting is possible, the same name + red dot
- * becomes a button that opens the reconnect instructions (`onReconnect`).
- * A dormant resumable managed host is excluded: its "offline" is idle
- * dormancy the next message wakes, not a disconnect to act on.
- *
- * Otherwise the badge is a button that opens `SwitchHostDialog` to move the
- * session to another machine. Reconnect keeps the click when it applies — it
- * has no other entry point — and offers the move inside its own dialog
- * instead. Server-managed sandbox hosts never offer it: the server owns
- * their placement.
- *
- * @param sessionId - The open conversation whose host to show.
- * @param onReconnect - Opens the reconnect help dialog. Wired by the caller
- *   for every host-bound session; the badge itself decides when a host is
- *   actually reconnectable.
+ * Session-bound host status with shared liveness, reconnect and switch behavior.
+ * The composer variant uses the compact host menu; the default retains the
+ * name-and-status badge. Managed sandbox placement remains server-owned.
  */
 export function HostBadge({
   sessionId,
   onReconnect,
+  appearance = "status",
+  readOnly = false,
 }: {
   sessionId: string;
   onReconnect?: () => void;
+  appearance?: "status" | "composer";
+  readOnly?: boolean;
 }) {
   const [switchOpen, setSwitchOpen] = useState(false);
   const { session } = useSession(sessionId);
@@ -138,6 +128,66 @@ export function HostBadge({
       : liveOnline;
 
   const badge = resolveHostBadge({ hostId, host, online });
+  if (appearance === "composer") {
+    const reconnectable = badge?.status === "offline" && !session?.hostResumable && !!onReconnect;
+    const canSwitch = host !== undefined && !host.sandbox_provider && !readOnly;
+    const label = badge ? `Host ${badge.label}, ${STATUS_WORD[badge.status]}` : "No host bound";
+    return (
+      <>
+        <DropdownMenu>
+          <DropdownMenuTrigger asChild>
+            <ComposerHostTrigger
+              label={label}
+              status={badge?.status ?? "unknown"}
+              cloud={!!host?.sandbox_provider}
+              data-testid="composer-host-select"
+            />
+          </DropdownMenuTrigger>
+          <DropdownMenuContent
+            align="start"
+            side="top"
+            sideOffset={8}
+            className="composer-host-menu w-max min-w-[220px]"
+            data-testid="composer-host-menu"
+          >
+            <div className="px-2 py-1 text-xs text-muted-foreground">
+              {host?.sandbox_provider ? "Cloud" : "Local"}
+            </div>
+            <DropdownMenuItem disabled className="gap-2" data-selected="true">
+              <span
+                className={cn(
+                  "size-2 shrink-0 rounded-full",
+                  STATUS_DOT_CLASS[badge?.status ?? "unknown"],
+                )}
+              />
+              <span>{badge?.label ?? "No host bound"}</span>
+            </DropdownMenuItem>
+            {reconnectable && (
+              <DropdownMenuItem disabled={readOnly} onSelect={onReconnect}>
+                Reconnect host
+              </DropdownMenuItem>
+            )}
+            {canSwitch && (
+              <DropdownMenuItem onSelect={() => setSwitchOpen(true)}>Switch host…</DropdownMenuItem>
+            )}
+            {!badge && (
+              <p className="max-w-60 px-2 py-1 text-xs text-muted-foreground">
+                This session has no host binding.
+              </p>
+            )}
+          </DropdownMenuContent>
+        </DropdownMenu>
+        {switchOpen && canSwitch && (
+          <SwitchHostDialog
+            open
+            onOpenChange={setSwitchOpen}
+            sessionId={sessionId}
+            currentHostId={hostId}
+          />
+        )}
+      </>
+    );
+  }
   if (!badge) return null;
 
   // A resumable managed host that reports offline is idle-stopped, not

@@ -90,9 +90,7 @@ def _make_cancel_server(
             body = json.loads(request.content)
             events.append(body)
             if stop_marks_terminal and body.get("type") == "stop_session":
-                runner_app.mark_subagent_work_terminal(
-                    child_id, status="cancelled", output="[System: sub-agent stopped]"
-                )
+                runner_app.mark_subagent_work_terminal(child_id, status="cancelled", output=None)
             return httpx.Response(204)
         return httpx.Response(404, json={"error": str(request.url)})
 

@@ -22,7 +22,7 @@ from playwright.async_api import Route, async_playwright, expect
 from tests.e2e_ui.start_session.test_start_session import (
     _HOST_ID,
     _codex_native_agents_body,
-    _open_entry_config,
+    _open_entry_models,
     _register_common_routes,
     _run_in_fresh_loop,
 )
@@ -52,7 +52,7 @@ _CLAUDE_HOST_ROWS = [
 def test_claude_default_entry_names_the_true_default(
     seeded_session: tuple[str, str],
 ) -> None:
-    """Row 6: the claude model select reads "Default (Opus 4.8 (1M context))".
+    """Row 6: the claude model select reads "Opus 4.8 (1M context)".
 
     :param seeded_session: ``(base_url, session_id)`` from the spawned server.
     """
@@ -86,7 +86,9 @@ async def _drive_claude_default_label(base_url: str, session_id: str) -> None:
 
             import re as _re
 
-            await page.route(_re.compile(r"/v1/sessions\?.*kind=any"), handle_agent_scan)
+            await page.route(
+                _re.compile(r"/v1/sessions\?(?!.*pinned=).*visibility=mine"), handle_agent_scan
+            )
             await page.route(
                 f"**/v1/hosts/{_HOST_ID}/harnesses/claude-native/model-options",
                 handle_model_options,
@@ -102,11 +104,11 @@ async def _drive_claude_default_label(base_url: str, session_id: str) -> None:
             await page.get_by_test_id("new-chat-landing-input").wait_for(
                 state="visible", timeout=30_000
             )
-            await _open_entry_config(page, "ag_claude_e2e")
-            model = page.get_by_test_id("new-chat-landing-config-model")
+            await _open_entry_models(page, "ag_claude_e2e")
+            model = page.get_by_test_id("new-chat-landing-agent-models")
             # The design's row 6: the untouched select names the model a
             # Default launch truly runs, for claude exactly as for codex.
-            await expect(model).to_contain_text("Default (Opus 4.8 (1M context))")
+            await expect(model).to_contain_text("Opus 4.8 (1M context)")
         finally:
             await browser.close()
 
@@ -146,7 +148,9 @@ async def _drive_codex_probe_failure(base_url: str, session_id: str) -> None:
 
             import re as _re
 
-            await page.route(_re.compile(r"/v1/sessions\?.*kind=any"), handle_agent_scan)
+            await page.route(
+                _re.compile(r"/v1/sessions\?(?!.*pinned=).*visibility=mine"), handle_agent_scan
+            )
             await page.route(
                 f"**/v1/hosts/{_HOST_ID}/harnesses/codex-native/model-options",
                 handle_model_options,
@@ -162,8 +166,8 @@ async def _drive_codex_probe_failure(base_url: str, session_id: str) -> None:
             await page.get_by_test_id("new-chat-landing-input").wait_for(
                 state="visible", timeout=30_000
             )
-            await _open_entry_config(page, "ag_codex_e2e")
-            await page.get_by_test_id("new-chat-landing-config-model").click()
+            await _open_entry_models(page, "ag_codex_e2e")
+
             await expect(
                 page.get_by_text("the codex model probe failed — see the host log", exact=True)
             ).to_be_visible(timeout=30_000)

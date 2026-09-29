@@ -1,0 +1,16 @@
+name: "Test uv installer"
+description: "Deterministic setup-uv substitute for testing retry behavior"
+
+inputs:
+  enable-cache:
+    description: "Ignored compatibility input."
+    required: false
+  version:
+    description: "Version printed by the successful test installer."
+    required: true
+
+runs:
+  using: node24
+  main: main.mjs
+  post: post.mjs
+  post-if: always()

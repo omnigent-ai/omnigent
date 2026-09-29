@@ -206,6 +206,53 @@ function resolveExternalCjsRequire(externals: readonly string[]): Plugin {
   };
 }
 
+// The worker asset then inherits the regular CDN publicPath and `new Worker(<cross-origin URL>)`
+// throws a SecurityError under managed omnigent — breaking BOTH the pdf.js and Monaco
+// module workers (pdf.js surfaced it first). Rewrite the construction back to the
+// literal `new Worker(new URL("./asset", import.meta.url), …)` so rspack treats it
+// as a worker chunk and serves it same-origin. Standalone Vite is unaffected (the
+// literal is what it resolves to anyway). Fails the build loudly if Vite's emitted
+// shape changes, mirroring resolveExternalCjsRequire's assert contract.
+function inlineWorkerUrlForHost(): Plugin {
+  // Vite injects the wrapper AFTER renderChunk, so we rewrite in generateBundle
+  // where the final chunk code exists. Captures the inner asset specifier ($1,
+  // quotes included). Anchored on `new Worker(` so plain asset `new URL(...)`
+  // references (e.g. wasm), which fetch fine cross-origin, are left untouched.
+  const VITE_WORKER_URL =
+    /new Worker\(\s*new URL\(\s*(?:\/\*\s*@vite-ignore\s*\*\/\s*)?""\s*\+\s*new URL\(\s*("(?:[^"\\]|\\.)*")\s*,\s*import\.meta\.url\s*\)\.href\s*,\s*""\s*\+\s*import\.meta\.url\s*\)/g;
+  return {
+    name: "inline-worker-url-for-host",
+    enforce: "post",
+    generateBundle(_options, bundle) {
+      let patchedCount = 0;
+      for (const file of Object.values(bundle)) {
+        if (file.type !== "chunk") continue;
+        file.code = file.code.replace(VITE_WORKER_URL, (_m, spec: string) => {
+          patchedCount++;
+          return `new Worker(new URL(${spec}, import.meta.url)`;
+        });
+      }
+      // The embed always builds the Monaco and pdf.js module workers through
+      // `new Worker(new URL(..., import.meta.url))`; both share this shape. Zero
+      // matches means Vite's worker emission changed and the rewrite rotted,
+      // silently reintroducing the cross-origin worker break.
+      if (patchedCount < 1) {
+        let sample: string | undefined;
+        for (const file of Object.values(bundle)) {
+          if (file.type !== "chunk") continue;
+          sample = file.code.match(/new Worker\([^;]{0,160}/)?.[0];
+          if (sample) break;
+        }
+        throw new Error(
+          "inline-worker-url-for-host: expected to rewrite Vite's worker-URL construction at least once, " +
+            "but matched 0 times. Vite's worker emission shape changed — re-check the VITE_WORKER_URL pattern. " +
+            `First 'new Worker(' seen: ${sample ?? "<none>"}`,
+        );
+      }
+    },
+  };
+}
+
 function scopeOmnigentCss(): Plugin {
   return {
     name: "scope-omnigent-css",
@@ -250,6 +297,7 @@ export default defineConfig({
     tailwindcss(),
     scopeOmnigentCss(),
     resolveExternalCjsRequire(SHARED_EXTERNALS),
+    inlineWorkerUrlForHost(),
   ],
   resolve: {
     alias: {

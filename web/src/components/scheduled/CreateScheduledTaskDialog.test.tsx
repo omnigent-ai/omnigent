@@ -20,6 +20,8 @@ import * as agentsHook from "@/hooks/useAvailableAgents";
 import * as hostsHook from "@/hooks/useHosts";
 import * as scheduledHooks from "@/hooks/useScheduledTasks";
 import type { AvailableAgent } from "@/hooks/useAvailableAgents";
+import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
+import { SERVER_INFO_OFFLINE_FALLBACK } from "@/lib/bootCapabilities";
 
 vi.mock("@/hooks/useAvailableAgents", () => ({ useAvailableAgents: vi.fn() }));
 // useHostModelOptions is consumed by the ModelEffortFields sub-form (model
@@ -35,8 +37,9 @@ vi.mock("@/hooks/useScheduledTasks", () => ({
 }));
 vi.mock("@/lib/agentLabels", () => ({ useBrainHarnessLabels: () => ({}) }));
 vi.mock("@/shell/WorkspacePicker", () => ({
-  WorkspacePicker: ({ onNavigate }: { onNavigate?: (p: string) => void }) => (
-    <button type="button" onClick={() => onNavigate?.("/home/me/repo")}>
+  isNavigablePath: (path: string) => path.startsWith("/"),
+  WorkspacePicker: ({ onSelect }: { onSelect?: (p: string) => void }) => (
+    <button type="button" onClick={() => onSelect?.("/home/me/repo")}>
       pick-workspace
     </button>
   ),
@@ -55,6 +58,9 @@ vi.mock("@/shell/NewChatDialog", () => ({
     agentLabel,
     host,
     dropdownModal,
+    contentClassName,
+    harnessEntries,
+    agentEntries,
   }: {
     onSelectAgent: (a: AvailableAgent) => void;
     onOpenChange?: (open: boolean) => void;
@@ -62,6 +68,9 @@ vi.mock("@/shell/NewChatDialog", () => ({
     agentLabel: string;
     host?: { host_id: string } | null;
     dropdownModal?: boolean;
+    contentClassName?: string;
+    harnessEntries: AvailableAgent[];
+    agentEntries: AvailableAgent[];
   }) => (
     <div
       data-testid="agent-picker-stub"
@@ -70,6 +79,9 @@ vi.mock("@/shell/NewChatDialog", () => ({
       // a test can assert it's populated even when no host is pinned.
       data-badge-host={host?.host_id ?? ""}
       data-dropdown-modal={dropdownModal === false ? "false" : "true"}
+      data-content-class={contentClassName}
+      data-harness-entries={harnessEntries.map((agent) => agent.name).join(",")}
+      data-agent-entries={agentEntries.map((agent) => agent.name).join(",")}
     >
       <span>{agentLabel}</span>
       <button
@@ -173,6 +185,17 @@ function renderDialog(onOpenChange: (open: boolean) => void = vi.fn()) {
   return render(<CreateScheduledTaskDialog open onOpenChange={onOpenChange} />);
 }
 
+/** Render inside a CapabilitiesProvider that advertises managed sandboxes. */
+function renderWithSandboxes(onOpenChange: (open: boolean) => void = vi.fn()) {
+  return render(
+    <CapabilitiesProvider
+      info={{ ...SERVER_INFO_OFFLINE_FALLBACK, managed_sandboxes_enabled: true }}
+    >
+      <CreateScheduledTaskDialog open onOpenChange={onOpenChange} />
+    </CapabilitiesProvider>,
+  );
+}
+
 function scheduledTask(overrides: Partial<ScheduledTasksApiModule.ScheduledTask> = {}) {
   return {
     id: "st_1",
@@ -189,6 +212,7 @@ function scheduledTask(overrides: Partial<ScheduledTasksApiModule.ScheduledTask>
     permissionMode: null,
     workspace: null,
     hostId: null,
+    executionTarget: "connected_host",
     state: "active",
     lastRunAt: null,
     lastRunStatus: null,
@@ -225,6 +249,43 @@ describe("agent picker readiness (needs-setup badges)", () => {
     renderDialog();
     expect(screen.getByTestId("agent-picker-stub")).toHaveAttribute("data-dropdown-modal", "false");
   });
+
+  it("uses the shared viewport-aware menu height instead of a fixed scroll cap", () => {
+    renderDialog();
+    expect(screen.getByTestId("agent-picker-stub")).toHaveAttribute("data-content-class", "w-80");
+  });
+
+  it("groups generic ACP choices with harnesses like the main composer", () => {
+    vi.mocked(agentsHook.useAvailableAgents).mockReturnValue({
+      data: [
+        ...AGENTS,
+        {
+          id: "ag_jcode",
+          name: "jcode",
+          display_name: "Jcode",
+          description: null,
+          harness: "jcode",
+          skills: [],
+          acpHarness: true,
+        },
+        {
+          id: "ag_grok",
+          name: "grok",
+          display_name: "Grok Build",
+          description: null,
+          harness: "grok",
+          skills: [],
+          acpHarness: true,
+        },
+      ],
+    } as unknown as ReturnType<typeof agentsHook.useAvailableAgents>);
+
+    renderDialog();
+
+    const picker = screen.getByTestId("agent-picker-stub");
+    expect(picker).toHaveAttribute("data-harness-entries", "claude-native-ui,jcode,grok");
+    expect(picker).toHaveAttribute("data-agent-entries", "polly");
+  });
 });
 
 describe("CreateScheduledTaskDialog validation", () => {
@@ -239,6 +300,23 @@ describe("CreateScheduledTaskDialog validation", () => {
     expect(submit).toBeDisabled();
     fireEvent.change(screen.getByTestId("task-prompt-input"), { target: { value: "Do it" } });
     expect(submit).toBeEnabled();
+  });
+
+  it("pins a workspace only after the full-screen browser confirms", () => {
+    renderDialog();
+    const hostTrigger = screen.getByTestId("task-host-trigger");
+    fireEvent.pointerDown(hostTrigger, new MouseEvent("pointerdown", { bubbles: true, button: 0 }));
+    fireEvent.click(hostTrigger);
+    fireEvent.click(screen.getByRole("option", { name: /laptop/ }));
+
+    fireEvent.click(screen.getByTestId("task-workspace-browse"));
+    expect(screen.getByTestId("workspace-picker-dialog")).toBeInTheDocument();
+    expect(screen.queryByText("/home/me/repo")).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: "pick-workspace" }));
+
+    expect(screen.queryByTestId("workspace-picker-dialog")).toBeNull();
+    expect(screen.getAllByText("/home/me/repo")).toHaveLength(2);
   });
 });
 
@@ -440,6 +518,53 @@ describe("CreateScheduledTaskDialog edit mode", () => {
     );
     expect(screen.getByRole("alert")).toHaveTextContent("This schedule can't be edited");
     expect(screen.getByTestId("create-scheduled-task-submit")).toBeDisabled();
+  });
+});
+
+describe("CreateScheduledTaskDialog sandbox mode", () => {
+  // Open the Host <Select> the Radix-in-jsdom way (see ForkSessionDialog.test).
+  function openHostSelect() {
+    const trigger = screen.getByTestId("task-host-trigger");
+    fireEvent.pointerDown(trigger, new MouseEvent("pointerdown", { bubbles: true, button: 0 }));
+    fireEvent.click(trigger);
+  }
+
+  it("offers no sandbox host option when the server does not advertise managed sandboxes", () => {
+    renderDialog();
+    openHostSelect();
+    expect(screen.queryByTestId("task-host-sandbox-option")).not.toBeInTheDocument();
+  });
+
+  it("offers a sandbox option in the host picker when enabled; choosing it enters sandbox mode", () => {
+    renderWithSandboxes();
+    openHostSelect();
+    fireEvent.click(screen.getByTestId("task-host-sandbox-option"));
+    // Sandbox mode swaps the helper text to the fresh-sandbox copy (no separate
+    // checkbox), and the connected-host workspace picker never appears.
+    expect(
+      screen.getByText(
+        "Provisions a fresh sandbox for each run. Shutdown follows the server’s sandbox configuration.",
+      ),
+    ).toBeInTheDocument();
+    expect(screen.queryByText("pick-workspace")).not.toBeInTheDocument();
+  });
+
+  it("submits execution_target=managed_sandbox with no host/workspace when the sandbox option is chosen", async () => {
+    renderWithSandboxes();
+    fireEvent.change(screen.getByTestId("task-name-input"), { target: { value: "Nightly" } });
+    fireEvent.change(screen.getByTestId("task-prompt-input"), { target: { value: "Do it" } });
+    openHostSelect();
+    fireEvent.click(screen.getByTestId("task-host-sandbox-option"));
+
+    const submit = screen.getByTestId("create-scheduled-task-submit");
+    await waitFor(() => expect(submit).toBeEnabled());
+    fireEvent.click(submit);
+
+    await waitFor(() => expect(mutateAsync).toHaveBeenCalledTimes(1));
+    const arg = mutateAsync.mock.calls[0][0];
+    expect(arg).toMatchObject({ executionTarget: "managed_sandbox" });
+    expect(arg).not.toHaveProperty("hostId");
+    expect(arg).not.toHaveProperty("workspace");
   });
 });
 

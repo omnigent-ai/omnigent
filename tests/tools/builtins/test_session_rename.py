@@ -14,3 +14,6 @@ def test_session_rename_schema_is_self_scoped() -> None:
         schema["parameters"]["properties"]["title"]["maxLength"]
         == DEFAULT_GENERATED_TITLE_MAX_CHARS
     )
+    assert "user's configured" in schema["description"]
+    assert "date prefixes" in schema["description"]
+    assert "PR or issue numbers" in schema["description"]

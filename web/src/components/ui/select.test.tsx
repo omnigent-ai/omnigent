@@ -69,3 +69,11 @@ describe("Select analytics (componentId)", () => {
     expect(analytics).not.toHaveBeenCalled();
   });
 });
+
+describe("Select item interaction", () => {
+  it("uses the hand cursor for options", () => {
+    renderSelect({});
+    fireEvent.click(screen.getByRole("combobox"));
+    expect(screen.getByRole("option", { name: "High" })).toHaveClass("cursor-pointer");
+  });
+});

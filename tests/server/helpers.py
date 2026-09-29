@@ -879,6 +879,7 @@ async def create_test_agent(
     skills: list[dict[str, str]] | None = None,
     user: str | None = None,
     guardrails: dict[str, Any] | None = None,
+    terminals: dict[str, Any] | None = None,
     include_llm: bool = True,
     sub_agents: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
@@ -906,6 +907,8 @@ async def create_test_agent(
     :param guardrails: Optional ``guardrails:`` block for the agent
         spec (e.g. a ``cost_budget`` policy). Passed verbatim to
         :func:`build_agent_bundle`. ``None`` omits guardrails.
+    :param terminals: Optional ``terminals:`` block written verbatim
+        into the agent spec.
     :param include_llm: Whether to include the default ``llm:`` block.
         Set ``False`` for model-less harness tests.
     :param sub_agents: Optional sub-agent config dicts declared in the
@@ -924,6 +927,7 @@ async def create_test_agent(
         executor=executor,
         skills=skills,
         guardrails=guardrails,
+        terminals=terminals,
         include_llm=include_llm,
         sub_agents=sub_agents,
     )
