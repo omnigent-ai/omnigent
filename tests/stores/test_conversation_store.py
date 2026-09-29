@@ -173,6 +173,44 @@ def test_create_and_get(conversation_store: SqlAlchemyConversationStore) -> None
     assert fetched.id == conv.id
 
 
+def test_create_persists_initial_labels_and_overrides(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """Create returns the initial session state without a follow-up update."""
+    created = conversation_store.create_conversation(
+        labels={
+            "omnigent.ui": "terminal",
+            "custom": "value",
+            "long": "x" * 257,
+        },
+        reasoning_effort="high",
+        model_override="model-a",
+        cost_control_mode_override="on",
+        subagent_routing_override="off",
+        harness_override="codex-native",
+    )
+
+    assert created.labels == {
+        "omnigent.ui": "terminal",
+        "custom": "value",
+        "long": "x" * 256,
+    }
+    assert created.reasoning_effort == "high"
+    assert created.model_override == "model-a"
+    assert created.cost_control_mode_override == "on"
+    assert created.subagent_routing_override == "off"
+    assert created.harness_override == "codex-native"
+
+    fetched = conversation_store.get_conversation(created.id)
+    assert fetched is not None
+    assert fetched.labels == created.labels
+    assert fetched.reasoning_effort == "high"
+    assert fetched.model_override == "model-a"
+    assert fetched.cost_control_mode_override == "on"
+    assert fetched.subagent_routing_override == "off"
+    assert fetched.harness_override == "codex-native"
+
+
 def test_create_with_existing_caller_supplied_id_raises(db_uri: str) -> None:
     """A stable caller id turns a retry from another store into a typed conflict."""
     from omnigent.stores.conversation_store import ConversationAlreadyExistsError
@@ -3360,6 +3398,51 @@ def test_set_host_id_with_workspace_satisfies_constraint(
     assert updated.workspace == "/Users/corey/projects/myapp"
 
 
+@pytest.mark.parametrize(
+    ("move_host", "workspace", "git_branch", "expected_branch"),
+    [
+        pytest.param(True, "/repo/worktree", None, None, id="different-host-same-path"),
+        pytest.param(True, None, None, None, id="different-host-omitted-workspace"),
+        pytest.param(False, "/repo/other", None, None, id="different-workspace"),
+        pytest.param(False, "/repo/worktree", None, "feature/source", id="same-binding"),
+        pytest.param(False, None, None, "feature/source", id="same-host-omitted-workspace"),
+        pytest.param(True, "/repo/other", "feature/new", "feature/new", id="move-with-branch"),
+        pytest.param(False, "/repo/worktree", "feature/new", "feature/new", id="replace-branch"),
+    ],
+)
+def test_set_host_id_keeps_git_branch_with_its_workspace(
+    conversation_store: SqlAlchemyConversationStore,
+    db_uri: str,
+    move_host: bool,
+    workspace: str | None,
+    git_branch: str | None,
+    expected_branch: str | None,
+) -> None:
+    """A moved session must not reuse its former worktree branch for side chats."""
+    original_host = "292dfcdf8a31f1319b469f4fa179ac6b"
+    other_host = "8f48061706cb92d5e7cd7c4aadc56ef0"
+    _register_host(db_uri, original_host)
+    _register_host(db_uri, other_host)
+    conv = conversation_store.create_conversation(
+        host_id=original_host,
+        workspace="/repo/worktree",
+        git_branch="feature/source",
+    )
+    target_host = other_host if move_host else original_host
+
+    updated = conversation_store.set_host_id(
+        conv.id, target_host, workspace=workspace, git_branch=git_branch
+    )
+
+    assert updated.git_branch == expected_branch
+    fetched = conversation_store.get_conversation(conv.id)
+    assert fetched is not None
+    assert fetched.host_id == target_host
+    assert fetched.workspace == (workspace or "/repo/worktree")
+    assert fetched.git_branch == expected_branch
+    assert fetched.updated_at == conv.updated_at
+
+
 def test_clear_host_binding_nulls_all_binding_fields(
     conversation_store: SqlAlchemyConversationStore,
     db_uri: str,
@@ -3369,8 +3452,7 @@ def test_clear_host_binding_nulls_all_binding_fields(
 
     This is the failed-bind rollback primitive: after a worktree launch
     fails and the worktree is removed, the session must not keep pointing
-    at the deleted worktree/branch or stay runner-bound. Unlike set_host_id
-    (None = leave untouched, so it can't clear git_branch), this fully
+    at the deleted worktree/branch or stay runner-bound. This fully
     reverts to unbound. A leftover git_branch here would wrongly satisfy
     worktree-cleanup paths (git_branch IS NOT NULL); a leftover runner_id
     would block the picker's retry on the atomic set_runner_id CAS.
@@ -6721,6 +6803,60 @@ def test_live_state_columns_round_trip_without_bumping_updated_at(
     conversation_store.touch_runner_liveness([], now=1)
 
 
+def test_clear_runner_liveness_not_after_spares_a_newer_stamp(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """
+    A ``not_after`` guard keeps a stamp another replica wrote after ours.
+
+    The cross-replica disconnect check compares against THIS replica's own
+    last stamp, so a clear scheduled before it learns of a reconnect
+    elsewhere must never erase that replica's fresher write.
+    """
+    conv = conversation_store.create_conversation(title="newer-elsewhere")
+    assert conversation_store.set_runner_id(conv.id, "runner_newer_elsewhere")
+
+    conversation_store.touch_runner_liveness(["runner_newer_elsewhere"], now=2_000_000)
+    conversation_store.clear_runner_liveness("runner_newer_elsewhere", not_after=1_000_000)
+
+    connectivity = conversation_store.get_session_connectivity([conv.id])
+    assert connectivity[conv.id].runner_last_seen == 2_000_000
+
+
+def test_clear_runner_liveness_not_after_clears_an_equal_or_older_stamp(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """A stamp at or before ``not_after`` still clears — the runner is really gone."""
+    equal = conversation_store.create_conversation(title="equal-stamp")
+    older = conversation_store.create_conversation(title="older-stamp")
+    assert conversation_store.set_runner_id(equal.id, "runner_equal_stamp")
+    assert conversation_store.set_runner_id(older.id, "runner_older_stamp")
+
+    conversation_store.touch_runner_liveness(["runner_equal_stamp"], now=1_000_000)
+    conversation_store.clear_runner_liveness("runner_equal_stamp", not_after=1_000_000)
+
+    conversation_store.touch_runner_liveness(["runner_older_stamp"], now=999_000)
+    conversation_store.clear_runner_liveness("runner_older_stamp", not_after=1_000_000)
+
+    connectivity = conversation_store.get_session_connectivity([equal.id, older.id])
+    assert connectivity[equal.id].runner_last_seen is None
+    assert connectivity[older.id].runner_last_seen is None
+
+
+def test_clear_runner_liveness_without_not_after_still_clears_unconditionally(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """Omitting ``not_after`` preserves the pre-cross-replica unconditional clear."""
+    conv = conversation_store.create_conversation(title="unconditional-clear")
+    assert conversation_store.set_runner_id(conv.id, "runner_unconditional_clear")
+
+    conversation_store.touch_runner_liveness(["runner_unconditional_clear"], now=2_000_000)
+    conversation_store.clear_runner_liveness("runner_unconditional_clear")
+
+    connectivity = conversation_store.get_session_connectivity([conv.id])
+    assert connectivity[conv.id].runner_last_seen is None
+
+
 def test_live_state_writes_via_chokepoint_land_in_scoped_workspace(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:
@@ -7561,6 +7697,31 @@ def test_append_with_stable_id_is_idempotent(
 
     page = conversation_store.list_items(conv.id)
     assert [i.id for i in page.data if i.id == stable] == [stable]
+
+
+def test_get_item_returns_the_persisted_item_or_none(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """``get_item`` is the point lookup the native mirror path uses to spot a retry."""
+    conv = conversation_store.create_conversation()
+    stable = "cd" * 16
+    item = NewConversationItem(
+        type="message",
+        response_id="resp_y",
+        data=MessageData(role="user", content=[{"type": "input_text", "text": "hi"}]),
+        stable_id=stable,
+    )
+    assert conversation_store.get_item(conv.id, stable) is None
+
+    [persisted] = conversation_store.append(conv.id, [item])
+
+    found = conversation_store.get_item(conv.id, stable)
+    assert found is not None
+    assert found.id == persisted.id
+    assert isinstance(found.data, MessageData)
+    assert found.data.content == [{"type": "input_text", "text": "hi"}]
+    other = conversation_store.create_conversation()
+    assert conversation_store.get_item(other.id, stable) is None
 
 
 def test_append_without_stable_id_still_duplicates(

@@ -16,8 +16,8 @@ before sending:
 1. **Permission mode** — native permission/approval choices, in the
    hand dropdown. A non-default pick rides along as
    ``terminal_launch_args``.
-2. **Working directory** — the file-browser popover behind the working-
-   directory chip. Browsing into a folder sets the session's
+2. **Working directory** — the full-screen file-browser dialog behind the
+   working-directory chip. Confirming a browsed folder sets the session's
    ``workspace``.
 3. **Git worktree** — the branch chip's popover. Naming a branch attaches
    a ``git`` worktree spec to the create.
@@ -3061,11 +3061,21 @@ async def _drive_folder_selection(base_url: str, session_id: str) -> None:
                 "e2e"
             )
 
-            # Open the file browser and navigate into the "projects" folder.
+            # Every entry point uses the same viewport-safe full-screen browser.
             await open_landing_workspace_picker(page)
+            picker_dialog = page.get_by_test_id("workspace-picker-dialog")
+            await expect(picker_dialog).to_be_visible()
+            picker = page.get_by_test_id("workspace-picker")
+            await expect(picker).to_have_css("width", "800px")
+            await expect(picker).to_have_css("height", "600px")
+
+            # Navigate into "projects"; the landing chip remains unchanged
+            # until the explicit Confirm action commits the provisional path.
             await page.get_by_test_id("workspace-picker-entry-projects").click()
-            # The child listing confirms we navigated in.
             await expect(page.get_by_test_id("workspace-picker-entry-src")).to_be_visible()
+            await expect(page.get_by_test_id("new-chat-landing-workspace-chip")).to_contain_text(
+                "e2e"
+            )
             await commit_landing_workspace_picker(page)
 
             # The explicit Select action commits the navigated folder.
@@ -3440,6 +3450,7 @@ async def _drive_add_worktree(base_url: str, session_id: str) -> None:
             await page.get_by_test_id("new-chat-landing-input").wait_for(
                 state="visible", timeout=30_000
             )
+            await expect(page.get_by_test_id("new-chat-landing-branch-chip")).to_have_text("None")
 
             # Open the worktree chip and name a branch + base branch.
             await page.get_by_test_id("new-chat-landing-branch-chip").click()
@@ -3545,7 +3556,7 @@ async def _drive_select_existing_worktree(base_url: str, session_id: str) -> Non
                 0
             )
             await expect(page.get_by_test_id("new-chat-landing-branch-chip")).to_contain_text(
-                "feature/x"
+                "feature-x"
             )
 
             # Reopening keeps the existing row selected while reserving New
@@ -3702,10 +3713,10 @@ async def _drive_fork_of_fork_dedup(base_url: str, session_id: str) -> None:
             await expect(page.get_by_test_id("new-chat-landing-agent-ag_forkfork")).to_have_count(
                 0
             )
-            # Top level: the built-in Claude row + the "Custom agents" submenu
+            # Top level: the built-in Claude row + the custom-agent "Other..." submenu
             # trigger — no duplicate "Claude Code" sneaks in via a leaked clone.
             await expect(page.locator("[data-harness-menu-row]")).to_have_count(1)
-            # The genuinely custom agent survives, inside the Custom agents submenu.
+            # The genuinely custom agent survives inside that submenu.
             await page.get_by_test_id("new-chat-landing-custom-agents").click()
             await expect(page.get_by_test_id("new-chat-landing-agent-ag_doc")).to_be_visible()
         finally:

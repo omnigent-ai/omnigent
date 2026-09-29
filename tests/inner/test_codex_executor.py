@@ -23,18 +23,21 @@ from omnigent.inner.codex_executor import (
     _codex_builtin_tool_completion,
     _codex_cli_version,
     _CodexAppServerSession,
+    _CodexSessionState,
     _databricks_codex_config_overrides,
     _dynamic_tool_result_payload,
     _goal_objective_from_content,
     _parse_codex_gateway_error,
     _prompt_for_turn,
     _provider_codex_config_overrides,
+    _require_brokered_codex_version,
     _to_codex_input_items,
 )
 from omnigent.inner.codex_goal_command import (
     GOAL_OBJECTIVE_MAX_CHARS,
     goal_objective_length_error,
 )
+from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.executor import (
     ExecutorError,
     ReasoningChunk,
@@ -44,6 +47,9 @@ from omnigent.inner.executor import (
     ToolCallStatus,
     TurnComplete,
 )
+from omnigent.inner.model_auth import ProviderAuthRequired
+from omnigent.inner.model_egress import FrozenModelRoute
+from omnigent.inner.model_signer import SignerLaunchConfig, SubprocessModelSigner
 from omnigent.models.codex_model_vocabulary import codex_spawn_model
 from omnigent.models.model_fallbacks import CODEX_DEFAULT_MODEL
 from omnigent.native import _native_forwarder_health as native_forwarder_health
@@ -103,6 +109,30 @@ class _FakePipe:
 
     async def read(self, n: int) -> bytes:
         return b""
+
+
+class _ScriptedStdoutPipe(_FakePipe):
+    """Stdout that emits scripted frames, then stays open like a live server.
+
+    The prompt stdout-EOF recovery turns an immediate EOF into
+    ``HarnessTransportClosedError``, and ``start()`` resets ``_events``,
+    so tests that drive the real ``start()`` must deliver events through
+    the reader and keep stdout open until ``close()`` cancels the reader
+    task.
+    """
+
+    def __init__(self, lines: list[bytes]) -> None:
+        super().__init__()
+        self._lines = list(lines)
+
+    async def read(self, n: int) -> bytes:
+        if self._lines:
+            return self._lines.pop(0)
+        await asyncio.Event().wait()
+        return b""
+
+    async def readline(self) -> bytes:
+        return await self.read(-1)
 
 
 class _OverflowingPipe:
@@ -371,6 +401,29 @@ class TestCodexExecutor(unittest.TestCase):
         prompt = _prompt_for_turn(messages, is_new_thread=False)
         self.assertEqual(prompt, "Summarize our conversation.")
 
+    def test_build_initial_prompt_keeps_user_attachments_as_native_blocks(self):
+        # A fresh thread replaying multimodal history must keep image bytes as
+        # native input_image blocks, not flatten the data URI into prompt text.
+        uri = "data:image/png;base64,QUJD"
+        messages = [
+            {"role": "user", "content": [{"type": "input_image", "image_url": uri}]},
+            {"role": "assistant", "content": "Saw it."},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": "Compare."},
+                    {"type": "input_image", "image_url": uri},
+                ],
+            },
+        ]
+        prompt = _build_initial_prompt(messages)
+        self.assertIsInstance(prompt, list)
+        wire = _to_codex_input_items(prompt)
+        images = [item for item in wire if item["type"] == "image"]
+        self.assertEqual(images, [{"type": "image", "url": uri}, {"type": "image", "url": uri}])
+        text = "\n".join(item["text"] for item in wire if item["type"] == "text")
+        self.assertNotIn(uri, text)
+
     def test_goal_objective_requires_a_standalone_command(self):
         self.assertEqual(
             _goal_objective_from_content("  /goal Finish the implementation  "),
@@ -514,7 +567,7 @@ class TestCodexExecutor(unittest.TestCase):
         _run(_t())
 
     def test_app_server_run_turn_keeps_native_shell_by_default(self):
-        async def _t():
+        async def _t(supports_direct_tools: bool):
             session = _CodexAppServerSession(
                 codex_path="/bin/echo",
                 cwd="/tmp/workspace",
@@ -522,6 +575,7 @@ class TestCodexExecutor(unittest.TestCase):
                 tool_executor=None,
             )
             session.start = AsyncMock()
+            session._supports_direct_tool_namespaces = supports_direct_tools
             session._proc = _FakeProcess()
             session._request = AsyncMock(
                 side_effect=[
@@ -574,10 +628,21 @@ class TestCodexExecutor(unittest.TestCase):
 
             thread_start_call = session._request.await_args_list[0]
             params = thread_start_call.args[1]
-            self.assertNotIn("shell_tool", params["config"]["features"])
+            self.assertNotIn("features.shell_tool", params["config"])
+            if supports_direct_tools:
+                self.assertEqual(
+                    params["config"]["features.code_mode.direct_only_tool_namespaces"],
+                    ["functions"],
+                )
+            else:
+                self.assertNotIn(
+                    "features.code_mode.direct_only_tool_namespaces", params["config"]
+                )
             self.assertEqual(params["dynamicTools"][0]["name"], "sys_os_shell")
 
-        _run(_t())
+        for supports_direct_tools in (False, True):
+            with self.subTest(supports_direct_tools=supports_direct_tools):
+                _run(_t(supports_direct_tools))
 
     def test_app_server_run_turn_starts_goal_before_objective_turn(self):
         async def _t():
@@ -625,6 +690,7 @@ class TestCodexExecutor(unittest.TestCase):
                 [call.args[0] for call in calls],
                 ["thread/start", "thread/goal/set", "turn/start"],
             )
+            self.assertNotIn("modelProvider", calls[0].args[1])
             self.assertEqual(
                 calls[1].args[1],
                 {"threadId": "thread-1", "objective": "Finish and test"},
@@ -632,6 +698,51 @@ class TestCodexExecutor(unittest.TestCase):
             self.assertEqual(
                 calls[2].args[1]["input"],
                 [{"type": "text", "text": "Finish and test"}],
+            )
+
+        _run(_t())
+
+    def test_brokered_app_server_pins_provider_on_thread_start(self):
+        async def _t():
+            session = _CodexAppServerSession(
+                codex_path="/bin/echo",
+                cwd="/tmp/workspace",
+                env={},
+                tool_executor=None,
+                thread_model_provider="omnigent_brokered",
+            )
+            session.start = AsyncMock()
+            session._proc = _FakeProcess()
+            session._request = AsyncMock(
+                side_effect=[
+                    {"result": {"thread": {"id": "thread-1"}}},
+                    {"result": {"turn": {"id": "turn-1"}}},
+                ]
+            )
+
+            async def _inject_turn_completed() -> None:
+                await asyncio.sleep(0.01)
+                session._events.put_nowait(
+                    {"method": "turn/completed", "params": {"turn": {"id": "turn-1"}}}
+                )
+
+            inject_task = asyncio.create_task(_inject_turn_completed())
+            async for _event in session.run_turn(
+                messages=[{"role": "user", "content": "hi"}],
+                tools=[],
+                system_prompt="",
+                model="gpt-5.4-mini",
+                cwd=".",
+                sandbox="workspace-write",
+            ):
+                pass
+            await inject_task
+
+            thread_start = session._request.await_args_list[0]
+            self.assertEqual(thread_start.args[0], "thread/start")
+            self.assertEqual(
+                thread_start.args[1]["modelProvider"],
+                "omnigent_brokered",
             )
 
         _run(_t())
@@ -1029,7 +1140,7 @@ class TestCodexExecutor(unittest.TestCase):
 
             thread_start_call = session._request.await_args_list[0]
             params = thread_start_call.args[1]
-            self.assertEqual(params["config"]["features"]["shell_tool"], False)
+            self.assertEqual(params["config"]["features.shell_tool"], False)
 
         _run(_t())
 
@@ -1092,6 +1203,36 @@ class TestCodexExecutor(unittest.TestCase):
 
         _run(_t())
 
+    def test_signature_change_cannot_replace_incompletely_cleaned_session(self):
+        async def _t():
+            existing = AsyncMock()
+            existing._closing = True
+            existing.cleaned = False
+            factory = AsyncMock()
+            executor = CodexExecutor(
+                codex_path="/bin/echo",
+                app_session_factory=factory,
+            )
+            state = _CodexSessionState(
+                app_session=existing,
+                signature=(None, "old", "old", "old"),
+            )
+            executor._session_states["s1"] = state
+
+            with self.assertRaisesRegex(RuntimeError, "cleanup is incomplete"):
+                await executor._ensure_app_session(
+                    "s1",
+                    state,
+                    signature=(None, "new", "new", "new"),
+                    effective_cwd="/tmp",
+                )
+
+            existing.close.assert_awaited_once_with()
+            factory.assert_not_called()
+            self.assertIs(state.app_session, existing)
+
+        _run(_t())
+
     def test_close_session_closes_app_session(self):
         async def _t():
             fake_session = _FakeAppSession([[TurnComplete(response="done")]])
@@ -1109,6 +1250,28 @@ class TestCodexExecutor(unittest.TestCase):
             ]
             await executor.close_session("s1")
             self.assertTrue(fake_session.closed)
+
+        _run(_t())
+
+    def test_close_session_removes_cleaned_state_when_cancellation_is_reraised(self):
+        async def _t():
+            class _CancelledCleanSession:
+                cleaned = True
+
+                async def close(self) -> None:
+                    raise asyncio.CancelledError
+
+            executor = CodexExecutor(codex_path="/bin/echo")
+            app_session = _CancelledCleanSession()
+            executor._session_states["s1"] = _CodexSessionState(
+                app_session=app_session,  # type: ignore[arg-type]
+                signature=(None, "", "", ""),
+            )
+
+            with self.assertRaises(asyncio.CancelledError):
+                await executor.close_session("s1")
+
+            self.assertEqual(executor._session_states, {})
 
         _run(_t())
 
@@ -3657,6 +3820,79 @@ def test_populate_codex_home_config_partial_files(tmp_path: Path) -> None:
     assert not (target / "config.toml").exists()
 
 
+@pytest.mark.parametrize(
+    "user_agent,direct_tools",
+    [
+        ("omnigent/0.141.0 (macOS 15.6.1)", False),
+        ("omnigent/0.142.0", True),
+        ("codex_cli_rs/0.154.0", True),
+        ("custom-client/0.154.0-alpha.1 (client/0.1)", True),
+        ("unknown (client/0.154.0)", False),
+        (None, False),
+    ],
+)
+def test_app_server_negotiates_direct_tools_from_server_version(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    user_agent: str | None,
+    direct_tools: bool,
+) -> None:
+    """Only compatible servers receive the direct dynamic-tool setting."""
+    monkeypatch.setattr(
+        "omnigent.inner.codex_executor._codex_home_config_source_from_env",
+        lambda: tmp_path / "empty-config",
+    )
+    monkeypatch.setattr(
+        "omnigent.inner.codex_executor.populate_codex_skills_from_bundle", lambda *_: None
+    )
+
+    async def _t() -> None:
+        session = _CodexAppServerSession(
+            codex_path="/fixture/codex", cwd=str(tmp_path), env={}, tool_executor=None
+        )
+        session._request = AsyncMock(
+            side_effect=[
+                {"result": {"userAgent": user_agent}},
+                {"result": {"thread": {"id": "thread-1"}}},
+                {"result": {"turn": {"id": "turn-1"}}},
+            ]
+        )
+        fake_process = _FakeProcess()
+        fake_process.stdout = _ScriptedStdoutPipe(
+            [
+                json.dumps(
+                    {
+                        "method": "turn/completed",
+                        "params": {"turnId": "turn-1", "turn": {"id": "turn-1"}},
+                    }
+                ).encode()
+                + b"\n"
+            ]
+        )
+        with patch(
+            "omnigent.inner.codex_executor._create_subprocess_exec",
+            new=AsyncMock(return_value=fake_process),
+        ):
+            try:
+                async for _event in session.run_turn(
+                    messages=[{"role": "user", "content": "Read the screenshot"}],
+                    tools=[{"name": "snapshot", "description": "Screenshot", "parameters": {}}],
+                    system_prompt="",
+                    model="fixture-model",
+                    cwd=str(tmp_path),
+                    sandbox="workspace-write",
+                ):
+                    pass
+                config = session._request.await_args_list[1].args[1]["config"]
+                assert config["features.unified_exec"] is False
+                key = "features.code_mode.direct_only_tool_namespaces"
+                assert config.get(key) == (["functions"] if direct_tools else None)
+            finally:
+                await session.close()
+
+    _run(_t())
+
+
 def test_app_server_start_uses_real_home_for_private_inherited_codex_home(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -4232,6 +4468,82 @@ async def test_codex_cli_version_times_out_and_kills_proc(
     assert proc.killed is True
 
 
+@pytest.mark.parametrize(
+    "output",
+    [
+        b"codex-cli (unknown build)\n",
+        b"codex-cli 0.139.0\n",
+        b"codex-cli 0.140.0-alpha.18\n",
+        b"codex-cli 0.140.0-alpha.19\n",
+        b"codex-cli 0.140.0\n",
+        b"codex-cli 0.141.0\n",
+        b"codex-cli 0.146.1-alpha.1\n",
+        b"codex-cli 0.146.1\n",
+        b"codex-cli 1.0.0\n",
+        b"dependency 0.146.0 codex-cli 0.146.0\n",
+    ],
+)
+async def test_brokered_codex_version_gate_rejects_unknown_wire_versions_before_launch(
+    monkeypatch: pytest.MonkeyPatch,
+    output: bytes,
+) -> None:
+    async def _fake_exec(*_args: Any, **_kwargs: Any) -> _FakeVersionProcess:
+        return _FakeVersionProcess(stdout=output)
+
+    monkeypatch.setattr("omnigent.inner.codex_executor._create_subprocess_exec", _fake_exec)
+
+    with pytest.raises(RuntimeError, match="unsupported Codex wire version"):
+        await _require_brokered_codex_version("/usr/local/bin/codex")
+
+
+async def test_brokered_codex_version_gate_accepts_tested_1460(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def _fake_exec(*_args: Any, **_kwargs: Any) -> _FakeVersionProcess:
+        return _FakeVersionProcess(stdout=b"codex-cli 0.146.0\n")
+
+    monkeypatch.setattr("omnigent.inner.codex_executor._create_subprocess_exec", _fake_exec)
+
+    await _require_brokered_codex_version("/usr/local/bin/codex")
+
+
+async def test_brokered_version_failure_precedes_signer_session_construction(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    version_gate = AsyncMock(side_effect=RuntimeError("unsupported Codex wire version"))
+    app_session_factory = AsyncMock()
+    monkeypatch.setattr(
+        "omnigent.inner.codex_executor._require_brokered_codex_version", version_gate
+    )
+    signer_config = SignerLaunchConfig(
+        binding_id="test-fake-provider-v1",
+        endpoint="https://model.test/v1",
+        routes=(FrozenModelRoute(method="POST", host="model.test", path="/v1/responses"),),
+    )
+    executor = CodexExecutor(
+        cwd=str(tmp_path),
+        os_env=OSEnvSpec(sandbox=OSEnvSandboxSpec(type="darwin_seatbelt")),
+        model="gpt-5.4-mini",
+        codex_path="/usr/local/bin/codex",
+        app_session_factory=app_session_factory,
+        signer_launch_config=signer_config,
+    )
+
+    with pytest.raises(RuntimeError, match="unsupported Codex wire version"):
+        await anext(
+            executor.run_turn(
+                [{"role": "user", "content": "hello", "session_id": "version-gate"}],
+                [],
+                "",
+            )
+        )
+
+    version_gate.assert_awaited_once_with("/usr/local/bin/codex")
+    app_session_factory.assert_not_called()
+    assert executor._session_states == {}
+
+
 # ── model_provider_override (cli-config / subscription pinning) ─────────────
 # Function-based (the project standard); the TestCase class above predates it.
 
@@ -4476,6 +4788,88 @@ def test_run_turn_cli_config_passes_no_model_to_thread_create():
     _run(_t())
 
 
+def test_default_factory_wires_fresh_typed_signer_per_session(tmp_path: Path) -> None:
+    async def _t() -> None:
+        config = SignerLaunchConfig(
+            binding_id="test-fake-provider-v1",
+            endpoint="https://model.test/v1",
+            routes=(FrozenModelRoute(method="POST", host="model.test", path="/v1/responses"),),
+        )
+        executor = CodexExecutor(
+            cwd=str(tmp_path),
+            os_env=OSEnvSpec(sandbox=OSEnvSandboxSpec(type="darwin_seatbelt")),
+            codex_path="/bin/echo",
+            model="gpt-5.4-mini",
+            signer_launch_config=config,
+        )
+
+        first_state = _CodexSessionState()
+        second_state = _CodexSessionState()
+        executor._session_states["first"] = first_state
+        executor._session_states["second"] = second_state
+        first = await executor._ensure_app_session(
+            "first",
+            first_state,
+            signature=(None, "model", str(tmp_path), "workspace-write"),
+            effective_cwd=str(tmp_path),
+        )
+        second = await executor._ensure_app_session(
+            "second",
+            second_state,
+            signature=(None, "model", str(tmp_path), "workspace-write"),
+            effective_cwd=str(tmp_path),
+        )
+
+        first_signer = first._signer_factory()
+        second_signer = second._signer_factory()
+        assert isinstance(first_signer, SubprocessModelSigner)
+        assert isinstance(second_signer, SubprocessModelSigner)
+        assert first_signer is not second_signer
+        assert first_signer._config is config
+        rendered = "\n".join(executor._codex_config_overrides)
+        assert 'env_key="OPENAI_API_KEY"' in rendered
+        assert "auth=" not in rendered
+        assert "gateway_auth_command" not in rendered
+
+    _run(_t())
+
+
+def test_signer_backed_executor_rejects_missing_sandbox_before_session() -> None:
+    config = SignerLaunchConfig(
+        binding_id="test-fake-provider-v1",
+        endpoint="https://model.test/v1",
+        routes=(FrozenModelRoute(method="POST", host="model.test", path="/v1/responses"),),
+    )
+
+    with pytest.raises(OSError, match="requires an active sandbox"):
+        CodexExecutor(
+            codex_path="/bin/echo",
+            model="gpt-5.4-mini",
+            signer_launch_config=config,
+        )
+
+
+def test_signer_backed_executor_rejects_ordinary_egress_rules_before_session() -> None:
+    config = SignerLaunchConfig(
+        binding_id="test-fake-provider-v1",
+        endpoint="https://model.test/v1",
+        routes=(FrozenModelRoute(method="POST", host="model.test", path="/v1/responses"),),
+    )
+
+    with pytest.raises(ValueError, match=r"does not support os_env\.sandbox\.egress_rules"):
+        CodexExecutor(
+            codex_path="/bin/echo",
+            model="gpt-5.4-mini",
+            os_env=OSEnvSpec(
+                sandbox=OSEnvSandboxSpec(
+                    type="darwin_seatbelt",
+                    egress_rules=["GET api.github.com/repos/company/**"],
+                )
+            ),
+            signer_launch_config=config,
+        )
+
+
 def test_run_turn_defaults_to_a_codex_model_on_codexs_own_login():
     """With no model anywhere, a codex-login turn gets a model codex accepts.
 
@@ -4637,6 +5031,59 @@ def test_app_server_run_turn_fails_fast_on_gateway_auth_error():
             {"threadId": "thread-1", "turnId": "turn-1"},
         )
         native_forwarder_health.clear()
+
+    _run(_t())
+
+
+def test_signer_runtime_auth_failure_preserves_recovery_error():
+    async def _t():
+        native_forwarder_health.clear()
+        session = _CodexAppServerSession(
+            codex_path="/bin/echo",
+            cwd="/tmp/workspace",
+            env={},
+            tool_executor=None,
+            provider_auth_authority=(
+                "https://workspace.cloud.databricks.com",
+                "agent-profile",
+            ),
+        )
+        session.start = AsyncMock()
+        session._proc = _FakeProcess()
+        session._request = AsyncMock(
+            side_effect=[
+                {"result": {"thread": {"id": "thread-1"}}},
+                {"result": {"turn": {"id": "turn-1"}}},
+                {"result": {}},
+            ]
+        )
+
+        async def _inject_gateway_error() -> None:
+            await asyncio.sleep(0.01)
+            session._note_stderr_gateway_error("Reconnecting... 5/5")
+            session._note_stderr_gateway_error(
+                "unexpected status 401 Unauthorized: {}, "
+                "url: https://workspace.cloud.databricks.com/"
+                "ai-gateway/codex/v1/responses"
+            )
+
+        inject_task = asyncio.create_task(_inject_gateway_error())
+        try:
+            with pytest.raises(ProviderAuthRequired) as raised:
+                async for _ in session.run_turn(
+                    messages=[{"role": "user", "content": "hi"}],
+                    tools=[],
+                    system_prompt="Be helpful.",
+                    model="databricks-gpt-5",
+                    cwd=".",
+                    sandbox="workspace-write",
+                ):
+                    pass
+            assert raised.value.code == "PROVIDER_AUTH_REQUIRED"
+            assert raised.value.remediation == "ucode configure"
+        finally:
+            await inject_task
+            native_forwarder_health.clear()
 
     _run(_t())
 

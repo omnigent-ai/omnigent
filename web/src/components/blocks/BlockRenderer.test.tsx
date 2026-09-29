@@ -354,6 +354,37 @@ describe("BlockRenderer dispatch", () => {
     expect(screen.queryByText("Thinking...")).toBeNull();
   });
 
+  it("hides a live turn's reasoning duration after assistant text arrives", () => {
+    const items: RenderItem[] = [
+      { kind: "reasoning", itemId: "live-reasoning", text: "still working", duration: 5 },
+      { kind: "text", itemId: "live-text", text: "Partial answer", final: false },
+    ];
+
+    render(<BlockRenderer items={items} sessionStatus="running" isLastAssistant showsWorking />);
+
+    expect(screen.queryByText(/Thought for \d/)).toBeNull();
+  });
+
+  it("keeps an earlier turn settled while the next turn reasons", () => {
+    const settledItems: RenderItem[] = [
+      { kind: "reasoning", itemId: "settled-reasoning", text: "finished", duration: undefined },
+      { kind: "text", itemId: "settled-text", text: "First answer", final: true },
+    ];
+    const liveItems: RenderItem[] = [
+      { kind: "reasoning", itemId: "live-reasoning", text: "working", duration: undefined },
+    ];
+
+    render(
+      <>
+        <BlockRenderer items={settledItems} sessionStatus="running" />
+        <BlockRenderer items={liveItems} sessionStatus="running" isLastAssistant showsWorking />
+      </>,
+    );
+
+    expect(screen.getByText("Thought for a few seconds")).toBeInTheDocument();
+    expect(screen.getAllByText("Thinking...")).toHaveLength(1);
+  });
+
   it("renders settled assistant text in static markdown mode", () => {
     const { container } = renderMarkdownText("*settled");
 

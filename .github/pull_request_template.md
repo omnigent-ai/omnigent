@@ -1,8 +1,9 @@
 <!--
 For AI-written descriptions:
 - Follow this template (Related issue, Summary, Test Plan, Demo, Type of change, Test coverage, Coverage notes).
-- Keep it concise; reviewers skim long descriptions.
-- For non-trivial changes, include an ELI5 and a diagram (ASCII or mermaid).
+- Keep it concise; explain the cause, fix, and proof once, in plain language.
+- For non-trivial changes, open the Summary with a 1–2 sentence ELI5; add a diagram when it
+  makes a relationship or sequence easier to follow.
 - Keep every section and checkbox row in place so reviewers can skim them.
 - For UI changes (the "UI / frontend change" box below), fill in the Demo
   section: attach a screenshot or screen recording of the new behaviour.

@@ -3,7 +3,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Bubble } from "@/lib/renderItems";
 import { useChatStore, type ChatState } from "@/store/chatStore";
-import { BubbleView } from "./chatBubbleParts";
+import { BubbleView, containsMermaidDiagram } from "./chatBubbleParts";
 
 const fetchMock = vi.fn();
 const initialStoreState = useChatStore.getState();
@@ -54,6 +54,39 @@ afterEach(() => {
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
   useChatStore.setState(initialStoreState);
+});
+
+describe("Mermaid diagram width", () => {
+  it("uses the full chat column for a Mermaid fence", () => {
+    const items = [
+      { kind: "text" as const, itemId: "diagram", text: "```mermaid\nA-->B\n```", final: true },
+    ];
+    expect(containsMermaidDiagram(items)).toBe(true);
+    const bubble: Extract<Bubble, { kind: "assistant" }> = {
+      kind: "assistant",
+      responseId: "resp_diagram",
+      stableId: "diagram",
+      lifecycle: "completed",
+      error: null,
+      items,
+    };
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <BubbleView bubble={bubble} isLastAssistant={false} />
+      </QueryClientProvider>,
+    );
+
+    expect(screen.getByTestId("message-bubble")).toHaveClass("max-w-full");
+    expect(screen.getByTestId("message-bubble").firstElementChild).toHaveClass("w-full");
+  });
+
+  it("ignores Mermaid mentioned outside a fence", () => {
+    expect(
+      containsMermaidDiagram([
+        { kind: "text", itemId: "prose", text: "A Mermaid diagram would help.", final: true },
+      ]),
+    ).toBe(false);
+  });
 });
 
 describe("message navigation highlight", () => {

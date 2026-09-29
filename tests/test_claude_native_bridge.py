@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import io
 import json
 import os
@@ -5805,8 +5806,10 @@ def test_post_tools_changed_preserves_programming_errors(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("result_kind", ["text", "images", "image_error"])
 @pytest.mark.parametrize("cancellable", [False, True])
 async def test_channel_server_relays_active_omnigent_tools(
+    result_kind: str,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     subprocess_bridge_root: Path,
@@ -5841,8 +5844,25 @@ async def test_channel_server_relays_active_omnigent_tools(
         text=True,
     )
     calls: list[dict[str, object]] = []
+    from PIL import Image
 
-    async def tool_executor(name: str, arguments: dict[str, object]) -> dict[str, object]:
+    from omnigent.runtime.mcp_tool_result import encode_mcp_image_result
+    from omnigent.util.json_types import JsonObject
+
+    image_blocks: list[JsonObject] = []
+    for color in ("red", "blue"):
+        buffer = io.BytesIO()
+        Image.new("RGB", (2, 2), color).save(buffer, format="PNG")
+        image_blocks.append(
+            {
+                "type": "image",
+                "data": base64.b64encode(buffer.getvalue()).decode(),
+                "mimeType": "image/png",
+            }
+        )
+    image_blocks.append({"type": "text", "text": "After both images: subtract 30; word amber."})
+
+    async def tool_executor(name: str, arguments: dict[str, object]) -> object:
         """
         Capture one relayed tool call.
 
@@ -5852,6 +5872,10 @@ async def test_channel_server_relays_active_omnigent_tools(
         :returns: Structured tool result.
         """
         calls.append({"name": name, "arguments": arguments})
+        if result_kind != "text":
+            return json.loads(
+                encode_mcp_image_result(image_blocks, is_error=result_kind == "image_error")
+            )
         return {"echo": arguments}
 
     relay = None
@@ -5916,8 +5940,14 @@ async def test_channel_server_relays_active_omnigent_tools(
         )
         tool_result = await asyncio.to_thread(_read_json_line, proc.stdout, timeout_s=5.0)
         assert tool_result["id"] == 3
-        text = tool_result["result"]["content"][0]["text"]
-        assert json.loads(text) == {"echo": {"value": "hello"}}
+        if result_kind == "text":
+            text = tool_result["result"]["content"][0]["text"]
+            assert json.loads(text) == {"echo": {"value": "hello"}}
+        else:
+            assert tool_result["result"] == {
+                "content": image_blocks,
+                "isError": result_kind == "image_error",
+            }
         assert calls == [{"name": "sys_custom", "arguments": {"value": "hello"}}]
     finally:
         if relay is not None:
@@ -7662,6 +7692,64 @@ def test_hook_record_todo_write_with_non_list_todos_gives_none() -> None:
     assert record.todos is None
 
 
+def test_hook_record_parses_stop_failure_reason() -> None:
+    """``StopFailure`` keeps its error category and rendered error text."""
+    record = _hook_record_from_jsonl_record(
+        _make_jsonl_record(
+            {
+                "hook_event_name": "StopFailure",
+                "error": " server_error ",
+                "last_assistant_message": "API Error: 500 " + "x" * 5000,
+            }
+        )
+    )
+    assert record.failure_category == "server_error"
+    assert record.failure_message is not None
+    assert record.failure_message.startswith("API Error: 500 x")
+    assert len(record.failure_message) == 4000
+
+
+def test_hook_record_failure_fields_none_when_blank_or_not_stop_failure() -> None:
+    """Blank, non-string, or non-``StopFailure`` fields are not a failure reason."""
+    blank = _hook_record_from_jsonl_record(
+        _make_jsonl_record(
+            {"hook_event_name": "StopFailure", "error": "  ", "last_assistant_message": 7}
+        )
+    )
+    assert blank.failure_category is None
+    assert blank.failure_message is None
+    stop = _hook_record_from_jsonl_record(
+        _make_jsonl_record(
+            {"hook_event_name": "Stop", "error": "rate_limit", "last_assistant_message": "done"}
+        )
+    )
+    assert stop.failure_category is None
+    assert stop.failure_message is None
+
+
+def test_hook_record_stop_failure_message_gets_web_chat_guidance() -> None:
+    """The failure card rewrites dead-end CLI remedies like the mirrored message."""
+    overflow = _hook_record_from_jsonl_record(
+        _make_jsonl_record(
+            {"hook_event_name": "StopFailure", "last_assistant_message": "Prompt is too long"}
+        )
+    )
+    assert overflow.failure_message is not None
+    assert overflow.failure_message.startswith("Context limit reached")
+    login = _hook_record_from_jsonl_record(
+        _make_jsonl_record(
+            {
+                "hook_event_name": "StopFailure",
+                "error": "authentication_failed",
+                "last_assistant_message": "Login expired · Please run /login",
+            }
+        )
+    )
+    assert login.failure_message is not None
+    assert login.failure_message.startswith("Login expired · Please run /login\n\n")
+    assert "omni setup" in login.failure_message
+
+
 # ── stop_hook_seen_since: subagent filtering ─────────────────────────
 
 
@@ -8913,6 +9001,67 @@ def test_wait_for_claude_prompt_ready_outlasts_base_budget_while_pane_alive(
         "/tmp/example/tmux.sock",
         "claude:0.0",
         timeout_s=0.0,
+    )
+
+
+_SIGN_IN_PANE = (
+    "dbexec: launcher 1.2.3\n"
+    "Logging in via SSO...\n"
+    "If the browser does not open automatically, please open the following URL:\n"
+    "\thttps://signin.example.com/oauth2/v1/authorize?client_id=abc&state=xyz\n"
+)
+
+
+def test_wait_for_claude_prompt_ready_fails_fast_with_the_sign_in_link(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A launcher sign-in prompt holding the pane fails delivery within a poll
+    interval, carrying the address as the next step, instead of waiting out
+    the budget and reaping the pane the person needs to finish signing in.
+    """
+    captures: list[bool] = []
+
+    def _capture(socket_path: str, tmux_target: str, *, join_wrapped: bool = False) -> str:
+        captures.append(join_wrapped)
+        return _SIGN_IN_PANE
+
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._capture_pane", _capture)
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._claude_pane_state",
+        lambda socket_path, tmux_target: claude_native_bridge._ClaudePaneState(True),
+    )
+    with pytest.raises(claude_native_bridge.ClaudeSignInPending) as raised:
+        claude_native_bridge._wait_for_claude_prompt_ready(
+            "/tmp/example/tmux.sock",
+            "claude:0.0",
+            timeout_s=30.0,
+        )
+    assert raised.value.code == "databricks_sign_in_pending"
+    assert raised.value.title == "Claude Code can't start until you sign in to Databricks"
+    # The one-time address stays out of the error text; the card fetches the
+    # live link from the host when clicked.
+    assert "http" not in raised.value.remediation
+    assert raised.value.remediation.startswith(
+        "Open the sign-in link and sign in. Claude Code continues on its own"
+    )
+    # Two plain polls saw the address; each looked again with wrapped rows joined.
+    assert captures == [False, True, False, True]
+    assert not isinstance(raised.value, claude_native_bridge.ClaudePromptTimeout)
+
+
+def test_wait_for_claude_prompt_ready_prefers_a_rendered_prompt_over_a_link(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An address left in scrollback is not a sign-in gate once the input box is up."""
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._capture_pane",
+        lambda socket_path, tmux_target, *, join_wrapped=False: _SIGN_IN_PANE + _READY_PANE,
+    )
+    claude_native_bridge._wait_for_claude_prompt_ready(
+        "/tmp/example/tmux.sock",
+        "claude:0.0",
+        timeout_s=30.0,
     )
 
 

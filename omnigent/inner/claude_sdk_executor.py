@@ -57,6 +57,7 @@ from omnigent.models.claude_model_vocabulary import (
     served_canonical_overrides,
 )
 from omnigent.models.model_metadata import concrete_reported_model
+from omnigent.runtime.mcp_tool_result import decode_mcp_image_result
 from omnigent.spec.types import RetryPolicy
 from omnigent.util.json_types import JsonObject as _JsonObject
 from omnigent.util.reasoning_effort import CLAUDE_EFFORTS, validate_effort
@@ -911,7 +912,13 @@ def _build_mcp_tools(
                     # runtime returns without confusing the type checker.
                     raw = await tool_executor(tool_name, args)
                     result: ToolResult = raw if isinstance(raw, dict) else {"result": raw}
-                    response: McpResponse = {
+                    image_result = decode_mcp_image_result(result)
+                    if image_result is not None:
+                        response: McpResponse = image_result.to_mcp()
+                        # The SDK server reads snake_case; native MCP clients use isError.
+                        response["is_error"] = image_result.is_error
+                        return response
+                    response = {
                         "content": [{"type": "text", "text": json.dumps(result)}],
                     }
                     if result.get("blocked") is True or (

@@ -1402,6 +1402,71 @@ def test_bundled_agent_command_rejects_extra_positional_target(
     dispatch.assert_not_called()
 
 
+def test_copilot_command_forwards_to_run_on_the_copilot_harness(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``omnigent copilot`` dispatches ``run --harness copilot`` with pass-through
+    flags intact and a canonical ``omnigent run --harness copilot`` resume prefix."""
+    result, dispatch = _invoke_bundled_agent_command(
+        monkeypatch, ["copilot", "-p", "review the last commit", "--model", "m1"]
+    )
+
+    assert result.exit_code == 0, result.output
+    dispatch.assert_called_once()
+    kwargs = dispatch.call_args.kwargs
+    assert kwargs["target"] is None
+    assert kwargs["harness"] == "copilot"
+    assert kwargs["prompt"] == "review the last commit"
+    assert kwargs["model"] == "m1"
+    assert kwargs["resume_parts"][:4] == ["omnigent", "run", "--harness", "copilot"]
+
+
+def test_copilot_command_rejects_explicit_harness(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``--harness`` on the copilot shorthand is a usage error, not a silent override."""
+    result, dispatch = _invoke_bundled_agent_command(monkeypatch, ["copilot", "--harness=codex"])
+
+    assert result.exit_code != 0
+    assert "always uses the copilot harness" in result.output
+    dispatch.assert_not_called()
+
+
+def test_copilot_command_answers_help_and_is_rostered_as_a_harness() -> None:
+    """``omnigent copilot --help`` prints its own usage and the command is a harness row."""
+    from omnigent.cli import _HARNESS_COMMANDS, _harness_extra_checks
+
+    result = CliRunner().invoke(cli, ["copilot", "--help"])
+
+    assert result.exit_code == 0, result.output
+    assert "copilot [OPTIONS] [RUN_ARGS]..." in result.output
+    assert "No such command" not in result.output
+    assert "copilot" in _CLICK_SUBCOMMANDS
+    assert "copilot" in _HARNESS_COMMANDS
+    # Extras-gated like cursor: the roster row follows the Copilot SDK extra.
+    assert "copilot" in _harness_extra_checks()
+
+
+def test_help_rosters_copilot_only_when_its_sdk_is_installed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The copilot row appears under Harnesses with its SDK, and hides without it."""
+    monkeypatch.setattr("omnigent.cli._harness_extra_checks", lambda: {"copilot": lambda: True})
+    shown = CliRunner().invoke(cli, ["--help"])
+
+    assert shown.exit_code == 0, shown.output
+    harnesses_at = shown.output.index("Harnesses:")
+    commands_at = shown.output.index("Commands:", harnesses_at)
+    assert harnesses_at < shown.output.index("\n  copilot ") < commands_at
+
+    monkeypatch.setattr("omnigent.cli._harness_extra_checks", lambda: {"copilot": lambda: False})
+    hidden = CliRunner().invoke(cli, ["--help"])
+
+    assert hidden.exit_code == 0, hidden.output
+    assert "\n  copilot " not in hidden.output
+    assert "Some harnesses need an optional extra" in hidden.output
+    # Still registered and runnable; only the listing is suppressed.
+    assert "copilot" in cli.commands
+
+
 def test_first_run_plan_and_polly_command_agree_on_bundled_path(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

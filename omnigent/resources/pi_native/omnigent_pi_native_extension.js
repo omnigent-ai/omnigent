@@ -1117,6 +1117,21 @@ async function postModelOptions(config, ctx) {
   });
 }
 
+/**
+ * Tell the runner's terminal watcher that Pi now accepts input: the inbox
+ * poller is armed, so queued web messages will be delivered. The runner
+ * clears the marker before each launch and logs ``native_input_ready`` when
+ * it appears. Best-effort — readiness logging must never break the session.
+ */
+function markInputReady(config) {
+  if (!config || !config.bridgeDir) return;
+  try {
+    fs.writeFileSync(path.join(config.bridgeDir, "input_ready"), "");
+  } catch (_err) {
+    // Diagnostics only.
+  }
+}
+
 function startInboxPoller(
   pi,
   config,
@@ -1876,6 +1891,7 @@ module.exports = function (pi) {
         return idle === null ? agentRunning : !idle;
       },
     );
+    markInputReady(config);
     const nativeSessionId =
       ctx && ctx.sessionManager && ctx.sessionManager.getSessionId
         ? ctx.sessionManager.getSessionId()
@@ -1896,10 +1912,8 @@ module.exports = function (pi) {
         data: { model: startupModel },
       });
     }
-    await postEvent(config, {
-      type: "external_session_status",
-      data: { status: "idle", response_id: `pi-${Date.now()}-${++sequence}` },
-    });
+    // Readiness is not turn completion: a queued prompt may already be running.
+    // Only agent_end publishes idle so startup cannot complete a child task.
   });
 
   pi.on("session_tree", async (_event, ctx) => {

@@ -646,7 +646,18 @@ def _resolve_session_id_for_resume(
         return None
     from omnigent_client import OmnigentClient
 
+    from omnigent.host.identity import load_host_identity_if_present
     from omnigent.repl._resume_picker import pick_conversation_by_wrapper_label_from_sdk
+
+    # Pi state is host-local, so scope the picker to this machine's host id.
+    # A machine that never registered as a host lists top-level rows unfiltered.
+    try:
+        identity = load_host_identity_if_present()
+    except ValueError as exc:
+        raise click.ClickException(
+            f"Could not resolve this machine's host identity: {exc}"
+        ) from exc
+    invoking_host_id = identity.host_id if identity is not None else None
 
     async def _drive() -> str | None:
         async with OmnigentClient(
@@ -657,6 +668,7 @@ def _resolve_session_id_for_resume(
                 client,
                 wrapper_value=_WRAPPER_LABEL_VALUE,
                 agent_name=_AGENT_NAME,
+                host_id=invoking_host_id,
             )
 
     return asyncio.run(_drive())

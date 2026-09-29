@@ -95,7 +95,41 @@ def test_grouping_handles_bots_deleted_authors_and_sorting() -> None:
     assert "[#3](https://github.com/o/o/pull/3), Author unavailable" in notes
     assert "Author unavailable; [#1]" in notes
     assert "[#1](https://github.com/o/o/pull/1), [#2](https://github.com/o/o/pull/2)" in notes
-    assert notes.count("[@bot[bot]](https://github.com/apps/bot)") == 1
+    assert notes.count("[@bot[bot]](https://github.com/apps/bot)") == 2
+
+
+@pytest.mark.parametrize("raw", ["", _raw("## Bug fixes\n- Fixed (#1, #2, #3, #4, #5)")])
+def test_community_credits_all_authors_once_in_alphabetical_order(raw: str) -> None:
+    credits = [
+        {"pr": pr, "author": author, "author_url": url}
+        for pr, author, url in [
+            (1, "zed", "https://github.com/zed"),
+            (2, "alice", "https://github.com/alice"),
+            (3, "Bob", "https://github.com/Bob"),
+            (4, "ALICE", "https://github.com/ALICE"),
+            (5, "", ""),
+            (6, "bot[bot]", "https://github.com/apps/bot"),
+        ]
+    ]
+    notes = compose_notes(raw, credits, REPO)
+    assert notes.count("### 💜 Thanks to our community") == 1
+    thanks, footer = notes.split("### 💜 Thanks to our community\n\n")[1].split(
+        "\n\nFull Changelog:"
+    )
+    assert thanks.split("\n\n")[-1] == (
+        "[@ALICE](https://github.com/ALICE), [@Bob](https://github.com/Bob), "
+        "[@bot[bot]](https://github.com/apps/bot), [@zed](https://github.com/zed)"
+    )
+    assert "Author unavailable" not in thanks
+    assert footer.strip() == "https://github.com/o/o/blob/main/CHANGELOG.md"
+
+
+def test_community_note_without_known_authors() -> None:
+    notes = compose_notes("", [{"pr": 1, "author": "", "author_url": ""}], REPO)
+    thanks = notes.split("### 💜 Thanks to our community\n\n")[1]
+    assert "Thank you for building omnigent with us" in thanks
+    assert "[@" not in thanks
+    assert "Author unavailable" not in thanks
 
 
 def test_cli_missing_highlights_uses_grouped_fallback(tmp_path: Path) -> None:

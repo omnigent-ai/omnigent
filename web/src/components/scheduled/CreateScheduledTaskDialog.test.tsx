@@ -37,8 +37,9 @@ vi.mock("@/hooks/useScheduledTasks", () => ({
 }));
 vi.mock("@/lib/agentLabels", () => ({ useBrainHarnessLabels: () => ({}) }));
 vi.mock("@/shell/WorkspacePicker", () => ({
-  WorkspacePicker: ({ onNavigate }: { onNavigate?: (p: string) => void }) => (
-    <button type="button" onClick={() => onNavigate?.("/home/me/repo")}>
+  isNavigablePath: (path: string) => path.startsWith("/"),
+  WorkspacePicker: ({ onSelect }: { onSelect?: (p: string) => void }) => (
+    <button type="button" onClick={() => onSelect?.("/home/me/repo")}>
       pick-workspace
     </button>
   ),
@@ -299,6 +300,23 @@ describe("CreateScheduledTaskDialog validation", () => {
     expect(submit).toBeDisabled();
     fireEvent.change(screen.getByTestId("task-prompt-input"), { target: { value: "Do it" } });
     expect(submit).toBeEnabled();
+  });
+
+  it("pins a workspace only after the full-screen browser confirms", () => {
+    renderDialog();
+    const hostTrigger = screen.getByTestId("task-host-trigger");
+    fireEvent.pointerDown(hostTrigger, new MouseEvent("pointerdown", { bubbles: true, button: 0 }));
+    fireEvent.click(hostTrigger);
+    fireEvent.click(screen.getByRole("option", { name: /laptop/ }));
+
+    fireEvent.click(screen.getByTestId("task-workspace-browse"));
+    expect(screen.getByTestId("workspace-picker-dialog")).toBeInTheDocument();
+    expect(screen.queryByText("/home/me/repo")).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: "pick-workspace" }));
+
+    expect(screen.queryByTestId("workspace-picker-dialog")).toBeNull();
+    expect(screen.getAllByText("/home/me/repo")).toHaveLength(2);
   });
 });
 

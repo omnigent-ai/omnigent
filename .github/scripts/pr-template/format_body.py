@@ -52,16 +52,6 @@ def format_body(body: str) -> str:
         "<!-- Video or images demonstrating the change. Mandatory for UI / "
         "frontend changes; use 'N/A' otherwise. -->",
     )
-    body = _append_section(
-        body,
-        "ELI5",
-        "<!-- Optional: explain the change in plain language. -->",
-    )
-    body = _append_section(
-        body,
-        "Diagram",
-        "```mermaid\nflowchart LR\n  A[Before] --> B[Change]\n  B --> C[After]\n```",
-    )
     body = _append_section(body, "Type of change", _checkbox_block(TYPE_LABELS))
     body = _append_section(body, "Test coverage", _checkbox_block(TEST_LABELS))
     body = _append_section(

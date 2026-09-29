@@ -1749,6 +1749,132 @@ _AUTO_MODE_BILLING_NOTICE_PANE = """──────────────�
   https://code.claude.com/docs/en/auto-mode-classifier-billing
   Enter to continue · Esc to cancel
 """
+
+
+async def _observe_native_capturing_tick(
+    tmp_path: Path,
+    session_id: str,
+    terminal_name: str,
+    resource_role: str,
+    env: dict[str, str],
+) -> tuple[object, TerminalInstance]:
+    """Observe a native terminal and return its watcher ``on_tick`` callback.
+
+    :returns: ``(on_tick, instance)`` for driving the input-ready probe.
+    """
+    terminal_registry = TerminalRegistry()
+    registry = SessionResourceRegistry(terminal_registry=terminal_registry)
+    registry.set_session_status_publisher(lambda *_args: None)
+    registry.set_terminal_exit_publisher(lambda *_args: None)
+    instance = make_test_terminal_instance(terminal_name, "main", tmp_path)
+    instance.env = env
+    terminal_registry._by_conversation.setdefault(session_id, {})[(terminal_name, "main")] = (
+        instance
+    )
+    callbacks: dict[str, object] = {}
+
+    def _capture_watcher(*_args: object, on_tick: object | None = None, **_kwargs: object) -> None:
+        callbacks["on_tick"] = on_tick
+
+    instance.start_idle_watcher_thread = _capture_watcher  # type: ignore[method-assign]
+    await registry.observe_required_terminal(
+        session_id, terminal_name, "main", instance, resource_role=resource_role
+    )
+    assert callable(callbacks["on_tick"])
+    return callbacks["on_tick"], instance
+
+
+def _input_ready_events(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    return [r for r in caplog.records if getattr(r, "event_name", None) == "native_input_ready"]
+
+
+@pytest.mark.asyncio
+async def test_pi_native_logs_input_ready_once_extension_marks_it(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    from omnigent.harnesses.pi_native import bridge as pi_bridge
+
+    caplog.set_level(logging.INFO, logger="omnigent.runner.resource_registry")
+    bridge_dir = tmp_path / "pi-bridge"
+    bridge_dir.mkdir()
+    # A marker from the previous Pi process must not survive the relaunch.
+    (bridge_dir / "input_ready").write_text("", encoding="utf-8")
+    _extension, config = pi_bridge.write_extension_files(
+        bridge_dir,
+        session_id="conv_pi",
+        server_url="http://ap.example",
+        conversation_url="http://ap.example/c/conv_pi",
+    )
+    on_tick, instance = await _observe_native_capturing_tick(
+        tmp_path,
+        "conv_pi",
+        "pi",
+        PI_NATIVE_TERMINAL_ROLE,
+        {pi_bridge.PI_NATIVE_CONFIG_ENV_VAR: str(config)},
+    )
+
+    on_tick()  # type: ignore[operator]
+    assert _input_ready_events(caplog) == []
+
+    # What the extension's session_start writes once its inbox poller is armed.
+    (bridge_dir / "input_ready").write_text("", encoding="utf-8")
+    on_tick()  # type: ignore[operator]
+    on_tick()  # type: ignore[operator]
+
+    events = _input_ready_events(caplog)
+    assert len(events) == 1
+    assert events[0].session_id == "conv_pi"
+    assert events[0].attributes["harness"] == "pi-native"
+    assert events[0].attributes["terminal_instance_id"] == instance.diagnostic_id
+
+
+@pytest.mark.asyncio
+async def test_codex_native_logs_input_ready_once_thread_is_bound_to_session(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    from omnigent.harnesses.codex_native import bridge as codex_bridge
+
+    caplog.set_level(logging.INFO, logger="omnigent.runner.resource_registry")
+    bridge_dir = tmp_path / "codex-bridge"
+    bridge_dir.mkdir()
+    codex_home = codex_bridge.codex_home_for_bridge_dir(bridge_dir)
+
+    def _bind(session_id: str) -> None:
+        codex_bridge.write_bridge_state(
+            bridge_dir,
+            codex_bridge.CodexNativeBridgeState(
+                session_id=session_id,
+                socket_path="ws://127.0.0.1:1",
+                thread_id=f"thread_{session_id}",
+                codex_home=str(codex_home),
+            ),
+        )
+
+    # Thread-switch shape: the terminal moved to conv_new before the forwarder
+    # rebinds bridge state, so conv_old's thread must not count as ready.
+    _bind("conv_old")
+    on_tick, _instance = await _observe_native_capturing_tick(
+        tmp_path,
+        "conv_new",
+        "codex",
+        CODEX_NATIVE_TERMINAL_ROLE,
+        {"CODEX_HOME": str(codex_home)},
+    )
+    on_tick()  # type: ignore[operator]
+    assert _input_ready_events(caplog) == []
+
+    _bind("conv_new")
+    on_tick()  # type: ignore[operator]
+    on_tick()  # type: ignore[operator]
+
+    events = _input_ready_events(caplog)
+    assert len(events) == 1
+    assert events[0].session_id == "conv_new"
+    assert events[0].attributes["harness"] == "codex-native"
+
+
 _CLAUDE_READY_PANE = "────────────────────\n❯ \n────────────────────"
 
 
