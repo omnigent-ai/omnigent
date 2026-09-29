@@ -1,6 +1,6 @@
 """Regression checks for the UI suite's fixture configuration."""
 
-from collections.abc import Callable
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
@@ -10,15 +10,6 @@ import pytest
 from _pytest.config import Config
 
 from tests.e2e_ui import conftest as fixtures
-
-
-def test_mock_config_honors_config_home_and_restores(monkeypatch, tmp_path):
-    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
-    path = tmp_path / "config.yaml"
-    path.write_text("original\n")
-    with fixtures._temp_omnigent_mock_config("http://127.0.0.1:12345", "claude"):
-        assert "12345" in path.read_text()
-    assert path.read_text() == "original\n"
 
 
 @pytest.mark.parametrize("harness", ["claude", "codex"])
@@ -31,8 +22,6 @@ def test_mock_fixture_ignores_credential_placeholder(monkeypatch, harness, owned
     monkeypatch.setattr(fixtures, "_ensure_runner_online", lambda *_: None)
     monkeypatch.setattr(fixtures, f"_create_native_{harness}_session", lambda *_: "session")
     monkeypatch.setattr(fixtures.httpx, "delete", Mock())
-    from contextlib import nullcontext
-
     configure = Mock(return_value=nullcontext())
     monkeypatch.setattr(fixtures, "_temp_omnigent_mock_config", configure)
     fixture = getattr(fixtures, f"native_{harness}_mock_session").__wrapped__
@@ -42,14 +31,17 @@ def test_mock_fixture_ignores_credential_placeholder(monkeypatch, harness, owned
     assert configure.call_count == (0 if owned else 1)
 
 
-@pytest.mark.parametrize("present", range(1, 7))
-def test_partial_prepared_environment_fails_before_spawning_mock(monkeypatch, present):
+@pytest.mark.parametrize("missing", ["SERVER_URL", "MODEL_URL", "RUNNER_ID"])
+def test_partial_prepared_environment_fails_before_spawning_mock(monkeypatch, missing):
     keys = ("OMNIGENT_REPRO_SERVER_URL", "OMNIGENT_REPRO_MODEL_URL", "OMNIGENT_REPRO_RUNNER_ID")
-    for index, key in enumerate(keys):
-        monkeypatch.setenv(key, "configured" if present & (1 << index) else "")
+    missing_key = f"OMNIGENT_REPRO_{missing}"
+    for key in keys:
+        monkeypatch.setenv(key, "" if key == missing_key else "configured")
     spawn = Mock(side_effect=AssertionError("must not spawn a different mock"))
     monkeypatch.setattr(fixtures.subprocess, "Popen", spawn)
-    with pytest.raises(RuntimeError, match="Incomplete prepared reproduction environment"):
+    with pytest.raises(
+        RuntimeError, match=f"Incomplete prepared reproduction environment: missing {missing_key}"
+    ):
         next(fixtures.mock_llm_server_url.__wrapped__(None))
     spawn.assert_not_called()
 
@@ -67,6 +59,7 @@ def test_mock_config_backup_survives_and_blocks_overwrite(monkeypatch, tmp_path)
     backup = tmp_path / "config.yaml.e2e-backup"
     path.write_bytes(b"original config\n")
     with fixtures._temp_omnigent_mock_config("http://127.0.0.1:12345", "claude"):
+        assert "12345" in path.read_text()
         assert backup.read_bytes() == b"original config\n"
         assert backup.stat().st_mode & 0o077 == 0
     assert path.read_bytes() == b"original config\n"
@@ -108,18 +101,13 @@ class _ConfigStub:
         return self.options.get(name, default)
 
 
-def _pytest_configure() -> Callable[[Config], None]:
-    pytest.importorskip("playwright", exc_type=ImportError)
-    from tests.e2e_ui.conftest import pytest_configure
-
-    return pytest_configure
-
-
 def test_pytest_configure_rejects_headed_in_ci(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("CI", "1")
 
     with pytest.raises(pytest.UsageError, match="must run headless in CI"):
-        _pytest_configure()(cast(Config, _ConfigStub({"--ui-base-url": None, "--headed": True})))
+        fixtures.pytest_configure(
+            cast(Config, _ConfigStub({"--ui-base-url": None, "--headed": True}))
+        )
 
 
 def test_pytest_configure_rejects_dev_ui_base_url(
@@ -129,7 +117,7 @@ def test_pytest_configure_rejects_dev_ui_base_url(
     monkeypatch.delenv("CI", raising=False)
 
     with pytest.raises(pytest.UsageError, match="Refusing --ui-base-url"):
-        _pytest_configure()(
+        fixtures.pytest_configure(
             cast(
                 Config,
                 _ConfigStub({"--ui-base-url": "http://127.0.0.1:5173", "--headed": False}),
