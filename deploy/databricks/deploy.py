@@ -46,13 +46,11 @@ _WORKSPACE_WHEEL_LIMIT_BYTES = _WORKSPACE_FILE_LIMIT_BYTES
 _WEB_UI_DIR_NAME = "web-ui"
 _WEB_UI_ARCHIVE_NAME = "web-ui.tar.gz"
 _APP_REQUIRES_PYTHON = ">=3.12,<3.13"
-# The only index the Databricks Apps runtime installs from; the generated app
-# lock must resolve here regardless of the operator machine's uv setup.
+# Public PyPI by default; UV_INDEX_URL selects a deployment-accessible mirror.
 _UV_DEFAULT_INDEX_URL = "https://pypi.org/simple"
 
-# Ambient uv knobs that steer index selection. --no-config shuts out config
-# *files*, but these survive it, and UV_INDEX / UV_EXTRA_INDEX_URL entries
-# outrank even --default-index (verified on uv 0.12).
+# Select UV_INDEX_URL explicitly before clearing uv's environment overrides.
+# --no-config only ignores files; extra indexes can still outrank --default-index.
 _UV_INDEX_ENV_VARS = (
     "UV_CONFIG_FILE",
     "UV_DEFAULT_INDEX",
@@ -531,38 +529,29 @@ def build_uv_pyproject(
 def run_uv_lock(src: Path) -> None:
     """Generate ``uv.lock`` for the Databricks Apps source directory.
 
-    The lock installs inside the Databricks Apps runtime, which reaches only
-    public PyPI, so it is generated hermetically: ``--no-config`` shuts out
-    machine-level uv config (whose ``[[index]]`` entries outrank the index
-    flags), the index env vars are stripped, and the index is pinned to
-    public PyPI.
+    Use public PyPI unless ``UV_INDEX_URL`` selects another deployment index.
+    Ignore machine-level uv configuration and competing index variables so
+    they cannot replace the selected index with a machine-only mirror.
 
     :param src: App source directory containing ``pyproject.toml``,
         e.g. ``deploy/databricks/src``.
     """
+    index_url = os.environ.get("UV_INDEX_URL") or _UV_DEFAULT_INDEX_URL
     env = os.environ.copy()
-    dropped = sorted(var for var in _UV_INDEX_ENV_VARS if env.pop(var, None) is not None)
-    if dropped:
-        _log(
-            f"ignoring {', '.join(dropped)} for the app lock; it must resolve "
-            "from public PyPI, the only index the Databricks Apps runtime reaches"
-        )
-    _log(f"uv lock --python 3.12 --no-config --default-index {_UV_DEFAULT_INDEX_URL}")
-    subprocess.run(
-        [
-            "uv",
-            "lock",
-            "--python",
-            "3.12",
-            "--no-config",
-            "--default-index",
-            _UV_DEFAULT_INDEX_URL,
-        ],
-        cwd=src,
-        env=env,
-        check=True,
-    )
-    _check_lock_registries(src / "uv.lock", _UV_DEFAULT_INDEX_URL)
+    for var in _UV_INDEX_ENV_VARS:
+        env.pop(var, None)
+    _log(f"uv lock --python 3.12 --no-config --default-index {_redact_url(index_url)}")
+    cmd = ["uv", "lock", "--python", "3.12", "--no-config", "--default-index", index_url]
+    try:
+        subprocess.run(cmd, cwd=src, env=env, check=True)
+    except subprocess.CalledProcessError as exc:
+        # Keep credentialed index URLs out of failure tracebacks.
+        raise subprocess.CalledProcessError(
+            exc.returncode,
+            [*cmd[:-1], _redact_url(index_url)],
+            output=exc.output,
+            stderr=exc.stderr,
+        ) from None
 
 
 def _redact_url(url: str) -> str:
@@ -571,55 +560,6 @@ def _redact_url(url: str) -> str:
     url = re.sub(r"^(\w+://)[^/]+@", r"\1***@", url)
     # Query strings and fragments can carry tokens (e.g. ?token=...).
     return url.split("?", 1)[0].split("#", 1)[0]
-
-
-def _canonical_index(url: str) -> str:
-    """Normalize an index URL for equality: drop userinfo and a trailing slash.
-
-    uv does not persist index credentials into ``uv.lock`` registry sources,
-    so a credentialed index request must still match its own credential-less
-    lock entry.
-    """
-    return re.sub(r"^(\w+://)[^/]+@", r"\1", url).rstrip("/")
-
-
-def _check_lock_registries(lock_path: Path, index_url: str) -> None:
-    """Fail loudly when the generated lock resolved from another registry.
-
-    Defense in depth behind run_uv_lock's hermetic setup: uv's index selection
-    has several ambient channels with surprising precedence, and a lock that
-    resolved against one installs locally but breaks in the Databricks Apps
-    runtime, which cannot reach that host.
-
-    :param lock_path: Generated ``uv.lock`` path.
-    :param index_url: The registry every locked package must come from.
-    :raises SystemExit: If any package resolved from a different registry.
-    """
-    # Per-wheel `url` entries are deliberately not checked: a legitimate index
-    # serves artifacts from a separate CDN host (pypi.org -> pythonhosted.org),
-    # and a wheel's host always follows its package's registry source anyway.
-    # Direct-URL *sources* are different: the generated pyproject only uses
-    # registry and local-path sources, so any http(s) source is a leak.
-    expected = _canonical_index(index_url)
-    lock_text = lock_path.read_text()
-    leaked = {
-        match.group(1)
-        for match in re.finditer(r'source\s*=\s*\{\s*registry\s*=\s*"([^"]+)"', lock_text)
-        if _canonical_index(match.group(1)) != expected
-    }
-    leaked.update(
-        match.group(1)
-        for match in re.finditer(r'source\s*=\s*\{\s*url\s*=\s*"(https?://[^"]+)"', lock_text)
-    )
-    leaked = sorted(leaked)
-    if leaked:
-        shown = ", ".join(_redact_url(url) for url in leaked)
-        raise SystemExit(
-            f"{lock_path} resolved packages from {shown} instead of "
-            f"{_redact_url(index_url)}; the Databricks Apps runtime cannot reach "
-            "that host, so the app would fail to install. The app lock must "
-            "resolve from public PyPI."
-        )
 
 
 def write_uv_dependency_files(

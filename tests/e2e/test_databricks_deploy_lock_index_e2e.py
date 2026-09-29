@@ -1,15 +1,11 @@
-"""Databricks deploy lock generation must not bake a machine mirror index.
-
-Machine config and ``UV_INDEX_URL`` point at a local mirror, while a second
-index stands in for public PyPI. ``run_uv_lock`` must preserve a local wheel
-source and produce a lock that still installs after the mirror stops.
-"""
+"""Deploy locks isolate machine indexes while preserving explicit sources."""
 
 from __future__ import annotations
 
 import hashlib
 import importlib.util
 import io
+import os
 import shutil
 import subprocess
 import sys
@@ -22,6 +18,7 @@ from pathlib import Path
 from types import ModuleType
 
 import pytest
+import tomllib
 
 _ROOT = Path(__file__).resolve().parents[2]
 _DEPLOY_PY = _ROOT / "deploy" / "databricks" / "deploy.py"
@@ -42,14 +39,16 @@ def deploy_mod() -> Iterator[ModuleType]:
         sys.modules.pop(spec.name, None)
 
 
-def _wheel_bytes(name: str) -> bytes:
+def _wheel_bytes(name: str, dependencies: tuple[str, ...] = ()) -> bytes:
     """Build a minimal valid py3-none-any wheel for the named package."""
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
         z.writestr(f"{name}/__init__.py", "__version__ = '1.0.0'\n")
         z.writestr(
             f"{name}-1.0.0.dist-info/METADATA",
-            f"Metadata-Version: 2.1\nName: {name}\nVersion: 1.0.0\n\n",
+            f"Metadata-Version: 2.1\nName: {name}\nVersion: 1.0.0\n"
+            + "".join(f"Requires-Dist: {dependency}\n" for dependency in dependencies)
+            + "\n",
         )
         z.writestr(
             f"{name}-1.0.0.dist-info/WHEEL",
@@ -74,75 +73,78 @@ def _write_simple_index(root: Path, wheel: bytes) -> None:
 
 
 @pytest.fixture
-def index_servers(tmp_path: Path) -> Iterator[tuple[str, str, ThreadingHTTPServer]]:
-    """Serve a public-PyPI stand-in and a machine-mirror stand-in over HTTP.
-
-    :returns: ``(public_url, mirror_url, mirror_server)`` — the mirror server
-        object is exposed so the test can take the mirror down, modelling the
-        Databricks Apps build runtime where it is unreachable.
-    """
+def index_servers(tmp_path: Path) -> Iterator[dict[str, tuple[str, ThreadingHTTPServer]]]:
+    """Serve public, intentional custom, and machine-only indexes locally."""
     wheel = _wheel_bytes("probepkg")
-    servers: list[ThreadingHTTPServer] = []
-    urls: list[str] = []
-    for side in ("public", "mirror"):
+    servers: dict[str, tuple[str, ThreadingHTTPServer]] = {}
+    for side in ("public", "custom", "mirror"):
         root = tmp_path / side
         _write_simple_index(root, wheel)
+        if side == "public":
+            (root / "packages" / "urlpkg-1.0.0-py3-none-any.whl").write_bytes(
+                _wheel_bytes("urlpkg")
+            )
         handler = partial(SimpleHTTPRequestHandler, directory=str(root))
         server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
         threading.Thread(target=server.serve_forever, daemon=True).start()
-        servers.append(server)
-        urls.append(f"http://127.0.0.1:{server.server_address[1]}")
+        servers[side] = f"http://127.0.0.1:{server.server_address[1]}", server
     try:
-        yield urls[0], urls[1], servers[1]
+        yield servers
     finally:
-        for server in servers:
+        for _, server in servers.values():
             server.shutdown()
             server.server_close()
 
 
-def test_generated_app_lock_ignores_machine_mirror_index(
+@pytest.mark.parametrize(
+    "use_custom_index", [False, True], ids=["public-default", "explicit-index"]
+)
+def test_generated_app_lock_preserves_explicit_sources(
     deploy_mod: ModuleType,
-    index_servers: tuple[str, str, ThreadingHTTPServer],
+    index_servers: dict[str, tuple[str, ThreadingHTTPServer]],
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    use_custom_index: bool,
 ) -> None:
-    public_url, mirror_url, mirror_server = index_servers
+    public_url, _ = index_servers["public"]
+    custom_url, _ = index_servers["custom"]
+    mirror_url, mirror_server = index_servers["mirror"]
+    selected_index = f"{custom_url if use_custom_index else public_url}/simple"
 
-    # The operator's machine: uv config registers a private mirror as the
-    # default index (outranks --index-url) and as an extra named index
-    # (outranks even --default-index); only --no-config shuts both out.
+    # Default and extra machine indexes can outrank uv's index flags.
     machine_config = tmp_path / "xdg" / "uv"
     machine_config.mkdir(parents=True)
-    (machine_config / "uv.toml").write_text(
+    config_file = machine_config / "uv.toml"
+    config_file.write_text(
         f'[[index]]\nurl = "{mirror_url}/simple"\ndefault = true\n'
         f'\n[[index]]\nname = "corp-extra"\nurl = "{mirror_url}/simple"\n'
     )
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
-    for var in (
-        "UV_CONFIG_FILE",
-        "UV_NO_CONFIG",
-        "UV_INDEX",
-        "UV_DEFAULT_INDEX",
-        "UV_EXTRA_INDEX_URL",
-        "UV_FIND_LINKS",
-    ):
-        monkeypatch.delenv(var, raising=False)
-    # Keep localhost traffic away from any ambient corporate proxy.
+    competing_env = {
+        "UV_CONFIG_FILE": str(config_file),
+        "UV_NO_CONFIG": "false",
+        "UV_INDEX": f"{mirror_url}/simple",
+        "UV_DEFAULT_INDEX": f"{mirror_url}/simple",
+        "UV_EXTRA_INDEX_URL": f"{mirror_url}/simple",
+        "UV_FIND_LINKS": f"{mirror_url}/packages",
+    }
+    for var, value in competing_env.items():
+        monkeypatch.setenv(var, value)
     monkeypatch.setenv("NO_PROXY", "127.0.0.1,localhost")
     monkeypatch.setenv("no_proxy", "127.0.0.1,localhost")
-    # Corporate shells export the generic UV_INDEX_URL at the mirror just to
-    # make uv work locally; the deploy must not let it leak into the lock.
-    monkeypatch.setenv("UV_INDEX_URL", f"{mirror_url}/simple")
-    # In production the pinned index is public PyPI; point it at the local
-    # stand-in so the test never leaves the machine.
+    monkeypatch.setenv("UV_CACHE_DIR", str(tmp_path / "lock-cache"))
+    if use_custom_index:
+        monkeypatch.setenv("UV_INDEX_URL", selected_index)
+    else:
+        monkeypatch.delenv("UV_INDEX_URL", raising=False)
     monkeypatch.setattr(deploy_mod, "_UV_DEFAULT_INDEX_URL", f"{public_url}/simple")
 
-    # The app source directory, shaped like deploy/databricks/src's generated
-    # pyproject (same name / requires-python), with a registry dependency and
-    # a local wheel [tool.uv.sources] entry like the real deploy wheels.
+    # A local extension wheel may intentionally depend on a remote wheel URL.
+    direct_url = f"{public_url}/packages/urlpkg-1.0.0-py3-none-any.whl"
     src = tmp_path / "appsrc"
     src.mkdir()
-    (src / "localpkg-1.0.0-py3-none-any.whl").write_bytes(_wheel_bytes("localpkg"))
+    local_wheel = "localpkg-1.0.0-py3-none-any.whl"
+    (src / local_wheel).write_bytes(_wheel_bytes("localpkg", (f"urlpkg @ {direct_url}",)))
     (src / "pyproject.toml").write_text(
         "[project]\n"
         'name = "omnigent-databricks-app"\n'
@@ -159,50 +161,47 @@ def test_generated_app_lock_ignores_machine_mirror_index(
     deploy_mod.run_uv_lock(src)
 
     lock_text = (src / "uv.lock").read_text()
-    # Match the /-terminated URL so an ephemeral mirror port that happens to
-    # prefix the public port (e.g. :5001 vs :50011) cannot false-positive.
-    leaked = [
-        f"uv.lock line {number}: {line.strip()}"
-        for number, line in enumerate(lock_text.splitlines(), start=1)
-        if f"{mirror_url}/" in line
-    ]
-    assert not leaked, (
-        "run_uv_lock baked the machine's mirror index into the generated app "
-        "uv.lock; the Databricks Apps runtime cannot reach the mirror, so the "
-        "deployed app fails to install. Leaked references:\n" + "\n".join(leaked)
-    )
+    assert f"{mirror_url}/" not in lock_text, "the machine-only mirror leaked into uv.lock"
+    packages = {package["name"]: package for package in tomllib.loads(lock_text)["package"]}
+    assert packages["probepkg"]["source"] == {"registry": selected_index}
+    assert packages["localpkg"]["source"]["path"].removeprefix("./") == local_wheel
+    assert packages["urlpkg"]["source"] == {"url": direct_url}
 
-    # The hermetic lock pins the public index, so the registry dependency must
-    # have resolved from the public stand-in — anything else means the lock
-    # points somewhere the Apps runtime was never promised to reach.
-    assert f"{public_url}/simple" in lock_text, (
-        "the generated lock does not reference the pinned public index "
-        f"{public_url}/simple; it resolved from somewhere else entirely:\n" + lock_text
-    )
-
-    # --no-config must not disturb the project's own [tool.uv.sources]; the
-    # real generated pyproject ships the omnigent wheels as local paths.
-    assert "localpkg-1.0.0-py3-none-any.whl" in lock_text, (
-        "the hermetic lock dropped the project's local wheel source:\n" + lock_text
-    )
-
-    # The Databricks Apps build runtime: no machine uv config, and the
-    # operator's mirror does not exist there. Installing from the generated
-    # lock must still succeed.
+    # Install without the machine mirror or artifacts cached during locking.
     mirror_server.shutdown()
     mirror_server.server_close()
     empty_config = tmp_path / "xdg-empty"
     empty_config.mkdir()
-    monkeypatch.setenv("XDG_CONFIG_HOME", str(empty_config))
-    monkeypatch.delenv("UV_INDEX_URL", raising=False)
+    install_cache = tmp_path / "install-cache"
+    assert not install_cache.exists()
+    install_env = os.environ.copy()
+    for var in (*competing_env, "UV_INDEX_URL"):
+        install_env.pop(var, None)
+    install_env["XDG_CONFIG_HOME"] = str(empty_config)
+    install_env["UV_CACHE_DIR"] = str(install_cache)
     result = subprocess.run(
-        ["uv", "sync", "--locked", "--python", "3.12"],
+        [
+            "uv",
+            "sync",
+            "--locked",
+            "--python",
+            "3.12",
+            "--no-config",
+            "--default-index",
+            selected_index,
+        ],
         cwd=src,
+        env=install_env,
         capture_output=True,
         text=True,
+        timeout=60,
     )
-    assert result.returncode == 0, (
-        "installing the deploy-generated uv.lock in an environment without "
-        "the operator's mirror failed (this is the Databricks Apps install "
-        f"failure):\n{result.stdout}\n{result.stderr}"
+    assert result.returncode == 0, f"fresh-cache install failed:\n{result.stdout}\n{result.stderr}"
+    installed_python = src / ".venv" / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+    subprocess.run(
+        [str(installed_python), "-c", "import probepkg, localpkg, urlpkg"],
+        cwd=src,
+        env=install_env,
+        check=True,
+        timeout=10,
     )
