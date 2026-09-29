@@ -56,11 +56,11 @@ class Evidence:
         self.capture(operation, save, **data)
 
     @staticmethod
-    def session_identity(body):
+    def session_identity(body, field="id"):
         # Collections (including future reserved routes) are not session objects.
         if not isinstance(body, dict) or isinstance(body.get("data"), list):
             return None
-        sid = body.get("id")
+        sid = body.get(field)
         if (
             isinstance(sid, str)
             and sid
@@ -80,12 +80,21 @@ class Evidence:
             return (f"{parts.scheme}://{parts.netloc}", unquote(match[1]))
         return None
 
-    def session(self, url, body=None, state=None, status=200):
+    def session(self, url, body=None, state=None, status=200, method=None):
         parts = urlsplit(url)
         if parts.hostname not in {"127.0.0.1", "localhost", "::1"}:
             return
         origin = f"{parts.scheme}://{parts.netloc}"
         identity = self.session_identity(body) if 200 <= status < 300 else None
+        if (
+            identity is None
+            and method == "POST"
+            and parts.path.rstrip("/") == "/v1/sessions"
+            and 200 <= status < 300
+            and isinstance(body, dict)
+            and "id" not in body
+        ):
+            identity = self.session_identity(body, field="session_id")
         key = self.session_key(url)
         if parts.path.rstrip("/") == "/v1/sessions" and identity:
             key = (origin, identity)
@@ -256,7 +265,12 @@ class Evidence:
                     if request.method == "DELETE":
                         self.deleted_session(str(request.url), response.status_code)
                     else:
-                        self.session(str(request.url), body, status=response.status_code)
+                        self.session(
+                            str(request.url),
+                            body,
+                            status=response.status_code,
+                            method=request.method,
+                        )
                     self.emit(
                         "http",
                         method=request.method,
@@ -538,7 +552,9 @@ class Evidence:
         if request.method == "DELETE":
             self.deleted_session(response.url, response.status)
         else:
-            self.session(response.url, body, state=state, status=response.status)
+            self.session(
+                response.url, body, state=state, status=response.status, method=request.method
+            )
         self.emit(
             "browser_response",
             context_id=context_id,

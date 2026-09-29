@@ -1222,6 +1222,89 @@ def test_session_discovery_requires_matching_identity(tmp_path, sid):
     assert set(collector.sessions) == {("http://localhost", sid), ("http://localhost", "second")}
 
 
+@pytest.mark.parametrize("observer", ["http", "browser"])
+def test_bundle_created_session_is_captured_before_delete(tmp_path, monkeypatch, observer):
+    from types import SimpleNamespace
+
+    deleted = False
+
+    def handle(request):
+        nonlocal deleted
+        if request.method == "POST":
+            return httpx.Response(
+                201, json={"session_id": "bundled", "agent_id": "ag_test", "agent_name": "test"}
+            )
+        if request.method == "DELETE":
+            deleted = True
+            return httpx.Response(204)
+        if deleted:
+            return httpx.Response(404)
+        body = (
+            {"id": "bundled"}
+            if request.url.path == "/v1/sessions/bundled"
+            else {"data": [{"id": "last-turn"}], "has_more": False}
+        )
+        return httpx.Response(200, json=body)
+
+    original = httpx.Client.__init__
+    monkeypatch.setattr(
+        httpx.Client,
+        "__init__",
+        lambda client, *a, **kw: original(
+            client, *a, **{**kw, "transport": httpx.MockTransport(handle)}
+        ),
+    )
+    collector = Evidence(tmp_path)
+    state = {"sessions": set()}
+    try:
+        if observer == "http":
+            collector.install_http()
+        with httpx.Client() as client:
+            created = client.post("http://localhost/v1/sessions", files={"bundle": b"bundle"})
+            if observer == "browser":
+                collector.response(
+                    SimpleNamespace(
+                        url=str(created.url),
+                        status=created.status_code,
+                        headers=created.headers,
+                        json=created.json,
+                        request=SimpleNamespace(method="POST", post_data=None),
+                    ),
+                    "browser",
+                    state,
+                )
+                assert state["sessions"] == {("http://localhost", "bundled")}
+                collector.install_http()
+            # No navigation or session-info read precedes deletion.
+            client.get("http://localhost/v1/sessions/bundled/items")
+            client.delete("http://localhost/v1/sessions/bundled")
+        snapshots = [e for e in events(tmp_path) if e["kind"] == "session_items"]
+        assert len(snapshots) == 1
+        assert snapshots[0]["session_id"] == "bundled"
+        assert snapshots[0]["reason"] == "before_session_delete"
+        assert snapshots[0]["body"]["data"] == [{"id": "last-turn"}]
+    finally:
+        collector.patch.undo()
+
+
+@pytest.mark.parametrize(
+    "method,path,status,body",
+    [
+        ("GET", "/v1/sessions", 200, {"session_id": "s"}),
+        ("POST", "/v1/sessions/s/items", 200, {"session_id": "s"}),
+        ("POST", "/v1/sessions/s", 200, {"session_id": "s"}),
+        ("POST", "/v1/sessions", 400, {"session_id": "s"}),
+        ("POST", "/v1/sessions", 201, {"session_id": "s", "data": []}),
+        ("POST", "/v1/sessions", 201, {"id": None, "session_id": "s"}),
+        *[("POST", "/v1/sessions", 201, {"session_id": sid}) for sid in (".", "..", "a/b", [])],
+    ],
+)
+def test_creation_alias_does_not_bypass_identity_checks(tmp_path, method, path, status, body):
+    collector = Evidence(tmp_path)
+    collector.session("http://localhost" + path, body, status=status, method=method)
+    assert not collector.sessions
+
+
 @pytest.mark.parametrize("sid", [".", ".."])
 @pytest.mark.parametrize("route", ["/v1/sessions", "/v1/sessions/{sid}", "/c/{sid}"])
 def test_dot_only_session_identity_cannot_trigger_normalized_snapshot(
