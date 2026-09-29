@@ -23,9 +23,11 @@ from .runtime import write_json
 MAX_EVENT = 256 * 1024
 MAX_OUTPUT = 8 * 1024 * 1024
 MAX_OUTPUT_LINE = 8 * 1024 * 1024
+MAX_DIAGNOSTIC_INPUT = 16 * 1024
 OUTPUT_JOIN_TIMEOUT = 5
 PROCESS_CLEANUP_TIMEOUT = 5
 SECRET_NAME = re.compile(r"authorization|cookie|password|secret|api.?key|token", re.I)
+DIAGNOSTIC_ASSIGNMENT = re.compile(r"""(?<![\w-])([\w-]+)["']?\s*[=:]\s*""")
 
 
 TOKEN_COUNT = re.compile(
@@ -158,12 +160,17 @@ class Journal:
         with contextlib.suppress(Exception):
             error = {**self.clean(context), **error}
         with contextlib.suppress(Exception):
-            detail = self.clean(str(exc))
-            detail = re.sub(
-                r"""(?i)(\b[\w-]*(?:authorization|cookie|password|secret|token|api[-_]?key)[\w-]*["']?\s*[=:]\s*)(?:"[^"]*"|'[^']*'|[^\s,;]+)""",
-                r"\1[redacted]",
-                detail,
-            )
+            raw = str(exc)
+            if len(raw) > MAX_DIAGNOSTIC_INPUT:
+                # Do not split a credential before sanitization or scan unbounded errors.
+                detail = "[diagnostic omitted: oversized error]"
+            else:
+                detail = self.clean(raw)
+                for assignment in DIAGNOSTIC_ASSIGNMENT.finditer(detail):
+                    if credential_field(assignment[1]):
+                        # A free-form credential can contain whitespace, quotes or newlines.
+                        detail = detail[: assignment.end()] + "[redacted]"
+                        break
             error["detail"] = detail[:2048]
 
         self.errors.append(error)

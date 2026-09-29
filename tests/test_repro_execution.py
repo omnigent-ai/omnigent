@@ -1415,11 +1415,79 @@ def test_diagnostics_are_sanitized_before_bounding(tmp_path, monkeypatch):
 
     journal.capture("trace_stop", fail, context_id="context-1", phase="before_browser_close")
     event = events(tmp_path)[0]
-    assert len(event["detail"]) == 2048
+    assert event["detail"] == "stop failed [redacted] password=[redacted]"
     assert "secret-value" not in event["detail"] and "user:password" not in event["detail"]
     assert all(s not in event["detail"] for s in ("inline-value", "two words", "unknown-secret"))
     assert "token=hidden" not in event["detail"]
     assert event["context_id"] == "context-1" and event["phase"] == "before_browser_close"
+
+
+@pytest.mark.parametrize(
+    "assignment",
+    [
+        "password=correct horse battery staple",
+        "client-secret = correct horse battery staple, with more words",
+        'payload {"refresh_token": "correct horse\\" battery staple"}',
+        "api_key='correct horse\nbattery staple'",
+        "password\n= correct horse battery staple",
+    ],
+)
+def test_diagnostic_credentials_do_not_reach_journal_or_aggregation(tmp_path, assignment):
+    from dev.repro_env.execution import collector_errors
+
+    journal = Journal(tmp_path)
+    # The credential was generated at runtime, not supplied in the environment.
+    journal.secrets = ()
+
+    def fail():
+        raise RuntimeError("stop failed " + assignment)
+
+    journal.capture("trace_stop", fail)
+    wrapper = Journal(tmp_path)
+    errors = collector_errors(tmp_path, wrapper)
+    assert len(errors) == 1
+    assert errors[0]["detail"].startswith("stop failed ")
+    saved = journal.path.read_text() + json.dumps(errors) + json.dumps(journal.errors)
+    assert "[redacted]" in saved
+    assert all(part not in saved for part in ("correct", "horse", "battery", "staple"))
+
+
+def test_diagnostics_bound_safe_text_and_omit_oversized_input(tmp_path, monkeypatch):
+    from dev.repro_env.execution import MAX_DIAGNOSTIC_INPUT
+
+    journal = Journal(tmp_path)
+    assert len(journal.failure("trace_stop", RuntimeError("benign " * 600))["detail"]) == 2048
+    original = journal.clean
+
+    def clean(value):
+        if isinstance(value, str):
+            pytest.fail("oversized diagnostic must not be scanned or truncated before redaction")
+        return original(value)
+
+    monkeypatch.setattr(journal, "clean", clean)
+    error = journal.failure("trace_stop", RuntimeError("sensitive " * MAX_DIAGNOSTIC_INPUT))
+    assert error["detail"] == "[diagnostic omitted: oversized error]"
+
+
+def test_hyphenated_diagnostic_does_not_stall_collection(tmp_path):
+    import subprocess
+    from pathlib import Path
+
+    script = """
+from pathlib import Path
+from dev.repro_env.execution import Journal
+import sys
+journal = Journal(Path(sys.argv[1]))
+error = journal.failure('trace_stop', RuntimeError('failure ' + 'a-' * 8000 + '!'))
+assert len(error['detail']) == 2048
+"""
+    subprocess.run(
+        [sys.executable, "-c", script, str(tmp_path)],
+        check=True,
+        capture_output=True,
+        timeout=5,
+        cwd=Path(__file__).resolve().parent.parent,
+    )
 
 
 @pytest.mark.parametrize(
