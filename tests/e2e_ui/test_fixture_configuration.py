@@ -12,6 +12,11 @@ from _pytest.config import Config
 from tests.e2e_ui import conftest as fixtures
 
 
+@pytest.fixture(autouse=True, name="_enforce_min_server_version")
+def isolated_version_gate() -> None:
+    """Fixture unit tests have no live server to check for compatibility."""
+
+
 @pytest.mark.parametrize("harness", ["claude", "codex"])
 @pytest.mark.parametrize("owned", [True, False])
 def test_mock_fixture_ignores_credential_placeholder(monkeypatch, harness, owned):

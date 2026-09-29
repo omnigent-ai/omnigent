@@ -12,6 +12,11 @@ from tests._helpers.compat import COMPAT_SERVER_VERSION_ENV
 pytest_plugins = ["pytester"]
 
 
+@pytest.fixture(autouse=True, name="_enforce_min_server_version")
+def isolated_version_gate() -> None:
+    """Exercise the real version gate only inside the mocked pytester runs."""
+
+
 def _configure(
     pytester: pytest.Pytester,
     monkeypatch: pytest.MonkeyPatch,
