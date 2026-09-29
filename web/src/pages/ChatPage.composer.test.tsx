@@ -15,7 +15,7 @@ import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testi
 import userEvent from "@testing-library/user-event";
 import { createRef, StrictMode, type ComponentRef, type ReactElement } from "react";
 import { MemoryRouter } from "react-router-dom";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import { useChatStore, type ChatState, type QueuedMessage } from "@/store/chatStore";
 import {
   clearSessionDrafts,
@@ -851,6 +851,39 @@ describe("Composer slash-command menu", () => {
     fireEvent.keyDown(textarea(), { key: "Tab" });
     expect(textarea()).toHaveValue(command + " ");
     expect(screen.queryByText("No usage data yet — send a message first.")).toBeNull();
+  });
+
+  it.each([
+    ["claude-native", "/compact"],
+    ["claude-native", "/compact preserve decisions and TODOs"],
+    ["claude-sdk", "/compact"],
+    ["codex-native", "/compact"],
+    ["pi-native", "/compact"],
+  ])("%s submits %s through the appropriate path after completion", (harness, command) => {
+    const previousHarness = useChatStore.getState().sessionHarness;
+    onTestFinished(() => useChatStore.setState({ sessionHarness: previousHarness }));
+    useChatStore.setState({ sessionHarness: harness });
+    const compact = vi.spyOn(useChatStore.getState(), "compact").mockResolvedValue();
+    const props = composerProps({ isNativeWrapper: harness !== "claude-sdk" });
+    render(<Composer {...props} />);
+    fireEvent.change(textarea(), { target: { value: "/comp" } });
+    fireEvent.keyDown(textarea(), { key: "Tab" });
+    expect(textarea()).toHaveValue("/compact ");
+    expect(props.onSend).not.toHaveBeenCalled();
+    expect(compact).not.toHaveBeenCalled();
+
+    fireEvent.change(textarea(), { target: { value: command + " " } });
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+    expect(textarea()).toHaveValue("");
+    if (harness === "claude-native") {
+      expect(props.onSend).toHaveBeenCalledExactlyOnceWith(command);
+      expect(compact).not.toHaveBeenCalled();
+      fireEvent.keyDown(textarea(), { key: "ArrowUp" });
+      expect(textarea()).toHaveValue(command);
+    } else {
+      expect(compact).toHaveBeenCalledOnce();
+      expect(props.onSend).not.toHaveBeenCalled();
+    }
   });
 
   it("Tab completes a match found only mid-name (exercises menuMatches, not just the render filter)", () => {
