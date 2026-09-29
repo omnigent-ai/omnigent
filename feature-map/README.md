@@ -103,6 +103,9 @@ user-visible behavior. It then uses exactly these four H2 sections in order:
 - [GitLab merge requests](./gitlab.md) covers the shared MR panel, composer,
   Canvas links, and native tracking.
 
+- [Azure DevOps pull requests](./azure-devops.md) covers the shared panel,
+  composer, associations, partial results, and Canvas links.
+
 ## Seed scope
 
 The original five recipes form the seed set. Completing this set means checking

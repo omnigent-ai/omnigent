@@ -32,6 +32,7 @@ _logger = logging.getLogger(__name__)
 PROVIDER_MODULES: tuple[str, ...] = (
     "omnigent.git_providers.github",
     "omnigent.git_providers.gitlab",
+    "omnigent.git_providers.azure_devops",
 )
 ENTRY_POINT_GROUP = "omnigent.git_providers"
 
