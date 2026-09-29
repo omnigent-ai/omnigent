@@ -718,6 +718,11 @@ async def test_delete_worktree_after_workspace_disappears(
         ("/repo-worktrees/feature_%", "/repo-worktrees/feature_%/web", True),
         ("/repo-worktrees/feature_%", "/repo-worktrees/feature-abc/web", False),
         ("C:/repo-worktrees/feature", r"c:\repo-worktrees\feature\web", True),
+        ("C:/Wörk/Ärger", r"C:\Wörk\Ärger\web", True),
+        ("C:/Wörk/Ärger", r"c:\wörk\ärger\web", True),
+        ("c:/wörk/ärger", r"C:\WÖRK\ÄRGER\web", True),
+        ("C:/Wörk/Ärger", r"C:\Wörk\Ärger-other\web", False),
+        ("//SÉRVER/share/Ärger", r"\\sérver\share\ärger\web", True),
     ],
 )
 async def test_worktree_sharing_includes_descendants(
@@ -741,6 +746,25 @@ async def test_worktree_sharing_includes_descendants(
     assert not store.has_other_live_session_in_workspace(
         host_id=_HOST_ID,
         workspace=root,
+        exclude_conversation_id=mine,
+        include_subdirectories=True,
+    )
+
+
+async def test_windows_sharing_limit_preserves_worktree(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A full Windows candidate batch cannot prove that later sessions do not share it."""
+    from omnigent.stores.conversation_store import sqlalchemy_store
+
+    monkeypatch.setattr(sqlalchemy_store, "_WORKSPACE_SHARER_SCAN_LIMIT", 2)
+    mine = _make_worktree_conversation(db_uri, "C:/Wörk/Ärger")
+    for index in range(3):
+        _make_worktree_conversation(db_uri, f"C:/unrelated/{index}")
+    store = SqlAlchemyConversationStore(db_uri)
+    assert store.has_other_live_session_in_workspace(
+        host_id=_HOST_ID,
+        workspace="C:/Wörk/Ärger",
         exclude_conversation_id=mine,
         include_subdirectories=True,
     )

@@ -707,10 +707,11 @@ def test_subdirectory_creation_preserves_remote_tracking(git_repo: Path, auto_tr
     assert Path(nested_created.workspace).is_dir()
 
 
-def test_failed_pinned_checkout_removes_new_worktree_and_branch(
-    git_repo: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("rollback_fails", [False, True])
+def test_failed_pinned_checkout_rolls_back_without_hiding_original_error(
+    git_repo: Path, monkeypatch: pytest.MonkeyPatch, rollback_fails: bool
 ) -> None:
-    """Failure to populate a new checkout must not leave a branch or worktree behind."""
+    """Checkout errors remain visible even when rollback also fails."""
     source = git_repo / "web"
     source.mkdir()
     (source / "index.txt").write_text("tracked")
@@ -721,10 +722,12 @@ def test_failed_pinned_checkout_removes_new_worktree_and_branch(
     def fail_checkout(args: list[str], *, cwd: str) -> subprocess.CompletedProcess[str]:
         if args[:2] == ["checkout", "--force"]:
             return subprocess.CompletedProcess(args, 1, "", "checkout failed")
+        if rollback_fails and args[:2] == ["worktree", "remove"]:
+            return subprocess.CompletedProcess(args, 1, "", "rollback failed")
         return real_run(args, cwd=cwd)
 
     monkeypatch.setattr(git_worktree_module, "_run_git", fail_checkout)
     with pytest.raises(WorktreeError, match="could not check out validated"):
         create_worktree(repo_path=str(source), branch_name="new")
-    assert not _branch_exists(git_repo, "new")
-    assert len(list_worktrees(repo_path=str(git_repo))) == 1
+    assert _branch_exists(git_repo, "new") is rollback_fails
+    assert len(list_worktrees(repo_path=str(git_repo))) == (2 if rollback_fails else 1)

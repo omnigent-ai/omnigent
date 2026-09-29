@@ -8,11 +8,14 @@ designs/SESSION_GIT_WORKTREE.md.
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
+
+_logger = logging.getLogger(__name__)
 
 # fetch/add can be slow on large repos; bound it so git can't hang the
 # host's tunnel loop.
@@ -533,11 +536,14 @@ def create_worktree(
                 if checkout.returncode != 0:
                     raise _git_error("could not check out validated worktree revision", checkout)
         except WorktreeError:
-            remove_worktree(
-                worktree_path=str(worktree_path),
-                branch=branch_name,
-                delete_branch=not existing_branch,
-            )
+            try:
+                remove_worktree(
+                    worktree_path=str(worktree_path),
+                    branch=branch_name,
+                    delete_branch=not existing_branch,
+                )
+            except WorktreeError:
+                _logger.warning("Could not roll back worktree %s", worktree_path, exc_info=True)
             raise
     return CreatedWorktree(
         worktree_path=str(worktree_path),
