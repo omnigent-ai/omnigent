@@ -395,6 +395,44 @@ const arcaAutoConnect = createArcaAutoConnect({
 });
 
 /**
+ * Onboarding's Arca connect, run through the auto-connect state machine so
+ * the window's own launch-time connect joins it instead of racing a second
+ * `arca ssh`. Picking Arca opts into auto-connect; the opt-in only sticks when
+ * the connect succeeds. Like any auto-connect, a started run finishes in the
+ * background even if setup closes.
+ *
+ * @param {string} serverUrl
+ * @param {(line: string) => void} log
+ * @returns {Promise<{ ok: boolean, alreadyRunning?: boolean, error?: string }>}
+ */
+async function connectOnboardingArca(serverUrl, log) {
+  const settings = loadSettings();
+  const previous = settings.arca_auto_connect;
+  settings.arca_auto_connect = true;
+  saveSettings(settings);
+  await refreshArcaBinary();
+  const command = arcaAutoConnect.getStatus(serverUrl).command;
+  if (command) log(`$ ${command}`);
+  const status =
+    arcaAutoConnect.getStatus(serverUrl).state === "failed"
+      ? await arcaAutoConnect.retry(serverUrl, log)
+      : await arcaAutoConnect.ensure(serverUrl, log);
+  if (status.state === "online")
+    return { ok: true, alreadyRunning: status.alreadyRunning === true };
+  const restored = loadSettings();
+  if (previous === undefined) delete restored.arca_auto_connect;
+  else restored.arca_auto_connect = previous;
+  saveSettings(restored);
+  return {
+    ok: false,
+    error:
+      status.state === "unavailable"
+        ? "The arca CLI was not found on this machine."
+        : (status.error ?? "Couldn't connect Arca."),
+  };
+}
+
+/**
  * Quit-safety timeouts (see the before-quit handler near the end of this
  * file). `let` (not const) so tests can shrink them via testApi.setQuitTimeouts
  * to exercise the force-exit safety nets without waiting seconds in real
@@ -3244,13 +3282,7 @@ function registerIpc() {
       if (!databricksInternalFeaturesEnabled() || !isDatabricksManagedServerUrl(target)) {
         return { ok: false, error: "A remote environment isn't available for this server." };
       }
-      const run = arca.startArcaConnect(target, { onOutput: log });
-      if (run.command) log(`$ ${run.command}`);
-      // Closing the setup window cancels the connect, like the connect console.
-      const cancel = () => run.cancel();
-      event.sender.once("destroyed", cancel);
-      const result = await run.promise;
-      event.sender.removeListener("destroyed", cancel);
+      const result = await connectOnboardingArca(target, log);
       if (result.ok) rememberOnboardingRunner(target, runner);
       return result;
     }

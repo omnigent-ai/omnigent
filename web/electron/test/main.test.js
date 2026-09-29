@@ -1070,7 +1070,7 @@ describe("managed server preference wiring", () => {
     );
   });
 
-  it("wires the onboarding connect's remote gate, cancel-on-close, and sign-in order", () => {
+  it("wires the onboarding connect's remote gate, auto-connect run, and sign-in order", () => {
     assert.match(
       preloadSource,
       /connectRunner:\s*\(url, runner\)\s*=>\s*ipcRenderer\.invoke\("omnigent:connect-runner",\s*url,\s*runner\)/,
@@ -1083,11 +1083,12 @@ describe("managed server preference wiring", () => {
     const handler = liveCode.slice(start, end);
     assert.match(
       handler,
-      /runner === "remote"[\s\S]{0,80}!databricksInternalFeaturesEnabled\(\) \|\| !isDatabricksManagedServerUrl\(target\)[\s\S]{0,200}arca\.startArcaConnect\(target/,
+      /runner === "remote"[\s\S]{0,80}!databricksInternalFeaturesEnabled\(\) \|\| !isDatabricksManagedServerUrl\(target\)[\s\S]{0,200}return connectOnboardingArca\(target, log\);/,
     );
+    // Remote runs share the launch-time auto-connect; the opt-in sticks only on success.
     assert.match(
-      handler,
-      /event\.sender\.once\("destroyed", cancel\);\s*const result = await run\.promise;\s*event\.sender\.removeListener\("destroyed", cancel\);/,
+      liveCode,
+      /async function connectOnboardingArca\(serverUrl, log\)[\s\S]{0,300}settings\.arca_auto_connect = true;[\s\S]{0,500}arcaAutoConnect\.retry\(serverUrl, log\)\s*:\s*await arcaAutoConnect\.ensure\(serverUrl, log\);\s*if \(status\.state === "online"\)\s*return[\s\S]{0,160}if \(previous === undefined\) delete restored\.arca_auto_connect;/,
     );
     assert.match(
       handler,

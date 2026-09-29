@@ -94,7 +94,7 @@ function createArcaAutoConnect({
     return entry.status;
   }
 
-  function runConnect(serverUrl, origin) {
+  function runConnect(serverUrl, origin, onOutput) {
     const command = commandLine(serverUrl);
     let output = "";
     const status = {
@@ -105,6 +105,7 @@ function createArcaAutoConnect({
     publish(origin, status);
     log(`arca auto-connect: running against ${origin}`);
     const connect = startConnect(serverUrl, (text) => {
+      onOutput?.(text);
       output = (output + text).slice(-OUTPUT_TAIL_CHARS);
       const entry = byOrigin.get(origin);
       if (entry?.status.state === "starting") entry.status = { ...entry.status, output };
@@ -137,15 +138,17 @@ function createArcaAutoConnect({
    * second window or a reload shares the in-flight run.
    *
    * @param {string | null | undefined} serverUrl
+   * @param {(text: string) => void} [onOutput] Streams a new run's output;
+   *   joining a run already in flight gets only its outcome.
    * @returns {Promise<ArcaStatus>}
    */
-  function ensure(serverUrl) {
+  function ensure(serverUrl, onOutput) {
     const current = getStatus(serverUrl);
     if (current.state !== "idle") {
       const entry = byOrigin.get(originOf(serverUrl));
       return entry?.run ?? Promise.resolve(current);
     }
-    return runConnect(serverUrl, originOf(serverUrl));
+    return runConnect(serverUrl, originOf(serverUrl), onOutput);
   }
 
   /**
@@ -153,14 +156,15 @@ function createArcaAutoConnect({
    * can't use this to re-run the command at will.
    *
    * @param {string | null | undefined} serverUrl
+   * @param {(text: string) => void} [onOutput] As for ensure.
    * @returns {Promise<ArcaStatus>}
    */
-  function retry(serverUrl) {
+  function retry(serverUrl, onOutput) {
     const running = inFlight(serverUrl);
     if (running) return running;
     const current = getStatus(serverUrl);
     if (current.state !== "failed") return Promise.resolve(current);
-    return runConnect(serverUrl, originOf(serverUrl));
+    return runConnect(serverUrl, originOf(serverUrl), onOutput);
   }
 
   /**

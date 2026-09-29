@@ -111,6 +111,27 @@ describe("arca auto-connect", () => {
     assert.equal((await second).state, "online");
   });
 
+  it("streams a new run's output to the caller that started it", async () => {
+    const { auto, runs } = harness();
+    const seen = [];
+    const first = auto.ensure(SERVER, (text) => seen.push(text));
+    // Joining the in-flight run gets its outcome, not its output.
+    const joined = [];
+    const second = auto.ensure(SERVER, (text) => joined.push(text));
+    runs[0].onOutput("Starting…\n");
+    runs[0].finish({ ok: false, errorKind: "timeout", error: "timed out" });
+    await Promise.all([first, second]);
+    assert.deepEqual(seen, ["Starting…\n"]);
+    assert.deepEqual(joined, []);
+
+    const retried = [];
+    const again = auto.retry(SERVER, (text) => retried.push(text));
+    runs[1].onOutput("Retrying…\n");
+    runs[1].finish({ ok: true });
+    assert.equal((await again).state, "online");
+    assert.deepEqual(retried, ["Retrying…\n"]);
+  });
+
   it("exposes the in-flight run for the manual connect to share", async () => {
     const { auto, runs } = harness();
     assert.equal(auto.inFlight(SERVER), null);
