@@ -29,6 +29,7 @@ _DRAG_PX = 140
 # A working drag must grow the sidebar by most of the travel (clamps and
 # rubber-banding get some slack).
 _MIN_GROWTH_PX = 100
+_TRANSPARENT = "rgba(0, 0, 0, 0)"
 
 
 def _touch(cdp: CDPSession, type_: str, points: list[dict[str, float]]) -> None:
@@ -99,8 +100,14 @@ def test_sidebar_divider_touch_drag_resizes(
         for dx in range(step, _DRAG_PX + 1, step):
             _touch(cdp, "touchMove", [{"x": start_x + dx, "y": start_y, "id": 1}])
             page.wait_for_timeout(30)
+        # Touch has no hover and drops :active mid-drag, so the handle must
+        # stay highlighted by its drag state until the finger lifts.
+        expect(handle).to_have_attribute("data-dragging", "")
+        assert handle.evaluate("el => getComputedStyle(el).backgroundColor") != _TRANSPARENT
         _touch(cdp, "touchEnd", [])
         page.wait_for_timeout(500)
+        expect(handle).not_to_have_attribute("data-dragging", "")
+        assert handle.evaluate("el => getComputedStyle(el).backgroundColor") == _TRANSPARENT
 
         after = sidebar.bounding_box()
         assert after is not None

@@ -167,3 +167,38 @@ describe("useResizeDrag lifecycle callbacks", () => {
     expect(onCancel).toHaveBeenCalledTimes(1);
   });
 });
+
+// Touch has no hover and drops :active once a press becomes a drag, so the
+// gutter's highlight keys off an attribute that lasts for the whole drag.
+describe("useResizeDrag dragging highlight", () => {
+  it.each([
+    ["release", (handle: HTMLElement) => fireEvent.pointerUp(handle, { pointerId: 31 })],
+    ["cancellation", () => fireEvent.keyDown(document, { key: "Escape" })],
+  ])("marks the handle for the whole drag until %s", (_end, finish) => {
+    const onMove = vi.fn();
+    render(<DragHandle name="Resize highlighted" onMove={onMove} />);
+    const handle = screen.getByLabelText("Resize highlighted");
+    installPointerCapture(handle);
+    expect(handle).not.toHaveAttribute("data-dragging");
+
+    startDrag(handle, 31);
+    fireEvent.pointerMove(handle, { pointerId: 31 });
+    expect(handle).toHaveAttribute("data-dragging");
+
+    finish(handle);
+    expect(handle).not.toHaveAttribute("data-dragging");
+  });
+
+  it("does not mark a handle whose pointer capture fails", () => {
+    render(<DragHandle name="Resize uncaptured" onMove={vi.fn()} />);
+    const handle = screen.getByLabelText("Resize uncaptured");
+    Object.assign(handle, {
+      setPointerCapture: vi.fn(() => {
+        throw new Error("no capture");
+      }),
+    });
+
+    startDrag(handle, 32);
+    expect(handle).not.toHaveAttribute("data-dragging");
+  });
+});

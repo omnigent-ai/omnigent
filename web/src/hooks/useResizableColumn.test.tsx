@@ -43,7 +43,7 @@ function pointerEvent(
     button,
     pointerType,
     preventDefault: vi.fn(),
-    currentTarget: { setPointerCapture },
+    currentTarget: { setPointerCapture, setAttribute: vi.fn(), removeAttribute: vi.fn() },
     setPointerCapture,
   } as unknown as React.PointerEvent & { setPointerCapture: ReturnType<typeof vi.fn> };
 }
