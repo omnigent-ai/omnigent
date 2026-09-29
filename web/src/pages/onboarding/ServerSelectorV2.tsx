@@ -21,7 +21,7 @@ import {
 import { LandingFooter } from "@/pages/onboarding/LandingFooter";
 import { LandingStep } from "@/pages/onboarding/LandingStep";
 import { HarnessIconRow, LocalIntroStep } from "@/pages/onboarding/LocalIntroStep";
-import { ServerDetailStep } from "@/pages/onboarding/ServerDetailStep";
+import { RunnerStep } from "@/pages/onboarding/RunnerStep";
 import {
   isLocalInstall,
   ServerHeroIcons,
@@ -80,6 +80,9 @@ export interface ServerSelectorV2Setup {
   onInstallCli?: () => Promise<{ ok: boolean; error?: string }>;
   /** Subscribe to the CLI installer's output lines; returns an unsubscribe. */
   onInstallLog?: (cb: (line: string) => void) => () => void;
+  /** Runners the "Where do you work today?" step offers for `url`. Absent →
+   *  this laptop only. */
+  getRunnerOptions?: (url: string) => Promise<{ remote: boolean }>;
   /** Remove a recent server from the saved list, if the shell supports it. */
   onRemoveServer?: (url: string) => void;
   /** Copy text to the clipboard via the shell's native bridge. */
@@ -106,14 +109,14 @@ export interface ServerCheckResult {
   status: "ok" | "reachable" | "unreachable";
 }
 
-type Step = "landing" | "local" | "detail" | "server" | "terminal";
+type Step = "landing" | "local" | "runner" | "server" | "terminal";
 
 // Per-step card dimensions (px). The panel shrinks as steps gain content; the
 // card grows for the scrollable server list. Drives the CSS-transition resize.
 const CARD: Record<Step, { height: number; panelHeight: number }> = {
   landing: { height: 560, panelHeight: 308 },
   local: { height: 560, panelHeight: 150 },
-  detail: { height: 600, panelHeight: 150 },
+  runner: { height: 560, panelHeight: 150 },
   server: { height: 600, panelHeight: 64 },
   terminal: { height: 560, panelHeight: 240 },
 };
@@ -140,8 +143,14 @@ export function ServerSelectorV2({ setup }: { setup: ServerSelectorV2Setup }) {
   const [colorScheme, setColorScheme] = useState<"system" | "light" | "dark">(
     setup.initialColorScheme ?? "system",
   );
-  // The preset server picked from the landing split button (drives the detail step).
-  const [detailUrl, setDetailUrl] = useState<string | null>(null);
+  // The preset server picked from the landing split button, and whether its
+  // runner step offers the remote environment.
+  const [runnerTarget, setRunnerTarget] = useState<{ url: string; remote: boolean } | null>(null);
+  const pickPreset = async (url: string) => {
+    const options = await setup.getRunnerOptions?.(url).catch(() => undefined);
+    setRunnerTarget({ url, remote: options?.remote === true });
+    setStep("runner");
+  };
   // What the terminal step should run after any install: start the local server
   // (Back → the step that launched it), or connect to a remote URL. A picked
   // local install carries its `url`: opened as-is when up, else started.
@@ -155,7 +164,7 @@ export function ServerSelectorV2({ setup }: { setup: ServerSelectorV2Setup }) {
   const needsInstall =
     setup.mockInstall === true || (setup.installed === false && setup.onInstallCli != null);
 
-  // A server pick (list Join / preset detail): install-then-connect when the CLI
+  // A server pick (list Join / runner step): install-then-connect when the CLI
   // is missing (route via terminal), else connect straight away. Resolves the
   // ConnectResult so the list can still show a connect error when connecting
   // directly.
@@ -196,11 +205,11 @@ export function ServerSelectorV2({ setup }: { setup: ServerSelectorV2Setup }) {
   const panelHeight = step === "server" && serverAddMode ? 150 : basePanelHeight;
 
   // Panel band: harness icons on the local intro; server hero icons on the
-  // detail step and on the server step's add (URL-input) view.
+  // runner step and on the server step's add (URL-input) view.
   const bandContent =
     step === "local" ? (
       <HarnessIconRow />
-    ) : step === "detail" || (step === "server" && serverAddMode) ? (
+    ) : step === "runner" || (step === "server" && serverAddMode) ? (
       <ServerHeroIcons />
     ) : undefined;
 
@@ -269,10 +278,7 @@ export function ServerSelectorV2({ setup }: { setup: ServerSelectorV2Setup }) {
             onGetStarted={() => setStep("local")}
             onJoinServer={() => openServers(false)}
             onAddServer={() => openServers(true)}
-            onJoinManaged={(url) => {
-              setDetailUrl(url);
-              setStep("detail");
-            }}
+            onJoinManaged={pickPreset}
           />
         )}
         {step === "local" && (
@@ -286,14 +292,12 @@ export function ServerSelectorV2({ setup }: { setup: ServerSelectorV2Setup }) {
             }}
           />
         )}
-        {step === "detail" && detailUrl !== null && (
-          <ServerDetailStep
-            url={detailUrl}
+        {step === "runner" && runnerTarget !== null && (
+          <RunnerStep
+            remoteAvailable={runnerTarget.remote}
             installed={setup.installed}
             onBack={() => setStep("landing")}
-            onConnect={connect}
-            onCopy={setup.onCopy}
-            onShowAll={() => openServers(false)}
+            onInstall={() => connect(runnerTarget.url)}
           />
         )}
         {step === "terminal" && (

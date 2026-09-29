@@ -452,6 +452,9 @@ contextBridge.exposeInMainWorld("omnigentSetup", {
   /** Wizard capabilities, e.g. `{v2Forced}` — v2Forced disables "Switch to
    *  legacy" because the env var pins the selector on. */
   getSetupCapabilities: () => ipcRenderer.invoke("omnigent:get-setup-capabilities"),
+  /** Runners the onboarding runner step offers for `url`: `{remote}`.
+   *  @param {string} url */
+  getRunnerOptions: (url) => ipcRenderer.invoke("omnigent:get-runner-options", url),
   /** Live color-scheme override for the wizard (System/Light/Dark). Not
    *  persisted — resets to the OS default on relaunch.
    *  @param {"light"|"dark"|"system"} scheme */

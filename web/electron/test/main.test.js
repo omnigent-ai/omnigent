@@ -853,6 +853,17 @@ describe("managed server preference wiring", () => {
     );
   });
 
+  it("offers the onboarding remote environment only behind the host picker's gate plus arca", () => {
+    assert.match(
+      preloadSource,
+      /getRunnerOptions:\s*\(url\)\s*=>\s*ipcRenderer\.invoke\("omnigent:get-runner-options",\s*url\)/,
+    );
+    assert.match(
+      liveCode,
+      /ipcMain\.handle\("omnigent:get-runner-options"[\s\S]{0,120}!isSetupPageSender\(event\)[\s\S]{0,200}typeof url === "string" &&\s*databricksInternalFeaturesEnabled\(\) &&\s*isDatabricksManagedServerUrl\(url\) &&\s*arca\.resolveArcaPath\(\) !== null/,
+    );
+  });
+
   it("preserves a managed path while still expanding bare workspace roots", () => {
     assert.match(
       liveCode,

@@ -155,6 +155,7 @@ function serverSelectorV2DevUrl() {
  *   OMNIGENT_ONBOARDING_MOCK_MANAGED=url,url   MDM-preset servers
  *   OMNIGENT_ONBOARDING_MOCK_RECENTS=url,url   recent servers
  *   OMNIGENT_ONBOARDING_MOCK_INSTALLED=1       returning user
+ *   OMNIGENT_ONBOARDING_MOCK_REMOTE_ENV=1      offer the remote environment
  *
  * @returns {string} A query string without the leading "?", or "".
  */
@@ -166,6 +167,7 @@ function onboardingMockSearch() {
   if (process.env.OMNIGENT_ONBOARDING_MOCK_RECENTS)
     p.set("recents", process.env.OMNIGENT_ONBOARDING_MOCK_RECENTS);
   if (process.env.OMNIGENT_ONBOARDING_MOCK_INSTALLED === "1") p.set("installed", "1");
+  if (process.env.OMNIGENT_ONBOARDING_MOCK_REMOTE_ENV === "1") p.set("remote", "1");
   return p.toString();
 }
 
@@ -3017,6 +3019,22 @@ function registerIpc() {
     return {
       v2Forced: serverSelectorV2EnvForced(),
       connectedBefore: normalizeRecentServers(loadSettings().recent_servers).length > 0,
+    };
+  });
+
+  // Setup page → runners the onboarding runner step offers for `url`. The
+  // remote environment follows the same gate as the host picker's, plus the
+  // arca CLI being installed here.
+  ipcMain.handle("omnigent:get-runner-options", (event, url) => {
+    if (!isSetupPageSender(event)) {
+      throw new Error("get-runner-options is only available to the setup page");
+    }
+    return {
+      remote:
+        typeof url === "string" &&
+        databricksInternalFeaturesEnabled() &&
+        isDatabricksManagedServerUrl(url) &&
+        arca.resolveArcaPath() !== null,
     };
   });
 

@@ -14,6 +14,7 @@
 //   installed=1                   omnigent CLI already installed
 //   returning=1                   connected before (implied by recents=)
 //   localRunning=1                local server already up ("Open" vs "Start")
+//   remote=1                      offer the remote environment on the runner step
 //   step=server                   open straight on the server list
 //   error=<msg>                   show a connect-error banner
 //
@@ -55,6 +56,7 @@ export function maybeMockSetup(params: URLSearchParams): ServerSelectorV2Setup |
   const installed = params.get("installed") === "1";
   const connectedBefore = params.get("returning") === "1";
   const localServerRunning = params.get("localRunning") === "1";
+  const remote = params.get("remote") === "1";
   const error = params.get("error") ?? undefined;
   const initialStep = params.get("step") === "server" ? ("server" as const) : undefined;
 
@@ -111,6 +113,10 @@ export function maybeMockSetup(params: URLSearchParams): ServerSelectorV2Setup |
       return () => {
         if (installLog === cb) installLog = null;
       };
+    },
+    getRunnerOptions: async (url) => {
+      log("getRunnerOptions", url);
+      return { remote };
     },
     onRemoveServer: (url) => log("onRemoveServer", url),
     onCopy: (text) => log("onCopy", text),

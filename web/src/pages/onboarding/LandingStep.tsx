@@ -1,8 +1,8 @@
 // Onboarding step 1: the hero landing. Without MDM presets: "Get started
 // locally" opens deployment-mode select and "Join your team" opens server
-// select. With MDM presets: "Join your team (<name>)" becomes a primary split
-// button (button + dropdown of preset servers, "Show all servers…", "Add
-// server…") and "Get started locally" drops to secondary. Rendered inside the card body below the animated panel.
+// select. With MDM presets: "Join your team (<name>)" is the only CTA — a split
+// button whose dropdown lists the other presets and "Enter Omnigent server
+// URL…". Rendered inside the card body below the animated panel.
 
 import { ChevronDown, Laptop, Users } from "lucide-react";
 import { Button } from "@/components/ui/button";
@@ -14,11 +14,12 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 
-/** Short label for a preset server URL — host without scheme / trailing slash,
- *  first label of the host (mirrors the mock's "field-eng-omni"). */
-function shortName(url: string): string {
-  const host = url.replace(/^https?:\/\//i, "").replace(/\/.*$/, "");
-  return host.split(".")[0] || host;
+/** Team name for a preset server URL: the host's first label, capitalized
+ *  ("https://team.example.com/x" → "Team"). */
+function teamName(url: string): string {
+  const host = url.replace(/^https?:\/\//i, "").replace(/[/?#].*$/, "");
+  const label = host.split(".")[0] || host;
+  return label.charAt(0).toUpperCase() + label.slice(1);
 }
 
 export function LandingStep({
@@ -50,47 +51,38 @@ export function LandingStep({
       </div>
 
       {hasPresets ? (
-        <>
-          {/* Primary split button: join the first preset, or pick another. */}
-          <div className="flex gap-0">
-            <Button
-              onClick={() => onJoinManaged(managedServers[0])}
-              className="flex-1 py-5 rounded-tr-none rounded-br-none border-none"
-            >
-              <Users className="size-4" />
-              <span>
-                Join your team (
-                <span className="opacity-80 font-normal">{shortName(managedServers[0])}</span>)
-              </span>
-            </Button>
-            <DropdownMenu>
-              <DropdownMenuTrigger asChild>
-                <Button
-                  className="py-5 rounded-tl-none rounded-bl-none border-0 border-l-[1px] border-muted-foreground"
-                  aria-label="Choose team URL"
-                >
-                  <ChevronDown className="size-4" />
-                </Button>
-              </DropdownMenuTrigger>
-              <DropdownMenuContent align="end">
-                {managedServers.map((url) => (
-                  <DropdownMenuItem key={url} onSelect={() => onJoinManaged(url)}>
-                    {url.replace(/^https?:\/\//i, "").replace(/\/$/, "")}
-                  </DropdownMenuItem>
-                ))}
-                {/* Escape hatch to the full list (presets + recents), which is
-                    otherwise unreachable from the MDM landing. */}
-                <DropdownMenuSeparator />
-                <DropdownMenuItem onSelect={onJoinServer}>Show all servers…</DropdownMenuItem>
-                <DropdownMenuItem onSelect={onAddServer}>Add server…</DropdownMenuItem>
-              </DropdownMenuContent>
-            </DropdownMenu>
-          </div>
-          <Button variant="outline" onClick={onGetStarted} className="py-5">
-            <Laptop className="size-4" />
-            Get started locally
+        // Only CTA: join the first preset, or pick another / enter a URL.
+        <div className="flex gap-0">
+          <Button
+            onClick={() => onJoinManaged(managedServers[0])}
+            className="flex-1 py-5 rounded-tr-none rounded-br-none border-none"
+          >
+            <Users className="size-4" />
+            <span>
+              Join your team (
+              <span className="opacity-80 font-normal">{teamName(managedServers[0])}</span>)
+            </span>
           </Button>
-        </>
+          <DropdownMenu>
+            <DropdownMenuTrigger asChild>
+              <Button
+                className="py-5 rounded-tl-none rounded-bl-none border-0 border-l-[1px] border-muted-foreground"
+                aria-label="Choose team URL"
+              >
+                <ChevronDown className="size-4" />
+              </Button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="end">
+              {managedServers.slice(1).map((url) => (
+                <DropdownMenuItem key={url} onSelect={() => onJoinManaged(url)}>
+                  {url.replace(/^https?:\/\//i, "").replace(/\/$/, "")}
+                </DropdownMenuItem>
+              ))}
+              {managedServers.length > 1 && <DropdownMenuSeparator />}
+              <DropdownMenuItem onSelect={onAddServer}>Enter Omnigent server URL…</DropdownMenuItem>
+            </DropdownMenuContent>
+          </DropdownMenu>
+        </div>
       ) : (
         <>
           <Button onClick={onGetStarted} className="h-9">
