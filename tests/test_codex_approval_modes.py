@@ -7,6 +7,7 @@ import pytest
 from omnigent.codex_approval_modes import (
     CODEX_NATIVE_PERMISSION_PRESETS,
     CODEX_NATIVE_PERMISSION_VALUES,
+    codex_pane_confirms_permission_label,
     codex_permission_preset,
     codex_permission_preset_from_thread_settings,
 )
@@ -91,3 +92,51 @@ def test_preset_from_thread_settings_none_for_unmapped() -> None:
     """A non-mapping / custom payload resolves to None rather than guessing."""
     assert codex_permission_preset_from_thread_settings(None) is None
     assert codex_permission_preset_from_thread_settings({}) is None
+
+
+# Pane tails captured from codex-cli 0.145.0 after a /permissions switch.
+_WIDE_PANE = """\
+• Permissions updated to Approve for me
+• Permissions updated to Ask for approval
+› Use /skills to list available skills
+  gpt-5.6-sol medium · /tmp/repo · 1M window · Context 0% used
+"""
+# At a 36-column pane Codex hard-wraps the echo across rows.
+_NARROW_PANE = """\
+• Permissions updated to Approve for
+me
+• Permissions updated to Ask for
+approval
+› Use /skills to list available ski
+  gpt-5.6-sol medium · /tmp/repo…
+"""
+
+
+@pytest.mark.parametrize("pane", [_WIDE_PANE, _NARROW_PANE])
+def test_pane_confirms_latest_permission_label(pane: str) -> None:
+    """The most recent echo confirms its label, even when wrapped mid-label."""
+    assert codex_pane_confirms_permission_label(pane, "Ask for approval")
+    assert not codex_pane_confirms_permission_label(pane, "Approve for me")
+
+
+def test_pane_confirms_when_marker_itself_wraps() -> None:
+    """A very narrow pane can split the marker text across rows too."""
+    pane = "• Permissions updated\nto Full\nAccess\n"
+    assert codex_pane_confirms_permission_label(pane, "Full Access")
+
+
+def test_no_preset_label_is_a_prefix_of_another() -> None:
+    """The confirm check prefix-matches labels, so none may prefix another."""
+    labels = [p.label for p in CODEX_NATIVE_PERMISSION_PRESETS]
+    assert not any(a != b and b.startswith(a) for a in labels for b in labels)
+
+
+def test_pane_confirms_label_with_codex_suffix() -> None:
+    """A suffix Codex appends to the label (Windows sandbox) still confirms."""
+    pane = "• Permissions updated to Ask for approval (non-admin sandbox)\n"
+    assert codex_pane_confirms_permission_label(pane, "Ask for approval")
+
+
+def test_pane_without_echo_does_not_confirm() -> None:
+    """No echo on screen means the switch is unconfirmed."""
+    assert not codex_pane_confirms_permission_label("› Use /skills\n", "Ask for approval")

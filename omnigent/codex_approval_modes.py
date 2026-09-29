@@ -131,3 +131,26 @@ def codex_permission_preset_from_thread_settings(settings: object) -> str | None
     if approval_policy == "on-request":
         return "ask-for-approval"
     return None
+
+
+_PERMISSION_UPDATE_MARKER = "Permissions updated to"
+
+
+def codex_pane_confirms_permission_label(pane: str, label: str) -> bool:
+    """Whether a captured Codex pane's latest ``/permissions`` echo names *label*.
+
+    Codex echoes ``Permissions updated to <label>`` when a switch applies, but
+    hard-wraps it at the pane width (a narrow pane splits ``Ask for approval``
+    across rows), so whitespace is normalized across the whole pane before
+    matching. A prefix match tolerates suffixes Codex appends to the label
+    (e.g. ``(non-admin sandbox)``); no preset label is a prefix of another.
+
+    :param pane: Visible pane text, e.g. from ``tmux capture-pane -p``.
+    :param label: The preset label, e.g. ``"Ask for approval"``.
+    :returns: ``True`` when the most recent echo names *label*.
+    """
+    flat = " ".join(pane.split())
+    marker_at = flat.rfind(_PERMISSION_UPDATE_MARKER)
+    if marker_at < 0:
+        return False
+    return flat[marker_at + len(_PERMISSION_UPDATE_MARKER) :].lstrip().startswith(label)

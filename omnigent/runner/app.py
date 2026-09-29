@@ -7282,18 +7282,17 @@ def create_runner_app(
 
     def _codex_permission_mode_confirmed(socket_path: str, target: str, label: str) -> bool:
         # Codex echoes "Permissions updated to <label>" when a /permissions switch
-        # applies. Poll the pane and require the most-recent such line to match the
+        # applies. Poll the pane and require the most-recent echo to match the
         # target, so a keystroke that hit a non-existent menu row (a preset this
         # codex build doesn't offer) is reported as not-applied rather than the
         # label claiming a mode the TUI never entered.
+        from omnigent.codex_approval_modes import codex_pane_confirms_permission_label
         from omnigent.harnesses.claude_native.bridge import _capture_pane
 
-        marker = "Permissions updated to "
         deadline = time.monotonic() + _CODEX_PERMISSION_CONFIRM_BUDGET_S
         while True:
             pane = _capture_pane(socket_path, target)
-            updates = [line for line in pane.splitlines() if marker in line]
-            if updates and updates[-1].split(marker, 1)[1].strip() == label:
+            if codex_pane_confirms_permission_label(pane, label):
                 return True
             if time.monotonic() >= deadline:
                 return False
