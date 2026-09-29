@@ -25,7 +25,7 @@ from contextlib import AsyncExitStack, suppress
 from dataclasses import dataclass, field
 from datetime import timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, TypeVar
+from typing import Any, TypeVar
 from urllib.parse import urlparse
 
 import httpx
@@ -57,10 +57,11 @@ from mcp.types import Tool as McpToolDef
 from omnigent.runner.identity import strip_runner_auth_secrets
 from omnigent.runtime.mcp_tool_result import encode_mcp_image_result, native_image_payload
 from omnigent.spec.types import MCPServerConfig, RetryPolicy
-from omnigent.tools.mcp_oauth import build_oauth_client_provider
-
-if TYPE_CHECKING:
-    from mcp.client.auth.oauth2 import OAuthClientProvider
+from omnigent.tools.mcp_oauth import (
+    OmnigentOAuthClientProvider,
+    build_oauth_client_provider,
+    find_oauth_error,
+)
 
 _T = TypeVar("_T")
 
@@ -900,7 +901,8 @@ class McpServerConnection:
         # future never resolved and connect() would hang forever.
         except Exception as exc:
             if not ready.done():
-                ready.set_exception(exc)
+                # Surface a sign-in problem's own message, not its task-group wrapper.
+                ready.set_exception(find_oauth_error(exc) or exc)
                 return
             _logger.exception(
                 "MCP server %r lifecycle task failed during steady state",
@@ -1218,21 +1220,19 @@ class McpServerConnection:
             merged.setdefault("Authorization", f"Bearer {token}")
         return merged or None
 
-    def _resolve_http_auth(self) -> OAuthClientProvider | None:
+    def _resolve_http_auth(self) -> OmnigentOAuthClientProvider | None:
         """
         Build the ``httpx.Auth`` for the MCP connection, when configured.
 
-        Returns a fresh :class:`~mcp.client.auth.oauth2.OAuthClientProvider`
-        when ``config.oauth`` is set, or ``None`` otherwise (the common
-        case — most servers use a static header or no auth at all).
-        Constructing a new instance per connect/reconnect is safe and
-        cheap: the provider lazily loads any previously stored token from
-        :class:`~omnigent.tools.mcp_oauth.OmnigentOAuthTokenStorage` on
-        first use rather than requiring in-memory state to survive a
-        reconnect, mirroring ``_resolve_http_headers``'s "resolve fresh
-        each call" approach for the Databricks token.
+        Returns a fresh OAuth provider when ``config.oauth`` is set, or
+        ``None`` otherwise (the common case — most servers use a static
+        header or no auth at all). A new instance per connect/reconnect
+        is safe: it restores the stored tokens, their expiry and the
+        discovered token endpoint on first use, so an expired token is
+        refreshed without a browser sign-in (see
+        :class:`~omnigent.tools.mcp_oauth.OmnigentOAuthClientProvider`).
 
-        :returns: An ``OAuthClientProvider``, or ``None`` when
+        :returns: An OAuth provider, or ``None`` when
             ``config.oauth`` is not set.
         """
         return build_oauth_client_provider(self.config)
@@ -1242,7 +1242,7 @@ class McpServerConnection:
         stack: AsyncExitStack,
         timeout: int | None,
         headers: dict[str, str] | None,
-        auth: OAuthClientProvider | None = None,
+        auth: OmnigentOAuthClientProvider | None = None,
     ) -> tuple[_ReadStream, _WriteStream]:
         """
         Open a Streamable HTTP MCP transport.
@@ -1280,7 +1280,7 @@ class McpServerConnection:
         stack: AsyncExitStack,
         timeout: int | None,
         headers: dict[str, str] | None,
-        auth: OAuthClientProvider | None = None,
+        auth: OmnigentOAuthClientProvider | None = None,
     ) -> tuple[_ReadStream, _WriteStream]:
         """
         Open a legacy SSE MCP transport.

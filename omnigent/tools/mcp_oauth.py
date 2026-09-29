@@ -1,48 +1,82 @@
 """Generic MCP OAuth — browser sign-in with PKCE and automatic refresh.
 
-Wires the MCP SDK's own :class:`mcp.client.auth.oauth2.OAuthClientProvider`
+Builds on the MCP SDK's :class:`mcp.client.auth.oauth2.OAuthClientProvider`
 (RFC 8414/9728 discovery, RFC 7591 dynamic client registration,
-authorization_code + PKCE, and transparent 401 re-auth/refresh) into
-Omnigent: a :class:`TokenStorage` backed by the existing OS-keychain-or-file
-secret store (:mod:`omnigent.onboarding.secrets`), and a local loopback HTTP
-listener for the authorization redirect. Omnigent does not reimplement any
-OAuth protocol logic — that all lives in the SDK and is exercised by its own
-test suite; this module only supplies the storage/redirect/callback glue the
-SDK asks for.
+authorization_code + PKCE). Omnigent supplies what the SDK leaves to the
+host application:
+
+- a :class:`TokenStorage` backed by the OS-keychain-or-file secret store
+  (:mod:`omnigent.onboarding.secrets`), which also remembers when the access
+  token expires and where the token endpoint is, so a new connection (or a
+  new process) refreshes an expired token instead of asking for a new
+  browser sign-in;
+- a loopback HTTP listener for the authorization redirect, bound before the
+  flow needs a redirect URI, so client registration, the authorization
+  request and the token exchange all carry the same ``redirect_uri``;
+- a refresh attempt when the server rejects a token with 401, before
+  falling back to a browser sign-in.
+
+Sign-in is local-only: the browser must run on the machine running this
+code. Where no browser can be opened (a remote or headless server) the
+connection fails fast with :class:`McpOAuthError` instead of waiting for a
+callback that can never arrive.
 
 Used when an ``MCPServerConfig`` sets ``oauth=True`` (``auth: {type:
-oauth}`` in YAML). See :func:`build_oauth_client_provider`, the single
-entry point :mod:`omnigent.tools.mcp` calls.
+oauth}`` in YAML); :func:`build_oauth_client_provider` is the entry point
+:mod:`omnigent.tools.mcp` calls.
 """
 
 from __future__ import annotations
 
 import asyncio
 import hashlib
+import html
 import logging
+import os
+import sys
 import threading
+import time
 import webbrowser
+from collections.abc import AsyncGenerator
 from concurrent.futures import Future
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import TYPE_CHECKING
-from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
+from urllib.parse import parse_qs, urlparse
 
-from mcp.client.auth.oauth2 import OAuthClientProvider
-from mcp.shared.auth import OAuthClientInformationFull, OAuthClientMetadata, OAuthToken
+import httpx
+from mcp.client.auth.oauth2 import OAuthClientProvider, OAuthContext
+from mcp.shared.auth import (
+    OAuthClientInformationFull,
+    OAuthClientMetadata,
+    OAuthMetadata,
+    OAuthToken,
+    ProtectedResourceMetadata,
+)
+from pydantic import AnyUrl, BaseModel
 
 from omnigent.onboarding.secrets import delete_secret, load_secret, store_secret
+from omnigent.spec.types import mcp_oauth_url_problem
 
 if TYPE_CHECKING:
     from omnigent.spec.types import MCPServerConfig
 
 _logger = logging.getLogger(__name__)
 
-# Local loopback callback listener never waits longer than the SDK's own
-# authorization-flow timeout (OAuthClientProvider default: 300s) — bounding
-# it independently would just produce a confusing second timeout.
+# How long to wait for the user to finish signing in in the browser.
 _CALLBACK_TIMEOUT_SECONDS = 300.0
 
+_CALLBACK_HOST = "127.0.0.1"
+_CALLBACK_PATH = "/callback"
+
 _SECRET_NAME_PREFIX = "mcp-oauth"
+
+
+class McpOAuthError(RuntimeError):
+    """An MCP OAuth sign-in problem the user has to act on.
+
+    Its message is written for the user: it becomes the MCP server's
+    connection error.
+    """
 
 
 def _tokens_secret_name(server_key: str) -> str:
@@ -53,23 +87,49 @@ def _client_info_secret_name(server_key: str) -> str:
     return f"{_SECRET_NAME_PREFIX}:client:{server_key}"
 
 
+class _TokenRecord(BaseModel):
+    """What is persisted per server: the token set plus what refresh needs.
+
+    ``expires_at`` is absolute (epoch seconds) because the token's own
+    ``expires_in`` is relative to when it was issued. The discovered
+    metadata tells a later connection which token endpoint to refresh
+    against without first taking a 401.
+    """
+
+    tokens: OAuthToken
+    expires_at: float | None = None
+    oauth_metadata: OAuthMetadata | None = None
+    protected_resource_metadata: ProtectedResourceMetadata | None = None
+
+
 class OmnigentOAuthTokenStorage:
     """:class:`mcp.client.auth.oauth2.TokenStorage` backed by the OS keychain.
 
     Persists to the same store as provider API keys
     (:mod:`omnigent.onboarding.secrets` — OS keychain, falling back to a
     ``0600`` JSON file), keyed by *server_key* so two MCP servers never
-    collide and a URL change gets a fresh credential rather than reusing
-    a stale one.
+    collide and a URL change gets a fresh credential.
 
-    :param server_key: Stable identifier for the MCP server this storage
-        instance authenticates — :func:`build_oauth_client_provider`
-        derives this from the server's URL.
+    Besides the SDK protocol it keeps the loaded token's absolute expiry
+    and discovered metadata (:attr:`expires_at`, :attr:`oauth_metadata`,
+    :attr:`protected_resource_metadata`) for
+    :class:`OmnigentOAuthClientProvider` to restore.
+
+    :param server_key: Stable identifier for the MCP server, e.g. a
+        digest of its URL (see :func:`build_oauth_client_provider`).
     """
 
     def __init__(self, server_key: str) -> None:
         self._tokens_name = _tokens_secret_name(server_key)
         self._client_info_name = _client_info_secret_name(server_key)
+        self._context: OAuthContext | None = None
+        self.expires_at: float | None = None
+        self.oauth_metadata: OAuthMetadata | None = None
+        self.protected_resource_metadata: ProtectedResourceMetadata | None = None
+
+    def attach(self, context: OAuthContext) -> None:
+        """Save *context*'s discovered metadata alongside future tokens."""
+        self._context = context
 
     async def get_tokens(self) -> OAuthToken | None:
         """Return the stored token set, or ``None`` if never authenticated."""
@@ -77,19 +137,31 @@ class OmnigentOAuthTokenStorage:
         if raw is None:
             return None
         try:
-            return OAuthToken.model_validate_json(raw)
+            record = _TokenRecord.model_validate_json(raw)
         except ValueError:
-            # Corrupt/unrecognized stored value — treat as absent rather
-            # than raising, so a bad on-disk secret degrades to a fresh
-            # sign-in instead of a hard crash.
+            # A corrupt stored value degrades to a fresh sign-in, not a crash.
             _logger.warning(
                 "Discarding unreadable stored MCP OAuth tokens for %s", self._tokens_name
             )
             return None
+        self.expires_at = record.expires_at
+        self.oauth_metadata = record.oauth_metadata
+        self.protected_resource_metadata = record.protected_resource_metadata
+        return record.tokens
 
     async def set_tokens(self, tokens: OAuthToken) -> None:
         """Persist the token set, e.g. after a fresh grant or a refresh."""
-        store_secret(self._tokens_name, tokens.model_dump_json())
+        self.expires_at = time.time() + tokens.expires_in if tokens.expires_in else None
+        if self._context is not None:
+            self.oauth_metadata = self._context.oauth_metadata
+            self.protected_resource_metadata = self._context.protected_resource_metadata
+        record = _TokenRecord(
+            tokens=tokens,
+            expires_at=self.expires_at,
+            oauth_metadata=self.oauth_metadata,
+            protected_resource_metadata=self.protected_resource_metadata,
+        )
+        store_secret(self._tokens_name, record.model_dump_json(exclude_none=True))
 
     async def get_client_info(self) -> OAuthClientInformationFull | None:
         """Return the stored dynamic-client-registration info, if any."""
@@ -109,201 +181,342 @@ class OmnigentOAuthTokenStorage:
         store_secret(self._client_info_name, client_info.model_dump_json())
 
     def forget(self) -> None:
-        """Delete both stored secrets — used when a config drops ``oauth``.
+        """Delete both stored secrets, e.g. to sign out of a server.
 
-        Not part of the SDK's ``TokenStorage`` protocol; called directly by
-        callers that want to revoke a stored grant (e.g. a future ``omnigent
-        mcp logout`` command).
+        Not part of the SDK's ``TokenStorage`` protocol.
         """
         delete_secret(self._tokens_name)
         delete_secret(self._client_info_name)
 
 
 class _OAuthCallbackHandler(BaseHTTPRequestHandler):
-    """One-shot handler: captures ``?code=&state=`` from the redirect, then
-    lets the server shut down. Set as class attributes by
-    :func:`_start_callback_server` since ``HTTPServer`` instantiates this
-    class itself.
+    """Captures ``?code=&state=`` from the authorization redirect.
+
+    ``result_future`` is set as a class attribute by
+    :class:`_CallbackListener`, since ``HTTPServer`` instantiates this class
+    itself. Only the first callback settles the future.
     """
 
     result_future: Future[tuple[str, str | None]]
 
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
+        if parsed.path != _CALLBACK_PATH:
+            # e.g. the browser's /favicon.ico probe
+            self.send_error(404)
+            return
         params = parse_qs(parsed.query)
         error = params.get("error", [None])[0]
+        description = params.get("error_description", [None])[0]
         code = params.get("code", [None])[0]
         state = params.get("state", [None])[0]
 
-        self.send_response(200)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
-        self.end_headers()
         if error or not code:
             reason = error or "No authorization code received."
-            body = f"<html><body><h3>Sign-in failed</h3><p>{reason}</p></body></html>"
-            self.wfile.write(body.encode("utf-8"))
+            if description:
+                reason = f"{reason}: {description}"
+            # Every reflected value comes from the redirecting server: escape it.
+            self._respond("Sign-in failed", html.escape(reason))
             if not self.result_future.done():
                 self.result_future.set_exception(
-                    RuntimeError(f"MCP OAuth authorization failed: {reason}")
+                    McpOAuthError(f"MCP OAuth sign-in failed: {reason}")
                 )
-        else:
-            body = (
-                "<html><body><h3>Signed in</h3>"
-                "<p>You can close this tab and return to Omnigent.</p></body></html>"
-            )
-            self.wfile.write(body.encode("utf-8"))
-            if not self.result_future.done():
-                self.result_future.set_result((code, state))
+            return
+        self._respond("Signed in", "You can close this tab and return to Omnigent.")
+        if not self.result_future.done():
+            self.result_future.set_result((code, state))
+
+    def _respond(self, title: str, message_html: str) -> None:
+        body = f"<html><body><h3>{title}</h3><p>{message_html}</p></body></html>"
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Security-Policy", "default-src 'none'")
+        self.end_headers()
+        self.wfile.write(body.encode("utf-8"))
 
     def log_message(self, format: str, *args: object) -> None:
-        # Silence BaseHTTPRequestHandler's default stderr access log —
-        # this is a one-shot local listener, not a service worth logging.
+        # One-shot local listener; the default stderr access log is noise.
         pass
 
 
-def _start_callback_server() -> tuple[HTTPServer, Future[tuple[str, str | None]]]:
-    """Bind an ephemeral loopback listener for the OAuth redirect.
+class _CallbackListener:
+    """A loopback HTTP listener that receives one OAuth redirect.
 
-    Binds on an OS-assigned port (``0``) — the real port is only known
-    after this returns, via ``server.server_address[1]``. Callers that
-    already promised a specific ``redirect_uri`` to the auth server (e.g.
-    in a dynamic client registration request) need to patch that port in
-    after the fact; see :func:`_with_redirect_uri_port` in
-    :func:`build_oauth_client_provider`.
-
-    :returns: ``(server, result_future)`` — *result_future* resolves with
-        ``(code, state)`` once the browser hits the callback, or raises
-        if the auth server reported an error.
+    :param preferred_port: Port to try first, e.g. the one in the
+        registered redirect URI; falls back to an OS-assigned port when it
+        is ``None`` or already taken.
     """
-    result_future: Future[tuple[str, str | None]] = Future()
-    handler_cls = type(
-        "_BoundOAuthCallbackHandler",
-        (_OAuthCallbackHandler,),
-        {"result_future": result_future},
-    )
-    server = HTTPServer(("127.0.0.1", 0), handler_cls)
-    thread = threading.Thread(
-        target=server.handle_request, name="omnigent-mcp-oauth-callback", daemon=True
-    )
-    thread.start()
-    return server, result_future
+
+    def __init__(self, preferred_port: int | None = None) -> None:
+        self.result: Future[tuple[str, str | None]] = Future()
+        handler_cls = type(
+            "_BoundOAuthCallbackHandler",
+            (_OAuthCallbackHandler,),
+            {"result_future": self.result},
+        )
+        self._server = _bind_http_server(handler_cls, preferred_port)
+        self._thread = threading.Thread(
+            target=self._server.serve_forever,
+            kwargs={"poll_interval": 0.1},
+            name="omnigent-mcp-oauth-callback",
+            daemon=True,
+        )
+        self._thread.start()
+
+    @property
+    def port(self) -> int:
+        return int(self._server.server_address[1])
+
+    @property
+    def redirect_uri(self) -> str:
+        return f"http://{_CALLBACK_HOST}:{self.port}{_CALLBACK_PATH}"
+
+    def close(self) -> None:
+        """Stop serving and release the port (blocks up to one poll interval)."""
+        self._server.shutdown()
+        self._server.server_close()
+        if not self.result.done():
+            self.result.cancel()
 
 
-def _with_redirect_uri_port(authorization_url: str, port: int) -> str:
-    """Patch the ``redirect_uri`` query param's port in an authorization URL.
+def _bind_http_server(
+    handler_cls: type[BaseHTTPRequestHandler], preferred_port: int | None
+) -> HTTPServer:
+    if preferred_port:
+        try:
+            return HTTPServer((_CALLBACK_HOST, preferred_port), handler_cls)
+        except OSError:
+            _logger.debug("MCP OAuth callback port %d is busy; using another", preferred_port)
+    return HTTPServer((_CALLBACK_HOST, 0), handler_cls)
 
-    The client is registered with a placeholder ``redirect_uris`` entry
-    (the real loopback port isn't known until the callback listener
-    actually binds, which happens lazily — see
-    :func:`build_oauth_client_provider`), so the authorization request the
-    SDK builds initially carries that placeholder. RFC 8252 §7.3 expects
-    exactly this: authorization servers supporting native/loopback clients
-    must tolerate the redirect URI's port varying from what was
-    registered, since a native app cannot know it in advance.
 
-    :param authorization_url: The full authorization URL the SDK built.
-    :param port: The actual bound loopback port.
-    :returns: *authorization_url* with its ``redirect_uri`` param's port
-        replaced by *port*; unchanged if there was no ``redirect_uri`` param.
+def _registered_loopback_port(client_info: OAuthClientInformationFull | None) -> int | None:
+    """The port of a stored client's registered loopback redirect URI, if any.
+
+    Reusing it keeps the redirect URI identical to the registered one, which
+    servers that don't allow loopback port variance (RFC 8252 §7.3) require.
     """
-    parsed = urlparse(authorization_url)
-    params = parse_qs(parsed.query, keep_blank_values=True)
-    redirect_uris = params.get("redirect_uri")
-    if not redirect_uris:
-        return authorization_url
-    redirect_parsed = urlparse(redirect_uris[0])
-    patched_redirect = redirect_parsed._replace(netloc=f"{redirect_parsed.hostname}:{port}")
-    params["redirect_uri"] = [urlunparse(patched_redirect)]
-    return urlunparse(parsed._replace(query=urlencode(params, doseq=True)))
+    if client_info is None or not client_info.redirect_uris:
+        return None
+    registered = urlparse(str(client_info.redirect_uris[0]))
+    if registered.hostname != _CALLBACK_HOST or registered.path != _CALLBACK_PATH:
+        return None
+    return registered.port
 
 
-def build_oauth_client_provider(config: MCPServerConfig) -> OAuthClientProvider | None:
-    """Build an :class:`OAuthClientProvider` for *config*, or ``None``.
+def _browser_available() -> bool:
+    """Whether this process can show a browser to the person using it.
 
-    Returns ``None`` when ``config.oauth`` is not set, so callers can
-    unconditionally do ``auth = build_oauth_client_provider(config)`` and
-    pass the result straight into ``streamablehttp_client``/``sse_client``'s
-    ``auth=`` kwarg.
+    On Linux and other X11/Wayland systems a browser needs a display; without
+    one, :func:`webbrowser.open` may start a console browser nobody can see.
+    An explicit ``BROWSER`` setting is trusted.
+    """
+    if os.environ.get("BROWSER"):
+        return True
+    if sys.platform in ("darwin", "win32"):
+        return True
+    return bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
 
-    The returned provider handles everything from here: on first use it
-    discovers the auth server (RFC 8414/9728), registers a dynamic client
-    (RFC 7591) if needed, opens the user's browser for authorization_code +
-    PKCE consent, and stores the resulting tokens via
-    :class:`OmnigentOAuthTokenStorage`. On subsequent connections it reuses
-    the stored tokens and refreshes them transparently (including on a
-    live 401), so most runs never touch the browser at all.
 
-    :param config: The MCP server config declaring ``oauth: True``.
-    :returns: A configured provider, or ``None`` if OAuth isn't enabled
-        for this server.
+def _open_browser(url: str) -> bool:
+    """Open *url* in the user's browser; ``False`` if that isn't possible."""
+    if not _browser_available():
+        return False
+    try:
+        return bool(webbrowser.open(url, new=2))
+    except webbrowser.Error:
+        return False
+
+
+class OmnigentOAuthClientProvider(OAuthClientProvider):
+    """The SDK's OAuth provider, adjusted for loopback sign-in and refresh.
+
+    Adds three behaviours on top of :class:`OAuthClientProvider`:
+
+    - Restores the stored token's expiry and discovered metadata on first
+      use, so an expired token is refreshed (at the right token endpoint)
+      rather than sent and rejected.
+    - On a 401, tries the stored refresh token before a browser sign-in.
+    - Binds the loopback callback listener as soon as a sign-in is
+      unavoidable and sets its URI in the client metadata, which the SDK
+      then uses for registration, authorization and token exchange alike.
+
+    :param server_name: The MCP server's configured name, for messages.
+    :param server_url: The MCP server URL.
+    :param storage: Token storage for this server.
+    """
+
+    def __init__(
+        self,
+        server_name: str,
+        server_url: str,
+        storage: OmnigentOAuthTokenStorage,
+    ) -> None:
+        client_metadata = OAuthClientMetadata(
+            # Replaced by the bound listener's URI before the SDK reads it.
+            redirect_uris=[AnyUrl(f"http://{_CALLBACK_HOST}{_CALLBACK_PATH}")],
+            client_name="Omnigent",
+            grant_types=["authorization_code", "refresh_token"],
+            response_types=["code"],
+            token_endpoint_auth_method="none",
+        )
+        super().__init__(
+            server_url=server_url,
+            client_metadata=client_metadata,
+            storage=storage,
+            redirect_handler=self._open_authorization_url,
+            callback_handler=self._wait_for_callback,
+            timeout=_CALLBACK_TIMEOUT_SECONDS,
+        )
+        self._server_name = server_name
+        self._storage = storage
+        self._listener: _CallbackListener | None = None
+        storage.attach(self.context)
+
+    async def _initialize(self) -> None:
+        await super()._initialize()
+        # The SDK loads the tokens but not when they expire, so it would
+        # treat an expired token as valid and never refresh it up front.
+        self.context.token_expiry_time = self._storage.expires_at
+        if self.context.oauth_metadata is None:
+            self.context.oauth_metadata = self._storage.oauth_metadata
+        if self.context.protected_resource_metadata is None:
+            self.context.protected_resource_metadata = self._storage.protected_resource_metadata
+
+    async def _handle_refresh_response(self, response: httpx.Response) -> bool:
+        previous = self.context.current_tokens
+        previous_refresh_token = previous.refresh_token if previous else None
+        refreshed = await super()._handle_refresh_response(response)
+        tokens = self.context.current_tokens
+        if (
+            refreshed
+            and tokens is not None
+            and not tokens.refresh_token
+            and previous_refresh_token
+        ):
+            # RFC 6749 §6: a refresh response may omit refresh_token, in which
+            # case the one just used stays valid; keep it for the next refresh.
+            self.context.current_tokens = tokens.model_copy(
+                update={"refresh_token": previous_refresh_token}
+            )
+            await self._storage.set_tokens(self.context.current_tokens)
+        return refreshed
+
+    async def async_auth_flow(
+        self, request: httpx.Request
+    ) -> AsyncGenerator[httpx.Request, httpx.Response]:
+        """Run the SDK's flow, adding refresh-on-401 and the callback listener.
+
+        Relays every request and response between httpx and the SDK's
+        generator; only the first response to *request* itself is acted on.
+        """
+        flow = super().async_auth_flow(request)
+        listener: _CallbackListener | None = None
+        handled_first_response = False
+        try:
+            outgoing = await flow.__anext__()
+            while True:
+                response = yield outgoing
+                if outgoing is request and not handled_first_response:
+                    handled_first_response = True
+                    if response.status_code == 401 and self.context.can_refresh_token():
+                        refresh_response = yield await self._refresh_token()
+                        if await self._handle_refresh_response(refresh_response):
+                            self._add_auth_header(request)
+                            response = yield request
+                    if response.status_code in (401, 403):
+                        # The SDK signs in again next (a 403 may ask for more scope).
+                        listener = self._open_callback_listener()
+                try:
+                    outgoing = await flow.asend(response)
+                except StopAsyncIteration:
+                    return
+        finally:
+            await flow.aclose()
+            if listener is not None:
+                self._listener = None
+                # Synchronous so cancellation can't skip it; blocks ≤ one poll.
+                listener.close()
+
+    def _open_callback_listener(self) -> _CallbackListener:
+        listener = _CallbackListener(_registered_loopback_port(self.context.client_info))
+        self._listener = listener
+        self.context.client_metadata.redirect_uris = [AnyUrl(listener.redirect_uri)]
+        return listener
+
+    async def _open_authorization_url(self, authorization_url: str) -> None:
+        if not _open_browser(authorization_url):
+            raise McpOAuthError(
+                f"MCP server {self._server_name!r} needs a browser sign-in, but Omnigent "
+                "can't open a browser where it is running (for example a remote or "
+                "headless server). OAuth sign-in currently needs Omnigent and your browser "
+                "on the same machine: run the agent locally, or replace "
+                "'auth: {type: oauth}' with a static 'Authorization' header for this server."
+            )
+        _logger.info("MCP server %r requires sign-in; opened the browser", self._server_name)
+        print(
+            f"\nSign in to connect the '{self._server_name}' MCP server. "
+            f"If your browser didn't open, visit:\n  {authorization_url}\n"
+        )
+
+    async def _wait_for_callback(self) -> tuple[str, str | None]:
+        listener = self._listener
+        if listener is None:
+            raise McpOAuthError(
+                f"MCP server {self._server_name!r}: no sign-in callback listener is running"
+            )
+        try:
+            return await asyncio.wait_for(
+                asyncio.wrap_future(listener.result), timeout=_CALLBACK_TIMEOUT_SECONDS
+            )
+        except TimeoutError:
+            raise McpOAuthError(
+                f"Timed out after {int(_CALLBACK_TIMEOUT_SECONDS // 60)} minutes waiting for "
+                f"the browser sign-in to MCP server {self._server_name!r}; reconnect to try again."
+            ) from None
+
+
+def find_oauth_error(exc: BaseException) -> McpOAuthError | None:
+    """Return the :class:`McpOAuthError` behind *exc*, if there is one.
+
+    The MCP transports run requests in task groups, so a sign-in failure
+    reaches the caller wrapped in an exception group.
+    """
+    if isinstance(exc, McpOAuthError):
+        return exc
+    # A 3.11+ builtin (we require 3.12); ruff's py310 target misflags it.
+    if isinstance(exc, BaseExceptionGroup):  # noqa: F821
+        for inner in exc.exceptions:
+            found = find_oauth_error(inner)
+            if found is not None:
+                return found
+    return None
+
+
+def oauth_server_key(url: str) -> str:
+    """Storage key for *url*'s tokens: stable for as long as the URL is."""
+    return hashlib.sha256(url.encode("utf-8")).hexdigest()[:16]
+
+
+def build_oauth_client_provider(config: MCPServerConfig) -> OmnigentOAuthClientProvider | None:
+    """Build an OAuth provider for *config*, or ``None`` if OAuth is off.
+
+    Callers can pass the result straight to ``streamablehttp_client`` /
+    ``sse_client``'s ``auth=`` argument. Building one per connection is
+    cheap: tokens, expiry and discovered metadata are loaded from storage
+    on first use.
+
+    :param config: The MCP server config.
+    :returns: A provider when ``config.oauth`` is set, else ``None``.
+    :raises McpOAuthError: If OAuth is on but the URL is missing or isn't
+        https (or loopback http).
     """
     if not config.oauth:
         return None
     if config.url is None:
-        raise RuntimeError(f"MCP server {config.name!r} has oauth=True but no url set")
-
-    # Keyed by the server URL alone (not the full connection-pooling hash
-    # `omnigent.runner.mcp_manager.compute_server_hash` uses, which this
-    # module can't import without a circular dependency) — token identity
-    # only needs to be stable across reconnects to the same real endpoint;
-    # it doesn't need to change when unrelated fields like `timeout` do.
-    server_key = hashlib.sha256(config.url.encode("utf-8")).hexdigest()[:16]
-    storage = OmnigentOAuthTokenStorage(server_key)
-
-    # The listener binds lazily, inside `redirect_handler` — which
-    # `OAuthClientProvider` only calls when a fresh browser sign-in is
-    # actually needed (no valid stored token to reuse or refresh). Binding
-    # a real socket + thread on every connection attempt, most of which
-    # never need one, would leak a listener each time the stored token
-    # was simply reused. `_pending` is how `callback_handler` learns what
-    # `redirect_handler` bound, since the SDK calls them as two separate
-    # awaits rather than passing state between them itself.
-    _pending: dict[str, tuple[HTTPServer, Future[tuple[str, str | None]]]] = {}
-
-    async def redirect_handler(authorization_url: str) -> None:
-        server, result_future = _start_callback_server()
-        _pending["server"] = (server, result_future)
-        port = server.server_address[1]
-        # The client was registered with a placeholder redirect_uri (the
-        # real port wasn't known yet); patch it into the actual
-        # authorization request now that the listener is bound. Loopback
-        # port variance is expected by spec — see _with_redirect_uri_port.
-        authorization_url = _with_redirect_uri_port(authorization_url, port)
-        _logger.info(
-            "MCP server %r requires sign-in — opening browser: %s", config.name, authorization_url
-        )
-        print(f"\nSign in to connect the '{config.name}' MCP server:\n  {authorization_url}\n")
-        # Best-effort: webbrowser.open() safely returns False (never raises)
-        # when no display/browser is available, e.g. a headless runner —
-        # the printed URL above is the fallback for that case.
-        webbrowser.open(authorization_url)
-
-    async def callback_handler() -> tuple[str, str | None]:
-        server, result_future = _pending["server"]
-        try:
-            return await asyncio.wait_for(
-                asyncio.wrap_future(result_future), timeout=_CALLBACK_TIMEOUT_SECONDS
-            )
-        finally:
-            server.server_close()
-
-    client_metadata = OAuthClientMetadata(
-        # Placeholder — the real loopback port isn't known until
-        # redirect_handler binds the listener (patched in there via
-        # _with_redirect_uri_port). Pydantic just needs a syntactically
-        # valid entry to build the initial authorization request.
-        redirect_uris=["http://127.0.0.1:0/callback"],  # type: ignore[arg-type]
-        client_name="Omnigent",
-        grant_types=["authorization_code", "refresh_token"],
-        response_types=["code"],
-        token_endpoint_auth_method="none",
-    )
-
-    return OAuthClientProvider(
-        server_url=config.url,
-        client_metadata=client_metadata,
-        storage=storage,
-        redirect_handler=redirect_handler,
-        callback_handler=callback_handler,
-        timeout=_CALLBACK_TIMEOUT_SECONDS,
-    )
+        raise McpOAuthError(f"MCP server {config.name!r} has auth type 'oauth' but no url")
+    problem = mcp_oauth_url_problem(config.url)
+    if problem is not None:
+        raise McpOAuthError(f"MCP server {config.name!r} auth type 'oauth': the url {problem}")
+    storage = OmnigentOAuthTokenStorage(oauth_server_key(config.url))
+    return OmnigentOAuthClientProvider(config.name, config.url, storage)

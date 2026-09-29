@@ -2038,6 +2038,30 @@ async def test_http_connect_passes_oauth_provider_when_configured(
 
 
 @pytest.mark.asyncio()
+async def test_http_connect_refuses_oauth_over_cleartext_http() -> None:
+    """
+    A config that bypassed the parser (built in code, or an env var
+    expanded later) still can't send OAuth tokens over plain http to a
+    non-loopback host: connect() fails before any request is made.
+    """
+    from omnigent.tools.mcp_oauth import McpOAuthError
+
+    config = MCPServerConfig(
+        name="test-http-oauth-cleartext",
+        url="http://mcp.example.com/mcp",
+        oauth=True,
+    )
+
+    with _mock_http_transport() as captured:
+        conn = McpServerConnection(config=config)
+        with pytest.raises(McpOAuthError, match="plain http"):
+            await conn.connect()
+
+    assert "auth" not in captured.transport_kwargs
+    await conn.close()
+
+
+@pytest.mark.asyncio()
 async def test_http_connect_passes_none_auth_when_oauth_not_configured() -> None:
     """
     HTTP ``connect()`` passes ``auth=None`` when ``config.oauth`` is not
