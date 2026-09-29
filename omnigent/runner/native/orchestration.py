@@ -55,7 +55,7 @@ from omnigent.entities.session_resources import (
     session_resource_view_to_dict,
     terminal_resource_id,
 )
-from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.errors import ErrorCategory, ErrorCode, ErrorImpact, ErrorPhase, OmnigentError
 from omnigent.harness_plugins import native_provider_for_key
 from omnigent.models.model_override import validate_model_override
 from omnigent.native.native_coding_agents import (
@@ -940,11 +940,10 @@ def _kiro_session_workspace(session_workspace: str | None) -> Path:
     return Path(raw.strip()).expanduser().resolve()
 
 
-# A runner->server ``GET /v1/sessions/<id>`` launch-config read that times out
-# under load is a transient upstream condition, not an Omnigent defect. Left
-# un-retried it fails Codex terminal launch, ensure, and the next turn from one
-# blip; a bounded retry rides it out (the read is idempotent) before surfacing
-# a hard error, so genuinely-broken cases still fail loud.
+# A runner->server ``GET /v1/sessions/<id>`` launch-config read can time out
+# under load. Left un-retried it fails Codex terminal launch, ensure, and the
+# next turn from one blip; a bounded retry rides it out (the read is idempotent)
+# before surfacing a server-attributed hard error, so persistent cases fail loud.
 _LAUNCH_CONFIG_FETCH_TIMEOUT_S = 10.0
 _LAUNCH_CONFIG_FETCH_ATTEMPTS = 3
 _LAUNCH_CONFIG_FETCH_BACKOFF_BASE_S = 0.5
@@ -975,6 +974,30 @@ def _launch_config_fetch_is_transient(exc: httpx.HTTPError) -> bool:
 async def _launch_config_retry_sleep(delay: float) -> None:
     """Sleep between launch-config fetch attempts (patched to a no-op in tests)."""
     await asyncio.sleep(delay)
+
+
+class NativeLaunchConfigUnavailableError(OmnigentError, RuntimeError):
+    """The Omnigent server could not serve a native terminal's launch config.
+
+    Raised once bounded retries of ``GET /v1/sessions/<id>`` are exhausted, or
+    when the server answers with a 5xx or a malformed body. Attributed to the
+    server as a blocking harness-setup failure so startup-reliability signals
+    count it as a platform fault. Subclasses :class:`RuntimeError` so existing
+    callers that catch that keep working.
+    """
+
+    def __init__(self, message: str) -> None:
+        """
+        :param message: Human-readable failure, e.g.
+            ``"Could not fetch Codex launch config for 'conv_abc123'."``.
+        """
+        super().__init__(
+            message,
+            code=ErrorCode.INTERNAL_ERROR,
+            category=ErrorCategory.SERVER,
+            impact=ErrorImpact.BLOCKING,
+            phase=ErrorPhase.HARNESS_SETUP,
+        )
 
 
 # Metadata reads do not need transcript, liveness, or subtree-usage aggregation.
@@ -1022,10 +1045,13 @@ async def _fetch_native_launch_snapshot(
                 path, params=_SESSION_METADATA_PARAMS, timeout=_LAUNCH_CONFIG_FETCH_TIMEOUT_S
             )
         except httpx.HTTPError as exc:
-            if last_attempt or not _launch_config_fetch_is_transient(exc):
-                raise RuntimeError(
-                    f"Could not fetch {runtime_label} launch config for {session_id!r}."
-                ) from exc
+            transient = _launch_config_fetch_is_transient(exc)
+            if last_attempt or not transient:
+                message = f"Could not fetch {runtime_label} launch config for {session_id!r}."
+                # Exhausted timeouts/disconnects mean our server never answered.
+                if transient:
+                    raise NativeLaunchConfigUnavailableError(message) from exc
+                raise RuntimeError(message) from exc
             _logger.warning(
                 "Transient %s launch-config fetch error (attempt %d/%d) for "
                 "session=%s; retrying: %s",
@@ -1040,10 +1066,13 @@ async def _fetch_native_launch_snapshot(
             if resp.status_code == 200:
                 break
             if last_attempt or resp.status_code not in _LAUNCH_CONFIG_RETRYABLE_STATUS:
-                raise RuntimeError(
+                message = (
                     f"Could not fetch {runtime_label} launch config for {session_id!r}: "
                     f"GET /v1/sessions returned {resp.status_code}."
                 )
+                if resp.status_code >= 500 or resp.status_code in _LAUNCH_CONFIG_RETRYABLE_STATUS:
+                    raise NativeLaunchConfigUnavailableError(message)
+                raise RuntimeError(message)
             _logger.warning(
                 "Transient %s launch-config fetch status %d (attempt %d/%d) for "
                 "session=%s; retrying",
@@ -1063,11 +1092,11 @@ async def _fetch_native_launch_snapshot(
     try:
         snapshot = resp.json()
     except ValueError as exc:
-        raise RuntimeError(
+        raise NativeLaunchConfigUnavailableError(
             f"Could not fetch {runtime_label} launch config for {session_id!r}: invalid JSON."
         ) from exc
     if not isinstance(snapshot, dict):
-        raise RuntimeError(
+        raise NativeLaunchConfigUnavailableError(
             f"Could not fetch {runtime_label} launch config for {session_id!r}: "
             "snapshot was not a JSON object."
         )
@@ -7473,6 +7502,8 @@ def _native_terminal_start_failure_cause(exc: BaseException) -> str:
             detail = f"{detail} {errno_name}"
         return f"{class_name} {detail}"
     if isinstance(exc, OmnigentError):
+        if exc.__cause__ is not None:
+            return f"{class_name} code {exc.code} (cause {type(exc.__cause__).__name__})"
         return f"{class_name} code {exc.code}"
     if exc.__cause__ is not None:
         return f"{class_name} (cause {type(exc.__cause__).__name__})"

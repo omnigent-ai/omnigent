@@ -9,6 +9,7 @@ function with a stub async client returning controlled snapshots.
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Awaitable, Callable
 from typing import Any
 
@@ -16,6 +17,7 @@ import httpx
 import pytest
 
 import omnigent.runner.native.orchestration as _orchestration
+from omnigent import debug_logging
 from omnigent.runner.app import _codex_native_launch_config
 
 
@@ -348,3 +350,51 @@ async def test_non_transient_transport_error_fails_without_retry(
         await _codex_native_launch_config(session_id="conv_1", server_client=client)
     assert client.calls == 1, "A non-transient error should not be retried."
     assert retry_sleeps == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "actions",
+    [
+        pytest.param([httpx.ReadTimeout("slow")] * 3, id="persistent-read-timeout"),
+        pytest.param([_Resp(503, None)] * 3, id="persistent-503"),
+        pytest.param([_Resp(500, None)], id="internal-500"),
+    ],
+)
+async def test_server_side_launch_config_failure_is_server_blocking(
+    actions: list[Any],
+) -> None:
+    """A server that never serves the launch config is a blocking platform fault.
+
+    Startup-reliability KPIs count a ``terminal_start_failed`` row as a platform
+    failure only when it carries a server/host/runner category and blocking
+    impact; the debug-log sink reads both off the raised exception.
+    """
+    client = _SequenceClient(actions)
+    with pytest.raises(_orchestration.NativeLaunchConfigUnavailableError) as info:
+        await _codex_native_launch_config(session_id="conv_1", server_client=client)
+    assert isinstance(info.value, RuntimeError), (
+        "Existing RuntimeError callers must still catch it."
+    )
+    record = logging.LogRecord(
+        "omnigent.runner",
+        logging.ERROR,
+        __file__,
+        0,
+        "failed",
+        None,
+        (type(info.value), info.value, info.value.__traceback__),
+    )
+    attrs = debug_logging._attributes(record, "runner")
+    assert attrs["error_category"] == "server"
+    assert attrs["error_impact"] == "blocking"
+    assert attrs["error_phase"] == "harness_setup"
+
+
+@pytest.mark.asyncio
+async def test_client_side_launch_config_failure_stays_unattributed() -> None:
+    """A 404 (e.g. a session deleted mid-launch) is not claimed as a server fault."""
+    client = _SequenceClient([_Resp(404, None)])
+    with pytest.raises(RuntimeError) as info:
+        await _codex_native_launch_config(session_id="conv_1", server_client=client)
+    assert not isinstance(info.value, _orchestration.NativeLaunchConfigUnavailableError)
