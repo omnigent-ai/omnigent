@@ -32,7 +32,6 @@ on:
       - 'omnigent/**'
       - 'web/**'
       - 'sdks/**'
-      - 'examples/**'
       - 'pyproject.toml'
       - 'setup.py'
       - 'uv.lock'
