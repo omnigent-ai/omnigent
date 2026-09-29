@@ -305,7 +305,7 @@ importers:
         specifier: ^0.4.6
         version: 0.4.6(react-dom@18.3.1(react@18.3.1))(react@18.3.1)
       pdfjs-dist:
-        specifier: ^4.8.69
+        specifier: 4.8.69
         version: 4.8.69
       qrcode.react:
         specifier: ^4.2.0
@@ -492,6 +492,9 @@ importers:
       electron-builder:
         specifier: ^26.0.0
         version: 26.15.3(electron-builder-squirrel-windows@26.15.3)(supports-color@10.2.2)
+      jsdom:
+        specifier: ^29.1.1
+        version: 29.1.1(@noble/hashes@2.2.0)(canvas@3.2.3)
       playwright:
         specifier: ^1.62.1
         version: 1.62.1

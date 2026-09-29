@@ -133,7 +133,7 @@ async def _register_routes(
         # Neutralize agent discovery so only the stubbed Claude agent feeds the
         # picker. On the shared e2e_ui server, sessions other tests left behind
         # would otherwise leak in as discovered custom agents — flipping the
-        # picker's "Custom agents" group on and folding "Create custom agent"
+        # picker's custom-agent "Other..." group on and folding "Create custom agent"
         # into a submenu, so the top-level create row this test clicks is absent.
         await route.fulfill(
             status=200,
@@ -167,7 +167,7 @@ async def _open_create_agent(page) -> None:
     """Open the agent picker and click "Create custom agent".
 
     With no custom agents registered, the create action is a top-level row in
-    the picker (it only folds into a "Custom agents" submenu once custom agents
+    the picker (it only folds into an "Other..." submenu once custom agents
     exist), so open the dropdown and click the create item directly.
     """
     await page.get_by_test_id("new-chat-landing-agent-select").click()

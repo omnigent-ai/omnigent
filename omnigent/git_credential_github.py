@@ -89,7 +89,11 @@ def _credential_url(server: str, host_id: str) -> str:
 
 
 def _fetch(server: str, host_id: str, host_token: str) -> dict | None:
-    """Fetch the credential endpoint JSON, or ``None`` on any failure."""
+    """Fetch the credential endpoint JSON, or ``None`` if the result is inconclusive.
+
+    Only the server's explicit no-provider 404 maps to ``connected: false``.
+    A generic 404 from a proxy or missing route must not enable shared credentials.
+    """
     try:
         resp = httpx.get(
             _credential_url(server, host_id),
@@ -98,15 +102,19 @@ def _fetch(server: str, host_id: str, host_token: str) -> dict | None:
         )
     except httpx.HTTPError:
         return None
-    if resp.status_code != 200:
+    if resp.status_code not in (200, 404):
         return None
     try:
         data = resp.json()
     except ValueError:
         return None
-    # Guard non-object JSON (a top-level list/string) so callers' ``data.get(...)``
-    # can't raise — keeps the broker fetch's "never raises" contract honest.
-    return data if isinstance(data, dict) else None
+    if not isinstance(data, dict):
+        return None
+    if resp.status_code == 404:
+        if data.get("detail") != "unknown credential provider":
+            return None
+        return {"connected": False}
+    return data
 
 
 def _fetch_credential(server: str, host_id: str, host_token: str) -> tuple[str, str] | None:
@@ -363,13 +371,14 @@ def configure_clone_credentials(server_url: str, host_id: str) -> bool:
     a shared-token clone still works for them.
 
     Fails closed on an ambiguous probe: :func:`_fetch` returns ``None`` on any
-    transient fault (timeout, non-200, bad JSON), which is indistinguishable from
+    transient fault (timeout, 5xx, bad JSON), which is indistinguishable from
     "not linked". Treating that as unlinked would silently clone a *linked*
     owner's private repo under the shared image identity, defeating the per-user
-    contract. So only a **successful** ``connected: false`` keeps the shared
-    fallback; a connected owner — or an unresolved probe — installs the broker,
-    so the clone authenticates per-user or fails visibly instead of quietly
-    falling back to the shared token. Best-effort: never raises.
+    contract. So only a **definitive** negative — a ``connected: false``, or the
+    endpoint's explicit 404 "unknown credential provider" — keeps the shared fallback; a
+    connected owner — or an unresolved probe — installs the broker, so the clone
+    authenticates per-user or fails visibly instead of quietly falling back to
+    the shared token. Best-effort: never raises.
 
     :returns: ``True`` when the broker was wired (owner connected, or the probe
         was inconclusive); ``False`` only when the owner is confirmed not linked.

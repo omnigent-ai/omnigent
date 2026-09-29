@@ -8,7 +8,7 @@
 import { act, cleanup, render, renderHook, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider, QueryObserver } from "@tanstack/react-query";
 import { MemoryRouter, useNavigate } from "react-router-dom";
-import type { ReactNode } from "react";
+import type { ContextType, ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
@@ -22,22 +22,33 @@ import type { ConversationsInfiniteData } from "@/lib/sessionListCache";
 // Mock the socket transport so setWatched is observable and start/stop are
 // inert. subscribe/subscribeStatus return no-op unsubscribers.
 const setWatched = vi.fn();
+const start = vi.fn();
 const subscribe = vi.fn((_fn: () => void) => () => {});
 vi.mock("@/lib/sessionUpdatesSocket", () => ({
   sessionUpdatesSocket: {
-    start: vi.fn(),
+    start: (...args: unknown[]) => start(...args),
     stop: vi.fn(),
     setWatched: (...args: unknown[]) => setWatched(...args),
     subscribe: (fn: () => void) => subscribe(fn),
   },
 }));
 
-import { SidebarDataProvider, useSidebarView } from "./useSidebarData";
+import { SidebarDataContext, SidebarDataProvider, useSidebarView } from "./useSidebarData";
 import { useCanEdit } from "./usePermissions";
 import { sidebarConfig } from "@/lib/sidebarConfig";
 import { SessionUpdatesProvider } from "./SessionUpdatesProvider";
 import { useSaveProjectOrder } from "./useProjectOrder";
 import * as projectsApi from "@/lib/projectsApi";
+
+type SidebarDataValue = NonNullable<ContextType<typeof SidebarDataContext>>;
+const identityPendingSidebarData = {
+  identityReady: false,
+  watchedIds: ["conv_a"],
+} as unknown as SidebarDataValue;
+const identityReadySidebarData = {
+  ...identityPendingSidebarData,
+  identityReady: true,
+};
 
 function conv(id: string): Conversation {
   return {
@@ -97,6 +108,7 @@ function lastWatched(): string[] {
 
 beforeEach(() => {
   setWatched.mockClear();
+  start.mockClear();
   subscribe.mockClear();
 });
 
@@ -106,6 +118,33 @@ afterEach(() => {
 });
 
 describe("SessionUpdatesProvider watch-set", () => {
+  it("waits for sidebar identity before starting session updates", () => {
+    const client = new QueryClient();
+    seedConversations(client, ["conv_a"]);
+
+    const { rerender } = render(
+      <QueryClientProvider client={client}>
+        <MemoryRouter>
+          <SidebarDataContext.Provider value={identityPendingSidebarData}>
+            <SessionUpdatesProvider>{null}</SessionUpdatesProvider>
+          </SidebarDataContext.Provider>
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+    expect(start).not.toHaveBeenCalled();
+
+    rerender(
+      <QueryClientProvider client={client}>
+        <MemoryRouter>
+          <SidebarDataContext.Provider value={identityReadySidebarData}>
+            <SessionUpdatesProvider>{null}</SessionUpdatesProvider>
+          </SidebarDataContext.Provider>
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+    expect(start).toHaveBeenCalledOnce();
+  });
+
   it("watches the cached sidebar ids when no session is open", () => {
     const client = new QueryClient();
     seedConversations(client, ["conv_a", "conv_b"]);

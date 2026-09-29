@@ -363,4 +363,28 @@ describe("<ReconnectSessionDialog />", () => {
     );
     expect(screen.queryByTestId("reconnect-session-dialog")).toBeNull();
   });
+
+  it("shows the failed local reconnect with an accessible error and retry", () => {
+    const onReconnect = vi.fn();
+    renderDialog({
+      localReconnect: {
+        reconnecting: false,
+        error: "Finish signing in, then try again.",
+        onReconnect,
+      },
+    });
+    expect(screen.getByRole("alert")).toHaveTextContent("Finish signing in");
+    expect(screen.getByTestId("reconnect-session-command")).toHaveTextContent("omnigent host");
+    fireEvent.click(screen.getByRole("button", { name: "Retry reconnect" }));
+    expect(onReconnect).toHaveBeenCalledOnce();
+  });
+
+  it("disables retry while reconnecting", () => {
+    renderDialog({
+      localReconnect: { reconnecting: true, error: null, onReconnect: vi.fn() },
+    });
+    const button = screen.getByRole("button", { name: "Reconnecting this machine…" });
+    expect(button).toBeDisabled();
+    expect(button).toHaveAttribute("aria-busy", "true");
+  });
 });

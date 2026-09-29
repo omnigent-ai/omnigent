@@ -174,10 +174,10 @@ import secrets
 import time
 import uuid
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from dataclasses import field as dataclass_field
 from functools import partial
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import click
 from fastapi import HTTPException
@@ -189,7 +189,7 @@ from omnigent.onboarding.sandboxes.base import SandboxGoneError
 # RepoWorkspace lives in the launcher's own package so a launcher can accept it
 # without importing omnigent.server; re-exported here (its parser is here) so
 # existing `from omnigent.server.managed_hosts import RepoWorkspace` keeps working.
-from omnigent.onboarding.sandboxes.types import RepoWorkspace
+from omnigent.onboarding.sandboxes.types import GitCloneOptions, RepoWorkspace
 from omnigent.stores.host_store import Host, HostStore
 
 if TYPE_CHECKING:
@@ -616,7 +616,12 @@ class ManagedSandboxConfig:
         :func:`omnigent.onboarding.sandboxes.base.render_host_config_write_command`.
         Non-secret by design: credentials stay behind
         ``api_key_ref: env:VAR`` indirection, resolved inside the
-        sandbox against its own environment.
+        sandbox against its own environment. Saved session inference settings
+        replace the current template's providers and bindings on restore.
+    :param model_discovery: Server-only catalog endpoints and credential references,
+        keyed by inference provider name. Never installed in the sandbox.
+    :param git_clone: Admin clone policy for fresh or missing repo checkouts.
+        Existing retained checkouts are not reconfigured.
     """
 
     server_url: str
@@ -625,6 +630,8 @@ class ManagedSandboxConfig:
     managed_launch_supported: bool = True
     provider: str | None = None
     host_config: dict[str, object] | None = None
+    model_discovery: dict[str, object] = dataclass_field(default_factory=dict)
+    git_clone: GitCloneOptions = dataclass_field(default_factory=GitCloneOptions)
 
 
 @dataclass(frozen=True)
@@ -786,14 +793,17 @@ class ManagedSandboxDeployment:
         ponytail: builds launchers on each call; memoize on the deployment only
         if /v1/info shows up hot (provider count is tiny, __init__ does no I/O).
 
-        :returns: ``{provider: {"multi_repo": bool}}`` for each launchable
-            provider, in configured order.
+        :returns: Capability flags for each launchable provider, in configured order.
         """
         caps: dict[str, dict[str, bool]] = {}
         for config in self.configs:
             if config.managed_launch_supported and config.provider is not None:
                 launcher = config.launcher_factory()
                 caps[config.provider] = {"multi_repo": launcher.capabilities.multi_repo}
+                from omnigent.inference_config import parse_inference_config
+
+                if parse_inference_config(config.host_config or {}):
+                    caps[config.provider]["inference_models"] = True
         return caps
 
 
@@ -1164,6 +1174,26 @@ def _apply_keep_warm(
     return merged
 
 
+def deployment_with_inference_snapshot(
+    deployment: ManagedSandboxDeployment, snapshot: dict[str, Any] | None
+) -> ManagedSandboxDeployment:
+    """Restore saved inference settings while retaining current sandbox lifecycle settings."""
+    from omnigent.inference_config import snapshot_runtime_config
+
+    runtime = snapshot_runtime_config(snapshot)
+    if runtime is None:
+        if not any((entry.host_config or {}).get("inference") for entry in deployment.configs):
+            return deployment
+        runtime = {"inference": {}}
+    return replace(
+        deployment,
+        configs=tuple(
+            replace(entry, host_config={**(entry.host_config or {}), **(runtime or {})})
+            for entry in deployment.configs
+        ),
+    )
+
+
 def _parse_host_config(raw: dict[str, object]) -> dict[str, object] | None:
     """
     Extract and validate the top-level ``sandbox.host_config`` block.
@@ -1198,6 +1228,10 @@ def _parse_host_config(raw: dict[str, object]) -> dict[str, object] | None:
     # validation here yet still ride to the sandbox, where the merge writes
     # `providers: null` over any existing block — the silent degradation this
     # parse exists to prevent.
+    from omnigent.inference_config import parse_inference_config, validate_inference_credentials
+
+    if parse_inference_config(host_config):
+        validate_inference_credentials(host_config)
     if "providers" in host_config:
         providers = host_config["providers"]
         # load_providers silently ignores a non-mapping providers value, so
@@ -1392,6 +1426,16 @@ def _parse_multi_provider_sandbox_config(
     return ManagedSandboxDeployment(configs=tuple(parsed), reaper=reaper)
 
 
+def _parse_git_clone_options(raw: object) -> GitCloneOptions:
+    if raw is None:
+        return GitCloneOptions()
+    if not isinstance(raw, dict):
+        raise ValueError("server config 'sandbox.git_clone' must be a mapping")
+    if raw.keys() - {"depth", "single_branch", "filter", "tags"}:
+        raise ValueError("sandbox.git_clone only accepts depth, single_branch, filter, and tags")
+    return GitCloneOptions(**raw)
+
+
 def _parse_single_provider_sandbox_config(raw: dict[str, object]) -> ManagedSandboxConfig:
     """
     Parse one provider's ``sandbox`` mapping (the scalar ``provider:`` shape).
@@ -1410,6 +1454,7 @@ def _parse_single_provider_sandbox_config(raw: dict[str, object]) -> ManagedSand
             f"server config 'sandbox.provider' must be one of: {supported} (got {provider!r})"
         )
     warm_pool = _parse_agent_sandbox_warm_pool(raw)
+    git_clone = _parse_git_clone_options(raw.get("git_clone"))
     server_url = raw.get("server_url")
     if not isinstance(server_url, str) or not server_url.strip():
         raise ValueError(
@@ -1419,6 +1464,24 @@ def _parse_single_provider_sandbox_config(raw: dict[str, object]) -> ManagedSand
     # Validated regardless of provider (like server_url): a malformed
     # host_config should stop startup even for staged/unsupported providers.
     host_config = _parse_host_config(raw)
+    model_discovery = raw.get("model_discovery", {})
+    if not isinstance(model_discovery, dict):
+        raise ValueError("sandbox.model_discovery must be a mapping")
+    for name, discovery in model_discovery.items():
+        if not isinstance(discovery, dict) or set(discovery) - {
+            "base_url",
+            "api_key_ref",
+            "auth_command",
+            "family",
+        }:
+            raise ValueError(f"Invalid sandbox.model_discovery entry {name!r}")
+        if not isinstance(discovery.get("base_url"), str):
+            raise ValueError(f"sandbox.model_discovery.{name} requires base_url")
+        if not (discovery.get("api_key_ref") or discovery.get("auth_command")):
+            raise ValueError(f"sandbox.model_discovery.{name} requires a credential reference")
+    from omnigent.inference_config import validate_inference_credentials
+
+    validate_inference_credentials({}, model_discovery)
     if provider == "agent_sandbox":
         host_config = _apply_keep_warm(host_config, _parse_keep_warm_s(raw))
     if provider == "modal":
@@ -1642,6 +1705,8 @@ def _parse_single_provider_sandbox_config(raw: dict[str, object]) -> ManagedSand
         ),
         provider=provider,
         host_config=host_config,
+        model_discovery=model_discovery,
+        git_clone=git_clone,
     )
 
 
@@ -3429,6 +3494,7 @@ async def launch_managed_host(
     """
     entry = _select_provider_config(config, provider)
     launcher = entry.launcher_factory()
+    repos = _apply_git_clone_options(launcher, repos, entry.git_clone)
     host_id = uuid.uuid4().hex
     # Visible label in the host picker; (owner, name) is the hosts
     # table PK, so embed the host_id's leading hex for uniqueness
@@ -3515,6 +3581,7 @@ async def relaunch_managed_host(
     # Stay on the host's provider so the new generation is armed with ITS
     # token TTL, not the deployment default's.
     entry = config.recorded(host.sandbox_provider)
+    repos = _apply_git_clone_options(launcher, repos, entry.git_clone)
     # The old generation is normally already dead (that is why we are
     # here), but terminate defensively so a transient tunnel outage
     # can never leave two live sandboxes claiming one host identity.
@@ -3554,6 +3621,25 @@ async def relaunch_managed_host(
             detail=f"managed sandbox relaunch conflicted with host lifecycle: {exc}",
         ) from exc
     return ManagedHostLaunch(host_id=host.host_id, workspace=workspace)
+
+
+def _apply_git_clone_options(
+    launcher: SandboxHostLauncher,
+    repos: Sequence[RepoWorkspace],
+    options: GitCloneOptions,
+) -> Sequence[RepoWorkspace]:
+    """Apply admin clone policy before provisioning or replacing any sandbox."""
+    if options == GitCloneOptions():
+        return repos
+    if not launcher.capabilities.git_clone_options:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"sandbox provider '{launcher.provider}' does not support sandbox.git_clone "
+                "options; remove the block or use a provider that supports them"
+            ),
+        )
+    return [replace(repo, git_clone=options) for repo in repos]
 
 
 async def _start_sandbox_host(
@@ -3691,6 +3777,7 @@ async def _register_and_start_host(
         registration fails.
     """
     token = secrets.token_urlsafe(32)
+    record = None
     try:
         if keep_host_on_failure:
             record = await asyncio.to_thread(
@@ -3702,6 +3789,8 @@ async def _register_and_start_host(
                 sandbox_id=sandbox_id,
                 token_expires_at=now_epoch() + config.token_ttl_s,
             )
+            if record is None:
+                raise ValueError(f"managed host {host_id!r} no longer exists")
         else:
             record = await asyncio.to_thread(
                 host_store.register_managed_host,
@@ -3713,25 +3802,6 @@ async def _register_and_start_host(
                 sandbox_id=sandbox_id,
                 token_expires_at=now_epoch() + config.token_ttl_s,
             )
-    except Exception:
-        # Registration did not confirm ownership of a host row. Only the
-        # newly allocated sandbox is ours to clean up.
-        await _terminate_sandbox_best_effort(
-            launcher,
-            sandbox_id,
-            host_id=host_id,
-            provider=launcher.provider,
-        )
-        raise
-    if record is None:
-        await _terminate_sandbox_best_effort(
-            launcher,
-            sandbox_id,
-            host_id=host_id,
-            provider=launcher.provider,
-        )
-        raise ValueError(f"managed host {host_id!r} no longer exists")
-    try:
         # Uniform across providers: provision() fixed the sandbox id and the
         # token was armed against it above, so start_host starts the host with
         # a token that already resolves. The exec-model default execs in; the
@@ -3750,14 +3820,30 @@ async def _register_and_start_host(
         )
         await _wait_for_host_online(host_store, host_id)
     except Exception as exc:
-        # Broad on purpose: any post-provision failure — launcher CLI
-        # errors, provider SDK exceptions (e.g. Modal's
-        # SandboxTerminated), raw network errors from the in-sandbox
-        # exec — must tear down the sandbox and revoke the armed token,
-        # or the sandbox leaks running until the provider's lifetime
-        # cap. Cleanup-then-reraise at a system boundary, not a
-        # swallow: every path below re-raises as an HTTPException.
-        if keep_host_on_failure:
+        # The provider allocated the sandbox before registration or startup
+        # could fail, so both failures must attempt cleanup.
+        if record is None:
+            current = None
+            try:
+                current = await asyncio.to_thread(host_store.get_host, host_id)
+            except Exception:
+                _logger.exception("Could not inspect failed host registration")
+            # A provider can reuse an ID already retained for active work or cleanup.
+            if (
+                current is None
+                or current.sandbox_provider != launcher.provider
+                or sandbox_id
+                not in (
+                    current.sandbox_id,
+                    current.terminating_sandbox_id,
+                )
+            ):
+                await _terminate_sandbox_best_effort(
+                    launcher, sandbox_id, host_id=host_id, provider=launcher.provider
+                )
+            if isinstance(exc, ValueError):
+                raise
+        elif keep_host_on_failure:
             await _terminate_sandbox_best_effort(
                 launcher,
                 sandbox_id,
@@ -3978,6 +4064,7 @@ async def resume_managed_host(
         # providers retain their filesystem and do not need workspace prep.
         workspace_repos = repos if launcher.provider == "agent_sandbox" else ()
         entry = config.recorded(host.sandbox_provider)
+        workspace_repos = _apply_git_clone_options(launcher, workspace_repos, entry.git_clone)
         sandbox_id = host.sandbox_id
         _logger.info(
             "Waking dormant managed host %s (sandbox %s, provider %s)",

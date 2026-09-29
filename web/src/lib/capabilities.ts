@@ -57,7 +57,7 @@ export interface Branding {
 }
 
 /** Release features understood by this frontend build. */
-export type FeatureKey = "usage_page" | "harness_install" | "canvas";
+export type FeatureKey = "usage_page" | "harness_install" | "canvas" | "customize";
 
 /** Deployment-wide release-feature values advertised by the server. */
 export type FeatureValues = Record<string, boolean>;
@@ -120,7 +120,10 @@ export interface ServerInfo {
    * branches on these (multi-repo list vs single). A provider absent from the
    * map, or the map absent entirely, defaults every flag off.
    */
-  sandbox_provider_capabilities?: Record<string, { multi_repo?: boolean }>;
+  sandbox_provider_capabilities?: Record<
+    string,
+    { multi_repo?: boolean; inference_models?: boolean }
+  >;
   /**
    * Connection providers this deploy has wired (config + store present),
    * e.g. ``["github"]`` or ``["github", "databricks"]``. Non-empty shows the
@@ -330,7 +333,7 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
             data.sandbox_provider_capabilities !== null &&
             typeof data.sandbox_provider_capabilities === "object" &&
             !Array.isArray(data.sandbox_provider_capabilities)
-              ? (data.sandbox_provider_capabilities as Record<string, { multi_repo?: boolean }>)
+              ? (data.sandbox_provider_capabilities as ServerInfo["sandbox_provider_capabilities"])
               : {},
           enabled_connections: Array.isArray(data.enabled_connections)
             ? data.enabled_connections.filter((p): p is string => typeof p === "string")

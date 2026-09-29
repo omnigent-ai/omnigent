@@ -61,6 +61,18 @@ function describe(state: SessionState): Visual {
           <CircleAlertIcon aria-hidden className="size-3.5 shrink-0 text-destructive" />
         ),
       };
+    case "disconnected":
+      return {
+        kind: state.kind,
+        ariaLabel: "Host disconnected",
+        tooltip: "Host disconnected",
+        render: () => (
+          <span
+            aria-hidden
+            className="size-2 shrink-0 rounded-full border border-muted-foreground"
+          />
+        ),
+      };
     case "unseen":
       // Solid brand-pink dot — distinguished from the running indicator,
       // which is a grey spinner.

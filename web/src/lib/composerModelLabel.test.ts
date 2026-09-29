@@ -20,11 +20,18 @@ describe("catalog model labels", () => {
     const row = Object.freeze({ id, model, displayName, isDefault: true });
     expect(nativeModelLabel(row)).toBe(displayName);
     expect(defaultModelLabel([row])).toBe(`Default (${displayName})`);
-    expect(compactModelTriggerLabel(defaultModelLabel([row]))).toBe(displayName);
+    expect(compactModelTriggerLabel(defaultModelLabel([row]))).toBe(
+      displayName.replace(" (1M context)", " 1M"),
+    );
     expect(formatStatusModelLabel(model)).toBe(model);
     expect(formatStatusModelLabel(model, [row])).toBe(displayName);
     expect(formatStatusModelLabel(id, [row])).toBe(displayName);
     expect(row).toEqual({ id, model, displayName, isDefault: true });
+  });
+
+  it("condenses context capacity in the composer button label", () => {
+    expect(compactModelTriggerLabel("Opus (1M context)")).toBe("Opus 1M");
+    expect(compactModelTriggerLabel("Default (Opus (1M context))")).toBe("Opus 1M");
   });
 
   it.each(["sonnet", "sonnet_5", "opus[1m]", "Unrecognized-ID"])(

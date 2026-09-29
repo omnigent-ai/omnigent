@@ -26,9 +26,7 @@ from __future__ import annotations
 
 import zstandard
 from sqlalchemy import LargeBinary
-from sqlalchemy.dialects.mysql import MEDIUMBLOB
-from sqlalchemy.engine import Dialect
-from sqlalchemy.types import TypeDecorator, TypeEngine
+from sqlalchemy.types import TypeDecorator
 
 # Leading byte marking a framed (post-migration) value. Legacy text never
 # begins with NUL, so its presence unambiguously distinguishes the two formats.
@@ -137,13 +135,3 @@ class CompressedText(TypeDecorator[str]):
         """Decompress on the way out of the database."""
         del dialect
         return decode(value)
-
-
-class CompressedLargeText(CompressedText):
-    """Compressed text with a 16 MiB MySQL capacity instead of BLOB's 64 KiB."""
-
-    cache_ok = True
-
-    def load_dialect_impl(self, dialect: Dialect) -> TypeEngine[bytes]:
-        """Retain compression while selecting the backend's binary column type."""
-        return dialect.type_descriptor(MEDIUMBLOB() if dialect.name == "mysql" else LargeBinary())

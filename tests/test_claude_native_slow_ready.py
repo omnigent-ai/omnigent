@@ -78,10 +78,16 @@ def test_first_message_survives_slow_terminal_startup(
     original_wait = bridge._wait_for_claude_prompt_ready
     started_at: list[float] = []
 
-    def observe_wait(socket_path: str, tmux_target: str, *, timeout_s: float) -> None:
+    def observe_wait(
+        socket_path: str,
+        tmux_target: str,
+        *,
+        timeout_s: float,
+        bridge_dir: Path | None = None,
+    ) -> None:
         started_at.append(time.monotonic())
         gate_started.touch()
-        original_wait(socket_path, tmux_target, timeout_s=timeout_s)
+        original_wait(socket_path, tmux_target, timeout_s=timeout_s, bridge_dir=bridge_dir)
 
     monkeypatch.setattr(bridge, "_wait_for_claude_prompt_ready", observe_wait)
     with tempfile.TemporaryDirectory(prefix="claude-ready-", dir="/tmp") as socket_dir:
@@ -124,15 +130,28 @@ def test_first_message_survives_slow_terminal_startup(
                 )
                 assert time.monotonic() - started_at[0] >= 1.0
                 assert json.loads(delivered.read_text()) == ["FIRST_PROMPT_DELIVERED"]
-                assert bridge._claude_pane_alive(str(socket_path), "main")
+                assert bridge._claude_pane_state(str(socket_path), "main").alive
+            elif startup == "dead":
+                with pytest.raises(
+                    bridge.ClaudeTerminalExited,
+                    match=r"has exited \(status (?:1|unknown)\)",
+                ) as excinfo:
+                    bridge.inject_user_message(
+                        bridge_dir, content="MUST_NOT_DELIVER", timeout_s=0.3
+                    )
+                assert not delivered.exists()
+                assert excinfo.value.exit_status in {None, "1"}
+                pane_state = bridge._claude_pane_state(str(socket_path), "main")
+                assert pane_state.alive is False
+                assert pane_state.exited is True
+                # Older tmux builds leave pane_dead_status empty.
+                assert pane_state.exit_status in {None, "1"}
             else:
                 with pytest.raises(bridge.ClaudePromptTimeout, match="did not become ready"):
                     bridge.inject_user_message(
                         bridge_dir, content="MUST_NOT_DELIVER", timeout_s=0.3
                     )
                 assert not delivered.exists()
-                if startup == "dead":
-                    assert not bridge._claude_pane_alive(str(socket_path), "main")
         finally:
             with contextlib.suppress(subprocess.SubprocessError):
                 subprocess.run([*tmux, "kill-server"], check=False, capture_output=True, timeout=5)

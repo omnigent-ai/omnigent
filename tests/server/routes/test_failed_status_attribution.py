@@ -102,7 +102,7 @@ def test_detail_less_failure_still_reports_origin(
     # No turn to name; the sink drops null attributes rather than shipping
     # an empty column.
     assert record.attributes["response_id"] is None
-    assert "response_id" not in _attributes(record)
+    assert "response_id" not in _attributes(record, source="server")
 
 
 def test_unattributed_failure_is_labelled_not_blank(

@@ -24,9 +24,11 @@ from sqlalchemy.engine import CursorResult
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from omnigent.db.account_authority import require_active_account, session_account_owner_query
 from omnigent.db.db_models import (
     SqlConversationMetadata,
     SqlHost,
+    SqlSessionPermission,
     current_workspace_id,
 )
 from omnigent.db.enum_codecs import decode_host_status, encode_host_status
@@ -36,6 +38,7 @@ from omnigent.db.utils import (
     now_epoch,
     run_write_transaction,
 )
+from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.harness_availability import HarnessAvailability, is_harness_availability
 
 # A host is considered live only if its row was touched (connect or
@@ -98,6 +101,7 @@ class Host:
     configured_harnesses: dict[str, HarnessAvailability] | None = None
     terminating_sandbox_id: str | None = None
     deleted_at: int | None = None
+    account_generation: str | None = None
 
 
 ManagedSandboxScanCursor = tuple[str, int, str]
@@ -171,6 +175,7 @@ def _row_to_host(row: SqlHost) -> Host:
         sandbox_id=row.sandbox_id,
         terminating_sandbox_id=row.terminating_sandbox_id,
         deleted_at=row.deleted_at,
+        account_generation=row.account_generation,
         configured_harnesses=_parse_configured_harnesses(row.configured_harnesses),
     )
 
@@ -189,6 +194,35 @@ def hash_host_launch_token(token: str) -> str:
     :returns: Hex SHA-256 digest, e.g. ``"9f86d08..."`` (64 chars).
     """
     return hashlib.sha256(token.encode()).hexdigest()
+
+
+def delete_host_in_session(session: Session, row: SqlHost) -> Host:
+    """Delete an already locked host while retaining pending provider cleanup."""
+    host_id = row.host_id
+    deleted = _row_to_host(row)
+    session.execute(
+        update(SqlConversationMetadata)
+        .where(
+            SqlConversationMetadata.workspace_id == current_workspace_id(),
+            SqlConversationMetadata.host_id == host_id,
+        )
+        .values(host_id=None)
+    )
+    if row.sandbox_provider is None or (
+        row.sandbox_id is None and row.terminating_sandbox_id is None
+    ):
+        session.execute(
+            sql_delete(SqlHost).where(
+                SqlHost.workspace_id == current_workspace_id(),
+                SqlHost.host_id == host_id,
+            )
+        )
+        return deleted
+    row.token_hash = None
+    row.token_expires_at = None
+    row.status = encode_host_status("offline")
+    row.deleted_at = row.deleted_at or now_epoch()
+    return _row_to_host(row)
 
 
 class HostStore:
@@ -283,6 +317,7 @@ class HostStore:
         )
 
         def write(session: Session) -> Host:
+            generation = require_active_account(session, user_id)
             if managed_token is not None:
                 result = cast(
                     CursorResult[tuple[object]],
@@ -330,6 +365,7 @@ class HostStore:
                 # Known host_id (same user_id, or reown opted in): update
                 # user_id/name in case they changed, then refresh status and timestamp.
                 row.user_id = user_id
+                row.account_generation = generation
                 row.name = name
                 row.status = encode_host_status("online")
                 row.updated_at = now
@@ -347,6 +383,7 @@ class HostStore:
                     host_id=host_id,
                     name=name,
                     user_id=user_id,
+                    generation=generation,
                     now=now,
                     configured_harnesses_json=harnesses_json,
                 )
@@ -377,6 +414,7 @@ class HostStore:
 
             # Genuinely new host: plain INSERT.
             row = SqlHost(
+                account_generation=generation,
                 user_id=user_id,
                 name=name,
                 host_id=host_id,
@@ -423,6 +461,7 @@ class HostStore:
         # Preserve durable fields from the outgoing row before deletion.
         created_at = row.created_at
         user_id = row.user_id
+        generation = row.account_generation
         name = row.name
         token_hash = row.token_hash
         token_expires_at = row.token_expires_at
@@ -459,6 +498,7 @@ class HostStore:
         session.flush()
 
         new_row = SqlHost(
+            account_generation=generation,
             workspace_id=current_workspace_id(),
             host_id=new_host_id,
             user_id=user_id,
@@ -496,6 +536,7 @@ class HostStore:
         host_id: str,
         name: str,
         user_id: str,
+        generation: str | None,
         now: int,
         configured_harnesses_json: str | None = None,
     ) -> Host | None:
@@ -544,6 +585,7 @@ class HostStore:
             )
             .values(
                 user_id=user_id,
+                account_generation=generation,
                 name=name,
                 status=encode_host_status("online"),
                 updated_at=now,
@@ -557,6 +599,7 @@ class HostStore:
             status="online",
             created_at=created_at,
             updated_at=now,
+            account_generation=generation,
             sandbox_provider=existing.sandbox_provider,
             sandbox_id=existing.sandbox_id,
             configured_harnesses=_parse_configured_harnesses(configured_harnesses_json),
@@ -869,7 +912,9 @@ class HostStore:
         token_hash = hash_host_launch_token(token)
 
         def write(session: Session) -> Host:
+            generation = require_active_account(session, user_id)
             row = SqlHost(
+                account_generation=generation,
                 user_id=user_id,
                 name=name,
                 host_id=host_id,
@@ -905,6 +950,7 @@ class HostStore:
         now = now_epoch()
         token_hash = hash_host_launch_token(token)
         with self._lifecycle_session("replace_managed_host_sandbox") as session:
+            require_active_account(session, user_id)
             existing = session.execute(
                 select(SqlHost)
                 .where(SqlHost.workspace_id == current_workspace_id(), SqlHost.host_id == host_id)
@@ -914,6 +960,7 @@ class HostStore:
                 return None
             if existing.deleted_at is not None:
                 return None
+            require_active_account(session, user_id, generation=existing.account_generation)
             if existing.user_id != user_id:
                 raise ValueError(
                     f"host {host_id!r} is registered to a different user; "
@@ -954,7 +1001,13 @@ class HostStore:
         longer current and the provider must not be asked to resume that sandbox id.
         """
         now = now_epoch()
-        with self._session("rearm_managed_host") as session:
+        with self._lifecycle_session("rearm_managed_host") as session:
+            snapshot = session.get(SqlHost, (current_workspace_id(), host_id))
+            if snapshot is None:
+                return None
+            require_active_account(
+                session, snapshot.user_id, generation=snapshot.account_generation
+            )
             result = cast(
                 CursorResult[tuple[object]],
                 session.execute(
@@ -1025,6 +1078,88 @@ class HostStore:
                 return None
             return _row_to_host(row)
 
+    def admit_launch(
+        self,
+        host_id: str,
+        session_id: str,
+        owner: str | None,
+        generation: str | None,
+        allow_unbound: bool = False,
+        transfer_from_host_id: str | None = None,
+        *,
+        require_account_owner: bool = False,
+    ) -> None:
+        """Order final launch authorization with account deletion across replicas.
+
+        An authorized transfer may still carry the source host binding captured
+        during resolution. Same-host restarts must not opt into this exception.
+        Accounts deployments also require a live session owner able to mint
+        runner credentials; other auth modes retain their own owner lifecycle.
+        """
+
+        def write(session: Session) -> None:
+            owner_query = (
+                session_account_owner_query()
+                .where(SqlSessionPermission.conversation_id == session_id)
+                .limit(1)
+            )
+            session_owner = (
+                session.execute(owner_query).one_or_none() if require_account_owner else None
+            )
+            related = (
+                {session_owner.session_owner: session_owner.session_generation}
+                if session_owner is not None
+                else None
+            )
+            require_active_account(session, owner, generation=generation, related_accounts=related)
+            if require_account_owner and (
+                session_owner is None
+                or session.execute(owner_query.with_for_update()).one_or_none() != session_owner
+            ):
+                raise OmnigentError(
+                    "session no longer has an active account owner", code=ErrorCode.UNAUTHORIZED
+                )
+            host = session.execute(
+                select(SqlHost)
+                .where(
+                    SqlHost.workspace_id == current_workspace_id(),
+                    SqlHost.host_id == host_id,
+                )
+                .with_for_update()
+            ).scalar_one_or_none()
+            if (
+                host is None
+                or host.deleted_at is not None
+                or (owner is not None and host.user_id != owner)
+            ):
+                raise OmnigentError("host is no longer available", code=ErrorCode.UNAUTHORIZED)
+            meta = session.execute(
+                select(SqlConversationMetadata)
+                .where(
+                    SqlConversationMetadata.workspace_id == current_workspace_id(),
+                    SqlConversationMetadata.id == session_id,
+                )
+                .with_for_update()
+            ).scalar_one_or_none()
+            if meta is None or (
+                meta.host_id != host_id
+                and not (allow_unbound and meta.host_id is None)
+                and not (
+                    transfer_from_host_id is not None and meta.host_id == transfer_from_host_id
+                )
+            ):
+                raise OmnigentError(
+                    "session is no longer bound to this host", code=ErrorCode.UNAUTHORIZED
+                )
+            if meta.inference_snapshot is not None and host.sandbox_provider is None:
+                raise OmnigentError(
+                    "This session has a saved sandbox inference profile. "
+                    "Choose a managed sandbox host or start a new session to use this host.",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+
+        run_write_transaction(self._lifecycle_session, "admit_runner_launch", write)
+
     def delete_host(self, host_id: str) -> Host | None:
         """
         Logically delete a host and retain pending sandbox cleanup.
@@ -1050,30 +1185,7 @@ class HostStore:
             ).scalar_one_or_none()
             if row is None:
                 return None
-            deleted = _row_to_host(row)
-            session.execute(
-                update(SqlConversationMetadata)
-                .where(
-                    SqlConversationMetadata.workspace_id == current_workspace_id(),
-                    SqlConversationMetadata.host_id == host_id,
-                )
-                .values(host_id=None)
-            )
-            if row.sandbox_provider is None or (
-                row.sandbox_id is None and row.terminating_sandbox_id is None
-            ):
-                session.execute(
-                    sql_delete(SqlHost).where(
-                        SqlHost.workspace_id == current_workspace_id(),
-                        SqlHost.host_id == host_id,
-                    )
-                )
-                return deleted
-            row.token_hash = None
-            row.token_expires_at = None
-            row.status = encode_host_status("offline")
-            row.deleted_at = row.deleted_at or now_epoch()
-            return _row_to_host(row)
+            return delete_host_in_session(session, row)
 
         return run_write_transaction(self._lifecycle_session, "delete_host", write)
 

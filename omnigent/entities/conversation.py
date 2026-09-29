@@ -248,6 +248,7 @@ class Conversation:
     session_todos: list[dict[str, Any]] = field(default_factory=list)
     reasoning_effort: str | None = None
     model_override: str | None = None
+    inference_snapshot: dict[str, Any] | None = None
     reported_model: str | None = None
     cost_control_mode_override: str | None = None
     subagent_routing_override: str | None = None
@@ -418,12 +419,21 @@ class ErrorData(BaseModel):
         notice (e.g. codex started a fresh thread) rather than a failure;
         ``None`` / ``"error"`` is the destructive default and is omitted from
         the wire so existing error items are unchanged.
+    :param title: Optional short headline naming the failure, e.g. ``"Codex can't
+        start until you sign in to Databricks"``. Kept so the card reads the
+        same after a reload as it did live.
+    :param cause: Optional one or two sentences explaining why it failed.
+    :param remediation: Optional concrete next step, e.g. the sign-in link
+        and code; the card offers it as an action.
     """
 
     source: Literal["llm", "execution", "tool", "harness"]
     code: str
     message: str
     level: Literal["error", "info"] | None = None
+    title: str | None = None
+    cause: str | None = None
+    remediation: str | None = None
 
     @field_validator("code", "message")
     @classmethod

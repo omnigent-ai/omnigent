@@ -25,6 +25,7 @@ import {
 import { createPortal } from "react-dom";
 import {
   ArchiveIcon,
+  ArrowUpDownIcon,
   ArchiveRestoreIcon,
   CheckIcon,
   CheckIcon as CheckMarkIcon,
@@ -48,6 +49,7 @@ import {
   MailIcon,
   MailOpenIcon,
   MessageCircleDashedIcon,
+  MessageCirclePlusIcon,
   Maximize2Icon,
   Minimize2Icon,
   MoreHorizontalIcon,
@@ -61,7 +63,6 @@ import {
   SmilePlusIcon,
   SquareIcon,
   SquareCheckIcon,
-  SquarePenIcon,
   Trash2Icon,
   UsersIcon,
   WalletIcon,
@@ -173,7 +174,8 @@ import { isImeCompositionKeyEvent } from "@/lib/ime";
 import { useHasSessionDraft } from "@/lib/sessionDrafts";
 import { useOptimisticTitle } from "@/lib/optimisticTitles";
 import { getSessionState, type SessionState } from "@/hooks/useSessionState";
-import { useSessionErrors } from "@/hooks/useSessionErrors";
+import { useSessionErrorStates } from "@/hooks/useSessionErrors";
+import type { LatestSessionError } from "@/lib/sessionError";
 import { useChatStore } from "@/store/chatStore";
 import {
   isConversationUnseen,
@@ -667,17 +669,20 @@ function SidebarImpl({
     [selectionMode, exitSelectionMode],
   );
 
-  useSidebarView(activeTab);
-  const archivedQuery = useArchivedSessions(activeTab === "archived");
+  const availableTab = activeTab === "shared" && !sidebarData.sharedAvailable ? "mine" : activeTab;
+  useLayoutEffect(() => {
+    if (availableTab !== activeTab) switchTab(availableTab);
+  }, [activeTab, availableTab, switchTab]);
+
+  useSidebarView(availableTab);
+  const archivedQuery = useArchivedSessions(availableTab === "archived");
   const displayQuery: SidebarListQuery =
-    activeTab === "archived"
+    availableTab === "archived"
       ? archivedQuery
-      : activeTab === "mine"
+      : availableTab === "mine"
         ? sidebarData.mine
-        : activeTab === "shared"
-          ? sidebarData.sharedAvailable
-            ? sidebarData.shared
-            : { ...sidebarData.all, data: undefined, isLoading: false, hasNextPage: false }
+        : availableTab === "shared"
+          ? sidebarData.shared
           : sidebarData.all;
   const inboxCount = sidebarData.inboxCount;
 
@@ -1035,7 +1040,7 @@ function SidebarImpl({
               />
             </div>
 
-            <div className="flex flex-col gap-0 px-2 pt-2 pb-0" data-testid="sidebar-primary-nav">
+            <div className="flex flex-col gap-px px-2 pt-2 pb-0" data-testid="sidebar-primary-nav">
               {/* "New session" routes to the home composer ("/"), which now owns
             session creation end-to-end (host/workspace/worktree chips +
             send). Rendered as a Link so cmd/middle-click opens it in a new
@@ -1067,7 +1072,7 @@ function SidebarImpl({
                     onNavClick(e);
                   }}
                 >
-                  <SquarePenIcon
+                  <MessageCirclePlusIcon
                     className={cn(
                       "ui-icon",
                       isNewChatPage
@@ -1219,27 +1224,33 @@ function SidebarImpl({
                     : "[scrollbar-color:transparent_transparent] [&::-webkit-scrollbar-thumb]:bg-transparent",
                 )}
               >
-                <ConversationList
-                  conversationsQuery={displayQuery}
-                  scrollContainerRef={scrollContainerRef}
-                  onRowClick={onNavClick}
-                  searchQuery=""
-                  newSessionProjectName={newSessionProjectName}
-                  activeTab={activeTab}
-                  onActiveTabChange={switchTab}
-                  multiUser={multiUser}
-                  pinnedConversationIds={pinnedConversationIds}
-                  pinnedConversations={pinnedConversations}
-                  onTogglePinned={togglePinnedConversation}
-                  onEnterSelectionMode={enterSelectionMode}
-                  selectionMode={selectionMode}
-                  selectionScope={selectionScope}
-                  selectedIds={selectedIds}
-                  onToggleSelected={toggleSelected}
-                  onDeselectAll={deselectAll}
-                  onExitSelectionMode={exitSelectionMode}
-                  getVisibleIdsRef={getVisibleIdsRef}
-                />
+                {sidebarData.identityReady ? (
+                  <ConversationList
+                    conversationsQuery={displayQuery}
+                    scrollContainerRef={scrollContainerRef}
+                    onRowClick={onNavClick}
+                    searchQuery=""
+                    newSessionProjectName={newSessionProjectName}
+                    activeTab={availableTab}
+                    onActiveTabChange={switchTab}
+                    multiUser={multiUser}
+                    pinnedConversationIds={pinnedConversationIds}
+                    pinnedConversations={pinnedConversations}
+                    onTogglePinned={togglePinnedConversation}
+                    onEnterSelectionMode={enterSelectionMode}
+                    selectionMode={selectionMode}
+                    selectionScope={selectionScope}
+                    selectedIds={selectedIds}
+                    onToggleSelected={toggleSelected}
+                    onDeselectAll={deselectAll}
+                    onExitSelectionMode={exitSelectionMode}
+                    getVisibleIdsRef={getVisibleIdsRef}
+                  />
+                ) : (
+                  <p role="status" className="px-2 py-1 text-muted-foreground text-sm">
+                    Loading sessions…
+                  </p>
+                )}
               </nav>
               {/* Mobile: Settings floats over the bottom of the session list, with
           Search floating at the top of the header row — the two icons the
@@ -1376,7 +1387,7 @@ function ProjectFolder({
       frozenSortKeys,
     );
   }, [query.data, windowConversations, pinnedSet, activeOverride, frozenSortKeys]);
-  const errors = useSessionErrors(conversations);
+  const errors = useSessionErrorStates(conversations);
   const startingConversationId = useChatStore((s) =>
     s.status === "streaming" || s.terminalPending ? s.conversationId : null,
   );
@@ -1493,8 +1504,6 @@ function ProjectFolder({
             actions={orderedMenuActions}
           />
         }
-        // Touch exposes these actions through the header's long-press menu.
-        actionHoverOnly
         headerContextMenu={
           <ContextMenuContent className="min-w-40">
             <ProjectFolderMenuItems
@@ -2222,7 +2231,7 @@ function ConversationList({
       >
         <RowEditHoldContext.Provider value={reportRowEditing}>
           <div
-            className="flex flex-col gap-4"
+            className="flex flex-col gap-6"
             data-testid="sidebar-conversation-list"
             // Freeze the sort order while the pointer is over the list so rows
             // never move under the cursor. The frozen-keys map is cleared by the
@@ -2589,13 +2598,14 @@ function UngroupDropZone() {
 /** Surface the most actionable state across a collapsed project's loaded rows. */
 function projectMarkerState(
   conversations: Conversation[],
-  errors: readonly boolean[],
+  errors: readonly (LatestSessionError | null)[],
   startingConversationId: string | null,
 ): SessionState | null {
   let awaiting = 0;
   let running = false;
   let starting = false;
   let error = false;
+  let disconnected = false;
   let unseen = false;
   for (const [i, c] of conversations.entries()) {
     const state = getSessionState(c, errors[i]);
@@ -2607,6 +2617,8 @@ function projectMarkerState(
       starting = true;
     } else if (state?.kind === "error") {
       error = true;
+    } else if (state?.kind === "disconnected") {
+      disconnected = true;
     } else if (isConversationUnseen(c.id, c.updated_at, c.status)) {
       unseen = true;
     }
@@ -2615,6 +2627,7 @@ function projectMarkerState(
   if (running) return { kind: "running" };
   if (starting) return { kind: "starting" };
   if (error) return { kind: "error" };
+  if (disconnected) return { kind: "disconnected" };
   if (unseen) return { kind: "unseen" };
   return null;
 }
@@ -2629,7 +2642,6 @@ function SectionHeader({
   marker,
   active = false,
   hasAction,
-  actionHoverOnly,
   hasPersistentAction,
   actionFocusVisible,
   collapsed,
@@ -2649,8 +2661,6 @@ function SectionHeader({
       full control column there; only at rest on hover-capable desktops do the
       badges return to the rows' badge column. */
   hasAction?: boolean;
-  /** Whether the header action is absent without a fine hover pointer. */
-  actionHoverOnly?: boolean;
   /** Whether an always-visible control sits at the header's right edge (the
       Sessions filter), which the collapsed badges must clear even at rest on
       hover-capable desktops. */
@@ -2666,21 +2676,8 @@ function SectionHeader({
   contextMenuDisabled?: boolean;
 }) {
   const showsMarker = collapsed && marker != null;
-  // Right-edge offset of the marker when no header control is painted: it
-  // matches the rows' badge slot (-mr-1 trims an icon folder's px-2 to the
-  // right-1 edge; mr-1 pushes a padless header out to it). One media condition
-  // governs the whole header-control matrix: overlays hide (and stop
-  // hit-testing) only on md+ displays whose PRIMARY pointer is a fine,
-  // hover-capable one — `hover:hover` alone is not enough, since a convertible
-  // with a coarse primary pointer can still report it, and its first tap would
-  // be captured by the header underneath before any hover state exists.
-  // Everywhere else the controls stay painted and clickable, so with
-  // `hasAction` the cluster reserves the full mr-14 control column, returning
-  // to this rest offset (or clearing the always-visible Sessions filter with
-  // mr-7) only under that same condition. Hover-only actions keep this rest
-  // offset at every capability. On fine-pointer touchscreen laptops a screen
-  // tap still hit-tests before hover applies, so the folder's menu keeps its
-  // "New session" fallback at every breakpoint.
+  // Touch and narrow layouts reserve space for the visible controls. On hover
+  // desktops the marker returns to the right edge until the controls appear.
   const clusterRestMargin = showsMarker ? (icon ? "-mr-1" : "mr-1") : "mr-2";
   const clusterHoverDesktopMargin = hasPersistentAction
     ? "[@media((hover:hover)_and_(pointer:fine))]:md:mr-7"
@@ -2689,22 +2686,11 @@ function SectionHeader({
         ? "[@media((hover:hover)_and_(pointer:fine))]:md:-mr-1"
         : "[@media((hover:hover)_and_(pointer:fine))]:md:mr-1"
       : "[@media((hover:hover)_and_(pointer:fine))]:md:mr-2";
-  const markerFade = actionHoverOnly
-    ? "[@media((hover:hover)_and_(pointer:fine))]:group-hover/section:opacity-0 [@media((hover:hover)_and_(pointer:fine))]:group-has-[[data-state=open]]/header:opacity-0"
-    : "[@media((hover:hover)_and_(pointer:fine))]:md:group-hover/section:opacity-0 [@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-state=open]]/header:opacity-0";
-  // The hover-only control's focus reveal (`focus-visible:not-sr-only`) is
-  // ungated by pointer type, so a coarse-pointer tablet with a keyboard can
-  // land focus on it. Its focus fade must therefore fire at every pointer type
-  // too — otherwise the focus-revealed kebab paints over a still-visible
-  // spinner/count. The hover-driven fades above stay pointer-gated (hover only
-  // exists on fine). Every other header keeps its width-gated focus fade.
+  const markerFade =
+    "[@media((hover:hover)_and_(pointer:fine))]:md:group-hover/section:opacity-0 [@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-state=open]]/header:opacity-0";
   const actionFocusFade = actionFocusVisible
-    ? actionHoverOnly
-      ? "group-has-[[data-header-controls]_:focus-visible]/header:opacity-0"
-      : "[@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-header-controls]_:focus-visible]/header:opacity-0"
-    : actionHoverOnly
-      ? "group-has-[[data-header-controls]:focus-within]/header:opacity-0"
-      : "[@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-header-controls]:focus-within]/header:opacity-0";
+    ? "[@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-header-controls]_:focus-visible]/header:opacity-0"
+    : "[@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-header-controls]:focus-within]/header:opacity-0";
   const button = (
     <button
       ref={
@@ -2744,8 +2730,11 @@ function SectionHeader({
               SIDEBAR_HOVER_HIGHLIGHT,
               contextMenu && SIDEBAR_OPEN_MENU_HIGHLIGHT,
               active && SIDEBAR_ACTIVE_HIGHLIGHT,
+              hasAction &&
+                !showsMarker &&
+                "pr-8 [@media((hover:hover)_and_(pointer:fine))]:pr-14 [@media((hover:hover)_and_(pointer:fine))]:md:pr-2 [@media((hover:hover)_and_(pointer:fine))]:md:group-hover/header:pr-14 [@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-header-controls]:focus-within]/header:pr-14 [@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-state=open]]/header:pr-14",
             )
-          : "group flex w-full items-center gap-1 border-0 pt-0 pr-0 pb-1 pl-2 text-left text-sm font-normal text-muted-foreground transition-colors hover:text-foreground",
+          : "group flex h-7 w-full items-center gap-1 border-0 pr-0 pl-2 text-left text-sm font-normal text-muted-foreground transition-colors hover:text-foreground",
       )}
     >
       {icon ? (
@@ -2785,8 +2774,12 @@ function SectionHeader({
         <span
           className={cn(
             "ml-auto flex shrink-0 items-center justify-center transition-opacity",
-            hasAction && !actionHoverOnly
-              ? cn("mr-14", clusterHoverDesktopMargin)
+            // Touch project rows have one menu; fine pointers also get a shortcut.
+            hasAction
+              ? cn(
+                  icon ? "mr-7 [@media((hover:hover)_and_(pointer:fine))]:mr-14" : "mr-14",
+                  clusterHoverDesktopMargin,
+                )
               : hasPersistentAction
                 ? "mr-7"
                 : clusterRestMargin,
@@ -2835,22 +2828,28 @@ function SessionFilterMenu({
     : SIDEBAR_FILTERS.filter((filter) => filter.value !== "shared");
   return (
     <DropdownMenu>
-      <Tooltip>
+      <Tooltip disableHoverableContent>
         <TooltipTrigger asChild>
-          <DropdownMenuTrigger asChild>
-            <Button
-              type="button"
-              variant="ghost"
-              size="icon-xs"
-              aria-label="Filter sessions"
-              data-testid="session-filter"
-              onClick={(event) => event.stopPropagation()}
-            >
-              <ListFilterIcon className="size-3.5" />
-            </Button>
-          </DropdownMenuTrigger>
+          {/* Separate nodes keep the Radix tooltip and menu trigger states independent. */}
+          <span className="inline-flex shrink-0">
+            <DropdownMenuTrigger asChild>
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon-xs"
+                aria-label="Filter sessions"
+                data-testid="session-filter"
+                className="text-muted-foreground"
+                onClick={(event) => event.stopPropagation()}
+              >
+                <ListFilterIcon className="size-3.5" />
+              </Button>
+            </DropdownMenuTrigger>
+          </span>
         </TooltipTrigger>
-        <TooltipContent side="bottom">Filter sessions</TooltipContent>
+        <TooltipContent side="bottom" data-noninteractive-tooltip>
+          Filter sessions
+        </TooltipContent>
       </Tooltip>
       <DropdownMenuContent align="end" className="min-w-44 [&_[role=menuitemradio]]:text-ui">
         <DropdownMenuLabel className="text-muted-foreground text-sm">Display</DropdownMenuLabel>
@@ -3025,7 +3024,7 @@ function SectionGroup({
         )}
       </div>
       {afterHeader}
-      {!collapsed && <div className="flex flex-col gap-0">{children}</div>}
+      {!collapsed && <div className="flex flex-col gap-px pt-1">{children}</div>}
     </section>
   );
 }
@@ -3049,7 +3048,6 @@ function ConversationSection({
   emptyMessage,
   indentRows,
   headerAction,
-  actionHoverOnly,
   headerContextMenu,
   persistentHeaderAction,
   afterHeader,
@@ -3084,8 +3082,6 @@ function ConversationSection({
   indentRows?: boolean;
   /** Optional control overlaid at the header's right edge. */
   headerAction?: ReactNode;
-  /** Whether `headerAction` is absent without a fine hover pointer. */
-  actionHoverOnly?: boolean;
   /** Optional context-menu content opened from the header button. */
   headerContextMenu?: ReactNode;
   /** Optional control that remains visible at the header's right edge. */
@@ -3116,7 +3112,6 @@ function ConversationSection({
             marker={marker}
             active={active}
             hasAction={headerAction != null}
-            actionHoverOnly={actionHoverOnly}
             hasPersistentAction={persistentHeaderAction != null}
             collapsed={isCollapsed}
             onToggleCollapsed={onToggleCollapsed}
@@ -3140,14 +3135,8 @@ function ConversationSection({
               data-header-controls
               className={cn(
                 "-translate-y-1/2 absolute top-1/2 right-1 flex items-center gap-0.5",
-                // A hover-only action reveals at every width on a fine hover
-                // pointer (no `md:`), so the badge it overlays is protected from
-                // its at-rest hit target on narrow hover desktops too. Every
-                // other header keeps the width-gated reveal.
                 protectsCollapsedBadge &&
-                  (actionHoverOnly
-                    ? "[@media((hover:hover)_and_(pointer:fine))]:pointer-events-none [@media((hover:hover)_and_(pointer:fine))]:group-has-[[data-header-controls]:focus-within]/header:pointer-events-auto [@media((hover:hover)_and_(pointer:fine))]:group-hover/header:pointer-events-auto [@media((hover:hover)_and_(pointer:fine))]:group-has-[[data-state=open]]/header:pointer-events-auto [@media((hover:hover)_and_(pointer:fine))]:has-[[aria-expanded=true]]:pointer-events-auto"
-                    : "[@media((hover:hover)_and_(pointer:fine))]:md:pointer-events-none [@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-header-controls]:focus-within]/header:pointer-events-auto [@media((hover:hover)_and_(pointer:fine))]:md:group-hover/header:pointer-events-auto [@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-state=open]]/header:pointer-events-auto [@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-testid=session-filter][aria-expanded=true]]/header:pointer-events-auto [@media((hover:hover)_and_(pointer:fine))]:md:has-[[aria-expanded=true]]:pointer-events-auto"),
+                  "[@media((hover:hover)_and_(pointer:fine))]:md:pointer-events-none [@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-header-controls]:focus-within]/header:pointer-events-auto [@media((hover:hover)_and_(pointer:fine))]:md:group-hover/header:pointer-events-auto [@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-state=open]]/header:pointer-events-auto [@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-testid=session-filter][aria-expanded=true]]/header:pointer-events-auto [@media((hover:hover)_and_(pointer:fine))]:md:has-[[aria-expanded=true]]:pointer-events-auto",
               )}
             >
               {headerAction && (
@@ -3158,10 +3147,8 @@ function ConversationSection({
                 // control itself still reveals it.
                 <div
                   className={cn(
-                    "flex items-center transition-opacity",
-                    actionHoverOnly
-                      ? "[@media((hover:hover)_and_(pointer:fine))]:opacity-0 [@media((hover:hover)_and_(pointer:fine))]:group-has-[[data-header-controls]:focus-within]/header:opacity-100 [@media((hover:hover)_and_(pointer:fine))]:group-hover/header:opacity-100 [@media((hover:hover)_and_(pointer:fine))]:group-has-[[data-state=open]]/header:opacity-100 [@media((hover:hover)_and_(pointer:fine))]:has-[[aria-expanded=true]]:opacity-100"
-                      : "[@media((hover:hover)_and_(pointer:fine))]:md:opacity-0 [@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-header-controls]:focus-within]/header:opacity-100 [@media((hover:hover)_and_(pointer:fine))]:md:group-hover/header:opacity-100 [@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-state=open]]/header:opacity-100 [@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-testid=session-filter][aria-expanded=true]]/header:opacity-100 [@media((hover:hover)_and_(pointer:fine))]:md:has-[[aria-expanded=true]]:opacity-100",
+                    "flex items-center rounded transition-opacity",
+                    "[@media((hover:hover)_and_(pointer:fine))]:md:opacity-0 [@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-header-controls]:focus-within]/header:opacity-100 [@media((hover:hover)_and_(pointer:fine))]:md:group-hover/header:opacity-100 [@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-state=open]]/header:opacity-100 [@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-testid=session-filter][aria-expanded=true]]/header:opacity-100 [@media((hover:hover)_and_(pointer:fine))]:md:has-[[aria-expanded=true]]:opacity-100",
                   )}
                 >
                   {headerAction}
@@ -3178,7 +3165,7 @@ function ConversationSection({
       )}
       {afterHeader}
       {!isCollapsed && (
-        <>
+        <div className="pt-1">
           {conversations.length === 0 && emptyMessage ? (
             // Expanded but empty — a project with no loaded chats (indented, in a
             // dashed well) or a top-level list whose filter matched nothing.
@@ -3196,7 +3183,7 @@ function ConversationSection({
             )
           ) : (
             // Indent project chats a step under the project-folder name above.
-            <ul className={cn("flex flex-col", indentRows ? "gap-0 pl-6" : "gap-0")}>
+            <ul className={cn("flex flex-col gap-px", indentRows && "pl-6")}>
               {conversations.map((conv) => (
                 <ConversationRow
                   key={conv.id}
@@ -3214,7 +3201,7 @@ function ConversationSection({
             </ul>
           )}
           {footer}
-        </>
+        </div>
       )}
     </section>
   );
@@ -3868,8 +3855,8 @@ function ConversationRowImpl({
   const canMarkUnread = !hasUnseenMessages;
   // Approvals and failures outrank the unread dot without clearing read state.
   const errorConversations = useMemo(() => [conversation], [conversation]);
-  const [latestMessageIsError] = useSessionErrors(errorConversations);
-  const derivedState = getSessionState(conversation, latestMessageIsError);
+  const [latestError] = useSessionErrorStates(errorConversations);
+  const derivedState = getSessionState(conversation, latestError);
   // The bound session's launch/relaunch window: a send is in flight (local
   // status "streaming") or the runner is auto-creating the PTY
   // (`terminalPending`), but the server hasn't confirmed `running` yet — a
@@ -4000,7 +3987,7 @@ function ConversationRowImpl({
     // unmounts. A failed archive reconciles the row back with its own error
     // toast. The toast is driven imperatively (module state + app-level
     // Toaster), so it survives this row unmounting.
-    if (nextArchived) showArchiveUndoToast(queryClient, [conversation]);
+    if (nextArchived) showArchiveUndoToast(queryClient, [conversation], navigate);
   }
 
   function runUnarchive() {
@@ -4170,8 +4157,17 @@ function ConversationRowImpl({
     <li
       ref={setRowRef}
       data-sidebar-session-id={conversation.id}
-      onMouseDown={(event) => dragListeners?.onMouseDown?.(event)}
-      onTouchStart={(event) => dragListeners?.onTouchStart?.(event)}
+      onMouseDown={(event) => {
+        // Portaled dialogs bubble through this row but must not start a drag.
+        if (event.currentTarget.contains(event.target as Node)) {
+          dragListeners?.onMouseDown?.(event);
+        }
+      }}
+      onTouchStart={(event) => {
+        if (event.currentTarget.contains(event.target as Node)) {
+          dragListeners?.onTouchStart?.(event);
+        }
+      }}
       className={cn("group relative", isDragging && "opacity-40")}
     >
       {/* Right-click anywhere on the row opens the same actions as the kebab.
@@ -4316,131 +4312,149 @@ function ConversationRowImpl({
           gap to its left. Hidden entirely while selecting (bulk mode owns the
           row controls). */}
       {!selectionMode && (
-        <div className="-translate-y-1/2 absolute top-1/2 right-1 flex items-center gap-0.5">
-          {/* Archived rows omit the pin entirely: pinning is meaningless there
+        <ContextMenu>
+          <ContextMenuTrigger asChild>
+            <div className="-translate-y-1/2 absolute top-1/2 right-1 flex items-center gap-0.5">
+              {/* Archived rows omit the pin entirely: pinning is meaningless there
               (archive outranks pin), so there's no pin action even on hover. */}
-          {!isArchived && (
-            <Button
-              type="button"
-              variant="ghost"
-              size="icon-xs"
-              aria-label={isPinned ? "Unpin conversation" : "Pin conversation"}
-              data-testid="quick-pin-conversation"
-              aria-disabled={!isPinned && atPinCap}
-              title={!isPinned && atPinCap ? "Unpin a session first" : undefined}
-              className={cn(
-                // Desktop-only quick affordance: hidden on mobile (the kebab's
-                // Pin item below covers that), hover/focus-revealed from `md`
-                // up. Pinned rows no longer keep a persistent pin marker, since
-                // the "Pinned" section header (and pinned-first ordering inside
-                // a project) already conveys the pinned state. Revealed glyph:
-                // unpin if pinned, pin otherwise.
-                //
-                // `md:inline-flex` (not `md:block`): the Button base is
-                // `inline-flex` and relies on it for `items-center
-                // justify-center` to center the icon. `md:block` would override
-                // that display and collapse the centering, leaving the glyph
-                // pinned to the top-left of the button — so keep the flex
-                // display when revealing it.
-                "text-muted-foreground transition-opacity",
-                "hidden md:inline-flex",
-                "md:opacity-0 md:group-hover:opacity-100",
-                "md:group-has-[:focus-visible]:opacity-100 md:group-has-[[aria-expanded=true]]:opacity-100",
+              {!isArchived && (
+                <Tooltip disableHoverableContent>
+                  <TooltipContent>
+                    <TooltipArrow />
+                    {!isPinned && atPinCap ? "Unpin a session first" : isPinned ? "Unpin" : "Pin"}
+                  </TooltipContent>
+                  <TooltipTrigger asChild>
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="icon-xs"
+                      aria-label={isPinned ? "Unpin conversation" : "Pin conversation"}
+                      data-testid="quick-pin-conversation"
+                      aria-disabled={!isPinned && atPinCap}
+                      className={cn(
+                        // Desktop-only quick affordance: hidden on mobile (the kebab's
+                        // Pin item below covers that), hover/focus-revealed from `md`
+                        // up. Pinned rows no longer keep a persistent pin marker, since
+                        // the "Pinned" section header (and pinned-first ordering inside
+                        // a project) already conveys the pinned state. Revealed glyph:
+                        // unpin if pinned, pin otherwise.
+                        //
+                        // `md:inline-flex` (not `md:block`): the Button base is
+                        // `inline-flex` and relies on it for `items-center
+                        // justify-center` to center the icon. `md:block` would override
+                        // that display and collapse the centering, leaving the glyph
+                        // pinned to the top-left of the button — so keep the flex
+                        // display when revealing it.
+                        "text-muted-foreground transition-opacity",
+                        "hidden md:inline-flex",
+                        "md:opacity-0 md:group-hover:opacity-100",
+                        "md:group-has-[:focus-visible]:opacity-100 md:group-has-[[aria-expanded=true]]:opacity-100",
+                      )}
+                      onClick={(e) => {
+                        // Keep the toggle click off the surrounding Link (no navigation).
+                        e.preventDefault();
+                        e.stopPropagation();
+                        onTogglePinned(conversation.id);
+                      }}
+                    >
+                      {isPinned ? (
+                        <PinOffIcon className="size-3.5" data-icon-size="14" />
+                      ) : (
+                        <PinIcon className="size-3.5" data-icon-size="14" />
+                      )}
+                    </Button>
+                  </TooltipTrigger>
+                </Tooltip>
               )}
-              onClick={(e) => {
-                // Keep the toggle click off the surrounding Link (no navigation).
-                e.preventDefault();
-                e.stopPropagation();
-                onTogglePinned(conversation.id);
-              }}
-            >
-              {isPinned ? (
-                <PinOffIcon className="size-3.5" data-icon-size="14" />
-              ) : (
-                <PinIcon className="size-3.5" data-icon-size="14" />
-              )}
-            </Button>
-          )}
-          {/* Archive is owner-only, same as the kebab's Archive item; non-owners
+              {/* Archive is owner-only, same as the kebab's Archive item; non-owners
               don't get the quick affordance and instead see that item disabled
               with an explanation. */}
-          {isOwner && (
-            <Tooltip disableHoverableContent>
-              <TooltipContent>
-                <TooltipArrow />
-                {isArchived ? "Unarchive conversation" : "Archive conversation"}
-              </TooltipContent>
-              <TooltipTrigger asChild>
-                <Button
-                  type="button"
-                  variant="ghost"
-                  size="icon-xs"
-                  aria-label={isArchived ? "Unarchive conversation" : "Archive conversation"}
-                  data-testid="quick-archive-conversation"
-                  className={cn(
-                    "text-muted-foreground transition-opacity",
-                    "hidden md:inline-flex",
-                    "md:opacity-0 md:group-hover:opacity-100",
-                    "md:group-has-[:focus-visible]:opacity-100 md:group-has-[[aria-expanded=true]]:opacity-100",
-                  )}
-                  onClick={(e) => {
-                    // Keep the toggle click off the surrounding Link (no navigation).
-                    e.preventDefault();
-                    e.stopPropagation();
-                    if (!isArchived) {
-                      runArchive();
-                    } else {
-                      runUnarchive();
-                    }
-                  }}
-                >
-                  {isArchived ? (
-                    <ArchiveRestoreIcon className="size-3.5" data-icon-size="14" />
-                  ) : (
-                    <ArchiveIcon className="size-3.5" data-icon-size="14" />
-                  )}
-                </Button>
-              </TooltipTrigger>
-            </Tooltip>
-          )}
+              {isOwner && (
+                <Tooltip disableHoverableContent>
+                  <TooltipContent>
+                    <TooltipArrow />
+                    {isArchived ? "Unarchive" : "Archive"}
+                  </TooltipContent>
+                  <TooltipTrigger asChild>
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="icon-xs"
+                      aria-label={isArchived ? "Unarchive conversation" : "Archive conversation"}
+                      data-testid="quick-archive-conversation"
+                      className={cn(
+                        "text-muted-foreground transition-opacity",
+                        "hidden md:inline-flex",
+                        "md:opacity-0 md:group-hover:opacity-100",
+                        "md:group-has-[:focus-visible]:opacity-100 md:group-has-[[aria-expanded=true]]:opacity-100",
+                      )}
+                      onClick={(e) => {
+                        // Keep the toggle click off the surrounding Link (no navigation).
+                        e.preventDefault();
+                        e.stopPropagation();
+                        if (!isArchived) {
+                          runArchive();
+                        } else {
+                          runUnarchive();
+                        }
+                      }}
+                    >
+                      {isArchived ? (
+                        <ArchiveRestoreIcon className="size-3.5" data-icon-size="14" />
+                      ) : (
+                        <ArchiveIcon className="size-3.5" data-icon-size="14" />
+                      )}
+                    </Button>
+                  </TooltipTrigger>
+                </Tooltip>
+              )}
 
-          <DropdownMenu open={menuOpen} onOpenChange={setMenuOpen}>
-            <DropdownMenuTrigger asChild>
-              <Button
-                type="button"
-                variant="ghost"
-                size="icon-xs"
-                aria-label="Conversation actions"
-                data-testid="conversation-actions"
-                // Desktop-only: the chat page's own header menu covers these
-                // per-session actions on mobile, so the row kebab is dropped
-                // there. From `md` up it stays hidden until hover / keyboard
-                // focus, with `aria-expanded` keeping it surfaced while the menu
-                // is open so the trigger doesn't vanish under the cursor.
-                className={cn(
-                  "text-muted-foreground transition-opacity",
-                  "hidden md:inline-flex",
-                  "md:opacity-0 md:group-hover:opacity-100 md:group-has-[:focus-visible]:opacity-100",
-                  "md:aria-expanded:opacity-100",
-                )}
-                onClick={(e) => {
-                  // Keep the trigger click from bubbling into the Link.
-                  e.preventDefault();
-                  e.stopPropagation();
-                }}
-              >
-                <MoreHorizontalIcon className="size-3.5" data-icon-size="14" />
-              </Button>
-            </DropdownMenuTrigger>
-            <DropdownMenuContent align="end" className="min-w-44">
-              <ConversationMenuItems
-                components={dropdownBundle}
-                setMenuOpen={setMenuOpen}
-                {...menuItemProps}
-              />
-            </DropdownMenuContent>
-          </DropdownMenu>
-        </div>
+              <DropdownMenu open={menuOpen} onOpenChange={setMenuOpen}>
+                <DropdownMenuTrigger asChild>
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="icon-xs"
+                    aria-label="Conversation actions"
+                    data-testid="conversation-actions"
+                    // Desktop-only: the chat page's own header menu covers these
+                    // per-session actions on mobile, so the row kebab is dropped
+                    // there. From `md` up it stays hidden until hover / keyboard
+                    // focus, with `aria-expanded` keeping it surfaced while the menu
+                    // is open so the trigger doesn't vanish under the cursor.
+                    className={cn(
+                      "text-muted-foreground transition-opacity",
+                      "hidden md:inline-flex",
+                      "md:opacity-0 md:group-hover:opacity-100 md:group-has-[:focus-visible]:opacity-100",
+                      "md:aria-expanded:opacity-100",
+                    )}
+                    onClick={(e) => {
+                      // Keep the trigger click from bubbling into the Link.
+                      e.preventDefault();
+                      e.stopPropagation();
+                    }}
+                  >
+                    <MoreHorizontalIcon className="size-3.5" data-icon-size="14" />
+                  </Button>
+                </DropdownMenuTrigger>
+                <DropdownMenuContent align="end" className="min-w-44">
+                  <ConversationMenuItems
+                    components={dropdownBundle}
+                    setMenuOpen={setMenuOpen}
+                    {...menuItemProps}
+                  />
+                </DropdownMenuContent>
+              </DropdownMenu>
+            </div>
+          </ContextMenuTrigger>
+          <ContextMenuContent className="min-w-44">
+            <ConversationMenuItems
+              components={contextBundle}
+              setMenuOpen={() => {}}
+              {...menuItemProps}
+            />
+          </ContextMenuContent>
+        </ContextMenu>
       )}
       {/* Mount only while open — one per row, its hook tree + JSX would
           otherwise run closed on every row re-render. */}
@@ -4723,35 +4737,21 @@ function PinnedProjectFlyoutContent({
   );
 }
 
-// ── ProjectFolderActions ──────────────────────────────────────────────────────
-
-/** Fine-hover shortcuts for project actions and starting a pre-filed session. */
 function ProjectFolderActions({
   projectName,
   onNavigate,
   actions,
 }: {
   projectName: string;
-  /** Plain-left-click nav handler — closes the mobile overlay so the
-      pre-filed new-session page isn't left hidden behind the sidebar. */
   onNavigate: (e: MouseEvent<HTMLAnchorElement>) => void;
   actions: ProjectFolderMenuActions;
 }) {
   return (
-    // gap-0.5 (2px) between the pencil and kebab mirrors the session row's
-    // pin↔kebab spacing, so the two icon columns line up across row types.
     <div className="flex items-center gap-0.5">
-      {/* A redundant shortcut for the kebab's always-present "New session"
-          item, so it is genuinely absent (not just clipped) wherever no fine
-          hover pointer can reveal it: on touch, folding fully into the kebab
-          instead of leaving a duplicate focus stop for keyboard/AT users. On
-          hover+fine it is display-flex and revealed on hover or keyboard focus
-          by the overlay's opacity. */}
       <Tooltip>
         <TooltipTrigger asChild>
           <Button
             asChild
-            type="button"
             variant="ghost"
             size="icon-xs"
             aria-label={`New session in ${projectName}`}
@@ -4761,13 +4761,11 @@ function ProjectFolderActions({
             <Link
               to={`/?project=${encodeURIComponent(projectName)}`}
               onClick={(e) => {
-                // Keep the click off the folder's collapse toggle, then run the
-                // shared nav handler (closes the sidebar overlay on mobile).
                 e.stopPropagation();
                 onNavigate(e);
               }}
             >
-              <SquarePenIcon className="size-3.5" data-icon-size="14" />
+              <MessageCirclePlusIcon className="size-3.5" data-icon-size="14" />
             </Link>
           </Button>
         </TooltipTrigger>
@@ -4786,11 +4784,13 @@ function ProjectFolderMenuItems({
   projectName,
   onNavigate,
   actions,
+  hideNewSessionOnDesktop = false,
 }: {
   components: MenuComponents;
   projectName: string;
   onNavigate: (e: MouseEvent<HTMLAnchorElement>) => void;
   actions: ProjectFolderMenuActions;
+  hideNewSessionOnDesktop?: boolean;
 }) {
   const { onMenuOpen, onMenuClose } = actions;
   useEffect(() => {
@@ -4800,7 +4800,13 @@ function ProjectFolderMenuItems({
 
   return (
     <>
-      <C.Item asChild data-testid="project-new-session-menu">
+      <C.Item
+        asChild
+        data-testid="project-new-session-menu"
+        className={
+          hideNewSessionOnDesktop ? "[@media((hover:hover)_and_(pointer:fine))]:hidden" : undefined
+        }
+      >
         <Link
           to={`/?project=${encodeURIComponent(projectName)}`}
           onClick={(e) => {
@@ -4808,7 +4814,7 @@ function ProjectFolderMenuItems({
             onNavigate(e);
           }}
         >
-          <SquarePenIcon className="size-3.5" />
+          <MessageCirclePlusIcon className="size-3.5" />
           New session
         </Link>
       </C.Item>
@@ -4821,27 +4827,32 @@ function ProjectFolderMenuItems({
         Project settings
       </C.Item>
       {actions.ordering && (
-        <>
-          <C.Separator />
-          {(["up", "down", "top", "bottom"] as const).map((destination) => (
-            <C.Item
-              key={destination}
-              disabled={
-                actions.ordering!.disabled ||
-                (destination === "up" || destination === "top"
-                  ? actions.ordering!.first
-                  : actions.ordering!.last)
-              }
-              onSelect={() => actions.ordering!.move(destination)}
-            >
-              {destination === "top" || destination === "bottom"
-                ? `Move to ${destination}`
-                : `Move ${destination}`}
-            </C.Item>
-          ))}
-          <C.Separator />
-        </>
+        <C.Sub>
+          <C.SubTrigger data-testid="move-project">
+            <ArrowUpDownIcon className="size-3.5" />
+            Move
+          </C.SubTrigger>
+          <C.SubContent>
+            {(["up", "down", "top", "bottom"] as const).map((destination) => (
+              <C.Item
+                key={destination}
+                disabled={
+                  actions.ordering!.disabled ||
+                  (destination === "up" || destination === "top"
+                    ? actions.ordering!.first
+                    : actions.ordering!.last)
+                }
+                onSelect={() => actions.ordering!.move(destination)}
+              >
+                {destination === "top" || destination === "bottom"
+                  ? `Move to ${destination}`
+                  : `Move ${destination}`}
+              </C.Item>
+            ))}
+          </C.SubContent>
+        </C.Sub>
       )}
+      <C.Separator />
       <C.Item data-testid="delete-project" variant="destructive" onSelect={actions.openDelete}>
         <Trash2Icon className="size-3.5" />
         Delete project
@@ -5178,16 +5189,13 @@ function ProjectFolderMenu({
   return (
     <DropdownMenu>
       <DropdownMenuTrigger asChild>
-        {/* Revealed on hover for fine hover pointers at any width; otherwise
-            sr-only so touch and assistive tech keep a focusable, announced
-            trigger for the same actions the long-press menu also opens. */}
         <Button
           type="button"
           variant="ghost"
           size="icon-xs"
           aria-label={`Project actions for ${projectName}`}
           data-testid="project-actions"
-          className="sr-only text-muted-foreground focus-visible:not-sr-only [@media((hover:hover)_and_(pointer:fine))]:not-sr-only [@media((hover:hover)_and_(pointer:fine))]:flex"
+          className="text-muted-foreground"
           onClick={(e) => e.stopPropagation()}
         >
           <MoreHorizontalIcon className="size-3.5" data-icon-size="14" />
@@ -5196,6 +5204,7 @@ function ProjectFolderMenu({
       <DropdownMenuContent align="end" className="min-w-40">
         <ProjectFolderMenuItems
           components={dropdownBundle}
+          hideNewSessionOnDesktop
           projectName={projectName}
           onNavigate={onNavigate}
           actions={actions}
@@ -5557,7 +5566,7 @@ function BulkActionBar({
     // Offer Undo for the whole batch. Fire now, before this bar unmounts with
     // the cleared selection; the toast is driven by module state + the
     // app-level Toaster, so it outlives this component.
-    showArchiveUndoToast(queryClient, nonArchivedSelected);
+    showArchiveUndoToast(queryClient, nonArchivedSelected, navigate);
   }
 
   function handleUnarchive() {
@@ -5693,27 +5702,31 @@ function BulkActionBar({
                 if (!open) setMoveSearch("");
               }}
             >
-              <Tooltip>
+              <Tooltip disableHoverableContent>
                 <TooltipTrigger asChild>
-                  <DropdownMenuTrigger asChild>
-                    <Button
-                      type="button"
-                      variant="ghost"
-                      size="icon-xs"
-                      className="shrink-0"
-                      disabled={isBusy || ownedSelected.length === 0}
-                      aria-label="Move to project"
-                      data-testid="bulk-move-to-project"
-                    >
-                      {bulkMove.isPending ? (
-                        <Loader2Icon className="size-3.5 animate-spin" />
-                      ) : (
-                        <FolderInputIcon className="size-3.5" />
-                      )}
-                    </Button>
-                  </DropdownMenuTrigger>
+                  {/* Separate nodes keep the Radix tooltip and menu trigger states independent. */}
+                  <span className="inline-flex shrink-0">
+                    <DropdownMenuTrigger asChild>
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="icon-xs"
+                        disabled={isBusy || ownedSelected.length === 0}
+                        aria-label="Move to project"
+                        data-testid="bulk-move-to-project"
+                      >
+                        {bulkMove.isPending ? (
+                          <Loader2Icon className="size-3.5 animate-spin" />
+                        ) : (
+                          <FolderInputIcon className="size-3.5" />
+                        )}
+                      </Button>
+                    </DropdownMenuTrigger>
+                  </span>
                 </TooltipTrigger>
-                <TooltipContent side="bottom">Move to project</TooltipContent>
+                <TooltipContent side="bottom" data-noninteractive-tooltip>
+                  Move to project
+                </TooltipContent>
               </Tooltip>
               <DropdownMenuContent align="end" className="w-52">
                 <div className="flex items-center gap-2 border-b px-2 py-1.5">

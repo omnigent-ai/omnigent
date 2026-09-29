@@ -15,7 +15,7 @@ import base64
 import os
 import re
 import stat
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable, Iterable, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, BinaryIO, Literal, ParamSpec
 
@@ -50,6 +50,7 @@ from omnigent.inner.sandbox import (
 
 if TYPE_CHECKING:
     from omnigent.inner.os_env import OpResult, OSEnvironment
+    from omnigent.runtime.filesystem_registry import FilesystemRegistry
 
 _MAX_READ_BYTES = 10 * 1024 * 1024  # 10 MiB
 # Cap on entries a single search may examine. Distinct from the result
@@ -177,6 +178,228 @@ def split_glob_list(raw: str | None) -> list[str]:
             current.append(ch)
     patterns.append("".join(current))
     return [p.strip() for p in patterns if p.strip()]
+
+
+_BENEATH_SUPPORTED = (
+    os.open in os.supports_dir_fd
+    and os.stat in os.supports_dir_fd
+    and hasattr(os, "O_NOFOLLOW")
+    and hasattr(os, "O_DIRECTORY")
+)
+
+
+def _lstat_beneath(root: Path, rel: str) -> os.stat_result | None:
+    """``lstat`` *root*/*rel* without letting any component be a symlink.
+
+    Every parent is opened with ``O_NOFOLLOW`` relative to the previous one,
+    so a directory swapped for a symlink cannot route the read outside
+    *root*, even between the check and the read. The leaf is never
+    followed. Platforms without ``dir_fd`` support fall back to a plain
+    ``lstat`` after checking the parent's resolved location.
+
+    :param root: Absolute directory the path is relative to.
+    :param rel: ``/``-separated path relative to *root*.
+    :returns: The leaf's own ``stat`` result, or ``None`` when any component
+        is missing, is a symlink, or cannot be opened.
+    """
+    parts = rel.split("/")
+    if not _BENEATH_SUPPORTED:
+        full = root / rel
+        real_root = os.path.realpath(root)
+        parent = os.path.realpath(full.parent)
+        if parent != real_root and not parent.startswith(real_root.rstrip(os.sep) + os.sep):
+            return None
+        try:
+            return full.lstat()
+        except OSError:
+            return None
+    try:
+        fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+    except OSError:
+        return None
+    try:
+        for name in parts[:-1]:
+            nfd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY, dir_fd=fd)
+            os.close(fd)
+            fd = nfd
+        return os.stat(parts[-1], dir_fd=fd, follow_symlinks=False)
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+
+
+def search_indexed_paths(
+    root: Path,
+    paths: Iterable[str],
+    query: str,
+    *,
+    include: Sequence[str] = (),
+    exclude: Sequence[str] = (),
+    limit: int = 500,
+) -> list[FilesystemEntry]:
+    """Match already-enumerated *paths* the way the directory walk would.
+
+    Applies the same filters as :meth:`CallerProcessFilesystem.search_files`
+    — case-insensitive substring on the path, include/exclude globs — and
+    reports a matching path's ancestor directories as directory entries, so
+    a query like ``"src"`` still surfaces the ``src`` folder. Only the
+    entries returned are stat'ed, and never through a symlink: parents are
+    opened without following links and the leaf is ``lstat``-ed, so nothing
+    outside *root* is ever described, even if a link is swapped mid-search.
+    A leaf that is itself a symlink is left out — the sandboxed walk, which
+    can follow links safely, describes those — and so is a path that no
+    longer exists (indexed but deleted from the working tree).
+
+    :param root: Absolute directory the paths are relative to.
+    :param paths: File paths relative to *root*, e.g. from ``git ls-files``.
+    :param query: Case-insensitive substring; whitespace-only matches nothing.
+    :param include: Pre-split include globs (see :func:`_glob_to_regex`).
+    :param exclude: Pre-split exclude globs; an excluded directory takes its
+        whole subtree with it, as the walk's pruning does.
+    :param limit: Maximum number of entries to return.
+    :returns: Matching entries sorted by path.
+    """
+    q = query.strip().lower()
+    if not q:
+        return []
+    inc = [re.compile(_glob_to_regex(p), re.IGNORECASE) for p in include]
+    exc = [re.compile(_glob_to_regex(p), re.IGNORECASE) for p in exclude]
+
+    def kept(rel: str) -> bool:
+        parts = rel.split("/")
+        ancestors = ("/".join(parts[:i]) for i in range(1, len(parts) + 1))
+        if any(r.match(a) for a in ancestors for r in exc):
+            return False
+        return not inc or any(r.match(rel) for r in inc)
+
+    # A directory whose path contains q is a prefix of every file under it,
+    # so only files that match can contribute matching directories.
+    candidates: dict[str, bool] = {}  # path -> is a directory
+    seen_dirs: set[str] = set()
+    for p in paths:
+        if q not in p.lower():
+            continue
+        candidates.setdefault(p, False)
+        cut = p.rfind("/")
+        while cut != -1:
+            ancestor = p[:cut]
+            if ancestor in seen_dirs:
+                break
+            seen_dirs.add(ancestor)
+            if q in ancestor.lower():
+                candidates[ancestor] = True
+            cut = p.rfind("/", 0, cut)
+
+    # Metadata is read outside the sandbox, so nothing here follows a symlink.
+    entries: list[FilesystemEntry] = []
+    for rel in sorted(candidates):
+        if not kept(rel):
+            continue
+        st = _lstat_beneath(root, rel)
+        if st is None or stat.S_ISLNK(st.st_mode):
+            continue
+        # A submodule is one index entry but a directory on disk.
+        is_dir = candidates[rel] or stat.S_ISDIR(st.st_mode)
+        entries.append(
+            FilesystemEntry(
+                id=rel,
+                name=rel.rsplit("/", 1)[-1],
+                path=rel,
+                type="directory" if is_dir else "file",
+                bytes=None if is_dir else st.st_size,
+                modified_at=int(st.st_mtime),
+            )
+        )
+        if len(entries) >= limit:
+            break
+    return entries
+
+
+def merge_entries(
+    primary: Sequence[FilesystemEntry], secondary: Sequence[FilesystemEntry], limit: int
+) -> list[FilesystemEntry]:
+    """Union two result sets by path, sorted by path and capped at *limit*.
+
+    :param primary: Entries that win on a duplicate path, e.g. index matches.
+    :param secondary: Entries filling in the rest, e.g. from a walk.
+    :param limit: Maximum number of entries to return.
+    :returns: Deduplicated entries sorted by path.
+    """
+    by_path = {e.path: e for e in secondary}
+    by_path.update((e.path, e) for e in primary)
+    return sorted(by_path.values(), key=lambda e: e.path)[:limit]
+
+
+def paths_under(paths: Iterable[str], subdir: str) -> list[str]:
+    """Narrow workspace-relative *paths* to those below *subdir*, re-rooted there.
+
+    :param paths: Paths relative to the workspace root.
+    :param subdir: Directory relative to the workspace root; ``""`` keeps all.
+    :returns: The paths under *subdir*, relative to it.
+    """
+    if not subdir:
+        return list(paths)
+    prefix = subdir.rstrip("/") + "/"
+    return [p[len(prefix) :] for p in paths if p.startswith(prefix)]
+
+
+def index_search(
+    registry: FilesystemRegistry,
+    root: Path,
+    subdir: str,
+    query: str,
+    *,
+    include: Sequence[str] = (),
+    exclude: Sequence[str] = (),
+    limit: int = 500,
+) -> list[FilesystemEntry] | None:
+    """Match the workspace's index plus its latest change snapshot, if any.
+
+    Covers every tracked file in one index read, however large the repo, and
+    the untracked files the Changed tab's most recent ``git status`` listed.
+    Ignored files are in neither, so callers still union in a walk.
+
+    :param registry: The workspace's change registry.
+    :param root: Absolute directory the results are relative to.
+    :param subdir: Directory relative to the workspace root being searched;
+        ``""`` for the whole workspace.
+    :param query: Case-insensitive substring.
+    :param include: Pre-split include globs.
+    :param exclude: Pre-split exclude globs.
+    :param limit: Maximum number of entries to return.
+    :returns: Matching entries, or ``None`` when the workspace has no index.
+    """
+    tracked = registry.list_tracked_files(subdir)
+    if tracked is None:
+        return None
+    snapshot = registry.last_changed_files()
+    if snapshot is not None:
+        # Snapshot paths come from pathlib and carry native separators;
+        # everything here (and git's index output) speaks '/'.
+        if os.sep != "/":
+            snapshot = [p.replace(os.sep, "/") for p in snapshot]
+        tracked += paths_under(snapshot, subdir.replace(os.sep, "/"))
+    return search_indexed_paths(
+        root, tracked, query, include=include, exclude=exclude, limit=limit
+    )
+
+
+def entry_payload(entry: FilesystemEntry) -> dict[str, object]:
+    """Serialize *entry* in the shape the filesystem endpoints return.
+
+    :param entry: Entry to serialize.
+    :returns: JSON-ready dict.
+    """
+    return {
+        "id": entry.id,
+        "object": "session.environment.filesystem.entry",
+        "name": entry.name,
+        "path": entry.path,
+        "type": entry.type,
+        "bytes": entry.bytes,
+        "modified_at": entry.modified_at,
+    }
 
 
 async def _run_os_env_async(
@@ -625,9 +848,9 @@ class CallerProcessFilesystem:
     ) -> tuple[list[FilesystemEntry], bool]:
         """Search recursively by name/path substring and glob filters.
 
-        Walks the full directory tree via ``os.walk()`` inside the sandbox and
-        returns entries — both files and directories — that satisfy all of the
-        supplied filters:
+        Walks the full directory tree via ``os.walk()`` inside the sandbox
+        (never entering ``.git``) and returns entries — both files and
+        directories — that satisfy all of the supplied filters:
 
         - ``exclude`` (highest priority): the entry is dropped if its path
           matches any exclude glob. Excluded subtrees are pruned from the
@@ -705,56 +928,55 @@ deferred = deque()
 scanned = 0
 truncated = False
 stop = False
+# os.walk is handed absolute roots, so an entry's path relative to `start` is
+# a slice of dirpath -- no per-entry relpath(), whose getcwd() calls used to
+# dominate the walk's runtime.
+root = os.path.abspath(start)
+# A bare root ('/', 'C:\') already ends in the separator the slice skips.
+cut = len(root.rstrip(os.sep)) + 1
 
 
-def match_dir(dirpath, dname):
-    dfull = os.path.join(dirpath, dname)
-    dp = os.path.relpath(dfull, start)
-    # Every dir reaching here already passed the exc filter in scan()'s kept
-    # loop; re-checking keeps match_dir/match_file symmetric so a future
-    # refactor of that pre-filter can't silently leak excluded dirs.
-    if exc and any(r.match(dp) for r in exc):
-        return
-    if inc and not any(r.match(dp) for r in inc):
-        return
-    if q not in dname.lower() and q not in dp.lower():
-        return
-    try:
-        st = os.stat(dfull)
-        results.append({'n': dname, 'p': dp, 's': None, 'm': int(st.st_mtime), 'd': True})
-    except OSError:
-        results.append({'n': dname, 'p': dp, 's': None, 'm': None, 'd': True})
+def rel(dirpath, name):
+    # Entries always use '/', like the git-index paths they merge with.
+    dp = dirpath[cut:]
+    if os.sep != '/':
+        dp = dp.replace(os.sep, '/')
+    return dp + '/' + name if dp else name
 
 
-def match_file(dirpath, fname):
-    # stat the FULL path: p is relative to `start`, but the helper's cwd is the
-    # workspace root, so stat(p) would miss -- or worse, stat a same-named file.
-    full = os.path.join(dirpath, fname)
-    p = os.path.relpath(full, start)
+def match(dirpath, name, is_dir):
+    # A directory carries no byte size; a file stats for size + mtime. Every
+    # dir reaching here already passed the exc filter in scan()'s kept loop;
+    # re-checking keeps the two entry kinds symmetric so a future refactor of
+    # that pre-filter can't silently leak excluded dirs.
+    p = rel(dirpath, name)
     if exc and any(r.match(p) for r in exc):
         return
     if inc and not any(r.match(p) for r in inc):
         return
-    if q not in fname.lower() and q not in p.lower():
+    if q not in p.lower():
         return
     try:
-        st = os.stat(full)
-        results.append({'n': fname, 'p': p, 's': st.st_size, 'm': int(st.st_mtime), 'd': False})
+        st = os.stat(os.path.join(dirpath, name))
+        results.append({'n': name, 'p': p, 's': None if is_dir else st.st_size,
+                        'm': int(st.st_mtime), 'd': is_dir})
     except OSError:
-        results.append({'n': fname, 'p': p, 's': None, 'm': None, 'd': False})
+        results.append({'n': name, 'p': p, 's': None, 'm': None, 'd': is_dir})
 
 
-def scan(root, defer):
+def scan(walk_root, defer):
     # A query matching little or nothing never trips the result cap, so the walk
     # needs its own bound. Counted per entry: per-directory would let one huge
     # directory overshoot it.
     global scanned, truncated, stop
-    for dirpath, dirnames, filenames in os.walk(root):
+    for dirpath, dirnames, filenames in os.walk(walk_root):
         kept = []
         for d in sorted(dirnames):
-            full = os.path.join(dirpath, d)
-            dp = os.path.relpath(full, start)
-            if any(r.match(dp) for r in exc):
+            if d == '.git':
+                # Git's own store is never a search target, and in a plain
+                # clone its reflogs alone can outnumber the source tree.
+                continue
+            if any(r.match(rel(dirpath, d)) for r in exc):
                 continue
             if defer and d in depri:
                 # Match the dir itself now, but walk its subtree later (pass 2)
@@ -763,6 +985,7 @@ def scan(root, defer):
                 # committed 'node_modules -> ..' would let pass 2 escape the
                 # workspace. os.walk(followlinks=False) never crosses symlinks
                 # mid-tree; deferring only real dirs keeps that boundary intact.
+                full = os.path.join(dirpath, d)
                 if not os.path.islink(full):
                     deferred.append(full)
             kept.append(d)
@@ -775,7 +998,7 @@ def scan(root, defer):
                 truncated = True
                 stop = True
                 return
-            match_dir(dirpath, dname)
+            match(dirpath, dname, True)
             if len(results) >= limit:
                 stop = True
                 return
@@ -785,13 +1008,13 @@ def scan(root, defer):
                 truncated = True
                 stop = True
                 return
-            match_file(dirpath, fname)
+            match(dirpath, fname, False)
             if len(results) >= limit:
                 stop = True
                 return
 
 
-scan(start, True)
+scan(root, True)
 while deferred and not stop:
     scan(deferred.popleft(), False)
 # When the walk stops early it is always because scan() tripped the budget

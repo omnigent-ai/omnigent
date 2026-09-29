@@ -317,6 +317,7 @@ def main(argv: list[str] | None = None) -> int:
     """
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--coords")
+    parser.add_argument("--workspace")
     parser.add_argument("operation", nargs="?", default="token")
     args, _ = parser.parse_known_args(argv)
     if args.operation != "token":
@@ -324,6 +325,8 @@ def main(argv: list[str] | None = None) -> int:
     coords = _read_sidecar(Path(args.coords) if args.coords else _sidecar_path())
     if coords is None:
         return 0
+    if args.workspace and coords["workspace_host"].rstrip("/") != args.workspace.rstrip("/"):
+        return 1
     resolved = fetch_broker_bearer(coords["server"], coords["host_id"], coords["host_token"])
     if resolved is None:
         return 0

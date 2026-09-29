@@ -252,10 +252,11 @@ def _rig_python(work: Path, gate_started: Path) -> str:
         "from omnigent.harnesses.claude_native import bridge\n"
         f"gate_started = Path({str(gate_started)!r})\n"
         "wait_for_prompt = bridge._wait_for_claude_prompt_ready\n"
-        "def observe_wait(socket_path, tmux_target, *, timeout_s):\n"
+        "def observe_wait(socket_path, tmux_target, *, timeout_s, bridge_dir=None):\n"
         "    if not gate_started.exists():\n"
         "        gate_started.write_text(str(time.monotonic()))\n"
-        "    wait_for_prompt(socket_path, tmux_target, timeout_s=timeout_s)\n"
+        "    wait_for_prompt(socket_path, tmux_target, timeout_s=timeout_s, "
+        "bridge_dir=bridge_dir)\n"
         "bridge._wait_for_claude_prompt_ready = observe_wait\n"
     )
     (site_packages / "omnigent_rig.pth").write_text(
@@ -293,7 +294,8 @@ def test_slow_ready_wrapper_waits_for_delivery(
                 "from omnigent.harnesses.claude_native import bridge\n"
                 f"assert not Path({str(gate_started)!r}).exists()\n"
                 "bridge._capture_pane = lambda *_: '────────────────\\n❯ \\n────────────────'\n"
-                "bridge._wait_for_claude_prompt_ready('/tmp/sock', 'main', timeout_s=0.0)\n"
+                "bridge._wait_for_claude_prompt_ready('/tmp/sock', 'main', timeout_s=0.0, "
+                f"bridge_dir=Path({str(tmp_path)!r}))\n"
                 f"assert Path({str(gate_started)!r}).exists()\n",
             ],
             check=True,

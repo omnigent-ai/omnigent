@@ -2169,6 +2169,35 @@ def test_provider_ui_capabilities_reports_multi_repo_per_provider() -> None:
     }
 
 
+def test_provider_ui_capabilities_enable_inference_only_on_configured_target() -> None:
+    launcher = FakeSandboxLauncher()
+    profile = {
+        "providers": {"gateway": {"kind": "gateway"}},
+        "inference": {"harnesses": {"pi-native": {"provider": "gateway"}}},
+    }
+    deployment = ManagedSandboxDeployment(
+        configs=tuple(
+            ManagedSandboxConfig(
+                server_url="https://s",
+                provider=provider,
+                token_ttl_s=3600,
+                launcher_factory=lambda: launcher,
+                host_config=config,
+            )
+            for provider, config in (
+                ("kubernetes", None),
+                ("modal", {"inference": {"harnesses": {}}}),
+                ("agent_sandbox", profile),
+            )
+        )
+    )
+    assert deployment.provider_ui_capabilities() == {
+        "kubernetes": {"multi_repo": False},
+        "modal": {"multi_repo": False},
+        "agent_sandbox": {"multi_repo": False, "inference_models": True},
+    }
+
+
 # ── GET /v1/info: managed_sandboxes_enabled ─────────────────
 
 
@@ -2976,7 +3005,7 @@ async def test_relaunch_rejects_pending_reused_id_then_allows_retry(db_uri: str)
     assert exc.value.status_code == 409
     assert "host lifecycle" in exc.value.detail
     assert len(fake.host_starts) == 1
-    assert fake.terminated == [active.name]
+    assert fake.terminated == []
     still_pending = host_store.get_host(active.host_id)
     assert still_pending is not None
     assert still_pending.sandbox_id is None
@@ -2984,7 +3013,7 @@ async def test_relaunch_rejects_pending_reused_id_then_allows_retry(db_uri: str)
 
     reaper = ManagedSandboxReaper(host_store=host_store, sandbox_config=config)
     assert await reaper.sweep_once() == 1
-    assert fake.terminated == [active.name, active.name]
+    assert fake.terminated == [active.name]
     cleared = host_store.get_host(active.host_id)
     assert cleared is not None
     assert cleared.sandbox_id is None
@@ -3460,6 +3489,7 @@ async def test_run_managed_wake_forwards_recorded_repo(
 
     monkeypatch.setattr("omnigent.server.managed_hosts.resume_managed_host", _resume)
     conv = SimpleNamespace(
+        inference_snapshot=None,
         labels={MANAGED_REPO_LABEL_KEY: raw_repo} if raw_repo is not None else {},
         host_id="host_1",
     )
@@ -3468,7 +3498,7 @@ async def test_run_managed_wake_forwards_recorded_repo(
     await orchestration._run_managed_wake(
         session_id="conv_1",
         conv=conv,
-        sandbox_config=SimpleNamespace(),
+        sandbox_config=SimpleNamespace(configs=()),
         tracker=tracker,
         conversation_store=SimpleNamespace(get_conversation=lambda _sid: conv),
         host_store=SimpleNamespace(),
@@ -4709,7 +4739,7 @@ async def test_kick_managed_relaunch_defers_the_classifier_to_the_launch_task(
         session_id="conv_1",
         conv=conv,
         host=SimpleNamespace(user_id=_OWNER),
-        sandbox_config=SimpleNamespace(),
+        sandbox_config=SimpleNamespace(configs=()),
         tracker=tracker,
         conversation_store=SimpleNamespace(),
         host_store=SimpleNamespace(),
@@ -4761,7 +4791,7 @@ async def test_relaunch_claim_and_launch_task_are_one_synchronous_step(
         session_id="conv_1",
         conv=conv,
         host=SimpleNamespace(user_id=_OWNER),
-        sandbox_config=SimpleNamespace(),
+        sandbox_config=SimpleNamespace(configs=()),
         tracker=tracker,
         conversation_store=SimpleNamespace(),
         host_store=SimpleNamespace(),
@@ -4794,7 +4824,7 @@ async def test_kick_managed_relaunch_without_agent_store_threads_none(
         session_id="conv_1",
         conv=conv,
         host=SimpleNamespace(user_id=_OWNER),
-        sandbox_config=SimpleNamespace(),
+        sandbox_config=SimpleNamespace(configs=()),
         tracker=ManagedLaunchTracker(),
         conversation_store=SimpleNamespace(),
         host_store=SimpleNamespace(),
@@ -4833,10 +4863,10 @@ async def test_run_managed_launch_leaves_the_runner_unclassified(
     await orchestration._run_managed_launch(
         session_id="conv_1",
         owner=_OWNER,
-        sandbox_config=SimpleNamespace(),
+        sandbox_config=SimpleNamespace(configs=()),
         repos=[],
         tracker=ManagedLaunchTracker(),
-        conversation_store=SimpleNamespace(),
+        conversation_store=SimpleNamespace(get_conversation=lambda _sid: None),
         host_store=SimpleNamespace(),
         host_registry=None,
         tunnel_registry=None,
@@ -4876,10 +4906,10 @@ async def test_run_managed_launch_resolves_the_classifier_on_its_own_task(
     await orchestration._run_managed_launch(
         session_id="conv_1",
         owner=_OWNER,
-        sandbox_config=SimpleNamespace(),
+        sandbox_config=SimpleNamespace(configs=()),
         repos=[],
         tracker=ManagedLaunchTracker(),
-        conversation_store=SimpleNamespace(),
+        conversation_store=SimpleNamespace(get_conversation=lambda _sid: None),
         host_store=SimpleNamespace(),
         host_registry=None,
         tunnel_registry=None,
@@ -4915,10 +4945,10 @@ async def test_run_managed_launch_omits_the_classifier_for_a_session_scoped_impo
     await orchestration._run_managed_launch(
         session_id="conv_1",
         owner=_OWNER,
-        sandbox_config=SimpleNamespace(),
+        sandbox_config=SimpleNamespace(configs=()),
         repos=[],
         tracker=ManagedLaunchTracker(),
-        conversation_store=SimpleNamespace(),
+        conversation_store=SimpleNamespace(get_conversation=lambda _sid: None),
         host_store=SimpleNamespace(),
         host_registry=None,
         tunnel_registry=None,
@@ -4967,7 +4997,7 @@ async def test_kick_managed_wake_defers_the_classifier_to_the_wake_task(
     orchestration._kick_managed_wake_impl(
         session_id="conv_1",
         conv=conv,
-        sandbox_config=SimpleNamespace(),
+        sandbox_config=SimpleNamespace(configs=()),
         tracker=ManagedLaunchTracker(),
         conversation_store=SimpleNamespace(),
         host_store=SimpleNamespace(),
@@ -5004,11 +5034,13 @@ async def test_run_managed_wake_re_stamps_the_woken_runner(
         bundle_location="bundle/loc",
         session_id=None,
     )
-    conv = SimpleNamespace(labels={}, host_id="host_1", agent_id=builtin.id)
+    conv = SimpleNamespace(
+        inference_snapshot=None, labels={}, host_id="host_1", agent_id=builtin.id
+    )
     await orchestration._run_managed_wake(
         session_id="conv_1",
         conv=conv,
-        sandbox_config=SimpleNamespace(),
+        sandbox_config=SimpleNamespace(configs=()),
         tracker=ManagedLaunchTracker(),
         conversation_store=SimpleNamespace(get_conversation=lambda _sid: None),
         host_store=SimpleNamespace(),
@@ -5044,11 +5076,13 @@ async def test_run_managed_wake_omits_the_classifier_for_a_session_scoped_impost
         bundle_location="bundle/loc",
         session_id="conv_1",
     )
-    conv = SimpleNamespace(labels={}, host_id="host_1", agent_id=impostor.id)
+    conv = SimpleNamespace(
+        inference_snapshot=None, labels={}, host_id="host_1", agent_id=impostor.id
+    )
     await orchestration._run_managed_wake(
         session_id="conv_1",
         conv=conv,
-        sandbox_config=SimpleNamespace(),
+        sandbox_config=SimpleNamespace(configs=()),
         tracker=ManagedLaunchTracker(),
         conversation_store=SimpleNamespace(get_conversation=lambda _sid: None),
         host_store=SimpleNamespace(),
@@ -5087,11 +5121,12 @@ async def test_run_managed_wake_recreates_a_definitively_gone_sandbox(
     agent_store = _StubAgentStore({builtin.id: builtin})
     host = SimpleNamespace(host_id="host_1", user_id=_OWNER)
     host_store = SimpleNamespace(get_host=lambda _host_id: host)
-    sandbox_config = SimpleNamespace()
+    sandbox_config = SimpleNamespace(configs=())
     conversation_store = SimpleNamespace()
     host_registry = SimpleNamespace()
     tunnel_registry = SimpleNamespace()
     conv = SimpleNamespace(
+        inference_snapshot=None,
         labels={MANAGED_REPO_LABEL_KEY: "https://github.com/omnigent-ai/omnigent#main"},
         host_id=host.host_id,
         agent_id=builtin.id,
@@ -5170,7 +5205,7 @@ async def test_recreated_sandbox_records_and_publishes_workspace_reset_notice(
             host_id="host_1",
             workspace="/root/workspace/omnigent",
         ),
-        sandbox_config=SimpleNamespace(),
+        sandbox_config=SimpleNamespace(configs=()),
         tracker=tracker,
         conversation_store=_ConversationStore(),
         host_store=SimpleNamespace(),
@@ -5258,7 +5293,7 @@ async def test_concurrent_relaunch_messages_kick_a_single_launch(
     )
     app_state = SimpleNamespace(
         host_store=SimpleNamespace(get_host=lambda _hid: dead_host, is_online=lambda _hid: False),
-        sandbox_config=SimpleNamespace(),
+        sandbox_config=SimpleNamespace(configs=()),
         managed_launches=tracker,
         agent_store=_StubAgentStore({builtin.id: builtin}),
         host_registry=None,
@@ -5582,3 +5617,58 @@ def test_keep_warm_sets_runner_idle_timeout() -> None:
     assert _apply_keep_warm({"x": 1}, None) == {"x": 1}
     with pytest.raises(ValueError):
         _parse_keep_warm_s({"keep_warm_s": -5})
+
+
+@pytest.mark.parametrize("relaunch", [False, True])
+async def test_account_deleted_after_provision_terminates_unregistered_sandbox(db_uri, relaunch):
+    from omnigent.db.account_authority import account_authority_scope
+    from omnigent.server.accounts_store import SqlAlchemyAccountStore
+
+    accounts = SqlAlchemyAccountStore(db_uri)
+    account = accounts.create_user_with_password(_OWNER, "test-password-hash")
+    hosts = HostStore(db_uri)
+
+    def connect(invocation):
+        hosts.upsert_on_connect(invocation.host_id, invocation.host_name, _OWNER)
+
+    fake = FakeSandboxLauncher(on_host_start=connect)
+    config = _injected_config(fake)
+    host = None
+    if relaunch:
+        first = await launch_managed_host(config=config, owner=_OWNER, host_store=hosts)
+        host = hosts.get_host(first.host_id)
+    provision = fake.provision
+    unregistered = []
+
+    def delete_after_provision(name):
+        sandbox_id = provision(name)
+        unregistered.append(sandbox_id)
+        assert accounts.delete_user(_OWNER) is True
+        return sandbox_id
+
+    fake.provision = delete_after_provision
+    with account_authority_scope(_OWNER, account.account_generation):
+        with pytest.raises(HTTPException) as error:
+            if relaunch:
+                await relaunch_managed_host(config=config, host=host, host_store=hosts)
+            else:
+                await launch_managed_host(config=config, owner=_OWNER, host_store=hosts)
+    assert "revoked" in str(error.value.detail)
+    assert len(unregistered) == 1
+    assert unregistered[0] in fake.terminated
+    assert len(fake.host_starts) == (1 if relaunch else 0)
+
+
+async def test_registration_database_failure_still_attempts_provider_cleanup(db_uri, monkeypatch):
+    hosts = HostStore(db_uri)
+    fake = FakeSandboxLauncher()
+
+    def unavailable(*args, **kwargs):
+        raise RuntimeError("database unavailable")
+
+    monkeypatch.setattr(hosts, "register_managed_host", unavailable)
+    monkeypatch.setattr(hosts, "get_host", unavailable)
+    with pytest.raises(HTTPException, match="database unavailable"):
+        await launch_managed_host(config=_injected_config(fake), owner=_OWNER, host_store=hosts)
+    assert len(fake.terminated) == 1
+    assert fake.host_starts == []

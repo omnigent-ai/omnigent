@@ -281,11 +281,15 @@ async def test_sys_agent_list_preserves_small_default_then_pages(tmp_path: Path)
         )
 
     state = {"large": False}
+    session_queries: list[httpx.QueryParams] = []
+    agent_queries: list[httpx.QueryParams] = []
 
     async def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/v1/agents":
+            agent_queries.append(request.url.params)
             return _server_page(request, _agent_rows(large=state["large"]))
         if request.url.path == "/v1/sessions":
+            session_queries.append(request.url.params)
             return _server_page(request, _session_rows(large=False))
         if request.url.path == "/v1/sessions/conv_caller":
             return httpx.Response(404)
@@ -334,6 +338,9 @@ async def test_sys_agent_list_preserves_small_default_then_pages(tmp_path: Path)
     assert len(complete["session_agents"]) == _ROW_COUNT
     assert len(complete["local_configs"]) == _ROW_COUNT
     assert "page" not in complete
+    assert all(query.get("visibility") == "all" for query in session_queries)
+    assert all("visibility" not in query for query in agent_queries)
+    assert session_queries[2]["after"] == "conv_04"
     assert [row["agent_id"] for row in later["builtins"]] == [
         f"ag_{index:02d}" for index in range(5, 10)
     ]
@@ -449,6 +456,7 @@ async def test_sys_session_list_continues_server_catalog_with_cursor() -> None:
         for index in range(1_001)
     ]
     received_afters: list[str | None] = []
+    received_visibilities: list[str | None] = []
 
     async def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/v1/sessions/conv_caller/child_sessions":
@@ -457,6 +465,7 @@ async def test_sys_session_list_continues_server_catalog_with_cursor() -> None:
             return httpx.Response(200, json={"id": "conv_caller", "parent_session_id": None})
         if request.url.path == "/v1/sessions":
             received_afters.append(request.url.params.get("after"))
+            received_visibilities.append(request.url.params.get("visibility"))
             return _server_page(request, rows)
         raise AssertionError(f"unexpected path {request.url.path}")
 
@@ -483,6 +492,7 @@ async def test_sys_session_list_continues_server_catalog_with_cursor() -> None:
     assert first["sessions"][0]["session_id"] == "conv_0000"
     assert second["sessions"][0]["session_id"] == "conv_0100"
     assert received_afters == [None, "conv_0099"]
+    assert received_visibilities == ["all", "all"]
 
 
 @pytest.mark.asyncio

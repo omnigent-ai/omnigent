@@ -5507,8 +5507,12 @@ async def _cmd_switch(
     from rich.table import Table
     from rich.text import Text
 
+    # Switching binds an owner-only runner unless this is an attach/co-drive client.
+    visibility = (
+        "all" if isinstance(session, _SessionsChatReplAdapter) and session._attach_only else "mine"
+    )
     if not arg:
-        sessions_list = await client.sessions.list(limit=20)
+        sessions_list = await client.sessions.list(limit=20, visibility=visibility)
         if sessions_list:
             table = Table(title="Switch to…")
             table.add_column("#", style="bold " + fmt.accent)
@@ -5531,7 +5535,7 @@ async def _cmd_switch(
             host.output(Text.from_markup(f"  [{fmt.muted}]No sessions.[/{fmt.muted}]"))
     else:
         if arg.isdigit():
-            sessions_list = await client.sessions.list(limit=20)
+            sessions_list = await client.sessions.list(limit=20, visibility=visibility)
             index = int(arg) - 1
             if index < 0 or index >= len(sessions_list):
                 host.output(

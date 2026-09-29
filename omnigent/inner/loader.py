@@ -18,6 +18,7 @@ from .datamodel import (
     OSEnvSpec,
     ParamDef,
     TerminalEnvSpec,
+    parse_write_paths,
 )
 from .policies import (
     FunctionPolicy,
@@ -276,11 +277,29 @@ def _parse_agent_def(
     agent.spawn = data.get("spawn", False)
     agent.agent_session_sharing = data.get("agent_session_sharing", "none")
     agent.os_env = _parse_os_env_spec(data.get("os_env"))
+    raw_model_egress = data.get("model_egress")
+    if raw_model_egress is not None:
+        if not isinstance(raw_model_egress, list) or not raw_model_egress:
+            raise ValueError("model_egress must be a non-empty list")
+        from .egress.rules import parse_rule
+
+        agent.model_egress = []
+        for index, rule in enumerate(raw_model_egress):
+            if not isinstance(rule, str):
+                raise ValueError(f"model_egress[{index}] must be a string")
+            parse_rule(rule)
+            agent.model_egress.append(rule)
 
     # Executor
     executor_data = data.get("executor")
     if executor_data:
         agent.executor = _parse_executor_spec(executor_data)
+
+    from omnigent.sandbox.copy_on_write import validate_copy_on_write_harness
+
+    validate_copy_on_write_harness(
+        agent.os_env, agent.executor.harness if agent.executor else None
+    )
 
     # Params
     for pname, pdata in data.get("params", {}).items():
@@ -666,11 +685,19 @@ def _parse_executor_spec(data: YamlData | str | bool | None) -> ExecutorSpec | N
             from omnigent.spec.parser import _parse_executor_auth
 
             auth = _parse_executor_auth(data, expand_env=True)
+        context_files = data.get("context_files")
+        if "context_files" in data and not isinstance(context_files, bool):
+            raise ValueError("executor.context_files must be a boolean")
+        system_prompt_mode = data.get("system_prompt_mode")
+        if "system_prompt_mode" in data and system_prompt_mode not in ("append", "replace"):
+            raise ValueError("executor.system_prompt_mode must be 'append' or 'replace'")
         return ExecutorSpec(
             model=data.get("model"),
             harness=data.get("harness"),
             profile=data.get("profile"),
             auth=auth,
+            context_files=context_files,
+            system_prompt_mode=system_prompt_mode,
         )
     return None
 
@@ -784,6 +811,11 @@ def _parse_os_env_sandbox_spec(data: YamlData | str | bool | None) -> OSEnvSandb
         if raw_type is not None and not isinstance(raw_type, str):
             raise TypeError("os_env.sandbox.type must be a string or null")
         sandbox_type = _resolve_sandbox_type(raw_type)
+    parsed_write_paths = parse_write_paths(data.get("write_paths"))
+    if sandbox_type != "linux_bwrap" and any(
+        not isinstance(p, str) and p.copy_on_write for p in parsed_write_paths or []
+    ):
+        raise ValueError("copy_on_write requires sandbox.type=linux_bwrap")
     egress_rules = data.get("egress_rules")
     # Mirror the Omnigent parser's hard reject of ``egress_rules`` paired with
     # a backend that cannot enforce them at spawn time. Without this
@@ -850,11 +882,7 @@ def _parse_os_env_sandbox_spec(data: YamlData | str | bool | None) -> OSEnvSandb
     return OSEnvSandboxSpec(
         type=sandbox_type,
         read_paths=data.get("read_paths"),
-        write_paths=(
-            list(data["write_paths"])
-            if "write_paths" in data and data.get("write_paths") is not None
-            else None
-        ),
+        write_paths=parsed_write_paths,
         write_files=(
             list(data["write_files"])
             if "write_files" in data and data.get("write_files") is not None

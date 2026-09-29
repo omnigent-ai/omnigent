@@ -712,7 +712,7 @@ class BenchEnvironment:
         """Resolve a registered agent's id by name."""
         assert self.client is not None
         listing = await self.client.get(
-            "/v1/sessions", params={"agent_name": agent_name, "limit": 1}
+            "/v1/sessions", params={"agent_name": agent_name, "limit": 1, "visibility": "all"}
         )
         listing.raise_for_status()
         return str(listing.json()["data"][0]["agent_id"])

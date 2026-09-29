@@ -285,6 +285,18 @@ async def _drive_sandbox_prefill(base_url: str, session_id: str) -> None:
                     status=200, content_type="application/json", body=_managed_info_body()
                 )
 
+            async def handle_sandbox_models(route: Route) -> None:
+                await route.fulfill(
+                    json={
+                        "configured": False,
+                        "models": [],
+                        "configuration_revision": None,
+                        "provider_label": None,
+                        "default_model": None,
+                        "status": "unconfigured",
+                    }
+                )
+
             async def handle_hosts(route: Route) -> None:
                 await route.fulfill(
                     status=200, content_type="application/json", body=_hosts_body()
@@ -329,6 +341,9 @@ async def _drive_sandbox_prefill(base_url: str, session_id: str) -> None:
                 )
 
             await page.route("**/v1/info", handle_info)
+            await page.route(
+                "**/v1/sandbox-providers/*/harnesses/*/model-options*", handle_sandbox_models
+            )
             await page.route("**/v1/hosts", handle_hosts)
             await page.route("**/v1/agents", handle_agents)
             await page.route("**/v1/sessions/projects", handle_projects_list)

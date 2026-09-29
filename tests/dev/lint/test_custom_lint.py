@@ -9,6 +9,7 @@ from __future__ import annotations
 import pytest
 
 import dev.lint.custom_lint as custom_lint
+from dev.lint import lint_session_list_visibility
 
 
 def test_workspace_scoped_cache_is_the_first_registered_rule() -> None:
@@ -17,9 +18,14 @@ def test_workspace_scoped_cache_is_the_first_registered_rule() -> None:
     assert custom_lint.RULES[0].name == "workspace-scoped-cache"
 
 
-def test_clean_tree_passes() -> None:
-    """With every rule clean on the real tree, the runner returns 0."""
+def test_clean_tree_passes(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Check Python sources without requiring frontend dependencies in Python CI."""
+    monkeypatch.setattr(lint_session_list_visibility, "_check_typescript", lambda paths: [])
     assert custom_lint.main() == 0
+
+
+def test_session_visibility_is_registered() -> None:
+    assert any(rule.name == "session-list-visibility" for rule in custom_lint.RULES)
 
 
 def test_any_rule_violation_fails(monkeypatch: pytest.MonkeyPatch) -> None:

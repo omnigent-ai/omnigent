@@ -670,6 +670,43 @@ def test_deleted_file_raises_clear_error(
         )
 
 
+def test_filesystem_attachment_rejected_by_generic_resolver() -> None:
+    """Generic resolvers reject filesystem attachments before fetching their bytes."""
+    zip_store, _ = _stores_with("file_zip", "archive.zip", "application/zip", b"PK\x03\x04")
+    item = _make_conversation_item(
+        [{"type": "input_file", "file_id": "file_zip", "filename": "archive.zip"}]
+    )
+
+    with pytest.raises(ValueError, match="filesystem-capable harness"):
+        resolve_content_references(
+            [item],
+            zip_store,
+            FakeArtifactStore(blobs={}),  # type: ignore[arg-type]
+        )
+
+
+def test_native_forward_defers_filesystem_files_and_resolves_the_rest() -> None:
+    """Native forwarding preserves filesystem references while resolving ordinary files."""
+    from omnigent.runtime.content_resolver import _resolve_message_content
+
+    store, artifacts = _stores_with("file_txt", "notes.txt", "text/plain", b"hello")
+    zip_store, _ = _stores_with("file_zip", "archive.zip", "application/zip", b"PK\x03\x04")
+    store.files.update(zip_store.files)
+    zip_block = {"type": "input_file", "file_id": "file_zip", "filename": "archive.zip"}
+    content = [zip_block, {"type": "input_file", "file_id": "file_txt", "filename": "notes.txt"}]
+
+    resolved = _resolve_message_content(
+        content,
+        store,
+        artifacts,  # type: ignore[arg-type]
+        defer_filesystem_files=True,
+    )
+
+    assert resolved[0] == zip_block
+    assert resolved[1]["file_data"].startswith("data:text/plain;base64,")
+    assert "file_id" not in resolved[1]
+
+
 # ── _resolve_content_type tests ───────────────────────────────────────
 
 
@@ -1664,12 +1701,7 @@ def _stores_with(
 
 
 def test_extracts_text_from_csv_attachment() -> None:
-    """A text/csv ``input_file`` attachment's content is decoded for scanning.
-
-    Regression for #2906: an attached CSV is base64-inlined to the model and
-    never appears in the typed message, so its PII must be surfaced here for
-    the request-phase PII policy to catch it.
-    """
+    """Policy receives decoded CSV text even when it is absent from the typed message."""
     csv = b"id,full_name,credit_card\n1,Alice,4111 1111 1111 1111\n"
     fs, arts = _stores_with("file_csv", "data.csv", "text/csv", csv)
     content = [
@@ -1677,16 +1709,48 @@ def test_extracts_text_from_csv_attachment() -> None:
         {"type": "input_file", "file_id": "file_csv"},
     ]
     out = extract_text_attachments(content, fs, arts)  # type: ignore[arg-type]
-    assert len(out) == 1
-    assert out[0]["filename"] == "data.csv"
-    assert out[0]["content_type"] == "text/csv"
-    assert "4111 1111 1111 1111" in out[0]["text"]
+    assert out == [{"filename": "data.csv", "content_type": "text/csv", "text": csv.decode()}]
 
 
-def test_skips_binary_attachments() -> None:
+@pytest.mark.parametrize(
+    ("content_type", "block_type"),
+    [
+        ("application/zip", "input_file"),
+        ("text/plain", "input_file"),
+        ("image/png", "input_image"),
+    ],
+)
+def test_archive_is_announced_to_policy_without_text(content_type: str, block_type: str) -> None:
+    """Policy sees filesystem files without decoding, even with misleading MIME/block types."""
+    fs, arts = _stores_with("file_zip", "bundle.zip", content_type, b"PK\x03\x04data")
+    content = [
+        {"type": "input_text", "text": "unpack this"},
+        {"type": block_type, "file_id": "file_zip"},
+    ]
+
+    out = extract_text_attachments(content, fs, arts)  # type: ignore[arg-type]
+
+    assert out == [{"filename": "bundle.zip", "content_type": content_type, "text": ""}]
+
+
+def test_resolved_block_takes_its_filename_from_the_stored_file() -> None:
+    """Delivery uses the stored filename even when the message supplies another extension."""
+    fs, arts = _stores_with("file_txt", "payload.txt", "text/plain", b"hello")
+    item = _make_conversation_item(
+        [{"type": "input_file", "file_id": "file_txt", "filename": "payload.db"}]
+    )
+
+    result = resolve_content_references([item], fs, arts)  # type: ignore[arg-type]
+
+    assert isinstance(result[0].data, MessageData)
+    assert result[0].data.content[0]["filename"] == "payload.txt"
+
+
+@pytest.mark.parametrize("block_type", ["input_file", "input_image"])
+def test_skips_binary_attachments(block_type: str) -> None:
     """Non-text attachments (image/PDF) are not decoded."""
     fs, arts = _stores_with("file_png", "photo.png", "image/png", PNG_BYTES)
-    content = [{"type": "input_file", "file_id": "file_png"}]
+    content = [{"type": block_type, "file_id": "file_png"}]
     assert extract_text_attachments(content, fs, arts) == []  # type: ignore[arg-type]
 
 

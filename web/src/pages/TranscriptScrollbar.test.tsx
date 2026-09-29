@@ -23,7 +23,7 @@ describe("TranscriptScrollbar thumb", () => {
     // viewport. A thumb for that noise advertises hidden content that does
     // not exist, so the scrollbar must not render.
     render(
-      <TranscriptScrollbar scroller={makeScroller({ clientHeight: 800, scrollHeight: 803 })} />,
+      <TranscriptScrollbar scroller={makeScroller({ clientHeight: 800, scrollHeight: 808 })} />,
     );
     expect(screen.queryByTestId("transcript-scrollbar-thumb")).toBeNull();
   });
@@ -36,11 +36,11 @@ describe("TranscriptScrollbar thumb", () => {
   });
 
   it("paints a thumb at exactly the minimum scroll range", () => {
-    // 804 − 800 sits right on the threshold: the gate is `<`, so a real range
-    // of exactly 4px still gets an indicator. Locks the boundary against an
+    // 809 − 800 sits right on the threshold: the gate is `<`, so a real range
+    // of exactly 9px still gets an indicator. Locks the boundary against an
     // accidental flip to `<=`.
     render(
-      <TranscriptScrollbar scroller={makeScroller({ clientHeight: 800, scrollHeight: 804 })} />,
+      <TranscriptScrollbar scroller={makeScroller({ clientHeight: 800, scrollHeight: 809 })} />,
     );
     expect(screen.getByTestId("transcript-scrollbar-thumb")).toBeTruthy();
   });

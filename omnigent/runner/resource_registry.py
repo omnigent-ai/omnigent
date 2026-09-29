@@ -12,13 +12,15 @@ See ``designs/SESSION_RESOURCES_API_DESIGN.md`` §Runner internal model.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
 import re
 import threading
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from copy import deepcopy
+from dataclasses import dataclass, replace
 from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
@@ -38,6 +40,8 @@ from omnigent.entities.session_resources import (
     terminal_resource_view,
 )
 from omnigent.inner.sandbox import contained_realpath, containment_prefix
+from omnigent.native.native_coding_agents import native_coding_agent_for_harness
+from omnigent.native.native_dispatch import resolve_hook_for_key
 
 if TYPE_CHECKING:
     from omnigent.harnesses.claude_native.status_file import SessionStatusPoller
@@ -276,6 +280,34 @@ def _monotonic() -> float:
     return time.monotonic()
 
 
+def _native_input_ready_probe(
+    resource_role: str | None,
+) -> Callable[[str, TerminalInstance], bool] | None:
+    """Resolve the provider's ``input_ready_probe`` for a native terminal role.
+
+    Native terminal roles are the harness names (``"pi-native"``), so the role
+    maps straight onto the provider row that owns the probe.
+
+    :param resource_role: Runner-private terminal role, e.g.
+        :data:`PI_NATIVE_TERMINAL_ROLE`, or ``None`` for a generic terminal.
+    :returns: The probe, or ``None`` for generic terminals or a probe that fails
+        to import (logged loudly, but readiness logging must not block the
+        terminal watcher).
+    """
+    agent = native_coding_agent_for_harness(resource_role)
+    if agent is None:
+        return None
+    try:
+        return resolve_hook_for_key(agent.key, "input_ready_probe")
+    except Exception:  # noqa: BLE001 - see docstring.
+        _logger.warning(
+            "Native input-ready probe unavailable for %s; native_input_ready will not be logged",
+            resource_role,
+            exc_info=True,
+        )
+        return None
+
+
 # Allowlist rather than a denylist: a denylist only stops the separators it
 # thought to enumerate, and the previous one let a backslash through — a real
 # separator on a Windows host.
@@ -373,9 +405,12 @@ class SessionResourceRegistry:
         per_session_workspace: bool = False,
     ) -> None:
         self._terminal_registry = terminal_registry
+        if terminal_registry is not None:
+            terminal_registry.environment_resolver = self._resolve_terminal_environment
         self._runner_workspace = runner_workspace
         self._per_session_workspace = per_session_workspace
         self._primary_envs: dict[str, OSEnvironment] = {}
+        self._primary_env_specs: dict[str, OSEnvSpec | None] = {}
         self._terminal_roles: dict[tuple[str, str], str] = {}
         self._terminal_lifecycles: dict[tuple[str, str], TerminalLifecycle] = {}
         self._is_alive_cache: TTLCache[str, bool] = TTLCache(
@@ -791,10 +826,24 @@ class SessionResourceRegistry:
 
         raise ValueError(f"Environment {environment_id!r} not found for session {session_id!r}")
 
+    def uses_copy_on_write(self, session_id: str) -> bool:
+        """Preserve disposable semantics if a later spec lookup is unavailable."""
+        with self._lock:
+            environment = self._primary_envs.get(session_id)
+            return bool(
+                getattr(getattr(environment, "sandbox", None), "copy_on_write_roots", None)
+            )
+
+    def _resolve_terminal_environment(self, session_id: str, spec: OSEnvSpec) -> OSEnvironment:
+        """Resolve the environment shared by inherited terminals and file tools."""
+        return self._resolve_primary(session_id, None, os_env_spec=spec)
+
     def _resolve_primary(
         self,
         session_id: str,
         agent_spec: AgentSpec | None,
+        *,
+        os_env_spec: OSEnvSpec | None = None,
     ) -> OSEnvironment:
         """Get or create the primary OSEnvironment for a session.
 
@@ -803,18 +852,65 @@ class SessionResourceRegistry:
         :returns: The primary :class:`OSEnvironment`.
         """
         with self._lock:
+            requested_spec = os_env_spec or getattr(agent_spec, "os_env", None)
+            if requested_spec is not None:
+                requested_spec = self._effective_primary_spec(session_id, requested_spec)
             cached = self._primary_envs.get(session_id)
             if cached is not None:
-                return cached
+                previous_spec = self._primary_env_specs.get(session_id)
+                requested_cow = (
+                    requested_spec is not None
+                    and requested_spec.sandbox is not None
+                    and any(p.copy_on_write for p in requested_spec.sandbox.write_path_specs)
+                )
+                cached_cow = bool(
+                    getattr(getattr(cached, "sandbox", None), "copy_on_write_roots", None)
+                )
+                if requested_spec is not None and (requested_cow or cached_cow):
+                    if previous_spec is None and not cached_cow:
+                        # The filesystem panel may create a host read view before
+                        # the agent's sandbox configuration becomes available.
+                        cached.close()
+                        self._primary_envs.pop(session_id)
+                    elif previous_spec != requested_spec:
+                        raise ValueError(
+                            "Cannot change an active copy-on-write environment; "
+                            "start a new session"
+                        )
+                    else:
+                        return cached
+                else:
+                    return cached
 
-            os_env = self._create_primary_env(session_id, agent_spec)
+            os_env = (
+                self._create_primary_env(session_id, agent_spec, os_env_spec=os_env_spec)
+                if os_env_spec is not None
+                else self._create_primary_env(session_id, agent_spec)
+            )
             self._primary_envs[session_id] = os_env
+            self._primary_env_specs[session_id] = deepcopy(requested_spec)
             return os_env
+
+    def _effective_primary_spec(self, session_id: str, spec: OSEnvSpec) -> OSEnvSpec:
+        """Use the same workspace identity for tools and inherited terminals."""
+        if self._runner_workspace is not None:
+            cwd = (
+                _contained_session_dir(self._runner_workspace, session_id)
+                if self._per_session_workspace
+                else str(self._runner_workspace)
+            )
+        elif spec.cwd is None or spec.cwd in ("", ".", "./"):
+            cwd = _session_workspace(session_id)
+        else:
+            cwd = spec.cwd
+        return replace(spec, cwd=str(Path(cwd).resolve()))
 
     def _create_primary_env(
         self,
         session_id: str,
         agent_spec: AgentSpec | None,
+        *,
+        os_env_spec: OSEnvSpec | None = None,
     ) -> OSEnvironment:
         """Create a new primary OSEnvironment.
 
@@ -858,31 +954,15 @@ class SessionResourceRegistry:
             os.makedirs(default_cwd, mode=0o700, exist_ok=True)
             os.chmod(default_cwd, 0o700)  # ensure mode even if pre-existing
 
-        if agent_spec is not None:
-            spec_os_env = getattr(agent_spec, "os_env", None)
+        if agent_spec is not None or os_env_spec is not None:
+            spec_os_env = (
+                os_env_spec if os_env_spec is not None else getattr(agent_spec, "os_env", None)
+            )
             if spec_os_env is None:
                 raise ValueError(
                     "Agent spec has no os_env; cannot create a primary filesystem environment."
                 )
-            # Precedence per designs/SESSION_WORKSPACE_SELECTION.md:
-            # runner_workspace (env-var-driven) ALWAYS wins when set.
-            # Otherwise the spec's absolute cwd wins; otherwise we
-            # fall back to the per-session tmpdir (default_cwd).
-            if (
-                self._runner_workspace is not None
-                or spec_os_env.cwd is None
-                or spec_os_env.cwd in (".", "./")
-            ):
-                cwd = default_cwd
-            else:
-                cwd = spec_os_env.cwd
-            effective_spec = OSEnvSpec(
-                type=spec_os_env.type,
-                cwd=cwd,
-                sandbox=spec_os_env.sandbox,
-                fork=spec_os_env.fork,
-                start_in_scratch=spec_os_env.start_in_scratch,
-            )
+            effective_spec = self._effective_primary_spec(session_id, spec_os_env)
             env = create_os_environment(effective_spec)
             if env is not None:
                 return env
@@ -1046,15 +1126,29 @@ class SessionResourceRegistry:
         if self._terminal_registry is None:
             raise RuntimeError("Terminal registry not configured")
 
-        instance = await self._terminal_registry.launch(
-            conversation_id=session_id,
-            terminal_name=terminal_name,
-            session_key=session_key,
-            spec=spec,
-            parent_os_env=parent_os_env,
-            cwd_override=cwd_override,
-            sandbox_override=sandbox_override,
-        )
+        from omnigent.terminals.registry import TerminalExitedDuringLaunch
+
+        try:
+            instance = await self._terminal_registry.launch(
+                conversation_id=session_id,
+                terminal_name=terminal_name,
+                session_key=session_key,
+                spec=spec,
+                parent_os_env=parent_os_env,
+                cwd_override=cwd_override,
+                sandbox_override=sandbox_override,
+            )
+        except TerminalExitedDuringLaunch as exc:
+            await self._finalize_terminal_exit(
+                session_id=session_id,
+                terminal_name=terminal_name,
+                session_key=session_key,
+                lifecycle=lifecycle,
+                instance=exc.instance,
+                resource_role=resource_role,
+                before_observation=True,
+            )
+            raise
         return await self._observe_terminal_with_lifecycle(
             lifecycle,
             session_id=session_id,
@@ -1124,13 +1218,18 @@ class SessionResourceRegistry:
         if self._terminal_registry is None:
             raise RuntimeError("Terminal registry not configured")
         if not getattr(instance, "running", False) or not await instance.is_alive():
-            # Close by instance, not key — a successor may hold the key now.
-            await self._terminal_registry.close(
-                session_id, terminal_name, session_key, expected=instance
+            from omnigent.terminals.registry import TerminalExitedDuringLaunch
+
+            await self._finalize_terminal_exit(
+                session_id=session_id,
+                terminal_name=terminal_name,
+                session_key=session_key,
+                lifecycle=lifecycle,
+                instance=instance,
+                resource_role=resource_role,
+                before_observation=True,
             )
-            raise RuntimeError(
-                f"terminal {terminal_name}:{session_key} is not running for session {session_id}"
-            )
+            raise TerminalExitedDuringLaunch(instance)
 
         from omnigent.terminals.registry import TerminalListEntry
 
@@ -1278,6 +1377,54 @@ class SessionResourceRegistry:
             with self._lock:
                 self._status_pollers[session_id] = status_poller
 
+        input_ready_probe = _native_input_ready_probe(resource_role)
+        native_input_ready = False
+
+        def _on_tick() -> None:
+            nonlocal native_input_ready
+            if status_poller is not None:
+                status_poller.tick()
+            if resource_role == CLAUDE_NATIVE_TERMINAL_ROLE:
+                try:
+                    from omnigent.harnesses.claude_native.bridge import (
+                        acknowledge_auto_mode_billing_notice,
+                        auto_mode_billing_notice_visible,
+                        bridge_dir_for_conversation_id,
+                        bridge_dir_from_launch_args,
+                    )
+
+                    # Recheck a cached match before sending any acknowledgement.
+                    if auto_mode_billing_notice_visible(instance.last_pane_text() or ""):
+                        bridge_dir = bridge_dir_from_launch_args(instance.args)
+                        if bridge_dir is None:
+                            bridge_dir = bridge_dir_for_conversation_id(session_id)
+                        acknowledge_auto_mode_billing_notice(
+                            bridge_dir,
+                            expected_socket_path=str(instance.socket_path),
+                            expected_tmux_target=instance.tmux_target,
+                        )
+                except Exception:  # noqa: BLE001 - keep lifecycle observation running.
+                    _logger.debug(
+                        "Claude auto-mode billing notice acknowledgement failed",
+                        exc_info=True,
+                        extra={"session_id": session_id},
+                    )
+            if input_ready_probe is not None and not native_input_ready:
+                # Readiness logging must not stop the lifecycle watcher on failure.
+                with contextlib.suppress(Exception):
+                    if input_ready_probe(session_id, instance):
+                        native_input_ready = True
+                        _logger.info(
+                            "Native input ready",
+                            extra=debug_event(
+                                "native_input_ready",
+                                session_id=session_id,
+                                harness=resource_role,
+                                terminal_instance_id=instance.diagnostic_id,
+                                stage="native_input",
+                            ),
+                        )
+
         def _on_activity() -> None:
             # Runs on the watcher daemon thread; hop to the loop so the
             # loop-only publishers (queue.put_nowait) are touched safely.
@@ -1352,9 +1499,13 @@ class SessionResourceRegistry:
                 )
 
         if not emit_status:
+            needs_tick = (
+                resource_role == CLAUDE_NATIVE_TERMINAL_ROLE or input_ready_probe is not None
+            )
             instance.start_idle_watcher_thread(
                 on_activity=_on_activity if activity_publisher is not None else None,
                 on_exit=_on_exit,
+                on_tick=_on_tick if needs_tick else None,
                 replace=replace,
             )
             return
@@ -1377,19 +1528,11 @@ class SessionResourceRegistry:
             # behind it.
             last_activity_emit["value"] = None
 
-        def _on_tick() -> None:
-            # Drive the status-file poller on the watcher cadence. No-op
-            # once it resolves the file and every read is unchanged, cheap
-            # (one ``stat``) otherwise; retires to the PTY watcher if the
-            # file never appears (old Claude) or later vanishes.
-            if status_poller is not None:
-                status_poller.tick()
-
         instance.start_idle_watcher_thread(
             on_activity=_on_activity,
             on_idle=_on_idle,
             on_exit=_on_exit,
-            on_tick=_on_tick if status_poller is not None else None,
+            on_tick=_on_tick,
             idle_threshold_s=_CLAUDE_NATIVE_STATUS_IDLE_THRESHOLD_SECONDS,
             poll_interval_s=_CLAUDE_NATIVE_STATUS_POLL_INTERVAL_SECONDS,
             replace=replace,
@@ -1459,7 +1602,7 @@ class SessionResourceRegistry:
         terminal_id = terminal_resource_id(terminal_name, session_key)
         with self._lock:
             observed = self._terminal_lifecycles.pop((session_id, terminal_id), None)
-            self._terminal_roles.pop((session_id, terminal_id), None)
+            observed_role = self._terminal_roles.pop((session_id, terminal_id), None)
         if observed is None:
             return
         if observed != lifecycle:
@@ -1474,11 +1617,29 @@ class SessionResourceRegistry:
             )
             lifecycle = observed
 
+        await self._finalize_terminal_exit(
+            session_id=session_id,
+            terminal_name=terminal_name,
+            session_key=session_key,
+            lifecycle=lifecycle,
+            instance=instance,
+            resource_role=observed_role,
+        )
+
+    async def _finalize_terminal_exit(
+        self,
+        *,
+        session_id: str,
+        terminal_name: str,
+        session_key: str,
+        lifecycle: TerminalLifecycle,
+        instance: TerminalInstance | None,
+        resource_role: str | None,
+        before_observation: bool = False,
+    ) -> None:
+        """Preserve exit evidence even when a pane dies before observation starts."""
+        terminal_id = terminal_resource_id(terminal_name, session_key)
         command, args_count, cwd, last_output, exit_status = _terminal_exit_diagnostics(instance)
-        # Idle = clean shutdown after the turn finished. Anything else (running,
-        # or never observed → boot failure) stays a failure.
-        session_status_before_exit = self._take_session_status_memo(session_id)
-        session_was_idle = session_status_before_exit == "idle"
 
         superseded_by: TerminalInstance | None = None
         if self._terminal_registry is not None:
@@ -1497,6 +1658,35 @@ class SessionResourceRegistry:
                 current = self._terminal_registry.get(session_id, terminal_name, session_key)
                 if current is not None and instance is not None and current is not instance:
                     superseded_by = current
+
+        # A replaced launch must not consume its successor's status memo.
+        session_status_before_exit = (
+            self._take_session_status_memo(session_id)
+            if superseded_by is None and not before_observation
+            else None
+        )
+        session_was_idle = session_status_before_exit == "idle"
+
+        # Codex keeps its existing final-screen event. New pre-observation
+        # diagnostics may include recent history only under explicit opt-in.
+        redacted_last_output: str | None = None
+        if resource_role == CODEX_NATIVE_TERMINAL_ROLE:
+            from omnigent.harnesses.diagnostics import sanitize_diagnostic_text
+            from omnigent.process_logging import harness_stderr_capture_enabled
+
+            if not before_observation or harness_stderr_capture_enabled():
+                # Redact the complete frame before trimming, so a long credential
+                # cannot lose its identifying prefix at the truncation boundary.
+                raw_output = last_output
+                if instance is not None:
+                    raw_output = (
+                        instance.last_exit_text()
+                        if before_observation
+                        else instance.last_pane_text()
+                    )
+                redacted_last_output = trim_terminal_output(
+                    sanitize_diagnostic_text(raw_output or "")
+                )
 
         publisher = self._terminal_exit_publisher
         _logger.info(
@@ -1518,6 +1708,8 @@ class SessionResourceRegistry:
                 terminal_lifecycle=lifecycle.value,
                 session_status_before_exit=session_status_before_exit or "unknown",
                 terminal_exit_status=exit_status,
+                terminal_last_output=redacted_last_output,
+                before_observation=before_observation,
                 superseded=superseded_by is not None,
             ),
         )
@@ -1528,7 +1720,7 @@ class SessionResourceRegistry:
                 terminal_name,
                 session_key,
             )
-        elif publisher is not None:
+        elif publisher is not None and not before_observation:
             publisher(
                 TerminalExitEvent(
                     session_id=session_id,
@@ -1572,6 +1764,7 @@ class SessionResourceRegistry:
                         session_id=session_id,
                         terminal_id=terminal_id,
                         terminal_instance_id=entry.instance.diagnostic_id,
+                        terminal_name=entry.terminal_name,
                     ),
                 )
                 closed = await self._terminal_registry.close(
@@ -1697,6 +1890,7 @@ class SessionResourceRegistry:
         with self._lock:
             self._session_activity_epoch.pop(session_id, None)
             primary = self._primary_envs.pop(session_id, None)
+            self._primary_env_specs.pop(session_id, None)
             stale_role_keys = [key for key in self._terminal_roles if key[0] == session_id]
             for key in stale_role_keys:
                 self._terminal_roles.pop(key, None)
@@ -1705,15 +1899,6 @@ class SessionResourceRegistry:
             ]
             for key in stale_lifecycle_keys:
                 self._terminal_lifecycles.pop(key, None)
-        if primary is not None:
-            try:
-                primary.close()
-            except Exception:
-                _logger.exception(
-                    "Error closing primary env for session=%s",
-                    session_id,
-                )
-
         if self._terminal_registry is not None:
             try:
                 await self._terminal_registry.cleanup_conversation(
@@ -1722,6 +1907,15 @@ class SessionResourceRegistry:
             except Exception:
                 _logger.exception(
                     "Error cleaning up terminals for session=%s",
+                    session_id,
+                )
+
+        if primary is not None:
+            try:
+                primary.close()
+            except Exception:
+                _logger.exception(
+                    "Error closing primary env for session=%s",
                     session_id,
                 )
 

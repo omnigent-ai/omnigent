@@ -622,12 +622,14 @@ class PolicyEngine:
             approved = float(value)
         except (TypeError, ValueError):
             return
-        owner = self._store.get_session_owner(self._conversation_id)
+        owner = self._store.get_session_owner_authority(self._conversation_id)
         if owner is None:
             return
+        from omnigent.db.account_authority import target_account_scope
         from omnigent.db.utils import now_epoch, utc_day
 
-        self._store.set_daily_ask_approved(owner, utc_day(now_epoch()), approved)
+        with target_account_scope(owner.user_id, owner.generation):
+            self._store.set_daily_ask_approved(owner.user_id, utc_day(now_epoch()), approved)
         # Keep the in-memory snapshot current so any later evaluate() on
         # this engine sees the approval and doesn't re-ASK the checkpoint
         # the user just approved — mirroring how the session policy's

@@ -31,6 +31,7 @@ from omnigent.server._elicitation_registry import (
 )
 from omnigent.server.auth import (
     LEVEL_EDIT,
+    LEVEL_OWNER,
     LEVEL_READ,
     AuthProvider,
     local_single_user_enabled,
@@ -38,10 +39,16 @@ from omnigent.server.auth import (
 from omnigent.server.bundles import bundle_location, validate_agent_bundle
 from omnigent.server.host_registry import HostRegistry
 from omnigent.server.routes._auth_helpers import (
+    can_mutate_session_agent as _can_mutate_session_agent,
+)
+from omnigent.server.routes._auth_helpers import (
     require_access as _require_access,
 )
 from omnigent.server.routes._auth_helpers import (
     require_access_and_level as _require_access_and_level,
+)
+from omnigent.server.routes._auth_helpers import (
+    require_agent_owner as _require_agent_owner,
 )
 from omnigent.server.routes._auth_helpers import (
     require_user as _require_user,
@@ -136,6 +143,15 @@ def register_agent_routes(
                 f"Agent not found: {conv.agent_id!r}",
                 code=ErrorCode.NOT_FOUND,
             )
+        mcp_servers_editable = await asyncio.to_thread(
+            _can_mutate_session_agent,
+            user_id,
+            session_id,
+            agent,
+            permission_store,
+            conversation_store,
+            conversation=conv,
+        )
         terminals_override = None
         if (
             conv.host_id is not None
@@ -152,6 +168,7 @@ def register_agent_routes(
             agent,
             agent_cache,
             terminals_override=terminals_override,
+            mcp_servers_editable=mcp_servers_editable,
         )
 
     @router.get(
@@ -261,6 +278,7 @@ def register_agent_routes(
         the existing agent, stores the bundle under a
         content-addressed key, updates the agent row, and warm-swaps
         the cache. Idempotent when the bundle content is unchanged.
+        Requires session-owner permission because a bundle can replace MCP servers.
 
         :param request: The incoming FastAPI request.
         :param session_id: Session identifier, e.g.
@@ -272,7 +290,7 @@ def register_agent_routes(
         """
         user_id = _require_user(request, auth_provider)
         access = await _require_access_and_level(
-            user_id, session_id, LEVEL_EDIT, permission_store, conversation_store
+            user_id, session_id, LEVEL_OWNER, permission_store, conversation_store
         )
         conv = access.conversation
         if conv is None:
@@ -302,6 +320,12 @@ def register_agent_routes(
                 code=ErrorCode.INVALID_INPUT,
             )
 
+        # Owner-only: a session-scoped agent's bundle runs with runner
+        # authority, so a LEVEL_EDIT grant on the session (shared editors,
+        # reused-agent sessions) is not enough — only the creating user or an
+        # admin may replace it.
+        await asyncio.to_thread(_require_agent_owner, user_id, agent, permission_store)
+
         bundle_bytes = await bundle.read()
         # Run bundle validation (tar extraction + spec parse, both
         # blocking) off the event loop -- mirrors the POST
@@ -329,7 +353,7 @@ def register_agent_routes(
 
         # Idempotency: same bundle content = no-op
         if new_loc == agent.bundle_location:
-            return _to_agent_object(agent, agent_cache)
+            return _to_agent_object(agent, agent_cache, mcp_servers_editable=True)
 
         if artifact_store is None:
             raise OmnigentError(
@@ -337,7 +361,7 @@ def register_agent_routes(
                 code=ErrorCode.INTERNAL_ERROR,
             )
         artifact_store.put(new_loc, bundle_bytes)
-        updated = await asyncio.to_thread(agent_store.update, agent.id, new_loc)
+        updated = await asyncio.to_thread(agent_store.update, agent.id, new_loc, user_id)
         if updated is None:
             raise OmnigentError(
                 f"Agent not found: {agent.id!r}",
@@ -352,7 +376,7 @@ def register_agent_routes(
                 agent.id, new_loc, bundle_bytes, expand_env=agent.session_id is None
             )
 
-        return _to_agent_object(updated, agent_cache)
+        return _to_agent_object(updated, agent_cache, mcp_servers_editable=True)
 
     # ── POST /sessions/{session_id}/mcp ──────────────────────────────────
     # MCP Streamable HTTP proxy endpoint. Only registered when a

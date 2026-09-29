@@ -189,10 +189,8 @@ export function CommandPalette({
     );
   }, [actions, query, sessionsOnly]);
 
-  // includeArchived=true shares the sidebar's cache key; archived rows are
-  // filtered out below so the palette only lists active sessions.
   const { data, isFetching, isError, refetch, hasNextPage, fetchNextPage, isFetchNextPageError } =
-    useConversations(sessionsOnly ? "" : debouncedQuery, !sessionsOnly, { enabled: open });
+    useConversations(sessionsOnly ? "" : debouncedQuery, false, { enabled: open });
   const loadedPages = data?.pages.length ?? 0;
   useEffect(() => {
     if (
@@ -279,7 +277,7 @@ export function CommandPalette({
           "overflow-hidden p-0",
           isMobile
             ? "inset-x-0 top-0 h-full max-h-full w-full max-w-full translate-x-0 translate-y-0 gap-0 rounded-none border-0 shadow-none"
-            : "top-1/4 translate-y-0 sm:max-w-2xl",
+            : "top-1/4 translate-y-0 rounded-xl sm:max-w-2xl",
         )}
         style={
           isMobile

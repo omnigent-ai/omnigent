@@ -269,6 +269,8 @@ export interface Session {
    */
   agentName: string | null;
   runnerId?: string | null;
+  /** Current runner reachability; absent when the snapshot omits liveness. */
+  runnerOnline?: boolean;
   /**
    * Host that launched (or should launch) the runner, e.g.
    * ``"host_a1b2"``; ``null`` for CLI/local sessions. Carried on the
@@ -281,6 +283,8 @@ export interface Session {
    * older recorded fixtures may omit it (treated as `null`).
    */
   hostId?: string | null;
+  /** Current host reachability; absent when the snapshot omits liveness. */
+  hostOnline?: boolean;
   /**
    * Whether this session's host is a dormant resumable managed host the
    * server can wake on the next message. Carried on the snapshot so the open
@@ -390,11 +394,12 @@ export interface Session {
    * render immediately on conversation resume.
    */
   lastTotalTokens?: number | null;
+  /** False when subtree usage was skipped and must be fetched separately. */
+  usageIncluded?: boolean;
   /**
    * Cumulative session spend in USD, server-computed (the cost-budget
-   * total). ``null``/absent when the session is **unpriced** (no turn
-   * priced yet), so the UI renders "—" rather than ``$0.00``. Lets the
-   * cost indicator render immediately on conversation resume.
+   * total). ``null``/absent when usage was skipped or the session is
+   * unpriced, so unknown spend is never displayed as ``$0.00``.
    */
   totalCostUsd?: number | null;
   /**
@@ -414,6 +419,7 @@ export interface Session {
   lastTaskError?: {
     code: string;
     message: string;
+    agent_name?: string;
     title?: string;
     cause?: string;
     remediation?: string;
@@ -481,6 +487,9 @@ export interface Session {
   }[];
   /** Runner-owned model picker rows for the active native session. */
   codexModelOptions?: NativeModelOption[];
+  /** A saved sandbox inference policy owns the model catalog. */
+  inferenceConfigured?: boolean;
+  inferenceError?: string | null;
   /**
    * True while the runner is auto-creating the terminal for a
    * terminal-first session (claude-native / codex-native). Sourced

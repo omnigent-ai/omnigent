@@ -54,13 +54,16 @@ import re
 import shutil
 import subprocess
 import time
+from concurrent.futures import ThreadPoolExecutor
+from contextvars import ContextVar
 from typing import Any
 from urllib.parse import quote
 
 from filelock import Timeout as FileLockTimeout
 
 from omnigent import config as _config
-from omnigent.runner.session_prs import PullRequestRef, SessionPrRegistry
+from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.runner.session_prs import PullRequestRef, SessionPrRegistry, SessionPullRequest
 from omnigent.runtime.filesystem_registry import _git_timeout_seconds
 
 _logger = logging.getLogger(__name__)
@@ -69,6 +72,14 @@ _logger = logging.getLogger(__name__)
 # slightly more generous timeout than the local ``git`` reads. Overridable via
 # ``OMNIGENT_GH_TIMEOUT_SECONDS`` so operators can tune it without a restart.
 _DEFAULT_GH_TIMEOUT_SECONDS = 15.0
+# Cache failed lookups too so inaccessible PRs do not add work to every poll.
+_PR_TITLE_CACHE_SECONDS = 300.0
+_PR_TITLE_TIMEOUT_RETRY_SECONDS = 15.0
+_PR_TITLE_LOOKUP_SECONDS = 2.0
+# Leave headroom for persistence and the runner proxy's ten-second response limit.
+_PR_TITLE_REQUEST_SECONDS = 8.0
+_pr_title_deadline: ContextVar[float | None] = ContextVar("pr_title_deadline", default=None)
+_pr_title_timed_out: ContextVar[bool] = ContextVar("pr_title_timed_out", default=False)
 
 # Fields requested from ``gh pr view``. Always pass ``--json`` — bare
 # ``gh pr view`` opens an interactive/pager view and misbehaves in a
@@ -147,6 +158,12 @@ def _in_sandbox() -> bool:
 
 
 def _gh(argv: list[str], *, cwd: str, token: str | None = None) -> tuple[int | None, str, str]:
+    timeout = _gh_timeout_seconds()
+    if (deadline := _pr_title_deadline.get()) is not None:
+        timeout = min(timeout, deadline - time.monotonic())
+        if timeout <= 0:
+            _pr_title_timed_out.set(True)
+            return None, "", "title lookup deadline exceeded"
     # In a managed sandbox the panel must authenticate as the connected owner via
     # the per-user hosts.yml that configure_host_gh writes — never an ambient
     # GH_TOKEN/GITHUB_TOKEN, which gh ranks ABOVE hosts.yml. Scrub them so a stray
@@ -171,7 +188,15 @@ def _gh(argv: list[str], *, cwd: str, token: str | None = None) -> tuple[int | N
         env["GH_ENTERPRISE_TOKEN"] = token
         env.pop("GITHUB_TOKEN", None)
         env.pop("GITHUB_ENTERPRISE_TOKEN", None)
-    return _run(["gh", *argv], cwd=cwd, timeout=_gh_timeout_seconds(), env=env)
+    result = _run(["gh", *argv], cwd=cwd, timeout=timeout, env=env)
+    if (
+        deadline is not None
+        and result[0] is None
+        and result[2] == "timed out"
+        and time.monotonic() >= deadline
+    ):
+        _pr_title_timed_out.set(True)
+    return result
 
 
 # ── Account selection ────────────────────────────────────────────────────────
@@ -739,12 +764,84 @@ def _reference_info(root: str, reference: PullRequestRef) -> dict[str, Any]:
     return info
 
 
+def _pr_title(data: dict[str, Any] | None) -> str | None:
+    title = data.get("title") if data else None
+    if not isinstance(title, str):
+        return None
+    return title.strip() or None
+
+
+def _session_prs_with_titles(
+    root: str,
+    info: dict[str, Any],
+    registry: SessionPrRegistry,
+    entries: list[SessionPullRequest],
+    request_deadline: float,
+) -> list[dict[str, Any]]:
+    if not info.get("gh_available"):
+        return [entry.model_dump() for entry in entries]
+
+    now = time.time()
+    titles: dict[str, str | None] = {}
+    timed_out_urls: set[str] = set()
+    pending: list[SessionPullRequest] = []
+    for entry in entries:
+        cache_seconds = (
+            _PR_TITLE_TIMEOUT_RETRY_SECONDS
+            if entry.title_lookup_timed_out
+            else _PR_TITLE_CACHE_SECONDS
+        )
+        stale = now - entry.title_checked_at >= cache_seconds
+        if entry.url == info.get("selected_pr_url"):
+            title = _pr_title(info.get("pr"))
+            if stale or (title is not None and title != entry.title):
+                titles[entry.url] = title
+        elif stale:
+            pending.append(entry)
+
+    # Short-backoff retries must not starve PRs that have waited longer or never ran.
+    pending.sort(key=lambda entry: entry.title_checked_at)
+    deadline = min(request_deadline, time.monotonic() + _PR_TITLE_LOOKUP_SECONDS)
+
+    def fetch_title(entry: SessionPullRequest) -> tuple[str, str | None, bool] | None:
+        if time.monotonic() >= deadline:
+            return None
+        token = _pr_title_deadline.set(deadline)
+        timeout_token = _pr_title_timed_out.set(False)
+        try:
+            data = _pr_json(root, entry, "title")
+            return entry.url, _pr_title(data), data is None and _pr_title_timed_out.get()
+        finally:
+            _pr_title_timed_out.reset(timeout_token)
+            _pr_title_deadline.reset(token)
+
+    may_cache = time.monotonic() < request_deadline
+    if pending and time.monotonic() < deadline:
+        with ThreadPoolExecutor(max_workers=min(4, len(pending))) as executor:
+            for result in executor.map(fetch_title, pending):
+                if result is not None:
+                    url, title, timed_out = result
+                    titles[url] = title
+                    if timed_out:
+                        timed_out_urls.add(url)
+    if titles and may_cache:
+        try:
+            registry.update_titles(titles, timestamp=now, timed_out_urls=timed_out_urls)
+        except (OSError, ValueError, FileLockTimeout):
+            _logger.debug("Could not cache session PR titles", exc_info=True)
+
+    return [
+        {**entry.model_dump(), "title": titles.get(entry.url) or entry.title} for entry in entries
+    ]
+
+
 def github_info(
     root: str, *, session_id: str | None = None, pr_url: str | None = None
 ) -> dict[str, Any]:
     """Read the selected session PR, with branch inference for untracked sessions."""
     if session_id is None:
         return _workspace_github_info(root)
+    request_deadline = time.monotonic() + _PR_TITLE_REQUEST_SECONDS
     registry = SessionPrRegistry(session_id)
     entries = registry.list()
     if pr_url:
@@ -766,7 +863,7 @@ def github_info(
                 info["selected_pr_url"] = reference.url
             else:
                 info["pr"] = None
-    info["prs"] = [entry.model_dump() for entry in entries]
+    info["prs"] = _session_prs_with_titles(root, info, registry, entries, request_deadline)
     info["tracking_available"] = True
     return info
 
@@ -842,16 +939,18 @@ def resolve_base_ref(root: str, base: str | None) -> str | None:
     return github_info(root).get("base_ref")
 
 
-def _resolve_diff_base(root: str, base: str) -> str | None:
+def _resolve_diff_base(root: str, base: str) -> str:
     """Resolve a base branch name to the ref to diff HEAD against.
 
     Prefers the merge-base of ``origin/<base>`` (or ``<base>``) and HEAD, giving
-    the three-dot / "Files changed" semantics GitHub shows. Falls back to the
-    base ref itself, then ``None`` when nothing resolves.
+    the three-dot / "Files changed" semantics GitHub shows. A missing merge base
+    in a shallow repository raises instead of comparing branch tips. Full-history
+    repositories retain the base-tip fallback. An unavailable base ref raises.
 
     :param root: Absolute workspace path.
     :param base: Base branch name, e.g. ``"main"``.
-    :returns: A ref (SHA or name) to diff against, or ``None``.
+    :returns: A ref (SHA or name) to diff against.
+    :raises OmnigentError: If the base is unavailable or shallow ancestry is missing.
     """
     candidates = [f"origin/{base}", base]
     resolved: str | None = None
@@ -861,11 +960,45 @@ def _resolve_diff_base(root: str, base: str) -> str | None:
             resolved = candidate
             break
     if resolved is None:
-        return None
+        raise OmnigentError(
+            f"Diff base {base!r} is not available locally. Fetch the base branch explicitly "
+            "with `git fetch origin <base>:refs/remotes/origin/<base>` (replace <base> "
+            "with the branch name), then retry. Single-branch clones do not fetch "
+            "other branches automatically.",
+            code=ErrorCode.INVALID_INPUT,
+        )
     rc, out, _ = _git(["merge-base", resolved, "HEAD"], cwd=root)
     if rc == 0 and out.strip():
         return out.strip()
+    if rc == 1:
+        shallow_rc, shallow, _ = _git(["rev-parse", "--is-shallow-repository"], cwd=root)
+        if shallow_rc == 0 and shallow.strip() == "true":
+            raise OmnigentError(
+                f"No merge base found between HEAD and {resolved!r} in this shallow repository. "
+                "Fetch more history with `git fetch --deepen=100 origin` or "
+                "`git fetch --unshallow origin`, then retry. "
+                "Include both branch refspecs if origin tracks only one branch.",
+                code=ErrorCode.INVALID_INPUT,
+            )
     return resolved
+
+
+def _read_diff_content(root: str, ref: str, path: str) -> str | None:
+    """Read a local diff side; only a confirmed absent tree entry means no content."""
+    rc, out, _ = _git(["show", f"{ref}:{path}"], cwd=root)
+    if rc == 0:
+        return out
+    # Tree entries remain available in blobless clones even if a lazy blob fetch fails.
+    tree_rc, entries, _ = _git(
+        ["--literal-pathspecs", "ls-tree", "-z", "--full-tree", ref, "--", path], cwd=root
+    )
+    if tree_rc == 0 and not entries:
+        return None
+    raise OmnigentError(
+        f"Unable to read file content for {path!r} at {ref!r}. Check repository access "
+        "and connectivity, then retry; a partial clone may need to fetch missing objects.",
+        code=ErrorCode.INTERNAL_ERROR,
+    )
 
 
 # GitHub pulls/files ``status`` → the status vocabulary the web list uses.
@@ -982,6 +1115,7 @@ def github_file_diff(
     :returns: A ``session.github.file_diff`` object with ``before`` (merge-base
         content, ``None`` for an added file) and ``after`` (HEAD content,
         ``None`` for a deleted file).
+    :raises OmnigentError: If the local diff base or file content is unavailable.
     """
     reference = _default_pr(session_id, pr_url)
     if reference:
@@ -996,16 +1130,8 @@ def github_file_diff(
     resolved = resolve_base_ref(root, base or None)
     diff_base = _resolve_diff_base(root, resolved) if resolved else None
 
-    before: str | None = None
-    if diff_base is not None:
-        rc, out, _ = _git(["show", f"{diff_base}:{path}"], cwd=root)
-        if rc == 0:
-            before = out
-
-    after: str | None = None
-    rc, out, _ = _git(["show", f"HEAD:{path}"], cwd=root)
-    if rc == 0:
-        after = out
+    before = _read_diff_content(root, diff_base, path) if diff_base is not None else None
+    after = _read_diff_content(root, "HEAD", path)
 
     return {
         "object": "session.github.file_diff",

@@ -669,3 +669,87 @@ async def test_safe_interrupt_reaps_even_when_interrupt_hangs(
     # … but the reap STILL ran: the abandoned executor was closed, not orphaned.
     assert executor.close_session_calls == 1
     assert executor.close_calls == 1
+
+
+class _RefusedInterruptExecutor(_FakeExecutor):
+    """Executor whose ``interrupt_session`` finds the harness socket gone.
+
+    Models the common abandoned-executor shape: the harness exited (which is
+    why the executor was abandoned), so connecting to its socket is refused.
+    """
+
+    async def interrupt_session(self, session_key: str) -> bool:
+        self.interrupt_calls.append(session_key)
+        raise ConnectionRefusedError(111, "Connection refused")
+
+
+class _BrokenInterruptExecutor(_FakeExecutor):
+    """Executor whose ``interrupt_session`` fails for an unexpected reason."""
+
+    async def interrupt_session(self, session_key: str) -> bool:
+        self.interrupt_calls.append(session_key)
+        raise RuntimeError("app-server rejected the interrupt")
+
+
+async def test_safe_interrupt_gone_harness_is_not_an_error(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A refused interrupt socket is teardown evidence, not a session error.
+
+    The executor is abandoned *because* the harness exited, so a refused
+    connection only confirms that. Logging it at ERROR booked a mid-session
+    error against a session whose turn had already ended, while the reap that
+    follows did the real cleanup.
+    """
+    executor = _RefusedInterruptExecutor()
+    adapter = ExecutorAdapter(executor_factory=lambda: executor)
+
+    with caplog.at_level(logging.WARNING, logger=_ADAPTER_LOGGER):
+        await adapter._safe_interrupt(executor, "sess_gone")
+
+    records = [rec for rec in caplog.records if rec.name == _ADAPTER_LOGGER]
+    assert [rec.levelno for rec in records] == [logging.WARNING]
+    assert "already gone (ConnectionRefusedError)" in records[0].getMessage()
+    # The reap still ran, so nothing is left orphaned by the softer severity.
+    assert executor.close_session_calls == 1
+    assert executor.close_calls == 1
+
+
+async def test_safe_interrupt_hang_is_not_an_error(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An interrupt slice that expires with nothing answering stays a warning."""
+    import omnigent.runtime.harnesses._executor_adapter as _adapter_mod
+
+    monkeypatch.setattr(_adapter_mod, "_INTERRUPT_SLICE_S", 0.05)
+    monkeypatch.setattr(_adapter_mod, "INTERRUPT_TIMEOUT_S", 0.2)
+
+    executor = _HangInterruptExecutor()
+    adapter = ExecutorAdapter(executor_factory=lambda: executor)
+
+    with caplog.at_level(logging.WARNING, logger=_ADAPTER_LOGGER):
+        await adapter._safe_interrupt(executor, "sess_hang")
+
+    records = [rec for rec in caplog.records if rec.name == _ADAPTER_LOGGER]
+    assert [rec.levelno for rec in records] == [logging.WARNING]
+    assert "already gone (TimeoutError)" in records[0].getMessage()
+
+
+async def test_safe_interrupt_unexpected_failure_still_errors(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An interrupt rejected for any other reason keeps its ERROR.
+
+    The softer severity is scoped to "the harness is gone"; a live harness that
+    refuses the interrupt is still a fault worth surfacing.
+    """
+    executor = _BrokenInterruptExecutor()
+    adapter = ExecutorAdapter(executor_factory=lambda: executor)
+
+    with caplog.at_level(logging.WARNING, logger=_ADAPTER_LOGGER):
+        await adapter._safe_interrupt(executor, "sess_broken")
+
+    records = [rec for rec in caplog.records if rec.name == _ADAPTER_LOGGER]
+    assert [rec.levelno for rec in records] == [logging.ERROR]
+    assert "failed or timed out" in records[0].getMessage()

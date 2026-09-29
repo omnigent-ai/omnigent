@@ -17,6 +17,8 @@ from omnigent.harnesses.claude_native.bridge import (
     REQUEST_SESSION_ID_ENV_VAR,
     SWITCH_MODEL_DIALOG_HINT,
     ClaudePromptTimeout,
+    ClaudeSignInPending,
+    ClaudeTerminalExited,
     TmuxSessionNotAdvertised,
     cancellable_injection,
     inject_slash_command,
@@ -243,6 +245,24 @@ class ClaudeNativeExecutor(Executor):
                         # comparison is against what routing asked for.
                         self._applied_model = wanted_model
                     await self._inject_prompt(text, notices)
+        except ClaudeTerminalExited as exc:
+            # Claude Code exits 0 on /quit or a closed window. The turn still
+            # fails, but the person's own teardown is not a defect; a pane that
+            # died on its own keeps the ERROR.
+            clean_exit = exc.exit_status == "0"
+            log = _logger.warning if clean_exit else _logger.error
+            log(
+                "claude-native: terminal exited before prompt delivery (status %s)",
+                exc.exit_status or "unknown",
+                exc_info=not clean_exit,
+                extra={"session_id": self._request_session_id},
+            )
+            cleanup_error = self._reap_failed_turn()
+            message = describe_exception(exc)
+            if cleanup_error is not None:
+                message = f"{message} Cleanup also failed: {cleanup_error}"
+            yield ExecutorError(message=message)
+            return
         except ClaudePromptTimeout as exc:
             _logger.exception(
                 "claude-native: prompt delivery to harness timed out",
@@ -252,7 +272,22 @@ class ClaudeNativeExecutor(Executor):
             message = describe_exception(exc)
             if cleanup_error is not None:
                 message = f"{message} Cleanup also failed: {cleanup_error}"
-            yield ExecutorError(message=message)
+            yield ExecutorError(message=message, undelivered=True)
+            return
+        except ClaudeSignInPending as exc:
+            # The pane is parked on a launcher sign-in the person finishes from
+            # the card's link; reaping it would destroy that prompt.
+            _logger.warning(
+                "claude-native: launcher sign-in pending; message not delivered",
+                extra={"session_id": self._request_session_id},
+            )
+            yield ExecutorError(
+                message=str(exc),
+                code=exc.code,
+                title=exc.title,
+                remediation=exc.remediation,
+                undelivered=True,
+            )
             return
         except RuntimeError as exc:
             _logger.exception(
@@ -449,12 +484,11 @@ def _latest_user_text(messages: list[Message], bridge_dir: Path) -> str:
     Return the latest user text from executor messages.
 
     Multimodal content blocks (images, files) are materialized to the
-    bridge directory and referenced by path in the returned text so
+    session attachment cache and referenced by path in the returned text so
     Claude Code can read them via its Read tool.
 
     :param messages: Conversation history in executor message shape.
-    :param bridge_dir: Bridge directory path for writing attachment
-        files, e.g. ``Path("/tmp/omnigent/claude-native/<digest>")``.
+    :param bridge_dir: Session bridge path identifying the attachment cache.
     :returns: Concatenated latest user message text, or ``""`` when
         no user text is present.
     """
@@ -470,15 +504,14 @@ def _content_to_text(content: EnqueuedContent, bridge_dir: Path) -> str:
 
     Text blocks are extracted directly. Multimodal blocks
     (``input_image``, ``input_file``) that carry resolved base64 data
-    URIs are decoded to files in the bridge directory and referenced
+    URIs are decoded to files in the session attachment cache and referenced
     by path so Claude Code can view them with its Read tool.
 
     :param content: Message content, e.g. a string or a list of
         ``{"type": "input_text", "text": "..."}`` blocks. May also
         contain ``input_image`` blocks with an ``image_url`` data URI
         or ``input_file`` blocks with a ``file_data`` data URI.
-    :param bridge_dir: Bridge directory path for writing attachment
-        files, e.g. ``Path("/tmp/omnigent/claude-native/<digest>")``.
+    :param bridge_dir: Session bridge path identifying the attachment cache.
     :returns: Plain text content with file-path references prepended
         for any materialized attachments.
     """

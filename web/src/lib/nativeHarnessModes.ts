@@ -16,6 +16,56 @@ export interface NativeHarnessMode {
   args: string[];
 }
 
+export type PermissionModeConcept =
+  "manual" | "automatic" | "edit-automatic" | "read-only" | "deny" | "full-access" | "default";
+
+const PERMISSION_MODE_CONCEPTS: Record<string, Record<string, PermissionModeConcept>> = {
+  "claude-native": {
+    default: "manual",
+    auto: "automatic",
+    acceptEdits: "edit-automatic",
+    plan: "read-only",
+    dontAsk: "deny",
+    bypassPermissions: "full-access",
+  },
+  "codex-native": {
+    default: "automatic",
+    "full-access": "full-access",
+    "read-only": "read-only",
+    bypass: "full-access",
+  },
+  "cursor-native": {
+    default: "manual",
+    "auto-review": "automatic",
+    plan: "read-only",
+    ask: "read-only",
+    yolo: "full-access",
+  },
+  "antigravity-native": {
+    default: "manual",
+    skip: "full-access",
+  },
+};
+
+const PERMISSION_HARNESS_ALIASES: Record<string, string> = {
+  "native-claude": "claude-native",
+  "native-codex": "codex-native",
+  "native-cursor": "cursor-native",
+  "native-antigravity": "antigravity-native",
+  "agy-native": "antigravity-native",
+  "native-agy": "antigravity-native",
+};
+
+/** Shared permission concept for presentation across native harness vocabularies. */
+export function permissionModeConcept(
+  harness: string | null | undefined,
+  value: string | null | undefined,
+): PermissionModeConcept {
+  if (!harness || !value) return "default";
+  const canonicalHarness = PERMISSION_HARNESS_ALIASES[harness] ?? harness;
+  return PERMISSION_MODE_CONCEPTS[canonicalHarness]?.[value] ?? "default";
+}
+
 // Antigravity (agy) permission control. agy exposes exactly ONE pre-emptive
 // knob — `--dangerously-skip-permissions`, an all-or-nothing bypass — with no
 // per-tool equivalent of acceptEdits/plan, so this is a two-value toggle rather

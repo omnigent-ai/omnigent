@@ -39,16 +39,13 @@ from pathlib import Path
 from playwright.sync_api import Page, Route, expect
 
 _COMPOSER = "Send a message…"
-# Composer accepts image/*,application/pdf,text/*,application/json (the hidden
-# input's accept attr); a .txt file is in-scope and keeps the fixture trivial.
-# ``set_input_files`` bypasses the accept filter, but ``addFiles`` now validates
-# every file (type + size, via lib/attachments.ts) — a .txt passes both.
+# A text file passes both the OS picker filter and client validation.
 _ATTACH_NAME = "attach_sample.txt"
 _ATTACH_BODY = "composer attachment e2e sample\n"
 
-# An unsupported binary type: ``addFiles`` rejects it (no chip) and shows an
-# inline error. Used by ``test_reject_unsupported_type``.
-_PPTX_NAME = "deck.pptx"
+# An unsupported type: ``addFiles`` rejects it (no chip) and shows an inline
+# error. Office documents and archives are accepted.
+_MEDIA_NAME = "clip.mp4"
 
 # JSON is its own MIME (``application/json``), which is NOT covered by the
 # ``text/*`` wildcard, so it has to be listed in the ``accept`` attr explicitly
@@ -56,14 +53,14 @@ _PPTX_NAME = "deck.pptx"
 _JSON_NAME = "attach_sample.json"
 _JSON_BODY = '{"composer": "attachment", "e2e": true}\n'
 
-# A zip is the case users actually hit (dragging an iCloud Photos export).
+# A ZIP is a common input, such as an iCloud Photos export.
 _ZIP_NAME = "photos.zip"
 
 # The server's real 415 body for an unsupported upload, from
 # ``routes_resources.upload_session_file``. Used to drive the failed-send path.
 _SERVER_415_DETAIL = (
-    "Unsupported attachment type 'application/zip'. Only images, PDF, "
-    "and text/code files can be attached."
+    "Unsupported attachment type 'video/mp4'. Attach images, PDF, or text/code files, "
+    "or use Claude Code or Codex for archives, Office documents, and databases."
 )
 
 
@@ -130,21 +127,49 @@ def test_attach_json_file(page: Page, seeded_session: tuple[str, str], tmp_path:
     expect(page.get_by_text(_JSON_NAME, exact=True)).to_be_visible()
 
 
+def test_attach_zip_as_file_card(
+    page: Page, seeded_session: tuple[str, str], tmp_path: Path
+) -> None:
+    """The picker admits ZIP files and the composer shows a normal file card."""
+    base_url, session_id = seeded_session
+    sample = tmp_path / _ZIP_NAME
+    sample.write_bytes(b"PK\x03\x04 a small but real-enough zip payload")
+
+    page.goto(f"{base_url}/c/{session_id}")
+    expect(page.get_by_placeholder(_COMPOSER)).to_be_visible(timeout=30_000)
+
+    file_input = page.locator('input[type="file"][accept*="image/"]')
+    # Without .zip in the accept attr the OS picker hides the very files the
+    # server now accepts, so the feature is unreachable from the UI.
+    accept = file_input.get_attribute("accept")
+    assert accept is not None and ".zip" in accept, (
+        f"composer file input should accept .zip; got {accept!r}"
+    )
+
+    file_input.set_input_files(str(sample))
+
+    # Accepted: the chip and its remove control exist.
+    expect(page.get_by_role("button", name=f"Remove {_ZIP_NAME}")).to_be_visible(timeout=10_000)
+    chip = page.get_by_text(_ZIP_NAME, exact=True).locator("xpath=..")
+    expect(chip).to_contain_text("ZIP ·")
+    expect(chip).not_to_contain_text("workspace")
+
+
 def test_reject_unsupported_type(
     page: Page, seeded_session: tuple[str, str], tmp_path: Path
 ) -> None:
-    """An unsupported type (pptx) is rejected client-side: no chip, inline error.
+    """An unsupported type (mp4) is rejected client-side: no chip, inline error.
 
     Covers the validation ``addFiles`` gained (``validateAttachments`` in
-    lib/attachments.ts): only images, PDF, and text/code files attach; office /
-    binary formats are rejected before upload with a per-file message. Driving
-    the hidden input with a ``.pptx`` (``set_input_files`` bypasses the accept
-    filter, so the file reaches ``addFiles``) must yield NO chip and a visible
-    rejection error.
+    lib/attachments.ts). Office documents and archives are no longer rejected
+    here, so this pins the shape
+    that is still refused: media no harness can open from disk. Driving the
+    hidden input directly (``set_input_files`` bypasses the accept filter, so
+    the file reaches ``addFiles``) must yield NO chip and a visible error.
     """
     base_url, session_id = seeded_session
-    sample = tmp_path / _PPTX_NAME
-    sample.write_bytes(b"PK\x03\x04 not a real pptx, just an unsupported binary")
+    sample = tmp_path / _MEDIA_NAME
+    sample.write_bytes(b"\x00\x00\x00 not a real mp4, just an unsupported binary")
 
     page.goto(f"{base_url}/c/{session_id}")
     expect(page.get_by_placeholder(_COMPOSER)).to_be_visible(timeout=30_000)
@@ -153,7 +178,7 @@ def test_reject_unsupported_type(
     file_input.set_input_files(str(sample))
 
     # Rejected: no chip / remove control for the file.
-    expect(page.get_by_role("button", name=f"Remove {_PPTX_NAME}")).to_have_count(0)
+    expect(page.get_by_role("button", name=f"Remove {_MEDIA_NAME}")).to_have_count(0)
     # And the inline rejection error is shown.
     expect(page.get_by_text("can't be attached", exact=False)).to_be_visible(timeout=10_000)
 
@@ -161,7 +186,7 @@ def test_reject_unsupported_type(
 def test_landing_rejects_unsupported_type_and_keeps_message(
     page: Page, live_server: str, tmp_path: Path
 ) -> None:
-    """The new-chat landing composer rejects a zip without losing the typed message.
+    """The landing composer rejects an unsupported file without losing the message.
 
     The landing screen is the case that actually bit users: it used to append
     incoming files unchecked, so a zip only failed after the session had been
@@ -173,15 +198,15 @@ def test_landing_rejects_unsupported_type_and_keeps_message(
     because they depend on the real hidden input and on no session being
     created:
 
-    1. No chip appears — the zip never enters composer state.
+    1. No chip appears — the file never enters composer state.
     2. The typed message survives the rejection.
     3. The rejection notice clears on the next keystroke. A rejected file is
        never attached, so there is no chip to remove and nothing else would
        ever clear it; left sticky it reads as a hard blocker.
     """
     base_url = live_server
-    sample = tmp_path / _ZIP_NAME
-    sample.write_bytes(b"PK\x03\x04 not a real zip, just an unsupported binary")
+    sample = tmp_path / _MEDIA_NAME
+    sample.write_bytes(b"\x00\x00\x00 not a real mp4, just an unsupported binary")
 
     page.goto(base_url)
     composer = page.get_by_test_id("new-chat-landing-input")
@@ -191,10 +216,10 @@ def test_landing_rejects_unsupported_type_and_keeps_message(
     page.get_by_test_id("new-chat-landing-file-input").set_input_files(str(sample))
 
     # Rejected: no chip, and the reason names the file.
-    expect(page.get_by_role("button", name=f"Remove {_ZIP_NAME}")).to_have_count(0)
+    expect(page.get_by_role("button", name=f"Remove {_MEDIA_NAME}")).to_have_count(0)
     error = page.get_by_test_id("new-chat-landing-attachment-error")
     expect(error).to_be_visible(timeout=10_000)
-    expect(error).to_contain_text(_ZIP_NAME)
+    expect(error).to_contain_text(_MEDIA_NAME)
 
     # The message the user typed is untouched, and no session was created —
     # still on the landing screen, not redirected into /c/<id>.

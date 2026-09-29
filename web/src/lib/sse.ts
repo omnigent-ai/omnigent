@@ -411,7 +411,11 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
     } satisfies ResponseCompleted;
   }
   if (eventType === "response.failed") {
-    return { type: "response_failed", response: parseResponse(data) } satisfies ResponseFailed;
+    return {
+      type: "response_failed",
+      response: parseResponse(data),
+      ...(typeof data.source === "string" ? { source: data.source } : {}),
+    } satisfies ResponseFailed;
   }
   if (eventType === "response.incomplete") {
     const resp = parseResponse(data);

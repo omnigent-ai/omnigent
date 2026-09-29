@@ -179,6 +179,19 @@ def write_catalog(harness: str, fingerprint: str, rows: list[dict[str, Any]]) ->
 _inflight: dict[tuple[str, str], asyncio.Task[list[dict[str, Any]] | None]] = {}
 
 
+async def shutdown_catalog_probes() -> None:
+    """Cancel shared probes after consumers stop, before event-loop shutdown.
+
+    Drain them while asyncio's subprocess plumbing can still run; cancelling
+    every loop task at once can interrupt subprocess cleanup during spawn.
+    """
+    tasks = list(_inflight.values())
+    for task in tasks:
+        task.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
+    _inflight.clear()
+
+
 async def ensure_catalog(
     harness: str,
     fingerprint: str,
@@ -316,5 +329,6 @@ __all__ = [
     "fingerprint_of",
     "read_catalog",
     "reprobe_catalog",
+    "shutdown_catalog_probes",
     "write_catalog",
 ]

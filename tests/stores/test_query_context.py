@@ -165,6 +165,7 @@ def test_conversation_store_names_create_and_get_queries(
         )
         assert query_names == [
             "omnigent.conversation_store.select_parent_conversation",
+            "omnigent.conversation_store.select_conversation_metadata_by_id",
             "omnigent.conversation_store.select_duplicate_child_title",
             "omnigent.conversation_store.insert_conversation",
             "omnigent.conversation_store.insert_conversation_metadata",

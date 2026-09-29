@@ -268,10 +268,13 @@ async def test_create_session_terminal_ensure_failure_returns_json_without_live_
     assert len(error_id) == 36
     int(error_id.removeprefix("err_"), 16)
     assert error["message"] == (
-        "Native Claude terminal failed to start; "
+        "Native Claude terminal failed to start (ImportError); "
         f"see the runner log for details: {pinned_runner_log} Error ID: {error_id}."
     )
     assert "requires the 'claude' CLI" not in error["message"]
+    # The structured, non-sensitive cause (exception type only, here) still
+    # names the failure kind without the free-form message.
+    assert "(ImportError)" in error["message"]
 
 
 @dataclass

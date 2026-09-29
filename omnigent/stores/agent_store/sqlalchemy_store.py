@@ -97,6 +97,11 @@ class SqlAlchemyAgentStore(AgentStore):
         a replica has not caught up to. ``conversations`` lives on the AP DB, so
         this runs on the conversation engine.
 
+        This lookup is NOT used to authorize agent-code mutation: a legacy
+        (``created_by`` NULL) agent may be referenced by several unrelated roots
+        after reuse, so agent mutation gates on ``created_by`` and admin status
+        only (see ``require_agent_owner``), never on this reverse lookup.
+
         :param agent_id: Agent identifier, e.g. ``"ag_abc123"``.
         :returns: The agent's spawn-tree root conversation id, or ``None`` when
             no conversation points at this agent.
@@ -291,6 +296,7 @@ class SqlAlchemyAgentStore(AgentStore):
         self,
         agent_id: str,
         bundle_location: str,
+        created_by: str | None = None,
     ) -> Agent | None:
         """
         Update an agent's bundle location, bump version, and set
@@ -300,6 +306,10 @@ class SqlAlchemyAgentStore(AgentStore):
             e.g. ``"agent_abc123"``.
         :param bundle_location: New artifact store key for the
             bundle, e.g. ``"ag_abc123/a1b2c3d4e5f6..."``.
+        :param created_by: When set, records the owner only if the row
+            does not already have one (claim-on-write). Heals
+            pre-migration session-scoped rows on their first authorized
+            mutation; ``None`` leaves any existing owner untouched.
         :returns: The updated :class:`Agent`, or ``None`` if not
             found.
         """
@@ -312,6 +322,9 @@ class SqlAlchemyAgentStore(AgentStore):
             row.bundle_location = bundle_location
             row.version = row.version + 1
             row.updated_at = updated_at
+            # Claim-on-write: only fill an empty owner, never overwrite one.
+            if created_by is not None and row.created_by is None:
+                row.created_by = created_by
             session.flush()
             return row
 

@@ -196,6 +196,7 @@ function removeIdsFromCache(queryClient: QueryClient, ids: string[]): boolean {
 export function SessionUpdatesProvider({ children }: { children: ReactNode }) {
   const queryClient = useQueryClient();
   const sidebarData = useContext(SidebarDataContext);
+  const identityReady = sidebarData?.identityReady ?? true;
   const sidebarIds = sidebarData?.watchedIds;
   const sidebarIdsRef = useRef(sidebarIds);
   sidebarIdsRef.current = sidebarIds;
@@ -291,6 +292,7 @@ export function SessionUpdatesProvider({ children }: { children: ReactNode }) {
   // anyway). The session list itself is NOT gated on the modal (it populates the
   // map the modal reads; gating it on the modal would deadlock).
   useEffect(() => {
+    if (!identityReady) return;
     let cacheUnsub: (() => void) | null = null;
     const tryResolveAndStart = (): boolean => {
       const succeeded = queryClient
@@ -475,7 +477,7 @@ export function SessionUpdatesProvider({ children }: { children: ReactNode }) {
       if (watchTimer !== null) clearTimeout(watchTimer);
       sessionUpdatesSocket.stop();
     };
-  }, [queryClient, pushWatched]);
+  }, [identityReady, queryClient, pushWatched]);
 
   return children;
 }

@@ -396,6 +396,31 @@ def test_idle_containers_terminate_promptly(
     assert worker.returncode == 128 + signal.SIGTERM
 
 
+def test_readiness_probe_import_avoids_heavy_dependencies() -> None:
+    """A warm Pod runs the ``ready`` probe once a second in a fresh interpreter.
+
+    Importing this module must stay lightweight: it must not pull in YAML or the
+    ``omnigent.config`` machinery (which the full ``omnigent.host.identity``
+    module does). Those recompile on every cold probe tick and dominate its CPU
+    cost, so the probe reads the env-var names from the leaf
+    ``omnigent.host.identity_env`` module instead.
+    """
+    probe = """\
+import sys, omnigent.host.warm_bootstrap
+print(",".join(sorted(m for m in ("yaml", "omnigent.config") if m in sys.modules)))
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", probe],
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=60,
+    )
+    assert result.stdout.strip() == "", (
+        f"warm_bootstrap import unexpectedly pulled in heavy modules: {result.stdout.strip()}"
+    )
+
+
 def test_cli_rejects_bad_payload_without_echoing_input(activation_dir: Path) -> None:
     result = subprocess.run(
         [sys.executable, "-m", bootstrap.__name__, "activate"],

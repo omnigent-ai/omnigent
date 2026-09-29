@@ -24,6 +24,8 @@ from omnigent.runner.app import _build_claude_native_base_args, _claude_terminal
 from omnigent.runner.native.orchestration import (
     _ROUTED_SPAWN_ALLOWED_TOOLS,
     _claude_launch_metadata_from_envelope,
+    _claude_launch_permission_mode,
+    _load_claude_launch_metadata,
     _load_legacy_claude_launch_metadata,
     _routed_spawn_launch_args,
 )
@@ -451,6 +453,130 @@ def test_routed_spawn_launch_args_gate_is_off_without_auto_harness() -> None:
 
 
 @pytest.mark.parametrize(
+    ("args", "expected"),
+    [
+        (["--permission-mode", "auto"], "auto"),
+        (["--permission-mode=acceptEdits"], "acceptEdits"),
+        (["--permission-mode", "secret-value"], None),
+        (["--permission-mode"], None),
+        (["--model", "opus"], None),
+        (["--permission-mode", "auto", "--permission-mode="], "auto"),
+        (["--dangerously-skip-permissions"], "bypassPermissions"),
+    ],
+)
+def test_claude_launch_permission_mode_logs_only_known_values(
+    args: list[str], expected: str | None
+) -> None:
+    assert _claude_launch_permission_mode(args) == expected
+
+
+async def test_claude_launch_metadata_log_includes_permission_mode(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    import logging
+
+    from omnigent.runner.session_init_protocol import (
+        SESSION_INIT_PROTOCOL_VERSION,
+        RunnerSessionInitEnvelope,
+    )
+
+    envelope = RunnerSessionInitEnvelope(
+        protocol_version=SESSION_INIT_PROTOCOL_VERSION,
+        server_version="test",
+        session_id="conv_auto",
+        agent_id="agent",
+        snapshot={
+            "created_at": 0,
+            "updated_at": 0,
+            "terminal_launch_args": ["--permission-mode", "auto"],
+        },
+    )
+
+    with caplog.at_level(logging.INFO, logger="omnigent.runner.app"):
+        await _load_claude_launch_metadata(
+            server_client=None,  # type: ignore[arg-type]
+            session_id="conv_auto",
+            session_init=envelope,
+        )
+
+    record = next(
+        record
+        for record in caplog.records
+        if getattr(record, "event_name", None) == "claude_launch_config_loaded"
+    )
+    assert "permission_mode=auto" in record.getMessage()
+    assert record.attributes == {"permission_mode": "auto"}
+
+
+async def test_claude_launch_metadata_log_excludes_unknown_permission_mode(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    import logging
+
+    from omnigent.runner.session_init_protocol import (
+        SESSION_INIT_PROTOCOL_VERSION,
+        RunnerSessionInitEnvelope,
+    )
+
+    unknown_mode = "secret-value"
+    envelope = RunnerSessionInitEnvelope(
+        protocol_version=SESSION_INIT_PROTOCOL_VERSION,
+        server_version="test",
+        session_id="conv_unknown",
+        agent_id="agent",
+        snapshot={
+            "created_at": 0,
+            "updated_at": 0,
+            "terminal_launch_args": ["--permission-mode", unknown_mode],
+        },
+    )
+
+    with caplog.at_level(logging.INFO, logger="omnigent.runner.app"):
+        await _load_claude_launch_metadata(
+            server_client=None,  # type: ignore[arg-type]
+            session_id="conv_unknown",
+            session_init=envelope,
+        )
+
+    record = next(
+        record
+        for record in caplog.records
+        if getattr(record, "event_name", None) == "claude_launch_config_loaded"
+    )
+    assert unknown_mode not in record.getMessage()
+    assert unknown_mode not in record.attributes.values()
+    assert "permission_mode" not in record.attributes
+
+
+async def test_legacy_claude_launch_metadata_log_includes_permission_mode(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    import logging
+
+    import httpx
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={"terminal_launch_args": ["--permission-mode=plan"]},
+        )
+
+    with caplog.at_level(logging.INFO, logger="omnigent.runner.app"):
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler), base_url="http://runner"
+        ) as client:
+            await _load_legacy_claude_launch_metadata(client, "conv_plan")
+
+    record = next(
+        record
+        for record in caplog.records
+        if getattr(record, "event_name", None) == "claude_launch_config_loaded"
+    )
+    assert "permission_mode=plan" in record.getMessage()
+    assert record.attributes == {"permission_mode": "plan"}
+
+
+@pytest.mark.parametrize(
     ("labels", "harness_override", "expected"),
     [
         ({AUTO_HARNESS_LABEL_KEY: "1"}, None, True),
@@ -523,3 +649,107 @@ async def test_legacy_metadata_loader_reads_the_auto_harness_flag(
         metadata = await _load_legacy_claude_launch_metadata(client, "conv_abc")
 
     assert metadata.auto_harness is expected
+
+
+async def test_runner_launch_error_is_logged_before_cancellable_diagnostic_drain(
+    bridge_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Cancelling a blocked diagnostic drain must leave the launch error logged."""
+    import asyncio
+    import contextlib
+    import logging
+    import threading
+    from unittest.mock import AsyncMock, Mock
+
+    import httpx
+
+    from omnigent.harnesses.claude_native import diagnostics
+    from omnigent.runner.native import orchestration
+    from omnigent.runner.resource_registry import SessionResourceRegistry
+    from omnigent.runner.session_init_protocol import (
+        SESSION_INIT_PROTOCOL_VERSION,
+        RunnerSessionInitEnvelope,
+        RunnerSessionInitSnapshot,
+    )
+
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge.ensure_claude_workspace_trusted", lambda _: None
+    )
+    monkeypatch.setattr("omnigent.inference_config.load_runtime_inference_config", dict)
+    monkeypatch.setattr("omnigent.config.load_effective_config", dict)
+    monkeypatch.setattr(orchestration, "resolve_cli_binary", lambda _: None)
+    # Keep application traceback renderers out of this synchronization test.
+    logger = logging.getLogger(f"{__name__}.launch_failure")
+    caplog.set_level(logging.ERROR, logger=logger.name)
+    monkeypatch.setattr(logger, "handlers", [caplog.handler])
+    monkeypatch.setattr(logger, "propagate", False)
+    monkeypatch.setattr(orchestration, "_logger", logger)
+    session_id = "conv_launch_cancelled_during_drain"
+    original_error = httpx.ConnectError("original launch transport failure")
+    registry = Mock(spec=SessionResourceRegistry)
+    registry.launch_required_terminal.side_effect = original_error
+    session_init = RunnerSessionInitEnvelope(
+        protocol_version=SESSION_INIT_PROTOCOL_VERSION,
+        server_version="test",
+        session_id=session_id,
+        agent_id="agent",
+        snapshot=RunnerSessionInitSnapshot(created_at=0, updated_at=0, workspace=str(bridge_dir)),
+    )
+    loop = asyncio.get_running_loop()
+    closing = asyncio.Event()
+    closed = asyncio.Event()
+    release_close = threading.Event()
+
+    def blocked_close(_session_id: str) -> None:
+        loop.call_soon_threadsafe(closing.set)
+        try:
+            if not release_close.wait(timeout=30):
+                raise TimeoutError("test did not release diagnostic close")
+        finally:
+            loop.call_soon_threadsafe(closed.set)
+
+    follower = Mock(close=Mock(side_effect=blocked_close))
+    monkeypatch.setattr(diagnostics, "ClaudeDebugLogFollower", lambda _: follower)
+    task = asyncio.create_task(
+        orchestration._auto_create_claude_terminal(
+            session_id,
+            registry,
+            Mock(),
+            server_client=AsyncMock(spec=httpx.AsyncClient),
+            session_init=session_init,
+            auth_token_factory=lambda: None,
+            resolve_launch_config=AsyncMock(return_value=None),
+        )
+    )
+    try:
+        await asyncio.wait_for(closing.wait(), timeout=10)
+        assert not closed.is_set()
+        errors_before_cancel = [
+            record
+            for record in caplog.records
+            if record.getMessage().startswith("Claude terminal tmux launch failed:")
+        ]
+        assert len(errors_before_cancel) == 1
+        record = errors_before_cancel[0]
+        assert record.levelno == logging.ERROR
+        assert record.exc_info is not None
+        assert record.exc_info[1] is original_error
+        assert getattr(record, "session_id", None) == session_id
+        assert f"session={session_id}" in record.getMessage()
+        task.cancel("cancelled during diagnostic cleanup")
+        with pytest.raises(asyncio.CancelledError, match="cancelled during diagnostic cleanup"):
+            await asyncio.wait_for(task, timeout=10)
+        assert task.cancelled()
+        assert not release_close.is_set()
+        assert not closed.is_set()
+        registry.launch_required_terminal.assert_awaited_once()
+        follower.close.assert_called_once_with(session_id)
+    finally:
+        release_close.set()
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=10)
+        if closing.is_set():
+            await asyncio.wait_for(closed.wait(), timeout=10)

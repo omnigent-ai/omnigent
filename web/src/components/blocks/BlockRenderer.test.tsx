@@ -238,7 +238,7 @@ describe("BlockRenderer dispatch", () => {
     };
 
     render(<BlockRenderer items={[item]} sessionStatus="idle" onRetryError={onRetryError} />);
-    const retry = screen.getByRole("button", { name: "Retry" });
+    const retry = screen.getByRole("button", { name: "Resume session" });
     fireEvent.click(retry);
     fireEvent.click(retry);
 
@@ -246,12 +246,68 @@ describe("BlockRenderer dispatch", () => {
     expect(onRetryError).toHaveBeenCalledWith(item);
     expect(screen.queryByRole("alert")).toBeNull();
     expect(screen.getByRole("status")).toHaveTextContent(/^Reconnecting$/);
-    expect(screen.queryByRole("button", { name: "Retry" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Resume session" })).toBeNull();
     resolveRetry?.();
     await waitFor(() => {
       expect(screen.queryByRole("status")).toBeNull();
       expect(screen.queryByRole("alert")).toBeNull();
     });
+  });
+
+  it("dispatches a related disconnect through session recovery", async () => {
+    const onRetryError = vi.fn(async () => {});
+    const item: Extract<RenderItem, { kind: "error" }> = {
+      kind: "error",
+      itemId: "runner-error",
+      source: "execution",
+      code: "runner_error",
+      message: "Runner setup failed.",
+      relatedErrors: [
+        {
+          itemId: "runner-disconnected",
+          source: "execution",
+          code: "runner_disconnected",
+          message: "Runner disconnected.",
+        },
+      ],
+    };
+
+    render(<BlockRenderer items={[item]} sessionStatus="idle" onRetryError={onRetryError} />);
+    fireEvent.click(screen.getByRole("button", { name: "Resume session" }));
+
+    await waitFor(() =>
+      expect(onRetryError).toHaveBeenCalledWith({
+        kind: "error",
+        itemId: "runner-disconnected",
+        source: "execution",
+        code: "runner_disconnected",
+        message: "Runner disconnected.",
+      }),
+    );
+  });
+
+  it("keeps rate-limit retry distinct from related session recovery", async () => {
+    const onRetryError = vi.fn(async () => {});
+    const item: Extract<RenderItem, { kind: "error" }> = {
+      kind: "error",
+      itemId: "rate-limit",
+      source: "llm",
+      code: "rate_limit_exceeded",
+      message: "Rate limited.",
+      relatedErrors: [
+        {
+          itemId: "runner-disconnected",
+          source: "execution",
+          code: "runner_disconnected",
+          message: "Runner disconnected.",
+        },
+      ],
+    };
+
+    render(<BlockRenderer items={[item]} sessionStatus="idle" onRetryError={onRetryError} />);
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+
+    await waitFor(() => expect(onRetryError).toHaveBeenCalledWith(item));
   });
 
   it("falls back to a code→sentence description for an unclassified failure", () => {
@@ -296,6 +352,37 @@ describe("BlockRenderer dispatch", () => {
     ];
     render(<BlockRenderer items={items} sessionStatus="running" />);
     expect(screen.queryByText("Thinking...")).toBeNull();
+  });
+
+  it("hides a live turn's reasoning duration after assistant text arrives", () => {
+    const items: RenderItem[] = [
+      { kind: "reasoning", itemId: "live-reasoning", text: "still working", duration: 5 },
+      { kind: "text", itemId: "live-text", text: "Partial answer", final: false },
+    ];
+
+    render(<BlockRenderer items={items} sessionStatus="running" isLastAssistant showsWorking />);
+
+    expect(screen.queryByText(/Thought for \d/)).toBeNull();
+  });
+
+  it("keeps an earlier turn settled while the next turn reasons", () => {
+    const settledItems: RenderItem[] = [
+      { kind: "reasoning", itemId: "settled-reasoning", text: "finished", duration: undefined },
+      { kind: "text", itemId: "settled-text", text: "First answer", final: true },
+    ];
+    const liveItems: RenderItem[] = [
+      { kind: "reasoning", itemId: "live-reasoning", text: "working", duration: undefined },
+    ];
+
+    render(
+      <>
+        <BlockRenderer items={settledItems} sessionStatus="running" />
+        <BlockRenderer items={liveItems} sessionStatus="running" isLastAssistant showsWorking />
+      </>,
+    );
+
+    expect(screen.getByText("Thought for a few seconds")).toBeInTheDocument();
+    expect(screen.getAllByText("Thinking...")).toHaveLength(1);
   });
 
   it("renders settled assistant text in static markdown mode", () => {

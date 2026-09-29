@@ -177,10 +177,23 @@ def test_failure_diagnostics_preserves_logs_without_gateway_secrets(
 
 
 @pytest.mark.parametrize("failure_step", ["secret-scan", "posting", None])
-def test_review_diagnostics_retain_raw_stdout(tmp_path: Path, failure_step: str | None) -> None:
+@pytest.mark.parametrize(
+    "scope_suffix",
+    [
+        "",
+        "<!-- POLLY_SCOPE_START -->\n{malformed\n<!-- POLLY_SCOPE_END -->\n",
+        "<!-- POLLY_SCOPE_START -->\n{}\n<!-- POLLY_SCOPE_END --> (see above)\n" * 2,
+    ],
+    ids=["plain-prose", "malformed-legacy-scope", "duplicate-legacy-scope"],
+)
+def test_review_diagnostics_retain_raw_stdout(
+    tmp_path: Path, failure_step: str | None, scope_suffix: str
+) -> None:
     workflow = yaml.safe_load(_WORKFLOW.read_text())
     steps = {step["name"]: step for step in workflow["jobs"]["review"]["steps"]}
-    review = _REVIEW + ("test-api-secret\n" if failure_step == "secret-scan" else "")
+    review = (
+        _REVIEW + scope_suffix + ("test-api-secret\n" if failure_step == "secret-scan" else "")
+    )
     raw = f"Starting review: test-api-secret at https://gateway.test\n{_MARKER}\n{review}"
     (tmp_path / "stdout.txt").write_text(raw)
     (tmp_path / "review_prompt.txt").write_text("Synthetic review; no model calls.")

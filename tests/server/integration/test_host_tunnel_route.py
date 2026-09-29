@@ -16,14 +16,19 @@ from omnigent.host.frames import (
     HostConnectionErrorFrame,
     HostHarnessReadinessFrame,
     HostHelloFrame,
+    HostImportedLocalSession,
+    HostImportLocalDoneFrame,
+    HostImportLocalSessionChunkFrame,
     HostLaunchRunnerResultFrame,
     decode_host_frame,
     encode_host_frame,
+    encode_import_local_session_frames,
 )
 from omnigent.server.auth import AuthProvider
 from omnigent.server.host_registry import HostRegistry
 from omnigent.server.routes.host_tunnel import create_host_tunnel_router
 from omnigent.stores.host_store import HostStore
+from tests.budgets import budget
 
 pytestmark = pytest.mark.asyncio
 
@@ -69,7 +74,7 @@ async def _connect_route(
     """
     communicator = ApplicationCommunicator(app, _websocket_scope(path))
     await communicator.send_input({"type": "websocket.connect"})
-    accepted = await communicator.receive_output(timeout=1.0)
+    accepted = await communicator.receive_output(timeout=budget(1.0))
     assert accepted["type"] == "websocket.accept", f"Expected {path} to accept; got {accepted!r}"
     return communicator
 
@@ -132,7 +137,7 @@ async def _send_hello_and_wait(
     )
     await asyncio.wait_for(
         _wait_registered(registry, host_id),
-        timeout=2.0,
+        timeout=budget(2.0),
     )
 
 
@@ -165,6 +170,19 @@ async def _wait_offline(
         await asyncio.sleep(0.01)
 
 
+async def _wait_deregistered(
+    registry: HostRegistry,
+    host_id: str,
+) -> None:
+    """Poll until the host is removed from the registry.
+
+    :param registry: Host registry to poll.
+    :param host_id: Host id expected to disappear.
+    """
+    while registry.get(host_id) is not None:
+        await asyncio.sleep(0.01)
+
+
 async def _wait_updated_at_at_least(
     store: HostStore,
     host_id: str,
@@ -189,7 +207,7 @@ async def _wait_updated_at_at_least(
                 return host.updated_at
             await asyncio.sleep(0.01)
 
-    return await asyncio.wait_for(_poll(), timeout=timeout_s)
+    return await asyncio.wait_for(_poll(), timeout=budget(timeout_s))
 
 
 async def test_host_tunnel_ping_loop_persists_heartbeat(
@@ -282,8 +300,10 @@ async def test_host_tunnel_deregisters_on_disconnect(
     assert registry.get(_HOST_ID) is not None
 
     await comm.send_input({"type": "websocket.disconnect", "code": 1000})
-    # Give the handler a moment to process the disconnect.
-    await asyncio.sleep(0.1)
+    # Poll until deregistered — a fixed sleep flakes under load (the
+    # disconnect handler runs deregister asynchronously and may not
+    # complete within a fixed window).
+    await asyncio.wait_for(_wait_deregistered(registry, _HOST_ID), timeout=budget(2.0))
 
     assert registry.get(_HOST_ID) is None
 
@@ -323,7 +343,7 @@ async def test_host_tunnel_reports_registration_failure(
         {"type": "websocket.receive", "text": _make_hello()},
     )
 
-    sent = await comm.receive_output(timeout=1.0)
+    sent = await comm.receive_output(timeout=budget(1.0))
     assert sent["type"] == "websocket.send"
     error = decode_host_frame(sent["text"])
     assert error == HostConnectionErrorFrame(
@@ -331,7 +351,7 @@ async def test_host_tunnel_reports_registration_failure(
         error="database unavailable",
         retryable=True,
     )
-    close = await comm.receive_output(timeout=1.0)
+    close = await comm.receive_output(timeout=budget(1.0))
     assert close["type"] == "websocket.close"
     assert close["code"] == 4005
     assert registry.get(_HOST_ID) is None
@@ -351,7 +371,7 @@ async def test_registry_failure_marks_persisted_host_offline(
     comm = await _connect_route(app, _TUNNEL_PATH)
     await comm.send_input({"type": "websocket.receive", "text": _make_hello()})
 
-    sent = await comm.receive_output(timeout=1.0)
+    sent = await comm.receive_output(timeout=budget(1.0))
     error = decode_host_frame(sent["text"])
     assert error == HostConnectionErrorFrame(
         stage="registry",
@@ -398,7 +418,7 @@ async def test_host_tunnel_refreshes_harness_readiness_without_reconnect(
             ),
         }
     )
-    await asyncio.wait_for(_wait_registered(registry, _HOST_ID), timeout=2.0)
+    await asyncio.wait_for(_wait_registered(registry, _HOST_ID), timeout=budget(2.0))
 
     await comm.send_input(
         {
@@ -416,7 +436,7 @@ async def test_host_tunnel_refreshes_harness_readiness_without_reconnect(
                 return
             await asyncio.sleep(0.01)
 
-    await asyncio.wait_for(_wait_until_ready(), timeout=0.5)
+    await asyncio.wait_for(_wait_until_ready(), timeout=budget(0.5))
 
     conn = registry.get(_HOST_ID)
     assert conn is not None
@@ -442,7 +462,7 @@ async def test_host_tunnel_sets_offline_on_disconnect(
     # Poll until status flips — avoids the fixed-sleep race that
     # causes flakes under load (set_offline runs via to_thread and
     # may not complete within a fixed 0.1 s window).
-    await asyncio.wait_for(_wait_offline(store, _HOST_ID), timeout=2.0)
+    await asyncio.wait_for(_wait_offline(store, _HOST_ID), timeout=budget(2.0))
 
     host = store.get_host(_HOST_ID)
     assert host is not None
@@ -472,13 +492,13 @@ async def test_host_tunnel_rejects_bad_protocol_version(
         {"type": "websocket.receive", "text": bad_hello},
     )
 
-    sent = await comm.receive_output(timeout=1.0)
+    sent = await comm.receive_output(timeout=budget(1.0))
     assert sent["type"] == "websocket.send"
     error = decode_host_frame(sent["text"])
     assert isinstance(error, HostConnectionErrorFrame)
     assert error.stage == "protocol"
     assert "frame_protocol_version mismatch" in error.error
-    close = await comm.receive_output(timeout=1.0)
+    close = await comm.receive_output(timeout=budget(1.0))
     assert close["type"] == "websocket.close"
     assert close.get("code") == 4002
 
@@ -507,7 +527,7 @@ async def test_host_tunnel_rejects_non_hello_first_frame(
         {"type": "websocket.receive", "text": result_frame},
     )
 
-    sent = await comm.receive_output(timeout=1.0)
+    sent = await comm.receive_output(timeout=budget(1.0))
     assert sent["type"] == "websocket.send"
     error = decode_host_frame(sent["text"])
     assert error == HostConnectionErrorFrame(
@@ -515,7 +535,7 @@ async def test_host_tunnel_rejects_non_hello_first_frame(
         error="expected host.hello frame",
         retryable=False,
     )
-    close = await comm.receive_output(timeout=1.0)
+    close = await comm.receive_output(timeout=budget(1.0))
     assert close["type"] == "websocket.close"
     assert close.get("code") == 4001
 
@@ -557,10 +577,263 @@ async def test_host_tunnel_routes_launch_result_to_future(
     )
 
     # Future should resolve within a short time.
-    result = await asyncio.wait_for(future, timeout=2.0)
+    result = await asyncio.wait_for(future, timeout=budget(2.0))
     assert result["status"] == "launched"
     assert result["runner_id"] == "runner_token_xyz"
     assert result["error"] is None
+
+
+async def test_host_tunnel_reassembles_chunked_import_session(
+    host_app: tuple[FastAPI, HostRegistry, HostStore],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Verify that an import session sliced into chunk frames lands on the
+    pending import queue as one whole session, identical to the payload a
+    single ``host.import_local_session`` frame would deliver.
+    """
+    monkeypatch.setattr("omnigent.host.frames.IMPORT_SESSION_CHUNK_CHARS", 64)
+
+    app, registry, _store = host_app
+    comm = await _connect_route(app, _TUNNEL_PATH)
+    await _send_hello_and_wait(comm, registry)
+
+    conn = registry.get(_HOST_ID)
+    assert conn is not None
+    queue: asyncio.Queue[tuple[str, dict[str, object]]] = asyncio.Queue()
+    conn.pending_import_local["req_chunked"] = queue
+
+    session = HostImportedLocalSession(
+        external_session_id="s_giant",
+        workspace="/repo",
+        items=[{"type": "message", "response_id": "r1", "data": {"text": "x" * 400}}],
+        title="giant",
+        source="claude",
+    )
+    texts = list(encode_import_local_session_frames("req_chunked", 1, session, allow_chunks=True))
+    assert len(texts) > 1  # actually exercised the chunk path
+    for text in texts:
+        await comm.send_input({"type": "websocket.receive", "text": text})
+
+    received = [await asyncio.wait_for(queue.get(), timeout=2.0) for _ in range(len(texts) + 1)]
+    kind, payload = next(entry for entry in received if entry[0] == "session")
+    assert kind == "session"
+    assert payload["external_session_id"] == "s_giant"
+    assert payload["items"] == session.items
+    assert payload["total"] == 1
+
+
+async def test_host_tunnel_counts_corrupt_chunked_session_as_failed(
+    host_app: tuple[FastAPI, HostRegistry, HostStore],
+) -> None:
+    """
+    Verify that a corrupt chunk sequence yields a session payload the import
+    loop counts as failed (no ``external_session_id``) instead of stalling or
+    killing the stream.
+    """
+    app, registry, _store = host_app
+    comm = await _connect_route(app, _TUNNEL_PATH)
+    await _send_hello_and_wait(comm, registry)
+
+    conn = registry.get(_HOST_ID)
+    assert conn is not None
+    queue: asyncio.Queue[tuple[str, dict[str, object]]] = asyncio.Queue()
+    conn.pending_import_local["req_corrupt"] = queue
+
+    # A final slice arriving with a sequence gap can never reassemble.
+    frame = encode_host_frame(
+        HostImportLocalSessionChunkFrame(
+            request_id="req_corrupt", total=1, seq=5, last=True, data="{}"
+        )
+    )
+    await comm.send_input({"type": "websocket.receive", "text": frame})
+
+    assert (await asyncio.wait_for(queue.get(), timeout=2.0))[0] == "progress"
+    kind, payload = await asyncio.wait_for(queue.get(), timeout=2.0)
+    assert kind == "session"
+    assert "external_session_id" not in payload
+    assert payload["total"] == 1
+
+
+async def test_host_tunnel_counts_incomplete_chunked_session_as_failed(
+    host_app: tuple[FastAPI, HostRegistry, HostStore],
+) -> None:
+    """A done frame cannot silently discard a session missing its final slice."""
+    app, registry, _store = host_app
+    comm = await _connect_route(app, _TUNNEL_PATH)
+    await _send_hello_and_wait(comm, registry)
+
+    conn = registry.get(_HOST_ID)
+    assert conn is not None
+    queue: asyncio.Queue[tuple[str, dict[str, object]]] = asyncio.Queue()
+    conn.pending_import_local["req_incomplete"] = queue
+
+    await comm.send_input(
+        {
+            "type": "websocket.receive",
+            "text": encode_host_frame(
+                HostImportLocalSessionChunkFrame(
+                    request_id="req_incomplete", total=1, seq=0, last=False, data="{"
+                )
+            ),
+        }
+    )
+    await comm.send_input(
+        {
+            "type": "websocket.receive",
+            "text": encode_host_frame(
+                HostImportLocalDoneFrame(request_id="req_incomplete", status="ok")
+            ),
+        }
+    )
+
+    received = [await asyncio.wait_for(queue.get(), timeout=2.0) for _ in range(3)]
+    assert [kind for kind, _payload in received] == ["progress", "session", "done"]
+    assert "external_session_id" not in received[1][1]
+
+
+async def test_host_tunnel_caps_aggregate_chunk_reassembly_memory(
+    host_app: tuple[FastAPI, HostRegistry, HostStore],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cross-request chunk buffers share one connection-level memory cap."""
+    monkeypatch.setattr(
+        "omnigent.server.routes.host_tunnel.IMPORT_SESSION_MAX_CONNECTION_REASSEMBLED_CHARS", 10
+    )
+    app, registry, _store = host_app
+    comm = await _connect_route(app, _TUNNEL_PATH)
+    await _send_hello_and_wait(comm, registry)
+
+    conn = registry.get(_HOST_ID)
+    assert conn is not None
+    first: asyncio.Queue[tuple[str, dict[str, object]]] = asyncio.Queue()
+    second: asyncio.Queue[tuple[str, dict[str, object]]] = asyncio.Queue()
+    conn.pending_import_local.update({"req_first": first, "req_second": second})
+
+    # An unsolicited request must not allocate any chunk buffer. If it did,
+    # the first legitimate 6-character chunk below would exceed the 10-char cap.
+    await comm.send_input(
+        {
+            "type": "websocket.receive",
+            "text": encode_host_frame(
+                HostImportLocalSessionChunkFrame(
+                    request_id="req_unknown",
+                    total=1,
+                    seq=0,
+                    last=False,
+                    data="x" * 6,
+                )
+            ),
+        }
+    )
+
+    for request_id in ("req_first", "req_second"):
+        await comm.send_input(
+            {
+                "type": "websocket.receive",
+                "text": encode_host_frame(
+                    HostImportLocalSessionChunkFrame(
+                        request_id=request_id,
+                        total=1,
+                        seq=0,
+                        last=False,
+                        data="x" * 6,
+                    )
+                ),
+            }
+        )
+
+    assert (await asyncio.wait_for(first.get(), timeout=2.0))[0] == "progress"
+    assert (await asyncio.wait_for(second.get(), timeout=2.0))[0] == "progress"
+    kind, payload = await asyncio.wait_for(second.get(), timeout=2.0)
+    assert kind == "session"
+    assert "external_session_id" not in payload
+
+
+def _chunked_session(external_session_id: str, payload: str) -> HostImportedLocalSession:
+    """A one-item session whose chunk count is driven by *payload*."""
+    return HostImportedLocalSession(
+        external_session_id=external_session_id,
+        workspace="/repo",
+        items=[{"type": "message", "response_id": "r1", "data": {"text": payload}}],
+        title=external_session_id,
+        source="claude",
+    )
+
+
+async def _pending_import_queue(
+    host_app: tuple[FastAPI, HostRegistry, HostStore], request_id: str
+) -> tuple[ApplicationCommunicator, asyncio.Queue[tuple[str, dict[str, object]]]]:
+    """Connect a host and register one pending import request on it."""
+    app, registry, _store = host_app
+    comm = await _connect_route(app, _TUNNEL_PATH)
+    await _send_hello_and_wait(comm, registry)
+    conn = registry.get(_HOST_ID)
+    assert conn is not None
+    queue: asyncio.Queue[tuple[str, dict[str, object]]] = asyncio.Queue()
+    conn.pending_import_local[request_id] = queue
+    return comm, queue
+
+
+async def test_host_tunnel_imports_session_after_truncated_chunked_session(
+    host_app: tuple[FastAPI, HostRegistry, HostStore],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A session cut off before its final slice fails alone; the next one still imports."""
+    monkeypatch.setattr("omnigent.host.frames.IMPORT_SESSION_CHUNK_CHARS", 64)
+    comm, queue = await _pending_import_queue(host_app, "req_cut")
+
+    cut = list(
+        encode_import_local_session_frames(
+            "req_cut", 2, _chunked_session("s_cut", "x" * 400), allow_chunks=True
+        )
+    )
+    whole_session = _chunked_session("s_whole", "y" * 200)
+    whole = list(
+        encode_import_local_session_frames("req_cut", 2, whole_session, allow_chunks=True)
+    )
+    assert len(cut) > 2 and len(whole) > 1
+    # The host moved on to the next session without ever sending s_cut's final slice.
+    sent = [*cut[:-1], *whole]
+    for text in sent:
+        await comm.send_input({"type": "websocket.receive", "text": text})
+
+    received = [await asyncio.wait_for(queue.get(), timeout=2.0) for _ in range(len(sent) + 2)]
+    sessions = [payload for kind, payload in received if kind == "session"]
+    assert [payload.get("external_session_id") for payload in sessions] == [None, "s_whole"]
+    assert sessions[1]["items"] == whole_session.items
+
+
+async def test_host_tunnel_imports_session_after_over_cap_chunked_session(
+    host_app: tuple[FastAPI, HostRegistry, HostStore],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A session rejected for size is counted once, its leftovers skipped, and the next imports."""
+    monkeypatch.setattr("omnigent.host.frames.IMPORT_SESSION_CHUNK_CHARS", 64)
+    monkeypatch.setattr(
+        "omnigent.server.routes.host_tunnel.IMPORT_SESSION_MAX_CONNECTION_REASSEMBLED_CHARS", 300
+    )
+    comm, queue = await _pending_import_queue(host_app, "req_cap")
+
+    big = list(
+        encode_import_local_session_frames(
+            "req_cap", 2, _chunked_session("s_big", "x" * 400), allow_chunks=True
+        )
+    )
+    small_session = _chunked_session("s_small", "ok")
+    small = list(
+        encode_import_local_session_frames("req_cap", 2, small_session, allow_chunks=True)
+    )
+    assert len(big) > 6 and len(small) > 1
+    # s_big blows the cap partway through and is cut off before its final slice.
+    sent = [*big[:-2], *small]
+    for text in sent:
+        await comm.send_input({"type": "websocket.receive", "text": text})
+
+    received = [await asyncio.wait_for(queue.get(), timeout=2.0) for _ in range(len(sent) + 2)]
+    sessions = [payload for kind, payload in received if kind == "session"]
+    assert [payload.get("external_session_id") for payload in sessions] == [None, "s_small"]
+    assert sessions[1]["items"] == small_session.items
 
 
 # ── Cross-owner re-registration rejection ───────────────────
@@ -631,10 +904,10 @@ async def test_cross_owner_refused_with_409_before_accept(db_uri: str) -> None:
     comm = ApplicationCommunicator(app, scope)
     await comm.send_input({"type": "websocket.connect"})
 
-    start = await comm.receive_output(timeout=1.0)
+    start = await comm.receive_output(timeout=budget(1.0))
     assert start["type"] == "websocket.http.response.start"
     assert start["status"] == 409
-    body = await comm.receive_output(timeout=1.0)
+    body = await comm.receive_output(timeout=budget(1.0))
     assert body["type"] == "websocket.http.response.body"
     assert b"already registered to a different account" in body["body"]
 
@@ -661,7 +934,7 @@ async def test_cross_owner_refused_with_close_when_no_denial_extension(db_uri: s
     comm = ApplicationCommunicator(app, _websocket_scope(_TUNNEL_PATH))
     await comm.send_input({"type": "websocket.connect"})
 
-    closed = await comm.receive_output(timeout=1.0)
+    closed = await comm.receive_output(timeout=budget(1.0))
     assert closed["type"] == "websocket.close"
     assert closed["code"] == 4009
     assert registry.get(_HOST_ID) is None
@@ -706,10 +979,10 @@ async def test_malformed_host_id_refused_with_400_before_accept(
     comm = ApplicationCommunicator(app, scope)
     await comm.send_input({"type": "websocket.connect"})
 
-    start = await comm.receive_output(timeout=1.0)
+    start = await comm.receive_output(timeout=budget(1.0))
     assert start["type"] == "websocket.http.response.start"
     assert start["status"] == 400
-    body = await comm.receive_output(timeout=1.0)
+    body = await comm.receive_output(timeout=budget(1.0))
     assert body["type"] == "websocket.http.response.body"
     assert b"UUID" in body["body"]
     assert registry.get("superagent-databricks-host") is None
@@ -723,7 +996,7 @@ async def test_malformed_host_id_refused_with_close_when_no_denial_extension(
     comm = ApplicationCommunicator(app, _websocket_scope("/v1/hosts/not-a-uuid/tunnel"))
     await comm.send_input({"type": "websocket.connect"})
 
-    closed = await comm.receive_output(timeout=1.0)
+    closed = await comm.receive_output(timeout=budget(1.0))
     assert closed["type"] == "websocket.close"
     assert closed["code"] == 4009
     assert registry.get("not-a-uuid") is None
@@ -790,7 +1063,7 @@ async def test_managed_token_authenticates_as_record_owner(
 
     communicator = ApplicationCommunicator(app, _managed_scope(_TUNNEL_PATH, "tunnel-token-ok"))
     await communicator.send_input({"type": "websocket.connect"})
-    accepted = await communicator.receive_output(timeout=1.0)
+    accepted = await communicator.receive_output(timeout=budget(1.0))
     assert accepted["type"] == "websocket.accept"
 
     await _send_hello_and_wait(communicator, registry, name=f"managed-{_HOST_ID}")
@@ -814,7 +1087,7 @@ async def test_managed_token_is_revalidated_after_websocket_accept(
 
     communicator = ApplicationCommunicator(app, _managed_scope(_TUNNEL_PATH, "tunnel-token-race"))
     await communicator.send_input({"type": "websocket.connect"})
-    accepted = await communicator.receive_output(timeout=1.0)
+    accepted = await communicator.receive_output(timeout=budget(1.0))
     assert accepted["type"] == "websocket.accept"
 
     assert store.detach_stale_managed_sandbox(
@@ -825,9 +1098,9 @@ async def test_managed_token_is_revalidated_after_websocket_accept(
     await communicator.send_input(
         {"type": "websocket.receive", "text": _make_hello(name=f"managed-{_HOST_ID}")},
     )
-    response = await communicator.receive_output(timeout=1.0)
+    response = await communicator.receive_output(timeout=budget(1.0))
     if response["type"] == "websocket.send":
-        response = await communicator.receive_output(timeout=1.0)
+        response = await communicator.receive_output(timeout=budget(1.0))
     assert response["type"] == "websocket.close"
     assert registry.get(_HOST_ID) is None
     detached = store.get_host(_HOST_ID)
@@ -874,7 +1147,7 @@ async def test_invalid_managed_token_refused_before_accept(
 
     communicator = ApplicationCommunicator(app, _managed_scope(_TUNNEL_PATH, presented_token))
     await communicator.send_input({"type": "websocket.connect"})
-    closed = await communicator.receive_output(timeout=1.0)
+    closed = await communicator.receive_output(timeout=budget(1.0))
     assert closed["type"] == "websocket.close"
     assert closed["code"] == 4004
     # Nothing registered on this replica, and the target host never
@@ -883,3 +1156,69 @@ async def test_invalid_managed_token_refused_before_accept(
     assert registry.get(_HOST_ID) is None
     host = store.get_host(_HOST_ID)
     assert host is None or host.status == "offline"
+
+
+class _FakeSenderWebSocket:
+    """Minimal ``send_text`` stand-in for ``_sender_loop`` unit tests.
+
+    :param raises: Exception ``send_text`` raises, or ``None`` to
+        record the frame instead.
+    :param application_state: Post-raise state, mimicking Starlette's
+        synchronous state flip when a concurrent close wins the race.
+    """
+
+    def __init__(
+        self,
+        *,
+        raises: Exception | None = None,
+        application_state: object = None,
+    ) -> None:
+        from starlette.websockets import WebSocketState
+
+        self._raises = raises
+        self.application_state = (
+            application_state if application_state is not None else WebSocketState.CONNECTED
+        )
+        self.sent: list[str] = []
+
+    async def send_text(self, data: str) -> None:
+        if self._raises is not None:
+            raise self._raises
+        self.sent.append(data)
+
+
+async def test_host_sender_loop_swallows_send_after_close_race() -> None:
+    """A send racing a concurrent close (socket already DISCONNECTED)
+    ends the sender loop quietly instead of raising into the route."""
+    from types import SimpleNamespace
+
+    from starlette.websockets import WebSocketState
+
+    from omnigent.server.routes import host_tunnel
+
+    ws = _FakeSenderWebSocket(
+        raises=RuntimeError('Cannot call "send" once a close message has been sent.'),
+        application_state=WebSocketState.DISCONNECTED,
+    )
+    conn = SimpleNamespace(host_id=_HOST_ID, outbound_queue=asyncio.Queue())
+    conn.outbound_queue.put_nowait("frame")
+    await host_tunnel._sender_loop(ws, conn)  # returns without raising
+
+
+async def test_host_sender_loop_reraises_send_failure_while_connected() -> None:
+    """The same RuntimeError while the socket is still CONNECTED is a
+    real error and must propagate to the route's error-logging path."""
+    from types import SimpleNamespace
+
+    from starlette.websockets import WebSocketState
+
+    from omnigent.server.routes import host_tunnel
+
+    ws = _FakeSenderWebSocket(
+        raises=RuntimeError('Cannot call "send" once a close message has been sent.'),
+        application_state=WebSocketState.CONNECTED,
+    )
+    conn = SimpleNamespace(host_id=_HOST_ID, outbound_queue=asyncio.Queue())
+    conn.outbound_queue.put_nowait("frame")
+    with pytest.raises(RuntimeError):
+        await host_tunnel._sender_loop(ws, conn)

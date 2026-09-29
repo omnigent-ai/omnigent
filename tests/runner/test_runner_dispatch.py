@@ -81,6 +81,7 @@ from omnigent.runner.app import (
     _evaluate_policy_via_omnigent,
     _forward_harness_response,
     _harness_error_response_error,
+    _normalize_turn_error,
     _resolve_harness_config,
 )
 from omnigent.runtime.harnesses import _HARNESS_MODULES
@@ -1616,6 +1617,40 @@ def test_harness_error_response_error_parses_runner_error_bodies(
     assert _harness_error_response_error(response) == expected
 
 
+@pytest.mark.parametrize(
+    ("error", "expected"),
+    [
+        # A harness failure names itself: the status edge keeps that code so the
+        # web UI can de-duplicate it against the persisted error item.
+        (
+            {
+                "code": "databricks_sign_in_pending",
+                "message": "Codex is waiting for a sign-in.",
+            },
+            {
+                "code": "databricks_sign_in_pending",
+                "message": "Codex is waiting for a sign-in.",
+            },
+        ),
+        # The legacy ``type`` spelling still wins over the generic fallback.
+        (
+            {"type": "_ContextWindowOverflow", "message": "too long"},
+            {"code": "_ContextWindowOverflow", "message": "too long"},
+        ),
+        (
+            {"message": "turn setup failed: boom"},
+            {"code": "runner_error", "message": "turn setup failed: boom"},
+        ),
+        ({"status": 503}, {"code": "runner_error", "message": "turn failed (status 503)"}),
+        ({}, {"code": "runner_error", "message": "turn failed"}),
+    ],
+)
+def test_normalize_turn_error_keeps_the_failure_code(
+    error: dict[str, object], expected: dict[str, str]
+) -> None:
+    assert _normalize_turn_error(error) == expected
+
+
 class _SpawnFailingProcessManager(_FakeProcessManager):
     """Process manager stub whose harness spawn always fails.
 
@@ -2406,6 +2441,9 @@ async def test_runner_publishes_terminal_failed_when_harness_stream_fails(
         f"response.failed was dropped at stream end."
     )
     if until == "failed":
+        # The failed edge names the turn it closes (the harness's response id)
+        # so the web folds it into that response's own error card.
+        assert events[-1].get("response_id") == "resp_sf_1"
         error = events[-1].get("error")
         # The terminal failed edge must carry the harness's real error so
         # clients can render it — a bare ``failed`` with no payload would
@@ -5521,7 +5559,7 @@ async def test_sys_cancel_task_stops_subagent_and_dedupes_late_completion(
                 runner_app.mark_subagent_work_terminal(
                     "conv_child_cancel",
                     status="cancelled",
-                    output="[System: sub-agent stopped]",
+                    output=None,
                 )
             return httpx.Response(202, json={"queued": True})
         return httpx.Response(404, json={"error": str(request.url)})
@@ -7295,6 +7333,7 @@ async def test_session_list_global_sessions_filter_and_connectivity() -> None:
 
     # agent_name forwarded to the server-side filter.
     assert sessions_params.get("agent_name") == "researcher"
+    assert sessions_params.get("visibility") == "all"
     # Both sessions projected with status + connectivity from the single
     # shared-runner status lookup.
     assert out["sessions"] == [
@@ -12387,3 +12426,201 @@ async def test_send_by_session_id_reuses_running_child_without_restamp() -> None
     assert len(event_posts) == 1
     assert event_posts[0]["created_by"] == "alice@example.com"
     assert event_posts[0]["data"]["content"][0]["text"] == "please stop and report"
+
+
+_SSE_RESPONSE_FAILED_SIGN_IN = (
+    "event: response.failed\ndata: "
+    '{"type":"response.failed","response":{"status":"failed"},'
+    '"error":{"message":"The agent is waiting for a sign-in in this session\'s terminal.",'
+    '"code":"databricks_sign_in_pending"}}\n\n'
+)
+_SIGN_IN_PROMPT_SCREEN = (
+    "dbcert: If the browser does not open automatically, please open the following URL:\n"
+    "\n\thttps://databricks.okta.com/oauth2/v1/authorize?client_id=0oa1&state=T4IU\n\n"
+)
+_SIGNED_IN_SCREENS = {
+    # Codex draws inline: dbcert's lines stay above its banner.
+    "codex-native": (
+        _SIGN_IN_PROMPT_SCREEN + "dbcert: All credentials successfully written\n"
+        "╭── OpenAI Codex (v0.156.1) ──╮\n"
+        "› Ask Codex to do anything\n"
+    ),
+    # Claude Code takes the alternate screen: only its composer is visible.
+    "claude-native": "─" * 16 + "\n❯ \n" + "─" * 16 + "\n  Opus 4.8\n",
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("harness", ["codex-native", "claude-native"])
+async def test_sign_in_pending_failure_posts_a_notice_once_the_agent_is_ready(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    harness: str,
+) -> None:
+    """
+    A turn that failed on a pending Databricks sign-in is followed by one "signed in" notice.
+
+    The runner watches the session's pane after the failure. While the sign-in
+    prompt is on screen nothing is posted. Once the prompt is gone and the
+    agent can take a message (Codex has published its bridge state, Claude Code
+    shows its composer), one neutral notice lands in the transcript so the
+    person knows the sign-in worked and can resend.
+    """
+    import omnigent.runner.app as runner_app
+    from omnigent.harnesses.codex_native import bridge as codex_bridge
+    from omnigent.terminals import TerminalRegistry
+    from tests.runner.helpers import NullServerClient, make_test_terminal_instance
+
+    conv = f"conv_signin_{harness.replace('-', '_')}"
+    monkeypatch.setattr(runner_app, "_SIGN_IN_WATCH_INTERVAL_S", 0.01)
+    monkeypatch.setattr(codex_bridge, "_BRIDGE_ROOT", tmp_path / "bridges")
+
+    class _RecordingServerClient(NullServerClient):
+        def __init__(self) -> None:
+            self.posts: list[tuple[str, Any]] = []
+
+        async def post(self, url: str, **kwargs: Any) -> Any:
+            self.posts.append((url, kwargs.get("json")))
+            return await super().post(url, **kwargs)
+
+    reads = 0
+
+    async def _read(scrollback: int = 0, *, join_wrapped: bool = False) -> dict[str, object]:
+        nonlocal reads
+        del scrollback, join_wrapped
+        reads += 1
+        if reads < 3:
+            return {"screen": _SIGN_IN_PROMPT_SCREEN}
+        if harness == "codex-native":
+            # Thread discovery publishes the bridge state as the TUI starts a thread.
+            codex_bridge.write_bridge_state(
+                codex_bridge.bridge_dir_for_bridge_id(conv),
+                codex_bridge.CodexNativeBridgeState(
+                    session_id=conv,
+                    socket_path="ws://127.0.0.1:1",
+                    thread_id="019e96aa-abcd-7343-8d3b-6f914d60936b",
+                    codex_home=str(tmp_path / "codex-home"),
+                    cwd=str(tmp_path),
+                ),
+            )
+        return {"screen": _SIGNED_IN_SCREENS[harness]}
+
+    pane_name = "codex" if harness == "codex-native" else "claude"
+    instance = make_test_terminal_instance(pane_name, "main", tmp_path)
+    instance.read = _read  # type: ignore[method-assign]
+    registry = TerminalRegistry(conversation_link_base_url="http://127.0.0.1:8000")
+    registry._by_conversation.setdefault(conv, {})[(instance.name, instance.session_key)] = (
+        instance
+    )
+
+    async def _spec_resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return AgentSpec(
+            spec_version=1,
+            name="sign-in-agent",
+            executor=ExecutorSpec(type="omnigent", config={"harness": harness}),
+        )
+
+    server_client = _RecordingServerClient()
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(  # type: ignore[arg-type]
+            _FakeHarnessClient([_SSE_RESPONSE_CREATED, _SSE_RESPONSE_FAILED_SIGN_IN])
+        ),
+        spec_resolver=_spec_resolver,
+        server_client=server_client,  # type: ignore[arg-type]
+        terminal_registry=registry,
+    )
+
+    def _notices() -> list[Any]:
+        return [
+            body
+            for url, body in server_client.posts
+            if url.endswith(f"/v1/sessions/{conv}/events")
+            and isinstance(body, dict)
+            and body.get("type") == "external_conversation_item"
+            and body["data"]["item_data"].get("code") == "databricks_sign_in_completed"
+        ]
+
+    async with _runner_test_client(app) as http:
+        response = await http.post(
+            f"/v1/sessions/{conv}/events",
+            json={
+                "type": "message",
+                "role": "user",
+                "agent_id": "ag_sign_in",
+                "model": "x",
+                "content": [{"role": "user", "content": "hi"}],
+            },
+        )
+        assert response.status_code == 202
+        await _await_bg_turn_task(conv)
+        for _ in range(200):
+            if _notices():
+                break
+            await asyncio.sleep(0.01)
+        # Let the watcher wind down before the app is torn down.
+        await asyncio.sleep(0.05)
+
+    (notice,) = _notices()
+    item = notice["data"]["item_data"]
+    agent = "Codex" if harness == "codex-native" else "Claude Code"
+    assert notice["data"]["item_type"] == "error"
+    assert item["level"] == "info"
+    assert item["title"] == "Signed in to Databricks"
+    assert item["message"] == f"{agent} is ready. Send your message again."
+    # The prompt screen was seen (and ignored) before the agent came up.
+    assert reads >= 3
+
+
+@pytest.mark.asyncio
+async def test_failed_turn_event_names_the_web_message_it_carried() -> None:
+    """
+    ``response.failed`` carries the web message's stable id.
+
+    The server settles a failed native turn's queued web message by this id,
+    so a turn that fails must say which message it carried; the id rides in on
+    the forwarded message as ``stable_id`` and leaves as ``input_stable_id``.
+    """
+    conv = "conv_stable_id_on_failure"
+
+    async def _spec_resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return AgentSpec(
+            spec_version=1,
+            name="stable-id-agent",
+            executor=ExecutorSpec(type="omnigent", config={"harness": "codex-native"}),
+        )
+
+    published: list[dict[str, Any]] = []
+    app = create_runner_app(
+        process_manager=cast(
+            HarnessProcessManager,
+            _FakeProcessManager(_FakeHarnessClient([_SSE_RESPONSE_CREATED, _SSE_RESPONSE_FAILED])),
+        ),
+        spec_resolver=_spec_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    async with _runner_test_client(app) as http:
+        response = await http.post(
+            f"/v1/sessions/{conv}/events",
+            json={
+                "type": "message",
+                "role": "user",
+                "agent_id": "ag_stable",
+                "model": "x",
+                "content": [{"role": "user", "content": "hi"}],
+                "stable_id": "7f3a9c1e5b2d4f6a8c0e1d2b3a4f5c6d",
+            },
+        )
+        assert response.status_code == 202
+        await _await_bg_turn_task(conv)
+        queue = app.state.session_event_queues.get(conv)
+        for _ in range(100):
+            while queue is not None and not queue.empty():
+                published.append(queue.get_nowait())
+            if any(e.get("type") == "response.failed" for e in published):
+                break
+            await asyncio.sleep(0.02)
+    failed = [e for e in published if e.get("type") == "response.failed"]
+    assert failed, "response.failed was not published"
+    assert failed[0]["input_stable_id"] == "7f3a9c1e5b2d4f6a8c0e1d2b3a4f5c6d"
