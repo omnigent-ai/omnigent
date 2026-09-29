@@ -1,23 +1,8 @@
-"""A loopback stand-in for ``https://github.com`` for credential-flow e2e tests.
+"""Serve authenticated Git smart HTTP through a loopback ``github.com`` TLS proxy.
 
-Runs an HTTP ``CONNECT`` proxy on ``127.0.0.1`` that terminates TLS for
-``github.com`` itself (self-signed certificate; clients set
-``GIT_SSL_NO_VERIFY=1``) and serves bare repositories over git's smart-HTTP
-protocol behind HTTP Basic auth — anonymous requests get the same ``401`` +
-``WWW-Authenticate: Basic`` challenge github.com sends for a private
-repository.
-
-Pointing ``https_proxy`` at it makes a real ``git clone
-https://github.com/<org>/<repo>.git`` exercise the exact credential-helper
-chain a github.com clone uses — the clone URL, and therefore git's credential
-context (``credential.https://github.com.helper``), stays ``github.com`` —
-with no network egress. That is what the managed-sandbox credential tests
-need: whether the sandbox's helper chain can still produce a credential for
-``https://github.com`` is precisely the behavior under test, so the hostname
-must not be rewritten to a localhost URL.
-
-No kubernetes/product imports; pure test infrastructure like
-:mod:`tests.e2e._k8s_stub_sdk`.
+Set ``https_proxy`` to ``FakeGitHub.proxy_url`` and ``GIT_SSL_NO_VERIFY=1``
+for the self-signed certificate. Keeping the clone URL on ``github.com``
+exercises Git's actual hostname-scoped credential-helper chain.
 """
 
 from __future__ import annotations
@@ -30,6 +15,7 @@ import ssl
 import subprocess
 import tempfile
 import threading
+from http.client import HTTPMessage, parse_headers
 from pathlib import Path
 
 _GIT_TIMEOUT_S = 30.0
@@ -43,11 +29,10 @@ _SEED_GIT_ENV = {
 }
 
 
-def _run_git(*args: str, cwd: Path | None = None) -> None:
+def _run_git(*args: str) -> None:
     subprocess.run(
         ["git", *args],
         check=True,
-        cwd=str(cwd) if cwd is not None else None,
         env=_SEED_GIT_ENV,
         capture_output=True,
         timeout=_GIT_TIMEOUT_S,
@@ -55,11 +40,7 @@ def _run_git(*args: str, cwd: Path | None = None) -> None:
 
 
 def make_bare_repo(root: Path, org_repo: str) -> Path:
-    """Seed ``<root>/<org>/<repo>.git`` with one commit; return the repo path.
-
-    :param root: The project root the fake server exports (``GIT_PROJECT_ROOT``).
-    :param org_repo: The github-style path, e.g. ``"acme/private-widget"``.
-    """
+    """Seed ``<root>/<org>/<repo>.git`` with one commit; return the repo path."""
     seed = root / "_seed" / org_repo.replace("/", "__")
     seed.mkdir(parents=True, exist_ok=True)
     (seed / "README.md").write_text(f"{org_repo}: a private repository\n")
@@ -116,18 +97,7 @@ def _make_github_cert(directory: Path) -> tuple[Path, Path]:
     return cert, key
 
 
-def _read_headers(rfile) -> dict[str, str]:
-    """Read HTTP headers until the blank line; keys lower-cased."""
-    headers: dict[str, str] = {}
-    while True:
-        line = rfile.readline(65536)
-        if not line or line in (b"\r\n", b"\n"):
-            return headers
-        name, _, value = line.decode("latin-1").partition(":")
-        headers[name.strip().lower()] = value.strip()
-
-
-def _read_body(rfile, headers: dict[str, str]) -> bytes:
+def _read_body(rfile, headers: HTTPMessage) -> bytes:
     """Read a request body (Content-Length or chunked)."""
     if headers.get("transfer-encoding", "").lower() == "chunked":
         chunks = []
@@ -140,7 +110,7 @@ def _read_body(rfile, headers: dict[str, str]) -> bytes:
             chunks.append(rfile.read(size))
             rfile.readline(65536)  # chunk-terminating CRLF
     length = int(headers.get("content-length", "0") or "0")
-    return rfile.read(length) if length else b""
+    return rfile.read(length)
 
 
 class _ProxyHandler(socketserver.BaseRequestHandler):
@@ -150,7 +120,7 @@ class _ProxyHandler(socketserver.BaseRequestHandler):
         server: FakeGitHub = self.server.fake_github  # type: ignore[attr-defined]
         rfile = self.request.makefile("rb")
         request_line = rfile.readline(65536).decode("latin-1").strip()
-        _read_headers(rfile)
+        parse_headers(rfile)
         parts = request_line.split()
         if len(parts) != 3 or parts[0] != "CONNECT" or parts[1] != "github.com:443":
             self.request.sendall(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
@@ -172,7 +142,7 @@ class _ProxyHandler(socketserver.BaseRequestHandler):
         if not request_line:
             return
         method, target, _ = request_line.split()
-        headers = _read_headers(rfile)
+        headers = parse_headers(rfile)
         if headers.get("expect", "").lower() == "100-continue":
             tls.sendall(b"HTTP/1.1 100 Continue\r\n\r\n")
         body = _read_body(rfile, headers)
@@ -231,13 +201,7 @@ class _ThreadingProxy(socketserver.ThreadingTCPServer):
 
 
 class FakeGitHub:
-    """The CONNECT proxy + TLS github.com stand-in. Use as a context manager.
-
-    :param project_root: Directory exported as ``GIT_PROJECT_ROOT`` (contains
-        ``<org>/<repo>.git`` bare repos; see :func:`make_bare_repo`).
-    :param username: Basic-auth username the server accepts.
-    :param token: Basic-auth password (the shared ``$GIT_TOKEN``).
-    """
+    """Context-managed proxy serving *project_root* with the supplied Git credentials."""
 
     def __init__(self, project_root: Path, username: str, token: str) -> None:
         self.project_root = project_root

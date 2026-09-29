@@ -1,53 +1,14 @@
-"""
-End-to-end guard: a managed-sandbox clone must keep the
-shared ``$GIT_TOKEN`` helper on a server with **no GitHub connection
-configured**.
+"""Clone a private repo with the image's shared token when no provider is configured.
 
-User journey (operator + user):
-
-1. An operator runs a server with no GitHub App integration (``/v1/info``
-   reports ``enabled_connections: []``) and ``sandbox.provider: kubernetes``
-   with ``sandbox.kubernetes.secret_name`` supplying ``GIT_TOKEN`` (the shared
-   fleet clone credential the host image's system-scope credential helper
-   reads).
-2. A user creates a managed session whose workspace is a **private** GitHub
-   repository URL (``POST /v1/sessions`` with ``host_type: "managed"`` and
-   ``workspace: "https://github.com/..."``).
-3. The launcher submits the sandbox Job; its ``workspace-prep`` init container
-   wires clone credentials (``configure_clone_credentials`` — which probes the
-   server's credential endpoint and gets a **404 "unknown credential
-   provider"**, since no GitHub provider is configured) and then runs
-   ``git clone``.
-4. Expected: the clone authenticates with the shared ``$GIT_TOKEN`` (the 404
-   means "this server vends no GitHub credential for anyone", so the ambient
-   helper chain must be kept). Bug: the inconclusive-probe path installs the
-   per-user broker anyway, whose chain reset **disarms** the image's shared
-   ``$GIT_TOKEN`` helper; the broker itself vends nothing (the endpoint 404s),
-   so the clone dies ``fatal: could not read Username for
-   'https://github.com'`` and the sandbox launch fails with it.
-
-The apiserver is unreachable from the test environment, so the stub
-``kubernetes`` SDK (:mod:`tests.e2e._k8s_stub_sdk`) stands in for the cluster
-and records the launch-token Secret + Job manifests the real launcher submits.
-The test then acts as the kubelet for the captured ``workspace-prep`` init
-container: it executes the manifest's command verbatim with the manifest's env
-(the launch token resolved from the captured Secret, ``GIT_TOKEN`` standing in
-for the operator's projected harness Secret, and the host image's system-scope
-credential helper from ``deploy/docker/Dockerfile``). Real github.com is not
-reachable either, so a loopback CONNECT proxy terminates TLS for
-``github.com`` itself and serves the private repository over smart HTTP behind
-Basic auth (:mod:`tests.e2e._fake_github_https`) — the clone URL, and
-therefore git's credential-helper context, stays ``https://github.com``.
-Everything else is real: the server process, the managed-session HTTP journey,
-the launcher, the credential endpoint's 404, the init container's exact
-command, and git's credential resolution.
+A stub Kubernetes SDK captures the real server's Job and Secret. Run the captured
+workspace-prep command against a local authenticated GitHub stand-in, preserving
+the github.com URL that selects Git's scoped credential helpers. No LLM is used.
 """
 
 from __future__ import annotations
 
 import json
 import os
-import socket
 import subprocess
 import sys
 import time
@@ -63,6 +24,7 @@ from omnigent.host.identity import (
     MANAGED_HOST_TOKEN_HEADER,
 )
 from omnigent.onboarding.sandboxes.kubernetes import _HOME_DIR as _POD_HOME_DIR
+from tests._helpers.live_server import find_free_port
 from tests.e2e._fake_github_https import FakeGitHub, make_bare_repo
 from tests.e2e._k8s_stub_sdk import CAPTURE_ENV_VAR as _CAPTURE_ENV_VAR
 from tests.e2e._k8s_stub_sdk import STUB_FILES as _STUB_FILES
@@ -74,19 +36,12 @@ _CAPTURE_TIMEOUT_S = 120.0
 _POLL_INTERVAL_S = 0.5
 _PREP_TIMEOUT_S = 180.0
 
-# The private repository of the reported journey, served by the loopback
-# github.com stand-in. The host must stay github.com: the broker disarm the
-# bug turns on is keyed to ``credential.https://github.com.helper``.
 _ORG_REPO = "acme/private-widget"
 _CLONE_URL = f"https://github.com/{_ORG_REPO}.git"
-
-# The shared fleet clone token the operator's harness Secret supplies as
-# ``GIT_TOKEN`` (report step 2: ``sandbox.kubernetes.secret_name``).
 _SHARED_GIT_TOKEN = "shared-fleet-git-token"
+_HARNESS_SECRET = "omnigent-harness-secrets"
 
-# The exact system-scope credential helper the managed host image installs
-# (deploy/docker/Dockerfile): answers ``git credential get`` for any host from
-# $GIT_TOKEN / $GIT_USERNAME, emitting nothing when GIT_TOKEN is unset.
+# Match the system-scope helper in deploy/docker/Dockerfile.
 _IMAGE_CREDENTIAL_HELPER = (
     '!f() { [ "$1" = get ] || return 0; [ -n "$GIT_TOKEN" ] || return 0; '
     'printf "username=%s\\npassword=%s\\n" "${GIT_USERNAME:-x-access-token}" "$GIT_TOKEN"; }; f'
@@ -95,13 +50,6 @@ _IMAGE_CREDENTIAL_HELPER = (
 # Server boot (<=180s) + manifest capture (<=120s) can exceed the repo-default
 # pytest-timeout on a loaded box.
 pytestmark = pytest.mark.timeout(600)
-
-
-def _find_free_port() -> int:
-    """Bind port 0 and return the assigned free port."""
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        return sock.getsockname()[1]
 
 
 def _write_stub_sdk(tmp_path: Path) -> Path:
@@ -115,13 +63,7 @@ def _write_stub_sdk(tmp_path: Path) -> Path:
 
 
 def _write_server_config(tmp_path: Path, port: int) -> Path:
-    """Write a server config: kubernetes sandboxes, NO GitHub connection.
-
-    ``pod_ready_timeout_s`` is high on purpose: in a real cluster the
-    workspace-prep init container runs while the server is still waiting for
-    the pod to become ready, and this test executes the captured init
-    container inside exactly that window (launch token armed, host row live).
-    """
+    """Keep the launch token alive while the test runs the captured init command."""
     config_path = tmp_path / "server-config.yaml"
     config_path.write_text(
         yaml.safe_dump(
@@ -135,9 +77,7 @@ def _write_server_config(tmp_path: Path, port: int) -> Path:
                         "in_cluster": False,
                         "kubeconfig": str(tmp_path / "kubeconfig"),
                         "pod_ready_timeout_s": 600,
-                        # The operator Secret that supplies GIT_TOKEN to the
-                        # init container via envFrom (report step 2).
-                        "secret_name": "omnigent-harness-secrets",
+                        "secret_name": _HARNESS_SECRET,
                     },
                 }
             }
@@ -221,11 +161,7 @@ def _create_managed_repo_session(base_url: str) -> None:
     """Drive the user journey: a managed session cloning a private repo."""
     info = httpx.get(f"{base_url}/v1/info", timeout=10.0).json()
     assert info.get("managed_sandboxes_enabled") is True
-    # Report step 1: this deployment has no GitHub connection provider.
-    assert info.get("enabled_connections") == [], (
-        f"harness setup: expected no configured connection providers, got "
-        f"{info.get('enabled_connections')!r}"
-    )
+    assert info["enabled_connections"] == []
     agents = httpx.get(f"{base_url}/v1/agents", timeout=10.0).json()["data"]
     assert agents, "no agents registered on the server to bind a session to"
     response = httpx.post(
@@ -278,13 +214,7 @@ def _write_image_git_identity(tmp_path: Path) -> Path:
 
 
 def _prepare_pod_home(tmp_path: Path) -> Path:
-    """Create the init container's HOME, with the image-profile PATH shim.
-
-    The init container runs ``bash -lc``; the managed host image's login
-    profile puts its venv on PATH. ``~/.profile`` reproduces that here (and
-    repairs any ``/etc/profile`` PATH reset on the box running the test) so
-    the script's ``python3`` resolves to this interpreter.
-    """
+    """Mirror the image's login profile so bash -lc uses the test interpreter."""
     pod_home = tmp_path / "pod-home"
     pod_home.mkdir()
     venv_bin = Path(sys.executable).parent
@@ -300,14 +230,7 @@ def _init_container_env(
     system_cfg: Path,
     proxy_url: str,
 ) -> dict[str, str]:
-    """Build the env the kubelet would give the workspace-prep container.
-
-    Manifest env is honored verbatim (the launch token resolved from the
-    captured Secret, ``HOME`` relocated with the pod filesystem); around it sit
-    the pieces the image/operator provide in a real pod: the projected harness
-    Secret (``GIT_TOKEN``), the image's system-scope git helper, no TTY
-    (``GIT_TERMINAL_PROMPT=0``), and the loopback github.com transport.
-    """
+    """Resolve the manifest's env and add the image helper and harness Secret."""
     env: dict[str, str] = {}
     for entry in init_container["env"]:
         if "value" in entry:
@@ -315,20 +238,13 @@ def _init_container_env(
         else:
             key = entry["valueFrom"]["secretKeyRef"]["key"]
             env[entry["name"]] = secret_data[key]
-    # The operator's harness Secret rides envFrom in the manifest; the
-    # stand-in kubelet projects its GIT_TOKEN key here (report step 2).
-    assert init_container.get("envFrom"), (
-        "harness setup: the init container lost its envFrom harness-Secret "
-        "projection — GIT_TOKEN would never reach the clone"
-    )
+    assert init_container["envFrom"] == [{"secretRef": {"name": _HARNESS_SECRET}}]
     env["GIT_TOKEN"] = _SHARED_GIT_TOKEN
     env.update(
         {
             "PATH": os.pathsep.join([str(Path(sys.executable).parent), os.environ["PATH"]]),
             "PYTHONPATH": _pythonpath(),
             "GIT_CONFIG_SYSTEM": str(system_cfg),
-            # A pod has no TTY: a credential-less HTTPS clone dies with
-            # "could not read Username" instead of prompting.
             "GIT_TERMINAL_PROMPT": "0",
             # The github.com stand-in's self-signed certificate.
             "GIT_SSL_NO_VERIFY": "1",
@@ -336,8 +252,7 @@ def _init_container_env(
             "HTTPS_PROXY": proxy_url,
             "http_proxy": proxy_url,
             "HTTP_PROXY": proxy_url,
-            # The wire step's probe of the (loopback) server must not ride the
-            # github.com proxy.
+            # Keep broker requests direct; only GitHub uses the proxy.
             "no_proxy": "127.0.0.1,localhost",
             "NO_PROXY": "127.0.0.1,localhost",
         }
@@ -346,16 +261,8 @@ def _init_container_env(
 
 
 def test_shared_git_token_clone_survives_no_provider_probe(tmp_path: Path) -> None:
-    """A 404 from the credential endpoint must not disarm the shared $GIT_TOKEN helper.
-
-    Fails on the bug with the init container's own journey: the workspace-prep
-    command exits non-zero, its ``git clone`` dying ``fatal: could not read
-    Username for 'https://github.com'`` even though ``GIT_TOKEN`` is set and
-    armed, because the broker probe treated the definitive 404 ("no GitHub
-    provider on this server") as inconclusive and reset the github.com helper
-    chain. Passes when the clone completes with the shared token.
-    """
-    port = _find_free_port()
+    """The no-provider 404 must preserve shared credentials for workspace-prep."""
+    port = find_free_port()
     config_path = _write_server_config(tmp_path, port)
     capture_path = tmp_path / "submitted.json"
     proc, log_path = _spawn_server(tmp_path, config_path, port, capture_path)
@@ -368,40 +275,25 @@ def test_shared_git_token_clone_survives_no_provider_probe(tmp_path: Path) -> No
         ]
         job_manifest = _await_capture(capture_path, "create_namespaced_job", log_path)["manifest"]
 
-        init_container = job_manifest["spec"]["template"]["spec"]["initContainers"][0]
+        pod = job_manifest["spec"]["template"]["spec"]
+        init_container = pod["initContainers"][0]
         assert init_container["name"] == "workspace-prep"
         command = init_container["command"]
         script = command[-1]
         secret_data = secret_manifest["stringData"]
-        host_token = secret_data[HOST_TOKEN_ENV_VAR]
-
-        # The reported trigger: with the launch token armed, this server's
-        # credential endpoint vends nothing for github (today a 404 "unknown
-        # credential provider"). Guard that a connected credential never
-        # appears — if one did, the journey under test wouldn't exist.
-        assert "configure_clone_credentials" in script, (
-            f"no credential wire step in workspace-prep script:\n{script}"
+        assert "configure_clone_credentials" in script
+        host_id = next(
+            e["value"] for e in pod["containers"][0]["env"] if e["name"] == HOST_ID_ENV_VAR
         )
-        host_container = job_manifest["spec"]["template"]["spec"]["containers"][0]
-        host_id = next(e["value"] for e in host_container["env"] if e["name"] == HOST_ID_ENV_VAR)
         probe = httpx.get(
             f"{base_url}/v1/hosts/{host_id}/credentials/github",
-            headers={MANAGED_HOST_TOKEN_HEADER: host_token},
+            headers={MANAGED_HOST_TOKEN_HEADER: secret_data[HOST_TOKEN_ENV_VAR]},
             timeout=10.0,
         )
-        assert probe.status_code != 401, (
-            "harness setup: the captured launch token does not resolve"
-        )
-        # Pin the exact trigger under test: the no-provider 404. A 200
-        # ``connected: false`` would exercise the (already-working)
-        # confirmed-unlinked path instead, and the pre-fix code would pass.
-        assert probe.status_code == 404, (
-            "harness setup: expected the no-provider 404 from the credential "
-            f"endpoint, got HTTP {probe.status_code}: {probe.text[:200]}"
-        )
+        # A 200 connected:false would also pass before the fix; pin the trigger.
+        assert probe.status_code == 404, probe.text
+        assert probe.json() == {"detail": "unknown credential provider"}
 
-        # Stand-in kubelet + github.com: image git identity, projected
-        # GIT_TOKEN, loopback github.com serving the private repository.
         system_cfg = _write_image_git_identity(tmp_path)
         pod_home = _prepare_pod_home(tmp_path)
         github_root = tmp_path / "github"
@@ -415,9 +307,7 @@ def test_shared_git_token_clone_survives_no_provider_probe(tmp_path: Path) -> No
                 proxy_url=fake_github.proxy_url,
             )
 
-            # Control: with the image's ambient chain intact (no broker
-            # wiring), the shared-token clone of this private repo works. If
-            # THIS fails the harness lane is broken, not the product.
+            # Prove the shared token works before running workspace-prep.
             control_home = tmp_path / "control-home"
             control_home.mkdir()
             control = subprocess.run(
@@ -427,13 +317,9 @@ def test_shared_git_token_clone_survives_no_provider_probe(tmp_path: Path) -> No
                 text=True,
                 timeout=_PREP_TIMEOUT_S,
             )
-            assert control.returncode == 0, (
-                f"harness setup: shared-token clone with the ambient chain failed:\n"
-                f"{control.stderr[-2000:]}"
-            )
+            assert control.returncode == 0, control.stderr
 
-            # The journey: execute the captured workspace-prep init container
-            # verbatim (only the pod filesystem root is relocated).
+            # Run the captured command with only the pod filesystem relocated.
             prep = subprocess.run(
                 [*command[:-1], script.replace(_POD_HOME_DIR, str(pod_home))],
                 env=env,
@@ -442,32 +328,10 @@ def test_shared_git_token_clone_survives_no_provider_probe(tmp_path: Path) -> No
                 timeout=_PREP_TIMEOUT_S,
             )
 
-        # The wire step is best-effort (`|| true`): a crashed probe would skip
-        # the broker path entirely and mask the bug with a false pass.
-        assert "Traceback" not in prep.stdout + prep.stderr, (
-            f"harness setup: the credential wire step crashed instead of running:\n"
-            f"{(prep.stdout + prep.stderr)[-2000:]}"
-        )
-
-        helpers_after = subprocess.run(
-            ["git", "config", "--global", "--get-all", "credential.https://github.com.helper"],
-            env=env,
-            capture_output=True,
-            text=True,
-            timeout=30.0,
-        ).stdout
-        clone_landed = (pod_home / "workspace" / "private-widget" / "README.md").exists()
-        assert prep.returncode == 0 and clone_landed, (
-            "workspace-prep failed to clone the private repository with the shared "
-            "$GIT_TOKEN on a server with no GitHub connection configured: the broker "
-            "probe's 404 (no provider) must keep the image's ambient credential chain, "
-            "but the clone could not authenticate.\n"
-            f"credential endpoint probe: HTTP {probe.status_code} {probe.text[:120]!r}\n"
-            f"workspace-prep exit code: {prep.returncode}\n"
-            f"workspace-prep stdout:\n{prep.stdout[-1000:]}\n"
-            f"workspace-prep stderr:\n{prep.stderr[-2000:]}\n"
-            f"github.com helper chain after workspace-prep (--global):\n{helpers_after}"
-        )
+        output = prep.stdout + prep.stderr
+        assert "Traceback" not in output, output
+        assert prep.returncode == 0, output
+        assert (pod_home / "workspace" / "private-widget" / "README.md").is_file()
     finally:
         proc.kill()
         proc.wait(timeout=30)
