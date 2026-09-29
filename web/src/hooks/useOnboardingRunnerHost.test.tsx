@@ -1,20 +1,27 @@
 import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Host } from "@/hooks/useHosts";
 import { ONBOARDING_RUNNER_GRACE_MS, useOnboardingRunnerHost } from "./useOnboardingRunnerHost";
 
 const bridge = vi.hoisted(() => ({
   takeOnboardingRunner: vi.fn<() => Promise<"local" | "remote" | null>>(),
+  getHostIdentity: vi.fn<() => Promise<{ cliInstalled: boolean; hostId: string | null } | null>>(),
 }));
 vi.mock("@/lib/nativeBridge", () => ({
   isElectronShell: () => true,
   takeOnboardingRunner: bridge.takeOnboardingRunner,
+  getHostIdentity: bridge.getHostIdentity,
 }));
+
+beforeEach(() => {
+  bridge.getHostIdentity.mockResolvedValue({ cliInstalled: true, hostId: "laptop" });
+});
 
 afterEach(() => {
   cleanup();
   vi.useRealTimers();
   bridge.takeOnboardingRunner.mockReset();
+  bridge.getHostIdentity.mockReset();
 });
 
 function host(host_id: string, status: Host["status"] = "online"): Host {
@@ -24,7 +31,7 @@ function host(host_id: string, status: Host["status"] = "online"): Host {
 describe("useOnboardingRunnerHost", () => {
   it("holds the default until the shell answers, then lets it through when nothing was picked", async () => {
     bridge.takeOnboardingRunner.mockResolvedValue(null);
-    const { result } = renderHook(() => useOnboardingRunnerHost([host("laptop")], "laptop"));
+    const { result } = renderHook(() => useOnboardingRunnerHost([host("laptop")]));
     expect(result.current.pending).toBe(true);
     await waitFor(() => expect(result.current.pending).toBe(false));
     expect(result.current.hostId).toBeNull();
@@ -33,10 +40,9 @@ describe("useOnboardingRunnerHost", () => {
 
   it("resolves 'local' to this machine's host once it's online", async () => {
     bridge.takeOnboardingRunner.mockResolvedValue("local");
-    const { result, rerender } = renderHook(
-      ({ hosts }) => useOnboardingRunnerHost(hosts, "laptop"),
-      { initialProps: { hosts: [host("laptop", "offline"), host("box")] } },
-    );
+    const { result, rerender } = renderHook(({ hosts }) => useOnboardingRunnerHost(hosts), {
+      initialProps: { hosts: [host("laptop", "offline"), host("box")] },
+    });
     await waitFor(() => expect(bridge.takeOnboardingRunner).toHaveBeenCalled());
     expect(result.current).toMatchObject({ pending: true, hostId: null });
     rerender({ hosts: [host("laptop"), host("box")] });
@@ -45,10 +51,9 @@ describe("useOnboardingRunnerHost", () => {
 
   it("resolves 'remote' to the only other online host, and gives up with several", async () => {
     bridge.takeOnboardingRunner.mockResolvedValue("remote");
-    const { result, rerender } = renderHook(
-      ({ hosts }) => useOnboardingRunnerHost(hosts, "laptop"),
-      { initialProps: { hosts: [host("laptop")] } },
-    );
+    const { result, rerender } = renderHook(({ hosts }) => useOnboardingRunnerHost(hosts), {
+      initialProps: { hosts: [host("laptop")] },
+    });
     await waitFor(() => expect(bridge.takeOnboardingRunner).toHaveBeenCalled());
     await act(async () => {});
     // Still booting: nothing but this machine is online yet.
@@ -64,7 +69,7 @@ describe("useOnboardingRunnerHost", () => {
   it("stops waiting after the grace period", async () => {
     vi.useFakeTimers();
     bridge.takeOnboardingRunner.mockResolvedValue("remote");
-    const { result } = renderHook(() => useOnboardingRunnerHost([], "laptop"));
+    const { result } = renderHook(() => useOnboardingRunnerHost([]));
     await act(async () => {
       await vi.advanceTimersByTimeAsync(0);
     });
@@ -78,7 +83,7 @@ describe("useOnboardingRunnerHost", () => {
   it("keeps a resolved runner past the grace period", async () => {
     vi.useFakeTimers();
     bridge.takeOnboardingRunner.mockResolvedValue("local");
-    const { result } = renderHook(() => useOnboardingRunnerHost([host("laptop")], "laptop"));
+    const { result } = renderHook(() => useOnboardingRunnerHost([host("laptop")]));
     await act(async () => {
       await vi.advanceTimersByTimeAsync(0);
     });
@@ -91,8 +96,28 @@ describe("useOnboardingRunnerHost", () => {
 
   it("treats a failed handoff as nothing picked", async () => {
     bridge.takeOnboardingRunner.mockRejectedValue(new Error("ipc down"));
-    const { result } = renderHook(() => useOnboardingRunnerHost([host("laptop")], "laptop"));
+    const { result } = renderHook(() => useOnboardingRunnerHost([host("laptop")]));
     await waitFor(() => expect(result.current.pending).toBe(false));
     expect(result.current.hostId).toBeNull();
+  });
+
+  it("doesn't take this laptop for the remote host before its identity loads", async () => {
+    let resolveIdentity: (v: { cliInstalled: boolean; hostId: string }) => void = () => {};
+    bridge.getHostIdentity.mockReturnValue(
+      new Promise((resolve) => {
+        resolveIdentity = resolve;
+      }),
+    );
+    bridge.takeOnboardingRunner.mockResolvedValue("remote");
+    const { result, rerender } = renderHook(({ hosts }) => useOnboardingRunnerHost(hosts), {
+      initialProps: { hosts: [host("laptop")] },
+    });
+    await waitFor(() => expect(bridge.getHostIdentity).toHaveBeenCalled());
+    // Only the laptop is online and its identity is unknown: keep waiting.
+    expect(result.current).toEqual({ pending: true, hostId: null });
+    await act(async () => resolveIdentity({ cliInstalled: true, hostId: "laptop" }));
+    expect(result.current).toEqual({ pending: true, hostId: null });
+    rerender({ hosts: [host("laptop"), host("box")] });
+    expect(result.current).toEqual({ pending: false, hostId: "box" });
   });
 });

@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import type { Host } from "@/hooks/useHosts";
-import { isElectronShell, takeOnboardingRunner } from "@/lib/nativeBridge";
+import { getHostIdentity, isElectronShell, takeOnboardingRunner } from "@/lib/nativeBridge";
 
 /** How long the new-session picker waits for the onboarding runner to come online. */
 export const ONBOARDING_RUNNER_GRACE_MS = 30_000;
@@ -11,10 +11,10 @@ export const ONBOARDING_RUNNER_GRACE_MS = 30_000;
  * `pending` holds the picker's own default while the runner is still coming
  * online; after the grace period it gives up and the normal default applies.
  */
-export function useOnboardingRunnerHost(
-  hosts: Host[] | undefined,
-  localHostId: string | null | undefined,
-): { pending: boolean; hostId: string | null } {
+export function useOnboardingRunnerHost(hosts: Host[] | undefined): {
+  pending: boolean;
+  hostId: string | null;
+} {
   // undefined = not asked yet; the shell hands the choice over only once.
   const [runner, setRunner] = useState<"local" | "remote" | null | undefined>(() =>
     isElectronShell() ? undefined : null,
@@ -26,13 +26,28 @@ export function useOnboardingRunnerHost(
     void takeOnboardingRunner().then(setRunner, () => setRunner(null));
   }, [runner]);
 
+  // This machine's host id, undefined until the shell answers. Nothing resolves
+  // before then, or "remote" could mistake this laptop for the other host.
+  const [localHostId, setLocalHostId] = useState<string | null | undefined>(undefined);
+  useEffect(() => {
+    if (!runner) return;
+    let cancelled = false;
+    void getHostIdentity().then((identity) => {
+      if (!cancelled) setLocalHostId(identity?.hostId ?? null);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [runner]);
+  const identityKnown = localHostId !== undefined;
+
   const online = (hosts ?? []).filter((h) => h.status === "online");
   // "remote" resolves only when exactly one other host is online; with several, the user picks.
   const others = online.filter((h) => h.host_id !== localHostId);
   let hostId: string | null = null;
-  if (runner === "local") {
+  if (runner === "local" && identityKnown) {
     hostId = online.find((h) => h.host_id === localHostId)?.host_id ?? null;
-  } else if (runner === "remote" && others.length === 1) {
+  } else if (runner === "remote" && identityKnown && others.length === 1) {
     hostId = others[0].host_id;
   }
 
@@ -46,6 +61,7 @@ export function useOnboardingRunnerHost(
   // Waits only while the runner may still appear; several candidates can't resolve.
   const pending =
     runner === undefined ||
+    (runner !== null && !identityKnown) ||
     (runner === "local" && hostId === null) ||
     (runner === "remote" && others.length === 0);
   return { pending, hostId };

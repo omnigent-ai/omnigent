@@ -2388,7 +2388,7 @@ export function NewChatLandingScreen() {
   // picker can tag the current machine and offer to auto-connect it.
   const [desktopHost, setDesktopHost] = useState<HostIdentity | null>(null);
   // The runner picked during desktop onboarding, preselected once it's online.
-  const onboardingHost = useOnboardingRunnerHost(hosts, desktopHost?.hostId);
+  const onboardingHost = useOnboardingRunnerHost(hosts);
   const [connectingThisMachine, setConnectingThisMachine] = useState(false);
   // Error surfaced when "Run on this machine" fails (sign-in needed, enrollment
   // declined, server unreachable). Rendered in the composer body with a retry,
