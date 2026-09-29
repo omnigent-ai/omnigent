@@ -4695,6 +4695,52 @@ async def test_codex_model_list_does_not_hide_failures_or_retry_forever(code: in
     assert client.request.await_count == (2 if code == -32602 else 1)
 
 
+async def test_codex_model_list_timeout_discards_partial_pages() -> None:
+    """A timed-out live list never returns an incomplete account catalog."""
+    client = AsyncMock(spec=CodexAppServerClient)
+    first_page_started = asyncio.Event()
+    never_respond = asyncio.Event()
+
+    async def _request(method: str, params: object) -> dict[str, object]:
+        assert method == "model/list"
+        assert params == {"includeHidden": False}
+        first_page_started.set()
+        await never_respond.wait()
+        raise AssertionError("unreachable")
+
+    client.request.side_effect = _request
+
+    with pytest.raises(TimeoutError):
+        await app_server.list_codex_model_options(client, timeout_s=0.01)
+
+    assert first_page_started.is_set()
+    assert client.request.await_count == 1
+
+
+async def test_codex_model_list_timeout_covers_later_pages() -> None:
+    """The budget spans the whole pagination; rows already served are not returned."""
+    client = AsyncMock(spec=CodexAppServerClient)
+
+    async def _request(method: str, params: dict[str, object]) -> dict[str, object]:
+        assert method == "model/list"
+        if "cursor" not in params:
+            return {
+                "result": {"data": [{"id": "first", "isDefault": True}], "nextCursor": "page2"}
+            }
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+    client.request.side_effect = _request
+
+    with pytest.raises(TimeoutError):
+        await app_server.list_codex_model_options(client, timeout_s=0.05)
+
+    assert [call.args for call in client.request.await_args_list] == [
+        ("model/list", {"includeHidden": False}),
+        ("model/list", {"includeHidden": False, "cursor": "page2"}),
+    ]
+
+
 @pytest.mark.parametrize("config_text", [None, "", 'model = "second"\n'])
 @pytest.mark.parametrize("config_error", [-32600, -32601, -32602])
 async def test_codex_without_custom_catalog_keeps_models_and_default(

@@ -250,6 +250,11 @@ _CODEX_POPUP_RENDER_S = 0.7
 # fails loud instead of the label claiming a mode the TUI never entered.
 _CODEX_PERMISSION_CONFIRM_BUDGET_S = 4.0
 
+# Budget for the live, account-aware ``model/list`` refresh of an already-running
+# app-server. A stalled RPC fails the picker request retryably instead of leaving
+# it pending, and partial rows are never written back to the shared catalog.
+_CODEX_NATIVE_MODEL_OPTIONS_TIMEOUT_S = 5.0
+
 
 def _warn_unresolved_sub_agent(session_id: str | None, sub_agent_name: str) -> None:
     """
@@ -6296,7 +6301,10 @@ def create_runner_app(
         )
         try:
             await codex_client.connect()
-            rows = await list_codex_model_options(codex_client)
+            rows = await list_codex_model_options(
+                codex_client,
+                timeout_s=_CODEX_NATIVE_MODEL_OPTIONS_TIMEOUT_S,
+            )
         finally:
             with contextlib.suppress(Exception):
                 await codex_client.close()
