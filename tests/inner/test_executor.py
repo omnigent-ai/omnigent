@@ -12,6 +12,7 @@ from omnigent.inner.executor import (
     TextChunk,
     ToolCallRequest,
     TurnComplete,
+    describe_exception,
     split_transient_tail,
 )
 
@@ -146,6 +147,83 @@ class TestSplitTransientTail(unittest.TestCase):
         split = split_transient_tail(msgs)
         self.assertEqual(split.persisted, msgs)
         self.assertEqual(split.transient, [])
+
+
+class TestDescribeException(unittest.TestCase):
+    def test_plain_exception_returns_str(self):
+        exc = ValueError("bad value")
+        self.assertEqual(describe_exception(exc), "bad value")
+
+    def test_empty_str_falls_back_to_repr(self):
+        # A bare RuntimeError() has an empty str().
+        exc = RuntimeError()
+        result = describe_exception(exc)
+        self.assertIn("RuntimeError", result)
+        self.assertTrue(result)
+
+    def test_oserror_with_filename_uses_str(self):
+        # FileNotFoundError with a filename already includes it in str().
+        exc = FileNotFoundError(2, "No such file or directory", "/missing/file")
+        result = describe_exception(exc)
+        self.assertIn("/missing/file", result)
+        self.assertIn("[Errno 2]", result)
+
+    def test_oserror_without_filename_appends_cwd(self):
+        # OSError without a filename (e.g. from os.getcwd() on a deleted cwd)
+        # should append the current cwd so operators can identify the location.
+        exc = OSError(2, "No such file or directory")
+        self.assertIsNone(exc.filename)
+        result = describe_exception(exc)
+        self.assertIn("[Errno 2] No such file or directory", result)
+        self.assertIn("cwd:", result)
+
+    def test_oserror_without_filename_cwd_inaccessible(self):
+        # When getcwd() itself fails, the description mentions "inaccessible".
+        import unittest.mock
+
+        exc = OSError(2, "No such file or directory")
+        with unittest.mock.patch("os.getcwd", side_effect=OSError(2, "No such file or directory")):
+            result = describe_exception(exc)
+        self.assertIn("[Errno 2] No such file or directory", result)
+        self.assertIn("inaccessible", result)
+
+    def test_oserror_with_both_filenames_uses_str(self):
+        # rename(src, dst) raises OSError with both filename and filename2.
+        exc = OSError(2, "No such file or directory")
+        exc.filename = "/src"
+        exc.filename2 = "/dst"
+        # str(exc) may or may not include filenames when set post-construction,
+        # but describe_exception must NOT try to call getcwd() in this case.
+        import unittest.mock
+
+        with unittest.mock.patch("os.getcwd") as mock_cwd:
+            result = describe_exception(exc)
+            mock_cwd.assert_not_called()
+        # The result should still be a non-empty string.
+        self.assertTrue(result)
+
+    def test_oserror_with_only_filename2_uses_str(self):
+        exc = OSError(2, "No such file or directory")
+        exc.filename2 = "/dst"
+        import unittest.mock
+
+        with unittest.mock.patch("os.getcwd") as mock_cwd:
+            result = describe_exception(exc)
+            mock_cwd.assert_not_called()
+        self.assertTrue(result)
+
+    def test_permission_error_without_filename_not_augmented(self):
+        # A path-less PermissionError is NOT ENOENT; cwd context would mislead.
+        # describe_exception must return str(exc) unchanged without calling getcwd().
+        import unittest.mock
+
+        exc = PermissionError(13, "Permission denied")
+        self.assertIsNone(exc.filename)
+        with unittest.mock.patch("os.getcwd") as mock_cwd:
+            result = describe_exception(exc)
+            mock_cwd.assert_not_called()
+        self.assertEqual(result, str(exc))
+        self.assertNotIn("cwd:", result)
 
 
 if __name__ == "__main__":

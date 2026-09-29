@@ -1272,6 +1272,7 @@ async def _resolve_agent_spec_from_server(
     """
     from omnigent.runner.native import ResolvedSpec
     from omnigent.spec import load
+    from omnigent.spec.parser import AgentImageConfigMissingError
 
     if session_id is None:
         _logger.warning(
@@ -1312,10 +1313,28 @@ async def _resolve_agent_spec_from_server(
     # unsupported sub-agent and launch the parent with what this runner
     # *does* support, rather than failing every dispatch of the agent.
     # See omnigent.spec.load.
-    if not dest.exists():
+    if not dest.is_dir():
         dest.mkdir(parents=True)
         load(resp.content, dest=dest, expand_env=expand_env, prune_invalid_sub_agents=True)
-    spec = load(dest, expand_env=expand_env, prune_invalid_sub_agents=True)
+    try:
+        spec = load(dest, expand_env=expand_env, prune_invalid_sub_agents=True)
+    except AgentImageConfigMissingError:
+        # The cache dir exists but its contents were removed (e.g. the OS
+        # cleaned up files under the temp root while the runner was live).
+        # Wipe the stale directory, re-extract from the server response,
+        # and load once more so the session can proceed normally.
+        import shutil
+
+        _logger.warning(
+            "spec_resolver: bundle contents missing from %s for agent %s; re-extracting",
+            dest,
+            agent_id,
+            extra={"session_id": session_id},
+        )
+        shutil.rmtree(dest, ignore_errors=True)
+        dest.mkdir(parents=True)
+        load(resp.content, dest=dest, expand_env=expand_env, prune_invalid_sub_agents=True)
+        spec = load(dest, expand_env=expand_env, prune_invalid_sub_agents=True)
     _apply_host_interactive_shells(spec)
     return ResolvedSpec(spec=spec, workdir=dest)
 

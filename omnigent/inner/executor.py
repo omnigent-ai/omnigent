@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import enum
+import errno
 import json
 import threading
 from collections.abc import AsyncIterator, Iterator
@@ -63,9 +64,34 @@ def describe_exception(exc: BaseException) -> str:
     to ``repr(exc)`` — which always includes the class name — so a failure is
     never reported without at least naming its type.
 
+    For :class:`OSError` subclasses, Python already includes ``filename`` and
+    ``filename2`` in ``str(exc)`` when they were set at construction time.
+    When both are absent — the case for errors raised by ``os.getcwd()`` or
+    ``asyncio.create_subprocess_exec`` on Python < 3.12 when the process cwd
+    was deleted — the message carries no path, leaving operators with a bare
+    ``[Errno 2] No such file or directory``. This function appends the
+    current cwd (or notes it is inaccessible) so the location is visible.
+
     :param exc: The exception to describe.
-    :returns: ``str(exc)`` when non-empty, otherwise ``repr(exc)``.
+    :returns: ``str(exc)`` when non-empty, otherwise ``repr(exc)``, with
+        cwd context appended for path-less ``OSError`` instances.
     """
+    if (
+        isinstance(exc, OSError)
+        and exc.errno == errno.ENOENT
+        and exc.filename is None
+        and exc.filename2 is None
+    ):
+        base = str(exc)
+        if not base:
+            return repr(exc)
+        import os as _os
+
+        try:
+            cwd = _os.getcwd()
+            return f"{base} (cwd: {cwd!r})"
+        except OSError:
+            return f"{base} (cwd: inaccessible)"
     return str(exc) or repr(exc)
 
 
