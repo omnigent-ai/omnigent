@@ -105,11 +105,17 @@ opposite default of the rest of this design, so the accept is deliberately fail-
   accept hint (`→ Run (once) (y)`). A stale marker with no gate rendered gets no keystroke —
   `tmux send-keys y` would type a literal `y` into the composer, which then prepends itself to
   whatever the user types next in the embedded terminal.
-- **Bounded.** `_YOLO_ACCEPT_MAX_ATTEMPTS` tries, paced by `_YOLO_ACCEPT_RETRY_S`, at most one
-  keystroke per poll (cursor renders one prompt at a time).
-- **Falls back to the card.** A dead pane, a send tmux rejects, or a gate still pending after
-  the budget all surface the ordinary ApprovalCard. The worst case is therefore today's visible
-  stall, never a keystroke loop.
+- **Waits for a visible gate.** An absent accept hint neither spends the retry budget nor
+  surfaces a card. Checkpoint markers can outlive an approval or precede its rendering; a
+  delayed transcript update must not create an approval for a call Cursor already accepted.
+  If Cursor changes its key hints, the native prompt remains available in the embedded terminal.
+- **Bounded retries with backoff.** A visible gate gets 30 seconds from its first accept attempt,
+  with delays of 2, 4, then 5 seconds between retries. The delay applies across pending markers
+  in the same pane, so several calls cannot send a burst of keys. When the prompt
+  disappears, its retry state resets.
+- **Falls back to the card.** A dead pane, a send tmux rejects, or a gate still **visible** after
+  the retry budget surfaces the ordinary ApprovalCard. No further auto-accept runs while a
+  surfaced prompt is awaiting an answer.
 - **`AskQuestion` is excluded** — a question is human input, not a gate `y` can answer.
 - Because a gate answered this way is never seen by a human, the accept logs the tool name and
   an argument preview at INFO: that line is the only record Omnigent approved the call.

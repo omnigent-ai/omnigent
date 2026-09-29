@@ -10,7 +10,7 @@ HTTP boundaries faked:
   auto-approved calls, the TUI-resolved release, and the yolo auto-accept path
   that sends ``y`` without parking a web card — including every way that path
   refuses to type (no gate on screen, dead pane, undelivered keystroke, retry
-  budget spent) and falls back to the ordinary card.
+  budget spent), suppressing stale markers and surfacing real failures.
 * **Verdict delivery** — ``_run_one_approval`` (park → verdict → keystroke,
   incl. the reject → reason-prompt → Enter two-step) and ``_run_one_question``
   (AskQuestion form → picker keystrokes).
@@ -29,6 +29,7 @@ import json as _json
 import sqlite3 as _sqlite3
 from collections.abc import Callable
 from pathlib import Path
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -653,16 +654,52 @@ async def test_supervise_transcript_yolo_auto_accepts_without_card(
     assert not any(j.get("type") == "external_elicitation_resolved" for _, j in posts), posts
 
 
-async def test_supervise_transcript_yolo_caps_retries_then_surfaces_card(
+@pytest.mark.parametrize("delay", ["prompt", "transcript", "backoff"])
+async def test_supervise_transcript_yolo_waits_through_stale_pending_burst(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, delay: str
+) -> None:
+    """Slow rendering or checkpoint updates must not produce cards or key bursts."""
+    pending = [
+        CursorPendingToolCall(f"call_{i}", name, {})
+        for i, name in enumerate(["ReadFile"] * 4 + ["Shell", "GetDynamicTools"])
+    ]
+    posts, keys_sent = _install_supervisor_fakes(
+        monkeypatch, tmp_path, pending=pending, pane=_IDLE_PANE
+    )
+    polls = 0
+
+    def read_pending(_store: Path) -> list[CursorPendingToolCall]:
+        nonlocal polls
+        polls += 1
+        return pending if polls <= 6 else []
+
+    def capture_pane(_bridge: Path) -> str:
+        prompt_poll = 5 if delay == "prompt" else 1
+        return _ACCEPT_PANE if delay == "backoff" or polls == prompt_poll else _IDLE_PANE
+
+    # Advance the supervisor's clock without changing the real event loop.
+    clock = SimpleNamespace(time=lambda: (polls - 1) * 2.0)
+    async_facade = SimpleNamespace(**vars(asyncio))
+    async_facade.get_running_loop = lambda: clock
+    monkeypatch.setattr(cnp, "asyncio", async_facade)
+    monkeypatch.setattr(cnp, "read_cursor_pending_tool_calls", read_pending)
+    monkeypatch.setattr(cnp, "capture_cursor_pane", capture_pane)
+    task = _start_supervisor(tmp_path, session_id="conv_slow", auto_accept_approvals=True)
+    try:
+        assert await _wait_for(lambda: polls >= 7)
+    finally:
+        await _stop(task)
+
+    assert _hook_posts(posts) == []
+    assert keys_sent == [("y",)] * (3 if delay == "backoff" else 1)
+
+
+async def test_supervise_transcript_yolo_times_out_then_surfaces_card(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """A gate ``y`` never clears is retried a bounded number of times, then mirrored.
-
-    Without a cap the supervisor types ``y`` into the pane every couple of
-    seconds for the life of the session and no human ever sees the gate. After
-    the budget it must fall back to the ApprovalCard the non-yolo path shows.
-    """
+    """A visible gate that never clears falls back once its retry time expires."""
     monkeypatch.setattr(cnp, "_YOLO_ACCEPT_RETRY_S", 0.0)
+    monkeypatch.setattr(cnp, "_YOLO_ACCEPT_TIMEOUT_S", 0.03)
     # Stays pending no matter how many times we accept it.
     pending_now = [_SHELL_CALL]
     posts, keys_sent = _install_supervisor_fakes(
@@ -671,19 +708,21 @@ async def test_supervise_transcript_yolo_caps_retries_then_surfaces_card(
 
     task = _start_supervisor(tmp_path, session_id="conv_yolo_cap", auto_accept_approvals=True)
     assert await _wait_for(lambda: bool(_hook_posts(posts)))
+    sent_before_card = list(keys_sent)
     # Give the loop several more polls: the card is parked, so nothing more
     # should be sent and the card must not be re-posted.
     await asyncio.sleep(0.1)
     await _stop(task)
 
-    assert keys_sent == [("y",)] * cnp._YOLO_ACCEPT_MAX_ATTEMPTS
+    assert sent_before_card
+    assert keys_sent == sent_before_card
     assert len(_hook_posts(posts)) == 1, posts
 
 
 async def test_supervise_transcript_yolo_never_types_when_no_prompt_on_screen(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """A pending marker with no gate rendered is mirrored, never typed at.
+    """A pending marker with no gate rendered produces no keys or cards.
 
     This is the stale-marker case the feature exists for. ``tmux send-keys y``
     against an idle pane types a literal ``y`` into cursor's composer, which
@@ -696,11 +735,11 @@ async def test_supervise_transcript_yolo_never_types_when_no_prompt_on_screen(
     )
 
     task = _start_supervisor(tmp_path, session_id="conv_yolo_idle", auto_accept_approvals=True)
-    assert await _wait_for(lambda: bool(_hook_posts(posts)))
+    await asyncio.sleep(0.1)
     await _stop(task)
 
     assert keys_sent == []
-    assert len(_hook_posts(posts)) == 1, posts
+    assert _hook_posts(posts) == []
 
 
 async def test_supervise_transcript_yolo_surfaces_card_when_pane_is_gone(
