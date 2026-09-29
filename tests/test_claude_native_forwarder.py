@@ -2306,7 +2306,9 @@ async def test_forwarder_does_not_post_compaction_on_non_compact_session_start(
     assert request["path"] == "/v1/sessions/conv_abc/events"
     assert request["body"] == {
         "type": "external_session_status",
-        "data": {"status": "failed"},
+        "data": {
+            "status": "failed",
+        },
     }
 
 
@@ -2527,12 +2529,16 @@ async def test_forwarder_posts_external_session_status_on_stop_failure_hook(
     ("payload_fields", "expected_detail"),
     [
         (
-            {"error": "server_error", "last_assistant_message": "API Error: 500 Overloaded"},
+            {"error": "server_error", "error_details": "API Error: 500 Overloaded"},
             "API Error: 500 Overloaded",
         ),
         (
             {"error": "rate_limit"},
             "Claude Code ended the turn with an API error (rate_limit).",
+        ),
+        (
+            {},
+            None,
         ),
     ],
 )
@@ -2540,10 +2546,12 @@ async def test_forwarder_posts_external_session_status_on_stop_failure_hook(
 async def test_forwarder_attaches_stop_failure_reason_to_failed_edge(
     tmp_path: Path,
     payload_fields: dict[str, str],
-    expected_detail: str,
+    expected_detail: str | None,
 ) -> None:
     """
-    The failed edge carries the hook's own error text, else its category.
+    The failed edge carries ``error_details`` when present, else a category
+    fallback; when both are absent the field is omitted so the server can
+    fall back to its own store.
 
     The transcript mirror can land the error after the edge or never, so
     without this the server reports the turn's last prose or no detail.
@@ -2586,10 +2594,54 @@ async def test_forwarder_attaches_stop_failure_reason_to_failed_edge(
         thread.join(timeout=5.0)
 
     # ``failure_detail``, not ``output``: wire output is labeled a Codex error.
+    expected_data: dict[str, object] = {"status": "failed"}
+    if expected_detail is not None:
+        expected_data["failure_detail"] = expected_detail
     assert request["body"] == {
         "type": "external_session_status",
-        "data": {"status": "failed", "failure_detail": expected_detail},
+        "data": expected_data,
     }
+
+
+@pytest.mark.parametrize(
+    ("failure_category", "failure_message"),
+    [
+        ("rate_limit", None),
+        (None, None),
+    ],
+)
+def test_stop_failure_detail_warns_when_no_error_details(
+    caplog: pytest.LogCaptureFixture,
+    failure_category: str | None,
+    failure_message: str | None,
+) -> None:
+    """
+    A WARNING is emitted whenever ``error_details`` was absent from the hook.
+
+    Session id, event cursor, and category are present in the log record so
+    operators can correlate the fallback with the originating hook.
+    """
+    from omnigent.harnesses.claude_native.forwarder import _stop_failure_detail
+
+    record = ClaudeHookRecord(
+        event_cursor=5,
+        byte_offset=100,
+        event_name="StopFailure",
+        failure_category=failure_category,
+        failure_message=failure_message,
+    )
+    with caplog.at_level(logging.WARNING, logger=forwarder.__name__):
+        detail = _stop_failure_detail(record, session_id="conv_test")
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert warnings[0].session_id == "conv_test"
+    assert "StopFailure" in warnings[0].getMessage()
+    assert "error_details" in warnings[0].getMessage()
+    # category-only → string; no category → None (server falls back to its store)
+    if failure_category is not None:
+        assert detail is not None
+    else:
+        assert detail is None
 
 
 @pytest.mark.asyncio
