@@ -12,11 +12,6 @@ from tests._helpers.compat import COMPAT_SERVER_VERSION_ENV
 pytest_plugins = ["pytester"]
 
 
-@pytest.fixture(autouse=True, name="_enforce_min_server_version")
-def isolated_version_gate() -> None:
-    """Exercise the real version gate only inside the mocked pytester runs."""
-
-
 def _configure(
     pytester: pytest.Pytester,
     monkeypatch: pytest.MonkeyPatch,
@@ -25,7 +20,7 @@ def _configure(
     pinned: str | None = None,
     expect_server: bool = True,
 ) -> None:
-    root = str(Path(__file__).resolve().parents[2])
+    root = str(Path(__file__).resolve().parents[1])
     monkeypatch.setenv("PYTHONPATH", os.pathsep.join([root, os.environ.get("PYTHONPATH", "")]))
     monkeypatch.setenv("PYTEST_DISABLE_PLUGIN_AUTOLOAD", "1")
     monkeypatch.delenv(COMPAT_SERVER_VERSION_ENV, raising=False)
@@ -38,7 +33,7 @@ from unittest.mock import patch
 import httpx
 import pytest
 
-from tests.e2e_ui.conftest import _enforce_min_server_version, server_version
+from tests.helpers.ui_server_compat import _enforce_min_server_version, server_version
 
 
 @pytest.fixture(scope="session")
