@@ -17,6 +17,8 @@ function makeHandleTarget() {
     setPointerCapture: vi.fn((id: number) => captured.add(id)),
     releasePointerCapture: vi.fn((id: number) => captured.delete(id)),
     hasPointerCapture: (id: number) => captured.has(id),
+    setAttribute: vi.fn(),
+    removeAttribute: vi.fn(),
   };
 }
 

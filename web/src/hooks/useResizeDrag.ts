@@ -76,6 +76,7 @@ export function useResizeDrag<T extends Element = Element>({
     cleanup.current = null;
     overlayElement.current?.remove();
     overlayElement.current = null;
+    handle?.removeAttribute("data-dragging");
 
     try {
       handle?.releasePointerCapture(pointerId);
@@ -105,6 +106,9 @@ export function useResizeDrag<T extends Element = Element>({
       event.preventDefault();
       activePointerId.current = event.pointerId;
       activeHandle.current = event.currentTarget;
+      // Touch has no hover and drops :active once a press becomes a drag, so
+      // gutters highlight on this instead; set on the DOM to avoid re-renders.
+      event.currentTarget.setAttribute("data-dragging", "");
       onStartRef.current?.(event);
 
       const onDocumentPointerUp = (documentEvent: PointerEvent) => {

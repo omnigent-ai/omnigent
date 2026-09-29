@@ -184,7 +184,7 @@ export function CommentsPanel({
       {isDesktop && (
         <div
           {...handleProps}
-          className="relative z-10 w-1 shrink-0 cursor-col-resize hover:bg-primary/30 active:bg-primary/50 transition-colors"
+          className="relative z-10 w-1 shrink-0 cursor-col-resize hover:bg-primary/30 active:bg-primary/50 data-dragging:bg-primary/50 transition-colors"
         />
       )}
       <div
