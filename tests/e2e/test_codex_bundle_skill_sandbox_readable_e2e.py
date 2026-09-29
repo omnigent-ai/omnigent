@@ -50,10 +50,13 @@ from pathlib import Path
 
 import pytest
 
+from omnigent.entities import DEFAULT_ENVIRONMENT_ID
 from omnigent.inner.bwrap_sandbox import BwrapSandboxBackend
 from omnigent.inner.codex_executor import _CodexAppServerSession
-from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
-from omnigent.inner.os_env import create_os_environment
+from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec, WritePathSpec
+from omnigent.inner.os_env import CallerProcessOSEnvironment
+from omnigent.runner.resource_registry import SessionResourceRegistry
+from omnigent.spec.types import AgentSpec
 from tests.e2e._harness_probes import cli_unavailable_reason
 
 pytestmark = [
@@ -71,6 +74,9 @@ pytestmark = [
 # the bundle's own tools genuinely read the staged SKILL.md.
 _SKILL_NAME = "implementation-planning"
 _SKILL_MARKER = "bundle-skill methodology marker 4f8a1c"
+
+# A checkout-wide grant masks its .venv; grant only the Python runtime and source.
+_RUNTIME_READ_PATHS = [str(Path(__file__).resolve().parents[2] / "omnigent"), sys.prefix]
 
 
 @cache
@@ -138,7 +144,13 @@ def _build_workspace_and_bundle(root: Path) -> tuple[Path, Path]:
     return workspace, bundle
 
 
-async def _stage_codex_session(workspace: Path, bundle: Path) -> _CodexAppServerSession:
+async def _stage_codex_session(
+    workspace: Path,
+    bundle: Path,
+    *,
+    skills_dir: Path | None = None,
+    skills_filter: str = "all",
+) -> _CodexAppServerSession:
     """Start a real codex app-server session so the product stages skills.
 
     This is the same start path a runner session takes: the executor
@@ -160,14 +172,33 @@ async def _stage_codex_session(workspace: Path, bundle: Path) -> _CodexAppServer
         },
         tool_executor=None,
         bundle_dir=bundle,
-        skills_filter="all",
+        skills_filter=skills_filter,
+        skills_dir=skills_dir,
     )
     await session.start()
     return session
 
 
+async def _manifest_path(session: _CodexAppServerSession, workspace: Path) -> Path:
+    response = await session._request(
+        "skills/list", {"cwds": [str(workspace)], "forceReload": True}
+    )
+    skills = [
+        skill
+        for item in response["result"]["data"]
+        for skill in item["skills"]
+        if skill["name"] == _SKILL_NAME
+    ]
+    assert len(skills) == 1, response
+    return Path(skills[0]["path"])
+
+
 def _wrapped_argv(
-    workspace: Path, argv: list[str], *, extra_allow_hidden: list[str] | None = None
+    workspace: Path,
+    argv: list[str],
+    *,
+    skills_dir: Path,
+    extra_allow_hidden: list[str] | None = None,
 ) -> list[str]:
     """Build the exact bwrap argv the runner would execute for a helper.
 
@@ -187,6 +218,7 @@ def _wrapped_argv(
             type="linux_bwrap",
             cwd_allow_hidden=[".git", *(extra_allow_hidden or [])],
             write_paths=["."],
+            read_paths=[str(skills_dir)],
         ),
     )
     policy = backend.resolve(spec, workspace)
@@ -345,7 +377,7 @@ async def test_manifest_skill_path_readable_in_sandbox_mount_plan(tmp_path: Path
     try:
         codex_home = session._codex_home_dir
         assert codex_home is not None
-        manifest = codex_home / "skills" / _SKILL_NAME / "SKILL.md"
+        manifest = await _manifest_path(session, workspace)
         # Discovery half of the report: the staged skill exists host-side,
         # which is why Codex lists it in the model's manifest.
         assert manifest.exists(), "codex staging no longer exposes the bundle skill at all"
@@ -357,7 +389,11 @@ async def test_manifest_skill_path_readable_in_sandbox_mount_plan(tmp_path: Path
         if not auth.exists():
             auth.write_text('{"OPENAI_API_KEY": "sk-e2e-do-not-expose"}')
 
-        ops = _mount_ops(_wrapped_argv(workspace, ["/bin/cat", str(manifest)]))
+        ops = _mount_ops(
+            _wrapped_argv(
+                workspace, ["/bin/cat", str(manifest)], skills_dir=manifest.parent.parent
+            )
+        )
 
         readable, detail = _sandbox_readable(manifest, ops)
         assert readable, (
@@ -398,10 +434,12 @@ async def test_manifest_skill_readable_through_real_bwrap_namespace(tmp_path: Pa
     try:
         codex_home = session._codex_home_dir
         assert codex_home is not None
-        manifest = codex_home / "skills" / _SKILL_NAME / "SKILL.md"
+        manifest = await _manifest_path(session, workspace)
         assert manifest.exists(), "codex staging no longer exposes the bundle skill at all"
 
-        wrapped = _wrapped_argv(workspace, ["/bin/cat", str(manifest)])
+        wrapped = _wrapped_argv(
+            workspace, ["/bin/cat", str(manifest)], skills_dir=manifest.parent.parent
+        )
         proc = subprocess.run(wrapped, capture_output=True, text=True, timeout=120, check=False)
         assert proc.returncode == 0, (
             "reading the manifest SKILL.md from inside the bundle's own "
@@ -419,39 +457,53 @@ async def test_manifest_skill_readable_through_real_bwrap_namespace(tmp_path: Pa
     _bwrap_namespace_unavailable() is not None,
     reason=f"cannot execute bwrap namespaces here: {_bwrap_namespace_unavailable()}",
 )
+@pytest.mark.parametrize("copy_on_write", [False, True])
 async def test_manifest_skill_readable_through_cached_os_environment(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, copy_on_write: bool
 ) -> None:
-    """Repeated real file and shell tools expose skills read-only, never credentials."""
+    """A cached environment keeps its own read-only skills across Codex restarts."""
     host_home = tmp_path / "host-home"
     host_home.mkdir()
     monkeypatch.setenv("HOME", str(host_home))
     monkeypatch.setenv("CODEX_HOME", str(host_home / ".codex"))
     workspace, bundle = _build_workspace_and_bundle(tmp_path)
-    session = await _stage_codex_session(workspace, bundle)
-    os_env = None
+    if copy_on_write and "--tmp-overlay" not in subprocess.check_output(
+        ["bwrap", "--help"], text=True
+    ):
+        pytest.skip("Bubblewrap 0.11+ required for copy-on-write")
+    spec = OSEnvSpec(
+        type="caller_process",
+        cwd=str(workspace),
+        sandbox=OSEnvSandboxSpec(
+            type="linux_bwrap",
+            cwd_allow_hidden=[".git"],
+            write_paths=[WritePathSpec(".", copy_on_write)],
+            read_paths=_RUNTIME_READ_PATHS,
+        ),
+    )
+    agent = AgentSpec(spec_version=1, name="skills", os_env=spec)
+    registry = SessionResourceRegistry(runner_workspace=workspace)
+    os_env = registry.resolve_environment("owner", DEFAULT_ENVIRONMENT_ID, agent)
+    assert isinstance(os_env, CallerProcessOSEnvironment)
+    skills_dir = registry.codex_skills_dir("owner")
+    skills_inode = skills_dir.stat().st_ino
+    session = None
     try:
+        assert "error" not in await os_env.read("README.md")
+        initial_namespace = os_env.sandbox.copy_on_write_namespace
+        initial_keeper = (
+            os_env.copy_on_write_environment._process
+            if os_env.copy_on_write_environment is not None
+            else None
+        )
+        session = await _stage_codex_session(workspace, bundle, skills_dir=skills_dir)
         codex_home = session._codex_home_dir
         assert codex_home is not None
-        manifest = codex_home / "skills" / _SKILL_NAME / "SKILL.md"
+        manifest = await _manifest_path(session, workspace)
+        assert manifest.is_relative_to(skills_dir)
         body = manifest.read_text()
         auth = codex_home / "auth.json"
         auth.write_text('{"OPENAI_API_KEY": "test-only-credential"}')
-        os_env = create_os_environment(
-            OSEnvSpec(
-                type="caller_process",
-                cwd=str(workspace),
-                sandbox=OSEnvSandboxSpec(
-                    type="linux_bwrap",
-                    cwd_allow_hidden=[".git"],
-                    write_paths=["."],
-                    # Editable test installs need their package source visible;
-                    # this grants neither the bundle nor the staged home.
-                    read_paths=[str(Path(__file__).resolve().parents[2])],
-                ),
-            )
-        )
-        assert os_env is not None
 
         read_result = await os_env.read(str(manifest))
         assert "error" not in read_result, read_result
@@ -474,6 +526,28 @@ async def test_manifest_skill_readable_through_cached_os_environment(
         assert shell_write.get("exit_code") not in (None, 0), shell_write
         assert manifest.read_text() == body
 
+        await session.close()
+        session = await _stage_codex_session(
+            workspace, bundle, skills_dir=skills_dir, skills_filter="none"
+        )
+        assert skills_dir.stat().st_ino == skills_inode
+        assert not (skills_dir / _SKILL_NAME).exists()
+        assert "error" in await os_env.read(str(manifest))
+        await session.close()
+
+        (bundle / "skills" / _SKILL_NAME / "SKILL.md").write_text(body + "\nreloaded skill\n")
+        session = await _stage_codex_session(workspace, bundle, skills_dir=skills_dir)
+        assert await _manifest_path(session, workspace) == manifest
+        assert "reloaded skill" in str((await os_env.read(str(manifest))).get("content", ""))
+        assert registry.resolve_environment("owner", DEFAULT_ENVIRONMENT_ID, agent) is os_env
+        assert skills_dir.stat().st_ino == skills_inode
+        if copy_on_write:
+            assert initial_namespace is not None
+            assert os_env.sandbox.copy_on_write_namespace == initial_namespace
+            assert initial_keeper is not None and initial_keeper.poll() is None
+            assert os_env.copy_on_write_environment is not None
+            assert os_env.copy_on_write_environment._process is initial_keeper
+
         status = subprocess.run(
             ["git", "status", "--porcelain"],
             cwd=workspace,
@@ -483,9 +557,82 @@ async def test_manifest_skill_readable_through_cached_os_environment(
         )
         assert status.stdout.strip() == "", status.stdout
     finally:
-        if os_env is not None:
-            os_env.close()
-        await session.close()
+        if session is not None:
+            await session.close()
+        await registry.cleanup_session("owner")
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(
+    _bwrap_namespace_unavailable() is not None,
+    reason=f"cannot execute bwrap namespaces here: {_bwrap_namespace_unavailable()}",
+)
+@pytest.mark.parametrize("second_filter", ["all", "none"])
+async def test_sessions_only_read_their_own_staged_skills(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, second_filter: str
+) -> None:
+    """Even sessions sharing a workspace receive distinct skill read grants."""
+    host_home = tmp_path / "host-home"
+    host_home.mkdir()
+    monkeypatch.setenv("HOME", str(host_home))
+    monkeypatch.setenv("CODEX_HOME", str(host_home / ".codex"))
+    workspace, first_bundle = _build_workspace_and_bundle(tmp_path)
+    second_bundle = tmp_path / "second-bundle"
+    shutil.copytree(first_bundle, second_bundle)
+    for bundle, marker in ((first_bundle, "first-session-only"), (second_bundle, "second-only")):
+        skill = bundle / "skills" / _SKILL_NAME / "SKILL.md"
+        skill.write_text(skill.read_text() + f"\n{marker}\n")
+    spec = OSEnvSpec(
+        cwd=str(workspace),
+        sandbox=OSEnvSandboxSpec(
+            type="linux_bwrap",
+            cwd_allow_hidden=[".git"],
+            write_paths=["."],
+            read_paths=_RUNTIME_READ_PATHS,
+        ),
+    )
+    agent = AgentSpec(spec_version=1, name="skills", os_env=spec)
+    registry = SessionResourceRegistry(runner_workspace=workspace)
+    first_env = registry.resolve_environment("first", DEFAULT_ENVIRONMENT_ID, agent)
+    second_env = registry.resolve_environment("second", DEFAULT_ENVIRONMENT_ID, agent)
+    first = second = None
+    try:
+        first = await _stage_codex_session(
+            workspace, first_bundle, skills_dir=registry.codex_skills_dir("first")
+        )
+        second = await _stage_codex_session(
+            workspace,
+            second_bundle,
+            skills_dir=registry.codex_skills_dir("second"),
+            skills_filter=second_filter,
+        )
+        first_manifest = await _manifest_path(first, workspace)
+        own_read = await first_env.read(str(first_manifest))
+        assert "first-session-only" in str(own_read.get("content", "")), own_read
+        assert "error" in await second_env.read(str(first_manifest))
+        other_shell = await second_env.shell(shlex.join(["cat", str(first_manifest)]), timeout=30)
+        assert other_shell.get("exit_code") not in (None, 0), other_shell
+        assert "first-session-only" not in str(other_shell.get("stdout", ""))
+
+        if second_filter == "all":
+            second_manifest = await _manifest_path(second, workspace)
+            own_read = await second_env.read(str(second_manifest))
+            assert "second-only" in str(own_read.get("content", "")), own_read
+            assert "error" in await first_env.read(str(second_manifest))
+            other_shell = await first_env.shell(
+                shlex.join(["cat", str(second_manifest)]), timeout=30
+            )
+            assert other_shell.get("exit_code") not in (None, 0), other_shell
+            assert "second-only" not in str(other_shell.get("stdout", ""))
+        else:
+            assert not (registry.codex_skills_dir("second") / _SKILL_NAME).exists()
+    finally:
+        if first is not None:
+            await first.close()
+        if second is not None:
+            await second.close()
+        await registry.cleanup_session("first")
+        await registry.cleanup_session("second")
 
 
 @pytest.mark.asyncio

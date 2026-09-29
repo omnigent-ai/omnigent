@@ -1403,7 +1403,9 @@ class TestCodexExecutor(unittest.TestCase):
                     codex_home = Path(recorded_env["CODEX_HOME"])
                     self.assertTrue(codex_home.is_dir())
                     self.assertTrue(codex_home.name.startswith("omnigent-codex-home-"))
-                    self.assertTrue(str(codex_home).startswith(tempfile.gettempdir()))
+                    self.assertTrue(
+                        codex_home.is_relative_to(Path(tempfile.gettempdir()).resolve())
+                    )
                     # Must not point at the user's real ~/.codex directory.
                     self.assertNotEqual(codex_home, Path.home() / ".codex")
                     await session.close()
@@ -4773,9 +4775,9 @@ class TestCodexAppServerSessionHomeStaging(unittest.TestCase):
         mkdtemp_dirs: list[str] = []
         original_mkdtemp = _tempfile.mkdtemp
 
-        def _capture(**kwargs):
+        def _capture(*args, **kwargs):
             mkdtemp_dirs.append(kwargs.get("dir", ""))
-            return original_mkdtemp(**kwargs)
+            return original_mkdtemp(*args, **kwargs)
 
         async def _t():
             session = _CodexAppServerSession(
@@ -4842,7 +4844,8 @@ class TestCodexAppServerSessionHomeStaging(unittest.TestCase):
         async def _stop_before_spawn(*args: Any, **kwargs: Any) -> None:
             skills = Path(kwargs["env"]["CODEX_HOME"]) / "skills"
             self.assertTrue(skills.is_dir())
-            self.assertFalse(skills.is_symlink())
+            self.assertTrue(skills.is_symlink())
+            self.assertTrue(skills.resolve().name.startswith("omnigent-codex-skills-"))
             self.assertEqual(list(skills.iterdir()), [])
             raise RuntimeError("stop before worker spawn")
 

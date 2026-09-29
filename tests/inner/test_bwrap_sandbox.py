@@ -2288,7 +2288,9 @@ def test_wrap_launcher_argv_exposes_staged_codex_skills_read_only(
     cwd.mkdir()
 
     backend = _make_backend()
-    argv = backend.wrap_launcher_argv([sys.executable, "-c", "pass"], _make_policy(cwd), cwd)
+    argv = backend.wrap_launcher_argv(
+        [sys.executable, "-c", "pass"], _make_policy(cwd, read_roots=[skills]), cwd
+    )
 
     ro_pairs = _bind_triples(argv, "--ro-bind-try")
     assert (str(skills), str(skills)) in ro_pairs, (
@@ -2325,6 +2327,28 @@ def test_wrap_launcher_argv_staged_codex_skills_dedupe_with_read_roots(
 
     pair = (str(skills), str(skills))
     assert _bind_triples(argv, "--ro-bind-try").count(pair) == 1
+
+
+def test_wrap_launcher_argv_does_not_discover_other_sessions_skills(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A staged home is not a read grant for an unrelated sandbox."""
+    import tempfile as _tempfile
+
+    tmproot = tmp_path / "tmproot"
+    tmproot.mkdir()
+    monkeypatch.setattr(_tempfile, "gettempdir", lambda: str(tmproot))
+    home, skills = _stage_codex_skills_root(tmproot)
+    cwd = tmp_path / "ws"
+    cwd.mkdir()
+
+    argv = _make_backend().wrap_launcher_argv(
+        [sys.executable, "-c", "pass"], _make_policy(cwd), cwd
+    )
+
+    for op in ("--ro-bind-try", "--ro-bind", "--bind", "--bind-try"):
+        assert (str(skills), str(skills)) not in _bind_triples(argv, op)
+        assert (str(home), str(home)) not in _bind_triples(argv, op)
 
 
 @pytest.mark.skipif(not Path("/bin/sh").exists(), reason="needs a depth-2 POSIX binary")

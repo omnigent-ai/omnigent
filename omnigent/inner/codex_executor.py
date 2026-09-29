@@ -60,7 +60,12 @@ from ._subprocess_lifecycle import close_subprocess_transport, terminate_subproc
 from .async_utils import run_sync_on_thread
 from .codex_goal_command import goal_objective_from_content as _goal_objective_from_content
 from .codex_goal_command import goal_objective_length_error as _goal_objective_length_error
-from .codex_staging import CODEX_HOME_PREFIX, codex_home_staging_root
+from .codex_staging import (
+    CODEX_HOME_PREFIX,
+    CODEX_SKILLS_PREFIX,
+    codex_home_staging_root,
+    prepare_codex_skills_dir,
+)
 from .codex_worker import (
     CodexWorkerLaunch,
     prepare_codex_catalog_probe,
@@ -2659,6 +2664,7 @@ class _CodexAppServerSession:
         disable_native_tools: bool = False,
         bundle_dir: Path | None = None,
         skills_filter: str | list[str] = "all",
+        skills_dir: Path | None = None,
         os_env: OSEnvSpec | None = None,
         signer_factory: Callable[[], ModelSignerSession] | None = None,
         provider_auth_authority: tuple[str, str] | None = None,
@@ -2673,6 +2679,8 @@ class _CodexAppServerSession:
         self._disable_native_tools = disable_native_tools
         self._bundle_dir = bundle_dir
         self._skills_filter = skills_filter
+        self._skills_dir = skills_dir
+        self._owned_skills_dir: tempfile.TemporaryDirectory[str] | None = None
         self._os_env_spec = os_env
         self._signer_factory = signer_factory
         self._provider_auth_authority = provider_auth_authority
@@ -2802,19 +2810,13 @@ class _CodexAppServerSession:
         home_stat = self._codex_home_dir.lstat()
         if not stat.S_ISDIR(home_stat.st_mode) or stat.S_IMODE(home_stat.st_mode) != 0o700:
             raise OSError("unsafe signer CODEX_HOME")
-        # Populate the per-conversation CODEX_HOME's ``skills/`` subdir
-        # based on the spec's ``skills:`` field. Codex auto-discovers
-        # skills under ``$CODEX_HOME/skills/<name>/SKILL.md``; without
-        # this step the temp CODEX_HOME has no skills directory at all,
-        # so even ``skills: all`` would expose nothing. The shared helper
-        # is the same one the codex-native launch path uses, so both
-        # expose an identical skill surface.
-        # ``copy_skills``: the sandbox re-exposes only the staged ``skills/``
-        # subtree, so its entries must be self-contained — a symlink into the
-        # bundle dir would dangle inside the mount namespace.
-        # Pin a read-only mount even when skills are disabled, so a sandboxed
-        # worker cannot replace the skills root with a host-directory symlink.
-        (self._codex_home_dir / "skills").mkdir()
+        # The runner grants only this session's skills directory to its tools.
+        # Keep its inode stable so cached sandbox mounts survive worker restarts.
+        if self._skills_dir is None:
+            self._owned_skills_dir = tempfile.TemporaryDirectory(prefix=CODEX_SKILLS_PREFIX)
+            self._skills_dir = Path(self._owned_skills_dir.name)
+        self._skills_dir = prepare_codex_skills_dir(self._skills_dir)
+        (self._codex_home_dir / "skills").symlink_to(self._skills_dir, target_is_directory=True)
         populate_codex_skills_from_bundle(
             self._codex_home_dir,
             self._bundle_dir,
@@ -2906,6 +2908,7 @@ class _CodexAppServerSession:
                     codex_path=self._codex_path,
                     cwd=process_cwd,
                     codex_home=self._codex_home_dir,
+                    skills_dir=self._skills_dir,
                     os_env=self._os_env_spec,
                     spawn_env_names=list(proc_env),
                     signer_readiness=self._signer_readiness,
@@ -3338,6 +3341,10 @@ class _CodexAppServerSession:
                 pass
             self._codex_home_dir = None
             self._codex_home_identity = None
+        if self._owned_skills_dir is not None:
+            self._owned_skills_dir.cleanup()
+            self._owned_skills_dir = None
+            self._skills_dir = None
 
     def _close_worker_liveness(self) -> None:
         fd = self._worker_liveness_fd
@@ -4287,6 +4294,7 @@ class _AppSessionFactory(Protocol):
         disable_native_tools: bool,
         bundle_dir: Path | None,
         skills_filter: str | list[str],
+        skills_dir: Path | None,
         os_env: OSEnvSpec | None,
     ) -> _CodexAppServerSession: ...
 
@@ -4302,6 +4310,7 @@ def _default_app_session_factory(
     disable_native_tools: bool,
     bundle_dir: Path | None,
     skills_filter: str | list[str],
+    skills_dir: Path | None = None,
     os_env: OSEnvSpec | None,
     signer_launch_config: SignerLaunchConfig | None = None,
 ) -> _CodexAppServerSession:
@@ -4315,6 +4324,7 @@ def _default_app_session_factory(
         disable_native_tools=disable_native_tools,
         bundle_dir=bundle_dir,
         skills_filter=skills_filter,
+        skills_dir=skills_dir,
         os_env=os_env,
         signer_factory=(
             (lambda: SubprocessModelSigner(signer_launch_config))
@@ -4354,6 +4364,7 @@ class CodexExecutor(Executor):
         bundle_dir: Path | None = None,
         agent_name: str | None = None,
         skills_filter: str | list[str] = "all",
+        skills_dir: Path | None = None,
         signer_launch_config: SignerLaunchConfig | None = None,
     ) -> None:
         """Create a CodexExecutor.
@@ -4430,6 +4441,7 @@ class CodexExecutor(Executor):
         :param signer_launch_config: Trusted, non-secret signer authority.
             When set, the default session factory creates a fresh signer for
             each session and Codex is pinned to its endpoint and placeholder.
+        :param skills_dir: Runtime-owned skills directory granted only to this session.
         """
         self._cwd = cwd
         self._os_env_spec = os_env
@@ -4448,6 +4460,7 @@ class CodexExecutor(Executor):
         self._bundle_dir = bundle_dir
         self._agent_name = agent_name
         self._skills_filter = skills_filter
+        self._skills_dir = skills_dir
         self._signer_backed = signer_launch_config is not None
         self._brokered_version_identity: tuple[int, int, int, int] | None = None
         resolved_codex = codex_path or _find_codex_cli()
@@ -4748,6 +4761,7 @@ class CodexExecutor(Executor):
             disable_native_tools=self._disable_native_tools,
             bundle_dir=self._bundle_dir,
             skills_filter=self._skills_filter,
+            skills_dir=self._skills_dir,
             os_env=self._os_env_spec,
         )
         state.app_session = app_session

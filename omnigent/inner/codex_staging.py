@@ -1,26 +1,13 @@
-"""Staging-root helpers for the wrapped codex executor's private CODEX_HOMEs.
+"""Private Codex homes and explicitly granted, session-owned skill directories.
 
-The wrapped codex executor gives every conversation a private ``CODEX_HOME``
-(so the user's real ``~/.codex/`` is never touched), and codex publishes each
-skill's ``SKILL.md`` path — a path inside that home — in the model's skill
-manifest. Two constraints follow:
-
-- the staged home must live **outside the session workspace**, so it never
-  shows up as an untracked directory in the user's checkout; and
-- the published ``skills/`` subtree must stay **readable from the session's
-  sandboxed tools**, while the rest of the home (``auth.json``,
-  ``config.toml``, session logs) stays hidden.
-
-Both hang off one well-known location: homes are staged under
-:func:`codex_home_staging_root` in the system temp dir, and sandbox backends
-re-expose exactly the ``skills/`` subtree of each staged home via
-:func:`staged_codex_skill_dirs`.
+Homes stay outside the workspace. Skills live in a separate directory granted
+only to their owning session; no sandbox discovers grants by scanning temp homes.
 """
 
 from __future__ import annotations
 
-import contextlib
 import os
+import shutil
 import stat
 import tempfile
 from pathlib import Path
@@ -29,13 +16,11 @@ from pathlib import Path
 # what identifies an Omnigent-private codex home to nested launches (see
 # ``_is_omnigent_private_codex_home`` in ``codex_executor``).
 CODEX_HOME_PREFIX = "omnigent-codex-home-"
+CODEX_SKILLS_PREFIX = "omnigent-codex-skills-"
 
 
 def _staging_root_path() -> Path:
-    # Per-uid name: the system temp dir is shared, so a fixed name could be
-    # squatted by another user. Together with the ownership check in
-    # :func:`staged_codex_skill_dirs` this keeps other users' trees out of
-    # the sandbox mount set. Windows temp dirs are already per-user.
+    # The shared temp root must not route private homes through another user.
     suffix = f"-{os.getuid()}" if hasattr(os, "getuid") else ""
     return Path(tempfile.gettempdir()).resolve() / f"omnigent-codex-homes{suffix}"
 
@@ -48,8 +33,8 @@ def codex_home_staging_root() -> Path:
     :raises OSError: When the root cannot be created (e.g. an unwritable
         system temp dir), or exists but is not a real directory owned by the
         current user without group/other write access. Callers fall back to a
-        plain unpredictable temp-dir home, which keeps the session bootable at
-        the cost of sandbox skill exposure.
+        plain unpredictable temp-dir home. Skills use a separate directory,
+        so this fallback does not change their sandbox visibility.
     """
     root = _staging_root_path()
     root.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -75,41 +60,23 @@ def codex_home_staging_root() -> Path:
     return root
 
 
-def staged_codex_skill_dirs() -> list[Path]:
-    """The ``skills/`` dirs of currently-staged codex homes, for sandbox exposure.
+def prepare_codex_skills_dir(path: Path) -> Path:
+    """Validate and empty an owned skill directory without replacing its inode.
 
-    Sandbox backends bind these read-only so the ``$CODEX_HOME/skills/...``
-    paths codex publishes in its skill manifest resolve inside the tool
-    namespace. Only the ``skills/`` subtree is ever returned — siblings such
-    as ``auth.json`` and ``config.toml`` stay unmounted. The root is ignored
-    entirely unless it is a directory owned by the current user without
-    group/other write access, so a squatted or loosened root cannot inject
-    content into sandboxes (fail closed).
-
-    :returns: Sorted list of existing ``<staging-root>/<home>/skills`` dirs;
-        empty when the root is absent or fails the safety check.
+    Existing sandbox mounts keep this directory across harness restarts. Clear
+    old contents so a narrower skill filter cannot retain previously loaded skills.
     """
-    root = _staging_root_path()
-    try:
-        root_stat = root.lstat()
-    except OSError:
-        return []
-    if not stat.S_ISDIR(root_stat.st_mode):
-        return []
-    if hasattr(os, "getuid") and root_stat.st_uid != os.getuid():
-        return []
-    if root_stat.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
-        return []
-    skill_dirs: list[Path] = []
-    try:
-        homes = sorted(root.iterdir())
-    except OSError:
-        return []
-    for home in homes:
-        if not home.name.startswith(CODEX_HOME_PREFIX):
-            continue
-        skills = home / "skills"
-        with contextlib.suppress(OSError):
-            if stat.S_ISDIR(home.lstat().st_mode) and stat.S_ISDIR(skills.lstat().st_mode):
-                skill_dirs.append(skills)
-    return skill_dirs
+    root = path.parent.resolve() / path.name
+    root_stat = root.lstat()
+    if not root.name.startswith(CODEX_SKILLS_PREFIX) or not stat.S_ISDIR(root_stat.st_mode):
+        raise OSError("Codex skills must use a dedicated session staging directory")
+    if hasattr(os, "getuid") and (
+        root_stat.st_uid != os.getuid() or stat.S_IMODE(root_stat.st_mode) != 0o700
+    ):
+        raise OSError("Codex skills staging directory must be private to the current user")
+    for child in root.iterdir():
+        if child.is_symlink() or not child.is_dir():
+            child.unlink()
+        else:
+            shutil.rmtree(child)
+    return root

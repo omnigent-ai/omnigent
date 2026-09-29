@@ -16,6 +16,7 @@ import contextlib
 import logging
 import os
 import re
+import tempfile
 import threading
 import time
 from collections.abc import Callable
@@ -381,6 +382,7 @@ class SessionResourceRegistry:
         self._per_session_workspace = per_session_workspace
         self._primary_envs: dict[str, OSEnvironment] = {}
         self._primary_env_specs: dict[str, OSEnvSpec | None] = {}
+        self._codex_skills_dirs: dict[str, tempfile.TemporaryDirectory[str]] = {}
         self._terminal_roles: dict[tuple[str, str], str] = {}
         self._terminal_lifecycles: dict[tuple[str, str], TerminalLifecycle] = {}
         self._is_alive_cache: TTLCache[str, bool] = TTLCache(
@@ -759,6 +761,23 @@ class SessionResourceRegistry:
             return terminal_resource_view(session_id, entry)
         return None
 
+    def codex_skills_dir(self, session_id: str) -> Path:
+        """Return the stable, private skills-only directory owned by this session."""
+        with self._lock:
+            return self._codex_skills_dir_locked(session_id)
+
+    def _codex_skills_dir_locked(self, session_id: str) -> Path:
+        """Allocate the session's skills directory while holding ``_lock``."""
+        from omnigent.inner.codex_staging import CODEX_SKILLS_PREFIX
+
+        directory = self._codex_skills_dirs.get(session_id)
+        if directory is None:
+            directory = tempfile.TemporaryDirectory(
+                prefix=CODEX_SKILLS_PREFIX, dir=Path(tempfile.gettempdir()).resolve()
+            )
+            self._codex_skills_dirs[session_id] = directory
+        return Path(directory.name)
+
     def resolve_environment(
         self,
         session_id: str,
@@ -933,7 +952,10 @@ class SessionResourceRegistry:
                     "Agent spec has no os_env; cannot create a primary filesystem environment."
                 )
             effective_spec = self._effective_primary_spec(session_id, spec_os_env)
-            env = create_os_environment(effective_spec)
+            env = create_os_environment(
+                effective_spec,
+                additional_read_roots=[self._codex_skills_dir_locked(session_id)],
+            )
             if env is not None:
                 return env
 
@@ -942,7 +964,10 @@ class SessionResourceRegistry:
             cwd=default_cwd,
             sandbox=OSEnvSandboxSpec(type="none"),
         )
-        env = create_os_environment(default_spec)
+        env = create_os_environment(
+            default_spec,
+            additional_read_roots=[self._codex_skills_dir_locked(session_id)],
+        )
         if env is None:
             raise RuntimeError(
                 f"Failed to create default OS environment for session {session_id!r}"
@@ -1860,6 +1885,7 @@ class SessionResourceRegistry:
             self._session_activity_epoch.pop(session_id, None)
             primary = self._primary_envs.pop(session_id, None)
             self._primary_env_specs.pop(session_id, None)
+            skills_directory = self._codex_skills_dirs.pop(session_id, None)
             stale_role_keys = [key for key in self._terminal_roles if key[0] == session_id]
             for key in stale_role_keys:
                 self._terminal_roles.pop(key, None)
@@ -1885,6 +1911,14 @@ class SessionResourceRegistry:
             except Exception:
                 _logger.exception(
                     "Error closing primary env for session=%s",
+                    session_id,
+                )
+        if skills_directory is not None:
+            try:
+                await asyncio.to_thread(skills_directory.cleanup)
+            except OSError:
+                _logger.exception(
+                    "Error cleaning up Codex skills for session=%s",
                     session_id,
                 )
 

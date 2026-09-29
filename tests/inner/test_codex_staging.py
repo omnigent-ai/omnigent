@@ -1,11 +1,4 @@
-"""Tests for the codex home staging root and its sandbox-exposure globber.
-
-The wrapped codex executor stages per-conversation CODEX_HOMEs under a
-well-known temp-dir root so sandbox backends can re-expose exactly the
-``skills/`` subtree of each home (and nothing else — ``auth.json`` &
-co stay hidden). These tests pin the root's location/permissions and
-the globber's selection + fail-closed safety semantics.
-"""
+"""Private home and session-owned skill staging safety."""
 
 from __future__ import annotations
 
@@ -17,43 +10,20 @@ from pathlib import Path
 import pytest
 
 from omnigent.inner.codex_staging import (
-    CODEX_HOME_PREFIX,
+    CODEX_SKILLS_PREFIX,
     _staging_root_path,
     codex_home_staging_root,
-    staged_codex_skill_dirs,
+    prepare_codex_skills_dir,
 )
 
 
 @pytest.fixture
 def isolated_tempdir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    """Point ``tempfile.gettempdir()`` at a per-test dir.
-
-    The staging helpers derive every path from ``tempfile.gettempdir()``
-    at call time, so this isolates them from the host's real temp dir
-    (which may carry live staged homes from concurrent sessions).
-    """
     monkeypatch.setattr(tempfile, "gettempdir", lambda: str(tmp_path))
     return tmp_path
 
 
-def _stage_home(root: Path, name_suffix: str, *, with_skills: bool = True) -> Path:
-    home = root / f"{CODEX_HOME_PREFIX}{name_suffix}"
-    home.mkdir()
-    (home / "auth.json").write_text('{"secret": "never-expose"}')
-    if with_skills:
-        skill = home / "skills" / "demo-skill"
-        skill.mkdir(parents=True)
-        (skill / "SKILL.md").write_text("body\n")
-    return home
-
-
 def test_staging_root_is_private_and_under_tempdir(isolated_tempdir: Path) -> None:
-    """The root is created inside the system temp dir, private to the user.
-
-    ``0o700``: the temp dir is shared, and a group/other-writable root
-    would let another principal plant content that the globber then
-    mounts into sandboxes.
-    """
     root = codex_home_staging_root()
     assert root.parent == isolated_tempdir
     assert root.is_dir()
@@ -63,10 +33,6 @@ def test_staging_root_is_private_and_under_tempdir(isolated_tempdir: Path) -> No
 
 
 def test_staging_root_tightens_a_loose_preexisting_mode(isolated_tempdir: Path) -> None:
-    """A pre-existing root with a permissive mode is chmodded back to 0700,
-    so the globber's fail-closed check doesn't silently disable skill
-    exposure forever after one bad umask.
-    """
     root = codex_home_staging_root()
     root.chmod(0o770)
     assert stat.S_IMODE(codex_home_staging_root().stat().st_mode) == 0o700
@@ -76,91 +42,19 @@ def test_staging_root_tightens_a_loose_preexisting_mode(isolated_tempdir: Path) 
 def test_staging_root_resolves_symlinked_temp_ancestors(
     isolated_tempdir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Published skill paths must match the sandbox's canonical read roots."""
     real_temp = isolated_tempdir / "real-temp"
     real_temp.mkdir()
     temp_alias = isolated_tempdir / "temp-alias"
     temp_alias.symlink_to(real_temp, target_is_directory=True)
     monkeypatch.setattr(tempfile, "gettempdir", lambda: str(temp_alias))
-
-    root = codex_home_staging_root()
-    home = _stage_home(root, "test")
-
-    assert root.parent == real_temp.resolve()
-    assert staged_codex_skill_dirs() == [(home / "skills").resolve()]
-
-
-def test_globber_returns_only_skills_subtrees_of_staged_homes(
-    isolated_tempdir: Path,
-) -> None:
-    """Only ``<home>/skills`` dirs come back — never the home itself (whose
-    siblings hold credentials), never non-prefixed entries, never homes
-    without a skills dir.
-    """
-    root = codex_home_staging_root()
-    with_skills = _stage_home(root, "aaa")
-    _stage_home(root, "bbb", with_skills=False)
-    stranger = root / "unrelated-dir"
-    stranger.mkdir()
-    (stranger / "skills").mkdir()
-
-    dirs = staged_codex_skill_dirs()
-
-    assert dirs == [with_skills / "skills"]
-
-
-def test_globber_is_empty_when_root_is_absent(isolated_tempdir: Path) -> None:
-    """No staging root (no codex session ever staged) → no grants."""
-    assert staged_codex_skill_dirs() == []
-
-
-@pytest.mark.skipif(not hasattr(os, "getuid"), reason="POSIX directory symlinks")
-@pytest.mark.parametrize("component", ["root", "home", "skills"])
-def test_globber_rejects_symlinked_staging_directories(
-    isolated_tempdir: Path, component: str
-) -> None:
-    """A staging-directory symlink must not grant its outside target."""
-    root = codex_home_staging_root()
-    home = _stage_home(root, "test")
-    link = {"root": root, "home": home, "skills": home / "skills"}[component]
-    outside = isolated_tempdir / f"outside-{component}"
-    link.rename(outside)
-    link.symlink_to(outside, target_is_directory=True)
-
-    assert staged_codex_skill_dirs() == []
-
-
-@pytest.mark.skipif(not hasattr(os, "getuid"), reason="POSIX permission semantics")
-def test_globber_fails_closed_on_a_group_or_other_writable_root(
-    isolated_tempdir: Path,
-) -> None:
-    """A root someone loosened must contribute nothing to sandbox mounts:
-    group/other write access would let another principal swap mount
-    sources between glob and spawn.
-    """
-    root = codex_home_staging_root()
-    _stage_home(root, "aaa")
-    assert staged_codex_skill_dirs() != []
-
-    root.chmod(0o707)
-    assert staged_codex_skill_dirs() == []
+    assert codex_home_staging_root().parent == real_temp.resolve()
 
 
 @pytest.mark.skipif(not hasattr(os, "getuid"), reason="POSIX ownership semantics")
-def test_staging_root_refuses_a_symlink_squatting_its_name(
-    isolated_tempdir: Path,
-) -> None:
-    """A pre-planted symlink at the root's predictable name must be refused.
-
-    ``mkdir(exist_ok=True)`` accepts a symlink-to-directory silently, so a
-    squatter in the shared temp dir could route every staged home — whose
-    ``config.toml``/``auth.json`` codex reads by pathname — into a tree they
-    control and substitute contents at will.
-    """
-    attacker_tree = isolated_tempdir / "attacker-controlled"
-    attacker_tree.mkdir()
-    _staging_root_path().symlink_to(attacker_tree)
-
+def test_staging_root_refuses_a_symlink_squatting_its_name(isolated_tempdir: Path) -> None:
+    outside = isolated_tempdir / "outside"
+    outside.mkdir()
+    _staging_root_path().symlink_to(outside)
     with pytest.raises(OSError):
         codex_home_staging_root()
 
@@ -169,13 +63,68 @@ def test_staging_root_refuses_a_symlink_squatting_its_name(
 def test_staging_root_refuses_a_root_owned_by_another_user(
     isolated_tempdir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A pre-existing root owned by a different uid must be refused — its
-    owner can rename homes under it and substitute a malicious config that
-    the codex process then loads. The caller's OSError fallback boots the
-    session from a private ``mkdtemp`` home instead.
-    """
     foreign_uid = os.getuid() + 1
     monkeypatch.setattr(os, "getuid", lambda: foreign_uid)
-
     with pytest.raises(OSError):
         codex_home_staging_root()
+
+
+def test_skills_refresh_preserves_mount_root_and_removes_old_contents(tmp_path: Path) -> None:
+    root = tmp_path / f"{CODEX_SKILLS_PREFIX}session"
+    root.mkdir(mode=0o700)
+    skill = root / "old-skill"
+    skill.mkdir()
+    (skill / "SKILL.md").write_text("old content")
+    identity = root.stat().st_ino
+
+    assert prepare_codex_skills_dir(root) == root.resolve()
+    assert root.stat().st_ino == identity
+    assert list(root.iterdir()) == []
+
+
+@pytest.mark.skipif(not hasattr(os, "getuid"), reason="POSIX directory symlinks")
+def test_skills_refresh_does_not_follow_child_symlinks(tmp_path: Path) -> None:
+    root = tmp_path / f"{CODEX_SKILLS_PREFIX}session"
+    root.mkdir(mode=0o700)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    marker = outside / "keep.txt"
+    marker.write_text("keep")
+    (root / "link").symlink_to(outside, target_is_directory=True)
+
+    prepare_codex_skills_dir(root)
+
+    assert marker.read_text() == "keep"
+    assert list(root.iterdir()) == []
+
+
+@pytest.mark.skipif(not hasattr(os, "getuid"), reason="POSIX directory symlinks")
+def test_skills_refresh_rejects_symlink_root(tmp_path: Path) -> None:
+    outside = tmp_path / "outside"
+    outside.mkdir(mode=0o700)
+    marker = outside / "keep.txt"
+    marker.write_text("keep")
+    root = tmp_path / f"{CODEX_SKILLS_PREFIX}session"
+    root.symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(OSError):
+        prepare_codex_skills_dir(root)
+    assert marker.read_text() == "keep"
+
+
+@pytest.mark.skipif(not hasattr(os, "getuid"), reason="POSIX permission semantics")
+@pytest.mark.parametrize("mode", [0o750, 0o770, 0o707])
+def test_skills_refresh_rejects_nonprivate_root(tmp_path: Path, mode: int) -> None:
+    root = tmp_path / f"{CODEX_SKILLS_PREFIX}session"
+    root.mkdir(mode=mode)
+    root.chmod(mode)
+    with pytest.raises(OSError):
+        prepare_codex_skills_dir(root)
+
+
+def test_skills_refresh_rejects_unrelated_directory(tmp_path: Path) -> None:
+    marker = tmp_path / "keep.txt"
+    marker.write_text("keep")
+    with pytest.raises(OSError):
+        prepare_codex_skills_dir(tmp_path)
+    assert marker.read_text() == "keep"

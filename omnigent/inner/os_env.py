@@ -30,7 +30,6 @@ from omnigent.util.json_types import JsonValue
 
 from .agent_env import strip_desktop_session_env
 from .async_utils import run_sync_on_thread
-from .codex_staging import staged_codex_skill_dirs
 from .credential_proxy import (
     CredentialProxyRuntime,
     CredentialRewriteRule,
@@ -484,10 +483,6 @@ class _HelperProcessClient:
         if sandbox.active:
             self._tmpdir = create_private_tmpdir()
             sandbox = with_additional_write_roots(sandbox, [self._tmpdir])
-            # Match file-tool reach checks to the sandbox's staged-skill mounts.
-            staged_skill_dirs = staged_codex_skill_dirs()
-            if staged_skill_dirs:
-                sandbox = with_additional_read_roots(sandbox, staged_skill_dirs)
             set_sandbox_env(env, self._tmpdir)
             if self.start_in_scratch:
                 helper_cwd = self._tmpdir
@@ -993,6 +988,7 @@ def create_os_environment(
     *,
     copy_on_write_environment: CopyOnWriteEnvironment | None = None,
     sandbox_policy: SandboxPolicy | None = None,
+    additional_read_roots: Sequence[Path] = (),
 ) -> OSEnvironment | None:
     """Instantiate the configured OS environment."""
     if spec is None:
@@ -1008,6 +1004,8 @@ def create_os_environment(
         _copy_tree(cwd, effective_cwd)
         cwd = effective_cwd
     sandbox = replace(sandbox_policy) if sandbox_policy is not None else resolve_sandbox(spec, cwd)
+    if additional_read_roots:
+        sandbox = with_additional_read_roots(sandbox, list(additional_read_roots))
     if spec.start_in_scratch and not sandbox.active:
         raise ValueError(
             "os_env.start_in_scratch requires an active sandbox; "

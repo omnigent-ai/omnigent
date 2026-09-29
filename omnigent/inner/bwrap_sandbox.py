@@ -81,7 +81,6 @@ from ._seccomp import (
     apply_seccomp_filter,
     scmp_act_errno,
 )
-from .codex_staging import staged_codex_skill_dirs
 from .datamodel import OSEnvSandboxSpec, OSEnvSpec
 from .sandbox import (
     SandboxBackend,
@@ -557,21 +556,6 @@ class BwrapSandboxBackend(SandboxBackend):
         # caller also added the parent to read_paths or write_paths).
         for fpath in policy.write_files:
             bwrap_args += ["--bind-try", str(fpath), str(fpath)]
-
-        # Harness-staged skill manifests. The wrapped codex executor stages a
-        # private CODEX_HOME per conversation under a well-known temp root
-        # and publishes ``$CODEX_HOME/skills/<name>/SKILL.md`` paths to the
-        # model; with ``/tmp`` tmpfs-masked above those paths would dangle,
-        # so re-expose exactly the ``skills/`` subtree of each staged home
-        # read-only. Home siblings (``auth.json``, ``config.toml``, session
-        # logs) are deliberately never mounted. ``--ro-bind-try`` so a home
-        # torn down between glob and spawn doesn't fail the wrap.
-        for skills_dir in staged_codex_skill_dirs():
-            if policy.read_roots is not None and any(
-                _is_same_path(skills_dir, root) for root in policy.read_roots
-            ):
-                continue  # already granted (and bound) via read_paths above
-            bwrap_args += ["--ro-bind-try", str(skills_dir), str(skills_dir)]
 
         # Mask dotfiles anywhere under cwd OR under any ``read_paths`` /
         # ``write_paths`` root that aren't on the allowlist, plus any
