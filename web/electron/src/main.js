@@ -1123,6 +1123,32 @@ function resolvedCliPath() {
 }
 
 /**
+ * What to tell the user when hostCliCommand(serverUrl) found no launcher.
+ *
+ * @param {string} serverUrl
+ * @returns {string}
+ */
+function missingHostCliError(serverUrl) {
+  return databricksInternalFeaturesEnabled() && isDatabricksManagedServerUrl(serverUrl)
+    ? "The isaac CLI was not found. Install it before connecting this machine."
+    : "The omnigent CLI was not found. Install it or set its path.";
+}
+
+/**
+ * The server URL a setup-page connect targets: a managed choice exactly as
+ * configured (it may name a workspace mount), else normalized; workspace roots
+ * then expand to their mount. Throws on an invalid URL.
+ *
+ * @param {string} url
+ * @param {{ signal?: AbortSignal }} [options]
+ * @returns {Promise<string>}
+ */
+function resolveConnectTarget(url, options) {
+  const managedTarget = managedServerUrls().find((candidate) => candidate === url);
+  return expandDatabricksWorkspaceUrl(managedTarget ?? normalizeUrl(url), options);
+}
+
+/**
  * CLI command for desktop host enrollment on `serverUrl`. Databricks-internal
  * windows use `isaac omni` behind the same effective gate as Arca (MDM flag +
  * Databricks-managed HTTPS server); every other window keeps the configured /
@@ -2886,9 +2912,7 @@ function registerIpc() {
       // A managed choice is already validated and may name a workspace mount;
       // preserve it exactly. The shared expansion is a no-op for paths, while a
       // managed workspace root still gets the normal mount discovery.
-      const managedTarget = managedServerUrls().find((candidate) => candidate === url);
-      const normalized = managedTarget ?? normalizeUrl(url); // throws → setup page shows error
-      const target = await expandDatabricksWorkspaceUrl(normalized, { signal });
+      const target = await resolveConnectTarget(url, { signal }); // throws → setup page shows error
       signal.throwIfAborted();
 
       // Multi-server windows connect without touching the saved server —
@@ -3044,8 +3068,8 @@ function registerIpc() {
       throw new Error("connect-runner is only available to the setup page");
     }
     if (runner !== "local" && runner !== "remote") throw new TypeError("unknown runner");
-    const managedTarget = managedServerUrls().find((candidate) => candidate === url);
-    const target = await expandDatabricksWorkspaceUrl(managedTarget ?? normalizeUrl(url));
+    if (typeof url !== "string") throw new TypeError("connect-runner requires a URL string");
+    const target = await resolveConnectTarget(url);
     const log = (line) => {
       try {
         event.sender.send("omnigent:runner-connect-log", { line });
@@ -3059,12 +3083,15 @@ function registerIpc() {
       }
       const run = arca.startArcaConnect(target, { onOutput: log });
       if (run.command) log(`$ ${run.command}`);
-      return run.promise;
+      // Closing the setup window cancels the connect, like the connect console.
+      const cancel = () => run.cancel();
+      event.sender.once("destroyed", cancel);
+      const result = await run.promise;
+      event.sender.removeListener("destroyed", cancel);
+      return result;
     }
     const cliCommand = hostCliCommand(target);
-    if (!cliCommand) {
-      return { ok: false, error: "The Omnigent CLI was not found. Install it and try again." };
-    }
+    if (!cliCommand) return { ok: false, error: missingHostCliError(target) };
     log(`$ ${omnigentCli.cliCommandParts(cliCommand).displayName} host --server ${target}`);
     log("Signing in to the server if needed…");
     const auth = await serverManager.ensureServerAuth(cliCommand, target);
@@ -3519,16 +3546,7 @@ function registerIpc() {
     const serverUrl = senderServerUrl(event);
     if (!serverUrl) return { ok: false, error: "this window is not connected to a server" };
     const cliCommand = hostCliCommand(serverUrl);
-    if (!cliCommand) {
-      const internal =
-        databricksInternalFeaturesEnabled() && isDatabricksManagedServerUrl(serverUrl);
-      return {
-        ok: false,
-        error: internal
-          ? "The isaac CLI was not found. Install it before connecting this machine."
-          : "The omnigent CLI was not found. Install it or set its path.",
-      };
-    }
+    if (!cliCommand) return { ok: false, error: missingHostCliError(serverUrl) };
     let result;
     if (action === "start" || action === "restart") {
       // Enrolling this machine as a runner executes agent code locally, so it

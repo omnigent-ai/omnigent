@@ -169,11 +169,9 @@ export function ServerSelectorV2({ setup }: { setup: ServerSelectorV2Setup }) {
     setRunnerError(undefined);
     setStep("runner");
   };
-  // What the terminal step should run after any install: start the local server
-  // (Back → the step that launched it), or connect to a remote URL. A picked
-  // local install carries its `url`: opened as-is when up, else started.
-  // A runner-step connect also carries the picked runner (connected first) and
-  // whether to skip the CLI install.
+  // What the terminal step runs after any install (Back → `back`): start the
+  // local server (a picked local install's `url` opens as-is when up), or
+  // connect to a URL, first connecting the picked runner when set.
   const [terminalTarget, setTerminalTarget] = useState<
     | { kind: "local"; back: Step; url?: string }
     | { kind: "connect"; back: Step; url: string; runner?: Runner; skipInstall?: boolean }
@@ -230,6 +228,11 @@ export function ServerSelectorV2({ setup }: { setup: ServerSelectorV2Setup }) {
   };
   const terminalRunner = terminalTarget.kind === "connect" ? terminalTarget.runner : undefined;
   const skipInstall = terminalTarget.kind === "connect" && terminalTarget.skipInstall === true;
+  const terminalCopy = terminalRunningCopy(
+    terminalRunner,
+    terminalTarget.kind,
+    setup.localServerRunning === true,
+  );
   // Whether the server step is showing its URL-input ("add") view vs the list —
   // reported up so the band can show the hero icons only in the add view.
   const [serverAddMode, setServerAddMode] = useState(false);
@@ -360,28 +363,8 @@ export function ServerSelectorV2({ setup }: { setup: ServerSelectorV2Setup }) {
             onRun={runTerminal}
             onSetupLog={terminalRunner ? setup.onRunnerLog : setup.onSetupLog}
             onBack={() => setStep(terminalTarget.back)}
-            runningLabel={
-              terminalRunner === "remote"
-                ? "Connecting your remote environment"
-                : terminalRunner === "local"
-                  ? "Connecting this laptop"
-                  : terminalTarget.kind === "connect"
-                    ? "Connecting"
-                    : setup.localServerRunning
-                      ? "Opening Omnigent"
-                      : "Starting Omnigent"
-            }
-            runningHint={
-              terminalRunner === "remote"
-                ? "Starting your remote environment…"
-                : terminalRunner === "local"
-                  ? "Connecting this laptop to the server…"
-                  : terminalTarget.kind === "connect"
-                    ? "Connecting to the server…"
-                    : setup.localServerRunning
-                      ? "Connecting to the local server…"
-                      : "Starting the local server…"
-            }
+            runningLabel={terminalCopy.label}
+            runningHint={terminalCopy.hint}
           />
         )}
         {step === "server" && (
@@ -404,4 +387,25 @@ export function ServerSelectorV2({ setup }: { setup: ServerSelectorV2Setup }) {
       <LandingFooter />
     </div>
   );
+}
+
+/** Terminal heading + empty-log hint for what the run phase is doing. */
+function terminalRunningCopy(
+  runner: Runner | undefined,
+  kind: "local" | "connect",
+  localServerRunning: boolean,
+): { label: string; hint: string } {
+  if (runner === "remote") {
+    return {
+      label: "Connecting your remote environment",
+      hint: "Starting your remote environment…",
+    };
+  }
+  if (runner === "local") {
+    return { label: "Connecting this laptop", hint: "Connecting this laptop to the server…" };
+  }
+  if (kind === "connect") return { label: "Connecting", hint: "Connecting to the server…" };
+  return localServerRunning
+    ? { label: "Opening Omnigent", hint: "Connecting to the local server…" }
+    : { label: "Starting Omnigent", hint: "Starting the local server…" };
 }

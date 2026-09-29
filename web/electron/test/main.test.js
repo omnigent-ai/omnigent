@@ -869,12 +869,23 @@ describe("managed server preference wiring", () => {
       preloadSource,
       /connectRunner:\s*\(url, runner\)\s*=>\s*ipcRenderer\.invoke\("omnigent:connect-runner",\s*url,\s*runner\)/,
     );
-    const handler = liveCode.slice(
-      liveCode.indexOf('ipcMain.handle("omnigent:connect-runner"'),
-      liveCode.indexOf('ipcMain.handle("omnigent:copy-setup-text"'),
-    );
+    const start = liveCode.indexOf('ipcMain.handle("omnigent:connect-runner"');
+    const end = liveCode.indexOf('ipcMain.handle("omnigent:copy-setup-text"');
+    assert.ok(start >= 0 && end > start, "connect-runner handler not found before copy-setup-text");
+    const handler = liveCode.slice(start, end);
     assert.match(handler, /^[\s\S]{0,120}!isSetupPageSender\(event\)/);
     assert.match(handler, /runner !== "local" && runner !== "remote"/);
+    assert.match(handler, /typeof url !== "string"\) throw new TypeError/);
+    // Same target resolution as set-server-url; the remote run dies with the setup window.
+    assert.match(handler, /const target = await resolveConnectTarget\(url\);/);
+    assert.match(
+      handler,
+      /event\.sender\.once\("destroyed", cancel\);\s*const result = await run\.promise;\s*event\.sender\.removeListener\("destroyed", cancel\);/,
+    );
+    assert.match(
+      handler,
+      /if \(!cliCommand\) return \{ ok: false, error: missingHostCliError\(target\) \};/,
+    );
     // Remote: the window-independent gate is re-checked in main, never trusted from the page.
     assert.match(
       handler,
@@ -890,7 +901,11 @@ describe("managed server preference wiring", () => {
   it("preserves a managed path while still expanding bare workspace roots", () => {
     assert.match(
       liveCode,
-      /managedTarget\s*\?\?\s*normalizeUrl\(url\)[\s\S]{0,120}await expandDatabricksWorkspaceUrl\(normalized,\s*\{\s*signal\s*\}\)/,
+      /function resolveConnectTarget\(url, options\)[\s\S]{0,160}expandDatabricksWorkspaceUrl\(managedTarget \?\? normalizeUrl\(url\), options\)/,
+    );
+    assert.match(
+      liveCode,
+      /ipcMain\.handle\("omnigent:set-server-url"[\s\S]{0,1200}await resolveConnectTarget\(url, \{ signal \}\)/,
     );
   });
 
