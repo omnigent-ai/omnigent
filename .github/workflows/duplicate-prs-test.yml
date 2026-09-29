@@ -8,6 +8,7 @@ name: Duplicate PRs Test
 on:
   pull_request:
     paths:
+      - '.github/workflows/duplicate-prs-test.yml'
       - .github/workflows/duplicate-prs.js
       - .github/workflows/duplicate-prs.test.js
       - .github/workflows/close-superseded-pr.js

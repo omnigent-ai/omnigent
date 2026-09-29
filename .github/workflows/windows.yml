@@ -10,11 +10,45 @@ name: Windows (native)
 on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
-    paths-ignore: ['web/**', 'tests/e2e_ui/**', 'tests/browser_ui/**', 'CHANGELOG.md']
+    paths:
+      - '**'
+      - '!web/**'
+      - '!tests/e2e_ui/**'
+      - '!tests/browser_ui/**'
+      - '!CHANGELOG.md'
+      - '!docs/**'
+      - '!CONTRIBUTING.md'
+      - '!SECURITY.md'
+      - '!tests/scripts/**'
+      - '!tests/github/**'
+      - '!.github/scripts/polly-review-*.py'
+      - '!.github/workflows/polly-review*.yml'
+      - '!.github/workflows/*.js'
+      - '!tests/e2e/**'
+      - '!tests/integration/**'
+      # Read by a test in this workflow despite the general web exclusion.
+      - 'web/src/lib/attachments.ts'
   push:
     branches:
       - main
-    paths-ignore: ['web/**', 'tests/e2e_ui/**', 'tests/browser_ui/**', 'CHANGELOG.md']
+    paths:
+      - '**'
+      - '!web/**'
+      - '!tests/e2e_ui/**'
+      - '!tests/browser_ui/**'
+      - '!CHANGELOG.md'
+      - '!docs/**'
+      - '!CONTRIBUTING.md'
+      - '!SECURITY.md'
+      - '!tests/scripts/**'
+      - '!tests/github/**'
+      - '!.github/scripts/polly-review-*.py'
+      - '!.github/workflows/polly-review*.yml'
+      - '!.github/workflows/*.js'
+      - '!tests/e2e/**'
+      - '!tests/integration/**'
+      # Read by a test in this workflow despite the general web exclusion.
+      - 'web/src/lib/attachments.ts'
 
 permissions:
   contents: read

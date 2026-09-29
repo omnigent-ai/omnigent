@@ -12,14 +12,34 @@ name: CI
 on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
-    paths-ignore: ['web/**', 'tests/e2e_ui/**', 'tests/browser_ui/**', 'CHANGELOG.md']
+    paths:
+      - '**'
+      - '!web/**'
+      - '!tests/e2e_ui/**'
+      - '!tests/browser_ui/**'
+      - '!CHANGELOG.md'
+      - '!docs/**'
+      - '!CONTRIBUTING.md'
+      - '!SECURITY.md'
+      # Read by a test in this workflow despite the general web exclusion.
+      - 'web/src/lib/attachments.ts'
   push:
     branches:
       - main
       # Release branches: release.yml's green-CI gate reads check runs off the
       # branch head, so cherry-picks and release-bump commits must run CI.
       - 'release/v[0-9]*'
-    paths-ignore: ['web/**', 'tests/e2e_ui/**', 'tests/browser_ui/**', 'CHANGELOG.md']
+    paths:
+      - '**'
+      - '!web/**'
+      - '!tests/e2e_ui/**'
+      - '!tests/browser_ui/**'
+      - '!CHANGELOG.md'
+      - '!docs/**'
+      - '!CONTRIBUTING.md'
+      - '!SECURITY.md'
+      # Read by a test in this workflow despite the general web exclusion.
+      - 'web/src/lib/attachments.ts'
 
 permissions:
   contents: read
