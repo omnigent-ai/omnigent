@@ -15,6 +15,19 @@
 // local session, leaving routing to the default.
 
 const _sessionHosts = new Map<string, string>();
+const _hostChangeListeners = new Set<() => void>();
+
+/** Subscribe to host/parent changes so live streams can recheck their effective host. */
+export function subscribeSessionHostChanges(listener: () => void): () => void {
+  _hostChangeListeners.add(listener);
+  return () => {
+    _hostChangeListeners.delete(listener);
+  };
+}
+
+function notifySessionHostChanges(): void {
+  for (const listener of _hostChangeListeners) listener();
+}
 
 /**
  * Record (or clear) the host a session is bound to. Called wherever a session
@@ -22,11 +35,13 @@ const _sessionHosts = new Map<string, string>();
  * that loses its host binding stops routing to the old replica.
  */
 export function setSessionHost(sessionId: string, hostId: string | null | undefined): void {
+  if ((_sessionHosts.get(sessionId) ?? null) === (hostId || null)) return;
   if (hostId) {
     _sessionHosts.set(sessionId, hostId);
   } else {
     _sessionHosts.delete(sessionId);
   }
+  notifySessionHostChanges();
 }
 
 // A sub-agent child runs on its parent's runner, whose tunnel lives on the
@@ -40,11 +55,14 @@ const _sessionParents = new Map<string, string>();
  * through the ancestor chain. Called wherever a session object is parsed.
  */
 export function setSessionParent(sessionId: string, parentId: string | null | undefined): void {
-  if (parentId && parentId !== sessionId) {
-    _sessionParents.set(sessionId, parentId);
+  const nextParent = parentId && parentId !== sessionId ? parentId : null;
+  if ((_sessionParents.get(sessionId) ?? null) === nextParent) return;
+  if (nextParent) {
+    _sessionParents.set(sessionId, nextParent);
   } else {
     _sessionParents.delete(sessionId);
   }
+  notifySessionHostChanges();
 }
 
 /**

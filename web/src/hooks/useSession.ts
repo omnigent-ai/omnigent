@@ -12,6 +12,7 @@
 // gets the user's actual level for any conversation they navigate to.
 
 import { type QueryClient, useQuery, useQueryClient } from "@tanstack/react-query";
+import type { SessionHostResolveOptions } from "@/lib/identity";
 import { getSessionHost, setSessionHost, setSessionParent } from "@/lib/sessionHost";
 import { getSessionSlim } from "@/lib/sessionsApi";
 import { isTempConvId } from "@/lib/tempConversationId";
@@ -173,20 +174,31 @@ export function useActiveRootSessionId(
 export async function prefetchSessionHostChain(
   queryClient: QueryClient,
   sessionId: string,
+  options: SessionHostResolveOptions = {},
 ): Promise<void> {
   const visited = new Set<string>();
   let id: string | null = sessionId;
   while (id !== null && !visited.has(id) && getSessionHost(sessionId) === null) {
     visited.add(id);
     const hopId: string = id;
-    // Each hop's id comes from the previous snapshot, so the chain is serial.
-    // oxlint-disable-next-line no-await-in-loop
-    const session: Session = await queryClient.fetchQuery({
+    const queryOptions = {
       queryKey: ["session", hopId],
       queryFn: () => getSessionSlim(hopId),
-      staleTime: Infinity,
+      staleTime: options.force ? 0 : Infinity,
       retry: false,
-    });
+    };
+    if (
+      options.force &&
+      queryClient.getQueryState(queryOptions.queryKey)?.fetchStatus === "fetching"
+    ) {
+      // An in-flight snapshot may predate provisioning. Let it settle before
+      // starting the fresh read, without cancelling other snapshot consumers.
+      // oxlint-disable-next-line no-await-in-loop
+      await queryClient.fetchQuery(queryOptions).catch(() => undefined);
+    }
+    // Each hop's id comes from the previous snapshot, so the chain is serial.
+    // oxlint-disable-next-line no-await-in-loop
+    const session: Session = await queryClient.fetchQuery(queryOptions);
     // `sessionFromWire` records these on a live fetch; re-record so a cached
     // snapshot seeds the map the same way.
     setSessionHost(session.id, session.hostId);

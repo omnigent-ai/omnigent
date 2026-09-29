@@ -154,6 +154,61 @@ describe("prefetchSessionHostChain", () => {
     expect(getSessionSlimMock).toHaveBeenCalledTimes(1);
   });
 
+  it("force-refreshes a cached hostless managed session after provisioning", async () => {
+    const { client } = harness();
+    client.setQueryData(["session", "managed_top"], routed("managed_top", null, null));
+    serve([routed("managed_top", "host_new", null)]);
+
+    await prefetchSessionHostChain(client, "managed_top", { force: true });
+
+    expect(getSessionHost("managed_top")).toBe("host_new");
+    expect(getSessionSlimMock).toHaveBeenCalledTimes(1);
+    expect(client.getQueryData(["session", "managed_top"])).toMatchObject({ hostId: "host_new" });
+  });
+
+  it("force-refreshes cached hostless ancestors as well as the child", async () => {
+    const { client } = harness();
+    client.setQueryData(
+      ["session", "managed_child"],
+      routed("managed_child", null, "managed_parent"),
+    );
+    client.setQueryData(["session", "managed_parent"], routed("managed_parent", null, null));
+    serve([
+      routed("managed_child", null, "managed_parent"),
+      routed("managed_parent", "host_parent", null),
+    ]);
+
+    await prefetchSessionHostChain(client, "managed_child", { force: true });
+
+    expect(getSessionHost("managed_child")).toBe("host_parent");
+    expect(getSessionSlimMock.mock.calls.map((call) => call[0])).toEqual([
+      "managed_child",
+      "managed_parent",
+    ]);
+  });
+
+  it("fetches again after a pre-provisioning snapshot already in flight settles", async () => {
+    const { client } = harness();
+    let finishOldSnapshot!: (value: Session) => void;
+    const oldSnapshot = client.fetchQuery({
+      queryKey: ["session", "inflight_managed"],
+      queryFn: () =>
+        new Promise<Session>((done) => {
+          finishOldSnapshot = done;
+        }),
+      staleTime: Infinity,
+    });
+    serve([routed("inflight_managed", "host_after_provision", null)]);
+
+    const refresh = prefetchSessionHostChain(client, "inflight_managed", { force: true });
+    finishOldSnapshot(routed("inflight_managed", null, null));
+    await oldSnapshot;
+    await refresh;
+
+    expect(getSessionHost("inflight_managed")).toBe("host_after_provision");
+    expect(getSessionSlimMock).toHaveBeenCalledTimes(1);
+  });
+
   it("terminates on a malformed parent cycle", async () => {
     const { client } = harness();
     serve([routed("cycle_a", null, "cycle_b"), routed("cycle_b", null, "cycle_a")]);
