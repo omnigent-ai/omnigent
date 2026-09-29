@@ -4299,15 +4299,10 @@ function nextReconnectDelay(failedOpens: number): number {
  *   streaming `activeResponse` — without one there is no rid to scope
  *   the drop.
  * - Native live previews (`live:<message_id>` provisional blocks): the
- *   replay is one CUMULATIVE delta per in-flight message (the joined
- *   text so far). Appending that replay to a surviving preview would
- *   double the text. A message that committed
- *   during the gap is excluded from the replay entirely; its preview
- *   must vanish too, or it would double-render beside the committed
- *   item the reconnect backfill splices in. So previews are dropped
- *   unconditionally (NOT gated on `activeResponse` — native sessions
- *   stream mid-turn while `session.status`-driven, e.g. parked on a
- *   permission prompt).
+ *   same server replays one cumulative delta, so discard that server's
+ *   streamed suffix before appending the replay. After a server restart,
+ *   retain the prior server's prefix, which the new process cannot replay.
+ *   Committed items remove their previews during snapshot reconciliation.
  *
  * Committed blocks are kept in place so they aren't lost (the replay
  * won't resend them) and dedupe by `itemId` against the live tail.
@@ -4317,7 +4312,11 @@ function nextReconnectDelay(failedOpens: number): number {
  * ApprovalCard here would orphan the parked prompt until a full page
  * refresh.
  */
-function dropEphemeralInFlightBlocks(id: string, set: Setter): void {
+function dropEphemeralInFlightBlocks(
+  id: string,
+  set: Setter,
+  nativePreviewBaselines: ReadonlyMap<string, string> | null = null,
+): void {
   set((s) => {
     if (s.conversationId !== id) return {};
     const active = s.activeResponse;
@@ -4325,12 +4324,29 @@ function dropEphemeralInFlightBlocks(id: string, set: Setter): void {
       active !== null && active.state === "streaming" && active.responseId
         ? active.responseId
         : null;
-    const kept = s.blocks.filter((b) => {
-      if (isLiveProvisionalBlock(b)) return false;
-      if (b.type === "elicitation" || b.type === "error") return true;
-      return rid === null || b.ctx.responseId !== rid || Boolean(b.ctx.itemId);
-    });
-    if (kept.length === s.blocks.length) return {};
+    const kept: AnyBlock[] = [];
+    for (const block of s.blocks) {
+      if (isLiveProvisionalBlock(block)) {
+        const prefix = nativePreviewBaselines?.get(block.ctx.itemId ?? "");
+        if (prefix === undefined) continue;
+        kept.push(
+          block.type === "text_done" && block.fullText !== prefix
+            ? { ...block, fullText: prefix, hasCodeBlocks: prefix.includes("```") }
+            : block,
+        );
+      } else if (
+        block.type === "elicitation" ||
+        block.type === "error" ||
+        rid === null ||
+        block.ctx.responseId !== rid ||
+        Boolean(block.ctx.itemId)
+      ) {
+        kept.push(block);
+      }
+    }
+    if (kept.length === s.blocks.length && kept.every((block, i) => block === s.blocks[i])) {
+      return {};
+    }
     return { blocks: kept };
   });
 }
@@ -5014,6 +5030,8 @@ export async function startStreamPump(
   // established stream — failed opens leave it false so a recovered first
   // connect is still treated as initial, not a reconnect.
   let hasConnected = false;
+  let previousStreamEpoch: string | null = null;
+  const nativePreviewBaselines = new Map<string, string>();
   // A reconnect loop is inherently sequential — open → pump → reconnect —
   // so its awaits cannot be parallelized; no-await-in-loop doesn't apply.
   /* eslint-disable no-await-in-loop */
@@ -5122,18 +5140,42 @@ export async function startStreamPump(
         }
 
         const reconnecting = hasConnected;
+        const streamEpoch = streamRes.headers.get("x-omnigent-stream-epoch");
         hasConnected = true;
         failedOpens = 0;
         consecutive404s = 0;
         presenceIdle.noteReported(idle);
         streamAttemptActivity.set(attempt, Date.now());
         if (reconnecting) {
-          dropEphemeralInFlightBlocks(id, set);
+          if (previousStreamEpoch === null || streamEpoch === null) {
+            nativePreviewBaselines.clear();
+          } else if (previousStreamEpoch !== streamEpoch) {
+            nativePreviewBaselines.clear();
+            for (const block of get().blocks) {
+              if (isLiveProvisionalBlock(block) && block.type === "text_done" && block.ctx.itemId) {
+                nativePreviewBaselines.set(block.ctx.itemId, block.fullText);
+              }
+            }
+          }
+          const liveIds = new Set(
+            get()
+              .blocks.filter(isLiveProvisionalBlock)
+              .map((block) => block.ctx.itemId),
+          );
+          for (const itemId of nativePreviewBaselines.keys()) {
+            if (!liveIds.has(itemId)) nativePreviewBaselines.delete(itemId);
+          }
+          dropEphemeralInFlightBlocks(
+            id,
+            set,
+            nativePreviewBaselines.size > 0 ? nativePreviewBaselines : null,
+          );
         } else {
           // Fresh connection (not a reconnect) — clear any stale SSE log from
           // a previous stream bind so the debug panel starts clean.
           clearSseLog(id);
         }
+        previousStreamEpoch = streamEpoch;
         // Guard the byte stream with a silence watchdog: the server
         // heartbeats every 15 s, so a longer gap means a half-open socket
         // (laptop sleep, network path change, proxy reap). The guard ends
