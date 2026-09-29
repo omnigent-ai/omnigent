@@ -417,7 +417,8 @@ def _parse_tool(name: str, data: str | YamlData, *, allow_dynamic_tools: bool) -
         or (tool_type == "cancellable_function" and isinstance(data.get("runner"), str))
     ):
         raise ValueError(
-            "uploaded agent bundles may not declare a server-side Python callable tool."
+            f"Tool {name!r}: uploaded agent bundles may not declare a "
+            "server-side Python callable tool."
         )
 
     if tool_type == "function":

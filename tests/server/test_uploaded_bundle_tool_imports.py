@@ -33,7 +33,9 @@ _TOOL_TARGETS = (
     (None, "callable"),
     ("cancellable_function", "runner"),
 )
-_REJECTION = "uploaded agent bundles may not declare a server-side Python callable tool."
+_REJECTION = (
+    "Tool 'probe': uploaded agent bundles may not declare a server-side Python callable tool."
+)
 
 
 def _agent_with_tool(tool: dict[str, object], depth: int) -> dict[str, object]:
