@@ -1642,14 +1642,18 @@ describe("onboarding runner IPC", () => {
     const h = harness(t);
     const connect = h.ipc.get("omnigent:connect-runner");
     const sender = setupSender();
-    await assert.rejects(connect({ sender, senderFrame: { url: server } }, server, "local"));
+    await assert.rejects(
+      connect({ sender, senderFrame: { url: server } }, server, "local"),
+      /only available to the setup page/,
+    );
     await assert.rejects(
       connect({ sender, senderFrame: setupFrame(h) }, server, "sandbox"),
       typeError,
     );
     await assert.rejects(connect({ sender, senderFrame: setupFrame(h) }, 42, "local"), typeError);
-    assert.throws(() =>
-      h.ipc.get("omnigent:get-runner-options")({ senderFrame: { url: server } }, server),
+    assert.throws(
+      () => h.ipc.get("omnigent:get-runner-options")({ senderFrame: { url: server } }, server),
+      /only available to the setup page/,
     );
   });
 
@@ -1669,10 +1673,8 @@ describe("onboarding runner IPC", () => {
     const h = harness(t);
     const event = { sender: setupSender(), senderFrame: setupFrame(h) };
     const result = await h.ipc.get("omnigent:connect-runner")(event, server, "local");
-    assert.deepEqual(plain(result), {
-      ok: false,
-      error: "The omnigent CLI was not found. Install it or set its path.",
-    });
+    assert.equal(result.ok, false);
+    assert.match(result.error, /omnigent CLI was not found/);
   });
 
   for (const runner of ["local", "remote"]) {

@@ -410,14 +410,22 @@ describe("ServerSelectorV2", () => {
     await waitFor(() => expect(onConnect).toHaveBeenCalledWith("https://team.example.com/"));
   });
 
-  it("tells a laptop runner what connecting grants", async () => {
+  it("tells a laptop runner, and only a laptop runner, what connecting grants", async () => {
+    const grant = "The server will be able to run agents on this laptop.";
     render(
-      <ServerSelectorV2 setup={makeSetup({ managedServers: ["https://team.example.com/"] })} />,
+      <ServerSelectorV2
+        setup={makeSetup({
+          managedServers: ["https://team.example.com/"],
+          getRunnerOptions: vi.fn().mockResolvedValue({ remote: true }),
+        })}
+      />,
     );
     fireEvent.click(screen.getByRole("button", { name: /join your team \(team\)/i }));
-    expect(
-      await screen.findByText("The server will be able to run agents on this laptop."),
-    ).toBeInTheDocument();
+    // Arca is the default: no laptop grant to explain.
+    fireEvent.click(await screen.findByRole("combobox", { name: "Runner" }));
+    expect(screen.queryByText(grant)).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("option", { name: "My laptop" }));
+    expect(screen.getByText(grant)).toBeInTheDocument();
   });
 
   it("the laptop skips the install when its host CLI is bundled", async () => {
