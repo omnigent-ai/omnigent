@@ -245,8 +245,16 @@ def test_append_dead_letter_classification_defaults(tmp_path: Path) -> None:
         (_dead_letter_record(), True),
         # Retryable status exhausted after the forwarder's bounded retries.
         (_dead_letter_record(http_status=503), True),
-        # Ambiguous: the server may have committed it — never replay.
+        # Legacy ambiguous item: no idempotency key, so never replay.
         (_dead_letter_record(delivered_ambiguous=True), False),
+        # Idempotent ambiguous item: source_id makes a replay duplicate-safe.
+        (
+            _dead_letter_record(
+                delivered_ambiguous=True,
+                payload={"item_type": "message", "source_id": "thread:turn:item"},
+            ),
+            True,
+        ),
         # Permanent 4xx: the server rejected it; a replay just re-rejects.
         (_dead_letter_record(http_status=400), False),
         # Non-retryable 5xx that is not in the retry set is also not recoverable.
@@ -271,7 +279,7 @@ def test_append_dead_letter_classification_defaults(tmp_path: Path) -> None:
 )
 def test_dead_letter_record_replayable_classification(record: object, replayable: bool) -> None:
     """
-    Only proven-undelivered records are replayable; everything else is forensic.
+    Proven-undelivered records and source-idempotent ambiguous items are replayable.
 
     A wrong classification either duplicates a committed item (ambiguous or
     permanent record wrongly replayed) or re-rejects forever.

@@ -48,7 +48,9 @@ describe(
     it("connects from the setup page and lands in the app shell", async () => {
       // Launch WITHOUT a pre-seeded server so the journey starts on the bundled
       // setup page — the connect flow is part of the desktop journey we film.
-      const { electronApp, window, userDataDir } = await launchDesktop({ recordDir: RECORD_DIR });
+      const { electronApp, window, userDataDir, stopDisplayCapture } = await launchDesktop({
+        recordDir: RECORD_DIR,
+      });
       let saved;
       try {
         // 1. The bundled "connect to server" setup page is shown.
@@ -72,6 +74,7 @@ describe(
         // before-fix footage must still be saved on that path, not just on
         // pass. Rename to the stable name the repro-agent handoff points at.
         await electronApp.close();
+        await stopDisplayCapture();
         saved = saveRecording(RECORD_DIR, "connect-journey");
         fs.rmSync(userDataDir, { recursive: true, force: true });
       }

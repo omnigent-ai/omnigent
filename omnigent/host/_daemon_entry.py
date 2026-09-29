@@ -72,9 +72,9 @@ def main() -> None:
         return
 
     try:
-        from omnigent.host.identity import CONFIG_PATH, load_or_create_host_identity
+        from omnigent.host.identity import load_or_create_host_identity
 
-        identity = load_or_create_host_identity(CONFIG_PATH)
+        identity = load_or_create_host_identity()
         mode = "local" if args.local else "server"
         record = HostDaemonRecord(
             pid=os.getpid(),

@@ -30,6 +30,23 @@ describe("isLoginRedirect", () => {
     );
   });
 
+  it("matches a managed workspace's /login and /login/sso bounce", () => {
+    // The real signal on a managed workspace: an expired session redirects to
+    // /login or /login/sso (not login.html).
+    assert.equal(
+      isLoginRedirect({ statusCode: 302, redirectURL: "https://ws.cloud.databricks.com/login" }),
+      true,
+    );
+    assert.equal(
+      isLoginRedirect({
+        statusCode: 303,
+        redirectURL:
+          "https://ws.cloud.databricks.com/login/sso?accountId=abc&next_url=%2Fomnigent&ssoType=OPENID_CONNECT",
+      }),
+      true,
+    );
+  });
+
   it("ignores a redirect that is not to the login page", () => {
     // An ordinary same-origin API-to-API redirect must be left alone.
     assert.equal(

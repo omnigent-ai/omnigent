@@ -1,9 +1,12 @@
-import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { copyText } from "@/lib/clipboard";
+import { getSessionSignInLink } from "@/lib/sessionsApi";
+import { useChatStore } from "@/store/chatStore";
 import { ErrorBanner, RoutingDecisionCard } from "./StatusBlocks";
 
 vi.mock("@/lib/clipboard", () => ({ copyText: vi.fn(() => Promise.resolve()) }));
+vi.mock("@/lib/sessionsApi", () => ({ getSessionSignInLink: vi.fn() }));
 
 afterEach(cleanup);
 
@@ -29,6 +32,12 @@ const TERMINAL_ERROR = [
   "Last captured terminal output:",
   "Pane is dead (status 0, Tue Aug 11 17:00:46 2026)",
 ].join("\n");
+
+const RATE_LIMIT_ERROR = [
+  "API Error: Request rejected (429) · REQUEST_LIMIT_EXCEEDED: Exceeded workspace",
+  "input tokens per minute rate limit for databricks-test-model. Work with your",
+  "Databricks account team to request a higher FMAPI rate limit tier.",
+].join(" ");
 
 describe("ErrorBanner", () => {
   beforeEach(() => vi.mocked(copyText).mockClear());
@@ -56,95 +65,48 @@ describe("ErrorBanner", () => {
     expect(message).not.toHaveTextContent("terminal: claude:main");
   });
 
-  it("uses one stable leading slot across rest, hover, focus, and expanded states", () => {
+  it("disclosure chevron is always visible and rotates when expanded", () => {
     render(
       <ErrorBanner message={TERMINAL_ERROR} source="execution" code="required_terminal_exited" />,
     );
 
     const messageToggle = screen.getByRole("button", { name: /terminal exited unexpectedly/i });
     expect(screen.getByTestId("error-leading-slot")).toHaveClass("h-[18px]", "w-[18px]");
-    expect(screen.getByTestId("error-status-icon")).toBeInTheDocument();
-    expect(screen.queryByTestId("error-disclosure-icon")).toBeNull();
-
-    fireEvent.mouseEnter(messageToggle);
+    // Chevron is present in rest state — no status icon.
     expect(screen.queryByTestId("error-status-icon")).toBeNull();
     expect(screen.getByTestId("error-disclosure-icon")).toHaveClass(
       "text-muted-foreground",
       "group-hover/error:text-foreground",
     );
     expect(screen.getByTestId("error-disclosure-icon")).not.toHaveClass("rotate-90");
+    expect(screen.queryByText("Expand for details")).toBeNull();
 
-    fireEvent.mouseLeave(messageToggle);
-    expect(screen.getByTestId("error-status-icon")).toBeInTheDocument();
-    expect(screen.queryByTestId("error-disclosure-icon")).toBeNull();
-
-    fireEvent.keyDown(document, { key: "Tab" });
-    act(() => messageToggle.focus());
-    expect(screen.queryByTestId("error-status-icon")).toBeNull();
-    expect(screen.getByTestId("error-disclosure-icon")).not.toHaveClass("rotate-90");
-
-    act(() => messageToggle.blur());
-    expect(screen.getByTestId("error-status-icon")).toBeInTheDocument();
+    // Expand: chevron rotates without adding redundant helper copy.
     fireEvent.click(messageToggle);
-    expect(screen.queryByTestId("error-status-icon")).toBeNull();
     expect(screen.getByTestId("error-disclosure-icon")).toHaveClass("rotate-90");
+    expect(screen.queryByText("Expand for details")).toBeNull();
+
+    // Collapse: chevron resets and the helper stays absent.
+    fireEvent.click(messageToggle);
+    expect(screen.getByTestId("error-disclosure-icon")).not.toHaveClass("rotate-90");
+    expect(screen.queryByText("Expand for details")).toBeNull();
   });
 
-  it("restores the status icon after pointer expand, collapse, and mouse leave", () => {
+  it("expand and collapse toggle correctly via pointer clicks", () => {
     render(
       <ErrorBanner message={TERMINAL_ERROR} source="execution" code="required_terminal_exited" />,
     );
 
     const messageToggle = screen.getByRole("button", { name: /terminal exited unexpectedly/i });
-    fireEvent.mouseEnter(messageToggle);
-    fireEvent.pointerDown(messageToggle);
-    fireEvent.focus(messageToggle);
-    fireEvent.pointerUp(messageToggle);
+    // Expand.
     fireEvent.click(messageToggle);
-    expect(screen.queryByTestId("error-status-icon")).toBeNull();
     expect(screen.getByTestId("error-disclosure-icon")).toHaveClass("rotate-90");
-
-    fireEvent.pointerDown(messageToggle);
-    fireEvent.pointerUp(messageToggle);
+    expect(screen.queryByText("Expand for details")).toBeNull();
+    // Collapse.
     fireEvent.click(messageToggle);
-    expect(screen.queryByTestId("error-status-icon")).toBeNull();
     expect(screen.getByTestId("error-disclosure-icon")).not.toHaveClass("rotate-90");
-
-    fireEvent.mouseLeave(messageToggle);
-    expect(screen.getByTestId("error-status-icon")).toBeInTheDocument();
-    expect(screen.queryByTestId("error-disclosure-icon")).toBeNull();
+    expect(screen.queryByText("Expand for details")).toBeNull();
   });
-
-  it.each([" ", "Enter"])(
-    "refreshes keyboard focus visibility after pointer focus and %j activation",
-    (key) => {
-      render(
-        <ErrorBanner message={TERMINAL_ERROR} source="execution" code="required_terminal_exited" />,
-      );
-
-      const messageToggle = screen.getByRole("button", { name: /terminal exited unexpectedly/i });
-      fireEvent.pointerDown(messageToggle);
-      act(() => messageToggle.focus());
-      fireEvent.pointerUp(messageToggle);
-      fireEvent.mouseLeave(messageToggle);
-      expect(screen.getByTestId("error-status-icon")).toBeInTheDocument();
-
-      fireEvent.keyDown(messageToggle, { key });
-      expect(screen.queryByTestId("error-status-icon")).toBeNull();
-      expect(screen.getByTestId("error-disclosure-icon")).not.toHaveClass("rotate-90");
-      fireEvent.click(messageToggle);
-      expect(screen.getByTestId("error-disclosure-icon")).toHaveClass("rotate-90");
-
-      fireEvent.keyDown(messageToggle, { key });
-      fireEvent.click(messageToggle);
-      expect(screen.queryByTestId("error-status-icon")).toBeNull();
-      expect(screen.getByTestId("error-disclosure-icon")).not.toHaveClass("rotate-90");
-
-      act(() => messageToggle.blur());
-      expect(screen.getByTestId("error-status-icon")).toBeInTheDocument();
-      expect(screen.queryByTestId("error-disclosure-icon")).toBeNull();
-    },
-  );
 
   it("replaces the full banner during recovery and restores it after failure", async () => {
     let rejectRetry: ((error: Error) => void) | undefined;
@@ -163,7 +125,7 @@ describe("ErrorBanner", () => {
       />,
     );
 
-    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    fireEvent.click(screen.getByRole("button", { name: "Resume session" }));
     const reconnecting = screen.getByTestId("error-reconnecting");
     const status = screen.getByRole("status");
     expect(screen.queryByTestId("error-headline")).toBeNull();
@@ -177,17 +139,19 @@ describe("ErrorBanner", () => {
     expect(status).toHaveAttribute("aria-live", "polite");
     expect(status).toHaveAttribute("aria-atomic", "true");
     expect(status).toHaveClass("rounded-xl", "border-border", "bg-background");
-    expect(screen.queryByRole("button", { name: "Retry" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Resume session" })).toBeNull();
     expect(screen.queryByRole("button", { name: "Dismiss error message" })).toBeNull();
     expect(screen.queryByText("Message")).toBeNull();
     expect(screen.queryByRole("button", { name: "View diagnostics" })).toBeNull();
-    expect(screen.queryByTestId("error-status-icon")).toBeNull();
+    expect(screen.queryByTestId("error-disclosure-icon")).toBeNull();
 
     await act(async () => rejectRetry?.(new Error("Host is still offline")));
     expect(screen.getByTestId("error-headline")).toBeInTheDocument();
     expect(screen.queryByTestId("error-reconnecting")).toBeNull();
-    expect(screen.getByRole("status")).toHaveTextContent("Retry failed: Host is still offline");
-    expect(screen.getByTestId("error-status-icon")).toBeInTheDocument();
+    expect(screen.getByRole("status")).toHaveTextContent(
+      "Resume session failed: Host is still offline",
+    );
+    expect(screen.getByTestId("error-disclosure-icon")).toBeInTheDocument();
   });
 
   it("matches the prototype pill structure and diagnostics treatment", () => {
@@ -282,6 +246,170 @@ describe("ErrorBanner", () => {
     expect(screen.getByTestId("error-message-content")).toHaveTextContent(
       "Try this: Run the host as a non-root user (uid != 0).",
     );
+    expect(screen.queryByRole("button", { name: "Copy recovery command" })).toBeNull();
+  });
+
+  it("copies structured provider recovery commands without diagnostics", async () => {
+    const remediation = "ucode configure";
+    render(
+      <ErrorBanner
+        message="Provider authentication required."
+        source="harness"
+        code="PROVIDER_AUTH_REQUIRED"
+        title="Databricks authentication required"
+        cause="Databricks authentication is missing or expired."
+        remediation={remediation}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: /Databricks authentication required/i }));
+    fireEvent.click(screen.getByRole("button", { name: "Copy recovery command" }));
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "Recovery command copied" })).toBeTruthy(),
+    );
+    expect(copyText).toHaveBeenLastCalledWith(remediation);
+  });
+
+  it.each([
+    ["databricks_sign_in_pending", "The agent is waiting for a Databricks sign-in."],
+    ["agent_startup_pending", "The agent is still starting in the session terminal."],
+    ["codex_thread_not_started", "Codex stopped before it could start, so this turn never ran."],
+  ])("describes a %s failure in plain English", (code, sentence) => {
+    render(<ErrorBanner message="raw diagnostics" source="execution" code={code} />);
+    expect(screen.getByText(sentence)).toBeInTheDocument();
+  });
+
+  const SIGN_IN_REMEDIATION =
+    "Open the sign-in link and sign in. " +
+    "Codex continues on its own once the sign-in completes; then send your message again.";
+
+  function renderSignInCard() {
+    render(
+      <ErrorBanner
+        message="Codex is waiting for a sign-in in this session's terminal."
+        source="harness"
+        code="databricks_sign_in_pending"
+        title="Codex can't start until you sign in to Databricks"
+        remediation={SIGN_IN_REMEDIATION}
+      />,
+    );
+  }
+
+  it("offers the sign-in action by failure code, with no stored link or code", () => {
+    // The card text carries no address: the link is a one-time URL bound to the
+    // launcher process, so the button fetches the live one from the host.
+    useChatStore.setState({ conversationId: null });
+    const open = vi.spyOn(window, "open").mockReturnValue(null);
+    renderSignInCard();
+    expect(screen.getByRole("button", { name: "Open sign-in link" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /Copy code/ })).not.toBeInTheDocument();
+    // Without a live session there is nothing to fetch, and nothing to open.
+    fireEvent.click(screen.getByRole("button", { name: "Open sign-in link" }));
+    expect(open).not.toHaveBeenCalled();
+    expect(screen.getByTestId("error-sign-in-note")).toHaveTextContent(
+      "Open this session to fetch the current sign-in link.",
+    );
+    // The actions sit on the collapsed face and must not toggle the pill open.
+    expect(screen.queryByText("Message")).not.toBeInTheDocument();
+    open.mockRestore();
+  });
+
+  it("asks the host for the live sign-in link before opening it", async () => {
+    // The saved link belongs to the launcher process that printed it and goes
+    // stale once that process moves on, so the click fetches the current one.
+    useChatStore.setState({ conversationId: "conv_live" });
+    const tab = { location: { href: "" }, close: vi.fn(), opener: window as Window | null };
+    const open = vi.spyOn(window, "open").mockReturnValue(tab as unknown as Window);
+    vi.mocked(getSessionSignInLink).mockResolvedValue({
+      pending: true,
+      url: "https://signin.example.com/device?fresh=1",
+      code: "ZZ99-FRSH",
+    });
+    renderSignInCard();
+    fireEvent.click(screen.getByRole("button", { name: "Open sign-in link" }));
+    await waitFor(() =>
+      expect(tab.location.href).toBe("https://signin.example.com/device?fresh=1"),
+    );
+    // The sign-in page must not be able to navigate this tab.
+    expect(tab.opener).toBeNull();
+    expect(getSessionSignInLink).toHaveBeenCalledWith("conv_live");
+    // The tab was pre-opened in the click, so the navigation is not a popup.
+    expect(open).toHaveBeenCalledWith("", "_blank");
+    expect(screen.getByRole("button", { name: "Copy code ZZ99-FRSH" })).toBeInTheDocument();
+    open.mockRestore();
+    useChatStore.setState({ conversationId: null });
+  });
+
+  it("shows a completed sign-in notice's line without expanding it", () => {
+    render(
+      <ErrorBanner
+        message="Codex is ready. Send your message again."
+        source="harness"
+        code="databricks_sign_in_completed"
+        title="Signed in to Databricks"
+        level="info"
+      />,
+    );
+    expect(screen.getByTestId("error-headline")).toHaveTextContent("Signed in to Databricks");
+    expect(screen.getByTestId("error-notice-body")).toHaveTextContent(
+      "Codex is ready. Send your message again.",
+    );
+    expect(screen.queryByRole("button", { name: "Open sign-in link" })).toBeNull();
+  });
+
+  it("explains when no sign-in is pending any more instead of opening a dead link", async () => {
+    useChatStore.setState({ conversationId: "conv_live" });
+    const tab = { location: { href: "" }, close: vi.fn() };
+    const open = vi.spyOn(window, "open").mockReturnValue(tab as unknown as Window);
+    // A first click found a prompt with a code; the sign-in then completed.
+    vi.mocked(getSessionSignInLink).mockResolvedValueOnce({
+      pending: true,
+      url: "https://signin.example.com/device?fresh=1",
+      code: "ZZ99-FRSH",
+    });
+    renderSignInCard();
+    fireEvent.click(screen.getByRole("button", { name: "Open sign-in link" }));
+    await screen.findByRole("button", { name: "Copy code ZZ99-FRSH" });
+    tab.location.href = "";
+    vi.mocked(getSessionSignInLink).mockResolvedValue({ pending: false, url: null, code: null });
+    fireEvent.click(screen.getByRole("button", { name: "Open sign-in link" }));
+    await waitFor(() => expect(tab.close).toHaveBeenCalled());
+    // The obsolete code is gone along with the prompt.
+    expect(screen.queryByRole("button", { name: "Copy code ZZ99-FRSH" })).toBeNull();
+    expect(screen.getByTestId("error-sign-in-note")).toHaveTextContent(
+      "No sign-in is pending in the terminal any more. Try sending your message again.",
+    );
+    expect(tab.location.href).toBe("");
+    open.mockRestore();
+    useChatStore.setState({ conversationId: null });
+  });
+
+  it("links addresses inside the expanded remediation text", () => {
+    render(
+      <ErrorBanner
+        message="raw diagnostics"
+        source="harness"
+        code="databricks_sign_in_pending"
+        remediation="Open https://signin.example.com/device and enter code HQ7M-2KPD."
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: /waiting for a Databricks sign-in/i }));
+    const content = screen.getByTestId("error-message-content");
+    expect(within(content).getByRole("link")).toHaveAttribute(
+      "href",
+      "https://signin.example.com/device",
+    );
+  });
+
+  it("shows no sign-in actions for failures that are not a pending sign-in", () => {
+    render(
+      <ErrorBanner
+        message="raw diagnostics"
+        source="harness"
+        code="agent_startup_pending"
+        remediation="Finish any sign-in shown in the session terminal, then send your message again."
+      />,
+    );
+    expect(screen.queryByTestId("error-remediation-actions")).not.toBeInTheDocument();
   });
 
   it("separates terminal diagnostics and last output into tabs", () => {
@@ -336,6 +464,19 @@ describe("ErrorBanner", () => {
     expect(screen.queryByRole("button", { name: "View diagnostics" })).toBeNull();
   });
 
+  it("names an undelivered native web message in the headline", () => {
+    render(
+      <ErrorBanner
+        message="Claude Code never recorded this message in its transcript before accepting a later one, so it was not delivered."
+        source="execution"
+        code="native_prompt_not_recorded"
+      />,
+    );
+    expect(screen.getByTestId("error-headline")).toHaveTextContent(
+      "Message not delivered. Try sending it again.",
+    );
+  });
+
   it("dismisses only the visible banner", () => {
     render(
       <div>
@@ -373,8 +514,8 @@ describe("ErrorBanner", () => {
     fireEvent.click(pill);
     expect(toggle).toHaveAttribute("aria-expanded", "false");
 
-    // Retry starts recovery instead of toggling; dismiss removes the banner.
-    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    // Resume starts recovery instead of toggling; dismiss removes the banner.
+    fireEvent.click(screen.getByRole("button", { name: "Resume session" }));
     expect(onRetry).toHaveBeenCalledTimes(1);
     expect(screen.getByTestId("error-reconnecting")).toBeInTheDocument();
     await act(async () => resolveRetry?.());
@@ -399,7 +540,7 @@ describe("ErrorBanner", () => {
     );
     fireEvent.click(screen.getByRole("button", { name: /terminal exited unexpectedly/i }));
     expect(screen.getByText("Message")).toBeInTheDocument();
-    const retry = screen.getByRole("button", { name: "Retry" });
+    const retry = screen.getByRole("button", { name: "Resume session" });
     act(() => {
       retry.click();
       retry.click();
@@ -425,11 +566,13 @@ describe("ErrorBanner", () => {
         onRetry={onRetry}
       />,
     );
-    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    fireEvent.click(screen.getByRole("button", { name: "Resume session" }));
     await waitFor(() =>
-      expect(screen.getByRole("status")).toHaveTextContent("Retry failed: Host is still offline"),
+      expect(screen.getByRole("status")).toHaveTextContent(
+        "Resume session failed: Host is still offline",
+      ),
     );
-    expect(screen.getByRole("button", { name: "Retry" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Resume session" })).toBeEnabled();
     expect(screen.getByRole("button", { name: "Dismiss error message" })).toHaveFocus();
     // The retry-error status row must not toggle the pill when clicked.
     fireEvent.click(screen.getByRole("status"));
@@ -449,6 +592,113 @@ describe("ErrorBanner", () => {
     );
     expect(screen.queryByRole("button", { name: "Retry" })).toBeNull();
   });
+
+  it("keeps causally related error messages in order inside one expanded banner", () => {
+    render(
+      <ErrorBanner
+        message="The session runner stopped."
+        source="execution"
+        code="required_terminal_exited"
+        relatedErrors={[
+          {
+            itemId: "related-1",
+            message: "Harness cleanup failed.\n\nLifecycle diagnostics:\ncleanup: exit 1",
+            source: "execution",
+            code: "runner_error",
+          },
+          {
+            itemId: "related-2",
+            message: "Runner disconnected.\n\nTerminal diagnostics:\ntunnel: closed",
+            source: "execution",
+            code: "runner_disconnected",
+          },
+        ]}
+      />,
+    );
+
+    expect(screen.getAllByTestId("error-pill")).toHaveLength(1);
+    fireEvent.click(screen.getByRole("button", { name: /terminal exited unexpectedly/i }));
+    expect(screen.getByText("Related errors (2)")).toBeInTheDocument();
+    expect(screen.getAllByTestId("related-error-content").map((node) => node.textContent)).toEqual([
+      "Harness cleanup failed.\n\nLifecycle diagnostics:\ncleanup: exit 1",
+      "Runner disconnected.\n\nTerminal diagnostics:\ntunnel: closed",
+    ]);
+  });
+
+  it("offers recovery from a retryable related disconnect", async () => {
+    const onRetry = vi.fn(async () => {});
+    const relatedDisconnect = {
+      itemId: "related-disconnect",
+      message: "Runner disconnected.",
+      source: "execution",
+      code: "runner_disconnected",
+    };
+    render(
+      <ErrorBanner
+        itemId="primary-error"
+        message="The runner failed."
+        source="execution"
+        code="runner_error"
+        relatedErrors={[relatedDisconnect]}
+        onRetry={onRetry}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Resume session" }));
+    await waitFor(() => expect(onRetry).toHaveBeenCalledWith(relatedDisconnect));
+  });
+
+  it("retries classified rate-limit errors and preserves the provider's details", async () => {
+    let resolveRetry: (() => void) | undefined;
+    const onRetry = vi.fn(
+      () =>
+        new Promise<void>((resolve) => {
+          resolveRetry = resolve;
+        }),
+    );
+    render(
+      <ErrorBanner
+        message={RATE_LIMIT_ERROR}
+        source="llm"
+        code="rate_limit_exceeded"
+        onRetry={onRetry}
+      />,
+    );
+
+    expect(screen.getByTestId("error-headline")).toHaveTextContent(
+      "The model's rate limit was reached. You can retry this turn.",
+    );
+    fireEvent.click(screen.getByRole("button", { name: /model's rate limit was reached/i }));
+    expect(screen.getByTestId("error-message-content")).toHaveTextContent(RATE_LIMIT_ERROR);
+
+    const retry = screen.getByRole("button", { name: "Retry" });
+    act(() => {
+      retry.click();
+      retry.click();
+    });
+    expect(onRetry).toHaveBeenCalledTimes(1);
+    expect(screen.getByRole("status")).toHaveTextContent(/^Retrying$/);
+    expect(screen.queryByRole("button", { name: "Retry" })).toBeNull();
+
+    await act(async () => resolveRetry?.());
+    expect(screen.queryByRole("status")).toBeNull();
+    expect(screen.queryByTestId("error-headline")).toBeNull();
+  });
+
+  it("does not offer rate-limit retry without a handler", () => {
+    render(<ErrorBanner message={RATE_LIMIT_ERROR} source="llm" code="rate_limit_exceeded" />);
+    expect(screen.queryByRole("button", { name: "Retry" })).toBeNull();
+  });
+
+  it.each(["native_turn_error", "codex_turn_error", "codex_reauth_required", "unauthorized"])(
+    "does not infer rate-limit retry from the message for code %s",
+    (code) => {
+      render(
+        <ErrorBanner message={RATE_LIMIT_ERROR} source="execution" code={code} onRetry={vi.fn()} />,
+      );
+      expect(screen.queryByRole("button", { name: "Retry" })).toBeNull();
+    },
+  );
 
   it.each(["executor_error", "connection_error", "runner_error", "wrong_replica"])(
     "does not offer reconnect for live-runner code %s",
@@ -590,6 +840,43 @@ describe("routing decision — harness / scope / raw pick", () => {
       expect(screen.getByTestId("routing-decision-scope")).toHaveTextContent(badge);
     }
   });
+
+  // A shared type or rationale cannot identify the work a decision governs.
+  it("card: names the task the decision governed, in place of the shared type row", () => {
+    render(
+      <RoutingDecisionCard
+        model="databricks-claude-sonnet-4-6"
+        applied={false}
+        rationale="Routing unavailable; spawn allowed unchanged"
+        agent="general-purpose"
+        routing={{ scope: "native_subagent", taskDescription: "Research auth flows" }}
+      />,
+    );
+    expect(screen.getByTestId("routing-decision-task")).toHaveTextContent("Research auth flows");
+    // The shared type stays visible on the scope badge.
+    expect(screen.getByTestId("routing-decision-scope")).toHaveTextContent(
+      "subagent: general-purpose",
+    );
+    fireEvent.click(screen.getByTestId("routing-decision-raw-toggle"));
+    expect(screen.getByText(/"task_description": "Research auth flows"/)).toBeInTheDocument();
+  });
+
+  it.each([undefined, "", " \t\n"])(
+    "card: an unlabeled spawn (%j) keeps the agent row label",
+    (taskDescription) => {
+      render(
+        <RoutingDecisionCard
+          model="databricks-claude-sonnet-4-6"
+          applied={false}
+          rationale="x"
+          agent="general-purpose"
+          routing={{ scope: "native_subagent", taskDescription }}
+        />,
+      );
+      expect(screen.queryByTestId("routing-decision-task")).toBeNull();
+      expect(screen.getByTestId("routing-decision-card")).toHaveTextContent("general-purpose");
+    },
+  );
 
   // The router's vocabulary pick may have had no endpoint and been mapped to a
   // servable id — that must be visible. When it resolves to the same short
@@ -764,15 +1051,15 @@ describe("ErrorBanner — info level", () => {
       "Codex hit an error reloading the earlier transcript, so it started a fresh thread.",
     );
     expect(screen.getByTestId("error-headline")).not.toHaveClass("text-destructive");
-    const icon = screen.getByTestId("error-status-icon");
-    expect(icon).toHaveClass("lucide-info");
-    expect(icon).not.toHaveClass("text-destructive");
+    // Disclosure chevron is always shown; destructive styling is on the headline, not the icon.
+    expect(screen.getByTestId("error-disclosure-icon")).toBeInTheDocument();
+    expect(screen.getByTestId("error-disclosure-icon")).not.toHaveClass("text-destructive");
     expect(screen.getByRole("button", { name: "Dismiss notice" })).toBeInTheDocument();
   });
 
   it("keeps the destructive pill as the default level", () => {
     render(<ErrorBanner message="boom" source="execution" code="runner_error" />);
     expect(screen.getByTestId("error-pill")).toHaveAttribute("data-level", "error");
-    expect(screen.getByTestId("error-status-icon")).toHaveClass("text-destructive");
+    expect(screen.getByTestId("error-headline")).toHaveClass("text-destructive");
   });
 });

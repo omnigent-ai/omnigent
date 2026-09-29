@@ -91,6 +91,39 @@ async def test_repost_without_source_id_keeps_legacy_behavior(
     assert await _message_texts(client, session_id) == ["legacy", "legacy"]
 
 
+async def test_reposted_batch_persists_each_item_once_in_order(
+    client: httpx.AsyncClient,
+) -> None:
+    # A forwarder re-posts a timed-out batch whose prefix already committed; the
+    # run's single append must dedupe item by item and keep the batch order.
+    session_id = await _create_session(client, "idem-batch")
+    batch = [
+        {
+            "type": "external_conversation_item",
+            "data": {
+                "item_type": "message",
+                "item_data": {
+                    "role": "assistant",
+                    "content": [{"type": "input_text", "text": f"part {i}"}],
+                    "agent": "worker",
+                },
+                "response_id": "resp_claude_echo",
+                "source_id": f"rec-{i}:0:message",
+            },
+        }
+        for i in range(5)
+    ]
+    first = await client.post(f"/v1/sessions/{session_id}/events", json=batch[:3])
+    second = await client.post(f"/v1/sessions/{session_id}/events", json=batch)
+    assert first.status_code in (200, 201, 202), first.text
+    assert second.status_code in (200, 201, 202), second.text
+    first_ids = [ack["item_id"] for ack in first.json()]
+    second_ids = [ack["item_id"] for ack in second.json()]
+    assert second_ids[:3] == first_ids
+    assert len(set(second_ids)) == 5
+    assert await _message_texts(client, session_id) == [f"part {i}" for i in range(5)]
+
+
 async def test_duplicate_repost_restores_the_drained_pending_input(
     client: httpx.AsyncClient,
 ) -> None:

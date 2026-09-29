@@ -23,9 +23,9 @@ def _open_appearance(page: Page, base_url: str) -> None:
     )
 
 
-def test_export_import_buttons_are_visible(page: Page, seeded_session: tuple[str, str]) -> None:
+def test_export_import_buttons_are_visible(page: Page, live_server: str) -> None:
     """The Export and Import buttons render next to Reset to defaults."""
-    base_url, _session_id = seeded_session
+    base_url = live_server
     _open_appearance(page, base_url)
 
     expect(page.get_by_test_id("export-settings-button")).to_be_visible()
@@ -33,9 +33,9 @@ def test_export_import_buttons_are_visible(page: Page, seeded_session: tuple[str
     expect(page.get_by_test_id("reset-appearance-button")).to_be_visible()
 
 
-def test_import_dialog_opens_and_closes(page: Page, seeded_session: tuple[str, str]) -> None:
+def test_import_dialog_opens_and_closes(page: Page, live_server: str) -> None:
     """Clicking Import opens the import dialog with a file chooser."""
-    base_url, _session_id = seeded_session
+    base_url = live_server
     _open_appearance(page, base_url)
 
     page.get_by_test_id("import-settings-button").click()
@@ -47,9 +47,9 @@ def test_import_dialog_opens_and_closes(page: Page, seeded_session: tuple[str, s
     expect(page.get_by_role("dialog", name="Import settings")).to_have_count(0)
 
 
-def test_settings_persist_to_localstorage(page: Page, seeded_session: tuple[str, str]) -> None:
+def test_settings_persist_to_localstorage(page: Page, live_server: str) -> None:
     """Changing appearance settings writes to localStorage for export."""
-    base_url, _session_id = seeded_session
+    base_url = live_server
     _open_appearance(page, base_url)
 
     # Change several appearance preferences away from defaults.
@@ -69,11 +69,9 @@ def test_settings_persist_to_localstorage(page: Page, seeded_session: tuple[str,
     assert terminal_theme == "dark"  # Stored as plain string
 
 
-def test_import_restores_localstorage_settings(
-    page: Page, seeded_session: tuple[str, str]
-) -> None:
+def test_import_restores_localstorage_settings(page: Page, live_server: str) -> None:
     """Writing settings to localStorage (simulating import) restores UI state."""
-    base_url, _session_id = seeded_session
+    base_url = live_server
     _open_appearance(page, base_url)
 
     # Step 1: Set preferences and capture them.
@@ -119,15 +117,13 @@ def test_import_restores_localstorage_settings(
     expect(page.get_by_test_id("terminal-theme-dark")).to_have_attribute("aria-checked", "true")
 
 
-def test_export_and_import_preserve_theme_mode(
-    page: Page, seeded_session: tuple[str, str]
-) -> None:
+def test_export_and_import_preserve_theme_mode(page: Page, live_server: str) -> None:
     """The web-theme key (next-themes) is included in export/import.
 
     Note: next-themes stores the value as a plain string (e.g. 'dark'), not
     JSON-stringified like other settings.
     """
-    base_url, _session_id = seeded_session
+    base_url = live_server
     _open_appearance(page, base_url)
 
     # Set theme to dark.
@@ -153,9 +149,9 @@ def test_export_and_import_preserve_theme_mode(
     expect(page.get_by_test_id("theme-dark")).to_have_attribute("aria-checked", "true")
 
 
-def test_import_rejects_invalid_json(page: Page, seeded_session: tuple[str, str]) -> None:
+def test_import_rejects_invalid_json(page: Page, live_server: str) -> None:
     """Import shows error when uploaded file contains invalid JSON or structure."""
-    base_url, _session_id = seeded_session
+    base_url = live_server
     _open_appearance(page, base_url)
 
     # Open import dialog.

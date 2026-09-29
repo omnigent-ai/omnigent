@@ -68,6 +68,8 @@ export interface ResponseCompleted {
 export interface ResponseFailed {
   type: "response_failed";
   response: Response;
+  /** Where the failure originated, when supplied by the server. */
+  source?: string;
 }
 
 /** `response.incomplete` — stopped early. */
@@ -254,6 +256,13 @@ export interface ElicitationRequest {
    */
   allowAllEdits?: boolean;
   /**
+   * Producer-supplied extra (eligible claude-native tool prompts): when
+   * true, the ApprovalCard offers "Approve & switch to auto mode" —
+   * accepting with ``allow_auto_mode`` echoes a session-scoped
+   * ``setMode(auto)`` in the hook decision.
+   */
+  allowAutoMode?: boolean;
+  /**
    * Producer-supplied extra (claude-native non-edit tool prompts only):
    * present when the PermissionRequest endpoint is gating a tool that
    * supports a persistent "don't ask again" allow rule (everything
@@ -283,6 +292,20 @@ export interface ElicitationRequest {
 export interface ElicitationResolved {
   type: "elicitation_resolved";
   elicitationId: string;
+  /**
+   * Verdict the prompt was resolved with, when the server knows it
+   * (answered on another surface: native terminal popup, another tab,
+   * the approve page). Absent when the resolution carried no verdict,
+   * e.g. a tool-result auto-resolve.
+   */
+  action?: "accept" | "decline" | "cancel";
+  /**
+   * Why the prompt resolved without a verdict, when the server knows:
+   * `"unanswered"` means the hook stopped waiting (a severed poll never
+   * re-parked, the ask timed out) before anyone answered, so the prompt
+   * is gone rather than decided. Never present alongside `action`.
+   */
+  reason?: "unanswered";
 }
 
 /** A provider-native tool output (web_search, mcp, etc.). */
@@ -299,6 +322,24 @@ export interface NativeToolCall {
 export interface MessageDone {
   type: "message_done";
   content: Record<string, unknown>[];
+  itemId: string;
+  responseId: string;
+  /** Native live-preview stream finalized by this item. */
+  messageId?: string;
+}
+
+/**
+ * A persisted reasoning item from `output_item.done` (type `reasoning`).
+ * Produced with no preceding reasoning deltas by native transcript
+ * mirrors (e.g. claude-native thinking blocks); delta-streaming
+ * harnesses may also publish it after the streamed section.
+ */
+export interface ReasoningDone {
+  type: "reasoning_done";
+  /** Joined raw reasoning text from the item's `content` blocks. */
+  text: string;
+  /** Joined summary text from the item's `summary` blocks. */
+  summary: string;
   itemId: string;
   responseId: string;
 }
@@ -847,20 +888,6 @@ export interface SessionTerminalActivityEvent {
 }
 
 /**
- * `session.skills` — the session's runner-owned skills just resolved
- * (the server's background fetch populated its per-session skills cache).
- * Skills are fetched off the snapshot hot path, so the snapshot serves
- * an empty list until the fetch lands; this event is the "skills are
- * ready, re-read the snapshot" nudge. Consumers refetch the session
- * snapshot and apply its now-populated `skills` to fill the composer's
- * slash-command menu. Carries no payload beyond the conversation id.
- */
-export interface SessionSkillsEvent {
-  type: "session_skills";
-  conversationId: string;
-}
-
-/**
  * `session.model_options` — a runner-owned native model catalog just resolved.
  * Consumers refetch the session snapshot and apply its now-populated options.
  */
@@ -913,6 +940,25 @@ export interface SessionSupersededEvent {
 }
 
 /**
+ * `session.btw_sidechat` — a transient side-chat answer from `/btw` command.
+ *
+ * Broadcast-only (never persisted, no SSE replay). The answer appears in a
+ * dismissable overlay near the composer — not as a persisted message — and
+ * Escape closes it. Nothing persists; a reload drops it.
+ */
+export interface SessionBtwSidechatEvent {
+  type: "session_btw_sidechat";
+  /** The conversation this side-chat was spawned in. */
+  conversationId: string;
+  /** The original `/btw` question text. */
+  question: string;
+  /** The assistant's answer. */
+  answer: string;
+  /** True when the answer was truncated (user should check the terminal for full response). */
+  truncated: boolean;
+}
+
+/**
  * `browser.action_request` — the agent's `browser_*` tool asks the desktop shell
  * to run a browser action against this conversation's WebContentsView. Every
  * renderer sees the event, but the relay (`useBrowserAgentRelay`) claims it first
@@ -950,6 +996,7 @@ export type StreamEvent =
   | RoutingDecision
   | TerminalCommandEvent
   | MessageDone
+  | ReasoningDone
   | OutputFileDone
   | RetryEvent
   | ErrorEvent
@@ -982,7 +1029,7 @@ export type StreamEvent =
   | SessionChildSessionUpdatedEvent
   | SessionChangedFilesInvalidatedEvent
   | SessionTerminalActivityEvent
-  | SessionSkillsEvent
   | SessionModelOptionsEvent
   | SessionPresenceEvent
+  | SessionBtwSidechatEvent
   | BrowserActionRequestEvent;

@@ -41,6 +41,7 @@ Usage::
 from __future__ import annotations
 
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -52,6 +53,7 @@ import pytest
 from omnigent.inner.bwrap_sandbox import BwrapSandboxBackend
 from omnigent.inner.codex_executor import _CodexAppServerSession
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+from omnigent.inner.os_env import create_os_environment
 from tests.e2e._harness_probes import cli_unavailable_reason
 
 pytestmark = [
@@ -82,6 +84,8 @@ def _bwrap_namespace_unavailable() -> str | None:
     :returns: ``None`` when a trivial bwrap namespace spawns, else the
         first stderr line explaining why it cannot.
     """
+    if not sys.platform.startswith("linux") or shutil.which("bwrap") is None:
+        return "Linux with bubblewrap is required"
     probe = subprocess.run(
         ["bwrap", "--ro-bind", "/", "/", "true"],
         capture_output=True,
@@ -407,6 +411,80 @@ async def test_manifest_skill_readable_through_real_bwrap_namespace(tmp_path: Pa
             f"sandboxed read of the manifest SKILL.md returned no skill body: {proc.stdout!r}"
         )
     finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(
+    _bwrap_namespace_unavailable() is not None,
+    reason=f"cannot execute bwrap namespaces here: {_bwrap_namespace_unavailable()}",
+)
+async def test_manifest_skill_readable_through_cached_os_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Repeated real file and shell tools expose skills read-only, never credentials."""
+    host_home = tmp_path / "host-home"
+    host_home.mkdir()
+    monkeypatch.setenv("HOME", str(host_home))
+    monkeypatch.setenv("CODEX_HOME", str(host_home / ".codex"))
+    workspace, bundle = _build_workspace_and_bundle(tmp_path)
+    session = await _stage_codex_session(workspace, bundle)
+    os_env = None
+    try:
+        codex_home = session._codex_home_dir
+        assert codex_home is not None
+        manifest = codex_home / "skills" / _SKILL_NAME / "SKILL.md"
+        body = manifest.read_text()
+        auth = codex_home / "auth.json"
+        auth.write_text('{"OPENAI_API_KEY": "test-only-credential"}')
+        os_env = create_os_environment(
+            OSEnvSpec(
+                type="caller_process",
+                cwd=str(workspace),
+                sandbox=OSEnvSandboxSpec(
+                    type="linux_bwrap",
+                    cwd_allow_hidden=[".git"],
+                    write_paths=["."],
+                    # Editable test installs need their package source visible;
+                    # this grants neither the bundle nor the staged home.
+                    read_paths=[str(Path(__file__).resolve().parents[2])],
+                ),
+            )
+        )
+        assert os_env is not None
+
+        read_result = await os_env.read(str(manifest))
+        assert "error" not in read_result, read_result
+        assert _SKILL_MARKER in str(read_result.get("content", ""))
+        shell_read = await os_env.shell(shlex.join(["cat", str(manifest)]), timeout=30)
+        assert shell_read.get("exit_code") == 0, shell_read
+        assert _SKILL_MARKER in str(shell_read.get("stdout", ""))
+
+        auth_read = await os_env.read(str(auth))
+        assert "error" in auth_read, auth_read
+        auth_shell = await os_env.shell(shlex.join(["cat", str(auth)]), timeout=30)
+        assert auth_shell.get("exit_code") not in (None, 0), auth_shell
+        assert "test-only-credential" not in str(auth_shell.get("stdout", ""))
+
+        write_result = await os_env.write(str(manifest), "overwritten")
+        assert "error" in write_result, write_result
+        shell_write = await os_env.shell(
+            f"printf %s overwritten > {shlex.quote(str(manifest))}", timeout=30
+        )
+        assert shell_write.get("exit_code") not in (None, 0), shell_write
+        assert manifest.read_text() == body
+
+        status = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=workspace,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        assert status.stdout.strip() == "", status.stdout
+    finally:
+        if os_env is not None:
+            os_env.close()
         await session.close()
 
 

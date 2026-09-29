@@ -207,13 +207,15 @@ def test_routed_session_config_modal_names_the_routed_model(
     gear = page.get_by_test_id("composer-config-gear")
     expect(gear).to_be_visible(timeout=15_000)
     gear.click()
+    page.get_by_test_id("composer-agent-edit").click()
 
-    model_row = page.get_by_test_id("composer-config-model")
+    model_row = page.get_by_test_id("composer-agent-models")
     expect(model_row).to_be_visible()
     expect(model_row).to_contain_text(_ROUTED_MODEL)
 
     # The row also OFFERS it, alongside the harness's own aliases — a pinned
     # model that no option declares is what rendered blank.
-    model_row.click()
-    expect(page.locator(f'[role="option"][data-model-id="{_ROUTED_MODEL}"]')).to_have_count(1)
-    expect(page.locator('[role="option"][data-model-id="sonnet"]')).to_have_count(1)
+    expect(
+        page.locator(f'[role="menuitemcheckbox"][data-model-id="{_ROUTED_MODEL}"]')
+    ).to_have_count(1)
+    expect(page.locator('[role="menuitemcheckbox"][data-model-id="sonnet"]')).to_have_count(1)

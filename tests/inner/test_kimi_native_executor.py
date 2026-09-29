@@ -39,6 +39,7 @@ from omnigent.inner.kimi_native_executor import (
     _content_to_text,
     _latest_user_text,
 )
+from omnigent.inner.native_attachments import attachment_cache_dir
 from omnigent.llms.errors import RetryableLLMError
 
 _FIXTURE_DIR = Path(__file__).parents[1] / "fixtures" / "kimi_native"
@@ -71,7 +72,7 @@ class TestContentExtraction:
         )
         out = _content_to_text([{"type": "input_image", "image_url": png}], tmp_path)
         assert out.startswith("[Attached: ")
-        assert str(tmp_path) in out
+        assert str(attachment_cache_dir(tmp_path)) in out
 
     def test_empty_and_none(self, tmp_path: Path) -> None:
         assert _content_to_text(None, tmp_path) == ""
@@ -768,6 +769,54 @@ class TestUserMessageInjection:
         sent = self._stub_tui(monkeypatch, tmp_path, submit_after_enters=2)
         inject_user_message(tmp_path / "bridge", content="fix the flaky test")
         assert [args[-1] for args in sent if args[-1] == "Enter"] == ["Enter", "Enter"]
+
+    def test_steer_follows_confirmed_submit(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        sent = self._stub_tui(
+            monkeypatch,
+            tmp_path,
+            submit_after_enters=2,
+            content="steer now",
+        )
+        inject_user_message(tmp_path / "bridge", content="steer now", turn_streaming=True)
+        assert [args[-1] for args in sent if args[0] == "send-keys"] == [
+            "Enter",
+            "Enter",
+            "C-s",
+        ]
+        enter_index = max(index for index, args in enumerate(sent) if args[-1] == "Enter")
+        assert sent[enter_index + 1 : enter_index + 2] == [("send-keys", "-t", "main", "C-s")]
+
+    @pytest.mark.parametrize(
+        "injected_error",
+        [
+            pytest.param(RuntimeError("tmux socket disappeared"), id="runtime-error"),
+            pytest.param(OSError("tmux socket disappeared"), id="os-error"),
+        ],
+    )
+    def test_ctrl_s_failure_keeps_submitted_message_delivered(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+        injected_error: RuntimeError | OSError,
+    ) -> None:
+        sent = self._stub_tui(monkeypatch, tmp_path, submit_after_enters=1)
+        run_tmux = kimi_native_bridge._run_tmux
+
+        def _run_tmux(socket_path: str, *args: str) -> None:
+            run_tmux(socket_path, *args)
+            if args == ("send-keys", "-t", "main", "C-s"):
+                raise injected_error
+
+        monkeypatch.setattr(kimi_native_bridge, "_run_tmux", _run_tmux)
+        inject_user_message(tmp_path / "bridge", content="fix the flaky test")
+        assert sent[-2:] == [
+            ("send-keys", "-t", "main", "Enter"),
+            ("send-keys", "-t", "main", "C-s"),
+        ]
+        assert "the message may remain queued until the turn ends" in caplog.text
 
     def test_raises_when_draft_never_submits(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path

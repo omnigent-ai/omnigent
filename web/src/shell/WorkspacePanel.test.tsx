@@ -8,6 +8,7 @@ import type * as UseTerminalsModule from "@/hooks/useTerminals";
 import { useCreateTerminal, useTerminals } from "@/hooks/useTerminals";
 import type { ChangedSort } from "./FlatFileList";
 import type { RightRailTab } from "./railTabs";
+import { writeDefaultWorkspaceTab } from "@/lib/workspaceTabPreferences";
 import { WorkspacePanel } from "./WorkspacePanel";
 
 // The rail's content children are exercised by their own suites; stub them so
@@ -30,8 +31,10 @@ vi.mock("./SubagentsPanel", () => ({
   SubagentsPanel: () => <div data-testid="subagents-stub" />,
 }));
 vi.mock("@/components/BrowserPane/BrowserPane", () => ({
-  BrowserPane: ({ conversationId }: { conversationId: string }) => (
-    <div data-testid="browser-pane-stub">{conversationId}</div>
+  BrowserPane: ({ conversationId, active }: { conversationId: string; active?: boolean }) => (
+    <div data-testid="browser-pane-stub" data-active={String(active)}>
+      {conversationId}
+    </div>
   ),
 }));
 // The rail terminal view mounts a real xterm/WebSocket; stub it to a marker
@@ -90,6 +93,10 @@ function renderWorkspace(
     selectedTerminalKey?: string | null;
     maximized?: boolean;
     liveness?: SessionLiveness;
+    pending?: boolean;
+    open?: boolean;
+    resizing?: boolean;
+    inert?: boolean;
   } = {},
 ) {
   const openFileViewer = vi.fn();
@@ -98,12 +105,21 @@ function renderWorkspace(
   const openTerminalTab = vi.fn();
   const onCloseTerminal = vi.fn();
   const onToggleMaximized = vi.fn();
-  render(
+  const view = render(
     <TooltipProvider delayDuration={0}>
       <WorkspacePanel
         conversationId="conv_ws"
         width={360}
-        handleProps={{ tabIndex: 0 }}
+        open={overrides.open}
+        resizing={overrides.resizing}
+        inert={overrides.inert}
+        handleProps={{
+          tabIndex: 0,
+          role: "separator",
+          "aria-label": "Resize panel",
+          onMouseDown: vi.fn(),
+          onKeyDown: vi.fn(),
+        }}
         rightRailTab={overrides.rightRailTab ?? "files"}
         onRightRailTabChange={onRightRailTabChange}
         showFilesPanel
@@ -131,6 +147,7 @@ function renderWorkspace(
         filesPanelShowHidden={false}
         onShowHiddenChange={vi.fn()}
         liveness={overrides.liveness}
+        pending={overrides.pending}
       />
     </TooltipProvider>,
   );
@@ -141,6 +158,7 @@ function renderWorkspace(
     openTerminalTab,
     onCloseTerminal,
     onToggleMaximized,
+    view,
   };
 }
 
@@ -151,6 +169,18 @@ describe("WorkspacePanel surface presentation", () => {
     const panel = screen.getByRole("complementary", { name: "Workspace" });
     expect(panel).toHaveClass("md:border-l", "md:border-border");
     expect(panel).not.toHaveClass("md:m-2", "md:rounded-lg", "md:shadow-lg");
+    expect(panel).toHaveClass("workspace-panel-motion", "md:overflow-hidden");
+    expect(panel).toHaveAttribute("data-state", "open");
+  });
+
+  it("marks the exiting panel closed and disables motion while resizing", () => {
+    renderWorkspace({ open: false, resizing: true, inert: true });
+
+    const panel = document.querySelector('aside[aria-label="Workspace"]');
+    expect(panel).not.toBeNull();
+    expect(panel).toHaveAttribute("data-state", "closed");
+    expect(panel).toHaveAttribute("data-resizing", "true");
+    expect(panel).toHaveAttribute("aria-hidden", "true");
   });
 
   it("presents the fixed pane tabs as compact icon controls with accessible labels", () => {
@@ -165,6 +195,68 @@ describe("WorkspacePanel surface presentation", () => {
     expect(filesTab).not.toHaveAttribute("title");
     expect(changesTab).not.toHaveAttribute("title");
     expect(agentsTab).not.toHaveAttribute("title");
+  });
+
+  it.each([
+    ["files", ["Files", "Changes", "GitHub", "Agents 1", "Browser"]],
+    ["changes", ["Changes", "Files", "GitHub", "Agents 1", "Browser"]],
+    ["github", ["GitHub", "Files", "Changes", "Agents 1", "Browser"]],
+    ["subagents", ["Agents 1", "Files", "Changes", "GitHub", "Browser"]],
+  ] as const)("places the %s default first without reordering the remaining tabs", (tab, order) => {
+    writeDefaultWorkspaceTab(tab);
+    renderWorkspace({ showGithubTab: true, showBrowserTab: true, rightRailTab: "files" });
+
+    expect(screen.getAllByRole("tab").map((item) => item.getAttribute("aria-label"))).toEqual(
+      order,
+    );
+    expect(screen.getByRole("tab", { name: "Files" })).toHaveAttribute("aria-selected", "true");
+  });
+
+  it("moves keyboard focus through the displayed order", async () => {
+    writeDefaultWorkspaceTab("changes");
+    const { onRightRailTabChange } = renderWorkspace({
+      showGithubTab: true,
+      rightRailTab: "changes",
+    });
+
+    fireEvent.keyDown(screen.getByRole("tab", { name: "Changes" }), { key: "ArrowRight" });
+
+    await waitFor(() => expect(screen.getByRole("tab", { name: "Files" })).toHaveFocus());
+    expect(onRightRailTabChange).toHaveBeenCalledWith("files");
+  });
+
+  it("keeps the remaining order when the default tab is unavailable", () => {
+    writeDefaultWorkspaceTab("github");
+    renderWorkspace({ showGithubTab: false });
+
+    expect(screen.getAllByRole("tab").map((tab) => tab.getAttribute("aria-label"))).toEqual([
+      "Files",
+      "Changes",
+      "Agents 1",
+    ]);
+  });
+
+  it("shows inert workspace chrome while a temporary session is pending", () => {
+    renderWorkspace({ pending: true });
+
+    for (const name of ["Files", "Changes", "GitHub", "Agents"]) {
+      expect(screen.getByRole("tab", { name: new RegExp(name) })).toBeDisabled();
+    }
+    expect(screen.getByText("Starting workspace…")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Open new" })).toBeNull();
+    expect(screen.queryByTestId("files-panel-stub")).toBeNull();
+    expect(screen.queryByTestId("file-viewer-stub")).toBeNull();
+    expect(screen.queryByTestId("subagents-stub")).toBeNull();
+    expect(useCreateTerminalMock).not.toHaveBeenCalled();
+    expect(screen.getByRole("button", { name: "Full screen" })).toBeDisabled();
+    expect(screen.getByRole("separator", { name: "Resize panel" })).toHaveAttribute(
+      "aria-disabled",
+      "true",
+    );
+    expect(screen.getByRole("separator", { name: "Resize panel" })).toHaveAttribute(
+      "tabindex",
+      "-1",
+    );
   });
 
   it("has no static Shells nav tab — shells open only as closable soft tabs", () => {
@@ -615,7 +707,9 @@ describe("WorkspacePanel maximize", () => {
   it("shows a full-screen toggle pinned to the right and fires onToggleMaximized", () => {
     const { onToggleMaximized } = renderWorkspace();
 
-    fireEvent.click(screen.getByRole("button", { name: "Full screen" }));
+    const toggle = screen.getByRole("button", { name: "Full screen" });
+    expect(toggle).toHaveClass("text-muted-foreground", "hover:text-foreground");
+    fireEvent.click(toggle);
 
     expect(onToggleMaximized).toHaveBeenCalledTimes(1);
   });
@@ -745,6 +839,12 @@ describe("WorkspacePanel browser tab", () => {
     expect(screen.getByTestId("browser-pane-stub")).toBeInTheDocument();
     // And the file scope views are not mounted in that branch.
     expect(screen.queryByTestId("files-panel-stub")).toBeNull();
+  });
+
+  it("deactivates the browser pane while the persistent rail is closed", () => {
+    renderWorkspace({ showBrowserTab: true, rightRailTab: "browser", open: false, inert: true });
+
+    expect(screen.getByTestId("browser-pane-stub")).toHaveAttribute("data-active", "false");
   });
 
   it("shows an error when a native browser close fails", async () => {

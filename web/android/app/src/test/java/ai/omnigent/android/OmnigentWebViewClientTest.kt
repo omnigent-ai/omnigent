@@ -20,12 +20,19 @@ import org.robolectric.Shadows.shadowOf
 @RunWith(RobolectricTestRunner::class)
 class OmnigentWebViewClientTest {
     @Test
-    fun `page start does not inject into the outgoing document`() {
+    fun `page start notifies the shell without injecting into the outgoing document`() {
         val webView = RecordingWebView(ApplicationProvider.getApplicationContext())
-        val client = client(shouldInjectBridgeAtPageReady = false)
+        var navigationStarts = 0
+        val client =
+            client(
+                shouldInjectBridgeAtPageReady = false,
+                onNavigationStarted = { navigationStarts++ },
+            )
 
         client.onPageStarted(webView, PINNED_URL, null)
+        client.onPageStarted(webView, "about:blank", null)
 
+        assertEquals(1, navigationStarts)
         assertTrue(webView.evaluatedScripts.isEmpty())
     }
 
@@ -328,10 +335,12 @@ class OmnigentWebViewClientTest {
         onLoginRequired: () -> Unit = {},
         onRendererGone: (WebView, Boolean) -> Unit = { _, _ -> },
         onPageReady: (String?) -> Unit = {},
+        onNavigationStarted: () -> Unit = {},
     ) = OmnigentWebViewClient(
         pinnedOrigin = { pinnedOrigin },
         shouldInjectBridgeAtPageReady = { shouldInjectBridgeAtPageReady },
         onPageReady = onPageReady,
+        onNavigationStarted = onNavigationStarted,
         onLoginRequired = onLoginRequired,
         onRendererGone = onRendererGone,
     )

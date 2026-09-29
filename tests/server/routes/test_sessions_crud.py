@@ -8,6 +8,11 @@ the stores.
 
 from __future__ import annotations
 
+import asyncio
+import logging
+import signal
+import sys
+from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import httpx
@@ -16,11 +21,16 @@ import pytest_asyncio
 
 from omnigent.db.utils import generate_agent_id
 from omnigent.entities import USER_SESSION_TITLE_MAX_CHARS
+from omnigent.harnesses.opencode_native.app_server import OpenCodeNativeServer
+from omnigent.runner import create_runner_app
 from omnigent.server.routes import sessions as sessions_module
+from omnigent.spec.types import AgentSpec
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
+from tests.runner.conftest import _FakeProcessManager, _ScriptedHarnessClient
+from tests.runner.helpers import NullServerClient
 
 
 @pytest_asyncio.fixture()
@@ -297,6 +307,95 @@ async def test_delete_session_calls_full_runner_teardown(
     assert deleted_paths == [f"/v1/sessions/{session_id}"], (
         f"server-side delete should call full runner teardown, got: {deleted_paths}"
     )
+
+
+@pytest.mark.posix_only
+async def test_delete_session_reaps_child_that_ignores_sigterm(
+    client: httpx.AsyncClient,
+    session_id: str,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Nested delete deadlines allow forced exit after the full SIGTERM grace period."""
+    ready_file = tmp_path / "child-ready"
+    server = OpenCodeNativeServer(
+        bridge_dir=tmp_path / "bridge",
+        workspace=tmp_path,
+        opencode_path=sys.executable,
+        verify_version=False,
+    )
+    child_code = (
+        "import signal, sys, time\n"
+        "from pathlib import Path\n"
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+        "Path(sys.argv[1]).touch()\n"
+        "time.sleep(60)\n"
+    )
+    monkeypatch.setattr(
+        server, "build_argv", lambda: [sys.executable, "-c", child_code, str(ready_file)]
+    )
+    readiness_started = asyncio.Event()
+
+    async def parked_readiness() -> None:
+        while not ready_file.exists():
+            await asyncio.sleep(0.01)
+        readiness_started.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(server, "_wait_until_ready", parked_readiness)
+
+    async def parked_resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        await server.start()
+        raise AssertionError("startup should be cancelled")
+
+    runner_app = create_runner_app(
+        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
+        spec_resolver=parked_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    runner_transport = httpx.ASGITransport(app=runner_app)
+
+    async def dispatch(request: httpx.Request) -> httpx.Response:
+        # ASGITransport does not enforce HTTP timeouts itself.
+        try:
+            return await asyncio.wait_for(
+                runner_transport.handle_async_request(request),
+                timeout=request.extensions["timeout"]["read"],
+            )
+        except TimeoutError as exc:
+            raise httpx.ReadTimeout("runner cleanup timed out", request=request) from exc
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(dispatch), base_url="http://runner", timeout=30.0
+    ) as runner_client:
+
+        async def get_runner(session_id: str) -> httpx.AsyncClient:
+            return runner_client
+
+        monkeypatch.setattr(sessions_module, "_get_runner_client_for_resource_access", get_runner)
+        create_request = asyncio.create_task(
+            runner_client.post(
+                "/v1/sessions", json={"session_id": session_id, "agent_id": "ag_cleanup"}
+            )
+        )
+        try:
+            await asyncio.wait_for(readiness_started.wait(), timeout=5.0)
+            process = server.process
+            assert process is not None
+            with caplog.at_level(logging.WARNING):
+                response = await client.delete(f"/v1/sessions/{session_id}")
+            assert response.status_code == 200
+            assert process.returncode == -signal.SIGKILL
+            assert server.process is None
+            assert "did not finish within" not in caplog.text
+            assert "Runner cleanup failed" not in caplog.text
+        finally:
+            create_request.cancel()
+            if server.process is not None and server.process.poll() is None:
+                server.process.kill()
+                await asyncio.to_thread(server.process.wait, 5)
+            await asyncio.gather(create_request, return_exceptions=True)
 
 
 # ── PATCH /v1/sessions/{id} ─────────────────────────────────────────
@@ -612,6 +711,29 @@ async def test_patch_rejects_client_supplied_sandbox_labels(
         conv = conv_store.get_conversation(session_id)
         assert conv is not None
         assert key not in conv.labels
+
+
+async def test_patch_rejects_client_supplied_side_chat_thread_id_label(
+    client: httpx.AsyncClient,
+    session_id: str,
+    db_uri: str,
+) -> None:
+    """``omnigent.codex_native.subagent_thread_id`` records the Codex thread a
+    ``/side`` child forwards follow-up turns onto. The server writes it and later
+    re-reads the child's own copy to drive ``turn/start``, so a client seed would
+    redirect another session's follow-up into an attacker-chosen thread. It must
+    be rejected and nothing persisted."""
+    conv_store = SqlAlchemyConversationStore(db_uri)
+
+    resp = await client.patch(
+        f"/v1/sessions/{session_id}",
+        json={"labels": {"omnigent.codex_native.subagent_thread_id": "thread_evil"}},
+        headers={"Content-Type": "application/json"},
+    )
+    assert resp.status_code == 400
+    conv = conv_store.get_conversation(session_id)
+    assert conv is not None
+    assert "omnigent.codex_native.subagent_thread_id" not in conv.labels
 
 
 async def test_patch_rejects_client_supplied_archived_at_label(

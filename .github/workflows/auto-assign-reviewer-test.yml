@@ -11,7 +11,15 @@ on:
     paths:
       - .github/workflows/auto-assign-reviewer.js
       - .github/workflows/auto-assign-reviewer.test.js
+      - .github/workflows/auto-assign-reviewer.yml
+      - .github/workflows/auto-assign-reviewer-test.yml
+      - .github/workflows/areas.test.js
+      - .github/workflows/issue-triage.yml
+      - .github/scripts/issue_triage_assignment_test.py
+      - .github/triage_v2/**
       - .github/areas.json
+      - .github/MAINTAINER
+      - .python-version
   workflow_dispatch:
 
 permissions:
@@ -29,7 +37,19 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
         with:
           persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        with:
+          python-version-file: .python-version
+      - name: Install test dependencies
+        run: python3 -m pip install 'PyYAML==6.0.3' 'pytest==9.0.3'
       - name: Check areas.json integrity
         run: node .github/workflows/areas.test.js
       - name: Run reviewer-assignment unit test
         run: node .github/workflows/auto-assign-reviewer.test.js
+      - name: Test issue-triage assignment guards
+        run: python3 .github/scripts/issue_triage_assignment_test.py
+      - name: Test v2 intake assignment
+        env:
+          PYTHONPATH: .github/triage_v2/src
+        run: python3 -m pytest -c .github/triage_v2/pyproject.toml .github/triage_v2/tests/test_intake.py

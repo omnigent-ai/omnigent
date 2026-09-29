@@ -340,6 +340,15 @@ export function clearRecentlyCreated(): void {
 }
 
 /**
+ * Drop one row from the keep-alive map — e.g. an optimistic unarchive whose
+ * PATCH failed, so the row must stop being re-injected and fall back to
+ * archived. Safe to call for an id that isn't tracked.
+ */
+export function unmarkRecentlyCreated(id: string): void {
+  recentlyCreatedSessions.delete(id);
+}
+
+/**
  * Prepend brand-new rows (a create here or elsewhere, a share) to page 0 so the
  * sidebar shows them the instant the push lands, instead of after the debounced
  * refetch (which lags the search index). A new row sorts newest-first, so page 0
@@ -388,20 +397,18 @@ export function insertNewRowsIntoPages(
   return { data: { ...data, pages: [nextFirst, ...rest] }, inserted: rows };
 }
 
-/**
- * Drop rows with the given ids from one infinite query's cached pages.
- *
- * Page cursors are recomputed from the surviving rows: `last_id` of the
- * final page is the `after=` anchor `fetchNextPage` sends, and a deleted
- * anchor id makes the server's keyset lookup miss (the next page comes
- * back empty). An emptied page gets null cursors — infinite scroll then
- * pauses until the next reconcile refetch rebuilds the pages, which
- * beats paginating from a dead anchor.
- *
- * @param data - The cached infinite data, or `undefined`.
- * @param ids - Conversation ids to remove.
- * @returns The (possibly identical) data and whether anything was removed.
- */
+// Only known legacy row-ID cursors can be repaired after removing their anchor.
+// All other continuation tokens must round-trip unchanged, even on empty pages.
+export function lastIdAfterFiltering(
+  original: ConversationsPage,
+  rows: Conversation[],
+  emptyCursor: string | null = null,
+): string | null {
+  if (!original.data.some((row) => row.id === original.last_id)) return original.last_id;
+  return rows.at(-1)?.id ?? emptyCursor;
+}
+
+/** Drop matching rows while preserving opaque continuation metadata. */
 export function removeIdsFromPages(
   data: ConversationsInfiniteData | undefined,
   ids: Set<string>,
@@ -416,7 +423,7 @@ export function removeIdsFromPages(
       ...page,
       data: nextData,
       first_id: nextData[0]?.id ?? null,
-      last_id: nextData[nextData.length - 1]?.id ?? null,
+      last_id: lastIdAfterFiltering(page, nextData),
     };
   });
   if (!changed) return { data, removed: false };

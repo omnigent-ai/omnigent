@@ -14,8 +14,8 @@
 // hooks/useGithub.ts), which shells out to `gh` + `git`. `deriveGithubPanelState`
 // is the single switch that turns the info query into what the panel shows: an
 // outdated host, a non-git workspace, a missing `gh` CLI, an unresolved
-// upstream repo, or no open PR each render their own empty state, and only an
-// open PR falls through to the header + stacked diff.
+// upstream repo, or no PR each render their own empty state, and an associated
+// PR falls through to the header + stacked diff.
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
@@ -42,13 +42,17 @@ import {
   type LucideIcon,
   PanelLeftCloseIcon,
   PanelLeftOpenIcon,
+  PlusIcon,
   Rows2Icon,
   TerminalIcon,
+  Trash2Icon,
 } from "lucide-react";
 import { FileDiff } from "@pierre/diffs/react";
 import { parsePatchFiles, type FileDiffMetadata } from "@pierre/diffs";
 import { cn } from "@/lib/utils";
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
 import { HoverCard, HoverCardContent, HoverCardTrigger } from "@/components/ui/hover-card";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
@@ -61,6 +65,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { useResolvedThemeMode } from "@/components/theme/useResolvedThemeMode";
+import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useResizableColumn } from "@/hooks/useResizableColumn";
 import { RunnerOfflineError } from "@/hooks/useWorkspaceChangedFiles";
 import { readFileViewPreferences, writeFileViewPreferences } from "@/lib/fileViewPreferences";
@@ -71,11 +76,13 @@ import {
   useGithubInfo,
   useGithubPrDiff,
   useSetGithubPreference,
+  useUpdateSessionPr,
   type GithubChangedFile,
   type GithubCheckRun,
   type GithubChecks,
   type GithubComment,
   type GithubInfo,
+  type GithubPrAssociation,
 } from "@/hooks/useGithub";
 
 // Shiki bundled themes matching the app's editor look; the concrete side is
@@ -141,7 +148,7 @@ function GithubAccountSelector({
     <div className="flex w-full max-w-xs flex-col items-center gap-2 pt-2">
       <Select
         value={selectedAccount}
-        onValueChange={(login) => setPref.mutate({ account: login })}
+        onValueChange={(login) => setPref.mutate({ account: login, pr_url: info.selected_pr_url })}
         disabled={setPref.isPending}
       >
         <SelectTrigger aria-label="GitHub account" className="h-8 w-full text-ui">
@@ -183,7 +190,7 @@ export type GithubPanelState =
  *
  * Order matters: transient states (loading/offline/error) first, then the
  * git-first availability reasons, then the `gh` enhancement layer (CLI → auth
- * → repo → PR). `ready` is reached only with an open PR to render. */
+ * → repo → PR). `ready` is reached only with an associated PR to render. */
 export function deriveGithubPanelState(info: {
   isLoading: boolean;
   error: unknown;
@@ -215,11 +222,13 @@ export function deriveGithubPanelState(info: {
 function IconButton({
   label,
   onClick,
+  disabled,
   className,
   children,
 }: {
   label: string;
   onClick: () => void;
+  disabled?: boolean;
   className?: string;
   children: React.ReactNode;
 }) {
@@ -231,6 +240,7 @@ function IconButton({
           size="icon-xs"
           aria-label={label}
           onClick={onClick}
+          disabled={disabled}
           className={cn("shrink-0", className)}
         >
           {children}
@@ -238,6 +248,37 @@ function IconButton({
       </TooltipTrigger>
       <TooltipContent>{label}</TooltipContent>
     </Tooltip>
+  );
+}
+
+/** Compact PR state shown beside the title in the shared panel header. */
+function PullRequestStatus({ state }: { state: string }) {
+  const normalized = state.toUpperCase();
+  const visual =
+    normalized === "OPEN"
+      ? {
+          label: "Open",
+          className: "border-green-500/25 bg-green-500/10 text-green-700 dark:text-green-400",
+        }
+      : normalized === "MERGED"
+        ? {
+            label: "Merged",
+            className: "border-purple-500/25 bg-purple-500/10 text-purple-700 dark:text-purple-400",
+          }
+        : normalized === "CLOSED"
+          ? {
+              label: "Closed",
+              className: "border-red-500/25 bg-red-500/10 text-red-700 dark:text-red-400",
+            }
+          : { label: state, className: "border-border bg-muted text-muted-foreground" };
+
+  return (
+    <Badge
+      aria-label={`Pull request status: ${visual.label}`}
+      className={cn("h-5 rounded-full border px-2 py-px text-xs leading-none", visual.className)}
+    >
+      {visual.label}
+    </Badge>
   );
 }
 
@@ -727,17 +768,261 @@ function SidebarNode({
   );
 }
 
+function pullRequestLabel(pr: GithubPrAssociation): string {
+  const host = pr.host === "github.com" ? "" : `${pr.host}/`;
+  const inferred = pr.relationship === "inferred" ? " (from branch)" : "";
+  const identity = `${host}${pr.repository} #${pr.number}${inferred}`;
+  const title = pr.title?.trim();
+  return title ? `${identity} — ${title}` : identity;
+}
+
 export function GithubPanel({ conversationId }: { conversationId: string }) {
-  // Poll for live CI status only while this panel is mounted (the status-line
-  // indicator keeps the non-polling default). Self-limits to unsettled checks.
-  const info = useGithubInfo(conversationId, { poll: true });
-  // The tab is a pure PR view: the list + patch are the PR's, fetched only when
-  // one exists. `baseRef` is kept for the on-demand expand-context loader
-  // (git show <base>:<path>) and the "branch → base" label.
+  const isMobileViewport = useIsMobileViewport();
+  const [selection, setSelection] = useState<{ sessionId: string; url?: string }>();
+  const [prPickerOpen, setPrPickerOpen] = useState(false);
+  const [prPickerTooltipOpen, setPrPickerTooltipOpen] = useState(false);
+  // Select focuses rows on both pointer hover and keyboard navigation.
+  const [focusedPrUrl, setFocusedPrUrl] = useState<string>();
+  const [linking, setLinking] = useState(false);
+  const [url, setUrl] = useState("");
+  const selected = selection?.sessionId === conversationId ? selection.url : undefined;
+  const info = useGithubInfo(conversationId, { poll: true, prUrl: selected });
+  const [knownAssociations, setKnownAssociations] = useState<{
+    sessionId: string;
+    data: Pick<GithubInfo, "prs" | "tracking_available" | "selected_pr_url">;
+  }>();
+  useEffect(() => {
+    if (info.data) {
+      const { prs, tracking_available, selected_pr_url } = info.data;
+      setKnownAssociations({
+        sessionId: conversationId,
+        data: { prs, tracking_available, selected_pr_url },
+      });
+    }
+  }, [conversationId, info.data]);
+  // Switching the metadata query must not unmount the session's PR controls.
+  const associations =
+    info.data ??
+    (knownAssociations?.sessionId === conversationId ? knownAssociations.data : undefined);
+  const update = useUpdateSessionPr(conversationId);
+  useEffect(() => {
+    if (!selected && info.data?.selected_pr_url) {
+      setSelection({ sessionId: conversationId, url: info.data.selected_pr_url });
+    }
+  }, [conversationId, selected, info.data?.selected_pr_url]);
+  const changeSelection = (next?: string) => setSelection({ sessionId: conversationId, url: next });
+  const prs = associations?.prs ?? [];
+  const selectedPr = prs.find((pr) => pr.url === (selected ?? associations?.selected_pr_url));
+  const linkInEmptyState = prs.length === 0 && deriveGithubPanelState(info).kind === "no-pr";
+  const linkControls = (
+    <>
+      {linking && (
+        <form
+          className="mt-2 flex gap-2"
+          onKeyDown={(event) => {
+            if (event.key === "Escape") {
+              event.preventDefault();
+              event.stopPropagation();
+              setLinking(false);
+            }
+          }}
+          onSubmit={(event) => {
+            event.preventDefault();
+            update.mutate(
+              { url, action: "attach" },
+              {
+                onSuccess: (data) => {
+                  changeSelection(data.selected_pr_url);
+                  setLinking(false);
+                  setUrl("");
+                },
+              },
+            );
+          }}
+        >
+          <Input
+            aria-label="Pull request URL"
+            type="url"
+            required
+            value={url}
+            onChange={(event) => setUrl(event.target.value)}
+            placeholder="https://github.com/owner/repo/pull/123"
+            className="flex-1 focus-visible:ring-0"
+          />
+          <Button type="submit" disabled={update.isPending}>
+            Link
+          </Button>
+          <Button type="button" variant="outline" onClick={() => setLinking(false)}>
+            Cancel
+          </Button>
+        </form>
+      )}
+      {update.isError && (
+        <p role="alert" className="mt-1 text-ui text-destructive">
+          {update.error.message}
+        </p>
+      )}
+    </>
+  );
+  const openPrFallback =
+    associations?.tracking_available && selected && !info.isLoading && !info.data?.pr ? (
+      <div className="mt-2 flex flex-col items-center gap-2 text-ui">
+        <span className="text-muted-foreground">or</span>
+        <a
+          href={selected}
+          target="_blank"
+          rel="noreferrer"
+          className="text-foreground underline underline-offset-4"
+        >
+          Open the PR on GitHub
+        </a>
+      </div>
+    ) : undefined;
+  const showTrackingControls = !!associations?.tracking_available && !linkInEmptyState;
+  return (
+    <div className="flex h-full min-h-0 flex-col">
+      {showTrackingControls ? (
+        <div className="flex h-11 shrink-0 items-center gap-2 border-b border-border px-2">
+          <h2 className="shrink-0 font-medium text-ui">GitHub</h2>
+          <div className="ml-auto flex min-w-0 flex-1 items-center gap-2">
+            {prs.length > 0 && (
+              <TooltipProvider>
+                <Select
+                  open={prPickerOpen}
+                  onOpenChange={(open) => {
+                    setPrPickerOpen(open);
+                    setPrPickerTooltipOpen(false);
+                    setFocusedPrUrl(undefined);
+                  }}
+                  value={selected ?? associations.selected_pr_url ?? ""}
+                  onValueChange={changeSelection}
+                >
+                  <Tooltip
+                    open={prPickerTooltipOpen && !prPickerOpen}
+                    onOpenChange={(open) => setPrPickerTooltipOpen(open && !prPickerOpen)}
+                  >
+                    <TooltipTrigger asChild>
+                      <SelectTrigger
+                        aria-label="Session pull request"
+                        className="min-w-0 flex-1 *:data-[slot=select-value]:block *:data-[slot=select-value]:truncate"
+                      >
+                        <SelectValue />
+                      </SelectTrigger>
+                    </TooltipTrigger>
+                    {selectedPr && (
+                      <TooltipContent className="wrap-anywhere">
+                        {pullRequestLabel(selectedPr)}
+                      </TooltipContent>
+                    )}
+                  </Tooltip>
+                  <SelectContent
+                    position="popper"
+                    align="start"
+                    className="w-(--radix-select-trigger-width)"
+                    onKeyDown={(event) => {
+                      if (event.key === "Escape") setPrPickerOpen(false);
+                    }}
+                  >
+                    {prs.map((pr) => (
+                      <Tooltip key={pr.url} open={prPickerOpen && focusedPrUrl === pr.url}>
+                        <TooltipTrigger asChild>
+                          <SelectItem
+                            value={pr.url}
+                            onFocus={() => setFocusedPrUrl(pr.url)}
+                            onBlur={() =>
+                              setFocusedPrUrl((current) =>
+                                current === pr.url ? undefined : current,
+                              )
+                            }
+                            className="*:[span]:last:block *:[span]:last:min-w-0 *:[span]:last:truncate"
+                          >
+                            {pullRequestLabel(pr)}
+                          </SelectItem>
+                        </TooltipTrigger>
+                        <TooltipContent
+                          side={isMobileViewport ? "bottom" : "left"}
+                          className="wrap-anywhere"
+                          style={isMobileViewport ? { pointerEvents: "none" } : undefined}
+                        >
+                          {pullRequestLabel(pr)}
+                        </TooltipContent>
+                      </Tooltip>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </TooltipProvider>
+            )}
+            <div className="ml-auto flex shrink-0 items-center gap-1">
+              <TooltipProvider delayDuration={0}>
+                <IconButton label="Link a PR" onClick={() => setLinking(!linking)}>
+                  <PlusIcon className="size-3.5" aria-hidden="true" />
+                </IconButton>
+                {selected && (
+                  <IconButton
+                    label="Unlink PR"
+                    disabled={update.isPending}
+                    onClick={() =>
+                      update.mutate(
+                        { url: selected, action: "remove" },
+                        {
+                          onSuccess: (data) => changeSelection(data.selected_pr_url),
+                        },
+                      )
+                    }
+                  >
+                    <Trash2Icon className="size-3.5" aria-hidden="true" />
+                  </IconButton>
+                )}
+              </TooltipProvider>
+            </div>
+          </div>
+        </div>
+      ) : (
+        <div className="flex h-11 shrink-0 items-center border-b border-border px-2">
+          <h2 className="font-medium text-ui">GitHub</h2>
+        </div>
+      )}
+      {showTrackingControls && (linking || update.isError) && (
+        <div className="shrink-0 border-b border-border p-2">{linkControls}</div>
+      )}
+      <div className="min-h-0 flex-1">
+        <GithubPanelDetails
+          key={`${conversationId}:${selected ?? ""}`}
+          conversationId={conversationId}
+          info={info}
+          emptyStateAction={
+            associations?.tracking_available && linkInEmptyState ? (
+              <div className="mt-2 w-full max-w-sm">
+                <Button onClick={() => setLinking(!linking)}>Link a PR</Button>
+                {linkControls}
+              </div>
+            ) : (
+              openPrFallback
+            )
+          }
+        />
+      </div>
+    </div>
+  );
+}
+
+function GithubPanelDetails({
+  conversationId,
+  info,
+  emptyStateAction,
+}: {
+  conversationId: string;
+  info: ReturnType<typeof useGithubInfo>;
+  emptyStateAction?: React.ReactNode;
+}) {
   const baseRef = info.data?.base_ref ?? undefined;
+  const prUrl = info.data?.selected_pr_url;
+  const headSha = info.data?.pr?.head_sha;
+  const baseSha = info.data?.pr?.base_sha;
+  const revision = `${baseSha ?? ""}:${headSha ?? ""}`;
   const hasPr = !!info.data?.pr;
-  const changes = useGithubChangedFiles(conversationId, hasPr);
-  const prDiff = useGithubPrDiff(conversationId, hasPr);
+  const changes = useGithubChangedFiles(conversationId, hasPr, prUrl, revision);
+  const prDiff = useGithubPrDiff(conversationId, hasPr, prUrl, revision);
 
   // Summary (PR body + comments) vs Changes (the stacked diff). Summary is the
   // landing tab — like GitHub's PR page opening on the Conversation view.
@@ -822,13 +1107,20 @@ export function GithubPanel({ conversationId }: { conversationId: string }) {
   // the reader expands unchanged regions.
   const loadDiffFiles = useCallback(
     async (fd: FileDiffMetadata) => {
-      const { before, after } = await fetchGithubFileContents(conversationId, fd.name, baseRef);
+      const { before, after } = prUrl
+        ? await fetchGithubFileContents(conversationId, fd.name, baseRef, {
+            pr_url: prUrl,
+            previous_path: fd.prevName,
+            head_sha: headSha,
+            base_sha: baseSha,
+          })
+        : await fetchGithubFileContents(conversationId, fd.name, baseRef);
       return {
         oldFile: { name: fd.prevName ?? fd.name, contents: before ?? "" },
         newFile: { name: fd.name, contents: after ?? "" },
       };
     },
-    [conversationId, baseRef],
+    [conversationId, baseRef, prUrl, headSha, baseSha],
   );
 
   const diffOptions = useMemo<DiffOptions>(
@@ -906,17 +1198,27 @@ export function GithubPanel({ conversationId }: { conversationId: string }) {
       );
     case "runner-offline":
       return (
-        <PanelMessage>The agent is asleep. Send a message to reconnect its runner.</PanelMessage>
+        <PanelMessage>
+          <p>The agent is asleep. Send a message to reconnect its runner.</p>
+          {emptyStateAction}
+        </PanelMessage>
       );
     case "error":
-      return <PanelMessage>Couldn’t load GitHub info: {panelState.message}</PanelMessage>;
+      return (
+        <PanelMessage>
+          <p>Couldn’t load GitHub info: {panelState.message}</p>
+          {emptyStateAction}
+        </PanelMessage>
+      );
     case "host-outdated":
       return (
         <GithubEmptyState
           icon={DownloadIcon}
           title="Update your host to use GitHub"
           hint="The GitHub panel needs the host running Omnigent 0.13.0 or later. Update the host, then reconnect the session."
-        />
+        >
+          {emptyStateAction}
+        </GithubEmptyState>
       );
     case "not-a-git-repo":
       return (
@@ -924,7 +1226,9 @@ export function GithubPanel({ conversationId }: { conversationId: string }) {
           icon={GitBranchIcon}
           title="Not a git repository"
           hint="This workspace isn’t a git checkout, so there’s no branch or PR to show."
-        />
+        >
+          {emptyStateAction}
+        </GithubEmptyState>
       );
     case "no-gh-cli":
       return (
@@ -937,7 +1241,9 @@ export function GithubPanel({ conversationId }: { conversationId: string }) {
               branch’s pull request and CI status.
             </>
           }
-        />
+        >
+          {emptyStateAction}
+        </GithubEmptyState>
       );
     case "repo-unresolved":
       return (
@@ -952,6 +1258,7 @@ export function GithubPanel({ conversationId }: { conversationId: string }) {
           }
         >
           {info.data && <GithubAccountSelector conversationId={conversationId} info={info.data} />}
+          {emptyStateAction}
         </GithubEmptyState>
       );
     case "no-pr":
@@ -966,8 +1273,10 @@ export function GithubPanel({ conversationId }: { conversationId: string }) {
               No open PR for <span className="font-mono">{panelState.branch ?? "this branch"}</span>
             </>
           }
-          hint="When you open a pull request for this branch, it’ll show up here."
-        />
+          hint="Pull requests created in this session appear here. You can also link an existing PR."
+        >
+          {emptyStateAction}
+        </GithubEmptyState>
       );
     case "unavailable":
       return (
@@ -975,11 +1284,13 @@ export function GithubPanel({ conversationId }: { conversationId: string }) {
           icon={AlertCircleIcon}
           title="GitHub isn’t available"
           hint="There’s no GitHub information to show for this session."
-        />
+        >
+          {emptyStateAction}
+        </GithubEmptyState>
       );
   }
 
-  // ── Ready: an open PR to render as its header + the stacked diff ─────────
+  // ── Ready: an associated PR to render as its header + stacked diff ───────
   const data = info.data!;
   const pr = data.pr!;
   const checks = pr.checks;
@@ -1009,17 +1320,18 @@ export function GithubPanel({ conversationId }: { conversationId: string }) {
                 </>
               )}
             </span>
-            <div className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-1">
+            <div className="mt-1 flex flex-nowrap items-center gap-2">
               <a
                 href={pr.url}
                 target="_blank"
                 rel="noreferrer"
-                className="group inline-flex min-w-0 items-center gap-1 text-ui font-medium hover:underline"
+                className="group flex min-w-0 items-center gap-1 text-ui font-medium hover:underline"
               >
                 <span className="truncate">{pr.title}</span>
                 <span className="shrink-0 text-muted-foreground">#{pr.number}</span>
                 <ExternalLinkIcon className="size-3 shrink-0 text-muted-foreground" />
               </a>
+              <PullRequestStatus state={pr.state} />
             </div>
           </div>
           {/* Tab bar (Summary | Changes); the diff controls live inside the

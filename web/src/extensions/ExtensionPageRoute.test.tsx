@@ -19,7 +19,7 @@ import { ExtensionPageRoute } from "./ExtensionPageRoute";
 
 function renderRoute() {
   return render(
-    <MemoryRouter initialEntries={["/extensions/omnigent.canvas/canvas"]}>
+    <MemoryRouter initialEntries={["/extensions/acme.review/dashboard"]}>
       <Routes>
         <Route path="/extensions/:extensionId/*" element={<ExtensionPageRoute />} />
       </Routes>

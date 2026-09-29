@@ -255,6 +255,72 @@ def test_update_increments_version(agent_store: SqlAlchemyAgentStore) -> None:
     assert v3 is not None and v3.version == 3
 
 
+def test_update_stamps_created_by_when_null(agent_store: SqlAlchemyAgentStore) -> None:
+    """update() claims an unowned agent on first authorized write."""
+    agent = agent_store.create(
+        agent_id="c0000000000000000000000000000001",
+        name="claimable",
+        bundle_location="ag_claim/h1",
+    )
+    assert agent.created_by is None
+
+    updated = agent_store.update(agent.id, "ag_claim/h2", "alice@example.com")
+    assert updated is not None
+    assert updated.created_by == "alice@example.com"
+
+
+def test_update_does_not_overwrite_existing_created_by(
+    agent_store: SqlAlchemyAgentStore,
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """Claim-on-write only fills an empty owner; it never reassigns one."""
+    created = conversation_store.create_session_with_agent(
+        agent_id="c0000000000000000000000000000002",
+        agent_name="owned",
+        agent_bundle_location="ag_owned/h1",
+        agent_description=None,
+        created_by="owner@example.com",
+    )
+    assert created.agent.created_by == "owner@example.com"
+
+    # A later write carrying a different identity must not steal ownership.
+    updated = agent_store.update(created.agent.id, "ag_owned/h2", "attacker@example.com")
+    assert updated is not None
+    assert updated.created_by == "owner@example.com"
+
+
+def test_update_created_by_none_leaves_owner_untouched(
+    agent_store: SqlAlchemyAgentStore,
+) -> None:
+    """A template-refresh style update (created_by=None) never stamps an owner."""
+    agent = agent_store.create(
+        agent_id="c0000000000000000000000000000003",
+        name="template-ish",
+        bundle_location="ag_tmpl/h1",
+    )
+    updated = agent_store.update(agent.id, "ag_tmpl/h2")
+    assert updated is not None
+    assert updated.created_by is None
+
+
+def test_create_session_with_agent_records_created_by(
+    agent_store: SqlAlchemyAgentStore,
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """A session-scoped agent persists the creating user for owner checks."""
+    created = conversation_store.create_session_with_agent(
+        agent_id="c0000000000000000000000000000004",
+        agent_name="scoped",
+        agent_bundle_location="ag_scoped/h1",
+        agent_description=None,
+        created_by="alice@example.com",
+    )
+    assert created.agent.created_by == "alice@example.com"
+    fetched = agent_store.get(created.agent.id)
+    assert fetched is not None
+    assert fetched.created_by == "alice@example.com"
+
+
 def test_create_agent_has_version_1(agent_store: SqlAlchemyAgentStore) -> None:
     """Newly created agents start at version 1."""
     agent = agent_store.create(

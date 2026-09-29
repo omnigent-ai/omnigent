@@ -60,12 +60,9 @@ from tests.e2e.omnigent.conftest import configure_mock_llm
 # the URL regex in ``_linkify`` accepts it (``https://`` prefix +
 # valid host chars), but distinctive enough that a substring
 # match doesn't false-positive on something else in the buffer.
-_TEST_URL = "https://omni-linkify-e2e-test.example.com/path"
+_TEST_HOST = "omni-linkify-e2e-test.example.com"
+_TEST_URL = f"https://{_TEST_HOST}/path"
 
-# OSC 8 envelope components — pinned here so the test fails
-# loudly if the wire format drifts.
-_OSC_OPEN = "\x1b]8;;"
-_OSC_CLOSE = "\x1b\\"
 
 # Agent that echoes the test URL through bash. Tool-output
 # path is more deterministic than asking the LLM to print the
@@ -224,31 +221,42 @@ def _assert_url_was_linkified(captured: str) -> None:
     Assert ``_TEST_URL`` appears wrapped in OSC 8 envelope and
     does not appear unwrapped anywhere in the PTY output.
 
-    Two independent assertions:
+    The assertions key on OSC 8 *openers* rather than an
+    opener+display byte sandwich: the opener params may carry
+    Rich's link ID (``\\x1b]8;id=…;<url>``), and Rich may
+    interleave SGR escapes between the opener and the display
+    text.
 
-    1. The exact OSC 8 byte sequence around the URL appears at
-       least once. Pins the wire format. If linkify ever
-       changed how it builds the envelope, this fails.
-    2. Every occurrence of the URL in the buffer is preceded
-       by ``\\x1b]8;;``. Pins coverage — every render site
-       that emits the URL must have run through linkify.
+    Three independent assertions:
+
+    1. At least one opener targets the URL — some linkify pass
+       ran on the path that emitted it.
+    2. Every opener pointing at the URL's host targets the URL
+       exactly — the destination a click opens is the full URL.
+    3. Every occurrence of the URL in the buffer belongs to an
+       envelope (destination or display text). Pins coverage —
+       every render site that emits the URL must have run
+       through linkify.
 
     :param captured: The full PTY byte stream from ``pexpect``'s
         ``logfile_read``. Includes Rich-rendered panels,
         streaming text, ANSI styling, and OSC 8 escapes if the
         linkify hook fired.
     """
-    expected_envelope = f"{_OSC_OPEN}{_TEST_URL}{_OSC_CLOSE}{_TEST_URL}{_OSC_OPEN}{_OSC_CLOSE}"
+    # Every OSC 8 opener: ``ESC ] 8 ; <params> ; <target> ST``.
+    # Group 1 is the destination a terminal opens on click.
+    opener_re = re.compile(r"\x1b\]8;[^;\x07\x1b]*;([^\x07\x1b]*)(?:\x07|\x1b\\)")
+    targets = [t for t in opener_re.findall(captured) if _TEST_HOST in t]
 
-    # Assertion 1: the OSC 8 envelope is present. This is the
-    # load-bearing check. Failure means linkify_ansi wasn't
-    # called on the path that emitted the URL.
-    assert expected_envelope in captured, (
-        f"Expected OSC 8 hyperlink envelope around the test URL in "
-        f"the captured PTY output. Looked for "
-        f"{expected_envelope!r}; not found.\n\n"
-        f"Likely cause: someone removed the ``linkify_ansi`` call "
-        f"from one of the print sites in ``TerminalHost``, OR a "
+    # Assertion 1: some opener targets the URL. This is the
+    # load-bearing check. Failure means no linkify pass ran on
+    # the path that emitted the URL.
+    assert targets, (
+        f"Expected an OSC 8 hyperlink targeting {_TEST_URL!r} in "
+        f"the captured PTY output; found none.\n\n"
+        f"Likely cause: someone removed the linkify pass "
+        f"(``LinkifyingConsole`` / ``linkify_ansi``) from one of the "
+        f"print sites in ``TerminalHost``, OR a "
         f"new render path was added that bypasses ``output()``. "
         f"The unit + integration tests in "
         f"tests/frontends/sdk/test_linkify.py and "
@@ -257,23 +265,29 @@ def _assert_url_was_linkified(captured: str) -> None:
         f"Captured tail (last 4000 chars):\n{captured[-4000:]}"
     )
 
-    # Assertion 2: no BARE (un-enveloped) occurrences of the
-    # URL anywhere in the PTY output. Each OSC 8 envelope
-    # contains the URL TWICE — once as the link target inside
-    # the opener (``\x1b]8;;<URL>\x1b\\``) and once as the
-    # visible display text immediately after the opener's ST.
-    # So total URL occurrences = 2 × envelope_count + bare,
-    # and we want bare == 0.
-    envelope_pattern = re.compile(re.escape(expected_envelope))
-    envelope_count = len(envelope_pattern.findall(captured))
+    # Assertion 2: every opener pointing at the test host targets
+    # the complete URL — never a truncated fragment.
+    wrong = sorted({t for t in targets if t != _TEST_URL})
+    assert not wrong, (
+        f"OSC 8 hyperlink(s) target the wrong destination. Expected "
+        f"every destination pointing at {_TEST_HOST!r} to be "
+        f"{_TEST_URL!r}, but found: {wrong!r}\n\n"
+        f"Captured tail (last 4000 chars):\n{captured[-4000:]}"
+    )
+
+    # Assertion 3: no BARE (un-enveloped) occurrences of the
+    # URL anywhere in the PTY output. Each envelope contains the
+    # URL TWICE — once as the opener's destination and once as
+    # the visible display text. So total URL occurrences =
+    # 2 × envelopes + bare, and we want bare == 0.
     url_count = captured.count(_TEST_URL)
-    bare_count = url_count - 2 * envelope_count
+    bare_count = url_count - 2 * len(targets)
 
     assert bare_count == 0, (
         f"Found {bare_count} bare (un-OSC-8-wrapped) occurrence(s) "
         f"of the test URL in the captured PTY output. "
         f"(Total URL occurrences: {url_count}; envelopes: "
-        f"{envelope_count}; expected bare: 0 since each envelope "
+        f"{len(targets)}; expected bare: 0 since each envelope "
         f"holds 2 URL occurrences.)\n\n"
         f"This is a coverage gap: linkify is wired at most call "
         f"sites but missed at least one. Audit "

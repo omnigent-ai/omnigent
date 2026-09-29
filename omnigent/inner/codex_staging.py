@@ -37,7 +37,7 @@ def _staging_root_path() -> Path:
     # :func:`staged_codex_skill_dirs` this keeps other users' trees out of
     # the sandbox mount set. Windows temp dirs are already per-user.
     suffix = f"-{os.getuid()}" if hasattr(os, "getuid") else ""
-    return Path(tempfile.gettempdir()) / f"omnigent-codex-homes{suffix}"
+    return Path(tempfile.gettempdir()).resolve() / f"omnigent-codex-homes{suffix}"
 
 
 def codex_home_staging_root() -> Path:
@@ -91,7 +91,7 @@ def staged_codex_skill_dirs() -> list[Path]:
     """
     root = _staging_root_path()
     try:
-        root_stat = root.stat()
+        root_stat = root.lstat()
     except OSError:
         return []
     if not stat.S_ISDIR(root_stat.st_mode):
@@ -110,6 +110,6 @@ def staged_codex_skill_dirs() -> list[Path]:
             continue
         skills = home / "skills"
         with contextlib.suppress(OSError):
-            if skills.is_dir():
+            if stat.S_ISDIR(home.lstat().st_mode) and stat.S_ISDIR(skills.lstat().st_mode):
                 skill_dirs.append(skills)
     return skill_dirs

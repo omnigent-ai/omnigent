@@ -192,14 +192,6 @@ class _UsageAccumulator:
             self.model = model  # latest turn's model wins (mirrors a /model switch)
         return True
 
-    def seen_count(self) -> int:
-        """Distinct turns folded in so far (one per ``generation_id``).
-
-        Drives the forwarder's turn-completion wake edge: each newly-seen turn
-        posts one ``external_session_status: idle``.
-        """
-        return len(self.seen)
-
 
 def _read_usage_state(bridge_dir: Path) -> _UsageAccumulator:
     """Load the persisted accumulator, or a cold zero default."""
@@ -294,23 +286,16 @@ async def forward_cursor_usage_to_session(
     is persisted to ``bridge_dir`` so a supervisor restart resumes without
     re-counting. Never returns normally; cancel the task to stop it.
 
-    A newly-observed usage line means cursor-agent fired its ``stop`` hook — a
-    turn completed. On that edge we also POST ``external_session_status: idle``,
-    the only signal that reaches the parent inbox wake (the forwarder mirrors
-    only conversation items, and the PTY-activity watcher is suppressed for
-    cursor-native). Idle delivery is idempotent server-side.
+    Turn completion is forwarded separately by
+    :mod:`omnigent.harnesses.cursor_native.forwarder`, which can order the
+    terminal edge after transcript delivery. Usage must never post completion:
+    its independent poll can observe the stop-hook payload before the final
+    assistant message and wake a parent with empty output.
     """
     import httpx
 
-    from omnigent.native._native_post_delivery import post_external_session_status
-
     acc = _read_usage_state(bridge_dir)
     timeout = httpx.Timeout(_POST_TIMEOUT_S)
-    # Turns already woken this run. Seeded at 0 (not from persisted usage state):
-    # a restart re-posts one idle, which the server dedupes if already delivered
-    # — the safe direction. Seeding from persisted usage would permanently skip a
-    # wake whose idle POST crashed after the usage flush persisted.
-    idle_posted_turns = 0
     from omnigent.cli_auth import open_server_client
 
     async with open_server_client(base_url, headers=headers, auth=auth, timeout=timeout) as client:
@@ -330,15 +315,6 @@ async def forward_cursor_usage_to_session(
                     # Persist only after a successful POST so a failed flush is
                     # retried (the unseen turns stay unseen until they land).
                     await asyncio.to_thread(_write_usage_state, bridge_dir, acc)
-                # Wake the parent once per newly-seen turn, after the usage flush
-                # so the inbox read sees up-to-date cost. A failed idle is retried
-                # next poll (the counter only advances on success).
-                seen_turns = acc.seen_count()
-                if seen_turns > idle_posted_turns:
-                    await post_external_session_status(
-                        client, session_id=session_id, status="idle"
-                    )
-                    idle_posted_turns = seen_turns
             except asyncio.CancelledError:
                 raise
             except Exception:

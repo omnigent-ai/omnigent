@@ -2,7 +2,7 @@
 
 Both Claude Code and Codex expose a command-hook system whose
 ``PreToolUse`` / ``PostToolUse`` payloads use the same field names
-(``hook_event_name``, ``tool_name``, ``tool_input``, ``tool_output``)
+(``hook_event_name``, ``tool_name``, ``tool_input``, ``tool_response``)
 and whose ``UserPromptSubmit`` payload carries the user prompt under
 ``prompt``. This module owns the harness-neutral translation between
 that hook shape and the server's proto-compatible ``EvaluationRequest``
@@ -34,13 +34,24 @@ import httpx
 # How long to keep retrying transient 5xx / connect errors on the
 # policy evaluate POST before failing closed. Keeps the pre-execution
 # gate from blocking long on a sick server while still absorbing brief
-# DB hiccups on a hosted deployment.
+# DB hiccups on a hosted deployment. A gateway-severed held poll resets
+# it — see :func:`post_evaluate_with_retry`.
 _EVALUATE_POLICY_RETRY_BUDGET_S = 30.0
 _EVALUATE_POLICY_RETRY_INITIAL_BACKOFF_S = 1.0
 _EVALUATE_POLICY_RETRY_MAX_BACKOFF_S = 10.0
 # Fast connect budget so an unreachable server fails into the retry
 # loop quickly rather than blocking on the day-long read timeout.
 _EVALUATE_POLICY_CONNECT_TIMEOUT_S = 5.0
+# A 5xx or torn connection that arrives only after the POST was held at
+# least this long is a gateway severing a parked ASK long-poll (the
+# Databricks front door caps any request at 300s and answers 504), not a
+# sick server: it re-POSTs the same id at once and spends no budget.
+# Mirrors the PermissionRequest hook's held-poll floor.
+_EVALUATE_POLICY_HELD_POLL_FLOOR_S = 10.0
+# Transport errors that mean an established connection was torn down
+# mid-poll. A timeout is deliberately absent: a ReadTimeout fires only
+# after the server held the poll for the whole read budget.
+_HELD_POLL_SEVER_ERRORS = (httpx.RemoteProtocolError, httpx.ReadError)
 
 # Hook event names that gate tool execution and therefore carry policy
 # meaning. ``PreToolUse`` fires before the tool runs (can block);
@@ -332,7 +343,7 @@ def hook_payload_to_evaluation_request(
             },
         }
     if hook_event == _POST_TOOL_USE:
-        tool_output = payload.get("tool_output", "")
+        tool_output = payload.get("tool_response", payload.get("tool_output", ""))
         return {
             "event": {
                 "type": "PHASE_TOOL_RESULT",
@@ -586,6 +597,14 @@ def post_evaluate_with_retry(
     :data:`_EVALUATE_POLICY_RETRY_BUDGET_S`. Returns the successful response,
     or ``None`` if the budget is exhausted or a non-retryable error occurs.
 
+    A 5xx or torn connection that arrives only after the POST was held at
+    least :data:`_EVALUATE_POLICY_HELD_POLL_FLOOR_S` is not a fault but a
+    gateway severing a parked ASK long-poll (the Databricks front door caps
+    any request at 300s and answers 504). It re-POSTs the same id after the
+    initial backoff — inside the server's re-park grace, so the approval card
+    survives — and spends none of the transient budget, so a slow human is
+    never failed closed by the proxy.
+
     A stable ``_omnigent_elicitation_id`` is minted once and stamped on
     every attempt. When the server parks an ASK gate and the connection
     drops (5xx or :class:`httpx.ConnectError`), the retry re-POSTs the
@@ -595,13 +614,10 @@ def post_evaluate_with_retry(
     second approval card from appearing when the first was already
     published before the error.
 
-    4xx responses are final — a bad request won't succeed on retry. Other
-    mid-stream errors (e.g. :class:`httpx.ReadTimeout`) are also not retried:
-    a read timeout fires *after* the server received the request and may
-    mean the long-polling ASK gate was severed mid-wait; retrying with the
-    same id will re-park the existing elicitation (no duplicate card), but
-    the caller's fail-closed path is equivalent and simpler. The caller is
-    responsible for fail-closed handling on ``None``.
+    4xx responses are final — a bad request won't succeed on retry. A
+    :class:`httpx.ReadTimeout` is final too: it fires only after the server
+    held the poll for the whole read budget, i.e. the ask itself timed out.
+    The caller is responsible for fail-closed handling on ``None``.
 
     :param url: Absolute URL of the evaluate endpoint.
     :param headers: Auth headers for the Omnigent server.
@@ -618,7 +634,9 @@ def post_evaluate_with_retry(
         refresh-capable :class:`~omnigent.runner._entry._RunnerDatabricksAuth`.
         ``None`` (the default) keeps the legacy behavior for callers that have
         no token source. Returning ``None`` from it falls through to the
-        normal failure handling (the caller fails closed).
+        normal failure handling (the caller fails closed). A poll the server
+        held past the floor re-arms the one-shot, so a wait longer than the
+        token lifetime survives every lapse.
     :returns: ``(response, error)`` — on success, ``(response, None)``; on
         failure, ``(None, short_error_string)`` describing the last error so
         callers can surface it in the deny/block reason shown to the user.
@@ -635,6 +653,8 @@ def post_evaluate_with_retry(
     reauthed = False
     last_error: str = "unknown error"
     while True:
+        attempt_started = time.monotonic()
+        held_poll_severed = False
         try:
             with httpx.Client(headers=headers, timeout=timeout) as client:
                 resp = client.post(url, json=request_body)
@@ -693,8 +713,16 @@ def post_evaluate_with_retry(
                     file=sys.stderr,
                 )
                 return None, last_error
+            held_poll_severed = (
+                time.monotonic() - attempt_started >= _EVALUATE_POLICY_HELD_POLL_FLOOR_S
+            )
             print(
-                f"omnigent {hook_label}: Omnigent returned {status}; retrying",
+                f"omnigent {hook_label}: Omnigent returned {status}"
+                + (
+                    " after a held poll (gateway sever); re-parking"
+                    if held_poll_severed
+                    else "; retrying"
+                ),
                 file=sys.stderr,
             )
         except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
@@ -704,15 +732,33 @@ def post_evaluate_with_retry(
                 file=sys.stderr,
             )
         except httpx.HTTPError as exc:
-            # Other HTTP errors (ReadTimeout while a long ASK poll is in flight,
-            # etc.) are not retried — retrying a severed ASK would open a new
-            # elicitation and prompt the human twice.
             last_error = f"request error: {exc}"
+            # A connection the gateway tore down after holding the poll is a
+            # sever: the same id re-parks the elicitation. Anything else
+            # mid-stream (a ReadTimeout means the ask itself timed out) is final.
+            held_poll_severed = (
+                isinstance(exc, _HELD_POLL_SEVER_ERRORS)
+                and time.monotonic() - attempt_started >= _EVALUATE_POLICY_HELD_POLL_FLOOR_S
+            )
+            if not held_poll_severed:
+                print(
+                    f"omnigent {hook_label}: Omnigent request failed: {exc}",
+                    file=sys.stderr,
+                )
+                return None, last_error
             print(
-                f"omnigent {hook_label}: Omnigent request failed: {exc}",
+                f"omnigent {hook_label}: held poll severed by the gateway; re-parking: {exc}",
                 file=sys.stderr,
             )
-            return None, last_error
+        if held_poll_severed:
+            # The re-park mechanism working as intended, not a transient fault:
+            # the budget and backoff are for fast failures, and the accepted
+            # poll re-arms the one-shot re-mint for the next token lapse.
+            deadline = time.monotonic() + _EVALUATE_POLICY_RETRY_BUDGET_S
+            backoff_s = _EVALUATE_POLICY_RETRY_INITIAL_BACKOFF_S
+            reauthed = False
+            time.sleep(backoff_s)
+            continue
         if time.monotonic() + backoff_s >= deadline:
             print(
                 f"omnigent {hook_label}: retry budget exhausted",

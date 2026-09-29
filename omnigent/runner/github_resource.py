@@ -1,10 +1,9 @@
 """GitHub integration for the session workspace, backed by the ``gh`` CLI.
 
-Powers the web UI's read-only "GitHub" rail tab, which is purely a PR view: the
-changed-files list and the whole-PR patch come straight from GitHub via ``gh``
-(``gh api .../pulls/<n>/files`` and ``gh pr diff``), so they match the PR's
-"Files changed" exactly. With no PR for the branch the tab shows its "no PR"
-empty state and fetches nothing.
+Powers the session PR selector, details, and link/unlink actions. Tracked PRs
+use explicit host/repository/number identities. Branch and commit discovery
+remains a fallback for sessions without recorded PRs. Files and patches come
+from GitHub; recording an association does not modify the remote PR.
 
 Design notes:
 
@@ -21,9 +20,9 @@ Design notes:
   connected owner. Outside a sandbox the env is inherited untouched.
 - The list and patch are GitHub-computed, never a local ``git diff``, so a stale
   local ``origin/<base>`` can't inflate them with files outside the PR.
-- Only the on-demand per-file expand-context reader (:func:`github_file_diff`)
-  still uses ``git show`` for full before/after content — a unified-diff blob
-  can't drive the viewer's context expansion.
+- Expanded context uses the selected PR's head and merge-base commits through
+  GitHub, including fork heads and renames. Legacy calls without a session
+  continue to read local git objects.
 - The branch→PR lookup is a ``gh pr view --json`` (``--json`` avoids the
   interactive pager and the Projects-classic mis-parse of a bare view), backed by
   a commit-identity fallback for when the remote branch name is decoupled from the
@@ -47,6 +46,7 @@ Design notes:
 
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import os
@@ -54,9 +54,16 @@ import re
 import shutil
 import subprocess
 import time
+from concurrent.futures import ThreadPoolExecutor
+from contextvars import ContextVar
 from typing import Any
+from urllib.parse import quote
+
+from filelock import Timeout as FileLockTimeout
 
 from omnigent import config as _config
+from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.runner.session_prs import PullRequestRef, SessionPrRegistry, SessionPullRequest
 from omnigent.runtime.filesystem_registry import _git_timeout_seconds
 
 _logger = logging.getLogger(__name__)
@@ -65,6 +72,14 @@ _logger = logging.getLogger(__name__)
 # slightly more generous timeout than the local ``git`` reads. Overridable via
 # ``OMNIGENT_GH_TIMEOUT_SECONDS`` so operators can tune it without a restart.
 _DEFAULT_GH_TIMEOUT_SECONDS = 15.0
+# Cache failed lookups too so inaccessible PRs do not add work to every poll.
+_PR_TITLE_CACHE_SECONDS = 300.0
+_PR_TITLE_TIMEOUT_RETRY_SECONDS = 15.0
+_PR_TITLE_LOOKUP_SECONDS = 2.0
+# Leave headroom for persistence and the runner proxy's ten-second response limit.
+_PR_TITLE_REQUEST_SECONDS = 8.0
+_pr_title_deadline: ContextVar[float | None] = ContextVar("pr_title_deadline", default=None)
+_pr_title_timed_out: ContextVar[bool] = ContextVar("pr_title_timed_out", default=False)
 
 # Fields requested from ``gh pr view``. Always pass ``--json`` — bare
 # ``gh pr view`` opens an interactive/pager view and misbehaves in a
@@ -143,6 +158,12 @@ def _in_sandbox() -> bool:
 
 
 def _gh(argv: list[str], *, cwd: str, token: str | None = None) -> tuple[int | None, str, str]:
+    timeout = _gh_timeout_seconds()
+    if (deadline := _pr_title_deadline.get()) is not None:
+        timeout = min(timeout, deadline - time.monotonic())
+        if timeout <= 0:
+            _pr_title_timed_out.set(True)
+            return None, "", "title lookup deadline exceeded"
     # In a managed sandbox the panel must authenticate as the connected owner via
     # the per-user hosts.yml that configure_host_gh writes — never an ambient
     # GH_TOKEN/GITHUB_TOKEN, which gh ranks ABOVE hosts.yml. Scrub them so a stray
@@ -155,12 +176,27 @@ def _gh(argv: list[str], *, cwd: str, token: str | None = None) -> tuple[int | N
     # _account_token_for — so it never overrides the sandbox's broker identity.
     env: dict[str, str] | None = None
     if _in_sandbox():
-        env = {k: v for k, v in os.environ.items() if k not in ("GH_TOKEN", "GITHUB_TOKEN")}
+        env = {
+            k: v
+            for k, v in os.environ.items()
+            if k
+            not in ("GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN")
+        }
     if token:
         env = dict(os.environ) if env is None else env
         env["GH_TOKEN"] = token
+        env["GH_ENTERPRISE_TOKEN"] = token
         env.pop("GITHUB_TOKEN", None)
-    return _run(["gh", *argv], cwd=cwd, timeout=_gh_timeout_seconds(), env=env)
+        env.pop("GITHUB_ENTERPRISE_TOKEN", None)
+    result = _run(["gh", *argv], cwd=cwd, timeout=timeout, env=env)
+    if (
+        deadline is not None
+        and result[0] is None
+        and result[2] == "timed out"
+        and time.monotonic() >= deadline
+    ):
+        _pr_title_timed_out.set(True)
+    return result
 
 
 # ── Account selection ────────────────────────────────────────────────────────
@@ -275,9 +311,9 @@ def _workspace_key(root: str) -> str | None:
     return None
 
 
-def _gh_auth_token(root: str, login: str) -> str | None:
+def _gh_auth_token(root: str, login: str, host: str = "github.com") -> str | None:
     """Return *login*'s GitHub token via ``gh auth token --user`` (never logged)."""
-    rc, out, _ = _gh(["auth", "token", "--user", login, "-h", "github.com"], cwd=root)
+    rc, out, _ = _gh(["auth", "token", "--user", login, "-h", host], cwd=root)
     if rc != 0:
         return None
     return out.strip() or None
@@ -542,7 +578,7 @@ def _pr_view_json(root: str, fields: str, *, token: str | None = None) -> dict[s
     return data if isinstance(data, dict) else None
 
 
-def github_info(root: str) -> dict[str, Any]:
+def _workspace_github_info(root: str) -> dict[str, Any]:
     """Resolve GitHub context for the workspace: repo, branch, base, and PR.
 
     Git-first: a git checkout is the fundamental requirement, so ``available``
@@ -641,11 +677,222 @@ def github_info(root: str) -> dict[str, Any]:
     return payload
 
 
+def _selected_pr(session_id: str, pr_url: str) -> PullRequestRef:
+    reference = PullRequestRef.from_url(pr_url)
+    for entry in SessionPrRegistry(session_id).list():
+        if entry.url == reference.url:
+            return entry
+    raise ValueError("This pull request is not associated with the session")
+
+
+def _default_pr(session_id: str | None, pr_url: str | None) -> PullRequestRef | None:
+    if session_id is None:
+        return None
+    if pr_url:
+        return _selected_pr(session_id, pr_url)
+    entries = SessionPrRegistry(session_id).list()
+    return entries[0] if entries else None
+
+
+def _pr_token(root: str, reference: PullRequestRef) -> str | None:
+    if _in_sandbox():
+        return None
+    login = _config.github_account_preference(reference.repo_argument)
+    if login:
+        return _gh_auth_token(root, login, reference.host)
+    return None
+
+
+def _pr_json(root: str, reference: PullRequestRef, fields: str) -> dict[str, Any] | None:
+    if reference.host != "github.com":
+        _, accounts = _list_accounts(root)
+        if reference.host not in {account.get("host") for account in accounts}:
+            return None
+    rc, out, _ = _gh(
+        ["pr", "view", str(reference.number), "-R", reference.repo_argument, "--json", fields],
+        cwd=root,
+        token=_pr_token(root, reference),
+    )
+    if rc != 0:
+        return None
+    try:
+        result = json.loads(out)
+    except ValueError:
+        return None
+    return result if isinstance(result, dict) else None
+
+
+def _reference_info(root: str, reference: PullRequestRef) -> dict[str, Any]:
+    info: dict[str, Any] = {
+        "object": "session.github.info",
+        "available": True,
+        "gh_available": shutil.which("gh") is not None,
+        "authenticated": False,
+        "pr": None,
+        "repo": {"name_with_owner": reference.repository},
+        "selected_pr_url": reference.url,
+    }
+    if not info["gh_available"]:
+        return info
+    _, accounts = _list_accounts(root)
+    info["accounts"] = [a for a in accounts if a.get("host") == reference.host]
+    info["selected_account"] = _config.github_account_preference(reference.repo_argument) or next(
+        (a["login"] for a in info["accounts"] if a.get("active")), None
+    )
+    data = _pr_json(root, reference, _PR_VIEW_FIELDS + ",headRefOid,baseRefOid")
+    if data is None:
+        return info
+    author = data.get("author")
+    info.update(
+        authenticated=True, branch=data.get("headRefName"), base_ref=data.get("baseRefName")
+    )
+    info["pr"] = {
+        "number": reference.number,
+        "url": reference.url,
+        "title": data.get("title"),
+        "state": data.get("state"),
+        "is_draft": data.get("isDraft", False),
+        "author": author.get("login") if isinstance(author, dict) else None,
+        "base_ref": data.get("baseRefName"),
+        "head_ref": data.get("headRefName"),
+        "head_sha": data.get("headRefOid"),
+        "base_sha": data.get("baseRefOid"),
+        "checks": _summarize_checks(data.get("statusCheckRollup")),
+        "body": data.get("body") or None,
+        "comments": _shape_comments(data.get("comments")),
+    }
+    return info
+
+
+def _pr_title(data: dict[str, Any] | None) -> str | None:
+    title = data.get("title") if data else None
+    if not isinstance(title, str):
+        return None
+    return title.strip() or None
+
+
+def _session_prs_with_titles(
+    root: str,
+    info: dict[str, Any],
+    registry: SessionPrRegistry,
+    entries: list[SessionPullRequest],
+    request_deadline: float,
+) -> list[dict[str, Any]]:
+    if not info.get("gh_available"):
+        return [entry.model_dump() for entry in entries]
+
+    now = time.time()
+    titles: dict[str, str | None] = {}
+    timed_out_urls: set[str] = set()
+    pending: list[SessionPullRequest] = []
+    for entry in entries:
+        cache_seconds = (
+            _PR_TITLE_TIMEOUT_RETRY_SECONDS
+            if entry.title_lookup_timed_out
+            else _PR_TITLE_CACHE_SECONDS
+        )
+        stale = now - entry.title_checked_at >= cache_seconds
+        if entry.url == info.get("selected_pr_url"):
+            title = _pr_title(info.get("pr"))
+            if stale or (title is not None and title != entry.title):
+                titles[entry.url] = title
+        elif stale:
+            pending.append(entry)
+
+    # Short-backoff retries must not starve PRs that have waited longer or never ran.
+    pending.sort(key=lambda entry: entry.title_checked_at)
+    deadline = min(request_deadline, time.monotonic() + _PR_TITLE_LOOKUP_SECONDS)
+
+    def fetch_title(entry: SessionPullRequest) -> tuple[str, str | None, bool] | None:
+        if time.monotonic() >= deadline:
+            return None
+        token = _pr_title_deadline.set(deadline)
+        timeout_token = _pr_title_timed_out.set(False)
+        try:
+            data = _pr_json(root, entry, "title")
+            return entry.url, _pr_title(data), data is None and _pr_title_timed_out.get()
+        finally:
+            _pr_title_timed_out.reset(timeout_token)
+            _pr_title_deadline.reset(token)
+
+    may_cache = time.monotonic() < request_deadline
+    if pending and time.monotonic() < deadline:
+        with ThreadPoolExecutor(max_workers=min(4, len(pending))) as executor:
+            for result in executor.map(fetch_title, pending):
+                if result is not None:
+                    url, title, timed_out = result
+                    titles[url] = title
+                    if timed_out:
+                        timed_out_urls.add(url)
+    if titles and may_cache:
+        try:
+            registry.update_titles(titles, timestamp=now, timed_out_urls=timed_out_urls)
+        except (OSError, ValueError, FileLockTimeout):
+            _logger.debug("Could not cache session PR titles", exc_info=True)
+
+    return [
+        {**entry.model_dump(), "title": titles.get(entry.url) or entry.title} for entry in entries
+    ]
+
+
+def github_info(
+    root: str, *, session_id: str | None = None, pr_url: str | None = None
+) -> dict[str, Any]:
+    """Read the selected session PR, with branch inference for untracked sessions."""
+    if session_id is None:
+        return _workspace_github_info(root)
+    request_deadline = time.monotonic() + _PR_TITLE_REQUEST_SECONDS
+    registry = SessionPrRegistry(session_id)
+    entries = registry.list()
+    if pr_url:
+        info = _reference_info(root, _selected_pr(session_id, pr_url))
+    elif entries:
+        info = _reference_info(root, entries[0])
+    else:
+        info = _workspace_github_info(root)
+        pr = info.get("pr")
+        if isinstance(pr, dict) and isinstance(pr.get("url"), str):
+            reference = PullRequestRef.from_url(pr["url"])
+            registry.record([reference], relationship="inferred", source="branch")
+            entries = registry.list()
+            if any(entry.url == reference.url for entry in entries):
+                key = _workspace_key(root)
+                account = _config.github_account_preference(key) if key else None
+                if account and not _config.github_account_preference(reference.repo_argument):
+                    _config.set_github_account_preference(reference.repo_argument, account)
+                info["selected_pr_url"] = reference.url
+            else:
+                info["pr"] = None
+    info["prs"] = _session_prs_with_titles(root, info, registry, entries, request_deadline)
+    info["tracking_available"] = True
+    return info
+
+
+def update_session_pr(root: str, session_id: str, url: str, action: str) -> dict[str, Any]:
+    """Attach a verified PR or persist an explicit exclusion."""
+    reference = PullRequestRef.from_url(url)
+    registry = SessionPrRegistry(session_id)
+    try:
+        if action == "attach":
+            if _pr_json(root, reference, "number,url") is None:
+                raise ValueError("Cannot access this pull request using gh on the host")
+            registry.record([reference], relationship="attached", source="user")
+            return github_info(root, session_id=session_id, pr_url=reference.url)
+        if action == "remove":
+            registry.remove(reference.url)
+            return github_info(root, session_id=session_id)
+    except FileLockTimeout as exc:
+        raise ValueError("PR tracking is busy; try again.") from exc
+    raise ValueError("Expected attach or remove")
+
+
 def set_github_preference(
     root: str,
     *,
     account: str | None = None,
     remote: str | None = None,
+    session_id: str | None = None,
+    pr_url: str | None = None,
 ) -> dict[str, Any]:
     """Apply an account and/or remote selection, then return refreshed info.
 
@@ -663,13 +910,18 @@ def set_github_preference(
         ``None`` to leave the base unchanged.
     :returns: The refreshed :func:`github_info` payload.
     """
+    if pr_url and session_id:
+        reference = _selected_pr(session_id, pr_url)
+        if account is not None:
+            _config.set_github_account_preference(reference.repo_argument, account or None)
+        return github_info(root, session_id=session_id, pr_url=pr_url)
     if remote:
         _gh(["repo", "set-default", remote], cwd=root)
     if account is not None:
         key = _workspace_key(root)
         if key:
             _config.set_github_account_preference(key, account or None)
-    return github_info(root)
+    return github_info(root, session_id=session_id)
 
 
 def resolve_base_ref(root: str, base: str | None) -> str | None:
@@ -687,16 +939,18 @@ def resolve_base_ref(root: str, base: str | None) -> str | None:
     return github_info(root).get("base_ref")
 
 
-def _resolve_diff_base(root: str, base: str) -> str | None:
+def _resolve_diff_base(root: str, base: str) -> str:
     """Resolve a base branch name to the ref to diff HEAD against.
 
     Prefers the merge-base of ``origin/<base>`` (or ``<base>``) and HEAD, giving
-    the three-dot / "Files changed" semantics GitHub shows. Falls back to the
-    base ref itself, then ``None`` when nothing resolves.
+    the three-dot / "Files changed" semantics GitHub shows. A missing merge base
+    in a shallow repository raises instead of comparing branch tips. Full-history
+    repositories retain the base-tip fallback. An unavailable base ref raises.
 
     :param root: Absolute workspace path.
     :param base: Base branch name, e.g. ``"main"``.
-    :returns: A ref (SHA or name) to diff against, or ``None``.
+    :returns: A ref (SHA or name) to diff against.
+    :raises OmnigentError: If the base is unavailable or shallow ancestry is missing.
     """
     candidates = [f"origin/{base}", base]
     resolved: str | None = None
@@ -706,11 +960,45 @@ def _resolve_diff_base(root: str, base: str) -> str | None:
             resolved = candidate
             break
     if resolved is None:
-        return None
+        raise OmnigentError(
+            f"Diff base {base!r} is not available locally. Fetch the base branch explicitly "
+            "with `git fetch origin <base>:refs/remotes/origin/<base>` (replace <base> "
+            "with the branch name), then retry. Single-branch clones do not fetch "
+            "other branches automatically.",
+            code=ErrorCode.INVALID_INPUT,
+        )
     rc, out, _ = _git(["merge-base", resolved, "HEAD"], cwd=root)
     if rc == 0 and out.strip():
         return out.strip()
+    if rc == 1:
+        shallow_rc, shallow, _ = _git(["rev-parse", "--is-shallow-repository"], cwd=root)
+        if shallow_rc == 0 and shallow.strip() == "true":
+            raise OmnigentError(
+                f"No merge base found between HEAD and {resolved!r} in this shallow repository. "
+                "Fetch more history with `git fetch --deepen=100 origin` or "
+                "`git fetch --unshallow origin`, then retry. "
+                "Include both branch refspecs if origin tracks only one branch.",
+                code=ErrorCode.INVALID_INPUT,
+            )
     return resolved
+
+
+def _read_diff_content(root: str, ref: str, path: str) -> str | None:
+    """Read a local diff side; only a confirmed absent tree entry means no content."""
+    rc, out, _ = _git(["show", f"{ref}:{path}"], cwd=root)
+    if rc == 0:
+        return out
+    # Tree entries remain available in blobless clones even if a lazy blob fetch fails.
+    tree_rc, entries, _ = _git(
+        ["--literal-pathspecs", "ls-tree", "-z", "--full-tree", ref, "--", path], cwd=root
+    )
+    if tree_rc == 0 and not entries:
+        return None
+    raise OmnigentError(
+        f"Unable to read file content for {path!r} at {ref!r}. Check repository access "
+        "and connectivity, then retry; a partial clone may need to fetch missing objects.",
+        code=ErrorCode.INTERNAL_ERROR,
+    )
 
 
 # GitHub pulls/files ``status`` → the status vocabulary the web list uses.
@@ -740,7 +1028,9 @@ def _pr_number(root: str, *, token: str | None = None) -> int | None:
     return number if isinstance(number, int) else None
 
 
-def github_changed_files(root: str) -> dict[str, Any]:
+def github_changed_files(
+    root: str, *, session_id: str | None = None, pr_url: str | None = None
+) -> dict[str, Any]:
     """List the PR's changed files, straight from GitHub.
 
     Sourced from ``gh api .../pulls/<n>/files`` so the set (and each file's
@@ -752,14 +1042,21 @@ def github_changed_files(root: str) -> dict[str, Any]:
         / ``status`` / ``lines_added`` / ``lines_removed``.
     """
     empty: dict[str, Any] = {"object": "list", "data": [], "has_more": False}
-    token = _account_token_for(root)
-    number = _pr_number(root, token=token)
+    reference = _default_pr(session_id, pr_url)
+    token = _pr_token(root, reference) if reference else _account_token_for(root)
+    number = reference.number if reference else _pr_number(root, token=token)
     if number is None:
         return empty
-    # ``{owner}`` / ``{repo}`` are filled by ``gh`` from the repo; ``--paginate``
-    # concatenates the pages of the (array) response into one JSON array.
+    repository = reference.repository if reference else "{owner}/{repo}"
+    host_args = _host_args(root, reference) if reference else []
     rc, out, _ = _gh(
-        ["api", "--paginate", f"repos/{{owner}}/{{repo}}/pulls/{number}/files?per_page=100"],
+        [
+            "api",
+            *host_args,
+            "--paginate",
+            *(["--slurp"] if reference else []),
+            f"repos/{repository}/pulls/{number}/files?per_page=100",
+        ],
         cwd=root,
         token=token,
     )
@@ -772,6 +1069,10 @@ def github_changed_files(root: str) -> dict[str, Any]:
     if not isinstance(entries, list):
         return empty
 
+    if reference:
+        entries = [
+            entry for page in entries for entry in (page if isinstance(page, list) else [page])
+        ]
     data: list[dict[str, Any]] = []
     for entry in entries:
         if not isinstance(entry, dict):
@@ -794,7 +1095,17 @@ def github_changed_files(root: str) -> dict[str, Any]:
     return {"object": "list", "data": data, "has_more": False}
 
 
-def github_file_diff(root: str, base: str, path: str) -> dict[str, Any]:
+def github_file_diff(
+    root: str,
+    base: str,
+    path: str,
+    *,
+    session_id: str | None = None,
+    pr_url: str | None = None,
+    previous_path: str | None = None,
+    head_sha: str | None = None,
+    base_sha: str | None = None,
+) -> dict[str, Any]:
     """Return before/after content for one file, HEAD vs the base merge-base.
 
     :param root: Absolute workspace path.
@@ -804,19 +1115,23 @@ def github_file_diff(root: str, base: str, path: str) -> dict[str, Any]:
     :returns: A ``session.github.file_diff`` object with ``before`` (merge-base
         content, ``None`` for an added file) and ``after`` (HEAD content,
         ``None`` for a deleted file).
+    :raises OmnigentError: If the local diff base or file content is unavailable.
     """
-    diff_base = _resolve_diff_base(root, base)
+    reference = _default_pr(session_id, pr_url)
+    if reference:
+        return _pr_file_contents(
+            root,
+            reference,
+            path,
+            previous_path=previous_path,
+            head_sha=head_sha,
+            base_sha=base_sha,
+        )
+    resolved = resolve_base_ref(root, base or None)
+    diff_base = _resolve_diff_base(root, resolved) if resolved else None
 
-    before: str | None = None
-    if diff_base is not None:
-        rc, out, _ = _git(["show", f"{diff_base}:{path}"], cwd=root)
-        if rc == 0:
-            before = out
-
-    after: str | None = None
-    rc, out, _ = _git(["show", f"HEAD:{path}"], cwd=root)
-    if rc == 0:
-        after = out
+    before = _read_diff_content(root, diff_base, path) if diff_base is not None else None
+    after = _read_diff_content(root, "HEAD", path)
 
     return {
         "object": "session.github.file_diff",
@@ -826,7 +1141,9 @@ def github_file_diff(root: str, base: str, path: str) -> dict[str, Any]:
     }
 
 
-def github_pr_diff(root: str) -> dict[str, Any]:
+def github_pr_diff(
+    root: str, *, session_id: str | None = None, pr_url: str | None = None
+) -> dict[str, Any]:
     """Return the whole PR as one unified diff patch, straight from GitHub.
 
     ``gh pr diff <number>`` yields the PR's "Files changed" patch (server-computed
@@ -840,9 +1157,112 @@ def github_pr_diff(root: str) -> dict[str, Any]:
         (empty when there's no PR / no changes).
     """
     empty: dict[str, Any] = {"object": "session.github.pr_diff", "patch": ""}
-    token = _account_token_for(root)
-    number = _pr_number(root, token=token)
+    reference = _default_pr(session_id, pr_url)
+    token = _pr_token(root, reference) if reference else _account_token_for(root)
+    number = reference.number if reference else _pr_number(root, token=token)
     if number is None:
         return empty
-    rc, out, _ = _gh(["pr", "diff", str(number)], cwd=root, token=token)
+    if reference:
+        _host_args(root, reference)
+    repo_args = ["-R", reference.repo_argument] if reference else []
+    rc, out, _ = _gh(["pr", "diff", str(number), *repo_args], cwd=root, token=token)
     return {"object": "session.github.pr_diff", "patch": out if rc == 0 else ""}
+
+
+def _host_args(root: str, reference: PullRequestRef) -> list[str]:
+    if reference.host != "github.com":
+        _, accounts = _list_accounts(root)
+        if reference.host not in {account.get("host") for account in accounts}:
+            raise ValueError("Sign in to this GitHub host with gh before viewing its PRs")
+    return ["--hostname", reference.host]
+
+
+def _pr_api(root: str, reference: PullRequestRef, endpoint: str) -> dict[str, Any]:
+    rc, out, _ = _gh(
+        ["api", *_host_args(root, reference), endpoint],
+        cwd=root,
+        token=_pr_token(root, reference),
+    )
+    if rc != 0:
+        raise ValueError("GitHub could not load the selected PR's file content")
+    try:
+        result = json.loads(out)
+    except ValueError as exc:
+        raise ValueError("GitHub returned an unexpected file response") from exc
+    if not isinstance(result, dict):
+        raise ValueError("GitHub returned an unexpected file response")
+    return result
+
+
+def _api_string(value: object, *keys: str) -> str:
+    """Read a required nonempty string from a GitHub API response."""
+    for key in keys:
+        if not isinstance(value, dict):
+            raise ValueError("GitHub returned an unexpected file response")
+        value = value.get(key)
+    if not isinstance(value, str) or not value:
+        raise ValueError("GitHub returned an unexpected file response")
+    return value
+
+
+def _pr_file_contents(
+    root: str,
+    reference: PullRequestRef,
+    path: str,
+    *,
+    previous_path: str | None,
+    head_sha: str | None,
+    base_sha: str | None,
+) -> dict[str, Any]:
+    for candidate in (path, previous_path or path):
+        if candidate.startswith("/") or any(p in {"", ".."} for p in candidate.split("/")):
+            raise ValueError("Invalid repository-relative path")
+    pr = _pr_api(root, reference, f"repos/{reference.repository}/pulls/{reference.number}")
+    current_head = _api_string(pr, "head", "sha")
+    current_base = _api_string(pr, "base", "sha")
+    if (head_sha and head_sha != current_head) or (base_sha and base_sha != current_base):
+        raise ValueError("The pull request changed; refresh before expanding context")
+    head_repo = pr["head"].get("repo")
+    if not isinstance(head_repo, dict):
+        raise ValueError("The pull request's head repository is no longer available")
+    head_repository = _api_string(head_repo, "full_name")
+    comparison = _pr_api(
+        root,
+        reference,
+        f"repos/{reference.repository}/compare/{current_base}...{current_head}",
+    )
+    merge_base = _api_string(comparison, "merge_base_commit", "sha")
+
+    def contents(repository: str, ref: str, filename: str) -> str | None:
+        # A missing side is expected for additions/deletions. Other failures stay visible.
+        endpoint = f"repos/{repository}/contents/{quote(filename, safe='/')}?ref={quote(ref)}"
+        rc, out, err = _gh(
+            ["api", *_host_args(root, reference), endpoint],
+            cwd=root,
+            token=_pr_token(root, reference),
+        )
+        if rc != 0:
+            if "HTTP 404" in err:
+                return None
+            raise ValueError("GitHub could not load the selected file revision")
+        try:
+            value = json.loads(out)
+            if (
+                not isinstance(value, dict)
+                or value.get("encoding") != "base64"
+                or not isinstance(value.get("content"), str)
+            ):
+                raise ValueError("Unexpected file content")
+            text = base64.b64decode(value["content"]).decode("utf-8")
+            if "\x00" in text:
+                raise ValueError("Binary content")
+            return text
+        except (ValueError, UnicodeError) as exc:
+            raise ValueError("Expanded context is unavailable for this file") from exc
+
+    return {
+        "object": "session.github.file_diff",
+        "path": path,
+        "before": contents(reference.repository, merge_base, previous_path or path),
+        "after": contents(head_repository, current_head, path),
+    }

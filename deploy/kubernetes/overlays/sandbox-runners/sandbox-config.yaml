@@ -42,9 +42,10 @@ data:
         # env: [PROXY_URL]           # SERVER env vars injected as literal Pod env (prefer secret_name for creds)
         # node_selector:             # extra node labels; default kubernetes.io/arch: amd64, override to arm64 to run there
         #   disktype: ssd
-        # resources:                 # runner Pod sizing (defaults: 0.5-2 cpu / 1-4Gi)
-        #   requests: {cpu: "500m", memory: "1Gi"}
-        #   limits: {cpu: "2", memory: "4Gi"}
+        # resources:                 # runner Pod sizing (defaults: 0.5-2 cpu / 1-4Gi; ephemeral-storage unset)
+        #   requests: {cpu: "500m", memory: "1Gi", ephemeral-storage: "2Gi"}
+        #   limits: {cpu: "2", memory: "4Gi", ephemeral-storage: "8Gi"}
+        # home_size_limit: 8Gi       # sizeLimit of the HOME emptyDir (default 8Gi); null = unbounded (node-wide eviction risk)
         # pvc_mounts:                # pre-created PVCs (in the runner namespace) mounted into every runner Pod
         #   - claim_name: omnigent-datasets
         #     mount_path: /mnt/datasets

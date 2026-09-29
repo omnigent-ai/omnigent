@@ -1,6 +1,55 @@
 import { describe, expect, it } from "vitest";
 import type { ImageContentBlock, MessageContentBlock } from "./blocks";
-import { attachmentLabel, imagePreview, isTextBlock, keyedAttachments } from "./blocks";
+import {
+  attachmentLabel,
+  imagePreview,
+  isTextBlock,
+  keyedAttachments,
+  structuredErrorFields,
+} from "./blocks";
+
+describe("structuredErrorFields", () => {
+  it("keeps classified failures and informational notices intact", () => {
+    const classified = {
+      code: "executor_error",
+      title: "The provider rejected the API key",
+      cause: "The configured credential has expired.",
+      remediation: "Update the provider credential.",
+    };
+    expect(structuredErrorFields(classified, "polly")).toEqual({
+      title: classified.title,
+      cause: classified.cause,
+      remediation: classified.remediation,
+    });
+    expect(
+      structuredErrorFields({ code: "unknown_error", source: "harness", level: "info" }, "polly"),
+    ).toEqual({});
+  });
+
+  it.each([
+    "runner_disconnected",
+    "runner_failed_to_start",
+    "required_terminal_exited",
+    "terminal_launch_failed",
+    "native_terminal_start_failed",
+    "workspace_missing",
+    "connection_error",
+    "context_length_exceeded",
+    "rate_limit_exceeded",
+    "codex_thread_reset",
+    "internal_error",
+    "native_policy_not_enforced",
+    "model_change_not_applied",
+  ])("preserves the specific or infrastructure headline for %s", (code) => {
+    expect(structuredErrorFields({ code, source: "execution" }, "polly")).toEqual({});
+  });
+
+  it("keeps tool failures and errors with no agent identity generic", () => {
+    expect(structuredErrorFields({ code: "timeout", source: "tool" }, "polly")).toEqual({});
+    expect(structuredErrorFields({ code: "RuntimeError", source: "tool" }, "polly")).toEqual({});
+    expect(structuredErrorFields({ code: "executor_error" }, " ")).toEqual({});
+  });
+});
 
 // `input_image` blocks arrive from the composer (file_id) and from imported
 // sessions (inline `image_url`, or malformed): neither may blank a transcript.

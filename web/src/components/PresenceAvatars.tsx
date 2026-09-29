@@ -10,7 +10,7 @@ const MAX_VISIBLE_VIEWERS = 3;
 
 /**
  * PresenceAvatars — Google-Docs-style circles for OTHER users currently
- * viewing this session, rendered in the chat header's action row.
+ * viewing this session, rendered in the header or mobile session menu.
  *
  * Self-contained: subscribes to `useChatStore.viewers` (replaced
  * wholesale by each `session.presence` SSE event) and filters out the
@@ -32,7 +32,7 @@ export function PresenceAvatars() {
     // Spaced row, not an overlapping stack: with at most 3 circles +
     // an overflow chip, full visibility of each face beats the space
     // savings of AvatarGroup's negative-margin pile-up.
-    <div className="mr-1 flex items-center gap-1" data-testid="presence-avatars">
+    <div className="mr-1 flex shrink-0 items-center gap-1" data-testid="presence-avatars">
       {visible.map((viewer) => (
         <Tooltip key={viewer.userId}>
           <TooltipTrigger asChild>

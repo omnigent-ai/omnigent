@@ -61,7 +61,7 @@ jobs:
         run: python scripts/normalize_uv_lock_registry.py --check uv.lock
 
       - name: Set up uv
-        uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a  # v3
+        uses: ./.github/actions/setup-uv
         with:
           enable-cache: true
 
@@ -95,7 +95,7 @@ jobs:
         # checked here so Electron's large native devDependencies are not fetched.
         env:
           NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
-        run: pnpm install --frozen-lockfile --filter web --filter omnigent-vscode --filter @omnigent/canvas
+        run: pnpm install --frozen-lockfile --filter web --filter omnigent-vscode
 
       # The pnpm equivalent of the `uv sync --locked` gate above.
       # `pnpm install --frozen-lockfile` only checks the lockfile is CONSISTENT

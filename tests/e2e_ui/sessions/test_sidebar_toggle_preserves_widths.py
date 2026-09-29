@@ -18,6 +18,7 @@ from playwright.sync_api import Page, expect
 _CONVERSATIONS = 'aside[aria-label="Conversations"]'
 _LEFT_CHORD = "Control+Alt+BracketLeft"
 _CHAT_MIN_PX = 480
+_PANEL_MOTION_SETTLE_MS = 400
 
 
 def _rail_width(page: Page) -> float:
@@ -50,6 +51,7 @@ def test_sidebar_toggle_preserves_widths(
     conversations = page.locator(_CONVERSATIONS)
     workspace = page.get_by_role("complementary", name="Workspace")
     expect(workspace).to_be_visible(timeout=30_000)
+    page.wait_for_timeout(_PANEL_MOTION_SETTLE_MS)
 
     # Sidebar defaults open on the desktop viewport. Chat must already sit at
     # or above its minimum, with the rail shrunk to make room.
@@ -61,6 +63,7 @@ def test_sidebar_toggle_preserves_widths(
     # that the reserved sidebar space is freed.
     page.keyboard.press(_LEFT_CHORD)
     expect(conversations).to_have_attribute("data-collapsed", "true")
+    page.wait_for_timeout(_PANEL_MOTION_SETTLE_MS)
     rail_collapsed = _rail_width(page)
     assert rail_collapsed > rail_open, (rail_collapsed, rail_open)
 
@@ -68,6 +71,14 @@ def test_sidebar_toggle_preserves_widths(
     # the preferred width was preserved through the squeeze, not overwritten.
     page.keyboard.press(_LEFT_CHORD)
     expect(conversations).not_to_have_attribute("data-collapsed", "true")
+    page.wait_for_function(
+        """target => {
+            const rail = document.querySelector('aside[aria-label="Workspace"]');
+            return rail && Math.abs(rail.getBoundingClientRect().width - target) < 2;
+        }""",
+        arg=rail_open,
+        timeout=2_000,
+    )
     assert abs(_rail_width(page) - rail_open) < 2, (_rail_width(page), rail_open)
     assert _chat_width(page) >= _CHAT_MIN_PX - 1, _chat_width(page)
 
@@ -92,11 +103,13 @@ def test_shrinking_viewport_keeps_chat_minimum_with_sidebar_open(
     conversations = page.locator(_CONVERSATIONS)
     workspace = page.get_by_role("complementary", name="Workspace")
     expect(workspace).to_be_visible(timeout=30_000)
+    page.wait_for_timeout(_PANEL_MOTION_SETTLE_MS)
     expect(conversations).not_to_have_attribute("data-collapsed", "true")
     assert _chat_width(page) >= _CHAT_MIN_PX - 1, _chat_width(page)
 
     # Shrink the window hard, sidebar still open. The rail must yield (below its
     # own comfort minimum if needed) so the chat holds its 480px floor.
     page.set_viewport_size({"width": 1000, "height": 800})
+    page.wait_for_timeout(_PANEL_MOTION_SETTLE_MS)
     expect(conversations).not_to_have_attribute("data-collapsed", "true")
     assert _chat_width(page) >= _CHAT_MIN_PX - 1, _chat_width(page)

@@ -26,7 +26,7 @@ import json
 import logging
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal
 
 import httpx
 from pydantic import TypeAdapter
@@ -179,8 +179,9 @@ class Session:
         conversations.
     :param archived: Whether the session is archived. Archived
         sessions are hidden from the default ``list`` listing and
-        returned only when ``include_archived=True``. ``False`` for
-        normal sessions.
+        returned with ``visibility="archived"`` or with
+        ``visibility="all", include_archived=True``. ``False`` for normal
+        sessions.
     """
 
     id: str
@@ -275,8 +276,11 @@ class SessionListItem:
         running can tell which ones are blocked on them. ``0`` when
         the session has no outstanding prompts.
     :param archived: Whether the session is archived. Returned by
-        ``list`` only when ``include_archived=True``. ``False`` for
-        normal sessions.
+        ``list`` with ``visibility="archived"`` or with
+        ``visibility="all", include_archived=True``. ``False`` for normal
+        sessions.
+    :param parent_session_id: Parent session for a sub-agent child; ``None``
+        for top-level sessions or when omitted by an older server.
     """
 
     id: str
@@ -293,6 +297,7 @@ class SessionListItem:
     external_session_id: str | None = None
     pending_elicitations_count: int = 0
     archived: bool = False
+    parent_session_id: str | None = None
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> SessionListItem:
@@ -319,6 +324,7 @@ class SessionListItem:
             external_session_id=raw.get("external_session_id"),
             pending_elicitations_count=raw.get("pending_elicitations_count", 0),
             archived=bool(raw.get("archived", False)),
+            parent_session_id=raw.get("parent_session_id"),
         )
 
 
@@ -607,6 +613,8 @@ class SessionsNamespace:
         order: str = "desc",
         sort_by: str = "created_at",
         include_archived: bool = False,
+        visibility: Literal["all", "mine", "shared", "archived"] = "all",
+        kind: Literal["default", "sub_agent", "any"] | None = None,
     ) -> list[SessionListItem]:
         """
         List sessions with cursor-based pagination.
@@ -626,13 +634,31 @@ class SessionsNamespace:
         :param order: Sort direction, ``"desc"`` or ``"asc"``.
         :param sort_by: Column to sort on, ``"created_at"`` or
             ``"updated_at"``.
-        :param include_archived: When ``False`` (default), archived
-            sessions are omitted. When ``True``, archived sessions are
-            returned alongside active ones.
+        :param include_archived: With ``visibility="all"``, include
+            archived sessions alongside active ones when ``True``.
+            Defaults to ``False``. Other visibility modes determine
+            archive filtering themselves.
+        :param visibility: ``"all"`` (default) returns all accessible
+            sessions. ``"mine"`` returns owned active sessions, and
+            ``"shared"`` returns accessible active sessions not owned
+            by the caller. ``"archived"`` returns only archived sessions.
+            Without server authentication, ``"mine"`` and ``"shared"``
+            behave like ``"all"``. Always sent explicitly to the server.
+        :param kind: ``"default"`` returns top-level sessions,
+            ``"sub_agent"`` returns children, and ``"any"`` includes both.
+            ``None`` leaves the server's top-level-only default unchanged.
         :returns: List of :class:`SessionListItem`.
+        :raises StaleCursorError: If ``after``/``before`` names a session
+            that has since been deleted. The walk cannot continue from
+            that cursor — restart it from the first page with no cursor.
         :raises OmnigentError: On non-2xx status.
         """
-        params: dict[str, str | int] = {"limit": limit, "order": order, "sort_by": sort_by}
+        params: dict[str, str | int] = {
+            "limit": limit,
+            "order": order,
+            "sort_by": sort_by,
+            "visibility": visibility,
+        }
         if after is not None:
             params["after"] = after
         if before is not None:
@@ -643,6 +669,8 @@ class SessionsNamespace:
             params["agent_name"] = agent_name
         if include_archived:
             params["include_archived"] = "true"
+        if kind is not None:
+            params["kind"] = kind
         resp = await self._http.get(
             f"{self._base}/v1/sessions",
             params=params,
@@ -793,9 +821,10 @@ class SessionsNamespace:
 
         Calls ``PATCH /v1/sessions/{session_id}`` with
         ``{"archived": ...}``. Archived sessions are hidden from the
-        default :meth:`list` listing and surfaced only with
-        ``include_archived=True``. Owner-only (the web UI stops the
-        session on archive, an owner-gated lifecycle action, so archive
+        default :meth:`list` listing and surfaced with
+        ``visibility="archived"`` or with
+        ``visibility="all", include_archived=True``. Owner-only (the web
+        UI stops the session on archive, an owner-gated lifecycle action, so archive
         is held to the same gate); note this method only flips the
         archived flag — it does not stop the session.
 
@@ -872,6 +901,9 @@ class SessionsNamespace:
         :param order: Sort order, ``"asc"`` (chronological) or
             ``"desc"``.
         :returns: List of conversation item dicts.
+        :raises StaleCursorError: If ``after`` names an item that has since
+            been deleted. The walk cannot continue from that cursor —
+            restart it from the first page with no cursor.
         :raises OmnigentError: On non-2xx status (404 when the
             session does not exist).
         """

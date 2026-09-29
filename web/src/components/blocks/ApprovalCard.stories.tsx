@@ -36,6 +36,17 @@ export const NativeEditPermission: Story = {
   },
 };
 
+export const AutoModePermission: Story = {
+  args: {
+    message: "Claude wants to run the project tests.",
+    phase: "pre_tool_use",
+    policyName: "claude_native_permission",
+    contentPreview: 'Bash({"command":"pnpm test"})',
+    allowAutoMode: true,
+    rememberScope: { tool: "Bash" },
+  },
+};
+
 export const RememberWebDomain: Story = {
   args: {
     message: "Claude wants to fetch the Storybook documentation.",
@@ -96,5 +107,49 @@ export const SubmittedAnswers: Story = {
         coverage: ["Light theme", "Component states"],
       },
     },
+  },
+};
+
+export const Approved: Story = {
+  args: {
+    message: "Claude wants to run the project tests.",
+    phase: "pre_tool_use",
+    policyName: "claude_native_permission",
+    contentPreview: 'Bash({"command":"pnpm test"})',
+    status: "responded",
+    response: { action: "accept" },
+  },
+};
+
+export const ResolvedElsewhere: Story = {
+  args: {
+    message: "Claude wants to run the project tests.",
+    phase: "pre_tool_use",
+    policyName: "claude_native_permission",
+    contentPreview: 'Bash({"command":"pnpm test"})',
+    status: "responded",
+    response: { action: "auto_resolved" },
+  },
+};
+
+export const PromptExpired: Story = {
+  args: {
+    message: "Claude wants to run the project tests.",
+    phase: "pre_tool_use",
+    policyName: "claude_native_permission",
+    contentPreview: 'Bash({"command":"pnpm test"})',
+    status: "responded",
+    response: { action: "auto_resolved", reason: "unanswered" },
+  },
+};
+
+export const Cancelled: Story = {
+  args: {
+    message: "Claude wants to run the project tests.",
+    phase: "pre_tool_use",
+    policyName: "claude_native_permission",
+    contentPreview: 'Bash({"command":"pnpm test"})',
+    status: "responded",
+    response: { action: "cancel" },
   },
 };

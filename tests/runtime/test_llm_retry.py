@@ -8,7 +8,14 @@ from unittest.mock import MagicMock
 import httpx
 import pytest
 
-from omnigent.llms.errors import LLMErrorDetail, PermanentLLMError, RetryableLLMError
+from omnigent.errors import ErrorCategory, ErrorImpact, ErrorPhase
+from omnigent.llms.errors import (
+    ContextWindowExceededError,
+    LLMErrorDetail,
+    PermanentLLMError,
+    RetryableLLMError,
+    llm_error_category,
+)
 from omnigent.runtime.llm_retry import (
     classify_llm_error,
     compute_backoff_delay,
@@ -460,3 +467,82 @@ def test_detail_to_dict_with_empty_detail() -> None:
     # All fields are None → empty dict → collapsed to None.
     # Failure would mean empty dicts leak into the SSE event payload.
     assert result is None
+
+
+@pytest.mark.parametrize(
+    "code,expected",
+    [
+        ("timeout", ErrorCategory.UPSTREAM),
+        ("connection_error", ErrorCategory.UPSTREAM),
+        ("429", ErrorCategory.UPSTREAM),
+        ("503", ErrorCategory.UPSTREAM),
+        ("401", ErrorCategory.CONFIG),
+        ("403", ErrorCategory.CONFIG),
+        ("400", ErrorCategory.UNKNOWN),
+        ("unknown_error", ErrorCategory.UNKNOWN),
+        ("context_length_exceeded", ErrorCategory.USER),
+    ],
+)
+def test_llm_error_category(code: str, expected: ErrorCategory) -> None:
+    """LLM codes resolve in their own namespace, not through ErrorCode."""
+    assert llm_error_category(code) == expected
+
+
+def test_classified_llm_errors_carry_category(retryable_status_codes: list[int]) -> None:
+    """The classifier's results expose the right fault attribution.
+
+    A provider 429 is upstream, a provider 401 is config (bad key), a timeout is
+    upstream. This is what the retry log and any dashboard read off ``.category``.
+    """
+    rate_limited = classify_llm_error(
+        httpx.HTTPStatusError(
+            "429", request=MagicMock(), response=httpx.Response(429, text="slow down")
+        ),
+        retryable_status_codes,
+    )
+    assert rate_limited.category is ErrorCategory.UPSTREAM
+
+    bad_key = classify_llm_error(
+        httpx.HTTPStatusError(
+            "401", request=MagicMock(), response=httpx.Response(401, text="unauthorized")
+        ),
+        retryable_status_codes,
+    )
+    assert bad_key.category is ErrorCategory.CONFIG
+
+    timed_out = classify_llm_error(httpx.TimeoutException("slow"), retryable_status_codes)
+    assert timed_out.category is ErrorCategory.UPSTREAM
+
+
+def test_llm_error_impact() -> None:
+    """Retryable is transient; permanent blocks; context-overflow recovers.
+
+    The context-window case is the notable one: it subclasses PermanentLLMError
+    but is transient because the workflow can compact and retry.
+    """
+    assert RetryableLLMError("rate limited", code="429").impact is ErrorImpact.TRANSIENT
+    assert PermanentLLMError("bad key", code="401").impact is ErrorImpact.BLOCKING
+    assert (
+        ContextWindowExceededError(
+            "too big",
+            code="context_length_exceeded",
+            max_context_tokens=1000,
+            actual_tokens=2000,
+        ).impact
+        is ErrorImpact.TRANSIENT
+    )
+
+
+def test_llm_error_phase_is_turn() -> None:
+    """LLM failures happen while a turn is running, regardless of code."""
+    assert RetryableLLMError("rate limited", code="429").phase is ErrorPhase.TURN
+    assert PermanentLLMError("bad key", code="401").phase is ErrorPhase.TURN
+    assert (
+        ContextWindowExceededError(
+            "too big",
+            code="context_length_exceeded",
+            max_context_tokens=1000,
+            actual_tokens=2000,
+        ).phase
+        is ErrorPhase.TURN
+    )

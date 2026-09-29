@@ -14,10 +14,13 @@ import { CliCommandBlock } from "./CliCommandBlock";
 import { ForkSessionForm } from "./ForkSessionDialog";
 import { SwitchHostDialog } from "./SwitchHostDialog";
 
-const CLAUDE_NATIVE_WRAPPER = "claude-code-native-ui";
+import { nativeCodingAgentForHarness, nativeCodingAgentForWrapper } from "@/lib/nativeCodingAgents";
 
 const HOST_OWNER_DESCRIPTION =
   "This session's host is offline. Run the command below from the host machine to reconnect.";
+
+const HOST_OWNER_THIS_MACHINE_DESCRIPTION =
+  "This session's host is this machine. Reconnect it below, or run the command from a terminal.";
 
 const HOST_VIEWER_DESCRIPTION =
   "This session's host machine is offline and only its owner can reconnect it. " +
@@ -53,6 +56,11 @@ export type ReconnectState = "host_offline" | "local_stranded";
  *    --resume <id>`; everything else uses the generic `omnigent run
  *    path/to/agent.yaml --resume <id>`.
  *
+ * The native wrapper is resolved from the `omnigent.wrapper` label, then
+ * the canonical `harness` — a pre-native session (e.g. a legacy `devin-acp`
+ * row) can carry no wrapper label yet still be a native harness, and the
+ * generic `omnigent run` form cannot resume it.
+ *
  * The Databricks profile stays a placeholder in every form — it's
  * per-deployment and not knowable from the browser.
  */
@@ -60,11 +68,13 @@ export function buildReconnectCommand({
   conversationId,
   serverUrl,
   wrapper,
+  harness,
   state,
 }: {
   conversationId: string;
   serverUrl: string;
   wrapper?: string | null;
+  harness?: string | null;
   state: ReconnectState;
 }): string {
   // Backslash-continued so the command stays readable inside a narrow
@@ -73,9 +83,15 @@ export function buildReconnectCommand({
   if (state === "host_offline") {
     return ["omnigent host \\", `  --server ${quotedServerUrl}`].join("\n");
   }
-  if (wrapper === CLAUDE_NATIVE_WRAPPER) {
+  // Every native TUI wrapper resumes through its own verb (`omnigent devin
+  // --resume …`), and the verb is the registry key — the generic
+  // `omnigent run <agent.yaml>` below cannot resume one at all, so it was wrong
+  // for every native harness except claude. Fall back to the canonical harness
+  // when there's no wrapper label (a label-less pre-native session).
+  const nativeAgent = nativeCodingAgentForWrapper(wrapper) ?? nativeCodingAgentForHarness(harness);
+  if (nativeAgent !== undefined) {
     return [
-      "omnigent claude \\",
+      `omnigent ${nativeAgent.key} \\`,
       `  --resume ${conversationId} \\`,
       `  --server ${quotedServerUrl}`,
     ].join("\n");
@@ -98,7 +114,8 @@ export function buildReconnectCommand({
  * - **Reconnect** — a one-line instruction plus the CLI command. For a
  *   non-owner of a `host_offline` session — who can't reach the host
  *   machine — the command is dropped and the text explains that only
- *   the owner can reconnect.
+ *   the owner can reconnect. If an in-app reconnect failed, the owner
+ *   can retry it here or use the terminal command.
  * - **Clone** — the same {@link ForkSessionForm} the header-menu Clone
  *   dialog uses (one fork implementation, two entry points), so the
  *   user can continue in a copy they own without leaving the dialog.
@@ -109,6 +126,8 @@ export function buildReconnectCommand({
  * @param wrapper - The conversation's `omnigent.wrapper` label
  *   (`"claude-code-native-ui"` for `omnigent claude` sessions). Picks
  *   the `local_stranded` command form.
+ * @param harness - The conversation's canonical harness, used to pick the
+ *   `local_stranded` command form when no wrapper label is present.
  * @param state - Which unreachable state we're reconnecting from.
  * @param isOwner - Whether the viewer owns the session. Gates the
  *   reconnect command for `host_offline`.
@@ -125,38 +144,50 @@ export function ReconnectSessionDialog({
   conversationId,
   serverUrl,
   wrapper,
+  harness,
   state,
   isOwner,
   sourceTitle,
   sourceWorkspace,
   sourceHostId,
   sourceGitBranch,
+  localReconnect,
 }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   conversationId: string;
   serverUrl: string;
   wrapper?: string | null;
+  harness?: string | null;
   state: ReconnectState;
   isOwner: boolean;
   sourceTitle?: string | null;
   sourceWorkspace?: string | null;
   sourceHostId?: string | null;
   sourceGitBranch?: string | null;
+  localReconnect?: {
+    reconnecting: boolean;
+    error: string | null;
+    onReconnect: () => void;
+  };
 }) {
   const [switchOpen, setSwitchOpen] = useState(false);
   const isHostReconnect = state === "host_offline";
+  const canReconnectThisMachine = isHostReconnect && isOwner && localReconnect != null;
+
   // A non-owner can't reach the host machine to reconnect it, so the
   // CLI command is useless to them. Owners of both states, and anyone
   // on a local_stranded session, get a command.
   const showCommand = isOwner || !isHostReconnect;
-  const command = buildReconnectCommand({ conversationId, serverUrl, wrapper, state });
+  const command = buildReconnectCommand({ conversationId, serverUrl, wrapper, harness, state });
   // Titles mirror the unreachable banner's wording ("Host is offline —
   // click to reconnect" / "Agent disconnected — click to reconnect").
   const title = isHostReconnect ? "Host is offline" : "Agent disconnected";
   const description = isHostReconnect
     ? isOwner
-      ? HOST_OWNER_DESCRIPTION
+      ? canReconnectThisMachine
+        ? HOST_OWNER_THIS_MACHINE_DESCRIPTION
+        : HOST_OWNER_DESCRIPTION
       : HOST_VIEWER_DESCRIPTION
     : RUN_DESCRIPTION;
   return (
@@ -194,6 +225,28 @@ export function ReconnectSessionDialog({
               >
                 {description}
               </p>
+              {canReconnectThisMachine && localReconnect && (
+                <div className="flex flex-col gap-2">
+                  <Button
+                    className="self-start"
+                    data-testid="reconnect-session-this-machine"
+                    disabled={localReconnect.reconnecting}
+                    aria-busy={localReconnect.reconnecting}
+                    onClick={localReconnect.onReconnect}
+                  >
+                    {localReconnect.reconnecting ? "Reconnecting this machine…" : "Retry reconnect"}
+                  </Button>
+                  {localReconnect.error && (
+                    <p
+                      className="text-sm text-destructive select-text"
+                      role="alert"
+                      data-testid="reconnect-session-reconnect-error"
+                    >
+                      {localReconnect.error}
+                    </p>
+                  )}
+                </div>
+              )}
               {showCommand && (
                 <CliCommandBlock command={command} testIdPrefix="reconnect-session" />
               )}

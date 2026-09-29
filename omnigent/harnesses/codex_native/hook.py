@@ -57,6 +57,10 @@ def main(argv: list[str] | None = None) -> int:
         so a hook failure never wedges Codex.
     """
     raw_argv = sys.argv[1:] if argv is None else argv
+    if raw_argv and raw_argv[0] == "observe-tool":
+        from omnigent.native.tool_observer_hook import main as observe_main
+
+        return observe_main(raw_argv[1:])
     if raw_argv and raw_argv[0] == "evaluate-policy":
         return _main_evaluate_policy(raw_argv[1:])
     if raw_argv and raw_argv[0] == "route-turn":

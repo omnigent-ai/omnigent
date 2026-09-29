@@ -8,11 +8,12 @@ interface and the newer pluggable surface in
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Sequence
 
 
 class SandboxError(Exception):
@@ -87,6 +88,12 @@ class SandboxCapabilities:
         suspend-time snapshot (dependencies installed, caches warm)
         rather than cold-starting it. Only meaningful alongside
         ``resume_stopped``.
+    :param multi_repo: Provider can clone more than one repository into a
+        single session's workspace. Off by default, so a provider that
+        clones only one repo (and every out-of-tree provider) is never
+        handed a multi-repo request; providers opt in explicitly.
+    :param git_clone_options: Provider honors ``RepoWorkspace.git_clone``
+        when creating checkouts. Custom materializers must opt in.
     """
 
     cli_bootstrap: bool = False
@@ -101,6 +108,8 @@ class SandboxCapabilities:
     # New fields append at the end to preserve positional-constructor
     # compatibility for out-of-tree providers.
     snapshot_restore: bool = False
+    multi_repo: bool = False
+    git_clone_options: bool = False
 
 
 @dataclass(frozen=True)
@@ -125,6 +134,120 @@ class SandboxInfo:
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
+@dataclass(frozen=True)
+class GitCloneOptions:
+    """Admin policy for new checkouts; defaults preserve existing Git behavior."""
+
+    depth: int | None = None
+    single_branch: bool | None = None
+    filter: Literal["blob:none"] | None = None
+    tags: bool = True
+
+    def __post_init__(self) -> None:
+        if self.depth is not None and (type(self.depth) is not int or self.depth <= 0):
+            raise ValueError("sandbox.git_clone.depth must be null or a positive integer")
+        if self.single_branch is not None and type(self.single_branch) is not bool:
+            raise ValueError("sandbox.git_clone.single_branch must be null or a boolean")
+        if self.filter is not None and self.filter != "blob:none":
+            raise ValueError("sandbox.git_clone.filter must be null or 'blob:none'")
+        if type(self.tags) is not bool:
+            raise ValueError("sandbox.git_clone.tags must be a boolean")
+
+    def clone_args(self, branch: str | None) -> list[str]:
+        """Return only allowlisted options; callers quote URL and destination."""
+        args = ["--branch", branch] if branch is not None else []
+        single_branch = (
+            self.single_branch if self.single_branch is not None else branch is not None
+        )
+        if single_branch:
+            args.append("--single-branch")
+        elif self.single_branch is False or self.depth is not None:
+            # --depth implies --single-branch unless explicitly countermanded.
+            args.append("--no-single-branch")
+        if self.depth is not None:
+            args.extend(["--depth", str(self.depth)])
+        if self.filter is not None:
+            args.append(f"--filter={self.filter}")
+        if not self.tags:
+            args.append("--no-tags")
+        return args
+
+
+@dataclass(frozen=True)
+class RepoWorkspace:
+    """
+    A single repository to materialize in a managed sandbox's workspace.
+
+    Server code builds these via ``parse_repo_workspace`` (which validates
+    the URL and branch); the launcher surface only reads the fields. Lives
+    here rather than in the server package so a launcher can accept it
+    without importing ``omnigent.server`` (an onboarding→server dependency
+    the entrypoint-as-host launchers deliberately avoid).
+
+    :param url: The clone URL with any ``#<branch>`` fragment stripped,
+        e.g. ``"https://github.com/org/repo.git"`` or
+        ``"git@github.com:org/repo.git"``.
+    :param branch: Branch to clone (``--branch … --single-branch``), or
+        ``None`` for the default branch.
+    :param repo_name: Directory the clone lands in under the sandbox
+        workspace, derived from the URL's last path segment, e.g.
+        ``"repo"``.
+    :param git_clone: Admin clone policy for fresh checkouts only.
+    """
+
+    url: str
+    branch: str | None
+    repo_name: str
+    git_clone: GitCloneOptions = field(default_factory=GitCloneOptions)
+
+
+def _owner_segment(url: str) -> str:
+    """
+    The owner/org segment of a repo URL (second-to-last path segment), used to
+    disambiguate repos whose ``repo_name`` collides. Best-effort: ``""`` when
+    the URL has no owner segment.
+
+    ``https://github.com/org-a/api`` → ``"org-a"``;
+    ``git@github.com:org-b/api.git`` → ``"org-b"``.
+    """
+    parts = [p for p in re.split(r"[/:]", url.rstrip("/")) if p]
+    return parts[-2] if len(parts) >= 2 else ""
+
+
+def clone_dir_names(repos: Sequence[RepoWorkspace]) -> list[str]:
+    """
+    Unique clone-directory names for a list of repos, positionally aligned.
+
+    Each repo clones into ``<workspace>/<name>``. Distinct URLs can derive the
+    same ``repo_name`` (e.g. ``org-a/api`` and ``org-b/api`` → ``api``), which
+    would collide into one directory and fail the clone; those are qualified by
+    owner (``org-a__api``), with a numeric suffix as a last resort. A repo whose
+    name is already unique keeps the plain name, so the single-repo working
+    directory is unchanged.
+
+    :param repos: The repositories to clone, in order.
+    :returns: A directory name per repo, in the same order.
+    """
+    from collections import Counter
+
+    counts = Counter(r.repo_name for r in repos)
+    used: set[str] = set()
+    names: list[str] = []
+    for repo in repos:
+        if counts[repo.repo_name] > 1:
+            owner = _owner_segment(repo.url)
+            base = f"{owner}__{repo.repo_name}" if owner else repo.repo_name
+        else:
+            base = repo.repo_name
+        name, n = base, 2
+        while name in used:
+            name = f"{base}-{n}"
+            n += 1
+        used.add(name)
+        names.append(name)
+    return names
+
+
 @dataclass
 class HostContext:
     """Context handed to ``start_host`` when launching a managed host."""
@@ -133,8 +256,6 @@ class HostContext:
     host_id: str
     host_name: str
     server_url: str
-    repo_url: str | None = None
-    repo_branch: str | None = None
-    repo_name: str | None = None
+    repos: list[RepoWorkspace] = field(default_factory=list)
     host_config: dict[str, object] = field(default_factory=dict)
     on_stage: Callable[[str], None] | None = None

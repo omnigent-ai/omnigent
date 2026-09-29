@@ -2,12 +2,28 @@
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
+import pexpect
 import pytest
 import yaml
 
-from tests.e2e.omnigent._pexpect_harness import ensure_repl_test_theme_env
+from tests.e2e.omnigent._pexpect_harness import ensure_repl_test_theme_env, wait_for_ready
+
+
+@pytest.mark.parametrize("keep_running", [False, True])
+def test_wait_for_ready_reports_startup_failure(keep_running: bool) -> None:
+    """Preserve startup errors when the process exits or waits at a crash prompt."""
+    script = "print('RuntimeError: startup failed', flush=True)"
+    if keep_running:
+        script += "; input('Report this crash? ')"
+    child = pexpect.spawn(sys.executable, ["-c", script], encoding="utf-8")
+    try:
+        with pytest.raises(AssertionError, match="RuntimeError: startup failed"):
+            wait_for_ready(child, timeout=1.0)
+    finally:
+        child.close(force=True)
 
 
 def test_ensure_repl_test_theme_env_seeds_isolated_home(tmp_path: Path) -> None:

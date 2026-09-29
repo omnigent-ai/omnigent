@@ -24,14 +24,21 @@ When to use each implementation:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+import uuid
 from collections.abc import Callable
 from typing import cast
 
 import httpx
 
 from omnigent.runner import pending_approvals
+from omnigent.runner.mcp_execution_registry import (
+    MCP_OPERATION_ID_PARAM,
+    RUNNER_MCP_EXECUTION_DETACHED_CODE,
+    McpExecutionRegistry,
+)
 from omnigent.runner.mcp_manager import McpSchemasResult
 from omnigent.runner.tool_dispatch import MCP_PROXY_CALL_TIMEOUT_S
 from omnigent.spec.types import AgentSpec
@@ -40,6 +47,7 @@ from omnigent.util.json_types import JsonObject as _JsonObject
 _logger = logging.getLogger(__name__)
 
 _EventPublisher = Callable[[str, _JsonObject], None]
+_SERVER_RECONNECT_WAIT_S = 120.0
 
 
 def _json_object(value: object) -> _JsonObject | None:
@@ -151,6 +159,7 @@ class ProxyMcpManager:
         session_id: str,
         ap_client: httpx.AsyncClient,
         publish_event: _EventPublisher | None = None,
+        execution_registry: McpExecutionRegistry | None = None,
     ) -> None:
         """Create a proxy manager bound to one session.
 
@@ -162,10 +171,13 @@ class ProxyMcpManager:
             when the user decides (keeps the approval-badge counter in
             sync).  Pass ``None`` only in test contexts where the badge
             is irrelevant.
+        :param execution_registry: Runner-owned MCP operations that a new
+            server generation can reattach to after a tunnel replacement.
         """
         self._session_id = session_id
         self._omnigent_client = ap_client
         self._publish_event = publish_event
+        self._execution_registry = execution_registry
 
     @property
     def _mcp_url(self) -> str:
@@ -313,15 +325,65 @@ class ProxyMcpManager:
         """
         del spec  # Omnigent server resolves spec from session context
 
-        payload: _JsonObject = {
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "tools/call",
-            "params": {"name": tool_name, "arguments": arguments},
-        }
+        operation_id = f"mcpop_{uuid.uuid4().hex}"
+        registry = self._execution_registry
+        if registry is not None:
+            registry.retain_operation(self._session_id, operation_id)
+        try:
+            return await self._call_tool_with_operation(tool_name, arguments, operation_id)
+        finally:
+            if registry is not None:
+                registry.release_operation(self._session_id, operation_id)
 
-        # At most two iterations: initial call + one approval retry.
-        for _attempt in range(2):
+    async def _call_tool_with_operation(
+        self,
+        tool_name: str,
+        arguments: _JsonObject,
+        operation_id: str,
+    ) -> str:
+        """Run one proxy call under an already-retained operation id."""
+        request_id = 1
+
+        def _initial_payload() -> _JsonObject:
+            return {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "method": "tools/call",
+                "params": {
+                    "name": tool_name,
+                    "arguments": arguments,
+                    MCP_OPERATION_ID_PARAM: operation_id,
+                },
+            }
+
+        async def _wait_to_reattach(
+            request_generation: int,
+            cause: BaseException | None = None,
+        ) -> None:
+            registry = self._execution_registry
+            if registry is None or not registry.has_operation(self._session_id, operation_id):
+                raise RuntimeError(
+                    f"MCP proxy call for tool {tool_name!r} in session "
+                    f"{self._session_id!r} lost its server without a reserved "
+                    "runner operation"
+                ) from cause
+            try:
+                await pending_approvals.wait_for_server_reconnect(
+                    request_generation,
+                    timeout_seconds=_SERVER_RECONNECT_WAIT_S,
+                )
+            except asyncio.TimeoutError as reconnect_exc:
+                raise RuntimeError(
+                    f"MCP proxy call for tool {tool_name!r} in session "
+                    f"{self._session_id!r} lost its server and no replacement "
+                    f"connected within {_SERVER_RECONNECT_WAIT_S:.0f}s"
+                ) from reconnect_exc
+
+        payload = _initial_payload()
+        approval_retries = 0
+
+        while True:
+            request_generation = pending_approvals.current_server_generation()
             try:
                 resp = await self._omnigent_client.post(
                     self._mcp_url,
@@ -339,6 +401,14 @@ class ProxyMcpManager:
                 )
                 resp.raise_for_status()
                 data = _response_json_object(resp)
+            except httpx.TransportError as exc:
+                await _wait_to_reattach(request_generation, exc)
+                # Reattach the new server generation to the same runner-owned
+                # operation. A fresh JSON-RPC id distinguishes this transport
+                # attempt; the operation id prevents external work from replaying.
+                request_id += 1
+                payload = cast("_JsonObject", {**payload, "id": request_id})
+                continue
             except Exception as exc:
                 raise RuntimeError(
                     f"MCP proxy call failed for tool {tool_name!r} in session "
@@ -353,6 +423,11 @@ class ProxyMcpManager:
                     )
                 code = err.get("code")
                 msg = err.get("message", "")
+                if code == RUNNER_MCP_EXECUTION_DETACHED_CODE:
+                    await _wait_to_reattach(request_generation)
+                    request_id += 1
+                    payload = cast("_JsonObject", {**payload, "id": request_id})
+                    continue
                 # -32000 is the MCP convention for server-defined errors (tool
                 # denials, tool errors).  Return as a JSON error string so the
                 # harness feeds the refusal back to the LLM rather than raising.
@@ -372,7 +447,7 @@ class ProxyMcpManager:
             # Park for user approval and retry with inputResponses per the
             # MCP Multi Round-Trip Requests spec.
             if result.get("resultType") == "input_required":
-                if _attempt >= 1:
+                if approval_retries >= 1:
                     # Guard against unexpected re-elicitation after one retry.
                     return json.dumps({"error": "Approval loop exceeded"})
 
@@ -395,19 +470,30 @@ class ProxyMcpManager:
                     if self._publish_event is not None
                     else (lambda _s, _e: None)
                 )
-                verdict = await pending_approvals.wait_for_user_verdict(
-                    elicitation_id=elicitation_id,
-                    conversation_id=self._session_id,
-                    publish_event=publisher,
-                )
+                try:
+                    verdict = await pending_approvals.wait_for_user_verdict(
+                        elicitation_id=elicitation_id,
+                        conversation_id=self._session_id,
+                        publish_event=publisher,
+                        retry_on_server_reconnect=True,
+                    )
+                except pending_approvals.ServerReconnected:
+                    # requestState and its elicitation id belong to the server
+                    # generation that issued them. Re-run the original call so
+                    # the connected generation can create an answerable gate.
+                    request_id += 1
+                    payload = _initial_payload()
+                    continue
 
+                request_id += 1
                 payload = {
                     "jsonrpc": "2.0",
-                    "id": 2,  # MRTR spec: retry MUST use a different id
+                    "id": request_id,  # MRTR retry MUST use a different id
                     "method": "tools/call",
                     "params": {
                         "name": tool_name,
                         "arguments": arguments,
+                        MCP_OPERATION_ID_PARAM: operation_id,
                         "requestState": request_state,
                         "inputResponses": {
                             elicitation_id: _input_response(
@@ -416,6 +502,7 @@ class ProxyMcpManager:
                         },
                     },
                 }
+                approval_retries += 1
                 continue
 
             # ── Normal result (ALLOW or post-approval execution) ──────────
@@ -435,8 +522,6 @@ class ProxyMcpManager:
                     return json.dumps({"error": text})
                 return text if text else json.dumps(result)
             return json.dumps(result)
-
-        return json.dumps({"error": "Approval retry loop exhausted"})
 
     async def prewarm(self, spec: AgentSpec) -> None:
         """No-op — the Omnigent server warms connections lazily via ServerMcpPool.

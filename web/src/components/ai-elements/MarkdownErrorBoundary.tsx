@@ -13,6 +13,10 @@ import { Component, type ErrorInfo, type ReactNode } from "react";
  * markdown source and the rest of the page keeps working. Deliberately does not
  * reset when `children` change: React.lazy caches a rejection forever, so a
  * retry would only throw again.
+ *
+ * Streamdown's own lazy facades ship inside its statically-loaded chunk
+ * (web/vite.streamdown.ts), so those imports cannot reject mid-session; the
+ * boundary stays as containment for any other throw in the pipeline.
  */
 export class MarkdownErrorBoundary extends Component<
   { children: ReactNode; source: ReactNode },

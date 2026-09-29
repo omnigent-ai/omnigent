@@ -54,6 +54,14 @@ class TestNormalizeDatabaseUrl:
         url = "postgresql://user:pass@host/db"
         assert normalize_database_url(url) == "postgresql+psycopg://user:pass@host/db"
 
+    def test_cockroachdb_prefix(self) -> None:
+        url = "cockroachdb://user:pass@host/db"
+        assert normalize_database_url(url) == "cockroachdb+psycopg://user:pass@host/db"
+
+    def test_cockroachdb_psycopg_passthrough(self) -> None:
+        url = "cockroachdb+psycopg://user:pass@host/db"
+        assert normalize_database_url(url) == url
+
     def test_sqlite_passthrough(self) -> None:
         url = "sqlite:///path/to/db.sqlite"
         assert normalize_database_url(url) == url

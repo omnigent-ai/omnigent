@@ -279,7 +279,13 @@ export function ImageLightboxProvider({ children }: { children: React.ReactNode 
               <Button
                 variant="ghost"
                 size="icon-sm"
-                className="absolute top-3 right-3 bg-background/70 hover:bg-background/90"
+                // Offset by the top safe-area inset so the button clears the
+                // status bar / notch on native shells and stays tappable.
+                style={{
+                  top: "calc(0.75rem + var(--omnigent-safe-top, 0px))",
+                  right: "calc(0.75rem + var(--omnigent-safe-right, 0px))",
+                }}
+                className="absolute bg-background/70 hover:bg-background/90"
               >
                 <XIcon />
                 <span className="sr-only">Close</span>

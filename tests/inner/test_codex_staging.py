@@ -72,6 +72,24 @@ def test_staging_root_tightens_a_loose_preexisting_mode(isolated_tempdir: Path) 
     assert stat.S_IMODE(codex_home_staging_root().stat().st_mode) == 0o700
 
 
+@pytest.mark.skipif(not hasattr(os, "getuid"), reason="POSIX directory symlinks")
+def test_staging_root_resolves_symlinked_temp_ancestors(
+    isolated_tempdir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Published skill paths must match the sandbox's canonical read roots."""
+    real_temp = isolated_tempdir / "real-temp"
+    real_temp.mkdir()
+    temp_alias = isolated_tempdir / "temp-alias"
+    temp_alias.symlink_to(real_temp, target_is_directory=True)
+    monkeypatch.setattr(tempfile, "gettempdir", lambda: str(temp_alias))
+
+    root = codex_home_staging_root()
+    home = _stage_home(root, "test")
+
+    assert root.parent == real_temp.resolve()
+    assert staged_codex_skill_dirs() == [(home / "skills").resolve()]
+
+
 def test_globber_returns_only_skills_subtrees_of_staged_homes(
     isolated_tempdir: Path,
 ) -> None:
@@ -93,6 +111,22 @@ def test_globber_returns_only_skills_subtrees_of_staged_homes(
 
 def test_globber_is_empty_when_root_is_absent(isolated_tempdir: Path) -> None:
     """No staging root (no codex session ever staged) → no grants."""
+    assert staged_codex_skill_dirs() == []
+
+
+@pytest.mark.skipif(not hasattr(os, "getuid"), reason="POSIX directory symlinks")
+@pytest.mark.parametrize("component", ["root", "home", "skills"])
+def test_globber_rejects_symlinked_staging_directories(
+    isolated_tempdir: Path, component: str
+) -> None:
+    """A staging-directory symlink must not grant its outside target."""
+    root = codex_home_staging_root()
+    home = _stage_home(root, "test")
+    link = {"root": root, "home": home, "skills": home / "skills"}[component]
+    outside = isolated_tempdir / f"outside-{component}"
+    link.rename(outside)
+    link.symlink_to(outside, target_is_directory=True)
+
     assert staged_codex_skill_dirs() == []
 
 

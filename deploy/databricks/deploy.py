@@ -36,6 +36,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from packaging.version import InvalidVersion, Version
+
 if TYPE_CHECKING:
     from databricks.sdk import WorkspaceClient
 
@@ -65,9 +67,6 @@ _ENV_VARS_TO_CLEAR = (
 _BUNDLE_RESOURCE_KEY = "omnigent"
 
 _WHEEL_PREFIXES = ("omnigent-", "omnigent_client-", "omnigent_ui_sdk-")
-_BUILTIN_EXTENSION_WHEEL_PREFIXES = ("omnigent_canvas-",)
-_ENABLE_CANVAS_ENV_VAR = "OMNIGENT_ENABLE_CANVAS"
-_TRUTHY_ENV_VALUES = frozenset({"1", "true", "yes"})
 
 
 def _log(msg: str) -> None:
@@ -96,6 +95,10 @@ def _pyproject_paths() -> list[Path]:
     ]
 
 
+def _version_py_path() -> Path:
+    return _repo_root() / "omnigent" / "version.py"
+
+
 def _read_base_version() -> str:
     """Read the base version from the top-level pyproject.toml.
 
@@ -114,21 +117,54 @@ def _read_base_version() -> str:
 def _compute_deploy_version(base: str, explicit: str | None) -> str:
     if explicit:
         # Caller knows what they want — let it through after a sanity check.
-        if not re.match(r"^\d+(\.\d+)*(\.dev\d+|\.post\d+|[+\-][\w.]+)?$", explicit):
-            raise SystemExit(f"--version {explicit!r} is not a recognizable PEP 440 version")
-        return explicit
-    # Strip any existing `.postN` / `.devN` suffix so we don't stack
-    # them if a prior deploy left pyproject.toml dirty (or someone
-    # committed the bumped value). Without this, `0.1.0.post<old>`
-    # would become `0.1.0.post<old>.post<new>` which isn't valid
-    # PEP 440 and fails the wheel build.
+        # The parser accepts every form this script generates, so a generated
+        # version can be fed back through `--skip-build --version`; the
+        # normalized form is the one wheel filenames carry.
+        try:
+            return str(Version(explicit))
+        except InvalidVersion:
+            raise SystemExit(f"--version {explicit!r} is not a valid PEP 440 version") from None
+    # Strip a previous deploy's stamp so suffixes don't stack if a prior
+    # deploy left pyproject.toml dirty (or someone committed the bumped
+    # value): the local segment first, then `.postN` / `.devN`.
+    base = re.sub(r"\+[\w.]+$", "", base)
     base = re.sub(r"(\.post\d+|\.dev\d+)+$", "", base)
     # Post-release, not dev: pip treats `.dev` as a pre-release and
     # ignores it when resolving `>=` constraints, so a deploy that
     # bumps via `.dev` clashes with `omnigent-ui-sdk` declaring
     # `omnigent-client>=0.1.0`. `.post` is a final release and
-    # sorts strictly above the base.
-    return f"{base}.post{int(time.time())}"
+    # sorts strictly above the base. The local segment names the commit
+    # so a debug-log row's app_version (and a runner's hello) says which
+    # build it came from.
+    return f"{base}.post{int(time.time())}{_git_build_suffix()}"
+
+
+def _git_build_suffix() -> str:
+    """PEP 440 local segment for the checked-out commit, e.g. ``+g1a2b3c4``.
+
+    ``.dirty`` is appended when the tree has uncommitted changes or untracked,
+    non-ignored files (the wheel packages those too), so a deploy from a
+    modified tree is not mistaken for the commit itself. Empty when the tree
+    is not a git checkout.
+    """
+    try:
+        sha = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=_repo_root(),
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        dirty = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=_repo_root(),
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+    except (OSError, subprocess.CalledProcessError):
+        return ""
+    return f"+g{sha}.dirty" if dirty else f"+g{sha}"
 
 
 def set_version_in_pyproject(path: Path, new_version: str) -> str:
@@ -166,11 +202,41 @@ def set_version_in_pyproject(path: Path, new_version: str) -> str:
     return original
 
 
+_VERSION_CONSTANT = re.compile(r'^VERSION = "[^"]*"$', re.MULTILINE)
+
+
+def set_version_constant(path: Path, new_version: str) -> str:
+    """Rewrite the ``VERSION`` constant the runtime imports.
+
+    ``omnigent/version.py`` is what debug-log rows (``app_version``), the
+    runner hello and ``omnigent --version`` report; the wheel build reads
+    only the pyprojects, so the stamped version has to be written here too
+    or the deployed processes keep announcing the unstamped base version.
+
+    :param path: ``<repo>/omnigent/version.py``.
+    :param new_version: Stamped deploy version, e.g.
+        ``"0.16.0.post1790000000+g1a2b3c4"``.
+    :returns: The original file text, for restore after the build.
+    """
+    original = path.read_text()
+    updated, count = _VERSION_CONSTANT.subn(f'VERSION = "{new_version}"', original)
+    if count != 1:
+        raise RuntimeError(f"could not rewrite VERSION in {path}")
+    path.write_text(updated)
+    return original
+
+
 def _stamp_versions(new_version: str) -> dict[Path, str]:
-    """Stamp `new_version` into all three pyprojects. Returns originals for restore."""
+    """Stamp `new_version` into the three pyprojects and the runtime constant.
+
+    :param new_version: Stamped deploy version.
+    :returns: Original file texts keyed by path, for restore after the build.
+    """
     backups: dict[Path, str] = {}
     for path in _pyproject_paths():
         backups[path] = set_version_in_pyproject(path, new_version)
+    version_py = _version_py_path()
+    backups[version_py] = set_version_constant(version_py, new_version)
     return backups
 
 
@@ -205,12 +271,7 @@ def _dist_web_ui_archive() -> Path:
     return _repo_root() / "dist" / _WEB_UI_ARCHIVE_NAME
 
 
-def _env_var_is_truthy(name: str) -> bool:
-    """Return whether an environment variable contains a supported true value."""
-    return os.environ.get(name, "").strip().lower() in _TRUTHY_ENV_VALUES
-
-
-def _build_wheels(skip_web_ui: bool, *, enable_canvas: bool = False) -> list[Path]:
+def _build_wheels(skip_web_ui: bool) -> list[Path]:
     """Invoke build.sh and return the resulting wheel paths."""
     root = _repo_root()
     build_sh = _deploy_dir() / "build.sh"
@@ -225,14 +286,8 @@ def _build_wheels(skip_web_ui: bool, *, enable_canvas: bool = False) -> list[Pat
         env["EXTERNALIZE_WEB_UI"] = "1"
         env.pop("SKIP_WEB_UI", None)
         env.pop("OMNIGENT_SKIP_WEB_UI", None)
-    if enable_canvas and not skip_web_ui:
-        env[_ENABLE_CANVAS_ENV_VAR] = "1"
-    else:
-        env.pop(_ENABLE_CANVAS_ENV_VAR, None)
-    modes = ["SKIP_WEB_UI=1" if skip_web_ui else "EXTERNALIZE_WEB_UI=1"]
-    if enable_canvas and not skip_web_ui:
-        modes.append(f"{_ENABLE_CANVAS_ENV_VAR}=1")
-    _log(f"$ {build_sh} ({', '.join(modes)})")
+    mode = "SKIP_WEB_UI=1" if skip_web_ui else "EXTERNALIZE_WEB_UI=1"
+    _log(f"$ {build_sh} ({mode})")
     subprocess.run([str(build_sh)], cwd=root, env=env, check=True)
     wheels = sorted((root / "dist").glob("*.whl"))
     if not wheels:
@@ -270,19 +325,16 @@ def _classify_wheels(wheels: Iterable[Path]) -> _ClassifiedWheels:
     return _ClassifiedWheels(main=main_wheel, small=small, oversize=oversize)
 
 
-def _partition_built_wheels(
+def _core_release_wheels(
     wheels: Iterable[Path], explicit_extensions: Iterable[Path] = ()
-) -> tuple[list[Path], list[Path]]:
-    """Separate core release wheels from bundled first-party extensions."""
+) -> list[Path]:
+    """Return the core release wheels, rejecting anything unexpected in dist/."""
     explicit_paths = {wheel.resolve() for wheel in explicit_extensions}
     core: list[Path] = []
-    extensions: list[Path] = []
     unexpected: list[Path] = []
     for wheel in wheels:
         if wheel.name.startswith(_WHEEL_PREFIXES):
             core.append(wheel)
-        elif wheel.name.startswith(_BUILTIN_EXTENSION_WHEEL_PREFIXES):
-            extensions.append(wheel)
         elif wheel.resolve() in explicit_paths:
             continue
         else:
@@ -293,45 +345,7 @@ def _partition_built_wheels(
             f"unexpected wheel(s) in dist/: {names}; pass additional extensions "
             "with --extension-wheel from a separate output directory"
         )
-    return core, extensions
-
-
-def _is_canvas_wheel(wheel: Path) -> bool:
-    """Return whether ``wheel`` is the first-party Canvas distribution."""
-    return wheel.name.startswith(_BUILTIN_EXTENSION_WHEEL_PREFIXES)
-
-
-def _select_extension_wheels(
-    builtin_extensions: Iterable[Path],
-    explicit_extensions: Iterable[Path],
-    *,
-    enable_canvas: bool,
-) -> list[Path]:
-    """Select deploy extensions while keeping Canvas behind its env opt-in."""
-    builtin = list(builtin_extensions)
-    explicit = list(explicit_extensions)
-    explicit_canvas = [wheel for wheel in explicit if _is_canvas_wheel(wheel)]
-    if explicit_canvas and not enable_canvas:
-        raise SystemExit(
-            f"Canvas is disabled; set {_ENABLE_CANVAS_ENV_VAR}=true instead of "
-            "passing its wheel directly"
-        )
-
-    canvas_wheels = list(
-        {wheel.resolve(): wheel for wheel in [*builtin, *explicit_canvas]}.values()
-    )
-    if enable_canvas and len(canvas_wheels) != 1:
-        names = ", ".join(wheel.name for wheel in canvas_wheels) or "none"
-        raise SystemExit(
-            f"{_ENABLE_CANVAS_ENV_VAR}=true requires exactly one Canvas wheel; "
-            f"found {names}. Rebuild without --skip-build or provide one with "
-            "--extension-wheel."
-        )
-
-    selected = [wheel for wheel in explicit if not _is_canvas_wheel(wheel)]
-    if enable_canvas:
-        selected.insert(0, canvas_wheels[0])
-    return selected
+    return core
 
 
 def _wheel_version(wheel: Path, prefix: str) -> str:
@@ -477,8 +491,9 @@ def _wheel_name_version(wheel: Path) -> tuple[str, str]:
     """
     Return the normalized distribution name and version from a wheel filename.
 
-    :param wheel: Wheel path, e.g. ``dist/omnigent_canvas-0.1.0-py3-none-any.whl``.
-    :returns: ``("omnigent-canvas", "0.1.0")``.
+    :param wheel: Wheel path, e.g.
+        ``dist/omnigent_hello_extension-0.1.0-py3-none-any.whl``.
+    :returns: ``("omnigent-hello-extension", "0.1.0")``.
     """
     name, version = wheel.name.split("-")[:2]
     return name.lower().replace("_", "-"), version
@@ -545,7 +560,7 @@ def build_uv_pyproject(
         ``"0.1.0.post123"``.
     :param extension_wheels: Omnigent extension wheels (``omnigent.extensions``
         entry points) installed alongside the server, e.g.
-        ``src/omnigent_canvas-0.1.0-py3-none-any.whl``.
+        ``src/omnigent_hello_extension-0.1.0-py3-none-any.whl``.
     :returns: Complete TOML text for ``src/pyproject.toml``.
     """
     source_lines = _uv_source_lines(main_wheel, small_wheels, oversize_wheels, extension_wheels)
@@ -783,7 +798,7 @@ def _parse_args() -> argparse.Namespace:
         default="",
         help=(
             "Comma-separated deployment-wide release features, e.g. "
-            "'usage_page'. Empty keeps every release feature off."
+            "'usage_page,canvas'. Empty keeps every release feature off."
         ),
     )
     parser.add_argument(
@@ -819,8 +834,9 @@ def _parse_args() -> argparse.Namespace:
         "--version",
         default=None,
         help=(
-            "Explicit PEP 440 version to stamp into pyprojects for this "
-            "deploy. Default: <base-version>.post<unix-ts>."
+            "Explicit PEP 440 version to stamp into the pyprojects and "
+            "omnigent/version.py for this deploy. Default: "
+            "<base-version>.post<unix-ts>+g<short-sha>."
         ),
     )
     parser.add_argument(
@@ -841,7 +857,7 @@ def _parse_args() -> argparse.Namespace:
         metavar="WHEEL",
         help=(
             "Prebuilt Omnigent extension wheel to install alongside the server "
-            "(repeatable), e.g. dist-ext/omnigent_canvas-0.1.0-py3-none-any.whl. "
+            "(repeatable), e.g. dist-ext/omnigent_hello_extension-0.1.0-py3-none-any.whl. "
             "The server discovers it through its omnigent.extensions entry point."
         ),
     )
@@ -1105,12 +1121,6 @@ def main() -> int:
     _clear_env_vars()
     _assert_clean_tree(skip=args.allow_dirty)
 
-    enable_canvas = _env_var_is_truthy(_ENABLE_CANVAS_ENV_VAR)
-    if enable_canvas and args.skip_web_ui:
-        _log(f"{_ENABLE_CANVAS_ENV_VAR}=true ignored with --skip-web-ui")
-        enable_canvas = False
-    _log(f"Canvas extension: {'enabled' if enable_canvas else 'disabled'}")
-
     base_version = _read_base_version()
     deploy_version = _compute_deploy_version(base_version, args.version)
     _log(f"deploy version: {deploy_version} (base: {base_version})")
@@ -1120,17 +1130,14 @@ def main() -> int:
         if not args.skip_build:
             _clean_build_artifacts()
             backups = _stamp_versions(deploy_version)
-            wheels = _build_wheels(
-                skip_web_ui=args.skip_web_ui,
-                enable_canvas=enable_canvas,
-            )
+            wheels = _build_wheels(skip_web_ui=args.skip_web_ui)
         else:
             dist = _repo_root() / "dist"
             wheels = sorted(dist.glob("*.whl"))
             if not wheels:
                 raise SystemExit("--skip-build was set but dist/ has no wheels to redeploy")
             wheel_version = _derive_deploy_version_from_wheels(wheels)
-            if args.version and args.version != wheel_version:
+            if args.version and deploy_version != wheel_version:
                 raise SystemExit(
                     f"--version {args.version!r} does not match reused wheel "
                     f"version {wheel_version!r}"
@@ -1146,15 +1153,9 @@ def main() -> int:
     for wheel in explicit_extension_wheels:
         if not wheel.is_file():
             raise SystemExit(f"--extension-wheel {wheel} does not exist")
-    core_wheels, builtin_extension_wheels = _partition_built_wheels(
-        wheels, explicit_extension_wheels
-    )
+    core_wheels = _core_release_wheels(wheels, explicit_extension_wheels)
     classified = _classify_wheels(core_wheels)
-    extension_wheels = _select_extension_wheels(
-        builtin_extension_wheels,
-        explicit_extension_wheels,
-        enable_canvas=enable_canvas,
-    )
+    extension_wheels = explicit_extension_wheels
     for wheel in wheels:
         size_mb = wheel.stat().st_size / 1024 / 1024
         _log(f"  {wheel.name}  {size_mb:.2f} MB")

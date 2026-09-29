@@ -1157,5 +1157,70 @@ def test_load_agent_def_enforce_allows_registered_handler() -> None:
     assert "ask_os" in agent.policies
 
 
+def test_load_agent_def_rejects_empty_document(tmp_path: Path) -> None:
+    """A comments-only spec names itself instead of raising AttributeError.
+
+    An empty or comments-only YAML file loads as ``None``. Every reader in the
+    parser indexes the document as a mapping, so an unguarded ``None`` used to
+    surface as a bare ``AttributeError: 'NoneType' object has no attribute
+    'get'`` — an internal error on what is really an invalid upload.
+
+    :param tmp_path: Pytest temporary directory fixture.
+    :returns: None.
+    """
+    spec = tmp_path / "agent.yaml"
+    spec.write_text("# nothing but a comment\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="must be a YAML mapping") as excinfo:
+        load_agent_def(spec)
+
+    message = str(excinfo.value)
+    assert "an empty document" in message
+    assert str(spec) in message, "the message must name the offending file"
+
+
+@pytest.mark.parametrize(
+    ("document", "expected"),
+    [
+        (None, "an empty document"),
+        ([{"name": "t"}], "a list"),
+        (42, "a int"),
+    ],
+)
+def test_load_agent_def_rejects_non_mapping_documents(
+    document: object,
+    expected: str,
+) -> None:
+    """Any non-mapping document is rejected by shape, naming what was found.
+
+    :param document: The parsed YAML value handed to the loader.
+    :param expected: The description the error message must contain.
+    :returns: None.
+    """
+    with pytest.raises(ValueError, match="must be a YAML mapping") as excinfo:
+        load_agent_def(document)  # type: ignore[arg-type]
+    assert expected in str(excinfo.value)
+
+
+def test_load_agent_def_rejects_a_scalar_spec_file(tmp_path: Path) -> None:
+    """A file holding a bare scalar is rejected by shape, not by AttributeError.
+
+    :param tmp_path: Pytest temporary directory fixture.
+    :returns: None.
+    """
+    spec = tmp_path / "agent.yaml"
+    spec.write_text("just-a-string\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="must be a YAML mapping") as excinfo:
+        load_agent_def(spec)
+    assert "a str" in str(excinfo.value)
+
+
+def test_load_agent_def_still_accepts_a_minimal_mapping() -> None:
+    """The guard does not block a valid spec that omits optional keys."""
+    agent = load_agent_def({"name": "t"})
+    assert agent.name == "t"
+
+
 if __name__ == "__main__":
     unittest.main()

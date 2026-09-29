@@ -7,12 +7,19 @@ import { cn } from "@/lib/utils";
 const IS_MAC = isMacPlatform();
 
 export const MOD_KEY = IS_MAC ? "⌘" : "Ctrl";
+// Literal Control on every platform (⌃ on Mac), for chords that use Ctrl rather
+// than the platform command modifier — unlike MOD_KEY, which is ⌘ on Mac.
+export const CTRL_KEY = IS_MAC ? "⌃" : "Ctrl";
 export const ALT_KEY = IS_MAC ? "⌥" : "Alt";
 export const ENTER_KEY = "↵";
 export const SHIFT_KEY = "⇧";
 
 export function composerSendShortcutKeys(submitWithModEnter: boolean): string[] {
   return submitWithModEnter ? [MOD_KEY, ENTER_KEY] : [ENTER_KEY];
+}
+
+export function composerSteerAllShortcutKeys(submitWithModEnter: boolean): string[] {
+  return submitWithModEnter ? [MOD_KEY, SHIFT_KEY, ENTER_KEY] : [MOD_KEY, ENTER_KEY];
 }
 
 export function composerNewLineShortcutKeys(submitWithModEnter: boolean): string[] {

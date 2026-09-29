@@ -457,7 +457,17 @@ async def test_claude_native_title_uses_tool_free_print_mode(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path,
 ) -> None:
+    from omnigent.harnesses.claude_native.main import ClaudeNativeUcodeConfig
+
     captured: dict[str, Any] = {}
+    claude_config = ClaudeNativeUcodeConfig(
+        env={"ANTHROPIC_BASE_URL": "https://gateway.example/anthropic"},
+        api_key_helper="printf token",
+        model_overrides={
+            "claude-opus-5": "deployment-current",
+            "claude-opus-4-8": "deployment-17",
+        },
+    )
 
     class FakeProcess:
         returncode = 0
@@ -471,7 +481,7 @@ async def test_claude_native_title_uses_tool_free_print_mode(
 
     monkeypatch.setattr(
         "omnigent.harnesses.claude_native.main.resolve_native_claude_config",
-        lambda spec=None: None,
+        lambda spec=None: claude_config,
     )
     monkeypatch.setattr(
         "omnigent.claude_launcher.resolve_claude_launch",
@@ -497,6 +507,14 @@ async def test_claude_native_title_uses_tool_free_print_mode(
     assert args[args.index("--tools") + 1] == ""
     assert args[args.index("--output-format") + 1] == "text"
     assert args[args.index("--model") + 1] == "claude-sonnet-4-6"
+    settings = json.loads(args[args.index("--settings") + 1])
+    assert settings == {
+        "apiKeyHelper": "printf token",
+        "modelOverrides": {
+            "claude-opus-5": "deployment-current",
+            "claude-opus-4-8": "deployment-17",
+        },
+    }
     assert "--no-session-persistence" in args
     assert captured["kwargs"]["cwd"] == str(tmp_path)
     assert "CLAUDECODE" not in captured["kwargs"]["env"]

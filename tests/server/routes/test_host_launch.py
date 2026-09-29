@@ -11,8 +11,10 @@ from dataclasses import dataclass, field
 import pytest
 from fastapi import HTTPException
 
+from omnigent import debug_logging
 from omnigent.entities import Conversation
 from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.server.auth import LEVEL_OWNER
 from omnigent.server.routes._host_launch import (
     host_absent_error,
     resolve_host_launch,
@@ -49,9 +51,28 @@ class _FakeHostRegistry:
 @dataclass
 class _FakeConversationStore:
     convs: dict[str, Conversation] = field(default_factory=dict)
+    reads: list[str] = field(default_factory=list)
 
     def get_conversation(self, conversation_id: str) -> Conversation | None:
+        self.reads.append(conversation_id)
         return self.convs.get(conversation_id)
+
+
+@dataclass
+class _FakePermissionStore:
+    grants: set[tuple[str, str]] = field(default_factory=set)
+
+    def is_admin(self, user_id: str) -> bool:
+        return False
+
+    def check_access(
+        self,
+        user_id: str | None,
+        conversation_id: str,
+        required_level: int,
+    ) -> bool:
+        assert required_level == LEVEL_OWNER
+        return user_id is not None and (user_id, conversation_id) in self.grants
 
 
 # ── resolve_host_owner ───────────────────────────────────────────────
@@ -147,6 +168,104 @@ class TestResolveHostLaunch:
         )
         assert result.host.host_id == "host_1"
         assert result.conv.id == "s1"
+
+    def test_preloaded_conversation_skips_reads_but_keeps_acl(self) -> None:
+        host = _FakeHost(host_id="host_1", user_id="alice")
+        conn = object()
+        conv = Conversation(
+            id="s1",
+            created_at=1,
+            updated_at=1,
+            root_conversation_id="s1",
+            agent_id="ag_1",
+        )
+        store = _FakeHostStore(hosts={"host_1": host})
+        registry = _FakeHostRegistry(conns={"host_1": conn})
+        conv_store = _FakeConversationStore()
+        permissions = _FakePermissionStore(grants={("alice", "s1")})
+
+        result = resolve_host_launch(
+            user_id="alice",
+            host_id="host_1",
+            session_id="s1",
+            host_store=store,
+            host_registry=registry,
+            conversation_store=conv_store,
+            permission_store=permissions,  # type: ignore[arg-type]
+            conversation=conv,
+        )
+
+        assert result.conv is conv
+        assert conv_store.reads == []
+
+        permissions.grants.clear()
+        with pytest.raises(HTTPException) as exc_info:
+            resolve_host_launch(
+                user_id="alice",
+                host_id="host_1",
+                session_id="s1",
+                host_store=store,
+                host_registry=registry,
+                conversation_store=conv_store,
+                permission_store=permissions,  # type: ignore[arg-type]
+                conversation=conv,
+            )
+        assert exc_info.value.status_code == 404
+        assert conv_store.reads == []
+
+    def test_standalone_resolution_does_not_record_create_timing(self) -> None:
+        """The shared host-launch route must not pollute create-only stages."""
+        host = _FakeHost(host_id="host_1", user_id="alice")
+        conv = Conversation(
+            id="s1",
+            created_at=1,
+            updated_at=1,
+            root_conversation_id="s1",
+            agent_id="ag_1",
+        )
+        permissions = _FakePermissionStore(grants={("alice", "s1")})
+        debug_logging.reset_request_audit_attrs()
+
+        resolve_host_launch(
+            user_id="alice",
+            host_id="host_1",
+            session_id="s1",
+            host_store=_FakeHostStore(hosts={"host_1": host}),
+            host_registry=_FakeHostRegistry(conns={"host_1": object()}),
+            conversation_store=_FakeConversationStore(convs={"s1": conv}),
+            permission_store=permissions,  # type: ignore[arg-type]
+        )
+
+        assert "create_acl_ms" not in debug_logging.current_request_audit_attrs()
+
+    def test_mismatched_preloaded_conversation_is_denied_without_reads(self) -> None:
+        host = _FakeHost(host_id="host_1", user_id="alice")
+        wrong_conv = Conversation(
+            id="s2",
+            created_at=1,
+            updated_at=1,
+            root_conversation_id="s2",
+            agent_id="ag_1",
+        )
+        store = _FakeHostStore(hosts={"host_1": host})
+        registry = _FakeHostRegistry(conns={"host_1": object()})
+        conv_store = _FakeConversationStore()
+        permissions = _FakePermissionStore(grants={("alice", "s1"), ("alice", "s2")})
+
+        with pytest.raises(HTTPException) as exc_info:
+            resolve_host_launch(
+                user_id="alice",
+                host_id="host_1",
+                session_id="s1",
+                host_store=store,
+                host_registry=registry,
+                conversation_store=conv_store,
+                permission_store=permissions,  # type: ignore[arg-type]
+                conversation=wrong_conv,
+            )
+
+        assert exc_info.value.status_code == 404
+        assert conv_store.reads == []
 
 
 # ── host_absent_error (single-replica vs sharded) ─────────────────────

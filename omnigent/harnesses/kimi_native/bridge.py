@@ -3,10 +3,10 @@
 The runner launches the ``kimi`` TUI in a private tmux pane and records
 that pane's socket + target here via :func:`write_tmux_target`. The harness
 executor then delivers Omnigent web-UI messages into the *same* pane via
-:func:`inject_user_message` (tmux bracketed paste + Enter) — the kimi analog
-of claude-native's tmux send-keys bridge. This is what wires the web-UI chat box
-to the running Kimi TUI (and, since the web UI embeds that pane, the message
-shows in both surfaces).
+:func:`inject_user_message` (tmux bracketed paste + Enter + C-s steer) — the
+kimi analog of claude-native's tmux send-keys bridge. This is what wires the
+web-UI chat box to the running Kimi TUI (and, since the web UI embeds that pane,
+the message shows in both surfaces).
 """
 
 from __future__ import annotations
@@ -843,7 +843,8 @@ def inject_user_message(
 
     Clears any leftover draft, pastes *content* (multi-line safe via
     ``load-buffer``/``paste-buffer -p`` so interior newlines stay data, not
-    submits), settles, then submits with Enter.
+    submits), settles, then submits with Enter. Once accepted, C-s steers the
+    draft into a running turn.
 
     :param bridge_dir: The kimi-native bridge dir holding ``tmux.json``.
     :param content: User text (non-empty).
@@ -851,7 +852,10 @@ def inject_user_message(
     :param cancel_event: Optional cancellation flag checked before delivery.
     :param turn_streaming: True when Kimi is already streaming and queues input.
     :raises RuntimeError: If the tmux target is never advertised or a tmux
-        command fails.
+        command fails before submission is accepted; a failed C-s steer is
+        logged instead.
+    :raises OSError: If an OS-level tmux failure occurs before submission is
+        accepted.
     """
     if not content:
         raise RuntimeError("kimi-native injection requires non-empty content")
@@ -1091,6 +1095,17 @@ def inject_user_message(
                 "Kimi TUI input box disappeared before the message could be submitted; "
                 "the message was not delivered"
             )
+
+        def _steer_accepted_draft() -> None:
+            try:
+                _run_tmux(socket_path, "send-keys", "-t", tmux_target, "C-s")
+            except (RuntimeError, OSError) as exc:
+                _logger.warning(
+                    "Kimi Ctrl-S steer failed after Enter was accepted; "
+                    "the message may remain queued until the turn ends: %s",
+                    exc,
+                )
+
         post_submit_deadline = time.monotonic() + _SUBMIT_VERIFY_TIMEOUT_S
         last_enter = time.monotonic()
         while time.monotonic() < post_submit_deadline:
@@ -1119,6 +1134,8 @@ def inject_user_message(
                     "resolve it in the terminal before sending another message"
                 )
             if state.editor_content is not None and draft_seen and not state.editor_content:
+                # Kimi >= 0.41 accepts C-s steering after the queued draft is accepted.
+                _steer_accepted_draft()
                 return
             if state.exit_armed and state.editor_content:
                 raise RuntimeError("Kimi terminal is exit-armed; press Escape and retry")
@@ -1145,6 +1162,8 @@ def inject_user_message(
             if _approval_pending(state) or not state.editor_present:
                 continue
             if state.editor_content is not None and draft_seen and not state.editor_content:
+                # Kimi >= 0.41 accepts C-s steering after the queued draft is accepted.
+                _steer_accepted_draft()
                 return
             if state.exit_armed:
                 raise RuntimeError("Kimi terminal is exit-armed; press Escape and retry")

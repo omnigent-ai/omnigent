@@ -538,6 +538,35 @@ def claude_managed_gateway(
     return None, False
 
 
+def claude_managed_model_picker(
+    paths: tuple[Path, ...] | None = None,
+) -> tuple[tuple[str, str], ...]:
+    """Read a replacement model picker from Claude Code's managed settings."""
+    for path in CLAUDE_CODE_MANAGED_SETTINGS_PATHS if paths is None else paths:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        picker = payload.get("modelPicker")
+        if not isinstance(picker, dict) or picker.get("replaceBuiltInOptions") is not True:
+            return ()
+        options = picker.get("options")
+        if not isinstance(options, list):
+            return ()
+        return tuple(
+            (model.strip(), label.strip())
+            for option in options
+            if isinstance(option, dict)
+            and isinstance((model := option.get("model")), str)
+            and model.strip()
+            and isinstance((label := option.get("label", model)), str)
+            and label.strip()
+        )
+    return ()
+
+
 def claude_managed_gateway_display_name(paths: tuple[Path, ...] | None = None) -> str | None:
     """A human label for the managed-settings credential, when one is delivered.
 
