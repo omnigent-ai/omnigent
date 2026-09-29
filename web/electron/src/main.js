@@ -1010,6 +1010,18 @@ function setWindowServerUrl(win, serverUrl) {
 }
 
 /**
+ * The URL a window's Arca host connects to: the one the user picked, even after
+ * sign-in moved to another host, so one server keeps one Arca host.
+ *
+ * @param {Electron.BrowserWindow | null} win
+ * @returns {string | null}
+ */
+function windowArcaServerUrl(win) {
+  const state = win ? windows.get(win) : undefined;
+  return state?.arcaServerUrl ?? state?.serverUrl ?? null;
+}
+
+/**
  * Record the version manifest of the server a window connected to (see
  * `fetchServerManifest` in src/url.js). Stored per-window because different
  * windows can be pinned to different servers — and therefore to servers of
@@ -1604,6 +1616,12 @@ async function loadServerUrl(
     databricksAuth?.reset(win);
     pinWindow(win, originOf(serverUrl), attempt);
     setWindowServerUrl(win, serverUrl);
+    const windowState = windows.get(win);
+    if (windowState) {
+      windowState.arcaServerUrl =
+        serverLabel(parseServerLabels(loadSettings().server_labels), requestedServerUrl) ??
+        requestedServerUrl;
+    }
     let target = loadUrl ?? (routePath ? resolveServerPath(serverUrl, routePath) : serverUrl);
     if (usesBrowserAuth(serverUrl)) {
       reportConnectionProgress(win, attempt, "authenticating");
@@ -1653,7 +1671,8 @@ async function loadServerUrl(
     });
     await win.loadURL(target);
     assertCurrent();
-    void refreshArcaBinary().then(() => arcaAutoConnect.ensure(serverUrl));
+    const arcaServerUrl = windowArcaServerUrl(win);
+    void refreshArcaBinary().then(() => arcaAutoConnect.ensure(arcaServerUrl));
     return serverUrl;
   } finally {
     attempt.pending = false;
@@ -3844,9 +3863,11 @@ function registerIpc() {
     if (!isDatabricksManagedServerUrl(serverUrl)) {
       return { ok: false, error: "Arca hosts can only connect to Databricks-managed servers." };
     }
+    const win = BrowserWindow.fromWebContents(event.sender);
+    const arcaServerUrl = windowArcaServerUrl(win);
     // An auto-connect already running shares its outcome instead of racing a
     // second `arca ssh`.
-    const autoRun = arcaAutoConnect.inFlight(serverUrl);
+    const autoRun = arcaAutoConnect.inFlight(arcaServerUrl);
     if (autoRun) {
       const status = await autoRun;
       return status.state === "online"
@@ -3858,8 +3879,7 @@ function registerIpc() {
             authError: status.errorKind === "omni-auth",
           };
     }
-    const win = BrowserWindow.fromWebContents(event.sender);
-    return arcaConnectFlow.run(win, serverUrl);
+    return arcaConnectFlow.run(win, arcaServerUrl);
   });
 
   // Push a status ping when a host child connects or exits on its own (no

@@ -409,6 +409,43 @@ describe("Arca auto-connect wiring", () => {
     assert.deepEqual(h.calls.arcaConnects, [workspace]);
   });
 
+  it("keeps one Arca host for a pick whose sign-in moves to the workspace host", async (t) => {
+    const picked = "https://accounts.cloud.databricks.com/omnigent?o=123";
+    const workspaceOrigin = new URL(workspace).origin;
+    const options = {
+      databricksMode: "browser",
+      arcaPath: "/usr/local/bin/arca",
+      internalFeatures: true,
+      ensureSession: async () => workspaceOrigin,
+    };
+    const h = loadNavigationHarness({ ...options, serverUrl: picked });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    const setupEvent = {
+      sender: h.webContents,
+      senderFrame: { url: `file://${h.api.SETUP_PAGE}` },
+    };
+    // Onboarding connects Arca to the pick, then opens it; sign-in lands on the workspace host.
+    const setupPage = { send() {}, once() {}, removeListener() {}, isDestroyed: () => false };
+    const connected = await h.ipc.get("omnigent:connect-runner")(
+      { sender: setupPage, senderFrame: setupEvent.senderFrame },
+      picked,
+      "remote",
+    );
+    assert.equal(connected.ok, true);
+    await h.ipc.get("omnigent:set-server-url")(setupEvent, picked);
+    await tick();
+    assert.deepEqual(h.calls.arcaConnects, [picked]);
+
+    // Next launch opens the saved workspace host, and Arca still targets the pick.
+    const relaunched = loadNavigationHarness({ ...options, serverUrl: workspace });
+    t.after(relaunched.cleanup);
+    fs.copyFileSync(h.settingsPath, relaunched.settingsPath);
+    await relaunched.api.loadServerUrl(relaunched.win, workspace);
+    await tick();
+    assert.deepEqual(relaunched.calls.arcaConnects, [picked]);
+  });
+
   it("stays off without the feature flag, even with arca installed", async (t) => {
     const h = loadNavigationHarness({ serverUrl: workspace, databricksMode: "browser", arcaPath });
     t.after(h.cleanup);
