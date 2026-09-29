@@ -368,7 +368,10 @@ open web — Slack, Drive, Confluence, and whatever else your company has
 connected — through the PipesHub MCP server. It searches before it answers and
 cites what it found, so you can check the source. Same shape as Deep Research:
 one agent, one `tools/mcp/*.yaml` server. (Needs a PipesHub deployment and a
-personal access token.)
+personal access token. Installed with `uv tool` or `pip` rather than from a
+checkout? Its
+[README](https://github.com/omnigent-ai/omnigent/blob/main/examples/pipeshub/README.md)
+has a one-line copy command.)
 
 **Prefer the browser?** One command starts the local server and registers this
 machine as a host:

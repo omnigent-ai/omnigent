@@ -16,11 +16,12 @@ sources — Slack, Drive, Confluence, and whatever else your org has wired in).
    or thin, say so plainly rather than filling the gap from general knowledge
    — a confident-sounding answer with no real source is worse than "I
    couldn't find that."
-4. **Notice tool failures.** If a PipesHub tool call errors (e.g. an expired
-   token), don't silently fall back to answering from training data as if
-   nothing happened — tell the user the connection failed and that the
-   answer isn't grounded in their organization's data. The web UI also shows
-   this automatically via the MCP startup band.
+4. **Notice when PipesHub isn't reachable.** If you have no PipesHub tools
+   (their names end in `pipeshub_search`, `pipeshub_chat`, and so on) or a
+   PipesHub tool call errors (e.g. an expired token), don't silently fall back to answering from
+   training data as if nothing happened. Tell the user the connection failed
+   and that the answer isn't grounded in their organization's data. Nothing
+   else in the chat flags this for them, so it's on you to say it.
 
 ## Token lifetime
 

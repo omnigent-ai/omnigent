@@ -8,7 +8,7 @@
 #   - PIPESHUB_MCP_URL and PIPESHUB_MCP_TOKEN set in the environment (the
 #     token panel gives you a ready-to-paste block with both).
 #
-# Usage:
+# Usage (see README.md for running it from a pip / uv tool install):
 #   PIPESHUB_MCP_URL=... PIPESHUB_MCP_TOKEN=... omnigent run examples/pipeshub/
 
 spec_version: 1
@@ -18,12 +18,12 @@ description: >-
   organization's PipesHub-connected knowledge sources via the PipesHub MCP
   server.
 
-# "Brain": Claude Agent SDK, pinned deliberately — this example is written
-# against claude-sdk's MCP failure/runner path (see AGENTS.md and the
-# `session.mcp_startup` band in the web UI for how a bad/expired token
-# surfaces). Don't switch this to a native harness without re-checking that
-# story; native harnesses run their own MCP startup pipeline and will look
-# healthier than they are for a stale token.
+# "Brain": Claude Agent SDK, pinned deliberately. On this harness Omnigent
+# connects the PipesHub MCP server itself: if that fails (bad token, wrong
+# URL, outage), the session still starts without PipesHub's tools and the
+# reason goes to the runner log (`omnigent debug logs`). AGENTS.md tells the
+# agent to say so instead of answering from training data. Re-check that
+# before moving this to a native harness, which runs its own MCP startup.
 executor:
   type: omnigent
   config:
