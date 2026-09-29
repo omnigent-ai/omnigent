@@ -9,6 +9,7 @@ function with a stub async client returning controlled snapshots.
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Awaitable, Callable
 from typing import Any
 
@@ -16,6 +17,8 @@ import httpx
 import pytest
 
 import omnigent.runner.native.orchestration as _orchestration
+from omnigent import debug_logging
+from omnigent.errors import OmnigentError
 from omnigent.runner.app import _codex_native_launch_config
 
 
@@ -113,9 +116,9 @@ async def test_missing_client_raises() -> None:
 
 @pytest.mark.asyncio
 async def test_http_error_raises() -> None:
-    """A transport error fetching the snapshot surfaces as a RuntimeError."""
+    """A persistent transport error fetching the snapshot surfaces as an OmnigentError."""
     client = _Client(raise_exc=httpx.ConnectError("boom"))
-    with pytest.raises(RuntimeError, match="Could not fetch Codex launch config"):
+    with pytest.raises(OmnigentError, match="Could not fetch Codex launch config"):
         await _run(client)
 
 
@@ -131,7 +134,7 @@ async def test_non_200_raises() -> None:
 async def test_invalid_json_raises() -> None:
     """A body that does not parse as JSON is rejected."""
     client = _Client(_Resp(200, None, json_raises=True))
-    with pytest.raises(RuntimeError, match="invalid JSON"):
+    with pytest.raises(OmnigentError, match="invalid JSON"):
         await _run(client)
 
 
@@ -139,7 +142,7 @@ async def test_invalid_json_raises() -> None:
 async def test_non_dict_snapshot_raises() -> None:
     """A JSON array (not an object) is not a valid session snapshot."""
     client = _Client(_Resp(200, ["not", "a", "dict"]))
-    with pytest.raises(RuntimeError, match="not a JSON object"):
+    with pytest.raises(OmnigentError, match="not a JSON object"):
         await _run(client)
 
 
@@ -310,7 +313,7 @@ async def test_persistent_transient_failure_raises_after_attempt_cap(
 ) -> None:
     """A read timeout on every attempt exhausts the bounded retries and fails loud."""
     client = _SequenceClient([httpx.ReadTimeout("slow")] * 3)
-    with pytest.raises(RuntimeError, match="Could not fetch Codex launch config"):
+    with pytest.raises(OmnigentError, match="Could not fetch Codex launch config"):
         await _codex_native_launch_config(session_id="conv_1", server_client=client)
     assert client.calls == 3, "Should attempt exactly the configured cap, then fail."
     assert retry_sleeps == [pytest.approx(0.5), pytest.approx(1.0)], (
@@ -348,3 +351,48 @@ async def test_non_transient_transport_error_fails_without_retry(
         await _codex_native_launch_config(session_id="conv_1", server_client=client)
     assert client.calls == 1, "A non-transient error should not be retried."
     assert retry_sleeps == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "actions",
+    [
+        pytest.param([httpx.ReadTimeout("slow")] * 3, id="persistent-read-timeout"),
+        pytest.param([_Resp(503, None)] * 3, id="persistent-503"),
+        pytest.param([_Resp(500, None)], id="internal-500"),
+    ],
+)
+async def test_server_side_launch_config_failure_is_server_blocking(
+    actions: list[Any],
+) -> None:
+    """A server that never serves the launch config is a blocking platform fault.
+
+    Startup-reliability KPIs count a ``terminal_start_failed`` row as a platform
+    failure only when it carries a server/host/runner category and blocking
+    impact; the debug-log sink reads both off the raised exception.
+    """
+    client = _SequenceClient(actions)
+    with pytest.raises(OmnigentError) as info:
+        await _codex_native_launch_config(session_id="conv_1", server_client=client)
+    record = logging.LogRecord(
+        "omnigent.runner",
+        logging.ERROR,
+        __file__,
+        0,
+        "failed",
+        None,
+        (type(info.value), info.value, info.value.__traceback__),
+    )
+    attrs = debug_logging._attributes(record, "runner")
+    assert attrs["error_category"] == "server"
+    assert attrs["error_impact"] == "blocking"
+    assert attrs["error_phase"] == "harness_setup"
+
+
+@pytest.mark.asyncio
+async def test_client_side_launch_config_failure_stays_unattributed() -> None:
+    """A 404 (e.g. a session deleted mid-launch) is not claimed as a server fault."""
+    client = _SequenceClient([_Resp(404, None)])
+    with pytest.raises(RuntimeError) as info:
+        await _codex_native_launch_config(session_id="conv_1", server_client=client)
+    assert not isinstance(info.value, OmnigentError)

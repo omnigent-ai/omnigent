@@ -788,3 +788,18 @@ async def test_list_sessions_pinned_filter(
     assert plain.id not in ids
     # A pin belonging to another user must not appear for the caller.
     assert other_user_pin.id not in ids
+
+
+async def test_patch_rejects_forged_worktree_identity(
+    client: httpx.AsyncClient, session_id: str, db_uri: str
+) -> None:
+    """The cleanup identity must remain server-owned after creation."""
+    from omnigent.server.routes._host_worktree import WORKTREE_ROOT_LABEL_KEY
+
+    response = await client.patch(
+        f"/v1/sessions/{session_id}", json={"labels": {WORKTREE_ROOT_LABEL_KEY: "forged"}}
+    )
+    assert response.status_code == 400, response.text
+    conv = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
+    assert conv is not None
+    assert WORKTREE_ROOT_LABEL_KEY not in conv.labels

@@ -72,7 +72,6 @@ from omnigent.host.frames import (
     HostImportLocalByIdFrame,
     HostImportLocalDoneFrame,
     HostImportLocalFrame,
-    HostImportLocalSessionFrame,
     HostInstallHarnessFrame,
     HostInstallHarnessResultFrame,
     HostLaunchRunnerFrame,
@@ -99,8 +98,10 @@ from omnigent.host.frames import (
     HostStopRunnerResultFrame,
     HostStoreSecretFrame,
     HostStoreSecretResultFrame,
+    ImportSessionChunkingUnsupportedError,
     decode_host_frame,
     encode_host_frame,
+    encode_import_local_session_frames,
     workspace_missing_message,
 )
 from omnigent.host.git_worktree import (
@@ -2623,13 +2624,28 @@ class HostProcess:
                             }
                         )
                         continue
-                    await ws.send(
-                        encode_host_frame(
-                            HostImportLocalSessionFrame(
-                                request_id=frame.request_id, total=total, session=session
-                            )
-                        )
+                    # Oversized sessions are sliced into chunk frames; a single
+                    # whole-session frame past the tunnel's message cap would
+                    # drop the host connection and kill the rest of the batch.
+                    for text in encode_import_local_session_frames(
+                        frame.request_id,
+                        total,
+                        session,
+                        allow_chunks=frame.allow_session_chunks,
+                    ):
+                        await ws.send(text)
+                except ImportSessionChunkingUnsupportedError:
+                    failures.append(
+                        {
+                            "external_session_id": session_id,
+                            "source": source,
+                            "reason": (
+                                "This session is too large for the connected server. "
+                                "Upgrade the server and retry."
+                            ),
+                        }
                     )
+                    continue
                 except ConnectionClosed:
                     # Dead tunnel: abort the batch (recovery is owned upstream),
                     # never a per-session skip — nothing more can be sent.
@@ -3293,7 +3309,10 @@ class HostProcess:
                 error="the codex model probe failed — see the host log",
             )
 
-        if harness == "pi-native":
+        if harness in ("pi-native", "pi"):
+            # ``pi`` is a canonical harness id (the gateway-wrapped headless
+            # Pi), not an alias of ``pi-native``; both share one configured
+            # inventory.
             try:
                 from omnigent.harnesses.pi_native.credentials import pi_native_model_options
 
@@ -3588,6 +3607,7 @@ class HostProcess:
             status="ok",
             worktree_path=created.worktree_path,
             branch=created.branch,
+            workspace=created.workspace,
         )
 
     async def _handle_remove_worktree(
@@ -3649,6 +3669,7 @@ class HostProcess:
                 worktrees = await asyncio.to_thread(
                     list_worktrees,
                     repo_path=frame.repo_path,
+                    for_cleanup=frame.for_cleanup,
                 )
         except WorktreeError as exc:
             return HostListWorktreesResultFrame(

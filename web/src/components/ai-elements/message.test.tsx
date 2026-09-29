@@ -1,11 +1,13 @@
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { setEmbedRoot } from "@/lib/host";
 import { Message, MessageAction, MessageActions, MessageContent, MessageResponse } from "./message";
 
 const clipboardDescriptor = Object.getOwnPropertyDescriptor(Navigator.prototype, "clipboard");
 const execCommandDescriptor = Object.getOwnPropertyDescriptor(Document.prototype, "execCommand");
 
 afterEach(() => {
+  setEmbedRoot(null);
   vi.unstubAllGlobals();
   cleanup();
   vi.restoreAllMocks();
@@ -141,6 +143,35 @@ describe("MessageResponse", () => {
     );
 
     expect(container.firstElementChild).toHaveClass("wrap-anywhere", "math-config-a");
+  });
+});
+
+describe("MessageResponse table fullscreen", () => {
+  const tableMarkdown = "| Name | Value |\n| --- | --- |\n| Alpha | One |";
+
+  it("opens inside the embed root and closes from the fullscreen control", async () => {
+    const embedRoot = document.createElement("div");
+    document.body.appendChild(embedRoot);
+    setEmbedRoot(embedRoot);
+    render(<MessageResponse>{tableMarkdown}</MessageResponse>);
+
+    fireEvent.click(await screen.findByRole("button", { name: "View fullscreen" }));
+
+    const dialog = within(embedRoot).getByRole("dialog", { name: "View fullscreen" });
+    expect(within(dialog).getByRole("cell", { name: "Alpha" })).toBeInTheDocument();
+
+    fireEvent.click(within(dialog).getByRole("button", { name: "Exit fullscreen" }));
+    expect(within(embedRoot).queryByRole("dialog", { name: "View fullscreen" })).toBeNull();
+    embedRoot.remove();
+  });
+
+  it("closes the fullscreen table with Escape", async () => {
+    render(<MessageResponse>{tableMarkdown}</MessageResponse>);
+    fireEvent.click(await screen.findByRole("button", { name: "View fullscreen" }));
+
+    expect(screen.getByRole("dialog", { name: "View fullscreen" })).toBeInTheDocument();
+    fireEvent.keyDown(document, { key: "Escape" });
+    expect(screen.queryByRole("dialog", { name: "View fullscreen" })).toBeNull();
   });
 });
 

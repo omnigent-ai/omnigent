@@ -6,6 +6,7 @@ import json
 import logging
 from collections.abc import Mapping
 from contextlib import suppress
+from pathlib import PureWindowsPath
 from typing import Any, Protocol, cast
 
 from sqlalchemy import (
@@ -3585,7 +3586,7 @@ class SqlAlchemyConversationStore(ConversationStore):
 
         run_write_transaction(self._session_immediate, "touch_runner_liveness", write)
 
-    def clear_runner_liveness(self, runner_id: str) -> None:
+    def clear_runner_liveness(self, runner_id: str, not_after: int | None = None) -> None:
         """
         Clear ``runner_last_seen`` for sessions bound to a runner.
 
@@ -3593,18 +3594,25 @@ class SqlAlchemyConversationStore(ConversationStore):
         (sidebar ordering) is untouched by construction. See the abstract method.
 
         :param runner_id: The disconnected runner's id.
+        :param not_after: When given, skip a row whose stamp is newer —
+            another replica already re-stamped it after the runner
+            reconnected there.
         """
         from sqlalchemy import update
 
         def write(session: Session) -> None:
-            session.execute(
-                update(SqlConversationMetadata)
-                .where(
-                    SqlConversationMetadata.workspace_id == current_workspace_id(),
-                    SqlConversationMetadata.runner_id == runner_id,
-                )
-                .values(runner_last_seen=None)
+            stmt = update(SqlConversationMetadata).where(
+                SqlConversationMetadata.workspace_id == current_workspace_id(),
+                SqlConversationMetadata.runner_id == runner_id,
             )
+            if not_after is not None:
+                stmt = stmt.where(
+                    or_(
+                        SqlConversationMetadata.runner_last_seen.is_(None),
+                        SqlConversationMetadata.runner_last_seen <= not_after,
+                    )
+                )
+            session.execute(stmt.values(runner_last_seen=None))
 
         run_write_transaction(self._session_immediate, "clear_runner_liveness", write)
 
@@ -4995,6 +5003,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         host_id: str,
         workspace: str,
         exclude_conversation_id: str,
+        include_subdirectories: bool = False,
     ) -> bool:
         """
         Is another non-archived conversation sitting in this ``(host_id, workspace)``?
@@ -5004,29 +5013,56 @@ class SqlAlchemyConversationStore(ConversationStore):
         table (Omnigent DB) while ``archived`` lives on ``conversations`` (AP
         DB, which may be a separate engine), so they cannot be joined. They
         are ordered so the overwhelmingly common answer — nothing else is in
-        the directory — costs a single indexed query and returns before the AP
+        the directory — costs a single metadata query and returns before the AP
         DB is touched at all.
         """
+        workspace_column: ColumnElement[str | None] = SqlConversationMetadata.workspace.expression
+        workspace_match: ColumnElement[bool] = workspace_column == workspace
+        windows_workspace = include_subdirectories and PureWindowsPath(workspace).is_absolute()
+        if include_subdirectories:
+            if windows_workspace:
+                workspace = workspace.replace("\\", "/").lower()
+            prefix = workspace.rstrip("/") + "/"
+            if windows_workspace:
+                # SQL lower() is not consistently Unicode-aware across databases.
+                workspace_match = workspace_column.is_not(None)
+            else:
+                workspace_match = or_(
+                    workspace_column == workspace,
+                    # SQLite LIKE ignores ASCII case even for case-sensitive POSIX paths.
+                    func.substr(workspace_column, 1, len(prefix)) == prefix,
+                )
         with self._session("check_workspace_used_by_other_session") as meta_sess:
-            candidate_ids = list(
-                meta_sess.scalars(
-                    select(SqlConversationMetadata.id)
+            candidates = list(
+                meta_sess.execute(
+                    select(SqlConversationMetadata.id, workspace_column)
                     .where(
                         SqlConversationMetadata.workspace_id == current_workspace_id(),
                         SqlConversationMetadata.host_id == host_id,
-                        SqlConversationMetadata.workspace == workspace,
+                        workspace_match,
                         SqlConversationMetadata.id != exclude_conversation_id,
                     )
                     .limit(_WORKSPACE_SHARER_SCAN_LIMIT)
                 )
             )
-        if not candidate_ids:
+        if not candidates:
             return False
-        if len(candidate_ids) >= _WORKSPACE_SHARER_SCAN_LIMIT:
-            # More sharers than we bound the scan to. "In use" is the safe
+        if len(candidates) >= _WORKSPACE_SHARER_SCAN_LIMIT:
+            # The candidate bound was reached. "In use" is the safe
             # answer: a wrong "free" deletes a directory out from under a
             # running session, while a wrong "in use" only leaves it behind.
             return True
+        if windows_workspace:
+            candidate_ids = []
+            prefix = workspace.rstrip("/") + "/"
+            for candidate_id, candidate_workspace in candidates:
+                normalized = (candidate_workspace or "").replace("\\", "/").lower()
+                if normalized == workspace or normalized.startswith(prefix):
+                    candidate_ids.append(candidate_id)
+        else:
+            candidate_ids = [candidate_id for candidate_id, _ in candidates]
+        if not candidate_ids:
+            return False
         with self._conv_session("check_workspace_sharers_are_archived") as conv_sess:
             return (
                 conv_sess.scalar(

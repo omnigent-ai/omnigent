@@ -246,6 +246,17 @@ describe("useSlashCompletion arrow navigation", () => {
 });
 
 describe("useSlashCompletion Tab/Enter completion", () => {
+  it("uses the completion-only callback for Tab while Enter still selects", () => {
+    const onTabComplete = vi.fn();
+    const { view, onSelect } = setup({ text: "/comp", onTabComplete });
+    expect(view.result.current.handleKey(keyEvent("Tab"), NO_PREFERENCE)).toBe(true);
+    expect(onTabComplete).toHaveBeenCalledExactlyOnceWith("/compact");
+    expect(onSelect).not.toHaveBeenCalled();
+
+    expect(view.result.current.handleKey(keyEvent("Enter"), NO_PREFERENCE)).toBe(true);
+    expect(onSelect).toHaveBeenCalledExactlyOnceWith("/compact");
+  });
+
   it("completes the highlighted match with Tab", () => {
     const { view, onSelect } = setup({ text: "/rev" });
     const event = keyEvent("Tab");

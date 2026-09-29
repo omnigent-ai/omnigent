@@ -13,6 +13,7 @@ describe("LandingStep", () => {
         managedServers={[]}
         onGetStarted={onGetStarted}
         onJoinServer={onJoinServer}
+        onAddServer={vi.fn()}
         onJoinManaged={vi.fn()}
       />,
     );
@@ -31,6 +32,7 @@ describe("LandingStep", () => {
         managedServers={["https://field-eng-omni.aws.databricksapps.com"]}
         onGetStarted={vi.fn()}
         onJoinServer={vi.fn()}
+        onAddServer={vi.fn()}
         onJoinManaged={onJoinManaged}
       />,
     );
@@ -47,11 +49,28 @@ describe("LandingStep", () => {
         managedServers={["https://field-eng-omni.aws.databricksapps.com"]}
         onGetStarted={vi.fn()}
         onJoinServer={onJoinServer}
+        onAddServer={vi.fn()}
         onJoinManaged={vi.fn()}
       />,
     );
     fireEvent.pointerDown(screen.getByRole("button", { name: /choose team url/i }), { button: 0 });
     fireEvent.click(screen.getByRole("menuitem", { name: /show all servers/i }));
     expect(onJoinServer).toHaveBeenCalledOnce();
+  });
+
+  it("offers 'Add server…' in the preset dropdown → onAddServer", () => {
+    const onAddServer = vi.fn();
+    render(
+      <LandingStep
+        managedServers={["https://field-eng-omni.aws.databricksapps.com"]}
+        onGetStarted={vi.fn()}
+        onJoinServer={vi.fn()}
+        onAddServer={onAddServer}
+        onJoinManaged={vi.fn()}
+      />,
+    );
+    fireEvent.pointerDown(screen.getByRole("button", { name: /choose team url/i }), { button: 0 });
+    fireEvent.click(screen.getByRole("menuitem", { name: /add server/i }));
+    expect(onAddServer).toHaveBeenCalledOnce();
   });
 });

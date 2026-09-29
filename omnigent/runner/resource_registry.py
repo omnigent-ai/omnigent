@@ -40,6 +40,8 @@ from omnigent.entities.session_resources import (
     terminal_resource_view,
 )
 from omnigent.inner.sandbox import contained_realpath, containment_prefix
+from omnigent.native.native_coding_agents import native_coding_agent_for_harness
+from omnigent.native.native_dispatch import resolve_hook_for_key
 
 if TYPE_CHECKING:
     from omnigent.harnesses.claude_native.status_file import SessionStatusPoller
@@ -276,6 +278,34 @@ def _monotonic() -> float:
     :returns: Seconds from an arbitrary monotonic reference point.
     """
     return time.monotonic()
+
+
+def _native_input_ready_probe(
+    resource_role: str | None,
+) -> Callable[[str, TerminalInstance], bool] | None:
+    """Resolve the provider's ``input_ready_probe`` for a native terminal role.
+
+    Native terminal roles are the harness names (``"pi-native"``), so the role
+    maps straight onto the provider row that owns the probe.
+
+    :param resource_role: Runner-private terminal role, e.g.
+        :data:`PI_NATIVE_TERMINAL_ROLE`, or ``None`` for a generic terminal.
+    :returns: The probe, or ``None`` for generic terminals or a probe that fails
+        to import (logged loudly, but readiness logging must not block the
+        terminal watcher).
+    """
+    agent = native_coding_agent_for_harness(resource_role)
+    if agent is None:
+        return None
+    try:
+        return resolve_hook_for_key(agent.key, "input_ready_probe")
+    except Exception:  # noqa: BLE001 - see docstring.
+        _logger.warning(
+            "Native input-ready probe unavailable for %s; native_input_ready will not be logged",
+            resource_role,
+            exc_info=True,
+        )
+        return None
 
 
 # Allowlist rather than a denylist: a denylist only stops the separators it
@@ -1347,6 +1377,7 @@ class SessionResourceRegistry:
             with self._lock:
                 self._status_pollers[session_id] = status_poller
 
+        input_ready_probe = _native_input_ready_probe(resource_role)
         native_input_ready = False
 
         def _on_tick() -> None:
@@ -1378,20 +1409,17 @@ class SessionResourceRegistry:
                         exc_info=True,
                         extra={"session_id": session_id},
                     )
-            if resource_role == CLAUDE_NATIVE_TERMINAL_ROLE and not native_input_ready:
+            if input_ready_probe is not None and not native_input_ready:
                 # Readiness logging must not stop the lifecycle watcher on failure.
                 with contextlib.suppress(Exception):
-                    from omnigent.harnesses.claude_native.bridge import claude_pane_text_ready
-
-                    # The watcher already captured this live pane; no extra tmux query.
-                    if claude_pane_text_ready(instance.last_pane_text() or ""):
+                    if input_ready_probe(session_id, instance):
                         native_input_ready = True
                         _logger.info(
-                            "Claude native input ready",
+                            "Native input ready",
                             extra=debug_event(
                                 "native_input_ready",
                                 session_id=session_id,
-                                harness="claude-native",
+                                harness=resource_role,
                                 terminal_instance_id=instance.diagnostic_id,
                                 stage="native_input",
                             ),
@@ -1471,10 +1499,13 @@ class SessionResourceRegistry:
                 )
 
         if not emit_status:
+            needs_tick = (
+                resource_role == CLAUDE_NATIVE_TERMINAL_ROLE or input_ready_probe is not None
+            )
             instance.start_idle_watcher_thread(
                 on_activity=_on_activity if activity_publisher is not None else None,
                 on_exit=_on_exit,
-                on_tick=_on_tick if resource_role == CLAUDE_NATIVE_TERMINAL_ROLE else None,
+                on_tick=_on_tick if needs_tick else None,
                 replace=replace,
             )
             return

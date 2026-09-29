@@ -12,13 +12,21 @@ import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuRadioGroup,
+  DropdownMenuRadioItem,
+  DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { LandingFooter } from "@/pages/onboarding/LandingFooter";
 import { LandingStep } from "@/pages/onboarding/LandingStep";
 import { HarnessIconRow, LocalIntroStep } from "@/pages/onboarding/LocalIntroStep";
 import { ServerDetailStep } from "@/pages/onboarding/ServerDetailStep";
-import { ServerHeroIcons, ServerSelectStep } from "@/pages/onboarding/ServerSelectStep";
+import {
+  isLocalInstall,
+  ServerHeroIcons,
+  ServerSelectStep,
+} from "@/pages/onboarding/ServerSelectStep";
 import { SetupTerminalStep } from "@/pages/onboarding/SetupTerminalStep";
 
 /**
@@ -42,9 +50,15 @@ export interface ServerSelectorV2Setup {
   recentServers: string[];
   /** Organization-provided server URLs. */
   managedServers: string[];
-  /** Whether the `omnigent` CLI is already installed (returning user). Drives
-   *  the "Install" vs "Open" action label and the returning-user start step. */
+  /** Whether the `omnigent` CLI is already installed. Drives the "Install" vs
+   *  "Start"/"Open" action label and whether install runs first. */
   installed?: boolean;
+  /** Has connected to any server before (returning user). The shell counts MDM
+   *  presets too, which `recentServers` excludes, so it outlives the list. */
+  connectedBefore?: boolean;
+  /** start-local would reuse a healthy server (checked at load) → the local
+   *  intro and its terminal read "Open"/"Opening" rather than "Start". */
+  localServerRunning?: boolean;
   /** Mocks only: route Join / Install actions to the terminal step (which runs
    *  the mocked local-server flow) instead of the no-op connect, so the install
    *  screen is reachable from every path. Never set by the real shell. */
@@ -76,6 +90,15 @@ export interface ServerSelectorV2Setup {
   onCloudSetup: () => void;
   /** Revert to the classic (legacy) setup page. */
   onSwitchToLegacy: () => void;
+  /** Disable "Switch to legacy" — the env var pins the selector on, so it can't
+   *  take effect. */
+  switchToLegacyDisabled?: boolean;
+  /** Set the wizard's live color scheme (System/Light/Dark), if the shell
+   *  supports it. Absent → the theme submenu is hidden. */
+  onSetColorScheme?: (scheme: "light" | "dark" | "system") => void;
+  /** The shell's current color-scheme source, to seed the radio (themeSource
+   *  survives navigation, so it may be non-system on return to setup). */
+  initialColorScheme?: "system" | "light" | "dark";
 }
 
 /** Result of the advisory reachability probe. */
@@ -96,26 +119,39 @@ const CARD: Record<Step, { height: number; panelHeight: number }> = {
 };
 
 export function ServerSelectorV2({ setup }: { setup: ServerSelectorV2Setup }) {
-  // A failed connect reloads the wizard with an error (from ?error=&url=). That
-  // only ever comes from the server-select flow, so open there — otherwise the
-  // error banner renders on a step that isn't mounted and stays invisible.
-  // "Connect to new server…" also opens the list directly (initialStep). A
-  // returning user (CLI installed) skips the welcome and lands on the list too;
-  // Back still reaches the landing for the local path.
+  // A failed connect reloads with an error (?error=&url=) whose banner lives on
+  // the server step, so open there; "Connect to new server…" too (initialStep).
+  const failedOrForced = setup.error !== undefined || setup.initialStep === "server";
+  // Returning users land on the server list when it has something to pick; new
+  // users — or one who cleared every server — land on the welcome.
+  const returning = setup.connectedBefore === true || setup.recentServers.length > 0;
+  const hasServers = setup.recentServers.length > 0 || setup.managedServers.length > 0;
   const [step, setStep] = useState<Step>(
-    setup.error || setup.initialStep === "server" || setup.installed ? "server" : "landing",
+    failedOrForced || (returning && hasServers) ? "server" : "landing",
+  );
+  // Open the server step on its URL-input view (landing's "Add server…").
+  const [serverStartInAdd, setServerStartInAdd] = useState(false);
+  const openServers = (addView: boolean) => {
+    setServerStartInAdd(addView);
+    setStep("server");
+  };
+  // Wizard color scheme radio. Seeded from the shell's current source (which
+  // survives navigation), defaulting to "system" when the shell doesn't report.
+  const [colorScheme, setColorScheme] = useState<"system" | "light" | "dark">(
+    setup.initialColorScheme ?? "system",
   );
   // The preset server picked from the landing split button (drives the detail step).
   const [detailUrl, setDetailUrl] = useState<string | null>(null);
-  // What the terminal step should run after any install: start the local server,
-  // or connect to a remote URL. Set by whichever action routed to "terminal".
+  // What the terminal step should run after any install: start the local server
+  // (Back → the step that launched it), or connect to a remote URL. A picked
+  // local install carries its `url`: opened as-is when up, else started.
   const [terminalTarget, setTerminalTarget] = useState<
-    { kind: "local" } | { kind: "connect"; url: string }
-  >({ kind: "local" });
+    { kind: "local"; back: Step; url?: string } | { kind: "connect"; url: string }
+  >({ kind: "local", back: "local" });
   // Install runs in the terminal step only when the CLI is missing AND in-app
-  // install is actually offered (macOS — onInstallCli is present). A returning
-  // user ("Open Omnigent"), or any platform without install support, connects
-  // directly. Mocks force the install screen to show.
+  // install is actually offered (macOS — onInstallCli is present). An installed
+  // CLI, or any platform without install support, connects directly. Mocks
+  // force the install screen to show.
   const needsInstall =
     setup.mockInstall === true || (setup.installed === false && setup.onInstallCli != null);
 
@@ -124,12 +160,32 @@ export function ServerSelectorV2({ setup }: { setup: ServerSelectorV2Setup }) {
   // ConnectResult so the list can still show a connect error when connecting
   // directly.
   const connect = async (url: string): Promise<ConnectResult> => {
+    // The local install is checked in the terminal step, so a stopped one starts.
+    if (isLocalInstall(url)) {
+      setTerminalTarget({ kind: "local", back: "server", url });
+      setStep("terminal");
+      return {};
+    }
     if (needsInstall) {
       setTerminalTarget({ kind: "connect", url });
       setStep("terminal");
       return {};
     }
     return setup.onConnect(url);
+  };
+  // Connect from the terminal: success navigates away, a rejection shows there.
+  const connectInTerminal = async (url: string) => {
+    const result = await setup.onConnect(url);
+    return { ok: result.error === undefined, error: result.error };
+  };
+  // Checked at run time (Retry re-checks): a picked local install that's up opens
+  // that exact URL; one that's down starts like "Get started locally".
+  const runTerminal = async () => {
+    const t = terminalTarget;
+    if (t.kind === "connect") return connectInTerminal(t.url);
+    if (t.url !== undefined && (await setup.onCheckServer(t.url)).status !== "unreachable")
+      return connectInTerminal(t.url);
+    return setup.onStartLocal();
   };
   // Whether the server step is showing its URL-input ("add") view vs the list —
   // reported up so the band can show the hero icons only in the add view.
@@ -173,13 +229,30 @@ export function ServerSelectorV2({ setup }: { setup: ServerSelectorV2Setup }) {
             </button>
           </DropdownMenuTrigger>
           <DropdownMenuContent align="end">
-            <DropdownMenuItem onSelect={setup.onSwitchToLegacy}>
+            <DropdownMenuItem
+              onSelect={setup.onSwitchToLegacy}
+              disabled={setup.switchToLegacyDisabled}
+            >
               Switch to legacy selector experience
             </DropdownMenuItem>
-            {/* Debug aid: flip the theme in place (not persisted). */}
-            <DropdownMenuItem onSelect={() => document.documentElement.classList.toggle("dark")}>
-              Toggle light/dark mode
-            </DropdownMenuItem>
+            {setup.onSetColorScheme && (
+              <>
+                <DropdownMenuSeparator />
+                <DropdownMenuLabel>Appearance</DropdownMenuLabel>
+                <DropdownMenuRadioGroup
+                  value={colorScheme}
+                  onValueChange={(v) => {
+                    const scheme = v as "system" | "light" | "dark";
+                    setColorScheme(scheme);
+                    setup.onSetColorScheme?.(scheme);
+                  }}
+                >
+                  <DropdownMenuRadioItem value="system">System (default)</DropdownMenuRadioItem>
+                  <DropdownMenuRadioItem value="light">Light</DropdownMenuRadioItem>
+                  <DropdownMenuRadioItem value="dark">Dark</DropdownMenuRadioItem>
+                </DropdownMenuRadioGroup>
+              </>
+            )}
           </DropdownMenuContent>
         </DropdownMenu>
       </div>
@@ -194,7 +267,8 @@ export function ServerSelectorV2({ setup }: { setup: ServerSelectorV2Setup }) {
           <LandingStep
             managedServers={setup.managedServers}
             onGetStarted={() => setStep("local")}
-            onJoinServer={() => setStep("server")}
+            onJoinServer={() => openServers(false)}
+            onAddServer={() => openServers(true)}
             onJoinManaged={(url) => {
               setDetailUrl(url);
               setStep("detail");
@@ -204,9 +278,10 @@ export function ServerSelectorV2({ setup }: { setup: ServerSelectorV2Setup }) {
         {step === "local" && (
           <LocalIntroStep
             installed={setup.installed}
+            startsLocal={!setup.localServerRunning}
             onBack={() => setStep("landing")}
             onInstall={() => {
-              setTerminalTarget({ kind: "local" });
+              setTerminalTarget({ kind: "local", back: "local" });
               setStep("terminal");
             }}
           />
@@ -218,27 +293,35 @@ export function ServerSelectorV2({ setup }: { setup: ServerSelectorV2Setup }) {
             onBack={() => setStep("landing")}
             onConnect={connect}
             onCopy={setup.onCopy}
-            onShowAll={() => setStep("server")}
+            onShowAll={() => openServers(false)}
           />
         )}
         {step === "terminal" && (
           <SetupTerminalStep
             onInstallCli={needsInstall ? setup.onInstallCli : undefined}
             onInstallLog={setup.onInstallLog}
-            onRun={
-              terminalTarget.kind === "connect"
-                ? async () => {
-                    const url = terminalTarget.url;
-                    const result = await setup.onConnect(url);
-                    // Success navigates the window away; a rejection surfaces as
-                    // an error here.
-                    return { ok: result.error === undefined, error: result.error };
-                  }
-                : setup.onStartLocal
-            }
+            onRun={runTerminal}
             onSetupLog={setup.onSetupLog}
-            onBack={() => setStep(terminalTarget.kind === "connect" ? "server" : "local")}
-            runningLabel={terminalTarget.kind === "connect" ? "Connecting" : "Starting Omnigent"}
+            onBack={() => {
+              const back = terminalTarget.kind === "connect" ? "server" : terminalTarget.back;
+              // Back to the list itself, not the add view it may have opened on.
+              if (back === "server") openServers(false);
+              else setStep(back);
+            }}
+            runningLabel={
+              terminalTarget.kind === "connect"
+                ? "Connecting"
+                : setup.localServerRunning
+                  ? "Opening Omnigent"
+                  : "Starting Omnigent"
+            }
+            runningHint={
+              terminalTarget.kind === "connect"
+                ? "Connecting to the server…"
+                : setup.localServerRunning
+                  ? "Connecting to the local server…"
+                  : "Starting the local server…"
+            }
           />
         )}
         {step === "server" && (
@@ -248,6 +331,7 @@ export function ServerSelectorV2({ setup }: { setup: ServerSelectorV2Setup }) {
             recentServers={setup.recentServers}
             managedServers={setup.managedServers}
             installed={setup.installed}
+            startInAdd={serverStartInAdd}
             onBack={() => setStep("landing")}
             onConnect={connect}
             onRemove={setup.onRemoveServer}

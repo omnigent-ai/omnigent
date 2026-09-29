@@ -24,7 +24,15 @@ interface OmnigentSetup {
   checkServer?: (url: string) => Promise<{ status: "ok" | "reachable" | "unreachable" }>;
   copyText: (text: string) => Promise<unknown>;
   setServerSelectorV2?: (enabled: boolean) => Promise<unknown>;
-  getCliStatus: () => Promise<{ installed?: boolean; installSupported?: boolean }>;
+  getSetupCapabilities?: () => Promise<{ v2Forced?: boolean; connectedBefore?: boolean }>;
+  setColorScheme?: (scheme: "light" | "dark" | "system") => void;
+  getColorScheme?: () => Promise<{ source: string; effective: "light" | "dark" } | null>;
+  onColorScheme?: (cb: (theme: "light" | "dark") => void) => () => void;
+  getCliStatus: () => Promise<{
+    installed?: boolean;
+    installSupported?: boolean;
+    localServerRunning?: boolean;
+  }>;
   startLocalServer: () => Promise<{ ok?: boolean; url?: string; error?: string }>;
   onLocalServerSetupLog?: (cb: (line: string) => void) => () => void;
   installCli?: () => Promise<{ ok?: boolean; error?: string; installed?: boolean }>;
@@ -61,12 +69,23 @@ function BridgeSetupApp() {
   const [initialUrl, setInitialUrl] = useState(failedUrl ?? DEFAULT_URL);
   const [recentServers, setRecentServers] = useState<string[]>([]);
   const [managedServers, setManagedServers] = useState<string[]>([]);
-  // Whether the `omnigent` CLI is installed — decides "Install" vs "Open" and
-  // the returning-user start step. Undefined until the probe resolves.
+  // Whether the `omnigent` CLI is installed — decides "Install" vs "Start"/"Open".
+  // Undefined until the probe resolves.
   const [installed, setInstalled] = useState<boolean | undefined>(undefined);
+  // Whether the local server is already up → local actions "Open" vs "Start".
+  const [localServerRunning, setLocalServerRunning] = useState(false);
+  // Has ever connected (returning user) — picks the welcome vs server-list start.
+  const [connectedBefore, setConnectedBefore] = useState(false);
   // Whether in-app install is available on this platform (macOS only). Off →
   // connect/local must never route through an install step.
   const [installSupported, setInstallSupported] = useState(false);
+  // Whether the env var pins the selector on → "Switch to legacy" can't take
+  // effect, so the menu item is disabled.
+  const [v2Forced, setV2Forced] = useState(false);
+  // The shell's current color-scheme source. themeSource is process-global and
+  // survives navigation, so a returning-to-setup wizard must seed the radio
+  // from it (not assume "system"). Undefined → shell didn't report → "system".
+  const [colorScheme, setColorScheme] = useState<"system" | "light" | "dark">("system");
   // Hold the initial paint until the CLI probe resolves, so the wizard opens on
   // the correct step (welcome vs server list) instead of flashing the wrong one.
   const [ready, setReady] = useState(false);
@@ -92,13 +111,40 @@ function BridgeSetupApp() {
     const cli = bridge.getCliStatus().then((status) => {
       setInstalled(status?.installed === true);
       setInstallSupported(status?.installSupported === true);
+      setLocalServerRunning(status?.localServerRunning === true);
     });
-    Promise.allSettled([savedUrl, recents, managed, cli]).then(() => {
+    // Older shells omit getSetupCapabilities → leave the item enabled. Gate on
+    // it too, so the legacy item isn't shown enabled before v2Forced resolves.
+    const caps = bridge.getSetupCapabilities
+      ? bridge.getSetupCapabilities().then((c) => {
+          setV2Forced(c?.v2Forced === true);
+          setConnectedBefore(c?.connectedBefore === true);
+        })
+      : Promise.resolve();
+    // Seed the radio + `.dark` class from the shell's live theme so returning to
+    // setup after the app set Dark shows Dark, not the "system" default.
+    const theme = bridge.getColorScheme
+      ? bridge.getColorScheme().then((s) => {
+          if (!s) return;
+          setColorScheme(s.source === "light" || s.source === "dark" ? s.source : "system");
+          document.documentElement.classList.toggle("dark", s.effective === "dark");
+        })
+      : Promise.resolve();
+    Promise.allSettled([savedUrl, recents, managed, cli, caps, theme]).then(() => {
       // A failed CLI probe means "not installed" rather than unknown.
       setInstalled((prev) => prev ?? false);
       setReady(true);
     });
   }, [failedUrl, isEphemeral]);
+
+  // Sync the wizard's `.dark` class with the shell's effective theme: the dark
+  // styles key off the class (index.css), not the OS media query. The shell
+  // pushes on scheme change and on OS changes (so "System" tracks live).
+  useEffect(() => {
+    return setupBridge()?.onColorScheme?.((theme) =>
+      document.documentElement.classList.toggle("dark", theme === "dark"),
+    );
+  }, []);
 
   const setup: ServerSelectorV2Setup = {
     initialUrl,
@@ -107,6 +153,8 @@ function BridgeSetupApp() {
     recentServers,
     managedServers,
     installed,
+    connectedBefore,
+    localServerRunning,
     onConnect: async (url) => {
       // setServerUrl persists the URL and navigates the window to it; on success
       // the server's SPA takes over and this page goes away. A rejection (e.g.
@@ -213,6 +261,12 @@ function BridgeSetupApp() {
         ?.setServerSelectorV2?.(false)
         ?.catch(() => {});
     },
+    switchToLegacyDisabled: v2Forced,
+    // Live color-scheme override; only offered when the shell exposes it.
+    onSetColorScheme: setupBridge()?.setColorScheme
+      ? (scheme) => setupBridge()?.setColorScheme?.(scheme)
+      : undefined,
+    initialColorScheme: colorScheme,
   };
 
   return (

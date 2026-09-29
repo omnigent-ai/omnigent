@@ -51,6 +51,8 @@ export interface UseSlashCompletionOptions {
   allowOpen: boolean;
   /** Called with the ranked, prefixed name chosen via Tab/Enter. */
   onSelect: (cmd: string) => void;
+  /** Tab only fills the draft when selecting a command would execute it. */
+  onTabComplete?: (cmd: string) => void;
   /** Clears the composer draft (Escape semantics). */
   clearText: () => void;
 }
@@ -96,6 +98,7 @@ export function useSlashCompletion({
   escapeClearsOnlyWithContent,
   allowOpen,
   onSelect,
+  onTabComplete = onSelect,
   clearText,
 }: UseSlashCompletionOptions): UseSlashCompletionResult {
   const [selection, setSelection] = useState<{ text: string; start: number; end: number } | null>(
@@ -205,7 +208,7 @@ export function useSlashCompletion({
         index >= 0
       ) {
         e.preventDefault();
-        onSelect(matches[index]!);
+        (e.key === "Tab" ? onTabComplete : onSelect)(matches[index]!);
         return true;
       }
     }

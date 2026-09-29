@@ -118,6 +118,8 @@ interface ChatHeaderProps {
   subAgentName?: string | null;
   /** Active session id, or undefined on the landing composer. */
   conversationId: string | undefined;
+  /** Effective access to the active session. */
+  permissionLevel?: number | null;
   /** Owner-managed top-level row backing the title-adjacent action menu. */
   actionConversation?: Conversation | null;
   /**
@@ -306,6 +308,7 @@ export function ChatHeader({
   isChildSession,
   subAgentName,
   conversationId,
+  permissionLevel,
   actionConversation = null,
   conversationTitle,
   projectName,
@@ -643,7 +646,11 @@ export function ChatHeader({
         {/* Agent info: tools & policies for the bound agent. Desktop-only
             popover; self-hides when the agent has neither configured. */}
         {!pending && conversationId && (
-          <AgentInfoButton agent={boundAgent} sessionId={conversationId} />
+          <AgentInfoButton
+            agent={boundAgent}
+            sessionId={conversationId}
+            permissionLevel={permissionLevel}
+          />
         )}
         {/* Chat/Terminal switcher for terminal-first sessions — self-gates to
             null otherwise. Renders on every shell, iOS included. */}

@@ -115,6 +115,20 @@ class WSTunnelTransport(httpx.AsyncBaseTransport):
         self._registry = registry
         self._runner_id = runner_id
 
+    async def wait_for_runner(self, timeout_s: float) -> bool:
+        """
+        Wait until this transport's runner has a live tunnel or the timeout expires.
+
+        Lets a caller that just saw the runner go offline park until it
+        re-registers, instead of retrying requests on a fixed interval.
+
+        :param timeout_s: Maximum seconds to wait, e.g. ``90.0``.
+        :returns: ``True`` when the runner is registered when the wait ends.
+        """
+        return (
+            await self._registry.wait_for_runner(self._runner_id, timeout_s=timeout_s) is not None
+        )
+
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
         session = self._registry.get(self._runner_id)
         if session is None:

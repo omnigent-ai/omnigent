@@ -473,6 +473,58 @@ async def test_handle_model_options_uses_host_pi_configuration(
     )
 
 
+async def test_handle_model_options_serves_the_pi_harness(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The headless ``pi`` harness gets the same launch picker as ``pi-native``."""
+    from omnigent.harnesses.pi_native import credentials as pi_native_credentials
+    from omnigent.host import connect as host_connect
+
+    # The source decoration comes from the host's ambient provider config; pin it.
+    monkeypatch.setattr(
+        host_connect,
+        "_model_configuration_source_for_harness",
+        lambda harness: {
+            "kind": "subscription",
+            "label": "Subscription",
+            "name": "pi",
+        },
+    )
+    monkeypatch.setattr(
+        pi_native_credentials,
+        "pi_native_model_options",
+        lambda: [
+            {
+                "id": "omnigent/glm-5.3",
+                "model": "omnigent/glm-5.3",
+                "displayName": "glm-5.3",
+            }
+        ],
+    )
+    host = _make_host_process()
+
+    result = await host._handle_model_options(
+        HostModelOptionsFrame(request_id="req_pi", harness="pi"),
+    )
+
+    assert result == HostModelOptionsResultFrame(
+        request_id="req_pi",
+        status="ok",
+        models=[
+            {
+                "id": "omnigent/glm-5.3",
+                "model": "omnigent/glm-5.3",
+                "displayName": "glm-5.3",
+                "source": {
+                    "kind": "subscription",
+                    "label": "Subscription",
+                    "name": "pi",
+                },
+            }
+        ],
+    )
+
+
 @pytest.mark.parametrize("harness", ["devin-native", "native-devin", "devin"])
 async def test_handle_model_options_missing_devin_is_quiet(
     monkeypatch: pytest.MonkeyPatch,
@@ -7851,6 +7903,150 @@ async def test_handle_import_local_send_connection_closed_aborts_batch(
             _FakeWs(),  # type: ignore[arg-type]
             HostImportLocalFrame(request_id="req_cc", source="all", limit=5),
         )
+
+
+async def test_handle_import_local_slices_oversized_session_into_chunks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An oversized session streams as chunk frames instead of one giant frame.
+
+    A single whole-session frame past the tunnel's message cap would drop the
+    host connection, killing the oversized session's import and the rest of
+    the batch with it.
+    """
+    from omnigent.host.frames import (
+        HostImportLocalDoneFrame,
+        HostImportLocalSessionChunkFrame,
+        HostImportLocalSessionFrame,
+        ImportLocalSessionChunkAssembler,
+        decode_host_frame,
+    )
+
+    host = _make_host_process()
+    monkeypatch.setattr("omnigent.host.frames.IMPORT_SESSION_CHUNK_CHARS", 256)
+
+    def _fake_across(*, limit: int) -> list[tuple[str, str]]:
+        return [("claude", "small"), ("claude", "giant")]
+
+    def _fake_load(source: str, session_id: str) -> SimpleNamespace:
+        payload = {"text": "x" * 2000} if session_id == "giant" else {"role": "user"}
+        item = SimpleNamespace(
+            type="message",
+            response_id="r1",
+            data=SimpleNamespace(model_dump=lambda **_kw: payload),
+        )
+        return SimpleNamespace(
+            external_session_id=session_id,
+            workspace="/repo",
+            items=[item],
+            title=f"{session_id} title",
+            source=source,
+        )
+
+    monkeypatch.setattr(
+        "omnigent.session_import.local.list_recent_sessions_across_harnesses", _fake_across
+    )
+    monkeypatch.setattr("omnigent.session_import.local.load_local_session", _fake_load)
+
+    sent: list[str] = []
+
+    class _FakeWs:
+        async def send(self, text: str) -> None:
+            sent.append(text)
+
+    await host._handle_import_local(
+        _FakeWs(),  # type: ignore[arg-type]
+        HostImportLocalFrame(
+            request_id="req_big",
+            source="all",
+            limit=5,
+            allow_session_chunks=True,
+        ),
+    )
+
+    frames = [decode_host_frame(text) for text in sent]
+    session_frames = [f for f in frames if isinstance(f, HostImportLocalSessionFrame)]
+    chunk_frames = [f for f in frames if isinstance(f, HostImportLocalSessionChunkFrame)]
+    done_frames = [f for f in frames if isinstance(f, HostImportLocalDoneFrame)]
+
+    # The small session still rides whole; the giant one rides as slices.
+    assert [f.session.external_session_id for f in session_frames] == ["small"]
+    assert len(chunk_frames) > 1
+    assert [f.seq for f in chunk_frames] == list(range(len(chunk_frames)))
+    assert chunk_frames[-1].last is True
+
+    assembler = ImportLocalSessionChunkAssembler()
+    reassembled = None
+    for chunk in chunk_frames:
+        reassembled = assembler.add(chunk)
+    assert reassembled is not None
+    assert reassembled.external_session_id == "giant"
+    assert reassembled.items[0]["data"] == {"text": "x" * 2000}
+    assert len(done_frames) == 1 and done_frames[0].status == "ok"
+
+
+async def test_handle_import_local_legacy_server_skips_only_unsafe_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without negotiated chunks, an over-limit session cannot drop the batch."""
+    from omnigent.host.frames import (
+        HostImportLocalDoneFrame,
+        HostImportLocalSessionFrame,
+        decode_host_frame,
+    )
+
+    host = _make_host_process()
+    monkeypatch.setattr("omnigent.host.frames.IMPORT_SESSION_CHUNK_CHARS", 64)
+    monkeypatch.setattr("omnigent.host.frames.RUNNER_TUNNEL_MAX_MESSAGE_BYTES", 512)
+
+    def _fake_across(*, limit: int) -> list[tuple[str, str]]:
+        return [("claude", "small"), ("claude", "giant")]
+
+    def _fake_load(source: str, session_id: str) -> SimpleNamespace:
+        payload = {"text": "x" * 2000} if session_id == "giant" else {"role": "user"}
+        item = SimpleNamespace(
+            type="message",
+            response_id="r1",
+            data=SimpleNamespace(model_dump=lambda **_kw: payload),
+        )
+        return SimpleNamespace(
+            external_session_id=session_id,
+            workspace="/repo",
+            items=[item],
+            title=f"{session_id} title",
+            source=source,
+        )
+
+    monkeypatch.setattr(
+        "omnigent.session_import.local.list_recent_sessions_across_harnesses", _fake_across
+    )
+    monkeypatch.setattr("omnigent.session_import.local.load_local_session", _fake_load)
+
+    sent: list[str] = []
+
+    class _FakeWs:
+        async def send(self, text: str) -> None:
+            sent.append(text)
+
+    await host._handle_import_local(
+        _FakeWs(),  # type: ignore[arg-type]
+        HostImportLocalFrame(request_id="req_legacy", source="all", limit=5),
+    )
+
+    frames = [decode_host_frame(text) for text in sent]
+    sessions = [frame for frame in frames if isinstance(frame, HostImportLocalSessionFrame)]
+    done = next(frame for frame in frames if isinstance(frame, HostImportLocalDoneFrame))
+    assert [frame.session.external_session_id for frame in sessions] == ["small"]
+    assert done.status == "ok" and done.failed == 1
+    assert done.failures == [
+        {
+            "external_session_id": "giant",
+            "source": "claude",
+            "reason": (
+                "This session is too large for the connected server. Upgrade the server and retry."
+            ),
+        }
+    ]
 
 
 async def test_dispatch_fs_write_op_routes_github_set_preference(

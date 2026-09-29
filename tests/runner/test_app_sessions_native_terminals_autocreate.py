@@ -45,6 +45,7 @@ from omnigent.harnesses.codex_native.bridge import (
 )
 from omnigent.harnesses.cursor_native import bridge as cursor_native_bridge
 from omnigent.harnesses.kiro_native import bridge as kiro_native_bridge
+from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.terminal import TerminalInstance
 from omnigent.runner import app as runner_app
 from omnigent.runner import create_runner_app
@@ -1902,7 +1903,8 @@ async def _run_auto_create_cursor_terminal(
             parent_os_env: Any = None,
         ) -> SessionResourceView:
             """Record the spec and return a terminal resource view."""
-            del terminal_name, session_key, resource_role, parent_os_env
+            del terminal_name, session_key, resource_role
+            captured["parent_os_env"] = parent_os_env
             captured["spec"] = spec
             return SessionResourceView(
                 id="terminal_cursor_main",
@@ -1958,6 +1960,24 @@ async def test_auto_create_cursor_terminal_injects_spec_model(
     assert spec.command == "cursor-agent"
     assert "--model" in spec.args
     assert spec.args[spec.args.index("--model") + 1] == "sonnet-4-thinking"
+
+
+@pytest.mark.asyncio
+async def test_auto_create_cursor_terminal_inherits_agent_os_env(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cursor launches with the sandbox and environment declared by its agent."""
+    agent_os_env = OSEnvSpec(sandbox=OSEnvSandboxSpec(type="none"))
+    captured = await _run_auto_create_cursor_terminal(
+        tmp_path=tmp_path,
+        monkeypatch=monkeypatch,
+        agent_spec=AgentSpec(spec_version=1, name="cursor", os_env=agent_os_env),
+        terminal_launch_args=None,
+    )
+
+    assert captured["parent_os_env"] is agent_os_env
+    assert captured["spec"].os_env.sandbox is agent_os_env.sandbox
 
 
 @pytest.mark.parametrize(

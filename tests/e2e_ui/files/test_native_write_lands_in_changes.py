@@ -181,22 +181,15 @@ def test_native_claude_write_lands_in_changes(
         reset_mock_llm(mock_llm_server_url)
         go_token = f"native-write-go-{uuid.uuid4().hex[:6]}"
         write_args = json.dumps({"file_path": str(target), "content": _FILE_CONTENT})
-        # Scripted Write turn for the composer message (matched by go_token);
-        # the extra copy absorbs a background request draining the queue.
         configure_mock_llm(
             mock_llm_server_url,
-            [{"tool_calls": [{"name": "Write", "arguments": write_args}]}] * 2,
+            [
+                {"tool_calls": [{"name": "Write", "arguments": write_args}]},
+                {"text": "created the file"},
+            ],
             key="native-write",
             match=go_token,
-        )
-        # Post-tool requests carry the Write tool_result, which names the
-        # file; that longer match token outranks go_token, so the turn closes
-        # with plain text instead of a second Write.
-        configure_mock_llm(
-            mock_llm_server_url,
-            [{"text": "created the file"}] * 3,
-            key="native-write-done",
-            match=_FILE_NAME,
+            required_tools=["Write"],
         )
         prompt = f"create the report file now {go_token}"
     else:
@@ -246,6 +239,14 @@ def test_native_claude_write_lands_in_changes(
         f"Claude Code's native Write never created {target} — the journey did "
         "not reach the state the changes assertions need."
     )
+
+    if use_mock:
+        expect(
+            page.locator(
+                '[data-testid="message-bubble"][data-role="assistant"]',
+                has_text="created the file",
+            ).last
+        ).to_be_visible(timeout=30_000)
 
     # The file exists on disk, so the session's changed-files view must list
     # it. Open the rail only now, so the panel's first fetch is post-write.

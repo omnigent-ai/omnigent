@@ -1709,6 +1709,62 @@ def test_spec_harness_derivation() -> None:
     assert spec_harness(SimpleNamespace()) is None
 
 
+@pytest.mark.parametrize(
+    ("provider_base", "expected"),
+    [
+        ("https://api.openai.com/v1", "https://api.openai.com/v1/models"),
+        ("https://api.openai.com/v1/", "https://api.openai.com/v1/models"),
+        ("https://api.anthropic.com", "https://api.anthropic.com/v1/models"),
+        ("https://api.z.ai/api/coding/paas/v4", "https://api.z.ai/api/coding/paas/v4/models"),
+        ("https://api.z.ai/api/coding/paas/v4/", "https://api.z.ai/api/coding/paas/v4/models"),
+        ("https://gw.example.com/v6", "https://gw.example.com/v6/models"),
+        ("https://gw.example.com/v10", "https://gw.example.com/v10/models"),
+        ("https://gw.example.com/v1beta", "https://gw.example.com/v1beta/v1/models"),
+        ("https://gw.example.com/v4/proxy", "https://gw.example.com/v4/proxy/v1/models"),
+        ("https://gw.example.com/v٤", "https://gw.example.com/v٤/v1/models"),
+        ("https://v4", "https://v4/v1/models"),
+    ],
+)
+def test_models_url_appends_models_to_any_versioned_base(
+    provider_base: str, expected: str
+) -> None:
+    """A base already ending in ``/v<n>`` lists at ``<base>/models``, not ``/v1/models``."""
+    assert model_catalog._models_url(provider_base) == expected
+
+
+def test_openai_compatible_listing_hits_the_versioned_base() -> None:
+    """Live discovery for a ``/v4`` base GETs ``<base>/models`` and parses the page."""
+    requests_seen: list[httpx.Request] = []
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        requests_seen.append(request)
+        if request.url.path != "/api/coding/paas/v4/models":
+            return httpx.Response(404, json={"error": "not found"})
+        return httpx.Response(
+            200,
+            json={"data": [{"id": "glm-4.6", "context_length": 200000}, {"id": "glm-4.5-air"}]},
+        )
+
+    provider = ResolvedModelProvider(
+        kind="key",
+        family="openai",
+        base_url="https://api.z.ai/api/coding/paas/v4",
+        api_key="test-key",
+    )
+
+    listing = model_catalog._fetch_openai_compatible_listing(
+        provider, transport=httpx.MockTransport(_handler)
+    )
+
+    assert [str(request.url) for request in requests_seen] == [
+        "https://api.z.ai/api/coding/paas/v4/models"
+    ]
+    assert [(m.id, m.context_window) for m in listing.models] == [
+        ("glm-4.6", 200000),
+        ("glm-4.5-air", None),
+    ]
+
+
 def test_openai_compatible_listing_mints_bearer_via_auth_command(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

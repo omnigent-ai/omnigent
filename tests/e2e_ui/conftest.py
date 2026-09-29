@@ -652,8 +652,9 @@ def configure_mock_llm(
     mock_url: str,
     responses: list[dict[str, Any]],
     *,
-    key: str = "default",
+    key: str | None = None,
     match: str | None = None,
+    required_tools: list[str] | None = None,
 ) -> None:
     """Configure a keyed response queue on the mock LLM server.
 
@@ -671,12 +672,20 @@ def configure_mock_llm(
         completion event — a mid-stream fault for exercising the SPA's
         stream error/recovery UI).
     :param key: Queue key — typically the model name baked into the
-        agent spec. Defaults to ``"default"`` (matches any model
-        not assigned to a more specific queue).
+        agent spec. Omitting it allocates an independent content queue when
+        ``match`` is supplied, otherwise uses ``"default"``. Explicit keys replace
+        existing queues. The helper in ``tests/e2e/conftest.py`` instead uses
+        the match token as its explicit key and has no ``required_tools`` guard.
     :param match: Optional substring to match against the user text for
         content-based routing (in addition to model-name routing).
+    :param required_tools: Only consume responses when these tools are advertised.
+        Use this to exclude title-generation requests containing the same nonce.
     """
-    body: dict[str, Any] = {"key": key, "responses": responses}
+    body: dict[str, Any] = {"responses": responses}
+    if key is not None:
+        body["key"] = key
+    if required_tools is not None:
+        body["required_tools"] = required_tools
     if match is not None:
         body["match"] = match
     resp = httpx.post(

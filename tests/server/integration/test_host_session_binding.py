@@ -521,7 +521,11 @@ async def test_managed_session_create_end_to_end(
     # the picker (no offline ghost lingering after the session).
     delete_resp = await env.client.delete(f"/v1/sessions/{session_id}")
     assert delete_resp.status_code == 200, delete_resp.text
-    assert fake.terminated == ["sb-fake-1"]
+    # Provider terminate is best-effort and idempotent: with no runner ever
+    # connecting here, the background launch's failure teardown can race the
+    # delete's teardown and both fire it. Assert the sandbox (and only it) was
+    # torn down, not the number of best-effort attempts.
+    assert set(fake.terminated) == {"sb-fake-1"}
     assert env.host_store.get_host(conv.host_id) is None
     assert env.host_store.list_hosts(RESERVED_USER_LOCAL) == []
     # The tunnels list holds the fake hosts open through the delete;

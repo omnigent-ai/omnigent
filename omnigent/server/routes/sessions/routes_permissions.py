@@ -379,6 +379,7 @@ def _to_agent_object(
     agent: Agent,
     cache: AgentCache | None,
     *,
+    mcp_servers_editable: bool,
     terminals_override: list[str] | None = None,
 ) -> AgentObject:
     """
@@ -396,6 +397,8 @@ def _to_agent_object(
     :param cache: Agent cache, or ``None`` in test setups.
     :param terminals_override: Selected host's shell inventory. Applied only
         when the loaded spec is a recognized native wrapper.
+    :param mcp_servers_editable: Whether the authenticated caller may mutate
+        MCP configuration for the session serving this object.
     :returns: An :class:`AgentObject` for the API response.
     """
     mcp_servers: list[MCPServerSummary] = []
@@ -475,7 +478,9 @@ def _to_agent_object(
         harness=harness,
         mcp_servers=mcp_servers,
         mcp_servers_editable=(
-            agent.session_id is not None and not (harness or "").endswith("-native")
+            mcp_servers_editable
+            and agent.session_id is not None
+            and not (harness or "").endswith("-native")
         ),
         policies=policies,
         skills=skills,

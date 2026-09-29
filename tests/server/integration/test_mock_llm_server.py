@@ -154,3 +154,164 @@ def test_responses_json_merges_partial_token_usage(monkeypatch: pytest.MonkeyPat
         "output_tokens": 5,
         "total_tokens": 1005,
     }
+
+
+@pytest.mark.parametrize(
+    "endpoint,tool",
+    [
+        ("/v1/messages", {"name": "Agent", "input_schema": {"type": "object"}}),
+        ("/v1/responses", {"type": "function", "name": "Agent", "parameters": {"type": "object"}}),
+        (
+            "/v1/chat/completions",
+            {"type": "function", "function": {"name": "Agent", "parameters": {"type": "object"}}},
+        ),
+    ],
+)
+def test_independent_content_queues_and_title_isolation(monkeypatch, endpoint, tool):
+    monkeypatch.setattr(mock_llm_server, "_state", MockState())
+    with TestClient(mock_llm_server.app) as client:
+        keys = []
+        for marker in ("parent-prompt", "worker-prompt", "followup-prompt"):
+            response = client.post(
+                "/mock/configure",
+                json={
+                    "match": marker,
+                    "required_tools": ["Agent"],
+                    "responses": [
+                        {"tool_calls": [{"call_id": marker, "name": "Agent", "arguments": "{}"}]}
+                    ],
+                },
+            )
+            assert response.status_code == 200
+            keys.append(response.json()["key"])
+        assert len(set(keys)) == 3
+        for marker, key in zip(
+            ("parent-prompt", "worker-prompt", "followup-prompt"), keys, strict=True
+        ):
+            body = {"model": "any-model", "messages": [{"role": "user", "content": marker}]}
+            if endpoint == "/v1/responses":
+                body = {"model": "any-model", "input": marker}
+            # A title request sees the same user nonce but lacks agent tools.
+            assert client.post(endpoint, json=body).status_code == 200
+            assert mock_llm_server._state.queues[key].index == 0
+            response = client.post(endpoint, json={**body, "tools": [tool]})
+            assert response.status_code == 200
+            assert marker in response.text
+        assert all(mock_llm_server._state.queues[key].index == 1 for key in keys)
+
+
+@pytest.mark.parametrize("key", [None, "default", "custom-model"])
+def test_explicit_keys_and_unrouted_default_still_replace(monkeypatch, key):
+    monkeypatch.setattr(mock_llm_server, "_state", MockState())
+    with TestClient(mock_llm_server.app) as client:
+        for text in ("old", "new"):
+            body = {"responses": [{"text": text}]}
+            if key is not None:
+                body.update(key=key, match="nonce")
+            assert client.post("/mock/configure", json=body).status_code == 200
+        response = client.post("/v1/responses", json={"input": "nonce"})
+        assert response.json()["output"][0]["content"][0]["text"] == "new"
+        assert len(mock_llm_server._state.queues) == 1
+
+
+def test_tool_guard_cannot_be_bypassed_by_model_or_default(monkeypatch):
+    monkeypatch.setattr(mock_llm_server, "_state", MockState())
+    with TestClient(mock_llm_server.app) as client:
+        for key in ("default", "native-model"):
+            client.post(
+                "/mock/configure",
+                json={
+                    "key": key,
+                    "required_tools": ["Task"],
+                    "responses": [{"text": "protected"}],
+                },
+            )
+        for model in ("unknown", "native-model"):
+            response = client.post("/v1/responses", json={"model": model, "input": "title"})
+            assert "protected" not in response.text
+        assert all(queue.index == 0 for queue in mock_llm_server._state.queues.values())
+
+
+@pytest.mark.parametrize("key,model", [("default", "unknown"), ("native-model", "native-model")])
+def test_tool_guard_protects_configured_fallback(monkeypatch, key, model):
+    monkeypatch.setattr(mock_llm_server, "_state", MockState())
+    with TestClient(mock_llm_server.app) as client:
+        client.post(
+            "/mock/configure",
+            json={"key": key, "required_tools": ["Task"], "responses": [{"text": "scripted"}]},
+        ).raise_for_status()
+        client.post(
+            "/mock/set_fallback", json={"key": key, "text": "protected fallback"}
+        ).raise_for_status()
+        request = {"model": model, "input": "title"}
+        for tools, expected, remaining in [
+            ([], "Mock LLM response", 1),
+            ([{"name": "Task"}], "scripted", 0),
+            ([], "Mock LLM response", 0),
+            ([{"name": "Task"}], "protected fallback", 0),
+        ]:
+            response = client.post("/v1/responses", json={**request, "tools": tools})
+            response.raise_for_status()
+            assert response.json()["output"][0]["content"][0]["text"] == expected
+            assert (
+                len(mock_llm_server._state.queues[key].responses)
+                - mock_llm_server._state.queues[key].index
+                == remaining
+            )
+
+
+@pytest.mark.parametrize(
+    "invalid", [{"required_tools": "Task"}, {"required_tools": [1]}, {"match": ""}]
+)
+def test_invalid_routing_is_rejected_before_replacing_queue(monkeypatch, invalid):
+    monkeypatch.setattr(mock_llm_server, "_state", MockState())
+    with TestClient(mock_llm_server.app) as client:
+        client.post("/mock/configure", json={"responses": [{"text": "kept"}]})
+        assert client.post("/mock/configure", json=invalid).status_code == 400
+        assert mock_llm_server._state.queues["default"].index == 0
+
+
+def test_tool_results_cannot_steal_parent_content_routing():
+    state = MockState()
+    parent = state.get_queue("parent")
+    parent.match = "parent-token"
+    child = state.get_queue("child")
+    child.match = "longer-child-token"
+    request = {
+        "messages": [
+            {"role": "user", "content": "parent-token"},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "tool_result", "tool_use_id": "call", "content": "longer-child-token"}
+                ],
+            },
+        ]
+    }
+    assert state.resolve_queue_for_request(request) is parent
+
+
+def test_same_implicit_selector_replaces_and_different_purpose_coexists(monkeypatch):
+    monkeypatch.setattr(mock_llm_server, "_state", MockState())
+    with TestClient(mock_llm_server.app) as client:
+        keys = []
+        for text in ("old", "new"):
+            keys.append(
+                client.post(
+                    "/mock/configure",
+                    json={
+                        "match": "nonce",
+                        "required_tools": ["Task"],
+                        "responses": [{"text": text}],
+                    },
+                ).json()["key"]
+            )
+        other = client.post(
+            "/mock/configure",
+            json={"match": "nonce", "required_tools": ["Read"], "responses": [{"text": "worker"}]},
+        ).json()["key"]
+        assert keys[0] == keys[1] != other
+        response = client.post(
+            "/v1/responses", json={"input": "nonce", "tools": [{"name": "Task"}]}
+        )
+        assert response.json()["output"][0]["content"][0]["text"] == "new"

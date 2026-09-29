@@ -75,7 +75,12 @@ class MarkSubagentTerminalAndWake(Protocol):
     """Mark a sub-agent work entry terminal and wake its parent."""
 
     def __call__(
-        self, child_session_id: str, *, status: str, output: str | None
+        self,
+        child_session_id: str,
+        *,
+        status: str,
+        output: str | None,
+        only_if_work_id: str | None = None,
     ) -> SubagentDeliveryAck:
         raise NotImplementedError
 
@@ -84,6 +89,13 @@ class ClientSafeErrorDetail(Protocol):
     """Log an exception and return safe client-facing detail."""
 
     def __call__(self, exc: BaseException, *, context: str) -> str:
+        raise NotImplementedError
+
+
+class SubagentWorkIdForSession(Protocol):
+    """Return the ``work_id`` of the dispatch currently registered for a child."""
+
+    def __call__(self, conv_id: str) -> str | None:
         raise NotImplementedError
 
 
@@ -308,6 +320,14 @@ def native_cancel_capability(wrapper_label: str | None) -> str:
     return "best_effort"
 
 
+# How long an unresolved interrupt may wait for the harness's own terminal
+# edge before the dispatch is reported ``cancelled`` to the parent anyway.
+# An interrupted native agent usually aborts without firing any turn-end
+# hook, so this timer is the liveness floor that keeps the parent from
+# hanging; a confirmed completion that lands later still corrects the record.
+_NATIVE_INTERRUPT_CANCEL_GRACE_S = 20.0
+
+
 class NativeInterruptRunner:
     """Forward interrupt / stop events into a session's native harness bridge."""
 
@@ -322,6 +342,7 @@ class NativeInterruptRunner:
         codex_bridge_state_for_session: CodexBridgeStateForSession,
         client_safe_error_detail: ClientSafeErrorDetail,
         logger: logging.Logger,
+        subagent_work_id_for_session: SubagentWorkIdForSession | None = None,
     ) -> None:
         self._server_client = server_client
         self._resource_registry = resource_registry
@@ -331,6 +352,14 @@ class NativeInterruptRunner:
         self._codex_bridge_state_for_session = codex_bridge_state_for_session
         self._client_safe_error_detail = client_safe_error_detail
         self._logger = logger
+        self._subagent_work_id_for_session = subagent_work_id_for_session
+        # Sessions whose native interrupt was injected but whose turn outcome is
+        # still unknown; resolved by the next terminal edge or the grace timer,
+        # whichever lands first. The value is the ``work_id`` of the dispatch the
+        # interrupt was raised for, so a delayed cancel never lands on a newer
+        # send that reused the same child session.
+        self._pending_interrupts: dict[str, str | None] = {}
+        self._pending_interrupt_timers: dict[str, asyncio.TimerHandle] = {}
 
     async def interrupt(self, harness_name: str | None, conv_id: str) -> Response | None:
         """Dispatch an interrupt to the harness's bridge.
@@ -374,11 +403,114 @@ class NativeInterruptRunner:
             return None
         return await self._uniform_stop(spec, conv_id)
 
-    def _wake_parent_after_native_interrupt(self, conv_id: str) -> None:
+    def _defer_parent_wake_after_native_interrupt(self, conv_id: str) -> None:
+        """Record the interrupt instead of guessing a terminal status.
+
+        Injecting an Escape does not confirm the agent stopped: it may abort
+        mid-task or survive and finish. Reporting ``cancelled`` here locked the
+        dispatch and discarded a genuine result that landed afterwards. The
+        outcome is decided by whichever arrives first: the harness's terminal
+        edge (``external_session_status``) or the grace timer.
+        """
+        # Capture the dispatch this interrupt is for so a delayed cancel can be
+        # bound to it and never lands on a newer send that reused this session.
+        work_id = (
+            self._subagent_work_id_for_session(conv_id)
+            if self._subagent_work_id_for_session is not None
+            else None
+        )
+        # Deduplicate only within the SAME dispatch. A pending record left by an
+        # earlier dispatch (e.g. one the launch reaper failed before its timer
+        # fired) must not suppress a new dispatch's own record and timer — that
+        # would leave the new dispatch with no cancellation fallback while the
+        # stale timer rejects itself as superseded. Replace the stale record.
+        if conv_id in self._pending_interrupts and self._pending_interrupts[conv_id] == work_id:
+            return
+        stale_timer = self._pending_interrupt_timers.pop(conv_id, None)
+        if stale_timer is not None:
+            stale_timer.cancel()
+        self._pending_interrupts[conv_id] = work_id
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self._pending_interrupt_timers[conv_id] = loop.call_later(
+            _NATIVE_INTERRUPT_CANCEL_GRACE_S,
+            self._deliver_unconfirmed_interrupt_cancel,
+            conv_id,
+        )
+
+    def take_pending_interrupt(self, conv_id: str) -> tuple[bool, str | None]:
+        """Consume a recorded-but-unresolved interrupt for *conv_id*.
+
+        :returns: ``(was_pending, work_id)`` — whether an interrupt was pending
+            and the ``work_id`` it was raised for (``None`` when unknown). The
+            caller now owns resolving that dispatch's terminal status, binding
+            any cancel to ``work_id`` so it cannot settle a newer dispatch.
+        """
+        was_pending = conv_id in self._pending_interrupts
+        work_id = self._pending_interrupts.pop(conv_id, None)
+        timer = self._pending_interrupt_timers.pop(conv_id, None)
+        if timer is not None:
+            timer.cancel()
+        return was_pending, work_id
+
+    def resolve_pending_interrupt(
+        self, conv_id: str, current_work_id: str | None
+    ) -> tuple[bool, str | None]:
+        """Consume a pending interrupt only when it belongs to the current dispatch.
+
+        A pending interrupt records the ``work_id`` it was raised for. When an
+        idle edge arrives for *conv_id*, it resolves that interrupt only if the
+        dispatch now registered is the same one; otherwise the pending record is
+        stale (its dispatch exited or was superseded by a new send that reused
+        the child) and must NOT capture this idle — for a legacy harness that
+        idle is the *new* dispatch's completion. The stale record is dropped and
+        ``(False, None)`` returned so the caller processes the idle normally.
+
+        :param conv_id: Session/conversation id, e.g. ``"conv_abc123"``.
+        :param current_work_id: ``work_id`` of the dispatch now registered for
+            *conv_id*, or ``None`` when none is tracked.
+        :returns: ``(resolved, work_id)`` — ``resolved`` is ``True`` only when a
+            pending interrupt for the current dispatch was consumed.
+        """
+        if conv_id not in self._pending_interrupts:
+            return False, None
+        pending_work_id = self._pending_interrupts.get(conv_id)
+        if current_work_id is None or pending_work_id != current_work_id:
+            # Stale (or unbindable) pending: drop it, but let the idle be
+            # handled as the current dispatch's own outcome.
+            self.clear_pending_interrupt(conv_id)
+            return False, None
+        self.take_pending_interrupt(conv_id)
+        return True, pending_work_id
+
+    def clear_pending_interrupt(self, conv_id: str) -> None:
+        """Drop any recorded interrupt whose outcome another path resolved."""
+        self.take_pending_interrupt(conv_id)
+
+    def _deliver_unconfirmed_interrupt_cancel(self, conv_id: str) -> None:
+        """Grace-timer fallback: no terminal edge followed the interrupt."""
+        was_pending, work_id = self.take_pending_interrupt(conv_id)
+        if not was_pending:
+            return
+        if work_id is None:
+            # The interrupt was never bound to a dispatch (no work entry existed
+            # when it fired — e.g. a runner restart hadn't recovered it yet).
+            # Delivering ``cancelled`` now could settle a *newer* send that has
+            # since reused this child session, permanently mislabeling it. Skip:
+            # the restart recovery scan owns children with no live work entry.
+            self._logger.info(
+                "Native interrupt grace timer: no dispatch bound for session=%s; "
+                "skipping cancel to avoid settling a reused dispatch",
+                conv_id,
+            )
+            return
         delivery_ack = self._mark_subagent_terminal_and_wake(
             conv_id,
             status="cancelled",
-            output="[System: sub-agent interrupted]",
+            output=None,
+            only_if_work_id=work_id,
         )
         if not delivery_ack.delivered and (
             delivery_ack.entry is not None or conv_id in self._session_sub_agent_names
@@ -447,7 +579,7 @@ class NativeInterruptRunner:
         # is why publishing here would double it.
         if terminal_role is not None and terminal_role not in _STATUS_EMITTING_TERMINAL_ROLES:
             self._publish_event(conv_id, {"type": "session.status", "status": "idle"})
-        self._wake_parent_after_native_interrupt(conv_id)
+        self._defer_parent_wake_after_native_interrupt(conv_id)
         return Response(status_code=204)
 
     async def _uniform_stop(self, spec: _UniformStop, conv_id: str) -> Response:
@@ -471,10 +603,13 @@ class NativeInterruptRunner:
         await self._teardown_session_terminals(conv_id)
         await _cancel_auto_forwarder_task(conv_id)
         self._publish_event(conv_id, {"type": "session.status", "status": "idle"})
+        # The kill is confirmed, so this ``cancelled`` is truthful and settles
+        # any interrupt still waiting on its outcome.
+        self.clear_pending_interrupt(conv_id)
         delivery_ack = self._mark_subagent_terminal_and_wake(
             conv_id,
             status="cancelled",
-            output="[System: sub-agent stopped]",
+            output=None,
         )
         if not delivery_ack.delivered and (
             delivery_ack.entry is not None or conv_id in self._session_sub_agent_names
@@ -511,7 +646,7 @@ class NativeInterruptRunner:
                     ),
                 },
             )
-        self._wake_parent_after_native_interrupt(conv_id)
+        self._defer_parent_wake_after_native_interrupt(conv_id)
         return Response(status_code=204)
 
     async def _claude_stop(self, conv_id: str) -> Response:
@@ -540,10 +675,13 @@ class NativeInterruptRunner:
             )
         await self._teardown_session_terminals(conv_id)
         self._publish_event(conv_id, {"type": "session.status", "status": "idle"})
+        # The kill is confirmed, so this ``cancelled`` is truthful and settles
+        # any interrupt still waiting on its outcome.
+        self.clear_pending_interrupt(conv_id)
         delivery_ack = self._mark_subagent_terminal_and_wake(
             conv_id,
             status="cancelled",
-            output="[System: sub-agent stopped]",
+            output=None,
         )
         if not delivery_ack.delivered and (
             delivery_ack.entry is not None or conv_id in self._session_sub_agent_names
@@ -649,5 +787,5 @@ class NativeInterruptRunner:
         finally:
             with contextlib.suppress(Exception):
                 await codex_client.close()
-        self._wake_parent_after_native_interrupt(conv_id)
+        self._defer_parent_wake_after_native_interrupt(conv_id)
         return Response(status_code=204)
