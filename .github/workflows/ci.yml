@@ -15,14 +15,14 @@ on:
     paths:
       - '**'
       - '!**.md'
-      # Keep package metadata, agent instructions, and Markdown test inputs.
-      - 'README.md'
-      - 'AGENTS.md'
-      - 'CLAUDE.md'
-      - 'omnigent/**.md'
-      - 'examples/**.md'
-      - 'tests/**.md'
-      - 'dev/**.md'
+      # Keep bundled prompts, skills, and test fixtures.
+      - 'omnigent/onboarding/agent/**.md'
+      - 'examples/**/skills/**.md'
+      - 'tests/resources/**.md'
+      # The unit suite checks these agent contracts and Markdown links.
+      - 'dev/resolve-agent/**.md'
+      - 'dev/repro-agent/AGENTS.md'
+      - 'dev/recording-lanes.md'
       - '!web/**'
       - '!tests/e2e_ui/**'
       - '!tests/browser_ui/**'
@@ -38,14 +38,14 @@ on:
     paths:
       - '**'
       - '!**.md'
-      # Keep package metadata, agent instructions, and Markdown test inputs.
-      - 'README.md'
-      - 'AGENTS.md'
-      - 'CLAUDE.md'
-      - 'omnigent/**.md'
-      - 'examples/**.md'
-      - 'tests/**.md'
-      - 'dev/**.md'
+      # Keep bundled prompts, skills, and test fixtures.
+      - 'omnigent/onboarding/agent/**.md'
+      - 'examples/**/skills/**.md'
+      - 'tests/resources/**.md'
+      # The unit suite checks these agent contracts and Markdown links.
+      - 'dev/resolve-agent/**.md'
+      - 'dev/repro-agent/AGENTS.md'
+      - 'dev/recording-lanes.md'
       - '!web/**'
       - '!tests/e2e_ui/**'
       - '!tests/browser_ui/**'

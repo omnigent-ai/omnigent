@@ -21,14 +21,10 @@ on:
     paths:
       - '**'
       - '!**.md'
-      # Keep package metadata, agent instructions, and Markdown test inputs.
-      - 'README.md'
-      - 'AGENTS.md'
-      - 'CLAUDE.md'
-      - 'omnigent/**.md'
-      - 'examples/**.md'
-      - 'tests/**.md'
-      - 'dev/**.md'
+      # Keep bundled prompts, skills, and test fixtures.
+      - 'omnigent/onboarding/agent/**.md'
+      - 'examples/**/skills/**.md'
+      - 'tests/resources/**.md'
       - '!docs/**'
       - '!tests/scripts/**'
       - '!tests/github/**'
