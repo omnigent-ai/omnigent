@@ -1,6 +1,6 @@
 # OpenCode v2 support for `opencode-native`
 
-**Status:** approved design · **Date:** 2026-09-25 · **Harness:** `opencode-native`
+**Status:** implemented · **Date:** 2026-09-25 · **Harness:** `opencode-native`
 
 ## Goal
 

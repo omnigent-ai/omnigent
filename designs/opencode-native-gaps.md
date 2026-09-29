@@ -2,7 +2,7 @@
 
 > **Superseded.** This plan and its recon target OpenCode 1.17/1.18, which is no
 > longer supported. The current design is the OpenCode v2 spec,
-> [`docs/superpowers/specs/2026-09-25-opencode-v2-native-harness-design.md`](../docs/superpowers/specs/2026-09-25-opencode-v2-native-harness-design.md);
+> [`designs/opencode-v2-native-harness.md`](opencode-v2-native-harness.md);
 > the user guide is [`docs/opencode-native.md`](../docs/opencode-native.md).
 
 **Status:** implemented (single PR) · **Owner:** Dhruv Gupta · **Harness:** `opencode-native`

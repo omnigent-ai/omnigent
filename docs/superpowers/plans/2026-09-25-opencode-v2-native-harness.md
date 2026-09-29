@@ -8,7 +8,7 @@
 
 **Tech Stack:** Python 3.12 (`httpx`, `asyncio`, FastAPI), pytest with `httpx.MockTransport` fakes, OpenCode `@opencode/cli` 2.0.x (Bun binary, HTTP + SSE at `/api/*`, ES-module plugins via `@opencode/plugin`), tmux for the TUI leg.
 
-**Spec:** `docs/superpowers/specs/2026-09-25-opencode-v2-native-harness-design.md`
+**Spec:** `designs/opencode-v2-native-harness.md`
 
 ## Global Constraints
 
@@ -817,7 +817,7 @@ no way to automate a real provider call in CI for this repo.
   - `messages.json` has `data` (array) and `cursor` keys.
   - `recon-findings.md` has a yes/no (or short factual) line for each of the
     six open items from the spec's "Open items resolved by the recon spike"
-    section — re-read `docs/superpowers/specs/2026-09-25-opencode-v2-native-harness-design.md`
+    section — re-read `designs/opencode-v2-native-harness.md`
     section by that name and confirm every item is answered, not just
     present as a key.
   - Confirm no secrets leaked: `grep -riE "password|/tmp/opencode-v2-recon" tests/fixtures/opencode_v2/*` should return nothing (the redaction in `_write_fixtures` should have caught it, but verify by hand since this data is about to be committed).
@@ -5004,7 +5004,7 @@ SKIP=pyrefly git commit -m "test(opencode-native): re-point the wire-contract e2
 4. While the e2e runs, `ps -ef | grep "opencode serve"` should show `--stdio`. After the test it should show no stray `opencode serve` processes.
 ## Stage 2: Forwarder rewrite for the v2 event model, with live streaming (Tasks 23-46)
 
-Implements spec section 3 (`docs/superpowers/specs/2026-09-25-opencode-v2-native-harness-design.md`) in `omnigent/harnesses/opencode_native/forwarder.py`: the v1 part-snapshot handlers are replaced by one handler per v2 `/api/event` type, text/reasoning/tool output stream live, permissions and forms go through the policy evaluator and web cards, subagent child sessions are mirrored, and reconnects catch up from `GET /api/session/{id}/message`.
+Implements spec section 3 (`designs/opencode-v2-native-harness.md`) in `omnigent/harnesses/opencode_native/forwarder.py`: the v1 part-snapshot handlers are replaced by one handler per v2 `/api/event` type, text/reasoning/tool output stream live, permissions and forms go through the policy evaluator and web cards, subagent child sessions are mirrored, and reconnects catch up from `GET /api/session/{id}/message`.
 
 
 ## Evidence: v2 names and payloads (verified against OpenCode `v2.0.18` source)
@@ -11208,7 +11208,7 @@ git commit -m "test(opencode-native): guard the v2 forwarder handler table"
 ```
 ## Stage 3: Config, plugin, policies, credentials (harness functional here)
 
-Stage 3 of `docs/superpowers/specs/2026-09-25-opencode-v2-native-harness-design.md` (section 4).
+Stage 3 of `designs/opencode-v2-native-harness.md` (section 4).
 Branch: stacked on Stage 2. Tasks 47–63.
 
 ## Source-verified facts this stage relies on (OpenCode tag `v2.0.18`)
@@ -19035,7 +19035,7 @@ git commit -m "docs(opencode-native): link OpenCode 2.x guide and update steer m
 - Modify: `designs/opencode-native-gaps-qa.md:1` (it is a 1.17.7 QA script; same header)
 
 **Interfaces:**
-- Consumes: spec path `docs/superpowers/specs/2026-09-25-opencode-v2-native-harness-design.md`.
+- Consumes: spec path `designs/opencode-v2-native-harness.md`.
 - Produces: nothing callable.
 
 - [ ] **Step 1: Write the failing check**
@@ -19063,7 +19063,7 @@ Replace them with:
 
 > **Superseded.** This plan and its recon target OpenCode 1.17/1.18, which is no
 > longer supported. The current design is the OpenCode v2 spec,
-> [`docs/superpowers/specs/2026-09-25-opencode-v2-native-harness-design.md`](../docs/superpowers/specs/2026-09-25-opencode-v2-native-harness-design.md);
+> [`designs/opencode-v2-native-harness.md`](../designs/opencode-v2-native-harness.md);
 > the user guide is [`docs/opencode-native.md`](../docs/opencode-native.md).
 
 **Status:** implemented (single PR) · **Owner:** Dhruv Gupta · **Harness:** `opencode-native`
