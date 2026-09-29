@@ -1200,7 +1200,7 @@ export interface ChatActions {
   setClaudePermissionMode: (mode: string) => Promise<void>;
   /**
    * Switch a running codex-native session's approval/sandbox mode (e.g. to
-   * ``"read-only"``). Rejects when the live Codex thread could not accept the
+   * ``"full-access"``). Rejects when the live Codex thread could not accept the
    * update, so callers surface the error rather than assuming it landed.
    * No-ops when there is no active conversation.
    */

@@ -2477,8 +2477,22 @@ describe("Composer shared visible controls", () => {
       .mockResolvedValue(undefined);
     renderWithTooltips(<Composer {...composerProps({ showCodexApprovalMode: true })} />);
     fireEvent.keyDown(screen.getByTestId("composer-permission-chip"), { key: "ArrowDown" });
-    fireEvent.click(screen.getByTestId("composer-permission-option-read-only"));
-    await waitFor(() => expect(setApproval).toHaveBeenCalledWith("read-only"));
+    fireEvent.click(screen.getByTestId("composer-permission-option-full-access"));
+    await waitFor(() => expect(setApproval).toHaveBeenCalledWith("full-access"));
+  });
+
+  it("doesn't offer Read Only as a codex runtime switch", () => {
+    useChatStore.setState({
+      conversationId: "codex-no-read-only",
+      codexApprovalMode: "read-only",
+    });
+    renderWithTooltips(<Composer {...composerProps({ showCodexApprovalMode: true })} />);
+    const chip = screen.getByTestId("composer-permission-chip");
+    // A session launched read-only still shows its live mode on the chip.
+    expect(chip).toHaveTextContent("Read Only");
+    fireEvent.keyDown(chip, { key: "ArrowDown" });
+    expect(screen.getByTestId("composer-permission-option-full-access")).toBeInTheDocument();
+    expect(screen.queryByTestId("composer-permission-option-read-only")).toBeNull();
   });
 });
 
