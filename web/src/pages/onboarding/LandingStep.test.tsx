@@ -4,68 +4,80 @@ import { LandingStep } from "./LandingStep";
 
 afterEach(cleanup);
 
+function renderLanding(over: Partial<Parameters<typeof LandingStep>[0]> = {}) {
+  const props = {
+    managedServers: [] as string[],
+    recentServers: [] as string[],
+    onGetStarted: vi.fn(),
+    onJoinServer: vi.fn(),
+    onJoinManaged: vi.fn(),
+    onJoinUrl: vi.fn(),
+    ...over,
+  };
+  render(<LandingStep {...props} />);
+  return props;
+}
+
+function openDropdown() {
+  fireEvent.pointerDown(screen.getByRole("button", { name: /choose team url/i }), { button: 0 });
+}
+
 describe("LandingStep", () => {
   it("fires onGetStarted / onJoinServer without presets", () => {
-    const onGetStarted = vi.fn();
-    const onJoinServer = vi.fn();
-    render(
-      <LandingStep
-        managedServers={[]}
-        onGetStarted={onGetStarted}
-        onJoinServer={onJoinServer}
-        onAddServer={vi.fn()}
-        onJoinManaged={vi.fn()}
-      />,
-    );
+    const props = renderLanding();
 
     fireEvent.click(screen.getByRole("button", { name: /get started locally/i }));
-    expect(onGetStarted).toHaveBeenCalledOnce();
+    expect(props.onGetStarted).toHaveBeenCalledOnce();
 
     fireEvent.click(screen.getByRole("button", { name: /join your team/i }));
-    expect(onJoinServer).toHaveBeenCalledOnce();
+    expect(props.onJoinServer).toHaveBeenCalledOnce();
   });
 
   it("makes the first preset's split button the only CTA", () => {
-    const onJoinManaged = vi.fn();
-    render(
-      <LandingStep
-        managedServers={["https://team.example.com/omnigent?o=1"]}
-        onGetStarted={vi.fn()}
-        onJoinServer={vi.fn()}
-        onAddServer={vi.fn()}
-        onJoinManaged={onJoinManaged}
-      />,
-    );
+    const props = renderLanding({ managedServers: ["https://team.example.com/omnigent?o=1"] });
 
     // Primary button names the first preset's capitalized host label.
     fireEvent.click(screen.getByRole("button", { name: /join your team \(team\)/i }));
-    expect(onJoinManaged).toHaveBeenCalledWith("https://team.example.com/omnigent?o=1");
+    expect(props.onJoinManaged).toHaveBeenCalledWith("https://team.example.com/omnigent?o=1");
     expect(screen.queryByRole("button", { name: /get started locally/i })).not.toBeInTheDocument();
   });
 
-  it("lists the other presets and a URL entry in the dropdown", () => {
-    const onJoinManaged = vi.fn();
-    const onAddServer = vi.fn();
-    render(
-      <LandingStep
-        managedServers={["https://team.example.com", "https://other.example.com/"]}
-        onGetStarted={vi.fn()}
-        onJoinServer={vi.fn()}
-        onAddServer={onAddServer}
-        onJoinManaged={onJoinManaged}
-      />,
-    );
-    fireEvent.pointerDown(screen.getByRole("button", { name: /choose team url/i }), { button: 0 });
+  it("lists the other presets, then recents, in the dropdown", () => {
+    const props = renderLanding({
+      managedServers: ["https://team.example.com", "https://other.example.com/"],
+      recentServers: ["https://old.example.com/"],
+    });
+    openDropdown();
     // The first preset is the main button, so it isn't repeated here.
     expect(screen.getAllByRole("menuitem").map((i) => i.textContent)).toEqual([
       "other.example.com",
-      "Enter Omnigent server URL…",
+      "old.example.com",
     ]);
     fireEvent.click(screen.getByRole("menuitem", { name: "other.example.com" }));
-    expect(onJoinManaged).toHaveBeenCalledWith("https://other.example.com/");
+    expect(props.onJoinManaged).toHaveBeenCalledWith("https://other.example.com/");
 
-    fireEvent.pointerDown(screen.getByRole("button", { name: /choose team url/i }), { button: 0 });
-    fireEvent.click(screen.getByRole("menuitem", { name: /enter omnigent server url/i }));
-    expect(onAddServer).toHaveBeenCalledOnce();
+    openDropdown();
+    fireEvent.click(screen.getByRole("menuitem", { name: "old.example.com" }));
+    expect(props.onJoinUrl).toHaveBeenCalledWith("https://old.example.com/");
+  });
+
+  it("joins a URL typed into the dropdown, and rejects an invalid one", () => {
+    const props = renderLanding({ managedServers: ["https://team.example.com"] });
+    openDropdown();
+    const input = screen.getByLabelText("Server URL");
+
+    fireEvent.change(input, { target: { value: "ftp://nope" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(screen.getByRole("alert")).toHaveTextContent(/valid http\(s\) server url/i);
+    expect(props.onJoinUrl).not.toHaveBeenCalled();
+
+    fireEvent.change(input, { target: { value: "https://typed.example.com/x" } });
+    fireEvent.click(screen.getByRole("button", { name: "Join server" }));
+    expect(props.onJoinUrl).toHaveBeenCalledWith("https://typed.example.com/x");
+  });
+
+  it("shows a connect error above the preset CTA", () => {
+    renderLanding({ managedServers: ["https://team.example.com"], error: "boom" });
+    expect(screen.getByRole("alert")).toHaveTextContent("boom");
   });
 });

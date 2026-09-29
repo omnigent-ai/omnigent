@@ -122,31 +122,29 @@ const CARD: Record<Step, { height: number; panelHeight: number }> = {
 };
 
 export function ServerSelectorV2({ setup }: { setup: ServerSelectorV2Setup }) {
+  // With MDM presets everyone starts on the landing: its dropdown holds recents
+  // and a URL field, and it shows connect errors itself.
+  const mdm = setup.managedServers.length > 0;
   // A failed connect reloads with an error (?error=&url=) whose banner lives on
   // the server step, so open there; "Connect to new server…" too (initialStep).
   const failedOrForced = setup.error !== undefined || setup.initialStep === "server";
   // Returning users land on the server list when it has something to pick; new
   // users — or one who cleared every server — land on the welcome.
   const returning = setup.connectedBefore === true || setup.recentServers.length > 0;
-  const hasServers = setup.recentServers.length > 0 || setup.managedServers.length > 0;
+  const hasServers = setup.recentServers.length > 0 || mdm;
   const [step, setStep] = useState<Step>(
-    failedOrForced || (returning && hasServers) ? "server" : "landing",
+    !mdm && (failedOrForced || (returning && hasServers)) ? "server" : "landing",
   );
-  // Open the server step on its URL-input view (landing's "Add server…").
-  const [serverStartInAdd, setServerStartInAdd] = useState(false);
-  const openServers = (addView: boolean) => {
-    setServerStartInAdd(addView);
-    setStep("server");
-  };
+  const [landingError, setLandingError] = useState(setup.error);
   // Wizard color scheme radio. Seeded from the shell's current source (which
   // survives navigation), defaulting to "system" when the shell doesn't report.
   const [colorScheme, setColorScheme] = useState<"system" | "light" | "dark">(
     setup.initialColorScheme ?? "system",
   );
-  // The preset server picked from the landing split button, and whether its
-  // runner step offers the remote environment.
+  // The server picked on the MDM landing, and whether its runner step offers
+  // the remote environment.
   const [runnerTarget, setRunnerTarget] = useState<{ url: string; remote: boolean } | null>(null);
-  const pickPreset = async (url: string) => {
+  const pickRunnerFor = async (url: string) => {
     const options = await setup.getRunnerOptions?.(url).catch(() => undefined);
     setRunnerTarget({ url, remote: options?.remote === true });
     setStep("runner");
@@ -155,7 +153,7 @@ export function ServerSelectorV2({ setup }: { setup: ServerSelectorV2Setup }) {
   // (Back → the step that launched it), or connect to a remote URL. A picked
   // local install carries its `url`: opened as-is when up, else started.
   const [terminalTarget, setTerminalTarget] = useState<
-    { kind: "local"; back: Step; url?: string } | { kind: "connect"; url: string }
+    { kind: "local"; back: Step; url?: string } | { kind: "connect"; back: Step; url: string }
   >({ kind: "local", back: "local" });
   // Install runs in the terminal step only when the CLI is missing AND in-app
   // install is actually offered (macOS — onInstallCli is present). An installed
@@ -168,19 +166,26 @@ export function ServerSelectorV2({ setup }: { setup: ServerSelectorV2Setup }) {
   // is missing (route via terminal), else connect straight away. Resolves the
   // ConnectResult so the list can still show a connect error when connecting
   // directly.
-  const connect = async (url: string): Promise<ConnectResult> => {
+  const connect = async (url: string, back: Step = "server"): Promise<ConnectResult> => {
     // The local install is checked in the terminal step, so a stopped one starts.
     if (isLocalInstall(url)) {
-      setTerminalTarget({ kind: "local", back: "server", url });
+      setTerminalTarget({ kind: "local", back, url });
       setStep("terminal");
       return {};
     }
     if (needsInstall) {
-      setTerminalTarget({ kind: "connect", url });
+      setTerminalTarget({ kind: "connect", back, url });
       setStep("terminal");
       return {};
     }
     return setup.onConnect(url);
+  };
+  // MDM landing: a new user picks a runner first; a returning user just opens it.
+  const joinFromLanding = async (url: string) => {
+    if (!returning) return pickRunnerFor(url);
+    setLandingError(undefined);
+    const result = await connect(url, "landing");
+    if (result.error) setLandingError(result.error);
   };
   // Connect from the terminal: success navigates away, a rejection shows there.
   const connectInTerminal = async (url: string) => {
@@ -275,10 +280,12 @@ export function ServerSelectorV2({ setup }: { setup: ServerSelectorV2Setup }) {
         {step === "landing" && (
           <LandingStep
             managedServers={setup.managedServers}
+            recentServers={setup.recentServers}
+            error={landingError}
             onGetStarted={() => setStep("local")}
-            onJoinServer={() => openServers(false)}
-            onAddServer={() => openServers(true)}
-            onJoinManaged={pickPreset}
+            onJoinServer={() => setStep("server")}
+            onJoinManaged={joinFromLanding}
+            onJoinUrl={joinFromLanding}
           />
         )}
         {step === "local" && (
@@ -297,7 +304,7 @@ export function ServerSelectorV2({ setup }: { setup: ServerSelectorV2Setup }) {
             remoteAvailable={runnerTarget.remote}
             installed={setup.installed}
             onBack={() => setStep("landing")}
-            onInstall={() => connect(runnerTarget.url)}
+            onInstall={() => connect(runnerTarget.url, "runner")}
           />
         )}
         {step === "terminal" && (
@@ -306,12 +313,7 @@ export function ServerSelectorV2({ setup }: { setup: ServerSelectorV2Setup }) {
             onInstallLog={setup.onInstallLog}
             onRun={runTerminal}
             onSetupLog={setup.onSetupLog}
-            onBack={() => {
-              const back = terminalTarget.kind === "connect" ? "server" : terminalTarget.back;
-              // Back to the list itself, not the add view it may have opened on.
-              if (back === "server") openServers(false);
-              else setStep(back);
-            }}
+            onBack={() => setStep(terminalTarget.back)}
             runningLabel={
               terminalTarget.kind === "connect"
                 ? "Connecting"
@@ -335,7 +337,6 @@ export function ServerSelectorV2({ setup }: { setup: ServerSelectorV2Setup }) {
             recentServers={setup.recentServers}
             managedServers={setup.managedServers}
             installed={setup.installed}
-            startInAdd={serverStartInAdd}
             onBack={() => setStep("landing")}
             onConnect={connect}
             onRemove={setup.onRemoveServer}

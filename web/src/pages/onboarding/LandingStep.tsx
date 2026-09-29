@@ -1,10 +1,11 @@
 // Onboarding step 1: the hero landing. Without MDM presets: "Get started
 // locally" opens deployment-mode select and "Join your team" opens server
 // select. With MDM presets: "Join your team (<name>)" is the only CTA — a split
-// button whose dropdown lists the other presets and "Enter Omnigent server
-// URL…". Rendered inside the card body below the animated panel.
+// button whose dropdown lists the other presets and recent servers, plus an
+// inline server URL field. Rendered inside the card body below the animated panel.
 
-import { ChevronDown, Laptop, Users } from "lucide-react";
+import { useState } from "react";
+import { ArrowRight, ChevronDown, Laptop, Users } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {
   DropdownMenu,
@@ -13,6 +14,8 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
+import { Input } from "@/components/ui/input";
+import { normalizeServerUrl } from "@/pages/onboarding/ServerSelectStep";
 
 /** Team name for a preset server URL: the host's first label, capitalized
  *  ("https://team.example.com/x" → "Team"). */
@@ -22,22 +25,40 @@ function teamName(url: string): string {
   return label.charAt(0).toUpperCase() + label.slice(1);
 }
 
+function displayUrl(url: string): string {
+  return url.replace(/^https?:\/\//i, "").replace(/\/$/, "");
+}
+
 export function LandingStep({
   managedServers,
+  recentServers,
+  error,
   onGetStarted,
   onJoinServer,
-  onAddServer,
   onJoinManaged,
+  onJoinUrl,
 }: {
   managedServers: string[];
+  /** Recent non-preset servers, listed in the preset dropdown. */
+  recentServers: string[];
+  /** Connect error to show above the CTA (MDM landing only). */
+  error?: string;
   onGetStarted: () => void;
   onJoinServer: () => void;
-  /** Open the add-server (URL input) view directly (preset dropdown). */
-  onAddServer: () => void;
-  /** Join a specific preset server (the split button + its dropdown). */
+  /** Join a preset server (the split button + its dropdown). */
   onJoinManaged: (url: string) => void;
+  /** Join a recent or typed server URL (preset dropdown). */
+  onJoinUrl: (url: string) => void;
 }) {
   const hasPresets = managedServers.length > 0;
+  const [typedUrl, setTypedUrl] = useState("");
+  const [invalid, setInvalid] = useState(false);
+  const joinTyped = () => {
+    const url = normalizeServerUrl(typedUrl);
+    if (url === null) setInvalid(true);
+    else onJoinUrl(url);
+  };
+  const otherServers = [...managedServers.slice(1), ...recentServers];
 
   return (
     <div className="flex flex-1 flex-col gap-2 px-2 pb-1">
@@ -50,8 +71,15 @@ export function LandingStep({
         </p>
       </div>
 
+      {hasPresets && error && (
+        <div role="alert" className="text-base text-destructive">
+          <span className="font-medium">Couldn&apos;t connect to the server: </span>
+          {error}
+        </div>
+      )}
+
       {hasPresets ? (
-        // Only CTA: join the first preset, or pick another / enter a URL.
+        // Only CTA: join the first preset, or pick another / type a URL.
         <div className="flex gap-0">
           <Button
             onClick={() => onJoinManaged(managedServers[0])}
@@ -72,14 +100,48 @@ export function LandingStep({
                 <ChevronDown className="size-4" />
               </Button>
             </DropdownMenuTrigger>
-            <DropdownMenuContent align="end">
-              {managedServers.slice(1).map((url) => (
-                <DropdownMenuItem key={url} onSelect={() => onJoinManaged(url)}>
-                  {url.replace(/^https?:\/\//i, "").replace(/\/$/, "")}
+            <DropdownMenuContent align="end" className="w-80">
+              {otherServers.map((url) => (
+                <DropdownMenuItem
+                  key={url}
+                  onSelect={() =>
+                    managedServers.includes(url) ? onJoinManaged(url) : onJoinUrl(url)
+                  }
+                >
+                  {displayUrl(url)}
                 </DropdownMenuItem>
               ))}
-              {managedServers.length > 1 && <DropdownMenuSeparator />}
-              <DropdownMenuItem onSelect={onAddServer}>Enter Omnigent server URL…</DropdownMenuItem>
+              {otherServers.length > 0 && <DropdownMenuSeparator />}
+              {/* Typed in place; keys stay in the field instead of driving the menu. */}
+              <div className="flex items-center gap-1 p-1" onKeyDown={(e) => e.stopPropagation()}>
+                <Input
+                  value={typedUrl}
+                  onChange={(e) => {
+                    setTypedUrl(e.target.value);
+                    setInvalid(false);
+                  }}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") joinTyped();
+                  }}
+                  placeholder="Enter Omnigent server URL"
+                  aria-label="Server URL"
+                  aria-invalid={invalid}
+                />
+                <Button
+                  size="icon"
+                  variant="ghost"
+                  disabled={typedUrl.trim() === ""}
+                  onClick={joinTyped}
+                  aria-label="Join server"
+                >
+                  <ArrowRight className="size-4" />
+                </Button>
+              </div>
+              {invalid && (
+                <p role="alert" className="px-2 pb-1 text-sm text-destructive">
+                  Enter a valid http(s) server URL.
+                </p>
+              )}
             </DropdownMenuContent>
           </DropdownMenu>
         </div>

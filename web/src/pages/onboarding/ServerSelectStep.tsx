@@ -140,7 +140,6 @@ export function ServerSelectStep({
   recentServers,
   managedServers,
   installed,
-  startInAdd,
   onBack,
   onConnect,
   onRemove,
@@ -154,8 +153,6 @@ export function ServerSelectStep({
   managedServers: string[];
   /** CLI installed → "Open"/"Start Omnigent"; missing → "Install Omnigent". */
   installed?: boolean;
-  /** Open on the URL-input ("add") view even when servers are listed. */
-  startInAdd?: boolean;
   /** Reports whether the URL-input ("add") view is showing, so the parent can
    *  swap the panel band (hero icons) for it. */
   onAddModeChange?: (addMode: boolean) => void;
@@ -193,9 +190,7 @@ export function ServerSelectStep({
   const [expandedUrl, setExpandedUrl] = useState<string | null>(null);
   // "list": pick from existing servers (with an "Add server" button). "add":
   // the URL-input view (heading + input + benefits). Empty list → start in add.
-  const [mode, setMode] = useState<"list" | "add">(
-    startInAdd || listed.length === 0 ? "add" : "list",
-  );
+  const [mode, setMode] = useState<"list" | "add">(listed.length === 0 ? "add" : "list");
   // Back from the add view returns to the list only when it was opened from
   // there; otherwise (empty list, or opened directly) it exits the step.
   const [addFromList, setAddFromList] = useState(false);
