@@ -7912,7 +7912,6 @@ async def _load_legacy_claude_launch_metadata(
         extra=debug_event(
             "claude_launch_config_loaded",
             session_id=session_id,
-            metadata_source="legacy_fetch",
             **({"permission_mode": permission_mode} if permission_mode is not None else {}),
         ),
     )
@@ -7943,7 +7942,6 @@ async def _load_claude_launch_metadata(
         extra=debug_event(
             "claude_launch_config_loaded",
             session_id=session_id,
-            metadata_source="init_envelope",
             **({"permission_mode": permission_mode} if permission_mode is not None else {}),
         ),
     )

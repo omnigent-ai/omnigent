@@ -505,10 +505,7 @@ async def test_claude_launch_metadata_log_includes_permission_mode(
         if getattr(record, "event_name", None) == "claude_launch_config_loaded"
     )
     assert "permission_mode=auto" in record.getMessage()
-    assert record.attributes == {
-        "metadata_source": "init_envelope",
-        "permission_mode": "auto",
-    }
+    assert record.attributes == {"permission_mode": "auto"}
 
 
 async def test_claude_launch_metadata_log_excludes_unknown_permission_mode(
@@ -576,10 +573,7 @@ async def test_legacy_claude_launch_metadata_log_includes_permission_mode(
         if getattr(record, "event_name", None) == "claude_launch_config_loaded"
     )
     assert "permission_mode=plan" in record.getMessage()
-    assert record.attributes == {
-        "metadata_source": "legacy_fetch",
-        "permission_mode": "plan",
-    }
+    assert record.attributes == {"permission_mode": "plan"}
 
 
 @pytest.mark.parametrize(
