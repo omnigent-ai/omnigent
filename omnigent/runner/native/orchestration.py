@@ -2972,13 +2972,22 @@ async def _auto_create_cursor_terminal(
         model = launch_config.model_override or _cursor_native_model_from_spec(agent_spec)
         if model is not None:
             cursor_args.extend(["--model", model])
+    # Inherit the agent's os_env so its declared sandbox is honored by Cursor.
+    # Otherwise launch_required_terminal selects the platform-default sandbox
+    # instead of the sandbox declared by the agent spec.
+    agent_os_env = _agent_os_env_from_spec(agent_spec)
     terminal_view = await resource_registry.launch_required_terminal(
         session_id=session_id,
         terminal_name="cursor",
         session_key="main",
         resource_role=CURSOR_NATIVE_TERMINAL_ROLE,
+        parent_os_env=agent_os_env,
         spec=TerminalEnvSpec(
-            os_env=OSEnvSpec(type="caller_process", cwd=workspace),
+            os_env=OSEnvSpec(
+                type="caller_process",
+                cwd=workspace,
+                sandbox=(agent_os_env.sandbox if agent_os_env is not None else None),
+            ),
             command=cursor_command,
             args=cursor_args,
             env={},

@@ -281,6 +281,20 @@ function renderViewer(props: RenderProps = {}) {
   return render(viewerTree(props));
 }
 
+/** Viewer context for a session running on this machine's desktop host. */
+function localDesktopContext() {
+  return {
+    openFile: vi.fn(),
+    registerNavigationGuard: () => () => {},
+    openGithubTab: vi.fn(),
+    isChangedPath: () => false,
+    conversationId: "conv_1",
+    workspaceRoot: "/repo",
+    workspaceHome: null,
+    sessionHostId: "this-mac",
+  };
+}
+
 // ── Setup / teardown ──────────────────────────────────────────────────────────
 
 beforeEach(() => {
@@ -1467,6 +1481,25 @@ describe("FileViewer view-settings menu", () => {
     // Wrap / whitespace are diff-only — absent when the source view is showing.
     expect(screen.queryByRole("menuitem", { name: "Wrap lines" })).toBeNull();
     expect(screen.queryByRole("menuitem", { name: "Hide whitespace changes" })).toBeNull();
+  });
+
+  it("offers the file manager reveal for a file on this machine", async () => {
+    const revealFile = vi.fn(() => Promise.resolve(true));
+    vi.stubGlobal("omnigentDesktop", {
+      kind: "electron",
+      revealFile,
+      getHostIdentity: () => Promise.resolve({ cliInstalled: true, hostId: "this-mac" }),
+    });
+    const context = localDesktopContext();
+    render(
+      <FileViewerContext.Provider value={context}>
+        {viewerTree({ open: true })}
+      </FileViewerContext.Provider>,
+    );
+    await act(() => Promise.resolve());
+    openSettingsMenu();
+    fireEvent.click(screen.getByRole("menuitem", { name: /^Show in / }));
+    expect(revealFile).toHaveBeenCalledWith("this-mac", "/repo/file1.py");
   });
 
   it("adds the wrap-lines and whitespace toggles in diff view", async () => {

@@ -77,7 +77,7 @@ _FAILURE_SIGNATURE = re.compile(
 )
 _HEALTH_TIMEOUT_S = 90.0
 
-pytestmark = [pytest.mark.timeout(300, method="signal")]
+pytestmark = [pytest.mark.timeout(420, method="signal")]
 
 
 def _ambient_free_environ() -> dict[str, str]:
@@ -221,6 +221,11 @@ class _TunnelIngressProxy:
         with self._lock:
             self._reject = False
 
+    def retarget(self, backend_host: str, backend_port: int) -> None:
+        """Forward new connections to a different server replica."""
+        with self._lock:
+            self._backend = (backend_host, backend_port)
+
     def close(self) -> None:
         """Stop the proxy and close all active sockets."""
         self.end_blackout()
@@ -330,6 +335,12 @@ class _ReconnectStack:
             what="the runner WebSocket tunnel to register",
         )
 
+    def start_second_replica(self) -> _Replica:
+        """Start a second server replica sharing this stack's database."""
+        replica = _Replica(self, self.server_log.parent)
+        replica.start()
+        return replica
+
     def teardown(self) -> None:
         """Stop processes, proxy, HTTP client, and log handles."""
         _terminate(self._runner_proc)
@@ -339,6 +350,63 @@ class _ReconnectStack:
         self.client.close()
         self._runner_handle.close()
         self._server_handle.close()
+
+
+class _Replica:
+    """A second real server process over the same database as a stack."""
+
+    def __init__(self, stack: _ReconnectStack, log_dir: Path) -> None:
+        self._stack = stack
+        self.port = find_free_port()
+        self.base_url = f"http://127.0.0.1:{self.port}"
+        self.server_log = log_dir / "server-b.log"
+        self._handle = self.server_log.open("w")
+        self._proc: subprocess.Popen[bytes] | None = None
+        self.client = httpx.Client(base_url=self.base_url, timeout=30.0, trust_env=False)
+
+    def start(self) -> None:
+        self._proc = subprocess.Popen(
+            [
+                sys.executable,
+                "-m",
+                "omnigent.cli",
+                "server",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                str(self.port),
+                "--database-uri",
+                self._stack._database_uri,
+                "--artifact-location",
+                str(self._stack._artifact_dir),
+            ],
+            env=self._stack._server_env(),
+            stdout=self._handle,
+            stderr=subprocess.STDOUT,
+        )
+        _poll_until(
+            self._healthy,
+            timeout=_HEALTH_TIMEOUT_S,
+            what="the second Omnigent replica to become healthy",
+        )
+
+    def _healthy(self) -> bool:
+        try:
+            return self.client.get("/health", timeout=2.0).status_code == 200
+        except httpx.HTTPError:
+            return False
+
+    def runner_online(self) -> bool:
+        try:
+            response = self.client.get(f"/v1/runners/{self._stack.runner_id}/status", timeout=2.0)
+            return response.status_code == 200 and response.json().get("online") is True
+        except httpx.HTTPError:
+            return False
+
+    def teardown(self) -> None:
+        _terminate(self._proc)
+        self.client.close()
+        self._handle.close()
 
 
 @pytest.fixture
@@ -365,6 +433,15 @@ def _session_snapshot(client: httpx.Client, session_id: str) -> dict:
     response = client.get(f"/v1/sessions/{session_id}")
     response.raise_for_status()
     return response.json()
+
+
+def _session_list_entry(client: httpx.Client, session_id: str) -> dict:
+    response = client.get(
+        "/v1/sessions",
+        params={"visibility": "all", "limit": 100},
+    )
+    response.raise_for_status()
+    return next(entry for entry in response.json()["data"] if entry["id"] == session_id)
 
 
 def _session_blob(client: httpx.Client, session_id: str) -> str:
@@ -467,3 +544,110 @@ def test_mid_turn_tunnel_blackout_recovers_without_failed_edge(
         f"Session {session_id} still carries a persisted runner_disconnected label after "
         f"recovery; snapshot={snapshot_text[:2000]}"
     )
+
+
+def test_reconnect_to_another_replica_does_not_fail_the_turn(
+    reconnect_stack: _ReconnectStack,
+    mock_llm_server_url: str,
+) -> None:
+    """A runner that reconnects to a different replica must not be failed by the first.
+
+    Replica A relays the turn. Its tunnel is cut, and the runner reconnects to
+    replica B (same database), which re-initializes the sessions and relays
+    the turn to completion. A's disconnect timer and relay only consult A's
+    own in-memory tunnel registry, so on unchanged main they wait out the
+    liveness lease and then mark the session failed while B is still
+    running it. The shared row's fresh ``runner_last_seen`` stamp, written by
+    B, is the proof that the runner was adopted elsewhere.
+    """
+    from omnigent.server.routes.sessions import RUNNER_DISCONNECT_GRACE_S
+
+    stack = reconnect_stack
+    proxy = stack.proxy
+    assert proxy is not None
+    replica_b = stack.start_second_replica()
+    try:
+        reset_mock_llm(mock_llm_server_url)
+        model = f"runner-cross-replica-{uuid.uuid4().hex[:8]}"
+        configure_mock_llm(
+            mock_llm_server_url,
+            [{"text": _ANSWER, "block": True}],
+            key=model,
+        )
+        agent_name = register_inline_agent(
+            stack.client,
+            name=f"runner-cross-replica-{uuid.uuid4().hex[:8]}",
+            harness="openai-agents",
+            model=model,
+            profile="",
+            prompt="Return the configured answer.",
+            mock_llm_base_url=f"{mock_llm_server_url}/v1",
+        )
+        session_id = create_runner_bound_session(
+            stack.client,
+            agent_name=agent_name,
+            runner_id=stack.runner_id,
+        )
+        _send_user_message(stack.client, session_id)
+        _poll_until(
+            lambda: _gate_pending(mock_llm_server_url),
+            timeout=60.0,
+            what="the real turn to block inside the mock LLM on replica A",
+        )
+
+        # Cut A's tunnel, then hand the runner's next connection to B.
+        proxy.begin_blackout()
+        _poll_until(
+            lambda: proxy.rejected_connections > 0,
+            timeout=10.0,
+            what="the real runner to attempt a reconnect through the 503 ingress",
+        )
+        proxy.retarget("127.0.0.1", replica_b.port)
+        proxy.end_blackout()
+        _poll_until(
+            replica_b.runner_online,
+            timeout=_HEALTH_TIMEOUT_S,
+            what="the runner WebSocket tunnel to register on replica B",
+        )
+
+        release_mock_gate(mock_llm_server_url)
+        _poll_until(
+            lambda: _ANSWER in _session_blob(replica_b.client, session_id),
+            timeout=60.0,
+            what="the original in-flight turn to complete via replica B",
+        )
+
+        # A's lease-long wait is what fails the turn; give it time to fire.
+        time.sleep(RUNNER_DISCONNECT_GRACE_S + 10.0)
+
+        server_a_log = stack.server_log.read_text()
+        failed_edges = _FAILURE_SIGNATURE.findall(server_a_log)
+        assert not failed_edges, (
+            f"Replica A failed session {session_id} after the runner reconnected to "
+            "replica B and completed the turn there. A consulted only its own tunnel "
+            "registry and never noticed the fresh liveness stamp B wrote to the shared "
+            "row. This reproduces the production wrong-replica false-fatal.\n"
+            f"Failure lines: {failed_edges}\n"
+            f"Replica A log tail:\n{server_a_log[-4000:]}"
+        )
+
+        snapshot_a = _session_snapshot(stack.client, session_id)
+        assert snapshot_a.get("status") != "running", (
+            f"Replica A still reports the completed session as running; "
+            f"snapshot={json.dumps(snapshot_a)[:2000]}"
+        )
+        assert snapshot_a.get("active_response_id") is None
+        list_entry_a = _session_list_entry(stack.client, session_id)
+        assert list_entry_a.get("status") == snapshot_a.get("status"), (
+            f"Replica A's list and snapshot disagree after handoff; "
+            f"list_entry={json.dumps(list_entry_a)[:2000]}"
+        )
+
+        snapshot = _session_snapshot(replica_b.client, session_id)
+        assert snapshot.get("status") != "failed", (
+            f"Session {session_id} reads failed after completing on replica B; "
+            f"snapshot={json.dumps(snapshot)[:2000]}"
+        )
+        assert "runner_disconnected" not in json.dumps(snapshot)
+    finally:
+        replica_b.teardown()

@@ -102,7 +102,7 @@
           },
           "mcp_servers_editable": {
             "default": false,
-            "description": "Whether the MCP list can be edited through the session UI. Built-in template agents are read-only; session-scoped uploaded agents are editable.",
+            "description": "Whether the MCP list can be edited through the session UI by the authenticated caller. This requires ownership of both the effective session and its session-scoped agent; built-in template and native agents are read-only.",
             "title": "Mcp Servers Editable",
             "type": "boolean"
           },
@@ -11506,7 +11506,7 @@
         ]
       },
       "put": {
-        "description": "Replace the session's agent bundle with a new upload.\n\nValidates the new bundle, checks that the spec name matches\nthe existing agent, stores the bundle under a\ncontent-addressed key, updates the agent row, and warm-swaps\nthe cache. Idempotent when the bundle content is unchanged.\n\n**Parameters**\n\n- `bundle` \u2014 Uploaded `.tar.gz` agent bundle file.\n\n**Returns:** The updated `AgentObject`.\n\n**Raises**\n\n- `OmnigentError` \u2014 If the session or agent is not found, the bundle is invalid, or the spec name doesn't match.",
+        "description": "Replace the session's agent bundle with a new upload.\n\nValidates the new bundle, checks that the spec name matches\nthe existing agent, stores the bundle under a\ncontent-addressed key, updates the agent row, and warm-swaps\nthe cache. Idempotent when the bundle content is unchanged.\nRequires session-owner permission because a bundle can replace MCP servers.\n\n**Parameters**\n\n- `bundle` \u2014 Uploaded `.tar.gz` agent bundle file.\n\n**Returns:** The updated `AgentObject`.\n\n**Raises**\n\n- `OmnigentError` \u2014 If the session or agent is not found, the bundle is invalid, or the spec name doesn't match.",
         "operationId": "update_session_agent_v1_sessions__session_id__agent_put",
         "parameters": [
           {
