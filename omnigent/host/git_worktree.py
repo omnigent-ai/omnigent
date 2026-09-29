@@ -474,10 +474,18 @@ def create_worktree(
         )
     if base_branch is not None:
         _ensure_base_resolvable(repo_root, base_branch)
+    validated_commit: str | None = None
     if relative_directory:
         revision = f"refs/heads/{branch_name}" if existing_branch else (base_branch or "HEAD")
+        resolved = _run_git(
+            ["rev-parse", "--verify", "--end-of-options", f"{revision}^{{commit}}"], cwd=repo_root
+        )
+        if resolved.returncode != 0:
+            raise _git_error("could not resolve worktree revision", resolved)
+        validated_commit = resolved.stdout.strip()
         directory = _run_git(
-            ["cat-file", "-t", f"{revision}:{relative_directory.rstrip('/')}"], cwd=repo_root
+            ["cat-file", "-t", f"{validated_commit}:{relative_directory.rstrip('/')}"],
+            cwd=repo_root,
         )
         if directory.returncode != 0:
             raise WorktreeError(
@@ -498,14 +506,26 @@ def create_worktree(
         add_args = ["worktree", "add", str(worktree_path), "--end-of-options", branch_name]
     else:
         add_args = ["worktree", "add", "-b", branch_name, str(worktree_path)]
-        if base_branch is not None:
-            # --end-of-options: treat base_branch as a rev, never a git flag,
-            # so a user-supplied value starting with '-' can't inject an
-            # option.
-            add_args += ["--end-of-options", base_branch]
+        checkout_revision = validated_commit or base_branch
+        if checkout_revision is not None:
+            # Use the validated commit even if the selected ref moves before checkout.
+            add_args += ["--end-of-options", checkout_revision]
     result = _run_git(add_args, cwd=repo_root)
     if result.returncode != 0:
         raise _git_error("git worktree add failed", result)
+    if existing_branch and validated_commit is not None:
+        try:
+            checked_out = _run_git(["rev-parse", "--verify", "HEAD"], cwd=str(worktree_path))
+            if checked_out.returncode != 0:
+                raise _git_error("could not verify worktree revision", checked_out)
+            if checked_out.stdout.strip() != validated_commit:
+                raise WorktreeError(
+                    f"branch {branch_name!r} changed during worktree creation; retry"
+                )
+        except WorktreeError:
+            # Preserve the pre-existing branch; discard only this request's checkout.
+            remove_worktree(worktree_path=str(worktree_path))
+            raise
     return CreatedWorktree(
         worktree_path=str(worktree_path),
         branch=branch_name,

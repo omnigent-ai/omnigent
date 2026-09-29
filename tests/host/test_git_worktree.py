@@ -640,3 +640,45 @@ def test_worktree_picker_accepts_symlinked_prefix(git_repo: Path) -> None:
     created = create_worktree(repo_path=str(git_repo), branch_name="feature")
     trees = list_worktrees(repo_path=str(alias / git_repo.name))
     assert [tree.path for tree in trees] == [str(git_repo), created.worktree_path]
+
+
+@pytest.mark.parametrize("mode", ["base", "head", "existing"])
+def test_directory_validation_survives_revision_moving(
+    git_repo: Path, monkeypatch: pytest.MonkeyPatch, mode: str
+) -> None:
+    """Ref movement cannot make creation succeed with a missing session directory."""
+    before = _rev_parse(git_repo)
+    source = git_repo / "web"
+    source.mkdir()
+    (source / "index.txt").write_text("tracked")
+    _git(git_repo, "add", ".")
+    _git(git_repo, "commit", "-m", "web")
+    validated = _rev_parse(git_repo)
+    _git(git_repo, "branch", "moving")
+    real_run = git_worktree_module._run_git
+    moved = False
+
+    def move_after_validation(args: list[str], *, cwd: str) -> subprocess.CompletedProcess[str]:
+        nonlocal moved
+        result = real_run(args, cwd=cwd)
+        if args[:2] == ["cat-file", "-t"] and not moved:
+            ref = "main" if mode == "head" else "moving"
+            _git(git_repo, "update-ref", f"refs/heads/{ref}", before)
+            moved = True
+        return result
+
+    monkeypatch.setattr(git_worktree_module, "_run_git", move_after_validation)
+    if mode == "existing":
+        with pytest.raises(WorktreeError, match="changed during worktree creation"):
+            create_worktree(repo_path=str(source), branch_name="moving", existing_branch=True)
+        assert len(list_worktrees(repo_path=str(git_repo))) == 1
+        assert _rev_parse(git_repo, "refs/heads/moving") == before
+    else:
+        created = create_worktree(
+            repo_path=str(source),
+            branch_name="new",
+            base_branch="moving" if mode == "base" else None,
+        )
+        assert Path(created.workspace).is_dir()
+        assert _rev_parse(Path(created.worktree_path)) == validated
+    assert moved
