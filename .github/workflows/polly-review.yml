@@ -432,13 +432,14 @@ jobs:
           """ if is_external else ""
 
           # The "Missing visual demonstration" report item + rule are only included
-          # for external contributors; otherwise the review has just the 5 standard
+          # for external contributors; otherwise the review has just the standard
           # sections. Build the numbered list so the numbering stays contiguous
           # regardless of whether the visual item is present.
           standard_items = [
               "**Blocking issues** — clearly evidenced unrelated changes, correctness bugs, broken contracts, missing error handling on failure paths, data loss risks, mandatory database best-practice violations.",
               "**Security vulnerabilities** — injection (SQL, command, template), authentication/authorization bypasses, secret exposure, unsafe deserialization, path traversal, SSRF, and any change that weakens an existing security boundary. Flag even subtle issues.",
               "**Non-blocking notes** — scope clarification questions, design concerns or edge cases worth flagging (brief).",
+              "**Test assessment** — briefly assess necessity/consolidation, behavioral coverage, and test layer using the rules below. Cite concrete tests or gaps; say when existing coverage is sufficient. Put blocking findings in Blocking issues and reference them here without repeating them.",
               "**Approach** — is there a materially simpler or more consistent way to reach the PR's stated goal, given existing patterns in the repo (config surfaces, variables, helpers, conventions)? Name the concrete alternative briefly, or say the approach is sound. Never blocking.",
               "**Summary** — one-paragraph overall assessment.",
           ]
@@ -542,6 +543,14 @@ jobs:
           intended outcome incomplete, incorrect, unsafe, or inadequately tested
           or documented.
 
+          **Diff size:** Assess whether the implementation and test changes are
+          proportional to that outcome. Look for avoidable duplication, unnecessary
+          scaffolding, or adjacent cleanup that could be omitted. Cite concrete
+          hunks and explain what can be removed or consolidated while preserving
+          behavior and coverage. Line counts and test-to-code ratios are signals
+          to investigate, never thresholds or reasons to reject a PR. Keep size
+          reductions non-blocking unless they meet the blocking criteria above.
+
           Put clearly unrelated work under **Blocking issues**: cite the stated goal,
           identify the specific change, and explain why it serves an independent
           outcome. When the goal is vague or a connection is plausible but unexplained,
@@ -555,6 +564,42 @@ jobs:
           or exclusions, or describe uncertainty as blocking in the summary. Ask for
           clarification first; suggest splitting only when outcomes are independent.
           Use the ordinary prose review sections; no separate scope report is needed.
+
+          **Test assessment:** Apply all three checks to added, modified, and removed
+          tests, and inspect relevant existing tests before asking for more. The
+          checkout is main; use the saved diff to account for PR changes. Distinguish
+          verified coverage from unavailable context, and do not claim tests passed
+          unless execution evidence is provided. Pass these checks to every reviewer.
+
+          - **Necessity and consolidation:** Identify the distinct behavior or failure
+            each test protects. Flag redundant scenarios, assertions that merely
+            mirror implementation details, and excessive fixtures or setup. Suggest
+            extending an existing test or parameterizing cases when it preserves
+            distinct assertions and useful failure diagnostics. Name the tests to
+            combine or remove and the coverage that remains; do not demand fewer
+            tests merely because the diff is large or the suite already has many.
+          - **Coverage:** Map changed behavior to meaningful assertions. Check the
+            relevant happy path, regression trigger, and material failure paths or
+            boundaries, including coverage lost through test deletion or weakened
+            assertions. A test should fail for the bug or broken contract it guards;
+            executing code or asserting mocked results alone is insufficient. Credit
+            existing coverage even when no test file changes. Request only concrete
+            missing scenarios tied to this diff, not speculative exhaustive cases.
+          - **Test layer:** Prefer the smallest reliable test that catches the failure:
+            unit tests for isolated logic and component behavior (including Vitest),
+            integration tests for component contracts, and E2E tests for full user
+            flows or browser/runtime wiring that lower layers cannot establish.
+            Do not require both unit and E2E tests for the same assertion by default.
+            Explain what an E2E test uniquely verifies before recommending one; move
+            redundant E2E cases to a lower layer only if the relevant boundary remains
+            covered. UI behavior changes do not automatically require a new or
+            modified browser test: existing coverage or focused unit/component
+            tests may suffice. Do not request a waiver label for missing E2E edits.
+
+          Keep consolidation and test-layer suggestions non-blocking. For a coverage
+          gap, name the unprotected behavior and smallest suitable test; missing tests
+          alone are not proof of a correctness bug. Apply the blocking criteria above
+          when a demonstrated bug or explicit contract violation is also present.
 
           **Lockfile pins** — review the "Changed lockfile pins" section above and flag
           as a **blocking security issue** any of:
