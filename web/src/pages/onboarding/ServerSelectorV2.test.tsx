@@ -368,8 +368,15 @@ describe("ServerSelectorV2", () => {
     fireEvent.click(await screen.findByRole("button", { name: /(install|open) omnigent/i }));
   }
 
-  it("a remote runner connects first, then opens the server, with no local install", async () => {
-    const onConnectRunner = vi.fn().mockResolvedValue({ ok: true });
+  it("a remote runner connects first, streaming its output, then opens the server, with no local install", async () => {
+    let finishRunner: (v: { ok: boolean }) => void = () => {};
+    let emit: (line: string) => void = () => {};
+    const onConnectRunner = vi.fn(
+      () =>
+        new Promise<{ ok: boolean }>((resolve) => {
+          finishRunner = resolve;
+        }),
+    );
     const onInstallCli = vi.fn().mockResolvedValue({ ok: true });
     const onConnect = vi.fn().mockResolvedValue({});
     await installFromRunnerStep({
@@ -377,30 +384,16 @@ describe("ServerSelectorV2", () => {
       onInstallCli,
       onConnectRunner,
       onConnect,
-      getRunnerOptions: vi.fn().mockResolvedValue({ remote: true, bundledCli: true }),
-    });
-    expect(screen.getByText(/connecting your remote environment/i)).toBeInTheDocument();
-    await waitFor(() => expect(onConnect).toHaveBeenCalledWith("https://team.example.com/"));
-    expect(onConnectRunner).toHaveBeenCalledWith("https://team.example.com/", "remote");
-    expect(onInstallCli).not.toHaveBeenCalled();
-  });
-
-  it("opens the server only after the remote runner connects, streaming its output", async () => {
-    let finishRunner: (v: { ok: boolean }) => void = () => {};
-    let emit: (line: string) => void = () => {};
-    const onConnect = vi.fn().mockResolvedValue({});
-    await installFromRunnerStep({
-      onConnect,
-      getRunnerOptions: vi.fn().mockResolvedValue({ remote: true }),
       onRunnerLog: (cb) => {
         emit = cb;
         return () => {};
       },
-      onConnectRunner: () =>
-        new Promise((resolve) => {
-          finishRunner = resolve;
-        }),
+      getRunnerOptions: vi.fn().mockResolvedValue({ remote: true, bundledCli: true }),
     });
+    expect(screen.getByText(/connecting your remote environment/i)).toBeInTheDocument();
+    await waitFor(() =>
+      expect(onConnectRunner).toHaveBeenCalledWith("https://team.example.com/", "remote"),
+    );
     act(() => emit("$ remote host --server https://team.example.com/"));
     expect(
       await screen.findByText("$ remote host --server https://team.example.com/"),
@@ -408,6 +401,7 @@ describe("ServerSelectorV2", () => {
     expect(onConnect).not.toHaveBeenCalled();
     finishRunner({ ok: true });
     await waitFor(() => expect(onConnect).toHaveBeenCalledWith("https://team.example.com/"));
+    expect(onInstallCli).not.toHaveBeenCalled();
   });
 
   it("tells a laptop runner, and only a laptop runner, what connecting grants", async () => {
