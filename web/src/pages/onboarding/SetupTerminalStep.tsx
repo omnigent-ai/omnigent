@@ -24,6 +24,7 @@ export function SetupTerminalStep({
   onSetupLog,
   onBack,
   runningLabel = "Starting Omnigent",
+  runningHint = "Starting the local server…",
 }: {
   /** Install the CLI first (when missing). Absent → skip straight to onRun. */
   onInstallCli?: () => Promise<{ ok: boolean; error?: string }>;
@@ -36,6 +37,8 @@ export function SetupTerminalStep({
   onBack: () => void;
   /** Heading + verb for the run phase ("Starting Omnigent" / "Connecting…"). */
   runningLabel?: string;
+  /** Placeholder log line for the run phase until its first line streams. */
+  runningHint?: string;
 }) {
   const [phase, setPhase] = useState<Phase>(onInstallCli ? "installing" : "running");
   const [error, setError] = useState<string | undefined>();
@@ -142,7 +145,7 @@ export function SetupTerminalStep({
           ? "Installing the Omnigent CLI"
           : runningLabel;
   const phaseLabel = inProgress ? `${baseLabel}${".".repeat(dots)}` : baseLabel;
-  const pendingHint = phase === "installing" ? "Installing the CLI…" : "Starting the local server…";
+  const pendingHint = phase === "installing" ? "Installing the CLI…" : runningHint;
   // Coarse progress: each step is a real detected milestone — warmup → install
   // output starts → server starting → done. Holds within a step (streaming log +
   // pulse show liveness) rather than fake an unmeasurable fraction.

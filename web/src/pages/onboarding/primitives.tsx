@@ -1,5 +1,5 @@
 import type { ReactNode } from "react";
-import { ArrowLeft, ArrowRight, Download } from "lucide-react";
+import { ArrowLeft, ArrowRight, Download, Play } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 
@@ -22,13 +22,22 @@ export function OnboardingHeading({
   );
 }
 
-export function installActionLabel(installed?: boolean): string {
-  return installed ? "Open Omnigent" : "Install Omnigent";
+/** Main action label: install the CLI first, start the stopped local server, or
+ *  just open (a running local server or a remote one). */
+export function installActionLabel(installed?: boolean, startsLocal?: boolean): string {
+  if (!installed) return "Install Omnigent";
+  return startsLocal ? "Start Omnigent" : "Open Omnigent";
 }
 
-/** Leading icon for the install/open action, paired with installActionLabel. */
-export function InstallActionIcon({ installed }: { installed?: boolean }) {
-  const Icon = installed ? ArrowRight : Download;
+/** Leading icon for the install/start/open action, paired with installActionLabel. */
+export function InstallActionIcon({
+  installed,
+  startsLocal,
+}: {
+  installed?: boolean;
+  startsLocal?: boolean;
+}) {
+  const Icon = !installed ? Download : startsLocal ? Play : ArrowRight;
   return <Icon className="size-4" aria-hidden />;
 }
 
@@ -47,15 +56,17 @@ export function OnboardingBackButton({ onClick }: { onClick: () => void }) {
 
 export function InstallActionButton({
   installed,
+  startsLocal,
   onClick,
 }: {
   installed?: boolean;
+  startsLocal?: boolean;
   onClick: () => void;
 }) {
   return (
     <Button size="lg" onClick={onClick}>
-      <InstallActionIcon installed={installed} />
-      {installActionLabel(installed)}
+      <InstallActionIcon installed={installed} startsLocal={startsLocal} />
+      {installActionLabel(installed, startsLocal)}
     </Button>
   );
 }

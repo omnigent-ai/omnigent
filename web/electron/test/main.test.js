@@ -853,10 +853,50 @@ describe("managed server preference wiring", () => {
     );
   });
 
+  it("offers the onboarding remote environment only behind the host picker's gate plus arca", () => {
+    assert.match(
+      preloadSource,
+      /getRunnerOptions:\s*\(url\)\s*=>\s*ipcRenderer\.invoke\("omnigent:get-runner-options",\s*url\)/,
+    );
+    assert.match(
+      liveCode,
+      /ipcMain\.handle\("omnigent:get-runner-options"[\s\S]{0,120}!isSetupPageSender\(event\)[\s\S]{0,200}typeof url === "string" &&\s*databricksInternalFeaturesEnabled\(\) &&\s*isDatabricksManagedServerUrl\(url\);\s*return \{ remote: internal && arca\.resolveArcaPath\(\) !== null, bundledCli: internal \}/,
+    );
+  });
+
+  it("wires the onboarding connect's remote gate, cancel-on-close, and sign-in order", () => {
+    assert.match(
+      preloadSource,
+      /connectRunner:\s*\(url, runner\)\s*=>\s*ipcRenderer\.invoke\("omnigent:connect-runner",\s*url,\s*runner\)/,
+    );
+    // The harness can't observe these (its arca and host stubs are fixed), so
+    // they stay source checks; the gates and cancellation are exercised below.
+    const start = liveCode.indexOf('ipcMain.handle("omnigent:connect-runner"');
+    const end = liveCode.indexOf('ipcMain.handle("omnigent:copy-setup-text"');
+    assert.ok(start >= 0 && end > start, "connect-runner handler not found before copy-setup-text");
+    const handler = liveCode.slice(start, end);
+    assert.match(
+      handler,
+      /runner === "remote"[\s\S]{0,80}!databricksInternalFeaturesEnabled\(\) \|\| !isDatabricksManagedServerUrl\(target\)[\s\S]{0,200}arca\.startArcaConnect\(target/,
+    );
+    assert.match(
+      handler,
+      /event\.sender\.once\("destroyed", cancel\);\s*const result = await run\.promise;\s*event\.sender\.removeListener\("destroyed", cancel\);/,
+    );
+    assert.match(
+      handler,
+      /hostCliCommand\(target\)[\s\S]{0,500}serverManager\.ensureServerAuth\(cliCommand, target\)[\s\S]{0,150}serverManager\.ensureHostConnected\(cliCommand, target\)/,
+    );
+  });
+
   it("preserves a managed path while still expanding bare workspace roots", () => {
     assert.match(
       liveCode,
-      /managedTarget\s*\?\?\s*normalizeUrl\(url\)[\s\S]{0,120}await expandDatabricksWorkspaceUrl\(normalized,\s*\{\s*signal\s*\}\)/,
+      /function resolveConnectTarget\(url, options\)[\s\S]{0,160}expandDatabricksWorkspaceUrl\(managedTarget \?\? normalizeUrl\(url\), options\)/,
+    );
+    assert.match(
+      liveCode,
+      /ipcMain\.handle\("omnigent:set-server-url"[\s\S]{0,1200}await resolveConnectTarget\(url, \{ signal \}\)/,
     );
   });
 
@@ -1263,6 +1303,21 @@ describe("recent-server startup wiring (src/main.js)", () => {
       /ipcMain\.handle\("omnigent:get-recent-servers"[\s\S]{0,400}excludingManagedServers\(\s*normalizeRecentServers\(loadSettings\(\)\.recent_servers\),\s*managed/,
     );
   });
+
+  it("counts MDM presets toward the setup page's returning-user signal", () => {
+    // Raw recents, NOT managed-excluded: a preset-only history is still returning.
+    assert.match(
+      liveCode,
+      /ipcMain\.handle\("omnigent:get-setup-capabilities"[\s\S]{0,400}connectedBefore:\s*normalizeRecentServers\(loadSettings\(\)\.recent_servers\)\.length > 0/,
+    );
+  });
+
+  it("reports the local server as running only when start-local would reuse it", () => {
+    assert.match(
+      liveCode,
+      /ipcMain\.handle\("omnigent:get-cli-status"[\s\S]{0,900}localServerRunning:\s*\(await omnigentCli\.localServerHealthy\(\)\) !== null/,
+    );
+  });
 });
 
 // Guard for the deep-link path join in createWindow. A basename-less SPA path
@@ -1554,4 +1609,92 @@ describe("browser-view teardown on server change (src/main.js)", () => {
       ].join(" "),
     );
   });
+});
+
+describe("onboarding runner IPC", () => {
+  const server = "https://host.example/ml/omnigents";
+  const setupFrame = (h) => ({ url: `file://${h.api.SETUP_PAGE}` });
+  // main.js runs in its own VM context: compare its values structurally, and
+  // match its errors by name (their classes differ from this realm's).
+  const plain = (value) => JSON.parse(JSON.stringify(value));
+  const typeError = { name: "TypeError" };
+  // A setup-page sender that can be closed mid-request.
+  function setupSender() {
+    let destroyed = false;
+    return {
+      send() {},
+      once() {},
+      removeListener() {},
+      isDestroyed: () => destroyed,
+      destroy: () => {
+        destroyed = true;
+      },
+    };
+  }
+  function harness(t, options) {
+    const h = loadNavigationHarness({ serverUrl: server, ...options });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    return h;
+  }
+
+  it("serves only the setup page, and rejects bad input", async (t) => {
+    const h = harness(t);
+    const connect = h.ipc.get("omnigent:connect-runner");
+    const sender = setupSender();
+    await assert.rejects(
+      connect({ sender, senderFrame: { url: server } }, server, "local"),
+      /only available to the setup page/,
+    );
+    await assert.rejects(
+      connect({ sender, senderFrame: setupFrame(h) }, server, "sandbox"),
+      typeError,
+    );
+    await assert.rejects(connect({ sender, senderFrame: setupFrame(h) }, 42, "local"), typeError);
+    assert.throws(
+      () => h.ipc.get("omnigent:get-runner-options")({ senderFrame: { url: server } }, server),
+      /only available to the setup page/,
+    );
+  });
+
+  it("offers no remote environment without the internal flag, and refuses to connect one", async (t) => {
+    const h = harness(t);
+    const event = { sender: setupSender(), senderFrame: setupFrame(h) };
+    assert.deepEqual(plain(h.ipc.get("omnigent:get-runner-options")(event, server)), {
+      remote: false,
+      bundledCli: false,
+    });
+    const result = await h.ipc.get("omnigent:connect-runner")(event, server, "remote");
+    assert.equal(result.ok, false);
+    assert.match(result.error, /isn't available/);
+  });
+
+  it("names the missing launcher when this laptop has no host CLI", async (t) => {
+    const h = harness(t);
+    const event = { sender: setupSender(), senderFrame: setupFrame(h) };
+    const result = await h.ipc.get("omnigent:connect-runner")(event, server, "local");
+    assert.equal(result.ok, false);
+    assert.match(result.error, /omnigent CLI was not found/);
+  });
+
+  for (const runner of ["local", "remote"]) {
+    it(`starts nothing for a ${runner} runner once setup closes during URL resolution`, async (t) => {
+      let resolveTarget;
+      const h = harness(t, {
+        expandWorkspace: () =>
+          new Promise((resolve) => {
+            resolveTarget = resolve;
+          }),
+      });
+      const sender = setupSender();
+      const pending = h.ipc.get("omnigent:connect-runner")(
+        { sender, senderFrame: setupFrame(h) },
+        server,
+        runner,
+      );
+      sender.destroy();
+      resolveTarget(server);
+      assert.deepEqual(plain(await pending), { ok: false, canceled: true });
+    });
+  }
 });

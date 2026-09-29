@@ -16,10 +16,14 @@ from collections.abc import Callable, Iterator, MutableMapping
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import tomllib
 
 from omnigent.native import native_bridge_common
+
+if TYPE_CHECKING:
+    from omnigent.inner.terminal import TerminalInstance
 
 CODEX_NATIVE_BRIDGE_ID_LABEL_KEY = "omnigent.codex_native.bridge_id"
 CODEX_NATIVE_BRIDGE_DIR_ENV_VAR = "HARNESS_CODEX_NATIVE_BRIDGE_DIR"
@@ -1299,6 +1303,25 @@ def read_bridge_state(bridge_dir: Path) -> CodexNativeBridgeState | None:
         active_turn_id=parsed_active_turn_id,
         cwd=cwd if isinstance(cwd, str) and cwd else None,
     )
+
+
+def native_input_ready(session_id: str, instance: TerminalInstance) -> bool:
+    """Provider ``input_ready_probe``: the app-server thread is bound to *session_id*.
+
+    The runner writes bridge state only after the TUI's thread is known (fresh
+    discovery, known-thread resume, or a thread switch that moved the terminal
+    to a new session), which is when web turns can be routed into it.
+
+    :param session_id: Omnigent conversation id currently owning the terminal.
+    :param instance: The live Codex terminal; its ``CODEX_HOME`` locates the
+        bridge directory (see :func:`codex_home_for_bridge_dir`).
+    :returns: Whether bridge state names a thread for *session_id*.
+    """
+    codex_home = instance.env.get("CODEX_HOME")
+    if not codex_home:
+        return False
+    state = read_bridge_state(Path(codex_home).parent)
+    return state is not None and state.session_id == session_id
 
 
 def update_active_turn_id(bridge_dir: Path, active_turn_id: str | None) -> None:

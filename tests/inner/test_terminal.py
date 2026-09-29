@@ -1802,6 +1802,59 @@ async def test_is_alive_false_when_probe_communication_fails(
 
 
 @pytest.mark.skipif(shutil.which("tmux") is None, reason="requires a real tmux binary")
+@pytest.mark.parametrize("start_on_attach", [False, True])
+@pytest.mark.parametrize(
+    "prompt",
+    [
+        "test\n",
+        "test\n\n",
+        "first\nsecond",
+        "",
+        "it's a test",
+        "$(printf expanded); $HOME",
+        "test",
+    ],
+)
+async def test_launch_preserves_prompt_and_following_args_real_tmux(
+    tmp_path: Path, short_tmp_parent: Path, prompt: str, start_on_attach: bool
+) -> None:
+    """Prompt text must stay one argument without consuming later connection flags."""
+    output = tmp_path / "argv.json"
+    script = (
+        "import json, pathlib, sys; pathlib.Path(sys.argv[1]).write_text(json.dumps(sys.argv[2:]))"
+    )
+    expected = [
+        prompt,
+        "-c",
+        'approvals_reviewer="auto_review"',
+        "--remote",
+        "ws://127.0.0.1:12345",
+    ]
+    instance = TerminalInstance(
+        name="codex",
+        session_key="main",
+        socket_path=short_tmp_parent / "tmux.sock",
+        private_dir=tmp_path,
+        command=sys.executable,
+        args=["-c", script, str(output), *expected],
+        keep_alive_after_exit=True,
+        tmux_start_on_attach=start_on_attach,
+    )
+    try:
+        await instance.launch(cwd=tmp_path)
+        if start_on_attach:
+            await instance._tmux("wait-for", "-S", terminal_mod._TMUX_START_ON_ATTACH_CHANNEL)
+        async with asyncio.timeout(5):
+            while await instance.is_alive():
+                await asyncio.sleep(0.01)
+
+        assert json.loads(output.read_text()) == expected
+        assert instance.last_exit_status() == 0
+    finally:
+        await instance.close()
+
+
+@pytest.mark.skipif(shutil.which("tmux") is None, reason="requires a real tmux binary")
 @pytest.mark.parametrize("exit_status", [0, 255])
 @pytest.mark.asyncio
 async def test_server_survives_inner_process_exit_real_tmux(

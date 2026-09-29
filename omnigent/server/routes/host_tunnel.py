@@ -22,6 +22,7 @@ import contextlib
 import logging
 import time
 from collections.abc import Awaitable, Callable
+from typing import Any
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from starlette.websockets import WebSocketState
@@ -30,6 +31,7 @@ from omnigent.db.db_models import InvalidUuidError, uuid_to_bytes
 from omnigent.debug_logging import debug_event, set_current_user_id
 from omnigent.errors import ErrorCategory, ErrorImpact, ErrorPhase
 from omnigent.host.frames import (
+    IMPORT_SESSION_MAX_CONNECTION_REASSEMBLED_CHARS,
     HostConnectionErrorFrame,
     HostCreateDirResultFrame,
     HostCreateWorktreeResultFrame,
@@ -37,12 +39,15 @@ from omnigent.host.frames import (
     HostFsResultFrame,
     HostHarnessReadinessFrame,
     HostHelloFrame,
+    HostImportedLocalSession,
     HostImportLocalDoneFrame,
+    HostImportLocalSessionChunkFrame,
     HostImportLocalSessionFrame,
     HostInstallHarnessResultFrame,
     HostLaunchRunnerResultFrame,
     HostListDirResultFrame,
     HostListWorktreesResultFrame,
+    HostMcpServersResultFrame,
     HostModelOptionsResultFrame,
     HostRemoveWorktreeResultFrame,
     HostRunnerExitedFrame,
@@ -51,6 +56,7 @@ from omnigent.host.frames import (
     HostStatResultFrame,
     HostStopRunnerResultFrame,
     HostStoreSecretResultFrame,
+    ImportLocalSessionChunkAssembler,
     decode_host_frame,
     encode_host_frame,
 )
@@ -504,6 +510,18 @@ async def _sender_loop(ws: WebSocket, conn: HostConnection) -> None:
             raise
 
 
+def _import_session_queue_payload(total: int, session: HostImportedLocalSession) -> dict[str, Any]:
+    """Build the pending-import queue payload for one streamed session."""
+    return {
+        "total": total,
+        "external_session_id": session.external_session_id,
+        "workspace": session.workspace,
+        "items": session.items,
+        "title": session.title,
+        "source": session.source,
+    }
+
+
 async def _receive_loop(
     ws: WebSocket,
     conn: HostConnection,
@@ -531,6 +549,9 @@ async def _receive_loop(
     :param on_host_update: Callback fired after readiness changes persist;
         ``None`` skips it.
     """
+    # Per-request reassembly of chunked import sessions; buffers die with the
+    # connection, so a tunnel drop can never leak a partial session.
+    import_chunk_assemblers: dict[str, ImportLocalSessionChunkAssembler] = {}
     while True:
         message = await ws.receive()
         if message["type"] == "websocket.disconnect":
@@ -699,6 +720,7 @@ async def _receive_loop(
                     {
                         "status": frame.status,
                         "worktree_path": frame.worktree_path,
+                        "workspace": frame.workspace,
                         "branch": frame.branch,
                         "error": frame.error,
                     }
@@ -803,26 +825,74 @@ async def _receive_loop(
             if skills_future is not None and not skills_future.done():
                 skills_future.set_result(frame)
             continue
+        if isinstance(frame, HostMcpServersResultFrame):
+            mcp_future = conn.pending_mcp_servers.pop(frame.request_id, None)
+            if mcp_future is not None and not mcp_future.done():
+                mcp_future.set_result(frame)
+            continue
         if isinstance(frame, HostImportLocalSessionFrame):
             queue = conn.pending_import_local.get(frame.request_id)
             if queue is not None:
-                s = frame.session
                 queue.put_nowait(
-                    (
-                        "session",
-                        {
-                            "total": frame.total,
-                            "external_session_id": s.external_session_id,
-                            "workspace": s.workspace,
-                            "items": s.items,
-                            "title": s.title,
-                            "source": s.source,
-                        },
-                    )
+                    ("session", _import_session_queue_payload(frame.total, frame.session))
                 )
+            continue
+        if isinstance(frame, HostImportLocalSessionChunkFrame):
+            queue = conn.pending_import_local.get(frame.request_id)
+            if queue is None:
+                # Never allocate memory for an unsolicited or expired request.
+                import_chunk_assemblers.pop(frame.request_id, None)
+                continue
+
+            # Every slice proves the host is making progress. Feed the request
+            # queue so a large session on a slow tunnel cannot hit the
+            # inter-session timeout while chunks are actively arriving.
+            queue.put_nowait(("progress", {}))
+
+            assembler = import_chunk_assemblers.setdefault(
+                frame.request_id, ImportLocalSessionChunkAssembler()
+            )
+            if assembler.opens_new_session(frame):
+                # The previous session never sent its final slice: count it as
+                # failed on its own so this one still assembles.
+                _logger.warning(
+                    "Host %s started a chunked import session before finishing the previous one",
+                    host_id,
+                )
+                queue.put_nowait(("session", {"total": frame.total}))
+            # Every in-flight request on this connection shares one buffer cap.
+            buffered_elsewhere = sum(
+                candidate.buffered_chars
+                for request_id, candidate in import_chunk_assemblers.items()
+                if request_id != frame.request_id
+            )
+            try:
+                session = assembler.add(
+                    frame,
+                    budget=IMPORT_SESSION_MAX_CONNECTION_REASSEMBLED_CHARS - buffered_elsewhere,
+                )
+            except ValueError as exc:
+                _logger.warning(
+                    "Host %s sent an unusable chunked import session: %s",
+                    host_id,
+                    exc,
+                )
+                # A payload with no external_session_id makes the import loop
+                # count one failed session and continue, keeping the stream
+                # (and the rest of the batch) alive.
+                queue.put_nowait(("session", {"total": frame.total}))
+                continue
+            if session is None:
+                continue
+            queue.put_nowait(("session", _import_session_queue_payload(frame.total, session)))
             continue
         if isinstance(frame, HostImportLocalDoneFrame):
             queue = conn.pending_import_local.get(frame.request_id)
+            assembler = import_chunk_assemblers.pop(frame.request_id, None)
+            if queue is not None and assembler is not None and assembler.in_progress:
+                # A stream that ends before the final slice must count the
+                # partial session as failed instead of silently dropping it.
+                queue.put_nowait(("session", {"total": 0}))
             if queue is not None:
                 queue.put_nowait(
                     (

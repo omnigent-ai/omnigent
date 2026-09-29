@@ -70,7 +70,7 @@ from omnigent._platform import IS_WINDOWS, is_wsl, stable_user_id
 from omnigent.harnesses.claude_native.message_display_hook import MESSAGE_DELTAS_FILE
 from omnigent.harnesses.claude_native.status import CONTEXT_RAW_FILE
 from omnigent.harnesses.diagnostics import detect_sign_in_prompt, sign_in_next_step
-from omnigent.harnesses.kiro_native.bridge import bridge_root as kiro_bridge_root
+from omnigent.harnesses.kiro_native import bridge as kiro_bridge
 from omnigent.models.claude_model_vocabulary import MODEL_VOCABULARY_ENV_VARS
 from omnigent.models.model_metadata import concrete_reported_model
 from omnigent.util.json_types import JsonObject as _JsonObject
@@ -80,6 +80,7 @@ if TYPE_CHECKING:
 
     from omnigent.inner.datamodel import OSEnvSandboxSpec
     from omnigent.inner.os_env import OSEnvironment
+    from omnigent.inner.terminal import TerminalInstance
     from omnigent.llms.context_window import ModelPricing
 
 from omnigent.inner.hook_scripts.subagent_router import (
@@ -747,7 +748,7 @@ def _trusted_parent_for_bridge_dir(target: Path) -> Path:
             trusted_parent = opencode_root.parent.parent
         return _absolute_syntactic_path(trusted_parent)
 
-    kiro_root = _absolute_syntactic_path(kiro_bridge_root())
+    kiro_root = _absolute_syntactic_path(kiro_bridge.bridge_root())
     if target.is_relative_to(kiro_root):
         # Same shape as cursor-native ($TMPDIR/omnigent-<uid>/kiro-native): trust
         # the uid-scoped temp dir's parent and validate/chmod the two
@@ -5293,6 +5294,18 @@ def claude_pane_text_ready(pane: str) -> bool:
     if any(text in pane for text in _CONFIRM_DIALOG_HINTS):
         return False
     return _claude_prompt_rendered(pane)
+
+
+def native_input_ready(session_id: str, instance: TerminalInstance) -> bool:
+    """Provider ``input_ready_probe``: Claude's composer is on screen.
+
+    :param session_id: Omnigent conversation id (unused; the pane is enough).
+    :param instance: The live Claude terminal.
+    :returns: Whether the watcher's last captured pane shows the prompt.
+    """
+    del session_id
+    # The watcher already captured this live pane; no extra tmux query.
+    return claude_pane_text_ready(instance.last_pane_text() or "")
 
 
 def _user_prompt_visible(pane: str) -> bool:

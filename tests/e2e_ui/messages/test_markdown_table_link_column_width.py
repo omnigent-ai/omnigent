@@ -148,3 +148,26 @@ def test_table_link_column_keeps_its_natural_width(
     long_boxes = long_link.evaluate(_LINE_BOXES)
     assert long_boxes > 1, f"long URL should wrap across multiple lines, got {long_boxes}"
     assert not long_link.evaluate(_OVERFLOWS_CELL), "long URL overflows its table cell"
+
+
+def test_table_fullscreen_control_expands_and_shrinks(
+    page: Page,
+    table_session: tuple[str, str],
+) -> None:
+    """The table fullscreen control opens a usable dialog and closes again."""
+    base_url, session_id = table_session
+    page.goto(f"{base_url}/c/{session_id}")
+
+    inline_table = page.locator(_TABLE).first
+    expect(inline_table).to_be_visible(timeout=30_000)
+
+    page.get_by_role("button", name="View fullscreen", exact=True).click()
+    dialog = page.get_by_role("dialog", name="View fullscreen", exact=True)
+    expect(dialog).to_be_visible()
+    expect(dialog.locator(_TABLE)).to_contain_text(_SHORT_LINK_TEXT)
+    expect(dialog.get_by_role("button", name="Copy table", exact=True)).to_be_visible()
+    expect(dialog.get_by_role("button", name="Download table", exact=True)).to_be_visible()
+
+    dialog.get_by_role("button", name="Exit fullscreen", exact=True).click()
+    expect(dialog).to_have_count(0)
+    expect(inline_table).to_be_visible()

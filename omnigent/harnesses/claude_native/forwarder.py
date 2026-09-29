@@ -1419,10 +1419,9 @@ async def forward_claude_transcript_to_session(
                             # The turn-end edges (Stop→idle / StopFailure→failed)
                             # carry the turn's response id so ap-web can CLOSE the
                             # streaming ``activeResponse`` opened by the turn-start
-                            # ``running`` edge (_forward_available_items). The
-                            # transcript forwarder ran just above, so
-                            # ``state.current_response_id`` is the active turn's id
-                            # (the user-message reset only fires on the next turn).
+                            # ``running`` edge. The transcript forwarder ran just
+                            # above, so ``state.current_response_id`` is the active
+                            # turn's id.
                             response_id=state.current_response_id,
                         )
                         # Deferred ``/compact``-refusal dismissal: runs AFTER
@@ -4023,6 +4022,10 @@ async def _forward_available_status_events(
                 session_id=session_id,
                 status=status,
                 response_id=response_id,
+                # The ``Stop`` hook fires exactly once per finished turn and
+                # never on an interrupt, so its ``idle`` edge is a confirmed
+                # turn completion, unlike quiescence-derived idles.
+                turn_completed=True if status == "idle" else None,
                 # Only the ``Stop`` (idle) edge carries an authoritative
                 # background-shell count — ``0`` clears the tally, ``N`` sets it.
                 # This is the one thing the status file cannot report: its

@@ -3105,12 +3105,16 @@ function ComposerImpl(
     }
   };
 
-  // Skills insert at the caret; standalone no-argument built-ins execute immediately.
+  const completeMenuSelection = (cmd: string) => {
+    const completion = slashCompletion.complete(cmd);
+    setValue(completion.text);
+    dirtyRef.current = true;
+  };
+
+  // Skills insert at the caret; Enter/click executes standalone no-argument built-ins.
   const applyMenuSelection = (cmd: string) => {
     if (slashCompletion.inline || slashCommandsWithArgs.has(cmd)) {
-      const completion = slashCompletion.complete(cmd);
-      setValue(completion.text);
-      dirtyRef.current = true;
+      completeMenuSelection(cmd);
     } else {
       // Execute immediately — no argument needed.
       setValue("");
@@ -3138,6 +3142,7 @@ function ComposerImpl(
     escapeClearsOnlyWithContent: true,
     allowOpen: inputFocused && draft.quotes.length === 0 && files.length === 0,
     onSelect: applyMenuSelection,
+    onTabComplete: completeMenuSelection,
     clearText: () => setValue(""),
   });
 

@@ -103,6 +103,9 @@ _STATE_FILE = "cursor_forwarder.json"
 # way, so the loop warns once when it starts and re-warns at most this often.
 _FD_EXHAUSTION_REWARN_S = 60.0
 
+# Let an in-progress hook append finish before treating its record as damaged.
+_TURN_OUTCOME_PARSE_ATTEMPTS = 3
+
 # A sibling session's persisted claim (naming the same ``store_path``) counts as
 # a LIVE owner only if its heartbeat was refreshed within this window; an older
 # claim is treated as a dead session and may be taken over. Generous relative to
@@ -955,6 +958,7 @@ async def forward_cursor_store_to_session(
     fd_exhausted_since: float | None = None
     fd_exhaustion_last_warn = 0.0
     pending_turn_end: int | None = None
+    outcome_parse_failures = 0
     timeout = httpx.Timeout(_POST_TIMEOUT_S)
     async with httpx.AsyncClient(
         base_url=base_url, headers=headers, auth=auth, timeout=timeout
@@ -967,10 +971,11 @@ async def forward_cursor_store_to_session(
                     total_turn_ends = await asyncio.to_thread(
                         cursor_native_status.count_turn_ends, bridge_dir
                     )
-                    if total_turn_ends > await asyncio.to_thread(
+                    posted_turn_ends = await asyncio.to_thread(
                         cursor_native_status.read_posted_count, bridge_dir
-                    ):
-                        pending_turn_end = total_turn_ends
+                    )
+                    if total_turn_ends > posted_turn_ends:
+                        pending_turn_end = posted_turn_ends + 1
                 retrying_items = False
                 if store_path is None or not store_path.exists():
                     # On cold resume the runner pre-seeds the bridge state with
@@ -1208,9 +1213,26 @@ async def forward_cursor_store_to_session(
                 # Deliver the hook outcome after its transcript, even without a
                 # bound store. Failed posts retain this snapshot for the next poll.
                 if not retrying_items and pending_turn_end is not None:
-                    outcome = await asyncio.to_thread(
-                        cursor_native_status.read_turn_outcome, bridge_dir, pending_turn_end
-                    )
+                    try:
+                        outcome = await asyncio.to_thread(
+                            cursor_native_status.read_turn_outcome, bridge_dir, pending_turn_end
+                        )
+                    except (ValueError, IndexError):
+                        outcome_parse_failures += 1
+                        if outcome_parse_failures < _TURN_OUTCOME_PARSE_ATTEMPTS:
+                            await asyncio.sleep(poll_interval_s)
+                            continue
+                        if outcome_parse_failures == _TURN_OUTCOME_PARSE_ATTEMPTS:
+                            _logger.error(
+                                "cursor stop marker %s is damaged; reporting failure; "
+                                "session=%s bridge_dir=%s",
+                                pending_turn_end,
+                                session_id,
+                                bridge_dir,
+                            )
+                        outcome = "failed"
+                    else:
+                        outcome_parse_failures = 0
                     await _post_external_session_status(
                         client,
                         session_id=session_id,
@@ -1221,6 +1243,7 @@ async def forward_cursor_store_to_session(
                         cursor_native_status.write_posted_count, bridge_dir, pending_turn_end
                     )
                     pending_turn_end = None
+                    outcome_parse_failures = 0
                 if fd_exhausted_since is not None:
                     _logger.info(
                         "cursor forwarder polling recovered after fd exhaustion (%.1fs); "

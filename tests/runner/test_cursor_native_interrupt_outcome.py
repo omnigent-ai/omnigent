@@ -3,15 +3,25 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import uuid
+from pathlib import Path
 from typing import Any
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
+import httpx
 import pytest
 
+from omnigent.entities import ConversationItem, MessageData, PagedList
 from omnigent.harnesses.cursor_native import bridge
+from omnigent.harnesses.cursor_native import forwarder as fwd
+from omnigent.harnesses.cursor_native import status as cursor_status
 from omnigent.runner import app as runner_app
+from omnigent.server.routes._sessions.orchestration import (
+    _enrich_terminal_status_with_subagent_output,
+)
 from omnigent.spec.types import AgentSpec, ExecutorSpec
+from omnigent.stores.conversation_store import ConversationStore
 from tests.runner.conftest import (
     _drain_session_event_queue,
     _FakeProcessManager,
@@ -19,6 +29,114 @@ from tests.runner.conftest import (
     _ScriptedHarnessClient,
 )
 from tests.runner.helpers import NullServerClient
+
+
+@pytest.mark.parametrize("append_later", [False, True], ids=["backlog", "during-retry"])
+async def test_damaged_stop_marker_recovers_parent_delivery(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, append_later: bool
+) -> None:
+    """A truncated record fails with partial output, then the next dispatch completes."""
+    from tests.runner.test_native_subagent_turn_outcome_delivery import _Rig
+
+    marker_file = tmp_path / cursor_status.TURN_END_FILE
+    marker_file.write_text('{"status": "abort', encoding="utf-8")
+    if not append_later:
+        cursor_status.record_turn_end(tmp_path, {"status": "completed"})
+    read_outcome = cursor_status.read_turn_outcome
+    reads = 0
+
+    def read_then_append(directory: Path, marker: int) -> str:
+        nonlocal reads
+        reads += 1
+        try:
+            return read_outcome(directory, marker)
+        finally:
+            if append_later and reads == 1:
+                cursor_status.record_turn_end(tmp_path, {"status": "completed"})
+
+    monkeypatch.setattr(cursor_status, "read_turn_outcome", read_then_append)
+    monkeypatch.setattr(fwd, "_discover_store", lambda *a: None)
+    rig = _Rig("cursor-native")
+    store = Mock(spec=ConversationStore)
+    results = []
+    failure_posts = 0
+    task = None
+    try:
+        async with _runner_client(rig.app) as client:
+
+            async def forward(request: httpx.Request) -> httpx.Response:
+                nonlocal failure_posts
+                body = json.loads(request.content)
+                if body["data"]["status"] == "failed":
+                    failure_posts += 1
+                    if failure_posts == 1:
+                        return httpx.Response(503)
+                reply = "Partial research" if not results else "Next task completed"
+                store.list_items.return_value = PagedList(
+                    data=[
+                        ConversationItem(
+                            id="reply",
+                            type="message",
+                            status="completed",
+                            response_id="response",
+                            created_at=1,
+                            data=MessageData(
+                                role="assistant",
+                                agent="cursor-native-ui",
+                                content=[{"type": "text", "text": reply}],
+                            ),
+                        )
+                    ]
+                )
+                body["data"] = await _enrich_terminal_status_with_subagent_output(
+                    body["data"], body["data"]["status"], rig.child_id, store
+                )
+                response = await client.post(f"/v1/sessions/{rig.child_id}/events", json=body)
+                assert response.status_code == 204, response.text
+                results.extend(rig.drained())
+                if len(results) == 1:
+                    runner_app.register_subagent_work(
+                        parent_session_id=rig.parent_id,
+                        child_session_id=rig.child_id,
+                        agent="researcher",
+                        title="next task",
+                    )
+                return httpx.Response(204)
+
+            client_type = httpx.AsyncClient
+            monkeypatch.setattr(
+                fwd.httpx,
+                "AsyncClient",
+                lambda **kwargs: client_type(
+                    transport=httpx.MockTransport(forward),
+                    **kwargs,
+                ),
+            )
+            task = asyncio.create_task(
+                fwd.forward_cursor_store_to_session(
+                    base_url="http://test",
+                    headers={},
+                    session_id=rig.child_id,
+                    bridge_dir=tmp_path,
+                    workspace="/ws",
+                    launch_epoch_ms=0,
+                    agent_name="cursor-native-ui",
+                    poll_interval_s=0.01,
+                )
+            )
+            async with asyncio.timeout(2):
+                while cursor_status.read_posted_count(tmp_path) != 2:
+                    await asyncio.sleep(0.01)
+            assert [(r["status"], r["output"]) for r in results] == [
+                ("failed", "Partial research"),
+                ("completed", "Next task completed"),
+            ]
+            assert failure_posts == 2
+    finally:
+        if task is not None:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        rig.close()
 
 
 @pytest.mark.parametrize(

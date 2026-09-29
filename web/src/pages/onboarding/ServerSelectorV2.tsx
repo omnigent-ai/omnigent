@@ -5,7 +5,7 @@
  * `omnigentSetup` bridge via the `setup` prop.
  */
 
-import { type CSSProperties, useState } from "react";
+import { type CSSProperties, useRef, useState } from "react";
 import { Settings } from "lucide-react";
 import { AnimatedOmnigentPanel } from "@/components/onboarding/AnimatedOmnigentPanel";
 import {
@@ -21,8 +21,12 @@ import {
 import { LandingFooter } from "@/pages/onboarding/LandingFooter";
 import { LandingStep } from "@/pages/onboarding/LandingStep";
 import { HarnessIconRow, LocalIntroStep } from "@/pages/onboarding/LocalIntroStep";
-import { ServerDetailStep } from "@/pages/onboarding/ServerDetailStep";
-import { ServerHeroIcons, ServerSelectStep } from "@/pages/onboarding/ServerSelectStep";
+import { type Runner, RunnerStep } from "@/pages/onboarding/RunnerStep";
+import {
+  isLocalInstall,
+  ServerHeroIcons,
+  ServerSelectStep,
+} from "@/pages/onboarding/ServerSelectStep";
 import { SetupTerminalStep } from "@/pages/onboarding/SetupTerminalStep";
 
 /**
@@ -46,9 +50,15 @@ export interface ServerSelectorV2Setup {
   recentServers: string[];
   /** Organization-provided server URLs. */
   managedServers: string[];
-  /** Whether the `omnigent` CLI is already installed (returning user). Drives
-   *  the "Install" vs "Open" action label and the returning-user start step. */
+  /** Whether the `omnigent` CLI is already installed. Drives the "Install" vs
+   *  "Start"/"Open" action label and whether install runs first. */
   installed?: boolean;
+  /** Has connected to any server before (returning user). The shell counts MDM
+   *  presets too, which `recentServers` excludes, so it outlives the list. */
+  connectedBefore?: boolean;
+  /** start-local would reuse a healthy server (checked at load) → the local
+   *  intro and its terminal read "Open"/"Opening" rather than "Start". */
+  localServerRunning?: boolean;
   /** Mocks only: route Join / Install actions to the terminal step (which runs
    *  the mocked local-server flow) instead of the no-op connect, so the install
    *  screen is reachable from every path. Never set by the real shell. */
@@ -70,6 +80,14 @@ export interface ServerSelectorV2Setup {
   onInstallCli?: () => Promise<{ ok: boolean; error?: string }>;
   /** Subscribe to the CLI installer's output lines; returns an unsubscribe. */
   onInstallLog?: (cb: (line: string) => void) => () => void;
+  /** Runners the "Where do you work today?" step offers for `url`, and whether
+   *  its host CLI comes bundled (no CLI install). Absent → this laptop only. */
+  getRunnerOptions?: (url: string) => Promise<{ remote: boolean; bundledCli?: boolean }>;
+  /** Connect the picked runner to `url` before opening it. Absent → the runner
+   *  step just opens the server. */
+  onConnectRunner?: (url: string, runner: Runner) => Promise<{ ok: boolean; error?: string }>;
+  /** Subscribe to onConnectRunner's output lines; returns an unsubscribe. */
+  onRunnerLog?: (cb: (line: string) => void) => () => void;
   /** Remove a recent server from the saved list, if the shell supports it. */
   onRemoveServer?: (url: string) => void;
   /** Copy text to the clipboard via the shell's native bridge. */
@@ -96,59 +114,125 @@ export interface ServerCheckResult {
   status: "ok" | "reachable" | "unreachable";
 }
 
-type Step = "landing" | "local" | "detail" | "server" | "terminal";
+type Step = "landing" | "local" | "runner" | "server" | "terminal";
 
 // Per-step card dimensions (px). The panel shrinks as steps gain content; the
 // card grows for the scrollable server list. Drives the CSS-transition resize.
 const CARD: Record<Step, { height: number; panelHeight: number }> = {
   landing: { height: 560, panelHeight: 308 },
   local: { height: 560, panelHeight: 150 },
-  detail: { height: 600, panelHeight: 150 },
+  runner: { height: 560, panelHeight: 150 },
   server: { height: 600, panelHeight: 64 },
   terminal: { height: 560, panelHeight: 240 },
 };
 
 export function ServerSelectorV2({ setup }: { setup: ServerSelectorV2Setup }) {
-  // A failed connect reloads the wizard with an error (from ?error=&url=). That
-  // only ever comes from the server-select flow, so open there — otherwise the
-  // error banner renders on a step that isn't mounted and stays invisible.
-  // "Connect to new server…" also opens the list directly (initialStep). A
-  // returning user (CLI installed) skips the welcome and lands on the list too;
-  // Back still reaches the landing for the local path.
+  // With MDM presets everyone starts on the landing: its dropdown holds recents
+  // and a URL field, and it shows connect errors itself.
+  const mdm = setup.managedServers.length > 0;
+  // A failed connect reloads with an error (?error=&url=) whose banner lives on
+  // the server step, so open there; "Connect to new server…" too (initialStep).
+  const failedOrForced = setup.error !== undefined || setup.initialStep === "server";
+  // Returning users land on the server list when it has something to pick; new
+  // users — or one who cleared every server — land on the welcome.
+  const returning = setup.connectedBefore === true || setup.recentServers.length > 0;
+  const hasServers = setup.recentServers.length > 0 || mdm;
   const [step, setStep] = useState<Step>(
-    setup.error || setup.initialStep === "server" || setup.installed ? "server" : "landing",
+    !mdm && (failedOrForced || (returning && hasServers)) ? "server" : "landing",
   );
+  const [landingError, setLandingError] = useState(setup.error);
   // Wizard color scheme radio. Seeded from the shell's current source (which
   // survives navigation), defaulting to "system" when the shell doesn't report.
   const [colorScheme, setColorScheme] = useState<"system" | "light" | "dark">(
     setup.initialColorScheme ?? "system",
   );
-  // The preset server picked from the landing split button (drives the detail step).
-  const [detailUrl, setDetailUrl] = useState<string | null>(null);
-  // What the terminal step should run after any install: start the local server,
-  // or connect to a remote URL. Set by whichever action routed to "terminal".
+  // The server picked on the MDM landing, whether its runner step offers the
+  // remote environment, and whether its host CLI is bundled.
+  const [runnerTarget, setRunnerTarget] = useState<{
+    url: string;
+    remote: boolean;
+    bundledCli: boolean;
+  } | null>(null);
+  const [runnerError, setRunnerError] = useState<string>();
+  // Bumped per pick, so a slow lookup can't replace a newer pick's runner step.
+  const runnerPick = useRef(0);
+  const pickRunnerFor = async (url: string) => {
+    const pick = ++runnerPick.current;
+    // A failed lookup falls back to this laptop only.
+    const options = await setup.getRunnerOptions?.(url).catch(() => undefined);
+    if (pick !== runnerPick.current) return;
+    setRunnerTarget({
+      url,
+      remote: options?.remote === true,
+      bundledCli: options?.bundledCli === true,
+    });
+    setRunnerError(undefined);
+    setStep("runner");
+  };
+  // What the terminal step runs after any install (Back → `back`): start the
+  // local server (a picked local install's `url` opens as-is when up), or
+  // connect to a URL, first connecting the picked runner when set.
   const [terminalTarget, setTerminalTarget] = useState<
-    { kind: "local" } | { kind: "connect"; url: string }
-  >({ kind: "local" });
+    | { kind: "local"; back: Step; url?: string }
+    | { kind: "connect"; back: Step; url: string; runner?: Runner; skipInstall?: boolean }
+  >({ kind: "local", back: "local" });
   // Install runs in the terminal step only when the CLI is missing AND in-app
-  // install is actually offered (macOS — onInstallCli is present). A returning
-  // user ("Open Omnigent"), or any platform without install support, connects
-  // directly. Mocks force the install screen to show.
+  // install is actually offered (macOS — onInstallCli is present). An installed
+  // CLI, or any platform without install support, connects directly. Mocks
+  // force the install screen to show.
   const needsInstall =
     setup.mockInstall === true || (setup.installed === false && setup.onInstallCli != null);
 
-  // A server pick (list Join / preset detail): install-then-connect when the CLI
+  // A server pick (list Join / runner step): install-then-connect when the CLI
   // is missing (route via terminal), else connect straight away. Resolves the
   // ConnectResult so the list can still show a connect error when connecting
   // directly.
-  const connect = async (url: string): Promise<ConnectResult> => {
+  const connect = async (url: string, back: Step = "server"): Promise<ConnectResult> => {
+    // The local install is checked in the terminal step, so a stopped one starts.
+    if (isLocalInstall(url)) {
+      setTerminalTarget({ kind: "local", back, url });
+      setStep("terminal");
+      return {};
+    }
     if (needsInstall) {
-      setTerminalTarget({ kind: "connect", url });
+      setTerminalTarget({ kind: "connect", back, url });
       setStep("terminal");
       return {};
     }
     return setup.onConnect(url);
   };
+  // MDM landing: a new user picks a runner first; a returning user just opens it.
+  const joinFromLanding = async (url: string) => {
+    if (!returning) return pickRunnerFor(url);
+    setLandingError(undefined);
+    const result = await connect(url, "landing");
+    if (result.error) setLandingError(result.error);
+  };
+  // Connect from the terminal: success navigates away, a rejection shows there.
+  const connectInTerminal = async (url: string) => {
+    const result = await setup.onConnect(url);
+    return { ok: result.error === undefined, error: result.error };
+  };
+  // Checked at run time (Retry re-checks): a picked local install that's up opens
+  // that exact URL; one that's down starts like "Get started locally".
+  const runTerminal = async () => {
+    const t = terminalTarget;
+    if (t.kind === "connect" && t.runner && setup.onConnectRunner) {
+      const res = await setup.onConnectRunner(t.url, t.runner);
+      if (!res.ok) return res;
+    }
+    if (t.kind === "connect") return connectInTerminal(t.url);
+    if (t.url !== undefined && (await setup.onCheckServer(t.url)).status !== "unreachable")
+      return connectInTerminal(t.url);
+    return setup.onStartLocal();
+  };
+  const terminalRunner = terminalTarget.kind === "connect" ? terminalTarget.runner : undefined;
+  const skipInstall = terminalTarget.kind === "connect" && terminalTarget.skipInstall === true;
+  const terminalCopy = terminalRunningCopy(
+    terminalRunner,
+    terminalTarget.kind,
+    setup.localServerRunning === true,
+  );
   // Whether the server step is showing its URL-input ("add") view vs the list —
   // reported up so the band can show the hero icons only in the add view.
   const [serverAddMode, setServerAddMode] = useState(false);
@@ -158,11 +242,11 @@ export function ServerSelectorV2({ setup }: { setup: ServerSelectorV2Setup }) {
   const panelHeight = step === "server" && serverAddMode ? 150 : basePanelHeight;
 
   // Panel band: harness icons on the local intro; server hero icons on the
-  // detail step and on the server step's add (URL-input) view.
+  // runner step and on the server step's add (URL-input) view.
   const bandContent =
     step === "local" ? (
       <HarnessIconRow />
-    ) : step === "detail" || (step === "server" && serverAddMode) ? (
+    ) : step === "runner" || (step === "server" && serverAddMode) ? (
       <ServerHeroIcons />
     ) : undefined;
 
@@ -228,52 +312,59 @@ export function ServerSelectorV2({ setup }: { setup: ServerSelectorV2Setup }) {
         {step === "landing" && (
           <LandingStep
             managedServers={setup.managedServers}
+            recentServers={setup.recentServers}
+            error={landingError}
             onGetStarted={() => setStep("local")}
             onJoinServer={() => setStep("server")}
-            onJoinManaged={(url) => {
-              setDetailUrl(url);
-              setStep("detail");
-            }}
+            onJoinManaged={joinFromLanding}
+            onJoinUrl={joinFromLanding}
           />
         )}
         {step === "local" && (
           <LocalIntroStep
             installed={setup.installed}
+            startsLocal={!setup.localServerRunning}
             onBack={() => setStep("landing")}
             onInstall={() => {
-              setTerminalTarget({ kind: "local" });
+              setTerminalTarget({ kind: "local", back: "local" });
               setStep("terminal");
             }}
           />
         )}
-        {step === "detail" && detailUrl !== null && (
-          <ServerDetailStep
-            url={detailUrl}
+        {step === "runner" && runnerTarget !== null && (
+          <RunnerStep
+            remoteAvailable={runnerTarget.remote}
             installed={setup.installed}
+            error={runnerError}
             onBack={() => setStep("landing")}
-            onConnect={connect}
-            onCopy={setup.onCopy}
-            onShowAll={() => setStep("server")}
+            onInstall={async (runner) => {
+              if (!setup.onConnectRunner) {
+                setRunnerError(undefined);
+                const result = await connect(runnerTarget.url, "runner");
+                if (result.error) setRunnerError(result.error);
+                return;
+              }
+              // No local install for a remote runner, or when the host CLI is bundled.
+              setTerminalTarget({
+                kind: "connect",
+                back: "runner",
+                url: runnerTarget.url,
+                runner,
+                skipInstall: runner === "remote" || runnerTarget.bundledCli,
+              });
+              setStep("terminal");
+            }}
           />
         )}
         {step === "terminal" && (
           <SetupTerminalStep
-            onInstallCli={needsInstall ? setup.onInstallCli : undefined}
+            onInstallCli={needsInstall && !skipInstall ? setup.onInstallCli : undefined}
             onInstallLog={setup.onInstallLog}
-            onRun={
-              terminalTarget.kind === "connect"
-                ? async () => {
-                    const url = terminalTarget.url;
-                    const result = await setup.onConnect(url);
-                    // Success navigates the window away; a rejection surfaces as
-                    // an error here.
-                    return { ok: result.error === undefined, error: result.error };
-                  }
-                : setup.onStartLocal
-            }
-            onSetupLog={setup.onSetupLog}
-            onBack={() => setStep(terminalTarget.kind === "connect" ? "server" : "local")}
-            runningLabel={terminalTarget.kind === "connect" ? "Connecting" : "Starting Omnigent"}
+            onRun={runTerminal}
+            onSetupLog={terminalRunner ? setup.onRunnerLog : setup.onSetupLog}
+            onBack={() => setStep(terminalTarget.back)}
+            runningLabel={terminalCopy.label}
+            runningHint={terminalCopy.hint}
           />
         )}
         {step === "server" && (
@@ -296,4 +387,25 @@ export function ServerSelectorV2({ setup }: { setup: ServerSelectorV2Setup }) {
       <LandingFooter />
     </div>
   );
+}
+
+/** Terminal heading + empty-log hint for what the run phase is doing. */
+function terminalRunningCopy(
+  runner: Runner | undefined,
+  kind: "local" | "connect",
+  localServerRunning: boolean,
+): { label: string; hint: string } {
+  if (runner === "remote") {
+    return {
+      label: "Connecting your remote environment",
+      hint: "Starting your remote environment…",
+    };
+  }
+  if (runner === "local") {
+    return { label: "Connecting this laptop", hint: "Connecting this laptop to the server…" };
+  }
+  if (kind === "connect") return { label: "Connecting", hint: "Connecting to the server…" };
+  return localServerRunning
+    ? { label: "Opening Omnigent", hint: "Connecting to the local server…" }
+    : { label: "Starting Omnigent", hint: "Starting the local server…" };
 }

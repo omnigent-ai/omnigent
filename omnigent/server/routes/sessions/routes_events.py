@@ -2763,6 +2763,8 @@ def register_events_routes(
             and conv.workspace is not None
             and conv.host_id is not None
         ):
+            from omnigent.server.routes._host_worktree import WORKTREE_ROOT_LABEL_KEY
+
             await _remove_session_worktree_best_effort(
                 host_id=conv.host_id,
                 worktree_path=conv.workspace,
@@ -2770,6 +2772,7 @@ def register_events_routes(
                 delete_branch=True,
                 request=request,
                 reason="session-delete",
+                expected_root_fingerprint=conv.labels.get(WORKTREE_ROOT_LABEL_KEY),
                 conversation_store=conversation_store,
                 exclude_conversation_id=conv.id,
                 fail_if_unavailable=True,

@@ -158,7 +158,17 @@ def test_repeated_rpcs_only_revalidate_their_owner(
 ) -> None:
     scans = Mock(return_value=list(authenticated_agy))
     ports = {101: [52548], 102: [52550]} if socket_attribution else {101: [], 102: []}
-    lookups = Mock(side_effect=lambda pid: ports[pid])
+    # Mock.call_count is not thread-safe: the concurrent reads below race its
+    # non-atomic increment and under-count. Tally through a locked side effect.
+    lookup_lock = threading.Lock()
+    lookup_calls: list[int] = []
+
+    def _record_lookup(pid: int) -> list[int]:
+        with lookup_lock:
+            lookup_calls.append(pid)
+        return ports[pid]
+
+    lookups = Mock(side_effect=_record_lookup)
     monkeypatch.setattr(rpc, "_list_agy_pids", scans)
     monkeypatch.setattr(rpc, "_pid_listen_ports", lookups)
     if not socket_attribution:
@@ -176,7 +186,8 @@ def test_repeated_rpcs_only_revalidate_their_owner(
     for port in [52548, 52550]:
         rpc.get_trajectory_steps(port, _CONVERSATION_ID)
     scans.reset_mock()
-    lookups.reset_mock()
+    with lookup_lock:
+        lookup_calls.clear()
 
     ports_to_read = [52548, 52550] * 10
     with ThreadPoolExecutor(max_workers=4) as executor:
@@ -186,7 +197,8 @@ def test_repeated_rpcs_only_revalidate_their_owner(
             )
         )
     scans.assert_not_called()
-    assert lookups.call_count == len(ports_to_read)
+    with lookup_lock:
+        assert len(lookup_calls) == len(ports_to_read)
 
 
 @pytest.mark.parametrize("cached_owner", [False, True])

@@ -200,6 +200,39 @@ async def test_stop_hook_outcome_reaches_session(
 
 
 @pytest.mark.asyncio
+async def test_partial_stop_marker_retries_before_reporting_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A write that finishes on the next poll keeps its actual outcome."""
+    marker_file = tmp_path / status.TURN_END_FILE
+    marker_file.write_text('{"status": "abort', encoding="utf-8")
+    read_outcome = status.read_turn_outcome
+    reads = 0
+    outcomes: list[str] = []
+
+    def read_then_finish(bridge: Path, marker: int) -> str:
+        nonlocal reads
+        reads += 1
+        try:
+            return read_outcome(bridge, marker)
+        finally:
+            if reads == 1:
+                with marker_file.open("a", encoding="utf-8") as handle:
+                    handle.write('ed"}\n')
+
+    async def post_status(client, *, session_id, status, turn_outcome):
+        outcomes.append(turn_outcome)
+
+    monkeypatch.setattr(status, "read_turn_outcome", read_then_finish)
+    monkeypatch.setattr(fwd, "_post_external_session_status", post_status)
+    await _drive_idle_loop(
+        monkeypatch, tmp_path, None, until=lambda: status.read_posted_count(tmp_path) == 1
+    )
+    assert reads == 2
+    assert outcomes == ["cancelled"]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("failure", ["read", "post"])
 async def test_stop_outcome_snapshot_survives_append_and_retry(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str

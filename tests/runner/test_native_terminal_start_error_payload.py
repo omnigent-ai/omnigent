@@ -147,6 +147,16 @@ def test_cause_names_omnigent_error_code() -> None:
     assert "internal detail" not in orchestration._native_terminal_start_failure_cause(exc)
 
 
+def test_cause_names_omnigent_error_code_and_cause_type() -> None:
+    """A coded launch-config failure keeps the underlying transport cause visible."""
+    exc = OmnigentError("could not fetch", code=ErrorCode.INTERNAL_ERROR)
+    exc.__cause__ = httpx.ReadTimeout("slow")
+
+    assert orchestration._native_terminal_start_failure_cause(exc) == (
+        f"OmnigentError code {ErrorCode.INTERNAL_ERROR} (cause ReadTimeout)"
+    )
+
+
 def test_codex_early_exit_with_unknown_status_does_not_invent_one(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

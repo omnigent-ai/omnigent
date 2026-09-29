@@ -60,9 +60,10 @@ def record_turn_end(bridge_dir: Path, payload: object | None = None) -> None:
         if hook_status in ("completed", "aborted", "error"):
             line["status"] = hook_status
     bridge_dir.mkdir(parents=True, exist_ok=True)
-    # O_APPEND keeps a fast-firing hook's short JSON line from interleaving.
+    # A leading separator isolates this record from a previous short write.
+    # Blank lines are ignored by readers, including older forwarders.
     with open(bridge_dir / TURN_END_FILE, "a", encoding="utf-8") as handle:
-        handle.write(json.dumps(line, sort_keys=True) + "\n")
+        handle.write("\n" + json.dumps(line, sort_keys=True) + "\n")
 
 
 def count_turn_ends(bridge_dir: Path) -> int:

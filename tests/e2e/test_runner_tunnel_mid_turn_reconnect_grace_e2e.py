@@ -251,6 +251,10 @@ class _ReconnectStack:
         self._artifact_dir = tmp_path / "artifacts"
         self._artifact_dir.mkdir()
         self.server_log = tmp_path / "server.log"
+        # The server's own log file. Its stderr mirroring is env-dependent,
+        # so assertions on server log lines read this path, which
+        # configure_process_logging always writes when the variable is set.
+        self.process_log = tmp_path / "server-process.log"
         self.runner_log = tmp_path / "runner.log"
         self._server_handle = self.server_log.open("w")
         self._runner_handle = self.runner_log.open("w")
@@ -259,12 +263,13 @@ class _ReconnectStack:
         self.proxy: _TunnelIngressProxy | None = None
         self.client = httpx.Client(base_url=self.base_url, timeout=30.0, trust_env=False)
 
-    def _server_env(self) -> dict[str, str]:
+    def _server_env(self, process_log: Path | None = None) -> dict[str, str]:
         env = {
             **_ambient_free_environ(),
             "OPENAI_API_KEY": "mock-key",
             "OPENAI_BASE_URL": self._mock_base,
             "OMNIGENT_RUNNER_TUNNEL_TOKEN": self._binding_token,
+            "OMNIGENT_PROCESS_LOG_FILE": str(process_log or self.process_log),
         }
         apply_server_env(env, _REPO_ROOT)
         return env
@@ -299,7 +304,9 @@ class _ReconnectStack:
         proxy_url = f"http://127.0.0.1:{self.proxy.port}"
         runner_env = apply_runner_env(
             {
-                **self._server_env(),
+                **{
+                    k: v for k, v in self._server_env().items() if k != "OMNIGENT_PROCESS_LOG_FILE"
+                },
                 "OMNIGENT_RUNNER_ID": self.runner_id,
                 "OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN": self._binding_token,
                 "OMNIGENT_RUNNER_PARENT_PID": str(os.getpid()),
@@ -360,6 +367,7 @@ class _Replica:
         self.port = find_free_port()
         self.base_url = f"http://127.0.0.1:{self.port}"
         self.server_log = log_dir / "server-b.log"
+        self.process_log = log_dir / "server-b-process.log"
         self._handle = self.server_log.open("w")
         self._proc: subprocess.Popen[bytes] | None = None
         self.client = httpx.Client(base_url=self.base_url, timeout=30.0, trust_env=False)
@@ -380,7 +388,7 @@ class _Replica:
                 "--artifact-location",
                 str(self._stack._artifact_dir),
             ],
-            env=self._stack._server_env(),
+            env=self._stack._server_env(process_log=self.process_log),
             stdout=self._handle,
             stderr=subprocess.STDOUT,
         )
@@ -520,7 +528,7 @@ def test_mid_turn_tunnel_blackout_recovers_without_failed_edge(
         what="the original in-flight turn to complete after runner reconnect",
     )
 
-    server_log = stack.server_log.read_text()
+    server_log = stack.process_log.read_text()
     assert _FAILURE_SIGNATURE.search(server_log) is None, (
         f"The server failed session {session_id} during a {_BLACKOUT_S:.0f}s transient "
         "runner-tunnel outage even though the same runner reconnected and the original "
@@ -620,7 +628,7 @@ def test_reconnect_to_another_replica_does_not_fail_the_turn(
         # A's lease-long wait is what fails the turn; give it time to fire.
         time.sleep(RUNNER_DISCONNECT_GRACE_S + 10.0)
 
-        server_a_log = stack.server_log.read_text()
+        server_a_log = stack.process_log.read_text()
         failed_edges = _FAILURE_SIGNATURE.findall(server_a_log)
         assert not failed_edges, (
             f"Replica A failed session {session_id} after the runner reconnected to "
@@ -651,3 +659,86 @@ def test_reconnect_to_another_replica_does_not_fail_the_turn(
         assert "runner_disconnected" not in json.dumps(snapshot)
     finally:
         replica_b.teardown()
+
+
+def test_relay_waits_for_reconnect_instead_of_polling(
+    reconnect_stack: _ReconnectStack,
+    mock_llm_server_url: str,
+) -> None:
+    """The relay rides out an outage with one wait, not a stream open every 0.5 s.
+
+    On unchanged main the relay retries ``GET /stream`` every 0.5 s for the
+    whole lease, so a 45 s outage logs dozens of ``retrying`` lines and
+    stream opens per session (~100k give-up rows a week in managed). Waiting
+    on the runner's re-registration instead means a single attempt per
+    outage, resolved the instant the runner comes back.
+    """
+    stack = reconnect_stack
+    proxy = stack.proxy
+    assert proxy is not None
+    reset_mock_llm(mock_llm_server_url)
+    model = f"runner-relay-wait-{uuid.uuid4().hex[:8]}"
+    configure_mock_llm(
+        mock_llm_server_url,
+        [{"text": _ANSWER, "block": True}],
+        key=model,
+    )
+    agent_name = register_inline_agent(
+        stack.client,
+        name=f"runner-relay-wait-{uuid.uuid4().hex[:8]}",
+        harness="openai-agents",
+        model=model,
+        profile="",
+        prompt="Return the configured answer.",
+        mock_llm_base_url=f"{mock_llm_server_url}/v1",
+    )
+    session_id = create_runner_bound_session(
+        stack.client,
+        agent_name=agent_name,
+        runner_id=stack.runner_id,
+    )
+    _send_user_message(stack.client, session_id)
+    _poll_until(
+        lambda: _gate_pending(mock_llm_server_url),
+        timeout=60.0,
+        what="the real turn to block inside the mock LLM",
+    )
+
+    blackout_started = time.monotonic()
+    proxy.begin_blackout()
+    try:
+        _poll_until(
+            lambda: proxy.rejected_connections > 0,
+            timeout=10.0,
+            what="the real runner to attempt a reconnect through the 503 ingress",
+        )
+        remaining = _BLACKOUT_S - (time.monotonic() - blackout_started)
+        if remaining > 0:
+            time.sleep(remaining)
+    finally:
+        proxy.end_blackout()
+
+    stack.wait_runner_online()
+    release_mock_gate(mock_llm_server_url)
+    _poll_until(
+        lambda: _ANSWER in _session_blob(stack.client, session_id),
+        timeout=60.0,
+        what="the original in-flight turn to complete after runner reconnect",
+    )
+
+    # Read the server's own log file, not its captured stderr: stderr
+    # mirroring is env-dependent, so a count there could be zero and pass
+    # vacuously. One transport-lost row opens the outage; a polling relay
+    # then logs a retry line per attempt.
+    process_log = stack.process_log.read_text()
+    outages = process_log.count(f"Relay: runner transport lost for session={session_id} (")
+    assert outages >= 1, "the blackout never registered as a transport loss in the server log"
+    retry_lines = [
+        line
+        for line in process_log.splitlines()
+        if f"transport lost for session={session_id}; retrying" in line
+    ]
+    assert len(retry_lines) <= 1, (
+        f"The relay re-opened GET /stream {len(retry_lines)} times during a single "
+        f"{_BLACKOUT_S:.0f}s outage instead of waiting once for the runner to re-register."
+    )
