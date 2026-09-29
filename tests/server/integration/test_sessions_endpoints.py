@@ -10084,7 +10084,9 @@ async def test_interrupt_forward_failure_lifts_stop_fence(
         await fake_runner.aclose()
 
 
-@pytest.mark.parametrize("case", ["request", "cache", "idle", "missing", "invalid", "failure"])
+@pytest.mark.parametrize(
+    "case", ["request", "request_idle", "cache", "idle", "missing", "invalid", "failure"]
+)
 async def test_interrupt_codex_side_chat_targets_its_turn_on_parent_runner(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
@@ -10112,7 +10114,7 @@ async def test_interrupt_codex_side_chat_targets_its_turn_on_parent_runner(
     assert child_response.status_code == 202, child_response.text
     child_id = child_response.json()["child_session_id"]
     try:
-        _session_status_cache[child_id] = "idle" if case == "idle" else "running"
+        _session_status_cache[child_id] = "idle" if case in ("idle", "request_idle") else "running"
         if case == "cache":
             _session_active_response_cache[child_id] = "codex_turn_side"
         forwarded: list[tuple[str, dict[str, Any]]] = []
@@ -10127,7 +10129,7 @@ async def test_interrupt_codex_side_chat_targets_its_turn_on_parent_runner(
             get_runner = AsyncMock(return_value=runner)
             monkeypatch.setattr(sessions_module, "_get_runner_client", get_runner)
             data = {}
-            if case in ("request", "failure"):
+            if case in ("request", "request_idle", "failure"):
                 data["response_id"] = "codex_turn_side"
             elif case == "invalid":
                 data["response_id"] = "unrelated_response"
@@ -10139,7 +10141,7 @@ async def test_interrupt_codex_side_chat_targets_its_turn_on_parent_runner(
 
         expected_status = {"missing": 409, "invalid": 400, "failure": 503}.get(case, 202)
         assert response.status_code == expected_status, response.text
-        if case in ("request", "cache", "failure"):
+        if case in ("request", "request_idle", "cache", "failure"):
             assert get_runner.await_args.args[0] == parent["id"]
             assert forwarded == [
                 (
@@ -10152,7 +10154,10 @@ async def test_interrupt_codex_side_chat_targets_its_turn_on_parent_runner(
                 )
             ]
         else:
+            get_runner.assert_not_awaited()
             assert forwarded == []
+        if case == "idle":
+            assert response.json() == {"queued": False}
         assert parent["id"] not in _interrupt_fenced_sessions
         assert child_id not in _interrupt_fenced_sessions
     finally:

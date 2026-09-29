@@ -2101,7 +2101,7 @@ async def test_events_interrupt_on_codex_native_uses_turn_interrupt_without_mark
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("case", ["running", "idle", "newer_turn", "missing_turn"])
+@pytest.mark.parametrize("case", ["running", "idle", "newer_turn", "missing_turn", "rpc_failure"])
 async def test_events_interrupt_codex_side_chat_leaves_parent_turn_running(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -2132,10 +2132,11 @@ async def test_events_interrupt_codex_side_chat_leaves_parent_turn_running(
         message = {
             "idle": "no active turn to interrupt",
             "newer_turn": "expected active turn id turn_side but found turn_new",
+            "rpc_failure": "thread-store internal error",
         }.get(case)
         if message is not None:
             raise codex_native_app_server.CodexAppServerResponseError(
-                {"code": -32600, "message": message}
+                {"code": -32603 if case == "rpc_failure" else -32600, "message": message}
             )
         return result
 
@@ -2166,9 +2167,19 @@ async def test_events_interrupt_codex_side_chat_leaves_parent_turn_running(
             "/v1/sessions", json={"session_id": conv_id, "agent_id": "agent_side"}
         )
         assert created.status_code == 201, created.text
-        response = await client.post(f"/v1/sessions/{conv_id}/events", json=payload)
+        if case == "rpc_failure":
+            with pytest.raises(
+                codex_native_app_server.CodexAppServerResponseError,
+                match="thread-store internal error",
+            ) as error:
+                await client.post(f"/v1/sessions/{conv_id}/events", json=payload)
+            assert error.value.code == -32603
+        else:
+            response = await client.post(f"/v1/sessions/{conv_id}/events", json=payload)
+            assert response.status_code == (400 if case == "missing_turn" else 202), response.text
 
-    assert response.status_code == (400 if case == "missing_turn" else 202), response.text
+    assert fake_client.connected == (case != "missing_turn")
+    assert fake_client.closed == (case != "missing_turn")
     assert fake_client.requests == (
         []
         if case == "missing_turn"

@@ -217,6 +217,9 @@ export function SideChatPane({
   const lastAssistantIndex = liveCandidateAssistantIndex(bubbles);
   const showsWorking =
     !readOnly && (starting || computeIsTurnActive(sessionStatus, state.status === "streaming"));
+  // Native interruption needs an observed turn; local streaming can start before one exists.
+  const interruptReady =
+    !usesNativeSideChatFork(sessionHarness) || activeResponse?.state === "streaming";
 
   // Keep the newest content in view. A side chat is short and non-virtualized,
   // so a bottom sentinel scrolled on each change is enough.
@@ -291,6 +294,7 @@ export function SideChatPane({
               childId={childId}
               agentId={boundAgentId}
               responseId={activeResponse?.responseId}
+              interruptReady={interruptReady}
               busy={showsWorking}
               pending={pending}
               starting={starting}
@@ -314,6 +318,7 @@ function SideChatComposer({
   childId,
   agentId,
   responseId,
+  interruptReady,
   busy,
   pending,
   starting,
@@ -322,6 +327,7 @@ function SideChatComposer({
   childId: string;
   agentId: string | null;
   responseId: string | undefined;
+  interruptReady: boolean;
   busy: boolean;
   pending: boolean;
   starting: boolean;
@@ -360,7 +366,7 @@ function SideChatComposer({
   const showInterrupt = !pending && busy;
 
   const interruptSideChat = () => {
-    if (interrupting) return;
+    if (interrupting || !interruptReady) return;
     setInterrupting(true);
     void interrupt(childId, responseId)
       .catch(() => toast.error("Couldn’t interrupt this side chat. Please try again."))
@@ -454,7 +460,9 @@ function SideChatComposer({
                 label={showInterrupt ? "Interrupt side chat" : "Send side question"}
                 interrupt={showInterrupt}
                 busy={interrupting}
-                disabled={showInterrupt ? interrupting : !canSend || !ready || busy}
+                disabled={
+                  showInterrupt ? interrupting || !interruptReady : !canSend || !ready || busy
+                }
                 onClick={showInterrupt ? interruptSideChat : submit}
                 data-testid={showInterrupt ? "side-chat-interrupt" : "side-chat-send"}
               />

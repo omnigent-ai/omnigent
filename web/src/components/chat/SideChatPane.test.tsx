@@ -86,6 +86,7 @@ describe("side-chat working indicator", () => {
       conversationRegistry.acquire(childId).setState({
         sessionStatus: "waiting",
         blockedOn: "tool approval",
+        activeResponse: { responseId: "codex_turn_side", state: "streaming", error: null },
       }),
     );
 
@@ -122,19 +123,77 @@ describe("side-chat working indicator", () => {
 });
 
 describe("side-chat interrupt", () => {
+  beforeEach(() => {
+    conversationRegistry.acquire(childId).setState({
+      activeResponse: { responseId: "codex_turn_side", state: "streaming", error: null },
+    });
+  });
+
+  it("waits for an observed native turn while showing immediate follow-up progress", async () => {
+    conversationRegistry.acquire(childId).setState({
+      sessionStatus: "idle",
+      status: "streaming",
+      activeResponse: null,
+    });
+    render(<SideChatPane childId={childId} />);
+
+    expect(screen.getByTestId("working-indicator")).toHaveTextContent("Working…");
+    const interrupt = screen.getByRole("button", { name: "Interrupt side chat" });
+    expect(interrupt).toBeDisabled();
+    fireEvent.click(interrupt);
+    expect(sessionsApi.interrupt).not.toHaveBeenCalled();
+
+    act(() =>
+      conversationRegistry.acquire(childId).setState({
+        activeResponse: { responseId: "codex_turn_followup", state: "streaming", error: null },
+      }),
+    );
+
+    expect(interrupt).toBeEnabled();
+    fireEvent.click(interrupt);
+    expect(sessionsApi.interrupt).toHaveBeenCalledExactlyOnceWith(childId, "codex_turn_followup");
+    await waitFor(() => expect(interrupt).toBeEnabled());
+  });
+
+  it("keeps generic side chats interruptible before a response ID arrives", async () => {
+    conversationRegistry.acquire(childId).setState({
+      sessionHarness: "claude-native",
+      sessionStatus: "idle",
+      status: "streaming",
+      activeResponse: null,
+    });
+    render(<SideChatPane childId={childId} />);
+
+    expect(screen.getByTestId("working-indicator")).toHaveTextContent("Working…");
+    const interrupt = screen.getByRole("button", { name: "Interrupt side chat" });
+    expect(interrupt).toBeEnabled();
+    fireEvent.click(interrupt);
+    expect(sessionsApi.interrupt).toHaveBeenCalledExactlyOnceWith(childId, undefined);
+    await waitFor(() => expect(interrupt).toBeEnabled());
+  });
+
+  it("does not target a completed native response while the session status settles", () => {
+    conversationRegistry.acquire(childId).setState({
+      activeResponse: { responseId: "codex_turn_side", state: "completed", error: null },
+    });
+    render(<SideChatPane childId={childId} />);
+
+    const interrupt = screen.getByRole("button", { name: "Interrupt side chat" });
+    expect(interrupt).toBeDisabled();
+    fireEvent.click(interrupt);
+    expect(sessionsApi.interrupt).not.toHaveBeenCalled();
+  });
+
   it("targets the native child's active response rather than the parent's response", async () => {
     useChatStore.setState({
       sessionStatus: "running",
       activeResponse: { responseId: "resp_main", state: "streaming", error: null },
     });
-    conversationRegistry.acquire(childId).setState({
-      activeResponse: { responseId: "resp_side", state: "streaming", error: null },
-    });
     render(<SideChatPane childId={childId} />);
 
     fireEvent.click(screen.getByRole("button", { name: "Interrupt side chat" }));
 
-    expect(sessionsApi.interrupt).toHaveBeenCalledExactlyOnceWith(childId, "resp_side");
+    expect(sessionsApi.interrupt).toHaveBeenCalledExactlyOnceWith(childId, "codex_turn_side");
     await waitFor(() =>
       expect(screen.getByRole("button", { name: "Interrupt side chat" })).toBeEnabled(),
     );
@@ -158,7 +217,7 @@ describe("side-chat interrupt", () => {
     fireEvent.click(interrupt);
     fireEvent.click(interrupt);
 
-    expect(sessionsApi.interrupt).toHaveBeenCalledExactlyOnceWith(childId, undefined);
+    expect(sessionsApi.interrupt).toHaveBeenCalledExactlyOnceWith(childId, "codex_turn_side");
     expect(interrupt).toBeDisabled();
     expect(input).toHaveValue("Keep this follow-up");
     expect(send).not.toHaveBeenCalled();
@@ -192,7 +251,7 @@ describe("side-chat interrupt", () => {
 
     fireEvent.click(interrupt);
     await waitFor(() => expect(sessionsApi.interrupt).toHaveBeenCalledTimes(2));
-    expect(sessionsApi.interrupt).toHaveBeenLastCalledWith(childId, undefined);
+    expect(sessionsApi.interrupt).toHaveBeenLastCalledWith(childId, "codex_turn_side");
   });
 
   it.each([
