@@ -17,6 +17,7 @@ on:
       - 'designs/**'
       - 'CHANGELOG.md'
       - 'tests/browser_ui/**'
+      - 'tests/e2e_ui/**'
   push:
     branches:
       - main
@@ -28,6 +29,7 @@ on:
       - 'designs/**'
       - 'CHANGELOG.md'
       - 'tests/browser_ui/**'
+      - 'tests/e2e_ui/**'
 
 permissions:
   contents: read
