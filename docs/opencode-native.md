@@ -99,8 +99,9 @@ flattened to text. A message sent during a running turn is delivered as a
 ## One server per conversation
 
 Each conversation gets its own `opencode serve --stdio` process, its own
-password (`OPENCODE_PASSWORD`) and its own data directory under
-`~/.omnigent/opencode-native/`. OpenCode 2.x scopes plugins, MCP servers,
+password (`OPENCODE_PASSWORD`) and its own data directory, with its own
+`opencode.db`, under `$OMNIGENT_DATA_DIR/opencode-native/` (default
+`~/.omnigent/opencode-native/`). OpenCode 2.x scopes plugins, MCP servers,
 instructions (`AGENTS.md`) and the process environment to the server, and
 Omnigent binds the policy plugin, the tool relay and the agent's instructions per
 conversation; a shared server would need a session-to-conversation registry

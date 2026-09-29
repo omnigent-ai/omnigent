@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from omnigent.models import model_catalog
+from omnigent.process_logging import DATA_DIR_ENV_VAR
 
 if TYPE_CHECKING:
     from databricks.sdk.core import Config
@@ -406,6 +407,11 @@ def build_opencode_omnigent_mcp_server(
         env = dict(env_value)
     else:
         raise ValueError("Claude MCP server environment is malformed")
+    # opencode serve drops OMNIGENT_* env; serve-mcp needs the same data dir to
+    # accept a bridge dir under a custom OMNIGENT_DATA_DIR.
+    data_dir_value = os.environ.get(DATA_DIR_ENV_VAR)
+    if data_dir_value:
+        env[DATA_DIR_ENV_VAR] = data_dir_value
     if env:
         entry["environment"] = env
     return {str(name): entry}

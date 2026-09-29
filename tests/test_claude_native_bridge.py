@@ -6624,6 +6624,26 @@ async def test_start_tool_relay_accepts_opencode_native_bridge_root(
             relay.close()
 
 
+def test_opencode_native_bridge_dir_under_custom_data_dir_is_trusted(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """serve-mcp accepts an OpenCode bridge dir under a custom ``OMNIGENT_DATA_DIR``."""
+    from omnigent.harnesses.opencode_native import bridge as opencode_native_bridge
+
+    # Distinct claude root (the autouse fixture points it at ``tmp_path``).
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path / "claude-native"
+    )
+    monkeypatch.setattr(opencode_native_bridge, "_BRIDGE_ROOT", None)
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data"))
+    bridge_dir = opencode_native_bridge.prepare_bridge_dir("conv_oc")
+
+    assert bridge_dir.parent == tmp_path / "data" / "opencode-native"
+    assert claude_native_bridge._trusted_parent_for_bridge_dir(bridge_dir) == tmp_path / "data"
+    claude_native_bridge._ensure_secure_dir(bridge_dir)
+
+
 @pytest.mark.asyncio
 async def test_relay_close_keeps_advertisement_owned_by_newer_relay(
     tmp_path: Path,

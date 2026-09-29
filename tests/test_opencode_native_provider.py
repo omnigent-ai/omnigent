@@ -58,6 +58,19 @@ def test_build_omnigent_mcp_server_points_serve_mcp_at_bridge_dir() -> None:
     assert entry.get("environment", {}).get("PYTHONUNBUFFERED") == "1"
 
 
+def test_build_omnigent_mcp_server_forwards_data_dir(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # serve-mcp only accepts a bridge dir under the root it computes itself.
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data"))
+    entry = build_opencode_omnigent_mcp_server(Path("/tmp/b"))["omnigent"]
+    assert entry["environment"]["OMNIGENT_DATA_DIR"] == str(tmp_path / "data")
+
+    monkeypatch.delenv("OMNIGENT_DATA_DIR")
+    entry = build_opencode_omnigent_mcp_server(Path("/tmp/b"))["omnigent"]
+    assert "OMNIGENT_DATA_DIR" not in entry["environment"]
+
+
 def test_build_omnigent_mcp_server_honors_python_executable() -> None:
     block = build_opencode_omnigent_mcp_server(Path("/tmp/b"), python_executable="/custom/python")
     assert block["omnigent"]["command"][0] == "/custom/python"

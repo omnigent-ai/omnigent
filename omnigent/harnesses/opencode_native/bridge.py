@@ -9,7 +9,8 @@ it can inject web turns over REST.
 
 Layout (per bridge id):
 
-    ~/.omnigent/opencode-native/<sha256(bridge_id)[:32]>/
+    $OMNIGENT_DATA_DIR/opencode-native/<sha256(bridge_id)[:32]>/   (default ~/.omnigent)
+        opencode.db         # OPENCODE_DB: this conversation's OpenCode database
         state.json          # runtime state (mutates each turn)
         auth.secret         # OPENCODE_PASSWORD for this server
         xdg-data/           # XDG_DATA_HOME for the per-session opencode
@@ -39,6 +40,7 @@ from pathlib import Path
 from typing import Protocol
 
 from omnigent.native import native_bridge_common
+from omnigent.process_logging import data_dir
 
 _logger = logging.getLogger(__name__)
 
@@ -239,7 +241,8 @@ def write_opencode_policy_plugin(bridge_dir: Path) -> Path:
 
 
 _STATE_VERSION = 1
-_BRIDGE_ROOT = Path.home() / ".omnigent" / "opencode-native"
+# Test override; ``None`` resolves under ``OMNIGENT_DATA_DIR`` at call time.
+_BRIDGE_ROOT: Path | None = None
 _ID_HASH_CHARS = 32
 
 
@@ -247,12 +250,16 @@ def bridge_root() -> Path:
     """
     Return the configured OpenCode-native bridge root.
 
-    Tests may monkeypatch :data:`_BRIDGE_ROOT` to isolate bridge files.
+    Follows ``OMNIGENT_DATA_DIR``, so a host with a custom data directory
+    keeps each conversation's OpenCode database there. Tests may monkeypatch
+    :data:`_BRIDGE_ROOT` to isolate bridge files.
 
     :returns: Absolute root for OpenCode-native bridge directories, e.g.
         ``Path("~/.omnigent/opencode-native")``.
     """
-    return _BRIDGE_ROOT
+    if _BRIDGE_ROOT is not None:
+        return _BRIDGE_ROOT
+    return data_dir() / "opencode-native"
 
 
 @dataclass(frozen=True)
@@ -322,11 +329,10 @@ def bridge_dir_for_bridge_id(bridge_id: str) -> Path:
     Return the bridge directory for an OpenCode-native bridge id.
 
     :param bridge_id: Opaque bridge id, e.g. ``"conv_abc123"``.
-    :returns: Absolute bridge directory under
-        ``~/.omnigent/opencode-native``.
+    :returns: Absolute bridge directory under :func:`bridge_root`.
     """
     digest = hashlib.sha256(bridge_id.encode("utf-8")).hexdigest()[:_ID_HASH_CHARS]
-    return _BRIDGE_ROOT / digest
+    return bridge_root() / digest
 
 
 def build_opencode_native_spawn_env(

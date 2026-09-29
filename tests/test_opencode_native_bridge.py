@@ -329,6 +329,26 @@ def test_spawn_env_points_at_bridge_dir(monkeypatch: pytest.MonkeyPatch, tmp_pat
     assert env["HARNESS_OPENCODE_NATIVE_REQUEST_SESSION_ID"] == "conv_abc"
 
 
+def test_bridge_root_follows_omnigent_data_dir(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(bridge, "_BRIDGE_ROOT", None)
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data"))
+    assert bridge.bridge_root() == tmp_path / "data" / "opencode-native"
+    assert bridge_dir_for_bridge_id("conv_abc").parent == tmp_path / "data" / "opencode-native"
+    env = build_opencode_native_spawn_env("conv_abc")
+    assert env["HARNESS_OPENCODE_NATIVE_BRIDGE_DIR"].startswith(str(tmp_path / "data"))
+
+
+def test_bridge_root_defaults_to_home_omnigent(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(bridge, "_BRIDGE_ROOT", None)
+    monkeypatch.delenv("OMNIGENT_DATA_DIR", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    assert bridge.bridge_root() == tmp_path / ".omnigent" / "opencode-native"
+
+
 def test_spawn_env_bridge_id_override(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setattr(bridge, "_BRIDGE_ROOT", tmp_path / "opencode-native")
     env = build_opencode_native_spawn_env("conv_abc", bridge_id="bridge_xyz")
