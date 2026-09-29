@@ -73,19 +73,22 @@ would make that extension misleading. Keep investigation history in evidence
 and test comments short. Reuse unchanged coverage when sufficient; there is no
 requirement for a new test file or both a new e2e and a smaller test.
 
-Before final verification, compare each new scenario's setup and transitions
-with the nearest existing tests across the repository. Moving a reproduction
-into an existing file is not consolidation. Reuse the scenario or its helpers
-before writing new setup. For each separate scenario retained, name the nearest
-existing test in `test_audit` and explain why extending or parameterizing it
-would lose the required assertion, ordering, or boundary.
+Start with an edit to the nearest compatible scenario: preserve its existing
+assertions and add the regression input, seed records, or missing assertion.
+Needing richer data does not make its journey incompatible. Keep a separate
+scenario only for a concrete ordering, lifecycle, or isolation conflict; name
+that conflict and the nearest existing test in `test_audit`. Before final
+verification, compare the setups and consolidate any compatible duplication.
+Moving a reproduction into an existing file is not consolidation.
 
-Extend an existing scenario's seed data or inputs when that preserves its journey;
-different fixture data alone does not require a separate test. Cover an input or
-edge-case matrix once at the lowest reliable layer. Add checks at other layers
-only for a distinct failure boundary, not to repeat the same outcomes through a
-helper, store, API, and browser. Before retaining each new check, state what
-regression would escape the other selected checks if it were omitted.
+Each reported facet needs reliable coverage, not coverage at every layer.
+Keep the input and edge-case matrix at the lowest reliable layer. At a higher
+layer, use a representative regression input for each distinct boundary the
+lower tests cannot expose; do not replay the whole matrix there. A new helper
+does not automatically need direct unit tests when its real callers already
+exercise its contract. Retain a helper test only for behavior those caller
+checks miss. For every added layer, briefly identify the regression that would
+escape the other selected checks if that layer were omitted.
 
 Retain an e2e when it protects a distinct production boundary that lower-level
 coverage would miss, and explain that boundary briefly in `test_audit`. Do not
