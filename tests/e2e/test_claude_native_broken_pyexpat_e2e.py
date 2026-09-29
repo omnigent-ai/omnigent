@@ -21,6 +21,7 @@ import os
 import subprocess
 from pathlib import Path
 
+from tests._helpers.live_server import find_free_port
 from tests.e2e._native_resume_helpers import omnigent_console_script
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -55,9 +56,18 @@ class _BrokenPyexpatFinder:
 sys.meta_path.insert(0, _BrokenPyexpatFinder())
 """
 
-# Almost certainly closed, so the connect step fails fast with its actionable
-# "Could not reach the omnigent server" error rather than hanging.
-_UNREACHABLE_SERVER = "http://127.0.0.1:59999"
+
+def _unreachable_server() -> str:
+    """A server URL nothing is listening on, so the connect step fails fast
+    with its actionable "Could not reach the omnigent server" error rather
+    than hanging.
+
+    The port is reserved ephemerally and released instead of hardcoded: shared
+    CI runners can already have something bound to a fixed port, and a listener
+    answers the probe with its own status (e.g. 404) rather than a connection
+    failure — failing this test for a reason unrelated to pyexpat.
+    """
+    return f"http://127.0.0.1:{find_free_port()}"
 
 
 def _run_claude_with_broken_pyexpat(tmp_path: Path) -> subprocess.CompletedProcess[str]:
@@ -83,7 +93,7 @@ def _run_claude_with_broken_pyexpat(tmp_path: Path) -> subprocess.CompletedProce
     env["OMNIGENT_SKIP_ONBOARD"] = "1"
 
     return subprocess.run(
-        [str(omnigent_console_script()), "claude", "--server", _UNREACHABLE_SERVER],
+        [str(omnigent_console_script()), "claude", "--server", _unreachable_server()],
         env=env,
         capture_output=True,
         text=True,
