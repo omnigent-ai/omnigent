@@ -20,6 +20,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import time
 import uuid
 
 from omnigent.llms.adapters._content import redact_binary_payloads
@@ -191,9 +192,12 @@ _UCODE_CLAUDE_AGENT_NAME = "claude"
 _UCODE_CLAUDE_BASE_URL_ENV = "ANTHROPIC_BASE_URL"
 _ANTHROPIC_MODEL_ENV = "ANTHROPIC_MODEL"
 _ANTHROPIC_API_KEY_ENV = "ANTHROPIC_API_KEY"
+_ANTHROPIC_AUTH_TOKEN_ENV = "ANTHROPIC_AUTH_TOKEN"
 _ANTHROPIC_BEDROCK_BASE_URL_ENV = "ANTHROPIC_BEDROCK_BASE_URL"
 _AWS_BEARER_TOKEN_BEDROCK_ENV = "AWS_BEARER_TOKEN_BEDROCK"
 _CLAUDE_CODE_USE_BEDROCK_ENV = "CLAUDE_CODE_USE_BEDROCK"
+_CLAUDE_CODE_USE_FOUNDRY_ENV = "CLAUDE_CODE_USE_FOUNDRY"
+_CLAUDE_CODE_USE_VERTEX_ENV = "CLAUDE_CODE_USE_VERTEX"
 # Bedrock mode reads the token from the env (not an apiKeyHelper), so a
 # provider ``auth_command`` is resolved to a concrete token at launch.
 _BEDROCK_AUTH_COMMAND_TIMEOUT_S = 15.0
@@ -463,6 +467,158 @@ def _ambient_env_is_non_anthropic_gateway() -> bool:
     return host != "anthropic.com" and not host.endswith(".anthropic.com")
 
 
+def _provider_flag_is_truthy(value: object) -> bool:
+    """Whether an inherited or managed-settings provider-mode flag is enabled."""
+    return str(value).strip().lower() not in ("", "0", "false", "no", "none")
+
+
+def _env_flag_is_truthy(name: str) -> bool:
+    """Whether an inherited Claude provider-mode flag is enabled."""
+    return _provider_flag_is_truthy(os.environ.get(name))
+
+
+def _ambient_claude_endpoint_marker() -> str | None:
+    """Classify inherited routing that makes a ``None`` config non-login-shaped."""
+    if _env_flag_is_truthy(_CLAUDE_CODE_USE_VERTEX_ENV):
+        return "vertex"
+    if _env_flag_is_truthy(_CLAUDE_CODE_USE_BEDROCK_ENV) or os.environ.get(
+        _ANTHROPIC_BEDROCK_BASE_URL_ENV
+    ):
+        return "bedrock"
+    if _env_flag_is_truthy(_CLAUDE_CODE_USE_FOUNDRY_ENV):
+        return "foundry"
+    base_url = os.environ.get(_UCODE_CLAUDE_BASE_URL_ENV, "")
+    if base_url:
+        return "ambient_gateway" if _ambient_env_is_non_anthropic_gateway() else "anthropic"
+    if _env_flag_is_truthy(_CLAUDE_CODE_USE_GATEWAY_ENV):
+        return "ambient_gateway"
+    model_env_keys = {
+        _ANTHROPIC_MODEL_ENV,
+        *_UCODE_CLAUDE_TIER_TO_ENV.values(),
+        _ANTHROPIC_CUSTOM_MODEL_OPTION_ENV,
+    }
+    if any(
+        isinstance(value := os.environ.get(key), str) and value.strip() for key in model_env_keys
+    ):
+        return "ambient_models"
+    if os.environ.get(_ANTHROPIC_API_KEY_ENV) or os.environ.get(_ANTHROPIC_AUTH_TOKEN_ENV):
+        return "anthropic"
+    return None
+
+
+def _managed_claude_launch_marker() -> str | None:
+    """Classify routing or model controls applied through managed settings."""
+    for path in _managed_settings_paths():
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            continue
+        except (OSError, ValueError):
+            return "managed_settings"
+        if not isinstance(payload, dict):
+            return "managed_settings"
+        raw_env = payload.get("env")
+        env = raw_env if isinstance(raw_env, dict) else {}
+        if _provider_flag_is_truthy(env.get(_CLAUDE_CODE_USE_VERTEX_ENV)):
+            return "vertex"
+        if _provider_flag_is_truthy(env.get(_CLAUDE_CODE_USE_BEDROCK_ENV)) or env.get(
+            _ANTHROPIC_BEDROCK_BASE_URL_ENV
+        ):
+            return "bedrock"
+        if _provider_flag_is_truthy(env.get(_CLAUDE_CODE_USE_FOUNDRY_ENV)):
+            return "foundry"
+        if _provider_flag_is_truthy(env.get(_CLAUDE_CODE_USE_GATEWAY_ENV)):
+            return "managed_gateway"
+        model_env_keys = {
+            _ANTHROPIC_MODEL_ENV,
+            *_UCODE_CLAUDE_TIER_TO_ENV.values(),
+            _ANTHROPIC_CUSTOM_MODEL_OPTION_ENV,
+        }
+        if any(isinstance(value := env.get(key), str) and value.strip() for key in model_env_keys):
+            return "managed_models"
+        model_picker = payload.get("modelPicker")
+        if isinstance(model_picker, dict) and model_picker.get("replaceBuiltInOptions") is True:
+            return "managed_models"
+        model_overrides = payload.get("modelOverrides")
+        if isinstance(model_overrides, dict) and model_overrides:
+            return "managed_models"
+        # Even credential-only or otherwise unrecognized enterprise settings
+        # make this launch managed rather than a positively identified
+        # canonical login. Keep that entire cohort on synchronous discovery.
+        return "managed_settings"
+    return None
+
+
+def _user_claude_settings_path() -> Path:
+    """Return the user settings file Claude Code will load."""
+    configured = os.environ.get("CLAUDE_CONFIG_DIR")
+    config_dir = Path(configured).expanduser() if configured else Path.home() / ".claude"
+    return config_dir / "settings.json"
+
+
+def _claude_settings_launch_marker(path: Path, marker: str) -> str | None:
+    """Classify one Claude settings file that can choose a provider or model."""
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError):
+        # An existing settings file we cannot interpret is not positive proof
+        # that Claude will use its canonical login route.
+        return marker
+    if not isinstance(payload, dict):
+        return marker
+
+    for key in ("apiKeyHelper", "model"):
+        if key not in payload:
+            continue
+        value = payload[key]
+        if not isinstance(value, str) or value.strip():
+            return marker
+    for key in ("modelPicker", "modelOverrides"):
+        if key not in payload:
+            continue
+        value = payload[key]
+        if not isinstance(value, dict) or value:
+            return marker
+
+    raw_env = payload.get("env")
+    if raw_env is None:
+        return None
+    if not isinstance(raw_env, dict):
+        return marker
+    for key, value in raw_env.items():
+        if not isinstance(key, str) or not key.startswith(("ANTHROPIC_", "CLAUDE_CODE_USE_")):
+            continue
+        if key.startswith("CLAUDE_CODE_USE_"):
+            configured_value = _provider_flag_is_truthy(value)
+        elif isinstance(value, str):
+            configured_value = bool(value.strip())
+        else:
+            configured_value = value is not None
+        if configured_value:
+            return marker
+    return None
+
+
+def _user_claude_launch_marker() -> str | None:
+    """Classify user settings that can choose a provider or model."""
+    return _claude_settings_launch_marker(_user_claude_settings_path(), "user_settings")
+
+
+def _workspace_claude_launch_marker(workspace: Path | None) -> str | None:
+    """Classify project settings that can choose a provider or model."""
+    if workspace is None:
+        return None
+    for filename in ("settings.json", "settings.local.json"):
+        marker = _claude_settings_launch_marker(
+            workspace / ".claude" / filename, "workspace_settings"
+        )
+        if marker is not None:
+            return marker
+    return None
+
+
 def _claude_family(token: str) -> str | None:
     """
     The family alias a model id or alias folds onto, bracket markers dropped.
@@ -592,6 +748,44 @@ def claude_launch_endpoint_label(claude_config: ClaudeNativeUcodeConfig | None) 
         if base_url:
             return f"the gateway at {_endpoint_origin(base_url)}"
     return "Claude Code's own login"
+
+
+def claude_launch_endpoint_marker(
+    claude_config: ClaudeNativeUcodeConfig | None,
+    *,
+    launch_config_resolution_failed: bool = False,
+    workspace: Path | None = None,
+) -> str:
+    """Return a bounded provider-shape marker suitable for launch telemetry."""
+    try:
+        if launch_config_resolution_failed:
+            return "resolution_failed"
+        if claude_config is None:
+            ambient_marker = _ambient_claude_endpoint_marker()
+            if ambient_marker is not None:
+                return ambient_marker
+            managed_launch = _managed_claude_launch_marker()
+            if managed_launch is not None:
+                return managed_launch
+            user_launch = _user_claude_launch_marker()
+            if user_launch is not None:
+                return user_launch
+            workspace_launch = _workspace_claude_launch_marker(workspace)
+            if workspace_launch is not None:
+                return workspace_launch
+            from omnigent.onboarding.ambient import claude_managed_gateway
+
+            managed_base_url, managed_gateway = claude_managed_gateway(_managed_settings_paths())
+            if managed_gateway:
+                return "managed_gateway"
+            return "managed_endpoint" if managed_base_url else "claude_login"
+        if claude_config.env.get(_ANTHROPIC_BEDROCK_BASE_URL_ENV):
+            return "bedrock"
+        if claude_config.env.get(_UCODE_CLAUDE_BASE_URL_ENV):
+            return "anthropic" if _serves_canonical_anthropic_ids(claude_config) else "gateway"
+        return "configured_provider"
+    except Exception:  # noqa: BLE001 — telemetry classification must never block launch
+        return "unknown"
 
 
 def resolve_claude_native_model_selection(
@@ -1331,7 +1525,46 @@ async def claude_model_catalog(
     :param claude_config: The resolved launch config, or ``None``.
     :returns: Catalog rows, or ``None`` when the probe failed.
     """
-    probe = await probe_claude_model_options(claude_config)
+    from omnigent.debug_logging import debug_event
+
+    probe_started = time.perf_counter()
+    try:
+        probe = await probe_claude_model_options(claude_config)
+    except asyncio.CancelledError:
+        _logger.info(
+            "Claude model catalog probe cancelled after %.1fms",
+            (time.perf_counter() - probe_started) * 1000,
+            extra=debug_event(
+                "claude_model_catalog_probe",
+                outcome="cancelled",
+                endpoint=claude_launch_endpoint_marker(claude_config),
+                probe_duration_ms=round((time.perf_counter() - probe_started) * 1000, 3),
+            ),
+        )
+        raise
+    except BaseException:
+        _logger.info(
+            "Claude model catalog probe failed after %.1fms",
+            (time.perf_counter() - probe_started) * 1000,
+            extra=debug_event(
+                "claude_model_catalog_probe",
+                outcome="failed",
+                endpoint=claude_launch_endpoint_marker(claude_config),
+                probe_duration_ms=round((time.perf_counter() - probe_started) * 1000, 3),
+            ),
+        )
+        raise
+    probe_duration_ms = round((time.perf_counter() - probe_started) * 1000, 3)
+    _logger.info(
+        "Claude model catalog probe completed in %.1fms",
+        probe_duration_ms,
+        extra=debug_event(
+            "claude_model_catalog_probe",
+            outcome="available" if probe is not None else "unavailable",
+            endpoint=claude_launch_endpoint_marker(claude_config),
+            probe_duration_ms=probe_duration_ms,
+        ),
+    )
     if probe is None:
         return None
     if probe.empty_picker:
@@ -1414,6 +1647,53 @@ def stored_claude_catalog_rows(
     return model_catalog_store.read_catalog(
         "claude-native", claude_catalog_fingerprint(claude_config)
     )
+
+
+def claude_launch_catalog_state(claude_config: ClaudeNativeUcodeConfig | None) -> str:
+    """Classify the store access a synchronous launch would perform."""
+    from omnigent.models import model_catalog_store
+
+    fingerprint = claude_catalog_fingerprint(claude_config)
+    rows = model_catalog_store.read_catalog("claude-native", fingerprint)
+    if rows is not None:
+        return (
+            "stale"
+            if model_catalog_store.catalog_is_stale("claude-native", fingerprint)
+            else "hit"
+        )
+    if model_catalog_store.catalog_probe_inflight("claude-native", fingerprint):
+        return "joined_inflight"
+    return "cold_probe"
+
+
+def claude_default_catalog_bypass_is_safe(
+    claude_config: ClaudeNativeUcodeConfig | None,
+    *,
+    launch_config_resolution_failed: bool = False,
+    workspace: Path | None = None,
+) -> bool:
+    """Whether a bare Default launch can safely let Claude choose its model."""
+    # Eligibility is intentionally stricter than telemetry classification:
+    # each source of launch configuration must be known-safe before discovery
+    # can leave the terminal critical path.
+    try:
+        if launch_config_resolution_failed or claude_config is not None:
+            return False
+        if _ambient_claude_endpoint_marker() is not None:
+            return False
+        if _managed_claude_launch_marker() is not None:
+            return False
+        if _user_claude_launch_marker() is not None:
+            return False
+        if _workspace_claude_launch_marker(workspace) is not None:
+            return False
+
+        from omnigent.onboarding.ambient import claude_managed_gateway
+
+        managed_base_url, managed_gateway = claude_managed_gateway(_managed_settings_paths())
+        return not managed_base_url and not managed_gateway
+    except Exception:  # noqa: BLE001 — uncertain routing must keep discovery synchronous
+        return False
 
 
 def stored_claude_picker_values(

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -262,11 +263,19 @@ async def test_legacy_catalog_failure_preserves_probe_failure(
 
 async def test_cancelled_catalog_probe_never_starts_a_fallback(
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
+    caplog.set_level(logging.INFO, logger="omnigent.harnesses.claude_native.main")
     launches = _stub_picker(monkeypatch, None, control_failure="cancelled")
     with pytest.raises(asyncio.CancelledError):
         await claude_native.claude_model_catalog(None)
     assert len(launches) == 1
+    records = [
+        record
+        for record in caplog.records
+        if getattr(record, "event_name", None) == "claude_model_catalog_probe"
+    ]
+    assert records[-1].attributes["outcome"] == "cancelled"
 
 
 async def test_catalog_keeps_enabled_fable_and_future_picker_models(
@@ -289,3 +298,170 @@ async def test_catalog_keeps_enabled_fable_and_future_picker_models(
         },
         {"id": "future", "model": "vendor-future", "displayName": "Future model"},
     ]
+
+
+def test_default_catalog_bypass_requires_claude_owned_routing(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    for name in (
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_AUTH_TOKEN",
+        "ANTHROPIC_BASE_URL",
+        "ANTHROPIC_BEDROCK_BASE_URL",
+        "ANTHROPIC_CUSTOM_MODEL_OPTION",
+        "ANTHROPIC_DEFAULT_FABLE_MODEL",
+        "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+        "ANTHROPIC_DEFAULT_OPUS_MODEL",
+        "ANTHROPIC_DEFAULT_SONNET_MODEL",
+        "ANTHROPIC_MODEL",
+        "CLAUDE_CODE_USE_BEDROCK",
+        "CLAUDE_CODE_USE_FOUNDRY",
+        "CLAUDE_CODE_USE_GATEWAY",
+        "CLAUDE_CODE_USE_VERTEX",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(claude_native, "_CLAUDE_CODE_MANAGED_SETTINGS_PATHS", ())
+    monkeypatch.setattr("omnigent.onboarding.ambient.CLAUDE_CODE_MANAGED_SETTINGS_PATHS", ())
+    user_config_dir = tmp_path / "claude-config"
+    user_config_dir.mkdir()
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(user_config_dir))
+    monkeypatch.setattr(
+        "omnigent.onboarding.ambient.claude_managed_gateway", lambda _paths=None: (None, False)
+    )
+
+    assert claude_native.claude_default_catalog_bypass_is_safe(None)
+    assert claude_native.claude_launch_endpoint_marker(None) == "claude_login"
+    assert not claude_native.claude_default_catalog_bypass_is_safe(
+        None, launch_config_resolution_failed=True
+    )
+    assert (
+        claude_native.claude_launch_endpoint_marker(None, launch_config_resolution_failed=True)
+        == "resolution_failed"
+    )
+    assert not claude_native.claude_default_catalog_bypass_is_safe(
+        claude_native.ClaudeNativeUcodeConfig(
+            env={"ANTHROPIC_BASE_URL": "https://gateway.example/anthropic"},
+            model="gateway-default",
+        )
+    )
+
+    monkeypatch.setenv("ANTHROPIC_MODEL", "synthetic-default")
+    assert not claude_native.claude_default_catalog_bypass_is_safe(None)
+    assert claude_native.claude_launch_endpoint_marker(None) == "ambient_models"
+    monkeypatch.delenv("ANTHROPIC_MODEL")
+
+    user_settings = user_config_dir / "settings.json"
+    user_settings.write_text(json.dumps({"apiKeyHelper": "printf synthetic"}), encoding="utf-8")
+    assert not claude_native.claude_default_catalog_bypass_is_safe(None)
+    assert claude_native.claude_launch_endpoint_marker(None) == "user_settings"
+    user_settings.write_text(
+        json.dumps({"env": {"ANTHROPIC_BASE_URL": "https://gateway.example/anthropic"}}),
+        encoding="utf-8",
+    )
+    assert not claude_native.claude_default_catalog_bypass_is_safe(None)
+    assert claude_native.claude_launch_endpoint_marker(None) == "user_settings"
+    user_settings.write_text(json.dumps({"model": "synthetic-default"}), encoding="utf-8")
+    assert not claude_native.claude_default_catalog_bypass_is_safe(None)
+    assert claude_native.claude_launch_endpoint_marker(None) == "user_settings"
+    user_settings.write_text(json.dumps({"permissions": {"allow": []}}), encoding="utf-8")
+    assert claude_native.claude_default_catalog_bypass_is_safe(None)
+    user_settings.unlink()
+
+    workspace = tmp_path / "workspace"
+    workspace_settings_dir = workspace / ".claude"
+    workspace_settings_dir.mkdir(parents=True)
+    workspace_settings = workspace_settings_dir / "settings.json"
+    workspace_settings.write_text(
+        json.dumps({"env": {"ANTHROPIC_BASE_URL": "https://gateway.example/anthropic"}}),
+        encoding="utf-8",
+    )
+    assert not claude_native.claude_default_catalog_bypass_is_safe(None, workspace=workspace)
+    assert (
+        claude_native.claude_launch_endpoint_marker(None, workspace=workspace)
+        == "workspace_settings"
+    )
+    workspace_settings.write_text(json.dumps({"permissions": {"allow": []}}), encoding="utf-8")
+    assert claude_native.claude_default_catalog_bypass_is_safe(None, workspace=workspace)
+    workspace_settings.unlink()
+    workspace_local_settings = workspace_settings_dir / "settings.local.json"
+    workspace_local_settings.write_text("{malformed", encoding="utf-8")
+    assert not claude_native.claude_default_catalog_bypass_is_safe(None, workspace=workspace)
+    assert (
+        claude_native.claude_launch_endpoint_marker(None, workspace=workspace)
+        == "workspace_settings"
+    )
+    workspace_local_settings.unlink()
+
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://gateway.example/anthropic")
+    assert not claude_native.claude_default_catalog_bypass_is_safe(None)
+    assert claude_native.claude_launch_endpoint_marker(None) == "ambient_gateway"
+
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "http://[::1")
+    assert not claude_native.claude_default_catalog_bypass_is_safe(None)
+    assert claude_native.claude_launch_endpoint_marker(None) == "unknown"
+
+    monkeypatch.delenv("ANTHROPIC_BASE_URL")
+    monkeypatch.setattr(
+        "omnigent.onboarding.ambient.claude_managed_gateway",
+        lambda _paths=None: ("https://gateway.example/anthropic", True),
+    )
+    assert not claude_native.claude_default_catalog_bypass_is_safe(None)
+    assert claude_native.claude_launch_endpoint_marker(None) == "managed_gateway"
+
+    monkeypatch.setattr(
+        "omnigent.onboarding.ambient.claude_managed_gateway",
+        lambda _paths=None: ("https://gateway.example/anthropic", False),
+    )
+    assert not claude_native.claude_default_catalog_bypass_is_safe(None)
+    assert claude_native.claude_launch_endpoint_marker(None) == "managed_endpoint"
+
+    monkeypatch.setattr(
+        "omnigent.onboarding.ambient.claude_managed_gateway", lambda _paths=None: (None, False)
+    )
+    monkeypatch.setenv("CLAUDE_CODE_USE_VERTEX", "1")
+    monkeypatch.setenv("ANTHROPIC_VERTEX_PROJECT_ID", "synthetic-project")
+    monkeypatch.setenv("CLOUD_ML_REGION", "us-central1")
+    assert not claude_native.claude_default_catalog_bypass_is_safe(None)
+    assert claude_native.claude_launch_endpoint_marker(None) == "vertex"
+
+    monkeypatch.delenv("CLAUDE_CODE_USE_VERTEX")
+    managed_settings = tmp_path / "managed-settings.json"
+    managed_settings.write_text("{malformed", encoding="utf-8")
+    monkeypatch.setattr(claude_native, "_CLAUDE_CODE_MANAGED_SETTINGS_PATHS", (managed_settings,))
+    assert not claude_native.claude_default_catalog_bypass_is_safe(None)
+    assert claude_native.claude_launch_endpoint_marker(None) == "managed_settings"
+
+    managed_settings.write_text(
+        json.dumps({"env": {"CLAUDE_CODE_USE_BEDROCK": "1"}}), encoding="utf-8"
+    )
+    assert not claude_native.claude_default_catalog_bypass_is_safe(None)
+    assert claude_native.claude_launch_endpoint_marker(None) == "bedrock"
+
+    managed_settings.write_text(
+        json.dumps({"env": {"ANTHROPIC_DEFAULT_SONNET_MODEL": "synthetic-sonnet"}}),
+        encoding="utf-8",
+    )
+    assert not claude_native.claude_default_catalog_bypass_is_safe(None)
+    assert claude_native.claude_launch_endpoint_marker(None) == "managed_models"
+
+    managed_settings.write_text(
+        json.dumps({"env": {"ANTHROPIC_API_KEY": "configured-by-enterprise"}}),
+        encoding="utf-8",
+    )
+    assert not claude_native.claude_default_catalog_bypass_is_safe(None)
+    assert claude_native.claude_launch_endpoint_marker(None) == "managed_settings"
+
+    managed_settings.write_text(
+        json.dumps(
+            {
+                "modelPicker": {
+                    "replaceBuiltInOptions": True,
+                    "options": [{"model": "synthetic-sonnet", "label": "Synthetic Sonnet"}],
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert not claude_native.claude_default_catalog_bypass_is_safe(None)
+    assert claude_native.claude_launch_endpoint_marker(None) == "managed_models"

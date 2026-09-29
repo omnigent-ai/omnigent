@@ -179,6 +179,12 @@ def write_catalog(harness: str, fingerprint: str, rows: list[dict[str, Any]]) ->
 _inflight: dict[tuple[str, str], asyncio.Task[list[dict[str, Any]] | None]] = {}
 
 
+def catalog_probe_inflight(harness: str, fingerprint: str) -> bool:
+    """Whether a catalog probe is currently running for one store key."""
+    task = _inflight.get((harness, fingerprint))
+    return task is not None and not task.done()
+
+
 async def shutdown_catalog_probes() -> None:
     """Cancel shared probes after consumers stop, before event-loop shutdown.
 
@@ -324,6 +330,7 @@ __all__ = [
     "catalog_contains",
     "catalog_is_stale",
     "catalog_path",
+    "catalog_probe_inflight",
     "default_row",
     "ensure_catalog",
     "fingerprint_of",

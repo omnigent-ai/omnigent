@@ -4965,11 +4965,45 @@ async def test_auto_create_claude_terminal_launch_gate_folds_a_gateway_namespace
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("freshness", ["fresh", "stale"])
+@pytest.mark.parametrize(
+    ("freshness", "provider_shape", "probe_result", "custom_launcher"),
+    [
+        ("fresh", "claude_login", "available", False),
+        ("stale", "claude_login", "available", False),
+        ("missing", "claude_login", "available", False),
+        ("inflight", "claude_login", "available", False),
+        ("missing", "claude_login", "failed", False),
+        ("missing", "claude_login", "available", True),
+        ("missing", "ambient_models", "available", False),
+        ("inflight", "ambient_models", "available", False),
+        ("missing", "user_api_key_helper", "available", False),
+        ("inflight", "user_api_key_helper", "available", False),
+        ("missing", "user_provider_env", "available", False),
+        ("inflight", "user_provider_env", "available", False),
+        ("missing", "workspace_settings", "available", False),
+        ("missing", "workspace_local_settings", "available", False),
+        ("missing", "resolution_failed", "available", False),
+        ("inflight", "resolution_failed", "available", False),
+        ("missing", "managed_models", "available", False),
+        ("inflight", "managed_models", "available", False),
+        ("missing", "managed_malformed", "available", False),
+        ("missing", "vertex", "available", False),
+        ("inflight", "vertex", "available", False),
+        ("missing", "managed_endpoint", "available", False),
+        ("inflight", "managed_endpoint", "available", False),
+        ("missing", "managed_endpoint", "failed", False),
+        ("missing", "malformed_endpoint_default", "failed", False),
+        ("missing", "malformed_endpoint_explicit", "failed", False),
+    ],
+)
 async def test_auto_create_claude_terminal_default_pin_requires_a_fresh_catalog(
     freshness: str,
+    provider_shape: str,
+    probe_result: str,
+    custom_launcher: bool,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """
     A Default launch pins the stored default only while the entry is fresh.
@@ -4977,8 +5011,8 @@ async def test_auto_create_claude_terminal_default_pin_requires_a_fresh_catalog(
     The store never forgets an entry, so its ``isDefault`` row can outlive
     the model it names (a retirement or an entitlement change); pinning it
     as ``--model`` then hard-fails every Default launch on the host. A
-    stale entry defers to the CLI's own default — no ``--model`` at all —
-    while the store re-probes in the background.
+    stale entry and a cold miss defer to the CLI's own default — no ``--model``
+    at all — while the store probes in the background.
     """
     import os
     import time
@@ -4990,6 +5024,87 @@ async def test_auto_create_claude_terminal_default_pin_requires_a_fresh_catalog(
     monkeypatch.setattr(claude_native_bridge, "_TRUSTED_PARENT", tmp_path)
     monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "root")
     monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
+    user_config_dir = tmp_path / "claude-config"
+    user_config_dir.mkdir()
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(user_config_dir))
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.setenv("OMNIGENT_RUNNER_WORKSPACE", str(workspace))
+    for name in (
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_AUTH_TOKEN",
+        "ANTHROPIC_BASE_URL",
+        "ANTHROPIC_BEDROCK_BASE_URL",
+        "ANTHROPIC_MODEL",
+        "CLAUDE_CODE_USE_BEDROCK",
+        "CLAUDE_CODE_USE_FOUNDRY",
+        "CLAUDE_CODE_USE_GATEWAY",
+        "CLAUDE_CODE_USE_VERTEX",
+        "ANTHROPIC_VERTEX_PROJECT_ID",
+        "CLOUD_ML_REGION",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    managed_gateway: tuple[str | None, bool] = (None, False)
+    if provider_shape == "vertex":
+        monkeypatch.setenv("CLAUDE_CODE_USE_VERTEX", "1")
+        monkeypatch.setenv("ANTHROPIC_VERTEX_PROJECT_ID", "synthetic-project")
+        monkeypatch.setenv("CLOUD_ML_REGION", "us-central1")
+    elif provider_shape == "managed_endpoint":
+        managed_gateway = ("https://gateway.example/anthropic", False)
+    elif provider_shape == "ambient_models":
+        monkeypatch.setenv("ANTHROPIC_MODEL", "synthetic-default")
+    elif provider_shape.startswith("malformed_endpoint_"):
+        monkeypatch.setenv("ANTHROPIC_BASE_URL", "http://[::1")
+    elif provider_shape == "user_api_key_helper":
+        (user_config_dir / "settings.json").write_text(
+            json.dumps({"apiKeyHelper": "printf synthetic"}), encoding="utf-8"
+        )
+    elif provider_shape == "user_provider_env":
+        (user_config_dir / "settings.json").write_text(
+            json.dumps({"env": {"ANTHROPIC_BASE_URL": "https://gateway.example/anthropic"}}),
+            encoding="utf-8",
+        )
+    elif provider_shape in {"workspace_settings", "workspace_local_settings"}:
+        workspace_settings_dir = workspace / ".claude"
+        workspace_settings_dir.mkdir()
+        filename = (
+            "settings.local.json"
+            if provider_shape == "workspace_local_settings"
+            else "settings.json"
+        )
+        (workspace_settings_dir / filename).write_text(
+            json.dumps({"env": {"ANTHROPIC_BASE_URL": "https://gateway.example/anthropic"}}),
+            encoding="utf-8",
+        )
+    managed_settings_paths: tuple[Path, ...] = ()
+    if provider_shape in {"managed_models", "managed_malformed"}:
+        managed_settings = tmp_path / "managed-settings.json"
+        if provider_shape == "managed_malformed":
+            managed_settings.write_text("{malformed", encoding="utf-8")
+        else:
+            managed_settings.write_text(
+                json.dumps({"env": {"ANTHROPIC_DEFAULT_SONNET_MODEL": "synthetic-sonnet"}}),
+                encoding="utf-8",
+            )
+        managed_settings_paths = (managed_settings,)
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.main._CLAUDE_CODE_MANAGED_SETTINGS_PATHS",
+        managed_settings_paths,
+    )
+    monkeypatch.setattr(
+        "omnigent.onboarding.ambient.CLAUDE_CODE_MANAGED_SETTINGS_PATHS",
+        managed_settings_paths,
+    )
+    monkeypatch.setattr(
+        "omnigent.onboarding.ambient.claude_managed_gateway", lambda _paths=None: managed_gateway
+    )
+    harness_config: dict[str, object] = {}
+    if custom_launcher:
+        harness_config = {
+            "harness": {"claude-native": {"command": "synthetic-wrapper", "args": ["--"]}}
+        }
+    monkeypatch.setattr("omnigent.config.load_effective_config", lambda: harness_config)
+    caplog.set_level(logging.INFO, logger="omnigent.runner.app")
 
     async def _no_op_forwarder(**kwargs: Any) -> None:
         del kwargs
@@ -5004,32 +5119,46 @@ async def test_auto_create_claude_terminal_default_pin_requires_a_fresh_catalog(
         "omnigent.harnesses.claude_native.main.claude_launch_catalog", REAL_CLAUDE_LAUNCH_CATALOG
     )
     refreshed = [{"id": "sonnet", "model": "claude-sonnet-5", "isDefault": True}]
+    probe_started = asyncio.Event()
+    release_probe = asyncio.Event()
+    probe_attempts = 0
 
     async def _fake_probe_catalog(config: object) -> list[dict[str, object]]:
+        nonlocal probe_attempts
         del config
+        probe_attempts += 1
+        probe_started.set()
+        await release_probe.wait()
+        if probe_result == "failed" and probe_attempts == 1:
+            raise RuntimeError("synthetic catalog failure")
         return refreshed
 
     monkeypatch.setattr(
         "omnigent.harnesses.claude_native.main.claude_model_catalog", _fake_probe_catalog
     )
     fingerprint = claude_catalog_fingerprint(None)
-    model_catalog_store.write_catalog(
-        "claude-native",
-        fingerprint,
-        [
-            {"id": "opus", "model": "claude-opus-5", "displayName": "Opus 5"},
-            {
-                "id": "claude-3-5-sonnet-20241022",
-                "model": "claude-3-5-sonnet-20241022",
-                "displayName": "Claude 3.5 Sonnet",
-                "isDefault": True,
-            },
-        ],
-    )
+    prewarm_task: asyncio.Task[list[dict[str, object]] | None] | None = None
+    if freshness not in {"missing", "inflight"}:
+        model_catalog_store.write_catalog(
+            "claude-native",
+            fingerprint,
+            [
+                {"id": "opus", "model": "claude-opus-5", "displayName": "Opus 5"},
+                {
+                    "id": "claude-3-5-sonnet-20241022",
+                    "model": "claude-3-5-sonnet-20241022",
+                    "displayName": "Claude 3.5 Sonnet",
+                    "isDefault": True,
+                },
+            ],
+        )
     if freshness == "stale":
         path = model_catalog_store.catalog_path("claude-native", fingerprint)
         old = time.time() - (model_catalog_store.CATALOG_STALE_AFTER_S + 60)
         os.utime(path, (old, old))
+    elif freshness == "inflight":
+        prewarm_task = asyncio.create_task(REAL_CLAUDE_LAUNCH_CATALOG(None))
+        await asyncio.wait_for(probe_started.wait(), timeout=15)
 
     captured: dict[str, Any] = {}
 
@@ -5060,7 +5189,10 @@ async def test_auto_create_claude_terminal_default_pin_requires_a_fresh_catalog(
             )
 
     def _handle_request(_request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json={"labels": {}})
+        payload: dict[str, object] = {"labels": {}}
+        if provider_shape == "malformed_endpoint_explicit":
+            payload["model_override"] = "claude-sonnet-5"
+        return httpx.Response(200, json=payload)
 
     fake_client = httpx.AsyncClient(
         base_url="http://test-server",
@@ -5068,24 +5200,100 @@ async def test_auto_create_claude_terminal_default_pin_requires_a_fresh_catalog(
     )
 
     async def _resolve() -> None:
-        return None
+        if provider_shape == "resolution_failed":
+            raise RuntimeError("synthetic provider resolution failure")
+        return
 
-    await _auto_create_claude_terminal(
-        "9b1d2c3e4f5a6b7c8d9e0f1a2b3c4d5e",
-        _FakeResourceRegistry(),
-        lambda _sid, _evt: None,
-        server_client=fake_client,
-        resolve_launch_config=_resolve,
+    launch_task = asyncio.create_task(
+        _auto_create_claude_terminal(
+            "9b1d2c3e4f5a6b7c8d9e0f1a2b3c4d5e",
+            _FakeResourceRegistry(),
+            lambda _sid, _evt: None,
+            server_client=fake_client,
+            resolve_launch_config=_resolve,
+        )
     )
+    synchronous_probe = (provider_shape != "claude_login" or custom_launcher) and freshness in {
+        "missing",
+        "inflight",
+    }
+    if synchronous_probe:
+        await asyncio.wait_for(probe_started.wait(), timeout=15)
+        await asyncio.sleep(0)
+        assert not launch_task.done(), (
+            f"{provider_shape} Default launch skipped its {freshness} catalog probe"
+        )
+        release_probe.set()
+    # Full runner shards can spend several seconds rendering a synthetic probe
+    # traceback and waiting for the shared thread pool. Keep a bounded guard,
+    # but leave enough headroom for that CI-only contention.
+    await asyncio.wait_for(launch_task, timeout=15)
     args = captured["spec"].args
-    if freshness == "fresh":
+    if custom_launcher:
+        assert captured["spec"].command == "synthetic-wrapper"
+    if provider_shape == "malformed_endpoint_explicit":
+        assert args[args.index("--model") + 1] == "claude-sonnet-5"
+    elif freshness == "fresh":
         assert args[args.index("--model") + 1] == "claude-3-5-sonnet-20241022"
+    elif synchronous_probe and probe_result == "available":
+        assert args[args.index("--model") + 1] == "claude-sonnet-5"
     else:
-        assert "--model" not in args, f"a stale default was still pinned: {args}"
+        assert "--model" not in args, f"a non-authoritative default was still pinned: {args}"
+    if freshness != "fresh":
+        await asyncio.wait_for(probe_started.wait(), timeout=15)
+        # Canonical login returned before the probe. Ambiguous providers waited
+        # and pinned the catalog's discovered default before launching.
+        if not synchronous_probe:
+            assert not release_probe.is_set()
+            release_probe.set()
         task = model_catalog_store._inflight.get(("claude-native", fingerprint))
         if task is not None:
-            await task
-        # The background re-probe healed the store for the next launch.
-        assert model_catalog_store.read_catalog("claude-native", fingerprint) == refreshed
+            await asyncio.gather(task, return_exceptions=True)
+        if prewarm_task is not None:
+            await prewarm_task
+        # Successful discovery healed the picker store; a failed probe left the
+        # miss intact while the terminal still launched without a model pin.
+        assert model_catalog_store.read_catalog("claude-native", fingerprint) == (
+            refreshed if probe_result == "available" else None
+        )
+        if provider_shape == "claude_login" and probe_result == "failed":
+            # A failed advisory probe leaves a real miss: a later picker read
+            # retries discovery and heals the shared store.
+            assert await REAL_CLAUDE_LAUNCH_CATALOG(None) == refreshed
+            assert model_catalog_store.read_catalog("claude-native", fingerprint) == refreshed
+
+    records = [
+        record
+        for record in caplog.records
+        if getattr(record, "event_name", None) == "claude_launch_catalog_resolution"
+    ]
+    assert records
+    attributes = records[-1].attributes
+    expected_outcome = (
+        "error"
+        if probe_result == "failed" and synchronous_probe
+        else {
+            "fresh": "hit",
+            "stale": "stale",
+            "missing": "cold_probe" if synchronous_probe else "default_bypass",
+            "inflight": "joined_inflight" if synchronous_probe else "default_bypass",
+        }[freshness]
+    )
+    assert attributes["catalog_outcome"] == expected_outcome
+    assert attributes["catalog_on_terminal_critical_path"] is (
+        freshness in {"fresh", "stale"} or synchronous_probe
+    )
+    assert attributes["catalog_probe_on_terminal_critical_path"] is synchronous_probe
+    if provider_shape in {"user_api_key_helper", "user_provider_env"}:
+        expected_endpoint = "user_settings"
+    elif provider_shape in {"workspace_settings", "workspace_local_settings"}:
+        expected_endpoint = "workspace_settings"
+    elif provider_shape == "managed_malformed":
+        expected_endpoint = "managed_settings"
+    elif provider_shape.startswith("malformed_endpoint_"):
+        expected_endpoint = "unknown"
+    else:
+        expected_endpoint = provider_shape
+    assert attributes["endpoint"] == expected_endpoint
 
     await fake_client.aclose()

@@ -337,6 +337,9 @@ _COST_POPUP_REPOP_TASKS: set[asyncio.Task[object]] = set()
 # One-shot readiness observers for runner-owned native terminals. Strong
 # references keep the tasks alive after session creation returns.
 _TERMINAL_INTERACTIVE_TASKS: set[asyncio.Task[None]] = set()
+# Default Claude launches can populate a cold picker after terminal creation.
+# Keep those one-shot waiters alive until the shared store probe completes.
+_CLAUDE_CATALOG_REFRESH_TASKS: set[asyncio.Task[None]] = set()
 _TERMINAL_INTERACTIVE_TIMEOUT_S = 180.0
 _TERMINAL_INTERACTIVE_POLL_INTERVAL_S = 0.15
 # Sign-in may stay open indefinitely; limit its liveness subprocess rate.
@@ -352,6 +355,29 @@ _AUTO_CODEX_APP_SERVERS: dict[str, CodexNativeAppServer] = {}
 # opencode-native runners, kept referenced so they aren't garbage-collected
 # mid-run (mirrors ``_AUTO_CODEX_APP_SERVERS``).
 _AUTO_OPENCODE_SERVERS: dict[str, OpenCodeNativeServer] = {}
+
+
+def _schedule_claude_catalog_refresh(
+    session_id: str,
+    resolve: Callable[[], Awaitable[object]],
+) -> None:
+    """Run one store-backed Claude catalog read outside terminal creation."""
+
+    async def _run() -> None:
+        try:
+            await resolve()
+        except Exception:  # noqa: BLE001 — picker discovery is advisory after launch
+            _logger.warning(
+                "background Claude launch catalog refresh failed for session=%s",
+                session_id,
+                exc_info=True,
+                extra={"session_id": session_id},
+            )
+
+    task = asyncio.create_task(_run(), name=f"claude-catalog-refresh-{session_id}")
+    _CLAUDE_CATALOG_REFRESH_TASKS.add(task)
+    task.add_done_callback(_CLAUDE_CATALOG_REFRESH_TASKS.discard)
+
 
 # Bound repeated terminal GET miss logs from tight client poll loops.
 _TERMINAL_LOOKUP_MISS_LOG_INTERVAL_S = 10.0
@@ -8204,6 +8230,24 @@ async def _auto_create_claude_terminal(
     fork_source_external_id = launch_metadata.fork_source_external_id
     fork_carry_history = launch_metadata.fork_carry_history
 
+    # Resolve the actual launcher before deciding whether Claude itself owns a
+    # Default choice. A configured wrapper can alter credentials, endpoint, or
+    # model selection in ways the canonical Claude catalog cannot observe, so
+    # only the built-in bare ``claude`` command is eligible for the cold-probe
+    # bypass. Reuse this same config snapshot when the final augmented argv is
+    # assembled below.
+    from omnigent.config import load_effective_config  # noqa: FlagLocalImports
+    from omnigent.harness_startup_config import (  # noqa: FlagLocalImports
+        resolve_harness_args,
+        resolve_harness_command,
+    )
+
+    _harness_cfg = load_effective_config()
+    launch_command = resolve_harness_command("claude-native", default="claude", cfg=_harness_cfg)
+    launch_passthrough_args = resolve_harness_args(
+        "claude-native", tuple(session_launch_args or ()), cfg=_harness_cfg
+    )
+
     # The server GET may miss the external_session_id binding when the
     # reconnect request arrives without a workspace-scoped context (the
     # ContextVar defaults to 0 on fresh tasks). Fall back to the claude_session_id
@@ -8409,6 +8453,7 @@ async def _auto_create_claude_terminal(
         resolve_bound_model,
     )
 
+    config_resolution_started = time.perf_counter()
     inference_config = load_runtime_inference_config()
     claude_binding = binding_for_harness(inference_config, "claude-native")
     try:
@@ -8433,6 +8478,7 @@ async def _auto_create_claude_terminal(
             extra={"session_id": session_id},
         )
         _launch_config_resolution_failed = True
+    config_resolution_ms = round((time.perf_counter() - config_resolution_started) * 1000, 3)
     # A transient resolver failure must not be cached as "no provider configured".
     # A routed session's turn-1 ``/model`` can only reach ids this launch env
     # spells, so point the family aliases at the router's frozen arms before the
@@ -8475,27 +8521,85 @@ async def _auto_create_claude_terminal(
         from omnigent.harnesses.claude_native.main import (
             claude_catalog_launch_spelling,
             claude_catalog_serves_model,
+            claude_default_catalog_bypass_is_safe,
             claude_launch_catalog,
             claude_launch_catalog_is_stale,
+            claude_launch_catalog_state,
             claude_launch_endpoint_label,
+            claude_launch_endpoint_marker,
             claude_reprobed_launch_catalog,
         )
         from omnigent.models.model_catalog_store import default_row
 
         launch_catalog_was_stale = False
+        catalog_outcome = claude_launch_catalog_state(claude_config)
+        catalog_wait_started = time.perf_counter()
+        default_bypass = (
+            session_model_override is None
+            and launch_model is None
+            and not launch_metadata.routing_enabled
+            and launch_command == "claude"
+            and not launch_passthrough_args
+            and claude_default_catalog_bypass_is_safe(
+                claude_config,
+                launch_config_resolution_failed=_launch_config_resolution_failed,
+                workspace=Path(workspace),
+            )
+            and catalog_outcome in {"joined_inflight", "cold_probe"}
+        )
+        catalog_probe_on_terminal_critical_path = False
         try:
-            # Read staleness BEFORE the fetch: the fetch itself kicks the
-            # background re-probe, which could land between the two reads and
-            # make a same-launch check call yesterday's rows fresh.
-            launch_catalog_was_stale = claude_launch_catalog_is_stale(claude_config)
-            launch_catalog = await claude_launch_catalog(claude_config)
+            if default_bypass:
+                # Claude's own canonical login owns the Default choice. Start
+                # discovery for the picker, but do not join a cold probe before
+                # the terminal exists.
+                _schedule_claude_catalog_refresh(
+                    session_id, lambda: claude_launch_catalog(claude_config)
+                )
+                catalog_outcome = "default_bypass"
+            else:
+                catalog_probe_on_terminal_critical_path = catalog_outcome in {
+                    "joined_inflight",
+                    "cold_probe",
+                }
+                # Read staleness BEFORE the fetch: the fetch itself kicks the
+                # background re-probe, which could land between the two reads and
+                # make a same-launch check call yesterday's rows fresh.
+                launch_catalog_was_stale = claude_launch_catalog_is_stale(claude_config)
+                launch_catalog = await claude_launch_catalog(claude_config)
         except Exception:  # noqa: BLE001 — no catalog means no validation/default
+            catalog_outcome = "error"
             _logger.warning(
                 "claude launch catalog unavailable for session=%s",
                 session_id,
                 exc_info=True,
                 extra={"session_id": session_id},
             )
+        catalog_wait_ms = round((time.perf_counter() - catalog_wait_started) * 1000, 3)
+        catalog_on_terminal_critical_path = not default_bypass
+        _logger.info(
+            "Claude launch catalog resolved: session=%s outcome=%s "
+            "config_resolution_ms=%.1f catalog_wait_ms=%.1f critical_path=%s",
+            session_id,
+            catalog_outcome,
+            config_resolution_ms,
+            catalog_wait_ms,
+            catalog_on_terminal_critical_path,
+            extra=debug_event(
+                "claude_launch_catalog_resolution",
+                session_id=session_id,
+                catalog_outcome=catalog_outcome,
+                config_resolution_ms=config_resolution_ms,
+                catalog_wait_ms=catalog_wait_ms,
+                catalog_on_terminal_critical_path=catalog_on_terminal_critical_path,
+                catalog_probe_on_terminal_critical_path=catalog_probe_on_terminal_critical_path,
+                endpoint=claude_launch_endpoint_marker(
+                    claude_config,
+                    launch_config_resolution_failed=_launch_config_resolution_failed,
+                    workspace=Path(workspace),
+                ),
+            ),
+        )
         if session_model_override and launch_catalog:
             pick = session_model_override
             resolved_request = resolve_claude_native_model_selection(pick, claude_config) or pick
@@ -8728,14 +8832,6 @@ async def _auto_create_claude_terminal(
     # appended above, so the ``--`` stays first). Identity by default. This is
     # the same resolver the local-CLI native launch uses (see cli_native.py), so
     # both terminal-creation paths honour one config surface.
-    from omnigent.config import load_effective_config  # noqa: FlagLocalImports
-    from omnigent.harness_startup_config import (  # noqa: FlagLocalImports
-        resolve_harness_args,
-        resolve_harness_command,
-    )
-
-    _harness_cfg = load_effective_config()
-    launch_command = resolve_harness_command("claude-native", default="claude", cfg=_harness_cfg)
     launch_args = resolve_harness_args("claude-native", tuple(claude_args), cfg=_harness_cfg)
     # Validate the binary this terminal will actually spawn: ``launch_command``
     # already reflects the OMNIGENT_CLAUDE_PATH / config overrides, and a bare
