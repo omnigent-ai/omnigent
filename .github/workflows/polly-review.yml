@@ -526,6 +526,8 @@ jobs:
           **Required summary format:** End with exactly one `## Summary`, containing
           all three headings below, even when there are no findings. Do not repeat
           the computed statistics; the workflow inserts them after `## Summary`.
+          Write plain Markdown; the workflow collapses the full Tests assessment
+          inside a clickable disclosure. Do not add the disclosure HTML yourself.
           Missing or empty subsections, or a changed test/support file absent from
           the Tests subsection, cause the workflow to reject the review as incomplete.
 
@@ -534,6 +536,7 @@ jobs:
           (implementation, tests, fixtures, docs, dependencies, generated files).
           Explain whether its size is justified and name concrete opportunities
           to reduce it; line counts alone are not evidence of unnecessary work.
+          Put test-specific action items only in the notes described below.
 
           ### Tests
           Include a compact table with columns: Test / case, Behavior protected,
@@ -546,7 +549,13 @@ jobs:
           test edits explicitly without inventing test cases. Every changed test/support
           file listed above must appear here. Also describe missing coverage and whether
           existing tests suffice. If no tests changed, state that and assess existing
-          coverage. Put blocking bugs in Blocking issues and reference them briefly here.
+          coverage. Keep all "keep" verdicts and full test rationale in this table.
+          Surface only actionable test changes (add missing coverage, consolidate,
+          move layer, change, or remove) outside this subsection, as concise notes
+          naming the test/case and the recommended action. Put them in Blocking
+          issues only when they address a demonstrated bug or broken contract;
+          otherwise use Non-blocking notes. Do not repeat the table or list tests
+          that need no changes in the visible notes, Changes, or Scope sections.
 
           ### Scope
           State whether all changes support the intended outcome. Identify unrelated

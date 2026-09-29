@@ -86,6 +86,21 @@ def diff_stats(diff: Path) -> dict:
     return {"markdown": "\n".join(lines), "test_files": test_files}
 
 
+def collapse_test_assessment(summary_body: str) -> str:
+    return re.sub(
+        r"(^### Tests[ \t]*\n)(.*?)(?=^#{1,3} |\Z)",
+        lambda match: (
+            match[1]
+            + "\n<details>\n<summary>Test-by-test assessment</summary>\n\n"
+            + match[2].strip()
+            + "\n\n</details>\n\n"
+        ),
+        summary_body,
+        count=1,
+        flags=re.MULTILINE | re.DOTALL,
+    )
+
+
 def compose_review(review: str, stats: dict) -> str:
     summaries = list(re.finditer(r"^## Summary\s*$", review, re.MULTILINE))
     if len(summaries) != 1:
@@ -132,7 +147,7 @@ def compose_review(review: str, stats: dict) -> str:
         + "\n\n"
         + stats["markdown"]
         + "\n\n"
-        + review[summary.end() :].lstrip()
+        + collapse_test_assessment(review[summary.end() :].lstrip())
     )
     if len(result.encode("utf-8")) > 60000:
         raise ValueError(

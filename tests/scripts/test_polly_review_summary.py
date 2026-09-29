@@ -183,5 +183,8 @@ def test_workflow_inserts_computed_summary_before_secret_scan_and_publication(
         )
         assert result.returncode == 0, result.stdout + result.stderr
     expected = _REVIEW.replace("## Summary\n", f"## Summary\n\n{stats['markdown']}\n\n")
+    expected = expected.replace(
+        "### Tests\n", "### Tests\n\n<details>\n<summary>Test-by-test assessment</summary>\n\n"
+    ).replace("### Scope\n", "\n</details>\n\n### Scope\n")
     assert review.read_text() == expected
     assert expected in (tmp_path / "comment.md").read_text()
