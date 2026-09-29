@@ -1,11 +1,9 @@
 """Fixture-integrity tests for tests/fixtures/opencode_v2/.
 
-These four files are committed, not generated in CI: a human runs
-dev/opencode_v2_recon.py against a real, credentialed opencode v2 server and
-commits the result whenever the OpenCode wire protocol this harness targets
-changes. This module's only job is to fail loudly, with an actionable
-message, if the fixtures are ever missing or malformed, so Stage 1+ tests
-don't silently run against nothing.
+The fixtures are committed, not generated in CI: they were captured from a
+real ``opencode serve`` 2.0.18 and must be recaptured when the OpenCode wire
+protocol this harness targets changes. This module fails loudly if they are
+missing or malformed, so the harness tests never run against nothing.
 """
 
 from __future__ import annotations
@@ -38,10 +36,9 @@ _REQUIRED_EVENT_TYPES = [
 def test_fixture_files_exist() -> None:
     missing = [path for path in (OPENAPI_PATH, EVENTS_PATH, MESSAGES_PATH) if not path.is_file()]
     assert not missing, (
-        f"Missing OpenCode v2 recon fixtures: {missing}. Run "
-        "`uv run python dev/opencode_v2_recon.py --model <provider/model>` "
-        "with real credentials and commit tests/fixtures/opencode_v2/ "
-        "(see Stage 0, Task 3)."
+        f"Missing OpenCode v2 wire fixtures: {missing}. Recapture them from a "
+        "real `opencode serve` 2.0.x (GET /openapi.json, the /api/event stream of one "
+        "turn, and GET /api/session/{id}/message) into tests/fixtures/opencode_v2/."
     )
 
 

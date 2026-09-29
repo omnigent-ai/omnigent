@@ -1,8 +1,7 @@
-"""Loaders for the committed OpenCode v2 recon fixtures.
+"""Loaders for the committed OpenCode v2 wire fixtures.
 
-Fixtures live in ``tests/fixtures/opencode_v2/`` (captured by
-``dev/opencode_v2_recon.py`` against a real 2.0.x ``opencode serve``) and
-back every ``opencode-native`` v2 unit test from Stage 1 onward.
+Fixtures live in ``tests/fixtures/opencode_v2/``. They were captured from a
+real ``opencode serve`` 2.0.18 and back the ``opencode-native`` unit tests.
 """
 
 from __future__ import annotations
