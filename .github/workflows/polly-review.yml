@@ -15,7 +15,7 @@ name: Polly AI Review
 #
 # A head SHA is reviewed at most once: a trigger that lands on an
 # already-reviewed commit posts a short "skipped" note instead of a second
-# review. `/review force` overrides that.
+# review. `/review force` or the manual force input overrides that.
 
 on:
   pull_request:
@@ -28,6 +28,10 @@ on:
         description: PR number to review.
         required: true
         type: string
+      force:
+        description: Review even if this PR commit already has a review.
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -43,7 +47,8 @@ jobs:
   # the scan; trusted authors pass through. Only runs on pull_request events.
   # issue_comment and workflow_dispatch are gated by write-access or the
   # REVIEW_ALLOWLIST (author_association / login check, plus GitHub's dispatch
-  # auth) and never check out PR code, so the scan is not applicable.
+  # auth). Manual runs use the selected workflow commit; the target PR is
+  # fetched only as a diff, so the scan is not applicable.
   gate:
     if: github.event_name == 'pull_request'
     uses: ./.github/workflows/security-gate.yml
@@ -131,14 +136,15 @@ jobs:
           REPO: ${{ github.repository }}
           PR_NUMBER: ${{ github.event.pull_request.number || github.event.issue.number || inputs.pr }}
           COMMENT_BODY: ${{ github.event.comment.body }}
+          FORCE_REVIEW: ${{ github.event_name == 'workflow_dispatch' && inputs.force || false }}
         run: |
           set -euo pipefail
 
           head_sha="$(gh api "repos/${REPO}/pulls/${PR_NUMBER}" --jq '.head.sha')"
           echo "head_sha=${head_sha}" >> "$GITHUB_OUTPUT"
 
-          if grep -qE '^[[:space:]]*/review[[:space:]]+force([[:space:]]|$)' <<<"${COMMENT_BODY:-}"; then
-            echo "::notice::'/review force': re-reviewing ${head_sha}."
+          if [ "${FORCE_REVIEW:-false}" = "true" ] || grep -qE '^[[:space:]]*/review[[:space:]]+force([[:space:]]|$)' <<<"${COMMENT_BODY:-}"; then
+            echo "::notice::Forced review of ${head_sha}."
             exit 0
           fi
 
@@ -200,15 +206,14 @@ jobs:
             *)                  echo "pr_number=${{ github.event.pull_request.number }}" >> "$GITHUB_OUTPUT" ;;
           esac
 
-      # Always check out the default branch (trusted). The PR diff is
-      # fetched via the API — we never execute PR-authored code. This
-      # avoids the TOCTOU issue CodeQL flags when issue_comment checks
-      # out untrusted PR code in a privileged workflow.
+      # Automatic runs use the trusted default branch. A write-authorized
+      # manual dispatch uses its selected workflow commit for branch testing.
+      # The target PR is always fetched as a diff, never checked out or executed.
       - name: Check out repo
         if: steps.creds.outputs.available == 'true'
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
         with:
-          ref: ${{ github.event.repository.default_branch }}
+          ref: ${{ github.event_name == 'workflow_dispatch' && github.sha || github.event.repository.default_branch }}
           persist-credentials: false
 
       - name: Set up Python
@@ -498,8 +503,9 @@ jobs:
           in each reviewer task. Reviewers must read the file themselves with their
           own tools. Do not paste or regenerate the diff in task messages, and do
           not modify the snapshot. If a reviewer cannot read it, report the failure.
-          The codebase is checked out at `main` — read source files freely for
-          additional context when needed.
+          The codebase is the trusted review-code checkout (the default branch for
+          automatic runs, the selected workflow commit for manual runs). Read source
+          files for context, but use the frozen diff for the target PR's changes.
 
           The database review reference is `{database_guidance_path}`, from the
           trusted checkout or its verified bootstrap snapshot. Polly and every
@@ -605,7 +611,7 @@ jobs:
 
           **Test assessment:** Apply all three checks to added, modified, and removed
           tests, and inspect relevant existing tests before asking for more. The
-          checkout is main; use the saved diff to account for PR changes. Distinguish
+          checkout contains review code; use the saved diff for PR changes. Distinguish
           verified coverage from unavailable context, and do not claim tests passed
           unless execution evidence is provided. Pass these checks to every reviewer.
 
