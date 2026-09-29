@@ -1716,7 +1716,13 @@ def test_spec_harness_derivation() -> None:
         ("https://api.openai.com/v1/", "https://api.openai.com/v1/models"),
         ("https://api.anthropic.com", "https://api.anthropic.com/v1/models"),
         ("https://api.z.ai/api/coding/paas/v4", "https://api.z.ai/api/coding/paas/v4/models"),
+        ("https://api.z.ai/api/coding/paas/v4/", "https://api.z.ai/api/coding/paas/v4/models"),
         ("https://gw.example.com/v6", "https://gw.example.com/v6/models"),
+        ("https://gw.example.com/v10", "https://gw.example.com/v10/models"),
+        ("https://gw.example.com/v1beta", "https://gw.example.com/v1beta/v1/models"),
+        ("https://gw.example.com/v4/proxy", "https://gw.example.com/v4/proxy/v1/models"),
+        ("https://gw.example.com/v٤", "https://gw.example.com/v٤/v1/models"),
+        ("https://v4", "https://v4/v1/models"),
     ],
 )
 def test_models_url_appends_models_to_any_versioned_base(

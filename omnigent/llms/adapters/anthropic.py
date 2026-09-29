@@ -18,7 +18,7 @@ import threading
 import time
 from collections.abc import AsyncIterator
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 import httpx
 from cachetools import TTLCache
@@ -221,7 +221,7 @@ def _models_url(base_url: str) -> str:
     trimmed = base_url.rstrip("/")
     # A base that already names its API version lists at <base>/models;
     # appending /v1 again builds a path no server serves.
-    if re.search(r"/v\d+$", trimmed):
+    if re.search(r"/v[0-9]+\Z", urlsplit(trimmed).path):
         return f"{trimmed}/models"
     return f"{trimmed}/v1/models"
 
