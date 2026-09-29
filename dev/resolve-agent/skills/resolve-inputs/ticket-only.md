@@ -16,9 +16,11 @@ materialize. Instead:
    purpose, mutually exclusive options), stop with `needs_more_info` and say
    exactly what decision or information is missing — do not pick for them.
 3. Take the author path (Step 2B) with these substitutions: 2B.1 has no repro
-   test to audit, so your **targeted test written in 2B.4 is the fail→pass
-   proof** — write it in the existing test module for that code, make sure it
-   fails on the unfixed tree and passes on the fixed one. Complete the shared
+   test to audit, so the **selected regression check from 2B.4 supplies the
+   fail→pass proof** for a behavioral bug. Reuse or extend an existing test
+   where sufficient. For an instruction/documentation-only change, use the
+   applicable existing contract/bundle checks without fabricating a behavioral
+   failure. Complete the shared
    impact assessment too: run that module and the focused checks for affected
    consumers and boundaries. Recordings apply only when the change has a product
    surface a user would see; for CI-wrapper fixes emit `recordings: []` with a

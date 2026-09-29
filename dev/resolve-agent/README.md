@@ -3,8 +3,8 @@
 Take a bug that **repro-agent reports as reproduced** to resolution, and prove that
 resolution with the reproduction test going fail→pass. It is the step *after*
 [repro-agent](../repro-agent/README.md): it consumes that agent's handoff (the
-reproduction verdict, the per-facet breakdown, the journey, and the authored e2e
-test), then does one of two things:
+reproduction verdict, the per-facet breakdown, the journey, and reproduction
+tests), then does one of two things:
 
 - **If an open PR already fixes the bug**, it **reviews that PR** — checks out the
   PR, runs the repro test against it, and reviews the full diff for quality and
@@ -14,8 +14,11 @@ test), then does one of two things:
   and uncertain scope as non-blocking clarification questions in its ordinary
   review. A missing issue link alone is not a scope finding. Resolve addresses
   those findings against the reported bug before approving the existing PR.
-- **If no fix exists yet**, it **authors the fix** in a fresh worktree, adds
-  targeted tests at the layer it changed, and proves the set goes fail→pass.
+- **If no fix exists yet**, it **authors the fix** in a fresh worktree, selects
+  permanent regression coverage, and proves the bug checks go fail→pass. Reuse
+  or extend existing tests when sufficient; retain an e2e for its distinct
+  boundary. Investigation-only reproduction source stays in the evidence
+  archive, with the command, tested revision, and result.
   Publication then follows the selected mode: the agent either opens and drives
   the PR itself, prepares a reviewer-facing body for a workflow-owned publisher,
   or stops after a local commit when `skip_push` is enabled.
@@ -41,7 +44,7 @@ run that already happened — exactly one of:
 - **`ci_link`** — a CI run URL (when repro-agent ran in throwaway CI and its
   worktree is gone).
 
-From that pointer the agent recovers the verdict/facets/journey and the e2e
+From that pointer the agent recovers the verdict/facets/journey and the reproduction
 test's content. The test **content** can't be pulled from the session transcript
 (large tool args are truncated there), so the agent asks the session where it ran
 — `sys_session_get_info` returns the repro session's `workspace` (the
@@ -115,7 +118,7 @@ is the review gate after the fact.
 
 ## What it does
 
-1. Recovers the repro handoff (verdict, facets, journey, `bug_url`) and the e2e
+1. Recovers the repro handoff (verdict, facets, journey, `bug_url`) and the reproduction
    test's content from the `session` or `ci_link`. CI recovery reads the compact
    artifact checkpoint and preserved test files first, using multi-megabyte job
    logs only as a compatibility fallback for older bundles.
@@ -133,8 +136,8 @@ is the review gate after the fact.
      comments its findings. A green test alone does not prove a fix, and a
      setup/import failure is a verification blocker, not a product regression.
    - **No fix PR** → the author path below, using the same baseline proof.
-4. *(author path)* Root-causes, implements the fix, and adds targeted
-   unit/integration tests at the layer it changed. Tests of the bug go fail→pass;
+4. *(author path)* Root-causes, implements the fix, and selects permanent
+   coverage from existing, extended, or new tests. Tests of the bug go fail→pass;
    checks protecting previously correct behavior can pass on both revisions.
 5. *(author path)* Re-runs the whole set to prove every live facet goes fail→pass
    (not just a loosened test), and — when the fix touches env-derived defaults —

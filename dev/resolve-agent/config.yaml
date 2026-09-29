@@ -2,11 +2,11 @@
 # requested changes on an existing Resolve-managed PR.
 #
 # This is the step AFTER repro-agent. It consumes repro-agent's handoff (the
-# reported reproduction and its e2e test). It audits the patch and behavioral
+# reported reproduction and its tests). It audits the patch and behavioral
 # baseline before looking for an open PR: if found, it REVIEWS that PR using the
 # audited test and diff — instead of writing a competing fix. If none
-# exists, it finds the root cause, implements a fix in a fresh worktree, adds
-# targeted unit/regression tests at the layer it changed, proves the whole set
+# exists, it finds the root cause, implements a fix in a fresh worktree, selects
+# permanent regression coverage (reusing existing tests where sufficient), proves the set
 # goes fail→pass, then commits, pushes, and opens a ready-for-review PR. It then
 # drives that PR to a landable state (Step 4): labels every PR `ui-preview` (so a
 # live app is deployed to validate against, not just for frontend fixes) and posts
@@ -44,14 +44,14 @@ description: >-
   Takes a bug that repro-agent reports as reproduced to resolution, and proves
   it with a fail→pass test transition. Given a pointer to a completed repro run —
   a session link (local) or a CI run URL (ci_link) — it recovers the reproduction
-  (verdict, per-facet breakdown, journey) and the authored e2e test. Before both
+  (verdict, per-facet breakdown, journey) and the reproduction test. Before both
   authoring and reviewing, it independently audits the patch, assertions, and
   behavioral failure on the unfixed base. It repairs or rejects unreliable tests
   with preserved evidence in test_audit, rather than trusting artifact delivery
   or a green test alone. It then looks for an open fix PR: if found it REVIEWS
   that PR with the same audited test, journey, and diff review; otherwise it
-  root-causes and implements the fix, adds targeted
-  unit/regression tests at the layer it changed, re-runs the set to confirm every
+  root-causes and implements the fix, selects permanent regression coverage,
+  archives investigation-only reproduction source, and re-runs checks to confirm every
   live facet goes fail→pass, and assesses the final diff's impact on other
   consumers in every resolution mode. It records focused checks, revision context,
   evidence, and uncovered boundaries in impact_assessment before claiming fixed.

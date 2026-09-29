@@ -1,7 +1,9 @@
 # repro-agent
 
 Reproduce a bug **live in your running Omnigent app** and capture it as a
-durable end-to-end test. It runs against whatever server you already have (the
+minimal reliable regression test. Search existing tests and fixtures first;
+reuse or extend them when sufficient. Keep e2e coverage for a boundary that
+lower-level checks miss. It runs against whatever server you already have (the
 server `omnigent run` spins up, or one you pass with `--server`) and authors the
 reproduction test into **this** checkout.
 
@@ -72,9 +74,10 @@ invocations below do not pause for registration or require those records.
    with a connected desktop, and `sys_session_*` / HTTP for backend bugs — until
    it observes the failure. Headless CI does not probe or use desktop browser
    tools, even when they appear in the tool list.
-3. Authors a durable e2e test (`tests/e2e_ui/` for UI, PTY/pexpect for CLI
-   journeys, `tests/e2e/` for backend) keyed to the concrete failure, so a fix
-   has a fail→pass regression guard.
+3. Identifies the smallest reliable regression coverage for the observed
+   failure: an existing test, a small extension, a focused lower-level check,
+   or a necessary e2e. It records the selection rationale and original evidence
+   so Resolve can decide which tests ship. Two new test layers are not required.
 4. Records each settled facet on its user-facing surface under `recordings/<slug>/`
    — the e2e_ui test run with `--video on` for web/terminal facets, a rendered VHS
    tape for CLI facets. A reproduced facet is filmed failing (before-fix footage

@@ -42,8 +42,8 @@ the message. Same discipline as repro-agent:
     {"symptom": "catalog default", "outcome": "nothing_to_fix", "test_transition": "already_fixed in #3448; skipped"}
   ],
   "tests": {
-    "e2e": "tests/e2e_ui/model_catalog/test_1234.py",
-    "added": ["tests/web/model/test_picker_label.py"]
+    "e2e": "",
+    "added": ["tests/web/model/test_picker_label.py::test_display_label"]
   },
   "recordings": [
     {"surface": "web", "kind": "before", "path": "recordings/1234/before-picker.webm", "format": "webm",
@@ -54,7 +54,7 @@ the message. Same discipline as repro-agent:
      "caption": "open the model picker → select the catalog → picker now shows friendly names"}
   ],
   "recording_unavailable_reason": "",
-  "test_audit": "repro e2e was behavioral (failed on raw IDs); no rewrite needed",
+  "test_audit": "Reused the display-label regression; the same assertions fail on base and pass on head. Browser reproduction source, command, revisions, and results are retained in .omnigent/repro-evidence/. No additional browser boundary was found.",
   "impact_assessment": {
     "base_sha": "<full target-branch tip SHA>",
     "head_sha": "<full candidate HEAD SHA>",
@@ -137,8 +137,14 @@ Field meanings:
   `\n` within the JSON string.
 - `facets` — per-facet, mirroring the recovered breakdown: each with its own
   `outcome` and a `test_transition` (the fail→pass proof, or why it was skipped).
-- `tests` — `e2e` is the (possibly rewritten) repro test path; `added` is the list
-  of targeted tests you wrote (empty in review mode).
+- `tests` — selected permanent regression coverage. `e2e` is the retained e2e
+  path, or `""` when none is needed. `added` keeps its legacy name but lists the
+  other selected checks, including reused unchanged tests or extensions to an
+  existing module. Paths/node IDs must resolve on the committed candidate.
+  Do not list artifact-only reproduction paths here. In comment-only review,
+  keep the existing review procedure and do not commit temporary test source.
+  Use `test_audit` for brief selection reasoning: reused/retained tests, why any
+  new permanent e2e is necessary, reproduction-only artifact locations, and gaps.
 - `recordings` — your after-fix clips (`kind: "after"`) and any recovered
   before-clips, using `{surface, kind, path, format, capture_mode, caption}`.
   Follow the recording rules in Step 2B.5 on both author and review runs; in

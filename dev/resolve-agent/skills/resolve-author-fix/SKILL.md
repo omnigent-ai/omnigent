@@ -61,11 +61,27 @@ Fix the root cause, not the symptom. Change the code the bug lives in, matching
 surrounding conventions, as small as the root cause allows. Do not touch the test
 to make it pass; the *code* must change to satisfy it.
 
-### 2B.4 — Add targeted tests at the layer you changed
+### 2B.4 — Select permanent regression coverage
 
-The reproduction test is a full end-to-end journey — slow, one layer above your
-fix. Add **targeted, fast tests at the layer you changed** (a unit/integration
-test on the function/module/component you edited):
+Choose which tests belong in the final PR. Search existing tests and fixtures
+first: reuse an unchanged test, extend an existing scenario, or add a focused
+test only for a demonstrated gap. There is no requirement for a new test file
+or both a new e2e and a smaller test.
+
+Retain an e2e when it protects a distinct production boundary that lower-level
+coverage would miss, and explain that boundary briefly in `test_audit`. Do not
+mock away the failure, skip configurations, or supply already-correct objects
+in place of testing serialization, startup, process, or browser wiring.
+For documentation/instruction-only changes, existing contract/bundle checks
+may suffice; do not add a standalone module of sentence assertions or fabricate
+a behavioral failure.
+
+Preserve investigation-only reproduction source and logs before removing its
+source-tree copy. Use `.omnigent/repro-evidence/` with original paths, commands,
+exact tested revision, and results, or cite the intact CI repro baseline/bundle.
+This archive is separate from the selected permanent tests; it must remain
+retrievable after the original worktree is removed. On retries, preserve the
+selection and retained evidence instead of reinstating the omitted source.
 
 - Tests of the reported bug must **fail on the unfixed code and pass with your
   fix** — same fail→pass discipline. Checks of previously correct behavior may
@@ -79,18 +95,20 @@ test on the function/module/component you edited):
   ticket number (no `test_omni_2812_*.py`, no `OMNI-2812`/`#4458` in symbol names
   or comments). Prefer the observable defect: e.g.
   `test_mid_stream_error_surfaces_as_abort.py`, not `test_omni_2812_*`. This
-  applies to the repro e2e test too — if the file you recovered at `test_path` has
-  a ticket-numbered name or ticket references in code, **rename it and strip the
+  applies to a retained reproduction test too — if its `test_path` has a
+  ticket-numbered name or ticket references in code, **rename it and strip the
   references** as part of the fix (fold the rename into your diff). A reader six
   months from now shouldn't need to chase a ticket to know what the test guards.
   The bug link belongs in the **PR body** (Step 3.4), not in code.
 
 ### 2B.5 — Prove the whole set goes fail→pass
 
-Re-run **every** test in the deliverable — the (possibly rewritten) repro e2e test
-plus your new targeted tests — on the fixed tree. They must all pass. Then confirm
-the transition is real and complete the shared impact assessment for the final
-diff, including its checks of previously correct behavior:
+Run the selected permanent checks on the exact committed candidate, including
+unchanged tests; they do not need a new commit to qualify. Record fail→pass
+proof with the same assertions for the live behavioral bug, plus the required
+preservation checks. Keep the audited reproduction evidence even when its
+source is artifact-only; CI may also rerun the archived original independently.
+Complete the shared impact assessment for the final diff:
 
 - Each live facet has a **fail reason on the unfixed tree** and a **pass on the
   fixed tree** — that pair is the proof.

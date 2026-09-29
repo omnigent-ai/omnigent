@@ -93,11 +93,15 @@ gh auth setup-git   # route git pushes through gh's credential helper with this 
 
 Once the set is genuinely green:
 
-1. **Commit** the fix and the tests on the working branch (the fix builds on the
-   repro branch, so the reproduction test and the fix land in one reviewable
-   diff). Follow the repo's commit conventions.
-   **Never commit workspace artifacts.** The commit must contain only the fix and
-   its reproduction test — nothing else. In particular, **never** stage or commit
+1. **Commit** the fix and selected permanent regression tests on the working
+   branch. Reused unchanged tests need no new commit. Follow the repo's commit
+   conventions. Before removing investigation-only reproduction source, retain
+   its original paths, command, tested revision, result, and source under
+   `.omnigent/repro-evidence/`, or cite the intact CI repro baseline/bundle.
+   Confirm the evidence remains retrievable after the original worktree is gone.
+   Put selected committed tests in `tests` and the selection/evidence location in
+   `test_audit`; no reproduction-only source is required in the PR.
+   **Never commit workspace artifacts.** In particular, **never** stage or commit
    the `recordings/` clips or any `.omnigent/` handoff files (e.g.
    `.omnigent/repro-handoff.json`): recordings are workspace artifacts that ride
    in the PR's Demo section / CI artifact bundle, not in the diff (see

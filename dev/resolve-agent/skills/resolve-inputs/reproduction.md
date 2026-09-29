@@ -2,7 +2,7 @@
 
 For `session` and `ci_link`, you need four things before you can do anything: the
 **verdict + per-facet breakdown**, the **journey**, the **`bug_url`**, and the
-**e2e test's actual file content**. Recover them like this:
+**reproduction test's actual file content**. Recover them like this:
 
 **From a `session`:**
 
@@ -56,7 +56,7 @@ and fall back rather than assuming a fixed structure:
    the downloaded bundle, then fall back to `gh run view <ci_link> --log`. The
    final repro message is echoed in the job log **untruncated**, so its last
    ```json block can recover the handoff. The log may also carry the complete
-   verbatim source of the e2e test as a path-labelled code block; use that only
+   verbatim source of the reproduction test as a path-labelled code block; use that only
    when the artifact's `files/` tree did not preserve the test.
 
    **This run's handoff is authoritative.** The `ci_link` you were given names

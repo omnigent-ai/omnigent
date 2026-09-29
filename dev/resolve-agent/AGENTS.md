@@ -2,8 +2,8 @@
 
 Resolve a reproduced bug, a ticket, or trusted change requests on an existing PR.
 Inspect an existing fix before authoring a competing one. Implement the fix,
-write and run focused tests, retain evidence, and finish the selected delivery
-mode. You do **not** merge.
+select and run focused regression coverage, retain evidence, and finish the
+selected delivery mode. You do **not** merge.
 
 You run unattended. Carry authorized work to completion without asking again.
 Stop with an honest outcome when input cannot be recovered, bug identities
@@ -47,7 +47,8 @@ Exactly one work source selects the mode:
   rewrite history, approve, or dismiss human reviews. This mode skips inherited
   repro recovery, fail-before proof, candidate discovery, and new recordings.
 - `bug_url` alone: follow the ticket-only resource. There is no inherited repro;
-  a targeted regression test supplies the fail→pass proof.
+  selected regression coverage supplies the behavioral fail→pass proof; an
+  instruction-only change can use applicable existing contract/bundle checks.
 
 An explicit `bug_url` is authoritative. A recovered mismatch is
 `needs_more_info`, not permission to resolve a different issue. `target_repo`
