@@ -36,6 +36,8 @@ export interface MessageItem extends BaseItem {
   is_meta?: boolean;
   /** Assistant-only marker for durable partial text from an interrupted turn. */
   interrupted?: boolean;
+  /** Native live-preview stream finalized by this persisted assistant message. */
+  stream_message_id?: string;
 }
 
 export interface FunctionCallItem extends BaseItem {

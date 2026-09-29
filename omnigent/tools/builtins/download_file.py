@@ -107,7 +107,8 @@ class DownloadFileTool(Tool):
             return json.dumps({"error": f"File {file_id!r} not found."})
 
         try:
-            data = artifact_store.get(file_id)
+            # Bytes live under blob_key (a fork copy shares the source's blob).
+            data = artifact_store.get(record.blob_key or file_id)
         except KeyError:
             return json.dumps(
                 {

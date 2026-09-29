@@ -7,13 +7,43 @@ import pytest
 
 from omnigent.onboarding.sandboxes.types import (
     HostContext,
+    RepoWorkspace,
     SandboxCapabilities,
     SandboxCommandError,
     SandboxConfigError,
     SandboxError,
     SandboxInfo,
     SandboxSpec,
+    clone_dir_names,
 )
+
+
+def _repo(url: str, name: str) -> RepoWorkspace:
+    return RepoWorkspace(url=url, branch=None, repo_name=name)
+
+
+def test_clone_dir_names_disambiguates_collisions_by_owner() -> None:
+    """Distinct URLs deriving the same repo_name get owner-qualified dirs; a
+    unique name stays plain (so the single-repo working directory is unchanged)."""
+    repos = [
+        _repo("https://github.com/org-a/api", "api"),
+        _repo("git@github.com:org-b/api.git", "api"),
+        _repo("https://github.com/org-c/web", "web"),
+    ]
+    assert clone_dir_names(repos) == ["org-a__api", "org-b__api", "web"]
+    # A single repo never collides — plain name.
+    assert clone_dir_names([_repo("https://github.com/o/solo", "solo")]) == ["solo"]
+
+
+def test_clone_dir_names_suffixes_residual_collisions() -> None:
+    """If even the owner-qualified name repeats (same owner+name), a numeric
+    suffix guarantees uniqueness so no two repos share a clone directory."""
+    repos = [
+        _repo("https://github.com/org/api", "api"),
+        _repo("https://github.com/org/api", "api"),
+    ]
+    names = clone_dir_names(repos)
+    assert len(set(names)) == 2, names
 
 
 def test_capabilities_defaults() -> None:
@@ -28,6 +58,9 @@ def test_capabilities_defaults() -> None:
     assert caps.file_copy is False
     assert caps.streaming_exec is False
     assert caps.foreground_exec is False
+    # Off by default so a single-repo provider (and every out-of-tree one) is
+    # never handed a multi-repo request; providers opt in explicitly.
+    assert caps.multi_repo is False
 
 
 def test_capabilities_custom() -> None:
@@ -65,7 +98,7 @@ def test_host_context_defaults() -> None:
     assert ctx.host_id == "hid"
     assert ctx.host_name == "hname"
     assert ctx.server_url == "https://srv"
-    assert ctx.repo_url is None
+    assert ctx.repos == []
     assert ctx.on_stage is None
     assert ctx.host_config == {}
 

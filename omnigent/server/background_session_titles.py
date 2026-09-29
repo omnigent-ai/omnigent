@@ -7,7 +7,7 @@ import logging
 import re
 import time
 from collections.abc import Awaitable, Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any
 
 from omnigent.entities.conversation import (
@@ -44,7 +44,7 @@ def _background_session_title_harness_supported(harness: str | None) -> bool:
 
 @dataclass(frozen=True)
 class BackgroundTitleRequest:
-    """Immutable session inputs captured after the first prompt is forwarded."""
+    """Immutable session inputs for isolated title inference."""
 
     session_id: str
     prompt: str
@@ -122,7 +122,7 @@ class RunnerBackgroundTitleGenerator:
 
 
 class BackgroundSessionTitleCoordinator:
-    """Run one guarded title attempt outside the user turn's critical path."""
+    """Coordinate background titles and policy-aware agent rename requests."""
 
     def __init__(
         self,
@@ -145,6 +145,45 @@ class BackgroundSessionTitleCoordinator:
         self._pending: set[asyncio.Task[None]] = set()
         self._scheduled_session_ids: set[str] = set()
         self._scheduled_task_summary_ids: set[str] = set()
+
+    async def format_agent_title(self, request: BackgroundTitleRequest) -> str | None:
+        """Apply configured title requirements without changing the stored title.
+
+        Without custom requirements, the agent's proposed title is used as-is.
+        Generation failures leave the existing title intact rather than falling
+        back to a proposal that may violate the configured format.
+        """
+        if not self._additional_instructions or not self._additional_instructions.strip():
+            return request.prompt
+        request = replace(request, additional_instructions=self._additional_instructions)
+        try:
+            async with asyncio.timeout(self._timeout_seconds), self._generation_slots:
+                return await self._generate_title(request)
+        except Exception:  # noqa: BLE001
+            _logger.warning(
+                "agent session title generation failed session=%s",
+                request.session_id,
+                exc_info=True,
+            )
+            return None
+
+    async def _generate_title(self, request: BackgroundTitleRequest) -> str | None:
+        generated = await asyncio.wait_for(
+            self._generator(request),
+            timeout=self._timeout_seconds,
+        )
+        has_custom_instructions = bool(
+            request.additional_instructions and request.additional_instructions.strip()
+        )
+        return normalize_background_title(
+            generated,
+            max_chars=(
+                CUSTOM_BACKGROUND_TITLE_MAX_CHARS
+                if has_custom_instructions
+                else BACKGROUND_TITLE_MAX_CHARS
+            ),
+            truncate_overflow=has_custom_instructions,
+        )
 
     def schedule(
         self,
@@ -254,23 +293,7 @@ class BackgroundSessionTitleCoordinator:
                         extra={"session_id": request.session_id},
                     )
                     return
-                generated = await asyncio.wait_for(
-                    self._generator(request),
-                    timeout=self._timeout_seconds,
-                )
-            has_custom_instructions = bool(
-                request.additional_instructions and request.additional_instructions.strip()
-            )
-            max_chars = (
-                CUSTOM_BACKGROUND_TITLE_MAX_CHARS
-                if has_custom_instructions
-                else BACKGROUND_TITLE_MAX_CHARS
-            )
-            title = normalize_background_title(
-                generated,
-                max_chars=max_chars,
-                truncate_overflow=has_custom_instructions,
-            )
+                title = await self._generate_title(request)
             if title is None:
                 _logger.info(
                     "background session title skipped session=%s "

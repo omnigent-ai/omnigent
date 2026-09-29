@@ -1,0 +1,19 @@
+spec_version: 1
+name: worker
+description: >
+  Trivial worker child for the spawn_bounds dispatch e2e test. Runs one
+  scripted mock turn and reports done; the test only cares how many of
+  these the parent was allowed to dispatch.
+
+executor:
+  type: omnigent
+  model: mock-child-model
+  config:
+    harness: openai-agents
+
+prompt: |
+  You are a worker. Acknowledge the task you were given and finish.
+
+os_env:
+  type: caller_process
+  cwd: .

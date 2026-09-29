@@ -204,6 +204,7 @@ writing nothing to disk — use HTTPS repository URLs. Details by provider match
 |---|---|
 | `provider` | `kubernetes` (a Job with a fixed 7-day cap) or `agent_sandbox` (an agent-sandbox `Sandbox` that reclaims itself once idle): see [Self-reclaiming sandboxes](#self-reclaiming-sandboxes-provider-agent_sandbox). Both read this same `kubernetes:` block. |
 | `server_url` | URL the runner Pod's host dials back to (in-cluster service DNS by default). |
+| `keep_warm_s` | Optional, top-level under `sandbox:` (`agent_sandbox` only): seconds an idle sandbox stays warm (runner alive) after the last turn before it suspends — the single idle-suspend timing knob. Maps to the in-sandbox `runner.idle_timeout_s` and is authoritative over an explicit one. Unset → ~1h default. See [Watching and tuning the lifecycle](#watching-and-tuning-the-lifecycle). |
 | `host_config` | Optional, top-level under `sandbox:` (provider-agnostic, not inside `kubernetes:`): verbatim in-sandbox `~/.omnigent/config.yaml` content installed before `omnigent host` starts — e.g. a `providers:` block routing the `pi` harness through a self-hosted gateway (LiteLLM/vLLM). Server-managed: entries injected by a previous launch are replaced or removed on the next launch/resume; config created inside the sandbox survives. Keep secrets out via `api_key_ref: env:VAR`, resolved inside the runner Pod against the `secret_name` Secret. Validated at server startup. |
 | `namespace` | Runner-Pod namespace (defaults to `omnigent-sandboxes`). |
 | `secret_name` | Harness-creds Secret projected into every Pod via `envFrom`. |
@@ -252,6 +253,12 @@ Prerequisites:
 1. Install the agent-sandbox controller and its CRDs in the cluster.
 2. The `sandboxes` RBAC rule in `role.yaml` (already applied by this overlay).
 
+To prepare spare Pods before sessions arrive, enable
+[native warm pools](warm-pool/README.md). Warm mode keeps the same credential
+broker and durable Sandbox lifecycle, and adds claim allocation plus an
+explicit `pods/exec` grant for post-allocation activation. The linked guide
+includes template generation, capacity planning, and opt-in deployment validation.
+
 ### Suspend and resume
 
 `shutdownPolicy` is `Retain`, so a lapsed deadline **suspends** the sandbox: the
@@ -263,6 +270,52 @@ Deleting for good stays explicit: deleting the session terminates it, and a
 deployment-wide reaper handles sandboxes abandoned long-term. `kubectl get
 sandbox -n omnigent-sandboxes` shows suspended ones with `Ready=False`,
 `Reason=SandboxExpired`.
+
+### Watching and tuning the lifecycle
+
+**Tune it — one knob.** Set `keep_warm_s` on the sandbox config: how long an idle
+sandbox stays warm (its runner alive, so follow-ups are instant) after the last
+turn. Once that elapses the runner exits and the pod suspends a short window
+later (~5 min), so a sandbox is reclaimed roughly `keep_warm_s` after the agent
+goes quiet:
+
+```yaml
+sandbox:
+  provider: agent_sandbox
+  keep_warm_s: 300      # stay warm 5 min after the last turn, then suspend
+```
+
+It maps directly to the in-sandbox `runner.idle_timeout_s` and is authoritative
+(it wins over an explicit `host_config.runner.idle_timeout_s`). Leave it unset for
+the ~1h default. A short value reclaims aggressively; a follow-up **within**
+`keep_warm_s` is instant, while one sent after it re-wakes the sandbox on the next
+message (the CR + PVC are retained, so the workspace survives). Note the ~5-min
+window tail: a `keep_warm_s` of a few seconds still suspends ~5 min after idle
+(the window trades a longer linger for headroom against reaping a busy sandbox;
+lower it with `OMNIGENT_AGENT_SANDBOX_SHUTDOWN_WINDOW_S` for a faster demo).
+
+**Watch it happen.** The reliable view is the `Sandbox` CR itself:
+
+```bash
+kubectl get sandbox -n omnigent-sandboxes -w
+```
+
+`spec.shutdownTime` marches forward while a runner is live (keepalive), then the
+CR flips to `Ready=False` / `SandboxExpired` and the Pod is torn down when it
+suspends — a *suspend* (resumable, PVC kept), distinct from the deployment-wide
+reaper's hard terminate. The server also logs each keepalive at `INFO` from
+`omnigent.server.managed_host_keepalive` (`kept managed sandbox <id> alive
+(provider <p>)`), but that runs on a background thread and may not surface in
+every logging setup — treat `kubectl get sandbox -w` as the source of truth.
+
+**Advanced (rarely needed).** agent_sandbox refreshes its deadline every ~60s
+under a short ~300s pod-linger window; other managed providers keep a cheaper
+~600s cadence, so agent_sandbox's fast refresh doesn't multiply their write load.
+`OMNIGENT_AGENT_SANDBOX_SHUTDOWN_WINDOW_S` and `OMNIGENT_MANAGED_KEEPALIVE_INTERVAL_S`
+override the window and cadence for experiments (e.g. a faster demo). Keepalive
+runs on its own timer (not the fixed 30s liveness ping), and the create/wake
+deadline is floored at a boot grace so a short window never reaps a still-booting
+Pod.
 
 ### Durable workspace (`OMNIGENT_AGENT_SANDBOX_WORKSPACE_SIZE`)
 
@@ -294,17 +347,19 @@ caches all survive a suspend. Requirements and caveats:
   pre-created, deployment-global, shared, and rejected at/over `$HOME`. Use
   `pvc_mounts` for shared datasets and caches, this for per-session work.
 
-### Warm pools are not usable yet
+### Native warm pools
 
-The extension CRDs (`SandboxWarmPool` / `SandboxClaim`) look like the answer to
-slow image pulls, but they cannot help Omnigent as the API stands: a
-`SandboxClaim` that sets either `env` or `volumeClaimTemplates` is documented
-(and tested upstream) to force a **cold start**, and Omnigent needs both, a
-per-session host identity in `env` and a per-session workspace claim. A warm
-pod's pre-created volumes are also pool-owned and recycled across claims, which
-is not acceptable for sandbox isolation. Pre-pulling the host image onto nodes
-is the workaround until upstream can inject per-claim identity without
-discarding the warm pod.
+Opt in with `sandbox.agent_sandbox.warm_pool`; see the
+[warm-pool guide](warm-pool/README.md). Session identity arrives after allocation,
+and each Sandbox gets its own template-created HOME PVC when durable HOME is
+enabled. Claims need no environment or volume overrides, and allocated
+workspaces are never returned to the spare pool.
+
+An allocated warm Sandbox keeps its original image, mounts, resources, and agent
+classifier. Changing that profile can block wake while preserving the Sandbox
+and PVC. Versioned pools select profiles for new allocations; existing
+allocations are not migrated. Use direct provisioning for new sessions that
+need profile changes across suspension.
 
 ## Persistent storage mounts (`pvc_mounts`)
 

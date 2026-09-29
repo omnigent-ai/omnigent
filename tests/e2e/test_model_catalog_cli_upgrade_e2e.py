@@ -23,6 +23,7 @@ or credentials are needed — only this repo's own server and host daemon.
 
 from __future__ import annotations
 
+import json
 import os
 import socket
 import subprocess
@@ -69,6 +70,20 @@ if "--version" in args:
 model = args[args.index("--model") + 1] if "--model" in args else None
 alias = model if model in ALIASES else "sonnet"
 mid, label = ALIASES[alias]
+if "--input-format" in args:
+    if {legacy}:
+        print("unsupported initialize request", file=sys.stderr)
+        raise SystemExit(2)
+    print(json.dumps({{
+        "type": "control_response",
+        "response": {{
+            "subtype": "success", "request_id": "model-catalog",
+            "response": {{"models": [
+                {{"value": value, "resolvedModel": entry[0], "displayName": entry[1]}}
+                for value, entry in ALIASES.items()
+            ]}},
+        }},
+    }}))
 print(json.dumps({{"type": "system", "subtype": "init", "model": mid}}))
 print(json.dumps({{"type": "result", "result":
     "Usage: /model <name>. Available: sonnet, opus, default, "
@@ -79,7 +94,10 @@ _FAKE_CODEX_TEMPLATE = """#!{python}
 '''Fake Codex CLI build {marker}: an app-server with a fixed model/list.'''
 import asyncio
 import json
+import os
 import sys
+import tomllib
+from pathlib import Path
 
 MODELS = [
     {{"id": "gpt-6-codex", "model": "gpt-6-codex",
@@ -92,6 +110,11 @@ MODELS = [
 async def _serve(listen_url):
     import websockets
 
+    config_path = Path(os.environ["CODEX_HOME"]) / "config.toml"
+    config = tomllib.loads(config_path.read_text()) if config_path.exists() else {{}}
+    catalog_path = config.get("model_catalog_json")
+    models = json.loads(Path(catalog_path).read_text())["models"] if catalog_path else MODELS
+
     host, _, port = listen_url.removeprefix("ws://").partition(":")
 
     async def handler(ws):
@@ -100,11 +123,26 @@ async def _serve(listen_url):
             if "id" not in msg:
                 continue  # notification (e.g. "initialized")
             method = msg.get("method")
+            if {legacy} and (
+                method == "config/read"
+                or (method == "model/list" and "includeHidden" in msg.get("params", {{}}))
+            ):
+                error = (
+                    {{"code": -32600, "message": "unknown variant `config/read`"}}
+                    if method == "config/read"
+                    else {{"code": -32602, "message": "unknown field `includeHidden`"}}
+                )
+                await ws.send(json.dumps({{"id": msg["id"], "error": error}}))
+                continue
             if method == "initialize":
                 result = {{"serverInfo": {{"name": "fake-codex",
                                            "version": "{marker}"}}}}
             elif method == "model/list":
-                result = {{"data": MODELS, "nextCursor": None}}
+                result = {{
+                    "data": [row for row in models if not row.get("hidden")], "nextCursor": None
+                }}
+            elif method == "config/read":
+                result = {{"config": {{"model": config.get("model")}}}}
             else:
                 result = {{}}
             await ws.send(json.dumps({{"id": msg["id"], "result": result}}))
@@ -123,17 +161,21 @@ else:
 """
 
 
-def _write_fake_claude(path: Path, *, version: str, marker: str, gen: int) -> None:
+def _write_fake_claude(
+    path: Path, *, version: str, marker: str, gen: int, legacy: bool = False
+) -> None:
     """(Re)write the fake ``claude`` binary in place, like an auto-update.
 
     :param path: The installed CLI path (constant across builds).
     :param version: The build's ``--version`` answer, e.g. ``"2.1.247"``.
     :param marker: Build marker carried in every model name (``OLD``/``NEW``).
     :param gen: Model generation this build ships, e.g. ``5``.
+    :param legacy: Reject control initialization, exposing only /model help.
     """
     path.write_text(
         _FAKE_CLAUDE_TEMPLATE.format(
             version=version,
+            legacy=legacy,
             sonnet_model=f"claude-sonnet-{gen}-20250929",
             sonnet_label=f"Sonnet {gen} {marker}",
             opus_model=f"claude-opus-{gen}",
@@ -143,13 +185,16 @@ def _write_fake_claude(path: Path, *, version: str, marker: str, gen: int) -> No
     path.chmod(0o755)
 
 
-def _write_fake_codex(path: Path, *, marker: str) -> None:
+def _write_fake_codex(path: Path, *, marker: str, legacy: bool = False) -> None:
     """(Re)write the fake ``codex`` binary in place, like an auto-update.
 
     :param path: The installed CLI path (constant across builds).
     :param marker: Build marker carried in every model name (``OLD``/``NEW``).
+    :param legacy: Reject the optional discovery fields and config/read method.
     """
-    path.write_text(_FAKE_CODEX_TEMPLATE.format(python=sys.executable, marker=marker))
+    path.write_text(
+        _FAKE_CODEX_TEMPLATE.format(python=sys.executable, marker=marker, legacy=legacy)
+    )
     path.chmod(0o755)
 
 
@@ -391,7 +436,8 @@ def _assert_upgrade_refreshed(before: list[str], after: list[str], harness: str)
 
 
 @pytest.mark.timeout(400)
-def test_claude_cli_upgrade_refreshes_model_catalog(tmp_path: Path) -> None:
+@pytest.mark.parametrize("legacy", [False, True], ids=["modern", "legacy"])
+def test_claude_cli_upgrade_refreshes_model_catalog(tmp_path: Path, legacy: bool) -> None:
     """A Claude Code upgrade must re-probe the claude-native model catalog.
 
     Journey: host boots with claude 2.1.247 (models named ``… OLD``) and the
@@ -402,7 +448,7 @@ def test_claude_cli_upgrade_refreshes_model_catalog(tmp_path: Path) -> None:
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     claude = bin_dir / "claude"
-    _write_fake_claude(claude, version="2.1.247", marker="OLD", gen=5)
+    _write_fake_claude(claude, version="2.1.247", marker="OLD", gen=5, legacy=legacy)
 
     with _booted_rig(tmp_path / "rig", bin_dir, {}) as rig:
         rig.start_host()
@@ -422,7 +468,8 @@ def test_claude_cli_upgrade_refreshes_model_catalog(tmp_path: Path) -> None:
 
 
 @pytest.mark.timeout(400)
-def test_codex_cli_upgrade_refreshes_model_catalog(tmp_path: Path) -> None:
+@pytest.mark.parametrize("legacy", [False, True], ids=["modern", "legacy"])
+def test_codex_cli_upgrade_refreshes_model_catalog(tmp_path: Path, legacy: bool) -> None:
     """A Codex CLI upgrade must re-probe the codex-native model catalog.
 
     Same journey as the claude twin — ``codex_catalog_fingerprint`` keys on
@@ -431,7 +478,7 @@ def test_codex_cli_upgrade_refreshes_model_catalog(tmp_path: Path) -> None:
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     codex = bin_dir / "codex"
-    _write_fake_codex(codex, marker="OLD")
+    _write_fake_codex(codex, marker="OLD", legacy=legacy)
 
     with _booted_rig(tmp_path / "rig", bin_dir, {"OMNIGENT_CODEX_PATH": str(codex)}) as rig:
         rig.start_host()
@@ -448,3 +495,43 @@ def test_codex_cli_upgrade_refreshes_model_catalog(tmp_path: Path) -> None:
             after = rig.model_display_names("codex-native", timeout=5.0)
 
     _assert_upgrade_refreshed(before, after, "codex-native")
+
+
+@pytest.mark.timeout(180)
+def test_codex_custom_catalog_changes_refresh_host_picker(tmp_path: Path) -> None:
+    """The host uses configured visible models and re-reads an edited catalog."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    codex = bin_dir / "codex"
+    _write_fake_codex(codex, marker="BUILTIN")
+    source = tmp_path / "codex-source"
+    source.mkdir()
+    catalog = source / "models.json"
+    rows = [
+        {"id": "gateway-first", "displayName": "Configured first", "isDefault": True},
+        {"id": "gateway-default", "displayName": "Configured default"},
+        {"id": "gateway-hidden", "displayName": "Hidden", "hidden": True},
+    ]
+    catalog.write_text(json.dumps({"models": rows}))
+    (source / "config.toml").write_text(
+        'model = "gateway-default"\nmodel_catalog_json = "models.json"\n'
+    )
+    env = {"OMNIGENT_CODEX_PATH": str(codex), "CODEX_HOME": str(source)}
+
+    with _booted_rig(tmp_path / "rig", bin_dir, env) as rig:
+        rig.start_host()
+        names = rig.model_display_names("codex-native", timeout=_CATALOG_TIMEOUT_S)
+        assert names == ["Configured first", "Configured default"]
+        url = f"{rig.base_url}/v1/hosts/{rig.host_id}/harnesses/codex-native/model-options"
+        served = rig._get_json(url)["models"]
+        assert [row["id"] for row in served if row.get("isDefault")] == ["gateway-default"]
+
+        rows[0]["displayName"] = "Configured first updated"
+        rows[2]["hidden"] = False
+        catalog.write_text(json.dumps({"models": rows}))
+        rig.start_host()
+        assert rig.model_display_names("codex-native", timeout=_CATALOG_TIMEOUT_S) == [
+            "Configured first updated",
+            "Configured default",
+            "Hidden",
+        ]

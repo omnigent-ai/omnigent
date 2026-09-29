@@ -71,6 +71,10 @@ class _AsyncPolicyCallable(Protocol):
         raise NotImplementedError
 
 
+# Shared with the translator and handler allowlist.
+BUILD_PATH = f"{__name__}.build"
+
+
 # Maps Omnigent' :class:`Phase` enum to the string literal
 # the legacy callable expects as its ``phase`` argument.
 _PHASE_TO_LEGACY_STR: dict[Phase, str] = {

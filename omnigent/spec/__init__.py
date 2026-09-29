@@ -366,23 +366,12 @@ def _prune_invalid_sub_agents(spec: AgentSpec) -> list[str]:
 
 
 def _reject_unregistered_spec_policy_handlers(spec: AgentSpec) -> None:
-    """Reject function policies whose handler is not registered.
+    """Validate policy handlers throughout a parsed uploaded agent tree.
 
-    Scans a parsed :class:`AgentSpec`'s guardrail policies for
-    :class:`~omnigent.spec.types.FunctionPolicySpec` entries whose
-    ``function.path`` is not in the policy registry. Recurses into
-    ``sub_agents`` — the ``config.yaml`` parser discovers child agents
-    from ``agents/`` subdirectories, each with its own ``guardrails``,
-    and those handlers are resolved + called at engine build just like
-    the root's, so a clean root with a malicious sub-agent would
-    otherwise bypass the upload allowlist. Used on the untrusted
-    agent-bundle upload path only (see :func:`load`).
-
-    :param spec: The parsed agent spec (or sub-agent) to scan.
-    :raises OmnigentError: If a function policy names an unregistered
-        handler, e.g. ``"subprocess.Popen"``.
+    Both bundle formats use the same registry check, including legacy wrappers
+    and policies belonging to nested agents.
     """
-    from omnigent.policies.registry import is_registered_handler
+    from omnigent.policies.registry import function_policy_handler_allowed
 
     guardrails = spec.guardrails
     if guardrails is not None:
@@ -390,7 +379,9 @@ def _reject_unregistered_spec_policy_handlers(spec: AgentSpec) -> None:
             if (
                 isinstance(policy, FunctionPolicySpec)
                 and policy.function is not None
-                and not is_registered_handler(policy.function.path)
+                and not function_policy_handler_allowed(
+                    policy.function.path, policy.function.arguments
+                )
             ):
                 raise OmnigentError(
                     f"Policy {policy.name!r}: handler {policy.function.path!r} is not a "

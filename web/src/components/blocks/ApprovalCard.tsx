@@ -32,6 +32,7 @@
 //      on `POST /v1/sessions/{id}/elicitations/{eid}/resolve`,
 //   3. rolls back to "pending" on network error.
 
+import { useContext } from "react";
 import {
   CheckIcon,
   ClipboardListIcon,
@@ -44,6 +45,7 @@ import {
 } from "lucide-react";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import {
   type AskUserQuestionPayload,
   castAskUserQuestionPayload,
@@ -55,6 +57,7 @@ import { formatPreview } from "@/lib/previewFormat";
 import type { RenderItem } from "@/lib/renderItems";
 import type { CodexPersistMode, RememberScope } from "@/lib/types";
 import { useChatStore } from "@/store/chatStore";
+import { ConversationScopeContext } from "@/components/chat/conversationScope";
 import { AskUserQuestionForm, type AskUserQuestionAnswers } from "./AskUserQuestionForm";
 import {
   type ElicitationAnswers,
@@ -62,6 +65,10 @@ import {
   schemaFields,
 } from "./ElicitationSchemaForm";
 import { ExitPlanModeReview } from "./ExitPlanModeReview";
+
+const AUTO_RESOLVED_DETAIL =
+  "This request was answered outside this view, for example in the " +
+  "agent's own terminal, another tab, or the approve page.";
 
 /**
  * Extract the answer-option labels from an AskUserQuestion-shaped
@@ -204,11 +211,19 @@ export function ApprovalCard({
   codexPersistModes = EMPTY_CODEX_PERSIST_MODES,
   onSubmit,
 }: ApprovalCardProps) {
+  // In a side-chat pane this resolves to the child id, so the verdict targets
+  // the child's elicitation rather than the main conversation's. null (the main
+  // transcript) leaves submitApproval on its active-conversation default.
+  const scopedConversationId = useContext(ConversationScopeContext);
   const submit: SubmitApprovalFn =
     onSubmit ??
     ((id, action, content, meta) => {
       const store = useChatStore.getState();
-      if (meta === undefined) {
+      // Keep the exact call shape for the main chat (no scope); pass the child
+      // id only when scoped so a side-chat verdict targets the child.
+      if (scopedConversationId) {
+        void store.submitApproval(id, action, content, meta, scopedConversationId);
+      } else if (meta === undefined) {
         void store.submitApproval(id, action, content);
       } else {
         void store.submitApproval(id, action, content, meta);
@@ -490,13 +505,17 @@ export function ApprovalCard({
       icon = <ClockIcon className="size-4 text-muted-foreground" />;
       label = "Prompt expired";
     } else if (autoResolved) {
-      // Card was cleared by the chat store when the gated tool's
-      // function_call_output arrived without a UI verdict —
-      // typically because the user approved (or denied) via Claude
-      // Code's TUI prompt directly. We can't know the actual
-      // verdict, so render a neutral pill rather than implying an
-      // accept/reject decision the UI never witnessed.
-      icon = <InfoIcon className="size-4 text-muted-foreground" />;
+      // Verdict unknown here; explain the neutral pill.
+      icon = (
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <span tabIndex={0} className="inline-flex" aria-label={AUTO_RESOLVED_DETAIL}>
+              <InfoIcon className="size-4 text-muted-foreground" />
+            </span>
+          </TooltipTrigger>
+          <TooltipContent className="max-w-72">{AUTO_RESOLVED_DETAIL}</TooltipContent>
+        </Tooltip>
+      );
       label = "Resolved elsewhere";
     } else if (response.action === "cancel") {
       // Dismissed without deciding — neither approved nor rejected.

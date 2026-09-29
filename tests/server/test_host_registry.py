@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 import pytest
 
 from omnigent.db.db_models import workspace_scope
-from omnigent.host.frames import HostHelloFrame
+from omnigent.host.frames import CAP_CODEX_SIDE_CHAT, HostHelloFrame
 from omnigent.server.host_registry import HostRegistry, RunnerExitReports
 
 
@@ -73,6 +73,52 @@ def test_register_and_get() -> None:
     assert fetched.hello.name == "test-host"
 
 
+def test_host_supports_codex_side_chat_by_capability() -> None:
+    """The gate refuses only a connected host that didn't advertise the capability.
+
+    A newer build advertises ``CAP_CODEX_SIDE_CHAT``; an older host omits it
+    (empty capabilities) and is gated out. An offline/unknown host fails OPEN so
+    a host we can't see isn't wrongly declared too old.
+    """
+    registry = HostRegistry()
+
+    def hello_caps(caps: list[str]) -> HostHelloFrame:
+        return HostHelloFrame(
+            version="0.1.0", frame_protocol_version=1, name="h", capabilities=caps
+        )
+
+    registry.register("host_new", FakeWebSocket(), hello_caps([CAP_CODEX_SIDE_CHAT]), owner="a")
+    registry.register("host_old", FakeWebSocket(), hello_caps([]), owner="a")
+
+    assert registry.host_supports_codex_side_chat("host_new") is True
+    assert registry.host_supports_codex_side_chat("host_old") is False
+    # Fail-open: an unknown/offline host isn't declared too old.
+    assert registry.host_supports_codex_side_chat("host_absent") is True
+
+
+def test_interactive_shells_survive_disconnect() -> None:
+    """A runner can outlive its host tunnel without losing the shell snapshot."""
+    registry = HostRegistry()
+    hello = _make_hello()
+    hello.interactive_shells = ["zsh", "invalid", "zsh", "bash"]
+    registry.register("host_shells", FakeWebSocket(), hello, owner="alice")
+    registry.deregister("host_shells")
+
+    assert registry.interactive_shells("host_shells") == ["zsh", "bash"]
+
+
+def test_reconnect_without_shell_inventory_clears_snapshot() -> None:
+    """An older reconnecting host cannot retain a newer host's inventory."""
+    registry = HostRegistry()
+    hello = _make_hello()
+    hello.interactive_shells = ["zsh", "bash"]
+    registry.register("host_shells", FakeWebSocket(), hello, owner="alice")
+
+    registry.register("host_shells", FakeWebSocket(), _make_hello(), owner="alice")
+
+    assert registry.interactive_shells("host_shells") is None
+
+
 def test_deregister() -> None:
     """
     Verify that deregister removes the host from the registry.
@@ -102,6 +148,38 @@ def test_deregister_poisons_outbound_queue() -> None:
 
     assert registry.deregister("host_poison") is True
     assert conn.outbound_queue.get_nowait() is None
+
+
+def test_deregister_fails_pending_import_streams() -> None:
+    """Deregistering fails in-flight import streams instead of leaving them to
+    wait out their 60s per-frame timeout on a tunnel that can never answer."""
+    registry = HostRegistry()
+    conn = registry.register("host_imp", FakeWebSocket(), _make_hello(), owner="bob")
+    queue: asyncio.Queue[tuple[str, dict[str, object]]] = asyncio.Queue()
+    conn.pending_import_local["req_1"] = queue
+
+    assert registry.deregister("host_imp") is True
+
+    kind, data = queue.get_nowait()
+    assert kind == "done"
+    assert data["status"] == "failed"
+    assert "disconnected mid-import" in str(data["error"])
+    assert conn.pending_import_local == {}
+
+
+def test_register_replacement_fails_stale_pending_import_streams() -> None:
+    """A reconnect fails the replaced connection's import streams: the new
+    tunnel has no context for them, so no frame will ever land on their queues."""
+    registry = HostRegistry()
+    old = registry.register("host_imp2", FakeWebSocket(), _make_hello(), owner="bob")
+    queue: asyncio.Queue[tuple[str, dict[str, object]]] = asyncio.Queue()
+    old.pending_import_local["req_1"] = queue
+
+    registry.register("host_imp2", FakeWebSocket(), _make_hello(), owner="bob")
+
+    kind, data = queue.get_nowait()
+    assert kind == "done"
+    assert data["status"] == "failed"
 
 
 def test_deregister_returns_false_for_unknown() -> None:

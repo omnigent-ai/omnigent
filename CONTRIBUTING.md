@@ -138,6 +138,17 @@ uv run --no-sync pyrefly check               # Python type checking (core and cl
 uv run --no-sync pre-commit run --all-files
 ```
 
+The `session-list-visibility` custom rule checks Python, JavaScript/TypeScript,
+and shell clients for explicit visibility on session-list requests. It follows
+local query builders and same-file helpers; direct server tests and mock
+fixtures are excluded so they can exercise the API's compatibility default.
+Install web dependencies (`pnpm install --frozen-lockfile --filter web`) before
+running the full custom lint, then use
+`uv run --no-sync python -m dev.lint.custom_lint`. A request built outside the
+checker's supported patterns needs a `custom-lint: disable=session-list-visibility
+-- <reason>` comment on its request line (or `disable-next` on the preceding
+line), after verifying that its query builder sends visibility.
+
 When touching `web/`:
 
 ```bash
@@ -197,6 +208,31 @@ current checkout is the one you intend to test.
 
 See [`dev/omnidev/README.md`](dev/omnidev/README.md) for log controls,
 clean-state testing, backend-only and LAN modes, and other options.
+
+### Session-list refresh settings
+
+The web and embedded clients share defaults in `web/src/appConfig.ts`.
+`sidebar.mineRefreshMs` defaults to 60,000 ms and `sidebar.sharedRefreshMs`
+to 180,000 ms. Set `VITE_MINE_REFRESH_MS` and `VITE_SHARED_REFRESH_MS` before
+starting Vite or building the frontend to override them with positive integer
+milliseconds, for example:
+
+```bash
+VITE_MINE_REFRESH_MS=120000 VITE_SHARED_REFRESH_MS=300000 pnpm --dir web dev
+```
+
+Each refresh requests the loaded window, capped by `sidebar.maxRefreshSessions`
+(default 200). Up to that cap, the response replaces the window. Beyond it, the
+newest 200 rows replace the refreshed portion and older loaded rows remain.
+Agent discovery reads the first 30 Mine sessions from that cache, adding no
+session-list requests. Agents found only in older or shared sessions are not
+discovered; the built-in `/v1/agents` catalog is still loaded separately.
+
+Pagination still adds 30 rows per request. Mine and Shared results are checked
+against the viewer's ownership metadata in the frontend as well.
+If Load more is clicked during a refresh, the click waits for that refresh,
+then fetches the next 30 using the updated cursor and appends them to the cache.
+Archived refreshes each time it is opened, without scheduled polling.
 
 ### Manual three-terminal fallback
 
@@ -308,17 +344,21 @@ Two cross-cutting suites sit on top of these:
   reserve them for genuine end-to-end behaviour — but a PR that adds new
   user-facing functionality **must** include at least one e2e happy-path test
   (see `.github/copilot-instructions.md`).
+  Frontend-only changes follow the guidance below instead.
 
 ### Frontend (`web/`)
 
 Frontend changes follow the same expectation with a different toolchain:
 
-- Add or update a **colocated Vitest test** — a `*.test.ts`/`*.test.tsx` file
-  next to the component or module you changed — and run it with `pnpm test`.
-- A change to **user-facing UI behaviour** also needs a Playwright test under
-  `tests/e2e_ui/`. This one is enforced mechanically by the `E2E UI Required`
-  check, so a UI PR won't merge without a covering test (or a maintainer
-  waiver) — see `.github/workflows/e2e-ui-required.yml`.
+- Prefer a **colocated Vitest test** — a `*.test.ts`/`*.test.tsx` file next to
+  the component or module you changed — and run it with `pnpm test`.
+  Existing tests count when they already cover the changed behaviour; add or
+  update tests for concrete gaps.
+- Use Playwright tests under `tests/e2e_ui/` for browser behaviour or full user
+  flows that unit or component tests cannot adequately cover. Extend an existing
+  test where practical, and explain what the browser test uniquely verifies.
+  UI changes do not automatically require a new or modified E2E test. The
+  existing E2E UI suite continues to run in CI.
 - Styling/formatting-only changes, copy tweaks with no flow change, and
   refactors with no behaviour change are exempt, same as the backend.
 
@@ -349,6 +389,23 @@ request enforces this, so unsigned commits will block merging.
   "UI / frontend change" box and attach a **video or images** in the `Demo`
   section showing the new behaviour, so reviewers can see it without checking
   out the branch.
+
+### Database migration reviews
+
+Follow the [database best practices](docs/DATABASE_BEST_PRACTICES.md) when
+changing schemas, queries, transactions, or storage code. Polly uses this
+reference in its reviews and treats violations of mandatory requirements as
+blocking findings.
+
+Changes under `omnigent/db/migrations/`, to `omnigent/db/alembic.ini`, or to
+[`.github/CODEOWNERS`](.github/CODEOWNERS) require a GitHub approval from at
+least one of Edwin He (`@Edwinhe03`), Aravind Segu (`@aravind-segu`), Corey
+Zumar (`@dbczumar`), or Bryan Qiu (`@bbqiu`). The reviewer must be someone
+other than the PR author, including for maintainer-authored PRs.
+
+GitHub requests these reviews automatically. The `main-no-force-push` ruleset
+requires code-owner approval and dismisses stale approvals after changes are
+pushed. This requirement is enforced by GitHub alongside the CI checks.
 
 ### Every PR needs an issue
 

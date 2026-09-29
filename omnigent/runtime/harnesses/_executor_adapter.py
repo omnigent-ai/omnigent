@@ -76,6 +76,13 @@ _MCP_TOOL_NAME_PREFIX = "mcp__"
 INTERRUPT_TIMEOUT_S = 3.0
 _INTERRUPT_SLICE_S = 3.0
 
+# Interrupting an executor abandoned by an abnormal exit usually fails because the
+# harness is already gone -- that absence is what abandoned it. Its socket refuses or
+# resets the connection, or the slice expires with nothing left to answer. The reap
+# below still tears the subprocess down and reports its own failures, so these are
+# teardown facts rather than faults. Any other error keeps ERROR.
+_HARNESS_ALREADY_GONE_ERRORS = (TimeoutError, ConnectionError)
+
 # Consecutive orphaned tool callbacks (no active turn context) before forcing a Tier-1 SDK reset.
 # Reset to zero at each ``run_turn`` start so a single late straggler never trips it.
 _ORPHAN_RESYNC_THRESHOLD = 3
@@ -103,6 +110,37 @@ _HOST_TOOL_PREFIX = "sys_os_"
 def _is_host_tool(tool_name: str) -> bool:
     """Return ``True`` for ``sys_os_*`` host-tool-bridge calls (bare or MCP-prefixed)."""
     return _strip_mcp_tool_prefix(tool_name).startswith(_HOST_TOOL_PREFIX)
+
+
+class InnerExecutorError(RuntimeError):
+    """
+    An executor-reported failure that names its own semantic error code.
+
+    Raised by :class:`ExecutorAdapter` when an :class:`ExecutorError` event
+    carries a ``code``, so the terminal ``response.failed`` reports that code,
+    headline and next step instead of the exception class name.
+
+    :param message: Human-readable failure text shown to the user.
+    :param code: Semantic failure code, e.g. ``"databricks_sign_in_pending"``.
+    :param title: Short headline for the error card, or ``None``.
+    :param remediation: Concrete next step for the user, or ``None``.
+    :param undelivered: ``True`` when the harness never received the message.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: str,
+        title: str | None = None,
+        remediation: str | None = None,
+        undelivered: bool = False,
+    ) -> None:
+        super().__init__(message)
+        self.code = code
+        self.title = title
+        self.remediation = remediation
+        self.undelivered = undelivered
 
 
 class ExecutorAdapter(HarnessApp):
@@ -139,8 +177,9 @@ class ExecutorAdapter(HarnessApp):
         # Per-session tracing context; created lazily on first turn and reused across turns.
         self._tracing_ctx: TracingContext | None = None
         # Detached bounded background tasks (abnormal-exit _safe_interrupt). Strongly referenced
-        # until completion; drained on shutdown. Never awaited inline to avoid blocking teardown.
-        self._bg_tasks: set[asyncio.Task[None]] = set()
+        # until completion; drained before recovery and on shutdown.
+        self._bg_tasks: set[asyncio.Task[bool]] = set()
+        self._abandoned_executor_cleanup: asyncio.Task[bool] | None = None
         # Consecutive orphaned-callback counter and reset guard for the Tier-1 SDK watchdog.
         self._orphan_callback_count = 0
         self._resyncing = False
@@ -310,6 +349,7 @@ class ExecutorAdapter(HarnessApp):
                         clean_exit = True
                         return
                     if isinstance(event, ExecutorError):
+                        clean_exit = event.preserve_session
                         if tctx is not None and agent_span is not None:
                             tctx.end_agent_span(
                                 agent_span,
@@ -326,6 +366,17 @@ class ExecutorAdapter(HarnessApp):
                             ctx.provider_usage = event.usage
                         # Guard: empty message surfaces as "inner executor error: " with no detail.
                         detail = event.message or "no detail reported (see runner/harness logs)"
+                        if event.code:
+                            # The executor named the failure: keep its code, headline
+                            # and next step so the card reads as that failure rather
+                            # than as a bare exception class.
+                            raise InnerExecutorError(
+                                detail,
+                                code=event.code,
+                                title=event.title,
+                                remediation=event.remediation,
+                                undelivered=event.undelivered,
+                            )
                         raise RuntimeError(f"inner executor error: {detail}")
         except ElicitationDeclinedError:
             # Fallback for non-SDK executors; SDK-based paths use ctx.cancelled.set() instead.
@@ -366,14 +417,14 @@ class ExecutorAdapter(HarnessApp):
             if self._current_ctx is ctx:
                 self._current_ctx = None
                 self._current_agent = None
-            # On abnormal exit, detach and interrupt the executor synchronously before scheduling
-            # the background reap — a continuation turn must not reuse the abandoned executor.
+            # Detach before background cleanup so a continuation cannot reuse this executor.
             if not clean_exit:
                 abandoned_executor = self._executor
                 self._executor = None
                 interrupt_task = asyncio.create_task(
                     self._safe_interrupt(abandoned_executor, self._session_key)
                 )
+                self._abandoned_executor_cleanup = interrupt_task
                 self._bg_tasks.add(interrupt_task)
                 interrupt_task.add_done_callback(self._bg_tasks.discard)
 
@@ -388,18 +439,34 @@ class ExecutorAdapter(HarnessApp):
             await self._executor.interrupt_session(self._session_key)
         return response
 
-    async def _safe_interrupt(self, executor: Executor | None, session_key: str) -> None:
+    async def _prepare_turn_retry(self) -> bool:
+        """Wait for confirmed teardown without cancelling the background reap."""
+        cleanup = self._abandoned_executor_cleanup
+        return cleanup is not None and await asyncio.shield(cleanup)
+
+    async def _safe_interrupt(self, executor: Executor | None, session_key: str) -> bool:
         """Best-effort bounded interrupt + close of a detached abandoned executor.
 
-        Scheduled (never awaited inline) from run_turn's finally on abnormal exit. The interrupt
+        Scheduled from run_turn's finally and awaited before any recovery retry. The interrupt
         gets a short slice; the reap (close_session + close) always runs under its own budget so
         a wedged interrupt can never starve the subprocess reap.
+
+        An interrupt that only proves the harness is already gone
+        (:data:`_HARNESS_ALREADY_GONE_ERRORS`) logs a warning naming the cause; every other
+        failure stays at ERROR.
         """
         if executor is None:
-            return
+            return True
         try:
             await asyncio.wait_for(
                 executor.interrupt_session(session_key), timeout=_INTERRUPT_SLICE_S
+            )
+        except _HARNESS_ALREADY_GONE_ERRORS as exc:
+            _logger.warning(
+                "abnormal-exit interrupt of inner session %s found the harness already gone (%s)",
+                session_key,
+                type(exc).__name__,
+                exc_info=True,
             )
         except Exception:  # best-effort: a failed/timed-out interrupt is logged, not raised
             _logger.error(
@@ -408,14 +475,25 @@ class ExecutorAdapter(HarnessApp):
                 exc_info=True,
             )
 
-        async def _reap() -> None:
-            with contextlib.suppress(Exception):
+        async def _reap() -> bool:
+            closed = True
+            try:
                 await executor.close_session(session_key)
-            with contextlib.suppress(Exception):
+            except Exception:
+                _logger.exception("abandoned executor close_session failed")
+                closed = False
+            try:
                 await executor.close()
+            except Exception:
+                _logger.exception("abandoned executor close failed")
+                closed = False
+            return closed
 
-        with contextlib.suppress(Exception):
-            await asyncio.wait_for(_reap(), timeout=INTERRUPT_TIMEOUT_S)
+        try:
+            return await asyncio.wait_for(_reap(), timeout=INTERRUPT_TIMEOUT_S)
+        except Exception:
+            _logger.exception("abandoned executor teardown failed or timed out")
+            return False
 
     async def _maybe_resync_on_orphan(self, *, force: bool = False) -> None:
         """Tier-1 SDK reset after repeated orphan callbacks (or immediately when ``force=True``).
@@ -513,6 +591,8 @@ class ExecutorAdapter(HarnessApp):
         self,
         tool_name: str,
         args: dict[str, Any],
+        *,
+        call_id: str | None = None,
     ) -> dict[str, Any]:
         """Bridge installed once on the executor; dispatches tool calls into the current turn ctx.
 
@@ -539,11 +619,13 @@ class ExecutorAdapter(HarnessApp):
                 "error": "no active turn context for tool dispatch",
                 "code": "runner_turn_context_desync",
             }
-        # Pop the queued tool_use_id so the dispatch reuses the observed event's call_id.
-        # The callback receives bare names (MCP wrapper strips the prefix), so we pop
-        # unconditionally — non-MCP paths don't populate the queue.
-        correlated_call_id: str | None = None
-        if self._pending_mcp_call_ids:
+        # Explicit IDs survive callbacks arriving before, or out of order with,
+        # stdout observations. SDKs without callback IDs retain FIFO correlation.
+        correlated_call_id = call_id
+        if call_id:
+            with contextlib.suppress(ValueError):
+                self._pending_mcp_call_ids.remove(call_id)
+        elif self._pending_mcp_call_ids:
             correlated_call_id = self._pending_mcp_call_ids.popleft()
         # Allocate id here to record in _dispatched_call_ids; matching ToolCallComplete
         # is suppressed in _translate_event (dispatch_tool already emits its output).
@@ -739,6 +821,10 @@ class ExecutorAdapter(HarnessApp):
             # so the post-stream dispatch reuses the same call_id for deduplication.
             # Emit bare names (strip MCP prefix) to match the Omnigent wire shape.
             tool_use_id = _call_id_from_metadata(event.metadata)
+            if tool_use_id in self._dispatched_call_ids:
+                # Dispatch already owns this card; a late observation must not
+                # downgrade it or queue an ID for a different tool.
+                return
             # Observed native tools already ran inside their harness. They must
             # never enter the queue consumed by Omnigent's dispatch bridge.
             if tool_use_id is not None and event.metadata.get("internally_executed") is not True:
@@ -781,7 +867,11 @@ class ExecutorAdapter(HarnessApp):
             # (unpaiable — they'd render a ghost card). Internally-run tools (e.g. antigravity)
             # stamp real ids and are the sole output source; they must not be suppressed.
             call_id = _call_id_from_metadata(getattr(event, "metadata", None)) or ""
-            if not call_id or call_id in self._dispatched_call_ids:
+            if not call_id:
+                return
+            if call_id in self._dispatched_call_ids:
+                self._observed_tool_calls.pop(call_id, None)
+                self._pr_tool_calls.pop(call_id, None)
                 return
             # A live observed call cached at ToolCallRequest is re-emitted here as a
             # durable COMPLETED function_call so it survives reload — the in_progress
@@ -903,8 +993,25 @@ class ExecutorAdapter(HarnessApp):
         Unknown types fall back to base class (``type(exception).__name__``).
         """
         from omnigent.errors import OmnigentError
+        from omnigent.inner.model_auth import ProviderAuthRequired
         from omnigent.server.schemas import ErrorDetail
 
+        if isinstance(exception, ProviderAuthRequired):
+            return ErrorDetail(
+                code=exception.code,
+                message=str(exception),
+                title=exception.title,
+                cause=exception.cause,
+                remediation=exception.remediation,
+            )
+        if isinstance(exception, InnerExecutorError):
+            return ErrorDetail(
+                code=exception.code,
+                message=str(exception),
+                title=exception.title,
+                remediation=exception.remediation,
+                undelivered=True if exception.undelivered else None,
+            )
         if isinstance(exception, OmnigentError):
             return ErrorDetail(code=exception.code, message=str(exception))
 
@@ -1170,7 +1277,7 @@ def _extract_role_keyed_messages(
     """Extract role-keyed message items from an Omnigent input list.
 
     Tool-call items (function_call, function_call_output, etc.) are skipped — the inner SDK
-    reconstructs them from its own Layer 1 state. Returns empty list for non-history inputs.
+    reconstructs its own tool state. Returns an empty list for non-history inputs.
     """
     messages: list[Message] = []
     for item in input_value:

@@ -61,6 +61,7 @@ import {
 } from "./conversationItems";
 import { nativePolicyNameForAgentName } from "./nativeCodingAgents";
 import { routingExtrasFromWire } from "./routingDecision";
+import { taskNotificationMarkerContent } from "./systemMessage";
 
 // Claude built-ins whose call is a question TO the user rather than work
 // the agent did on its own. The elicitation that carried the card is
@@ -90,6 +91,7 @@ const ANSWER_SEPARATOR = '"="';
 export function itemsToBlocks(items: ConversationItem[]): AnyBlock[] {
   const blocks: AnyBlock[] = [];
   const outputs = toolOutputsByCallId(items);
+  const agents = agentNamesByResponseId(items);
   for (const item of items) {
     if (!item.response_id) continue;
     if (isSlashCommandItem(item)) {
@@ -100,10 +102,33 @@ export function itemsToBlocks(items: ConversationItem[]): AnyBlock[] {
       const card = answeredElicitationBlock(item, outputs.get(item.call_id));
       if (card !== null) blocks.push(card);
     }
-    const block = itemToBlock(item);
+    const block = itemToBlock(item, agents.get(item.response_id));
     if (block !== null) blocks.push(block);
   }
   return blocks;
+}
+
+function agentNamesByResponseId(items: ConversationItem[]): Map<string, string | null> {
+  const agents = new Map<string, string | null>();
+  for (const item of items) {
+    if (
+      !item.response_id ||
+      !(
+        (isMessageItem(item) && item.role === "assistant") ||
+        isFunctionCallItem(item) ||
+        isReasoningItem(item)
+      )
+    ) {
+      continue;
+    }
+    const name = item.model?.trim();
+    if (!name) continue;
+    const previous = agents.get(item.response_id);
+    // A model id on routing/compaction items is not an agent identity. Multiple
+    // speakers in one response are also insufficient to attribute its error.
+    agents.set(item.response_id, previous === undefined || previous === name ? name : null);
+  }
+  return agents;
 }
 
 function toolOutputsByCallId(items: ConversationItem[]): Map<string, string> {
@@ -213,7 +238,18 @@ function answersFromToolResult(
   return answers;
 }
 
-function itemToBlock(item: ConversationItem): AnyBlock | null {
+function itemToBlock(item: ConversationItem, agentName?: string | null): AnyBlock | null {
+  if (isMessageItem(item) && item.role === "user") {
+    // Claude Code's background-task wake: the CLI injects a
+    // `<task-notification>` user entry (mirrored with `is_meta`) and
+    // starts a new turn on it. Render it as a muted system marker so the
+    // answer it interrupts keeps its own bubble instead of folding into
+    // the follow-up work's "Worked for" row.
+    const marker = taskNotificationMarkerContent(item.content);
+    if (marker !== null) {
+      return { ...userMessageToBlock(item), content: marker };
+    }
+  }
   if (isMessageItem(item) && item.is_meta === true) {
     return null;
   }
@@ -222,7 +258,7 @@ function itemToBlock(item: ConversationItem): AnyBlock | null {
     // after /compact. It starts with a distinctive prefix and is
     // part of the model's context (needed for resume) but should
     // not be shown as a chat bubble in the web UI.
-    if (isCompactionSummaryMessage(item) || isClaudeTaskNotificationMessage(item)) {
+    if (isCompactionSummaryMessage(item)) {
       return null;
     }
     return userMessageToBlock(item);
@@ -237,7 +273,7 @@ function itemToBlock(item: ConversationItem): AnyBlock | null {
     return functionCallOutputToBlock(item);
   }
   if (isErrorItem(item)) {
-    return errorToBlock(item);
+    return errorToBlock(item, agentName);
   }
   if (isReasoningItem(item)) {
     return reasoningToBlock(item);
@@ -271,23 +307,6 @@ function isCompactionSummaryMessage(item: MessageItem): boolean {
   for (const block of item.content) {
     if (block.type === "input_text" && typeof block.text === "string") {
       if (block.text.startsWith(prefix)) {
-        return true;
-      }
-    }
-  }
-  return false;
-}
-
-// Hide legacy Claude Task notifications persisted before the bridge marked them meta.
-function isClaudeTaskNotificationMessage(item: MessageItem): boolean {
-  const requiredMarkers = ["<task-notification>", "<task-id>", "</task-notification>"];
-  for (const block of item.content) {
-    if (block.type === "input_text" && typeof block.text === "string") {
-      const text = block.text.trimStart();
-      if (
-        text.startsWith("<task-notification>") &&
-        requiredMarkers.every((marker) => text.includes(marker))
-      ) {
         return true;
       }
     }
@@ -365,7 +384,7 @@ function functionCallOutputToBlock(item: FunctionCallOutputItem): ToolResultBloc
   };
 }
 
-function errorToBlock(item: ErrorItem): ErrorBlock {
+function errorToBlock(item: ErrorItem, agentName?: string | null): ErrorBlock {
   return {
     type: "error",
     ctx: ctxFor(item),
@@ -373,7 +392,7 @@ function errorToBlock(item: ErrorItem): ErrorBlock {
     code: item.code,
     message: item.message,
     ...(item.level ? { level: item.level } : {}),
-    ...structuredErrorFields(item),
+    ...structuredErrorFields(item, agentName),
   };
 }
 

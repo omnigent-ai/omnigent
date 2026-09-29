@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { parseEvent, withStallGuard } from "./sse";
 import type {
   ElicitationResolved,
+  MessageDone,
   ReasoningDone,
   SessionStatusEvent,
   SessionSupersededEvent,
@@ -82,6 +83,29 @@ describe("withStallGuard", () => {
   });
 });
 
+describe("parseEvent — response.failed", () => {
+  const response = {
+    id: "resp_failed",
+    status: "failed",
+    model: "polly",
+    error: { code: "ValueError", message: "The harness failed." },
+  };
+
+  it("preserves the failure source alongside the response's agent identity", () => {
+    expect(parseEvent("response.failed", { source: "harness", response })).toMatchObject({
+      type: "response_failed",
+      source: "harness",
+      response,
+    });
+  });
+
+  it("does not invent a source when the server omits it", () => {
+    const event = parseEvent("response.failed", { response });
+    expect(event).toMatchObject({ type: "response_failed", response });
+    expect(event).not.toHaveProperty("source");
+  });
+});
+
 describe("parseEvent — response.output_text.delta", () => {
   it("parses a plain delta with no streaming identifiers", () => {
     // Ordinary in-process task streaming: only `delta` is present, and
@@ -136,6 +160,27 @@ describe("parseEvent — response.output_text.delta", () => {
 
   it("returns null when delta is not a string", () => {
     expect(parseEvent("response.output_text.delta", { delta: { text: "bad" } })).toBeNull();
+  });
+});
+
+describe("parseEvent — response.output_item.done (message)", () => {
+  it("carries the native preview id finalized by the item", () => {
+    const ev = parseEvent("response.output_item.done", {
+      message_id: "codex:thread_1:turn_1:agentMessage:item_1",
+      item: {
+        id: "it_1",
+        type: "message",
+        response_id: "resp_1",
+        content: [{ type: "output_text", text: "done" }],
+      },
+    });
+    expect(ev).toEqual({
+      type: "message_done",
+      content: [{ type: "output_text", text: "done" }],
+      itemId: "it_1",
+      responseId: "resp_1",
+      messageId: "codex:thread_1:turn_1:agentMessage:item_1",
+    } satisfies MessageDone);
   });
 });
 

@@ -164,6 +164,7 @@ class DispatchCapability:
 # child workflow that recovers on a different process will not find
 # the entry and must surface a clear error rather than silently
 # dispatching on stale state.
+# custom-lint: disable-next=workspace-scoped-cache -- process-local task_id
 _dispatch_capabilities: dict[str, DispatchCapability] = {}
 
 

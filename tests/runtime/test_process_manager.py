@@ -11,6 +11,7 @@ without launching real runner subprocesses.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import httpx
@@ -19,6 +20,7 @@ import pytest
 from omnigent.runner.identity import RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR
 from omnigent.runtime.harnesses.process_manager import (
     HarnessProcessManager,
+    _acp_startup_config,
     _build_harness_spawn_env,
     _HarnessEndpoint,
     _model_env_key,
@@ -33,8 +35,10 @@ class _AliveProc:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("harness", ["claude-sdk", "acp"])
 async def test_get_client_respawns_only_when_model_changes(
     monkeypatch: pytest.MonkeyPatch,
+    harness: str,
 ) -> None:
     """``get_client`` respawns iff a concrete different model is requested.
 
@@ -76,7 +80,7 @@ async def test_get_client_respawns_only_when_model_changes(
     monkeypatch.setattr(pm, "_spawn_entry", _fake_spawn)
     monkeypatch.setattr(pm, "_close_entry", _fake_close)
 
-    conv, harness = "conv_x", "claude-sdk"
+    conv = "conv_x"
     key = _model_env_key(harness)  # HARNESS_CLAUDE_SDK_MODEL
 
     await pm.get_client(conv, harness, env={key: "claude-opus-4-6"})  # spawn opus
@@ -99,10 +103,12 @@ async def test_get_client_respawns_only_when_model_changes(
 
 
 @pytest.mark.asyncio
-async def test_qwen_model_change_keeps_live_acp_process(
+@pytest.mark.parametrize("harness", ["qwen", "acp"])
+async def test_live_acp_model_change_keeps_process(
     monkeypatch: pytest.MonkeyPatch,
+    harness: str,
 ) -> None:
-    """Qwen applies model changes through ACP session config without respawning."""
+    """ACP applies model changes through session config without respawning."""
     pm = HarnessProcessManager()
     pm._started = True
     spawns: list[str | None] = []
@@ -116,18 +122,76 @@ async def test_qwen_model_change_keeps_live_acp_process(
             endpoint=_HarnessEndpoint(socket_path=Path("/tmp/fake-qwen.sock")),
             harness=harness,
             model=model,
+            acp_config=_acp_startup_config(env) if harness == "acp" else None,
         )
 
     monkeypatch.setattr(pm, "_spawn_entry", _fake_spawn)
-    key = _model_env_key("qwen")
+    key = _model_env_key(harness)
 
-    await pm.get_client("conv_qwen", "qwen", env={key: "qwen-turbo"})
-    await pm.get_client("conv_qwen", "qwen", env={key: "qwen-plus"})
+    env = {"HARNESS_ACP_MODEL_LIST": "model-a,model-b"} if harness == "acp" else {}
+    await pm.get_client("conv_acp", harness, env={**env, key: "model-a"})
+    await pm.get_client("conv_acp", harness, env={**env, key: "model-b"})
 
-    assert spawns == ["qwen-turbo"]
-    entry = pm._entries.get("conv_qwen")
+    assert spawns == ["model-a"]
+    entry = pm._entries.get("conv_acp")
     if entry is not None:
         await entry.client.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("key", "changed_value"),
+    [
+        ("HARNESS_ACP_COMMAND", "another-agent --acp"),
+        ("HARNESS_ACP_MODEL_LIST", "model-a,model-c"),
+        ("HARNESS_ACP_DEFAULT_MODEL", "model-b"),
+        ("HARNESS_ACP_ENV_UNSET", "OPENAI_API_KEY"),
+        ("HARNESS_ACP_MODEL_LIST", None),
+    ],
+)
+async def test_acp_startup_config_change_restarts_process(
+    monkeypatch: pytest.MonkeyPatch, key: str, changed_value: str | None
+) -> None:
+    """Commands, curation, defaults, and credential exclusions cannot change in a cached child."""
+    pm = HarnessProcessManager()
+    pm._started = True
+
+    async def fake_spawn(conv: str, harness: str, env: dict[str, str] | None) -> _SubprocessEntry:
+        return _SubprocessEntry(
+            process=_AliveProc(),
+            client=httpx.AsyncClient(),
+            endpoint=_HarnessEndpoint(socket_path=Path("/tmp/fake-acp.sock")),
+            harness=harness,
+            model=(env or {}).get(_model_env_key(harness)),
+            acp_config=_acp_startup_config(env),
+        )
+
+    async def fake_close(entry: _SubprocessEntry) -> None:
+        await entry.client.aclose()
+
+    monkeypatch.setattr(pm, "_spawn_entry", fake_spawn)
+    monkeypatch.setattr(pm, "_close_entry", fake_close)
+    env = {
+        "HARNESS_ACP_COMMAND": "agent --acp",
+        "HARNESS_ACP_MODEL_LIST": "model-a,model-b",
+        "HARNESS_ACP_DEFAULT_MODEL": "model-a",
+        "HARNESS_ACP_MODEL": "model-a",
+    }
+    first = await pm.get_client("conv_acp", "acp", env=env)
+    assert await pm.get_client("conv_acp", "any") is first
+    assert await pm.get_client("conv_acp", "acp", env=env) is first
+    changed_env = dict(env)
+    if changed_value is None:
+        changed_env.pop(key)
+    else:
+        changed_env[key] = changed_value
+    second = await pm.get_client("conv_acp", "acp", env=changed_env)
+    try:
+        assert second is not first
+        assert first.is_closed
+        assert await pm.get_client("conv_acp", "acp", env=changed_env) is second
+    finally:
+        await second.aclose()
 
 
 def test_build_harness_spawn_env_strips_binding_token_with_overrides(
@@ -179,3 +243,27 @@ def test_build_harness_spawn_env_strips_binding_token_without_overrides(
     assert RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR not in env
     assert "bug-binding-token-secret" not in env.values()  # not leaked under another key
     assert env["PATH_MARKER_FOR_TEST"] == "marker-value"
+
+
+@pytest.mark.parametrize("with_overrides", [False, True])
+def test_build_harness_spawn_env_keeps_desktop_session_in_runner(
+    monkeypatch: pytest.MonkeyPatch, with_overrides: bool
+) -> None:
+    session_env = {
+        "DBUS_SESSION_BUS_ADDRESS": "unix:path=/run/user/1000/bus",
+        "XDG_RUNTIME_DIR": "/run/user/1000",
+    }
+    monkeypatch.setattr(os, "environ", {**session_env, "XDG_CONFIG_HOME": "/home/test/.config"})
+    overrides = {**session_env, "HARNESS_CODEX_GATEWAY_AUTH_COMMAND": "printf %s test-key"}
+
+    env = _build_harness_spawn_env(overrides if with_overrides else None)
+
+    if with_overrides:
+        assert {name: env[name] for name in session_env} == session_env
+    else:
+        assert session_env.keys().isdisjoint(env)
+    assert env["XDG_CONFIG_HOME"] == "/home/test/.config"
+    assert {name: os.environ[name] for name in session_env} == session_env
+    assert {name: overrides[name] for name in session_env} == session_env
+    if with_overrides:
+        assert env["HARNESS_CODEX_GATEWAY_AUTH_COMMAND"] == "printf %s test-key"

@@ -161,6 +161,11 @@ def use_error_with_usage(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.fixture
+def use_provider_auth_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MOCK_EXECUTOR_SCRIPT", "provider_auth_failure")
+
+
+@pytest.fixture
 def use_cancelled(monkeypatch: pytest.MonkeyPatch) -> None:
     """MockExecutor that yields a provider-side TurnCancelled."""
     monkeypatch.setenv("MOCK_EXECUTOR_SCRIPT", "cancelled")
@@ -409,6 +414,60 @@ async def test_executor_error_terminates_with_response_failed(
     assert "mock error" in error_detail["message"]
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("preserve_session", [False, True])
+async def test_executor_error_preserves_only_explicitly_idle_sessions(
+    preserve_session: bool,
+) -> None:
+    """Ordinary errors still tear down; pre-prompt failures can retain an idle executor."""
+    import asyncio
+    from unittest.mock import AsyncMock, Mock
+
+    from omnigent.inner.executor import ExecutorError, MockExecutor, TextChunk
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.runtime.harnesses._scaffold import TurnContext
+    from omnigent.server.schemas import CreateResponseRequest
+
+    executor = MockExecutor()
+    error = ExecutorError(message="model unavailable", retryable=True)
+    if preserve_session:
+        error.preserve_session = True
+        executor.enqueue_events([error])
+    else:
+        executor.enqueue_events([TextChunk(text="partial response"), error])
+    executor.interrupt_session = AsyncMock(return_value=True)
+    executor.close_session = AsyncMock()
+    executor.close = AsyncMock()
+    factory = Mock(return_value=executor)
+    adapter = ExecutorAdapter(executor_factory=factory)
+    request = CreateResponseRequest(model="test-agent", input="hello")
+    ctx = TurnContext(
+        response_id="resp_failed", event_queue=asyncio.Queue(), cancelled=asyncio.Event()
+    )
+
+    with pytest.raises(RuntimeError, match="model unavailable"):
+        await adapter.run_turn(request, ctx)
+
+    if preserve_session:
+        assert adapter._executor is executor
+        assert adapter._abandoned_executor_cleanup is None
+        executor.interrupt_session.assert_not_awaited()
+        executor.close.assert_not_awaited()
+        executor.enqueue_response("retried")
+        retry_ctx = TurnContext(
+            response_id="resp_retry", event_queue=asyncio.Queue(), cancelled=asyncio.Event()
+        )
+        await adapter.run_turn(request, retry_ctx)
+        factory.assert_called_once()
+    else:
+        assert adapter._executor is None
+        assert adapter._abandoned_executor_cleanup is not None
+        await adapter._abandoned_executor_cleanup
+        executor.interrupt_session.assert_awaited_once()
+        executor.close_session.assert_awaited_once()
+        executor.close.assert_awaited_once()
+
+
 async def test_executor_error_usage_reaches_response_failed(
     use_error_with_usage: None,
     manager: HarnessProcessManager,
@@ -444,6 +503,39 @@ async def test_executor_error_usage_reaches_response_failed(
     assert events[-1].data["response"]["error"] is not None
 
 
+async def test_provider_auth_required_survives_adapter_and_sse_envelope(
+    use_provider_auth_failure: None,
+    manager: HarnessProcessManager,
+) -> None:
+    conv_id = "conv_provider_auth"
+    client = await manager.get_client(conv_id, _TEST_HARNESS_NAME)
+    events: list[_ParsedSSEEvent] = []
+    async with client.stream(
+        "POST", f"/v1/sessions/{conv_id}/events", json=_start_turn_body()
+    ) as response:
+        async for event in _stream_iter(response):
+            events.append(event)
+
+    assert events[-1].event == "response.failed"
+    error = events[-1].data["response"]["error"]
+    assert error == {
+        "code": "PROVIDER_AUTH_REQUIRED",
+        "message": (
+            "Provider authentication required for host "
+            "https://workspace.cloud.databricks.com and profile agent-profile. "
+            "Run `ucode configure` or `databricks auth login --host "
+            "https://workspace.cloud.databricks.com --profile agent-profile`, then Retry."
+        ),
+        "title": "Databricks authentication required",
+        "cause": (
+            "Databricks authentication for the selected workspace/profile is missing or expired."
+        ),
+        "remediation": "ucode configure",
+    }
+    assert "stderr" not in str(error).lower()
+    assert "token" not in str(error).lower()
+
+
 async def test_turn_cancelled_terminates_with_response_cancelled(
     use_cancelled: None,
     manager: HarnessProcessManager,
@@ -470,6 +562,84 @@ async def test_turn_cancelled_terminates_with_response_cancelled(
 
 
 # ── Error-code classification ──────────────────────────────────
+
+
+def test_build_error_detail_keeps_inner_executor_error_fields() -> None:
+    """
+    An executor that names its failure (``ExecutorError.code``) is raised as
+    :class:`InnerExecutorError`; the detail keeps that code plus the headline
+    and next step, so the web card reads as that failure instead of as a bare
+    ``RuntimeError``.
+    """
+    from omnigent.runtime.harnesses._executor_adapter import (
+        ExecutorAdapter,
+        InnerExecutorError,
+    )
+
+    adapter = ExecutorAdapter(executor_factory=lambda: _StubExecutor())
+    error = InnerExecutorError(
+        "Codex is waiting for a sign-in in this session's terminal.",
+        code="databricks_sign_in_pending",
+        title="Codex can't start until you sign in to Databricks",
+        remediation="Open https://signin.example.com/device and enter code HQ7M-2KPD.",
+        undelivered=True,
+    )
+    detail = adapter._build_error_detail(error)
+
+    assert detail.code == "databricks_sign_in_pending"
+    # The relay settles the queued message only on a failure before delivery.
+    assert detail.undelivered is True
+    assert detail.message == "Codex is waiting for a sign-in in this session's terminal."
+    assert detail.title == "Codex can't start until you sign in to Databricks"
+    assert detail.remediation is not None
+    assert "HQ7M-2KPD" in detail.remediation
+
+
+@pytest.mark.asyncio
+async def test_coded_executor_error_is_raised_with_its_code() -> None:
+    """
+    An ``ExecutorError`` that names its failure surfaces as
+    :class:`InnerExecutorError` carrying that code, headline and next step,
+    with the executor's own sentence as the message (no "inner executor
+    error:" prefix). An uncoded error keeps today's generic wrap.
+    """
+    import asyncio
+
+    from omnigent.inner.executor import ExecutorError, MockExecutor
+    from omnigent.runtime.harnesses._executor_adapter import (
+        ExecutorAdapter,
+        InnerExecutorError,
+    )
+    from omnigent.runtime.harnesses._scaffold import TurnContext
+    from omnigent.server.schemas import CreateResponseRequest
+
+    executor = MockExecutor()
+    executor.enqueue_events(
+        [
+            ExecutorError(
+                message="Codex is waiting for a sign-in in this session's terminal.",
+                code="databricks_sign_in_pending",
+                title="Codex can't start until you sign in to Databricks",
+                remediation="Open https://signin.example.com/device and enter code HQ7M-2KPD.",
+                undelivered=True,
+            )
+        ]
+    )
+    adapter = ExecutorAdapter(executor_factory=lambda: executor)
+    request = CreateResponseRequest(model="test-agent", input="hello")
+    ctx = TurnContext(
+        response_id="resp_coded", event_queue=asyncio.Queue(), cancelled=asyncio.Event()
+    )
+
+    with pytest.raises(InnerExecutorError) as raised:
+        await adapter.run_turn(request, ctx)
+
+    assert str(raised.value) == "Codex is waiting for a sign-in in this session's terminal."
+    assert raised.value.code == "databricks_sign_in_pending"
+    assert raised.value.title == "Codex can't start until you sign in to Databricks"
+    assert raised.value.remediation is not None
+    assert "HQ7M-2KPD" in raised.value.remediation
+    assert raised.value.undelivered is True
 
 
 def test_build_error_detail_uses_omnigent_error_code() -> None:

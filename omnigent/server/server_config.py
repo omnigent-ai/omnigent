@@ -186,6 +186,91 @@ def copy_total_bytes_limit() -> int:
     return _config_positive_int("copy_max_total_bytes", MAX_COPY_TOTAL_BYTES)
 
 
+def image_compression_concurrency() -> int:
+    """Max concurrent image uploads that materialize + decode in memory.
+
+    Bounds server peak upload memory (each holds up to the image cap in raw
+    bytes plus a decoded bitmap). Config key ``image_compression_concurrency``;
+    defaults to
+    :data:`omnigent.runtime.content_resolver.MAX_IMAGE_COMPRESSION_CONCURRENCY`.
+    Raise it on instances with more memory headroom.
+    """
+    from omnigent.runtime.content_resolver import MAX_IMAGE_COMPRESSION_CONCURRENCY
+
+    return _config_positive_int("image_compression_concurrency", MAX_IMAGE_COMPRESSION_CONCURRENCY)
+
+
+def filesystem_attachment_upload_limit() -> int:
+    """Max byte size of a single filesystem attachment.
+
+    Config key ``filesystem_attachment_max_bytes``; defaults to
+    :data:`omnigent.inner.native_attachments.MAX_FILESYSTEM_ATTACHMENT_UPLOAD_BYTES`.
+    """
+    from omnigent.inner.native_attachments import MAX_FILESYSTEM_ATTACHMENT_UPLOAD_BYTES
+
+    return _config_positive_int(
+        "filesystem_attachment_max_bytes", MAX_FILESYSTEM_ATTACHMENT_UPLOAD_BYTES
+    )
+
+
+def filesystem_attachment_file_limit() -> int:
+    """Max number of filesystem attachments one session may hold.
+
+    Config key ``filesystem_attachment_max_files``; defaults to
+    :data:`omnigent.inner.native_attachments.MAX_SESSION_FILESYSTEM_ATTACHMENTS`.
+    """
+    from omnigent.inner.native_attachments import MAX_SESSION_FILESYSTEM_ATTACHMENTS
+
+    return _config_positive_int(
+        "filesystem_attachment_max_files", MAX_SESSION_FILESYSTEM_ATTACHMENTS
+    )
+
+
+def filesystem_attachment_total_bytes_limit() -> int:
+    """Max summed bytes of filesystem attachments per session.
+
+    Config key ``filesystem_attachment_max_total_bytes``; defaults to
+    :data:`omnigent.inner.native_attachments.MAX_SESSION_FILESYSTEM_ATTACHMENT_BYTES`.
+    """
+    from omnigent.inner.native_attachments import MAX_SESSION_FILESYSTEM_ATTACHMENT_BYTES
+
+    return _config_positive_int(
+        "filesystem_attachment_max_total_bytes", MAX_SESSION_FILESYSTEM_ATTACHMENT_BYTES
+    )
+
+
+def filesystem_attachment_denied_extensions() -> frozenset[str]:
+    """Extensions a deployment refuses to materialize, beyond the allowlist.
+
+    Config key ``filesystem_attachment_denied_extensions``, a list of
+    extensions with or without the leading dot (``[".zip", "docx"]``).
+    Lets an operator narrow the built-in allowlist (e.g. deny archives
+    while still accepting office documents) without a code change.
+    Unparseable entries are skipped rather than failing the upload path.
+    """
+    raw = load_server_config().get("filesystem_attachment_denied_extensions")
+    if raw is None:
+        return frozenset()
+    if not isinstance(raw, list):
+        logger.warning(
+            "server config filesystem_attachment_denied_extensions=%r is not a list, ignoring",
+            raw,
+        )
+        return frozenset()
+    denied: set[str] = set()
+    for entry in raw:
+        if not isinstance(entry, str) or not entry.strip():
+            logger.warning(
+                "server config filesystem_attachment_denied_extensions entry %r is not a "
+                "non-empty string, skipping",
+                entry,
+            )
+            continue
+        value = entry.strip().lower()
+        denied.add(value if value.startswith(".") else f".{value}")
+    return frozenset(denied)
+
+
 def _branding_section(config: Mapping[str, Any]) -> Mapping[str, Any]:
     """Return the ``branding:`` mapping, or ``{}`` when absent/not a map."""
     section = config.get("branding")

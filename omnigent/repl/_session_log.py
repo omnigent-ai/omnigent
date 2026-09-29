@@ -61,8 +61,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from omnigent_client import OmnigentClient
+from omnigent_client import StaleCursorError as ClientStaleCursorError
 from omnigent_ui_sdk import state_dir
 
+from omnigent.errors import restart_on_stale_cursor
 from omnigent.stores.conversation_store import (
     ConversationNotFoundError,
     ConversationStore,
@@ -499,6 +501,7 @@ def _build_node_sync(
     }
 
 
+@restart_on_stale_cursor
 def _fetch_all_items_sync(
     conv_store: ConversationStore,
     conversation_id: str,
@@ -508,6 +511,10 @@ def _fetch_all_items_sync(
     :class:`ConversationStore` directly. See that function's
     docstring for the pagination strategy and the empty-page
     end-of-data convention.
+
+    An item deleted mid-walk invalidates the page cursor, so the whole
+    enumeration restarts (:func:`restart_on_stale_cursor`) rather than
+    dumping a silently truncated log.
 
     Items are converted to plain dicts so the JSON dump is
     self-contained — a reader doesn't need any of Omnigent'
@@ -554,9 +561,40 @@ async def _fetch_all_items_via_sessions(
     Same pagination pattern as :func:`_fetch_all_items` but uses the
     sessions items endpoint instead of conversations.
 
+    An item deleted mid-walk makes the server reject the next page with
+    ``stale_cursor``; restart the whole enumeration so the log holds one
+    consistent view rather than a truncated one. The server-side sibling
+    uses :func:`restart_on_stale_cursor`; this path crosses HTTP, so it
+    catches the client SDK's own stale-cursor type instead.
+
     :param client: The connected :class:`OmnigentClient`.
     :param session_id: Session to page through.
     :returns: All items in chronological order.
+    """
+    for _ in range(_STALE_CURSOR_RESTARTS - 1):
+        try:
+            return await _fetch_all_items_via_sessions_once(client, session_id)
+        except ClientStaleCursorError:
+            continue
+    return await _fetch_all_items_via_sessions_once(client, session_id)
+
+
+# Full-enumeration attempts before a persistently stale cursor propagates.
+# Mirrors ``omnigent.errors._STALE_CURSOR_ATTEMPTS`` for the HTTP path.
+_STALE_CURSOR_RESTARTS = 3
+
+
+async def _fetch_all_items_via_sessions_once(
+    client: OmnigentClient,
+    session_id: str,
+) -> list[dict[str, object]]:
+    """
+    Run one complete page walk of ``GET /v1/sessions/{id}/items``.
+
+    :param client: The connected :class:`OmnigentClient`.
+    :param session_id: Session to page through.
+    :returns: All items in chronological order.
+    :raises StaleCursorError: If a page cursor's item was deleted mid-walk.
     """
     collected: list[dict[str, object]] = []
     cursor: str | None = None
