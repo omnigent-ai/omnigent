@@ -45,6 +45,9 @@ def prompt_workspace(tmp_path: Path) -> Path:
         )
     )
     (artifacts / "pr_diff.txt").write_text("+CREATE TABLE example (id INTEGER);\n")
+    (artifacts / "pr_diff_summary.json").write_text(
+        json.dumps({"markdown": "Computed diff statistics", "test_files": []})
+    )
     (artifacts / "lockfile_pins.txt").write_text("")
     (artifacts / "gh_response").write_bytes(b"Unexpected fetch")
     (artifacts / "gh_exit_code").write_text("99")

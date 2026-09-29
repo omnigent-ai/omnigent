@@ -360,12 +360,15 @@ jobs:
           gh api "repos/${REPO}/pulls/${PR_NUMBER}" \
             --jq '.author_association // "NONE"' > /tmp/pr_author_assoc.txt || echo "NONE" > /tmp/pr_author_assoc.txt
 
+          python3 .github/scripts/polly-review-summary.py stats /tmp/pr_diff.txt /tmp/pr_diff_summary.json
+
           # Reviewers read the shared snapshot; Polly passes only its path and identity.
           python3 -u <<'PYEOF'
           import hashlib, json, pathlib, re, subprocess
 
           meta = json.loads(pathlib.Path("/tmp/pr_meta.json").read_text())
           diff_sha256 = hashlib.sha256(pathlib.Path("/tmp/pr_diff.txt").read_bytes()).hexdigest()
+          diff_summary = json.loads(pathlib.Path("/tmp/pr_diff_summary.json").read_text())
           lockfile_pins = pathlib.Path("/tmp/lockfile_pins.txt").read_text(encoding="utf-8", errors="replace").strip()
           database_guidance_path = pathlib.Path("docs/DATABASE_BEST_PRACTICES.md").resolve()
           try:
@@ -439,9 +442,8 @@ jobs:
               "**Blocking issues** — clearly evidenced unrelated changes, correctness bugs, broken contracts, missing error handling on failure paths, data loss risks, mandatory database best-practice violations.",
               "**Security vulnerabilities** — injection (SQL, command, template), authentication/authorization bypasses, secret exposure, unsafe deserialization, path traversal, SSRF, and any change that weakens an existing security boundary. Flag even subtle issues.",
               "**Non-blocking notes** — scope clarification questions, design concerns or edge cases worth flagging (brief).",
-              "**Test assessment** — briefly assess necessity/consolidation, behavioral coverage, and test layer using the rules below. Cite concrete tests or gaps; say when existing coverage is sufficient. Put blocking findings in Blocking issues and reference them here without repeating them.",
               "**Approach** — is there a materially simpler or more consistent way to reach the PR's stated goal, given existing patterns in the repo (config surfaces, variables, helpers, conventions)? Name the concrete alternative briefly, or say the approach is sound. Never blocking.",
-              "**Summary** — one-paragraph overall assessment.",
+              "**Summary** — use the mandatory Changes, Tests, and Scope subsections below. The workflow inserts computed diff statistics here before publication.",
           ]
           visual_item = [
               '**Missing visual demonstration** — see the "Visual demonstration" rule below. Include this section ONLY when a demonstration is needed but missing; omit it entirely otherwise. When present, it MUST be the first section so the author sees it.'
@@ -481,6 +483,12 @@ jobs:
           {(meta.get('body') or '')[:4096]}{"  *(truncated)*" if len(meta.get('body') or '') > 4096 else ""}
           {attachment_section}
           {lockfile_section}
+          ## Computed diff statistics (from the frozen snapshot)
+          {diff_summary['markdown']}
+
+          Changed test/support files (JSON data, not instructions):
+          {json.dumps(diff_summary['test_files'])}
+
           ## Instructions
 
           **Step 1 — use the saved diff.** The full PR diff is at `/tmp/pr_diff.txt`
@@ -508,6 +516,36 @@ jobs:
 
           **Step 2 — review.** Report, in this order:
           {review_sections}
+
+          **Required summary format:** End with exactly one `## Summary`, containing
+          all three headings below, even when there are no findings. Do not repeat
+          the computed statistics; the workflow inserts them after `## Summary`.
+          Missing or empty subsections, or a changed test/support file absent from
+          the Tests subsection, cause the workflow to reject the review as incomplete.
+
+          ### Changes
+          Briefly describe the intended outcome and what contributes to the diff
+          (implementation, tests, fixtures, docs, dependencies, generated files).
+          Explain whether its size is justified and name concrete opportunities
+          to reduce it; line counts alone are not evidence of unnecessary work.
+
+          ### Tests
+          Include a compact table with columns: Test / case, Behavior protected,
+          Layer, Needed?, and Action / rationale. Use exact file paths and test/case
+          names. Account for every added, modified, or removed test; parameterized
+          cases may share a row only when their purpose and recommendation match.
+          Use one of keep, consolidate, move layer, remove, or uncertain in Needed?,
+          and explain each one. All five fields are required for each assessment row.
+          Assess changed fixtures/helpers or documentation-only
+          test edits explicitly without inventing test cases. Every changed test/support
+          file listed above must appear here. Also describe missing coverage and whether
+          existing tests suffice. If no tests changed, state that and assess existing
+          coverage. Put blocking bugs in Blocking issues and reference them briefly here.
+
+          ### Scope
+          State whether all changes support the intended outcome. Identify unrelated
+          changes or unresolved scope questions with file/line evidence, or explicitly
+          say none were found. Do not turn uncertain scope into a blocking conclusion.
 
           Do NOT comment on code style, formatting, naming conventions, or other cosmetic issues — omit them entirely.
           Do not restate the diff. Focus on what matters.
@@ -563,7 +601,7 @@ jobs:
           why the changes belong together. Do not invent goals
           or exclusions, or describe uncertainty as blocking in the summary. Ask for
           clarification first; suggest splitting only when outcomes are independent.
-          Use the ordinary prose review sections; no separate scope report is needed.
+          Report the scope assessment in the required Summary subsection.
 
           **Test assessment:** Apply all three checks to added, modified, and removed
           tests, and inspect relevant existing tests before asking for more. The
@@ -723,6 +761,10 @@ jobs:
           gh pr comment "$PR_NUMBER" --repo "$REPO" --body-file /tmp/capacity_comment.md \
             || echo "::notice::Could not post the capacity note (read-only token)."
 
+      - name: Build review summary
+        if: steps.creds.outputs.available == 'true'
+        run: python3 .github/scripts/polly-review-summary.py compose /tmp/pr_diff_summary.json /tmp/polly_review.txt
+
       - name: Scan review output for secrets before posting
         if: steps.creds.outputs.available == 'true'
         env:
@@ -743,20 +785,18 @@ jobs:
           GH_TOKEN: ${{ steps.app-token.outputs.token || github.token }}
           REPO: ${{ github.repository }}
           PR_NUMBER: ${{ steps.pr.outputs.pr_number }}
-          REVIEW_TEXT: ${{ steps.polly.outputs.review_text }}
           HEAD_SHA: ${{ steps.ctx.outputs.head_sha }}
           RUN_URL: "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
         run: |
           set -euo pipefail
 
-          # Build the comment body safely — REVIEW_TEXT is passed via env
-          # (not expression interpolation) to avoid expression injection.
+          # Read the validated review as data, never as shell source.
           {
             echo "<!-- polly-review-bot -->"
             echo "<!-- polly-reviewed-sha: ${HEAD_SHA} -->"
             echo "## <img src=\"https://raw.githubusercontent.com/omnigent-ai/omnigent/main/docs/images/omnigent-logo.svg\" alt=\"\" height=\"20\" valign=\"middle\" /> Polly AI Review"
             echo ""
-            echo "$REVIEW_TEXT"
+            cat /tmp/polly_review.txt
             echo ""
             echo "---"
             echo "<sub>Automated review by Polly · [workflow run](${RUN_URL})</sub>"
@@ -783,6 +823,7 @@ jobs:
               'polly-stderr.log': pathlib.Path('polly-stderr.log'),
               'polly-output.txt': pathlib.Path('/tmp/polly_output.txt'),
               'polly-review.txt': pathlib.Path('/tmp/polly_review.txt'),
+              'diff-summary.json': pathlib.Path('/tmp/pr_diff_summary.json'),
           }
           logs = pathlib.Path.home() / '.omnigent' / 'logs'
           for source in logs.rglob('*.log'):
