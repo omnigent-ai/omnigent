@@ -188,6 +188,45 @@ class OpenCodeReviewWorkflowTest(unittest.TestCase):
         self.assertEqual(result["outputs"], {})
         self.assertIn("default branch", result["error"])
 
+    def pull_request(self, *, action="opened", draft=False, state="open", fork=False):
+        context = self.comment()
+        context["eventName"] = "pull_request_target"
+        context["payload"] = {
+            "repository": {"default_branch": "main"},
+            "action": action,
+            "pull_request": {
+                "number": 7878,
+                "draft": draft,
+                "state": state,
+                "head": {"repo": {"fork": fork}},
+            },
+        }
+        return context
+
+    def test_automatic_reviews_match_polly_lifecycle_events_from_trusted_base(self):
+        # PyYAML's YAML 1.1 loader reads the workflow's `on` key as True.
+        triggers = WORKFLOW[True]
+        polly = yaml.safe_load((ROOT / ".github/workflows/polly-review.yml").read_text())
+        self.assertEqual(triggers["pull_request_target"], polly[True]["pull_request"])
+        self.assertNotIn("pull_request", triggers)
+        self.assertNotIn("synchronize", triggers["pull_request_target"]["types"])
+        for action in triggers["pull_request_target"]["types"]:
+            for fork in (False, True):
+                with self.subTest(action=action, fork=fork):
+                    context = self.pull_request(action=action, fork=fork)
+                    result = self.run_script(context)
+                    self.assertNotIn("error", result)
+                    self.assertEqual(result["outputs"], {"pr": "7878"})
+                    self.assertEqual(result["calls"], [])
+                    self.assertEqual(self.acknowledge(context)["calls"], [])
+
+    def test_draft_and_closed_pr_events_do_not_enter_review_queue(self):
+        for context in (self.pull_request(draft=True), self.pull_request(state="closed")):
+            result = self.run_script(context)
+            self.assertNotIn("error", result)
+            self.assertEqual(result["outputs"], {})
+            self.assertEqual(result["calls"], [])
+
     def acknowledge(self, context, **kwargs):
         authorized = self.run_script(context, **kwargs)
         self.assertNotIn("error", authorized)
@@ -299,9 +338,10 @@ class OpenCodeReviewWorkflowTest(unittest.TestCase):
 
     def test_completed_commit_skips_before_gateway_and_posts_one_notice(self):
         artifact, run = self.completion()
-        for event in ("issue_comment", "workflow_dispatch"):
+        for event in ("pull_request_target", "issue_comment", "workflow_dispatch"):
             with self.subTest(event=event):
                 run["event"] = event
+                run["head_branch"] = "feature-branch" if event == "pull_request_target" else "main"
                 result = self.resolve(artifacts=[artifact], runs={123: run})
                 self.assertNotIn("error", result)
                 self.assertEqual(result["outputs"], {})
@@ -337,7 +377,7 @@ class OpenCodeReviewWorkflowTest(unittest.TestCase):
             self.assertEqual(result["outputs"], {"base": "main", "head": HEAD})
             self.assertEqual(result["calls"], [])
 
-    def test_only_successful_default_branch_workflow_receipts_suppress_review(self):
+    def test_only_successful_trusted_workflow_receipts_suppress_review(self):
         cases = [
             ("artifact", {"name": f"ocr-completed-999-{HEAD}"}),
             ("artifact", {"name": f"ocr-completed-7878-{'b' * 40}"}),
