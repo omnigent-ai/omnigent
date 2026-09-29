@@ -1268,14 +1268,14 @@ def test_create_worktree_frame_existing_branch_absent_defaults_false() -> None:
 def test_create_worktree_result_frame_round_trip() -> None:
     """Verify HostCreateWorktreeResultFrame survives encode → decode.
 
-    The server stores worktree_path as the session workspace; a
-    dropped field would persist a session with no workspace.
+    Preserve the worktree root and the selected session subdirectory separately.
     """
     original = HostCreateWorktreeResultFrame(
         request_id="req_wt_1",
         status="ok",
         worktree_path="/Users/alice/myrepo-worktrees/feature-login",
         branch="feature/login",
+        workspace="/Users/alice/myrepo-worktrees/feature-login/web",
     )
     decoded = decode_host_frame(encode_host_frame(original))
     assert isinstance(decoded, HostCreateWorktreeResultFrame)

@@ -9935,7 +9935,7 @@ async def _create_session_from_existing_agent(
                 git=body.git,
                 request=request,
             )
-            canonical_workspace = created_worktree.worktree_path
+            canonical_workspace = created_worktree.workspace or created_worktree.worktree_path
             git_branch = created_worktree.branch
             created_worktree_path = created_worktree.worktree_path
 

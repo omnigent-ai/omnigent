@@ -561,14 +561,14 @@ class HostCreateWorktreeResultFrame:
     :param request_id: Correlates to the
         :class:`HostCreateWorktreeFrame`, e.g. ``"req_wt_1"``.
     :param status: ``"ok"`` or ``"failed"``.
-    :param worktree_path: Created worktree directory (stored as the
-        session ``workspace``), e.g.
+    :param worktree_path: Created worktree root directory, e.g.
         ``"/Users/alice/myrepo-worktrees/feature-login"``. ``None``
         on failure.
     :param branch: Branch checked out, e.g. ``"feature/login"``.
         ``None`` on failure.
     :param error: Error message when ``status`` is ``"failed"``,
         e.g. ``"not a git repository"``. ``None`` on success.
+    :param workspace: Selected directory in the new worktree. Absent on older hosts.
     """
 
     request_id: str
@@ -576,6 +576,7 @@ class HostCreateWorktreeResultFrame:
     worktree_path: str | None = None
     branch: str | None = None
     error: str | None = None
+    workspace: str | None = None
 
 
 @dataclass
@@ -1339,6 +1340,7 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "worktree_path": frame.worktree_path,
                 "branch": frame.branch,
                 "error": frame.error,
+                "workspace": frame.workspace,
             }
         )
     if isinstance(frame, HostRemoveWorktreeFrame):
@@ -2012,6 +2014,7 @@ def _decode_create_worktree_result(
         worktree_path=_optional_nullable_str(msg, "worktree_path"),
         branch=_optional_nullable_str(msg, "branch"),
         error=_optional_nullable_str(msg, "error"),
+        workspace=_optional_nullable_str(msg, "workspace"),
     )
 
 

@@ -149,6 +149,7 @@ async def register_host(
         create_error: str | None = None,
         create_gate: asyncio.Event | None = None,
         launch_status: str = "launched",
+        workspace: str | None = None,
     ) -> _HostCapture:
         HostStore(db_uri).upsert_on_connect(_HOST_ID, "wt-host", RESERVED_USER_LOCAL)
         conn = app.state.host_registry.register(
@@ -172,7 +173,8 @@ async def register_host(
                 future.set_result(
                     {
                         "status": "ok",
-                        "worktree_path": f"{frame.repo_path}-worktrees/{dirname}",
+                        "worktree_path": f"{_SOURCE_REPO}-worktrees/{dirname}",
+                        "workspace": workspace,
                         "branch": frame.branch_name,
                         "error": None,
                     }
@@ -586,3 +588,36 @@ async def test_launch_runner_rollback_preserves_existing_branch(
     assert conv is not None
     assert conv.runner_id is None
     assert conv.git_branch is None
+
+
+@pytest.mark.parametrize("launch_status", ["launched", "failed"])
+async def test_launch_runner_preserves_subdirectory_and_rolls_back_root(
+    register_host: RegisterHost,
+    client: httpx.AsyncClient,
+    db_uri: str,
+    launch_status: str,
+) -> None:
+    """Launch in the selected subdirectory, but remove the whole worktree on failure."""
+    root = f"{_SOURCE_REPO}-worktrees/feature-subdir"
+    workspace = f"{root}/packages/app"
+    cap = register_host(workspace=workspace, launch_status=launch_status)
+    session_id = await _bare_session(client, "subdirectory-launch-agent")
+    response = await client.post(
+        f"/v1/hosts/{_HOST_ID}/runners",
+        json={
+            "session_id": session_id,
+            "workspace": f"{_SOURCE_REPO}/packages/app",
+            "git": {"branch_name": "feature/subdir"},
+        },
+    )
+    assert response.status_code == (200 if launch_status == "launched" else 502), response.text
+    assert cap.create[0].repo_path == f"{_SOURCE_REPO}/packages/app"
+    assert cap.launch[0].workspace == workspace
+    conv = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
+    assert conv is not None
+    if launch_status == "launched":
+        assert conv.workspace == workspace
+        assert cap.remove == []
+    else:
+        assert conv.workspace is None
+        assert cap.remove[0].worktree_path == root

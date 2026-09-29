@@ -699,6 +699,7 @@ async def _receive_loop(
                     {
                         "status": frame.status,
                         "worktree_path": frame.worktree_path,
+                        "workspace": frame.workspace,
                         "branch": frame.branch,
                         "error": frame.error,
                     }

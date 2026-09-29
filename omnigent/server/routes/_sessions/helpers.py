@@ -9254,8 +9254,8 @@ async def _create_session_worktree(
     Create a git worktree on the host for a new session branch.
 
     Validates the branch name server-side (the host re-validates), then
-    proxies ``host.create_worktree``. The returned worktree path
-    becomes the session ``workspace``. See
+    proxies ``host.create_worktree``. The returned workspace preserves
+    the selected subdirectory in the new worktree. See
     designs/SESSION_GIT_WORKTREE.md.
 
     :param host_id: Target host id, e.g. ``"host_a1b2c3d4..."``.
@@ -9266,8 +9266,8 @@ async def _create_session_worktree(
     :param git: Validated git options (``branch_name``, optional
         ``base_branch``).
     :param request: FastAPI request carrying the host registry.
-    :returns: The created worktree's ``worktree_path`` (to store as
-        ``workspace``) and ``branch`` (to store as ``git_branch``).
+    :returns: The worktree root for rollback, the relocated ``workspace``,
+        and ``branch`` (to store as ``git_branch``).
     :raises OmnigentError: ``invalid_input`` for a bad branch name,
         missing source repo, or a host-reported git failure (duplicate
         branch, bad base ref, not a repo); ``conflict`` when the host is
@@ -9367,8 +9367,10 @@ async def _remove_session_worktree_best_effort(
     from omnigent.server.routes._host_worktree import (
         WorktreeHostUnavailableError,
         WorktreeProxyError,
+        list_worktrees_on_host,
         remove_worktree_on_host,
     )
+    from omnigent.server.routes._workspace_validation import _is_subpath_of
 
     # A fork reusing the source's directory, or several sessions attached to
     # one existing worktree, all run in the same cwd. Removing it under them
@@ -9414,6 +9416,36 @@ async def _remove_session_worktree_best_effort(
         )
         return
     try:
+        if conversation_store is not None and exclude_conversation_id is not None:
+            worktrees = await list_worktrees_on_host(
+                host_registry=host_registry,
+                host_conn=host_conn,
+                repo_path=worktree_path,
+            )
+            roots = [
+                path
+                for tree in worktrees
+                if isinstance(path := tree.get("path"), str)
+                and _is_subpath_of(worktree_path, path)
+                and tree.get("branch") == branch
+                and not tree.get("is_main", True)
+            ]
+            if not roots:
+                _logger.warning(
+                    "No matching linked worktree for %s; skipping cleanup", worktree_path
+                )
+                return
+            worktree_path = max(roots, key=len)
+            shared = await asyncio.to_thread(
+                conversation_store.has_other_live_session_in_workspace,
+                host_id=host_id,
+                workspace=worktree_path,
+                exclude_conversation_id=exclude_conversation_id,
+                include_subdirectories=True,
+            )
+            if shared:
+                _logger.info("Keeping worktree %s: another session uses it", worktree_path)
+                return
         await remove_worktree_on_host(
             host_registry=host_registry,
             host_conn=host_conn,

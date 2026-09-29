@@ -1908,6 +1908,7 @@ class ConversationStore(ABC):
         host_id: str,
         workspace: str,
         exclude_conversation_id: str,
+        include_subdirectories: bool = False,
     ) -> bool:
         """
         Is another non-archived conversation sitting in this ``(host_id, workspace)``?
@@ -1925,6 +1926,7 @@ class ConversationStore(ABC):
         :param workspace: Absolute worktree path, e.g. ``"/w/feature-login"``.
         :param exclude_conversation_id: The conversation being deleted or
             archived — its own row must not count as "another session".
+        :param include_subdirectories: Also protect sessions inside this worktree root.
         :returns: ``True`` when at least one other live conversation
             references the pair, else ``False``.
         """

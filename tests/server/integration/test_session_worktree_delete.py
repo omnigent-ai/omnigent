@@ -11,6 +11,9 @@ are used. See designs/SESSION_GIT_WORKTREE.md.
 from __future__ import annotations
 
 import asyncio
+import shutil
+from dataclasses import asdict
+from pathlib import Path
 
 import httpx
 import pytest
@@ -19,14 +22,17 @@ from fastapi import FastAPI
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.host.frames import (
     HostHelloFrame,
+    HostListWorktreesFrame,
     HostRemoveWorktreeFrame,
     decode_host_frame,
 )
+from omnigent.host.git_worktree import create_worktree, list_worktrees, remove_worktree
 from omnigent.server.auth import RESERVED_USER_LOCAL
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
 from omnigent.stores.host_store import HostStore
+from tests.host.test_git_worktree import _branch_exists, _git
 
 pytestmark = pytest.mark.asyncio
 
@@ -77,6 +83,21 @@ async def _register_fake_host(
                 fut = conn.pending_remove_worktrees.pop(frame.request_id, None)
                 if fut is not None and not fut.done():
                     fut.set_result({"status": "ok", "error": None})
+            elif isinstance(frame, HostListWorktreesFrame):
+                fut = conn.pending_list_worktrees.pop(frame.request_id, None)
+                if fut is not None and not fut.done():
+                    fut.set_result(
+                        {
+                            "status": "ok",
+                            "worktrees": [
+                                {
+                                    "path": _WORKTREE_PATH,
+                                    "branch": "feature/login",
+                                    "is_main": False,
+                                }
+                            ],
+                        }
+                    )
 
     task = asyncio.create_task(_drain())
     # Stash so the caller can stop the drain on teardown.
@@ -159,10 +180,16 @@ async def test_delete_without_flag_sends_no_remove_worktree(
     assert captured == []
 
 
+@pytest.mark.parametrize(
+    ("first_subdir", "second_subdir"),
+    [("", ""), ("/web", ""), ("", "/web"), ("/web", "/packages/app")],
+)
 async def test_delete_shared_worktree_keeps_it_until_the_last_session(
     app: FastAPI,
     client: httpx.AsyncClient,
     db_uri: str,
+    first_subdir: str,
+    second_subdir: str,
 ) -> None:
     """
     Two sessions in one worktree: deleting the first leaves the directory,
@@ -174,8 +201,8 @@ async def test_delete_shared_worktree_keeps_it_until_the_last_session(
     directory and stop responding.
     """
     captured = await _register_fake_host(app, db_uri)
-    first = _make_worktree_conversation(db_uri)
-    second = _make_worktree_conversation(db_uri)
+    first = _make_worktree_conversation(db_uri, _WORKTREE_PATH + first_subdir)
+    second = _make_worktree_conversation(db_uri, _WORKTREE_PATH + second_subdir)
     assert first != second
 
     resp = await client.delete(f"/v1/sessions/{first}?delete_branch=true")
@@ -592,3 +619,92 @@ async def test_delete_with_flag_still_succeeds_on_host_git_failure(
     assert resp.status_code == 200, resp.text
     get_resp = await client.get(f"/v1/sessions/{conv_id}")
     assert get_resp.status_code == 404
+
+
+@pytest.mark.parametrize("change", ["rename", "delete", "replace-with-file"])
+async def test_delete_worktree_after_workspace_disappears(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    db_uri: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    change: str,
+) -> None:
+    """Resolve and remove the real Git worktree after its session directory disappears."""
+    await _register_fake_host(app, db_uri)
+    repo = (tmp_path / "repo").resolve()
+    source = repo / "packages" / "app"
+    source.mkdir(parents=True)
+    (source / "README.md").write_text("tracked project")
+    _git(repo, "init", "-q", "-b", "main")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-qm", "init")
+    created = create_worktree(repo_path=str(source), branch_name="feature/login")
+    session_id = _make_worktree_conversation(db_uri, created.workspace)
+    root = Path(created.worktree_path)
+    packages = root / "packages"
+    if change == "rename":
+        packages.rename(root / "renamed-packages")
+    else:
+        shutil.rmtree(packages)
+        if change == "replace-with-file":
+            packages.write_text("now a file")
+
+    removed: list[str] = []
+
+    async def list_on_host(*, repo_path: str, **_kwargs: object) -> list[dict[str, object]]:
+        return [asdict(tree) for tree in list_worktrees(repo_path=repo_path)]
+
+    async def remove_on_host(
+        *, worktree_path: str, branch: str, delete_branch: bool, **_kwargs: object
+    ) -> None:
+        removed.append(worktree_path)
+        remove_worktree(worktree_path=worktree_path, branch=branch, delete_branch=delete_branch)
+
+    monkeypatch.setattr(
+        "omnigent.server.routes._host_worktree.list_worktrees_on_host", list_on_host
+    )
+    monkeypatch.setattr(
+        "omnigent.server.routes._host_worktree.remove_worktree_on_host", remove_on_host
+    )
+    response = await client.delete(f"/v1/sessions/{session_id}?delete_branch=true")
+    assert response.status_code == 200, response.text
+    assert removed == [created.worktree_path]
+    assert not root.exists()
+    assert not _branch_exists(repo, created.branch)
+
+
+@pytest.mark.parametrize(
+    ("root", "other", "in_use"),
+    [
+        ("/repo-worktrees/feature", "/repo-worktrees/feature/web", True),
+        ("/repo-worktrees/feature", "/repo-worktrees/feature-other/web", False),
+        ("/repo-worktrees/feature_%", "/repo-worktrees/feature_%/web", True),
+        ("/repo-worktrees/feature_%", "/repo-worktrees/feature-abc/web", False),
+        ("C:/repo-worktrees/feature", r"c:\repo-worktrees\feature\web", True),
+    ],
+)
+async def test_worktree_sharing_includes_descendants(
+    db_uri: str, root: str, other: str, in_use: bool
+) -> None:
+    """Descendant matching respects path boundaries, SQL wildcards, and Windows separators."""
+    _upsert_host_row(db_uri)
+    mine = _make_worktree_conversation(db_uri, root)
+    sibling = _make_worktree_conversation(db_uri, other)
+    store = SqlAlchemyConversationStore(db_uri)
+    assert (
+        store.has_other_live_session_in_workspace(
+            host_id=_HOST_ID,
+            workspace=root,
+            exclude_conversation_id=mine,
+            include_subdirectories=True,
+        )
+        is in_use
+    )
+    store.update_conversation(sibling, archived=True)
+    assert not store.has_other_live_session_in_workspace(
+        host_id=_HOST_ID,
+        workspace=root,
+        exclude_conversation_id=mine,
+        include_subdirectories=True,
+    )

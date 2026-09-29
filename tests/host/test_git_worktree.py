@@ -151,20 +151,66 @@ def test_create_worktree_places_sibling_of_repo_root(git_repo: Path) -> None:
     # Path proves the sibling layout + slash->dash dir sanitization;
     # a regression in _resolve_worktree_path would change this.
     assert created.worktree_path == str(expected)
+    assert created.workspace == str(expected)
     assert Path(created.worktree_path).is_dir()
     # The branch is actually checked out in the worktree (not just the dir made).
     assert _current_branch(Path(created.worktree_path)) == "feature/login"
     assert isinstance(created, CreatedWorktree)
 
 
-def test_create_worktree_resolves_repo_root_from_subdir(git_repo: Path) -> None:
-    """Picking a subdir still anchors the worktree at the repo root's sibling."""
-    sub = git_repo / "src"
-    sub.mkdir()
+@pytest.mark.parametrize("linked", [False, True])
+def test_create_worktree_resolves_repo_root_from_subdir(git_repo: Path, linked: bool) -> None:
+    """Preserve a nested workspace from either the main checkout or a linked worktree."""
+    relative = Path("packages") / "my app"
+    sub = git_repo / relative
+    sub.mkdir(parents=True)
+    (sub / "README.md").write_text("nested project")
+    _git(git_repo, "add", ".")
+    _git(git_repo, "commit", "-qm", "add nested project")
+    if linked:
+        first = create_worktree(repo_path=str(git_repo), branch_name="first")
+        sub = Path(first.worktree_path) / relative
     created = create_worktree(repo_path=str(sub), branch_name="wip")
-    # Sibling of the repo ROOT, not of the picked subdir — proves
-    # rev-parse --show-toplevel is used rather than the raw repo_path.
+    # Worktree placement stays anchored at the main repository.
     assert created.worktree_path == str(git_repo.parent / "myrepo-worktrees" / "wip")
+    assert created.workspace == str(Path(created.worktree_path) / relative)
+    assert (Path(created.workspace) / "README.md").read_text() == "nested project"
+    assert _current_branch(Path(created.workspace)) == "wip"
+
+    remove_worktree(worktree_path=created.workspace, branch="wip", delete_branch=True)
+    assert not Path(created.worktree_path).exists()
+    assert not _branch_exists(git_repo, "wip")
+
+
+@pytest.mark.parametrize("existing_branch", [False, True])
+@pytest.mark.parametrize("base_path_kind", ["missing", "file"])
+def test_create_worktree_missing_subdir_leaves_no_worktree(
+    git_repo: Path, existing_branch: bool, base_path_kind: str
+) -> None:
+    """A directory missing from the target revision fails before creating a worktree."""
+    sub = git_repo / "new-project"
+    if base_path_kind == "file":
+        sub.write_text("a file in the old revision")
+        _git(git_repo, "add", ".")
+        _git(git_repo, "commit", "-qm", "add file")
+    _git(git_repo, "branch", "old-base")
+    if base_path_kind == "file":
+        sub.unlink()
+    sub.mkdir()
+    (sub / "README.md").write_text("new project")
+    _git(git_repo, "add", ".")
+    _git(git_repo, "commit", "-qm", "add project")
+    message = "does not exist" if base_path_kind == "missing" else "is not a directory"
+    with pytest.raises(WorktreeError, match=message):
+        create_worktree(
+            repo_path=str(sub),
+            branch_name="old-base" if existing_branch else "new-worktree",
+            base_branch=None if existing_branch else "old-base",
+            existing_branch=existing_branch,
+        )
+    assert _worktree_count(git_repo) == 1
+    assert not _branch_exists(git_repo, "new-worktree")
+    assert _branch_exists(git_repo, "old-base")
 
 
 def test_create_worktree_from_linked_worktree_anchors_at_main_repo(git_repo: Path) -> None:

@@ -3571,6 +3571,7 @@ class HostProcess:
             status="ok",
             worktree_path=created.worktree_path,
             branch=created.branch,
+            workspace=created.workspace,
         )
 
     async def _handle_remove_worktree(

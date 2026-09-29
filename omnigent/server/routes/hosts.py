@@ -935,7 +935,7 @@ def create_hosts_router(
                         raise HTTPException(status_code=409, detail=exc.message) from exc
                     except WorktreeProxyError as exc:
                         raise HTTPException(status_code=400, detail=exc.message) from exc
-                    workspace = worktree.worktree_path
+                    workspace = worktree.workspace or worktree.worktree_path
                     git_branch = worktree.branch
 
             try:

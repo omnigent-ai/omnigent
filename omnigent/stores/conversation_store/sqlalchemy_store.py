@@ -6,6 +6,7 @@ import json
 import logging
 from collections.abc import Mapping
 from contextlib import suppress
+from pathlib import PureWindowsPath
 from typing import Any, Protocol, cast
 
 from sqlalchemy import (
@@ -5002,6 +5003,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         host_id: str,
         workspace: str,
         exclude_conversation_id: str,
+        include_subdirectories: bool = False,
     ) -> bool:
         """
         Is another non-archived conversation sitting in this ``(host_id, workspace)``?
@@ -5014,6 +5016,16 @@ class SqlAlchemyConversationStore(ConversationStore):
         the directory — costs a single indexed query and returns before the AP
         DB is touched at all.
         """
+        workspace_column: ColumnElement[str | None] = SqlConversationMetadata.workspace.expression
+        workspace_match: ColumnElement[bool] = workspace_column == workspace
+        if include_subdirectories:
+            if PureWindowsPath(workspace).is_absolute():
+                workspace = workspace.replace("\\", "/").lower()
+                workspace_column = func.lower(func.replace(workspace_column, "\\", "/"))
+            workspace_match = or_(
+                workspace_column == workspace,
+                workspace_column.startswith(workspace.rstrip("/") + "/", autoescape=True),
+            )
         with self._session("check_workspace_used_by_other_session") as meta_sess:
             candidate_ids = list(
                 meta_sess.scalars(
@@ -5021,7 +5033,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                     .where(
                         SqlConversationMetadata.workspace_id == current_workspace_id(),
                         SqlConversationMetadata.host_id == host_id,
-                        SqlConversationMetadata.workspace == workspace,
+                        workspace_match,
                         SqlConversationMetadata.id != exclude_conversation_id,
                     )
                     .limit(_WORKSPACE_SHARER_SCAN_LIMIT)

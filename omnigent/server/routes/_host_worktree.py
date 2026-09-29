@@ -70,14 +70,16 @@ class CreatedWorktree:
 
     :param worktree_path: Absolute path of the created worktree
         directory on the host, e.g.
-        ``"/Users/alice/myrepo-worktrees/feature-login"``. Stored as
-        the session ``workspace``.
+        ``"/Users/alice/myrepo-worktrees/feature-login"``. Used for rollback.
     :param branch: The branch checked out in the worktree, e.g.
         ``"feature/login"``.
+    :param workspace: Selected directory relocated into the new worktree.
+        ``None`` for results from older hosts.
     """
 
     worktree_path: str
     branch: str
+    workspace: str | None = None
 
 
 async def _await_host_worktree_result(
@@ -185,7 +187,12 @@ async def create_worktree_on_host(
     branch = result.get("branch")
     if not isinstance(worktree_path, str) or not isinstance(branch, str):
         raise WorktreeProxyError("host returned an incomplete worktree result")
-    return CreatedWorktree(worktree_path=worktree_path, branch=branch)
+    workspace = result.get("workspace")
+    return CreatedWorktree(
+        worktree_path=worktree_path,
+        branch=branch,
+        workspace=workspace if isinstance(workspace, str) else None,
+    )
 
 
 async def remove_worktree_on_host(
