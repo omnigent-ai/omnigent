@@ -1149,3 +1149,47 @@ async def test_question_asked_dedupes_concurrent_same_request() -> None:
     assert fwd._question_tasks["que_1"] is task
     await task
     assert opencode.question_replies == [("que_1", [["A"]])]
+
+
+async def test_permission_parks_the_session_until_the_verdict_is_replied() -> None:
+    """opencode waits on a permission while the policy ASK is decided."""
+    from omnigent.native import prompt_parks
+
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    seen: list[tuple[str, ...]] = []
+
+    async def _ask(_normalized: Any) -> dict[str, Any]:
+        seen.append(prompt_parks.open_keys("conv_1"))
+        return {"decision": "allow"}
+
+    fwd = _forwarder(server, opencode, policy_evaluator=_ask)
+    await fwd.handle_event(_event("permission.v2.asked", id="per_park", action="bash"))
+
+    assert seen == [("opencode:perm:per_park",)]
+    assert prompt_parks.open_keys("conv_1") == ()
+    assert opencode.replies[0][0] == "per_park"
+
+
+async def test_question_parks_the_session_until_answered_or_withdrawn() -> None:
+    """A blocking opencode question parks from ``asked`` to its answer or withdrawal."""
+    from omnigent.native import prompt_parks
+
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    server.hook_response = {"action": "accept", "content": {"0": "Tabs"}}
+    fwd = _forwarder(server, opencode)
+    question = [{"question": "Indent?", "options": [{"label": "Tabs"}, {"label": "Spaces"}]}]
+
+    await fwd.handle_event(_event("question.asked", id="que_p1", questions=question))
+    assert prompt_parks.open_keys("conv_1") == ("opencode:question:que_p1",)
+    await fwd._question_tasks["que_p1"]
+    await asyncio.sleep(0)
+    assert prompt_parks.open_keys("conv_1") == ()
+
+    async def _never(*_a: Any, **_k: Any) -> None:
+        await asyncio.sleep(3600)
+
+    fwd._handle_question = _never  # type: ignore[method-assign]
+    await fwd.handle_event(_event("question.asked", id="que_p2", questions=question))
+    assert prompt_parks.open_keys("conv_1") == ("opencode:question:que_p2",)
+    await fwd.handle_event(_event("question.replied", requestID="que_p2", answers=[["A"]]))
+    assert prompt_parks.open_keys("conv_1") == ()

@@ -39,6 +39,7 @@ from typing import TypedDict
 import httpx
 
 from omnigent.harnesses.goose_native.bridge import capture_goose_pane, send_goose_pane_keys
+from omnigent.native import prompt_parks
 
 _logger = logging.getLogger(__name__)
 
@@ -172,7 +173,10 @@ async def supervise_goose_approval_mirror(
     timeout = httpx.Timeout(_POST_TIMEOUT_S, connect=10.0)
     from omnigent.cli_auth import open_server_client
 
-    async with open_server_client(base_url, headers=headers, auth=auth, timeout=timeout) as client:
+    async with (
+        open_server_client(base_url, headers=headers, auth=auth, timeout=timeout) as client,
+        prompt_parks.released(session_id, "goose:"),
+    ):
         while True:
             try:
                 pane = await asyncio.to_thread(capture_goose_pane, bridge_dir)
@@ -197,6 +201,9 @@ async def supervise_goose_approval_mirror(
                             name=f"goose-approval-{episode}",
                         )
                         active = {"elicitation_id": elicitation_id, "task": task}
+                        # The prompt is on screen: park until it goes away, even
+                        # if the card POST fails.
+                        prompt_parks.open_park(session_id, f"goose:{episode}")
                 elif active is not None:
                     # Falling edge: the prompt vanished. If the web card is still
                     # parked (answered in the TUI), release it; if the task already
@@ -207,6 +214,7 @@ async def supervise_goose_approval_mirror(
                             client, session_id, str(active["elicitation_id"])
                         )
                     active = None
+                    prompt_parks.close_parks(session_id, "goose:")
             except asyncio.CancelledError:
                 raise
             except Exception:

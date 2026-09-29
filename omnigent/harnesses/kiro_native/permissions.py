@@ -13,6 +13,7 @@ from pathlib import Path
 import httpx
 
 from omnigent.harnesses.kiro_native.bridge import acp_record_path, send_kiro_permission_verdict
+from omnigent.native import prompt_parks
 
 _logger = logging.getLogger(__name__)
 
@@ -206,7 +207,10 @@ async def supervise_kiro_permission_mirror(
     timeout = httpx.Timeout(_POST_TIMEOUT_S, connect=10.0)
     from omnigent.cli_auth import open_server_client
 
-    async with open_server_client(base_url, headers=headers, auth=auth, timeout=timeout) as client:
+    async with (
+        open_server_client(base_url, headers=headers, auth=auth, timeout=timeout) as client,
+        prompt_parks.released(session_id, "kiro:"),
+    ):
         while True:
             try:
                 events, offset = await asyncio.to_thread(
@@ -232,8 +236,12 @@ async def supervise_kiro_permission_mirror(
                         ):
                             continue
                         queued[event.request_id] = event.permission
+                        # Kiro shows the prompt until it answers it: park on the
+                        # request, whatever becomes of the card's delivery task.
+                        prompt_parks.open_park(session_id, f"kiro:{event.request_id}")
                     else:
                         queued.pop(event.request_id, None)
+                        prompt_parks.close_park(session_id, f"kiro:{event.request_id}")
                         entry = pending.pop(event.request_id, None)
                         if entry is None:
                             continue

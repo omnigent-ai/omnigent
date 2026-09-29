@@ -21,6 +21,7 @@ from omnigent.runner.resource_registry import (
     _TERMINAL_EXIT_OUTPUT_MAX_CHARS,
     CLAUDE_NATIVE_TERMINAL_ROLE,
     CODEX_NATIVE_TERMINAL_ROLE,
+    OPENCODE_NATIVE_TERMINAL_ROLE,
     PI_NATIVE_TERMINAL_ROLE,
     SessionResourceRegistry,
     TerminalExitEvent,
@@ -30,6 +31,7 @@ from omnigent.runner.resource_registry import (
     _terminal_exit_diagnostics,
     trim_terminal_output,
 )
+from omnigent.runner.session_status import StatusSource
 from omnigent.terminals import TerminalRegistry
 from tests.runner.helpers import make_test_terminal_instance
 
@@ -668,12 +670,13 @@ async def test_parked_pane_stays_running_then_recovers_on_pane_death(tmp_path: P
 
 @pytest.mark.asyncio
 async def test_hook_status_resyncs_watcher_dedup(tmp_path: Path) -> None:
-    """A forwarder's hook-derived edge rebases the shared dedup baseline.
+    """A forwarder's hook-derived edge rebases the shared wire dedup baseline.
 
     ``Stop`` → ``idle`` is posted to the server by the claude-native forwarder,
-    bypassing this watcher. Adopting it as the baseline is what makes the pair
-    idempotent: the file's own ``idle`` lands on the same edge and is collapsed,
-    so the two agree regardless of which arrives first.
+    bypassing this watcher. Adopting it as the wire baseline makes the pair
+    idempotent on the wire: the file's own ``idle`` lands on the same edge and
+    is not re-published, so the server hears one idle whichever arrives first.
+    The runner's status book still records the file's edge.
     """
     callbacks, statuses, pollers, registry = await _observe_native_with_fake_poller(
         tmp_path, "conv_resync"
@@ -701,12 +704,127 @@ async def test_hook_status_resyncs_watcher_dedup(tmp_path: Path) -> None:
     poller.emit("idle")
     await asyncio.sleep(0)
     assert statuses == ["running"]
+    idle_record = registry.status_book.current("conv_resync")
+    assert idle_record is not None
+    assert idle_record.status == "idle"
+    assert idle_record.sources == {StatusSource.RELAY, StatusSource.STATUS_FILE}
+    assert registry.status_book.claim("conv_resync") is None
 
     # Next turn: the file reports work again and must publish.
     poller.emit("running")
     await asyncio.sleep(0)
     assert statuses == ["running", "running"]
     del callbacks
+
+
+@pytest.mark.asyncio
+async def test_deduped_pty_edge_is_recorded_locally(tmp_path: Path) -> None:
+    """A pane idle the wire dedup swallows still ends the runner's running."""
+    callbacks, statuses, _pollers, registry = await _observe_native_with_fake_poller(
+        tmp_path, "conv_pty_dedup"
+    )
+    on_activity = callbacks["on_activity"]
+    on_idle = callbacks["on_idle"]
+    assert callable(on_activity) and callable(on_idle)
+
+    on_activity()
+    await asyncio.sleep(0)
+    assert statuses == ["running"]
+    assert registry.status_book.claim("conv_pty_dedup") is not None
+
+    registry.note_external_session_status("conv_pty_dedup", "idle")
+    on_idle()
+    await asyncio.sleep(0)
+
+    assert statuses == ["running"]
+    record = registry.status_book.current("conv_pty_dedup")
+    assert record is not None
+    assert record.status == "idle"
+    assert record.sources == {StatusSource.RELAY, StatusSource.PTY}
+    assert registry.status_book.claim("conv_pty_dedup") is None
+
+
+def test_relay_only_running_is_not_a_hard_claim() -> None:
+    """A relayed running alone is recorded but claims a turn only on request."""
+    registry = SessionResourceRegistry()
+    registry.note_external_session_status("conv_relay_only", "idle")
+    registry.note_external_session_status(
+        "conv_relay_only", "running", response_id="resp_1", blocked_on="permission prompt"
+    )
+
+    record = registry.status_book.current("conv_relay_only")
+    assert record is not None
+    assert record.status == "running"
+    assert record.sources == {StatusSource.RELAY}
+    assert record.response_id == "resp_1"
+    assert registry.status_book.blocked("conv_relay_only") is not None
+    assert registry.status_book.claim("conv_relay_only") is None
+    assert registry.status_book.claim("conv_relay_only", include_relay=True) == record
+
+
+@pytest.mark.asyncio
+async def test_registry_publish_hop_does_not_rerecord(tmp_path: Path) -> None:
+    """A queued pane running delivered after a relayed idle cannot revive the claim."""
+    from omnigent.runner.app import _session_event_queues_ref, create_runner_app
+    from tests.runner.helpers import NullServerClient
+
+    terminal_registry = TerminalRegistry()
+    registry = SessionResourceRegistry(terminal_registry=terminal_registry)
+    create_runner_app(
+        terminal_registry=terminal_registry,
+        resource_registry=registry,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    instance = make_test_terminal_instance("pi", "main", tmp_path)
+    terminal_registry._by_conversation.setdefault("conv_hop", {})[("pi", "main")] = instance
+    callbacks: dict[str, object] = {}
+
+    def _capture_watcher(on_idle: object | None = None, **kwargs: object) -> None:
+        callbacks["on_idle"] = on_idle
+        callbacks.update(kwargs)
+
+    instance.start_idle_watcher_thread = _capture_watcher  # type: ignore[attr-defined]
+    await registry.observe_required_terminal(
+        "conv_hop", "pi", "main", instance, resource_role=PI_NATIVE_TERMINAL_ROLE
+    )
+    on_activity = callbacks["on_activity"]
+    assert callable(on_activity)
+
+    try:
+        on_activity()
+        registry.note_external_session_status("conv_hop", "idle")
+        for _ in range(3):
+            await asyncio.sleep(0)
+
+        queue = _session_event_queues_ref["conv_hop"]
+        published = [
+            event["status"]
+            for event in (queue.get_nowait() for _ in range(queue.qsize()))
+            if event.get("type") == "session.status"
+        ]
+        assert published == ["running"]
+        record = registry.status_book.current("conv_hop")
+        assert record is not None
+        assert record.status == "idle"
+        assert registry.status_book.claim("conv_hop") is None
+    finally:
+        _session_event_queues_ref.pop("conv_hop", None)
+
+
+def test_reset_session_status_keeps_what_the_server_heard() -> None:
+    """A reset drops the status and exit memo but not the wire baseline or epoch."""
+    registry = SessionResourceRegistry()
+    registry.note_session_turn_started("conv_reset")
+    registry.note_external_session_status("conv_reset", "running")
+    epoch = registry.session_activity_epoch("conv_reset")
+
+    registry.reset_session_status("conv_reset", "required_terminal_exited")
+
+    assert registry.status_book.current("conv_reset") is None
+    assert not registry.session_turn_is_active("conv_reset")
+    assert registry.session_activity_epoch("conv_reset") == epoch
+    # A re-created pane's first edge must still read as a change on the wire.
+    assert registry._server_delivery_baseline["conv_reset"] == ("running", None)
 
 
 @pytest.mark.asyncio
@@ -748,8 +866,8 @@ async def test_reconnect_resync_republishes_a_running_session(tmp_path: Path) ->
 async def test_reconnect_resync_keeps_the_exit_classification_memo(tmp_path: Path) -> None:
     """The resync clears published edges, not the exit memo.
 
-    ``_last_session_status`` decides whether a terminal exit reads as a clean
-    shutdown or a mid-turn crash. It tracks what the PANE last did, not what the
+    The exit-classification memo decides whether a terminal exit reads as a
+    clean shutdown or a mid-turn crash. It tracks what the PANE last did, not what the
     server has heard, so a reconnect must leave it alone — clearing it would make
     a crash right after a reconnect look like a tidy exit.
     """
@@ -1034,13 +1152,15 @@ async def test_cleanup_session_clears_status_memo(tmp_path: Path) -> None:
     del tmp_path
     registry = SessionResourceRegistry()
     registry.note_session_turn_started("conv_cleanup")
-    assert "conv_cleanup" in registry._last_session_status
+    registry.note_external_session_status("conv_cleanup", "running")
     assert registry.session_activity_epoch("conv_cleanup") > 0
     assert registry.session_turn_is_active("conv_cleanup")
+    assert registry.status_book.current("conv_cleanup") is not None
 
     await registry.cleanup_session("conv_cleanup")
 
-    assert "conv_cleanup" not in registry._last_session_status
+    assert registry._take_session_status_memo("conv_cleanup") is None
+    assert registry.status_book.current("conv_cleanup") is None
     assert registry.session_activity_epoch("conv_cleanup") == 0
     assert not registry.session_turn_is_active("conv_cleanup")
 
@@ -1092,11 +1212,11 @@ async def test_transfer_terminal_moves_status_memo(
     moved = await registry.transfer_terminal("conv_src", "conv_dst", view.id)
 
     assert moved is not None
-    assert "conv_src" not in registry._last_session_status
-    assert registry._last_session_status.get("conv_dst") == "running"
     assert not registry.session_turn_is_active("conv_src")
     assert registry.session_turn_is_active("conv_dst")
     assert registry.session_activity_epoch("conv_dst") > 0
+    assert registry._take_session_status_memo("conv_src") is None
+    assert registry._take_session_status_memo("conv_dst") == "running"
 
 
 def test_get_resource_finds_default() -> None:
@@ -1926,3 +2046,525 @@ async def test_non_claude_terminal_never_acknowledges_billing_notice(
         on_tick()
 
     acknowledge.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_closing_a_native_pane_resets_its_session_status(tmp_path: Path) -> None:
+    """A re-created pane must not inherit the closed pane's running."""
+    terminal_registry = TerminalRegistry()
+    registry = SessionResourceRegistry(terminal_registry=terminal_registry)
+    instance = make_test_terminal_instance("claude", "main", tmp_path)
+    terminal_registry._by_conversation.setdefault("conv_close", {})[("claude", "main")] = instance
+    await _observe_native_agent_terminal_and_capture(
+        registry, terminal_registry, instance, "conv_close"
+    )
+    registry.note_session_turn_started("conv_close")
+    registry.note_external_session_status("conv_close", "running")
+    epoch = registry.session_activity_epoch("conv_close")
+
+    assert await registry.close_terminal("conv_close", "terminal_claude_main") is True
+
+    assert registry.status_book.current("conv_close") is None
+    assert not registry.session_turn_is_active("conv_close")
+    assert registry.session_activity_epoch("conv_close") == epoch
+
+
+@pytest.mark.asyncio
+async def test_side_shell_exit_keeps_session_status(tmp_path: Path) -> None:
+    """Only the agent's own pane takes the session's status with it."""
+    terminal_registry = TerminalRegistry()
+    registry = SessionResourceRegistry(terminal_registry=terminal_registry)
+    instance = make_test_terminal_instance("sidecar", "s1", tmp_path)
+    terminal_registry._by_conversation.setdefault("conv_side", {})[("sidecar", "s1")] = instance
+    callbacks: dict[str, object] = {}
+    done = asyncio.Event()
+
+    def _capture_watcher(on_idle: object | None = None, **kwargs: object) -> None:
+        callbacks.update(kwargs)
+
+    instance.start_idle_watcher_thread = _capture_watcher  # type: ignore[method-assign]
+    registry.set_terminal_exit_publisher(lambda _event: done.set())
+    await registry.observe_auxiliary_terminal("conv_side", "sidecar", "s1", instance)
+    registry.note_external_session_status("conv_side", "running")
+
+    on_exit = callbacks["on_exit"]
+    assert callable(on_exit)
+    on_exit()
+    await asyncio.wait_for(done.wait(), timeout=1.0)
+
+    record = registry.status_book.current("conv_side")
+    assert record is not None and record.status == "running"
+
+
+@pytest.mark.asyncio
+async def test_a_failing_status_record_never_breaks_the_watcher(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    callbacks, statuses, _pollers, registry = await _observe_native_with_fake_poller(
+        tmp_path, "conv_record_fails"
+    )
+
+    def _boom(*_args: object, **_kwargs: object) -> bool:
+        raise RuntimeError("book unavailable")
+
+    monkeypatch.setattr(registry.status_book, "record", _boom)
+    on_activity = callbacks["on_activity"]
+    assert callable(on_activity)
+    on_activity()
+    await asyncio.sleep(0)
+    assert statuses == ["running"]
+
+
+async def _observed_pane(
+    tmp_path: Path,
+    registry: SessionResourceRegistry,
+    terminal_registry: TerminalRegistry,
+    session_id: str,
+    name: str,
+    role: str | None,
+    *,
+    lifecycle: TerminalLifecycle = TerminalLifecycle.AUXILIARY,
+) -> TerminalInstance:
+    """Register and observe a fake pane without tmux or a watcher thread."""
+    instance = make_test_terminal_instance(name, "main", tmp_path / session_id)
+
+    async def _close() -> None:
+        instance.running = False
+
+    async def _no_link(_link: str) -> None:
+        return None
+
+    instance.close = _close  # type: ignore[method-assign]
+    instance.set_conversation_link = _no_link  # type: ignore[method-assign]
+    instance.start_idle_watcher_thread = lambda **_kwargs: None  # type: ignore[method-assign]
+    terminal_registry._by_conversation.setdefault(session_id, {})[(name, "main")] = instance
+    observe = (
+        registry.observe_required_terminal
+        if lifecycle is TerminalLifecycle.REQUIRED
+        else registry.observe_auxiliary_terminal
+    )
+    await observe(session_id, name, "main", instance, resource_role=role)
+    return instance
+
+
+@pytest.mark.asyncio
+async def test_closing_a_native_pane_resets_its_sessions_status(tmp_path: Path) -> None:
+    terminal_registry = TerminalRegistry()
+    registry = SessionResourceRegistry(terminal_registry=terminal_registry)
+    await _observed_pane(tmp_path, registry, terminal_registry, "conv_n", "goose", "goose-native")
+    registry.status_book.record("conv_n", "running", source=StatusSource.PTY)
+    registry._claim_status_edge("conv_n", "running", None)
+
+    assert await registry.close_terminal("conv_n", "terminal_goose_main")
+
+    assert registry.status_book.current("conv_n") is None
+    # What the server heard does not change when a pane closes.
+    assert registry._server_delivery_baseline["conv_n"] == ("running", None)
+
+
+@pytest.mark.asyncio
+async def test_a_relaunched_native_pane_does_not_resend_what_the_server_heard(
+    tmp_path: Path,
+) -> None:
+    # Closing a pane does not change what the server heard: the next pane's
+    # first edge repeating the last delivered one is still a duplicate (a
+    # second ``idle`` would, e.g., complete a scheduled run early).
+    session = "conv_relaunch_wire"
+    _callbacks, statuses, pollers, registry = await _observe_native_with_fake_poller(
+        tmp_path, session
+    )
+    pollers[0].active = True
+    pollers[0].emit("running")
+    pollers[0].emit("idle")
+    await asyncio.sleep(0)
+    assert statuses == ["running", "idle"]
+
+    assert await registry.close_terminal(session, "terminal_claude_main")
+    assert registry.status_book.current(session) is None
+    assert registry.status_poller_path(session) is None
+
+    second = tmp_path / "second"
+    second.mkdir()
+    instance = make_test_terminal_instance("claude", "main", second)
+    registry.terminal_registry._by_conversation.setdefault(session, {})[("claude", "main")] = (  # type: ignore[union-attr]
+        instance
+    )
+    instance.start_idle_watcher_thread = lambda *_a, **_k: None  # type: ignore[attr-defined]
+    await registry.observe_required_terminal(
+        session, "claude", "main", instance, resource_role=CLAUDE_NATIVE_TERMINAL_ROLE
+    )
+    pollers[-1].active = True
+    pollers[-1].emit("idle")
+    pollers[-1].emit("running")
+    await asyncio.sleep(0)
+    assert statuses == ["running", "idle", "running"]
+    current = registry.status_book.current(session)
+    assert current is not None and current.status == "running"
+
+
+@pytest.mark.asyncio
+async def test_closing_or_losing_a_side_shell_keeps_the_sessions_status(tmp_path: Path) -> None:
+    terminal_registry = TerminalRegistry()
+    registry = SessionResourceRegistry(terminal_registry=terminal_registry)
+    await _observed_pane(tmp_path, registry, terminal_registry, "conv_s", "bash", None)
+    registry.status_book.record("conv_s", "running", source=StatusSource.RUNNER)
+
+    assert await registry.close_terminal("conv_s", "terminal_bash_main")
+    record = registry.status_book.current("conv_s")
+    assert record is not None and record.status == "running"
+
+    await _observed_pane(tmp_path, registry, terminal_registry, "conv_s", "bash", None)
+    from omnigent.runner.resource_registry import TerminalLifecycle
+
+    await registry._handle_terminal_exit(
+        session_id="conv_s",
+        terminal_name="bash",
+        session_key="main",
+        lifecycle=TerminalLifecycle.AUXILIARY,
+    )
+    record = registry.status_book.current("conv_s")
+    assert record is not None and record.status == "running"
+
+
+@pytest.mark.asyncio
+async def test_a_native_pane_that_exits_takes_its_status_with_it(tmp_path: Path) -> None:
+    from omnigent.runner.resource_registry import TerminalLifecycle
+
+    terminal_registry = TerminalRegistry()
+    registry = SessionResourceRegistry(terminal_registry=terminal_registry)
+    await _observed_pane(tmp_path, registry, terminal_registry, "conv_x", "qwen", "qwen-native")
+    registry.status_book.record("conv_x", "running", source=StatusSource.PTY)
+
+    await registry._handle_terminal_exit(
+        session_id="conv_x",
+        terminal_name="qwen",
+        session_key="main",
+        lifecycle=TerminalLifecycle.AUXILIARY,
+    )
+
+    assert registry.status_book.current("conv_x") is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("how", "kept_while_served"),
+    [("exit", True), ("delete", True), ("teardown", False), ("required_exit", False)],
+)
+@pytest.mark.parametrize("role", [CODEX_NATIVE_TERMINAL_ROLE, OPENCODE_NATIVE_TERMINAL_ROLE])
+async def test_a_lost_tui_keeps_the_turn_its_vendor_server_still_runs(
+    tmp_path: Path, role: str, how: str, kept_while_served: bool
+) -> None:
+    """Codex and opencode run each turn in their vendor server, not in the TUI.
+
+    An auxiliary TUI that exits, or that a user deletes, while the server is
+    still registered keeps the session's status: whoever releases the server
+    resets it. A teardown that releases the server itself, and a required
+    terminal's exit, reset it at once; so does any TUI whose server is gone.
+    """
+    from omnigent.runner.native import orchestration
+
+    servers = (
+        orchestration._AUTO_CODEX_APP_SERVERS
+        if role == CODEX_NATIVE_TERMINAL_ROLE
+        else orchestration._AUTO_OPENCODE_SERVERS
+    )
+    name = role.removesuffix("-native")
+    terminal_registry = TerminalRegistry()
+    registry = SessionResourceRegistry(terminal_registry=terminal_registry)
+
+    async def _lose_tui(session_id: str) -> str | None:
+        lifecycle = (
+            TerminalLifecycle.REQUIRED if how == "required_exit" else TerminalLifecycle.AUXILIARY
+        )
+        await _observed_pane(
+            tmp_path, registry, terminal_registry, session_id, name, role, lifecycle=lifecycle
+        )
+        registry.note_external_session_status(session_id, "running")
+        terminal_id = f"terminal_{name}_main"
+        if how in ("exit", "required_exit"):
+            await registry._handle_terminal_exit(
+                session_id=session_id, terminal_name=name, session_key="main", lifecycle=lifecycle
+            )
+        else:
+            assert await registry.close_terminal(
+                session_id, terminal_id, keep_vendor_turn=how == "delete"
+            )
+        record = registry.status_book.current(session_id)
+        return None if record is None else record.status
+
+    servers["conv_served"] = object()  # type: ignore[assignment]
+    try:
+        assert await _lose_tui("conv_served") == ("running" if kept_while_served else None)
+    finally:
+        servers.pop("conv_served", None)
+    assert await _lose_tui("conv_unserved") is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("how", ["exit", "delete"])
+@pytest.mark.parametrize("role", [CODEX_NATIVE_TERMINAL_ROLE, OPENCODE_NATIVE_TERMINAL_ROLE])
+async def test_a_transferred_tui_keeps_its_turn_while_the_launching_sessions_server_lives(
+    tmp_path: Path, role: str, how: str
+) -> None:
+    """A TUI moved by a ``/clear`` rotation runs its turn in the launching session's server.
+
+    That server stays keyed by the launching session. Losing the moved TUI
+    keeps the rotated session's status while the server is registered, as for
+    the launching session's own TUI, and releasing the launching session's
+    sidecars resets it. With that server gone the loss resets it at once, even
+    when the rotated session has a server of its own: the turn never ran there.
+    """
+    from omnigent.runner.native import orchestration
+
+    servers = (
+        orchestration._AUTO_CODEX_APP_SERVERS
+        if role == CODEX_NATIVE_TERMINAL_ROLE
+        else orchestration._AUTO_OPENCODE_SERVERS
+    )
+    name = role.removesuffix("-native")
+    terminal_id = f"terminal_{name}_main"
+    terminal_registry = TerminalRegistry()
+    registry = SessionResourceRegistry(terminal_registry=terminal_registry)
+
+    async def _lose_moved_tui(launching: str, rotated: str) -> str | None:
+        await _observed_pane(tmp_path, registry, terminal_registry, launching, name, role)
+        assert await registry.transfer_terminal(launching, rotated, terminal_id)
+        assert registry.sidecar_home(rotated) == launching
+        registry.note_external_session_status(rotated, "running")
+        if how == "exit":
+            await registry._handle_terminal_exit(
+                session_id=rotated,
+                terminal_name=name,
+                session_key="main",
+                lifecycle=TerminalLifecycle.AUXILIARY,
+            )
+        else:
+            assert await registry.close_terminal(rotated, terminal_id, keep_vendor_turn=True)
+        record = registry.status_book.current(rotated)
+        return None if record is None else record.status
+
+    servers["conv_launch"] = object()  # type: ignore[assignment]
+    try:
+        assert await _lose_moved_tui("conv_launch", "conv_rotated") == "running"
+        # Releasing another session's sidecars leaves it alone ...
+        assert registry.reset_statuses_kept_for("conv_other", "idle_sidecar_sweep") == ()
+        assert registry.status_book.current("conv_rotated") is not None
+        # ... and releasing the launching session's resets it, once.
+        assert registry.reset_statuses_kept_for("conv_launch", "idle_sidecar_sweep") == (
+            "conv_rotated",
+        )
+        assert registry.status_book.current("conv_rotated") is None
+        assert registry.reset_statuses_kept_for("conv_launch", "idle_sidecar_sweep") == ()
+    finally:
+        servers.pop("conv_launch", None)
+
+    servers["conv_rotated_own"] = object()  # type: ignore[assignment]
+    try:
+        assert await _lose_moved_tui("conv_launch_gone", "conv_rotated_own") is None
+    finally:
+        servers.pop("conv_rotated_own", None)
+    assert registry.reset_statuses_kept_for("conv_launch_gone", "idle_sidecar_sweep") == ()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("event", "after"),
+    [
+        ("launching_sidecars_released", None),
+        ("launching_session_cleaned_up", None),
+        ("rotated_session_cleaned_up", None),
+        ("rotated_session_launches_its_own_pane", "running"),
+        ("a_pane_is_moved_into_the_rotated_session", "running"),
+        ("a_runner_turn_starts_on_the_rotated_session", "running"),
+    ],
+)
+async def test_a_rotated_sessions_kept_turn_ends_with_the_launching_sessions_server(
+    tmp_path: Path, event: str, after: str | None
+) -> None:
+    """What ends the status a rotated session kept for its launching session's server.
+
+    Releasing that server's sidecars, or cleaning up either session, resets
+    it. A pane of the rotated session's own (a relaunch, or one moved in), or
+    a runner turn started on it before its pane is up, takes over its status
+    instead, so a later release of the launching session's sidecars must not
+    reset a turn that pane or that turn may be running.
+
+    :param event: What happens after the moved TUI is lost.
+    :param after: The rotated session's status once the launching session's
+        sidecars are released after *event*.
+    """
+    from omnigent.runner.native import orchestration
+
+    terminal_id = "terminal_codex_main"
+    terminal_registry = TerminalRegistry()
+    registry = SessionResourceRegistry(terminal_registry=terminal_registry)
+    await _observed_pane(
+        tmp_path, registry, terminal_registry, "conv_launch", "codex", CODEX_NATIVE_TERMINAL_ROLE
+    )
+    assert await registry.transfer_terminal("conv_launch", "conv_rotated", terminal_id)
+    registry.note_external_session_status("conv_rotated", "running")
+    orchestration._AUTO_CODEX_APP_SERVERS["conv_launch"] = object()  # type: ignore[assignment]
+    try:
+        assert await registry.close_terminal("conv_rotated", terminal_id, keep_vendor_turn=True)
+        record = registry.status_book.current("conv_rotated")
+        assert record is not None and record.status == "running"
+        assert registry._vendor_turn_homes == {"conv_rotated": "conv_launch"}
+
+        if event == "launching_sidecars_released":
+            registry.reset_statuses_kept_for("conv_launch", "terminal_deleted")
+        elif event == "launching_session_cleaned_up":
+            await registry.cleanup_session("conv_launch")
+        elif event == "rotated_session_cleaned_up":
+            await registry.cleanup_session("conv_rotated")
+        elif event == "rotated_session_launches_its_own_pane":
+            await _observed_pane(
+                tmp_path,
+                registry,
+                terminal_registry,
+                "conv_rotated",
+                "codex",
+                CODEX_NATIVE_TERMINAL_ROLE,
+            )
+        elif event == "a_runner_turn_starts_on_the_rotated_session":
+            registry.note_session_turn_started("conv_rotated")
+        else:
+            await _observed_pane(
+                tmp_path,
+                registry,
+                terminal_registry,
+                "conv_elsewhere",
+                "codex",
+                CODEX_NATIVE_TERMINAL_ROLE,
+            )
+            assert await registry.transfer_terminal("conv_elsewhere", "conv_rotated", terminal_id)
+
+        assert registry.reset_statuses_kept_for("conv_launch", "idle_sidecar_sweep") == ()
+        record = registry.status_book.current("conv_rotated")
+        assert (None if record is None else record.status) == after
+        assert registry._vendor_turn_homes == {}
+    finally:
+        orchestration._AUTO_CODEX_APP_SERVERS.pop("conv_launch", None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("turn_on", ["conv_launch", "conv_other"])
+async def test_a_runner_turn_elsewhere_leaves_a_rotated_sessions_kept_turn_alone(
+    tmp_path: Path, turn_on: str
+) -> None:
+    """A runner turn on another session leaves a rotated session's kept status alone.
+
+    Only a turn on the rotated session itself takes that status over. A turn
+    started on the launching session, or on an unrelated one, keeps the
+    relation, so releasing the launching session's sidecars still resets the
+    rotated session's status.
+
+    :param turn_on: The session the runner turn starts on.
+    """
+    from omnigent.runner.native import orchestration
+
+    terminal_id = "terminal_codex_main"
+    terminal_registry = TerminalRegistry()
+    registry = SessionResourceRegistry(terminal_registry=terminal_registry)
+    await _observed_pane(
+        tmp_path, registry, terminal_registry, "conv_launch", "codex", CODEX_NATIVE_TERMINAL_ROLE
+    )
+    assert await registry.transfer_terminal("conv_launch", "conv_rotated", terminal_id)
+    registry.note_external_session_status("conv_rotated", "running")
+    orchestration._AUTO_CODEX_APP_SERVERS["conv_launch"] = object()  # type: ignore[assignment]
+    try:
+        assert await registry.close_terminal("conv_rotated", terminal_id, keep_vendor_turn=True)
+        assert registry._vendor_turn_homes == {"conv_rotated": "conv_launch"}
+
+        registry.note_session_turn_started(turn_on)
+
+        assert registry._vendor_turn_homes == {"conv_rotated": "conv_launch"}
+        record = registry.status_book.current("conv_rotated")
+        assert record is not None and record.status == "running"
+        assert registry.reset_statuses_kept_for("conv_launch", "idle_sidecar_sweep") == (
+            "conv_rotated",
+        )
+        assert registry.status_book.current("conv_rotated") is None
+        assert registry._vendor_turn_homes == {}
+    finally:
+        orchestration._AUTO_CODEX_APP_SERVERS.pop("conv_launch", None)
+
+
+@pytest.mark.asyncio
+async def test_a_replaced_native_panes_exit_keeps_its_successors_status(tmp_path: Path) -> None:
+    """A launch a successor already replaced must not reset the successor's turn."""
+    terminal_registry = TerminalRegistry()
+    registry = SessionResourceRegistry(terminal_registry=terminal_registry)
+    first = await _observed_pane(
+        tmp_path, registry, terminal_registry, "conv_r", "qwen", "qwen-native"
+    )
+    successor = make_test_terminal_instance("qwen", "main", tmp_path / "successor")
+    terminal_registry._by_conversation["conv_r"][("qwen", "main")] = successor
+    registry.status_book.record("conv_r", "running", source=StatusSource.PTY)
+
+    await registry._handle_terminal_exit(
+        session_id="conv_r",
+        terminal_name="qwen",
+        session_key="main",
+        lifecycle=TerminalLifecycle.AUXILIARY,
+        instance=first,
+    )
+
+    assert terminal_registry.get("conv_r", "qwen", "main") is successor
+    record = registry.status_book.current("conv_r")
+    assert record is not None and record.status == "running"
+
+
+@pytest.mark.asyncio
+async def test_a_transferred_native_pane_remembers_the_session_whose_sidecars_serve_it(
+    tmp_path: Path,
+) -> None:
+    from omnigent.runner.resource_registry import TerminalLifecycle
+
+    terminal_registry = TerminalRegistry()
+    registry = SessionResourceRegistry(terminal_registry=terminal_registry)
+
+    async def _claude_pane(session_id: str) -> None:
+        await _observed_pane(
+            tmp_path, registry, terminal_registry, session_id, "claude", "claude-native"
+        )
+
+    await _claude_pane("conv_a")
+    assert registry.sidecar_home("conv_a") == "conv_a"
+
+    # /clear twice: a -> b -> c. The sidecars stay keyed by conv_a throughout.
+    assert await registry.transfer_terminal("conv_a", "conv_b", "terminal_claude_main")
+    assert await registry.transfer_terminal("conv_b", "conv_c", "terminal_claude_main")
+    assert registry.sidecar_home("conv_c") == "conv_a"
+    assert registry.sidecar_home("conv_b") == "conv_b"
+
+    # Transferred back to the launching session: no indirection left.
+    assert await registry.transfer_terminal("conv_c", "conv_a", "terminal_claude_main")
+    assert registry.sidecar_home("conv_a") == "conv_a"
+    assert registry._sidecar_homes == {}
+
+    # A pane's close, its exit and session cleanup each drop the link.
+    assert await registry.transfer_terminal("conv_a", "conv_d", "terminal_claude_main")
+    assert await registry.close_terminal("conv_d", "terminal_claude_main")
+    assert registry.sidecar_home("conv_d") == "conv_d"
+    await _claude_pane("conv_e")
+    assert await registry.transfer_terminal("conv_e", "conv_f", "terminal_claude_main")
+    await registry._handle_terminal_exit(
+        session_id="conv_f",
+        terminal_name="claude",
+        session_key="main",
+        lifecycle=TerminalLifecycle.AUXILIARY,
+    )
+    assert registry.sidecar_home("conv_f") == "conv_f"
+    await _claude_pane("conv_g")
+    assert await registry.transfer_terminal("conv_g", "conv_h", "terminal_claude_main")
+    await registry.cleanup_session("conv_h")
+    assert registry.sidecar_home("conv_h") == "conv_h"
+
+
+@pytest.mark.asyncio
+async def test_transferring_a_side_shell_records_no_sidecar_link(tmp_path: Path) -> None:
+    terminal_registry = TerminalRegistry()
+    registry = SessionResourceRegistry(terminal_registry=terminal_registry)
+    await _observed_pane(tmp_path, registry, terminal_registry, "conv_a", "bash", None)
+    assert await registry.transfer_terminal("conv_a", "conv_b", "terminal_bash_main")
+    assert registry.sidecar_home("conv_b") == "conv_b"

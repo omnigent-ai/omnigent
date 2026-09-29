@@ -20,6 +20,7 @@ from omnigent.harnesses.cursor_native import bridge as cursor_native_bridge
 from omnigent.harnesses.kiro_native import bridge as kiro_native_bridge
 from omnigent.harnesses.qwen_native import bridge as qwen_native_bridge
 from omnigent.runner import create_runner_app
+from omnigent.runner.session_status import StatusSource
 from omnigent.spec.types import AgentSpec, ExecutorSpec
 from omnigent.terminals import TerminalRegistry
 from tests.runner.conftest import (
@@ -2166,6 +2167,8 @@ async def _post_model_change_with_status_sequence(
     picker_source: str = "bridge",
     empty_session_catalog: bool = False,
     stored_catalog_rows: list[dict[str, object]] | None = None,
+    status_source: StatusSource = StatusSource.RUNNER,
+    prior_status: str | None = None,
 ) -> Any:
     """Run one claude-native ``model_change`` with a scripted status file.
 
@@ -2259,8 +2262,14 @@ async def _post_model_change_with_status_sequence(
             },
         )
         assert create_resp.status_code == 201, create_resp.text
+        if prior_status is not None:
+            app.state.session_status_book.record(
+                "68c7c1acc5eeec3978c5e62043da51a5", prior_status, source=StatusSource.RUNNER
+            )
         if pane_status is not None:
-            app.state.native_pane_status["68c7c1acc5eeec3978c5e62043da51a5"] = pane_status
+            app.state.session_status_book.record(
+                "68c7c1acc5eeec3978c5e62043da51a5", pane_status, source=status_source
+            )
         if picker_source == "session" or empty_session_catalog:
             catalog = await client.get(
                 "/v1/sessions/68c7c1acc5eeec3978c5e62043da51a5/claude-model-options"
@@ -2429,8 +2438,37 @@ async def test_events_model_change_unconfirmed_switch_answers_503(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("status_source", [StatusSource.RELAY, StatusSource.STATUS_FILE])
+async def test_events_model_change_after_the_turn_ended_answers_503(
+    monkeypatch: pytest.MonkeyPatch, status_source: StatusSource
+) -> None:
+    """An idle on another channel than the running ends the turn for ``/model``."""
+    resp = await _post_model_change_with_status_sequence(
+        monkeypatch,
+        ["claude-opus-4-6"],
+        pane_status="idle",
+        status_source=status_source,
+        prior_status="running",
+    )
+    assert resp.status_code == 503, resp.text
+    assert resp.json()["error"] == "claude_native_model_unconfirmed"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("pane_status", "status_source"),
+    [
+        ("running", StatusSource.RUNNER),
+        # Claude's own status file, which the runner never publishes itself.
+        ("running", StatusSource.STATUS_FILE),
+        ("running", StatusSource.PTY),
+        ("running", StatusSource.RELAY),
+        # Recorded as ``waiting`` even when an old server hears ``running``.
+        ("waiting", StatusSource.RUNNER),
+    ],
+)
 async def test_events_model_change_mid_turn_defers_instead_of_failing(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, pane_status: str, status_source: StatusSource
 ) -> None:
     """A switch during an active turn is deferred, never a visible failure.
 
@@ -2444,7 +2482,8 @@ async def test_events_model_change_mid_turn_defers_instead_of_failing(
     resp = await _post_model_change_with_status_sequence(
         monkeypatch,
         ["claude-opus-4-6"],
-        pane_status="running",
+        pane_status=pane_status,
+        status_source=status_source,
     )
     assert resp.status_code == 204, resp.text
 

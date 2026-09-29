@@ -129,9 +129,12 @@ from omnigent.runner.native.orchestration import (
     _terminal_lookup_miss_reason,
     _terminal_tmux_pane,
     _unwrap_resolved_spec,
+    has_native_pane_sidecars,
+    native_pane_sidecar_sessions,
     teardown_all_codex_native_app_servers,
     teardown_all_opencode_native_servers,
     teardown_codex_native_app_server,
+    teardown_native_pane_sidecars,
     teardown_opencode_native_server,
 )
 
@@ -264,8 +267,11 @@ __all__ = [
     "_terminal_lookup_miss_reason",
     "_terminal_tmux_pane",
     "_unwrap_resolved_spec",
+    "has_native_pane_sidecars",
+    "native_pane_sidecar_sessions",
     "teardown_all_codex_native_app_servers",
     "teardown_all_opencode_native_servers",
     "teardown_codex_native_app_server",
+    "teardown_native_pane_sidecars",
     "teardown_opencode_native_server",
 ]

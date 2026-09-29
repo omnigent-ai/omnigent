@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import os
 import shutil
 import uuid
 from collections.abc import AsyncIterator, Callable
@@ -1298,3 +1299,153 @@ async def test_failed_launch_rolls_back_the_relay_it_started(tmp_path: Path) -> 
             ) as c:
                 await c.delete(f"/v1/sessions/{session_id}")
         shutil.rmtree(bridge_dir, ignore_errors=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["/policies/evaluate", "/hook/claude/evaluate-policy"])
+@pytest.mark.parametrize("fails", [False, True])
+async def test_relay_policy_wait_parks_the_session_for_its_duration(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    path: str,
+    fails: bool,
+) -> None:
+    """The agent waits on the policy verdict, possibly on a human ASK card."""
+    import asyncio
+
+    from omnigent.harnesses.claude_native.bridge import prepare_bridge_dir as _prep
+    from omnigent.harnesses.claude_native.bridge import start_tool_relay
+    from omnigent.native import prompt_parks
+
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path / "root")
+    bridge_dir = _prep("relay-policy-park", workspace=tmp_path)
+    session_id = "conv_relay_park"
+    seen: list[tuple[str, ...]] = []
+
+    class _ServerClient:
+        content = b'{"result":"POLICY_ACTION_ALLOW"}'
+        status_code = 200
+        headers: dict[str, str] = {"Content-Type": "application/json"}
+
+        async def post(self, url: str, **kwargs: object) -> _ServerClient:
+            del url, kwargs
+            seen.append(prompt_parks.open_keys(session_id))
+            if fails:
+                raise httpx.ConnectError("server down")
+            return self
+
+    relay = start_tool_relay(
+        bridge_dir=bridge_dir,
+        tools=[],
+        tool_executor=lambda name, args: {},  # type: ignore[arg-type]
+        loop=asyncio.get_running_loop(),
+        policy_client=_ServerClient(),
+        session_id=session_id,
+    )
+    try:
+        info = json.loads((bridge_dir / _TOOL_RELAY_FILE).read_text())
+        body = (
+            {"event": {"type": "PHASE_TOOL_CALL", "target": "", "data": {"name": "Bash"}}}
+            if path == "/policies/evaluate"
+            else {"hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_input": {}}
+        )
+        async with httpx.AsyncClient() as client:
+            await client.post(
+                f"{info['url']}{path}",
+                json=body,
+                headers={"Authorization": f"Bearer {info['token']}"},
+                timeout=10.0,
+            )
+    finally:
+        relay.close()
+    assert seen
+    assert all(len(keys) == 1 and keys[0].startswith("relay-policy:") for keys in seen)
+    assert prompt_parks.open_keys(session_id) == ()
+
+
+@pytest.mark.asyncio
+async def test_hermes_policy_hook_waits_on_the_relay_under_a_park(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Hermes' pre_tool_call wrapper runs the shipped hook, which waits on the relay.
+
+    Once the wrapper is rewritten onto the relay, the hook posts to its
+    ``/policies/evaluate`` and hermes blocks on the verdict, so the session
+    stays parked for the whole wait and is released when the verdict returns.
+    """
+    import asyncio
+
+    from omnigent.harnesses.claude_native.bridge import prepare_bridge_dir as _prep
+    from omnigent.harnesses.claude_native.bridge import start_tool_relay
+    from omnigent.harnesses.hermes_native import bridge as hermes_bridge
+    from omnigent.native import prompt_parks
+
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path / "root")
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    for name in [name for name in os.environ if name.startswith("DATABRICKS_")]:
+        monkeypatch.delenv(name, raising=False)
+    bridge_dir = _prep("hermes-policy-park", workspace=tmp_path)
+    session_id = "conv_hermes_policy_park"
+    posted = asyncio.Event()
+    verdict_ready = asyncio.Event()
+
+    class _ServerClient:
+        content = b'{"result":"POLICY_ACTION_ALLOW"}'
+        status_code = 200
+        headers: dict[str, str] = {"Content-Type": "application/json"}
+
+        async def post(self, url: str, **kwargs: object) -> _ServerClient:
+            del url, kwargs
+            posted.set()
+            await verdict_ready.wait()
+            return self
+
+    relay = start_tool_relay(
+        bridge_dir=bridge_dir,
+        tools=[],
+        tool_executor=lambda name, args: {},  # type: ignore[arg-type]
+        loop=asyncio.get_running_loop(),
+        policy_client=_ServerClient(),
+        session_id=session_id,
+    )
+    hermes_dir = tmp_path / "hermes-bridge"
+    hermes_home = hermes_bridge.write_policy_hook_config(
+        hermes_dir, "http://127.0.0.1:9", session_id
+    )
+    info = json.loads((bridge_dir / _TOOL_RELAY_FILE).read_text())
+    assert hermes_bridge.inject_relay_into_policy_hook(
+        hermes_dir,
+        relay_url=info["url"],
+        relay_token=info["token"],
+        server_url="http://127.0.0.1:9",
+        session_id=session_id,
+    )
+    hook = await asyncio.create_subprocess_exec(
+        "/bin/sh",
+        str(hermes_home / "omnigent-policy-hook.sh"),
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    call = {"hook_event_name": "pre_tool_call", "tool_name": "terminal", "tool_input": {}}
+    try:
+        communicate = asyncio.create_task(hook.communicate(json.dumps(call).encode()))
+        await asyncio.wait_for(posted.wait(), timeout=60)
+        for _ in range(500):
+            if prompt_parks.open_keys(session_id):
+                break
+            await asyncio.sleep(0.01)
+        (key,) = prompt_parks.open_keys(session_id)
+        assert key.startswith("relay-policy:")
+        verdict_ready.set()
+        stdout, stderr = await asyncio.wait_for(communicate, timeout=60)
+    finally:
+        verdict_ready.set()
+        if hook.returncode is None:
+            hook.kill()
+        relay.close()
+    assert hook.returncode == 0, stderr.decode()
+    assert json.loads(stdout) == {}
+    assert prompt_parks.open_keys(session_id) == ()

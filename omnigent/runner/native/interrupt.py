@@ -322,6 +322,7 @@ class NativeInterruptRunner:
         codex_bridge_state_for_session: CodexBridgeStateForSession,
         client_safe_error_detail: ClientSafeErrorDetail,
         logger: logging.Logger,
+        record_control_idle: Callable[[str], None] | None = None,
     ) -> None:
         self._server_client = server_client
         self._resource_registry = resource_registry
@@ -331,6 +332,9 @@ class NativeInterruptRunner:
         self._codex_bridge_state_for_session = codex_bridge_state_for_session
         self._client_safe_error_detail = client_safe_error_detail
         self._logger = logger
+        # Records a local idle after an accepted interrupt/stop, for harnesses
+        # whose idle no pane or status file reports.
+        self._record_control_idle = record_control_idle
 
     async def interrupt(self, harness_name: str | None, conv_id: str) -> Response | None:
         """Dispatch an interrupt to the harness's bridge.
@@ -372,7 +376,7 @@ class NativeInterruptRunner:
         spec = _UNIFORM_STOP.get(key)
         if spec is None:
             return None
-        return await self._uniform_stop(spec, conv_id)
+        return await self._uniform_stop(spec, conv_id, terminal_role=agent.harness)
 
     def _wake_parent_after_native_interrupt(self, conv_id: str) -> None:
         delivery_ack = self._mark_subagent_terminal_and_wake(
@@ -447,10 +451,22 @@ class NativeInterruptRunner:
         # is why publishing here would double it.
         if terminal_role is not None and terminal_role not in _STATUS_EMITTING_TERMINAL_ROLES:
             self._publish_event(conv_id, {"type": "session.status", "status": "idle"})
+            self._note_control_idle(conv_id)
         self._wake_parent_after_native_interrupt(conv_id)
         return Response(status_code=204)
 
-    async def _uniform_stop(self, spec: _UniformStop, conv_id: str) -> Response:
+    def _note_control_idle(self, conv_id: str) -> None:
+        if self._record_control_idle is None:
+            return
+        try:
+            self._record_control_idle(conv_id)
+        except Exception:
+            # Bookkeeping must not fail an accepted interrupt.
+            self._logger.exception("Recording control idle failed for session=%s", conv_id)
+
+    async def _uniform_stop(
+        self, spec: _UniformStop, conv_id: str, *, terminal_role: str | None = None
+    ) -> Response:
         module = importlib.import_module(spec.module)
         try:
             await asyncio.to_thread(
@@ -471,6 +487,8 @@ class NativeInterruptRunner:
         await self._teardown_session_terminals(conv_id)
         await _cancel_auto_forwarder_task(conv_id)
         self._publish_event(conv_id, {"type": "session.status", "status": "idle"})
+        if terminal_role is not None and terminal_role not in _STATUS_EMITTING_TERMINAL_ROLES:
+            self._note_control_idle(conv_id)
         delivery_ack = self._mark_subagent_terminal_and_wake(
             conv_id,
             status="cancelled",
@@ -649,5 +667,9 @@ class NativeInterruptRunner:
         finally:
             with contextlib.suppress(Exception):
                 await codex_client.close()
+        # Codex accepted turn/interrupt for a turn it had started, so that turn
+        # is over. Its idle otherwise arrives only through the forwarder relay.
+        if state.active_turn_id is not None:
+            self._note_control_idle(conv_id)
         self._wake_parent_after_native_interrupt(conv_id)
         return Response(status_code=204)

@@ -3636,7 +3636,7 @@ async def test_required_terminal_exit_while_idle_does_not_fail_session(tmp_path:
             instance,
         )
         # The session reached idle (turn completed) before the pane vanished.
-        resource_registry._last_session_status[conv_id] = "idle"
+        resource_registry._set_session_status_memo(conv_id, "idle")
         on_exit = callbacks.get("on_exit")
         assert callable(on_exit)
         on_exit()

@@ -160,5 +160,7 @@ _can_forward = (
 Native `run_turn` returns as soon as `send-keys` finishes pasting (not when the
 agent finishes). `_active_turns` clears immediately, so the buffer drains the
 next message quickly and it pastes into the still-live pane — the native app then
-decides to steer it. `_native_pane_status` is the reliable liveness signal for a
-long autonomous native turn (since `_active_turns` clears early).
+decides to steer it. A long autonomous native turn is tracked by the session's
+recorded status in `SessionStatusBook` (since `_active_turns` clears early).
+That status is a claim, not liveness: see "Session status and liveness" in the
+root `AGENTS.md` and `docs/native-pane-reaping.md`.

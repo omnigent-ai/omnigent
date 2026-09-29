@@ -90,6 +90,46 @@ the caller's intent rather than repeat SQL syntax; use a nested
 subqueries. Because the named session covers implicit flush and commit, don't
 add an explicit `flush()` only to make a query name observable.
 
+## Session status and liveness
+
+Session status reaches the runner on several lossy channels: its own turn
+edges, the pane watcher, Claude's status file, forwarder relays and
+interrupts. A dict of "the status this runner last published" once missed the
+relayed edges, and the pane reaper trusted its stale `running`, so finished
+panes were never reaped.
+
+- **One source of truth.** Every status edge is recorded in `SessionStatusBook`
+  (`omnigent/runner/session_status.py`) through one of its recorders.
+  A new channel gets a new `StatusSource`; it does not get its own dict.
+- **Caches are derived and owned by the recorder.** Any view of status is
+  updated by the call that records the edge and cleared by the book's
+  `reset`/`forget`. The wire dedup baseline records what the server heard,
+  not what the session is doing.
+- **A recorded status is a claim, never a veto.** A `running` can stay stale
+  forever. A decision to keep a pane, process or turn alive needs first-hand
+  evidence too (a live runner turn, pane output, a harness probe, a pending
+  prompt) and must still conclude if the status never changes again.
+  Presence is not evidence either: an attached viewer keeps a pane only while
+  a human drives it (a CLI keypress or a web-terminal event within the busy
+  window), never merely because it is attached.
+  The one sanctioned claim-based hold is the runner idle watchdog's
+  native-turn hold (`_native_turn_in_flight` in `omnigent/runner/app.py`). A
+  recorded `running`/`waiting` keeps the runner up for at most
+  `OMNIGENT_NATIVE_PANE_MAX_TURN_S` (floored at an hour) after the start of
+  its episode or the turn's last first-hand evidence of work (the agent pane's
+  output, a runner dispatch). A dialog the agent reported (`blocked_on`) or an
+  open prompt park keeps it up for at most `OMNIGENT_NATIVE_PANE_APPROVAL_MAX_S`
+  from when it opened, whatever `OMNIGENT_NATIVE_PANE_MAX_TURN_S` is. A
+  re-asserted status never renews either, and a reap ends them sooner (a
+  refutation ends a recorded claim). Do not add another.
+- **New native harnesses conform.** Declare `pane_reap` and `status_owner` in
+  `omnigent/harness_plugins.py`; `tests/runner/test_native_pane_reap_conformance.py`
+  then runs the harness through every scenario and must pass without new
+  `_KNOWN_GAPS`.
+
+Code review enforces the first rule above: record through the book, and do
+not add another copy of status. See `docs/native-pane-reaping.md`.
+
 ## Framework-owned instructions
 
 Keep runtime lifecycle and metadata instructions separate from portable agent

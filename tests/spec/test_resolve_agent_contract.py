@@ -295,3 +295,15 @@ def test_recording_blockers_are_explicit_and_do_not_block_delivery() -> None:
     assert "name the specific blocker in `recording_unavailable_reason`" in normalized
     assert "Text-only CLI output is not a reason to skip recording" in normalized
     assert "Do not block the fix or PR because footage is missing or rejected" in normalized
+
+
+def test_root_cause_audits_cached_state_before_trusting_it() -> None:
+    normalized = _normalized_resolve_instructions()
+    root_cause = normalized.split("### 2B.2", 1)[1].split("### 2B.3", 1)[0]
+    review = normalized.split("## Step 2A", 1)[1].split("## Step 2B", 1)[0]
+
+    assert "list every writer (grep for each assignment and mutating call)" in root_cause
+    assert "a stale value must never block a decision on its own" in root_cause
+    assert "When an existing test asserts the stale value, it documents the bug" in root_cause
+    assert "through the production route that carries it in real use" in root_cause
+    assert "apply the 2B.2 cached-state check to it" in review

@@ -62,12 +62,14 @@ class McpExecutionRegistry:
     def __init__(self) -> None:
         self._entries: dict[tuple[str, str, str], _Execution] = {}
         self._operation_leases: dict[tuple[str, str], int] = {}
+        self._lease_started_at: dict[tuple[str, str], float] = {}
         self._released_at: dict[tuple[str, str], float] = {}
 
     def retain_operation(self, session_id: str, operation_id: str) -> None:
         """Keep an operation reattachable while its originating call is live."""
         key = (session_id, operation_id)
         self._operation_leases[key] = self._operation_leases.get(key, 0) + 1
+        self._lease_started_at.setdefault(key, monotonic())
         self._released_at.pop(key, None)
         self._prune()
 
@@ -81,6 +83,7 @@ class McpExecutionRegistry:
         if leases == 0:
             return
         self._operation_leases.pop(key, None)
+        self._lease_started_at.pop(key, None)
         if any(entry_key[:2] == key for entry_key in self._entries):
             self._released_at[key] = monotonic()
         self._prune()
@@ -94,6 +97,34 @@ class McpExecutionRegistry:
             stored_session == session_id and stored_operation == operation_id
             for stored_session, stored_operation, _step in self._entries
         )
+
+    def has_live_operation(self, session_id: str) -> bool:
+        """Whether a tool call for *session_id* is running right now.
+
+        True while a caller holds an operation lease (a proxied tool call,
+        including one parked on an approval) or a retained execution has not
+        finished. Completed-but-retained results do not count.
+
+        :param session_id: Session/conversation id, e.g. ``"conv_abc123"``.
+        """
+        if any(key[0] == session_id for key in self._operation_leases):
+            return True
+        return any(
+            key[0] == session_id and not entry.task.done() for key, entry in self._entries.items()
+        )
+
+    def oldest_live_operation_age_s(self, session_id: str) -> float | None:
+        """Seconds since the session's oldest live operation lease began.
+
+        :param session_id: Session/conversation id, e.g. ``"conv_abc123"``.
+        :returns: The age, or ``None`` when no lease is held.
+        """
+        starts = [
+            started for key, started in self._lease_started_at.items() if key[0] == session_id
+        ]
+        if not starts:
+            return None
+        return max(0.0, monotonic() - min(starts))
 
     async def execute(
         self,
@@ -141,6 +172,7 @@ class McpExecutionRegistry:
         for key in tuple(self._operation_leases):
             if key[0] == session_id:
                 self._operation_leases.pop(key, None)
+                self._lease_started_at.pop(key, None)
         for key in tuple(self._released_at):
             if key[0] == session_id:
                 self._released_at.pop(key, None)

@@ -30,6 +30,8 @@ Scenarios (from the plan's Step-1):
 
 from __future__ import annotations
 
+import contextlib
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -744,3 +746,32 @@ def test_tui_injector_for_binds_an_explicit_bridge_dir(
     asyncio.run(tui_injector_for(bridge_dir)(["1", "Enter"]))
 
     assert calls == [(bridge_dir, ("1", "Enter"))]
+
+
+async def test_reader_parks_the_session_while_an_interaction_is_bridged(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """agy is gated on a WAITING step until the interaction bridge resolves it."""
+    from omnigent.harnesses.antigravity_native import interactions, reader
+    from omnigent.native import prompt_parks
+
+    seen: list[tuple[str, ...]] = []
+
+    async def _bridge(*_args: object, **_kwargs: object) -> None:
+        seen.append(prompt_parks.open_keys("conv_agy"))
+        raise RuntimeError("card post failed")
+
+    async def _one_pending_then_stop(
+        _bridge_dir: Path, _session_id: str, *, on_pending_interaction: object, **_kw: object
+    ) -> None:
+        pending = {"kind": "permission", "trajectory_id": "traj", "step_index": 4, "spec": {}}
+        with contextlib.suppress(RuntimeError):
+            await on_pending_interaction("cascade_1", 7, pending)  # type: ignore[operator]
+
+    monkeypatch.setattr(interactions, "bridge_interaction", _bridge)
+    monkeypatch.setattr(reader, "supervise_reader", _one_pending_then_stop)
+    await reader.run_reader_with_bridge(
+        base_url="http://x", headers={}, auth=None, session_id="conv_agy", bridge_dir=tmp_path
+    )
+    assert seen == [("antigravity:cascade_1:traj:4",)]
+    assert prompt_parks.open_keys("conv_agy") == ()

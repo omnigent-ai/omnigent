@@ -136,3 +136,67 @@ async def test_reattach_rejects_changed_execution_parameters() -> None:
         )
 
     assert invocations == 1
+
+
+@pytest.mark.asyncio
+async def test_live_operation_tracks_leases_and_unfinished_executions() -> None:
+    """A lease or an unfinished execution marks the session as mid tool call."""
+    registry = McpExecutionRegistry()
+    assert registry.has_live_operation("conv_tool") is False
+    assert registry.oldest_live_operation_age_s("conv_tool") is None
+
+    registry.retain_operation("conv_tool", "mcpop_a")
+    registry.retain_operation("conv_tool", "mcpop_a")
+    assert registry.has_live_operation("conv_tool") is True
+    assert registry.has_live_operation("conv_other") is False
+    age = registry.oldest_live_operation_age_s("conv_tool")
+    assert age is not None and age >= 0.0
+    registry.release_operation("conv_tool", "mcpop_a")
+    assert registry.has_live_operation("conv_tool") is True
+    registry.release_operation("conv_tool", "mcpop_a")
+    assert registry.has_live_operation("conv_tool") is False
+    assert registry.oldest_live_operation_age_s("conv_tool") is None
+
+    release = asyncio.Event()
+
+    async def _work() -> McpExecutionResult:
+        await release.wait()
+        return McpExecutionResult(status_code=200, content={})
+
+    waiter = asyncio.create_task(
+        registry.execute(
+            session_id="conv_tool",
+            operation_id="mcpop_b",
+            step="initial",
+            params={"method": "tools/call"},
+            run=_work,
+        )
+    )
+    await asyncio.sleep(0)
+    assert registry.has_live_operation("conv_tool") is True
+    release.set()
+    await waiter
+    assert registry.has_live_operation("conv_tool") is False
+
+
+@pytest.mark.asyncio
+async def test_proxy_call_holds_a_lease_for_its_whole_duration() -> None:
+    """``ProxyMcpManager.call_tool`` leases the operation until it returns or raises."""
+    from omnigent.runner.proxy_mcp_manager import ProxyMcpManager
+
+    registry = McpExecutionRegistry()
+    manager = ProxyMcpManager.__new__(ProxyMcpManager)
+    manager._execution_registry = registry  # type: ignore[attr-defined]
+    manager._session_id = "conv_proxy"  # type: ignore[attr-defined]
+    observed: list[bool] = []
+
+    async def _call(tool_name: str, arguments: dict[str, object], operation_id: str) -> str:
+        del tool_name, arguments, operation_id
+        observed.append(registry.has_live_operation("conv_proxy"))
+        raise RuntimeError("tool failed")
+
+    manager._call_tool_with_operation = _call  # type: ignore[method-assign]
+    with pytest.raises(RuntimeError):
+        await manager.call_tool(None, "github__search", {})
+    assert observed == [True]
+    assert registry.has_live_operation("conv_proxy") is False

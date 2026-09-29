@@ -403,3 +403,47 @@ async def test_supervise_mirror_skips_request_resolved_in_same_poll_batch(
         task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await task
+
+
+@pytest.mark.asyncio
+async def test_supervise_parks_each_request_until_its_response(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A request stays parked after its card delivery ends, until qwen answers it."""
+    from omnigent.native import prompt_parks
+
+    delivered = asyncio.Event()
+
+    async def _card_post_failed(_client: object, **_kw: object) -> None:
+        delivered.set()
+
+    monkeypatch.setattr(qnp, "_run_one_approval", _card_post_failed)
+    events_file = events_file_path(tmp_path)
+    events_file.write_bytes(b"")
+    task = asyncio.create_task(
+        qnp.supervise_qwen_approval_mirror(
+            base_url="http://t",
+            headers={},
+            session_id="conv_qpark",
+            bridge_dir=tmp_path,
+            poll_interval_s=0.001,
+        )
+    )
+    try:
+        await asyncio.sleep(0.02)
+        with open(events_file, "ab") as fh:
+            fh.write(_ev_bytes(_can_use_tool_ev("r7")))
+        await asyncio.wait_for(delivered.wait(), 2.0)
+        await asyncio.sleep(0.02)
+        assert prompt_parks.open_keys("conv_qpark") == ("qwen:r7",)
+        with open(events_file, "ab") as fh:
+            fh.write(_ev_bytes(_control_response_ev("r7")))
+        for _ in range(400):
+            if not prompt_parks.open_keys("conv_qpark"):
+                break
+            await asyncio.sleep(0.005)
+        assert prompt_parks.open_keys("conv_qpark") == ()
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task

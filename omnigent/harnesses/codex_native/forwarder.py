@@ -54,6 +54,7 @@ from omnigent.harnesses.codex_native.elicitation import (
 from omnigent.harnesses.codex_native.elicitation import (
     is_codex_request_id as _is_codex_request_id,
 )
+from omnigent.native import prompt_parks
 from omnigent.native._native_forwarder_health import (
     note_post_success as note_native_post_success,
 )
@@ -1742,6 +1743,12 @@ class _PendingCodexElicitation:
     turn_id: str | None
     request_id: int | str
     elicitation_id: str
+    session_id: str | None = None
+
+    @property
+    def park_key(self) -> str:
+        """Prompt-park key for this request, e.g. ``"codex:elicit_codex_abc"``."""
+        return f"codex:{self.elicitation_id}"
 
 
 class _CodexElicitationTaskTracker:
@@ -1799,7 +1806,7 @@ class _CodexElicitationTaskTracker:
             ),
             name="codex-native-elicitation-hook",
         )
-        self._pending[task] = _PendingCodexElicitation(
+        pending = _PendingCodexElicitation(
             thread_id=_thread_id_from_params(params),
             turn_id=_turn_id_from_payload(params.get("turn")) or _turn_id_from_payload(params),
             request_id=request_id,
@@ -1808,7 +1815,11 @@ class _CodexElicitationTaskTracker:
                 method,
                 request_id,
             ),
+            session_id=session_id,
         )
+        self._pending[task] = pending
+        # Codex is blocked on this request until it resolves or the wait ends.
+        prompt_parks.open_park(session_id, pending.park_key)
         task.add_done_callback(self._discard_done)
 
     async def resolve_by_server_notification(
@@ -1894,6 +1905,8 @@ class _CodexElicitationTaskTracker:
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
+        for pending in self._pending.values():
+            _close_codex_park(pending)
         self._pending.clear()
         self._posted_resolutions.clear()
 
@@ -1938,6 +1951,8 @@ class _CodexElicitationTaskTracker:
         :returns: None.
         """
         pending = self._pending.pop(task, None)
+        if pending is not None:
+            _close_codex_park(pending)
         if task.cancelled():
             if pending is not None:
                 self._posted_resolutions.discard(pending.elicitation_id)
@@ -1960,6 +1975,7 @@ class _CodexElicitationTaskTracker:
         :param pending: Pending hook wait metadata to resolve.
         :returns: None.
         """
+        _close_codex_park(pending)
         if pending.elicitation_id in self._posted_resolutions:
             return
         posted = await _post_external_elicitation_resolved(
@@ -1969,6 +1985,12 @@ class _CodexElicitationTaskTracker:
         )
         if posted:
             self._posted_resolutions.add(pending.elicitation_id)
+
+
+def _close_codex_park(pending: _PendingCodexElicitation) -> None:
+    """Close the prompt park a tracked Codex request opened."""
+    if pending.session_id is not None:
+        prompt_parks.close_park(pending.session_id, pending.park_key)
 
 
 def _pending_elicitation_matches_resolution(

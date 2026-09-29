@@ -55,8 +55,9 @@ of the test. A passing repro alone does not prove the PR fixes the bug.
    special cases and long-term maintenance cost, and preserve security,
    compatibility, and performance? Does it miss facets or obvious adjacent edge
    cases, or introduce a regression in the surrounding code? Complete the shared
-   impact assessment and run its checks for the whole PR. Record why the selected
-   approach is preferable in the review.
+   impact assessment and run its checks for the whole PR. If it reads or adds
+   cached state, apply the 2B.2 cached-state check to it. Record why the
+   selected approach is preferable in the review.
    "Best" means the strongest maintainable fit for this codebase and bug, not a
    license to replace a sound, idiomatic contribution with a theoretically purer
    rewrite or a personal style preference.
