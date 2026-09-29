@@ -5143,6 +5143,25 @@ def _run_tmux(socket_path: str, *args: str) -> None:
         raise RuntimeError(f"tmux command failed (rc={proc.returncode}): {detail}")
 
 
+def _exit_pane_mode(socket_path: str, tmux_target: str) -> None:
+    """
+    Leave tmux copy mode (or any pane mode) so injected keys reach the program.
+
+    Managed panes run with ``mouse on``, so a wheel scroll leaves the pane in
+    copy mode, where ``send-keys`` drives tmux (e.g. ``/`` starts a search)
+    instead of the TUI. A no-op when the pane is not in a mode.
+
+    :param socket_path: Absolute path to the tmux socket, e.g.
+        ``"/tmp/.../tmux.sock"``.
+    :param tmux_target: tmux pane target string, e.g. ``"main"``.
+    :returns: None.
+    :raises RuntimeError: If the tmux command fails.
+    """
+    _run_tmux(
+        socket_path, "if-shell", "-F", "-t", tmux_target, "#{pane_in_mode}", "send-keys -X cancel"
+    )
+
+
 def _capture_pane(socket_path: str, tmux_target: str, *, join_wrapped: bool = False) -> str:
     """
     Capture the current visible contents of a tmux pane.

@@ -6197,6 +6197,7 @@ def create_runner_app(
                 str(instance.socket_path),
                 instance.tmux_target,
                 preset.label,
+                session_id=conv_id,
             )
         except (RuntimeError, ValueError) as exc:
             return JSONResponse(
@@ -7244,8 +7245,9 @@ def create_runner_app(
         # Typing "/compact" opens Codex's slash-command popup, which draws
         # asynchronously: an Enter sent back-to-back is swallowed by the
         # still-opening popup and the command never submits, so settle first.
-        from omnigent.harnesses.claude_native.bridge import _run_tmux
+        from omnigent.harnesses.claude_native.bridge import _exit_pane_mode, _run_tmux
 
+        _exit_pane_mode(socket_path, target)
         _run_tmux(socket_path, "send-keys", "-t", target, "C-u")
         _run_tmux(socket_path, "send-keys", "-l", "-t", target, "/compact")
         time.sleep(_CODEX_POPUP_RENDER_S)
@@ -7264,11 +7266,13 @@ def create_runner_app(
         # (digit 1) confirms. A settle pause between keystrokes is required — each
         # screen draws asynchronously, and typing the command then pressing Enter
         # back-to-back races the slash-menu so the command never submits.
-        from omnigent.harnesses.claude_native.bridge import _run_tmux
+        from omnigent.harnesses.claude_native.bridge import _exit_pane_mode, _run_tmux
 
-        # Reset to a clean composer so the command submits: close any stray
-        # menu/popup, then clear the line. C-u also wipes any text the TUI user
-        # was mid-typing — a rare, accepted cost for reliable injection.
+        # Reset to a clean composer so the command submits: leave tmux copy mode
+        # (a scrolled-back pane), close any stray menu/popup, then clear the
+        # line. C-u also wipes any text the TUI user was mid-typing — a rare,
+        # accepted cost for reliable injection.
+        _exit_pane_mode(socket_path, target)
         _run_tmux(socket_path, "send-keys", "-t", target, "Escape")
         _run_tmux(socket_path, "send-keys", "-t", target, "C-u")
         _run_tmux(socket_path, "send-keys", "-l", "-t", target, "/permissions")
@@ -7280,7 +7284,9 @@ def create_runner_app(
             time.sleep(_CODEX_POPUP_RENDER_S)
             _run_tmux(socket_path, "send-keys", "-l", "-t", target, "1")
 
-    def _codex_permission_mode_confirmed(socket_path: str, target: str, label: str) -> bool:
+    def _codex_permission_mode_confirmed(
+        socket_path: str, target: str, label: str, *, session_id: str
+    ) -> bool:
         # Codex echoes "Permissions updated to <label>" when a /permissions switch
         # applies. Poll the pane and require the most-recent echo to match the
         # target, so a keystroke that hit a non-existent menu row (a preset this
@@ -7295,6 +7301,15 @@ def create_runner_app(
             if codex_pane_confirms_permission_label(pane, label):
                 return True
             if time.monotonic() >= deadline:
+                # The pane tail shows why (popup never opened, busy turn, ...).
+                pane_tail = "\n".join(line for line in pane.splitlines() if line.strip())[-800:]
+                _logger.warning(
+                    "Codex did not confirm /permissions switch to %r for %s; pane tail:\n%s",
+                    label,
+                    session_id,
+                    pane_tail,
+                    extra={"session_id": session_id},
+                )
                 return False
             time.sleep(_CODEX_POPUP_RENDER_S)
 
