@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import ipaddress
 import os
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar, Literal
+from urllib.parse import urlparse
 
 from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
 
@@ -906,6 +908,44 @@ class SkillSpec:
     user_invocable: bool = True
 
 
+def mcp_oauth_url_problem(url: str) -> str | None:
+    """
+    Explain why *url* can't be used with MCP OAuth, or return ``None``.
+
+    OAuth bearer tokens must only travel over TLS, so the URL must be
+    ``https``; plain ``http`` is allowed only for a loopback host
+    (``localhost``, ``127.0.0.0/8``, ``::1``), e.g. a local dev server.
+
+    :param url: The MCP server URL, e.g. ``"https://mcp.example.com/mcp"``.
+    :returns: A short reason suitable for an error message, or ``None``
+        when the URL is acceptable.
+    """
+    try:
+        parsed = urlparse(url)
+        host = parsed.hostname
+    except ValueError:
+        return "is not a valid URL"
+    scheme = parsed.scheme.lower()
+    if not host or scheme not in ("http", "https"):
+        return "must be an https:// URL"
+    if scheme == "https" or _is_loopback_host(host):
+        return None
+    return (
+        "uses plain http:// — OAuth tokens need https:// "
+        "(http:// is only allowed for localhost, 127.0.0.0/8 or ::1)"
+    )
+
+
+def _is_loopback_host(host: str) -> bool:
+    """Whether *host* (already stripped of brackets/port) is loopback-only."""
+    if host.lower() == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
 @dataclass
 class MCPServerConfig:
     """
@@ -990,10 +1030,9 @@ class MCPServerConfig:
     # with PKCE, via the MCP SDK's OAuthClientProvider). When True, the
     # connection authenticates with a browser sign-in on first use and
     # auto-refreshes afterward, instead of a static Authorization header.
-    # Set from ``auth: {type: oauth}`` in YAML. Mutually usable with
-    # ``headers``, but an explicit ``Authorization`` header there takes
-    # priority over the OAuth token (same "explicit wins" convention as
-    # ``databricks_profile``).
+    # Set from ``auth: {type: oauth}`` in YAML. The OAuth token replaces
+    # any ``Authorization`` header on each request, so the parser rejects
+    # configs that set both; other ``headers`` are sent unchanged.
     oauth: bool = False
     # Stdio-only fields.
     command: str | None = None

@@ -595,6 +595,26 @@ tools:
       Authorization: Bearer ${TOKEN}
 ```
 
+For a server that supports MCP OAuth, sign in with the browser instead of
+a static token:
+
+```yaml
+tools:
+  docs:
+    type: mcp
+    url: https://example.com/mcp
+    auth:
+      type: oauth
+```
+
+On first use Omnigent opens a browser to sign in (authorization code with
+PKCE), stores the tokens in the OS keychain, and refreshes them when they
+expire. The URL must be `https://` (plain `http://` is allowed only for
+`localhost`, `127.0.0.0/8` or `::1`), and an `Authorization` header can't be
+set alongside it. Sign-in needs a browser on the machine running the MCP
+connection; where none can be opened (a remote or headless server), the
+connection fails with an error instead of waiting.
+
 ### Python function tool
 
 ```yaml

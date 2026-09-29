@@ -59,6 +59,7 @@ from omnigent.spec.types import (
     SharePolicy,
     SkillSpec,
     ToolsConfig,
+    mcp_oauth_url_problem,
 )
 
 _log = logging.getLogger(__name__)
@@ -2799,6 +2800,12 @@ def _parse_inline_mcp_servers(
                 databricks_profile = str(raw_profile)
             elif auth_type == "oauth":
                 oauth = True
+                _validate_mcp_oauth_config(
+                    f"Inline MCP server {name!r}",
+                    url=url if transport == "http" else None,
+                    headers=headers or {},
+                    expand_env=expand_env,
+                )
         servers.append(
             MCPServerConfig(
                 name=name,
@@ -2964,6 +2971,14 @@ def _parse_http_mcp_server(
     headers = {str(key): str(value) for key, value in raw_headers.items()}
     raw_description = raw.get("description")
     databricks_profile, oauth = _parse_mcp_auth_block(name, raw, yaml_file)
+    if oauth:
+        _validate_mcp_oauth_config(
+            f"MCP server {name!r}",
+            url=url_str,
+            headers=headers,
+            expand_env=expand_env,
+            source=yaml_file,
+        )
     return MCPServerConfig(
         name=str(name),
         transport="http",
@@ -2980,6 +2995,49 @@ def _parse_http_mcp_server(
         ),
         retry=_parse_retry(raw["retry"]) if "retry" in raw else None,
     )
+
+
+def _validate_mcp_oauth_config(
+    label: str,
+    *,
+    url: str | None,
+    headers: dict[str, str],
+    expand_env: bool,
+    source: Path | None = None,
+) -> None:
+    """
+    Reject an ``auth: {type: oauth}`` MCP entry that can't be used safely.
+
+    :param label: How the server is named in errors, e.g.
+        ``"Inline MCP server 'docs'"``.
+    :param url: The server URL, or ``None`` for a non-HTTP (stdio) entry.
+    :param headers: The entry's configured headers.
+    :param expand_env: Whether ``${VAR}`` references were expanded. An
+        unexpanded URL is checked again when the connection opens.
+    :param source: The YAML file the entry came from, for error messages.
+    :raises OmnigentError: If the entry has no HTTP URL, also sets an
+        ``Authorization`` header, or its URL isn't https (or loopback http).
+    """
+    where = f": {source}" if source is not None else ""
+    if url is None:
+        raise OmnigentError(
+            f"{label} auth type 'oauth' requires an http(s) 'url'{where}",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    if any(str(key).lower() == "authorization" for key in headers):
+        raise OmnigentError(
+            f"{label} sets both auth type 'oauth' and an 'Authorization' header; "
+            f"remove one, because the OAuth token replaces that header{where}",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    if not expand_env and "${" in url:
+        return
+    problem = mcp_oauth_url_problem(url)
+    if problem is not None:
+        raise OmnigentError(
+            f"{label} auth type 'oauth': the url {problem}{where}",
+            code=ErrorCode.INVALID_INPUT,
+        )
 
 
 def _parse_mcp_auth_block(

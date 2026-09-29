@@ -1888,6 +1888,68 @@ def test_parse_inline_mcp_auth_oauth_sets_oauth_flag(tmp_path: Path) -> None:
     assert http_srv.databricks_profile is None
 
 
+def _write_inline_oauth_server(tmp_path: Path, entry: dict[str, object]) -> None:
+    config = {
+        "spec_version": 1,
+        "name": "inline-oauth",
+        "tools": {"svc": {"type": "mcp", "auth": {"type": "oauth"}, **entry}},
+    }
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+
+
+@pytest.mark.parametrize(
+    "url", ["http://mcp.example.com/mcp", "http://192.168.1.10/mcp", "ftp://mcp.example.com"]
+)
+def test_parse_inline_mcp_oauth_rejects_cleartext_urls(tmp_path: Path, url: str) -> None:
+    """OAuth tokens must not travel over plain http to a non-loopback host."""
+    _write_inline_oauth_server(tmp_path, {"url": url})
+    with pytest.raises(OmnigentError, match=r"Inline MCP server 'svc' auth type 'oauth'.*https"):
+        parse(tmp_path)
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://localhost:8000/mcp",
+        "http://127.0.0.1:8000/mcp",
+        "http://127.9.9.9/mcp",
+        "http://[::1]/mcp",
+    ],
+)
+def test_parse_inline_mcp_oauth_allows_loopback_http(tmp_path: Path, url: str) -> None:
+    _write_inline_oauth_server(tmp_path, {"url": url})
+    assert parse(tmp_path).mcp_servers[0].oauth is True
+
+
+def test_parse_inline_mcp_oauth_rejects_authorization_header(tmp_path: Path) -> None:
+    """The OAuth token would replace the header, so both together are an error."""
+    _write_inline_oauth_server(
+        tmp_path,
+        {"url": "https://mcp.example.com/mcp", "headers": {"authorization": "Bearer x"}},
+    )
+    with pytest.raises(OmnigentError, match=r"both auth type 'oauth' and an 'Authorization'"):
+        parse(tmp_path)
+
+
+def test_parse_inline_mcp_oauth_keeps_other_headers(tmp_path: Path) -> None:
+    _write_inline_oauth_server(
+        tmp_path, {"url": "https://mcp.example.com/mcp", "headers": {"X-Tenant": "acme"}}
+    )
+    assert parse(tmp_path).mcp_servers[0].headers == {"X-Tenant": "acme"}
+
+
+def test_parse_inline_mcp_oauth_requires_a_url(tmp_path: Path) -> None:
+    _write_inline_oauth_server(tmp_path, {"command": "npx", "args": ["some-server"]})
+    with pytest.raises(OmnigentError, match=r"auth type 'oauth' requires an http\(s\) 'url'"):
+        parse(tmp_path)
+
+
+def test_parse_inline_mcp_oauth_unexpanded_url_is_checked_later(tmp_path: Path) -> None:
+    """Scaffolding/validation parses keep ``${VAR}``; the scheme is checked at connect."""
+    _write_inline_oauth_server(tmp_path, {"url": "${MCP_URL}"})
+    assert parse(tmp_path, expand_env=False).mcp_servers[0].url == "${MCP_URL}"
+
+
 def test_parse_inline_mcp_url_expanded(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Inline ``type: mcp`` entries expand ``${VAR}`` in ``url``, same
     as the directory-config path."""
@@ -2708,6 +2770,37 @@ def test_mcp_directory_config_auth_oauth_sets_oauth_flag(agent_dir: Path) -> Non
     spec = parse(agent_dir)
     assert spec.mcp_servers[0].oauth is True
     assert spec.mcp_servers[0].databricks_profile is None
+
+
+def test_mcp_directory_config_auth_oauth_rejects_cleartext_url(agent_dir: Path) -> None:
+    mcp_dir = agent_dir / "tools" / "mcp"
+    mcp_dir.mkdir(parents=True)
+    mcp_config = {
+        "name": "oauth-server",
+        "transport": "http",
+        "url": "http://mcp.example.com/mcp",
+        "auth": {"type": "oauth"},
+    }
+    (mcp_dir / "oauth.yaml").write_text(yaml.dump(mcp_config))
+    with pytest.raises(
+        OmnigentError, match=r"auth type 'oauth': the url uses plain http.*oauth\.yaml"
+    ):
+        parse(agent_dir)
+
+
+def test_mcp_directory_config_auth_oauth_rejects_authorization_header(agent_dir: Path) -> None:
+    mcp_dir = agent_dir / "tools" / "mcp"
+    mcp_dir.mkdir(parents=True)
+    mcp_config = {
+        "name": "oauth-server",
+        "transport": "http",
+        "url": "https://mcp.example.com/mcp",
+        "headers": {"Authorization": "Bearer static"},
+        "auth": {"type": "oauth"},
+    }
+    (mcp_dir / "oauth.yaml").write_text(yaml.dump(mcp_config))
+    with pytest.raises(OmnigentError, match=r"both auth type 'oauth' and an 'Authorization'"):
+        parse(agent_dir)
 
 
 def test_mcp_directory_config_auth_databricks_sets_profile(agent_dir: Path) -> None:
