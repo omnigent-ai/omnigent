@@ -59,6 +59,14 @@ exceed that threshold. The job has a 30-minute timeout.
 and our Python and frontend tests, while retaining its built-in language rules.
 OCR's other file filters and size limits still apply; inspect the coverage artifact.
 
+The workflow's shared `background` instructions review changed code comments:
+prefer one line, allow at most three lines per block, and explain the scenario
+or reasoning instead of restating code or PR history. Docstrings, API docs,
+license headers, generated comments, and required tool directives are exempt.
+Violations appear as low-severity findings in the summary and do not block
+merging. Keeping this policy in `background` applies it alongside every file's
+built-in or custom rule.
+
 OCR `1.12.0` ignores directory-only `.gitignore` exceptions such as `!.github/`.
 The root `.gitignore` also includes `!.github/**` so tracked automation reaches
 OCR's file selection. Generated-file exclusions follow that exception, and
@@ -79,6 +87,12 @@ only sanitized copies are uploaded. This check protects diagnostic artifacts;
 the upstream action publishes PR comments before it runs.
 
 ## Verify after merging
+
+To check comment quality, use a PR that adds a four-line comment block, a comment
+that merely restates code, a useful one-line comment, a useful three-line
+explanation, and a longer docstring. Run `/ocr force` and inspect the summary:
+only the first two should receive comment-quality findings. This is a model
+review; local workflow tests do not establish its detection accuracy.
 
 1. Open a non-draft, same-repository PR and confirm OCR starts without a
    command. Open a fork PR and confirm OCR skips it; reopening or marking it
