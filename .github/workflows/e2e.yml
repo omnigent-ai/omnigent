@@ -40,7 +40,6 @@ concurrency:
 
 permissions:
   contents: read
-  pull-requests: read
 
 env:
   # No web SPA build during `uv sync`: this job never serves the
@@ -65,14 +64,11 @@ jobs:
       github.event.label.name == 'skip-security-scan'
     uses: ./.github/workflows/security-gate.yml
 
-  select-suites:
-    needs: gate
-    uses: ./.github/workflows/select-test-suites.yml
-
-  # Empty matrices skip draft PRs and known automation-only diffs.
+  # Shard matrix (e2e-shard-matrix.sh, shared with e2e-ui.yml). Fork PRs run by
+  # default; draft PRs resolve to an empty matrix.
   setup:
     name: setup
-    needs: select-suites
+    needs: gate
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
@@ -88,7 +84,6 @@ jobs:
       - name: Compute shard matrix
         id: matrix
         env:
-          RUN_PRODUCT: ${{ needs.select-suites.outputs.product }}
           EVENT_NAME: ${{ github.event_name }}
           IS_DRAFT: ${{ github.event.pull_request.draft }}
           NUM_SHARDS: "4"

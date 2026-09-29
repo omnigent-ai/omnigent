@@ -21,7 +21,6 @@ on:
 
 permissions:
   contents: read
-  pull-requests: read
 
 env:
   # No web SPA build during `uv sync`: this job never serves the bundle
@@ -45,14 +44,11 @@ jobs:
   gate:
     uses: ./.github/workflows/security-gate.yml
 
-  select-suites:
-    needs: gate
-    uses: ./.github/workflows/select-test-suites.yml
-
-  # Empty matrices skip draft PRs and known automation-only diffs.
+  # Harness matrix (integration-matrix.sh). Fork PRs run by default; draft PRs
+  # resolve to an empty matrix.
   setup:
     name: setup
-    needs: select-suites
+    needs: gate
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
@@ -70,7 +66,6 @@ jobs:
       - name: Compute integration matrix
         id: matrix
         env:
-          RUN_PRODUCT: ${{ needs.select-suites.outputs.product }}
           EVENT_NAME: ${{ github.event_name }}
           IS_DRAFT: ${{ github.event.pull_request.draft }}
         run: bash .github/scripts/ci/integration-matrix.sh

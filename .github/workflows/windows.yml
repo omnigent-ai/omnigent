@@ -18,7 +18,6 @@ on:
 
 permissions:
   contents: read
-  pull-requests: read
 
 env:
   # No web SPA build during `uv sync`; this job never serves the bundle.
@@ -31,13 +30,9 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  select-suites:
-    uses: ./.github/workflows/select-test-suites.yml
-
   windows-smoke:
     name: Windows smoke + unit
-    needs: select-suites
-    if: ${{ !github.event.pull_request.draft && needs.select-suites.outputs.product != 'false' }}
+    if: ${{ !github.event.pull_request.draft }}
     runs-on: windows-latest
     timeout-minutes: 30
     steps:
