@@ -133,6 +133,58 @@ async def test_single_subscriber_receives_events_in_order() -> None:
 
 
 @pytest.mark.asyncio
+async def test_publish_drops_closed_loop_without_disturbing_healthy_subscriber() -> None:
+    """A closed subscriber loop is removed while healthy peers still receive events."""
+    conversation_id = "conv_closed_loop"
+    stale_loop = asyncio.new_event_loop()
+    stale_queue: asyncio.Queue[dict[str, Any] | object] = asyncio.Queue()
+    stale_subscriber = (stale_queue, stale_loop)
+    stale_loop.close()
+    session_stream._subscribers.setdefault(conversation_id, set()).add(stale_subscriber)
+
+    task = asyncio.create_task(_collect(conversation_id, expected=1))
+    await asyncio.sleep(0)
+
+    assert session_stream.publish(conversation_id, {"type": "event"}) == 1
+    assert stale_subscriber not in session_stream._subscribers[conversation_id]
+    assert await asyncio.wait_for(task, timeout=2.0) == [{"type": "event"}]
+
+
+@pytest.mark.asyncio
+async def test_close_drops_closed_loop_and_terminates_healthy_subscriber() -> None:
+    """Closing ignores a stale loop and still terminates healthy subscribers."""
+    conversation_id = "conv_close_closed_loop"
+    stale_loop = asyncio.new_event_loop()
+    stale_queue: asyncio.Queue[dict[str, Any] | object] = asyncio.Queue()
+    stale_subscriber = (stale_queue, stale_loop)
+    stale_loop.close()
+    session_stream._subscribers.setdefault(conversation_id, set()).add(stale_subscriber)
+
+    task = asyncio.create_task(_collect(conversation_id, expected=0))
+    await asyncio.sleep(0)
+
+    session_stream.close(conversation_id)
+
+    assert await asyncio.wait_for(task, timeout=2.0) == []
+    assert conversation_id not in session_stream._subscribers
+
+
+def test_schedule_delivery_does_not_count_already_removed_subscriber() -> None:
+    """A slot removed after a publisher snapshot is no longer deliverable."""
+    conversation_id = "conv_removed_before_schedule"
+    loop = asyncio.new_event_loop()
+    queue: asyncio.Queue[dict[str, Any] | object] = asyncio.Queue()
+    subscriber = (queue, loop)
+    try:
+        assert not session_stream._schedule_delivery(
+            conversation_id, subscriber, {"type": "event"}
+        )
+        assert queue.empty()
+    finally:
+        loop.close()
+
+
+@pytest.mark.asyncio
 async def test_pre_subscribe_events_are_lost() -> None:
     """
     Events published before any subscriber connected are dropped.
