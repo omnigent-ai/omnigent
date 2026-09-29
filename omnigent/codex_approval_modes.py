@@ -7,17 +7,11 @@ running-session switcher drives the popup by keystroke: type ``/permissions``,
 then the option's menu digit (position-independent, unlike arrow navigation),
 then confirm the sub-dialog for the ones that ask.
 
-These presets mirror the popup: their ``label`` is what the popup shows and
-their order is the popup's own. The selecting digit is NOT stored here — popup
-row positions vary by platform/feature/variant, so the digit is discovered at
-runtime by reading the rendered popup.
+These presets use the popup's labels. Menu digits are discovered from the
+rendered popup because row positions vary by platform and configuration.
 
-Platform caveat: on macOS/Linux the default popup lists only Ask for approval,
-Approve for me (Guardian on) and Full Access — Read Only is shown on Windows
-and in Codex's permission-profiles popup variant, never in the default
-macOS/Linux popup. On a popup that lacks Read Only, selecting it keys a
-non-existent row (a no-op); the full-bypass launch flag has no ``/permissions``
-row and is not represented here.
+Read Only is absent from the default macOS/Linux popup, but appears on Windows
+and with permission profiles. The full-bypass launch flag has no popup row.
 
 Kept dependency-free so the server routes, the runner, and the web contract can
 all agree on the same list.
@@ -47,9 +41,8 @@ class CodexPermissionPreset:
     needs_confirm: bool
 
 
-# Labels match Codex's ``/permissions`` popup; no selecting digit is stored —
-# row positions are not stable across platform/feature/variant, so the digit is
-# discovered at runtime by reading the rendered popup.
+# Labels match Codex's ``/permissions`` popup. Row positions are discovered at
+# runtime because they vary by platform and configuration.
 CODEX_NATIVE_PERMISSION_PRESETS: tuple[CodexPermissionPreset, ...] = (
     CodexPermissionPreset(
         value="ask-for-approval",
@@ -91,20 +84,11 @@ def codex_permission_preset(value: str) -> CodexPermissionPreset | None:
 
 _MENU_ROW_RE = re.compile(r"^\s*(?:›\s*)?(\d+)\.\s+(.*)$")
 _CURRENT_SUFFIX_RE = re.compile(r"\s*\(current\)\s*$", re.IGNORECASE)
-_PERMISSIONS_UPDATED_MARKER = "Permissions updated to "
 
 
-def codex_parse_permissions_menu(pane_text: str) -> list[tuple[str, str]]:
-    """Parse a captured Codex ``/permissions`` popup into ``(digit, label)`` rows.
-
-    Reads the visible option rows (``N. Label   Description``), tolerating the
-    leading ``›`` selection marker, a trailing `` (current)`` on the active row,
-    and the 2+-space gap before each description. Non-option lines (title,
-    footer, wrapped description continuations) are skipped. Rows are returned in
-    the order they appear; ``[]`` when no option rows are present (e.g. the popup
-    has not rendered yet).
-    """
-    rows: list[tuple[str, str]] = []
+def codex_permissions_menu(pane_text: str) -> dict[str, str]:
+    """Return ``{label: digit}`` for a captured ``/permissions`` popup."""
+    rows: dict[str, str] = {}
     for line in pane_text.splitlines():
         match = _MENU_ROW_RE.match(line)
         if match is None:
@@ -113,32 +97,8 @@ def codex_parse_permissions_menu(pane_text: str) -> list[tuple[str, str]]:
         label = re.split(r"\s{2,}", remainder, maxsplit=1)[0].strip()
         label = _CURRENT_SUFFIX_RE.sub("", label).strip()
         if label:
-            rows.append((digit, label))
+            rows[label] = digit
     return rows
-
-
-def codex_permission_menu_match(options: list[tuple[str, str]], label: str) -> str | None:
-    """:returns: the digit of the row whose label equals *label*
-    (case-insensitively), or ``None`` when no row matches."""
-    wanted = label.casefold()
-    return next((digit for digit, row_label in options if row_label.casefold() == wanted), None)
-
-
-def codex_permissions_menu_digit(pane_text: str, label: str) -> str | None:
-    """Convenience wrapper: match *label* against the parsed rows of *pane_text*."""
-    return codex_permission_menu_match(codex_parse_permissions_menu(pane_text), label)
-
-
-def codex_permission_switch_confirmed(pane_text: str, label: str) -> bool:
-    """Whether the most-recent ``Permissions updated to <x>`` line in *pane_text*
-    reports ``<x>`` equal (case-insensitively) to *label*. Codex prints this exact
-    string when a ``/permissions`` switch applies (rendered with a leading ``• ``);
-    a keystroke that hit no menu row leaves no such line, so this stays False."""
-    applied = [line for line in pane_text.splitlines() if _PERMISSIONS_UPDATED_MARKER in line]
-    if not applied:
-        return False
-    latest = applied[-1].split(_PERMISSIONS_UPDATED_MARKER, 1)[1].strip()
-    return latest.casefold() == label.casefold()
 
 
 # Sandbox ``type`` spellings Codex uses (the app-server ``thread/settings/updated``

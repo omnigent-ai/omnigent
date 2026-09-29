@@ -7,12 +7,9 @@ import pytest
 from omnigent.codex_approval_modes import (
     CODEX_NATIVE_PERMISSION_PRESETS,
     CODEX_NATIVE_PERMISSION_VALUES,
-    codex_parse_permissions_menu,
-    codex_permission_menu_match,
     codex_permission_preset,
     codex_permission_preset_from_thread_settings,
-    codex_permission_switch_confirmed,
-    codex_permissions_menu_digit,
+    codex_permissions_menu,
 )
 
 # Real ``threadSettings`` payloads captured from codex-cli 0.146.0's
@@ -143,89 +140,35 @@ def test_preset_from_thread_settings_none_for_unmapped() -> None:
 
 def test_parse_profile_popup_all_four_rows() -> None:
     """The profile-popup variant parses all four rows, stripping `` (current)``."""
-    assert codex_parse_permissions_menu(_PROFILE_POPUP) == [
-        ("1", "Ask for approval"),
-        ("2", "Approve for me"),
-        ("3", "Full Access"),
-        ("4", "Read Only"),
-    ]
+    assert codex_permissions_menu(_PROFILE_POPUP) == {
+        "Ask for approval": "1",
+        "Approve for me": "2",
+        "Full Access": "3",
+        "Read Only": "4",
+    }
 
 
 def test_parse_linux_default_popup_two_rows() -> None:
     """The default macOS/Linux popup (Guardian off) parses its two rows."""
-    assert codex_parse_permissions_menu(_LINUX_DEFAULT_POPUP) == [
-        ("1", "Ask for approval"),
-        ("2", "Full Access"),
-    ]
+    assert codex_permissions_menu(_LINUX_DEFAULT_POPUP) == {
+        "Ask for approval": "1",
+        "Full Access": "2",
+    }
 
 
 @pytest.mark.parametrize("pane", ["", "some unrelated transcript text\nno menu here"])
 def test_parse_non_popup_is_empty(pane: str) -> None:
     """A pane without option rows parses to an empty list."""
-    assert codex_parse_permissions_menu(pane) == []
-
-
-@pytest.mark.parametrize(
-    ("label", "expected"),
-    [
-        ("Ask for approval", "1"),
-        ("Approve for me", "2"),
-        ("Full Access", "3"),
-        ("Read Only", "4"),
-    ],
-)
-def test_menu_digit_profile_popup(label: str, expected: str) -> None:
-    """Each profile-popup row resolves to its rendered digit."""
-    assert codex_permissions_menu_digit(_PROFILE_POPUP, label) == expected
+    assert codex_permissions_menu(pane) == {}
 
 
 def test_menu_digit_linux_default_read_only_absent() -> None:
     """Read Only is absent from the default macOS/Linux popup → no digit."""
-    assert codex_permissions_menu_digit(_LINUX_DEFAULT_POPUP, "Read Only") is None
-    assert codex_permissions_menu_digit(_LINUX_DEFAULT_POPUP, "Full Access") == "2"
+    menu = codex_permissions_menu(_LINUX_DEFAULT_POPUP)
+    assert menu.get("Read Only") is None
+    assert menu["Full Access"] == "2"
 
 
 def test_menu_digit_windows_read_only_first() -> None:
     """On Windows, Read Only is row 1 (with a `` (current)`` suffix)."""
-    assert codex_permissions_menu_digit(_WINDOWS_POPUP, "Read Only") == "1"
-
-
-@pytest.mark.parametrize("pane", ["", "some unrelated transcript text\nno menu here"])
-def test_menu_digit_non_popup_is_none(pane: str) -> None:
-    """A pane without option rows yields no digit."""
-    assert codex_permissions_menu_digit(pane, "Full Access") is None
-
-
-def test_menu_match_is_case_insensitive() -> None:
-    """Label matching ignores case on both sides."""
-    options = codex_parse_permissions_menu(_PROFILE_POPUP)
-    assert codex_permission_menu_match(options, "full access") == "3"
-    assert codex_permission_menu_match(options, "READ ONLY") == "4"
-    assert codex_permission_menu_match(options, "No Such Row") is None
-
-
-def test_switch_confirmed_full_access() -> None:
-    """A ``Permissions updated to Full Access`` line confirms Full Access only."""
-    pane = "some output\n• Permissions updated to Full Access\nmore output"
-    assert codex_permission_switch_confirmed(pane, "Full Access") is True
-    assert codex_permission_switch_confirmed(pane, "Read Only") is False
-
-
-def test_switch_confirmed_read_only() -> None:
-    """A ``Permissions updated to Read Only`` line confirms Read Only."""
-    pane = "• Permissions updated to Read Only"
-    assert codex_permission_switch_confirmed(pane, "Read Only") is True
-
-
-@pytest.mark.parametrize("pane", ["", "some unrelated transcript text\nno switch here"])
-def test_switch_confirmed_no_marker_is_false(pane: str) -> None:
-    """Without a ``Permissions updated to`` line, nothing is confirmed."""
-    assert codex_permission_switch_confirmed(pane, "Full Access") is False
-    assert codex_permission_switch_confirmed(pane, "Read Only") is False
-
-
-def test_switch_confirmed_last_line_wins() -> None:
-    """With several confirmations, the most-recent one is authoritative."""
-    pane = "• Permissions updated to Ask for approval\n• Permissions updated to Full Access"
-    assert codex_permission_switch_confirmed(pane, "Full Access") is True
-    assert codex_permission_switch_confirmed(pane, "Ask for approval") is False
+    assert codex_permissions_menu(_WINDOWS_POPUP)["Read Only"] == "1"

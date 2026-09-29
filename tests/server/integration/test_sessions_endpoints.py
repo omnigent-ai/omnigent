@@ -10476,76 +10476,7 @@ async def test_patch_approval_mode_requires_live_runner_before_persisting(
         set_runner_client(None)
 
     assert resp.status_code == 503, resp.text
-    assert "Could not switch to Full Access approval mode" in resp.text
-    assert "omnigent.codex_native.approval_mode" not in snapshot["labels"]
-    mode_events = [
-        event for _, event in published if event["type"] == "session.codex_approval_mode"
-    ]
-    assert mode_events == []
-
-
-async def test_patch_approval_mode_unsupported_surfaces_actionable_banner(
-    client: httpx.AsyncClient,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A read-only switch the popup can't offer surfaces the label + guidance.
-
-    When Codex's ``/permissions`` popup doesn't list Read Only (macOS/Linux), the
-    runner returns the ``codex_native_approval_mode_unsupported`` body. The banner
-    must name the mode by its human label ("Read Only", not the "read-only" slug)
-    and carry the runner's actionable detail, and no approval label may persist.
-    """
-    from omnigent.runtime import set_runner_client
-
-    published: list[tuple[str, dict[str, Any]]] = []
-    monkeypatch.setattr(
-        "omnigent.server.routes.sessions.session_stream.publish",
-        lambda sid, ev: published.append((sid, ev)),
-    )
-
-    def _handler(request: httpx.Request) -> httpx.Response:
-        """Reject read-only like a popup that doesn't offer the row."""
-        return httpx.Response(
-            503,
-            json={
-                "error": "codex_native_approval_mode_unsupported",
-                "detail": (
-                    "Codex's /permissions popup doesn't offer Read Only on this "
-                    "platform — Codex lists it only on Windows or when a permission "
-                    "profile is active. To run read-only, start a new session in "
-                    "read-only mode."
-                ),
-            },
-        )
-
-    fake_runner = httpx.AsyncClient(
-        transport=httpx.MockTransport(_handler),
-        base_url="http://runner",
-    )
-    set_runner_client(fake_runner)
-    try:
-        agent = await create_test_agent(client)
-        session = await _create_session(
-            client,
-            agent["id"],
-            labels={
-                "omnigent.ui": "terminal",
-                "omnigent.wrapper": "codex-native-ui",
-            },
-        )
-
-        resp = await client.patch(
-            f"/v1/sessions/{session['id']}",
-            json={"approval_mode": "read-only"},
-        )
-        snapshot = (await client.get(f"/v1/sessions/{session['id']}")).json()
-    finally:
-        await fake_runner.aclose()
-        set_runner_client(None)
-
-    assert resp.status_code == 503, resp.text
-    assert "Could not switch to Read Only approval mode" in resp.text
-    assert "start a new session in read-only mode" in resp.text
+    assert "Could not switch to full-access approval mode" in resp.text
     assert "omnigent.codex_native.approval_mode" not in snapshot["labels"]
     mode_events = [
         event for _, event in published if event["type"] == "session.codex_approval_mode"

@@ -7304,8 +7304,7 @@ def create_runner_app(
         # popup never renders any rows.
         from omnigent.codex_approval_modes import (
             CODEX_NATIVE_PERMISSION_PRESETS,
-            codex_parse_permissions_menu,
-            codex_permission_menu_match,
+            codex_permissions_menu,
         )
         from omnigent.harnesses.claude_native.bridge import _capture_pane, _run_tmux
 
@@ -7323,17 +7322,17 @@ def create_runner_app(
         # approval and Full Access) rather than any numbered line, so a numbered
         # list still visible in the transcript above can't be mistaken for the
         # rendered popup.
-        known_labels = {preset.label.casefold() for preset in CODEX_NATIVE_PERMISSION_PRESETS}
+        known_labels = {preset.label for preset in CODEX_NATIVE_PERMISSION_PRESETS}
 
-        def _codex_menu_digit() -> tuple[list[tuple[str, str]], str | None]:
-            options = codex_parse_permissions_menu(_capture_pane(socket_path, target))
-            return options, codex_permission_menu_match(options, label)
+        def _codex_menu_digit() -> tuple[dict[str, str], str | None]:
+            options = codex_permissions_menu(_capture_pane(socket_path, target))
+            return options, options.get(label)
 
         deadline = time.monotonic() + _CODEX_PERMISSION_MENU_BUDGET_S
         while True:
             time.sleep(_CODEX_POPUP_RENDER_S)
             options, digit = _codex_menu_digit()
-            if sum(row_label.casefold() in known_labels for _, row_label in options) >= 2:
+            if len(options.keys() & known_labels) >= 2:
                 break
             if time.monotonic() >= deadline:
                 # Close whatever opened so the TUI isn't stranded in a popup.
@@ -7356,16 +7355,14 @@ def create_runner_app(
         return True
 
     def _codex_permission_mode_confirmed(socket_path: str, target: str, label: str) -> bool:
-        # Codex echoes "Permissions updated to <label>" when a /permissions switch
-        # applies. Poll the pane and require the most-recent such line to name the
-        # target label, so a keystroke that didn't apply is reported as not-applied
-        # rather than the label claiming a mode the TUI never entered.
-        from omnigent.codex_approval_modes import codex_permission_switch_confirmed
         from omnigent.harnesses.claude_native.bridge import _capture_pane
 
+        marker = "Permissions updated to "
         deadline = time.monotonic() + _CODEX_PERMISSION_CONFIRM_BUDGET_S
         while True:
-            if codex_permission_switch_confirmed(_capture_pane(socket_path, target), label):
+            pane = _capture_pane(socket_path, target)
+            updates = [line for line in pane.splitlines() if marker in line]
+            if updates and updates[-1].split(marker, 1)[1].strip() == label:
                 return True
             if time.monotonic() >= deadline:
                 return False
