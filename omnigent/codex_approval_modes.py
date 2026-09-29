@@ -162,8 +162,12 @@ def codex_pane_shows_running_turn(pane: str) -> bool:
     Codex's status row reads ``Working (12s • esc to interrupt)`` while a turn
     runs, so an Escape sent then cancels the turn instead of closing a popup.
     An open popup replaces that row, so the check is false while one is up.
+    Only a row shaped like the status row counts, not model output quoting it.
 
     :param pane: Visible pane text, e.g. from ``tmux capture-pane -p``.
     :returns: ``True`` when the busy status row is visible.
     """
-    return "esc to interrupt" in pane.lower()
+    return any(
+        line.lstrip().startswith("• Working (") and "esc to interrupt" in line
+        for line in pane.splitlines()
+    )

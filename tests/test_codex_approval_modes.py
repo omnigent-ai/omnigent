@@ -151,3 +151,5 @@ def test_running_turn_detected_from_status_row() -> None:
     )
     assert codex_pane_shows_running_turn(busy)
     assert not codex_pane_shows_running_turn(_WIDE_PANE)
+    # Model output quoting the phrase is not the status row.
+    assert not codex_pane_shows_running_turn("• Press esc to interrupt a turn.\n")

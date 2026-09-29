@@ -7273,11 +7273,9 @@ def create_runner_app(
             _run_tmux,
         )
 
-        # Reset to a clean composer so the command submits: leave tmux copy mode
-        # (a scrolled-back pane), close any stray menu/popup, then clear the
-        # line. C-u also wipes any text the TUI user was mid-typing — a rare,
-        # accepted cost for reliable injection. Mid-turn, Escape would cancel the
-        # turn instead, and /permissions opens fine without it.
+        # Reset to a clean composer: leave copy mode, close a stray popup (Escape
+        # mid-turn would cancel the turn, and /permissions opens without it), and
+        # clear the line — which also wipes any text the TUI user was mid-typing.
         _exit_pane_mode(socket_path, target)
         if not codex_pane_shows_running_turn(_capture_pane(socket_path, target)):
             _run_tmux(socket_path, "send-keys", "-t", target, "Escape")
@@ -7308,13 +7306,16 @@ def create_runner_app(
             if codex_pane_confirms_permission_label(pane, label):
                 return True
             if time.monotonic() >= deadline:
-                # The pane tail shows why (popup never opened, busy turn, ...).
-                pane_tail = "\n".join(line for line in pane.splitlines() if line.strip())[-800:]
+                # The redacted pane tail shows why (popup never opened, busy, ...).
+                from omnigent.harnesses.antigravity_native.bridge import (
+                    _format_pane_debug_tail,
+                )
+
                 _logger.warning(
                     "Codex did not confirm /permissions switch to %r for %s; pane tail:\n%s",
                     label,
                     session_id,
-                    pane_tail,
+                    _format_pane_debug_tail(pane),
                     extra={"session_id": session_id},
                 )
                 return False
