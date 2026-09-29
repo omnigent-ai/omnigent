@@ -67,9 +67,8 @@ import {
 import { ExitPlanModeReview } from "./ExitPlanModeReview";
 
 const AUTO_RESOLVED_DETAIL =
-  "This request was answered outside this view — for example in the " +
-  "agent's own terminal, another tab, or the approve page — so the " +
-  "verdict isn't shown here.";
+  "This request was answered outside this view, for example in the " +
+  "agent's own terminal, another tab, or the approve page.";
 
 /**
  * Extract the answer-option labels from an AskUserQuestion-shaped
@@ -506,7 +505,7 @@ export function ApprovalCard({
       icon = <ClockIcon className="size-4 text-muted-foreground" />;
       label = "Prompt expired";
     } else if (autoResolved) {
-      // The verdict is unknown in this view, so explain the neutral status.
+      // Verdict unknown here; explain the neutral pill.
       icon = (
         <Tooltip>
           <TooltipTrigger asChild>

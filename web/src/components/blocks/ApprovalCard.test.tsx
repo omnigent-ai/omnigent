@@ -1446,7 +1446,6 @@ describe("ApprovalCard — resolved-elsewhere pill", () => {
   } as const;
 
   it("explains the status from the info icon's accessible label", () => {
-    // Match the app’s root tooltip provider.
     render(
       <TooltipProvider>
         <ApprovalCard {...props} />
