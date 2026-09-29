@@ -13,6 +13,7 @@ on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
     paths-ignore:
+      - 'web/**'
       - 'docs/**'
       - 'designs/**'
       - 'CHANGELOG.md'
@@ -25,6 +26,7 @@ on:
       # branch head, so cherry-picks and release-bump commits must run CI.
       - 'release/v[0-9]*'
     paths-ignore:
+      - 'web/**'
       - 'docs/**'
       - 'designs/**'
       - 'CHANGELOG.md'
