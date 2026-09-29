@@ -976,30 +976,6 @@ async def _launch_config_retry_sleep(delay: float) -> None:
     await asyncio.sleep(delay)
 
 
-class NativeLaunchConfigUnavailableError(OmnigentError, RuntimeError):
-    """The Omnigent server could not serve a native terminal's launch config.
-
-    Raised once bounded retries of ``GET /v1/sessions/<id>`` are exhausted, or
-    when the server answers with a 5xx or a malformed body. Attributed to the
-    server as a blocking harness-setup failure so startup-reliability signals
-    count it as a platform fault. Subclasses :class:`RuntimeError` so existing
-    callers that catch that keep working.
-    """
-
-    def __init__(self, message: str) -> None:
-        """
-        :param message: Human-readable failure, e.g.
-            ``"Could not fetch Codex launch config for 'conv_abc123'."``.
-        """
-        super().__init__(
-            message,
-            code=ErrorCode.INTERNAL_ERROR,
-            category=ErrorCategory.SERVER,
-            impact=ErrorImpact.BLOCKING,
-            phase=ErrorPhase.HARNESS_SETUP,
-        )
-
-
 # Metadata reads do not need transcript, liveness, or subtree-usage aggregation.
 _SESSION_METADATA_PARAMS: dict[str, str] = {
     "include_items": "false",
@@ -1020,17 +996,20 @@ async def _fetch_native_launch_snapshot(
     A transient runner->server condition (a read/connect timeout, or a
     ``429``/``502``/``503``/``504``) is retried with bounded exponential
     backoff so one blip under load does not tear through native terminal
-    launch, ensure, and the next turn. A non-transient status, a persistent
-    transient failure, or a malformed body still raises ``RuntimeError`` so
-    genuinely-broken launches fail loud.
+    launch, ensure, and the next turn. A persistent transient failure, a 5xx,
+    or a malformed body raises a server-attributed ``OmnigentError`` so
+    startup-reliability signals count it as a platform fault.
 
     :param server_client: Runner's Omnigent server HTTP client.
     :param session_id: Session/conversation id, e.g. ``"conv_abc123"``.
     :param runtime_label: Human-readable harness name for error text, e.g.
         ``"Codex"``.
     :returns: The snapshot mapping.
-    :raises RuntimeError: If the client is missing, the fetch cannot be
-        completed, or the response is not a JSON object.
+    :raises OmnigentError: Server-attributed (blocking, harness setup) when
+        retries are exhausted, the server returns a 5xx, or the body is not a
+        JSON object.
+    :raises RuntimeError: If the client is missing, or on a client-side 4xx
+        or non-transient transport error.
     """
     if server_client is None:
         raise RuntimeError(
@@ -1050,7 +1029,12 @@ async def _fetch_native_launch_snapshot(
                 message = f"Could not fetch {runtime_label} launch config for {session_id!r}."
                 # Exhausted timeouts/disconnects mean our server never answered.
                 if transient:
-                    raise NativeLaunchConfigUnavailableError(message) from exc
+                    raise OmnigentError(
+                        message,
+                        category=ErrorCategory.SERVER,
+                        impact=ErrorImpact.BLOCKING,
+                        phase=ErrorPhase.HARNESS_SETUP,
+                    ) from exc
                 raise RuntimeError(message) from exc
             _logger.warning(
                 "Transient %s launch-config fetch error (attempt %d/%d) for "
@@ -1071,7 +1055,12 @@ async def _fetch_native_launch_snapshot(
                     f"GET /v1/sessions returned {resp.status_code}."
                 )
                 if resp.status_code >= 500 or resp.status_code in _LAUNCH_CONFIG_RETRYABLE_STATUS:
-                    raise NativeLaunchConfigUnavailableError(message)
+                    raise OmnigentError(
+                        message,
+                        category=ErrorCategory.SERVER,
+                        impact=ErrorImpact.BLOCKING,
+                        phase=ErrorPhase.HARNESS_SETUP,
+                    )
                 raise RuntimeError(message)
             _logger.warning(
                 "Transient %s launch-config fetch status %d (attempt %d/%d) for "
@@ -1092,13 +1081,19 @@ async def _fetch_native_launch_snapshot(
     try:
         snapshot = resp.json()
     except ValueError as exc:
-        raise NativeLaunchConfigUnavailableError(
-            f"Could not fetch {runtime_label} launch config for {session_id!r}: invalid JSON."
+        raise OmnigentError(
+            f"Could not fetch {runtime_label} launch config for {session_id!r}: invalid JSON.",
+            category=ErrorCategory.SERVER,
+            impact=ErrorImpact.BLOCKING,
+            phase=ErrorPhase.HARNESS_SETUP,
         ) from exc
     if not isinstance(snapshot, dict):
-        raise NativeLaunchConfigUnavailableError(
+        raise OmnigentError(
             f"Could not fetch {runtime_label} launch config for {session_id!r}: "
-            "snapshot was not a JSON object."
+            "snapshot was not a JSON object.",
+            category=ErrorCategory.SERVER,
+            impact=ErrorImpact.BLOCKING,
+            phase=ErrorPhase.HARNESS_SETUP,
         )
     return snapshot
 

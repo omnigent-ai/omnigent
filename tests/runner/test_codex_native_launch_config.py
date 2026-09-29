@@ -18,6 +18,7 @@ import pytest
 
 import omnigent.runner.native.orchestration as _orchestration
 from omnigent import debug_logging
+from omnigent.errors import OmnigentError
 from omnigent.runner.app import _codex_native_launch_config
 
 
@@ -115,9 +116,9 @@ async def test_missing_client_raises() -> None:
 
 @pytest.mark.asyncio
 async def test_http_error_raises() -> None:
-    """A transport error fetching the snapshot surfaces as a RuntimeError."""
+    """A persistent transport error fetching the snapshot surfaces as an OmnigentError."""
     client = _Client(raise_exc=httpx.ConnectError("boom"))
-    with pytest.raises(RuntimeError, match="Could not fetch Codex launch config"):
+    with pytest.raises(OmnigentError, match="Could not fetch Codex launch config"):
         await _run(client)
 
 
@@ -133,7 +134,7 @@ async def test_non_200_raises() -> None:
 async def test_invalid_json_raises() -> None:
     """A body that does not parse as JSON is rejected."""
     client = _Client(_Resp(200, None, json_raises=True))
-    with pytest.raises(RuntimeError, match="invalid JSON"):
+    with pytest.raises(OmnigentError, match="invalid JSON"):
         await _run(client)
 
 
@@ -141,7 +142,7 @@ async def test_invalid_json_raises() -> None:
 async def test_non_dict_snapshot_raises() -> None:
     """A JSON array (not an object) is not a valid session snapshot."""
     client = _Client(_Resp(200, ["not", "a", "dict"]))
-    with pytest.raises(RuntimeError, match="not a JSON object"):
+    with pytest.raises(OmnigentError, match="not a JSON object"):
         await _run(client)
 
 
@@ -312,7 +313,7 @@ async def test_persistent_transient_failure_raises_after_attempt_cap(
 ) -> None:
     """A read timeout on every attempt exhausts the bounded retries and fails loud."""
     client = _SequenceClient([httpx.ReadTimeout("slow")] * 3)
-    with pytest.raises(RuntimeError, match="Could not fetch Codex launch config"):
+    with pytest.raises(OmnigentError, match="Could not fetch Codex launch config"):
         await _codex_native_launch_config(session_id="conv_1", server_client=client)
     assert client.calls == 3, "Should attempt exactly the configured cap, then fail."
     assert retry_sleeps == [pytest.approx(0.5), pytest.approx(1.0)], (
@@ -371,11 +372,8 @@ async def test_server_side_launch_config_failure_is_server_blocking(
     impact; the debug-log sink reads both off the raised exception.
     """
     client = _SequenceClient(actions)
-    with pytest.raises(_orchestration.NativeLaunchConfigUnavailableError) as info:
+    with pytest.raises(OmnigentError) as info:
         await _codex_native_launch_config(session_id="conv_1", server_client=client)
-    assert isinstance(info.value, RuntimeError), (
-        "Existing RuntimeError callers must still catch it."
-    )
     record = logging.LogRecord(
         "omnigent.runner",
         logging.ERROR,
@@ -397,4 +395,4 @@ async def test_client_side_launch_config_failure_stays_unattributed() -> None:
     client = _SequenceClient([_Resp(404, None)])
     with pytest.raises(RuntimeError) as info:
         await _codex_native_launch_config(session_id="conv_1", server_client=client)
-    assert not isinstance(info.value, _orchestration.NativeLaunchConfigUnavailableError)
+    assert not isinstance(info.value, OmnigentError)

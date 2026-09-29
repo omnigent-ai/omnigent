@@ -149,11 +149,11 @@ def test_cause_names_omnigent_error_code() -> None:
 
 def test_cause_names_omnigent_error_code_and_cause_type() -> None:
     """A coded launch-config failure keeps the underlying transport cause visible."""
-    exc = orchestration.NativeLaunchConfigUnavailableError("could not fetch")
+    exc = OmnigentError("could not fetch", code=ErrorCode.INTERNAL_ERROR)
     exc.__cause__ = httpx.ReadTimeout("slow")
 
     assert orchestration._native_terminal_start_failure_cause(exc) == (
-        f"NativeLaunchConfigUnavailableError code {ErrorCode.INTERNAL_ERROR} (cause ReadTimeout)"
+        f"OmnigentError code {ErrorCode.INTERNAL_ERROR} (cause ReadTimeout)"
     )
 
 
