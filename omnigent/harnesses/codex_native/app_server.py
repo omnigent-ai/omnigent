@@ -4273,6 +4273,42 @@ async def apply_codex_thread_effort(
         await client.close()
 
 
+async def apply_codex_thread_collaboration_mode(
+    transport: str,
+    thread_id: str,
+    mode: str,
+    *,
+    model: str,
+    effort: str | None = None,
+) -> None:
+    """Switch a loaded thread's collaboration mode via ``thread/settings/update``,
+    keeping ``settings.developer_instructions`` null so a value there cannot replace
+    Codex's built-in Plan Mode prompt. ``effort`` is clamped to what ``model`` accepts."""
+    from omnigent.util.reasoning_effort import clamp_effort_for_model
+
+    client = client_for_transport(transport, client_name="omnigent-codex-native-runner")
+    await client.connect()
+    try:
+        await client.request(
+            "thread/settings/update",
+            {
+                "threadId": thread_id,
+                "collaborationMode": {
+                    "mode": mode,
+                    "settings": {
+                        "model": model,
+                        "reasoning_effort": (
+                            clamp_effort_for_model(effort, model) if effort else None
+                        ),
+                        "developer_instructions": None,
+                    },
+                },
+            },
+        )
+    finally:
+        await client.close()
+
+
 def codex_terminal_env(app_server: CodexNativeAppServer) -> dict[str, str]:
     """
     Build terminal env overrides for the native Codex TUI.

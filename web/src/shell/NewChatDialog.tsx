@@ -50,6 +50,7 @@ import {
   FolderGit2Icon,
   FolderIcon,
   FolderOpenIcon,
+  FileTextIcon,
   PlusIcon,
   ShuffleIcon,
   WandSparklesIcon,
@@ -173,6 +174,7 @@ import {
   writeLastSandboxRepos,
 } from "@/lib/repoPreferences";
 import { readHarnessOptions, writeHarnessOption, type HarnessOptions } from "@/lib/modePreferences";
+import { CODEX_NATIVE_COLLABORATION_MODE_LABEL_KEY } from "@/lib/codexPlanMode";
 import {
   getNewChatPickerCacheKey,
   readNewChatPermissionCache,
@@ -2062,6 +2064,7 @@ interface LandingDraft {
   permissionMode: string;
   approvalMode: string;
   bypassSandbox: boolean;
+  planMode: boolean;
   cursorExecMode: string;
   agySkipMode: string;
   devinPermissionMode: string;
@@ -2517,6 +2520,9 @@ export function NewChatLandingScreen() {
   const [bypassSandbox, setBypassSandbox] = useState<boolean>(
     () => restoredDraft?.bypassSandbox ?? false,
   );
+  // Codex Plan mode armed before the first prompt. A per-session pick like
+  // the TUI's shift+tab, so it is never remembered per harness.
+  const [planMode, setPlanMode] = useState<boolean>(() => restoredDraft?.planMode ?? false);
   // Execution mode for Cursor (cursor-agent --mode / --yolo). Only meaningful
   // for the cursor-native wrapper; ignored otherwise.
   const [cursorExecMode, setCursorExecMode] = useState<string>(
@@ -2621,6 +2627,7 @@ export function NewChatLandingScreen() {
     permissionMode,
     approvalMode,
     bypassSandbox,
+    planMode,
     cursorExecMode,
     agySkipMode,
     devinPermissionMode,
@@ -3230,6 +3237,10 @@ export function NewChatLandingScreen() {
   // picks native Claude Code or Codex per task. It rides a placeholder wrapper
   // agent for the create call, so the pick lives in pickedHarness alone.
   const smartRoutingHarnessSelected = pickedHarness === AUTO_NATIVE_HARNESS_ID;
+  // Codex Plan mode is a collaboration mode, not an approval preset, so the
+  // add menu arms it directly; Smart Routing may not land on Codex at all.
+  const codexPlanModeSelectable =
+    !smartRoutingHarnessSelected && selectedNativeHarness === "codex-native";
   const selectedAgentHasAdvancedSettings = agentHasAdvancedSettings(
     selectedAgent,
     brainHarnessLabelsAll,
@@ -3363,6 +3374,7 @@ export function NewChatLandingScreen() {
         ...modelRows,
         ...effortRows,
         { label: "Permission mode", value: approvalValue },
+        ...(isCodex && planMode ? [{ label: "Plan mode", value: "On" }] : []),
         ...(isCodex ? sourceRows(codexModelOptions) : []),
       ];
     }
@@ -3410,6 +3422,7 @@ export function NewChatLandingScreen() {
     permissionMode,
     approvalMode,
     bypassSandbox,
+    planMode,
     cursorExecMode,
     agySkipMode,
     pickedHarness,
@@ -3972,6 +3985,7 @@ export function NewChatLandingScreen() {
     if (prev === undefined || prev === null || prev === effectiveAgentId) return;
     userPickedModelRef.current = false;
     setBypassSandbox(false);
+    setPlanMode(false);
     setCostControlMode(null);
   }, [effectiveAgentId, setCostControlMode]);
   // A project-configured default model (Project settings) outranks the user's
@@ -5294,10 +5308,19 @@ export function NewChatLandingScreen() {
       // DANGEROUS codex full-bypass opt-in rides along as an extra label (only
       // when the toggle is armed for a codex-native agent) so the runner
       // launches with --dangerously-bypass-approvals-and-sandbox and the choice
-      // survives reload.
+      // survives reload. A pre-launch Plan pick rides the label the in-session
+      // toggle persists, so the runner starts the fresh thread in Plan mode.
+      const codexCreateLabels = {
+        ...(agentSupportsApprovalMode && bypassSandbox
+          ? { [CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY]: "1" }
+          : {}),
+        ...(nativeAgent?.harness === "codex-native" && planMode
+          ? { [CODEX_NATIVE_COLLABORATION_MODE_LABEL_KEY]: "plan" }
+          : {}),
+      };
       const baseLabels =
-        agentSupportsApprovalMode && bypassSandbox
-          ? { ...(nativeLabels ?? {}), [CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY]: "1" }
+        Object.keys(codexCreateLabels).length > 0
+          ? { ...(nativeLabels ?? {}), ...codexCreateLabels }
           : nativeLabels;
       // First-class project filing: a project-driven visit whose `?project=`
       // name resolved to a real project id sends `project_id` so the server
@@ -6452,13 +6475,23 @@ export function NewChatLandingScreen() {
                         disabled={creating}
                         onAttach={() => fileInputRef.current?.click()}
                         onPlan={
-                          directModeOptions.some((mode) => mode.value === "plan")
-                            ? () => selectDirectMode("plan")
-                            : undefined
+                          codexPlanModeSelectable
+                            ? () => setPlanMode((armed) => !armed)
+                            : directModeOptions.some((mode) => mode.value === "plan")
+                              ? () => selectDirectMode("plan")
+                              : undefined
                         }
                         planActive={
                           (supportsPermissionMode && permissionMode === "plan") ||
-                          (supportsCursorMode && cursorExecMode === "plan")
+                          (supportsCursorMode && cursorExecMode === "plan") ||
+                          (codexPlanModeSelectable && planMode)
+                        }
+                        planLabel={
+                          codexPlanModeSelectable
+                            ? planMode
+                              ? "Exit Plan mode"
+                              : "Enter Plan mode"
+                            : undefined
                         }
                         projects={projectList ?? []}
                         onProjectSelect={(name) => {
@@ -6686,6 +6719,16 @@ export function NewChatLandingScreen() {
                         testIdPrefix="new-chat-landing"
                       />
                     ) : null}
+                    {/* Mirrors the in-session composer's Plan-mode marker. */}
+                    {codexPlanModeSelectable && planMode && (
+                      <span
+                        data-testid="new-chat-landing-plan-mode"
+                        className="inline-flex shrink-0 items-center gap-1 px-1 text-sm font-medium text-foreground"
+                      >
+                        <FileTextIcon className="ui-icon" />
+                        <span>Plan mode</span>
+                      </span>
+                    )}
 
                     {/* The session's project membership (from a `?project=` landing)
                 is shown in the hero heading instead of a tray chip; filing on

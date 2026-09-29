@@ -5779,6 +5779,65 @@ describe("NewChatLandingScreen", () => {
     expect(labels["omnigent.wrapper"]).toBe("codex-native-ui");
   });
 
+  it("offers Plan mode in the add menu for Codex before the first prompt", () => {
+    renderLanding();
+    selectAgent("a2");
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-attach"), { button: 0 });
+    const plan = screen.getByTestId("composer-plan-action");
+    expect(plan).not.toHaveAttribute("data-disabled");
+    expect(plan).toHaveAttribute("aria-label", "Enter Plan mode");
+    expect(screen.queryByTestId("new-chat-landing-plan-mode")).toBeNull();
+    fireEvent.click(plan);
+    // The armed pick is visible beside the composer controls before any typing.
+    expect(screen.getByTestId("new-chat-landing-plan-mode")).toHaveTextContent("Plan mode");
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-attach"), { button: 0 });
+    const armed = screen.getByTestId("composer-plan-action");
+    expect(armed).toHaveAttribute("data-active", "true");
+    expect(armed).toHaveAttribute("aria-label", "Exit Plan mode");
+    fireEvent.click(armed);
+    expect(screen.queryByTestId("new-chat-landing-plan-mode")).toBeNull();
+  });
+
+  it("seeds the collaboration-mode label in the create body when Plan mode is armed", async () => {
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+    renderLanding();
+    selectAgent("a2");
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-attach"), { button: 0 });
+    fireEvent.click(screen.getByTestId("composer-plan-action"));
+    const { body } = await submitAndReadBody("plan the auth refactor");
+    const labels = body.labels as Record<string, string>;
+    // The runner reads this label to start the fresh thread in Plan mode.
+    expect(labels["omnigent.codex_native.collaboration_mode"]).toBe("plan");
+    expect(labels["omnigent.wrapper"]).toBe("codex-native-ui");
+  });
+
+  it("omits the collaboration-mode label when Plan mode is left off", async () => {
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+    renderLanding();
+    selectAgent("a2");
+    const { body } = await submitAndReadBody("run the build");
+    expect(
+      (body.labels as Record<string, string>)["omnigent.codex_native.collaboration_mode"],
+    ).toBeUndefined();
+  });
+
+  it("drops the armed Plan mode when the agent changes", () => {
+    renderLanding();
+    selectAgent("a2");
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-attach"), { button: 0 });
+    fireEvent.click(screen.getByTestId("composer-plan-action"));
+    expect(screen.getByTestId("new-chat-landing-plan-mode")).toBeVisible();
+    selectAgent("a1");
+    selectAgent("a2");
+    expect(screen.queryByTestId("new-chat-landing-plan-mode")).toBeNull();
+  });
+
   it.each([
     ["default", "Default", undefined],
     [

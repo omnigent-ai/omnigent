@@ -288,6 +288,45 @@ async def test_bypass_sandbox_defaults_off_unless_label_is_one(
 
 
 @pytest.mark.asyncio
+async def test_plan_mode_parses_from_collaboration_mode_label(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The pre-launch Plan-mode pick rides the collaboration-mode label: the launch config
+    surfaces the seeded ``collaboration_mode: "plan"`` so the runner switches the fresh
+    thread into Plan mode before the first turn."""
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8123")
+    snapshot = {
+        "workspace": "/tmp/repo",
+        "labels": {"omnigent.codex_native.collaboration_mode": "plan"},
+    }
+    cfg = await _run(_Client(_Resp(200, snapshot)))
+    assert cfg.plan_mode is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "labels",
+    [
+        None,
+        {},
+        {"omnigent.codex_native.collaboration_mode": "default"},
+        {"omnigent.codex_native.collaboration_mode": ""},
+        {"omnigent.codex_native.collaboration_mode": "PLAN"},
+    ],
+)
+async def test_plan_mode_defaults_off_unless_label_is_plan(
+    monkeypatch: pytest.MonkeyPatch, labels: Any
+) -> None:
+    """``plan_mode`` is False unless the label is exactly ``"plan"``."""
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8123")
+    snapshot: dict[str, Any] = {"workspace": "/tmp/repo"}
+    if labels is not None:
+        snapshot["labels"] = labels
+    cfg = await _run(_Client(_Resp(200, snapshot)))
+    assert cfg.plan_mode is False
+
+
+@pytest.mark.asyncio
 async def test_transient_timeout_recovers_on_retry(retry_sleeps: list[float]) -> None:
     """A first-attempt read timeout is retried, and a follow-up 200 succeeds.
 
