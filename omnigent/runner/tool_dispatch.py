@@ -7835,11 +7835,15 @@ def _format_async_task_item(payload: _JsonObject) -> str:
         title = payload.get("title", "")
         target = f"{agent}:{title}" if title else str(agent)
         if status == "completed":
+            corrected = payload.get("corrected_status")
+            verb = (
+                f"completed, superseding its earlier {corrected} notice"
+                if isinstance(corrected, str) and corrected
+                else "completed"
+            )
             if not has_output:
-                return (
-                    f"[System: sub-agent task {handle_id} completed — {target} produced no output]"
-                )
-            return f"[System: sub-agent task {handle_id} completed — {target} returned: {output}]"
+                return f"[System: sub-agent task {handle_id} {verb} — {target} produced no output]"
+            return f"[System: sub-agent task {handle_id} {verb} — {target} returned: {output}]"
         if status == "failed":
             return f"[System: sub-agent task {handle_id} failed — {target} error: {output}]"
         if status == "cancelled":
