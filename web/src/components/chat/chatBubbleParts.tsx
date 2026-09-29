@@ -419,9 +419,16 @@ export function workingIndicatorLabel(tick = 0, blockedOn: string | null = null)
 }
 
 export function WorkingIndicator() {
-  const bgCount = useChatStore((s) => s.backgroundTaskCount);
-  const blockedOn = useChatStore((s) => s.blockedOn);
-  const agentWorking = useAgentTurnActive();
+  const scopedConversationId = useContext(ConversationScopeContext);
+  const scopedState = useConversationEntryState(scopedConversationId);
+  const rootBgCount = useChatStore((s) => s.backgroundTaskCount);
+  const rootBlockedOn = useChatStore((s) => s.blockedOn);
+  const rootAgentWorking = useAgentTurnActive();
+  const bgCount = scopedConversationId ? scopedState.backgroundTaskCount : rootBgCount;
+  const blockedOn = scopedConversationId ? scopedState.blockedOn : rootBlockedOn;
+  const agentWorking = scopedConversationId
+    ? computeIsWorking(scopedState.sessionStatus) || scopedState.status === "streaming"
+    : rootAgentWorking;
   const tick = useWorkingLabelTick();
   // Once the turn ends but background shells outlive it, BackgroundTaskPill owns
   // the state and the shimmer stays off (it would misread as the agent still

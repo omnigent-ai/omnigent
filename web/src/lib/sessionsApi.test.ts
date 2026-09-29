@@ -1494,16 +1494,22 @@ describe("openSessionStream", () => {
 });
 
 describe("interrupt", () => {
-  it("posts {type: 'interrupt', data: {}} to the events endpoint", async () => {
-    fetchMock.mockResolvedValueOnce(mockJsonResponse({ queued: false }));
+  it.each([undefined, "codex_turn_side_1"])(
+    "posts an interrupt with the optional observed response id %s",
+    async (responseId) => {
+      fetchMock.mockResolvedValueOnce(mockJsonResponse({ queued: false }));
 
-    const out = await interrupt("conv_abc");
+      const out = await interrupt("conv_abc", responseId);
 
-    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
-    expect(url).toBe("/v1/sessions/conv_abc/events");
-    expect(JSON.parse(init.body as string)).toEqual({ type: "interrupt", data: {} });
-    expect(out.queued).toBe(false);
-  });
+      const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+      expect(url).toBe("/v1/sessions/conv_abc/events");
+      expect(JSON.parse(init.body as string)).toEqual({
+        type: "interrupt",
+        data: responseId ? { response_id: responseId } : {},
+      });
+      expect(out.queued).toBe(false);
+    },
+  );
 });
 
 describe("stopSession", () => {

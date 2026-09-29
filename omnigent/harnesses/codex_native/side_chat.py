@@ -220,6 +220,26 @@ async def open_side_chat_on_client(
     return child_thread_id
 
 
+async def interrupt_side_turn(
+    codex_client: CodexAppServerClient, child_thread_id: str, turn_id: str
+) -> None:
+    """Interrupt the observed child turn without cancelling a newer turn or its parent."""
+    from omnigent.harnesses.codex_native.app_server import CodexAppServerResponseError
+
+    try:
+        await codex_client.request(
+            "turn/interrupt", {"threadId": child_thread_id, "turnId": turn_id}
+        )
+    except CodexAppServerResponseError as exc:
+        message = (exc.message or "").casefold()
+        if exc.code == -32600 and (
+            "no active turn to interrupt" in message
+            or ("expected active turn id" in message and "but found" in message)
+        ):
+            return
+        raise
+
+
 def is_omnigent_side_fork(event: _JsonObject) -> bool:
     """
     Return whether a ``thread/started`` event announces an ephemeral side fork.

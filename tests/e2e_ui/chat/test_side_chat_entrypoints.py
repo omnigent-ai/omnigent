@@ -8,6 +8,7 @@ dispatch, streaming, and transcript persistence use the real backend.
 from __future__ import annotations
 
 import re
+import time
 from collections.abc import Iterator
 
 import httpx
@@ -254,3 +255,136 @@ def test_runner_bound_side_chat_closes_without_stopping_parent(
     parent_items = str(_items(base_url, session_id))
     assert parent_question in parent_items
     assert question not in parent_items
+
+
+def test_running_empty_side_chat_shows_working(
+    page: Page,
+    seeded_session: tuple[str, str],
+    side_chat_forks: list[str],
+) -> None:
+    """Native status can arrive before the side chat's first conversation item."""
+    base_url, session_id = seeded_session
+    response = httpx.post(
+        f"{base_url}/v1/sessions/{session_id}/fork",
+        json={"title": "Side chat", "side_chat": True},
+        timeout=10.0,
+    )
+    response.raise_for_status()
+    child_id = response.json()["id"]
+    side_chat_forks.append(child_id)
+    response = httpx.post(
+        f"{base_url}/v1/sessions/{child_id}/events",
+        json={"type": "external_session_status", "data": {"status": "running"}},
+        timeout=10.0,
+    )
+    response.raise_for_status()
+
+    page.goto(f"{base_url}/c/{session_id}")
+    page.evaluate(
+        """({ parentId, childId }) => localStorage.setItem(
+            "omnigent:session-workspace-state",
+            JSON.stringify([{ id: parentId, state: {
+                open: true, rightRailTab: "sidechat",
+                openSideChats: [childId], selectedSideChatId: childId,
+            } }]),
+        )""",
+        {"parentId": session_id, "childId": child_id},
+    )
+    page.reload()
+    page.get_by_role("tab", name="Side chat 1", exact=True).click()
+
+    pane = page.locator(".side-chat-backdrop")
+    expect(pane.get_by_test_id("working-indicator")).to_be_visible()
+    expect(pane.get_by_test_id("message-bubble")).to_have_count(0)
+    expect(
+        pane.get_by_text("Ask a question here without affecting the main conversation.")
+    ).to_have_count(0)
+    expect(pane.get_by_role("button", name="Interrupt side chat", exact=True)).to_be_enabled()
+
+    response = httpx.post(
+        f"{base_url}/v1/sessions/{child_id}/events",
+        json={"type": "external_session_status", "data": {"status": "idle"}},
+        timeout=10.0,
+    )
+    response.raise_for_status()
+    expect(pane.get_by_test_id("working-indicator")).to_have_count(0)
+    expect(pane.get_by_test_id("side-chat-interrupt")).to_have_count(0)
+    expect(
+        pane.get_by_text("Ask a question here without affecting the main conversation.")
+    ).to_be_visible()
+
+
+def test_side_chat_interrupt_allows_followup_without_stopping_parent(
+    page: Page,
+    seeded_session: tuple[str, str],
+    side_chat_forks: list[str],
+    mock_llm_server_url: str,
+) -> None:
+    """Interrupt cancels the child's real turn and keeps both conversations usable."""
+    base_url, session_id = seeded_session
+    question = f"interrupt-side-{session_id}: wait for me to stop this answer"
+    followup = f"interrupt-side-{session_id}: answer this follow-up instead"
+    parent_question = f"interrupt-parent-{session_id}: check the main conversation"
+    configure_mock_llm(
+        mock_llm_server_url,
+        [
+            {"text": "This answer should be interrupted.", "block": True},
+            {"text": "The side chat continued."},
+        ],
+        key=f"interrupt-side-{session_id}",
+        match=f"interrupt-side-{session_id}",
+    )
+    configure_mock_llm(
+        mock_llm_server_url,
+        [{"text": "The main conversation still works."}],
+        key=f"interrupt-parent-{session_id}",
+        match=f"interrupt-parent-{session_id}",
+    )
+
+    try:
+        page.goto(f"{base_url}/c/{session_id}")
+        expect(page.get_by_placeholder("Send a message…")).to_be_visible()
+        _start_side_chat(page, "slash", question)
+        pane = page.locator(".side-chat-backdrop")
+        expect(pane.get_by_test_id("working-indicator")).to_be_visible(timeout=30_000)
+        interrupt = pane.get_by_role("button", name="Interrupt side chat", exact=True)
+        expect(interrupt).to_be_enabled()
+        assert len(side_chat_forks) == 1
+        child_id = side_chat_forks[0]
+
+        deadline = time.monotonic() + 30.0
+        while time.monotonic() < deadline:
+            response = httpx.get(f"{mock_llm_server_url}/gate/pending", timeout=5.0)
+            response.raise_for_status()
+            if response.json()["pending"]:
+                break
+            page.wait_for_timeout(50)
+        else:
+            pytest.fail("The side chat never reached the blocked LLM response")
+
+        parent_items = _items(base_url, session_id)
+        page.get_by_test_id("side-chat-input").fill(followup)
+        with page.expect_response(f"**/v1/sessions/{child_id}/events") as interrupted:
+            interrupt.click()
+        assert interrupted.value.ok
+        assert interrupted.value.request.post_data_json["type"] == "interrupt"
+        expect(pane.get_by_test_id("working-indicator")).to_have_count(0, timeout=30_000)
+        expect(interrupt).to_have_count(0)
+        expect(page.get_by_test_id("side-chat-input")).to_have_value(followup)
+        assert _items(base_url, session_id) == parent_items
+
+        expect(page.get_by_test_id("side-chat-send")).to_be_enabled()
+        page.get_by_test_id("side-chat-send").click()
+        expect(pane.locator(_ASSISTANT).filter(has_text="The side chat continued.")).to_be_visible(
+            timeout=30_000
+        )
+        expect(pane.get_by_test_id("working-indicator")).to_have_count(0, timeout=30_000)
+        expect(pane.get_by_text("This answer should be interrupted.", exact=True)).to_have_count(0)
+        assert _items(base_url, session_id) == parent_items
+
+        _send_parent(page, parent_question, "The main conversation still works.")
+        assert followup in str(_items(base_url, child_id))
+        assert question not in str(_items(base_url, session_id))
+        expect(page).to_have_url(f"{base_url}/c/{session_id}")
+    finally:
+        httpx.post(f"{mock_llm_server_url}/gate/release", timeout=5.0).raise_for_status()
