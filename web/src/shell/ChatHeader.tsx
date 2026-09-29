@@ -22,6 +22,7 @@ import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
+  DropdownMenuLabel,
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
@@ -117,6 +118,8 @@ interface ChatHeaderProps {
   subAgentName?: string | null;
   /** Active session id, or undefined on the landing composer. */
   conversationId: string | undefined;
+  /** Effective access to the active session. */
+  permissionLevel?: number | null;
   /** Owner-managed top-level row backing the title-adjacent action menu. */
   actionConversation?: Conversation | null;
   /**
@@ -225,7 +228,7 @@ function PendingHeaderActions({ isMobile }: { isMobile: boolean }) {
         aria-label="Switch between chat and terminal"
         aria-disabled="true"
         title={PENDING_ACTION_TITLE}
-        className="hidden items-center gap-0.5 rounded-[var(--radius-lg)] bg-muted/60 p-0.5 md:flex"
+        className="hidden h-6 w-[74px] shrink-0 items-center gap-0.5 rounded-[6px] bg-muted p-0 md:flex"
       >
         <Button
           type="button"
@@ -234,9 +237,9 @@ function PendingHeaderActions({ isMobile }: { isMobile: boolean }) {
           aria-label="Chat view"
           aria-pressed="true"
           disabled
-          className="border-none bg-background text-foreground shadow-sm"
+          className="h-6 w-9 rounded-[6px] border border-border bg-background px-2.5 py-0 text-foreground shadow-sm"
         >
-          <MessagesSquareIcon className="size-3.5" />
+          <MessagesSquareIcon className="size-4" />
         </Button>
         <Button
           type="button"
@@ -245,9 +248,9 @@ function PendingHeaderActions({ isMobile }: { isMobile: boolean }) {
           aria-label="Terminal view"
           aria-pressed="false"
           disabled
-          className="border-none text-muted-foreground"
+          className="h-6 w-9 rounded-[6px] border border-transparent px-2.5 py-0 text-muted-foreground"
         >
-          <TerminalIcon className="size-3.5" />
+          <TerminalIcon className="size-4" />
         </Button>
       </div>
       <Button
@@ -305,6 +308,7 @@ export function ChatHeader({
   isChildSession,
   subAgentName,
   conversationId,
+  permissionLevel,
   actionConversation = null,
   conversationTitle,
   projectName,
@@ -539,7 +543,7 @@ export function ChatHeader({
         // Scrolled chat text can't render through the controls because the
         // conversation viewport fades its top edge instead (chat-scroll-fade
         // in index.css, applied in ChatPage).
-        "chat-header absolute inset-x-0 top-0 z-30 flex h-14 md:h-12 items-center justify-between px-2 md:px-4 py-3 md:right-[var(--workspace-panel-offset,0px)]",
+        "chat-header absolute inset-x-0 top-0 z-30 flex h-14 md:h-12 items-center justify-between px-2 md:px-4 py-3 md:right-[var(--workspace-panel-offset,0px)] md:transition-[right] md:duration-300 md:ease-in-out",
       )}
     >
       {/* Left slot: sidebar toggle (when sidebar is closed) and a
@@ -570,10 +574,9 @@ export function ChatHeader({
               <Button
                 type="button"
                 variant="ghost"
-                // icon on <md (size-10, comfortable tap target), icon-xs on
-                // desktop (md:size-6). size="icon" gives the base size-10; the
-                // md:size-6 override replaces the variant's md:size-8.
-                size="icon"
+                // Match the right-panel toggle's 24px icon-xs geometry on
+                // desktop; mobile keeps its larger touch target below.
+                size="icon-xs"
                 aria-label="Open sidebar"
                 componentId="chat.header.open_sidebar"
                 onClick={() => {
@@ -586,7 +589,7 @@ export function ChatHeader({
                 // copy of it. Kept everywhere else, where it is the ONLY way to
                 // reopen a collapsed sidebar.
                 className={cn(
-                  "chat-header-sidebar-toggle text-muted-foreground hover:text-foreground max-md:size-11 md:size-6",
+                  "chat-header-sidebar-toggle border-none text-muted-foreground hover:text-foreground max-md:size-11",
                   MOBILE_GLASS_PILL,
                 )}
                 onPointerEnter={onPeekSidebar}
@@ -635,7 +638,7 @@ export function ChatHeader({
         {/* Other users currently viewing this session (presence).
             Self-contained — reads the chat store directly, renders
             nothing when the user is alone. */}
-        {conversationId && <PresenceAvatars />}
+        {conversationId && !isMobile && <PresenceAvatars />}
         {/* Desktop (md+) action buttons. On mobile these collapse into
             the three-dot "Session actions" menu below. Fork is also
             available from the session menus and assistant messages. */}
@@ -643,7 +646,11 @@ export function ChatHeader({
         {/* Agent info: tools & policies for the bound agent. Desktop-only
             popover; self-hides when the agent has neither configured. */}
         {!pending && conversationId && (
-          <AgentInfoButton agent={boundAgent} sessionId={conversationId} />
+          <AgentInfoButton
+            agent={boundAgent}
+            sessionId={conversationId}
+            permissionLevel={permissionLevel}
+          />
         )}
         {/* Chat/Terminal switcher for terminal-first sessions — self-gates to
             null otherwise. Renders on every shell, iOS included. */}
@@ -693,7 +700,21 @@ export function ChatHeader({
                   <EllipsisVerticalIcon className="size-4 max-md:size-5" />
                 </Button>
               </DropdownMenuTrigger>
-              <DropdownMenuContent align="end" className={cn("min-w-44", MOBILE_GLASS_SURFACE)}>
+              <DropdownMenuContent
+                align="end"
+                className={cn("min-w-44 max-w-[min(20rem,calc(100vw-1rem))]", MOBILE_GLASS_SURFACE)}
+              >
+                {isMobile && conversationId && (
+                  <>
+                    <DropdownMenuLabel className="flex items-center gap-2 px-2.5 pb-1.5 text-foreground">
+                      <span className="min-w-0 flex-1 truncate">
+                        {conversationTitle || UNTITLED_CONVERSATION_LABEL}
+                      </span>
+                      <PresenceAvatars />
+                    </DropdownMenuLabel>
+                    <DropdownMenuSeparator />
+                  </>
+                )}
                 {/* Chat/Terminal switch (terminal-first sessions) — self-gates to
                   null otherwise, and renders its own trailing separator. */}
                 {isMobile && <ViewModeMenuItems />}

@@ -45,12 +45,23 @@ def short_tmp_parent() -> Iterator[pathlib.Path]:
 
 @pytest.fixture(autouse=True)
 def _stub_executor_catalog_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Keep executor unit tests deterministic without catalog network access."""
+    """Keep executor unit tests deterministic without catalog auth or network access."""
+
+    from omnigent.models.model_catalog import ModelListing
 
     def _resolve(provider_name: str, *, family: str, **kwargs: object) -> SimpleNamespace:
         return SimpleNamespace(model_id=f"catalog-{provider_name}-{family}-default")
 
+    def _listing(_provider: object) -> ModelListing:
+        return ModelListing(
+            source="none",
+            verified=False,
+            models=(),
+            note="stubbed for executor unit tests",
+        )
+
     monkeypatch.setattr("omnigent.models.model_catalog.resolve_catalog_model", _resolve)
+    monkeypatch.setattr("omnigent.models.model_catalog.listing_for_provider", _listing)
 
 
 # Diagnostic: dump every thread's stack every 90s. The dispatcher's

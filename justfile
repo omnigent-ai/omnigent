@@ -115,6 +115,86 @@ electron-dev: _ensure-web _ensure-electron
 electron-build: _ensure-web _ensure-electron
     pnpm --filter ./web/electron run build
 
+# Build (if needed) and launch the packaged app (reads MDM managed prefs).
+# Flags: --rebuild (force a fresh build even if one exists),
+#        --v2-flow (force the new server-selector wizard on),
+#        --reset-state (first uninstall the CLI + wipe app data for a fresh
+#                       user; destructive, asks for confirmation).
+[group('electron')]
+electron-run *flags:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    # Validate flags and get reset confirmation BEFORE any side effect (dep
+    # install, build, quitting the app), so declining leaves the machine
+    # untouched.
+    [ "$(uname)" = "Darwin" ] || { echo "electron-run is macOS-only (managed-prefs testing); build with 'just electron-build' and open the app for your OS."; exit 1; }
+    # just delivers variadic args via {{flags}} substitution; put them into
+    # positional params so the loop treats each as one datum. (Local dev recipe:
+    # the caller already has shell access, so this isn't a trust boundary.)
+    set -- {{flags}}
+    rebuild=0; v2=0; reset_state=0
+    for f in "$@"; do
+        case "$f" in
+            --rebuild) rebuild=1 ;;
+            --v2-flow) v2=1 ;;
+            --reset-state) reset_state=1 ;;
+            *) echo "unknown flag: $f (supported: --rebuild, --v2-flow, --reset-state)"; exit 2 ;;
+        esac
+    done
+    if [ "$reset_state" = 1 ]; then
+        echo "--reset-state will UNINSTALL the omnigent CLI and remove the desktop"
+        echo "app's data (session cookies, recent servers) for a fresh-user test."
+        read -r -p 'Type "yes" to proceed: ' reply
+        [ "$reply" = "yes" ] || { echo "Aborted."; exit 1; }
+    fi
+    # Pick the bundle for THIS machine's architecture (electron-builder emits both
+    # mac-arm64 and mac-x64/mac); a bare glob could launch the wrong one on Intel.
+    case "$(uname -m)" in
+        arm64) archdir="mac-arm64" ;;
+        *) archdir="mac" ;;  # electron-builder names the x64 output "mac"
+    esac
+    find_app() { ls -d "web/electron/dist/$archdir/Omnigent.app" 2>/dev/null | head -1 || true; }
+    app="$(find_app)"
+    if [ "$rebuild" = 1 ] || [ -z "$app" ]; then
+        echo "Building the packaged app (this takes a few minutes)…"
+        just _ensure-web _ensure-electron
+        pnpm --filter ./web/electron run build
+        app="$(find_app)"
+    fi
+    [ -n "$app" ] || { echo "No $archdir build found after building."; exit 1; }
+    echo "Quitting any running Omnigent…"
+    osascript -e 'quit app "Omnigent"' 2>/dev/null || true
+    pkill -x Omnigent 2>/dev/null || true
+    sleep 1
+    if [ "$reset_state" = 1 ]; then
+        # Uninstall the CLI. The shared uninstaller exits non-zero both when no
+        # install exists (fine) and on a genuine failure (e.g. removal blocked) —
+        # and its exit codes don't distinguish those. So verify the OUTCOME
+        # instead: after running it, if the binary is still resolvable the
+        # uninstall really failed — abort BEFORE deleting data or launching, so a
+        # half-reset can't masquerade as a clean fresh-user state.
+        sh scripts/uninstall_oss.sh cli --yes || true
+        hash -r 2>/dev/null || true
+        if command -v omnigent >/dev/null 2>&1; then
+            echo "CLI uninstall did not remove 'omnigent' (still on PATH). Aborting" >&2
+            echo "before touching app data. Remove it manually, then retry." >&2
+            exit 1
+        fi
+        # Wipe the desktop app data directly so a fresh-user reset works even with
+        # no CLI installed (the uninstaller's global guard skips desktop-data in
+        # that case). Intentional destroy — see the confirmation above.
+        rm -rf "$HOME/Library/Application Support/Omnigent" \
+               "$HOME/Library/Caches/Omnigent" \
+               "$HOME/Library/Logs/Omnigent"
+    fi
+    if [ "$v2" = 1 ]; then
+        echo "Launching $app (v2 flow forced)"
+        open -n "$app" --env OMNIGENT_SERVER_SELECTOR_V2=1
+    else
+        echo "Launching $app"
+        open -n "$app"
+    fi
+
 # --- Lint ---
 
 [group('lint')]

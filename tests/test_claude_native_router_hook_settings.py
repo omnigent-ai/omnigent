@@ -74,7 +74,7 @@ def test_router_hook_coexists_with_policy_hooks(tmp_path: Path) -> None:
     )
     pre_tool_use = settings["hooks"]["PreToolUse"]
     matchers = [entry.get("matcher") for entry in pre_tool_use]
-    assert matchers == ["AskUserQuestion", None, AGENT_TOOL_MATCHER]
+    assert matchers == [None, AGENT_TOOL_MATCHER]
 
 
 def _commands(settings: dict[str, Any], event: str) -> list[str]:
@@ -104,13 +104,12 @@ def test_both_routing_hooks_coexist_with_the_policy_hooks(tmp_path: Path) -> Non
     )
 
     prompt_submit = _commands(settings, "UserPromptSubmit")
-    # Order is load-bearing: the transcript forwarder's status hook first, the
-    # routing gate next (it may block the prompt), the request-phase policy gate
-    # last — for a native session that gate is the sole request gate.
-    assert len(prompt_submit) == 3
+    # Order is load-bearing: status, framework context, routing, then policy.
+    assert len(prompt_submit) == 4
     assert "omnigent.harnesses.claude_native.hook" in prompt_submit[0]
-    assert "route-turn" in prompt_submit[1]
-    assert "evaluate-policy" in prompt_submit[2]
+    assert "framework-context" in prompt_submit[1]
+    assert "route-turn" in prompt_submit[2]
+    assert "evaluate-policy" in prompt_submit[3]
     # Neither routing hook leaks onto the other's event.
     assert not any("route-subagent" in c or "claude_router_hook" in c for c in prompt_submit)
 

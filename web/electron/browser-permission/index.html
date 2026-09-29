@@ -1,0 +1,227 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'none'; script-src 'self'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'"
+    />
+    <title>Local network permission</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+        --surface: #ffffff;
+        --text: #202124;
+        --muted: #62666c;
+        --border: #e0e3e7;
+        --accent: #1967d2;
+        --accent-hover: #1558b5;
+        --tint: #eaf2ff;
+        --hover: #f1f3f4;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        font-size: 13px;
+      }
+
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --surface: #292a2d;
+          --text: #e8eaed;
+          --muted: #b0b4bb;
+          --border: #45474c;
+          --accent: #a8c7fa;
+          --accent-hover: #c2d7fc;
+          --tint: #35445e;
+          --hover: #383a3f;
+        }
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+      [hidden] {
+        display: none !important;
+      }
+      html,
+      body {
+        width: 100%;
+        height: 100%;
+        margin: 0;
+        overflow: hidden;
+      }
+      body {
+        padding: 8px;
+        background: transparent;
+        color: var(--text);
+      }
+      main {
+        height: 100%;
+        padding: 16px 18px;
+        display: flex;
+        flex-direction: column;
+        border: 1px solid var(--border);
+        border-radius: 18px;
+        background: var(--surface);
+        box-shadow: 0 3px 8px rgb(0 0 0 / 18%);
+      }
+      header {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+      }
+      header svg {
+        flex: none;
+        color: var(--muted);
+      }
+      #origin {
+        flex: 1;
+        min-width: 0;
+        max-height: 36px;
+        overflow-y: auto;
+        overflow-wrap: anywhere;
+        font-size: 12px;
+        line-height: 18px;
+      }
+      button {
+        font: inherit;
+        cursor: pointer;
+        border: 1px solid var(--border);
+        border-radius: 18px;
+        color: var(--text);
+        background: transparent;
+      }
+      button:hover {
+        background: var(--hover);
+      }
+      button:focus-visible {
+        outline: 2px solid var(--accent);
+        outline-offset: 2px;
+      }
+      button:disabled {
+        opacity: 0.5;
+        cursor: default;
+      }
+      #close {
+        flex: none;
+        display: grid;
+        place-items: center;
+        width: 26px;
+        height: 26px;
+        margin-right: -6px;
+        border: none;
+      }
+      section {
+        flex: 1;
+        display: flex;
+        flex-direction: column;
+        justify-content: center;
+      }
+      h1 {
+        margin: 0 0 8px;
+        font-size: 17px;
+        line-height: 22px;
+        font-weight: 600;
+      }
+      p {
+        margin: 0;
+        color: var(--muted);
+        font-size: 13px;
+        line-height: 19px;
+      }
+      #reload {
+        margin-top: 6px;
+        font-size: 11px;
+        line-height: 16px;
+      }
+      footer {
+        display: flex;
+        gap: 8px;
+      }
+      footer button {
+        height: 34px;
+        padding: 0 12px;
+        white-space: nowrap;
+        font-size: 12px;
+        font-weight: 500;
+      }
+      #once {
+        border-color: transparent;
+        background: var(--accent);
+        color: var(--surface);
+      }
+      #once:hover {
+        background: var(--accent-hover);
+      }
+      #always {
+        border-color: transparent;
+        background: var(--tint);
+        color: var(--accent);
+      }
+      #always:hover {
+        filter: brightness(0.95);
+      }
+      #deny {
+        margin-left: auto;
+      }
+    </style>
+  </head>
+  <body>
+    <main role="dialog" aria-labelledby="heading" aria-describedby="description">
+      <header>
+        <svg
+          width="15"
+          height="15"
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          stroke-width="1.6"
+          aria-hidden="true"
+        >
+          <rect x="5" y="10" width="14" height="11" rx="2" />
+          <path d="M8 10V7a4 4 0 0 1 8 0v3" />
+        </svg>
+        <span id="origin"></span>
+        <button id="close" type="button" aria-label="Dismiss permission request" title="Dismiss">
+          <svg
+            width="14"
+            height="14"
+            viewBox="0 0 16 16"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="1.5"
+            aria-hidden="true"
+          >
+            <path d="m4 4 8 8M12 4l-8 8" />
+          </svg>
+        </button>
+      </header>
+      <section>
+        <h1 id="heading">Allow local network access?</h1>
+        <p id="description">Connect to nearby devices and apps on this computer.</p>
+        <p id="reload" hidden>Allowing will reload this page.</p>
+      </section>
+      <footer>
+        <button
+          id="once"
+          type="button"
+          title="Until you leave this site or close this browser"
+          disabled
+        >
+          Allow once
+        </button>
+        <button
+          id="always"
+          type="button"
+          title="Remember for this site across all conversations"
+          disabled
+        >
+          Always allow
+        </button>
+        <button id="deny" type="button" title="Block this site across all conversations" disabled>
+          Deny
+        </button>
+      </footer>
+    </main>
+    <script src="index.js"></script>
+  </body>
+</html>

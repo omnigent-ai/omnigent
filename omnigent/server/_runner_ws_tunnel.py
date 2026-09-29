@@ -45,7 +45,7 @@ from typing import TYPE_CHECKING
 from websockets.exceptions import ConnectionClosed
 from websockets.frames import Close
 
-from omnigent.errors import OmnigentError
+from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.runner.transports.ws_tunnel.frames import (
     WSCloseFrame,
     WSFrame,
@@ -163,6 +163,8 @@ def make_tunnel_ws_factory(
         try:
             routed = router.client_for_existing_conversation(conversation_id)
         except OmnigentError as exc:
+            if exc.code == ErrorCode.WRONG_REPLICA:
+                raise WrongReplicaWSError(str(exc)) from exc
             raise RuntimeError(str(exc)) from exc
         if routed is None:
             raise RuntimeError(f"no runner pinned for conversation {conversation_id!r}")

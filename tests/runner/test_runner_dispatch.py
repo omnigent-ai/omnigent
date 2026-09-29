@@ -81,6 +81,7 @@ from omnigent.runner.app import (
     _evaluate_policy_via_omnigent,
     _forward_harness_response,
     _harness_error_response_error,
+    _normalize_turn_error,
     _resolve_harness_config,
 )
 from omnigent.runtime.harnesses import _HARNESS_MODULES
@@ -92,7 +93,7 @@ from omnigent.runtime.harnesses._scaffold import ToolResultEvent as _ToolResultE
 from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
 from omnigent.runtime.prompt import EMBEDDED_BROWSER_PRIORITY_INSTRUCTION
 from omnigent.server.schemas import CreateResponseRequest as _CreateResponseRequest
-from omnigent.spec.types import AgentSpec, ExecutorSpec, SharePolicy
+from omnigent.spec.types import AgentSpec, ExecutorSpec, SharePolicy, ToolsConfig
 from omnigent.util.session_lifecycle import CLOSED_LABEL_KEY, CLOSED_LABEL_VALUE
 from tests.runner.conftest import (
     _FakeProcessManager as _RecoveryFakeProcessManager,
@@ -1616,6 +1617,40 @@ def test_harness_error_response_error_parses_runner_error_bodies(
     assert _harness_error_response_error(response) == expected
 
 
+@pytest.mark.parametrize(
+    ("error", "expected"),
+    [
+        # A harness failure names itself: the status edge keeps that code so the
+        # web UI can de-duplicate it against the persisted error item.
+        (
+            {
+                "code": "databricks_sign_in_pending",
+                "message": "Codex is waiting for a sign-in.",
+            },
+            {
+                "code": "databricks_sign_in_pending",
+                "message": "Codex is waiting for a sign-in.",
+            },
+        ),
+        # The legacy ``type`` spelling still wins over the generic fallback.
+        (
+            {"type": "_ContextWindowOverflow", "message": "too long"},
+            {"code": "_ContextWindowOverflow", "message": "too long"},
+        ),
+        (
+            {"message": "turn setup failed: boom"},
+            {"code": "runner_error", "message": "turn setup failed: boom"},
+        ),
+        ({"status": 503}, {"code": "runner_error", "message": "turn failed (status 503)"}),
+        ({}, {"code": "runner_error", "message": "turn failed"}),
+    ],
+)
+def test_normalize_turn_error_keeps_the_failure_code(
+    error: dict[str, object], expected: dict[str, str]
+) -> None:
+    assert _normalize_turn_error(error) == expected
+
+
 class _SpawnFailingProcessManager(_FakeProcessManager):
     """Process manager stub whose harness spawn always fails.
 
@@ -2406,6 +2441,9 @@ async def test_runner_publishes_terminal_failed_when_harness_stream_fails(
         f"response.failed was dropped at stream end."
     )
     if until == "failed":
+        # The failed edge names the turn it closes (the harness's response id)
+        # so the web folds it into that response's own error card.
+        assert events[-1].get("response_id") == "resp_sf_1"
         error = events[-1].get("error")
         # The terminal failed edge must carry the harness's real error so
         # clients can render it — a bare ``failed`` with no payload would
@@ -4115,6 +4153,7 @@ def _spec_with_real_subagent(harness: str) -> AgentSpec:
     return AgentSpec(
         spec_version=1,
         name="parent",
+        tools=ToolsConfig(agents=["worker"]),
         sub_agents=[
             AgentSpec(
                 spec_version=1,
@@ -4325,6 +4364,58 @@ async def test_sys_session_send_strips_gateway_prefix_for_vendor_direct_child(
     assert len(result.create_bodies) == 1
     # Stripped: the vendor API only routes the bare canonical id.
     assert result.create_bodies[0]["model_override"] == "claude-opus-4-8"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("harness", ["acp", "acp:synthetic"])
+async def test_sys_session_send_preserves_acp_model_id_through_launch(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, harness: str
+) -> None:
+    """ACP dispatch metadata and launch preserve the command's literal model namespace."""
+    from omnigent.models.model_catalog import validate_acp_model
+    from omnigent.runner.app import _build_spawn_env_from_spec
+    from omnigent.spec.types import ProviderAuth
+
+    model = "databricks-gpt-5-4"
+    _isolate_model_providers(
+        monkeypatch,
+        tmp_path,
+        "providers:\n"
+        "  acp-key:\n"
+        "    kind: key\n"
+        "    openai:\n"
+        "      base_url: https://gateway.example.invalid/v1\n"
+        "      api_key: synthetic-test-key\n"
+        "      models:\n"
+        "        default: model-a\n"
+        f"        alternate: {model}\n",
+    )
+    parent_spec = _spec_with_real_subagent(harness)
+    worker_spec = parent_spec.sub_agents[0]
+    worker_spec.executor.auth = ProviderAuth(name="acp-key")
+    worker_spec.executor.config["acp_agent"] = {
+        "name": "Synthetic ACP",
+        "command": "synthetic-acp",
+        "model": "model-a",
+        "send_model": True,
+    }
+
+    result = await _dispatch_model_send(
+        monkeypatch,
+        agent_spec=parent_spec,
+        model=model,
+        conv_id="conv_parent_acp_literal_model",
+    )
+
+    assert json.loads(result.output)["status"] == "launching"
+    assert len(result.create_bodies) == 1
+    selected_model = result.create_bodies[0]["model_override"]
+    assert selected_model == model
+    validate_acp_model(worker_spec, selected_model)
+    env = _build_spawn_env_from_spec(worker_spec, harness, model_override=selected_model)
+    assert env is not None
+    assert env["HARNESS_ACP_MODEL"] == model
+    assert env["HARNESS_ACP_DEFAULT_MODEL"] == "model-a"
 
 
 @pytest.mark.asyncio
@@ -6525,7 +6616,11 @@ async def test_session_peek_returns_chronological_projected_items() -> None:
 _REST_HISTORY_CONTENT_SCENARIOS = [
     pytest.param(3000, 4000, "R" * 3000, id="raised-limit"),
     pytest.param(3000, None, "R" * 2000 + " [truncated]", id="default-limit"),
-    pytest.param(13000, 50000, "R" * 12000 + " [truncated]", id="ceiling"),
+    # An explicit limit recovers one long item in full (a sub-agent
+    # handoff longer than the inbox delivery cap stays reachable).
+    pytest.param(13000, 50000, "R" * 13000, id="explicit-limit-recovers-long-item"),
+    # The total prompt budget still bounds a single read.
+    pytest.param(100050, 200000, "R" * 100000 + " [truncated]", id="budget-ceiling"),
     # No REST request is expected because validation rejects before the GET.
     pytest.param(None, 0, "content_max_chars must be >= 1", id="non-positive"),
 ]
@@ -6589,6 +6684,86 @@ async def test_session_peek_rest_content_limit_scenario(
         assert payload["title"] == "auth"
         actual = payload["items"][0]["text"]
     assert actual == expected
+
+
+@pytest.mark.asyncio
+async def test_session_peek_rest_offset_pages_through_long_item() -> None:
+    """
+    ``content_offset_chars`` pages through one long item on the REST path.
+
+    Stepping the offset by the window size reconstructs a content field
+    longer than one window, so a long sub-agent handoff stays reachable
+    from a runner-bound parent.
+    """
+    from omnigent.runner.tool_dispatch import _execute_session_query_tool
+
+    text = "BEGIN|" + ("0123456789" * 2000) + "|END"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/sessions/conv_target/items":
+            return httpx.Response(
+                200,
+                json={
+                    "object": "list",
+                    "data": [
+                        {
+                            "id": "i1",
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [{"type": "output_text", "text": text}],
+                        }
+                    ],
+                },
+            )
+        if request.url.path == "/v1/sessions/conv_target":
+            return httpx.Response(200, json={"id": "conv_target", "title": "researcher:auth"})
+        raise AssertionError(f"unexpected path {request.url.path}")
+
+    window = 12000
+    windows: list[str] = []
+    async with _session_query_client(handler) as client:
+        for offset in (0, window):
+            payload = json.loads(
+                await _execute_session_query_tool(
+                    "sys_session_get_history",
+                    json.dumps(
+                        {
+                            "conversation_id": "conv_target",
+                            "tail_items": 1,
+                            "content_max_chars": window,
+                            "content_offset_chars": offset,
+                        }
+                    ),
+                    conversation_id="conv_caller",
+                    server_client=client,
+                )
+            )
+            windows.append(payload["items"][0]["text"])
+
+    assert windows[0] == text[:window] + " [truncated]"
+    # The second window reaches the true end: no marker, tail present.
+    assert windows[1] == text[window:]
+    assert windows[0].removesuffix(" [truncated]") + windows[1] == text
+
+
+@pytest.mark.asyncio
+async def test_session_peek_rest_rejects_invalid_offset() -> None:
+    """An invalid offset is rejected before any REST request is made."""
+    from omnigent.runner.tool_dispatch import _execute_session_query_tool
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError("REST request should not run for rejected arguments")
+
+    async with _session_query_client(handler) as client:
+        payload = json.loads(
+            await _execute_session_query_tool(
+                "sys_session_get_history",
+                json.dumps({"conversation_id": "conv_target", "content_offset_chars": -1}),
+                conversation_id="conv_caller",
+                server_client=client,
+            )
+        )
+    assert payload["error"] == "content_offset_chars must be >= 0"
 
 
 @pytest.mark.asyncio
@@ -7158,6 +7333,7 @@ async def test_session_list_global_sessions_filter_and_connectivity() -> None:
 
     # agent_name forwarded to the server-side filter.
     assert sessions_params.get("agent_name") == "researcher"
+    assert sessions_params.get("visibility") == "all"
     # Both sessions projected with status + connectivity from the single
     # shared-runner status lookup.
     assert out["sessions"] == [
@@ -8623,6 +8799,56 @@ def test_format_async_task_item_nonempty_subagent_completion_shows_output() -> N
     )
     assert "returned: review done: LGTM" in line
     assert "produced no output" not in line
+
+
+def test_format_async_task_item_truncated_subagent_output_names_retrieval_path() -> None:
+    """
+    A sub-agent handoff cut by the inbox delivery cap tells the parent how
+    to read the rest.
+
+    Delivery stays bounded (the wake prompt cannot grow without limit), but
+    the marker must name the child session and the retrieval tool — without
+    it the tail reads as silently lost.
+    """
+    from omnigent.runner.tool_dispatch import _INBOX_OUTPUT_MAX_CHARS, _format_async_task_item
+
+    long_output = "X" * (_INBOX_OUTPUT_MAX_CHARS + 8000)
+    line = _format_async_task_item(
+        {
+            "type": "sub_agent",
+            "conversation_id": "conv_child_long",
+            "handle_id": "conv_child_long",
+            "agent": "writer",
+            "title": "long-report",
+            "status": "completed",
+            "output": long_output,
+        }
+    )
+    assert "...[truncated 8000 chars" in line
+    assert "sys_session_get_history conversation_id=conv_child_long" in line
+    assert f"content_max_chars={len(long_output)}" in line
+
+
+def test_format_async_task_item_truncated_generic_task_keeps_plain_marker() -> None:
+    """
+    A truncated generic async-task output keeps the plain marker.
+
+    There is no session transcript to read a plain tool task's output back
+    from, so no retrieval hint must be fabricated.
+    """
+    from omnigent.runner.tool_dispatch import _INBOX_OUTPUT_MAX_CHARS, _format_async_task_item
+
+    line = _format_async_task_item(
+        {
+            "type": "async_tool",
+            "handle_id": "task_generic",
+            "tool_name": "sys_os_shell",
+            "status": "completed",
+            "output": "Y" * (_INBOX_OUTPUT_MAX_CHARS + 500),
+        }
+    )
+    assert "...[truncated 500 chars]" in line
+    assert "sys_session_get_history" not in line
 
 
 @pytest.mark.asyncio
@@ -10878,6 +11104,7 @@ def _fake_entry(harness: str, model: str | None, returncode: int | None = None) 
 
     class _FakeProc:
         def __init__(self, rc: int | None) -> None:
+            self.pid = 12345
             self.returncode = rc
 
     return _SubprocessEntry(
@@ -12199,3 +12426,201 @@ async def test_send_by_session_id_reuses_running_child_without_restamp() -> None
     assert len(event_posts) == 1
     assert event_posts[0]["created_by"] == "alice@example.com"
     assert event_posts[0]["data"]["content"][0]["text"] == "please stop and report"
+
+
+_SSE_RESPONSE_FAILED_SIGN_IN = (
+    "event: response.failed\ndata: "
+    '{"type":"response.failed","response":{"status":"failed"},'
+    '"error":{"message":"The agent is waiting for a sign-in in this session\'s terminal.",'
+    '"code":"databricks_sign_in_pending"}}\n\n'
+)
+_SIGN_IN_PROMPT_SCREEN = (
+    "dbcert: If the browser does not open automatically, please open the following URL:\n"
+    "\n\thttps://databricks.okta.com/oauth2/v1/authorize?client_id=0oa1&state=T4IU\n\n"
+)
+_SIGNED_IN_SCREENS = {
+    # Codex draws inline: dbcert's lines stay above its banner.
+    "codex-native": (
+        _SIGN_IN_PROMPT_SCREEN + "dbcert: All credentials successfully written\n"
+        "╭── OpenAI Codex (v0.156.1) ──╮\n"
+        "› Ask Codex to do anything\n"
+    ),
+    # Claude Code takes the alternate screen: only its composer is visible.
+    "claude-native": "─" * 16 + "\n❯ \n" + "─" * 16 + "\n  Opus 4.8\n",
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("harness", ["codex-native", "claude-native"])
+async def test_sign_in_pending_failure_posts_a_notice_once_the_agent_is_ready(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    harness: str,
+) -> None:
+    """
+    A turn that failed on a pending Databricks sign-in is followed by one "signed in" notice.
+
+    The runner watches the session's pane after the failure. While the sign-in
+    prompt is on screen nothing is posted. Once the prompt is gone and the
+    agent can take a message (Codex has published its bridge state, Claude Code
+    shows its composer), one neutral notice lands in the transcript so the
+    person knows the sign-in worked and can resend.
+    """
+    import omnigent.runner.app as runner_app
+    from omnigent.harnesses.codex_native import bridge as codex_bridge
+    from omnigent.terminals import TerminalRegistry
+    from tests.runner.helpers import NullServerClient, make_test_terminal_instance
+
+    conv = f"conv_signin_{harness.replace('-', '_')}"
+    monkeypatch.setattr(runner_app, "_SIGN_IN_WATCH_INTERVAL_S", 0.01)
+    monkeypatch.setattr(codex_bridge, "_BRIDGE_ROOT", tmp_path / "bridges")
+
+    class _RecordingServerClient(NullServerClient):
+        def __init__(self) -> None:
+            self.posts: list[tuple[str, Any]] = []
+
+        async def post(self, url: str, **kwargs: Any) -> Any:
+            self.posts.append((url, kwargs.get("json")))
+            return await super().post(url, **kwargs)
+
+    reads = 0
+
+    async def _read(scrollback: int = 0, *, join_wrapped: bool = False) -> dict[str, object]:
+        nonlocal reads
+        del scrollback, join_wrapped
+        reads += 1
+        if reads < 3:
+            return {"screen": _SIGN_IN_PROMPT_SCREEN}
+        if harness == "codex-native":
+            # Thread discovery publishes the bridge state as the TUI starts a thread.
+            codex_bridge.write_bridge_state(
+                codex_bridge.bridge_dir_for_bridge_id(conv),
+                codex_bridge.CodexNativeBridgeState(
+                    session_id=conv,
+                    socket_path="ws://127.0.0.1:1",
+                    thread_id="019e96aa-abcd-7343-8d3b-6f914d60936b",
+                    codex_home=str(tmp_path / "codex-home"),
+                    cwd=str(tmp_path),
+                ),
+            )
+        return {"screen": _SIGNED_IN_SCREENS[harness]}
+
+    pane_name = "codex" if harness == "codex-native" else "claude"
+    instance = make_test_terminal_instance(pane_name, "main", tmp_path)
+    instance.read = _read  # type: ignore[method-assign]
+    registry = TerminalRegistry(conversation_link_base_url="http://127.0.0.1:8000")
+    registry._by_conversation.setdefault(conv, {})[(instance.name, instance.session_key)] = (
+        instance
+    )
+
+    async def _spec_resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return AgentSpec(
+            spec_version=1,
+            name="sign-in-agent",
+            executor=ExecutorSpec(type="omnigent", config={"harness": harness}),
+        )
+
+    server_client = _RecordingServerClient()
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(  # type: ignore[arg-type]
+            _FakeHarnessClient([_SSE_RESPONSE_CREATED, _SSE_RESPONSE_FAILED_SIGN_IN])
+        ),
+        spec_resolver=_spec_resolver,
+        server_client=server_client,  # type: ignore[arg-type]
+        terminal_registry=registry,
+    )
+
+    def _notices() -> list[Any]:
+        return [
+            body
+            for url, body in server_client.posts
+            if url.endswith(f"/v1/sessions/{conv}/events")
+            and isinstance(body, dict)
+            and body.get("type") == "external_conversation_item"
+            and body["data"]["item_data"].get("code") == "databricks_sign_in_completed"
+        ]
+
+    async with _runner_test_client(app) as http:
+        response = await http.post(
+            f"/v1/sessions/{conv}/events",
+            json={
+                "type": "message",
+                "role": "user",
+                "agent_id": "ag_sign_in",
+                "model": "x",
+                "content": [{"role": "user", "content": "hi"}],
+            },
+        )
+        assert response.status_code == 202
+        await _await_bg_turn_task(conv)
+        for _ in range(200):
+            if _notices():
+                break
+            await asyncio.sleep(0.01)
+        # Let the watcher wind down before the app is torn down.
+        await asyncio.sleep(0.05)
+
+    (notice,) = _notices()
+    item = notice["data"]["item_data"]
+    agent = "Codex" if harness == "codex-native" else "Claude Code"
+    assert notice["data"]["item_type"] == "error"
+    assert item["level"] == "info"
+    assert item["title"] == "Signed in to Databricks"
+    assert item["message"] == f"{agent} is ready. Send your message again."
+    # The prompt screen was seen (and ignored) before the agent came up.
+    assert reads >= 3
+
+
+@pytest.mark.asyncio
+async def test_failed_turn_event_names_the_web_message_it_carried() -> None:
+    """
+    ``response.failed`` carries the web message's stable id.
+
+    The server settles a failed native turn's queued web message by this id,
+    so a turn that fails must say which message it carried; the id rides in on
+    the forwarded message as ``stable_id`` and leaves as ``input_stable_id``.
+    """
+    conv = "conv_stable_id_on_failure"
+
+    async def _spec_resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return AgentSpec(
+            spec_version=1,
+            name="stable-id-agent",
+            executor=ExecutorSpec(type="omnigent", config={"harness": "codex-native"}),
+        )
+
+    published: list[dict[str, Any]] = []
+    app = create_runner_app(
+        process_manager=cast(
+            HarnessProcessManager,
+            _FakeProcessManager(_FakeHarnessClient([_SSE_RESPONSE_CREATED, _SSE_RESPONSE_FAILED])),
+        ),
+        spec_resolver=_spec_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    async with _runner_test_client(app) as http:
+        response = await http.post(
+            f"/v1/sessions/{conv}/events",
+            json={
+                "type": "message",
+                "role": "user",
+                "agent_id": "ag_stable",
+                "model": "x",
+                "content": [{"role": "user", "content": "hi"}],
+                "stable_id": "7f3a9c1e5b2d4f6a8c0e1d2b3a4f5c6d",
+            },
+        )
+        assert response.status_code == 202
+        await _await_bg_turn_task(conv)
+        queue = app.state.session_event_queues.get(conv)
+        for _ in range(100):
+            while queue is not None and not queue.empty():
+                published.append(queue.get_nowait())
+            if any(e.get("type") == "response.failed" for e in published):
+                break
+            await asyncio.sleep(0.02)
+    failed = [e for e in published if e.get("type") == "response.failed"]
+    assert failed, "response.failed was not published"
+    assert failed[0]["input_stable_id"] == "7f3a9c1e5b2d4f6a8c0e1d2b3a4f5c6d"

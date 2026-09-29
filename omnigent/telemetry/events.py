@@ -105,6 +105,14 @@ class TurnEndEvent:
 
     :param installation_id: Server-side installation ID.
     :param session_id: Omnigent conversation/session identifier.
+    :param anon_user_id: First 16 hex chars of ``sha256("<installation_id>:<user_id>")``
+        for the user the turn is attributed to — the request's caller on the
+        native path, the ambient request user on the relay path (whose task
+        outlives any one turn).
+    :param host_installation_id: Installation ID of the machine that posted the
+        turn-end event, read from its request header; ``None`` when the header
+        is absent (an older client, telemetry opted out) or the emitter has no
+        request, as the relay path does not.
     :param status: Terminal status of the turn: ``"completed"``,
         ``"failed"``, ``"cancelled"``, or ``"incomplete"``.
     :param latency_ms: Wall-clock turn duration in milliseconds from
@@ -122,6 +130,8 @@ class TurnEndEvent:
 
     installation_id: str | None
     session_id: str
+    anon_user_id: str | None
+    host_installation_id: str | None
     status: str
     latency_ms: float | None
     model: str | None
@@ -142,6 +152,11 @@ class NativeSessionUsageEvent:
 
     :param installation_id: Server-side installation ID.
     :param session_id: Omnigent conversation/session identifier.
+    :param anon_user_id: First 16 hex chars of ``sha256("<installation_id>:<user_id>")``
+        for the authenticated caller of the harness's flush POST.
+    :param host_installation_id: Installation ID of the machine that posted the
+        flush, read from its request header; ``None`` when the header is absent
+        (an older client, or telemetry opted out there).
     :param input_tokens: Cumulative input tokens at time of flush.
         ``None`` when not reported in this flush.
     :param output_tokens: Cumulative output tokens at time of flush.
@@ -154,6 +169,8 @@ class NativeSessionUsageEvent:
 
     installation_id: str | None
     session_id: str
+    anon_user_id: str | None
+    host_installation_id: str | None
     input_tokens: int | None
     output_tokens: int | None
     cost_usd: float | None

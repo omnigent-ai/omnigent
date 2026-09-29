@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from decimal import Decimal
+from urllib.error import HTTPError
 
 import pytest
 
@@ -11,6 +12,7 @@ from issue_prioritization.github import (
     GitHubClient,
     GitHubLegacyPriorityOwnership,
     GitHubMutationSink,
+    GitHubNotFound,
 )
 from issue_prioritization.labels import LabelDefinition, LabelManifest
 from issue_prioritization.mutations import (
@@ -228,6 +230,58 @@ def test_apply_checkpoints_successful_writes_after_a_later_failure() -> None:
         GitHubMutationSink(FailingClient(), manifest, planner, states).apply(run)
 
     assert [state.issue_number for state in states.updated] == [1]
+
+
+def test_apply_skips_an_issue_deleted_from_github() -> None:
+    # The bronze snapshot lags GitHub: #2 was deleted/transferred since
+    # ingestion, so its live re-check 404s. It must be skipped, not abort the
+    # whole apply — #1 still gets written.
+    first = BotState(1, "P2-medium", ("comp:server",))
+    second = BotState(2, "P2-medium", ("comp:server",))
+    states = FakeStates({1: first, 2: second})
+    manifest = _manifest()
+    planner = MutationPlanner(manifest, states)
+    targets = (
+        MutationPlan(MutationTarget(1, "P1-high", ("comp:db",)), (), (), (), first),
+        MutationPlan(MutationTarget(2, "P1-high", ("comp:db",)), (), (), (), second),
+    )
+    run = PipelineRun("run", PipelineMode.APPLY, datetime.now(UTC), (), 0, targets)
+
+    class DeletedIssueClient(FakeClient):
+        def issue_labels(self, issue_number):
+            if issue_number == 2:
+                raise GitHubNotFound("GitHub API GET /issues/2 failed: 404 Not Found")
+            return super().issue_labels(issue_number)
+
+    plans = GitHubMutationSink(DeletedIssueClient(), manifest, planner, states).apply_with_plans(
+        run
+    )
+
+    assert [plan.target.issue_number for plan in plans] == [1]
+    assert [state.issue_number for state in states.updated] == [1]
+
+
+def test_request_maps_404_to_not_found_and_keeps_other_errors_generic(monkeypatch) -> None:
+    import io
+
+    from issue_prioritization import github as github_module
+
+    def raise_http(code):
+        def _open(request, timeout=0):
+            raise HTTPError(request.full_url, code, "boom", {}, io.BytesIO(b"{}"))
+
+        return _open
+
+    client = GitHubClient("token", "org/repo")
+
+    monkeypatch.setattr(github_module, "urlopen", raise_http(404))
+    with pytest.raises(GitHubNotFound):
+        client.issue_data(6863)
+
+    monkeypatch.setattr(github_module, "urlopen", raise_http(500))
+    with pytest.raises(RuntimeError) as exc:
+        client.issue_data(6863)
+    assert not isinstance(exc.value, GitHubNotFound)
 
 
 def test_legacy_priority_uses_the_latest_label_actor() -> None:

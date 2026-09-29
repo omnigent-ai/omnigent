@@ -87,6 +87,7 @@ async def test_info_returns_expected_fields(client: httpx.AsyncClient) -> None:
     assert isinstance(data["managed_sandboxes_enabled"], bool)
     assert data["features"] == {
         "usage_page": False,
+        "customize": False,
         "harness_install": False,
         "canvas": False,
     }

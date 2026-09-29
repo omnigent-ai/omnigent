@@ -32,9 +32,11 @@
 //      on `POST /v1/sessions/{id}/elicitations/{eid}/resolve`,
 //   3. rolls back to "pending" on network error.
 
+import { useContext } from "react";
 import {
   CheckIcon,
   ClipboardListIcon,
+  ClockIcon,
   ExternalLinkIcon,
   InfoIcon,
   MessageCircleQuestionMark,
@@ -54,6 +56,7 @@ import { formatPreview } from "@/lib/previewFormat";
 import type { RenderItem } from "@/lib/renderItems";
 import type { CodexPersistMode, RememberScope } from "@/lib/types";
 import { useChatStore } from "@/store/chatStore";
+import { ConversationScopeContext } from "@/components/chat/conversationScope";
 import { AskUserQuestionForm, type AskUserQuestionAnswers } from "./AskUserQuestionForm";
 import {
   type ElicitationAnswers,
@@ -113,6 +116,8 @@ interface ApprovalCardProps {
   status: "pending" | "responded";
   response: {
     action: "accept" | "decline" | "cancel" | "auto_resolved";
+    /** Why an `auto_resolved` card has no verdict; see `ElicitationBlock`. */
+    reason?: "unanswered";
     content?: Record<string, unknown>;
     _meta?: Record<string, unknown>;
   } | null;
@@ -201,11 +206,19 @@ export function ApprovalCard({
   codexPersistModes = EMPTY_CODEX_PERSIST_MODES,
   onSubmit,
 }: ApprovalCardProps) {
+  // In a side-chat pane this resolves to the child id, so the verdict targets
+  // the child's elicitation rather than the main conversation's. null (the main
+  // transcript) leaves submitApproval on its active-conversation default.
+  const scopedConversationId = useContext(ConversationScopeContext);
   const submit: SubmitApprovalFn =
     onSubmit ??
     ((id, action, content, meta) => {
       const store = useChatStore.getState();
-      if (meta === undefined) {
+      // Keep the exact call shape for the main chat (no scope); pass the child
+      // id only when scoped so a side-chat verdict targets the child.
+      if (scopedConversationId) {
+        void store.submitApproval(id, action, content, meta, scopedConversationId);
+      } else if (meta === undefined) {
         void store.submitApproval(id, action, content);
       } else {
         void store.submitApproval(id, action, content, meta);
@@ -447,6 +460,7 @@ export function ApprovalCard({
 
   if (status === "responded" && response) {
     const autoResolved = response.action === "auto_resolved";
+    const promptExpired = autoResolved && response.reason === "unanswered";
     const accepted = response.action === "accept";
 
     // Distinguish three responded sub-states:
@@ -478,7 +492,14 @@ export function ApprovalCard({
 
     let icon = <XIcon className="size-4 text-destructive" />;
     let label = isExitPlanMode ? "Plan rejected" : "Rejected";
-    if (autoResolved) {
+    if (promptExpired) {
+      // The server cleared the prompt because the hook stopped waiting
+      // before anyone answered (a severed poll never re-parked, the ask
+      // timed out). Nothing was decided, so say so and tell the user how
+      // to get the agent moving again instead of implying an answer.
+      icon = <ClockIcon className="size-4 text-muted-foreground" />;
+      label = "Prompt expired";
+    } else if (autoResolved) {
       // Card was cleared by the chat store when the gated tool's
       // function_call_output arrived without a UI verdict —
       // typically because the user approved (or denied) via Claude
@@ -487,6 +508,10 @@ export function ApprovalCard({
       // accept/reject decision the UI never witnessed.
       icon = <InfoIcon className="size-4 text-muted-foreground" />;
       label = "Resolved elsewhere";
+    } else if (response.action === "cancel") {
+      // Dismissed without deciding — neither approved nor rejected.
+      icon = <InfoIcon className="size-4 text-muted-foreground" />;
+      label = "Cancelled";
     } else if (submittedAnswers !== null) {
       icon = <CheckIcon className="size-4 text-success" />;
       label = "Submitted";
@@ -529,7 +554,8 @@ export function ApprovalCard({
       showGatingMessage ||
       isCodexCommandApproval ||
       submittedAnswers !== null ||
-      planRejectionFeedback !== null;
+      planRejectionFeedback !== null ||
+      promptExpired;
 
     return (
       <Alert
@@ -577,6 +603,11 @@ export function ApprovalCard({
             {planRejectionFeedback !== null && (
               <span className="italic" data-testid="plan-rejection-feedback">
                 “{planRejectionFeedback}”
+              </span>
+            )}
+            {promptExpired && (
+              <span className="text-muted-foreground" data-testid="prompt-expired-hint">
+                Nobody answered before the agent stopped waiting. Send a message to continue.
               </span>
             )}
           </AlertDescription>

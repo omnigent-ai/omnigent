@@ -54,9 +54,9 @@ def _open_landing(page: Page, base_url: str) -> None:
     expect(page.get_by_test_id("new-chat-landing")).to_be_visible(timeout=30_000)
 
 
-def test_custom_branding_reshapes_the_landing(page: Page, seeded_session: tuple[str, str]) -> None:
+def test_custom_branding_reshapes_the_landing(page: Page, live_server: str) -> None:
     """A full branding block sets the name, heading, logo, favicon, and credit."""
-    base_url, _ = seeded_session
+    base_url = live_server
     _stub_logos(page)
     _stub_info(
         page,
@@ -83,9 +83,9 @@ def test_custom_branding_reshapes_the_landing(page: Page, seeded_session: tuple[
     expect(page.get_by_test_id("powered-by-omnigent")).to_be_visible()
 
 
-def test_empty_heading_hides_the_hero_line(page: Page, seeded_session: tuple[str, str]) -> None:
+def test_empty_heading_hides_the_hero_line(page: Page, live_server: str) -> None:
     """An explicit empty heading hides the hero line rather than defaulting."""
-    base_url, _ = seeded_session
+    base_url = live_server
     _stub_logos(page)
     _stub_info(
         page,
@@ -99,9 +99,9 @@ def test_empty_heading_hides_the_hero_line(page: Page, seeded_session: tuple[str
     expect(page.get_by_test_id("powered-by-omnigent")).to_be_visible()
 
 
-def test_powered_by_false_hides_the_credit(page: Page, seeded_session: tuple[str, str]) -> None:
+def test_powered_by_false_hides_the_credit(page: Page, live_server: str) -> None:
     """A branded deployment can explicitly hide the Omnigent attribution."""
-    base_url, _ = seeded_session
+    base_url = live_server
     _stub_logos(page)
     _stub_info(
         page,
@@ -113,11 +113,9 @@ def test_powered_by_false_hides_the_credit(page: Page, seeded_session: tuple[str
     expect(page.get_by_test_id("powered-by-omnigent")).to_have_count(0)
 
 
-def test_unbranded_keeps_defaults_and_hides_credit(
-    page: Page, seeded_session: tuple[str, str]
-) -> None:
+def test_unbranded_keeps_defaults_and_hides_credit(page: Page, live_server: str) -> None:
     """With no branding, the UI keeps its defaults and shows no credit."""
-    base_url, _ = seeded_session
+    base_url = live_server
     _stub_info(page, None)
     _open_landing(page, base_url)
 

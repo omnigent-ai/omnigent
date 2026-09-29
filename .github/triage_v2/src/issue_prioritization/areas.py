@@ -27,6 +27,7 @@ class Area:
 class AreaCatalog:
     by_key: Mapping[str, Area]
     by_label: Mapping[str, tuple[Area, ...]]
+    assignment_paused: tuple[str, ...] = ()
 
     @classmethod
     def from_json(cls, path: str | Path) -> AreaCatalog:
@@ -58,6 +59,9 @@ class AreaCatalog:
         return cls(
             by_key={area.key: area for area in areas},
             by_label={label: tuple(items) for label, items in by_label.items()},
+            assignment_paused=tuple(
+                str(login).casefold() for login in value.get("assignment_paused", ())
+            ),
         )
 
     def weight_for(self, issue: Issue, default: Decimal) -> Decimal:
@@ -74,4 +78,9 @@ class AreaCatalog:
         areas = [self.by_key[key] for key in area_keys if key in self.by_key]
         if not areas:
             areas = list(self.by_key.values())
-        return tuple(dict.fromkeys(owner for area in areas for owner in area.owners))
+        paused = {login.casefold() for login in self.assignment_paused}
+        return tuple(
+            dict.fromkeys(
+                owner for area in areas for owner in area.owners if owner.casefold() not in paused
+            )
+        )

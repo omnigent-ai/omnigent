@@ -1582,7 +1582,9 @@ def lookup_agent_id(client: httpx.Client, agent_name: str) -> str:
     :returns: The matching ``"ag_..."`` durable id.
     :raises AssertionError: If no session with that agent name exists.
     """
-    resp = client.get("/v1/sessions", params={"agent_name": agent_name, "limit": 1})
+    resp = client.get(
+        "/v1/sessions", params={"visibility": "all", "agent_name": agent_name, "limit": 1}
+    )
     resp.raise_for_status()
     sessions = resp.json()["data"]
     if sessions:
@@ -1715,31 +1717,34 @@ def _flatten_session_item(item: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _output_after_input(items: list[dict[str, Any]], response_id: str) -> list[dict[str, Any]]:
+    """Select output after the requested user input, across harness response ids."""
+    after_input = False
+    output = []
+    for item in items:
+        flattened = _flatten_session_item(item)
+        if flattened.get("type") == "message" and flattened.get("role") == "user":
+            if item.get("response_id") == response_id:
+                after_input = True
+        elif after_input:
+            output.append(flattened)
+    return output
+
+
 def _session_items_for_response(
     client: httpx.Client,
     *,
     session_id: str,
     response_id: str,
 ) -> list[dict[str, Any]]:
-    """Return flat session items for a runner-native turn.
+    """Return output after the requested input's position in the transcript.
 
-    The AP-stamped user input ``response_id`` is only a local grouping id.
-    Runner-native output items use the harness-allocated response id, so
-    do not filter by ``response_id`` here. These E2E helpers create one
-    fresh session per turn; all non-user items in the snapshot belong to
-    the turn under observation.
+    Native output has a harness-allocated response id, so the input's id
+    locates the user message rather than filtering the output ids.
     """
-    del response_id
     resp = client.get(f"/v1/sessions/{session_id}")
     resp.raise_for_status()
-    return [
-        flattened
-        for item in resp.json().get("items", [])
-        if not (
-            (flattened := _flatten_session_item(item)).get("type") == "message"
-            and flattened.get("role") == "user"
-        )
-    ]
+    return _output_after_input(resp.json().get("items", []), response_id)
 
 
 def poll_session_until_terminal(
@@ -1756,7 +1761,8 @@ def poll_session_until_terminal(
     pollable Omnigent ``Task`` for ``GET /v1/responses/{response_id}``. This
     helper returns a Responses-like dict synthesized from the session
     snapshot: terminal status from ``session.status`` and output from
-    non-user ``conversation_items`` sharing the turn ``response_id``.
+    non-user items after the input with the requested ``response_id``. Native
+    harnesses may allocate a different response id for the output.
 
     :param client: HTTP client pointed at the live server.
     :param session_id: Session/conversation id.
@@ -1779,14 +1785,7 @@ def poll_session_until_terminal(
         status = last_body.get("status")
         if status in ("running", "waiting"):
             seen_running = True
-        output = [
-            flattened
-            for item in last_body.get("items", [])
-            if not (
-                (flattened := _flatten_session_item(item)).get("type") == "message"
-                and flattened.get("role") == "user"
-            )
-        ]
+        output = _output_after_input(last_body.get("items", []), response_id)
         has_turn_output = any(item.get("type") != "resource_event" for item in output)
         if status == "failed" or (status == "idle" and (seen_running or has_turn_output)):
             return {
@@ -1826,6 +1825,7 @@ def poll_for_pending_tool_calls(
     :returns: List of action_required function_call items.
     """
     deadline = time.monotonic() + timeout
+    seen_running = False
     while time.monotonic() < deadline:
         if session_id is None:
             resp = client.get(f"/v1/responses/{response_id}")
@@ -1854,7 +1854,10 @@ def poll_for_pending_tool_calls(
                 return pending
             snap = client.get(f"/v1/sessions/{session_id}")
             snap.raise_for_status()
-            if snap.json().get("status") in ("idle", "failed"):
+            status = snap.json().get("status")
+            seen_running = seen_running or status in ("running", "waiting")
+            has_turn_output = any(item.get("type") != "resource_event" for item in items)
+            if status == "failed" or (status == "idle" and (seen_running or has_turn_output)):
                 return []
         time.sleep(POLL_INTERVAL_S)
     return []

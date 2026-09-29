@@ -254,6 +254,7 @@ def test_owner_browses_outside_workspace_but_shared_collaborator_cannot(
         picker = owner_page.get_by_test_id("workspace-picker")
         expect(picker).to_be_visible(timeout=15_000)
         picker.get_by_test_id(f"workspace-picker-entry-{outside.name}").click()
+        picker.get_by_test_id("workspace-picker-select").click()
 
         # Proof the tree re-rooted: this file exists only outside the workspace.
         expect(owner_rail.get_by_text("owner-only.txt")).to_be_visible(timeout=30_000)

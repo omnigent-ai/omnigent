@@ -226,6 +226,7 @@ async def test_equivalent_gateway_pick_launches_without_reset(
     await harness.launch()
 
     assert harness.builds[0]["model"] == pick
+    assert harness.builds[0]["session_id"] == _SESSION_ID
     assert harness.resets == []
     harness.probe.assert_not_awaited()
 

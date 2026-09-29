@@ -24,6 +24,7 @@ import time
 from collections.abc import Awaitable, Callable
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+from starlette.websockets import WebSocketState
 
 from omnigent.db.db_models import InvalidUuidError, uuid_to_bytes
 from omnigent.debug_logging import debug_event, set_current_user_id
@@ -46,6 +47,7 @@ from omnigent.host.frames import (
     HostRemoveWorktreeResultFrame,
     HostRunnerExitedFrame,
     HostRunnerStatusResultFrame,
+    HostSkillsResultFrame,
     HostStatResultFrame,
     HostStopRunnerResultFrame,
     HostStoreSecretResultFrame,
@@ -276,7 +278,7 @@ def create_host_tunnel_router(
                 return
 
             stage = "registration"
-            await asyncio.to_thread(
+            persisted_host = await asyncio.to_thread(
                 host_store.upsert_on_connect,
                 host_id=host_id,
                 name=frame.name,
@@ -286,6 +288,10 @@ def create_host_tunnel_router(
                 managed_token=managed_token,
             )
             host_persisted = True
+            if persisted_host.account_generation is not None:
+                from omnigent.db.account_authority import bind_account_authority
+
+                bind_account_authority(tunnel_owner, persisted_host.account_generation)
 
             stage = "registry"
             conn = host_registry.register(
@@ -293,6 +299,9 @@ def create_host_tunnel_router(
                 ws,
                 frame,
                 owner=tunnel_owner,
+                # A resolved launch token is proof this is a server-provisioned
+                # sandbox, not a user machine reconnecting on a managed host id.
+                registered_with_managed_token=managed_token is not None,
             )
             # Delivered on the handshake, never persisted: a replica that just
             # started learns the host's gateway backing here, so a server
@@ -476,12 +485,23 @@ async def _sender_loop(ws: WebSocket, conn: HostConnection) -> None:
 
     :param ws: Accepted Starlette WebSocket.
     :param conn: Host connection whose outbound queue to drain.
+    :returns: None when the queue is retired, or when the socket was
+        closed by another task (ping timeout, retire) while a send
+        raced it.
     """
     while True:
         data = await conn.outbound_queue.get()
         if data is None:
             return
-        await ws.send_text(data)
+        try:
+            await ws.send_text(data)
+        except RuntimeError:
+            if ws.application_state is WebSocketState.DISCONNECTED:
+                # The ping loop or registry retirement closed the socket
+                # concurrently; the disconnect is already logged there.
+                _logger.debug("Host %s send raced a concurrent close", conn.host_id)
+                return
+            raise
 
 
 async def _receive_loop(
@@ -778,6 +798,11 @@ async def _receive_loop(
                     }
                 )
             continue
+        if isinstance(frame, HostSkillsResultFrame):
+            skills_future = conn.pending_skills.pop(frame.request_id, None)
+            if skills_future is not None and not skills_future.done():
+                skills_future.set_result(frame)
+            continue
         if isinstance(frame, HostImportLocalSessionFrame):
             queue = conn.pending_import_local.get(frame.request_id)
             if queue is not None:
@@ -802,7 +827,12 @@ async def _receive_loop(
                 queue.put_nowait(
                     (
                         "done",
-                        {"status": frame.status, "error": frame.error, "failed": frame.failed},
+                        {
+                            "status": frame.status,
+                            "error": frame.error,
+                            "failed": frame.failed,
+                            "failures": frame.failures,
+                        },
                     )
                 )
             continue

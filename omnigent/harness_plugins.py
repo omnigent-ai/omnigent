@@ -7,7 +7,6 @@ packages contribute additional harnesses through the
 
 from __future__ import annotations
 
-import dataclasses
 import importlib
 import importlib.metadata
 import logging
@@ -20,6 +19,7 @@ from omnigent._wrapper_labels import (
     CLAUDE_NATIVE_WRAPPER_VALUE,
     CODEX_NATIVE_WRAPPER_VALUE,
     CURSOR_NATIVE_WRAPPER_VALUE,
+    DEVIN_NATIVE_WRAPPER_VALUE,
     GOOSE_NATIVE_WRAPPER_VALUE,
     HERMES_NATIVE_WRAPPER_VALUE,
     KIMI_NATIVE_WRAPPER_VALUE,
@@ -44,7 +44,6 @@ from omnigent.harness_capabilities import (
     Resume,
 )
 from omnigent.harness_install_spec import HarnessInstallSpec
-from omnigent.inner.devin import DEVIN_ACP_EXTENSION
 
 _logger = logging.getLogger(__name__)
 
@@ -209,6 +208,24 @@ GOOSE_NATIVE_CODING_AGENT = NativeCodingAgent(
     terminal_name="goose",
 )
 
+
+# Devin spawns its own sub-agents in-TUI via the `run_subagent` tool. Each call
+# is mirrored as an ordinary tool card (the PreToolUse/PostToolUse hooks carry
+# it) AND promoted to an Omnigent child session once the delegate finishes: the
+# forwarder reconstructs its chain from Devin's own session store (see
+# `harnesses/devin_native/subagents.py`). Hence the `subagent_wrapper_label`
+# below, which is what makes `capabilities.subagents` True
+# (tests/test_harness_capabilities.py derives one from the other).
+DEVIN_NATIVE_CODING_AGENT = NativeCodingAgent(
+    key="devin",
+    display_name="Devin",
+    agent_name="devin-native-ui",
+    harness="devin-native",
+    wrapper_label=DEVIN_NATIVE_WRAPPER_VALUE,
+    subagent_wrapper_label="devin-native-ui-subagent",
+    terminal_name="devin",
+)
+
 ANTIGRAVITY_NATIVE_CODING_AGENT = NativeCodingAgent(
     key="antigravity",
     display_name="Antigravity",
@@ -301,6 +318,7 @@ _BUILTIN_NATIVE_PROVIDERS: tuple[NativeHarnessProvider, ...] = tuple(
         QWEN_NATIVE_CODING_AGENT,
         KIMI_NATIVE_CODING_AGENT,
         HERMES_NATIVE_CODING_AGENT,
+        DEVIN_NATIVE_CODING_AGENT,
     )
 )
 
@@ -493,6 +511,53 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         # shell_tool_* stay None.
         instruction_delivery=_ID.COMPOSED_PER_TURN,
     ),
+    # devin-native wraps the resident `devin` TUI. Every axis below was
+    # live-verified against devin 3000.10.21:
+    #   * HOOK elicitation — a PreToolUse hook returning
+    #     `hookSpecificOutput.permissionDecision: "deny"` blocks the tool EVEN
+    #     under `--permission-mode bypass`, and the reason reaches the model; the
+    #     PermissionRequest hook accepts `{"decision": "approve"}`. So Devin
+    #     honours the same output contract claude-native uses, and the shared
+    #     omnigent.native.native_policy_hook seam drives it unmodified.
+    #   * interrupt — Devin's own hint is "esc twice to interrupt"; two Escapes
+    #     yield "✱ Canceled." (one only clears the composer draft).
+    #   * steering — the composer stays writable mid-turn (its placeholder
+    #     becomes "Guide Devin while it works").
+    #   * effort — ANTHROPIC's low/medium/high/xhigh/max is exactly the rung set
+    #     Devin encodes as a model-variant suffix, which
+    #     omnigent.harnesses.devin_native.main.compose_devin_model recombines.
+    #   * streaming=False by construction: the forwarder mirrors whole hook
+    #     events, so it posts no external_output_text_delta at all.
+    "devin-native": _C(
+        _IM.NATIVE_TUI,
+        _EL.HOOK,
+        _RS.WARM_REATTACH,
+        _EF.ANTHROPIC,
+        _MF.MULTI,
+        _AU.OWN_AUTH,
+        # Devin's run_subagent delegates are mirrored as child sessions: the
+        # forwarder reconstructs each one's full transcript from Devin's own
+        # session store (message_nodes) on completion — see
+        # omnigent.harnesses.devin_native.subagents.
+        subagents=True,
+        interrupt=True,
+        streaming=False,
+        steering=True,
+        live_queue=True,
+        images=True,
+        compaction=True,
+        # PREAMBLE, not REBUILD: Devin's session store is read-only to Omnigent, so
+        # a fork replays its prior turns as text on the clone's first message (the
+        # choice cursor-native makes) rather than seeding a local transcript for
+        # `--resume`. See write_fork_preamble / wrap_fork_preamble.
+        fork_history=_FH.PREAMBLE,
+        shell_tool_name="exec",
+        shell_tool_prompt=_SHELL_PROMPT,
+        # A custom agent's instructions are delivered at launch as an always-on
+        # Windsurf rule in the workspace (Devin's only per-turn system-prompt
+        # channel; it has no --append-system-prompt). See write_devin_agent_rule.
+        instruction_delivery=_ID.AGENT_STARTUP_ADDITIVE,
+    ),
     "hermes-native": _C(
         _IM.NATIVE_TUI,
         _EL.APPROVAL_MIRROR,
@@ -681,15 +746,6 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
 for _acp_cli_name in ACP_CLI_HARNESSES:
     _BUILTIN_CAPABILITIES[_acp_cli_name] = _BUILTIN_CAPABILITIES["acp"]
 
-# Devin is the one row that diverges: its own wrap injects a vendor extension
-# (omnigent.inner.devin), so it surfaces the agent's sub-agents as child sessions
-# where a generic ACP agent cannot. Derived from the extension so this declared
-# capability cannot drift from the dialect that implements it.
-_BUILTIN_CAPABILITIES["devin"] = dataclasses.replace(
-    _BUILTIN_CAPABILITIES["acp"],
-    subagents=DEVIN_ACP_EXTENSION.surfaces_subagents,
-)
-
 
 _BUILTIN_CONTRIBUTION = HarnessContribution(
     name="omnigent",
@@ -705,6 +761,7 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
             "copilot",
             "cursor",
             "cursor-native",
+            "devin-native",
             "goose",
             "goose-native",
             "hermes",
@@ -728,9 +785,7 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
         # Every catalog row runs the shared generic ACP wrap...
         **dict.fromkeys(ACP_CLI_HARNESSES, "omnigent.inner.acp_harness"),
         "acp": "omnigent.inner.acp_harness",
-        # ...except a row with vendor behavior, which runs its own thin wrap to
-        # inject an AcpExtension into the same shared executor.
-        "devin": "omnigent.inner.devin.harness",
+        "devin-native": "omnigent.inner.devin_native_harness",
         "antigravity": "omnigent.inner.antigravity_harness",
         "antigravity-native": "omnigent.inner.antigravity_native_harness",
         "claude-native": "omnigent.inner.claude_native_harness",
@@ -759,11 +814,22 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
         "agy": "antigravity",
         "agy-native": "antigravity-native",
         "claude": "claude-sdk",
+        # Both vendor spellings resolve to the native wrap, mirroring
+        # ``opencode`` -> ``opencode-native``. ``devin-acp`` was the built-in ACP
+        # row, removed in 0.14: keeping the id aliased is what stops a session,
+        # bundle or ``--harness devin-acp`` script that still names it from
+        # failing to resolve a harness at all. The ACP path never warm-resumed
+        # (COLD_ONLY, no session/load), so nothing that worked is lost. A
+        # user-configured ``acp:devin`` is untouched — it canonicalizes to
+        # ``acp`` and reads the user's own config.
+        "devin": "devin-native",
+        "devin-acp": "devin-native",
         "github-copilot": "copilot",
         "google-antigravity": "antigravity",
         "kimi-code": "kimi",
         "native-agy": "antigravity-native",
         "native-antigravity": "antigravity-native",
+        "native-devin": "devin-native",
         "native-goose": "goose-native",
         "native-hermes": "hermes-native",
         "native-kimi": "kimi-native",
@@ -782,6 +848,7 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
             "claude-native",
             "codex-native",
             "cursor-native",
+            "devin-native",
             "goose-native",
             "hermes-native",
             "kimi-native",
@@ -791,6 +858,7 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
             "native-claude",
             "native-codex",
             "native-cursor",
+            "native-devin",
             "native-goose",
             "native-hermes",
             "native-kimi",
@@ -815,6 +883,7 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
         QWEN_NATIVE_CODING_AGENT,
         KIMI_NATIVE_CODING_AGENT,
         HERMES_NATIVE_CODING_AGENT,
+        DEVIN_NATIVE_CODING_AGENT,
     ),
     native_providers=_BUILTIN_NATIVE_PROVIDERS,
     # Catalog rows gate readiness on their vendor binary; the install spec also
@@ -860,6 +929,7 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
         "codex": "Codex",
         "copilot": "Copilot",
         "cursor": "Cursor",
+        "devin-native": "Devin",
         "hermes": "Hermes",
         # openai-agents is intentionally omitted from the picker catalog: it
         # stays a valid harness for YAML specs (and the credential-free

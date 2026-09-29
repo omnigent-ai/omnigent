@@ -10,15 +10,17 @@ parser; config + ambient are isolated so resolution is deterministic.
 
 from __future__ import annotations
 
+import shlex
 from pathlib import Path
 
 import pytest
+import tomllib
 import yaml
 
 from omnigent.errors import OmnigentError
 from omnigent.harnesses.codex_native.app_server import resolve_native_codex_launch
 from omnigent.inner.codex_executor import _provider_codex_config_overrides
-from omnigent.spec.types import AgentSpec, ExecutorSpec, ProviderAuth
+from omnigent.spec.types import AgentSpec, ApiKeyAuth, ExecutorSpec, ProviderAuth
 
 
 @pytest.fixture()
@@ -54,6 +56,82 @@ def _write_codex_login(home: Path, *, logged_in: bool) -> None:
     codex_dir.mkdir(parents=True, exist_ok=True)
     content = '{"auth_mode": "apikey", "OPENAI_API_KEY": "sk-codex-login"}' if logged_in else "{}"
     (codex_dir / "auth.json").write_text(content, encoding="utf-8")
+
+
+@pytest.mark.parametrize("auth_source", ["spec", "global"])
+@pytest.mark.parametrize("endpoint_url", [None, "https://openrouter.ai/api/v1"])
+def test_native_codex_inline_api_key_routes_to_declared_endpoint(
+    _isolated: Path,
+    auth_source: str,
+    endpoint_url: str | None,
+) -> None:
+    """Native Codex uses inline credentials even without a Codex CLI login."""
+    api_key = "test-key with ' quotes"
+    if auth_source == "spec":
+        _seed(
+            _isolated,
+            {
+                "other": {
+                    "kind": "key",
+                    "default": True,
+                    "openai": {"base_url": "https://other.example.com/v1", "api_key": "other-key"},
+                }
+            },
+        )
+        spec = AgentSpec(
+            spec_version=1,
+            name="inline-auth",
+            instructions="Test inline credentials.",
+            executor=ExecutorSpec(
+                type="omnigent", auth=ApiKeyAuth(api_key=api_key, base_url=endpoint_url)
+            ),
+        )
+    else:
+        (_isolated / "config.yaml").write_text(
+            yaml.safe_dump(
+                {"auth": {"type": "api_key", "api_key": api_key, "base_url": endpoint_url}}
+            )
+        )
+        spec = None
+
+    launch = resolve_native_codex_launch(model="test-model", spec=spec)
+
+    config = tomllib.loads("\n".join(launch.config_overrides))
+    provider = config["model_providers"][config["model_provider"]]
+    assert provider["base_url"] == (endpoint_url or "https://api.openai.com/v1")
+    assert provider["wire_api"] == "responses"
+    assert launch.model == "test-model"
+    assert launch.profile is None
+    assert not launch.login_required
+    assert api_key not in launch.summary
+    assert provider["auth"]["command"] == "sh"
+    assert shlex.split(provider["auth"]["args"][-1]) == ["printf", "%s", api_key]
+
+
+@pytest.mark.parametrize("fragment", [None, "wrong-key"])
+def test_native_codex_resolved_api_key_preserves_literal_dollars(
+    _isolated: Path, monkeypatch: pytest.MonkeyPatch, fragment: str | None
+) -> None:
+    """Literal dollars must neither change the bearer nor trigger login fallback."""
+    monkeypatch.delenv("OMNIGENT_KEY_FRAGMENT", raising=False)
+    if fragment is None:
+        monkeypatch.delenv("KEY_FRAGMENT", raising=False)
+    else:
+        monkeypatch.setenv("KEY_FRAGMENT", fragment)
+    api_key = "test-$KEY_FRAGMENT-'quoted'"
+    spec = AgentSpec(
+        spec_version=1,
+        name="literal-key",
+        instructions="Test literal credentials.",
+        executor=ExecutorSpec(type="omnigent", auth=ApiKeyAuth(api_key=api_key)),
+    )
+
+    launch = resolve_native_codex_launch(model="test-model", spec=spec)
+
+    config = tomllib.loads("\n".join(launch.config_overrides))
+    provider = config["model_providers"][config["model_provider"]]
+    assert shlex.split(provider["auth"]["args"][-1]) == ["printf", "%s", api_key]
+    assert not launch.login_required
 
 
 def test_provider_codex_overrides_coerce_chat_wire_to_responses() -> None:
@@ -822,16 +900,19 @@ def test_default_provider_without_credential_logged_out_marks_login_required(
     assert launch.login_required is True
 
 
-def test_global_auth_block_login_logged_out_marks_login_required(
+def test_global_api_key_routes_without_model_or_cli_login(
     _isolated: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A non-Databricks global auth block falling to Codex login is doomed headlessly."""
-    from omnigent.runtime import workflow
-
+    """An inline key authenticates headlessly while Codex chooses its own model."""
     monkeypatch.setenv("CODEX_HOME", str(_write_codex_home_login(_isolated, logged_in=False)))
-    monkeypatch.setattr(workflow, "_load_global_auth", lambda: object())
+    (_isolated / "config.yaml").write_text(
+        yaml.safe_dump({"auth": {"type": "api_key", "api_key": "test-global-key"}})
+    )
 
     launch = resolve_native_codex_launch(model=None)
 
-    assert "global auth block" in launch.summary
-    assert launch.login_required is True
+    config = tomllib.loads("\n".join(launch.config_overrides))
+    assert config["model_provider"] == "omnigent_provider"
+    assert "model" not in config
+    assert launch.model is None
+    assert launch.login_required is False

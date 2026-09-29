@@ -8,6 +8,7 @@
 import { type CSSProperties, useEffect, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { ServerSelectorV2, type ServerSelectorV2Setup } from "./pages/onboarding/ServerSelectorV2";
+import { maybeMockSetup } from "./pages/onboarding/mockSetup";
 import "./index.css";
 
 const DEFAULT_URL = "http://localhost:6767";
@@ -16,26 +17,40 @@ const CLOUD_DOCS_URL = "https://omnigent.ai/docs/deploy/overview";
 /** The `omnigentSetup` preload bridge (see electron/src/preload.js). */
 interface OmnigentSetup {
   getServerUrl: () => Promise<string | null>;
-  setServerUrl: (
-    url: string,
-    opts?: { force?: boolean },
-  ) => Promise<{ needsConfirm?: boolean } | unknown>;
+  setServerUrl: (url: string) => Promise<unknown>;
   getManagedServers: () => Promise<string[]>;
   getRecentServers: () => Promise<string[]>;
   forgetRecentServer?: (url: string) => Promise<string[]>;
   checkServer?: (url: string) => Promise<{ status: "ok" | "reachable" | "unreachable" }>;
   copyText: (text: string) => Promise<unknown>;
   setServerSelectorV2?: (enabled: boolean) => Promise<unknown>;
-  getCliStatus: () => Promise<{ installed?: boolean }>;
+  getSetupCapabilities?: () => Promise<{ v2Forced?: boolean }>;
+  setColorScheme?: (scheme: "light" | "dark" | "system") => void;
+  getColorScheme?: () => Promise<{ source: string; effective: "light" | "dark" } | null>;
+  onColorScheme?: (cb: (theme: "light" | "dark") => void) => () => void;
+  getCliStatus: () => Promise<{ installed?: boolean; installSupported?: boolean }>;
   startLocalServer: () => Promise<{ ok?: boolean; url?: string; error?: string }>;
   onLocalServerSetupLog?: (cb: (line: string) => void) => () => void;
+  installCli?: () => Promise<{ ok?: boolean; error?: string; installed?: boolean }>;
+  onCliInstallLog?: (cb: (line: string) => void) => () => void;
 }
 
 function setupBridge(): OmnigentSetup | undefined {
   return (window as unknown as { omnigentSetup?: OmnigentSetup }).omnigentSetup;
 }
 
+// Mock-or-real router: with `?mock=1` render the URL-param mock (dev only, see
+// mockSetup.ts), otherwise the real bridge-wired flow. Split so each branch's
+// hooks run unconditionally (rules of hooks).
 function SetupApp() {
+  const mock = maybeMockSetup(new URLSearchParams(window.location.search));
+  if (mock) {
+    return <ServerSelectorV2 setup={mock} />;
+  }
+  return <BridgeSetupApp />;
+}
+
+function BridgeSetupApp() {
   const params = new URLSearchParams(window.location.search);
   const failedUrl = params.get("url");
   const error = params.get("error") ?? undefined;
@@ -50,25 +65,74 @@ function SetupApp() {
   const [initialUrl, setInitialUrl] = useState(failedUrl ?? DEFAULT_URL);
   const [recentServers, setRecentServers] = useState<string[]>([]);
   const [managedServers, setManagedServers] = useState<string[]>([]);
+  // Whether the `omnigent` CLI is installed — decides "Install" vs "Open" and
+  // the returning-user start step. Undefined until the probe resolves.
+  const [installed, setInstalled] = useState<boolean | undefined>(undefined);
+  // Whether in-app install is available on this platform (macOS only). Off →
+  // connect/local must never route through an install step.
+  const [installSupported, setInstallSupported] = useState(false);
+  // Whether the env var pins the selector on → "Switch to legacy" can't take
+  // effect, so the menu item is disabled.
+  const [v2Forced, setV2Forced] = useState(false);
+  // The shell's current color-scheme source. themeSource is process-global and
+  // survives navigation, so a returning-to-setup wizard must seed the radio
+  // from it (not assume "system"). Undefined → shell didn't report → "system".
+  const [colorScheme, setColorScheme] = useState<"system" | "light" | "dark">("system");
+  // Hold the initial paint until the CLI probe resolves, so the wizard opens on
+  // the correct step (welcome vs server list) instead of flashing the wrong one.
+  const [ready, setReady] = useState(false);
 
   useEffect(() => {
     const bridge = setupBridge();
-    if (!bridge) return;
-    if (!failedUrl && !isEphemeral) {
-      bridge
-        .getServerUrl()
-        .then((saved) => setInitialUrl(saved || DEFAULT_URL))
-        .catch(() => {});
+    // No shell bridge (browser preview): nothing to probe, render immediately.
+    if (!bridge) {
+      setReady(true);
+      return;
     }
-    bridge
-      .getRecentServers()
-      .then(setRecentServers)
-      .catch(() => {});
-    bridge
-      .getManagedServers()
-      .then(setManagedServers)
-      .catch(() => {});
+    // Load ALL setup data before the first paint — not just CLI status. The
+    // initial step depends on recents/managed too (a returning user starts on
+    // the server list), so mounting before those resolve would open the empty
+    // "add" view and never switch when the lists arrive. allSettled: a single
+    // failed probe degrades to its default, never blocks the wizard.
+    const savedUrl =
+      !failedUrl && !isEphemeral
+        ? bridge.getServerUrl().then((saved) => setInitialUrl(saved || DEFAULT_URL))
+        : Promise.resolve();
+    const recents = bridge.getRecentServers().then(setRecentServers);
+    const managed = bridge.getManagedServers().then(setManagedServers);
+    const cli = bridge.getCliStatus().then((status) => {
+      setInstalled(status?.installed === true);
+      setInstallSupported(status?.installSupported === true);
+    });
+    // Older shells omit getSetupCapabilities → leave the item enabled. Gate on
+    // it too, so the legacy item isn't shown enabled before v2Forced resolves.
+    const caps = bridge.getSetupCapabilities
+      ? bridge.getSetupCapabilities().then((c) => setV2Forced(c?.v2Forced === true))
+      : Promise.resolve();
+    // Seed the radio + `.dark` class from the shell's live theme so returning to
+    // setup after the app set Dark shows Dark, not the "system" default.
+    const theme = bridge.getColorScheme
+      ? bridge.getColorScheme().then((s) => {
+          if (!s) return;
+          setColorScheme(s.source === "light" || s.source === "dark" ? s.source : "system");
+          document.documentElement.classList.toggle("dark", s.effective === "dark");
+        })
+      : Promise.resolve();
+    Promise.allSettled([savedUrl, recents, managed, cli, caps, theme]).then(() => {
+      // A failed CLI probe means "not installed" rather than unknown.
+      setInstalled((prev) => prev ?? false);
+      setReady(true);
+    });
   }, [failedUrl, isEphemeral]);
+
+  // Sync the wizard's `.dark` class with the shell's effective theme: the dark
+  // styles key off the class (index.css), not the OS media query. The shell
+  // pushes on scheme change and on OS changes (so "System" tracks live).
+  useEffect(() => {
+    return setupBridge()?.onColorScheme?.((theme) =>
+      document.documentElement.classList.toggle("dark", theme === "dark"),
+    );
+  }, []);
 
   const setup: ServerSelectorV2Setup = {
     initialUrl,
@@ -76,20 +140,18 @@ function SetupApp() {
     error,
     recentServers,
     managedServers,
-    onConnect: async (url, force) => {
+    installed,
+    onConnect: async (url) => {
       // setServerUrl persists the URL and navigates the window to it; on success
-      // the server's SPA takes over and this page goes away. It resolves
-      // {needsConfirm} when a remote URL doesn't look like an Omnigent server —
-      // pass that back so the step can warn and let the user proceed anyway. A
-      // rejection (e.g. main-side normalizeUrl rejects an input the renderer
-      // accepted) is surfaced as {error} so the step can show it, rather than
-      // a click that silently does nothing.
+      // the server's SPA takes over and this page goes away. A rejection (e.g.
+      // main-side normalizeUrl rejects an input the renderer accepted) is
+      // surfaced as {error} so the step can show it, rather than a click that
+      // silently does nothing.
       const bridge = setupBridge();
       if (!bridge) return { error: "The desktop shell is unavailable." };
       try {
-        const result = (await bridge.setServerUrl(url, force ? { force: true } : undefined)) as
-          { needsConfirm?: boolean } | undefined;
-        return { needsConfirm: result?.needsConfirm === true };
+        await bridge.setServerUrl(url);
+        return {};
       } catch (e) {
         return { error: e instanceof Error ? e.message : "Could not connect to that server." };
       }
@@ -116,6 +178,36 @@ function SetupApp() {
     // shells / browser preview omit it → the terminal step shows phases only).
     onSetupLog: setupBridge()?.onLocalServerSetupLog
       ? (cb) => setupBridge()?.onLocalServerSetupLog?.(cb) ?? (() => {})
+      : undefined,
+    // Install the CLI, if the shell supports it. Offered only when NOT already
+    // installed — a returning user opens rather than installs.
+    onInstallCli:
+      installed === false && installSupported && setupBridge()?.installCli
+        ? async () => {
+            const bridge = setupBridge();
+            if (!bridge?.installCli) return { ok: false, error: "Install is unavailable." };
+            try {
+              const result = await bridge.installCli();
+              setInstalled(result?.installed === true);
+              // The installer can exit 0 yet leave the binary unresolvable (PATH
+              // issue). Treat "installed:false after a successful run" as a
+              // failure rather than proceeding to start/connect with no CLI.
+              if (result?.ok && result.installed !== true) {
+                return {
+                  ok: false,
+                  error:
+                    "The installer finished but the omnigent CLI still isn't detected. " +
+                    "Try opening a new terminal, or install it from https://omnigent.ai/.",
+                };
+              }
+              return { ok: result?.ok === true, error: result?.error };
+            } catch (e) {
+              return { ok: false, error: e instanceof Error ? e.message : String(e) };
+            }
+          }
+        : undefined,
+    onInstallLog: setupBridge()?.onCliInstallLog
+      ? (cb) => setupBridge()?.onCliInstallLog?.(cb) ?? (() => {})
       : undefined,
     // Only offered when the shell exposes the forget method (newer shells).
     onRemoveServer: setupBridge()?.forgetRecentServer
@@ -155,6 +247,12 @@ function SetupApp() {
         ?.setServerSelectorV2?.(false)
         ?.catch(() => {});
     },
+    switchToLegacyDisabled: v2Forced,
+    // Live color-scheme override; only offered when the shell exposes it.
+    onSetColorScheme: setupBridge()?.setColorScheme
+      ? (scheme) => setupBridge()?.setColorScheme?.(scheme)
+      : undefined,
+    initialColorScheme: colorScheme,
   };
 
   return (
@@ -175,7 +273,16 @@ function SetupApp() {
           } as CSSProperties
         }
       />
-      <ServerSelectorV2 setup={setup} />
+      {ready ? (
+        <ServerSelectorV2 setup={setup} />
+      ) : (
+        // Hold on the wizard background until the CLI probe resolves, so the
+        // flow opens on the correct step rather than flashing the wrong one.
+        <div
+          className="min-h-screen"
+          style={{ background: "var(--onboarding-wizard-background)" }}
+        />
+      )}
     </>
   );
 }

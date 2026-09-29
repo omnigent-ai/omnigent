@@ -81,6 +81,38 @@ point the handoff at the one that shows the failure — don't assume the largest
 As with every lane, recordings are workspace artifacts — leave them
 uncommitted; CI's artifact bundle collects them.
 
+## Floating Design editor inside modal forms
+
+`desktop_design_prompt.e2e.js` exercises the real SPA, desktop, local server,
+runner, and mock model against native HTML and Radix dialogs. It checks direct
+form editing, native keyboard focus, floating-editor typing, Escape/close,
+normal chat submission, and returning to form editing after Design mode exits.
+The Radix fixture is a transformed, scrollable form; the test also checks popup
+positioning, clipping, scrolling, resizing, zooming, and accidental form submission.
+The same picker and fixtures run in headless Chromium in the regular UI CI suite:
+`uv run --no-sync pytest tests/e2e_ui/desktop/test_design_mode_dialog_focus.py`.
+
+```bash
+# From the repository root after installing dependencies:
+pnpm --filter web run build
+pnpm --filter omnigent-desktop-electron run build:overlay
+OMNIGENT_PYTHON="$PWD/.venv/bin/python" \
+  node --test --test-concurrency=1 web/electron/e2e/desktop_design_prompt.e2e.js
+```
+
+Run on an interactive desktop and keep the test app foregrounded for its native
+focus assertions. `OMNIGENT_DESKTOP_EXECUTABLE` may point to a packaged binary.
+`OMNIGENT_DESKTOP_COMPOSITED_VIDEO=1` records the native window on macOS (requires
+Screen Recording permission). Set `OMNIGENT_DESKTOP_RECORD_DIR` outside the
+checkout; each fixture's subdirectory receives `design-prompt-native.mov`.
+These captures include both the shell and embedded browser; Playwright's renderer
+recordings do not capture their native composition.
+
+Human check: select a modal field containing `W41` in Design mode, type `asdf`
+into the nearby floating editor, and confirm the field remains `W41`. Escape
+should close only the editor. Reopen it and use Send or Enter to submit an
+instruction to chat. No instruction bar should appear below the browser URL.
+
 ## Authoring a desktop reproduction
 
 1. Copy `desktop_connect.e2e.js` to `e2e/desktop_<slug>.e2e.js`.

@@ -17,6 +17,7 @@ from omnigent.runner.app import (
     _cursor_fork_history_preamble,
     _cursor_message_item_text,
     _cursor_native_model_from_spec,
+    _devin_has_replayable_history,
 )
 from omnigent.spec.types import AgentSpec, ExecutorSpec
 
@@ -115,3 +116,25 @@ class TestCursorForkHistoryPreamble:
     def test_no_replayable_text_yields_empty(self) -> None:
         assert _cursor_fork_history_preamble([]) == ""
         assert _cursor_fork_history_preamble([{"type": "function_call"}]) == ""
+
+
+class TestDevinReplayableHistory:
+    """The guard that separates a resumed conversation from a brand-new one.
+
+    A devin launch with no session id to reattach to covers both, and only one
+    of them should get its transcript replayed as a preamble.
+    """
+
+    def test_finished_exchange_is_replayable(self) -> None:
+        items = [_msg("user", "add hello.txt"), _msg("assistant", "done")]
+        assert _devin_has_replayable_history(items) is True
+
+    def test_pending_prompt_alone_is_not(self) -> None:
+        # A brand-new session's items can already hold the prompt being
+        # dispatched; replaying it would prepend the message to itself.
+        assert _devin_has_replayable_history([_msg("user", "add hello.txt")]) is False
+
+    def test_empty_or_textless_assistant_is_not(self) -> None:
+        assert _devin_has_replayable_history([]) is False
+        assert _devin_has_replayable_history([_msg("assistant", "")]) is False
+        assert _devin_has_replayable_history([{"type": "function_call"}]) is False

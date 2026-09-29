@@ -32,6 +32,8 @@ from typing import TYPE_CHECKING
 from omnigent.models import model_catalog
 
 if TYPE_CHECKING:
+    from databricks.sdk.core import Config
+
     from omnigent.spec.types import MCPServerConfig
 
 _logger = logging.getLogger(__name__)
@@ -75,6 +77,44 @@ class OpenCodeGatewayResolution:
     def qualified_model(self) -> str:
         """:returns: The per-prompt ``provider/model`` id opencode expects."""
         return f"{self.provider_id}/{self.model_id}"
+
+
+def resolve_bound_opencode_gateway(
+    *, model: str | None = None, auth: object = None
+) -> OpenCodeGatewayResolution | None:
+    """Resolve an explicit session binding without consulting Connect fallbacks."""
+    from omnigent.inference_config import (
+        binding_for_harness,
+        load_runtime_inference_config,
+        resolve_bound_model,
+        resolve_bound_provider,
+    )
+    from omnigent.onboarding.provider_config import OPENAI_FAMILY
+
+    config = load_runtime_inference_config()
+    entry = resolve_bound_provider(config, "opencode-native", auth)
+    if entry is None:
+        return None
+    family = entry.family(OPENAI_FAMILY)
+    selected = resolve_bound_model(config, "opencode-native", model)
+    if family is None or not selected:
+        raise ValueError("OpenCode requires an OpenAI-compatible provider and a default model.")
+    if family.wire_api == "responses":
+        raise ValueError("OpenCode's configured gateway must support the chat wire API.")
+    token = model_catalog._resolve_bearer_token(
+        model_catalog.ResolvedModelProvider(
+            kind=entry.kind, api_key=family.api_key, auth_command=family.auth_command
+        )
+    )
+    binding = binding_for_harness(config, "opencode-native")
+    return OpenCodeGatewayResolution(
+        base_url=family.base_url,
+        api_key=token,
+        model_id=selected,
+        model_ids=binding.model_allowlist or () if binding is not None else (),
+        provider_id="omnigent",
+        provider_name=entry.name,
+    )
 
 
 def build_opencode_model_default_config(model: str) -> dict[str, object]:
@@ -345,7 +385,7 @@ def resolve_databricks_gateway(
     )
 
 
-def _list_gateway_models(config: object) -> tuple[str, ...]:
+def _list_gateway_models(config: Config) -> tuple[str, ...]:
     """
     List the workspace's chat-capable ``databricks-*`` serving endpoints.
 

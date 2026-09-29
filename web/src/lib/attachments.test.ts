@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   ATTACHMENT_SIZE_LIMITS_MB,
+  attachmentFilename,
   attachmentKey,
   classifyAttachment,
   validateAttachments,
@@ -11,6 +12,18 @@ function makeFile(name: string, type: string, bytes = 10): File {
 }
 
 const MB = 1024 * 1024;
+
+describe("attachmentFilename", () => {
+  it.each(["screenshot.png", "notes.txt", "report.pdf"])("preserves the name %s", (name) => {
+    expect(attachmentFilename(makeFile(name, ""))).toBe(name);
+  });
+
+  it("uses the upload filename for an unnamed clipboard image without renaming the File", () => {
+    const file = makeFile("", "image/png");
+    expect(attachmentFilename(file)).toBe("image.png");
+    expect(file.name).toBe("");
+  });
+});
 
 describe("attachmentKey", () => {
   it("is stable per File object and distinct for equivalent files", () => {
@@ -45,12 +58,28 @@ describe("classifyAttachment", () => {
     expect(classifyAttachment(makeFile("data.csv", "application/vnd.ms-excel"))).toBe("text");
   });
 
-  it("rejects office/binary types", () => {
+  it("classifies archives, Office documents and databases as files", () => {
     const pptx = "application/vnd.openxmlformats-officedocument.presentationml.presentation";
-    expect(classifyAttachment(makeFile("deck.pptx", pptx))).toBeNull();
-    expect(classifyAttachment(makeFile("a.zip", "application/zip"))).toBeNull();
+    expect(classifyAttachment(makeFile("deck.pptx", pptx))).toBe("file");
+    expect(classifyAttachment(makeFile("a.zip", "application/zip"))).toBe("file");
+    // Office files are zip containers, so the browser often mislabels them.
+    expect(classifyAttachment(makeFile("report.docx", "application/zip"))).toBe("file");
+    expect(classifyAttachment(makeFile("sheet.xlsx", "application/octet-stream"))).toBe("file");
+    expect(classifyAttachment(makeFile("app.sqlite3", ""))).toBe("file");
+    // The extension wins over a text MIME, matching the server.
+    expect(classifyAttachment(makeFile("a.zip", "text/plain"))).toBe("file");
+  });
+
+  it("rejects types outside the supported allowlist", () => {
     expect(classifyAttachment(makeFile("a.bin", "application/octet-stream"))).toBeNull();
     expect(classifyAttachment(makeFile("a.mp4", "video/mp4"))).toBeNull();
+    expect(classifyAttachment(makeFile("song.mp3", "audio/mpeg"))).toBeNull();
+    expect(classifyAttachment(makeFile("noext", ""))).toBeNull();
+  });
+
+  it("recognizes a text/code extension the MIME mislabels", () => {
+    // .csv tagged as an office MIME still uses the text size limit.
+    expect(classifyAttachment(makeFile("data.csv", "application/vnd.ms-excel"))).toBe("text");
   });
 });
 
@@ -63,11 +92,24 @@ describe("validateAttachments", () => {
   });
 
   it("rejects unsupported types with a message", () => {
-    const pptx = "application/vnd.openxmlformats-officedocument.presentationml.presentation";
-    const { accepted, errors } = validateAttachments([makeFile("deck.pptx", pptx)]);
+    const { accepted, errors } = validateAttachments([makeFile("clip.mp4", "video/mp4")]);
     expect(accepted).toHaveLength(0);
     expect(errors).toHaveLength(1);
-    expect(errors[0]).toContain("deck.pptx");
+    expect(errors[0]).toContain("clip.mp4");
+  });
+
+  it("accepts an archive up to its larger limit", () => {
+    const zip = makeFile("bundle.zip", "application/zip", 30 * MB);
+    const { accepted, errors } = validateAttachments([zip]);
+    expect(accepted).toEqual([zip]);
+    expect(errors).toHaveLength(0);
+  });
+
+  it("rejects an archive over its limit", () => {
+    const huge = makeFile("bundle.zip", "application/zip", ATTACHMENT_SIZE_LIMITS_MB.file * MB + 1);
+    const { accepted, errors } = validateAttachments([huge]);
+    expect(accepted).toHaveLength(0);
+    expect(errors[0]).toContain("too large");
   });
 
   it("rejects files over their per-type size limit", () => {
@@ -77,12 +119,26 @@ describe("validateAttachments", () => {
     expect(errors[0]).toContain("too large");
   });
 
+  it("caps non-compressible images (SVG) at the smaller limit", () => {
+    // Under 5 MB: accepted. A raster PNG the same size would be fine too, but
+    // SVG can't be compressed server-side, so it keeps the small cap.
+    const smallSvg = makeFile("icon.svg", "image/svg+xml", 4 * MB);
+    expect(validateAttachments([smallSvg]).accepted).toHaveLength(1);
+
+    // Between the SVG cap (5 MB) and the raster image cap (50 MB): rejected.
+    const bigSvg = makeFile("big.svg", "image/svg+xml", 6 * MB);
+    const { accepted, errors } = validateAttachments([bigSvg]);
+    expect(accepted).toHaveLength(0);
+    expect(errors[0]).toContain("too large");
+  });
+
   it("partitions a mixed batch into accepted + errors", () => {
     const ok = makeFile("a.png", "image/png");
-    const badType = makeFile("a.zip", "application/zip");
+    const zip = makeFile("a.zip", "application/zip");
+    const badType = makeFile("a.mp4", "video/mp4");
     const tooBig = makeFile("big.pdf", "application/pdf", ATTACHMENT_SIZE_LIMITS_MB.pdf * MB + 1);
-    const { accepted, errors } = validateAttachments([ok, badType, tooBig]);
-    expect(accepted).toEqual([ok]);
+    const { accepted, errors } = validateAttachments([ok, zip, badType, tooBig]);
+    expect(accepted).toEqual([ok, zip]);
     expect(errors).toHaveLength(2);
   });
 });

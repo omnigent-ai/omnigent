@@ -170,6 +170,7 @@ try:
     from omnigent.runtime.caps import RuntimeCaps
     from omnigent.server.app import create_app
     from omnigent.server.auth import create_auth_provider, warn_if_single_user_exposed
+    from omnigent.util.tunnel_limits import uvicorn_tunnel_kwargs
 
     # OTel: the Databricks Apps platform auto-injects
     # OTEL_EXPORTER_OTLP_ENDPOINT when `telemetry_export_destinations`
@@ -283,7 +284,10 @@ try:
 
     if __name__ == "__main__":
         logger.info("Starting omnigent on 0.0.0.0:%d", PORT)
-        uvicorn.run(app, host="0.0.0.0", port=PORT)
+        # Tunnel frame cap + keepalive: without them uvicorn's 20 s default closes
+        # a busy-but-healthy runner or host tunnel with 1011 after a client-path
+        # stall, while both clients tolerate 90 s.
+        uvicorn.run(app, host="0.0.0.0", port=PORT, **uvicorn_tunnel_kwargs())
 
 except Exception:  # noqa: BLE001 — startup catch-all; we want every failure logged
     logger.error("FATAL: omnigent failed to start:\n%s", traceback.format_exc())

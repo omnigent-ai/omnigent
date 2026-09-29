@@ -2,6 +2,7 @@
 // FORK PRs authored by a NON-maintainer, preferring the owners of the area(s)
 // the PR touches.
 //
+// `assignment_paused` excludes logins from this workflow's reviews and assignments.
 // Ownership comes from .github/areas.json (a custom, non-magic path -- NOT
 // .github/CODEOWNERS -- so GitHub's native CODEOWNERS auto-request never fires;
 // this action is the sole assigner). The candidate pool is the union of owners
@@ -98,11 +99,13 @@ module.exports = async ({ github, context, core }) => {
   // tests don't churn every time real ownership in .github/areas.json changes
   // (areas.test.js validates the real file). Defaults to the real file.
   const areasFile = process.env.REVIEWER_AREAS_FILE || ".github/areas.json";
-  const areas = JSON.parse(fs.readFileSync(areasFile, "utf8")).areas;
+  const config = JSON.parse(fs.readFileSync(areasFile, "utf8"));
+  const paused = new Set((config.assignment_paused || []).map((u) => u.toLowerCase()));
+  const areas = config.areas;
   const rules = []; // { prefix, owners: [logins] }  (path rules only)
   const poolSet = new Map(); // lc -> original-case
   for (const area of areas) {
-    const owners = area.owners || [];
+    const owners = (area.owners || []).filter((u) => !paused.has(u.toLowerCase()));
     owners.forEach((o) => poolSet.set(o.toLowerCase(), o));
     for (const p of area.paths || []) {
       // `dir/` or `dir/file_` -> match files whose path startsWith the prefix.
