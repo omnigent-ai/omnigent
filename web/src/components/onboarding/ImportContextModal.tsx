@@ -22,11 +22,13 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import type {
-  HarnessInventoryContext,
-  HarnessInventoryStatus,
-  InventoryAssetKind,
+import {
+  INVENTORY_HARNESS_IDS,
+  type HarnessInventoryContext,
+  type HarnessInventoryStatus,
+  type InventoryAssetKind,
 } from "@/hooks/useHarnessInventory";
+import { skillInvocationPrefix } from "@/lib/harnessSetup";
 
 export type ImportHarness = BrandHarness;
 export type ImportContext = HarnessInventoryContext;
@@ -107,7 +109,10 @@ function assetLists(context: ImportContext, harness: ImportHarness): AssetList[]
     {
       kind: "skills",
       label: "Skills",
-      rows: own(context.skills).map((skill) => ({ id: skill.id, name: `$${skill.name}` })),
+      rows: own(context.skills).map((skill) => ({
+        id: skill.id,
+        name: `${skillInvocationPrefix(INVENTORY_HARNESS_IDS[harness])}${skill.name}`,
+      })),
     },
     {
       kind: "plugins",

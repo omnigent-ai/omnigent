@@ -54,7 +54,7 @@ describe("ImportReviewGate", () => {
     renderWithClient(<ImportReviewGate />);
 
     expect(await screen.findByText("Your imports are ready")).toBeTruthy();
-    expect(screen.getByText("$review")).toBeTruthy();
+    expect(screen.getByText("/review")).toBeTruthy();
     // A single host isn't named.
     expect(screen.queryByText(/on a-machine/)).toBeNull();
     fireEvent.click(screen.getByRole("button", { name: "Confirm" }));
@@ -77,7 +77,7 @@ describe("ImportReviewGate", () => {
     renderWithClient(<ImportReviewGate />);
 
     expect(await screen.findByText(/Found in your harnesses on fresh-machine\./)).toBeTruthy();
-    expect(screen.getByText("$c")).toBeTruthy();
+    expect(screen.getByText("/c")).toBeTruthy();
     fireEvent.click(screen.getByRole("button", { name: "Close" }));
     await waitFor(() => expect(screen.queryByText("Your imports are ready")).toBeNull());
     expect(window.localStorage.getItem("omnigent:imports-reviewed:fresh")).not.toBeNull();
@@ -92,7 +92,7 @@ describe("ReviewImportsPanel", () => {
     renderWithClient(<ReviewImportsPanel />);
 
     fireEvent.click(await screen.findByRole("button", { name: "Review imports on a-machine" }));
-    expect(await screen.findByText("$review")).toBeTruthy();
+    expect(await screen.findByText("/review")).toBeTruthy();
   });
 
   it("explains when no machine is online", async () => {

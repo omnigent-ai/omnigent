@@ -113,6 +113,7 @@ import {
   usesNativeSideChatFork,
 } from "@/lib/sideChat";
 import { readAlwaysSteer } from "@/lib/alwaysSteerPreferences";
+import { skillInvocationPrefix } from "@/lib/harnessSetup";
 import { DEVIN_NATIVE_PERMISSION_MODES } from "@/lib/nativeHarnessModes";
 import { readSubmitWithModEnter } from "@/lib/composerSendShortcutPreferences";
 import {
@@ -2792,7 +2793,7 @@ function ComposerImpl(
   // claude-native sessions. Selected/typed, it sends as plaintext to the
   // vendor TUI (see submit) — the forwarder relays its answer to the overlay.
   const showBtw = sessionHarness === "claude-native";
-  const skillPrefix = sessionHarness === "codex-native" ? "$" : "/";
+  const skillPrefix = skillInvocationPrefix(sessionHarness);
   // /side is a Codex Code CLI built-in (ephemeral fork side chat), so offer it
   // only on codex-native sessions. Selected/typed, it sends as plaintext to the
   // vendor turn path (see submit); the runner opens the fork as a sub-agent chat.

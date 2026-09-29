@@ -113,6 +113,7 @@ import {
   harnessWarningBadgeText,
   isCodexHarness,
   isNativeCursorHarness,
+  skillInvocationPrefix,
 } from "@/lib/harnessSetup";
 
 // Re-exported for tests that import the readiness helpers from this module.
@@ -4602,7 +4603,7 @@ export function NewChatLandingScreen() {
 
   // Pre-session suggestions contain skills; built-ins such as /model need a live session.
   const [inputFocused, setInputFocused] = useState(false);
-  const skillPrefix = skillsHarness === "codex-native" ? "$" : "/";
+  const skillPrefix = skillInvocationPrefix(skillsHarness);
   const skillCommands = useMemo(
     () =>
       Object.fromEntries(

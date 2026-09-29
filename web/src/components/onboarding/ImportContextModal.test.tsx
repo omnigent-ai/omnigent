@@ -109,6 +109,16 @@ describe("ImportContextModal – harness tabs", () => {
     expect(assetTabNames()).toEqual(["MCPs 2", "Skills 3"]);
     expect(rowNames("MCPs")).toEqual(["github", "web_search"]);
   });
+
+  it("prefixes Claude skills with / and Codex skills with $", () => {
+    renderModal();
+    switchAsset("Skills");
+    expect(rowNames("Skills")[0]).toBe("/create-kafka-topic");
+
+    switchHarness("Codex");
+    switchAsset("Skills");
+    expect(rowNames("Skills")[0]).toBe("$code-review");
+  });
 });
 
 describe("ImportContextModal – host and status", () => {
