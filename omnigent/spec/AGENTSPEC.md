@@ -267,11 +267,20 @@ defaults apply: **5 seconds** for the initial HTTP connection handshake and
 **300 seconds (5 minutes)** for each SSE event read. Setting an explicit
 `timeout` overrides both values to the same number of seconds.
 
-When an MCP server returns `InitializeResult.instructions`, the
-runner-mediated (SSE) turn path appends that text to the agent system
-prompt after `AGENTS.md` as untrusted routing guidance. Native harness
-launch prompts do not receive it. Disable globally with
-`OMNIGENT_MCP_INSTRUCTIONS_ENABLED=0` (or `false` / `no` / `off`).
+**Server-provided instructions (opt-in):** MCP servers may return
+`InitializeResult.instructions` describing how to use their tools. This
+text comes from the server, not the agent author, so Omnigent ignores it
+unless the operator sets `OMNIGENT_MCP_INSTRUCTIONS_ENABLED=1` (or
+`true` / `yes` / `on`) in the runner's environment. When enabled, the
+runner-mediated (SSE) turn path appends it to the system prompt after
+`AGENTS.md` and all other agent instructions, as a section marked
+lower-authority third-party data that must never override them. Each
+server's text is sanitised first: control and invisible characters are
+removed, `<` / `>` are escaped so it cannot close its wrapper or forge
+markers, markdown headings are demoted below the per-server `###`
+heading, and setext underlines and code fences are escaped. Bodies are
+capped at 4,096 characters per server and 16,384 in total. Native harness launch
+prompts do not receive this text.
 
 **Security note — `${VAR}` is NOT expanded for uploaded bundles:**
 ``${VAR}`` references in `headers`, `env`, and connection blocks are
