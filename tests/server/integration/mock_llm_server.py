@@ -1457,6 +1457,9 @@ async def configure(request: Request) -> dict[str, object]:
     Explicit keys replace the named queue, including ``"default"``.
     ``required_tools`` restricts consumption to requests advertising all listed
     tool names, isolating turns from title-generation/background requests.
+    The guard covers the entire queue, including its configured fallback.
+    If the model/default queue fails the guard, return the generic
+    "Mock LLM response" without consuming that queue.
 
     Multiple calls with different keys accumulate queues; use
     ``POST /mock/reset`` to clear all keys.

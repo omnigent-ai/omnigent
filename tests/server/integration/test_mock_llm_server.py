@@ -246,6 +246,30 @@ def test_tool_guard_cannot_be_bypassed_by_model_or_default(monkeypatch):
         )
 
 
+@pytest.mark.parametrize("key,model", [("default", "unknown"), ("native-model", "native-model")])
+def test_tool_guard_protects_configured_fallback(monkeypatch, key, model):
+    monkeypatch.setattr(mock_llm_server, "_state", MockState())
+    with TestClient(mock_llm_server.app) as client:
+        client.post(
+            "/mock/configure",
+            json={"key": key, "required_tools": ["Task"], "responses": [{"text": "scripted"}]},
+        ).raise_for_status()
+        client.post(
+            "/mock/set_fallback", json={"key": key, "text": "protected fallback"}
+        ).raise_for_status()
+        request = {"model": model, "input": "title"}
+        for tools, expected, remaining in [
+            ([], "Mock LLM response", 1),
+            ([{"name": "Task"}], "scripted", 0),
+            ([], "Mock LLM response", 0),
+            ([{"name": "Task"}], "protected fallback", 0),
+        ]:
+            response = client.post("/v1/responses", json={**request, "tools": tools})
+            response.raise_for_status()
+            assert response.json()["output"][0]["content"][0]["text"] == expected
+            assert client.get("/mock/queues").json()["queues"][key]["remaining"] == remaining
+
+
 @pytest.mark.parametrize(
     "invalid", [{"required_tools": "Task"}, {"required_tools": [1]}, {"match": ""}]
 )
