@@ -89,13 +89,10 @@ def _credential_url(server: str, host_id: str) -> str:
 
 
 def _fetch(server: str, host_id: str, host_token: str) -> dict | None:
-    """Fetch the credential endpoint JSON, or ``None`` on any transient failure.
+    """Fetch the credential endpoint JSON, or ``None`` if the result is inconclusive.
 
-    A 404 is not transient: the endpoint sends it only when this server has no
-    resolver/store for the provider (or predates the route), so nobody can be
-    connected here. It maps to a definitive ``{"connected": False}`` so the
-    connected-gated callers keep the ambient credential chain, exactly as a 200
-    ``connected: false`` does.
+    Only the server's explicit no-provider 404 maps to ``connected: false``.
+    A generic 404 from a proxy or missing route must not enable shared credentials.
     """
     try:
         resp = httpx.get(
@@ -105,18 +102,19 @@ def _fetch(server: str, host_id: str, host_token: str) -> dict | None:
         )
     except httpx.HTTPError:
         return None
-    if resp.status_code == 404:
-        # Definitive "no provider on this server": nothing will ever vend here.
-        return {"connected": False}
-    if resp.status_code != 200:
+    if resp.status_code not in (200, 404):
         return None
     try:
         data = resp.json()
     except ValueError:
         return None
-    # Guard non-object JSON (a top-level list/string) so callers' ``data.get(...)``
-    # can't raise — keeps the broker fetch's "never raises" contract honest.
-    return data if isinstance(data, dict) else None
+    if not isinstance(data, dict):
+        return None
+    if resp.status_code == 404:
+        if data.get("detail") != "unknown credential provider":
+            return None
+        return {"connected": False}
+    return data
 
 
 def _fetch_credential(server: str, host_id: str, host_token: str) -> tuple[str, str] | None:
@@ -377,7 +375,7 @@ def configure_clone_credentials(server_url: str, host_id: str) -> bool:
     "not linked". Treating that as unlinked would silently clone a *linked*
     owner's private repo under the shared image identity, defeating the per-user
     contract. So only a **definitive** negative — a ``connected: false``, or the
-    endpoint's 404 "no provider on this server" — keeps the shared fallback; a
+    endpoint's explicit 404 "unknown credential provider" — keeps the shared fallback; a
     connected owner — or an unresolved probe — installs the broker, so the clone
     authenticates per-user or fails visibly instead of quietly falling back to
     the shared token. Best-effort: never raises.
