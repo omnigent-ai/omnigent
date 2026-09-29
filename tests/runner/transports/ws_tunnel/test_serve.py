@@ -41,6 +41,7 @@ from omnigent.runner.transports.ws_tunnel.frames import (
 from omnigent.runner.transports.ws_tunnel.serve import (
     _handle_tunnel_frame,
     _serve_tunnel_once,
+    _truncate_close_reason,
     _websocket_auth_redirect_url,
     _websocket_close_code,
     _websocket_http_status,
@@ -1140,6 +1141,418 @@ async def test_serve_tunnel_once_graceful_shutdown_returns_and_closes(
 
     assert drain_calls == ["drained"]
     assert ws.closed is True
+
+
+def test_truncate_close_reason_leaves_short_reason_unchanged() -> None:
+    """A reason within the 123-byte limit is returned as-is.
+
+    :returns: None.
+    """
+    reason = "runner exiting: idle timeout reached"
+    assert _truncate_close_reason(reason) == reason
+
+
+def test_truncate_close_reason_truncates_long_reason_to_123_bytes() -> None:
+    """A reason exceeding 123 bytes is truncated at a UTF-8 character boundary.
+
+    The truncated result must decode cleanly and fit within the WebSocket
+    close-frame limit so the library accepts it without error.
+
+    :returns: None.
+    """
+    # Build a string whose UTF-8 encoding exceeds 123 bytes.
+    long_reason = "runner exiting: " + "x" * 200
+    result = _truncate_close_reason(long_reason)
+    assert len(result.encode("utf-8")) <= 123
+
+
+def test_truncate_close_reason_handles_multibyte_boundary() -> None:
+    """Truncation never splits a multi-byte UTF-8 sequence.
+
+    A truncation point that falls inside a 2-byte (or wider) character must
+    drop the incomplete sequence so the result is valid UTF-8.
+
+    :returns: None.
+    """
+    # U+00E9 (é) encodes as 2 bytes; pad to just over 123 bytes.
+    # 61 ASCII chars (61 bytes) + 32 "é" chars (64 bytes) = 125 bytes total.
+    reason = "runner exiting: " + "é" * 54  # 16 + 108 = 124 bytes
+    assert len(reason.encode("utf-8")) > 123
+    result = _truncate_close_reason(reason)
+    encoded = result.encode("utf-8")
+    assert len(encoded) <= 123
+    # Must decode without error (proves no split sequence).
+    encoded.decode("utf-8")
+
+    # U+1F600 (😀) encodes as 4 bytes; a 4-byte sequence spanning the
+    # truncation boundary must also be dropped entirely.
+    reason4 = "x" * 121 + "\U0001f600"  # 121 + 4 = 125 bytes
+    assert len(reason4.encode("utf-8")) > 123
+    result4 = _truncate_close_reason(reason4)
+    assert len(result4.encode("utf-8")) <= 123
+    result4.encode("utf-8").decode("utf-8")  # valid UTF-8; emoji was not split
+
+
+@pytest.mark.asyncio
+async def test_serve_tunnel_once_graceful_shutdown_sends_close_reason(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A close_reason callable is invoked and its string sent in the close frame.
+
+    When the idle reaper fires the graceful drain, ``_serve_tunnel_once`` must
+    call ``ws.close(1000, reason)`` with the string from ``close_reason()``
+    before the context manager exits — so the server sees the reason, not ''.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :returns: None.
+    """
+    import websockets
+
+    shutdown_event = asyncio.Event()
+    close_calls: list[tuple[int, str]] = []
+
+    class _FakeWS:
+        def __init__(self) -> None:
+            self.closed = False
+
+        async def send(self, data: str) -> None:
+            del data
+
+        async def recv(self) -> str:
+            await asyncio.Event().wait()
+            raise AssertionError("recv should have been cancelled")  # pragma: no cover
+
+        async def close(self, code: int = 1000, reason: str = "") -> None:
+            await asyncio.sleep(0)
+            close_calls.append((code, reason))
+            self.closed = True
+
+    ws = _FakeWS()
+
+    class _Ctx:
+        async def __aenter__(self) -> _FakeWS:
+            return ws
+
+        async def __aexit__(self, *_exc: object) -> None:
+            ws.closed = True
+
+    def _fake_connect(url: str, **kwargs: object) -> _Ctx:
+        del url, kwargs
+        return _Ctx()
+
+    monkeypatch.setattr(websockets, "connect", _fake_connect)
+    monkeypatch.setattr("omnigent.cli_auth.load_databricks_org_id", lambda _server_url: None)
+
+    shutdown_event.set()
+    await asyncio.wait_for(
+        _serve_tunnel_once(
+            _noop_app,
+            tunnel_url="wss://acme.databricks.com/v1/runners/r/tunnel",
+            server_url="https://acme.databricks.com",
+            runner_id="r",
+            runner_version="0.1.0",
+            auth_token="tok",
+            shutdown_event=shutdown_event,
+            close_reason=lambda: "runner exiting: idle timeout reached",
+        ),
+        timeout=5.0,
+    )
+
+    assert close_calls == [(1000, "runner exiting: idle timeout reached")]
+    assert ws.closed is True
+
+
+@pytest.mark.asyncio
+async def test_serve_tunnel_once_graceful_shutdown_truncates_long_close_reason(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A close_reason longer than 123 bytes is truncated before sending.
+
+    The WebSocket protocol caps the close-reason field at 123 bytes; sending
+    a longer string would cause a protocol error.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :returns: None.
+    """
+    import websockets
+
+    shutdown_event = asyncio.Event()
+    close_calls: list[tuple[int, str]] = []
+
+    class _FakeWS:
+        def __init__(self) -> None:
+            self.closed = False
+
+        async def send(self, data: str) -> None:
+            del data
+
+        async def recv(self) -> str:
+            await asyncio.Event().wait()
+            raise AssertionError("recv should have been cancelled")  # pragma: no cover
+
+        async def close(self, code: int = 1000, reason: str = "") -> None:
+            await asyncio.sleep(0)
+            close_calls.append((code, reason))
+            self.closed = True
+
+    ws = _FakeWS()
+
+    class _Ctx:
+        async def __aenter__(self) -> _FakeWS:
+            return ws
+
+        async def __aexit__(self, *_exc: object) -> None:
+            ws.closed = True
+
+    def _fake_connect(url: str, **kwargs: object) -> _Ctx:
+        del url, kwargs
+        return _Ctx()
+
+    monkeypatch.setattr(websockets, "connect", _fake_connect)
+    monkeypatch.setattr("omnigent.cli_auth.load_databricks_org_id", lambda _server_url: None)
+
+    long_reason = "runner exiting: " + "x" * 200  # well over 123 bytes
+
+    shutdown_event.set()
+    await asyncio.wait_for(
+        _serve_tunnel_once(
+            _noop_app,
+            tunnel_url="wss://acme.databricks.com/v1/runners/r/tunnel",
+            server_url="https://acme.databricks.com",
+            runner_id="r",
+            runner_version="0.1.0",
+            auth_token="tok",
+            shutdown_event=shutdown_event,
+            close_reason=lambda: long_reason,
+        ),
+        timeout=5.0,
+    )
+
+    assert len(close_calls) == 1
+    sent_code, sent_reason = close_calls[0]
+    assert sent_code == 1000
+    assert len(sent_reason.encode("utf-8")) <= 123
+    assert sent_reason == sent_reason.encode("utf-8").decode("utf-8")  # valid UTF-8
+
+
+@pytest.mark.asyncio
+async def test_serve_tunnel_once_graceful_shutdown_no_close_reason_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Omitting close_reason preserves today's behaviour: no explicit ws.close().
+
+    When no callable is provided, ``_serve_tunnel_once`` must not call
+    ``ws.close()`` directly and instead let the context manager close the
+    connection with its library default.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :returns: None.
+    """
+    import websockets
+
+    shutdown_event = asyncio.Event()
+    close_calls: list[tuple[int, str]] = []
+
+    class _FakeWS:
+        def __init__(self) -> None:
+            self.closed = False
+
+        async def send(self, data: str) -> None:
+            del data
+
+        async def recv(self) -> str:
+            await asyncio.Event().wait()
+            raise AssertionError("recv should have been cancelled")  # pragma: no cover
+
+        async def close(self, code: int = 1000, reason: str = "") -> None:
+            await asyncio.sleep(0)
+            close_calls.append((code, reason))
+            self.closed = True
+
+    ws = _FakeWS()
+
+    class _Ctx:
+        async def __aenter__(self) -> _FakeWS:
+            return ws
+
+        async def __aexit__(self, *_exc: object) -> None:
+            ws.closed = True
+
+    def _fake_connect(url: str, **kwargs: object) -> _Ctx:
+        del url, kwargs
+        return _Ctx()
+
+    monkeypatch.setattr(websockets, "connect", _fake_connect)
+    monkeypatch.setattr("omnigent.cli_auth.load_databricks_org_id", lambda _server_url: None)
+
+    shutdown_event.set()
+    await asyncio.wait_for(
+        _serve_tunnel_once(
+            _noop_app,
+            tunnel_url="wss://acme.databricks.com/v1/runners/r/tunnel",
+            server_url="https://acme.databricks.com",
+            runner_id="r",
+            runner_version="0.1.0",
+            auth_token="tok",
+            shutdown_event=shutdown_event,
+            # close_reason is omitted — default behaviour preserved.
+        ),
+        timeout=5.0,
+    )
+
+    # No explicit ws.close() call; the context manager handles it.
+    assert close_calls == []
+    assert ws.closed is True
+
+
+@pytest.mark.asyncio
+async def test_serve_tunnel_once_cancel_sends_close_reason(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cancelling the tunnel task sends close code 1000 with the exit reason.
+
+    Simulates the signal / parent-death path: ``_entry.py`` cancels
+    ``tunnel_task`` while the runner is connected. ``_serve_tunnel_once`` must
+    send ``ws.close(1000, reason)`` before re-raising the ``CancelledError``
+    so the server sees the exit reason instead of an empty string.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :returns: None.
+    """
+    import websockets
+
+    connected = asyncio.Event()
+    close_calls: list[tuple[int, str]] = []
+
+    class _FakeWS:
+        def __init__(self) -> None:
+            self.closed = False
+
+        async def send(self, data: str) -> None:
+            del data
+
+        async def recv(self) -> str:
+            connected.set()
+            await asyncio.Event().wait()
+            raise AssertionError("recv should have been cancelled")  # pragma: no cover
+
+        async def close(self, code: int = 1000, reason: str = "") -> None:
+            await asyncio.sleep(0)
+            close_calls.append((code, reason))
+            self.closed = True
+
+    ws = _FakeWS()
+
+    class _Ctx:
+        async def __aenter__(self) -> _FakeWS:
+            return ws
+
+        async def __aexit__(self, *_exc: object) -> None:
+            ws.closed = True
+
+    def _fake_connect(url: str, **kwargs: object) -> _Ctx:
+        del url, kwargs
+        return _Ctx()
+
+    monkeypatch.setattr(websockets, "connect", _fake_connect)
+    monkeypatch.setattr("omnigent.cli_auth.load_databricks_org_id", lambda _server_url: None)
+
+    # Use a never-fired shutdown_event so the recv loop runs via asyncio.wait
+    # (not `async for ws`), letting us cancel the task cleanly mid-recv.
+    task = asyncio.create_task(
+        _serve_tunnel_once(
+            _noop_app,
+            tunnel_url="wss://acme.databricks.com/v1/runners/r/tunnel",
+            server_url="https://acme.databricks.com",
+            runner_id="r",
+            runner_version="0.1.0",
+            auth_token="tok",
+            shutdown_event=asyncio.Event(),
+            close_reason=lambda: "runner exiting: parent process died",
+        )
+    )
+    # Wait until the recv loop is blocked inside ws.recv(), then cancel.
+    await asyncio.wait_for(connected.wait(), timeout=5.0)
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, timeout=5.0)
+
+    # Server side sees code 1000 with the human-readable exit reason.
+    assert close_calls == [(1000, "runner exiting: parent process died")]
+
+
+@pytest.mark.asyncio
+async def test_serve_tunnel_once_cancel_no_close_reason_unchanged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without close_reason the cancel path is unchanged: no explicit ws.close().
+
+    Cancellation still raises CancelledError; the context manager handles the
+    close with its library default — no regression for callers that do not
+    supply a reason callable.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :returns: None.
+    """
+    import websockets
+
+    connected = asyncio.Event()
+    close_calls: list[tuple[int, str]] = []
+
+    class _FakeWS:
+        def __init__(self) -> None:
+            self.closed = False
+
+        async def send(self, data: str) -> None:
+            del data
+
+        async def recv(self) -> str:
+            connected.set()
+            await asyncio.Event().wait()
+            raise AssertionError("recv should have been cancelled")  # pragma: no cover
+
+        async def close(self, code: int = 1000, reason: str = "") -> None:
+            await asyncio.sleep(0)
+            close_calls.append((code, reason))
+            self.closed = True
+
+    ws = _FakeWS()
+
+    class _Ctx:
+        async def __aenter__(self) -> _FakeWS:
+            return ws
+
+        async def __aexit__(self, *_exc: object) -> None:
+            ws.closed = True
+
+    def _fake_connect(url: str, **kwargs: object) -> _Ctx:
+        del url, kwargs
+        return _Ctx()
+
+    monkeypatch.setattr(websockets, "connect", _fake_connect)
+    monkeypatch.setattr("omnigent.cli_auth.load_databricks_org_id", lambda _server_url: None)
+
+    task = asyncio.create_task(
+        _serve_tunnel_once(
+            _noop_app,
+            tunnel_url="wss://acme.databricks.com/v1/runners/r/tunnel",
+            server_url="https://acme.databricks.com",
+            runner_id="r",
+            runner_version="0.1.0",
+            auth_token="tok",
+            shutdown_event=asyncio.Event(),
+            # close_reason omitted — default behavior.
+        )
+    )
+    await asyncio.wait_for(connected.wait(), timeout=5.0)
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, timeout=5.0)
+
+    # No explicit ws.close() call without a close_reason callable.
+    assert close_calls == []
 
 
 @pytest.mark.asyncio
