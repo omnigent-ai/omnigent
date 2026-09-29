@@ -259,6 +259,61 @@ def test_detect_sign_in_prompt_accepts_a_device_flow_by_its_instructions() -> No
     assert prompt.code == "1A2B-3C4D"
 
 
+_WORKSPACE = "https://example.cloud.databricks.com"
+_AUTHORIZE_URL = (
+    f"{_WORKSPACE}/oidc/v1/authorize?response_type=code&client_id=example-client"
+    "&redirect_uri=http%3A%2F%2Flocalhost%3A8020%2Foauth-callback"
+    "&state=abc123&code_challenge=REDACTED&code_challenge_method=S256"
+    "&scope=offline_access+all-apis"
+)
+_OAUTH_FLOW_LINES = (
+    f"[INFO] Cached token expired or missing for {_WORKSPACE}. Starting OAuth flow...\n"
+    "[INFO] Waiting for OAuth callback on port 8020. "
+    "Please open this URL in your browser:\n"
+    f"{_AUTHORIZE_URL}\n"
+)
+_PAUSED_AUTO_OPEN_LINES = (
+    "[WARNING] Not opening a browser tab automatically: the last authentication attempt "
+    "did not complete within 120s, so the launcher is pausing auto-open to avoid piling up "
+    "tabs while you're away. Open this URL in your browser to authenticate:\n"
+    f"{_AUTHORIZE_URL}\n\n\n"
+)
+
+
+@pytest.mark.parametrize("reprint", ["", _PAUSED_AUTO_OPEN_LINES])
+def test_detect_sign_in_prompt_prefers_the_endpoint_over_a_cue_adjacent_host(reprint: str) -> None:
+    """
+    A launcher names the workspace host above the real authorize link.
+
+    The host sits next to "open this URL" wording but is not the link; the
+    authorize address is, including when the launcher prints it again.
+    """
+    prompt = detect_sign_in_prompt(_OAUTH_FLOW_LINES + reprint)
+    assert prompt is not None
+    assert prompt.url == _AUTHORIZE_URL
+    assert prompt.code is None
+
+
+def test_detect_sign_in_prompt_ignores_an_endpoint_the_launcher_moved_past() -> None:
+    """Preferring the endpoint keeps the stale check anchored at the endpoint's own line."""
+    screen = (
+        _OAUTH_FLOW_LINES
+        + "[INFO] Token cached for the workspace\n"
+        + "╭── OpenAI Codex (v0.156.1) ──╮\n"
+        + "› Ask Codex to do anything\n"
+    )
+    assert detect_sign_in_prompt(screen) is None
+
+
+def test_detect_sign_in_prompt_ignores_output_that_extends_a_bare_host() -> None:
+    """A line that only starts with the fallback address is agent output, not a re-print."""
+    screen = (
+        "[INFO] Cached token expired for https://host.example.com. Starting sign-in...\n"
+        "Opened https://host.example.com/pr/123 for review\n"
+    )
+    assert detect_sign_in_prompt(screen) is None
+
+
 def test_sign_in_next_step_names_the_agent_and_carries_no_address() -> None:
     """The next step never embeds the one-time link; the card fetches it live."""
     step = sign_in_next_step("Codex")

@@ -118,6 +118,11 @@ _SIGN_IN_CODE = re.compile(
 )
 
 
+def _nearby(lines: list[str], index: int) -> str:
+    """Join the few screen lines around ``index`` where sign-in wording may sit."""
+    return "\n".join(lines[max(0, index - 3) : index + 3])
+
+
 def detect_sign_in_prompt(screen: str | None) -> SignInPrompt | None:
     """Find a device-style sign-in prompt in terminal screen text.
 
@@ -127,17 +132,19 @@ def detect_sign_in_prompt(screen: str | None) -> SignInPrompt | None:
     that prompt so the chat can offer to open the live link.
 
     Only an address that is itself an OAuth or device-flow endpoint, or that
-    sits within a few lines of sign-in instructions, counts. A running agent's
-    screen is full of ordinary addresses (pull requests, docs links in a
-    banner) and none of those is a gate. The prompt must also still be the
-    launcher's latest output: an agent that draws inline leaves the launcher's
-    lines on screen above its own, so any output below the address other than
-    the prompt's own trailing lines (the code, "waiting for sign-in") means the
-    sign-in already completed and the address is stale. The code is the first
-    device-code-shaped token on a line that mentions "code"; the address
-    itself is never taken as the code. An address wrapped across two pane
-    lines is truncated at the wrap, so callers should capture with wrapped
-    rows joined.
+    sits within a few lines of sign-in instructions, counts. The first
+    endpoint wins; an address that only sits near instructions is the
+    fallback. A running agent's screen is full of ordinary addresses (pull
+    requests, docs links in a banner) and none of those is a gate. The
+    prompt must also still be the launcher's latest output: an agent that
+    draws inline leaves the launcher's lines on screen above its own, so any
+    output below the address other than the prompt's own trailing lines (the
+    code, "waiting for sign-in", the address printed again) means the
+    sign-in already completed and the address is stale. The code is the
+    first device-code-shaped token on a line that mentions "code"; the
+    address itself is never taken as the code. An address wrapped across two
+    pane lines is truncated at the wrap, so callers should capture with
+    wrapped rows joined.
 
     :param screen: ANSI-stripped terminal screen text, or ``None``.
     :returns: The prompt, or ``None`` when no pending sign-in address is on screen.
@@ -145,20 +152,21 @@ def detect_sign_in_prompt(screen: str | None) -> SignInPrompt | None:
     if not screen:
         return None
     lines = screen.splitlines()
-    url: str | None = None
-    for index, line in enumerate(lines):
-        for match in _SIGN_IN_URL.finditer(line):
-            candidate = match.group(0).rstrip(".,;:")
-            nearby = "\n".join(lines[max(0, index - 3) : index + 3])
-            if _SIGN_IN_URL_SHAPE.search(candidate) or _SIGN_IN_CUE.search(nearby):
-                url = candidate
-                break
-        if url is not None:
-            break
-    if url is None:
+    addresses = [
+        (index, match.group(0).rstrip(".,;:"))
+        for index, line in enumerate(lines)
+        for match in _SIGN_IN_URL.finditer(line)
+    ]
+    chosen = next((a for a in addresses if _SIGN_IN_URL_SHAPE.search(a[1])), None)
+    if chosen is None:
+        chosen = next((a for a in addresses if _SIGN_IN_CUE.search(_nearby(lines, a[0]))), None)
+    if chosen is None:
         return None
+    index, url = chosen
     if any(
-        re.search(r"\w", _ECHOED_CONTROL.sub("", line)) and not _SIGN_IN_TRAILER.search(line)
+        line.strip().rstrip(".,;:") != url
+        and re.search(r"\w", _ECHOED_CONTROL.sub("", line))
+        and not _SIGN_IN_TRAILER.search(line)
         for line in lines[index + 1 :]
     ):
         return None
