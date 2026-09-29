@@ -507,7 +507,8 @@ when *every* sub-symptom is fixed is the overall verdict `already_fixed`.
 
 ## Step 3 — Identify the smallest reliable regression coverage
 
-Search existing tests by behavior and fixture, and read the nearest scenarios.
+Search existing tests across the repository by behavior, input event, and fixture,
+and read the nearest scenarios. Reuse their helpers before writing new setup.
 If one already drives the relevant setup and state transition, fold the missing
 assertion into it before creating another test body. Prefer reusing an existing
 check unchanged when sufficient. If new coverage is needed, choose the lowest

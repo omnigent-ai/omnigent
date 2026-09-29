@@ -73,6 +73,13 @@ would make that extension misleading. Keep investigation history in evidence
 and test comments short. Reuse unchanged coverage when sufficient; there is no
 requirement for a new test file or both a new e2e and a smaller test.
 
+Before final verification, compare each new scenario's setup and transitions
+with the nearest existing tests across the repository. Moving a reproduction
+into an existing file is not consolidation. Reuse the scenario or its helpers
+before writing new setup. For each separate scenario retained, name the nearest
+existing test in `test_audit` and explain why extending or parameterizing it
+would lose the required assertion, ordering, or boundary.
+
 Retain an e2e when it protects a distinct production boundary that lower-level
 coverage would miss, and explain that boundary briefly in `test_audit`. Do not
 mock away the failure, skip configurations, or supply already-correct objects
