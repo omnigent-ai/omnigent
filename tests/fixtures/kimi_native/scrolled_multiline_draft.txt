@@ -1,0 +1,11 @@
+ ╭──────────────────────────────── ↑ 10 more ─────────────────────────────────╮
+ │ > Section 2: Receive this harmless dispatch and preserve all its words.    │
+ │   Receive this harmless dispatch and preserve all its words. Receive       │
+ │   this harmless dispatch and preserve all its words. Receive this          │
+ │   harmless dispatch and preserve all its words. Receive this harmless      │
+ │   dispatch and preserve all its words.                                     │
+ │   Reply only ACK.                                                          │
+ │                                                                            │
+ ╰────────────────────────────────────────────────────────────────────────────╯
+ K2.8 Preview thinking: max  /private/tmp/kimi-paste-repro
+                                                             context: 0% (0/1M)

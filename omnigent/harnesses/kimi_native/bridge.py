@@ -661,7 +661,19 @@ def _draft_visible_in_editor(
         )
     if expected_content is not None:
         expected = _paste_payload_bytes(expected_content).decode("utf-8")
-        return _normalized_contains(content, expected)
+        if _normalized_contains(content, expected):
+            return True
+        # Kimi caps the editor height: a wrapped paste can show only its tail.
+        # Require scroll chrome, a changed draft, and the complete visible suffix.
+        if state.editor_bounds is not None and pre_paste_content is not None:
+            top, bottom = state.editor_bounds
+            scrolled = re.search(r"↑ [1-9]\d* more", state.lines[top])
+            at_end = not re.search(r"↓ [1-9]\d* more", state.lines[bottom])
+            visible = "".join(content.split())
+            payload = "".join(expected.split())
+            if scrolled and at_end and len(visible) >= _DRAFT_NEEDLE_MAX_CHARS:
+                return payload.endswith(visible)
+        return False
     if needle:
         return _normalized_contains(content, needle)
     return not needle
