@@ -70,8 +70,8 @@ from tests.codex_parity.sidecar_harness import (
     build_sidecar_bin,
     start_codex_responses_sidecar,
 )
-from tests.e2e_ui import timings
-from tests.e2e_ui.url_safety import DEV_PORTS, unsafe_ui_base_url_reason
+from tests.helpers import ui_timings as timings
+from tests.helpers.ui_url_safety import DEV_PORTS, unsafe_ui_base_url_reason
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _ALLOW_DEV_BASE_URL_ENV = "OMNIGENT_E2E_ALLOW_DEV_BASE_URL"

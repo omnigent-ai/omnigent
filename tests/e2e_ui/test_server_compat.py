@@ -20,7 +20,7 @@ def _configure(
     pinned: str | None = None,
     expect_server: bool = True,
 ) -> None:
-    root = str(Path(__file__).resolve().parents[1])
+    root = str(Path(__file__).resolve().parents[2])
     monkeypatch.setenv("PYTHONPATH", os.pathsep.join([root, os.environ.get("PYTHONPATH", "")]))
     monkeypatch.setenv("PYTEST_DISABLE_PLUGIN_AUTOLOAD", "1")
     monkeypatch.delenv(COMPAT_SERVER_VERSION_ENV, raising=False)
