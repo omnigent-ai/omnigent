@@ -62,10 +62,18 @@ describe("arca connect command", () => {
       "omni",
       "host",
       "--server",
-      "https://workspace.example.com/ml/omnigents",
+      "'https://workspace.example.com/ml/omnigents'",
       "--background",
       "--non-interactive",
     ]);
+  });
+
+  it("quotes the URL for the remote shell so a query's `?` isn't globbed", () => {
+    const args = buildConnectArgs("https://ws.cloud.databricks.com/omnigent?o=123");
+    assert.equal(
+      args[args.indexOf("--server") + 1],
+      "'https://ws.cloud.databricks.com/omnigent?o=123'",
+    );
   });
 
   it("rejects non-http(s) server URLs", () => {
@@ -147,7 +155,7 @@ describe("startArcaConnect / connectArcaHost", () => {
     });
     assert.equal(
       run.command,
-      "arca ssh -o ClearAllForwardings=yes isaac omni host --server https://srv.example.com/ --background --non-interactive",
+      "arca ssh -o ClearAllForwardings=yes isaac omni host --server 'https://srv.example.com/' --background --non-interactive",
     );
     child.stdout.emit("data", "Attempting to start your Arca instance\n");
     child.stderr.emit("data", "synced dbcert\n");
