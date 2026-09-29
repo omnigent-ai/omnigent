@@ -9422,6 +9422,7 @@ async def _remove_session_worktree_best_effort(
                 host_conn=host_conn,
                 repo_path=worktree_path,
             )
+            # Keep worktrees that have been repurposed for another branch or detached HEAD.
             roots = [
                 path
                 for tree in worktrees

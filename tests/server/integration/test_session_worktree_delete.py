@@ -52,11 +52,14 @@ class _FakeWebSocket:
 async def _register_fake_host(
     app: FastAPI,
     db_uri: str,
+    *,
+    worktree_path: str | None = None,
 ) -> list[HostRemoveWorktreeFrame]:
     """Register a fake host and start a drain that captures remove frames.
 
     :param app: The app whose ``host_registry`` to register into.
     :param db_uri: DB URI so the host row (FK target) can be upserted.
+    :param worktree_path: Optional root returned by the host's worktree listing.
     :returns: A list that accumulates every ``HostRemoveWorktreeFrame``
         the server sends to this host.
     """
@@ -91,7 +94,7 @@ async def _register_fake_host(
                             "status": "ok",
                             "worktrees": [
                                 {
-                                    "path": _WORKTREE_PATH,
+                                    "path": worktree_path or _WORKTREE_PATH,
                                     "branch": "feature/login",
                                     "is_main": False,
                                 }
@@ -708,3 +711,32 @@ async def test_worktree_sharing_includes_descendants(
         exclude_conversation_id=mine,
         include_subdirectories=True,
     )
+
+
+@pytest.mark.parametrize(
+    ("root", "workspace"),
+    [
+        (r"\\server\share\repo-worktrees\feature", r"\\server\share\repo-worktrees\feature\web"),
+        ("//server/share/repo-worktrees/feature", r"\\SERVER\share\repo-worktrees\feature\web"),
+        (r"\\SERVER\share\repo-worktrees\feature", "//server/share/repo-worktrees/feature/web"),
+    ],
+)
+async def test_delete_unc_worktree_preserves_sharers_and_cleans_up_last_session(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    db_uri: str,
+    root: str,
+    workspace: str,
+) -> None:
+    """UNC subdirectories share a cleanup root even with mixed separators and casing."""
+    captured = await _register_fake_host(app, db_uri, worktree_path=root)
+    first = _make_worktree_conversation(db_uri, root)
+    second = _make_worktree_conversation(db_uri, workspace)
+    response = await client.delete(f"/v1/sessions/{first}?delete_branch=true")
+    assert response.status_code == 200, response.text
+    assert captured == []
+    response = await client.delete(f"/v1/sessions/{second}?delete_branch=true")
+    assert response.status_code == 200, response.text
+    assert len(captured) == 1
+    assert captured[0].worktree_path == root
+    assert captured[0].delete_branch is True
