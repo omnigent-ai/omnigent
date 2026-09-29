@@ -27,6 +27,7 @@ from omnigent.host.connect import (
     HostRetryableConnectionError,
     ModelOptionsResult,
     _build_runner_env,
+    _check_ca_bundle,
     _runner_exit_error,
     _RunnerHandle,
     run_host_process,
@@ -251,6 +252,102 @@ async def test_host_skills_distinguishes_empty_and_failure(
     result = host._handle_skills(frame)
     assert result.status == "failed"
     assert result.error_code == "discovery_failed"
+
+
+async def test_host_skills_names_missing_ca_bundle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A bare FileNotFoundError (no filename) with a missing CA bundle emits a diagnostic event."""
+    from omnigent.host import skills as skill_sources
+
+    missing_cert = str(tmp_path / "nonexistent-ca.pem")
+    monkeypatch.setenv("SSL_CERT_FILE", missing_cert)
+
+    def raise_bare_fnfe(*_args: object) -> None:
+        raise FileNotFoundError(2, "No such file or directory")
+
+    monkeypatch.setattr(skill_sources, "resolve_harness_skills", raise_bare_fnfe)
+    host = _make_host_process()
+    frame = HostSkillsFrame(
+        request_id="r", harness="claude-sdk", path=str(tmp_path), session_id="sess_abc"
+    )
+    with caplog.at_level(logging.ERROR, logger="omnigent.host.connect"):
+        result = host._handle_skills(frame)
+
+    assert result.status == "failed"
+    assert result.error_code == "discovery_failed"
+    assert "CA bundle" in (result.error or "")
+    assert "restart the host" in (result.error or "")
+
+    record = next(
+        r for r in caplog.records if getattr(r, "event_name", None) == "host_ca_bundle_missing"
+    )
+    assert record.session_id == "sess_abc"
+    assert record.attributes["harness"] == "claude-sdk"
+    assert record.attributes["ca_bundle"] == missing_cert
+    assert record.attributes["ca_bundle_source"] == "ssl_cert_file_env"
+    assert isinstance(record.attributes["install_present"], bool)
+    assert missing_cert in caplog.text
+    assert "restart the host" in caplog.text
+
+
+async def test_host_skills_unrelated_exception_uses_generic_log(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An OSError that names its file keeps the generic skill-discovery log."""
+    from omnigent.host import skills as skill_sources
+
+    # OSError with a real filename: should NOT emit the CA-bundle diagnostic.
+    def raise_named_oserror(*_args: object) -> None:
+        raise FileNotFoundError(2, "No such file or directory", "/some/skill/file")
+
+    monkeypatch.setattr(skill_sources, "resolve_harness_skills", raise_named_oserror)
+    host = _make_host_process()
+    frame = HostSkillsFrame(request_id="r", harness="claude-sdk", path=str(tmp_path))
+    with caplog.at_level(logging.ERROR, logger="omnigent.host.connect"):
+        result = host._handle_skills(frame)
+
+    assert result.status == "failed"
+    assert result.error_code == "discovery_failed"
+    assert result.error == "skill discovery failed; see the host log"
+    assert not any(
+        getattr(r, "event_name", None) == "host_ca_bundle_missing" for r in caplog.records
+    )
+
+
+async def test_check_ca_bundle_respects_env_priority(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """SSL_CERT_FILE takes priority over SSL_CERT_DIR; certifi is the final fallback."""
+    cert_file = tmp_path / "ca.pem"
+    cert_dir = tmp_path / "ca-dir"
+    cert_dir.mkdir()
+
+    monkeypatch.delenv("SSL_CERT_FILE", raising=False)
+    monkeypatch.delenv("SSL_CERT_DIR", raising=False)
+    path, source, exists = _check_ca_bundle()
+    assert source == "certifi"
+
+    monkeypatch.setenv("SSL_CERT_DIR", str(cert_dir))
+    path, source, exists = _check_ca_bundle()
+    assert source == "ssl_cert_dir_env"
+    assert path == str(cert_dir)
+    assert exists is True
+
+    monkeypatch.setenv("SSL_CERT_FILE", str(cert_file))
+    path, source, exists = _check_ca_bundle()
+    assert source == "ssl_cert_file_env"
+    assert path == str(cert_file)
+    assert exists is False  # file not created yet
+
+    cert_file.write_text("# cert")
+    _, _, exists = _check_ca_bundle()
+    assert exists is True
 
 
 async def test_host_skills_does_not_block_tunnel(
