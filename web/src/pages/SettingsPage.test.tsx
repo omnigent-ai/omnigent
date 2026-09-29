@@ -817,7 +817,7 @@ describe("SettingsPage", () => {
     expect(screen.getByTestId("terminal-theme-auto")).toHaveAttribute("aria-checked", "false");
   });
 
-  it("renders the Extra keys row select next to Terminal theme, defaulting to Auto", () => {
+  it("renders the Extra keys row select in the Touch & mobile section, defaulting to Auto", () => {
     renderPage("/settings/appearance");
     const select = screen.getByTestId("terminal-extra-keys-select") as HTMLSelectElement;
     expect(select.value).toBe("auto");
@@ -826,16 +826,15 @@ describe("SettingsPage", () => {
     expect(screen.getByText("Never")).toBeInTheDocument();
     expect(localStorage.getItem("omnigent:terminal-extra-keys")).toBeNull();
 
-    // Sits with the terminal controls: after Terminal theme, before Color theme.
-    const terminal = screen.getByText("Terminal theme");
+    const touch = screen.getByRole("heading", { level: 2, name: "Touch & mobile" });
+    const codeWeight = screen.getByText("Heavier code font");
     const extraKeys = screen.getByText("Extra keys row");
-    const color = screen.getByText("Color theme");
-    expect(
-      terminal.compareDocumentPosition(extraKeys) & Node.DOCUMENT_POSITION_FOLLOWING,
-    ).toBeTruthy();
-    expect(
-      extraKeys.compareDocumentPosition(color) & Node.DOCUMENT_POSITION_FOLLOWING,
-    ).toBeTruthy();
+    const exportButton = screen.getByTestId("export-settings-button");
+    const follows = (a: Node, b: Node) =>
+      Boolean(a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING);
+    expect(follows(codeWeight, touch)).toBe(true);
+    expect(follows(touch, extraKeys)).toBe(true);
+    expect(follows(extraKeys, exportButton)).toBe(true);
   });
 
   it("persists Always / Never for the extra keys row and clears the key for Auto", () => {
