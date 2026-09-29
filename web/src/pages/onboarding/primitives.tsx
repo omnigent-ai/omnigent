@@ -1,5 +1,5 @@
 import type { ReactNode } from "react";
-import { ArrowLeft } from "lucide-react";
+import { ArrowLeft, ArrowRight, Download } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 
@@ -26,6 +26,12 @@ export function installActionLabel(installed?: boolean): string {
   return installed ? "Open Omnigent" : "Install Omnigent";
 }
 
+/** Leading icon for the install/open action, paired with installActionLabel. */
+export function InstallActionIcon({ installed }: { installed?: boolean }) {
+  const Icon = installed ? ArrowRight : Download;
+  return <Icon className="size-4" aria-hidden />;
+}
+
 export function OnboardingRail({ children }: { children: ReactNode }) {
   return <div className="mt-3 flex justify-between gap-2">{children}</div>;
 }
@@ -48,6 +54,7 @@ export function InstallActionButton({
 }) {
   return (
     <Button size="lg" onClick={onClick}>
+      <InstallActionIcon installed={installed} />
       {installActionLabel(installed)}
     </Button>
   );

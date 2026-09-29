@@ -141,6 +141,51 @@ Omnigent's runtime instructions are still sent to Pi. This option maps to Pi's
 separate `SYSTEM.md` discovery, and is only supported by `pi`, not `pi-native`
 or other harnesses.
 
+### Pi system prompt
+
+With `harness: pi`, `system_prompt_mode` controls how Omnigent sends its composed
+instructions to Pi:
+
+- `append` (default) keeps Pi's base prompt and appends Omnigent's instructions
+  using `--append-system-prompt`. The base is Pi's built-in coding prompt or a
+  discovered `SYSTEM.md`.
+- `replace` sends Omnigent's instructions as the base using `--system-prompt`.
+  Pi's built-in coding prompt and discovered `SYSTEM.md` are omitted. An explicit
+  empty `--append-system-prompt` also prevents discovery of `APPEND_SYSTEM.md`.
+
+To replace the base prompt and disable workspace context discovery:
+
+```yaml
+name: support-agent
+executor:
+  harness: pi
+  system_prompt_mode: replace
+  context_files: false
+prompt: |
+  You are a customer-support assistant.
+```
+
+For a directory bundle, set `executor.config.system_prompt_mode`:
+
+```yaml
+spec_version: 1
+name: support-agent
+executor:
+  type: omnigent
+  config:
+    harness: pi
+    system_prompt_mode: replace
+    context_files: false
+instructions: AGENTS.md
+```
+
+Both modes preserve explicit agent instructions, per-request instructions, and
+Omnigent's appended runtime instructions. Replacement removes Pi's default tool
+summaries and coding guidelines; tool schemas and execution still work.
+`context_files` is independent and still defaults to `true`. Skills, the working
+directory footer, and extension hooks remain active; extensions can modify the
+final prompt. This setting only supports `pi`, not `pi-native` or other harnesses.
+
 ### GitHub Copilot
 
 `harness: copilot` runs the agent through the

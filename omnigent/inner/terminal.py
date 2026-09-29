@@ -1692,12 +1692,20 @@ class TerminalInstance:
 
         return {"status": "sent"}
 
-    async def read(self, scrollback: int = 0) -> TerminalResult:
-        """Capture the terminal screen."""
+    async def read(self, scrollback: int = 0, *, join_wrapped: bool = False) -> TerminalResult:
+        """Capture the terminal screen.
+
+        :param scrollback: Scrollback lines to include above the visible pane.
+        :param join_wrapped: Join lines the pane wrapped at its width back into
+            one line (``capture-pane -J``), so a long token such as a sign-in
+            address printed into an 80-column pane reads back whole.
+        """
         if not self.running:
             return {"error": "Terminal is not running"}
 
         args = ["capture-pane", "-t", self.tmux_target, "-p"]
+        if join_wrapped:
+            args.append("-J")
         if scrollback > 0:
             args.extend(["-S", f"-{scrollback}"])
 

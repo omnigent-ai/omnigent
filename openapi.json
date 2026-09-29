@@ -102,7 +102,7 @@
           },
           "mcp_servers_editable": {
             "default": false,
-            "description": "Whether the MCP list can be edited through the session UI. Built-in template agents are read-only; session-scoped uploaded agents are editable.",
+            "description": "Whether the MCP list can be edited through the session UI by the authenticated caller. This requires ownership of both the effective session and its session-scoped agent; built-in template and native agents are read-only.",
             "title": "Mcp Servers Editable",
             "type": "boolean"
           },
@@ -1735,6 +1735,18 @@
       "ErrorData": {
         "description": "Data for a persisted error banner item.\n\nThese items mirror `response.error` events so clients can render\nthe same error banner after reconnect / refresh. They are listed in\n`NON_CONTENT_ITEM_TYPES` because they are operator-visible\ntranscript metadata, not content the next agent turn should receive.",
         "properties": {
+          "cause": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Optional one or two sentences explaining why it failed.",
+            "title": "Cause"
+          },
           "code": {
             "description": "Stable error classifier, e.g. `\"native_terminal_start_failed\"`.",
             "title": "Code",
@@ -1761,6 +1773,18 @@
             "title": "Message",
             "type": "string"
           },
+          "remediation": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Optional concrete next step, e.g. the sign-in link and code; the card offers it as an action.",
+            "title": "Remediation"
+          },
           "source": {
             "description": "Error source, e.g. `\"execution\"`.",
             "enum": [
@@ -1771,6 +1795,18 @@
             ],
             "title": "Source",
             "type": "string"
+          },
+          "title": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Optional short headline naming the failure, e.g. `\"Codex can't start until you sign in to Databricks\"`. Kept so the card reads the same after a reload as it did live.",
+            "title": "Title"
           }
         },
         "required": [
@@ -1829,6 +1865,18 @@
             ],
             "description": "Optional short headline naming what went wrong, e.g. `\"Claude Code can't run as root\"`. Present when the runner recognized the failure (see `omnigent.runner.launch_failure`); lets the UI show a clear card title instead of the raw `code`.",
             "title": "Title"
+          },
+          "undelivered": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "`True` when the harness reports it never received the message this turn carried (it failed before delivery), so the sender's queued copy is the only record of it; absent otherwise.",
+            "title": "Undelivered"
           }
         },
         "required": [
@@ -11458,7 +11506,7 @@
         ]
       },
       "put": {
-        "description": "Replace the session's agent bundle with a new upload.\n\nValidates the new bundle, checks that the spec name matches\nthe existing agent, stores the bundle under a\ncontent-addressed key, updates the agent row, and warm-swaps\nthe cache. Idempotent when the bundle content is unchanged.\n\n**Parameters**\n\n- `bundle` \u2014 Uploaded `.tar.gz` agent bundle file.\n\n**Returns:** The updated `AgentObject`.\n\n**Raises**\n\n- `OmnigentError` \u2014 If the session or agent is not found, the bundle is invalid, or the spec name doesn't match.",
+        "description": "Replace the session's agent bundle with a new upload.\n\nValidates the new bundle, checks that the spec name matches\nthe existing agent, stores the bundle under a\ncontent-addressed key, updates the agent row, and warm-swaps\nthe cache. Idempotent when the bundle content is unchanged.\nRequires session-owner permission because a bundle can replace MCP servers.\n\n**Parameters**\n\n- `bundle` \u2014 Uploaded `.tar.gz` agent bundle file.\n\n**Returns:** The updated `AgentObject`.\n\n**Raises**\n\n- `OmnigentError` \u2014 If the session or agent is not found, the bundle is invalid, or the spec name doesn't match.",
         "operationId": "update_session_agent_v1_sessions__session_id__agent_put",
         "parameters": [
           {
@@ -14990,6 +15038,48 @@
         "summary": "Get Session Resource",
         "tags": [
           "session_resources"
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/sign-in-link": {
+      "get": {
+        "description": "Return the sign-in link the session's terminal is waiting on right now.\n\nAsked by the error card at click time, so the user opens the live\nprompt rather than a link saved earlier that its launcher process has\nsince abandoned.\n\n**Returns:** The runner's `{\"pending\", \"url\", \"code\", \"terminal_id\"}` payload.",
+        "operationId": "get_session_sign_in_link_v1_sessions__session_id__sign_in_link_get",
+        "parameters": [
+          {
+            "description": "Session/conversation identifier.",
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Session Sign In Link",
+        "tags": [
+          "sessions"
         ]
       }
     },

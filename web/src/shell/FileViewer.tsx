@@ -10,6 +10,7 @@
 //   └──────────────────────────────────┴──────────────────┘
 
 import { FileViewerContext, type FilePosition } from "./FileViewerContext";
+import { revealInFileManager, revealLabel, useRevealTarget } from "./RevealInFileManager";
 import {
   dismissFilePosition,
   isFilePositionDismissed,
@@ -43,6 +44,7 @@ import {
   EyeIcon,
   EyeOffIcon,
   FileDiffIcon,
+  FolderOpenIcon,
   Link2Icon,
   ListIcon,
   Loader2Icon,
@@ -689,6 +691,7 @@ function FileViewerBody({
     (changedFiles.data?.data.some((f) => f.path === path) ?? false);
   const isDeletedFile =
     changedFiles.data?.data.some((f) => f.path === path && f.status === "deleted") ?? false;
+  const revealTarget = useRevealTarget(path);
 
   // Diff is a global toggle — turning it on/off on any file carries over as you
   // navigate to the next file. Source ↔ preview is also shared across previewable
@@ -1161,6 +1164,15 @@ function FileViewerBody({
       onSelect: openSearch,
     },
   ];
+  if (revealTarget && !isDeletedFile) {
+    settingsMenu.push({
+      key: "reveal",
+      label: revealLabel(false),
+      icon: <FolderOpenIcon className="size-4" />,
+      active: false,
+      onSelect: () => revealInFileManager(revealTarget),
+    });
+  }
   if (!isDeletedFile && fileQuery.data) {
     settingsMenu.push({
       key: "download",

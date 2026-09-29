@@ -14,7 +14,11 @@ import {
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { ServerDetails } from "@/pages/onboarding/ServerSelectStep";
-import { installActionLabel, OnboardingHeading } from "@/pages/onboarding/primitives";
+import {
+  InstallActionIcon,
+  installActionLabel,
+  OnboardingHeading,
+} from "@/pages/onboarding/primitives";
 import { cn } from "@/lib/utils";
 
 /** Strip scheme + trailing slash for display. */
@@ -93,6 +97,7 @@ export function ServerDetailStep({
           Back
         </Button>
         <Button onClick={() => onConnect(url)} size="lg">
+          <InstallActionIcon installed={installed} />
           {installActionLabel(installed)}
         </Button>
       </div>

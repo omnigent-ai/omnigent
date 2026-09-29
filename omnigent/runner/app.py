@@ -2627,8 +2627,15 @@ def _normalize_turn_error(error: Mapping[str, object]) -> dict[str, str]:
     The result is what gets published on the ``failed`` status event
     and ultimately rendered as the REPL's terminal error line.
 
+    A harness ``response.failed`` error already names its failure in ``code``;
+    that code is kept so the failed status edge and the persisted error item
+    describe one failure the same way (the web UI de-duplicates them by code
+    and message). ``type`` is the legacy spelling; ``runner_error`` is the
+    fallback for setup failures that carry neither.
+
     :param error: Raw error dict from a ``_on_proxy_stream_end`` call,
-        e.g. ``{"message": "turn setup failed: ..."}`` or
+        e.g. ``{"message": "turn setup failed: ..."}``,
+        ``{"code": "agent_startup_pending", "message": "..."}`` or
         ``{"status": 502}``.
     :returns: A dict with ``code`` and ``message`` string keys, e.g.
         ``{"code": "runner_error", "message": "turn setup failed: ..."}``.
@@ -2641,8 +2648,12 @@ def _normalize_turn_error(error: Mapping[str, object]) -> dict[str, str]:
         message = f"turn failed (status {error['status']})"
     else:
         message = "turn failed"
-    raw_code = error.get("type")
-    code = raw_code if isinstance(raw_code, str) and raw_code else "runner_error"
+    code = "runner_error"
+    for key in ("code", "type"):
+        raw_code = error.get(key)
+        if isinstance(raw_code, str) and raw_code:
+            code = raw_code
+            break
     return {"code": code, "message": message}
 
 
@@ -2835,6 +2846,10 @@ def _require_full_native_lock_coverage(
             f"native terminal lock dispatch is missing built-in harness(es): {sorted(missing)}"
         )
     return dispatch
+
+
+# How often the pane behind a sign-in card is read for the sign-in to complete.
+_SIGN_IN_WATCH_INTERVAL_S = 3.0
 
 
 def create_runner_app(
@@ -3110,6 +3125,8 @@ def create_runner_app(
     _desync_terminalized: dict[str, int] = {}
     app.state.desync_terminalized = _desync_terminalized
     _background_tasks: set[asyncio.Task[Any]] = set()
+    # One watcher per session for a pending Databricks sign-in (see _start_sign_in_watch).
+    _sign_in_watchers: dict[str, asyncio.Task[None]] = {}
     _subagent_recovery_tasks: dict[str, asyncio.Task[None]] = {}
     _subagent_wake_pending: set[str] = set()
     _last_rewake_notice: dict[str, str] = {}
@@ -4675,6 +4692,7 @@ def create_runner_app(
             or _turn_bind_epoch.get(session_id) != initial_turn_epoch
             or resource_registry.session_activity_epoch(session_id) != initial_native_activity
         )
+        recovery_turn = "none"
         if history and not execution_seen and session_id not in _active_turns:
             _session_histories[session_id] = history
             last = history[-1]
@@ -4691,6 +4709,7 @@ def create_runner_app(
                 and not _suppress_recovery
                 and session_id not in _active_turns
             ):
+                recovery_turn = "history_resume"
                 _begin_turn_slot(session_id)
                 _publish_turn_status(session_id, "running")
                 msg_body = {
@@ -4719,6 +4738,7 @@ def create_runner_app(
                 and session_id not in _active_turns
                 and not resource_registry.session_turn_is_active(session_id)
             ):
+                recovery_turn = "recovery_prompt"
                 if is_native_harness(harness_name):
                     _session_histories[session_id] = []
                 _begin_turn_slot(session_id)
@@ -4751,13 +4771,28 @@ def create_runner_app(
             _recovery_turn_ids.setdefault(session_id, set()).add(recovery_id)
 
         status = "running" if session_id in _active_turns else "idle"
+        # The recovery decision and its inputs, so a turn that restarted after a
+        # reconnect can be attributed to the history heuristic, the server's
+        # continuation request, or neither.
         _logger.info(
             "Runner session initialization finished",
             extra=debug_event(
                 "runner_session_initialized",
+                session_id=session_id,
                 stage="session_init",
                 status_code=201,
                 harness=harness_name,
+                status=status,
+                recovery_turn=recovery_turn,
+                recovery_id=recovery_id,
+                resume_interrupted_turn=(
+                    init_context.envelope is not None
+                    and init_context.envelope.resume_interrupted_turn
+                ),
+                suppress_recovery_turn=_suppress_recovery,
+                execution_seen=execution_seen,
+                history_len=len(history),
+                last_item_type=history[-1].get("type") if history else None,
             ),
         )
         return JSONResponse(
@@ -5476,6 +5511,120 @@ def create_runner_app(
         _task.add_done_callback(_background_tasks.discard)
         _background_tasks.add(_task)
 
+    def _native_pane_names(conv_id: str) -> set[str]:
+        """
+        Return the terminal names that can carry a session's launcher sign-in prompt.
+
+        Only the native agent's own pane counts: a shell the person opened
+        alongside it (``gh auth login``, a docs page) must not supply the
+        sign-in address or hold back the "signed in" notice. With the harness
+        known this is its one pane; otherwise any native agent pane.
+        """
+        from omnigent.harness_plugins import native_agents
+
+        harness = _session_harness_name(conv_id)
+        names = {agent.terminal_name for agent in native_agents() if agent.harness == harness}
+        return names or {agent.terminal_name for agent in native_agents()}
+
+    def _start_sign_in_watch(conv_id: str) -> None:
+        """Watch the pane behind a sign-in card so the chat learns when the sign-in worked."""
+        existing = _sign_in_watchers.get(conv_id)
+        if existing is not None and not existing.done():
+            return
+        task = asyncio.get_running_loop().create_task(
+            _watch_sign_in_completion(conv_id), name=f"sign-in-watch-{conv_id}"
+        )
+        _sign_in_watchers[conv_id] = task
+        task.add_done_callback(_background_tasks.discard)
+        _background_tasks.add(task)
+
+    async def _watch_sign_in_completion(conv_id: str) -> None:
+        """
+        Post one "Signed in to Databricks" notice once the agent behind a sign-in card is ready.
+
+        A turn failed because the session's launcher was parked on a sign-in
+        prompt. This reads the session's running panes until no prompt is on
+        screen and the agent can take a message, then posts the notice. It ends
+        silently when no pane is running any more: the launcher exited, which
+        the next send reports on its own.
+
+        :param conv_id: Session whose turn failed with ``databricks_sign_in_pending``.
+        """
+        from omnigent.harnesses.diagnostics import detect_sign_in_prompt
+
+        harness = _session_harness_name(conv_id)
+        pane_names = _native_pane_names(conv_id)
+        while True:
+            await asyncio.sleep(_SIGN_IN_WATCH_INTERVAL_S)
+            registry = resource_registry.terminal_registry
+            entries = registry.list_for_conversation(conv_id) if registry is not None else []
+            screens: list[str] = []
+            for entry in entries:
+                if entry.terminal_name not in pane_names or not entry.instance.running:
+                    continue
+                result = await entry.instance.read(join_wrapped=True)
+                screen = result.get("screen") if isinstance(result, dict) else None
+                screens.append(screen if isinstance(screen, str) else "")
+            if not screens:
+                return
+            if any(detect_sign_in_prompt(screen) is not None for screen in screens):
+                continue
+            if _sign_in_agent_ready(conv_id, harness, screens):
+                await _post_sign_in_completed_notice(conv_id, harness)
+                return
+
+    def _sign_in_agent_ready(conv_id: str, harness: str | None, screens: list[str]) -> bool:
+        """Return whether the agent can take a message now that no sign-in prompt is on screen."""
+        if harness == "codex-native":
+            from omnigent.harnesses.codex_native.bridge import (
+                bridge_dir_for_bridge_id,
+                read_bridge_state,
+            )
+
+            # Thread discovery publishes the bridge state the moment the TUI starts a thread.
+            return read_bridge_state(bridge_dir_for_bridge_id(conv_id)) is not None
+        if harness == "claude-native":
+            from omnigent.harnesses.claude_native.bridge import _claude_prompt_rendered
+
+            return any(_claude_prompt_rendered(screen) for screen in screens)
+        return True
+
+    async def _post_sign_in_completed_notice(conv_id: str, harness: str | None) -> None:
+        """Append the neutral "Signed in to Databricks" notice to the session transcript."""
+        agent = {"codex-native": "Codex", "claude-native": "Claude Code"}.get(
+            harness or "", "The agent"
+        )
+        try:
+            resp = await server_client.post(
+                f"/v1/sessions/{conv_id}/events",
+                json={
+                    "type": "external_conversation_item",
+                    "data": {
+                        "item_type": "error",
+                        "item_data": {
+                            "source": "harness",
+                            "code": "databricks_sign_in_completed",
+                            "title": "Signed in to Databricks",
+                            "message": f"{agent} is ready. Send your message again.",
+                            "level": "info",
+                        },
+                    },
+                },
+                timeout=10.0,
+            )
+            resp.raise_for_status()
+        except (httpx.HTTPError, RuntimeError):
+            _logger.warning(
+                "Failed to post the sign-in completed notice for %s", conv_id, exc_info=True
+            )
+            return
+        _logger.info(
+            "Databricks sign-in completed for %s; %s is ready",
+            conv_id,
+            agent,
+            extra={"session_id": conv_id},
+        )
+
     async def _persist_cancellation_items(
         conv_id: str,
         items: list[_JsonObject],
@@ -5722,6 +5871,7 @@ def create_runner_app(
         error: Mapping[str, object] | None = None,
         *,
         source_error: Mapping[str, object] | None = None,
+        response_id: str | None = None,
     ) -> None:
         if status == "waiting" and not (
             _server_version is not None and _version_supports_waiting_status(_server_version)
@@ -5744,6 +5894,11 @@ def create_runner_app(
         event: _JsonObject = {"type": "session.status", "status": status}
         if error is not None:
             event["error"] = error
+        if response_id is not None:
+            # Name the turn this edge closes. The web UI already rendered the
+            # response's own terminal error; the id lets it recognise this edge
+            # as the same failure instead of adding a second card.
+            event["response_id"] = response_id
         if status == "failed":
             source = source_error if source_error is not None else (error or {})
             dimensions: dict[str, str] = {}
@@ -7589,10 +7744,17 @@ def create_runner_app(
             if not has_buffered and not _suppress_status:
                 _publish_turn_status(conv_id, "idle")
         elif error is not None:
+            normalized_error = _normalize_turn_error(error)
             if not _suppress_status:
                 _publish_turn_status(
-                    conv_id, "failed", error=_normalize_turn_error(error), source_error=error
+                    conv_id,
+                    "failed",
+                    error=normalized_error,
+                    source_error=error,
+                    response_id=owner_response_id,
                 )
+            if normalized_error.get("code") == "databricks_sign_in_pending":
+                _start_sign_in_watch(conv_id)
         else:
             if not has_buffered and not _suppress_status:
                 children = _subagent_work_by_parent.get(conv_id, set())
@@ -8744,6 +8906,11 @@ def create_runner_app(
         _model_override = msg_body.get("model_override")
         if isinstance(_model_override, str) and _model_override:
             harness_body["model_override"] = _model_override
+        # The web's stable id for this message: stamped on the turn's failure
+        # so the server can settle exactly this queued entry, not the oldest.
+        _stable_id = msg_body.get("stable_id")
+        if isinstance(_stable_id, str) and _stable_id:
+            harness_body["input_stable_id"] = _stable_id
             _logger.info(
                 "_run_turn_bg: conv=%s received model_override=%s (forwarding to harness)",
                 conv,
@@ -9764,6 +9931,10 @@ def create_runner_app(
                             if event is None:
                                 yield raw_sse_bytes
                                 continue
+                            if event.get("type") == "response.failed":
+                                _input_stable_id = body.get("input_stable_id")
+                                if isinstance(_input_stable_id, str):
+                                    event["input_stable_id"] = _input_stable_id
                             if not _defer_publish and event.get("type") != "response.created":
                                 _publish_event(conv_id, event)
                             if dispatch is not None and event.get(_RUNNER_DISPATCHED_FIELD):
@@ -11111,6 +11282,49 @@ def create_runner_app(
             status_code=200,
             content=session_resource_view_to_dict(resource),
         )
+
+    @app.get("/v1/sessions/{session_id}/sign-in-link")
+    async def get_session_sign_in_link(session_id: str) -> JSONResponse:
+        """
+        Return the sign-in prompt a session's terminal is showing right now, if any.
+
+        A launcher wrapper can park a native pane on a device-style sign-in
+        (an address to open, often with a code) before the agent runs. The
+        address is bound to that launcher process, so a link saved in an
+        earlier error card goes stale once the process moves on. The web asks
+        here at click time and opens whatever the pane shows now.
+
+        :param session_id: Session/conversation id.
+        Only the native agent's own pane is read (see ``_native_pane_names``):
+        another terminal in the session must not supply the address.
+
+        :returns: ``{"pending": true, "url", "code", "terminal_id"}`` when the
+            running agent pane shows a prompt; ``{"pending": false}`` otherwise.
+        """
+        from omnigent.harnesses.diagnostics import detect_sign_in_prompt
+
+        registry = resource_registry.terminal_registry
+        entries = registry.list_for_conversation(session_id) if registry is not None else []
+        pane_names = _native_pane_names(session_id)
+        for entry in entries:
+            if entry.terminal_name not in pane_names or not entry.instance.running:
+                continue
+            # Wrapped rows joined: the address is far wider than the pane.
+            result = await entry.instance.read(join_wrapped=True)
+            screen = result.get("screen") if isinstance(result, dict) else None
+            prompt = detect_sign_in_prompt(screen if isinstance(screen, str) else None)
+            if prompt is None:
+                continue
+            return JSONResponse(
+                status_code=200,
+                content={
+                    "pending": True,
+                    "url": prompt.url,
+                    "code": prompt.code,
+                    "terminal_id": terminal_resource_id(entry.terminal_name, entry.session_key),
+                },
+            )
+        return JSONResponse(status_code=200, content={"pending": False, "url": None, "code": None})
 
     @app.post("/v1/sessions/{session_id}/resources/terminals/{terminal_id}/transfer")
     async def transfer_session_terminal(

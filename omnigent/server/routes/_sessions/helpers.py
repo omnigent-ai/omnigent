@@ -7745,6 +7745,11 @@ def _routing_decision_item_from_sse(
     )
 
 
+def _optional_error_text(value: object) -> str | None:
+    """Return *value* when it is a non-empty string, else ``None``."""
+    return value if isinstance(value, str) and value.strip() else None
+
+
 def _error_item_from_sse(
     event: dict[str, Any],
     response_id: str | None = None,
@@ -7807,6 +7812,12 @@ def _error_item_from_sse(
             source=source,
             code=raw_code,
             message=raw_message,
+            # A classified failure's headline and next step must survive a
+            # reload, or the card loses its sign-in link once it comes from
+            # history instead of the live stream.
+            title=_optional_error_text(raw_error.get("title")),
+            cause=_optional_error_text(raw_error.get("cause")),
+            remediation=_optional_error_text(raw_error.get("remediation")),
         ),
     )
 

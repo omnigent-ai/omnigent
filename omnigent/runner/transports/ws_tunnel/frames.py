@@ -72,6 +72,9 @@ class HelloFrame:
         direct-attach listener. Only meaningful alongside
         *direct_attach_port*; both travel together or not at all.
     :param capabilities: Optional build features; omitted by older runners.
+    :param connection_id: Runner-minted identifier for this connection
+        attempt, stamped on both ends' tunnel debug-log rows. ``None``
+        from runners that predate it.
     """
 
     runner_version: str
@@ -82,6 +85,7 @@ class HelloFrame:
     direct_attach_port: int | None = None
     direct_attach_token: str | None = None
     capabilities: list[str] = field(default_factory=list)
+    connection_id: str | None = None
 
 
 @dataclass
@@ -229,6 +233,8 @@ def encode_frame(frame: Frame) -> str:
         }
         if frame.capabilities:
             payload["capabilities"] = list(frame.capabilities)
+        if frame.connection_id:
+            payload["connection_id"] = frame.connection_id
         # Emitted only when the listener is actually up, so old servers
         # (which ignore unknown keys) and advert-less runners share one
         # wire shape.
@@ -424,6 +430,7 @@ def _decode_hello(msg: _JsonObject) -> HelloFrame:
         direct_attach_port=direct_port,
         direct_attach_token=direct_token,
         capabilities=_optional_str_list(msg, "capabilities"),
+        connection_id=_optional_str(msg, "connection_id", "") or None,
     )
 
 

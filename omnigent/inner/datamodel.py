@@ -354,6 +354,7 @@ class ExecutorSpec:
         can forward it into the child :class:`ExecutorSpec` without
         re-reading raw YAML.
     :param context_files: Pi context-file discovery override. None uses Pi's default.
+    :param system_prompt_mode: Pi prompt delivery: append (default) or replace its base prompt.
     """
 
     model: str | None = None
@@ -361,6 +362,7 @@ class ExecutorSpec:
     profile: str | None = None
     auth: object | None = None  # ApiKeyAuth | DatabricksAuth | None
     context_files: bool | None = None
+    system_prompt_mode: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -938,6 +940,7 @@ class AgentDef:
     # translated to an AgentSpec.
     agent_session_sharing: str = "none"
     os_env: OSEnvSpec | None = None
+    model_egress: list[str] | None = None
     terminals: dict[str, TerminalEnvSpec] = field(default_factory=dict)
     skills: SkillRegistry = field(default_factory=dict)
     # Materialized agent-bundle root on disk, when known. Used by

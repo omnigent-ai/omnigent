@@ -3,7 +3,7 @@
 
 import type { ImportContext } from "./ImportContextModal";
 
-const SKILL_NAMES = [
+const CLAUDE_SKILLS = [
   "create-kafka-topic",
   "create-system",
   "dashboard-analyzer",
@@ -15,6 +15,7 @@ const SKILL_NAMES = [
   "deploy-omnigent-databricks",
   "dev-productivity-survey",
 ];
+const CODEX_SKILLS = ["code-review", "fix-lint", "ship"];
 
 export const MOCK_IMPORT_CONTEXT: ImportContext = {
   credentials: [
@@ -45,9 +46,13 @@ export const MOCK_IMPORT_CONTEXT: ImportContext = {
       toolCount: 36,
     },
   ],
-  skills: SKILL_NAMES.map((name) => ({
-    id: `claude:${name}`,
-    name,
-    harness: "claude" as const,
-  })),
+  skills: [
+    ...CLAUDE_SKILLS.map((name) => ({ id: `claude:${name}`, name, harness: "claude" as const })),
+    ...CODEX_SKILLS.map((name) => ({ id: `codex:${name}`, name, harness: "codex" as const })),
+  ],
+  plugins: [
+    { id: "claude:frontend-toolkit", name: "frontend-toolkit", harness: "claude", skillCount: 12 },
+    { id: "claude:dev-productivity", name: "dev-productivity", harness: "claude", skillCount: 8 },
+    { id: "cursor:figma", name: "figma", harness: "cursor", skillCount: 1 },
+  ],
 };

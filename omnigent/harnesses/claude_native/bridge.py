@@ -1,4 +1,9 @@
-"""Bridge utilities for the native Claude Code wrapper.
+"""Claude terminal utilities and the shared native-harness MCP relay.
+
+The ``serve-mcp`` entrypoint and tool relay also serve Codex, Antigravity,
+OpenCode, Cursor, Hermes, Kiro, Qwen and ACP clients. The historical module
+path remains stable; shared result conversion lives in
+``omnigent.runtime.mcp_tool_result``.
 
 The native wrapper has two live processes that need to rendezvous:
 
@@ -64,6 +69,7 @@ from filelock import Timeout as FileLockTimeout
 from omnigent._platform import IS_WINDOWS, is_wsl, stable_user_id
 from omnigent.harnesses.claude_native.message_display_hook import MESSAGE_DELTAS_FILE
 from omnigent.harnesses.claude_native.status import CONTEXT_RAW_FILE
+from omnigent.harnesses.diagnostics import detect_sign_in_prompt, sign_in_next_step
 from omnigent.harnesses.kiro_native.bridge import bridge_root as kiro_bridge_root
 from omnigent.models.claude_model_vocabulary import MODEL_VOCABULARY_ENV_VARS
 from omnigent.models.model_metadata import concrete_reported_model
@@ -563,6 +569,30 @@ class ClaudeTerminalDialog(RuntimeError):
     the dialog is answerable from the embedded terminal, so delivery handlers
     must report it without reaping the pane.
     """
+
+
+class ClaudeSignInPending(RuntimeError):
+    """
+    Claude Code's terminal is parked on a launcher sign-in prompt.
+
+    A wrapper in front of the ``claude`` binary printed an address to open
+    (often with a device code) and is waiting for the person to sign in.
+    Like :class:`ClaudeTerminalDialog` this is deliberately not a
+    :class:`ClaudePromptTimeout`: the pane is alive and the sign-in is
+    finished from the card's link, so delivery handlers must not reap it.
+
+    :param message: Human-readable failure text.
+    :param title: Card headline, e.g.
+        ``"Claude Code can't start until you sign in to Databricks"``.
+    :param remediation: The link (and code) to open, phrased as the next step.
+    """
+
+    code = "databricks_sign_in_pending"
+
+    def __init__(self, message: str, *, title: str, remediation: str) -> None:
+        super().__init__(message)
+        self.title = title
+        self.remediation = remediation
 
 
 class ClaudeInjectionCancelled(RuntimeError):
@@ -5111,7 +5141,7 @@ def _run_tmux(socket_path: str, *args: str) -> None:
         raise RuntimeError(f"tmux command failed (rc={proc.returncode}): {detail}")
 
 
-def _capture_pane(socket_path: str, tmux_target: str) -> str:
+def _capture_pane(socket_path: str, tmux_target: str, *, join_wrapped: bool = False) -> str:
     """
     Capture the current visible contents of a tmux pane.
 
@@ -5122,14 +5152,20 @@ def _capture_pane(socket_path: str, tmux_target: str) -> str:
     :param socket_path: Absolute path to the tmux socket, e.g.
         ``"/tmp/.../tmux.sock"``.
     :param tmux_target: tmux pane target string, e.g. ``"main"``.
+    :param join_wrapped: Join rows the pane wrapped at its width back into one
+        line (``capture-pane -J``), so an address wider than the pane reads
+        back whole.
     :returns: The pane's visible text, or ``""`` if capture failed.
     """
     import subprocess
 
     _check_injection_cancelled()
+    args = ["tmux", "-S", socket_path, "capture-pane", "-t", tmux_target, "-p"]
+    if join_wrapped:
+        args.append("-J")
     try:
         proc = subprocess.run(
-            ["tmux", "-S", socket_path, "capture-pane", "-t", tmux_target, "-p"],
+            args,
             check=False,
             capture_output=True,
             text=True,
@@ -5809,6 +5845,10 @@ def _wait_for_claude_prompt_ready(
         consecutive polls. Raised within a poll interval instead of waiting
         out the budget, so the person can answer the dialog in the embedded
         terminal and resend; the pane is left alive.
+    :raises ClaudeSignInPending: If a launcher sign-in prompt (an address to
+        open, often with a device code) holds the pane on two consecutive
+        polls. Raised within a poll interval with the link attached, so the
+        card can offer it; the pane is left alive for the sign-in to finish.
     :raises ClaudePromptTimeout: If the prompt never renders in time
         (Claude failed to boot, or a slow boot outlasted even the hard
         cap). The message carries the seconds actually waited, a poll
@@ -5833,6 +5873,7 @@ def _wait_for_claude_prompt_ready(
     exited_status: str | None = None
     pane_exited = False
     dialog_headline: str | None = None
+    sign_in_url: str | None = None
     # Poll at least once even at timeout_s=0: a single readiness check is
     # still meaningful, and it guarantees a capture to attach on failure.
     while True:
@@ -5864,6 +5905,24 @@ def _wait_for_claude_prompt_ready(
                 "prompt, then resend your message." + _format_terminal_failure_tail(pane)
             )
         dialog_headline = headline
+        # A launcher sign-in prompt printed before Claude Code runs: an address
+        # to open, often with a device code. Real when the same address shows
+        # on two consecutive polls. Fail now with the link rather than wait out
+        # the budget and reap the pane the person needs to finish signing in.
+        # The joined capture keeps an address wider than the pane in one piece.
+        sign_in = (
+            detect_sign_in_prompt(_capture_pane(socket_path, tmux_target, join_wrapped=True))
+            if "http" in pane
+            else None
+        )
+        if sign_in is not None and sign_in.url == sign_in_url:
+            raise ClaudeSignInPending(
+                "Claude Code is waiting for a sign-in in this session's terminal, "
+                "so the message was not delivered.",
+                title="Claude Code can't start until you sign in to Databricks",
+                remediation=sign_in_next_step("Claude Code"),
+            )
+        sign_in_url = sign_in.url if sign_in is not None else None
         now = time.monotonic()
         if now >= hard_deadline:
             break
@@ -5978,7 +6037,7 @@ def start_tool_relay(
     file_change_observer: Callable[[_JsonObject], Awaitable[None]] | None = None,
 ) -> ClaudeNativeToolRelay:
     """
-    Start a relay for Omnigent tool calls from Claude.
+    Start the shared relay for native-harness Omnigent tool calls.
 
     Writes ``tool_relay.json`` and starts the HTTP server that backs it
     (see :func:`_start_bridge_http_server` for the bind/advertise rules).
@@ -6624,20 +6683,10 @@ async def _await_tool_result(result: Awaitable[object]) -> object:
 
 
 def _mcp_response_from_tool_result(result: object) -> _JsonObject:
-    """
-    Convert a harness tool result into MCP response shape.
+    """Convert relay results without loading the runtime on observer hook imports."""
+    from omnigent.runtime.mcp_tool_result import mcp_response_from_tool_result
 
-    :param result: Result returned by ``_tool_executor``. Existing
-        harnesses usually return a dict, e.g. ``{"result": "ok"}``.
-    :returns: MCP tool-call response.
-    """
-    payload = result if isinstance(result, dict) else {"result": result}
-    response: _JsonObject = {
-        "content": [{"type": "text", "text": json.dumps(payload)}],
-    }
-    if payload.get("blocked") is True or ("error" in payload and payload.get("error")):
-        response["isError"] = True
-    return response
+    return mcp_response_from_tool_result(result)
 
 
 def _notification_writer(
