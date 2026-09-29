@@ -26,6 +26,7 @@ from fastapi import (
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from starlette.types import Receive, Scope, Send
 
+from omnigent.debug_logging import debug_event
 from omnigent.entities import (
     Conversation,
     StoredFile,
@@ -162,6 +163,56 @@ def _attachment_upload_lock(session_id: str) -> asyncio.Lock:
         lock = asyncio.Lock()
         _attachment_upload_locks[session_id] = lock
     return lock
+
+
+def _log_session_file_not_found(
+    file_store: FileStore,
+    session_id: str,
+    file_id: str,
+) -> None:
+    """Emit one diagnostic WARNING for a session-scoped file 404.
+
+    Distinguishes a truly missing file from one that exists but belongs to
+    a different session, which is the suspected initial_items root cause.
+    The owning session id is included in the server log only; the HTTP
+    response stays an identical 404.
+
+    :param file_store: The file store to query for the unscoped lookup.
+    :param session_id: The session that made the request.
+    :param file_id: The file that was not found under that session.
+    """
+    try:
+        unscoped = file_store.get(file_id)
+    except Exception:
+        unscoped = None
+    if unscoped is None:
+        reason = "missing"
+        _logger.warning(
+            "session file not found: file_id=%s session_id=%s",
+            file_id,
+            session_id,
+            extra=debug_event(
+                "session_file_not_found",
+                file_id=file_id,
+                session_id=session_id,
+                reason=reason,
+            ),
+        )
+    else:
+        reason = "owned_by_other_session"
+        _logger.warning(
+            "session file not found: file_id=%s session_id=%s owning_session_id=%s",
+            file_id,
+            session_id,
+            unscoped.session_id,
+            extra=debug_event(
+                "session_file_not_found",
+                file_id=file_id,
+                session_id=session_id,
+                reason=reason,
+                owning_session_id=unscoped.session_id,
+            ),
+        )
 
 
 def register_resources_routes(
@@ -1814,6 +1865,7 @@ def register_resources_routes(
             )
         stored = file_store.get(file_id, session_id=session_id)
         if stored is None:
+            _log_session_file_not_found(file_store, session_id, file_id)
             raise OmnigentError(
                 "File not found",
                 code=ErrorCode.NOT_FOUND,
@@ -1845,6 +1897,7 @@ def register_resources_routes(
             )
         stored = await asyncio.to_thread(file_store.get, file_id, session_id=session_id)
         if stored is None:
+            await asyncio.to_thread(_log_session_file_not_found, file_store, session_id, file_id)
             raise OmnigentError(
                 "File not found",
                 code=ErrorCode.NOT_FOUND,

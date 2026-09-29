@@ -1451,11 +1451,17 @@ def _response_failed_event(
     return f"event: response.failed\ndata: {payload}\n\n".encode()
 
 
+# Deduplicates file-fetch failure warnings per (session_id, file_id) so
+# repeated history re-resolution does not flood logs. Evicted on session delete.
+_logged_file_fetch_failures: dict[str, set[str]] = {}
+
+
 async def _resolve_forwarded_message_content(
     content: list[_JsonObject],
     *,
     session_id: str,
     server_client: httpx.AsyncClient,
+    from_history: bool = False,
 ) -> list[_JsonObject]:
     """Resolve server-uploaded ``file_id`` blocks inside the runner.
 
@@ -1464,6 +1470,12 @@ async def _resolve_forwarded_message_content(
     runner. The runner can still fetch bytes through the session-scoped
     file resource endpoint and inline them before handing content to a
     harness. Blocks already resolved by the server pass through.
+
+    :param content: Message content blocks to resolve.
+    :param session_id: Owning session id, used to build the fetch URL.
+    :param server_client: HTTP client pointed at the Omnigent server.
+    :param from_history: True when resolving reloaded history items
+        (blocks may recur every turn); False for the current event.
     """
     if not any(isinstance(block, dict) and has_unresolved_file_id(block) for block in content):
         return content
@@ -1477,6 +1489,23 @@ async def _resolve_forwarded_message_content(
                 block, session_id=session_id, client=server_client
             )
         if result is None:
+            if isinstance(block, dict) and has_unresolved_file_id(block):
+                file_id = str(block.get("file_id", ""))
+                _seen = _logged_file_fetch_failures.setdefault(session_id, set())
+                if file_id not in _seen:
+                    _seen.add(file_id)
+                    _logger.warning(
+                        "file_id fetch failed in runner: file_id=%s session_id=%s",
+                        file_id,
+                        session_id,
+                        extra=debug_event(
+                            "runner_file_id_fetch_failed",
+                            session_id=session_id,
+                            file_id=file_id,
+                            block_type=block.get("type"),
+                            from_history=from_history,
+                        ),
+                    )
             resolved.append(block)
         else:
             new_block, notice = result
@@ -5114,6 +5143,7 @@ def create_runner_app(
         _hermes_terminal_ensure_locks.pop(session_id, None)
         _repl_terminal_ensure_locks.pop(session_id, None)
         _interrupted_sessions.discard(session_id)
+        _logged_file_fetch_failures.pop(session_id, None)
         await _cancel_auto_forwarder_task(session_id)
         # Close any OpenCode server that no forwarder adopted.
         await _native_runtime.teardown_opencode_native_server(session_id)
@@ -5303,6 +5333,7 @@ def create_runner_app(
                     content,
                     session_id=session_id,
                     server_client=server_client,
+                    from_history=True,
                 )
         return converted
 

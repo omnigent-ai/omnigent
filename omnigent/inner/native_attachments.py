@@ -226,10 +226,14 @@ def _decode_attachment_block(block: Mapping[str, object]) -> tuple[bytes, str] |
     data_uri = block.get("image_url") or block.get("file_data")
     if not isinstance(data_uri, str) or not data_uri.startswith("data:"):
         if block.get("file_id"):
+            _filename = block.get("filename")
+            _extra = f" filename={_filename!r}" if isinstance(_filename, str) and _filename else ""
             _logger.error(
-                "Native executor received unresolved file_id %s — "
-                "content resolver may not have run",
+                "Native executor received unresolved file_id %s"
+                " block_type=%s%s — content resolver may not have run",
                 block["file_id"],
+                block.get("type"),
+                _extra,
             )
         return None
 

@@ -2110,6 +2110,122 @@ async def test_get_session_file_validates_ownership(
 
 
 @pytest.mark.asyncio
+async def test_get_session_file_404_logs_owned_by_other_session(
+    file_client: httpx.AsyncClient,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """GET metadata 404 for wrong session logs owned_by_other_session; response unchanged.
+
+    Distinguishes a cross-session file_id from a truly missing one so the
+    initial_items root-cause hypothesis can be confirmed in production.
+    """
+    upload = await file_client.post(
+        "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/files",
+        files={"file": ("owned.txt", b"data", "text/plain")},
+    )
+    file_id = upload.json()["id"]
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.server.routes.sessions"):
+        resp = await file_client.get(
+            f"/v1/sessions/5d29bee4350489d66feafecfebd94a97/resources/files/{file_id}",
+        )
+
+    assert resp.status_code == 404
+    # Response body must not expose ownership information.
+    body = resp.json()
+    assert "owned" not in str(body).lower()
+    assert "79b22ebd2309e48fdeb450c65611d51b" not in str(body)
+    records = [
+        r for r in caplog.records if getattr(r, "event_name", None) == "session_file_not_found"
+    ]
+    assert len(records) == 1
+    assert records[0].levelno == logging.WARNING
+    attrs = getattr(records[0], "attributes", {})
+    assert attrs.get("reason") == "owned_by_other_session"
+    assert attrs.get("file_id") == file_id
+    assert getattr(records[0], "session_id", None) == "5d29bee4350489d66feafecfebd94a97"
+
+
+@pytest.mark.asyncio
+async def test_get_session_file_404_logs_missing(
+    file_client: httpx.AsyncClient,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """GET metadata 404 for a nonexistent file_id logs reason=missing."""
+    absent_id = "deadbeefdeadbeefdeadbeefdeadbeef"
+    with caplog.at_level(logging.WARNING, logger="omnigent.server.routes.sessions"):
+        resp = await file_client.get(
+            f"/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/files/{absent_id}",
+        )
+
+    assert resp.status_code == 404
+    records = [
+        r for r in caplog.records if getattr(r, "event_name", None) == "session_file_not_found"
+    ]
+    assert len(records) == 1
+    assert records[0].levelno == logging.WARNING
+    attrs = getattr(records[0], "attributes", {})
+    assert attrs.get("reason") == "missing"
+    assert attrs.get("file_id") == absent_id
+    assert "owning_session_id" not in attrs
+
+
+@pytest.mark.asyncio
+async def test_get_session_file_content_404_logs_owned_by_other_session(
+    file_client: httpx.AsyncClient,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """GET content 404 for wrong session logs owned_by_other_session; response unchanged."""
+    upload = await file_client.post(
+        "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/files",
+        files={"file": ("owned.txt", b"bytes", "text/plain")},
+    )
+    file_id = upload.json()["id"]
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.server.routes.sessions"):
+        resp = await file_client.get(
+            f"/v1/sessions/5d29bee4350489d66feafecfebd94a97/resources/files/{file_id}/content",
+        )
+
+    assert resp.status_code == 404
+    body = resp.json()
+    assert "owned" not in str(body).lower()
+    assert "79b22ebd2309e48fdeb450c65611d51b" not in str(body)
+    records = [
+        r for r in caplog.records if getattr(r, "event_name", None) == "session_file_not_found"
+    ]
+    assert len(records) == 1
+    assert records[0].levelno == logging.WARNING
+    attrs = getattr(records[0], "attributes", {})
+    assert attrs.get("reason") == "owned_by_other_session"
+    assert attrs.get("file_id") == file_id
+
+
+@pytest.mark.asyncio
+async def test_get_session_file_content_404_logs_missing(
+    file_client: httpx.AsyncClient,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """GET content 404 for a nonexistent file_id logs reason=missing."""
+    absent_id = "cafebabecafebabecafebabecafebabe"
+    with caplog.at_level(logging.WARNING, logger="omnigent.server.routes.sessions"):
+        resp = await file_client.get(
+            f"/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/files/{absent_id}/content",
+        )
+
+    assert resp.status_code == 404
+    records = [
+        r for r in caplog.records if getattr(r, "event_name", None) == "session_file_not_found"
+    ]
+    assert len(records) == 1
+    assert records[0].levelno == logging.WARNING
+    attrs = getattr(records[0], "attributes", {})
+    assert attrs.get("reason") == "missing"
+    assert attrs.get("file_id") == absent_id
+    assert "owning_session_id" not in attrs
+
+
+@pytest.mark.asyncio
 async def test_download_session_file_content(
     file_client: httpx.AsyncClient,
 ) -> None:
