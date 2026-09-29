@@ -15,6 +15,7 @@ import {
   bubbleKey,
   buildPendingBubbles,
   computeIsWorking,
+  computeIsTurnActive,
   mergePendingBubbles,
   reorderCommittedRequestElicitations,
   shouldShowWorkingIndicator,
@@ -215,7 +216,7 @@ export function SideChatPane({
 
   const lastAssistantIndex = liveCandidateAssistantIndex(bubbles);
   const showsWorking =
-    !readOnly && (starting || computeIsWorking(sessionStatus) || state.status === "streaming");
+    !readOnly && (starting || computeIsTurnActive(sessionStatus, state.status === "streaming"));
 
   // Keep the newest content in view. A side chat is short and non-virtualized,
   // so a bottom sentinel scrolled on each change is enough.
@@ -233,6 +234,7 @@ export function SideChatPane({
     try {
       await onStart(text);
     } catch {
+      // Re-enable the composer while preserving the draft for retry.
       setStarting(false);
     }
   };
@@ -369,8 +371,7 @@ function SideChatComposer({
     const trimmed = text.trim();
     if (pending) {
       if (trimmed.length === 0 || starting || !onStart) return;
-      // Keep the text: on success the tab closes (this unmounts); on failure
-      // re-enable so the user can retry without re-typing.
+      // Keep the text so a failed fork can be retried without re-typing.
       void onStart(trimmed);
       return;
     }

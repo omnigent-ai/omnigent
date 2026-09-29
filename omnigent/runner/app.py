@@ -10137,24 +10137,28 @@ def create_runner_app(
             from omnigent.harnesses.codex_native.app_server import client_for_transport
 
             _side_turn_id = body.get("codex_side_turn_id")
-            if body_type == "interrupt" and (
-                not isinstance(_side_turn_id, str) or not _side_turn_id
-            ):
-                return JSONResponse(
-                    status_code=400,
-                    content={"error": "invalid_request", "detail": "Missing side-chat turn id."},
+            _side_text = ""
+            if body_type == "interrupt":
+                if not isinstance(_side_turn_id, str) or not _side_turn_id:
+                    return JSONResponse(
+                        status_code=400,
+                        content={
+                            "error": "invalid_request",
+                            "detail": "Missing side-chat turn id.",
+                        },
+                    )
+            else:
+                _side_text = _side_chat_text_from_content(
+                    body.get("content") if isinstance(body, dict) else None
                 )
-            _side_text = _side_chat_text_from_content(
-                body.get("content") if isinstance(body, dict) else None
-            )
-            if body_type != "interrupt" and not _side_text:
-                return JSONResponse(
-                    status_code=400,
-                    content={
-                        "error": "invalid_request",
-                        "detail": "side chat message had no text",
-                    },
-                )
+                if not _side_text:
+                    return JSONResponse(
+                        status_code=400,
+                        content={
+                            "error": "invalid_request",
+                            "detail": "side chat message had no text",
+                        },
+                    )
             _side_state = await _codex_native_bridge_state_for_session(
                 conversation_id, action="side chat turn"
             )

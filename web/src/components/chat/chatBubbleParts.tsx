@@ -395,10 +395,14 @@ export function isBackgroundTasksOnly(
  * Whether the agent's own turn is in progress — server `running`/`waiting`, or
  * a local send in flight.
  */
+export function computeIsTurnActive(sessionStatus: SessionStatus, localSending: boolean): boolean {
+  return computeIsWorking(sessionStatus) || localSending;
+}
+
 function useAgentTurnActive(): boolean {
   const sessionStatus = useChatStore((s) => s.sessionStatus);
   const localSending = useChatStore((s) => s.status === "streaming");
-  return computeIsWorking(sessionStatus) || localSending;
+  return computeIsTurnActive(sessionStatus, localSending);
 }
 
 /**
@@ -427,7 +431,7 @@ export function WorkingIndicator() {
   const bgCount = scopedConversationId ? scopedState.backgroundTaskCount : rootBgCount;
   const blockedOn = scopedConversationId ? scopedState.blockedOn : rootBlockedOn;
   const agentWorking = scopedConversationId
-    ? computeIsWorking(scopedState.sessionStatus) || scopedState.status === "streaming"
+    ? computeIsTurnActive(scopedState.sessionStatus, scopedState.status === "streaming")
     : rootAgentWorking;
   const tick = useWorkingLabelTick();
   // Once the turn ends but background shells outlive it, BackgroundTaskPill owns

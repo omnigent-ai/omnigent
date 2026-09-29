@@ -1156,6 +1156,7 @@ def register_events_routes(
             codex_child = conv.kind == "sub_agent" and _is_codex_native_subagent(conv)
             response_id = None
             if codex_child:
+                # Native child boundaries come from the Codex forwarder.
                 child_thread_id = (conv.labels or {}).get(
                     _CODEX_NATIVE_SUBAGENT_THREAD_ID_LABEL_KEY
                 )
@@ -1188,7 +1189,7 @@ def register_events_routes(
                 )
             else:
                 _publish_interrupted(session_id)
-                # Native child boundaries come from the Codex forwarder.
+                # Fence the cancelled turn (see _interrupt_fenced_sessions).
                 _interrupt_fenced_sessions.add(session_id)
             runner_client = await _get_runner_client(
                 target_session_id,
@@ -1210,14 +1211,14 @@ def register_events_routes(
                         session_id,
                     )
             if not interrupt_delivered:
-                # The turn keeps running and nothing else lifts the fence —
-                # remove it so the turn's remaining output isn't dropped.
-                _interrupt_fenced_sessions.discard(session_id)
                 if codex_child:
                     raise OmnigentError(
                         "Couldn't interrupt the side chat. Please try again.",
                         code=ErrorCode.RUNNER_UNAVAILABLE,
                     )
+                # The turn keeps running and nothing else lifts the fence —
+                # remove it so the turn's remaining output isn't dropped.
+                _interrupt_fenced_sessions.discard(session_id)
             return {"queued": False}
         if body.type == _STOP_SESSION_TYPE:
             # Terminating the whole session (not just the current turn)
