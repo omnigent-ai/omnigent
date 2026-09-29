@@ -158,7 +158,6 @@ import {
   DARK_MODE_PREVIEW,
   ExtraKeysPreview,
   LIGHT_MODE_PREVIEW,
-  ModePreview,
   PaletteChip,
   PaletteSwatchPreview,
 } from "@/components/theme/AppearancePreviews";
@@ -1459,10 +1458,6 @@ function AppearanceSection() {
             </div>
           </SettingsGroup>
 
-          <SettingsGroup title="Terminal" testId="settings-group-terminal">
-            <TerminalExtraKeysControl />
-          </SettingsGroup>
-
           <SettingsGroup title="Interface typography" testId="settings-group-interface-type">
             <UiFontSizeControl />
             <div className="mt-4 border-t border-border pt-4">
@@ -1478,6 +1473,10 @@ function AppearanceSection() {
             <div className="mt-4 border-t border-border pt-4">
               <UiCodeFontWeightControl />
             </div>
+          </SettingsGroup>
+
+          <SettingsGroup title="Touch & mobile" testId="settings-group-touch">
+            <TerminalExtraKeysControl />
           </SettingsGroup>
         </div>
 
