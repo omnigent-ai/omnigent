@@ -40,11 +40,13 @@ from __future__ import annotations
 import contextvars
 import logging
 import time
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from typing import TYPE_CHECKING
 
 from omnigent.db.enum_codecs import SESSION_LIVE_STATUS
 from omnigent.db.workspace_cache import WorkspaceScopedCache
+from omnigent.debug_logging import debug_event
 
 if TYPE_CHECKING:
     from omnigent.stores import ConversationStore
@@ -110,7 +112,13 @@ def conversation_store() -> ConversationStore | None:
     return _store
 
 
-def submit(description: str, fn, *args, on_failure=None) -> None:  # type: ignore[no-untyped-def]
+def submit(  # type: ignore[no-untyped-def]
+    description: str,
+    fn,
+    *args,
+    on_failure=None,
+    failure_extra: Callable[[str], dict[str, object]] | None = None,
+) -> None:
     """
     Run one store-backed task on the ordered background worker.
 
@@ -131,6 +139,8 @@ def submit(description: str, fn, *args, on_failure=None) -> None:  # type: ignor
         thread) when the write raises. Used to evict a dedupe entry so a
         dropped write's value can be re-attempted by the next identical
         publish instead of being swallowed.
+    :param failure_extra: Optional builder of the failure warning's
+        ``extra=`` payload (a ``debug_event``), given the exception type name.
     """
     global _executor
     if _executor is None:
@@ -141,8 +151,16 @@ def submit(description: str, fn, *args, on_failure=None) -> None:  # type: ignor
     def _run() -> None:
         try:
             fn(*args)
-        except Exception:  # noqa: BLE001 — best-effort display state
-            _logger.warning("session live-state write failed (%s)", description, exc_info=True)
+        except Exception as exc:  # noqa: BLE001 — best-effort display state
+            extra = None
+            if failure_extra is not None:
+                try:
+                    extra = failure_extra(type(exc).__name__)
+                except Exception:  # noqa: BLE001 — diagnostics must not skip eviction
+                    extra = None
+            _logger.warning(
+                "session live-state write failed (%s)", description, exc_info=True, extra=extra
+            )
             if on_failure is not None:
                 on_failure()
 
@@ -189,7 +207,19 @@ def persist_live_status(session_id: str, status: str) -> None:
         if _last_status.get(session_id) == status:
             _last_status.pop(session_id, None)
 
-    submit("live_status", _store.set_session_live_status, session_id, status, on_failure=_evict)
+    submit(
+        "live_status",
+        _store.set_session_live_status,
+        session_id,
+        status,
+        on_failure=_evict,
+        failure_extra=lambda error_type: debug_event(
+            "live_status_persist_failed",
+            session_id=session_id,
+            live_status=status,
+            error_type=error_type,
+        ),
+    )
 
 
 def forget_live_status(session_id: str) -> None:

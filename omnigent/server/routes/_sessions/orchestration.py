@@ -3516,8 +3516,25 @@ async def _mark_runner_sessions_offline_impl(
         # Cache first (this replica holds the runner's tunnel, so it saw the
         # turn edges), falling back to the row for a session whose live state
         # was published before a restart.
-        live = _session_status_cache.get(conv.id, conv.live_status)
+        cached_status = _session_status_cache.get(conv.id)
+        live = cached_status if cached_status is not None else conv.live_status
         interrupted = live in _MID_TURN_STATUSES
+        if interrupted:
+            status_source = "cache" if cached_status is not None else "row"
+            _logger.info(
+                "Runner offline sweep: failing session=%s (source=%s)",
+                conv.id,
+                status_source,
+                extra=debug_event(
+                    "runner_offline_sweep_session",
+                    session_id=conv.id,
+                    runner_id=getattr(conv, "runner_id", None),
+                    status_source=status_source,
+                    cached_session_status=cached_status,
+                    row_live_status=conv.live_status,
+                    **_runner_drop_entity_fields(conv),
+                ),
+            )
         dead_on_arrival = fail_idle_top_level and conv.kind != "sub_agent"
         if not interrupted and not dead_on_arrival:
             continue
@@ -7175,10 +7192,68 @@ async def _runner_drop_interrupted_turn(
             exc_info=True,
             extra={"session_id": session_id},
         )
+        _log_runner_drop_status_source(session_id, "row_unreadable", None, True)
         return True
     if conv is None:
+        _log_runner_drop_status_source(session_id, "row_missing", None, True)
         return True
-    return conv.live_status in _MID_TURN_STATUSES
+    interrupted = conv.live_status in _MID_TURN_STATUSES
+    _log_runner_drop_status_source(session_id, "row", conv, interrupted)
+    return interrupted
+
+
+def _runner_drop_entity_fields(conv: Conversation) -> dict[str, Any]:
+    """
+    Return the diagnostic fields a runner-drop log row takes from *conv*.
+
+    :param conv: Conversation row already read by the caller. Read
+        defensively: this is diagnostics and must never fail a drop decision.
+    :returns: Elicitation count, sub-agent flag and harness override.
+    """
+    return {
+        "pending_elicitation_count": getattr(conv, "pending_elicitation_count", None),
+        "is_sub_agent": getattr(conv, "parent_conversation_id", None) is not None,
+        "harness_override": getattr(conv, "harness_override", None),
+    }
+
+
+def _log_runner_drop_status_source(
+    session_id: str,
+    status_source: str,
+    conv: Conversation | None,
+    interrupted: bool,
+) -> None:
+    """
+    Log which source decided a cache-cold runner-drop verdict.
+
+    :param session_id: Session/conversation identifier.
+    :param status_source: ``"row"``, ``"row_missing"`` or ``"row_unreadable"``.
+    :param conv: The row read, or ``None`` when missing or unreadable.
+    :param interrupted: The verdict being returned.
+    """
+    last_seen = getattr(conv, "runner_last_seen", None)
+    age_s = (
+        max(0, int(time.time()) - last_seen)
+        if isinstance(last_seen, int) and not isinstance(last_seen, bool)
+        else None
+    )
+    fields = _runner_drop_entity_fields(conv) if conv is not None else {}
+    _logger.info(
+        "Relay: runner drop status for session=%s (source=%s, interrupted=%s)",
+        session_id,
+        status_source,
+        interrupted,
+        extra=debug_event(
+            "runner_drop_status_source",
+            session_id=session_id,
+            status_source=status_source,
+            row_live_status=getattr(conv, "live_status", None),
+            interrupted=interrupted,
+            runner_id=getattr(conv, "runner_id", None),
+            runner_last_seen_age_s=age_s,
+            **fields,
+        ),
+    )
 
 
 async def _relay_runner_live_elsewhere(
