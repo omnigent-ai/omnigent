@@ -3264,7 +3264,7 @@ def test_generated_claude_subprocesses_pin_runner_tmpdir(
         if "/venv/bin/python" in hook["command"]
     ]
     assert len(python_commands) == 18
-    expected_tmpdir = f"TMPDIR={shlex.quote(str(runner_tmpdir))}"
+    expected_tmpdir = f"env TMPDIR={shlex.quote(str(runner_tmpdir))}"
     assert all(expected_tmpdir in command for command in python_commands)
 
 
