@@ -18,16 +18,23 @@ on:
     # Security Gate via rerun-security-gate.yml, so label churn need not re-run
     # the heavy Playwright suite. (#399 added these for the gate; superseded.)
     types: [opened, synchronize, reopened, ready_for_review]
-    paths-ignore:
-      - 'CHANGELOG.md'
-      - 'docs/**'
-      - 'CONTRIBUTING.md'
-      - 'SECURITY.md'
-      - 'tests/scripts/**'
-      - 'tests/github/**'
-      - '.github/scripts/polly-review-*.py'
-      - '.github/workflows/polly-review*.yml'
-      - '.github/workflows/*.js'
+    paths:
+      - '**'
+      - '!**.md'
+      # Keep package metadata, agent instructions, and Markdown test inputs.
+      - 'README.md'
+      - 'AGENTS.md'
+      - 'CLAUDE.md'
+      - 'omnigent/**.md'
+      - 'examples/**.md'
+      - 'tests/**.md'
+      - 'dev/**.md'
+      - '!docs/**'
+      - '!tests/scripts/**'
+      - '!tests/github/**'
+      - '!.github/scripts/polly-review-*.py'
+      - '!.github/workflows/polly-review*.yml'
+      - '!.github/workflows/*.js'
   schedule:
     - cron: "0 9 * * *"
   workflow_dispatch:
