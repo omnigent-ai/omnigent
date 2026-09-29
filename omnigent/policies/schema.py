@@ -149,7 +149,6 @@ class UserDailyCostContext(TypedDict, total=False):
     ask_approved_usd: float
     user_id: str
     day_utc: str
-    harness: str | None
 
 
 class EventContext(TypedDict, total=False):
@@ -161,11 +160,11 @@ class EventContext(TypedDict, total=False):
         its descendants. Present when subagent cost enforcement is enabled.
     :param user_daily_cost: List of the session owner's daily cost records.
         Each record contains ``cost_usd``, ``ask_approved_usd``, ``day_utc``,
-        ``user_id``, and ``harness``. For daily budgets, this contains a single
-        record (today). For period budgets (week/month/quarter/year), this
-        contains all daily records in the period, which the policy aggregates
-        to compute the period total. Present only when a cost-budget policy
-        is configured; read via ``event["context"]["user_daily_cost"]``.
+        and ``user_id``. For daily budgets, this contains a single record
+        (today). For period budgets (week/month/quarter/year), this contains
+        all daily records in the period, which the policy aggregates to
+        compute the period total. Present only when a cost-budget policy is
+        configured; read via ``event["context"]["user_daily_cost"]``.
     :param model: The model the session is currently using —
         the conversation's ``model_override`` when set (e.g. via a
         mid-session ``/model`` change), else the agent spec's

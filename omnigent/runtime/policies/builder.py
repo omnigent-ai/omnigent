@@ -114,31 +114,68 @@ _SESSION_POLICY_SPECS_CACHE: WorkspaceScopedCache[str, list[PolicySpec]] = Works
 )
 
 
-def _needs_user_daily_cost(specs: list[PolicySpec]) -> bool:
+def _get_cost_policy_oldest_period(specs: list[PolicySpec]) -> str | None:
     """
-    Return whether any policy in *specs* is the per-user daily cost-budget.
+    Find the oldest period across all cost-budget policies.
 
-    Drives the conditional injection: only when this returns ``True``
-    does :func:`build_policy_engine` resolve the owner and read the
-    daily-cost rollup.
+    Scans for daily and period cost-budget policies, determines the start
+    date for each period, and returns the period string for the oldest one.
+    This allows fetching all daily cost records needed by all policies in
+    a single query.
 
     :param specs: The merged policy specs for the engine.
-    :returns: ``True`` when a :class:`FunctionPolicySpec` references the
-        ``user_daily_cost_budget`` factory OR the ``user_period_cost_budget``
-        factory with ``period="day"``.
+    :returns: The period string ("day", "week", "month", "quarter", "year")
+        for the oldest period, or None if no cost-budget policies are present.
     """
+    from datetime import datetime, timedelta, timezone
+
+    from omnigent.db.utils import now_epoch
+
+    # Collect all periods from cost-budget policies
+    periods: list[str] = []
+
     for s in specs:
         if not isinstance(s, FunctionPolicySpec) or s.function is None:
             continue
         # Legacy daily cost budget policy
         if s.function.path == _USER_DAILY_COST_POLICY_PATH:
-            return True
-        # Generic period policy with period="day"
-        if s.function.path == _USER_PERIOD_COST_POLICY_PATH:
+            periods.append("day")
+        # Generic period policy
+        elif s.function.path == _USER_PERIOD_COST_POLICY_PATH:
             args = s.function.arguments or {}
-            if args.get("period") == "day":
-                return True
-    return False
+            period = args.get("period")
+            if period:
+                periods.append(period)
+
+    if not periods:
+        return None
+
+    # Calculate start date for each period and find the oldest
+    now = now_epoch()
+    dt = datetime.fromtimestamp(now, tz=timezone.utc)
+
+    def period_start_date(period: str) -> datetime:
+        if period == "day":
+            return datetime.combine(dt.date(), datetime.min.time(), tzinfo=timezone.utc)
+        elif period == "week":
+            # ISO week starts on Monday
+            start = dt.date() - timedelta(days=dt.weekday())
+            return datetime.combine(start, datetime.min.time(), tzinfo=timezone.utc)
+        elif period == "month":
+            return datetime(dt.year, dt.month, 1, tzinfo=timezone.utc)
+        elif period == "quarter":
+            quarter = (dt.month - 1) // 3 + 1
+            start_month = (quarter - 1) * 3 + 1
+            return datetime(dt.year, start_month, 1, tzinfo=timezone.utc)
+        elif period == "year":
+            return datetime(dt.year, 1, 1, tzinfo=timezone.utc)
+        else:
+            # Unknown period, treat as day
+            return datetime.combine(dt.date(), datetime.min.time(), tzinfo=timezone.utc)
+
+    # Find the period with the oldest start date
+    oldest_period = min(periods, key=period_start_date)
+    return oldest_period
 
 
 def _needs_subtree_usage(specs: list[PolicySpec]) -> bool:
@@ -160,31 +197,6 @@ def _needs_subtree_usage(specs: list[PolicySpec]) -> bool:
     )
 
 
-def _get_period_cost_requirements(specs: list[PolicySpec]) -> list[str]:
-    """
-    Extract all period cost requirements from the policy specs.
-
-    Scans the specs for any user_period_cost_budget policies and returns a
-    list of periods for which the engine needs to load cost data.
-    NOTE: Currently only ONE period cost policy is supported per engine;
-    callers must validate ``len(result) <= 1`` or raise an error.
-
-    :param specs: The merged policy specs for the engine.
-    :returns: List of periods, e.g. ``["month"]`` or ``["week"]``. Empty
-        when no period cost policies are configured. Contains at most one
-        element in current implementation.
-    """
-    requirements: list[str] = []
-    for s in specs:
-        if not isinstance(s, FunctionPolicySpec) or s.function is None:
-            continue
-        # Generic period policy
-        if s.function.path == _USER_PERIOD_COST_POLICY_PATH:
-            args = s.function.arguments or {}
-            period = args.get("period")
-            if period and period != "day":  # day uses user_daily_cost
-                requirements.append(period)
-    return requirements
 
 
 def _normalize_usage_for_engine(usage: dict[str, float]) -> dict[str, float]:
@@ -785,34 +797,15 @@ def build_policy_engine(
             if conv is not None
             else {}
         )
-    # Conditional injection (#1): only pay the owner + daily-cost lookups
-    # when a per-user daily cost-budget policy is actually present.
-    initial_user_daily_cost = (
-        _load_user_daily_cost(conversation_id, conversation_store)
-        if _needs_user_daily_cost(all_policy_specs)
-        else None
-    )
-    # Conditional injection (#2): only pay the owner + period-cost lookups
-    # when a per-user period cost-budget policy is actually present.
-    # NOTE: Only ONE period policy is currently supported per engine. Multiple
-    # period policies would require seeding multiple context keys (e.g.,
-    # user_weekly_cost, user_monthly_cost) and updating each policy to read
-    # its specific context. For now, we validate this constraint.
-    period_requirements = _get_period_cost_requirements(all_policy_specs)
-    if len(period_requirements) > 1:
-        raise ValueError(
-            f"Multiple period cost policies are not yet supported. "
-            f"Found {len(period_requirements)} policies with periods: "
-            f"{period_requirements}. "
-            "Configure at most one period cost policy (day, week, month, quarter, or year)."
-        )
-    initial_user_period_cost = None
-    if period_requirements:
-        # Use only the first (and validated-to-be-only) period requirement.
-        # The validation above ensures len(period_requirements) <= 1.
-        period = period_requirements[0]
-        initial_user_period_cost = _load_user_period_cost(
-            conversation_id, conversation_store, period=period
+    # Conditional injection: only load daily cost records when cost-budget
+    # policies are present. Find the oldest period across all policies and
+    # load daily records from that date forward, so all policies can filter
+    # to their own period ranges from a single seed.
+    initial_user_daily_cost = None
+    oldest_period = _get_cost_policy_oldest_period(all_policy_specs)
+    if oldest_period:
+        initial_user_daily_cost = _load_user_period_cost(
+            conversation_id, conversation_store, period=oldest_period
         )
     # Session model: the conversation's model_override (set when a user
     # picks a model mid-session) wins over the spec's llm.model; None when
@@ -883,9 +876,7 @@ def build_policy_engine(
         initial_session_state=initial_session_state,
         initial_usage=initial_usage,
         initial_subtree_usage=initial_subtree_usage,
-        initial_user_daily_cost=(
-            initial_user_daily_cost if initial_user_daily_cost else initial_user_period_cost
-        ),
+        initial_user_daily_cost=initial_user_daily_cost,
         token_pricing=token_pricing,
         initial_model=initial_model,
         conversation_store=conversation_store,
