@@ -981,6 +981,56 @@ class TestUserMessageInjection:
         inject_user_message(tmp_path / "bridge", content=content)
         assert [args[-1] for args in sent if args[-1] == "Enter"] == ["Enter"]
 
+    @pytest.mark.parametrize("turn_streaming", [False, True])
+    def test_submits_scrolled_multiline_dispatch(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, turn_streaming: bool
+    ) -> None:
+        content = (
+            "\n".join(
+                f"Section {index}: "
+                + "Receive this harmless dispatch and preserve all its words. " * 5
+                for index in range(3)
+            )
+            + "\nReply only ACK."
+        )
+        sent = self._stub_tui(
+            monkeypatch,
+            tmp_path,
+            submit_after_enters=1,
+            content=content,
+            post_paste_captures=(_fixture("scrolled_multiline_draft.txt"),) * 100,
+        )
+        inject_user_message(tmp_path / "bridge", content=content, turn_streaming=turn_streaming)
+        assert [args[-1] for args in sent if args[0] == "send-keys"] == ["Enter", "C-s"]
+
+    @pytest.mark.parametrize("case", ["stale", "wrong-tail", "no-scroll", "below", "short-tail"])
+    def test_rejects_unverified_scrolled_dispatch(self, case: str) -> None:
+        pane = _fixture("scrolled_multiline_draft.txt")
+        state = kimi_native_bridge._parse_pane(pane)
+        tail = state.editor_content
+        assert tail is not None
+        expected = "Hidden prefix " + tail
+        previous = ""
+        if case == "stale":
+            previous = tail
+        elif case == "wrong-tail":
+            expected += " missing text"
+        elif case == "no-scroll":
+            pane = pane.replace("↑ 10 more", "─────────")
+        elif case == "below":
+            pane = pane.replace("╰─────────", "╰ ↓ 2 more")
+        else:
+            pane = pane.replace(tail.splitlines()[0], "ACK")
+            lines = pane.splitlines()
+            pane = "\n".join([lines[0], lines[1], lines[-3], lines[-2], lines[-1]])
+            expected = "Hidden prefix ACK"
+        assert not kimi_native_bridge._draft_visible_in_editor(
+            kimi_native_bridge._parse_pane(pane),
+            "Hidden prefix",
+            expected_content=expected,
+            pre_paste_content=previous,
+        )
+
     def test_submits_real_multiline_paste_placeholder(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
