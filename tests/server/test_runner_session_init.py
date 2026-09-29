@@ -42,12 +42,13 @@ class _Client:
         self.entered = asyncio.Event()
         self.release = asyncio.Event()
         self.status_code = 201
+        self.response_json: dict[str, Any] = {"status": "initialized"}
 
     async def post(self, _path: str, **kwargs: Any) -> httpx.Response:
         self.calls.append(kwargs["json"])
         self.entered.set()
         await self.release.wait()
-        return httpx.Response(self.status_code, json={"status": "initialized"})
+        return httpx.Response(self.status_code, json=self.response_json)
 
 
 def _conversation() -> Conversation:
@@ -369,22 +370,30 @@ async def test_init_logs_rejection_retry_and_cached_success_once() -> None:
     client.release.set()
     initializer = RunnerSessionInitializer(registry, server_version="test")  # type: ignore[arg-type]
     conversation = _conversation()
+    client.response_json = {"error": "runner overloaded"}
     with capture_debug_rows("server") as rows:
         client.status_code = 503
         await initializer.initialize(conversation, client, timeout=1)  # type: ignore[arg-type]
         client.status_code = 201
+        client.response_json = {"status": "initialized"}
         await initializer.initialize(conversation, client, timeout=1)  # type: ignore[arg-type]
         await initializer.initialize(conversation, client, timeout=1)  # type: ignore[arg-type]
     events = [row for row in rows if row["event_name"]]
     assert [row["event_name"] for row in events] == [
         "runner_session_init_started",
-        "runner_session_init_failed",
+        "runner_session_init_rejected",
         "runner_session_init_started",
         "runner_session_initialized",
     ]
     assert all(row["session_id"] == conversation.id for row in events)
     assert all(row["attributes"]["runner_id"] == conversation.runner_id for row in events)
-    assert events[1]["attributes"]["status_code"] == "503"
+    # Non-2xx row carries status code, body snippet, and a distinct message.
+    rejected = events[1]
+    assert rejected["attributes"]["status_code"] == "503"
+    assert rejected["attributes"]["response_body"] == "runner overloaded"
+    assert rejected["level"] == "ERROR"
+    # Success row logs at INFO.
+    assert events[3]["level"] == "INFO"
     # The init-started row says what the server asked the runner to do.
     assert events[0]["attributes"]["resume_interrupted_turn"] == "False"
     assert events[0]["attributes"]["suppress_recovery_turn"] == "False"
@@ -413,3 +422,52 @@ async def test_init_attributes_dropped_tunnel_to_runner(error: Exception) -> Non
     [failed] = [row for row in rows if row["event_name"] == "runner_session_init_failed"]
     assert failed["attributes"]["error_category"] == "runner"
     assert failed["attributes"]["error_impact"] == "transient"
+    assert failed["attributes"]["exc_type"] == type(error).__name__
+
+
+@pytest.mark.asyncio
+async def test_init_logs_transport_error_as_warning_without_traceback() -> None:
+    """Transport loss during POST /v1/sessions is recoverable on the next reconnect."""
+    from tests.debug_log_helpers import capture_debug_rows
+
+    registry = _Registry()
+    initializer = RunnerSessionInitializer(registry, server_version="test")  # type: ignore[arg-type]
+    conversation = _conversation()
+
+    class _TunnelDropClient:
+        async def post(self, _path: str, **kwargs: Any) -> httpx.Response:
+            raise httpx.ConnectError("tunnel closed before request completed")
+
+    with capture_debug_rows("server") as rows:
+        with pytest.raises(httpx.ConnectError):
+            await initializer.initialize(conversation, _TunnelDropClient(), timeout=1)  # type: ignore[arg-type]
+
+    transport_rows = [row for row in rows if row["event_name"] == "runner_session_init_failed"]
+    assert len(transport_rows) == 1
+    row = transport_rows[0]
+    assert row["level"] == "WARNING"
+    assert row["stack_trace"] is None
+    assert row["attributes"]["exc_type"] == "ConnectError"
+
+
+@pytest.mark.asyncio
+async def test_init_logs_unexpected_exception_as_error_with_traceback() -> None:
+    """Unexpected exceptions during POST /v1/sessions stay at ERROR with traceback."""
+    from tests.debug_log_helpers import capture_debug_rows
+
+    registry = _Registry()
+    initializer = RunnerSessionInitializer(registry, server_version="test")  # type: ignore[arg-type]
+    conversation = _conversation()
+
+    class _BrokenClient:
+        async def post(self, _path: str, **kwargs: Any) -> httpx.Response:
+            raise RuntimeError("unexpected internal error")
+
+    with capture_debug_rows("server") as rows:
+        with pytest.raises(RuntimeError):
+            await initializer.initialize(conversation, _BrokenClient(), timeout=1)  # type: ignore[arg-type]
+
+    error_rows = [row for row in rows if row["event_name"] == "runner_session_init_failed"]
+    assert len(error_rows) == 1
+    assert error_rows[0]["level"] == "ERROR"
+    assert error_rows[0]["stack_trace"] is not None

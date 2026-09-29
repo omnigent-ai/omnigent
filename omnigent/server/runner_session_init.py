@@ -11,7 +11,7 @@ import httpx
 
 from omnigent.debug_logging import debug_event, runner_log_scope
 from omnigent.entities import Conversation
-from omnigent.errors import ErrorCategory
+from omnigent.errors import ErrorCategory, ErrorImpact
 from omnigent.runner.session_init_protocol import build_runner_session_init_payload
 
 if TYPE_CHECKING:
@@ -31,6 +31,27 @@ def runner_inference_verified(conversation: Conversation, response: httpx.Respon
     except ValueError:
         return False
     return isinstance(payload, dict) and payload.get("inference_config_verified") is True
+
+
+_BODY_SNIPPET_MAX = 500
+
+
+def runner_response_error_body(response: httpx.Response) -> str:
+    """Return a bounded error snippet from a non-2xx runner response.
+
+    Prefers the ``error``, ``detail``, or ``message`` field when the body is
+    JSON, otherwise falls back to the raw text.
+    """
+    try:
+        payload = response.json()
+        if isinstance(payload, dict):
+            for key in ("error", "detail", "message"):
+                val = payload.get(key)
+                if isinstance(val, str) and val:
+                    return val[:_BODY_SNIPPET_MAX]
+    except ValueError:
+        pass
+    return response.text[:_BODY_SNIPPET_MAX]
 
 
 _logger = logging.getLogger(__name__)
@@ -206,33 +227,54 @@ class RunnerSessionInitializer:
                     json=payload,
                     timeout=timeout,
                 )
-            except Exception as exc:
+            except (httpx.TransportError, ConnectionError) as exc:
+                # Tunnel dropped mid-request; both callers recover on the next
+                # runner reconnect, so log without a traceback. The request
+                # rides the runner's tunnel: this is the runner going away.
+                _logger.warning(
+                    "Runner session initialization lost tunnel (%s: %s)",
+                    type(exc).__name__,
+                    exc,
+                    extra=debug_event(
+                        "runner_session_init_failed",
+                        stage="session_init",
+                        exc_type=type(exc).__name__,
+                        error_category=ErrorCategory.RUNNER.value,
+                        error_impact=ErrorImpact.TRANSIENT.value,
+                    ),
+                )
+                raise
+            except Exception:
                 _logger.exception(
                     "Runner session initialization failed",
                     extra=debug_event(
                         "runner_session_init_failed",
                         stage="session_init",
-                        # The request rides the runner's tunnel: a closed tunnel
-                        # (ConnectionError) or offline runner (httpx.ConnectError)
-                        # is the runner going away, not an upstream.
-                        error_category=(
-                            ErrorCategory.RUNNER.value
-                            if isinstance(exc, (ConnectionError, httpx.TransportError))
-                            else None
-                        ),
                     ),
                 )
                 raise
-            failed = not 200 <= response.status_code < 300
-            log = _logger.error if failed else _logger.info
-            log(
-                "Runner session initialization finished",
-                extra=debug_event(
-                    "runner_session_init_failed" if failed else "runner_session_initialized",
-                    stage="session_init",
-                    status_code=response.status_code,
-                ),
-            )
+            if 200 <= response.status_code < 300:
+                _logger.info(
+                    "Runner session initialization finished",
+                    extra=debug_event(
+                        "runner_session_initialized",
+                        stage="session_init",
+                        status_code=response.status_code,
+                    ),
+                )
+            else:
+                body = runner_response_error_body(response)
+                _logger.error(
+                    "Runner session initialization rejected with HTTP %d: %s",
+                    response.status_code,
+                    body,
+                    extra=debug_event(
+                        "runner_session_init_rejected",
+                        stage="session_init",
+                        status_code=response.status_code,
+                        response_body=body,
+                    ),
+                )
             return response
 
     def invalidate_runner(self, runner_id: str) -> None:
