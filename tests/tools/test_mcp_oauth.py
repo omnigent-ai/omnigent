@@ -9,7 +9,6 @@ against a fake authorization server is in ``test_mcp_oauth_e2e.py``.
 
 from __future__ import annotations
 
-import http.client
 import io
 import time
 from concurrent.futures import Future
@@ -217,17 +216,13 @@ class TestCallbackHandler:
 
 
 class TestCallbackListener:
-    def test_binds_loopback_and_serves_the_callback(self) -> None:
+    # Serving a real callback request is covered in test_mcp_oauth_e2e.py.
+
+    def test_redirect_uri_names_the_bound_loopback_port(self) -> None:
         listener = _CallbackListener()
         try:
+            assert listener.port > 0
             assert listener.redirect_uri == f"http://127.0.0.1:{listener.port}/callback"
-            conn = http.client.HTTPConnection("127.0.0.1", listener.port, timeout=5)
-            conn.request("GET", "/favicon.ico")
-            assert conn.getresponse().status == 404
-            conn = http.client.HTTPConnection("127.0.0.1", listener.port, timeout=5)
-            conn.request("GET", "/callback?code=c1&state=s1")
-            assert conn.getresponse().status == 200
-            assert listener.result.result(timeout=5) == ("c1", "s1")
         finally:
             listener.close()
 

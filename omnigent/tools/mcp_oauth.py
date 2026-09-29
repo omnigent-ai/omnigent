@@ -43,7 +43,6 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import TYPE_CHECKING
 from urllib.parse import parse_qs, urlparse
 
-import httpx
 from mcp.client.auth.oauth2 import OAuthClientProvider, OAuthContext
 from mcp.shared.auth import (
     OAuthClientInformationFull,
@@ -58,6 +57,8 @@ from omnigent.onboarding.secrets import delete_secret, load_secret, store_secret
 from omnigent.spec.types import mcp_oauth_url_problem
 
 if TYPE_CHECKING:
+    from httpx import Request, Response
+
     from omnigent.spec.types import MCPServerConfig
 
 _logger = logging.getLogger(__name__)
@@ -383,7 +384,7 @@ class OmnigentOAuthClientProvider(OAuthClientProvider):
         if self.context.protected_resource_metadata is None:
             self.context.protected_resource_metadata = self._storage.protected_resource_metadata
 
-    async def _handle_refresh_response(self, response: httpx.Response) -> bool:
+    async def _handle_refresh_response(self, response: Response) -> bool:
         previous = self.context.current_tokens
         previous_refresh_token = previous.refresh_token if previous else None
         refreshed = await super()._handle_refresh_response(response)
@@ -402,9 +403,7 @@ class OmnigentOAuthClientProvider(OAuthClientProvider):
             await self._storage.set_tokens(self.context.current_tokens)
         return refreshed
 
-    async def async_auth_flow(
-        self, request: httpx.Request
-    ) -> AsyncGenerator[httpx.Request, httpx.Response]:
+    async def async_auth_flow(self, request: Request) -> AsyncGenerator[Request, Response]:
         """Run the SDK's flow, adding refresh-on-401 and the callback listener.
 
         Relays every request and response between httpx and the SDK's

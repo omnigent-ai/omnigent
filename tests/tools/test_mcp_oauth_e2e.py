@@ -41,7 +41,7 @@ from starlette.routing import Route
 from omnigent.spec.types import MCPServerConfig
 from omnigent.tools import mcp_oauth
 from omnigent.tools.mcp import McpServerConnection, clear_discovery_cache
-from omnigent.tools.mcp_oauth import McpOAuthError
+from omnigent.tools.mcp_oauth import McpOAuthError, _CallbackListener
 
 _ACCESS_TOKEN_LIFETIME_S = 3600
 
@@ -377,3 +377,16 @@ def test_fake_server_rejects_a_mismatched_redirect_uri(fake_server: _FakeAuthSer
         )
     assert response.status_code == 400
     assert json.loads(response.text)["error"] == "invalid_grant"
+
+
+def test_callback_listener_serves_the_redirect_over_loopback() -> None:
+    """A stray request (the browser's favicon probe) doesn't use up the listener."""
+    listener = _CallbackListener()
+    try:
+        with httpx.Client(timeout=5) as client:
+            assert client.get(f"http://127.0.0.1:{listener.port}/favicon.ico").status_code == 404
+            callback = client.get(f"{listener.redirect_uri}?code=c1&state=s1")
+        assert callback.status_code == 200
+        assert listener.result.result(timeout=5) == ("c1", "s1")
+    finally:
+        listener.close()
