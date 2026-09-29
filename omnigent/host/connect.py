@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import re
+import signal
 import subprocess
 import sys
 import threading
@@ -382,6 +383,22 @@ def _runner_exit_error(exit_code: int | None, log_path: Path) -> str:
         lines = tail.strip().splitlines()[-_LOG_TAIL_MAX_LINES:]
         message += "\n--- runner log tail ---\n" + _redact_log_tail("\n".join(lines))
     return message
+
+
+def _exit_signal_name(returncode: int | None) -> str | None:
+    """Return the POSIX signal name when *returncode* indicates a signal kill.
+
+    :param returncode: The process's exit code.  A negative value means the
+        process was killed by that POSIX signal (Python subprocess convention).
+    :returns: The signal name (e.g. ``"SIGKILL"``), or ``None`` for a normal
+        exit, an unknown returncode, or an unrecognised signal number.
+    """
+    if returncode is None or returncode >= 0:
+        return None
+    try:
+        return signal.Signals(-returncode).name
+    except ValueError:
+        return None
 
 
 def _url_is_loopback(url: str) -> bool:
@@ -2373,6 +2390,14 @@ class HostProcess:
             await self._report_runner_exit(runner_id, error)
             return
         error = _runner_exit_error(handle.proc.returncode, handle.log_path)
+        exit_code = handle.proc.returncode
+        # Check whether the runner connected before dying; None when the
+        # connect-marker watchdog was disabled at launch.
+        ever_connected = (
+            await asyncio.to_thread(handle.connect_marker.exists)
+            if handle.connect_marker is not None
+            else None
+        )
         # A non-zero runner exit is a runner-process fault that blocks the
         # session; the specific cause lives in the unparsed log tail (lifecycle
         # stage unknown).
@@ -2388,6 +2413,10 @@ class HostProcess:
                 error_category=ErrorCategory.RUNNER.value,
                 error_impact=ErrorImpact.BLOCKING.value,
                 error_phase=ErrorPhase.UNKNOWN.value,
+                exit_code=exit_code,
+                signal_name=_exit_signal_name(exit_code),
+                ever_connected=ever_connected,
+                log_tail_present="\n--- runner log tail ---\n" in error,
             ),
         )
         await self._report_runner_exit(runner_id, error)
@@ -2411,6 +2440,7 @@ class HostProcess:
         if handle.stop_requested:
             # A stop may arrive while the marker check runs off-loop.
             return
+        _never_conn_exit_code = handle.proc.returncode
         _logger.error(
             "Runner %s for session %s never connected its tunnel within "
             "%.0fs of launch (pid=%d): the runner process is hung, exited "
@@ -2427,6 +2457,9 @@ class HostProcess:
                 error_category=ErrorCategory.RUNNER.value,
                 error_impact=ErrorImpact.BLOCKING.value,
                 error_phase=ErrorPhase.RUNNER_LAUNCH.value,
+                exit_code=_never_conn_exit_code,
+                signal_name=_exit_signal_name(_never_conn_exit_code),
+                ever_connected=False,
             ),
         )
 
