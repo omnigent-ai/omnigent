@@ -1458,7 +1458,7 @@ describe("ApprovalCard — resolved-elsewhere pill", () => {
     expect(trigger.getAttribute("aria-label")?.toLowerCase()).not.toBe("resolved elsewhere");
   });
 
-  it("keeps the trigger keyboard-reachable so the tooltip opens on focus", () => {
+  it("opens the explanation when the trigger takes keyboard focus", async () => {
     render(
       <TooltipProvider>
         <ApprovalCard {...props} />
@@ -1467,6 +1467,8 @@ describe("ApprovalCard — resolved-elsewhere pill", () => {
 
     const trigger = screen.getByLabelText(/answered outside this view/i);
     expect(trigger.getAttribute("tabindex")).toBe("0");
+    fireEvent.focus(trigger);
+    expect(await screen.findByRole("tooltip")).toHaveTextContent(/answered outside this view/i);
   });
 });
 
