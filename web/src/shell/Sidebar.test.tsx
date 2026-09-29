@@ -2716,7 +2716,7 @@ describe("Sidebar project sections", () => {
     );
   });
 
-  it("offers a desktop New session shortcut while keeping the touch menu accessible", async () => {
+  it("keeps project header actions to fine hover so touch uses the long-press menu", async () => {
     projectsMock.push("Customer X");
     mockConversations([
       conv("conv_filed", "Claude Code", { labels: { omni_project: "Customer X" } }),
@@ -2725,10 +2725,14 @@ describe("Sidebar project sections", () => {
 
     const shortcut = screen.getByRole("link", { name: "New session in Customer X" });
     expect(shortcut).toHaveAttribute("href", "/?project=Customer%20X");
-    expect(shortcut).toHaveClass("hidden", "[@media((hover:hover)_and_(pointer:fine))]:flex");
     const menuButton = screen.getByTestId("project-actions");
-    expect(menuButton).not.toHaveClass("hidden");
-    expect(menuButton).not.toHaveClass("sr-only");
+    const cluster = menuButton.parentElement!;
+    expect(cluster).toContainElement(shortcut);
+    expect(cluster).toHaveClass("hidden", "fine-hover:flex");
+    // Without the painted cluster, the title keeps the row's own padding.
+    const header = document.querySelector<HTMLElement>('[data-project-order-name="Customer X"]')!;
+    expect(header).not.toHaveClass("pr-8");
+    expect(header).toHaveClass("fine-hover:pr-14", "fine-hover:md:pr-2");
     fireEvent.pointerDown(screen.getByRole("button", { name: "Project actions for Customer X" }), {
       button: 0,
       ctrlKey: false,
@@ -3197,12 +3201,10 @@ describe("Sidebar collapsed project marker", () => {
     // Fixed centered box so the dot centers on the same vertical line as the
     // rows' dots.
     expect(slot).toHaveClass("w-6", "justify-center");
-    // Visible touch controls get their own column beside the marker.
-    expect(slot).toHaveClass(
-      "mr-7",
-      "[@media((hover:hover)_and_(pointer:fine))]:mr-14",
-      "fine-hover:md:-mr-1",
-    );
+    // Touch has no header controls, so the marker holds the badge slot; narrow
+    // fine-hover layouts paint the shortcut + kebab column beside it.
+    expect(slot).toHaveClass("-mr-1", "fine-hover:mr-14", "fine-hover:md:-mr-1");
+    expect(slot).not.toHaveClass("mr-7");
     expect(slot).toHaveClass(
       "fine-hover:md:group-hover/section:opacity-0",
       "fine-hover:md:group-has-[[data-state=open]]/header:opacity-0",
