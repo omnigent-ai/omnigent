@@ -2168,7 +2168,7 @@ function FileViewerBody({
       {isDesktop && open && (
         <div
           {...handleProps}
-          className="relative z-10 w-1 shrink-0 self-stretch cursor-col-resize transition-colors hover:bg-primary/30 active:bg-primary/50"
+          className="relative z-10 w-1 shrink-0 self-stretch cursor-col-resize transition-colors hover:bg-primary/30 active:bg-primary/50 data-dragging:bg-primary/50"
         />
       )}
       <aside

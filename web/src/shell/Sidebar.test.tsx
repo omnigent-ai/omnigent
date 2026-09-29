@@ -550,6 +550,7 @@ describe("Sidebar resize handle geometry", () => {
       "transition-colors",
       "hover:bg-primary/30",
       "active:bg-primary/50",
+      "data-dragging:bg-primary/50",
       "md:absolute",
       "md:inset-y-0",
       "md:block",
