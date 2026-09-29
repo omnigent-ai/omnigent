@@ -140,7 +140,11 @@ Field meanings:
 - `tests` — selected permanent regression coverage. `e2e` is the retained e2e
   path, or `""` when none is needed. `added` keeps its legacy name but lists the
   other selected checks, including reused unchanged tests or extensions to an
-  existing module. Paths/node IDs must resolve on the committed candidate.
+  existing module. Each entry must be a bare repository-relative path or test
+  node ID that resolves on the committed candidate. Do not append labels such
+  as `(reused unchanged)`, shell commands, or result summaries; put those in
+  `test_audit`. Before handing off, check the file portion of every reference
+  against the committed tree and use the same node IDs as the executed checks.
   Do not list artifact-only reproduction paths here. In comment-only review,
   keep the existing review procedure and do not commit temporary test source.
   Use `test_audit` for brief selection reasoning: reused/retained tests, why any

@@ -95,12 +95,13 @@ Once the set is genuinely green:
 
 1. **Commit** the fix and selected permanent regression tests on the working
    branch. Reused unchanged tests need no new commit. Follow the repo's commit
-   conventions. Before removing investigation-only reproduction source, retain
-   its original paths, command, tested revision, result, and source under
+   conventions. Before omitting an investigative test introduced for this task,
+   retain its original paths, command, tested revision, result, and source under
    `.omnigent/repro-evidence/`, or cite the intact CI repro baseline/bundle.
    Confirm the evidence remains retrievable after the original worktree is gone.
    Put selected committed tests in `tests` and the selection/evidence location in
-   `test_audit`; no reproduction-only source is required in the PR.
+   `test_audit`; no reproduction-only source is required in the PR. This does not
+   authorize deleting existing repository tests solely to reduce LOC.
    **Never commit workspace artifacts.** In particular, **never** stage or commit
    the `recordings/` clips or any `.omnigent/` handoff files (e.g.
    `.omnigent/repro-handoff.json`): recordings are workspace artifacts that ride

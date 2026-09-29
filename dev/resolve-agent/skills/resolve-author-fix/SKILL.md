@@ -76,9 +76,11 @@ For documentation/instruction-only changes, existing contract/bundle checks
 may suffice; do not add a standalone module of sentence assertions or fabricate
 a behavioral failure.
 
-Preserve investigation-only reproduction source and logs before removing its
-source-tree copy. Use `.omnigent/repro-evidence/` with original paths, commands,
-exact tested revision, and results, or cite the intact CI repro baseline/bundle.
+Preserve investigation-only reproduction source and logs before omitting a
+test introduced for this task from the final diff. Do not delete existing
+repository coverage just to reduce LOC. Use `.omnigent/repro-evidence/` with
+original paths, commands, exact tested revision, and results, or cite the intact
+CI repro baseline/bundle.
 This archive is separate from the selected permanent tests; it must remain
 retrievable after the original worktree is removed. On retries, preserve the
 selection and retained evidence instead of reinstating the omitted source.
@@ -95,11 +97,12 @@ selection and retained evidence instead of reinstating the omitted source.
   ticket number (no `test_omni_2812_*.py`, no `OMNI-2812`/`#4458` in symbol names
   or comments). Prefer the observable defect: e.g.
   `test_mid_stream_error_surfaces_as_abort.py`, not `test_omni_2812_*`. This
-  applies to a retained reproduction test too — if its `test_path` has a
-  ticket-numbered name or ticket references in code, **rename it and strip the
-  references** as part of the fix (fold the rename into your diff). A reader six
-  months from now shouldn't need to chase a ticket to know what the test guards.
-  The bug link belongs in the **PR body** (Step 3.4), not in code.
+  applies to a reproduction test introduced by this task too — if its
+  `test_path` has a ticket-numbered name or ticket references in code,
+  **rename it and strip the references** as part of the fix. A reader six months
+  from now shouldn't need to chase a ticket to know what the test guards.
+  The bug link belongs in the **PR body** (Step 3.4), not in code. Reusing a
+  pre-existing test does not require an unrelated rename or comment cleanup.
 
 ### 2B.5 — Prove the whole set goes fail→pass
 
