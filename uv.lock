@@ -3397,7 +3397,7 @@ requires-dist = [
     { name = "keyring", specifier = ">=24,<26" },
     { name = "kubernetes", marker = "extra == 'kubernetes'", specifier = ">=36,<37" },
     { name = "locust", marker = "extra == 'loadtest'", specifier = ">=2.30,<3" },
-    { name = "mcp", specifier = ">=1.0,<2" },
+    { name = "mcp", specifier = ">=1.20,<2" },
     { name = "microsandbox", marker = "extra == 'microsandbox'", specifier = ">=0.6.9,<0.7" },
     { name = "modal", marker = "extra == 'modal'", specifier = ">=1.0,<2" },
     { name = "nimble-python", marker = "extra == 'nimble'", specifier = ">=1.2.0,<2" },
