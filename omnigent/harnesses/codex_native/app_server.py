@@ -928,7 +928,8 @@ class CodexAppServerClient:
         self._ws: ClientConnection | None = None
         self._reader_task: asyncio.Task[None] | None = None
         self._pending_requests: dict[int, asyncio.Future[CodexMessage]] = {}
-        self._events: asyncio.Queue[CodexMessage] = asyncio.Queue()
+        # ``None`` marks the end of the event stream (reader exited).
+        self._events: asyncio.Queue[CodexMessage | None] = asyncio.Queue()
         self._next_id = 1
 
     async def connect(self) -> None:
@@ -950,6 +951,9 @@ class CodexAppServerClient:
                 max_size=_MAX_WEBSOCKET_MESSAGE_SIZE_BYTES,
                 compression=None,
             )
+        # Fresh queue per connection so a previous stream's end marker
+        # cannot end this connection's consumers.
+        self._events = asyncio.Queue()
         self._reader_task = asyncio.create_task(
             self._reader_loop(),
             name="codex-native-app-server-reader",
@@ -1077,10 +1081,20 @@ class CodexAppServerClient:
         """
         Yield app-server notifications until the connection closes.
 
+        Delivers notifications buffered before the stream ended, then
+        terminates once the reader is gone (disconnect, reader failure,
+        or client close), so waiting consumers wake instead of blocking
+        forever on events that can no longer arrive.
+
         :returns: Async iterator of notification envelopes.
         """
         while True:
-            yield await self._events.get()
+            message = await self._events.get()
+            if message is None:
+                # Re-signal so every other waiting or future consumer ends too.
+                self._events.put_nowait(None)
+                return
+            yield message
 
     async def _reader_loop(self) -> None:
         """
@@ -1089,35 +1103,39 @@ class CodexAppServerClient:
         :returns: None.
         """
         assert self._ws is not None
-        async for raw in self._ws:
-            if not isinstance(raw, str):
-                continue
-            decoded: object = json.loads(raw)
-            message = _string_object_dict(decoded)
-            if message is None:
-                _logger.warning("Ignoring non-object Codex app-server message")
-                continue
-            if (
-                "id" in message
-                and "method" not in message
-                and ("result" in message or "error" in message)
-            ):
-                raw_id = message["id"]
-                request_id: int | None = None
-                if isinstance(raw_id, int):
-                    request_id = raw_id
-                elif isinstance(raw_id, str):
-                    with contextlib.suppress(ValueError):
-                        request_id = int(raw_id)
-                future = (
-                    self._pending_requests.pop(request_id, None)
-                    if request_id is not None
-                    else None
-                )
-                if future is not None and not future.done():
-                    future.set_result(message)
-                continue
-            await self._events.put(message)
+        try:
+            async for raw in self._ws:
+                if not isinstance(raw, str):
+                    continue
+                decoded: object = json.loads(raw)
+                message = _string_object_dict(decoded)
+                if message is None:
+                    _logger.warning("Ignoring non-object Codex app-server message")
+                    continue
+                if (
+                    "id" in message
+                    and "method" not in message
+                    and ("result" in message or "error" in message)
+                ):
+                    raw_id = message["id"]
+                    request_id: int | None = None
+                    if isinstance(raw_id, int):
+                        request_id = raw_id
+                    elif isinstance(raw_id, str):
+                        with contextlib.suppress(ValueError):
+                            request_id = int(raw_id)
+                    future = (
+                        self._pending_requests.pop(request_id, None)
+                        if request_id is not None
+                        else None
+                    )
+                    if future is not None and not future.done():
+                        future.set_result(message)
+                    continue
+                await self._events.put(message)
+        finally:
+            # Wake iter_events() consumers: no further events can arrive.
+            self._events.put_nowait(None)
 
 
 def _codex_rejects_request_field(exc: CodexAppServerResponseError, field: str) -> bool:

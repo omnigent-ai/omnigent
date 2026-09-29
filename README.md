@@ -288,6 +288,7 @@ omnigent agy                         # Antigravity
 omnigent opencode                    # OpenCode
 omnigent hermes                      # Hermes Agent (Nous Research)
 omnigent pi                          # Pi
+omnigent copilot                     # GitHub Copilot (SDK harness, via `omnigent run`)
 ```
 
 `omnigent agy` requires agy 1.1.13 or newer. When `GEMINI_API_KEY` is set,
