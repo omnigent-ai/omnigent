@@ -2787,8 +2787,8 @@ def _parse_inline_mcp_servers(
         raw_auth = val.get("auth")
         databricks_profile: str | None = None
         oauth = False
+        auth_type = _mcp_auth_type(f"Inline MCP server {name!r}", raw_auth)
         if isinstance(raw_auth, dict):
-            auth_type = str(raw_auth.get("type", ""))
             if auth_type == "databricks":
                 raw_profile = raw_auth.get("profile")
                 if raw_profile is None:
@@ -3040,6 +3040,46 @@ def _validate_mcp_oauth_config(
         )
 
 
+_MCP_AUTH_TYPES = ("databricks", "oauth")
+
+
+def _mcp_auth_type(label: str, raw_auth: object, *, source: Path | None = None) -> str | None:
+    """
+    Validate an MCP entry's ``auth:`` block and return its ``type``.
+
+    An unrecognised type would otherwise connect with no credentials, so it
+    is an error. Matching is case-sensitive, like every other ``type:`` field
+    in the spec; a near miss such as ``OAuth`` gets a "did you mean" hint.
+
+    :param label: How the server is named in errors, e.g.
+        ``"Inline MCP server 'docs'"``.
+    :param raw_auth: The raw ``auth`` value, e.g. ``{"type": "oauth"}``.
+    :param source: The YAML file the entry came from, for error messages.
+    :returns: The auth type, or ``None`` when there is no ``auth:`` block.
+    :raises OmnigentError: If ``auth`` is not a mapping, or its ``type`` is
+        missing or not one of :data:`_MCP_AUTH_TYPES`.
+    """
+    if raw_auth is None:
+        return None
+    where = f": {source}" if source is not None else ""
+    allowed = " or ".join(repr(t) for t in _MCP_AUTH_TYPES)
+    if not isinstance(raw_auth, dict):
+        raise OmnigentError(
+            f"{label} 'auth' must be a mapping such as {{type: oauth}}, got {raw_auth!r}{where}",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    auth_type = raw_auth.get("type")
+    if auth_type in _MCP_AUTH_TYPES:
+        return str(auth_type)
+    hint = ""
+    if isinstance(auth_type, str) and auth_type.strip().lower() in _MCP_AUTH_TYPES:
+        hint = f" (did you mean {auth_type.strip().lower()!r}?)"
+    raise OmnigentError(
+        f"{label} auth type must be {allowed}, got {auth_type!r}{hint}{where}",
+        code=ErrorCode.INVALID_INPUT,
+    )
+
+
 def _parse_mcp_auth_block(
     name: object,
     raw: dict[str, object],
@@ -3057,13 +3097,13 @@ def _parse_mcp_auth_block(
     :param raw: Parsed YAML mapping for the MCP file.
     :param yaml_file: Path to the source file — used in error messages.
     :returns: ``(databricks_profile, oauth)`` — at most one is set.
-    :raises OmnigentError: If ``auth.type == "databricks"`` but
-        ``profile`` is missing.
+    :raises OmnigentError: If ``auth.type`` is not a supported value, or
+        ``auth.type == "databricks"`` but ``profile`` is missing.
     """
     raw_auth = raw.get("auth")
+    auth_type = _mcp_auth_type(f"MCP server {name!r}", raw_auth, source=yaml_file)
     if not isinstance(raw_auth, dict):
         return None, False
-    auth_type = str(raw_auth.get("type", ""))
     if auth_type == "databricks":
         raw_profile = raw_auth.get("profile")
         if raw_profile is None:

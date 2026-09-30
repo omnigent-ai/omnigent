@@ -1944,6 +1944,43 @@ def test_parse_inline_mcp_oauth_requires_a_url(tmp_path: Path) -> None:
         parse(tmp_path)
 
 
+@pytest.mark.parametrize(
+    ("auth", "expected"),
+    [
+        ({"type": "OAuth"}, r"got 'OAuth' \(did you mean 'oauth'\?\)"),
+        ({"type": "oauht"}, r"got 'oauht'$"),
+        ({"type": "api_key"}, r"got 'api_key'$"),
+        ({"profile": "prod"}, r"got None$"),
+    ],
+)
+def test_parse_inline_mcp_rejects_unknown_auth_type(
+    tmp_path: Path, auth: dict[str, str], expected: str
+) -> None:
+    """A mistyped auth type must not connect silently without credentials."""
+    config = {
+        "spec_version": 1,
+        "name": "inline-auth",
+        "tools": {"svc": {"type": "mcp", "url": "https://mcp.example.com/mcp", "auth": auth}},
+    }
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    with pytest.raises(
+        OmnigentError,
+        match=r"Inline MCP server 'svc' auth type must be 'databricks' or 'oauth', " + expected,
+    ):
+        parse(tmp_path)
+
+
+def test_parse_inline_mcp_rejects_non_mapping_auth(tmp_path: Path) -> None:
+    config = {
+        "spec_version": 1,
+        "name": "inline-auth",
+        "tools": {"svc": {"type": "mcp", "url": "https://mcp.example.com/mcp", "auth": "oauth"}},
+    }
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    with pytest.raises(OmnigentError, match=r"Inline MCP server 'svc' 'auth' must be a mapping"):
+        parse(tmp_path)
+
+
 def test_parse_inline_mcp_oauth_unexpanded_url_is_checked_later(tmp_path: Path) -> None:
     """Scaffolding/validation parses keep ``${VAR}``; the scheme is checked at connect."""
     _write_inline_oauth_server(tmp_path, {"url": "${MCP_URL}"})
@@ -2832,6 +2869,53 @@ def test_mcp_directory_config_auth_databricks_missing_profile_raises(agent_dir: 
     }
     (mcp_dir / "bad.yaml").write_text(yaml.dump(mcp_config))
     with pytest.raises(OmnigentError, match=r"auth type 'databricks' requires a 'profile'"):
+        parse(agent_dir)
+
+
+@pytest.mark.parametrize(
+    ("auth", "expected"),
+    [
+        ({"type": "OAuth"}, r"got 'OAuth' \(did you mean 'oauth'\?\)"),
+        (
+            {"type": "Databricks", "profile": "p"},
+            r"got 'Databricks' \(did you mean 'databricks'\?\)",
+        ),
+        ({"type": "bearer"}, r"got 'bearer'"),
+    ],
+)
+def test_mcp_directory_config_rejects_unknown_auth_type(
+    agent_dir: Path, auth: dict[str, str], expected: str
+) -> None:
+    """A mistyped auth type must not connect silently without credentials."""
+    mcp_dir = agent_dir / "tools" / "mcp"
+    mcp_dir.mkdir(parents=True)
+    mcp_config = {
+        "name": "typo-server",
+        "transport": "http",
+        "url": "https://mcp.example.com/mcp",
+        "auth": auth,
+    }
+    (mcp_dir / "typo.yaml").write_text(yaml.dump(mcp_config))
+    with pytest.raises(
+        OmnigentError,
+        match=r"MCP server 'typo-server' auth type must be 'databricks' or 'oauth', "
+        + expected
+        + r".*typo\.yaml",
+    ):
+        parse(agent_dir)
+
+
+def test_mcp_directory_config_rejects_non_mapping_auth(agent_dir: Path) -> None:
+    mcp_dir = agent_dir / "tools" / "mcp"
+    mcp_dir.mkdir(parents=True)
+    mcp_config = {
+        "name": "typo-server",
+        "transport": "http",
+        "url": "https://mcp.example.com/mcp",
+        "auth": "oauth",
+    }
+    (mcp_dir / "typo.yaml").write_text(yaml.dump(mcp_config))
+    with pytest.raises(OmnigentError, match=r"'typo-server' 'auth' must be a mapping.*typo\.yaml"):
         parse(agent_dir)
 
 
