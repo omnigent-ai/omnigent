@@ -67,7 +67,6 @@ from filelock import FileLock
 from filelock import Timeout as FileLockTimeout
 
 from omnigent._platform import IS_WINDOWS, is_wsl, stable_user_id
-from omnigent.debug_logging import current_session_id, debug_event
 from omnigent.harnesses.claude_native.message_display_hook import MESSAGE_DELTAS_FILE
 from omnigent.harnesses.claude_native.status import CONTEXT_RAW_FILE
 from omnigent.harnesses.diagnostics import detect_sign_in_prompt, sign_in_next_step
@@ -3971,6 +3970,8 @@ def _delivery_event(event: str, *, level: int = logging.INFO, **attributes: obje
     trace = _prompt_delivery_trace.get()
     if trace is None or not _logger.isEnabledFor(level):
         return
+    from omnigent.debug_logging import debug_event
+
     fields = {
         "delivery_id": trace.delivery_id,
         "stage": trace.stage,
@@ -4001,6 +4002,9 @@ def _trace_user_message_delivery(function: _InjectionFunction) -> _InjectionFunc
 
     @functools.wraps(function)
     def wrapped(bridge_dir: Path, *, content: str, **kwargs: Any) -> Any:
+        # Hooks import this module on every invocation; keep the sink lazy.
+        from omnigent.debug_logging import current_session_id
+
         trace = _PromptDeliveryTrace(
             delivery_id=secrets.token_hex(8),
             session_id=current_session_id() or read_active_session_id(bridge_dir),

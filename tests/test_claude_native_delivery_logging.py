@@ -16,6 +16,7 @@ from omnigent.harnesses.claude_native import bridge
     ("scenario", "verification", "outcome"),
     [
         ("normal", "draft_absent", "returned"),
+        ("session_fallback", "draft_absent", "returned"),
         ("unknown_command", "draft_absent", "returned"),
         ("blank_line", "unverified", "returned"),
         ("retry", "draft_absent", "returned"),
@@ -97,9 +98,14 @@ def test_delivery_diagnostics(
     monkeypatch.setattr(bridge, "_SUBMIT_VERIFY_TIMEOUT_S", 0.06)
     monkeypatch.setattr(bridge, "_SUBMIT_RETRY_INTERVAL_S", 0.02)
 
+    if scenario == "session_fallback":
+        (tmp_path / bridge._CONFIG_FILE).write_text(
+            json.dumps({"active_session_id": "bridge-session"})
+        )
+
     with (
         caplog.at_level("INFO", logger=bridge.__name__),
-        current_session_id_scope("child-session"),
+        current_session_id_scope(None if scenario == "session_fallback" else "child-session"),
     ):
         if outcome == "returned":
             bridge.inject_user_message(tmp_path, content=content)
@@ -118,7 +124,8 @@ def test_delivery_diagnostics(
     assert records[-1].attributes["verification"] == verification
     assert records[-1].attributes["outcome"] == outcome
     assert len({r.attributes["delivery_id"] for r in records}) == 1
-    assert all(r.session_id == "child-session" for r in records)
+    expected_session = "bridge-session" if scenario == "session_fallback" else "child-session"
+    assert all(r.session_id == expected_session for r in records)
     assert bridge._prompt_delivery_trace.get() is None
     rows = [record_to_row(r, "harness") for r in records]
     assert secret not in json.dumps(rows)
@@ -128,6 +135,22 @@ def test_delivery_diagnostics(
     if scenario == "unknown_command":
         assert enters == 2
         assert records[-1].attributes["attempt"] == 2
+
+    if scenario in {"normal", "empty_capture"}:
+        draft = next(r for r in records if r.event_name == "claude_native_draft_observed")
+        verified = next(r for r in records if r.event_name == "claude_native_submit_verification")
+        assert draft.attributes["polls"] == 1
+        assert draft.attributes["empty_captures"] == 0
+        assert draft.attributes["wait_ms"] == 0
+        assert draft.attributes["pane_rows"] == 1
+        assert draft.attributes["pane_max_columns"] == len("❯ " + secret)
+        assert verified.attributes["polls"] == 1
+        assert verified.attributes["wait_ms"] == 10
+        assert verified.attributes["pane_rows"] == (0 if scenario == "empty_capture" else 1)
+        assert verified.attributes["pane_max_columns"] == (0 if scenario == "empty_capture" else 2)
+        assert verified.attributes["capture_empty"] == (scenario == "empty_capture")
+        assert records[0].attributes["elapsed_ms"] == 0
+        assert records[-1].attributes["elapsed_ms"] == 10
 
     if scenario == "blank_line":
         warning = next(r for r in records if r.event_name == "claude_native_submit_unverified")
