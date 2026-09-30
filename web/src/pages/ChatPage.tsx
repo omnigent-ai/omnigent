@@ -2996,6 +2996,10 @@ function ComposerImpl(
           setCommandError("/compact is not supported for this agent type");
           return true;
         }
+        if (sessionHarness === "codex-native" && isWorking) {
+          toast.error("Compact is disabled while a chat is in progress", { richColors: true });
+          return true;
+        }
         dirtyRef.current = true;
         setValue("");
         setCommandError(null);
@@ -3126,7 +3130,8 @@ function ComposerImpl(
       completeMenuSelection(cmd);
     } else {
       // Execute immediately — no argument needed.
-      setValue("");
+      // /compact clears its draft only after the busy guard accepts it.
+      if (cmd !== "/compact") setValue("");
       setCommandError(null);
       executeSlashCommand(cmd, "");
     }
