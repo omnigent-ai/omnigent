@@ -52,6 +52,9 @@ async def validate_create_harness_readiness(
         host = None
     if host is None:
         return
+    # Sharing a parent session does not grant access to its host telemetry.
+    if user_id is not None and host.user_id != user_id:
+        return
     available, reason = reported_harness_availability(harness, host.configured_harnesses)
     if available is not False:
         return

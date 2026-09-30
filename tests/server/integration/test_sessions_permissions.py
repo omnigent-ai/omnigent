@@ -3465,3 +3465,61 @@ async def test_leave_rejects_a_sub_agent_session(
     # The parent grant is untouched, so carol still sees the shared session.
     parent_ids = {s["id"] for s in await _list_sessions_as(auth_client, "carol")}
     assert parent["id"] in parent_ids, "a refused child leave must not touch the parent grant"
+
+
+@pytest.mark.parametrize("bundle_mode", [False, True])
+async def test_shared_parent_readiness_remains_private(
+    auth_client: httpx.AsyncClient,
+    auth_app: FastAPI,
+    db_uri: str,
+    bundle_mode: bool,
+) -> None:
+    """Read access to a parent does not expose the owner's host telemetry."""
+    from omnigent.stores.host_store import HostStore
+
+    parent = await _create_session_as(auth_client, "ignored", "alice", title="shared-parent")
+    grant = await _grant_permission(
+        auth_client,
+        parent["id"],
+        granter="alice",
+        target_user="bob",
+        level=LEVEL_READ,
+    )
+    assert grant.status_code == 200
+    store = SqlAlchemyConversationStore(db_uri)
+    host_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    store.set_host_id(parent["id"], host_id, workspace="/tmp/workspace")
+    store.set_runner_id(parent["id"], "offline-test-runner")
+    hosts = HostStore(db_uri)
+    hosts.upsert_on_connect(
+        host_id, "private-host", "alice", configured_harnesses={"jcode": False}
+    )
+    auth_app.state.host_store = hosts
+    if bundle_mode:
+        response = await auth_client.post(
+            "/v1/sessions",
+            data={"metadata": json.dumps({"parent_session_id": parent["id"]})},
+            files={
+                "bundle": (
+                    "agent.tar.gz",
+                    build_agent_bundle(
+                        name="worker",
+                        executor={"type": "omnigent", "config": {"harness": "jcode"}},
+                    ),
+                    "application/gzip",
+                )
+            },
+            headers={"X-Forwarded-Email": "bob"},
+        )
+    else:
+        response = await auth_client.post(
+            "/v1/sessions",
+            json={
+                "agent_id": parent["agent_id"],
+                "parent_session_id": parent["id"],
+                "harness_override": "jcode",
+            },
+            headers={"X-Forwarded-Email": "bob"},
+        )
+    assert response.status_code == 201, response.text
+    assert "harness_not_configured" not in response.text
