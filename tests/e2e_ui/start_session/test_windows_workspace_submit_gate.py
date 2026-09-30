@@ -1,18 +1,15 @@
 """A Windows workspace picked through the host tunnel must enable Start session.
 
-The host is simulated; agent discovery and session creation are stubbed.
-"""
+The host is simulated; agent discovery and session creation are stubbed."""
 
 from __future__ import annotations
 
 import json
 import re
-from typing import Any
 
-from playwright.async_api import Route, async_playwright, expect
+from playwright.async_api import Request, Route, async_playwright, expect
 
 from tests.e2e_ui.start_session.helpers import commit_landing_workspace_picker
-from tests.e2e_ui.start_session.test_start_session import _wait_until
 from tests.e2e_ui.start_session.test_windows_workspace_picker import (
     _open_picker_at_windows_home,
     _run_in_fresh_loop,
@@ -21,6 +18,7 @@ from tests.e2e_ui.start_session.test_windows_workspace_picker import (
 )
 
 _PICKED_DIR = "C:\\Users\\alice\\work"
+_SESSIONS_URL = re.compile(r"/v1/sessions(\?.*)?$")
 
 
 def test_windows_workspace_enables_start_session(live_server: str) -> None:
@@ -36,13 +34,11 @@ async def _drive_windows_submit(base_url: str) -> None:
         context = await browser.new_context(**_video_kwargs())
         page = await context.new_page()
         try:
-            create_bodies: list[dict[str, Any]] = []
 
             async def handle_sessions(route: Route) -> None:
-                # Capture only the composer's create POST; the fake host has
-                # no runner, so a real create could not dispatch anyway.
+                # Stub the composer's create POST; the fake host has no
+                # runner, so a real create could not dispatch anyway.
                 if route.request.method == "POST":
-                    create_bodies.append(route.request.post_data_json)
                     await route.fulfill(
                         status=200,
                         content_type="application/json",
@@ -71,7 +67,10 @@ async def _drive_windows_submit(base_url: str) -> None:
                     ),
                 )
 
-            await page.route(re.compile(r"/v1/sessions(\?.*)?$"), handle_sessions)
+            def is_session_create(request: Request) -> bool:
+                return request.method == "POST" and _SESSIONS_URL.search(request.url) is not None
+
+            await page.route(_SESSIONS_URL, handle_sessions)
             # A single agent auto-selects; hide agents left by other tests so
             # no explicit pick is needed.
             await page.route("**/v1/agents", handle_agents)
@@ -101,9 +100,9 @@ async def _drive_windows_submit(base_url: str) -> None:
             await page.locator('span[data-slot="tooltip-trigger"]', has=submit).hover()
             await expect(submit).to_be_enabled(timeout=10_000)
 
-            await submit.click()
-            await _wait_until(lambda: len(create_bodies) == 1)
-            body = create_bodies[0]
+            async with page.expect_request(is_session_create) as create_request:
+                await submit.click()
+            body = (await create_request.value).post_data_json
             assert body["host_id"] == host_id, body
             assert body["workspace"] == _PICKED_DIR, body
         finally:
