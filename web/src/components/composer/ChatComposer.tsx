@@ -29,6 +29,7 @@ import {
   ComposerCompactView,
   ComposerHighlightLayer,
   type ComposerAccentRange,
+  type ScrollAnchor,
 } from "./ComposerHighlightLayer";
 import { compactLayout } from "@/lib/composerCompact";
 import {
@@ -580,6 +581,12 @@ export const ComposerTextarea = forwardRef<HTMLTextAreaElement, ComposerTextarea
       onCompactChangeRef.current?.();
     }, [compacted]);
     useOutOfFlow(textareaRef, compacted);
+    // The layer's lookup of the draft line at the textarea's scroll position.
+    const anchorRef = useRef<((top: number) => ScrollAnchor | null) | null>(null);
+    const readAnchor = useCallback(() => {
+      const textarea = textareaRef.current;
+      return textarea ? (anchorRef.current?.(textarea.scrollTop) ?? null) : null;
+    }, []);
     const placeCaret = useCallback((at: number) => {
       const textarea = textareaRef.current;
       if (!textarea || textarea.disabled) return;
@@ -608,6 +615,7 @@ export const ComposerTextarea = forwardRef<HTMLTextAreaElement, ComposerTextarea
             revealRanges={revealRanges}
             disabled={props.disabled}
             hidden={compacted}
+            anchorRef={anchorRef}
           />
         )}
         {compact && compacted && (
@@ -616,6 +624,7 @@ export const ComposerTextarea = forwardRef<HTMLTextAreaElement, ComposerTextarea
             accentRange={accent}
             disabled={props.disabled}
             textareaRef={textareaRef}
+            readAnchor={readAnchor}
             onPlaceCaret={placeCaret}
           />
         )}

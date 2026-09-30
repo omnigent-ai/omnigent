@@ -1981,20 +1981,14 @@ def test_compact_preview_first_tap_focuses_with_the_caret_there(
     assert composer.evaluate("t => t.selectionStart") == draft.index("here") + 2
 
 
-def test_compact_preview_toggles_quickly_on_a_huge_draft(
-    page: Page,
-    seeded_session: tuple[str, str],
-) -> None:
-    """Focus changes on a 5,000-line draft switch views without a long task."""
-    base_url, session_id = seeded_session
-    page.set_viewport_size({"width": 1440, "height": 900})
-    page.goto(f"{base_url}/c/{session_id}")
-    composer = page.get_by_role("textbox", name="Message the agent", exact=True)
-    expect(composer).to_be_visible(timeout=30_000)
-    draft = "\n".join(
-        f"{i}. item with **bold**, `code` and _em_" if i % 50 else f"```\ncode {i}\n```"
-        for i in range(5000)
-    )
+_HUGE_COMPACT_DRAFT = "\n".join(
+    f"{i}. item with **bold**, `code` and _em_" if i % 50 else f"```\ncode {i}\n```"
+    for i in range(5000)
+)
+
+
+def _set_draft(composer: Locator, draft: str) -> None:
+    """Load a large draft at once (typing or fill would take minutes)."""
     composer.evaluate(
         """(t, v) => {
         const set = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value').set;
@@ -2003,6 +1997,76 @@ def test_compact_preview_toggles_quickly_on_a_huge_draft(
         draft,
     )
     expect(composer).to_have_value(draft)
+
+
+# The text and draft line of the preview row near its top or bottom edge.
+_PREVIEW_ROW_AT_JS = """([view, edge]) => {
+    const box = view.getBoundingClientRect();
+    const y = edge === 'top' ? box.top + 3 : box.bottom - 3;
+    const row = document.elementFromPoint(box.left + 40, y)?.closest('[data-row]');
+    if (!row || !view.contains(row)) return null;
+    return [row.textContent, row.dataset.line ? Number(row.dataset.line) : null];
+}"""
+
+
+@pytest.mark.parametrize("where", ["middle", "end"])
+def test_compact_preview_opens_at_the_line_the_textarea_showed(
+    page: Page,
+    seeded_session: tuple[str, str],
+    where: str,
+) -> None:
+    """Blurring a long, scrolled draft keeps the same lines in view."""
+    base_url, session_id = seeded_session
+    page.set_viewport_size({"width": 1440, "height": 900})
+    page.goto(f"{base_url}/c/{session_id}")
+    composer = page.get_by_role("textbox", name="Message the agent", exact=True)
+    expect(composer).to_be_visible(timeout=30_000)
+    draft = _HUGE_COMPACT_DRAFT
+    _set_draft(composer, draft)
+    lines = draft.split("\n")
+    starts = [0]
+    for line in lines[:-1]:
+        starts.append(starts[-1] + len(line) + 1)
+    line_height = composer.evaluate("t => parseFloat(getComputedStyle(t).lineHeight)")
+    if where == "middle":
+        # An item line near the middle at the textarea's top (no line wraps here).
+        top = next(k for k in range(len(lines) // 2, len(lines)) if lines[k][0].isdigit())
+        composer.evaluate("(t, y) => { t.scrollTop = y; }", top * line_height)
+    else:
+        composer.evaluate("t => { t.scrollTop = t.scrollHeight; }")
+    _next_frame(page)
+    composer.evaluate("t => t.blur()")
+    view = _compact_view(composer)
+    expect(view).to_be_visible()
+    _next_frame(page)
+    _next_frame(page)
+    if where == "middle":
+        row = view.evaluate(_PREVIEW_ROW_AT_JS.replace("([view, edge])", "(view, edge)"), "top")
+        number = lines[top].split(".")[0]
+        assert row == [f"{number}. item with bold, code and em\n", starts[top]], lines[top]
+    else:
+        row = view.evaluate(_PREVIEW_ROW_AT_JS.replace("([view, edge])", "(view, edge)"), "bottom")
+        assert row == ["4999. item with bold, code and em", starts[-1]], lines[-1]
+        assert view.evaluate("v => v.scrollHeight - v.clientHeight - v.scrollTop") <= 1
+
+
+def test_compact_preview_toggles_quickly_on_a_huge_draft(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """Focus changes on a 5,000-line draft switch views in well under a second."""
+    base_url, session_id = seeded_session
+    page.set_viewport_size({"width": 1440, "height": 900})
+    page.goto(f"{base_url}/c/{session_id}")
+    composer = page.get_by_role("textbox", name="Message the agent", exact=True)
+    expect(composer).to_be_visible(timeout=30_000)
+    draft = _HUGE_COMPACT_DRAFT
+    _set_draft(composer, draft)
+    # Where a writer is: caret at the end, scrolled to it (a focus would jump
+    # there otherwise, and time the jump's paint rather than the switch).
+    composer.evaluate("t => { t.setSelectionRange(t.value.length, t.value.length); }")
+    composer.evaluate("t => { t.scrollTop = t.scrollHeight; }")
+    _next_frame(page)
     timings = composer.evaluate(
         """async t => {
             const frames = () => new Promise(resolve =>
