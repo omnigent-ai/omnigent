@@ -3384,6 +3384,73 @@ def test_bundle_upload_keeps_literal_mcp_url(tmp_path: Path) -> None:
     assert "tools/mcp/plain.yaml" not in _resolve_bundle_env_vars(tmp_path)
 
 
+def _bundle_member_text(bundle_bytes: bytes, arcname: str) -> str:
+    """
+    Return one bundle member's raw text, without parsing it.
+
+    :param bundle_bytes: The gzipped tarball bytes.
+    :param arcname: The archive member name, e.g. ``"tools/mcp/github.yaml"``.
+    :returns: The member's contents decoded as UTF-8.
+    """
+    with tarfile.open(fileobj=io.BytesIO(bundle_bytes), mode="r:gz") as tf:
+        extracted = tf.extractfile(tf.getmember(arcname))
+        assert extracted is not None, f"Expected {arcname!r} to be a regular file in the bundle"
+        return extracted.read().decode("utf-8")
+
+
+def test_bundle_upload_rewrites_mcp_file_only_when_a_value_expands(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    MCP files whose headers and env are all literal ship byte-for-byte
+    (comments and formatting kept); a ``${VAR}`` header is resolved.
+    """
+    monkeypatch.setenv("SIDECAR_MCP_TOKEN", "tok-sidecar")
+    _write_upload_agent(
+        tmp_path,
+        tools={
+            "inline": {
+                "type": "mcp",
+                "url": "https://inline.example.invalid/mcp",
+                "headers": {"Authorization": "Bearer literal-inline"},
+            },
+        },
+    )
+    mcp_dir = tmp_path / "tools" / "mcp"
+    mcp_dir.mkdir(parents=True, exist_ok=True)
+    literal_text = (
+        "# Hand-written sidecar; keep this comment.\n"
+        "name: literal\n"
+        "transport: http\n"
+        "url: http://localhost:9000/mcp\n"
+        "headers:\n"
+        "  Authorization: Bearer literal-token  # not a secret\n"
+        "env:\n"
+        "  LOG_LEVEL: debug\n"
+    )
+    (mcp_dir / "literal.yaml").write_text(literal_text, encoding="utf-8")
+    (mcp_dir / "templated.yaml").write_text(
+        "# Token comes from the uploader's environment.\n"
+        "name: templated\n"
+        "transport: http\n"
+        "url: http://localhost:9001/mcp\n"
+        "headers:\n"
+        "  Authorization: Bearer ${SIDECAR_MCP_TOKEN}\n",
+        encoding="utf-8",
+    )
+
+    resolved = _resolve_bundle_env_vars(tmp_path)
+    bundle_bytes = _bundle(tmp_path)
+
+    assert "config.yaml" not in resolved
+    assert "tools/mcp/literal.yaml" not in resolved
+    assert _bundle_member_text(bundle_bytes, "tools/mcp/literal.yaml") == literal_text
+    assert "tools/mcp/templated.yaml" in resolved
+    templated = _extract_yaml_from_bundle(bundle_bytes, "tools/mcp/templated.yaml")
+    assert templated["headers"] == {"Authorization": "Bearer tok-sidecar"}
+
+
 def test_bundle_materializes_standalone_omnigent_yaml(tmp_path: Path) -> None:
     """
     ``_bundle`` wraps a standalone omnigent YAML file in a tarball.
