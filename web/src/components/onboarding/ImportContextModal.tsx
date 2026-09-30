@@ -3,7 +3,7 @@
 // there. Review only: sessions already load these, so nothing is selected.
 
 import type { ReactNode } from "react";
-import { ArrowRight, Check, Loader2, XIcon } from "lucide-react";
+import { ArrowRight, Check, XIcon } from "lucide-react";
 import omnigentLogo from "@/assets/omnigent-starfish-icon.png";
 import BlobGraphic from "@/components/onboarding/BlobGraphic";
 import {
@@ -21,6 +21,7 @@ import {
   DialogDescription,
   DialogTitle,
 } from "@/components/ui/dialog";
+import { Spinner } from "@/components/ui/spinner";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import {
   INVENTORY_HARNESS_IDS,
@@ -288,7 +289,7 @@ function ImportContextBody({
   if (status === "loading") {
     content = (
       <EmptyState>
-        <Loader2 className="mx-auto mb-2 size-4 animate-spin" aria-hidden="true" />
+        <Spinner aria-hidden="true" className="mx-auto mb-2" />
         {loadingMessage}
       </EmptyState>
     );
