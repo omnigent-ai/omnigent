@@ -1455,6 +1455,39 @@ describe("ComposerTextarea compact preview", () => {
     expect(view()).toBeNull();
   });
 
+  it("replaces, adds and removes styled runs while blurred, with no stale text", async () => {
+    await blurred("**bold** _italic_ **end**");
+    expect(view()?.textContent).toBe("bold italic end");
+    // Each step changes which styled runs a row holds, and where; `word` is
+    // one of its styled words and `last` its final run.
+    const steps: [string, string, string, string][] = [
+      ["plain _italic_ **end**", "plain italic end", "italic", "end"],
+      ["plain _italic_ **end** `code` ~~gone~~", "plain italic end code gone", "code", "gone"],
+      ["**aa** **bb** **cc**", "aa bb cc", "bb", "cc"],
+      ["**cc**", "cc", "cc", "cc"],
+      ["_xx_ **why** `zz` [w](u) and **bold**", "xx why zz wu and bold", "why", "bold"],
+    ];
+    const click = async (node: Node, offset: number) => {
+      Object.assign(document, { caretPositionFromPoint: () => ({ offsetNode: node, offset }) });
+      fireEvent.mouseDown(view()!, { button: 0 });
+      const at = input().selectionStart;
+      act(() => input().blur());
+      await settle();
+      return at;
+    };
+    // Steps run in order: each edits the draft the previous one left.
+    /* oxlint-disable no-await-in-loop */
+    for (const [draft, shown, word, last] of steps) {
+      act(() => setDraft(draft));
+      expect(view()?.textContent).toBe(shown);
+      // Clicks still land on the draft character under them: inside a word,
+      // and at the very end (past any closing markers).
+      expect(await click(pieceText(word), 1)).toBe(draft.indexOf(word) + 1);
+      expect(await click(pieceText(last), last.length)).toBe(draft.length);
+    }
+    /* oxlint-enable no-await-in-loop */
+  });
+
   it("does nothing on a click while disabled", async () => {
     render(<Controlled initial="x **bold**" disabled />);
     await settle(60);
