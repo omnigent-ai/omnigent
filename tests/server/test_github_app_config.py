@@ -75,7 +75,7 @@ def test_from_env_disabled_without_redirect(monkeypatch: pytest.MonkeyPatch) -> 
 
 def test_from_env_enabled_without_store_key(monkeypatch: pytest.MonkeyPatch) -> None:
     # Token-at-rest encryption is the credential store's concern
-    # (OMNIGENT_CREDENTIAL_ENC_KEY), not GitHub's: client id/secret + a
+    # (its KMS or Vault cipher), not GitHub's: client id/secret + a
     # resolvable redirect are enough for a valid GitHub App config. Whether
     # a connection store is wired is decided separately by the caller.
     _clear_env(monkeypatch)

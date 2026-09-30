@@ -106,7 +106,7 @@ def _config() -> GitHubAppConfig:
 
 def _app(db_uri: str) -> tuple[TestClient, GithubConnectionStore, GitHubAppConfig, _FakeClient]:
     config = _config()
-    # The store's cipher key is the credential store's own (OMNIGENT_CREDENTIAL_ENC_KEY),
+    # The store's cipher is the credential store's own (KMS or Vault),
     # independent of the GitHub App config.
     store = GithubConnectionStore(db_uri, SecretBox("store-enc-key"))
     client = _FakeClient()

@@ -177,8 +177,8 @@ def connections_from_env(
         if secret_cipher is None:
             descriptor = provider(provider_id)
             _logger.error(
-                "%s is configured but disabled: set OMNIGENT_CREDENTIAL_ENC_KEY "
-                "(the credential store's encryption key) to enable it.",
+                "%s is configured but disabled: configure the credential store's cipher "
+                "(OMNIGENT_CREDENTIAL_KMS_KEY_ID or OMNIGENT_CREDENTIAL_VAULT_KEY) to enable it.",
                 descriptor.display_name if descriptor is not None else provider_id,
             )
             connections[provider_id] = (config, None)

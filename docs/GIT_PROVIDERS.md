@@ -406,7 +406,8 @@ which can quote configuration. An error raised by `config_from_env` or
 `make_store` stops startup, so a misconfigured provider is never disabled
 silently. A configured provider whose credential store has no cipher stays in
 the mapping with a `None` store, so its connection is disabled, and the server
-logs that `OMNIGENT_CREDENTIAL_ENC_KEY` enables it. The cipher is built once,
+logs that a credential cipher (`OMNIGENT_CREDENTIAL_KMS_KEY_ID` or
+`OMNIGENT_CREDENTIAL_VAULT_KEY`) enables it. The cipher is built once,
 and only when a provider is configured.
 
 `create_app` enables a provider when both its config and its store are present.
