@@ -426,36 +426,97 @@ describe("ServerSelectorV2", () => {
     expect(screen.queryByText(/server ready/i)).not.toBeInTheDocument();
   });
 
-  it("a direct connect shows its sign-in phase with Cancel, then goes idle", async () => {
-    let finish: (r: { cancelled: boolean }) => void = () => {};
-    const onCancelConnect = vi.fn();
+  // A connect held in browser sign-in until `finish` settles it.
+  function pendingSignIn() {
+    let finish: (r: { cancelled?: boolean }) => void = () => {};
     const onConnect = vi.fn(
       (_url: string, onPhase?: (phase: "connecting" | "authenticating") => void) =>
-        new Promise<{ cancelled: boolean }>((resolve) => {
+        new Promise<{ cancelled?: boolean }>((resolve) => {
           onPhase?.("authenticating");
           finish = resolve;
         }),
     );
+    return { onConnect, finish: (r: { cancelled?: boolean }) => finish(r) };
+  }
+
+  function renderRecents(over: Partial<ServerSelectorV2Setup>) {
     render(
       <ServerSelectorV2
         setup={makeSetup({
           installed: true,
           recentServers: ["https://team.example.com/"],
-          onConnect,
-          onCancelConnect,
+          ...over,
         })}
       />,
     );
-    const open = screen.getByRole("button", { name: /open omnigent/i });
+    return screen.getByRole("button", { name: /open omnigent/i });
+  }
+
+  it("a direct connect shows its sign-in phase and Cancelling…, then goes idle", async () => {
+    const { onConnect, finish } = pendingSignIn();
+    let confirm: (cancelled: boolean) => void = () => {};
+    const onCancelConnect = vi.fn(
+      () =>
+        new Promise<boolean>((resolve) => {
+          confirm = resolve;
+        }),
+    );
+    const open = renderRecents({ onConnect, onCancelConnect });
     fireEvent.click(open);
     expect(await screen.findByText(/finish signing in in your browser/i)).toBeInTheDocument();
     expect(open).toHaveAttribute("aria-busy", "true");
     fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
     expect(onCancelConnect).toHaveBeenCalled();
+    expect(screen.getByText("Cancelling…")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Cancel" })).not.toBeInTheDocument();
+    await act(async () => confirm(true));
     act(() => finish({ cancelled: true }));
-    await waitFor(() => expect(screen.queryByRole("status")).not.toBeInTheDocument());
+    await waitFor(() => expect(screen.queryByText("Cancelling…")).not.toBeInTheDocument());
     expect(open).not.toHaveAttribute("aria-busy");
     expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  });
+
+  it("a Cancel the shell refuses restores the phase and says why", async () => {
+    const { onConnect } = pendingSignIn();
+    const open = renderRecents({ onConnect, onCancelConnect: vi.fn().mockResolvedValue(false) });
+    fireEvent.click(open);
+    fireEvent.click(await screen.findByRole("button", { name: "Cancel" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent(/still finishing/i);
+    expect(screen.getByText(/finish signing in in your browser/i)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Cancel" })).toBeInTheDocument();
+    expect(open).toHaveAttribute("aria-busy", "true");
+  });
+
+  it("a second join from the MDM dropdown can't start or hide the first's progress", async () => {
+    const { onConnect, finish } = pendingSignIn();
+    render(
+      <ServerSelectorV2
+        setup={makeSetup({
+          installed: true,
+          connectedBefore: true,
+          managedServers: ["https://team.example.com/"],
+          onConnect,
+          onCancelConnect: vi.fn(),
+        })}
+      />,
+    );
+    openPresetDropdown();
+    const input = await screen.findByRole("textbox", { name: "Server URL" });
+    fireEvent.change(input, { target: { value: "https://other.example.com" } });
+    // Both Enters land before the dropdown's close renders.
+    act(() => {
+      fireEvent.keyDown(input, { key: "Enter" });
+      fireEvent.keyDown(input, { key: "Enter" });
+    });
+    expect(onConnect).toHaveBeenCalledTimes(1);
+    await waitFor(() =>
+      expect(screen.queryByRole("textbox", { name: "Server URL" })).not.toBeInTheDocument(),
+    );
+    expect(screen.getByText(/finish signing in in your browser/i)).toBeInTheDocument();
+    act(() => finish({ cancelled: true }));
+    await waitFor(() =>
+      expect(screen.queryByText(/finish signing in in your browser/i)).not.toBeInTheDocument(),
+    );
   });
 
   it("tells a laptop runner, and only a laptop runner, what connecting grants", async () => {

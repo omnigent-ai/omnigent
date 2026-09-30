@@ -11,7 +11,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import type { ConnectPhase } from "@/pages/onboarding/ServerSelectorV2";
+import type { ConnectProgress } from "@/pages/onboarding/ServerSelectorV2";
 import {
   ConnectStatus,
   InstallActionButton,
@@ -26,7 +26,7 @@ export function RunnerStep({
   remoteAvailable,
   installed,
   error,
-  connectPhase = null,
+  connection = null,
   onCancelConnect,
   onBack,
   onInstall,
@@ -38,7 +38,7 @@ export function RunnerStep({
   /** A connect error to show above the actions. */
   error?: string;
   /** Progress of an in-flight direct connect (null when idle). */
-  connectPhase?: ConnectPhase | null;
+  connection?: ConnectProgress | null;
   onCancelConnect?: () => void;
   onBack: () => void;
   onInstall: (runner: Runner) => void;
@@ -85,13 +85,13 @@ export function RunnerStep({
         </div>
       )}
 
-      <ConnectStatus phase={connectPhase} onCancel={onCancelConnect} />
+      <ConnectStatus connection={connection} onCancel={onCancelConnect} />
 
       <OnboardingRail>
-        <OnboardingBackButton onClick={onBack} disabled={connectPhase !== null} />
+        <OnboardingBackButton onClick={onBack} disabled={connection !== null} />
         <InstallActionButton
           installed={installed}
-          loading={connectPhase !== null}
+          loading={connection !== null}
           onClick={() => onInstall(runner)}
         />
       </OnboardingRail>

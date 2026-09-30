@@ -32,6 +32,7 @@ const {
 const { autoUpdater } = require("electron-updater");
 const { createDesktopUpdater } = require("./desktop_updater");
 const { createUpdateOverlay } = require("./update_overlay");
+const { createConnectionLoading } = require("./connection_loading");
 const { createAboutWindow, resolveAppIconDataUrl } = require("./about_window");
 const { registerFileReveal } = require("./fileReveal");
 const fs = require("node:fs");
@@ -764,6 +765,7 @@ function abortConnectionAttempt(win, message = "Connection superseded") {
   const attempt = connectionAttempts.get(win);
   if (!attempt) return;
   connectionAttempts.delete(win);
+  connectionLoading.hide(win, attempt);
   attempt.pending = false;
   attempt.controller.abort(Object.assign(new Error(message), { name: "AbortError" }));
 }
@@ -1199,6 +1201,8 @@ const aboutWindow = createAboutWindow({
   aboutPage: ABOUT_PAGE,
   preloadPath: path.join(__dirname, "about_preload.js"),
 });
+
+const connectionLoading = createConnectionLoading({ BrowserWindow });
 
 // Shell-owned update toast: renders the reused web UpdateBanner in a transparent
 // corner window so it shows even against servers running old omnigent web.
@@ -1662,6 +1666,9 @@ async function loadServerUrl(
       reportConnectionProgress(win, attempt, "authenticating");
       const auth = getDatabricksAuth();
       win.webContents.stop();
+      if (!isSetupPageUrl(win.webContents.getURL())) {
+        connectionLoading.show(win, attempt, "Signing in…");
+      }
       try {
         const entered = new URL(serverUrl);
         const resolvedOrigin = await ensureDatabricksSession(
@@ -1704,12 +1711,14 @@ async function loadServerUrl(
     void fetchServerManifest(serverUrl).then((manifest) => {
       if (current()) setWindowServerManifest(win, manifest);
     });
+    connectionLoading.show(win, attempt, "Opening Omnigent…");
     await win.loadURL(target);
     assertCurrent();
     const arcaServerUrl = windowArcaServerUrl(win);
     void refreshArcaBinary().then(() => arcaAutoConnect.ensure(arcaServerUrl));
     return serverUrl;
   } finally {
+    connectionLoading.hide(win, attempt);
     attempt.pending = false;
   }
 }

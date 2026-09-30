@@ -2,7 +2,7 @@ import type { ReactNode } from "react";
 import { ArrowLeft, ArrowRight, Download, Play } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
-import type { ConnectPhase } from "@/pages/onboarding/ServerSelectorV2";
+import type { ConnectProgress } from "@/pages/onboarding/ServerSelectorV2";
 
 export function OnboardingHeading({
   children,
@@ -63,24 +63,34 @@ export function OnboardingBackButton({
 
 /** What an in-flight connect is waiting on, with a Cancel when the shell supports it. */
 export function ConnectStatus({
-  phase,
+  connection,
   onCancel,
 }: {
-  phase: ConnectPhase | null;
+  connection: ConnectProgress | null;
   onCancel?: () => void;
 }) {
-  if (phase === null) return null;
+  if (connection === null) return null;
+  const { phase, error } = connection;
   return (
-    <p role="status" className="mt-2 text-center text-sm text-muted-foreground">
-      {phase === "authenticating"
-        ? "Finish signing in in your browser, then come back here."
-        : "Waiting for the server…"}{" "}
-      {onCancel && (
-        <button type="button" onClick={onCancel} className="underline hover:text-foreground">
-          Cancel
-        </button>
+    <>
+      <p role="status" className="mt-2 text-center text-sm text-muted-foreground">
+        {phase === "cancelling"
+          ? "Cancelling…"
+          : phase === "authenticating"
+            ? "Finish signing in in your browser, then come back here."
+            : "Waiting for the server…"}{" "}
+        {onCancel && phase !== "cancelling" && (
+          <button type="button" onClick={onCancel} className="underline hover:text-foreground">
+            Cancel
+          </button>
+        )}
+      </p>
+      {error && (
+        <p role="alert" className="text-center text-sm text-destructive">
+          {error}
+        </p>
       )}
-    </p>
+    </>
   );
 }
 

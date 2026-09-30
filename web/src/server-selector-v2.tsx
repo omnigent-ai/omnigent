@@ -199,13 +199,14 @@ export function BridgeSetupApp() {
       }
     },
     onCancelConnect: setupBridge()?.cancelServerConnection
-      ? () => {
+      ? async () => {
           const requestId = activeConnect.current;
-          if (requestId === null) return;
-          activeConnect.current = null;
-          setupBridge()
-            ?.cancelServerConnection?.(requestId)
-            .catch(() => {});
+          if (requestId === null) return false;
+          // Only a confirmed cancel drops the request: an unconfirmed one keeps
+          // the connect's real outcome (navigation or its error).
+          const cancelled = (await setupBridge()?.cancelServerConnection?.(requestId)) === true;
+          if (cancelled && activeConnect.current === requestId) activeConnect.current = null;
+          return cancelled;
         }
       : undefined,
     onStartLocal: async () => {

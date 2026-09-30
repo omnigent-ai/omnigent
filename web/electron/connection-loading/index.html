@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'none'; style-src 'unsafe-inline'"
+    />
+    <title>Opening Omnigent</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+      }
+      body {
+        margin: 0;
+        padding: 8px;
+        font:
+          14px system-ui,
+          sans-serif;
+      }
+      .card {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        gap: 12px;
+        height: 46px;
+        border: 1px solid #8885;
+        border-radius: 12px;
+        background: #fff;
+        color: #222;
+      }
+      .spinner {
+        width: 16px;
+        height: 16px;
+        border: 2px solid #8884;
+        border-top-color: currentColor;
+        border-radius: 50%;
+        animation: spin 0.8s linear infinite;
+      }
+      @keyframes spin {
+        to {
+          transform: rotate(360deg);
+        }
+      }
+      @media (prefers-color-scheme: dark) {
+        .card {
+          background: #1e1927;
+          color: #eee;
+        }
+      }
+      @media (prefers-reduced-motion: reduce) {
+        .spinner {
+          animation: none;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="card" role="status" aria-live="polite" aria-busy="true">
+      <span class="spinner" aria-hidden="true"></span>
+      <span id="status">Opening Omnigent…</span>
+    </div>
+  </body>
+</html>

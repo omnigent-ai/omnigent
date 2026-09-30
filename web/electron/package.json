@@ -70,6 +70,7 @@
       "server-selector-v2/**/*",
       "find/**/*",
       "return-banner/**/*",
+      "connection-loading/**/*",
       "icons/**/*",
       "overlay/**/*"
     ],

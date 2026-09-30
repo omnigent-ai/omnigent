@@ -7,6 +7,19 @@ afterEach(() => {
   delete (window as { omnigentSetup?: unknown }).omnigentSetup;
 });
 
+/** Install a minimal `omnigentSetup` bridge; `over` replaces its defaults. */
+function stubBridge(over: Record<string, unknown>) {
+  (window as { omnigentSetup?: unknown }).omnigentSetup = {
+    getServerUrl: async () => null,
+    getRecentServers: async () => ["https://team.example.com/"],
+    getManagedServers: async () => [],
+    getCliStatus: async () => ({ installed: true }),
+    copyText: async () => {},
+    startLocalServer: async () => ({ ok: false }),
+    ...over,
+  };
+}
+
 it("tags a connect with a request ID, shows only its phases, and cancels it", async () => {
   let progress: (p: { requestId?: string; phase?: string }) => void = () => {};
   let finish: (r: { cancelled?: boolean }) => void = () => {};
@@ -17,20 +30,14 @@ it("tags a connect with a request ID, shows only its phases, and cancels it", as
       }),
   );
   const cancelServerConnection = vi.fn().mockResolvedValue(true);
-  (window as { omnigentSetup?: unknown }).omnigentSetup = {
-    getServerUrl: async () => null,
-    getRecentServers: async () => ["https://team.example.com/"],
-    getManagedServers: async () => [],
-    getCliStatus: async () => ({ installed: true }),
-    copyText: async () => {},
-    startLocalServer: async () => ({ ok: false }),
+  stubBridge({
     setServerUrl,
     cancelServerConnection,
     onConnectionProgress: (cb: typeof progress) => {
       progress = cb;
       return () => {};
     },
-  };
+  });
   render(<BridgeSetupApp />);
   fireEvent.click(await screen.findByRole("button", { name: /open omnigent/i }));
   const requestId = setServerUrl.mock.calls[0][1]?.requestId;
@@ -41,10 +48,26 @@ it("tags a connect with a request ID, shows only its phases, and cancels it", as
   act(() => progress({ requestId, phase: "authenticating" }));
   expect(screen.getByText(/finish signing in/i)).toBeInTheDocument();
 
-  fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+  await act(async () => fireEvent.click(screen.getByRole("button", { name: "Cancel" })));
   expect(cancelServerConnection).toHaveBeenCalledWith(requestId);
-  // The shell's late result after a cancel reads as cancelled: idle, no error.
+  // The shell's late result after a confirmed cancel reads as cancelled: idle, no error.
   await act(async () => finish({}));
   expect(screen.queryByRole("status")).not.toBeInTheDocument();
   expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+});
+
+it("a cancel from the shell (workspace picker closed) fails the terminal with Retry", async () => {
+  stubBridge({
+    getManagedServers: async () => ["https://team.example.com/"],
+    getRecentServers: async () => [],
+    getRunnerOptions: async () => ({ remote: false, bundledCli: true }),
+    connectRunner: async () => ({ ok: true }),
+    setServerUrl: async () => ({ cancelled: true }),
+  });
+  render(<BridgeSetupApp />);
+  fireEvent.click(await screen.findByRole("button", { name: /join your team/i }));
+  fireEvent.click(await screen.findByRole("button", { name: /open omnigent/i }));
+  expect(await screen.findByText("Connection cancelled.")).toBeInTheDocument();
+  expect(screen.getByRole("button", { name: /retry/i })).toBeInTheDocument();
+  expect(screen.queryByText(/server ready/i)).not.toBeInTheDocument();
 });
