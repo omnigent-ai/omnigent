@@ -587,6 +587,24 @@ def snapshot_for(conversation_id: str) -> list[dict[str, Any]]:
         return events
 
 
+def retire_native_previews(conversation_id: str) -> None:
+    """Stop replaying finalized native previews after an assistant item commits."""
+    with _lock:
+        messages = _native_inflight.get(conversation_id)
+        if not messages:
+            return
+        finalized = [message_id for message_id, message in messages.items() if message.final_seen]
+        if not finalized:
+            # A provider may commit without reporting a final chunk. Without
+            # an item-to-preview id, prefer the authoritative item to a ghost.
+            _native_inflight.pop(conversation_id, None)
+            return
+        for message_id in finalized:
+            messages.pop(message_id, None)
+        if not messages:
+            _native_inflight.pop(conversation_id, None)
+
+
 def discard(conversation_id: str) -> None:
     """
     Drop a conversation's in-flight entry, if any.
