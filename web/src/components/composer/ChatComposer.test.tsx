@@ -465,11 +465,15 @@ describe("ComposerTextarea Markdown highlight layer", () => {
   });
 
   it("uses only width-neutral styles, in the textarea's typography", () => {
-    render(<ControlledTextarea initial="_a_ **b** `c`" />);
+    render(<ControlledTextarea initial="_a_ **b** `c` ***d***" />);
     expect(layer()).toHaveClass("composer-input-text", "text-ui", "whitespace-pre-wrap");
     for (const span of layer()!.querySelectorAll("span")) {
       expect(span.className).not.toMatch(/\b(italic|font-|p[xytrbl]?-|m[xytrbl]?-|border)/);
     }
+    // Bold is the faux bold (a stroke, in index.css), bold italic too.
+    const bold = Array.from(layer()!.querySelectorAll<HTMLElement>(".md-strong"));
+    expect(bold.map((span) => span.textContent)).toEqual(["b", "d"]);
+    expect(bold[1]).toHaveClass("md-em");
   });
 
   it("tints the accent range as a command token", () => {
@@ -1345,6 +1349,22 @@ describe("ComposerTextarea compact preview", () => {
     vi.restoreAllMocks();
     Reflect.deleteProperty(document, "caretPositionFromPoint");
     Reflect.deleteProperty(document, "caretRangeFromPoint");
+  });
+
+  it("uses the real bold and italic faces, which needn't line up with the textarea", async () => {
+    await blurred("**bold** _it_ ***both*** `code`");
+    const span = (text: string) =>
+      Array.from(view()!.querySelectorAll<HTMLElement>("[data-md]")).find(
+        (candidate) => candidate.textContent === text,
+      )!;
+    // Semibold, the weight sent messages give `**strong**`; no faux-bold stroke.
+    expect(span("bold")).toHaveClass("font-semibold");
+    expect(span("bold")).not.toHaveClass("md-strong", "italic");
+    expect(span("it")).toHaveClass("italic");
+    expect(span("it")).not.toHaveClass("font-semibold", "md-em");
+    expect(span("both")).toHaveClass("italic", "font-semibold");
+    expect(span("both")).not.toHaveClass("md-strong", "md-em");
+    expect(span("code")).not.toHaveClass("font-semibold");
   });
 
   it("collapses hidden markers once blurred, and restores the aligned layer on focus", async () => {

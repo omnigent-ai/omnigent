@@ -1312,6 +1312,14 @@ html[data-electron-mac] .breadcrumb-folder {
   content: "\200b";
 }
 
+/* Faux bold in the composer layer: a stroke thickens each glyph without
+ * changing its advance. 0.06em is the thickest that keeps small counters
+ * (e, a, @) open at 11px on a 1x screen, light and dark; slanted italic
+ * copies (`.md-slant`) carry it too. The compact preview uses real semibold. */
+.composer-highlight-layer .md-strong {
+  -webkit-text-stroke: 0.06em currentColor;
+}
+
 /* The composer highlight layer's decorations: paint-only background layers, so
  * no glyph moves (text-decoration's ink can also outlive a span's repaint).
  * Each flag turns on its layer; they stack when a span is, say, a struck link. */

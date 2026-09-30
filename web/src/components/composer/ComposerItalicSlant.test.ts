@@ -94,15 +94,11 @@ describe("slantItalics", () => {
     stubLayout();
     const { layer, overlay, state } = layerWith(
       '<span class="md-em">a </span><span class="text-transparent md-em">**</span>' +
-        '<span class="md-em [-webkit-text-stroke:0.04em_currentColor]">b</span>',
+        '<span class="md-em md-strong">b</span>',
     );
     slantItalics(layer, overlay, state);
     const classes = Array.from(overlay.children, (copy) => copy.className);
-    expect(classes).toEqual([
-      "md-slant",
-      "text-transparent md-slant",
-      "[-webkit-text-stroke:0.04em_currentColor] md-slant",
-    ]);
+    expect(classes).toEqual(["md-slant", "text-transparent md-slant", "md-strong md-slant"]);
   });
 
   it("keeps the dotted underline on a span it can't copy exactly (a tab)", () => {
