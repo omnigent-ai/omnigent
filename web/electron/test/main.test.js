@@ -540,6 +540,51 @@ describe("Arca auto-connect wiring", () => {
       assert.equal(saved(h).arca_auto_connect, true);
     });
 
+    it("restores the preference when overlapping attempts all fail", async (t) => {
+      let finishRun;
+      const h = harness(t, {
+        arcaResult: () =>
+          new Promise((resolve) => {
+            finishRun = resolve;
+          }),
+      });
+      // Two setup windows connect the same server; they share one run.
+      const first = connect(h);
+      const second = connect(h);
+      for (let i = 0; i < 20; i++) {
+        // oxlint-disable-next-line no-await-in-loop -- Let both attempts join the run.
+        await tick();
+      }
+      finishRun(failed);
+      assert.equal((await first).ok, false);
+      assert.equal((await second).ok, false);
+      assert.equal(h.calls.arcaConnects.length, 1);
+      assert.equal(saved(h).arca_auto_connect, undefined);
+    });
+
+    it("lets a started run finish, and keep the opt-in, after setup closes", async (t) => {
+      let finishRun;
+      const h = harness(t, {
+        arcaResult: () =>
+          new Promise((resolve) => {
+            finishRun = resolve;
+          }),
+      });
+      let closed = false;
+      const page = { send() {}, once() {}, removeListener() {}, isDestroyed: () => closed };
+      const attempt = connect(h, workspace, page);
+      for (let i = 0; i < 100 && h.calls.arcaConnects.length === 0; i++) {
+        // oxlint-disable-next-line no-await-in-loop -- Wait for the run to start.
+        await tick();
+      }
+      closed = true;
+      finishRun({ ok: true });
+      const result = await attempt;
+      assert.equal(result.ok, true);
+      assert.equal(result.canceled, undefined);
+      assert.equal(saved(h).arca_auto_connect, true);
+    });
+
     it("keeps the manual connect on Databricks servers, even through a hand-edited label", async (t) => {
       const h = harness(t);
       fs.writeFileSync(

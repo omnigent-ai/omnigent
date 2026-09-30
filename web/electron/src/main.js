@@ -394,14 +394,18 @@ const arcaAutoConnect = createArcaAutoConnect({
   log: (message) => console.log(`[omnigent] ${message}`),
 });
 
-/** Onboarding Arca connects that succeeded this launch (see connectOnboardingArca). */
-let onboardingArcaSuccesses = 0;
+/**
+ * The auto-connect opt-in shared by overlapping onboarding connects: how many
+ * are running, the preference from before the first of them, and whether any
+ * succeeded.
+ */
+const onboardingArcaOptIn = { pending: 0, baseline: undefined, succeeded: false };
 
 /**
  * Onboarding's Arca connect, run through the auto-connect state machine so
  * the window's own launch-time connect joins it instead of racing a second
- * `arca ssh`. Picking Arca opts into auto-connect; the opt-in only sticks when
- * the connect succeeds, and a failure never undoes another window's success.
+ * `arca ssh`. Picking Arca opts into auto-connect; overlapping attempts share
+ * the opt-in, and the last to finish keeps it only if any of them succeeded.
  * Like any auto-connect, a started run finishes in the background even if
  * setup closes; nothing starts once it has.
  *
@@ -411,9 +415,13 @@ let onboardingArcaSuccesses = 0;
  * @returns {Promise<{ ok: boolean, canceled?: boolean, alreadyRunning?: boolean, error?: string }>}
  */
 async function connectOnboardingArca(serverUrl, log, isClosed) {
-  const successesBefore = onboardingArcaSuccesses;
+  const optIn = onboardingArcaOptIn;
   const settings = loadSettings();
-  const previous = settings.arca_auto_connect;
+  if (optIn.pending === 0) {
+    optIn.baseline = settings.arca_auto_connect;
+    optIn.succeeded = false;
+  }
+  optIn.pending += 1;
   settings.arca_auto_connect = true;
   saveSettings(settings);
   let result;
@@ -445,15 +453,12 @@ async function connectOnboardingArca(serverUrl, log, isClosed) {
   } catch (error) {
     result = { ok: false, error: error instanceof Error ? error.message : String(error) };
   }
-  const latest = loadSettings();
-  if (result.ok) {
-    onboardingArcaSuccesses += 1;
-    // Another window's failed attempt may have undone the opt-in meanwhile.
-    latest.arca_auto_connect = true;
-    saveSettings(latest);
-  } else if (onboardingArcaSuccesses === successesBefore) {
-    if (previous === undefined) delete latest.arca_auto_connect;
-    else latest.arca_auto_connect = previous;
+  optIn.pending -= 1;
+  if (result.ok) optIn.succeeded = true;
+  if (optIn.pending === 0 && !optIn.succeeded) {
+    const latest = loadSettings();
+    if (optIn.baseline === undefined) delete latest.arca_auto_connect;
+    else latest.arca_auto_connect = optIn.baseline;
     saveSettings(latest);
   }
   return result;
