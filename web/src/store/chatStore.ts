@@ -1600,6 +1600,14 @@ const STREAM_RECONNECT_BASE_MS = 250;
 const STREAM_RECONNECT_MAX_MS = 5_000;
 export const ACTIVE_SESSION_STATUS_RECONCILE_INTERVAL_MS = 60_000;
 export const ACTIVE_SESSION_STATUS_RECONCILE_TIMEOUT_MS = 15_000;
+// After the stream reconnects, `reconcileActiveSessionStatus` runs once
+// immediately — but a server that just restarted may not have reprocessed the
+// in-flight turn's completion yet, so that read can see a stale "running" and
+// leave the tab on "Working…" until the 60s periodic reconcile. These short
+// catch-up delays re-read status a few times over the first ~20s so a status
+// that settles right after reconnect is reflected in seconds, not up to a
+// minute. Each call is guarded + idempotent (see reconcileActiveSessionStatus).
+export const RECONNECT_STATUS_CATCHUP_DELAYS_MS = [3_000, 8_000, 20_000] as const;
 // A reverse proxy serves 404 for the stream route for the ~10-60s a backend
 // container takes to restart (upgrade, config change, re-seed bounce), so a
 // 404 mid-restart must not be treated as permanent. Bound the retries instead
@@ -5314,6 +5322,24 @@ export async function startStreamPump(
         );
         if (reconnecting) {
           await reconcileOnReconnect(id, set, get, ignoredNativeMessageIds);
+          // reconcileOnReconnect can read a stale "running" when the server
+          // just restarted and hasn't reprocessed the turn's completion yet,
+          // stranding the tab on "Working…" until the 60s periodic reconcile.
+          // Re-read status a few times over the next ~20s so a status that
+          // settles shortly after reconnect clears in seconds. Guarded +
+          // idempotent, and scoped to the active conversation by
+          // reconcileActiveSessionStatus itself.
+          if (typeof window !== "undefined") {
+            for (const delayMs of RECONNECT_STATUS_CATCHUP_DELAYS_MS) {
+              const catchupTimer = window.setTimeout(() => {
+                if (controller.signal.aborted || isConversationDisposed(id)) return;
+                void reconcileActiveSessionStatus(id, controller, set, get);
+              }, delayMs);
+              controller.signal.addEventListener("abort", () => window.clearTimeout(catchupTimer), {
+                once: true,
+              });
+            }
+          }
         }
         let reason = await pumpPromise;
 
