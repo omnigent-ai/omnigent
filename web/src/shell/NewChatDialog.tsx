@@ -2389,6 +2389,8 @@ export function NewChatLandingScreen() {
   const [desktopHost, setDesktopHost] = useState<HostIdentity | null>(null);
   // The runner picked during desktop onboarding, preselected once it's online.
   const onboardingHost = useOnboardingRunnerHost(hosts);
+  // Applied (or given up) once, after the first prefill; later resets use the usual defaults.
+  const onboardingHostSettled = useRef(false);
   const [connectingThisMachine, setConnectingThisMachine] = useState(false);
   // Error surfaced when "Run on this machine" fails (sign-in needed, enrollment
   // declined, server unreachable). Rendered in the composer body with a retry,
@@ -2785,14 +2787,17 @@ export function NewChatLandingScreen() {
   // overridden. Holds off while a project prefill is deciding.
   useEffect(() => {
     if (!prefillSettled) return;
+    if (!onboardingHostSettled.current) {
+      if (onboardingHost.pending) return;
+      onboardingHostSettled.current = true;
+      if (onboardingHost.hostId && !sandboxSelected && selectedHostId === null) {
+        writeLastHostChoice(onboardingHost.hostId);
+        setSelectedHostId(onboardingHost.hostId);
+        return;
+      }
+    }
     if (sandboxSelected) return;
     if (selectedHostId !== null) return;
-    if (onboardingHost.pending) return;
-    if (onboardingHost.hostId) {
-      writeLastHostChoice(onboardingHost.hostId);
-      setSelectedHostId(onboardingHost.hostId);
-      return;
-    }
 
     // Read the persisted pick once, as a mount-time seed — deliberately NOT a
     // dependency: it only matters until the slot is filled, and re-running on

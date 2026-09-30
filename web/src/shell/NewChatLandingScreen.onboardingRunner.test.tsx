@@ -1,3 +1,6 @@
+// The new-session picker preselects the runner picked in desktop onboarding
+// (resolved by useOnboardingRunnerHost), ahead of the remembered host.
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type * as SandboxModelOptionsModule from "@/hooks/useSandboxModelOptions";
 
 vi.mock("@/hooks/useSandboxModelOptions", async (importOriginal) => ({
@@ -15,7 +18,6 @@ vi.mock("@/hooks/useSandboxModelOptions", async (importOriginal) => ({
     error: null,
   })),
 }));
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("@/hooks/useSidebarData", () => ({
   useLoadedConversations: () => ({ data: undefined, isLoading: false }),
@@ -24,15 +26,13 @@ vi.mock("@/hooks/useSidebarData", () => ({
 vi.mock("@/hooks/useSkills", () => ({
   useSkills: () => ({ skills: [], skillsStatus: "ready", refetch: vi.fn() }),
 }));
-// The new-session picker preselects the runner picked in desktop onboarding
-// (resolved by useOnboardingRunnerHost), ahead of the remembered host.
 
 import type * as UseConversationsModule from "@/hooks/useConversations";
 import type * as HostWorktreesModule from "@/hooks/useHostWorktrees";
 import type * as AgentLabelsModule from "@/lib/agentLabels";
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import type { ReactNode } from "react";
 
 import type { Host } from "@/hooks/useHosts";
@@ -43,9 +43,10 @@ import { useOnboardingRunnerHost } from "@/hooks/useOnboardingRunnerHost";
 import { readLastHostChoice, writeLastHostChoice } from "@/lib/hostPreferences";
 import { NewChatLandingScreen, resetLandingDraft } from "./NewChatDialog";
 
+let searchParams = new URLSearchParams();
 vi.mock("@/lib/routing", () => ({
   useNavigate: () => vi.fn(),
-  useSearchParams: () => [new URLSearchParams(), vi.fn()],
+  useSearchParams: () => [searchParams, vi.fn()],
 }));
 
 vi.mock("@/store/chatStore", () => ({ setPendingInitialPrompt: vi.fn() }));
@@ -89,9 +90,9 @@ vi.mock("@/lib/agentLabels", async (importOriginal) => ({
 }));
 vi.mock("@/hooks/useOnboardingRunnerHost", () => ({ useOnboardingRunnerHost: vi.fn() }));
 
-function renderLanding(): void {
+function renderLanding() {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-  render(<NewChatLandingScreen />, {
+  return render(<NewChatLandingScreen />, {
     wrapper: ({ children }: { children: ReactNode }) => (
       <QueryClientProvider client={client}>{children}</QueryClientProvider>
     ),
@@ -121,6 +122,7 @@ beforeEach(() => {
   } as ReturnType<typeof useAvailableAgents>);
   // Each test is a fresh page after onboarding: no in-memory composer draft.
   resetLandingDraft();
+  searchParams = new URLSearchParams();
   window.localStorage.clear();
   writeLastHostChoice("host_1");
 });
@@ -133,6 +135,20 @@ describe("NewChatLandingScreen onboarding runner", () => {
     renderLanding();
     await waitFor(() => expect(chip().getAttribute("aria-label")).toContain("onboarding-box"));
     expect(readLastHostChoice()).toBe("host_2");
+  });
+
+  it("applies the onboarding runner once, so a later pick survives a project switch", async () => {
+    vi.mocked(useOnboardingRunnerHost).mockReturnValue({ pending: false, hostId: "host_2" });
+    const { rerender } = renderLanding();
+    await waitFor(() => expect(chip().getAttribute("aria-label")).toContain("onboarding-box"));
+    fireEvent.pointerDown(chip(), { button: 0 });
+    fireEvent.click(screen.getByRole("menuitem", { name: /remembered-box/ }));
+    await waitFor(() => expect(chip().getAttribute("aria-label")).toContain("remembered-box"));
+    // Another project's pencil changes the param in place, which clears the pick.
+    searchParams = new URLSearchParams("project=Beta");
+    rerender(<NewChatLandingScreen />);
+    await waitFor(() => expect(chip().getAttribute("aria-label")).toContain("remembered-box"));
+    expect(readLastHostChoice()).toBe("host_1");
   });
 
   it("keeps the remembered host when onboarding picked nothing", async () => {
