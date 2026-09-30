@@ -22,6 +22,9 @@ implements them separately, so a fix for one harness does not reach the others.
 - `resume`: resume a previous conversation from the CLI (`--resume`, or a bare
   `--resume` picker that lists only this host's sessions) or by reopening it.
 - `steer`: sending while the harness is mid-turn steers the active turn.
+- `pi-compact`: Pi chat queues busy `/compact` even with Always steer enabled;
+  Send now preserves native immediate abort-and-compact behavior. Follow-ups
+  wait, and interruption controls are unavailable during compaction.
 - `chat-render`: the harness's output renders in chat like other harnesses.
 - `cleanup`: stopping, cancelling, or idling a session reaps the harness's
   helper processes and per-session files.
@@ -82,6 +85,9 @@ Cross-harness journeys:
 - **`resume`, bare picker scoped to this host:**
   `tests/e2e/test_native_resume_picker_cross_host_e2e.py::test_bare_resume_picker_excludes_other_hosts_sessions`
 - **`chat-render`, `steer`, per harness:** use the matrix.
+- **`pi-compact`, Pi chat:** follow the [composer compact recipe](./composer.md).
+  In the Pi terminal, `/compact` interrupts and compacts immediately; the
+  visible queue is an Omnigent chat feature.
 - **`cleanup`:** no single cross-harness test. For each harness in scope, start
   a session, stop it (and separately cancel one during startup), then confirm
   no helper process from that session is still running.

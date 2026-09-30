@@ -10,11 +10,13 @@ export function shouldQueueSend(
   queuedMessages: QueuedMessage[],
   alwaysSteer = false,
   opensSideChat = false,
+  compactHarness?: string | null,
 ): boolean {
   if (conversationId === null) return false;
   if (opensSideChat) return false;
   const hasQueued = queuedMessages.some((m) => m.conversationId === conversationId);
-  if (alwaysSteer) return hasQueued;
+  // Pi compact aborts the turn; bypassing its queue requires explicit Send now.
+  if (alwaysSteer && compactHarness !== "pi-native") return hasQueued;
   const isBusy = status === "streaming" || sessionStatus === "running";
   return isBusy || hasQueued;
 }

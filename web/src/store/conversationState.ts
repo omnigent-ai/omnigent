@@ -62,6 +62,7 @@ const CONVERSATION_STATE_KEY_MAP: Record<keyof ConversationState, true> = {
   failedSendDraft: true,
   pendingRetryStableId: true,
   sendLatchedAt: true,
+  piCompactPending: true,
   historyGeneration: true,
   awaitingSideChatFor: true,
 };
@@ -128,6 +129,7 @@ export function createInitialConversationState(): ConversationState {
     failedSendDraft: null,
     pendingRetryStableId: null,
     sendLatchedAt: null,
+    piCompactPending: false,
     historyGeneration: 0,
     awaitingSideChatFor: null,
   };

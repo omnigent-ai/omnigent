@@ -867,6 +867,7 @@ describe("Composer slash-command menu", () => {
     ["codex-native", "/compact extra arguments", "idle"],
     ["pi-native", "/compact", "idle"],
     ["pi-native", "/compact", "running"],
+    ["pi-native", "/compact extra arguments", "idle"],
   ] as const)("%s handles %s (status: %s)", (harness, command, turnStatus) => {
     const { sessionHarness, status, sessionStatus } = useChatStore.getState();
     onTestFinished(() => useChatStore.setState({ sessionHarness, status, sessionStatus }));
@@ -893,9 +894,13 @@ describe("Composer slash-command menu", () => {
 
     fireEvent.change(textarea(), { target: { value: command + " " } });
     fireEvent.keyDown(textarea(), { key: "Enter" });
-    if ((harness === "codex-native" || harness === "claude-sdk") && command !== "/compact") {
+    if (harness !== "claude-native" && command !== "/compact") {
       expect(textarea()).toHaveValue(command + " ");
-      const harnessName = harness === "codex-native" ? "Codex" : "Claude SDK";
+      const harnessName = {
+        "codex-native": "Codex",
+        "pi-native": "Pi",
+        "claude-sdk": "Claude SDK",
+      }[harness];
       expect(
         screen.getByText(`/compact does not accept arguments for ${harnessName}`),
       ).toBeVisible();
@@ -905,16 +910,22 @@ describe("Composer slash-command menu", () => {
     }
     expect(textarea()).toHaveValue("");
     expect(error).not.toHaveBeenCalled();
-    if (harness === "claude-native" || harness === "claude-sdk" || harness === "codex-native") {
-      const sent = harness === "codex-native" ? "/compact" : command;
-      expect(props.onSend).toHaveBeenCalledExactlyOnceWith(sent);
-      expect(compact).not.toHaveBeenCalled();
-      fireEvent.keyDown(textarea(), { key: "ArrowUp" });
-      expect(textarea()).toHaveValue(sent);
-    } else {
-      expect(compact).toHaveBeenCalledOnce();
-      expect(props.onSend).not.toHaveBeenCalled();
-    }
+    expect(props.onSend).toHaveBeenCalledExactlyOnceWith(command);
+    expect(compact).not.toHaveBeenCalled();
+    fireEvent.keyDown(textarea(), { key: "ArrowUp" });
+    expect(textarea()).toHaveValue(command);
+  });
+
+  it("keeps Pi compaction non-interruptible in the composer", () => {
+    const { piCompactPending } = useChatStore.getState();
+    onTestFinished(() => useChatStore.setState({ piCompactPending }));
+    useChatStore.setState({ piCompactPending: true });
+    const props = composerProps({ isNativeWrapper: true, isWorking: true });
+    render(<Composer {...props} />);
+    expect(textarea()).toHaveAttribute("placeholder", "Send a follow-up (queued)");
+    expect(screen.queryByRole("button", { name: "Interrupt" })).toBeNull();
+    fireEvent.keyDown(textarea(), { key: "Escape" });
+    expect(props.onStop).not.toHaveBeenCalled();
   });
 
   it.each(["Enter", "click"])("shows a toast for busy Codex /compact via %s", (submit) => {

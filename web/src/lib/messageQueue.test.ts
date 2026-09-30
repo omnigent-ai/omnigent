@@ -46,6 +46,19 @@ describe("shouldQueueSend", () => {
     expect(shouldQueueSend("conv_a", "idle", "running", [], true)).toBe(false);
   });
 
+  it.each(["pi-native", "claude-native", "claude-sdk", "codex-native"])(
+    "applies Always steer to busy compact for %s",
+    (harness) => {
+      expect(shouldQueueSend("conv_a", "streaming", "idle", [], true, false, harness)).toBe(
+        harness === "pi-native",
+      );
+      expect(shouldQueueSend("conv_a", "idle", "running", [], true, false, harness)).toBe(
+        harness === "pi-native",
+      );
+      expect(shouldQueueSend("conv_a", "idle", "idle", [], true, false, harness)).toBe(false);
+    },
+  );
+
   it("still queues under alwaysSteer when this conversation has a queued message", () => {
     // The ordering guard outranks always-steer: draining must stay in order, so
     // a direct send can't overtake a still-queued earlier one.

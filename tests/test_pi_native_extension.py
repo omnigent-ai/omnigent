@@ -1920,9 +1920,8 @@ def test_compact_payload_without_ctx_compact_surfaces_error_and_consumes_file(
     200, so the server runs no AP-side fallback — if the extension stayed silent
     the user's /compact would vanish with no feedback. ``triggerCompaction`` must
     instead post a visible ``external_conversation_item`` error
-    (``pi_compact_unavailable``) and raise NO spinner edge (zero
-    ``external_compaction_status`` events, so the web spinner created only by the
-    ``response.compaction.in_progress`` SSE never appears and cannot strand). The
+    (``pi_compact_unavailable``) and a failed compaction edge to release the web
+    queue, without raising a spinner. The
     payload file is still consumed (unlinked) so the poller does not re-read it.
     """
     node = shutil.which("node")
@@ -1988,7 +1987,7 @@ const pi = {
 require(extensionPath)(pi);
 
 // Resident context WITHOUT a compact() function: triggerCompaction must
-// short-circuit and post nothing.
+// surface the error and release the web queue without starting compaction.
 const ctx = {
   sessionManager: { getSessionId: () => "native-session-1" },
   ui: { setTitle() {}, setStatus() {}, notify() {} },
@@ -2007,9 +2006,8 @@ const ctx = {
   const compactionStatuses = postedEvents.filter(
     (event) => event.type === "external_compaction_status",
   );
-  // No spinner is ever raised: zero compaction-status edges (most importantly
-  // no in_progress), so nothing can strand.
-  assert.deepEqual(compactionStatuses, [], JSON.stringify(postedEvents));
+  // Release the web queue without raising a spinner.
+  assert.deepEqual(compactionStatuses.map((e) => e.data.status), ["failed"]);
 
   // The failure is surfaced as a visible conversation error item rather than
   // silently swallowed, so the user knows /compact did nothing.

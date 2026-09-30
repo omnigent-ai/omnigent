@@ -33,6 +33,9 @@ and steers messages while the agent is busy.
   can be steered into the running turn.
 - `browser-pointer-queue`: desktop Design-mode instructions follow the same queue
   and always-steer preference, keeping their element screenshots.
+- `pi-compact`: busy Pi `/compact` queues even with Always steer enabled;
+  Send now interrupts the turn and compacts immediately. Follow-ups wait for
+  compaction, during which Interrupt and Escape-to-stop are unavailable.
 - `draft-persistence`: unsent text survives arriving messages and prompts.
 - `mobile-labels`: on narrow screens labels collapse to icons without
   overlapping the stop button.
@@ -49,6 +52,8 @@ and steers messages while the agent is busy.
 - Type `/` in the message box; attach files with the button, by paste, or by
   dropping them on the transcript.
 - Send while the agent is working to queue a message, then steer it.
+- In a Pi session, submit `/compact`, then use its queued item's Send now action
+  to compact immediately instead of waiting for the turn to finish.
 
 **Desktop browser pointer** (open a session in the desktop app):
 
@@ -123,6 +128,11 @@ Tests under `tests/browser_ui/` stub every backend call and need no instance:
   Repeat in a fresh session with Always steer on: both entry points send while
   busy and the pointer popup says "Sent to agent." If older messages are already
   queued, new pointer instructions must join them even with Always steer on.
+- **`pi-compact`:** manually enable Always steer, start a long Pi turn, type
+  `/comp`, press Tab, then Enter. Tab should only complete the draft; Enter
+  should visibly queue `/compact` without interrupting the turn. Queue a
+  follow-up and confirm it waits for compaction to finish. Repeat using Send
+  now; compaction should interrupt the turn, hide Interrupt, and ignore Escape.
 - **`draft-persistence`:**
   `tests/e2e_ui/chat/test_draft_survives_incoming_messages.py::test_mid_typing_answer_survives_arriving_prompt`
 - **`mobile-labels`, new-session composer:**

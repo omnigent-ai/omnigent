@@ -935,6 +935,7 @@ export function ChatPage() {
           chat.queuedMessages,
           readAlwaysSteer(),
           opensSideChat,
+          text.trim() === "/compact" && !files?.length ? chat.sessionHarness : undefined,
         )
       ) {
         chat.enqueueMessage(text, files, replyDraft);
@@ -2441,7 +2442,11 @@ function ComposerImpl(
   // Highlight overlay mirroring the textarea; scroll-synced so the tinted
   // `/skill` token stays aligned once the draft grows past the visible rows.
   const backdropRef = useRef<HTMLDivElement>(null);
+  const piCompactPending = useChatStore((s) => s.piCompactPending);
   const isStreaming = status === "streaming";
+  const followUpPlaceholder = piCompactPending
+    ? "Send a follow-up (queued)"
+    : "Send a follow-up (queued) — Esc to stop";
 
   // Read-only when either the user lacks a write grant OR the session
   // is structurally non-interactive (``readOnlyReason``). The
@@ -2516,6 +2521,7 @@ function ComposerImpl(
     maybeFlushQueuedHead();
   }, [
     status,
+    piCompactPending,
     sessionStatus,
     queuedMessages,
     conversationId,
@@ -2874,6 +2880,7 @@ function ComposerImpl(
   const hasDraft = fullText.trim().length > 0 || files.length > 0 || mentionedItems.length > 0;
   const showInterruptButton =
     isWorking &&
+    !piCompactPending &&
     (!hasDraft ||
       hasPendingElicitation ||
       isTempConvId(conversationId) ||
@@ -2954,8 +2961,17 @@ function ComposerImpl(
           setCommandError("/compact is not supported for this agent type");
           return true;
         }
-        if ((sessionHarness === "codex-native" || sessionHarness === "claude-sdk") && arg) {
-          const harnessName = sessionHarness === "codex-native" ? "Codex" : "Claude SDK";
+        if (
+          (sessionHarness === "codex-native" ||
+            sessionHarness === "claude-sdk" ||
+            sessionHarness === "pi-native") &&
+          arg
+        ) {
+          const harnessName = {
+            "codex-native": "Codex",
+            "pi-native": "Pi",
+            "claude-sdk": "Claude SDK",
+          }[sessionHarness];
           setCommandError(`/compact does not accept arguments for ${harnessName}`);
           return true;
         }
@@ -2980,9 +2996,10 @@ function ComposerImpl(
         if (
           sessionHarness === "claude-native" ||
           sessionHarness === "claude-sdk" ||
-          sessionHarness === "codex-native"
+          sessionHarness === "codex-native" ||
+          sessionHarness === "pi-native"
         ) {
-          // Use the message queue; the store dispatches SDK and Codex as controls.
+          // Use the message queue; the store dispatches SDK, Codex and Pi as controls.
           const command = arg ? `/compact ${arg}` : "/compact";
           appendEntry(command);
           onSend(command);
@@ -3467,7 +3484,7 @@ function ComposerImpl(
     // Esc cancels an in-flight turn. When idle it's a no-op — clearing on
     // Esc destroys typed prompts with no undo (common muscle memory after
     // dismissing autocomplete suggestions).
-    if (e.key === "Escape" && isWorking && !isReadOnly) {
+    if (e.key === "Escape" && isWorking && !piCompactPending && !isReadOnly) {
       e.preventDefault();
       onStop();
       return;
@@ -3680,8 +3697,8 @@ function ComposerImpl(
                     ? "Respond to the pending request above to continue"
                     : disabled && sendDisabledReason === null
                       ? "Waiting for agents…"
-                      : isStreaming
-                        ? "Send a follow-up (queued) — Esc to stop"
+                      : isStreaming || piCompactPending
+                        ? followUpPlaceholder
                         : "Send a message…",
           rows: 1,
           disabled:

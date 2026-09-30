@@ -173,6 +173,8 @@ export interface SendOptions {
    * dedup recognises the retry and does not re-dispatch to the runner.
    */
   stableId?: string;
+  /** Preserve submission order if a queued send is deferred again. */
+  queueOrder?: number;
   /**
    * Reuse the optimistic bubble already on the target entry (pushed by
    * `beginLocalConversation`) instead of pushing a fresh one, so the navigate-
@@ -826,6 +828,8 @@ export interface ConversationState {
    * travel together (adoption on new-chat, eviction, mirroring).
    */
   sendLatchedAt: number | null;
+  /** Pi compact has its own completion event, independent of the aborted turn. */
+  piCompactPending: boolean;
   /**
    * LLM model identifier from the bound agent's spec for the active
    * session, e.g. ``"anthropic/claude-sonnet-4-6"``. Populated from
@@ -1398,11 +1402,14 @@ function cachedConversationStatus(conversationId: string): string | undefined {
  * latch is overridden only once it has outlived any plausible POST AND the
  * session's own row disagrees with it. A live streaming response is never stale.
  */
-function sendLatchIsStranded(s: ChatState): boolean {
+function sendLatchIsStranded(s: ChatState, unlistedStatus?: string): boolean {
   if (s.sendLatchedAt === null || Date.now() - s.sendLatchedAt < SEND_CHAIN_MAX_WAIT_MS)
     return false;
   if (s.activeResponse?.state === "streaming") return false;
-  return s.conversationId !== null && cachedConversationStatus(s.conversationId) === "idle";
+  return (
+    s.conversationId !== null &&
+    (cachedConversationStatus(s.conversationId) ?? unlistedStatus) === "idle"
+  );
 }
 
 // One send chain per conversation, keyed by conversation id. A `send` waits on
@@ -1816,6 +1823,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   failedSendDraft: null,
   pendingRetryStableId: null,
   sendLatchedAt: null,
+  piCompactPending: false,
   llmModel: null,
   pendingModelChange: null,
   sessionHarness: null,
@@ -1842,24 +1850,16 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   enqueueMessage: (text, files, replyDraft) => {
     const { conversationId, boundAgentId, sessionHarness } = get();
     if (conversationId === null) return;
-    queueSeq += 1;
-    const queueId = `q_${queueSeq}`;
-    const stableId = randomUUID().replace(/-/g, "");
-    setActive((s) => ({
-      queuedMessages: [
-        ...s.queuedMessages,
-        {
-          queueId,
-          text,
-          ...(isCompactControl(sessionHarness, text, files) ? { command: "compact" as const } : {}),
-          stableId,
-          conversationId,
-          ...(boundAgentId !== null ? { agentId: boundAgentId } : {}),
-          ...(files && files.length > 0 ? { files } : {}),
-          ...(replyDraft ? { replyDraft } : {}),
-        },
-      ],
-    }));
+    appendQueuedMessage(
+      {
+        text,
+        conversationId,
+        ...(boundAgentId !== null ? { agentId: boundAgentId } : {}),
+        ...(files?.length ? { files } : {}),
+        ...(replyDraft ? { replyDraft } : {}),
+      },
+      sessionHarness,
+    );
     // A message queued while the agent is idle (a race where the send routed
     // to the queue but the turn had already ended) would otherwise wait for an
     // idle edge that never comes — flush now.
@@ -1906,9 +1906,12 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     const target = s.queuedMessages.find((m) => m.queueId === queueId);
     const agentId = target?.agentId ?? s.boundAgentId;
     if (target === undefined || agentId === null) return;
+    if (rejectDuringPiCompact(target.conversationId)) return;
     if (target.command === "compact" && rejectBusyCompact(target.conversationId)) return;
     // Remove BEFORE the POST so a concurrent flush can't also send it.
-    setActive({ queuedMessages: s.queuedMessages.filter((m) => m.queueId !== queueId) });
+    setActive((current) => ({
+      queuedMessages: current.queuedMessages.filter((m) => m.queueId !== queueId),
+    }));
     void s.send(target.text, agentId, target.files, queuedSendOptions(target));
   },
 
@@ -1916,6 +1919,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     const s = get();
     const own = s.queuedMessages.filter((m) => m.conversationId === conversationId);
     if (own.length === 0) return;
+    if (rejectDuringPiCompact(conversationId)) return;
     // SDK buffers compact with the rest of the batch; Codex needs an idle turn.
     const compactIndex =
       setterForState(conversationId)?.sessionHarness === "claude-sdk"
@@ -1929,9 +1933,9 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     if (batch.some((m) => (m.agentId ?? s.boundAgentId) === null)) return;
     const batchOrder = new Map(batch.map((m, index) => [m.queueId, index]));
     // Remove BEFORE the POSTs so a concurrent flush can't also send one.
-    setActive({
-      queuedMessages: s.queuedMessages.filter((m) => !batchOrder.has(m.queueId)),
-    });
+    setActive((current) => ({
+      queuedMessages: current.queuedMessages.filter((m) => !batchOrder.has(m.queueId)),
+    }));
     for (const m of batch) {
       const agentId = m.agentId ?? s.boundAgentId;
       if (agentId === null) continue;
@@ -1949,7 +1953,9 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   },
 
   maybeFlushQueuedHead: () => {
+    recoverStrandedPiCompact(get());
     const s = get();
+    if (s.piCompactPending) return;
     // Flush once the agent loop is free to take a turn. `waiting` is NOT busy:
     // the turn already ended and only background work (background shells /
     // sub-agents) outlives it, so the server accepts a new turn immediately —
@@ -1987,6 +1993,8 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   },
 
   flushBackgroundQueues: () => {
+    // Sidebar polling also releases stranded compact holds with no queued follow-up.
+    for (const entry of conversationRegistry.all()) recoverStrandedPiCompact(entryGetter(entry)());
     const s = get();
     if (queryClient === null || s.queuedMessages.length === 0) return;
 
@@ -2022,7 +2030,12 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       if (statusById.get(conversationId) !== "idle") continue;
       // The sidebar can still say idle while a compact control starts.
       const local = setterForState(conversationId);
-      if (local?.sessionHarness === "codex-native" || local?.sessionHarness === "claude-sdk") {
+      if (local?.piCompactPending) continue;
+      if (
+        local?.sessionHarness === "codex-native" ||
+        local?.sessionHarness === "claude-sdk" ||
+        local?.sessionHarness === "pi-native"
+      ) {
         if (local.sessionStatus === "running") continue;
         if (local.status === "streaming") {
           if (!sendLatchIsStranded(local)) continue;
@@ -2167,17 +2180,40 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     // plaintext — the runner forks in-process. Generic harnesses intercept
     // `/side` in the composer and call the server side-chat endpoint instead, so
     // their `/side` text never reaches `send`.
+    const targetState = pinnedId === null ? get() : setterForState(pinnedId);
+    const priorSendLatchedAt = targetState?.sendLatchedAt ?? null;
+    const queueOrder = opts?.queueOrder ?? ++queueSeq;
+    const queueDuringPiCompact = (state: ChatState | null): boolean => {
+      if (!state?.piCompactPending || state.conversationId === null) return false;
+      appendQueuedMessage(
+        {
+          text,
+          agentId,
+          stableId,
+          conversationId: state.conversationId,
+          ...(files?.length ? { files } : {}),
+          ...(opts?.replyDraft ? { replyDraft: opts.replyDraft } : {}),
+          ...(opts?.command ? { command: opts.command } : {}),
+        },
+        state.sessionHarness,
+        queueOrder,
+      );
+      return true;
+    };
+    if (queueDuringPiCompact(targetState)) return;
     const opensSideChat =
       usesNativeSideChatFork(get().sessionHarness) && isSideChatCommand(text.trim());
     if (opensSideChat) {
       useChatStore.setState({ awaitingSideChatFor: pinnedId ?? get().conversationId });
     }
-    const targetState = pinnedId === null ? get() : setterForState(pinnedId);
     const compacts =
       opts?.command === "compact" || isCompactControl(targetState?.sessionHarness, text, files);
     if (compacts && rejectBusyCompact(pinnedId ?? get().conversationId)) {
       opts?.onError?.("Compact is disabled while a chat is in progress");
       return;
+    }
+    if (compacts && targetState?.sessionHarness === "pi-native") {
+      pinnedSetter({ piCompactPending: true, sendLatchedAt: Date.now() });
     }
     const skipPendingBubble = opensSideChat || compacts;
     const initialDraft =
@@ -2295,10 +2331,21 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       if (initialDraft && !(await waitForModelSelection(sessionId, tempId))) return;
 
       if (compacts) {
-        // Compact controls emit turn status edges, but no user
-        // message acknowledgement. Keep the send latch without a pending bubble.
+        // A background entry may have learned its harness during binding.
+        if (setterForState(sessionId)?.sessionHarness === "pi-native") {
+          setterFor(sessionId)({ piCompactPending: true, sendLatchedAt: Date.now() });
+        }
+        // Controls have no user-message acknowledgement; completion releases the latch.
         await postEvent(sessionId, { type: "compact", data: {} });
         queryClient?.invalidateQueries({ queryKey: ["conversations"] });
+        return;
+      }
+
+      // Binding can discover Pi after this send passed the initial hold check.
+      if (queueDuringPiCompact(setterForState(sessionId))) {
+        setterFor(sessionId)((s) => ({
+          pendingUserMessages: s.pendingUserMessages.filter((p) => p.tempId !== tempId),
+        }));
         return;
       }
 
@@ -2449,6 +2496,12 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         failTarget === null ? get() : (setterForState(failTarget) ?? get());
       // Roll back the optimistic bubble — no server idle will fire.
       failSet((s) => ({
+        ...(compacts && s.piCompactPending
+          ? {
+              piCompactPending: false,
+              ...(alreadyStreaming ? { sendLatchedAt: priorSendLatchedAt } : {}),
+            }
+          : {}),
         pendingUserMessages: s.pendingUserMessages.filter((p) => p.tempId !== tempId),
       }));
       if (!alreadyStreaming) {
@@ -3208,13 +3261,39 @@ function setActive(partial: Partial<ChatState> | ((state: ChatState) => Partial<
 
 // ── Internal helpers ─────────────────────────────────────
 
+function appendQueuedMessage(
+  message: Omit<QueuedMessage, "queueId">,
+  harness: string | null | undefined,
+  order?: number,
+): void {
+  const queued: QueuedMessage = {
+    ...message,
+    queueId: `q_${order ?? ++queueSeq}`,
+    stableId: message.stableId ?? randomUUID().replace(/-/g, ""),
+    ...(isCompactControl(harness, message.text, message.files)
+      ? { command: "compact" as const }
+      : {}),
+  };
+  setActive((s) => {
+    if (order === undefined) return { queuedMessages: [...s.queuedMessages, queued] };
+    // A send waiting for binding predates messages queued while it was waiting.
+    const next = s.queuedMessages.findIndex(
+      (m) => m.conversationId === message.conversationId && Number(m.queueId.slice(2)) > order,
+    );
+    const at = next < 0 ? s.queuedMessages.length : next;
+    return {
+      queuedMessages: [...s.queuedMessages.slice(0, at), queued, ...s.queuedMessages.slice(at)],
+    };
+  });
+}
+
 function isCompactControl(
   harness: string | null | undefined,
   text: string,
   files?: File[],
 ): boolean {
   return (
-    (harness === "codex-native" || harness === "claude-sdk") &&
+    (harness === "codex-native" || harness === "claude-sdk" || harness === "pi-native") &&
     !files?.length &&
     text.trim() === "/compact"
   );
@@ -3222,10 +3301,43 @@ function isCompactControl(
 
 function rejectBusyCompact(conversationId: string | null): boolean {
   const state = conversationId === null ? undefined : setterForState(conversationId);
-  if (state?.sessionHarness === "claude-sdk") return false;
+  if (state?.sessionHarness === "claude-sdk" || state?.sessionHarness === "pi-native") return false;
   if (state?.status !== "streaming" && state?.sessionStatus !== "running") return false;
   toast.error("Compact is disabled while a chat is in progress", { richColors: true });
   return true;
+}
+
+function rejectDuringPiCompact(conversationId: string | null): boolean {
+  const state = conversationId === null ? undefined : setterForState(conversationId);
+  if (!state?.piCompactPending) return false;
+  recoverStrandedPiCompact(state);
+  if (!setterForState(conversationId!)?.piCompactPending) return false;
+  toast.error("Wait for Pi compaction to finish before sending", { richColors: true });
+  return true;
+}
+
+function recoverStrandedPiCompact(state: ChatState): void {
+  // Child sessions may have no sidebar row; use their own status as a fallback.
+  if (!state.piCompactPending || !sendLatchIsStranded(state, state.sessionStatus)) return;
+  // A lost completion is ambiguous. Preserve the queue for explicit retry.
+  sendChains.delete(state.conversationId!);
+  setterFor(state.conversationId)((s) => ({
+    piCompactPending: false,
+    status: "idle",
+    sendLatchedAt: null,
+    blocks: [
+      ...s.blocks.filter((b) => b.type !== "compaction_loading"),
+      makeClientErrorBlock(
+        "Pi compaction exceeded the wait limit. Check the terminal, then use Retry to resume queued messages.",
+        "",
+      ),
+    ],
+  }));
+  setActive((s) => ({
+    queuedMessages: s.queuedMessages.map((m) =>
+      m.conversationId === state.conversationId ? { ...m, requiresRetry: true } : m,
+    ),
+  }));
 }
 
 function queuedSendOptions(
@@ -3235,6 +3347,7 @@ function queuedSendOptions(
   const stableId = message.stableId ?? randomUUID().replace(/-/g, "");
   return {
     command: message.command,
+    queueOrder: Number(message.queueId.slice(2)),
     replyDraft: message.replyDraft,
     stableId,
     pinnedConversationId: message.conversationId,
@@ -6475,6 +6588,17 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
     setterFor(sourceConversationId)(patch);
   };
 
+  const finishPiCompact = (): void => {
+    if (sourceConversationId === null || !setterForState(sourceConversationId)?.piCompactPending)
+      return;
+    applyToConversation((s) => ({
+      piCompactPending: false,
+      ...(s.sessionStatus !== "running" ? { status: "idle", sendLatchedAt: null } : {}),
+    }));
+    // Pi emits no turn-idle edge after manual compaction to wake background queues.
+    useChatStore.getState().flushBackgroundQueues();
+  };
+
   /**
    * Same as {@link applyToConversation}, for events that name their own target.
    *
@@ -6603,6 +6727,8 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       });
       return;
     case "error":
+      // Older Pi extensions report this failure without a compaction-status edge.
+      if (event.error.code === "pi_compact_unavailable") finishPiCompact();
       // A `model_change_not_applied` error is the loud outcome of a model
       // ask the pane never took: settle the pending indicator (the chip
       // already shows the true model). The error block itself renders
@@ -6709,6 +6835,7 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       if (event.totalTokens != null) {
         applyToConversation({ tokensUsed: event.totalTokens });
       }
+      finishPiCompact();
       return;
     case "compaction_failed":
       // Compaction failed — history is unchanged. Remove every
@@ -6719,6 +6846,7 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
         const blocks = s.blocks.filter((b) => b.type !== "compaction_loading");
         return blocks.length === s.blocks.length ? {} : { blocks };
       });
+      finishPiCompact();
       return;
     case "policy_denied":
       // Policy denied the user input — drop the optimistic bubble (the

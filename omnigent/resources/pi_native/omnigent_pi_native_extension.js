@@ -862,7 +862,7 @@ function interruptActiveContext(ctx) {
  *   - No resident compaction API (ctx missing or ctx.compact not a function):
  *     post a visible error item so a user's /compact does not silently vanish
  *     (the runner already returned 200, so the server runs no fallback), post
- *     no spinner edge, return false.
+ *     failed to release queued follow-ups, return false.
  *   - ctx.compact() threw synchronously: in_progress was already posted, so the
  *     catch posts failed to dismiss the spinner, return false.
  *   - Submitted: in_progress posted and awaited; completed/failed follows from
@@ -884,6 +884,10 @@ async function triggerCompaction(config, ctx, customInstructions) {
             "Pi version may not support it.",
         },
       },
+    });
+    await postEvent(config, {
+      type: "external_compaction_status",
+      data: { status: "failed" },
     });
     return false;
   }
