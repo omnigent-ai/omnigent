@@ -951,8 +951,9 @@ def register_core_routes(
         _reject_server_reserved_label_seed(parsed_metadata.labels)
 
         inherited_runner_id: str | None = None
+        parent_conv = None
         if parsed_metadata.parent_session_id is not None:
-            inherited_runner_id = await _authorize_bundled_parent_and_inherit_runner(
+            parent_conv, inherited_runner_id = await _authorize_bundled_parent_and_inherit_runner(
                 parsed_metadata.parent_session_id,
                 user_id=user_id,
                 permission_store=permission_store,
@@ -1013,7 +1014,7 @@ def register_core_routes(
             user_id=user_id,
             conversation_store=conversation_store,
             host_store=getattr(request.app.state, "host_store", None),
-            inference_snapshot=inference_snapshot,
+            parent=parent_conv,
         )
         with creation_stage("create_persistence_ms"):
             result = await asyncio.to_thread(

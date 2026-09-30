@@ -9949,7 +9949,7 @@ async def _create_session_from_existing_agent(
     # is assigned to the same runner (sub-agent co-location).
     inherited_runner_id: str | None = None
     if body.parent_session_id is not None:
-        parent_conv = conversation_store.get_conversation(body.parent_session_id)
+        parent_conv = _parent_for_routing
         if parent_conv is not None:
             inherited_runner_id = parent_conv.runner_id
             # Defense-in-depth: don't inherit a runner the
@@ -9962,6 +9962,24 @@ async def _create_session_from_existing_agent(
                 runner_owner = runner_router.runner_owner(inherited_runner_id)
                 if runner_owner is not None and runner_owner != user_id:
                     inherited_runner_id = None
+
+    # Workspace validation: if the caller is binding to a host,
+    # they must also pass a workspace, and the workspace must
+    # satisfy the agent's os_env.cwd boundary on that host (per
+    # designs/SESSION_WORKSPACE_SELECTION.md). Done before
+    # create_conversation so a bad workspace never produces a row.
+    # With git worktree creation, the validated path is the source
+    # repo; the worktree it produces becomes the stored workspace.
+    canonical_workspace: str | None = body.workspace
+    if body.host_id is not None:
+        canonical_workspace = await _validate_session_workspace(
+            user_id=user_id,
+            host_id=body.host_id,
+            workspace=body.workspace,
+            agent=agent,
+            agent_cache=agent_cache,
+            request=request,
+        )
 
     from omnigent.server.routes._session_harness_readiness import (
         validate_create_harness_readiness,
@@ -9982,26 +10000,8 @@ async def _create_session_from_existing_agent(
         user_id=user_id,
         conversation_store=conversation_store,
         host_store=getattr(request.app.state, "host_store", None),
-        inference_snapshot=inference_snapshot,
+        parent=_parent_for_routing,
     )
-
-    # Workspace validation: if the caller is binding to a host,
-    # they must also pass a workspace, and the workspace must
-    # satisfy the agent's os_env.cwd boundary on that host (per
-    # designs/SESSION_WORKSPACE_SELECTION.md). Done before
-    # create_conversation so a bad workspace never produces a row.
-    # With git worktree creation, the validated path is the source
-    # repo; the worktree it produces becomes the stored workspace.
-    canonical_workspace: str | None = body.workspace
-    if body.host_id is not None:
-        canonical_workspace = await _validate_session_workspace(
-            user_id=user_id,
-            host_id=body.host_id,
-            workspace=body.workspace,
-            agent=agent,
-            agent_cache=agent_cache,
-            request=request,
-        )
 
     # Git worktree options (optional). Two modes on body.git:
     #  - create (default): make a worktree; it becomes the stored
@@ -10151,10 +10151,7 @@ async def _create_session_from_existing_agent(
         initial_labels.update(_subagent_labels)
     elif (
         body.sub_agent_name is None
-        and native_coding_agent_for_harness(
-            await asyncio.to_thread(_create_resolved_harness, agent, harness_override, agent_cache)
-        )
-        is not None
+        and native_coding_agent_for_harness(selected_harness) is not None
     ):
         initial_labels[_CLAUDE_NATIVE_UI_LABEL_KEY] = _CLAUDE_NATIVE_UI_LABEL_VALUE
     elif body.sub_agent_name is None and body.host_id is not None:

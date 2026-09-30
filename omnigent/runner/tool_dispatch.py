@@ -5589,29 +5589,43 @@ def _in_spawn_family(builtins: list[_JsonObject], family: str | None) -> list[_J
     return kept
 
 
+_AGENT_READINESS_TIMEOUT_S = 5.0
+_AGENT_READINESS_MAX_DEPTH = 16
+
+
 async def _agent_list_host_readiness(
     server_client: httpx.AsyncClient,
     conversation_id: str | None,
 ) -> _JsonObject | None:
-    """Find readiness on the caller's host, including inherited child placement."""
-    seen: set[str] = set()
-    while conversation_id and conversation_id not in seen:
-        seen.add(conversation_id)
-        try:
-            response = await server_client.get(
-                f"/v1/sessions/{conversation_id}",
-                params={"include_items": "false", "include_liveness": "false"},
-                timeout=5.0,
-            )
-            if response.status_code != 200:
-                return None
-            snapshot = response.json()
-            host_id = snapshot.get("host_id")
-            if isinstance(host_id, str) and host_id:
+    """Use the runner's host identity, with a bounded legacy session fallback."""
+    from omnigent.runner.identity import RUNNER_SLICE_KEY_ENV_VAR
+
+    try:
+        async with asyncio.timeout(_AGENT_READINESS_TIMEOUT_S):
+            host_id = os.environ.get(RUNNER_SLICE_KEY_ENV_VAR)
+            if host_id:
                 return await _host_harnesses_or_none(host_id, server_client)
-            conversation_id = _optional_string(snapshot.get("parent_session_id"))
-        except (httpx.HTTPError, ValueError, AttributeError):
-            return None
+            seen: set[str] = set()
+            while conversation_id and conversation_id not in seen:
+                if len(seen) >= _AGENT_READINESS_MAX_DEPTH:
+                    return None
+                seen.add(conversation_id)
+                response = await server_client.get(
+                    f"/v1/sessions/{conversation_id}",
+                    params={"include_items": "false", "include_liveness": "false"},
+                    timeout=_AGENT_READINESS_TIMEOUT_S,
+                )
+                if response.status_code != 200:
+                    return None
+                snapshot = _string_object_dict(response.json())
+                if snapshot is None:
+                    return None
+                host_id = _optional_string(snapshot.get("host_id"))
+                if host_id:
+                    return await _host_harnesses_or_none(host_id, server_client)
+                conversation_id = _optional_string(snapshot.get("parent_session_id"))
+    except (TimeoutError, httpx.HTTPError, ValueError):
+        return None
     return None
 
 
@@ -5660,30 +5674,24 @@ async def _agent_list_via_rest(
         bounded page with continuation metadata.
     """
     source_limit = limit or _AGENT_LIST_PAGE_LIMIT
-    builtins_page = (
-        _DiscoveryPage([], False)
-        if cursor_state["builtins"][0] == _DISCOVERY_END
-        else await _agent_list_fetch(
-            "/v1/agents",
-            server_client,
-            after=cursor_state["builtins"][1],
-            limit=source_limit,
+
+    async def fetch_page(section: str, path: str) -> _DiscoveryPage:
+        if cursor_state[section][0] == _DISCOVERY_END:
+            return _DiscoveryPage([], False)
+        return await _agent_list_fetch(
+            path, server_client, after=cursor_state[section][1], limit=source_limit
         )
-    )
-    sessions_page = (
-        _DiscoveryPage([], False)
-        if cursor_state["session_agents"][0] == _DISCOVERY_END
-        else await _agent_list_fetch(
-            "/v1/sessions",
-            server_client,
-            after=cursor_state["session_agents"][1],
-            limit=source_limit,
-        )
-    )
+
     spec = _effective_runner_os_env_spec(agent_spec, conversation_id, runner_workspace)
     assert spec.cwd is not None
     configs_dir = Path(spec.cwd) / _AGENT_CONFIG_SUBDIR
-    local_configs = await asyncio.to_thread(_scan_local_agent_configs, configs_dir)
+    builtins_page, sessions_page, local_configs, readiness, family = await asyncio.gather(
+        fetch_page("builtins", "/v1/agents"),
+        fetch_page("session_agents", "/v1/sessions"),
+        asyncio.to_thread(_scan_local_agent_configs, configs_dir),
+        _agent_list_host_readiness(server_client, conversation_id),
+        _spawn_family(server_client, conversation_id),
+    )
     local_state, local_after = cursor_state["local_configs"]
     if local_state == _DISCOVERY_END:
         remaining_configs = []
@@ -5698,17 +5706,15 @@ async def _agent_list_via_rest(
         sessions_page.rows,
         remaining_configs[:source_limit],
     )
-    listing["builtins"] = _in_spawn_family(
-        listing["builtins"], await _spawn_family(server_client, conversation_id)
-    )
+    listing["builtins"] = _in_spawn_family(listing["builtins"], family)
     from omnigent.harness_availability import reported_harness_availability
 
-    readiness = await _agent_list_host_readiness(server_client, conversation_id)
     for row in listing["builtins"]:
         available, reason = reported_harness_availability(
             _optional_string(row.get("harness")), readiness
         )
-        row["available_on_host"] = available
+        # Local auth reports cannot see credentials supplied by the session.
+        row["available_on_host"] = None if reason == "needs-auth" else available
         row["unavailable_reason"] = reason
     return _bounded_discovery_result(
         listing,

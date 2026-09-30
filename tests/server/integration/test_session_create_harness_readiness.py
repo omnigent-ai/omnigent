@@ -12,9 +12,7 @@ pytestmark = pytest.mark.asyncio
 
 
 @pytest.mark.parametrize("bundle", [False, True])
-@pytest.mark.parametrize(
-    "readiness", [False, "binary-missing", "needs-auth", "version-too-low", "absent"]
-)
+@pytest.mark.parametrize("readiness", [False, "binary-missing", "version-too-low", "absent"])
 async def test_child_create_rejects_unavailable_harness(
     client: httpx.AsyncClient,
     app: FastAPI,
@@ -71,7 +69,7 @@ async def test_child_create_rejects_unavailable_harness(
     assert len(store.list_conversations(limit=100).data) == len(before)
 
 
-@pytest.mark.parametrize("readiness", [None, {}, {"jcode": True}])
+@pytest.mark.parametrize("readiness", [None, {}, {"jcode": True}, {"jcode": "needs-auth"}])
 async def test_child_create_preserves_ready_and_unknown_hosts(
     client: httpx.AsyncClient,
     app: FastAPI,
@@ -107,8 +105,16 @@ async def test_top_level_create_rejects_unavailable_harness(
     client: httpx.AsyncClient,
     app: FastAPI,
     db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    from unittest.mock import AsyncMock
+
+    from omnigent.server.routes._sessions import orchestration
     from omnigent.stores.host_store import HostStore
+
+    monkeypatch.setattr(
+        orchestration, "_validate_session_workspace", AsyncMock(return_value="/tmp/workspace")
+    )
 
     agent = await create_test_agent(client)
     hosts = HostStore(db_uri)
@@ -136,9 +142,17 @@ async def test_agent_id_child_uses_parent_host_even_if_request_names_another(
     client: httpx.AsyncClient,
     app: FastAPI,
     db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    from unittest.mock import AsyncMock
+
+    from omnigent.server.routes._sessions import orchestration
     from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
     from omnigent.stores.host_store import HostStore
+
+    monkeypatch.setattr(
+        orchestration, "_validate_session_workspace", AsyncMock(return_value="/tmp/workspace")
+    )
 
     parent_agent = await create_test_agent(client)
     jcode = await create_test_agent(
@@ -180,59 +194,39 @@ async def test_agent_id_child_uses_parent_host_even_if_request_names_another(
     assert response.json()["error"]["code"] == "harness_not_configured"
 
 
-@pytest.mark.parametrize("reason,allowed", [("needs-auth", True), ("binary-missing", False)])
-async def test_inference_binding_only_overrides_auth_readiness(
+async def test_loaded_parent_does_not_require_another_session_read(
+    client: httpx.AsyncClient,
     db_uri: str,
-    reason: str,
-    allowed: bool,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from omnigent.errors import ErrorCode, OmnigentError
     from omnigent.server.routes._session_harness_readiness import validate_create_harness_readiness
     from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
     from omnigent.stores.host_store import HostStore
 
+    agent = await create_test_agent(client)
+    parent_id = (await client.post("/v1/sessions", json={"agent_id": agent["id"]})).json()["id"]
+    store = SqlAlchemyConversationStore(db_uri)
+    store.set_host_id(parent_id, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", workspace="/tmp/workspace")
+    parent = store.get_conversation(parent_id)
     hosts = HostStore(db_uri)
     hosts.upsert_on_connect(
         "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         "test-host",
         "local",
-        configured_harnesses={"jcode": reason},
+        configured_harnesses={"jcode": True},
     )
-    snapshot = {
-        "harness": "jcode",
-        "runtime_config": {
-            "providers": {
-                "test-provider": {
-                    "kind": "gateway",
-                    "openai": {
-                        "base_url": "https://gateway.example/v1",
-                        "api_key_ref": "env:TEST_KEY",
-                    },
-                }
-            },
-            "inference": {
-                "harnesses": {
-                    "jcode": {"provider": "test-provider", "default_model": "test-model"},
-                }
-            },
-        },
-    }
 
-    async def validate() -> None:
-        await validate_create_harness_readiness(
-            harness="jcode",
-            host_id="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            parent_session_id=None,
-            inherited_runner_id=None,
-            user_id=None,
-            conversation_store=SqlAlchemyConversationStore(db_uri),
-            host_store=hosts,
-            inference_snapshot=snapshot,
-        )
+    def unexpected_read(session_id: str) -> None:
+        raise AssertionError("Already-loaded parent must be reused")
 
-    if allowed:
-        await validate()
-    else:
-        with pytest.raises(OmnigentError) as exc:
-            await validate()
-        assert exc.value.code == ErrorCode.HARNESS_NOT_CONFIGURED
+    monkeypatch.setattr(store, "get_conversation", unexpected_read)
+    await validate_create_harness_readiness(
+        harness="jcode",
+        host_id=None,
+        parent_session_id=parent_id,
+        inherited_runner_id="runner_test",
+        user_id=None,
+        conversation_store=store,
+        host_store=hosts,
+        parent=parent,
+    )

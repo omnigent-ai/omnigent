@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import asyncio
-from typing import Any
 
+from omnigent.entities import Conversation
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.harness_availability import reported_harness_availability
 from omnigent.stores import ConversationStore
@@ -20,7 +20,7 @@ async def validate_create_harness_readiness(
     user_id: str | None,
     conversation_store: ConversationStore,
     host_store: HostStore | None,
-    inference_snapshot: dict[str, Any] | None,
+    parent: Conversation | None = None,
 ) -> None:
     """Check resolved placement after parent authorization and before persistence.
 
@@ -28,24 +28,21 @@ async def validate_create_harness_readiness(
     without readiness reports remain unknown; host launch checks still apply.
     """
     from omnigent.server.routes._host_launch import resolve_host_owner
-    from omnigent.server.routes.sandbox_inference import configured_snapshot
 
     if host_store is None or not harness or harness == "auto":
         return
     if inherited_runner_id is not None:
-        host_id = None
-        seen: set[str] = set()
-        while parent_session_id and parent_session_id not in seen:
-            seen.add(parent_session_id)
+        from omnigent.runner.routing import routing_host_id
+
+        if parent is None and parent_session_id:
             parent = await asyncio.to_thread(
                 conversation_store.get_conversation, parent_session_id
             )
-            if parent is None:
-                break
-            if parent.host_id:
-                host_id = parent.host_id
-                break
-            parent_session_id = parent.parent_conversation_id
+        host_id = (
+            await asyncio.to_thread(routing_host_id, parent, conversation_store)
+            if parent is not None
+            else None
+        )
         host = await asyncio.to_thread(host_store.get_host, host_id) if host_id else None
     elif host_id:
         host = await asyncio.to_thread(
@@ -58,7 +55,8 @@ async def validate_create_harness_readiness(
     available, reason = reported_harness_availability(harness, host.configured_harnesses)
     if available is not False:
         return
-    if reason == "needs-auth" and configured_snapshot(inference_snapshot):
+    # Host authentication reports cannot see spec-level or runtime credentials.
+    if reason == "needs-auth":
         return
     raise OmnigentError(
         f"Harness {harness!r} is not configured on the target host ({reason}). "
