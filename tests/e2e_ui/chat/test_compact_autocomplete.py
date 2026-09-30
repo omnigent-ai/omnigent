@@ -5,26 +5,31 @@ import re
 import pytest
 from playwright.sync_api import Page, Route, expect
 
-from tests.e2e_ui.conftest import fetch_with_retry
-
 
 @pytest.mark.parametrize("busy", [False, True])
+@pytest.mark.parametrize("harness", ["claude-native", "claude-sdk"])
 def test_tab_completes_compact_until_explicit_submit(
-    page: Page, seeded_session: tuple[str, str], busy: bool
+    page: Page, seeded_session: tuple[str, str], busy: bool, harness: str
 ) -> None:
     base_url, session_id = seeded_session
 
-    def claude_snapshot(route: Route) -> None:
-        response = fetch_with_retry(route)
-        payload = response.json()
-        payload["harness"] = "claude-native"
+    response = page.request.get(f"{base_url}/v1/sessions/{session_id}")
+    assert response.ok
+    payload = response.json()
+    payload["harness"] = harness
+    if harness == "claude-native":
         payload["labels"] = {
             **payload.get("labels", {}),
             "omnigent.wrapper": "claude-code-native-ui",
         }
-        if busy:
-            payload["status"] = "running"
-        route.fulfill(response=response, json=payload)
+    if busy:
+        payload["status"] = "running"
+
+    def claude_snapshot(route: Route) -> None:
+        if route.request.method == "GET":
+            route.fulfill(json=payload)
+        else:
+            route.continue_()
 
     page.route(re.compile(rf"/v1/sessions/{session_id}(?:\?.*)?$"), claude_snapshot)
     posts: list[dict] = []
@@ -55,6 +60,9 @@ def test_tab_completes_compact_until_explicit_submit(
         with page.expect_response(f"**/v1/sessions/{session_id}/events"):
             composer.press("Enter")
     expect(composer).to_have_value("")
-    assert [post["type"] for post in posts] == ["message"]
-    assert posts[0]["data"]["content"] == [{"type": "input_text", "text": "/compact"}]
+    if harness == "claude-sdk":
+        assert posts == [{"type": "compact", "data": {}}]
+    else:
+        assert [post["type"] for post in posts] == ["message"]
+        assert posts[0]["data"]["content"] == [{"type": "input_text", "text": "/compact"}]
     page.unroute_all(behavior="wait")

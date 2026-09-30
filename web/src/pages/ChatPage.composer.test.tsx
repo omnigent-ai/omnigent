@@ -859,6 +859,8 @@ describe("Composer slash-command menu", () => {
     ["claude-native", "/compact", "idle"],
     ["claude-native", "/compact preserve decisions and TODOs", "idle"],
     ["claude-sdk", "/compact", "idle"],
+    ["claude-sdk", "/compact", "running"],
+    ["claude-sdk", "/compact preserve decisions and TODOs", "idle"],
     ["codex-native", "/compact", "idle"],
     ["codex-native", "/compact", "running"],
     ["codex-native", "/compact", "waiting"],
@@ -891,16 +893,19 @@ describe("Composer slash-command menu", () => {
 
     fireEvent.change(textarea(), { target: { value: command + " " } });
     fireEvent.keyDown(textarea(), { key: "Enter" });
-    if (harness === "codex-native" && command !== "/compact") {
+    if ((harness === "codex-native" || harness === "claude-sdk") && command !== "/compact") {
       expect(textarea()).toHaveValue(command + " ");
-      expect(screen.getByText("/compact does not accept arguments for Codex")).toBeVisible();
+      const harnessName = harness === "codex-native" ? "Codex" : "Claude SDK";
+      expect(
+        screen.getByText(`/compact does not accept arguments for ${harnessName}`),
+      ).toBeVisible();
       expect(props.onSend).not.toHaveBeenCalled();
       expect(compact).not.toHaveBeenCalled();
       return;
     }
     expect(textarea()).toHaveValue("");
     expect(error).not.toHaveBeenCalled();
-    if (harness === "claude-native" || harness === "codex-native") {
+    if (harness === "claude-native" || harness === "claude-sdk" || harness === "codex-native") {
       const sent = harness === "codex-native" ? "/compact" : command;
       expect(props.onSend).toHaveBeenCalledExactlyOnceWith(sent);
       expect(compact).not.toHaveBeenCalled();

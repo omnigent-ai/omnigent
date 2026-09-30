@@ -14202,22 +14202,27 @@ describe("chatStore — policy deny renders once", () => {
 });
 
 describe("chatStore — client-side message queue", () => {
-  it.each(["foreground", "background", "evicted", "stranded"])(
-    "queues Codex compact and holds the next message until idle (%s)",
-    async (mode) => {
-      const background = mode !== "foreground";
+  it.each([
+    ...["codex-native", "claude-sdk"].flatMap((harness) =>
+      ["foreground", "background", "evicted", "stranded"].map((mode) => [harness, mode]),
+    ),
+    ["claude-sdk", "steered"],
+  ])(
+    "queues %s compact as a control and holds the next message until idle (%s)",
+    async (harness, mode) => {
+      const background = mode !== "foreground" && mode !== "steered";
       const id = "conv_compact";
       seedSession(id, []);
       fetchMock.mockImplementation(async (input, init) => {
         const response = defaultFetchHandler(input as RequestInfo, init as RequestInit);
         if (String(input).split("?")[0] === `/v1/sessions/${id}` && !init?.method) {
-          return mockResponse({ ...(await response.json()), harness: "codex-native" });
+          return mockResponse({ ...(await response.json()), harness });
         }
         return response;
       });
       await useChatStore.getState().switchTo(id);
       useChatStore.setState({
-        sessionHarness: "codex-native",
+        sessionHarness: harness,
         status: "streaming",
         sessionStatus: "running",
       });
@@ -14226,20 +14231,24 @@ describe("chatStore — client-side message queue", () => {
       const queued = useChatStore.getState().queuedMessages;
       const toastError = vi.spyOn(toast, "error").mockReturnValue("compact-busy");
       onTestFinished(() => toastError.mockRestore());
-      useChatStore.getState().steerMessage(queued[0]!.queueId);
-      expect(toastError).toHaveBeenCalledExactlyOnceWith(
-        "Compact is disabled while a chat is in progress",
-        { richColors: true },
-      );
-      toastError.mockClear();
-      useChatStore.getState().steerAllQueuedMessages(id);
-      expect(toastError).toHaveBeenCalledExactlyOnceWith(
-        "Compact is disabled while a chat is in progress",
-        { richColors: true },
-      );
-      expect(useChatStore.getState().queuedMessages).toEqual(queued);
+      if (harness === "codex-native") {
+        useChatStore.getState().steerMessage(queued[0]!.queueId);
+        expect(toastError).toHaveBeenCalledExactlyOnceWith(
+          "Compact is disabled while a chat is in progress",
+          { richColors: true },
+        );
+        toastError.mockClear();
+        useChatStore.getState().steerAllQueuedMessages(id);
+        expect(toastError).toHaveBeenCalledExactlyOnceWith(
+          "Compact is disabled while a chat is in progress",
+          { richColors: true },
+        );
+        expect(useChatStore.getState().queuedMessages).toEqual(queued);
+      }
 
-      handleSessionEvent({ type: "session_status", conversationId: id, status: "idle" });
+      if (mode !== "steered") {
+        handleSessionEvent({ type: "session_status", conversationId: id, status: "idle" });
+      }
       if (background) {
         seedSession("conv_other", []);
         await useChatStore.getState().switchTo("conv_other");
@@ -14271,12 +14280,19 @@ describe("chatStore — client-side message queue", () => {
           sendLatchedAt: beforeFlush - 10 * 60_000,
         });
       }
-      flush();
+      if (mode === "steered") {
+        useChatStore.getState().steerMessage(queued[0]!.queueId);
+      } else {
+        flush();
+      }
       await tick();
       expect(posts()).toEqual([{ type: "compact", data: {} }]);
-      expect(conversationRegistry.peek(id)!.getState().sendLatchedAt).toBeGreaterThanOrEqual(
-        beforeFlush,
-      );
+      if (harness === "claude-sdk") expect(toastError).not.toHaveBeenCalled();
+      if (mode !== "steered") {
+        expect(conversationRegistry.peek(id)!.getState().sendLatchedAt).toBeGreaterThanOrEqual(
+          beforeFlush,
+        );
+      }
       expect(conversationRegistry.peek(id)!.getState().pendingUserMessages).toEqual([]);
       flush();
       await tick();
@@ -14339,6 +14355,33 @@ describe("chatStore — client-side message queue", () => {
       }),
     );
     expect(useChatStore.getState().queuedMessages).toEqual([]);
+  });
+
+  it.each([false, true])("bulk steers SDK compact while busy (has prefix: %s)", async (prefix) => {
+    const id = "conv_sdk_compact";
+    seedSession(id, []);
+    await useChatStore.getState().switchTo(id);
+    useChatStore.setState({
+      sessionHarness: "claude-sdk",
+      status: "streaming",
+      sessionStatus: "running",
+    });
+    const toastError = vi.spyOn(toast, "error");
+    onTestFinished(() => toastError.mockRestore());
+    if (prefix) useChatStore.getState().enqueueMessage("before compact");
+    useChatStore.getState().enqueueMessage("/compact");
+    useChatStore.getState().enqueueMessage("after compact");
+    useChatStore.getState().steerAllQueuedMessages(id);
+    await tick();
+    const posts = fetchMock.mock.calls
+      .filter(([url, init]) => url === `/v1/sessions/${id}/events` && init?.method === "POST")
+      .map(([, init]) => JSON.parse(init!.body as string));
+    expect(posts.map((p) => p.type)).toEqual(
+      prefix ? ["message", "compact", "message"] : ["compact", "message"],
+    );
+    expect(posts.at(-1).data.content).toEqual([{ type: "input_text", text: "after compact" }]);
+    expect(useChatStore.getState().queuedMessages).toEqual([]);
+    expect(toastError).not.toHaveBeenCalled();
   });
 
   it("bulk steer stops at the first compact, retaining it and later messages", () => {

@@ -3511,6 +3511,19 @@ class ClaudeSDKExecutor(Executor):
         trailing: list[Message] = []
         for msg in reversed(messages):
             if msg.get("role") == "user":
+                content = msg.get("content")
+                if content == "/compact" or (
+                    isinstance(content, list)
+                    and len(content) == 1
+                    and isinstance(content[0], dict)
+                    and content[0].get("type") in {"text", "input_text"}
+                    and content[0].get("text") == "/compact"
+                ):
+                    # The runner dispatches earlier input before a compact control.
+                    # Compaction may emit no assistant text; keep it out of later prompts.
+                    if not trailing:
+                        return "/compact"
+                    break
                 trailing.append(msg)
             else:
                 break

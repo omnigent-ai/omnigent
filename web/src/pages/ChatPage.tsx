@@ -2996,8 +2996,9 @@ function ComposerImpl(
           setCommandError("/compact is not supported for this agent type");
           return true;
         }
-        if (sessionHarness === "codex-native" && arg) {
-          setCommandError("/compact does not accept arguments for Codex");
+        if ((sessionHarness === "codex-native" || sessionHarness === "claude-sdk") && arg) {
+          const harnessName = sessionHarness === "codex-native" ? "Codex" : "Claude SDK";
+          setCommandError(`/compact does not accept arguments for ${harnessName}`);
           return true;
         }
         const chat = useChatStore.getState();
@@ -3018,8 +3019,12 @@ function ComposerImpl(
         dirtyRef.current = true;
         setValue("");
         setCommandError(null);
-        if (sessionHarness === "claude-native" || sessionHarness === "codex-native") {
-          // Both use the existing queue; the store dispatches Codex as a control.
+        if (
+          sessionHarness === "claude-native" ||
+          sessionHarness === "claude-sdk" ||
+          sessionHarness === "codex-native"
+        ) {
+          // Use the message queue; the store dispatches SDK and Codex as controls.
           const command = arg ? `/compact ${arg}` : "/compact";
           appendEntry(command);
           onSend(command);

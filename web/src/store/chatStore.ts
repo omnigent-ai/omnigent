@@ -151,7 +151,7 @@ import type { StoredReplyDraft } from "@/lib/replyDraft";
 import { toast } from "sonner";
 
 export interface SendOptions {
-  /** Codex compact is a control event, not a user-message turn. */
+  /** Compact is a control event, not a user-message turn. */
   command?: "compact";
   /** Client-only quote provenance, retained if the composer needs to retry. */
   replyDraft?: StoredReplyDraft;
@@ -1839,7 +1839,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         {
           queueId,
           text,
-          ...(isCodexCompact(sessionHarness, text, files) ? { command: "compact" as const } : {}),
+          ...(isCompactControl(sessionHarness, text, files) ? { command: "compact" as const } : {}),
           stableId,
           conversationId,
           ...(boundAgentId !== null ? { agentId: boundAgentId } : {}),
@@ -1904,8 +1904,11 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     const s = get();
     const own = s.queuedMessages.filter((m) => m.conversationId === conversationId);
     if (own.length === 0) return;
-    // Steer ordinary messages up to the compact; it must run on an idle turn.
-    const compactIndex = own.findIndex((m) => m.command === "compact");
+    // SDK buffers compact with the rest of the batch; Codex needs an idle turn.
+    const compactIndex =
+      setterForState(conversationId)?.sessionHarness === "claude-sdk"
+        ? -1
+        : own.findIndex((m) => m.command === "compact");
     if (compactIndex === 0) {
       s.steerMessage(own[0]!.queueId);
       return;
@@ -2005,9 +2008,9 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     const now = Date.now();
     for (const conversationId of candidateIds) {
       if (statusById.get(conversationId) !== "idle") continue;
-      // The sidebar can still say idle while Codex starts compaction.
+      // The sidebar can still say idle while a compact control starts.
       const local = setterForState(conversationId);
-      if (local?.sessionHarness === "codex-native") {
+      if (local?.sessionHarness === "codex-native" || local?.sessionHarness === "claude-sdk") {
         if (local.sessionStatus === "running") continue;
         if (local.status === "streaming") {
           if (!sendLatchIsStranded(local)) continue;
@@ -2159,7 +2162,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     }
     const targetState = pinnedId === null ? get() : setterForState(pinnedId);
     const compacts =
-      opts?.command === "compact" || isCodexCompact(targetState?.sessionHarness, text, files);
+      opts?.command === "compact" || isCompactControl(targetState?.sessionHarness, text, files);
     if (compacts && rejectBusyCompact(pinnedId ?? get().conversationId)) {
       opts?.onError?.("Compact is disabled while a chat is in progress");
       return;
@@ -2280,7 +2283,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       if (initialDraft && !(await waitForModelSelection(sessionId, tempId))) return;
 
       if (compacts) {
-        // Codex emits normal turn status edges for compaction, but no user
+        // Compact controls emit turn status edges, but no user
         // message acknowledgement. Keep the send latch without a pending bubble.
         await postEvent(sessionId, { type: "compact", data: {} });
         queryClient?.invalidateQueries({ queryKey: ["conversations"] });
@@ -3193,12 +3196,21 @@ function setActive(partial: Partial<ChatState> | ((state: ChatState) => Partial<
 
 // ── Internal helpers ─────────────────────────────────────
 
-function isCodexCompact(harness: string | null | undefined, text: string, files?: File[]): boolean {
-  return harness === "codex-native" && !files?.length && text.trim() === "/compact";
+function isCompactControl(
+  harness: string | null | undefined,
+  text: string,
+  files?: File[],
+): boolean {
+  return (
+    (harness === "codex-native" || harness === "claude-sdk") &&
+    !files?.length &&
+    text.trim() === "/compact"
+  );
 }
 
 function rejectBusyCompact(conversationId: string | null): boolean {
   const state = conversationId === null ? undefined : setterForState(conversationId);
+  if (state?.sessionHarness === "claude-sdk") return false;
   if (state?.status !== "streaming" && state?.sessionStatus !== "running") return false;
   toast.error("Compact is disabled while a chat is in progress", { richColors: true });
   return true;
