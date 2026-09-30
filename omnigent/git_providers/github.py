@@ -115,6 +115,7 @@ class GitHubProvider:
     display_name = "GitHub"
     default_hosts = ("github.com",)
     facets = FacetModules(
+        credential="omnigent.git_credential.github",
         pull_requests="omnigent.runner.git_providers.github",
         policy="omnigent.policies.builtins.github",
     )
