@@ -424,6 +424,45 @@ async def test_busy_registered_port_during_scope_step_up_fails_clearly(
     assert len(state.registrations) == 1
 
 
+async def test_only_an_insufficient_scope_403_starts_a_sign_in(
+    fake_server: _FakeAuthServer, browser: list[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state = fake_server
+    assert "echo: one" in await _connect_and_echo(state, "one")
+    listeners: list[int] = []
+    real_listener = mcp_oauth._CallbackListener
+
+    class _RecordingListener(real_listener):  # type: ignore[misc,valid-type]
+        def __init__(self, preferred_port: int | None = None) -> None:
+            super().__init__(preferred_port)
+            listeners.append(self.port)
+
+    monkeypatch.setattr(mcp_oauth, "_CallbackListener", _RecordingListener)
+
+    # No access to this resource: an error, with no sign-in attempted.
+    state.forbid_access_tokens(None)
+    conn = McpServerConnection(config=_config(state))
+    try:
+        # A 3.11+ builtin (we require 3.12); ruff's py310 target misflags it.
+        with pytest.raises(BaseExceptionGroup) as excinfo:  # noqa: F821
+            await asyncio.wait_for(conn.connect(), timeout=30)
+    finally:
+        await conn.close()
+    assert excinfo.group_contains(httpx.HTTPStatusError, match="403 Forbidden")
+    assert listeners == []
+    assert len(browser) == 1
+    assert len(state.token_requests) == 1
+    assert 403 in state.mcp_statuses
+
+    # Missing scope: the SDK asks for it with a new browser sign-in.
+    state.forbid_access_tokens('Bearer error="insufficient_scope", scope="mcp:write"')
+    assert "echo: two" in await _connect_and_echo(state, "two")
+    assert len(listeners) == 1
+    assert len(browser) == 2
+    assert state.authorize_requests[1]["scope"] == "mcp:write"
+    assert len(state.registrations) == 1
+
+
 async def test_headless_fails_fast_with_a_clear_error(
     fake_server: _FakeAuthServer, monkeypatch: pytest.MonkeyPatch
 ) -> None:

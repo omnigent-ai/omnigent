@@ -14,6 +14,7 @@ import time
 from concurrent.futures import Future
 from pathlib import Path
 
+import httpx
 import pytest
 from mcp.shared.auth import OAuthClientInformationFull, OAuthMetadata, OAuthToken
 
@@ -297,6 +298,28 @@ class TestBrowserHandling:
         group = ExceptionGroup("task group", [ValueError("other"), nested])  # noqa: F821
         assert find_oauth_error(group) is inner
         assert find_oauth_error(ValueError("x")) is None
+
+
+# ── 403 handling ─────────────────────────────────────────────────────
+
+
+class TestAsksForMoreScope:
+    @pytest.mark.parametrize(
+        ("status", "www_authenticate", "expected"),
+        [
+            (403, 'Bearer error="insufficient_scope", scope="files:write"', True),
+            (403, "Bearer error=insufficient_scope", True),
+            (403, 'Bearer realm="mcp", error="invalid_token"', False),
+            (403, None, False),
+            (401, 'Bearer error="insufficient_scope"', False),
+        ],
+    )
+    def test_only_a_403_with_insufficient_scope_counts(
+        self, status: int, www_authenticate: str | None, expected: bool
+    ) -> None:
+        headers = {"WWW-Authenticate": www_authenticate} if www_authenticate else {}
+        response = httpx.Response(status, headers=headers)
+        assert mcp_oauth._asks_for_more_scope(response) is expected
 
 
 # ── build_oauth_client_provider ──────────────────────────────────────

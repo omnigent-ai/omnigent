@@ -34,6 +34,7 @@ import hashlib
 import html
 import logging
 import os
+import re
 import sys
 import threading
 import time
@@ -315,6 +316,22 @@ def _busy_port_message(server_name: str, port: int | None) -> str:
     )
 
 
+# Same pattern as the MCP SDK's WWW-Authenticate parser, so both agree.
+_WWW_AUTH_ERROR = re.compile(r'error=(?:"([^"]+)"|([^\s,]+))')
+
+
+def _asks_for_more_scope(response: Response) -> bool:
+    """Whether *response* is a 403 asking for more scope (RFC 6750 §3.1).
+
+    That is the only 403 the SDK answers with a new authorization; any other
+    403 (the account simply lacks access) is returned as an error.
+    """
+    if response.status_code != 403:
+        return False
+    match = _WWW_AUTH_ERROR.search(response.headers.get("WWW-Authenticate", ""))
+    return match is not None and (match.group(1) or match.group(2)) == "insufficient_scope"
+
+
 def _browser_available() -> bool:
     """Whether this process can show a browser to the person using it.
 
@@ -349,8 +366,9 @@ class OmnigentOAuthClientProvider(OAuthClientProvider):
       rather than sent and rejected.
     - On a 401, tries the stored refresh token before a browser sign-in.
     - Binds the loopback callback listener as soon as a sign-in is
-      unavoidable and sets its URI in the client metadata, which the SDK
-      then uses for registration, authorization and token exchange alike.
+      unavoidable (a 401, or a 403 asking for more scope) and sets its URI
+      in the client metadata, which the SDK then uses for registration,
+      authorization and token exchange alike.
 
     :param server_name: The MCP server's configured name, for messages.
     :param server_url: The MCP server URL.
@@ -433,8 +451,8 @@ class OmnigentOAuthClientProvider(OAuthClientProvider):
                         if await self._handle_refresh_response(refresh_response):
                             self._add_auth_header(request)
                             response = yield request
-                    if response.status_code in (401, 403):
-                        # The SDK signs in again next (a 403 may ask for more scope).
+                    if response.status_code == 401 or _asks_for_more_scope(response):
+                        # The SDK signs in again next; any other 403 is just an error.
                         listener = self._open_callback_listener(
                             can_register=response.status_code == 401
                         )
