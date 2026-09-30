@@ -1,4 +1,5 @@
 import {
+  Fragment,
   forwardRef,
   memo,
   useCallback,
@@ -605,13 +606,15 @@ function renderPiece(piece: CompactPiece, accent: ComposerAccentRange | null): R
     const flags = accented ? piece.flags | ACCENT : piece.flags;
     const at = cuts[i] - piece.source;
     const text = piece.text.slice(at, cuts[i + 1] - piece.source);
+    // Keyed by draft offset: unique in the row, so an edit elsewhere can't
+    // match one run's node to another's.
     if (flags === 0) {
-      nodes.push(text);
+      nodes.push(<Fragment key={cuts[i]}>{text}</Fragment>);
       continue;
     }
     nodes.push(
       <span
-        key={at}
+        key={cuts[i]}
         data-md={flags}
         className={cn(
           compactClassFor(flags),
