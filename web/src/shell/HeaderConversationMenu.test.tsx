@@ -235,10 +235,17 @@ describe("HeaderConversationMenu", () => {
 
     openMenu();
     fireEvent.click(screen.getByRole("menuitem", { name: "Archive" }));
-    // Just the flag: the optimistic overlay lives in the hook, and the Undo
-    // toast fires synchronously (navigating away unmounts this menu, so a
-    // mutate onSuccess callback wouldn't fire).
-    expect(mocks.archive).toHaveBeenCalledWith({ id: "conv-1", archived: true });
+    // A worktree session asks whether to delete the worktree first.
+    expect(mocks.archive).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Yes, delete worktree" }));
+    // The optimistic overlay lives in the hook, and the Undo toast fires
+    // synchronously (navigating away unmounts this menu, so a mutate onSuccess
+    // callback wouldn't fire).
+    expect(mocks.archive).toHaveBeenCalledWith({
+      id: "conv-1",
+      archived: true,
+      deleteWorktree: true,
+    });
 
     view.unmount();
     renderMenu();

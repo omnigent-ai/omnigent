@@ -96,6 +96,7 @@ beforeEach(() => {
 
 afterEach(() => {
   cleanup();
+  localStorage.clear();
 });
 
 describe("archive flow", () => {
@@ -108,7 +109,11 @@ describe("archive flow", () => {
     // Just the flag — the optimistic overlay + error reconcile live in the
     // hook, and the toast fires synchronously (not in a mutate callback, which
     // wouldn't fire once the optimistic overlay unmounts the row).
-    expect(mocks.archive.mutate).toHaveBeenCalledWith({ id: "conv_1", archived: true });
+    expect(mocks.archive.mutate).toHaveBeenCalledWith({
+      id: "conv_1",
+      archived: true,
+      deleteWorktree: false,
+    });
     // The server owns the stop. A client stop here would race it against
     // the same runner and put its timeouts in front of the flag flip.
     expect(mocks.stop.mutate).not.toHaveBeenCalled();
@@ -150,7 +155,11 @@ describe("archive flow", () => {
 
     // Same single-PATCH contract as the kebab item, just a different affordance.
     expect(mocks.archive.mutate).toHaveBeenCalledTimes(1);
-    expect(mocks.archive.mutate).toHaveBeenCalledWith({ id: "conv_1", archived: true });
+    expect(mocks.archive.mutate).toHaveBeenCalledWith({
+      id: "conv_1",
+      archived: true,
+      deleteWorktree: false,
+    });
     expect(mocks.stop.mutate).not.toHaveBeenCalled();
   });
 
@@ -166,5 +175,80 @@ describe("archive flow", () => {
     fireEvent.click(screen.getByTestId("quick-archive-conversation"));
 
     expect(mocks.archive.mutate).toHaveBeenCalledWith({ id: "conv_1", archived: false });
+  });
+});
+
+describe("archive worktree prompt", () => {
+  const WORKTREE_CONV: Conversation = { ...CONV, git_branch: "feature/x" };
+  const PREF_KEY = "omnigent:delete-worktrees-on-archive";
+
+  it("archives a non-worktree session without prompting", () => {
+    mockConversations([CONV]);
+    renderSidebar();
+    clickArchive();
+
+    expect(screen.queryByTestId("archive-worktree-dialog")).not.toBeInTheDocument();
+    expect(mocks.archive.mutate).toHaveBeenCalledTimes(1);
+  });
+
+  it("asks before archiving a worktree session, then deletes on Yes", async () => {
+    mockConversations([WORKTREE_CONV]);
+    renderSidebar();
+    clickArchive();
+
+    await screen.findByTestId("archive-worktree-dialog");
+    expect(mocks.archive.mutate).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByTestId("archive-worktree-delete"));
+
+    expect(mocks.archive.mutate).toHaveBeenCalledWith({
+      id: "conv_1",
+      archived: true,
+      deleteWorktree: true,
+    });
+    // Without "Don't show this again" the choice isn't remembered.
+    expect(localStorage.getItem(PREF_KEY)).toBeNull();
+  });
+
+  it("archives only on No and remembers the choice when asked to", async () => {
+    mockConversations([WORKTREE_CONV]);
+    renderSidebar();
+    clickArchive();
+
+    await screen.findByTestId("archive-worktree-dialog");
+    fireEvent.click(screen.getByTestId("archive-worktree-remember"));
+    fireEvent.click(screen.getByTestId("archive-worktree-keep"));
+
+    expect(mocks.archive.mutate).toHaveBeenCalledWith({
+      id: "conv_1",
+      archived: true,
+      deleteWorktree: false,
+    });
+    expect(localStorage.getItem(PREF_KEY)).toBe("false");
+  });
+
+  it("cancels the archive when the prompt is dismissed", async () => {
+    mockConversations([WORKTREE_CONV]);
+    renderSidebar();
+    clickArchive();
+
+    const dialog = await screen.findByTestId("archive-worktree-dialog");
+    fireEvent.keyDown(dialog, { key: "Escape" });
+
+    expect(screen.queryByTestId("archive-worktree-dialog")).not.toBeInTheDocument();
+    expect(mocks.archive.mutate).not.toHaveBeenCalled();
+  });
+
+  it("applies a saved preference without prompting", () => {
+    localStorage.setItem(PREF_KEY, "true");
+    mockConversations([WORKTREE_CONV]);
+    renderSidebar();
+    clickArchive();
+
+    expect(screen.queryByTestId("archive-worktree-dialog")).not.toBeInTheDocument();
+    expect(mocks.archive.mutate).toHaveBeenCalledWith({
+      id: "conv_1",
+      archived: true,
+      deleteWorktree: true,
+    });
   });
 });

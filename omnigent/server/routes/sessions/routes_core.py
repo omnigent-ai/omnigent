@@ -2216,6 +2216,11 @@ def register_core_routes(
             registered; 404 if no session exists.
         """
         user_id = _get_user_id(request, auth_provider)
+        if body.delete_worktree and body.archived is not True:
+            raise OmnigentError(
+                "delete_worktree is only valid with archived=true",
+                code=ErrorCode.INVALID_INPUT,
+            )
         # This PATCH gates at the least level the request actually needs, in
         # three tiers matching the if/elif/else below:
         #
@@ -2696,6 +2701,7 @@ def register_core_routes(
                 conversation_store,
                 runner_router,
                 getattr(request.app.state, "host_registry", None),
+                delete_worktree=body.delete_worktree,
             )
         elif body.archived is False:
             # Unarchive (including Undo, which re-PATCHes archived=false within
