@@ -101,6 +101,41 @@ describe("useOnboardingRunnerHost", () => {
     expect(result.current.hostId).toBeNull();
   });
 
+  it("gives up without this machine's identity, rather than guess", async () => {
+    bridge.getHostIdentity.mockResolvedValue(null);
+    bridge.takeOnboardingRunner.mockResolvedValue("remote");
+    // The only online host could be this laptop.
+    const { result } = renderHook(() => useOnboardingRunnerHost([host("laptop")]));
+    await waitFor(() => expect(result.current.pending).toBe(false));
+    expect(result.current.hostId).toBeNull();
+  });
+
+  it("resolves 'remote' on a laptop that never hosted", async () => {
+    bridge.getHostIdentity.mockResolvedValue({ cliInstalled: false, hostId: null });
+    bridge.takeOnboardingRunner.mockResolvedValue("remote");
+    const { result } = renderHook(() => useOnboardingRunnerHost([host("box")]));
+    await waitFor(() => expect(result.current).toEqual({ pending: false, hostId: "box" }));
+  });
+
+  it("gives up on 'local' right away when this machine has no host id", async () => {
+    bridge.getHostIdentity.mockResolvedValue({ cliInstalled: true, hostId: null });
+    bridge.takeOnboardingRunner.mockResolvedValue("local");
+    const { result } = renderHook(() => useOnboardingRunnerHost([host("box")]));
+    await waitFor(() => expect(result.current.pending).toBe(false));
+    expect(result.current.hostId).toBeNull();
+  });
+
+  it("stops waiting even if the shell never answers", async () => {
+    vi.useFakeTimers();
+    bridge.takeOnboardingRunner.mockReturnValue(new Promise(() => {}));
+    const { result } = renderHook(() => useOnboardingRunnerHost([host("laptop")]));
+    expect(result.current.pending).toBe(true);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(ONBOARDING_RUNNER_GRACE_MS);
+    });
+    expect(result.current.pending).toBe(false);
+  });
+
   it("doesn't take this laptop for the remote host before its identity loads", async () => {
     let resolveIdentity: (v: { cliInstalled: boolean; hostId: string }) => void = () => {};
     bridge.getHostIdentity.mockReturnValue(

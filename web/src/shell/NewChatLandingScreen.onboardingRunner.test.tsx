@@ -32,7 +32,7 @@ import type * as HostWorktreesModule from "@/hooks/useHostWorktrees";
 import type * as AgentLabelsModule from "@/lib/agentLabels";
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import type { ReactNode } from "react";
 
 import type { Host } from "@/hooks/useHosts";
@@ -161,10 +161,9 @@ describe("NewChatLandingScreen onboarding runner", () => {
   it("holds the default while the onboarding runner is still coming online", async () => {
     vi.mocked(useOnboardingRunnerHost).mockReturnValue({ pending: true, hostId: null });
     renderLanding();
-    // Give the default-host effect a chance to run; it must not pick anything.
-    await new Promise((resolve) => {
-      setTimeout(resolve, 50);
-    });
+    // Once the landing screen has settled, the default-host effect must not have picked anything.
+    await waitFor(() => expect(useOnboardingRunnerHost).toHaveBeenCalled());
+    await act(async () => {});
     expect(chip().getAttribute("aria-label")).not.toContain("remembered-box");
     expect(chip().getAttribute("aria-label")).not.toContain("onboarding-box");
   });

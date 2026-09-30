@@ -33,7 +33,11 @@ export function useOnboardingRunnerHost(hosts: Host[] | undefined): {
     if (!runner) return;
     let cancelled = false;
     void getHostIdentity().then((identity) => {
-      if (!cancelled) setLocalHostId(identity?.hostId ?? null);
+      if (cancelled) return;
+      // A null hostId means this machine never hosted, so it can't be the remote
+      // host. Without the identity at all, or for "local" without an id, give up.
+      if (identity === null || (runner === "local" && !identity.hostId)) setRunner(null);
+      else setLocalHostId(identity.hostId ?? null);
     });
     return () => {
       cancelled = true;
@@ -53,7 +57,7 @@ export function useOnboardingRunnerHost(hosts: Host[] | undefined): {
 
   // Stop waiting after the grace period, unless the runner already resolved.
   useEffect(() => {
-    if (!runner || hostId) return;
+    if (runner === null || hostId) return;
     const timer = setTimeout(() => setRunner(null), ONBOARDING_RUNNER_GRACE_MS);
     return () => clearTimeout(timer);
   }, [runner, hostId]);
