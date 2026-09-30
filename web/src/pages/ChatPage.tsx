@@ -3164,13 +3164,18 @@ function ComposerImpl(
   // Suggest names until a space starts the arguments; exclude file paths.
   const trimmedValue = value.trimStart();
   const hasCommandPrefix = trimmedValue.startsWith("/") || trimmedValue.startsWith(skillPrefix);
+  const commandSplit =
+    draft.quotes.length === 0 && files.length === 0 && hasCommandPrefix
+      ? splitSlashCommand(value, slashCommandNames)
+      : null;
+  const composerIsCommand = commandSplit !== null;
   // Tint only the command or skill token, leaving arguments in the default color.
-  const composerIsCommand =
-    draft.quotes.length === 0 &&
-    files.length === 0 &&
-    hasCommandPrefix &&
-    splitSlashCommand(value, slashCommandNames) !== null;
-
+  const accentStart = commandSplit ? commandSplit.before.length : -1;
+  const accentEnd = commandSplit ? accentStart + commandSplit.token.length : -1;
+  const composerCommandAccent = useMemo(
+    () => (accentStart < 0 ? null : { start: accentStart, end: accentEnd }),
+    [accentStart, accentEnd],
+  );
   const toggleCodexPlanMode = async () => {
     if (planModeBusy) return;
     setCommandError(null);
@@ -3884,6 +3889,7 @@ function ComposerImpl(
     onGrowthRef.current?.();
   }, []);
   useAutoGrowTextarea(tailTextareaRef, draft.text, draft.quotes.length ? Infinity : 10, onGrowth);
+  const pinOnCompactChange = useCallback(() => onGrowthRef.current?.(), []);
 
   // Scope recall to the active conversation so ArrowUp surfaces only this
   // chat's prompts, not the last thing typed in any other chat.
@@ -4516,6 +4522,9 @@ function ComposerImpl(
           disabled: inputDisabled,
           "data-slash-command": composerIsCommand ? "true" : undefined,
           "data-has-draft": hasDraft ? "true" : undefined,
+          accentRange: composerCommandAccent,
+          // The compact preview changes the composer's height too.
+          onCompactChange: pinOnCompactChange,
           className: cn(
             draft.quotes.length > 0 && "max-h-none overflow-y-hidden",
             // Hand glyph painting to the overlay while a command is drafted;
