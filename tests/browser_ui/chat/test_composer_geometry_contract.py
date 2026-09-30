@@ -733,6 +733,14 @@ def test_composer_hides_native_scrollbar_without_disabling_scroll(
     transition = page.evaluate(
         r"""async () => {
           const composer = document.querySelector('textarea[aria-label="Message the agent"]');
+          // The input area: the composer card's child that holds the textarea.
+          const card = composer.closest('[data-composer-card]');
+          if (!card) throw new Error('composer textarea is not inside [data-composer-card]');
+          let inputArea = composer;
+          while (inputArea.parentElement !== card) {
+            inputArea = inputArea.parentElement;
+            if (!inputArea) throw new Error('no child of the composer card holds the textarea');
+          }
           const setter = Object.getOwnPropertyDescriptor(
             HTMLTextAreaElement.prototype, 'value').set;
           const samples = [];
@@ -741,7 +749,7 @@ def test_composer_hides_native_scrollbar_without_disabling_scroll(
               `Draft line ${line}`).join('\n'));
             composer.dispatchEvent(new InputEvent('input', {bubbles: true}));
             await new Promise(resolve => requestAnimationFrame(resolve));
-            samples.push({input: getComputedStyle(composer.parentElement).overflowY,
+            samples.push({input: getComputedStyle(inputArea).overflowY,
               root: getComputedStyle(document.documentElement).overflowY,
               body: getComputedStyle(document.body).overflowY,
               rootScrollTop: document.scrollingElement.scrollTop});
@@ -756,6 +764,13 @@ def test_composer_hides_native_scrollbar_without_disabling_scroll(
     geometry = page.evaluate(
         """() => {
           const composer = document.querySelector('textarea[aria-label="Message the agent"]');
+          const card = composer.closest('[data-composer-card]');
+          if (!card) throw new Error('composer textarea is not inside [data-composer-card]');
+          let inputArea = composer;
+          while (inputArea.parentElement !== card) {
+            inputArea = inputArea.parentElement;
+            if (!inputArea) throw new Error('no child of the composer card holds the textarea');
+          }
           const transcript = document.querySelector('[role="log"] > div');
           const probe = el => ({
             clientHeight: el.clientHeight,
@@ -764,7 +779,7 @@ def test_composer_hides_native_scrollbar_without_disabling_scroll(
             webkitDisplay: getComputedStyle(el, '::-webkit-scrollbar').display,
           });
           return { composer: probe(composer), transcript: probe(transcript),
-            input: getComputedStyle(composer.parentElement).overflowY,
+            input: getComputedStyle(inputArea).overflowY,
             root: getComputedStyle(document.documentElement).overflowY,
             body: getComputedStyle(document.body).overflowY };
         }"""

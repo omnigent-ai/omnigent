@@ -2451,9 +2451,6 @@ function ComposerImpl(
   // Declared after textareaRef so dictation can place the caret after the
   // text it inserts (and insert at the caret rather than the draft's end).
   const dictation = useDictationInsert(value, setValue, textareaRef);
-  // Highlight overlay mirroring the textarea; scroll-synced so the tinted
-  // `/skill` token stays aligned once the draft grows past the visible rows.
-  const backdropRef = useRef<HTMLDivElement>(null);
   const isStreaming = status === "streaming";
 
   // Read-only when either the user lacks a write grant OR the session
@@ -2811,12 +2808,18 @@ function ComposerImpl(
   // Suggest names until a space starts the arguments; exclude file paths.
   const trimmedValue = value.trimStart();
   const hasCommandPrefix = trimmedValue.startsWith("/") || trimmedValue.startsWith(skillPrefix);
+  const commandSplit =
+    draft.quotes.length === 0 && files.length === 0 && hasCommandPrefix
+      ? splitSlashCommand(value, slashCommandNames)
+      : null;
+  const composerIsCommand = commandSplit !== null;
   // Tint only the command or skill token, leaving arguments in the default color.
-  const composerIsCommand =
-    draft.quotes.length === 0 &&
-    files.length === 0 &&
-    hasCommandPrefix &&
-    splitSlashCommand(value, slashCommandNames) !== null;
+  const accentStart = commandSplit ? commandSplit.before.length : -1;
+  const accentEnd = commandSplit ? accentStart + commandSplit.token.length : -1;
+  const composerCommandAccent = useMemo(
+    () => (accentStart < 0 ? null : { start: accentStart, end: accentEnd }),
+    [accentStart, accentEnd],
+  );
   const toggleCodexPlanMode = async () => {
     if (planModeBusy) return;
     setCommandError(null);
@@ -3245,6 +3248,7 @@ function ComposerImpl(
     onGrowthRef.current?.();
   }, []);
   useAutoGrowTextarea(tailTextareaRef, draft.text, draft.quotes.length ? Infinity : 10, onGrowth);
+  const pinOnCompactChange = useCallback(() => onGrowthRef.current?.(), []);
 
   // Scope recall to the active conversation so ArrowUp surfaces only this
   // chat's prompts, not the last thing typed in any other chat.
@@ -3734,10 +3738,6 @@ function ComposerImpl(
             dismissMention();
           },
           onPaste,
-          onScroll: (e) => {
-            // Keep the overlay's scroll position locked to the textarea's.
-            if (backdropRef.current) backdropRef.current.scrollTop = e.currentTarget.scrollTop;
-          },
           "aria-label": "Message the agent",
           placeholder: composerLockedByBtw
             ? "Side chat open — press Esc to close"
@@ -3761,12 +3761,10 @@ function ComposerImpl(
             composerLockedByBtw,
           "data-slash-command": composerIsCommand ? "true" : undefined,
           "data-has-draft": hasDraft ? "true" : undefined,
-          className: cn(
-            draft.quotes.length > 0 && "max-h-none overflow-y-hidden",
-            // Hand glyph painting to the overlay while a command is drafted;
-            // the caret stays visible via caret-foreground.
-            composerIsCommand && "text-transparent caret-foreground",
-          ),
+          accentRange: composerCommandAccent,
+          // The compact preview changes the composer's height too.
+          onCompactChange: pinOnCompactChange,
+          className: cn(draft.quotes.length > 0 && "max-h-none overflow-y-hidden"),
         }}
         slots={{
           inputPrefix:
@@ -3856,32 +3854,7 @@ function ComposerImpl(
                   <p className="mt-2 text-xs text-muted-foreground">Press Esc to close</p>
                 </div>
               )}
-              {/* Highlight overlay: a textarea can only paint its text one color, so
-            to tint just the command or skill token we hide the textarea's own glyphs
-            (text-transparent, caret kept visible) and render an aligned mirror
-            behind it. Same box/typography so wrapping matches the textarea
-            exactly. Only mounted while the draft is a command. */}
             </>
-          ),
-          inputBackdrop: composerIsCommand && (
-            <div
-              ref={backdropRef}
-              aria-hidden
-              data-testid="composer-highlight-overlay"
-              className="composer-input-text pointer-events-none absolute inset-0 overflow-hidden whitespace-pre-wrap break-words px-3 pt-3 pb-1 text-ui text-foreground"
-            >
-              {(() => {
-                const split = splitSlashCommand(value, slashCommandNames);
-                if (!split) return value;
-                return (
-                  <>
-                    {split.before}
-                    <span className="text-brand-accent">{split.token}</span>
-                    {split.after}
-                  </>
-                );
-              })()}
-            </div>
           ),
           attachments: (
             <>

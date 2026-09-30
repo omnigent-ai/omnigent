@@ -531,7 +531,7 @@ describe("Composer growth layout", () => {
       "[scrollbar-width:none]",
       "[&::-webkit-scrollbar]:hidden",
     );
-    expect(ta.parentElement).toHaveClass("overflow-hidden");
+    expect(ta.parentElement?.parentElement).toHaveClass("overflow-hidden");
   });
 });
 
@@ -2426,7 +2426,7 @@ describe("Composer shared visible controls", () => {
     const workspace = screen.getByTestId("composer-workspace-controls");
     const card = textarea().closest("[data-composer-card]");
     const actions = screen.getByTestId("composer-action-row");
-    expect(textarea().parentElement?.parentElement).toBe(card);
+    expect(textarea().parentElement?.parentElement?.parentElement).toBe(card);
     expect(actions.parentElement).toBe(card);
     const [widthProbe, leading, trailing] = Array.from(actions.children);
     expect(widthProbe).toHaveClass("h-0");
@@ -3392,6 +3392,38 @@ describe("Composer slash-command highlight overlay", () => {
     render(<Composer {...composerProps()} />);
     fireEvent.change(textarea(), { target: { value: "just a normal message" } });
     expect(screen.queryByTestId("composer-highlight-overlay")).toBeNull();
+  });
+});
+
+describe("Composer Markdown highlight layer", () => {
+  beforeEach(() => {
+    setComposerState({ conversationId: "conv_test", skills: [] });
+  });
+  afterEach(() => cleanup());
+
+  it("styles Markdown live and sends the draft byte for byte", () => {
+    const props = composerProps();
+    render(<Composer {...props} />);
+    // Inner whitespace, escapes and Unicode survive. Trimming outer whitespace on
+    // send is existing behavior this feature doesn't change, so the draft has none.
+    const draft =
+      "Use _this_, **this** and `this` for snake_case_names.\n```py\nprint(a_b)\t # 日本\n```\n\n\\*not em\\*  🎉";
+    fireEvent.change(textarea(), { target: { value: draft } });
+    const overlay = screen.getByTestId("composer-highlight-overlay");
+    expect(overlay.textContent).toBe(draft);
+    expect(overlay.querySelectorAll("[data-md]").length).toBeGreaterThan(0);
+    expect(textarea()).toHaveClass("text-transparent");
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+    expect(props.onSend).toHaveBeenCalledExactlyOnceWith(draft, undefined);
+  });
+
+  it("styles command arguments while tinting only the command token", () => {
+    render(<Composer {...composerProps()} />);
+    fireEvent.change(textarea(), { target: { value: "/cross-review the **hot** path" } });
+    const overlay = screen.getByTestId("composer-highlight-overlay");
+    expect(overlay.querySelector(".text-brand-accent")?.textContent).toBe("/cross-review");
+    expect(overlay.textContent).toBe("/cross-review the **hot** path");
+    expect(overlay.querySelector("[data-md='2']")?.textContent).toBe("hot");
   });
 });
 

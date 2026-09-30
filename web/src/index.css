@@ -1304,6 +1304,81 @@ html[data-electron-mac] .breadcrumb-folder {
   }
 }
 
+/* The textarea shows an empty line after a final newline; a block collapses it,
+ * so the composer's highlight layer (or an unclosed code block ending the draft)
+ * holds that line open with a zero-width space. */
+.composer-highlight-layer[data-trailing-newline]::after,
+.composer-highlight-layer .composer-code-block[data-trailing-newline]::after {
+  content: "\200b";
+}
+
+/* The composer highlight layer's decorations: paint-only background layers, so
+ * no glyph moves (text-decoration's ink can also outlive a span's repaint).
+ * Each flag turns on its layer; they stack when a span is, say, a struck link. */
+.composer-highlight-layer .md-deco {
+  background-image: var(--md-italic, none), var(--md-strike, none), var(--md-link, none);
+  background-repeat: repeat-x, no-repeat, no-repeat;
+  background-size:
+    3px 1px,
+    100% 1px,
+    100% 1px;
+  background-position:
+    0 100%,
+    0 55%,
+    0 100%;
+}
+.composer-highlight-layer .md-em {
+  --md-italic: linear-gradient(to right, currentColor 50%, transparent 50%);
+}
+.composer-highlight-layer .md-del {
+  --md-strike: linear-gradient(currentColor, currentColor);
+}
+.composer-highlight-layer .md-a {
+  --md-link: linear-gradient(currentColor, currentColor);
+}
+
+/* Slanted italics in the composer layer (ComposerItalicSlant): skewed copies of
+ * italic line fragments, drawn over the in-flow text they replace. The overlay
+ * and copies are out of the flow, so they move no glyph and take no pointer. */
+.composer-highlight-layer .composer-italic-overlay {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 0;
+  height: 0;
+  pointer-events: none;
+}
+.composer-highlight-layer .md-slant {
+  position: absolute;
+  white-space: pre;
+  pointer-events: none;
+  transform: skewX(-12deg);
+  transform-origin: 0 78%;
+}
+.composer-highlight-layer .md-slant::before {
+  content: attr(data-text);
+}
+/* A copy's strike and link lines sit on its text box, like the in-flow span's. */
+.composer-highlight-layer .md-slant.md-deco {
+  background-image: none;
+}
+.composer-highlight-layer .md-slant.md-deco::before {
+  background-image: var(--md-italic, none), var(--md-strike, none), var(--md-link, none);
+  background-repeat: repeat-x, no-repeat, no-repeat;
+  background-size:
+    3px 1px,
+    100% 1px,
+    100% 1px;
+  background-position:
+    0 100%,
+    0 55%,
+    0 100%;
+}
+/* A span with a copy paints nothing itself; without one it keeps the dots. */
+.composer-highlight-layer .md-em[data-slanted] {
+  color: transparent;
+}
+
 /* Geist Mono renders wider than Geist Sans at the same point size, making
  * streamdown's default text-sm inline code and code blocks look larger than
  * the surrounding prose. Scale both down to ~87.5 % of the parent font size
