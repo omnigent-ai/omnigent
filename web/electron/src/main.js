@@ -3344,8 +3344,11 @@ function registerIpc() {
     if (!cliCommand) return { ok: false, error: missingHostCliError(target) };
     log(`$ ${omnigentCli.cliCommandParts(cliCommand).displayName} host --server ${target}`);
     log("Signing in to the server if needed…");
-    const auth = await serverManager.ensureServerAuth(cliCommand, target);
+    const auth = await serverManager.ensureServerAuth(cliCommand, target, {
+      onLogin: () => log("Finish signing in in your browser, then come back here."),
+    });
     if (!auth.ok) return { ok: false, error: auth.error };
+    log("Connecting this laptop to the server…");
     const result = await serverManager.ensureHostConnected(cliCommand, target);
     broadcastHostStatus();
     if (result.ok) {
@@ -3596,14 +3599,19 @@ function registerIpc() {
     if (!isSetupPageSender(event)) {
       throw new Error("get-cli-status is only available to the setup page");
     }
+    // Concurrent: the setup page holds its first paint on this.
+    const [status, localUrl] = await Promise.all([
+      omnigentCli.getCliStatus(loadSettings().omnigent_path),
+      omnigentCli.localServerHealthy(),
+    ]);
     return {
-      ...(await omnigentCli.getCliStatus(loadSettings().omnigent_path)),
+      ...status,
       customizationDisabled: databricksInternalFeaturesEnabled(),
       // In-app install is macOS-only; the renderer must not route connect/local
       // through an install step on platforms where it can't run.
       installSupported: process.platform === "darwin",
       // start-local's own reuse test, so "Open" vs "Start Omnigent" matches it.
-      localServerRunning: (await omnigentCli.localServerHealthy()) !== null,
+      localServerRunning: localUrl !== null,
     };
   });
 

@@ -73,7 +73,9 @@ describe("ServerSelectorV2", () => {
       />,
     );
     fireEvent.click(screen.getByRole("button", { name: /join your team \(team\)/i }));
-    await waitFor(() => expect(onConnect).toHaveBeenCalledWith("https://team.example.com/"));
+    await waitFor(() =>
+      expect(onConnect).toHaveBeenCalledWith("https://team.example.com/", expect.any(Function)),
+    );
     expect(getRunnerOptions).not.toHaveBeenCalled();
   });
 
@@ -154,7 +156,9 @@ describe("ServerSelectorV2", () => {
     );
     expect(await screen.findByText("Omnigent server")).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Open Omnigent" }));
-    await waitFor(() => expect(onConnect).toHaveBeenCalledWith("http://localhost:6767/"));
+    await waitFor(() =>
+      expect(onConnect).toHaveBeenCalledWith("http://localhost:6767/", expect.any(Function)),
+    );
     expect(onStartLocal).not.toHaveBeenCalled();
   });
 
@@ -199,7 +203,7 @@ describe("ServerSelectorV2", () => {
         />,
       );
       fireEvent.click(screen.getByRole("button", { name: "Open Omnigent" }));
-      await waitFor(() => expect(onConnect).toHaveBeenCalledWith(url));
+      await waitFor(() => expect(onConnect).toHaveBeenCalledWith(url, expect.any(Function)));
       expect(onStartLocal).not.toHaveBeenCalled();
     },
   );
@@ -282,7 +286,9 @@ describe("ServerSelectorV2", () => {
     await waitFor(() => expect(getRunnerOptions).toHaveBeenCalledTimes(2));
     expect(runner).toHaveTextContent("My laptop");
     fireEvent.click(screen.getByRole("button", { name: "Open Omnigent" }));
-    await waitFor(() => expect(onConnect).toHaveBeenCalledWith("https://typed.example.com/"));
+    await waitFor(() =>
+      expect(onConnect).toHaveBeenCalledWith("https://typed.example.com/", expect.any(Function)),
+    );
   });
 
   it("a failed runner lookup still opens the runner step, laptop only", async () => {
@@ -343,7 +349,9 @@ describe("ServerSelectorV2", () => {
     );
     fireEvent.click(screen.getByRole("button", { name: /join your team \(team\)/i }));
     fireEvent.click(await screen.findByRole("button", { name: "Open Omnigent" }));
-    await waitFor(() => expect(onConnect).toHaveBeenCalledWith("https://team.example.com/"));
+    await waitFor(() =>
+      expect(onConnect).toHaveBeenCalledWith("https://team.example.com/", expect.any(Function)),
+    );
     unmount();
 
     render(
@@ -400,8 +408,54 @@ describe("ServerSelectorV2", () => {
     ).toBeInTheDocument();
     expect(onConnect).not.toHaveBeenCalled();
     finishRunner({ ok: true });
-    await waitFor(() => expect(onConnect).toHaveBeenCalledWith("https://team.example.com/"));
+    await waitFor(() =>
+      expect(onConnect).toHaveBeenCalledWith("https://team.example.com/", expect.any(Function)),
+    );
     expect(onInstallCli).not.toHaveBeenCalled();
+  });
+
+  it("a cancelled connect in the terminal fails with Retry instead of reading ready", async () => {
+    await installFromRunnerStep({
+      installed: true,
+      onConnectRunner: vi.fn().mockResolvedValue({ ok: true }),
+      onConnect: vi.fn().mockResolvedValue({ cancelled: true }),
+      getRunnerOptions: vi.fn().mockResolvedValue({ remote: true, bundledCli: true }),
+    });
+    expect(await screen.findByText("Connection cancelled.")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /retry/i })).toBeInTheDocument();
+    expect(screen.queryByText(/server ready/i)).not.toBeInTheDocument();
+  });
+
+  it("a direct connect shows its sign-in phase with Cancel, then goes idle", async () => {
+    let finish: (r: { cancelled: boolean }) => void = () => {};
+    const onCancelConnect = vi.fn();
+    const onConnect = vi.fn(
+      (_url: string, onPhase?: (phase: "connecting" | "authenticating") => void) =>
+        new Promise<{ cancelled: boolean }>((resolve) => {
+          onPhase?.("authenticating");
+          finish = resolve;
+        }),
+    );
+    render(
+      <ServerSelectorV2
+        setup={makeSetup({
+          installed: true,
+          recentServers: ["https://team.example.com/"],
+          onConnect,
+          onCancelConnect,
+        })}
+      />,
+    );
+    const open = screen.getByRole("button", { name: /open omnigent/i });
+    fireEvent.click(open);
+    expect(await screen.findByText(/finish signing in in your browser/i)).toBeInTheDocument();
+    expect(open).toHaveAttribute("aria-busy", "true");
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    expect(onCancelConnect).toHaveBeenCalled();
+    act(() => finish({ cancelled: true }));
+    await waitFor(() => expect(screen.queryByRole("status")).not.toBeInTheDocument());
+    expect(open).not.toHaveAttribute("aria-busy");
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
   });
 
   it("tells a laptop runner, and only a laptop runner, what connecting grants", async () => {

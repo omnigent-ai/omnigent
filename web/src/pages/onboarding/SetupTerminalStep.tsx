@@ -10,6 +10,8 @@
 import { useEffect, useRef, useState } from "react";
 import { RotateCw } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import type { ConnectPhase } from "@/pages/onboarding/ServerSelectorV2";
+import { ConnectStatus } from "@/pages/onboarding/primitives";
 
 type Phase = "installing" | "running" | "ready" | "failed";
 
@@ -25,6 +27,8 @@ export function SetupTerminalStep({
   onBack,
   runningLabel = "Starting Omnigent",
   runningHint = "Starting the local server…",
+  connectPhase = null,
+  onCancelConnect,
 }: {
   /** Install the CLI first (when missing). Absent → skip straight to onRun. */
   onInstallCli?: () => Promise<{ ok: boolean; error?: string }>;
@@ -39,6 +43,9 @@ export function SetupTerminalStep({
   runningLabel?: string;
   /** Placeholder log line for the run phase until its first line streams. */
   runningHint?: string;
+  /** Progress of the run phase's server connect (null when not connecting). */
+  connectPhase?: ConnectPhase | null;
+  onCancelConnect?: () => void;
 }) {
   const [phase, setPhase] = useState<Phase>(onInstallCli ? "installing" : "running");
   const [error, setError] = useState<string | undefined>();
@@ -189,6 +196,8 @@ export function SetupTerminalStep({
           </div>
         )}
       </div>
+
+      <ConnectStatus phase={connectPhase} onCancel={onCancelConnect} />
 
       {phase === "failed" && (
         <div className="mt-3 flex gap-2">

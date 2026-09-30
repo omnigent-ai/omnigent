@@ -2,6 +2,7 @@ import type { ReactNode } from "react";
 import { ArrowLeft, ArrowRight, Download, Play } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
+import type { ConnectPhase } from "@/pages/onboarding/ServerSelectorV2";
 
 export function OnboardingHeading({
   children,
@@ -45,26 +46,57 @@ export function OnboardingRail({ children }: { children: ReactNode }) {
   return <div className="mt-3 flex justify-between gap-2">{children}</div>;
 }
 
-export function OnboardingBackButton({ onClick }: { onClick: () => void }) {
+export function OnboardingBackButton({
+  onClick,
+  disabled,
+}: {
+  onClick: () => void;
+  disabled?: boolean;
+}) {
   return (
-    <Button variant="ghost" size="lg" onClick={onClick}>
+    <Button variant="ghost" size="lg" onClick={onClick} disabled={disabled}>
       <ArrowLeft className="size-4" />
       Back
     </Button>
   );
 }
 
+/** What an in-flight connect is waiting on, with a Cancel when the shell supports it. */
+export function ConnectStatus({
+  phase,
+  onCancel,
+}: {
+  phase: ConnectPhase | null;
+  onCancel?: () => void;
+}) {
+  if (phase === null) return null;
+  return (
+    <p role="status" className="mt-2 text-center text-sm text-muted-foreground">
+      {phase === "authenticating"
+        ? "Finish signing in in your browser, then come back here."
+        : "Waiting for the server…"}{" "}
+      {onCancel && (
+        <button type="button" onClick={onCancel} className="underline hover:text-foreground">
+          Cancel
+        </button>
+      )}
+    </p>
+  );
+}
+
 export function InstallActionButton({
   installed,
   startsLocal,
+  loading,
   onClick,
 }: {
   installed?: boolean;
   startsLocal?: boolean;
+  loading?: boolean;
   onClick: () => void;
 }) {
   return (
-    <Button size="lg" onClick={onClick}>
+    <Button size="lg" onClick={onClick} loading={loading}>
       <InstallActionIcon installed={installed} startsLocal={startsLocal} />
       {installActionLabel(installed, startsLocal)}
     </Button>

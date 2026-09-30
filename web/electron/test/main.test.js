@@ -1279,7 +1279,7 @@ describe("managed server preference wiring", () => {
     const handler = liveCode.slice(start, end);
     assert.match(
       handler,
-      /hostCliCommand\(target\)[\s\S]{0,500}serverManager\.ensureServerAuth\(cliCommand, target\)[\s\S]{0,150}serverManager\.ensureHostConnected\(cliCommand, target\)/,
+      /hostCliCommand\(target\)[\s\S]{0,500}serverManager\.ensureServerAuth\(cliCommand, target,[\s\S]{0,300}serverManager\.ensureHostConnected\(cliCommand, target\)/,
     );
   });
 
@@ -1772,7 +1772,7 @@ describe("recent-server startup wiring (src/main.js)", () => {
   it("reports the local server as running only when start-local would reuse it", () => {
     assert.match(
       liveCode,
-      /ipcMain\.handle\("omnigent:get-cli-status"[\s\S]{0,900}localServerRunning:\s*\(await omnigentCli\.localServerHealthy\(\)\) !== null/,
+      /ipcMain\.handle\("omnigent:get-cli-status"[\s\S]{0,300}Promise\.all\(\[[\s\S]{0,120}omnigentCli\.localServerHealthy\(\),[\s\S]{0,600}localServerRunning:\s*localUrl !== null/,
     );
   });
 });

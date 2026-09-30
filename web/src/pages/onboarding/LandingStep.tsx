@@ -14,6 +14,8 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { Input } from "@/components/ui/input";
 import { normalizeServerUrl } from "@/pages/onboarding/ServerSelectStep";
+import type { ConnectPhase } from "@/pages/onboarding/ServerSelectorV2";
+import { ConnectStatus } from "@/pages/onboarding/primitives";
 
 /** Team name for a preset server URL: the host's first label, capitalized
  *  ("https://team.example.com/x" → "Team"). */
@@ -32,6 +34,8 @@ export function LandingStep({
   managedServerNames,
   recentServers,
   error,
+  connectPhase = null,
+  onCancelConnect,
   onGetStarted,
   onJoinServer,
   onJoinManaged,
@@ -44,6 +48,9 @@ export function LandingStep({
   recentServers: string[];
   /** Connect error to show above the CTA (MDM landing only). */
   error?: string;
+  /** Progress of an in-flight join (MDM landing only; null when idle). */
+  connectPhase?: ConnectPhase | null;
+  onCancelConnect?: () => void;
   onGetStarted: () => void;
   onJoinServer: () => void;
   /** Join a preset server (the split button + its dropdown). */
@@ -86,6 +93,7 @@ export function LandingStep({
         <div className="flex gap-0">
           <Button
             onClick={() => onJoinManaged(managedServers[0])}
+            loading={connectPhase !== null}
             className="flex-1 py-5 rounded-tr-none rounded-br-none border-none"
           >
             <Users className="size-4" />
@@ -102,6 +110,7 @@ export function LandingStep({
               <Button
                 className="py-5 rounded-tl-none rounded-bl-none border-0 border-l-[1px] border-muted-foreground"
                 aria-label="Choose team URL"
+                disabled={connectPhase !== null}
               >
                 <ChevronDown className="size-4" />
               </Button>
@@ -163,6 +172,8 @@ export function LandingStep({
           </Button>
         </>
       )}
+
+      <ConnectStatus phase={connectPhase} onCancel={onCancelConnect} />
     </div>
   );
 }

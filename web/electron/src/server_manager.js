@@ -322,14 +322,17 @@ async function disconnectHost(cliCommand, serverUrl) {
  *
  * @param {Parameters<typeof cli.cliCommandParts>[0]} cliCommand
  * @param {string} serverUrl
+ * @param {{ onLogin?: () => void }} [opts] `onLogin` fires just before the login
+ *   (which may open the browser) runs.
  * @returns {Promise<{ ok: boolean, authError?: boolean, error?: string }>}
  */
-async function ensureServerAuth(cliCommand, serverUrl) {
+async function ensureServerAuth(cliCommand, serverUrl, { onLogin } = {}) {
   if (cli.isLoopbackServer(serverUrl)) return { ok: true };
   const probe = await cli.probeServerAuth(serverUrl);
   // Already authed, or unreachable — in the unreachable case skip a doomed login
   // and let the connect attempt surface the real (connectivity) error.
   if (probe.authed || !probe.reachable) return { ok: true };
+  onLogin?.();
   const res = await cli.loginServer(cliCommand, serverUrl);
   if (res.ok) return { ok: true };
   // Deliberately a fixed, generic message — NOT `res.output`. `omnigent login`
