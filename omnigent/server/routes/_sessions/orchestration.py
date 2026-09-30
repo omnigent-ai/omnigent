@@ -9881,6 +9881,7 @@ async def _create_session_from_existing_agent(
         )
 
     inference_snapshot = None
+    selection_spec = None
     if agent_cache is not None:
         from omnigent.harness_aliases import canonicalize_harness
         from omnigent.runtime.workflow import _find_spec_by_name
@@ -9961,6 +9962,28 @@ async def _create_session_from_existing_agent(
                 runner_owner = runner_router.runner_owner(inherited_runner_id)
                 if runner_owner is not None and runner_owner != user_id:
                     inherited_runner_id = None
+
+    from omnigent.server.routes._session_harness_readiness import (
+        validate_create_harness_readiness,
+    )
+
+    selected_harness = (
+        harness_override or _spec_harness(selection_spec)
+        if selection_spec is not None
+        else await asyncio.to_thread(
+            _create_resolved_harness, agent, harness_override, agent_cache
+        )
+    )
+    await validate_create_harness_readiness(
+        harness=selected_harness,
+        host_id=body.host_id,
+        parent_session_id=body.parent_session_id,
+        inherited_runner_id=inherited_runner_id,
+        user_id=user_id,
+        conversation_store=conversation_store,
+        host_store=getattr(request.app.state, "host_store", None),
+        inference_snapshot=inference_snapshot,
+    )
 
     # Workspace validation: if the caller is binding to a host,
     # they must also pass a workspace, and the workspace must

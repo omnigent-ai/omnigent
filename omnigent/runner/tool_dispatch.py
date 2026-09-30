@@ -5589,6 +5589,32 @@ def _in_spawn_family(builtins: list[_JsonObject], family: str | None) -> list[_J
     return kept
 
 
+async def _agent_list_host_readiness(
+    server_client: httpx.AsyncClient,
+    conversation_id: str | None,
+) -> _JsonObject | None:
+    """Find readiness on the caller's host, including inherited child placement."""
+    seen: set[str] = set()
+    while conversation_id and conversation_id not in seen:
+        seen.add(conversation_id)
+        try:
+            response = await server_client.get(
+                f"/v1/sessions/{conversation_id}",
+                params={"include_items": "false", "include_liveness": "false"},
+                timeout=5.0,
+            )
+            if response.status_code != 200:
+                return None
+            snapshot = response.json()
+            host_id = snapshot.get("host_id")
+            if isinstance(host_id, str) and host_id:
+                return await _host_harnesses_or_none(host_id, server_client)
+            conversation_id = _optional_string(snapshot.get("parent_session_id"))
+        except (httpx.HTTPError, ValueError, AttributeError):
+            return None
+    return None
+
+
 async def _agent_list_via_rest(
     server_client: httpx.AsyncClient,
     *,
@@ -5600,7 +5626,7 @@ async def _agent_list_via_rest(
     continued: bool,
 ) -> str:
     """
-    List launchable agents across built-ins, session-bound, and local.
+    List agents across built-ins, session-bound, and local, with host readiness.
 
     Fans out three independent reads — each degrades to an empty section
     on failure rather than failing the whole call:
@@ -5675,6 +5701,15 @@ async def _agent_list_via_rest(
     listing["builtins"] = _in_spawn_family(
         listing["builtins"], await _spawn_family(server_client, conversation_id)
     )
+    from omnigent.harness_availability import reported_harness_availability
+
+    readiness = await _agent_list_host_readiness(server_client, conversation_id)
+    for row in listing["builtins"]:
+        available, reason = reported_harness_availability(
+            _optional_string(row.get("harness")), readiness
+        )
+        row["available_on_host"] = available
+        row["unavailable_reason"] = reason
     return _bounded_discovery_result(
         listing,
         limit=limit,
