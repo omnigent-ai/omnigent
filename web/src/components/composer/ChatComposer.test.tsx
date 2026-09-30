@@ -1058,6 +1058,24 @@ describe("ComposerTextarea Markdown editing and new styles", () => {
     expect(input().selectionStart).toBe("intro\n```\n".length);
   });
 
+  it("pairs a backtick on an empty line, and three typed make the code block", async () => {
+    place("intro\n");
+    await type("`");
+    expect(shown()).toBe("intro\n`|`");
+    await type("`");
+    expect(shown()).toBe("intro\n``|``");
+    await type("`");
+    expect(shown()).toBe("intro\n```\n|\n```");
+    cleanup();
+    // Or inline code on its own line.
+    place("");
+    // Keystrokes land one at a time.
+    /* oxlint-disable no-await-in-loop */
+    for (const char of "`code`") await type(char);
+    /* oxlint-enable no-await-in-loop */
+    expect(shown()).toBe("`code`|");
+  });
+
   it("makes Enter a newline inside a code block, and Cmd/Ctrl+Enter still sends", () => {
     const onKeyDown = vi.fn();
     render(<Controlled initial={"```\ncode\n```"} onKeyDown={onKeyDown} />);

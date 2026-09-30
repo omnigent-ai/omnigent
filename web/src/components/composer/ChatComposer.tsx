@@ -871,6 +871,7 @@ function useTypingEdits(
         const result = editAfterKeystroke(text, caret, typed, state);
         state = result.state;
         if (result.edit) apply(result.edit);
+        if (result.then) apply(result.then);
       });
     };
     // A caret moved out of a pair's text leaves its closer as plain text.

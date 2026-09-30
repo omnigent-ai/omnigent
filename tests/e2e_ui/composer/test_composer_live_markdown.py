@@ -1252,6 +1252,21 @@ def test_auto_paired_markers_show_and_send_real_text(
     page.keyboard.press("ControlOrMeta+z")
     expect(composer).to_have_value("**x** then *hi**")
 
+    # A backtick pairs on an empty line too: `code` there is inline code, and
+    # three make the code block, whose first undo leaves ``` as typed.
+    composer.fill("")
+    page.keyboard.type("`code`")
+    expect(composer).to_have_value("`code`")
+    page.keyboard.press("ControlOrMeta+z")
+    expect(composer).to_have_value("`code``")
+    composer.fill("")
+    page.keyboard.type("```")
+    expect(composer).to_have_value("```\n\n```")
+    assert caret() == len("```\n")
+    for undone in ("```", "`````", "````"):
+        page.keyboard.press("ControlOrMeta+z")
+        expect(composer).to_have_value(undone)
+
 
 def test_code_block_in_a_quoted_list_item_stays_code(
     page: Page,

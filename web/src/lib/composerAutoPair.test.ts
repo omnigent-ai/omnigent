@@ -92,6 +92,7 @@ class Draft {
     const result = editAfterKeystroke(this.text, this.start, key, this.state);
     this.state = result.state;
     if (result.edit) this.apply(result.edit);
+    if (result.then) this.apply(result.then);
   }
 
   /** Move the caret (a click or arrow key): a closer left behind stops being tracked. */
@@ -239,6 +240,34 @@ describe("auto-pairing inline markers", () => {
     expect(typedInto("intro\n|", "```")).toBe("intro\n```\n|\n```");
     expect(typedInto("> |", "```")).toBe("> ```\n> |\n> ```");
     expect(typedInto("- |", "```")).toBe("- ```\n  |\n  ```");
+    expect(typedInto("> - |", "```")).toBe("> - ```\n>   |\n>   ```");
+  });
+
+  it("pairs a backtick on an empty line, which grows into the ``` code block", () => {
+    // One and two backticks pair like anywhere else.
+    expect(typed("`")).toBe("`|`");
+    expect(typed("``")).toBe("``|``");
+    expect(typedInto("> |", "`")).toBe("> `|`");
+    // Inline code on its own line.
+    expect(typed("`code`")).toBe("`code`|");
+    expect(typed("``ab`` x")).toBe("``ab`` x|");
+    // The third makes the block; each step before it undoes to what it was.
+    const block = new Draft().type("```");
+    expect(String(block)).toBe("```\n|\n```");
+    expect(String(block.undo())).toBe("```|");
+    expect(String(block.undo())).toBe("```|``");
+    expect(String(block.undo())).toBe("``|``");
+    // Undoing the step over its closer shows the backtick typed before it.
+    const code = new Draft().type("`code`");
+    expect(String(code.undo())).toBe("`code`|`");
+    expect(String(code.undo())).toBe("`code|`");
+  });
+
+  it("makes no block where the line holds more than the backticks", () => {
+    // Unchanged from before: text after the caret leaves them unpaired, and
+    // mid-line the third steps over the pair's closer.
+    expect(typedInto("|x", "```")).toBe("```|x");
+    expect(typedInto("say |", "```")).toBe("say ````|");
   });
 });
 
