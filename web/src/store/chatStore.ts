@@ -148,8 +148,11 @@ import { getSessionHost } from "@/lib/sessionHost";
 import { isSystemUserContent, taskNotificationMarkerContent } from "@/lib/systemMessage";
 import { isNativeTerminalSession as isNativeTerminalSessionFn } from "@/lib/nativeCodingAgents";
 import type { StoredReplyDraft } from "@/lib/replyDraft";
+import { toast } from "sonner";
 
 export interface SendOptions {
+  /** Codex compact is a control event, not a user-message turn. */
+  command?: "compact";
   /** Client-only quote provenance, retained if the composer needs to retry. */
   replyDraft?: StoredReplyDraft;
   /**
@@ -542,6 +545,8 @@ export interface PendingUserMessage {
  * directly (no serialization concern).
  */
 export interface QueuedMessage {
+  /** Captured at enqueue time so background dispatch preserves the control. */
+  command?: "compact";
   /** Client-only id, e.g. `q_1`. */
   queueId: string;
   /** Fully-assembled message text (mentions/quotes already applied). */
@@ -1823,7 +1828,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   historyGeneration: 0,
 
   enqueueMessage: (text, files, replyDraft) => {
-    const { conversationId, boundAgentId } = get();
+    const { conversationId, boundAgentId, sessionHarness } = get();
     if (conversationId === null) return;
     queueSeq += 1;
     const queueId = `q_${queueSeq}`;
@@ -1834,6 +1839,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         {
           queueId,
           text,
+          ...(isCodexCompact(sessionHarness, text, files) ? { command: "compact" as const } : {}),
           stableId,
           conversationId,
           ...(boundAgentId !== null ? { agentId: boundAgentId } : {}),
@@ -1888,6 +1894,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     const target = s.queuedMessages.find((m) => m.queueId === queueId);
     const agentId = target?.agentId ?? s.boundAgentId;
     if (target === undefined || agentId === null) return;
+    if (target.command === "compact" && rejectBusyCompact(target.conversationId)) return;
     // Remove BEFORE the POST so a concurrent flush can't also send it.
     setActive({ queuedMessages: s.queuedMessages.filter((m) => m.queueId !== queueId) });
     void s.send(target.text, agentId, target.files, queuedSendOptions(target));
@@ -1896,13 +1903,21 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   steerAllQueuedMessages: (conversationId) => {
     const s = get();
     const own = s.queuedMessages.filter((m) => m.conversationId === conversationId);
-    if (own.length === 0 || own.some((m) => (m.agentId ?? s.boundAgentId) === null)) return;
-    const batchOrder = new Map(own.map((m, index) => [m.queueId, index]));
+    if (own.length === 0) return;
+    // Steer ordinary messages up to the compact; it must run on an idle turn.
+    const compactIndex = own.findIndex((m) => m.command === "compact");
+    if (compactIndex === 0) {
+      s.steerMessage(own[0]!.queueId);
+      return;
+    }
+    const batch = compactIndex < 0 ? own : own.slice(0, compactIndex);
+    if (batch.some((m) => (m.agentId ?? s.boundAgentId) === null)) return;
+    const batchOrder = new Map(batch.map((m, index) => [m.queueId, index]));
     // Remove BEFORE the POSTs so a concurrent flush can't also send one.
     setActive({
-      queuedMessages: s.queuedMessages.filter((m) => m.conversationId !== conversationId),
+      queuedMessages: s.queuedMessages.filter((m) => !batchOrder.has(m.queueId)),
     });
-    for (const m of own) {
+    for (const m of batch) {
       const agentId = m.agentId ?? s.boundAgentId;
       if (agentId === null) continue;
       void s.send(m.text, agentId, m.files, queuedSendOptions(m, batchOrder));
@@ -1990,6 +2005,17 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     const now = Date.now();
     for (const conversationId of candidateIds) {
       if (statusById.get(conversationId) !== "idle") continue;
+      // The sidebar can still say idle while Codex starts compaction.
+      const local = setterForState(conversationId);
+      if (local?.sessionHarness === "codex-native") {
+        if (local.sessionStatus === "running") continue;
+        if (local.status === "streaming") {
+          if (!sendLatchIsStranded(local)) continue;
+          // Recover the same stranded send state as the foreground flush.
+          sendChains.delete(conversationId);
+          setterFor(conversationId)({ status: "idle", sendLatchedAt: null });
+        }
+      }
       // Skip a conversation mid-POST or in its post-failure cooldown so a
       // persistent failure can't spin this into a tight retry loop (the effect
       // re-fires on every re-queue, and a failed POST leaves the row idle).
@@ -1998,12 +2024,21 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       if (cooldownUntil !== undefined && cooldownUntil > now) continue;
       const head = get().queuedMessages.find((m) => m.conversationId === conversationId);
       if (head === undefined || head.requiresRetry) continue;
+      const compactAgentId = head.agentId ?? local?.boundAgentId;
+      if (head.command === "compact" && !compactAgentId) continue;
 
       // Remove BEFORE the work starts so a re-entrant trigger can't double-send.
       backgroundFlushInFlight.add(conversationId);
       setActive((st) => ({
         queuedMessages: st.queuedMessages.filter((m) => m.queueId !== head.queueId),
       }));
+      if (head.command === "compact") {
+        conversationRegistry.acquire(conversationId);
+        void s
+          .send(head.text, compactAgentId!, head.files, queuedSendOptions(head))
+          .finally(() => backgroundFlushInFlight.delete(conversationId));
+        continue;
+      }
       // Join the SAME send chain the foreground path uses for this
       // conversation. A queued message can hand off from the foreground flush
       // (send() → its chain) to here the moment the user navigates away, and
@@ -2123,11 +2158,18 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       useChatStore.setState({ awaitingSideChatFor: pinnedId ?? get().conversationId });
     }
     const targetState = pinnedId === null ? get() : setterForState(pinnedId);
+    const compacts =
+      opts?.command === "compact" || isCodexCompact(targetState?.sessionHarness, text, files);
+    if (compacts && rejectBusyCompact(pinnedId ?? get().conversationId)) {
+      opts?.onError?.("Compact is disabled while a chat is in progress");
+      return;
+    }
+    const skipPendingBubble = opensSideChat || compacts;
     const initialDraft =
       opts?.reusePendingTempId != null
         ? targetState?.pendingUserMessages.find((p) => p.tempId === opts.reusePendingTempId)
             ?.initialDraft
-        : !opensSideChat &&
+        : !skipPendingBubble &&
             targetState &&
             (modelSelectionPending(targetState) ||
               (targetState.sessionModelSeeded && targetState.sessionHarness === null))
@@ -2181,7 +2223,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     const selfAuthor = getCurrentAuthorId();
     if (reuseTempId === null) {
       pinnedSetter((s) => ({
-        pendingUserMessages: opensSideChat
+        pendingUserMessages: skipPendingBubble
           ? s.pendingUserMessages
           : [
               ...s.pendingUserMessages,
@@ -2236,6 +2278,14 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       const sessionId = await ensureBoundSession(agentId, get, opts, submitConversationId, rekey);
       postedSessionId = sessionId;
       if (initialDraft && !(await waitForModelSelection(sessionId, tempId))) return;
+
+      if (compacts) {
+        // Codex emits normal turn status edges for compaction, but no user
+        // message acknowledgement. Keep the send latch without a pending bubble.
+        await postEvent(sessionId, { type: "compact", data: {} });
+        queryClient?.invalidateQueries({ queryKey: ["conversations"] });
+        return;
+      }
 
       // Upload any attached files and build the real content blocks with
       // server-assigned file_ids (input_image for images, input_file
@@ -3143,12 +3193,24 @@ function setActive(partial: Partial<ChatState> | ((state: ChatState) => Partial<
 
 // ── Internal helpers ─────────────────────────────────────
 
+function isCodexCompact(harness: string | null | undefined, text: string, files?: File[]): boolean {
+  return harness === "codex-native" && !files?.length && text.trim() === "/compact";
+}
+
+function rejectBusyCompact(conversationId: string | null): boolean {
+  const state = conversationId === null ? undefined : setterForState(conversationId);
+  if (state?.status !== "streaming" && state?.sessionStatus !== "running") return false;
+  toast.error("Compact is disabled while a chat is in progress", { richColors: true });
+  return true;
+}
+
 function queuedSendOptions(
   message: QueuedMessage,
   batchOrder?: ReadonlyMap<string, number>,
 ): SendOptions {
   const stableId = message.stableId ?? randomUUID().replace(/-/g, "");
   return {
+    command: message.command,
     replyDraft: message.replyDraft,
     stableId,
     pinnedConversationId: message.conversationId,

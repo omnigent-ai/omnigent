@@ -164,6 +164,7 @@ import type { ElicitationBlock } from "@/lib/blocks";
 import { getGoal } from "@/lib/goalApi";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { Composer, computeIsWorking, shouldQueueSend } from "./ChatPage";
+import { readAlwaysSteer, writeAlwaysSteer } from "@/lib/alwaysSteerPreferences";
 import { appendPromptHistoryEntry } from "@/hooks/usePromptHistory";
 import {
   BUILTIN_SLASH_COMMANDS,
@@ -855,19 +856,32 @@ describe("Composer slash-command menu", () => {
   });
 
   it.each([
-    ["claude-native", "/compact", false],
-    ["claude-native", "/compact preserve decisions and TODOs", false],
-    ["claude-sdk", "/compact", false],
-    ["codex-native", "/compact", false],
-    ["pi-native", "/compact", false],
-    ["pi-native", "/compact", true],
-  ] as const)("%s dispatches %s (busy: %s)", (harness, command, isWorking) => {
-    const previousHarness = useChatStore.getState().sessionHarness;
-    onTestFinished(() => useChatStore.setState({ sessionHarness: previousHarness }));
-    useChatStore.setState({ sessionHarness: harness });
+    ["claude-native", "/compact", "idle"],
+    ["claude-native", "/compact preserve decisions and TODOs", "idle"],
+    ["claude-sdk", "/compact", "idle"],
+    ["codex-native", "/compact", "idle"],
+    ["codex-native", "/compact", "running"],
+    ["codex-native", "/compact", "waiting"],
+    ["codex-native", "/compact extra arguments", "idle"],
+    ["pi-native", "/compact", "idle"],
+    ["pi-native", "/compact", "running"],
+  ] as const)("%s handles %s (status: %s)", (harness, command, turnStatus) => {
+    const { sessionHarness, status, sessionStatus } = useChatStore.getState();
+    onTestFinished(() => useChatStore.setState({ sessionHarness, status, sessionStatus }));
+    const previousAlwaysSteer = readAlwaysSteer();
+    onTestFinished(() => writeAlwaysSteer(previousAlwaysSteer));
+    writeAlwaysSteer(false);
+    useChatStore.setState({
+      sessionHarness: harness,
+      status: turnStatus === "running" ? "streaming" : "idle",
+      sessionStatus: turnStatus,
+    });
     const compact = vi.spyOn(useChatStore.getState(), "compact").mockResolvedValue();
     const error = vi.spyOn(toast, "error");
-    const props = composerProps({ isNativeWrapper: harness !== "claude-sdk", isWorking });
+    const props = composerProps({
+      isNativeWrapper: harness !== "claude-sdk",
+      isWorking: turnStatus !== "idle",
+    });
     render(<Composer {...props} />);
     fireEvent.change(textarea(), { target: { value: "/comp" } });
     fireEvent.keyDown(textarea(), { key: "Tab" });
@@ -877,13 +891,21 @@ describe("Composer slash-command menu", () => {
 
     fireEvent.change(textarea(), { target: { value: command + " " } });
     fireEvent.keyDown(textarea(), { key: "Enter" });
+    if (harness === "codex-native" && command !== "/compact") {
+      expect(textarea()).toHaveValue(command + " ");
+      expect(screen.getByText("/compact does not accept arguments for Codex")).toBeVisible();
+      expect(props.onSend).not.toHaveBeenCalled();
+      expect(compact).not.toHaveBeenCalled();
+      return;
+    }
     expect(textarea()).toHaveValue("");
     expect(error).not.toHaveBeenCalled();
-    if (harness === "claude-native") {
-      expect(props.onSend).toHaveBeenCalledExactlyOnceWith(command);
+    if (harness === "claude-native" || harness === "codex-native") {
+      const sent = harness === "codex-native" ? "/compact" : command;
+      expect(props.onSend).toHaveBeenCalledExactlyOnceWith(sent);
       expect(compact).not.toHaveBeenCalled();
       fireEvent.keyDown(textarea(), { key: "ArrowUp" });
-      expect(textarea()).toHaveValue(command);
+      expect(textarea()).toHaveValue(sent);
     } else {
       expect(compact).toHaveBeenCalledOnce();
       expect(props.onSend).not.toHaveBeenCalled();
@@ -891,9 +913,19 @@ describe("Composer slash-command menu", () => {
   });
 
   it.each(["Enter", "click"])("shows a toast for busy Codex /compact via %s", (submit) => {
-    const previousHarness = useChatStore.getState().sessionHarness;
-    onTestFinished(() => useChatStore.setState({ sessionHarness: previousHarness }));
-    useChatStore.setState({ sessionHarness: "codex-native" });
+    const { sessionHarness, status, sessionStatus, queuedMessages } = useChatStore.getState();
+    onTestFinished(() =>
+      useChatStore.setState({ sessionHarness, status, sessionStatus, queuedMessages }),
+    );
+    const previousAlwaysSteer = readAlwaysSteer();
+    writeAlwaysSteer(true);
+    onTestFinished(() => writeAlwaysSteer(previousAlwaysSteer));
+    useChatStore.setState({
+      sessionHarness: "codex-native",
+      status: "streaming",
+      sessionStatus: "running",
+      queuedMessages: [],
+    });
     const compact = vi.spyOn(useChatStore.getState(), "compact").mockResolvedValue();
     const error = vi.spyOn(toast, "error");
     const props = composerProps({ isNativeWrapper: true, isWorking: true });
