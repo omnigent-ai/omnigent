@@ -130,6 +130,7 @@ import { uploadFile } from "@/lib/filesApi";
 import { attachmentKey } from "@/lib/attachments";
 import type { ActiveResponse } from "./types";
 import { supportsEffortControl } from "@/lib/sessionCapabilities";
+import { fetchHarnessCatalog } from "@/lib/agentLabels";
 import { claudePermissionModeFromSession } from "@/lib/claudePermissionMode";
 import { codexApprovalModeFromSession } from "@/lib/codexApprovalMode";
 import { codexPlanModeFromSession, isCodexNativeSession } from "@/lib/codexPlanMode";
@@ -146,7 +147,10 @@ import {
 } from "./interactionTelemetry";
 import { getSessionHost } from "@/lib/sessionHost";
 import { isSystemUserContent, taskNotificationMarkerContent } from "@/lib/systemMessage";
-import { isNativeTerminalSession as isNativeTerminalSessionFn } from "@/lib/nativeCodingAgents";
+import {
+  isNativeTerminalSession as isNativeTerminalSessionFn,
+  nativeCodingAgentForHarness,
+} from "@/lib/nativeCodingAgents";
 import type { StoredReplyDraft } from "@/lib/replyDraft";
 import { toast } from "sonner";
 
@@ -1765,6 +1769,32 @@ export function consumePendingInitialPrompt(conversationId: string): PendingInit
   return prompt;
 }
 
+/**
+ * The reasoning-effort family a session's harness declares in ``/v1/harnesses``.
+ *
+ * A non-native SDK harness (claude-sdk, codex) carries no wrapper label, so
+ * ``supportsEffortControl`` needs the declared family to know the session takes
+ * an effort override. Native harnesses keep their wrapper-label gate (as in
+ * ChatPage), so they resolve to ``null`` here too. Reads the cached harness
+ * catalog; ``null`` when the map is unavailable or the harness declares no family.
+ */
+async function effortFamilyForSession(
+  session: { harness?: string | null } | null | undefined,
+): Promise<string | null> {
+  if (queryClient === null || !session?.harness) return null;
+  if (nativeCodingAgentForHarness(session.harness)) return null;
+  try {
+    const catalog = await queryClient.fetchQuery({
+      queryKey: ["harness-labels"],
+      queryFn: fetchHarnessCatalog,
+      staleTime: 30_000,
+    });
+    return catalog.effortFamilies[session.harness] ?? null;
+  } catch {
+    return null;
+  }
+}
+
 export const useChatStore = create<ChatState>((_rootSet, get) => ({
   conversationId: null,
   redirectToConversationId: null,
@@ -2919,7 +2949,9 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       });
       // Harness has no effort control: undo the optimistic session-scoped write
       // so this conversation doesn't claim an effort the server will never hold.
-      if (!supportsEffortControl(session)) {
+      // SDK harnesses carry no wrapper label, so resolve their declared effort
+      // family to recognize that they do take a ``reasoning_effort`` override.
+      if (!supportsEffortControl(session, await effortFamilyForSession(session))) {
         setterFor(conversationId)({ sessionReasoningEffort: null });
         return;
       }
@@ -4074,7 +4106,7 @@ async function bindStream(
     const snapshotNativeMessageIds = nativeCompletedMessageIds(items);
     snapshotNativeMessageIds.forEach((messageId) => ignoredNativeMessageIds.add(messageId));
 
-    const canApplyEffort = supportsEffortControl(session);
+    const canApplyEffort = supportsEffortControl(session, await effortFamilyForSession(session));
     const effectiveEffort = canApplyEffort ? (session.reasoningEffort ?? null) : null;
 
     const snapshotBlocks = itemsToBlocks(items);
