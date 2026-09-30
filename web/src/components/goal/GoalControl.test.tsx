@@ -143,10 +143,11 @@ describe("GoalControl", () => {
 
     fireEvent.focus(screen.getByTestId("composer-goal-mode"));
     await screen.findByRole("tooltip");
-    const bubble = document.querySelector('[data-slot="tooltip-content"]') as HTMLElement;
+    const bubble = document.querySelector('[data-slot="tooltip-content"]');
+    expect(bubble).not.toBeNull();
     // Radix also renders a visually hidden copy for the tooltip role; the first
     // match is the visible objective line.
-    const objective = within(bubble).getAllByText(GOAL.objective)[0];
+    const objective = within(bubble as HTMLElement).getAllByText(GOAL.objective)[0];
     expect(objective).toHaveClass("line-clamp-3", "wrap-anywhere");
   });
 });
