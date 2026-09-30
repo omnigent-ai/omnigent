@@ -18,6 +18,7 @@ import { ALT_KEY, ARIA_MOD_KEY, MOD_KEY } from "@/components/KeyboardShortcut";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { Conversation } from "@/hooks/useConversations";
 import {
+  markConversationRead,
   markConversationSeen,
   resetReadStateForTests,
   seedReadState,
@@ -3091,6 +3092,17 @@ describe("Sidebar view options", () => {
     expect(JSON.parse(localStorage.getItem("omnigent:sidebar-view")!)).toMatchObject({
       grouping: "status",
     });
+  });
+
+  it("moves a session out of Unread as soon as it's marked read", () => {
+    localStorage.setItem("omnigent:sidebar-view", JSON.stringify({ grouping: "status" }));
+    seedReadState([{ id: "conv_unread", viewer_last_seen: 100 }]);
+    mockConversations([conv("conv_unread", "Codex", { status: "idle", updated_at: 200 })]);
+    renderSidebar();
+    expect(groupHeaders()).toEqual(["Unread"]);
+
+    act(() => markConversationRead("conv_unread", 200));
+    expect(groupHeaders()).toEqual(["Done"]);
   });
 
   it("groups sessions by updated day from the persisted preference", () => {

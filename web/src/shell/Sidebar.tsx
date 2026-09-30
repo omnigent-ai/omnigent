@@ -1681,8 +1681,9 @@ function ConversationList({
   const grouped = view.grouping !== "default";
   const groupOrder: readonly string[] =
     view.grouping === "status" ? STATUS_BUCKETS : UPDATED_BUCKETS;
-  // Status groups read the unread mirror; re-render when a row is marked read/unread.
-  const unseenTick = useUnseenTick();
+  // Status buckets read the unread mirror; only a status view re-renders the
+  // whole list on read/unread writes.
+  const unseenTick = useUnseenTick(view.grouping === "status" || view.ordering === "status");
   // All loaded conversations from the single paginated list (for the flat
   // session list; pinned rows are merged in from the server pinned query).
   const allConversations = useMemo(
