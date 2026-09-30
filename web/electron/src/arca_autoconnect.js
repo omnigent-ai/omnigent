@@ -105,10 +105,11 @@ function createArcaAutoConnect({
     publish(origin, status);
     log(`arca auto-connect: running against ${origin}`);
     const connect = startConnect(serverUrl, (text) => {
-      onOutput?.(text);
       output = (output + text).slice(-OUTPUT_TAIL_CHARS);
       const entry = byOrigin.get(origin);
       if (entry?.status.state === "starting") entry.status = { ...entry.status, output };
+      // After the shared bookkeeping, so a throwing caller can't skip it.
+      onOutput?.(text);
     });
     const run = connect.promise.then((result) => {
       const base = { command, startedAt: status.startedAt };

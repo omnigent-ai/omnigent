@@ -394,42 +394,69 @@ const arcaAutoConnect = createArcaAutoConnect({
   log: (message) => console.log(`[omnigent] ${message}`),
 });
 
+/** Onboarding Arca connects that succeeded this launch (see connectOnboardingArca). */
+let onboardingArcaSuccesses = 0;
+
 /**
  * Onboarding's Arca connect, run through the auto-connect state machine so
  * the window's own launch-time connect joins it instead of racing a second
  * `arca ssh`. Picking Arca opts into auto-connect; the opt-in only sticks when
- * the connect succeeds. Like any auto-connect, a started run finishes in the
- * background even if setup closes.
+ * the connect succeeds, and a failure never undoes another window's success.
+ * Like any auto-connect, a started run finishes in the background even if
+ * setup closes; nothing starts once it has.
  *
  * @param {string} serverUrl
  * @param {(line: string) => void} log
- * @returns {Promise<{ ok: boolean, alreadyRunning?: boolean, error?: string }>}
+ * @param {() => boolean} isClosed Whether the setup window has closed.
+ * @returns {Promise<{ ok: boolean, canceled?: boolean, alreadyRunning?: boolean, error?: string }>}
  */
-async function connectOnboardingArca(serverUrl, log) {
+async function connectOnboardingArca(serverUrl, log, isClosed) {
+  const successesBefore = onboardingArcaSuccesses;
   const settings = loadSettings();
   const previous = settings.arca_auto_connect;
   settings.arca_auto_connect = true;
   saveSettings(settings);
-  await refreshArcaBinary();
-  const command = arcaAutoConnect.getStatus(serverUrl).command;
-  if (command) log(`$ ${command}`);
-  const status =
-    arcaAutoConnect.getStatus(serverUrl).state === "failed"
-      ? await arcaAutoConnect.retry(serverUrl, log)
-      : await arcaAutoConnect.ensure(serverUrl, log);
-  if (status.state === "online")
-    return { ok: true, alreadyRunning: status.alreadyRunning === true };
-  const restored = loadSettings();
-  if (previous === undefined) delete restored.arca_auto_connect;
-  else restored.arca_auto_connect = previous;
-  saveSettings(restored);
-  return {
-    ok: false,
-    error:
-      status.state === "unavailable"
-        ? "The arca CLI was not found on this machine."
-        : (status.error ?? "Couldn't connect Arca."),
-  };
+  let result;
+  try {
+    await refreshArcaBinary();
+    if (isClosed()) {
+      result = { ok: false, canceled: true };
+    } else {
+      const current = arcaAutoConnect.getStatus(serverUrl);
+      // Joining a run already in flight streams nothing, so only a new run shows its command.
+      if (current.command && (current.state === "idle" || current.state === "failed")) {
+        log(`$ ${current.command}`);
+      }
+      const status =
+        current.state === "failed"
+          ? await arcaAutoConnect.retry(serverUrl, log)
+          : await arcaAutoConnect.ensure(serverUrl, log);
+      result =
+        status.state === "online"
+          ? { ok: true, alreadyRunning: status.alreadyRunning === true }
+          : {
+              ok: false,
+              error:
+                status.state === "unavailable"
+                  ? "The arca CLI was not found on this machine."
+                  : (status.error ?? "Couldn't connect Arca."),
+            };
+    }
+  } catch (error) {
+    result = { ok: false, error: error instanceof Error ? error.message : String(error) };
+  }
+  const latest = loadSettings();
+  if (result.ok) {
+    onboardingArcaSuccesses += 1;
+    // Another window's failed attempt may have undone the opt-in meanwhile.
+    latest.arca_auto_connect = true;
+    saveSettings(latest);
+  } else if (onboardingArcaSuccesses === successesBefore) {
+    if (previous === undefined) delete latest.arca_auto_connect;
+    else latest.arca_auto_connect = previous;
+    saveSettings(latest);
+  }
+  return result;
 }
 
 /**
@@ -1618,8 +1645,11 @@ async function loadServerUrl(
     setWindowServerUrl(win, serverUrl);
     const windowState = windows.get(win);
     if (windowState) {
+      // An explicit connect targets what was typed; a restore or switch lands on
+      // the workspace host and maps back to the URL picked for it.
       windowState.arcaServerUrl =
-        serverLabel(parseServerLabels(loadSettings().server_labels), requestedServerUrl) ??
+        (!interactive &&
+          serverLabel(parseServerLabels(loadSettings().server_labels), requestedServerUrl)) ||
         requestedServerUrl;
     }
     let target = loadUrl ?? (routePath ? resolveServerPath(serverUrl, routePath) : serverUrl);
@@ -3301,7 +3331,7 @@ function registerIpc() {
       if (!databricksInternalFeaturesEnabled() || !isDatabricksManagedServerUrl(target)) {
         return { ok: false, error: "A remote environment isn't available for this server." };
       }
-      const result = await connectOnboardingArca(target, log);
+      const result = await connectOnboardingArca(target, log, () => event.sender.isDestroyed());
       if (result.ok) rememberOnboardingRunner(target, runner);
       return result;
     }
@@ -3865,6 +3895,10 @@ function registerIpc() {
     }
     const win = BrowserWindow.fromWebContents(event.sender);
     const arcaServerUrl = windowArcaServerUrl(win);
+    // It can come from a settings label, so it passes the same gate.
+    if (!isDatabricksManagedServerUrl(arcaServerUrl)) {
+      return { ok: false, error: "Arca hosts can only connect to Databricks-managed servers." };
+    }
     // An auto-connect already running shares its outcome instead of racing a
     // second `arca ssh`.
     const autoRun = arcaAutoConnect.inFlight(arcaServerUrl);

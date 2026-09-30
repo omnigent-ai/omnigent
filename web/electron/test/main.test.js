@@ -254,7 +254,8 @@ function loadNavigationHarness({
       isExecutableFile: (p) => p === arcaPath,
       startArcaConnect: (url) => {
         calls.arcaConnects.push(url);
-        return { command: "arca ssh", promise: Promise.resolve(arcaResult), cancel: () => {} };
+        const result = typeof arcaResult === "function" ? arcaResult(url) : arcaResult;
+        return { command: "arca ssh", promise: Promise.resolve(result), cancel: () => {} };
       },
     },
     "./databricks-session": {
@@ -433,6 +434,7 @@ describe("Arca auto-connect wiring", () => {
       "remote",
     );
     assert.equal(connected.ok, true);
+    assert.equal(JSON.parse(fs.readFileSync(h.settingsPath, "utf8")).arca_auto_connect, true);
     await h.ipc.get("omnigent:set-server-url")(setupEvent, picked);
     await tick();
     assert.deepEqual(h.calls.arcaConnects, [picked]);
@@ -444,6 +446,118 @@ describe("Arca auto-connect wiring", () => {
     await relaunched.api.loadServerUrl(relaunched.win, workspace);
     await tick();
     assert.deepEqual(relaunched.calls.arcaConnects, [picked]);
+
+    // Connecting to the workspace host itself targets the host that was typed.
+    await h.ipc.get("omnigent:set-server-url")(setupEvent, workspace);
+    await tick();
+    assert.deepEqual(h.calls.arcaConnects, [picked, workspace]);
+  });
+
+  describe("onboarding connect", () => {
+    const setupFrame = (h) => ({ url: `file://${h.api.SETUP_PAGE}` });
+    // A setup page that closes after `openChecks` isDestroyed() checks.
+    const setupPage = (openChecks = Infinity) => {
+      let checks = 0;
+      return {
+        send() {},
+        once() {},
+        removeListener() {},
+        isDestroyed: () => ++checks > openChecks,
+      };
+    };
+    const saved = (h) =>
+      fs.existsSync(h.settingsPath) ? JSON.parse(fs.readFileSync(h.settingsPath, "utf8")) : {};
+    function harness(t, options = {}) {
+      const h = loadNavigationHarness({
+        serverUrl: workspace,
+        arcaPath,
+        internalFeatures: true,
+        ...options,
+      });
+      t.after(h.cleanup);
+      h.api.registerIpc();
+      return h;
+    }
+    const connect = (h, url = workspace, page = setupPage()) =>
+      h.ipc.get("omnigent:connect-runner")(
+        { sender: page, senderFrame: setupFrame(h) },
+        url,
+        "remote",
+      );
+    const failed = { ok: false, errorKind: "timeout", error: "timed out" };
+
+    it("keeps the auto-connect opt-in only when the connect succeeds", async (t) => {
+      const ok = harness(t);
+      assert.equal((await connect(ok)).ok, true);
+      assert.equal(saved(ok).arca_auto_connect, true);
+      for (const previous of [undefined, false, true]) {
+        const h = harness(t, { arcaResult: failed });
+        if (previous !== undefined) {
+          fs.writeFileSync(h.settingsPath, JSON.stringify({ arca_auto_connect: previous }));
+        }
+        // oxlint-disable-next-line no-await-in-loop -- Each case is its own app.
+        assert.equal((await connect(h)).ok, false);
+        assert.equal(saved(h).arca_auto_connect, previous);
+      }
+    });
+
+    it("retries a failed run on the next attempt", async (t) => {
+      let attempts = 0;
+      const h = harness(t, { arcaResult: () => (++attempts === 1 ? failed : { ok: true }) });
+      assert.equal((await connect(h)).ok, false);
+      assert.equal((await connect(h)).ok, true);
+      assert.equal(h.calls.arcaConnects.length, 2);
+    });
+
+    it("starts nothing when setup closes while arca is being looked up", async (t) => {
+      const h = harness(t);
+      // Open at the check after URL resolution, closed at the one after the lookup.
+      const result = await connect(h, workspace, setupPage(1));
+      assert.equal(result.canceled, true);
+      assert.deepEqual(h.calls.arcaConnects, []);
+      assert.equal(saved(h).arca_auto_connect, undefined);
+    });
+
+    it("never undoes another window's successful opt-in", async (t) => {
+      const other = "https://other.cloud.databricks.com/omnigent";
+      const finish = new Map();
+      const h = harness(t, {
+        arcaResult: (url) =>
+          new Promise((resolve) => {
+            finish.set(url, resolve);
+          }),
+      });
+      const failing = connect(h, workspace);
+      const succeeding = connect(h, other);
+      for (let i = 0; i < 100 && finish.size < 2; i++) {
+        // oxlint-disable-next-line no-await-in-loop -- Wait for both runs to start.
+        await tick();
+      }
+      finish.get(other)({ ok: true });
+      assert.equal((await succeeding).ok, true);
+      finish.get(workspace)(failed);
+      assert.equal((await failing).ok, false);
+      assert.equal(saved(h).arca_auto_connect, true);
+    });
+
+    it("keeps the manual connect on Databricks servers, even through a hand-edited label", async (t) => {
+      const h = harness(t);
+      fs.writeFileSync(
+        h.settingsPath,
+        JSON.stringify({
+          arca_auto_connect: true,
+          server_labels: { [new URL(workspace).origin]: "https://evil.example/" },
+        }),
+      );
+      await h.api.loadServerUrl(h.win, workspace);
+      await tick();
+      const result = await h.ipc.get("omnigent:arca-connect")({
+        sender: h.webContents,
+        senderFrame: { url: workspace },
+      });
+      assert.match(result.error, /Databricks-managed servers/);
+      assert.deepEqual(h.calls.arcaConnects, []);
+    });
   });
 
   it("stays off without the feature flag, even with arca installed", async (t) => {
@@ -1107,26 +1221,17 @@ describe("managed server preference wiring", () => {
     );
   });
 
-  it("wires the onboarding connect's remote gate, auto-connect run, and sign-in order", () => {
+  it("wires the onboarding connect to the page, and signs in before connecting a laptop", () => {
     assert.match(
       preloadSource,
       /connectRunner:\s*\(url, runner\)\s*=>\s*ipcRenderer\.invoke\("omnigent:connect-runner",\s*url,\s*runner\)/,
     );
-    // The harness can't observe these (its arca and host stubs are fixed), so
-    // they stay source checks; the gates and cancellation are exercised below.
+    // The harness's host stubs can't observe this order; the remote path's
+    // gates, opt-in and cancellation are exercised through the harness.
     const start = liveCode.indexOf('ipcMain.handle("omnigent:connect-runner"');
     const end = liveCode.indexOf('ipcMain.handle("omnigent:copy-setup-text"');
     assert.ok(start >= 0 && end > start, "connect-runner handler not found before copy-setup-text");
     const handler = liveCode.slice(start, end);
-    assert.match(
-      handler,
-      /runner === "remote"[\s\S]{0,80}!databricksInternalFeaturesEnabled\(\) \|\| !isDatabricksManagedServerUrl\(target\)[\s\S]{0,200}return connectOnboardingArca\(target, log\);/,
-    );
-    // Remote runs share the launch-time auto-connect; the opt-in sticks only on success.
-    assert.match(
-      liveCode,
-      /async function connectOnboardingArca\(serverUrl, log\)[\s\S]{0,300}settings\.arca_auto_connect = true;[\s\S]{0,500}arcaAutoConnect\.retry\(serverUrl, log\)\s*:\s*await arcaAutoConnect\.ensure\(serverUrl, log\);\s*if \(status\.state === "online"\)\s*return[\s\S]{0,160}if \(previous === undefined\) delete restored\.arca_auto_connect;/,
-    );
     assert.match(
       handler,
       /hostCliCommand\(target\)[\s\S]{0,500}serverManager\.ensureServerAuth\(cliCommand, target\)[\s\S]{0,150}serverManager\.ensureHostConnected\(cliCommand, target\)/,
@@ -1987,7 +2092,12 @@ describe("onboarding runner IPC", () => {
   // Remote runs on a managed server behind the internal flag; local uses a laptop CLI.
   const managedServer = "https://workspace.cloud.databricks.com/omnigent";
   const connectCases = [
-    ["remote", managedServer, { internalFeatures: true }, (ok) => ({ arcaResult: { ok } })],
+    [
+      "remote",
+      managedServer,
+      { internalFeatures: true, arcaPath: "/usr/local/bin/arca" },
+      (ok) => ({ arcaResult: { ok } }),
+    ],
     [
       "local",
       server,
