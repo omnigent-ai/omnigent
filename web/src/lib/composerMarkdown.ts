@@ -586,8 +586,12 @@ function parseFence(
 
 function cachedFence(text: string, blockStart: number, opener: FenceOpener, cr: boolean) {
   const fenced = parseFence(text, blockStart, opener, cr);
-  // The opening line (part of the key) fixes the containers.
-  const key = text.slice(blockStart, fenced.end);
+  // The same lines can be a fence of different containers (a list item opened
+  // on an earlier line), which fix its prefix, so they're part of the key.
+  const containers = opener.containers
+    .map((container) => (container.quote ? ">" : container.indent))
+    .join(",");
+  const key = `${containers}\u0000${text.slice(blockStart, fenced.end)}`;
   const cached = fenceCache.get(key);
   if (cached) return { end: fenced.end, parsed: cached };
   fenceCache.set(key, fenced.parsed);

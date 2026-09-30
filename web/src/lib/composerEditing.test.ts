@@ -183,6 +183,17 @@ describe("code blocks inside list items", () => {
     expect(fence("1. ```|")).toBe("1. ```\n   |\n   ```");
   });
 
+  it("follows the item an earlier line opens or closes, for the same fence lines", () => {
+    // The same three lines, first as a quote's fence, then (a list item added
+    // above them) as the item's, then as the quote's again: each parse keeps
+    // its own prefix, so Enter indents into the item only while it's there.
+    const lines = ">   ```\n>   co|de\n>   ```";
+    expect(enter(lines)).toBe(">   ```\n>   co\n> |de\n>   ```");
+    expect(enter(`> - item\n${lines}`)).toBe("> - item\n>   ```\n>   co\n>   |de\n>   ```");
+    expect(enter(lines)).toBe(">   ```\n>   co\n> |de\n>   ```");
+    expect(enter(`> - item\n${lines}`)).toBe("> - item\n>   ```\n>   co\n>   |de\n>   ```");
+  });
+
   it("makes Enter a line of the block, indented into the item", () => {
     expect(enter("> - ```\n>   ** not| bold**\n>   ```")).toBe(
       "> - ```\n>   ** not\n>   | bold**\n>   ```",

@@ -693,6 +693,18 @@ describe("strikethrough, links and block quotes", () => {
     expect(reassemble(text)).toBe(text);
   });
 
+  it("gives unchanged fence lines the prefix of the containers around them now", () => {
+    const lines = ">   ```\n>   code\n>   ```";
+    const prefixOf = (draft: string) =>
+      tokenizeComposerMarkdown(draft).blocks.find((block) => block.fence)?.fence?.prefix;
+    // Parsed first alone (a quote's fence), then inside a list item opened
+    // above it, then alone again: each keeps its own containers.
+    expect(prefixOf(lines)).toBe("> ");
+    expect(prefixOf(`> - item\n${lines}`)).toBe(">   ");
+    expect(prefixOf(lines)).toBe("> ");
+    expect(prefixOf(`> - item\n${lines}`)).toBe(">   ");
+  });
+
   it("finds fences after any list and quote containers", () => {
     const fence = (text: string) => tokenizeComposerMarkdown(text).blocks[0].fence;
     expect(fence("- ```\n  ** x**\n  ```")?.prefix).toBe("  ");
