@@ -363,6 +363,20 @@ describe("AssistantBubble error retry", () => {
   });
 });
 
+describe("AssistantBubble role", () => {
+  it("gives a bubble made only of error items the error role", () => {
+    render(<BubbleView bubble={errorBubble("native_prompt_not_recorded")} />);
+    expect(screen.getByTestId("message-bubble")).toHaveAttribute("data-role", "error");
+  });
+
+  it("keeps the assistant role when an error accompanies a reply", () => {
+    const bubble = errorBubble();
+    bubble.items.unshift({ kind: "text", itemId: "text_1", text: "partial answer", final: true });
+    render(<BubbleView bubble={bubble} />);
+    expect(screen.getByTestId("message-bubble")).toHaveAttribute("data-role", "assistant");
+  });
+});
+
 describe("UserBubble long-prompt collapse", () => {
   const COLLAPSE_THRESHOLD = 12000;
   const TAIL = "UNIQUE_TAIL";

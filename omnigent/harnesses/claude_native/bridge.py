@@ -307,6 +307,9 @@ _PASTE_SETTLE_S = 0.1  # let the TUI commit a paste before the separate submit E
 # submitting — the draft then sits unsent. Polling for the draft makes
 # the handoff deterministic where the old fixed sleep raced it.
 _PASTE_COMMIT_TIMEOUT_S = 5.0
+# How long to wait for Ctrl-A/Ctrl-K to visibly empty the input box before
+# pasting over it; the clear is only sent when a draft is on screen.
+_DRAFT_CLEAR_TIMEOUT_S = 2.0
 # After the submit Enter, how long to keep checking that the draft
 # actually left the input box (re-sending Enter while it hasn't)
 # before failing loud. Sized to out-wait a transiently unresponsive
@@ -4112,15 +4115,7 @@ def _paste_and_submit(
         raise ClaudeUserPromptPending(
             "Answer the pending Claude question or permission request before sending a message."
         )
-    # Clear any leftover text in Claude's input field before typing.
-    # After Escape-cancel, Claude Code re-populates the prompt area
-    # with the previous input for re-editing. Without this clear,
-    # the new message appends to the stale buffer (e.g.
-    # "old promptnew prompt" with no separator).
-    # Ctrl-A (Home) + Ctrl-K (kill-to-end) is the safest pair —
-    # Ctrl-U only clears backwards from cursor.
-    _run_tmux(socket_path, "send-keys", "-t", tmux_target, "C-a")
-    _run_tmux(socket_path, "send-keys", "-t", tmux_target, "C-k")
+    _clear_leftover_draft(socket_path, tmux_target)
     # Trailing newline absorbs a trailing "\" so it can't escape the submit Enter.
     # Delivered through a tmux buffer, NOT ``send-keys`` argv: tmux caps one
     # client→server command at ~16KB, so per-byte hex argv blew up with
@@ -4192,6 +4187,25 @@ def _paste_and_submit(
     raise RuntimeError(
         f"Claude Code did not accept the submitted message within {_SUBMIT_VERIFY_TIMEOUT_S}s "
         "(the draft is still in the input box). The message was not delivered."
+    )
+
+
+def _clear_leftover_draft(socket_path: str, tmux_target: str) -> None:
+    """Clear a draft left in Claude's input box and wait for the box to read empty."""
+    # Skip an empty box: a TUI still busy after a resume folds keystrokes arriving
+    # with the paste into it, and the mirror then matches no queued entry.
+    if not _composer_draft(_capture_pane(socket_path, tmux_target)):
+        return
+    _run_tmux(socket_path, "send-keys", "-t", tmux_target, "C-a")
+    _run_tmux(socket_path, "send-keys", "-t", tmux_target, "C-k")
+    deadline = time.monotonic() + _DRAFT_CLEAR_TIMEOUT_S
+    while time.monotonic() < deadline:
+        if not _composer_draft(_capture_pane(socket_path, tmux_target)):
+            return
+        time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
+    _logger.info(
+        "claude-native: the input box still shows a draft %.1fs after clearing it; pasting anyway",
+        _DRAFT_CLEAR_TIMEOUT_S,
     )
 
 
@@ -5607,6 +5621,12 @@ def _composer_row(pane: str) -> str | None:
         if row.strip()[:1] in _COMPOSER_MODE_GLYPHS:
             return row
     return None
+
+
+def _composer_draft(pane: str) -> str:
+    """Text after the composer glyph in Claude Code's input box; "" when empty or absent."""
+    row = _composer_row(pane)
+    return "" if row is None else row.strip()[1:].strip()
 
 
 def _claude_prompt_rendered(pane: str) -> bool:

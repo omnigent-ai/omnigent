@@ -602,3 +602,26 @@ def test_mark_uncertain_keeps_jumped_over_entries_out_of_the_undelivered_set() -
     assert matched.skipped == []
     assert [entry.pending_id for entry in matched.uncertain] == [second]
     assert pending_inputs.snapshot_for("conv_a") == []
+
+
+def test_resolve_matching_text_ignores_stray_control_characters_in_the_mirror() -> None:
+    """A mirror led by stray control characters still matches its own entry, not the head."""
+    lost = pending_inputs.record("conv_a", [_text_block("This is turn 2.")])
+    sent = pending_inputs.record("conv_a", [_text_block("This is turn 3.")])
+
+    drained = pending_inputs.resolve_matching_text("conv_a", "\x01\x0bThis is turn 3.")
+
+    assert drained.matched is not None
+    assert drained.matched.pending_id == sent
+    assert [entry.pending_id for entry in drained.skipped] == [lost]
+    assert pending_inputs.snapshot_for("conv_a") == []
+
+
+def test_resolve_matching_text_treats_a_control_only_mirror_as_no_match() -> None:
+    """Control characters alone carry no text to match on."""
+    queued = pending_inputs.record("conv_a", [_text_block("hello")])
+
+    drained = pending_inputs.resolve_matching_text("conv_a", "\x01\x0b")
+
+    assert drained.matched is None
+    assert [entry["pending_id"] for entry in pending_inputs.snapshot_for("conv_a")] == [queued]

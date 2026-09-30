@@ -3922,12 +3922,10 @@ def test_inject_user_message_pastes_content_then_submits(
 
     captured: list[list[str]] = []
     loaded_payloads: list[bytes] = []
-    # Simulates Claude Code's input-box state machine: empty before the
-    # paste, draft (collapsed-paste placeholder) after the paste, empty
-    # again once Enter submits. The paste-committed and submit-verified
-    # gates both poll capture-pane, so a static pane would either stall
-    # the paste gate (draft never appears) or fail verification.
-    tui = {"pane": _composer_pane()}
+    # Simulated input box: a stale draft until Ctrl-K, the collapsed-paste
+    # placeholder after the paste, empty after Enter. The paste-committed and
+    # submit-verified gates poll capture-pane, so a static pane would stall.
+    tui = {"pane": _composer_pane("stale draft")}
 
     def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
         """
@@ -3949,6 +3947,8 @@ def test_inject_user_message_pastes_content_then_submits(
         del kwargs
         if "capture-pane" in cmd:
             return SimpleNamespace(returncode=0, stdout=tui["pane"], stderr="")
+        if cmd[-1] == "C-k":
+            tui["pane"] = _composer_pane()
         if "load-buffer" in cmd:
             loaded_payloads.append(Path(cmd[-1]).read_bytes())
         if "paste-buffer" in cmd:
@@ -4393,6 +4393,100 @@ def test_inject_user_message_raises_on_tmux_failure(
         inject_user_message(bridge_dir, content="hi")
 
 
+def test_inject_user_message_skips_the_draft_clear_when_the_input_box_is_empty(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An empty input box gets the paste alone; a busy TUI could fold Ctrl-A/Ctrl-K into it."""
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(
+        bridge_dir,
+        socket_path=Path("/tmp/example/tmux.sock"),
+        tmux_target="claude:0.0",
+    )
+
+    captured: list[list[str]] = []
+    tui = {"pane": _composer_pane()}
+
+    def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        """Serve the simulated input box; record every other tmux call."""
+        del kwargs
+        if "capture-pane" in cmd:
+            return SimpleNamespace(returncode=0, stdout=tui["pane"], stderr="")
+        if "paste-buffer" in cmd:
+            tui["pane"] = _composer_pane("hello after the resume")
+        if cmd[-1] == "Enter":
+            tui["pane"] = _composer_pane()
+        captured.append(cmd)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    inject_user_message(bridge_dir, content="hello after the resume")
+
+    keystrokes = [cmd[-1] for cmd in captured if "send-keys" in cmd]
+    assert keystrokes == ["Enter"], (
+        f"Expected only the submit Enter on an empty input box, got {keystrokes}."
+    )
+    assert [cmd[3] for cmd in captured if "send-keys" not in cmd] == [
+        "load-buffer",
+        "paste-buffer",
+    ]
+
+
+def test_inject_user_message_clears_a_leftover_draft_and_waits_for_the_box_to_empty(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A leftover draft is cleared, and the paste waits until the box reads empty."""
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._CLAUDE_READY_POLL_INTERVAL_S", 0.01
+    )
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(
+        bridge_dir,
+        socket_path=Path("/tmp/example/tmux.sock"),
+        tmux_target="claude:0.0",
+    )
+
+    captured: list[list[str]] = []
+    # The stale draft stays on screen for two polls after Ctrl-K, as a TUI
+    # that takes a moment to repaint would show it.
+    tui: dict[str, Any] = {"pane": _composer_pane("old prompt"), "polls_after_kill": None}
+    panes_at_paste: list[str] = []
+
+    def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        """Simulate a TUI whose clear lands two polls late; record tmux calls."""
+        del kwargs
+        if "capture-pane" in cmd:
+            if tui["polls_after_kill"] is not None:
+                tui["polls_after_kill"] += 1
+                if tui["polls_after_kill"] > 2:
+                    tui["pane"] = _composer_pane()
+            return SimpleNamespace(returncode=0, stdout=tui["pane"], stderr="")
+        if cmd[-1] == "C-k":
+            tui["polls_after_kill"] = 0
+        if "paste-buffer" in cmd:
+            panes_at_paste.append(tui["pane"])
+            tui["pane"] = _composer_pane("new prompt")
+        if cmd[-1] == "Enter":
+            tui["pane"] = _composer_pane()
+        captured.append(cmd)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    inject_user_message(bridge_dir, content="new prompt")
+
+    keystrokes = [cmd[-1] for cmd in captured if "send-keys" in cmd]
+    assert keystrokes == ["C-a", "C-k", "Enter"], (
+        f"Expected the clear, then the submit; got {keystrokes}."
+    )
+    assert panes_at_paste == [_composer_pane()], (
+        "The paste went in while the stale draft was still in the input box."
+    )
+
+
 def test_inject_user_message_waits_for_claude_prompt_before_typing(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -4454,18 +4548,15 @@ def test_inject_user_message_waits_for_claude_prompt_before_typing(
     inject_user_message(bridge_dir, content="hello")
 
     # Gate polled until the third capture (prompt present), then the
-    # five delivery calls (C-a, C-k, load-buffer, paste-buffer, Enter)
-    # fired.
+    # three delivery calls (load-buffer, paste-buffer, Enter) fired; an
+    # empty input box gets no clear keystrokes.
     assert capture_calls["n"] >= 3, (
         f"Expected >=3 capture-pane polls before the prompt rendered, got {capture_calls['n']}."
     )
-    assert len(send_keys) == 5, (
-        f"Expected 5 tmux calls (C-a, C-k, load-buffer, paste-buffer, Enter), "
-        f"got {len(send_keys)}."
+    assert len(send_keys) == 3, (
+        f"Expected 3 tmux calls (load-buffer, paste-buffer, Enter), got {len(send_keys)}."
     )
-    clear_home, clear_kill, load, paste, submit = send_keys
-    assert clear_home[-1] == "C-a"
-    assert clear_kill[-1] == "C-k"
+    load, paste, submit = send_keys
     # The paste fires after the gate via the buffer path. The exact
     # payload/flag assertions live in the dedicated paste test; here the
     # gate ordering is the claim.
@@ -10460,9 +10551,9 @@ def test_inject_user_message_restores_an_occupied_input_box_first(
     inject_user_message(bridge_dir, content="restore my composer")
 
     tails = [cmd[-1] for cmd in captured]
-    # Escape (dismiss the surface) must precede every delivery keystroke.
-    assert tails[:3] == ["Escape", "C-a", "C-k"], (
-        f"Expected the occupying surface to be Escaped before the clear; got {tails}."
+    # Escape (dismiss the surface) must precede every delivery call.
+    assert tails[0] == "Escape", (
+        f"Expected the occupying surface to be Escaped before delivery; got {tails}."
     )
     assert tails.count("Escape") == 1, f"One sighting, one Escape — got {tails.count('Escape')}."
     assert tails[-1] == "Enter"

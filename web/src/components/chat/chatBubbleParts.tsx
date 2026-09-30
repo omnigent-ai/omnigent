@@ -1026,13 +1026,17 @@ function AssistantBubble({
   // element — the hover footer belongs to assistant text, not to the error.
   const errorOnly = hasError && !markdownText;
   const spansFullColumn = isWide || hasError;
+  // A bubble made only of error items (an undelivered-message notice, a failed
+  // turn) sits in the assistant column but is not a reply, so it does not
+  // carry the assistant role that tests and anchors use to find replies.
+  const onlyErrors = bubble.items.every((it) => it.kind === "error");
 
   return (
     <>
       <Message
         from="assistant"
         data-testid="message-bubble"
-        data-role="assistant"
+        data-role={onlyErrors ? "error" : "assistant"}
         data-response-stable-id={bubble.stableId}
         data-message-id={bubble.responseId}
         className={

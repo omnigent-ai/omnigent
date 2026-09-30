@@ -42,13 +42,14 @@ its entry at the head of the queue, and every later message would then
 drain the wrong entry — the receipt names the previous message, clients
 settle the wrong bubble, and the new message renders twice. So the
 persist site drains the oldest entry whose text equals the mirror
-(whitespace collapsed; for a message with attachments, the executor's
-generated marker lines — one per file block — are dropped from the mirror
-first) and reports the older entries it skipped, which the caller
-persists as undelivered. Two queued messages with identical text drain in
-queue order: text alone cannot tell them apart, so if the older one was
-lost the receipt names it and the later one is surfaced as undelivered
-at the next match — the only ambiguity this scheme accepts. When
+(control characters dropped and whitespace collapsed; for a message with
+attachments, the executor's generated marker lines — one per file block —
+are dropped from the mirror first) and reports the older entries it
+skipped, which the caller persists as undelivered. Two queued messages
+with identical text drain in queue order: text alone cannot tell them
+apart, so if the older one was lost the receipt names it and the later
+one is surfaced as undelivered at the next match — the only ambiguity
+this scheme accepts. When
 no entry matches — the transcript may still reformat text in ways not
 normalized here — the oldest entry is drained, as before, and every entry
 still queued is marked uncertain (:func:`mark_uncertain`): the drained
@@ -535,7 +536,7 @@ def resolve_matching_text(conversation_id: str, text: str, *, hold: bool = False
         when nothing carries this text (e.g. it was typed directly in the
         TUI).
     """
-    exact_needle = _collapse_whitespace(text)
+    exact_needle = _match_key(text)
     if not exact_needle:
         return MatchedDrain(matched=None, skipped=[])
     with _lock:
@@ -544,8 +545,8 @@ def resolve_matching_text(conversation_id: str, text: str, *, hold: bool = False
         if entries is None:
             return MatchedDrain(matched=None, skipped=[])
         ordered = [(pid, entry) for pid, entry in entries.items() if not entry.held]
-        texts = [_collapse_whitespace(_content_text(entry.content)) for _pid, entry in ordered]
-        # Two passes. An exact (whitespace-collapsed) match first, so two
+        texts = [_match_key(_content_text(entry.content)) for _pid, entry in ordered]
+        # Two passes. An exact match on the normalized text first, so two
         # messages that differ only in a marker-like phrase the person typed
         # at the front stay distinct. Then, for entries carrying attachments:
         # the executor pastes one generated marker line per file block ahead
@@ -557,10 +558,8 @@ def resolve_matching_text(conversation_id: str, text: str, *, hold: bool = False
                 attachments = _attachment_count(entry.content)
                 if attachments == 0 or not texts[index]:
                     continue
-                if (
-                    _collapse_whitespace(_strip_generated_markers(text, attachments))
-                    == texts[index]
-                ):
+                mirror = _strip_generated_markers(_drop_control_chars(text), attachments)
+                if _match_key(mirror) == texts[index]:
                     match_index = index
                     break
         if match_index is None:
@@ -680,8 +679,8 @@ def _first_match(texts: list[str], needle: str) -> int | None:
     different accepted prompt, handing that entry's file attachments to the
     wrong persisted message.
 
-    :param texts: Whitespace-collapsed queued entry texts in queue order.
-    :param needle: The whitespace-collapsed mirrored text.
+    :param texts: Normalized queued entry texts (:func:`_match_key`) in queue order.
+    :param needle: The normalized mirrored text.
     :returns: The matching index, or ``None``.
     """
     if not needle:
@@ -692,9 +691,29 @@ def _first_match(texts: list[str], needle: str) -> int | None:
     return None
 
 
-def _collapse_whitespace(text: str) -> str:
-    """Collapse whitespace runs so paste and mirror spacing differences cancel out."""
-    return " ".join(text.split())
+# C0 control characters other than whitespace, plus DEL. A TUI still busy when
+# a paste arrives can fold the keystrokes sent just before it into the pasted
+# text, so they come back in the mirror ahead of the message.
+_CONTROL_CHAR_TABLE = {code: None for code in (*range(0x20), 0x7F) if not chr(code).isspace()}
+
+
+def _drop_control_chars(text: str) -> str:
+    """Remove non-whitespace control characters from ``text``."""
+    return text.translate(_CONTROL_CHAR_TABLE)
+
+
+def _match_key(text: str) -> str:
+    r"""
+    Normalize text for matching a mirror to its queued entry.
+
+    Drops non-whitespace control characters and collapses whitespace runs, so
+    stray keystrokes and paste/mirror spacing differences cancel out.
+
+    :param text: Mirrored or queued message text.
+    :returns: The comparison key, e.g. ``"fix the bug"`` for
+        ``"\x01\x0bfix  the\nbug"``.
+    """
+    return " ".join(_drop_control_chars(text).split())
 
 
 def _attachment_count(content: list[dict[str, Any]]) -> int:
