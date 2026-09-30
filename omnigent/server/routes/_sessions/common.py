@@ -781,6 +781,13 @@ _native_ask_gate_locks: weakref.WeakValueDictionary[tuple[str, str], asyncio.Loc
     weakref.WeakValueDictionary()
 )
 
+# Serializes native transcript mirrors per conversation so a retried mirror sees
+# the first attempt's commit before it touches the pending-input queue.
+# custom-lint: disable-next=workspace-scoped-cache -- lock; collision only serializes
+_native_mirror_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = (
+    weakref.WeakValueDictionary()
+)
+
 
 # custom-lint: disable-next=workspace-scoped-cache -- lock; collision only serializes
 _policy_evaluation_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = (

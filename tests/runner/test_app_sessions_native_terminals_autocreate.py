@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -44,6 +45,7 @@ from omnigent.harnesses.codex_native.bridge import (
 )
 from omnigent.harnesses.cursor_native import bridge as cursor_native_bridge
 from omnigent.harnesses.kiro_native import bridge as kiro_native_bridge
+from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.terminal import TerminalInstance
 from omnigent.runner import app as runner_app
 from omnigent.runner import create_runner_app
@@ -167,11 +169,16 @@ async def test_auto_create_pi_terminal_launches_required_terminal(
     # The lifecycle of the launch — not the binary or credentials — is under
     # test, so neither a real Pi install nor a configured provider is needed.
     monkeypatch.setattr(pi_native, "resolve_pi_executable", lambda: "pi")
-    # Accept the ``model`` kwarg the runner now threads through (the spec model
-    # → models.json path); None still skips provider injection here.
-    monkeypatch.setattr(
-        pi_native_credentials, "resolve_pi_native_provider", lambda **_kwargs: None
-    )
+    loop = asyncio.get_running_loop()
+    provider_waits: list[bool] = []
+
+    def _slow_provider(**_kwargs: Any) -> None:
+        # Credential discovery must let the runner service its stream heartbeat.
+        serviced = threading.Event()
+        loop.call_soon_threadsafe(serviced.set)
+        provider_waits.append(serviced.wait(timeout=2))
+
+    monkeypatch.setattr(pi_native_credentials, "resolve_pi_native_provider", _slow_provider)
 
     # Skip the GET /v1/sessions round-trip: hand the flow a ready launch
     # config pointing at the tmp workspace.
@@ -230,6 +237,7 @@ async def test_auto_create_pi_terminal_launches_required_terminal(
     assert captured["resource_role"] == PI_NATIVE_TERMINAL_ROLE
     assert captured["spec"].command == "pi"
     assert captured["spec"].env_unset == expected_env_unset
+    assert provider_waits == [True], "Fresh Pi startup must resolve once without blocking"
     config = json.loads(
         Path(captured["spec"].env[pi_native_bridge.PI_NATIVE_CONFIG_ENV_VAR]).read_text()
     )
@@ -1895,7 +1903,8 @@ async def _run_auto_create_cursor_terminal(
             parent_os_env: Any = None,
         ) -> SessionResourceView:
             """Record the spec and return a terminal resource view."""
-            del terminal_name, session_key, resource_role, parent_os_env
+            del terminal_name, session_key, resource_role
+            captured["parent_os_env"] = parent_os_env
             captured["spec"] = spec
             return SessionResourceView(
                 id="terminal_cursor_main",
@@ -1951,6 +1960,24 @@ async def test_auto_create_cursor_terminal_injects_spec_model(
     assert spec.command == "cursor-agent"
     assert "--model" in spec.args
     assert spec.args[spec.args.index("--model") + 1] == "sonnet-4-thinking"
+
+
+@pytest.mark.asyncio
+async def test_auto_create_cursor_terminal_inherits_agent_os_env(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cursor launches with the sandbox and environment declared by its agent."""
+    agent_os_env = OSEnvSpec(sandbox=OSEnvSandboxSpec(type="none"))
+    captured = await _run_auto_create_cursor_terminal(
+        tmp_path=tmp_path,
+        monkeypatch=monkeypatch,
+        agent_spec=AgentSpec(spec_version=1, name="cursor", os_env=agent_os_env),
+        terminal_launch_args=None,
+    )
+
+    assert captured["parent_os_env"] is agent_os_env
+    assert captured["spec"].os_env.sandbox is agent_os_env.sandbox
 
 
 @pytest.mark.parametrize(
@@ -2526,7 +2553,7 @@ def test_publish_native_terminal_start_error_emits_failed_status_only(
         "code": "native_terminal_start_failed",
         "error_id": error_id,
         "message": (
-            "Native Codex terminal failed to start; "
+            "Native Codex terminal failed to start (ImportError); "
             f"see the runner log for details: {pinned_runner_log} "
             f"Error ID: {error_id}."
         ),
@@ -2535,6 +2562,9 @@ def test_publish_native_terminal_start_error_emits_failed_status_only(
     # logged for operators. If this fails, the redaction regressed (raw
     # text back in the payload) or the server-side log was dropped.
     assert "requires the 'codex' CLI" not in error["message"]
+    # The structured, non-sensitive cause (exception type only, here) still
+    # names the failure kind without the free-form message.
+    assert "(ImportError)" in error["message"]
     assert "requires the 'codex' CLI on PATH." in caplog.text
     assert error_id in caplog.text
     assert [p.event for p in published] == [

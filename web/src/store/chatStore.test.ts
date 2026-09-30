@@ -15331,3 +15331,65 @@ describe("beginLocalConversation — optimistic model seed", () => {
     expect(state.sessionReasoningEffort).toBe("low");
   });
 });
+
+describe("chatStore — one error card per failed turn", () => {
+  const error = {
+    code: "databricks_sign_in_pending",
+    message: "Codex is waiting for a sign-in in this session's terminal.",
+  };
+  const errorBlocks = () => useChatStore.getState().blocks.filter((b) => b.type === "error");
+
+  async function failOneTurn(): Promise<void> {
+    seedSession("conv_one_card", []);
+    await useChatStore.getState().switchTo("conv_one_card");
+    // The stream reducer already rendered the harness's response.failed as an
+    // error block for this response; the status edge arrives right after it.
+    useChatStore.setState({
+      blocks: [
+        {
+          type: "error",
+          ctx: {
+            agent: null,
+            depth: 0,
+            turn: 0,
+            timestamp: 0,
+            responseId: "resp_pending",
+            itemId: "item_failed",
+          },
+          message: error.message,
+          source: "harness",
+          code: error.code,
+        },
+      ],
+    });
+    expect(errorBlocks()).toHaveLength(1);
+  }
+
+  it("does not add a second card when the failed status repeats the harness error", async () => {
+    // The runner publishes the harness error's own code and message on the
+    // failed status edge, so the edge is recognised as the same failure.
+    await failOneTurn();
+    handleSessionEvent({
+      type: "session_status",
+      conversationId: "conv_one_card",
+      status: "failed",
+      responseId: "resp_pending",
+      error,
+    });
+    expect(errorBlocks()).toHaveLength(1);
+  });
+
+  it("adds a card when the failed status names a different failure", async () => {
+    // A status edge whose code differs (the pre-fix generic host-setup code)
+    // reads as a separate failure and renders a second card.
+    await failOneTurn();
+    handleSessionEvent({
+      type: "session_status",
+      conversationId: "conv_one_card",
+      status: "failed",
+      responseId: "resp_pending",
+      error: { code: "runner_error", message: error.message },
+    });
+    expect(errorBlocks()).toHaveLength(2);
+  });
+});

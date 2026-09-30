@@ -238,6 +238,9 @@ def _build_event(ctx: EvaluationContext) -> PolicyEvent:
             # descendants only), injected by the engine only when a
             # subagent_cost_budget policy is present; empty dict otherwise.
             "subtree_usage": dict(ctx.subtree_usage) if ctx.subtree_usage else {},
+            # The conversation this event belongs to, injected by
+            # the engine.
+            "conversation_id": ctx.conversation_id,
         },
         # Mutable per-conversation state readable by the callable.
         # Empty dict when no policy has written state yet; the engine

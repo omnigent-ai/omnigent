@@ -1,13 +1,15 @@
 import {
   ArrowDownAZIcon,
+  ArrowDownUpIcon,
   ArrowDownWideNarrowIcon,
   EyeIcon,
   EyeOffIcon,
   FileClockIcon,
   FileTypeIcon,
+  FilterIcon,
   MoonIcon,
+  RefreshCwIcon,
   SearchIcon,
-  SlidersHorizontalIcon,
   XIcon,
 } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
@@ -29,6 +31,7 @@ import { cn } from "@/lib/utils";
 import { BrowseLocationBar } from "./BrowseLocationBar";
 import { CopyPathButton } from "./CopyPathButton";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
+import { Button } from "@/components/ui/button";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -83,12 +86,10 @@ interface FilesPanelProps {
 function HiddenFilesToggle({
   showHidden,
   onToggle,
-  size,
   hiddenCount,
 }: {
   showHidden: boolean;
   onToggle: () => void;
-  size: "4" | "3.5";
   hiddenCount: number;
 }) {
   const hasHidden = hiddenCount > 0 && !showHidden;
@@ -98,26 +99,25 @@ function HiddenFilesToggle({
     : hasHidden
       ? `${hiddenCount} file${hiddenCount === 1 ? "" : "s"} in hidden directories. Click to show.`
       : "Show hidden files";
-  const iconSize = size === "4" ? "size-4" : "size-3.5";
   return (
     <TooltipProvider>
       <Tooltip>
         <TooltipTrigger asChild>
-          <button
+          <Button
             type="button"
+            variant="ghost"
+            size="icon-sm"
             aria-label={ariaLabel}
             className={cn(
-              "cursor-pointer rounded p-1 hover:bg-muted",
               hasHidden
                 ? "text-warning hover:text-warning/80"
                 : "text-muted-foreground hover:text-foreground",
             )}
             onClick={onToggle}
           >
-            {/* The icon shows the current state, not the action: a plain eye
-                means hidden files are visible, a slashed eye means they are not. */}
-            {showHidden ? <EyeIcon className={iconSize} /> : <EyeOffIcon className={iconSize} />}
-          </button>
+            {/* The icon previews the action: slash to hide, eye to reveal. */}
+            {showHidden ? <EyeOffIcon /> : <EyeIcon />}
+          </Button>
         </TooltipTrigger>
         <TooltipContent side="bottom">{tooltipLabel}</TooltipContent>
       </Tooltip>
@@ -145,28 +145,37 @@ function SortSelector({
 }) {
   const active = SORT_OPTIONS.find((o) => o.value === sort) ?? SORT_OPTIONS[0];
   return (
-    <DropdownMenu>
-      <DropdownMenuTrigger asChild>
-        <button
-          type="button"
-          aria-label={`Sort: ${active.label}`}
-          className="flex shrink-0 cursor-pointer items-center gap-1 rounded-full px-2.5 py-[4px] text-muted-foreground text-sm hover:bg-muted hover:text-foreground"
-        >
-          <span>Sort:</span>
-          <active.Icon className="size-3.5" />
-        </button>
-      </DropdownMenuTrigger>
-      <DropdownMenuContent align="end" className="w-40">
-        <DropdownMenuRadioGroup value={sort} onValueChange={(v) => onChange(v as ChangedSort)}>
-          {SORT_OPTIONS.map(({ value, label, Icon }) => (
-            <DropdownMenuRadioItem key={value} value={value}>
-              <Icon className="size-3.5" />
-              {label}
-            </DropdownMenuRadioItem>
-          ))}
-        </DropdownMenuRadioGroup>
-      </DropdownMenuContent>
-    </DropdownMenu>
+    <TooltipProvider>
+      <DropdownMenu>
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <DropdownMenuTrigger asChild>
+              <Button
+                type="button"
+                variant="ghost"
+                size="sm"
+                aria-label={`Sort: ${active.label}`}
+                className="shrink-0 gap-[2px] text-muted-foreground hover:text-foreground"
+              >
+                <ArrowDownUpIcon />
+                <span>{active.label}</span>
+              </Button>
+            </DropdownMenuTrigger>
+          </TooltipTrigger>
+          <TooltipContent side="bottom">Sort files</TooltipContent>
+        </Tooltip>
+        <DropdownMenuContent align="end" className="w-40">
+          <DropdownMenuRadioGroup value={sort} onValueChange={(v) => onChange(v as ChangedSort)}>
+            {SORT_OPTIONS.map(({ value, label, Icon }) => (
+              <DropdownMenuRadioItem key={value} value={value}>
+                <Icon className="size-3.5" />
+                {label}
+              </DropdownMenuRadioItem>
+            ))}
+          </DropdownMenuRadioGroup>
+        </DropdownMenuContent>
+      </DropdownMenu>
+    </TooltipProvider>
   );
 }
 
@@ -268,6 +277,8 @@ export function FilesPanel({
   const [treeExclude, setTreeExclude] = useState("");
   const [debouncedTreeExclude, setDebouncedTreeExclude] = useState("");
   const [showSearchFilters, setShowSearchFilters] = useState(false);
+  const [directoryRefreshToken, setDirectoryRefreshToken] = useState(0);
+  const [refreshingFiles, setRefreshingFiles] = useState(false);
   // The drawer (onClose) adds an X close button to the header. Both the drawer
   // and the inline rail (frameless) fill their parent's height and drop the
   // rounded card chrome; only the standalone card caps content at max-h.
@@ -322,8 +333,6 @@ export function FilesPanel({
     [workspaceRoot, conversationId],
   );
 
-  // Stable so memo(TreeNodeRow) isn't busted on every FilesPanel re-render.
-  /** Re-root onto a directory of the current tree (double-click to open). */
   const navigateToChild = useCallback(
     (relativePath: string) => {
       if (!workingDir) return;
@@ -413,6 +422,31 @@ export function FilesPanel({
   // Highlight the filters toggle when include/exclude carry a value.
   const treeFiltersActive = treeInclude.trim().length > 0 || treeExclude.trim().length > 0;
 
+  const refreshFiles = useCallback(async () => {
+    if (refreshingFiles) return;
+    setRefreshingFiles(true);
+    if (!flatView) setDirectoryRefreshToken((token) => token + 1);
+    try {
+      const refreshes = flatView
+        ? [changedQuery.refetch()]
+        : [
+            allFilesQuery.refetch(),
+            changedQuery.refetch(),
+            ...(debouncedTreeSearch.trim() ? [treeSearchQuery.refetch()] : []),
+          ];
+      await Promise.all(refreshes);
+    } finally {
+      setRefreshingFiles(false);
+    }
+  }, [
+    allFilesQuery,
+    changedQuery,
+    debouncedTreeSearch,
+    flatView,
+    refreshingFiles,
+    treeSearchQuery,
+  ]);
+
   // Persist/restore the list's scroll position across conversation and view
   // switches. Keyed per conversation + view (Changed vs All) since the two
   // lists have independent heights. Readiness is data presence rather than
@@ -432,10 +466,10 @@ export function FilesPanel({
         fillHeight ? "flex h-full min-h-0 flex-col" : "flex min-h-0 flex-col",
       )}
     >
-      {/* Header — single row: [title · workingDir] [eye] [close?] */}
-      <div className="flex shrink-0 items-center gap-2 px-3 py-2">
-        <h2 className="shrink-0 font-medium text-ui">{flatView ? "Changes" : "Working folder"}</h2>
-        {workingDir && workspaceRoot && (
+      {/* Header — single row: [workingDir] [copy] [close?] */}
+      <div className="flex h-11 shrink-0 items-center gap-[2px] px-2">
+        {flatView && <h2 className="shrink-0 font-medium text-ui">Changes</h2>}
+        {!flatView && workingDir && workspaceRoot && (
           <BrowseLocationBar
             current={workingDir}
             workspace={workspaceRoot}
@@ -464,20 +498,32 @@ export function FilesPanel({
             </Tooltip>
           </TooltipProvider>
         )}
-        <div className="ml-auto flex items-center gap-1">
-          {workingDir && (
+        <div className="ml-auto flex items-center gap-[2px]">
+          {!flatView && workingDir && (
             // Its own provider: the header has no TooltipProvider ancestor
             // (each control here brings one), unlike the file rows.
             <TooltipProvider>
               <CopyPathButton path={workingDir} label="Copy folder path" />
             </TooltipProvider>
           )}
-          <HiddenFilesToggle
-            showHidden={showHidden}
-            onToggle={() => onShowHiddenChange(!showHidden)}
-            size={isDrawer ? "4" : "3.5"}
-            hiddenCount={hiddenFilesCount}
-          />
+          <TooltipProvider>
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="icon-sm"
+                  aria-label="Refresh files"
+                  disabled={refreshingFiles}
+                  className="shrink-0 text-muted-foreground hover:text-foreground"
+                  onClick={() => void refreshFiles()}
+                >
+                  <RefreshCwIcon className={cn(refreshingFiles && "animate-spin")} />
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent side="bottom">Refresh files</TooltipContent>
+            </Tooltip>
+          </TooltipProvider>
           {onClose && (
             <button
               type="button"
@@ -498,11 +544,11 @@ export function FilesPanel({
               scroll container so negative margins aren't clipped. */}
       {flatView && (
         <div
-          className="shrink-0 flex items-center gap-2 px-2 py-1.5 @max-[400px]/filespanel:flex-col @max-[400px]/filespanel:items-stretch"
+          className="shrink-0 flex items-center gap-2 px-2 py-2 @max-[400px]/filespanel:flex-col @max-[400px]/filespanel:items-stretch"
           onClick={(e) => e.stopPropagation()}
         >
-          <div className="flex min-w-0 flex-1 items-center gap-2">
-            <div className="flex min-w-0 flex-1 items-center gap-[6px] rounded-full border border-border px-[10px] py-[4px] transition-colors focus-within:border-border-strong">
+          <div className="flex min-w-0 flex-1 items-center gap-[2px]">
+            <div className="flex min-w-0 flex-1 items-center gap-[6px] rounded-lg border border-border px-[10px] py-[4px] transition-colors focus-within:border-border-strong">
               <SearchIcon className="size-4 shrink-0 text-muted-foreground" />
               <input
                 aria-label="Search changed files"
@@ -514,14 +560,19 @@ export function FilesPanel({
               />
             </div>
             <SortSelector sort={changedSort} onChange={onSortChange} />
+            <HiddenFilesToggle
+              showHidden={showHidden}
+              onToggle={() => onShowHiddenChange(!showHidden)}
+              hiddenCount={hiddenFilesCount}
+            />
           </div>
         </div>
       )}
       {!flatView && (
         <div className="shrink-0" onClick={(e) => e.stopPropagation()}>
-          <div className="flex items-center gap-2 px-2 py-1.5 @max-[400px]/filespanel:flex-col @max-[400px]/filespanel:items-stretch">
-            <div className="flex min-w-0 flex-1 items-center gap-2">
-              <div className="flex min-w-0 flex-1 items-center gap-[6px] rounded-full border border-border px-[10px] py-[4px] transition-colors focus-within:border-border-strong">
+          <div className="flex items-center gap-2 px-2 py-2 @max-[400px]/filespanel:flex-col @max-[400px]/filespanel:items-stretch">
+            <div className="flex min-w-0 flex-1 items-center gap-[2px]">
+              <div className="flex min-w-0 flex-1 items-center gap-[6px] rounded-lg border border-border px-[10px] py-[4px] transition-colors focus-within:border-border-strong">
                 <SearchIcon className="size-4 shrink-0 text-muted-foreground" />
                 <input
                   aria-label="Search all files"
@@ -532,25 +583,41 @@ export function FilesPanel({
                   value={treeSearch}
                 />
               </div>
-              <button
-                type="button"
-                aria-label={showSearchFilters ? "Hide search filters" : "Show search filters"}
-                aria-expanded={showSearchFilters}
-                title="Files to include / exclude"
-                className={cn(
-                  "flex shrink-0 cursor-pointer items-center gap-1 rounded-full px-2.5 py-[4px] hover:bg-muted",
-                  showSearchFilters || treeFiltersActive
-                    ? "text-foreground"
-                    : "text-muted-foreground hover:text-foreground",
-                )}
-                onClick={() => setShowSearchFilters((v) => !v)}
-              >
-                <SlidersHorizontalIcon className="size-3.5" />
-                {treeFiltersActive && !showSearchFilters && (
-                  <span className="size-1.5 rounded-full bg-primary" aria-hidden />
-                )}
-              </button>
               <SortSelector sort={changedSort} onChange={onSortChange} />
+              <TooltipProvider>
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="icon-sm"
+                      aria-label={showSearchFilters ? "Hide search filters" : "Show search filters"}
+                      aria-expanded={showSearchFilters}
+                      className={cn(
+                        "shrink-0",
+                        showSearchFilters || treeFiltersActive
+                          ? "text-foreground"
+                          : "text-muted-foreground hover:text-foreground",
+                      )}
+                      onClick={() => setShowSearchFilters((v) => !v)}
+                    >
+                      <FilterIcon />
+                      {treeFiltersActive && !showSearchFilters && (
+                        <span
+                          className="absolute top-0.5 right-0.5 size-1.5 rounded-full bg-primary"
+                          aria-hidden
+                        />
+                      )}
+                    </Button>
+                  </TooltipTrigger>
+                  <TooltipContent side="bottom">Files to include / exclude</TooltipContent>
+                </Tooltip>
+              </TooltipProvider>
+              <HiddenFilesToggle
+                showHidden={showHidden}
+                onToggle={() => onShowHiddenChange(!showHidden)}
+                hiddenCount={hiddenFilesCount}
+              />
             </div>
           </div>
           {showSearchFilters && (
@@ -575,7 +642,7 @@ export function FilesPanel({
         ref={scrollRef}
         className={cn(
           "overflow-y-auto px-2 pb-2",
-          flatView ? "pt-1" : "pt-2",
+          flatView ? "pt-1" : "pt-0",
           fillHeight ? "min-h-0 flex-1" : "max-h-72",
         )}
         onScroll={handleScroll}
@@ -625,6 +692,7 @@ export function FilesPanel({
             onNavigateDir={navigateToChild}
             onExitSearch={exitTreeSearch}
             scrollParentRef={scrollRef}
+            refreshToken={directoryRefreshToken}
           />
         )}
       </section>

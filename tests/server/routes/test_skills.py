@@ -224,8 +224,15 @@ async def test_presession_catalog_matches_filtered_invocations(
         _to_agent_object as session_agent_object,
     )
 
-    for convert in (builtin_agent_object, session_agent_object):
-        assert [s.name for s in convert(agent, app.state.agent_cache).skills] == ["bundled"]
+    assert [s.name for s in builtin_agent_object(agent, app.state.agent_cache).skills] == [
+        "bundled"
+    ]
+    assert [
+        s.name
+        for s in session_agent_object(
+            agent, app.state.agent_cache, mcp_servers_editable=True
+        ).skills
+    ] == ["bundled"]
     discovery = HostSkillDiscovery(
         lambda _: pytest.fail("Pre-session discovery needs no bundle fetch")
     )

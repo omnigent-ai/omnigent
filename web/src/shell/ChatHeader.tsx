@@ -118,6 +118,8 @@ interface ChatHeaderProps {
   subAgentName?: string | null;
   /** Active session id, or undefined on the landing composer. */
   conversationId: string | undefined;
+  /** Effective access to the active session. */
+  permissionLevel?: number | null;
   /** Owner-managed top-level row backing the title-adjacent action menu. */
   actionConversation?: Conversation | null;
   /**
@@ -306,6 +308,7 @@ export function ChatHeader({
   isChildSession,
   subAgentName,
   conversationId,
+  permissionLevel,
   actionConversation = null,
   conversationTitle,
   projectName,
@@ -540,7 +543,7 @@ export function ChatHeader({
         // Scrolled chat text can't render through the controls because the
         // conversation viewport fades its top edge instead (chat-scroll-fade
         // in index.css, applied in ChatPage).
-        "chat-header absolute inset-x-0 top-0 z-30 flex h-14 md:h-12 items-center justify-between px-2 md:px-4 py-3 md:right-[var(--workspace-panel-offset,0px)]",
+        "chat-header absolute inset-x-0 top-0 z-30 flex h-14 md:h-12 items-center justify-between px-2 md:px-4 py-3 md:right-[var(--workspace-panel-offset,0px)] md:transition-[right] md:duration-300 md:ease-in-out",
       )}
     >
       {/* Left slot: sidebar toggle (when sidebar is closed) and a
@@ -643,7 +646,11 @@ export function ChatHeader({
         {/* Agent info: tools & policies for the bound agent. Desktop-only
             popover; self-hides when the agent has neither configured. */}
         {!pending && conversationId && (
-          <AgentInfoButton agent={boundAgent} sessionId={conversationId} />
+          <AgentInfoButton
+            agent={boundAgent}
+            sessionId={conversationId}
+            permissionLevel={permissionLevel}
+          />
         )}
         {/* Chat/Terminal switcher for terminal-first sessions — self-gates to
             null otherwise. Renders on every shell, iOS included. */}

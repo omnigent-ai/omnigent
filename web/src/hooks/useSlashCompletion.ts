@@ -1,10 +1,4 @@
-// Slash-completion menu mechanics shared by the composer surfaces: when the
-// draft reads as a lone command token ("/rev", "$review"), the menu opens
-// with ranked matches and owns the keys that navigate, complete, or dismiss
-// it. What a selection DOES (fill the draft, execute a command) and where
-// the command inventory comes from stay with the calling surface.
-
-import { useState } from "react";
+import { useLayoutEffect, useRef, useState, type RefObject } from "react";
 import { rankedSlashCommandNames } from "@/components/SlashCommandMenu";
 
 /** The slice of a textarea keydown the menu reads. */
@@ -29,11 +23,14 @@ export interface UseSlashCompletionOptions {
   text: string;
   /** Command inventory: prefixed name ("/model", "$review") to description. */
   commands: Record<string, string>;
+  /** Explicit skill inventory, including names that collide with built-ins. */
+  skills: Record<string, string>;
+  textareaRef?: RefObject<HTMLTextAreaElement | null>;
   /**
    * The command prefix this surface's inventory uses ("$" for codex-native,
    * "/" otherwise). "/" always opens the menu as well.
    */
-  prefix: string;
+  prefix: "/" | "$";
   /** Skill discovery status, or null when discovery is not in play. */
   status: string | null;
   mobile: boolean;
@@ -44,7 +41,8 @@ export interface UseSlashCompletionOptions {
    */
   mobileEnterCompletes: boolean;
   /**
-   * When true, Escape clears the draft only if the menu has content (matches,
+   * Inline Escape dismisses without changing text. For a lone command token,
+   * when true, Escape clears the draft only if the menu has content (matches,
    * or discovery still in flight), so an idle Escape can fall through to
    * other handlers. When false, Escape always clears while the menu is open.
    */
@@ -53,11 +51,19 @@ export interface UseSlashCompletionOptions {
   allowOpen: boolean;
   /** Called with the ranked, prefixed name chosen via Tab/Enter. */
   onSelect: (cmd: string) => void;
+  /** Tab only fills the draft when selecting a command would execute it. */
+  onTabComplete?: (cmd: string) => void;
   /** Clears the composer draft (Escape semantics). */
   clearText: () => void;
 }
 
 export interface UseSlashCompletionResult {
+  /** Inventory for this token; inline suggestions contain only skills. */
+  commands: Record<string, string>;
+  builtinNames: ReadonlySet<string>;
+  inline: boolean;
+  onSelectionChange: (element: HTMLTextAreaElement) => void;
+  complete: (cmd: string) => { text: string; caret: number };
   /** Whether the suggestions menu is open. */
   open: boolean;
   /** The text typed after the prefix while open, else "". */
@@ -67,7 +73,7 @@ export interface UseSlashCompletionResult {
   /** Highlighted row index, -1 when nothing is highlighted. */
   index: number;
   /**
-   * The draft reads as a lone command token, discovery is in flight, and
+   * The draft is a lone command token, discovery is in flight, and
    * there is nothing to complete yet. Not gated on the menu being open —
    * submit blocking keys off it even while the composer is blurred.
    */
@@ -83,6 +89,8 @@ export interface UseSlashCompletionResult {
 export function useSlashCompletion({
   text,
   commands,
+  skills,
+  textareaRef,
   prefix,
   status,
   mobile,
@@ -90,26 +98,51 @@ export function useSlashCompletion({
   escapeClearsOnlyWithContent,
   allowOpen,
   onSelect,
+  onTabComplete = onSelect,
   clearText,
 }: UseSlashCompletionOptions): UseSlashCompletionResult {
-  const trimmed = text.trimStart();
-  // "/" always opens; a surface whose inventory uses another prefix
-  // ("$review" for codex-native) opens on that prefix too — even while the
-  // inventory is still empty (discovery in flight).
-  const hasCommandPrefix = trimmed.startsWith("/") || trimmed.startsWith(prefix);
-  // Suggest names until a space starts the arguments; exclude file paths.
-  const baseOpen = hasCommandPrefix && !trimmed.slice(1).includes("/") && !trimmed.includes(" ");
-  const open = allowOpen && baseOpen;
+  const [selection, setSelection] = useState<{ text: string; start: number; end: number } | null>(
+    null,
+  );
+  const [dismissed, setDismissed] = useState<{ text: string; start: number; end: number } | null>(
+    null,
+  );
+  const pendingCaret = useRef<{ text: string; originalText: string; caret: number } | null>(null);
+  const caret = selection?.text === text ? selection.start : text.length;
+  const selectionEnd = selection?.text === text ? selection.end : caret;
+  const before = text.slice(0, caret);
+  const token = /\s$/.test(before) ? undefined : before.match(/(?:^|\s)([/$][\w:-]*)$/)?.[1];
+  const hasPrefix = token?.startsWith("/") || token?.startsWith(prefix);
+  const start = token ? caret - token.length : caret;
+  const tokenSuffix = text.slice(caret).match(/^\S*/)?.[0] ?? "";
+  const end = caret + tokenSuffix.length;
+  const inline = text.slice(0, start).trim().length > 0 || text.slice(end).trim().length > 0;
+  const builtinNames = new Set(
+    Object.keys(commands).filter((name) => !Object.hasOwn(skills, name)),
+  );
+  const menuCommands = inline ? skills : commands;
+  const baseOpen = Boolean(hasPrefix) && caret === selectionEnd && /^[\w:-]*$/.test(tokenSuffix);
+  const isDismissed =
+    dismissed?.text === text && dismissed.start === start && dismissed.end === end;
+  const [previousText, setPreviousText] = useState(text);
+  if (previousText !== text) {
+    setPreviousText(text);
+    if (dismissed?.text !== text) setDismissed(null);
+  }
+  const open = allowOpen && baseOpen && !isDismissed;
   // Ranked on the token shape alone: a pending completion still reports
   // while the menu is blurred closed, since submit gating keys off it.
   // The returned query/matches stay gated on open.
-  const baseQuery = baseOpen ? trimmed.slice(1) : "";
+  const baseQuery = baseOpen ? (token?.slice(1) ?? "") : "";
   // Kept in sync with what the menu renders so keyboard nav indexes into
   // the same list.
-  const baseMatches = baseOpen ? rankedSlashCommandNames(commands, baseQuery) : [];
+  const baseMatches = baseOpen
+    ? rankedSlashCommandNames(menuCommands, baseQuery, builtinNames)
+    : [];
   const query = open ? baseQuery : "";
   const matches = open ? baseMatches : [];
-  const pendingCompletion = baseOpen && status === "loading" && baseMatches.length === 0;
+  const pendingCompletion =
+    baseOpen && !inline && !isDismissed && status === "loading" && baseMatches.length === 0;
 
   const [index, setIndex] = useState(-1);
   // New queries select the first match; asynchronous arrivals retain the
@@ -141,7 +174,8 @@ export function useSlashCompletion({
       (!escapeClearsOnlyWithContent || matches.length > 0 || status != null)
     ) {
       e.preventDefault();
-      clearText();
+      if (inline) setDismissed({ text, start, end });
+      else clearText();
       setIndex(-1);
       return true;
     }
@@ -174,12 +208,61 @@ export function useSlashCompletion({
         index >= 0
       ) {
         e.preventDefault();
-        onSelect(matches[index]!);
+        (e.key === "Tab" ? onTabComplete : onSelect)(matches[index]!);
         return true;
       }
     }
     return false;
   }
 
-  return { open, query, matches, index, pendingCompletion, handleKey };
+  function onSelectionChange(element: HTMLTextAreaElement) {
+    const next = { text: element.value, start: element.selectionStart, end: element.selectionEnd };
+    setSelection((previous) =>
+      previous?.text === next.text && previous.start === next.start && previous.end === next.end
+        ? previous
+        : next,
+    );
+  }
+
+  // Restore selection after React commits the completed draft, before another input event.
+  useLayoutEffect(() => {
+    const pending = pendingCaret.current;
+    if (!pending) return;
+    if (text !== pending.text) {
+      if (text !== pending.originalText) pendingCaret.current = null;
+      return;
+    }
+    pendingCaret.current = null;
+    const element = textareaRef?.current;
+    if (!element || element.value !== pending.text) return;
+    element.focus();
+    element.setSelectionRange(pending.caret, pending.caret);
+    onSelectionChange(element);
+  });
+
+  return {
+    open,
+    query,
+    matches,
+    index,
+    pendingCompletion,
+    handleKey,
+    commands: menuCommands,
+    inline,
+    builtinNames,
+    onSelectionChange,
+    complete: (cmd) => {
+      const suffix = text.slice(end);
+      const separator = /^\s/.test(suffix) ? "" : " ";
+      const completedText = text.slice(0, start) + cmd + separator + suffix;
+      // Leave existing newlines and tabs after the caret.
+      const advancePastSpace = separator.length > 0 || suffix.startsWith(" ");
+      const completedCaret = start + cmd.length + (advancePastSpace ? 1 : 0);
+      // Keep completion and caret state together before the textarea restores its selection.
+      setSelection({ text: completedText, start: completedCaret, end: completedCaret });
+      setDismissed({ text: completedText, start, end: start + cmd.length });
+      pendingCaret.current = { text: completedText, originalText: text, caret: completedCaret };
+      return { text: completedText, caret: completedCaret };
+    },
+  };
 }

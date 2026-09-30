@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
 import gc
 import json
 import logging
@@ -26,7 +27,7 @@ import httpx
 from fastapi import FastAPI
 
 from omnigent._platform import IS_WINDOWS, normalize_interactive_shells
-from omnigent.debug_logging import runner_primary_session_id
+from omnigent.debug_logging import debug_event, runner_primary_session_id
 from omnigent.inner import _proc
 from omnigent.runner.transports.ws_tunnel.serve import RUNNER_TUNNEL_REJECTION_PREFIX
 from omnigent.util.threaded_auth import ThreadedAuth
@@ -1596,6 +1597,42 @@ def create_app(
     return app
 
 
+def _handle_loop_exception(
+    loop: asyncio.AbstractEventLoop,  # noqa: ARG001 — asyncio handler signature
+    context: dict[str, object],
+) -> None:
+    """Attribute asynchronous failures without serializing callback arguments."""
+    from websockets.exceptions import ConnectionClosedOK
+
+    exc = context.get("exception")
+    future = context.get("task") or context.get("future")
+    handle = context.get("handle")
+    callback = getattr(handle, "_callback", None)
+    while isinstance(callback, functools.partial):
+        callback = callback.func
+    coroutine = future.get_coro() if isinstance(future, asyncio.Task) else None
+    extra = debug_event(
+        "runner_async_failure",
+        session_id=runner_primary_session_id(),
+        exception_type=type(exc).__name__ if isinstance(exc, BaseException) else None,
+        callback_name=getattr(callback, "__qualname__", None),
+        coroutine_name=getattr(coroutine, "__qualname__", None),
+        future_done=future.done() if isinstance(future, asyncio.Future) else None,
+        future_cancelled=future.cancelled() if isinstance(future, asyncio.Future) else None,
+        context_kind="callback"
+        if handle is not None
+        else "task"
+        if isinstance(future, asyncio.Task)
+        else "other",
+    )
+    if isinstance(exc, asyncio.CancelledError | ConnectionClosedOK):
+        _logger.debug("asyncio teardown completed", exc_info=exc, extra=extra)
+    elif isinstance(exc, BaseException):
+        _logger.error("asyncio callback or task failed", exc_info=exc, extra=extra)
+    else:
+        _logger.error("asyncio reported an unhandled failure", extra=extra)
+
+
 async def _run_tunnel_from_env() -> None:
     """Run the runner as a WebSocket tunnel client.
 
@@ -1660,28 +1697,6 @@ async def _run_tunnel_from_env() -> None:
     loop = asyncio.get_running_loop()
     last_activity_at = loop.time()
 
-    # asyncio funnels unretrieved task exceptions and callback errors through
-    # the loop's exception handler. Those are not our own _logger callsites
-    # (e.g. a discarded ``ws.recv()`` task on a normal tunnel close), so this is
-    # the one place we can attribute them to the runner's session and keep them
-    # out of asyncio's default, untagged "Task exception was never retrieved".
-    from websockets.exceptions import ConnectionClosedOK
-
-    def _handle_loop_exception(
-        loop: asyncio.AbstractEventLoop,  # noqa: ARG001 — signature mandated by asyncio
-        context: dict[str, object],
-    ) -> None:
-        exc = context.get("exception")
-        message = context.get("message") or "unhandled asyncio exception"
-        extra = {"session_id": runner_primary_session_id()}
-        if isinstance(exc, asyncio.CancelledError | ConnectionClosedOK):
-            # Benign teardown — keep it quiet but still attributed.
-            _logger.debug("asyncio: %s", message, exc_info=exc, extra=extra)
-        elif isinstance(exc, BaseException):
-            _logger.error("asyncio: %s", message, exc_info=exc, extra=extra)
-        else:
-            _logger.error("asyncio: %s (context=%r)", message, context, extra=extra)
-
     loop.set_exception_handler(_handle_loop_exception)
 
     def _mark_activity() -> None:
@@ -1730,10 +1745,14 @@ async def _run_tunnel_from_env() -> None:
     # Set when the launcher adopts this runner (tmux detach); makes the
     # parent-death killer stand down so the runner outlives the CLI.
     adopted_event = threading.Event()
+    _shutting_down_state = getattr(app.state, "shutting_down", None)
     _install_signal_handlers(
         stop_event,
         adopted_event=adopted_event,
         record_reason=_record_exit_reason,
+        mark_shutting_down=(
+            _shutting_down_state.set if _shutting_down_state is not None else None
+        ),
     )
     # Set (instead of stop_event) on an idle-reaper shutdown so the tunnel
     # drains its session streams and closes cleanly — the server then sees an
@@ -1897,6 +1916,7 @@ def _install_signal_handlers(
     stop_event: asyncio.Event,
     adopted_event: threading.Event | None = None,
     record_reason: Callable[[str], None] | None = None,
+    mark_shutting_down: Callable[[], None] | None = None,
 ) -> None:
     """Install process signal handlers that request graceful shutdown.
 
@@ -1908,6 +1928,10 @@ def _install_signal_handlers(
     :param record_reason: Optional callback given the signal name when a
         shutdown signal arrives, so the exit log line can attribute the
         cause. ``None`` skips attribution.
+    :param mark_shutting_down: Optional callback invoked (no args) when a
+        shutdown signal arrives, before any teardown runs — lets app.py tell
+        an intentional stop from a real crash when a terminal watcher races
+        the shutdown. ``None`` skips it.
     :returns: None.
     """
     loop = asyncio.get_running_loop()
@@ -1920,6 +1944,8 @@ def _install_signal_handlers(
         """
         if record_reason is not None:
             record_reason(f"received {signal.Signals(sig).name}")
+        if mark_shutting_down is not None:
+            mark_shutting_down()
         stop_event.set()
 
     degraded = False

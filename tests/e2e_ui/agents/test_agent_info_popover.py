@@ -23,12 +23,20 @@ from __future__ import annotations
 
 import re
 import sys
+from collections.abc import Iterator
 from pathlib import Path
 
 import httpx
 import pytest
-from playwright.sync_api import Page, expect
+from playwright.sync_api import Browser, Page, Route, expect
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+
+from tests.e2e_ui.collaboration._multi_user_server import (
+    ADMIN_EMAIL,
+    MultiUserServer,
+    spawn_multi_user_server,
+)
+from tests.e2e_ui.conftest import fetch_with_retry
 
 _COMPOSER = "Send a message…"
 _AGENT_INFO_TRIGGER = '[data-testid="agent-info-trigger"]'
@@ -41,6 +49,60 @@ _REPO_ROOT = Path(__file__).resolve().parents[3]
 # ``_ANIM_SETTLE_MS`` in ``sessions/test_agent_info_hover.py``.
 _PANEL_SETTLE_MS = 250
 _ECHO_MCP_SERVER = _REPO_ROOT / "tests" / "tools" / "fixtures" / "echo_stdio_mcp_server.py"
+
+
+@pytest.fixture(scope="module")
+def shared_child_mcp_session(
+    built_spa: None,
+    mock_llm_server_url: str,
+    tmp_path_factory: pytest.TempPathFactory,
+) -> Iterator[tuple[MultiUserServer, str, dict[int, str]]]:
+    """Multi-user parent + child whose agent declares an HTTP MCP server."""
+    server_tmp = tmp_path_factory.mktemp("e2e_ui_child_mcp_permissions")
+    for server in spawn_multi_user_server(mock_llm_server_url, server_tmp):
+        admin_headers = {"X-Forwarded-Email": ADMIN_EMAIL}
+        agent = httpx.get(
+            f"{server.base_url}/v1/sessions/{server.session_id}/agent",
+            headers=admin_headers,
+            timeout=10.0,
+        )
+        agent.raise_for_status()
+        created = httpx.post(
+            f"{server.base_url}/v1/sessions/{server.session_id}/agent/mcp-servers",
+            headers=admin_headers,
+            json={
+                "name": "ui-http",
+                "transport": "http",
+                "url": "https://example.com/mcp",
+            },
+            timeout=30.0,
+        )
+        created.raise_for_status()
+        child = httpx.post(
+            f"{server.base_url}/v1/sessions",
+            headers=admin_headers,
+            json={
+                "agent_id": agent.json()["id"],
+                "parent_session_id": server.session_id,
+                "sub_agent_name": "researcher",
+                "title": "researcher:mcp-permissions",
+            },
+            timeout=30.0,
+        )
+        child.raise_for_status()
+
+        collaborators: dict[int, str] = {}
+        for level, role in ((1, "reader"), (2, "editor"), (3, "manager")):
+            email = f"child-{role}@ui.test"
+            granted = httpx.put(
+                f"{server.base_url}/v1/sessions/{server.session_id}/permissions",
+                headers=admin_headers,
+                json={"user_id": email, "level": level},
+                timeout=10.0,
+            )
+            granted.raise_for_status()
+            collaborators[level] = email
+        yield server, child.json()["id"], collaborators
 
 
 def _callable_registry_policy(base_url: str) -> dict:
@@ -316,6 +378,137 @@ def test_agent_info_mcp_server_add_and_remove(
 
     dialog.get_by_role("button", name="Delete ui-search").click()
     _wait_for(lambda: not _agent_mcp_names(base_url, session_id))
+
+
+@pytest.mark.parametrize("viewport_width", [1280, 390], ids=["desktop", "mobile"])
+@pytest.mark.parametrize(
+    "permission_level", [4, 1, 2, 3], ids=["owner", "reader", "editor", "manager"]
+)
+def test_agent_info_mcp_controls_require_owner(
+    page: Page,
+    seeded_session: tuple[str, str],
+    viewport_width: int,
+    permission_level: int,
+) -> None:
+    """Real SPA and MCP metadata, with only snapshot access mocked.
+
+    The agent creator retains editable metadata after losing session ownership.
+    Exercise AppShell's desktop/mobile permission wiring for that case; backend
+    role enforcement is covered separately by the authorization integration tests.
+    """
+    base_url, session_id = seeded_session
+    for config in (
+        {"name": "ui-http", "transport": "http", "url": "https://example.com/mcp"},
+        {"name": "ui-stdio", "transport": "stdio", "command": sys.executable},
+    ):
+        response = httpx.post(
+            f"{base_url}/v1/sessions/{session_id}/agent/mcp-servers",
+            json=config,
+            timeout=10.0,
+        )
+        response.raise_for_status()
+    agent = httpx.get(f"{base_url}/v1/sessions/{session_id}/agent", timeout=10.0)
+    agent.raise_for_status()
+    assert agent.json()["mcp_servers_editable"] is True
+
+    def snapshot_with_access(route: Route) -> None:
+        response = fetch_with_retry(route)
+        snapshot = response.json()
+        snapshot["permission_level"] = permission_level
+        route.fulfill(response=response, json=snapshot)
+
+    snapshot_url = re.compile(rf"{re.escape(base_url)}/v1/sessions/{session_id}(?:\?.*)?$")
+    page.route(snapshot_url, snapshot_with_access)
+    page.set_viewport_size({"width": viewport_width, "height": 844})
+    with page.expect_response(snapshot_url):
+        page.goto(f"{base_url}/c/{session_id}")
+    if viewport_width < 768:
+        menu_name = "Conversation actions" if permission_level == 4 else "Session actions"
+        page.get_by_role("button", name=menu_name, exact=True).click()
+        page.get_by_role("menuitem", name="Agent info", exact=True).click()
+        panel = page.get_by_role("dialog").filter(
+            has=page.get_by_role("heading", name="Agent", exact=True)
+        )
+    else:
+        _open_popover(page)
+        panel = page.locator(_AGENT_INFO_PANEL)
+
+    for name in ("ui-http", "ui-stdio"):
+        expect(panel.get_by_text(name, exact=True)).to_be_visible()
+    manage = panel.get_by_role("button", name="Manage MCP servers")
+    if permission_level != 4:
+        expect(manage).to_have_count(0)
+        for name in ("ui-http", "ui-stdio"):
+            expect(panel.get_by_role("button", name=name, exact=True)).to_have_count(0)
+        return
+
+    expect(manage).to_be_visible()
+    expect(panel.get_by_role("button", name="ui-http", exact=True)).to_be_visible()
+    manage.click()
+    dialog = page.get_by_role("dialog").filter(
+        has=page.get_by_role("heading", name="Manage MCP Servers", exact=True)
+    )
+    expect(dialog.get_by_label("Name", exact=True)).to_be_visible()
+    for name in ("ui-http", "ui-stdio"):
+        expect(dialog.get_by_role("button", name=f"Edit {name}")).to_be_visible()
+        expect(dialog.get_by_role("button", name=f"Delete {name}")).to_be_visible()
+
+
+@pytest.mark.parametrize("viewport_width", [1280, 390], ids=["desktop", "mobile"])
+@pytest.mark.parametrize(
+    "permission_level", [4, 1, 2, 3], ids=["owner", "reader", "editor", "manager"]
+)
+def test_child_agent_info_mcp_controls_require_effective_owner(
+    browser: Browser,
+    shared_child_mcp_session: tuple[MultiUserServer, str, dict[int, str]],
+    viewport_width: int,
+    permission_level: int,
+) -> None:
+    """Inherited child access keeps MCP badges visible but controls owner-only."""
+    server, child_id, collaborators = shared_child_mcp_session
+    email = ADMIN_EMAIL if permission_level == 4 else collaborators[permission_level]
+    headers = {"X-Forwarded-Email": email}
+
+    snapshot = httpx.get(
+        f"{server.base_url}/v1/sessions/{child_id}", headers=headers, timeout=10.0
+    )
+    snapshot.raise_for_status()
+    expected_level = 4 if permission_level == 4 else None
+    assert snapshot.json()["permission_level"] is expected_level
+    agent = httpx.get(
+        f"{server.base_url}/v1/sessions/{child_id}/agent", headers=headers, timeout=10.0
+    )
+    agent.raise_for_status()
+    assert agent.json()["mcp_servers_editable"] is (permission_level == 4)
+
+    context = browser.new_context(extra_http_headers=headers)
+    try:
+        page = context.new_page()
+        page.set_viewport_size({"width": viewport_width, "height": 844})
+        page.goto(f"{server.public_url}/c/{child_id}")
+        expect(page.get_by_placeholder(_COMPOSER)).to_be_visible(timeout=30_000)
+        if viewport_width < 768:
+            page.get_by_role(
+                "button", name=re.compile(r"^(Conversation|Session) actions$")
+            ).click()
+            page.get_by_role("menuitem", name="Agent info", exact=True).click()
+            panel = page.get_by_role("dialog").filter(
+                has=page.get_by_role("heading", name="Agent", exact=True)
+            )
+        else:
+            _open_popover(page)
+            panel = page.locator(_AGENT_INFO_PANEL)
+
+        expect(panel.get_by_text("ui-http", exact=True)).to_be_visible()
+        manage = panel.get_by_role("button", name="Manage MCP servers")
+        if permission_level == 4:
+            expect(manage).to_be_visible()
+            expect(panel.get_by_role("button", name="ui-http", exact=True)).to_be_visible()
+        else:
+            expect(manage).to_have_count(0)
+            expect(panel.get_by_role("button", name="ui-http", exact=True)).to_have_count(0)
+    finally:
+        context.close()
 
 
 def test_agent_info_mcp_dirty_warning_after_edit(

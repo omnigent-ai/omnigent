@@ -2101,6 +2101,98 @@ async def test_events_interrupt_on_codex_native_uses_turn_interrupt_without_mark
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("case", ["running", "idle", "newer_turn", "missing_turn", "rpc_failure"])
+async def test_events_interrupt_codex_side_chat_leaves_parent_turn_running(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    case: str,
+) -> None:
+    from omnigent.harnesses.codex_native import app_server as codex_native_app_server
+
+    conv_id = "acbeddbbce38421b921a7abbe82f7176"
+    monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path / "codex-bridge")
+    bridge_dir = codex_native_bridge.bridge_dir_for_bridge_id(conv_id)
+    codex_native_bridge.write_bridge_state(
+        bridge_dir,
+        codex_native_bridge.CodexNativeBridgeState(
+            session_id=conv_id,
+            socket_path="ws://127.0.0.1:43210",
+            thread_id="thread_parent",
+            codex_home=str(tmp_path / "codex-home"),
+            active_turn_id="turn_parent",
+        ),
+    )
+    fake_client = _RecordingCodexAppServerClient(
+        transport="ws://127.0.0.1:43210", client_name="omnigent-codex-native-runner"
+    )
+    original_request = fake_client.request
+
+    async def request(method: str, params: dict[str, Any]) -> dict[str, Any]:
+        result = await original_request(method, params)
+        message = {
+            "idle": "no active turn to interrupt",
+            "newer_turn": "expected active turn id turn_side but found turn_new",
+            "rpc_failure": "thread-store internal error",
+        }.get(case)
+        if message is not None:
+            raise codex_native_app_server.CodexAppServerResponseError(
+                {"code": -32603 if case == "rpc_failure" else -32600, "message": message}
+            )
+        return result
+
+    monkeypatch.setattr(fake_client, "request", request)
+    monkeypatch.setattr(
+        codex_native_app_server, "client_for_transport", lambda *_args, **_kwargs: fake_client
+    )
+    spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "codex-native"}),
+    )
+
+    async def resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        return spec
+
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    payload = {"type": "interrupt", "codex_side_thread_id": "thread_side"}
+    if case != "missing_turn":
+        payload["codex_side_turn_id"] = "turn_side"
+    async with _runner_client(app) as client:
+        created = await client.post(
+            "/v1/sessions", json={"session_id": conv_id, "agent_id": "agent_side"}
+        )
+        assert created.status_code == 201, created.text
+        if case == "rpc_failure":
+            with pytest.raises(
+                codex_native_app_server.CodexAppServerResponseError,
+                match="thread-store internal error",
+            ) as error:
+                await client.post(f"/v1/sessions/{conv_id}/events", json=payload)
+            assert error.value.code == -32603
+        else:
+            response = await client.post(f"/v1/sessions/{conv_id}/events", json=payload)
+            assert response.status_code == (400 if case == "missing_turn" else 202), response.text
+
+    assert fake_client.connected == (case != "missing_turn")
+    assert fake_client.closed == (case != "missing_turn")
+    assert fake_client.requests == (
+        []
+        if case == "missing_turn"
+        else [("turn/interrupt", {"threadId": "thread_side", "turnId": "turn_side"})]
+    )
+    parent_state = codex_native_bridge.read_bridge_state(bridge_dir)
+    assert parent_state is not None and parent_state.active_turn_id == "turn_parent"
+    assert pm.cancelled == []
+    assert pm.released == []
+    assert conv_id not in app.state.interrupted_sessions
+
+
+@pytest.mark.asyncio
 async def test_events_stop_session_on_codex_native_uses_turn_interrupt_without_marker(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -3889,6 +3981,86 @@ async def test_required_terminal_voluntary_exit_publishes_idle_not_failed() -> N
         if event.get("type") == "session.status" and event.get("status") == "failed"
     ] == []
     # The harness subprocess is released.
+    assert pm.released == [conv_id]
+
+
+@pytest.mark.asyncio
+async def test_required_terminal_exit_during_shutdown_does_not_fail_session(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A required terminal exit while the runner is shutting down is not a crash.
+
+    The host stopping a runner mid-turn (SIGINT/SIGTERM) tears down tmux with
+    the process group, so the idle watcher reports the required terminal as
+    exited even though nothing crashed. With ``app.state.shutting_down`` set,
+    the runner must still remove the terminal resource and release the
+    harness, but must not log an ERROR or publish ``session.status: failed``
+    — the server already handles a runner going away via the dropped tunnel.
+    """
+    import logging
+
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.app import _session_event_queues_ref
+    from omnigent.runner.resource_registry import (
+        TerminalExitEvent,
+        TerminalLifecycle,
+    )
+
+    conv_id = uuid.uuid4().hex
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+    pm._sessions.add(conv_id)
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    resource_registry = app.state.session_resource_registry
+    app.state.shutting_down.set()
+    publish_exit = resource_registry._terminal_exit_publisher
+    assert callable(publish_exit)
+
+    try:
+        with caplog.at_level(logging.INFO, logger="omnigent.runner.app"):
+            publish_exit(
+                TerminalExitEvent(
+                    session_id=conv_id,
+                    terminal_id="terminal_claude_main",
+                    terminal_name="claude",
+                    session_key="main",
+                    lifecycle=TerminalLifecycle.REQUIRED,
+                    exit_status=None,
+                    session_was_idle=False,
+                )
+            )
+            queued_events: list[dict[str, Any]] = []
+            for _ in range(1000):
+                queued_events.extend(
+                    _drain_session_event_queue(_session_event_queues_ref.get(conv_id))
+                )
+                if pm.released:
+                    break
+                await asyncio.sleep(0)
+    finally:
+        _session_event_queues_ref.pop(conv_id, None)
+        runner_app.unregister_child_session(conv_id)
+
+    assert {
+        "type": "session.resource.deleted",
+        "resource_id": "terminal_claude_main",
+        "resource_type": "terminal",
+        "session_id": conv_id,
+    } in queued_events
+    # No spurious failure card while the runner is shutting down.
+    assert [
+        event
+        for event in queued_events
+        if event.get("type") == "session.status" and event.get("status") == "failed"
+    ] == []
+    assert [record for record in caplog.records if record.levelno >= logging.ERROR] == []
+    assert any(
+        "shutting down" in record.getMessage() and record.levelno == logging.INFO
+        for record in caplog.records
+    )
+    # The harness subprocess is still released — the terminal is gone.
     assert pm.released == [conv_id]
 
 

@@ -17,6 +17,7 @@ import pytest
 
 from omnigent.harnesses.codex_native import forwarder as fwd
 from omnigent.harnesses.codex_native import side_chat
+from omnigent.harnesses.codex_native.app_server import CodexAppServerResponseError
 
 _JsonObject = dict[str, Any]
 
@@ -100,6 +101,27 @@ async def test_submit_side_turn_targets_child_thread() -> None:
     assert params["threadId"] == "thread_side"
     assert params["input"] == [{"type": "text", "text": "why is the sky blue?"}]
     assert "collaborationMode" not in params
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        CodexAppServerResponseError({"code": -32600, "message": "thread not found"}),
+        CodexAppServerResponseError({"code": -32603, "message": "no active turn to interrupt"}),
+        RuntimeError("request timed out"),
+    ],
+)
+async def test_interrupt_side_turn_propagates_unrelated_errors(error: Exception) -> None:
+    client = AsyncMock()
+    client.request.side_effect = error
+
+    with pytest.raises(type(error)) as caught:
+        await side_chat.interrupt_side_turn(client, "thread_side", "turn_side")
+
+    assert caught.value is error
+    client.request.assert_awaited_once_with(
+        "turn/interrupt", {"threadId": "thread_side", "turnId": "turn_side"}
+    )
 
 
 @pytest.mark.asyncio

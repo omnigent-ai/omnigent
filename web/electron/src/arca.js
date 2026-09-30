@@ -162,7 +162,9 @@ function buildConnectArgs(serverUrl) {
     "omni",
     "host",
     "--server",
-    url.toString(),
+    // Quoted for the remote shell, which would glob a `?` (zsh fails on no
+    // match); SAFE_URL_RE already bars `'`, so the quotes can't be broken out of.
+    `'${url.toString()}'`,
     "--background",
     "--non-interactive",
   ];

@@ -355,6 +355,7 @@ class PolicyEngine:
         ctx = self._inject_model(ctx)
         ctx = self._inject_labels(ctx)
         ctx = self._inject_llm_client(ctx)
+        ctx = self._inject_conversation_id(ctx)
 
         for policy in self.policies:
             if not self._should_fire(policy.spec, ctx):
@@ -825,6 +826,23 @@ class PolicyEngine:
             hot cache.
         """
         return replace(ctx, session_state=dict(self._session_state))
+
+    def _inject_conversation_id(self, ctx: EvaluationContext) -> EvaluationContext:
+        """
+        Return a copy of *ctx* with ``conversation_id`` populated.
+
+        Injects the engine's own conversation_id so function policy
+        callables can correlate an event with its session via
+        ``event["context"]["conversation_id"]`` without the caller
+        having to thread it through every :class:`EvaluationContext`
+        it builds.
+
+        :param ctx: Original :class:`EvaluationContext` from the
+            caller.
+        :returns: A new :class:`EvaluationContext` with
+            ``conversation_id`` set to this engine's conversation_id.
+        """
+        return replace(ctx, conversation_id=self._conversation_id)
 
     def _filter_schema_valid(
         self,

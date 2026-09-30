@@ -37,10 +37,12 @@ def test_hello_round_trip() -> None:
         frame_protocol_version=1,
         harnesses=["claude-sdk", "codex"],
         envs=["os_sandbox"],
+        connection_id="c0ffee01",
     )
     decoded = decode_frame(encode_frame(f))
     assert isinstance(decoded, HelloFrame)
     assert decoded.runner_version == "0.1.2"
+    assert decoded.connection_id == "c0ffee01"
     assert decoded.frame_protocol_version == 1
     assert decoded.harnesses == ["claude-sdk", "codex"]
     assert decoded.envs == ["os_sandbox"]
@@ -79,6 +81,10 @@ def test_hello_without_advert_omits_direct_attach_keys_on_wire() -> None:
     wire = json.loads(encode_frame(HelloFrame(runner_version="0.1.2", frame_protocol_version=1)))
     assert "direct_attach_port" not in wire
     assert "direct_attach_token" not in wire
+    assert "connection_id" not in wire
+    decoded = decode_frame(json.dumps(wire))
+    assert isinstance(decoded, HelloFrame)
+    assert decoded.connection_id is None
 
 
 def test_hello_decode_drops_half_present_direct_attach_advert() -> None:

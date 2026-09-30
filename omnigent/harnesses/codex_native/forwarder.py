@@ -7,6 +7,8 @@ import contextlib
 import hashlib
 import json
 import logging
+import urllib.error
+import urllib.request
 from collections.abc import AsyncIterator, Callable
 from contextvars import ContextVar
 from dataclasses import dataclass, field
@@ -15,7 +17,6 @@ from pathlib import Path
 import httpx
 
 from omnigent.codex_approval_modes import codex_permission_preset_from_thread_settings
-from omnigent.debug_logging import debug_event
 from omnigent.entities.session_resources import terminal_resource_id
 from omnigent.harnesses.claude_native.bridge import url_component
 from omnigent.harnesses.codex_native import side_chat
@@ -2473,17 +2474,6 @@ async def _create_thread_replacement_session(
             # Carry the workspace across the rotation, or the executor
             # falls back to the harness process's own cwd for new turns.
             cwd=state.cwd if state is not None else None,
-        ),
-    )
-
-    _logger.info(
-        "Codex native input ready after thread switch",
-        extra=debug_event(
-            "native_input_ready",
-            session_id=new_session_id,
-            runner_id=runner_id,
-            harness="codex-native",
-            stage="native_input",
         ),
     )
 
@@ -5119,6 +5109,8 @@ async def _handle_completed_item_inner(
         await _post_review_mode_marker(client, session_id, params, item, source_id=source_id)
         return
     if item_type in _TOOL_ITEM_TYPES:
+        if item_type == "fileChange":
+            await _observe_file_change(bridge_dir, item)
         await _post_tool_item(
             client,
             session_id,
@@ -6442,6 +6434,57 @@ def _file_change_tool_call(call_id: str, item: _JsonObject) -> _CodexToolCall | 
         arguments={"changes": changes},
         output=output_text,
     )
+
+
+def _post_file_change_observer(url: str, token: str, payload: _JsonObject) -> None:
+    """POST one observer payload without the server client's auth middleware."""
+    request = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=2) as response:
+        response.read()
+
+
+async def _observe_file_change(bridge_dir: Path | None, item: _JsonObject) -> None:
+    """Send a completed Codex fileChange through the runner's file observer."""
+    if bridge_dir is None:
+        return
+    if item.get("status") in {"failed", "declined"}:
+        return
+    changes = item.get("changes")
+    if not isinstance(changes, list):
+        return
+    observed_changes = [
+        {"path": change.get("path"), "kind": change.get("kind")}
+        for change in changes
+        if isinstance(change, dict) and isinstance(change.get("path"), str)
+    ]
+    if not observed_changes:
+        return
+    try:
+        relay = json.loads((bridge_dir / "tool_relay.json").read_text(encoding="utf-8"))
+        url = relay["url"].rstrip("/") + "/hook/observe-tool"
+        token = relay["token"]
+        payload: _JsonObject = {
+            "hook_event_name": "PostToolUse",
+            "tool_name": "apply_patch",
+            "tool_input": {"changes": observed_changes},
+            "tool_response": {"type": "success"},
+        }
+        await asyncio.to_thread(
+            _post_file_change_observer,
+            url,
+            token,
+            payload,
+        )
+    except (OSError, ValueError, KeyError, TypeError, urllib.error.URLError) as exc:
+        _logger.warning("Codex fileChange observer delivery failed: %s", exc)
 
 
 def _web_search_tool_call(call_id: str, item: _JsonObject) -> _CodexToolCall | None:

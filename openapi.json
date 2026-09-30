@@ -102,7 +102,7 @@
           },
           "mcp_servers_editable": {
             "default": false,
-            "description": "Whether the MCP list can be edited through the session UI. Built-in template agents are read-only; session-scoped uploaded agents are editable.",
+            "description": "Whether the MCP list can be edited through the session UI by the authenticated caller. This requires ownership of both the effective session and its session-scoped agent; built-in template and native agents are read-only.",
             "title": "Mcp Servers Editable",
             "type": "boolean"
           },
@@ -1735,6 +1735,18 @@
       "ErrorData": {
         "description": "Data for a persisted error banner item.\n\nThese items mirror `response.error` events so clients can render\nthe same error banner after reconnect / refresh. They are listed in\n`NON_CONTENT_ITEM_TYPES` because they are operator-visible\ntranscript metadata, not content the next agent turn should receive.",
         "properties": {
+          "cause": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Optional one or two sentences explaining why it failed.",
+            "title": "Cause"
+          },
           "code": {
             "description": "Stable error classifier, e.g. `\"native_terminal_start_failed\"`.",
             "title": "Code",
@@ -1761,6 +1773,18 @@
             "title": "Message",
             "type": "string"
           },
+          "remediation": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Optional concrete next step, e.g. the sign-in link and code; the card offers it as an action.",
+            "title": "Remediation"
+          },
           "source": {
             "description": "Error source, e.g. `\"execution\"`.",
             "enum": [
@@ -1771,6 +1795,18 @@
             ],
             "title": "Source",
             "type": "string"
+          },
+          "title": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Optional short headline naming the failure, e.g. `\"Codex can't start until you sign in to Databricks\"`. Kept so the card reads the same after a reload as it did live.",
+            "title": "Title"
           }
         },
         "required": [
@@ -1829,6 +1865,18 @@
             ],
             "description": "Optional short headline naming what went wrong, e.g. `\"Claude Code can't run as root\"`. Present when the runner recognized the failure (see `omnigent.runner.launch_failure`); lets the UI show a clear card title instead of the raw `code`.",
             "title": "Title"
+          },
+          "undelivered": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "`True` when the harness reports it never received the message this turn carried (it failed before delivery), so the sender's queued copy is the only record of it; absent otherwise.",
+            "title": "Undelivered"
           }
         },
         "required": [
@@ -3182,6 +3230,85 @@
           "status"
         ],
         "title": "McpServerStartup",
+        "type": "object"
+      },
+      "McpServerSummary": {
+        "description": "An MCP server a harness loads on the host, without secrets.",
+        "properties": {
+          "harness": {
+            "description": "Harness family that loads it: `claude`, `codex`, or `cursor`.",
+            "title": "Harness",
+            "type": "string"
+          },
+          "name": {
+            "description": "Server name as configured, e.g. `\"github\"`.",
+            "title": "Name",
+            "type": "string"
+          },
+          "plugin": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Plugin that bundles the server, e.g. `\"figma\"`.",
+            "title": "Plugin"
+          },
+          "scope": {
+            "const": "user",
+            "description": "Config scope; always `user` today.",
+            "title": "Scope",
+            "type": "string"
+          },
+          "transport": {
+            "description": "`stdio` for a local process, `http` for a remote server.",
+            "enum": [
+              "stdio",
+              "http"
+            ],
+            "title": "Transport",
+            "type": "string"
+          },
+          "url_host": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Hostname of a remote server, e.g. `\"mcp.linear.app\"`.",
+            "title": "Url Host"
+          }
+        },
+        "required": [
+          "name",
+          "harness",
+          "transport",
+          "scope"
+        ],
+        "title": "McpServerSummary",
+        "type": "object"
+      },
+      "McpServersResponse": {
+        "description": "User-level MCP servers discovered on a host.",
+        "properties": {
+          "mcp_servers": {
+            "items": {
+              "$ref": "#/components/schemas/McpServerSummary"
+            },
+            "title": "Mcp Servers",
+            "type": "array"
+          }
+        },
+        "required": [
+          "mcp_servers"
+        ],
+        "title": "McpServersResponse",
         "type": "object"
       },
       "MessageData": {
@@ -7728,8 +7855,19 @@
         "type": "object"
       },
       "SetSharingRequest": {
-        "description": "Body for `PUT /v1/sharing`.\n\nBoth fields are optional so an admin can update either setting\nindependently; at least one must be present.",
+        "description": "Body for `PUT /v1/sharing`.\n\nEvery field is optional so an admin can update each setting\nindependently; at least one must be present.",
         "properties": {
+          "default_public_sessions": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Default Public Sessions"
+          },
           "public_sharing": {
             "anyOf": [
               {
@@ -9933,6 +10071,49 @@
         ]
       }
     },
+    "/v1/hosts/{host_id}/mcp-servers": {
+      "get": {
+        "description": "List the user-level MCP servers configured for each harness on a host.\n\nReturns names and non-secret metadata only; the caller must own the host.",
+        "operationId": "get_mcp_servers_v1_hosts__host_id__mcp_servers_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "host_id",
+            "required": true,
+            "schema": {
+              "title": "Host Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/McpServersResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Mcp Servers",
+        "tags": [
+          "hosts"
+        ]
+      }
+    },
     "/v1/hosts/{host_id}/runners": {
       "post": {
         "description": "Launch a runner on a host for a session.\n\nGenerates a binding token, writes the expected runner_id\nto the session row, sends the launch command to the host,\nand waits for the host's acknowledgement.\n\n**Parameters**\n\n- `body` \u2014 Launch request with `session_id` and `workspace`.\n\n**Returns:** `{\"runner_id\": ..., \"status\": \"launching\"}`.\n\n**Raises**\n\n- `HTTPException` \u2014 404 if host not found, 409 if host offline, 403 if caller doesn't own the host, 400 if session already has a runner.",
@@ -10194,7 +10375,7 @@
     },
     "/v1/me": {
       "get": {
-        "description": "Return the current user's identity.\n\nReads the user from the auth provider (same logic that\nsession routes use). The frontend calls this on load to\ndiscover who it is.\n\nAlso returns `is_admin` \u2014 the mode-agnostic admin signal\n(the shared `users.is_admin` column, set by the admin-list\npromotion at login). The SPA gates admin chrome on it in\nEVERY mode, including OIDC/SSO where the accounts-only\n`/auth/me` endpoint does not exist.\n\nWhen OIDC is active and the user is unauthenticated,\nreturns 401 with a `login_url` so the frontend knows\nwhere to redirect.\n\n**Returns:** `{\"user_id\": \"alice@example.com\", \"is_admin\": true}`, `{\"user_id\": null, \"is_admin\": false}` if unauthenticated in header mode, or 401 with `login_url` in OIDC mode.",
+        "description": "Return the current user's identity.\n\nReads the user from the auth provider (same logic that\nsession routes use). The frontend calls this on load to\ndiscover who it is.\n\nAlso returns `is_admin` \u2014 the mode-agnostic admin signal\n(the shared `users.is_admin` column, set by the admin-list\npromotion at login). The SPA gates admin chrome on it in\nEVERY mode, including OIDC/SSO where the accounts-only\n`/auth/me` endpoint does not exist.\n\nAn identity the admin list names but the database doesn't yet\nflag is promoted here, as login does for OIDC and accounts.\nHeader auth has no login step, so without this a listed admin\nwould see admin chrome that every admin-gated route refuses.\n\nWhen OIDC is active and the user is unauthenticated,\nreturns 401 with a `login_url` so the frontend knows\nwhere to redirect.\n\n**Returns:** `{\"user_id\": \"alice@example.com\", \"is_admin\": true}`, `{\"user_id\": null, \"is_admin\": false}` if unauthenticated in header mode, or 401 with `login_url` in OIDC mode.",
         "operationId": "me_v1_me_get",
         "responses": {
           "200": {
@@ -11447,7 +11628,7 @@
         ]
       },
       "put": {
-        "description": "Replace the session's agent bundle with a new upload.\n\nValidates the new bundle, checks that the spec name matches\nthe existing agent, stores the bundle under a\ncontent-addressed key, updates the agent row, and warm-swaps\nthe cache. Idempotent when the bundle content is unchanged.\n\n**Parameters**\n\n- `bundle` \u2014 Uploaded `.tar.gz` agent bundle file.\n\n**Returns:** The updated `AgentObject`.\n\n**Raises**\n\n- `OmnigentError` \u2014 If the session or agent is not found, the bundle is invalid, or the spec name doesn't match.",
+        "description": "Replace the session's agent bundle with a new upload.\n\nValidates the new bundle, checks that the spec name matches\nthe existing agent, stores the bundle under a\ncontent-addressed key, updates the agent row, and warm-swaps\nthe cache. Idempotent when the bundle content is unchanged.\nRequires session-owner permission because a bundle can replace MCP servers.\n\n**Parameters**\n\n- `bundle` \u2014 Uploaded `.tar.gz` agent bundle file.\n\n**Returns:** The updated `AgentObject`.\n\n**Raises**\n\n- `OmnigentError` \u2014 If the session or agent is not found, the bundle is invalid, or the spec name doesn't match.",
         "operationId": "update_session_agent_v1_sessions__session_id__agent_put",
         "parameters": [
           {
@@ -14982,6 +15163,48 @@
         ]
       }
     },
+    "/v1/sessions/{session_id}/sign-in-link": {
+      "get": {
+        "description": "Return the sign-in link the session's terminal is waiting on right now.\n\nAsked by the error card at click time, so the user opens the live\nprompt rather than a link saved earlier that its launcher process has\nsince abandoned.\n\n**Returns:** The runner's `{\"pending\", \"url\", \"code\", \"terminal_id\"}` payload.",
+        "operationId": "get_session_sign_in_link_v1_sessions__session_id__sign_in_link_get",
+        "parameters": [
+          {
+            "description": "Session/conversation identifier.",
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Session Sign In Link",
+        "tags": [
+          "sessions"
+        ]
+      }
+    },
     "/v1/sessions/{session_id}/stream": {
       "get": {
         "description": "Subscribe to the session's live SSE event stream.\n\nDoes NOT replay history; clients reconcile via the snapshot\nendpoint. The generator emits `[DONE]` on normal completion\nand uses `finally` only for presence cleanup \u2014 see\n`_stream_live_events`.\n\nHolding this stream open registers the caller as a session\n*viewer* (presence): co-viewers' streams receive\n`session.presence` events on join/leave/idle edges, and\nthis stream's snapshot-on-connect includes the current\nviewer list. Presence is scoped to the session tree's root\nconversation, so viewers of different agents/sub-agents in\none session see each other. See\n`omnigent/server/presence.py`.\n\n**Returns:** An SSE `StreamingResponse`.\n\n**Raises**\n\n- `OmnigentError` \u2014 404 if no session exists.",
@@ -15096,7 +15319,7 @@
     },
     "/v1/sessions/{source_id}/fork": {
       "post": {
-        "description": "Fork an existing session into a new session.\n\nDeep-copies the source session's conversation items and\nclones the agent into a new session. When `body.agent_id`\nis set, the fork binds that built-in agent instead of the\nsource's \u2014 switching harness (e.g. Claude-SDK \u2192 Claude Code,\nor Claude \u2192 Codex). The source's model settings carry over\nonly within the same provider family; a same-family native\ntarget also carries conversation history (the runner rebuilds\nits transcript). The REPL/CLI binds the fork to its runner via\n`PATCH /v1/sessions/{id}` after creation.\n\nWhen `body.up_to_response_id` is set, only history up to and\nincluding that response is copied into the fork (a \"fork from\nthis response\"); a native target then rebuilds its transcript\nfrom the truncated items instead of resuming the source's full\nnative transcript.\n\nThe dialog's run-config picks (`body.model_override`,\n`body.reasoning_effort`, `body.terminal_launch_args` \u2014 the\npermission-/approval-mode selector) override what the fork would\notherwise inherit. Each is opt-in: a field omitted from the request\nkeeps the inherited value (model/effort within the same provider\nfamily; launch args on a same-agent fork), while a field present\nwins \u2014 a clear alias (`\"default\"`) resets to the bound agent's\ndefault, and an explicit launch-args list also drops the source's\ncopied permission-mode / codex-bypass labels so they can't shadow\nthe freshly chosen mode.\n\nA sub-agent source is allowed, which is how a sub-agent is\npromoted to a session of its own: the fork is always a fresh\ntop-level conversation (no parent, its own spawn-tree root, its\nown owner grant), so it appears in the sidebar and outlives the\nparent. The source keeps running under its parent untouched,\nand the fork does not adopt the source's own children.\n\n`body.host_type: \"managed\"` gives the fork its own\nserver-provisioned sandbox instead of leaving it unbound for the\ncaller to bind a host to. It schedules the same background launch\na managed create does \u2014 this POST returns before the sandbox\nexists \u2014 and the sandbox is registered to the FORKING caller, not\nto the source session's owner. The fork's workspace is the\nrepository named by `body.workspace`, or the one the source\nrecorded when that field is omitted.\n\n**Parameters**\n\n- `body` \u2014 The validated `SessionForkRequest`.\n\n**Returns:** A `SessionResponse` describing the newly created fork (status `\"idle\"`).\n\n**Raises**\n\n- `OmnigentError` \u2014 404 if *source_id* does not exist or `body.agent_id` is not a bindable built-in agent; 403 if the caller lacks read access; 400 if the source has no agent binding, `body.up_to_response_id` names no response in the source session, or a managed fork asks for a sandbox this server has not configured.",
+        "description": "Fork an existing session into a new session.\n\nDeep-copies the source session's conversation items and\nclones the agent into a new session. When `body.agent_id`\nis set, the fork binds that agent instead of the\nsource's \u2014 switching harness (e.g. Claude-SDK \u2192 Claude Code,\nor Claude \u2192 Codex). The source's model settings carry over\nonly within the same provider family; a same-family native\ntarget also carries conversation history (the runner rebuilds\nits transcript). The REPL/CLI binds the fork to its runner via\n`PATCH /v1/sessions/{id}` after creation.\n\nWhen `body.up_to_response_id` is set, only history up to and\nincluding that response is copied into the fork (a \"fork from\nthis response\"); a native target then rebuilds its transcript\nfrom the truncated items instead of resuming the source's full\nnative transcript.\n\nThe dialog's run-config picks (`body.model_override`,\n`body.reasoning_effort`, `body.terminal_launch_args` \u2014 the\npermission-/approval-mode selector) override what the fork would\notherwise inherit. Each is opt-in: a field omitted from the request\nkeeps the inherited value (model/effort within the same provider\nfamily; launch args on a same-agent fork), while a field present\nwins \u2014 a clear alias (`\"default\"`) resets to the bound agent's\ndefault, and an explicit launch-args list also drops the source's\ncopied permission-mode / codex-bypass labels so they can't shadow\nthe freshly chosen mode.\n\nA sub-agent source is allowed, which is how a sub-agent is\npromoted to a session of its own: the fork is always a fresh\ntop-level conversation (no parent, its own spawn-tree root, its\nown owner grant), so it appears in the sidebar and outlives the\nparent. The source keeps running under its parent untouched,\nand the fork does not adopt the source's own children.\n\n`body.host_type: \"managed\"` gives the fork its own\nserver-provisioned sandbox instead of leaving it unbound for the\ncaller to bind a host to. It schedules the same background launch\na managed create does \u2014 this POST returns before the sandbox\nexists \u2014 and the sandbox is registered to the FORKING caller, not\nto the source session's owner. The fork's workspace is the\nrepository named by `body.workspace`, or the one the source\nrecorded when that field is omitted.\n\n**Parameters**\n\n- `body` \u2014 The validated `SessionForkRequest`.\n\n**Returns:** A `SessionResponse` describing the newly created fork (status `\"idle\"`).\n\n**Raises**\n\n- `OmnigentError` \u2014 404 if *source_id* does not exist or `body.agent_id` names no agent; 403/404 if the caller lacks read access on the source, or on the session that owns a session-scoped `body.agent_id`; 400 if the source has no agent binding, `body.up_to_response_id` names no response in the source session, or a managed fork asks for a sandbox this server has not configured.",
         "operationId": "fork_session_v1_sessions__source_id__fork_post",
         "parameters": [
           {
@@ -15150,7 +15373,7 @@
     },
     "/v1/sharing": {
       "get": {
-        "description": "Report both settings, whether each is editable here, and the tiers.",
+        "description": "Report every setting, whether each is editable here, and the options.",
         "operationId": "get_sharing_v1_sharing_get",
         "responses": {
           "200": {
@@ -15172,7 +15395,7 @@
         ]
       },
       "put": {
-        "description": "Set the sharing mode and/or public-access setting (admin only).\n\nUpdates only the fields present in the body; requires at least one.\nRejects an unknown mode value with 400 (no fail-open coercion \u2014 an admin\nsetting a value should learn about a typo). Rejects a write to a setting\nthe deployment manages itself (not file-backed) with 403.",
+        "description": "Set the sharing mode, public-access and/or default-public settings (admin only).\n\nUpdates only the fields present in the body; requires at least one.\nRejects an unknown mode value with 400 (no fail-open coercion \u2014 an admin\nsetting a value should learn about a typo). Rejects a write to a setting\nthe deployment manages itself (not file-backed) with 403.",
         "operationId": "set_sharing_v1_sharing_put",
         "requestBody": {
           "content": {

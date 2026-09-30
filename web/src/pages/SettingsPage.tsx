@@ -246,10 +246,12 @@ import {
   getCliStatus,
   isElectronShell,
   resetCliPath,
+  supportsBrowser,
   type UpdateConfig,
   type UpdateMode,
   updateBridge,
 } from "@/lib/nativeBridge";
+import { readOpenLinksInApp, writeOpenLinksInApp } from "@/lib/linkOpenPreferences";
 import { cn } from "@/lib/utils";
 import {
   readBackgroundSessionTitlesEnabled,
@@ -1487,6 +1489,45 @@ function ComposerSendShortcutControl() {
   );
 }
 
+/**
+ * Where a plain click on a web link in chat content opens — desktop shells
+ * with the embedded browser only. Off keeps the current behavior (the
+ * default external browser); on routes the link into the conversation's
+ * in-app Browser tab. Modified clicks always stay external.
+ */
+function OpenLinksInAppControl() {
+  const [enabled, setEnabled] = useState(readOpenLinksInApp);
+  const labelId = useId();
+  const descriptionId = useId();
+  const toggle = useCallback((next: boolean) => {
+    setEnabled(next);
+    writeOpenLinksInApp(next);
+  }, []);
+
+  return (
+    <div className="flex items-start justify-between gap-6">
+      <div className="flex min-w-0 flex-1 flex-col">
+        <span id={labelId} className="text-ui font-medium">
+          Open links in the in-app browser
+        </span>
+        <span id={descriptionId} className="text-ui text-muted-foreground">
+          Open web links from chat in this conversation&apos;s Browser tab instead of your default
+          browser. {MOD_KEY}+click always opens the external browser.
+        </span>
+      </div>
+      <Switch
+        aria-labelledby={labelId}
+        aria-describedby={descriptionId}
+        checked={enabled}
+        onCheckedChange={toggle}
+        data-testid="open-links-in-app-toggle"
+        className="mt-0.5 shrink-0"
+        componentId="settings.general.open_links_in_app"
+      />
+    </div>
+  );
+}
+
 function BackgroundSessionTitlesControl() {
   const [enabled, setEnabled] = useState(readBackgroundSessionTitlesEnabled);
   const labelId = useId();
@@ -1610,6 +1651,14 @@ function GeneralSection() {
         <div className="rounded-xl border border-border bg-card p-4">
           <TerminalClipboardControl />
         </div>
+        {supportsBrowser() && (
+          <>
+            <h2 className="mt-3 text-ui font-medium">Links</h2>
+            <div className="rounded-xl border border-border bg-card p-4">
+              <OpenLinksInAppControl />
+            </div>
+          </>
+        )}
       </div>
     </Section>
   );

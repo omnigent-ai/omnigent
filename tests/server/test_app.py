@@ -1321,6 +1321,7 @@ def test_build_native_bundle_raises_without_materialize_hook() -> None:
         key="ghost",
         run_native="omnigent.ghost_native:run_ghost_native",
         auto_create_terminal="omnigent.runner.native:_launch_ghost",
+        input_ready_probe="omnigent.ghost_native.bridge:native_input_ready",
         materialize_agent_spec=None,
     )
     with pytest.raises(OmnigentError, match="no materialize_agent_spec hook"):

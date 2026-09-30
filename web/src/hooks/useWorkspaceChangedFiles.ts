@@ -1016,6 +1016,7 @@ export function useWorkspaceDirectories(
   conversationId: string | undefined,
   dirPaths: string[],
   location = "",
+  refreshToken = 0,
 ): Map<string, DirectoryResult> {
   const serveable = useWorkspaceServeable(conversationId);
   const enabled = !!conversationId && serveable !== false;
@@ -1041,7 +1042,10 @@ export function useWorkspaceDirectories(
   );
   return useQueries({
     queries: dirPaths.map((dirPath) => ({
-      queryKey: ["workspace-dir", conversationId, dirPath, location],
+      queryKey:
+        refreshToken === 0
+          ? ["workspace-dir", conversationId, dirPath, location]
+          : ["workspace-dir", conversationId, dirPath, location, refreshToken],
       queryFn: () => fetchWorkspaceDirectory(conversationId!, dirPath, location),
       enabled,
       staleTime: 5_000,
