@@ -8,6 +8,14 @@ CLOSED_LABEL_KEY = "omnigent.closed"
 CLOSED_LABEL_VALUE = "true"
 CLOSED_TITLE_INFIX = ":closed:"
 
+VERBATIM_TITLE_LABEL_KEY = "omnigent.title_verbatim"
+VERBATIM_TITLE_LABEL_VALUE = "true"
+
+
+def is_title_verbatim(labels: Mapping[str, str] | None) -> bool:
+    """Whether a child stores the caller's title without an agent prefix."""
+    return (labels or {}).get(VERBATIM_TITLE_LABEL_KEY) == VERBATIM_TITLE_LABEL_VALUE
+
 
 def title_without_closed_marker(title: str | None) -> str | None:
     """

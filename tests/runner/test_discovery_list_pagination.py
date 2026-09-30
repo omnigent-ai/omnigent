@@ -358,11 +358,19 @@ async def test_sys_agent_list_preserves_small_default_then_pages(tmp_path: Path)
     assert large["page"]["limit"] == len(large["builtins"])
     assert large["page"]["has_more"]["builtins"] is True
 
+    # Every page of the session-bound source widens to sub-agent sessions,
+    # so a continuation can't silently narrow back to top-level rows. The
+    # template agent catalog stays unparameterized.
+    assert session_queries and {query.get("kind") for query in session_queries} == {"any"}
+    assert {query.get("visibility") for query in session_queries} == {"all"}
+    assert agent_queries and {query.get("kind") for query in agent_queries} == {None}
+
 
 @pytest.mark.asyncio
 async def test_sys_session_list_preserves_small_default_then_pages() -> None:
     """A large global view pages without hiding the caller's direct children."""
     state = {"large": False}
+    received_kinds: list[str | None] = []
 
     async def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/v1/sessions/conv_caller/child_sessions":
@@ -382,6 +390,7 @@ async def test_sys_session_list_preserves_small_default_then_pages() -> None:
         if request.url.path == "/v1/sessions/conv_caller":
             return httpx.Response(200, json={"id": "conv_caller", "parent_session_id": None})
         if request.url.path == "/v1/sessions":
+            received_kinds.append(request.url.params.get("kind"))
             return _server_page(request, _session_rows(large=state["large"]))
         raise AssertionError(f"unexpected path {request.url.path}")
 
@@ -439,6 +448,10 @@ async def test_sys_session_list_preserves_small_default_then_pages() -> None:
     assert large["page"]["limit"] == len(large["sessions"])
     assert large["page"]["has_more"] == {"sessions": True}
 
+    # Sub-agent sessions stay in view on every page, including the ones a
+    # size-fitting refetch issues.
+    assert received_kinds and set(received_kinds) == {"any"}
+
 
 @pytest.mark.asyncio
 async def test_sys_session_list_continues_server_catalog_with_cursor() -> None:
@@ -456,6 +469,7 @@ async def test_sys_session_list_continues_server_catalog_with_cursor() -> None:
         for index in range(1_001)
     ]
     received_afters: list[str | None] = []
+    received_kinds: list[str | None] = []
     received_visibilities: list[str | None] = []
 
     async def handler(request: httpx.Request) -> httpx.Response:
@@ -465,6 +479,7 @@ async def test_sys_session_list_continues_server_catalog_with_cursor() -> None:
             return httpx.Response(200, json={"id": "conv_caller", "parent_session_id": None})
         if request.url.path == "/v1/sessions":
             received_afters.append(request.url.params.get("after"))
+            received_kinds.append(request.url.params.get("kind"))
             received_visibilities.append(request.url.params.get("visibility"))
             return _server_page(request, rows)
         raise AssertionError(f"unexpected path {request.url.path}")
@@ -492,6 +507,9 @@ async def test_sys_session_list_continues_server_catalog_with_cursor() -> None:
     assert first["sessions"][0]["session_id"] == "conv_0000"
     assert second["sessions"][0]["session_id"] == "conv_0100"
     assert received_afters == [None, "conv_0099"]
+    # kind is a constant of the view, not a cursor filter: the
+    # continuation page must widen exactly like the first.
+    assert received_kinds == ["any", "any"]
     assert received_visibilities == ["all", "all"]
 
 
