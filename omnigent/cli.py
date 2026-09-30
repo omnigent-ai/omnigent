@@ -6313,7 +6313,8 @@ def _expand_mcp_server_env_vars(  # type: ignore[explicit-any]  # raw is parsed 
         ``{"url": "${MCP_URL}", "headers": {"Authorization": "Bearer ${TOKEN}"}}``.
     :param expand_fn: Callable that expands env var references
         in a string-to-string dict.
-    :returns: ``True`` if any values were expanded.
+    :returns: ``True`` if expansion changed any value; literal-only
+        fields are left untouched so the file can ship unmodified.
     :raises OmnigentError: If a ``${VAR}`` reference cannot be
         resolved from the environment.
     """
@@ -6321,14 +6322,17 @@ def _expand_mcp_server_env_vars(  # type: ignore[explicit-any]  # raw is parsed 
     url = raw.get("url")
     if url is not None:
         expanded_url = expand_fn({"url": str(url)})["url"]
-        if expanded_url != url:
+        if expanded_url != str(url):
             raw["url"] = expanded_url
             changed = True
     for field in ("headers", "env"):
         value = raw.get(field)
         if isinstance(value, dict):
-            raw[field] = expand_fn({str(k): str(v) for k, v in value.items()})
-            changed = True
+            original = {str(k): str(v) for k, v in value.items()}
+            expanded = expand_fn(original)
+            if expanded != original:
+                raw[field] = expanded
+                changed = True
     return changed
 
 
