@@ -125,6 +125,7 @@ map an area, remove it here in the same change.
 - Mobile layout: `tests/e2e_ui/mobile/` (only composer labels and terminal
   touch scroll are mapped)
 - Visual snapshots: `tests/e2e_ui/visual/`
+- Onboarding: `tests/e2e_ui/onboarding/`
 
 **CLI commands:**
 
