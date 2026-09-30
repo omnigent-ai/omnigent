@@ -12,8 +12,8 @@ transport: http
 url: ${PIPESHUB_MCP_URL}
 
 headers:
-  # Mint this from PipesHub: workspace → Developer settings → Personal
-  # Access Tokens → New token. Runs as you, so results respect your own
+  # Mint this from PipesHub: Workspace Settings → Developer Settings →
+  # Personal Access Tokens → New token. Runs as you, so results respect your own
   # per-user permissions (unlike an OAuth app's client-credentials flow).
   Authorization: "Bearer ${PIPESHUB_MCP_TOKEN}"
 

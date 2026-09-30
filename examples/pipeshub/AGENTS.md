@@ -28,4 +28,4 @@ sources — Slack, Drive, Confluence, and whatever else your org has wired in).
 Personal access tokens are long-lived by user choice (30/90/365 days, or
 never), not the 24-hour session token. If PipesHub tools stop working
 mid-project, the most likely cause is a revoked token, not expiry — check
-workspace → Developer settings → Personal Access Tokens.
+Workspace Settings → Developer Settings → Personal Access Tokens.

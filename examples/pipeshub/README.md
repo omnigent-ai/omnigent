@@ -23,8 +23,8 @@ pipeshub/
 ## Prerequisites
 
 - A PipesHub deployment you have access to.
-- A **personal access token**: in PipesHub, go to workspace → Developer
-  settings → Personal Access Tokens → New token. Pick an expiry (30 / 90 /
+- A **personal access token**: in PipesHub, go to Workspace Settings →
+  Developer Settings → Personal Access Tokens → New token. Pick an expiry (30 / 90 /
   365 days, or never) and the default scope set — it's already tuned for MCP
   access. The token panel gives you a ready-to-paste block with both
   environment variables below.
@@ -84,7 +84,7 @@ agent's instructions tell it to say it has no PipesHub access rather than
 answer from its own training data. The reason is in the runner log:
 `omnigent debug logs` shows a `runner mcp connect failed ... server=pipeshub`
 line with the error. A revoked token is the most common cause, so check
-workspace → Developer settings → Personal Access Tokens before assuming the
+Workspace Settings → Developer Settings → Personal Access Tokens before assuming the
 deployment itself is down.
 
 ## Why MCP (not a custom connector)

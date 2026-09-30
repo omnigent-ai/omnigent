@@ -3,8 +3,8 @@
 # PipesHub) through PipesHub's MCP server.
 #
 # Prerequisites:
-#   - A PipesHub deployment with a Personal Access Token: workspace →
-#     Developer settings → Personal Access Tokens → New token.
+#   - A PipesHub deployment with a Personal Access Token: Workspace
+#     Settings → Developer Settings → Personal Access Tokens → New token.
 #   - PIPESHUB_MCP_URL and PIPESHUB_MCP_TOKEN set in the environment (the
 #     token panel gives you a ready-to-paste block with both).
 #
