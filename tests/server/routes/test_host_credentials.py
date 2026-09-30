@@ -8,6 +8,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from omnigent.connections.github import GithubConnectionStore
+from omnigent.db.utils import now_epoch
 from omnigent.host.identity import MANAGED_HOST_TOKEN_HEADER
 from omnigent.server.github_app import GitHubTokenSet
 from omnigent.server.routes.host_credentials import create_host_credentials_router
@@ -92,7 +93,24 @@ def test_returns_github_credential_for_valid_host_token(db_uri: str) -> None:
         "username": "x-access-token",
         "token": "ghu_live",
         "login": "octocat",
+        "expires_at": None,
+        "hosts": ["github.com"],
     }
+
+
+def test_github_credential_carries_token_expiry_and_hosts(db_uri: str) -> None:
+    hs = _FakeHostStore("host1", "launch-tok", "alice@example.com")
+    store = GithubConnectionStore(db_uri, SecretBox("enc-secret"))
+    expires_at = now_epoch() + 3600
+    store.upsert(
+        "alice@example.com",
+        github_login="octocat",
+        github_user_id=42,
+        tokens=GitHubTokenSet("ghu_live", "ghr_x", expires_at, None, "repo"),
+    )
+    tc = _app(hs, github_store=store)
+    body = tc.get("/v1/hosts/host1/credentials/github", headers=_HDR).json()
+    assert (body["expires_at"], body["hosts"]) == (expires_at, ["github.com"])
 
 
 def test_unauthenticated_without_or_with_bad_token(db_uri: str) -> None:

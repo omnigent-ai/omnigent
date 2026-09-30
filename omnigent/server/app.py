@@ -10,7 +10,8 @@ import re
 import tarfile
 import time
 import uuid
-from collections.abc import AsyncIterator, Awaitable, Callable
+import warnings
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from contextlib import asynccontextmanager, suppress
 from functools import partial
 from importlib import import_module
@@ -1293,6 +1294,35 @@ def _ensure_default_polly_agent(
     )
 
 
+def _with_deprecated_github_connection(
+    connections: Mapping[str, tuple[Any, Any]] | None,
+    github_config: Any | None,
+    github_store: Any | None,
+) -> dict[str, tuple[Any, Any]]:
+    """Return *connections* with the deprecated GitHub arguments added as ``"github"``.
+
+    ``create_app(github_config=..., github_store=...)`` is deprecated and will be
+    removed in 0.19.0.
+
+    :raises ValueError: If *connections* also names ``"github"``.
+    """
+    merged = dict(connections or {})
+    if github_config is None and github_store is None:
+        return merged
+    warnings.warn(
+        "create_app(github_config=..., github_store=...) is deprecated and will be "
+        "removed in 0.19.0; pass connections={'github': (config, store)} instead.",
+        DeprecationWarning,
+        stacklevel=3,
+    )
+    if "github" in merged:
+        raise ValueError(
+            "Pass the GitHub connection in connections or as github_config/github_store, not both."
+        )
+    merged["github"] = (github_config, github_store)
+    return merged
+
+
 def create_app(
     agent_store: AgentStore,
     file_store: FileStore,
@@ -1314,8 +1344,9 @@ def create_app(
     admins: list[str] | None = None,
     allowed_domains: list[str] | None = None,
     sandbox_config: ManagedSandboxDeployment | None = None,
-    github_config: Any | None = None,  # GitHubAppConfig — GitHub App integration
-    github_store: Any | None = None,  # GithubConnectionStore — GitHub App integration
+    connections: Mapping[str, tuple[Any, Any]] | None = None,  # git provider connections
+    github_config: Any | None = None,  # @deprecated, remove in 0.19.0: use connections
+    github_store: Any | None = None,  # @deprecated, remove in 0.19.0: use connections
     databricks_config: Any | None = None,  # DatabricksConfig — Databricks Connect
     databricks_store: Any | None = None,  # DatabricksConnectionStore — Databricks Connect
     sharing_mode: SharingMode | Callable[[], SharingMode] | None = None,
@@ -1399,15 +1430,19 @@ def create_app(
         ``host_type="managed"`` create fails with a clear error).
         Managed-host credentials live on the ``hosts`` table, so no
         extra store is wired.
-    :param github_config: Parsed GitHub App configuration
-        (:class:`omnigent.server.github_app.GitHubAppConfig`) enabling
-        the per-user "Connect GitHub" flow. ``None`` disables the
-        integration (the connect UI is hidden and the routes stay
-        unmounted).
-    :param github_store: Persistence for per-user GitHub connections
+    :param connections: Per-user git provider connections as
+        ``{provider_id: (config, store)}``, e.g. ``{"github": (config,
+        store)}``, usually from
+        :func:`omnigent.server.git_providers.connections_from_env`. A
+        provider whose connection facet loads is enabled when both its
+        config and its store are present; otherwise its connect UI is
+        hidden and its routes stay unmounted.
+    :param github_config: Deprecated, removed in 0.19.0: pass
+        ``connections={"github": (config, store)}``. The parsed GitHub App
+        configuration (:class:`omnigent.server.github_app.GitHubAppConfig`).
+    :param github_store: Deprecated, removed in 0.19.0, with
+        ``github_config``. The per-user GitHub connection store
         (:class:`omnigent.connections.github.GithubConnectionStore`).
-        Required alongside ``github_config`` to enable the integration;
-        wired together by ``create_app``'s caller.
     :param sharing_mode: Server policy for creating new session
         permission grants (see :class:`SharingMode`): ``ON`` allows
         grants at any level plus public/workspace read, ``READ_ONLY``
@@ -1457,10 +1492,14 @@ def create_app(
         root deployment.
     :returns: A fully configured :class:`FastAPI` application.
     :raises ValueError: If ``permission_store`` is provided
-        without an ``auth_provider``.
+        without an ``auth_provider``, or if ``connections`` names
+        ``"github"`` and the deprecated GitHub arguments are also set.
     """
     if permission_store is not None and auth_provider is None:
         raise ValueError("auth_provider is required when permission_store is provided")
+    resolved_connections = _with_deprecated_github_connection(
+        connections, github_config, github_store
+    )
 
     # Public base path for serving behind a subpath reverse proxy (issue
     # #1031). Falls back to OMNIGENT_WEB_BASE_PATH so Docker/PaaS entrypoints
@@ -1840,21 +1879,17 @@ def create_app(
     # a full-page redirect (not covered by BasePathMiddleware's inbound-only
     # strip) can prefix it themselves. "" for a root deployment.
     app.state.base_path = resolved_base_path
-    # GitHub App integration: enabled only when both the config and the
-    # connection store are wired. The client is stateless (holds config),
-    # built once and reused for the connect flow.
-    # Per-user connection providers (GitHub, ...). One registry entry per
-    # provider (connections_registry) drives uniform wiring: each gets
-    # ``app.state.<name>_{config,store,client}``, populated only when both its
-    # config and its store are present, else None. The info endpoint's
-    # enabled_connections list and the router mounting below both read these.
+    # Per-user connection providers (git provider facets, then Databricks) each get
+    # ``app.state.<name>_{config,store,client}``, set only when both config and store
+    # are present. enabled_connections and the router mounting below read these.
     from omnigent.server.connections_registry import connection_providers
 
+    _connection_providers = connection_providers()
     _connection_inputs = {
-        "github": (github_config, github_store),
+        **resolved_connections,
         "databricks": (databricks_config, databricks_store),
     }
-    for _provider in connection_providers():
+    for _provider in _connection_providers:
         _cfg, _store = _connection_inputs.get(_provider.name, (None, None))
         _on = _cfg is not None and _store is not None
         setattr(app.state, f"{_provider.name}_config", _cfg if _on else None)
@@ -2897,10 +2932,10 @@ def create_app(
         # one panel per provider. A provider appears only when both its config
         # and its connection store are present.
         enabled_connections = [
-            provider
-            for provider in ("github", "databricks")
-            if getattr(app.state, f"{provider}_config", None) is not None
-            and getattr(app.state, f"{provider}_store", None) is not None
+            provider.name
+            for provider in _connection_providers
+            if getattr(app.state, f"{provider.name}_config", None) is not None
+            and getattr(app.state, f"{provider.name}_store", None) is not None
         ]
         # sharing_mode is the server's session-sharing policy
         # (on/read_only/off), surfaced so the web app can hide the Share
@@ -3776,7 +3811,7 @@ def create_app(
     # callback / status / disconnect. One registry entry per provider; each is
     # mounted only when configured (config + store present), so an unconfigured
     # provider's surface stays absent exactly like a build without the feature.
-    for _provider in connection_providers():
+    for _provider in _connection_providers:
         _cfg = getattr(app.state, f"{_provider.name}_config", None)
         _store = getattr(app.state, f"{_provider.name}_store", None)
         if _cfg is None or _store is None:

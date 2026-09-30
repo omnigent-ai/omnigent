@@ -447,27 +447,12 @@ def build_app(resolved_config: _ResolvedConfig | None = None) -> _BuiltApp:
 
         account_store = SqlAlchemyAccountStore(database_url)
 
-    # GitHub App: same env-driven wiring as `omnigent server`
-    # (omnigent/cli.py). Without these kwargs the Docker image silently
-    # leaves Connect GitHub disabled even when the OMNIGENT_GITHUB_APP_*
-    # env vars are set.
-    from omnigent.server.github_app import GitHubAppConfig
+    # Git provider connections (Connect GitHub, ...): same env-driven wiring as
+    # `omnigent server` (omnigent/cli.py), so the image enables them from the same
+    # env vars, e.g. OMNIGENT_GITHUB_APP_*.
+    from omnigent.server.git_providers import connections_from_env
 
-    github_config = GitHubAppConfig.from_env()
-    github_store = None
-    if github_config is not None:
-        from omnigent.stores.credential_store import build_secret_cipher
-
-        cipher = build_secret_cipher()
-        if cipher is None:
-            logger.error(
-                "GitHub App is configured but disabled: set OMNIGENT_CREDENTIAL_ENC_KEY "
-                "(the credential store's encryption key) to enable it."
-            )
-        else:
-            from omnigent.connections.github import GithubConnectionStore
-
-            github_store = GithubConnectionStore(database_url, cipher)
+    connections = connections_from_env(database_url)
 
     from omnigent.server.databricks_app import DatabricksConfig
 
@@ -508,12 +493,12 @@ def build_app(resolved_config: _ResolvedConfig | None = None) -> _BuiltApp:
         allowed_domains=config_str_list(cfg.get("allowed_domains")),
         sandbox_config=sandbox_config,
         server_config=cfg,
-        github_config=github_config,
-        github_store=github_store,
+        connections=connections,
         databricks_config=databricks_config,
         databricks_store=databricks_store,
     )
 
+    github_config, github_store = connections.get("github", (None, None))
     log_capabilities(sandbox_config, github_config, github_store)
 
     return _BuiltApp(app=app, host=resolved_config.host, port=resolved_config.port)

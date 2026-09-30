@@ -7,6 +7,8 @@ the httpx sink there) mirrors the module split in the source.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import jwt
 import pytest
 from cryptography.hazmat.primitives.asymmetric import rsa
@@ -16,6 +18,7 @@ from cryptography.hazmat.primitives.serialization import (
     PrivateFormat,
 )
 
+from omnigent.server.git_providers import connections_from_env
 from omnigent.server.github_app import (
     GitHubAppConfig,
     GitHubAppError,
@@ -46,6 +49,21 @@ def _clear_env(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_from_env_disabled_without_client(monkeypatch: pytest.MonkeyPatch) -> None:
     _clear_env(monkeypatch)
     assert GitHubAppConfig.from_env() is None
+
+
+def test_unreadable_private_key_path_stops_server_startup(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # The server's connection wiring surfaces the error instead of disabling GitHub.
+    _clear_env(monkeypatch)
+    monkeypatch.delenv("OMNIGENT_GIT_PROVIDER_MODULES", raising=False)
+    monkeypatch.setenv("OMNIGENT_GITHUB_APP_CLIENT_ID", "Iv1abc")
+    monkeypatch.setenv("OMNIGENT_GITHUB_APP_CLIENT_SECRET", "shh")
+    monkeypatch.setenv("OMNIGENT_GITHUB_APP_REDIRECT_URI", "https://x/cb")
+    monkeypatch.setenv("OMNIGENT_GITHUB_APP_PRIVATE_KEY_PATH", str(tmp_path / "missing.pem"))
+
+    with pytest.raises(RuntimeError, match="OMNIGENT_GITHUB_APP_PRIVATE_KEY_PATH"):
+        connections_from_env("sqlite://", cipher_factory=lambda: None)
 
 
 def test_from_env_disabled_without_redirect(monkeypatch: pytest.MonkeyPatch) -> None:
