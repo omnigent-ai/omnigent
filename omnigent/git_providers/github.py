@@ -116,6 +116,7 @@ class GitHubProvider:
     default_hosts = ("github.com",)
     facets = FacetModules(
         pull_requests="omnigent.runner.git_providers.github",
+        policy="omnigent.policies.builtins.github",
     )
 
     def matches_host(self, host: str, instances: Instances) -> bool:

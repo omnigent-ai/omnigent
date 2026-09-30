@@ -351,6 +351,24 @@ def test_explicit_instances_replace_the_environment() -> None:
     assert configured is not None and configured.provider == "claimer"
 
 
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://evil.example\\@git.example.test/o/r.git",
+        "https://git.example.test/o\\r.git",
+        "git@git.example.test:o\\r.git",
+        "https://evil.example\\@github.com/o/r.git",
+        "https://evil.example\\@dev.azure.com/o/p/_git/r",
+    ],
+)
+def test_a_remote_url_with_a_backslash_resolves_to_nothing(url: str) -> None:
+    # urlsplit and git can read the host of such a URL differently.
+    register_provider(FakeProvider("agnostic", any_host=True))
+
+    assert resolve_remote(url) is None
+    assert resolve_remote(url.replace("\\", "")) is not None
+
+
 def test_pull_request_ref_uses_a_registered_gitlab_descriptor() -> None:
     with pytest.raises(ValueError):
         PullRequestRef.from_url(GITLAB_MR)

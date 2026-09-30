@@ -162,6 +162,23 @@ def test_other_remotes_are_not_azure_devops(url: str) -> None:
     assert resolved is None or resolved.provider != "azure_devops"
 
 
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://evil.example\\@dev.azure.com/o/p/_git/r",
+        "https://dev.azure.com/o\\p/_git/r",
+        "https://dev.azure.com/o/p/_git/r\\x",
+        "ssh://git@ssh.dev.azure.com/v3/o\\x/p/r",
+        "git@ssh.dev.azure.com:v3/o/p\\x/r",
+    ],
+)
+def test_a_remote_with_a_backslash_is_not_azure_devops(url: str) -> None:
+    # urlsplit and git can read the host of such a URL differently.
+    assert parse_azure_devops_remote(url) is None
+    assert PROVIDER.parse_remote_url(url, EnvInstances()) is None
+    assert parse_azure_devops_remote(url.replace("\\", "")) is not None
+
+
 def test_github_remotes_still_resolve_to_github() -> None:
     assert resolve_remote("https://github.com/o/r.git") == GITHUB_REMOTE
     assert resolve_remote("git@github.com:o/r.git") == GITHUB_REMOTE

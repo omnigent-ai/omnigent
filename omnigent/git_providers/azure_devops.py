@@ -109,9 +109,12 @@ def parse_azure_devops_remote(url: str) -> AzureRepo | None:
     :param url: e.g. ``"https://dev.azure.com/org/project/_git/repo"``,
         ``"ssh://git@ssh.dev.azure.com/v3/org/project/repo"``, or
         ``"git@ssh.dev.azure.com:v3/org/project/repo"``. The ``.git`` suffix is optional.
-    :returns: The repository, or ``None`` when *url* is not an Azure DevOps remote.
+    :returns: The repository, or ``None`` when *url* is not an Azure DevOps remote or has a
+        backslash, which ``urlsplit`` and git can read as different hosts.
     """
     candidate = url.strip()
+    if "\\" in candidate:
+        return None
     scp = _SCP_REMOTE.match(candidate)
     if scp is not None:
         if scp["host"].lower() not in _SSH_HOSTS:

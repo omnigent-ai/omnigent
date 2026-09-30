@@ -332,11 +332,15 @@ def resolve_remote(url: str, instances: Instances | None = None) -> ParsedRemote
     """Resolve a git remote URL with the first provider that parses it.
 
     A descriptor that raises is logged and skipped, so the other providers still resolve.
+    A URL with a backslash resolves to nothing: ``urlsplit`` and git can read its host
+    differently, so a provider's parse might not match the host git contacts.
 
     :param url: A git remote URL, e.g. ``"git@github.com:o/r.git"``.
     :param instances: Configured provider hosts; defaults to :class:`EnvInstances`.
     :returns: The parsed remote, or ``None`` when no provider recognizes it.
     """
+    if "\\" in url:
+        return None
     instances = EnvInstances() if instances is None else instances
     for descriptor in _candidates(url, instances):
         parsed = _parse_remote(descriptor, url, instances)
