@@ -215,22 +215,25 @@ describe("bulk-action bar layout", () => {
     // Enter selection mode WITHOUT selecting anything yet.
     fireEvent.click(screen.getByRole("button", { name: "Select sessions" }));
 
-    // Both actions are present up front (not conditionally hidden) but
+    // All three actions are present up front (not conditionally hidden) but
     // disabled while nothing is selected.
     const archiveBtn = screen.getByTestId("bulk-archive");
     const deleteBtn = screen.getByTestId("bulk-delete");
+    const moveBtn = screen.getByTestId("bulk-move-to-project");
     expect(archiveBtn).toBeDisabled();
     expect(deleteBtn).toBeDisabled();
+    expect(moveBtn).toBeDisabled();
     expect(screen.getByText("0 selected")).toBeInTheDocument();
 
-    // Selecting a row enables both.
+    // Selecting a row enables all three actions.
     fireEvent.click(screen.getByRole("link", { name: /My Session/ }));
     expect(archiveBtn).toBeEnabled();
     expect(deleteBtn).toBeEnabled();
+    expect(moveBtn).toBeEnabled();
     expect(screen.getByText("1 selected")).toBeInTheDocument();
   });
 
-  it("renders the row checkbox to the LEFT of the session title", () => {
+  it("renders the row checkbox to the LEFT of the title and removes it on exit", () => {
     renderSidebar();
     fireEvent.click(screen.getByRole("button", { name: "Select sessions" }));
 
@@ -241,5 +244,14 @@ describe("bulk-action bar layout", () => {
     const marker = li.querySelector("svg.lucide-square")?.parentElement as HTMLElement;
     expect(marker.className).toMatch(/\bleft-2\b/);
     expect(marker.className).not.toMatch(/\bright-/);
+
+    fireEvent.click(row);
+    expect(screen.getByText("1 selected")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Exit selection mode" }));
+
+    expect(screen.getByRole("button", { name: "Select sessions" })).toBeInTheDocument();
+    expect(li.querySelector("svg.lucide-square")).toBeNull();
+    expect(li.querySelector("svg.lucide-square-check")).toBeNull();
+    expect(screen.queryByText(/\d+ selected/)).toBeNull();
   });
 });

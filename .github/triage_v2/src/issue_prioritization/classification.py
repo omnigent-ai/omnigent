@@ -235,7 +235,7 @@ Return one complete JSON object without surrounding prose or trailing commas."""
         duplicate_candidates=(
             json.dumps(duplicate_candidates, ensure_ascii=False, indent=2)
             if duplicate_candidates
-            else "None. This is a reclassification; return duplicate_decision=none."
+            else "None. No related issue candidates are available; return duplicate_decision=none."
         ),
     )
 
@@ -319,12 +319,18 @@ def _confidence(value: object) -> float:
 
 
 def _classification_labels(labels: tuple[str, ...]) -> tuple[str, ...]:
+    # Labels the content hash keys on, so a change re-classifies. Excludes labels
+    # the triage/validation bots churn: priority, type, severity, comp, needs-info,
+    # and the repro-agent's validating/validated:* — a repro landing edits the body
+    # (which does re-grade), so its label flip alone shouldn't force a re-grade.
     return tuple(
         label
         for label in labels
         if label not in _PRIORITY_LABELS
         and label.casefold() not in _TYPE_LABELS
         and label.casefold() != "needs-info"
+        and label.casefold() != "validating"
         and not label.startswith("severity:")
         and not label.startswith("comp:")
+        and not label.startswith("validated:")
     )

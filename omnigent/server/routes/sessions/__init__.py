@@ -249,6 +249,7 @@ from omnigent.server.routes._sessions.common import (
     _EXTERNAL_TOOL_OUTPUT_DELTA_TYPE as _EXTERNAL_TOOL_OUTPUT_DELTA_TYPE,
     _FENCE_EXEMPT_EVENT_TYPES as _FENCE_EXEMPT_EVENT_TYPES,
     _FORK_HISTORY_NATIVE_HARNESSES as _FORK_HISTORY_NATIVE_HARNESSES,
+    _ARCHIVE_STOP_UNDO_GRACE_S as _ARCHIVE_STOP_UNDO_GRACE_S,
     _HARNESS_ELICITATION_REPARK_GRACE_S as _HARNESS_ELICITATION_REPARK_GRACE_S,
     _HARNESS_PRE_RESOLVED_ELICITATION_MAX_ENTRIES as _HARNESS_PRE_RESOLVED_ELICITATION_MAX_ENTRIES,
     _HARNESS_PRE_RESOLVED_ELICITATION_TTL_S as _HARNESS_PRE_RESOLVED_ELICITATION_TTL_S,
@@ -609,6 +610,7 @@ from omnigent.server.routes._sessions.orchestration import (
     _context_labels_from_turn_usage as _context_labels_from_turn_usage,
     _bind_and_launch_managed_runner as _bind_and_launch_managed_runner,
     _build_native_terminal_message_event as _build_native_terminal_message_event,
+    _cancel_pending_archive_stop as _cancel_pending_archive_stop,
     _build_session_list_item as _build_session_list_item,
     _build_session_response as _build_session_response,
     _child_session_summaries_from_conversations as _child_session_summaries_from_conversations,
@@ -650,7 +652,9 @@ from omnigent.server.routes._sessions.orchestration import (
     _recover_subagent_status_forward_via_parent as _recover_subagent_status_forward_via_parent,
     _register_policy_elicitation as _register_policy_elicitation,
     _relay_runner_stream as _relay_runner_stream,
+    _relinquish_session_live_state as _relinquish_session_live_state,
     _resolve_elicitation as _resolve_elicitation,
+    _runner_live_on_another_replica_from_conversations as _runner_live_on_another_replica_from_conversations,
     _run_managed_launch as _run_managed_launch,
     _run_managed_wake as _run_managed_wake,
     _runner_reject_detail as _runner_reject_detail,
@@ -804,6 +808,7 @@ def create_sessions_router(
     host_registry: HostRegistry | None = None,
     project_store: ProjectStore | None = None,
     background_title_coordinator: BackgroundSessionTitleCoordinator | None = None,
+    register_runner_ingest: Callable[..., None] | None = None,
 ) -> APIRouter:
     """
     Factory that builds the sessions router.
@@ -966,6 +971,7 @@ def create_sessions_router(
         host_registry=host_registry,
         background_title_coordinator=background_title_coordinator,
         runner_tunnel_tokens=runner_tunnel_tokens,
+        register_runner_ingest=register_runner_ingest,
     )
 
     register_permissions_routes(

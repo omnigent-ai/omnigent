@@ -194,6 +194,9 @@ afterEach(() => {
 describe("GithubPanel", () => {
   it("shows the PR title in the header and CI check pills on the Summary tab", async () => {
     renderPanel();
+    const heading = screen.getByRole("heading", { name: "GitHub" });
+    expect(heading).toHaveClass("font-medium", "text-ui");
+    expect(heading.parentElement).toHaveClass("h-11");
     // Title + number live in the shared header (both tabs).
     expect(await screen.findByText("chore: dummy PR")).toBeInTheDocument();
     expect(screen.getByText("#6000")).toBeInTheDocument();

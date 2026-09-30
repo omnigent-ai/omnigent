@@ -1,5 +1,14 @@
 import { useLoadedConversations } from "@/hooks/useSidebarData";
-import { type CSSProperties, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  type CSSProperties,
+  lazy,
+  Suspense,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { Outlet, useParams, useSearchParams } from "@/lib/routing";
 import { PROJECT_LABEL_KEY, type Conversation, useProjects } from "@/hooks/useConversations";
@@ -27,6 +36,7 @@ import {
   updateBridge,
 } from "@/lib/nativeBridge";
 import { onBrowserActionRequest } from "@/lib/browserActionBus";
+import { onInAppLinkOpen } from "@/lib/openLinkInApp";
 import {
   buildDesignModePrompt,
   dataUrlToFile,
@@ -113,6 +123,7 @@ import {
 import { TerminalsPanel } from "./TerminalsPanel";
 import { PermissionsModal } from "@/components/PermissionsModal";
 import { KeyboardShortcutsDialog } from "@/components/KeyboardShortcutsDialog";
+import { ImportReviewGate } from "@/components/onboarding/HostImportReview";
 import { CommandPalette } from "./CommandPalette";
 import { Toaster } from "@/components/ui/sonner";
 import { CloseShellDialog } from "./CloseShellDialog";
@@ -123,6 +134,11 @@ import { resolveDefaultShell } from "./preferredShell";
 import { WorkspacePanel } from "./WorkspacePanel";
 import { SessionRail } from "./SessionRail";
 import type { RightRailTab } from "./railTabs";
+
+// Dev-only preview; lazy so the sample data never ships in production bundles.
+const ImportContextPreview = import.meta.env.DEV
+  ? lazy(() => import("@/components/onboarding/ImportContextPreview"))
+  : null;
 
 /**
  * Top-level layout. The sidebar and right panels are responsive:
@@ -784,13 +800,16 @@ export function AppShell() {
   useEffect(() => {
     if (rootSessionResolved) stickyRootRef.current = rootSessionId;
   }, [rootSessionId, rootSessionResolved]);
-  const { panelWidth: inlinePanelWidth, handleProps: inlinePanelHandleProps } =
-    useResizableInlinePanel(
-      rootSessionId,
-      inlinePanelMinWidth,
-      sidebarOpen ? sidebarWidth : 0,
-      rootSessionResolved,
-    );
+  const {
+    panelWidth: inlinePanelWidth,
+    handleProps: inlinePanelHandleProps,
+    isDragging: inlinePanelResizing,
+  } = useResizableInlinePanel(
+    rootSessionId,
+    inlinePanelMinWidth,
+    sidebarOpen ? sidebarWidth : 0,
+    rootSessionResolved,
+  );
   // How many children are actively working — surfaced in the tab badge so
   // "something's happening" is visible without opening the panel.
   const subagentsWorking = childSessions.filter((c) => c.busy).length;
@@ -865,21 +884,6 @@ export function AppShell() {
   useEffect(() => {
     resyncBrowserSuppression();
   }, []);
-
-  // Auto-surface the Browser tab on a `navigate` action, so a browser_navigate
-  // fired while another tab is selected doesn't load into a hidden pane.
-  // Browser-capable shells only; no-op elsewhere (the bus never fires without a relay).
-  useEffect(() => {
-    if (!supportsBrowser()) return;
-    return onBrowserActionRequest((evt, sourceConversationId) => {
-      if (evt.action !== "navigate" || !sourceConversationId) return;
-      writeSessionWorkspaceState(sourceConversationId, { selectedBrowserId: null });
-      if (sourceConversationId === conversationId) {
-        setRightRailTab("browser");
-        setRightPanelOpen(true);
-      }
-    });
-  }, [conversationId]);
 
   // Design-mode submit routing. Lives here (with the hoisted relay) because the
   // in-page popup posts back via preload IPC delivered to the always-mounted
@@ -1600,6 +1604,30 @@ export function AppShell() {
     [selectedFilePath, selectedTerminalKey, clearFileViewerUrl],
   );
 
+  // Auto-surface the Browser tab on a `navigate` action — agent-issued
+  // (browser_navigate) or a chat link the user routed in-app — so the load
+  // never lands in a hidden pane, even behind an open file or shell tab.
+  // Browser-capable shells only (neither source fires without the bridge).
+  useEffect(() => {
+    if (!supportsBrowser()) return;
+    const surfaceBrowserTab = (sourceConversationId: string) => {
+      writeSessionWorkspaceState(sourceConversationId, { selectedBrowserId: null });
+      if (sourceConversationId === conversationId) {
+        handleRightRailTabChange("browser");
+        setRightPanelOpen(true);
+      }
+    };
+    const unsubscribeLink = onInAppLinkOpen(surfaceBrowserTab);
+    const unsubscribeAction = onBrowserActionRequest((evt, sourceConversationId) => {
+      if (evt.action !== "navigate" || !sourceConversationId) return;
+      surfaceBrowserTab(sourceConversationId);
+    });
+    return () => {
+      unsubscribeLink();
+      unsubscribeAction();
+    };
+  }, [conversationId, handleRightRailTabChange]);
+
   // A side chat the user just opened must be visible: reveal the Workspace rail
   // so its soft tab shows. WorkspacePanel owns opening/selecting the tab and
   // clearing the one-shot `sideChatToOpen` signal (it holds the side-chat tab
@@ -1836,6 +1864,7 @@ export function AppShell() {
       conversationId,
       workspaceRoot,
       workspaceHome,
+      sessionHostId: activeSession?.hostId ?? null,
     }),
     [
       openFileViewer,
@@ -1845,6 +1874,7 @@ export function AppShell() {
       conversationId,
       workspaceRoot,
       workspaceHome,
+      activeSession?.hostId,
     ],
   );
 
@@ -2121,6 +2151,7 @@ export function AppShell() {
             renders inline in main (via MainTerminalView) and the
             workspace card stays visible alongside. */}
               <div
+                data-workspace-panel-resizing={inlinePanelResizing || undefined}
                 className={cn(
                   "relative flex min-h-0 min-w-0 flex-1",
                   panelOpen && !terminalFirst && "md:hidden",
@@ -2156,6 +2187,7 @@ export function AppShell() {
                     isChildSession={isChildSession}
                     subAgentName={activeSession?.subAgentName ?? null}
                     conversationId={conversationId}
+                    permissionLevel={permissionLevel}
                     actionConversation={actionConversation}
                     conversationTitle={headerConversationTitle}
                     projectName={headerProjectName}
@@ -2239,12 +2271,14 @@ export function AppShell() {
               rectangle (e.g. a no-filesystem agent with no terminals).
               Sits inside the group so the header overlay spans it; the
               push panels below sit outside the group. */}
-                {conversationId && workspacePanelVisible && (
+                {conversationId && hasRailContent && (
                   <WorkspacePanel
                     conversationId={conversationId}
                     pending={pendingConversation}
                     width={inlinePanelWidth}
-                    inert={inlinePanelWidth === 0}
+                    inert={!workspacePanelVisible || inlinePanelWidth === 0}
+                    open={workspacePanelVisible}
+                    resizing={inlinePanelResizing}
                     handleProps={inlinePanelHandleProps}
                     rightRailTab={rightRailTab}
                     onRightRailTabChange={handleRightRailTabChange}
@@ -2430,13 +2464,25 @@ export function AppShell() {
                     Tools and policies configured for the active agent.
                   </DialogDescription>
                 </DialogHeader>
-                <AgentInfoContent agent={boundAgent} sessionId={conversationId} />
+                <AgentInfoContent
+                  agent={boundAgent}
+                  sessionId={conversationId}
+                  permissionLevel={permissionLevel}
+                />
               </DialogContent>
             </Dialog>
           )}
           {/* Keyboard-shortcuts reference. Self-contained (owns its open state +
               ⌘/Ctrl+/ opener); ungated so it works on every route. */}
           <KeyboardShortcutsDialog />
+          {/* Opens the import modal once per newly connected host. */}
+          {!isEmbedded && <ImportReviewGate />}
+          {/* Dev-only `?import-preview` for the post-setup import modal. */}
+          {ImportContextPreview && (
+            <Suspense fallback={null}>
+              <ImportContextPreview />
+            </Suspense>
+          )}
           {/* Global command palette (⌘K). Ungated so it works on every route
               and in embedded mode — the sidebar's "Search" button opens it
               there even though the ⌘K hotkey is disabled (it belongs to the

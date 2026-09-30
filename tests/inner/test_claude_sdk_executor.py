@@ -81,6 +81,38 @@ class TestPromptExtraction(unittest.TestCase):
         # Prior turns are SDK-cached on resume — not replayed.
         self.assertNotIn("First question", prompt)
 
+    def test_resumed_session_compact_is_a_separate_prompt(self):
+        executor = self._make_executor()
+        for compact_content in (
+            "/compact",
+            [{"type": "text", "text": "/compact"}],
+            [{"type": "input_text", "text": "/compact"}],
+        ):
+            with self.subTest(content=compact_content):
+                # The runner dispatches pending input before the compact control.
+                messages = [
+                    {"role": "user", "content": "previous input"},
+                    {"role": "user", "content": compact_content},
+                ]
+                compact_prompt = executor._build_prompt(messages, resume_session=True)
+                self.assertEqual(compact_prompt, "/compact")
+                messages.extend(
+                    [
+                        {"role": "user", "content": "next input"},
+                        {"role": "user", "content": "another queued input"},
+                    ]
+                )
+                self.assertEqual(
+                    executor._build_prompt(messages, resume_session=True),
+                    "next input\n\nanother queued input",
+                )
+
+    def test_resumed_session_rejects_non_object_content_blocks(self):
+        with self.assertRaisesRegex(ValueError, "Anthropic content blocks must be objects"):
+            self._make_executor()._build_prompt(
+                [{"role": "user", "content": ["/compact"]}], resume_session=True
+            )
+
     def test_resumed_session_trailing_run_stops_at_assistant(self):
         """Only the trailing run of user messages (after the last non-user) is sent."""
         executor = self._make_executor()

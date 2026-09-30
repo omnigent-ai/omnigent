@@ -43,9 +43,8 @@ import socket
 import subprocess
 import sys
 import tarfile
-import textwrap
 import time
-from collections.abc import Callable, Generator, Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -53,15 +52,11 @@ from typing import Any
 import filelock
 import httpx
 import pytest
-from packaging.version import InvalidVersion, Version
 from playwright.sync_api import APIResponse, Error, Locator, Page, Route, expect
 
 from tests._helpers.compat import (
-    COMPAT_SERVER_VERSION_ENV,
     apply_server_env,
     compat_server_cwd,
-    meets_min_server_version,
-    resolve_server_version,
     server_executable,
 )
 from tests.codex_parity.helpers import ev_assistant_message, ev_completed, ev_response_created
@@ -70,11 +65,33 @@ from tests.codex_parity.sidecar_harness import (
     build_sidecar_bin,
     start_codex_responses_sidecar,
 )
-from tests.e2e_ui import timings
-from tests.e2e_ui.url_safety import DEV_PORTS, unsafe_ui_base_url_reason
+from tests.helpers import ui_timings as timings
+from tests.helpers.ui_configuration import (
+    _ALLOW_DEV_BASE_URL_ENV,
+    ServerState,
+    prepared_repro_environment,
+)
+from tests.helpers.ui_configuration import (
+    _CLAUDE_MOCK_MODEL as _CLAUDE_MOCK_MODEL,
+)
+from tests.helpers.ui_configuration import (
+    _CODEX_MOCK_MODEL as _CODEX_MOCK_MODEL,
+)
+from tests.helpers.ui_configuration import (
+    pytest_configure as pytest_configure,
+)
+from tests.helpers.ui_configuration import (
+    temp_omnigent_mock_config as _temp_omnigent_mock_config,
+)
+from tests.helpers.ui_server_compat import (
+    _enforce_min_server_version as _enforce_min_server_version,
+)
+from tests.helpers.ui_server_compat import (
+    server_version as server_version,
+)
+from tests.helpers.ui_url_safety import DEV_PORTS
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
-_ALLOW_DEV_BASE_URL_ENV = "OMNIGENT_E2E_ALLOW_DEV_BASE_URL"
 _CODEX_GOAL_MIN_VERSION = (0, 139, 0)
 _PUBLIC_LOOPBACK_HOST = "omnigent-e2e-public.test"
 
@@ -169,39 +186,8 @@ def switch_markdown_view_mode(page: Page, file_viewer: Locator, mode: str) -> No
     page.get_by_role("menuitem", name=mode, exact=True).click()
 
 
-# Populated by ``live_server`` so test-scoped fixtures can access the
-# server PID and runner id without changing ``live_server``'s return
-# type (which other tests depend on).
-class _ServerState(dict[str, object]):
-    def __missing__(self, key: str) -> object:
-        if self.get("workflow_owned") and key in {
-            "pid",
-            "runner_pid",
-            "database_uri",
-            "restart_server",
-            "binding_token",
-        }:
-            raise RuntimeError(
-                f"Workflow-owned reproduction does not expose {key!r} to test fixtures. "
-                "Use the product HTTP API, or run this process/database test in a "
-                "separate fixture-owned environment outside dev.repro_env exec."
-            )
-        raise KeyError(key)
-
-
-_server_state: dict[str, object] = _ServerState()
-
-
-def _prepared_repro_environment() -> dict[str, str]:
-    keys = ("OMNIGENT_REPRO_SERVER_URL", "OMNIGENT_REPRO_MODEL_URL", "OMNIGENT_REPRO_RUNNER_ID")
-    values = {key: os.environ.get(key, "") for key in keys}
-    if any(values.values()) and not all(values.values()):
-        missing = ", ".join(key for key, value in values.items() if not value)
-        raise RuntimeError(
-            f"Incomplete prepared reproduction environment: missing {missing}. "
-            "Launch tests via python -m dev.repro_env exec -- ..."
-        )
-    return values
+# Populated by live_server for fixtures that need the server PID or runner ID.
+_server_state: dict[str, object] = ServerState()
 
 
 _WEB_DIR = _REPO_ROOT / "web"
@@ -361,52 +347,6 @@ def pytest_addoption(parser: pytest.Parser) -> None:
     )
 
 
-def pytest_configure(config: pytest.Config) -> None:
-    """Fail fast on unsafe e2e-ui harness options.
-
-    :param config: Pytest config with repo and pytest-playwright options.
-    """
-    timings.pytest_configure(config)
-    base_url = config.getoption("--ui-base-url")
-    if base_url:
-        _validate_ui_base_url(base_url)
-
-    if os.environ.get("CI") and config.getoption("--headed", default=False):
-        raise pytest.UsageError(
-            "tests/e2e_ui must run headless in CI. Remove --headed; headed "
-            "browser windows are only allowed for local debugging."
-        )
-
-
-@pytest.fixture(scope="session")
-def server_version(live_server: str) -> str:
-    """Read the live version once and cross-check any pinned compat server."""
-    return resolve_server_version(live_server)
-
-
-@pytest.fixture(autouse=True)
-def _enforce_min_server_version(request: pytest.FixtureRequest) -> None:
-    """Skip unsupported features without hiding a shadowed compat server."""
-    marker = request.node.get_closest_marker("min_server_version")
-    if marker is None and not os.environ.get(COMPAT_SERVER_VERSION_ENV):
-        return
-
-    required = None
-    if marker is not None:
-        if len(marker.args) != 1 or marker.kwargs or not isinstance(marker.args[0], str):
-            raise pytest.UsageError("min_server_version marker requires one version string")
-        required = marker.args[0]
-        try:
-            Version(required)
-        except InvalidVersion as exc:
-            raise pytest.UsageError(f"invalid min_server_version marker: {required!r}") from exc
-
-    # Resolve even unmarked compat tests so a worktree-shadowed server fails.
-    server_ver = request.getfixturevalue("server_version")
-    if required is not None and not meets_min_server_version(server_ver, required):
-        pytest.skip(f"requires server >= {required}; running {server_ver}")
-
-
 @pytest.fixture(scope="session")
 def browser_type_launch_args(
     browser_type_launch_args: dict[str, Any],
@@ -454,21 +394,6 @@ def browser_context_args(
     makes that contract explicit and prevents accidental mutable option reuse.
     """
     return {**browser_context_args}
-
-
-def _validate_ui_base_url(base_url: str) -> None:
-    reason = unsafe_ui_base_url_reason(base_url)
-    if reason is None or os.environ.get(_ALLOW_DEV_BASE_URL_ENV) == "1":
-        return
-    dev_ports = ", ".join(str(port) for port in sorted(DEV_PORTS))
-    raise pytest.UsageError(
-        f"Refusing --ui-base-url={base_url!r}: {reason}. Reusing a dev or "
-        "production-like server is unsafe because e2e UI tests share that "
-        "server's database, artifacts, and runner state. Omit --ui-base-url "
-        "to let the fixture spawn an isolated server on a random port. If "
-        "you intentionally want to reuse this server for local debugging, "
-        f"set {_ALLOW_DEV_BASE_URL_ENV}=1. Refused dev ports: {dev_ports}."
-    )
 
 
 @pytest.hookimpl(trylast=True)
@@ -598,7 +523,7 @@ def mock_llm_server_url(
     :param tmp_path_factory: Pytest temp path factory for logs.
     :returns: The mock server base URL, e.g. ``"http://127.0.0.1:51235"``.
     """
-    if url := _prepared_repro_environment()["OMNIGENT_REPRO_MODEL_URL"]:
+    if url := prepared_repro_environment()["OMNIGENT_REPRO_MODEL_URL"]:
         yield url
         return
     mock_port = _find_free_port()
@@ -652,8 +577,9 @@ def configure_mock_llm(
     mock_url: str,
     responses: list[dict[str, Any]],
     *,
-    key: str = "default",
+    key: str | None = None,
     match: str | None = None,
+    required_tools: list[str] | None = None,
 ) -> None:
     """Configure a keyed response queue on the mock LLM server.
 
@@ -671,12 +597,22 @@ def configure_mock_llm(
         completion event — a mid-stream fault for exercising the SPA's
         stream error/recovery UI).
     :param key: Queue key — typically the model name baked into the
-        agent spec. Defaults to ``"default"`` (matches any model
-        not assigned to a more specific queue).
+        agent spec. Omitting it allocates an independent content queue when
+        ``match`` is supplied, otherwise uses ``"default"``. Explicit keys replace
+        existing queues. The helper in ``tests/e2e/conftest.py`` instead uses
+        the match token as its explicit key and has no ``required_tools`` parameter.
     :param match: Optional substring to match against the user text for
         content-based routing (in addition to model-name routing).
+    :param required_tools: Only consume responses when these tools are advertised.
+        Use this to exclude title-generation requests containing the same nonce.
+        When omitted, the next scripted tool call requires a request with any
+        tools. Pass an empty list to allow calls even on requests without tools.
     """
-    body: dict[str, Any] = {"key": key, "responses": responses}
+    body: dict[str, Any] = {"responses": responses}
+    if key is not None:
+        body["key"] = key
+    if required_tools is not None:
+        body["required_tools"] = required_tools
     if match is not None:
         body["match"] = match
     resp = httpx.post(
@@ -870,7 +806,7 @@ def built_spa(request: pytest.FixtureRequest) -> None:
         ``--ui-skip-build``.
     :returns: ``None``. Side effect is the populated build dir.
     """
-    if _prepared_repro_environment()["OMNIGENT_REPRO_SERVER_URL"] or request.config.getoption(
+    if prepared_repro_environment()["OMNIGENT_REPRO_SERVER_URL"] or request.config.getoption(
         "--ui-base-url"
     ):
         return
@@ -1041,7 +977,7 @@ def live_server(
         the expected local runner does not report online within
         :data:`_HEALTH_TIMEOUT_S` seconds.
     """
-    prepared = _prepared_repro_environment()
+    prepared = prepared_repro_environment()
     if base_url := prepared["OMNIGENT_REPRO_SERVER_URL"]:
         _server_state.update(
             runner_id=prepared["OMNIGENT_REPRO_RUNNER_ID"],
@@ -2463,8 +2399,6 @@ def server_pid(live_server: str) -> int:
 _CUSTOM_AGENT_NAME = "echo_probe"
 # A separate mock model keeps the empty parity fallback away from other tests.
 _CUSTOM_AGENT_MODEL = "render-parity-probe"
-_CLAUDE_MOCK_MODEL = "claude-sonnet-4-20250514"
-_CODEX_MOCK_MODEL = "gpt-4o"
 _CUSTOM_AGENT_YAML = f"""\
 spec_version: 1
 name: {_CUSTOM_AGENT_NAME}
@@ -2837,76 +2771,6 @@ def native_codex_session(
                 respawned.wait(timeout=5)
 
 
-@contextlib.contextmanager
-def _temp_omnigent_mock_config(
-    mock_llm_server_url: str, harness: str
-) -> Generator[None, None, None]:
-    """Temporarily write a mock provider config in the selected config home.
-
-    Native credential helpers may read provider configuration on every turn,
-    so the mock config stays in place for the fixture's full lifetime.
-    Restores the original file (or removes it) on exit.
-
-    :param mock_llm_server_url: Base URL of the mock LLM server, e.g.
-        ``"http://127.0.0.1:51235"``.
-    :param harness: ``"claude"`` or ``"codex"``.
-    """
-    from omnigent.config import global_config_path
-
-    # Back up and restore the target without replacing a user's config symlink.
-    config_path = global_config_path().resolve()
-    config_dir = config_path.parent
-    config_dir.mkdir(parents=True, exist_ok=True)
-    backup = config_path.with_name(config_path.name + ".e2e-backup")
-    if backup.exists():
-        raise RuntimeError(
-            f"Unrestored mock-provider backup at {backup}; "
-            "recover the original config before retrying"
-        )
-    original = config_path.read_bytes() if config_path.exists() else None
-
-    if harness == "claude":
-        mock_config = textwrap.dedent(f"""\
-            providers:
-              mock-claude:
-                kind: key
-                default: [anthropic]
-                anthropic:
-                  base_url: "{mock_llm_server_url}"
-                  api_key: "mock-key"
-                  models:
-                    default: {_CLAUDE_MOCK_MODEL}
-            """)
-    else:  # codex
-        mock_config = textwrap.dedent(f"""\
-            providers:
-              mock-codex:
-                kind: key
-                default: [openai]
-                openai:
-                  base_url: "{mock_llm_server_url}/v1"
-                  api_key: "mock-key"
-                  wire_api: responses
-                  models:
-                    default: {_CODEX_MOCK_MODEL}
-            """)
-
-    if original is not None:
-        fd = os.open(backup, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        with os.fdopen(fd, "wb") as handle:
-            handle.write(original)
-            handle.flush()
-            os.fsync(handle.fileno())
-    try:
-        config_path.write_text(mock_config)
-        yield
-    finally:
-        if original is not None:
-            backup.replace(config_path)
-        else:
-            config_path.unlink(missing_ok=True)
-
-
 @pytest.fixture
 def native_claude_mock_session(
     live_server: str,
@@ -2920,12 +2784,9 @@ def native_claude_mock_session(
     """
     respawned = _ensure_runner_online(live_server, tmp_path_factory)
     runner_id = str(_server_state["runner_id"])
-    use_mock = not _server_state.get("workflow_owned")
-    if use_mock:
-        ctx: Any = _temp_omnigent_mock_config(mock_llm_server_url, "claude")
-    else:
-        ctx = contextlib.nullcontext()
-    with ctx:
+    with _temp_omnigent_mock_config(
+        mock_llm_server_url, "claude", workflow_owned=bool(_server_state.get("workflow_owned"))
+    ):
         session_id = _create_native_claude_session(live_server, runner_id)
         try:
             yield (live_server, session_id)
@@ -2953,12 +2814,9 @@ def native_codex_mock_session(
     """
     respawned = _ensure_runner_online(live_server, tmp_path_factory)
     runner_id = str(_server_state["runner_id"])
-    use_mock = not _server_state.get("workflow_owned")
-    if use_mock:
-        ctx: Any = _temp_omnigent_mock_config(mock_llm_server_url, "codex")
-    else:
-        ctx = contextlib.nullcontext()
-    with ctx:
+    with _temp_omnigent_mock_config(
+        mock_llm_server_url, "codex", workflow_owned=bool(_server_state.get("workflow_owned"))
+    ):
         session_id = _create_native_codex_session(live_server, runner_id)
         try:
             yield (live_server, session_id)

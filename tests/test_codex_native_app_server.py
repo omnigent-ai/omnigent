@@ -53,6 +53,28 @@ from omnigent.inner.codex_executor import (
 )
 
 
+@pytest.mark.parametrize(
+    ("code", "message", "expected"),
+    [
+        (-32600, "no active turn to steer", True),
+        (-32600, "no active turn to interrupt", True),
+        (-32600, " NO ACTIVE TURN TO INTERRUPT ", True),
+        (-32600, "expected active turn id `turn_a` but found `turn_b`", True),
+        (-32600, "expected active turn id turn_a but found turn_b", True),
+        (-32600, "thread not found", False),
+        (-32600, "invalid turn id", False),
+        (-32600, "expected active turn id", False),
+        (-32600, "cannot steer a review turn", False),
+        (-32603, "no active turn to interrupt", False),
+        (-32603, "expected active turn id turn_a but found turn_b", False),
+        (-32600, None, False),
+    ],
+)
+def test_is_stale_active_turn_error(code: int, message: str | None, expected: bool) -> None:
+    error = CodexAppServerResponseError({"code": code, "message": message})
+    assert app_server.is_stale_active_turn_error(error) is expected
+
+
 @pytest.mark.parametrize("method", ["turn/start", "turn/steer"])
 async def test_rejected_request_traceback_identifies_rpc(method: str) -> None:
     """RPC errors keep their structured payload and add only request identity."""
@@ -4322,6 +4344,44 @@ def test_resolve_databricks_codex_model_matches_servable_ids() -> None:
             _resolve_databricks_codex_model("https://h.example.com", "prof", "databricks-gpt-9-9")
             == "databricks-gpt-9-9"
         )
+
+
+def test_resolve_databricks_codex_model_discovery_failure_warns_without_traceback(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The ucode-state fallback warns in one actionable line, frame-free."""
+    import logging
+    from unittest.mock import patch
+
+    from omnigent.harnesses.codex_native.app_server import _resolve_databricks_codex_model
+
+    def _raise(profile: str | None) -> None:
+        raise OSError(
+            "token-less profile; run `databricks auth login --profile prof` "
+            "to refresh the OAuth session"
+        )
+
+    with (
+        patch(
+            "omnigent.runtime.credentials.databricks.resolve_databricks_workspace",
+            side_effect=_raise,
+        ),
+        patch("omnigent.onboarding.ucode_state.read_ucode_state", return_value=None),
+        caplog.at_level(logging.WARNING, logger="omnigent.harnesses.codex_native.app_server"),
+    ):
+        resolved = _resolve_databricks_codex_model(
+            "https://h.example.com", "prof", "databricks-gpt-9-9"
+        )
+
+    assert resolved == "databricks-gpt-9-9"
+    warning = next(
+        r for r in caplog.records if "live Databricks model discovery failed" in r.getMessage()
+    )
+    assert not warning.exc_info, (
+        "a recoverable ucode-state fallback must not log a traceback at WARNING; "
+        "host logging mirrors it to the user's terminal"
+    )
+    assert "databricks auth login --profile prof" in warning.getMessage()
 
 
 def test_probe_codex_home_bridges_provider_tables_and_credential(

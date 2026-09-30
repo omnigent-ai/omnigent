@@ -85,16 +85,17 @@ class RunnerSessionInitializer:
         )
         task = self._tasks.get(key)
         if task is None:
+            recovery_id = (
+                self._recovery_ids.setdefault(key, uuid4().hex)
+                if resume_interrupted_turn
+                else None
+            )
             payload = build_runner_session_init_payload(
                 conversation,
                 server_version=self._server_version,
                 suppress_recovery_turn=suppress_recovery_turn,
                 resume_interrupted_turn=resume_interrupted_turn,
-                recovery_id=(
-                    self._recovery_ids.setdefault(key, uuid4().hex)
-                    if resume_interrupted_turn
-                    else None
-                ),
+                recovery_id=recovery_id,
             )
 
             async def post_session_init() -> httpx.Response:
@@ -123,6 +124,9 @@ class RunnerSessionInitializer:
                     runner_id=runner_id,
                     payload=payload,
                     timeout=timeout,
+                    resume_interrupted_turn=resume_interrupted_turn,
+                    suppress_recovery_turn=suppress_recovery_turn,
+                    recovery_id=recovery_id,
                 )
 
             task = asyncio.create_task(
@@ -178,11 +182,22 @@ class RunnerSessionInitializer:
         runner_id: str,
         payload: dict[str, object],
         timeout: float,
+        resume_interrupted_turn: bool,
+        suppress_recovery_turn: bool,
+        recovery_id: str | None,
     ) -> httpx.Response:
         with runner_log_scope(session_id, runner_id):
+            # The flags name the caller: neither set is the tunnel-reconnect
+            # hook, resume is a sub-agent restore, suppress is a message forward.
             _logger.info(
                 "Initializing runner session",
-                extra=debug_event("runner_session_init_started", stage="session_init"),
+                extra=debug_event(
+                    "runner_session_init_started",
+                    stage="session_init",
+                    resume_interrupted_turn=resume_interrupted_turn,
+                    suppress_recovery_turn=suppress_recovery_turn,
+                    recovery_id=recovery_id,
+                ),
             )
             try:
                 response = await runner_client.post(

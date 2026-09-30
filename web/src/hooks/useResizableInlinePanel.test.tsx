@@ -240,11 +240,13 @@ describe("useResizableInlinePanel drag overlay", () => {
     act(() =>
       result.current.handleProps.onMouseDown({ preventDefault: () => {} } as React.MouseEvent),
     );
+    expect(result.current.isDragging).toBe(true);
     const overlay = overlaySelector();
     expect(overlay).not.toBeNull();
     expect(overlay?.style.cursor).toBe("col-resize");
 
     act(() => window.dispatchEvent(new MouseEvent("mouseup")));
+    expect(result.current.isDragging).toBe(false);
     expect(overlaySelector()).toBeNull();
     unmount();
   });

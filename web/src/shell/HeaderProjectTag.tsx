@@ -7,7 +7,6 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { useMoveToProject } from "@/hooks/useConversations";
-import { cn } from "@/lib/utils";
 import { ProjectPicker, ProjectRowIcon } from "./ProjectPicker";
 
 /**
@@ -19,9 +18,7 @@ import { ProjectPicker, ProjectRowIcon } from "./ProjectPicker";
  * mobile shells hide the breadcrumb.
  *
  * Filed sessions show `[folder] /` with a "Currently in: ‹project›" tooltip;
- * unfiled ones show a faint add-to-project folder that only fully reveals on
- * hover, with a "Move session" tooltip — an entry point for an empty state
- * without cluttering the title.
+ * unfiled ones show an add-to-project folder with a "Move session" tooltip.
  */
 export function HeaderProjectTag({
   conversationId,
@@ -55,12 +52,7 @@ export function HeaderProjectTag({
                   type="button"
                   data-testid="header-project-tag"
                   aria-label={projectName ? `Project: ${projectName}` : "Add to project"}
-                  className={cn(
-                    "breadcrumb-folder flex shrink-0 cursor-pointer items-center rounded text-muted-foreground transition-opacity hover:opacity-100 focus-visible:opacity-100 data-[state=open]:opacity-100 focus-visible:outline-none",
-                    // A full-color emoji reads as washed-out when faded, so only
-                    // dim the monochrome folder glyphs.
-                    projectIcon ? "opacity-100" : projectName ? "opacity-40" : "opacity-30",
-                  )}
+                  className="breadcrumb-folder flex size-6 shrink-0 cursor-pointer items-center justify-center rounded-md text-muted-foreground opacity-100 transition-colors hover:bg-muted hover:text-foreground focus-visible:outline-none"
                 >
                   {projectName ? (
                     <ProjectRowIcon icon={projectIcon} className="size-4 text-[16px]" />

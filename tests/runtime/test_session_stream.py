@@ -860,6 +860,54 @@ def test_sse_safe_attributes_whitelists_ids_and_excludes_content() -> None:
         assert leaked.lower() not in flat
 
 
+def test_sse_safe_attributes_captures_level_and_code_for_error_items() -> None:
+    # Level and code on an error item must be captured so dashboards can
+    # exclude info-level notices from error-rate metrics.
+    info_event = {
+        "type": "response.output_item.done",
+        "item": {
+            "id": "item_notice",
+            "type": "error",
+            "source": "execution",
+            "code": "pi_native_effort_ignored",
+            "message": "effort ignored for gateway-routed model: thinking disabled",
+            "level": "info",
+        },
+    }
+    attrs = session_stream._sse_safe_attributes(info_event)
+    assert attrs["item_type"] == "error"
+    assert attrs["item_level"] == "info"
+    assert attrs["item_code"] == "pi_native_effort_ignored"
+    # message text must never reach the debug table
+    assert "message" not in attrs
+    flat = repr(attrs).lower()
+    assert "effort ignored" not in flat
+    assert "thinking disabled" not in flat
+
+
+def test_sse_safe_attributes_omits_level_and_code_for_non_error_items() -> None:
+    # level/code are error-item-specific; they must not appear for other types.
+    event = {
+        "type": "response.output_item.done",
+        "item": {"id": "item_msg", "type": "message", "level": "info", "code": "some_code"},
+    }
+    attrs = session_stream._sse_safe_attributes(event)
+    assert attrs["item_type"] == "message"
+    assert "item_level" not in attrs
+    assert "item_code" not in attrs
+
+
+def test_sse_safe_attributes_omits_oversized_code() -> None:
+    # codes longer than 64 chars are not captured (guard against free-form text).
+    long_code = "x" * 65
+    event = {
+        "type": "response.output_item.done",
+        "item": {"id": "item_e", "type": "error", "code": long_code},
+    }
+    attrs = session_stream._sse_safe_attributes(event)
+    assert "item_code" not in attrs
+
+
 @contextlib.contextmanager
 def _capturing_sse_logger() -> Iterator[list[logging.LogRecord]]:
     """Attach a capturing handler to the SSE logger for the duration of the block."""

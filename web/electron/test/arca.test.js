@@ -62,10 +62,18 @@ describe("arca connect command", () => {
       "omni",
       "host",
       "--server",
-      "https://workspace.example.com/ml/omnigents",
+      "'https://workspace.example.com/ml/omnigents'",
       "--background",
       "--non-interactive",
     ]);
+  });
+
+  it("quotes the URL for the remote shell so a query's `?` isn't globbed", () => {
+    const args = buildConnectArgs("https://ws.cloud.databricks.com/omnigent?o=123");
+    assert.equal(
+      args[args.indexOf("--server") + 1],
+      "'https://ws.cloud.databricks.com/omnigent?o=123'",
+    );
   });
 
   it("rejects non-http(s) server URLs", () => {
@@ -120,6 +128,21 @@ describe("arca connect failures", () => {
     );
   });
 
+  it("tags each failure with the kind of fix it needs", () => {
+    const kind = (run) =>
+      describeConnectFailure({ code: 1, stdout: "", stderr: "", ...run }).errorKind;
+    assert.equal(kind({ code: null, timedOut: true }), "timeout");
+    assert.equal(kind({ stderr: "Not signed in to https://srv." }), "omni-auth");
+    assert.equal(
+      kind({ code: 127, stderr: "bash: isaac: command not found" }),
+      "missing-remote-cli",
+    );
+    assert.equal(kind({ stderr: "Error connecting to arca." }), "unreachable");
+    assert.equal(kind({ stderr: "Your certificate has expired. Run `arca login`." }), "arca-auth");
+    assert.equal(kind({ stderr: "user@host: Permission denied (publickey)." }), "arca-auth");
+    assert.equal(kind({ stderr: "something else" }), "unknown");
+  });
+
   it("falls back to the last output line for unrecognized failures", () => {
     const result = describeConnectFailure({
       code: 1,
@@ -147,7 +170,7 @@ describe("startArcaConnect / connectArcaHost", () => {
     });
     assert.equal(
       run.command,
-      "arca ssh -o ClearAllForwardings=yes isaac omni host --server https://srv.example.com/ --background --non-interactive",
+      "arca ssh -o ClearAllForwardings=yes isaac omni host --server 'https://srv.example.com/' --background --non-interactive",
     );
     child.stdout.emit("data", "Attempting to start your Arca instance\n");
     child.stderr.emit("data", "synced dbcert\n");

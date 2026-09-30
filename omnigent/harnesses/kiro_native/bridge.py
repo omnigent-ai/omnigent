@@ -12,10 +12,14 @@ import sys
 import tempfile
 import time
 from pathlib import Path
-from typing import TypedDict
+from typing import TYPE_CHECKING, TypedDict
 
 from omnigent._platform import stable_user_id
+from omnigent.harnesses.claude_native import bridge as claude_bridge
 from omnigent.util.json_types import JsonObject as _JsonObject
+
+if TYPE_CHECKING:
+    from omnigent.inner.terminal import TerminalInstance
 
 
 class _McpServerEntry(TypedDict):
@@ -123,11 +127,9 @@ def bridge_dir_for_session_id(session_id: str) -> Path:
 
 
 def prepare_bridge_dir(session_id: str) -> Path:
-    """Create and return the per-session Kiro bridge directory."""
+    """Return an owner-only session directory, raising if its ancestors are unsafe."""
     bridge_dir = bridge_dir_for_session_id(session_id)
-    bridge_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-    with contextlib.suppress(OSError):
-        os.chmod(bridge_dir, 0o700)
+    claude_bridge.ensure_secure_dir(bridge_dir)
     return bridge_dir
 
 
@@ -137,13 +139,11 @@ def acp_record_path(bridge_dir: Path) -> Path:
 
 
 def write_mcp_bridge_config(bridge_dir: Path) -> None:
-    """Write the token config the shared Omnigent MCP bridge requires at boot.
+    """Write the relay token after validating the directory chain; reuse it on resume.
 
-    ``serve-mcp`` (``omnigent.harnesses.claude_native.bridge``) reads ``bridge.json`` and
-    refuses to start without a ``token``. Mirrors cursor-native's writer;
-    idempotent so a resume reuses the existing token.
+    :raises RuntimeError: If a bridge ancestor is unsafe.
     """
-    bridge_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    claude_bridge.ensure_secure_dir(bridge_dir)
     config_path = bridge_dir / _MCP_BRIDGE_CONFIG_FILE
     if config_path.exists():
         return
@@ -809,3 +809,13 @@ def inject_model_command(
             return
         time.sleep(_POLL_INTERVAL_S)
     raise RuntimeError(f"kiro-native did not confirm the model switch to {model!r}")
+
+
+def native_input_ready(session_id: str, instance: TerminalInstance) -> bool:
+    """Provider ``input_ready_probe``: Kiro's input region shows a prompt marker.
+
+    :param session_id: Omnigent conversation id (unused; the pane is enough).
+    :param instance: The live terminal; the watcher already captured its pane.
+    """
+    del session_id
+    return _kiro_input_ready(instance.last_pane_text() or "")

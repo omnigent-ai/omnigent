@@ -270,11 +270,14 @@ export function QueuedMessagesStrip({
     />
   ));
 
+  // Desktop shares the card's content inset (COMPOSER_CONTENT_INSET_CLASS);
+  // the literal md:px-3 repeats it because the token has no responsive
+  // variant. Narrow phones keep the compact px-2.
   return (
     <div
       data-testid="composer-queued-strip"
       className={cn(
-        "composer-queued-surface mx-auto -mb-4 flex w-full flex-col rounded-t-2xl px-2 pt-1.5 pb-5.5",
+        "composer-queued-surface mx-auto -mb-4 flex w-full flex-col rounded-t-2xl px-2 pt-1.5 pb-5.5 md:px-3",
         widthClassName,
       )}
     >

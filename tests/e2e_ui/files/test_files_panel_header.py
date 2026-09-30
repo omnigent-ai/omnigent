@@ -1,16 +1,12 @@
-"""E2E: the Files rail "Working folder" header — never a collapse toggle, and
-a browse control when the session has somewhere else to go.
+"""E2E: the Files rail path/action header and browse controls.
 
 The desktop Workspace rail renders ``FilesPanel`` in its ``frameless``
 (inline) mode. Three behaviours are pinned here:
 
-1. The header never collapses the panel. The file list is the whole point of
-   the panel, so there is nothing to collapse to. This guards against
-   reintroducing the collapse chevron: the header once doubled as a collapse
-   toggle carrying ``aria-expanded``, which made no sense here. A session with
-   nowhere else to browse (no bound host) keeps the plain, unclickable label.
-2. The header's eye shows hidden files by default and reads as state: plain
-   while dot-prefixed entries are listed, slashed once they are filtered out.
+1. The header uses the working-directory breadcrumb itself instead of a
+   redundant "Working folder" title, and keeps Copy + Refresh actions visible.
+2. The hidden-files icon previews its action: slashed eye to hide currently
+   visible dotfiles, plain eye to reveal them again.
 3. When the session IS host-bound and unconfined, the working-folder path
    becomes a button that opens the workspace directory browser, and picking a
    directory re-roots the file tree there — through the real server, runner,
@@ -37,12 +33,11 @@ from playwright.sync_api import Page, Route, expect
 from tests.e2e_ui.conftest import fetch_with_retry, open_right_rail
 
 
-def test_files_rail_working_folder_header_is_a_static_label(
+def test_files_rail_header_uses_path_and_actions_without_redundant_title(
     page: Page,
     seeded_session: tuple[str, str],
 ) -> None:
-    """The rail's "Working folder" header is a static label (no toggle button),
-    and the file list is always visible."""
+    """The header is the path plus file actions; the tree stays visible."""
     base_url, session_id = seeded_session
     page.goto(f"{base_url}/c/{session_id}")
 
@@ -57,11 +52,13 @@ def test_files_rail_working_folder_header_is_a_static_label(
     # not depend on the remembered tab from a prior session.
     rail.get_by_role("tab", name=re.compile("^Files")).click()
 
-    # The header text is present, but it is NOT a button — there is no collapse
-    # toggle. substring-matching "Working folder" tolerates the trailing
-    # working-directory basename the header also renders.
-    expect(rail.get_by_text("Working folder")).to_be_visible(timeout=30_000)
-    expect(rail.get_by_role("button", name=re.compile("Working folder"))).to_have_count(0)
+    env = page.request.get(f"{base_url}/v1/sessions/{session_id}/resources/environments/default")
+    assert env.status == 200, env.text()
+    root_name = Path(env.json()["metadata"]["root"]).name
+    expect(rail.get_by_text(root_name, exact=True)).to_be_visible(timeout=30_000)
+    expect(rail.get_by_text("Working folder", exact=True)).to_have_count(0)
+    expect(rail.get_by_role("button", name="Copy folder path")).to_be_visible()
+    expect(rail.get_by_role("button", name="Refresh files")).to_be_visible()
 
     # The content is always shown: the Files (tree) search box is visible with
     # no toggle needed. Scope is the rail tab now (Files vs Changes), not an
@@ -74,9 +71,7 @@ def test_files_rail_shows_hidden_files_until_the_eye_is_clicked(
     seeded_session: tuple[str, str],
     request: pytest.FixtureRequest,
 ) -> None:
-    """Dot-prefixed entries are listed without touching the eye, and the eye
-    reports the current state rather than the pending action: unslashed while
-    hidden files are visible, slashed once they are filtered out.
+    """Dot-prefixed entries are listed by default; the eye previews its action.
 
     Agents write to ``.claude/``, ``.github/`` and friends constantly, so a
     workspace whose dotfiles are invisible by default hides much of what a
@@ -102,16 +97,15 @@ def test_files_rail_shows_hidden_files_until_the_eye_is_clicked(
     row = rail.get_by_role("button", name=".hidden-demo/", exact=True)
     expect(row).to_be_visible(timeout=30_000)
 
-    # Visible state → plain eye. The class regex is anchored on whitespace
-    # because "lucide-eye" is a prefix of "lucide-eye-off".
+    # Hidden files are visible, so the pending action is Hide → slashed eye.
     toggle = rail.get_by_role("button", name="Hide hidden files")
-    expect(toggle.locator("svg")).to_have_class(re.compile(r"(^|\s)lucide-eye(\s|$)"))
+    expect(toggle.locator("svg")).to_have_class(re.compile(r"(^|\s)lucide-eye-off(\s|$)"))
 
     toggle.click()
 
     expect(row).to_have_count(0)
     expect(rail.get_by_role("button", name="Show hidden files").locator("svg")).to_have_class(
-        re.compile(r"(^|\s)lucide-eye-off(\s|$)")
+        re.compile(r"(^|\s)lucide-eye(\s|$)")
     )
 
 
@@ -300,6 +294,7 @@ def test_files_panel_browses_to_a_directory_outside_the_workspace(
     picker = page.get_by_test_id("workspace-picker")
     expect(picker).to_be_visible(timeout=15_000)
     picker.get_by_test_id(f"workspace-picker-entry-{outside.name}").click()
+    picker.get_by_test_id("workspace-picker-select").click()
 
     # Re-rooted: the header names the new directory and the tree lists its
     # contents, served by the real runner from outside the workspace.
@@ -330,6 +325,7 @@ def test_files_panel_browses_to_a_directory_outside_the_workspace(
     # One click back to where the agent actually is.
     path_button.click()
     page.get_by_test_id("workspace-picker-workspace").click()
+    page.get_by_test_id("workspace-picker-select").click()
     expect(rail.get_by_text("sentinel.txt")).to_have_count(0, timeout=30_000)
 
 
@@ -463,6 +459,7 @@ def test_absolute_browse_survives_a_slash_merging_proxy(
     picker = page.get_by_test_id("workspace-picker")
     expect(picker).to_be_visible(timeout=15_000)
     picker.get_by_test_id(f"workspace-picker-entry-{outside.name}").click()
+    picker.get_by_test_id("workspace-picker-select").click()
 
     # Re-rooted through the proxy: the tree lists the outside directory's real
     # contents rather than collapsing to an empty "No files in workspace".

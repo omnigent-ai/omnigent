@@ -1320,6 +1320,7 @@ def create_app(
     databricks_store: Any | None = None,  # DatabricksConnectionStore — Databricks Connect
     sharing_mode: SharingMode | Callable[[], SharingMode] | None = None,
     public_sharing: bool | Callable[[], bool] | None = None,
+    default_public_sessions: str | Callable[[], str] | None = None,
     server_config: dict[str, Any] | None = None,
     feature_flags: FeatureFlags | None = None,
     extension_state: ExtensionPluginState | None = None,
@@ -1441,6 +1442,12 @@ def create_app(
         falsy — ``0``/``false``/``no``/``off``), failing open to enabled
         when unset. Reported by ``GET /v1/info`` as
         ``public_sharing_enabled``.
+    :param default_public_sessions: Which new sessions start with a public
+        read grant: ``"off"`` (all private), ``"sandbox"`` (managed cloud
+        sandbox sessions only) or ``"all"``. Same shape as ``public_sharing``:
+        ``None`` reads ``OMNIGENT_DEFAULT_PUBLIC_SESSIONS`` (default ``off``)
+        with an admin-editable file override; a static value or callable is
+        authoritative. Never grants past ``sharing_mode``/``public_sharing``.
     :param server_config: Resolved non-secret server settings. The optional
         ``session_title_instructions`` string augments the isolated automatic
         title prompt. ``None`` loads the standard server config.
@@ -1717,6 +1724,7 @@ def create_app(
                 # (before this lifespan runs), so it is already on state here.
                 sandbox_config=sandbox_config,
                 managed_launches=app_inst.state.managed_launches,
+                app_state=app_inst.state,
             )
             on_fire = build_on_fire(fire_deps)
             # The manual "run now" trigger reuses the same fire path (dispatch /
@@ -1863,7 +1871,7 @@ def create_app(
     # promoted (``promote_if_listed`` runs at login) would be authorized by the
     # routes yet see no admin chrome. The file portion lazily reloads on mtime
     # change (no restart).
-    from omnigent.server.admin_list import load_admin_list
+    from omnigent.server.admin_list import load_admin_list, promote_if_listed
 
     admin_list = load_admin_list(extra=frozenset(admins or ()))
     # Session-sharing policy, normalized to a per-request callable, plus a
@@ -1923,6 +1931,33 @@ def create_app(
         _public_static = bool(public_sharing)
         app.state.public_sharing = lambda: _public_static
         app.state.public_sharing_writable = False
+    # Default-public policy for NEW sessions, same shape as public_sharing.
+    from omnigent.server.sharing_settings import DefaultPublicSessions
+
+    if default_public_sessions is None:
+        from omnigent.server.sharing_settings import (
+            default_public_sessions_env_default,
+            read_default_public_sessions_override,
+        )
+
+        _default_public_env = default_public_sessions_env_default()
+
+        def _resolve_default_public_sessions() -> DefaultPublicSessions:
+            override = read_default_public_sessions_override()
+            return override if override is not None else _default_public_env
+
+        app.state.default_public_sessions = _resolve_default_public_sessions
+        app.state.default_public_sessions_writable = True
+    elif callable(default_public_sessions):
+        _default_public_callable = default_public_sessions
+        app.state.default_public_sessions = lambda: DefaultPublicSessions.coerce(
+            _default_public_callable()
+        )
+        app.state.default_public_sessions_writable = False
+    else:
+        _default_public_static = DefaultPublicSessions.coerce(default_public_sessions)
+        app.state.default_public_sessions = lambda: _default_public_static
+        app.state.default_public_sessions_writable = False
     # Tracks in-flight background managed-host launches (POST
     # /v1/sessions returns before the sandbox exists) so a message
     # racing the provision can rendezvous instead of failing with
@@ -2094,6 +2129,9 @@ def create_app(
                         operation="create",
                         creation_kind=_bag.get("creation_kind", "unknown"),
                         host_type=_bag.get("host_type", "unknown"),
+                        create_persistence_ms=_bag.get("create_persistence_ms"),
+                        create_identity_ms=_bag.get("create_identity_ms"),
+                        create_acl_ms=_bag.get("create_acl_ms"),
                         stage="create_request",
                         status_code=status_code,
                         error_code=(
@@ -2987,6 +3025,11 @@ def create_app(
         EVERY mode, including OIDC/SSO where the accounts-only
         ``/auth/me`` endpoint does not exist.
 
+        An identity the admin list names but the database doesn't yet
+        flag is promoted here, as login does for OIDC and accounts.
+        Header auth has no login step, so without this a listed admin
+        would see admin chrome that every admin-gated route refuses.
+
         When OIDC is active and the user is unauthenticated,
         returns 401 with a ``login_url`` so the frontend knows
         where to redirect.
@@ -3005,17 +3048,20 @@ def create_app(
                 status_code=401,
                 content={"user_id": None, "login_url": login_url},
             )
-        # Mirror the admin check the auth routes use
-        # (``permission_store.is_admin(caller) or admin_list.is_admin(caller)``)
-        # so the SPA's admin chrome never under-reports relative to what the
-        # endpoints actually authorize — e.g. for an identity added to the
-        # admin-list file who hasn't re-logged-in yet (so ``promote_if_listed``
-        # hasn't flipped the DB flag).
-        is_admin = user_id is not None and (
-            (permission_store is not None and permission_store.is_admin(user_id))
-            or admin_list.is_admin(user_id)
-        )
-        return {"user_id": user_id, "is_admin": is_admin}
+        if user_id is None:
+            return {"user_id": None, "is_admin": False}
+        listed = admin_list.is_admin(user_id)
+        flagged = permission_store is not None and permission_store.is_admin(user_id)
+        if listed and not flagged and permission_store is not None:
+            # Same promotion OIDC runs at login (see routes/auth.py). Best-effort:
+            # a failed write must not break identity resolution.
+            try:
+                await asyncio.to_thread(permission_store.ensure_user, user_id)
+                await asyncio.to_thread(promote_if_listed, admin_list, permission_store, user_id)
+            except Exception:  # noqa: BLE001
+                _logger.warning("Could not promote listed admin %s", user_id, exc_info=True)
+        # Still report the list, so admin chrome shows even if promotion failed.
+        return {"user_id": user_id, "is_admin": flagged or listed}
 
     app.include_router(
         create_sessions_router(
@@ -3050,6 +3096,9 @@ def create_app(
             # files a session into a project (owner-private membership).
             project_store=project_store,
             background_title_coordinator=background_title_coordinator,
+            register_runner_ingest=lambda handler: setattr(
+                app.state, "runner_event_ingest", handler
+            ),
         ),
         prefix="/v1",
         tags=["sessions"],
@@ -3244,38 +3293,65 @@ def create_app(
         if pending is not None and not pending.done():
             pending.cancel()
 
-    async def _mark_disconnected_runner_failed(runner_id: str) -> None:
-        """Reconcile a dropped runner's sessions once the grace expires.
+    async def _mark_disconnected_runner_failed(
+        runner_id: str, reference_stamp: int | None
+    ) -> None:
+        """Reconcile a dropped runner's sessions once the liveness lease expires.
 
-        A runner that re-registered inside the grace makes this a no-op
-        via the live-tunnel re-check (the same newest-wins rule the
-        immediate path used); one still gone hands its bound sessions to
+        Waits for the runner to re-register on this replica, event-driven,
+        for the whole liveness lease (:data:`RUNNER_DISCONNECT_GRACE_S`,
+        sized to :data:`RUNNER_LIVENESS_TTL_S`). A reconnect resolves the
+        wait at once and makes this a no-op, so a Wi-Fi roam, VPN stall,
+        ingress recycle, or sleep/resume that comes back within the lease
+        never flaps its sessions to failed. A runner still absent when the
+        lease expires hands its bound sessions to
         :func:`_mark_runner_sessions_offline`, which fails only the
         interrupted turns and stamps the disconnect cause.
+
+        This is the transport-drop path only. A runner that actually
+        crashed is reported by its daemon on the host tunnel and handled by
+        :func:`_on_runner_exited`, which fails fast and cancels this timer,
+        so waiting out the lease here costs nothing on real death.
 
         A server that is itself shutting down skips the marking too: it
         closed the tunnel, and the runner cannot re-register with a
         process that stopped listening — the replacement server re-adopts
         it on reconnect (:mod:`omnigent.server.shutdown_state`).
 
+        A runner confirmed live on another replica (via
+        :func:`_runner_live_on_another_replica_from_conversations`) skips it too: that
+        replica's tunnel is authoritative now, and this one's registry
+        only ever knew about its own connections.
+
         :param runner_id: The disconnected runner's id.
+        :param reference_stamp: This replica's own last liveness stamp for
+            *runner_id*, captured in :func:`_on_runner_disconnect` before
+            the clear — the reference the cross-replica check compares
+            against.
         """
         from omnigent.server.routes.sessions import (
             RUNNER_DISCONNECT_GRACE_S,
             _mark_runner_sessions_offline,
+            _relinquish_session_live_state,
+            _runner_live_on_another_replica_from_conversations,
         )
         from omnigent.server.schemas import ErrorDetail
 
-        await asyncio.sleep(RUNNER_DISCONNECT_GRACE_S)
+        # Event-driven: `register` resolves the wait the instant the runner
+        # reconnects here. A non-positive grace collapses to an immediate
+        # registry check, matching the sleep(0) behavior tests pin.
+        reconnected = await tunnel_registry.wait_for_runner(
+            runner_id, timeout_s=RUNNER_DISCONNECT_GRACE_S
+        )
         if shutdown_state.server_shutting_down():
             _logger.info(
                 "Runner %s dropped because this server is shutting down; skipping offline-marking",
                 runner_id,
             )
             return
-        if tunnel_registry.get(runner_id) is not None:
+        if reconnected is not None:
             _logger.info(
-                "Runner %s reconnected within the disconnect grace; skipping offline-marking",
+                "Runner %s reconnected within the liveness lease; skipping offline-marking",
                 runner_id,
             )
             return
@@ -3289,6 +3365,16 @@ def create_app(
         affected = await asyncio.to_thread(
             conversation_store.list_conversations_by_runner_id, runner_id
         )
+        if _runner_live_on_another_replica_from_conversations(
+            affected, runner_id, reference_stamp
+        ):
+            for conv in affected:
+                _relinquish_session_live_state(conv.id)
+            _logger.info(
+                "Runner %s is live on another replica; skipping offline-marking",
+                runner_id,
+            )
+            return
         _logger.warning(
             "Runner %s disconnected; reconciling %d bound session(s)",
             runner_id,
@@ -3348,6 +3434,10 @@ def create_app(
             extra=debug_event("runner_disconnected", runner_id=runner_id),
         )
         runner_session_initializer.invalidate_runner(runner_id)
+        # Capture this replica's own last stamp before clearing, so the grace
+        # timer can tell a fresher stamp another replica writes later from
+        # one we wrote ourselves (the clear itself never erases this record).
+        reference_stamp = session_live_state.last_liveness_stamp(runner_id)
         # Graceful disconnect: clear the persisted liveness stamp so other replicas
         # flip offline at once. Not on our own shutdown: the runner is alive and
         # re-tunnels to the replacement, which must not settle its turns to idle.
@@ -3360,7 +3450,7 @@ def create_app(
         # each outage a full grace window.
         _cancel_disconnect_grace(runner_id)
         task = asyncio.create_task(
-            _mark_disconnected_runner_failed(runner_id),
+            _mark_disconnected_runner_failed(runner_id, reference_stamp),
             name=f"runner-disconnect-grace-{runner_id}",
         )
         _disconnect_grace_tasks[runner_id] = task
@@ -3611,6 +3701,7 @@ def create_app(
     if host_store is not None:
         from omnigent.server.routes.host_tunnel import create_host_tunnel_router
         from omnigent.server.routes.hosts import create_hosts_router
+        from omnigent.server.routes.mcp_servers import create_mcp_servers_router
         from omnigent.server.routes.skills import create_skills_router
 
         async def _on_hosts_changed(_host_id: str, owner: str | None) -> None:
@@ -3656,6 +3747,11 @@ def create_app(
             ),
             prefix="/v1",
             tags=["skills"],
+        )
+        app.include_router(
+            create_mcp_servers_router(host_registry, host_store, auth_provider=auth_provider),
+            prefix="/v1",
+            tags=["hosts"],
         )
         # Host-facing credential vending: a sandbox fetches its owner's
         # per-provider credential over the launch-token-authenticated channel

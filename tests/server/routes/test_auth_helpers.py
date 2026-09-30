@@ -16,12 +16,17 @@ from omnigent.entities.agent import Agent
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.auth import (
     LEVEL_EDIT,
+    LEVEL_MANAGE,
     LEVEL_OWNER,
     LEVEL_READ,
     RESERVED_USER_PUBLIC,
 )
 from omnigent.server.routes import _auth_helpers
-from omnigent.server.routes._auth_helpers import require_access_and_level, require_agent_owner
+from omnigent.server.routes._auth_helpers import (
+    can_mutate_session_agent,
+    require_access_and_level,
+    require_agent_owner,
+)
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
@@ -203,6 +208,77 @@ async def test_sub_agent_delegates_access_to_parent(
     assert access.conversation.id == child.id, "snapshot reuses the sub-agent row"
     # Displayed level is the direct grant on the sub-agent (none granted).
     assert access.level is None, "displayed level is the sub-agent's own grant, which is None here"
+
+
+@pytest.mark.parametrize(
+    "level",
+    [LEVEL_READ, LEVEL_EDIT, LEVEL_MANAGE],
+    ids=["reader", "editor", "manager"],
+)
+def test_child_agent_mutation_capability_requires_effective_owner(
+    perm_store: SqlAlchemyPermissionStore,
+    conv_store: SqlAlchemyConversationStore,
+    monkeypatch: pytest.MonkeyPatch,
+    level: int,
+) -> None:
+    """An agent creator with inherited non-owner access cannot edit a child."""
+    monkeypatch.setattr(_auth_helpers, "local_single_user_enabled", lambda: False)
+    parent = conv_store.create_conversation()
+    child = conv_store.create_conversation(
+        kind="sub_agent",
+        parent_conversation_id=parent.id,
+        sub_agent_name="summarizer",
+    )
+    perm_store.ensure_user(ALICE)
+    perm_store.grant(ALICE, parent.id, level)
+
+    assert not can_mutate_session_agent(
+        ALICE,
+        child.id,
+        _session_agent(created_by=ALICE, session_id=parent.id),
+        perm_store,
+        conv_store,
+        conversation=child,
+    )
+
+
+def test_child_agent_mutation_capability_inherits_owner(
+    perm_store: SqlAlchemyPermissionStore,
+    conv_store: SqlAlchemyConversationStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The parent owner and agent creator may edit the child agent."""
+    monkeypatch.setattr(_auth_helpers, "local_single_user_enabled", lambda: False)
+    parent = conv_store.create_conversation()
+    child = conv_store.create_conversation(
+        kind="sub_agent",
+        parent_conversation_id=parent.id,
+        sub_agent_name="summarizer",
+    )
+    perm_store.ensure_user(ALICE)
+    perm_store.grant(ALICE, parent.id, LEVEL_OWNER)
+
+    assert can_mutate_session_agent(
+        ALICE,
+        child.id,
+        _session_agent(created_by=ALICE, session_id=parent.id),
+        perm_store,
+        conv_store,
+        conversation=child,
+    )
+
+
+def test_agent_mutation_capability_preserves_auth_disabled_mode(
+    conv_store: SqlAlchemyConversationStore,
+) -> None:
+    """The capability stays permissive when no ownership model is configured."""
+    assert can_mutate_session_agent(
+        None,
+        "unresolved-session",
+        _session_agent(created_by=None),
+        None,
+        conv_store,
+    )
 
 
 @pytest.mark.asyncio

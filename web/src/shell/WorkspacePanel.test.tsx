@@ -31,8 +31,10 @@ vi.mock("./SubagentsPanel", () => ({
   SubagentsPanel: () => <div data-testid="subagents-stub" />,
 }));
 vi.mock("@/components/BrowserPane/BrowserPane", () => ({
-  BrowserPane: ({ conversationId }: { conversationId: string }) => (
-    <div data-testid="browser-pane-stub">{conversationId}</div>
+  BrowserPane: ({ conversationId, active }: { conversationId: string; active?: boolean }) => (
+    <div data-testid="browser-pane-stub" data-active={String(active)}>
+      {conversationId}
+    </div>
   ),
 }));
 // The rail terminal view mounts a real xterm/WebSocket; stub it to a marker
@@ -92,6 +94,9 @@ function renderWorkspace(
     maximized?: boolean;
     liveness?: SessionLiveness;
     pending?: boolean;
+    open?: boolean;
+    resizing?: boolean;
+    inert?: boolean;
   } = {},
 ) {
   const openFileViewer = vi.fn();
@@ -100,11 +105,14 @@ function renderWorkspace(
   const openTerminalTab = vi.fn();
   const onCloseTerminal = vi.fn();
   const onToggleMaximized = vi.fn();
-  render(
+  const view = render(
     <TooltipProvider delayDuration={0}>
       <WorkspacePanel
         conversationId="conv_ws"
         width={360}
+        open={overrides.open}
+        resizing={overrides.resizing}
+        inert={overrides.inert}
         handleProps={{
           tabIndex: 0,
           role: "separator",
@@ -150,6 +158,7 @@ function renderWorkspace(
     openTerminalTab,
     onCloseTerminal,
     onToggleMaximized,
+    view,
   };
 }
 
@@ -160,6 +169,18 @@ describe("WorkspacePanel surface presentation", () => {
     const panel = screen.getByRole("complementary", { name: "Workspace" });
     expect(panel).toHaveClass("md:border-l", "md:border-border");
     expect(panel).not.toHaveClass("md:m-2", "md:rounded-lg", "md:shadow-lg");
+    expect(panel).toHaveClass("workspace-panel-motion", "md:overflow-hidden");
+    expect(panel).toHaveAttribute("data-state", "open");
+  });
+
+  it("marks the exiting panel closed and disables motion while resizing", () => {
+    renderWorkspace({ open: false, resizing: true, inert: true });
+
+    const panel = document.querySelector('aside[aria-label="Workspace"]');
+    expect(panel).not.toBeNull();
+    expect(panel).toHaveAttribute("data-state", "closed");
+    expect(panel).toHaveAttribute("data-resizing", "true");
+    expect(panel).toHaveAttribute("aria-hidden", "true");
   });
 
   it("presents the fixed pane tabs as compact icon controls with accessible labels", () => {
@@ -686,7 +707,9 @@ describe("WorkspacePanel maximize", () => {
   it("shows a full-screen toggle pinned to the right and fires onToggleMaximized", () => {
     const { onToggleMaximized } = renderWorkspace();
 
-    fireEvent.click(screen.getByRole("button", { name: "Full screen" }));
+    const toggle = screen.getByRole("button", { name: "Full screen" });
+    expect(toggle).toHaveClass("text-muted-foreground", "hover:text-foreground");
+    fireEvent.click(toggle);
 
     expect(onToggleMaximized).toHaveBeenCalledTimes(1);
   });
@@ -816,6 +839,12 @@ describe("WorkspacePanel browser tab", () => {
     expect(screen.getByTestId("browser-pane-stub")).toBeInTheDocument();
     // And the file scope views are not mounted in that branch.
     expect(screen.queryByTestId("files-panel-stub")).toBeNull();
+  });
+
+  it("deactivates the browser pane while the persistent rail is closed", () => {
+    renderWorkspace({ showBrowserTab: true, rightRailTab: "browser", open: false, inert: true });
+
+    expect(screen.getByTestId("browser-pane-stub")).toHaveAttribute("data-active", "false");
   });
 
   it("shows an error when a native browser close fails", async () => {

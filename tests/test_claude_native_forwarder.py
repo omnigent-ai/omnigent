@@ -29,6 +29,7 @@ import omnigent.harnesses.claude_native.forwarder as forwarder
 from omnigent.harnesses.claude_native.bridge import (
     BRIDGE_ID_LABEL_KEY,
     BtwOverlay,
+    ClaudeHookRecord,
     ClaudeMessageDelta,
     ClaudeTranscriptItem,
     TranscriptReadResult,
@@ -43,6 +44,7 @@ from omnigent.harnesses.claude_native.forwarder import (
     _claim_standalone_completion,
     _consume_pending_compaction,
     _handle_compact_summary_item,
+    _is_subagent_hook_record,
     _note_precompact,
     _persist_native_compaction_item,
     _PostRetryTracker,
@@ -1605,7 +1607,7 @@ async def test_forwarder_posts_idle_on_stop_and_ignores_user_prompt_submit(
     # no background tasks) so a finished shell clears the indicator.
     assert request["body"] == {
         "type": "external_session_status",
-        "data": {"status": "idle", "background_task_count": 0},
+        "data": {"status": "idle", "background_task_count": 0, "turn_completed": True},
     }
 
 
@@ -1694,6 +1696,205 @@ async def test_forwarder_ignores_subagent_stop_failure_hook(
 
 
 @pytest.mark.asyncio
+async def test_forwarder_ignores_background_subagent_stop_failure_by_session_id(
+    tmp_path: Path,
+) -> None:
+    """
+    A background subagent's ``StopFailure`` (foreign session id, non-``subagents/``
+    path) must not flip the parent to ``failed``.
+
+    The subsequent parent ``Stop`` acts as an anchor: the forwarder must
+    emit exactly one POST (``idle``), proving it ran and that the background
+    subagent's ``StopFailure`` was silently skipped.
+    """
+    bridge_dir = tmp_path / "bridge"
+    parent_transcript = tmp_path / "session.jsonl"
+    parent_transcript.write_text("", encoding="utf-8")
+    background_transcript = tmp_path / "bg-agent.jsonl"
+    background_transcript.write_text("", encoding="utf-8")
+
+    record_hook_event(
+        bridge_dir,
+        {
+            "hook_event_name": "SessionStart",
+            "session_id": "parent-session",
+            "transcript_path": str(parent_transcript),
+        },
+    )
+    # Background subagent fails — foreign session id, non-subagents path.
+    record_hook_event(
+        bridge_dir,
+        {
+            "hook_event_name": "StopFailure",
+            "session_id": "bg-agent-session",
+            "transcript_path": str(background_transcript),
+        },
+    )
+    # Parent turn ends normally — anchor that proves the forwarder ran.
+    record_hook_event(
+        bridge_dir,
+        {
+            "hook_event_name": "Stop",
+            "session_id": "parent-session",
+            "transcript_path": str(parent_transcript),
+        },
+    )
+
+    server, thread, base_url = _start_recording_server()
+    task = asyncio.create_task(
+        forward_claude_transcript_to_session(
+            base_url=base_url,
+            headers={},
+            session_id="conv_abc",
+            bridge_dir=bridge_dir,
+            agent_name="claude-native-ui",
+            start_at_end=False,
+            poll_interval_s=0.01,
+        )
+    )
+    try:
+        first = await _get_recorded_request(server)
+        with pytest.raises(AssertionError):
+            await _get_recorded_request(server, timeout_s=0.5)
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5.0)
+
+    # If background StopFailure was wrongly forwarded, first would be
+    # ``failed``; the fix ensures only the parent's ``idle`` arrives.
+    assert first["body"] == {
+        "type": "external_session_status",
+        "data": {"status": "idle", "background_task_count": 0, "turn_completed": True},
+    }
+
+
+@pytest.mark.asyncio
+async def test_forwarder_parent_stop_failure_not_affected_by_background_session_check(
+    tmp_path: Path,
+) -> None:
+    """
+    A ``StopFailure`` carrying the parent's own session id is still
+    forwarded as ``failed`` when the session id check is active.
+    """
+    bridge_dir = tmp_path / "bridge"
+    parent_transcript = tmp_path / "session.jsonl"
+    parent_transcript.write_text("", encoding="utf-8")
+
+    record_hook_event(
+        bridge_dir,
+        {
+            "hook_event_name": "SessionStart",
+            "session_id": "parent-session",
+            "transcript_path": str(parent_transcript),
+        },
+    )
+    record_hook_event(
+        bridge_dir,
+        {
+            "hook_event_name": "StopFailure",
+            "session_id": "parent-session",
+            "transcript_path": str(parent_transcript),
+        },
+    )
+
+    server, thread, base_url = _start_recording_server()
+    task = asyncio.create_task(
+        forward_claude_transcript_to_session(
+            base_url=base_url,
+            headers={},
+            session_id="conv_abc",
+            bridge_dir=bridge_dir,
+            agent_name="claude-native-ui",
+            start_at_end=False,
+            poll_interval_s=0.01,
+        )
+    )
+    try:
+        first = await _get_recorded_request(server)
+        with pytest.raises(AssertionError):
+            await _get_recorded_request(server, timeout_s=0.5)
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5.0)
+
+    assert first["body"] == {
+        "type": "external_session_status",
+        "data": {"status": "failed"},
+    }
+
+
+def test_is_subagent_hook_record_rotation_race(tmp_path: Path) -> None:
+    """
+    A StopFailure with an old (pre-rotation) parent session id must NOT be
+    classified as a subagent when the seen set includes that old id.
+    """
+    record = ClaudeHookRecord(
+        event_cursor=1,
+        byte_offset=100,
+        event_name="StopFailure",
+        claude_session_id="parent-old",
+        transcript_path=tmp_path / "session.jsonl",
+    )
+    # Both old and new ids are seen — old is still a parent id.
+    assert not _is_subagent_hook_record(
+        record, parent_claude_session_ids={"parent-old", "parent-new"}
+    )
+    # Only the new id is seen — old id would be wrongly dropped without
+    # the seen set.
+    assert _is_subagent_hook_record(record, parent_claude_session_ids={"parent-new"})
+
+
+def test_is_subagent_hook_record_empty_seen_set_uses_path(tmp_path: Path) -> None:
+    """
+    When the seen set is empty (no pin yet), the path check alone decides.
+    """
+    subagent_path = tmp_path / "session" / "subagents" / "agent-abc.jsonl"
+    parent_path = tmp_path / "session.jsonl"
+
+    # Subagent path → True (path check catches it).
+    assert _is_subagent_hook_record(
+        ClaudeHookRecord(
+            event_cursor=1,
+            byte_offset=50,
+            event_name="StopFailure",
+            claude_session_id="any",
+            transcript_path=subagent_path,
+        ),
+        parent_claude_session_ids=set(),
+    )
+    # Non-subagent path → False (conservative).
+    assert not _is_subagent_hook_record(
+        ClaudeHookRecord(
+            event_cursor=2,
+            byte_offset=100,
+            event_name="StopFailure",
+            claude_session_id="any",
+            transcript_path=parent_path,
+        ),
+        parent_claude_session_ids=set(),
+    )
+    # No path → False (conservative).
+    assert not _is_subagent_hook_record(
+        ClaudeHookRecord(
+            event_cursor=3,
+            byte_offset=150,
+            event_name="StopFailure",
+            claude_session_id="any",
+            transcript_path=None,
+        ),
+        parent_claude_session_ids=set(),
+    )
+
+
+@pytest.mark.asyncio
 async def test_forwarder_ignores_subagent_stop_hook(
     tmp_path: Path,
 ) -> None:
@@ -1771,7 +1972,7 @@ async def test_forwarder_ignores_subagent_stop_hook(
 
     assert first["body"] == {
         "type": "external_session_status",
-        "data": {"status": "idle", "background_task_count": 0},
+        "data": {"status": "idle", "background_task_count": 0, "turn_completed": True},
     }
 
 
@@ -2284,6 +2485,75 @@ async def test_forwarder_posts_external_session_status_on_stop_failure_hook(
     assert request["body"] == {
         "type": "external_session_status",
         "data": {"status": "failed"},
+    }
+
+
+@pytest.mark.parametrize(
+    ("payload_fields", "expected_detail"),
+    [
+        (
+            {"error": "server_error", "last_assistant_message": "API Error: 500 Overloaded"},
+            "API Error: 500 Overloaded",
+        ),
+        (
+            {"error": "rate_limit"},
+            "Claude Code ended the turn with an API error (rate_limit).",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_forwarder_attaches_stop_failure_reason_to_failed_edge(
+    tmp_path: Path,
+    payload_fields: dict[str, str],
+    expected_detail: str,
+) -> None:
+    """
+    The failed edge carries the hook's own error text, else its category.
+
+    The transcript mirror can land the error after the edge or never, so
+    without this the server reports the turn's last prose or no detail.
+    """
+    bridge_dir = tmp_path / "bridge"
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text("", encoding="utf-8")
+    record_hook_event(
+        bridge_dir,
+        {
+            "hook_event_name": "SessionStart",
+            "session_id": "claude-session",
+            "transcript_path": str(transcript_path),
+        },
+    )
+    record_hook_event(
+        bridge_dir,
+        {"hook_event_name": "StopFailure", "session_id": "claude-session", **payload_fields},
+    )
+    server, thread, base_url = _start_recording_server()
+    task = asyncio.create_task(
+        forward_claude_transcript_to_session(
+            base_url=base_url,
+            headers={},
+            session_id="conv_abc",
+            bridge_dir=bridge_dir,
+            agent_name="claude-native-ui",
+            start_at_end=False,
+            poll_interval_s=0.01,
+        )
+    )
+    try:
+        request = await _get_recorded_request(server)
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5.0)
+
+    # ``failure_detail``, not ``output``: wire output is labeled a Codex error.
+    assert request["body"] == {
+        "type": "external_session_status",
+        "data": {"status": "failed", "failure_detail": expected_detail},
     }
 
 
@@ -8580,7 +8850,7 @@ class _CapturedDeltaPost:
     """
 
     url_path: str
-    body: dict[str, Any]
+    body: dict[str, Any] | list[dict[str, Any]]
 
 
 def _write_deltas_file(bridge_dir: Path, records: list[dict[str, Any]]) -> None:
@@ -8620,9 +8890,9 @@ def _delta_capture_client(
     return httpx.AsyncClient(transport=httpx.MockTransport(handler), base_url="http://ap")
 
 
-async def test_forward_available_deltas_posts_each_and_advances_offset(tmp_path: Path) -> None:
+async def test_forward_available_deltas_batches_and_advances_offset(tmp_path: Path) -> None:
     """
-    Each appended chunk is POSTed as an ``external_output_text_delta``.
+    Chunks available in one poll are POSTed in one ordered batch.
 
     Proves the forwarder turns deltas-file lines into the exact event
     shape the Omnigent route expects (delta + message_id + index + final) and
@@ -8649,20 +8919,19 @@ async def test_forward_available_deltas_posts_each_and_advances_offset(tmp_path:
             seen_keys=seen,
         )
 
-    assert [c.url_path for c in captured] == [
-        "/v1/sessions/conv_x/events",
-        "/v1/sessions/conv_x/events",
-    ]
+    assert [c.url_path for c in captured] == ["/v1/sessions/conv_x/events"]
     # Full event shape proves every field survived hook → file → POST.
     assert [c.body for c in captured] == [
-        {
-            "type": "external_output_text_delta",
-            "data": {"delta": "Hello ", "message_id": "m1", "index": 0, "final": False},
-        },
-        {
-            "type": "external_output_text_delta",
-            "data": {"delta": "world", "message_id": "m1", "index": 1, "final": True},
-        },
+        [
+            {
+                "type": "external_output_text_delta",
+                "data": {"delta": "Hello ", "message_id": "m1", "index": 0, "final": False},
+            },
+            {
+                "type": "external_output_text_delta",
+                "data": {"delta": "world", "message_id": "m1", "index": 1, "final": True},
+            },
+        ]
     ]
     # Offset advanced to EOF and was persisted, so a reload resumes past
     # the two chunks instead of re-POSTing them.
@@ -8699,11 +8968,180 @@ async def test_forward_available_deltas_dedupes_by_message_id_and_index(tmp_path
             seen_keys=seen,
         )
     # The duplicate (m1, 0) is collapsed: only the first (m1,0) and the
-    # distinct (m1,1) are POSTed — 2 requests, not 3.
-    assert [(c.body["data"]["message_id"], c.body["data"]["index"]) for c in captured] == [
+    # distinct (m1,1) are POSTed — 1 batch, not 3 requests.
+    assert len(captured) == 1
+    assert isinstance(captured[0].body, list)
+    assert [(e["data"]["message_id"], e["data"]["index"]) for e in captured[0].body] == [
         ("m1", 0),
         ("m1", 1),
     ]
+
+
+async def test_forward_available_deltas_falls_back_for_old_servers(tmp_path: Path) -> None:
+    bridge_dir = prepare_bridge_dir("conv_x", bridge_id="b1", workspace=tmp_path)
+    _write_deltas_file(
+        bridge_dir,
+        [{"message_id": "m1", "index": i, "final": i == 2, "delta": str(i)} for i in range(3)],
+    )
+    captured: list[dict[str, Any] | list[dict[str, Any]]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        captured.append(body)
+        return httpx.Response(422 if isinstance(body, list) else 202)
+
+    capability = forwarder._SessionEventBatchCapability()
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://ap"
+    ) as client:
+        await forwarder._forward_available_deltas(
+            client=client,
+            session_id="conv_x",
+            bridge_dir=bridge_dir,
+            state=forwarder.DeltaForwardState(),
+            seen_keys={},
+            batch_capability=capability,
+        )
+    assert isinstance(captured[0], list)
+    assert [event["data"]["index"] for event in captured[1:]] == [0, 1, 2]
+    assert capability.supported is False
+
+
+async def test_legacy_delta_failure_does_not_skip_later_chunks(tmp_path: Path) -> None:
+    bridge_dir = prepare_bridge_dir("conv_x", bridge_id="b1", workspace=tmp_path)
+    _write_deltas_file(
+        bridge_dir,
+        [{"message_id": "m1", "index": i, "final": i == 2, "delta": str(i)} for i in range(3)],
+    )
+    posted: list[dict[str, Any] | list[dict[str, Any]]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        posted.append(body)
+        if isinstance(body, list):
+            return httpx.Response(422)
+        return httpx.Response(500 if body["data"]["index"] == 1 else 202)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://ap"
+    ) as client:
+        await forwarder._forward_available_deltas(
+            client=client,
+            session_id="conv_x",
+            bridge_dir=bridge_dir,
+            state=forwarder.DeltaForwardState(),
+            seen_keys={},
+        )
+    assert isinstance(posted[0], list)
+    assert [body["data"]["index"] for body in posted[1:]] == [0, 1, 2]
+
+
+async def test_forward_available_deltas_bounds_batch_bytes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cap = 220
+    monkeypatch.setattr(forwarder, "_MAX_DELTA_BATCH_BYTES", cap)
+    bridge_dir = prepare_bridge_dir("conv_x", bridge_id="b1", workspace=tmp_path)
+    _write_deltas_file(
+        bridge_dir,
+        [{"message_id": "m1", "index": i, "final": i == 3, "delta": "🚀" * 15} for i in range(4)],
+    )
+    captured: list[_CapturedDeltaPost] = []
+    async with _delta_capture_client(captured) as client:
+        await forwarder._forward_available_deltas(
+            client=client,
+            session_id="conv_x",
+            bridge_dir=bridge_dir,
+            state=forwarder.DeltaForwardState(),
+            seen_keys={},
+        )
+    assert len(captured) > 1
+    assert all(
+        len(forwarder.encode_session_event_batch(c.body)) <= cap
+        for c in captured
+        if isinstance(c.body, list)
+    )
+    assert [
+        event["data"]["index"]
+        for captured_post in captured
+        for event in (
+            captured_post.body if isinstance(captured_post.body, list) else [captured_post.body]
+        )
+    ] == list(range(4))
+
+
+async def test_oversized_single_delta_does_not_block_next(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(forwarder, "_MAX_DELTA_BATCH_BYTES", 200)
+    bridge_dir = prepare_bridge_dir("conv_x", bridge_id="b1", workspace=tmp_path)
+    _write_deltas_file(
+        bridge_dir,
+        [
+            {"message_id": "m1", "index": 0, "final": False, "delta": "🚀" * 100},
+            {"message_id": "m1", "index": 1, "final": True, "delta": "done"},
+        ],
+    )
+    captured: list[_CapturedDeltaPost] = []
+    async with _delta_capture_client(captured) as client:
+        await forwarder._forward_available_deltas(
+            client=client,
+            session_id="conv_x",
+            bridge_dir=bridge_dir,
+            state=forwarder.DeltaForwardState(),
+            seen_keys={},
+        )
+    assert [c.body["data"]["index"] for c in captured] == [0, 1]
+    assert all(isinstance(c.body, dict) for c in captured)
+
+
+async def test_failed_delta_batch_still_sends_next_batch(tmp_path: Path) -> None:
+    bridge_dir = prepare_bridge_dir("conv_x", bridge_id="b1", workspace=tmp_path)
+    _write_deltas_file(
+        bridge_dir,
+        [{"message_id": "m1", "index": i, "final": i == 39, "delta": str(i)} for i in range(40)],
+    )
+    posted: list[list[dict[str, Any]]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        assert isinstance(body, list)
+        posted.append(body)
+        return httpx.Response(500 if len(posted) == 1 else 202)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://ap"
+    ) as client:
+        state = await forwarder._forward_available_deltas(
+            client=client,
+            session_id="conv_x",
+            bridge_dir=bridge_dir,
+            state=forwarder.DeltaForwardState(),
+            seen_keys={},
+        )
+    assert [len(batch) for batch in posted] == [32, 8]
+    assert state.byte_offset == os.path.getsize(bridge_dir / "message_deltas.jsonl")
+
+
+async def test_forward_available_deltas_bounds_batch_count(tmp_path: Path) -> None:
+    bridge_dir = prepare_bridge_dir("conv_x", bridge_id="b1", workspace=tmp_path)
+    _write_deltas_file(
+        bridge_dir,
+        [{"message_id": "m1", "index": i, "final": i == 39, "delta": str(i)} for i in range(40)],
+    )
+    captured: list[_CapturedDeltaPost] = []
+    async with _delta_capture_client(captured) as client:
+        await forwarder._forward_available_deltas(
+            client=client,
+            session_id="conv_x",
+            bridge_dir=bridge_dir,
+            state=forwarder.DeltaForwardState(),
+            seen_keys={},
+        )
+    assert [len(c.body) for c in captured] == [32, 8]
+    assert isinstance(captured[0].body, list)
+    assert isinstance(captured[1].body, list)
+    assert [e["data"]["index"] for c in captured for e in c.body] == list(range(40))
 
 
 async def test_forward_available_deltas_drops_on_http_error(tmp_path: Path) -> None:
@@ -10816,6 +11254,7 @@ async def test_forwarder_posts_idle_with_count_when_stop_has_background_tasks(
         "type": "external_session_status",
         "data": {
             "status": "idle",
+            "turn_completed": True,
             "background_task_count": 1,
             # Per-shell detail rides alongside the count so the UI can name the
             # running shells (see BackgroundTaskInfo / _normalize_background_task).
@@ -10918,6 +11357,7 @@ async def test_forward_status_events_stamps_response_id_on_idle(tmp_path: Path) 
             # and background-task features share this one status edge.
             "data": {
                 "status": "idle",
+                "turn_completed": True,
                 "background_task_count": 0,
                 "response_id": "resp_turn_1",
             },

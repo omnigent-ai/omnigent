@@ -17,12 +17,8 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import {
-  WorkspacePicker,
-  isNavigablePath,
-  parentOf,
-  resolveWorkspacePath,
-} from "./WorkspacePicker";
+import { parentOf, resolveWorkspacePath } from "./WorkspacePicker";
+import { WorkspacePickerDialog } from "./WorkspacePickerDialog";
 import { WorkspacePathField } from "./WorkspacePathField";
 import { HostLabel } from "./HostLabel";
 import { normalizeWorkspacePath } from "./NewChatDialog";
@@ -84,7 +80,6 @@ export function SwitchHostDialog({
   const [selectedHostId, setSelectedHostId] = useState<string | null>(null);
   const [workspace, setWorkspace] = useState("");
   const [browsing, setBrowsing] = useState(false);
-  const [browseNonce, setBrowseNonce] = useState(0);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   // Set when step 1 succeeded but step 2 failed: the session is now
@@ -181,7 +176,6 @@ export function SwitchHostDialog({
   function commitWorkspacePath(path: string): void {
     handleWorkspaceChange(path);
     setBrowsing(true);
-    setBrowseNonce((n) => n + 1);
   }
 
   async function handleSwitch(): Promise<void> {
@@ -279,18 +273,13 @@ export function SwitchHostDialog({
                     recent={recent}
                     dropdownDisabled={browsing}
                   />
-                  {browsing && (
-                    <WorkspacePicker
-                      key={browseNonce}
-                      hostId={selectedHostId}
-                      initialPath={isNavigablePath(workspaceTrimmed) ? workspaceTrimmed : undefined}
-                      onSelect={(path) => {
-                        handleWorkspaceChange(path);
-                        setBrowsing(false);
-                      }}
-                      onClose={() => setBrowsing(false)}
-                    />
-                  )}
+                  <WorkspacePickerDialog
+                    open={browsing}
+                    onOpenChange={setBrowsing}
+                    hostId={selectedHostId}
+                    initialPath={workspaceTrimmed}
+                    onConfirm={handleWorkspaceChange}
+                  />
                   <p
                     className="flex items-start gap-1.5 text-xs text-warning"
                     data-testid="switch-host-warning"

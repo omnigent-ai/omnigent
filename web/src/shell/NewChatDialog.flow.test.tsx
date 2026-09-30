@@ -701,6 +701,57 @@ describe("NewChatLandingScreen create flow", () => {
     },
   );
 
+  it("restores the recovered temp-draft files onto the still-mounted landing after a failed create", async () => {
+    // The create is rejected while the landing is still on screen, and the
+    // optimistic temp conversation accumulated its own draft meanwhile. The
+    // recovered draft (submitted draft + temp draft) must be restored onto
+    // the live composer — a missing restore would leave only the submitted
+    // chip and go red here, unlike the unmount path where the remount
+    // re-seeds from the stashed draft either way.
+    const tempConvId = "temp:cccccccccccccccccccccccccccccccc";
+    let resolveCreate!: (response: Response) => void;
+    vi.mocked(authenticatedFetch).mockReturnValueOnce(
+      new Promise<Response>((resolve) => {
+        resolveCreate = resolve;
+      }) as ReturnType<typeof authenticatedFetch>,
+    );
+    beginLocalConversationMock.mockReturnValue({
+      tempConvId,
+      pendingMsgTempId: "pend_restore",
+      createToken: "cccccccccccccccccccccccccccccccc",
+    });
+
+    renderLanding();
+    await waitForWorkspaceSeed();
+    typeMessage("original task");
+    const submitted = new File(["hello"], "notes.txt", { type: "text/plain" });
+    fireEvent.change(screen.getByTestId("new-chat-landing-file-input"), {
+      target: { files: [submitted] },
+    });
+    expect(screen.getByText("notes.txt")).toBeTruthy();
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+    await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(1));
+
+    // A file the landing composer never had lands in the temp draft.
+    const carried = new File(["world"], "extra.txt", { type: "text/plain" });
+    act(() => {
+      setSessionDraft(tempConvId, { text: "more context", files: [carried] });
+    });
+    await act(async () => {
+      resolveCreate({
+        ok: false,
+        status: 503,
+        json: async () => ({ detail: "host unavailable" }),
+      } as unknown as Response);
+    });
+
+    await waitFor(() => expect(screen.getByText("extra.txt")).toBeTruthy());
+    expect(screen.getByText("notes.txt")).toBeTruthy();
+    expect(screen.getByTestId("new-chat-landing-input")).toHaveValue(
+      "original task\n\nmore context",
+    );
+  });
+
   it("keeps a failed create's restored draft when a newer create succeeds", async () => {
     let resolveFirst!: (response: Response) => void;
     let resolveSecond!: (response: Response) => void;
@@ -2317,7 +2368,7 @@ describe("NewChatLandingScreen create flow", () => {
     renderLanding();
     await waitForWorkspaceSeed();
     // Pick the non-default agent (Radix opens on pointerdown). "second_agent"
-    // is a custom agent, so it lives in the "Custom agents" submenu.
+    // is a custom agent, so it lives in the "Other..." submenu.
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
     fireEvent.click(screen.getByTestId("new-chat-landing-custom-agents"));
     fireEvent.click(screen.getByTestId("new-chat-landing-agent-ag_two"));

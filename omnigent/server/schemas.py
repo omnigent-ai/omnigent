@@ -253,8 +253,9 @@ class AgentObject(BaseModel):
         declares no MCP servers or when the bundle cannot be
         loaded.
     :param mcp_servers_editable: Whether the MCP list can be edited
-        through the session UI. Built-in template agents are read-only;
-        session-scoped uploaded agents are editable.
+        through the session UI by the authenticated caller. This requires
+        ownership of both the effective session and its session-scoped agent;
+        built-in template and native agents are read-only.
     :param policies: Guardrails policies declared on the agent.
         Each entry summarises the policy name, type, and
         phases. Empty list when the spec declares no policies
@@ -923,6 +924,9 @@ class ErrorDetail(BaseModel):
         Paired with ``title``.
     :param remediation: Optional concrete next step to fix it, e.g. a command
         to run. ``None`` when there is no single clear fix.
+    :param undelivered: ``True`` when the harness reports it never received the
+        message this turn carried (it failed before delivery), so the sender's
+        queued copy is the only record of it; absent otherwise.
     """
 
     code: str
@@ -930,6 +934,7 @@ class ErrorDetail(BaseModel):
     title: str | None = None
     cause: str | None = None
     remediation: str | None = None
+    undelivered: bool | None = None
 
 
 class ErrorResponse(BaseModel):
@@ -4971,6 +4976,8 @@ class ProjectOrderRequest(BaseModel):
     """Rank owned project IDs; unranked projects append in discovery order.
 
     Null selects alphabetical mode without erasing the remembered manual IDs.
+    The serialized preference must fit in 65,535 bytes after compression and
+    framing; lists below the 10,000-ID limit can still exceed this byte limit.
     """
 
     ordered_project_ids: (
