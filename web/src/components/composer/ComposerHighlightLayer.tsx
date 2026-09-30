@@ -7,6 +7,7 @@ import {
   useMemo,
   useRef,
   useState,
+  type MutableRefObject,
   type ReactNode,
   type RefObject,
 } from "react";
@@ -466,6 +467,53 @@ type LayerItem =
   | { kind: "chunk"; rows: Row[]; start: number; end: number }
   | { kind: "code"; chunks: Row[][]; open: boolean; start: number; end: number };
 
+/** A draft line at a scroll position, and how far into its row that position is. */
+export interface ScrollAnchor {
+  /** The line's draft offset. */
+  source: number;
+  /** Pixels from the row's top. */
+  within: number;
+}
+
+/**
+ * The draft line at `top` (content pixels) in the layer. Its children are its
+ * items in order and each item's rows in order, so a binary search by offset
+ * finds the row without touching the rest of a long draft.
+ */
+function anchorAt(layer: HTMLElement, items: readonly LayerItem[], top: number) {
+  const elements = layer.children;
+  const lastBefore = (count: number, topOf: (i: number) => number) => {
+    let low = 0;
+    let high = count - 1;
+    let found = 0;
+    while (low <= high) {
+      const mid = (low + high) >> 1;
+      if (topOf(mid) <= top) {
+        found = mid;
+        low = mid + 1;
+      } else high = mid - 1;
+    }
+    return found;
+  };
+  if (items.length === 0) return null;
+  const itemIndex = lastBefore(items.length, (i) => (elements[i] as HTMLElement).offsetTop);
+  const item = items[itemIndex];
+  const element = elements[itemIndex] as HTMLElement | undefined;
+  if (!element) return null;
+  const rows: { row: Row; element: HTMLElement }[] =
+    item.kind === "chunk"
+      ? item.rows.map((row, k) => ({ row, element: element.children[k] as HTMLElement }))
+      : item.chunks.flatMap((chunkRows, j) =>
+          chunkRows.map((row, k) => ({
+            row,
+            element: element.children[j]?.children[k] as HTMLElement,
+          })),
+        );
+  if (rows.some(({ element: rowElement }) => !rowElement)) return null;
+  const at = rows[lastBefore(rows.length, (i) => rows[i].element.offsetTop)];
+  return { source: at.row.start, within: Math.max(0, top - at.element.offsetTop) };
+}
+
 /**
  * The styled copy of the draft painted behind the (transparent-text) textarea.
  * Its box and typography must match the textarea's exactly; see
@@ -483,9 +531,11 @@ export const ComposerHighlightLayer = forwardRef<
     disabled?: boolean;
     /** Kept laid out but not painted, while the compact preview shows instead. */
     hidden?: boolean;
+    /** Receives a lookup of the draft line at a scroll position (see `ScrollAnchor`). */
+    anchorRef?: MutableRefObject<((top: number) => ScrollAnchor | null) | null>;
   }
 >(function ComposerHighlightLayer(
-  { markdown, accentRange, revealRanges = NO_REVEAL, disabled, hidden },
+  { markdown, accentRange, revealRanges = NO_REVEAL, disabled, hidden, anchorRef },
   ref,
 ) {
   const layerRef = useRef<HTMLDivElement | null>(null);
@@ -541,6 +591,13 @@ export const ComposerHighlightLayer = forwardRef<
     placeQuotes(ordered, quoted);
     return built;
   }, [markdown, accentRange]);
+  useLayoutEffect(() => {
+    if (!anchorRef) return;
+    anchorRef.current = (top) => (layerRef.current ? anchorAt(layerRef.current, items, top) : null);
+    return () => {
+      anchorRef.current = null;
+    };
+  }, [anchorRef, items]);
   const last = markdown.blocks.at(-1);
   const trailingNewline = last?.text.endsWith("\n") ?? false;
   const openFenceAtEnd = last !== undefined && isFenceBlock(last) && isOpenFence(last);
@@ -660,9 +717,19 @@ const CompactRow = memo(function CompactRow({
       </span>,
     );
   }
-  if (!quote) return <div data-row={line.compact}>{children}</div>;
+  if (!quote)
+    return (
+      <div data-row={line.compact} data-line={line.start}>
+        {children}
+      </div>
+    );
   return (
-    <div className="composer-quote relative isolate" data-quote={quote} data-row={line.compact}>
+    <div
+      className="composer-quote relative isolate"
+      data-quote={quote}
+      data-row={line.compact}
+      data-line={line.start}
+    >
       <span
         aria-hidden
         className={cn(
@@ -760,23 +827,30 @@ interface ChunkRange {
 }
 
 /**
- * The chunks around a scroll position, one view height either side. Heights
- * are measured once rendered, estimated from the line height until then.
+ * The chunks around the view's scroll position, one view height either side,
+ * by where their elements (rendered or placeholders) actually sit.
  */
-function chunksAround(heights: readonly number[], top: number, viewHeight: number): ChunkRange {
-  let offset = 0;
-  let first = -1;
-  let last = heights.length - 1;
-  for (let i = 0; i < heights.length; i++) {
-    const end = offset + heights[i];
-    if (first === -1 && end >= top - viewHeight) first = i;
-    if (offset > top + viewHeight * 2) {
-      last = i - 1;
-      break;
+function chunksAround(view: HTMLElement): ChunkRange | null {
+  const elements = view.querySelectorAll<HTMLElement>("[data-chunk-index]");
+  if (elements.length === 0) return null;
+  const top = view.scrollTop - view.clientHeight;
+  const bottom = view.scrollTop + view.clientHeight * 2;
+  // The first element ending below `top`, and the last starting above `bottom`.
+  const search = (below: (element: HTMLElement) => boolean) => {
+    let low = 0;
+    let high = elements.length;
+    while (low < high) {
+      const mid = (low + high) >> 1;
+      if (below(elements[mid])) high = mid;
+      else low = mid + 1;
     }
-    offset = end;
-  }
-  return { first: Math.max(0, first), last: Math.max(Math.max(0, first), last) };
+    return low;
+  };
+  const first = search((element) => element.offsetTop + element.offsetHeight > top);
+  const last = search((element) => element.offsetTop > bottom) - 1;
+  const index = (at: number) =>
+    Number(elements[Math.min(elements.length - 1, Math.max(0, at))].dataset.chunkIndex);
+  return { first: index(first), last: Math.max(index(first), index(last)) };
 }
 
 /**
@@ -785,7 +859,7 @@ function chunksAround(heights: readonly number[], top: number, viewHeight: numbe
  * lines collapse. It's aria-hidden; the textarea stays the input. A click or
  * tap puts the caret on the draft character under it (`onPlaceCaret`), and
  * the textarea's own layout comes back. It's never taller than the textarea
- * (it scrolls instead), and opens scrolled to the same place. A long draft
+ * (it scrolls instead), and opens at the textarea's top line. A long draft
  * renders only the chunks of lines near its scroll position, so opening and
  * closing it stays quick; the rest are placeholders of their height.
  */
@@ -794,16 +868,25 @@ export const ComposerCompactView = memo(function ComposerCompactView({
   accentRange = null,
   disabled,
   textareaRef,
+  readAnchor,
   onPlaceCaret,
 }: {
   layout: CompactLayout;
   accentRange?: ComposerAccentRange | null;
   disabled?: boolean;
-  /** The textarea it stands in for: its height caps the preview, its scroll places it. */
+  /** The textarea it stands in for: its height caps the preview. */
   textareaRef: RefObject<HTMLTextAreaElement | null>;
+  /** The draft line at the textarea's scroll position, which the preview opens at. */
+  readAnchor: () => ScrollAnchor | null;
   onPlaceCaret: (source: number) => void;
 }) {
   const viewRef = useRef<HTMLDivElement>(null);
+  // Read as it opens, while the textarea's own layout is still in place.
+  const [anchor] = useState(readAnchor);
+  const [lineHeight] = useState(() => {
+    const textarea = textareaRef.current;
+    return (textarea && parseFloat(getComputedStyle(textarea).lineHeight)) || 20;
+  });
   const pointerTypeRef = useRef("mouse");
   const blocks = useMemo(() => {
     const lines = layout.blocks.flatMap((block) => block.lines);
@@ -827,21 +910,28 @@ export const ComposerCompactView = memo(function ComposerCompactView({
   const chunks = useMemo(() => blocks.flatMap((block) => block.chunks), [blocks]);
   // Rendered chunks' measured heights, by key; the rest are estimated.
   const measuredRef = useRef(new Map<number, number>());
-  const lineHeightRef = useRef(0);
-  const heights = () =>
-    chunks.map(
-      (chunk) => measuredRef.current.get(chunk.key) ?? chunk.rows.length * lineHeightRef.current,
-    );
+  const estimate = (chunk: CompactChunkRows) =>
+    measuredRef.current.get(chunk.key) ?? chunk.rows.length * lineHeight;
+  // The line the preview opens at: the anchor's, or the next one shown (a
+  // collapsed fence line has none of its own).
+  const [target] = useState(() => {
+    if (!anchor) return null;
+    for (let c = 0; c < chunks.length; c++)
+      for (const { line } of chunks[c].rows)
+        if (line.start >= anchor.source) return { chunk: c, line };
+    return null;
+  });
   const [range, setRange] = useState<ChunkRange | null>(null);
-  // Before the first layout: everything for a short draft, else the end or the
-  // start (whichever the textarea is nearer), refined once measured.
+  // Before the first layout: everything for a short draft, else the chunks
+  // around the line it opens at.
   const shown =
     range ??
-    (chunks.length <= 3 || !textareaRef.current
+    (chunks.length <= 3
       ? { first: 0, last: chunks.length - 1 }
-      : textareaRef.current.scrollTop > textareaRef.current.scrollHeight / 2
-        ? { first: Math.max(0, chunks.length - 3), last: chunks.length - 1 }
-        : { first: 0, last: 2 });
+      : {
+          first: Math.max(0, (target?.chunk ?? 0) - 1),
+          last: Math.min(chunks.length - 1, (target?.chunk ?? 0) + 2),
+        });
   const measure = () => {
     const view = viewRef.current;
     if (!view) return;
@@ -852,7 +942,8 @@ export const ComposerCompactView = memo(function ComposerCompactView({
     const view = viewRef.current;
     if (!view || chunks.length <= 3) return;
     measure();
-    const next = chunksAround(heights(), view.scrollTop, view.clientHeight);
+    const next = chunksAround(view);
+    if (!next) return;
     setRange((previous) =>
       previous?.first === next.first && previous.last === next.last ? previous : next,
     );
@@ -861,17 +952,15 @@ export const ComposerCompactView = memo(function ComposerCompactView({
     const view = viewRef.current;
     const textarea = textareaRef.current;
     if (!view || !textarea) return;
-    lineHeightRef.current = parseFloat(getComputedStyle(textarea).lineHeight) || 20;
     const fit = () => {
       const height = textarea.getBoundingClientRect().height;
       if (height > 0) view.style.maxHeight = `${height}px`;
     };
     fit();
-    // Open at the textarea's scroll position, in proportion.
-    const scrollable = textarea.scrollHeight - textarea.clientHeight;
-    const fraction = scrollable > 0 ? textarea.scrollTop / scrollable : 0;
-    measure();
-    view.scrollTop = fraction * (view.scrollHeight - view.clientHeight);
+    // Open with the textarea's top line at the top, as far into it as it was.
+    const row = target && view.querySelector<HTMLElement>(`[data-line="${target.line.start}"]`);
+    if (row && anchor)
+      view.scrollTop = row.offsetTop + Math.min(anchor.within, Math.max(0, row.offsetHeight - 1));
     update();
     if (typeof ResizeObserver === "undefined") return;
     const observer = new ResizeObserver(fit);
@@ -899,19 +988,19 @@ export const ComposerCompactView = memo(function ComposerCompactView({
   const renderChunk = (chunk: CompactChunkRows) => {
     const at = index++;
     if (at < shown.first || at > shown.last) {
-      const height =
-        measuredRef.current.get(chunk.key) ?? chunk.rows.length * lineHeightRef.current;
+      const height = estimate(chunk);
       return (
         <div
           key={chunk.key}
           data-row={chunk.compact}
           data-placeholder=""
+          data-chunk-index={at}
           style={{ height: `${height}px` }}
         />
       );
     }
     return (
-      <div key={chunk.key} data-chunk={chunk.key}>
+      <div key={chunk.key} data-chunk={chunk.key} data-chunk-index={at}>
         {chunk.rows.map(({ line, quote }) => (
           <CompactRow key={line.start} line={line} quote={quote} accent={accentRange} />
         ))}
@@ -925,7 +1014,9 @@ export const ComposerCompactView = memo(function ComposerCompactView({
       data-testid="composer-compact-view"
       className={cn(
         // Its own 8px left gutter, like the layer's, for a quote's bar.
-        "composer-input-text composer-highlight-layer relative -ml-2 cursor-text overflow-y-auto pl-2 text-ui break-words whitespace-pre-wrap text-foreground select-none [overflow-anchor:none] [scrollbar-width:none] md:min-h-[42px] [&::-webkit-scrollbar]:hidden",
+        // Scroll anchoring on: chunks rendered above in place of placeholders
+        // keep what's in view where it is.
+        "composer-input-text composer-highlight-layer relative -ml-2 cursor-text overflow-y-auto pl-2 text-ui break-words whitespace-pre-wrap text-foreground select-none [scrollbar-width:none] md:min-h-[42px] [&::-webkit-scrollbar]:hidden",
         disabled && "cursor-default opacity-60",
       )}
       onScroll={update}
