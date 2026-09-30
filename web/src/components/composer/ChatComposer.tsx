@@ -726,7 +726,8 @@ function useOutOfFlow(textareaRef: RefObject<HTMLTextAreaElement | null>, active
  * press that blurred it ends (so a click on a control lands before the
  * composer changes height), and not when focus comes straight back or the
  * window alone lost it. A textarea that starts unfocused is checked shortly
- * after mount, once the page has had its chance to focus it. Returns the
+ * after mount, once the page has had its chance to focus it; a press or a
+ * focus first cancels that check, which blur takes over from. Returns the
  * function to call on blur.
  */
 function useSettledBlur(
@@ -740,8 +741,12 @@ function useSettledBlur(
     if (textarea && textarea.ownerDocument.activeElement !== textarea) setUnfocused(true);
   }, [textareaRef, setUnfocused]);
   useEffect(() => {
+    const textarea = textareaRef.current;
+    const mount = window.setTimeout(check, 50);
+    const cancelMount = () => window.clearTimeout(mount);
     const press = () => {
       pressedRef.current = true;
+      cancelMount();
     };
     const release = () => {
       pressedRef.current = false;
@@ -749,15 +754,16 @@ function useSettledBlur(
     document.addEventListener("pointerdown", press, true);
     document.addEventListener("pointerup", release, true);
     document.addEventListener("pointercancel", release, true);
-    const mount = window.setTimeout(check, 50);
+    textarea?.addEventListener("focus", cancelMount);
     return () => {
       document.removeEventListener("pointerdown", press, true);
       document.removeEventListener("pointerup", release, true);
       document.removeEventListener("pointercancel", release, true);
-      window.clearTimeout(mount);
+      textarea?.removeEventListener("focus", cancelMount);
+      cancelMount();
       pendingRef.current();
     };
-  }, [check]);
+  }, [check, textareaRef]);
   return useCallback(() => {
     pendingRef.current();
     let timer = 0;

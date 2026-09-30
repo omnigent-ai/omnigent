@@ -1406,6 +1406,47 @@ describe("ComposerTextarea compact preview", () => {
     expect(view()).not.toBeNull();
   });
 
+  it("never shows the preview mid-press, however slow the page is after mount", () => {
+    vi.useFakeTimers();
+    try {
+      render(<Controlled initial="x **bold**" />);
+      // Within the unfocused-mount check's 50 ms: focus, then a press that blurs.
+      act(() => input().focus());
+      fireEvent.pointerDown(document.body);
+      act(() => input().blur());
+      act(() => vi.advanceTimersByTime(200));
+      expect(view()).toBeNull();
+      // Once the press ends, blur's own check shows it.
+      fireEvent.pointerUp(document.body);
+      act(() => vi.advanceTimersByTime(10));
+      expect(view()).not.toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("drops the unfocused-mount check on an early press or focus", () => {
+    vi.useFakeTimers();
+    try {
+      render(<Controlled initial="x **bold**" />);
+      fireEvent.pointerDown(document.body);
+      act(() => vi.advanceTimersByTime(200));
+      expect(view()).toBeNull();
+      cleanup();
+      render(<Controlled initial="x **bold**" />);
+      act(() => input().focus());
+      act(() => vi.advanceTimersByTime(200));
+      expect(view()).toBeNull();
+      // Unmounted before it fires: nothing runs after.
+      cleanup();
+      render(<Controlled initial="x **bold**" />);
+      cleanup();
+      expect(() => act(() => vi.advanceTimersByTime(200))).not.toThrow();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("never compacts a draft with nothing hidden, or an empty one", async () => {
     await blurred("plain words, `unclosed and **open");
     expect(view()).toBeNull();
