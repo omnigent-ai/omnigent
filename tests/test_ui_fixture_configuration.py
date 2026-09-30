@@ -1,5 +1,6 @@
 """Regression checks for the UI suite's fixture configuration."""
 
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
@@ -12,8 +13,7 @@ from tests.helpers import ui_configuration as configuration
 
 @pytest.mark.parametrize("harness", ["claude", "codex"])
 @pytest.mark.parametrize("owned", [True, False])
-def test_mock_config_ignores_credential_placeholder(monkeypatch, tmp_path, harness, owned):
-    monkeypatch.setenv("LLM_API_KEY", "synthetic-proxy-placeholder")
+def test_mock_config_respects_workflow_ownership(monkeypatch, tmp_path, harness, owned):
     monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
     config = tmp_path / "config.yaml"
     config.write_text("original config\n")
@@ -72,13 +72,16 @@ def test_mock_config_restores_symlink_target(monkeypatch, tmp_path, raise_in_tes
     config = tmp_path / "config.yaml"
     config.symlink_to(target.name)
     link_inode = config.lstat().st_ino
-    try:
+    expected = (
+        pytest.raises(ValueError, match="test assertion failed")
+        if raise_in_test
+        else nullcontext()
+    )
+    with expected:
         with configuration.temp_omnigent_mock_config("http://127.0.0.1:12345", "claude"):
             assert "12345" in target.read_text()
             if raise_in_test:
                 raise ValueError("test assertion failed")
-    except ValueError:
-        assert raise_in_test
     assert config.is_symlink()
     assert config.lstat().st_ino == link_inode
     assert config.readlink() == Path(target.name)

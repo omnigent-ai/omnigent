@@ -37,7 +37,13 @@ def test_unsafe_ui_base_url_reason_refuses_dev_hosts(
 def test_unsafe_ui_base_url_reason_allows_public_non_dev_port(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(socket, "getaddrinfo", lambda *args, **kwargs: [])
+    monkeypatch.setattr(
+        socket,
+        "getaddrinfo",
+        lambda *args, **kwargs: [
+            (socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", ("93.184.216.34", 443))
+        ],
+    )
 
     assert unsafe_ui_base_url_reason("https://example.com:443") is None
 
