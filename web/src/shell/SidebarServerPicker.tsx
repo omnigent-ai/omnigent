@@ -95,6 +95,8 @@ export function SidebarServerPicker() {
   const isCurrent = (url: string) =>
     originOf(url) === info.currentOrigin || (currentKey !== null && serverKey(url) === currentKey);
   const currentIsManaged = managed.some(isCurrent);
+  const managedNames = new Map(Object.entries(info.managedServerNames ?? {}));
+  const managedLabel = (url: string) => managedNames.get(url) ?? hostOf(url);
   const recentLabels = new Map(Object.entries(info.recentLabels ?? {}));
   const shownAs = (url: string) => recentLabels.get(url) ?? url;
   // A recent reached through a managed server's URL is that server: it's listed
@@ -113,7 +115,10 @@ export function SidebarServerPicker() {
       !managed.some((managedUrl) => recentFor(managedUrl) === url)
     );
   });
-  const currentHost = hostOf(currentServer ?? info.currentOrigin);
+  const currentManaged = managed.find(isCurrent);
+  const currentHost =
+    (currentManaged !== undefined ? managedNames.get(currentManaged) : undefined) ??
+    hostOf(currentServer ?? info.currentOrigin);
 
   return (
     // shrink-0 keeps the row at its natural height so the scrolling session
@@ -178,7 +183,7 @@ export function SidebarServerPicker() {
                       <span className="size-4 shrink-0" aria-hidden="true" />
                     )}
                     <span className={cn("min-w-0 truncate", current && "font-medium")}>
-                      {hostOf(url)}
+                      {managedLabel(url)}
                     </span>
                   </DropdownMenuItem>
                 );

@@ -48,6 +48,7 @@ function loadNavigationHarness({
   internalFeatures = false,
   cliPath = null,
   hostConnectResult = { ok: true },
+  managedServerNames = {},
 } = {}) {
   const userData = fs.mkdtempSync(path.join(os.tmpdir(), "omnigent-navigation-test-"));
   if (savedServerUrl) {
@@ -238,6 +239,7 @@ function loadNavigationHarness({
       ...require("../src/managed_preferences"),
       getManagedServerUrls: () => managedServers,
       getDatabricksInternalFeaturesEnabled: () => internalFeatures,
+      getManagedServerNames: () => managedServerNames,
     },
     "./deepLink": {
       parseOmnigentDeepLink: () => null,
@@ -1116,6 +1118,7 @@ describe("managed server preference wiring", () => {
     const h = loadNavigationHarness({
       serverUrl: "https://host.example/",
       managedServers: [managed],
+      managedServerNames: { [managed]: "Team" },
     });
     try {
       h.api.registerIpc();
@@ -1130,8 +1133,26 @@ describe("managed server preference wiring", () => {
       // JSON round trip: the handler's arrays come from the harness's VM realm.
       const plain = JSON.parse(JSON.stringify(picker));
       assert.deepEqual(plain.managedServers, [managed]);
+      assert.deepEqual(plain.managedServerNames, { [managed]: "Team" });
       // A recent the organization already provides is listed once, as managed.
       assert.deepEqual(plain.recentServers, ["https://host.example/"]);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it("serves managed server names to the setup page only", () => {
+    const managed = "https://managed.example.com/";
+    const h = loadNavigationHarness({ managedServerNames: { [managed]: "Team" } });
+    try {
+      h.api.registerIpc();
+      const names = h.ipc.get("omnigent:get-managed-server-names");
+      const setup = { sender: h.webContents, senderFrame: { url: `file://${h.api.SETUP_PAGE}` } };
+      assert.deepEqual(JSON.parse(JSON.stringify(names(setup))), { [managed]: "Team" });
+      assert.throws(
+        () => names({ sender: h.webContents, senderFrame: { url: "https://host.example/" } }),
+        /only available to the setup page/,
+      );
     } finally {
       h.cleanup();
     }

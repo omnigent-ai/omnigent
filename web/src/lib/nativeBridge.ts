@@ -354,6 +354,8 @@ export interface ServerPickerInfo {
    * newer server-served SPA can run inside a desktop shell that predates MDM.
    */
   managedServers?: string[];
+  /** Display names for managed servers, server URL → name. Absent on older shells. */
+  managedServerNames?: Record<string, string>;
   /** Recently-connected server URLs, most recent first. */
   recentServers: string[];
   /**

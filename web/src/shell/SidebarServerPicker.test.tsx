@@ -231,6 +231,22 @@ describe("SidebarServerPicker", () => {
     );
   });
 
+  it("names managed servers from the organization's server names", async () => {
+    getServerPicker.mockResolvedValue({
+      currentOrigin: "https://dbc-1.cloud.databricks.com",
+      managedServers: ["https://dbc-1.cloud.databricks.com/?o=1", "https://two.example.com/"],
+      managedServerNames: { "https://dbc-1.cloud.databricks.com/?o=1": "Engineering" },
+      recentServers: [],
+    });
+    renderPicker();
+    // The row names the current, managed server by its name.
+    expect(await screen.findByText("Engineering")).toBeInTheDocument();
+    await openMenu();
+    expect(screen.getAllByText("Engineering").length).toBeGreaterThan(1);
+    // An unnamed one keeps its host.
+    expect(screen.getByText("two.example.com")).toBeInTheDocument();
+  });
+
   it("doesn't offer the workspace host it moved to as another server", async () => {
     getServerPicker.mockResolvedValue({
       currentOrigin: "https://dbc-1.cloud.databricks.com",

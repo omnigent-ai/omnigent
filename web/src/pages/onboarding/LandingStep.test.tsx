@@ -42,6 +42,19 @@ describe("LandingStep", () => {
     expect(screen.queryByRole("button", { name: /get started locally/i })).not.toBeInTheDocument();
   });
 
+  it("names presets from the organization's server names, else by host", () => {
+    renderLanding({
+      managedServers: ["https://dbc-1.cloud.example.com/?o=1", "https://two.example.com/"],
+      managedServerNames: { "https://dbc-1.cloud.example.com/?o=1": "Engineering" },
+    });
+    expect(
+      screen.getByRole("button", { name: /join your team \(engineering\)/i }),
+    ).toBeInTheDocument();
+    openDropdown();
+    // An unnamed preset keeps its URL.
+    expect(screen.getByRole("menuitem", { name: "two.example.com" })).toBeInTheDocument();
+  });
+
   it("lists the other presets, then recents, in the dropdown", () => {
     const props = renderLanding({
       managedServers: ["https://team.example.com", "https://other.example.com/"],

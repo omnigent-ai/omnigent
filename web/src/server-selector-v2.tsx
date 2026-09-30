@@ -20,6 +20,7 @@ interface OmnigentSetup {
   getServerUrl: () => Promise<string | null>;
   setServerUrl: (url: string) => Promise<unknown>;
   getManagedServers: () => Promise<string[]>;
+  getManagedServerNames?: () => Promise<Record<string, string>>;
   getRecentServers: () => Promise<string[]>;
   forgetRecentServer?: (url: string) => Promise<string[]>;
   getRunnerOptions?: (url: string) => Promise<{ remote?: boolean; bundledCli?: boolean } | null>;
@@ -73,6 +74,7 @@ function BridgeSetupApp() {
   const [initialUrl, setInitialUrl] = useState(failedUrl ?? DEFAULT_URL);
   const [recentServers, setRecentServers] = useState<string[]>([]);
   const [managedServers, setManagedServers] = useState<string[]>([]);
+  const [managedServerNames, setManagedServerNames] = useState<Record<string, string>>({});
   // Whether the `omnigent` CLI is installed — decides "Install" vs "Start"/"Open".
   // Undefined until the probe resolves.
   const [installed, setInstalled] = useState<boolean | undefined>(undefined);
@@ -112,6 +114,11 @@ function BridgeSetupApp() {
         : Promise.resolve();
     const recents = bridge.getRecentServers().then(setRecentServers);
     const managed = bridge.getManagedServers().then(setManagedServers);
+    // Names are cosmetic: don't hold the first paint for them.
+    void bridge.getManagedServerNames?.().then(
+      (names) => setManagedServerNames(names ?? {}),
+      () => {},
+    );
     const cli = bridge.getCliStatus().then((status) => {
       setInstalled(status?.installed === true);
       setInstallSupported(status?.installSupported === true);
@@ -156,6 +163,7 @@ function BridgeSetupApp() {
     error,
     recentServers,
     managedServers,
+    managedServerNames,
     installed,
     connectedBefore,
     localServerRunning,

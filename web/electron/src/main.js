@@ -67,6 +67,7 @@ const { isDeveloperModeEnabled } = require("./developer_mode");
 const {
   excludingManagedServers,
   getDatabricksInternalFeaturesEnabled,
+  getManagedServerNames,
   getManagedServerUrls,
 } = require("./managed_preferences");
 const arca = require("./arca");
@@ -264,6 +265,17 @@ function developerModeEnabled() {
 /** Read the current macOS MDM-provided server list without persisting it. */
 function managedServerUrls() {
   return getManagedServerUrls({
+    platform: process.platform,
+    getUserDefault:
+      typeof systemPreferences.getUserDefault === "function"
+        ? systemPreferences.getUserDefault.bind(systemPreferences)
+        : undefined,
+  });
+}
+
+/** Display names for the MDM-provided servers, keyed by server URL. */
+function managedServerNames() {
+  return getManagedServerNames({
     platform: process.platform,
     getUserDefault:
       typeof systemPreferences.getUserDefault === "function"
@@ -3173,6 +3185,14 @@ function registerIpc() {
     return managedServerUrls();
   });
 
+  // Setup page → display names for those servers (server URL → name).
+  ipcMain.handle("omnigent:get-managed-server-names", (event) => {
+    if (!isSetupPageSender(event)) {
+      throw new Error("get-managed-server-names is only available to the setup page");
+    }
+    return managedServerNames();
+  });
+
   // Setup page → capabilities that gate wizard chrome. `v2Forced` means the env
   // var pins the selector on, so "Switch to legacy" can't take effect and the
   // menu item is disabled. `connectedBefore` (returning user) reads the raw
@@ -3279,6 +3299,7 @@ function registerIpc() {
       // The URL the user picked when sign-in moved to this host, for display.
       currentServer: serverLabel(labels, origin),
       managedServers,
+      managedServerNames: managedServerNames(),
       recentServers: recents,
       recentLabels: Object.fromEntries(
         recents.flatMap((url) => {
