@@ -9085,6 +9085,9 @@ def create_runner_app(
 
             _mcp_hash = compute_spec_hash(list(cached_spec.mcp_servers))
             if _mcp_hash != _session_mcp_spec_hash.get(conv):
+                # The previous spec's server text must not outlive a failed refresh.
+                _session_mcp_instructions.pop(conv, None)
+                _session_mcp_labels.pop(conv, None)
                 _session_mcp_proxy = ProxyMcpManager(
                     conv,
                     server_client,

@@ -26,6 +26,7 @@ from omnigent.spec import AgentSpec
 
 # Opt-in gate for injecting MCP InitializeResult.instructions into the system
 # prompt. Off unless set to 1/true/yes/on: the text is untrusted server content.
+# Runner-wide: keep it off on a runner shared by several people or agents.
 MCP_INSTRUCTIONS_ENV = "OMNIGENT_MCP_INSTRUCTIONS_ENABLED"
 _TRUE_ENV_VALUES = {"1", "true", "yes", "on"}
 _MCP_HEADING_MAX = 80
@@ -55,6 +56,8 @@ def mcp_instructions_enabled() -> bool:
 
     Off by default because the text comes from the MCP server, not the agent
     author. Operators opt in on the runner via :data:`MCP_INSTRUCTIONS_ENV`.
+    The setting is per runner process, so it applies to every SSE session on
+    that runner; a runner shared by several people or agents should keep it off.
 
     Injection currently applies to the runner-mediated (SSE) turn path only;
     native harness launch prompts do not receive this block.

@@ -282,6 +282,11 @@ heading, and setext underlines and code fences are escaped. Bodies are
 capped at 4,096 characters per server and 16,384 in total. Native harness launch
 prompts do not receive this text.
 
+This is a runner-wide setting, not a per-agent or per-session one. Once it
+is on, every SSE session on that runner, whoever started it, gets the
+instructions of the MCP servers that session connects to. Keep it off on a runner shared by several people or
+agents, and turn it on only for a runner whose MCP servers you trust.
+
 **Security note — `${VAR}` is NOT expanded for uploaded bundles:**
 ``${VAR}`` references in `headers`, `env`, and connection blocks are
 resolved against the spec author's *own* environment at the client /
