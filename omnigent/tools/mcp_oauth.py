@@ -12,7 +12,8 @@ host application:
   browser sign-in;
 - a loopback HTTP listener for the authorization redirect, bound before the
   flow needs a redirect URI, so client registration, the authorization
-  request and the token exchange all carry the same ``redirect_uri``;
+  request and the token exchange all carry the same ``redirect_uri`` (the
+  client registers again if its registered port is taken);
 - a refresh attempt when the server rejects a token with 401, before
   falling back to a browser sign-in.
 
@@ -305,6 +306,15 @@ def _registered_loopback_port(client_info: OAuthClientInformationFull | None) ->
     return registered.port
 
 
+def _busy_port_message(server_name: str, port: int | None) -> str:
+    port_name = f"port {port}" if port else "the port"
+    return (
+        f"MCP server {server_name!r} asks you to sign in again for more access, but "
+        f"{port_name} its sign-in redirect is registered on is in use by another "
+        f"program. Free {port_name} and reconnect."
+    )
+
+
 def _browser_available() -> bool:
     """Whether this process can show a browser to the person using it.
 
@@ -425,7 +435,9 @@ class OmnigentOAuthClientProvider(OAuthClientProvider):
                             response = yield request
                     if response.status_code in (401, 403):
                         # The SDK signs in again next (a 403 may ask for more scope).
-                        listener = self._open_callback_listener()
+                        listener = self._open_callback_listener(
+                            can_register=response.status_code == 401
+                        )
                 try:
                     outgoing = await flow.asend(response)
                 except StopAsyncIteration:
@@ -437,8 +449,35 @@ class OmnigentOAuthClientProvider(OAuthClientProvider):
                 # Synchronous so cancellation can't skip it; blocks ≤ one poll.
                 listener.close()
 
-    def _open_callback_listener(self) -> _CallbackListener:
-        listener = _CallbackListener(_registered_loopback_port(self.context.client_info))
+    def _open_callback_listener(self, *, can_register: bool) -> _CallbackListener:
+        """Bind the callback listener, preferably on the registered port.
+
+        If that port is taken, the redirect URI changes, which a server that
+        matches redirect URIs exactly rejects. A full sign-in (*can_register*)
+        then registers the client again with the new URI; a scope step-up,
+        which the SDK runs without registration, fails with a clear error.
+
+        :param can_register: Whether the SDK registers a client before
+            authorizing, i.e. this is a full sign-in rather than a step-up.
+        :raises McpOAuthError: If the registered port is busy and the client
+            can't be registered again.
+        """
+        client_info = self.context.client_info
+        registered_port = _registered_loopback_port(client_info)
+        listener = _CallbackListener(registered_port)
+        if client_info is not None and listener.port != registered_port:
+            if not can_register:
+                listener.close()
+                raise McpOAuthError(_busy_port_message(self._server_name, registered_port))
+            _logger.info(
+                "MCP server %r: sign-in redirect port %s is unavailable; registering again "
+                "with port %d",
+                self._server_name,
+                registered_port,
+                listener.port,
+            )
+            # Stored client info only ever comes from dynamic registration here.
+            self.context.client_info = None
         self._listener = listener
         self.context.client_metadata.redirect_uris = [AnyUrl(listener.redirect_uri)]
         return listener

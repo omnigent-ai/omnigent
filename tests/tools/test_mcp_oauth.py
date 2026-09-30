@@ -283,7 +283,7 @@ class TestBrowserHandling:
         monkeypatch.setattr(mcp_oauth, "_CALLBACK_TIMEOUT_SECONDS", 0.05)
         provider = build_oauth_client_provider(_oauth_config())
         assert provider is not None
-        listener = provider._open_callback_listener()
+        listener = provider._open_callback_listener(can_register=True)
         try:
             with pytest.raises(McpOAuthError, match="Timed out"):
                 await provider._wait_for_callback()
@@ -352,7 +352,7 @@ class TestBuildOAuthClientProvider:
     def test_listener_uri_becomes_the_redirect_uri(self) -> None:
         provider = build_oauth_client_provider(_oauth_config())
         assert provider is not None
-        listener = provider._open_callback_listener()
+        listener = provider._open_callback_listener(can_register=True)
         try:
             assert [str(u) for u in provider.context.client_metadata.redirect_uris or []] == [
                 listener.redirect_uri
@@ -370,9 +370,11 @@ class TestBuildOAuthClientProvider:
             redirect_uris=[f"http://127.0.0.1:{port}/callback"],  # type: ignore[list-item]
             client_id="cid",
         )
-        listener = provider._open_callback_listener()
+        listener = provider._open_callback_listener(can_register=True)
         try:
             assert listener.port == port
+            # Same redirect URI, so the stored registration is kept.
+            assert provider.context.client_info is not None
         finally:
             listener.close()
 

@@ -5,9 +5,10 @@ dynamic registration, authorize, token) and an MCP server that only
 accepts its bearer tokens. A real :class:`McpServerConnection` signs in,
 with the browser step simulated by requesting the authorize URL and
 following its redirect to the loopback callback. The fake server behaves
-like a strict, compliant one: the token request's ``redirect_uri`` must
-equal the authorization request's, PKCE is verified, access tokens expire,
-and refresh responses don't rotate the refresh token.
+like a strict one: the authorization request's ``redirect_uri`` must be a
+registered one exactly (no loopback port variance), the token request's must
+equal it, PKCE is verified, access tokens expire, and refresh responses don't
+rotate the refresh token.
 
 Time is advanced by patching ``time.time`` (client and server share it),
 so expiry needs no sleeping.
@@ -24,6 +25,7 @@ import socket
 import threading
 import time
 from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -59,10 +61,17 @@ class _FakeAuthServer:
     access_tokens: dict[str, float] = field(default_factory=dict)
     refresh_tokens: set[str] = field(default_factory=set)
     mcp_statuses: list[int] = field(default_factory=list)
+    forbidden_tokens: set[str] = field(default_factory=set)
+    forbidden_www_authenticate: str | None = None
 
     def revoke_access_tokens(self) -> None:
         """Invalidate every issued access token (refresh tokens stay valid)."""
         self.access_tokens.clear()
+
+    def forbid_access_tokens(self, www_authenticate: str | None) -> None:
+        """Answer every token issued so far with a 403 carrying *www_authenticate*."""
+        self.forbidden_tokens = set(self.access_tokens)
+        self.forbidden_www_authenticate = www_authenticate
 
     def grants(self, grant_type: str) -> list[dict[str, str]]:
         return [r for r in self.token_requests if r.get("grant_type") == grant_type]
@@ -109,6 +118,9 @@ def _build_app(state: _FakeAuthServer) -> Callable[..., Any]:
         state.authorize_requests.append(params)
         if params.get("client_id") not in state.clients:
             return JSONResponse({"error": "invalid_client"}, status_code=400)
+        # Exact match against the registered URIs: no loopback port variance.
+        if params.get("redirect_uri") not in state.clients[params["client_id"]]:
+            return JSONResponse({"error": "invalid_request"}, status_code=400)
         code = secrets.token_urlsafe(16)
         state.codes[code] = params
         query = urlencode({"code": code, "state": params["state"]})
@@ -157,20 +169,30 @@ def _build_app(state: _FakeAuthServer) -> Callable[..., Any]:
         ]
     )
 
-    def bearer_is_valid(scope: dict[str, Any]) -> bool:
+    def bearer_token(scope: dict[str, Any]) -> str | None:
         headers = dict(scope.get("headers") or [])
         value = headers.get(b"authorization", b"").decode()
         if not value.startswith("Bearer "):
-            return False
-        expires_at = state.access_tokens.get(value.removeprefix("Bearer "))
-        return expires_at is not None and time.time() < expires_at
+            return None
+        token = value.removeprefix("Bearer ")
+        expires_at = state.access_tokens.get(token)
+        return token if expires_at is not None and time.time() < expires_at else None
 
     async def app(scope: dict[str, Any], receive: Any, send: Any) -> None:
         if scope["type"] == "lifespan":
             await mcp_app(scope, receive, send)
             return
         if scope["path"].startswith("/mcp"):
-            if not bearer_is_valid(scope):
+            token = bearer_token(scope)
+            if token is not None and token in state.forbidden_tokens:
+                state.mcp_statuses.append(403)
+                header = state.forbidden_www_authenticate
+                response = Response(
+                    status_code=403, headers={"WWW-Authenticate": header} if header else None
+                )
+                await response(scope, receive, send)
+                return
+            if token is None:
                 state.mcp_statuses.append(401)
                 metadata_url = f"{state.base}/.well-known/oauth-protected-resource/mcp"
                 response = Response(
@@ -333,6 +355,75 @@ async def test_refresh_token_rejected_falls_back_to_browser_sign_in(
     assert second_authorize == state.grants("authorization_code")[1]["redirect_uri"]
 
 
+@contextmanager
+def _occupied(port: int) -> Iterator[None]:
+    """Hold *port* on loopback, as another program would."""
+    blocker = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        # The earlier sign-in's connections may leave the port in TIME_WAIT.
+        blocker.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        blocker.bind(("127.0.0.1", port))
+        blocker.listen()
+        yield
+    finally:
+        blocker.close()
+
+
+def _registered_port(state: _FakeAuthServer, index: int = 0) -> int:
+    port = urlparse(state.registrations[index]["redirect_uris"][0]).port
+    assert port is not None
+    return port
+
+
+async def test_busy_registered_port_registers_the_client_again(
+    fake_server: _FakeAuthServer, browser: list[str], clock: Callable[[float], None]
+) -> None:
+    """A strict server rejects a changed redirect port, so sign-in re-registers."""
+    state = fake_server
+    assert "echo: one" in await _connect_and_echo(state, "one")
+    busy_port = _registered_port(state)
+
+    state.refresh_tokens.clear()
+    clock(_ACCESS_TOKEN_LIFETIME_S + 60)
+    with _occupied(busy_port):
+        assert "echo: two" in await _connect_and_echo(state, "two")
+
+    assert len(browser) == 2
+    assert len(state.registrations) == 2
+    new_uri = state.registrations[1]["redirect_uris"][0]
+    assert urlparse(new_uri).port != busy_port
+    assert state.authorize_requests[1]["client_id"] == "client-2"
+    assert state.authorize_requests[1]["redirect_uri"] == new_uri
+    assert state.grants("authorization_code")[1]["redirect_uri"] == new_uri
+
+    # The new registration is the one kept for later connections.
+    state.revoke_access_tokens()
+    assert "echo: three" in await _connect_and_echo(state, "three")
+    assert len(state.registrations) == 2
+    assert len(browser) == 2
+
+
+async def test_busy_registered_port_during_scope_step_up_fails_clearly(
+    fake_server: _FakeAuthServer, browser: list[str]
+) -> None:
+    """A step-up can't register again, so it names the busy port instead."""
+    state = fake_server
+    assert "echo: one" in await _connect_and_echo(state, "one")
+    busy_port = _registered_port(state)
+
+    state.forbid_access_tokens('Bearer error="insufficient_scope", scope="mcp:write"')
+    conn = McpServerConnection(config=_config(state))
+    try:
+        with _occupied(busy_port):
+            with pytest.raises(McpOAuthError, match=rf"port {busy_port} .*in use.*reconnect"):
+                await asyncio.wait_for(conn.connect(), timeout=30)
+    finally:
+        await conn.close()
+    assert len(browser) == 1
+    assert len(state.authorize_requests) == 1
+    assert len(state.registrations) == 1
+
+
 async def test_headless_fails_fast_with_a_clear_error(
     fake_server: _FakeAuthServer, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -354,7 +445,12 @@ def test_fake_server_rejects_a_mismatched_redirect_uri(fake_server: _FakeAuthSer
     with httpx.Client(timeout=10) as client:
         client_id = client.post(
             f"{fake_server.base}/as/register",
-            json={"redirect_uris": ["http://127.0.0.1:0/callback"]},
+            json={
+                "redirect_uris": [
+                    "http://127.0.0.1:0/callback",
+                    "http://127.0.0.1:5555/callback",
+                ]
+            },
         ).json()["client_id"]
         redirect = client.get(
             f"{fake_server.base}/as/authorize",
@@ -377,6 +473,26 @@ def test_fake_server_rejects_a_mismatched_redirect_uri(fake_server: _FakeAuthSer
         )
     assert response.status_code == 400
     assert json.loads(response.text)["error"] == "invalid_grant"
+
+
+def test_fake_server_rejects_an_unregistered_redirect_port(fake_server: _FakeAuthServer) -> None:
+    """Guard the fake: a loopback redirect on another port is not accepted."""
+    with httpx.Client(timeout=10) as client:
+        client_id = client.post(
+            f"{fake_server.base}/as/register",
+            json={"redirect_uris": ["http://127.0.0.1:5555/callback"]},
+        ).json()["client_id"]
+        response = client.get(
+            f"{fake_server.base}/as/authorize",
+            params={
+                "client_id": client_id,
+                "redirect_uri": "http://127.0.0.1:5556/callback",
+                "state": "s",
+                "code_challenge": "c" * 43,
+            },
+        )
+    assert response.status_code == 400
+    assert json.loads(response.text)["error"] == "invalid_request"
 
 
 def test_callback_listener_serves_the_redirect_over_loopback() -> None:
