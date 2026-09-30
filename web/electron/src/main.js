@@ -358,21 +358,6 @@ function arcaAutoConnectFeatureEnabled() {
   );
 }
 
-/**
- * Whether Arca connect (manual and automatic) is offered for `serverUrl`:
- * a Databricks-managed server and the MDM internal-features flag. With the
- * auto-connect feature on, an installed arca CLI qualifies too, so Arca
- * doesn't wait on an MDM rollout.
- *
- * @param {string | null | undefined} serverUrl
- * @returns {boolean}
- */
-function arcaEligible(serverUrl) {
-  if (!isDatabricksManagedServerUrl(serverUrl)) return false;
-  if (databricksInternalFeaturesEnabled()) return true;
-  return arcaAutoConnectFeatureEnabled() && cachedArcaBinary() !== null;
-}
-
 /** Launch-time Arca auto-connect, behind the feature flag above. */
 const arcaAutoConnect = createArcaAutoConnect({
   // Auto-connect needs arca itself: the MDM flag alone keeps the manual item
@@ -388,16 +373,6 @@ const arcaAutoConnect = createArcaAutoConnect({
       return `arca ${arca.buildConnectArgs(serverUrl).join(" ")}`;
     } catch {
       return null;
-    }
-  },
-  onStatus: (origin, status) => {
-    for (const [win, state] of windows) {
-      if (win.isDestroyed() || state.origin !== origin) continue;
-      try {
-        win.webContents.send("omnigent:arca-status-changed", status);
-      } catch {
-        // Window torn down between the check and the send; ignore.
-      }
     }
   },
   log: (message) => console.log(`[omnigent] ${message}`),
@@ -3547,31 +3522,15 @@ function registerIpc() {
   // (a workspace mount or a Databricks App) — internal features must not
   // light up against arbitrary self-hosted servers. Read fresh per call so
   // applying/removing the profile takes effect without a restart.
-  ipcMain.handle("omnigent:get-desktop-features", async (event) => {
+  ipcMain.handle("omnigent:get-desktop-features", (event) => {
     if (!isPinnedOriginSender(event)) {
       console.warn("[omnigent] get-desktop-features from untrusted sender dropped");
       return null;
     }
-    const serverUrl = senderServerUrl(event);
-    await refreshArcaBinary();
     return {
       databricksInternalFeatures:
-        databricksInternalFeaturesEnabled() && isDatabricksManagedServerUrl(serverUrl),
-      arca: arcaEligible(serverUrl),
+        databricksInternalFeaturesEnabled() && isDatabricksManagedServerUrl(senderServerUrl(event)),
     };
-  });
-
-  // SPA → Arca auto-connect status for the window's server. Read-only except
-  // for a retry after a failed run; the run itself is only ever started by
-  // the main process (arca_autoconnect.js).
-  ipcMain.handle("omnigent:arca-status", async (event) => {
-    if (!isPinnedOriginSender(event)) return null;
-    await refreshArcaBinary();
-    return arcaAutoConnect.getStatus(senderServerUrl(event));
-  });
-  ipcMain.handle("omnigent:arca-retry", async (event) => {
-    if (!isPinnedOriginSender(event)) return null;
-    return arcaAutoConnect.retry(senderServerUrl(event));
   });
 
   // SPA → connect the user's Arca instance (Databricks-internal sandbox) to
@@ -3588,15 +3547,15 @@ function registerIpc() {
     if (!isPinnedOriginSender(event)) {
       throw new Error("arca-connect is only available to a connected server page");
     }
+    if (!databricksInternalFeaturesEnabled()) {
+      return { ok: false, error: "Arca support is not enabled on this machine." };
+    }
     const serverUrl = senderServerUrl(event);
     if (!serverUrl) return { ok: false, error: "this window is not connected to a server" };
-    // Same gate as get-desktop-features, re-checked here: an Arca box may
+    // Same scope as get-desktop-features, re-checked here: an Arca box may
     // only be enrolled against a Databricks-managed server.
     if (!isDatabricksManagedServerUrl(serverUrl)) {
       return { ok: false, error: "Arca hosts can only connect to Databricks-managed servers." };
-    }
-    if (!arcaEligible(serverUrl)) {
-      return { ok: false, error: "Arca support is not enabled on this machine." };
     }
     // An auto-connect already running shares its outcome instead of racing a
     // second `arca ssh`.

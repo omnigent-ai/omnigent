@@ -13,7 +13,6 @@ import { useNewShellHotkey } from "@/hooks/useNewShellHotkey";
 import { useIsEmbedded } from "@/lib/embedded";
 import { AgentInfoContent, agentHasInfo } from "@/components/AgentInfo";
 import { useIdleNotifications } from "@/hooks/useIdleNotifications";
-import { useArcaAutoConnect } from "@/hooks/useArcaAutoConnect";
 import { useSeedReadState } from "@/hooks/useUnseenConversations";
 import { useIOSViewportLock } from "@/hooks/useIOSViewportLock";
 import { readFilesPanelPreferences, writeFilesPanelPreferences } from "@/lib/filesPanelPreferences";
@@ -470,7 +469,6 @@ export function AppShell() {
   // the active conversation id, which suppresses the notification/badge for
   // the session the user is actively viewing.
   useIdleNotifications(conversationId);
-  useArcaAutoConnect();
   // Seed the per-user read-state (unread/seen) mirror from the conversation
   // list, so the sidebar dots reflect what the user did on any device.
   // `undefined` while the query is still loading (vs `[]` for a loaded-but-

@@ -9,15 +9,15 @@
  *
  * The command exits once the remote daemon is up (or reports it was already
  * running), and the daemon then keeps its own outbound tunnel, so nothing here
- * outlives the run. The renderer only reads status and may ask for a retry
- * after a failure; it can never start a run on its own. Whether the feature
- * is on at all is part of `isEligible`.
+ * outlives the run. Only the main process starts runs; a retry is allowed
+ * only after a failure. Whether the feature is on at all is part of
+ * `isEligible`.
  *
  * Electron-free: every dependency is injected so the state machine is
  * unit-testable.
  */
 
-/** Keep the tail of the command output for the status "Details" view. */
+/** Keep the tail of the command output for failure diagnostics. */
 const OUTPUT_TAIL_CHARS = 8000;
 
 /**
@@ -39,7 +39,7 @@ const OUTPUT_TAIL_CHARS = 8000;
  *   startConnect: (serverUrl: string, onOutput: (text: string) => void) =>
  *     ReturnType<typeof import("./arca").startArcaConnect>,
  *   commandLine: (serverUrl: string) => string | null,
- *   onStatus: (origin: string, status: ArcaStatus) => void,
+ *   onStatus?: (origin: string, status: ArcaStatus) => void,
  *   now?: () => number,
  *   log?: (message: string) => void,
  * }} deps
@@ -48,7 +48,7 @@ function createArcaAutoConnect({
   isEligible,
   startConnect,
   commandLine,
-  onStatus,
+  onStatus = () => {},
   now = () => Date.now(),
   log = () => {},
 }) {
