@@ -33,10 +33,6 @@ policy is stateless and only ever inspects ``tool_call`` events):
   (human approval) rather than a guess. MCP tool calls carry structured
   ``owner``/``repo`` args, so an MCP write with no determinable repo is instead
   DENYed as anomalous.
-- A ``git`` command without flags whose remote URL belongs to another git
-  provider that declares its own policy facet (see :mod:`omnigent.git_providers`)
-  is not gated here: the policy abstains and leaves it to that provider's policy.
-  Every other remote keeps the decisions above.
 
 Repos are matched case-insensitively as ``owner/repo`` (GitHub treats them so);
 branches are matched exactly (git branch names are case-sensitive). Both bare
@@ -77,7 +73,6 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
-from omnigent.policies.builtins._git_remote import other_policy_owns_remote
 from omnigent.policies.builtins._shell import (
     MAX_SHELL_NESTING,
     SHELL_TOOLS,
@@ -714,32 +709,6 @@ def _repo_from_tokens(tokens: list[str]) -> str | None:
     return None
 
 
-# Id of the GitHub descriptor in ``omnigent.git_providers``.
-_GITHUB_PROVIDER_ID = "github"
-
-
-def _leaves_remote_to_other_provider(args: list[str]) -> bool:
-    """
-    Whether another git provider's own policy gates a git command's remote.
-
-    Only a command without flags qualifies, so its first argument is the remote: a
-    flag can take the next token as its value (``push -o <url>``) or add remotes
-    (``fetch --multiple``). A command that also names a GitHub repo keeps its GitHub
-    decision, as do remote names, URLs on hosts no provider claims, and remotes of a
-    provider that declares no policy facet.
-
-    :param args: Tokens after the git subcommand, e.g.
-        ``["https://git.example.com/o/r.git", "main"]``.
-    :returns: ``True`` when a provider other than GitHub, with a policy of its own,
-        claims the first argument.
-    """
-    if not args or any(token.startswith("-") for token in args):
-        return False
-    if _repo_from_tokens(args) is not None:
-        return False
-    return other_policy_owns_remote(args[0], _GITHUB_PROVIDER_ID)
-
-
 def _flag_value(tokens: list[str], names: frozenset[str]) -> str | None:
     """
     Return the value of the first matching ``--flag value`` / ``--flag=value``.
@@ -764,15 +733,12 @@ def _classify_git(tokens: list[str]) -> _ShellOp | None:
     :param tokens: Tokens starting at ``git``, e.g. ``["git", "push", "origin", "main"]``.
     :returns: A :class:`_ShellOp` for remote read/write subcommands, or ``None``
         for local-only git commands (status / commit / diff / branch / …),
-        which are never gated, and for remote commands left to another git
-        provider's policy (:func:`_leaves_remote_to_other_provider`).
+        which are never gated.
     """
     if len(tokens) < 2:
         return None
     sub = tokens[1]
     args = tokens[2:]
-    if sub in (_GIT_READ_SUBCMDS | _GIT_WRITE_SUBCMDS) and _leaves_remote_to_other_provider(args):
-        return None
     if sub in _GIT_READ_SUBCMDS:
         return _ShellOp(
             kind="read",
