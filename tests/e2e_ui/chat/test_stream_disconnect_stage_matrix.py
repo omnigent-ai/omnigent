@@ -140,7 +140,6 @@ def test_numbered_output_recovers_across_stream_stages(
                         "item_data": {
                             "role": "assistant",
                             "agent": "claude-native-ui",
-                            "stream_message_id": _MESSAGE_ID,
                             "content": [{"type": "output_text", "text": output}],
                         },
                     },
@@ -171,6 +170,9 @@ def test_numbered_output_recovers_across_stream_stages(
                 assert _wait_for_stream(page, epochs, 2) != first_epoch
                 assert failed_reopens == 2
                 expect(section).to_be_visible(timeout=_TIMEOUT_MS)
+                expect(page.get_by_test_id("stream-interruption-notice")).to_be_visible(
+                    timeout=_TIMEOUT_MS
+                )
                 resume.set()
                 assert tail_reached.wait(timeout=60), "numbered producer did not reach 900"
                 expect(section).to_contain_text("899 900 ", timeout=_TIMEOUT_MS)
@@ -206,5 +208,13 @@ def test_numbered_output_recovers_across_stream_stages(
         expect(
             page.locator('[data-testid="assistant-text-section"]', has_text=output)
         ).to_have_count(1, timeout=_TIMEOUT_MS)
+        expect(page.get_by_test_id("stream-interruption-notice")).to_have_count(0)
+
+        page.reload()
+        expect(page.get_by_placeholder("Send a message…")).to_be_visible(timeout=_TIMEOUT_MS)
+        expect(
+            page.locator('[data-testid="assistant-text-section"]', has_text="899 900 ")
+        ).to_have_count(1, timeout=_TIMEOUT_MS)
+        expect(page.get_by_test_id("stream-interruption-notice")).to_have_count(0)
     finally:
         page.remove_listener("response", observe_stream)

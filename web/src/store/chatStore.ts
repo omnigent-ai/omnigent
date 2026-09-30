@@ -4312,6 +4312,26 @@ function nextReconnectDelay(failedOpens: number): number {
  * ApprovalCard here would orphan the parked prompt until a full page
  * refresh.
  */
+function markLivePreviewsInterrupted(id: string, set: Setter): void {
+  set((state) => {
+    if (
+      state.conversationId !== id ||
+      state.sessionStatus === "failed" ||
+      state.activeResponse?.state === "failed" ||
+      state.activeResponse?.state === "cancelled" ||
+      !state.blocks.some(isLiveProvisionalBlock)
+    ) {
+      return {};
+    }
+    const blocks = state.blocks.map((block) =>
+      isLiveProvisionalBlock(block) && block.type === "text_done" && !block.previewInterrupted
+        ? { ...block, previewInterrupted: true }
+        : block,
+    );
+    return blocks.some((block, index) => block !== state.blocks[index]) ? { blocks } : {};
+  });
+}
+
 function dropEphemeralInFlightBlocks(
   id: string,
   set: Setter,
@@ -4503,6 +4523,17 @@ async function reconcileActiveSessionStatus(
   }
   set((s) => reconnectStatusPatch(session, s, stateBeforeFetch.mcpStartupLaunch));
   if (session.usageIncluded === false) void hydrateSessionUsage(id);
+  const ignored = nativePreviewTombstonesByController.get(controller);
+  if (
+    ignored &&
+    get().blocks.some(
+      (block) =>
+        isLiveProvisionalBlock(block) && block.type === "text_done" && block.previewInterrupted,
+    )
+  ) {
+    // Retry a missed final-item backfill on the existing status-reconcile cadence.
+    await reconcileOnReconnect(id, set, get, ignored);
+  }
 }
 
 /**
@@ -4869,6 +4900,10 @@ async function reconcileOnReconnect(
       currentBlocks.map((b) => b.ctx.itemId).filter((iid): iid is string => Boolean(iid)),
     );
     const unseen = snapshotBlocks.filter((b) => b.ctx.itemId && !seen.has(b.ctx.itemId));
+    const reconciledBlocks =
+      s.isNativeTerminalSession && unseen.some((b) => b.type === "text_done" && b.ctx.itemId)
+        ? withoutInterruptedNativePreviews(currentBlocks, ignoredNativeMessageIds)
+        : currentBlocks;
     const patch: Partial<ChatState> = reconnectStatusPatch(session, s, launchBeforeFetch);
     // `session.input.consumed` is not replayed, so recovered user blocks are
     // the durable equivalent of its FIFO acknowledgement.
@@ -4878,7 +4913,7 @@ async function reconcileOnReconnect(
     if (recoveredUserInputs > 0) {
       patch.pendingUserMessages = s.pendingUserMessages.slice(recoveredUserInputs);
     }
-    let nextBlocks = currentBlocks;
+    let nextBlocks = reconciledBlocks;
     if (unseen.length > 0) {
       // Splice the gap's committed items ahead of the active turn's
       // replayed in-flight region (its itemId-less blocks, rebuilt by the
@@ -4889,7 +4924,7 @@ async function reconcileOnReconnect(
       const rid = s.activeResponse?.state === "streaming" ? s.activeResponse.responseId : null;
       // A card answered before the gap whose call the gap persisted comes
       // back rebuilt in `unseen` — drop the live copy before anchoring.
-      const kept = withoutRebuiltUserInputCards(currentBlocks, unseen);
+      const kept = withoutRebuiltUserInputCards(reconciledBlocks, unseen);
       let at = -1;
       if (rid) {
         at = kept.findIndex((b) => b.ctx.responseId === rid && !b.ctx.itemId);
@@ -5216,6 +5251,9 @@ export async function startStreamPump(
         }
         // Only a transport drop is reconnectable; everything else ends the loop.
         if (reason !== "dropped") break;
+        if (!controller.signal.aborted && !isConversationDisposed(id)) {
+          markLivePreviewsInterrupted(id, set);
+        }
       } finally {
         controller.signal.removeEventListener("abort", onOuterAbort);
         presenceAttemptControllers.delete(attempt);
@@ -5370,6 +5408,25 @@ function withoutNativePreviews(blocks: AnyBlock[], messageIds: Set<string>): Any
   });
 }
 
+/** A completed item supersedes interrupted previews; never guess by text. */
+function withoutInterruptedNativePreviews(
+  blocks: AnyBlock[],
+  ignoredMessages: Set<string>,
+): AnyBlock[] {
+  if (
+    !blocks.some(
+      (block) =>
+        isLiveProvisionalBlock(block) && block.type === "text_done" && block.previewInterrupted,
+    )
+  ) {
+    return blocks;
+  }
+  for (const block of blocks) {
+    if (isLiveProvisionalBlock(block)) ignoreLivePreview(block, ignoredMessages);
+  }
+  return blocks.filter((block) => !isLiveProvisionalBlock(block));
+}
+
 /**
  * Build a provisional in-flight assistant-text block for live streaming.
  *
@@ -5393,7 +5450,12 @@ function withoutNativePreviews(blocks: AnyBlock[], messageIds: Set<string>): Any
  * :param responseId: the live turn's id, or `itemId` when none.
  * :returns: a `TextDone` block ready to push into `blocks`.
  */
-function makeLiveTextBlock(itemId: string, text: string, responseId: string): TextDone {
+function makeLiveTextBlock(
+  itemId: string,
+  text: string,
+  responseId: string,
+  streamIndex?: number,
+): TextDone {
   return {
     type: "text_done",
     // ``timestamp`` matches the reducer's monotonic source (not wall
@@ -5408,6 +5470,7 @@ function makeLiveTextBlock(itemId: string, text: string, responseId: string): Te
     },
     fullText: text,
     hasCodeBlocks: text.includes("```"),
+    ...(streamIndex !== undefined ? { streamIndex } : {}),
   };
 }
 
@@ -5427,7 +5490,7 @@ function makeLiveTextBlock(itemId: string, text: string, responseId: string): Te
  * :param delta: incremental text for this chunk, e.g. ``"Hello "``.
  * :returns: nothing; mutates `blocks` in the store.
  */
-function applyLiveDelta(set: Setter, messageId: string, delta: string): void {
+function applyLiveDelta(set: Setter, messageId: string, delta: string, index?: number): void {
   const itemId = LIVE_ITEM_PREFIX + messageId;
   set((s) => {
     const startupPatch =
@@ -5443,14 +5506,22 @@ function applyLiveDelta(set: Setter, messageId: string, delta: string): void {
       const responseId = live?.state === "streaming" ? live.responseId : itemId;
       return {
         ...startupPatch,
-        blocks: [...s.blocks, makeLiveTextBlock(itemId, delta, responseId)],
+        blocks: [...s.blocks, makeLiveTextBlock(itemId, delta, responseId, index)],
       };
     }
     const existing = s.blocks[at]!;
     if (existing.type !== "text_done") return {};
     const fullText = existing.fullText + delta;
     const next = s.blocks.slice();
-    next[at] = { ...existing, fullText, hasCodeBlocks: fullText.includes("```") };
+    const missedChunk =
+      index !== undefined && existing.streamIndex !== undefined && index > existing.streamIndex + 1;
+    next[at] = {
+      ...existing,
+      fullText,
+      hasCodeBlocks: fullText.includes("```"),
+      ...(index !== undefined ? { streamIndex: index } : {}),
+      ...(missedChunk ? { previewInterrupted: true } : {}),
+    };
     return { ...startupPatch, blocks: next };
   });
 }
@@ -5536,7 +5607,7 @@ async function* tapLiveDeltas(
           ignored.add(ev.messageId);
           continue;
         }
-        applyLiveDelta(set, ev.messageId, ev.delta);
+        applyLiveDelta(set, ev.messageId, ev.delta, ev.index);
       }
       continue;
     }
@@ -5764,6 +5835,28 @@ export async function pumpStreamEvents(
           status: "streaming",
         });
         continue;
+      }
+
+      if (
+        block.type === "text_done" &&
+        block.ctx.itemId &&
+        !isLiveProvisionalBlock(block) &&
+        get().isNativeTerminalSession &&
+        get().blocks.some(
+          (candidate) =>
+            isLiveProvisionalBlock(candidate) &&
+            candidate.type === "text_done" &&
+            candidate.previewInterrupted,
+        )
+      ) {
+        flush();
+        set((s) => {
+          const blocks = withoutInterruptedNativePreviews(s.blocks, ignoredMessages);
+          return blocks === s.blocks ? {} : { blocks };
+        });
+        // The in-band item is already authoritative; also reconcile any
+        // other persisted items whose live event was missed in the gap.
+        void reconcileOnReconnect(id, set, get, ignoredMessages);
       }
 
       // Native preview cleanup must run before the generic dedup below:
@@ -6569,6 +6662,13 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
         } else if (event.status === "failed") {
           patch.backgroundTaskCount = 0;
           patch.backgroundTasks = [];
+        }
+        if (event.status === "failed" && s.blocks.some(isLiveProvisionalBlock)) {
+          patch.blocks = s.blocks.map((block) =>
+            isLiveProvisionalBlock(block) && block.type === "text_done" && block.previewInterrupted
+              ? { ...block, previewInterrupted: false }
+              : block,
+          );
         }
         if (event.responseId !== undefined && event.status === "running") {
           patch.status = "streaming";
