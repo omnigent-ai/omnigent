@@ -79,8 +79,9 @@ invocations below do not pause for registration or require those records.
    or a necessary e2e. It records the selection rationale and original evidence
    so Resolve can decide which tests ship. Two new test layers are not required.
 4. Records each settled facet on its user-facing surface under `recordings/<slug>/`
-   — the e2e_ui test run with `--video on` for web/terminal facets, a rendered VHS
-   tape for CLI facets. A reproduced facet is filmed failing (before-fix footage
+   — a suitable journey driver with `--video on` for web/terminal facets, a rendered VHS
+   tape for CLI facets. The driver may be temporary and separate from the selected
+   regression test. A reproduced facet is filmed failing (before-fix footage
    the fix step pairs with its after-fix re-recording); an already-fixed facet is
    filmed passing (proof-it-works footage). Best-effort: skipped (and noted) when
    the recorders aren't installed.

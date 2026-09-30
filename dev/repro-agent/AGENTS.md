@@ -359,8 +359,8 @@ page, a native dialog, the window/popup policy — not the SPA it hosts), or
 behaving differently at a phone viewport or under touch, filmed on the web lane
 at a mobile device profile; a few are native-chrome only — safe-area insets, the
 system-browser OIDC hop, the native setup screen).
-The surface picks the kind of test you author (Step 3) and the recorder that
-captures it (Step 4).
+The surface determines the recording lane (Step 4). Choose regression coverage
+in Step 3 based on the boundary needed to expose the bug.
 
 **When the reported surface is a native one you cannot drive here, defer it —
 never clear it.** This runner drives the web SPA (including at a phone
@@ -464,7 +464,8 @@ handler that `fulfill`s or `abort`s the request works too (see
 `tests/e2e_ui/chat/test_stream_transient_404.py` and `test_stale_stream.py`).
 Pick the injection that matches the reported trigger, drive the turn through it,
 and observe the SPA's error/recovery UI (the error pill, retry, reconnect) — that
-observed error state is the reproduction, and the same test films it in Step 4.
+observed error state is the reproduction. The same journey driver can film it
+in Step 4, even when permanent coverage uses a narrower test.
 
 Judge **each sub-symptom** honestly and independently:
 
@@ -527,8 +528,9 @@ objects merely to make the test smaller.
 Assert the specific behavior observed in Step 2. Name tests by behavior, not a
 ticket number. Keep scenario-specific assertions near the test and reuse
 existing helpers; do not build a new framework for one reproduction.
-Extend an existing scenario in place, preserving its assertions while adding
-the needed seed data or inputs. Richer data alone is not a separate journey.
+When coverage is missing, extend an existing scenario in place, preserving its
+assertions while adding the needed seed data or inputs. Richer data alone is
+not a separate journey.
 Keep input/edge-case matrices at the lowest reliable layer. Use a representative
 regression input for each additional production boundary; every facet needs
 coverage, not coverage at every layer. A new helper needs a direct test only
@@ -554,37 +556,36 @@ fixed shape documented under Output, including `bug_url`, `verdict`, and
 `session_id`. Do this **before** authoring or recording work that could exhaust
 the turn, so CI can still dispatch the fix step if the final response is cut off.
 
-**Show the test inline in your final message.** After you write the file to
-disk, also paste its **complete, verbatim source** into your final message as a
-fenced code block (labelled with the path), so anyone browsing this session sees
-the reproduction test directly without opening the file. Reproduce the file
-**byte-for-byte from the first line to the last** — every import, fixture, and
-assertion. Do **not** truncate, summarize, elide, or replace any part with a
-placeholder like `# ...`, `# (see full file)`, or `# unchanged`; a reader must be
-able to copy the block back into the file and get exactly what you wrote. Place
-it **immediately before** the JSON handoff block (see Output) — i.e. the test
-code block is the last thing in the message before the final ```json fence. The
-parser reads only the *last* ```json fence, so a preceding code block for the
-test is safe. If you authored more than one test file, include each in full, back
-to back, still before the JSON block.
+**Report reproducible test references.** For an unchanged reused test, give its
+exact repository revision, path/node ID, command, and result in `evidence`;
+do not paste the whole existing file into the final response. Keep its source
+available for the handoff. For new or modified reproduction tests, retain the
+complete files in retrievable evidence and show their complete, verbatim source
+in path-labelled code blocks immediately before the final JSON handoff. Do not
+truncate or substitute placeholders in those source blocks. The parser reads
+only the last JSON fence.
 
 ## Step 4 — Record the reproduction
 
-A verdict is stronger when a human can *watch* the outcome. After authoring the
-test, record each facet you settled live, on the surface the user sees it on,
+A verdict is stronger when a human can *watch* the outcome. After selecting
+regression coverage, record each facet you settled live on its visible surface,
 saved under `recordings/<slug>/` in your workspace. **See
 [`dev/recording-lanes.md`](../recording-lanes.md) for the full how-to** — which
 surface to drive, standing the recorder's server up (build the SPA first, strip
 leaked runner env), and the per-surface mechanics (`web` / `mobile` / `terminal` /
 `cli` / `desktop`), plus the empty-recordings and caption rules. This section states only
-*which clip repro-agent produces*:
+*which clip repro-agent produces*. Use the selected regression test when it can
+drive that surface. Otherwise reuse or create a separate temporary recording
+driver for the observed journey. Keep its source and command in the evidence
+for Resolve to re-record; producing footage does not require selecting that
+driver as permanent regression coverage.
 
 - a **`reproduced`** facet → **before-fix footage** (`kind: "before"`): use the
-  authored test to drive and verify the failure, but film only the product surface
+  journey driver to reproduce and verify the failure, but film only the product surface
   and the user-visible bug (e.g. `recordings/1234/before-picker.webm`). Never film
   pytest, assertion output, or the test source.
 - an **`already_fixed`** facet → **proof-it-works footage** (`kind: "fixed"`): use
-  the same test to drive and verify the passing journey, while the video shows only
+  a journey driver to verify the passing journey, while the video shows only
   the product behaving correctly (e.g. `recordings/1234/fixed-picker.webm`).
 
 `not_reproduced` and `needs_more_info` facets have nothing to film — skip them.
@@ -615,17 +616,16 @@ choice:
   recording results, atomically rewrite it, and emit that same object in the
   final fence. The checkpoint and final block must not disagree.
 
-- Before the test source and JSON block, include a **Steps to reproduce**
+- Before the test references/source and JSON block, include a **Steps to reproduce**
   section using the manual recipe from Step 1: prerequisites, numbered actions,
   and expected/observed results at the relevant step. This section is required,
   even when a recording is available. For `needs_more_info` or
   `needs_manual_review`, include the known steps and clearly identify missing
   information or unverified steps; do not invent a successful reproduction.
   You may also include a brief verdict and per-facet notes. Then, as the
-  last thing before the JSON block, paste the **complete, verbatim source of the
-  reproduction test(s) you used** as a fenced, path-labelled code block — the whole
-  file, never truncated or elided with `# ...` placeholders — so the reproduction
-  test is visible inline when browsing the session (see Step 3). But all of this is
+  last thing before the JSON block, report the reproduction tests per Step 3:
+  exact references for unchanged tests, and complete source blocks for new or
+  modified tests. But all of this is
   **context, not the contract**: everything the parser needs lives *inside* the
   JSON block, and the ```json block is the **last chunk** of the message, with
   nothing after its closing fence.
@@ -751,7 +751,7 @@ Field meanings:
   - Do not substitute a video of test output or a made-up demonstration.
 
 Keep other prose terse, but include the full manual reproduction recipe and
-the full test source. You produce the live-confirmed reproduction +
+the test references/source described in Step 3. You produce the live-confirmed reproduction +
 the test; the fix step takes it from here. You take no further
 action — no fix, no merge, no push.
 
