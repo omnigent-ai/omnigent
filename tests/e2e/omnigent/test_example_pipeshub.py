@@ -19,6 +19,8 @@ What breaks if this fails:
   (not stdio) connector,
 - the ``url`` or ``Authorization`` header stops resolving from the
   environment, or a missing variable stops failing loudly,
+- the bundle ``omnigent run`` uploads stops carrying the resolved ``url``
+  and token (the server parses uploads with expansion off),
 - an endpoint or secret gets hardcoded into the committed files,
 - the example stops shipping as package data, so a ``pip`` / ``uv tool``
   install can no longer copy it out,
@@ -36,7 +38,9 @@ from pathlib import Path
 import pytest
 import yaml
 
+from omnigent.cli import _bundle
 from omnigent.errors import OmnigentError
+from omnigent.server.bundles import validate_agent_bundle
 from omnigent.spec import load
 from omnigent.spec.types import AgentSpec
 
@@ -87,6 +91,18 @@ def test_pipeshub_resolves_url_and_token_from_env(pipeshub_spec: AgentSpec) -> N
     assert [s.name for s in pipeshub_spec.mcp_servers] == ["pipeshub"]
     server = pipeshub_spec.mcp_servers[0]
     assert server.transport == "http"
+    assert server.url == _URL
+    assert server.headers.get("Authorization") == f"Bearer {_TOKEN}"
+
+
+def test_pipeshub_upload_bundle_resolves_url_and_token(pipeshub_env: None) -> None:
+    """
+    ``omnigent run`` bundles the folder and the server parses that bundle
+    with expansion off, so the upload itself must carry the resolved
+    ``url`` and token.
+    """
+    spec = validate_agent_bundle(_bundle(_PIPESHUB_BUNDLE), enforce_handler_allowlist=False)
+    server = next(s for s in spec.mcp_servers if s.name == "pipeshub")
     assert server.url == _URL
     assert server.headers.get("Authorization") == f"Bearer {_TOKEN}"
 
