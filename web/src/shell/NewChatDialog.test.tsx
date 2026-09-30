@@ -58,7 +58,7 @@ import {
 import { useSandboxModelOptions, type SandboxModelOptions } from "@/hooks/useSandboxModelOptions";
 import { ComposerAddMenu } from "@/components/composer/ComposerAddMenu";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
-import type { ServerInfo } from "@/lib/capabilities";
+import type { GitProviderInfo, ServerInfo } from "@/lib/capabilities";
 import { authenticatedFetch, getCurrentUserId, resolveIdentity } from "@/lib/identity";
 import { BACKGROUND_SESSION_TITLES_STORAGE_KEY } from "@/lib/backgroundSessionTitlesPreferences";
 import {
@@ -6872,6 +6872,323 @@ describe("NewChatLandingScreen", () => {
     // The free-text URL input is present; the connected-account picker is not.
     await screen.findByTestId("new-chat-landing-repo-input");
     expect(screen.queryByTestId("new-chat-landing-repo-select")).toBeNull();
+  });
+
+  describe("repository picker per git provider", () => {
+    const OCTO_HELLO = {
+      full_name: "octo/hello",
+      clone_url: "https://github.com/octo/hello.git",
+      default_branch: "main",
+      private: false,
+      pushed_at: "2026-07-28T00:00:00Z",
+    };
+
+    /** A `git_providers` entry as `/v1/info` serves it; every capability is on unless overridden. */
+    function gitProviderInfo(
+      id: string,
+      displayName: string,
+      capabilities: Partial<GitProviderInfo["capabilities"]> = {},
+    ): GitProviderInfo {
+      return {
+        id,
+        display_name: displayName,
+        capabilities: {
+          pull_requests: true,
+          connection: true,
+          repo_browser: true,
+          credential_broker: true,
+          ...capabilities,
+        },
+      };
+    }
+
+    /** Answer each URL in `bodies` with its JSON and each URL in `failing` with a 500; anything else gets an empty 200. */
+    function mockConnectionFetch(bodies: Record<string, unknown>, failing: string[] = []): void {
+      authenticatedFetchMock.mockImplementation(((input: RequestInfo | URL) => {
+        const url = typeof input === "string" ? input : input.toString();
+        if (failing.includes(url)) {
+          return Promise.resolve({
+            ok: false,
+            status: 500,
+            json: async () => ({}),
+          } as unknown as Response);
+        }
+        const body = Object.hasOwn(bodies, url) ? bodies[url] : {};
+        return Promise.resolve({ ok: true, json: async () => body } as unknown as Response);
+      }) as unknown as typeof authenticatedFetch);
+    }
+
+    /** Wait for the sandbox to be the selected host, then open the repository chip's popover. */
+    async function openRepoPopover(): Promise<void> {
+      await waitFor(() =>
+        expect(
+          screen.getByTestId("new-chat-landing-host-chip").getAttribute("aria-label"),
+        ).toContain("Sandbox"),
+      );
+      fireEvent.click(screen.getByTestId("new-chat-landing-repo-chip"));
+    }
+
+    const fetchedUrls = (): string[] =>
+      authenticatedFetchMock.mock.calls.map(([url]) => String(url));
+
+    it("renders the GitHub picker as before when git_providers lists GitHub with repo_browser", async () => {
+      mockConnectionFetch({
+        "/v1/connections/github/repos": { connected: true, repos: [OCTO_HELLO] },
+        "/v1/connections/github/repos/octo/hello/branches": {
+          connected: true,
+          branches: ["main", "dev"],
+        },
+      });
+      renderLanding({
+        managed_sandboxes_enabled: true,
+        enabled_connections: ["github"],
+        git_providers: [gitProviderInfo("github", "GitHub")],
+      });
+      await openRepoPopover();
+
+      // One picker, named for GitHub, with no provider label line above it.
+      const picker = await screen.findByRole("combobox", { name: "GitHub repository" });
+      expect(screen.getAllByTestId("new-chat-landing-repo-select")).toHaveLength(1);
+      expect(within(picker.parentElement!).queryByText("GitHub")).toBeNull();
+      expect(fetchedUrls()).toContain("/v1/connections/github/repos");
+
+      fireEvent.click(picker);
+      fireEvent.click(await screen.findByRole("option", { name: /octo\/hello/ }));
+      expect((await screen.findByTestId("new-chat-landing-repo-row")).textContent).toContain(
+        "octo/hello",
+      );
+      fireEvent.click(await screen.findByTestId("new-chat-landing-repo-branch-select"));
+      fireEvent.click(await screen.findByRole("option", { name: "dev" }));
+      expect(screen.getByTestId("new-chat-landing-repo-chip").textContent).toContain("hello#dev");
+      expect(fetchedUrls()).toContain("/v1/connections/github/repos/octo/hello/branches");
+    });
+
+    it("renders a labelled picker per provider, each on its own endpoint, and uses clone_url", async () => {
+      mockConnectionFetch({
+        "/v1/connections/github/repos": { connected: true, repos: [OCTO_HELLO] },
+        "/v1/connections/fake_git/repos": {
+          connected: true,
+          repos: [
+            {
+              full_name: "acme/widget",
+              clone_url: "https://git.example.com/acme/widget.git",
+              default_branch: "trunk",
+              private: true,
+              pushed_at: null,
+            },
+            // No clone_url, and the provider has no URL pattern to derive one.
+            {
+              full_name: "acme/no-url",
+              clone_url: null,
+              default_branch: "main",
+              private: false,
+              pushed_at: null,
+            },
+          ],
+        },
+        "/v1/connections/fake_git/repos/acme/widget/branches": {
+          connected: true,
+          branches: ["trunk", "release"],
+        },
+        "/v1/sessions": { id: "conv_new" },
+      });
+      renderLanding({
+        managed_sandboxes_enabled: true,
+        enabled_connections: ["github"],
+        git_providers: [
+          gitProviderInfo("github", "GitHub"),
+          gitProviderInfo("fake_git", "Fake Git"),
+        ],
+      });
+      await openRepoPopover();
+
+      // An id the frontend has no copy for is named by its id.
+      const github = await screen.findByRole("combobox", { name: "GitHub repository" });
+      const fake = await screen.findByRole("combobox", { name: "fake_git repository" });
+      expect(screen.getAllByTestId("new-chat-landing-repo-select")).toHaveLength(2);
+      expect(fetchedUrls()).toContain("/v1/connections/github/repos");
+      expect(fetchedUrls()).toContain("/v1/connections/fake_git/repos");
+      // Two pickers get a label line each, so they can be told apart.
+      const scope = within(github.parentElement!);
+      expect(scope.getByText("GitHub")).toBeInTheDocument();
+      expect(scope.getByText("fake_git")).toBeInTheDocument();
+
+      fireEvent.click(fake);
+      await screen.findByRole("option", { name: /acme\/widget/ });
+      expect(screen.queryByRole("option", { name: /no-url/ })).toBeNull();
+      fireEvent.click(screen.getByRole("option", { name: /acme\/widget/ }));
+
+      // The API's clone_url is the workspace URL, and the branch list comes from
+      // the same provider's connection.
+      const row = await screen.findByTestId("new-chat-landing-repo-row");
+      expect(within(row).getByTitle("https://git.example.com/acme/widget.git")).toBeVisible();
+      fireEvent.click(await screen.findByTestId("new-chat-landing-repo-branch-select"));
+      fireEvent.click(await screen.findByRole("option", { name: "release" }));
+      expect(fetchedUrls()).toContain("/v1/connections/fake_git/repos/acme/widget/branches");
+
+      fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+        target: { value: "audit the repo" },
+      });
+      fireEvent.submit(screen.getByTestId("new-chat-landing-composer"));
+      const { body } = await readCreateBody();
+      expect(body.workspaces).toEqual(["https://git.example.com/acme/widget.git#release"]);
+    });
+
+    it("takes the API's clone URL over GitHub's pattern and derives one only when the API sends none", async () => {
+      mockConnectionFetch({
+        "/v1/connections/github/repos": {
+          connected: true,
+          repos: [
+            { ...OCTO_HELLO, clone_url: null },
+            {
+              ...OCTO_HELLO,
+              full_name: "octo/enterprise",
+              clone_url: "https://ghe.example.com/octo/enterprise.git",
+            },
+          ],
+        },
+      });
+      // A multi-repo provider, so both picks can be made in one go.
+      renderLanding({
+        managed_sandboxes_enabled: true,
+        sandbox_provider: "agent_sandbox",
+        sandbox_provider_capabilities: { agent_sandbox: { multi_repo: true } },
+        git_providers: [gitProviderInfo("github", "GitHub")],
+      });
+      await openRepoPopover();
+
+      const pick = async (name: RegExp): Promise<void> => {
+        fireEvent.click(await screen.findByRole("combobox", { name: "GitHub repository" }));
+        fireEvent.click(await screen.findByRole("option", { name }));
+      };
+      await pick(/octo\/hello/);
+      await pick(/octo\/enterprise/);
+      await waitFor(() =>
+        expect(screen.getAllByTestId("new-chat-landing-repo-row")).toHaveLength(2),
+      );
+      const rows = screen.getAllByTestId("new-chat-landing-repo-row");
+      expect(within(rows[0]).getByTitle("https://github.com/octo/hello.git")).toBeVisible();
+      expect(
+        within(rows[1]).getByTitle("https://ghe.example.com/octo/enterprise.git"),
+      ).toBeVisible();
+    });
+
+    it("still renders the GitHub picker for an older server that sends no git_providers", async () => {
+      mockConnectionFetch({
+        "/v1/connections/github/repos": { connected: true, repos: [OCTO_HELLO] },
+      });
+      // No `git_providers` field: GitHub's connection is known from
+      // enabled_connections alone.
+      renderLanding({ managed_sandboxes_enabled: true, enabled_connections: ["github"] });
+      await openRepoPopover();
+
+      expect(await screen.findByRole("combobox", { name: "GitHub repository" })).toBeVisible();
+      expect(fetchedUrls()).toContain("/v1/connections/github/repos");
+    });
+
+    it.each([
+      [
+        "Azure DevOps with no connection or repo browser",
+        gitProviderInfo("azure_devops", "Azure DevOps", {
+          connection: false,
+          repo_browser: false,
+          credential_broker: false,
+        }),
+      ],
+      [
+        "a connected provider that cannot list repos",
+        gitProviderInfo("azure_devops", "Azure DevOps", { repo_browser: false }),
+      ],
+      [
+        "a repo browser whose connection is not configured",
+        gitProviderInfo("azure_devops", "Azure DevOps", { connection: false }),
+      ],
+    ])("renders no picker for %s", async (_case, provider) => {
+      mockConnectionFetch({});
+      renderLanding({ managed_sandboxes_enabled: true, git_providers: [provider] });
+      await openRepoPopover();
+
+      // The free-text URL input is the only way to add a repo.
+      await screen.findByTestId("new-chat-landing-repo-input");
+      expect(screen.queryByTestId("new-chat-landing-repo-select")).toBeNull();
+      expect(fetchedUrls().filter((url) => url.startsWith("/v1/connections/"))).toEqual([]);
+    });
+
+    it("lists only providers that can browse repos when the server sends several", async () => {
+      mockConnectionFetch({
+        "/v1/connections/github/repos": { connected: true, repos: [OCTO_HELLO] },
+      });
+      renderLanding({
+        managed_sandboxes_enabled: true,
+        git_providers: [
+          gitProviderInfo("github", "GitHub"),
+          gitProviderInfo("azure_devops", "Azure DevOps", {
+            connection: false,
+            repo_browser: false,
+            credential_broker: false,
+          }),
+        ],
+      });
+      await openRepoPopover();
+
+      await screen.findByRole("combobox", { name: "GitHub repository" });
+      expect(screen.getAllByTestId("new-chat-landing-repo-select")).toHaveLength(1);
+      expect(fetchedUrls()).not.toContain("/v1/connections/azure_devops/repos");
+    });
+
+    it("renders no picker for a provider whose account is not connected", async () => {
+      mockConnectionFetch({ "/v1/connections/github/repos": { connected: false, repos: [] } });
+      renderLanding({ managed_sandboxes_enabled: true, enabled_connections: ["github"] });
+      await openRepoPopover();
+
+      await screen.findByTestId("new-chat-landing-repo-input");
+      await waitFor(() => expect(fetchedUrls()).toContain("/v1/connections/github/repos"));
+      expect(screen.queryByTestId("new-chat-landing-repo-select")).toBeNull();
+      expect(screen.queryByTestId("new-chat-landing-repo-error")).toBeNull();
+    });
+
+    it("says so when the GitHub repo list fails to load", async () => {
+      mockConnectionFetch({}, ["/v1/connections/github/repos"]);
+      renderLanding({ managed_sandboxes_enabled: true, enabled_connections: ["github"] });
+      await openRepoPopover();
+
+      expect(await screen.findByTestId("new-chat-landing-repo-error")).toHaveTextContent(
+        "Couldn't load your GitHub repositories. Paste a repository URL below.",
+      );
+      expect(screen.queryByTestId("new-chat-landing-repo-select")).toBeNull();
+    });
+
+    it("names the provider whose repo list failed and keeps the other's picker", async () => {
+      mockConnectionFetch({ "/v1/connections/fake_git/repos": { connected: true, repos: [] } }, [
+        "/v1/connections/github/repos",
+      ]);
+      renderLanding({
+        managed_sandboxes_enabled: true,
+        git_providers: [
+          gitProviderInfo("github", "GitHub"),
+          gitProviderInfo("fake_git", "Fake Git"),
+        ],
+      });
+      await openRepoPopover();
+
+      expect(await screen.findByTestId("new-chat-landing-repo-error")).toHaveTextContent(
+        "Couldn't load your GitHub repositories. Paste a repository URL below.",
+      );
+      expect(screen.getByRole("combobox", { name: "fake_git repository" })).toBeVisible();
+      expect(screen.queryByRole("combobox", { name: "GitHub repository" })).toBeNull();
+    });
+
+    it("notes a truncated repo list", async () => {
+      mockConnectionFetch({
+        "/v1/connections/github/repos": { connected: true, repos: [OCTO_HELLO], truncated: true },
+      });
+      renderLanding({ managed_sandboxes_enabled: true, enabled_connections: ["github"] });
+      await openRepoPopover();
+
+      expect(await screen.findByTestId("new-chat-landing-repo-truncated")).toHaveTextContent(
+        "Showing your most recently pushed repositories. Don't see one? Paste its URL below.",
+      );
+    });
   });
 
   it("creates a managed session without host_id/workspace and no provisioning subtext", async () => {

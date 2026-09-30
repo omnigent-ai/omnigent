@@ -84,4 +84,14 @@ describe("gitProviderCopy", () => {
   it("does not resolve inherited object keys as providers", () => {
     expect(gitProviderCopy("toString").label).toBe("toString");
   });
+
+  it("derives a clone URL for GitHub only", () => {
+    expect(gitProviderCopy("github").cloneUrlFor?.("octo/hello")).toBe(
+      "https://github.com/octo/hello.git",
+    );
+    // A provider without a pattern needs the API to supply `clone_url`.
+    expect(gitProviderCopy("azure_devops").cloneUrlFor).toBeUndefined();
+    expect(gitProviderCopy("nope").cloneUrlFor).toBeUndefined();
+    expect(gitProviderCopy(null).cloneUrlFor).toBeUndefined();
+  });
 });

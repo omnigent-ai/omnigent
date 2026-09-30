@@ -1,5 +1,5 @@
-// Provider-visible copy for the pull request panel, keyed by the info payload's
-// `provider` id. A host that predates the field serves GitHub.
+// Provider-visible copy for the pull request panel and the new-chat repository
+// picker, keyed by the provider id. A host that predates the field serves GitHub.
 
 import type { ComponentType } from "react";
 import AzureMono from "@lobehub/icons/es/Azure/components/Mono";
@@ -30,6 +30,8 @@ export interface GitProviderCopy {
   signInWithoutCli?: boolean;
   /** Hint when the upstream repo can't be reached; `authHint` when absent. */
   repoUnresolvedHint?: string;
+  /** Clone URL of a repo the connection lists; absent when the API must supply `clone_url`. */
+  cloneUrlFor?: (fullName: string) => string;
 }
 
 const GITHUB: GitProviderCopy = {
@@ -43,6 +45,7 @@ const GITHUB: GitProviderCopy = {
   cliLabel: "GitHub CLI",
   repoUnresolvedHint:
     "Pick the account to use, or run `gh auth status` on the host to confirm the GitHub CLI is signed in.",
+  cloneUrlFor: (fullName) => `https://github.com/${fullName}.git`,
 };
 
 const AZURE_DEVOPS: GitProviderCopy = {

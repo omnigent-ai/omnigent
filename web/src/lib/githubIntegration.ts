@@ -9,6 +9,13 @@
  */
 
 import { withBasePath } from "./basePath";
+import {
+  fetchConnectionBranches,
+  fetchConnectionRepos,
+  type ConnectionBranchList,
+  type ConnectionRepo,
+  type ConnectionRepoList,
+} from "./connectionsApi";
 import { authenticatedFetch } from "./identity";
 
 /** Shape of ``GET /v1/connections/github/status``. */
@@ -46,60 +53,32 @@ export function beginGithubConnect(returnTo: string): void {
   window.location.href = withBasePath(url);
 }
 
-/** A repo the connected user can access, from ``GET .../github/repos``. */
-export interface GithubRepo {
-  /** ``owner/name``, e.g. ``"caffeinelabs/app"``. */
-  full_name: string;
-  /** HTTPS clone URL, or null. */
-  clone_url: string | null;
-  /** Default branch, or null. */
-  default_branch: string | null;
-  /** Whether the repo is private. */
-  private: boolean;
-  /** ISO-8601 last-push time, or null (list is newest-first). */
-  pushed_at: string | null;
-}
+/** @deprecated Use ``ConnectionRepo`` from ``connectionsApi``. Removal: 0.19.0. */
+export type GithubRepo = ConnectionRepo;
 
-/** Shape of ``GET /v1/connections/github/repos``. */
-export interface GithubRepoList {
-  /** False when the user hasn't connected GitHub (repos is then empty). */
-  connected: boolean;
-  repos: GithubRepo[];
-  /** True when the page cap was hit and more repos exist than are returned. */
-  truncated?: boolean;
-}
+/** @deprecated Use ``ConnectionRepoList`` from ``connectionsApi``. Removal: 0.19.0. */
+export type GithubRepoList = ConnectionRepoList;
+
+/** @deprecated Use ``ConnectionBranchList`` from ``connectionsApi``. Removal: 0.19.0. */
+export type GithubBranchList = ConnectionBranchList;
 
 /**
  * Fetch the repos the current user can access (App-scoped, newest first).
- * Returns ``connected: false`` with an empty list when GitHub isn't linked,
- * so callers can fall back to a free-text repo URL.
+ *
+ * @deprecated Use ``fetchConnectionRepos("github")`` from ``connectionsApi``. Removal: 0.19.0.
  */
-export async function fetchGithubRepos(): Promise<GithubRepoList> {
-  const res = await authenticatedFetch("/v1/connections/github/repos");
-  if (!res.ok) {
-    throw new Error(`GitHub repos failed: ${res.status}`);
-  }
-  return (await res.json()) as GithubRepoList;
-}
-
-/** Shape of ``GET .../github/repos/{owner}/{repo}/branches``. */
-export interface GithubBranchList {
-  /** False when the user hasn't connected GitHub (branches is then empty). */
-  connected: boolean;
-  branches: string[];
+export function fetchGithubRepos(): Promise<GithubRepoList> {
+  return fetchConnectionRepos("github");
 }
 
 /**
- * Fetch the branch names for ``fullName`` (``owner/repo``), for the
- * per-repo branch picker. Returns ``connected: false`` with an empty list
- * when GitHub isn't linked.
+ * Fetch the branch names for ``fullName`` (``owner/repo``).
+ *
+ * @deprecated Use ``fetchConnectionBranches("github", fullName)`` from ``connectionsApi``.
+ * Removal: 0.19.0.
  */
-export async function fetchGithubBranches(fullName: string): Promise<GithubBranchList> {
-  const res = await authenticatedFetch(`/v1/connections/github/repos/${fullName}/branches`);
-  if (!res.ok) {
-    throw new Error(`GitHub branches failed: ${res.status}`);
-  }
-  return (await res.json()) as GithubBranchList;
+export function fetchGithubBranches(fullName: string): Promise<GithubBranchList> {
+  return fetchConnectionBranches("github", fullName);
 }
 
 /** Disconnect the current user's GitHub account. */
