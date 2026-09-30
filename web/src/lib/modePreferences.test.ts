@@ -64,6 +64,31 @@ describe("modePreferences (per-harness options)", () => {
     expect(readHarnessOptions("claude-native")).toEqual({ model: "", effort: "" });
   });
 
+  it("drops legacy Codex model picks while preserving durable options", () => {
+    localStorage.setItem(
+      KEY,
+      JSON.stringify({
+        "codex-native": { model: "astra", effort: "high", mode: "full-access", routing: "on" },
+      }),
+    );
+
+    expect(readHarnessOptions("codex-native")).toEqual({
+      effort: "high",
+      mode: "full-access",
+      routing: "on",
+    });
+    expect(JSON.parse(localStorage.getItem(KEY) ?? "{}")["codex-native"]).toEqual({
+      effort: "high",
+      mode: "full-access",
+      routing: "on",
+    });
+  });
+
+  it("does not persist new Codex model picks", () => {
+    writeHarnessOption("codex-native", { model: "astra", effort: "high", mode: "plan" });
+    expect(readHarnessOptions("codex-native")).toEqual({ effort: "high", mode: "plan" });
+  });
+
   it("ignores a null/empty harness on write", () => {
     writeHarnessOption(null, { mode: "auto" });
     writeHarnessOption("", { mode: "auto" });

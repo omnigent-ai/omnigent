@@ -1,9 +1,9 @@
 // Persisted, app-global "remembered options" for the new-session landing
 // composer, keyed by harness. Each harness gets a small string->string map of
 // the option knobs the user last picked for it — Claude Code's permission mode
-// + model + effort, Codex's / OpenCode's approval mode, Cursor's exec mode — so
-// a returning user's new session seeds those instead of starting on the harness
-// default.
+// + model + effort, Codex's approval mode + effort, Cursor's exec mode — so a
+// returning user's new session seeds those instead of starting on the harness
+// default. Codex model picks are intentionally session-scoped and never stored.
 //
 // One store holding a per-harness options OBJECT (not a single value), so any
 // harness with start-session options remembers all of them under one roof. The
@@ -19,6 +19,7 @@
 // remembered mode survives the generalization without a reset.
 
 const STORAGE_KEY = "omnigent:last-mode-by-harness";
+const CODEX_NATIVE_HARNESS = "codex-native";
 
 /** A harness's remembered option knobs (e.g. `{ mode, model, effort }`). */
 export type HarnessOptions = Record<string, string>;
@@ -51,9 +52,23 @@ function readMap(): OptionsMap {
     const parsed: unknown = JSON.parse(raw);
     if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return {};
     const out: OptionsMap = {};
+    let migrated = false;
     for (const [harness, value] of Object.entries(parsed as Record<string, unknown>)) {
       const entry = coerceEntry(value);
+      // Codex model picks are session-scoped. Drop the model persisted by
+      // v0.16 and earlier so it cannot become a returning user's default.
+      if (harness === CODEX_NATIVE_HARNESS && "model" in entry) {
+        delete entry.model;
+        migrated = true;
+      }
       if (Object.keys(entry).length > 0) out[harness] = entry;
+    }
+    if (migrated) {
+      try {
+        window.localStorage.setItem(STORAGE_KEY, JSON.stringify(out));
+      } catch {
+        // A migration failure is harmless: the returned map is still cleaned.
+      }
     }
     return out;
   } catch {
@@ -74,9 +89,10 @@ export function readHarnessOptions(harness: string | null | undefined): HarnessO
 
 /**
  * Merge `patch` into `harness`'s remembered options (a partial set of knobs, so
- * a model-only change preserves a stored effort/mode). Reading through `readMap`
- * first also normalizes/self-heals any legacy or corrupt entries on write.
- * Swallows quota/access errors so a failed write can't break session creation.
+ * a model-only change preserves a stored effort/mode). Codex model fields are
+ * ignored because that pick belongs to one composer visit. Reading through
+ * `readMap` first also normalizes/self-heals any legacy or corrupt entries on
+ * write. Swallows quota/access errors so a failed write can't break session creation.
  */
 export function writeHarnessOption(
   harness: string | null | undefined,
@@ -85,8 +101,16 @@ export function writeHarnessOption(
   if (typeof window === "undefined" || !harness) return;
   try {
     const map = readMap();
-    map[harness] = { ...map[harness], ...patch };
-    window.localStorage.setItem(STORAGE_KEY, JSON.stringify(map));
+    const persistedPatch =
+      harness === CODEX_NATIVE_HARNESS
+        ? Object.fromEntries(Object.entries(patch).filter(([key]) => key !== "model"))
+        : patch;
+    const next = { ...map[harness], ...persistedPatch };
+    const nextMap =
+      Object.keys(next).length > 0
+        ? { ...map, [harness]: next }
+        : Object.fromEntries(Object.entries(map).filter(([key]) => key !== harness));
+    window.localStorage.setItem(STORAGE_KEY, JSON.stringify(nextMap));
   } catch {
     // localStorage quota or access errors shouldn't break the composer.
   }

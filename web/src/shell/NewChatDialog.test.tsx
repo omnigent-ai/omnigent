@@ -1955,8 +1955,10 @@ describe("NewChatLandingScreen cached picker preview", () => {
           };
           mockModelQueries(() => cachedModels);
           const first = renderLanding();
+          const expectedCachedModel =
+            harness === "codex-native" ? "Models unavailable" : "Cached model";
           expect(screen.getByTestId("new-chat-landing-agent-select")).toHaveTextContent(
-            "Cached model",
+            expectedCachedModel,
           );
           first.unmount();
 
@@ -1985,7 +1987,7 @@ describe("NewChatLandingScreen cached picker preview", () => {
             expect(picker).not.toHaveTextContent("Cached model");
             expect(screen.getByTestId("new-chat-landing-agent-warning")).toBeVisible();
           } else {
-            expect(picker).toHaveTextContent("Cached model");
+            expect(picker).toHaveTextContent(expectedCachedModel);
             openAgentModels("a1");
             expect(screen.getByTestId("new-chat-landing-agent-model-cached-model")).toBeVisible();
             closeMenu();
@@ -2028,7 +2030,8 @@ describe("NewChatLandingScreen cached picker preview", () => {
         ]);
         mockModelQueries(() => ({ ...SUCCESS_QUERY_STATE, data: [] }));
         const first = renderLanding();
-        const expectedSummary = catalogState === "absent" ? "saved-model" : "Default";
+        const expectedSummary =
+          harness === "codex-native" || catalogState === "empty" ? "Default" : "saved-model";
         fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
         expect(screen.getByTestId("new-chat-landing-agent-summary-a1")).toHaveTextContent(
           expectedSummary,
@@ -4209,7 +4212,7 @@ describe("NewChatLandingScreen", () => {
           fireEvent.click(screen.getByTestId("new-chat-landing-harness-more"));
         }
         expect(screen.getByTestId(`new-chat-landing-agent-summary-${agent.id}`)).toHaveTextContent(
-          enabled ? "Default" : "saved-model",
+          enabled || agent.harness === "codex-native" ? "Default" : "saved-model",
         );
       },
     );
@@ -5554,7 +5557,7 @@ describe("NewChatLandingScreen", () => {
     expect(selectedPickerEffort().textContent).toContain("High");
   });
 
-  it("sends the selected Codex launch model without changing Claude's remembered model", async () => {
+  it("sends the selected Codex launch model without persisting it", async () => {
     authenticatedFetchMock.mockResolvedValue({
       ok: true,
       json: async () => ({ id: "conv_new" }),
@@ -5567,16 +5570,8 @@ describe("NewChatLandingScreen", () => {
     fireEvent.click(screen.getByText("GPT-5.6"));
     closePrimaryPicker();
 
-    // The Codex model is remembered under codex-native only; Claude Code's
-    // picker should reopen on its own Default instead of inheriting the GPT id.
-    openAgentModels("a1");
-    expect(selectedPickerModel().textContent).toContain("Harness default");
-    expect(selectedPickerModel().textContent).not.toContain("GPT-5.6");
-    closePrimaryPicker();
-
-    openAgentModels("a2");
-    expect(selectedPickerModel().textContent).toContain("GPT-5.6");
-    closePrimaryPicker();
+    expect(readHarnessOptions("codex-native")).not.toHaveProperty("model");
+    expect(readHarnessOptions("claude-native")).not.toHaveProperty("model");
     fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
       target: { value: "run the build" },
     });
@@ -5592,6 +5587,47 @@ describe("NewChatLandingScreen", () => {
       true,
       expect.any(Object),
     );
+  });
+
+  it("keeps a Codex model pick to the current create only", async () => {
+    const codexWithAstra = {
+      ...CODEX_MODEL_OPTIONS_RESULT,
+      data: [
+        CODEX_MODEL_OPTIONS_RESULT.data[0],
+        {
+          id: "astra",
+          displayName: "Astra",
+          supportedReasoningEfforts: [{ reasoningEffort: "high" }],
+        },
+      ],
+    };
+    useHostModelOptionsMock.mockImplementation(
+      (_hostId, harness) =>
+        (harness === "codex-native"
+          ? codexWithAstra
+          : CLAUDE_MODEL_OPTIONS_RESULT) as unknown as ReturnType<typeof useHostModelOptions>,
+    );
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+    renderLanding();
+
+    openAgentModels("a2");
+    fireEvent.click(screen.getByRole("menuitemcheckbox", { name: "Astra" }));
+    closePrimaryPicker();
+    const first = await submitAndReadBody("use Astra once");
+    expect(first.body.model_override).toBe("astra");
+    expect(readHarnessOptions("codex-native")).not.toHaveProperty("model");
+
+    authenticatedFetchMock.mockClear();
+    remountLanding();
+    selectAgent("a2");
+    openAgentModels("a2");
+    expect(selectedPickerModel().textContent).toContain("GPT-5.5");
+    closePrimaryPicker();
+    const next = await submitAndReadBody("use the default");
+    expect(next.body.model_override).toBeUndefined();
   });
 
   it("keeps legacy Mod+Enter as a default-mode send alias", async () => {
@@ -9166,10 +9202,8 @@ describe("NewChatLandingScreen smart routing", () => {
   });
 
   it("clears a stale remembered model when Codex picks Smart Routing", async () => {
-    // Codex's modal has no model picker of its own, so a model remembered under
-    // codex-native has no other path out of the store. Left behind it rides
-    // along with routing, and a session that carries both reads as
-    // already-model-pinned server-side — routing then never runs.
+    // A v0.16 Codex model may still be present in localStorage. The migration
+    // strips it before routing can seed or send the stale one.
     localStorage.setItem(
       HARNESS_OPTIONS_KEY,
       JSON.stringify({ "codex-native": { model: "databricks-gpt-5-5", effort: "high" } }),
@@ -9187,7 +9221,10 @@ describe("NewChatLandingScreen smart routing", () => {
     closePrimaryPicker();
     expect(
       JSON.parse(localStorage.getItem(HARNESS_OPTIONS_KEY) ?? "{}")["codex-native"],
-    ).toMatchObject({ routing: "on", model: "", effort: "" });
+    ).toMatchObject({ routing: "on", effort: "" });
+    expect(
+      JSON.parse(localStorage.getItem(HARNESS_OPTIONS_KEY) ?? "{}")["codex-native"],
+    ).not.toHaveProperty("model");
 
     const { body } = await submitAndReadBody();
     expect(body.agent_id).toBe("a2");

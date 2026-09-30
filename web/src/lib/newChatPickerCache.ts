@@ -98,6 +98,33 @@ function preferenceSignature(preview: { agent: NewChatPickerPreview["agent"] }):
   ]);
 }
 
+function withoutCodexModel<T extends { agent: NewChatPickerPreview["agent"]; model: string }>(
+  value: T,
+): T {
+  return nativeCodingAgentForAvailableAgent(value.agent)?.harness === "codex-native" && value.model
+    ? ({ ...value, model: "" } as T)
+    : value;
+}
+
+function clearCachedModel(key: string | null): void {
+  if (key === null || typeof window === "undefined") return;
+  try {
+    const stored: unknown = JSON.parse(window.localStorage.getItem(key) ?? "null");
+    if (stored === null || typeof stored !== "object" || Array.isArray(stored)) return;
+    const envelope = stored as Record<string, unknown>;
+    const preview = envelope.preview;
+    if (preview === null || typeof preview !== "object" || Array.isArray(preview)) return;
+    const fields = preview as Record<string, unknown>;
+    if (typeof fields.model !== "string" || fields.model === "") return;
+    window.localStorage.setItem(
+      key,
+      JSON.stringify({ ...envelope, preview: { ...fields, model: "" } }),
+    );
+  } catch {
+    // The sanitized in-memory value remains safe when storage cannot be migrated.
+  }
+}
+
 function workspacePreferenceSignature(preview: NewChatWorkspacePreview): string {
   return JSON.stringify([
     readLastHostChoice(),
@@ -148,24 +175,29 @@ function writePreview<T>(
 }
 
 export function readNewChatPickerCache(key: string | null): NewChatPickerPreview | null {
-  return readPreview(key, previewSchema, preferenceSignature);
+  const preview = readPreview(key, previewSchema, preferenceSignature);
+  if (preview === null) return null;
+  const normalized = withoutCodexModel(preview);
+  if (normalized !== preview) clearCachedModel(key);
+  return normalized;
 }
 
 export function writeNewChatPickerCache(
   key: string | null,
   preview: NewChatPickerPreview | null,
 ): void {
-  writePreview(key, preview, preferenceSignature);
+  writePreview(key, preview === null ? null : withoutCodexModel(preview), preferenceSignature);
 }
 
 export function readNewChatPickerOptionsCache(key: string | null): NewChatPickerOptions | null {
-  const cached = readPreview(
-    key === null ? null : `${key}:options`,
-    storedPickerOptionsSchema,
-    preferenceSignature,
-  );
+  const cacheKey = key === null ? null : `${key}:options`;
+  const cached = readPreview(cacheKey, storedPickerOptionsSchema, preferenceSignature);
   if (cached === null) return null;
-  const { catalogVersion, ...options } = cached;
+  const normalized = withoutCodexModel(cached);
+  if (normalized !== cached) clearCachedModel(cacheKey);
+  const { catalogVersion, ...options } = normalized;
+  // Codex model picks belong to one composer visit. Older caches may still
+  // carry one, so neutralize it before the landing can use the preview.
   if (catalogVersion === undefined) {
     // Older caches stored missing catalogs as empty arrays; only populated lists are known.
     for (const harness of ["claude", "codex", "pi"] as const) {
@@ -179,9 +211,10 @@ export function writeNewChatPickerOptionsCache(
   key: string | null,
   options: NewChatPickerOptions | null,
 ): void {
+  const persistedOptions = options === null ? null : withoutCodexModel(options);
   writePreview(
     key === null ? null : `${key}:options`,
-    options === null ? null : { ...options, catalogVersion: 1 },
+    persistedOptions === null ? null : { ...persistedOptions, catalogVersion: 1 },
     preferenceSignature,
   );
 }

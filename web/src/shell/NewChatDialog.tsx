@@ -3983,7 +3983,11 @@ export function NewChatLandingScreen() {
     prefillConfig.agentId != null &&
     effectiveAgentId === prefillConfig.agentId
       ? prefillConfig.model
-      : prefillConfig === undefined && cachedPickerOptions?.agent.id === effectiveAgentId
+      : // The generic picker cache also holds the last live model, but Codex
+        // selections are one-session-only and must not become a new-chat default.
+        prefillConfig === undefined &&
+          selectedNativeHarness !== "codex-native" &&
+          cachedPickerOptions?.agent.id === effectiveAgentId
         ? cachedPickerOptions.model
         : null;
   // The same default validated against the selected harness's current vocab.

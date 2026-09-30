@@ -91,6 +91,53 @@ describe("newChatPickerCache", () => {
     expect(readNewChatPickerOptionsCache(key)).toEqual(options);
   });
 
+  it("does not retain a Codex model in the display cache", () => {
+    const codexPreview = {
+      ...preview,
+      agent: { name: "codex-native-ui", harness: "codex-native" },
+      model: "Astra",
+    };
+
+    writeNewChatPickerCache(key, codexPreview);
+    expect(readNewChatPickerCache(key)).toEqual({ ...codexPreview, model: "" });
+    expect(JSON.parse(localStorage.getItem(key)!)).toMatchObject({ preview: { model: "" } });
+
+    const legacy = JSON.parse(localStorage.getItem(key)!);
+    legacy.preview.model = "Astra";
+    localStorage.setItem(key, JSON.stringify(legacy));
+    expect(readNewChatPickerCache(key)).toEqual({ ...codexPreview, model: "" });
+    expect(JSON.parse(localStorage.getItem(key)!)).toMatchObject({ preview: { model: "" } });
+  });
+
+  it("does not retain a Codex model in the menu cache", () => {
+    const codexAgent = {
+      ...menuAgent,
+      name: "codex-native-ui",
+      display_name: "Codex",
+      harness: "codex-native",
+    };
+    const codexOptions = {
+      ...options,
+      agent: codexAgent,
+      agents: [codexAgent],
+      model: "coding-model",
+    };
+
+    writeNewChatPickerOptionsCache(key, codexOptions);
+    expect(readNewChatPickerOptionsCache(key)).toEqual({ ...codexOptions, model: "" });
+    expect(JSON.parse(localStorage.getItem(`${key}:options`)!)).toMatchObject({
+      preview: { model: "" },
+    });
+
+    const legacy = JSON.parse(localStorage.getItem(`${key}:options`)!);
+    legacy.preview.model = "coding-model";
+    localStorage.setItem(`${key}:options`, JSON.stringify(legacy));
+    expect(readNewChatPickerOptionsCache(key)).toEqual({ ...codexOptions, model: "" });
+    expect(JSON.parse(localStorage.getItem(`${key}:options`)!)).toMatchObject({
+      preview: { model: "" },
+    });
+  });
+
   it("preserves missing catalogs separately from successfully fetched empty catalogs", () => {
     const partialOptions = {
       ...options,
