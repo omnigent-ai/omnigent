@@ -105,10 +105,11 @@ describe("ImportReviewGate", () => {
 describe("ImportReviewGate with a requested host", () => {
   it("waits for an offline target without showing another host's imports", async () => {
     serve([host("target", { status: "offline" }), host("other")], { target: ["t"], other: ["o"] });
-    requestImportReview("target");
+    requestImportReview({ hostId: "target", runner: "remote" });
     renderWithClient(<ImportReviewGate />);
 
-    expect(await screen.findByText("Checking your harnesses…")).toBeTruthy();
+    // A listed host is named rather than described by its runner.
+    expect(await screen.findByText("Connecting to target-machine…")).toBeTruthy();
     await waitFor(() => expect(authenticatedFetchMock).toHaveBeenCalled());
     expect(screen.queryByText("/o")).toBeNull();
     expect(screen.queryByText(/is offline/)).toBeNull();
@@ -118,9 +119,9 @@ describe("ImportReviewGate with a requested host", () => {
   it("shows the target's imports once it connects", async () => {
     // Not registered yet (Arca's tunnel lags its daemon), then online.
     serve([host("other")], { target: ["t"], other: ["o"] });
-    requestImportReview("target");
+    requestImportReview({ hostId: "target", runner: "remote" });
     const { client } = renderWithClient(<ImportReviewGate />);
-    expect(await screen.findByText("Checking your harnesses…")).toBeTruthy();
+    expect(await screen.findByText("Connecting to Arca…")).toBeTruthy();
 
     serve([host("other"), host("target")], { target: ["t"], other: ["o"] });
     await client.invalidateQueries({ queryKey: ["hosts"] });
@@ -132,7 +133,7 @@ describe("ImportReviewGate with a requested host", () => {
 
   it("treats 409 as still connecting, not an error", async () => {
     serve([host("target")], { target: ["t"] }, { absentSkillCalls: 1 });
-    requestImportReview("target");
+    requestImportReview({ hostId: "target" });
     renderWithClient(<ImportReviewGate />);
 
     expect(await screen.findByText("Checking your harnesses…")).toBeTruthy();
@@ -142,10 +143,31 @@ describe("ImportReviewGate with a requested host", () => {
     expect(screen.queryByText(/Couldn't read/)).toBeNull();
   });
 
+  it.each([
+    ["local", "Connecting this Mac…"],
+    [undefined, "Connecting…"],
+  ] as const)("describes an unlisted %s runner while it connects", async (runner, copy) => {
+    serve([host("other")], { other: ["o"] });
+    requestImportReview({ hostId: "target", runner });
+    renderWithClient(<ImportReviewGate />);
+
+    expect(await screen.findByText(copy)).toBeTruthy();
+    await waitFor(() => expect(authenticatedFetchMock).toHaveBeenCalled());
+    expect(screen.queryByText("/o")).toBeNull();
+  });
+
+  it("names a single targeted host", async () => {
+    serve([host("target")], { target: ["t"] });
+    requestImportReview({ hostId: "target" });
+    renderWithClient(<ImportReviewGate />);
+
+    expect(await screen.findByText(/Found in your harnesses on target-machine\./)).toBeTruthy();
+  });
+
   it("shows a reviewed target and clears the request on dismiss", async () => {
     window.localStorage.setItem("omnigent:imports-reviewed:target", "x");
     serve([host("target"), host("other")], { target: ["t"], other: ["o"] });
-    requestImportReview("target");
+    requestImportReview({ hostId: "target" });
     renderWithClient(<ImportReviewGate />);
 
     expect(await screen.findByText("/t")).toBeTruthy();

@@ -11,6 +11,7 @@ import {
   importsReviewed,
   markImportsReviewed,
   useImportReviewRequest,
+  type ImportReviewTarget,
 } from "@/lib/importReviewState";
 
 function InventoryModal({
@@ -19,10 +20,12 @@ function InventoryModal({
   inventory,
   open,
   onOpenChange,
+  loadingMessage,
 }: {
   hostId: string;
   /** Shown when the user has several machines. */
   hostName?: string;
+  loadingMessage?: string;
   inventory: HarnessInventory;
   open: boolean;
   onOpenChange: (open: boolean) => void;
@@ -40,6 +43,7 @@ function InventoryModal({
       status={inventory.status}
       unavailable={inventory.unavailable}
       hostName={hostName}
+      loadingMessage={loadingMessage}
     />
   );
 }
@@ -74,22 +78,32 @@ export function HostImportsDialog({
  * whose harnesses bring MCPs, skills, or plugins.
  */
 export function ImportReviewGate() {
-  const requestedHostId = useImportReviewRequest();
-  if (requestedHostId !== null) {
-    return <RequestedImportReview key={requestedHostId} hostId={requestedHostId} />;
+  const target = useImportReviewRequest();
+  if (target !== null) {
+    return <RequestedImportReview key={target.hostId} target={target} />;
   }
   return <NewHostImportReview />;
 }
 
+/** Loading copy while the target isn't online; the default once it's fetching inventory. */
+function connectingMessage(host: Host | null, runner: ImportReviewTarget["runner"]) {
+  if (host?.status === "online") return undefined;
+  if (host) return `Connecting to ${host.name}…`;
+  if (runner === "remote") return "Connecting to Arca…";
+  if (runner === "local") return "Connecting this Mac…";
+  return "Connecting…";
+}
+
 /** Shows only the requested host, loading until it connects; never another host. */
-function RequestedImportReview({ hostId }: { hostId: string }) {
+function RequestedImportReview({ target }: { target: ImportReviewTarget }) {
   const { data: hosts } = useHosts();
-  const host = hosts?.find((candidate) => candidate.host_id === hostId) ?? null;
+  const host = hosts?.find((candidate) => candidate.host_id === target.hostId) ?? null;
   const inventory = useHarnessInventory(host, { awaitConnection: true });
   return (
     <InventoryModal
-      hostId={hostId}
-      hostName={host && (hosts?.length ?? 0) > 1 ? host.name : undefined}
+      hostId={target.hostId}
+      hostName={host?.name}
+      loadingMessage={connectingMessage(host, target.runner)}
       inventory={inventory}
       open
       onOpenChange={(next) => {

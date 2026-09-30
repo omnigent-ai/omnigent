@@ -242,6 +242,8 @@ export interface ImportContextModalProps {
   hostName?: string;
   /** Asset kinds the host couldn't report. */
   unavailable?: InventoryAssetKind[];
+  /** Replaces the default loading copy, e.g. while the host is still connecting. */
+  loadingMessage?: string;
 }
 
 export function ImportContextModal({
@@ -276,6 +278,7 @@ function ImportContextBody({
   status = "ready",
   hostName,
   unavailable = NONE_UNAVAILABLE,
+  loadingMessage = "Checking your harnesses…",
 }: Omit<ImportContextModalProps, "open" | "onOpenChange">) {
   const harnesses = detectedHarnesses(context);
   const notice = unavailableNotice(unavailable);
@@ -286,7 +289,7 @@ function ImportContextBody({
     content = (
       <EmptyState>
         <Loader2 className="mx-auto mb-2 size-4 animate-spin" aria-hidden="true" />
-        Checking your harnesses…
+        {loadingMessage}
       </EmptyState>
     );
   } else if (status === "offline") {
