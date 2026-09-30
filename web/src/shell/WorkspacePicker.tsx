@@ -739,7 +739,7 @@ export function WorkspacePicker({
                     key={item.path || "home"}
                     className={cn("flex min-w-0 items-center gap-1", !isLast && "shrink-0")}
                   >
-                    {index > 0 && (
+                    {index > 0 && breadcrumbItems[index - 1].path !== "/" && (
                       <span className="shrink-0 text-muted-foreground" aria-hidden>
                         /
                       </span>

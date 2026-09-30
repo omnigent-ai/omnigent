@@ -328,7 +328,15 @@ Do **not** substitute a direct call to the internal function the report blames,
 and do **not** hand-fabricate the end-state the bug would produce (e.g. writing a
 session row with the labels you *expect* the buggy path to omit) — both bake your
 own root-cause guess into the reproduction, so if the guess is wrong the test
-guards the wrong thing. If the real journey can't run because a precondition is
+guards the wrong thing. A raw HTTP/REST request or a direct database
+insert/update is **not** a journey step: a DB write is never a user action (reach
+that state through the user path that creates it), and a raw API call belongs in
+the journey only when the API/SDK *is* the user's surface (see "Prefer a
+user-facing surface" below). If you use one to set up or execute a
+reproduction, it is an `evidence` tooling detail — you still verify and describe
+the real user path.
+
+If the real journey can't run because a precondition is
 missing in your environment, **establish that precondition and drive the real
 path** rather than shortcutting around it. For example, a scheduled automation
 genuinely cannot fire without an online host, so a faithful repro *makes a host
@@ -414,7 +422,11 @@ independently, because a compound bug can be partly fixed:
   rules above.
 - **Backend/behavioral bugs** — create a session and drive turns via
   `sys_session_*`, or exercise the server's HTTP API directly, and capture the
-  bad response / traceback / exit.
+  bad response / traceback / exit. These drivers *execute* the reproduction; they
+  don't redefine the journey. Use them only when the API is the user's genuine
+  surface, or to stand up state whose real user path you still verify per Step 1 —
+  never as a stand-in for a UI/terminal/CLI action, and **never reproduce by
+  writing to the database directly**.
 
 **Inspect screenshots as images.** Do not use `browser_navigate` with a
 `file://` URL to inspect CI artifacts: it targets the desktop browser, not the

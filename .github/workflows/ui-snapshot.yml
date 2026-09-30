@@ -95,7 +95,7 @@ jobs:
           if ! files=$(gh api "repos/$REPO/pulls/$PR/files" --paginate --jq '.[].filename'); then
             echo "ui=true" >> "$GITHUB_OUTPUT"; echo "file list unavailable -> render"; exit 0
           fi
-          pattern='^(web/|tests/e2e_ui/visual/|tests/e2e_ui/conftest\.py|\.github/actions/setup-pnpm/|\.github/workflows/ui-snapshot\.yml|pnpm-lock\.yaml|pnpm-workspace\.yaml|pyproject\.toml|uv\.lock)'
+          pattern='^(web/|tests/e2e_ui/visual/|tests/e2e_ui/conftest\.py|tests/helpers/|\.github/actions/setup-pnpm/|\.github/workflows/ui-snapshot\.yml|pnpm-lock\.yaml|pnpm-workspace\.yaml|pyproject\.toml|uv\.lock)'
           if printf '%s\n' "$files" | grep -qE "$pattern"; then
             echo "ui=true" >> "$GITHUB_OUTPUT"
             echo "render-affecting files changed:"

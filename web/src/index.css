@@ -928,8 +928,8 @@ aside[aria-label="Workspace"][data-maximized] {
 }
 
 /* The iOS WKWebView runs full-screen under the keyboard at every responsive
- * width. Lock the shell to the visual viewport published by
- * useIOSViewportLock so flow content, including the composer, stays visible. */
+ * width. useIOSViewportLock publishes the area above the docked keyboard so
+ * flow content stays visible without shrinking for floating iPad controls. */
 [data-ios-native].app-shell {
   height: 100lvh;
   height: var(--omnigent-viewport-height, 100lvh);
@@ -1276,6 +1276,15 @@ aside[aria-label="Workspace"][data-maximized] {
 }
 [data-streamdown="code-block-body"] {
   font-size: 0.875em;
+}
+/* Fallback mono fonts (e.g. JetBrains Mono) ship ligatures that can visually
+ * swallow spaces in CLI flags like `-c --markdown`; code must render literally. */
+[data-streamdown="inline-code"],
+[data-streamdown="code-block-body"] {
+  font-variant-ligatures: none;
+  font-feature-settings:
+    "liga" 0,
+    "calt" 0;
 }
 
 /* The transcript draws its own constant-height scrollbar (TranscriptScrollbar);

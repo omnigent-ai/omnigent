@@ -1,6 +1,9 @@
 name: Open Code Review
 
 on:
+  # Use trusted base-branch configuration for automatic reviews.
+  pull_request_target:
+    types: [opened, reopened, ready_for_review]
   issue_comment:
     types: [created]
   workflow_dispatch:
@@ -48,7 +51,15 @@ jobs:
             if (!Array.isArray(allowed)) throw new Error('REVIEW_ALLOWLIST must be a JSON array');
             let number;
             let force = false;
-            if (context.eventName === 'issue_comment') {
+            if (context.eventName === 'pull_request_target') {
+              const pr = context.payload.pull_request;
+              if (pr.draft || pr.state !== 'open') return;
+              if (pr.head.repo?.full_name !== `${owner}/${repo}`) {
+                core.notice('Skipping automatic OCR for a fork PR; use an authorized /ocr command.');
+                return;
+              }
+              number = pr.number;
+            } else if (context.eventName === 'issue_comment') {
               const comment = context.payload.comment;
               const commands = [...comment.body.matchAll(/^[ \t]*\/ocr(?:[ \t]+(force))?[ \t]*\r?$/gm)];
               if (!context.payload.issue.pull_request || comment.user.type === 'Bot' || !commands.length) return;
@@ -134,10 +145,12 @@ jobs:
                   const { data: run } = await github.rest.actions.getWorkflowRun({
                     ...context.repo, run_id: artifact.workflow_run.id,
                   });
+                  // Target-event runs report the PR head branch, but execute the trusted base workflow.
+                  const trustedTrigger = run.event === 'pull_request_target' ||
+                    (run.head_branch === context.payload.repository.default_branch &&
+                     ['issue_comment', 'workflow_dispatch'].includes(run.event));
                   if (run.workflow_id === workflow.id && run.status === 'completed' &&
-                      run.conclusion === 'success' &&
-                      run.head_branch === context.payload.repository.default_branch &&
-                      ['issue_comment', 'workflow_dispatch'].includes(run.event)) {
+                      run.conclusion === 'success' && trustedTrigger) {
                     prior = run;
                     break;
                   }
@@ -206,7 +219,19 @@ jobs:
           background: >-
             Review Omnigent changes for correctness, security, broken contracts,
             race conditions, and failure paths, including the tests. Verify
-            findings against surrounding code. Omit cosmetic feedback.
+            findings against surrounding code. Omit cosmetic feedback except
+            for this explicit code-comment policy: review added or modified
+            comments, preferring one line when a comment is needed and allowing
+            at most three lines per comment block. Treat consecutive line
+            comments as one block. Flag longer blocks, comments that merely
+            restate the code, and comments about PR or ticket history instead
+            of the scenario or reasoning. Useful two- or three-line explanations
+            are acceptable. Exempt docstrings, API documentation, license
+            headers, generated comments, and required tool directives. Do not
+            flag unchanged comments or prose in documentation files. Report
+            violations as low-severity findings with a concrete suggestion to
+            shorten, remove, or rewrite the comment; do not raise severity just
+            because this is an explicit policy.
           effort: medium
           review_concurrency: '2'
           review_task_timeout: '15'

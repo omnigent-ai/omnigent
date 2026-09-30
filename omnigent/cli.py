@@ -1754,6 +1754,7 @@ _HARNESS_COMMANDS: frozenset[str] = frozenset(
         "antigravity",
         "claude",
         "codex",
+        "copilot",
         "cursor",
         "debby",
         "devin",
@@ -1791,9 +1792,11 @@ def _harness_extra_checks() -> dict[str, Callable[[], bool]]:
     The predicates use ``importlib.util.find_spec`` (no heavy import).
     Commands absent from this map are always listed.
     """
+    from omnigent.onboarding.copilot_auth import copilot_sdk_installed
     from omnigent.onboarding.cursor_auth import cursor_sdk_installed
 
     return {
+        "copilot": copilot_sdk_installed,
         "cursor": cursor_sdk_installed,
     }
 
@@ -2099,6 +2102,7 @@ _CLICK_SUBCOMMANDS: frozenset[str] = frozenset(
         "claude",
         "codex",
         "config",
+        "copilot",
         "cursor",
         "debby",
         "debug",
@@ -4724,9 +4728,8 @@ def server(
             # read that loss as ours, not as the runners dying.
             _shutdown_state.mark_server_shutting_down()
             _session_stream.shutdown_all()
-            # Yield to the event loop so generators can consume _DONE,
-            # flush their final "data: [DONE]\n\n" chunk, and exit before
-            # super().shutdown() calls connection.shutdown() / transport.close().
+            # Yield so streams consume _DONE and exit before transports close.
+            # No [DONE] reaches browsers: they must reconnect after restart.
             # Without this pause the generators write to an already-closing
             # transport, leaving connections open past the graceful window.
             await _asyncio.sleep(0)
@@ -6348,6 +6351,20 @@ def debby(run_args: tuple[str, ...]) -> None:
       omnigent debby -p "name ideas for a CLI that runs agents"
     """
     _run_bundled_agent("debby", run_args)
+
+
+@cli.command(
+    context_settings={
+        "ignore_unknown_options": True,
+        "allow_extra_args": True,
+    }
+)
+@click.argument("run_args", nargs=-1, type=click.UNPROCESSED)
+def copilot(run_args: tuple[str, ...]) -> None:
+    """Launch GitHub Copilot with Omnigent.
+
+    Shorthand for ``omnigent run --harness copilot``; every ``run`` option is forwarded."""
+    _run_harness_shorthand("copilot", run_args)
 
 
 @cli.command()
@@ -13392,6 +13409,22 @@ def _run_bundled_agent(name: str, run_args: tuple[str, ...]) -> None:
     # matching the outer `cli(args=argv, standalone_mode=False)` dispatch.
     run.main(
         args=[_bundled_example_path(name), *extra_args, *run_args],
+        prog_name="omnigent run",
+        standalone_mode=False,
+    )
+
+
+def _run_harness_shorthand(harness: str, run_args: tuple[str, ...]) -> None:
+    """Forward a harness shorthand (``omnigent copilot``) to ``run --harness``, the
+    way :func:`_run_bundled_agent` forwards ``polly``; an explicit ``--harness`` in
+    *run_args* is a usage error rather than a silent override."""
+    if any(arg == "--harness" or arg.startswith("--harness=") for arg in run_args):
+        raise click.UsageError(
+            f"`{cli_invocation()} {harness}` always uses the {harness} harness; drop "
+            f"--harness, or use `{cli_invocation()} run --harness <name>` to pick another."
+        )
+    run.main(
+        args=["--harness", harness, *run_args],
         prog_name="omnigent run",
         standalone_mode=False,
     )

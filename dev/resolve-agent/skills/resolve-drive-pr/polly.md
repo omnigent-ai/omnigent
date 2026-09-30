@@ -52,22 +52,28 @@ finding under *all* headings, not just Blocking/Security**. Polly's bucketing is
 verdict: a real defect regularly lands under **Non-blocking notes** (a missed edge
 case, a subtly wrong condition, a dropped error path), and "non-blocking" is not a
 licence to ignore it. Go through the newest comment finding by finding — Blocking
-issues, Security vulnerabilities, **and** Non-blocking notes — and for each one do
-exactly one of:
+issues, Security vulnerabilities, **and** Non-blocking notes. Check each finding's
+correctness and relevance to the reported outcome under **Keep the fix focused
+and complete** in the main instructions, then do exactly one of:
 
-- **Fix it** — the default for anything that is, or might be, a real defect or a
-  cheap correctness/robustness win. Fix at the root (same fail→pass discipline as
-  Step 2B — add/adjust a targeted test where it makes sense), re-run the affected
-  tests, then land the fix per the **push-or-take-over rule**: `git commit` +
+- **Fix it** — for defects that leave the requested fix incomplete, including
+  missed edge cases and regressions introduced by the PR, regardless of size.
+  Small incidental correctness/robustness wins are also allowed within the main
+  instructions' soft budget and scope conditions. Fix at the root (same
+  fail→pass discipline as Step 2B — add/adjust a targeted test where it makes
+  sense), re-run the affected tests, then land the fix per the
+  **push-or-take-over rule**: `git commit` +
   `git push` when you can push to the branch; on a **fork PR** you can't push to,
   take over into your own PR (Step 4 preamble) and continue on it. **Re-assess a
-  non-blocking note as if it were blocking** — decide by whether it's *correct*,
+  non-blocking note as if it were blocking** — decide by correctness and scope,
   not by which heading Polly filed it under.
 - **Justify skipping it** — only when it is genuinely not actionable in this PR: a
-  false positive, purely stylistic/subjective, or out of scope (a pre-existing
-  issue your diff didn't introduce). State *which* finding and *why* — in a PR
-  reply to Polly's comment and in the handoff (`polly_review`). Never skip a
-  finding silently, and never skip one merely because it's labelled non-blocking.
+  false positive, purely stylistic/subjective, or independent work beyond the
+  permitted small incidental improvements. Defer that independent work as a
+  follow-up; do not use scope to skip a change needed for a complete fix.
+  State *which* finding and *why* — in a PR reply to Polly's comment and in the
+  handoff (`polly_review`). Never skip a finding silently, and never skip one
+  merely because it's labelled non-blocking.
 
 After **pushing** any fix (to your PR or an in-repo branch), **re-trigger the
 review** — another `gh workflow run polly-review.yml -f pr=<pr>` (again: not a

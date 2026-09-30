@@ -71,11 +71,13 @@ of the test. A passing repro alone does not prove the PR fixes the bug.
    For each change, ask whether removing it would leave the intended fix
    incomplete, incorrect, unsafe, or inadequately tested or documented.
    Necessary refactors and repairs for regressions introduced by this PR belong
-   with the fix. Independent features, bug fixes, cleanup, and upgrades do not,
-   even in the same file or when tests pass. Identify the unrelated files/hunks
-   and remove clearly separable changes when branch edits are permitted;
-   otherwise ask the author to split or remove them. Do not guess when changes
-   are entangled. Carry only in-scope work into any fork takeover.
+   with the fix. Apply **Keep the fix focused and complete** from the main
+   instructions, including its allowance for small incidental correctness or
+   robustness improvements. Other independent features, bug fixes, cleanup, and
+   upgrades do not belong, even in the same file or when tests pass. Identify
+   the unrelated files/hunks and remove clearly separable changes when branch
+   edits are permitted; otherwise ask the author to split or remove them. Do not
+   guess when changes are entangled. Carry only in-scope work into any fork takeover.
 
    Address Polly's scope findings through the ordinary review process in Step
    4.3 before approving this existing PR. Keep your own edits within the same
@@ -87,7 +89,7 @@ of the test. A passing repro alone does not prove the PR fixes the bug.
    record its `pr_url` in your output. The `outcome` reflects what you found
    (`fixed` when the PR resolves every live facet, the shared impact assessment
    has no unresolved required checks, the diff is sound, and the changes stay
-   within the reported problem;
+   within the scope rule above;
    `partially_fixed` / `not_fixed` otherwise, with specifics). **Default to
    commenting, not competing** — if the PR is close and its approach is sound,
    review it and let the author iterate; don't open a rival PR over fixable nits.
@@ -123,6 +125,16 @@ of the test. A passing repro alone does not prove the PR fixes the bug.
      do **not** approve: that's self-approval of your own commits (branch
      protection rejects it anyway). Leave a `--comment` review and let a human
      approve.
+
+   Write the final review for someone scanning the PR timeline. Lead with a
+   plain-English verdict and next action, then use short bullets with labels
+   such as **Cause and fix**, **Verified**, and **Needs attention**. Aim for about
+   100 words when the fix is clean; name every blocking finding even if that
+   takes more space. Say when a check was unavailable. Keep investigation
+   history, branch bookkeeping, and full test details in the handoff fields.
+   For workflow-owned publication, put this exact Markdown in `review_body`;
+   the publisher adds the tested commit and its marker.
+
 6. **Then drive it to landable — go to Step 4.** Once you've kept the PR as the
    fix (the sound-PR default), it gets the **same landing treatment as a PR you
    authored**: `ui-preview`, green CI, a clean Polly review, a copy-paste

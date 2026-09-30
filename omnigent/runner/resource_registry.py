@@ -16,6 +16,7 @@ import contextlib
 import logging
 import os
 import re
+import tempfile
 import threading
 import time
 from collections.abc import Callable
@@ -40,6 +41,8 @@ from omnigent.entities.session_resources import (
     terminal_resource_view,
 )
 from omnigent.inner.sandbox import contained_realpath, containment_prefix
+from omnigent.native.native_coding_agents import native_coding_agent_for_harness
+from omnigent.native.native_dispatch import resolve_hook_for_key
 
 if TYPE_CHECKING:
     from omnigent.harnesses.claude_native.status_file import SessionStatusPoller
@@ -278,6 +281,34 @@ def _monotonic() -> float:
     return time.monotonic()
 
 
+def _native_input_ready_probe(
+    resource_role: str | None,
+) -> Callable[[str, TerminalInstance], bool] | None:
+    """Resolve the provider's ``input_ready_probe`` for a native terminal role.
+
+    Native terminal roles are the harness names (``"pi-native"``), so the role
+    maps straight onto the provider row that owns the probe.
+
+    :param resource_role: Runner-private terminal role, e.g.
+        :data:`PI_NATIVE_TERMINAL_ROLE`, or ``None`` for a generic terminal.
+    :returns: The probe, or ``None`` for generic terminals or a probe that fails
+        to import (logged loudly, but readiness logging must not block the
+        terminal watcher).
+    """
+    agent = native_coding_agent_for_harness(resource_role)
+    if agent is None:
+        return None
+    try:
+        return resolve_hook_for_key(agent.key, "input_ready_probe")
+    except Exception:  # noqa: BLE001 - see docstring.
+        _logger.warning(
+            "Native input-ready probe unavailable for %s; native_input_ready will not be logged",
+            resource_role,
+            exc_info=True,
+        )
+        return None
+
+
 # Allowlist rather than a denylist: a denylist only stops the separators it
 # thought to enumerate, and the previous one let a backslash through — a real
 # separator on a Windows host.
@@ -381,6 +412,7 @@ class SessionResourceRegistry:
         self._per_session_workspace = per_session_workspace
         self._primary_envs: dict[str, OSEnvironment] = {}
         self._primary_env_specs: dict[str, OSEnvSpec | None] = {}
+        self._codex_skills_dirs: dict[str, tempfile.TemporaryDirectory[str]] = {}
         self._terminal_roles: dict[tuple[str, str], str] = {}
         self._terminal_lifecycles: dict[tuple[str, str], TerminalLifecycle] = {}
         self._is_alive_cache: TTLCache[str, bool] = TTLCache(
@@ -759,6 +791,23 @@ class SessionResourceRegistry:
             return terminal_resource_view(session_id, entry)
         return None
 
+    def codex_skills_dir(self, session_id: str) -> Path:
+        """Return the stable, private skills-only directory owned by this session."""
+        with self._lock:
+            return self._codex_skills_dir_locked(session_id)
+
+    def _codex_skills_dir_locked(self, session_id: str) -> Path:
+        """Allocate the session's skills directory while holding ``_lock``."""
+        from omnigent.inner.codex_staging import CODEX_SKILLS_PREFIX
+
+        directory = self._codex_skills_dirs.get(session_id)
+        if directory is None:
+            directory = tempfile.TemporaryDirectory(
+                prefix=CODEX_SKILLS_PREFIX, dir=Path(tempfile.gettempdir()).resolve()
+            )
+            self._codex_skills_dirs[session_id] = directory
+        return Path(directory.name)
+
     def resolve_environment(
         self,
         session_id: str,
@@ -933,7 +982,10 @@ class SessionResourceRegistry:
                     "Agent spec has no os_env; cannot create a primary filesystem environment."
                 )
             effective_spec = self._effective_primary_spec(session_id, spec_os_env)
-            env = create_os_environment(effective_spec)
+            env = create_os_environment(
+                effective_spec,
+                additional_read_roots=[self._codex_skills_dir_locked(session_id)],
+            )
             if env is not None:
                 return env
 
@@ -942,7 +994,10 @@ class SessionResourceRegistry:
             cwd=default_cwd,
             sandbox=OSEnvSandboxSpec(type="none"),
         )
-        env = create_os_environment(default_spec)
+        env = create_os_environment(
+            default_spec,
+            additional_read_roots=[self._codex_skills_dir_locked(session_id)],
+        )
         if env is None:
             raise RuntimeError(
                 f"Failed to create default OS environment for session {session_id!r}"
@@ -1347,6 +1402,7 @@ class SessionResourceRegistry:
             with self._lock:
                 self._status_pollers[session_id] = status_poller
 
+        input_ready_probe = _native_input_ready_probe(resource_role)
         native_input_ready = False
 
         def _on_tick() -> None:
@@ -1378,20 +1434,17 @@ class SessionResourceRegistry:
                         exc_info=True,
                         extra={"session_id": session_id},
                     )
-            if resource_role == CLAUDE_NATIVE_TERMINAL_ROLE and not native_input_ready:
+            if input_ready_probe is not None and not native_input_ready:
                 # Readiness logging must not stop the lifecycle watcher on failure.
                 with contextlib.suppress(Exception):
-                    from omnigent.harnesses.claude_native.bridge import claude_pane_text_ready
-
-                    # The watcher already captured this live pane; no extra tmux query.
-                    if claude_pane_text_ready(instance.last_pane_text() or ""):
+                    if input_ready_probe(session_id, instance):
                         native_input_ready = True
                         _logger.info(
-                            "Claude native input ready",
+                            "Native input ready",
                             extra=debug_event(
                                 "native_input_ready",
                                 session_id=session_id,
-                                harness="claude-native",
+                                harness=resource_role,
                                 terminal_instance_id=instance.diagnostic_id,
                                 stage="native_input",
                             ),
@@ -1471,10 +1524,13 @@ class SessionResourceRegistry:
                 )
 
         if not emit_status:
+            needs_tick = (
+                resource_role == CLAUDE_NATIVE_TERMINAL_ROLE or input_ready_probe is not None
+            )
             instance.start_idle_watcher_thread(
                 on_activity=_on_activity if activity_publisher is not None else None,
                 on_exit=_on_exit,
-                on_tick=_on_tick if resource_role == CLAUDE_NATIVE_TERMINAL_ROLE else None,
+                on_tick=_on_tick if needs_tick else None,
                 replace=replace,
             )
             return
@@ -1860,6 +1916,7 @@ class SessionResourceRegistry:
             self._session_activity_epoch.pop(session_id, None)
             primary = self._primary_envs.pop(session_id, None)
             self._primary_env_specs.pop(session_id, None)
+            skills_directory = self._codex_skills_dirs.pop(session_id, None)
             stale_role_keys = [key for key in self._terminal_roles if key[0] == session_id]
             for key in stale_role_keys:
                 self._terminal_roles.pop(key, None)
@@ -1885,6 +1942,14 @@ class SessionResourceRegistry:
             except Exception:
                 _logger.exception(
                     "Error closing primary env for session=%s",
+                    session_id,
+                )
+        if skills_directory is not None:
+            try:
+                await asyncio.to_thread(skills_directory.cleanup)
+            except OSError:
+                _logger.exception(
+                    "Error cleaning up Codex skills for session=%s",
                     session_id,
                 )
 

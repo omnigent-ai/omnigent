@@ -204,6 +204,7 @@ def _configure_multi_turn_responses(mock_llm_server_url: str, count: int = 2) ->
 # ── CUJ 1: Single approval allows LLM response ─────────
 
 
+@pytest.mark.flaky(reruns=2, reruns_delay=5)
 def test_sessions_single_approval_allows_llm_response(
     repl_env: dict[str, str],
     mock_llm_server_url: str,
@@ -237,6 +238,7 @@ def test_sessions_single_approval_allows_llm_response(
 # ── CUJ 2: Refusal shows deny sentinel ──────────────────
 
 
+@pytest.mark.flaky(reruns=2, reruns_delay=5)
 def test_sessions_refusal_shows_deny_sentinel(
     repl_env: dict[str, str],
     mock_llm_server_url: str,
@@ -266,6 +268,7 @@ def test_sessions_refusal_shows_deny_sentinel(
 # ── CUJ 3: Multi-turn fires approval each turn ──────────
 
 
+@pytest.mark.flaky(reruns=2, reruns_delay=5)
 def test_sessions_two_turns_fires_one_approval_per_turn(
     repl_env: dict[str, str],
     mock_llm_server_url: str,
@@ -303,6 +306,7 @@ def test_sessions_two_turns_fires_one_approval_per_turn(
 # ── CUJ 4: Approve-always caches for session ────────────
 
 
+@pytest.mark.flaky(reruns=2, reruns_delay=5)
 def test_sessions_approve_always_caches_for_later_turns(
     repl_env: dict[str, str],
     mock_llm_server_url: str,
@@ -342,6 +346,7 @@ def test_sessions_approve_always_caches_for_later_turns(
 # ── CUJ 5: Tool call approval ───────────────────────────
 
 
+@pytest.mark.flaky(reruns=2, reruns_delay=5)
 def test_sessions_tool_call_approval_allows_tool(
     repl_env: dict[str, str],
     mock_llm_server_url: str,

@@ -9,7 +9,8 @@ so concurrent tests / sessions get isolated response streams.
 Keyed queues:
 
 Each ``POST /mock/configure`` call specifies an optional ``key``
-(defaults to ``"default"``). When ``POST /v1/responses`` arrives,
+(defaults to ``"default"`` for model routing; content routing gets a unique key).
+When ``POST /v1/responses`` arrives,
 the server extracts the ``model`` field from the request body and
 looks up a queue by that key. If no queue matches the model, the
 ``"default"`` queue is used. This lets e2e tests register one
@@ -61,6 +62,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import json
 import os
 import sys
@@ -72,7 +74,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import uvicorn
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 app = FastAPI()
@@ -839,6 +841,22 @@ class _ResponseQueue:
         # the #523 cross-test contamination, fixed without per-test
         # servers. ``None`` preserves the default model/"default" routing.
         self.match: str | None = None
+        self.required_tools: frozenset[str] | None = None
+
+    def accepts_tools(self, tool_names: set[str]) -> bool:
+        """Keep scripted tool calls out of requests without any tools.
+
+        Explicit guards cover the whole queue; an empty guard deliberately
+        permits calls even without tools. Otherwise only require a tool surface:
+        negative tests may deliberately call an unadvertised tool. Text, errors
+        and exhausted-queue fallbacks remain unrestricted.
+        """
+        if self.required_tools is not None:
+            return self.required_tools <= tool_names
+        if self.index < len(self.responses):
+            calls = self.responses[self.index].tool_calls or []
+            return not calls or bool(tool_names)
+        return True
 
     def next(self) -> QueuedResponse:
         """Consume the next response, or return the fallback / default."""
@@ -855,6 +873,7 @@ class _ResponseQueue:
         self.responses.clear()
         self.index = 0
         self.match = None
+        self.required_tools = None
 
 
 class MockState:
@@ -928,6 +947,8 @@ class MockState:
             if isinstance(content, str):
                 parts.append(content)
             elif isinstance(content, dict):
+                if content.get("type") in {"tool_result", "function_call_output"}:
+                    return
                 text = content.get("text")
                 if isinstance(text, str):
                     parts.append(text)
@@ -956,6 +977,20 @@ class MockState:
                     append_text(item.get("content"))
         return " ".join(parts)
 
+    @staticmethod
+    def tool_names(parsed: object) -> set[str]:
+        """Read advertised tool names across Messages, Responses and Chat APIs."""
+        if not isinstance(parsed, dict):
+            return set()
+        names = set()
+        for tool in parsed.get("tools") or []:
+            if isinstance(tool, dict):
+                schema = tool.get("function", tool)
+                name = schema.get("name") if isinstance(schema, dict) else None
+                if isinstance(name, str):
+                    names.add(name)
+        return names
+
     def resolve_queue_for_request(self, parsed: object) -> _ResponseQueue:
         """Pick the queue for a request: content-routed queues first, then model/default.
 
@@ -974,11 +1009,12 @@ class MockState:
         :returns: The selected response queue.
         """
         user_text = self._user_input_text(parsed)
+        tool_names = self.tool_names(parsed)
         if user_text:
             best: _ResponseQueue | None = None
             best_score = (-1, -1)
             for queue in self.queues.values():
-                if not queue.match:
+                if not queue.match or not queue.accepts_tools(tool_names):
                     continue
                 position = user_text.rfind(queue.match)
                 score = (len(queue.match), position)
@@ -988,7 +1024,11 @@ class MockState:
             if best is not None:
                 return best
         model = parsed.get("model") if isinstance(parsed, dict) else None
-        return self.resolve_queue(model)
+        queue = self.resolve_queue(model)
+        # Model/default lookup must respect both explicit and inferred guards.
+        if not queue.accepts_tools(tool_names):
+            return _ResponseQueue()
+        return queue
 
     def reset(self, *, record_evidence: bool = True) -> None:
         """Clear all state (queues, captured requests, gates).
@@ -1402,16 +1442,47 @@ async def configure(request: Request) -> dict[str, object]:
     contamination). Omitting ``match`` keeps the default model/"default"
     routing.
 
+    Without a key, distinct content selectors and their tool guards get
+    independent queues. Reconfiguring the same selector replaces its queue.
+    Without a content match, configuration still targets the default queue;
+    required_tools then guards consumption without changing model routing.
+    Explicit keys replace the named queue, including ``"default"``.
+    ``required_tools`` restricts consumption to requests advertising all listed
+    tool names, isolating turns from title-generation/background requests.
+    The guard covers the entire queue, including its configured fallback.
+    If the model/default queue fails the guard, return the generic
+    "Mock LLM response" without consuming that queue.
+
+    When ``required_tools`` is omitted, the next ``tool_calls`` response requires
+    a request with at least one advertised tool, so a no-tools title request
+    cannot consume it. Names need not match: negative tests can still call an
+    excluded tool. This does not guard text entries or the fallback. Set
+    ``required_tools: []`` to also permit calls on requests with no tools.
+    A nonempty explicit guard still takes precedence over inference.
+
     Multiple calls with different keys accumulate queues; use
     ``POST /mock/reset`` to clear all keys.
     """
     body = await request.json()
-    key = body.get("key", _DEFAULT_KEY)
     match = body.get("match")
+    required_tools = body.get("required_tools", [])
+    if not isinstance(required_tools, list) or any(
+        not isinstance(name, str) or not name for name in required_tools
+    ):
+        raise HTTPException(400, "required_tools must be a list of nonempty tool names")
+    if match is not None and (not isinstance(match, str) or not match):
+        raise HTTPException(400, "match must be a nonempty string")
+    # Only implicit content queues get independent identities. Explicit keys
+    # retain replacement semantics, including an explicit key="default".
+    guard = frozenset(required_tools) if "required_tools" in body else None
+    route = json.dumps([match, sorted(guard) if guard is not None else None]).encode()
+    implicit_key = f"content-{hashlib.sha256(route).hexdigest()[:24]}" if match else _DEFAULT_KEY
+    key = body.get("key", implicit_key)
     async with _state._lock:
         queue = _state.get_queue(key)
         queue.reset()
         queue.match = match
+        queue.required_tools = guard
         for entry in body.get("responses", []):
             queue.responses.append(
                 QueuedResponse(

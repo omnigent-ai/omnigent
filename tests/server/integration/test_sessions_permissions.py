@@ -25,7 +25,7 @@ import pytest_asyncio
 from fastapi import FastAPI
 
 from omnigent.host.frames import HostHelloFrame
-from omnigent.runtime import session_stream
+from omnigent.runtime import inflight_text, session_stream
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server import presence
 from omnigent.server.app import create_app
@@ -3283,6 +3283,7 @@ async def test_stream_local_single_user_not_tracked(
     try:
         resp = await _end_stream_via_close(session_id, task)
         assert resp.status_code == 200
+        assert resp.headers["x-omnigent-stream-epoch"] == inflight_text.stream_epoch()
         # The stream's own snapshot-on-connect ran AFTER any (buggy)
         # registration would have happened, so a "local" viewer in it
         # proves the attribution filter was dropped from the route.

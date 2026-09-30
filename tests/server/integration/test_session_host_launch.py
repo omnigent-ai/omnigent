@@ -508,33 +508,113 @@ async def test_inline_launch_stamps_terminal_view_label_at_creation(
     assert conv.labels.get("omnigent.ui") == "terminal"
 
 
-async def test_inline_launch_skips_terminal_view_label_for_native_harness(
+@pytest.mark.parametrize("harness", ["pi-native", "native-pi", "claude-native", "codex-native"])
+async def test_inline_launch_stamps_terminal_view_label_for_custom_native_harness(
     client: httpx.AsyncClient,
     app: FastAPI,
+    db_uri: str,
+    harness: str,
 ) -> None:
-    """A native-harness agent does not get the terminal-view label here.
-
-    Native harnesses run a vendor TUI instead of the omnigent REPL
-    terminal, so their runner never auto-creates one. Stamping the label
-    for them would leave the Web UI's spin-up spinner waiting on a
-    terminal that never arrives; they get terminal-first labels from the
-    native wrapper path instead.
-    """
+    """Custom native agents expose their terminal at creation and after reload."""
     comm = await _connect_host(app)
     agent = await create_test_agent(
         client,
-        executor={"type": "omnigent", "config": {"harness": "claude-native"}},
+        name="custom-native-agent",
+        executor={"type": "omnigent", "config": {"harness": harness}},
     )
 
     responder = asyncio.create_task(_serve_one_launch(comm, launch_status="launched"))
     resp = await client.post(
         "/v1/sessions",
-        json={"agent_id": agent["id"], "host_id": _HOST_ID, "workspace": _WORKSPACE},
+        json={
+            "agent_id": agent["id"],
+            "host_id": _HOST_ID,
+            "workspace": _WORKSPACE,
+            "labels": {"env": "test"},
+        },
     )
     await responder
 
     assert resp.status_code == 201, f"expected 201, got {resp.status_code}: {resp.text}"
-    assert "omnigent.ui" not in resp.json()["labels"]
+    body = resp.json()
+    expected_labels = {"env": "test", "omnigent.ui": "terminal"}
+    assert body["labels"] == expected_labels
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.get_conversation(body["id"])
+    assert conv is not None
+    assert conv.labels == expected_labels
+
+    listed = await client.get("/v1/sessions")
+    assert listed.status_code == 200
+    row = next(row for row in listed.json()["data"] if row["id"] == body["id"])
+    assert row["labels"] == expected_labels
+
+    # Existing sessions can predate the creation-time label.
+    store.delete_label(body["id"], "omnigent.ui")
+    snapshot = await client.get(f"/v1/sessions/{body['id']}")
+    assert snapshot.status_code == 200
+    assert snapshot.json()["labels"] == expected_labels
+
+
+@pytest.mark.parametrize(
+    "spec_harness,harness_override,terminal_view",
+    [
+        ("claude-sdk", "pi-native", True),
+        ("pi-native", "claude-sdk", False),
+        ("pi-native", "auto", False),
+    ],
+)
+async def test_custom_native_terminal_view_uses_harness_override(
+    client: httpx.AsyncClient,
+    spec_harness: str,
+    harness_override: str,
+    terminal_view: bool,
+) -> None:
+    """Only the effective native harness grants terminal access without a host."""
+    agent = await create_test_agent(
+        client,
+        executor={"type": "omnigent", "config": {"harness": spec_harness}},
+    )
+    response = await client.post(
+        "/v1/sessions",
+        json={"agent_id": agent["id"], "harness_override": harness_override},
+    )
+    assert response.status_code == 201, response.text
+    body = response.json()
+    assert (body["labels"].get("omnigent.ui") == "terminal") is terminal_view
+    assert "omnigent.wrapper" not in body["labels"]
+    snapshot = await client.get(f"/v1/sessions/{body['id']}")
+    assert snapshot.status_code == 200
+    assert (snapshot.json()["labels"].get("omnigent.ui") == "terminal") is terminal_view
+
+
+async def test_native_subagent_mirror_does_not_gain_terminal_view(
+    client: httpx.AsyncClient,
+) -> None:
+    """A native thread mirror inherits a harness but has no terminal of its own."""
+    agent = await create_test_agent(
+        client,
+        name="custom-native-parent",
+        executor={"type": "omnigent", "config": {"harness": "claude-native"}},
+    )
+    response = await client.post(
+        f"/v1/sessions/{agent['_session_id']}/events",
+        json={
+            "type": "external_subagent_start",
+            "data": {
+                "subagent_id": "terminal-view-mirror",
+                "agent_type": "worker",
+                "description": "Check terminal visibility",
+                "tool_use_id": "toolu_terminal_view_mirror",
+            },
+        },
+    )
+    assert response.status_code in (200, 202), response.text
+    child_id = response.json()["child_session_id"]
+    snapshot = await client.get(f"/v1/sessions/{child_id}")
+    assert snapshot.status_code == 200
+    assert snapshot.json()["harness"] == "claude-native"
+    assert "omnigent.ui" not in snapshot.json()["labels"]
 
 
 async def test_unbound_session_skips_terminal_view_label(

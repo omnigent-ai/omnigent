@@ -2820,6 +2820,10 @@ def register_core_routes(
                     "type": "codex_approval_mode_change",
                     "approval_mode": requested_codex_approval_mode,
                 },
+                # The runner drives Codex's /permissions popup — reading the rows,
+                # pressing the preset's digit, then confirming the echo — which
+                # outlasts the default forward budget.
+                timeout_s=_TUI_INJECT_FORWARD_TIMEOUT_S,
             )
             # Raises unless the runner drove the /permissions popup, so the label
             # can never claim a preset the Codex TUI wasn't switched to. Codex owns

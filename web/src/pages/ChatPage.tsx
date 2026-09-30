@@ -177,6 +177,7 @@ export type { ConversationScroller } from "@/components/chat/chatBubbleParts";
 import {
   type ConversationScroller,
   SessionSharedContext,
+  computeIsTurnActive,
   computeIsWorking,
 } from "@/components/chat/chatBubbleParts";
 import { useSession } from "@/hooks/useSession";
@@ -729,7 +730,7 @@ export function ChatPage() {
   // Keep the parent's Stop action live while its turn waits on an elicitation.
   // Child activity and display suppression belong to `showsWorking` below.
   const isWorking =
-    computeIsWorking(sessionStatus) || status === "streaming" || hasPendingInitialMessage;
+    computeIsTurnActive(sessionStatus, status === "streaming") || hasPendingInitialMessage;
   // Managed-sandbox stages own the in-progress slot with specific pipeline
   // copy. A normal terminal runner launch keeps the standard Working shimmer
   // so startup does not introduce a second, special chat state.
@@ -2996,9 +2997,21 @@ function ComposerImpl(
           setCommandError("/compact is not supported for this agent type");
           return true;
         }
+        if (sessionHarness === "codex-native" && isWorking) {
+          toast.error("Compact is disabled while a chat is in progress", { richColors: true });
+          return true;
+        }
         dirtyRef.current = true;
         setValue("");
         setCommandError(null);
+        if (sessionHarness === "claude-native") {
+          // Claude accepts /compact as input; reuse message queueing and
+          // pending bubbles until its transcript acknowledges the command.
+          const command = arg ? `/compact ${arg}` : "/compact";
+          appendEntry(command);
+          onSend(command);
+          return true;
+        }
         void useChatStore
           .getState()
           .compact()
@@ -3106,15 +3119,20 @@ function ComposerImpl(
     }
   };
 
-  // Skills insert at the caret; standalone no-argument built-ins execute immediately.
+  const completeMenuSelection = (cmd: string) => {
+    const completion = slashCompletion.complete(cmd);
+    setValue(completion.text);
+    dirtyRef.current = true;
+  };
+
+  // Skills insert at the caret; Enter/click executes standalone no-argument built-ins.
   const applyMenuSelection = (cmd: string) => {
     if (slashCompletion.inline || slashCommandsWithArgs.has(cmd)) {
-      const completion = slashCompletion.complete(cmd);
-      setValue(completion.text);
-      dirtyRef.current = true;
+      completeMenuSelection(cmd);
     } else {
       // Execute immediately — no argument needed.
-      setValue("");
+      // /compact clears its draft only after the busy guard accepts it.
+      if (cmd !== "/compact") setValue("");
       setCommandError(null);
       executeSlashCommand(cmd, "");
     }
@@ -3139,6 +3157,7 @@ function ComposerImpl(
     escapeClearsOnlyWithContent: true,
     allowOpen: inputFocused && draft.quotes.length === 0 && files.length === 0,
     onSelect: applyMenuSelection,
+    onTabComplete: completeMenuSelection,
     clearText: () => setValue(""),
   });
 
@@ -3328,7 +3347,7 @@ function ComposerImpl(
         cmd in BUILTIN_SLASH_COMMANDS &&
         cmd in slashCommands
       ) {
-        executeSlashCommand(cmd, arg);
+        executeSlashCommand(cmd, cmd === "/compact" ? trimmed.slice(parts[0].length).trim() : arg);
         return;
       }
       // /side opens a side chat. Codex forks in-process (falls through to the

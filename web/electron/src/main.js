@@ -33,6 +33,7 @@ const { autoUpdater } = require("electron-updater");
 const { createDesktopUpdater } = require("./desktop_updater");
 const { createUpdateOverlay } = require("./update_overlay");
 const { createAboutWindow, resolveAppIconDataUrl } = require("./about_window");
+const { registerFileReveal } = require("./fileReveal");
 const fs = require("node:fs");
 const path = require("node:path");
 const { pathToFileURL } = require("node:url");
@@ -71,6 +72,7 @@ const arca = require("./arca");
 const cliInstall = require("./cli_install");
 const isaac = require("./isaac");
 const { createArcaConnectFlow } = require("./arca_connect_window");
+const { createArcaAutoConnect } = require("./arca_autoconnect");
 const { registerSessionExpiryReload } = require("./session-expiry");
 const { ensureDatabricksSession } = require("./databricks-session");
 const { expireStoredAccessToken, removeStoredRefreshToken } = require("./databricks-oauth");
@@ -154,6 +156,7 @@ function serverSelectorV2DevUrl() {
  *   OMNIGENT_ONBOARDING_MOCK_MANAGED=url,url   MDM-preset servers
  *   OMNIGENT_ONBOARDING_MOCK_RECENTS=url,url   recent servers
  *   OMNIGENT_ONBOARDING_MOCK_INSTALLED=1       returning user
+ *   OMNIGENT_ONBOARDING_MOCK_REMOTE_ENV=1      offer the remote environment
  *
  * @returns {string} A query string without the leading "?", or "".
  */
@@ -165,6 +168,7 @@ function onboardingMockSearch() {
   if (process.env.OMNIGENT_ONBOARDING_MOCK_RECENTS)
     p.set("recents", process.env.OMNIGENT_ONBOARDING_MOCK_RECENTS);
   if (process.env.OMNIGENT_ONBOARDING_MOCK_INSTALLED === "1") p.set("installed", "1");
+  if (process.env.OMNIGENT_ONBOARDING_MOCK_REMOTE_ENV === "1") p.set("remote", "1");
   return p.toString();
 }
 
@@ -299,6 +303,79 @@ const arcaConnectFlow = createArcaConnectFlow({
       return `arca ${arca.buildConnectArgs(serverUrl).join(" ")}`;
     } catch {
       return "arca ssh isaac omni host …"; // the run itself re-validates and fails loud
+    }
+  },
+  log: (message) => console.log(`[omnigent] ${message}`),
+});
+
+/** How long a negative arca-binary probe is trusted before re-checking PATH. */
+const ARCA_PATH_RETRY_MS = 60 * 1000;
+let cachedArcaPath = { path: null, checkedAt: 0 };
+let arcaProbe = null;
+
+/**
+ * Refresh the cached arca binary in the background. A hit is kept for the
+ * launch; a miss is re-probed at most once a minute, since the probe spawns a
+ * shell. Concurrent callers share one probe.
+ *
+ * @returns {Promise<string | null>}
+ */
+function refreshArcaBinary() {
+  // Only auto-connect uses the cached binary; with the feature off, don't probe.
+  if (!arcaAutoConnectFeatureEnabled()) return Promise.resolve(null);
+  if (cachedArcaPath.path && arca.isExecutableFile(cachedArcaPath.path)) {
+    return Promise.resolve(cachedArcaPath.path);
+  }
+  if (Date.now() - cachedArcaPath.checkedAt < ARCA_PATH_RETRY_MS) return Promise.resolve(null);
+  arcaProbe ??= arca.resolveArcaPathAsync().then((found) => {
+    cachedArcaPath = { path: found, checkedAt: Date.now() };
+    arcaProbe = null;
+    return found;
+  });
+  return arcaProbe;
+}
+
+/**
+ * The cached arca binary, or null. Never blocks: a stale miss kicks off a
+ * background re-probe that later calls pick up.
+ *
+ * @returns {string | null}
+ */
+function cachedArcaBinary() {
+  if (cachedArcaPath.path && arca.isExecutableFile(cachedArcaPath.path)) return cachedArcaPath.path;
+  void refreshArcaBinary();
+  return null;
+}
+
+/**
+ * Feature flag for Arca auto-connect, off by default: `OMNIGENT_ARCA_AUTO_CONNECT=1`
+ * forces it on, otherwise settings.json `arca_auto_connect: true` enables it.
+ * Owner: desktop. Review by 0.16.0: make it default-on and delete this flag,
+ * or remove the feature.
+ *
+ * @returns {boolean}
+ */
+function arcaAutoConnectFeatureEnabled() {
+  return (
+    process.env.OMNIGENT_ARCA_AUTO_CONNECT === "1" || loadSettings().arca_auto_connect === true
+  );
+}
+
+/** Launch-time Arca auto-connect, behind the feature flag above. */
+const arcaAutoConnect = createArcaAutoConnect({
+  // Auto-connect needs arca itself: the MDM flag alone keeps the manual item
+  // (which explains what's missing) but shouldn't fail on every launch.
+  isEligible: (serverUrl) =>
+    arcaAutoConnectFeatureEnabled() &&
+    isDatabricksManagedServerUrl(serverUrl) &&
+    cachedArcaBinary() !== null,
+  startConnect: (serverUrl, onOutput) =>
+    arca.startArcaConnect(serverUrl, { onOutput, resolveArcaPath: cachedArcaBinary }),
+  commandLine: (serverUrl) => {
+    try {
+      return `arca ${arca.buildConnectArgs(serverUrl).join(" ")}`;
+    } catch {
+      return null;
     }
   },
   log: (message) => console.log(`[omnigent] ${message}`),
@@ -1120,6 +1197,32 @@ function resolvedCliPath() {
 }
 
 /**
+ * What to tell the user when hostCliCommand(serverUrl) found no launcher.
+ *
+ * @param {string} serverUrl
+ * @returns {string}
+ */
+function missingHostCliError(serverUrl) {
+  return databricksInternalFeaturesEnabled() && isDatabricksManagedServerUrl(serverUrl)
+    ? "The isaac CLI was not found. Install it before connecting this machine."
+    : "The omnigent CLI was not found. Install it or set its path.";
+}
+
+/**
+ * The server URL a setup-page connect targets: a managed choice exactly as
+ * configured (it may name a workspace mount), else normalized; workspace roots
+ * then expand to their mount. Throws on an invalid URL.
+ *
+ * @param {string} url
+ * @param {{ signal?: AbortSignal }} [options]
+ * @returns {Promise<string>}
+ */
+function resolveConnectTarget(url, options) {
+  const managedTarget = managedServerUrls().find((candidate) => candidate === url);
+  return expandDatabricksWorkspaceUrl(managedTarget ?? normalizeUrl(url), options);
+}
+
+/**
  * CLI command for desktop host enrollment on `serverUrl`. Databricks-internal
  * windows use `isaac omni` behind the same effective gate as Arca (MDM flag +
  * Databricks-managed HTTPS server); every other window keeps the configured /
@@ -1457,6 +1560,7 @@ async function loadServerUrl(
     });
     await win.loadURL(target);
     assertCurrent();
+    void refreshArcaBinary().then(() => arcaAutoConnect.ensure(serverUrl));
     return serverUrl;
   } finally {
     attempt.pending = false;
@@ -2883,9 +2987,7 @@ function registerIpc() {
       // A managed choice is already validated and may name a workspace mount;
       // preserve it exactly. The shared expansion is a no-op for paths, while a
       // managed workspace root still gets the normal mount discovery.
-      const managedTarget = managedServerUrls().find((candidate) => candidate === url);
-      const normalized = managedTarget ?? normalizeUrl(url); // throws → setup page shows error
-      const target = await expandDatabricksWorkspaceUrl(normalized, { signal });
+      const target = await resolveConnectTarget(url, { signal }); // throws → setup page shows error
       signal.throwIfAborted();
 
       // Multi-server windows connect without touching the saved server —
@@ -3003,6 +3105,78 @@ function registerIpc() {
       throw new Error("get-managed-servers is only available to the setup page");
     }
     return managedServerUrls();
+  });
+
+  // Setup page → capabilities that gate wizard chrome. `v2Forced` means the env
+  // var pins the selector on, so "Switch to legacy" can't take effect and the
+  // menu item is disabled. `connectedBefore` (returning user) reads the raw
+  // recents, which — unlike get-recent-servers — still count MDM presets.
+  ipcMain.handle("omnigent:get-setup-capabilities", (event) => {
+    if (!isSetupPageSender(event)) {
+      throw new Error("get-setup-capabilities is only available to the setup page");
+    }
+    return {
+      v2Forced: serverSelectorV2EnvForced(),
+      connectedBefore: normalizeRecentServers(loadSettings().recent_servers).length > 0,
+    };
+  });
+
+  // Setup page → runners the onboarding step offers for `url`: the remote
+  // environment behind the host picker's gate plus its CLI; `bundledCli` means
+  // the host CLI brings its own Omnigent, so onboarding skips the install.
+  ipcMain.handle("omnigent:get-runner-options", (event, url) => {
+    if (!isSetupPageSender(event)) {
+      throw new Error("get-runner-options is only available to the setup page");
+    }
+    const internal =
+      typeof url === "string" &&
+      databricksInternalFeaturesEnabled() &&
+      isDatabricksManagedServerUrl(url);
+    return { remote: internal && arca.resolveArcaPath() !== null, bundledCli: internal };
+  });
+
+  // Setup page → connect the runner picked in onboarding to `url`, streaming
+  // output, before the window opens the server. The Install click on this
+  // bundled page is the user's consent, so no enrollment dialog here.
+  ipcMain.handle("omnigent:connect-runner", async (event, url, runner) => {
+    if (!isSetupPageSender(event)) {
+      throw new Error("connect-runner is only available to the setup page");
+    }
+    if (runner !== "local" && runner !== "remote") throw new TypeError("unknown runner");
+    if (typeof url !== "string") throw new TypeError("connect-runner requires a URL string");
+    const target = await resolveConnectTarget(url);
+    // Resolving can probe the network; don't start anything for a closed window.
+    if (event.sender.isDestroyed()) return { ok: false, canceled: true };
+    const log = (line) => {
+      try {
+        event.sender.send("omnigent:runner-connect-log", { line });
+      } catch {
+        /* window torn down mid-connect */
+      }
+    };
+    if (runner === "remote") {
+      if (!databricksInternalFeaturesEnabled() || !isDatabricksManagedServerUrl(target)) {
+        return { ok: false, error: "A remote environment isn't available for this server." };
+      }
+      const run = arca.startArcaConnect(target, { onOutput: log });
+      if (run.command) log(`$ ${run.command}`);
+      // Closing the setup window cancels the connect, like the connect console.
+      const cancel = () => run.cancel();
+      event.sender.once("destroyed", cancel);
+      const result = await run.promise;
+      event.sender.removeListener("destroyed", cancel);
+      return result;
+    }
+    const cliCommand = hostCliCommand(target);
+    if (!cliCommand) return { ok: false, error: missingHostCliError(target) };
+    log(`$ ${omnigentCli.cliCommandParts(cliCommand).displayName} host --server ${target}`);
+    log("Signing in to the server if needed…");
+    const auth = await serverManager.ensureServerAuth(cliCommand, target);
+    if (!auth.ok) return { ok: false, error: auth.error };
+    const result = await serverManager.ensureHostConnected(cliCommand, target);
+    broadcastHostStatus();
+    if (result.ok) log("Connected this laptop.");
+    return { ok: result.ok, error: result.error };
   });
 
   ipcMain.handle("omnigent:copy-setup-text", (event, text) => {
@@ -3240,6 +3414,8 @@ function registerIpc() {
       // In-app install is macOS-only; the renderer must not route connect/local
       // through an install step on platforms where it can't run.
       installSupported: process.platform === "darwin",
+      // start-local's own reuse test, so "Open" vs "Start Omnigent" matches it.
+      localServerRunning: (await omnigentCli.localServerHealthy()) !== null,
     };
   });
 
@@ -3326,6 +3502,13 @@ function registerIpc() {
     return cliInstallInFlight;
   });
 
+  registerFileReveal({
+    ipcMain,
+    shell,
+    isPinnedOriginSender,
+    localHostId: () => omnigentCli.localHostId(),
+  });
+
   // SPA → this machine's identity: is the CLI installed, and its host id. Both
   // come from local config (no `omnigent host status` subprocess), so this is
   // instant — it lets the new-session picker tag/connect "this machine" without
@@ -3393,6 +3576,44 @@ function registerIpc() {
     }
   });
 
+  // Setup page ↔ live color-scheme override (System/Light/Dark) for the wizard.
+  // Separate sender gate from the SPA handler above: the setup page isn't a
+  // pinned origin. themeSource is process-global and NOT persisted, so it may
+  // still hold a value the connected SPA set earlier this run — the wizard must
+  // read it on load rather than assume "system".
+
+  // Read the current source + effective appearance so the wizard can seed its
+  // radio and `.dark` class on mount (the wizard's dark styles key off the
+  // class, not the OS media query). Mirrors update_overlay's initial send.
+  ipcMain.handle("omnigent:setup-get-color-scheme", (event) => {
+    if (!isSetupPageSender(event)) return null;
+    return {
+      source: nativeTheme.themeSource,
+      effective: nativeTheme.shouldUseDarkColors ? "dark" : "light",
+    };
+  });
+
+  ipcMain.on("omnigent:setup-set-color-scheme", (event, scheme) => {
+    if (!isSetupPageSender(event)) return;
+    if (scheme !== "light" && scheme !== "dark" && scheme !== "system") return;
+    nativeTheme.themeSource = scheme;
+    event.sender.send("omnigent:setup-theme", nativeTheme.shouldUseDarkColors ? "dark" : "light");
+  });
+
+  // Track OS appearance changes once, and push to every WebContents CURRENTLY
+  // on the setup page — re-checked per send, since setup and the connected SPA
+  // share one reused WebContents (a destroyed-only cleanup would leak the push
+  // into the SPA after navigation). "System" thus restyles live.
+  nativeTheme.on("updated", () => {
+    const theme = nativeTheme.shouldUseDarkColors ? "dark" : "light";
+    for (const win of BrowserWindow.getAllWindows()) {
+      const wc = win.webContents;
+      if (wc && !wc.isDestroyed() && isSetupPageUrl(wc.getURL())) {
+        wc.send("omnigent:setup-theme", theme);
+      }
+    }
+  });
+
   // SPA → start / stop / restart this machine's host daemon for the window's
   // own server (the host selection menu's "connect this machine" action).
   ipcMain.handle("omnigent:host-control", async (event, action) => {
@@ -3402,16 +3623,7 @@ function registerIpc() {
     const serverUrl = senderServerUrl(event);
     if (!serverUrl) return { ok: false, error: "this window is not connected to a server" };
     const cliCommand = hostCliCommand(serverUrl);
-    if (!cliCommand) {
-      const internal =
-        databricksInternalFeaturesEnabled() && isDatabricksManagedServerUrl(serverUrl);
-      return {
-        ok: false,
-        error: internal
-          ? "The isaac CLI was not found. Install it before connecting this machine."
-          : "The omnigent CLI was not found. Install it or set its path.",
-      };
-    }
+    if (!cliCommand) return { ok: false, error: missingHostCliError(serverUrl) };
     let result;
     if (action === "start" || action === "restart") {
       // Enrolling this machine as a runner executes agent code locally, so it
@@ -3481,6 +3693,20 @@ function registerIpc() {
     // only be enrolled against a Databricks-managed server.
     if (!isDatabricksManagedServerUrl(serverUrl)) {
       return { ok: false, error: "Arca hosts can only connect to Databricks-managed servers." };
+    }
+    // An auto-connect already running shares its outcome instead of racing a
+    // second `arca ssh`.
+    const autoRun = arcaAutoConnect.inFlight(serverUrl);
+    if (autoRun) {
+      const status = await autoRun;
+      return status.state === "online"
+        ? { ok: true, alreadyRunning: status.alreadyRunning === true }
+        : {
+            ok: false,
+            error: status.error,
+            errorKind: status.errorKind,
+            authError: status.errorKind === "omni-auth",
+          };
     }
     const win = BrowserWindow.fromWebContents(event.sender);
     return arcaConnectFlow.run(win, serverUrl);

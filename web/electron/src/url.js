@@ -49,8 +49,9 @@
    * Normalize a user-entered server URL to its origin. Accepts a bare
    * `host[:port][/path]`, defaults the scheme (https://, or http:// for loopback
    * hosts), trims whitespace, and discards paths, fragments, and query
-   * parameters. For Databricks workspace hosts only, it preserves `o` (the
-   * workspace organization selector). A server connection always starts at the
+   * parameters. Databricks workspace hosts use HTTPS unless a custom port is
+   * specified, and preserve `o` (the workspace organization selector).
+   * A server connection always starts at the
    * canonical root; workspace mounts
    * are discovered separately by expandDatabricksWorkspaceUrl.
    *
@@ -73,6 +74,7 @@
       throw new Error(`unsupported scheme '${url.protocol}' (use http/https)`);
     }
     const normalized = new URL(`${url.origin}/`);
+    upgradeWorkspaceProtocol(normalized);
     if (isDatabricksWorkspaceHost(url.hostname)) {
       for (const organization of url.searchParams.getAll("o")) {
         normalized.searchParams.append("o", organization);
@@ -135,24 +137,17 @@
 
   /**
    * True when the entered URL is unencrypted http:// to a non-local host — the
-   * setup page warns before connecting. Mirrors normalizeUrl's scheme-
-   * defaulting (https:// by default, http:// for loopback), so a bare remote
-   * host — now https — does not trip the warning; only an explicit http:// to a
-   * remote host does. Invalid URLs return false so the real error comes from
-   * normalizeUrl on Connect.
+   * setup page warns before connecting. Use the actual connection scheme,
+   * including HTTPS upgrades for Databricks workspaces. Invalid URLs return
+   * false so the real error comes from normalizeUrl on Connect.
    *
    * @param {string} raw
    * @returns {boolean}
    */
   function isPlainHttpRemote(raw) {
-    const trimmed = (raw || "").trim();
-    if (trimmed === "") return false;
-    const withScheme = trimmed.includes("://")
-      ? trimmed
-      : `${defaultSchemeFor(trimmed)}://${trimmed}`;
     let url;
     try {
-      url = new URL(withScheme);
+      url = new URL(normalizeUrl(raw));
     } catch {
       return false;
     }
@@ -176,6 +171,15 @@
     return WORKSPACE_DOMAINS.some(
       (domain) => normalized === domain || normalized.endsWith(`.${domain}`),
     );
+  }
+
+  /** Upgrade in place before origin pinning; custom ports may serve HTTP-only proxies. */
+  function upgradeWorkspaceProtocol(url) {
+    if (url.protocol !== "http:" || url.port || !isDatabricksWorkspaceHost(url.hostname)) {
+      return false;
+    }
+    url.protocol = "https:";
+    return true;
   }
 
   /**
@@ -207,7 +211,7 @@
   ]);
 
   /**
-   * Map a saved Databricks API URL to the browser-facing workspace mount.
+   * Upgrade saved Databricks HTTP URLs and map API mounts to the browser UI.
    *
    * The CLI records the API mount, but Electron must load the SPA mount.
    * Query and fragment state survive so workspace selectors and deep-link
@@ -226,8 +230,11 @@
     }
     if (url.protocol !== "http:" && url.protocol !== "https:") return rawUrl;
     if (!isDatabricksWorkspaceHost(url.hostname)) return rawUrl;
+    const upgraded = upgradeWorkspaceProtocol(url);
     const pathWithoutTrailingSlash = url.pathname.replace(/\/+$/, "");
-    if (!WORKSPACE_API_PATHS.has(pathWithoutTrailingSlash)) return rawUrl;
+    if (!WORKSPACE_API_PATHS.has(pathWithoutTrailingSlash)) {
+      return upgraded ? url.toString() : rawUrl;
+    }
     url.pathname = WORKSPACE_UI_PATH;
     return url.toString();
   }

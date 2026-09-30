@@ -2165,17 +2165,19 @@ def test_interrupt_with_no_active_turn_and_no_pending_mcp_is_noop(
     assert _FakeCodexNativeClient.requests == []
 
 
-def test_interrupt_tolerates_stale_active_turn_mismatch(
+@pytest.mark.parametrize(
+    "message",
+    [
+        "no active turn to interrupt",
+        "expected active turn id turn_gone but found turn_new",
+    ],
+)
+def test_interrupt_tolerates_stale_active_turn_error(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    message: str,
 ) -> None:
-    """Interrupting a turn a newer one replaced is not a failure.
-
-    Regression: the recorded turn can end or be replaced before Stop lands, so
-    ``turn/interrupt`` gets -32600 "expected active turn id X but found Y". That
-    used to raise and surface as "Harness interrupt failed or timed out"; the
-    turn we targeted is already gone, so the interrupt has nothing left to do.
-    """
+    """Interrupting a turn that ended or was replaced is not a failure."""
 
     class _MismatchInterruptClient(_FakeCodexNativeClient):
         """Reject the recorded-turn interrupt with the mismatch error."""
@@ -2187,7 +2189,7 @@ def test_interrupt_tolerates_stale_active_turn_mismatch(
                 raise CodexAppServerResponseError(
                     {
                         "code": -32600,
-                        "message": "expected active turn id turn_gone but found turn_new",
+                        "message": message,
                     }
                 )
             return {"result": {}}

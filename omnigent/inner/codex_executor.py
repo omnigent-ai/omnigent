@@ -60,6 +60,13 @@ from ._subprocess_lifecycle import close_subprocess_transport, terminate_subproc
 from .async_utils import run_sync_on_thread
 from .codex_goal_command import goal_objective_from_content as _goal_objective_from_content
 from .codex_goal_command import goal_objective_length_error as _goal_objective_length_error
+from .codex_staging import (
+    CODEX_HOME_PREFIX,
+    CODEX_SKILLS_PREFIX,
+    codex_home_staging_root,
+    link_codex_skills_dir,
+    prepare_codex_skills_dir,
+)
 from .codex_worker import (
     CodexWorkerLaunch,
     prepare_codex_catalog_probe,
@@ -794,13 +801,36 @@ def select_codex_skill_dirs(
     return {n: available[n] for n in names}
 
 
+def _is_linked_skill_dir(skill_dir: Path) -> bool:
+    """
+    Return whether a selected skill directory or its skills root is a link.
+
+    :param skill_dir: A ``<skills_root>/<name>`` directory from
+        :func:`select_codex_skill_dirs`.
+    :returns: ``True`` when either entry is a symlink or a Windows junction.
+    """
+    return any(path.is_symlink() or path.is_junction() for path in (skill_dir, skill_dir.parent))
+
+
+def _ignore_codex_skill_junctions(directory: str, names: list[str]) -> list[str]:
+    """Skip junctions before copytree can traverse them, including in nested directories."""
+    junctions = [name for name in names if (Path(directory) / name).is_junction()]
+    for name in junctions:
+        logger.warning(
+            "skipping directory junction %s while copying Codex skills", Path(directory) / name
+        )
+    return junctions
+
+
 def _populate_codex_skills(
     target_dir: Path,
     skills_filter: str | list[str],
     sources: list[Path],
+    *,
+    copy_skills: bool = False,
 ) -> None:
     """
-    Populate *target_dir* with symlinks to skill directories.
+    Populate *target_dir* with symlinks to (or copies of) skill directories.
 
     Codex auto-discovers skills under ``$CODEX_HOME/skills/<name>/``.
     Our executor already overrides ``CODEX_HOME`` to a per-conversation
@@ -824,6 +854,14 @@ def _populate_codex_skills(
         source that contains a given skill name wins (so callers should
         list bundled skills before host skills if they want bundle
         overrides, or vice versa).
+    :param copy_skills: Copy each selected skill directory instead of
+        symlinking it. Used for sandbox-exposed staging, where the
+        ``skills/`` subtree must be self-contained — a symlink whose
+        target is outside the mounted subtree dangles inside the tool
+        namespace. A skill whose directory or skills root is itself a
+        link is still linked, never copied: copying would materialize
+        the link's target, which no sandbox grant covers. Nested directory
+        junctions are skipped rather than traversed.
     """
     if skills_filter == "none":
         return
@@ -835,32 +873,47 @@ def _populate_codex_skills(
         link_path = target_dir / name
         if link_path.exists() or link_path.is_symlink():
             continue
-        try:
-            # Resolve to absolute so the symlink doesn't break when
-            # the source was a relative path (relative symlinks resolve
-            # against the link's parent, not the original cwd).
-            link_path.symlink_to(skill_dir.resolve())
-        except OSError as exc:
-            # Filesystems without symlink support (e.g. some Windows
-            # configs) — fall back to a copy. Don't crash the harness
-            # boot over a skill-discovery convenience.
-            logger.warning(
-                "could not symlink skill %r into %s (%s); copying instead",
-                name,
-                target_dir,
-                exc,
-            )
+        keep_link = _is_linked_skill_dir(skill_dir)
+        if not copy_skills or keep_link:
             try:
-                shutil.copytree(skill_dir, link_path)
-            except OSError as copy_exc:
-                # Copy fallback can also fail (unreadable source, race) — skip
-                # this one skill rather than abort the whole session boot.
+                # Resolve to absolute so the symlink doesn't break when
+                # the source was a relative path (relative symlinks resolve
+                # against the link's parent, not the original cwd).
+                link_codex_skills_dir(link_path, skill_dir.resolve())
+                continue
+            except OSError as exc:
+                if keep_link:
+                    logger.warning(
+                        "could not link skill %r into %s (%s); skipping",
+                        name,
+                        target_dir,
+                        exc,
+                    )
+                    continue
+                # Filesystems without symlink support (e.g. some Windows
+                # configs) — fall back to a copy. Don't crash the harness
+                # boot over a skill-discovery convenience.
                 logger.warning(
-                    "could not copy skill %r into %s (%s); skipping",
+                    "could not symlink skill %r into %s (%s); copying instead",
                     name,
                     target_dir,
-                    copy_exc,
+                    exc,
                 )
+        try:
+            # Preserve symlinks and skip junctions so outside targets never
+            # become regular files in the session's readable directory.
+            shutil.copytree(
+                skill_dir, link_path, symlinks=True, ignore=_ignore_codex_skill_junctions
+            )
+        except OSError as copy_exc:
+            # Copying can fail too (unreadable source, race) — skip this
+            # one skill rather than abort the whole session boot.
+            logger.warning(
+                "could not copy skill %r into %s (%s); skipping",
+                name,
+                target_dir,
+                copy_exc,
+            )
 
 
 def populate_codex_skills_from_bundle(
@@ -868,6 +921,7 @@ def populate_codex_skills_from_bundle(
     bundle_dir: Path | None,
     skills_filter: str | list[str],
     *,
+    copy_skills: bool = False,
     source_codex_home: Path | None = None,
 ) -> None:
     """
@@ -889,6 +943,11 @@ def populate_codex_skills_from_bundle(
         first (highest-priority) source when present.
     :param skills_filter: The spec's ``skills_filter``: ``"all"`` /
         ``"none"`` / a list of skill names.
+    :param copy_skills: Copy skill directories instead of symlinking them
+        (see :func:`_populate_codex_skills`). Per-conversation temp homes
+        pass ``True`` so the sandbox-exposed ``skills/`` subtree is
+        self-contained; the persistent codex-native home keeps symlinks so
+        skill content tracks the source.
     :param source_codex_home: When set, the resolved host Codex home to read
         skills from instead of ``~/.codex``. The native launch passes the
         ``$CODEX_HOME``-resolved home so the seeded skills match what the CLI
@@ -896,7 +955,9 @@ def populate_codex_skills_from_bundle(
     :returns: None.
     """
     skill_sources = codex_skill_sources(bundle_dir, Path.home(), codex_home=source_codex_home)
-    _populate_codex_skills(codex_home / "skills", skills_filter, skill_sources)
+    _populate_codex_skills(
+        codex_home / "skills", skills_filter, skill_sources, copy_skills=copy_skills
+    )
 
 
 def _is_omnigent_private_codex_home(path: Path) -> bool:
@@ -921,7 +982,7 @@ def _is_omnigent_private_codex_home(path: Path) -> bool:
         and parts[-4] == ".omnigent"
     ):
         return True
-    return expanded.name.startswith("omnigent-codex-home-")
+    return expanded.name.startswith(CODEX_HOME_PREFIX)
 
 
 def _private_codex_home_config_source(path: Path) -> Path | None:
@@ -2637,6 +2698,7 @@ class _CodexAppServerSession:
         disable_native_tools: bool = False,
         bundle_dir: Path | None = None,
         skills_filter: str | list[str] = "all",
+        skills_dir: Path | None = None,
         os_env: OSEnvSpec | None = None,
         signer_factory: Callable[[], ModelSignerSession] | None = None,
         provider_auth_authority: tuple[str, str] | None = None,
@@ -2651,6 +2713,8 @@ class _CodexAppServerSession:
         self._disable_native_tools = disable_native_tools
         self._bundle_dir = bundle_dir
         self._skills_filter = skills_filter
+        self._skills_dir = skills_dir
+        self._owned_skills_dir: tempfile.TemporaryDirectory[str] | None = None
         self._os_env_spec = os_env
         self._signer_factory = signer_factory
         self._provider_auth_authority = provider_auth_authority
@@ -2758,13 +2822,7 @@ class _CodexAppServerSession:
             self._signer_exited = False
             self._signer_watch_task = asyncio.create_task(self._watch_signer())
         codex_home_root = Path(tempfile.gettempdir())
-        if self._signer is None and self._cwd and self._cwd != "/":
-            try:
-                codex_home_root = Path(self._cwd) / ".codex-tmp"
-                codex_home_root.mkdir(parents=True, exist_ok=True)
-            except OSError:
-                codex_home_root = Path(tempfile.gettempdir())
-        elif self._signer is not None:
+        if self._signer is not None:
             root_stat = codex_home_root.lstat()
             unsafe_writable = bool(root_stat.st_mode & (stat.S_IWGRP | stat.S_IWOTH))
             if (
@@ -2773,8 +2831,12 @@ class _CodexAppServerSession:
                 or (unsafe_writable and not root_stat.st_mode & stat.S_ISVTX)
             ):
                 raise OSError("unsafe signer session temp root")
+        # Stage outside the workspace, falling back to a private temp home
+        # when the shared staging root is unavailable.
+        with suppress(OSError):
+            codex_home_root = codex_home_staging_root()
         self._codex_home_dir = Path(
-            tempfile.mkdtemp(prefix="omnigent-codex-home-", dir=str(codex_home_root))
+            tempfile.mkdtemp(prefix=CODEX_HOME_PREFIX, dir=str(codex_home_root))
         )
         home_stat = self._codex_home_dir.lstat()
         self._codex_home_identity = (home_stat.st_dev, home_stat.st_ino)
@@ -2782,17 +2844,28 @@ class _CodexAppServerSession:
         home_stat = self._codex_home_dir.lstat()
         if not stat.S_ISDIR(home_stat.st_mode) or stat.S_IMODE(home_stat.st_mode) != 0o700:
             raise OSError("unsafe signer CODEX_HOME")
-        # Populate the per-conversation CODEX_HOME's ``skills/`` subdir
-        # based on the spec's ``skills:`` field. Codex auto-discovers
-        # skills under ``$CODEX_HOME/skills/<name>/SKILL.md``; without
-        # this step the temp CODEX_HOME has no skills directory at all,
-        # so even ``skills: all`` would expose nothing. The shared helper
-        # is the same one the codex-native launch path uses, so both
-        # expose an identical skill surface.
+        # The runner grants only this session's skills directory to its tools.
+        # Keep its inode stable so cached sandbox mounts survive worker restarts.
+        if self._skills_dir is None:
+            self._owned_skills_dir = tempfile.TemporaryDirectory(prefix=CODEX_SKILLS_PREFIX)
+            self._skills_dir = Path(self._owned_skills_dir.name)
+        self._skills_dir = prepare_codex_skills_dir(self._skills_dir)
+        try:
+            link_codex_skills_dir(self._codex_home_dir / "skills", self._skills_dir)
+        except OSError as exc:
+            # Skills are then copied into the home itself: still discoverable,
+            # but outside the session's grant, so restricted reads can't open them.
+            logger.warning(
+                "could not link %s to the session skills directory (%s); sandboxed "
+                "tools with restricted reads cannot open this session's skills",
+                self._codex_home_dir / "skills",
+                exc,
+            )
         populate_codex_skills_from_bundle(
             self._codex_home_dir,
             self._bundle_dir,
             self._skills_filter,
+            copy_skills=True,
         )
         # Bridge the user's authentication and provider config into the
         # temp CODEX_HOME. The codex CLI reads ``auth.json`` (OAuth tokens
@@ -2879,6 +2952,7 @@ class _CodexAppServerSession:
                     codex_path=self._codex_path,
                     cwd=process_cwd,
                     codex_home=self._codex_home_dir,
+                    skills_dir=self._skills_dir,
                     os_env=self._os_env_spec,
                     spawn_env_names=list(proc_env),
                     signer_readiness=self._signer_readiness,
@@ -3311,6 +3385,10 @@ class _CodexAppServerSession:
                 pass
             self._codex_home_dir = None
             self._codex_home_identity = None
+        if self._owned_skills_dir is not None:
+            self._owned_skills_dir.cleanup()
+            self._owned_skills_dir = None
+            self._skills_dir = None
 
     def _close_worker_liveness(self) -> None:
         fd = self._worker_liveness_fd
@@ -4260,6 +4338,7 @@ class _AppSessionFactory(Protocol):
         disable_native_tools: bool,
         bundle_dir: Path | None,
         skills_filter: str | list[str],
+        skills_dir: Path | None,
         os_env: OSEnvSpec | None,
     ) -> _CodexAppServerSession: ...
 
@@ -4275,6 +4354,7 @@ def _default_app_session_factory(
     disable_native_tools: bool,
     bundle_dir: Path | None,
     skills_filter: str | list[str],
+    skills_dir: Path | None = None,
     os_env: OSEnvSpec | None,
     signer_launch_config: SignerLaunchConfig | None = None,
 ) -> _CodexAppServerSession:
@@ -4288,6 +4368,7 @@ def _default_app_session_factory(
         disable_native_tools=disable_native_tools,
         bundle_dir=bundle_dir,
         skills_filter=skills_filter,
+        skills_dir=skills_dir,
         os_env=os_env,
         signer_factory=(
             (lambda: SubprocessModelSigner(signer_launch_config))
@@ -4327,6 +4408,7 @@ class CodexExecutor(Executor):
         bundle_dir: Path | None = None,
         agent_name: str | None = None,
         skills_filter: str | list[str] = "all",
+        skills_dir: Path | None = None,
         signer_launch_config: SignerLaunchConfig | None = None,
     ) -> None:
         """Create a CodexExecutor.
@@ -4403,6 +4485,7 @@ class CodexExecutor(Executor):
         :param signer_launch_config: Trusted, non-secret signer authority.
             When set, the default session factory creates a fresh signer for
             each session and Codex is pinned to its endpoint and placeholder.
+        :param skills_dir: Runtime-owned skills directory granted only to this session.
         """
         self._cwd = cwd
         self._os_env_spec = os_env
@@ -4421,6 +4504,7 @@ class CodexExecutor(Executor):
         self._bundle_dir = bundle_dir
         self._agent_name = agent_name
         self._skills_filter = skills_filter
+        self._skills_dir = skills_dir
         self._signer_backed = signer_launch_config is not None
         self._brokered_version_identity: tuple[int, int, int, int] | None = None
         resolved_codex = codex_path or _find_codex_cli()
@@ -4721,6 +4805,7 @@ class CodexExecutor(Executor):
             disable_native_tools=self._disable_native_tools,
             bundle_dir=self._bundle_dir,
             skills_filter=self._skills_filter,
+            skills_dir=self._skills_dir,
             os_env=self._os_env_spec,
         )
         state.app_session = app_session

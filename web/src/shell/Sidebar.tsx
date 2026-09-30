@@ -1498,7 +1498,7 @@ function ProjectFolder({
         }
         indentRows
         headerAction={
-          <ProjectFolderMenu
+          <ProjectFolderActions
             projectName={name}
             onNavigate={onRowClick}
             actions={orderedMenuActions}
@@ -2732,7 +2732,7 @@ function SectionHeader({
               active && SIDEBAR_ACTIVE_HIGHLIGHT,
               hasAction &&
                 !showsMarker &&
-                "pr-8 [@media((hover:hover)_and_(pointer:fine))]:md:pr-2 [@media((hover:hover)_and_(pointer:fine))]:md:group-hover/header:pr-8 [@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-header-controls]:focus-within]/header:pr-8 [@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-state=open]]/header:pr-8",
+                "pr-8 [@media((hover:hover)_and_(pointer:fine))]:pr-14 [@media((hover:hover)_and_(pointer:fine))]:md:pr-2 [@media((hover:hover)_and_(pointer:fine))]:md:group-hover/header:pr-14 [@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-header-controls]:focus-within]/header:pr-14 [@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-state=open]]/header:pr-14",
             )
           : "group flex h-7 w-full items-center gap-1 border-0 pr-0 pl-2 text-left text-sm font-normal text-muted-foreground transition-colors hover:text-foreground",
       )}
@@ -2774,10 +2774,12 @@ function SectionHeader({
         <span
           className={cn(
             "ml-auto flex shrink-0 items-center justify-center transition-opacity",
-            // Icon headers are project folders with one menu button; section
-            // headers reserve two slots for their select/filter controls.
+            // Touch project rows have one menu; fine pointers also get a shortcut.
             hasAction
-              ? cn(icon ? "mr-7" : "mr-14", clusterHoverDesktopMargin)
+              ? cn(
+                  icon ? "mr-7 [@media((hover:hover)_and_(pointer:fine))]:mr-14" : "mr-14",
+                  clusterHoverDesktopMargin,
+                )
               : hasPersistentAction
                 ? "mr-7"
                 : clusterRestMargin,
@@ -4735,6 +4737,45 @@ function PinnedProjectFlyoutContent({
   );
 }
 
+function ProjectFolderActions({
+  projectName,
+  onNavigate,
+  actions,
+}: {
+  projectName: string;
+  onNavigate: (e: MouseEvent<HTMLAnchorElement>) => void;
+  actions: ProjectFolderMenuActions;
+}) {
+  return (
+    <div className="flex items-center gap-0.5">
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <Button
+            asChild
+            variant="ghost"
+            size="icon-xs"
+            aria-label={`New session in ${projectName}`}
+            data-testid="project-new-session"
+            className="hidden text-muted-foreground [@media((hover:hover)_and_(pointer:fine))]:flex"
+          >
+            <Link
+              to={`/?project=${encodeURIComponent(projectName)}`}
+              onClick={(e) => {
+                e.stopPropagation();
+                onNavigate(e);
+              }}
+            >
+              <MessageCirclePlusIcon className="size-3.5" data-icon-size="14" />
+            </Link>
+          </Button>
+        </TooltipTrigger>
+        <TooltipContent side="bottom">New session in project</TooltipContent>
+      </Tooltip>
+      <ProjectFolderMenu projectName={projectName} onNavigate={onNavigate} actions={actions} />
+    </div>
+  );
+}
+
 // ── ProjectFolderMenu ─────────────────────────────────────────────────────────
 
 /** The menu body shared by the project-folder kebab and context menu. */
@@ -4743,11 +4784,13 @@ function ProjectFolderMenuItems({
   projectName,
   onNavigate,
   actions,
+  hideNewSessionOnDesktop = false,
 }: {
   components: MenuComponents;
   projectName: string;
   onNavigate: (e: MouseEvent<HTMLAnchorElement>) => void;
   actions: ProjectFolderMenuActions;
+  hideNewSessionOnDesktop?: boolean;
 }) {
   const { onMenuOpen, onMenuClose } = actions;
   useEffect(() => {
@@ -4757,7 +4800,13 @@ function ProjectFolderMenuItems({
 
   return (
     <>
-      <C.Item asChild data-testid="project-new-session-menu">
+      <C.Item
+        asChild
+        data-testid="project-new-session-menu"
+        className={
+          hideNewSessionOnDesktop ? "[@media((hover:hover)_and_(pointer:fine))]:hidden" : undefined
+        }
+      >
         <Link
           to={`/?project=${encodeURIComponent(projectName)}`}
           onClick={(e) => {
@@ -5155,6 +5204,7 @@ function ProjectFolderMenu({
       <DropdownMenuContent align="end" className="min-w-40">
         <ProjectFolderMenuItems
           components={dropdownBundle}
+          hideNewSessionOnDesktop
           projectName={projectName}
           onNavigate={onNavigate}
           actions={actions}

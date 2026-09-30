@@ -47,6 +47,7 @@ from .sandbox import (
     reachable_roots,
     resolve_sandbox,
     set_sandbox_env,
+    with_additional_read_roots,
     with_additional_write_roots,
 )
 
@@ -987,6 +988,7 @@ def create_os_environment(
     *,
     copy_on_write_environment: CopyOnWriteEnvironment | None = None,
     sandbox_policy: SandboxPolicy | None = None,
+    additional_read_roots: Sequence[Path] = (),
 ) -> OSEnvironment | None:
     """Instantiate the configured OS environment."""
     if spec is None:
@@ -1002,6 +1004,8 @@ def create_os_environment(
         _copy_tree(cwd, effective_cwd)
         cwd = effective_cwd
     sandbox = replace(sandbox_policy) if sandbox_policy is not None else resolve_sandbox(spec, cwd)
+    if additional_read_roots:
+        sandbox = with_additional_read_roots(sandbox, list(additional_read_roots))
     if spec.start_in_scratch and not sandbox.active:
         raise ValueError(
             "os_env.start_in_scratch requires an active sandbox; "

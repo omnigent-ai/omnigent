@@ -15,7 +15,8 @@ import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testi
 import userEvent from "@testing-library/user-event";
 import { createRef, StrictMode, type ComponentRef, type ReactElement } from "react";
 import { MemoryRouter } from "react-router-dom";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { toast } from "sonner";
+import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import { useChatStore, type ChatState, type QueuedMessage } from "@/store/chatStore";
 import {
   clearSessionDrafts,
@@ -843,6 +844,77 @@ describe("Composer slash-command menu", () => {
     fireEvent.keyDown(ta, { key: "Tab" });
     // Skills fill "/name " and keep focus so the user can append args.
     expect(ta.value).toBe("/deslop ");
+  });
+
+  it.each(["/context", "/help"])("Tab only fills the %s built-in", (command) => {
+    render(<Composer {...composerProps()} />);
+    fireEvent.change(textarea(), { target: { value: command } });
+    fireEvent.keyDown(textarea(), { key: "Tab" });
+    expect(textarea()).toHaveValue(command + " ");
+    expect(screen.queryByText("No usage data yet — send a message first.")).toBeNull();
+  });
+
+  it.each([
+    ["claude-native", "/compact", false],
+    ["claude-native", "/compact preserve decisions and TODOs", false],
+    ["claude-sdk", "/compact", false],
+    ["codex-native", "/compact", false],
+    ["pi-native", "/compact", false],
+    ["pi-native", "/compact", true],
+  ] as const)("%s dispatches %s (busy: %s)", (harness, command, isWorking) => {
+    const previousHarness = useChatStore.getState().sessionHarness;
+    onTestFinished(() => useChatStore.setState({ sessionHarness: previousHarness }));
+    useChatStore.setState({ sessionHarness: harness });
+    const compact = vi.spyOn(useChatStore.getState(), "compact").mockResolvedValue();
+    const error = vi.spyOn(toast, "error");
+    const props = composerProps({ isNativeWrapper: harness !== "claude-sdk", isWorking });
+    render(<Composer {...props} />);
+    fireEvent.change(textarea(), { target: { value: "/comp" } });
+    fireEvent.keyDown(textarea(), { key: "Tab" });
+    expect(textarea()).toHaveValue("/compact ");
+    expect(props.onSend).not.toHaveBeenCalled();
+    expect(compact).not.toHaveBeenCalled();
+
+    fireEvent.change(textarea(), { target: { value: command + " " } });
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+    expect(textarea()).toHaveValue("");
+    expect(error).not.toHaveBeenCalled();
+    if (harness === "claude-native") {
+      expect(props.onSend).toHaveBeenCalledExactlyOnceWith(command);
+      expect(compact).not.toHaveBeenCalled();
+      fireEvent.keyDown(textarea(), { key: "ArrowUp" });
+      expect(textarea()).toHaveValue(command);
+    } else {
+      expect(compact).toHaveBeenCalledOnce();
+      expect(props.onSend).not.toHaveBeenCalled();
+    }
+  });
+
+  it.each(["Enter", "click"])("shows a toast for busy Codex /compact via %s", (submit) => {
+    const previousHarness = useChatStore.getState().sessionHarness;
+    onTestFinished(() => useChatStore.setState({ sessionHarness: previousHarness }));
+    useChatStore.setState({ sessionHarness: "codex-native" });
+    const compact = vi.spyOn(useChatStore.getState(), "compact").mockResolvedValue();
+    const error = vi.spyOn(toast, "error");
+    const props = composerProps({ isNativeWrapper: true, isWorking: true });
+    render(<Composer {...props} />);
+    fireEvent.change(textarea(), { target: { value: "/comp" } });
+    fireEvent.keyDown(textarea(), { key: "Tab" });
+    expect(error).not.toHaveBeenCalled();
+    if (submit === "Enter") {
+      fireEvent.keyDown(textarea(), { key: "Enter" });
+      expect(textarea()).toHaveValue("/compact ");
+    } else {
+      fireEvent.change(textarea(), { target: { value: "/comp" } });
+      fireEvent.click(activeRow()!);
+      expect(textarea()).toHaveValue("/comp");
+    }
+    expect(error).toHaveBeenCalledExactlyOnceWith(
+      "Compact is disabled while a chat is in progress",
+      { richColors: true },
+    );
+    expect(compact).not.toHaveBeenCalled();
+    expect(props.onSend).not.toHaveBeenCalled();
   });
 
   it("Tab completes a match found only mid-name (exercises menuMatches, not just the render filter)", () => {
@@ -2477,8 +2549,22 @@ describe("Composer shared visible controls", () => {
       .mockResolvedValue(undefined);
     renderWithTooltips(<Composer {...composerProps({ showCodexApprovalMode: true })} />);
     fireEvent.keyDown(screen.getByTestId("composer-permission-chip"), { key: "ArrowDown" });
-    fireEvent.click(screen.getByTestId("composer-permission-option-read-only"));
-    await waitFor(() => expect(setApproval).toHaveBeenCalledWith("read-only"));
+    fireEvent.click(screen.getByTestId("composer-permission-option-full-access"));
+    await waitFor(() => expect(setApproval).toHaveBeenCalledWith("full-access"));
+  });
+
+  it("doesn't offer Read Only as a codex runtime switch", () => {
+    useChatStore.setState({
+      conversationId: "codex-no-read-only",
+      codexApprovalMode: "read-only",
+    });
+    renderWithTooltips(<Composer {...composerProps({ showCodexApprovalMode: true })} />);
+    const chip = screen.getByTestId("composer-permission-chip");
+    // A session launched read-only still shows its live mode on the chip.
+    expect(chip).toHaveTextContent("Read Only");
+    fireEvent.keyDown(chip, { key: "ArrowDown" });
+    expect(screen.getByTestId("composer-permission-option-full-access")).toBeInTheDocument();
+    expect(screen.queryByTestId("composer-permission-option-read-only")).toBeNull();
   });
 });
 

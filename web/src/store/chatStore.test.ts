@@ -10671,14 +10671,17 @@ describe("chatStore — startStreamPump reconnect loop", () => {
 
   /** Route `/stream` opens to controllable sinks; everything else hits the
    *  default handler. Returns the growing list of opened stream sinks. */
-  function routeStreamOpens(): StreamSink[] {
+  function routeStreamOpens(epochs: readonly string[] = []): StreamSink[] {
     const sinks: StreamSink[] = [];
     fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
       const url = typeof input === "string" ? input : input.toString();
       if (/\/v1\/sessions\/[^/]+\/stream$/.test(url)) {
         const sink = pushableStream();
         sinks.push(sink);
-        return mockResponse(null, { bodyStream: sink.stream });
+        const response = mockResponse(null, { bodyStream: sink.stream });
+        const epoch = epochs[sinks.length - 1];
+        if (epoch) response.headers.set("x-omnigent-stream-epoch", epoch);
+        return response;
       }
       return defaultFetchHandler(input, init);
     });
@@ -10730,6 +10733,512 @@ describe("chatStore — startStreamPump reconnect loop", () => {
 
     controller.abort();
     await loop;
+  });
+
+  it("marks native preview interrupted during a dropped stream and clears after replay", async () => {
+    seedSession("conv_preview_notice", []);
+    const sinks: StreamSink[] = [];
+    let permitReconnect = false;
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (/\/v1\/sessions\/[^/]+\/stream$/.test(url)) {
+        if (sinks.length > 0 && !permitReconnect)
+          return mockResponse({}, { ok: false, status: 503 });
+        const sink = pushableStream();
+        sinks.push(sink);
+        return mockResponse(null, { bodyStream: sink.stream });
+      }
+      return defaultFetchHandler(input, init);
+    });
+    const controller = new AbortController();
+    useChatStore.setState({
+      conversationId: "conv_preview_notice",
+      abortController: controller,
+      isNativeTerminalSession: true,
+    });
+    const loop = startStreamPump("conv_preview_notice", controller, setState, getState);
+    const preview = () =>
+      useChatStore
+        .getState()
+        .blocks.find((b): b is TextDone => b.type === "text_done" && b.ctx.itemId === "live:m1");
+    await vi.advanceTimersByTimeAsync(1);
+    sinks[0]!.push(sse("response.output_text.delta", { message_id: "m1", index: 0, delta: "Hi" }));
+    await vi.advanceTimersByTimeAsync(20);
+    expect(preview()?.previewInterrupted).toBeUndefined();
+
+    sinks[0]!.error();
+    await vi.advanceTimersByTimeAsync(20);
+    expect(preview()?.previewInterrupted).toBe(true);
+    permitReconnect = true;
+    await vi.advanceTimersByTimeAsync(6000);
+    expect(sinks).toHaveLength(2);
+    sinks[1]!.push(sse("response.output_text.delta", { message_id: "m1", index: 0, delta: "Hi" }));
+    await vi.advanceTimersByTimeAsync(20);
+    expect(preview()?.previewInterrupted).toBeUndefined();
+
+    sinks[1]!.push("data: [DONE]\n\n");
+    sinks[1]!.close();
+    await vi.advanceTimersByTimeAsync(20);
+    controller.abort();
+    await loop;
+  });
+
+  it("reopens after a clean server-shutdown EOF without [DONE]", async () => {
+    seedSession("conv_server_restart", []);
+    const sinks = routeStreamOpens();
+    const controller = new AbortController();
+    useChatStore.setState({ conversationId: "conv_server_restart", abortController: controller });
+
+    const loop = startStreamPump("conv_server_restart", controller, setState, getState);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(sinks).toHaveLength(1);
+
+    sinks[0]!.close();
+    await vi.advanceTimersByTimeAsync(6000);
+    expect(sinks).toHaveLength(2);
+
+    sinks[1]!.push("data: [DONE]\n\n");
+    sinks[1]!.close();
+    await vi.advanceTimersByTimeAsync(20);
+    controller.abort();
+    await loop;
+  });
+
+  it("preserves native streamed text across a server process restart", async () => {
+    seedSession("conv_epoch_changed", []);
+    const sinks = routeStreamOpens(["server-before", "server-after"]);
+    const controller = new AbortController();
+    useChatStore.setState({ conversationId: "conv_epoch_changed", abortController: controller });
+
+    const loop = startStreamPump("conv_epoch_changed", controller, setState, getState);
+    await vi.advanceTimersByTimeAsync(1);
+    sinks[0]!.push(
+      sse("response.output_text.delta", { message_id: "m1", index: 0, delta: "before " }),
+    );
+    await vi.advanceTimersByTimeAsync(20);
+    expect(useChatStore.getState().blocks.find((b) => b.ctx.itemId === "live:m1")).toMatchObject({
+      fullText: "before ",
+    });
+
+    sinks[0]!.close();
+    await vi.advanceTimersByTimeAsync(6000);
+    expect(sinks).toHaveLength(2);
+    expect(useChatStore.getState().blocks.find((b) => b.ctx.itemId === "live:m1")).toMatchObject({
+      fullText: "before ",
+    });
+    sinks[1]!.push(
+      sse("response.output_text.delta", { message_id: "m1", index: 1, delta: "after" }),
+    );
+    await vi.advanceTimersByTimeAsync(20);
+    expect(useChatStore.getState().blocks.find((b) => b.ctx.itemId === "live:m1")).toMatchObject({
+      fullText: "before after",
+    });
+
+    sinks[1]!.push("data: [DONE]\n\n");
+    sinks[1]!.close();
+    await vi.advanceTimersByTimeAsync(20);
+    controller.abort();
+    await loop;
+  });
+
+  it("keeps the old server's prefix through another reconnect on the new server", async () => {
+    seedSession("conv_epoch_twice", []);
+    const sinks = routeStreamOpens(["server-a", "server-b", "server-b"]);
+    const controller = new AbortController();
+    useChatStore.setState({ conversationId: "conv_epoch_twice", abortController: controller });
+
+    const loop = startStreamPump("conv_epoch_twice", controller, setState, getState);
+    try {
+      await vi.advanceTimersByTimeAsync(1);
+      sinks[0]!.push(
+        sse("response.output_text.delta", { message_id: "m1", index: 0, delta: "before " }),
+      );
+      await vi.advanceTimersByTimeAsync(20);
+      sinks[0]!.close();
+      await vi.advanceTimersByTimeAsync(6000);
+      expect(sinks).toHaveLength(2);
+      sinks[1]!.push(
+        sse("response.output_text.delta", { message_id: "m1", index: 1, delta: "after " }),
+      );
+      await vi.advanceTimersByTimeAsync(20);
+      sinks[1]!.close();
+      await vi.advanceTimersByTimeAsync(6000);
+      expect(sinks).toHaveLength(3);
+      // The server-b replay knows only the post-restart suffix, not server-a's prefix.
+      sinks[2]!.push(
+        sse("response.output_text.delta", { message_id: "m1", index: 1, delta: "after " }),
+      );
+      await vi.advanceTimersByTimeAsync(20);
+      expect(useChatStore.getState().blocks.find((b) => b.ctx.itemId === "live:m1")).toMatchObject({
+        fullText: "before after ",
+      });
+    } finally {
+      controller.abort();
+      const last = sinks[sinks.length - 1];
+      if (last) {
+        last.push("data: [DONE]\n\n");
+        last.close();
+      }
+      await vi.advanceTimersByTimeAsync(20);
+      await loop;
+    }
+  });
+
+  it("uses a conservative preview after a headerless hop between server epochs", async () => {
+    seedSession("conv_epoch_unknown", []);
+    const sinks = routeStreamOpens(["server-a", "", "server-b"]);
+    const controller = new AbortController();
+    useChatStore.setState({
+      conversationId: "conv_epoch_unknown",
+      abortController: controller,
+      isNativeTerminalSession: true,
+    });
+    const loop = startStreamPump("conv_epoch_unknown", controller, setState, getState);
+    try {
+      await vi.advanceTimersByTimeAsync(1);
+      sinks[0]!.push(
+        sse("response.output_text.delta", { message_id: "m1", index: 0, delta: "before " }),
+      );
+      await vi.advanceTimersByTimeAsync(20);
+      sinks[0]!.close();
+      await vi.advanceTimersByTimeAsync(6000);
+      expect(sinks).toHaveLength(2);
+      sinks[1]!.push(
+        sse("response.output_text.delta", { message_id: "m1", index: 1, delta: "after" }),
+      );
+      await vi.advanceTimersByTimeAsync(20);
+      sinks[1]!.close();
+      await vi.advanceTimersByTimeAsync(6000);
+      expect(sinks).toHaveLength(3);
+      sinks[2]!.push(
+        sse("response.output_text.delta", { message_id: "m1", index: 1, delta: "after" }),
+      );
+      await vi.advanceTimersByTimeAsync(20);
+      expect(useChatStore.getState().blocks.find((b) => b.ctx.itemId === "live:m1")).toMatchObject({
+        fullText: "after",
+      });
+    } finally {
+      controller.abort();
+      const last = sinks[sinks.length - 1];
+      if (last) {
+        last.push("data: [DONE]\n\n");
+        last.close();
+      }
+      await vi.advanceTimersByTimeAsync(20);
+      await loop;
+    }
+  });
+
+  it("replaces preserved preview when the final item committed during restart", async () => {
+    seedSession("conv_epoch_completed", []);
+    const sinks = routeStreamOpens(["server-before", "server-after"]);
+    const controller = new AbortController();
+    useChatStore.setState({ conversationId: "conv_epoch_completed", abortController: controller });
+
+    const loop = startStreamPump("conv_epoch_completed", controller, setState, getState);
+    await vi.advanceTimersByTimeAsync(1);
+    sinks[0]!.push(
+      sse("response.output_text.delta", { message_id: "m1", index: 0, delta: "before " }),
+    );
+    await vi.advanceTimersByTimeAsync(20);
+    seedSessionItems("conv_epoch_completed", [
+      assistantMessage("response_done", "before after", "m1"),
+    ]);
+
+    sinks[0]!.close();
+    await vi.advanceTimersByTimeAsync(6000);
+    expect(sinks).toHaveLength(2);
+    expect(useChatStore.getState().blocks.some((b) => b.ctx.itemId === "live:m1")).toBe(false);
+    expect(useChatStore.getState().blocks.map((b) => b.ctx.itemId)).toContain(
+      "msg_response_done_asst",
+    );
+
+    sinks[1]!.push("data: [DONE]\n\n");
+    sinks[1]!.close();
+    await vi.advanceTimersByTimeAsync(20);
+    controller.abort();
+    await loop;
+  });
+
+  it("replaces native preview with cumulative replay on the same server", async () => {
+    seedSession("conv_epoch_same", []);
+    const sinks = routeStreamOpens(["same-server", "same-server"]);
+    const controller = new AbortController();
+    useChatStore.setState({ conversationId: "conv_epoch_same", abortController: controller });
+
+    const loop = startStreamPump("conv_epoch_same", controller, setState, getState);
+    await vi.advanceTimersByTimeAsync(1);
+    sinks[0]!.push(
+      sse("response.output_text.delta", { message_id: "m1", index: 0, delta: "before " }),
+    );
+    await vi.advanceTimersByTimeAsync(20);
+    sinks[0]!.close();
+    await vi.advanceTimersByTimeAsync(6000);
+    expect(sinks).toHaveLength(2);
+    expect(useChatStore.getState().blocks.some((b) => b.ctx.itemId === "live:m1")).toBe(false);
+    sinks[1]!.push(
+      sse("response.output_text.delta", { message_id: "m1", index: 1, delta: "before after" }),
+    );
+    await vi.advanceTimersByTimeAsync(20);
+    expect(useChatStore.getState().blocks.find((b) => b.ctx.itemId === "live:m1")).toMatchObject({
+      fullText: "before after",
+    });
+
+    sinks[1]!.push("data: [DONE]\n\n");
+    sinks[1]!.close();
+    await vi.advanceTimersByTimeAsync(20);
+    controller.abort();
+    await loop;
+  });
+
+  it("reopens a stale completed native turn when its running snapshot has the same id", async () => {
+    seedSession("conv_stale_running", []);
+    const sinks = routeStreamOpens(["server-a", "server-b"]);
+    const normalFetch = fetchMock.getMockImplementation()!;
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url.startsWith("/v1/sessions/conv_stale_running?") && (init?.method ?? "GET") === "GET") {
+        return mockResponse({
+          id: "conv_stale_running",
+          agent_id: "agent_xyz",
+          status: "running",
+          active_response_id: "resp_same",
+          created_at: 0,
+          items: [],
+          labels: { "omnigent.wrapper": "claude-code-native-ui" },
+        });
+      }
+      return normalFetch(input, init);
+    });
+    const controller = new AbortController();
+    const bound = bindConversationForTest("conv_stale_running", {
+      abortController: controller,
+      sessionStatus: "running",
+      isNativeTerminalSession: true,
+      activeResponse: {
+        responseId: "resp_same",
+        state: "completed",
+        error: null,
+        completedAt: Date.now() - 60_000,
+      },
+    });
+    const loop = startStreamPump("conv_stale_running", controller, bound.set, bound.get);
+    try {
+      await vi.advanceTimersByTimeAsync(1);
+      sinks[0]!.close();
+      await vi.advanceTimersByTimeAsync(6000);
+      expect(sinks).toHaveLength(2);
+      expect(bound.get().activeResponse?.state).toBe("streaming");
+
+      sinks[1]!.push(
+        sse("response.output_text.delta", { message_id: "m1", index: 1, delta: "resumed" }),
+      );
+      await vi.advanceTimersByTimeAsync(20);
+      expect(bound.get().blocks.find((b) => b.ctx.itemId === "live:m1")).toMatchObject({
+        fullText: "resumed",
+      });
+    } finally {
+      controller.abort();
+      const last = sinks[sinks.length - 1];
+      if (last) {
+        last.push("data: [DONE]\n\n");
+        last.close();
+      }
+      await vi.advanceTimersByTimeAsync(20);
+      await loop;
+    }
+  });
+
+  it("shows native deltas when a restarted server lost the active response id", async () => {
+    seedSession("conv_stale_no_id", []);
+    const sinks = routeStreamOpens(["server-a", "server-b"]);
+    const normalFetch = fetchMock.getMockImplementation()!;
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url.startsWith("/v1/sessions/conv_stale_no_id?") && (init?.method ?? "GET") === "GET") {
+        return mockResponse({
+          id: "conv_stale_no_id",
+          agent_id: "agent_xyz",
+          status: "running",
+          active_response_id: null,
+          created_at: 0,
+          items: [],
+          labels: { "omnigent.wrapper": "claude-code-native-ui" },
+        });
+      }
+      return normalFetch(input, init);
+    });
+    const controller = new AbortController();
+    const bound = bindConversationForTest("conv_stale_no_id", {
+      abortController: controller,
+      sessionStatus: "running",
+      isNativeTerminalSession: true,
+      activeResponse: {
+        responseId: "resp_same",
+        state: "completed",
+        error: null,
+        completedAt: Date.now() - 60_000,
+      },
+    });
+    const loop = startStreamPump("conv_stale_no_id", controller, bound.set, bound.get);
+    try {
+      await vi.advanceTimersByTimeAsync(1);
+      sinks[0]!.close();
+      await vi.advanceTimersByTimeAsync(6000);
+      expect(sinks).toHaveLength(2);
+      expect(bound.get().sessionStatus).toBe("running");
+      sinks[1]!.push(
+        sse("response.output_text.delta", { message_id: "m1", index: 1, delta: "resumed" }),
+      );
+      await vi.advanceTimersByTimeAsync(20);
+      expect(bound.get().blocks.find((b) => b.ctx.itemId === "live:m1")).toMatchObject({
+        fullText: "resumed",
+        ctx: { responseId: "live:m1" },
+      });
+    } finally {
+      controller.abort();
+      const last = sinks[sinks.length - 1];
+      if (last) {
+        last.push("data: [DONE]\n\n");
+        last.close();
+      }
+      await vi.advanceTimersByTimeAsync(20);
+      await loop;
+    }
+  });
+
+  it("still suppresses a stale native delta while the session is idle", async () => {
+    seedSession("conv_stale_idle", []);
+    const sinks = routeStreamOpens();
+    const controller = new AbortController();
+    const bound = bindConversationForTest("conv_stale_idle", {
+      abortController: controller,
+      sessionStatus: "idle",
+      isNativeTerminalSession: true,
+      activeResponse: {
+        responseId: "resp_old",
+        state: "completed",
+        error: null,
+        completedAt: Date.now() - 60_000,
+      },
+    });
+    const loop = startStreamPump("conv_stale_idle", controller, bound.set, bound.get);
+    try {
+      await vi.advanceTimersByTimeAsync(1);
+      sinks[0]!.push(
+        sse("response.output_text.delta", { message_id: "old", index: 0, delta: "stale" }),
+      );
+      await vi.advanceTimersByTimeAsync(20);
+      expect(bound.get().blocks.some((b) => b.ctx.itemId === "live:old")).toBe(false);
+    } finally {
+      controller.abort();
+      sinks[0]!.push("data: [DONE]\n\n");
+      sinks[0]!.close();
+      await vi.advanceTimersByTimeAsync(20);
+      await loop;
+    }
+  });
+
+  it("replaces an interrupted preview from a committed item missed during the gap", async () => {
+    seedSession("conv_interrupted_gap", []);
+    const sinks = routeStreamOpens(["old-server", "new-server"]);
+    const controller = new AbortController();
+    useChatStore.setState({
+      conversationId: "conv_interrupted_gap",
+      abortController: controller,
+      blocks: [],
+      isNativeTerminalSession: true,
+    });
+    const loop = startStreamPump("conv_interrupted_gap", controller, setState, getState);
+    try {
+      await vi.advanceTimersByTimeAsync(1);
+      sinks[0]!.push(
+        sse("response.output_text.delta", { message_id: "m1", index: 0, delta: "partial " }),
+      );
+      sinks[0]!.push(
+        sse("response.output_text.delta", { message_id: "m1", index: 2, delta: "preview" }),
+      );
+      await vi.advanceTimersByTimeAsync(20);
+      expect(useChatStore.getState().blocks.find((b) => b.ctx.itemId === "live:m1")).toMatchObject({
+        previewInterrupted: true,
+      });
+
+      // The completed item was committed while the browser stream was down;
+      // Claude does not put MessageDisplay's m1 ID in its transcript item.
+      seedSessionItems("conv_interrupted_gap", [assistantMessage("resp_1", "canonical answer")]);
+      sinks[0]!.close();
+      await vi.advanceTimersByTimeAsync(6000);
+      expect(sinks).toHaveLength(2);
+      expect(useChatStore.getState().blocks.map((b) => b.ctx.itemId)).toEqual(["msg_resp_1_asst"]);
+
+      sinks[1]!.push(
+        sse("response.output_text.delta", { message_id: "m2", index: 0, delta: "new preview" }),
+      );
+      await vi.advanceTimersByTimeAsync(20);
+      expect(useChatStore.getState().blocks.some((b) => b.ctx.itemId === "live:m2")).toBe(true);
+    } finally {
+      controller.abort();
+      const last = sinks[sinks.length - 1];
+      if (last) {
+        last.push("data: [DONE]\n\n");
+        last.close();
+      }
+      await vi.advanceTimersByTimeAsync(20);
+      await loop;
+    }
+  });
+
+  it("retries a failed final-item backfill while an interrupted preview remains", async () => {
+    seedSession("conv_interrupted_retry", []);
+    const sinks = routeStreamOpens(["server-a", "server-b"]);
+    const normalFetch = fetchMock.getMockImplementation()!;
+    let itemAttempts = 0;
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url.startsWith("/v1/sessions/conv_interrupted_retry/items")) {
+        itemAttempts += 1;
+        if (itemAttempts === 1) return Promise.reject(new Error("temporary item outage"));
+      }
+      return normalFetch(input, init);
+    });
+    const controller = new AbortController();
+    useChatStore.setState({
+      conversationId: "conv_interrupted_retry",
+      abortController: controller,
+      blocks: [],
+      isNativeTerminalSession: true,
+    });
+    const loop = startStreamPump("conv_interrupted_retry", controller, setState, getState);
+    try {
+      await vi.advanceTimersByTimeAsync(1);
+      sinks[0]!.push(
+        sse("response.output_text.delta", { message_id: "m1", index: 0, delta: "partial " }),
+      );
+      sinks[0]!.push(
+        sse("response.output_text.delta", { message_id: "m1", index: 2, delta: "preview" }),
+      );
+      await vi.advanceTimersByTimeAsync(20);
+      seedSessionItems("conv_interrupted_retry", [assistantMessage("resp_1", "canonical answer")]);
+      sinks[0]!.error();
+      await vi.advanceTimersByTimeAsync(6000);
+      expect(sinks).toHaveLength(2);
+      expect(itemAttempts).toBe(1);
+      expect(useChatStore.getState().blocks.some((b) => b.ctx.itemId === "live:m1")).toBe(true);
+
+      await advanceWithHeartbeats(sinks[1]!, ACTIVE_SESSION_STATUS_RECONCILE_INTERVAL_MS);
+      await drainAsync(2);
+      expect(itemAttempts).toBeGreaterThan(1);
+      expect(useChatStore.getState().blocks.map((b) => b.ctx.itemId)).toEqual(["msg_resp_1_asst"]);
+    } finally {
+      controller.abort();
+      const last = sinks[sinks.length - 1];
+      if (last) {
+        last.push("data: [DONE]\n\n");
+        last.close();
+      }
+      await vi.advanceTimersByTimeAsync(20);
+      await loop;
+    }
   });
 
   it("suppresses delayed previews after snapshot-only completion recovery", async () => {
@@ -12363,6 +12872,120 @@ describe("chatStore — live delta streaming (claude-native)", () => {
     expect(useChatStore.getState().blocks.filter((b) => b.type === "text_chunk")).toEqual([]);
 
     controller.abort();
+  });
+
+  it("marks a skipped native chunk until the authoritative message arrives", async () => {
+    useChatStore.setState({
+      conversationId: "conv_live_gap",
+      blocks: [],
+      isNativeTerminalSession: true,
+    });
+    const { sink, controller } = startPump("conv_live_gap");
+    sink.push(nativeDelta("m1", 0, "first ", false));
+    sink.push(nativeDelta("m1", 2, "third", true));
+    await tick();
+    expect(provisional()).toMatchObject({
+      fullText: "first third",
+      streamIndex: 2,
+      previewInterrupted: true,
+    });
+
+    sink.push(messageDone("ci_1", "resp_l", "first second third"));
+    await tick();
+    expect(provisional()).toBeUndefined();
+    expect(useChatStore.getState().blocks.some((b) => b.ctx.itemId === "ci_1")).toBe(true);
+    controller.abort();
+  });
+
+  it("replaces interrupted native text with a fetched canonical item on completion", async () => {
+    const id = "conv_live_replacement";
+    useChatStore.setState({ conversationId: id, blocks: [], isNativeTerminalSession: true });
+    const canonical: ConversationItem = {
+      ...assistantMessage("resp_l", "first missing last"),
+      id: "ci_1",
+    };
+    seedSessionItems(id, [canonical]);
+    let itemFetches = 0;
+    const normalFetch = fetchMock.getMockImplementation()!;
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input).startsWith(`/v1/sessions/${id}/items`)) itemFetches += 1;
+      return normalFetch(input, init);
+    });
+    const { sink, controller } = startPump(id);
+
+    sink.push(nativeDelta("m1", 0, "first ", false));
+    sink.push(nativeDelta("m1", 2, "last", true));
+    await tick();
+    expect(provisional()?.previewInterrupted).toBe(true);
+    sink.push(messageDone("ci_1", "resp_l", "first missing last"));
+    await tick();
+    await tick();
+
+    expect(itemFetches).toBeGreaterThan(0);
+    expect(provisional()).toBeUndefined();
+    const text = useChatStore.getState().blocks.filter((b) => b.type === "text_done");
+    expect(text).toHaveLength(1);
+    expect(text[0]).toMatchObject({ ctx: { itemId: "ci_1" }, fullText: "first missing last" });
+    sink.push(nativeDelta("m1", 3, " late", true));
+    await tick();
+    expect(provisional()).toBeUndefined();
+    controller.abort();
+  });
+
+  it("does not guess which interrupted preview a completed item belongs to", async () => {
+    useChatStore.setState({
+      conversationId: "conv_ambiguous_native",
+      blocks: [],
+      isNativeTerminalSession: true,
+    });
+    const { sink, controller, manual } = startPump("conv_ambiguous_native");
+    for (const messageId of ["m1", "m2"]) {
+      sink.push(nativeDelta(messageId, 0, `${messageId} prefix `, false));
+      sink.push(nativeDelta(messageId, 2, "tail", true));
+    }
+    await tick();
+    expect(
+      useChatStore.getState().blocks.filter((b) => b.type === "text_done" && b.previewInterrupted),
+    ).toHaveLength(2);
+
+    sink.push(messageDone("ci_1", "resp_l", "canonical first"));
+    await tick();
+    expect(useChatStore.getState().blocks.map((b) => b.ctx.itemId)).toEqual(["ci_1"]);
+    sink.push(messageDone("ci_2", "resp_l", "canonical second"));
+    await tick();
+    manual.fire();
+    expect(useChatStore.getState().blocks.map((b) => b.ctx.itemId)).toEqual(["ci_1", "ci_2"]);
+    controller.abort();
+  });
+
+  it("removes the preview interruption notice when the session fails", () => {
+    const preview: TextDone = {
+      type: "text_done",
+      ctx: {
+        agent: null,
+        depth: 0,
+        turn: 0,
+        timestamp: 0,
+        responseId: "live:m1",
+        itemId: "live:m1",
+      },
+      fullText: "partial",
+      hasCodeBlocks: false,
+      previewInterrupted: true,
+    };
+    useChatStore.setState({
+      conversationId: "conv_preview_failed",
+      blocks: [preview],
+      isNativeTerminalSession: true,
+    });
+
+    handleSessionEvent({
+      type: "session_status",
+      conversationId: "conv_preview_failed",
+      status: "failed",
+    });
+    const updated = useChatStore.getState().blocks[0] as TextDone;
+    expect(updated.previewInterrupted).toBe(false);
   });
 
   it("drops the first preview chunk when its authoritative item arrived first", async () => {

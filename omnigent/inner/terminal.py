@@ -13,6 +13,7 @@ import json
 import logging
 import os
 import re
+import shlex
 import shutil
 import stat
 import subprocess
@@ -1553,7 +1554,7 @@ class TerminalInstance:
             inner_cmd = [launcher_path, *self.args]
         else:
             inner_cmd = [self.command, *self.args]
-        inner_str = " ".join(_shell_quote(c) for c in inner_cmd)
+        inner_str = shlex.join(inner_cmd)
         if self.tmux_start_on_attach:
             inner_str = f"tmux wait-for {_TMUX_START_ON_ATTACH_CHANNEL}; exec {inner_str}"
 
@@ -2561,16 +2562,6 @@ class TerminalInstance:
         if proc.returncode != 0:
             raise _tmux_command_failed_error(cmd, proc.returncode, proc.stderr)
         return proc.stdout.decode()
-
-
-def _shell_quote(s: str) -> str:
-    """Quote a string for shell use."""
-    if not s:
-        return "''"
-    # Simple quoting for common cases.
-    if re.match(r"^[a-zA-Z0-9_./:@=-]+$", s):
-        return s
-    return "'" + s.replace("'", "'\\''") + "'"
 
 
 @dataclass(frozen=True)

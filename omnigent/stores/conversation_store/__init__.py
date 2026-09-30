@@ -1375,7 +1375,7 @@ class ConversationStore(ABC):
         ...
 
     @abstractmethod
-    def clear_runner_liveness(self, runner_id: str) -> None:
+    def clear_runner_liveness(self, runner_id: str, not_after: int | None = None) -> None:
         """
         Clear ``runner_last_seen`` for every session bound to a runner.
 
@@ -1384,6 +1384,11 @@ class ConversationStore(ABC):
         :data:`RUNNER_LIVENESS_TTL_S`. Must NOT bump ``updated_at``.
 
         :param runner_id: The disconnected runner's id.
+        :param not_after: When given, only clear a row whose
+            ``runner_last_seen`` is ``NULL`` or ``<= not_after`` — the
+            runner may have re-tunnelled to another replica, which
+            stamps a newer value this clear must not erase. ``None``
+            clears unconditionally (the pre-cross-replica behavior).
         """
         ...
 
@@ -1903,6 +1908,7 @@ class ConversationStore(ABC):
         host_id: str,
         workspace: str,
         exclude_conversation_id: str,
+        include_subdirectories: bool = False,
     ) -> bool:
         """
         Is another non-archived conversation sitting in this ``(host_id, workspace)``?
@@ -1920,6 +1926,7 @@ class ConversationStore(ABC):
         :param workspace: Absolute worktree path, e.g. ``"/w/feature-login"``.
         :param exclude_conversation_id: The conversation being deleted or
             archived — its own row must not count as "another session".
+        :param include_subdirectories: Also protect sessions inside this worktree root.
         :returns: ``True`` when at least one other live conversation
             references the pair, else ``False``.
         """

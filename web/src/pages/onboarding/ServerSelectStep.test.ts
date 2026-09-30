@@ -1,5 +1,17 @@
 import { describe, expect, it } from "vitest";
-import { normalizeServerUrl } from "./ServerSelectStep";
+import { isLocalInstall, normalizeServerUrl } from "./ServerSelectStep";
+
+describe("isLocalInstall", () => {
+  it("matches only the CLI's plain-HTTP loopback root on its port", () => {
+    expect(isLocalInstall("http://localhost:6767/")).toBe(true);
+    expect(isLocalInstall("http://127.0.0.1:6767")).toBe(true);
+    expect(isLocalInstall("https://localhost:6767/")).toBe(false);
+    expect(isLocalInstall("https://localhost:6767/team")).toBe(false);
+    expect(isLocalInstall("http://localhost:6767/team")).toBe(false);
+    expect(isLocalInstall("http://localhost:8000/")).toBe(false);
+    expect(isLocalInstall("http://example.com:6767/")).toBe(false);
+  });
+});
 
 // This mirrors electron/src/url.js semantics by hand (the renderer can't import
 // the CommonJS main-process module). The test pins the contract so drift from

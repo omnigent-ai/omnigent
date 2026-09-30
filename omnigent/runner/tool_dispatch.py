@@ -7088,7 +7088,14 @@ async def _execute_os_env_tool(
             )
             owns_environment = False
         else:
-            os_env = create_os_environment(effective_spec)
+            additional_read_roots = (
+                [resource_registry.codex_skills_dir(conversation_id)]
+                if resource_registry is not None and conversation_id is not None
+                else []
+            )
+            os_env = create_os_environment(
+                effective_spec, additional_read_roots=additional_read_roots
+            )
         if os_env is None:
             return "Error: unable to create OSEnvironment"
 
@@ -7843,7 +7850,15 @@ def _format_async_task_item(payload: _JsonObject) -> str:
         if status == "failed":
             return f"[System: sub-agent task {handle_id} failed — {target} error: {output}]"
         if status == "cancelled":
-            return f"[System: sub-agent task {handle_id} cancelled — {target}]"
+            if not has_output:
+                return f"[System: sub-agent task {handle_id} cancelled — {target}]"
+            # A cancelled turn may still have produced real output (the agent
+            # kept working after the interrupt); surface it instead of
+            # silently dropping the result.
+            return (
+                f"[System: sub-agent task {handle_id} cancelled — {target}; "
+                f"output before cancellation: {output}]"
+            )
         return f"[System: sub-agent task {handle_id} {status} — {target}: {output}]"
     if status == "completed":
         if not has_output:
