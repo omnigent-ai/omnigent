@@ -589,24 +589,9 @@ jobs:
           not automatic blockers. Cite the relevant section and concrete file/line
           evidence for each finding. Do not flag unchanged historical violations.
 
-          For blocking-issue assessment, consider host sharding when a diff changes
-          runner/session routing or its clients. Trace `host_id` through HTTP and
-          WebSocket requests to the replica
-          holding the runner. Side chats and sub-agents sharing a parent's runner must
-          inherit routing from the nearest host-bound ancestor across the full parent
-          chain; this must not give a mirrored native child ownership of a separate
-          runner launch. With the runner live on another replica, affected sends,
-          retries, resource reads, streams, and terminal attachments must reach it or
-          return retryable `wrong_replica`, without persisting a false offline/failed
-          turn. A failed keyless fallback must not clear the host affinity shared by
-          parent and child; remember keyless routing only after success. Use concrete
-          regression evidence with the runner present on one replica and requests
-          reaching another, including nested ancestry or failed fallbacks when affected.
-          Credit existing tests and apply the test-assessment/blocking rules below.
-          Report only verified defects meeting the existing blocking criteria under
-          **Blocking issues**. Do not add a host-sharding section, checklist, or
-          checked/passed note to the final review. Omit the topic when no blocking issue
-          is found. Pass this guidance to each reviewer.
+          For routing changes, consider `host_id` sharding, including parent-host
+          inheritance and retry affinity. Report verified bugs only under **Blocking issues**
+          using the existing criteria; add no separate section or status note.
 
           **PR scope:** Review the full diff, including pre-existing changes, against
           one concrete reported problem or requested outcome. Establish that outcome
