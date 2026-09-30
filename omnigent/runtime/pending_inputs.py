@@ -92,6 +92,14 @@ persist site records it as undelivered; :data:`_TTL_S` bounds a ghost no
 later message follows: stale entries are evicted lazily on the next
 :func:`record` / :func:`snapshot_for` / :func:`resolve_oldest` for the
 same conversation.
+
+A web client that loses the POST response re-sends the same submission
+with the same ``stable_id``. :func:`submission_for` answers such a retry
+with what the index knows — the queued entry (held or not) or the
+committed item (:func:`remember_committed`) — together with the content
+and author it was first posted under, so the route can refuse a different
+message that reuses the id instead of discarding it. No case pastes the
+prompt into the terminal a second time.
 """
 
 from __future__ import annotations
@@ -194,6 +202,40 @@ class MatchedDrain:
     uncertain: list[DrainedInput] = field(default_factory=list)
 
 
+@dataclass(frozen=True)
+class RecordedSubmission:
+    """
+    What the index knows about one web submission, keyed by its ``stable_id``.
+
+    Returned by :func:`submission_for` so the route can answer a client
+    re-send with the first delivery's outcome once it has checked that the
+    re-send repeats this content and author.
+
+    :param content: The message content blocks exactly as first POSTed.
+    :param created_by: Authenticated identity of the original poster, e.g.
+        ``"alice@example.com"``; ``None`` when unknown.
+    :param pending_id: The entry's id while it is queued (held or not), e.g.
+        ``"pending_a1b2c3"``; ``None`` once committed.
+    :param item_id: The committed item's id once the transcript append has
+        landed; ``None`` before that.
+    """
+
+    content: list[dict[str, Any]]
+    created_by: str | None
+    pending_id: str | None = None
+    item_id: str | None = None
+
+
+@dataclass
+class _Committed:
+    """A web submission whose mirrored item has been persisted."""
+
+    item_id: str
+    content: list[dict[str, Any]]
+    created_by: str | None
+    remembered_at: float
+
+
 @dataclass
 class _Entry:
     """
@@ -241,6 +283,29 @@ class _Entry:
 # dicts are popped eagerly so the index doesn't accrete stale keys.
 _pending: WorkspaceScopedCache[str, dict[str, _Entry]] = WorkspaceScopedCache()
 _lock = threading.Lock()
+
+# How long a web submission stays resolvable for a client retry of the same
+# ``stable_id``: its committed item id, and (SDK path) the fact that the runner
+# accepted it. This is the retry window the client honours too — a failed send
+# older than this is not revived after a reload — so delivery evidence is kept
+# for as long as a submission can still be retried.
+_COMMITTED_TTL_S: float = 24 * 3600.0
+# Per-conversation cap on remembered submissions; the oldest is dropped first.
+# Sized well above the web messages one conversation can see in a day, so
+# within the retry window eviction is by age, not by count.
+_COMMITTED_MAX_PER_CONVERSATION = 4096
+
+# Per-conversation mapping conversation_id → {stable_id: _Committed}.
+# Insertion-ordered so the cap above evicts the oldest submission.
+_committed: WorkspaceScopedCache[str, dict[str, _Committed]] = WorkspaceScopedCache()
+
+
+# Web submissions the SDK path has successfully forwarded to the runner:
+# conversation_id → {stable_id: dispatched_at}. The item is persisted before
+# it is forwarded, so "stored" is not "delivered"; this is what lets a re-send
+# of a message whose forward failed dispatch again while a re-send of one the
+# runner accepted does not.
+_dispatched: WorkspaceScopedCache[str, dict[str, float]] = WorkspaceScopedCache()
 
 
 def _evict_stale_locked(conversation_id: str, now: float) -> None:
@@ -393,6 +458,188 @@ def resolve(conversation_id: str, pending_id: str) -> DrainedInput | None:
         return _drained_input(entry) if entry is not None else None
 
 
+def submission_for(conversation_id: str, stable_id: str) -> RecordedSubmission | None:
+    """
+    Return what the index knows about web submission ``stable_id``, or ``None``.
+
+    A web client that lost the POST response re-sends with the same
+    ``stable_id``. The route answers the re-send from here instead of
+    forwarding the prompt to the terminal again: with the committed item once
+    the forwarder's mirror has been persisted, otherwise with the pending id
+    of the queued entry — held entries included, so a re-send that arrives
+    while the append is in flight is never told the message is committed.
+    The recorded content and author let the route refuse a different message
+    that reuses the id.
+
+    :param conversation_id: Conversation/session id, e.g. ``"conv_abc123"``.
+    :param stable_id: The client's 32-char hex submission id.
+    :returns: The recorded submission, or ``None`` when the id is unknown to
+        this process or has expired.
+    """
+    now = _now()
+    with _lock:
+        _evict_stale_committed_locked(conversation_id, now)
+        committed = _committed.get(conversation_id, {}).get(stable_id)
+        if committed is not None:
+            return RecordedSubmission(
+                content=copy.deepcopy(committed.content),
+                created_by=committed.created_by,
+                item_id=committed.item_id,
+            )
+        _evict_stale_locked(conversation_id, now)
+        for live in _pending.get(conversation_id, {}).values():
+            if live.stable_id == stable_id:
+                return RecordedSubmission(
+                    content=copy.deepcopy(live.content),
+                    created_by=live.created_by,
+                    pending_id=live.pending_id,
+                )
+    return None
+
+
+def remember_committed(conversation_id: str, drained: DrainedInput, item_id: str) -> None:
+    """
+    Remember that a drained web submission was persisted as ``item_id``.
+
+    Called once the transcript forwarder's mirror of a web message has been
+    appended. A later client re-send of the same submission (its POST
+    response was lost) then resolves to the committed item instead of
+    dispatching the prompt a second time; the content and author are kept so
+    the route can tell such a re-send from a different message reusing the
+    id. No-op for an entry without a stable id. Entries expire after
+    :data:`_COMMITTED_TTL_S`.
+
+    :param conversation_id: Conversation/session id, e.g. ``"conv_abc123"``.
+    :param drained: The drained entry the persisted item was built from.
+    :param item_id: Store-assigned id of the persisted user message.
+    """
+    if drained.stable_id is None:
+        return
+    now = _now()
+    with _lock:
+        entries = _committed.setdefault(conversation_id, {})
+        entries.pop(drained.stable_id, None)
+        entries[drained.stable_id] = _Committed(
+            item_id=item_id,
+            content=copy.deepcopy(drained.content),
+            created_by=drained.created_by,
+            remembered_at=now,
+        )
+        _evict_stale_committed_locked(conversation_id, now)
+        _sweep_inactive_locked(now)
+
+
+def mark_dispatched(conversation_id: str, stable_id: str) -> None:
+    """
+    Record that the runner accepted the forward of an SDK-path web submission.
+
+    :param conversation_id: Conversation/session id, e.g. ``"conv_abc123"``.
+    :param stable_id: The client's 32-char hex submission id.
+    """
+    now = _now()
+    with _lock:
+        entries = _dispatched.setdefault(conversation_id, {})
+        entries.pop(stable_id, None)
+        entries[stable_id] = now
+        _evict_stale_dispatched_locked(conversation_id, now)
+        _sweep_inactive_locked(now)
+
+
+def _evict_stale_dispatched_locked(conversation_id: str, now: float) -> None:
+    """
+    Drop dispatched submissions past the TTL or the per-conversation cap.
+
+    Runs on every write so ordinary successful sends, which are never queried
+    again, do not accumulate. Caller must hold :data:`_lock`.
+
+    :param conversation_id: Conversation/session id to sweep.
+    :param now: Current ``time.monotonic()`` value to compare against.
+    """
+    entries = _dispatched.get(conversation_id)
+    if entries is None:
+        return
+    for sid in [sid for sid, at in entries.items() if now - at > _COMMITTED_TTL_S]:
+        entries.pop(sid, None)
+    while len(entries) > _COMMITTED_MAX_PER_CONVERSATION:
+        entries.pop(next(iter(entries)))
+    if not entries:
+        _dispatched.pop(conversation_id, None)
+
+
+def dispatch_done(conversation_id: str, stable_id: str) -> bool:
+    """
+    Whether an SDK-path web submission was already forwarded successfully.
+
+    Entries expire after :data:`_COMMITTED_TTL_S`. A submission whose forward
+    failed is never recorded, so its re-send dispatches again.
+
+    :param conversation_id: Conversation/session id, e.g. ``"conv_abc123"``.
+    :param stable_id: The client's 32-char hex submission id.
+    :returns: ``True`` when the runner accepted a forward of this submission.
+    """
+    now = _now()
+    with _lock:
+        entries = _dispatched.get(conversation_id)
+        if entries is None:
+            return False
+        at = entries.get(stable_id)
+        if at is None:
+            return False
+        if now - at > _COMMITTED_TTL_S:
+            entries.pop(stable_id, None)
+            if not entries:
+                _dispatched.pop(conversation_id, None)
+            return False
+        return True
+
+
+def _sweep_inactive_locked(now: float) -> None:
+    """
+    Drop the committed and dispatched memories of conversations gone quiet.
+
+    Per-conversation eviction runs only when that conversation is written or
+    read again, so a conversation nobody returns to would keep its entries past
+    their expiry. Runs on every write; a conversation whose newest entry is
+    older than :data:`_COMMITTED_TTL_S` has nothing left worth keeping. Caller
+    must hold :data:`_lock`.
+
+    :param now: Current ``time.monotonic()`` value to compare against.
+    """
+    for conversation_id in [
+        cid
+        for cid, entries in _committed.items()
+        if all(now - c.remembered_at > _COMMITTED_TTL_S for c in entries.values())
+    ]:
+        _committed.pop(conversation_id, None)
+    for conversation_id in [
+        cid
+        for cid, entries in _dispatched.items()
+        if all(now - at > _COMMITTED_TTL_S for at in entries.values())
+    ]:
+        _dispatched.pop(conversation_id, None)
+
+
+def _evict_stale_committed_locked(conversation_id: str, now: float) -> None:
+    """
+    Drop remembered submissions past the TTL or the per-conversation cap.
+
+    Caller must hold :data:`_lock`.
+
+    :param conversation_id: Conversation/session id to sweep.
+    :param now: Current ``time.monotonic()`` value to compare against.
+    """
+    entries = _committed.get(conversation_id)
+    if entries is None:
+        return
+    stale = [sid for sid, c in entries.items() if now - c.remembered_at > _COMMITTED_TTL_S]
+    for sid in stale:
+        entries.pop(sid, None)
+    while len(entries) > _COMMITTED_MAX_PER_CONVERSATION:
+        entries.pop(next(iter(entries)))
+    if not entries:
+        _committed.pop(conversation_id, None)
+
+
 def resolve_oldest(conversation_id: str, *, hold: bool = False) -> DrainedInput | None:
     """
     Drain the oldest pending entry (FIFO) and return it.
@@ -454,6 +701,25 @@ def mark_uncertain(conversation_id: str) -> None:
         for entry in _pending.get(conversation_id, {}).values():
             if not entry.held:
                 entry.uncertain = True
+
+
+def mark_entry_uncertain(conversation_id: str, pending_id: str) -> None:
+    """
+    Flag one queued entry as possibly already mirrored.
+
+    Called when the runner answers a forward with "duplicate": it ran this
+    message before the server's memory of it was lost, so the entry's mirror
+    may already be persisted. A later match that jumps over it then drains it
+    quietly instead of recording it as undelivered; if the mirror is still to
+    come, it drains the entry as usual. No-op for an unknown id.
+
+    :param conversation_id: Conversation/session id, e.g. ``"conv_abc123"``.
+    :param pending_id: The entry's id, e.g. ``"pending_a1b2c3"``.
+    """
+    with _lock:
+        entry = _pending.get(conversation_id, {}).get(pending_id)
+        if entry is not None:
+            entry.uncertain = True
 
 
 def restore(conversation_id: str, drained: DrainedInput) -> None:
@@ -641,6 +907,9 @@ def snapshot_for(conversation_id: str) -> list[dict[str, Any]]:
                 "pending_id": entry.pending_id,
                 "content": copy.deepcopy(entry.content),
                 **({"created_by": entry.created_by} if entry.created_by is not None else {}),
+                # Lets a reloading client recognise its own un-acked send by
+                # identity instead of by wording.
+                **({"stable_id": entry.stable_id} if entry.stable_id is not None else {}),
             }
             for entry in entries.values()
         ]
@@ -736,3 +1005,5 @@ def reset_for_tests() -> None:
     """
     with _lock:
         _pending.clear()
+        _committed.clear()
+        _dispatched.clear()

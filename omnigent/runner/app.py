@@ -23,7 +23,7 @@ import tempfile
 import time
 import urllib.parse
 import uuid
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, Protocol, TypeAlias, cast, overload
@@ -201,6 +201,11 @@ _logger = logging.getLogger(__name__)
 
 # Allow process termination and forwarder cleanup to finish before DELETE proceeds.
 _SESSION_INIT_CANCEL_TIMEOUT_S = 20.0
+
+# Per-conversation cap on persisted item ids remembered as already started.
+# Sized well above the messages one conversation can see within the web
+# client's one-day retry window, so eviction never bites a live retry.
+_STARTED_ITEM_IDS_PER_CONVERSATION = 4096
 
 # Claude-native session model listing: how long one request waits inline for
 # the probe before answering 503-pending, and how long the probe may stay
@@ -3194,6 +3199,13 @@ def create_runner_app(
 
     _session_histories = _session_histories_ref
     _last_server_item_id: dict[str, str] = {}
+    # Delivery ids (persisted item id, or a native forward's web stable id)
+    # whose message already started (or buffered) a turn, per conversation.
+    # The server dedupes web re-sends, but its memory is process-local: after
+    # a server restart a re-send of a message this runner already ran arrives
+    # as a fresh forward. The runner outlives the server, so this is the
+    # durable half of that guarantee.
+    _started_item_ids: dict[str, deque[str]] = {}
     _session_event_queues = _session_event_queues_ref
     app.state.session_event_queues = _session_event_queues
     _session_inboxes = _session_inboxes_ref
@@ -5157,6 +5169,8 @@ def create_runner_app(
         if _binding := _session_comment_relays.pop(session_id, None):
             _binding.relay.close()
         _session_histories.pop(session_id, None)
+        # The session is gone; a later forward for it is a new session's message.
+        _started_item_ids.pop(session_id, None)
         _last_server_item_id.pop(session_id, None)
         _session_event_queues.pop(session_id, None)
         _session_inboxes.pop(session_id, None)
@@ -10323,6 +10337,43 @@ def create_runner_app(
                 while _ingest_now_serving.get(conversation_id, 0) != _seq:
                     await _cond.wait()
             try:
+                # Sequenced with the other messages of this conversation, so a
+                # re-forward of a message that is still being accepted waits for
+                # that acceptance instead of racing it. The record itself is
+                # written only where the message is actually taken (buffered or
+                # started): a request cancelled before that leaves nothing behind,
+                # and its retry is a fresh delivery.
+                # The delivery identity: the persisted item on the SDK path, the
+                # web submission's stable id on a native forward (nothing is
+                # persisted before the terminal echoes it).
+                persisted_item_id = message_body.get("persisted_item_id")
+                if not isinstance(persisted_item_id, str) or not persisted_item_id:
+                    persisted_item_id = message_body.get("stable_id")
+                if not isinstance(persisted_item_id, str) or not persisted_item_id:
+                    persisted_item_id = None
+                started_ids = _started_item_ids.setdefault(
+                    conversation_id, deque(maxlen=_STARTED_ITEM_IDS_PER_CONVERSATION)
+                )
+                if persisted_item_id is not None and persisted_item_id in started_ids:
+                    _logger.info(
+                        "post_session_events: message %s already started a turn for conv=%s; "
+                        "not running it again",
+                        persisted_item_id,
+                        conversation_id,
+                        extra={"session_id": conversation_id},
+                    )
+                    return JSONResponse(
+                        status_code=202,
+                        content={
+                            "status": "duplicate",
+                            "detail": "Message already started a turn; not running it again.",
+                        },
+                    )
+
+                def _accept_message() -> None:
+                    if persisted_item_id is not None:
+                        started_ids.append(persisted_item_id)
+
                 _raw_content = message_body.get("content")
                 if isinstance(_raw_content, list):
                     message_body["content"] = await _resolve_forwarded_message_content(
@@ -10386,6 +10437,7 @@ def create_runner_app(
                                 exc_info=True,
                                 extra={"session_id": conversation_id},
                             )
+                    _accept_message()
                     return JSONResponse(
                         status_code=202,
                         content={
@@ -10417,6 +10469,7 @@ def create_runner_app(
                             conversation_id,
                             extra={"session_id": conversation_id},
                         )
+                        _accept_message()
                         return JSONResponse(
                             status_code=202,
                             content={
@@ -10433,14 +10486,17 @@ def create_runner_app(
                 if conversation_id in _session_histories:
                     _session_histories[conversation_id].append(new_item)
                 else:
-                    persisted_item_id = message_body.get("persisted_item_id")
+                    # Only a persisted item can already sit in history; a
+                    # native forward's stable id names nothing there.
+                    drop_item_id = message_body.get("persisted_item_id")
                     loaded = await _load_history_as_input(
                         conversation_id,
-                        drop_item_id=persisted_item_id,
+                        drop_item_id=drop_item_id if isinstance(drop_item_id, str) else None,
                     )
                     loaded.append(new_item)
                     _session_histories[conversation_id] = loaded
 
+                _accept_message()
                 _begin_turn_slot(conversation_id)
                 _logger.info(
                     "post_session_events: starting background turn conv=%s",

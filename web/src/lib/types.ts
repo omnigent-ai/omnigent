@@ -47,6 +47,8 @@ export type CodexPersistMode = "session" | "always";
 export interface PendingInput {
   /** Server index id, e.g. ``"pending_a1b2c3"``; the bubble's stable key. */
   pendingId: string;
+  /** The web client's own submission id, when the entry came from one. */
+  stableId?: string;
   /** Message content blocks as POSTed (file blocks carry real ids). */
   content: MessageContentBlock[];
   /** Authenticated identity of the posting actor, e.g. ``"alice@example.com"``. Absent when unknown. */

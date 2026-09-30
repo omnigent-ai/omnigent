@@ -24,6 +24,7 @@ import {
   createBubbleCache,
   lastRenderableAssistantIndex,
   liveCandidateAssistantIndex,
+  type PendingDelivery,
 } from "./renderItems";
 import type { ActiveResponse } from "@/store/types";
 
@@ -3302,6 +3303,38 @@ describe("bubblesEqual — React.memo comparator", () => {
       items: [{ kind: "text", itemId: "a1", text, final: lifecycle === "completed" }],
     };
   }
+
+  it("re-renders a pending user bubble when only its delivery state changes", () => {
+    // The delivery footer (spinner, Retry · Cancel, "Couldn't send") is driven
+    // by fields the store flips after the bubble was first rendered. Ignoring
+    // them here left a failed send showing "Sending" with no controls.
+    const content: MessageContentBlock[] = [{ type: "input_text", text: "Hello" }];
+    const pending = (delivery: PendingDelivery): Bubble => ({
+      kind: "user",
+      itemId: "pend_1",
+      pending: true,
+      delivery,
+      content,
+    });
+    const sending = { posted: false };
+    expect(bubblesEqual(pending(sending), pending({ posted: false }))).toBe(true);
+    expect(
+      bubblesEqual(pending(sending), pending({ posted: false, failed: { attempts: 1 } })),
+    ).toBe(false);
+    expect(bubblesEqual(pending(sending), pending({ posted: true }))).toBe(false);
+    expect(
+      bubblesEqual(
+        pending({ posted: false, failed: { attempts: 1 } }),
+        pending({ posted: false, failed: { attempts: 2 } }),
+      ),
+    ).toBe(false);
+    expect(
+      bubblesEqual(
+        pending({ posted: false, failed: { attempts: 1 } }),
+        pending({ posted: false, failed: { reason: "boom", attempts: 1 } }),
+      ),
+    ).toBe(false);
+  });
 
   it("treats unchanged bubbles as equal across a rebuild (the memo win)", () => {
     const blocks = baseBlocks();

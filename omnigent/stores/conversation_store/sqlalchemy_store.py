@@ -2053,7 +2053,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         A point lookup on the ``(workspace_id, conversation_id, id)`` primary key.
 
         :param conversation_id: The conversation to look in, e.g. ``"conv_abc123"``.
-        :param item_id: The item id, e.g. a source-derived ``stable_id``.
+        :param item_id: The item id, e.g. a source-derived or web ``stable_id``.
         :returns: The item, or ``None``.
         """
         with self._conv_session("get_item") as session:

@@ -152,6 +152,19 @@ export type RenderItem =
       codexPersistModes?: CodexPersistMode[];
     };
 
+/**
+ * Delivery state of an optimistic user bubble whose POST has not settled.
+ * Rendered as the small footer under the bubble; absent once accepted.
+ */
+export interface PendingDelivery {
+  /** The server accepted the POST; the bubble now waits for its consumed event. */
+  posted: boolean;
+  /** The send failed; `reason` is the server's message when it refused it,
+   *  `attempts` how many deliveries have failed (a thrown fetch is checked
+   *  once automatically before the bubble reads "Failed"). */
+  failed?: { reason?: string; attempts: number };
+}
+
 /** A bubble cluster. The page maps over these. */
 export type Bubble =
   | {
@@ -159,6 +172,8 @@ export type Bubble =
       itemId: string;
       /** Queued input that does not yet have a persisted transcript item. */
       pending?: boolean;
+      /** Delivery footer state for a pending bubble sent from this client. */
+      delivery?: PendingDelivery;
       content: MessageContentBlock[];
       /** Human author email, when known. */
       createdBy?: string;
@@ -1824,6 +1839,12 @@ export function bubblesEqual(a: Bubble, b: Bubble): boolean {
       a.createdBy !== b.createdBy ||
       a.createdAtS !== b.createdAtS ||
       a.stableKey !== b.stableKey ||
+      // The delivery footer is driven by these; a failed send
+      // must re-render even though the message content is unchanged.
+      a.delivery?.posted !== b.delivery?.posted ||
+      (a.delivery?.failed === undefined) !== (b.delivery?.failed === undefined) ||
+      a.delivery?.failed?.reason !== b.delivery?.failed?.reason ||
+      a.delivery?.failed?.attempts !== b.delivery?.failed?.attempts ||
       a.content.length !== b.content.length
     )
       return false;

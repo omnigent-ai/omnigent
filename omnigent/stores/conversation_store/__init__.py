@@ -606,10 +606,13 @@ class ConversationStore(ABC):
 
         A bounded point lookup on the item's key, never a scan. Lets the native
         mirror path recognise a forwarder retry of an item it has already
-        persisted before it touches the pending-input queue.
+        persisted before it touches the pending-input queue, and lets a web
+        re-send be recognised once its committed copy has left the
+        process-local caches (server restart, cache expiry) — including the
+        check that the item a client-chosen id names really is that submission.
 
         :param conversation_id: The conversation to look in, e.g. ``"conv_abc123"``.
-        :param item_id: The item id, e.g. a source-derived ``stable_id``.
+        :param item_id: The item id, e.g. a source-derived or web ``stable_id``.
         :returns: The item, or ``None``.
         """
         ...
