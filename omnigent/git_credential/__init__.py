@@ -11,9 +11,15 @@ broker (:mod:`omnigent.server.routes.host_credentials`) at
 Host rules: :meth:`CredentialFacet.hosts` names the hosts a facet can serve, and the broker
 response lists the git hosts its credential is for in ``hosts`` (for example
 ``["github.com"]``). The helper vends a token, and is installed, only for a host in both sets.
-When the response has no ``hosts`` list (an older server), only the provider's default hosts
-qualify, so a github.com token never reaches a configured GitHub Enterprise host. Clearing
-removes only this helper's own entries; a helper the user configured is never changed.
+A connected response without a ``hosts`` list (an older server) vouches for the provider's
+default hosts only, so a github.com token never reaches a configured GitHub Enterprise host.
+Host setup changes the wiring only on a definitive answer: a ``hosts`` list, a connected
+response, a not-connected response, or the server's 404 for a provider it does not broker.
+An inconclusive probe (timeout, network error, 5xx, unparsable body) installs the helper on
+the default hosts only, so a broker outage fails git auth instead of running as the shared
+identity, and changes nothing on other hosts; the refresh thread applies the next definitive
+answer. Clearing removes only this helper's own entries; a helper the user configured is
+never changed.
 
 Why this shape:
 - For **git**, the forge **token is never persisted** in the sandbox: it is fetched fresh per
@@ -104,14 +110,6 @@ class CredentialFacet(Protocol):
         """Write the credential into the provider CLI's config under *home*.
 
         :returns: ``True`` when written; ``False`` when skipped or on a filesystem error.
-        """
-        ...
-
-    def clear_cli_config(self, home: Path) -> None:
-        """Remove what :meth:`write_cli_config` writes under *home*, keeping everything else.
-
-        The setup and refresh flows never call it: they cannot tell an entry this helper
-        wrote from one the user wrote.
         """
         ...
 
@@ -383,25 +381,26 @@ def _wire_git(
     host_id: str,
     token: str,
     facet: _Facet,
-    instances: Instances,
+    data: dict[str, Any] | None,
     *,
     clear_others: bool,
-) -> tuple[dict[str, Any] | None, frozenset[str]]:
-    """Probe the broker for one provider and install this helper on the hosts it serves.
+) -> frozenset[str]:
+    """Install this helper on the facet hosts that one broker probe serves.
 
-    :param clear_others: Also remove this helper's entries from the facet's other hosts.
-    :returns: The probe (the broker JSON, or ``None`` when inconclusive) and the served hosts.
+    :param data: The probe: the broker JSON, or ``None`` when inconclusive.
+    :param clear_others: After a definitive probe, also remove this helper's entries from the
+        facet's other hosts. An inconclusive probe never removes an entry.
+    :returns: The served hosts.
     """
-    data = _fetch(server_url, host_id, token, facet.provider_id)
-    hosts = _facet_hosts(facet, instances)
+    hosts = _facet_hosts(facet, EnvInstances())
     served = _served_hosts(facet, hosts, data)
     command = _helper_command(server_url, host_id, token)
     for host in sorted(served):
         _install_helper(host, command)
-    if clear_others:
+    if clear_others and data is not None:
         for host in sorted(hosts - served):
             _clear_helper(host)
-    return data, served
+    return served
 
 
 def _write_cli_config(facet: _Facet, data: dict[str, Any] | None) -> bool:
@@ -412,21 +411,68 @@ def _write_cli_config(facet: _Facet, data: dict[str, Any] | None) -> bool:
     return facet.credential.write_cli_config(data, home)
 
 
+class _HostSetup:
+    """Host setup state that the refresh threads read: what still waits for the broker."""
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        # Providers whose last host setup probe was inconclusive, so their wiring is still due.
+        self.pending: set[str] = set()
+        # Providers whose inconclusive probe was already logged at warning level.
+        self.warned: set[str] = set()
+        self.identity_set = False
+
+
+_host_setup = _HostSetup()
+
+
+def _apply_host_probe(
+    server_url: str, host_id: str, token: str, facet: _Facet, data: dict[str, Any] | None
+) -> bool:
+    """Apply one broker probe to a provider's git helpers, commit identity, and CLI config.
+
+    An inconclusive probe leaves the provider pending, so its refresh thread applies the next
+    definitive answer. It is logged at warning level once per provider.
+
+    :returns: Whether the CLI config was written.
+    """
+    _wire_git(server_url, host_id, token, facet, data, clear_others=True)
+    with _host_setup.lock:
+        if data is None:
+            first = facet.provider_id not in _host_setup.warned
+            _host_setup.warned.add(facet.provider_id)
+            _host_setup.pending.add(facet.provider_id)
+        else:
+            first = False
+            _host_setup.pending.discard(facet.provider_id)
+            if not _host_setup.identity_set:
+                _host_setup.identity_set = _set_commit_identity(data)
+    if data is None:
+        _logger.log(
+            logging.WARNING if first else logging.DEBUG,
+            "Git credential broker gave no definitive answer for provider %s; installed the "
+            "helper on its default hosts only, and a refresh will apply the next answer",
+            facet.provider_id,
+        )
+    return _write_cli_config(facet, data)
+
+
 def configure_host_credentials(server_url: str, host_id: str) -> None:
     """Point git and each provider CLI in a managed sandbox at the per-user broker.
 
     Called by ``omnigent host`` at startup: executor-agnostic, since the host runs in every
-    executor and holds ``$OMNIGENT_HOST_TOKEN``. One broker probe per credential facet decides:
+    executor and holds ``$OMNIGENT_HOST_TOKEN``. One broker probe per credential facet decides,
+    under the module docstring's host rules:
 
-    - The hosts the facet serves (see the module docstring's host rules) get this helper as
-      their only https credential helper, which fetches the owner's token per git op.
-    - The facet's other hosts lose this helper's entries, so a confirmed not-linked owner
-      (a shared-``$GIT_TOKEN`` or local deployment) falls back to the ambient helper. Helpers
-      the user configured stay unchanged.
+    - A definitive probe installs this helper on the hosts it serves, as their only https
+      credential helper, and removes this helper's entries from the facet's other hosts, so a
+      confirmed not-linked owner (a shared-``$GIT_TOKEN`` or local deployment) falls back to
+      the ambient helper. Helpers the user configured stay unchanged.
+    - An inconclusive probe installs this helper on the default hosts only and changes nothing
+      else; the provider's refresh thread applies the next definitive answer.
     - A connected owner whose id is an email address becomes the commit author (the first such
       provider wins), and the facet writes its CLI config (gh's ``hosts.yml`` for GitHub).
 
-    An inconclusive probe keeps the broker on the default hosts (fail closed, like the clone).
     Sandbox-only (see :func:`_in_sandbox`) and best-effort: never raises.
     """
     if not _in_sandbox():
@@ -434,15 +480,13 @@ def configure_host_credentials(server_url: str, host_id: str) -> None:
     token = _host_token()
     if not token:
         return
-    instances = EnvInstances()
-    identity_set = False
+    with _host_setup.lock:
+        _host_setup.pending.clear()
+        _host_setup.identity_set = False
     for facet in _credential_facets():
         try:
-            data, _served = _wire_git(
-                server_url, host_id, token, facet, instances, clear_others=True
-            )
-            identity_set = identity_set or _set_commit_identity(data)
-            _write_cli_config(facet, data)
+            data = _fetch(server_url, host_id, token, facet.provider_id)
+            _apply_host_probe(server_url, host_id, token, facet, data)
         except Exception as exc:  # noqa: BLE001 — one provider's failure must not stop the others
             # No traceback: its frames hold the launch token and the broker reply, which a
             # formatter that prints frame locals would log.
@@ -457,14 +501,16 @@ def configure_host_credentials(server_url: str, host_id: str) -> None:
 def configure_clone_credentials(server_url: str, host_id: str) -> bool:
     """Wire the per-user broker for the initial workspace clone.
 
-    Called before a managed sandbox clones its workspace repos. Connected-gated like
-    :func:`configure_host_credentials`: a provider whose owner is confirmed not linked keeps
-    the ambient chain (notably the image's shared ``$GIT_TOKEN`` helper), so a shared-token
-    clone still works for them. An inconclusive probe (timeout, 5xx, bad JSON) installs the
-    broker on the default hosts anyway: treating it as not linked would silently clone a linked
-    owner's private repo under the shared identity. Unlike host setup, this never removes a
-    helper and is not sandbox-gated. A facet that raises propagates, so the clone fails visibly
-    instead of falling back to the shared token.
+    Called before a managed sandbox clones its workspace repos. The sandbox init container will
+    call it once its renderer migrates from :mod:`omnigent.git_credential_github`.
+
+    Connected-gated like :func:`configure_host_credentials`: a provider whose owner is
+    confirmed not linked keeps the ambient chain (notably the image's shared ``$GIT_TOKEN``
+    helper), so a shared-token clone still works for them. An inconclusive probe (timeout, 5xx,
+    bad JSON) installs the broker on the default hosts anyway: treating it as not linked would
+    silently clone a linked owner's private repo under the shared identity. Unlike host setup,
+    this never removes a helper and is not sandbox-gated. A facet that raises propagates, so
+    the clone fails visibly instead of falling back to the shared token.
 
     :returns: ``True`` when the broker was wired for at least one host; ``False`` when no
         provider's broker was wired (owner confirmed not linked, or no launch token).
@@ -472,10 +518,10 @@ def configure_clone_credentials(server_url: str, host_id: str) -> bool:
     token = _host_token()
     if not token:
         return False
-    instances = EnvInstances()
     wired = False
     for facet in _credential_facets():
-        _data, served = _wire_git(server_url, host_id, token, facet, instances, clear_others=False)
+        data = _fetch(server_url, host_id, token, facet.provider_id)
+        served = _wire_git(server_url, host_id, token, facet, data, clear_others=False)
         wired = wired or bool(served)
     return wired
 
@@ -501,14 +547,25 @@ def _start_refresh_thread(
     return thread
 
 
-def _refresh_cli_config(server_url: str, host_id: str, facet: _Facet) -> bool:
-    """Re-fetch one provider's credential and re-write its CLI config (one refresher tick)."""
+def _refresh_provider(server_url: str, host_id: str, facet: _Facet) -> bool:
+    """Run one refresher tick: re-fetch a provider's credential and re-write its CLI config.
+
+    While host setup still waits for a definitive broker answer for the provider, the first
+    definitive one also gets applied to its git helpers and the commit identity.
+
+    :returns: Whether the CLI config was written.
+    """
     if not _in_sandbox():
         return False
     token = _host_token()
     if not token:
         return False
-    return _write_cli_config(facet, _fetch(server_url, host_id, token, facet.provider_id))
+    data = _fetch(server_url, host_id, token, facet.provider_id)
+    with _host_setup.lock:
+        pending = facet.provider_id in _host_setup.pending
+    if pending and data is not None:
+        return _apply_host_probe(server_url, host_id, token, facet, data)
+    return _write_cli_config(facet, data)
 
 
 def start_credential_refresh(server_url: str, host_id: str) -> list[threading.Thread]:
@@ -520,6 +577,8 @@ def start_credential_refresh(server_url: str, host_id: str) -> list[threading.Th
     thread per credential facet re-writes the config every
     :meth:`CredentialFacet.refresh_interval_s` seconds, whether or not the startup write
     succeeded: each tick re-fetches, so a broker blip at startup cannot strand a connected owner.
+    When host setup got no definitive answer for a provider, the first tick that gets one
+    also applies it to git (see :func:`configure_host_credentials`).
 
     :returns: The started threads; none outside a managed sandbox, and none for a facet whose
         interval is not positive.
@@ -539,7 +598,7 @@ def start_credential_refresh(server_url: str, host_id: str) -> list[threading.Th
             continue
         thread = _start_refresh_thread(
             interval,
-            functools.partial(_refresh_cli_config, server_url, host_id, facet),
+            functools.partial(_refresh_provider, server_url, host_id, facet),
             name=f"{facet.provider_id}-credential-refresh",
         )
         if thread is not None:

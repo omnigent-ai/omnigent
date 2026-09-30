@@ -78,6 +78,7 @@ def _sandbox(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Iterator[None]:
     monkeypatch.setenv("GH_CONFIG_DIR", str(tmp_path / "gh"))
     monkeypatch.setenv("IS_SANDBOX", "1")
     monkeypatch.setenv(HOST_TOKEN_ENV_VAR, LAUNCH_TOKEN)
+    monkeypatch.setattr(gc, "_host_setup", gc._HostSetup())
     reset_for_tests()
     yield
     reset_for_tests()
@@ -85,7 +86,7 @@ def _sandbox(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Iterator[None]:
 
 @dataclass
 class FakeBroker:
-    """The server's credential route: a JSON payload or a response per provider id.
+    """The server's credential route: a JSON payload, response, or error per provider id.
 
     A provider without an entry gets the server's 404 for a provider it does not broker.
     """
@@ -98,6 +99,8 @@ class FakeBroker:
         self.urls.append(url)
         self.launch_token_sent.append(headers.get(MANAGED_HOST_TOKEN_HEADER) == LAUNCH_TOKEN)
         answer = self.payloads.get(url.rsplit("/", 1)[-1])
+        if isinstance(answer, Exception):
+            raise answer
         if isinstance(answer, httpx.Response):
             return answer
         if answer is None:
@@ -155,9 +158,6 @@ class FakeGitLabCredential:
     def write_cli_config(self, cred: dict[str, Any], home: Path) -> bool:
         self.cli_writes.append(home)
         return True
-
-    def clear_cli_config(self, home: Path) -> None:
-        pass
 
 
 @pytest.fixture
@@ -508,6 +508,123 @@ def test_clearing_also_removes_the_deprecated_github_helper(broker: FakeBroker) 
     assert _helpers("github.com") == []
 
 
+def test_an_inconclusive_probe_keeps_the_helpers_an_earlier_answer_wired(
+    monkeypatch: pytest.MonkeyPatch, broker: FakeBroker
+) -> None:
+    monkeypatch.setenv("OMNIGENT_GIT_PROVIDER_GITHUB_HOSTS", GHE)
+    broker.payloads["github"] = _github(hosts=["github.com", GHE])
+    gc.configure_host_credentials(SERVER, HOST_ID)
+    _same(_helpers(GHE), ["", HELPER])
+
+    for answer in (
+        httpx.ConnectTimeout("timed out"),
+        httpx.Response(503, json={"detail": "unavailable"}),
+        httpx.Response(200, content=b"not json"),
+    ):
+        broker.payloads["github"] = answer
+        gc.configure_host_credentials(SERVER, HOST_ID)
+        _same(_helpers(GHE), ["", HELPER])
+        _same(_helpers("github.com"), ["", HELPER])
+
+    # A definitive answer that no longer lists the instance host clears it.
+    broker.payloads["github"] = _github(hosts=["github.com"])
+    gc.configure_host_credentials(SERVER, HOST_ID)
+    assert _helpers(GHE) == []
+    _same(_helpers("github.com"), ["", HELPER])
+
+
+@pytest.mark.posix_only
+def test_a_fresh_sandbox_fails_closed_while_the_broker_is_down(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # The image's shared helper lives in the system config, as in the managed images.
+    marker = tmp_path / "shared-helper-used"
+    system_config = tmp_path / "system-gitconfig"
+    shared_helper = (
+        '!f() { [ "$1" = get ] || return 0; printf used > "$SHARED_MARKER"; '
+        'printf "username=shared\\npassword=shared-value\\n"; }; f'
+    )
+    subprocess.run(
+        ["git", "config", "--file", str(system_config), "credential.helper", shared_helper],
+        capture_output=True,
+        check=True,
+    )
+    monkeypatch.delenv("GIT_CONFIG_NOSYSTEM")
+    monkeypatch.setenv("GIT_CONFIG_SYSTEM", str(system_config))
+    monkeypatch.setenv("SHARED_MARKER", str(marker))
+    monkeypatch.setenv("OMNIGENT_GIT_PROVIDER_GITHUB_HOSTS", GHE)
+
+    class DownBroker(BaseHTTPRequestHandler):
+        def log_message(self, *args: object) -> None:
+            pass
+
+        def do_GET(self) -> None:
+            self.send_response(503)
+            self.end_headers()
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), DownBroker)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    url = f"http://127.0.0.1:{server.server_port}"
+    try:
+        gc.configure_host_credentials(url, HOST_ID)
+        github = _git_fill("github.com")
+        shared_used_for_github = marker.exists()
+        ghe = _git_fill(GHE)
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    helper = f"!python3 -m omnigent.git_credential --server {url} --host-id {HOST_ID} "
+    _same(_helpers("github.com"), ["", f"{helper}--host-token {LAUNCH_TOKEN}"])
+    assert _helpers(GHE) == []
+    # github.com fails git auth instead of running as the shared identity.
+    assert github.returncode != 0
+    assert "password=shared-value" not in github.stdout
+    assert not shared_used_for_github
+    # The instance host keeps its ambient helper.
+    assert "password=shared-value" in ghe.stdout.splitlines()
+
+
+def test_the_refresh_thread_applies_the_next_definitive_answer(
+    monkeypatch: pytest.MonkeyPatch,
+    broker: FakeBroker,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    monkeypatch.setenv("OMNIGENT_GIT_PROVIDER_GITHUB_HOSTS", GHE)
+    broker.payloads["github"] = httpx.ConnectTimeout("timed out")
+    with caplog.at_level(logging.DEBUG, logger="omnigent.git_credential"):
+        gc.configure_host_credentials(SERVER, HOST_ID)
+        github = next(facet for facet in gc._credential_facets() if facet.provider_id == "github")
+        # A tick that still gets no definitive answer changes nothing.
+        assert gc._refresh_provider(SERVER, HOST_ID, github) is False
+        gc.configure_host_credentials(SERVER, HOST_ID)
+
+    warnings = [
+        record
+        for record in caplog.records
+        if record.levelno == logging.WARNING and "no definitive answer" in record.getMessage()
+    ]
+    assert len(warnings) == 1
+    _same(_helpers("github.com"), ["", HELPER])
+    assert _helpers(GHE) == []
+    assert _git_global("user.email") is None
+
+    broker.payloads["github"] = _github(hosts=["github.com", GHE])
+    assert gc._refresh_provider(SERVER, HOST_ID, github) is True
+    _same(_helpers(GHE), ["", HELPER])
+    assert _git_global("user.email") == "alice@example.com"
+    assert (tmp_path / "gh" / "hosts.yml").exists()
+
+    # Once applied, later ticks leave git alone and only re-write the CLI config.
+    _add_helper(GHE, "!user-ghe-helper")
+    broker.payloads["github"] = _github(hosts=["github.com"])
+    assert gc._refresh_provider(SERVER, HOST_ID, github) is True
+    _same(_helpers(GHE), ["", HELPER, "!user-ghe-helper"])
+
+
 def test_configure_host_credentials_wires_every_credential_facet(
     broker: FakeBroker, gitlab: FakeGitLabCredential
 ) -> None:
@@ -760,44 +877,6 @@ def test_github_facet_keeps_hosts_yml_when_the_write_fails(
     assert [path.name for path in hosts_path.parent.iterdir()] == ["hosts.yml"]
 
 
-def test_github_facet_clear_removes_only_the_github_com_account(tmp_path: Path) -> None:
-    hosts_path = tmp_path / "gh" / "hosts.yml"
-    hosts_path.parent.mkdir()
-    hosts_path.write_text(
-        yaml.safe_dump(
-            {
-                "github.com": {
-                    "oauth_token": OWNER_TOKEN,
-                    "user": "octo",
-                    "git_protocol": "https",
-                    "users": {"octo": {"oauth_token": OWNER_TOKEN}, "other": {"x": "y"}},
-                },
-                GHE: {"oauth_token": "enterprise-value", "user": "alice"},
-            }
-        )
-    )
-
-    gh_facet.CREDENTIAL.clear_cli_config(tmp_path / "home")
-
-    assert yaml.safe_load(hosts_path.read_text()) == {
-        "github.com": {"git_protocol": "https", "users": {"other": {"x": "y"}}},
-        GHE: {"oauth_token": "enterprise-value", "user": "alice"},
-    }
-    assert stat.S_IMODE(hosts_path.stat().st_mode) == 0o600
-
-
-def test_github_facet_clear_leaves_a_file_without_a_github_com_token(tmp_path: Path) -> None:
-    hosts_path = tmp_path / "gh" / "hosts.yml"
-    gh_facet.CREDENTIAL.clear_cli_config(tmp_path / "home")
-    assert not hosts_path.exists()
-
-    hosts_path.parent.mkdir()
-    original = "github.com:\n    git_protocol: ssh\n"
-    hosts_path.write_text(original)
-    gh_facet.CREDENTIAL.clear_cli_config(tmp_path / "home")
-    assert hosts_path.read_text() == original
-
-
 # ── Process boundaries ──────────────────────────────────────────────────────
 
 
@@ -806,6 +885,26 @@ def _child_env() -> dict[str, str]:
     env = {key: value for key, value in os.environ.items() if key != HOST_TOKEN_ENV_VAR}
     env["PYTHONPATH"] = os.pathsep.join(path for path in sys.path if path)
     return env
+
+
+def _git_fill(host: str) -> subprocess.CompletedProcess[str]:
+    """Ask real git for an https credential for *host*, with prompts off."""
+    env = {
+        key: value
+        for key, value in _child_env().items()
+        if key not in {"GIT_ASKPASS", "SSH_ASKPASS"}
+    }
+    # git runs this helper as ``python3``; resolve it to this interpreter.
+    env["PATH"] = f"{Path(sys.executable).parent}{os.pathsep}{env['PATH']}"
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    return subprocess.run(
+        ["git", "credential", "fill"],
+        input=f"protocol=https\nhost={host}\n\n",
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=budget(60),
+    )
 
 
 def test_helper_modules_do_not_import_the_server_stack() -> None:
@@ -861,22 +960,7 @@ def test_git_fetches_the_token_through_the_installed_helper() -> None:
     thread.start()
     try:
         gc.configure_host_credentials(f"http://127.0.0.1:{server.server_port}", HOST_ID)
-        env = {
-            key: value
-            for key, value in _child_env().items()
-            if key not in {"GIT_ASKPASS", "SSH_ASKPASS"}
-        }
-        # git runs the helper as ``python3``; resolve it to this interpreter.
-        env["PATH"] = f"{Path(sys.executable).parent}{os.pathsep}{env['PATH']}"
-        env["GIT_TERMINAL_PROMPT"] = "0"
-        result = subprocess.run(
-            ["git", "credential", "fill"],
-            input="protocol=https\nhost=github.com\n\n",
-            env=env,
-            capture_output=True,
-            text=True,
-            timeout=budget(60),
-        )
+        result = _git_fill("github.com")
     finally:
         server.shutdown()
         server.server_close()

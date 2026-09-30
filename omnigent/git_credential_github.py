@@ -7,6 +7,11 @@ server, so every name here keeps its signature and its GitHub-only behavior. Eac
 to :mod:`omnigent.git_credential` and reaches the other names here through this module at call
 time, so a caller that replaces one of them still changes what the others do.
 
+Migration before removal: the sandbox init container that
+:mod:`omnigent.onboarding.sandboxes.kubernetes` renders still imports this module and replaces
+``_install_broker_helper``. That renderer must switch to :mod:`omnigent.git_credential`, and
+the supported sandbox images must include that package, before this module goes.
+
 Run as: ``git credential.helper`` →
 ``python -m omnigent.git_credential_github --server <url> --host-id <id> --host-token <tok>``.
 """

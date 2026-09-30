@@ -28,8 +28,6 @@ _GIT_HOST = "github.com"
 _API_HOSTS = frozenset({"api.github.com"})
 # git's username for a GitHub token when the broker names none.
 _TOKEN_USERNAME = "x-access-token"
-# The account keys of a hosts.yml host entry that hold or name the credential.
-_ACCOUNT_KEYS = ("oauth_token", "user")
 
 # The name avoids a TOKEN/KEY/SECRET/PASSWORD/CREDENTIAL segment: the sandbox launcher rejects
 # env-passthrough names that look like a credential, and this is a plain integer.
@@ -112,28 +110,6 @@ def _write_hosts_entry(hosts_path: Path, login: str, token: str) -> bool:
     return _replace_hosts(hosts_path, hosts)
 
 
-def _clear_hosts_entry(hosts_path: Path) -> None:
-    """Remove the ``github.com`` token and user from gh's ``hosts.yml``, keeping the rest.
-
-    gh 2.40 and later also copies the active account's token under ``users.<login>``, so that
-    account goes too; other accounts, keys, and hosts stay.
-    """
-    hosts = _read_hosts(hosts_path)
-    entry = hosts.get(_GIT_HOST)
-    if not isinstance(entry, dict) or not any(key in entry for key in _ACCOUNT_KEYS):
-        return
-    accounts = entry.get("users")
-    if isinstance(accounts, dict):
-        accounts.pop(entry.get("user"), None)
-        if not accounts:
-            del entry["users"]
-    for key in _ACCOUNT_KEYS:
-        entry.pop(key, None)
-    if not entry:
-        del hosts[_GIT_HOST]
-    _replace_hosts(hosts_path, hosts)
-
-
 class GitHubCredential:
     """github.com, plus GitHub Enterprise instance hosts once the broker lists them."""
 
@@ -176,10 +152,6 @@ class GitHubCredential:
             return False
         hosts_path = _gh_config_dir(home) / "hosts.yml"
         return _write_hosts_entry(hosts_path, _cli_login(cred), str(token))
-
-    def clear_cli_config(self, home: Path) -> None:
-        """Remove the ``github.com`` token that :meth:`write_cli_config` writes."""
-        _clear_hosts_entry(_gh_config_dir(home) / "hosts.yml")
 
 
 CREDENTIAL: CredentialFacet = GitHubCredential()
