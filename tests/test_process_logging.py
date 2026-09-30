@@ -6,6 +6,7 @@ import contextlib
 import logging
 import os
 import re
+import sys
 import time
 from pathlib import Path
 
@@ -27,6 +28,7 @@ from omnigent.process_logging import (
     child_logging_popen_kwargs,
     configure_process_logging,
     current_process_log_path,
+    ensure_stdio_survives_unencodable_output,
     log_info_once,
     log_once,
     process_log_dir_reference,
@@ -765,3 +767,79 @@ def test_log_once_respects_level_and_captures_exc_info(
     assert len(records) == 1  # identical repeat dropped
     assert records[0].levelno == logging.WARNING
     assert records[0].exc_info is not None  # first occurrence keeps its traceback
+
+
+class _FakeStream:
+    """A stdio stub recording ``reconfigure`` calls for the stdio-hardening tests."""
+
+    def __init__(self, encoding: str, *, raises: bool = False) -> None:
+        self.encoding = encoding
+        self.raises = raises
+        self.reconfigured: dict[str, object] | None = None
+
+    def reconfigure(self, **kwargs: object) -> None:
+        if self.raises:
+            raise ValueError("stream detached")
+        self.reconfigured = kwargs
+        self.encoding = str(kwargs.get("encoding", self.encoding))
+
+
+def test_stdio_hardening_reconfigures_legacy_windows_streams(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """On Windows, non-UTF-8 stdio is reconfigured to utf-8/replace."""
+    monkeypatch.setattr(sys, "platform", "win32")
+    out, err = _FakeStream("cp1252"), _FakeStream("cp1252")
+    monkeypatch.setattr(sys, "stdout", out)
+    monkeypatch.setattr(sys, "stderr", err)
+
+    ensure_stdio_survives_unencodable_output()
+
+    assert out.reconfigured == {"encoding": "utf-8", "errors": "replace"}
+    assert err.reconfigured == {"encoding": "utf-8", "errors": "replace"}
+
+
+def test_stdio_hardening_relaxes_errors_on_posix_legacy_stream(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A legacy-encoding stream off Windows keeps its encoding, relaxed errors.
+
+    ``PYTHONIOENCODING=cp1252`` (or a C/latin-1 locale) reproduces the same
+    mid-command ``UnicodeEncodeError`` on any OS; the stream must degrade
+    unencodable glyphs instead of aborting, without changing the encoding
+    the consumer asked for.
+    """
+    monkeypatch.setattr(sys, "platform", "linux")
+    out, err = _FakeStream("cp1252"), _FakeStream("cp1252")
+    monkeypatch.setattr(sys, "stdout", out)
+    monkeypatch.setattr(sys, "stderr", err)
+
+    ensure_stdio_survives_unencodable_output()
+
+    assert out.reconfigured == {"errors": "replace"}
+    assert err.reconfigured == {"errors": "replace"}
+    assert out.encoding == "cp1252"
+
+
+def test_stdio_hardening_skips_already_utf8(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A UTF-8 stream is not reconfigured again (any platform)."""
+    for platform in ("win32", "linux"):
+        monkeypatch.setattr(sys, "platform", platform)
+        out = _FakeStream("utf-8")
+        monkeypatch.setattr(sys, "stdout", out)
+        monkeypatch.setattr(sys, "stderr", _FakeStream("utf-8"))
+
+        ensure_stdio_survives_unencodable_output()
+
+        assert out.reconfigured is None
+
+
+def test_stdio_hardening_tolerates_reconfigure_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stream whose ``reconfigure`` raises does not abort startup."""
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(sys, "stdout", _FakeStream("cp1252", raises=True))
+    monkeypatch.setattr(sys, "stderr", _FakeStream("cp1252", raises=True))
+
+    ensure_stdio_survives_unencodable_output()  # must not raise

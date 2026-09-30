@@ -541,6 +541,16 @@ describe("isValidWorkspace", () => {
     expect(isValidWorkspace("~")).toBe(false);
   });
 
+  it("accepts Windows absolute paths with drive letters", () => {
+    expect(isValidWorkspace("C:\\Users\\corey\\projects\\myapp")).toBe(true);
+    expect(isValidWorkspace("D:/projects/myapp")).toBe(true);
+    expect(isValidWorkspace("c:\\temp")).toBe(true);
+  });
+
+  it("accepts Windows UNC network paths", () => {
+    expect(isValidWorkspace("\\\\server\\share\\repo")).toBe(true);
+  });
+
   it("rejects relative paths", () => {
     expect(isValidWorkspace("projects/myapp")).toBe(false);
     expect(isValidWorkspace("./myapp")).toBe(false);
@@ -563,6 +573,10 @@ describe("normalizeWorkspacePath", () => {
     // Root is preserved, not collapsed away.
     ["/", "/"],
     ["///", "/"],
+    // Windows paths with trailing slashes / backslashes
+    ["C:\\Users\\me\\repo\\", "C:\\Users\\me\\repo"],
+    ["C:/Users/me/repo/", "C:/Users/me/repo"],
+    ["C:\\", "C:\\"],
     // Blank → null (no path) — must NOT become "/", or an empty input would
     // spuriously match a session whose workspace is the root.
     ["", null],

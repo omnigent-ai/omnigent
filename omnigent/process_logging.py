@@ -493,6 +493,40 @@ def _unlink_if_empty(path: Path) -> None:
             path.unlink()
 
 
+def ensure_stdio_survives_unencodable_output() -> None:
+    """Keep stdio writes from aborting when the stream encoding is legacy.
+
+    A shell on a legacy non-UTF-8 encoding (Windows ANSI codepage like
+    cp1252, a C/latin-1 locale, or an explicit ``PYTHONIOENCODING``) hands
+    Python stdio streams that can't encode the CLI's decorative glyphs
+    (emoji, ``✓``, ``←``, …), so a plain ``print`` raises
+    ``UnicodeEncodeError`` mid-command. Reconfigure such streams so the
+    unencodable character degrades to a stand-in instead of killing the
+    command: on Windows switch to UTF-8 outright (modern terminals render
+    it, and it preserves the glyphs); elsewhere keep the stream's own
+    encoding and only relax the error handler, so output stays in the
+    encoding the consumer asked for. ``PYTHONUTF8`` can't help here since
+    PEP 540 reads it only at interpreter startup.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        encoding = (getattr(stream, "encoding", "") or "").lower().replace("_", "-")
+        if encoding in {"utf-8", "utf8"}:
+            continue
+        # Trade-off: errors="replace" is process-wide, so any genuinely
+        # unencodable output (not just decorative glyphs) degrades to "?"
+        # instead of raising — acceptable for a CLI's human-facing stdio.
+        # Detached/replaced streams (or a test's capture object) can't be
+        # reconfigured; the glyph fallback still guards the actual writes.
+        with contextlib.suppress(ValueError, OSError):
+            if sys.platform == "win32":
+                reconfigure(encoding="utf-8", errors="replace")
+            else:
+                reconfigure(errors="replace")
+
+
 def configure_process_logging(
     destination: str,
     *,
