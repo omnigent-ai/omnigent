@@ -47,8 +47,7 @@ from omnigent.harnesses.cursor_native import bridge as cursor_native_bridge
 from omnigent.harnesses.kiro_native import bridge as kiro_native_bridge
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.terminal import TerminalInstance
-from omnigent.runner import app as runner_app
-from omnigent.runner import create_runner_app
+from omnigent.runner import create_runner_app, subagent_work
 from omnigent.runner.app import (
     ResolvedSpec,
     _agent_os_env_from_spec,
@@ -3403,7 +3402,7 @@ class _DeletingCodexRecoveryServerClient:
             "tool": "reviewer",
             "session_name": child_id,
             "current_task_status": "completed",
-            "labels": {runner_app.SUBAGENT_DISPATCH_ID_LABEL_KEY: dispatch_id},
+            "labels": {subagent_work.SUBAGENT_DISPATCH_ID_LABEL_KEY: dispatch_id},
         }
 
     @staticmethod
@@ -3879,20 +3878,20 @@ async def test_delete_cancels_recovery_before_same_session_reinitializes(
         with pytest.raises(RuntimeError, match="pre-launch failed"):
             await client.post("/v1/sessions", json=body)
         await asyncio.wait_for(server_client.second_child_read_started.wait(), timeout=1.0)
-        first_entry = runner_app.get_subagent_work(first_child_id)
+        first_entry = subagent_work.get_subagent_work(first_child_id)
         assert first_entry is not None and first_entry.delivered
-        assert runner_app._session_inboxes_ref[session_id].qsize() == 1
+        assert subagent_work._session_inboxes_ref[session_id].qsize() == 1
 
         delete_resp = await client.delete(f"/v1/sessions/{session_id}")
         assert delete_resp.status_code == 200, delete_resp.text
         assert server_client.first_recovery_cancelled.is_set()
-        assert runner_app.get_subagent_work(first_child_id) is None
-        assert session_id not in runner_app._session_inboxes_ref
+        assert subagent_work.get_subagent_work(first_child_id) is None
+        assert session_id not in subagent_work._session_inboxes_ref
 
         recreate_resp = await client.post("/v1/sessions", json=body)
         assert recreate_resp.status_code == 201, recreate_resp.text
         recovered = []
-        inbox = runner_app._session_inboxes_ref[session_id]
+        inbox = subagent_work._session_inboxes_ref[session_id]
         while not inbox.empty():
             recovered.append(inbox.get_nowait())
         assert any(

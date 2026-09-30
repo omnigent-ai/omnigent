@@ -16,6 +16,7 @@ from omnigent.entities.session_resources import SessionResourceView
 from omnigent.harnesses.claude_native import bridge as claude_native_bridge
 from omnigent.harnesses.codex_native import bridge as codex_native_bridge
 from omnigent.runner import app as runner_app_mod
+from omnigent.runner import subagent_work
 from omnigent.spec.types import AgentSpec, ExecutorSpec
 from tests.runner.helpers import NullServerClient
 
@@ -123,7 +124,7 @@ async def test_wake_post_retries_transient_503_then_succeeds(
         [_wake_response(503, parent_id), _wake_response(200, parent_id)]
     )
 
-    delivered = await runner_app_mod._deliver_subagent_wake_post(
+    delivered = await subagent_work._deliver_subagent_wake_post(
         client,  # type: ignore[arg-type]
         parent_id,
         "[System: worker completed]",
@@ -154,7 +155,7 @@ async def test_wake_post_carries_dispatch_actor() -> None:
     parent_id = "5a81ef19fce549929c8f9925c2ee034f"
     client = _QueuedResponseServerClient([_wake_response(200, parent_id)])
 
-    delivered = await runner_app_mod._deliver_subagent_wake_post(
+    delivered = await subagent_work._deliver_subagent_wake_post(
         client,  # type: ignore[arg-type]
         parent_id,
         "[System: worker completed]",
@@ -173,7 +174,7 @@ async def test_wake_post_retries_without_actor_when_attribution_is_rejected() ->
         [_wake_response(403, parent_id), _wake_response(200, parent_id)]
     )
 
-    delivered = await runner_app_mod._deliver_subagent_wake_post(
+    delivered = await subagent_work._deliver_subagent_wake_post(
         client,  # type: ignore[arg-type]
         parent_id,
         "[System: worker completed]",
@@ -198,10 +199,10 @@ async def test_wake_post_persistent_503_returns_failure(
     """
     parent_id = "a25887ef53cb74bba721c20edf204d10"
     client = _QueuedResponseServerClient(
-        [_wake_response(503, parent_id) for _ in range(runner_app_mod._WAKE_POST_MAX_ATTEMPTS)]
+        [_wake_response(503, parent_id) for _ in range(subagent_work._WAKE_POST_MAX_ATTEMPTS)]
     )
 
-    delivered = await runner_app_mod._deliver_subagent_wake_post(
+    delivered = await subagent_work._deliver_subagent_wake_post(
         client,  # type: ignore[arg-type]
         parent_id,
         "[System: worker completed]",
@@ -212,14 +213,14 @@ async def test_wake_post_persistent_503_returns_failure(
     assert delivered is False
     # Attempted exactly the bounded budget — not once (no retry) and not
     # unbounded. The stub would have asserted on a call past the queue.
-    assert len(client.calls) == runner_app_mod._WAKE_POST_MAX_ATTEMPTS, (
-        f"Expected {runner_app_mod._WAKE_POST_MAX_ATTEMPTS} attempts on persistent 503, "
+    assert len(client.calls) == subagent_work._WAKE_POST_MAX_ATTEMPTS, (
+        f"Expected {subagent_work._WAKE_POST_MAX_ATTEMPTS} attempts on persistent 503, "
         f"got {len(client.calls)}."
     )
     # One backoff fewer than attempts: we don't sleep after the final attempt.
-    assert len(_no_wake_backoff) == runner_app_mod._WAKE_POST_MAX_ATTEMPTS - 1, (
-        f"Expected {runner_app_mod._WAKE_POST_MAX_ATTEMPTS - 1} backoffs between "
-        f"{runner_app_mod._WAKE_POST_MAX_ATTEMPTS} attempts, got {_no_wake_backoff}."
+    assert len(_no_wake_backoff) == subagent_work._WAKE_POST_MAX_ATTEMPTS - 1, (
+        f"Expected {subagent_work._WAKE_POST_MAX_ATTEMPTS - 1} backoffs between "
+        f"{subagent_work._WAKE_POST_MAX_ATTEMPTS} attempts, got {_no_wake_backoff}."
     )
 
 
@@ -235,7 +236,7 @@ async def test_wake_post_permanent_4xx_not_retried(
     parent_id = "43cc3eccd350fed1b91854b2adf5ec3e"
     client = _QueuedResponseServerClient([_wake_response(400, parent_id)])
 
-    delivered = await runner_app_mod._deliver_subagent_wake_post(
+    delivered = await subagent_work._deliver_subagent_wake_post(
         client,  # type: ignore[arg-type]
         parent_id,
         "[System: worker completed]",
@@ -280,7 +281,7 @@ def test_wake_post_is_retryable_status_classification(
     )
     # Pins which statuses cost a retry vs. fail fast; a wrong verdict here
     # would either waste the budget on permanent errors or give up on a 503.
-    assert runner_app_mod._wake_post_is_retryable(exc) is expected_retryable
+    assert subagent_work._wake_post_is_retryable(exc) is expected_retryable
 
 
 def test_wake_post_transport_error_is_retryable() -> None:
@@ -293,7 +294,7 @@ def test_wake_post_transport_error_is_retryable() -> None:
     request = httpx.Request("POST", "http://test/v1/sessions/p/events")
     exc = httpx.ConnectError("connection refused", request=request)
     # True because a transport failure is not a definitive server rejection.
-    assert runner_app_mod._wake_post_is_retryable(exc) is True
+    assert subagent_work._wake_post_is_retryable(exc) is True
 
 
 @dataclass

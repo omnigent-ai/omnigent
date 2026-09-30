@@ -7,7 +7,9 @@ from typing import cast
 import pytest
 
 from omnigent.entities import ConversationItem, FunctionCallOutputData, MessageData
-from omnigent.runner.app import _format_subagent_wake_notice
+from omnigent.runner.subagent_work import (
+    _format_subagent_wake_notice,
+)
 from omnigent.runtime.mcp_tool_result import encode_mcp_image_result
 from omnigent.runtime.prompt import (
     EMBEDDED_BROWSER_PRIORITY_INSTRUCTION,
