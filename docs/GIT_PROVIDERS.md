@@ -1,11 +1,12 @@
 # Git providers
 
-The session pull request panel and the PR observer work with any git provider
-that implements the layer described here. GitHub and Azure DevOps ship with
+A git provider plugs into Omnigent with a descriptor and up to four facets: pull
+requests, connection, credential, and policy. GitHub and Azure DevOps ship with
 Omnigent. This page is for a developer who adds or maintains a provider.
 [Azure DevOps pull requests](AZURE_DEVOPS.md) covers the second provider from
-the user's side, and its code is the worked example for each step in
-[Adding a provider](#adding-a-provider).
+the user's side, and its code is the worked example for the pull request steps
+in [Adding a provider](#adding-a-provider). GitHub is the worked example for the
+connection, credential, and policy steps.
 
 ## What a provider is
 
@@ -26,15 +27,17 @@ A facet is a separate module that the descriptor names in `facets`, a
 provider, with `load_facet(provider_id, kind)`. The facet module exposes an
 object named after the kind in upper case, such as `PULL_REQUESTS`.
 
-| Facet kind | Imported by | State |
-| --- | --- | --- |
-| `pull_requests` | The runner: the PR panel and the PR observer | Implemented |
-| `connection` | The server | Later change |
-| `credential` | The host and the sandbox | Later change |
-| `policy` | The runner policy engine | Later change |
+| Facet kind | Exposes | Imported by | Built-in providers |
+| --- | --- | --- | --- |
+| `pull_requests` | `PULL_REQUESTS`, a `PullRequestFacet` | The runner: the PR panel and the PR observer | GitHub, Azure DevOps |
+| `connection` | `CONNECTION`, a `ConnectionFacet` | The server | GitHub |
+| `credential` | `CREDENTIAL`, a `CredentialFacet` | The host and the sandbox | GitHub |
+| `policy` | `POLICY`, the registry handler path of the provider's policy | The runner policy engine | GitHub |
 
-Only `pull_requests` exists so far. `FacetModules` and `load_facet` already
-accept the other three kinds, and the built-in providers leave them unset.
+`load_facet` returns `None` for a facet that the descriptor does not name, so a
+provider implements only the facets it needs. Azure DevOps has `pull_requests`
+only. [Providers in `/v1/info`](#providers-in-v1info) shows what each provider
+offers on a server.
 
 ## How URLs resolve
 
@@ -55,7 +58,10 @@ the first provider whose `parse_remote_url` or `parse_pr_url` returns a result
 wins. A provider registered later can therefore take a host from an earlier one
 by claiming it, and a provider that claims no host still parses the URLs that no
 provider claims. `host_of(url)` reads the lower-cased host from an `http`,
-`https`, `ssh`, or scp-style URL.
+`https`, `ssh`, or scp-style URL. A descriptor that raises is logged and
+skipped, so the other providers still resolve. `resolve_remote` returns nothing
+for a URL with a backslash, because `urlsplit` and git can read its host
+differently.
 
 `matches_host` receives an `Instances` object, which reports the hosts
 configured for a provider beyond its `default_hosts`. The default,
@@ -324,8 +330,9 @@ instead of a diff.
 ## Frontend
 
 `web/src/lib/gitProviders.ts` holds the name, icon, and wording that the panel
-shows for each provider. `GIT_PROVIDERS` maps a provider id to a
-`GitProviderCopy`, and `gitProviderCopy(id, authHint)` picks the entry to use.
+and the new-chat repository picker show for each provider. `GIT_PROVIDERS` maps
+a provider id to a `GitProviderCopy`, and `gitProviderCopy(id, authHint)` picks
+the entry to use.
 
 | `GitProviderCopy` field | Use |
 | --- | --- |
@@ -339,6 +346,7 @@ shows for each provider. `GIT_PROVIDERS` maps a provider id to a
 | `cliLabel` | The name of the provider's CLI, as in "Install the GitHub CLI". |
 | `signInWithoutCli` | Optional. The provider can sign in without its CLI, for example with a token, so a missing CLI also shows `authHint`. |
 | `repoUnresolvedHint` | Optional. The hint for an upstream repository that cannot be reached. `authHint` when absent. |
+| `cloneUrlFor` | Optional. The clone URL of a repo that the provider's connection lists, for a listing that carries no `clone_url`. GitHub returns `https://github.com/{fullName}.git`. |
 
 `gitProviderCopy` falls back in this order:
 
@@ -361,11 +369,270 @@ them. A missing `provider` becomes `github`, and an explicit `null` stays
 `null`. A missing `auth` is built from the legacy GitHub fields, and missing
 `capabilities` become GitHub's set. Applying it twice gives the same result.
 
+## The connection facet
+
+The connection facet is the server's half of a provider's per-user connection:
+the routes that link a user's account, the store that keeps the link, and the
+credential that the server vends to that user's sandboxes. The
+`ConnectionFacet` protocol in
+[`omnigent/server/git_providers/__init__.py`](../omnigent/server/git_providers/__init__.py)
+is the contract, and `omnigent/server/git_providers/github.py` is the example.
+The config, store, and client are the provider's own types. The server keeps
+them on `app.state` and passes them back to the facet.
+
+| Member | What it does |
+| --- | --- |
+| `repo_browser` | Whether the router lists the user's repositories for the new-chat picker. |
+| `config_from_env()` | The provider's config from the environment, or `None` when it is unset. Raises when the environment configures the provider incorrectly. |
+| `make_store(db_uri, cipher)` | The per-user connection store over the shared credential store. |
+| `make_client(config)` | The provider API client that the router and the credential resolver share. |
+| `make_router(config, store, *, auth_provider, client)` | The provider's `/connections/<id>/*` routes, mounted under `/v1`. |
+| `resolve_credential(user_id, *, store, client)` | The credential to vend for the user, or `None` when the user has not linked the provider. |
+
+`connection_facets()` yields `(provider_id, facet)` for each provider whose
+connection facet loads, in registration order. `connections_from_env(db_uri)`
+builds `{provider_id: (config, store)}` for the providers that the environment
+configures. `omnigent server` and the Docker entrypoint
+(`deploy/docker/entrypoint.py`) pass that mapping to
+`create_app(connections=...)`. `connection_providers()` in
+`omnigent/server/connections_registry.py` turns the loaded facets into
+`ConnectionProvider` entries, followed by Databricks, and `create_app` iterates
+them.
+
+A facet module that fails to import, or that does not implement
+`ConnectionFacet`, is logged and skipped, so one broken provider does not stop
+the server. The log names the provider and the exception type, not its text,
+which can quote configuration. An error raised by `config_from_env` or
+`make_store` stops startup, so a misconfigured provider is never disabled
+silently. A configured provider whose credential store has no cipher stays in
+the mapping with a `None` store, so its connection is disabled, and the server
+logs that `OMNIGENT_CREDENTIAL_ENC_KEY` enables it. The cipher is built once,
+and only when a provider is configured.
+
+`create_app` enables a provider when both its config and its store are present.
+It then sets `app.state.<id>_config`, `app.state.<id>_store`, and
+`app.state.<id>_client`, mounts the provider's router under `/v1`, and lists the
+provider in `enabled_connections`. A provider that lacks either one gets `None`
+for all three and no routes.
+
+The `github_config` and `github_store` arguments of `create_app` are deprecated
+and will be removed in 0.19.0. They emit a `DeprecationWarning` and are merged
+into `connections["github"]`, and naming `"github"` in both places raises
+`ValueError`. Pass `connections={"github": (config, store)}` instead. The GitHub
+facet reads the `OMNIGENT_GITHUB_APP_*` variables, and
+[GitHub App setup](GITHUB_APP_SETUP.md) covers its configuration.
+
+## The credential facet
+
+A managed sandbox gets the session owner's provider credential from the server
+when it needs one. The server half is the broker route, and the sandbox half is
+the git credential helper, which a credential facet feeds.
+
+### The broker route
+
+`GET /v1/hosts/{host_id}/credentials/{provider}`, in
+`omnigent/server/routes/host_credentials.py`, vends the session owner's
+credential for one provider. The caller sends the host's launch token in the
+`X-Omnigent-Host-Token` header, the same channel that the host tunnel uses, and
+the server resolves the token to the session owner. `{provider}` is the id of a
+connection provider, Databricks included, and the route calls that provider's
+`resolve_credential`. The response is `Cache-Control: no-store`.
+
+- `401` when the token is missing or does not resolve.
+- `404` with the body `{"detail": "unknown credential provider"}` when the
+  server has no connection for the provider.
+- `{"connected": false}` when the owner has not linked the provider, or when
+  `resolve_credential` raises.
+- `{"connected": true, "owner": ...}` plus the provider's payload otherwise.
+  `owner` is the session owner's user id.
+
+The payload of the GitHub facet has these fields:
+
+| Field | Meaning |
+| --- | --- |
+| `token` | The credential. Every facet sends it. |
+| `username` | The git username that goes with the token, `x-access-token` for GitHub. Optional. |
+| `login` | The owner's GitHub login. The helper uses it as the commit author's name and as gh's `user`. |
+| `expires_at` | The token's expiry in epoch seconds, or null when it does not expire. Optional. |
+| `hosts` | The lower-cased git host names that the token authenticates to, with no scheme or port. GitHub sends `["github.com"]`. Optional. |
+
+The server resolves the credential again on each request, and it stops vending
+when the launch token expires or the host is deleted. A token that it already
+vended stays valid at the provider for its own lifetime, so the trust boundary is
+the sandbox. [The credential store design](../designs/CREDENTIAL_STORE.md)
+covers the threat model.
+
+### The helper
+
+The helper is `python -m omnigent.git_credential --server <url> --host-id <id>
+--host-token <token>`, from `omnigent/git_credential/__init__.py`. git runs it as
+`credential.https://<host>.helper` with `get` and the request on stdin. The
+helper picks the credential facet whose `hosts` include the request's host,
+fetches that provider's credential from the broker route, and prints `username`
+and `password`. `store` and `erase` do nothing, because the token is never
+persisted.
+
+In a managed sandbox, `omnigent host` calls `configure_host_credentials` at
+startup and `start_credential_refresh` after it. Both do nothing elsewhere.
+`configure_host_credentials` probes the broker once for each credential facet,
+installs the helper on the hosts that qualify, makes a connected owner whose id
+is an email address the commit author, and has the facet write its CLI config.
+`configure_clone_credentials` installs the helper the same way before the
+initial clone, and never removes an entry. `start_credential_refresh` starts one
+daemon thread for each facet. Every `refresh_interval_s()` seconds the thread
+re-fetches the credential and re-writes the CLI config, because a CLI such as gh
+reads a static config and the provider token expires.
+
+The `CredentialFacet` protocol in `omnigent/git_credential/__init__.py` is the
+contract:
+
+| Member | What it does |
+| --- | --- |
+| `hosts(instances)` | The lower-cased git hosts that the facet can serve over https. GitHub returns `github.com` plus the hosts of `OMNIGENT_GIT_PROVIDER_GITHUB_HOSTS`. |
+| `git_username(cred)` | The git username that goes with the broker's token. GitHub returns the broker's `username`, else `x-access-token`. |
+| `write_cli_config(cred, home)` | Writes the credential into the provider CLI's config under `home`. It returns `True` when it wrote and `False` when it skipped or hit a filesystem error. GitHub merges `github.com` into gh's `hosts.yml`, keeps the other hosts, and skips a response whose `hosts` lack `github.com`. |
+| `refresh_interval_s()` | Seconds between CLI config refreshes. Zero or less disables them. GitHub reads `OMNIGENT_GH_REFRESH_INTERVAL_S` and defaults to 1800. |
+| `api_hosts()` | The lower-cased API hosts that the credential is valid for. GitHub returns `api.github.com`. Nothing calls it today. |
+
+The helper vends a token for a host only when the host is in both the facet's
+`hosts` and the `hosts` list of the broker response. A connected response with
+no `hosts` list, which an older server sends, is definitive for the provider's
+default hosts only, so a github.com token never reaches a configured GitHub
+Enterprise host. The host installs the helper on the hosts that qualify. After a
+definitive answer it also removes the helper's own entries from the facet's other
+hosts, so an owner who has not linked the provider falls back to the ambient
+helper. A helper that the user configured is never changed.
+
+An inconclusive probe (a timeout, a network error, a 5xx, or a body that does
+not parse) installs the helper on the provider's default hosts, so a broker
+outage fails git authentication instead of falling back to the image's shared
+token. It changes nothing on other hosts. The refresh thread applies the next
+definitive answer.
+
+`api_hosts()` exists for a later move of provider credentials to the egress
+credential proxy. That proxy ([design](../designs/SANDBOX_CREDENTIAL_PROXY.md))
+injects a credential into requests to the hosts it is bound to, so it needs the
+hosts that a credential is valid for.
+
+`omnigent/git_credential_github.py` is the earlier GitHub-only helper. Its names
+are deprecated and will be removed in 0.19.0. They are `main`,
+`configure_host_git`, `configure_host_gh`, `start_host_gh_refresh`,
+`configure_clone_credentials`, and the private hooks beside them. Each one
+delegates to `omnigent.git_credential` and keeps its signature and its
+GitHub-only behavior.
+
+They stay because the sandbox init container still runs this module.
+`_render_workspace_prep_command` in `omnigent/onboarding/sandboxes/kubernetes.py`
+renders a script that imports `main` and `configure_clone_credentials` from it
+and replaces its private `_install_broker_helper`, and a sandbox image can run a
+different version of Omnigent than the server that rendered the script. Before
+0.19.0 the renderer has to switch to `omnigent.git_credential`, and sandbox
+images have to include that package. The initial clone in a managed sandbox wires
+only github.com, so a provider that needs clone support there has to extend that
+script.
+
+## The policy facet
+
+The policy facet names the policy that gates a provider's commands and tool
+calls. Its module exposes `POLICY`, the registry handler path of the provider's
+policy. For GitHub the facet module is `omnigent/policies/builtins/github.py`,
+and `POLICY` is `omnigent.policies.builtins.github.github_policy`, the `handler`
+of the module's `POLICY_REGISTRY` entry.
+
+A provider that declares a policy facet must register its policy with the policy
+engine. The engine scans the `POLICY_REGISTRY` lists of the modules in
+`BUILTIN_POLICY_MODULES` (`omnigent/policies/builtins/__init__.py`) and of the
+modules that the server config lists in `policy_modules`, and `POLICY` has to be
+the `handler` of an entry in one of them.
+
+The GitHub policy keeps gating `git` commands for every remote, whichever
+provider the remote belongs to. A provider's own policy adds its own decisions
+for that provider's commands.
+
+## Providers in `/v1/info`
+
+`GET /v1/info` lists every registered provider in `git_providers`, in
+registration order. `ServerInfoResponse` in `omnigent/server/app.py` declares the
+field. The entry for GitHub on a server that has enabled its connection looks
+like this:
+
+```json
+{
+  "id": "github",
+  "display_name": "GitHub",
+  "capabilities": {
+    "pull_requests": true,
+    "connection": true,
+    "repo_browser": true,
+    "credential_broker": true
+  }
+}
+```
+
+| Capability | True when |
+| --- | --- |
+| `pull_requests` | The descriptor names a `pull_requests` facet. |
+| `connection` | The server has enabled the provider's connection: its config and its store are both present, so its id is in `enabled_connections`. |
+| `repo_browser` | `connection` is true and the connection facet's `repo_browser` is true. |
+| `credential_broker` | `connection` is true and the descriptor names a `credential` facet. |
+
+`git_provider_infos` reads the descriptors and the `repo_browser` flags that
+`create_app` passes in, so it imports no facet module. `enabled_connections` is
+unchanged: it still lists the id of every enabled connection, Databricks
+included.
+
+## The repo browser
+
+The new-chat dialog lets a user pick a repository from a connected account. It
+needs two routes from a provider whose connection facet has `repo_browser` set.
+GitHub's router in `omnigent/server/routes/connections_github.py` serves them.
+
+- `GET /v1/connections/{id}/repos` returns
+  `{"connected": ..., "repos": [...], "truncated": ...}`. `connected` is false,
+  with an empty `repos`, when the user has not linked the provider, so the dialog
+  falls back to a pasted URL. Each repo has `full_name`, `clone_url`,
+  `default_branch`, `private`, and `pushed_at`, newest push first. `truncated` is
+  true when the page cap was hit and more repos exist.
+- `GET /v1/connections/{id}/repos/{full_name}/branches` returns
+  `{"connected": ..., "branches": [...]}`. `full_name` is the repo's
+  provider-scoped name. For GitHub it is `owner/repo`, so the route has two path
+  segments, and a name outside GitHub's character set gets HTTP 400.
+
+Both routes return HTTP 502 when the provider API fails.
+
+`web/src/lib/connectionsApi.ts` calls the routes with
+`fetchConnectionRepos(providerId)` and
+`fetchConnectionBranches(providerId, fullName)`, and its `ConnectionRepo`,
+`ConnectionRepoList`, and `ConnectionBranchList` types describe the responses.
+`fetchGithubRepos`, `fetchGithubBranches`, and the `GithubRepo`,
+`GithubRepoList`, and `GithubBranchList` types in
+`web/src/lib/githubIntegration.ts` are deprecated wrappers and will be removed in
+0.19.0.
+
+`NewChatLandingScreen` in `web/src/shell/NewChatDialog.tsx` shows one picker for
+each provider in `gitProviders(info)` whose `connection` and `repo_browser`
+capabilities are both true. `gitProviders(info)` in
+`web/src/lib/capabilities.ts` returns `info.git_providers`. A server that
+predates the field has GitHub's connection exactly when `enabled_connections`
+names `github`, so in that case `gitProviders` returns one GitHub entry with
+every capability true, and otherwise an empty list. The parser that reads
+`git_providers` drops entries that lack an id, a display name, or a capabilities
+object, and repeated ids, and it counts a capability only when it is `true`.
+
+A repo's clone URL is its `clone_url`, else `cloneUrlFor(full_name)` from the
+provider's `GIT_PROVIDERS` entry. A repo that has neither is left out of the
+picker. The picker labels itself with the provider's `label` from
+`gitProviderCopy`. TanStack Query caches the lists under
+`["connection-repos", providerId]` and the branches under
+`["connection-branches", providerId, fullName]`, both with a five-minute
+`staleTime`.
+
 ## Stable wire identifiers
 
 Other processes, other versions of this code, saved browser state, and files on
-disk refer to the identifiers below by name. They keep the `github` name for
-every provider, including Azure DevOps. Renaming one breaks them.
+disk refer to the identifiers below by name. Renaming one breaks them. The pull
+request identifiers keep the `github` name for every provider, including Azure
+DevOps.
 
 | Identifier | Where it appears |
 | --- | --- |
@@ -377,10 +644,15 @@ every provider, including Azure DevOps. Renaming one breaks them.
 | Query keys `github-info`, `github-changed-files`, `github-pr-diff` | `web/src/hooks/usePullRequests.ts`. Also read by `web/src/canvas/pullRequests.ts` and `web/src/extensions/services/useExtensionHostServices.ts`. |
 | `testId="github-panel-drawer"` | `web/src/shell/AppShell.tsx`. The e2e tests select it. |
 | `componentId="github.panel.tabs"` | `web/src/shell/PullRequestPanel.tsx`. It is the analytics id of the panel's tabs. |
+| `/v1/connections/{id}/*` routes: `connect`, `callback`, `status`, `disconnect`, and for a provider with a repo browser `repos` and `repos/{full_name}/branches` | `omnigent/server/routes/connections_base.py`, `omnigent/server/routes/connections_github.py`, `web/src/lib/connectionsApi.ts`, `web/src/lib/githubIntegration.ts` |
+| `/v1/hosts/{id}/credentials/{provider}` | `omnigent/server/routes/host_credentials.py`, `omnigent/git_credential/__init__.py` |
+| The 404 body `{"detail": "unknown credential provider"}` of that route | `omnigent/server/routes/host_credentials.py`. The helper treats only this 404 as "the server does not broker this provider", and any other 404 as inconclusive (`_UNKNOWN_PROVIDER_DETAIL` in `omnigent/git_credential/__init__.py`). |
+| The sandbox helper source `import os,sys; from omnigent.git_credential_github import main; sys.exit(main(['--server',<server url>,'--host-id',<host id>,'--host-token',os.environ['OMNIGENT_HOST_TOKEN'],*sys.argv[1:]]))` | `_render_workspace_prep_command` in `omnigent/onboarding/sandboxes/kubernetes.py`. git runs it as `!python3 -Ic '<source>'` for `credential.https://github.com.helper`. |
 
 ## Adding a provider
 
-Each step has a counterpart in the Azure DevOps provider.
+Steps 1 to 7 have a counterpart in the Azure DevOps provider, and steps 8 to 11
+have one in the GitHub provider.
 
 1. Write the descriptor. Add `omnigent/git_providers/<id>.py` that exposes
    `PROVIDER`, as `omnigent/git_providers/github.py` and
@@ -422,12 +694,41 @@ Each step has a counterpart in the Azure DevOps provider.
    `tests/e2e_ui/azure_devops/test_azure_devops_tab.py` stubs the
    `/resources/github*` routes with `page.route` and canned payloads, so the
    panel runs without a real forge.
-8. When the connection, credential, and policy facets exist, add a module for
-   each and name it in `FacetModules`.
+8. Write the connection facet if users link an account with the provider. Add
+   `omnigent/server/git_providers/<id>.py` exposing `CONNECTION`, a
+   `ConnectionFacet`, and name it in `facets.connection`. Import server modules
+   inside the methods, as `omnigent/server/git_providers/github.py` does, so
+   loading the facet stays cheap. A provider that connects with OAuth can build
+   its router on `create_connection_router` and `ConnectionHooks` in
+   `omnigent/server/routes/connections_base.py`, as
+   `omnigent/server/routes/connections_github.py` does. Let `config_from_env`
+   return `None` when the environment does not configure the provider, and raise
+   when it configures it wrongly. `tests/server/test_connections_registry.py`
+   registers a fake provider at run time and drives `create_app` with it.
+9. Write the credential facet if sandboxes need the provider's token. Add
+   `omnigent/git_credential/<id>.py` exposing `CREDENTIAL`, a `CredentialFacet`,
+   and name it in `facets.credential`. Return the provider's hosts from `hosts`,
+   and have the connection facet's `resolve_credential` return the same hosts in
+   its `hosts` list, so the helper vends only for hosts that both sides name.
+   Test the facet in `tests/test_git_credential.py` and the broker route in
+   `tests/server/routes/test_host_credentials.py`. The initial clone in a managed
+   sandbox wires only github.com, so also extend the init container script in
+   `omnigent/onboarding/sandboxes/kubernetes.py` if the provider needs clone
+   support there.
+10. Add the repo browser if the provider can list repositories. Set
+    `repo_browser = True` on the connection facet, serve the two repo routes with
+    the responses described above, and add `cloneUrlFor` to the `GIT_PROVIDERS`
+    entry unless the repo list carries `clone_url`. Test the client in
+    `web/src/lib/connectionsApi.test.ts` and the picker in
+    `web/src/shell/NewChatDialog.test.tsx`.
+11. Write the policy facet if the provider has its own policy. Register the
+    policy in a `POLICY_REGISTRY` that the engine scans, expose its handler path
+    as `POLICY` in the module that `facets.policy` names, and test that `POLICY`
+    is a registered handler.
 
 Run the provider layer's Python and web tests with:
 
 ```bash
-uv run --no-sync pytest tests/git_providers tests/runner/test_git_provider_protocol.py tests/runner/test_pr_resource.py
-pnpm --dir web exec vitest run src/lib/gitProviders.test.ts
+uv run --no-sync pytest tests/git_providers tests/runner/test_git_provider_protocol.py tests/runner/test_pr_resource.py tests/server/test_connections_registry.py tests/test_git_credential.py tests/server/routes/test_host_credentials.py
+pnpm --dir web exec vitest run src/lib/gitProviders.test.ts src/lib/capabilities.test.ts src/lib/connectionsApi.test.ts
 ```
