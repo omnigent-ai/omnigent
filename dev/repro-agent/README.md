@@ -15,11 +15,11 @@ reproduction test into **this** checkout.
 - `gh` authenticated (`gh auth login`) if your `bug_url` is a GitHub issue, so
   the agent can read the report.
 - Run it **from the root of your `omnigent-ai/omnigent` checkout** so the agent's
-  working directory is this repo and it can author tests into `tests/e2e_ui/` or
-  `tests/e2e/`.
+  working directory is this repo and it can reuse or extend the appropriate
+  existing test suite.
 - Optional, for reproduction recordings (skipped gracefully when absent):
-  Playwright browsers (`playwright install chromium`) so the authored e2e_ui
-  test can run with `--video on`, [`vhs`](https://github.com/charmbracelet/vhs)
+  Playwright browsers (`playwright install chromium`) for browser journey
+  recordings, [`vhs`](https://github.com/charmbracelet/vhs)
   for CLI-journey tapes, and `ffmpeg` for `.mp4` conversion.
 
 ## Usage
@@ -79,9 +79,9 @@ invocations below do not pause for registration or require those records.
    or a necessary e2e. It records the selection rationale and original evidence
    so Resolve can decide which tests ship. Two new test layers are not required.
 4. Records each settled facet on its user-facing surface under `recordings/<slug>/`
-   — a suitable journey driver with `--video on` for web/terminal facets, a rendered VHS
-   tape for CLI facets. The driver may be temporary and separate from the selected
-   regression test. A reproduced facet is filmed failing (before-fix footage
+   — a suitable journey driver with `OMNIGENT_E2E_RECORD_DIR` for web/terminal
+   facets, a rendered VHS tape for CLI facets. The driver may be temporary and
+   separate from the selected regression test. A reproduced facet is filmed failing (before-fix footage
    the fix step pairs with its after-fix re-recording); an already-fixed facet is
    filmed passing (proof-it-works footage). Best-effort: skipped (and noted) when
    the recorders aren't installed.
