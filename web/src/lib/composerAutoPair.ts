@@ -39,6 +39,8 @@ export interface PairEdit {
   pairs: AutoPair[];
   /** Markers to drop if typed next, right there (the rest of a stepped-over closer). */
   swallow?: Swallow | null;
+  /** A second edit, its own undo step, made after `edit`. */
+  then?: ComposerEdit;
 }
 
 /** `count` more of `char`, typed right at `at`, are dropped: they'd repeat a closer. */
@@ -54,7 +56,7 @@ const OPENING = new Set(["(", "[", "{", '"', "'", "“", "‘", "«"]);
 const CLOSING = new Set([")", "]", "}", '"', "'", "”", "’", "»", ".", ",", ";", ":", "!", "?"]);
 const SPACE_RE = /\s/u;
 const WORD_RE = /[\p{L}\p{N}_]/u;
-/** An otherwise empty line, containers aside: `` ` `` there may start a ``` fence. */
+/** An otherwise empty line, containers aside: a pair there may become a ``` fence. */
 const EMPTY_LINE_START_RE = /^(?:[ \t]*(?:>|[-+*](?=[ \t])|\d{1,9}[.)](?=[ \t])))*[ \t]*$/;
 
 export const isPairChar = (char: string | null | undefined): char is PairChar =>
@@ -104,8 +106,10 @@ export function pairsAround(pairs: readonly AutoPair[], caret: number): AutoPair
  *   `*` ends `**bold|**` (the tidy then trims stray spaces inside);
  * - where it can open a span, it inserts the closer (`*` to `*|*`).
  * An opener must follow a line start, whitespace or opening punctuation, and
- * precede whitespace, a line end or closing punctuation, outside code. A
- * backtick on an otherwise empty line isn't paired, so ``` still makes a fence.
+ * precede whitespace, a line end or closing punctuation, outside code. On an
+ * otherwise empty line, a third backtick in an empty ``|`` pair makes the
+ * code block ``` does: its closers go (one undo step), then the block's
+ * template comes (another), so one undo leaves ``` as typed.
  */
 export function pairAfterTyping(
   text: string,
@@ -118,7 +122,13 @@ export function pairAfterTyping(
   const at = pairs.find((pair) => pair.char === char && pair.close === caret);
   if (at) {
     const others = pairs.filter((pair) => pair !== at);
-    if (at.open + at.size === caret - 1 && at.size < MAX_SIZE[char])
+    const empty = at.open + at.size === caret - 1;
+    if (char === "`" && empty && at.size === MAX_SIZE["`"] && aloneOnLine(text, at)) {
+      const closers: ComposerEdit = { start: caret, end: caret + at.size, insert: "", caret };
+      const fence = codeFenceAfterTyping(applyEdit(text, closers), caret);
+      if (fence) return { edit: closers, then: fence, pairs: others };
+    }
+    if (empty && at.size < MAX_SIZE[char])
       return {
         edit: { start: caret, end: caret, insert: char, caret },
         pairs: [...others, { ...at, size: at.size + 1 }],
@@ -141,11 +151,6 @@ export function pairAfterTyping(
   const after = text[caret] ?? "\n";
   if (!(before === "\n" || SPACE_RE.test(before) || OPENING.has(before))) return null;
   if (!(after === "\n" || SPACE_RE.test(after) || CLOSING.has(after))) return null;
-  if (char === "`") {
-    const newline = text.indexOf("\n", caret);
-    const rest = text.slice(caret, newline === -1 ? text.length : newline);
-    if (EMPTY_LINE_START_RE.test(text.slice(lineStart, caret - 1)) && rest === "") return null;
-  }
   // Typed inside code (or a fence), a marker is code text; after an open run
   // of it in the paragraph, it's likely that run's closer (the tidy and the
   // `**` completion handle it).
@@ -160,6 +165,14 @@ export function pairAfterTyping(
       { char, open: caret - 1, close: caret, size: 1 },
     ],
   };
+}
+
+/** Whether a pair is all its line holds, after the line's containers (`>`, list items). */
+function aloneOnLine(text: string, pair: AutoPair): boolean {
+  const lineStart = text.lastIndexOf("\n", pair.open - 1) + 1;
+  const newline = text.indexOf("\n", pair.close);
+  const rest = text.slice(pair.close + pair.size, newline === -1 ? text.length : newline);
+  return rest === "" && EMPTY_LINE_START_RE.test(text.slice(lineStart, pair.open));
 }
 
 /**
@@ -421,7 +434,7 @@ export function editAfterKeystroke(
   caret: number,
   typed: string,
   state: PairState,
-): { edit: ComposerEdit | null; state: PairState } {
+): { edit: ComposerEdit | null; then?: ComposerEdit; state: PairState } {
   const { pairs, swallow } = state;
   // The rest of a closer that landed anyway (no `beforeinput` dropped it).
   if (swallow && typed === swallow.char && swallow.at === caret - 1) {
@@ -443,7 +456,11 @@ export function editAfterKeystroke(
   if (fence) return { edit: fence, state: NO_PAIRS };
   const paired = pairAfterTyping(text, caret, pairs);
   if (paired)
-    return { edit: paired.edit, state: { pairs: paired.pairs, swallow: paired.swallow ?? null } };
+    return {
+      edit: paired.edit,
+      then: paired.then,
+      state: { pairs: paired.pairs, swallow: paired.swallow ?? null },
+    };
   const complete = typed === "*" ? completeBoldAfterTyping(text, caret) : null;
   if (complete)
     return {
