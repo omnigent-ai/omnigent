@@ -8,6 +8,7 @@ import { BRAND_HARNESSES, type BrandHarness } from "@/components/onboarding/harn
 import type { Host } from "@/hooks/useHosts";
 import { fetchSkills, skillsQueryKey, type SkillsTarget } from "@/hooks/useSkills";
 import { authenticatedFetch } from "@/lib/identity";
+import { ApiError } from "@/lib/sessionsApi";
 import type { SkillSummary } from "@/lib/types";
 
 /** The native spelling each brand family reports readiness and skills under. */
@@ -78,7 +79,9 @@ async function fetchMcpServers(hostId: string, signal: AbortSignal): Promise<Mcp
   const response = await authenticatedFetch(`/v1/hosts/${encodeURIComponent(hostId)}/mcp-servers`, {
     signal,
   });
-  if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
+  if (!response.ok) {
+    throw new ApiError(`${response.status} ${response.statusText}`, response.status, null);
+  }
   const body = (await response.json()) as { mcp_servers?: McpServerWire[] };
   if (!Array.isArray(body.mcp_servers)) throw new Error("Invalid host MCP servers response");
   return body.mcp_servers;
@@ -158,6 +161,19 @@ export function buildInventoryContext(
   return context;
 }
 
+/** The server answers 409 while the host's tunnel isn't connected yet. */
+function isHostAbsent(error: unknown): boolean {
+  return error instanceof ApiError && error.status === 409;
+}
+
+// A host listed online can still be registering its tunnel; retry for about a minute.
+const CONNECTING_RETRIES = 30;
+const CONNECTING_RETRY_MS = 2_000;
+
+function retryWhileConnecting(failureCount: number, error: unknown): boolean {
+  return isHostAbsent(error) && failureCount < CONNECTING_RETRIES;
+}
+
 const EMPTY_CONTEXT: HarnessInventoryContext = {
   credentials: [],
   mcps: [],
@@ -165,11 +181,21 @@ const EMPTY_CONTEXT: HarnessInventoryContext = {
   plugins: [],
 };
 
+interface HarnessInventoryOptions {
+  enabled?: boolean;
+  /**
+   * Report a host that's offline, unlisted, or answering 409 as still
+   * loading, for a host that's expected to connect shortly.
+   */
+  awaitConnection?: boolean;
+}
+
 /** Discover what each harness on *host* carries into Omnigent sessions. */
 export function useHarnessInventory(
   host: Host | null | undefined,
-  { enabled = true }: { enabled?: boolean } = {},
+  { enabled = true, awaitConnection = false }: HarnessInventoryOptions = {},
 ): HarnessInventory {
+  const retry = awaitConnection ? retryWhileConnecting : false;
   const online = enabled && host != null && host.status === "online";
   const harnesses = useMemo(() => (online ? installedHarnesses(host) : []), [online, host]);
   const skills = useQueries({
@@ -183,7 +209,8 @@ export function useHarnessInventory(
         queryKey: skillsQueryKey(target),
         queryFn: ({ signal }: { signal: AbortSignal }) => fetchSkills(target, signal),
         staleTime: 30_000,
-        retry: false,
+        retry,
+        retryDelay: CONNECTING_RETRY_MS,
       };
     }),
     // Structurally shared, so `data` keeps its identity until a catalog changes.
@@ -197,7 +224,8 @@ export function useHarnessInventory(
     queryKey: ["host-mcp-servers", host?.host_id],
     queryFn: online ? ({ signal }) => fetchMcpServers(host.host_id, signal) : skipToken,
     staleTime: 30_000,
-    retry: false,
+    retry,
+    retryDelay: CONNECTING_RETRY_MS,
   });
 
   const loading = online && (mcpQuery.isPending || skills.pending);
@@ -217,7 +245,13 @@ export function useHarnessInventory(
   if (online && mcpQuery.isError) unavailable.push("mcps");
   if (online && skills.failed) unavailable.push("skills");
   return {
-    status: !online ? "offline" : loading ? "loading" : "ready",
+    status: !online
+      ? enabled && awaitConnection
+        ? "loading"
+        : "offline"
+      : loading
+        ? "loading"
+        : "ready",
     context,
     unavailable,
     isEmpty: context.mcps.length + context.skills.length + context.plugins.length === 0,

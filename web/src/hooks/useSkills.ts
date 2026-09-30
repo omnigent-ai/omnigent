@@ -1,5 +1,6 @@
 import { skipToken, useQuery } from "@tanstack/react-query";
 import { authenticatedFetch } from "@/lib/identity";
+import { ApiError } from "@/lib/sessionsApi";
 import type { Session, SkillSummary, SkillsStatus } from "@/lib/types";
 
 export type SkillsTarget =
@@ -32,7 +33,9 @@ export async function fetchSkills(
       : new URLSearchParams({ host_id: target.hostId, harness: target.harness, path: target.path });
   if (target.agentId !== undefined) params.set("agent_id", target.agentId);
   const response = await authenticatedFetch(`/v1/skills?${params}`, { signal });
-  if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
+  if (!response.ok) {
+    throw new ApiError(`${response.status} ${response.statusText}`, response.status, null);
+  }
   const body = (await response.json()) as { skills?: SkillSummary[] };
   if (!Array.isArray(body.skills)) throw new Error("Invalid host skills response");
   return body.skills;

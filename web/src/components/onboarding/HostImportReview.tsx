@@ -1,39 +1,45 @@
 // Wires the import modal to a real host: the reviewable dialog Settings opens,
-// and the gate that opens it once for each newly connected host.
+// and the gate that opens it for a requested host or once per newly connected host.
 
 import { useEffect, useState } from "react";
 import { ImportContextModal } from "@/components/onboarding/ImportContextModal";
 import { Button } from "@/components/ui/button";
 import { useHarnessInventory, type HarnessInventory } from "@/hooks/useHarnessInventory";
 import { useHosts, type Host } from "@/hooks/useHosts";
-import { importsReviewed, markImportsReviewed } from "@/lib/importReviewState";
+import {
+  clearImportReviewRequest,
+  importsReviewed,
+  markImportsReviewed,
+  useImportReviewRequest,
+} from "@/lib/importReviewState";
 
 function InventoryModal({
-  host,
+  hostId,
+  hostName,
   inventory,
   open,
   onOpenChange,
-  showHostName,
 }: {
-  host: Host;
+  hostId: string;
+  /** Shown when the user has several machines. */
+  hostName?: string;
   inventory: HarnessInventory;
   open: boolean;
   onOpenChange: (open: boolean) => void;
-  showHostName: boolean;
 }) {
   return (
     <ImportContextModal
       open={open}
       onOpenChange={(next) => {
         // Confirm and dismiss both count as reviewed.
-        if (!next) markImportsReviewed(host.host_id);
+        if (!next) markImportsReviewed(hostId);
         onOpenChange(next);
       }}
       onConfirm={() => {}}
       context={inventory.context}
       status={inventory.status}
       unavailable={inventory.unavailable}
-      hostName={showHostName ? host.name : undefined}
+      hostName={hostName}
     />
   );
 }
@@ -53,20 +59,47 @@ export function HostImportsDialog({
   const inventory = useHarnessInventory(host, { enabled: open });
   return (
     <InventoryModal
-      host={host}
+      hostId={host.host_id}
+      hostName={showHostName ? host.name : undefined}
       inventory={inventory}
       open={open}
       onOpenChange={onOpenChange}
-      showHostName={showHostName}
     />
   );
 }
 
 /**
- * Opens the import modal the first time this device sees an online,
- * user-connected host whose harnesses bring MCPs, skills, or plugins.
+ * Opens the import modal for the host passed to `requestImportReview`, or
+ * otherwise the first time this device sees an online, user-connected host
+ * whose harnesses bring MCPs, skills, or plugins.
  */
 export function ImportReviewGate() {
+  const requestedHostId = useImportReviewRequest();
+  if (requestedHostId !== null) {
+    return <RequestedImportReview key={requestedHostId} hostId={requestedHostId} />;
+  }
+  return <NewHostImportReview />;
+}
+
+/** Shows only the requested host, loading until it connects; never another host. */
+function RequestedImportReview({ hostId }: { hostId: string }) {
+  const { data: hosts } = useHosts();
+  const host = hosts?.find((candidate) => candidate.host_id === hostId) ?? null;
+  const inventory = useHarnessInventory(host, { awaitConnection: true });
+  return (
+    <InventoryModal
+      hostId={hostId}
+      hostName={host && (hosts?.length ?? 0) > 1 ? host.name : undefined}
+      inventory={inventory}
+      open
+      onOpenChange={(next) => {
+        if (!next) clearImportReviewRequest();
+      }}
+    />
+  );
+}
+
+function NewHostImportReview() {
   const { data: hosts } = useHosts();
   const [openHostId, setOpenHostId] = useState<string | null>(null);
   // Hosts with nothing to show this session; they're rechecked on the next load.
@@ -98,13 +131,13 @@ export function ImportReviewGate() {
   if (candidate === null || openHostId === null) return null;
   return (
     <InventoryModal
-      host={candidate}
+      hostId={candidate.host_id}
+      hostName={(hosts?.length ?? 0) > 1 ? candidate.name : undefined}
       inventory={inventory}
       open
       onOpenChange={(next) => {
         if (!next) setOpenHostId(null);
       }}
-      showHostName={(hosts?.length ?? 0) > 1}
     />
   );
 }
