@@ -148,3 +148,38 @@ async def test_turn_refresh_is_best_effort(tmp_path: Path, monkeypatch) -> None:
     # Turn still completes; the swallowed mint error means no rewrite was tried.
     assert len(events) == 1 and isinstance(events[0], TurnComplete)
     assert called == []
+
+
+async def test_run_turn_queues_routed_model_before_message(tmp_path: Path) -> None:
+    """A Smart Routing pick (``config.model``) switches Pi before the turn runs.
+
+    The composer path routes a web message server-side and forwards the pick
+    as ``model_override`` → ``ExecutorConfig.model``. The executor must queue a
+    ``model_change`` that the extension's sorted inbox scan reads BEFORE the
+    message, or the routed turn would silently run on the old model.
+    """
+    import json
+
+    from omnigent.inner.executor import ExecutorConfig
+
+    ex = pne.PiNativeExecutor(bridge_dir=tmp_path)
+    config = ExecutorConfig(model="omnigent/databricks-claude-haiku-4-5")
+    [_ async for _ in ex.run_turn([{"role": "user", "content": "hi"}], [], "", config=config)]
+
+    queued = [json.loads(p.read_text()) for p in sorted((tmp_path / "inbox").glob("*.json"))]
+    assert [(q["type"], q.get("model") or q.get("content")) for q in queued] == [
+        ("model_change", "omnigent/databricks-claude-haiku-4-5"),
+        ("user_message", "hi"),
+    ]
+
+
+async def test_run_turn_without_model_queues_only_message(tmp_path: Path) -> None:
+    import json
+
+    from omnigent.inner.executor import ExecutorConfig
+
+    ex = pne.PiNativeExecutor(bridge_dir=tmp_path)
+    [_ async for _ in ex.run_turn([{"role": "user", "content": "hi"}], [], "", ExecutorConfig())]
+
+    queued = [json.loads(p.read_text()) for p in (tmp_path / "inbox").glob("*.json")]
+    assert [q["type"] for q in queued] == ["user_message"]

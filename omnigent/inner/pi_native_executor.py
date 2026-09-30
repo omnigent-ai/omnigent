@@ -9,6 +9,7 @@ from pathlib import Path
 from omnigent.harnesses.pi_native.bridge import (
     PI_NATIVE_BRIDGE_DIR_ENV_VAR,
     PI_NATIVE_REQUEST_SESSION_ID_ENV_VAR,
+    enqueue_model_change,
     enqueue_user_message,
     refresh_config_auth_headers,
 )
@@ -88,16 +89,24 @@ class PiNativeExecutor(Executor):
             Pi owns its configured tool surface.
         :param system_prompt: System prompt from the agent spec. Ignored
             because the native Pi terminal controls its own prompt/settings.
-        :param config: Per-turn executor config. Unused.
+        :param config: Per-turn executor config. Only ``config.model`` is
+            used: a Smart Routing pick for this turn (the adapter maps
+            ``request.model_override`` onto it). It is queued as a
+            ``model_change`` ahead of the message, and the extension holds
+            the message's turn until that switch settles, so the routed turn
+            runs on the routed model.
         :yields: :class:`TurnComplete` after the input was queued, or an
             :class:`ExecutorError` when no user text can be sent.
         """
-        del tools, system_prompt, config
+        del tools, system_prompt
         text = _latest_user_text(messages, self._bridge_dir)
         if not text:
             yield ExecutorError(message="Pi native turn had no user text to send")
             return
         self._refresh_auth_headers()
+        model = config.model if config is not None else None
+        if model:
+            enqueue_model_change(self._bridge_dir, model)
         enqueue_user_message(self._bridge_dir, text)
         yield TurnComplete(response=None)
 
