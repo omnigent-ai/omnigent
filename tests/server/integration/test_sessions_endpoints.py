@@ -37,6 +37,7 @@ from omnigent.host.frames import HostHelloFrame
 from omnigent.llms.context_window import ModelPricing
 from omnigent.native.native_coding_agents import CLAUDE_NATIVE_AGENT_NAME
 from omnigent.runner.transports.ws_tunnel.frames import EventBatchFrame
+from omnigent.runtime import inflight_text
 from omnigent.runtime.tool_output import MAX_TOOL_OUTPUT_BYTES
 from omnigent.server.background_session_titles import BackgroundTitleRequest
 from omnigent.server.routes._sessions.helpers import (
@@ -6141,6 +6142,46 @@ async def test_post_external_output_text_delta_carries_streaming_identifiers(
                 "final": False,
             },
         )
+    ]
+
+
+async def test_native_final_item_retires_server_preview_without_text_matching(
+    client: httpx.AsyncClient,
+) -> None:
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    session_id = session["id"]
+    preview = await client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={
+            "type": "external_output_text_delta",
+            "data": {"delta": "final suffix", "message_id": "m1", "index": 42, "final": True},
+        },
+    )
+    assert preview.status_code == 202
+    assert inflight_text.snapshot_for(session_id)
+
+    completed = await client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={
+            "type": "external_conversation_item",
+            "data": {
+                "source_id": "transcript-item-1",
+                "item_type": "message",
+                "response_id": "resp_1",
+                "item_data": {
+                    "role": "assistant",
+                    "agent": "claude-native-ui",
+                    "content": [{"type": "output_text", "text": "old prefix final suffix"}],
+                },
+            },
+        },
+    )
+    assert completed.status_code == 202
+    assert inflight_text.snapshot_for(session_id) == []
+    items = (await client.get(f"/v1/sessions/{session_id}/items")).json()["data"]
+    assert [item["content"][0]["text"] for item in items if item.get("type") == "message"] == [
+        "old prefix final suffix"
     ]
 
 

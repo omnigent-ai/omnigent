@@ -2969,6 +2969,12 @@ def _publish_external_conversation_item(
             # Hidden context on a non-user message has no live rendering
             # path that filters on the flag, so keep it off the stream.
             return
+    if (
+        item.type == "message"
+        and isinstance(item.data, MessageData)
+        and item.data.role == "assistant"
+    ):
+        inflight_text.retire_native_previews(session_id)
     event = OutputItemDoneEvent(type="response.output_item.done", item=item.to_api_dict())
     payload = event.model_dump()
     if message_id is not None:
