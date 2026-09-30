@@ -98,7 +98,10 @@ Once the set is genuinely green:
    conventions. Before omitting an investigative test introduced for this task,
    retain its original paths, command, tested revision, result, and source under
    `.omnigent/repro-evidence/`, or cite the intact CI repro baseline/bundle.
-   Confirm the evidence remains retrievable after the original worktree is gone.
+   Follow the [evidence retention rules in 2B.4](../resolve-author-fix/SKILL.md#2b4--select-permanent-regression-coverage):
+   identify the CI run/artifact/path or verified persistent local copy, and
+   distinguish pending workflow upload from confirmed storage. A worktree-local
+   path alone is not durable; preserve that worktree if retention is unresolved.
    Put selected committed tests in `tests` and the selection/evidence location in
    `test_audit`; no reproduction-only source is required in the PR. This does not
    authorize deleting existing repository tests solely to reduce LOC.

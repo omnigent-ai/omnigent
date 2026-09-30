@@ -73,8 +73,9 @@ would make that extension misleading. Keep investigation history in evidence
 and test comments short. Reuse unchanged coverage when sufficient; there is no
 requirement for a new test file or both a new e2e and a smaller test.
 
-Start with an edit to the nearest compatible scenario: preserve its existing
-assertions and add the regression input, seed records, or missing assertion.
+When existing coverage is insufficient, start with an edit to the nearest
+compatible scenario: preserve its existing assertions and add the regression
+input, seed records, or missing assertion. Leave sufficient coverage unchanged.
 Needing richer data does not make its journey incompatible. Keep a separate
 scenario only for a concrete ordering, lifecycle, or isolation conflict; name
 that conflict and the nearest existing test in `test_audit`. Before final
@@ -100,11 +101,27 @@ a behavioral failure.
 
 Preserve investigation-only reproduction source and logs before omitting a
 test introduced for this task from the final diff. Do not delete existing
-repository coverage just to reduce LOC. Use `.omnigent/repro-evidence/` with
-original paths, commands, exact tested revision, and results, or cite the intact
-CI repro baseline/bundle.
-This archive is separate from the selected permanent tests; it must remain
-retrievable after the original worktree is removed. On retries, preserve the
+repository coverage just to reduce LOC. Stage evidence in
+`.omnigent/repro-evidence/` with original paths, commands, exact tested revision,
+and results, or cite an intact CI repro baseline/bundle. This worktree-local
+directory alone does not survive worktree deletion. Record the retrieval
+location and retention status in `test_audit`:
+
+- Under the compatible internal Resolve workflow, evidence is captured as
+  `repro-evidence/` inside the GitHub Actions artifact `resolve-bundle-<run-id>`.
+  This includes ticket-only and `skip_push` runs; it needs no upstream Repro
+  bundle. Record the workflow run URL, artifact name, and path within it. The
+  workflow uploads after the session, so mark that upload pending until it is
+  confirmed; a staged directory is not proof of a successful upload. Retrieval
+  is subject to the artifact's retention period.
+- For local or direct runs without that collector, copy the evidence to an
+  authorized persistent location outside the disposable worktree, verify the
+  copied files, and record its absolute path or retrievable artifact URL. In
+  `skip_push` mode keep this local; do not publish evidence as a workaround.
+  If no such destination is available, preserve the worktree and report the
+  unresolved retention requirement instead of claiming a durable archive.
+
+Keep this archive separate from the permanent tests. On retries, preserve the
 selection and retained evidence instead of reinstating the omitted source.
 
 - Tests of the reported bug must **fail on the unfixed code and pass with your

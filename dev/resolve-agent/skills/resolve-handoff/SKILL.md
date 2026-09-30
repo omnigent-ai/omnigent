@@ -54,7 +54,7 @@ the message. Same discipline as repro-agent:
      "caption": "open the model picker → select the catalog → picker now shows friendly names"}
   ],
   "recording_unavailable_reason": "",
-  "test_audit": "Reused the display-label regression; the same assertions fail on base and pass on head. Browser reproduction source, command, revisions, and results are retained in .omnigent/repro-evidence/. No additional browser boundary was found.",
+  "test_audit": "Reused the display-label regression; the same assertions fail on base and pass on head. Browser reproduction evidence is staged in .omnigent/repro-evidence/; workflow upload is pending at <workflow run URL>, artifact resolve-bundle-<run-id>, path repro-evidence/. No additional browser boundary was found.",
   "impact_assessment": {
     "base_sha": "<full target-branch tip SHA>",
     "head_sha": "<full candidate HEAD SHA>",
@@ -148,7 +148,9 @@ Field meanings:
   Do not list artifact-only reproduction paths here. In comment-only review,
   keep the existing review procedure and do not commit temporary test source.
   Use `test_audit` for brief selection reasoning: reused/retained tests, why any
-  new permanent e2e is necessary, reproduction-only artifact locations, and gaps.
+  new permanent e2e is necessary, and gaps. For reproduction-only evidence, give
+  the run URL/artifact/path or verified persistent local path from 2B.4, plus
+  its retention status; identify pending uploads and unresolved retention.
 - `recordings` — your after-fix clips (`kind: "after"`) and any recovered
   before-clips, using `{surface, kind, path, format, capture_mode, caption}`.
   Follow the recording rules in Step 2B.5 on both author and review runs; in
