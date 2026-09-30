@@ -123,6 +123,29 @@ def test_prompt_references_readable_guidance_from_checkout(
     assert reference.read_text(encoding="utf-8") == contents
 
 
+@pytest.mark.parametrize(
+    ("labels", "expected"),
+    [
+        ([{"name": "intentional-api-break"}, {"name": "ci"}], "intentional-api-break, ci"),
+        ([], "(none)"),
+    ],
+    ids=["labeled", "unlabeled"],
+)
+def test_prompt_lists_pr_labels_for_compat_waiver(
+    prompt_workspace: Path, labels: list[dict[str, str]], expected: str
+) -> None:
+    (prompt_workspace / "docs/DATABASE_BEST_PRACTICES.md").write_text("# Database practices\n")
+    meta_path = prompt_workspace / "artifacts/pr_meta.json"
+    meta_path.write_text(json.dumps({**json.loads(meta_path.read_text()), "labels": labels}))
+
+    result = _generate_prompt(prompt_workspace, "MEMBER")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    prompt = (prompt_workspace / "artifacts/review_prompt.txt").read_text()
+    assert f"- **Labels:** {expected}\n" in prompt
+    assert "`intentional-api-break` label" in prompt
+
+
 @pytest.mark.parametrize("failure", ["blank", "directory", "invalid-utf8"])
 def test_prompt_generation_fails_without_usable_guidance(
     prompt_workspace: Path, failure: str

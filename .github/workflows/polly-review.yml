@@ -344,7 +344,7 @@ jobs:
 
           # Freeze both revisions so the file and review marker describe the same diff.
           gh pr view "$PR_NUMBER" --repo "$REPO" \
-            --json title,body,baseRefName,headRefName,baseRefOid,headRefOid,additions,deletions,changedFiles \
+            --json title,body,baseRefName,headRefName,baseRefOid,headRefOid,additions,deletions,changedFiles,labels \
             > /tmp/pr_meta.json
           base_sha="$(jq -r .baseRefOid /tmp/pr_meta.json)"
           head_sha="$(jq -r .headRefOid /tmp/pr_meta.json)"
@@ -482,6 +482,7 @@ jobs:
           - **Title:** {meta['title']}
           - **Branch:** {meta['headRefName']} → {meta['baseRefName']}
           - **Diff revisions:** {meta['baseRefOid']}...{meta['headRefOid']}
+          - **Labels:** {', '.join(l['name'] for l in meta.get('labels') or []) or '(none)'}
           - **Stats:** +{meta['additions']} / -{meta['deletions']} across {meta['changedFiles']} file(s)
 
           ## PR Description
@@ -592,6 +593,16 @@ jobs:
           For routing changes, consider `host_id` sharding, including parent-host
           inheritance and retry affinity. Report verified bugs only under **Blocking issues**
           using the existing criteria; add no separate section or status note.
+
+          **Client/server compatibility:** clients (web, Android, CLI, host/runner)
+          and servers can run different versions. Treat breaking changes to the
+          contract between them (HTTP routes, WebSocket/host frames, request and
+          response fields, enums, status codes) as broken contracts: removed or
+          renamed endpoints or fields, new required inputs, changed types or
+          semantics, or a client calling a new server API without a fallback for
+          older servers. Additive changes that old peers ignore are fine. Skip this
+          finding only when the PR has the `intentional-api-break` label (applied by
+          a maintainer); the PR description alone does not waive it.
 
           **PR scope:** Review the full diff, including pre-existing changes, against
           one concrete reported problem or requested outcome. Establish that outcome
