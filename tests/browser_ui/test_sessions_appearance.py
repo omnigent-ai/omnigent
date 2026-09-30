@@ -98,10 +98,14 @@ def sessions_url(appearance_url: str, browser_contract: BrowserContract) -> tupl
         "/v1/sessions",
         {**empty_list, "data": sessions, "first_id": session_ids[0], "last_id": session_ids[-1]},
     )
+    # The sliding header can hover-open agent info while the workspace panel toggles.
+    browser_contract.json("/v1/policy-registry", empty_list)
     for session in sessions:
         session_id = session["id"]
         browser_contract.json(f"/v1/sessions/{session_id}", session)
         browser_contract.json(f"/v1/sessions/{session_id}/items", empty_list)
+        browser_contract.json(f"/v1/sessions/{session_id}/policies", empty_list)
+        browser_contract.json(f"/v1/sessions/{session_id}/owner", {"owner": None})
         browser_contract.json(
             f"/v1/sessions/{session_id}/agent",
             {
