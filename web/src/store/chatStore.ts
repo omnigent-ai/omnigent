@@ -5128,16 +5128,30 @@ export async function startStreamPump(
   nativePreviewTombstonesByController.set(controller, ignoredNativeMessageIds);
   let failedOpens = 0;
   let statusReconcileInFlight = false;
+  // Shared by the periodic reconcile and the post-reconnect catch-up burst so
+  // reconciliations stay serialized: a catch-up tick that straddles a slow
+  // snapshot fetch (or the periodic tick) is skipped rather than issuing a
+  // duplicate concurrent backfill.
+  const runGuardedStatusReconcile = (): void => {
+    if (statusReconcileInFlight) return;
+    statusReconcileInFlight = true;
+    void reconcileActiveSessionStatus(id, controller, set, get).finally(() => {
+      statusReconcileInFlight = false;
+    });
+  };
   const statusReconcileTimer =
     typeof window === "undefined"
       ? null
-      : window.setInterval(() => {
-          if (statusReconcileInFlight) return;
-          statusReconcileInFlight = true;
-          void reconcileActiveSessionStatus(id, controller, set, get).finally(() => {
-            statusReconcileInFlight = false;
-          });
-        }, ACTIVE_SESSION_STATUS_RECONCILE_INTERVAL_MS);
+      : window.setInterval(runGuardedStatusReconcile, ACTIVE_SESSION_STATUS_RECONCILE_INTERVAL_MS);
+  // Pending post-reconnect catch-up timers. Tracked so each reconnect cancels
+  // the previous burst before scheduling a new one — otherwise recurring
+  // reconnects (the ~5-min ingress recycle) would accumulate timers on the
+  // long-lived controller. Cleared on teardown in the outer `finally`.
+  let catchupTimers: number[] = [];
+  const clearCatchupTimers = (): void => {
+    for (const timer of catchupTimers) window.clearTimeout(timer);
+    catchupTimers = [];
+  };
   // Consecutive 404s only — reset on any non-404 outcome (success or a
   // different-status failure), so a 404 has to persist across attempts to
   // count toward the cap below.
@@ -5330,15 +5344,15 @@ export async function startStreamPump(
           // idempotent, and scoped to the active conversation by
           // reconcileActiveSessionStatus itself.
           if (typeof window !== "undefined") {
-            for (const delayMs of RECONNECT_STATUS_CATCHUP_DELAYS_MS) {
-              const catchupTimer = window.setTimeout(() => {
+            // Cancel any prior burst so recurring reconnects don't accumulate
+            // timers on the long-lived controller.
+            clearCatchupTimers();
+            catchupTimers = RECONNECT_STATUS_CATCHUP_DELAYS_MS.map((delayMs) =>
+              window.setTimeout(() => {
                 if (controller.signal.aborted || isConversationDisposed(id)) return;
-                void reconcileActiveSessionStatus(id, controller, set, get);
-              }, delayMs);
-              controller.signal.addEventListener("abort", () => window.clearTimeout(catchupTimer), {
-                once: true,
-              });
-            }
+                runGuardedStatusReconcile();
+              }, delayMs),
+            );
           }
         }
         let reason = await pumpPromise;
@@ -5362,6 +5376,7 @@ export async function startStreamPump(
     }
   } finally {
     if (statusReconcileTimer !== null) window.clearInterval(statusReconcileTimer);
+    clearCatchupTimers();
     if (get().abortController === controller) {
       set({ abortController: null });
     }
