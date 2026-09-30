@@ -171,6 +171,7 @@ describe("sidebar Stop session item", () => {
       ctrlKey: false,
       pointerType: "mouse",
     });
+    fireEvent.keyDown(screen.getByTestId("session-display-menu"), { key: "ArrowRight" });
     fireEvent.click(screen.getByTestId("session-filter-shared"));
     openKebab();
     const item = screen.getByTestId("stop-conversation");

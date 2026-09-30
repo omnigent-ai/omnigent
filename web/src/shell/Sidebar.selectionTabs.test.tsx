@@ -52,6 +52,7 @@ function switchTo(testId: "sidebar-tab-mine" | "sidebar-tab-shared") {
     ctrlKey: false,
     pointerType: "mouse",
   });
+  fireEvent.keyDown(screen.getByTestId("session-display-menu"), { key: "ArrowRight" });
   fireEvent.click(screen.getByTestId(`session-filter-${value}`));
 }
 

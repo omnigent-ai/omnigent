@@ -664,6 +664,7 @@ describe("double-click to rename", () => {
       ctrlKey: false,
       pointerType: "mouse",
     });
+    fireEvent.keyDown(screen.getByTestId("session-display-menu"), { key: "ArrowRight" });
     fireEvent.click(screen.getByTestId("session-filter-shared"));
 
     fireEvent.dblClick(screen.getByRole("link", { name: /My Session/ }));
@@ -763,6 +764,7 @@ describe("leave a shared session", () => {
       ctrlKey: false,
       pointerType: "mouse",
     });
+    fireEvent.keyDown(screen.getByTestId("session-display-menu"), { key: "ArrowRight" });
     fireEvent.click(screen.getByTestId("session-filter-shared"));
   }
 
@@ -827,6 +829,7 @@ describe("leave a shared session", () => {
       ctrlKey: false,
       pointerType: "mouse",
     });
+    fireEvent.keyDown(screen.getByTestId("session-display-menu"), { key: "ArrowRight" });
     fireEvent.click(screen.getByTestId("session-filter-all"));
 
     fireEvent.contextMenu(screen.getByRole("link", { name: /My Session/ }));
@@ -850,6 +853,7 @@ describe("quick-archive owner gate", () => {
       ctrlKey: false,
       pointerType: "mouse",
     });
+    fireEvent.keyDown(screen.getByTestId("session-display-menu"), { key: "ArrowRight" });
     fireEvent.click(screen.getByTestId("session-filter-shared"));
 
     expect(screen.getByRole("link", { name: /My Session/ })).toBeInTheDocument();

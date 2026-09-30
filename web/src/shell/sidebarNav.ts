@@ -245,6 +245,58 @@ export function sortByUpdatedAtDesc(
   return [...conversations].sort((a, b) => effective(b) - effective(a));
 }
 
+/** Status groups, in the order the grouped sidebar renders them. */
+export const STATUS_BUCKETS = ["Needs attention", "Unread", "Working", "Draft", "Done"] as const;
+export type StatusBucket = (typeof STATUS_BUCKETS)[number];
+
+/** What a session needs from the viewer. `unseen` / `hasDraft` come from client stores. */
+export function statusBucket(c: Conversation, unseen: boolean, hasDraft: boolean): StatusBucket {
+  if ((c.pending_elicitations_count ?? 0) > 0 || c.status === "failed") return "Needs attention";
+  if (c.status === "running") return "Working";
+  if (unseen) return "Unread";
+  if (hasDraft) return "Draft";
+  return "Done";
+}
+
+export const UPDATED_BUCKETS = [
+  "Today",
+  "Yesterday",
+  "Previous 7 days",
+  "Previous 30 days",
+  "Older",
+] as const;
+export type UpdatedBucket = (typeof UPDATED_BUCKETS)[number];
+
+/** Bucket an `updated_at` (unix seconds) by local calendar day relative to `now`. */
+export function updatedBucket(updatedAt: number, now: Date): UpdatedBucket {
+  // Local midnights via the Date constructor, so DST days aren't an hour off.
+  const midnight = (daysAgo: number) =>
+    new Date(now.getFullYear(), now.getMonth(), now.getDate() - daysAgo).getTime();
+  const at = updatedAt * 1000;
+  if (at >= midnight(0)) return "Today";
+  if (at >= midnight(1)) return "Yesterday";
+  if (at >= midnight(7)) return "Previous 7 days";
+  if (at >= midnight(30)) return "Previous 30 days";
+  return "Older";
+}
+
+/** Split `rows` into non-empty groups in `order`, keeping input order within each group. */
+export function groupConversations<K extends string>(
+  rows: readonly Conversation[],
+  keyOf: (c: Conversation) => K | undefined,
+  order: readonly K[],
+): { title: K; conversations: Conversation[] }[] {
+  const byKey = new Map<K, Conversation[]>(order.map((key) => [key, []]));
+  for (const row of rows) {
+    const key = keyOf(row);
+    if (key !== undefined) byKey.get(key)?.push(row);
+  }
+  return order.flatMap((title) => {
+    const conversations = byKey.get(title) ?? [];
+    return conversations.length > 0 ? [{ title, conversations }] : [];
+  });
+}
+
 // Decide the next `activeOverride` value given the current route and
 // loaded conversations. Pulled out so the freeze behavior can be
 // unit-tested without driving a React render.
