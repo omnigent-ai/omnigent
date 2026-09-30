@@ -6947,9 +6947,11 @@ describe("NewChatLandingScreen", () => {
       await openRepoPopover();
 
       // One picker, named for GitHub, with no provider label line above it.
-      const picker = await screen.findByRole("combobox", { name: "GitHub repository" });
+      const section = await screen.findByTestId("new-chat-landing-repo-picker-github");
+      const picker = within(section).getByRole("combobox", { name: "GitHub repository" });
+      expect(picker).toHaveAttribute("data-testid", "new-chat-landing-repo-select");
       expect(screen.getAllByTestId("new-chat-landing-repo-select")).toHaveLength(1);
-      expect(within(picker.parentElement!).queryByText("GitHub")).toBeNull();
+      expect(within(section).queryByText("GitHub")).toBeNull();
       expect(fetchedUrls()).toContain("/v1/connections/github/repos");
 
       fireEvent.click(picker);
@@ -6968,6 +6970,7 @@ describe("NewChatLandingScreen", () => {
         "/v1/connections/github/repos": { connected: true, repos: [OCTO_HELLO] },
         "/v1/connections/fake_git/repos": {
           connected: true,
+          truncated: true,
           repos: [
             {
               full_name: "acme/widget",
@@ -7002,16 +7005,24 @@ describe("NewChatLandingScreen", () => {
       });
       await openRepoPopover();
 
-      // An id the frontend has no copy for is named by its id.
-      const github = await screen.findByRole("combobox", { name: "GitHub repository" });
-      const fake = await screen.findByRole("combobox", { name: "fake_git repository" });
+      // Each provider's picker sits in its own section and keeps the shared test
+      // ids, so two pickers are told apart by section.
+      const githubSection = await screen.findByTestId("new-chat-landing-repo-picker-github");
+      const fakeSection = await screen.findByTestId("new-chat-landing-repo-picker-fake_git");
       expect(screen.getAllByTestId("new-chat-landing-repo-select")).toHaveLength(2);
+      expect(
+        within(githubSection).getByRole("combobox", { name: "GitHub repository" }),
+      ).toBeVisible();
+      const fake = within(fakeSection).getByRole("combobox", { name: "Fake Git repository" });
+      expect(fake).toBe(within(fakeSection).getByTestId("new-chat-landing-repo-select"));
       expect(fetchedUrls()).toContain("/v1/connections/github/repos");
       expect(fetchedUrls()).toContain("/v1/connections/fake_git/repos");
-      // Two pickers get a label line each, so they can be told apart.
-      const scope = within(github.parentElement!);
-      expect(scope.getByText("GitHub")).toBeInTheDocument();
-      expect(scope.getByText("fake_git")).toBeInTheDocument();
+      // Two pickers get a label line each, from the server's display names.
+      expect(within(githubSection).getByText("GitHub")).toBeVisible();
+      expect(within(fakeSection).getByText("Fake Git")).toBeVisible();
+      // The truncated note lands in the section of the list that was cut short.
+      expect(within(fakeSection).getByTestId("new-chat-landing-repo-truncated")).toBeVisible();
+      expect(within(githubSection).queryByTestId("new-chat-landing-repo-truncated")).toBeNull();
 
       fireEvent.click(fake);
       await screen.findByRole("option", { name: /acme\/widget/ });
@@ -7133,6 +7144,7 @@ describe("NewChatLandingScreen", () => {
 
       await screen.findByRole("combobox", { name: "GitHub repository" });
       expect(screen.getAllByTestId("new-chat-landing-repo-select")).toHaveLength(1);
+      expect(screen.queryByTestId("new-chat-landing-repo-picker-azure_devops")).toBeNull();
       expect(fetchedUrls()).not.toContain("/v1/connections/azure_devops/repos");
     });
 
@@ -7171,11 +7183,54 @@ describe("NewChatLandingScreen", () => {
       });
       await openRepoPopover();
 
-      expect(await screen.findByTestId("new-chat-landing-repo-error")).toHaveTextContent(
+      const githubSection = await screen.findByTestId("new-chat-landing-repo-picker-github");
+      expect(within(githubSection).getByTestId("new-chat-landing-repo-error")).toHaveTextContent(
         "Couldn't load your GitHub repositories. Paste a repository URL below.",
       );
-      expect(screen.getByRole("combobox", { name: "fake_git repository" })).toBeVisible();
       expect(screen.queryByRole("combobox", { name: "GitHub repository" })).toBeNull();
+      const fakeSection = screen.getByTestId("new-chat-landing-repo-picker-fake_git");
+      expect(
+        within(fakeSection).getByRole("combobox", { name: "Fake Git repository" }),
+      ).toBeVisible();
+      expect(within(fakeSection).queryByTestId("new-chat-landing-repo-error")).toBeNull();
+    });
+
+    it("names a provider the app has no copy for by the server's display name", async () => {
+      mockConnectionFetch({ "/v1/connections/gitlab/repos": { connected: true, repos: [] } });
+      renderLanding({
+        managed_sandboxes_enabled: true,
+        git_providers: [gitProviderInfo("gitlab", "GitLab")],
+      });
+      await openRepoPopover();
+
+      const section = await screen.findByTestId("new-chat-landing-repo-picker-gitlab");
+      expect(within(section).getByRole("combobox", { name: "GitLab repository" })).toBeVisible();
+      expect(screen.queryByRole("combobox", { name: "gitlab repository" })).toBeNull();
+    });
+
+    it("uses the display name in the error for a provider the app has no copy for", async () => {
+      mockConnectionFetch({}, ["/v1/connections/gitlab/repos"]);
+      renderLanding({
+        managed_sandboxes_enabled: true,
+        git_providers: [gitProviderInfo("gitlab", "GitLab")],
+      });
+      await openRepoPopover();
+
+      const section = await screen.findByTestId("new-chat-landing-repo-picker-gitlab");
+      expect(within(section).getByTestId("new-chat-landing-repo-error")).toHaveTextContent(
+        "Couldn't load your GitLab repositories. Paste a repository URL below.",
+      );
+    });
+
+    it("falls back to the provider id when the display name is blank", async () => {
+      mockConnectionFetch({ "/v1/connections/gitlab/repos": { connected: true, repos: [] } });
+      renderLanding({
+        managed_sandboxes_enabled: true,
+        git_providers: [gitProviderInfo("gitlab", "  ")],
+      });
+      await openRepoPopover();
+
+      expect(await screen.findByRole("combobox", { name: "gitlab repository" })).toBeVisible();
     });
 
     it("notes a truncated repo list", async () => {

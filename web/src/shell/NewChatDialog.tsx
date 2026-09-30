@@ -7,7 +7,7 @@ import {
   HarnessPickerConfigPage,
   HarnessPickerSubContent,
 } from "@/components/composer/HarnessPicker";
-import { Fragment, type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate, useSearchParams } from "@/lib/routing";
 import {
   ComposerWorkspaceBar,
@@ -1030,7 +1030,7 @@ interface SandboxPickerRepo extends ConnectionRepo {
 /** One git provider's repo picker: its list state and the repos it can clone. */
 interface SandboxRepoSource {
   providerId: string;
-  /** Provider name for labels, e.g. "GitHub". */
+  /** The server's display name for the provider, e.g. "GitHub". */
   label: string;
   /** The caller has linked this provider's account. */
   connected: boolean;
@@ -2495,10 +2495,8 @@ export function NewChatLandingScreen() {
   }, []);
   // Free-text URL being typed into the "paste a URL" adder (not yet added).
   const [pendingRepoUrl, setPendingRepoUrl] = useState<string>("");
-  // For each git provider whose connection can list repositories, offer a
-  // picker over the caller's repos instead of only the free-text URL. The
-  // /repos endpoint returns `connected: false` when the account isn't linked,
-  // so reading `connected` off the payload doubles as the connection check.
+  // One repo picker per provider whose connection can list repositories;
+  // /repos answers `connected: false` for an unlinked account, which hides it.
   const repoBrowserProviders = useMemo(
     () =>
       info === "loading"
@@ -2520,7 +2518,7 @@ export function NewChatLandingScreen() {
     const connected = data?.connected ?? false;
     return {
       providerId: provider.id,
-      label: gitProviderCopy(provider.id).label,
+      label: provider.display_name.trim() || provider.id,
       connected,
       errored: isError,
       truncated: data?.truncated ?? false,
@@ -4946,10 +4944,8 @@ export function NewChatLandingScreen() {
     (branchName.trim() !== "" ||
       (worktreesEnabled && (hostWorktrees === undefined || hostWorktrees.length > 0)));
   const connectedRepoSources = sandboxRepoSources.filter((source) => source.connected);
-  // The connected-provider repo (if any) a selection URL names, so its row can
-  // offer that repo's branch list. Repos not in a picker (pasted URLs, or a
-  // repo the account lost access to) resolve to undefined and fall back to a
-  // free-text branch input.
+  // The listed repo a selection URL names, for its branch list. A pasted URL,
+  // or a repo the account lost, is unlisted and gets a free-text branch input.
   const repoForUrl = (url: string): { providerId: string; repo: SandboxPickerRepo } | undefined => {
     for (const source of connectedRepoSources) {
       const repo = source.repos.find((r) => r.clone_url === url.trim());
@@ -6030,54 +6026,59 @@ export function NewChatLandingScreen() {
                   slot and no multi-repo affordance. */}
                     {sandboxRepoSelections.length < maxSandboxRepos && (
                       <>
-                        {/* Add from a connected account's repos (only those
-                      not already picked); the free-text URL below is the
-                      fallback for a repo not in the list or no provider link.
-                      Several providers get one labelled picker each. */}
-                        {connectedRepoSources.map((source) => (
-                          <Fragment key={source.providerId}>
-                            {connectedRepoSources.length > 1 && (
-                              <span className="text-xs text-muted-foreground">{source.label}</span>
-                            )}
-                            <SandboxRepoCombobox
-                              providerLabel={source.label}
-                              repos={unselectedRepos(source)}
-                              value=""
-                              onSelect={(repo) => {
-                                if (repo) addSandboxRepo(repo.clone_url);
-                              }}
-                            />
-                            {source.truncated && (
-                              <p
-                                className="text-sm text-muted-foreground"
-                                data-testid="new-chat-landing-repo-truncated"
-                              >
-                                Showing your most recently pushed repositories. Don't see one? Paste
-                                its URL below.
-                              </p>
-                            )}
-                          </Fragment>
-                        ))}
+                        {/* One section per provider: its picker of repos not yet picked,
+                      or a note when its list failed, so that isn't read as "not connected". */}
+                        {sandboxRepoSources.map((source) => {
+                          const showError = source.errored && !source.connected;
+                          if (!source.connected && !showError) return null;
+                          return (
+                            <div
+                              key={source.providerId}
+                              className="flex flex-col gap-2"
+                              data-testid={`new-chat-landing-repo-picker-${source.providerId}`}
+                            >
+                              {showError ? (
+                                <p
+                                  className="text-sm text-destructive"
+                                  data-testid="new-chat-landing-repo-error"
+                                >
+                                  Couldn't load your {source.label} repositories. Paste a repository
+                                  URL below.
+                                </p>
+                              ) : (
+                                <>
+                                  {connectedRepoSources.length > 1 && (
+                                    <span className="text-xs text-muted-foreground">
+                                      {source.label}
+                                    </span>
+                                  )}
+                                  <SandboxRepoCombobox
+                                    providerLabel={source.label}
+                                    repos={unselectedRepos(source)}
+                                    value=""
+                                    onSelect={(repo) => {
+                                      if (repo) addSandboxRepo(repo.clone_url);
+                                    }}
+                                  />
+                                  {source.truncated && (
+                                    <p
+                                      className="text-sm text-muted-foreground"
+                                      data-testid="new-chat-landing-repo-truncated"
+                                    >
+                                      Showing your most recently pushed repositories. Don't see one?
+                                      Paste its URL below.
+                                    </p>
+                                  )}
+                                </>
+                              )}
+                            </div>
+                          );
+                        })}
                         {connectedRepoSources.length > 0 && (
                           <p className="text-sm text-muted-foreground">
                             or paste a repository URL:
                           </p>
                         )}
-                        {/* A provider's repo list failed to load: say so
-                      explicitly, so a transient error isn't mistaken for
-                      "not connected" (the picker just wouldn't render). */}
-                        {sandboxRepoSources
-                          .filter((source) => source.errored && !source.connected)
-                          .map((source) => (
-                            <p
-                              key={source.providerId}
-                              className="text-sm text-destructive"
-                              data-testid="new-chat-landing-repo-error"
-                            >
-                              Couldn't load your {source.label} repositories. Paste a repository URL
-                              below.
-                            </p>
-                          ))}
                         <div className="flex items-center gap-2">
                           <input
                             id="landing-repo-url"
