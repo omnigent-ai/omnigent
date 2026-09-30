@@ -28,12 +28,15 @@ class ConnectionProvider:
         to vend this provider's secret to a sandbox. ``None`` when the provider
         has no broker endpoint (connect-only, or on-demand delivery not built
         yet), in which case ``/hosts/{id}/credentials/{name}`` returns ``404``.
+    :param repo_browser: Whether the router lists the user's repositories for
+        the new-chat picker.
     """
 
     name: str
     client_factory: Callable[[Any], Any]
     router_factory: Callable[..., Any]
     credential_resolver: Callable[..., Awaitable[dict[str, Any] | None]] | None = None
+    repo_browser: bool = False
 
 
 def connection_providers() -> list[ConnectionProvider]:
@@ -56,6 +59,7 @@ def connection_providers() -> list[ConnectionProvider]:
             client_factory=facet.make_client,
             router_factory=facet.make_router,
             credential_resolver=facet.resolve_credential,
+            repo_browser=facet.repo_browser,
         )
         for provider_id, facet in connection_facets()
     ]

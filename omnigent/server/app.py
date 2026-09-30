@@ -161,6 +161,19 @@ class BrandingInfo(BaseModel):
     powered_by: bool
 
 
+class GitProviderCapabilitiesInfo(BaseModel):
+    pull_requests: bool
+    connection: bool
+    repo_browser: bool
+    credential_broker: bool
+
+
+class GitProviderInfo(BaseModel):
+    id: str
+    display_name: str
+    capabilities: GitProviderCapabilitiesInfo
+
+
 class ServerInfoResponse(BaseModel):
     accounts_enabled: bool
     single_user: bool
@@ -175,6 +188,9 @@ class ServerInfoResponse(BaseModel):
     # (multi-repo picker vs single). Providers absent from the map default off.
     sandbox_provider_capabilities: dict[str, dict[str, bool]] = {}
     enabled_connections: list[str]
+    # One entry per registered git provider, in registration order, naming the
+    # parts of it this server offers. The web keys the repo picker off these.
+    git_providers: list[GitProviderInfo]
     sharing_mode: Literal["on", "read_only", "restricted_read_only", "off"]
     public_sharing_enabled: bool
     server_version: str
@@ -2867,7 +2883,8 @@ def create_app(
         ``managed_sandboxes_enabled``, ``dictation_available``,
         ``single_user``), the short sandbox provider name
         (``sandbox_provider``) the web UI labels the new-session
-        sandbox option with, and the installed
+        sandbox option with, which parts of each git provider the
+        server offers (``git_providers``), and the installed
         ``server_version`` (already public via ``/api/version``).
         """
         from omnigent.server.auth import UnifiedAuthProvider, local_single_user_enabled
@@ -2937,6 +2954,14 @@ def create_app(
             if getattr(app.state, f"{provider.name}_config", None) is not None
             and getattr(app.state, f"{provider.name}_store", None) is not None
         ]
+        # git_providers: what each registered git provider offers here. Its
+        # ``connection`` flag uses the same condition as enabled_connections.
+        from omnigent.server.git_providers import git_provider_infos
+
+        git_providers = git_provider_infos(
+            enabled_connections,
+            {provider.name: provider.repo_browser for provider in _connection_providers},
+        )
         # sharing_mode is the server's session-sharing policy
         # (on/read_only/off), surfaced so the web app can hide the Share
         # control (off) or restrict it to read-only (read_only) in lockstep
@@ -3002,6 +3027,7 @@ def create_app(
                 "sandbox_providers": sandbox_providers,
                 "sandbox_provider_capabilities": sandbox_provider_capabilities,
                 "enabled_connections": enabled_connections,
+                "git_providers": git_providers,
                 "sharing_mode": sharing_mode.value,
                 "public_sharing_enabled": public_sharing_enabled,
                 "server_version": _server_version(),

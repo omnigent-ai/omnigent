@@ -6,14 +6,15 @@ as ``CONNECTION``. The server reads the facet's config from the environment,
 builds its connection store and API client, mounts its router under ``/v1``, and
 vends its credential to sandboxes through ``/v1/hosts/{host_id}/credentials/<id>``.
 The wired objects live on ``app.state.<id>_config``, ``<id>_store``, and
-``<id>_client``.
+``<id>_client``. :func:`git_provider_infos` describes every registered
+provider for ``/v1/info``.
 """
 
 from __future__ import annotations
 
 import functools
 import logging
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Collection, Iterator, Mapping
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 from omnigent.git_providers import load_facet, provider, providers
@@ -104,6 +105,39 @@ def connection_facets() -> Iterator[tuple[str, ConnectionFacet]]:
             )
             continue
         yield provider_id, facet
+
+
+def git_provider_infos(
+    enabled_connections: Collection[str], repo_browsers: Mapping[str, bool]
+) -> list[dict[str, object]]:
+    """Describe each registered git provider for ``/v1/info``, in registration order.
+
+    Only the descriptors are read, so no facet module is imported.
+
+    :param enabled_connections: Ids of the connections this server has enabled,
+        as in ``/v1/info``'s ``enabled_connections``.
+    :param repo_browsers: The ``repo_browser`` of each loaded connection facet, by id.
+    :returns: ``{"id", "display_name", "capabilities"}`` entries. ``capabilities``
+        has ``pull_requests``, ``connection``, ``repo_browser``, and
+        ``credential_broker``.
+    """
+    infos: list[dict[str, object]] = []
+    for descriptor in providers():
+        facets = descriptor.facets
+        connection = descriptor.id in enabled_connections
+        infos.append(
+            {
+                "id": descriptor.id,
+                "display_name": descriptor.display_name,
+                "capabilities": {
+                    "pull_requests": bool(facets.pull_requests),
+                    "connection": connection,
+                    "repo_browser": connection and repo_browsers.get(descriptor.id, False),
+                    "credential_broker": connection and bool(facets.credential),
+                },
+            }
+        )
+    return infos
 
 
 def _build_secret_cipher() -> SecretCipher | None:

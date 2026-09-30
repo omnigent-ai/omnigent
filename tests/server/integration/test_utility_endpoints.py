@@ -16,6 +16,8 @@ import httpx
 import pytest
 from fastapi import FastAPI
 
+from omnigent.git_providers.azure_devops import PROVIDER as AZURE_DEVOPS
+from omnigent.git_providers.github import PROVIDER as GITHUB
 from omnigent.server.feature_flags import Feature, FeatureFlags
 
 pytestmark = pytest.mark.asyncio
@@ -101,6 +103,21 @@ async def test_info_returns_expected_fields(client: httpx.AsyncClient) -> None:
     # conftest sets to "1" (the default local-dev posture), so it's true here.
     # The multi-user (marker-off) case is covered below.
     assert data["single_user"] is True
+    # git_providers lists every registered provider. The test app configures no
+    # connection, so each one offers only its pull requests.
+    assert data["git_providers"] == [
+        {
+            "id": descriptor.id,
+            "display_name": descriptor.display_name,
+            "capabilities": {
+                "pull_requests": True,
+                "connection": False,
+                "repo_browser": False,
+                "credential_broker": False,
+            },
+        }
+        for descriptor in (GITHUB, AZURE_DEVOPS)
+    ]
 
 
 async def test_info_single_user_false_without_marker(

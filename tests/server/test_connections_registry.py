@@ -31,6 +31,7 @@ from omnigent.git_providers import (
     register_provider,
     reset_for_tests,
 )
+from omnigent.git_providers.github import PROVIDER as GITHUB_PROVIDER
 from omnigent.host.identity import MANAGED_HOST_TOKEN_HEADER
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server import connections_registry
@@ -55,6 +56,8 @@ from omnigent.stores.host_store import HostStore
 from tests.server.github_app_fixtures import make_config
 
 _FACET_MODULE = "tests_server_fake_gitlab_connection"
+# Declared but never created: the server must not import a credential facet.
+_CREDENTIAL_MODULE = "tests_server_fake_gitlab_credential"
 _HOST = "gitlab.example.test"
 _CONFIG = {"instance": _HOST}
 _OWNER = "alice@example.com"
@@ -320,6 +323,56 @@ def test_enabled_connections_keep_the_registry_order(
     info = TestClient(app).get("/v1/info").json()
 
     assert info["enabled_connections"] == ["github", "gitlab", "databricks"]
+
+
+def test_info_offers_the_github_connection_and_repo_picker(db_uri: str, tmp_path: Path) -> None:
+    store = GithubConnectionStore(db_uri, _PlainCipher())
+    app = _app(db_uri, tmp_path, connections={"github": (make_config(), store)})
+
+    info = TestClient(app).get("/v1/info").json()
+    github, azure_devops = info["git_providers"]
+
+    assert info["enabled_connections"] == ["github"]
+    assert github == {
+        "id": "github",
+        "display_name": GITHUB_PROVIDER.display_name,
+        "capabilities": {
+            "pull_requests": True,
+            "connection": True,
+            "repo_browser": True,
+            # True once the GitHub descriptor declares its credential facet.
+            "credential_broker": bool(GITHUB_PROVIDER.facets.credential),
+        },
+    }
+    assert azure_devops["id"] == "azure_devops"
+    assert azure_devops["capabilities"]["connection"] is False
+
+
+@pytest.mark.parametrize("configured", [True, False])
+def test_info_describes_a_fake_provider_from_its_descriptor(
+    configured: bool, gitlab: FakeGitLabConnection, db_uri: str, tmp_path: Path
+) -> None:
+    descriptor = FakeGitLab(
+        facets=FacetModules(connection=_FACET_MODULE, credential=_CREDENTIAL_MODULE)
+    )
+    register_provider(descriptor)
+    store = FakeGitLabStore() if configured else None
+    app = _app(db_uri, tmp_path, connections={"gitlab": (_CONFIG, store)})
+
+    providers = TestClient(app).get("/v1/info").json()["git_providers"]
+
+    assert [provider["id"] for provider in providers] == ["github", "azure_devops", "gitlab"]
+    assert providers[-1] == {
+        "id": "gitlab",
+        "display_name": descriptor.display_name,
+        "capabilities": {
+            "pull_requests": False,
+            "connection": configured,
+            "repo_browser": False,
+            "credential_broker": configured,
+        },
+    }
+    assert _CREDENTIAL_MODULE not in sys.modules
 
 
 def test_the_deprecated_github_arguments_still_enable_github(db_uri: str, tmp_path: Path) -> None:
