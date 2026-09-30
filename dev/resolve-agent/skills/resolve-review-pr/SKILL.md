@@ -47,6 +47,15 @@ of the test. A passing repro alone does not prove the PR fixes the bug.
    un-stripped env, not a blocker: re-run with the `env -u` prefix from
    `dev/recording-lanes.md` first. A missing upstream before-clip is never that
    blocker. Never drop it silently.
+
+   A state you believe the PR head cannot reach is not on that list until you
+   have tried to reach it. Drive the fault injection with the recorder running
+   on the PR head — the fault the repro test injects, or the steps you would
+   give a maintainer in the 4.4 validation prompt — before you declare the state
+   unreachable; see "If recording is blocked" in `dev/recording-lanes.md`. If
+   the attempt fails, name the injection you ran and its observed result in
+   `recording_unavailable_reason`. The repro run's textual skip is not your
+   evidence: re-evaluate the surface yourself on the PR head.
 4. **Review the diff** for quality, not just green. Decide whether this is the
    **best practical approach** for the repository, not merely an approach that
    makes the reproduction pass. Identify the plausible alternatives suggested by

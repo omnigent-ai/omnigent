@@ -298,3 +298,31 @@ def test_recording_blockers_are_explicit_and_do_not_block_delivery() -> None:
     assert "name the specific blocker in `recording_unavailable_reason`" in normalized
     assert "Text-only CLI output is not a reason to skip recording" in normalized
     assert "Do not block the fix or PR because footage is missing or rejected" in normalized
+
+
+def test_resolve_recording_skips_require_trying_the_described_fault_injection() -> None:
+    skills = {skill.name: " ".join(skill.content.split()) for skill in load(_RESOLVE_AGENT).skills}
+    validation = " ".join(
+        (_RESOLVE_AGENT / "skills" / "resolve-drive-pr" / "validation-prompt.md")
+        .read_text(encoding="utf-8")
+        .split()
+    )
+
+    review = skills["resolve-review-pr"]
+    assert "is not on that list until you have tried to reach it" in review
+    assert "the steps you would give a maintainer in the 4.4 validation prompt" in review
+    assert "The repro run's textual skip is not your evidence" in review
+
+    author = skills["resolve-author-fix"]
+    assert "A state you can describe how to reach is not such an environment" in author
+    assert "name the injection you ran and its observed result" in author
+
+    assert "Cross-check the prompt against your recordings" in validation
+    assert (
+        "A recipe you can hand to a maintainer is never a journey you could not attempt"
+        in validation
+    )
+
+    handoff = skills["resolve-handoff"]
+    assert 'For a state the product "cannot reach", name the fault injection you drove' in handoff
+    assert "a reason inherited from the repro handoff, is not enough" in handoff

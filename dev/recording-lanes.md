@@ -54,6 +54,23 @@ Recording is **best-effort**:
   to show, set `recordings: []` for that facet. Name the specific blocker in
   `recording_unavailable_reason`, such as missing `vhs` or `ttyd`, or a server
   that cannot start.
+- **"The product cannot reach the state" is a claim you test, not a conclusion
+  you reason to.** For a `web` or `terminal` facet, a state you can describe how
+  to reach is reachable: the fault the reproduction test injects, or the steps
+  you would give a maintainer (kill the pane's tmux server so the runner marks
+  the terminal not running while its registration lingers, then bind the
+  rotation session the way `/clear` does). Drive that fault injection on the
+  recorder's own spawned server + runner, with the recorder running, before you
+  set `recordings: []`. A journey you can write into a validation prompt must be
+  tried with the recorder first. Reasoning that the state has "no user action or
+  product hook" is not a blocker, and neither is an earlier run's textual skip.
+- When that attempt fails, `recording_unavailable_reason` must name the fault
+  injection you actually ran and its observed result: the command, the error or
+  timeout, and the state it left the product in. When the only trigger you can
+  drive is a substitute for the user's own action — an API session bind standing
+  in for typing `/clear` in the dead pane — film it anyway and say in the clip's
+  caption what stood in for the user action, so a reviewer can judge whether it
+  stands for the typed journey; do not present it as that journey.
 - Text-only CLI output is not a reason to skip recording. A missing recording
   from an earlier run is not a reason either.
 - Do not block the verdict, fix, or PR because footage is missing or rejected.

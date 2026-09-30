@@ -166,6 +166,11 @@ Field meanings:
     and put the written before/after evidence in the PR Demo section.
   - For a recording failure, name the missing tool or the environment problem.
     Text-only CLI output is not a reason to skip recording.
+  - For a state the product "cannot reach", name the fault injection you drove
+    with the recorder running and its observed result. Reasoning that the state
+    has no user action or product hook, or a reason inherited from the repro
+    handoff, is not enough — see "If recording is blocked" in
+    `dev/recording-lanes.md`.
   - Do not substitute a video of test output or a made-up demonstration.
     Missing or rejected footage must not block the fix or PR.
 - `test_audit` — required in both author and review modes for reproduction-driven

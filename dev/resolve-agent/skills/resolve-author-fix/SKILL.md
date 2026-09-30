@@ -200,9 +200,12 @@ steps, including `OMNIGENT_E2E_RECORD_DIR` (`--video on` does not work here).
   in your evidence and the PR Demo section.
 - If recording is blocked by missing tools or an environment that cannot run
   the journey, set `recordings: []` and name the specific blocker in
-  `recording_unavailable_reason`. Do not block the fix or PR because footage is
-  missing or rejected; explain the gap and continue. Only report clips you
-  actually produced.
+  `recording_unavailable_reason`. A state you can describe how to reach is not
+  such an environment: drive that fault injection with the recorder running
+  first, and when it fails name the injection you ran and its observed result
+  (see "If recording is blocked" in `dev/recording-lanes.md`). Do not block the
+  fix or PR because footage is missing or rejected; explain the gap and
+  continue. Only report clips you actually produced.
 
 Build the SPA before starting the recorder. If you are inside a server-spawned
 runner (`OMNIGENT_RUNNER_ID` is set), strip the inherited runner/host variables
