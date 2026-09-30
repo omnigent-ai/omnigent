@@ -4142,15 +4142,10 @@ def _paste_and_submit(
             "Answer the pending Claude question or permission request before sending a message."
         )
     delivery_diagnostics.set_stage("pasting")
-    # Clear any leftover text in Claude's input field before typing.
-    # After Escape-cancel, Claude Code re-populates the prompt area
-    # with the previous input for re-editing. Without this clear,
-    # the new message appends to the stale buffer (e.g.
-    # "old promptnew prompt" with no separator).
-    # Ctrl-A (Home) + Ctrl-K (kill-to-end) is the safest pair —
-    # Ctrl-U only clears backwards from cursor.
-    _run_tmux(socket_path, "send-keys", "-t", tmux_target, "C-a")
-    _run_tmux(socket_path, "send-keys", "-t", tmux_target, "C-k")
+    # Clear stale text first: raw controls can otherwise become pasted text.
+    # CSI-u sends Ctrl+A/Ctrl+K literally so Claude handles them as keys.
+    _run_tmux(socket_path, "send-keys", "-l", "-t", tmux_target, "\x1b[97;5u")
+    _run_tmux(socket_path, "send-keys", "-l", "-t", tmux_target, "\x1b[107;5u")
     # Trailing newline absorbs a trailing "\" so it can't escape the submit Enter.
     # Delivered through a tmux buffer, NOT ``send-keys`` argv: tmux caps one
     # client→server command at ~16KB, so per-byte hex argv blew up with
