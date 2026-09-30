@@ -42,7 +42,11 @@ from omnigent.runner.identity import (
     RUNNER_TUNNEL_TOKEN_HEADER,
     touch_connect_marker,
 )
+from omnigent.runner.transports.ws_tunnel.event_delivery import RunnerEventDispatcher
 from omnigent.runner.transports.ws_tunnel.frames import (
+    EVENT_INGEST_CAPABILITY,
+    EventAckFrame,
+    EventReadyFrame,
     HelloFrame,
     PingFrame,
     PongFrame,
@@ -320,6 +324,7 @@ async def serve_tunnel(
     on_graceful_shutdown: Callable[[], None] | None = None,
     direct_attach_port: int | None = None,
     direct_attach_token: str | None = None,
+    event_dispatcher: RunnerEventDispatcher | None = None,
 ) -> None:
     """Keep a runner WebSocket tunnel connected to a server.
 
@@ -472,6 +477,7 @@ async def serve_tunnel(
                 reconnect=reconnecting,
                 attempt=attempt,
                 disconnected_monotonic=disconnected_monotonic,
+                event_dispatcher=event_dispatcher,
                 **activity_kwargs,
             )
             # A graceful shutdown drains and closes the connection cleanly,
@@ -844,6 +850,7 @@ async def _serve_tunnel_once(
     reconnect: bool = False,
     attempt: int = 1,
     disconnected_monotonic: float | None = None,
+    event_dispatcher: RunnerEventDispatcher | None = None,
 ) -> _CloseDetails:
     """Serve one WebSocket connection until it closes.
 
@@ -951,8 +958,18 @@ async def _serve_tunnel_once(
             direct_attach_port=direct_attach_port,
             direct_attach_token=direct_attach_token,
             connection_id=connection_id,
+            event_dispatcher=event_dispatcher,
         )
-        if on_ready is not None:
+        if event_dispatcher is not None:
+            event_dispatcher.connected(ws.send)
+        # Reconnect work can itself await event delivery; start receiving the
+        # new generation's ready frame before that work waits for an ACK.
+        reconnect_task = (
+            asyncio.ensure_future(on_ready())
+            if on_ready is not None and event_dispatcher is not None
+            else None
+        )
+        if on_ready is not None and reconnect_task is None:
             await on_ready()
         _logger.info(
             "runner %s connected to %s",
@@ -1017,6 +1034,7 @@ async def _serve_tunnel_once(
                         dispatch_tasks,
                         ws_channels,
                         on_activity=on_activity,
+                        event_dispatcher=event_dispatcher,
                     )
             else:
                 # Race reads against the shutdown signal. When it fires,
@@ -1081,12 +1099,19 @@ async def _serve_tunnel_once(
                             dispatch_tasks,
                             ws_channels,
                             on_activity=on_activity,
+                            event_dispatcher=event_dispatcher,
                         )
                 finally:
                     shutdown_wait.cancel()
                     with contextlib.suppress(asyncio.CancelledError):
                         await shutdown_wait
         finally:
+            if event_dispatcher is not None:
+                event_dispatcher.disconnected()
+            if reconnect_task is not None:
+                reconnect_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await reconnect_task
             suspend_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await suspend_task
@@ -1159,6 +1184,7 @@ async def _send_hello(
     direct_attach_port: int | None = None,
     direct_attach_token: str | None = None,
     connection_id: str | None = None,
+    event_dispatcher: RunnerEventDispatcher | None = None,
 ) -> None:
     """Send the runner's opening hello frame.
 
@@ -1192,7 +1218,10 @@ async def _send_hello(
             HelloFrame(
                 runner_version=runner_version,
                 frame_protocol_version=1,
-                capabilities=[CAP_FILESYSTEM_ATTACHMENTS],
+                capabilities=[
+                    CAP_FILESYSTEM_ATTACHMENTS,
+                    *([EVENT_INGEST_CAPABILITY] if event_dispatcher is not None else []),
+                ],
                 telemetry_opt_out=_tel_opt_out,
                 direct_attach_port=direct_attach_port,
                 direct_attach_token=direct_attach_token,
@@ -1219,6 +1248,7 @@ async def _handle_tunnel_frame(
     ws_channels: dict[str, _RunnerWSChannel],
     *,
     on_activity: Callable[[], None] | None = None,
+    event_dispatcher: RunnerEventDispatcher | None = None,
 ) -> None:
     """Handle one server-to-runner tunnel frame.
 
@@ -1245,7 +1275,13 @@ async def _handle_tunnel_frame(
             extra={"session_id": runner_primary_session_id()},
         )
         return
-    if isinstance(frame, PingFrame):
+    if isinstance(frame, EventReadyFrame):
+        if event_dispatcher is not None:
+            event_dispatcher.ready(send_text)
+    elif isinstance(frame, EventAckFrame):
+        if event_dispatcher is not None:
+            event_dispatcher.acknowledge(frame)
+    elif isinstance(frame, PingFrame):
         await send_text(encode_frame(PongFrame(ts=frame.ts)))
     elif isinstance(frame, RequestFrame):
         if on_activity is not None:

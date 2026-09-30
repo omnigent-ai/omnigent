@@ -61,11 +61,68 @@ Fix the root cause, not the symptom. Change the code the bug lives in, matching
 surrounding conventions, as small as the root cause allows. Do not touch the test
 to make it pass; the *code* must change to satisfy it.
 
-### 2B.4 — Add targeted tests at the layer you changed
+### 2B.4 — Select permanent regression coverage
 
-The reproduction test is a full end-to-end journey — slow, one layer above your
-fix. Add **targeted, fast tests at the layer you changed** (a unit/integration
-test on the function/module/component you edited):
+Choose which tests belong in the final PR. Search existing tests by behavior
+and fixture, and read the nearest scenarios. If one already drives the relevant
+setup and state transition, fold the missing assertions into it; parameterize
+configuration variants when useful. Apply this to recovered Repro tests too:
+archive the original, then consolidate its regression assertions into the
+existing scenario. Keep a separate test when a distinct ordering or boundary
+would make that extension misleading. Keep investigation history in evidence
+and test comments short. Reuse unchanged coverage when sufficient; there is no
+requirement for a new test file or both a new e2e and a smaller test.
+
+When existing coverage is insufficient, start with an edit to the nearest
+compatible scenario: preserve its existing assertions and add the regression
+input, seed records, or missing assertion. Leave sufficient coverage unchanged.
+Needing richer data does not make its journey incompatible. Keep a separate
+scenario only for a concrete ordering, lifecycle, or isolation conflict; name
+that conflict and the nearest existing test in `test_audit`. Before final
+verification, compare the setups and consolidate any compatible duplication.
+Moving a reproduction into an existing file is not consolidation.
+
+Each reported facet needs reliable coverage, not coverage at every layer.
+Keep the input and edge-case matrix at the lowest reliable layer. At a higher
+layer, use a representative regression input for each distinct boundary the
+lower tests cannot expose; do not replay the whole matrix there. A new helper
+does not automatically need direct unit tests when its real callers already
+exercise its contract. Retain a helper test only for behavior those caller
+checks miss. For every added layer, briefly identify the regression that would
+escape the other selected checks if that layer were omitted.
+
+Retain an e2e when it protects a distinct production boundary that lower-level
+coverage would miss, and explain that boundary briefly in `test_audit`. Do not
+mock away the failure, skip configurations, or supply already-correct objects
+in place of testing serialization, startup, process, or browser wiring.
+For documentation/instruction-only changes, existing contract/bundle checks
+may suffice; do not add a standalone module of sentence assertions or fabricate
+a behavioral failure.
+
+Preserve investigation-only reproduction source and logs before omitting a
+test introduced for this task from the final diff. Do not delete existing
+repository coverage just to reduce LOC. Stage evidence in
+`.omnigent/repro-evidence/` with original paths, commands, exact tested revision,
+and results, or cite an intact CI repro baseline/bundle. This worktree-local
+directory alone does not survive worktree deletion. Record the retrieval
+location and retention status in `test_audit`:
+
+- Under the compatible internal Resolve workflow, evidence is captured as
+  `repro-evidence/` inside the GitHub Actions artifact `resolve-bundle-<run-id>`.
+  This includes ticket-only and `skip_push` runs; it needs no upstream Repro
+  bundle. Record the workflow run URL, artifact name, and path within it. The
+  workflow uploads after the session, so mark that upload pending until it is
+  confirmed; a staged directory is not proof of a successful upload. Retrieval
+  is subject to the artifact's retention period.
+- For local or direct runs without that collector, copy the evidence to an
+  authorized persistent location outside the disposable worktree, verify the
+  copied files, and record its absolute path or retrievable artifact URL. In
+  `skip_push` mode keep this local; do not publish evidence as a workaround.
+  If no such destination is available, preserve the worktree and report the
+  unresolved retention requirement instead of claiming a durable archive.
+
+Keep this archive separate from the permanent tests. On retries, preserve the
+selection and retained evidence instead of reinstating the omitted source.
 
 - Tests of the reported bug must **fail on the unfixed code and pass with your
   fix** — same fail→pass discipline. Checks of previously correct behavior may
@@ -79,18 +136,21 @@ test on the function/module/component you edited):
   ticket number (no `test_omni_2812_*.py`, no `OMNI-2812`/`#4458` in symbol names
   or comments). Prefer the observable defect: e.g.
   `test_mid_stream_error_surfaces_as_abort.py`, not `test_omni_2812_*`. This
-  applies to the repro e2e test too — if the file you recovered at `test_path` has
-  a ticket-numbered name or ticket references in code, **rename it and strip the
-  references** as part of the fix (fold the rename into your diff). A reader six
-  months from now shouldn't need to chase a ticket to know what the test guards.
-  The bug link belongs in the **PR body** (Step 3.4), not in code.
+  applies to a reproduction test introduced by this task too — if its
+  `test_path` has a ticket-numbered name or ticket references in code,
+  **rename it and strip the references** as part of the fix. A reader six months
+  from now shouldn't need to chase a ticket to know what the test guards.
+  The bug link belongs in the **PR body** (Step 3.4), not in code. Reusing a
+  pre-existing test does not require an unrelated rename or comment cleanup.
 
 ### 2B.5 — Prove the whole set goes fail→pass
 
-Re-run **every** test in the deliverable — the (possibly rewritten) repro e2e test
-plus your new targeted tests — on the fixed tree. They must all pass. Then confirm
-the transition is real and complete the shared impact assessment for the final
-diff, including its checks of previously correct behavior:
+Run the selected permanent checks on the exact committed candidate, including
+unchanged tests; they do not need a new commit to qualify. Record fail→pass
+proof with the same assertions for the live behavioral bug, plus the required
+preservation checks. Keep the audited reproduction evidence even when its
+source is artifact-only; CI may also rerun the archived original independently.
+Complete the shared impact assessment for the final diff:
 
 - Each live facet has a **fail reason on the unfixed tree** and a **pass on the
   fixed tree** — that pair is the proof.

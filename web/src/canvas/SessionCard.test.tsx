@@ -104,6 +104,24 @@ describe("SessionCard", () => {
     expect(link).toHaveTextContent("#7 Ship it");
   });
 
+  it.each([
+    { provider: "github", prefix: "#", url: "https://github.com/acme/repo/pull/7" },
+    {
+      provider: "azure_devops",
+      prefix: "!",
+      url: "https://dev.azure.com/acme/proj/_git/repo/pullrequest/7",
+    },
+    { provider: null, prefix: "#", url: "https://github.com/acme/repo/pull/7" },
+  ])("puts $prefix before the number of a $provider pull request", ({ provider, prefix, url }) => {
+    renderCard({
+      conversation: conversation({ git_branch: "feat/canvas" }),
+      pullRequest: { number: 7, title: "Ship it", state: "OPEN", url, provider },
+    });
+    const link = screen.getByRole("link", { name: `Open pull request ${prefix}7` });
+    expect(link).toHaveAttribute("href", url);
+    expect(link.textContent).toBe(`${prefix}7 Ship it`);
+  });
+
   it("uses explicit fallbacks for missing fields", () => {
     renderCard({ conversation: conversation({ title: null, workspace: null, status: "failed" }) });
     expect(screen.getByText("New session")).toBeInTheDocument();

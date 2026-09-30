@@ -67,7 +67,13 @@ export interface RelatedRenderError extends RenderErrorDetails {
 }
 
 export type RenderItem =
-  | { kind: "text"; itemId: string | null; text: string; final: boolean }
+  | {
+      kind: "text";
+      itemId: string | null;
+      text: string;
+      final: boolean;
+      previewInterrupted?: boolean;
+    }
   | {
       kind: "reasoning";
       itemId: string | null;
@@ -1692,6 +1698,7 @@ function textItem(run: AnyBlock[]): RenderItem {
         itemId: b.ctx.itemId,
         text: b.fullText,
         final: true,
+        ...(b.previewInterrupted ? { previewInterrupted: true } : {}),
       };
     }
   }

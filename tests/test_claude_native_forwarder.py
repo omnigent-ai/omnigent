@@ -8850,7 +8850,7 @@ class _CapturedDeltaPost:
     """
 
     url_path: str
-    body: dict[str, Any]
+    body: dict[str, Any] | list[dict[str, Any]]
 
 
 def _write_deltas_file(bridge_dir: Path, records: list[dict[str, Any]]) -> None:
@@ -8890,9 +8890,9 @@ def _delta_capture_client(
     return httpx.AsyncClient(transport=httpx.MockTransport(handler), base_url="http://ap")
 
 
-async def test_forward_available_deltas_posts_each_and_advances_offset(tmp_path: Path) -> None:
+async def test_forward_available_deltas_batches_and_advances_offset(tmp_path: Path) -> None:
     """
-    Each appended chunk is POSTed as an ``external_output_text_delta``.
+    Chunks available in one poll are POSTed in one ordered batch.
 
     Proves the forwarder turns deltas-file lines into the exact event
     shape the Omnigent route expects (delta + message_id + index + final) and
@@ -8919,20 +8919,19 @@ async def test_forward_available_deltas_posts_each_and_advances_offset(tmp_path:
             seen_keys=seen,
         )
 
-    assert [c.url_path for c in captured] == [
-        "/v1/sessions/conv_x/events",
-        "/v1/sessions/conv_x/events",
-    ]
+    assert [c.url_path for c in captured] == ["/v1/sessions/conv_x/events"]
     # Full event shape proves every field survived hook → file → POST.
     assert [c.body for c in captured] == [
-        {
-            "type": "external_output_text_delta",
-            "data": {"delta": "Hello ", "message_id": "m1", "index": 0, "final": False},
-        },
-        {
-            "type": "external_output_text_delta",
-            "data": {"delta": "world", "message_id": "m1", "index": 1, "final": True},
-        },
+        [
+            {
+                "type": "external_output_text_delta",
+                "data": {"delta": "Hello ", "message_id": "m1", "index": 0, "final": False},
+            },
+            {
+                "type": "external_output_text_delta",
+                "data": {"delta": "world", "message_id": "m1", "index": 1, "final": True},
+            },
+        ]
     ]
     # Offset advanced to EOF and was persisted, so a reload resumes past
     # the two chunks instead of re-POSTing them.
@@ -8969,11 +8968,180 @@ async def test_forward_available_deltas_dedupes_by_message_id_and_index(tmp_path
             seen_keys=seen,
         )
     # The duplicate (m1, 0) is collapsed: only the first (m1,0) and the
-    # distinct (m1,1) are POSTed — 2 requests, not 3.
-    assert [(c.body["data"]["message_id"], c.body["data"]["index"]) for c in captured] == [
+    # distinct (m1,1) are POSTed — 1 batch, not 3 requests.
+    assert len(captured) == 1
+    assert isinstance(captured[0].body, list)
+    assert [(e["data"]["message_id"], e["data"]["index"]) for e in captured[0].body] == [
         ("m1", 0),
         ("m1", 1),
     ]
+
+
+async def test_forward_available_deltas_falls_back_for_old_servers(tmp_path: Path) -> None:
+    bridge_dir = prepare_bridge_dir("conv_x", bridge_id="b1", workspace=tmp_path)
+    _write_deltas_file(
+        bridge_dir,
+        [{"message_id": "m1", "index": i, "final": i == 2, "delta": str(i)} for i in range(3)],
+    )
+    captured: list[dict[str, Any] | list[dict[str, Any]]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        captured.append(body)
+        return httpx.Response(422 if isinstance(body, list) else 202)
+
+    capability = forwarder._SessionEventBatchCapability()
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://ap"
+    ) as client:
+        await forwarder._forward_available_deltas(
+            client=client,
+            session_id="conv_x",
+            bridge_dir=bridge_dir,
+            state=forwarder.DeltaForwardState(),
+            seen_keys={},
+            batch_capability=capability,
+        )
+    assert isinstance(captured[0], list)
+    assert [event["data"]["index"] for event in captured[1:]] == [0, 1, 2]
+    assert capability.supported is False
+
+
+async def test_legacy_delta_failure_does_not_skip_later_chunks(tmp_path: Path) -> None:
+    bridge_dir = prepare_bridge_dir("conv_x", bridge_id="b1", workspace=tmp_path)
+    _write_deltas_file(
+        bridge_dir,
+        [{"message_id": "m1", "index": i, "final": i == 2, "delta": str(i)} for i in range(3)],
+    )
+    posted: list[dict[str, Any] | list[dict[str, Any]]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        posted.append(body)
+        if isinstance(body, list):
+            return httpx.Response(422)
+        return httpx.Response(500 if body["data"]["index"] == 1 else 202)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://ap"
+    ) as client:
+        await forwarder._forward_available_deltas(
+            client=client,
+            session_id="conv_x",
+            bridge_dir=bridge_dir,
+            state=forwarder.DeltaForwardState(),
+            seen_keys={},
+        )
+    assert isinstance(posted[0], list)
+    assert [body["data"]["index"] for body in posted[1:]] == [0, 1, 2]
+
+
+async def test_forward_available_deltas_bounds_batch_bytes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cap = 220
+    monkeypatch.setattr(forwarder, "_MAX_DELTA_BATCH_BYTES", cap)
+    bridge_dir = prepare_bridge_dir("conv_x", bridge_id="b1", workspace=tmp_path)
+    _write_deltas_file(
+        bridge_dir,
+        [{"message_id": "m1", "index": i, "final": i == 3, "delta": "🚀" * 15} for i in range(4)],
+    )
+    captured: list[_CapturedDeltaPost] = []
+    async with _delta_capture_client(captured) as client:
+        await forwarder._forward_available_deltas(
+            client=client,
+            session_id="conv_x",
+            bridge_dir=bridge_dir,
+            state=forwarder.DeltaForwardState(),
+            seen_keys={},
+        )
+    assert len(captured) > 1
+    assert all(
+        len(forwarder.encode_session_event_batch(c.body)) <= cap
+        for c in captured
+        if isinstance(c.body, list)
+    )
+    assert [
+        event["data"]["index"]
+        for captured_post in captured
+        for event in (
+            captured_post.body if isinstance(captured_post.body, list) else [captured_post.body]
+        )
+    ] == list(range(4))
+
+
+async def test_oversized_single_delta_does_not_block_next(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(forwarder, "_MAX_DELTA_BATCH_BYTES", 200)
+    bridge_dir = prepare_bridge_dir("conv_x", bridge_id="b1", workspace=tmp_path)
+    _write_deltas_file(
+        bridge_dir,
+        [
+            {"message_id": "m1", "index": 0, "final": False, "delta": "🚀" * 100},
+            {"message_id": "m1", "index": 1, "final": True, "delta": "done"},
+        ],
+    )
+    captured: list[_CapturedDeltaPost] = []
+    async with _delta_capture_client(captured) as client:
+        await forwarder._forward_available_deltas(
+            client=client,
+            session_id="conv_x",
+            bridge_dir=bridge_dir,
+            state=forwarder.DeltaForwardState(),
+            seen_keys={},
+        )
+    assert [c.body["data"]["index"] for c in captured] == [0, 1]
+    assert all(isinstance(c.body, dict) for c in captured)
+
+
+async def test_failed_delta_batch_still_sends_next_batch(tmp_path: Path) -> None:
+    bridge_dir = prepare_bridge_dir("conv_x", bridge_id="b1", workspace=tmp_path)
+    _write_deltas_file(
+        bridge_dir,
+        [{"message_id": "m1", "index": i, "final": i == 39, "delta": str(i)} for i in range(40)],
+    )
+    posted: list[list[dict[str, Any]]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        assert isinstance(body, list)
+        posted.append(body)
+        return httpx.Response(500 if len(posted) == 1 else 202)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://ap"
+    ) as client:
+        state = await forwarder._forward_available_deltas(
+            client=client,
+            session_id="conv_x",
+            bridge_dir=bridge_dir,
+            state=forwarder.DeltaForwardState(),
+            seen_keys={},
+        )
+    assert [len(batch) for batch in posted] == [32, 8]
+    assert state.byte_offset == os.path.getsize(bridge_dir / "message_deltas.jsonl")
+
+
+async def test_forward_available_deltas_bounds_batch_count(tmp_path: Path) -> None:
+    bridge_dir = prepare_bridge_dir("conv_x", bridge_id="b1", workspace=tmp_path)
+    _write_deltas_file(
+        bridge_dir,
+        [{"message_id": "m1", "index": i, "final": i == 39, "delta": str(i)} for i in range(40)],
+    )
+    captured: list[_CapturedDeltaPost] = []
+    async with _delta_capture_client(captured) as client:
+        await forwarder._forward_available_deltas(
+            client=client,
+            session_id="conv_x",
+            bridge_dir=bridge_dir,
+            state=forwarder.DeltaForwardState(),
+            seen_keys={},
+        )
+    assert [len(c.body) for c in captured] == [32, 8]
+    assert isinstance(captured[0].body, list)
+    assert isinstance(captured[1].body, list)
+    assert [e["data"]["index"] for c in captured for e in c.body] == list(range(40))
 
 
 async def test_forward_available_deltas_drops_on_http_error(tmp_path: Path) -> None:

@@ -246,9 +246,18 @@ _CODEX_POPUP_RENDER_S = 0.7
 
 # Budget for confirming an approval switch actually landed. Codex echoes
 # "Permissions updated to <label>" once the popup applies; we poll the pane for
-# it so a no-op (e.g. a preset this codex build's /permissions doesn't offer)
-# fails loud instead of the label claiming a mode the TUI never entered.
+# it so a keystroke that didn't apply (e.g. a slow-rendering popup) fails loud
+# instead of the label claiming a mode the TUI never entered.
 _CODEX_PERMISSION_CONFIRM_BUDGET_S = 4.0
+
+# Budget for the /permissions popup to render its option rows before we read
+# them to find the target preset's menu digit. The popup can be slow to draw
+# mid-session (a busy TUI, MCP still starting), so give it room; if it still
+# can't be read we fall back to the preset's conventional menu position rather
+# than failing the switch. Which rows the popup lists is codex-config-dependent
+# (Read Only appears only with a read-only permission profile), so the digit is
+# read from the live popup when possible rather than hardcoded.
+_CODEX_PERMISSION_MENU_BUDGET_S = 5.0
 
 
 def _warn_unresolved_sub_agent(session_id: str | None, sub_agent_name: str) -> None:
@@ -4424,6 +4433,7 @@ def create_runner_app(
                 resource_registry=resource_registry,
                 publish_event=_publish_event,
                 server_client=server_client,
+                event_dispatcher=getattr(app.state, "runner_event_dispatcher", None),
                 ensure_comment_relay=_ensure_comment_relay_started,
             )
             _launch_pre: Callable[[bool], Awaitable[PreLaunchResult]] | None = None
@@ -6212,7 +6222,9 @@ def create_runner_app(
         # Codex switches approval stance through its own /permissions popup, not
         # thread/settings/update (that RPC drives model/effort but no-ops for
         # approval). So drive the popup by keystroke into the codex tmux pane —
-        # the same channel /compact uses — selecting the preset by its menu digit.
+        # the same channel /compact uses — reading the popup to find the preset's
+        # menu digit (row positions vary by codex build/platform, so we discover
+        # it rather than hardcode it) and confirming Codex echoed the switch.
         from omnigent.codex_approval_modes import codex_permission_preset
 
         preset = codex_permission_preset(mode)
@@ -6235,17 +6247,17 @@ def create_runner_app(
                 },
             )
         try:
-            await asyncio.to_thread(
+            offered = await asyncio.to_thread(
                 _inject_codex_permission_mode,
                 str(instance.socket_path),
                 instance.tmux_target,
-                menu_key=preset.menu_key,
+                label=preset.label,
                 needs_confirm=preset.needs_confirm,
             )
             # Confirm the switch landed before reporting success — the injection
-            # is otherwise fire-and-forget, so an unsupported preset (a menu row
-            # this codex build lacks) would silently no-op.
-            confirmed = await asyncio.to_thread(
+            # is otherwise fire-and-forget, so a slow-rendering popup would leave
+            # the label claiming a mode the TUI never entered.
+            confirmed = offered and await asyncio.to_thread(
                 _codex_permission_mode_confirmed,
                 str(instance.socket_path),
                 instance.tmux_target,
@@ -6261,14 +6273,36 @@ def create_runner_app(
                     ),
                 },
             )
+        if not offered:
+            # The popup was read but had no row for this preset. Codex lists Read
+            # Only only when the session runs with a read-only permission profile,
+            # so point the user at the reachable path instead of a phantom switch.
+            if preset.value == "read-only":
+                detail = (
+                    "Codex's /permissions popup doesn't offer Read Only on this "
+                    "platform — Codex lists it only on Windows or when a permission "
+                    "profile is active. To run read-only, start a new session in "
+                    "read-only mode."
+                )
+            else:
+                detail = (
+                    f"Codex's /permissions popup on this session doesn't offer {preset.label!r}."
+                )
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "codex_native_approval_mode_unsupported",
+                    "detail": detail,
+                },
+            )
         if not confirmed:
             return JSONResponse(
                 status_code=503,
                 content={
                     "error": "codex_native_approval_mode_failed",
                     "detail": (
-                        f"Codex did not confirm the switch to {preset.label!r}; this codex "
-                        "build's /permissions may not offer it."
+                        f"Codex didn't confirm the switch to {preset.label!r} within "
+                        f"{_CODEX_PERMISSION_CONFIRM_BUDGET_S:g}s; please try again."
                     ),
                 },
             )
@@ -7308,16 +7342,29 @@ def create_runner_app(
         socket_path: str,
         target: str,
         *,
-        menu_key: str,
+        label: str,
         needs_confirm: bool,
-    ) -> None:
-        # Drive Codex's /permissions popup: open it, then select the preset by
-        # its menu digit (position-independent, unlike arrow navigation). Full
-        # Access opens a "Yes, continue anyway" sub-dialog whose first option
-        # (digit 1) confirms. A settle pause between keystrokes is required — each
-        # screen draws asynchronously, and typing the command then pressing Enter
-        # back-to-back races the slash-menu so the command never submits.
-        from omnigent.harnesses.claude_native.bridge import _run_tmux
+    ) -> bool:
+        # Drive Codex's /permissions popup: open it, read its rows to find the
+        # digit that selects *label*, then press it. Which rows the popup lists
+        # depends on the session's codex config (Read Only shows only with a
+        # read-only permission profile) and their order can vary, so the digit is
+        # read from the live popup. If the popup can't be read in time (a busy
+        # TUI, a slow draw), fall back to the preset's conventional menu position
+        # rather than failing the switch. Full Access opens a "Yes, continue
+        # anyway" sub-dialog whose first option (digit 1) confirms. A settle pause
+        # between keystrokes is required — each screen draws asynchronously, and
+        # typing the command then pressing Enter back-to-back races the slash-menu
+        # so the command never submits.
+        #
+        # Returns True once a digit is pressed for *label* (from the live popup,
+        # or its conventional position on fallback); False when the popup was read
+        # but lists no row for *label*.
+        from omnigent.codex_approval_modes import (
+            CODEX_NATIVE_PERMISSION_PRESETS,
+            codex_permissions_menu,
+        )
+        from omnigent.harnesses.claude_native.bridge import _capture_pane, _run_tmux
 
         # Reset to a clean composer so the command submits: close any stray
         # menu/popup, then clear the line. C-u also wipes any text the TUI user
@@ -7327,26 +7374,67 @@ def create_runner_app(
         _run_tmux(socket_path, "send-keys", "-l", "-t", target, "/permissions")
         time.sleep(_CODEX_POPUP_RENDER_S)
         _run_tmux(socket_path, "send-keys", "-t", target, "Enter")
-        time.sleep(_CODEX_POPUP_RENDER_S)
-        _run_tmux(socket_path, "send-keys", "-l", "-t", target, menu_key)
+
+        # Wait for the popup to draw. Anchor on seeing at least two known preset
+        # rows (every popup variant lists Ask for approval and Full Access)
+        # rather than any numbered line, so a numbered list still visible in the
+        # transcript above can't be mistaken for the rendered popup.
+        known_labels = {preset.label for preset in CODEX_NATIVE_PERMISSION_PRESETS}
+
+        def _read_menu() -> dict[str, str]:
+            return codex_permissions_menu(_capture_pane(socket_path, target))
+
+        deadline = time.monotonic() + _CODEX_PERMISSION_MENU_BUDGET_S
+        options: dict[str, str] = {}
+        while True:
+            time.sleep(_CODEX_POPUP_RENDER_S)
+            options = _read_menu()
+            if len(options.keys() & known_labels) >= 2:
+                break
+            if time.monotonic() >= deadline:
+                options = {}
+                break
+
+        if options:
+            # The live popup was read: trust it. A missing row means this
+            # session's codex genuinely doesn't offer the preset (e.g. Read Only
+            # without a read-only permission profile). Re-read once to tolerate a
+            # partially-drawn popup before concluding the row is absent.
+            digit = options.get(label)
+            if digit is None:
+                time.sleep(_CODEX_POPUP_RENDER_S)
+                digit = _read_menu().get(label)
+            if digit is None:
+                # Close the popup so the TUI isn't stranded in it.
+                _run_tmux(socket_path, "send-keys", "-t", target, "Escape")
+                return False
+        else:
+            # The popup couldn't be read within the budget (a busy or slow TUI).
+            # Fall back to the preset's conventional menu position and let the
+            # confirmation echo gate correctness, rather than failing the switch.
+            digit = next(
+                (
+                    str(position)
+                    for position, preset in enumerate(CODEX_NATIVE_PERMISSION_PRESETS, start=1)
+                    if preset.label == label
+                ),
+                None,
+            )
+            if digit is None:
+                return False
+        _run_tmux(socket_path, "send-keys", "-l", "-t", target, digit)
         if needs_confirm:
             time.sleep(_CODEX_POPUP_RENDER_S)
             _run_tmux(socket_path, "send-keys", "-l", "-t", target, "1")
+        return True
 
     def _codex_permission_mode_confirmed(socket_path: str, target: str, label: str) -> bool:
-        # Codex echoes "Permissions updated to <label>" when a /permissions switch
-        # applies. Poll the pane and require the most-recent such line to match the
-        # target, so a keystroke that hit a non-existent menu row (a preset this
-        # codex build doesn't offer) is reported as not-applied rather than the
-        # label claiming a mode the TUI never entered.
+        from omnigent.codex_approval_modes import codex_permission_switch_confirmed
         from omnigent.harnesses.claude_native.bridge import _capture_pane
 
-        marker = "Permissions updated to "
         deadline = time.monotonic() + _CODEX_PERMISSION_CONFIRM_BUDGET_S
         while True:
-            pane = _capture_pane(socket_path, target)
-            updates = [line for line in pane.splitlines() if marker in line]
-            if updates and updates[-1].split(marker, 1)[1].strip() == label:
+            if codex_permission_switch_confirmed(_capture_pane(socket_path, target), label):
                 return True
             if time.monotonic() >= deadline:
                 return False
@@ -10131,25 +10219,34 @@ def create_runner_app(
         )
         _side_thread_id = body.get("codex_side_thread_id") if isinstance(body, dict) else None
         if _side_thread_id:
-            # Codex /side follow-up: the server redirected a side-chat child's
-            # message here (this endpoint's conversation_id is the PARENT), tagged
-            # with the child Codex thread id. Drive it on that thread via the
-            # parent's bridge, isolated from the parent's turn buffer/active-turn
-            # state on purpose so the main conversation is untouched.
+            # Side-chat controls use the parent's bridge but target the child's
+            # thread, leaving the parent's turn and message buffer untouched.
             from omnigent.harnesses.codex_native import side_chat
             from omnigent.harnesses.codex_native.app_server import client_for_transport
 
-            _side_text = _side_chat_text_from_content(
-                body.get("content") if isinstance(body, dict) else None
-            )
-            if not _side_text:
-                return JSONResponse(
-                    status_code=400,
-                    content={
-                        "error": "invalid_request",
-                        "detail": "side chat message had no text",
-                    },
+            _side_turn_id = body.get("codex_side_turn_id")
+            _side_text = ""
+            if body_type == "interrupt":
+                if not isinstance(_side_turn_id, str) or not _side_turn_id:
+                    return JSONResponse(
+                        status_code=400,
+                        content={
+                            "error": "invalid_request",
+                            "detail": "Missing side-chat turn id.",
+                        },
+                    )
+            else:
+                _side_text = _side_chat_text_from_content(
+                    body.get("content") if isinstance(body, dict) else None
                 )
+                if not _side_text:
+                    return JSONResponse(
+                        status_code=400,
+                        content={
+                            "error": "invalid_request",
+                            "detail": "side chat message had no text",
+                        },
+                    )
             _side_state = await _codex_native_bridge_state_for_session(
                 conversation_id, action="side chat turn"
             )
@@ -10166,7 +10263,14 @@ def create_runner_app(
             )
             try:
                 await _side_client.connect()
-                await side_chat.submit_side_turn(_side_client, str(_side_thread_id), _side_text)
+                if body_type == "interrupt":
+                    await side_chat.interrupt_side_turn(
+                        _side_client, str(_side_thread_id), _side_turn_id
+                    )
+                else:
+                    await side_chat.submit_side_turn(
+                        _side_client, str(_side_thread_id), _side_text
+                    )
             finally:
                 await _side_client.close()
             return Response(status_code=202)
@@ -11088,6 +11192,7 @@ def create_runner_app(
                 resource_registry=resource_registry,
                 publish_event=_publish_ensure_event,
                 server_client=server_client,
+                event_dispatcher=getattr(app.state, "runner_event_dispatcher", None),
                 ensure_comment_relay=_ensure_comment_relay_started,
             )
             _ensure_build: (
@@ -11982,12 +12087,11 @@ def create_runner_app(
             },
         )
 
-    # ── GitHub integration (read-only): PR metadata + the PR's files / diff ──
-    # The list and patch come from the ``gh`` CLI (the PR's "Files changed");
-    # only the per-file expand-context reader uses ``git show``. See
-    # omnigent.runner.github_resource. Each shells out synchronously, so it is
-    # offloaded to a thread like the changed-files / diff routes above (a blocked
-    # loop 503s the session).
+    # ── Pull request panel: PR metadata + the PR's files / diff ──
+    # omnigent.runner.pr_resource serves every git provider through its pull
+    # request facet; the ``github`` route paths are stable wire ids. Each call
+    # blocks on the provider's CLI or API, so it is offloaded to a thread like the
+    # changed-files / diff routes above (a blocked loop 503s the session).
 
     async def _github_workspace_root(session_id: str) -> str:
         """Resolve the workspace root for GitHub routes, or 404 when headless."""
@@ -12001,10 +12105,10 @@ def create_runner_app(
         return root
 
     async def _github_call(session_id: str, operation: str, **kwargs: Any) -> JSONResponse:
-        from omnigent.runner import github_resource
+        from omnigent.runner import pr_resource
 
         root = await _github_workspace_root(session_id)
-        function = getattr(github_resource, operation)
+        function = getattr(pr_resource, operation)
         try:
             result = await asyncio.to_thread(function, root, session_id=session_id, **kwargs)
         except ValueError as exc:
@@ -12013,15 +12117,15 @@ def create_runner_app(
 
     @app.get("/v1/sessions/{session_id}/resources/github")
     async def read_github_info(session_id: str, pr_url: str | None = None) -> JSONResponse:
-        return await _github_call(session_id, "github_info", pr_url=pr_url)
+        return await _github_call(session_id, "pr_info", pr_url=pr_url)
 
     @app.get("/v1/sessions/{session_id}/resources/github/changes")
     async def read_github_changes(session_id: str, pr_url: str | None = None) -> JSONResponse:
-        return await _github_call(session_id, "github_changed_files", pr_url=pr_url)
+        return await _github_call(session_id, "pr_changed_files", pr_url=pr_url)
 
     @app.get("/v1/sessions/{session_id}/resources/github/diff")
     async def read_github_pr_diff(session_id: str, pr_url: str | None = None) -> JSONResponse:
-        return await _github_call(session_id, "github_pr_diff", pr_url=pr_url)
+        return await _github_call(session_id, "pr_diff", pr_url=pr_url)
 
     @app.get("/v1/sessions/{session_id}/resources/github/diff/{relative_path:path}")
     async def read_github_file_diff(
@@ -12039,7 +12143,7 @@ def create_runner_app(
             raise HTTPException(status_code=400, detail="Invalid path")
         return await _github_call(
             session_id,
-            "github_file_diff",
+            "pr_file_diff",
             base=base or "",
             path=relative_path,
             pr_url=pr_url,
@@ -12062,7 +12166,7 @@ def create_runner_app(
         body = await request.json()
         return await _github_call(
             session_id,
-            "set_github_preference",
+            "set_pr_preference",
             account=body.get("account"),
             remote=body.get("remote"),
             pr_url=body.get("pr_url"),

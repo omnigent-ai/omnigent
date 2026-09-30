@@ -245,7 +245,10 @@ def test_output_outcomes_include_repro_audit_blockers() -> None:
 def test_repro_audit_preserves_non_repro_mode_contracts() -> None:
     instructions = _normalized_resolve_instructions()
     assert "Skip reproduction handoff recovery, fail-before proof" in instructions
-    assert "your **targeted test written in 2B.4 is the fail→pass proof**" in instructions
+    assert (
+        "the **selected regression check from 2B.4 supplies the fail→pass proof** "
+        "for a behavioral bug" in instructions
+    )
 
 
 def test_resolve_description_does_not_endorse_unaudited_tests() -> None:

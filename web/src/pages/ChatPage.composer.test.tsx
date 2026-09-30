@@ -15,7 +15,8 @@ import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testi
 import userEvent from "@testing-library/user-event";
 import { createRef, StrictMode, type ComponentRef, type ReactElement } from "react";
 import { MemoryRouter } from "react-router-dom";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { toast } from "sonner";
+import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import { useChatStore, type ChatState, type QueuedMessage } from "@/store/chatStore";
 import {
   clearSessionDrafts,
@@ -49,8 +50,8 @@ vi.mock("@/hooks/useWorkspaceChangedFiles", async (importOriginal) => {
 
 // ComposerStatusLine's PR link reads GitHub info via a TanStack query; stub it
 // (default: no PR) so bare Composer renders don't need a QueryClientProvider.
-vi.mock("@/hooks/useGithub", () => ({
-  useGithubInfo: () => ({ data: undefined }),
+vi.mock("@/hooks/usePullRequests", () => ({
+  usePullRequestInfo: () => ({ data: undefined }),
 }));
 // The workspace bar's git-status hook uses TanStack Query; stub it so the
 // composer renders in isolation (no QueryClient) with a neutral empty status.
@@ -68,6 +69,7 @@ const { composerGitStatusArgsSpy, composerGitStatusSnapshot } = vi.hoisted(() =>
     githubState: "ready" as "loading" | "ready" | "unknown",
     prCount: 0,
     prNumber: null as number | null,
+    prNumberPrefix: "#",
     refresh: vi.fn(),
     refreshing: false,
   },
@@ -97,6 +99,7 @@ function setComposerGitStatus(overrides: Record<string, unknown> = {}) {
       githubState: "ready",
       prCount: 0,
       prNumber: null,
+      prNumberPrefix: "#",
       refreshing: false,
     },
     overrides,
@@ -163,6 +166,7 @@ import type { ElicitationBlock } from "@/lib/blocks";
 import { getGoal } from "@/lib/goalApi";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { Composer, computeIsWorking, shouldQueueSend } from "./ChatPage";
+import { readAlwaysSteer, writeAlwaysSteer } from "@/lib/alwaysSteerPreferences";
 import { appendPromptHistoryEntry } from "@/hooks/usePromptHistory";
 import {
   BUILTIN_SLASH_COMMANDS,
@@ -851,6 +855,105 @@ describe("Composer slash-command menu", () => {
     fireEvent.keyDown(textarea(), { key: "Tab" });
     expect(textarea()).toHaveValue(command + " ");
     expect(screen.queryByText("No usage data yet — send a message first.")).toBeNull();
+  });
+
+  it.each([
+    ["claude-native", "/compact", "idle"],
+    ["claude-native", "/compact preserve decisions and TODOs", "idle"],
+    ["claude-sdk", "/compact", "idle"],
+    ["claude-sdk", "/compact", "running"],
+    ["claude-sdk", "/compact preserve decisions and TODOs", "idle"],
+    ["codex-native", "/compact", "idle"],
+    ["codex-native", "/compact", "running"],
+    ["codex-native", "/compact", "waiting"],
+    ["codex-native", "/compact extra arguments", "idle"],
+    ["pi-native", "/compact", "idle"],
+    ["pi-native", "/compact", "running"],
+  ] as const)("%s handles %s (status: %s)", (harness, command, turnStatus) => {
+    const { sessionHarness, status, sessionStatus } = useChatStore.getState();
+    onTestFinished(() => useChatStore.setState({ sessionHarness, status, sessionStatus }));
+    const previousAlwaysSteer = readAlwaysSteer();
+    onTestFinished(() => writeAlwaysSteer(previousAlwaysSteer));
+    writeAlwaysSteer(false);
+    useChatStore.setState({
+      sessionHarness: harness,
+      status: turnStatus === "running" ? "streaming" : "idle",
+      sessionStatus: turnStatus,
+    });
+    const compact = vi.spyOn(useChatStore.getState(), "compact").mockResolvedValue();
+    const error = vi.spyOn(toast, "error");
+    const props = composerProps({
+      isNativeWrapper: harness !== "claude-sdk",
+      isWorking: turnStatus !== "idle",
+    });
+    render(<Composer {...props} />);
+    fireEvent.change(textarea(), { target: { value: "/comp" } });
+    fireEvent.keyDown(textarea(), { key: "Tab" });
+    expect(textarea()).toHaveValue("/compact ");
+    expect(props.onSend).not.toHaveBeenCalled();
+    expect(compact).not.toHaveBeenCalled();
+
+    fireEvent.change(textarea(), { target: { value: command + " " } });
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+    if ((harness === "codex-native" || harness === "claude-sdk") && command !== "/compact") {
+      expect(textarea()).toHaveValue(command + " ");
+      const harnessName = harness === "codex-native" ? "Codex" : "Claude SDK";
+      expect(
+        screen.getByText(`/compact does not accept arguments for ${harnessName}`),
+      ).toBeVisible();
+      expect(props.onSend).not.toHaveBeenCalled();
+      expect(compact).not.toHaveBeenCalled();
+      return;
+    }
+    expect(textarea()).toHaveValue("");
+    expect(error).not.toHaveBeenCalled();
+    if (harness === "claude-native" || harness === "claude-sdk" || harness === "codex-native") {
+      const sent = harness === "codex-native" ? "/compact" : command;
+      expect(props.onSend).toHaveBeenCalledExactlyOnceWith(sent);
+      expect(compact).not.toHaveBeenCalled();
+      fireEvent.keyDown(textarea(), { key: "ArrowUp" });
+      expect(textarea()).toHaveValue(sent);
+    } else {
+      expect(compact).toHaveBeenCalledOnce();
+      expect(props.onSend).not.toHaveBeenCalled();
+    }
+  });
+
+  it.each(["Enter", "click"])("shows a toast for busy Codex /compact via %s", (submit) => {
+    const { sessionHarness, status, sessionStatus, queuedMessages } = useChatStore.getState();
+    onTestFinished(() =>
+      useChatStore.setState({ sessionHarness, status, sessionStatus, queuedMessages }),
+    );
+    const previousAlwaysSteer = readAlwaysSteer();
+    writeAlwaysSteer(true);
+    onTestFinished(() => writeAlwaysSteer(previousAlwaysSteer));
+    useChatStore.setState({
+      sessionHarness: "codex-native",
+      status: "streaming",
+      sessionStatus: "running",
+      queuedMessages: [],
+    });
+    const compact = vi.spyOn(useChatStore.getState(), "compact").mockResolvedValue();
+    const error = vi.spyOn(toast, "error");
+    const props = composerProps({ isNativeWrapper: true, isWorking: true });
+    render(<Composer {...props} />);
+    fireEvent.change(textarea(), { target: { value: "/comp" } });
+    fireEvent.keyDown(textarea(), { key: "Tab" });
+    expect(error).not.toHaveBeenCalled();
+    if (submit === "Enter") {
+      fireEvent.keyDown(textarea(), { key: "Enter" });
+      expect(textarea()).toHaveValue("/compact ");
+    } else {
+      fireEvent.change(textarea(), { target: { value: "/comp" } });
+      fireEvent.click(activeRow()!);
+      expect(textarea()).toHaveValue("/comp");
+    }
+    expect(error).toHaveBeenCalledExactlyOnceWith(
+      "Compact is disabled while a chat is in progress",
+      { richColors: true },
+    );
+    expect(compact).not.toHaveBeenCalled();
+    expect(props.onSend).not.toHaveBeenCalled();
   });
 
   it("Tab completes a match found only mid-name (exercises menuMatches, not just the render filter)", () => {
@@ -2331,6 +2434,13 @@ describe("Composer shared visible controls", () => {
     expect(screen.queryByTestId("composer-git-branch")).toBeNull();
   });
 
+  it("marks the PR number with the prefix of the PR's provider", () => {
+    setComposerGitStatus({ prCount: 1, prNumber: 7, prNumberPrefix: "!" });
+    renderWithTooltips(<Composer {...composerProps()} />);
+    expect(screen.getByTestId("composer-pr-link")).toHaveTextContent("!7");
+    expect(screen.getByTestId("composer-pr-link")).toHaveAccessibleName("!7");
+  });
+
   it("keeps the PR to the right of the confirmed worktree status", () => {
     setComposerGitStatus({
       branch: "feature/shared-composer",
@@ -2485,8 +2595,22 @@ describe("Composer shared visible controls", () => {
       .mockResolvedValue(undefined);
     renderWithTooltips(<Composer {...composerProps({ showCodexApprovalMode: true })} />);
     fireEvent.keyDown(screen.getByTestId("composer-permission-chip"), { key: "ArrowDown" });
-    fireEvent.click(screen.getByTestId("composer-permission-option-read-only"));
-    await waitFor(() => expect(setApproval).toHaveBeenCalledWith("read-only"));
+    fireEvent.click(screen.getByTestId("composer-permission-option-full-access"));
+    await waitFor(() => expect(setApproval).toHaveBeenCalledWith("full-access"));
+  });
+
+  it("doesn't offer Read Only as a codex runtime switch", () => {
+    useChatStore.setState({
+      conversationId: "codex-no-read-only",
+      codexApprovalMode: "read-only",
+    });
+    renderWithTooltips(<Composer {...composerProps({ showCodexApprovalMode: true })} />);
+    const chip = screen.getByTestId("composer-permission-chip");
+    // A session launched read-only still shows its live mode on the chip.
+    expect(chip).toHaveTextContent("Read Only");
+    fireEvent.keyDown(chip, { key: "ArrowDown" });
+    expect(screen.getByTestId("composer-permission-option-full-access")).toBeInTheDocument();
+    expect(screen.queryByTestId("composer-permission-option-read-only")).toBeNull();
   });
 });
 

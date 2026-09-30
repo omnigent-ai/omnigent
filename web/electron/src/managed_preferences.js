@@ -3,6 +3,9 @@
 /** Public macOS Managed Preferences key in the ai.omnigent.desktop domain. */
 const SERVER_URLS_KEY = "serverUrls";
 
+/** Optional display names for those servers: a dictionary of server URL → name. */
+const SERVER_NAMES_KEY = "serverNames";
+
 /**
  * Managed Preferences key gating Databricks-internal features (e.g. the Arca
  * host option). Boolean; anything but an explicit true reads as disabled.
@@ -85,6 +88,48 @@ function getManagedServerUrls({ platform = process.platform, getUserDefault } = 
 }
 
 /**
+ * The valid entries of the serverNames preference, keyed by the normalized URL
+ * of a server in `urls`. Names are cosmetic, so a bad entry is just skipped.
+ *
+ * @param {unknown} value
+ * @param {string[]} urls From parseManagedServerUrls.
+ * @returns {Record<string, string>}
+ */
+function parseManagedServerNames(value, urls) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  const names = {};
+  for (const [url, name] of Object.entries(value)) {
+    if (typeof name !== "string" || name.trim() === "") continue;
+    try {
+      const normalized = normalizeManagedServerUrl(url);
+      if (urls.includes(normalized)) names[normalized] = name.trim();
+    } catch {
+      // Not a server URL; skip it.
+    }
+  }
+  return names;
+}
+
+/**
+ * Read display names for the managed servers from effective macOS preferences.
+ *
+ * @param {{
+ *   platform?: NodeJS.Platform,
+ *   getUserDefault?: (key: string, type: string) => unknown,
+ * }} [options]
+ * @returns {Record<string, string>}
+ */
+function getManagedServerNames({ platform = process.platform, getUserDefault } = {}) {
+  const urls = getManagedServerUrls({ platform, getUserDefault });
+  if (urls.length === 0) return {};
+  try {
+    return parseManagedServerNames(getUserDefault(SERVER_NAMES_KEY, "dictionary"), urls);
+  } catch {
+    return {};
+  }
+}
+
+/**
  * Read the Databricks-internal-features flag from effective macOS preferences.
  * Fails closed: any missing value, wrong type, non-darwin platform, or read
  * error reads as disabled. Like the managed server list, the value is read on
@@ -131,10 +176,13 @@ function excludingManagedServers(candidates, managedServers) {
 module.exports = {
   DATABRICKS_INTERNAL_FEATURES_KEY,
   MAX_SERVER_URLS,
+  SERVER_NAMES_KEY,
   SERVER_URLS_KEY,
   excludingManagedServers,
   getDatabricksInternalFeaturesEnabled,
+  getManagedServerNames,
   getManagedServerUrls,
   normalizeManagedServerUrl,
+  parseManagedServerNames,
   parseManagedServerUrls,
 };

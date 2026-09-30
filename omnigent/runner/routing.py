@@ -74,9 +74,8 @@ def routing_host_id(conv: Conversation, conversation_store: ConversationStore) -
 
     A host-bound session is served by its own ``host_id``. A sub-agent child
     copies its parent's ``runner_id`` at creation but carries no host binding
-    of its own, so the nearest host-bound ancestor (parent, then root) names
-    the replica holding the shared tunnel. Without this, a child's routing
-    miss reads as a dead runner instead of a re-addressable wrong replica.
+    of its own. The nearest host-bound ancestor identifies the shared tunnel's
+    replica, so a routing miss is distinguished from a dead runner.
 
     :param conv: Conversation whose runner is being routed.
     :param conversation_store: Store used to read the ancestor rows.
@@ -85,12 +84,23 @@ def routing_host_id(conv: Conversation, conversation_store: ConversationStore) -
     """
     if conv.host_id is not None or conv.kind != "sub_agent":
         return conv.host_id
-    for ancestor_id in dict.fromkeys((conv.parent_conversation_id, conv.root_conversation_id)):
-        if ancestor_id is None or ancestor_id == conv.id:
-            continue
+    visited = {conv.id}
+    ancestor_id = conv.parent_conversation_id
+    while ancestor_id is not None and ancestor_id not in visited:
+        visited.add(ancestor_id)
         ancestor = conversation_store.get_conversation(ancestor_id)
-        if ancestor is not None and ancestor.host_id is not None:
+        if ancestor is None:
+            break
+        if ancestor.host_id is not None:
             return ancestor.host_id
+        ancestor_id = ancestor.parent_conversation_id
+
+    # Retain the root fallback when an intermediate parent is missing or cyclic.
+    root_id = conv.root_conversation_id
+    if root_id is not None and root_id not in visited:
+        root = conversation_store.get_conversation(root_id)
+        if root is not None:
+            return root.host_id
     return None
 
 

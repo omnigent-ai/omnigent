@@ -29,6 +29,7 @@ function displayUrl(url: string): string {
 
 export function LandingStep({
   managedServers,
+  managedServerNames,
   recentServers,
   error,
   onGetStarted,
@@ -37,6 +38,8 @@ export function LandingStep({
   onJoinUrl,
 }: {
   managedServers: string[];
+  /** Display names for preset servers, server URL → name. */
+  managedServerNames?: Record<string, string>;
   /** Recent non-preset servers, listed in the preset dropdown. */
   recentServers: string[];
   /** Connect error to show above the CTA (MDM landing only). */
@@ -57,6 +60,8 @@ export function LandingStep({
     else onJoinUrl(url);
   };
   const otherServers = [...managedServers.slice(1), ...recentServers];
+  const nameOf = (url: string) =>
+    managedServerNames && Object.hasOwn(managedServerNames, url) ? managedServerNames[url] : null;
 
   return (
     <div className="flex flex-1 flex-col gap-2 px-2 pb-1">
@@ -86,7 +91,10 @@ export function LandingStep({
             <Users className="size-4" />
             <span>
               Join your team (
-              <span className="opacity-80 font-normal">{teamName(managedServers[0])}</span>)
+              <span className="opacity-80 font-normal">
+                {nameOf(managedServers[0]) ?? teamName(managedServers[0])}
+              </span>
+              )
             </span>
           </Button>
           <DropdownMenu>
@@ -106,7 +114,7 @@ export function LandingStep({
                     managedServers.includes(url) ? onJoinManaged(url) : onJoinUrl(url)
                   }
                 >
-                  {displayUrl(url)}
+                  {nameOf(url) ?? displayUrl(url)}
                 </DropdownMenuItem>
               ))}
               {otherServers.length > 0 && <DropdownMenuSeparator />}

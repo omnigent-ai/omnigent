@@ -16,11 +16,14 @@ rules; do not approve or call the PR fully verified.
 Before you tag anyone, confirm the deliverable carries the before/after proof
 (2B.5 / 2A.3): the PR's **Demo** section shows the `after` clip (and the `before`
 when one was recovered), and `recordings` in your handoff lists an `after` entry
-for **every** `web`/`mobile`/`terminal`/`cli`/`desktop` facet. You **added the
-reproduction test** — that is the driver the recorder needs, so on a web/mobile
-fix the after-clip is obtainable here; produce it (build the SPA, record via
-`OMNIGENT_E2E_RECORD_DIR` per `dev/recording-lanes.md`) rather than linking only
-the repro run and a manual "run it yourself" command. Omit the after-clip **only**
+for **every** `web`/`mobile`/`terminal`/`cli`/`desktop` facet. Use a recording
+driver for the visible journey; it may be reused or restored temporarily from
+the retained investigation evidence. Permanent coverage may be unchanged or
+non-e2e; recording does not require committing a new e2e. For web/mobile,
+build the SPA and record via `OMNIGENT_E2E_RECORD_DIR` per
+`dev/recording-lanes.md`, then keep any temporary driver outside the final diff.
+Link the actual after-clip, not just the repro run and a manual "run it yourself"
+command. Omit the after-clip **only**
 for a genuine, named environmental blocker (recorder tooling missing, fixture
 won't come online after the SPA build, `api`-surface facet with nothing to film) —
 and when you omit it, **say which blocker, with the evidence**, in both the PR's
