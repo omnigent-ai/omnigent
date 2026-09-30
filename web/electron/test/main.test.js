@@ -45,6 +45,9 @@ function loadNavigationHarness({
   arcaPath = null,
   arcaResult = { ok: true, alreadyRunning: false },
   managedServers = [],
+  internalFeatures = false,
+  cliPath = null,
+  hostConnectResult = { ok: true },
 } = {}) {
   const userData = fs.mkdtempSync(path.join(os.tmpdir(), "omnigent-navigation-test-"));
   if (savedServerUrl) {
@@ -234,6 +237,7 @@ function loadNavigationHarness({
     "./managed_preferences": {
       ...require("../src/managed_preferences"),
       getManagedServerUrls: () => managedServers,
+      getDatabricksInternalFeaturesEnabled: () => internalFeatures,
     },
     "./deepLink": {
       parseOmnigentDeepLink: () => null,
@@ -300,7 +304,8 @@ function loadNavigationHarness({
     },
     "./omnigent_cli": {
       isExecutableFile: () => false,
-      resolveCliPath: () => null,
+      resolveCliPath: () => (cliPath ? { path: cliPath } : null),
+      cliCommandParts: require("../src/omnigent_cli").cliCommandParts,
       localHostId: () => "host_test",
       getCliStatus: () => ({ installed: false }),
     },
@@ -308,7 +313,7 @@ function loadNavigationHarness({
       shutdown: async () => {},
       onChange: () => {},
       ensureServerAuth: async () => ({ ok: true }),
-      ensureHostConnected: async () => ({ ok: true }),
+      ensureHostConnected: async () => hostConnectResult,
       restartHost: async () => ({ ok: true }),
       disconnectHost: async () => ({ ok: true }),
       startLocalServer: async () => ({ ok: false }),
@@ -1088,15 +1093,10 @@ describe("managed server preference wiring", () => {
     );
   });
 
-  it("records the onboarding runner only after a successful connect", () => {
+  it("exposes the onboarding runner handoff to the page", () => {
     assert.match(
       preloadSource,
       /takeOnboardingRunner:\s*\(\)\s*=>\s*ipcRenderer\.invoke\("omnigent:take-onboarding-runner"\)/,
-    );
-    assert.match(liveCode, /if \(result\.ok\) rememberOnboardingRunner\(target, runner\);/);
-    assert.match(
-      liveCode,
-      /log\("Connected this laptop\."\);\s*rememberOnboardingRunner\(target, runner\);/,
     );
   });
 
@@ -1924,6 +1924,37 @@ describe("onboarding runner IPC", () => {
     assert.equal(result.ok, false);
     assert.match(result.error, /omnigent CLI was not found/);
   });
+
+  // Remote runs on a managed server behind the internal flag; local uses a laptop CLI.
+  const managedServer = "https://workspace.cloud.databricks.com/omnigent";
+  const connectCases = [
+    ["remote", managedServer, { internalFeatures: true }, (ok) => ({ arcaResult: { ok } })],
+    [
+      "local",
+      server,
+      { cliPath: "/usr/local/bin/omnigent" },
+      (ok) => ({ hostConnectResult: { ok } }),
+    ],
+  ];
+  for (const [runner, url, options, result] of connectCases) {
+    it(`records a ${runner} runner only after its connect succeeds`, async (t) => {
+      const recorded = (h) => JSON.parse(fs.readFileSync(h.settingsPath, "utf8")).onboarding_runner;
+      const failed = harness(t, { ...options, ...result(false) });
+      const event = (h) => ({ sender: setupSender(), senderFrame: setupFrame(h) });
+      assert.equal(
+        (await failed.ipc.get("omnigent:connect-runner")(event(failed), url, runner)).ok,
+        false,
+      );
+      assert.equal(fs.existsSync(failed.settingsPath) ? recorded(failed) : undefined, undefined);
+      const connected = harness(t, { ...options, ...result(true) });
+      assert.equal(
+        (await connected.ipc.get("omnigent:connect-runner")(event(connected), url, runner)).ok,
+        true,
+      );
+      assert.equal(recorded(connected).runner, runner);
+      assert.equal(recorded(connected).origin, new URL(url).origin);
+    });
+  }
 
   for (const runner of ["local", "remote"]) {
     it(`starts nothing for a ${runner} runner once setup closes during URL resolution`, async (t) => {
