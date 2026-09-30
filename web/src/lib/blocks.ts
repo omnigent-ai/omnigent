@@ -324,6 +324,16 @@ export function slashCommandEchoItemId(slashItemId: string): string {
   return `${slashItemId}:user`;
 }
 
+/** Teammate prose delivery (Claude Code agent teams), rendered as a card. */
+export interface TeammateMessageBlock {
+  type: "teammate_message";
+  ctx: BlockContext;
+  teammateId: string;
+  text: string;
+  summary: string | null;
+  color: string | null;
+}
+
 /**
  * An intelligent-model-router decision, rendered as a standalone muted
  * chip at its transcript position (turn start). Display-only — the
@@ -704,6 +714,7 @@ export type AnyBlock =
   | SlashCommandBlock
   | RoutingDecisionBlock
   | TerminalCommandBlock
+  | TeammateMessageBlock
   | TextChunk
   | TextDone
   | ReasoningStartBlock

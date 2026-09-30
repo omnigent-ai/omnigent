@@ -389,6 +389,7 @@ def test_non_content_item_types_complete() -> None:
         "resource_event",
         "routing_decision",
         "slash_command",
+        "teammate_message",
         "terminal_command",
     }
     assert expected == NON_CONTENT_ITEM_TYPES
@@ -413,6 +414,7 @@ def test_item_type_map_covers_all_types() -> None:
         "resource_event",
         "routing_decision",
         "slash_command",
+        "teammate_message",
         "terminal_command",
     }
     assert set(ITEM_TYPE_TO_DATA_CLS.keys()) == expected_types

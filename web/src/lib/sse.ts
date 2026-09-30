@@ -63,6 +63,7 @@ import type {
   SessionUsageEvent,
   SlashCommand,
   RoutingDecision,
+  TeammateMessageEvent,
   TerminalCommandEvent,
   StreamEvent,
   TextDelta,
@@ -1298,6 +1299,21 @@ function parseOutputItem(data: Record<string, unknown>): StreamEvent | null {
       itemId,
       responseId,
     } satisfies TerminalCommandEvent;
+  }
+
+  if (itemType === "teammate_message") {
+    const teammateId = typeof rec.teammate_id === "string" ? rec.teammate_id : "";
+    // Drop malformed frames without a teammate id.
+    if (!teammateId) return null;
+    return {
+      type: "teammate_message",
+      teammateId,
+      text: typeof rec.text === "string" ? rec.text : "",
+      summary: typeof rec.summary === "string" && rec.summary ? rec.summary : null,
+      color: typeof rec.color === "string" && rec.color ? rec.color : null,
+      itemId,
+      responseId,
+    } satisfies TeammateMessageEvent;
   }
 
   if (NATIVE_TOOL_TYPES.has(itemType)) {
