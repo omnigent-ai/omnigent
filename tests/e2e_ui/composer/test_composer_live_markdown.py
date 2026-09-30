@@ -464,7 +464,13 @@ def _assert_formatted(layer: Locator) -> None:
     # Width-neutral stand-ins for bold and italic, never a different face.
     bold = layer.locator(f'[data-md="{_BOLD}"]')
     expect(bold).to_have_css("font-weight", layer.evaluate("l => getComputedStyle(l).fontWeight"))
-    assert bold.evaluate("s => getComputedStyle(s).webkitTextStrokeWidth") != "0px"
+    # The faux bold's stroke: 0.06em of the draft's font size.
+    stroke, size = bold.evaluate(
+        "s => { const c = getComputedStyle(s); return [c.webkitTextStrokeWidth, c.fontSize]; }"
+    )
+    assert float(stroke.removesuffix("px")) == pytest.approx(
+        float(size.removesuffix("px")) * 0.06, abs=0.01
+    ), (stroke, size)
     italic = layer.locator(f'[data-md="{_ITALIC}"]').first
     expect(italic).to_have_css("font-style", "normal")
     assert "linear-gradient" in italic.evaluate("s => getComputedStyle(s).backgroundImage")
@@ -1858,6 +1864,16 @@ def test_compact_preview_closes_marker_gaps_and_clicks_place_the_caret(
     expect(view).to_be_visible()
     shown = "Make bold and code then it now.\nx = 1\nquoted line\nend"
     assert view.evaluate("v => v.textContent") == shown
+    # Not lined up with the textarea, so bold is the sent message's semibold,
+    # with no faux-bold stroke; italic is the italic face.
+    faces = view.evaluate(
+        """v => Object.fromEntries(Array.from(v.querySelectorAll('[data-md]'), s => {
+            const c = getComputedStyle(s);
+            return [s.textContent, [c.fontWeight, c.fontStyle, c.webkitTextStrokeWidth]];
+        }))"""
+    )
+    assert faces["bold"] == ["600", "normal", "0px"], faces
+    assert faces["it"] == ["400", "italic", "0px"], faces
     card.screenshot(path=tmp_path / f"composer-compact-{theme}.png", animations="disabled")
     compact = gaps(view, shown)
     space = _char_rect(view, shown, " and")["right"] - _char_rect(view, shown, " and")["left"]

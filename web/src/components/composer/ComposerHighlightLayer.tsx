@@ -54,7 +54,7 @@ export interface ComposerAccentRange {
  * Styles here must never move a glyph: the textarea on top owns the caret and
  * selection, so the layer may only change paint (color, background, stroke).
  * Real bold and italic faces change advance widths in the system UI font, so
- * strong text is a faux bold (a thin text stroke) and emphasis is a dotted
+ * strong text is a faux bold (a text stroke, `.md-strong`) and emphasis is a dotted
  * underline instead of a slanted face: a synthesized oblique needs an
  * `@font-face` alias of the UI font, whose advances differ from the system
  * face's, and skewing inline-block words moves later glyphs by up to 1/64px
@@ -87,7 +87,7 @@ function segmentClass(flags: number): string {
   const decorated = flags & (MD_ITALIC | MD_STRIKE | MD_LINK);
   return cn(
     color,
-    flags & MD_BOLD && "[-webkit-text-stroke:0.04em_currentColor]",
+    flags & MD_BOLD && "md-strong",
     decorated && "md-deco",
     flags & MD_ITALIC && "md-em",
     flags & MD_STRIKE && "md-del",
@@ -643,11 +643,17 @@ export const ComposerHighlightLayer = forwardRef<
 });
 
 /**
- * A piece's class in the preview: the layer's, but italic is the real slanted
- * face (nothing needs to line up with the textarea here, so no stand-in).
+ * A piece's class in the preview: the layer's, but italic and bold are the real
+ * faces (nothing needs to line up with the textarea here, so no stand-ins).
  */
 function compactClassFor(flags: number): string {
-  return flags & MD_ITALIC ? cn(classFor(flags & ~MD_ITALIC), "italic") : classFor(flags);
+  if (!(flags & (MD_ITALIC | MD_BOLD))) return classFor(flags);
+  return cn(
+    classFor(flags & ~(MD_ITALIC | MD_BOLD)),
+    flags & MD_ITALIC && "italic",
+    // The weight sent messages give `**strong**` text.
+    flags & MD_BOLD && "font-semibold",
+  );
 }
 
 /** A piece: plain text as a bare text node, styled text in a span per accent cut. */
