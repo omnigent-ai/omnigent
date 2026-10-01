@@ -3,10 +3,12 @@
 Like :mod:`omnigent.onboarding.goose_auth`, Omnigent stores **no** OpenCode
 credentials: OpenCode owns its own provider auth via ``opencode auth login``
 (stored in ``~/.local/share/opencode/auth.json``) or ambient provider env vars
-(``OPENAI_API_KEY`` / ``ANTHROPIC_API_KEY`` / …), or an AWS profile selected in
-its Bedrock provider config. This module is a thin, read-only reporter so
-``omnigent setup`` can show which providers OpenCode can
-reach and offer to run its native login — without ever touching its secrets.
+(``OPENAI_API_KEY`` / ``ANTHROPIC_API_KEY`` / …). Amazon Bedrock is the
+exception: OpenCode loads it from a ``provider`` block in ``opencode.json`` or
+from the AWS credential-chain variables, and the AWS SDK authenticates at run
+time. This module is a thin, read-only reporter so ``omnigent setup`` can show
+which providers OpenCode can reach and offer to run its native login — without
+ever touching its secrets.
 
 It reads ``auth.json`` directly (a JSON object keyed by provider id — see
 ``packages/opencode/src/auth`` in the OpenCode source) rather than scraping
@@ -40,6 +42,16 @@ _ENV_PROVIDER_VARS: tuple[tuple[str, str, str], ...] = (
     ("xai", "xAI", "XAI_API_KEY"),
     ("mistral", "Mistral", "MISTRAL_API_KEY"),
     ("deepseek", "DeepSeek", "DEEPSEEK_API_KEY"),
+    # OpenCode autoloads Bedrock when any of these AWS credential-chain variables
+    # is set; the AWS SDK resolves the actual credential at run time.
+    ("amazon-bedrock", "Amazon Bedrock", "AWS_ACCESS_KEY_ID"),
+    ("amazon-bedrock", "Amazon Bedrock", "AWS_SECRET_ACCESS_KEY"),
+    ("amazon-bedrock", "Amazon Bedrock", "AWS_PROFILE"),
+    ("amazon-bedrock", "Amazon Bedrock", "AWS_REGION"),
+    ("amazon-bedrock", "Amazon Bedrock", "AWS_BEARER_TOKEN_BEDROCK"),
+    ("amazon-bedrock", "Amazon Bedrock", "AWS_WEB_IDENTITY_TOKEN_FILE"),
+    ("amazon-bedrock", "Amazon Bedrock", "AWS_CONTAINER_CREDENTIALS_FULL_URI"),
+    ("amazon-bedrock", "Amazon Bedrock", "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI"),
 )
 
 
@@ -72,7 +84,7 @@ def _stored_providers() -> tuple[str, ...]:
 
 
 def _env_providers(environ: dict[str, str] | None = None) -> tuple[str, ...]:
-    """Return provider labels whose API-key env var is present."""
+    """Return provider labels whose credential env var is present."""
     env = os.environ if environ is None else environ
     seen: list[str] = []
     for _provider_id, label, var in _ENV_PROVIDER_VARS:
@@ -82,26 +94,15 @@ def _env_providers(environ: dict[str, str] | None = None) -> tuple[str, ...]:
 
 
 def _configured_providers() -> tuple[str, ...]:
-    """Report Bedrock's configured AWS profile without resolving credentials.
+    """Return ``("amazon-bedrock",)`` when the user's ``opencode.json(c)`` declares it.
 
-    AWS profiles can use SSO or credential_process instead of an API key.
-    Use the same config reader as native launch, including JSONC support;
-    OpenCode's AWS SDK remains responsible for authenticating the profile.
+    OpenCode loads Bedrock from any ``provider.amazon-bedrock`` block and lets the
+    AWS SDK authenticate at run time, so only the declaration is checked.
     """
     from omnigent.harnesses.opencode_native.provider import maybe_merge_user_provider_config
 
-    config = maybe_merge_user_provider_config({})
-    providers = config.get("provider")
-    if not isinstance(providers, dict):
-        return ()
-    bedrock = providers.get("amazon-bedrock")
-    if not isinstance(bedrock, dict):
-        return ()
-    options = bedrock.get("options")
-    if not isinstance(options, dict):
-        return ()
-    profile = options.get("profile")
-    if isinstance(profile, str) and profile.strip():
+    providers = maybe_merge_user_provider_config({}).get("provider")
+    if isinstance(providers, dict) and isinstance(providers.get("amazon-bedrock"), dict):
         return ("amazon-bedrock",)
     return ()
 
@@ -127,8 +128,8 @@ class OpenCodeAuthSummary:
 
     :param installed: ``opencode`` binary present on ``PATH``.
     :param stored_providers: Provider ids with credentials in ``auth.json``.
-    :param env_providers: Provider labels whose API-key env var is set.
-    :param configured_providers: Provider ids using a configured AWS profile.
+    :param env_providers: Provider labels whose credential env var is set.
+    :param configured_providers: Provider ids declared in the user's ``opencode.json``.
     """
 
     installed: bool
@@ -138,7 +139,7 @@ class OpenCodeAuthSummary:
 
     @property
     def has_provider(self) -> bool:
-        """Whether any provider has credentials or a configured AWS profile."""
+        """Whether any provider is reachable (stored credential, env var, or config block)."""
         return bool(self.stored_providers or self.env_providers or self.configured_providers)
 
     @property

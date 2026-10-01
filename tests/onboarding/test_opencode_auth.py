@@ -9,6 +9,18 @@ import pytest
 
 import omnigent.onboarding.opencode_auth as oc
 
+# The AWS credential-chain variables OpenCode's Bedrock loader autoloads on.
+_AWS_BEDROCK_VARS = (
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_PROFILE",
+    "AWS_REGION",
+    "AWS_BEARER_TOKEN_BEDROCK",
+    "AWS_WEB_IDENTITY_TOKEN_FILE",
+    "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+    "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+)
+
 
 @pytest.fixture(autouse=True)
 def _isolate_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -23,6 +35,12 @@ def _write_auth(tmp_path: Path, providers: dict[str, object]) -> None:
     path = oc.opencode_auth_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(providers), encoding="utf-8")
+
+
+def _write_config(tmp_path: Path, raw: str, filename: str = "opencode.json") -> None:
+    path = tmp_path / "config" / "opencode" / filename
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(raw, encoding="utf-8")
 
 
 def test_auth_path_honors_xdg_data_home(tmp_path: Path) -> None:
@@ -103,23 +121,65 @@ def test_reachable_provider_ids_merges_stored_and_env(
     assert "groq" not in ids
 
 
-@pytest.mark.parametrize("filename", ["opencode.json", "opencode.jsonc"])
-def test_bedrock_profile_is_ready_without_stored_auth_or_api_keys(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, filename: str
+@pytest.mark.parametrize("var", _AWS_BEDROCK_VARS)
+def test_aws_credential_env_marks_bedrock_reachable(
+    monkeypatch: pytest.MonkeyPatch, var: str
 ) -> None:
+    """Any AWS variable OpenCode's Bedrock loader keys on counts as a provider."""
     monkeypatch.setattr(oc, "harness_cli_installed", lambda _key: True)
-    config_dir = tmp_path / "config" / "opencode"
-    config_dir.mkdir(parents=True)
-    raw = '{"provider": {"amazon-bedrock": {"options": {"profile": "work"}}}}'
-    if filename.endswith(".jsonc"):
-        raw = "// AWS credentials come from the profile\n" + raw.replace('"work"', '"work",')
-    (config_dir / filename).write_text(raw, encoding="utf-8")
+    monkeypatch.setenv(var, "placeholder")
+
+    summary = oc.opencode_auth_summary()
+    assert summary.ready is True
+    assert summary.stored_providers == ()
+    assert summary.env_providers == ("Amazon Bedrock",)
+    assert "env: Amazon Bedrock" in summary.describe()
+    assert oc.reachable_provider_ids() == frozenset({"amazon-bedrock"})
+
+
+@pytest.mark.parametrize(
+    "var", ["AWS_SESSION_TOKEN", "AWS_DEFAULT_REGION", "AWS_SHARED_CREDENTIALS_FILE"]
+)
+def test_other_aws_env_does_not_mark_bedrock_reachable(
+    monkeypatch: pytest.MonkeyPatch, var: str
+) -> None:
+    """AWS variables OpenCode's loader ignores must not read as a provider."""
+    monkeypatch.setattr(oc, "harness_cli_installed", lambda _key: True)
+    monkeypatch.setenv(var, "placeholder")
+
+    assert oc.opencode_auth_summary().ready is False
+    assert oc.reachable_provider_ids() == frozenset()
+
+
+@pytest.mark.parametrize(
+    ("filename", "raw"),
+    [
+        ("opencode.json", '{"provider": {"amazon-bedrock": {"options": {"profile": "work"}}}}'),
+        (
+            "opencode.json",
+            '{"provider": {"amazon-bedrock": {"options": {"region": "us-west-2"}}}}',
+        ),
+        ("opencode.json", '{"provider": {"amazon-bedrock": {}}}'),
+        (
+            "opencode.jsonc",
+            "// AWS credentials come from the profile\n"
+            '{"provider": {"amazon-bedrock": {"options": {"profile": "work",}}}}',
+        ),
+    ],
+)
+def test_bedrock_provider_block_is_ready_without_stored_auth_or_api_keys(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, filename: str, raw: str
+) -> None:
+    """OpenCode loads Bedrock from any ``provider.amazon-bedrock`` block."""
+    monkeypatch.setattr(oc, "harness_cli_installed", lambda _key: True)
+    _write_config(tmp_path, raw, filename)
 
     summary = oc.opencode_auth_summary()
     assert summary.ready is True
     assert summary.stored_providers == ()
     assert summary.env_providers == ()
-    assert "amazon-bedrock" in summary.describe()
+    assert summary.configured_providers == ("amazon-bedrock",)
+    assert "config: amazon-bedrock" in summary.describe()
     assert oc.reachable_provider_ids() == frozenset({"amazon-bedrock"})
 
 
@@ -129,20 +189,16 @@ def test_bedrock_profile_is_ready_without_stored_auth_or_api_keys(
         "not json",
         "[]",
         '{"provider": []}',
-        '{"provider": {"amazon-bedrock": {}}}',
-        '{"provider": {"amazon-bedrock": {"options": {"region": "us-west-2"}}}}',
-        '{"provider": {"amazon-bedrock": {"options": {"profile": " "}}}}',
-        '{"provider": {"amazon-bedrock": {"options": {"profile": 42}}}}',
-        '{"provider": {"amazon-bedrock": {"options": []}}}',
+        '{"provider": {"amazon-bedrock": "work"}}',
+        '{"enabled_providers": ["amazon-bedrock"]}',
     ],
 )
-def test_bedrock_without_profile_does_not_report_ready(
+def test_config_without_bedrock_block_does_not_report_ready(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, raw: str
 ) -> None:
+    """``enabled_providers`` only filters; a malformed file credits nothing."""
     monkeypatch.setattr(oc, "harness_cli_installed", lambda _key: True)
-    config_dir = tmp_path / "config" / "opencode"
-    config_dir.mkdir(parents=True)
-    (config_dir / "opencode.json").write_text(raw, encoding="utf-8")
+    _write_config(tmp_path, raw)
 
     assert oc.opencode_auth_summary().ready is False
     assert oc.reachable_provider_ids() == frozenset()
