@@ -1864,9 +1864,9 @@ class OpenAIAgentsSDKExecutor(Executor):
                     cached = getattr(details, "cached_tokens", None)
                     if cached is None and isinstance(details, dict):
                         cached = details.get("cached_tokens")
-                    # Clamp per response so a malformed cached > input never goes negative.
+                    # Clamp per response to [0, input] so malformed counts never go negative.
                     r_in = getattr(r.usage, "input_tokens", 0) or 0
-                    cached_tok += min(cached or 0, r_in)
+                    cached_tok += min(max(cached or 0, 0), r_in)
             last_r = raw_responses[-1]
             last_in = getattr(last_r.usage, "input_tokens", 0) or 0
             last_out = getattr(last_r.usage, "output_tokens", 0) or 0
