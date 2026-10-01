@@ -1273,7 +1273,7 @@ class MainActivity : AppCompatActivity() {
             buildString {
                 append(name).append('=').append(token).append("; Path=/")
                 if (secure) append("; Secure")
-                append("; SameSite=Lax")
+                append("; SameSite=Lax; HttpOnly")
             }
         val cookies = CookieManager.getInstance()
         cookies.setAcceptCookie(true)
