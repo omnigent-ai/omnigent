@@ -43,17 +43,6 @@ def test_context_args_carry_record_video_dir(
     assert path.stat().st_size > 0
 
 
-def test_sync_api_context_is_recorded(record_dir: Path, browser: Browser) -> None:
-    """A context opened via the sync API directly must emit a ``.webm``."""
-    context = browser.new_context()
-    page = context.new_page()
-    page.goto("about:blank")
-    video = page.video
-    assert video is not None, "page opened via sync Browser API is not recording"
-    context.close()
-    assert list(record_dir.rglob("*.webm")), "no .webm landed in the record dir"
-
-
 def test_page_fixture_is_recorded(record_dir: Path, page: Page) -> None:
     """A test on pytest-playwright's sync ``page`` fixture must be recording."""
     page.goto("about:blank")
@@ -61,29 +50,21 @@ def test_page_fixture_is_recorded(record_dir: Path, page: Page) -> None:
 
 
 @pytest.mark.parametrize("factory", ["new_context", "new_page"])
-def test_sync_recording_preserves_explicit_directory(
-    browser: Browser, tmp_path: Path, factory: str
+@pytest.mark.parametrize("explicit", [False, True])
+def test_sync_api_recording_directory(
+    record_dir: Path, browser: Browser, tmp_path: Path, factory: str, explicit: bool
 ) -> None:
-    target = tmp_path / "explicit"
-    created = getattr(browser, factory)(record_video_dir=str(target))
+    target = tmp_path / "explicit" if explicit else record_dir
+    created = getattr(browser, factory)(**({"record_video_dir": str(target)} if explicit else {}))
     page = created.new_page() if factory == "new_context" else created
-    page.set_content("<h1>explicit recording directory</h1>")
-    video = page.video
-    assert video is not None
-    page.context.close()
+    try:
+        page.set_content("<h1>sync recording</h1>")
+        video = page.video
+        assert video is not None
+    finally:
+        page.context.close()
     path = Path(video.path())
     assert path.parent == target
-    assert path.stat().st_size > 0
-
-
-def test_sync_new_page_is_recorded(record_dir: Path, browser: Browser) -> None:
-    page = browser.new_page()
-    page.set_content("<h1>direct sync page</h1>")
-    video = page.video
-    assert video is not None
-    page.context.close()
-    path = Path(video.path())
-    assert path.parent == record_dir
     assert path.stat().st_size > 0
 
 
