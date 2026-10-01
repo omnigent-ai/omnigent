@@ -47,6 +47,10 @@ from omnigent.harnesses.codex_native.app_server import (
     trust_native_policy_hooks,
 )
 from omnigent.harnesses.codex_native.hook import _EVALUATE_POLICY_TIMEOUT_S
+from omnigent.harnesses.codex_native.mcp_config import (
+    MCP_SOURCE_STATE_FILENAME,
+    CodexMcpInventoryError,
+)
 from omnigent.inner.codex_executor import (
     _populate_codex_home_config,
     _provider_codex_config_overrides,
@@ -1901,6 +1905,20 @@ def test_fresh_codex_launch_catalog_rejects_stale_rows(
     )
 
 
+def _private_mcp_servers(codex_home: Path) -> dict[str, Any]:
+    """Return the ``[mcp_servers]`` tables of a private ``config.toml``."""
+    config = tomllib.loads((codex_home / "config.toml").read_text(encoding="utf-8"))
+    return config.get("mcp_servers", {})
+
+
+def _drop_private_mcp_server(codex_home: Path, name: str) -> None:
+    """Remove one ``[mcp_servers.<name>]`` table, as a session-local ``codex mcp remove`` does."""
+    config_path = codex_home / "config.toml"
+    document = tomlkit.parse(config_path.read_text(encoding="utf-8"))
+    del document["mcp_servers"][name]
+    config_path.write_text(tomlkit.dumps(document), encoding="utf-8")
+
+
 def _test_app_server(
     tmp_path: Path,
     codex_home: Path,
@@ -2333,6 +2351,233 @@ args = []
         ],
         "tools": _PLAIN_TOOL_APPROVALS,
     }
+
+
+async def test_start_resume_picks_up_mcp_server_added_to_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    A server added to the user's config between launches reaches the resumed session.
+
+    The private config is copied once; Codex loads MCP servers only at process
+    start, so a resume must fold the new server in before spawning.
+    """
+    real_codex_home = tmp_path / "real-codex-home"
+    real_codex_home.mkdir()
+    source_config = real_codex_home / "config.toml"
+    source_config.write_text('[mcp_servers.github]\ncommand = "gh-mcp"\n', encoding="utf-8")
+    codex_home = tmp_path / "codex-home"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(real_codex_home))
+    _disable_codex_startup_rpc(monkeypatch)
+
+    server = _test_app_server(tmp_path, codex_home, tmp_path / "bridge", workspace)
+    await server.start()
+    await server.close()
+    assert set(_private_mcp_servers(codex_home)) == {"github", "omnigent"}
+
+    updated = source_config.read_text(encoding="utf-8") + '\n[mcp_servers.docs]\ncommand = "d"\n'
+    source_config.write_text(updated, encoding="utf-8")
+    await server.start()
+    await server.close()
+
+    servers = _private_mcp_servers(codex_home)
+    assert set(servers) == {"github", "docs", "omnigent"}
+    assert servers["docs"] == {"command": "d"}
+    assert source_config.read_text(encoding="utf-8") == updated
+
+
+async def test_start_repairs_legacy_private_home_missing_mcp_servers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A private config copied before the sync existed gains the user's servers."""
+    real_codex_home = tmp_path / "real-codex-home"
+    real_codex_home.mkdir()
+    (real_codex_home / "config.toml").write_text(
+        '[mcp_servers.github]\ncommand = "gh-mcp"\n\n[mcp_servers.docs]\ncommand = "d"\n',
+        encoding="utf-8",
+    )
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+    (codex_home / "config.toml").write_text(
+        'model = "gpt-test"\n\n[mcp_servers.github]\ncommand = "gh-mcp"\n', encoding="utf-8"
+    )
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(real_codex_home))
+    _disable_codex_startup_rpc(monkeypatch)
+
+    server = _test_app_server(tmp_path, codex_home, tmp_path / "bridge", workspace)
+    await server.start()
+    await server.close()
+
+    config = tomllib.loads((codex_home / "config.toml").read_text(encoding="utf-8"))
+    assert config["model"] == "gpt-test"
+    assert set(config["mcp_servers"]) == {"github", "docs", "omnigent"}
+
+
+async def test_start_fails_before_spawn_when_recorded_mcp_server_is_dropped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A recorded server lost to a later config step aborts startup, naming it."""
+    real_codex_home = tmp_path / "real-codex-home"
+    real_codex_home.mkdir()
+    (real_codex_home / "config.toml").write_text(
+        '[mcp_servers.github]\ncommand = "gh-mcp"\n\n[mcp_servers.docs]\ncommand = "d"\n',
+        encoding="utf-8",
+    )
+    codex_home = tmp_path / "codex-home"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(real_codex_home))
+    _disable_codex_startup_rpc(monkeypatch)
+
+    def _drop_github(home: Path, overrides: list[str]) -> list[str]:
+        config_path = home / "config.toml"
+        document = tomlkit.parse(config_path.read_text(encoding="utf-8"))
+        del document["mcp_servers"]["github"]
+        config_path.write_text(tomlkit.dumps(document), encoding="utf-8")
+        return overrides
+
+    spawned: list[object] = []
+
+    real_spawn = asyncio.create_subprocess_exec
+
+    async def _record_spawn(*args: Any, **kwargs: Any) -> Any:
+        # The ``--version`` probe is a legitimate earlier spawn; only the
+        # app-server launch must not happen.
+        if "app-server" in args:
+            spawned.append(args)
+            raise AssertionError("codex app-server must not be spawned")
+        return await real_spawn(*args, **kwargs)
+
+    monkeypatch.setattr(app_server, "materialize_codex_provider_config", _drop_github)
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _record_spawn)
+
+    server = _test_app_server(tmp_path, codex_home, tmp_path / "bridge", workspace)
+    with pytest.raises(CodexMcpInventoryError, match="github") as excinfo:
+        await server.start()
+
+    assert ": github. Codex loads MCP servers only at startup" in str(excinfo.value)
+    assert spawned == []
+
+
+async def test_start_restores_mcp_server_removed_only_from_private_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With a valid source, a server dropped from the private config comes back."""
+    real_codex_home = tmp_path / "real-codex-home"
+    real_codex_home.mkdir()
+    (real_codex_home / "config.toml").write_text(
+        '[mcp_servers.github]\ncommand = "gh-mcp"\n', encoding="utf-8"
+    )
+    codex_home = tmp_path / "codex-home"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(real_codex_home))
+    _disable_codex_startup_rpc(monkeypatch)
+
+    server = _test_app_server(tmp_path, codex_home, tmp_path / "bridge", workspace)
+    await server.start()
+    await server.close()
+    _drop_private_mcp_server(codex_home, "github")
+    assert "github" not in _private_mcp_servers(codex_home)
+
+    await server.start()
+    await server.close()
+
+    assert _private_mcp_servers(codex_home)["github"] == {"command": "gh-mcp"}
+
+
+async def test_start_tolerates_private_removal_when_source_config_is_unparsable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A skipped sync (broken source) must not flag a session-local removal as missing."""
+    real_codex_home = tmp_path / "real-codex-home"
+    real_codex_home.mkdir()
+    source_config = real_codex_home / "config.toml"
+    source_config.write_text('[mcp_servers.github]\ncommand = "gh-mcp"\n', encoding="utf-8")
+    codex_home = tmp_path / "codex-home"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(real_codex_home))
+    _disable_codex_startup_rpc(monkeypatch)
+
+    server = _test_app_server(tmp_path, codex_home, tmp_path / "bridge", workspace)
+    await server.start()
+    await server.close()
+    assert (codex_home / MCP_SOURCE_STATE_FILENAME).exists()
+    _drop_private_mcp_server(codex_home, "github")
+    source_config.write_text("mcp_servers = [", encoding="utf-8")
+
+    await server.start()
+    await server.close()
+
+    assert "github" not in _private_mcp_servers(codex_home)
+
+
+async def test_start_minimal_config_does_not_sync_user_mcp_servers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The auth/provider-only bridge never carries the user's MCP servers over."""
+    real_codex_home = tmp_path / "real-codex-home"
+    real_codex_home.mkdir()
+    (real_codex_home / "config.toml").write_text(
+        '[mcp_servers.github]\ncommand = "gh-mcp"\n', encoding="utf-8"
+    )
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+    (codex_home / "config.toml").write_text('model = "gpt-test"\n', encoding="utf-8")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(real_codex_home))
+    monkeypatch.setenv("HARNESS_CODEX_MINIMAL_CONFIG", "1")
+    _disable_codex_startup_rpc(monkeypatch)
+
+    server = _test_app_server(tmp_path, codex_home, tmp_path / "bridge", workspace)
+    await server.start()
+    await server.close()
+
+    assert set(_private_mcp_servers(codex_home)) == {"omnigent"}
+    assert not (codex_home / MCP_SOURCE_STATE_FILENAME).exists()
+
+
+async def test_start_profile_session_syncs_added_mcp_server_and_keeps_overlay(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A profile session gets source-added servers while its overlay stays on top."""
+    real_codex_home = tmp_path / "real-codex-home"
+    real_codex_home.mkdir()
+    source_config = real_codex_home / "config.toml"
+    source_config.write_text(
+        'model = "base-model"\n\n[mcp_servers.github]\ncommand = "gh-mcp"\n', encoding="utf-8"
+    )
+    (real_codex_home / "work.config.toml").write_text(
+        'model = "profile-model"\n', encoding="utf-8"
+    )
+    codex_home = tmp_path / "codex-home"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(real_codex_home))
+    _disable_codex_startup_rpc(monkeypatch)
+
+    server = _test_app_server(tmp_path, codex_home, tmp_path / "bridge", workspace)
+    server.config_profile = "work"
+    await server.start()
+    await server.close()
+    assert set(_private_mcp_servers(codex_home)) == {"github", "omnigent"}
+
+    source_config.write_text(
+        source_config.read_text(encoding="utf-8") + '\n[mcp_servers.docs]\ncommand = "d"\n',
+        encoding="utf-8",
+    )
+    await server.start()
+    await server.close()
+
+    config = tomllib.loads((codex_home / "config.toml").read_text(encoding="utf-8"))
+    assert config["model"] == "profile-model"
+    assert set(config["mcp_servers"]) == {"github", "docs", "omnigent"}
 
 
 async def test_start_can_delegate_global_process_reconciliation(

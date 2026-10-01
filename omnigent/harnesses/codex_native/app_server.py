@@ -44,6 +44,11 @@ from omnigent.harnesses.codex_native.launch_args import (
     validate_codex_config_profile_state,
     without_codex_config_profile,
 )
+from omnigent.harnesses.codex_native.mcp_config import (
+    CodexMcpInventoryError,
+    missing_codex_home_mcp_servers,
+    sync_codex_home_mcp_servers,
+)
 from omnigent.harnesses.codex_native.process_registry import (
     CodexNativeProcessOwnerLock,
     acquire_codex_native_process_owner_lock,
@@ -71,6 +76,7 @@ from omnigent.inner.codex_executor import (
     _populate_codex_home_config,
     _provider_codex_config_overrides,
     codex_extended_catalog_requested,
+    codex_minimal_config_requested,
     codex_router_bridge_dir,
     codex_router_hooks_settings,
     codex_router_session_id,
@@ -1948,6 +1954,11 @@ class CodexNativeAppServer:
             extend_model_catalog=codex_extended_catalog_requested(self.env),
             supported_efforts=CODEX_NATIVE_EFFORTS,
         )
+        expected_mcp_servers: frozenset[str] | None = None
+        if not codex_minimal_config_requested():
+            # The copy above happens once per session; Codex never hot-loads
+            # MCP servers, so later source edits must land before every spawn.
+            expected_mcp_servers = sync_codex_home_mcp_servers(self.codex_home, config_source)
         compose_profile_instructions = _materialize_codex_profile_for_start(
             self.codex_home,
             config_source,
@@ -1985,6 +1996,15 @@ class CodexNativeAppServer:
             self.codex_home,
             self.config_overrides,
         )
+        missing_mcp_servers = missing_codex_home_mcp_servers(self.codex_home, expected_mcp_servers)
+        if missing_mcp_servers:
+            raise CodexMcpInventoryError(
+                "Native Codex session config is missing MCP servers declared in "
+                f"{config_source / 'config.toml'}: {', '.join(missing_mcp_servers)}. "
+                "Codex loads MCP servers only at startup, so the session would run "
+                f"without them; check {self.codex_home / 'config.toml'} or start a "
+                "new session."
+            )
         if codex_version is not None and not policy_hooks_supported:
             self._disable_policy_hook(
                 f"Codex CLI {_format_codex_version(codex_version)} is older than "
