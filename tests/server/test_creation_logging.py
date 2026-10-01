@@ -97,6 +97,69 @@ async def test_creation_request_correlation_and_classification(
 
 
 @pytest.mark.asyncio
+async def test_session_created_logs_parent_session_id_for_child(
+    client: httpx.AsyncClient,
+) -> None:
+    """A sub-agent child's ``session_created`` row carries its parent link.
+
+    This is the join key a debug-log query needs to attribute a child session
+    back to its parent; a top-level session has no parent, so the attribute is
+    absent (null-valued attributes are dropped at the sink).
+    """
+    agent = await create_test_agent(client, name="parent-link-test")
+    agent_id = agent["id"]
+
+    parent = await client.post("/v1/sessions", json={"agent_id": agent_id})
+    assert parent.status_code == 201
+    parent_id = parent.json()["id"]
+
+    with capture_debug_rows("server") as rows:
+        child = await client.post(
+            "/v1/sessions",
+            json={"agent_id": agent_id, "parent_session_id": parent_id},
+        )
+    assert child.status_code == 201
+    child_id = child.json()["id"]
+
+    created = [
+        row
+        for row in rows
+        if row["event_name"] == "session_created" and row["session_id"] == child_id
+    ]
+    assert len(created) == 1
+    assert created[0]["attributes"]["parent_session_id"] == parent_id
+    assert created[0]["attributes"]["creation_kind"] == "child"
+
+
+@pytest.mark.asyncio
+async def test_publish_session_created_logs_parent_link_for_native_subagent() -> None:
+    """Native-harness sub-agents log ``session_created`` with their parent link.
+
+    They are minted outside the general create path's ``session_created``
+    logger, so ``_publish_session_created`` carries the join key for them.
+    """
+    from unittest.mock import MagicMock
+
+    from omnigent.server.routes._sessions.helpers import _publish_session_created
+
+    # The log fires before the subagent-activity write; a store whose lookup
+    # returns None makes that write a clean no-op so the test stays focused.
+    store = MagicMock()
+    store.get_conversation.return_value = None
+
+    with capture_debug_rows("server") as rows:
+        await _publish_session_created("conv_parent", "conv_child", "ag_abc", store)
+
+    created = [
+        row
+        for row in rows
+        if row["event_name"] == "session_created" and row["session_id"] == "conv_child"
+    ]
+    assert len(created) == 1
+    assert created[0]["attributes"]["parent_session_id"] == "conv_parent"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("managed", [False, True])
 async def test_bundle_creation_links_persistence_before_launch_failure(
     client: httpx.AsyncClient,

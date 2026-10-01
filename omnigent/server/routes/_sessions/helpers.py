@@ -3593,6 +3593,20 @@ async def _publish_session_created(
         parent_session_id=parent_id,
     )
     session_stream.publish(parent_id, event.model_dump())
+    # Native-harness sub-agents (claude Task tool, codex, antigravity, devin)
+    # are minted here, not through the general create path's ``session_created``
+    # logger, so emit the same creation marker with the parent link — this is
+    # what lets a debug-log query join these children back to their parent.
+    # A bare log (no request-scope mutation): this runs in the parent's
+    # forwarder/relay context, not the child's.
+    _logger.info(
+        "Sub-agent session created",
+        extra=debug_event(
+            "session_created",
+            session_id=child_session_id,
+            parent_session_id=parent_id,
+        ),
+    )
     from omnigent.server.subagent_activity import record_subagent_activity
 
     await record_subagent_activity(
