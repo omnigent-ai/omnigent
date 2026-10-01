@@ -1916,7 +1916,8 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     const s = get();
     const own = s.queuedMessages.filter((m) => m.conversationId === conversationId);
     if (own.length === 0) return;
-    // SDK buffers compact with the rest of the batch; Codex needs an idle turn.
+    // SDK buffers compact; Pi interrupts and Codex requires idle.
+    // Drain their prefix first so compaction cannot interrupt those messages.
     const compactIndex =
       setterForState(conversationId)?.sessionHarness === "claude-sdk"
         ? -1
@@ -2022,7 +2023,11 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       if (statusById.get(conversationId) !== "idle") continue;
       // The sidebar can still say idle while a compact control starts.
       const local = setterForState(conversationId);
-      if (local?.sessionHarness === "codex-native" || local?.sessionHarness === "claude-sdk") {
+      if (
+        local?.sessionHarness === "codex-native" ||
+        local?.sessionHarness === "claude-sdk" ||
+        local?.sessionHarness === "pi-native"
+      ) {
         if (local.sessionStatus === "running") continue;
         if (local.status === "streaming") {
           if (!sendLatchIsStranded(local)) continue;
@@ -3214,7 +3219,7 @@ function isCompactControl(
   files?: File[],
 ): boolean {
   return (
-    (harness === "codex-native" || harness === "claude-sdk") &&
+    (harness === "codex-native" || harness === "claude-sdk" || harness === "pi-native") &&
     !files?.length &&
     text.trim() === "/compact"
   );
@@ -3222,7 +3227,7 @@ function isCompactControl(
 
 function rejectBusyCompact(conversationId: string | null): boolean {
   const state = conversationId === null ? undefined : setterForState(conversationId);
-  if (state?.sessionHarness === "claude-sdk") return false;
+  if (state?.sessionHarness === "claude-sdk" || state?.sessionHarness === "pi-native") return false;
   if (state?.status !== "streaming" && state?.sessionStatus !== "running") return false;
   toast.error("Compact is disabled while a chat is in progress", { richColors: true });
   return true;
@@ -6491,6 +6496,24 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
     applyToConversation(patch);
   };
 
+  const settleLegacyPiCompact = (): void => {
+    if (sourceConversationId === null) return;
+    const s = setterForState(sourceConversationId);
+    // Older Pi extensions finish compaction without running/idle events.
+    // Only settle the synthetic control latch, never a prompt or a real turn.
+    if (
+      s?.sessionHarness !== "pi-native" ||
+      s.status !== "streaming" ||
+      s.sendLatchedAt === null ||
+      s.sessionStatus === "running" ||
+      s.activeResponse !== null ||
+      s.pendingUserMessages.length > 0
+    )
+      return;
+    applyToConversation({ status: "idle", sendLatchedAt: null });
+    useChatStore.getState().flushBackgroundQueues();
+  };
+
   switch (event.type) {
     case "response_completed":
     case "response_failed":
@@ -6603,6 +6626,7 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       });
       return;
     case "error":
+      if (event.error.code === "pi_compact_unavailable") settleLegacyPiCompact();
       // A `model_change_not_applied` error is the loud outcome of a model
       // ask the pane never took: settle the pending indicator (the chip
       // already shows the true model). The error block itself renders
@@ -6703,6 +6727,7 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       queryClient?.invalidateQueries({ queryKey: terminalsQueryKey(event.conversationId) });
       return;
     case "compaction_completed":
+      settleLegacyPiCompact();
       // Update the context-ring immediately with the post-compaction token
       // estimate so the ring reflects the reduced context without waiting
       // for the next LLM response.completed event.
@@ -6711,6 +6736,7 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       }
       return;
     case "compaction_failed":
+      settleLegacyPiCompact();
       // Compaction failed — history is unchanged. Remove every
       // compaction_loading block so the "Compacting…" shimmer disappears
       // without leaving a marker: a long compaction re-announces progress,

@@ -2,7 +2,7 @@
 // locally" / "Join your team". With presets: one "Join your team (<name>)" split
 // button; its dropdown lists other presets, recents, and a server URL field.
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { ArrowRight, ChevronDown, Laptop, Users } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {
@@ -61,6 +61,9 @@ export function LandingStep({
   // Close the dropdown once a join starts: its field and items would otherwise
   // stay usable (a second join) and cover the progress under the button.
   const [menuOpen, setMenuOpen] = useState(false);
+  // The menu spans the whole split button, not just its chevron trigger.
+  const ctaRef = useRef<HTMLDivElement>(null);
+  const [menuWidth, setMenuWidth] = useState<number>();
   const connecting = connection !== null;
   useEffect(() => {
     if (connecting) setMenuOpen(false);
@@ -97,7 +100,7 @@ export function LandingStep({
 
       {hasPresets ? (
         // Only CTA: join the first preset, or pick another / type a URL.
-        <div className="flex gap-0">
+        <div ref={ctaRef} className="flex gap-0">
           <Button
             onClick={() => onJoinManaged(managedServers[0])}
             loading={connecting}
@@ -112,7 +115,13 @@ export function LandingStep({
               )
             </span>
           </Button>
-          <DropdownMenu open={menuOpen} onOpenChange={setMenuOpen}>
+          <DropdownMenu
+            open={menuOpen}
+            onOpenChange={(open) => {
+              if (open) setMenuWidth(ctaRef.current?.offsetWidth);
+              setMenuOpen(open);
+            }}
+          >
             <DropdownMenuTrigger asChild>
               <Button
                 className="py-5 rounded-tl-none rounded-bl-none border-0 border-l-[1px] border-muted-foreground"
@@ -122,7 +131,7 @@ export function LandingStep({
                 <ChevronDown className="size-4" />
               </Button>
             </DropdownMenuTrigger>
-            <DropdownMenuContent align="end" className="w-80">
+            <DropdownMenuContent align="end" style={{ width: menuWidth }}>
               {otherServers.map((url) => (
                 <DropdownMenuItem
                   key={url}
@@ -130,7 +139,9 @@ export function LandingStep({
                     managedServers.includes(url) ? onJoinManaged(url) : onJoinUrl(url)
                   }
                 >
-                  {nameOf(url) ?? displayUrl(url)}
+                  <span className="truncate" title={url}>
+                    {nameOf(url) ?? displayUrl(url)}
+                  </span>
                 </DropdownMenuItem>
               ))}
               {otherServers.length > 0 && <DropdownMenuSeparator />}

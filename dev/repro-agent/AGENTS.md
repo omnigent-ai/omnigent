@@ -556,14 +556,16 @@ fixed shape documented under Output, including `bug_url`, `verdict`, and
 `session_id`. Do this **before** authoring or recording work that could exhaust
 the turn, so CI can still dispatch the fix step if the final response is cut off.
 
-**Report reproducible test references.** For an unchanged reused test, give its
-exact repository revision, path/node ID, command, and result in `evidence`;
-do not paste the whole existing file into the final response. Keep its source
-available for the handoff. For new or modified reproduction tests, retain the
-complete files in retrievable evidence and show their complete, verbatim source
-in path-labelled code blocks immediately before the final JSON handoff. Do not
-truncate or substitute placeholders in those source blocks. The parser reads
-only the last JSON fence.
+**Report reproducible test references.** For every test, put its path/node ID,
+tested repository revision, exact command, result, and source location in
+`evidence`. Keep complete new or modified files at their declared `test_path`
+in the worktree, with any required fixtures and helpers; include their source
+hashes because the revision alone does not identify uncommitted changes.
+Locally, identify the Repro session's workspace. In CI, identify the run and
+`repro-bundle-<run-id>/files/<test_path>`; describe the upload as pending until
+confirmed. Check that the files exist before finishing, and report missing
+source explicitly. Summarize these references in the final response without
+pasting complete test files. Resolve reads the workspace or bundle files.
 
 ## Step 4 — Record the reproduction
 
@@ -616,16 +618,15 @@ choice:
   recording results, atomically rewrite it, and emit that same object in the
   final fence. The checkpoint and final block must not disagree.
 
-- Before the test references/source and JSON block, include a **Steps to reproduce**
+- Before the test references and JSON block, include a **Steps to reproduce**
   section using the manual recipe from Step 1: prerequisites, numbered actions,
   and expected/observed results at the relevant step. This section is required,
   even when a recording is available. For `needs_more_info` or
   `needs_manual_review`, include the known steps and clearly identify missing
   information or unverified steps; do not invent a successful reproduction.
   You may also include a brief verdict and per-facet notes. Then, as the
-  last thing before the JSON block, report the reproduction tests per Step 3:
-  exact references for unchanged tests, and complete source blocks for new or
-  modified tests. But all of this is
+  last thing before the JSON block, give concise test references per Step 3,
+  including source locations and results. All of this is
   **context, not the contract**: everything the parser needs lives *inside* the
   JSON block, and the ```json block is the **last chunk** of the message, with
   nothing after its closing fence.
@@ -751,7 +752,7 @@ Field meanings:
   - Do not substitute a video of test output or a made-up demonstration.
 
 Keep other prose terse, but include the full manual reproduction recipe and
-the test references/source described in Step 3. You produce the live-confirmed reproduction +
+the test references described in Step 3. You produce the live-confirmed reproduction +
 the test; the fix step takes it from here. You take no further
 action — no fix, no merge, no push.
 

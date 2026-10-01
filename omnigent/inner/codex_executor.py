@@ -1055,6 +1055,11 @@ def _codex_home_config_source_from_env() -> Path:
     )
 
 
+def codex_minimal_config_requested() -> bool:
+    """Whether the worker should omit ambient user tools and instructions."""
+    return os.environ.get(_CODEX_MINIMAL_CONFIG_ENV, "").strip().lower() in {"1", "true", "yes"}
+
+
 def _populate_codex_home_config(
     target_dir: Path,
     source_dir: Path,
@@ -1136,11 +1141,7 @@ def _populate_codex_home_config(
         return
 
     if minimal_config is None:
-        minimal_config = os.environ.get(_CODEX_MINIMAL_CONFIG_ENV, "").strip().lower() in {
-            "1",
-            "true",
-            "yes",
-        }
+        minimal_config = codex_minimal_config_requested()
     symlink_files: tuple[str, ...] = _CODEX_HOME_SYMLINK_FILES
     if not include_credentials:
         symlink_files = tuple(

@@ -1136,3 +1136,40 @@ def websocket_scope(path: str) -> dict[str, object]:
         "server": ("testserver", 80),
         "subprotocols": [],
     }
+
+
+async def create_session_for_agent(client: httpx.AsyncClient, agent_id: str) -> str:
+    """
+    Create a session bound to an agent.
+
+    :param client: Test HTTP client.
+    :param agent_id: Agent to bind.
+    :returns: New session id.
+    """
+    resp = await client.post("/v1/sessions", json={"agent_id": agent_id})
+    assert resp.status_code == 201, f"create failed: {resp.status_code} {resp.text}"
+    return resp.json()["id"]
+
+
+def policy_tool_call_request(
+    tool_name: str = "Bash",
+    arguments: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """
+    Build a ``PHASE_TOOL_CALL`` policy-evaluate request.
+
+    :param tool_name: Tool name, e.g. ``"Bash"``.
+    :param arguments: Tool arguments dict.
+    :returns: JSON body for ``POST /v1/sessions/{id}/policies/evaluate``.
+    """
+    return {
+        "event": {
+            "type": "PHASE_TOOL_CALL",
+            "target": "",
+            "data": {
+                "name": tool_name,
+                "arguments": arguments or {},
+            },
+            "context": {},
+        },
+    }

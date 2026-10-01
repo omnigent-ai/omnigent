@@ -825,7 +825,7 @@ def _no_wake_backoff(monkeypatch: pytest.MonkeyPatch) -> list[float]:
     async def _record(seconds: float) -> None:
         recorded.append(seconds)
 
-    monkeypatch.setattr("omnigent.runner.app._wake_retry_sleep", _record)
+    monkeypatch.setattr("omnigent.runner.subagent_work._wake_retry_sleep", _record)
     return recorded
 
 

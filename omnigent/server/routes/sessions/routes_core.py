@@ -1029,7 +1029,11 @@ def register_core_routes(
                 inference_model,
                 created_by=user_id,
             )
-        session_created(result.session_id, inherited_runner_id)
+        session_created(
+            result.session_id,
+            inherited_runner_id,
+            parent_session_id=parsed_metadata.parent_session_id,
+        )
         # Top-level creates (no inherited runner) skip the notify —
         # their runner registers itself later.
         if inherited_runner_id is not None:

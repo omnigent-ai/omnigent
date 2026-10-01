@@ -362,7 +362,11 @@ describe("ServerSelectorV2", () => {
     expect(screen.getByRole("heading", { name: "Meet Omnigent" })).toBeInTheDocument();
   });
 
-  async function installFromRunnerStep(over: Partial<ServerSelectorV2Setup>, pick?: string) {
+  async function installFromRunnerStep(
+    over: Partial<ServerSelectorV2Setup>,
+    pick?: string,
+    action: string | RegExp = /(install|open) omnigent/i,
+  ) {
     render(
       <ServerSelectorV2
         setup={makeSetup({ managedServers: ["https://team.example.com/"], ...over })}
@@ -373,7 +377,7 @@ describe("ServerSelectorV2", () => {
       fireEvent.click(await screen.findByRole("combobox", { name: "Runner" }));
       fireEvent.click(screen.getByRole("option", { name: pick }));
     }
-    fireEvent.click(await screen.findByRole("button", { name: /(install|open) omnigent/i }));
+    fireEvent.click(await screen.findByRole("button", { name: action }));
   }
 
   it("a remote runner connects first, streaming its output, then opens the server, with no local install", async () => {
@@ -550,6 +554,8 @@ describe("ServerSelectorV2", () => {
         getRunnerOptions: vi.fn().mockResolvedValue({ remote: true, bundledCli: true }),
       },
       "My laptop",
+      // Nothing is installed, so the action only opens.
+      "Open Omnigent",
     );
     await waitFor(() => expect(onConnect).toHaveBeenCalledOnce());
     expect(onConnectRunner).toHaveBeenCalledWith("https://team.example.com/", "local");
@@ -570,7 +576,11 @@ describe("ServerSelectorV2", () => {
       calls.push("connect");
       return {};
     });
-    await installFromRunnerStep({ installed: false, onInstallCli, onConnectRunner, onConnect });
+    await installFromRunnerStep(
+      { installed: false, onInstallCli, onConnectRunner, onConnect },
+      undefined,
+      "Install Omnigent",
+    );
     await waitFor(() => expect(calls).toEqual(["install", "runner", "connect"]));
     expect(onConnectRunner).toHaveBeenCalledWith("https://team.example.com/", "local");
   });

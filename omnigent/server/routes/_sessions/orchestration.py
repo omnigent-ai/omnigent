@@ -10253,7 +10253,7 @@ async def _create_session_from_existing_agent(
     # joins the session's session.id group.
     from omnigent.runtime import telemetry
 
-    session_created(conv.id, conv.runner_id)
+    session_created(conv.id, conv.runner_id, parent_session_id=body.parent_session_id)
     telemetry.set_session_id(conv.id)
 
     if _native_smart_routing:
