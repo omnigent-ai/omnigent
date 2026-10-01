@@ -2954,8 +2954,17 @@ function ComposerImpl(
           setCommandError("/compact is not supported for this agent type");
           return true;
         }
-        if ((sessionHarness === "codex-native" || sessionHarness === "claude-sdk") && arg) {
-          const harnessName = sessionHarness === "codex-native" ? "Codex" : "Claude SDK";
+        if (
+          (sessionHarness === "codex-native" ||
+            sessionHarness === "claude-sdk" ||
+            sessionHarness === "pi-native") &&
+          arg
+        ) {
+          const harnessName = {
+            "codex-native": "Codex",
+            "pi-native": "Pi",
+            "claude-sdk": "Claude SDK",
+          }[sessionHarness];
           setCommandError(`/compact does not accept arguments for ${harnessName}`);
           return true;
         }
@@ -2980,9 +2989,10 @@ function ComposerImpl(
         if (
           sessionHarness === "claude-native" ||
           sessionHarness === "claude-sdk" ||
-          sessionHarness === "codex-native"
+          sessionHarness === "codex-native" ||
+          sessionHarness === "pi-native"
         ) {
-          // Use the message queue; the store dispatches SDK and Codex as controls.
+          // Use the message queue; the store dispatches SDK, Codex and Pi as controls.
           const command = arg ? `/compact ${arg}` : "/compact";
           appendEntry(command);
           onSend(command);
