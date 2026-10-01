@@ -369,6 +369,33 @@ def test_effective_mcp_servers_support_legacy_inline_profiles(tmp_path: Path) ->
     }
 
 
+def test_effective_mcp_servers_uses_journaled_legacy_profile(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    private = tmp_path / "private"
+    source.mkdir()
+    private.mkdir()
+    original = (
+        '[mcp_servers.base]\ncommand = "base"\n'
+        '[profiles.legacy.mcp_servers.profile]\ncommand = "profile"\n'
+    )
+    (source / "config.toml").write_text(original, encoding="utf-8")
+    (private / "config.toml").write_text(original, encoding="utf-8")
+    materialize_codex_config_profile(private, source, "legacy", codex_version=(0, 120, 0))
+    (source / "config.toml").write_text(
+        '[mcp_servers.base]\ncommand = "updated"\n', encoding="utf-8"
+    )
+
+    assert effective_codex_mcp_servers(
+        source,
+        "legacy",
+        codex_version=(0, 120, 0),
+        codex_home=private,
+    ) == {
+        "base": {"command": "updated"},
+        "profile": {"command": "profile"},
+    }
+
+
 def test_effective_mcp_servers_rejects_invalid_inventory_and_missing_profile(
     tmp_path: Path,
 ) -> None:
@@ -388,6 +415,13 @@ def test_effective_mcp_servers_rejects_invalid_inventory_and_missing_profile(
     with pytest.raises(ValueError, match="Invalid Codex config") as malformed:
         effective_codex_mcp_servers(source, None, codex_version=(0, 154, 0))
     assert str(config) in str(malformed.value)
+
+    profile = source / "invalid.config.toml"
+    config.write_text("", encoding="utf-8")
+    profile.write_text("[mcp_servers", encoding="utf-8")
+    with pytest.raises(ValueError, match="Invalid Codex config") as malformed_profile:
+        effective_codex_mcp_servers(source, "invalid", codex_version=(0, 154, 0))
+    assert str(profile) in str(malformed_profile.value)
 
     config.write_text("", encoding="utf-8")
     with pytest.raises(FileNotFoundError):

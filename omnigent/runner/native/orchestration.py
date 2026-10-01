@@ -4791,7 +4791,8 @@ async def _auto_create_codex_terminal(
     if backend_reusable:
         from omnigent.inner.codex_executor import _codex_home_config_source_from_env
 
-        shared_mcp_config_current = shared_mcp_server_config_matches(
+        shared_mcp_config_current = await asyncio.to_thread(
+            shared_mcp_server_config_matches,
             app_server.codex_home,
             _codex_home_config_source_from_env(),
             getattr(app_server, "config_profile", None),
@@ -4969,6 +4970,42 @@ async def _auto_create_codex_terminal(
         if _codex_catalog and not _codex_catalog_was_stale:
             _fresh_codex_catalog = _codex_catalog
     _session_meta_provider = codex_session_meta_model_provider(_codex_launch)
+    if backend_reusable and not shared_mcp_config_current:
+        latest_bridge_state = read_bridge_state(bridge_dir)
+        process = getattr(app_server, "proc", None)
+        backend_still_reusable = (
+            app_server is not None
+            and process is not None
+            and process.returncode is None
+            and forwarder is not None
+            and not forwarder.done()
+            and latest_bridge_state is not None
+            and latest_bridge_state.thread_id == launch_config.external_session_id
+            and latest_bridge_state.socket_path == app_server.listen_url
+            and latest_bridge_state.codex_home == str(app_server.codex_home)
+        )
+        if (
+            backend_still_reusable
+            and latest_bridge_state is not None
+            and latest_bridge_state.active_turn_id is not None
+        ):
+            _logger.info(
+                "Keeping Codex MCP config for newly active turn; refresh will occur "
+                "on the next terminal recreation or app-server launch: session=%s",
+                session_id,
+                extra={"session_id": session_id},
+            )
+            launched = await _launch_codex_native_tui(
+                session_id,
+                resource_registry,
+                publish_event,
+                app_server=app_server,
+                launch_config=launch_config,
+                bridge_dir=bridge_dir,
+                thread_id=latest_bridge_state.thread_id,
+                agent_spec=agent_spec,
+            )
+            return launched.view
     # Cancel any surviving forwarder first so its teardown closes the OLD app-server,
     # not the one registered below — and so it can't mirror alongside the new one.
     await _cancel_auto_forwarder_task(session_id)

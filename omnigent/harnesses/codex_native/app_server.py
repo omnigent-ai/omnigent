@@ -72,6 +72,7 @@ from omnigent.inner.codex_executor import (
     _populate_codex_home_config,
     _provider_codex_config_overrides,
     codex_extended_catalog_requested,
+    codex_minimal_config_requested,
     codex_router_bridge_dir,
     codex_router_hooks_settings,
     codex_router_session_id,
@@ -862,6 +863,8 @@ def _sync_shared_mcp_server_config(
         source_home,
         profile,
         codex_version=codex_version,
+        codex_home=codex_home,
+        minimal_config=codex_minimal_config_requested(),
     )
     # Omnigent owns this name in the private layer and injects its current
     # bridge command immediately after the shared inventory is refreshed.
@@ -883,7 +886,10 @@ def _sync_shared_mcp_server_config(
 def _validate_mcp_server_inventory(codex_home: Path, expected: frozenset[str]) -> None:
     """Fail startup when the private config does not contain the refreshed inventory."""
     config_path = codex_home / "config.toml"
-    document = tomlkit.parse(config_path.read_text(encoding="utf-8")).unwrap()
+    try:
+        document = tomlkit.parse(config_path.read_text(encoding="utf-8")).unwrap()
+    except (OSError, tomlkit.exceptions.TOMLKitError) as error:
+        raise RuntimeError(f"Invalid Codex MCP inventory config: {config_path}") from error
     servers = document.get("mcp_servers")
     actual = frozenset(servers) if isinstance(servers, dict) else frozenset()
     wanted = expected | {"omnigent"}
@@ -912,8 +918,10 @@ def shared_mcp_server_config_matches(
             source_home,
             profile,
             codex_version=codex_version,
+            codex_home=codex_home,
+            minimal_config=codex_minimal_config_requested(),
         )
-    except (OSError, ValueError):
+    except (OSError, ValueError, tomlkit.exceptions.TOMLKitError):
         # Tolerate incomplete shared config while the app-server is live.
         return True
     expected.pop("omnigent", None)
@@ -922,7 +930,7 @@ def shared_mcp_server_config_matches(
         return not expected
     try:
         document = tomlkit.parse(config_path.read_text(encoding="utf-8")).unwrap()
-    except (OSError, ValueError):
+    except (OSError, ValueError, tomlkit.exceptions.TOMLKitError):
         # Tolerate an incomplete private file while the app-server is live.
         return True
     configured = document.get("mcp_servers")

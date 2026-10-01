@@ -2404,6 +2404,29 @@ async def test_start_refreshes_shared_mcp_servers_across_relaunches(
     assert resumed["projects"]["/private-project"]["trust_level"] == "trusted"
 
 
+async def test_start_minimal_config_does_not_restore_shared_mcp_servers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source_home = tmp_path / "source"
+    source_home.mkdir()
+    (source_home / "config.toml").write_text(
+        '[mcp_servers.shared]\ncommand = "must-not-start"\n', encoding="utf-8"
+    )
+    codex_home = tmp_path / "codex-home"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(source_home))
+    monkeypatch.setenv("HARNESS_CODEX_MINIMAL_CONFIG", "1")
+    _disable_codex_startup_rpc(monkeypatch)
+    server = _test_app_server(tmp_path, codex_home, tmp_path / "bridge", workspace)
+
+    await server.start()
+    await server.close()
+
+    config = tomllib.loads((codex_home / "config.toml").read_text())
+    assert set(config["mcp_servers"]) == {"omnigent"}
+
+
 async def test_mcp_inventory_mismatch_fails_before_process_start(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2433,6 +2456,15 @@ async def test_mcp_inventory_mismatch_fails_before_process_start(
     with pytest.raises(RuntimeError, match=r"missing=\['omnigent'\]"):
         await server.start()
     assert not process_started
+
+
+def test_mcp_inventory_validation_identifies_invalid_config(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.toml"
+    config_path.write_text("[mcp_servers", encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="Invalid Codex MCP inventory config") as error:
+        app_server._validate_mcp_server_inventory(tmp_path, frozenset())
+    assert str(config_path) in str(error.value)
 
 
 def test_shared_mcp_server_config_matches_detects_content_changes(tmp_path: Path) -> None:

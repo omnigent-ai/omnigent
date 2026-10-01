@@ -207,6 +207,17 @@ _BROKERED_CODEX_PROVIDER_NAME = "omnigent_brokered"
 # developer API key that would charge separately.
 _CODEX_ENV_DENY_EXACT: frozenset[str] = frozenset({"OPENAI_API_KEY"})
 
+
+def codex_minimal_config_requested(env: Mapping[str, str] | None = None) -> bool:
+    """Return whether Codex config copying is restricted to routing essentials."""
+    source = os.environ if env is None else env
+    return source.get(_CODEX_MINIMAL_CONFIG_ENV, "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+    }
+
+
 # The codex CLI logs a rejected gateway request to stderr as
 # ``unexpected status <code> <reason>: {...}, url: <url>`` and precedes it with
 # ``Reconnecting... N/5`` retry lines. These parse that shape so the head can
@@ -1136,11 +1147,7 @@ def _populate_codex_home_config(
         return
 
     if minimal_config is None:
-        minimal_config = os.environ.get(_CODEX_MINIMAL_CONFIG_ENV, "").strip().lower() in {
-            "1",
-            "true",
-            "yes",
-        }
+        minimal_config = codex_minimal_config_requested()
     symlink_files: tuple[str, ...] = _CODEX_HOME_SYMLINK_FILES
     if not include_credentials:
         symlink_files = tuple(

@@ -271,7 +271,11 @@ def _resolve_profile_overlay(
     if codex_config_profile(["--profile", profile]) != profile:
         raise ValueError("Invalid Codex config profile name")
     if codex_version is None or codex_version >= (0, 134, 0):
-        overlay = tomlkit.parse((source_home / f"{profile}.config.toml").read_text()).unwrap()
+        profile_path = source_home / f"{profile}.config.toml"
+        try:
+            overlay = tomlkit.parse(profile_path.read_text(encoding="utf-8")).unwrap()
+        except TOMLKitError as error:
+            raise ValueError(f"Invalid Codex config: {profile_path}") from error
     else:
         overlay = base.get("profiles", {}).get(profile)
         if not isinstance(overlay, dict):
@@ -336,6 +340,8 @@ def effective_codex_mcp_servers(
     profile: str | None,
     *,
     codex_version: tuple[int, int, int] | None,
+    codex_home: Path | None = None,
+    minimal_config: bool = False,
 ) -> dict[str, Any]:
     """Return the shared MCP configuration effective for one Codex launch.
 
@@ -344,6 +350,8 @@ def effective_codex_mcp_servers(
     however, and must follow the shared base config plus the selected file
     profile on every cold launch.
     """
+    if minimal_config:
+        return {}
     source_path = source_home / "config.toml"
     try:
         source = (
@@ -355,7 +363,19 @@ def effective_codex_mcp_servers(
         raise ValueError(f"Invalid Codex config: {source_path}") from error
     merged = copy.deepcopy(source)
     if profile is not None:
-        overlay = _resolve_profile_overlay(source, source_home, profile, codex_version)
+        profile_base = source
+        if codex_version is not None and codex_version < (0, 134, 0) and codex_home:
+            state_path = codex_home / ".omnigent-config-profile.toml"
+            config_path = codex_home / "config.toml"
+            if state_path.exists():
+                current = (
+                    tomlkit.parse(config_path.read_text(encoding="utf-8")).unwrap()
+                    if config_path.exists()
+                    else {}
+                )
+                current.pop("developer_instructions", None)
+                profile_base = _profile_base(state_path, current)
+        overlay = _resolve_profile_overlay(profile_base, source_home, profile, codex_version)
         _merge_tables(merged, overlay)
     servers = merged.get("mcp_servers", {})
     if not isinstance(servers, dict):
