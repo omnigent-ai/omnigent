@@ -1029,10 +1029,16 @@ async def test_auto_create_codex_terminal_recovers_without_restarting_healthy_se
     )
     monkeypatch.setattr(codex_app_mod, "CodexAppServerClient", _UnexpectedDiscoveryClient)
     monkeypatch.setattr(codex_app_mod, "preload_codex_thread_for_resume", _fake_preload_thread)
+    mcp_config_checks: list[None] = []
+
+    def _mcp_config_matches(*_args: Any, **_kwargs: Any) -> bool:
+        mcp_config_checks.append(None)
+        return recovery_state != "mcp_changed"
+
     monkeypatch.setattr(
         codex_app_mod,
         "shared_mcp_server_config_matches",
-        lambda *_args, **_kwargs: recovery_state != "mcp_changed",
+        _mcp_config_matches,
     )
     monkeypatch.setattr(
         runner_app_mod,
@@ -1101,6 +1107,12 @@ async def test_auto_create_codex_terminal_recovers_without_restarting_healthy_se
         await asyncio.sleep(0)
 
         reused = recovery_state in {"live", "launch_error", "launch_cancelled"}
+        expected_config_checks = (
+            1
+            if recovery_state in {"live", "mcp_changed", "launch_error", "launch_cancelled"}
+            else 0
+        )
+        assert len(mcp_config_checks) == expected_config_checks
         assert len(app_servers) == (1 if reused else 2)
         assert len(runs) == (1 if reused else 2)
         assert runs[0].cancelled is not reused

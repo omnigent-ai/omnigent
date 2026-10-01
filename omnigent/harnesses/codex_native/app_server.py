@@ -904,12 +904,17 @@ def shared_mcp_server_config_matches(
     *,
     codex_version: tuple[int, int, int] | None,
 ) -> bool:
-    """Return whether a live app-server has the current shared MCP config."""
-    expected = effective_codex_mcp_servers(
-        source_home,
-        profile,
-        codex_version=codex_version,
-    )
+    """Return whether a live app-server has the current valid shared MCP config."""
+    try:
+        expected = effective_codex_mcp_servers(
+            source_home,
+            profile,
+            codex_version=codex_version,
+        )
+    except (OSError, ValueError):
+        # Keep a healthy live session usable while shared config is incomplete.
+        # A cold launch still validates the source and reports the error.
+        return True
     expected.pop("omnigent", None)
     config_path = codex_home / "config.toml"
     if not config_path.exists():

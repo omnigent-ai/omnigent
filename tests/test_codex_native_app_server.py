@@ -2422,6 +2422,26 @@ def test_shared_mcp_server_config_matches_detects_content_changes(tmp_path: Path
     )
 
 
+def test_shared_mcp_server_config_matches_keeps_live_session_on_invalid_source(
+    tmp_path: Path,
+) -> None:
+    source_home = tmp_path / "source"
+    private_home = tmp_path / "private"
+    source_home.mkdir()
+    private_home.mkdir()
+    (source_home / "config.toml").write_text("[mcp_servers", encoding="utf-8")
+    (private_home / "config.toml").write_text(
+        '[mcp_servers.omnigent]\ncommand = "relay"\n', encoding="utf-8"
+    )
+
+    assert app_server.shared_mcp_server_config_matches(
+        private_home, source_home, None, codex_version=(0, 154, 0)
+    )
+    assert app_server.shared_mcp_server_config_matches(
+        private_home, source_home, "removed", codex_version=(0, 154, 0)
+    )
+
+
 async def test_start_can_delegate_global_process_reconciliation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

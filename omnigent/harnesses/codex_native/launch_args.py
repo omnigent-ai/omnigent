@@ -261,6 +261,26 @@ def validate_codex_config_profile_state(codex_home: Path) -> None:
     _profile_base(state_path, current)
 
 
+def _resolve_profile_overlay(
+    base: dict[str, Any],
+    source_home: Path,
+    profile: str,
+    codex_version: tuple[int, int, int] | None,
+) -> dict[str, Any]:
+    """Load and path-resolve one Codex profile overlay."""
+    if codex_config_profile(["--profile", profile]) != profile:
+        raise ValueError("Invalid Codex config profile name")
+    if codex_version is None or codex_version >= (0, 134, 0):
+        overlay = tomlkit.parse((source_home / f"{profile}.config.toml").read_text()).unwrap()
+    else:
+        overlay = base.get("profiles", {}).get(profile)
+        if not isinstance(overlay, dict):
+            raise ValueError(f"Codex config profile {profile!r} does not exist")
+    resolved = copy.deepcopy(overlay)
+    _resolve_profile_paths(resolved, source_home)
+    return resolved
+
+
 def materialize_codex_config_profile(
     codex_home: Path,
     source_home: Path,
@@ -290,17 +310,8 @@ def materialize_codex_config_profile(
     base = _profile_base(state_path, current_config) if state_path.exists() else current_config
     merged = copy.deepcopy(base)
     if profile is not None:
-        if codex_config_profile(["--profile", profile]) != profile:
-            raise ValueError("Invalid Codex config profile name")
-        if codex_version is None or codex_version >= (0, 134, 0):
-            overlay = tomlkit.parse((source_home / f"{profile}.config.toml").read_text()).unwrap()
-        else:
-            overlay = base.get("profiles", {}).get(profile)
-            if not isinstance(overlay, dict):
-                raise ValueError(f"Codex config profile {profile!r} does not exist")
-        overlay = copy.deepcopy(overlay)
+        overlay = _resolve_profile_overlay(base, source_home, profile, codex_version)
         profile_instructions = overlay.pop("developer_instructions", _MISSING)
-        _resolve_profile_paths(overlay, source_home)
         _merge_tables(merged, overlay)
         if overlay.get("sandbox_mode") is not None and overlay.get("default_permissions") is None:
             merged.pop("default_permissions", None)
@@ -337,16 +348,7 @@ def effective_codex_mcp_servers(
     source = tomlkit.parse(source_path.read_text()).unwrap() if source_path.exists() else {}
     merged = copy.deepcopy(source)
     if profile is not None:
-        if codex_config_profile(["--profile", profile]) != profile:
-            raise ValueError("Invalid Codex config profile name")
-        if codex_version is None or codex_version >= (0, 134, 0):
-            overlay = tomlkit.parse((source_home / f"{profile}.config.toml").read_text()).unwrap()
-        else:
-            overlay = source.get("profiles", {}).get(profile)
-            if not isinstance(overlay, dict):
-                raise ValueError(f"Codex config profile {profile!r} does not exist")
-        overlay = copy.deepcopy(overlay)
-        _resolve_profile_paths(overlay, source_home)
+        overlay = _resolve_profile_overlay(source, source_home, profile, codex_version)
         _merge_tables(merged, overlay)
     servers = merged.get("mcp_servers", {})
     if not isinstance(servers, dict):

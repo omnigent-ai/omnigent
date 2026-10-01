@@ -4776,17 +4776,7 @@ async def _auto_create_codex_terminal(
     forwarder = _AUTO_FORWARDER_TASKS.get(session_id)
     bridge_state = read_bridge_state(bridge_dir)
     process = getattr(app_server, "proc", None)
-    shared_mcp_config_current = True
-    if app_server is not None:
-        from omnigent.inner.codex_executor import _codex_home_config_source_from_env
-
-        shared_mcp_config_current = shared_mcp_server_config_matches(
-            app_server.codex_home,
-            _codex_home_config_source_from_env(),
-            getattr(app_server, "config_profile", None),
-            codex_version=getattr(app_server, "codex_cli_version", None),
-        )
-    if (
+    backend_reusable = (
         app_server is not None
         and process is not None
         and process.returncode is None
@@ -4796,8 +4786,19 @@ async def _auto_create_codex_terminal(
         and bridge_state.thread_id == launch_config.external_session_id
         and bridge_state.socket_path == app_server.listen_url
         and bridge_state.codex_home == str(app_server.codex_home)
-        and shared_mcp_config_current
-    ):
+    )
+    shared_mcp_config_current = False
+    if backend_reusable:
+        from omnigent.inner.codex_executor import _codex_home_config_source_from_env
+
+        shared_mcp_config_current = shared_mcp_server_config_matches(
+            app_server.codex_home,
+            _codex_home_config_source_from_env(),
+            getattr(app_server, "config_profile", None),
+            codex_version=getattr(app_server, "codex_cli_version", None),
+        )
+    if backend_reusable and shared_mcp_config_current:
+        assert app_server is not None and bridge_state is not None
         # The TUI is auxiliary: replacing it must not restart an active turn,
         # reinitialize MCP, or cancel transcript forwarding.
         _logger.info(
@@ -4816,7 +4817,7 @@ async def _auto_create_codex_terminal(
             agent_spec=agent_spec,
         )
         return launched.view
-    if app_server is not None and not shared_mcp_config_current:
+    if backend_reusable and not shared_mcp_config_current:
         _logger.info(
             "Restarting Codex app-server to apply shared MCP config for session=%s",
             session_id,
