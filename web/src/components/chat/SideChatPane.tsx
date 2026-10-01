@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { MessagesSquareIcon, TriangleAlertIcon } from "lucide-react";
 import { toast } from "sonner";
+import { useQueryClient } from "@tanstack/react-query";
 import { getCurrentAuthorId } from "@/lib/identity";
 import {
   type Bubble,
@@ -29,6 +30,7 @@ import { Button } from "@/components/ui/button";
 import { useChatStore, ensureConversationStreamed } from "@/store/chatStore";
 import { useConversationEntryState } from "@/hooks/useConversationEntryState";
 import { useDictationInsert } from "@/hooks/useDictationInsert";
+import { useSession } from "@/hooks/useSession";
 import { usesNativeSideChatFork } from "@/lib/sideChat";
 import { interrupt, stopSession } from "@/lib/sessionsApi";
 import { ConversationScopeContext } from "@/components/chat/conversationScope";
@@ -91,7 +93,7 @@ const EMPTY_STATE_BODY = "Ask a question here without affecting the main convers
 export function SideChatPane({
   childId,
   onStart,
-  readOnly = false,
+  readOnly: restoredReadOnly = false,
 }: {
   childId: string;
   onStart?: (text: string) => Promise<void>;
@@ -101,6 +103,9 @@ export function SideChatPane({
 }) {
   const pending = isPendingSideChat(childId);
   const [starting, setStarting] = useState(false);
+  // The server seals a side chat whose fork died with its runner.
+  const { session } = useSession(pending ? null : childId);
+  const readOnly = restoredReadOnly || session?.labels?.["omnigent.closed"] === "true";
   // Open the child's stream once (real tabs only) so it hydrates and streams
   // here. The store guards a double-bind and re-binds a failed entry, so
   // re-mounts / tab switches / retries are cheap.
@@ -334,6 +339,7 @@ function SideChatComposer({
   onStart?: (text: string) => Promise<void>;
 }) {
   const send = useChatStore((s) => s.send);
+  const queryClient = useQueryClient();
   const clearSideChatDraft = useChatStore((s) => s.clearSideChatDraft);
   const [text, setText] = useState("");
   const [files, setFiles] = useState<File[]>([]);
@@ -387,6 +393,9 @@ function SideChatComposer({
     setFiles([]);
     void send(trimmed, agentId, outgoing.length > 0 ? outgoing : undefined, {
       pinnedConversationId: childId,
+    }).finally(() => {
+      // Re-read the labels so a side chat the server just sealed turns read-only.
+      void queryClient.invalidateQueries({ queryKey: ["session", childId] });
     });
   };
 
