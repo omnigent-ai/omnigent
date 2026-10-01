@@ -429,7 +429,7 @@ async function launchDesktop(opts) {
     // Native overlays can appear before the shell. Wait for its loaded page
     // instead of treating the first WebContents as the application window.
     const deadline = Date.now() + 20_000;
-    while (!window) {
+    for (;;) {
       window = electronApp.windows().find((page) => {
         const url = page.url();
         return /^https?:/.test(url) || /\/(setup|server-selector-v2)\/index\.html/.test(url);
