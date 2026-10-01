@@ -4465,3 +4465,155 @@ describe("file navigation request precedence", () => {
     expect(screen.getByTestId("url-params")).not.toHaveTextContent("column=");
   });
 });
+
+describe("AppShell design-mode submission", () => {
+  let submit: (payload: {
+    conversationId: string;
+    id: number;
+    element: { tag: string; id: string };
+    prompt: string;
+  }) => void;
+  let select: (payload: { conversationId: string; screenshot: string }) => void;
+  const send = vi.fn().mockResolvedValue(undefined);
+  const enqueueMessage = vi.fn();
+  const signal = vi.fn().mockResolvedValue({ ok: true });
+  let chat: ReturnType<typeof useChatStore.getState>;
+  let restoreGetState: () => void;
+
+  beforeEach(() => {
+    chat = { ...useChatStore.getState() };
+    const getState = vi.spyOn(useChatStore, "getState").mockImplementation(() => chat);
+    restoreGetState = () => getState.mockRestore();
+    send.mockClear();
+    enqueueMessage.mockClear();
+    enqueueMessage.mockImplementation((text: string, files?: File[]) => {
+      chat.queuedMessages.push({
+        queueId: `queued_${chat.queuedMessages.length}`,
+        conversationId: chat.conversationId!,
+        text,
+        files,
+      });
+    });
+    signal.mockClear();
+    vi.stubGlobal("omnigentDesktop", {
+      kind: "electron",
+      browserOpenOrNavigate: vi.fn(),
+      setBadgeCount: vi.fn(),
+      onBrowserElementSelected: (cb: typeof select) => {
+        select = cb;
+        return () => {};
+      },
+      onBrowserElementPromptSubmit: (cb: typeof submit) => {
+        submit = cb;
+        return () => {};
+      },
+      browserSignalDesignResult: signal,
+    });
+    mockConversations([{ id: "conv_design", permission_level: null }]);
+    useSessionAgentMock.mockReturnValue({ data: { id: "agent_design" } } as ReturnType<
+      typeof useSessionAgent
+    >);
+    Object.assign(chat, {
+      conversationId: "conv_design",
+      boundAgentId: "agent_design",
+      queuedMessages: [],
+      status: "streaming",
+      sessionStatus: "running",
+      send,
+      enqueueMessage,
+    });
+  });
+
+  afterEach(() => {
+    cleanup();
+    vi.unstubAllGlobals();
+    restoreGetState();
+  });
+
+  function submitInstruction(prompt = "Use a week picker.") {
+    act(() => {
+      select({ conversationId: "conv_design", screenshot: "data:image/png;base64,AQID" });
+      submit({
+        conversationId: "conv_design",
+        id: 1,
+        element: { tag: "input", id: "#period" },
+        prompt,
+      });
+    });
+  }
+
+  it.each([
+    { preference: null, busy: true, backlog: false, queued: true },
+    { preference: "false", busy: true, backlog: false, queued: true },
+    { preference: "true", busy: true, backlog: false, queued: false },
+    { preference: "true", busy: true, backlog: true, queued: true },
+    { preference: null, busy: false, backlog: false, queued: false },
+  ])("routes with $preference always-steer, busy=$busy, backlog=$backlog", async (test) => {
+    if (test.preference !== null) localStorage.setItem("omnigent:always-steer", test.preference);
+    Object.assign(chat, {
+      status: test.busy ? "streaming" : "idle",
+      sessionStatus: test.busy ? "running" : "idle",
+      queuedMessages: test.backlog
+        ? [{ queueId: "earlier", conversationId: "conv_design", text: "Earlier change" }]
+        : [],
+    });
+    renderShell("/c/conv_design");
+    submitInstruction();
+
+    const dispatched = test.queued ? enqueueMessage : send;
+    expect(dispatched).toHaveBeenCalledTimes(1);
+    expect(test.queued ? send : enqueueMessage).not.toHaveBeenCalled();
+    const args = dispatched.mock.calls[0];
+    expect(args[0]).toContain("Use a week picker.");
+    expect(args[0]).toContain("CSS selector: #period");
+    const files = args[test.queued ? 1 : 2] as File[];
+    expect(files).toHaveLength(1);
+    expect(files[0]).toMatchObject({ name: "design-element-1.png", type: "image/png", size: 3 });
+    await waitFor(() =>
+      expect(signal).toHaveBeenCalledWith("conv_design", {
+        id: 1,
+        ok: true,
+        message: test.queued ? "Queued for agent." : "Sent to agent.",
+      }),
+    );
+  });
+
+  it("reads a changed always-steer preference at submission without remounting", () => {
+    localStorage.setItem("omnigent:always-steer", "true");
+    renderShell("/c/conv_design");
+    submitInstruction();
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(chat.queuedMessages).toHaveLength(0);
+    localStorage.setItem("omnigent:always-steer", "false");
+    submitInstruction();
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(enqueueMessage).toHaveBeenCalledTimes(1);
+    expect(chat.queuedMessages).toHaveLength(1);
+  });
+
+  it("preserves queued instructions when always-steer is enabled mid-session", () => {
+    renderShell("/c/conv_design");
+    submitInstruction("First change");
+    localStorage.setItem("omnigent:always-steer", "true");
+    submitInstruction("Second change");
+    expect(send).not.toHaveBeenCalled();
+    expect(enqueueMessage).toHaveBeenCalledTimes(2);
+    expect(chat.queuedMessages.map((message) => message.text.split("\n")[0])).toEqual([
+      "First change",
+      "Second change",
+    ]);
+  });
+
+  it("rejects a late pointer submission after switching to another session", () => {
+    renderShell("/c/conv_design");
+    chat.conversationId = "conv_other";
+    submitInstruction();
+    expect(enqueueMessage).not.toHaveBeenCalled();
+    expect(send).not.toHaveBeenCalled();
+    expect(signal).toHaveBeenCalledWith("conv_design", {
+      id: 1,
+      ok: false,
+      message: "Return to this session before sending.",
+    });
+  });
+});

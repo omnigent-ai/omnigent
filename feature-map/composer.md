@@ -31,6 +31,8 @@ and steers messages while the agent is busy.
 - `send-shortcut`: Enter or Mod+Enter, chosen in settings; only one gesture sends.
 - `queue-and-steer`: messages sent while the agent is busy wait in a queue and
   can be steered into the running turn.
+- `browser-pointer-queue`: desktop Design-mode instructions follow the same queue
+  and always-steer preference, keeping their element screenshots.
 - `draft-persistence`: unsent text survives arriving messages and prompts.
 - `mobile-labels`: on narrow screens labels collapse to icons without
   overlapping the stop button.
@@ -47,6 +49,13 @@ and steers messages while the agent is busy.
 - Type `/` in the message box; attach files with the button, by paste, or by
   dropping them on the transcript.
 - Send while the agent is working to queue a message, then steer it.
+
+**Desktop browser pointer** (open a session in the desktop app):
+
+- Open the Browser tab, navigate to a page, enable Design mode, and click an
+  element. Type an instruction in the floating popup and use Send or Enter.
+- Change Settings → Always steer to choose whether busy-session follow-ups
+  queue or send immediately. Existing queued messages retain FIFO ordering.
 
 **New-session composer** (landing page, or New session):
 
@@ -107,6 +116,13 @@ Tests under `tests/browser_ui/` stub every backend call and need no instance:
 - **`queue-and-steer`:**
   `tests/e2e_ui/chat/test_queue_steer.py::test_steer_sends_queued_message_while_busy`,
   `tests/e2e_ui/chat/test_composer_bulk_steer.py::test_bulk_steer_retries_the_whole_queue`
+- **`browser-pointer-queue`, desktop:** manually hold an agent turn open, then
+  send a normal composer follow-up and two pointer instructions (Send and Enter).
+  With Always steer off, all three stay queued and the popup says "Queued for
+  agent." After the turn ends, verify FIFO delivery and each pointer screenshot.
+  Repeat in a fresh session with Always steer on: both entry points send while
+  busy and the pointer popup says "Sent to agent." If older messages are already
+  queued, new pointer instructions must join them even with Always steer on.
 - **`draft-persistence`:**
   `tests/e2e_ui/chat/test_draft_survives_incoming_messages.py::test_mid_typing_answer_survives_arriving_prompt`
 - **`mobile-labels`, new-session composer:**

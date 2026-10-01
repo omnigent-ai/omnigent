@@ -36,6 +36,8 @@ import {
   updateBridge,
 } from "@/lib/nativeBridge";
 import { onBrowserActionRequest } from "@/lib/browserActionBus";
+import { readAlwaysSteer } from "@/lib/alwaysSteerPreferences";
+import { shouldQueueSend } from "@/lib/messageQueue";
 import { onInAppLinkOpen } from "@/lib/openLinkInApp";
 import {
   buildDesignModePrompt,
@@ -951,11 +953,29 @@ export function AppShell() {
         const text = buildDesignModePrompt(payload.element, payload.prompt);
         const shot = designShotRef.current.get(cid);
         const file = dataUrlToFile(shot, `design-element-${submitId}.png`);
-        void useChatStore
-          .getState()
-          .send(text, boundAgentId, file ? [file] : undefined)
-          .then(() => signal(true, "Sent to agent."))
-          .catch((err: unknown) => signal(false, `Send failed: ${String(err)}`));
+        const chat = useChatStore.getState();
+        if (cid !== chat.conversationId) {
+          signal(false, "Return to this session before sending.");
+          return;
+        }
+        const files = file ? [file] : undefined;
+        if (
+          shouldQueueSend(
+            cid,
+            chat.status,
+            chat.sessionStatus,
+            chat.queuedMessages,
+            readAlwaysSteer(),
+          )
+        ) {
+          chat.enqueueMessage(text, files);
+          signal(true, "Queued for agent.");
+        } else {
+          void chat
+            .send(text, boundAgentId, files)
+            .then(() => signal(true, "Sent to agent."))
+            .catch((err: unknown) => signal(false, `Send failed: ${String(err)}`));
+        }
         // Clear the stashed screenshot so a later submit without a fresh pick
         // doesn't reuse a stale crop.
         designShotRef.current.delete(cid);

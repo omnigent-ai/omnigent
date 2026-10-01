@@ -94,7 +94,6 @@ import {
   isStaleTempConvId,
   isTempConvId,
   type PendingInitialPrompt,
-  type QueuedMessage,
   useChatStore,
 } from "@/store/chatStore";
 import {
@@ -112,6 +111,7 @@ import {
   supportsSideChat,
   usesNativeSideChatFork,
 } from "@/lib/sideChat";
+import { shouldQueueSend } from "@/lib/messageQueue";
 import { readAlwaysSteer } from "@/lib/alwaysSteerPreferences";
 import { skillInvocationPrefix } from "@/lib/harnessSetup";
 import { DEVIN_NATIVE_PERMISSION_MODES } from "@/lib/nativeHarnessModes";
@@ -340,49 +340,6 @@ export function splitSlashCommand(
   if (!m) return null;
   const [, before, token] = m;
   return { before, token, after: value.slice(before.length + token.length) };
-}
-
-/**
- * Whether a submitted message should be queued rather than POSTed now.
- *
- * Queue when busy, or when this conversation already has a queued message even
- * if it reads idle: the direct-send and queue-drain paths aren't ordered, so a
- * later direct send could overtake a still-queued earlier one when status
- * flickers idle mid-queue (cursor-native). A new chat always sends.
- *
- * ``waiting`` is NOT busy for queueing: it means the turn already ended and the
- * agent loop is only parked on background work (background shells / sub-agents)
- * — the server's turn gate is already free, so a new message starts a fresh
- * turn immediately instead of stalling behind that background work. (The
- * "Working…" spinner and sidebar dot still treat ``waiting`` as active — those
- * reflect background activity, which is a separate concern from send gating.)
- *
- * ``alwaysSteer`` (a per-device preference) drops the busy gate entirely: a
- * follow-up sent mid-turn is POSTed now — steered into the running turn —
- * instead of parking in the queue strip. The ``hasQueued`` guard still holds:
- * once this conversation has a queued message it must drain in order, or a
- * direct send could overtake a still-queued earlier one on an idle flicker.
- *
- * ``opensSideChat`` (a codex ``/side`` command) always POSTs now. A side chat is
- * forked onto its own thread and is non-interrupting by design — asking while
- * the agent works is the whole point — so it must not park in the queue behind
- * the parent's active turn. It shares no ordering with main-thread sends, so it
- * bypasses ``hasQueued`` too.
- */
-export function shouldQueueSend(
-  conversationId: string | null,
-  status: "idle" | "streaming",
-  sessionStatus: SessionStatus,
-  queuedMessages: QueuedMessage[],
-  alwaysSteer = false,
-  opensSideChat = false,
-): boolean {
-  if (conversationId === null) return false;
-  if (opensSideChat) return false;
-  const hasQueued = queuedMessages.some((m) => m.conversationId === conversationId);
-  if (alwaysSteer) return hasQueued;
-  const isBusy = status === "streaming" || sessionStatus === "running";
-  return isBusy || hasQueued;
 }
 
 // Iterate code points (not UTF-16 units) so emoji aren't cut mid-surrogate;
