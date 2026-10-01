@@ -183,3 +183,34 @@ def test_delivery_diagnostics(
         assert attrs["stage"] == "checking_pending_prompt"
         assert attrs["submit_sent"] is False
         assert enters == 0
+
+
+@pytest.mark.parametrize("delivery_fails", [False, True])
+def test_summary_logging_failure_preserves_delivery_outcome(
+    delivery_fails: bool,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    log_calls = 0
+
+    def broken_log(*args: object, **kwargs: object) -> None:
+        nonlocal log_calls
+        log_calls += 1
+        raise OSError("log destination unavailable")
+
+    @bridge._trace_user_message_delivery
+    def deliver(bridge_dir: Path, *, content: str) -> str:
+        if delivery_fails:
+            raise RuntimeError("delivery failed")
+        return "delivered"
+
+    monkeypatch.setattr(bridge._logger, "log", broken_log)
+    with caplog.at_level("INFO", logger=bridge.__name__):
+        if delivery_fails:
+            with pytest.raises(RuntimeError, match="delivery failed"):
+                deliver(tmp_path, content="test prompt")
+        else:
+            assert deliver(tmp_path, content="test prompt") == "delivered"
+    assert log_calls == 1
+    assert bridge._prompt_delivery_trace.get() is None

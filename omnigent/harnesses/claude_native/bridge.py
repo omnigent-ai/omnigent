@@ -4022,7 +4022,7 @@ def _trace_user_message_delivery(function: _InjectionFunction) -> _InjectionFunc
                         "delivery_id": trace.delivery_id,
                         "stage": trace.stage,
                         "attempt": len(trace.attempts),
-                        "elapsed_ms": round((trace.stage_started - trace.started) * 1000),
+                        "elapsed_ms": round((time.monotonic() - trace.started) * 1000),
                         "content_bytes": len(content.encode("utf-8")),
                         "newline_count": normalized.count("\n"),
                         "leading_blank_line": bool(normalized)
@@ -4049,6 +4049,8 @@ def _trace_user_message_delivery(function: _InjectionFunction) -> _InjectionFunc
                         json.dumps(fields),
                         extra=extra,
                     )
+            except Exception:  # noqa: BLE001 — diagnostics must not change delivery outcomes
+                pass
             finally:
                 _prompt_delivery_trace.reset(token)
 
