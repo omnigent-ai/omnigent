@@ -13,7 +13,8 @@ from pathlib import Path
 
 import pytest
 
-from omnigent.runner.app import ResolvedSpec, _claude_native_model_from_spec
+from omnigent.runner.app import ResolvedSpec
+from omnigent.runner.native.orchestration import _claude_native_model_from_spec
 from omnigent.spec.types import AgentSpec, ExecutorSpec
 
 

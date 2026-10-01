@@ -293,7 +293,7 @@ def _builtin_native_provider(key: str) -> NativeHarnessProvider:
     return NativeHarnessProvider(
         key=key,
         run_native=f"{module}:run_{key}_native",
-        auto_create_terminal=f"omnigent.runner.native:_launch_{key}",
+        auto_create_terminal=f"omnigent.runner.native.orchestration:_launch_{key}",
         spawn_env_builder=f"{pkg}.bridge:build_{key}_native_spawn_env",
         # Session label key — a stable wire identifier, not a module path.
         bridge_id_label_key=(

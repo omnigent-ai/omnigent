@@ -36,7 +36,7 @@ from omnigent.version import VERSION
 if TYPE_CHECKING:
     from types import TracebackType
 
-    from omnigent.runner.native import ResolvedSpec
+    from omnigent.runner.native.orchestration import ResolvedSpec
     from omnigent.runner.transports.ws_tunnel.serve import _ASGIApp
     from omnigent.spec.types import AgentSpec
 
@@ -1270,7 +1270,7 @@ async def _resolve_agent_spec_from_server(
     :raises RuntimeError: If the server returns a non-200 status
         other than 404.
     """
-    from omnigent.runner.native import ResolvedSpec
+    from omnigent.runner.native.orchestration import ResolvedSpec
     from omnigent.spec import load
 
     if session_id is None:
@@ -1563,7 +1563,7 @@ def create_app(
         if _pane_reaper is not None:
             await _pane_reaper.shutdown()
         # Host shutdown skips per-session deletion, so close native servers here.
-        from omnigent.runner.native import (
+        from omnigent.runner.native.orchestration import (
             teardown_all_codex_native_app_servers,
             teardown_all_opencode_native_servers,
         )

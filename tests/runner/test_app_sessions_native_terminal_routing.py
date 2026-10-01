@@ -241,7 +241,7 @@ async def test_create_session_terminal_ensure_failure_returns_json_without_live_
         "omnigent.runner.native.orchestration._auto_create_claude_terminal", _failing_auto_create
     )
     monkeypatch.setattr(
-        "omnigent.runner.app._publish_native_terminal_start_error",
+        "omnigent.runner.native.orchestration._publish_native_terminal_start_error",
         _unexpected_live_publish,
     )
 

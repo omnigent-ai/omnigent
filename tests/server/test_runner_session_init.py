@@ -214,7 +214,7 @@ def test_reconnect_init_envelope_carries_fork_history_directives(db_uri: str) ->
 
     # And the runner's own projection reads them as launch directives -- the
     # boolean the clone/rebuild branch gates on.
-    from omnigent.runner.app import _claude_launch_metadata_from_envelope
+    from omnigent.runner.native.orchestration import _claude_launch_metadata_from_envelope
 
     metadata = _claude_launch_metadata_from_envelope(envelope)
     assert metadata.fork_carry_history is True

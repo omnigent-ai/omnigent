@@ -50,6 +50,10 @@ from omnigent.runner import app as runner_app
 from omnigent.runner import create_runner_app
 from omnigent.runner.app import (
     ResolvedSpec,
+    _log_terminal_lookup_miss,
+    _publish_terminal_pending,
+)
+from omnigent.runner.native.orchestration import (
     _agent_os_env_from_spec,
     _auto_create_claude_terminal,
     _auto_create_cursor_terminal,
@@ -57,10 +61,8 @@ from omnigent.runner.app import (
     _auto_create_pi_terminal,
     _KiroNativeLaunchConfig,
     _load_claude_launch_metadata,
-    _log_terminal_lookup_miss,
     _PiNativeLaunchConfig,
     _publish_native_terminal_start_error,
-    _publish_terminal_pending,
     _terminal_lookup_miss_log_state,
 )
 from omnigent.runner.resource_registry import (
@@ -190,7 +192,10 @@ async def test_auto_create_pi_terminal_launches_required_terminal(
             external_session_id=None,
         )
 
-    monkeypatch.setattr("omnigent.runner.app._pi_native_launch_config", _fake_launch_config)
+    monkeypatch.setattr(
+        "omnigent.runner.native.orchestration._pi_native_launch_config",
+        _fake_launch_config,
+    )
 
     captured: dict[str, Any] = {}
 
@@ -287,7 +292,10 @@ async def test_auto_create_pi_terminal_keeps_tmux_alive_after_pi_exit(
             external_session_id=None,
         )
 
-    monkeypatch.setattr("omnigent.runner.app._pi_native_launch_config", _fake_launch_config)
+    monkeypatch.setattr(
+        "omnigent.runner.native.orchestration._pi_native_launch_config",
+        _fake_launch_config,
+    )
 
     captured: dict[str, Any] = {}
 
@@ -377,7 +385,10 @@ async def test_auto_create_pi_terminal_surfaces_credential_warning(
             external_session_id=None,
         )
 
-    monkeypatch.setattr("omnigent.runner.app._pi_native_launch_config", _fake_launch_config)
+    monkeypatch.setattr(
+        "omnigent.runner.native.orchestration._pi_native_launch_config",
+        _fake_launch_config,
+    )
 
     class _FakeResourceRegistry:
         terminal_registry = None
@@ -474,7 +485,10 @@ async def test_auto_create_pi_terminal_effort_notice_posts_info_level(
             external_session_id=None,
         )
 
-    monkeypatch.setattr("omnigent.runner.app._pi_native_launch_config", _fake_launch_config)
+    monkeypatch.setattr(
+        "omnigent.runner.native.orchestration._pi_native_launch_config",
+        _fake_launch_config,
+    )
 
     class _FakeResourceRegistry:
         terminal_registry = None
@@ -551,7 +565,10 @@ async def test_auto_create_pi_terminal_unmanaged_keeps_pinned_model(
             model_override="anthropic/claude-sonnet-4-5",
         )
 
-    monkeypatch.setattr("omnigent.runner.app._pi_native_launch_config", _fake_launch_config)
+    monkeypatch.setattr(
+        "omnigent.runner.native.orchestration._pi_native_launch_config",
+        _fake_launch_config,
+    )
 
     captured: dict[str, Any] = {}
 
@@ -616,7 +633,10 @@ async def test_auto_create_pi_terminal_unmanaged_refuses_slash_bearing_managed_m
             model_override="omnigent/moonshotai/kimi-k2.5",
         )
 
-    monkeypatch.setattr("omnigent.runner.app._pi_native_launch_config", _fake_launch_config)
+    monkeypatch.setattr(
+        "omnigent.runner.native.orchestration._pi_native_launch_config",
+        _fake_launch_config,
+    )
 
     captured: dict[str, Any] = {}
 
@@ -695,7 +715,10 @@ async def test_auto_create_kiro_terminal_launches_required_terminal_with_isolate
             external_session_id="kiro-session-123",
         )
 
-    monkeypatch.setattr("omnigent.runner.app._kiro_native_launch_config", _fake_launch_config)
+    monkeypatch.setattr(
+        "omnigent.runner.native.orchestration._kiro_native_launch_config",
+        _fake_launch_config,
+    )
 
     captured: dict[str, Any] = {}
 
@@ -843,7 +866,10 @@ async def test_auto_create_kiro_terminal_skips_mcp_wiring_without_relay(
             external_session_id=None,
         )
 
-    monkeypatch.setattr("omnigent.runner.app._kiro_native_launch_config", _fake_launch_config)
+    monkeypatch.setattr(
+        "omnigent.runner.native.orchestration._kiro_native_launch_config",
+        _fake_launch_config,
+    )
 
     class _FakeResourceRegistry:
         terminal_registry = None
@@ -917,7 +943,10 @@ async def test_auto_create_pi_terminal_inherits_agent_sandbox(
             external_session_id=None,
         )
 
-    monkeypatch.setattr("omnigent.runner.app._pi_native_launch_config", _fake_launch_config)
+    monkeypatch.setattr(
+        "omnigent.runner.native.orchestration._pi_native_launch_config",
+        _fake_launch_config,
+    )
 
     captured: dict[str, Any] = {}
 

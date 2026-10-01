@@ -14,7 +14,7 @@ from typing import Any
 import httpx
 import pytest
 
-from omnigent.runner.app import (
+from omnigent.runner.native.orchestration import (
     _pi_native_launch_config,
     _PiNativeLaunchConfig,
     _resolve_pi_resume_session,

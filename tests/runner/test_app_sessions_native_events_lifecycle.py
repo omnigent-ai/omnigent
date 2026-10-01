@@ -2318,14 +2318,16 @@ async def test_events_stop_on_codex_native_cancels_mcp_startup_without_active_tu
     # ``clear_bridge_state`` — otherwise the seeded bridge state below is
     # wiped on hosts where the codex CLI/provider config exist (in CI the
     # auto-create aborts on its own before the clear).
-    from omnigent.runner import app as runner_app_module
 
     async def _fail_launch_config(**kwargs: Any) -> None:
         """Abort codex auto-create before it clears bridge state."""
         del kwargs
         raise RuntimeError("launch config disabled in test")
 
-    monkeypatch.setattr(runner_app_module, "_codex_native_launch_config", _fail_launch_config)
+    monkeypatch.setattr(
+        "omnigent.runner.native.orchestration._codex_native_launch_config",
+        _fail_launch_config,
+    )
     bridge_dir = codex_native_bridge.bridge_dir_for_bridge_id(conv_id)
     codex_native_bridge.write_bridge_state(
         bridge_dir,
@@ -2452,14 +2454,16 @@ async def test_events_interrupt_on_codex_native_with_turn_and_mcp_stops_both(
     monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path / "codex-bridge")
     # Keep the seeded bridge state alive through session create (see the
     # sister startup-cancel test for why auto-create must abort early).
-    from omnigent.runner import app as runner_app_module
 
     async def _fail_launch_config(**kwargs: Any) -> None:
         """Abort codex auto-create before it clears bridge state."""
         del kwargs
         raise RuntimeError("launch config disabled in test")
 
-    monkeypatch.setattr(runner_app_module, "_codex_native_launch_config", _fail_launch_config)
+    monkeypatch.setattr(
+        "omnigent.runner.native.orchestration._codex_native_launch_config",
+        _fail_launch_config,
+    )
     bridge_dir = codex_native_bridge.bridge_dir_for_bridge_id(conv_id)
     codex_native_bridge.write_bridge_state(
         bridge_dir,
@@ -2567,14 +2571,16 @@ async def test_events_interrupt_on_codex_native_without_turn_or_mcp_is_noop(
     monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path / "codex-bridge")
     # Keep the seeded bridge state alive through session create (see the
     # sister startup-cancel test for why auto-create must abort early).
-    from omnigent.runner import app as runner_app_module
 
     async def _fail_launch_config(**kwargs: Any) -> None:
         """Abort codex auto-create before it clears bridge state."""
         del kwargs
         raise RuntimeError("launch config disabled in test")
 
-    monkeypatch.setattr(runner_app_module, "_codex_native_launch_config", _fail_launch_config)
+    monkeypatch.setattr(
+        "omnigent.runner.native.orchestration._codex_native_launch_config",
+        _fail_launch_config,
+    )
     bridge_dir = codex_native_bridge.bridge_dir_for_bridge_id(conv_id)
     codex_native_bridge.write_bridge_state(
         bridge_dir,

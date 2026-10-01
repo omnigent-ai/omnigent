@@ -20,11 +20,12 @@ from omnigent.harnesses.claude_native.main import (
     ClaudeNativeUcodeConfig,
     build_native_claude_terminal_env,
 )
-from omnigent.runner.app import _build_claude_native_base_args, _claude_terminal_env_unset
 from omnigent.runner.native.orchestration import (
     _ROUTED_SPAWN_ALLOWED_TOOLS,
+    _build_claude_native_base_args,
     _claude_launch_metadata_from_envelope,
     _claude_launch_permission_mode,
+    _claude_terminal_env_unset,
     _load_claude_launch_metadata,
     _load_legacy_claude_launch_metadata,
     _routed_spawn_launch_args,

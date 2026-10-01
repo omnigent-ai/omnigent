@@ -14,7 +14,7 @@ from typing import Any
 
 import httpx
 
-from omnigent.runner.app import _build_opencode_policy_evaluator
+from omnigent.runner.native.orchestration import _build_opencode_policy_evaluator
 
 
 class _FakeServerClient:

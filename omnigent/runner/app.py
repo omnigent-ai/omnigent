@@ -45,6 +45,7 @@ import httpx
 from fastapi import FastAPI, HTTPException, Query, Request, WebSocket
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
+import omnigent.runner.native.orchestration as _native_runtime
 from omnigent.entities.session_resources import (
     DEFAULT_ENVIRONMENT_ID,
     SessionResourceView,
@@ -86,7 +87,6 @@ from omnigent.observability.debug_logging import (
 )
 from omnigent.observability.process_logging import process_log_reference
 from omnigent.policies.types import FAIL_CLOSED_PHASES
-from omnigent.runner import native as _native
 from omnigent.runner import pending_approvals
 from omnigent.runner.background_titles import (
     BackgroundTitleContext,
@@ -104,7 +104,8 @@ from omnigent.runner.mcp_execution_registry import (
     McpExecutionRegistry,
     McpExecutionResult,
 )
-from omnigent.runner.native import (
+from omnigent.runner.native.interrupt import MarkSubagentTerminalAndWake, NativeInterruptRunner
+from omnigent.runner.native.orchestration import (
     _AUTO_OPENCODE_SERVERS,
     _COST_POPUP_REPOP_TASKS,
     _REPL_TERMINAL_NAME,
@@ -148,8 +149,6 @@ from omnigent.runner.native import (
     _session_payload_for_host_spawn_check,
     _unwrap_resolved_spec,
 )
-from omnigent.runner.native import orchestration as _native_runtime
-from omnigent.runner.native.interrupt import MarkSubagentTerminalAndWake, NativeInterruptRunner
 from omnigent.runner.proxy_mcp_manager import ProxyMcpManager
 from omnigent.runner.resource_registry import (
     CLAUDE_NATIVE_TERMINAL_ROLE,
@@ -284,53 +283,6 @@ def _warn_unresolved_sub_agent(session_id: str | None, sub_agent_name: str) -> N
         sub_agent_name,
         session_id,
     )
-
-
-def __getattr__(name: str) -> object:
-    """Preserve private native-helper imports during the package move."""
-    return cast(object, getattr(_native, name))
-
-
-class _NativeBuilderCall(Protocol):
-    async def __call__(self, *args: object, **kwargs: object) -> object: ...
-
-
-def _native_builder(name: str) -> _NativeBuilderCall:
-    async def _call(*args: object, **kwargs: object) -> object:
-        overrides: list[tuple[str, object]] = []
-        for dependency in _native.__all__:
-            if not dependency.startswith("_auto_create_") and dependency in globals():
-                app_value = globals()[dependency]
-                runtime_value = getattr(_native_runtime, dependency)
-                if app_value is not runtime_value:
-                    overrides.append((dependency, runtime_value))
-                    setattr(_native_runtime, dependency, app_value)
-        try:
-            builder = cast(_NativeBuilderCall, getattr(_native_runtime, name))
-            return await builder(*args, **kwargs)
-        finally:
-            for dependency, runtime_value in reversed(overrides):
-                setattr(_native_runtime, dependency, runtime_value)
-
-    return _call
-
-
-for _builder_name in (
-    "_auto_create_antigravity_terminal",
-    "_auto_create_claude_terminal",
-    "_auto_create_codex_terminal",
-    "_auto_create_cursor_terminal",
-    "_auto_create_devin_terminal",
-    "_auto_create_goose_terminal",
-    "_auto_create_hermes_terminal",
-    "_auto_create_kimi_terminal",
-    "_auto_create_kiro_terminal",
-    "_auto_create_opencode_terminal",
-    "_auto_create_pi_terminal",
-    "_auto_create_qwen_terminal",
-    "_auto_create_repl_terminal",
-):
-    globals()[_builder_name] = _native_builder(_builder_name)
 
 
 # Servers before 0.3.0 cannot serialize the runner's "waiting" status.

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-import omnigent.runner.app as app
+import omnigent.runner.native.orchestration as app
 
 _ITEMS: list[dict[str, Any]] = [
     {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]},
