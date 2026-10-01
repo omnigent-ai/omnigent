@@ -108,6 +108,21 @@ function harness({
 }
 
 describe("browser local network permissions", () => {
+  it("rejects reattaching a policy without disrupting the original tab", async () => {
+    const session = permissionSession();
+    const saved = storage();
+    const a = harness({ session, saved });
+    const b = harness({ session, saved, visible: false });
+    assert.throws(() => a.policy.attach(b.wc), /already attached/);
+    b.destroy();
+    const result = a.request();
+    await tick();
+    assert.equal(a.dialogs.length, 1);
+    a.respond("allow-once");
+    assert.equal(await result, true);
+    assert.equal(a.check(), true);
+  });
+
   it("routes shared-partition permissions to each tab and preserves surviving tabs on close", async () => {
     const session = permissionSession();
     const saved = storage();

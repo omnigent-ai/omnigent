@@ -33,8 +33,8 @@ function policiesForSession(session) {
       ? policies.get(contents)
       : [...policies.values()].find((candidate) => candidate.canPrompt());
     if (policy?.check(contents, permission, origin, details)) return true;
-    // Unattributed background checks may use saved site grants, but cannot
-    // borrow a hidden tab's one-visit consent or open a prompt.
+    // Unknown attributed views stay denied. Context-free checks may use saved
+    // site grants, but cannot borrow hidden one-visit consent or open a prompt.
     return (
       !contents && [...policies.values()].some((p) => p.checkSaved(permission, origin, details))
     );
@@ -208,6 +208,7 @@ function registerBrowserPermissions(session, { canPrompt, showPrompt, store }) {
 
   return {
     attach(webContents) {
+      if (contents) throw new Error("Browser permission policy is already attached");
       contents = webContents;
       policies.set(contents, {
         request: handleRequest,

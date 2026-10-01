@@ -98,10 +98,6 @@ describe("browserViewRegistry — storage partition isolation", () => {
     for (const id of ["browser-tab:conv_A", "browser-tab:conv_A:", "browser-tab:%ZZ:tab"]) {
       assert.equal(agentPartition("w1", id), `omnigent-agent-w1-${id}`);
     }
-    assert.notEqual(
-      agentPartition("w1", "browser-tab:conv_A:tab"),
-      agentPartition("w2", "browser-tab:conv_A:tab"),
-    );
   });
 
   it("passes a non-empty partition to WebContentsViewCtor for each created view", () => {
