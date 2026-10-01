@@ -7,34 +7,14 @@ the rest of the real UI runs against the live e2e server.
 
 from __future__ import annotations
 
-import asyncio
-import threading
-from collections.abc import Coroutine
-from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 from playwright.async_api import Page, Route, async_playwright, expect
 
+from tests._helpers.async_thread import run_in_fresh_loop as _run_in_fresh_loop
 from tests.e2e_ui.start_session.helpers import stub_empty_host_picker_data
 
 _HOST_ID = "host_import_e2e"
-
-
-def _run_in_fresh_loop(coro: Coroutine[Any, Any, None]) -> None:
-    """Run *coro* in a dedicated thread with its own event loop."""
-    captured: dict[str, Exception] = {}
-
-    def _worker() -> None:
-        try:
-            asyncio.run(coro)
-        except Exception as exc:
-            captured["error"] = exc
-
-    thread = threading.Thread(target=_worker)
-    thread.start()
-    thread.join()
-    if "error" in captured:
-        raise captured["error"]
 
 
 _HOSTS = {

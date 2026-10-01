@@ -32,31 +32,17 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
-from collections.abc import AsyncIterator
-from pathlib import Path
 from typing import Any
 
 import httpx
 import pytest
-import pytest_asyncio
-from fastapi import FastAPI
 
 from omnigent.runtime import get_caps, session_stream
-from omnigent.runtime.agent_cache import AgentCache
 from omnigent.runtime.caps import RuntimeCaps
-from omnigent.server.app import create_app
 from omnigent.spec.types import FunctionPolicySpec, FunctionRef
-from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
-from omnigent.stores.artifact_store.local import LocalArtifactStore
-from omnigent.stores.comment_store.sqlalchemy_store import SqlAlchemyCommentStore
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
-from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
-from omnigent.stores.permission_store.sqlalchemy_store import (
-    SqlAlchemyPermissionStore,
-)
-from tests.server.conftest import ControllableMockClient
 from tests.server.helpers import create_test_agent
 
 pytestmark = pytest.mark.asyncio
@@ -79,75 +65,6 @@ def _ask_for_bash(event: dict[str, Any]) -> dict[str, Any]:
     if tool == "Bash":
         return {"result": "ASK", "reason": "Approve child tool call"}
     return {"result": "ALLOW"}
-
-
-# ── Auth-enabled fixtures (per-module, matching the convention in
-#    test_sessions_permissions.py — these are redefined per test
-#    module rather than promoted to conftest) ──────────────────
-
-
-@pytest.fixture()
-def auth_app(runtime_init: None, db_uri: str, tmp_path: Path) -> FastAPI:
-    """
-    App fixture with a permission store + auth provider enabled.
-
-    Mirrors the shared ``app`` fixture from ``conftest.py`` but adds
-    a :class:`SqlAlchemyPermissionStore` and an auth provider so
-    access-control checks are live on the session routes — required
-    to exercise the cross-user gate on the resolve endpoint.
-
-    :param runtime_init: Fixture that initializes the runtime with a
-        mock LLM.
-    :param db_uri: Test database URI.
-    :param tmp_path: Pytest temporary directory fixture.
-    """
-    from omnigent.server.auth import UnifiedAuthProvider
-
-    artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
-    return create_app(
-        agent_store=SqlAlchemyAgentStore(db_uri),
-        file_store=SqlAlchemyFileStore(db_uri),
-        conversation_store=SqlAlchemyConversationStore(db_uri),
-        artifact_store=artifact_store,
-        agent_cache=AgentCache(
-            artifact_store=artifact_store,
-            cache_dir=tmp_path / "cache",
-        ),
-        comment_store=SqlAlchemyCommentStore(db_uri),
-        permission_store=SqlAlchemyPermissionStore(db_uri),
-        auth_provider=UnifiedAuthProvider(source="header"),
-    )
-
-
-@pytest_asyncio.fixture()
-async def auth_client(
-    auth_app: FastAPI,
-    mock_llm: ControllableMockClient,
-    tmp_path: Path,
-) -> AsyncIterator[httpx.AsyncClient]:
-    """
-    HTTP client wired to the auth-enabled app.
-
-    Same lifecycle as the shared ``client`` fixture: starts the
-    harness process manager, yields the client, then tears down.
-
-    :param auth_app: The auth-enabled FastAPI app.
-    :param mock_llm: Controllable mock LLM (released on teardown).
-    :param tmp_path: Pytest temporary directory fixture.
-    """
-    from omnigent.runtime import set_harness_process_manager
-    from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
-
-    pm = HarnessProcessManager(tmp_parent=tmp_path / "harness_pm")
-    await pm.start()
-    set_harness_process_manager(pm)
-
-    transport = httpx.ASGITransport(app=auth_app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
-        yield c
-    mock_llm.release_all()
-    set_harness_process_manager(None)
-    await pm.shutdown()
 
 
 async def _create_session(

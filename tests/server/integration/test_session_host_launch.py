@@ -66,6 +66,7 @@ from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
 from omnigent.stores.host_store import HostStore
 from tests.budgets import Deadline, budget
 from tests.server.helpers import create_test_agent
+from tests.server.helpers import websocket_scope as _websocket_scope
 
 pytestmark = pytest.mark.asyncio
 
@@ -132,26 +133,6 @@ def app(runtime_init: None, db_uri: str, tmp_path) -> FastAPI:
         comment_store=SqlAlchemyCommentStore(db_uri),
         host_store=HostStore(db_uri),
     )
-
-
-def _websocket_scope(path: str) -> dict[str, object]:
-    """Build a minimal ASGI WebSocket scope for the host tunnel.
-
-    :param path: WebSocket path, e.g. ``"/v1/hosts/<id>/tunnel"``.
-    :returns: ASGI WebSocket scope dict.
-    """
-    return {
-        "type": "websocket",
-        "asgi": {"version": "3.0"},
-        "scheme": "ws",
-        "path": path,
-        "raw_path": path.encode("ascii"),
-        "query_string": b"",
-        "headers": [],
-        "client": ("127.0.0.1", 50000),
-        "server": ("testserver", 80),
-        "subprotocols": [],
-    }
 
 
 async def _connect_host(app: FastAPI) -> ApplicationCommunicator:

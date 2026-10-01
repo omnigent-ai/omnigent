@@ -54,30 +54,11 @@ from tests.server.helpers import (
     create_test_agent,
     install_fake_modal_launcher,
 )
+from tests.server.helpers import websocket_scope as _websocket_scope
 
 pytestmark = pytest.mark.asyncio
 
 _HOST_ID = "3f866cafac81246fb60ae6ceb1a738da"
-
-
-def _websocket_scope(path: str) -> dict[str, object]:
-    """Build an ASGI WebSocket scope.
-
-    :param path: WebSocket path.
-    :returns: Minimal ASGI WebSocket scope.
-    """
-    return {
-        "type": "websocket",
-        "asgi": {"version": "3.0"},
-        "scheme": "ws",
-        "path": path,
-        "raw_path": path.encode("ascii"),
-        "query_string": b"",
-        "headers": [],
-        "client": ("127.0.0.1", 50000),
-        "server": ("testserver", 80),
-        "subprotocols": [],
-    }
 
 
 def _make_hello(

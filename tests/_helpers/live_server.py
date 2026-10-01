@@ -1,12 +1,12 @@
 """
-Shared fixtures for tests that need a live ``omnigent.cli server`` subprocess.
+Shared startup helpers for real ``omnigent.cli server`` subprocesses.
 
-Lifted out of ``tests/e2e/conftest.py`` so the inner test suite
-(``tests/inner/test_integration.py`` running with Omnigent mode) can
-reuse the same machinery without duplication. The e2e conftest
-re-exports from here.
+Use :func:`isolated_local_server` for single-user regression tests with a
+temporary database and local header auth. It owns startup, health polling,
+and teardown; callers retain their scenario-specific setup and assertions.
+The credential/profile-aware helpers below also support compatibility builds.
 
-Provides three primitives:
+The credential/profile-aware API provides three primitives:
 
 - :func:`find_free_port` — pick a free TCP port for the server.
 - :func:`make_live_server_fixture` — factory that builds a
@@ -42,10 +42,12 @@ import os
 import signal
 import socket
 import subprocess
+import sys
 import tarfile
 import tempfile
 import time
 from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -67,6 +69,117 @@ def find_free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind(("127.0.0.1", 0))
         return s.getsockname()[1]
+
+
+def local_server_env(extra: dict[str, str]) -> dict[str, str]:
+    """Use this checkout and local header auth, stripping ambient proxy/auth settings."""
+    pythonpath = [
+        str(_REPO_ROOT),
+        str(_REPO_ROOT / "sdks" / "python-client"),
+        str(_REPO_ROOT / "sdks" / "ui"),
+        *filter(None, os.environ.get("PYTHONPATH", "").split(os.pathsep)),
+    ]
+    env = {
+        **os.environ,
+        "PYTHONPATH": os.pathsep.join(pythonpath),
+        "NO_PROXY": "127.0.0.1,localhost",
+        "no_proxy": "127.0.0.1,localhost",
+        "OMNIGENT_AUTH_PROVIDER": "header",
+        "OMNIGENT_LOCAL_SINGLE_USER": "1",
+    }
+    for name in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
+        env.pop(name, None)
+    for name in list(env):
+        if (
+            name.startswith(("DATABRICKS_", "OMNIGENT_OIDC_"))
+            or name.endswith("_SECRET")
+            or name
+            in (
+                "ANTHROPIC_API_KEY",
+                "OMNIGENT_AUTH_ENABLED",
+                "OMNIGENT_RUNNER_TUNNEL_TOKEN",
+            )
+        ):
+            env.pop(name, None)
+    env.update(extra)
+    return env
+
+
+def terminate_process(proc: subprocess.Popen[bytes] | subprocess.Popen[str] | None) -> None:
+    """Reap a running child, escalating SIGTERM to SIGKILL after ten seconds."""
+    if proc is None or proc.poll() is not None:
+        return
+    proc.send_signal(signal.SIGTERM)
+    try:
+        proc.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait(timeout=5)
+
+
+@contextmanager
+def isolated_local_server(
+    tmp_path: Path,
+    *,
+    bootstrap: str = "from omnigent.cli import main\n\nmain()\n",
+    poll_interval: float = 0.5,
+    health_timeout: float = 120.0,
+) -> Iterator[str]:
+    """Run this checkout's single-user server; yield its URL and retain server.log.
+
+    Supply a bootstrap only when the scenario needs a fault installed before
+    the CLI starts. Existing profile/compatibility tests should use
+    :func:`start_live_server` instead.
+    """
+    port = find_free_port()
+    base_url = f"http://127.0.0.1:{port}"
+    log_path = tmp_path / "server.log"
+    with log_path.open("w") as log:
+        proc = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                bootstrap,
+                "server",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                str(port),
+                "--database-uri",
+                f"sqlite:///{tmp_path / 'chat.db'}",
+                "--artifact-location",
+                str(tmp_path / "artifacts"),
+            ],
+            env=local_server_env({}),
+            stdout=log,
+            stderr=subprocess.STDOUT,
+        )
+        try:
+            deadline = time.monotonic() + health_timeout
+            last = "not polled"
+            with httpx.Client(trust_env=False) as client:
+                while time.monotonic() < deadline:
+                    assert proc.poll() is None, (
+                        f"Server exited with code {proc.returncode} before becoming healthy.\n"
+                        f"Server log tail:\n{log_path.read_text(errors='replace')[-4000:]}"
+                    )
+                    try:
+                        resp = client.get(f"{base_url}/health", timeout=2.0)
+                        if resp.status_code == 200:
+                            break
+                        last = f"HTTP {resp.status_code}"
+                    except httpx.HTTPError as exc:
+                        last = f"{type(exc).__name__}: {exc}"
+                    time.sleep(poll_interval)
+                else:
+                    raise AssertionError(
+                        f"{base_url}/health never became healthy: {last} "
+                        f"(process exit code: {proc.poll()})\n"
+                        f"Server log tail:\n{log_path.read_text(errors='replace')[-4000:]}"
+                    )
+            yield base_url
+        finally:
+            terminate_process(proc)
 
 
 @dataclass(frozen=True)

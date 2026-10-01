@@ -94,33 +94,6 @@ def auth_app(
     )
 
 
-@pytest_asyncio.fixture()
-async def auth_client(
-    auth_app: FastAPI,
-    mock_llm: ControllableMockClient,
-    tmp_path: Path,
-) -> AsyncIterator[httpx.AsyncClient]:
-    """HTTP client wired to the auth-enabled FastAPI app.
-
-    Same lifecycle pattern as the shared ``client`` fixture from
-    ``conftest.py``: starts the harness process manager, yields the
-    client, then tears down DBOS on exit.
-    """
-    from omnigent.runtime import set_harness_process_manager
-    from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
-
-    pm = HarnessProcessManager(tmp_parent=tmp_path / "harness_pm")
-    await pm.start()
-    set_harness_process_manager(pm)
-
-    transport = httpx.ASGITransport(app=auth_app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
-        yield c
-    mock_llm.release_all()
-    set_harness_process_manager(None)
-    await pm.shutdown()
-
-
 @pytest.fixture()
 def local_auth_app(
     runtime_init: None,

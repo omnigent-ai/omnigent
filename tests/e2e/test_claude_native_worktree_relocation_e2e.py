@@ -63,8 +63,6 @@ import json
 import os
 import re
 import shutil
-import signal
-import socket
 import subprocess
 import sys
 import tarfile
@@ -77,24 +75,12 @@ from typing import Any
 import httpx
 import pytest
 
-_REPO_ROOT = Path(__file__).resolve().parents[2]
+from tests._helpers.live_server import isolated_local_server, local_server_env, terminate_process
 
 # CI shells can carry an egress proxy; every HTTP call here targets 127.0.0.1.
 _http = httpx.Client(trust_env=False)
 
-# The spawned server resolves worktree imports from the repo root and the SDKs.
-_PYTHONPATH = os.pathsep.join(
-    [
-        str(_REPO_ROOT),
-        str(_REPO_ROOT / "sdks" / "python-client"),
-        str(_REPO_ROOT / "sdks" / "ui"),
-        os.environ.get("PYTHONPATH", ""),
-    ]
-)
 
-_SERVER_BOOTSTRAP = "from omnigent.cli import main\n\nmain()\n"
-
-_HEALTH_TIMEOUT_S = 120.0
 _POLL_S = 0.25
 # Wall time for the forwarder to notice a change and the server to act on it.
 # The buggy path never converges (the hook's own long-poll lasts a day), so a
@@ -108,73 +94,6 @@ _EXIT_TOOL_USE_ID = "toolu_bdrk_01ExitWorktreeKeep"
 _PROMPT = "marker-user-prompt-work-in-the-existing-universe-worktree"
 _ASSISTANT_TEXT = "marker-assistant-entering-the-worktree-first"
 _REATTACH_PROMPT = "marker-preexisting-history-before-reattach"
-
-
-def _find_free_port() -> int:
-    """Grab an ephemeral port for the spawned server."""
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        return int(sock.getsockname()[1])
-
-
-def _localhost_env(extra: dict[str, str]) -> dict[str, str]:
-    """Subprocess env with worktree imports and no proxy/credentials in the way.
-
-    :param extra: Overrides/additions applied after the base env.
-    :returns: Environment mapping for ``subprocess.Popen``.
-    """
-    env = {
-        **os.environ,
-        "PYTHONPATH": _PYTHONPATH,
-        "NO_PROXY": "127.0.0.1,localhost",
-        "no_proxy": "127.0.0.1,localhost",
-        # Header auth + single-user keeps the spawned server out of login
-        # mode; ambient auth/OIDC vars would otherwise 401 every call.
-        "OMNIGENT_AUTH_PROVIDER": "header",
-        "OMNIGENT_LOCAL_SINGLE_USER": "1",
-    }
-    for name in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
-        env.pop(name, None)
-    for name in list(env):
-        if (
-            name.startswith(("DATABRICKS_", "OMNIGENT_OIDC_"))
-            or name.endswith("_SECRET")
-            or name
-            in (
-                "ANTHROPIC_API_KEY",
-                "OMNIGENT_AUTH_ENABLED",
-                "OMNIGENT_RUNNER_TUNNEL_TOKEN",
-            )
-        ):
-            env.pop(name, None)
-    env.update(extra)
-    return env
-
-
-def _terminate(proc: subprocess.Popen[Any] | None) -> None:
-    """Best-effort SIGTERM -> SIGKILL teardown for a spawned process."""
-    if proc is None or proc.poll() is not None:
-        return
-    proc.send_signal(signal.SIGTERM)
-    try:
-        proc.wait(timeout=10)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        proc.wait(timeout=5)
-
-
-def _wait_http_ok(url: str, deadline: float) -> None:
-    """Poll *url* until it returns 200 or *deadline* (monotonic) passes."""
-    last = "not polled"
-    while time.monotonic() < deadline:
-        try:
-            if _http.get(url, timeout=2.0).status_code == 200:
-                return
-            last = "non-200"
-        except httpx.HTTPError as exc:
-            last = f"{type(exc).__name__}: {exc}"
-        time.sleep(_POLL_S)
-    raise AssertionError(f"{url} never became healthy: {last}")
 
 
 def _create_claude_native_session(base_url: str) -> str:
@@ -736,7 +655,7 @@ async def _replay_terminal_approved_enter_worktree(
         observed["result_items"] = _items_containing(base_url, session_id, result_message)
         return observed
     finally:
-        _terminate(hook_proc)
+        terminate_process(hook_proc)
         forwarder.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             _ = await forwarder
@@ -767,9 +686,6 @@ def test_terminal_approved_enter_worktree_clears_the_web_approval_card(
     """
     from omnigent.harnesses.claude_native.bridge import build_hook_settings, prepare_bridge_dir
 
-    port = _find_free_port()
-    base_url = f"http://127.0.0.1:{port}"
-    database_uri = f"sqlite:///{tmp_path / 'chat.db'}"
     claude_home = tmp_path / "home" / ".claude"
     # The reporter's layout: an original checkout and a sibling worktree,
     # both under the same worktrees root.
@@ -779,91 +695,69 @@ def test_terminal_approved_enter_worktree_clears_the_web_approval_card(
     worktree.mkdir(parents=True)
     bridge_dir: Path | None = None
 
-    server_log = (tmp_path / "server.log").open("w")
-    server_proc: subprocess.Popen[bytes] | None = None
     try:
-        server_proc = subprocess.Popen(
-            [
-                sys.executable,
-                "-c",
-                _SERVER_BOOTSTRAP,
-                "server",
-                "--host",
-                "127.0.0.1",
-                "--port",
-                str(port),
-                "--database-uri",
-                database_uri,
-                "--artifact-location",
-                str(tmp_path / "artifacts"),
-            ],
-            env=_localhost_env({}),
-            stdout=server_log,
-            stderr=subprocess.STDOUT,
-        )
-        _wait_http_ok(f"{base_url}/health", time.monotonic() + _HEALTH_TIMEOUT_S)
-
-        session_id = _create_claude_native_session(base_url)
-        bridge_dir = prepare_bridge_dir(session_id, workspace=cwd)
-        # The very settings fragment the runner hands Claude via --settings.
-        settings = build_hook_settings(
-            bridge_dir,
-            python_executable=sys.executable,
-            ap_server_url=base_url,
-            ap_auth_headers={},
-        )
-        # Hook subprocesses run with ``python -I`` (no PYTHONPATH), so they
-        # import the installed omnigent, as in production.
-        # A conflicting TMPDIR reproduces the runner/hook bridge-root mismatch.
-        hook_tmpdir = tmp_path / "hook-tmp"
-        hook_tmpdir.mkdir()
-        hook_env = _localhost_env({"HOME": str(tmp_path / "home"), "TMPDIR": str(hook_tmpdir)})
-        hook_env.pop("PYTHONPATH", None)
-
-        observed = asyncio.run(
-            _replay_terminal_approved_enter_worktree(
-                base_url=base_url,
-                session_id=session_id,
-                bridge_dir=bridge_dir,
-                settings=settings,
-                claude_home=claude_home,
-                cwd=cwd,
-                worktree=worktree,
-                hook_env=hook_env,
-                start_at_end=start_at_end,
+        with isolated_local_server(tmp_path, poll_interval=_POLL_S) as base_url:
+            session_id = _create_claude_native_session(base_url)
+            bridge_dir = prepare_bridge_dir(session_id, workspace=cwd)
+            # The very settings fragment the runner hands Claude via --settings.
+            settings = build_hook_settings(
+                bridge_dir,
+                python_executable=sys.executable,
+                ap_server_url=base_url,
+                ap_auth_headers={},
             )
-        )
-        server_tail = (tmp_path / "server.log").read_text()[-2000:]
-        diagnostics = (
-            f"bridge transcript_path={observed['bridge_transcript_path']!r} "
-            f"pending={observed['pending']!r} "
-            f"result_items={observed['result_items']} "
-            f"hook_exit={observed['hook_exit_code']!r} "
-            f"hook_stderr={observed['hook_stderr']!r}\nserver log tail:\n{server_tail}"
-        )
+            # Hook subprocesses run with ``python -I`` (no PYTHONPATH), so they
+            # import the installed omnigent, as in production.
+            # A conflicting TMPDIR reproduces the runner/hook bridge-root mismatch.
+            hook_tmpdir = tmp_path / "hook-tmp"
+            hook_tmpdir.mkdir()
+            hook_env = local_server_env(
+                {"HOME": str(tmp_path / "home"), "TMPDIR": str(hook_tmpdir)}
+            )
+            hook_env.pop("PYTHONPATH", None)
 
-        # The bug: EnterWorktree moved the transcript, the bridge never heard,
-        # the forwarder tailed the vanished path -- so the terminal's answer
-        # never reached the web card. The hook is still parked and nothing
-        # after the relocation is in the conversation store.
-        assert observed["hook_returned"], (
-            "The web approval card stayed stuck after the user approved "
-            "EnterWorktree in the terminal: the permission-request hook was "
-            f"still long-polling {_CONVERGE_S:.0f}s after Claude ran the tool "
-            "(no mirrored tool result reached the server). " + diagnostics
-        )
-        assert observed["hook_exit_code"] == 0, diagnostics
-        assert observed["pending"] == [], (
-            "Session still shows a pending elicitation after the terminal "
-            "answered it. " + diagnostics
-        )
-        assert observed["result_items"] == 1, (
-            "EnterWorktree's result must be mirrored exactly once across both "
-            "transcript relocations. " + diagnostics
-        )
-        assert observed["reattach_history_items"] == 0, diagnostics
+            observed = asyncio.run(
+                _replay_terminal_approved_enter_worktree(
+                    base_url=base_url,
+                    session_id=session_id,
+                    bridge_dir=bridge_dir,
+                    settings=settings,
+                    claude_home=claude_home,
+                    cwd=cwd,
+                    worktree=worktree,
+                    hook_env=hook_env,
+                    start_at_end=start_at_end,
+                )
+            )
+            server_tail = (tmp_path / "server.log").read_text()[-2000:]
+            diagnostics = (
+                f"bridge transcript_path={observed['bridge_transcript_path']!r} "
+                f"pending={observed['pending']!r} "
+                f"result_items={observed['result_items']} "
+                f"hook_exit={observed['hook_exit_code']!r} "
+                f"hook_stderr={observed['hook_stderr']!r}\nserver log tail:\n{server_tail}"
+            )
+
+            # The bug: EnterWorktree moved the transcript, the bridge never heard,
+            # the forwarder tailed the vanished path -- so the terminal's answer
+            # never reached the web card. The hook is still parked and nothing
+            # after the relocation is in the conversation store.
+            assert observed["hook_returned"], (
+                "The web approval card stayed stuck after the user approved "
+                "EnterWorktree in the terminal: the permission-request hook was "
+                f"still long-polling {_CONVERGE_S:.0f}s after Claude ran the tool "
+                "(no mirrored tool result reached the server). " + diagnostics
+            )
+            assert observed["hook_exit_code"] == 0, diagnostics
+            assert observed["pending"] == [], (
+                "Session still shows a pending elicitation after the terminal "
+                "answered it. " + diagnostics
+            )
+            assert observed["result_items"] == 1, (
+                "EnterWorktree's result must be mirrored exactly once across both "
+                "transcript relocations. " + diagnostics
+            )
+            assert observed["reattach_history_items"] == 0, diagnostics
     finally:
-        _terminate(server_proc)
-        server_log.close()
         if bridge_dir is not None:
             shutil.rmtree(bridge_dir, ignore_errors=True)
