@@ -15,6 +15,7 @@ import {
   orderByPinnedTimestamp,
   pinOrderWrites,
   resolveSidebarDrop,
+  sessionsListAcceptsDrop,
   STATUS_BUCKETS,
   statusBucket,
   updatedBucket,
@@ -723,5 +724,31 @@ describe("groupConversations", () => {
       ["Working", ["b", "d"]],
       ["Done", ["a", "c"]],
     ]);
+  });
+
+  it("puts a row with no key in the last group instead of dropping it", () => {
+    const rows = ["a", "b"].map((id) => conversation(id, id, new Date(2026, 0, 1)));
+    const groups = groupConversations(rows, (c) => (c.id === "a" ? "Working" : undefined), [
+      "Working",
+      "Done",
+    ]);
+    expect(groups.map((g) => [g.title, g.conversations.map((c) => c.id)])).toEqual([
+      ["Working", ["a"]],
+      ["Done", ["b"]],
+    ]);
+  });
+});
+
+describe("sessionsListAcceptsDrop", () => {
+  const drag = (project: string | null, isPinned: boolean) => ({ id: "s", project, isPinned });
+  it("ungroups or unpins in the default view", () => {
+    expect(sessionsListAcceptsDrop(drag("Customer X", false), false)).toBe(true);
+    expect(sessionsListAcceptsDrop(drag(null, true), false)).toBe(true);
+    expect(sessionsListAcceptsDrop(drag(null, false), false)).toBe(false);
+  });
+  it("never removes a session from its project in a grouped view", () => {
+    expect(sessionsListAcceptsDrop(drag("Customer X", false), true)).toBe(false);
+    expect(sessionsListAcceptsDrop(drag("Customer X", true), true)).toBe(false);
+    expect(sessionsListAcceptsDrop(drag(null, true), true)).toBe(true);
   });
 });

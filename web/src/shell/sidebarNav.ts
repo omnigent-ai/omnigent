@@ -280,16 +280,22 @@ export function updatedBucket(updatedAt: number, now: Date): UpdatedBucket {
   return "Older";
 }
 
-/** Split `rows` into non-empty groups in `order`, keeping input order within each group. */
+/**
+ * Split `rows` into non-empty groups in `order`, keeping input order within each
+ * group. A row with no key (or one outside `order`) lands in the last group
+ * rather than vanishing.
+ */
 export function groupConversations<K extends string>(
   rows: readonly Conversation[],
   keyOf: (c: Conversation) => K | undefined,
   order: readonly K[],
 ): { title: K; conversations: Conversation[] }[] {
   const byKey = new Map<K, Conversation[]>(order.map((key) => [key, []]));
+  const fallback = byKey.get(order[order.length - 1]);
   for (const row of rows) {
     const key = keyOf(row);
-    if (key !== undefined) byKey.get(key)?.push(row);
+    const bucket = (key !== undefined && byKey.get(key)) || fallback;
+    bucket?.push(row);
   }
   return order.flatMap((title) => {
     const conversations = byKey.get(title) ?? [];
@@ -488,6 +494,15 @@ export type SidebarDropAction =
  *   `pin` with that row as `targetId`, so it's pinned into that slot.
  * - Dropped on nothing → `none`.
  */
+/**
+ * Whether the Sessions list accepts a dragged session: a filed one (ungroup) or
+ * a pinned one (unpin). Grouped views already list filed sessions in place, so
+ * there it only unpins a pin that has no project to lose.
+ */
+export function sessionsListAcceptsDrop(source: SidebarDragSource, grouped: boolean): boolean {
+  return grouped ? source.isPinned && !source.project : !!source.project || source.isPinned;
+}
+
 export function resolveSidebarDrop(
   source: SidebarDragSource,
   target: SidebarDropTarget,

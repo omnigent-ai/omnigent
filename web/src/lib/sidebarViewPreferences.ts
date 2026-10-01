@@ -1,8 +1,4 @@
-// Persisted, per-device sidebar view options from the Sessions filter menu:
-// how the session list is grouped and ordered, and which per-session metadata
-// rows show. Like `sessionFilterPreferences`, it's a device-local view
-// preference — no account or session state changes — so it lives in
-// localStorage and only seeds the sidebar's React state on mount.
+// Device-local sidebar grouping, ordering, and row-metadata preferences.
 
 const STORAGE_KEY = "omnigent:sidebar-view";
 

@@ -34,12 +34,17 @@ import {
   ClockIcon,
   CircleAlertIcon,
   CircleStopIcon,
+  FolderGit2Icon,
   FolderIcon,
   FolderInputIcon,
   FolderMinusIcon,
   FolderOpenIcon,
   GitBranchIcon,
   GitForkIcon,
+  GitMergeIcon,
+  GitPullRequestClosedIcon,
+  GitPullRequestDraftIcon,
+  GitPullRequestIcon,
   InboxIcon,
   ListChecksIcon,
   ListFilterIcon,
@@ -64,10 +69,11 @@ import {
   SquareIcon,
   SquareCheckIcon,
   Trash2Icon,
-  UserIcon,
+  UserRoundIcon,
   UsersIcon,
   WalletIcon,
   XIcon,
+  type LucideIcon,
 } from "lucide-react";
 import {
   DndContext,
@@ -183,7 +189,7 @@ import { useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
 import { useActiveRootSessionId } from "@/hooks/useSession";
 import { isSessionStoppable } from "@/lib/sessionStop";
 import { isImeCompositionKeyEvent } from "@/lib/ime";
-import { hasSessionDraft, useHasSessionDraft } from "@/lib/sessionDrafts";
+import { hasSessionDraft, useHasSessionDraft, useSessionDraftIds } from "@/lib/sessionDrafts";
 import { useNow } from "@/hooks/useNow";
 import { useOptimisticTitle } from "@/lib/optimisticTitles";
 import { getSessionState, type SessionState } from "@/hooks/useSessionState";
@@ -234,12 +240,14 @@ import {
   computeNextActiveOverride,
   conversationDisplayLabel,
   dedupeConversationsById,
+  getConversationAgentType,
   EXPANDED_PROJECT_SECTIONS_STORAGE_KEY,
   groupConversations,
   orderByPinnedTimestamp,
   pinOrderWrites,
   readPinnedConversationIds,
   resolveSidebarDrop,
+  sessionsListAcceptsDrop,
   type SidebarDropTarget,
   sortByUpdatedAtDesc,
   STATUS_BUCKETS,
@@ -252,6 +260,9 @@ import {
   sessionBelongsToProject,
 } from "./sidebarNav";
 import { SidebarServerPicker } from "./SidebarServerPicker";
+import { ComposerAgentIcon } from "@/components/ComposerAgentIcon";
+import { nativeCodingAgentForWrapper, WRAPPER_LABEL_KEY } from "@/lib/nativeCodingAgents";
+import { type PullRequest, usePullRequestInfo } from "@/hooks/usePullRequests";
 import { ForkSessionDialog } from "./ForkSessionDialog";
 import { SessionActionMenuItem } from "@/components/SessionActionMenuItem";
 import { useSessionActionRestrictions } from "@/hooks/useSessionActionRestrictions";
@@ -1671,19 +1682,27 @@ function ConversationList({
   // Grouping / ordering / show options from the Sessions filter menu, seeded
   // from the persisted per-device preference.
   const [view, setView] = useState<SidebarViewPreferences>(readSidebarViewPreferences);
-  const updateView = useCallback((patch: Partial<SidebarViewPreferences>) => {
-    setView((prev) => {
-      const next = { ...prev, ...patch };
+  const updateView = useCallback(
+    (patch: Partial<SidebarViewPreferences>) => {
+      // Regrouping swaps which sections (and selection scopes) exist, so leave
+      // selection the way a Display switch does.
+      if (patch.grouping !== undefined && patch.grouping !== view.grouping && selectionMode) {
+        onExitSelectionMode();
+      }
+      const next = { ...view, ...patch };
       writeSidebarViewPreferences(next);
-      return next;
-    });
-  }, []);
+      setView(next);
+    },
+    [view, selectionMode, onExitSelectionMode],
+  );
   const grouped = view.grouping !== "default";
   const groupOrder: readonly string[] =
     view.grouping === "status" ? STATUS_BUCKETS : UPDATED_BUCKETS;
-  // Status buckets read the unread mirror; only a status view re-renders the
-  // whole list on read/unread writes.
-  const unseenTick = useUnseenTick(view.grouping === "status" || view.ordering === "status");
+  // Status buckets read the unread mirror and the drafts store; only a status
+  // view subscribes, so other views don't re-render the list on those writes.
+  const statusView = view.grouping === "status" || view.ordering === "status";
+  const unseenTick = useUnseenTick(statusView);
+  const draftIds = useSessionDraftIds(statusView);
   // All loaded conversations from the single paginated list (for the flat
   // session list; pinned rows are merged in from the server pinned query).
   const allConversations = useMemo(
@@ -1906,7 +1925,7 @@ function ConversationList({
       (g) => g.conversations,
     );
     return { pinned, sessions, projectGroups, groupTitles };
-    // `unseenTick` isn't read here: it versions the unread mirror that status buckets read.
+    // `unseenTick` / `draftIds` aren't read here: they version the stores status buckets read.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [
     allConversations,
@@ -1923,6 +1942,7 @@ function ConversationList({
     view.grouping,
     view.ordering,
     unseenTick,
+    draftIds,
   ]);
 
   const config = useContext(SidebarConfigContext);
@@ -2528,9 +2548,10 @@ function ConversationList({
             ungroup target (wrapped below). This top strip is only a FALLBACK
             for when there are no ungrouped chats yet, so the Chats section
             isn't rendered and there'd otherwise be nowhere to drop. */}
-              {!showShared && activeDrag?.project != null && sections.sessions.length === 0 && (
-                <UngroupDropZone />
-              )}
+              {!showShared &&
+                !grouped &&
+                activeDrag?.project != null &&
+                sections.sessions.length === 0 && <UngroupDropZone />}
               {totalVisible === 0 && searchQuery && !sessionStatus ? (
                 <>
                   <p className="px-2 py-1 text-ui text-muted-foreground">{emptyMessage}</p>
@@ -2695,9 +2716,7 @@ function ConversationList({
                     // session (removes it from its project) or a pinned one (unpins
                     // it), since both have somewhere to land here.
                     <ChatsDropZone
-                      active={
-                        activeDrag != null && (activeDrag.project != null || activeDrag.isPinned)
-                      }
+                      active={activeDrag != null && sessionsListAcceptsDrop(activeDrag, grouped)}
                     >
                       {sessionGroups ? (
                         // Grouped: one titled section per group; the first carries
@@ -2743,10 +2762,11 @@ function ConversationList({
               Settings page ("Archived chats"), reachable from the footer. */}
                   {/* Infinite-scroll sentinel for the global list. Pagination extends
               the Chats list, so it hides with a collapsed Chats group — a loader
-              under a collapsed group reads orphaned. */}
-                  {!effectiveCollapsedSections.includes(
-                    sessionGroups?.at(-1)?.title ?? "Chats",
-                  ) && (
+              under a collapsed group reads orphaned. A new page can land in any
+              group, so grouped views keep it while any group is expanded. */}
+                  {!(sessionGroups
+                    ? sessionGroups.every((g) => effectiveCollapsedSections.includes(g.title))
+                    : effectiveCollapsedSections.includes("Chats")) && (
                     <InfiniteScrollSentinel
                       scopeKey={activeTab}
                       budgetRef={autoLoadBudget}
@@ -4051,12 +4071,12 @@ function SessionMetaLine({
 // A label-left, value-right line in the session tooltip's details block.
 function SessionTooltipDetail({
   label,
-  icon,
+  icon: Icon,
   testId,
   children,
 }: {
   label: string;
-  icon: ReactNode;
+  icon: LucideIcon;
   testId: string;
   children: ReactNode;
 }) {
@@ -4064,9 +4084,63 @@ function SessionTooltipDetail({
     <div data-testid={testId} className="flex items-center justify-between gap-3 text-sm">
       <span className="shrink-0 text-muted-foreground">{label}</span>
       <span className="flex min-w-0 items-center gap-1.5">
-        {icon}
+        <Icon aria-hidden className="size-3.5 shrink-0 text-muted-foreground" />
         <span className="truncate">{children}</span>
       </span>
+    </div>
+  );
+}
+
+// GitHub's glyph and label for a PR state; gh reports a draft as OPEN + is_draft.
+function pullRequestStatus(pr: PullRequest): { icon: LucideIcon; label: string } {
+  const state = pr.state.toUpperCase();
+  if (state === "MERGED") return { icon: GitMergeIcon, label: "Merged" };
+  if (state === "CLOSED") return { icon: GitPullRequestClosedIcon, label: "Closed" };
+  if (pr.is_draft) return { icon: GitPullRequestDraftIcon, label: "Draft" };
+  return { icon: GitPullRequestIcon, label: "Open" };
+}
+
+// The tooltip's detail rows. Repo, PR and a non-worktree branch come from the
+// session's GitHub info, fetched only while the tooltip is open (Radix mounts
+// its content on open) and shared with the GitHub panel's cache.
+function SessionTooltipDetails({ conversation }: { conversation: Conversation }) {
+  const viewerId = useContext(ViewerIdContext);
+  // Only a workspace-bound session has a checkout to read GitHub state from.
+  const { data: github } = usePullRequestInfo(conversation.workspace ? conversation.id : undefined);
+  // `owner` is null when permissions are off; there's no creator to name then.
+  const owner = conversation.owner ?? null;
+  const createdBy = owner !== null && isOwnedByViewer(conversation, viewerId) ? "You" : owner;
+  const repo = github?.repo?.name_with_owner?.split("/").pop() ?? null;
+  const pr = github?.pr ?? null;
+  const prStatus = pr ? pullRequestStatus(pr) : null;
+  const branch = conversation.git_branch ?? github?.branch ?? null;
+  if (createdBy === null && repo === null && pr === null && branch === null) return null;
+  return (
+    <div className="mt-2.5 flex flex-col gap-1 border-t border-border pt-2.5">
+      {createdBy !== null && (
+        <SessionTooltipDetail
+          label="Created by"
+          icon={UserRoundIcon}
+          testId="session-tooltip-owner"
+        >
+          {createdBy}
+        </SessionTooltipDetail>
+      )}
+      {repo !== null && (
+        <SessionTooltipDetail label="Repo" icon={FolderGit2Icon} testId="session-tooltip-repo">
+          {repo}
+        </SessionTooltipDetail>
+      )}
+      {pr !== null && prStatus !== null && (
+        <SessionTooltipDetail label="PR" icon={prStatus.icon} testId="session-tooltip-pr">
+          #{pr.number} · {prStatus.label}
+        </SessionTooltipDetail>
+      )}
+      {branch !== null && (
+        <SessionTooltipDetail label="Branch" icon={GitBranchIcon} testId="session-tooltip-branch">
+          {branch}
+        </SessionTooltipDetail>
+      )}
     </div>
   );
 }
@@ -4080,11 +4154,12 @@ function SessionTooltipContent({
   hostsById: ReadonlyMap<string, Host>;
   hasError: boolean;
 }) {
-  const viewerId = useContext(ViewerIdContext);
-  // `owner` is null when permissions are off; there's no creator to name then.
-  const owner = conversation.owner ?? null;
-  const createdBy = owner !== null && isOwnedByViewer(conversation, viewerId) ? "You" : owner;
-  const branch = conversation.git_branch ?? null;
+  const nativeAgent = nativeCodingAgentForWrapper(conversation.labels?.[WRAPPER_LABEL_KEY]);
+  const harnessAgent = nativeAgent
+    ? { name: nativeAgent.agentName, harness: nativeAgent.harness }
+    : conversation.agent_name === "nessie"
+      ? { name: "nessie", harness: null }
+      : null;
 
   return (
     <TooltipContent
@@ -4093,7 +4168,7 @@ function SessionTooltipContent({
       sideOffset={8}
       data-testid="session-tooltip-content"
       // Mirror PinnedProjectFlyoutContent's compact HoverCard look: title and a
-      // muted "updated · environment" line, then label/value detail rows.
+      // muted "updated · harness · environment" line, then label/value rows.
       className="w-72 max-w-[calc(100vw-2rem)] flex-col items-stretch rounded-lg bg-popover p-2.5 text-popover-foreground whitespace-normal shadow-menu ring-1 ring-foreground/10"
     >
       <p className="sidebar-compact-text line-clamp-3 font-medium">
@@ -4102,35 +4177,22 @@ function SessionTooltipContent({
       <p className="mt-1 flex items-center gap-1.5 text-sm text-muted-foreground">
         <span className="shrink-0">{relativeTime(conversation.updated_at * 1000)}</span>
         <span aria-hidden>·</span>
+        {harnessAgent && (
+          <span
+            role="img"
+            aria-label={`${getConversationAgentType(conversation)} harness`}
+            data-testid="session-tooltip-harness"
+            className="flex shrink-0"
+          >
+            <ComposerAgentIcon agent={harnessAgent} className="size-4" />
+          </span>
+        )}
         <span data-testid="session-tooltip-location" className="flex min-w-0 items-center gap-1.5">
           <LaptopIcon aria-hidden className="size-3.5 shrink-0" />
           <span className="truncate">{sessionLocationLabel(conversation, hostsById)}</span>
         </span>
       </p>
-      {(createdBy !== null || branch !== null) && (
-        <div className="mt-2.5 flex flex-col gap-1 border-t border-border pt-2.5">
-          {createdBy !== null && (
-            <SessionTooltipDetail
-              label="Created by"
-              icon={<UserIcon aria-hidden className="size-3.5 shrink-0 text-muted-foreground" />}
-              testId="session-tooltip-owner"
-            >
-              {createdBy}
-            </SessionTooltipDetail>
-          )}
-          {branch !== null && (
-            <SessionTooltipDetail
-              label="Branch"
-              icon={
-                <GitBranchIcon aria-hidden className="size-3.5 shrink-0 text-muted-foreground" />
-              }
-              testId="session-tooltip-branch"
-            >
-              {branch}
-            </SessionTooltipDetail>
-          )}
-        </div>
-      )}
+      <SessionTooltipDetails conversation={conversation} />
       {hasError && <SessionErrorHint />}
     </TooltipContent>
   );
