@@ -42,17 +42,21 @@ command never trips the client-side timeout in the first place.
 from __future__ import annotations
 
 import secrets
+import shlex
 import time
 from typing import TYPE_CHECKING, Any, ClassVar
 
 import click
 
+from omnigent.host.identity import HOST_ID_ENV_VAR, HOST_NAME_ENV_VAR, HOST_TOKEN_ENV_VAR
 from omnigent.onboarding.sandboxes.base import (
     RemoteCommandResult,
     SandboxGoneError,
     SandboxLauncher,
+    render_host_config_write_command,
+    supervise_host_command,
 )
-from omnigent.onboarding.sandboxes.types import SandboxCapabilities
+from omnigent.onboarding.sandboxes.types import SandboxCapabilities, clone_dir_names
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
@@ -67,6 +71,8 @@ _EXEC_TIMEOUT_S: int = 1800
 _EXEC_HTTP_TIMEOUT_S: int = _EXEC_TIMEOUT_S + 120
 _STATE_TIMEOUT_S: float = 600.0
 _STATE_POLL_S: float = 1.0
+
+_HOST_LOG: str = "/tmp/omnigent-host.log"
 
 _RUNNING = "SANDBOX_STATE_RUNNING"
 _STOPPED = "SANDBOX_STATE_STOPPED"
@@ -302,8 +308,21 @@ class DatabricksSandboxLauncher(SandboxLauncher):
 
     # ── Transport ───────────────────────────────────────
 
-    def run(self, sandbox_id: str, command: str, *, check: bool = True) -> RemoteCommandResult:
-        """Run *command* under ``bash -c`` via ``execute_command_sync``."""
+    def run(
+        self,
+        sandbox_id: str,
+        command: str,
+        *,
+        check: bool = True,
+        envs: dict[str, str] | None = None,
+    ) -> RemoteCommandResult:
+        """
+        Run *command* under ``bash -c`` via ``execute_command_sync``.
+
+        :param envs: Extra environment for the remote process. Carried in the
+            API request body, so secrets passed here never appear in the
+            sandbox's process argv (unlike an ``ENV=value cmd`` prefix).
+        """
         from google.protobuf.duration_pb2 import Duration
 
         try:
@@ -311,6 +330,7 @@ class DatabricksSandboxLauncher(SandboxLauncher):
                 self._resource(sandbox_id),
                 "/bin/bash",
                 args=["-c", _HOME_PRELUDE + command],
+                envs=envs,
                 execution_timeout=Duration(seconds=_EXEC_TIMEOUT_S),
             )
         except Exception as exc:
@@ -360,7 +380,8 @@ class DatabricksSandboxLauncher(SandboxLauncher):
         but not its processes). Any previous host supervisor is stopped first
         so a wake racing a still-alive host never leaves two hosts flapping one
         registration; then the optional :attr:`bootstrap_command` runs, then the
-        generic exec-model start.
+        workspace is prepared and the host is started detached under the
+        standard restart supervisor.
         """
         self.run(
             sandbox_id,
@@ -372,13 +393,54 @@ class DatabricksSandboxLauncher(SandboxLauncher):
             if on_stage is not None:
                 on_stage("starting")
             self.run(sandbox_id, self._bootstrap_command)
-        return super().start_host(
-            sandbox_id,
-            token=token,
-            host_id=host_id,
-            host_name=host_name,
-            server_url=server_url,
-            repos=repos,
-            host_config=host_config,
-            on_stage=on_stage,
+        workspace = self._prepare_workspace(sandbox_id, repos=repos, on_stage=on_stage)
+        if on_stage is not None:
+            on_stage("starting")
+        # Resumable: always (re)write, so a removed host_config is cleaned up.
+        self.run(sandbox_id, render_host_config_write_command(host_config or {}))
+        # The launch token rides in the exec request's `envs`, inherited by the
+        # detached supervisor and every host restart — never in argv, where any
+        # process in the sandbox could read it from `ps`.
+        supervised = supervise_host_command(f"omnigent host --server {shlex.quote(server_url)}")
+        launch = (
+            f"setsid nohup sh -c {shlex.quote(supervised)} "
+            f">> {_HOST_LOG} 2>&1 < /dev/null & echo launched"
         )
+        self.run(
+            sandbox_id,
+            launch,
+            envs={
+                HOST_TOKEN_ENV_VAR: token,
+                HOST_ID_ENV_VAR: host_id,
+                HOST_NAME_ENV_VAR: host_name,
+            },
+        )
+        return workspace
+
+    def _prepare_workspace(
+        self,
+        sandbox_id: str,
+        *,
+        repos: Sequence[RepoWorkspace],
+        on_stage: Callable[[str], None] | None,
+    ) -> str:
+        """Create ``$HOME/workspace`` and clone *repos*; return the agent cwd."""
+        home = self.run(sandbox_id, 'printf %s "$HOME"').stdout.strip()
+        workspace = f"{home}/workspace"
+        self.run(sandbox_id, f"mkdir -p {shlex.quote(workspace)}")
+        if not repos:
+            return workspace
+        if on_stage is not None:
+            on_stage("cloning")
+        clone_dirs = [
+            self.materialize_workspace(
+                sandbox_id,
+                workspace=workspace,
+                repo_url=repo.url,
+                repo_branch=repo.branch,
+                repo_name=dirname,
+                git_clone=repo.git_clone,
+            )
+            for repo, dirname in zip(repos, clone_dir_names(repos), strict=True)
+        ]
+        return clone_dirs[0] if len(clone_dirs) == 1 else workspace
