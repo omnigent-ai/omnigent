@@ -1484,13 +1484,8 @@ def _write_forwarder_bridge(
 
 def _recording_forwarder_client(posted: list[dict[str, Any]]) -> httpx.AsyncClient:
     """Capture event payloads in the caller's list; the caller owns client cleanup."""
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        posted.append(json.loads(request.content))
-        return httpx.Response(202, json={"queued": False})
-
     return httpx.AsyncClient(
-        base_url="http://127.0.0.1:8000", transport=httpx.MockTransport(handler)
+        base_url="http://127.0.0.1:8000", transport=httpx.MockTransport(_capture_handler(posted))
     )
 
 
@@ -6210,10 +6205,7 @@ def test_forwarder_streams_codex_command_output_before_completed_item(tmp_path: 
 
     async def run() -> None:
         """Replay command start, output chunks, and completion."""
-        async with httpx.AsyncClient(
-            base_url="http://127.0.0.1:8000",
-            transport=httpx.MockTransport(_capture_handler(posted)),
-        ) as client:
+        async with _recording_forwarder_client(posted) as client:
             coalescer = codex_native_forwarder._OutputTextDeltaCoalescer(
                 client,
                 "conv_123",
@@ -6756,10 +6748,7 @@ def test_forwarder_coalesces_and_flushes_turn_diff(tmp_path: Path) -> None:
 
         :returns: None.
         """
-        async with httpx.AsyncClient(
-            base_url="http://127.0.0.1:8000",
-            transport=httpx.MockTransport(_capture_handler(posted)),
-        ) as client:
+        async with _recording_forwarder_client(posted) as client:
             for event in [
                 _turn_diff_event("turn_123", "--- a/x.py\n+++ b/x.py\n@@\n-old\n"),
                 _turn_diff_event("turn_123", latest_diff),
@@ -6829,10 +6818,7 @@ def test_forwarder_skips_turn_diff_when_none_captured(tmp_path: Path) -> None:
 
         :returns: None.
         """
-        async with httpx.AsyncClient(
-            base_url="http://127.0.0.1:8000",
-            transport=httpx.MockTransport(_capture_handler(posted)),
-        ) as client:
+        async with _recording_forwarder_client(posted) as client:
             await codex_native_forwarder._handle_event(
                 client,
                 **_forwarder_context(client, tmp_path),
