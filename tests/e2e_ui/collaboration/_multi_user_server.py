@@ -25,7 +25,6 @@ headerless writes, so a ``local``-owned session can't be created here anyway).
 
 from __future__ import annotations
 
-import json as _json
 import os
 import signal
 import subprocess
@@ -37,6 +36,7 @@ from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 
+from tests._helpers.session import post_session_bundle
 from tests.e2e_ui.conftest import (
     _HEALTH_POLL_INTERVAL_S,
     _HEALTH_TIMEOUT_S,
@@ -196,12 +196,8 @@ def spawn_multi_user_server(
         # no turn: the Share modal / button / settings nav only need a
         # top-level session to exist at manage level, which the owner has.
         bundle = _build_hello_world_bundle()
-        create = httpx.post(
-            f"{base_url}/v1/sessions",
-            data={"metadata": _json.dumps({})},
-            files={"bundle": ("agent.tar.gz", bundle, "application/gzip")},
-            headers=admin_headers,
-            timeout=30.0,
+        create = post_session_bundle(
+            httpx.post, f"{base_url}/v1/sessions", bundle, headers=admin_headers, timeout=30.0
         )
         create.raise_for_status()
         session_id = create.json()["session_id"]
