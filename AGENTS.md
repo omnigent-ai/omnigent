@@ -20,6 +20,19 @@ Use `just` for common tasks; run `just --list` for grouped recipes.
 - `just lint` / `just lint-all` — run pre-commit
 - `just normalize-locks` — rewrite lockfile registries to PyPI/npmjs.org
 
+## Architecture
+
+`docs/ARCHITECTURE.md` maps the `omnigent/` package: what each subpackage owns,
+the layering rules, and where new code goes. `tests/test_architecture.py`
+enforces it. In short:
+
+- Harness-specific code lives in that harness's package under
+  `omnigent/harnesses/`, not behind `if harness == ...` branches elsewhere.
+- Don't add modules at the top of `omnigent/`; put them in the owning package.
+- Don't import the compatibility aliases (`omnigent.inner.*`,
+  `omnigent.runtime.harnesses`, `omnigent.harness_plugins`,
+  `omnigent.harness_install_spec`); they exist for callers outside the repo.
+
 ## Pull requests
 
 When you open a pull request, fill in the repo's PR template at

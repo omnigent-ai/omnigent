@@ -282,7 +282,7 @@ below.
 flowchart TB
   subgraph ABOVE["Above the seam — what you add"]
     F1["New Devin feature<br/>devin/hooks.py + one field on AcpExtension"]
-    F2["New ACP vendor<br/>inner/acme/ · own source + own create_app()"]
+    F2["New ACP vendor<br/>harnesses/acme/ · own source + own create_app()"]
     F3["ACP standardizes sub-agents<br/>one StandardAcpSubAgentSource in core"]
   end
   F1 -->|"adds a field"| SEAM["AcpExtension · the single composition point"]
