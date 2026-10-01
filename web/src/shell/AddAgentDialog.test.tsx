@@ -1,3 +1,4 @@
+import { testAgent } from "@/test/agentFixtures";
 import type * as ReactRouterDomModule from "react-router-dom";
 
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
@@ -32,14 +33,7 @@ const AGENTS: AvailableAgent[] = [
     harness: "claude-native",
     skills: [],
   },
-  {
-    id: "ag_codex",
-    name: "codex",
-    display_name: "codex",
-    description: null,
-    harness: "codex",
-    skills: [],
-  },
+  testAgent("ag_codex", "codex", { display_name: "codex", harness: "codex" }),
 ];
 
 function mockAgents(agents: AvailableAgent[]) {

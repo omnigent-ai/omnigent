@@ -1,3 +1,4 @@
+import { testAgent } from "@/test/agentFixtures";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
 import type { ReactNode } from "react";
@@ -947,14 +948,10 @@ describe("prefetchAvailableAgentDetails", () => {
 
   it("is a no-op when sessionId is absent (catalog agent)", async () => {
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-    const agent = {
-      id: "ag_native",
-      name: "claude-native-ui",
+    const agent = testAgent("ag_native", "claude-native-ui", {
       display_name: "Claude Code",
-      description: null,
       harness: null,
-      skills: [],
-    };
+    });
     queryClient.setQueryData(["available-agents"], [agent]);
 
     await prefetchAvailableAgentDetails(agent, queryClient);
@@ -989,14 +986,10 @@ describe("prefetchAvailableAgentDetails", () => {
     // prefetchAvailableAgentDetails detects harness: "kiro-native" after
     // enrichment and removes the agent since a seeded kiro built-in exists.
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-    const kiroBuiltin = {
-      id: "ag_kiro",
-      name: "kiro-native-ui",
+    const kiroBuiltin = testAgent("ag_kiro", "kiro-native-ui", {
       display_name: "Kiro",
-      description: null,
       harness: "kiro-native",
-      skills: [],
-    };
+    });
     const kiroShadow = {
       id: "ag_session_kiro",
       name: "kiro-naitive",
