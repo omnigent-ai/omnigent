@@ -1,7 +1,6 @@
-// Bottom-of-screen footer for the landing screen: app/community links + a
-// "Maintained by" note, mirroring the design. Links open in the
-// user's real browser (window.open on the file:// page is routed out by the
-// shell's popup policy, same as the Cloud-docs button).
+// Landing-screen footer: app/community links + a "Maintained by" note. Links
+// open in the user's real browser (window.open on the file:// page is routed
+// out by the shell's popup policy, same as the Cloud-docs button).
 
 import GithubMono from "@lobehub/icons/es/Github/components/Mono";
 import type { ReactNode } from "react";
