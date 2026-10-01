@@ -19,6 +19,10 @@ import httpx
 from pydantic import TypeAdapter
 
 from omnigent._platform import normalize_interactive_shells
+from omnigent._wrapper_labels import (
+    ACP_SUBAGENT_ID_LABEL_KEY,
+    ANTIGRAVITY_NATIVE_SUBAGENT_WRAPPER_VALUE,
+)
 from omnigent.db.db_models import LABEL_VALUE_MAX_LEN
 from omnigent.db.workspace_cache import WorkspaceScopedCache, WorkspaceScopedSet
 from omnigent.entities.conversation import (
@@ -168,7 +172,7 @@ _EXTERNAL_ACP_SUBAGENT_START_TYPE: str = "external_acp_subagent_start"
 # parent, so leaving the wrapper unset lets the child's harness resolve to the
 # parent's (e.g. ``devin``) and the UI label it accordingly, instead of
 # mislabeling it as another vendor.
-_ACP_SUBAGENT_ID_LABEL_KEY = "omnigent.acp.subagent_id"
+_ACP_SUBAGENT_ID_LABEL_KEY = ACP_SUBAGENT_ID_LABEL_KEY
 
 
 _ACP_SUBAGENT_DESCRIPTION_LABEL_KEY = "omnigent.acp.subagent_description"
@@ -255,7 +259,7 @@ _CODEX_NATIVE_SUBAGENT_DISPLAY_FALLBACK = "Codex"
 _EXTERNAL_ANTIGRAVITY_SUBAGENT_START_TYPE: str = "external_antigravity_subagent_start"
 
 
-_ANTIGRAVITY_NATIVE_SUBAGENT_WRAPPER_LABEL_VALUE = "antigravity-native-ui-subagent"
+_ANTIGRAVITY_NATIVE_SUBAGENT_WRAPPER_LABEL_VALUE = ANTIGRAVITY_NATIVE_SUBAGENT_WRAPPER_VALUE
 
 
 _ANTIGRAVITY_NATIVE_SUBAGENT_CASCADE_ID_LABEL_KEY = (

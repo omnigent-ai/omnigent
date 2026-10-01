@@ -36,6 +36,13 @@ WRAPPER_LABEL_KEY = "omnigent.wrapper"
 UI_MODE_LABEL_KEY = "omnigent.ui"
 UI_MODE_TERMINAL_VALUE = "terminal"
 
+# Label key the ACP bridge stamps on a mirrored sub-agent child; the value is
+# the harness's own sub-agent id. Such children run inside their parent.
+ACP_SUBAGENT_ID_LABEL_KEY = "omnigent.acp.subagent_id"
+
+# Wrapper value stamped on Antigravity's mirrored native sub-agent children.
+ANTIGRAVITY_NATIVE_SUBAGENT_WRAPPER_VALUE = "antigravity-native-ui-subagent"
+
 # Value the ``omnigent claude`` wrapper writes into
 # ``conversations.labels[WRAPPER_LABEL_KEY]``. Treated as a string
 # literal on the wire (see API.md "Bind Session Runner") so changes

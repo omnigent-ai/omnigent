@@ -146,6 +146,7 @@ from omnigent.server.routes._sessions.helpers import (
     _publish_permission_mode,
     _publish_sandbox_status,
     _publish_terminal_pending,
+    _raise_if_runner_session_spec_unavailable,
     _reject_reserved_cost_control_label_seed,
     _reject_server_reserved_label_seed,
     _require_codex_approval_mode_forward,
@@ -2562,6 +2563,7 @@ def register_core_routes(
                     session_id,
                 )
                 parent_initialized = False
+                init_error: OmnigentError | None = None
                 if _runner_client is not None and conv is not None and conv.agent_id is not None:
                     # The versioned payload's snapshot carries harness_override,
                     # so a rebind after a cross-harness create initializes the
@@ -2589,11 +2591,15 @@ def register_core_routes(
                     else:
                         from omnigent.server.runner_session_init import runner_inference_verified
 
+                        try:
+                            _raise_if_runner_session_spec_unavailable(runner_init_resp)
+                        except OmnigentError as exc:
+                            init_error = exc
                         parent_initialized = (
                             runner_init_resp.status_code < 400
                             and runner_inference_verified(conv, runner_init_resp)
                         )
-                if (
+                if init_error is not None or (
                     conv is not None
                     and conv.inference_snapshot is not None
                     and not parent_initialized
@@ -2604,6 +2610,8 @@ def register_core_routes(
                         await asyncio.to_thread(
                             conversation_store.replace_runner_id, session_id, previous_runner_id
                         )
+                    if init_error is not None:
+                        raise init_error
                     raise OmnigentError(
                         "The runner did not accept this session's saved inference configuration",
                         code=ErrorCode.RUNNER_UNAVAILABLE,

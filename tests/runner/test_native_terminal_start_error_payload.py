@@ -34,6 +34,16 @@ from omnigent.terminals.registry import TerminalExitedDuringLaunch
 _ERROR_ID_RE = re.compile(r" Error ID: (err_[0-9a-f]{32})\.$")
 
 
+def test_unresolved_sub_agent_preserves_typed_terminal_failure() -> None:
+    exc = OmnigentError("Sub-agent 'worker' is not declared", code=ErrorCode.SUB_AGENT_UNRESOLVED)
+    payload = _native_terminal_start_error_payload(exc, "Claude", session_id="conv_child")
+    assert payload["code"] == "sub_agent_unresolved"
+    assert "not declared" in payload["message"]
+    assert exc.http_status == 410
+    assert exc.blocking
+    assert exc.phase.value == "harness_setup"
+
+
 def test_missing_session_agent_classified_as_lifecycle_condition() -> None:
     """A ``SESSION_AGENT_MISSING`` cause yields the distinct lifecycle code.
 

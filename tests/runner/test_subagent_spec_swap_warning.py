@@ -1,39 +1,7 @@
-"""Regression: a sub-agent turn must not warn when it already holds the child.
+"""Cached children remain usable; missing children never fall back to their parent.
 
-Field symptom (polly dispatching a sub-agent): every turn of a healthy child
-session logged
-
-    Sub-agent '<name>' for session <id> did not resolve in the parent spec;
-    falling back to the parent spec (child runs with the parent's prompt,
-    tools and harness).
-
-even though the sub-agent is declared in the bundle. The warning is a false
-positive. Whatever primes ``_session_spec_cache`` first — ``POST
-/v1/sessions``, ``_resolve_session_spec_entry`` behind a resource read, or an
-earlier turn — resolves the PARENT tree, swaps to the named sub-spec, and
-caches the CHILD. The turn path then reads that cached spec and searches it
-*again* for the sub-agent name; ``_find_spec_by_name`` only walks
-``spec.sub_agents``, and the child has no child of its own, so the lookup
-always misses and the warning fires on a session that resolved perfectly.
-
-The warning matters because it names a real, silent failure mode (a child
-booting as a clone of an orchestrator parent), so firing it on healthy
-sessions makes the genuine case unreadable. The turn path therefore still
-looks the sub-agent up unconditionally and still swaps whenever it resolves;
-only the warning is gated, suppressed on a miss where the spec in hand
-already carries the sub-agent's name.
-
-Gating the LOOKUP on that same name check would be wrong, which is what the
-third test pins. A root may legally share its sub-agent's name — the
-uniqueness check never compares the root's own name — and
-``_find_spec_by_name`` still resolves the child there, so skipping the lookup
-drops a swap that would have succeeded and boots the child as a parent clone
-with no warning at all.
-
-The reported bundle was polly's ``pi`` worker; the defect is in the warning
-gate and is independent of the child's harness, so these tests use the
-``claude_code`` / ``claude-native`` child that the rest of the runner suite
-already exercises hermetically.
+Both session initialization and resource reads can prime the child spec cache.
+Fresh parent specs must still be searched even if the parent shares its child's name.
 """
 
 from __future__ import annotations
@@ -140,8 +108,7 @@ async def _prime_spec_cache_then_turn(
     ``_session_spec_cache`` before the first turn (the live sequence is ``POST
     /v1/sessions``; the web UI's resource panels hit this one). The log
     capture is cleared between the phases so the assertions only see what the
-    TURN logged — priming legitimately warns for an unresolvable name, and
-    that warning is not what this module is about.
+    TURN logged.
 
     :param sub_agent_name: The name the server snapshot reports.
     :param caplog: pytest log capture, cleared between the phases.
@@ -218,23 +185,20 @@ async def test_declared_sub_agent_turn_does_not_warn_about_resolution(
 
 
 @pytest.mark.asyncio
-async def test_unresolvable_sub_agent_turn_still_warns(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    """A name absent from the tree must still warn — that case is real.
-
-    Guards the fix against over-reach: when the cached spec is the PARENT
-    (the swap missed while priming too), the turn must keep surfacing the
-    fallback that silently boots the child as a parent clone.
-    """
-    _pm, records = await _prime_spec_cache_then_turn(UNRESOLVABLE_SUB_AGENT_NAME, caplog)
-
-    warned = [r for r in records if _WARNING_FRAGMENT in r.getMessage()]
-    assert warned, (
-        "a sub-agent name absent from the parent tree produced no "
-        "unresolved-sub-agent warning; the child silently boots with the "
-        "parent's prompt, tools and harness."
+async def test_unresolvable_sub_agent_resource_read_returns_typed_error() -> None:
+    """Resource reads must reject a missing child before caching the parent."""
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_parent_spec_resolver,
+        server_client=_SubAgentSnapshotServer(UNRESOLVABLE_SUB_AGENT_NAME),  # type: ignore[arg-type]
     )
+    async with _runner_client(app) as client:
+        response = await client.get(f"/v1/sessions/{CHILD_SESSION_ID}/resources")
+    assert response.status_code == 410
+    assert response.json()["error"]["code"] == "sub_agent_unresolved"
+    assert UNRESOLVABLE_SUB_AGENT_NAME in response.json()["error"]["message"]
+    assert not pm.get_client_calls
 
 
 def _shadowed_name_spec_tree() -> AgentSpec:

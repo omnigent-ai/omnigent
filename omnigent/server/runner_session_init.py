@@ -158,7 +158,7 @@ class RunnerSessionInitializer:
             if self._tasks.get(key) is task:
                 self._tasks.pop(key, None)
             raise
-        if not runner_inference_verified(conversation, response):
+        if response.status_code < 400 and not runner_inference_verified(conversation, response):
             response = httpx.Response(
                 409,
                 json={"error": "The runner did not accept this session's inference configuration"},

@@ -2,8 +2,9 @@
 
 from dataclasses import replace
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import AsyncMock, Mock
 
+import httpx
 import pytest
 
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec, WritePathSpec
@@ -260,10 +261,14 @@ async def test_stream_setup_errors_are_sanitized_before_spawn(
     environment.prepare_sandbox.side_effect = ValueError("private diagnostic sentinel")
     monkeypatch.setattr(registry, "_create_primary_env", Mock(return_value=environment))
     manager = _FakeProcessManager(_ScriptedHarnessClient([]))
+    server = NullServerClient()
+    monkeypatch.setattr(
+        server, "get", AsyncMock(return_value=httpx.Response(200, json={"agent_id": "agent"}))
+    )
     app = create_runner_app(
         process_manager=manager,
         spec_resolver=resolver,
-        server_client=NullServerClient(),
+        server_client=server,
         resource_registry=registry,
     )
     async with _runner_client(app) as client:

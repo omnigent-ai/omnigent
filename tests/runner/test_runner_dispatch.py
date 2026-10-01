@@ -9010,26 +9010,14 @@ async def test_create_session_reinit_preserves_existing_inbox() -> None:
 # ── approval-event flattening (elicitation-approval hang regression) ──────
 
 
-@pytest.mark.parametrize("second_turn", ["background", "known_harness"])
 @pytest.mark.asyncio
-async def test_unresolvable_sub_agent_warns_again_on_later_turns(
+@pytest.mark.parametrize("harness_override", [None, "hermes"])
+async def test_unresolvable_sub_agent_is_rejected_at_session_create(
     caplog: pytest.LogCaptureFixture,
-    second_turn: str,
+    harness_override: str | None,
 ) -> None:
-    """A parent kept after a miss must not become a resolved child on turn 2.
-
-    Session creation misses on ``sub_agent_name``, warns, and caches the
-    PARENT spec for the session. Later turns read that cache instead of
-    resolving again, and decide "is this the already-resolved child?" by
-    comparing the cached spec's name against the requested name. A root
-    whose own name equals the requested sub-agent satisfies that equality,
-    so the cached parent answers as though it were the child — and the
-    warning that made turn 1 honest never fires again.
-
-    :param caplog: Pytest log capture, read once per turn.
-    :param second_turn: Which dispatch path drives the turn after create.
-    """
-    conv = f"conv_fallback_second_turn_{second_turn}"
+    """A root sharing the requested child's name cannot substitute for that child."""
+    conv = "conv_unresolvable_sub_agent_create"
 
     root_spec = AgentSpec(
         spec_version=1,
@@ -9050,54 +9038,21 @@ async def test_unresolvable_sub_agent_warns_again_on_later_turns(
         server_client=NullServerClient(),  # type: ignore[arg-type]
     )
     async with _runner_test_client(app) as http:
-        with caplog.at_level(logging.WARNING, logger="omnigent.runner.app"):
+        with caplog.at_level(logging.ERROR, logger="omnigent.runner.app"):
             created = await http.post(
                 "/v1/sessions",
                 json={
                     "session_id": conv,
                     "agent_id": "ag_root",
                     "sub_agent_name": "worker",
+                    **({"harness_override": harness_override} if harness_override else {}),
                 },
             )
-        assert created.status_code == 201, created.text
-        assert "did not resolve" in caplog.text
 
-        caplog.clear()
-        with caplog.at_level(logging.WARNING, logger="omnigent.runner.app"):
-            if second_turn == "background":
-                bg = await http.post(
-                    f"/v1/sessions/{conv}/events",
-                    json={
-                        "type": "message",
-                        "role": "user",
-                        "agent_id": "ag_root",
-                        "model": "x",
-                        "content": [{"role": "user", "content": "hi"}],
-                    },
-                )
-                assert bg.status_code == 202, bg.text
-                await _await_bg_turn_task(conv)
-                statuses = await _drain_published_statuses(
-                    app.state.session_event_queues, conv, until="idle", timeout=2.0
-                )
-                assert "failed" not in statuses
-            else:
-                streamed = await _post_stream_message(
-                    http,
-                    conv,
-                    agent_id="ag_root",
-                    harness="claude-sdk",
-                    instructions="Caller-supplied instructions.",
-                )
-                assert streamed.status_code == 200, streamed.text
-
-    assert "'worker'" in caplog.text and "did not resolve" in caplog.text, (
-        f"The {second_turn} turn reused a PARENT kept after a miss silently; "
-        f"warnings: {caplog.text!r}."
-    )
-    assert recorder.posted_bodies
-    composed = recorder.posted_bodies[-1].get("instructions")
-    assert isinstance(composed, str) and "Root instructions." in composed
+    assert created.status_code == 410, created.text
+    assert created.json()["error"]["code"] == "sub_agent_unresolved"
+    assert "'worker'" in caplog.text and "did not resolve" in caplog.text
+    assert not recorder.posted_bodies
 
 
 @pytest.mark.asyncio
@@ -11618,38 +11573,51 @@ def _contract_resolver_for(scenario: str, calls: list[str]) -> Any:
             },
             id="child_present-background",
         ),
-        # child missing: all paths agree — warn, fall back to the parent spec.
+        # Missing children fail without composing the parent's instructions.
         pytest.param(
             "child_missing",
             "no_harness",
             {
-                "status": 200,
-                "error": None,
-                "instructions": _contract_composed_instructions("Root instructions."),
+                "status": 410,
+                "error": {
+                    "code": "sub_agent_unresolved",
+                    "message": (
+                        "Sub-agent 'worker' is not declared in this session's "
+                        "parent agent spec; it was renamed, removed, or never "
+                        "existed."
+                    ),
+                },
+                "instructions": None,
             },
-            id="child_missing-no_harness-parent",
+            id="child_missing-no_harness-410",
         ),
         pytest.param(
             "child_missing",
             "known_harness",
-            # same shape as child_present — caller text still composes additively.
             {
-                "status": 200,
-                "instructions": _contract_composed_instructions(
-                    "Root instructions.", _CONTRACT_CALLER_INSTRUCTIONS
-                ),
+                "status": 410,
+                "error": {
+                    "code": "sub_agent_unresolved",
+                    "message": (
+                        "Sub-agent 'worker' is not declared in this session's "
+                        "parent agent spec; it was renamed, removed, or never "
+                        "existed."
+                    ),
+                },
+                "instructions": None,
             },
-            id="child_missing-known_harness-parent",
+            id="child_missing-known_harness-410",
         ),
         pytest.param(
             "child_missing",
             "background",
+            # Background dispatch reports failure after accepting the request.
             {
                 "status": 202,
-                "terminal_status": "idle",
-                "instructions": _contract_composed_instructions("Root instructions."),
+                "terminal_status": "failed",
+                "instructions": None,
             },
-            id="child_missing-background-parent",
+            id="child_missing-background-failed",
         ),
         # ── Resolver raises: same three-way split, different trigger.
         pytest.param(
@@ -11717,16 +11685,16 @@ def _contract_resolver_for(scenario: str, calls: list[str]) -> Any:
             },
             id="cache_holds_child-known_harness-shortcut",
         ),
-        # no_harness path resolves a second time even with a cached child.
+        # Harness selection reuses the already selected child on streams too.
         pytest.param(
             "cache_holds_child",
             "no_harness",
             {
                 "status": 200,
                 "instructions": _contract_composed_instructions("Worker instructions."),
-                "resolver_calls": 2,
+                "resolver_calls": 1,
             },
-            id="cache_holds_child-no_harness-resolves-again",
+            id="cache_holds_child-no_harness-shortcut",
         ),
     ],
 )
@@ -11738,15 +11706,10 @@ async def test_cross_path_resolution_contract(
 ) -> None:
     """Pin the resolution behaviour matrix across all three dispatch paths.
 
-    Reading the table: ``child_present`` and ``child_missing`` are the
-    scenarios where all three paths agree, and for ``child_missing`` the
-    agreement is load-bearing — an unresolvable ``sub_agent_name`` gets one
-    answer (warn, then the parent's spec) no matter which transport asked.
-    The remaining scenarios still record transport-driven differences that
-    are intended: a synchronous 503, graceful degradation preserving the
-    caller's own instructions, and an asynchronous terminal ``failed``
-    against a 202 that has already gone out. Those differences come from
-    what each transport can report, not from differing answers.
+    A missing child fails every dispatch path: HTTP 410 for synchronous
+    streams (including an explicit harness), or terminal failed status after
+    a background dispatch's HTTP 202. No path may run the parent's spec.
+    Other resolver failures retain their transport-specific behavior.
 
     If you change one path and a row here starts failing, that is the point:
     decide whether the contract moved, do not quietly re-align the table.

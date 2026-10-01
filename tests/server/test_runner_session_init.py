@@ -94,7 +94,14 @@ async def test_initializer_shares_result_for_one_tunnel_generation() -> None:
 
 
 @pytest.mark.asyncio
-async def test_initializer_evicts_rejected_result_for_retry() -> None:
+@pytest.mark.parametrize("inference_verified", [False, True])
+async def test_initializer_evicts_rejected_result_for_retry(
+    inference_verified: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        "omnigent.server.runner_session_init.runner_inference_verified",
+        lambda *_: inference_verified,
+    )
     registry = _Registry()
     client = _Client()
     client.release.set()

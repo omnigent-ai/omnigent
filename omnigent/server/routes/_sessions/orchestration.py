@@ -301,6 +301,7 @@ from omnigent.server.routes._sessions.helpers import (
     _publish_status,
     _publish_terminal_pending,
     _query_host_runner_status,
+    _raise_if_runner_session_spec_unavailable,
     _read_state_entry,
     _record_daily_cost,
     _reject_reserved_cost_control_label_seed,
@@ -4804,6 +4805,7 @@ async def _ensure_runner_session_initialized(
             )
         from omnigent.server.runner_session_init import runner_inference_verified
 
+        _raise_if_runner_session_spec_unavailable(resp)
         if not runner_inference_verified(conv, resp):
             raise OmnigentError(
                 "The runner did not accept this session's saved inference configuration",
@@ -9735,13 +9737,8 @@ async def _create_session_from_existing_agent(
             conversation_store,
         )
 
-    # Reject an undeclared sub-agent before persisting the row. Downstream
-    # spec swaps warn and keep the parent on a miss, which is right for a
-    # name that once resolved and has since been renamed or removed — but
-    # for a name the parent's spec NEVER declared it would boot the child as
-    # a parent clone for the session's whole life, off a request that was
-    # wrong when it arrived. Reject it while the caller is still here to be
-    # told, and leave the parent-fallback to the cases it fits.
+    # Reject an undeclared sub-agent before persisting: the downstream swap
+    # sites fail the dispatch only after the row exists and the caller is gone.
     if body.sub_agent_name:
         await asyncio.to_thread(
             _require_declared_subagent,

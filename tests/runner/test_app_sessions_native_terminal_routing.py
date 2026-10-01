@@ -900,6 +900,20 @@ async def test_create_session_repl_terminal_dispatch(
         spec_version=1,
         name="dispatch-agent",
         executor=ExecutorSpec(type="omnigent", config={"harness": harness}),
+        # Declared so the sub-agent row exercises the dispatch gate rather
+        # than the undeclared-name rejection, which is a different route and
+        # has its own coverage.
+        sub_agents=(
+            [
+                AgentSpec(
+                    spec_version=1,
+                    name=sub_agent_name,
+                    executor=ExecutorSpec(type="omnigent", config={"harness": harness}),
+                )
+            ]
+            if sub_agent_name is not None
+            else []
+        ),
     )
     pm = _FakeProcessManager(_ScriptedHarnessClient([]))
 
@@ -1104,3 +1118,62 @@ async def test_dead_registered_pane_close_does_not_restore_running(
     assert registry.get(sid, "claude", "main") is None, (
         "Stale entry must be removed from the registry"
     )
+
+
+class _StaleChildSnapshotClient(NullServerClient):
+    """Session metadata naming a sub-agent the parent spec no longer declares."""
+
+    def __init__(self, session_id: str) -> None:
+        super().__init__()
+        self._session_id = session_id
+
+    async def get(self, url: str, **kwargs: object) -> NullServerClient._Response:
+        del kwargs
+
+        class _Resp(NullServerClient._Response):
+            status_code = 200
+
+            def json(self) -> dict[str, object]:
+                return {"agent_id": "ag_stale_parent", "sub_agent_name": "worker"}
+
+        if url.endswith(f"/v1/sessions/{self._session_id}"):
+            return _Resp()
+        return await super().get(url)
+
+
+@pytest.mark.asyncio
+async def test_stale_native_child_terminal_ensure_returns_typed_failure_without_spawn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A child whose name left the bundle gets a typed ensure failure, never a terminal."""
+    sid = "5d1a5b6c7e8f4a3b9c0d1e2f3a4b5c6d"
+
+    async def resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        return AgentSpec(
+            spec_version=1,
+            name="stale_parent",
+            executor=ExecutorSpec(type="omnigent", config={"harness": "claude-native"}),
+        )
+
+    async def _must_not_auto_create(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("a stale child must not launch a native terminal")
+
+    monkeypatch.setattr(
+        "omnigent.runner.native.orchestration._auto_create_claude_terminal", _must_not_auto_create
+    )
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
+        spec_resolver=resolver,
+        server_client=_StaleChildSnapshotClient(sid),  # type: ignore[arg-type]
+        terminal_registry=TerminalRegistry(),
+    )
+    async with _runner_client(app) as client:
+        resp = await client.post(
+            f"/v1/sessions/{sid}/resources/terminals",
+            json={"terminal": "claude", "session_key": "main", "ensure_native_terminal": True},
+        )
+    assert resp.status_code == 500, resp.text
+    error = resp.json()["error"]
+    assert error["code"] == "sub_agent_unresolved"
+    assert "not declared" in error["message"]
+    assert "session spec resolver" not in error["message"]

@@ -2526,20 +2526,20 @@ async def test_skill_slash_command_non_json_resolve_surfaces_controlled_error(
     assert "malformed skill resolution" in resp.json()["error"]["message"]
 
 
+@pytest.mark.parametrize(
+    "code, message_fragment",
+    [
+        ("session_agent_missing", "no longer available"),
+        ("sub_agent_unresolved", "not declared"),
+    ],
+)
 async def test_skill_slash_command_missing_session_agent_returns_typed_410(
     client: httpx.AsyncClient,
+    code: str,
+    message_fragment: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """
-    A runner ``session_agent_missing`` on ``/skills/resolve`` surfaces as a
-    typed 410, not a 500.
-
-    The session's bound agent was deleted or rebound — a session-lifecycle
-    condition the client resolves by recreating the agent or starting a new
-    session, not a server fault. The proxy re-derives the typed 410 from the
-    runner body's error code with a client-safe message that never leaks the
-    internal resolver text or the raw agent id.
-    """
+    """Missing parent and child specs preserve their typed, sanitized 410 errors."""
     from omnigent.server.routes import sessions as sessions_module
 
     def _handler(request: httpx.Request) -> httpx.Response:
@@ -2549,7 +2549,7 @@ async def test_skill_slash_command_missing_session_agent_returns_typed_410(
                 410,
                 json={
                     "error": {
-                        "code": "session_agent_missing",
+                        "code": code,
                         "message": (
                             "session spec resolver: agent 'ag_gone' for "
                             "session 'conv_test' was not found"
@@ -2595,11 +2595,11 @@ async def test_skill_slash_command_missing_session_agent_returns_typed_410(
 
     assert resp.status_code == 410, resp.text
     body = resp.json()
-    assert body["error"]["code"] == "session_agent_missing"
+    assert body["error"]["code"] == code
     message = body["error"]["message"]
     assert "session spec resolver" not in message
     assert "ag_gone" not in message
-    assert "no longer available" in message
+    assert message_fragment in message
 
 
 async def test_external_meta_user_message_persists_and_publishes_flagged_input_event(
@@ -12459,3 +12459,105 @@ async def test_external_info_error_item_publishes_and_persists_level(
     errors = [item for item in items.json()["data"] if item["type"] == "error"]
     assert len(errors) == 1
     assert errors[0]["level"] == "info"
+
+
+@pytest.mark.parametrize("operation", ["retry", "rebind"])
+@pytest.mark.parametrize("code", ["sub_agent_unresolved", "session_agent_missing"])
+async def test_session_initialization_preserves_missing_spec_errors(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    db_uri: str,
+    operation: str,
+    code: str,
+) -> None:
+    """Retry and rebind preserve typed initialization failures without reporting recovery."""
+    from omnigent.server.routes import sessions as sessions_module
+
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    sid = session["id"]
+    SqlAlchemyConversationStore(db_uri).set_runner_id(sid, "runner_previous")
+
+    def reject(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(410, json={"error": {"code": code, "message": "private resolver"}})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(reject), base_url="http://runner"
+    ) as runner:
+        monkeypatch.setattr(sessions_module, "_get_runner_client", AsyncMock(return_value=runner))
+        monkeypatch.setattr(sessions_module, "_ensure_runner_relay_ready", AsyncMock())
+        monkeypatch.setattr(sessions_module, "_registered_runner_id", lambda _, rid, **kw: rid)
+        if operation == "retry":
+            response = await client.post(
+                f"/v1/sessions/{sid}/events", json={"type": "retry_session", "data": {}}
+            )
+        else:
+            response = await client.patch(
+                f"/v1/sessions/{sid}", json={"runner_id": "runner_rejected"}
+            )
+    assert response.status_code == 410, response.text
+    assert response.json()["error"]["code"] == code
+    assert "private resolver" not in response.text
+    if operation == "rebind":
+        restored = await client.get(f"/v1/sessions/{sid}")
+        assert restored.json()["runner_id"] == "runner_previous"
+
+
+async def test_rejected_rebind_without_previous_runner_clears_binding(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A first bind the runner rejects leaves the session unbound, not half-bound."""
+    from omnigent.server.routes import sessions as sessions_module
+
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    sid = session["id"]
+
+    def reject(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            410, json={"error": {"code": "sub_agent_unresolved", "message": "private resolver"}}
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(reject), base_url="http://runner"
+    ) as runner:
+        monkeypatch.setattr(sessions_module, "_get_runner_client", AsyncMock(return_value=runner))
+        monkeypatch.setattr(sessions_module, "_ensure_runner_relay_ready", AsyncMock())
+        monkeypatch.setattr(sessions_module, "_registered_runner_id", lambda _, rid, **kw: rid)
+        response = await client.patch(f"/v1/sessions/{sid}", json={"runner_id": "runner_rejected"})
+    assert response.status_code == 410, response.text
+    assert response.json()["error"]["code"] == "sub_agent_unresolved"
+    restored = await client.get(f"/v1/sessions/{sid}")
+    assert restored.json()["runner_id"] is None
+
+
+@pytest.mark.parametrize(
+    "labels",
+    [
+        {"omnigent.acp.subagent_id": "forged"},
+        {"omnigent.wrapper": "claude-code-native-ui-subagent"},
+        {"omnigent.wrapper": "antigravity-native-ui-subagent"},
+    ],
+)
+async def test_mirror_identity_labels_are_rejected_from_clients(
+    client: httpx.AsyncClient, labels: dict[str, str]
+) -> None:
+    """Only the server's sub-agent handlers may mark a session as a native mirror."""
+    agent = await create_test_agent(client)
+    created = await client.post("/v1/sessions", json={"agent_id": agent["id"], "labels": labels})
+    assert created.status_code == 400, created.text
+    assert "server-internal" in created.json()["error"]["message"]
+
+    session = await _create_session(client, agent["id"])
+    patched = await client.patch(f"/v1/sessions/{session['id']}", json={"labels": labels})
+    assert patched.status_code == 400, patched.text
+    unchanged = await client.get(f"/v1/sessions/{session['id']}")
+    assert all(unchanged.json()["labels"].get(key) != value for key, value in labels.items())
+
+    # A top-level wrapper value is still the CLI's to write.
+    top_level = await client.patch(
+        f"/v1/sessions/{session['id']}",
+        json={"labels": {"omnigent.wrapper": "claude-code-native-ui"}},
+    )
+    assert top_level.status_code == 200, top_level.text
