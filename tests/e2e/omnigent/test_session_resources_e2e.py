@@ -228,6 +228,7 @@ def _create_session(client: httpx.Client, yaml_path: Path, runner_id: str) -> st
     session_resp = post_session_bundle(client.post, "/v1/sessions", _bundle_yaml(yaml_path))
     assert session_resp.status_code == 201, session_resp.text
     session_id = session_resp.json()["session_id"]
+    # The client already owns the base URL; keep the PATCH path relative.
     bind_session_runner(client.patch, "", session_id, runner_id)
     return session_id
 
