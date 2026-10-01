@@ -438,6 +438,78 @@ def test_missing_transcript_discovered_after_warning_never_errors(
     assert len([r for r in caplog.records if "path discovered" in r.getMessage()]) == 1
 
 
+def test_missing_transcript_error_includes_observer_stderr_head(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """
+    When observer stderr is non-empty, the first line appears in the stuck-discovery error.
+
+    The root cause (e.g. "bridge dir is not under an allowed bridge root") is
+    written by the observer hook to its own stderr. Surfacing it in the
+    session-stuck error row lets operators see the cause without a separate
+    query for the hook stderr log.
+    """
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    (bridge_dir / "claude-settings.json").write_text("{}", encoding="utf-8")
+    stderr_msg = (
+        "omnigent claude hook: failed to record hook: bridge dir /tmp/x "
+        "is not under an allowed bridge root (/allowed)"
+    )
+    (bridge_dir / forwarder.OBSERVER_HOOK_STDERR_FILE).write_text(
+        stderr_msg + "\n",
+        encoding="utf-8",
+    )
+
+    diagnostics = forwarder._TranscriptDiscoveryDiagnostics(started_at=0.0)
+    caplog.set_level(logging.ERROR, logger=forwarder.__name__)
+
+    forwarder._observe_transcript_discovery(
+        bridge_dir=bridge_dir,
+        session_id="conv_hook_err",
+        transcript_path=None,
+        diagnostics=diagnostics,
+        now=forwarder._TRANSCRIPT_DISCOVERY_ERROR_S,
+    )
+
+    errors = [r for r in caplog.records if "has not started" in r.getMessage()]
+    assert len(errors) == 1, "should log exactly one stuck-discovery error"
+    record = errors[0]
+    msg = record.getMessage()
+    assert "observer_stderr_head=" in msg, "first line of stderr must appear in message"
+    assert "allowed bridge root" in msg, "root-cause text must be in message"
+    assert getattr(record, "observer_stderr_head", None) is not None
+    head = record.observer_stderr_head
+    assert len(head) <= 300, "stderr head must be bounded at 300 chars"
+    assert head == stderr_msg[:300]
+
+
+def test_missing_transcript_error_no_stderr_head_when_file_absent(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """When observer stderr is absent, the error log has no observer_stderr_head field."""
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    (bridge_dir / "claude-settings.json").write_text("{}", encoding="utf-8")
+    diagnostics = forwarder._TranscriptDiscoveryDiagnostics(started_at=0.0)
+    caplog.set_level(logging.ERROR, logger=forwarder.__name__)
+
+    forwarder._observe_transcript_discovery(
+        bridge_dir=bridge_dir,
+        session_id="conv_no_stderr",
+        transcript_path=None,
+        diagnostics=diagnostics,
+        now=forwarder._TRANSCRIPT_DISCOVERY_ERROR_S,
+    )
+
+    errors = [r for r in caplog.records if "has not started" in r.getMessage()]
+    assert len(errors) == 1
+    assert "observer_stderr_head" not in errors[0].getMessage()
+    assert getattr(errors[0], "observer_stderr_head", None) is None
+
+
 @pytest.mark.asyncio
 async def test_clear_hook_rotates_active_session_without_reprocessing(
     tmp_path: Path,
@@ -7546,6 +7618,163 @@ async def test_subagent_cleanup_swallows_finished_worker_failure(
 
 
 @pytest.mark.asyncio
+async def test_child_history_worker_failure_logs_warning_not_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """
+    A failed child-history task is logged at WARNING, not ERROR.
+
+    The forward loop restarts from the durable checkpoint after a worker
+    failure, so the failure is self-healing and must not fire ERROR alerts.
+    The log message must include the exception type so operators can triage
+    without reading a full traceback.
+    """
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text("", encoding="utf-8")
+    # Provide a Stop hook so the loop sees a transcript path in the first poll.
+    record_hook_event(
+        bridge_dir,
+        {
+            "hook_event_name": "Stop",
+            "session_id": "conv_worker_fail",
+            "transcript_path": str(transcript_path),
+        },
+    )
+
+    worker_raised: asyncio.Event = asyncio.Event()
+
+    async def failing_forward(**kwargs: Any) -> forwarder.SubagentForwardState:
+        worker_raised.set()
+        raise TimeoutError("simulated child worker timeout")
+
+    @contextlib.asynccontextmanager
+    async def open_mock_client(*_args: Any, **_kwargs: Any) -> Any:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(lambda _r: httpx.Response(202, json={})),
+            base_url="http://ap",
+        ) as client:
+            yield client
+
+    monkeypatch.setattr(forwarder, "_forward_available_subagents", failing_forward)
+    monkeypatch.setattr("omnigent.cli_auth.open_server_client", open_mock_client)
+
+    caplog.set_level(logging.WARNING, logger=forwarder.__name__)
+    task = asyncio.create_task(
+        forward_claude_transcript_to_session(
+            base_url="http://ap",
+            headers={},
+            session_id="conv_worker_fail",
+            bridge_dir=bridge_dir,
+            agent_name="claude-native-ui",
+            start_at_end=False,
+            poll_interval_s=0.01,
+        )
+    )
+    try:
+        await asyncio.wait_for(worker_raised.wait(), timeout=5.0)
+        # One more poll cycle so the loop processes the done task and logs.
+        await asyncio.sleep(0.05)
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    restart_logs = [
+        r for r in caplog.records if "restarting from its durable checkpoint" in r.getMessage()
+    ]
+    assert restart_logs, "worker restart must be logged"
+    assert restart_logs[0].levelno == logging.WARNING, "restart log must be WARNING, not ERROR"
+    assert "TimeoutError" in restart_logs[0].getMessage(), "exception type must appear in message"
+    assert not any(
+        r.levelno >= logging.ERROR and "restarting" in r.getMessage() for r in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_child_history_worker_escalates_to_error_after_threshold(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """
+    After _FORWARD_DEGRADED_THRESHOLD consecutive worker failures the log
+    escalates from WARNING to ERROR exactly once; further failures are silent
+    until the worker recovers.
+    """
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text("", encoding="utf-8")
+    record_hook_event(
+        bridge_dir,
+        {
+            "hook_event_name": "Stop",
+            "session_id": "conv_escalate",
+            "transcript_path": str(transcript_path),
+        },
+    )
+
+    async def always_fails(**kwargs: Any) -> forwarder.SubagentForwardState:
+        raise AttributeError("simulated persistent bug")
+
+    @contextlib.asynccontextmanager
+    async def open_mock_client(*_args: Any, **_kwargs: Any) -> Any:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(lambda _r: httpx.Response(202, json={})),
+            base_url="http://ap",
+        ) as client:
+            yield client
+
+    monkeypatch.setattr(forwarder, "_forward_available_subagents", always_fails)
+    monkeypatch.setattr("omnigent.cli_auth.open_server_client", open_mock_client)
+
+    caplog.set_level(logging.WARNING, logger=forwarder.__name__)
+    task = asyncio.create_task(
+        forward_claude_transcript_to_session(
+            base_url="http://ap",
+            headers={},
+            session_id="conv_escalate",
+            bridge_dir=bridge_dir,
+            agent_name="claude-native-ui",
+            start_at_end=False,
+            poll_interval_s=0.01,
+        )
+    )
+    try:
+        # Poll until the expected ERROR appears, or timeout.
+        for _ in range(200):
+            await asyncio.sleep(0.05)
+            error_rows = [
+                r
+                for r in caplog.records
+                if r.levelno >= logging.ERROR and "consecutive" in r.getMessage()
+            ]
+            if error_rows:
+                # One extra sleep so any additional (forbidden) ERROR would appear.
+                await asyncio.sleep(0.1)
+                break
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    all_restart = [r for r in caplog.records if "restarting" in r.getMessage()]
+    error_rows = [r for r in all_restart if r.levelno >= logging.ERROR]
+    warning_rows = [r for r in all_restart if r.levelno == logging.WARNING]
+
+    assert error_rows, "should escalate to ERROR after consecutive failures"
+    assert len(error_rows) == 1, "ERROR must fire exactly once per outage (not per failure)"
+    assert "AttributeError" in error_rows[0].getMessage()
+    assert str(forwarder._FORWARD_DEGRADED_THRESHOLD) in error_rows[0].getMessage()
+    assert warning_rows, "should warn before escalating"
+    assert len(warning_rows) == forwarder._FORWARD_DEGRADED_THRESHOLD - 1
+
+
+@pytest.mark.asyncio
 async def test_subagent_history_drains_eight_children_concurrently(tmp_path: Path) -> None:
     """Independent child conversations are concurrent while each stays ordered."""
     bridge_dir = tmp_path / "bridge"
@@ -8091,6 +8320,13 @@ async def test_persistent_subagent_502_ends_as_explicit_failure(
     assert row["attributes"]["item_count"] == "1"
     assert row["attributes"]["exception_type"] == "HTTPStatusError"
     assert "lost output" not in json.dumps(row["attributes"])
+    # exc_type, exc_message, and elapsed_retry_s are now in message and attributes.
+    assert "exc_type=HTTPStatusError" in row["message"]
+    assert "elapsed_retry_s=" in row["message"]
+    assert "exc=" in row["message"]
+    assert "502" in row["attributes"]["exc_message"]
+    assert "elapsed_retry_s" in row["attributes"]
+    assert float(row["attributes"]["elapsed_retry_s"]) >= 0.0
 
 
 @pytest.mark.asyncio
