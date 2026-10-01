@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { act, cleanup, renderHook } from "@testing-library/react";
 import { serializeReplyDraft, type StoredReplyDraft } from "./replyDraft";
 
 const key = "omnigent.sessionDrafts";
@@ -100,5 +101,42 @@ describe("session drafts", () => {
     setSessionDraft("temp:failed", temporaryDraft);
     expect(getSessionDraft("temp:failed")).toBeUndefined();
     expect(sessionStorage.getItem(key)).toBeNull();
+  });
+
+  it("re-renders useSessionDraftIds only when the set of draft ids changes", async () => {
+    const { setSessionDraft, useSessionDraftIds } = await import("./sessionDrafts");
+    let renders = 0;
+    const { result } = renderHook(() => {
+      renders += 1;
+      return useSessionDraftIds();
+    });
+    expect(result.current).toBe("");
+
+    act(() => setSessionDraft("a", { text: "hi", files: [] }));
+    expect(result.current).toBe("a");
+    const afterAdd = renders;
+
+    // Editing an existing draft's text leaves the id set unchanged, so no re-render.
+    act(() => setSessionDraft("a", { text: "hello again", files: [] }));
+    expect(renders).toBe(afterAdd);
+
+    act(() => setSessionDraft("a", { text: "", files: [] }));
+    expect(result.current).toBe("");
+    cleanup();
+  });
+
+  it("returns an empty snapshot without subscribing when disabled", async () => {
+    const { setSessionDraft, useSessionDraftIds } = await import("./sessionDrafts");
+    let renders = 0;
+    const { result } = renderHook(() => {
+      renders += 1;
+      return useSessionDraftIds(false);
+    });
+    const before = renders;
+
+    act(() => setSessionDraft("a", { text: "hi", files: [] }));
+    expect(result.current).toBe("");
+    expect(renders).toBe(before);
+    cleanup();
   });
 });
