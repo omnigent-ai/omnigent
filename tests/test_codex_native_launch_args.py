@@ -13,6 +13,7 @@ from omnigent.harnesses.codex_native.launch_args import (
     absolute_codex_path,
     canonical_codex_launch_args,
     codex_config_profile,
+    effective_codex_mcp_servers,
     materialize_codex_config_profile,
     redact_codex_launch_args,
 )
@@ -327,6 +328,31 @@ def test_profile_paths_keep_source_origin_and_symbolic_permission_keys(tmp_path:
     assert config["mcp_servers"] == profile["mcp_servers"]
     assert config["developer_instructions"] == profile["developer_instructions"]
     assert (source / "strict.config.toml").read_text() == original
+
+
+def test_effective_mcp_servers_merge_shared_base_and_selected_profile(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "config.toml").write_text(
+        '[mcp_servers.base]\ncommand = "base"\n'
+        '[mcp_servers.overridden]\ncommand = "base-command"\n'
+    )
+    (source / "strict.config.toml").write_text(
+        '[mcp_servers.overridden]\ncommand = "profile-command"\n'
+        '[mcp_servers.profile]\ncommand = "profile"\ncwd = "tools"\n'
+    )
+
+    servers = effective_codex_mcp_servers(
+        source,
+        "strict",
+        codex_version=(0, 155, 0),
+    )
+
+    assert servers == {
+        "base": {"command": "base"},
+        "overridden": {"command": "profile-command"},
+        "profile": {"command": "profile", "cwd": "tools"},
+    }
 
 
 async def test_remote_resume_add_dir_preserves_configured_roots(

@@ -852,6 +852,7 @@ async def test_auto_create_claude_terminal_recreate_cancels_prior_forwarder(
         "forwarder_done",
         "missing_bridge",
         "different_thread",
+        "mcp_changed",
         "launch_error",
         "launch_cancelled",
     ],
@@ -1028,6 +1029,11 @@ async def test_auto_create_codex_terminal_recovers_without_restarting_healthy_se
     )
     monkeypatch.setattr(codex_app_mod, "CodexAppServerClient", _UnexpectedDiscoveryClient)
     monkeypatch.setattr(codex_app_mod, "preload_codex_thread_for_resume", _fake_preload_thread)
+    monkeypatch.setattr(
+        codex_app_mod,
+        "shared_mcp_server_config_matches",
+        lambda *_args, **_kwargs: recovery_state != "mcp_changed",
+    )
     monkeypatch.setattr(
         runner_app_mod,
         "_codex_forward_known_thread",

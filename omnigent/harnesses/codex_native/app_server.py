@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import copy
 import hashlib
 import json
 import logging
@@ -40,6 +41,7 @@ from omnigent.harnesses.codex_native.launch_args import (
     absolute_codex_path,
     canonical_codex_launch_args,
     codex_config_profile,
+    effective_codex_mcp_servers,
     materialize_codex_config_profile,
     validate_codex_config_profile_state,
     without_codex_config_profile,
@@ -847,6 +849,76 @@ def _inject_mcp_server_config(
     )
     rendered = f"{updated}\n\n{section}" if updated else section
     config_path.write_text(rendered, encoding="utf-8")
+
+
+def _sync_shared_mcp_server_config(
+    codex_home: Path,
+    source_home: Path,
+    profile: str | None,
+    *,
+    codex_version: tuple[int, int, int] | None,
+) -> frozenset[str]:
+    """Refresh source-owned MCP tables without replacing private session config."""
+    servers = effective_codex_mcp_servers(
+        source_home,
+        profile,
+        codex_version=codex_version,
+    )
+    # Omnigent owns this name in the private layer and injects its current
+    # bridge command immediately after the shared inventory is refreshed.
+    servers.pop("omnigent", None)
+    config_path = codex_home / "config.toml"
+    document = (
+        tomlkit.parse(config_path.read_text(encoding="utf-8"))
+        if config_path.exists()
+        else tomlkit.document()
+    )
+    if servers:
+        document["mcp_servers"] = servers
+    else:
+        document.pop("mcp_servers", None)
+    _write_private_config(config_path, tomlkit.dumps(document))
+    return frozenset(servers)
+
+
+def _validate_mcp_server_inventory(codex_home: Path, expected: frozenset[str]) -> None:
+    """Fail startup when the private config does not contain the refreshed inventory."""
+    config_path = codex_home / "config.toml"
+    document = tomlkit.parse(config_path.read_text(encoding="utf-8")).unwrap()
+    servers = document.get("mcp_servers")
+    actual = frozenset(servers) if isinstance(servers, dict) else frozenset()
+    wanted = expected | {"omnigent"}
+    if actual != wanted:
+        missing = sorted(wanted - actual)
+        unexpected = sorted(actual - wanted)
+        raise RuntimeError(
+            "Codex MCP inventory mismatch after config refresh: "
+            f"missing={missing}, unexpected={unexpected}"
+        )
+
+
+def shared_mcp_server_config_matches(
+    codex_home: Path,
+    source_home: Path,
+    profile: str | None,
+    *,
+    codex_version: tuple[int, int, int] | None,
+) -> bool:
+    """Return whether a live app-server has the current shared MCP config."""
+    expected = effective_codex_mcp_servers(
+        source_home,
+        profile,
+        codex_version=codex_version,
+    )
+    expected.pop("omnigent", None)
+    config_path = codex_home / "config.toml"
+    if not config_path.exists():
+        return not expected
+    document = tomlkit.parse(config_path.read_text(encoding="utf-8")).unwrap()
+    configured = document.get("mcp_servers")
+    actual = copy.deepcopy(configured) if isinstance(configured, dict) else {}
+    actual.pop("omnigent", None)
+    return actual == expected
 
 
 class CodexAppServerResponseError(RuntimeError):
@@ -1955,6 +2027,12 @@ class CodexNativeAppServer:
             codex_version=codex_version,
             agent_instructions=self.developer_instructions,
         )
+        expected_mcp_servers = _sync_shared_mcp_server_config(
+            self.codex_home,
+            config_source,
+            self.config_profile,
+            codex_version=codex_version,
+        )
         if self.trust_project:
             _trust_codex_project(self.codex_home, self.cwd)
         # Write the MCP server config into config.toml so the app-server
@@ -1985,6 +2063,7 @@ class CodexNativeAppServer:
             self.codex_home,
             self.config_overrides,
         )
+        _validate_mcp_server_inventory(self.codex_home, expected_mcp_servers)
         if codex_version is not None and not policy_hooks_supported:
             self._disable_policy_hook(
                 f"Codex CLI {_format_codex_version(codex_version)} is older than "

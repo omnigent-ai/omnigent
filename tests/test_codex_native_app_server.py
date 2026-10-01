@@ -2335,6 +2335,93 @@ args = []
     }
 
 
+async def test_start_refreshes_shared_mcp_servers_across_relaunches(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A cold resume reconciles MCP additions, edits, and removals."""
+    real_codex_home = tmp_path / "real-codex-home"
+    real_codex_home.mkdir()
+    source_config = real_codex_home / "config.toml"
+    source_config.write_text(
+        'model = "shared-at-creation"\n[mcp_servers.old]\ncommand = "old-command"\n',
+        encoding="utf-8",
+    )
+    codex_home = tmp_path / "codex-home"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(real_codex_home))
+    _disable_codex_startup_rpc(monkeypatch)
+    server = _test_app_server(tmp_path, codex_home, tmp_path / "bridge", workspace)
+
+    await server.start()
+    await server.close()
+    private_config = tomlkit.parse((codex_home / "config.toml").read_text())
+    private_config["model"] = "private-model-choice"
+    (codex_home / "config.toml").write_text(tomlkit.dumps(private_config))
+
+    source_config.write_text(
+        'model = "new-shared-model"\n'
+        '[mcp_servers.old]\ncommand = "updated-command"\n'
+        '[mcp_servers.added_after_creation]\ncommand = "new-command"\n',
+        encoding="utf-8",
+    )
+    await server.start()
+    await server.close()
+
+    resumed = tomllib.loads((codex_home / "config.toml").read_text())
+    assert resumed["model"] == "private-model-choice"
+    assert resumed["mcp_servers"]["old"]["command"] == "updated-command"
+    assert resumed["mcp_servers"]["added_after_creation"]["command"] == "new-command"
+
+    source_config.write_text(
+        '[mcp_servers.added_after_creation]\ncommand = "newest-command"\n',
+        encoding="utf-8",
+    )
+    await server.start()
+    await server.close()
+
+    resumed = tomllib.loads((codex_home / "config.toml").read_text())
+    assert set(resumed["mcp_servers"]) == {"added_after_creation", "omnigent"}
+    assert resumed["mcp_servers"]["added_after_creation"]["command"] == "newest-command"
+    assert resumed["model"] == "private-model-choice"
+
+
+def test_mcp_inventory_mismatch_fails_visibly(tmp_path: Path) -> None:
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+    (codex_home / "config.toml").write_text(
+        '[mcp_servers.omnigent]\ncommand = "relay"\n', encoding="utf-8"
+    )
+
+    with pytest.raises(RuntimeError, match=r"missing=\['configured'\]"):
+        app_server._validate_mcp_server_inventory(codex_home, frozenset({"configured"}))
+
+
+def test_shared_mcp_server_config_matches_detects_content_changes(tmp_path: Path) -> None:
+    source_home = tmp_path / "source"
+    private_home = tmp_path / "private"
+    source_home.mkdir()
+    private_home.mkdir()
+    (source_home / "config.toml").write_text(
+        '[mcp_servers.shared]\ncommand = "new"\n', encoding="utf-8"
+    )
+    (private_home / "config.toml").write_text(
+        '[mcp_servers.shared]\ncommand = "old"\n[mcp_servers.omnigent]\ncommand = "relay"\n',
+        encoding="utf-8",
+    )
+
+    assert not app_server.shared_mcp_server_config_matches(
+        private_home, source_home, None, codex_version=(0, 154, 0)
+    )
+    (private_home / "config.toml").write_text(
+        '[mcp_servers.shared]\ncommand = "new"\n[mcp_servers.omnigent]\ncommand = "relay"\n',
+        encoding="utf-8",
+    )
+    assert app_server.shared_mcp_server_config_matches(
+        private_home, source_home, None, codex_version=(0, 154, 0)
+    )
+
+
 async def test_start_can_delegate_global_process_reconciliation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -320,6 +320,40 @@ def materialize_codex_config_profile(
     _write_private_config(state_path, final_state)
 
 
+def effective_codex_mcp_servers(
+    source_home: Path,
+    profile: str | None,
+    *,
+    codex_version: tuple[int, int, int] | None,
+) -> dict[str, Any]:
+    """Return the shared MCP configuration effective for one Codex launch.
+
+    Native sessions keep a private ``config.toml`` so TUI changes such as
+    ``/model`` remain session-local. MCP definitions are host configuration,
+    however, and must follow the shared base config plus the selected file
+    profile on every cold launch.
+    """
+    source_path = source_home / "config.toml"
+    source = tomlkit.parse(source_path.read_text()).unwrap() if source_path.exists() else {}
+    merged = copy.deepcopy(source)
+    if profile is not None:
+        if codex_config_profile(["--profile", profile]) != profile:
+            raise ValueError("Invalid Codex config profile name")
+        if codex_version is None or codex_version >= (0, 134, 0):
+            overlay = tomlkit.parse((source_home / f"{profile}.config.toml").read_text()).unwrap()
+        else:
+            overlay = source.get("profiles", {}).get(profile)
+            if not isinstance(overlay, dict):
+                raise ValueError(f"Codex config profile {profile!r} does not exist")
+        overlay = copy.deepcopy(overlay)
+        _resolve_profile_paths(overlay, source_home)
+        _merge_tables(merged, overlay)
+    servers = merged.get("mcp_servers", {})
+    if not isinstance(servers, dict):
+        raise ValueError("Codex mcp_servers configuration must be a table")
+    return copy.deepcopy(servers)
+
+
 def redact_codex_launch_args(args: Sequence[str]) -> list[str]:
     """
     Return the resolved Codex argv with secret-bearing values masked.
