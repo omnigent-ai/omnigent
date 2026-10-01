@@ -8297,7 +8297,7 @@ describe("NewChatLandingScreen @-file-mention", () => {
     fireEvent.click(screen.getByTitle("Open omnigent"));
     fireEvent.click(screen.getByTitle("Attach cli.py"));
     // The chip shows the workspace-relative path, not the host-absolute one.
-    expect(screen.getByText("@omnigent/cli/commands.py")).toBeInTheDocument();
+    expect(screen.getByText("@omnigent/cli.py")).toBeInTheDocument();
 
     fireEvent.change(input(), { target: { value: "explain this", selectionStart: 12 } });
     fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
@@ -8307,7 +8307,7 @@ describe("NewChatLandingScreen @-file-mention", () => {
     // the "/Users/corey/repo/…" absolute path the host filesystem returned.
     await waitFor(() => expect(setPendingInitialPromptMock).toHaveBeenCalled());
     const [, payload] = setPendingInitialPromptMock.mock.calls[0]!;
-    expect((payload as { text: string }).text).toBe("[Attached: omnigent/cli/commands.py]\n\nexplain this");
+    expect((payload as { text: string }).text).toBe("[Attached: omnigent/cli.py]\n\nexplain this");
   });
 
   it("suppresses stale parent rows while a drilled directory is still loading", async () => {

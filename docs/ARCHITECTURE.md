@@ -65,8 +65,9 @@ Every harness lives in exactly one package under `omnigent/harnesses/`:
   subprocess entry point).
 - **Native harnesses** (`claude_native/`, `codex_native/`, `pi_native/`, …) wrap a
   vendor's own terminal UI: `main.py` launches it, `bridge.py` owns the
-  per-session bridge directory, `forwarder.py` mirrors its transcript, hooks
-  enforce policy, and `executor.py`/`harness.py` deliver web turns into it.
+  per-session bridge directory, a transcript forwarder (usually `forwarder.py`)
+  mirrors its output, hooks enforce policy, and `executor.py`/`harness.py`
+  deliver web turns into it.
   Shared plumbing lives in `harnesses/native/`; the runner-side terminal
   orchestration lives in `runner/native/`.
 - **The registry** (`harnesses/registry.py`, `aliases.py`, `capabilities.py`,

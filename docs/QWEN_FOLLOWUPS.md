@@ -376,6 +376,6 @@ Spec model → provider default → catalog default; `/model` overrides via
 
 ### Env vars consumed by the harness wrap
 
-`HARNESS_QWEN_MODEL`, `HARNESS_QWEN_CWD`, `HARNESS_QWEN_PATH`,
+`HARNESS_QWEN_MODEL`, `HARNESS_QWEN_CWD`, `OMNIGENT_QWEN_PATH`,
 `HARNESS_QWEN_OS_ENV`. (Gateway/Databricks vars are computed but not yet
 consumed — see Pending work. No skills-bridge vars are emitted.)

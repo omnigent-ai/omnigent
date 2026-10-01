@@ -1444,7 +1444,7 @@ def _build_codex_spawn_env(
     defined in ``omnigent/harnesses/codex/harness.py``. Mirrors
     :func:`_build_claude_sdk_spawn_env` — same per-spawn env-var
     pattern from §Step 5a. The codex-specific env vars
-    (``HARNESS_CODEX_PATH``, ``HARNESS_CODEX_ENABLE_WEB_SEARCH``,
+    (``OMNIGENT_CODEX_PATH``, ``HARNESS_CODEX_ENABLE_WEB_SEARCH``,
     ``HARNESS_CODEX_DISABLE_NATIVE_TOOLS``) are not threaded
     through here in v1: the legacy
     :func:`omnigent.inner.executor_factory.create_executor`

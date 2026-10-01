@@ -39,7 +39,7 @@ Env-var contract (read once at construction by
   ``cwd=`` on the subprocess. ``None`` falls back to the runner's cwd.
 - ``OMNIGENT_KIMI_PATH``: explicit path to the ``kimi`` binary, e.g.
   ``"/Users/x/.kimi-code/bin/kimi"``. Defaults to ``"kimi"`` looked up
-  on ``PATH``. (Legacy ``HARNESS_KIMI_PATH`` still honored, deprecated.)
+  on ``PATH``.
 - ``HARNESS_KIMI_PLAN``: truthy → ``--plan`` (read-only plan mode).
 - ``HARNESS_KIMI_CONTINUE_LAST``: truthy → ``--continue`` (resume the
   most recent session for the working directory). Mutually exclusive
@@ -312,9 +312,8 @@ def _parse_truthy(value: str | None) -> bool:
 def _resolve_kimi_binary() -> str:
     """Resolve the ``kimi`` binary path.
 
-    ``OMNIGENT_KIMI_PATH`` wins (legacy ``HARNESS_KIMI_PATH`` still honored
-    via :func:`resolve_harness_path`, which emits a deprecation warning; lets
-    users point at a custom build or a non-standard install location).
+    ``OMNIGENT_KIMI_PATH`` wins (it lets users point at a custom build or a
+    non-standard install location).
     Otherwise default to ``"kimi"`` and rely on ``shutil.which`` so a missing
     binary surfaces clearly at ``run_turn``.
 
@@ -725,7 +724,7 @@ class KimiExecutor(Executor):
                 message=(
                     f"kimi harness: binary {self._binary_path!r} not found on PATH. "
                     "Install via `curl -fsSL https://code.kimi.com/kimi-code/install.sh | bash` "
-                    "or set OMNIGENT_KIMI_PATH (legacy HARNESS_KIMI_PATH) to its"
+                    "or set OMNIGENT_KIMI_PATH to its"
                     " absolute location."
                 ),
                 retryable=False,

@@ -654,6 +654,9 @@ known-first-party = ["omnigent"]
 "omnigent/runtime/**/*.py" = [
     "ARG001", "ARG002", "BLE001", "B008", "RUF012",
 ]
+"omnigent/harnesses/runtime/*.py" = [
+    "ARG001", "ARG002", "BLE001", "B008", "RUF012",
+]
 "omnigent/terminals/**/*.py" = [
     "ARG001", "ARG002", "BLE001", "B008", "RUF012",
 ]
@@ -670,6 +673,9 @@ known-first-party = ["omnigent"]
 # Telemetry modules intentionally catch all exceptions at every boundary —
 # telemetry must never disrupt the application under any circumstances.
 "omnigent/telemetry/*.py" = ["BLE001", "SIM105"]
+"omnigent/observability/otel.py" = [
+    "ARG001", "ARG002", "BLE001", "B008", "RUF012",
+]
 "sdks/**/*.py" = [
     "ARG001", "ARG002", "BLE001", "B008", "RUF012",
 ]
@@ -685,4 +691,4 @@ known-first-party = ["omnigent"]
 # imports intentionally re-export implementation names and load route modules
 # for registration, so F401 remains expected in this package.
 "omnigent/server/routes/sessions/__init__.py" = ["ARG001", "ARG002", "BLE001", "E501", "F401"]
-"omnigent/server/routes/sessions/*.py" = ["ARG001", "ARG002", "BLE001", "E501", "F401"]
+"omnigent/server/routes/sessions/routes_*.py" = ["ARG001", "ARG002", "BLE001", "E501", "F401"]
