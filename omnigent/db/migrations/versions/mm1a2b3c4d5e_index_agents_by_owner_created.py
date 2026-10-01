@@ -10,16 +10,17 @@ keyset pagination: one walk for operator templates (``created_by`` NULL) and
 one for the viewer's own. ``kind`` leads so the walk skips session-scoped rows,
 which outnumber templates by one per session.
 
-Deployment: additive and safe to apply before or after the application
-release that lists owned templates; older application code ignores it. Roll
-back by downgrading this revision. Deployments that apply schema outside
-alembic must create the same index.
+Deployment: additive; older application code ignores it. On PostgreSQL it
+builds ``CONCURRENTLY`` so writes to ``agents`` continue during the build.
+Create it before enabling the owner-filtered picker (including deployments
+that apply schema outside alembic). Roll back by downgrading this revision.
 """
 
 from __future__ import annotations
 
 from collections.abc import Sequence
 
+import sqlalchemy as sa
 from alembic import op
 
 revision: str = "mm1a2b3c4d5e"
@@ -31,8 +32,37 @@ _INDEX = "ix_agents_kind_owner_created"
 _TABLE = "agents"
 
 
+_COLUMNS = ["workspace_id", "kind", "created_by", "created_at", "id"]
+
+
 def upgrade() -> None:
-    op.create_index(_INDEX, _TABLE, ["workspace_id", "kind", "created_by", "created_at", "id"])
+    if op.get_bind().dialect.name != "postgresql":
+        op.create_index(_INDEX, _TABLE, _COLUMNS)
+        return
+    # CONCURRENTLY can't run in a transaction; autocommit lets writers proceed.
+    with op.get_context().autocommit_block():
+        # A failed concurrent build leaves an INVALID index that IF NOT EXISTS would keep.
+        # Match it only on the table this connection resolves, never a same-named index elsewhere.
+        invalid = (
+            op.get_bind()
+            .execute(
+                sa.text(
+                    "SELECT i.indexrelid::regclass::text FROM pg_index i "
+                    "JOIN pg_class c ON c.oid = i.indexrelid "
+                    "WHERE i.indrelid = to_regclass(:table) AND c.relname = :name "
+                    "AND NOT i.indisvalid"
+                ),
+                {"table": _TABLE, "name": _INDEX},
+            )
+            .scalar()
+        )
+        if invalid:
+            # regclass text is quoted and schema-qualified as needed; CONCURRENTLY
+            # avoids blocking writers behind an exclusive lock.
+            op.execute(f"DROP INDEX CONCURRENTLY {invalid}")
+        op.execute(
+            f"CREATE INDEX CONCURRENTLY IF NOT EXISTS {_INDEX} ON {_TABLE} ({', '.join(_COLUMNS)})"
+        )
 
 
 def downgrade() -> None:
