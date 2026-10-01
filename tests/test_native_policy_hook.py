@@ -2,6 +2,14 @@
 
 from __future__ import annotations
 
+import contextlib
+import subprocess
+import sys
+import threading
+from collections.abc import Iterator
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
 import httpx
 import pytest
 
@@ -464,7 +472,7 @@ def _make_redirect_then_ok_client(
     """Build an httpx.Client stub: redirect on attempt 1, ``ok`` thereafter."""
 
     class _Client:
-        def __init__(self, *, headers: dict[str, str], timeout: object) -> None:
+        def __init__(self, *, headers: dict[str, str], timeout: object, **_kwargs: object) -> None:
             del timeout
             self._headers = headers
 
@@ -480,6 +488,207 @@ def _make_redirect_then_ok_client(
             return redirect if len(seen_headers) == 1 else ok
 
     return _Client
+
+
+@pytest.mark.parametrize(
+    ("url", "expected_trust_env"),
+    [
+        ("http://127.0.0.1:6767/v1/sessions/s/policies/evaluate", False),
+        ("http://localhost:6767/v1/sessions/s/policies/evaluate", False),
+        ("http://[::1]:6767/v1/sessions/s/policies/evaluate", False),
+        ("https://omnigent.example.com/v1/sessions/s/policies/evaluate", True),
+    ],
+)
+def test_post_evaluate_with_retry_bypasses_proxies_only_for_loopback_targets(
+    monkeypatch: pytest.MonkeyPatch,
+    url: str,
+    expected_trust_env: bool,
+) -> None:
+    """Local policy callbacks bypass proxies; remote deployments retain them."""
+    captured_trust_env: list[bool] = []
+
+    class _Client:
+        def __init__(
+            self,
+            *,
+            headers: dict[str, str],
+            timeout: object,
+            trust_env: bool,
+        ) -> None:
+            del headers, timeout
+            captured_trust_env.append(trust_env)
+
+        def __enter__(self) -> _Client:
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            del args
+
+        def post(self, request_url: str, *, json: dict[str, object]) -> httpx.Response:
+            del json
+            return httpx.Response(
+                200,
+                text='{"result":"POLICY_ACTION_ALLOW"}',
+                request=httpx.Request("POST", request_url),
+            )
+
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", _Client)
+
+    response, error = post_evaluate_with_retry(url, {}, {"event": {}}, 5.0, "evaluate-policy hook")
+
+    assert response is not None
+    assert error is None
+    assert captured_trust_env == [expected_trust_env]
+
+
+_ALLOW_BODY = b'{"result":"POLICY_ACTION_ALLOW"}'
+
+
+@contextlib.contextmanager
+def _http_endpoint(status: int, body: bytes) -> Iterator[tuple[str, list[str]]]:
+    """
+    Serve *status*/*body* to every POST on a loopback port, recording request targets.
+
+    Doubles as a forward-proxy stand-in: a proxied request arrives with the
+    absolute URL as its target, a direct one with just the path.
+
+    :param status: HTTP status to answer with.
+    :param body: Response body.
+    :returns: ``(base_url, targets)`` -- the targets list fills as requests land.
+    """
+    targets: list[str] = []
+
+    class _Handler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, *args: object) -> None:
+            del args
+
+        def do_POST(self) -> None:
+            self.rfile.read(int(self.headers.get("Content-Length") or 0))
+            targets.append(self.path)
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_address[1]}", targets
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+def _point_proxy_env_at(monkeypatch: pytest.MonkeyPatch, proxy_url: str) -> None:
+    """Export *proxy_url* the way a proxied host does: every scheme, no loopback exemption."""
+    for name in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"):
+        monkeypatch.setenv(name, proxy_url)
+        monkeypatch.setenv(name.lower(), proxy_url)
+    for name in ("NO_PROXY", "no_proxy"):
+        monkeypatch.delenv(name, raising=False)
+
+
+def test_post_evaluate_with_retry_loopback_callback_ignores_ambient_proxy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A loopback callback reaches the local server even when the host exports a proxy.
+
+    On a proxied host the runner-local relay is ``127.0.0.1``, which the proxy
+    resolves against itself and refuses. Sending that callback through the
+    proxy made every prompt fail closed; it must connect directly and never
+    consult the proxy at all.
+    """
+    # Keep the fail-closed retry loop short so the buggy path fails in seconds.
+    monkeypatch.setattr(native_policy_hook, "_EVALUATE_POLICY_RETRY_BUDGET_S", 3.0)
+    with (
+        _http_endpoint(200, _ALLOW_BODY) as (relay_url, relay_targets),
+        _http_endpoint(502, b"proxy: connect to 127.0.0.1 refused") as (proxy_url, proxy_targets),
+    ):
+        _point_proxy_env_at(monkeypatch, proxy_url)
+        resp, error = post_evaluate_with_retry(
+            f"{relay_url}/policies/evaluate",
+            {"Authorization": "Bearer relay-token"},
+            {"event": {}},
+            5.0,
+            "evaluate-policy hook",
+        )
+
+    assert error is None, f"loopback callback failed: {error}; proxy saw {proxy_targets!r}"
+    assert resp is not None and resp.json() == {"result": "POLICY_ACTION_ALLOW"}
+    assert relay_targets == ["/policies/evaluate"]
+    assert proxy_targets == []
+
+
+def test_post_evaluate_with_retry_remote_callback_honors_ambient_proxy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A non-loopback callback still travels through the environment's proxy.
+
+    Hosted deployments reach the Omnigent server only through a corporate
+    proxy, so the bypass must stay limited to loopback targets. The server
+    name here does not resolve; the request can only succeed via the proxy.
+    """
+    url = "http://omnigent-server.corp.invalid/v1/sessions/s/policies/evaluate"
+    with _http_endpoint(200, _ALLOW_BODY) as (proxy_url, proxy_targets):
+        _point_proxy_env_at(monkeypatch, proxy_url)
+        resp, error = post_evaluate_with_retry(url, {}, {"event": {}}, 5.0, "evaluate-policy hook")
+
+    assert error is None
+    assert resp is not None and resp.json() == {"result": "POLICY_ACTION_ALLOW"}
+    assert proxy_targets == [url]
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://127.0.0.1:28700/policies/evaluate",
+        "http://127.8.9.10:1/x",
+        "http://localhost:6767/x",
+        "http://relay.localhost/x",
+        "http://[::1]:6767/x",
+        "https://omnigent.example.com/x",
+        "http://10.0.0.7:6767/x",
+        "http://[fe80::1]:6767/x",
+        "not a url",
+        "",
+    ],
+)
+def test_is_loopback_url_matches_the_sdk_helper(url: str) -> None:
+    """The hook's stdlib copy must classify URLs exactly like the SDK helper it mirrors."""
+    from omnigent_client._http import is_loopback_url as sdk_is_loopback_url
+
+    assert native_policy_hook.is_loopback_url(url) is sdk_is_loopback_url(url)
+
+
+def test_policy_hook_import_does_not_load_the_sdk() -> None:
+    """
+    Importing the hook module must not pull in ``omnigent_client``.
+
+    The hook runs as a fresh subprocess on every native tool call; the SDK
+    package loads the server schemas and roughly triples that startup time.
+    """
+    probe = (
+        "import sys; import omnigent.native.native_policy_hook; "
+        "loaded = {name.partition('.')[0] for name in sys.modules}; "
+        "sys.exit(1 if 'omnigent_client' in loaded else 0)"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", probe],
+        cwd=Path(__file__).resolve().parents[1],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, (
+        f"omnigent_client was imported by the hook module\n{result.stderr}"
+    )
 
 
 def test_post_evaluate_with_retry_reauths_on_login_redirect(
@@ -558,7 +767,7 @@ def test_post_evaluate_with_retry_reparks_a_held_ask_poll_the_gateway_severed(
     )
 
     class _Client:
-        def __init__(self, *, headers: dict[str, str], timeout: object) -> None:
+        def __init__(self, *, headers: dict[str, str], timeout: object, **_kwargs: object) -> None:
             del headers, timeout
 
         def __enter__(self) -> _Client:
@@ -618,7 +827,7 @@ def test_post_evaluate_with_retry_fast_5xx_still_exhausts_the_budget(
     posts: list[str] = []
 
     class _Client:
-        def __init__(self, *, headers: dict[str, str], timeout: object) -> None:
+        def __init__(self, *, headers: dict[str, str], timeout: object, **_kwargs: object) -> None:
             del headers, timeout
 
         def __enter__(self) -> _Client:

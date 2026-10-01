@@ -35,7 +35,7 @@ class _DenyHttpxClient:
 
     captured: dict[str, object] = {}
 
-    def __init__(self, *, headers: dict[str, str], timeout: object) -> None:
+    def __init__(self, *, headers: dict[str, str], timeout: object, **_kwargs: object) -> None:
         """
         Capture constructor inputs for later assertions.
 

@@ -269,7 +269,7 @@ def test_clear_session_start_hook_rotates_before_printing_conversation_url(
 
         captured_timeouts: list[object] = []
 
-        def __init__(self, *, headers: dict[str, str], timeout: object) -> None:
+        def __init__(self, *, headers: dict[str, str], timeout: object, **_kwargs: object) -> None:
             """
             Capture constructor inputs.
 
@@ -452,7 +452,7 @@ def test_fork_session_start_hook_forks_before_printing_conversation_url(
 
         captured_timeouts: list[object] = []
 
-        def __init__(self, *, headers: dict[str, str], timeout: object) -> None:
+        def __init__(self, *, headers: dict[str, str], timeout: object, **_kwargs: object) -> None:
             """
             Capture constructor inputs.
 
@@ -642,7 +642,7 @@ def test_resume_session_start_without_branch_marker_does_not_fork(
         :param timeout: Timeout passed to :class:`httpx.Client`.
         """
 
-        def __init__(self, *, headers: dict[str, str], timeout: object) -> None:
+        def __init__(self, *, headers: dict[str, str], timeout: object, **_kwargs: object) -> None:
             """
             Capture constructor inputs.
 
@@ -759,7 +759,7 @@ def test_permission_request_hook_posts_to_active_session_from_bridge_config(
         :param timeout: Timeout passed to :class:`httpx.Client`.
         """
 
-        def __init__(self, *, headers: dict[str, str], timeout: object) -> None:
+        def __init__(self, *, headers: dict[str, str], timeout: object, **_kwargs: object) -> None:
             """
             Capture constructor inputs.
 
@@ -893,7 +893,7 @@ def test_permission_request_hook_retries_transport_cut_with_same_id(
         :param timeout: Timeout passed to :class:`httpx.Client`.
         """
 
-        def __init__(self, *, headers: dict[str, str], timeout: object) -> None:
+        def __init__(self, *, headers: dict[str, str], timeout: object, **_kwargs: object) -> None:
             """
             Accept and discard constructor inputs.
 
@@ -994,7 +994,7 @@ def test_permission_request_hook_does_not_retry_rejections(
         :param timeout: Timeout passed to :class:`httpx.Client`.
         """
 
-        def __init__(self, *, headers: dict[str, str], timeout: object) -> None:
+        def __init__(self, *, headers: dict[str, str], timeout: object, **_kwargs: object) -> None:
             """
             Accept and discard constructor inputs.
 
@@ -1234,7 +1234,7 @@ def test_evaluate_policy_pre_tool_use_converts_and_returns_deny(
         :param timeout: Timeout passed to :class:`httpx.Client`.
         """
 
-        def __init__(self, *, headers: dict[str, str], timeout: object) -> None:
+        def __init__(self, *, headers: dict[str, str], timeout: object, **_kwargs: object) -> None:
             """
             Capture constructor inputs.
 
@@ -1346,7 +1346,7 @@ def test_evaluate_policy_stamps_live_model_from_context_json(
     class _FakeHttpxClient:
         """Sync HTTP client stub capturing the posted EvaluationRequest."""
 
-        def __init__(self, *, headers: dict[str, str], timeout: object) -> None:
+        def __init__(self, *, headers: dict[str, str], timeout: object, **_kwargs: object) -> None:
             """Record constructor inputs. :returns: None."""
             del headers, timeout
 
@@ -1414,7 +1414,7 @@ def test_evaluate_policy_post_tool_use_converts_and_returns_context(
         :param timeout: Timeout passed to :class:`httpx.Client`.
         """
 
-        def __init__(self, *, headers: dict[str, str], timeout: object) -> None:
+        def __init__(self, *, headers: dict[str, str], timeout: object, **_kwargs: object) -> None:
             """
             Capture constructor inputs.
 
@@ -1533,6 +1533,40 @@ def test_ask_user_question_subcommand_is_a_silent_noop(
     assert exit_code == 0
     assert captured.out == ""
     assert captured.err == ""
+
+
+def test_evaluate_policy_ignores_ambient_proxy_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Policy callbacks must reach the local runner instead of an inherited proxy."""
+    client_options: dict[str, object] = {}
+
+    class _CapturingClient:
+        def __init__(self, **kwargs: object) -> None:
+            client_options.update(kwargs)
+
+        def __enter__(self) -> _CapturingClient:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def post(self, url: str, *, json: dict[str, object]) -> httpx.Response:
+            return httpx.Response(200, request=httpx.Request("POST", url))
+
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", _CapturingClient)
+
+    response, error = native_policy_hook.post_evaluate_with_retry(
+        "http://127.0.0.1:8787/v1/sessions/session/policies/evaluate",
+        {"Authorization": "Bearer token"},
+        {"event": {}},
+        read_timeout=60.0,
+        hook_label="evaluate-policy hook",
+    )
+
+    assert response is not None
+    assert error is None
+    assert client_options["trust_env"] is False
 
 
 @pytest.mark.parametrize("mode", ["connect_error", "non_2xx", "empty_body", "malformed_json"])
@@ -1707,7 +1741,7 @@ def test_evaluate_policy_retries_5xx_and_succeeds(
     call_count = 0
 
     class _FlakyThenOkClient:
-        def __init__(self, *, headers: object, timeout: object) -> None:
+        def __init__(self, *, headers: object, timeout: object, **_kwargs: object) -> None:
             del headers, timeout
 
         def __enter__(self) -> _FlakyThenOkClient:
@@ -1771,7 +1805,7 @@ def test_evaluate_policy_reauths_on_expired_token_instead_of_failing_closed(
     attempts: list[dict[str, str]] = []
 
     class _RedirectThenOkClient:
-        def __init__(self, *, headers: dict[str, str], timeout: object) -> None:
+        def __init__(self, *, headers: dict[str, str], timeout: object, **_kwargs: object) -> None:
             del timeout
             self._headers = headers
 
@@ -1846,7 +1880,7 @@ def test_evaluate_policy_reauths_on_403_invalid_token(
     attempts: list[dict[str, str]] = []
 
     class _ForbiddenThenOkClient:
-        def __init__(self, *, headers: dict[str, str], timeout: object) -> None:
+        def __init__(self, *, headers: dict[str, str], timeout: object, **_kwargs: object) -> None:
             del timeout
             self._headers = headers
 
@@ -1918,7 +1952,7 @@ def test_evaluate_policy_fails_closed_when_reauth_unavailable(
     """
 
     class _RedirectClient:
-        def __init__(self, *, headers: dict[str, str], timeout: object) -> None:
+        def __init__(self, *, headers: dict[str, str], timeout: object, **_kwargs: object) -> None:
             del headers, timeout
 
         def __enter__(self) -> _RedirectClient:
@@ -2012,7 +2046,7 @@ def _scripted_client(
     class _ScriptedClient:
         calls: list[str] = []
 
-        def __init__(self, *, headers: dict[str, str], timeout: object) -> None:
+        def __init__(self, *, headers: dict[str, str], timeout: object, **_kwargs: object) -> None:
             del headers, timeout
 
         def __enter__(self) -> _ScriptedClient:
@@ -2153,7 +2187,7 @@ def test_reattach_proxy_severed_held_poll_never_caps(monkeypatch: pytest.MonkeyP
     monkeypatch.setattr(claude_native_hook.time, "sleep", lambda _s: None)
 
     class _SeverThenAnswerClient:
-        def __init__(self, *, headers: dict[str, str], timeout: object) -> None:
+        def __init__(self, *, headers: dict[str, str], timeout: object, **_kwargs: object) -> None:
             del headers, timeout
 
         def __enter__(self) -> _SeverThenAnswerClient:
@@ -2274,7 +2308,7 @@ def test_reattach_holds_the_approval_wait_marker_until_the_wait_ends(
     monkeypatch.setattr(claude_native_hook.time, "sleep", lambda _s: None)
 
     class _ObservingClient:
-        def __init__(self, *, headers: dict[str, str], timeout: object) -> None:
+        def __init__(self, *, headers: dict[str, str], timeout: object, **_kwargs: object) -> None:
             del headers, timeout
 
         def __enter__(self) -> _ObservingClient:
@@ -2333,7 +2367,7 @@ def test_reattach_marker_stays_fresh_through_an_unsevered_held_poll(
     freshness: list[bool] = []
 
     class _HoldingClient:
-        def __init__(self, *, headers: dict[str, str], timeout: object) -> None:
+        def __init__(self, *, headers: dict[str, str], timeout: object, **_kwargs: object) -> None:
             del headers, timeout
 
         def __enter__(self) -> _HoldingClient:
@@ -2383,7 +2417,7 @@ def test_reattach_reauths_again_after_a_held_poll_sever(monkeypatch: pytest.Monk
     seen_auth: list[str] = []
 
     class _Client:
-        def __init__(self, *, headers: dict[str, str], timeout: object) -> None:
+        def __init__(self, *, headers: dict[str, str], timeout: object, **_kwargs: object) -> None:
             del timeout
             self._headers = headers
 
@@ -2548,7 +2582,7 @@ def test_reattach_returns_response_on_success(monkeypatch: pytest.MonkeyPatch) -
     class _OkClient:
         calls = 0
 
-        def __init__(self, *, headers: dict[str, str], timeout: object) -> None:
+        def __init__(self, *, headers: dict[str, str], timeout: object, **_kwargs: object) -> None:
             del headers, timeout
 
         def __enter__(self) -> _OkClient:
