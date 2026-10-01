@@ -2382,7 +2382,7 @@ async def test_cold_start_refreshes_user_mcp_inventory(
     assert source_config.read_text() == updated
 
 
-@pytest.mark.parametrize("empty_source", [None, "", "[mcp_servers]\n"])
+@pytest.mark.parametrize("empty_source", [None, "[mcp_servers]\n"])
 async def test_cold_start_removes_all_user_mcps(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, empty_source: str | None
 ) -> None:
@@ -2445,20 +2445,27 @@ async def test_cold_start_refreshes_mcps_across_profile_changes(
 
 
 @pytest.mark.parametrize(
-    "invalid",
+    ("invalid", "profile", "diagnostic"),
     [
-        "invalid = [",
-        'mcp_servers = "bad"',
-        "[mcp_servers]\nbad = 1",
-        PermissionError(errno.EACCES, "Permission denied"),
+        pytest.param("invalid = [", None, "UnexpectedEofError at line 1, column", id="syntax"),
+        pytest.param('mcp_servers = "bad"', None, "Invalid mcp_servers", id="inventory-shape"),
+        pytest.param("[mcp_servers]\nbad = 1", None, "Invalid mcp_servers", id="server-shape"),
+        pytest.param(
+            PermissionError(errno.EACCES, "Permission denied"),
+            None,
+            "Permission denied",
+            id="unreadable",
+        ),
+        pytest.param(b"\xff", None, "UnicodeDecodeError", id="invalid-utf8"),
+        pytest.param("invalid = [", "work", "UnexpectedEofError", id="profile-syntax"),
     ],
 )
-@pytest.mark.parametrize("profile", [None, "work"])
 async def test_cold_start_invalid_mcp_source_preserves_private_config(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    invalid: str | OSError,
+    invalid: str | bytes | OSError,
     profile: str | None,
+    diagnostic: str,
 ) -> None:
     source = tmp_path / "source"
     source.mkdir()
@@ -2467,7 +2474,9 @@ async def test_cold_start_invalid_mcp_source_preserves_private_config(
     if profile:
         (source / f"{profile}.config.toml").write_text(content)
     failed_path = source / (f"{profile}.config.toml" if profile else "config.toml")
-    if isinstance(invalid, OSError):
+    if isinstance(invalid, bytes):
+        failed_path.write_bytes(invalid)
+    elif isinstance(invalid, OSError):
         original_read = Path.read_text
 
         def read_text(path: Path, *args: Any, **kwargs: Any) -> str:
@@ -2491,17 +2500,13 @@ async def test_cold_start_invalid_mcp_source_preserves_private_config(
         await server.start()
 
     assert str(failed_path) in str(caught.value)
-    if isinstance(invalid, OSError):
-        assert "Permission denied" in str(caught.value)
-    elif invalid == "invalid = [":
-        assert "UnexpectedEofError at line 1, column" in str(caught.value)
+    assert diagnostic in str(caught.value)
     assert (private / "config.toml").read_text() == original
     spawn.assert_not_called()
 
 
-@pytest.mark.parametrize("profile", [None, "work"])
 def test_mcp_refresh_reads_utf8_independently_of_locale(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, profile: str | None
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     source = tmp_path / "source"
     source.mkdir()
@@ -2512,10 +2517,9 @@ def test_mcp_refresh_reads_utf8_independently_of_locale(
     (source / "config.toml").write_text(
         '[mcp_servers.search]\ncommand = "搜索"\n', encoding="utf-8"
     )
-    if profile:
-        (source / f"{profile}.config.toml").write_text(
-            '[mcp_servers.search]\nargs = ["資料"]\n', encoding="utf-8"
-        )
+    (source / "work.config.toml").write_text(
+        '[mcp_servers.search]\nargs = ["資料"]\n', encoding="utf-8"
+    )
     original_read = Path.read_text
 
     def read_text(path: Path, *args: Any, **kwargs: Any) -> str:
@@ -2523,12 +2527,11 @@ def test_mcp_refresh_reads_utf8_independently_of_locale(
         return original_read(path, *args, **kwargs)
 
     monkeypatch.setattr(Path, "read_text", read_text)
-    servers = launch_args.read_codex_mcp_servers(source, profile, codex_version=(0, 154, 0))
+    servers = launch_args.read_codex_mcp_servers(source, "work", codex_version=(0, 154, 0))
     app_server._inject_mcp_server_config(private, tmp_path / "bridge", mcp_servers=servers)
 
     config = tomllib.loads(config_path.read_text(encoding="utf-8"))
-    expected = {"command": "搜索", **({"args": ["資料"]} if profile else {})}
-    assert config["mcp_servers"]["search"] == expected
+    assert config["mcp_servers"]["search"] == {"command": "搜索", "args": ["資料"]}
     assert config["developer_instructions"] == "保持设置"
 
 
@@ -2567,22 +2570,57 @@ async def test_cold_start_rejects_shared_home_before_modifying_it(
     spawn.assert_not_called()
 
 
-async def test_cold_start_minimal_config_does_not_import_ambient_mcps(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize(
+    ("profile", "version"),
+    [
+        pytest.param(None, (0, 154, 0), id="no-profile"),
+        pytest.param("work", (0, 154, 0), id="file-profile"),
+        pytest.param("work", (0, 133, 0), id="legacy-profile"),
+    ],
+)
+async def test_cold_start_minimal_config_preserves_explicit_profile_mcps(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    profile: str | None,
+    version: tuple[int, int, int],
 ) -> None:
     source = tmp_path / "source"
     source.mkdir()
-    (source / "config.toml").write_text('[mcp_servers.ambient]\ncommand = "do-not-start"\n')
+    base = '[mcp_servers.ambient]\ncommand = "do-not-start"\n'
+    legacy_profile = '[profiles.work.mcp_servers.explicit]\ncommand = "old"\n'
+    source_config = source / "config.toml"
+    source_config.write_text(base + legacy_profile)
+    profile_config = source / "work.config.toml"
+    profile_config.write_text('[mcp_servers.explicit]\ncommand = "old"\n')
     monkeypatch.setenv("CODEX_HOME", str(source))
     monkeypatch.setenv("HARNESS_CODEX_MINIMAL_CONFIG", "true")
+    monkeypatch.setattr(app_server, "_codex_cli_version", AsyncMock(return_value=version))
     _disable_codex_startup_rpc(monkeypatch)
     private = tmp_path / "private"
     server = _test_app_server(tmp_path, private, tmp_path / "bridge", tmp_path)
+    server.config_profile = profile
 
     await server.start()
     await server.close()
 
-    assert set(tomllib.loads((private / "config.toml").read_text())["mcp_servers"]) == {"omnigent"}
+    expected = {"explicit", "omnigent"} if profile else {"omnigent"}
+    config_path = private / "config.toml"
+    assert set(tomllib.loads(config_path.read_text())["mcp_servers"]) == expected
+
+    if profile and version < (0, 134, 0):
+        source_config.write_text(base + legacy_profile.replace('"old"', '"new"'))
+    else:
+        # The existing minimal home no longer needs the ambient source on restart.
+        source_config.write_text("invalid = [")
+        profile_config.write_text('[mcp_servers.explicit]\ncommand = "new"\n')
+
+    await server.start()
+    await server.close()
+
+    servers = tomllib.loads(config_path.read_text())["mcp_servers"]
+    assert set(servers) == expected
+    if profile:
+        assert servers["explicit"] == {"command": "new"}
 
 
 def test_mcp_refresh_atomically_replaces_private_symlink(tmp_path: Path) -> None:

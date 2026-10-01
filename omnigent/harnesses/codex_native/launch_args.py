@@ -233,7 +233,7 @@ def read_codex_mcp_servers(
     codex_version: tuple[int, int, int] | None,
     minimal_config: bool = False,
 ) -> dict[str, Any]:
-    """Read current user MCPs, with the selected profile layered over the base."""
+    """Read current user MCPs; minimal mode omits ambient, not explicit profile MCPs."""
 
     def read(path: Path, *, optional: bool = False) -> dict[str, Any]:
         try:
@@ -265,12 +265,18 @@ def read_codex_mcp_servers(
         return copy.deepcopy(servers)
 
     source_path = source_home / "config.toml"
-    source = read(source_path, optional=True)
+    file_profile = codex_version is None or codex_version >= (0, 134, 0)
+    # Minimal mode needs the base only to find an explicitly selected legacy profile.
+    source = (
+        read(source_path, optional=True)
+        if not minimal_config or (profile is not None and not file_profile)
+        else {}
+    )
     servers = {} if minimal_config else inventory(source, source_path)
     if profile is not None:
         # Reject invalid profile names before deriving a file path from them.
         codex_config_profile(["--profile", profile])
-        if codex_version is None or codex_version >= (0, 134, 0):
+        if file_profile:
             profile_path = source_home / f"{profile}.config.toml"
             overlay = read(profile_path)
         else:
