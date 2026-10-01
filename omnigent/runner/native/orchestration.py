@@ -2494,7 +2494,10 @@ async def _auto_create_pi_terminal(
         from omnigent.runner.tool_dispatch import build_native_relay_tool_schemas
 
         spec_for_tools = _unwrap_resolved_spec(agent_spec)
-        pi_tools = build_native_relay_tool_schemas(spec_for_tools)
+        pi_tools = build_native_relay_tool_schemas(
+            spec_for_tools,
+            local_tool_workdir=_resolved_spec_workdir(agent_spec),
+        )
     except Exception:  # noqa: BLE001 — tool registration is additive
         _logger.warning(
             "Failed to build pi-native tool schemas for session %s; "
@@ -10263,11 +10266,18 @@ def _is_spec_local_native_python_tool(
     tool_name: str,
 ) -> bool:
     """Return whether *tool_name* is a spec-declared native python tool."""
+    from omnigent.runner.tool_dispatch import _is_spec_local_python_tool
+
     unwrapped = _unwrap_resolved_spec(spec)
     if unwrapped is None:
         return False
+    if _is_spec_local_python_tool(
+        tool_name,
+        unwrapped,
+        local_tool_workdir=_resolved_spec_workdir(spec),
+    ):
+        return True
     return any(
-        getattr(info, "name", None) == tool_name
-        and getattr(info, "language", None) in ("python", "omnigent-python-callable")
+        info.name == tool_name and info.language == "omnigent-python-callable" and info.path
         for info in getattr(unwrapped, "local_tools", [])
     )
