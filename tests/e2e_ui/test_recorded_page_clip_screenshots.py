@@ -9,6 +9,7 @@ import io
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from typing import Any
 
 import pytest
 from PIL import Image, ImageChops
@@ -147,15 +148,16 @@ def test_recorded_clip_scale_and_viewport(
     _assert_same_pixels(*shots, scale=2 if scale == "device" and not no_viewport else 1)
 
 
-@pytest.mark.parametrize("quality", [None, 0, 80, 100])
+@pytest.mark.parametrize("extension", ["jpg", "jpe"])
+@pytest.mark.parametrize("quality", [None, 0, 80, 80.0, 100])
 def test_recorded_jpeg_clip_preserves_quality_and_path(
-    browser: Browser, tmp_path: Path, quality: int | None
+    browser: Browser, tmp_path: Path, quality: int | float | None, extension: str
 ) -> None:
     _skip_unless_chromium(browser)
     context = browser.new_context(record_video_dir=str(tmp_path / "video"))
     page = context.new_page()
     page.set_content(_PAGE)
-    path = tmp_path / "out" / "clip.jpg"
+    path = tmp_path / "out" / f"clip.{extension}"
     options = {} if quality is None else {"quality": quality}
     data = page.screenshot(clip=_CLIP, path=path, **options)
     context.close()
@@ -166,7 +168,7 @@ def test_recorded_jpeg_clip_preserves_quality_and_path(
     # JPEG quantization tables expose the requested encoder quality, including zero.
     expected = io.BytesIO()
     Image.new("RGB", actual.size).save(
-        expected, "JPEG", quality=80 if quality is None else quality
+        expected, "JPEG", quality=80 if quality is None else int(quality)
     )
     with Image.open(expected) as expected_image:
         expected_quantization = expected_image.quantization
@@ -193,6 +195,79 @@ def test_invalid_clip_raises_playwright_error(
             page.screenshot(clip=clip)
     finally:
         context.close()
+
+
+@pytest.mark.parametrize("api", ["sync", "async"])
+@pytest.mark.parametrize(
+    "options",
+    [
+        pytest.param({"type": "png", "quality": 80}, id="png-quality"),
+        pytest.param({"quality": 0}, id="implicit-png-quality"),
+        pytest.param({"type": "webp"}, id="unsupported-format"),
+        pytest.param({"type": ""}, id="empty-format"),
+        pytest.param({"path": "probe.webp"}, id="unsupported-extension"),
+        pytest.param({"path": "probe"}, id="missing-extension"),
+        pytest.param({"type": "jpeg", "quality": -1}, id="negative-quality"),
+        pytest.param({"type": "jpeg", "quality": 101}, id="excessive-quality"),
+        pytest.param({"type": "jpeg", "quality": 80.5}, id="fractional-quality"),
+        pytest.param({"type": "jpeg", "quality": "80"}, id="string-quality"),
+        pytest.param({"type": "jpeg", "quality": True}, id="boolean-quality"),
+        pytest.param({"clip": {"x": 0, "y": 0, "height": 10}}, id="missing-width"),
+        pytest.param({"clip": []}, id="non-object-clip"),
+        pytest.param({"clip": {**_CLIP, "x": "40"}}, id="string-coordinate"),
+        pytest.param({"clip": {**_CLIP, "x": True}}, id="boolean-coordinate"),
+        pytest.param({"clip": {**_CLIP, "width": 0}}, id="zero-width"),
+    ],
+)
+def test_invalid_screenshot_options_match_native(
+    browser: Browser, tmp_path: Path, api: str, options: dict[str, Any]
+) -> None:
+    """Recording must preserve Playwright's error type and validation message."""
+    _skip_unless_chromium(browser)
+    kwargs = {"clip": _CLIP, **options}
+    if "path" in kwargs:
+        kwargs["path"] = tmp_path / kwargs["path"]
+    errors = []
+
+    async def drive() -> None:
+        async with async_playwright() as playwright:
+            async_browser = await playwright.chromium.launch()
+            try:
+                for recorded in (False, True):
+                    context = await async_browser.new_context(
+                        record_video_dir=str(tmp_path / "video") if recorded else None
+                    )
+                    try:
+                        page = await context.new_page()
+                        await page.set_content(_PAGE)
+                        with pytest.raises(Error) as error:
+                            await page.screenshot(**kwargs)
+                        errors.append(str(error.value).split("\nCall log:")[0])
+                    finally:
+                        await context.close()
+            finally:
+                await async_browser.close()
+
+    if api == "async":
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            executor.submit(lambda: asyncio.run(drive())).result(timeout=120)
+    else:
+        for recorded in (False, True):
+            context = browser.new_context(
+                record_video_dir=str(tmp_path / "video") if recorded else None
+            )
+            try:
+                page = context.new_page()
+                page.set_content(_PAGE)
+                with pytest.raises(Error) as error:
+                    page.screenshot(**kwargs)
+                errors.append(str(error.value).split("\nCall log:")[0])
+            finally:
+                context.close()
+
+    assert errors[0] == errors[1]
+    if "path" in kwargs:
+        assert not kwargs["path"].exists()
 
 
 @pytest.mark.parametrize("device_scale_factor", [1, 2])

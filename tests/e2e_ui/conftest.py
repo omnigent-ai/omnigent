@@ -36,6 +36,7 @@ import contextlib
 import io
 import json
 import math
+import mimetypes
 import os
 import re
 import shutil
@@ -2398,6 +2399,19 @@ def pytest_runtest_makereport(
 _CLIP_RESULT_KEYS = frozenset({"clip", "path", "type", "quality"})
 
 
+def _recorded_clip_format(kwargs: dict[str, Any]) -> str | None:
+    """Resolve supported output formats without bypassing native path validation."""
+    kind = kwargs.get("type")
+    if kind is None:
+        path = kwargs.get("path")
+        if path is None:
+            return "png"
+        if not isinstance(path, (str, Path)):
+            return None
+        kind = {"image/png": "png", "image/jpeg": "jpeg"}.get(mimetypes.guess_type(path)[0])
+    return kind if kind in ("png", "jpeg") else None
+
+
 def _recorded_clip_capture(page: Any, kwargs: dict[str, Any]) -> dict[str, Any] | None:
     """Full-viewport screenshot kwargs for a clip of a video-recorded page, or
     ``None`` when Playwright's native clip path is fine (no clip, ``full_page``,
@@ -2406,6 +2420,27 @@ def _recorded_clip_capture(page: Any, kwargs: dict[str, Any]) -> dict[str, Any] 
         return None
     browser = page.context.browser
     if browser is not None and browser.browser_type.name != "chromium":
+        return None
+    # Keep malformed options on Playwright's native path so it owns validation
+    # and raises the same errors before attempting a clipped capture.
+    kind = _recorded_clip_format(kwargs)
+    if kind is None:
+        return None
+    quality = kwargs.get("quality")
+    if quality is not None and (
+        kind != "jpeg"
+        or type(quality) not in (int, float)
+        or not 0 <= quality <= 100
+        or quality != int(quality)
+    ):
+        return None
+    clip = kwargs["clip"]
+    if not isinstance(clip, dict) or any(
+        type(clip.get(key)) not in (int, float) or not math.isfinite(clip[key])
+        for key in ("x", "y", "width", "height")
+    ):
+        return None
+    if clip["width"] <= 0 or clip["height"] <= 0:
         return None
     return {**{k: v for k, v in kwargs.items() if k not in _CLIP_RESULT_KEYS}, "type": "png"}
 
@@ -2434,13 +2469,13 @@ def _crop_recorded_clip(png: bytes, page: Any, kwargs: dict[str, Any]) -> bytes:
     cropped = image.crop((left, top, right, bottom))
 
     path = kwargs.get("path")
-    kind = kwargs.get("type") or (
-        "jpeg" if str(path or "").lower().endswith((".jpg", ".jpeg")) else "png"
-    )
+    kind = _recorded_clip_format(kwargs)
     encoded = io.BytesIO()
     if kind == "jpeg":
         quality = kwargs.get("quality")
-        cropped.convert("RGB").save(encoded, "JPEG", quality=80 if quality is None else quality)
+        cropped.convert("RGB").save(
+            encoded, "JPEG", quality=80 if quality is None else int(quality)
+        )
     else:
         cropped.save(encoded, "PNG")
     data = encoded.getvalue()

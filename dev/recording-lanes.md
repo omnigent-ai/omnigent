@@ -189,6 +189,10 @@ screenshots, or a Playwright script outside that suite, read pixels via
 `page.evaluate` (e.g. a canvas
 `toDataURL()`) or capture from a second, unrecorded context instead.
 
+Clipped JPEGs on recorded Chromium pages are encoded with Pillow, so they are
+not byte-identical to Chromium's native JPEG output. Unsupported formats and
+malformed screenshot options use Playwright's native validation and errors.
+
 **Maintenance:** Context closure before fixture teardown and screenshot crop
 rounding rely on pytest-playwright and Chromium internals; after Playwright,
 pytest-playwright, or Chromium upgrades, rerun
