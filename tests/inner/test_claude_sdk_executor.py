@@ -28,6 +28,66 @@ from omnigent.inner.executor import (
 )
 
 
+class _SDKClient:
+    """Quiet SDK lifecycle; scenarios override the interactions they exercise."""
+
+    def __init__(self, options):
+        self.options = options
+
+    async def connect(self):
+        return None
+
+    async def query(self, prompt, session_id="default"):
+        return None
+
+    async def disconnect(self):
+        return None
+
+
+def _sdk_types():
+    """Fresh stand-in message types and option container for one scenario."""
+    return type(
+        "SDKTypes",
+        (),
+        {
+            name: type(name, (), {})
+            for name in (
+                "AssistantMessage",
+                "UserMessage",
+                "SystemMessage",
+                "ResultMessage",
+                "StreamEvent",
+            )
+        }
+        | {
+            "ClaudeAgentOptions": type(
+                "ClaudeAgentOptions",
+                (),
+                {"__init__": lambda self, **kwargs: self.__dict__.update(kwargs)},
+            )
+        },
+    )
+
+
+class _SDKTools:
+    """MCP tool metadata exposed by the scripted SDK."""
+
+    @staticmethod
+    def tool(name, desc, params):
+        def decorator(handler):
+            return type(
+                "Tool",
+                (),
+                {"name": name, "description": desc, "parameters": params, "handler": handler},
+            )()
+
+        return decorator
+
+    @staticmethod
+    def create_sdk_mcp_server(**kwargs):
+        return kwargs
+
+
 def _run(coro):
     loop = asyncio.new_event_loop()
     try:
@@ -1917,33 +1977,15 @@ class TestSystemMessages(unittest.TestCase):
                 self.session_id = session_id
                 self.result = result
 
-        class _FakeSDK:
-            AssistantMessage = type("AssistantMessage", (), {})
-            UserMessage = type("UserMessage", (), {})
-            SystemMessage = type("SystemMessage", (), {})
+        class _FakeSDK(_sdk_types()):
             ResultMessage = _ResultMessage
-            StreamEvent = type("StreamEvent", (), {})
-            ClaudeAgentOptions = type(
-                "ClaudeAgentOptions",
-                (),
-                {"__init__": lambda self, **kwargs: self.__dict__.update(kwargs)},
-            )
 
-            class ClaudeSDKClient:
+            class ClaudeSDKClient(_SDKClient):
                 def __init__(self, options):
                     captured_options.append(options)
 
-                async def connect(self):
-                    return None
-
-                async def query(self, prompt, session_id="default"):
-                    return None
-
                 async def receive_response(self):
                     yield _ResultMessage("default", "ok")
-
-                async def disconnect(self):
-                    return None
 
         def _resolve_gateway_env(
             profile=None,
@@ -2031,7 +2073,7 @@ class TestSystemMessages(unittest.TestCase):
         class _Sentinel:
             pass
 
-        class _FakeSDK:
+        class _FakeSDK(_sdk_types()):
             AssistantMessage = _Sentinel
             ResultMessage = _Sentinel
             UserMessage = _Sentinel
@@ -2053,22 +2095,10 @@ class TestSystemMessages(unittest.TestCase):
                 )
             ]
 
-            class ClaudeSDKClient:
-                def __init__(self, options):
-                    self.options = options
-
-                async def connect(self):
-                    return None
-
-                async def query(self, prompt, session_id="default"):
-                    return None
-
+            class ClaudeSDKClient(_SDKClient):
                 async def receive_response(self):
                     for message in _FakeSDK.messages:
                         yield message
-
-                async def disconnect(self):
-                    return None
 
         async def _t():
             executor = ClaudeSDKExecutor()
@@ -2108,7 +2138,7 @@ class TestSystemMessages(unittest.TestCase):
         class _Sentinel:
             pass
 
-        class _FakeSDK:
+        class _FakeSDK(_sdk_types()):
             AssistantMessage = _Sentinel
             ResultMessage = _Sentinel
             UserMessage = _Sentinel
@@ -2130,22 +2160,10 @@ class TestSystemMessages(unittest.TestCase):
                 )
             ]
 
-            class ClaudeSDKClient:
-                def __init__(self, options):
-                    self.options = options
-
-                async def connect(self):
-                    return None
-
-                async def query(self, prompt, session_id="default"):
-                    return None
-
+            class ClaudeSDKClient(_SDKClient):
                 async def receive_response(self):
                     for message in _FakeSDK.messages:
                         yield message
-
-                async def disconnect(self):
-                    return None
 
         async def _t():
             # Create a gateway executor that uses a Databricks profile path.
@@ -2274,23 +2292,11 @@ class TestStreamEventStreaming(unittest.TestCase):
                 self.session_id = session_id
                 self.result = result
 
-        class _FakeSDK:
-            AssistantMessage = type("AssistantMessage", (), {})
-            UserMessage = type("UserMessage", (), {})
-            SystemMessage = type("SystemMessage", (), {})
+        class _FakeSDK(_sdk_types()):
             ResultMessage = _ResultMessage
-            StreamEvent = type("StreamEvent", (), {})
-            ClaudeAgentOptions = type(
-                "ClaudeAgentOptions",
-                (),
-                {"__init__": lambda self, **kwargs: self.__dict__.update(kwargs)},
-            )
             messages = []
 
-            class ClaudeSDKClient:
-                def __init__(self, options):
-                    self.options = options
-
+            class ClaudeSDKClient(_SDKClient):
                 async def connect(self):
                     connect_calls.append(self)
                     return
@@ -2316,9 +2322,6 @@ class TestStreamEventStreaming(unittest.TestCase):
                 async def receive_response(self):
                     for message in _FakeSDK.messages:
                         yield message
-
-                async def disconnect(self):
-                    return None
 
         async def _t():
             executor = ClaudeSDKExecutor()
@@ -2365,46 +2368,14 @@ class TestStreamEventStreaming(unittest.TestCase):
                 self.session_id = session_id
                 self.result = result
 
-        class _FakeSDK:
-            AssistantMessage = type("AssistantMessage", (), {})
-            UserMessage = type("UserMessage", (), {})
-            SystemMessage = type("SystemMessage", (), {})
+        class _FakeSDK(_sdk_types(), _SDKTools):
             ResultMessage = _ResultMessage
-            StreamEvent = type("StreamEvent", (), {})
-            ClaudeAgentOptions = type(
-                "ClaudeAgentOptions",
-                (),
-                {"__init__": lambda self, **kwargs: self.__dict__.update(kwargs)},
-            )
             messages = []
 
-            @staticmethod
-            def tool(name, desc, params):
-                def decorator(handler):
-                    return type(
-                        "Tool",
-                        (),
-                        {
-                            "name": name,
-                            "description": desc,
-                            "parameters": params,
-                            "handler": handler,
-                        },
-                    )()
-
-                return decorator
-
-            @staticmethod
-            def create_sdk_mcp_server(**kwargs):
-                return kwargs
-
-            class ClaudeSDKClient:
+            class ClaudeSDKClient(_SDKClient):
                 def __init__(self, options):
                     captured_options["tools"] = getattr(options, "tools", None)
                     captured_options["allowed_tools"] = getattr(options, "allowed_tools", None)
-
-                async def connect(self):
-                    return None
 
                 async def query(self, prompt, session_id="default"):
                     _FakeSDK.messages = [_ResultMessage(session_id, "done")]
@@ -2412,9 +2383,6 @@ class TestStreamEventStreaming(unittest.TestCase):
                 async def receive_response(self):
                     for message in _FakeSDK.messages:
                         yield message
-
-                async def disconnect(self):
-                    return None
 
         async def _t():
             # Explicit ``sandbox=none`` so the test runs on any
@@ -2463,46 +2431,14 @@ class TestStreamEventStreaming(unittest.TestCase):
                 self.session_id = session_id
                 self.result = result
 
-        class _FakeSDK:
-            AssistantMessage = type("AssistantMessage", (), {})
-            UserMessage = type("UserMessage", (), {})
-            SystemMessage = type("SystemMessage", (), {})
+        class _FakeSDK(_sdk_types(), _SDKTools):
             ResultMessage = _ResultMessage
-            StreamEvent = type("StreamEvent", (), {})
-            ClaudeAgentOptions = type(
-                "ClaudeAgentOptions",
-                (),
-                {"__init__": lambda self, **kwargs: self.__dict__.update(kwargs)},
-            )
             messages = []
 
-            @staticmethod
-            def tool(name, desc, params):
-                def decorator(handler):
-                    return type(
-                        "Tool",
-                        (),
-                        {
-                            "name": name,
-                            "description": desc,
-                            "parameters": params,
-                            "handler": handler,
-                        },
-                    )()
-
-                return decorator
-
-            @staticmethod
-            def create_sdk_mcp_server(**kwargs):
-                return kwargs
-
-            class ClaudeSDKClient:
+            class ClaudeSDKClient(_SDKClient):
                 def __init__(self, options):
                     captured_options["tools"] = getattr(options, "tools", None)
                     captured_options["allowed_tools"] = getattr(options, "allowed_tools", None)
-
-                async def connect(self):
-                    return None
 
                 async def query(self, prompt, session_id="default"):
                     _FakeSDK.messages = [_ResultMessage(session_id, "done")]
@@ -2510,9 +2446,6 @@ class TestStreamEventStreaming(unittest.TestCase):
                 async def receive_response(self):
                     for message in _FakeSDK.messages:
                         yield message
-
-                async def disconnect(self):
-                    return None
 
         async def _t():
             executor = ClaudeSDKExecutor()
@@ -2553,46 +2486,14 @@ class TestStreamEventStreaming(unittest.TestCase):
                 self.session_id = session_id
                 self.result = result
 
-        class _FakeSDK:
-            AssistantMessage = type("AssistantMessage", (), {})
-            UserMessage = type("UserMessage", (), {})
-            SystemMessage = type("SystemMessage", (), {})
+        class _FakeSDK(_sdk_types(), _SDKTools):
             ResultMessage = _ResultMessage
-            StreamEvent = type("StreamEvent", (), {})
-            ClaudeAgentOptions = type(
-                "ClaudeAgentOptions",
-                (),
-                {"__init__": lambda self, **kwargs: self.__dict__.update(kwargs)},
-            )
             messages = []
 
-            @staticmethod
-            def tool(name, desc, params):
-                def decorator(handler):
-                    return type(
-                        "Tool",
-                        (),
-                        {
-                            "name": name,
-                            "description": desc,
-                            "parameters": params,
-                            "handler": handler,
-                        },
-                    )()
-
-                return decorator
-
-            @staticmethod
-            def create_sdk_mcp_server(**kwargs):
-                return kwargs
-
-            class ClaudeSDKClient:
+            class ClaudeSDKClient(_SDKClient):
                 def __init__(self, options):
                     captured_options["allowed_tools"] = getattr(options, "allowed_tools", None)
                     captured_options["system_prompt"] = getattr(options, "system_prompt", None)
-
-                async def connect(self):
-                    return None
 
                 async def query(self, prompt, session_id="default"):
                     _FakeSDK.messages = [_ResultMessage(session_id, "done")]
@@ -2600,9 +2501,6 @@ class TestStreamEventStreaming(unittest.TestCase):
                 async def receive_response(self):
                     for message in _FakeSDK.messages:
                         yield message
-
-                async def disconnect(self):
-                    return None
 
         async def _t():
             executor = ClaudeSDKExecutor()
@@ -2647,46 +2545,14 @@ class TestStreamEventStreaming(unittest.TestCase):
                 self.session_id = session_id
                 self.result = result
 
-        class _FakeSDK:
-            AssistantMessage = type("AssistantMessage", (), {})
-            UserMessage = type("UserMessage", (), {})
-            SystemMessage = type("SystemMessage", (), {})
+        class _FakeSDK(_sdk_types(), _SDKTools):
             ResultMessage = _ResultMessage
-            StreamEvent = type("StreamEvent", (), {})
-            ClaudeAgentOptions = type(
-                "ClaudeAgentOptions",
-                (),
-                {"__init__": lambda self, **kwargs: self.__dict__.update(kwargs)},
-            )
             messages = []
 
-            @staticmethod
-            def tool(name, desc, params):
-                def decorator(handler):
-                    return type(
-                        "Tool",
-                        (),
-                        {
-                            "name": name,
-                            "description": desc,
-                            "parameters": params,
-                            "handler": handler,
-                        },
-                    )()
-
-                return decorator
-
-            @staticmethod
-            def create_sdk_mcp_server(**kwargs):
-                return kwargs
-
-            class ClaudeSDKClient:
+            class ClaudeSDKClient(_SDKClient):
                 def __init__(self, options):
                     captured_options["allowed_tools"] = getattr(options, "allowed_tools", None)
                     captured_options["system_prompt"] = getattr(options, "system_prompt", None)
-
-                async def connect(self):
-                    return None
 
                 async def query(self, prompt, session_id="default"):
                     _FakeSDK.messages = [_ResultMessage(session_id, "done")]
@@ -2694,9 +2560,6 @@ class TestStreamEventStreaming(unittest.TestCase):
                 async def receive_response(self):
                     for message in _FakeSDK.messages:
                         yield message
-
-                async def disconnect(self):
-                    return None
 
         async def _t():
             executor = ClaudeSDKExecutor()
@@ -2735,34 +2598,14 @@ class TestStreamEventStreaming(unittest.TestCase):
     def test_crashed_session_refuses_future_turns(self):
         from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
 
-        class _FakeSDK:
-            AssistantMessage = type("AssistantMessage", (), {})
-            UserMessage = type("UserMessage", (), {})
-            SystemMessage = type("SystemMessage", (), {})
-            ResultMessage = type("ResultMessage", (), {})
-            StreamEvent = type("StreamEvent", (), {})
-            ClaudeAgentOptions = type(
-                "ClaudeAgentOptions",
-                (),
-                {"__init__": lambda self, **kwargs: self.__dict__.update(kwargs)},
-            )
-
-            class ClaudeSDKClient:
-                def __init__(self, options):
-                    self.options = options
-
-                async def connect(self):
-                    return None
-
+        class _FakeSDK(_sdk_types()):
+            class ClaudeSDKClient(_SDKClient):
                 async def query(self, prompt, session_id="default"):
                     raise RuntimeError("claude subprocess crashed")
 
                 async def receive_response(self):
                     if False:
                         yield None
-
-                async def disconnect(self):
-                    return None
 
         async def _t():
             executor = ClaudeSDKExecutor()
@@ -2797,29 +2640,14 @@ class TestStreamEventStreaming(unittest.TestCase):
                 self.session_id = session_id
                 self.result = result
 
-        class _FakeSDK:
-            AssistantMessage = type("AssistantMessage", (), {})
-            UserMessage = type("UserMessage", (), {})
-            SystemMessage = type("SystemMessage", (), {})
+        class _FakeSDK(_sdk_types()):
             ResultMessage = _ResultMessage
-            StreamEvent = type("StreamEvent", (), {})
-            ClaudeAgentOptions = type(
-                "ClaudeAgentOptions",
-                (),
-                {"__init__": lambda self, **kwargs: self.__dict__.update(kwargs)},
-            )
 
-            class ClaudeSDKClient:
+            class ClaudeSDKClient(_SDKClient):
                 def __init__(self, options):
                     self.options = options
                     self.index = len(created)
                     created.append(self)
-
-                async def connect(self):
-                    return None
-
-                async def query(self, prompt, session_id="default"):
-                    return None
 
                 async def receive_response(self):
                     if self.index == 0:
@@ -2827,9 +2655,6 @@ class TestStreamEventStreaming(unittest.TestCase):
                         wedge_reached.set()
                         await asyncio.Event().wait()
                     yield _ResultMessage("claude-session-a", "recovered")
-
-                async def disconnect(self):
-                    return None
 
         async def _t():
             executor = ClaudeSDKExecutor()
@@ -2991,7 +2816,7 @@ class TestStreamEventStreaming(unittest.TestCase):
         class _Sentinel:
             pass
 
-        class _FakeSDK:
+        class _FakeSDK(_sdk_types()):
             AssistantMessage = _Sentinel
             UserMessage = _Sentinel
             SystemMessage = _Sentinel
@@ -3029,22 +2854,10 @@ class TestStreamEventStreaming(unittest.TestCase):
                 ),
             ]
 
-            class ClaudeSDKClient:
-                def __init__(self, options):
-                    self.options = options
-
-                async def connect(self):
-                    return None
-
-                async def query(self, prompt, session_id="default"):
-                    return None
-
+            class ClaudeSDKClient(_SDKClient):
                 async def receive_response(self):
                     for message in _FakeSDK.messages:
                         yield message
-
-                async def disconnect(self):
-                    return None
 
         async def _t():
             executor = ClaudeSDKExecutor()
@@ -3110,7 +2923,7 @@ class TestStreamEventStreaming(unittest.TestCase):
         class _Sentinel:
             pass
 
-        class _FakeSDK:
+        class _FakeSDK(_sdk_types()):
             AssistantMessage = SDKAssistantMessage
             UserMessage = _Sentinel
             SystemMessage = _Sentinel
@@ -3168,22 +2981,10 @@ class TestStreamEventStreaming(unittest.TestCase):
                 ),
             ]
 
-            class ClaudeSDKClient:
-                def __init__(self, options):
-                    self.options = options
-
-                async def connect(self):
-                    return None
-
-                async def query(self, prompt, session_id="default"):
-                    return None
-
+            class ClaudeSDKClient(_SDKClient):
                 async def receive_response(self):
                     for message in _FakeSDK.messages:
                         yield message
-
-                async def disconnect(self):
-                    return None
 
         async def _t():
             executor = ClaudeSDKExecutor()
@@ -3266,22 +3067,10 @@ class TestStreamEventStreaming(unittest.TestCase):
                 _ResultMessage("s1", "done"),
             ]
 
-            class ClaudeSDKClient:
-                def __init__(self, options):
-                    self.options = options
-
-                async def connect(self):
-                    return None
-
-                async def query(self, prompt, session_id="default"):
-                    return None
-
+            class ClaudeSDKClient(_SDKClient):
                 async def receive_response(self):
                     for message in _FakeSDK.messages:
                         yield message
-
-                async def disconnect(self):
-                    return None
 
         async def _t():
             executor = ClaudeSDKExecutor()
@@ -3357,22 +3146,10 @@ class TestStreamEventStreaming(unittest.TestCase):
                 _ResultMessage("s1", "done"),
             ]
 
-            class ClaudeSDKClient:
-                def __init__(self, options):
-                    self.options = options
-
-                async def connect(self):
-                    return None
-
-                async def query(self, prompt, session_id="default"):
-                    return None
-
+            class ClaudeSDKClient(_SDKClient):
                 async def receive_response(self):
                     for message in _FakeSDK.messages:
                         yield message
-
-                async def disconnect(self):
-                    return None
 
         async def _t():
             executor = ClaudeSDKExecutor()
@@ -3963,7 +3740,7 @@ async def test_result_message_usage_populates_turn_complete_usage() -> None:
         },
     )
 
-    class _FakeSDK:
+    class _FakeSDK(_sdk_types()):
         AssistantMessage = _Sentinel
         UserMessage = _Sentinel
         SystemMessage = _Sentinel
@@ -3972,22 +3749,10 @@ async def test_result_message_usage_populates_turn_complete_usage() -> None:
         ClaudeAgentOptions = SDKClaudeAgentOptions
         messages = [sdk_result]
 
-        class ClaudeSDKClient:
-            def __init__(self, options):
-                self.options = options
-
-            async def connect(self):
-                return None
-
-            async def query(self, prompt, session_id="default"):
-                return None
-
+        class ClaudeSDKClient(_SDKClient):
             async def receive_response(self):
                 for message in _FakeSDK.messages:
                     yield message
-
-            async def disconnect(self):
-                return None
 
     executor = ClaudeSDKExecutor()
     with patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=_FakeSDK):
@@ -4094,7 +3859,7 @@ async def test_result_message_is_error_yields_executor_error() -> None:
         usage=None,
     )
 
-    class _FakeSDK:
+    class _FakeSDK(_sdk_types()):
         AssistantMessage = _Sentinel
         UserMessage = _Sentinel
         SystemMessage = _Sentinel
@@ -4103,22 +3868,10 @@ async def test_result_message_is_error_yields_executor_error() -> None:
         ClaudeAgentOptions = SDKClaudeAgentOptions
         messages = [sdk_result]
 
-        class ClaudeSDKClient:
-            def __init__(self, options):
-                self.options = options
-
-            async def connect(self):
-                return None
-
-            async def query(self, prompt, session_id="default"):
-                return None
-
+        class ClaudeSDKClient(_SDKClient):
             async def receive_response(self):
                 for message in _FakeSDK.messages:
                     yield message
-
-            async def disconnect(self):
-                return None
 
     executor = ClaudeSDKExecutor()
     with patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=_FakeSDK):
@@ -4225,7 +3978,7 @@ async def test_context_tokens_uses_last_call_not_cumulative_on_multi_iteration_t
         },
     )
 
-    class _FakeSDK:
+    class _FakeSDK(_sdk_types()):
         AssistantMessage = _Sentinel
         UserMessage = _Sentinel
         SystemMessage = _Sentinel
@@ -4234,22 +3987,10 @@ async def test_context_tokens_uses_last_call_not_cumulative_on_multi_iteration_t
         ClaudeAgentOptions = SDKClaudeAgentOptions
         messages = [first_call, second_call, cumulative_result]
 
-        class ClaudeSDKClient:
-            def __init__(self, options):
-                self.options = options
-
-            async def connect(self):
-                return None
-
-            async def query(self, prompt, session_id="default"):
-                return None
-
+        class ClaudeSDKClient(_SDKClient):
             async def receive_response(self):
                 for message in _FakeSDK.messages:
                     yield message
-
-            async def disconnect(self):
-                return None
 
     executor = ClaudeSDKExecutor()
     with patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=_FakeSDK):
@@ -4346,7 +4087,7 @@ async def test_context_tokens_emitted_when_turn_ends_without_result_message() ->
         },
     )
 
-    class _FakeSDK:
+    class _FakeSDK(_sdk_types()):
         AssistantMessage = _Sentinel
         UserMessage = _Sentinel
         SystemMessage = _Sentinel
@@ -4355,22 +4096,10 @@ async def test_context_tokens_emitted_when_turn_ends_without_result_message() ->
         ClaudeAgentOptions = SDKClaudeAgentOptions
         messages = [message_start]  # note: no ResultMessage
 
-        class ClaudeSDKClient:
-            def __init__(self, options):
-                self.options = options
-
-            async def connect(self):
-                return None
-
-            async def query(self, prompt, session_id="default"):
-                return None
-
+        class ClaudeSDKClient(_SDKClient):
             async def receive_response(self):
                 for message in _FakeSDK.messages:
                     yield message
-
-            async def disconnect(self):
-                return None
 
     executor = ClaudeSDKExecutor()
     with patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=_FakeSDK):
@@ -4454,7 +4183,7 @@ async def test_assistant_message_model_flows_to_turn_usage(
         usage={"input_tokens": 100, "output_tokens": 50},
     )
 
-    class _FakeSDK:
+    class _FakeSDK(_sdk_types()):
         AssistantMessage = _AsstMsg
         UserMessage = type("_U", (), {})
         SystemMessage = type("_S", (), {})
@@ -4466,22 +4195,10 @@ async def test_assistant_message_model_flows_to_turn_usage(
             messages.append(_AsstMsg(content=[], model="<synthetic>"))
         messages.append(sdk_result)
 
-        class ClaudeSDKClient:
-            def __init__(self, options: object) -> None:
-                self.options = options
-
-            async def connect(self) -> None:
-                return None
-
-            async def query(self, prompt: object, session_id: str = "default") -> None:
-                return None
-
+        class ClaudeSDKClient(_SDKClient):
             async def receive_response(self):  # type: ignore[no-untyped-def]
                 for message in _FakeSDK.messages:
                     yield message
-
-            async def disconnect(self) -> None:
-                return None
 
     executor = ClaudeSDKExecutor(model=None if observed else "configured-model")
     with patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=_FakeSDK):
@@ -4540,7 +4257,7 @@ async def test_result_message_usage_none_yields_turn_complete_without_usage() ->
         usage=None,  # SDK didn't report usage
     )
 
-    class _FakeSDK:
+    class _FakeSDK(_sdk_types()):
         AssistantMessage = _Sentinel
         UserMessage = _Sentinel
         SystemMessage = _Sentinel
@@ -4549,22 +4266,10 @@ async def test_result_message_usage_none_yields_turn_complete_without_usage() ->
         ClaudeAgentOptions = SDKClaudeAgentOptions
         messages = [sdk_result]
 
-        class ClaudeSDKClient:
-            def __init__(self, options):
-                self.options = options
-
-            async def connect(self):
-                return None
-
-            async def query(self, prompt, session_id="default"):
-                return None
-
+        class ClaudeSDKClient(_SDKClient):
             async def receive_response(self):
                 for message in _FakeSDK.messages:
                     yield message
-
-            async def disconnect(self):
-                return None
 
     executor = ClaudeSDKExecutor()
     with patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=_FakeSDK):
@@ -4967,26 +4672,12 @@ def test_precompact_hook_emits_compaction_complete_with_session_messages() -> No
             self.type = type
             self.message = message
 
-    class _FakeSDK:
-        AssistantMessage = type("AssistantMessage", (), {})
-        UserMessage = type("UserMessage", (), {})
+    class _FakeSDK(_sdk_types()):
         SystemMessage = _SystemMessage
         ResultMessage = _ResultMessage
-        StreamEvent = type("StreamEvent", (), {})
-        ClaudeAgentOptions = type(
-            "ClaudeAgentOptions",
-            (),
-            {"__init__": lambda self, **kwargs: self.__dict__.update(kwargs)},
-        )
         messages: list = []
 
-        class ClaudeSDKClient:
-            def __init__(self, options):
-                self.options = options
-
-            async def connect(self):
-                return
-
+        class ClaudeSDKClient(_SDKClient):
             async def query(self, prompt, session_id="default"):
                 _FakeSDK.messages = [
                     _HookEventMessage(
@@ -5000,9 +4691,6 @@ def test_precompact_hook_emits_compaction_complete_with_session_messages() -> No
             async def receive_response(self):
                 for message in _FakeSDK.messages:
                     yield message
-
-            async def disconnect(self):
-                return None
 
     fake_session_msgs = [
         _FakeSessionMessage("user", {"content": [{"type": "text", "text": "hi"}]}),
@@ -5068,28 +4756,10 @@ def test_precompact_exception_persists_compaction_before_executor_error(tmp_path
             self.type = type
             self.message = message
 
-    class _FakeSDK:
-        AssistantMessage = type("AssistantMessage", (), {})
-        UserMessage = type("UserMessage", (), {})
+    class _FakeSDK(_sdk_types()):
         SystemMessage = _SystemMessage
-        ResultMessage = type("ResultMessage", (), {})
-        StreamEvent = type("StreamEvent", (), {})
-        ClaudeAgentOptions = type(
-            "ClaudeAgentOptions",
-            (),
-            {"__init__": lambda self, **kwargs: self.__dict__.update(kwargs)},
-        )
 
-        class ClaudeSDKClient:
-            def __init__(self, options):
-                self.options = options
-
-            async def connect(self):
-                return
-
-            async def query(self, prompt, session_id="default"):
-                return
-
+        class ClaudeSDKClient(_SDKClient):
             async def receive_response(self):
                 yield _SystemMessage(
                     subtype="hook_started",
@@ -5117,9 +4787,6 @@ def test_precompact_exception_persists_compaction_before_executor_error(tmp_path
                         + "\n"
                     )
                 raise RuntimeError("Autocompact is thrashing: the context refilled to the limit")
-
-            async def disconnect(self):
-                return None
 
     fake_session_msgs = [
         _FakeSessionMessage(
@@ -5236,28 +4903,14 @@ def test_precompact_exception_sdk_wire_payload_contract(
     hook_message = parse_message(raw_hook_payload)
     assert isinstance(hook_message, real_sdk.HookEventMessage)
 
-    class _FakeSDK:
+    class _FakeSDK(_sdk_types()):
         AssistantMessage = real_sdk.AssistantMessage
         UserMessage = real_sdk.UserMessage
         SystemMessage = real_sdk.SystemMessage
         ResultMessage = real_sdk.ResultMessage
         StreamEvent = real_sdk.StreamEvent
-        ClaudeAgentOptions = type(
-            "ClaudeAgentOptions",
-            (),
-            {"__init__": lambda self, **kwargs: self.__dict__.update(kwargs)},
-        )
 
-        class ClaudeSDKClient:
-            def __init__(self, options):
-                self.options = options
-
-            async def connect(self):
-                return
-
-            async def query(self, prompt, session_id="default"):
-                return
-
+        class ClaudeSDKClient(_SDKClient):
             async def receive_response(self):
                 yield hook_message
                 with transcript_path.open("a", encoding="utf-8") as transcript:
@@ -5276,9 +4929,6 @@ def test_precompact_exception_sdk_wire_payload_contract(
                         + "\n"
                     )
                 raise RuntimeError("Autocompact refilled the context")
-
-            async def disconnect(self):
-                return None
 
     fake_session_msgs = [
         _FakeSessionMessage(
@@ -5337,28 +4987,10 @@ def test_precompact_exception_preserves_history_without_exportable_checkpoint(
             self.hook_event_name = hook_event_name
             self.session_id = session_id
 
-    class _FakeSDK:
-        AssistantMessage = type("AssistantMessage", (), {})
-        UserMessage = type("UserMessage", (), {})
+    class _FakeSDK(_sdk_types()):
         SystemMessage = _SystemMessage
-        ResultMessage = type("ResultMessage", (), {})
-        StreamEvent = type("StreamEvent", (), {})
-        ClaudeAgentOptions = type(
-            "ClaudeAgentOptions",
-            (),
-            {"__init__": lambda self, **kwargs: self.__dict__.update(kwargs)},
-        )
 
-        class ClaudeSDKClient:
-            def __init__(self, options):
-                self.options = options
-
-            async def connect(self):
-                return
-
-            async def query(self, prompt, session_id="default"):
-                return
-
+        class ClaudeSDKClient(_SDKClient):
             async def receive_response(self):
                 yield _SystemMessage(
                     subtype="hook_started",
@@ -5386,9 +5018,6 @@ def test_precompact_exception_preserves_history_without_exportable_checkpoint(
                         + "\n"
                     )
                 raise RuntimeError("Autocompact is thrashing: the context refilled to the limit")
-
-            async def disconnect(self):
-                return None
 
     async def _t():
         executor = ClaudeSDKExecutor()
@@ -5434,28 +5063,10 @@ def test_precompact_exception_without_new_summary_preserves_history(tmp_path: Pa
             self.hook_event_name = hook_event_name
             self.session_id = session_id
 
-    class _FakeSDK:
-        AssistantMessage = type("AssistantMessage", (), {})
-        UserMessage = type("UserMessage", (), {})
+    class _FakeSDK(_sdk_types()):
         SystemMessage = _SystemMessage
-        ResultMessage = type("ResultMessage", (), {})
-        StreamEvent = type("StreamEvent", (), {})
-        ClaudeAgentOptions = type(
-            "ClaudeAgentOptions",
-            (),
-            {"__init__": lambda self, **kwargs: self.__dict__.update(kwargs)},
-        )
 
-        class ClaudeSDKClient:
-            def __init__(self, options):
-                self.options = options
-
-            async def connect(self):
-                return
-
-            async def query(self, prompt, session_id="default"):
-                return
-
+        class ClaudeSDKClient(_SDKClient):
             async def receive_response(self):
                 yield _SystemMessage(
                     subtype="hook_started",
@@ -5468,9 +5079,6 @@ def test_precompact_exception_without_new_summary_preserves_history(tmp_path: Pa
                     session_id="claude-uuid-error",
                 )
                 raise RuntimeError("stream failed before compaction completed")
-
-            async def disconnect(self):
-                return None
 
     async def _t():
         executor = ClaudeSDKExecutor()
@@ -5530,26 +5138,12 @@ def test_precompact_hook_emits_compaction_started_before_complete() -> None:
             self.type = type
             self.message = message
 
-    class _FakeSDK:
-        AssistantMessage = type("AssistantMessage", (), {})
-        UserMessage = type("UserMessage", (), {})
+    class _FakeSDK(_sdk_types()):
         SystemMessage = _SystemMessage
         ResultMessage = _ResultMessage
-        StreamEvent = type("StreamEvent", (), {})
-        ClaudeAgentOptions = type(
-            "ClaudeAgentOptions",
-            (),
-            {"__init__": lambda self, **kwargs: self.__dict__.update(kwargs)},
-        )
         messages: list = []
 
-        class ClaudeSDKClient:
-            def __init__(self, options):
-                self.options = options
-
-            async def connect(self):
-                return
-
+        class ClaudeSDKClient(_SDKClient):
             async def query(self, prompt, session_id="default"):
                 _FakeSDK.messages = [
                     _SystemMessage(
@@ -5563,9 +5157,6 @@ def test_precompact_hook_emits_compaction_started_before_complete() -> None:
             async def receive_response(self):
                 for message in _FakeSDK.messages:
                     yield message
-
-            async def disconnect(self):
-                return None
 
     async def _t():
         executor = ClaudeSDKExecutor()
@@ -5624,35 +5215,17 @@ def test_no_precompact_no_compaction_event() -> None:
                 },
             )()
 
-    class _FakeSDK:
-        AssistantMessage = type("AssistantMessage", (), {})
-        UserMessage = type("UserMessage", (), {})
-        SystemMessage = type("SystemMessage", (), {})
+    class _FakeSDK(_sdk_types()):
         ResultMessage = _ResultMessage
-        StreamEvent = type("StreamEvent", (), {})
-        ClaudeAgentOptions = type(
-            "ClaudeAgentOptions",
-            (),
-            {"__init__": lambda self, **kwargs: self.__dict__.update(kwargs)},
-        )
         messages: list = []
 
-        class ClaudeSDKClient:
-            def __init__(self, options):
-                self.options = options
-
-            async def connect(self):
-                return
-
+        class ClaudeSDKClient(_SDKClient):
             async def query(self, prompt, session_id="default"):
                 _FakeSDK.messages = [_ResultMessage(session_id, "normal result")]
 
             async def receive_response(self):
                 for message in _FakeSDK.messages:
                     yield message
-
-            async def disconnect(self):
-                return None
 
     async def _t():
         executor = ClaudeSDKExecutor()
@@ -5789,7 +5362,7 @@ async def test_terminal_error_carries_observed_usage() -> None:
         usage=None,
     )
 
-    class _FakeSDK:
+    class _FakeSDK(_sdk_types()):
         AssistantMessage = _Sentinel
         UserMessage = _Sentinel
         SystemMessage = _Sentinel
@@ -5798,22 +5371,10 @@ async def test_terminal_error_carries_observed_usage() -> None:
         ClaudeAgentOptions = SDKClaudeAgentOptions
         messages = [message_start, sdk_result]
 
-        class ClaudeSDKClient:
-            def __init__(self, options):
-                self.options = options
-
-            async def connect(self):
-                return None
-
-            async def query(self, prompt, session_id="default"):
-                return None
-
+        class ClaudeSDKClient(_SDKClient):
             async def receive_response(self):
                 for message in _FakeSDK.messages:
                     yield message
-
-            async def disconnect(self):
-                return None
 
     executor = ClaudeSDKExecutor()
     with patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=_FakeSDK):
