@@ -265,6 +265,10 @@ _CODEX_BUDGET_EXHAUSTED_FRAGMENTS = (
     "has reached its limit",
     "rate limit is set to 0",
 )
+# Fallback output for failed turns that carry no error detail.
+_CODEX_FAILED_TURN_NO_ERROR_OUTPUT = (
+    "Codex ended the turn with a failed status but reported no error message."
+)
 
 
 @dataclass
@@ -6750,6 +6754,15 @@ async def _post_turn_status_edge(
         if edge.error.is_auth:
             reauth_required = True
             output = f"{output}\n\n{_CODEX_REAUTH_HINT}"
+    elif edge.status == "failed":
+        _logger.warning(
+            "Codex forwarder published failed edge without error detail: "
+            "session_id=%s turn_id=%s source=%s",
+            session_id,
+            edge.turn_id,
+            edge.source,
+        )
+        output = _CODEX_FAILED_TURN_NO_ERROR_OUTPUT
     await _post_status(
         client,
         session_id,

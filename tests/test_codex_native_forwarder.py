@@ -1781,6 +1781,75 @@ async def test_post_turn_status_edge_clean_idle_has_no_output() -> None:
 
 
 @pytest.mark.asyncio
+async def test_post_turn_status_edge_failed_no_error_gets_generic_output(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A failed edge with no error receives a generic output and a WARNING.
+
+    When Codex emits ``turn/failed`` without populating ``turn.error``, the
+    server must not fall back to assistant prose as the error text.  The
+    generic fallback message is sent as ``output`` and a WARNING is logged so
+    the gap is observable in production logs.
+    """
+    client = _RecordingClient()
+    edge = fwd._CodexTurnStatusEdge(
+        status="failed",
+        turn_id="turn_456",
+        source="turn/failed",
+    )
+
+    with caplog.at_level("WARNING", logger="omnigent.harnesses.codex_native.forwarder"):
+        await fwd._post_turn_status_edge(client, "conv_y", edge)
+
+    assert len(client.posts) == 1
+    _url, body = client.posts[0]
+    data = body["data"]
+    assert data["status"] == "failed"
+    assert data["output"] == fwd._CODEX_FAILED_TURN_NO_ERROR_OUTPUT
+    assert "reauth_required" not in data
+    assert any(
+        "without error detail" in record.getMessage() and record.levelname == "WARNING"
+        for record in caplog.records
+    ), "expected a WARNING log for the failed edge without error detail"
+
+
+@pytest.mark.asyncio
+async def test_post_turn_status_edge_failed_with_error_output_unchanged(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A failed edge with an error message is unaffected by the generic fallback.
+
+    The explicit error message must reach the server; the generic fallback
+    must not overwrite it and no WARNING should be emitted.
+    """
+    client = _RecordingClient()
+    edge = fwd._CodexTurnStatusEdge(
+        status="failed",
+        turn_id="turn_789",
+        source="turn/failed:turn-error",
+        error=fwd._CodexTerminalError(
+            message="context window exhausted",
+            kind=fwd._CODEX_ERROR_KIND_GENERIC,
+        ),
+    )
+
+    with caplog.at_level("WARNING", logger="omnigent.harnesses.codex_native.forwarder"):
+        await fwd._post_turn_status_edge(client, "conv_z", edge)
+
+    assert len(client.posts) == 1
+    _url, body = client.posts[0]
+    data = body["data"]
+    assert data["status"] == "failed"
+    assert data["output"] == "context window exhausted"
+    assert data["output"] != fwd._CODEX_FAILED_TURN_NO_ERROR_OUTPUT
+    assert "reauth_required" not in data
+    assert not any(
+        "without error detail" in record.getMessage() and record.levelname == "WARNING"
+        for record in caplog.records
+    ), "no WARNING should be emitted when an error is already present"
+
+
+@pytest.mark.asyncio
 async def test_compaction_status_posts_and_dedupes_consecutive() -> None:
     """
     Compaction status mirrors as external_compaction_status, deduped (#1255).
