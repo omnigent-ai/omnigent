@@ -1490,11 +1490,15 @@ export function retrySession(sessionId: string): Promise<PostEventResponse> {
 }
 
 // Multiple error cards can describe the same failed turn.
-const rateLimitedTurnRetries = new Map<string, Promise<void>>();
+const failedTurnContinuations = new Map<string, Promise<void>>();
 
-/** Continue a rate-limited turn without replaying the original prompt or tools. */
-export function retryRateLimitedTurn(sessionId: string): Promise<void> {
-  const pending = rateLimitedTurnRetries.get(sessionId);
+/**
+ * Continue a turn whose upstream model call failed mid-stream (rate limit,
+ * transient gateway error) without replaying the original prompt or tools —
+ * the runner itself is healthy, only the turn died.
+ */
+export function continueFailedTurn(sessionId: string): Promise<void> {
+  const pending = failedTurnContinuations.get(sessionId);
   if (pending) return pending;
 
   const retry = postEvent(sessionId, {
@@ -1504,7 +1508,7 @@ export function retryRateLimitedTurn(sessionId: string): Promise<void> {
       content: [
         {
           type: "input_text",
-          text: "Please continue from where you left off before the rate limit error.",
+          text: "Please continue from where you left off.",
         },
       ],
     },
@@ -1514,9 +1518,9 @@ export function retryRateLimitedTurn(sessionId: string): Promise<void> {
       if (!result.queued) throw new Error("The retry was not accepted");
     })
     .finally(() => {
-      rateLimitedTurnRetries.delete(sessionId);
+      failedTurnContinuations.delete(sessionId);
     });
-  rateLimitedTurnRetries.set(sessionId, retry);
+  failedTurnContinuations.set(sessionId, retry);
   return retry;
 }
 
