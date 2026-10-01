@@ -5403,6 +5403,7 @@ async def _agent_list_fetch(
     *,
     after: str | None,
     limit: int,
+    exhausted: bool = False,
 ) -> _DiscoveryPage:
     """
     Fetch one cursor page of a paginated list endpoint.
@@ -5416,8 +5417,11 @@ async def _agent_list_fetch(
     :param server_client: HTTP client pointed at the Omnigent server.
     :param after: Server cursor from the previous page, if any.
     :param limit: Maximum number of source rows to fetch.
+    :param exhausted: Skip a source whose cursor has reached its end.
     :returns: Rows and server continuation metadata.
     """
+    if exhausted:
+        return _DiscoveryPage([], False)
     try:
         params: dict[str, str | int] = {"limit": limit, "order": "desc"}
         if path == "/v1/sessions":
@@ -5675,19 +5679,24 @@ async def _agent_list_via_rest(
     """
     source_limit = limit or _AGENT_LIST_PAGE_LIMIT
 
-    async def fetch_page(section: str, path: str) -> _DiscoveryPage:
-        if cursor_state[section][0] == _DISCOVERY_END:
-            return _DiscoveryPage([], False)
-        return await _agent_list_fetch(
-            path, server_client, after=cursor_state[section][1], limit=source_limit
-        )
-
     spec = _effective_runner_os_env_spec(agent_spec, conversation_id, runner_workspace)
     assert spec.cwd is not None
     configs_dir = Path(spec.cwd) / _AGENT_CONFIG_SUBDIR
     builtins_page, sessions_page, local_configs, readiness, family = await asyncio.gather(
-        fetch_page("builtins", "/v1/agents"),
-        fetch_page("session_agents", "/v1/sessions"),
+        _agent_list_fetch(
+            "/v1/agents",
+            server_client,
+            after=cursor_state["builtins"][1],
+            limit=source_limit,
+            exhausted=cursor_state["builtins"][0] == _DISCOVERY_END,
+        ),
+        _agent_list_fetch(
+            "/v1/sessions",
+            server_client,
+            after=cursor_state["session_agents"][1],
+            limit=source_limit,
+            exhausted=cursor_state["session_agents"][0] == _DISCOVERY_END,
+        ),
         asyncio.to_thread(_scan_local_agent_configs, configs_dir),
         _agent_list_host_readiness(server_client, conversation_id),
         _spawn_family(server_client, conversation_id),
@@ -5707,14 +5716,13 @@ async def _agent_list_via_rest(
         remaining_configs[:source_limit],
     )
     listing["builtins"] = _in_spawn_family(listing["builtins"], family)
-    from omnigent.harness_availability import reported_harness_availability
+    from omnigent.harness_availability import harness_launch_availability
 
     for row in listing["builtins"]:
-        available, reason = reported_harness_availability(
+        available, reason = harness_launch_availability(
             _optional_string(row.get("harness")), readiness
         )
-        # Local auth reports cannot see credentials supplied by the session.
-        row["available_on_host"] = None if reason == "needs-auth" else available
+        row["available_on_host"] = available
         row["unavailable_reason"] = reason
     return _bounded_discovery_result(
         listing,

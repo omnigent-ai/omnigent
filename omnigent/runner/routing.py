@@ -68,7 +68,12 @@ class RoutedRunner:
     client: httpx.AsyncClient
 
 
-def routing_host_id(conv: Conversation, conversation_store: ConversationStore) -> str | None:
+def routing_host_id(
+    conv: Conversation,
+    conversation_store: ConversationStore,
+    *,
+    max_ancestor_reads: int | None = None,
+) -> str | None:
     """
     Return the host whose replica serves *conv*'s runner tunnel.
 
@@ -79,14 +84,19 @@ def routing_host_id(conv: Conversation, conversation_store: ConversationStore) -
 
     :param conv: Conversation whose runner is being routed.
     :param conversation_store: Store used to read the ancestor rows.
+    :param max_ancestor_reads: Optional read budget, including the root fallback.
     :returns: The routing host id, or ``None`` when no host is bound anywhere
-        in the chain (a hostless local runner).
+        in the chain or the read budget is exhausted.
     """
     if conv.host_id is not None or conv.kind != "sub_agent":
         return conv.host_id
+    reads = 0
     visited = {conv.id}
     ancestor_id = conv.parent_conversation_id
     while ancestor_id is not None and ancestor_id not in visited:
+        if max_ancestor_reads is not None and reads >= max_ancestor_reads:
+            return None
+        reads += 1
         visited.add(ancestor_id)
         ancestor = conversation_store.get_conversation(ancestor_id)
         if ancestor is None:
@@ -98,6 +108,8 @@ def routing_host_id(conv: Conversation, conversation_store: ConversationStore) -
     # Retain the root fallback when an intermediate parent is missing or cyclic.
     root_id = conv.root_conversation_id
     if root_id is not None and root_id not in visited:
+        if max_ancestor_reads is not None and reads >= max_ancestor_reads:
+            return None
         root = conversation_store.get_conversation(root_id)
         if root is not None:
             return root.host_id

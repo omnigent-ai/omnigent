@@ -51,3 +51,12 @@ def reported_harness_availability(
     if isinstance(value, str):
         return False, value
     return None, None
+
+
+def harness_launch_availability(
+    harness: str | None,
+    readiness: Mapping[str, object] | None,
+) -> tuple[bool | None, str | None]:
+    """Treat host auth reports as advisory; sessions can supply credentials."""
+    available, reason = reported_harness_availability(harness, readiness)
+    return (None if reason == HARNESS_NEEDS_AUTH else available), reason

@@ -130,12 +130,17 @@ async def test_discovery_reads_run_concurrently(monkeypatch: pytest.MonkeyPatch)
     monkeypatch.setenv(RUNNER_SLICE_KEY_ENV_VAR, "host_test")
     arrived: set[str] = set()
     all_arrived = asyncio.Event()
+    timeouts: list[str] = []
 
     async def handle(request: httpx.Request) -> httpx.Response:
         arrived.add(request.url.path)
         if len(arrived) == 3:
             all_arrived.set()
-        await asyncio.wait_for(all_arrived.wait(), timeout=1.0)
+        try:
+            await asyncio.wait_for(all_arrived.wait(), timeout=1.0)
+        except TimeoutError:
+            timeouts.append(request.url.path)
+            raise
         if request.url.path == "/v1/hosts/host_test":
             return httpx.Response(200, json={"configured_harnesses": {"jcode": False}})
         return httpx.Response(200, json={"data": []})
@@ -149,4 +154,5 @@ async def test_discovery_reads_run_concurrently(monkeypatch: pytest.MonkeyPatch)
             server_client=client,
             conversation_id="child",
         )
+    assert not timeouts
     assert arrived == {"/v1/agents", "/v1/sessions", "/v1/hosts/host_test"}

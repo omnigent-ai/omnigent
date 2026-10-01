@@ -6,7 +6,7 @@ import asyncio
 
 from omnigent.entities import Conversation
 from omnigent.errors import ErrorCode, OmnigentError
-from omnigent.harness_availability import reported_harness_availability
+from omnigent.harness_availability import harness_launch_availability
 from omnigent.stores import ConversationStore
 from omnigent.stores.host_store import HostStore
 
@@ -39,7 +39,9 @@ async def validate_create_harness_readiness(
                 conversation_store.get_conversation, parent_session_id
             )
         host_id = (
-            await asyncio.to_thread(routing_host_id, parent, conversation_store)
+            await asyncio.to_thread(
+                routing_host_id, parent, conversation_store, max_ancestor_reads=16
+            )
             if parent is not None
             else None
         )
@@ -55,11 +57,8 @@ async def validate_create_harness_readiness(
     # Sharing a parent session does not grant access to its host telemetry.
     if user_id is not None and host.user_id != user_id:
         return
-    available, reason = reported_harness_availability(harness, host.configured_harnesses)
+    available, reason = harness_launch_availability(harness, host.configured_harnesses)
     if available is not False:
-        return
-    # Host authentication reports cannot see spec-level or runtime credentials.
-    if reason == "needs-auth":
         return
     raise OmnigentError(
         f"Harness {harness!r} is not configured on the target host ({reason}). "
