@@ -2513,7 +2513,10 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         // snapshot settles it; if that fetch fails too, the draft comes back
         // unsettled and the next live acknowledgement or snapshot decides.
         const verdict = await sendVerdictFromServer(draftSessionId, stableId);
-        if (verdict === "refused") serverRefused = true;
+        // The acknowledgement may have landed while that fetch was out; it
+        // outranks whatever the fetch said or failed to say.
+        if (inFlightSends.get(stableId) === true) deliveredDespiteFailure = true;
+        else if (verdict === "refused") serverRefused = true;
         else if (verdict === "delivered") deliveredDespiteFailure = true;
         else unsettled = true;
       }

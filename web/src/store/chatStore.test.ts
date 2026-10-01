@@ -5614,7 +5614,10 @@ describe("chatStore — delivered-but-unacked send", () => {
    * put the send's item in the transcript, and answer the follow-up snapshot
    * fetch with `verdict`.
    */
-  function failPostWithItemInTranscript(stableId: string, verdict: () => Response): void {
+  function failPostWithItemInTranscript(
+    stableId: string,
+    verdict: () => Response | Promise<Response>,
+  ): void {
     useChatStore.setState({
       conversationId: "conv_existing",
       abortController: new AbortController(),
@@ -5704,6 +5707,37 @@ describe("chatStore — delivered-but-unacked send", () => {
       unsettled: true,
     });
     expect(committedItemProvesDelivery(useChatStore.getState().blocks, draft!)).toBe(false);
+  });
+
+  it("hands back no draft when the acknowledgement lands during the verdict fetch", async () => {
+    const stableId = "d".repeat(32);
+    let verdictRequested = false;
+    let failVerdict!: (reason: Error) => void;
+    const pendingVerdict = new Promise<Response>((_resolve, reject) => {
+      failVerdict = reject;
+    });
+    failPostWithItemInTranscript(stableId, () => {
+      verdictRequested = true;
+      return pendingVerdict;
+    });
+
+    const sending = useChatStore.getState().send("resend me", "agent_xyz");
+    await vi.waitFor(() => expect(verdictRequested).toBe(true));
+    // The runner took the send after all: its acknowledgement arrives over the
+    // stream while the verdict request is still out, which then fails too.
+    handleSessionEvent({
+      type: "session_input_consumed",
+      itemId: stableId,
+      itemType: "message",
+      data: { role: "user", content: [{ type: "input_text", text: "resend me" }] },
+    });
+    failVerdict(new TypeError("Failed to fetch"));
+    await sending;
+
+    const state = useChatStore.getState();
+    expect(state.failedSendDraft).toBeNull();
+    expect(state.restoredSendDraft).toBeNull();
+    expect(state.pendingRetryStableId).toBeNull();
   });
 
   it("mints a fresh stable id when the restored draft was edited before the resend", async () => {
