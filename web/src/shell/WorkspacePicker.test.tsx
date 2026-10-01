@@ -804,6 +804,7 @@ describe("WorkspacePicker modal actions", () => {
       "workspace-picker-up",
       "workspace-picker-new-folder",
       "workspace-picker-show-hidden",
+      "workspace-picker-refresh",
       "workspace-picker-close",
     ]) {
       expect(screen.getByTestId(testId)).toHaveAttribute("data-variant", "ghost");
@@ -1106,6 +1107,87 @@ describe("WorkspacePicker modal actions", () => {
 
     fireEvent.click(screen.getByRole("radio", { name: "Use worktree feature-layout" }));
     expectFixedFrame(expectedClassName);
+  });
+});
+
+describe("WorkspacePicker refresh", () => {
+  const refetchListing = vi.fn();
+  const refetchWorktrees = vi.fn();
+
+  function mockListing(overrides: Partial<FakeListing> = {}) {
+    useHostFilesystemMock.mockReturnValue({
+      ...result({
+        data: { entries: [dir("src", "/Users/corey/repo/src")], truncated: false },
+        isLoading: false,
+        isFetching: false,
+        isPlaceholderData: false,
+        error: null,
+        ...overrides,
+      }),
+      refetch: refetchListing,
+    } as unknown as ReturnType<typeof useHostFilesystem>);
+  }
+
+  beforeEach(() => {
+    refetchListing.mockReset();
+    refetchWorktrees.mockReset();
+    useHostFilesystemMock.mockReset();
+    mockListing();
+    useHostWorktreesMock.mockReturnValue({
+      data: [],
+      isFetching: false,
+      isPlaceholderData: false,
+      error: null,
+      refetch: refetchWorktrees,
+    } as unknown as ReturnType<typeof useHostWorktrees>);
+  });
+
+  afterEach(() => {
+    cleanup();
+  });
+
+  it("re-reads the folder listing and its worktrees from the host", () => {
+    render(
+      <WorkspacePicker
+        hostId="host_1"
+        initialPath="/Users/corey/repo"
+        onClose={vi.fn()}
+        onSelect={vi.fn()}
+      />,
+    );
+
+    const refresh = screen.getByRole("button", { name: "Refresh" });
+    expect(screen.getByTestId("workspace-picker-header")).toContainElement(refresh);
+    expect(
+      refresh.compareDocumentPosition(screen.getByTestId("workspace-picker-close")) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBe(Node.DOCUMENT_POSITION_FOLLOWING);
+    fireEvent.click(refresh);
+
+    expect(refetchListing).toHaveBeenCalledOnce();
+    expect(refetchWorktrees).toHaveBeenCalledOnce();
+  });
+
+  it("skips the worktree read when the picker has no worktree panel", () => {
+    render(<WorkspacePicker hostId="host_1" initialPath="/Users/corey/repo" />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+
+    expect(refetchListing).toHaveBeenCalledOnce();
+    expect(refetchWorktrees).not.toHaveBeenCalled();
+  });
+
+  it("is disabled while the listing is already loading", () => {
+    mockListing({ isFetching: true });
+    render(<WorkspacePicker hostId="host_1" initialPath="/Users/corey/repo" onClose={vi.fn()} />);
+
+    expect(screen.getByRole("button", { name: "Refresh" })).toBeDisabled();
+  });
+
+  it("is disabled without a host", () => {
+    render(<WorkspacePicker hostId={null} onClose={vi.fn()} />);
+
+    expect(screen.getByRole("button", { name: "Refresh" })).toBeDisabled();
   });
 });
 
