@@ -3293,6 +3293,39 @@ describe("Sidebar view options", () => {
     expect(usePullRequestInfoMock).toHaveBeenCalledWith("conv_gh");
   });
 
+  it("shows the tracked PR number when gh can't resolve its state", async () => {
+    // gh unauthenticated: `pr` is null, but the association carries the number.
+    useGithubInfoMock.mockReturnValue({
+      data: {
+        object: "session.github.info",
+        available: true,
+        authenticated: false,
+        repo: { name_with_owner: "omnigent-ai/omnigent" },
+        pr: null,
+        selected_pr_url: "https://github.com/omnigent-ai/omnigent/pull/7918",
+        prs: [
+          {
+            url: "https://github.com/omnigent-ai/omnigent/pull/7918",
+            host: "github.com",
+            repository: "omnigent-ai/omnigent",
+            number: 7918,
+            relationship: "created",
+          },
+        ],
+      },
+    });
+    mockConversations([conv("conv_assoc", "Codex", { workspace: "/Users/me/omnigent" })]);
+    renderSidebar();
+
+    fireEvent.pointerMove(screen.getByRole("link", { name: "conv_assoc" }), {
+      pointerType: "mouse",
+    });
+    await waitFor(() => {
+      // Number only, no "· Open/Draft" suffix, since there's no resolved state.
+      expect(screen.getByTestId("session-tooltip-pr")).toHaveTextContent(/^PR#7918$/);
+    });
+  });
+
   it("skips the GitHub lookup for a session without a workspace", async () => {
     mockConversations([conv("conv_bare", "Codex", { owner: null })]);
     renderSidebar();
