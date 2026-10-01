@@ -261,6 +261,24 @@ def test_auth_aware_native_harness_needs_auth_when_installed_not_signed_in(
     assert result["opencode-native"] == "needs-auth"
 
 
+def test_opencode_ready_via_bedrock_profile_without_stored_login(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _all_clis_installed(monkeypatch)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "share"))
+    config_dir = tmp_path / "config" / "opencode"
+    config_dir.mkdir(parents=True)
+    (config_dir / "opencode.json").write_text(
+        '{"provider": {"amazon-bedrock": {"options": {"profile": "work"}}}}',
+        encoding="utf-8",
+    )
+
+    result = configured_harness_map()
+    for harness in ("opencode", "opencode-native", "native-opencode"):
+        assert result[harness] is True
+
+
 def test_claude_ready_via_configured_provider_without_cli_login(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -3,15 +3,17 @@
 Like :mod:`omnigent.onboarding.goose_auth`, Omnigent stores **no** OpenCode
 credentials: OpenCode owns its own provider auth via ``opencode auth login``
 (stored in ``~/.local/share/opencode/auth.json``) or ambient provider env vars
-(``OPENAI_API_KEY`` / ``ANTHROPIC_API_KEY`` / …). This module is a thin,
-read-only reporter so ``omnigent setup`` can show which providers OpenCode can
+(``OPENAI_API_KEY`` / ``ANTHROPIC_API_KEY`` / …), or an AWS profile selected in
+its Bedrock provider config. This module is a thin, read-only reporter so
+``omnigent setup`` can show which providers OpenCode can
 reach and offer to run its native login — without ever touching its secrets.
 
 It reads ``auth.json`` directly (a JSON object keyed by provider id — see
 ``packages/opencode/src/auth`` in the OpenCode source) rather than scraping
 ``opencode auth list`` output, and checks a curated set of common provider env
-vars. Both are best-effort: a missing/unreadable file or unknown env var simply
-reports "nothing configured", never raises.
+vars and the provider config used at launch. These are best-effort: a
+missing/unreadable file or unknown env var simply reports "nothing configured",
+never raises.
 """
 
 from __future__ import annotations
@@ -79,14 +81,40 @@ def _env_providers(environ: dict[str, str] | None = None) -> tuple[str, ...]:
     return tuple(seen)
 
 
+def _configured_providers() -> tuple[str, ...]:
+    """Report Bedrock's configured AWS profile without resolving credentials.
+
+    AWS profiles can use SSO or credential_process instead of an API key.
+    Use the same config reader as native launch, including JSONC support;
+    OpenCode's AWS SDK remains responsible for authenticating the profile.
+    """
+    from omnigent.harnesses.opencode_native.provider import maybe_merge_user_provider_config
+
+    config = maybe_merge_user_provider_config({})
+    providers = config.get("provider")
+    if not isinstance(providers, dict):
+        return ()
+    bedrock = providers.get("amazon-bedrock")
+    if not isinstance(bedrock, dict):
+        return ()
+    options = bedrock.get("options")
+    if not isinstance(options, dict):
+        return ()
+    profile = options.get("profile")
+    if isinstance(profile, str) and profile.strip():
+        return ("amazon-bedrock",)
+    return ()
+
+
 def reachable_provider_ids(environ: dict[str, str] | None = None) -> frozenset[str]:
-    """Return OpenCode provider ids reachable from stored auth + env keys.
+    """Return OpenCode provider ids from stored auth, env keys, and AWS profiles.
 
     Ids match OpenCode's own (the ``provider/model`` prefix), so callers can
     filter a model list down to what the user can actually authenticate.
     """
     env = os.environ if environ is None else environ
     ids = set(_stored_providers())
+    ids.update(_configured_providers())
     for provider_id, _label, var in _ENV_PROVIDER_VARS:
         if env.get(var, "").strip():
             ids.add(provider_id)
@@ -100,16 +128,18 @@ class OpenCodeAuthSummary:
     :param installed: ``opencode`` binary present on ``PATH``.
     :param stored_providers: Provider ids with credentials in ``auth.json``.
     :param env_providers: Provider labels whose API-key env var is set.
+    :param configured_providers: Provider ids using a configured AWS profile.
     """
 
     installed: bool
     stored_providers: tuple[str, ...]
     env_providers: tuple[str, ...]
+    configured_providers: tuple[str, ...] = ()
 
     @property
     def has_provider(self) -> bool:
-        """Whether any provider is reachable (stored credential or env key)."""
-        return bool(self.stored_providers or self.env_providers)
+        """Whether any provider has credentials or a configured AWS profile."""
+        return bool(self.stored_providers or self.env_providers or self.configured_providers)
 
     @property
     def ready(self) -> bool:
@@ -127,6 +157,8 @@ class OpenCodeAuthSummary:
             )
         if self.env_providers:
             parts.append(f"env: {', '.join(self.env_providers)}")
+        if self.configured_providers:
+            parts.append(f"config: {', '.join(self.configured_providers)}")
         return " · ".join(parts) if parts else "no provider configured yet"
 
 
@@ -136,4 +168,5 @@ def opencode_auth_summary() -> OpenCodeAuthSummary:
         installed=harness_cli_installed(OPENCODE_KEY),
         stored_providers=_stored_providers(),
         env_providers=_env_providers(),
+        configured_providers=_configured_providers(),
     )

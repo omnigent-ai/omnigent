@@ -14,6 +14,7 @@ import omnigent.onboarding.opencode_auth as oc
 def _isolate_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """Point XDG_DATA_HOME at a tmp dir and clear provider env keys."""
     monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "share"))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
     for _provider_id, _label, var in oc._ENV_PROVIDER_VARS:
         monkeypatch.delenv(var, raising=False)
 
@@ -100,3 +101,48 @@ def test_reachable_provider_ids_merges_stored_and_env(
     assert "anthropic" in ids  # from auth.json
     assert "openai" in ids  # from env key
     assert "groq" not in ids
+
+
+@pytest.mark.parametrize("filename", ["opencode.json", "opencode.jsonc"])
+def test_bedrock_profile_is_ready_without_stored_auth_or_api_keys(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, filename: str
+) -> None:
+    monkeypatch.setattr(oc, "harness_cli_installed", lambda _key: True)
+    config_dir = tmp_path / "config" / "opencode"
+    config_dir.mkdir(parents=True)
+    raw = '{"provider": {"amazon-bedrock": {"options": {"profile": "work"}}}}'
+    if filename.endswith(".jsonc"):
+        raw = "// AWS credentials come from the profile\n" + raw.replace('"work"', '"work",')
+    (config_dir / filename).write_text(raw, encoding="utf-8")
+
+    summary = oc.opencode_auth_summary()
+    assert summary.ready is True
+    assert summary.stored_providers == ()
+    assert summary.env_providers == ()
+    assert "amazon-bedrock" in summary.describe()
+    assert oc.reachable_provider_ids() == frozenset({"amazon-bedrock"})
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "not json",
+        "[]",
+        '{"provider": []}',
+        '{"provider": {"amazon-bedrock": {}}}',
+        '{"provider": {"amazon-bedrock": {"options": {"region": "us-west-2"}}}}',
+        '{"provider": {"amazon-bedrock": {"options": {"profile": " "}}}}',
+        '{"provider": {"amazon-bedrock": {"options": {"profile": 42}}}}',
+        '{"provider": {"amazon-bedrock": {"options": []}}}',
+    ],
+)
+def test_bedrock_without_profile_does_not_report_ready(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, raw: str
+) -> None:
+    monkeypatch.setattr(oc, "harness_cli_installed", lambda _key: True)
+    config_dir = tmp_path / "config" / "opencode"
+    config_dir.mkdir(parents=True)
+    (config_dir / "opencode.json").write_text(raw, encoding="utf-8")
+
+    assert oc.opencode_auth_summary().ready is False
+    assert oc.reachable_provider_ids() == frozenset()
