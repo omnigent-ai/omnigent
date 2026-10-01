@@ -62,6 +62,7 @@ from tests._helpers.compat import (
     compat_server_cwd,
     server_executable,
 )
+from tests._helpers.session import bind_session_runner, bundle_files, post_session_bundle
 from tests.codex_parity.helpers import ev_assistant_message, ev_completed, ev_response_created
 from tests.codex_parity.sidecar_harness import (
     CodexResponsesSidecar,
@@ -456,21 +457,11 @@ def _register_agent_yaml(
     Returns the new agent id on 201, or None on 409 (already registered against
     a long-lived ``--ui-base-url`` server).
     """
-    import json as _json
 
     yaml_bytes = yaml_text.encode()
-    buf = io.BytesIO()
-    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
-        info = tarfile.TarInfo(arcname)
-        info.size = len(yaml_bytes)
-        tar.addfile(info, io.BytesIO(yaml_bytes))
+    bundle_bytes = bundle_files({arcname: yaml_bytes})
 
-    resp = httpx.post(
-        f"{base_url}/v1/sessions",
-        data={"metadata": _json.dumps({})},
-        files={"bundle": ("agent.tar.gz", buf.getvalue(), "application/gzip")},
-        timeout=10.0,
-    )
+    resp = post_session_bundle(httpx.post, f"{base_url}/v1/sessions", bundle_bytes, timeout=10.0)
     if resp.status_code == 409:
         return None
     resp.raise_for_status()
@@ -1306,7 +1297,6 @@ def seeded_session(
     :returns: ``(base_url, session_id)``. Tests typically navigate to
         ``f"{base_url}/c/{session_id}"``.
     """
-    import json as _json
 
     respawned_runner = _ensure_runner_online(live_server, tmp_path_factory)
     runner_id = str(_server_state["runner_id"])
@@ -1314,21 +1304,13 @@ def seeded_session(
     # pre-registered the agent via --agent, but since /api/agents is
     # removed we create a fresh session-scoped agent via multipart.
     bundle = _build_hello_world_bundle()
-    create_resp = httpx.post(
-        f"{live_server}/v1/sessions",
-        data={"metadata": _json.dumps({})},
-        files={"bundle": ("agent.tar.gz", bundle, "application/gzip")},
-        timeout=30.0,
+    create_resp = post_session_bundle(
+        httpx.post, f"{live_server}/v1/sessions", bundle, timeout=30.0
     )
     create_resp.raise_for_status()
     session_id = create_resp.json()["session_id"]
 
-    patch_resp = httpx.patch(
-        f"{live_server}/v1/sessions/{session_id}",
-        json={"runner_id": runner_id},
-        timeout=10.0,
-    )
-    patch_resp.raise_for_status()
+    bind_session_runner(httpx.patch, live_server, session_id, runner_id, timeout=10.0)
 
     try:
         yield (live_server, session_id)
@@ -1357,24 +1339,13 @@ def _create_runner_bound_session(base_url: str, runner_id: str) -> str:
         e.g. ``"runner_token_abc123"``.
     :returns: The new session/conversation id, e.g. ``"conv_abc123"``.
     """
-    import json as _json
 
     bundle = _build_hello_world_bundle()
-    create_resp = httpx.post(
-        f"{base_url}/v1/sessions",
-        data={"metadata": _json.dumps({})},
-        files={"bundle": ("agent.tar.gz", bundle, "application/gzip")},
-        timeout=30.0,
-    )
+    create_resp = post_session_bundle(httpx.post, f"{base_url}/v1/sessions", bundle, timeout=30.0)
     create_resp.raise_for_status()
     session_id = create_resp.json()["session_id"]
 
-    patch_resp = httpx.patch(
-        f"{base_url}/v1/sessions/{session_id}",
-        json={"runner_id": runner_id},
-        timeout=10.0,
-    )
-    patch_resp.raise_for_status()
+    bind_session_runner(httpx.patch, base_url, session_id, runner_id, timeout=10.0)
     return session_id
 
 
@@ -1692,21 +1663,13 @@ def terminal_session(
         info = tarfile.TarInfo(name=f"{_TERMINAL_AGENT_NAME}.yaml")
         info.size = len(data)
         tar.addfile(info, io.BytesIO(data))
-    create_resp = httpx.post(
-        f"{live_server}/v1/sessions",
-        data={"metadata": _json.dumps({})},
-        files={"bundle": ("agent.tar.gz", buf.getvalue(), "application/gzip")},
-        timeout=10.0,
+    create_resp = post_session_bundle(
+        httpx.post, f"{live_server}/v1/sessions", buf.getvalue(), timeout=10.0
     )
     create_resp.raise_for_status()
     session_id = create_resp.json()["session_id"]
 
-    patch_resp = httpx.patch(
-        f"{live_server}/v1/sessions/{session_id}",
-        json={"runner_id": runner_id},
-        timeout=10.0,
-    )
-    patch_resp.raise_for_status()
+    bind_session_runner(httpx.patch, live_server, session_id, runner_id, timeout=10.0)
 
     try:
         yield (live_server, session_id)
@@ -1846,7 +1809,6 @@ def two_agent_chat_session(
     :param tmp_path_factory: Pytest temp path factory (for a respawn log).
     :returns: A :class:`TwoAgentChatSession` handle.
     """
-    import json as _json
     import uuid
 
     verification_code = f"vogon-{uuid.uuid4().hex[:10]}"
@@ -1915,29 +1877,17 @@ def two_agent_chat_session(
     runner_id = str(_server_state["runner_id"])
 
     yaml_bytes = yaml_text.encode()
-    buf = io.BytesIO()
-    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
-        # Non-config.yaml arcname routes the bundle through the omnigent
-        # compat adapter, whose loader parses the inline `type: agent`
-        # tool. The spec_version:1 parser does not accept this shorthand.
-        info = tarfile.TarInfo(name=f"{_TWO_AGENT_PARENT_NAME}.yaml")
-        info.size = len(yaml_bytes)
-        tar.addfile(info, io.BytesIO(yaml_bytes))
-    create_resp = httpx.post(
-        f"{live_server}/v1/sessions",
-        data={"metadata": _json.dumps({})},
-        files={"bundle": ("agent.tar.gz", buf.getvalue(), "application/gzip")},
-        timeout=10.0,
+    # Non-config.yaml arcname routes the bundle through the omnigent
+    # compat adapter, whose loader parses the inline `type: agent`
+    # tool. The spec_version:1 parser does not accept this shorthand.
+    bundle_bytes = bundle_files({f"{_TWO_AGENT_PARENT_NAME}.yaml": yaml_bytes})
+    create_resp = post_session_bundle(
+        httpx.post, f"{live_server}/v1/sessions", bundle_bytes, timeout=10.0
     )
     create_resp.raise_for_status()
     session_id = create_resp.json()["session_id"]
 
-    patch_resp = httpx.patch(
-        f"{live_server}/v1/sessions/{session_id}",
-        json={"runner_id": runner_id},
-        timeout=10.0,
-    )
-    patch_resp.raise_for_status()
+    bind_session_runner(httpx.patch, live_server, session_id, runner_id, timeout=10.0)
 
     try:
         yield TwoAgentChatSession(
@@ -2079,28 +2029,16 @@ def approval_session(
     runner_id = str(_server_state["runner_id"])
 
     yaml_bytes = agent_yaml_text.encode()
-    buf = io.BytesIO()
-    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
-        # Strict path: arcname config.yaml keeps it on the spec_version:1
-        # parser, which is the one that honors `guardrails`.
-        info = tarfile.TarInfo(name="config.yaml")
-        info.size = len(yaml_bytes)
-        tar.addfile(info, io.BytesIO(yaml_bytes))
-    create_resp = httpx.post(
-        f"{live_server}/v1/sessions",
-        data={"metadata": _json.dumps({})},
-        files={"bundle": ("agent.tar.gz", buf.getvalue(), "application/gzip")},
-        timeout=30.0,
+    # Strict path: arcname config.yaml keeps it on the spec_version:1
+    # parser, which is the one that honors `guardrails`.
+    bundle_bytes = bundle_files({"config.yaml": yaml_bytes})
+    create_resp = post_session_bundle(
+        httpx.post, f"{live_server}/v1/sessions", bundle_bytes, timeout=30.0
     )
     create_resp.raise_for_status()
     session_id = create_resp.json()["session_id"]
 
-    patch_resp = httpx.patch(
-        f"{live_server}/v1/sessions/{session_id}",
-        json={"runner_id": runner_id},
-        timeout=10.0,
-    )
-    patch_resp.raise_for_status()
+    bind_session_runner(httpx.patch, live_server, session_id, runner_id, timeout=10.0)
 
     try:
         yield (live_server, session_id)
@@ -2606,12 +2544,7 @@ def _bind_session_runner(base_url: str, session_id: str, runner_id: str) -> None
     :param session_id: The session/conversation id to bind.
     :param runner_id: The token-bound runner id the session dispatches to.
     """
-    patch = httpx.patch(
-        f"{base_url}/v1/sessions/{session_id}",
-        json={"runner_id": runner_id},
-        timeout=10.0,
-    )
-    patch.raise_for_status()
+    bind_session_runner(httpx.patch, base_url, session_id, runner_id, timeout=10.0)
 
 
 def _create_bundled_session(base_url: str, runner_id: str, yaml_text: str) -> str:
@@ -2626,21 +2559,11 @@ def _create_bundled_session(base_url: str, runner_id: str, yaml_text: str) -> st
     :param yaml_text: The agent spec body.
     :returns: The new session/conversation id.
     """
-    import json as _json
 
-    buf = io.BytesIO()
-    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
-        data = yaml_text.encode()
-        info = tarfile.TarInfo("config.yaml")
-        info.size = len(data)
-        tar.addfile(info, io.BytesIO(data))
+    data = yaml_text.encode()
+    bundle_bytes = bundle_files({"config.yaml": data})
 
-    create = httpx.post(
-        f"{base_url}/v1/sessions",
-        data={"metadata": _json.dumps({})},
-        files={"bundle": ("agent.tar.gz", buf.getvalue(), "application/gzip")},
-        timeout=30.0,
-    )
+    create = post_session_bundle(httpx.post, f"{base_url}/v1/sessions", bundle_bytes, timeout=30.0)
     create.raise_for_status()
     session_id = str(create.json()["session_id"])
     _bind_session_runner(base_url, session_id, runner_id)

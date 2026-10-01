@@ -34,7 +34,6 @@ from __future__ import annotations
 
 import contextlib
 import io
-import json
 import os
 import secrets
 import signal
@@ -48,6 +47,8 @@ from pathlib import Path
 
 import httpx
 import pytest
+
+from tests._helpers.session import bind_session_runner, post_session_bundle
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -139,21 +140,11 @@ def _create_hermes_session(base_url: str, runner_id: str) -> str:
             tar.addfile(info, io.BytesIO(payload))
         bundle = buf.getvalue()
 
-    create = _client.post(
-        f"{base_url}/v1/sessions",
-        data={"metadata": json.dumps({})},
-        files={"bundle": ("agent.tar.gz", bundle, "application/gzip")},
-        timeout=30.0,
-    )
+    create = post_session_bundle(_client.post, f"{base_url}/v1/sessions", bundle, timeout=30.0)
     create.raise_for_status()
     session_id = create.json()["session_id"]
 
-    patch = _client.patch(
-        f"{base_url}/v1/sessions/{session_id}",
-        json={"runner_id": runner_id},
-        timeout=10.0,
-    )
-    patch.raise_for_status()
+    bind_session_runner(_client.patch, base_url, session_id, runner_id, timeout=10.0)
     return session_id
 
 

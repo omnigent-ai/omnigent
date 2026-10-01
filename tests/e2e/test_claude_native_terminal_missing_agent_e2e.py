@@ -63,7 +63,6 @@ Run::
 from __future__ import annotations
 
 import contextlib
-import io
 import json
 import os
 import re
@@ -71,7 +70,6 @@ import secrets
 import shutil
 import subprocess
 import sys
-import tarfile
 import time
 from pathlib import Path
 
@@ -80,6 +78,7 @@ import pytest
 
 from tests._helpers.live_server import find_free_port, terminate_process
 from tests._helpers.native_session import create_native_session
+from tests._helpers.session import bundle_files, post_session_bundle
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -190,24 +189,15 @@ def _create_session_with_scoped_agent(base_url: str) -> tuple[str, str]:
             "",
         ]
     )
-    buf = io.BytesIO()
-    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
-        data = yaml_text.encode()
-        # Non-config.yaml arcname routes through the omnigent compat translator.
-        info = tarfile.TarInfo("missing-agent-fixture.yaml")
-        info.size = len(data)
-        tar.addfile(info, io.BytesIO(data))
+    # Non-config.yaml arcname routes through the omnigent compat translator.
+    data = yaml_text.encode()
+    bundle_bytes = bundle_files({"missing-agent-fixture.yaml": data})
 
-    create = _http.post(
+    create = post_session_bundle(
+        _http.post,
         f"{base_url}/v1/sessions",
-        data={"metadata": json.dumps({})},
-        files={
-            "bundle": (
-                "missing-agent-fixture.tar.gz",
-                buf.getvalue(),
-                "application/gzip",
-            )
-        },
+        bundle_bytes,
+        filename="missing-agent-fixture.tar.gz",
         headers={"Origin": OMNIGENT_INTERNAL_WS_ORIGIN},
         timeout=30.0,
     )

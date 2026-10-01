@@ -18,7 +18,6 @@ Usage::
 from __future__ import annotations
 
 import io
-import json
 import tarfile
 import time
 import uuid
@@ -26,6 +25,7 @@ import uuid
 import httpx
 import yaml
 
+from tests._helpers.session import post_session_bundle
 from tests.e2e.conftest import (
     configure_mock_llm,
     create_runner_bound_session,
@@ -285,11 +285,7 @@ def _upload_single_file_agent_with_os_env(
             info.size = len(yaml_bytes)
             tar.addfile(info, io.BytesIO(yaml_bytes))
         bundle = buf.getvalue()
-    resp = client.post(
-        "/v1/sessions",
-        data={"metadata": json.dumps({})},
-        files={"bundle": ("agent.tar.gz", bundle, "application/gzip")},
-    )
+    resp = post_session_bundle(client.post, "/v1/sessions", bundle)
     if resp.status_code == 409:
         return name
     resp.raise_for_status()

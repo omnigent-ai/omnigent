@@ -43,7 +43,6 @@ Run::
 from __future__ import annotations
 
 import io
-import json
 import os
 import secrets
 import signal
@@ -56,6 +55,8 @@ from pathlib import Path
 
 import httpx
 import yaml
+
+from tests._helpers.session import post_session_bundle
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -201,12 +202,7 @@ def _create_agent_session(base_url: str) -> str:
             info.size = len(data)
             tar.addfile(info, io.BytesIO(data))
         bundle = buf.getvalue()
-    resp = _http.post(
-        f"{base_url}/v1/sessions",
-        data={"metadata": json.dumps({})},
-        files={"bundle": ("agent.tar.gz", bundle, "application/gzip")},
-        timeout=30.0,
-    )
+    resp = post_session_bundle(_http.post, f"{base_url}/v1/sessions", bundle, timeout=30.0)
     resp.raise_for_status()
     return str(resp.json()["session_id"])
 
