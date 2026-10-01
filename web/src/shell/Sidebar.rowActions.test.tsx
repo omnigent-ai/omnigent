@@ -104,71 +104,55 @@ vi.mock("@/hooks/useInputCapabilities", () => ({
   }),
 }));
 
-vi.mock("@/hooks/useConversations", () => ({
-  useConversations: vi.fn(),
-  useConnectedConversations: () => [],
-  useStopAndDeleteConversation: () => ({
-    mutate: mocks.del.mutate,
-    reset: mocks.del.reset,
-    isPending: false,
-    isError: false,
-    variables: undefined,
-  }),
-  // Reactive server pinned set: subscribes to the hoisted store so a toggle
-  // re-renders, mapping pinned ids onto the loaded conversations.
-  usePinnedConversations: () => {
-    const ids = useSyncExternalStore(mocks.pinnedStore.subscribe, () => mocks.pinnedStore.ids);
-    const idSet = new Set(ids);
-    return {
-      data: {
-        conversations: (mocks.conversations as { id: string }[]).filter((c) => idSet.has(c.id)),
-        filterHonored: true,
-      },
-      isSuccess: true,
-    };
-  },
-  useTogglePinnedConversation: () => ({
-    mutate: ({ id, pinned }: { id: string; pinned: boolean }) =>
-      mocks.pinnedStore.toggle(id, pinned),
-  }),
-  setConversationPinned: vi.fn(() => Promise.resolve({})),
-  PINNED_CONVERSATIONS_KEY: ["pinned-conversations"],
-  useRenameConversation: () => mocks.rename,
-  useLeaveSession: () => mocks.leave,
-  useArchiveConversation: () => mocks.archive,
-  useBulkArchiveConversations: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  useBulkDeleteConversations: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  useBulkMoveToProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  useBulkStopSessions: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  useStopSession: () => mocks.stopSession,
-  useProjects: () => ({
-    data: mocks.projects.map((name: string) => ({
-      id: `p_${name}`,
-      name,
-      icon: mocks.projectIcons[name],
-    })),
-  }),
-  // A non-empty `useProjects` renders a project folder, which queries its
-  // sessions — return the collapsed (disabled) shape so the folder is inert
-  // (this suite keeps its test row unfiled; the picker only needs the name).
-  useProjectSessions: () => ({
-    data: undefined,
-    isLoading: false,
-    isError: false,
-    error: null,
-    fetchNextPage: vi.fn(),
-    hasNextPage: false,
-    isFetchingNextPage: false,
-  }),
-  useMoveToProject: () => mocks.moveToProject,
-  useDeleteProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  useRenameProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  useCreateProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  useProjectConfig: () => ({ data: undefined, isLoading: false }),
-  useUpdateProjectConfig: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  fetchProjectSessionIds: () => Promise.resolve([]),
-  PROJECT_LABEL_KEY: "omni_project",
-}));
+vi.mock("@/hooks/useConversations", async () => {
+  const { conversationHooksMock } = await import("@/test/sidebarMockHelpers");
+  return {
+    ...conversationHooksMock(),
+    useStopAndDeleteConversation: () => ({
+      mutate: mocks.del.mutate,
+      reset: mocks.del.reset,
+      isPending: false,
+      isError: false,
+      variables: undefined,
+    }),
+    useArchiveConversation: () => mocks.archive,
+    useStopSession: () => mocks.stopSession,
+    usePinnedConversations: () => {
+      const ids = useSyncExternalStore(mocks.pinnedStore.subscribe, () => mocks.pinnedStore.ids);
+      const idSet = new Set(ids);
+      return {
+        data: {
+          conversations: (mocks.conversations as { id: string }[]).filter((c) => idSet.has(c.id)),
+          filterHonored: true,
+        },
+        isSuccess: true,
+      };
+    },
+    useTogglePinnedConversation: () => ({
+      mutate: ({ id, pinned }: { id: string; pinned: boolean }) =>
+        mocks.pinnedStore.toggle(id, pinned),
+    }),
+    useRenameConversation: () => mocks.rename,
+    useLeaveSession: () => mocks.leave,
+    useProjects: () => ({
+      data: mocks.projects.map((name: string) => ({
+        id: `p_${name}`,
+        name,
+        icon: mocks.projectIcons[name],
+      })),
+    }),
+    useProjectSessions: () => ({
+      data: undefined,
+      isLoading: false,
+      isError: false,
+      error: null,
+      fetchNextPage: vi.fn(),
+      hasNextPage: false,
+      isFetchingNextPage: false,
+    }),
+    useMoveToProject: () => mocks.moveToProject,
+  };
+});
 
 // Heavy sibling widgets pull their own hooks/providers; stub them so this
 // test stays scoped to the conversation row.
