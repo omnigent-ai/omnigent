@@ -23,55 +23,14 @@ import pytest
 import pytest_asyncio
 from fastapi import FastAPI
 
-from omnigent.runtime.agent_cache import AgentCache
-from omnigent.server.app import create_app
-from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
-from omnigent.stores.artifact_store.local import LocalArtifactStore
-from omnigent.stores.comment_store.sqlalchemy_store import SqlAlchemyCommentStore
-from omnigent.stores.conversation_store.sqlalchemy_store import (
-    SqlAlchemyConversationStore,
-)
-from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
 from omnigent.stores.policy_store.sqlalchemy_store import SqlAlchemyPolicyStore
-from tests.server.conftest import ControllableMockClient
+from tests.server.conftest import ControllableMockClient, _app_client
 from tests.server.helpers import create_test_agent
 
 pytestmark = pytest.mark.asyncio
 
 
 # ── Fixtures ──────────────────────────────────────────────────────────────────
-
-
-@pytest.fixture()
-def policy_app(
-    runtime_init: None,
-    db_uri: str,
-    tmp_path: Path,
-) -> FastAPI:
-    """App with a ``policy_store`` so session-policy routes are active.
-
-    Uses no auth provider — the session policy routes fall through to
-    the unauthenticated path (no permission checks), which is sufficient
-    for testing the policy engine wiring.
-
-    :param runtime_init: Initializes the runtime with a mock LLM.
-    :param db_uri: Per-test SQLite URI.
-    :param tmp_path: Pytest temp dir for artifacts.
-    :returns: A FastAPI app with policy CRUD and session routes.
-    """
-    artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
-    return create_app(
-        agent_store=SqlAlchemyAgentStore(db_uri),
-        file_store=SqlAlchemyFileStore(db_uri),
-        conversation_store=SqlAlchemyConversationStore(db_uri),
-        artifact_store=artifact_store,
-        agent_cache=AgentCache(
-            artifact_store=artifact_store,
-            cache_dir=tmp_path / "cache",
-        ),
-        policy_store=SqlAlchemyPolicyStore(db_uri),
-        comment_store=SqlAlchemyCommentStore(db_uri),
-    )
 
 
 @pytest_asyncio.fixture()
@@ -82,53 +41,28 @@ async def policy_client(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> AsyncIterator[httpx.AsyncClient]:
-    """Async HTTP client wired to the policy-enabled app.
+    """Policy client allowing the fixed-action factory used by DENY scenarios."""
+    async with _app_client(policy_app, mock_llm, tmp_path) as client:
+        # Patch the runtime global so the policy engine picks up session policies.
+        policy_store = SqlAlchemyPolicyStore(db_uri)
+        monkeypatch.setattr("omnigent.runtime._globals._policy_store", policy_store)
 
-    Also patches the runtime-global ``_policy_store`` so the
-    ``_build_policy_engine_from_spec`` path (which reads the store via
-    ``get_policy_store()``) sees session-scoped policies created
-    through the CRUD routes.
+        # Allow the make_fixed_action_callable factory through the registry
+        # allowlist. In production this would be added via policy_modules config.
+        # Patch at the use site (the route module imports the function directly).
+        from omnigent.server.routes import session_policies as _sp_mod
 
-    :param policy_app: FastAPI app with policy store.
-    :param mock_llm: Controllable mock LLM — released on teardown.
-    :param db_uri: Per-test SQLite URI.
-    :param tmp_path: Pytest temp dir for the harness process manager.
-    :param monkeypatch: Pytest monkeypatch fixture.
-    :yields: A ready-to-use async HTTP client.
-    """
-    from omnigent.runtime import set_harness_process_manager
-    from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
+        _original_is_registered = _sp_mod.is_registered_handler
+        monkeypatch.setattr(
+            _sp_mod,
+            "is_registered_handler",
+            lambda handler: (
+                handler == "omnigent.policies.function.make_fixed_action_callable"
+                or _original_is_registered(handler)
+            ),
+        )
 
-    pm = HarnessProcessManager(tmp_parent=tmp_path / "harness_pm")
-    await pm.start()
-    set_harness_process_manager(pm)
-
-    # Patch the runtime global so the policy engine picks up session policies.
-    policy_store = SqlAlchemyPolicyStore(db_uri)
-    monkeypatch.setattr("omnigent.runtime._globals._policy_store", policy_store)
-
-    # Allow the make_fixed_action_callable factory through the registry
-    # allowlist. In production this would be added via policy_modules config.
-    # Patch at the use site (the route module imports the function directly).
-    from omnigent.server.routes import session_policies as _sp_mod
-
-    _original_is_registered = _sp_mod.is_registered_handler
-    monkeypatch.setattr(
-        _sp_mod,
-        "is_registered_handler",
-        lambda handler: (
-            handler == "omnigent.policies.function.make_fixed_action_callable"
-            or _original_is_registered(handler)
-        ),
-    )
-
-    transport = httpx.ASGITransport(app=policy_app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
-        yield c
-
-    mock_llm.release_all()
-    set_harness_process_manager(None)
-    await pm.shutdown()
+        yield client
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────

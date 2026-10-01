@@ -44,6 +44,7 @@ from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
 from tests.server.helpers import create_test_agent
+from tests.server.helpers import policy_tool_call_request as _tool_call_request
 
 pytestmark = pytest.mark.asyncio
 
@@ -121,30 +122,6 @@ def _create_child_session(
         agent_id=agent_id,
     )
     return child.id
-
-
-def _tool_call_request(
-    tool_name: str = "Bash",
-    arguments: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    """
-    Build a ``PHASE_TOOL_CALL`` policy-evaluate request.
-
-    :param tool_name: Tool name, e.g. ``"Bash"``.
-    :param arguments: Tool arguments dict. ``None`` means no args.
-    :returns: JSON body for ``POST /policies/evaluate``.
-    """
-    return {
-        "event": {
-            "type": "PHASE_TOOL_CALL",
-            "target": "",
-            "data": {
-                "name": tool_name,
-                "arguments": arguments or {},
-            },
-            "context": {},
-        },
-    }
 
 
 def _patch_default_policies(monkeypatch: pytest.MonkeyPatch, fn_path: str) -> None:

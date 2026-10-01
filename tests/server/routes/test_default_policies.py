@@ -2,7 +2,7 @@
 
 The default policies router is only mounted when ``create_app`` receives
 a ``policy_store``. The standard conftest ``app`` fixture does not
-supply one, so these tests provide their own app/client that include it.
+supply one, so these tests use the shared policy app with a route-only client.
 """
 
 from __future__ import annotations
@@ -40,24 +40,6 @@ class _FixedAuthProvider(AuthProvider):
 
     def get_user_id(self, request: HTTPConnection) -> str | None:
         return _TEST_USER_ID
-
-
-@pytest.fixture()
-def policy_app(runtime_init: None, db_uri: str, tmp_path: Path) -> FastAPI:
-    """Build a FastAPI app that includes the policy store."""
-    artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
-    return create_app(
-        agent_store=SqlAlchemyAgentStore(db_uri),
-        file_store=SqlAlchemyFileStore(db_uri),
-        conversation_store=SqlAlchemyConversationStore(db_uri),
-        artifact_store=artifact_store,
-        agent_cache=AgentCache(
-            artifact_store=artifact_store,
-            cache_dir=tmp_path / "cache",
-        ),
-        comment_store=SqlAlchemyCommentStore(db_uri),
-        policy_store=SqlAlchemyPolicyStore(db_uri),
-    )
 
 
 @pytest.fixture()
