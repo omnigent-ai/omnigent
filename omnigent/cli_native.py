@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import os
 from collections.abc import Callable
+from pathlib import Path
 from typing import ParamSpec, TypeVar
 
 import click
@@ -41,6 +42,7 @@ from omnigent.cli_common import (
 # Sourced from the stdlib-only bridge leaf, so importing it here adds no
 # launcher/runner imports to CLI startup.
 from omnigent.harnesses.devin_native.bridge import DEVIN_EFFORTS, DEVIN_PERMISSION_MODES
+from omnigent.session_policies_file import load_policies_file, policies_option
 
 _Args = ParamSpec("_Args")
 _Return = TypeVar("_Return")
@@ -597,11 +599,13 @@ def register_native_commands(cli: click.Group) -> None:
         hidden=True,
         help="Deprecated alias for ``--resume <id>``; kept for one release.",
     )
+    @policies_option
     @click.argument("pi_args", nargs=-1, type=click.UNPROCESSED)
     def pi(
         server: str | None,
         resume: str | None,
         session_id: str | None,
+        policies_file: Path | None,
         pi_args: tuple[str, ...],
     ) -> None:
         """Launch Pi with Omnigent.
@@ -612,6 +616,7 @@ def register_native_commands(cli: click.Group) -> None:
           omnigent pi --resume conv_abc123
           omnigent pi --resume                    # interactive picker
           omnigent pi --model local-deepseek/deepseek-v4-flash
+          omnigent pi --policies policies.yaml
         """
         choice = _split_resume_value(resume)
         if session_id is not None and (choice.picker or choice.conversation_id is not None):
@@ -623,6 +628,8 @@ def register_native_commands(cli: click.Group) -> None:
         from omnigent.harness_startup_config import resolve_harness_command
         from omnigent.harnesses.pi_native.main import run_pi_native
 
+        # Validate before any server work so a typo fails fast.
+        policies = load_policies_file(policies_file) if policies_file is not None else None
         cfg = _load_effective_config()
         # Thread ``harness.pi-native.command`` config into the runner via the
         # canonical ``OMNIGENT_PI_PATH`` env var (set before ``_ensure_backend``
@@ -647,6 +654,7 @@ def register_native_commands(cli: click.Group) -> None:
             resume_picker=choice.picker,
             extra_args=_resolve_harness_startup_args(cfg, "pi-native", pi_args),
             auto_open_conversation=auto_open_conversation,
+            policies=policies,
         )
 
     @cli.command(
