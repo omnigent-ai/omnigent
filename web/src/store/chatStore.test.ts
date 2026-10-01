@@ -12120,42 +12120,57 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     await loop;
   });
 
-  it("marks a restored draft refused when the snapshot reports a runner rejection", async () => {
-    const stableId = "e".repeat(32);
-    const before = userMessage("rejected_pre", "before the gap");
-    seedSession("conv_draft_rejected", [before]);
-    const sinks = routeStreamOpens();
-    // The snapshot carries the server's record of the rejection: it marked the
-    // session failed before answering the POST, and that answer was lost.
+  /**
+   * Serve `id`'s snapshot as failed by a runner rejection: the server records
+   * the rejection (naming `rejectedItemId` when it knows it) before answering
+   * the POST, so it is there even when that answer never reached the client.
+   */
+  function serveRunnerRejectedSnapshot(id: string, rejectedItemId?: string): void {
     const routed = fetchMock.getMockImplementation()!;
     fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
       if (
-        String(input).split("?")[0] === "/v1/sessions/conv_draft_rejected" &&
+        String(input).split("?")[0] === `/v1/sessions/${id}` &&
         (init?.method ?? "GET") === "GET"
       ) {
         return mockResponse({
-          id: "conv_draft_rejected",
+          id,
           agent_id: "agent_xyz",
           status: "failed",
           created_at: 0,
-          items: sessionSnapshots.get("conv_draft_rejected") ?? [],
+          items: sessionSnapshots.get(id) ?? [],
           last_task_error: {
             code: "runner_rejected_event",
             message: "Runner rejected the message: busy",
+            ...(rejectedItemId === undefined ? {} : { item_id: rejectedItemId }),
           },
         });
       }
       return routed(input, init);
     });
+  }
+
+  /**
+   * Restore `stableId`'s draft in `id` as ack-lost (the POST got no answer, so
+   * the client could not tell a lost refusal from a lost acknowledgement), then
+   * reconnect to a runner-rejected snapshot holding the draft's item. Returns
+   * the state right after reconciliation.
+   */
+  async function reconnectAfterRunnerRejection(
+    id: string,
+    stableId: string,
+    rejectedItemId?: string,
+  ): Promise<ReturnType<typeof useChatStore.getState>> {
+    const before = userMessage(`${id}_pre`, "before the gap");
+    seedSession(id, [before]);
+    const sinks = routeStreamOpens();
+    serveRunnerRejectedSnapshot(id, rejectedItemId);
     const controller = new AbortController();
     useChatStore.setState({
-      conversationId: "conv_draft_rejected",
+      conversationId: id,
       abortController: controller,
       blocks: itemsToBlocks([before]),
-      // The POST got no answer, so the client could not tell a lost refusal
-      // from a lost acknowledgement and restored the draft as merely ack-lost.
       restoredSendDraft: {
-        conversationId: "conv_draft_rejected",
+        conversationId: id,
         stableId,
         text: "resend me",
         files: [],
@@ -12165,29 +12180,17 @@ describe("chatStore — startStreamPump reconnect loop", () => {
       pendingRetryStableId: stableId,
     });
 
-    const loop = startStreamPump("conv_draft_rejected", controller, setState, getState);
+    const loop = startStreamPump(id, controller, setState, getState);
     await drainAsync();
     expect(sinks).toHaveLength(1);
 
-    // Persisted, then rejected by the runner: the item is in the snapshot but
-    // nothing ever ran it.
-    seedSessionItems("conv_draft_rejected", [
-      before,
-      { ...userMessage("rejected_gap", "resend me"), id: stableId },
-    ]);
+    // The item is in the snapshot either way; what differs is which message
+    // the recorded rejection names.
+    seedSessionItems(id, [before, { ...userMessage(`${id}_gap`, "resend me"), id: stableId }]);
     sinks[0]!.error();
     await drainAsync();
     expect(sinks).toHaveLength(2);
-
-    // Not delivery evidence: the draft stays and is now known refused, so no
-    // later snapshot can retract it either; the retry id is kept for the resend.
     const state = useChatStore.getState();
-    expect(state.restoredSendDraft).toMatchObject({
-      stableId,
-      delivered: false,
-      serverRefused: true,
-    });
-    expect(state.pendingRetryStableId).toBe(stableId);
     expect(state.blocks.map((b) => b.ctx.itemId)).toEqual([before.id, stableId]);
 
     const last = sinks[1]!;
@@ -12195,6 +12198,48 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     last.close();
     await drainAsync(2);
     await loop;
+    return state;
+  }
+
+  it("marks a restored draft refused when the snapshot's rejection names its item", async () => {
+    const stableId = "e".repeat(32);
+    const state = await reconnectAfterRunnerRejection("conv_draft_rejected", stableId, stableId);
+
+    // Not delivery evidence: the draft stays and is now known refused, so no
+    // later snapshot can retract it either; the retry id is kept for the resend.
+    expect(state.restoredSendDraft).toMatchObject({
+      stableId,
+      delivered: false,
+      serverRefused: true,
+    });
+    expect(state.pendingRetryStableId).toBe(stableId);
+  });
+
+  it("treats an older server's unattributed runner rejection as refusing the draft", async () => {
+    const stableId = "e".repeat(32);
+    const state = await reconnectAfterRunnerRejection("conv_draft_rejected_old", stableId);
+
+    // No item id to match against: the session-wide record stands for the draft.
+    expect(state.restoredSendDraft).toMatchObject({
+      stableId,
+      delivered: false,
+      serverRefused: true,
+    });
+    expect(state.pendingRetryStableId).toBe(stableId);
+  });
+
+  it("retracts a restored draft when the snapshot's rejection names another message", async () => {
+    const stableId = "e".repeat(32);
+    // Our send was delivered and only its acknowledgement lost; what the runner
+    // rejected was a later message, say from another tab.
+    const state = await reconnectAfterRunnerRejection(
+      "conv_draft_other_rejected",
+      stableId,
+      "f".repeat(32),
+    );
+
+    expect(state.restoredSendDraft).toMatchObject({ stableId, delivered: true });
+    expect(state.pendingRetryStableId).toBeNull();
   });
 
   it("clears the MCP startup band when its settle event fired into the reconnect gap", async () => {

@@ -6423,14 +6423,13 @@ function retractDeliveredSendDraft(
 /**
  * Reconcile a failed-send draft against a reconnect snapshot.
  *
- * A snapshot item under the draft's stable id normally proves the send was
- * delivered and only its acknowledgement lost (see `retractDeliveredSendDraft`).
- * Not when the snapshot also reports that the runner rejected the last forward
- * (`failed` with `runner_rejected_event`, persisted by the server before it
- * answers the POST): the item is then the refused attempt's trace, and the
- * refusal response may simply never have reached the client. The draft is
- * flagged `serverRefused` instead, keeping its text and retry id until a live
- * `session_input_consumed` proves a resend taken.
+ * A snapshot item under the draft's stable id proves delivery (see
+ * `retractDeliveredSendDraft`) unless the snapshot also records that the runner
+ * rejected that very item: the server persists the rejection, item id included,
+ * before answering the POST, so a refusal whose answer was lost still surfaces
+ * here. Such a draft is flagged `serverRefused` and kept, text and retry id
+ * included. Servers predating the item id record only the session-wide failure,
+ * which then stands for any draft the snapshot holds.
  *
  * @param s - The conversation's state.
  * @param itemIds - Item ids the snapshot holds.
@@ -6442,29 +6441,32 @@ function reconcileSendDraftWithSnapshot(
   itemIds: ReadonlySet<string>,
   session: Session,
 ): Partial<ChatState> {
-  const runnerRefused =
-    session.status === "failed" && session.lastTaskError?.code === "runner_rejected_event";
-  if (!runnerRefused) return retractDeliveredSendDraft(s, itemIds, "persisted");
+  const rejection =
+    session.status === "failed" && session.lastTaskError?.code === "runner_rejected_event"
+      ? session.lastTaskError
+      : null;
+  if (rejection === null) return retractDeliveredSendDraft(s, itemIds, "persisted");
+  const refused = (stableId: string | undefined): boolean =>
+    stableId !== undefined &&
+    itemIds.has(stableId) &&
+    (rejection.item_id === undefined || rejection.item_id === stableId);
   const patch: Partial<ChatState> = {};
   const failed = s.failedSendDraft;
-  if (
-    failed !== null &&
-    failed.stableId !== undefined &&
-    itemIds.has(failed.stableId) &&
-    failed.serverRefused !== true
-  ) {
+  if (failed !== null && failed.serverRefused !== true && refused(failed.stableId)) {
     patch.failedSendDraft = { ...failed, serverRefused: true };
   }
   const restored = s.restoredSendDraft;
   if (
     restored !== null &&
     !restored.delivered &&
-    itemIds.has(restored.stableId) &&
-    restored.serverRefused !== true
+    restored.serverRefused !== true &&
+    refused(restored.stableId)
   ) {
     patch.restoredSendDraft = { ...restored, serverRefused: true };
   }
-  return patch;
+  // Every other draft the snapshot holds an item for was delivered: the
+  // rejection names a different message.
+  return { ...patch, ...retractDeliveredSendDraft({ ...s, ...patch }, itemIds, "persisted") };
 }
 
 /**

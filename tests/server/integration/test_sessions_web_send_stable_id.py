@@ -209,6 +209,12 @@ async def test_runner_rejected_send_stays_persisted_without_delivery_acknowledge
     items = (await client.get(f"/v1/sessions/{session_id}/items")).json()["data"]
     assert [it["id"] for it in items if it["type"] == "message"] == [_STABLE_ID]
     assert consumed == []
+    # The snapshot records the refusal against this very item, so a client whose
+    # 503 was lost can tell its own refused send from another message's rejection.
+    snapshot = (await client.get(f"/v1/sessions/{session_id}")).json()
+    assert snapshot["status"] == "failed"
+    assert snapshot["last_task_error"]["code"] == "runner_rejected_event"
+    assert snapshot["last_task_error"]["item_id"] == _STABLE_ID
 
 
 @pytest.mark.asyncio

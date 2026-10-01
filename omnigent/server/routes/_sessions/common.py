@@ -305,6 +305,12 @@ _LAST_TASK_ERROR_CAUSE_LABEL_KEY: str = "omnigent.last_task_error_cause"
 _LAST_TASK_ERROR_REMEDIATION_LABEL_KEY: str = "omnigent.last_task_error_remediation"
 
 
+# The persisted item a ``runner_rejected_event`` failure refers to, so a client
+# whose POST answer was lost can tell its own refused send from another message's
+# rejection when the snapshot comes back. Empty for failures without an item.
+_LAST_TASK_ERROR_ITEM_ID_LABEL_KEY: str = "omnigent.last_task_error_item_id"
+
+
 _LABEL_VALUE_MAX_LEN: int = LABEL_VALUE_MAX_LEN
 
 
