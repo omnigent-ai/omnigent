@@ -57,6 +57,7 @@ def test_delivery_diagnostics(
         elapsed += seconds
 
     def ready(*args: object, **kwargs: object) -> None:
+        sleep(0.02)
         if scenario == "startup_error":
             raise RuntimeError(secret)
         if scenario == "cancelled":
@@ -64,6 +65,10 @@ def test_delivery_diagnostics(
 
     def run_tmux(socket: str, *args: str) -> None:
         nonlocal pane, enters
+        assert not any(
+            getattr(record, "event_name", "").startswith("claude_native_")
+            for record in caplog.records
+        )
         if args[0] == "paste-buffer":
             if scenario == "transport_error":
                 raise RuntimeError(secret)
@@ -119,59 +124,62 @@ def test_delivery_diagnostics(
     records = [
         r for r in caplog.records if getattr(r, "event_name", "").startswith("claude_native_")
     ]
-    assert records[0].event_name == "claude_native_delivery_started"
-    assert records[-1].event_name == "claude_native_delivery_finished"
-    assert records[-1].attributes["verification"] == verification
-    assert records[-1].attributes["outcome"] == outcome
-    assert len({r.attributes["delivery_id"] for r in records}) == 1
+    assert len(records) == 1
+    record = records[0]
+    assert record.event_name == "claude_native_delivery_finished"
+    attrs = record.attributes
+    assert attrs["verification"] == verification
+    assert attrs["outcome"] == outcome
+    assert record.levelname == (
+        "INFO" if verification == "draft_absent" and outcome == "returned" else "WARNING"
+    )
     expected_session = "bridge-session" if scenario == "session_fallback" else "child-session"
-    assert all(r.session_id == expected_session for r in records)
+    assert record.session_id == expected_session
     assert bridge._prompt_delivery_trace.get() is None
-    rows = [record_to_row(r, "harness") for r in records]
-    assert secret not in json.dumps(rows)
-    assert secret not in "\n".join(record.getMessage() for record in records)
-    assert rows[-1]["attributes"]["verification"] == verification
+    row = record_to_row(record, "harness")
+    assert secret not in json.dumps(row)
+    assert secret not in record.getMessage()
+    assert row["attributes"]["verification"] == verification
+    assert attrs["stage_waiting_for_prompt_ms"] == 20
 
     if scenario == "unknown_command":
         assert enters == 2
-        assert records[-1].attributes["attempt"] == 2
+        assert attrs["attempt"] == 2
+        attempts = json.loads(row["attributes"]["attempts"])
+        assert len(attempts) == 2
+        assert all(attempt["submit_sent"] for attempt in attempts)
+        assert all(attempt["verification"] == "draft_absent" for attempt in attempts)
 
     if scenario in {"normal", "empty_capture"}:
-        draft = next(r for r in records if r.event_name == "claude_native_draft_observed")
-        verified = next(r for r in records if r.event_name == "claude_native_submit_verification")
-        assert draft.attributes["polls"] == 1
-        assert draft.attributes["empty_captures"] == 0
-        assert draft.attributes["wait_ms"] == 0
-        assert draft.attributes["pane_rows"] == 1
-        assert draft.attributes["pane_max_columns"] == len("❯ " + secret)
-        assert verified.attributes["polls"] == 1
-        assert verified.attributes["wait_ms"] == 10
-        assert verified.attributes["pane_rows"] == (0 if scenario == "empty_capture" else 1)
-        assert verified.attributes["pane_max_columns"] == (0 if scenario == "empty_capture" else 2)
-        assert verified.attributes["capture_empty"] == (scenario == "empty_capture")
-        assert records[0].attributes["elapsed_ms"] == 0
-        assert records[-1].attributes["elapsed_ms"] == 10
+        assert attrs["draft_polls"] == 1
+        assert attrs["draft_empty_captures"] == 0
+        assert attrs["draft_wait_ms"] == 0
+        assert attrs["draft_pane_rows"] == 1
+        assert attrs["draft_pane_max_columns"] == len("❯ " + secret)
+        assert attrs["submit_polls"] == 1
+        assert attrs["submit_wait_ms"] == 10
+        assert attrs["submit_pane_rows"] == (0 if scenario == "empty_capture" else 1)
+        assert attrs["submit_pane_max_columns"] == (0 if scenario == "empty_capture" else 2)
+        assert attrs["submit_capture_empty"] == (scenario == "empty_capture")
+        assert attrs["stage_verifying_submit_ms"] == 10
+        assert attrs["elapsed_ms"] == 30
 
     if scenario == "blank_line":
-        warning = next(r for r in records if r.event_name == "claude_native_submit_unverified")
-        observed = next(r for r in records if r.event_name == "claude_native_draft_observed")
-        assert warning.levelname == "WARNING"
-        assert observed.attributes["draft_seen"] is False
-        assert observed.attributes["needle_visible_below_prompt"] is True
-        assert records[0].attributes["leading_blank_line"] is True
+        assert attrs["draft_seen"] is False
+        assert attrs["draft_needle_visible_below_prompt"] is True
+        assert attrs["leading_blank_line"] is True
+        assert attrs["submit_sent"] is True
         assert enters == 1
         assert pane == "❯ \n" + secret
     elif scenario in {"normal", "retry", "timeout", "empty_capture", "missing_glyph"}:
-        observed = next(r for r in records if r.event_name == "claude_native_submit_verification")
-        assert observed.attributes["retries"] == enters - 1
+        assert attrs["retries"] == enters - 1
         if scenario == "retry":
             assert enters == 2
-        if scenario in {"empty_capture", "missing_glyph"}:
-            assert observed.levelname == "WARNING"
     if scenario in {"startup_error", "cancelled"}:
-        assert records[-1].attributes["stage"] == "waiting_for_prompt"
+        assert attrs["stage"] == "waiting_for_prompt"
     elif scenario == "transport_error":
-        assert records[-1].attributes["stage"] == "pasting"
+        assert attrs["stage"] == "pasting"
     elif scenario.startswith("pending_"):
-        assert records[-1].attributes["stage"] == "checking_pending_prompt"
+        assert attrs["stage"] == "checking_pending_prompt"
+        assert attrs["submit_sent"] is False
         assert enters == 0

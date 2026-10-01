@@ -54,7 +54,7 @@ import time
 import urllib.parse
 from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
 from contextvars import ContextVar
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from http import HTTPStatus
 from http.client import HTTPConnection, HTTPException
@@ -3955,9 +3955,21 @@ class _PromptDeliveryTrace:
     delivery_id: str
     session_id: str | None
     started: float
+    stage_started: float
     stage: str = "lock_wait"
-    attempt: int = 0
-    verification: str = "not_started"
+    stage_seconds: dict[str, float] = field(default_factory=dict)
+    attempts: list[dict[str, object]] = field(default_factory=list)
+
+
+def _delivery_stage(stage: str) -> None:
+    trace = _prompt_delivery_trace.get()
+    if trace is not None:
+        now = time.monotonic()
+        trace.stage_seconds[trace.stage] = (
+            trace.stage_seconds.get(trace.stage, 0.0) + now - trace.stage_started
+        )
+        trace.stage = stage
+        trace.stage_started = now
 
 
 _prompt_delivery_trace: ContextVar[_PromptDeliveryTrace | None] = ContextVar(
@@ -3965,79 +3977,80 @@ _prompt_delivery_trace: ContextVar[_PromptDeliveryTrace | None] = ContextVar(
 )
 
 
-def _delivery_event(event: str, *, level: int = logging.INFO, **attributes: object) -> None:
-    """Emit content-free diagnostics to both the local log and structured sink."""
+def _delivery_details(**attributes: object) -> None:
     trace = _prompt_delivery_trace.get()
-    if trace is None or not _logger.isEnabledFor(level):
-        return
-    from omnigent.debug_logging import debug_event
-
-    fields = {
-        "delivery_id": trace.delivery_id,
-        "stage": trace.stage,
-        "attempt": trace.attempt,
-        "elapsed_ms": round((time.monotonic() - trace.started) * 1000),
-        **attributes,
-    }
-    extra = debug_event(event, session_id=trace.session_id)
-    extra["attributes"] = fields
-    _logger.log(
-        level,
-        "%s %s",
-        event,
-        json.dumps(fields, sort_keys=True),
-        extra=extra,
-    )
-
-
-def _delivery_stage(stage: str) -> None:
-    trace = _prompt_delivery_trace.get()
-    if trace is not None:
-        trace.stage = stage
-        _delivery_event("claude_native_delivery_stage")
+    if trace is not None and trace.attempts:
+        trace.attempts[-1].update(attributes)
 
 
 def _trace_user_message_delivery(function: _InjectionFunction) -> _InjectionFunction:
-    """Correlate startup, paste attempts and failures without recording user text."""
+    """Collect metadata in memory; emit one summary after the injection lock is released."""
 
     @functools.wraps(function)
     def wrapped(bridge_dir: Path, *, content: str, **kwargs: Any) -> Any:
         # Hooks import this module on every invocation; keep the sink lazy.
-        from omnigent.debug_logging import current_session_id
+        from omnigent.debug_logging import current_session_id, debug_event
 
+        started = time.monotonic()
         trace = _PromptDeliveryTrace(
             delivery_id=secrets.token_hex(8),
             session_id=current_session_id() or read_active_session_id(bridge_dir),
-            started=time.monotonic(),
+            started=started,
+            stage_started=started,
         )
         token = _prompt_delivery_trace.set(trace)
-        normalized = content.replace("\r\n", "\n").replace("\r", "\n")
+        outcome = "returned"
+        error_type = None
         try:
-            _delivery_event(
-                "claude_native_delivery_started",
-                content_bytes=len(content.encode("utf-8")),
-                newline_count=normalized.count("\n"),
-                leading_blank_line=bool(normalized) and not normalized.split("\n", 1)[0].strip(),
-            )
-            result = function(bridge_dir, content=content, **kwargs)
+            return function(bridge_dir, content=content, **kwargs)
         except BaseException as exc:
-            _delivery_event(
-                "claude_native_delivery_finished",
-                level=logging.WARNING,
-                outcome="interrupted" if isinstance(exc, ClaudeInjectionCancelled) else "error",
-                error_type=type(exc).__name__,
-                verification=trace.verification,
-            )
+            outcome = "interrupted" if isinstance(exc, ClaudeInjectionCancelled) else "error"
+            error_type = type(exc).__name__
             raise
-        else:
-            _delivery_event(
-                "claude_native_delivery_finished",
-                outcome="returned",
-                verification=trace.verification,
-            )
-            return result
         finally:
-            _prompt_delivery_trace.reset(token)
+            try:
+                _delivery_stage(trace.stage)
+                last_attempt = trace.attempts[-1] if trace.attempts else {}
+                verification = last_attempt.get("verification", "not_started")
+                uncertain = any(
+                    attempt.get("verification") != "draft_absent" for attempt in trace.attempts
+                )
+                level = logging.WARNING if outcome != "returned" or uncertain else logging.INFO
+                if _logger.isEnabledFor(level):
+                    normalized = content.replace("\r\n", "\n").replace("\r", "\n")
+                    fields = {
+                        "delivery_id": trace.delivery_id,
+                        "stage": trace.stage,
+                        "attempt": len(trace.attempts),
+                        "elapsed_ms": round((trace.stage_started - trace.started) * 1000),
+                        "content_bytes": len(content.encode("utf-8")),
+                        "newline_count": normalized.count("\n"),
+                        "leading_blank_line": bool(normalized)
+                        and not normalized.split("\n", 1)[0].strip(),
+                        "outcome": outcome,
+                        "verification": verification,
+                        **last_attempt,
+                        **{
+                            f"stage_{stage}_ms": round(seconds * 1000)
+                            for stage, seconds in trace.stage_seconds.items()
+                        },
+                    }
+                    if error_type is not None:
+                        fields["error_type"] = error_type
+                    if len(trace.attempts) > 1:
+                        fields["attempts"] = json.dumps(trace.attempts)
+                    extra = debug_event(
+                        "claude_native_delivery_finished", session_id=trace.session_id
+                    )
+                    extra["attributes"] = fields
+                    _logger.log(
+                        level,
+                        "claude_native_delivery_finished %s",
+                        json.dumps(fields),
+                        extra=extra,
+                    )
+            finally:
+                _prompt_delivery_trace.reset(token)
 
     return cast(_InjectionFunction, wrapped)
 
@@ -4230,8 +4243,7 @@ def _paste_and_submit(
     """
     trace = _prompt_delivery_trace.get()
     if trace is not None:
-        trace.attempt += 1
-        trace.verification = "not_started"
+        trace.attempts.append({"verification": "not_started", "submit_sent": False, "retries": 0})
     _delivery_stage("checking_pending_prompt")
     if has_pending_user_prompt(bridge_dir):
         raise ClaudeUserPromptPending(
@@ -4299,14 +4311,13 @@ def _paste_and_submit(
             draft_seen = True
             break
         time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
-    _delivery_event(
-        "claude_native_draft_observed",
+    _delivery_details(
         draft_seen=draft_seen,
         needle_available=bool(needle),
-        wait_ms=round((time.monotonic() - paste_wait_started) * 1000),
-        polls=polls,
-        empty_captures=empty_captures,
-        **_draft_observation(pane, needle),
+        draft_wait_ms=round((time.monotonic() - paste_wait_started) * 1000),
+        draft_polls=polls,
+        draft_empty_captures=empty_captures,
+        **{f"draft_{key}": value for key, value in _draft_observation(pane, needle).items()},
     )
     time.sleep(_PASTE_SETTLE_S)
     _delivery_stage("checking_pending_prompt")
@@ -4316,15 +4327,9 @@ def _paste_and_submit(
         )
     _delivery_stage("submitting")
     _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
-    _delivery_event("claude_native_submit_sent", draft_seen=draft_seen)
+    _delivery_details(submit_sent=True)
     if not draft_seen:
-        if trace is not None:
-            trace.verification = "unverified"
-        _delivery_event(
-            "claude_native_submit_unverified",
-            level=logging.WARNING,
-            reason="draft_not_observed",
-        )
+        _delivery_details(verification="unverified")
         # The draft was never observed, so its absence proves nothing —
         # verification would trivially "pass". Submit blind as before.
         return
@@ -4357,17 +4362,12 @@ def _report_submit_verification(
     polls: int,
     observation: _DraftObservation,
 ) -> None:
-    trace = _prompt_delivery_trace.get()
-    if trace is not None:
-        trace.verification = verification
-    _delivery_event(
-        "claude_native_submit_verification",
-        level=logging.INFO if verification == "draft_absent" else logging.WARNING,
+    _delivery_details(
         verification=verification,
-        wait_ms=round((time.monotonic() - start) * 1000),
+        submit_wait_ms=round((time.monotonic() - start) * 1000),
         retries=retries,
-        polls=polls,
-        **observation,
+        submit_polls=polls,
+        **{f"submit_{key}": value for key, value in observation.items()},
     )
 
 
@@ -4446,6 +4446,7 @@ def _verify_submit_accepted(
             _raise_if_user_prompt_pending(bridge_dir, pane)
             _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
             retries += 1
+            _delivery_details(retries=retries)
             last_enter = now
             retry_interval = min(retry_interval * 2, _SUBMIT_RETRY_MAX_INTERVAL_S)
     _report_submit_verification(
