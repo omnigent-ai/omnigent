@@ -209,7 +209,9 @@ describe("useHostFilesystem", () => {
 
 // The listing must not retry a deterministic 4xx (retries keep the query
 // pending, leaving the previous directory's rows on screen behind the
-// placeholder), but must still retry transient failures up to the cap.
+// placeholder), nor a 502/504 host-connectivity verdict (each silent retry
+// repeats the server's whole list_dir timeout behind a bare loading row),
+// but must still retry transient failures up to the cap.
 describe("shouldRetryHostFilesystem", () => {
   function withStatus(status: number): Error {
     const err = new Error(`HTTP ${status}`) as Error & { status?: number };
@@ -223,10 +225,17 @@ describe("shouldRetryHostFilesystem", () => {
     expect(shouldRetryHostFilesystem(0, withStatus(400))).toBe(false);
   });
 
+  it("never retries a host-connectivity verdict (502 dropped, 504 unresponsive)", () => {
+    // The server already waited its full list_dir window before answering
+    // 504, so retrying silently hides the failure for ~20s more.
+    expect(shouldRetryHostFilesystem(0, withStatus(504))).toBe(false);
+    expect(shouldRetryHostFilesystem(0, withStatus(502))).toBe(false);
+  });
+
   it("retries a transient 5xx up to the cap, then stops", () => {
-    expect(shouldRetryHostFilesystem(0, withStatus(502))).toBe(true);
-    expect(shouldRetryHostFilesystem(2, withStatus(502))).toBe(true);
-    expect(shouldRetryHostFilesystem(3, withStatus(502))).toBe(false);
+    expect(shouldRetryHostFilesystem(0, withStatus(500))).toBe(true);
+    expect(shouldRetryHostFilesystem(2, withStatus(500))).toBe(true);
+    expect(shouldRetryHostFilesystem(3, withStatus(500))).toBe(false);
   });
 
   it("retries a status-less error (network failure) up to the cap", () => {

@@ -127,9 +127,14 @@ async function describeListError(res: Response, path: string): Promise<string> {
  *
  * 4xx responses are deterministic (missing path, bad path, not the owner), so
  * retrying them just delays the error behind the stale placeholder listing the
- * picker keeps on screen while a query is pending. Skip retries for those and
- * let the error surface immediately; retry only transient failures (5xx,
- * network) up to the default cap, matching the untuned default's 3 retries.
+ * picker keeps on screen while a query is pending. 502/504 are verdicts the
+ * server already settled — a dropped host connection, a host-reported
+ * filesystem failure, or the host taking the server's whole ``list_dir``
+ * window (5s) without answering — so a silent retry mostly repeats a
+ * multi-second wait behind a bare loading row; surface those immediately. A
+ * gateway blip can also read as 502/504: skipping its retry trades that rare
+ * auto-recovery for bounded feedback, and re-opening the folder retries.
+ * Other 5xx and network errors retry, up to the default cap of 3.
  *
  * @param failureCount Number of failures so far (0 on the first failure).
  * @param error The thrown error; a ``FetchError`` carries the HTTP ``status``.
@@ -138,6 +143,9 @@ async function describeListError(res: Response, path: string): Promise<string> {
 export function shouldRetryHostFilesystem(failureCount: number, error: Error): boolean {
   const status = (error as FetchError).status;
   if (status !== undefined && status >= 400 && status < 500) {
+    return false;
+  }
+  if (status === 502 || status === 504) {
     return false;
   }
   return failureCount < MAX_LIST_RETRIES;
