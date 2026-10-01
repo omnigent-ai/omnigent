@@ -2487,17 +2487,27 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       // A coded error confirms refusal; a transport failure leaves delivery
       // unknown unless this retries a previously refused send.
       const answeredWithRefusal = err instanceof ApiError && err.code !== null;
-      const serverRefused = answeredWithRefusal || retriesRefusedSend;
-      // A network failure can lose only the POST's response: if the message's
-      // committed item already came back over the stream, the send was delivered
-      // and restoring a draft would repopulate the composer with a sent prompt.
+      let serverRefused = answeredWithRefusal || retriesRefusedSend;
       const draftState =
         draftSessionId === null ? get() : (setterForState(draftSessionId) ?? get());
-      // A live `session_input_consumed` for this very attempt outranks all of
-      // that: the runner took it, whatever became of the POST's answer.
-      const deliveredDespiteFailure =
-        inFlightSends.get(stableId) === true ||
-        committedItemProvesDelivery(draftState.blocks, { stableId, serverRefused });
+      // A live `session_input_consumed` for this very attempt proves the runner
+      // took it, whatever became of the POST's answer.
+      let deliveredDespiteFailure = inFlightSends.get(stableId) === true;
+      if (
+        !deliveredDespiteFailure &&
+        !serverRefused &&
+        draftSessionId !== null &&
+        hasCommittedItem(draftState.blocks, stableId)
+      ) {
+        // Only a snapshot can have put the item in the transcript, and it may
+        // predate the runner's verdict (the server persists before it forwards).
+        // The server records a rejection before answering the POST, so a fresh
+        // snapshot settles it; if that fetch fails too, the item stands as
+        // delivery, as it does on reconnect.
+        const verdict = await sendVerdictFromServer(draftSessionId, stableId);
+        if (verdict === "refused") serverRefused = true;
+        else deliveredDespiteFailure = true;
+      }
       if (
         !callerHandlesError &&
         !deliveredDespiteFailure &&
@@ -6423,17 +6433,55 @@ function retractDeliveredSendDraft(
 }
 
 /**
+ * Whether a session snapshot records the runner refusing the send `stableId`.
+ *
+ * An attributed rejection names its item and holds whatever the session is
+ * doing now; the unattributed record of a server predating the item id stands
+ * for any send, but only while the session is still `failed` by it.
+ *
+ * @param session - A session snapshot.
+ * @param stableId - The send's stable id (its persisted item id).
+ * @returns `true` when the snapshot's `runner_rejected_event` applies to it.
+ */
+function snapshotRefusesSend(session: Session, stableId: string): boolean {
+  const rejection = session.lastTaskError;
+  if (rejection?.code !== "runner_rejected_event") return false;
+  if (rejection.item_id !== undefined) return rejection.item_id === stableId;
+  return session.status === "failed";
+}
+
+/**
+ * Ask the server what became of a send whose POST got no answer.
+ *
+ * The server records a runner rejection before it answers the POST, so a
+ * snapshot fetched after the failure is conclusive where one merged during the
+ * send may not be.
+ *
+ * @param sessionId - The session the send was posted to.
+ * @param stableId - The send's stable id.
+ * @returns `"refused"` or `"delivered"`, or `null` when the fetch itself fails.
+ */
+async function sendVerdictFromServer(
+  sessionId: string,
+  stableId: string,
+): Promise<"refused" | "delivered" | null> {
+  try {
+    const session = await getSessionSlim(sessionId);
+    return snapshotRefusesSend(session, stableId) ? "refused" : "delivered";
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Reconcile a failed-send draft against a reconnect snapshot.
  *
  * A snapshot item under the draft's stable id proves delivery (see
- * `retractDeliveredSendDraft`) unless the snapshot also records that the runner
- * rejected that very item: the server persists the rejection, item id included,
- * before answering the POST, so a refusal whose answer was lost still surfaces
- * here. Such a draft is flagged `serverRefused` and kept, text and retry id
- * included. An attributed rejection speaks for its item whatever the session is
- * doing now; the unattributed record of a server predating the item id stands
- * for any draft the snapshot holds, but only while the session is still
- * `failed` by it.
+ * `retractDeliveredSendDraft`) unless the snapshot also records the runner
+ * refusing that send (see `snapshotRefusesSend`): the server persists the
+ * rejection before answering the POST, so a refusal whose answer was lost still
+ * surfaces here. Such a draft is flagged `serverRefused` and kept, text and
+ * retry id included.
  *
  * @param s - The conversation's state.
  * @param itemIds - Item ids the snapshot holds.
@@ -6445,15 +6493,11 @@ function reconcileSendDraftWithSnapshot(
   itemIds: ReadonlySet<string>,
   session: Session,
 ): Partial<ChatState> {
-  const rejection =
-    session.lastTaskError?.code === "runner_rejected_event" ? session.lastTaskError : null;
-  if (rejection === null || (rejection.item_id === undefined && session.status !== "failed")) {
+  if (session.lastTaskError?.code !== "runner_rejected_event") {
     return retractDeliveredSendDraft(s, itemIds, "persisted");
   }
   const refused = (stableId: string | undefined): boolean =>
-    stableId !== undefined &&
-    itemIds.has(stableId) &&
-    (rejection.item_id === undefined || rejection.item_id === stableId);
+    stableId !== undefined && itemIds.has(stableId) && snapshotRefusesSend(session, stableId);
   const patch: Partial<ChatState> = {};
   const failed = s.failedSendDraft;
   if (failed !== null && failed.serverRefused !== true && refused(failed.stableId)) {

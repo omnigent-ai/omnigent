@@ -5608,6 +5608,95 @@ describe("chatStore — delivered-but-unacked send", () => {
     expect(state.pendingRetryStableId).toBeNull();
   });
 
+  /**
+   * Fail the events POST on the network while a reconnect snapshot has already
+   * put the send's item in the transcript, and answer the follow-up snapshot
+   * fetch with `verdict`.
+   */
+  function failPostWithItemInTranscript(stableId: string, verdict: () => Response): void {
+    useChatStore.setState({
+      conversationId: "conv_existing",
+      abortController: new AbortController(),
+      blocks: itemsToBlocks([{ ...userMessage("persisted_mid_send", "resend me"), id: stableId }]),
+      pendingRetryStableId: stableId,
+    });
+    let posted = false;
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/v1/sessions/conv_existing/events") && init?.method === "POST") {
+        posted = true;
+        return Promise.reject(new TypeError("Failed to fetch"));
+      }
+      // Only the snapshot fetched AFTER the failed POST carries the verdict.
+      if (
+        posted &&
+        url.split("?")[0] === "/v1/sessions/conv_existing" &&
+        (init?.method ?? "GET") === "GET"
+      ) {
+        return verdict();
+      }
+      return defaultFetchHandler(input, init);
+    });
+  }
+
+  it("restores a refused draft when the mid-send snapshot predates the rejection", async () => {
+    const stableId = "a".repeat(32);
+    // The snapshot merged mid-send saw the persisted item; the runner refused
+    // it afterwards and the 503 never arrived. A fresh snapshot knows.
+    failPostWithItemInTranscript(stableId, () =>
+      mockResponse({
+        id: "conv_existing",
+        agent_id: "agent_xyz",
+        status: "failed",
+        created_at: 0,
+        items: [],
+        last_task_error: {
+          code: "runner_rejected_event",
+          message: "Runner rejected the message: busy",
+          item_id: stableId,
+        },
+      }),
+    );
+
+    await useChatStore.getState().send("resend me", "agent_xyz");
+
+    expect(useChatStore.getState().failedSendDraft).toMatchObject({
+      text: "resend me",
+      stableId,
+      serverRefused: true,
+    });
+  });
+
+  it("hands back no draft when a fresh snapshot shows the send was taken", async () => {
+    const stableId = "b".repeat(32);
+    failPostWithItemInTranscript(stableId, () =>
+      mockResponse({
+        id: "conv_existing",
+        agent_id: "agent_xyz",
+        status: "running",
+        created_at: 0,
+        items: [],
+      }),
+    );
+
+    await useChatStore.getState().send("resend me", "agent_xyz");
+
+    expect(useChatStore.getState().failedSendDraft).toBeNull();
+  });
+
+  it("lets the transcript item stand as delivery when the verdict fetch fails too", async () => {
+    const stableId = "c".repeat(32);
+    failPostWithItemInTranscript(stableId, () => {
+      throw new TypeError("Failed to fetch");
+    });
+
+    await useChatStore.getState().send("resend me", "agent_xyz");
+
+    // Same rule as on reconnect: with no refusal on record, the item is the
+    // durable trace of a lost acknowledgement.
+    expect(useChatStore.getState().failedSendDraft).toBeNull();
+  });
+
   it("mints a fresh stable id when the restored draft was edited before the resend", async () => {
     const stableId = "d".repeat(32);
     armRestoredDraft(stableId);
