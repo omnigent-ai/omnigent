@@ -34,10 +34,6 @@ re-post of the same batch (same source_ids) adds no items.
 from __future__ import annotations
 
 import asyncio
-import io
-import json
-import tarfile
-import tempfile
 import time
 from pathlib import Path
 from typing import Any
@@ -46,6 +42,7 @@ import httpx
 import pytest
 
 from tests._helpers.live_server import isolated_local_server
+from tests._helpers.native_session import create_native_session
 
 # CI shells can carry an egress proxy; every HTTP call here targets 127.0.0.1.
 _http = httpx.Client(trust_env=False)
@@ -82,49 +79,6 @@ _RESPONSE_ID = "resp-subagent-batch-timeout-test"
 # One 150 ms append per run is far inside the forwarder's 10 s timeout; 8 s
 # leaves generous headroom for a loaded CI box.
 _MAX_ELAPSED_S = 8.0
-
-
-def _create_claude_native_session(base_url: str) -> str:
-    """Create a claude-native wrapper session exactly like ``omnigent claude``.
-
-    Reuses the production spec materializer and stamps the same wrapper /
-    terminal-first labels the CLI writes, so the created session is a real
-    claude-native conversation with an agent_id (required by the sub-agent
-    start handler).
-
-    :param base_url: Spawned server base URL.
-    :returns: The new session/conversation id.
-    """
-    from omnigent._wrapper_labels import (
-        CLAUDE_NATIVE_WRAPPER_VALUE,
-        UI_MODE_LABEL_KEY,
-        UI_MODE_TERMINAL_VALUE,
-        WRAPPER_LABEL_KEY,
-    )
-    from omnigent.harnesses.claude_native.main import _materialize_claude_agent_spec
-
-    with tempfile.TemporaryDirectory() as tmp:
-        yaml_text = _materialize_claude_agent_spec(Path(tmp)).read_text()
-
-    buf = io.BytesIO()
-    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
-        data = yaml_text.encode()
-        info = tarfile.TarInfo("claude-native-ui.yaml")
-        info.size = len(data)
-        tar.addfile(info, io.BytesIO(data))
-
-    labels = {
-        UI_MODE_LABEL_KEY: UI_MODE_TERMINAL_VALUE,
-        WRAPPER_LABEL_KEY: CLAUDE_NATIVE_WRAPPER_VALUE,
-    }
-    create = _http.post(
-        f"{base_url}/v1/sessions",
-        data={"metadata": json.dumps({"labels": labels})},
-        files={"bundle": ("claude-native-ui.tar.gz", buf.getvalue(), "application/gzip")},
-        timeout=30.0,
-    )
-    create.raise_for_status()
-    return str(create.json()["session_id"])
 
 
 def _build_subagent_items(n: int) -> list[Any]:
@@ -303,7 +257,7 @@ def test_subagent_batch_100_items_completes_within_timeout(tmp_path: Path) -> No
     from omnigent.harnesses.claude_native.forwarder import _POST_TIMEOUT_S
 
     with isolated_local_server(tmp_path, bootstrap=_SERVER_BOOTSTRAP_SLOW_APPEND) as base_url:
-        parent_id = _create_claude_native_session(base_url)
+        parent_id = str(create_native_session(_http, base_url, harness="claude")["session_id"])
         child_id = asyncio.run(_setup_sessions(base_url, parent_id))
 
         items = _build_subagent_items(_BATCH_SIZE)
