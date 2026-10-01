@@ -2522,6 +2522,135 @@ async def test_resolve_agent_spec_from_server_caches_success_by_agent_version(
 
 
 @pytest.mark.asyncio
+async def test_resolve_agent_spec_from_server_rematerializes_when_contents_missing(
+    tmp_path: Path,
+) -> None:
+    """Re-extracts the bundle when the cache dir exists but config.yaml was removed.
+
+    The OS temp cleaner may remove files inside the cache dir while leaving the
+    directory entry itself, causing ``load(dest, ...)`` to raise
+    ``AgentImageConfigMissingError``.  The resolver must wipe the stale dir and
+    re-extract so the session can continue normally.
+
+    :param tmp_path: Temporary spec cache root.
+    :returns: None.
+    """
+    config_bytes = (
+        b"spec_version: 1\nname: remat-agent\nexecutor:\n  config:\n    harness: claude-sdk\n"
+    )
+    bundle_buf = io.BytesIO()
+    with tarfile.open(fileobj=bundle_buf, mode="w:gz") as tf:
+        info = tarfile.TarInfo(name="config.yaml")
+        info.size = len(config_bytes)
+        tf.addfile(info, io.BytesIO(config_bytes))
+    bundle_bytes = bundle_buf.getvalue()
+
+    fetch_count = 0
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        """Always return the valid bundle.
+
+        :param request: Incoming mocked HTTP request.
+        :returns: A mocked successful bundle response.
+        """
+        nonlocal fetch_count
+        fetch_count += 1
+        return httpx.Response(
+            200,
+            content=bundle_bytes,
+            headers={"X-Agent-Version": "3"},
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_handler),
+        base_url="http://server.test",
+    ) as client:
+        # First resolution: extracts to cache.
+        first = await _resolve_agent_spec_from_server(
+            client, tmp_path, "ag_remat", session_id="conv_rm"
+        )
+        assert first is not None
+        assert first.spec.name == "remat-agent"
+
+        # Simulate the OS temp cleaner removing config.yaml but leaving the dir.
+        cache_dir = tmp_path / "ag_remat-v3"
+        assert cache_dir.is_dir()
+        (cache_dir / "config.yaml").unlink()
+        assert not (cache_dir / "config.yaml").exists()
+
+        # Second resolution: should detect the missing file, re-fetch, and succeed.
+        second = await _resolve_agent_spec_from_server(
+            client, tmp_path, "ag_remat", session_id="conv_rm"
+        )
+
+    assert second is not None
+    assert second.spec.name == "remat-agent"
+    # The bundle was re-fetched once (first extraction + re-extraction).
+    assert fetch_count == 2
+    assert (cache_dir / "config.yaml").exists()
+
+
+@pytest.mark.asyncio
+async def test_resolve_agent_spec_from_server_rematerializes_when_whole_cache_root_removed(
+    tmp_path: Path,
+) -> None:
+    """Re-extracts when the entire cache root was removed by the OS temp cleaner.
+
+    If the OS removes the whole ``runner-specs-*`` tree, the cache dir itself
+    does not exist and the normal ``if not dest.is_dir()`` branch re-creates it.
+    This test confirms that path works end-to-end.
+
+    :param tmp_path: Temporary spec cache root.
+    :returns: None.
+    """
+    config_bytes = (
+        b"spec_version: 1\nname: remat-root\nexecutor:\n  config:\n    harness: claude-sdk\n"
+    )
+    bundle_buf = io.BytesIO()
+    with tarfile.open(fileobj=bundle_buf, mode="w:gz") as tf:
+        info = tarfile.TarInfo(name="config.yaml")
+        info.size = len(config_bytes)
+        tf.addfile(info, io.BytesIO(config_bytes))
+    bundle_bytes = bundle_buf.getvalue()
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        """Always return the valid bundle.
+
+        :param request: Incoming mocked HTTP request.
+        :returns: A mocked successful bundle response.
+        """
+        return httpx.Response(
+            200,
+            content=bundle_bytes,
+            headers={"X-Agent-Version": "1"},
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_handler),
+        base_url="http://server.test",
+    ) as client:
+        # First resolution: populate cache.
+        first = await _resolve_agent_spec_from_server(
+            client, tmp_path, "ag_rmroot", session_id="conv_rr"
+        )
+        assert first is not None
+
+        # Simulate the OS removing the entire cache root.
+        import shutil
+
+        shutil.rmtree(tmp_path)
+        assert not tmp_path.exists()
+
+        # Second resolution: the cache dir no longer exists; must re-create.
+        second = await _resolve_agent_spec_from_server(
+            client, tmp_path, "ag_rmroot", session_id="conv_rr"
+        )
+
+    assert second is not None
+    assert second.spec.name == "remat-root"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("status_code", [401, 403, 500, 502])
 async def test_resolve_agent_spec_from_server_raises_for_non_404_errors(
     tmp_path: Path,

@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import dataclasses
+import errno
 import functools
 import itertools
 import json
@@ -437,6 +438,42 @@ async def _get_server_version(server_client: httpx.AsyncClient) -> str | None:
             extra={"session_id": runner_primary_session_id()},
         )
     return _server_version
+
+
+def _format_oserror(exc: BaseException) -> str:
+    """Format an exception for user-visible turn-failure messages.
+
+    :class:`OSError` subclasses already include the failing path in
+    ``str(exc)`` when ``filename`` was set at construction time. When it
+    was not — the case for ``os.getcwd()`` / ``asyncio.create_subprocess_exec``
+    on Python < 3.12 when the process cwd was deleted — the raw ``str(exc)``
+    has no path, giving the user ``[Errno 2] No such file or directory`` with
+    no indication of what was missing.  Append the current cwd (or note it is
+    inaccessible) so operators can identify the deleted workspace.
+
+    Only ENOENT (errno 2) errors are augmented; other path-less OSErrors (e.g.
+    ``PermissionError``) are returned as-is because cwd context would mislead.
+
+    :param exc: The exception to format.
+    :returns: ``str(exc)`` (or ``repr(exc)`` when ``str`` is empty) for
+        non-OSError exceptions; for path-less ENOENT errors the string is
+        augmented with the cwd or a note that it is gone.
+    """
+    if (
+        isinstance(exc, OSError)
+        and exc.errno == errno.ENOENT
+        and exc.filename is None
+        and exc.filename2 is None
+    ):
+        base = str(exc)
+        if not base:
+            return repr(exc)
+        try:
+            cwd = os.getcwd()
+            return f"{base} (runner cwd: {cwd!r})"
+        except OSError:
+            return f"{base} (runner cwd: deleted or inaccessible)"
+    return str(exc) or repr(exc)
 
 
 def _client_safe_error_detail(exc: BaseException, *, context: str) -> str:
@@ -7279,7 +7316,9 @@ def create_runner_app(
                     exc_info=True,
                     extra={"session_id": conv},
                 )
-                _on_proxy_stream_end(conv, error={"message": f"turn setup failed: {exc}"})
+                _on_proxy_stream_end(
+                    conv, error={"message": f"turn setup failed: {_format_oserror(exc)}"}
+                )
                 raise
             except Exception as exc:
                 _logger.error(
@@ -7289,7 +7328,9 @@ def create_runner_app(
                     exc_info=True,
                     extra={"session_id": conv},
                 )
-                _on_proxy_stream_end(conv, error={"message": f"turn setup failed: {exc}"})
+                _on_proxy_stream_end(
+                    conv, error={"message": f"turn setup failed: {_format_oserror(exc)}"}
+                )
             finally:
                 # Permanent-wedge floor: guarantee _active_turns is never left stale,
                 # however the body exits — including a BaseException that escapes

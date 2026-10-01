@@ -377,6 +377,12 @@ class ExecutorAdapter(HarnessApp):
                                 remediation=event.remediation,
                                 undelivered=event.undelivered,
                             )
+                        _logger.warning(
+                            "inner executor error for session %s: %s",
+                            self._session_key,
+                            detail,
+                            extra={"session_id": self._session_key},
+                        )
                         raise RuntimeError(f"inner executor error: {detail}")
         except ElicitationDeclinedError:
             # Fallback for non-SDK executors; SDK-based paths use ctx.cancelled.set() instead.
