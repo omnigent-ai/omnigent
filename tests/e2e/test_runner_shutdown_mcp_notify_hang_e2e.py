@@ -33,13 +33,11 @@ readiness wait and the runner exits promptly.
 from __future__ import annotations
 
 import contextlib
-import io
 import os
 import secrets
 import signal
 import subprocess
 import sys
-import tarfile
 import textwrap
 import time
 from collections.abc import Iterator
@@ -48,7 +46,7 @@ from pathlib import Path
 import httpx
 import pytest
 
-from tests._helpers.session import bind_session_runner, post_session_bundle
+from tests._helpers.session import bind_session_runner, bundle_files, post_session_bundle
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -132,13 +130,7 @@ def _create_hermes_session(base_url: str, runner_id: str) -> str:
         f"  model: stub-model\n"
         f"  harness: hermes\n"
     )
-    with io.BytesIO() as buf:
-        with tarfile.open(fileobj=buf, mode="w:gz") as tar:
-            payload = agent_yaml.encode()
-            info = tarfile.TarInfo(f"{agent_name}.yaml")
-            info.size = len(payload)
-            tar.addfile(info, io.BytesIO(payload))
-        bundle = buf.getvalue()
+    bundle = bundle_files({f"{agent_name}.yaml": agent_yaml.encode()})
 
     create = post_session_bundle(_client.post, f"{base_url}/v1/sessions", bundle, timeout=30.0)
     create.raise_for_status()
