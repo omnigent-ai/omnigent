@@ -46,27 +46,19 @@ class _SDKClient:
 
 def _sdk_types():
     """Fresh stand-in message types and option container for one scenario."""
-    return type(
-        "SDKTypes",
-        (),
-        {
-            name: type(name, (), {})
-            for name in (
-                "AssistantMessage",
-                "UserMessage",
-                "SystemMessage",
-                "ResultMessage",
-                "StreamEvent",
-            )
-        }
-        | {
-            "ClaudeAgentOptions": type(
-                "ClaudeAgentOptions",
-                (),
-                {"__init__": lambda self, **kwargs: self.__dict__.update(kwargs)},
-            )
-        },
-    )
+
+    class SDKTypes:
+        AssistantMessage = type("AssistantMessage", (), {})
+        UserMessage = type("UserMessage", (), {})
+        SystemMessage = type("SystemMessage", (), {})
+        ResultMessage = type("ResultMessage", (), {})
+        StreamEvent = type("StreamEvent", (), {})
+
+        class ClaudeAgentOptions:
+            def __init__(self, **kwargs):
+                self.__dict__.update(kwargs)
+
+    return SDKTypes
 
 
 class _SDKTools:
