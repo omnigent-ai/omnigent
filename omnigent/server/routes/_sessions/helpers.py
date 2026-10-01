@@ -3593,12 +3593,9 @@ async def _publish_session_created(
         parent_session_id=parent_id,
     )
     session_stream.publish(parent_id, event.model_dump())
-    # Native-harness sub-agents (claude Task tool, codex, antigravity, devin)
-    # are minted here, not through the general create path's ``session_created``
-    # logger, so emit the same creation marker with the parent link — this is
-    # what lets a debug-log query join these children back to their parent.
-    # A bare log (no request-scope mutation): this runs in the parent's
-    # forwarder/relay context, not the child's.
+    # Native-harness sub-agents are minted outside the general create path's
+    # ``session_created`` logger, so emit the join key here. Log the child
+    # explicitly without rebinding the parent relay's request scope.
     _logger.info(
         "Sub-agent session created",
         extra=debug_event(

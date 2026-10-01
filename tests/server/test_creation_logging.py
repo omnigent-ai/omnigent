@@ -109,9 +109,19 @@ async def test_session_created_logs_parent_session_id_for_child(
     agent = await create_test_agent(client, name="parent-link-test")
     agent_id = agent["id"]
 
-    parent = await client.post("/v1/sessions", json={"agent_id": agent_id})
+    with capture_debug_rows("server") as parent_rows:
+        parent = await client.post("/v1/sessions", json={"agent_id": agent_id})
     assert parent.status_code == 201
     parent_id = parent.json()["id"]
+    # A top-level session has no parent, so the attribute is omitted entirely
+    # (null-valued attributes are dropped at the sink) — absence means no parent.
+    parent_created = [
+        row
+        for row in parent_rows
+        if row["event_name"] == "session_created" and row["session_id"] == parent_id
+    ]
+    assert len(parent_created) == 1
+    assert "parent_session_id" not in parent_created[0]["attributes"]
 
     with capture_debug_rows("server") as rows:
         child = await client.post(
@@ -147,8 +157,15 @@ async def test_publish_session_created_logs_parent_link_for_native_subagent() ->
     store = MagicMock()
     store.get_conversation.return_value = None
 
-    with capture_debug_rows("server") as rows:
-        await _publish_session_created("conv_parent", "conv_child", "ag_abc", store)
+    # Bind the parent's ambient session scope; the native-path log must identify
+    # the child without rebinding it (it runs in the parent's relay context).
+    debug_logging.set_current_session_id("conv_parent")
+    try:
+        with capture_debug_rows("server") as rows:
+            await _publish_session_created("conv_parent", "conv_child", "ag_abc", store)
+        assert debug_logging.current_session_id() == "conv_parent"
+    finally:
+        debug_logging.set_current_session_id(None)
 
     created = [
         row
@@ -157,6 +174,51 @@ async def test_publish_session_created_logs_parent_link_for_native_subagent() ->
     ]
     assert len(created) == 1
     assert created[0]["attributes"]["parent_session_id"] == "conv_parent"
+
+
+@pytest.mark.asyncio
+async def test_bundle_child_creation_logs_parent_session_id(
+    client: httpx.AsyncClient,
+) -> None:
+    """A multipart (bundled) child create forwards its parent link too.
+
+    The multipart path persists ``metadata.parent_session_id`` but has its own
+    ``session_created`` caller, so it must forward the parent id just like the
+    JSON path.
+    """
+    import json
+
+    from tests.server.helpers import build_agent_bundle
+
+    agent = await create_test_agent(client, name="bundle-parent-link")
+    parent = await client.post("/v1/sessions", json={"agent_id": agent["id"]})
+    assert parent.status_code == 201
+    parent_id = parent.json()["id"]
+
+    with capture_debug_rows("server") as rows:
+        child = await client.post(
+            "/v1/sessions",
+            files={
+                "metadata": (None, json.dumps({"parent_session_id": parent_id})),
+                "bundle": (
+                    "agent.tar.gz",
+                    build_agent_bundle("bundle-child"),
+                    "application/gzip",
+                ),
+            },
+        )
+    assert child.status_code == 201
+    # The multipart create returns CreatedSessionResponse (session_id), not the
+    # JSON path's SessionResponse (id).
+    child_id = child.json()["session_id"]
+
+    created = [
+        row
+        for row in rows
+        if row["event_name"] == "session_created" and row["session_id"] == child_id
+    ]
+    assert len(created) == 1
+    assert created[0]["attributes"]["parent_session_id"] == parent_id
 
 
 @pytest.mark.asyncio
