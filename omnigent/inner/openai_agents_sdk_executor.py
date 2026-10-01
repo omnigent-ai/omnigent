@@ -1858,17 +1858,19 @@ class OpenAIAgentsSDKExecutor(Executor):
             # TOTAL input count *including* cached tokens, whereas
             # ``compute_llm_cost`` expects Anthropic semantics where
             # ``input_tokens`` is the non-cached portion and
-            # ``cache_read_input_tokens`` is additive. Extract cached
-            # tokens from ``prompt_tokens_details.cached_tokens`` and
-            # subtract so downstream billing uses the cheaper cache rate.
+            # ``cache_read_input_tokens`` is additive. Cached tokens live on the
+            # SDK's ``Usage.input_tokens_details`` (its only cache field; the Chat
+            # Completions shape is normalized into it), so subtract them here.
             cached_tok = 0
             for r in raw_responses:
-                details = getattr(r.usage, "prompt_tokens_details", None)
+                details = getattr(r.usage, "input_tokens_details", None)
                 if details is not None:
                     cached = getattr(details, "cached_tokens", None)
                     if cached is None and isinstance(details, dict):
                         cached = details.get("cached_tokens")
                     cached_tok += cached or 0
+            # Clamp so a malformed cached > input never makes input_tokens negative.
+            cached_tok = min(cached_tok, in_tok)
             last_r = raw_responses[-1]
             last_in = getattr(last_r.usage, "input_tokens", 0) or 0
             last_out = getattr(last_r.usage, "output_tokens", 0) or 0
