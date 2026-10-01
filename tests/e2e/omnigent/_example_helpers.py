@@ -286,7 +286,7 @@ def validate_agent_def_structure(
 import json
 import sys
 sys.path.insert(0, {str(omnigent_repo_root)!r})
-from omnigent.inner.loader import load_agent_def_from_path
+from omnigent.core.loader import load_agent_def_from_path
 
 agent_def = load_agent_def_from_path({str(yaml_path)!r})
 assert agent_def is not None, "load returned None"

@@ -8,14 +8,14 @@ import secrets
 from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel
 
-from omnigent.harness_aliases import canonicalize_harness
+from omnigent.harnesses.aliases import canonicalize_harness
 from omnigent.host.frames import HostSkillsFrame, HostSkillsResultFrame, encode_host_frame
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.auth import LEVEL_EDIT, AuthProvider
 from omnigent.server.host_registry import HostConnection, HostRegistry
 from omnigent.server.routes._auth_helpers import require_access_and_level, require_user
 from omnigent.server.routes._host_launch import host_absent_error, resolve_host_owner
-from omnigent.server.routes._session_create_validation import validate_session_agent
+from omnigent.server.routes.sessions.create_validation import validate_session_agent
 from omnigent.server.schemas import SkillSummary
 from omnigent.spec.types import AgentSpec
 from omnigent.stores import AgentStore, ConversationStore

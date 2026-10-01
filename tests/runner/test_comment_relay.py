@@ -27,13 +27,13 @@ import httpx
 import pytest
 from fastapi import FastAPI
 
+from omnigent.core.datamodel import TerminalEnvSpec
 from omnigent.entities.session_resources import SessionResourceView, terminal_resource_view
 from omnigent.harnesses.claude_native.bridge import (
     BRIDGE_ID_LABEL_KEY,
     bridge_dir_for_bridge_id,
     prepare_bridge_dir,
 )
-from omnigent.inner.datamodel import TerminalEnvSpec
 from omnigent.runner import create_runner_app
 from omnigent.spec.types import AgentSpec, ToolsConfig
 from omnigent.terminals import TerminalListEntry

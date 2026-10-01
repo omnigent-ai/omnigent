@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-from omnigent.harness_aliases import is_native_harness
-from omnigent.harness_capabilities import AuthModel, HarnessCapabilities, IntegrationMode, Resume
-from omnigent.harness_plugins import (
+from omnigent.harnesses.aliases import is_native_harness
+from omnigent.harnesses.capabilities import AuthModel, HarnessCapabilities, IntegrationMode, Resume
+from omnigent.harnesses.registry import (
     harness_aliases,
     harness_capabilities,
     harness_install_keys,

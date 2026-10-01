@@ -47,7 +47,7 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
-from omnigent.process_logging import data_dir
+from omnigent.observability.process_logging import data_dir
 
 # Env-var override for the persistent state root. Reserved for tests
 # (and for advanced users who want to put state on a non-default

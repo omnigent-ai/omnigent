@@ -14,7 +14,7 @@ from unittest.mock import MagicMock, patch
 import click
 import pytest
 
-from omnigent.cli import _build_external_routing_client, _build_local_llm_routing_client
+from omnigent.cli.commands import _build_external_routing_client, _build_local_llm_routing_client
 from omnigent.server.smart_routing import ExternalRoutingClient, LLMRoutingClient
 
 

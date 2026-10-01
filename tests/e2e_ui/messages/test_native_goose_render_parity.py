@@ -7,7 +7,7 @@ the SAME canonical transcript the TUI prints. A native forwarder
 (:mod:`omnigent.harnesses.goose_native.forwarder`) tails Goose's SQLite session store and
 mirrors the transcript back OUT as conversation items; web-composer messages are
 injected INTO the TUI's tmux pane by
-:class:`omnigent.inner.goose_native_executor.GooseNativeExecutor`. This suite is
+:class:`omnigent.harnesses.goose_native.executor.GooseNativeExecutor`. This suite is
 the goose sibling of ``test_native_cursor_render_parity`` and asserts the same
 three properties:
 

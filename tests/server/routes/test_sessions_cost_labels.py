@@ -26,11 +26,6 @@ from fastapi.responses import JSONResponse
 from fastapi.testclient import TestClient
 
 from omnigent.errors import OmnigentError
-from omnigent.runner.identity import (
-    OMNIGENT_INTERNAL_WS_ORIGIN,
-    RUNNER_TUNNEL_TOKEN_HEADER,
-    token_bound_runner_id,
-)
 from omnigent.server.auth import LEVEL_EDIT, LEVEL_OWNER, UnifiedAuthProvider
 from omnigent.server.routes.sessions import create_sessions_router
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
@@ -40,6 +35,11 @@ from omnigent.stores.conversation_store.sqlalchemy_store import (
 )
 from omnigent.stores.permission_store.sqlalchemy_store import (
     SqlAlchemyPermissionStore,
+)
+from omnigent.util.runner_identity import (
+    OMNIGENT_INTERNAL_WS_ORIGIN,
+    RUNNER_TUNNEL_TOKEN_HEADER,
+    token_bound_runner_id,
 )
 
 ALICE = "alice@example.com"

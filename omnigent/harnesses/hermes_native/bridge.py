@@ -11,7 +11,7 @@ in both surfaces).
 When Omnigent policies are configured the runner writes a per-session
 ``HERMES_HOME`` with a ``pre_tool_call`` hook (via :func:`write_policy_hook_config`)
 that evaluates tool calls against the Omnigent policy engine — the same hook used
-by the headless ``hermes`` harness (:mod:`omnigent.inner.hermes_executor`). The
+by the headless ``hermes`` harness (:mod:`omnigent.harnesses.hermes.executor`). The
 ``HERMES_HOME`` env var in :func:`build_hermes_native_spawn_env` points the TUI at
 this per-session dir so the hook fires alongside Hermes' own approval prompt.
 
@@ -40,8 +40,8 @@ import uuid
 from pathlib import Path
 from typing import TypeAlias
 
-from omnigent._platform import stable_user_id
-from omnigent.native.input_ready import PaneSettledProbe
+from omnigent.harnesses.native.input_ready import PaneSettledProbe
+from omnigent.util.portability import stable_user_id
 
 _logger = logging.getLogger(__name__)
 
@@ -250,7 +250,7 @@ def build_hermes_native_spawn_env(session_id: str) -> dict[str, str]:
     """Build the ``HARNESS_HERMES_NATIVE_*`` env the harness executor reads.
 
     Publishes the per-session bridge dir so the
-    :class:`~omnigent.inner.hermes_native_executor.HermesNativeExecutor` can find
+    :class:`~omnigent.harnesses.hermes_native.executor.HermesNativeExecutor` can find
     the tmux target advertised by the runner. If a per-session ``HERMES_HOME``
     was written by :func:`write_policy_hook_config`, the env includes
     ``HERMES_HOME`` so the TUI picks up the policy hook.
@@ -301,7 +301,7 @@ _MCP_BRIDGE_CONFIG_FILE = "bridge.json"
 
 def _policy_hook_script_path() -> str:
     """Absolute path to the shipped hook entrypoint, resolved from its module."""
-    from omnigent.inner import hermes_policy_hook
+    from omnigent.harnesses.hermes import policy_hook as hermes_policy_hook
 
     return str(Path(hermes_policy_hook.__file__).resolve())
 
@@ -351,7 +351,7 @@ def write_policy_hook_config(
     # Wrapper shell script: sets env vars and execs the Python hook. It bakes a
     # one-shot auth token + workspace-routing header, so it is owner-only
     # (0o700) — the secret is never world-readable.
-    from omnigent.native.native_policy_hook import policy_hook_wrapper_script
+    from omnigent.harnesses.native.policy_hook import policy_hook_wrapper_script
 
     wrapper = hermes_home / "omnigent-policy-hook.sh"
     wrapper.write_text(policy_hook_wrapper_script(server_url, session_id, hook_script_path))
@@ -447,7 +447,7 @@ def inject_relay_into_policy_hook(
         return False
 
     hook_script_path = _policy_hook_script_path()
-    from omnigent.native.native_policy_hook import _RELAY_TOKEN_ENV, _RELAY_URL_ENV
+    from omnigent.harnesses.native.policy_hook import _RELAY_TOKEN_ENV, _RELAY_URL_ENV
 
     new_text = (
         "#!/bin/sh\n"

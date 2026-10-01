@@ -8,7 +8,7 @@ import logging
 import pytest
 from websockets.exceptions import ConnectionClosedOK
 
-from omnigent.debug_logging import record_to_row
+from omnigent.observability.debug_logging import record_to_row
 from omnigent.runner import _entry
 
 

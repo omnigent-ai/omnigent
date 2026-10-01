@@ -16,9 +16,9 @@ from pathlib import Path
 
 import pytest
 
-from omnigent.runner.identity import RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR
 from omnigent.runner.mcp_manager import RunnerMcpManager
 from omnigent.spec.types import AgentSpec, MCPServerConfig
+from omnigent.util.runner_identity import RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR
 
 _ECHO_SERVER = str(Path(__file__).parent / "fixtures" / "echo_stdio_mcp_server.py")
 _ENV_PROBE_SERVER = str(Path(__file__).parent / "fixtures" / "env_probe_stdio_mcp_server.py")

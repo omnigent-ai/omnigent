@@ -31,12 +31,30 @@ import click
 import httpx
 import yaml
 
-from omnigent._platform import resolve_cli_binary
-from omnigent._runner_startup import RunnerStartupProgress, runner_startup_progress
-from omnigent._wrapper_labels import CURSOR_NATIVE_WRAPPER_VALUE as _WRAPPER_LABEL_VALUE
-from omnigent._wrapper_labels import WRAPPER_LABEL_KEY as _WRAPPER_LABEL_KEY
-from omnigent.conversation_browser import conversation_url, open_conversation_link_if_enabled
+from omnigent.cli.conversation_browser import conversation_url, open_conversation_link_if_enabled
+from omnigent.cli.runner_startup import RunnerStartupProgress, runner_startup_progress
 from omnigent.entities.session_resources import terminal_resource_id
+from omnigent.harnesses.native.coding_agents import native_shell_terminal_spec
+from omnigent.harnesses.native.resume_hint import (
+    echo_native_cold_resume_hint,
+    echo_native_resume_hint,
+)
+from omnigent.harnesses.native.terminal import (
+    DAEMON_HOST_ONLINE_TIMEOUT_S as _DAEMON_HOST_ONLINE_TIMEOUT_S,
+)
+from omnigent.harnesses.native.terminal import (
+    DAEMON_RUNNER_ONLINE_TIMEOUT_S as _DAEMON_RUNNER_ONLINE_TIMEOUT_S,
+)
+from omnigent.harnesses.native.terminal import (
+    DAEMON_TERMINAL_READY_TIMEOUT_S as _DAEMON_TERMINAL_READY_TIMEOUT_S,
+)
+from omnigent.harnesses.native.terminal import bind_session_runner as _bind_session_runner
+from omnigent.harnesses.native.terminal import (
+    normalize_extra_args as _normalize_extra_args,
+)
+from omnigent.harnesses.native.terminal import url_component
+from omnigent.harnesses.wrapper_labels import CURSOR_NATIVE_WRAPPER_VALUE as _WRAPPER_LABEL_VALUE
+from omnigent.harnesses.wrapper_labels import WRAPPER_LABEL_KEY as _WRAPPER_LABEL_KEY
 from omnigent.host.daemon_launch import (
     error_text,
     launch_or_reuse_daemon_runner,
@@ -44,25 +62,7 @@ from omnigent.host.daemon_launch import (
     wait_for_host_online,
     wait_for_runner_online,
 )
-from omnigent.native._native_resume_hint import (
-    echo_native_cold_resume_hint,
-    echo_native_resume_hint,
-)
-from omnigent.native.native_coding_agents import native_shell_terminal_spec
-from omnigent.native.native_terminal import (
-    DAEMON_HOST_ONLINE_TIMEOUT_S as _DAEMON_HOST_ONLINE_TIMEOUT_S,
-)
-from omnigent.native.native_terminal import (
-    DAEMON_RUNNER_ONLINE_TIMEOUT_S as _DAEMON_RUNNER_ONLINE_TIMEOUT_S,
-)
-from omnigent.native.native_terminal import (
-    DAEMON_TERMINAL_READY_TIMEOUT_S as _DAEMON_TERMINAL_READY_TIMEOUT_S,
-)
-from omnigent.native.native_terminal import bind_session_runner as _bind_session_runner
-from omnigent.native.native_terminal import (
-    normalize_extra_args as _normalize_extra_args,
-)
-from omnigent.native.native_terminal import url_component
+from omnigent.util.portability import resolve_cli_binary
 
 _logger = logging.getLogger(__name__)
 
@@ -184,30 +184,30 @@ def resolve_cursor_executable(
 
 
 def build_cursor_launch(
-    cursor_args: Sequence[str],
+    extra_args: Sequence[str],
     *,
     env: Mapping[str, str] | None = None,
     which: Callable[[str], str | None] | None = None,
 ) -> NativeCursorLaunch:
     """Build the argv for a native Cursor process."""
     executable = resolve_cursor_executable(env=env, which=which)
-    return NativeCursorLaunch(executable=executable, argv=[executable, *cursor_args])
+    return NativeCursorLaunch(executable=executable, argv=[executable, *extra_args])
 
 
 def _inject_mode_arg(
-    cursor_args: tuple[str, ...],
+    extra_args: tuple[str, ...],
     mode: str | None,
 ) -> tuple[str, ...]:
-    """Return *cursor_args* with ``--mode <mode>`` prepended when appropriate.
+    """Return *extra_args* with ``--mode <mode>`` prepended when appropriate.
 
     No-op when *mode* is ``None`` or ``--mode`` / ``--plan`` is already present
-    in *cursor_args* (user-supplied value wins).
+    in *extra_args* (user-supplied value wins).
     """
     if mode is None:
-        return cursor_args
-    if any(arg in ("--mode", "--plan") or arg.startswith("--mode=") for arg in cursor_args):
-        return cursor_args
-    return ("--mode", mode, *cursor_args)
+        return extra_args
+    if any(arg in ("--mode", "--plan") or arg.startswith("--mode=") for arg in extra_args):
+        return extra_args
+    return ("--mode", mode, *extra_args)
 
 
 _CURSOR_MODEL_LINE_RE = re.compile(r"^(?P<id>\S+)\s+-\s+(?P<name>.+?)(?:\s+\((?P<tags>[^)]*)\))?$")
@@ -319,7 +319,6 @@ def run_cursor_native(
     server: str | None,
     session_id: str | None,
     extra_args: tuple[str, ...] | None = None,
-    cursor_args: tuple[str, ...] | None = None,
     resume_picker: bool = False,
     model: str | None = None,
     auto_open_conversation: bool = False,
@@ -330,7 +329,7 @@ def run_cursor_native(
 
     :param server: Resolved Omnigent server URL.
     :param session_id: Optional existing Omnigent conversation id.
-    :param cursor_args: Raw cursor-agent CLI args to persist for the runner-owned TUI.
+    :param extra_args: Raw cursor-agent CLI args to persist for the runner-owned TUI.
     :param resume_picker: ``True`` runs the cursor-native picker.
     :param model: Optional Cursor model id persisted as the session
         ``model_override`` (the runner applies it as ``--model``), e.g.
@@ -338,19 +337,17 @@ def run_cursor_native(
     :param auto_open_conversation: When ``True``, open the browser
         conversation URL after launch.
     :param mode: Optional cursor-agent execution mode (``"plan"`` or ``"ask"``).
-        Injected as ``--mode <mode>`` unless already present in *cursor_args*.
+        Injected as ``--mode <mode>`` unless already present in *extra_args*.
     :returns: None after the terminal attach session ends.
     """
-    cursor_args = _normalize_extra_args(
-        extra_args=extra_args, legacy_args=cursor_args, legacy_param="cursor_args"
-    )
+    extra_args = _normalize_extra_args(extra_args)
     _preflight_local_tools()
     if server is None:
         raise click.ClickException(
             "Cursor requires a resolved Omnigent server URL. The CLI should call "
             "_ensure_backend before run_cursor_native."
         )
-    effective_cursor_args = _inject_mode_arg(cursor_args, mode)
+    effective_cursor_args = _inject_mode_arg(extra_args, mode)
     with TemporaryDirectory(prefix="omnigent-cursor-native-") as tmpdir:
         spec_path = _materialize_cursor_agent_spec(Path(tmpdir))
         _run_with_remote_server(
@@ -358,7 +355,7 @@ def run_cursor_native(
             spec_path,
             session_id=session_id,
             resume_picker=resume_picker,
-            cursor_args=effective_cursor_args,
+            extra_args=effective_cursor_args,
             model=model,
             auto_open_conversation=auto_open_conversation,
         )
@@ -399,7 +396,7 @@ def _run_with_remote_server(
     *,
     session_id: str | None,
     resume_picker: bool,
-    cursor_args: tuple[str, ...],
+    extra_args: tuple[str, ...],
     model: str | None = None,
     auto_open_conversation: bool = False,
 ) -> None:
@@ -410,12 +407,12 @@ def _run_with_remote_server(
     :param spec_path: Generated Cursor wrapper agent spec.
     :param session_id: Optional existing Omnigent session id.
     :param resume_picker: When ``True``, run the cursor-native picker.
-    :param cursor_args: Raw cursor-agent CLI args.
+    :param extra_args: Raw cursor-agent CLI args.
     :param model: Optional Cursor model id persisted as ``model_override``.
     :param auto_open_conversation: Whether to open the web conversation URL.
     """
-    from omnigent.chat import _bundle_agent, _remote_headers
-    from omnigent.cli import _ensure_host_daemon
+    from omnigent.cli.chat import _bundle_agent, _remote_headers
+    from omnigent.cli.commands import _ensure_host_daemon
     from omnigent.host.identity import load_or_create_host_identity
 
     headers = _remote_headers(server_url=base_url, host_id=None)
@@ -440,7 +437,7 @@ def _run_with_remote_server(
                     headers=headers,
                     session_id=resolved_session_id,
                     session_bundle=bundle,
-                    cursor_args=cursor_args,
+                    extra_args=extra_args,
                     model=model,
                     host_id=host_id,
                     workspace=str(Path.cwd().resolve()),
@@ -486,7 +483,7 @@ async def _prepare_cursor_terminal_via_daemon(
     headers: dict[str, str],
     session_id: str | None,
     session_bundle: bytes | None,
-    cursor_args: tuple[str, ...],
+    extra_args: tuple[str, ...],
     model: str | None = None,
     host_id: str,
     workspace: str,
@@ -499,7 +496,7 @@ async def _prepare_cursor_terminal_via_daemon(
         ``model_override`` (the runner applies it as ``--model``).
     :returns: Prepared terminal details for attaching.
     """
-    persist_args = list(cursor_args)
+    persist_args = list(extra_args)
     timeout = httpx.Timeout(30.0, read=120.0)
     async with open_daemon_client(base_url, headers, host_id, timeout=timeout) as client:
         # Resuming an existing session can either reattach to a live

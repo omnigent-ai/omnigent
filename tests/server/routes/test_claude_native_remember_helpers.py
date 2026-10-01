@@ -15,11 +15,11 @@ tests pin the gating and URL-parsing edge cases directly.
 from __future__ import annotations
 
 from omnigent.policies.builtins.safety import NATIVE_WRITE_TOOLS
-from omnigent.server.routes._sessions.common import _CLAUDE_NATIVE_EDIT_TOOLS
 from omnigent.server.routes.sessions import (
     _allow_remember_eligible,
     _claude_native_remember_host,
 )
+from omnigent.server.routes.sessions.common import _CLAUDE_NATIVE_EDIT_TOOLS
 
 
 def test_policy_write_tool_set_matches_server() -> None:

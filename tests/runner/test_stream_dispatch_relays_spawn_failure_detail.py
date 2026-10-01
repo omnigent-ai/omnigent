@@ -34,8 +34,8 @@ import httpx
 import pytest
 from fastapi import FastAPI
 
+from omnigent.harnesses.runtime.process_manager import HarnessProcessManager
 from omnigent.runner import create_runner_app
-from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
 from tests.runner.conftest import _runner_client
 from tests.runner.helpers import NullServerClient
 

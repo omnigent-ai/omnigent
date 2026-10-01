@@ -144,7 +144,7 @@ def test_list_item_embeds_viewer_read_state() -> None:
 def test_list_item_reports_a_booting_session_as_running() -> None:
     """A parked first message or an in-flight dispatch reads as ``running``."""
     from omnigent.runtime import pending_inputs
-    from omnigent.server.routes._sessions import orchestration
+    from omnigent.server.routes.sessions import orchestration
 
     conv = _make_conversation("conv_boot")
     assert _build_item("u1", conv).status == "idle"  # type: ignore[attr-defined]

@@ -36,7 +36,7 @@ import psutil
 import pytest
 import yaml
 
-from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN, token_bound_runner_id
+from omnigent.util.runner_identity import OMNIGENT_INTERNAL_WS_ORIGIN, token_bound_runner_id
 from tests.e2e._harness_probes import cli_unavailable_reason
 from tests.e2e.conftest import (
     configure_mock_llm,

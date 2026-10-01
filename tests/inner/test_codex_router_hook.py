@@ -7,8 +7,8 @@ from typing import Any
 
 import pytest
 
-from omnigent.inner.hook_scripts import codex_router_hook as hook
-from omnigent.inner.hook_scripts import subagent_router
+from omnigent.harnesses.native.hook_scripts import codex_router_hook as hook
+from omnigent.harnesses.native.hook_scripts import subagent_router
 from tests.inner.conftest import advertise_relay_tools, advertise_router
 
 # Delivered plaintext in hook payloads (measured live); the name survives

@@ -67,10 +67,10 @@ if TYPE_CHECKING:
 
 import httpx
 
-from omnigent.native._native_forwarder_health import (
+from omnigent.harnesses.native.forwarder_health import (
     note_post_success as note_native_post_success,
 )
-from omnigent.native._native_forwarder_health import (
+from omnigent.harnesses.native.forwarder_health import (
     record_post_failure as record_native_post_failure,
 )
 
@@ -1492,7 +1492,7 @@ async def forward_kimi_wire_to_session(
     # host_id reads OMNIGENT_RUNNER_SLICE_KEY; emitted only on the workspace
     # mount). One point covers the client default + every helper POST below,
     # which all forward this same dict.
-    from omnigent.cli_auth import databricks_request_headers
+    from omnigent.cli.auth import databricks_request_headers
 
     headers = {**headers, **databricks_request_headers(base_url)}
     state = _read_state(bridge_dir)

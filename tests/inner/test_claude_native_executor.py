@@ -12,7 +12,9 @@ from typing import Any
 
 import pytest
 
+from omnigent.core.executor import ExecutorConfig, ExecutorError, TurnComplete
 from omnigent.harnesses.claude_native import bridge as claude_bridge
+from omnigent.harnesses.claude_native import executor as claude_native_executor
 from omnigent.harnesses.claude_native.bridge import (
     REQUEST_SESSION_ID_ENV_VAR,
     ClaudePromptTimeout,
@@ -21,10 +23,8 @@ from omnigent.harnesses.claude_native.bridge import (
     ClaudeTerminalExited,
     TmuxSessionNotAdvertised,
 )
-from omnigent.inner import claude_native_executor
-from omnigent.inner.claude_native_executor import ClaudeNativeExecutor
-from omnigent.inner.executor import ExecutorConfig, ExecutorError, TurnComplete
-from omnigent.inner.native_attachments import attachment_cache_dir
+from omnigent.harnesses.claude_native.executor import ClaudeNativeExecutor
+from omnigent.util.attachments import attachment_cache_dir
 
 # Minimal valid 1x1 white PNG used for multimodal attachment tests.
 _TINY_PNG_B64 = (
@@ -619,7 +619,7 @@ async def test_resize_notice_uses_hidden_hook_context(
     tmp_path: Path,
 ) -> None:
     """Claude terminal input excludes the framework notice."""
-    from omnigent.inner.native_attachments import framework_notice_block, resize_notice
+    from omnigent.util.attachments import framework_notice_block, resize_notice
 
     dimensions = {"width": 6000, "height": 4000}
     sent: list[dict[str, Any]] = []
@@ -653,7 +653,7 @@ async def test_resize_notice_uses_hidden_hook_context(
 async def test_failed_injection_clears_framework_context(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, error: Exception
 ) -> None:
-    from omnigent.inner.native_attachments import framework_notice_block
+    from omnigent.util.attachments import framework_notice_block
 
     def fail_inject(*args: Any, **kwargs: Any) -> None:
         assert (tmp_path / "pending_framework_context.txt").exists()
@@ -975,7 +975,7 @@ async def test_enqueue_session_message_materializes_image(
     attachments (same path as ``run_turn``).
     """
     from omnigent.harnesses.claude_native.bridge import CLAUDE_FRAMEWORK_CONTEXT_FILE
-    from omnigent.inner.native_attachments import framework_notice_block, resize_notice
+    from omnigent.util.attachments import framework_notice_block, resize_notice
 
     dimensions = {"width": 6000, "height": 4000}
     sent: list[dict[str, Any]] = []
@@ -1741,7 +1741,7 @@ async def test_run_turn_logs_a_closed_terminal_below_error(
         claude_native_executor, "kill_session", lambda bridge_dir_arg, *, timeout_s: None
     )
 
-    with caplog.at_level(logging.WARNING, logger="omnigent.inner.claude_native_executor"):
+    with caplog.at_level(logging.WARNING, logger="omnigent.harnesses.claude_native.executor"):
         events = [
             event
             async for event in ClaudeNativeExecutor(bridge_dir).run_turn(

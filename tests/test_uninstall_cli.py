@@ -7,8 +7,8 @@ from pathlib import Path
 
 from click.testing import CliRunner
 
-from omnigent import cli as cli_module
-from omnigent.install_ledger import InstallLedger, new_ledger
+from omnigent.cli import commands as cli_module
+from omnigent.onboarding.install_ledger import InstallLedger, new_ledger
 
 
 def test_uninstall_cli_resolves_ledger_and_forwards_flags(monkeypatch, tmp_path: Path) -> None:
@@ -24,7 +24,7 @@ def test_uninstall_cli_resolves_ledger_and_forwards_flags(monkeypatch, tmp_path:
     def _ledger() -> InstallLedger:
         return ledger
 
-    monkeypatch.setattr("omnigent.install_ledger.resolve_uninstall_ledger", _ledger)
+    monkeypatch.setattr("omnigent.onboarding.install_ledger.resolve_uninstall_ledger", _ledger)
 
     def _run(args, *, env, check):
         calls.append((list(args), env.get("OMNIGENT_UNINSTALL_LEDGER_SOURCE")))
@@ -48,7 +48,9 @@ def test_uninstall_cli_resolves_ledger_and_forwards_flags(monkeypatch, tmp_path:
 
 def test_uninstall_cli_refuses_without_install_signal(monkeypatch) -> None:
     runner = CliRunner()
-    monkeypatch.setattr("omnigent.install_ledger.resolve_uninstall_ledger", lambda: None)
+    monkeypatch.setattr(
+        "omnigent.onboarding.install_ledger.resolve_uninstall_ledger", lambda: None
+    )
 
     result = runner.invoke(cli_module.cli, ["uninstall", "--json"])
 
@@ -67,7 +69,9 @@ def test_uninstall_cli_defaults_to_dry_run_without_destructive_flags(
     calls: list[list[str]] = []
 
     monkeypatch.setattr(cli_module, "_uninstall_script_path", lambda: script)
-    monkeypatch.setattr("omnigent.install_ledger.resolve_uninstall_ledger", lambda: ledger)
+    monkeypatch.setattr(
+        "omnigent.onboarding.install_ledger.resolve_uninstall_ledger", lambda: ledger
+    )
 
     def _run(args, *, env, check):
         del env, check
@@ -84,7 +88,9 @@ def test_uninstall_cli_defaults_to_dry_run_without_destructive_flags(
 
 def test_uninstall_cli_human_refusal_exits_three(monkeypatch) -> None:
     runner = CliRunner()
-    monkeypatch.setattr("omnigent.install_ledger.resolve_uninstall_ledger", lambda: None)
+    monkeypatch.setattr(
+        "omnigent.onboarding.install_ledger.resolve_uninstall_ledger", lambda: None
+    )
 
     result = runner.invoke(cli_module.cli, ["uninstall"])
 
@@ -105,7 +111,9 @@ def test_uninstall_cli_uses_exclusive_manifest_and_cleans_temp_script(
     manifest_paths: list[Path] = []
 
     monkeypatch.setattr(cli_module, "_uninstall_script_path", lambda: script)
-    monkeypatch.setattr("omnigent.install_ledger.resolve_uninstall_ledger", lambda: ledger)
+    monkeypatch.setattr(
+        "omnigent.onboarding.install_ledger.resolve_uninstall_ledger", lambda: ledger
+    )
 
     def _run(args, *, env, check):
         del args, check

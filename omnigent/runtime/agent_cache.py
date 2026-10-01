@@ -13,8 +13,8 @@ from pathlib import Path
 
 from filelock import FileLock
 
-from omnigent.debug_logging import debug_event
 from omnigent.entities import LoadedAgent
+from omnigent.observability.debug_logging import debug_event
 from omnigent.spec import AgentSpec
 from omnigent.spec import load as load_spec
 from omnigent.stores.artifact_store import ArtifactStore

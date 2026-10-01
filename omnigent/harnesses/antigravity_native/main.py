@@ -22,7 +22,7 @@ Differences from the Codex / Claude wrappers (Phase 1 scope):
   (:mod:`omnigent.harnesses.antigravity_native.reader`), which polls/streams agy's
   connect-RPC trajectory steps. Web-UI turns are delivered into the native agy
   conversation (the write path) by the native executor
-  (:mod:`omnigent.inner.antigravity_native_executor`) over the connect-RPC
+  (:mod:`omnigent.harnesses.antigravity_native.executor`) over the connect-RPC
   ``SendUserCascadeMessage`` method, which agy records as a real ``USER_INPUT``
   turn — NOT ``SendAgentMessage`` (recorded as a ``SYSTEM_MESSAGE``, which would
   never mirror as a user turn; see the executor module).
@@ -76,20 +76,8 @@ import click
 import httpx
 import yaml
 
-from omnigent._runner_startup import RunnerStartupProgress, runner_startup_progress
-from omnigent._wrapper_labels import (
-    ANTIGRAVITY_NATIVE_WRAPPER_VALUE as _WRAPPER_LABEL_VALUE,
-)
-from omnigent._wrapper_labels import (
-    UI_MODE_LABEL_KEY as _UI_MODE_LABEL_KEY,
-)
-from omnigent._wrapper_labels import (
-    UI_MODE_TERMINAL_VALUE as _UI_MODE_TERMINAL_VALUE,
-)
-from omnigent._wrapper_labels import (
-    WRAPPER_LABEL_KEY as _WRAPPER_LABEL_KEY,
-)
-from omnigent.conversation_browser import conversation_url, open_conversation_link_if_enabled
+from omnigent.cli.conversation_browser import conversation_url, open_conversation_link_if_enabled
+from omnigent.cli.runner_startup import RunnerStartupProgress, runner_startup_progress
 from omnigent.entities.session_resources import terminal_resource_id
 from omnigent.harnesses.antigravity_native.bridge import (
     AGY_PLACEHOLDER_CONVERSATION_PREFIX,
@@ -126,29 +114,41 @@ from omnigent.harnesses.claude_native.main import (
     _AttachOutcome,
     attach_local_terminal,
 )
+from omnigent.harnesses.native.coding_agents import native_shell_terminal_spec
+from omnigent.harnesses.native.resume_hint import echo_native_resume_hint
+from omnigent.harnesses.native.terminal import (
+    DAEMON_HOST_ONLINE_TIMEOUT_S as _DAEMON_HOST_ONLINE_TIMEOUT_S,
+)
+from omnigent.harnesses.native.terminal import (
+    DAEMON_RUNNER_ONLINE_TIMEOUT_S as _DAEMON_RUNNER_ONLINE_TIMEOUT_S,
+)
+from omnigent.harnesses.native.terminal import (
+    bind_session_runner as _bind_session_runner,
+)
+from omnigent.harnesses.native.terminal import (
+    normalize_extra_args as _normalize_extra_args,
+)
+from omnigent.harnesses.native.terminal import (
+    terminal_attach_url as _attach_url,
+)
+from omnigent.harnesses.wrapper_labels import (
+    ANTIGRAVITY_NATIVE_WRAPPER_VALUE as _WRAPPER_LABEL_VALUE,
+)
+from omnigent.harnesses.wrapper_labels import (
+    UI_MODE_LABEL_KEY as _UI_MODE_LABEL_KEY,
+)
+from omnigent.harnesses.wrapper_labels import (
+    UI_MODE_TERMINAL_VALUE as _UI_MODE_TERMINAL_VALUE,
+)
+from omnigent.harnesses.wrapper_labels import (
+    WRAPPER_LABEL_KEY as _WRAPPER_LABEL_KEY,
+)
 from omnigent.host.daemon_launch import (
     error_text,
     launch_or_reuse_daemon_runner,
     open_daemon_client,
     wait_for_host_online,
     wait_for_runner_online,
-)
-from omnigent.native._native_resume_hint import echo_native_resume_hint
-from omnigent.native.native_coding_agents import native_shell_terminal_spec
-from omnigent.native.native_terminal import (
-    DAEMON_HOST_ONLINE_TIMEOUT_S as _DAEMON_HOST_ONLINE_TIMEOUT_S,
-)
-from omnigent.native.native_terminal import (
-    DAEMON_RUNNER_ONLINE_TIMEOUT_S as _DAEMON_RUNNER_ONLINE_TIMEOUT_S,
-)
-from omnigent.native.native_terminal import (
-    bind_session_runner as _bind_session_runner,
-)
-from omnigent.native.native_terminal import (
-    normalize_extra_args as _normalize_extra_args,
-)
-from omnigent.native.native_terminal import (
-    terminal_attach_url as _attach_url,
 )
 
 _logger = logging.getLogger(__name__)
@@ -212,7 +212,6 @@ def run_antigravity_native(
     server: str | None,
     session_id: str | None,
     extra_args: tuple[str, ...] | None = None,
-    antigravity_args: tuple[str, ...] | None = None,
     resume_picker: bool = False,
     command: str | None = None,
     model: str | None = None,
@@ -228,8 +227,6 @@ def run_antigravity_native(
     :param session_id: Optional existing Omnigent conversation id to
         resume, e.g. ``"conv_abc123"``. ``None`` creates a new bundled
         session.
-    :param antigravity_args: Raw pass-through args appended to the ``agy``
-        command line after the generated flags.
     :param resume_picker: ``True`` runs the antigravity-native picker once
         the server is reachable; ``False`` keeps the explicit
         ``session_id``-or-fresh behavior.
@@ -251,9 +248,7 @@ def run_antigravity_native(
     :returns: None after the terminal attach session ends.
     :raises click.ClickException: If setup, launch, or attach fails.
     """
-    antigravity_args = _normalize_extra_args(
-        extra_args=extra_args, legacy_args=antigravity_args, legacy_param="antigravity_args"
-    )
+    extra_args = _normalize_extra_args(extra_args)
     resolved_command = (command or agy_binary_path()).strip()
     if not resolved_command:
         raise click.ClickException("Antigravity command must not be empty.")
@@ -273,7 +268,7 @@ def run_antigravity_native(
                 spec_path,
                 session_id=session_id,
                 resume_picker=resume_picker,
-                antigravity_args=antigravity_args,
+                extra_args=extra_args,
                 command=resolved_command,
                 model=launch.model,
                 permission_mode=permission_mode,
@@ -286,7 +281,7 @@ def run_antigravity_native(
                 spec_path,
                 session_id=session_id,
                 resume_picker=resume_picker,
-                antigravity_args=antigravity_args,
+                extra_args=extra_args,
                 command=resolved_command,
                 model=launch.model,
                 permission_mode=permission_mode,
@@ -344,7 +339,7 @@ def _run_with_local_server(
     *,
     session_id: str | None,
     resume_picker: bool,
-    antigravity_args: tuple[str, ...],
+    extra_args: tuple[str, ...],
     command: str,
     model: str | None,
     permission_mode: str | None = None,
@@ -358,7 +353,7 @@ def _run_with_local_server(
     :param session_id: Optional existing Omnigent session id.
     :param resume_picker: When ``True`` and ``session_id is None``, run the
         picker.
-    :param antigravity_args: Raw pass-through agy args.
+    :param extra_args: Raw pass-through agy args.
     :param command: agy executable to run.
     :param model: Optional agy model id.
     :param permission_mode: Optional Omnigent permission mode (e.g.
@@ -369,7 +364,7 @@ def _run_with_local_server(
         conversation URL after the session is prepared.
     :returns: None.
     """
-    from omnigent.chat import (
+    from omnigent.cli.chat import (
         _bundle_agent,
         _find_free_port,
         _start_local_server,
@@ -406,7 +401,7 @@ def _run_with_local_server(
                     session_id=resolved_session_id,
                     runner_id=server_handle.runner_id,
                     session_bundle=bundle,
-                    antigravity_args=antigravity_args,
+                    extra_args=extra_args,
                     command=command,
                     model=model,
                     permission_mode=permission_mode,
@@ -443,7 +438,7 @@ def _run_with_remote_server(
     *,
     session_id: str | None,
     resume_picker: bool,
-    antigravity_args: tuple[str, ...],
+    extra_args: tuple[str, ...],
     command: str,
     model: str | None,
     permission_mode: str | None = None,
@@ -464,7 +459,7 @@ def _run_with_remote_server(
     :param session_id: Optional existing Omnigent session id.
     :param resume_picker: When ``True`` and ``session_id is None``, run the
         picker.
-    :param antigravity_args: Raw pass-through agy args.
+    :param extra_args: Raw pass-through agy args.
     :param command: agy executable to run.
     :param model: Optional agy model id.
     :param permission_mode: Optional Omnigent permission mode (e.g.
@@ -475,8 +470,8 @@ def _run_with_remote_server(
         conversation URL after the session is prepared.
     :returns: None.
     """
-    from omnigent.chat import _bundle_agent, _remote_headers
-    from omnigent.cli import _ensure_host_daemon
+    from omnigent.cli.chat import _bundle_agent, _remote_headers
+    from omnigent.cli.commands import _ensure_host_daemon
     from omnigent.host.identity import load_or_create_host_identity
 
     # This machine's host id keys the WebSocket attach handshake (and its
@@ -509,7 +504,7 @@ def _run_with_remote_server(
                     headers=headers,
                     session_id=resolved_session_id,
                     session_bundle=bundle,
-                    antigravity_args=antigravity_args,
+                    extra_args=extra_args,
                     command=command,
                     model=model,
                     permission_mode=permission_mode,
@@ -565,7 +560,7 @@ async def _prepare_antigravity_terminal(
     session_id: str | None,
     runner_id: str | None,
     session_bundle: bytes | None,
-    antigravity_args: tuple[str, ...],
+    extra_args: tuple[str, ...],
     command: str,
     model: str | None,
     permission_mode: str | None = None,
@@ -581,7 +576,7 @@ async def _prepare_antigravity_terminal(
     :param runner_id: Runner id to bind to the session, or ``None``.
     :param session_bundle: Gzipped agent bundle for new sessions. Required
         when *session_id* is ``None``.
-    :param antigravity_args: Raw pass-through agy args.
+    :param extra_args: Raw pass-through agy args.
     :param command: agy executable to run.
     :param model: Optional agy model id.
     :param permission_mode: Optional Omnigent permission mode threaded into the
@@ -593,7 +588,7 @@ async def _prepare_antigravity_terminal(
     :raises click.ClickException: If any server operation fails.
     """
     timeout = httpx.Timeout(30.0, read=120.0)
-    from omnigent.cli_auth import open_server_client
+    from omnigent.cli.auth import open_server_client
 
     async with open_server_client(base_url, headers=headers, timeout=timeout) as client:
         bridge_id: str
@@ -626,7 +621,7 @@ async def _prepare_antigravity_terminal(
             bridge_id = str(labels.get(ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY) or session_id)
             existing = await _find_running_antigravity_terminal(client, session_id)
             if existing is not None:
-                if antigravity_args or model is not None:
+                if extra_args or model is not None:
                     click.echo(
                         "Ignoring Antigravity launch args/model for an already-running "
                         "terminal; restart the session terminal to apply them.",
@@ -666,7 +661,7 @@ async def _prepare_antigravity_terminal(
                 client, session_id, _RUNNER_TERMINAL_AUTOCREATE_TIMEOUT_S
             )
             if autocreated is not None:
-                if antigravity_args or model is not None:
+                if extra_args or model is not None:
                     click.echo(
                         "Ignoring Antigravity launch args/model for the runner-owned "
                         "terminal; restart the session terminal to apply them.",
@@ -687,7 +682,7 @@ async def _prepare_antigravity_terminal(
             bridge_id=bridge_id,
             conversation_id=conversation_id,
             resume=resume,
-            antigravity_args=antigravity_args,
+            extra_args=extra_args,
             command=command,
             model=model,
             permission_mode=permission_mode,
@@ -749,7 +744,7 @@ async def _prepare_antigravity_terminal_via_daemon(
     headers: dict[str, str],
     session_id: str | None,
     session_bundle: bytes | None,
-    antigravity_args: tuple[str, ...],
+    extra_args: tuple[str, ...],
     command: str,
     model: str | None,
     permission_mode: str | None = None,
@@ -773,7 +768,7 @@ async def _prepare_antigravity_terminal_via_daemon(
         fresh session.
     :param session_bundle: Gzipped agent bundle. Required when
         *session_id* is ``None``.
-    :param antigravity_args: Raw pass-through agy args.
+    :param extra_args: Raw pass-through agy args.
     :param command: agy executable to run.
     :param model: Optional agy model id.
     :param permission_mode: Optional Omnigent permission mode threaded into the
@@ -831,7 +826,7 @@ async def _prepare_antigravity_terminal_via_daemon(
             # it); a cold resume returns ``None`` and falls through to launch.
             existing = await _find_running_antigravity_terminal(client, session_id)
             if existing is not None:
-                if antigravity_args or model is not None:
+                if extra_args or model is not None:
                     click.echo(
                         "Ignoring Antigravity launch args/model for an already-running "
                         "terminal; restart the session terminal to apply them.",
@@ -880,7 +875,7 @@ async def _prepare_antigravity_terminal_via_daemon(
             client, session_id, _RUNNER_TERMINAL_AUTOCREATE_TIMEOUT_S
         )
         if autocreated is not None:
-            if antigravity_args or model is not None:
+            if extra_args or model is not None:
                 click.echo(
                     "Ignoring Antigravity launch args/model for the runner-owned "
                     "terminal; restart the session terminal to apply them.",
@@ -901,7 +896,7 @@ async def _prepare_antigravity_terminal_via_daemon(
             bridge_id=bridge_id,
             conversation_id=conversation_id,
             resume=resume,
-            antigravity_args=antigravity_args,
+            extra_args=extra_args,
             command=command,
             model=model,
             permission_mode=permission_mode,
@@ -925,7 +920,7 @@ async def _launch_and_record(
     bridge_id: str,
     conversation_id: str,
     resume: bool,
-    antigravity_args: tuple[str, ...],
+    extra_args: tuple[str, ...],
     command: str,
     model: str | None,
     permission_mode: str | None = None,
@@ -968,7 +963,7 @@ async def _launch_and_record(
         ``agy_conv_*`` placeholder used only to seed bridge state until the
         cold-start mints agy's real id.
     :param resume: ``True`` to resume an existing agy conversation.
-    :param antigravity_args: Raw pass-through agy args.
+    :param extra_args: Raw pass-through agy args.
     :param command: agy executable to run.
     :param model: Optional agy model id.
     :param permission_mode: Optional Omnigent permission mode threaded into the
@@ -994,7 +989,7 @@ async def _launch_and_record(
         resume=resume,
         permission_mode=permission_mode,
         headless=headless,
-        extra_args=antigravity_args,
+        extra_args=extra_args,
         log_dir=bridge_dir,
     )
     # Scope agy to a per-session isolated Gemini dir, exactly as the runner-owned
@@ -1623,7 +1618,7 @@ async def _close_antigravity_terminal(
     :param terminal_id: Terminal resource id.
     :returns: None.
     """
-    from omnigent.cli_auth import open_server_client
+    from omnigent.cli.auth import open_server_client
 
     try:
         async with open_server_client(

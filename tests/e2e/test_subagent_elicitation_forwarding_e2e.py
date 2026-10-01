@@ -315,7 +315,7 @@ def _kill_tree(pid: int, conv_ids: set[str]) -> None:
         except subprocess.CalledProcessError:
             ps = ""
         for line in ps.splitlines():
-            if "omnigent.runtime.harnesses._runner" in line and any(c in line for c in conv_ids):
+            if "omnigent.harnesses.runtime._runner" in line and any(c in line for c in conv_ids):
                 toks = line.split()
                 with contextlib.suppress(ValueError, IndexError):
                     pids.add(int(toks[0]))

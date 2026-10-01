@@ -1,7 +1,6 @@
-"""Pre-integration omnigent code. Moved here during unification.
+"""Frozen compatibility namespace for import paths stored outside the repo.
 
-Internal imports between files here use relative syntax (from .X import
-Y). Cross-boundary imports from omnigent-native code inside
-omnigent/ use the explicit path (omnigent.inner.X) so the
-dependency is grep-findable.
+Nothing new goes here. ``nessie.policies`` stays importable because database
+rows store its policy handler paths; the other modules are aliases for the old
+library API, removed in 0.19.0. See ``docs/ARCHITECTURE.md``.
 """

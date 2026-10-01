@@ -19,7 +19,7 @@ from click import ClickException
 
 from omnigent.harnesses.claude_native import bridge, forwarder
 from omnigent.harnesses.claude_native import main as claude_native
-from omnigent.process_logging import HARNESS_STDERR_ENABLED_ENV_VAR
+from omnigent.observability.process_logging import HARNESS_STDERR_ENABLED_ENV_VAR
 
 
 @pytest.fixture(autouse=True)
@@ -99,7 +99,7 @@ def no_network(monkeypatch: pytest.MonkeyPatch) -> None:
         async with httpx.AsyncClient(transport=httpx.MockTransport(unexpected_request)) as client:
             yield client
 
-    monkeypatch.setattr("omnigent.cli_auth.open_server_client", open_server_client)
+    monkeypatch.setattr("omnigent.cli.auth.open_server_client", open_server_client)
 
 
 async def _forward(bridge_dir: Path) -> None:
@@ -210,7 +210,7 @@ async def test_server_client_start_failure_drains_diagnostics_before_first_poll(
     monkeypatch.setattr(forwarder, "ClaudeDebugLogFollower", make_follower)
     monkeypatch.setattr(forwarder, "read_active_session_id", lambda _bridge: "active-child")
     monkeypatch.setattr(
-        "omnigent.cli_auth.open_server_client", lambda *_a, **_kw: FailedClientContext()
+        "omnigent.cli.auth.open_server_client", lambda *_a, **_kw: FailedClientContext()
     )
 
     with pytest.raises(RuntimeError) as raised:

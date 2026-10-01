@@ -15,17 +15,17 @@ import databricks.sdk.config as _sdk_config_mod
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from omnigent.inner.databricks_executor import (
-    DatabricksExecutor,
-    _convert_messages,
-    _convert_tools_to_openai,
-)
-from omnigent.inner.executor import (
+from omnigent.core.executor import (
     ExecutorConfig,
     ExecutorError,
     TextChunk,
     ToolCallRequest,
     TurnComplete,
+)
+from omnigent.harnesses.databricks.executor import (
+    DatabricksExecutor,
+    _convert_messages,
+    _convert_tools_to_openai,
 )
 
 
@@ -708,7 +708,7 @@ from pathlib import Path as _Path  # noqa: E402
 
 import pytest  # noqa: E402
 
-from omnigent.inner.databricks_executor import (  # noqa: E402
+from omnigent.harnesses.databricks.executor import (  # noqa: E402
     DatabricksAuthError,
     _DatabricksBearerAuth,
     _read_databrickscfg,
@@ -900,7 +900,7 @@ def test_databricks_gateway_host_ignores_env_override_for_explicit_profile(
     URL and the token would target different workspaces and the gateway rejects
     the token. So the host must come from the profile section directly.
     """
-    from omnigent.inner.databricks_executor import _databricks_gateway_host
+    from omnigent.harnesses.databricks.executor import _databricks_gateway_host
 
     cfg_path = tmp_path / "databrickscfg"
     cfg_path.write_text(
@@ -929,7 +929,7 @@ def test_databricks_gateway_host_missing_profile_falls_back_to_ambient(
     App container with no matching section: there is no profile-pinned token to
     diverge from, so ambient ``DATABRICKS_HOST`` is the right host.
     """
-    from omnigent.inner.databricks_executor import _databricks_gateway_host
+    from omnigent.harnesses.databricks.executor import _databricks_gateway_host
 
     # Stub the SDK's host-metadata probe (a real HTTP GET with retries) so the
     # ambient-credential resolution stays offline and fast.
@@ -973,7 +973,7 @@ def test_codex_executor_gateway_uses_host_only_oauth_profile(
     )
     monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(cfg_path))
 
-    from omnigent.inner.codex_executor import CodexExecutor
+    from omnigent.harnesses.codex.executor import CodexExecutor
 
     executor = CodexExecutor(
         codex_path=sys.executable,
@@ -1299,7 +1299,7 @@ def test_resolve_databricks_auth_returns_bearer_auth_and_host(
 
     :param monkeypatch: Pytest monkeypatch fixture.
     """
-    from omnigent.inner.databricks_executor import (
+    from omnigent.harnesses.databricks.executor import (
         _DatabricksBearerAuth,
         _resolve_databricks_auth,
     )
@@ -1328,8 +1328,8 @@ def test_resolve_databricks_auth_invalid_profile_raises_clear_error(
     """
     import pytest
 
-    import omnigent.inner.databricks_executor as db_exec
-    from omnigent.inner.databricks_executor import (
+    import omnigent.harnesses.databricks.executor as db_exec
+    from omnigent.harnesses.databricks.executor import (
         DatabricksAuthError,
         _resolve_databricks_auth,
     )
@@ -1367,8 +1367,8 @@ def test_resolve_databricks_auth_env_profile_falls_back_to_ambient_with_warning(
     """
     import logging
 
-    import omnigent.inner.databricks_executor as db_exec
-    from omnigent.inner.databricks_executor import (
+    import omnigent.harnesses.databricks.executor as db_exec
+    from omnigent.harnesses.databricks.executor import (
         _DatabricksBearerAuth,
         _resolve_databricks_auth,
     )
@@ -1390,7 +1390,7 @@ def test_resolve_databricks_auth_env_profile_falls_back_to_ambient_with_warning(
     # Profile comes from env var, not an explicit argument.
     monkeypatch.setenv("DATABRICKS_CONFIG_PROFILE", "missing-profile")
 
-    with caplog.at_level(logging.WARNING, logger="omnigent.inner.databricks_executor"):
+    with caplog.at_level(logging.WARNING, logger="omnigent.harnesses.databricks.executor"):
         auth, host = _resolve_databricks_auth()  # profile=None — uses env var
 
     assert isinstance(auth, _DatabricksBearerAuth), (
@@ -1421,8 +1421,8 @@ def test_resolve_databricks_auth_explicit_profile_not_found_raises(
     """
     import pytest
 
-    import omnigent.inner.databricks_executor as db_exec
-    from omnigent.inner.databricks_executor import (
+    import omnigent.harnesses.databricks.executor as db_exec
+    from omnigent.harnesses.databricks.executor import (
         DatabricksAuthError,
         _resolve_databricks_auth,
     )
@@ -1458,7 +1458,7 @@ def test_bearer_auth_injects_fresh_token_per_request():
     """
     import httpx
 
-    from omnigent.inner.databricks_executor import _DatabricksBearerAuth
+    from omnigent.harnesses.databricks.executor import _DatabricksBearerAuth
 
     call_count = 0
 
@@ -1493,7 +1493,7 @@ def test_bearer_auth_raises_on_expired_refresh_token():
     import httpx
     import pytest
 
-    from omnigent.inner.databricks_executor import (
+    from omnigent.harnesses.databricks.executor import (
         DatabricksAuthError,
         _DatabricksBearerAuth,
     )
@@ -1552,11 +1552,11 @@ def test_claude_sdk_executor_reuses_api_key_helper_between_turns(
         }
 
     monkeypatch.setattr(
-        "omnigent.inner.claude_sdk_executor._resolve_gateway_env",
+        "omnigent.harnesses.claude_sdk.executor._resolve_gateway_env",
         _counting_resolve,
     )
 
-    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+    from omnigent.harnesses.claude_sdk.executor import ClaudeSDKExecutor
 
     # Construct with initial env.
     executor = ClaudeSDKExecutor.__new__(ClaudeSDKExecutor)
@@ -1607,11 +1607,11 @@ def test_codex_executor_uses_cli_auth_command_not_env_token(
         return "https://host"
 
     monkeypatch.setattr(
-        "omnigent.inner.codex_executor._databricks_gateway_host",
+        "omnigent.harnesses.codex.executor._databricks_gateway_host",
         _counting_read,
     )
 
-    from omnigent.inner.codex_executor import CodexExecutor
+    from omnigent.harnesses.codex.executor import CodexExecutor
 
     executor = CodexExecutor.__new__(CodexExecutor)
     executor._databricks = True
@@ -1751,7 +1751,7 @@ def test_resolve_auth_for_host_prefers_matching_profile(
     workspace). If this regresses to the bare ``databricks-cli`` host
     lookup, the constructed kwargs below change and the test fails.
     """
-    from omnigent.inner import databricks_executor
+    from omnigent.harnesses.databricks import executor as databricks_executor
 
     cfg_path = tmp_path / "databrickscfg"
     cfg_path.write_text(
@@ -1789,7 +1789,7 @@ def test_resolve_auth_for_host_uses_profile_cli_when_sdk_is_ambiguous(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """SDK profile auth can still hit ambiguous host lookup for CLI profiles."""
-    from omnigent.inner import databricks_executor
+    from omnigent.harnesses.databricks import executor as databricks_executor
 
     cfg_path = tmp_path / "databrickscfg"
     cfg_path.write_text(
@@ -1868,7 +1868,7 @@ def test_profile_cli_auth_config_caches_until_token_nears_expiry(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The profile CLI fallback does not re-shell for every auth header."""
-    from omnigent.inner import databricks_executor
+    from omnigent.harnesses.databricks import executor as databricks_executor
 
     calls = 0
     timestamps = iter([1000.0, 1001.0, 1020.0])
@@ -1901,7 +1901,7 @@ def test_profile_cli_token_error_does_not_include_stdout_token(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A non-zero CLI exit never reports stdout, which may contain a token."""
-    from omnigent.inner import databricks_executor
+    from omnigent.harnesses.databricks import executor as databricks_executor
 
     def _run_databricks(args: list[str], **kwargs: object) -> SimpleNamespace:
         return SimpleNamespace(
@@ -1929,7 +1929,7 @@ def test_resolve_auth_for_host_falls_back_to_cli_when_no_profile_matches(
     cache from ``databricks auth login --host`` — dropping this fallback
     would strand them.
     """
-    from omnigent.inner import databricks_executor
+    from omnigent.harnesses.databricks import executor as databricks_executor
 
     monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(tmp_path / "absent"))
 
@@ -1961,7 +1961,7 @@ def test_profiles_for_host_normalizes_scheme_and_slash(
     trailing ``/`` in the wild; a strict string compare would silently
     miss the profile and fall through to the unreliable CLI host lookup.
     """
-    from omnigent.inner.databricks_executor import _databrickscfg_profiles_for_host
+    from omnigent.harnesses.databricks.executor import _databrickscfg_profiles_for_host
 
     cfg_path = tmp_path / "databrickscfg"
     cfg_path.write_text(
@@ -1981,7 +1981,7 @@ def test_profiles_for_host_missing_file_returns_empty(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """No config file → no profile candidates (CLI fallback territory)."""
-    from omnigent.inner.databricks_executor import _databrickscfg_profiles_for_host
+    from omnigent.harnesses.databricks.executor import _databrickscfg_profiles_for_host
 
     monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(tmp_path / "absent"))
 
@@ -2019,7 +2019,7 @@ def test_host_selection_order_prefers_user_profile_over_m2m_sp(
     tried first it silently wins and the host registers under the wrong
     identity (invisible to the SSO-signed-in app user).
     """
-    from omnigent.inner.databricks_executor import (
+    from omnigent.harnesses.databricks.executor import (
         _databrickscfg_host_matches_and_sp_sections,
         _order_profiles_by_identity_preference,
     )
@@ -2047,7 +2047,7 @@ def test_host_selection_order_env_profile_wins_even_when_it_is_an_sp(
     the SP profile's name gets the SP, and one who exports DEFAULT gets
     their own profile even when the SP is first in the file.
     """
-    from omnigent.inner.databricks_executor import (
+    from omnigent.harnesses.databricks.executor import (
         _databrickscfg_host_matches_and_sp_sections,
         _order_profiles_by_identity_preference,
     )
@@ -2081,7 +2081,7 @@ def test_host_selection_order_env_profile_for_other_host_is_ignored(
     doesn't match that host must not jump the queue (it isn't even a
     candidate).
     """
-    from omnigent.inner.databricks_executor import (
+    from omnigent.harnesses.databricks.executor import (
         _databrickscfg_host_matches_and_sp_sections,
         _order_profiles_by_identity_preference,
     )
@@ -2121,7 +2121,7 @@ def test_host_selection_order_sp_only_config_still_offers_the_sp(
     Deprioritising is not dropping — CI boxes whose only credential is a
     service principal must still resolve auth for the host.
     """
-    from omnigent.inner.databricks_executor import (
+    from omnigent.harnesses.databricks.executor import (
         _databrickscfg_host_matches_and_sp_sections,
         _order_profiles_by_identity_preference,
     )
@@ -2154,7 +2154,7 @@ def test_sp_sections_not_polluted_by_default_section_inheritance(
     SP section (client_id/client_secret, no own auth_type) look like a
     user profile and defeat the deprioritisation.
     """
-    from omnigent.inner.databricks_executor import (
+    from omnigent.harnesses.databricks.executor import (
         _databrickscfg_host_matches_and_sp_sections,
     )
 
@@ -2176,7 +2176,7 @@ def test_sp_section_with_explicit_user_auth_type_is_not_an_sp(
     interactive/user mode the stray client keys don't make it a machine
     identity.
     """
-    from omnigent.inner.databricks_executor import (
+    from omnigent.harnesses.databricks.executor import (
         _databrickscfg_host_matches_and_sp_sections,
     )
 
@@ -2210,7 +2210,7 @@ def test_azure_service_principal_fields_are_classified_as_sp(
     "user" bucket and could keep precedence over a real user profile for the
     same host — re-weakening the ordering.
     """
-    from omnigent.inner.databricks_executor import (
+    from omnigent.harnesses.databricks.executor import (
         _databrickscfg_host_matches_and_sp_sections,
     )
 
@@ -2244,7 +2244,7 @@ def test_federated_oidc_machine_auth_types_are_classified_as_sp(
     U2M/PAT profile for the same host, the same mis-ranking this ordering
     exists to prevent. They must be recognized by ``auth_type``.
     """
-    from omnigent.inner.databricks_executor import (
+    from omnigent.harnesses.databricks.executor import (
         _databrickscfg_host_matches_and_sp_sections,
     )
 
@@ -2279,7 +2279,7 @@ def test_cloud_machine_auth_types_are_classified_as_sp(
     or Azure managed identity could outrank a real user profile for the
     same host. They must be recognized by ``auth_type``.
     """
-    from omnigent.inner.databricks_executor import (
+    from omnigent.harnesses.databricks.executor import (
         _databrickscfg_host_matches_and_sp_sections,
     )
 
@@ -2320,7 +2320,7 @@ def test_resolve_auth_for_host_prefers_user_over_gcp_service_account_first_in_fi
     bug, unresolved for GCP. The user profile must win, and a stale-user
     fallthrough to the service account must still warn.
     """
-    from omnigent.inner import databricks_executor
+    from omnigent.harnesses.databricks import executor as databricks_executor
 
     cfg_path = tmp_path / "databrickscfg"
     cfg_path.write_text(
@@ -2378,7 +2378,7 @@ def test_resolve_auth_for_host_env_profile_selects_sp_over_valid_user(
     the same host. The ordering unit test covers this; this asserts the
     resolver actually mints the SP's token, not the user's.
     """
-    from omnigent.inner import databricks_executor
+    from omnigent.harnesses.databricks import executor as databricks_executor
 
     monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(_write_sp_and_user_cfg(tmp_path)))
     monkeypatch.setenv("DATABRICKS_CONFIG_PROFILE", "sp")
@@ -2404,7 +2404,7 @@ def test_section_with_explicit_empty_host_does_not_inherit_default(
     has opted out of the workspace, so it must not fall back to [DEFAULT]'s
     host and spuriously match — matching ConfigParser's own semantics.
     """
-    from omnigent.inner.databricks_executor import (
+    from omnigent.harnesses.databricks.executor import (
         _databrickscfg_host_matches_and_sp_sections,
     )
 
@@ -2432,7 +2432,7 @@ def test_resolve_auth_for_host_selects_user_token_over_sp_token(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """End-to-end through the host= path: the user's bearer wins, not the SP's."""
-    from omnigent.inner import databricks_executor
+    from omnigent.harnesses.databricks import executor as databricks_executor
 
     monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(_write_sp_and_user_cfg(tmp_path)))
     monkeypatch.delenv("DATABRICKS_CONFIG_PROFILE", raising=False)
@@ -2463,7 +2463,7 @@ def test_resolve_auth_for_host_warns_when_stale_user_falls_through_to_sp(
     just triggered by a stale token. The fallback must be loud so the user
     is not left with an empty host picker without explanation.
     """
-    from omnigent.inner import databricks_executor
+    from omnigent.harnesses.databricks import executor as databricks_executor
 
     monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(_write_sp_and_user_cfg(tmp_path)))
     monkeypatch.delenv("DATABRICKS_CONFIG_PROFILE", raising=False)
@@ -2594,7 +2594,7 @@ def test_databrickscfg_workspace_id_for_host_missing_file_returns_none(
 
 def test_reused_token_source_re_resolves_when_cached_auth_goes_stale(monkeypatch):
     """A stale cached auth is replaced before retrying the mint."""
-    from omnigent.inner.databricks_executor import (
+    from omnigent.harnesses.databricks.executor import (
         _DatabricksBearerAuth,
         _ReusedDatabricksTokenSource,
     )
@@ -2616,7 +2616,7 @@ def test_reused_token_source_re_resolves_when_cached_auth_goes_stale(monkeypatch
         return _DatabricksBearerAuth(cfgs[-1], profile_name=None), "https://ex.test"
 
     monkeypatch.setattr(
-        "omnigent.inner.databricks_executor._resolve_databricks_auth", _fake_resolve
+        "omnigent.harnesses.databricks.executor._resolve_databricks_auth", _fake_resolve
     )
 
     source = _ReusedDatabricksTokenSource()
@@ -2633,7 +2633,7 @@ def test_reused_token_source_re_resolves_when_cached_auth_goes_stale(monkeypatch
 
 def test_reused_token_source_retries_resolution_after_failure(monkeypatch):
     """A failed resolution is retried on the next mint."""
-    from omnigent.inner.databricks_executor import (
+    from omnigent.harnesses.databricks.executor import (
         DatabricksAuthError,
         _DatabricksBearerAuth,
         _ReusedDatabricksTokenSource,
@@ -2651,7 +2651,7 @@ def test_reused_token_source_retries_resolution_after_failure(monkeypatch):
         return _DatabricksBearerAuth(_Cfg(), profile_name=None), "https://ex.test"
 
     monkeypatch.setattr(
-        "omnigent.inner.databricks_executor._resolve_databricks_auth", _fake_resolve
+        "omnigent.harnesses.databricks.executor._resolve_databricks_auth", _fake_resolve
     )
 
     source = _ReusedDatabricksTokenSource()

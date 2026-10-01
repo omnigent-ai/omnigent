@@ -7,14 +7,14 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 
-from omnigent.inner.model_egress import FrozenModelRoute
-from omnigent.inner.model_signer_service import (
+from omnigent.models.signer.egress import FrozenModelRoute
+from omnigent.models.signer.service import (
     _MAX_BODY_BYTES,
     _parse_strict_request_headers,
     _parse_strict_request_line,
     _SignerRelay,
 )
-from omnigent.inner.model_signing import SigningRejected
+from omnigent.models.signer.signing import SigningRejected
 
 _ROUTE = FrozenModelRoute(method="POST", host="model.test", path="/v1/responses")
 
@@ -319,7 +319,7 @@ async def test_client_disconnect_aborts_response_stream() -> None:
 
 async def test_idle_response_timeout_is_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
-        "omnigent.inner.model_signer_service._RESPONSE_IDLE_TIMEOUT_SECONDS",
+        "omnigent.models.signer.service._RESPONSE_IDLE_TIMEOUT_SECONDS",
         0.001,
     )
     relay = object.__new__(_SignerRelay)
@@ -336,7 +336,7 @@ async def test_idle_response_timeout_is_bounded(monkeypatch: pytest.MonkeyPatch)
 
 async def test_total_response_timeout_is_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
-        "omnigent.inner.model_signer_service._RESPONSE_TOTAL_TIMEOUT_SECONDS",
+        "omnigent.models.signer.service._RESPONSE_TOTAL_TIMEOUT_SECONDS",
         0.0,
     )
     relay = object.__new__(_SignerRelay)
@@ -359,7 +359,7 @@ async def test_total_response_timeout_bounds_client_backpressure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
-        "omnigent.inner.model_signer_service._RESPONSE_TOTAL_TIMEOUT_SECONDS",
+        "omnigent.models.signer.service._RESPONSE_TOTAL_TIMEOUT_SECONDS",
         0.001,
     )
     relay = object.__new__(_SignerRelay)
@@ -373,7 +373,7 @@ async def test_total_response_timeout_bounds_client_backpressure(
 
 
 async def test_unframed_infinite_response_is_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr("omnigent.inner.model_signer_service._MAX_RESPONSE_BODY_BYTES", 4)
+    monkeypatch.setattr("omnigent.models.signer.service._MAX_RESPONSE_BODY_BYTES", 4)
     relay = object.__new__(_SignerRelay)
     relay._credential_source = Mock()
     client = _Writer()

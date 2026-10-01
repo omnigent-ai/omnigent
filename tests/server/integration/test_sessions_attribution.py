@@ -21,7 +21,6 @@ import pytest
 from fastapi import FastAPI
 
 from omnigent.entities import MessageData, NewConversationItem
-from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.app import create_app
 from omnigent.server.auth import LEVEL_EDIT
@@ -38,6 +37,7 @@ from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
 from omnigent.stores.permission_store.sqlalchemy_store import (
     SqlAlchemyPermissionStore,
 )
+from omnigent.util.runner_identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
 from tests.server.helpers import create_test_agent
 
 _RUNNER_BINDING_TOKEN = "runner-created-by-token"

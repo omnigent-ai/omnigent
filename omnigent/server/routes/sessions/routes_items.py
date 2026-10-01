@@ -33,11 +33,11 @@ from omnigent.server.routes._errors import (
     STALE_CURSOR_RESPONSE,
 )
 from omnigent.server.routes._errors import session_not_found as _session_not_found
-from omnigent.server.routes._sessions.common import (
+from omnigent.server.routes.sessions.common import (
     get_server_runner_router,
     set_server_runner_router,
 )
-from omnigent.server.routes._sessions.orchestration import (
+from omnigent.server.routes.sessions.orchestration import (
     _child_session_summaries_from_conversations,
 )
 from omnigent.server.schemas import (

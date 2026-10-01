@@ -63,7 +63,7 @@ _LABEL_GATE_EXTRA_CONFIG: dict = {
     "policies": {
         "taint_on_banana": {
             "type": "function",
-            "handler": "omnigent._e2e_policy_callables.taint_on_banana",
+            "handler": "omnigent.testing.e2e_policy_callables.taint_on_banana",
         },
         "deny_when_tainted": {
             "type": "function",
@@ -191,7 +191,7 @@ def test_policy_gate_allows_clean_message(
             "policies": {
                 "block_sentinel": {
                     "type": "function",
-                    "handler": "omnigent._e2e_policy_callables.block_on_sentinel",
+                    "handler": "omnigent.testing.e2e_policy_callables.block_on_sentinel",
                 },
             },
         },

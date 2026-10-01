@@ -23,7 +23,7 @@ user cannot tell whether the agent completed, died, or is waiting.
 
 Root-cause lead (for the fix step, not asserted here): the server *does* publish
 ``response.elicitation_resolved`` with ``action: "accept"``
-(``omnigent/server/routes/_sessions/helpers.py:_publish_elicitation_resolved``),
+(``omnigent/server/routes/sessions/helpers.py:_publish_elicitation_resolved``),
 but the SPA drops the action — the SSE parser
 (``web/src/lib/sse.ts``, ``response.elicitation_resolved`` branch) keeps only
 ``elicitationId``, and the chat-store handler

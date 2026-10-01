@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from omnigent.inner.goose_executor import GooseExecutor
+from omnigent.harnesses.goose.executor import GooseExecutor
 
 
 def _make_executor() -> GooseExecutor:

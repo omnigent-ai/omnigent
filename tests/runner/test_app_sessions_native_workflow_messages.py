@@ -1358,8 +1358,7 @@ async def test_session_creation_does_not_replay_trailing_user_for_codex_native(
     runner_app_mod._session_histories_ref.pop(session_id, None)
 
     monkeypatch.setattr(
-        runner_app_mod,
-        "_auto_create_codex_terminal",
+        "omnigent.runner.native.orchestration._auto_create_codex_terminal",
         _fake_auto_create_codex_terminal,
     )
 
@@ -1443,8 +1442,7 @@ async def test_catch_up_scan_skips_codex_native_history_entries(
         return spec
 
     monkeypatch.setattr(
-        runner_app_mod,
-        "_auto_create_codex_terminal",
+        "omnigent.runner.native.orchestration._auto_create_codex_terminal",
         _fake_auto_create_codex_terminal,
     )
 

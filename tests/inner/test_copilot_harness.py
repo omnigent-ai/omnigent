@@ -1,4 +1,4 @@
-"""Tests for ``omnigent/inner/copilot_harness.py`` — the ``harness: copilot`` wrap.
+"""Tests for ``omnigent/harnesses/copilot/harness.py`` — the ``harness: copilot`` wrap.
 
 The wrap reads ``HARNESS_COPILOT_*`` env vars and constructs a
 :class:`CopilotExecutor` lazily. Constructing the executor does NOT import the
@@ -13,8 +13,8 @@ import json
 
 import pytest
 
-from omnigent.inner import copilot_harness as ch
-from omnigent.inner.copilot_executor import CopilotExecutor
+from omnigent.harnesses.copilot import harness as ch
+from omnigent.harnesses.copilot.executor import CopilotExecutor
 
 
 @pytest.fixture(autouse=True)

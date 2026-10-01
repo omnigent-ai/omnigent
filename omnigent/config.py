@@ -54,7 +54,7 @@ def _merge_effective_config(
     per-harness overrides. So the ``harness`` key is merged one level deep
     (per-harness sub-keys, local winning per-field) while every other key
     stays a shallow replace (local wins outright). See
-    :mod:`omnigent.harness_startup_config` for the ``harness:`` shape.
+    :mod:`omnigent.harnesses.startup_config` for the ``harness:`` shape.
 
     :param global_cfg: User-level config (``~/.omnigent/config.yaml``).
     :param local_cfg: Project-level config (``.omnigent/config.yaml``).

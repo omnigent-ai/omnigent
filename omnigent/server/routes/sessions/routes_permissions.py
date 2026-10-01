@@ -13,12 +13,12 @@ from fastapi import (
 from fastapi.responses import Response
 
 from omnigent.db.account_authority import target_account_scope
-from omnigent.debug_logging import add_audit_attrs
 from omnigent.entities import (
     Agent,
 )
 from omnigent.errors import ErrorCode, OmnigentError
-from omnigent.native.native_coding_agents import native_coding_agent_for_agent_name
+from omnigent.harnesses.native.coding_agents import native_coding_agent_for_agent_name
+from omnigent.observability.debug_logging import add_audit_attrs
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.runtime.policies.approval import _ELICITATION_MODE
 from omnigent.server._elicitation_registry import (
@@ -47,12 +47,12 @@ from omnigent.server.routes._auth_helpers import (
 from omnigent.server.routes._auth_helpers import (
     require_user as _require_user,
 )
-from omnigent.server.routes._sessions.common import (
+from omnigent.server.routes.sessions.common import (
     _logger,
     get_server_runner_router,
     set_server_runner_router,
 )
-from omnigent.server.routes._sessions.helpers import (
+from omnigent.server.routes.sessions.helpers import (
     _announce_session_added,
 )
 from omnigent.server.schemas import (

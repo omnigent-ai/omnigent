@@ -6,7 +6,7 @@ per-session private ``CODEX_HOME`` (see
 a short subprocess before/after each built-in tool call, piping the hook
 payload on stdin and reading a verdict on stdout. The conversion to/from
 the Omnigent policy schema is shared with the Claude-native hook via
-:mod:`omnigent.native.native_policy_hook`.
+:mod:`omnigent.harnesses.native.policy_hook`.
 """
 
 from __future__ import annotations
@@ -23,7 +23,7 @@ from omnigent.harnesses.codex_native.bridge import (
     read_codex_config_model,
     read_policy_hook_config,
 )
-from omnigent.native.native_policy_hook import (
+from omnigent.harnesses.native.policy_hook import (
     evaluation_response_to_hook_output,
     fail_ask_hook_output,
     hook_payload_to_evaluation_request,
@@ -58,7 +58,7 @@ def main(argv: list[str] | None = None) -> int:
     """
     raw_argv = sys.argv[1:] if argv is None else argv
     if raw_argv and raw_argv[0] == "observe-tool":
-        from omnigent.native.tool_observer_hook import main as observe_main
+        from omnigent.harnesses.native.tool_observer_hook import main as observe_main
 
         return observe_main(raw_argv[1:])
     if raw_argv and raw_argv[0] == "evaluate-policy":
@@ -79,7 +79,7 @@ def _main_evaluate_policy(argv: list[str]) -> int:
 
     Reads the hook JSON payload from stdin, converts it into the
     proto-compatible ``EvaluationRequest`` schema via
-    :func:`omnigent.native.native_policy_hook.hook_payload_to_evaluation_request`,
+    :func:`omnigent.harnesses.native.policy_hook.hook_payload_to_evaluation_request`,
     POSTs to ``/v1/sessions/{id}/policies/evaluate``, and converts the
     ``EvaluationResponse`` back into Codex's hook output format
     (``hookSpecificOutput.permissionDecision`` for PreToolUse;
@@ -285,7 +285,7 @@ def _main_route_turn(argv: list[str]) -> int:
         trace_turn_routing(bridge_dir, "skip", "no prompt text on this submit")
         return 0
 
-    from omnigent.inner.hook_scripts.subagent_router import read_router_endpoint
+    from omnigent.harnesses.native.hook_scripts.subagent_router import read_router_endpoint
 
     endpoint = read_router_endpoint(bridge_dir, filename=ADVERTISEMENT_FILE)
     if endpoint is None:

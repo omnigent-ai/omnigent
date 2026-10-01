@@ -46,7 +46,7 @@ def cursor_sdk_installed() -> bool:
     """Return whether the ``cursor-sdk`` SDK (the optional extra) is importable.
 
     The executor imports it lazily on the first turn
-    (:mod:`omnigent.inner.cursor_executor`), so a key can be set with no SDK;
+    (:mod:`omnigent.harnesses.cursor.executor`), so a key can be set with no SDK;
     setup uses this to detect that and offer to install it. Mirrors
     :func:`omnigent.onboarding.databricks_config.databricks_sdk_installed` /
     :func:`omnigent.onboarding.antigravity_auth.antigravity_sdk_installed`:
@@ -193,7 +193,7 @@ def cursor_api_key_configured(config: dict[str, object] | None = None) -> bool:
 def cursor_api_key_settings(ref: str) -> dict[str, object]:
     """Build the ``{"cursor": {...}}`` settings dict that records *ref*.
 
-    Handed to :func:`omnigent.cli._save_global_config` (a shallow update, so
+    Handed to :func:`omnigent.cli.commands._save_global_config` (a shallow update, so
     it replaces the whole ``cursor:`` block) to persist the reference.
 
     :param ref: The secret reference to record, e.g. ``"keychain:cursor"``

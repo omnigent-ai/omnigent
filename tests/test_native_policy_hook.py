@@ -5,8 +5,8 @@ from __future__ import annotations
 import httpx
 import pytest
 
-from omnigent.native import native_policy_hook
-from omnigent.native.native_policy_hook import (
+from omnigent.harnesses.native import policy_hook as native_policy_hook
+from omnigent.harnesses.native.policy_hook import (
     _is_login_redirect_or_unauthorized,
     evaluation_response_to_hook_output,
     fail_ask_hook_output,
@@ -807,7 +807,7 @@ def test_policy_hook_wrapper_script_bakes_auth_and_routing(
     workspace routing for free — the gap that left the cursor/hermes hooks
     posting unauthenticated and unrouted.
     """
-    import omnigent.cli_auth as cli_auth
+    import omnigent.cli.auth as cli_auth
     import omnigent.runner._entry as entry
 
     monkeypatch.setattr(
@@ -838,7 +838,7 @@ def test_policy_hook_wrapper_script_omits_auth_when_unauthenticated(
     The wrapper still exports the (empty) header dict, so the reader yields
     just ``Content-Type`` — non-workspace callers are unaffected.
     """
-    import omnigent.cli_auth as cli_auth
+    import omnigent.cli.auth as cli_auth
     import omnigent.runner._entry as entry
 
     monkeypatch.setattr(entry, "_make_auth_token_factory", lambda *, server_url=None: None)

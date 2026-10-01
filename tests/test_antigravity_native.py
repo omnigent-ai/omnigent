@@ -18,13 +18,13 @@ import pytest
 
 import omnigent.harnesses.antigravity_native.bridge as bridge_mod
 import omnigent.harnesses.antigravity_native.main as _mod
-from omnigent._wrapper_labels import ANTIGRAVITY_NATIVE_WRAPPER_VALUE, WRAPPER_LABEL_KEY
 from omnigent.harnesses.antigravity_native.bridge import (
     ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY,
     read_bridge_state,
     read_tmux_info,
 )
 from omnigent.harnesses.antigravity_native.main import antigravity_terminal_resource_id
+from omnigent.harnesses.wrapper_labels import ANTIGRAVITY_NATIVE_WRAPPER_VALUE, WRAPPER_LABEL_KEY
 
 
 def _mock_client(handler: Callable[[httpx.Request], httpx.Response]) -> httpx.AsyncClient:
@@ -249,7 +249,7 @@ async def test_daemon_resume_reattaches_to_running_terminal(
             headers={"Authorization": "Bearer t"},
             session_id="conv_abc123",
             session_bundle=None,
-            antigravity_args=(),
+            extra_args=(),
             command="agy",
             model=None,
             host_id="host_1",
@@ -317,7 +317,7 @@ async def test_daemon_resume_cold_falls_through_to_launch(
             headers={},
             session_id="conv_abc123",
             session_bundle=None,
-            antigravity_args=(),
+            extra_args=(),
             command="agy",
             model=None,
             host_id="host_1",
@@ -397,7 +397,7 @@ async def test_daemon_fresh_launch_reattaches_to_runner_autocreated_terminal(
             headers={},
             session_id=None,
             session_bundle=b"bundle",
-            antigravity_args=(),
+            extra_args=(),
             command="agy",
             model=None,
             host_id="host_1",
@@ -473,7 +473,7 @@ async def test_local_fresh_launch_reattaches_to_runner_autocreated_terminal(
             session_id=None,
             runner_id="runner_local_1",
             session_bundle=b"bundle",
-            antigravity_args=(),
+            extra_args=(),
             command="agy",
             model=None,
             startup_progress=None,
@@ -530,7 +530,7 @@ async def test_launch_and_record_advertises_tmux_target_when_pane_exposed(
             bridge_id=bridge_id,
             conversation_id="agy_conv_placeholder",
             resume=False,
-            antigravity_args=(),
+            extra_args=(),
             command="agy",
             model=None,
             startup_progress=None,
@@ -610,7 +610,7 @@ async def test_launch_and_record_threads_headless_skip_flag(
             bridge_id="bridge_headless_test",
             conversation_id=_PLACEHOLDER_ID,
             resume=False,
-            antigravity_args=(),
+            extra_args=(),
             command="agy",
             model=None,
             permission_mode=None,
@@ -656,7 +656,7 @@ async def test_launch_and_record_isolates_gemini_dir_and_wires_relay(
             bridge_id="bridge_gemini_dir_test",
             conversation_id=_PLACEHOLDER_ID,
             resume=False,
-            antigravity_args=(),
+            extra_args=(),
             command="agy",
             model=None,
             permission_mode=None,

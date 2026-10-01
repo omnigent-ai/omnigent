@@ -108,7 +108,7 @@ runner binding via atomic CAS (`set_runner_id`, `WHERE runner_id IS NULL`).
 
 **Taxonomy — two families** (this split explains most behavior differences). *In scope: claude + codex only.*
 - **SDK harnesses** — in-process agent loop; Omnigent owns prompt + tool set + turn loop;
-  user sees only the Omnigent WebUI; transcript is 100% Omnigent. Base `omnigent/inner/executor.py`.
+  user sees only the Omnigent WebUI; transcript is 100% Omnigent. Base `omnigent/core/executor.py`.
   (in scope: **claude-sdk**, **codex** — headless. **Polly / custom agents** run here too, typically on claude-sdk.)
 - **Native harnesses** — drive a resident vendor CLI/TUI in a tmux pane and **mirror** its
   transcript back; the *vendor* owns the system prompt + tool set; transcript lives in the

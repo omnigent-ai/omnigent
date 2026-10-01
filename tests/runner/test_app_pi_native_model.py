@@ -323,7 +323,7 @@ async def test_auto_create_pi_terminal_bakes_tunnel_token_into_config(
     """
     import omnigent.harnesses.pi_native.bridge as pi_bridge
     import omnigent.harnesses.pi_native.credentials as creds
-    from omnigent.runner.identity import (
+    from omnigent.util.runner_identity import (
         RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR,
         RUNNER_TUNNEL_TOKEN_HEADER,
     )

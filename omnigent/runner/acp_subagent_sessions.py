@@ -162,7 +162,7 @@ async def _complete_acp_subagent_child(
     :param title: The sub-agent's display name, used as the summary message's
         author; falls back to *child_key* when empty.
     """
-    from omnigent.native._native_post_delivery import post_external_session_status
+    from omnigent.harnesses.native.post_delivery import post_external_session_status
 
     try:
         child_id = await asyncio.wait_for(

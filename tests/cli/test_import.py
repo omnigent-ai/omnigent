@@ -11,7 +11,7 @@ import httpx
 import respx
 from click.testing import CliRunner
 
-from omnigent.cli import _CLICK_SUBCOMMANDS, cli
+from omnigent.cli.commands import _CLICK_SUBCOMMANDS, cli
 from omnigent.session_import.models import SessionImportNotFoundError
 
 _BASE = "http://localhost:6767"
@@ -57,7 +57,7 @@ def test_import_command_loads_local_session_and_posts_normalized_items(tmp_path:
         )
     )
 
-    with patch("omnigent.cli._resolve_attach_server", return_value=_BASE):
+    with patch("omnigent.cli.commands._resolve_attach_server", return_value=_BASE):
         result = CliRunner().invoke(
             cli,
             ["import", "--harness", "claude", "--session", session_id],
@@ -102,7 +102,7 @@ def test_import_command_sends_force_override(tmp_path: Path) -> None:
         )
     )
 
-    with patch("omnigent.cli._resolve_attach_server", return_value=_BASE):
+    with patch("omnigent.cli.commands._resolve_attach_server", return_value=_BASE):
         result = CliRunner().invoke(
             cli,
             ["import", "--harness", "claude", "--session", session_id, "--force"],
@@ -130,7 +130,7 @@ def test_import_command_binds_local_host_when_configured(tmp_path: Path) -> None
 
     identity = HostIdentity(host_id="a1b2c3d4e5f67890abcdef1234567890", name="my-box")
     with (
-        patch("omnigent.cli._resolve_attach_server", return_value=_BASE),
+        patch("omnigent.cli.commands._resolve_attach_server", return_value=_BASE),
         # The autouse _no_ambient_host fixture stubs this to None; re-patch so
         # this machine looks like a configured host.
         patch(
@@ -162,7 +162,7 @@ def test_import_command_omits_host_id_when_not_a_host(tmp_path: Path) -> None:
         )
     )
 
-    with patch("omnigent.cli._resolve_attach_server", return_value=_BASE):
+    with patch("omnigent.cli.commands._resolve_attach_server", return_value=_BASE):
         result = CliRunner().invoke(
             cli,
             ["import", "--harness", "claude", "--session", session_id],
@@ -210,7 +210,7 @@ def test_import_command_accepts_qwen_session(tmp_path: Path) -> None:
         )
     )
 
-    with patch("omnigent.cli._resolve_attach_server", return_value=_BASE):
+    with patch("omnigent.cli.commands._resolve_attach_server", return_value=_BASE):
         result = CliRunner().invoke(
             cli,
             ["import", "--harness", "qwen", "--session", session_id],
@@ -244,7 +244,7 @@ def test_import_command_accepts_opencode_export() -> None:
     }
 
     with (
-        patch("omnigent.cli._resolve_attach_server", return_value=_BASE),
+        patch("omnigent.cli.commands._resolve_attach_server", return_value=_BASE),
         patch("omnigent.session_import.local._run_opencode_json", return_value=export),
     ):
         result = CliRunner().invoke(
@@ -305,7 +305,7 @@ def test_import_command_imports_last_sessions_oldest_first_and_skips_duplicates(
 
     route = respx.post(f"{_BASE}/v1/imports").mock(side_effect=_respond)
 
-    with patch("omnigent.cli._resolve_attach_server", return_value=_BASE):
+    with patch("omnigent.cli.commands._resolve_attach_server", return_value=_BASE):
         result = CliRunner().invoke(
             cli,
             ["import", "--harness", "claude", "--last", "2"],
@@ -354,7 +354,7 @@ def test_import_command_batch_reports_oldest_first_despite_completion_order(
 
     respx.post(f"{_BASE}/v1/imports").mock(side_effect=_respond)
 
-    with patch("omnigent.cli._resolve_attach_server", return_value=_BASE):
+    with patch("omnigent.cli.commands._resolve_attach_server", return_value=_BASE):
         result = CliRunner().invoke(
             cli,
             ["import", "--harness", "claude", "--last", "3"],
@@ -391,7 +391,7 @@ def test_import_command_continues_batch_after_session_failure(tmp_path: Path) ->
         ]
     )
 
-    with patch("omnigent.cli._resolve_attach_server", return_value=_BASE):
+    with patch("omnigent.cli.commands._resolve_attach_server", return_value=_BASE):
         result = CliRunner().invoke(
             cli,
             ["import", "--harness", "claude", "--last", "2"],
@@ -432,7 +432,7 @@ def test_import_command_continues_batch_after_network_failure(tmp_path: Path) ->
 
     respx.post(f"{_BASE}/v1/imports").mock(side_effect=_respond)
 
-    with patch("omnigent.cli._resolve_attach_server", return_value=_BASE):
+    with patch("omnigent.cli.commands._resolve_attach_server", return_value=_BASE):
         result = CliRunner().invoke(
             cli,
             ["import", "--harness", "claude", "--last", "2"],
@@ -516,7 +516,7 @@ def test_import_command_all_harnesses_spans_sources() -> None:
     )
 
     with (
-        patch("omnigent.cli._resolve_attach_server", return_value=_BASE),
+        patch("omnigent.cli.commands._resolve_attach_server", return_value=_BASE),
         patch("omnigent.session_import.local.list_recent_sessions_across_harnesses", fake_across),
         patch("omnigent.session_import.local.load_local_session", fake_load),
     ):

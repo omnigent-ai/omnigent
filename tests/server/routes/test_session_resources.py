@@ -18,8 +18,8 @@ from fastapi.responses import FileResponse, JSONResponse
 
 from omnigent.entities import DEFAULT_ENVIRONMENT_ID, Conversation, ConversationItem, PagedList
 from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.harnesses.native.coding_agents import CLAUDE_NATIVE_AGENT_NAME
 from omnigent.host.frames import HOST_CAPABILITIES, HostHelloFrame
-from omnigent.native.native_coding_agents import CLAUDE_NATIVE_AGENT_NAME
 from omnigent.runtime import (
     _globals,
     session_stream,
@@ -1384,7 +1384,7 @@ def bash_terminal_spec(monkeypatch: pytest.MonkeyPatch) -> None:
     :param monkeypatch: Pytest monkeypatch fixture.
     :returns: None.
     """
-    from omnigent.inner.datamodel import TerminalEnvSpec
+    from omnigent.core.datamodel import TerminalEnvSpec
     from omnigent.server.routes import sessions as sessions_module
     from omnigent.spec.types import AgentSpec
 
@@ -1399,7 +1399,7 @@ def bash_terminal_spec(monkeypatch: pytest.MonkeyPatch) -> None:
 @pytest.fixture
 def bash_only_native_host(app: FastAPI, monkeypatch: pytest.MonkeyPatch) -> None:
     """Bind the canned session to a native spec on a bash-only host."""
-    from omnigent.inner.datamodel import TerminalEnvSpec
+    from omnigent.core.datamodel import TerminalEnvSpec
     from omnigent.server.routes import sessions as sessions_module
     from omnigent.spec.types import AgentSpec
 
@@ -2398,7 +2398,7 @@ async def test_copy_spends_the_child_workspace_quota(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Copies count against the child's workspace quota, like uploads."""
-    from omnigent.harness_plugins import CLAUDE_NATIVE_CODING_AGENT
+    from omnigent.harnesses.registry import CLAUDE_NATIVE_CODING_AGENT
 
     monkeypatch.setattr(
         "omnigent.server.server_config.filesystem_attachment_file_limit",
@@ -2462,10 +2462,10 @@ async def test_downscaled_upload_reaches_native_resolver(
 
     from PIL import Image
 
-    from omnigent.inner.codex_native_executor import _content_to_input_items
-    from omnigent.inner.native_attachments import framework_notices
+    from omnigent.harnesses.codex_native.executor import _content_to_input_items
     from omnigent.runner.app import _resolve_forwarded_message_content
     from omnigent.runtime import content_resolver
+    from omnigent.util.attachments import framework_notices
 
     monkeypatch.setattr(content_resolver, "IMAGE_MODEL_BUDGET_BYTES", 1024)
     monkeypatch.setattr(content_resolver, "IMAGE_MAX_EDGE_PX", 64)
@@ -3727,7 +3727,7 @@ async def test_filesystem_save_reconnects_runner_on_live_host(
     from types import SimpleNamespace
 
     from omnigent.server.routes import sessions as sessions_module
-    from omnigent.server.routes._sessions import orchestration
+    from omnigent.server.routes.sessions import orchestration
 
     session_id = "79b22ebd2309e48fdeb450c65611d51b"
     store = app.state.test_conversation_store
@@ -6177,8 +6177,8 @@ async def test_native_dispatch_tunnel_drop_retries_ensure_after_runner_reconnect
     import dataclasses
 
     from omnigent.runtime import pending_inputs
-    from omnigent.server.routes._sessions import orchestration as orchestration_module
     from omnigent.server.routes.sessions import _dispatch_session_event_to_runner
+    from omnigent.server.routes.sessions import orchestration as orchestration_module
 
     pending_inputs.reset_for_tests()
     store = _ConversationStore()
@@ -7927,7 +7927,7 @@ def offline_env_app(
     del runner_globals_reset
     from types import SimpleNamespace
 
-    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+    from omnigent.core.datamodel import OSEnvSandboxSpec, OSEnvSpec
     from omnigent.server.routes.sessions import routes_resources as _routes
 
     conv = Conversation(
@@ -8562,7 +8562,7 @@ async def test_copy_new_type_refuses_old_runtime(
     artifact_store: _InMemoryArtifactStore,
 ) -> None:
     """A capable harness on an old host cannot receive a copied binary file."""
-    from omnigent.harness_plugins import CLAUDE_NATIVE_CODING_AGENT
+    from omnigent.harnesses.registry import CLAUDE_NATIVE_CODING_AGENT
 
     child = "405bfe154d5c0e795a2b87021bc897bf"
     parent = "b460374fc8e697b296708f52dc9d8179"

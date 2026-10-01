@@ -63,7 +63,7 @@ import psutil
 import pytest
 import yaml
 
-from omnigent.process_logging import PROCESS_LOG_FILE_ENV_VAR
+from omnigent.observability.process_logging import PROCESS_LOG_FILE_ENV_VAR
 from tests._helpers.compat import apply_runner_env, compat_runner_cwd, runner_executable
 from tests.e2e._harness_probes import cli_unavailable_reason
 from tests.e2e.helpers import POLL_INTERVAL_S

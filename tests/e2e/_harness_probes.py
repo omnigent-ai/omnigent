@@ -9,7 +9,7 @@ up (``[claude-sdk]``, ``[codex]``, etc.) and a per-harness failure
 is visible without re-reading the parametrize tuple.
 
 Add a new entry here when a new harness wrap lands in
-:data:`omnigent.runtime.harnesses._HARNESS_MODULES`. Every
+:data:`omnigent.harnesses.runtime._HARNESS_MODULES`. Every
 parametrized e2e test then picks up the new harness without
 per-file edits.
 """

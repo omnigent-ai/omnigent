@@ -6,7 +6,7 @@ Drives the ``antigravity`` harness end-to-end through the production
 ``POST /v1/sessions/{id}/events`` → poll the session to idle — then asserts over
 the *persisted transcript items* (``GET /v1/sessions/{id}/items``), NOT stdout
 chrome. This exercises the full producer/consumer path in
-:mod:`omnigent.inner.antigravity_executor`: ``conversation.send`` →
+:mod:`omnigent.harnesses.antigravity.executor`: ``conversation.send`` →
 ``receive_steps()`` → the MODEL→USER ``content_delta`` mapping onto
 :class:`TextChunk` → the terminal :class:`TurnComplete` whose accumulated text
 the runner persists as an assistant ``message`` item.

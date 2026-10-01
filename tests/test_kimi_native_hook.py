@@ -18,7 +18,7 @@ from omnigent.harnesses.kimi_native.bridge import (
     KimiApprovalPromptNotFoundError,
     write_hook_config,
 )
-from omnigent.native.native_policy_hook import _EVAL_UNAVAILABLE_REASON
+from omnigent.harnesses.native.policy_hook import _EVAL_UNAVAILABLE_REASON
 
 
 def _governed_bridge(tmp_path: Path, *, server: str = "http://127.0.0.1:8787") -> Path:

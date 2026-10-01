@@ -3,7 +3,7 @@
 A pi-harness turn whose tool call runs longer than the executor's
 120s stdout idle budget must survive to completion. Today it dies
 with ``inner executor error: Pi process ended without response.``:
-``omnigent/inner/pi_executor.py`` reads pi's stdout with
+``omnigent/harnesses/pi/executor.py`` reads pi's stdout with
 ``rpc.read_line(timeout=120.0)`` and treats a timeout exactly like
 EOF, so a tool that stays silent for >120s (a long build, test
 suite, download, ...) kills the turn even though the pi process is

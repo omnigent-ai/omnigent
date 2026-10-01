@@ -168,7 +168,7 @@ class TestBuildAgyLaunch:
         assert paths[0] != paths[1]
 
     def test_each_launch_has_a_fresh_csrf_token(self, fake_agy: str) -> None:
-        from omnigent.process_logging import redact_log_text
+        from omnigent.observability.process_logging import redact_log_text
 
         tokens = []
         for resume in (False, True):

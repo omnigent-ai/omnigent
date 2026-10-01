@@ -42,7 +42,7 @@
 #   goose     → vendor installer (aaif-goose/goose download_cli.sh), default
 #               pin 1.38.0 (mirroring _GOOSE_MIN_VERSION)
 #   jcode     → vendor installer (1jehuang/jcode install.sh) — jcode is a
-#               builtin harness (omnigent/acp_cli_harnesses.py); a managed
+#               builtin harness (omnigent/harnesses/acp/cli_harnesses.py); a managed
 #               deployment still needs the binary on the host's PATH, since
 #               the sandbox cannot run the installer at session start
 #   cursor    → vendor installer (cursor.com/install) — always fetches the

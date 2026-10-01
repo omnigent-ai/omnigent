@@ -3,15 +3,15 @@ End-to-end smoke test for the per-harness wraps with a real LLM
 behind each, against the session-keyed harness API surface.
 
 Parametrized across every harness wrap registered in
-:data:`omnigent.runtime.harnesses._HARNESS_MODULES`. For each:
+:data:`omnigent.harnesses.runtime._HARNESS_MODULES`. For each:
 spawn a real harness subprocess via
 :class:`HarnessProcessManager`, drive a turn via the session-keyed
 ``POST /v1/sessions/{conversation_id}/events`` endpoint with a
 deterministic prompt, and verify the full round-trip works:
 
 - The runner subprocess loads the wrap module
-  (e.g. :mod:`omnigent.inner.claude_sdk_harness` or
-  :mod:`omnigent.inner.codex_harness`).
+  (e.g. :mod:`omnigent.harnesses.claude_sdk.harness` or
+  :mod:`omnigent.harnesses.codex.harness`).
 - Reads its ``HARNESS_<HARNESS>_*`` env vars (per-spawn, per
   harness contract step 5a).
 - Constructs a real inner Executor configured for the Databricks
@@ -56,7 +56,7 @@ from typing import Any
 import httpx
 import pytest
 
-from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
+from omnigent.harnesses.runtime.process_manager import HarnessProcessManager
 from tests.e2e._harness_probes import (
     HARNESS_IDS,
     HARNESS_PROBES,
@@ -201,7 +201,7 @@ async def test_harness_wrap_real_llm_smoke(
         # output for debugging.
         #
         # Wire shape: session-keyed ``MessageEvent`` body per
-        # ``omnigent/runtime/harnesses/_scaffold.py``. The
+        # ``omnigent/harnesses/runtime/_scaffold.py``. The
         # outer ``type``/``role`` discriminate this as a fresh
         # downward user-side ``message`` event; ``content`` is
         # a list of input blocks the scaffold forwards to the

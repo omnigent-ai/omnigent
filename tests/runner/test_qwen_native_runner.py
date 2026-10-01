@@ -9,7 +9,10 @@ import httpx
 import pytest
 
 from omnigent.harnesses.qwen_native import bridge as qnb
-from omnigent.runner.app import _build_qwen_fork_recording, _persist_qwen_external_session_id
+from omnigent.runner.native.orchestration import (
+    _build_qwen_fork_recording,
+    _persist_qwen_external_session_id,
+)
 
 
 class _RecordingClient:

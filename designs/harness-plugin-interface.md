@@ -46,11 +46,11 @@ uv may try to build `omnigent @ file:///Users/<user>`.
 
 ## Registry Types
 
-The public interface lives in `omnigent.harness_plugins`:
+The public interface lives in `omnigent.harnesses.registry`:
 
 ```python
-from omnigent.harness_plugins import HarnessContribution
-from omnigent.harness_install_spec import HarnessInstallSpec
+from omnigent.harnesses.registry import HarnessContribution
+from omnigent.harnesses.install_spec import HarnessInstallSpec
 ```
 
 `HarnessInstallSpec` intentionally lives outside `omnigent.onboarding` so a
@@ -103,15 +103,15 @@ installed.
 
 `harness_modules`
 : Maps each canonical harness id to the subprocess module that creates the
-harness app. `omnigent.runtime.harnesses` merges these into `_HARNESS_MODULES`.
+harness app. `omnigent.harnesses.runtime` merges these into `_HARNESS_MODULES`.
 
 `aliases`
-: User-facing spellings canonicalized by `omnigent.harness_aliases`, for example
+: User-facing spellings canonicalized by `omnigent.harnesses.aliases`, for example
 `foo-code -> foo`.
 
 `install_specs`
 : Plugin-provided CLI install/auth metadata, keyed by install key. Use
-`HarnessInstallSpec` from `omnigent.harness_install_spec`.
+`HarnessInstallSpec` from `omnigent.harnesses.install_spec`.
 
 `harness_install_keys`
 : Maps harness ids and aliases to an `install_specs` key. Readiness and
@@ -137,11 +137,11 @@ and merged into web picker surfaces.
 ## Runtime Flow
 
 1. Python loads installed entry points in `omnigent.community.harness`.
-2. `omnigent.harness_plugins.plugin_state()` merges the built-in contribution
+2. `omnigent.harnesses.registry.plugin_state()` merges the built-in contribution
    with each plugin contribution.
 3. Spec validation checks `accepted_harnesses()` and uses
    `missing_install_package()` for known optional harness hints.
-4. `omnigent.runtime.harnesses` registers `harness_modules()`.
+4. `omnigent.harnesses.runtime` registers `harness_modules()`.
 5. Runner launch paths consult `spawn_env_builders()` for contributed headless
    harnesses.
 6. Host readiness uses `harness_install_keys()` and `install_specs()` to gate
@@ -177,10 +177,10 @@ are rejected at load time until those lifecycle hooks are wired end to end.
 Entry-point loading happens early and can happen while other core modules are
 still initializing. Plugin `plugin.py` should keep top-level imports light:
 
-- safe: `omnigent.harness_plugins`, `omnigent.harness_install_spec`, constants,
+- safe: `omnigent.harnesses.registry`, `omnigent.harnesses.install_spec`, constants,
   stdlib;
-- risky: `omnigent.onboarding.*`, `omnigent.cli`, server modules, runner modules,
-  or anything that imports `omnigent.harness_aliases`.
+- risky: `omnigent.onboarding.*`, `omnigent.cli.commands`, server modules, runner modules,
+  or anything that imports `omnigent.harnesses.aliases`.
 
 Put heavy imports inside the callable that needs them. For example, a spawn-env
 builder may import provider/runtime helpers inside `build_spawn_env()`, but
@@ -195,8 +195,8 @@ cd /path/to/omnigent-oss-2
 uv pip install -e .
 uv pip install -e ../omnigent-foo
 
-uv run python -c "from omnigent.harness_plugins import valid_harnesses; print('foo' in valid_harnesses())"
-uv run python -c "from omnigent.runtime.harnesses import _HARNESS_MODULES; print(_HARNESS_MODULES['foo'])"
+uv run python -c "from omnigent.harnesses.registry import valid_harnesses; print('foo' in valid_harnesses())"
+uv run python -c "from omnigent.harnesses.runtime import _HARNESS_MODULES; print(_HARNESS_MODULES['foo'])"
 ```
 
 If the plugin dependency still points at a published or wrong local `omnigent`,

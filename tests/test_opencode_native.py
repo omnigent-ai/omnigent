@@ -541,11 +541,11 @@ def test_run_with_remote_server_aligns_cwd_before_daemon_prepare(
     import os
     from types import SimpleNamespace
 
-    import omnigent.chat as chat_mod
-    import omnigent.cli as cli_mod
+    import omnigent.cli.chat as chat_mod
+    import omnigent.cli.commands as cli_mod
     import omnigent.harnesses.opencode_native.main as on
     import omnigent.host.identity as identity_mod
-    from omnigent._runner_startup import RunnerStartupProgress
+    from omnigent.cli.runner_startup import RunnerStartupProgress
 
     start_dir = tmp_path / "start"
     aligned_dir = tmp_path / "aligned"
@@ -596,7 +596,7 @@ def test_run_with_remote_server_aligns_cwd_before_daemon_prepare(
         tmp_path / "spec.yaml",
         session_id="conv_abc",
         resume_picker=False,
-        opencode_args=(),
+        extra_args=(),
     )
 
     assert order == ["align", "ensure-daemon", "prepare", "attach"]
@@ -615,8 +615,8 @@ def test_run_with_remote_server_records_launch_after_create(
     """
     from types import SimpleNamespace
 
-    import omnigent.chat as chat_mod
-    import omnigent.cli as cli_mod
+    import omnigent.cli.chat as chat_mod
+    import omnigent.cli.commands as cli_mod
     import omnigent.harnesses.opencode_native.main as on
     import omnigent.host.identity as identity_mod
 
@@ -666,7 +666,7 @@ def test_run_with_remote_server_records_launch_after_create(
         tmp_path / "spec.yaml",
         session_id=None,
         resume_picker=False,
-        opencode_args=(),
+        extra_args=(),
     )
 
     assert order == ["ensure-daemon", "prepare", "record", "attach"]

@@ -13,7 +13,7 @@ from unittest.mock import patch
 
 import pytest
 
-from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+from omnigent.harnesses.claude_sdk.executor import ClaudeSDKExecutor
 
 
 class _FakeWorkspace(BaseHTTPRequestHandler):
@@ -103,7 +103,7 @@ async def test_databricks_profile_model_selection(
         captured.append(model)
         raise _StopAfterModelCapture()
 
-    caplog.set_level(logging.WARNING, logger="omnigent.inner.claude_sdk_executor")
+    caplog.set_level(logging.WARNING, logger="omnigent.harnesses.claude_sdk.executor")
     try:
         with patch.object(executor, "_get_or_create_client", side_effect=capture_model):
             for _ in range(2):

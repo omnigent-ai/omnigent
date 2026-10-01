@@ -803,7 +803,7 @@ def test_prune_orphaned_bridge_dirs_retains_recent_dead_owner_bridge(
     root = tmp_path / "codex-native"
     root.mkdir(parents=True)
     monkeypatch.setattr("omnigent.harnesses.codex_native.bridge._BRIDGE_ROOT", root)
-    monkeypatch.setattr("omnigent.inner.terminal._process_alive", lambda _pid: False)
+    monkeypatch.setattr("omnigent.terminals.terminal._process_alive", lambda _pid: False)
     now = 2_000_000_000.0
     monkeypatch.setattr(codex_native_bridge.time, "time", lambda: now)
 
@@ -853,7 +853,7 @@ def test_prune_orphaned_bridge_dirs_removes_expired_bridge(
     root = tmp_path / "codex-native"
     root.mkdir(parents=True)
     monkeypatch.setattr("omnigent.harnesses.codex_native.bridge._BRIDGE_ROOT", root)
-    monkeypatch.setattr("omnigent.inner.terminal._process_alive", lambda _pid: False)
+    monkeypatch.setattr("omnigent.terminals.terminal._process_alive", lambda _pid: False)
     now = 2_000_000_000.0
     monkeypatch.setattr(codex_native_bridge.time, "time", lambda: now)
 
@@ -891,7 +891,7 @@ def test_prune_orphaned_bridge_dirs_uses_latest_rollout_activity(
     root = tmp_path / "codex-native"
     root.mkdir(parents=True)
     monkeypatch.setattr("omnigent.harnesses.codex_native.bridge._BRIDGE_ROOT", root)
-    monkeypatch.setattr("omnigent.inner.terminal._process_alive", lambda _pid: False)
+    monkeypatch.setattr("omnigent.terminals.terminal._process_alive", lambda _pid: False)
     now = 2_000_000_000.0
     monkeypatch.setattr(codex_native_bridge.time, "time", lambda: now)
 
@@ -926,7 +926,7 @@ def test_prune_orphaned_bridge_dirs_retains_bridge_when_rollout_scan_fails(
     root = tmp_path / "codex-native"
     root.mkdir(parents=True)
     monkeypatch.setattr("omnigent.harnesses.codex_native.bridge._BRIDGE_ROOT", root)
-    monkeypatch.setattr("omnigent.inner.terminal._process_alive", lambda _pid: False)
+    monkeypatch.setattr("omnigent.terminals.terminal._process_alive", lambda _pid: False)
     now = 2_000_000_000.0
     monkeypatch.setattr(codex_native_bridge.time, "time", lambda: now)
 
@@ -961,7 +961,9 @@ def test_prune_orphaned_bridge_dirs_keeps_live_and_unmarked_bridges(
     root = tmp_path / "codex-native"
     root.mkdir(parents=True)
     monkeypatch.setattr("omnigent.harnesses.codex_native.bridge._BRIDGE_ROOT", root)
-    monkeypatch.setattr("omnigent.inner.terminal._process_alive", lambda pid: pid == os.getpid())
+    monkeypatch.setattr(
+        "omnigent.terminals.terminal._process_alive", lambda pid: pid == os.getpid()
+    )
     now = 2_000_000_000.0
     monkeypatch.setattr(codex_native_bridge.time, "time", lambda: now)
     expired_at = now - codex_native_bridge._ORPHAN_RETENTION_SECONDS - 1

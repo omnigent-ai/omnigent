@@ -7,7 +7,7 @@ from unittest.mock import Mock
 import pytest
 
 from omnigent.entities import ConversationItem, MessageData, PagedList
-from omnigent.server.routes._sessions.orchestration import (
+from omnigent.server.routes.sessions.orchestration import (
     _enrich_terminal_status_with_subagent_output,
 )
 from omnigent.stores.conversation_store import ConversationStore

@@ -140,8 +140,8 @@ async def local_auth_client(
 
     Same lifecycle pattern as :func:`auth_client`.
     """
+    from omnigent.harnesses.runtime.process_manager import HarnessProcessManager
     from omnigent.runtime import set_harness_process_manager
-    from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
 
     pm = HarnessProcessManager(tmp_parent=tmp_path / "harness_pm")
     await pm.start()
@@ -191,8 +191,8 @@ async def host_perm_client(
     tmp_path: Path,
 ) -> AsyncIterator[httpx.AsyncClient]:
     """HTTP client for the host-enabled auth app (mirrors ``auth_client``)."""
+    from omnigent.harnesses.runtime.process_manager import HarnessProcessManager
     from omnigent.runtime import set_harness_process_manager
-    from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
 
     pm = HarnessProcessManager(tmp_parent=tmp_path / "harness_pm")
     await pm.start()

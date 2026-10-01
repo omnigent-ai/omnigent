@@ -36,7 +36,7 @@ import re
 from functools import lru_cache
 from typing import TYPE_CHECKING
 
-from omnigent.debug_logging import runner_primary_session_id
+from omnigent.observability.debug_logging import runner_primary_session_id
 
 if TYPE_CHECKING:
     from databricks.sdk import WorkspaceClient

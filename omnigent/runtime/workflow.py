@@ -23,9 +23,8 @@ if TYPE_CHECKING:
     # TYPE_CHECKING import is only here so static type-checkers + ruff
     # can resolve the names in deferred annotations (``from __future__
     # import annotations`` is in effect).
-    from omnigent.inner.datamodel import OSEnvSpec
+    from omnigent.core.datamodel import OSEnvSpec
 
-from omnigent.cli_invocation import cli_invocation
 from omnigent.entities import (
     NON_CONTENT_ITEM_TYPES,
     CompactionData,
@@ -38,13 +37,13 @@ from omnigent.errors import (
     StaleCursorError,
     restart_on_stale_cursor,
 )
-from omnigent.inner.model_egress import (
-    UCODE_SIGNER_BINDING_ID,
-    registered_model_provider_binding,
-)
 from omnigent.llms import Client as LLMClient
 from omnigent.models.model_catalog import resolve_catalog_model
 from omnigent.models.model_resolver import ModelResolutionError
+from omnigent.models.signer.egress import (
+    UCODE_SIGNER_BINDING_ID,
+    registered_model_provider_binding,
+)
 from omnigent.onboarding.databricks_config import (
     get_workspace_url_for_profile,
 )
@@ -96,6 +95,7 @@ from omnigent.spec.types import (
     RetryPolicy,
 )
 from omnigent.stores import ConversationStore
+from omnigent.util.cli_invocation import cli_invocation
 from omnigent.util.env_credentials import expand_envvars_with_omnigent_prefix
 
 # ── Module-level constants ────────────────────────────────────
@@ -1145,7 +1145,10 @@ def _resolve_provider_for_build(
     :raises OmnigentError: If a named :class:`ProviderAuth` references a
         provider absent from the ``providers:`` block.
     """
-    from omnigent.inference_config import load_runtime_inference_config, resolve_bound_provider
+    from omnigent.models.inference_config import (
+        load_runtime_inference_config,
+        resolve_bound_provider,
+    )
 
     explicit_config = load_runtime_inference_config(load_config())
     identity = actual_harness or str(spec.executor.config.get("harness") or harness_type)
@@ -1237,7 +1240,7 @@ def _resolve_spec_model(spec: AgentSpec) -> str | None:
 
 def _resolve_bound_launch_model(spec: AgentSpec, harness: str) -> str | None:
     """Validate the selected model against this session's inference binding."""
-    from omnigent.inference_config import load_runtime_inference_config, resolve_bound_model
+    from omnigent.models.inference_config import load_runtime_inference_config, resolve_bound_model
 
     identity = str(spec.executor.config.get("harness") or harness)
     return resolve_bound_model(
@@ -1288,7 +1291,7 @@ def _build_claude_sdk_spawn_env(
     Build the env-var dict the claude-sdk harness wrap reads.
 
     Maps spec.executor fields → the ``HARNESS_CLAUDE_SDK_*`` env
-    vars defined in ``omnigent/inner/claude_sdk_harness.py``.
+    vars defined in ``omnigent/harnesses/claude_sdk/harness.py``.
     Per the v1 spec-config-flow design (see §Step 5b in the
     design doc), per-spawn env overrides are how Omnigent threads
     per-spec config into the subprocess without polluting
@@ -1305,7 +1308,10 @@ def _build_claude_sdk_spawn_env(
     env: dict[str, str] = {}
     model = _resolve_bound_launch_model(spec, "claude-sdk")
     if model is not None:
-        from omnigent.inference_config import binding_for_harness, load_runtime_inference_config
+        from omnigent.models.inference_config import (
+            binding_for_harness,
+            load_runtime_inference_config,
+        )
 
         # Specs may pin the provider-routed spelling ("anthropic/<name>") so
         # generic clients route correctly, but the claude CLI rejects
@@ -1317,7 +1323,7 @@ def _build_claude_sdk_spawn_env(
         )
     # Session workspace (the selected working folder), not the bundle workdir.
     # Without this the SDK subprocess inherits the runner's launch cwd — see
-    # ``HARNESS_CLAUDE_SDK_CWD`` in ``omnigent/inner/claude_sdk_harness.py``.
+    # ``HARNESS_CLAUDE_SDK_CWD`` in ``omnigent/harnesses/claude_sdk/harness.py``.
     if cwd is not None:
         env["HARNESS_CLAUDE_SDK_CWD"] = str(cwd)
 
@@ -1414,8 +1420,8 @@ def _apply_harness_path_override(
     :param env: The spawn-env dict being built (mutated in place).
     :param harness: A harness id (canonical or alias), e.g. ``"codex"``.
     """
-    from omnigent.harness_aliases import canonicalize_harness
-    from omnigent.harness_startup_config import (
+    from omnigent.harnesses.aliases import canonicalize_harness
+    from omnigent.harnesses.startup_config import (
         _harness_path_env_var,
         config_harness_path_override,
     )
@@ -1435,10 +1441,10 @@ def _build_codex_spawn_env(
     Build the env-var dict the codex harness wrap reads.
 
     Maps spec.executor fields → the ``HARNESS_CODEX_*`` env vars
-    defined in ``omnigent/inner/codex_harness.py``. Mirrors
+    defined in ``omnigent/harnesses/codex/harness.py``. Mirrors
     :func:`_build_claude_sdk_spawn_env` — same per-spawn env-var
     pattern from §Step 5a. The codex-specific env vars
-    (``HARNESS_CODEX_PATH``, ``HARNESS_CODEX_ENABLE_WEB_SEARCH``,
+    (``OMNIGENT_CODEX_PATH``, ``HARNESS_CODEX_ENABLE_WEB_SEARCH``,
     ``HARNESS_CODEX_DISABLE_NATIVE_TOOLS``) are not threaded
     through here in v1: the legacy
     :func:`omnigent.inner.executor_factory.create_executor`
@@ -1490,7 +1496,7 @@ def _build_codex_spawn_env(
         env["HARNESS_CODEX_AGENT_NAME"] = spec.name
     # Session workspace (the selected working folder), not the bundle workdir.
     # Without this the codex subprocess inherits the runner's launch cwd — see
-    # ``HARNESS_CODEX_CWD`` in ``omnigent/inner/codex_harness.py``.
+    # ``HARNESS_CODEX_CWD`` in ``omnigent/harnesses/codex/harness.py``.
     if cwd is not None:
         env["HARNESS_CODEX_CWD"] = str(cwd)
     if workdir is not None:
@@ -1518,7 +1524,7 @@ def _build_pi_spawn_env(
     Build the env-var dict the pi harness wrap reads.
 
     Maps spec.executor fields → the ``HARNESS_PI_*`` env vars
-    defined in ``omnigent/inner/pi_harness.py``. Mirrors
+    defined in ``omnigent/harnesses/pi/harness.py``. Mirrors
     :func:`_build_claude_sdk_spawn_env` /
     :func:`_build_codex_spawn_env` — same per-spawn env-var
     pattern from §Step 5a.
@@ -1535,7 +1541,7 @@ def _build_pi_spawn_env(
     """
     env: dict[str, str] = {}
     model = _resolve_bound_launch_model(spec, "pi")
-    from omnigent.inference_config import binding_for_harness, load_runtime_inference_config
+    from omnigent.models.inference_config import binding_for_harness, load_runtime_inference_config
 
     if binding_for_harness(load_runtime_inference_config(), "pi") is not None:
         env["HARNESS_PI_PRESERVE_MODEL_IDS"] = "true"
@@ -1581,7 +1587,7 @@ def _build_qwen_spawn_env(
     Build the env-var dict the qwen harness wrap reads.
 
     Maps spec.executor fields → the ``HARNESS_QWEN_*`` env vars
-    defined in ``omnigent/inner/qwen_harness.py``. Mirrors
+    defined in ``omnigent/harnesses/qwen/harness.py``. Mirrors
     :func:`_build_claude_sdk_spawn_env` /
     :func:`_build_codex_spawn_env`.
 
@@ -1608,7 +1614,10 @@ def _build_qwen_spawn_env(
     # OpenAI-compatible providers.
     provider = _resolve_provider_for_build(spec, harness_type="qwen", for_launch=True)
     if provider is not None:
-        from omnigent.inference_config import binding_for_harness, load_runtime_inference_config
+        from omnigent.models.inference_config import (
+            binding_for_harness,
+            load_runtime_inference_config,
+        )
 
         family = provider.family(OPENAI_FAMILY)
         if (
@@ -1619,7 +1628,7 @@ def _build_qwen_spawn_env(
             raise ValueError("Qwen's configured gateway must support the chat wire API.")
         configure_agent_harness_with_provider(env, provider, harness_type="qwen")
     # NB: no skills bridge for qwen yet. Unlike the claude-sdk / codex
-    # variants, the qwen wrap (omnigent/inner/qwen_harness.py) and
+    # variants, the qwen wrap (omnigent/harnesses/qwen/harness.py) and
     # QwenExecutor have no skills concept, so emitting
     # HARNESS_QWEN_SKILLS_FILTER / _AGENT_NAME / _BUNDLE_DIR would set env
     # nothing reads. Wire those through when skills land — see
@@ -1641,7 +1650,7 @@ def _build_goose_spawn_env(
     Build the env-var dict the headless goose harness wrap reads.
 
     Maps spec.executor fields → the ``HARNESS_GOOSE_*`` env vars defined in
-    ``omnigent/inner/goose_harness.py``. Unlike the SDK harnesses, Goose owns its
+    ``omnigent/harnesses/goose/harness.py``. Unlike the SDK harnesses, Goose owns its
     own auth via ``goose configure`` (keyring / ``~/.config/goose/config.yaml``),
     so this builder wires **no** provider/gateway credential — it forwards only an
     optional model override and the os_env/sandbox spec. A ``databricks-*`` model
@@ -1679,8 +1688,8 @@ def _build_acp_cli_spawn_env(
 ) -> dict[str, str]:
     """Build the generic-ACP env for one builtin ACP CLI harness (catalog row).
 
-    Rows in :data:`omnigent.acp_cli_harnesses.ACP_CLI_HARNESSES` all run the
-    shared ``omnigent/inner/acp_harness.py`` wrap; this maps a row + spec to
+    Rows in :data:`omnigent.harnesses.acp.cli_harnesses.ACP_CLI_HARNESSES` all run the
+    shared ``omnigent/harnesses/acp/harness.py`` wrap; this maps a row + spec to
     the ``HARNESS_ACP_*`` vars it reads. Like goose/acp, a vendor ACP CLI owns
     its own auth and model, so no provider/gateway credential and no model var
     is wired. The binary resolves via the ``OMNIGENT_<NAME>_PATH`` env
@@ -1693,12 +1702,12 @@ def _build_acp_cli_spawn_env(
         ACP wrap consumes no bundle dir.
     :returns: A dict of ``HARNESS_ACP_*`` env-var overrides for the spawn.
     """
-    from omnigent._platform import resolve_cli_binary
-    from omnigent.acp_cli_harnesses import ACP_CLI_HARNESSES
-    from omnigent.harness_startup_config import (
+    from omnigent.harnesses.acp.cli_harnesses import ACP_CLI_HARNESSES
+    from omnigent.harnesses.startup_config import (
         config_harness_path_override,
         resolve_harness_path,
     )
+    from omnigent.util.portability import resolve_cli_binary
 
     row = ACP_CLI_HARNESSES[harness]
     executable = (
@@ -1740,7 +1749,7 @@ def _build_acp_cli_spawn_env(
             configured_jcode_gateway_env,
             connect_jcode_gateway_env,
         )
-        from omnigent.inference_config import (
+        from omnigent.models.inference_config import (
             binding_for_harness,
             load_runtime_inference_config,
             resolve_bound_model,
@@ -1807,7 +1816,7 @@ def _build_acp_spawn_env(
     Prefers a one-shot agent embedded in ``spec.executor.config``; otherwise
     resolves the picked ``acp:<slug>`` to a user-configured agent in the global
     ``acp:`` block. The selected command + protocol knobs become the
-    ``HARNESS_ACP_*`` env vars defined in ``omnigent/inner/acp_harness.py``.
+    ``HARNESS_ACP_*`` env vars defined in ``omnigent/harnesses/acp/harness.py``.
 
     Like Goose, a generic ACP agent owns its own auth, so this wires **no**
     provider/gateway credential. A ``databricks-*`` model is dropped (not a valid
@@ -2028,7 +2037,7 @@ def _build_openai_agents_sdk_spawn_env(spec: AgentSpec) -> dict[str, str]:
 
     Maps spec.executor fields → the ``HARNESS_OPENAI_AGENTS_*``
     env vars defined in
-    ``omnigent/inner/openai_agents_sdk_harness.py``. Threads
+    ``omnigent/harnesses/openai_agents/harness.py``. Threads
     model + auth + Responses replay settings.
 
     Auth resolution order (highest priority first):
@@ -2156,7 +2165,7 @@ def _build_cursor_spawn_env(
     Build the ``HARNESS_CURSOR_*`` env-var dict the cursor harness wrap reads.
 
     Maps spec.executor fields → the ``HARNESS_CURSOR_*`` env vars defined
-    in ``omnigent/inner/cursor_harness.py``. Unlike the gateway-backed
+    in ``omnigent/harnesses/cursor/harness.py``. Unlike the gateway-backed
     builders (claude-sdk / codex / pi / openai-agents), there is NO gateway or
     Databricks-profile resolution: the Cursor SDK talks only to Cursor's own
     backend (``CURSOR_API_KEY``) and has no custom API base-URL override, so it
@@ -2203,7 +2212,7 @@ def _build_cursor_spawn_env(
         env["HARNESS_CURSOR_MODEL"] = model
     # Session workspace (the selected working folder), not the bundle workdir.
     # Without this the cursor subprocess inherits the runner's launch cwd — see
-    # ``HARNESS_CURSOR_CWD`` in ``omnigent/inner/cursor_harness.py``.
+    # ``HARNESS_CURSOR_CWD`` in ``omnigent/harnesses/cursor/harness.py``.
     if cwd is not None:
         env["HARNESS_CURSOR_CWD"] = str(cwd)
     # Auth precedence: an explicit api-key auth on the spec wins; with NO spec
@@ -2253,7 +2262,7 @@ def _build_kimi_spawn_env(
     """Build the env-var dict the kimi harness wrap reads.
 
     Maps ``spec.executor`` fields → the ``HARNESS_KIMI_*`` env vars
-    defined in :mod:`omnigent.inner.kimi_harness`.
+    defined in :mod:`omnigent.harnesses.kimi.harness`.
 
     The upstream Kimi Code CLI has no per-spawn provider override flag
     (no ``--config-file`` / ``--mcp-config-file``), so this builder
@@ -2316,7 +2325,7 @@ def _build_hermes_spawn_env(
     """Build the env-var dict the hermes harness wrap reads.
 
     Maps ``spec.executor`` fields → the ``HARNESS_HERMES_*`` env vars defined
-    in :mod:`omnigent.inner.hermes_harness`. Hermes owns its own file-based
+    in :mod:`omnigent.harnesses.hermes.harness`. Hermes owns its own file-based
     auth (``hermes setup`` / ``hermes model``, credentials under its
     ``HERMES_HOME``), so — like :func:`_build_kimi_spawn_env` — this threads
     only the model, working directory, skills filter, and ``os_env`` sandbox
@@ -2452,7 +2461,7 @@ def _build_copilot_spawn_env(
     Build the ``HARNESS_COPILOT_*`` env-var dict the copilot harness wrap reads.
 
     Maps spec.executor fields → the ``HARNESS_COPILOT_*`` env vars defined in
-    ``omnigent/inner/copilot_harness.py``. Like the cursor / antigravity
+    ``omnigent/harnesses/copilot/harness.py``. Like the cursor / antigravity
     builders there is NO gateway or Databricks-profile resolution: the GitHub
     Copilot SDK talks only to GitHub's Copilot backend (a GitHub token) and has
     no custom API base-URL override, so it never routes through the Databricks
@@ -2481,7 +2490,7 @@ def _build_copilot_spawn_env(
         env["HARNESS_COPILOT_MODEL"] = model
     # Session workspace (the selected working folder), not the bundle workdir.
     # Without this the copilot subprocess inherits the runner's launch cwd — see
-    # ``HARNESS_COPILOT_CWD`` in ``omnigent/inner/copilot_harness.py``.
+    # ``HARNESS_COPILOT_CWD`` in ``omnigent/harnesses/copilot/harness.py``.
     if cwd is not None:
         env["HARNESS_COPILOT_CWD"] = str(cwd)
     # Auth precedence: an explicit api-key auth on the spec wins (its ``api_key``

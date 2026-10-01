@@ -28,7 +28,7 @@ action — Account menu → Change password, or admin Members → Reset.
 
 **Loopback CLI handoff.** On a loopback boot, once an admin exists,
 bootstrap writes a session JWT to ``~/.omnigent/auth_tokens.json``
-(via :mod:`omnigent.cli_auth`) keyed to this spawn's URL, so the next
+(via :mod:`omnigent.cli.auth`) keyed to this spawn's URL, so the next
 ``omnigent run`` is signed in without a prompt. Skipped for
 non-loopback (remote) deploys where the server's machine ≠ the
 operator's.
@@ -215,7 +215,7 @@ def _mint_loopback_cli_token(
     :returns: ``True`` if the token was written, ``False`` otherwise.
     """
     try:
-        from omnigent import cli_auth
+        from omnigent.cli import auth as cli_auth
         from omnigent.server.oidc import mint_session_cookie
 
         now = int(time.time())

@@ -41,11 +41,11 @@ from collections.abc import Iterator, Mapping, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from omnigent._platform import stable_user_id
 from omnigent.util.json_types import JsonObject as _JsonObject
+from omnigent.util.portability import stable_user_id
 
 if TYPE_CHECKING:
-    from omnigent.inner.terminal import TerminalInstance
+    from omnigent.terminals.terminal import TerminalInstance
 
 DEVIN_NATIVE_BRIDGE_DIR_ENV_VAR = "HARNESS_DEVIN_NATIVE_BRIDGE_DIR"
 DEVIN_NATIVE_REQUEST_SESSION_ID_ENV_VAR = "HARNESS_DEVIN_NATIVE_REQUEST_SESSION_ID"
@@ -815,7 +815,7 @@ def write_hook_wrapper(
 ) -> Path:
     """Write the ``0o700`` shell wrapper each Devin hook is launched as.
 
-    Delegates to :func:`omnigent.native.native_policy_hook.policy_hook_wrapper_script`,
+    Delegates to :func:`omnigent.harnesses.native.policy_hook.policy_hook_wrapper_script`,
     which resolves a one-shot Omnigent bearer and bakes the auth +
     workspace-routing headers into the wrapper's environment. The token is a
     secret, hence ``0o700``.
@@ -825,7 +825,7 @@ def write_hook_wrapper(
     :param session_id: Omnigent conversation id for policy evaluation.
     :returns: Path to the written wrapper script.
     """
-    from omnigent.native.native_policy_hook import policy_hook_wrapper_script
+    from omnigent.harnesses.native.policy_hook import policy_hook_wrapper_script
 
     hook_entry = bridge_dir / "devin_hook_entry.py"
     hook_entry.write_text(

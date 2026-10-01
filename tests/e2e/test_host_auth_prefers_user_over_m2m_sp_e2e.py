@@ -144,7 +144,7 @@ def test_profiles_for_host_includes_m2m_sp_and_default_for_same_host(
     host, the resolver sees them and (absent a fix) picks the first one —
     which is the M2M SP.
     """
-    from omnigent.inner.databricks_executor import _databrickscfg_profiles_for_host
+    from omnigent.harnesses.databricks.executor import _databrickscfg_profiles_for_host
 
     cfg_path = _write_two_profile_cfg(tmp_path)
     monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(cfg_path))
@@ -173,7 +173,7 @@ def test_resolve_auth_for_host_must_not_select_m2m_sp_over_user_profile(
     ``{"profile": "sp-profile"}`` (M2M SP selected) rather than
     ``{"profile": "DEFAULT"}`` (U2M user selected).
     """
-    from omnigent.inner import databricks_executor
+    from omnigent.harnesses.databricks import executor as databricks_executor
 
     cfg_path = _write_two_profile_cfg(tmp_path)
     monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(cfg_path))
@@ -228,7 +228,7 @@ def test_resolve_auth_for_host_config_profile_env_is_honoured_in_host_path(
     On a broken resolver this test fails: the first-in-file-order M2M SP
     profile is selected instead of DEFAULT.
     """
-    from omnigent.inner import databricks_executor
+    from omnigent.harnesses.databricks import executor as databricks_executor
 
     cfg_path = _write_two_profile_cfg(tmp_path)
     monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(cfg_path))
@@ -293,7 +293,7 @@ def test_resolve_auth_for_host_skips_m2m_sp_profiles_without_explicit_profile(
     On a broken resolver this test fails: the first-in-file M2M SP is
     selected.
     """
-    from omnigent.inner import databricks_executor
+    from omnigent.harnesses.databricks import executor as databricks_executor
 
     cfg_path = _write_two_profile_cfg(tmp_path)
     monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(cfg_path))
@@ -342,7 +342,7 @@ def test_host_profile_selection_order_puts_user_profiles_before_sp(
     naive first-successful-auth walk.  The selection-order layer must
     reorder: user (U2M) profiles first, M2M SP profiles last.
     """
-    from omnigent.inner.databricks_executor import (
+    from omnigent.harnesses.databricks.executor import (
         _databrickscfg_host_matches_and_sp_sections,
         _order_profiles_by_identity_preference,
     )

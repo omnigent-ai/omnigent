@@ -203,7 +203,7 @@ def advertise_router(
     :param extra: Extra advertisement keys to merge in.
     :returns: *router_dir*, for use as the hook's ``--bridge-dir``.
     """
-    from omnigent.inner.hook_scripts import subagent_router
+    from omnigent.harnesses.native.hook_scripts import subagent_router
 
     # A live ``pid`` by default: the hook rejects an advertisement without
     # one, since the runner always writes it.
@@ -231,7 +231,7 @@ def advertise_relay_tools(bridge_dir: pathlib.Path, *tool_names: str) -> pathlib
         list, which is how "the session holds no spawn tool" is expressed.
     :returns: *bridge_dir*, for use as the hook's ``--bridge-dir``.
     """
-    from omnigent.inner.hook_scripts import subagent_router
+    from omnigent.harnesses.native.hook_scripts import subagent_router
 
     payload = {
         "url": "http://127.0.0.1:2/",
@@ -279,7 +279,7 @@ _OPENAI_CYBER_POLICY_HARNESSES = frozenset({"openai-agents", "codex"})
 @pytest.fixture(autouse=True)
 def _capture_codex_executor_diag(caplog: pytest.LogCaptureFixture) -> None:
     """Lower threshold so codex executor diag logs appear in junit failure reports."""
-    caplog.set_level(logging.INFO, logger="omnigent.inner.codex_executor")
+    caplog.set_level(logging.INFO, logger="omnigent.harnesses.codex.executor")
 
 
 @pytest.fixture(autouse=True)

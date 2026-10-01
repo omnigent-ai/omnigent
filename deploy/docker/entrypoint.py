@@ -300,7 +300,7 @@ def _build_routing(
         built-in judge when no external router is configured.
     :returns: ``(routing_client, routing_settings)`` for ``RuntimeCaps``.
     """
-    from omnigent.cli import _build_external_routing_client, parse_routing_settings
+    from omnigent.cli.commands import _build_external_routing_client, parse_routing_settings
 
     routing_cfg = cfg.get("routing")
     settings = parse_routing_settings(routing_cfg)
@@ -361,8 +361,8 @@ def build_app(resolved_config: _ResolvedConfig | None = None) -> _BuiltApp:
 
     # ── Stores ───────────────────────────────────────────────
 
+    from omnigent.observability import otel as telemetry
     from omnigent.runtime import init as init_runtime
-    from omnigent.runtime import telemetry
     from omnigent.runtime.agent_cache import AgentCache
     from omnigent.runtime.caps import RuntimeCaps
     from omnigent.server.managed_hosts import parse_sandbox_config
@@ -448,7 +448,7 @@ def build_app(resolved_config: _ResolvedConfig | None = None) -> _BuiltApp:
         account_store = SqlAlchemyAccountStore(database_url)
 
     # GitHub App: same env-driven wiring as `omnigent server`
-    # (omnigent/cli.py). Without these kwargs the Docker image silently
+    # (omnigent/cli/commands.py). Without these kwargs the Docker image silently
     # leaves Connect GitHub disabled even when the OMNIGENT_GITHUB_APP_*
     # env vars are set.
     from omnigent.server.github_app import GitHubAppConfig

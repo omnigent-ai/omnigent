@@ -83,7 +83,7 @@ CATALOG_STALE_AFTER_S = 3600.0
 def _data_dir() -> Path:
     """Return the omnigent data dir (must stay in lock-step with
     ``omnigent.host.local_server._local_data_dir`` /
-    ``omnigent.chat._omnigent_persistent_dir``).
+    ``omnigent.cli.chat._omnigent_persistent_dir``).
 
     :returns: ``$OMNIGENT_DATA_DIR`` when set, else ``~/.omnigent``.
     """

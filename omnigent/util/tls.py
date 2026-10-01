@@ -12,7 +12,7 @@ honored, falling back to the bundled certifi (Mozilla) roots — and builds a
 verifying client SSL context from it. Use :func:`client_ssl_context` for omnigent's
 own outbound websocket/HTTP clients.
 
-This is distinct from :mod:`omnigent.inner.egress.ca`, which *manufactures* a
+This is distinct from :mod:`omnigent.sandbox.egress.ca`, which *manufactures* a
 self-signed CA for the sandbox MITM proxy; here we only consume existing trust
 for our own client connections. Both share the CA-file resolution below.
 """

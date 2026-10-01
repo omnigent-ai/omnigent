@@ -44,7 +44,7 @@ import pytest
 import yaml
 
 from omnigent.onboarding.ambient import CLAUDE_CODE_MANAGED_SETTINGS_PATHS
-from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN, token_bound_runner_id
+from omnigent.util.runner_identity import OMNIGENT_INTERNAL_WS_ORIGIN, token_bound_runner_id
 from tests.e2e.conftest import find_free_port
 
 pytestmark = pytest.mark.timeout(360, method="signal")
@@ -167,7 +167,7 @@ def rig(
                     [
                         sys.executable,
                         "-m",
-                        "omnigent.cli",
+                        "omnigent.cli.commands",
                         "server",
                         "--host",
                         "127.0.0.1",

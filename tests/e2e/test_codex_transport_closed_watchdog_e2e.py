@@ -24,8 +24,8 @@ from pathlib import Path
 import pytest
 
 from omnigent import errors as omnigent_errors
-from omnigent.inner.codex_executor import CodexExecutor
-from omnigent.inner.executor import ExecutorError, ExecutorEvent
+from omnigent.core.executor import ExecutorError, ExecutorEvent
+from omnigent.harnesses.codex.executor import CodexExecutor
 
 # Bound well under the 3600s idle watchdog but far above a prompt EOF wake:
 # a build without EOF wake-up hangs indefinitely (times out here); a fixed

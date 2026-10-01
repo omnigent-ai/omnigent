@@ -30,6 +30,7 @@ from omnigent.util.json_types import JsonObject as _JsonObject
 if TYPE_CHECKING:
     # Type-only import: the runner keeps codex deps out of its runtime import
     # graph (they are imported lazily inside the codex-native helpers).
+    from omnigent.core.datamodel import OSEnvSpec
     from omnigent.harnesses.claude_native.main import ClaudeNativeUcodeConfig
     from omnigent.harnesses.codex_native.app_server import (
         CodexAppServerClient,
@@ -38,32 +39,30 @@ if TYPE_CHECKING:
     from omnigent.harnesses.opencode_native.app_server import OpenCodeNativeServer
     from omnigent.harnesses.opencode_native.client import OpenCodeClient, OpenCodeSession
     from omnigent.harnesses.opencode_native.forwarder import OpenCodeNativeForwarder
-    from omnigent.inner.datamodel import OSEnvSpec
-    from omnigent.inner.terminal import TerminalInstance
     from omnigent.runner.subagent_routing import SubagentRouter
     from omnigent.runner.turn_routing import TurnRouter
     from omnigent.spec.types import MCPServerConfig
+    from omnigent.terminals.terminal import TerminalInstance
 
 import click
 import httpx
 from fastapi.responses import JSONResponse, Response
 
-from omnigent._platform import IS_WINDOWS, resolve_cli_binary
-from omnigent.debug_logging import debug_event, runner_primary_session_id
 from omnigent.entities.session_resources import (
     SessionResourceView,
     session_resource_view_to_dict,
     terminal_resource_id,
 )
 from omnigent.errors import ErrorCategory, ErrorCode, ErrorImpact, ErrorPhase, OmnigentError
-from omnigent.harness_plugins import native_provider_for_key
-from omnigent.models.model_override import validate_model_override
-from omnigent.native.native_coding_agents import (
+from omnigent.harnesses.native.coding_agents import (
     native_coding_agent_for_harness,
     native_coding_agent_for_terminal_name,
 )
-from omnigent.native.native_dispatch import resolve_hook
-from omnigent.process_logging import process_log_reference
+from omnigent.harnesses.native.dispatch import resolve_hook
+from omnigent.harnesses.registry import native_provider_for_key
+from omnigent.models.model_override import validate_model_override
+from omnigent.observability.debug_logging import debug_event, runner_primary_session_id
+from omnigent.observability.process_logging import process_log_reference
 from omnigent.runner.resource_registry import (
     ANTIGRAVITY_NATIVE_TERMINAL_ROLE,
     CLAUDE_NATIVE_TERMINAL_ROLE,
@@ -85,6 +84,7 @@ from omnigent.runner.session_init_protocol import (
 )
 from omnigent.runner.transports.ws_tunnel.event_delivery import RunnerEventDispatcher
 from omnigent.spec.types import AgentSpec
+from omnigent.util.portability import IS_WINDOWS, resolve_cli_binary
 
 _logger = logging.getLogger("omnigent.runner.app")
 
@@ -1469,6 +1469,7 @@ async def _auto_create_opencode_terminal(
         MCP relay (tests / no server).
     :returns: The created terminal resource view.
     """
+    from omnigent.core.datamodel import OSEnvSpec, TerminalEnvSpec
     from omnigent.harnesses.opencode_native.app_server import (
         OpenCodeNativeServer,
         build_opencode_attach_args,
@@ -1484,7 +1485,6 @@ async def _auto_create_opencode_terminal(
         write_relay_bridge_config,
     )
     from omnigent.harnesses.opencode_native.forwarder import OpenCodeNativeForwarder
-    from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
 
     launch_config = await _opencode_native_launch_config(
         session_id=session_id,
@@ -1661,7 +1661,7 @@ async def _auto_create_opencode_terminal(
         _policy_factory = _make_auth_token_factory()
         _policy_token = _policy_factory() if _policy_factory is not None else None
         if _policy_token:
-            from omnigent.cli_auth import databricks_request_headers
+            from omnigent.cli.auth import databricks_request_headers
 
             policy_env["OMNIGENT_POLICY_HEADERS"] = json.dumps(
                 databricks_request_headers(runner_server_url, bearer_token=_policy_token)
@@ -1813,7 +1813,7 @@ async def _auto_create_opencode_terminal(
                     server_url=server.base_url,
                     workspace=workspace,
                     session_id=opencode_session_id,
-                    opencode_args=tuple(launch_config.terminal_launch_args or ()),
+                    extra_args=tuple(launch_config.terminal_launch_args or ()),
                 ),
                 env=opencode_terminal_env(server),
                 scrollback=100_000,
@@ -2437,7 +2437,8 @@ async def _auto_create_pi_terminal(
     :returns: Created terminal resource view.
     """
     await _cancel_auto_forwarder_task(session_id)
-    from omnigent.conversation_browser import conversation_url
+    from omnigent.cli.conversation_browser import conversation_url
+    from omnigent.core.datamodel import OSEnvSpec, TerminalEnvSpec
     from omnigent.harnesses.pi_native.bridge import (
         PI_NATIVE_CONFIG_ENV_VAR,
         clear_inbox,
@@ -2448,7 +2449,6 @@ async def _auto_create_pi_terminal(
     )
     from omnigent.harnesses.pi_native.bridge import extension_path as pi_extension_path
     from omnigent.harnesses.pi_native.main import resolve_pi_executable
-    from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
     from omnigent.runner._entry import _make_auth_token_factory
 
     launch_config = await _pi_native_launch_config(
@@ -2469,7 +2469,7 @@ async def _auto_create_pi_terminal(
     # bearer skips those selectors and can land on a different server instance
     # than the one the runner (and the web UI) are on, so live-streamed items
     # never reach the browser's in-process event stream (they only appear on reload).
-    from omnigent.cli_auth import databricks_request_headers
+    from omnigent.cli.auth import databricks_request_headers
 
     auth_headers = databricks_request_headers(launch_config.server_url, bearer_token=auth_token)
     # A guest-on-shared-host runner authenticates the extension's out-of-process
@@ -2477,7 +2477,7 @@ async def _auto_create_pi_terminal(
     # refresh runs env-scrubbed and can only preserve this header, so bake it in
     # here at launch (harmless additive header on bearer-authenticated servers).
     from omnigent.runner._entry import _runner_tunnel_binding_token_from_env
-    from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER
+    from omnigent.util.runner_identity import RUNNER_TUNNEL_TOKEN_HEADER
 
     binding_token = _runner_tunnel_binding_token_from_env()
     if binding_token:
@@ -2545,7 +2545,7 @@ async def _auto_create_pi_terminal(
     # never touching the user's global ``~/.pi/agent``.
     credential_warning: str | None = None
     effort_notice: str | None = None
-    from omnigent.inference_config import binding_for_harness, load_runtime_inference_config
+    from omnigent.models.inference_config import binding_for_harness, load_runtime_inference_config
 
     pi_binding = binding_for_harness(load_runtime_inference_config(), "pi-native")
     if pi_binding is not None and _pi_args_have_provider(launch_config.terminal_launch_args or []):
@@ -2862,8 +2862,8 @@ async def _auto_create_cursor_terminal(
         passthrough launch args.
     :returns: Created terminal resource view.
     """
+    from omnigent.core.datamodel import OSEnvSpec, TerminalEnvSpec
     from omnigent.harnesses.cursor_native.main import resolve_cursor_executable
-    from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
 
     # Stamp the launch time before the TUI starts. cursor creates the chat's
     # on-disk store lazily on the first message, so its ``meta.json``
@@ -3161,8 +3161,8 @@ async def _auto_create_goose_terminal(
     :param server_client: Runner Omnigent server client.
     :returns: Created terminal resource view.
     """
+    from omnigent.core.datamodel import OSEnvSpec, TerminalEnvSpec
     from omnigent.harnesses.goose_native.main import resolve_goose_executable
-    from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
 
     # Tear down any forwarder left from a prior terminal for this session before
     # re-creating, so old and new tasks can't both mirror (double-posting), and
@@ -3329,8 +3329,8 @@ async def _auto_create_hermes_terminal(
     :param server_client: Runner Omnigent server client.
     :returns: Created terminal resource view.
     """
+    from omnigent.core.datamodel import OSEnvSpec, TerminalEnvSpec
     from omnigent.harnesses.hermes_native.main import resolve_hermes_executable
-    from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
 
     # Tear down any forwarder left from a prior terminal for this session before
     # re-creating, so old and new tasks can't both mirror (double-posting), and
@@ -3569,6 +3569,7 @@ async def _auto_create_kiro_terminal(
     ensure_comment_relay: _EnsureCommentRelay | None = None,
 ) -> SessionResourceView:
     """Auto-create the Kiro TUI terminal for a kiro-native session."""
+    from omnigent.core.datamodel import OSEnvSpec, TerminalEnvSpec
     from omnigent.harnesses.kiro_native.bridge import (
         KIRO_NATIVE_ENV_UNSET,
         build_kiro_native_terminal_env,
@@ -3576,7 +3577,6 @@ async def _auto_create_kiro_terminal(
         write_kiro_workspace_mcp_config,
     )
     from omnigent.harnesses.kiro_native.main import build_kiro_launch
-    from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
 
     launch_config = await _kiro_native_launch_config(
         session_id=session_id,
@@ -3710,6 +3710,7 @@ async def _auto_create_devin_terminal(
         ``instructions`` are delivered to Devin as an always-on Windsurf rule in
         the workspace (Devin's only per-turn system-prompt channel).
     """
+    from omnigent.core.datamodel import OSEnvSpec, TerminalEnvSpec
     from omnigent.harnesses.devin_native.bridge import (
         DEVIN_NATIVE_ENV_UNSET,
         build_devin_native_terminal_env,
@@ -3725,7 +3726,6 @@ async def _auto_create_devin_terminal(
         write_tmux_target,
     )
     from omnigent.harnesses.devin_native.main import build_devin_launch, resolve_devin_launch_model
-    from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
 
     # ``_pi_native_launch_config`` is a generic session-snapshot reader
     # (workspace + terminal_launch_args + model_override); reused here, not
@@ -4032,8 +4032,8 @@ async def _auto_create_qwen_terminal(
     :param server_client: Runner Omnigent server client.
     :returns: Created terminal resource view.
     """
+    from omnigent.core.datamodel import OSEnvSpec, TerminalEnvSpec
     from omnigent.harnesses.qwen_native.main import resolve_qwen_executable
-    from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
 
     # Tear down any forwarder left from a prior terminal for this session before
     # re-creating, so old and new tasks can't both mirror (double-posting), and
@@ -4323,6 +4323,7 @@ async def _auto_create_kimi_terminal(
     :returns: Created terminal resource view.
     """
     del ensure_comment_relay, agent_spec
+    from omnigent.core.datamodel import OSEnvSpec, TerminalEnvSpec
     from omnigent.harnesses.kimi_native.bridge import (
         bridge_dir_for_session_id,
         write_hook_config,
@@ -4334,7 +4335,6 @@ async def _auto_create_kimi_terminal(
         supervise_kimi_forwarder,
     )
     from omnigent.harnesses.kimi_native.main import resolve_kimi_executable
-    from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
     from omnigent.runner._entry import _make_auth_token_factory, _RunnerDatabricksAuth
 
     bridge_dir = bridge_dir_for_session_id(session_id)
@@ -4373,7 +4373,7 @@ async def _auto_create_kimi_terminal(
     # The hook subprocess replays these static headers from its config (no
     # refresh-capable httpx.Auth of its own); the helper pairs the bearer with
     # the workspace-routing header so neither is dropped.
-    from omnigent.cli_auth import databricks_request_headers
+    from omnigent.cli.auth import databricks_request_headers
 
     _runner_headers = databricks_request_headers(server_url, bearer_token=_auth_token)
     write_hook_config(
@@ -4505,6 +4505,7 @@ async def _launch_codex_native_tui(
     login_required: bool = False,
 ) -> _CodexNativeTuiLaunch:
     """Attach a terminal to an app-server without owning its lifecycle."""
+    from omnigent.core.datamodel import OSEnvSpec, TerminalEnvSpec
     from omnigent.harnesses.codex_native.app_server import (
         _MIN_BYPASS_HOOK_TRUST_CODEX_VERSION,
         _format_codex_version,
@@ -4516,14 +4517,13 @@ async def _launch_codex_native_tui(
         codex_terminal_interactive,
     )
     from omnigent.harnesses.codex_native.launch_args import redact_codex_launch_args
-    from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
 
     codex_ws_url = app_server.listen_url
     assert codex_ws_url is not None
     workspace = str(launch_config.workspace)
     agent_os_env = _agent_os_env_from_spec(agent_spec)
     codex_remote_args = build_codex_remote_args(
-        codex_args=tuple(launch_config.terminal_launch_args or ()),
+        extra_args=tuple(launch_config.terminal_launch_args or ()),
         thread_id=thread_id,
         remote_url=codex_ws_url,
         bypass_sandbox=launch_config.bypass_sandbox,
@@ -4542,7 +4542,7 @@ async def _launch_codex_native_tui(
     )
     # Apply configured wrappers to both cold start and recovery.
     from omnigent.config import load_effective_config
-    from omnigent.harness_startup_config import (
+    from omnigent.harnesses.startup_config import (
         resolve_harness_args,
         resolve_harness_config,
     )
@@ -4738,6 +4738,7 @@ async def _auto_create_codex_terminal(
     import socket as _socket
     from pathlib import Path
 
+    from omnigent.harnesses.codex.executor import codex_extended_catalog_env
     from omnigent.harnesses.codex_native.app_server import (
         CodexAppServerClient,
         CodexAppServerResponseError,
@@ -4760,7 +4761,6 @@ async def _auto_create_codex_terminal(
         write_bridge_startup_timeout,
         write_bridge_state,
     )
-    from omnigent.inner.codex_executor import codex_extended_catalog_env
 
     launch_config = await _codex_native_launch_config(
         session_id=session_id,
@@ -4816,10 +4816,10 @@ async def _auto_create_codex_terminal(
     # machine-level config, parity with the in-process harness (#2744).
     _launch_spec = agent_spec.spec if isinstance(agent_spec, ResolvedSpec) else agent_spec
     _codex_launch = resolve_native_codex_launch(model=default_model, spec=_launch_spec)
-    from omnigent.inference_config import binding_for_harness, load_runtime_inference_config
+    from omnigent.models.inference_config import binding_for_harness, load_runtime_inference_config
 
     codex_binding = binding_for_harness(load_runtime_inference_config(), "codex-native")
-    from omnigent.inner.codex_executor import _find_codex_cli
+    from omnigent.harnesses.codex.executor import _find_codex_cli
 
     _codex_cli_path = _find_codex_cli()
     _catalog_launch = None
@@ -5133,7 +5133,7 @@ async def _auto_create_codex_terminal(
     # executor's skill population; the native CLI otherwise sees zero
     # bundled skills. Best-effort: a skill-link failure must not break
     # the terminal launch.
-    from omnigent.inner.codex_executor import (
+    from omnigent.harnesses.codex.executor import (
         _codex_home_config_source_from_env,
         populate_codex_skills_from_bundle,
     )
@@ -5187,7 +5187,7 @@ async def _auto_create_codex_terminal(
     # The codex policy hook subprocess replays these static headers from its
     # config (no refresh-capable auth of its own); the helper pairs the bearer
     # with the workspace-routing header so neither is dropped.
-    from omnigent.cli_auth import databricks_request_headers
+    from omnigent.cli.auth import databricks_request_headers
 
     policy_headers = databricks_request_headers(
         launch_config.policy_server_url, bearer_token=_policy_auth_token
@@ -5202,7 +5202,7 @@ async def _auto_create_codex_terminal(
     # keeps main's kwargs exactly.
     _codex_routing_note: str | None = None
     if launch_config.auto_harness:
-        from omnigent.inner.hook_scripts.subagent_router import smart_routing_spawn_note
+        from omnigent.harnesses.native.hook_scripts.subagent_router import smart_routing_spawn_note
 
         _codex_routing_note = smart_routing_spawn_note("codex-native")
     _codex_developer_instructions = (
@@ -5522,7 +5522,7 @@ def _codex_terminal_exit_summary(instance: TerminalInstance, *, before_thread: b
 def _codex_startup_terminal_output(instance: TerminalInstance) -> str | None:
     """Apply the same capture gate and bounds to both startup-error paths."""
     from omnigent.harnesses.diagnostics import sanitize_diagnostic_text
-    from omnigent.process_logging import harness_stderr_capture_enabled
+    from omnigent.observability.process_logging import harness_stderr_capture_enabled
     from omnigent.runner.resource_registry import trim_terminal_output
 
     if not harness_stderr_capture_enabled():
@@ -5870,7 +5870,9 @@ async def _codex_discover_thread_and_forward(
                         else terminal_instance
                     )
                     if diag_instance is not None:
-                        from omnigent.process_logging import harness_stderr_capture_enabled
+                        from omnigent.observability.process_logging import (
+                            harness_stderr_capture_enabled,
+                        )
 
                         if not isinstance(exc, _CodexTerminalExited):
                             with contextlib.suppress(Exception):
@@ -6021,7 +6023,7 @@ async def _codex_discover_thread_and_forward(
         # would resume fresh. Best-effort: a transient Omnigent failure here still
         # leaves chat streaming working — only fork-history carry-over
         # degrades.
-        from omnigent.cli_auth import open_server_client
+        from omnigent.cli.auth import open_server_client
 
         try:
             async with open_server_client(
@@ -6268,6 +6270,7 @@ async def _auto_create_antigravity_terminal(
     :raises RuntimeError: If the session snapshot or required runner env is
         unavailable.
     """
+    from omnigent.core.datamodel import OSEnvSandboxSpec, OSEnvSpec, TerminalEnvSpec
     from omnigent.harnesses.antigravity_native.bridge import (
         ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY,
         AntigravityNativeBridgeState,
@@ -6282,7 +6285,6 @@ async def _auto_create_antigravity_terminal(
         write_tmux_target,
     )
     from omnigent.harnesses.antigravity_native.launch import build_agy_launch
-    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec, TerminalEnvSpec
 
     if server_client is None:
         raise RuntimeError("server_client is required for runner-owned Antigravity terminals.")
@@ -6880,7 +6882,7 @@ def _terminal_tmux_pane(
     if instance is None or not instance.running:
         return None, None
     # ``socket_path`` is a Path and ``tmux_target`` a str on the live terminal
-    # instance (see omnigent.inner.terminal). Guard defensively so a registry
+    # instance (see omnigent.terminals.terminal). Guard defensively so a registry
     # variant without them falls back to the forwarder's ambiguity path.
     socket_path = getattr(instance, "socket_path", None)
     target = getattr(instance, "tmux_target", None)
@@ -7801,7 +7803,7 @@ def _routed_spawn_launch_args(
     """
     if not auto_harness or not router_started:
         return None, ()
-    from omnigent.inner.hook_scripts.subagent_router import smart_routing_spawn_note
+    from omnigent.harnesses.native.hook_scripts.subagent_router import smart_routing_spawn_note
 
     return smart_routing_spawn_note("claude-native"), _ROUTED_SPAWN_ALLOWED_TOOLS
 
@@ -8087,6 +8089,7 @@ async def _auto_create_claude_terminal(
     """
     from pathlib import Path
 
+    from omnigent.core.datamodel import OSEnvSpec, TerminalEnvSpec
     from omnigent.harnesses.claude_native.bridge import (
         BRIDGE_ID_LABEL_KEY,
         augment_claude_args,
@@ -8095,7 +8098,6 @@ async def _auto_create_claude_terminal(
         validate_claude_hook_interpreter_compatibility,
     )
     from omnigent.harnesses.claude_native.forwarder import reset_transcript_forward_state
-    from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
 
     workspace = (
         session_init.snapshot.workspace
@@ -8208,7 +8210,7 @@ async def _auto_create_claude_terminal(
     # The hook subprocess replays these static headers from its config (no
     # refresh-capable auth of its own); the helper pairs the bearer with the
     # workspace-routing header so neither is dropped.
-    from omnigent.cli_auth import databricks_request_headers
+    from omnigent.cli.auth import databricks_request_headers
 
     _runner_headers = databricks_request_headers(server_url, bearer_token=_auth_token)
     _runner_auth = _RunnerDatabricksAuth(_auth_factory)
@@ -8432,7 +8434,7 @@ async def _auto_create_claude_terminal(
     # CLI path.
     claude_config: ClaudeNativeUcodeConfig | None = None
     _launch_config_resolution_failed = False
-    from omnigent.inference_config import (
+    from omnigent.models.inference_config import (
         binding_for_harness,
         load_runtime_inference_config,
         resolve_bound_model,
@@ -8758,7 +8760,7 @@ async def _auto_create_claude_terminal(
     # the same resolver the local-CLI native launch uses (see cli_native.py), so
     # both terminal-creation paths honour one config surface.
     from omnigent.config import load_effective_config  # noqa: FlagLocalImports
-    from omnigent.harness_startup_config import (  # noqa: FlagLocalImports
+    from omnigent.harnesses.startup_config import (  # noqa: FlagLocalImports
         resolve_harness_args,
         resolve_harness_command,
     )
@@ -8769,7 +8771,7 @@ async def _auto_create_claude_terminal(
     # Validate the binary this terminal will actually spawn: ``launch_command``
     # already reflects the OMNIGENT_CLAUDE_PATH / config overrides, and a bare
     # name resolves against this process's inherited PATH (same lookup tmux's
-    # pane shell and omnigent.inner.terminal perform). Mirrors
+    # pane shell and omnigent.terminals.terminal perform). Mirrors
     # ``_preflight_local_tools`` on the local-CLI path.
     resolved_claude = resolve_cli_binary(launch_command)
     if resolved_claude is not None:
@@ -9012,8 +9014,8 @@ async def _auto_create_repl_terminal(
         UI show the Chat/Terminal toggle.
     :returns: The launched terminal's :class:`SessionResourceView`.
     """
-    from omnigent._wrapper_labels import UI_MODE_LABEL_KEY, UI_MODE_TERMINAL_VALUE
-    from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
+    from omnigent.core.datamodel import OSEnvSpec, TerminalEnvSpec
+    from omnigent.harnesses.wrapper_labels import UI_MODE_LABEL_KEY, UI_MODE_TERMINAL_VALUE
 
     started_at = time.monotonic()
     workspace = _runner_workspace_dir()
@@ -9165,7 +9167,7 @@ async def _delete_native_bridge_dirs(
     from omnigent.harnesses.qwen_native.bridge import (
         bridge_dir_for_session_id as qwen_bridge_dir,
     )
-    from omnigent.inner.native_attachments import attachment_cache_dir
+    from omnigent.util.attachments import attachment_cache_dir
 
     labels: dict[str, str] = {}
     if server_client is not None:

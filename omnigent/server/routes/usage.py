@@ -8,14 +8,14 @@ from typing import Any
 
 from fastapi import APIRouter, Request
 
-from omnigent._wrapper_labels import WRAPPER_LABEL_KEY
 from omnigent.entities import Conversation
 from omnigent.errors import restart_on_stale_cursor
+from omnigent.harnesses.wrapper_labels import WRAPPER_LABEL_KEY
 from omnigent.runtime.policies.builder import load_session_usage_and_tree
 from omnigent.server.auth import RESERVED_USER_LOCAL, AuthProvider
 from omnigent.server.feature_flags import Feature, FeatureFlags, resolve_feature_flags
 from omnigent.server.routes._auth_helpers import require_user
-from omnigent.server.routes._sessions.helpers import (
+from omnigent.server.routes.sessions.helpers import (
     _resolve_harness_impl,
     _resolve_llm_model,
 )

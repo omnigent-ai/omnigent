@@ -17,7 +17,7 @@ import pytest
 
 from omnigent.entities.session_resources import SessionResourceView
 from omnigent.harnesses.codex_native.bridge import CODEX_NATIVE_BRIDGE_ID_LABEL_KEY
-from omnigent.native import native_dispatch
+from omnigent.harnesses.native import dispatch as native_dispatch
 from omnigent.runner import create_runner_app
 from omnigent.runner import tool_dispatch as _tool_dispatch
 from omnigent.runner.app import (
@@ -26,7 +26,7 @@ from omnigent.runner.app import (
     _resolved_workdir_for_spec,
     _session_labels_for_runner_spawn,
 )
-from omnigent.runner.native import NativeLaunchContext, _resolve_native_spawn_env
+from omnigent.runner.native.orchestration import NativeLaunchContext, _resolve_native_spawn_env
 from omnigent.runner.resource_registry import (
     SessionResourceRegistry,
 )
@@ -369,7 +369,7 @@ async def test_launch_native_terminal_creates_when_absent(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """When no terminal exists, the shell resolves the adapter and creates one."""
-    from omnigent.runner.native import _launch_native_terminal
+    from omnigent.runner.native.orchestration import _launch_native_terminal
 
     called: dict[str, Any] = {}
 
@@ -377,7 +377,7 @@ async def test_launch_native_terminal_creates_when_absent(
         called["session_id"] = ctx.session_id
         return object()
 
-    monkeypatch.setattr("omnigent.runner.native._launch_pi", _fake_launch_pi)
+    monkeypatch.setattr("omnigent.runner.native.orchestration._launch_pi", _fake_launch_pi)
     locks: dict[str, Any] = {}
     result = await _launch_native_terminal(
         "pi-native",
@@ -395,12 +395,12 @@ async def test_launch_native_terminal_skips_when_terminal_exists(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """An existing terminal short-circuits to True without calling the adapter."""
-    from omnigent.runner.native import _launch_native_terminal
+    from omnigent.runner.native.orchestration import _launch_native_terminal
 
     async def _must_not_call(ctx: NativeLaunchContext) -> object:
         raise AssertionError("adapter must not run when a terminal already exists")
 
-    monkeypatch.setattr("omnigent.runner.native._launch_pi", _must_not_call)
+    monkeypatch.setattr("omnigent.runner.native.orchestration._launch_pi", _must_not_call)
     result = await _launch_native_terminal(
         "pi-native",
         _launch_ctx(resource_registry=_FakeResourceRegistry(_FakeTerminalRegistry(existing=True))),
@@ -415,7 +415,7 @@ async def test_launch_native_terminal_force_recreate_tears_down_existing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """force_recreate cleans up the existing terminal, then creates a fresh one."""
-    from omnigent.runner.native import PreLaunchResult, _launch_native_terminal
+    from omnigent.runner.native.orchestration import PreLaunchResult, _launch_native_terminal
 
     created: list[str] = []
 
@@ -423,7 +423,7 @@ async def test_launch_native_terminal_force_recreate_tears_down_existing(
         created.append(ctx.session_id)
         return object()
 
-    monkeypatch.setattr("omnigent.runner.native._launch_pi", _fake_launch_pi)
+    monkeypatch.setattr("omnigent.runner.native.orchestration._launch_pi", _fake_launch_pi)
     registry = _FakeTerminalRegistry(existing=True)
 
     async def _pre_launch(_has_terminal: bool) -> PreLaunchResult:
@@ -451,12 +451,12 @@ async def test_launch_native_terminal_force_recreate_and_skip_tears_down_without
     torn down, but because a sibling session's terminal is rotating in (skip),
     creation is left to the transfer instead of racing it with a fresh launch.
     """
-    from omnigent.runner.native import PreLaunchResult, _launch_native_terminal
+    from omnigent.runner.native.orchestration import PreLaunchResult, _launch_native_terminal
 
     async def _must_not_call(ctx: NativeLaunchContext) -> object:
         raise AssertionError("adapter must not run when the transfer will deliver")
 
-    monkeypatch.setattr("omnigent.runner.native._launch_pi", _must_not_call)
+    monkeypatch.setattr("omnigent.runner.native.orchestration._launch_pi", _must_not_call)
     registry = _FakeTerminalRegistry(existing=True)
 
     async def _pre_launch(_has_terminal: bool) -> PreLaunchResult:
@@ -479,12 +479,12 @@ async def test_launch_native_terminal_skip_and_needs_terminal_return_false(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """skip=True or needs_terminal=False returns False without creating."""
-    from omnigent.runner.native import PreLaunchResult, _launch_native_terminal
+    from omnigent.runner.native.orchestration import PreLaunchResult, _launch_native_terminal
 
     async def _must_not_call(ctx: NativeLaunchContext) -> object:
         raise AssertionError("adapter must not run when skipped")
 
-    monkeypatch.setattr("omnigent.runner.native._launch_pi", _must_not_call)
+    monkeypatch.setattr("omnigent.runner.native.orchestration._launch_pi", _must_not_call)
 
     for decision in (PreLaunchResult(skip=True), PreLaunchResult(needs_terminal=False)):
 
@@ -505,12 +505,12 @@ async def test_launch_native_terminal_publishes_start_error_on_failure(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """A builder failure returns False and publishes a terminal-start error."""
-    from omnigent.runner.native import _launch_native_terminal
+    from omnigent.runner.native.orchestration import _launch_native_terminal
 
     async def _boom(ctx: NativeLaunchContext) -> object:
         raise RuntimeError("launch blew up")
 
-    monkeypatch.setattr("omnigent.runner.native._launch_pi", _boom)
+    monkeypatch.setattr("omnigent.runner.native.orchestration._launch_pi", _boom)
     events: list[tuple[str, dict[str, Any]]] = []
     result = await _launch_native_terminal(
         "pi-native",
@@ -538,7 +538,7 @@ async def test_launch_native_terminal_resolves_spec_lazily_only_on_create(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """resolve_agent_spec runs only when creating, and feeds the adapter's ctx."""
-    from omnigent.runner.native import _launch_native_terminal
+    from omnigent.runner.native.orchestration import _launch_native_terminal
 
     seen_spec: dict[str, Any] = {}
     resolver_calls = {"n": 0}
@@ -551,7 +551,7 @@ async def test_launch_native_terminal_resolves_spec_lazily_only_on_create(
         resolver_calls["n"] += 1
         return "resolved-spec"
 
-    monkeypatch.setattr("omnigent.runner.native._launch_pi", _fake_launch_pi)
+    monkeypatch.setattr("omnigent.runner.native.orchestration._launch_pi", _fake_launch_pi)
 
     # Creating: resolver runs once, result lands on the adapter's ctx.
     await _launch_native_terminal(
@@ -573,7 +573,7 @@ async def test_launch_native_terminal_resolves_spec_lazily_only_on_create(
 @pytest.mark.asyncio
 async def test_launch_native_terminal_non_native_returns_none() -> None:
     """A non-native harness yields None so the caller handles it another way."""
-    from omnigent.runner.native import _launch_native_terminal
+    from omnigent.runner.native.orchestration import _launch_native_terminal
 
     result = await _launch_native_terminal("claude-sdk", _launch_ctx(), ensure_locks={})
     assert result is None
@@ -584,7 +584,7 @@ async def test_launch_native_terminal_build_context_enriches_only_on_create(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """build_context runs inside the create block and feeds the adapter's ctx."""
-    from omnigent.runner.native import _launch_native_terminal
+    from omnigent.runner.native.orchestration import _launch_native_terminal
 
     seen: dict[str, Any] = {}
     build_calls = {"n": 0}
@@ -597,7 +597,7 @@ async def test_launch_native_terminal_build_context_enriches_only_on_create(
         build_calls["n"] += 1
         return dataclasses.replace(ctx, bundle_dir=Path("/tmp/enriched"))
 
-    monkeypatch.setattr("omnigent.runner.native._launch_pi", _fake_launch_pi)
+    monkeypatch.setattr("omnigent.runner.native.orchestration._launch_pi", _fake_launch_pi)
 
     await _launch_native_terminal(
         "pi-native", _launch_ctx(), ensure_locks={}, build_context=_build
@@ -620,12 +620,12 @@ async def test_launch_native_terminal_reraise_propagates_without_error_event(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """reraise=True re-raises the builder failure instead of publishing an event."""
-    from omnigent.runner.native import _launch_native_terminal
+    from omnigent.runner.native.orchestration import _launch_native_terminal
 
     async def _boom(ctx: NativeLaunchContext) -> object:
         raise RuntimeError("cold-boot blew up")
 
-    monkeypatch.setattr("omnigent.runner.native._launch_pi", _boom)
+    monkeypatch.setattr("omnigent.runner.native.orchestration._launch_pi", _boom)
     events: list[tuple[str, dict[str, Any]]] = []
 
     with pytest.raises(RuntimeError, match="cold-boot blew up"):
@@ -685,7 +685,7 @@ async def test_ensure_native_terminal_returns_existing_without_creating(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """An existing terminal is returned as-is; the adapter never runs."""
-    from omnigent.runner.native import _ensure_native_terminal
+    from omnigent.runner.native.orchestration import _ensure_native_terminal
 
     created = False
 
@@ -694,7 +694,7 @@ async def test_ensure_native_terminal_returns_existing_without_creating(
         created = True
         return object()
 
-    monkeypatch.setattr("omnigent.runner.native._launch_goose", _fake_launch)
+    monkeypatch.setattr("omnigent.runner.native.orchestration._launch_goose", _fake_launch)
     registry = _FakeEnsureRegistry(existing=_terminal_view("existing"))
     resp = await _ensure_native_terminal("goose", _ensure_ctx(registry), ensure_locks={})
 
@@ -708,12 +708,12 @@ async def test_ensure_native_terminal_creates_when_absent(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """With no existing terminal, the shell resolves the adapter and creates one."""
-    from omnigent.runner.native import _ensure_native_terminal
+    from omnigent.runner.native.orchestration import _ensure_native_terminal
 
     async def _fake_launch(ctx: NativeLaunchContext) -> SessionResourceView:
         return _terminal_view("auto-created")
 
-    monkeypatch.setattr("omnigent.runner.native._launch_goose", _fake_launch)
+    monkeypatch.setattr("omnigent.runner.native.orchestration._launch_goose", _fake_launch)
     registry = _FakeEnsureRegistry(existing=None)
     locks: dict[str, Any] = {}
     resp = await _ensure_native_terminal("goose", _ensure_ctx(registry), ensure_locks=locks)
@@ -728,12 +728,12 @@ async def test_ensure_native_terminal_builder_error_returns_500(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A builder failure becomes a structured 500 JSON, not a live-published error."""
-    from omnigent.runner.native import _ensure_native_terminal
+    from omnigent.runner.native.orchestration import _ensure_native_terminal
 
     async def _boom(ctx: NativeLaunchContext) -> object:
         raise ImportError("Native goose requires the 'goose' CLI on PATH.")
 
-    monkeypatch.setattr("omnigent.runner.native._launch_goose", _boom)
+    monkeypatch.setattr("omnigent.runner.native.orchestration._launch_goose", _boom)
     resp = await _ensure_native_terminal(
         "goose", _ensure_ctx(_FakeEnsureRegistry(existing=None)), ensure_locks={}
     )
@@ -752,7 +752,7 @@ async def test_ensure_native_terminal_builder_error_returns_500(
 @pytest.mark.asyncio
 async def test_ensure_native_terminal_non_native_returns_none() -> None:
     """A non-native terminal name returns None so the caller uses the generic path."""
-    from omnigent.runner.native import _ensure_native_terminal
+    from omnigent.runner.native.orchestration import _ensure_native_terminal
 
     resp = await _ensure_native_terminal(
         "bash", _ensure_ctx(_FakeEnsureRegistry()), ensure_locks={}
@@ -765,7 +765,7 @@ async def test_ensure_native_terminal_owned_existing_uses_finalize(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """An owned existing terminal is returned through ``finalize`` (codex notice wrap)."""
-    from omnigent.runner.native import _ensure_native_terminal
+    from omnigent.runner.native.orchestration import _ensure_native_terminal
 
     existing = _terminal_view("owned-existing", terminal_id="terminal_codex_main")
     registry = _FakeEnsureRegistry(existing=existing)
@@ -794,12 +794,12 @@ async def test_ensure_native_terminal_non_owned_closes_and_recreates(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A non-owned existing terminal is closed, then the native one is created."""
-    from omnigent.runner.native import _ensure_native_terminal
+    from omnigent.runner.native.orchestration import _ensure_native_terminal
 
     async def _fake_launch(ctx: NativeLaunchContext) -> SessionResourceView:
         return _terminal_view("recreated", terminal_id="terminal_codex_main")
 
-    monkeypatch.setattr("omnigent.runner.native._launch_codex", _fake_launch)
+    monkeypatch.setattr("omnigent.runner.native.orchestration._launch_codex", _fake_launch)
     existing = _terminal_view("foreign", terminal_id="terminal_codex_main")
     registry = _FakeEnsureRegistry(existing=existing, close_ok=True)
 
@@ -819,7 +819,7 @@ async def test_ensure_native_terminal_non_owned_closes_and_recreates(
 @pytest.mark.asyncio
 async def test_ensure_native_terminal_non_owned_close_fails_returns_409() -> None:
     """When a non-owned terminal cannot be closed, the shell returns a 409 conflict."""
-    from omnigent.runner.native import _ensure_native_terminal
+    from omnigent.runner.native.orchestration import _ensure_native_terminal
 
     existing = _terminal_view("foreign", terminal_id="terminal_antigravity_main")
     registry = _FakeEnsureRegistry(existing=existing, close_ok=False)
@@ -843,7 +843,7 @@ async def test_ensure_native_terminal_build_context_runs_only_on_create(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """``build_context`` runs on create but is skipped when a terminal already exists."""
-    from omnigent.runner.native import _ensure_native_terminal
+    from omnigent.runner.native.orchestration import _ensure_native_terminal
 
     calls: list[str] = []
 
@@ -854,7 +854,7 @@ async def test_ensure_native_terminal_build_context_runs_only_on_create(
         calls.append("build")
         return dataclasses.replace(ctx, agent_name="resolved")
 
-    monkeypatch.setattr("omnigent.runner.native._launch_goose", _fake_launch)
+    monkeypatch.setattr("omnigent.runner.native.orchestration._launch_goose", _fake_launch)
 
     # Create path: build_context runs.
     await _ensure_native_terminal(
@@ -2102,7 +2102,7 @@ async def test_create_session_spawns_the_snapshot_harness_override() -> None:
     from the spec made init request a harness the turns never asked for: the
     mismatch tears down the override subprocess the kickoff turn is streaming
     through and replaces it with the spec's
-    (``omnigent/runtime/harnesses/process_manager.py:749-770``). When the
+    (``omnigent/harnesses/runtime/process_manager.py:749-770``). When the
     spec's harness is a native one, init also launches its terminal on top of
     that spawn, leaving two live processes for the one session.
     """
@@ -2662,12 +2662,13 @@ async def test_native_session_create_seeds_harness_compaction_anchor(
     ``response.compaction.completed`` persists instead of silently bailing
     on the missing anchor.
     """
-    import omnigent.runner.app as runner_app_mod
 
     async def _noop_terminal(*args: Any, **kwargs: Any) -> None:
         del args, kwargs
 
-    monkeypatch.setattr(runner_app_mod, "_auto_create_claude_terminal", _noop_terminal)
+    monkeypatch.setattr(
+        "omnigent.runner.native.orchestration._auto_create_claude_terminal", _noop_terminal
+    )
     # No bridge dir exists in this test; keep the lazy comment-relay start
     # from parking on the cold-bridge tools/list_changed wait.
     monkeypatch.setattr(

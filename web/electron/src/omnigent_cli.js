@@ -121,7 +121,7 @@ function localConfigDir() {
  * The shared Omnigent state dir, ALWAYS `~/.omnigent` — it ignores
  * `$OMNIGENT_DATA_DIR`, mirroring `state_dir()` in
  * sdks/ui/omnigent_ui_sdk/terminal/_config.py and `_HOST_PID_PATH` in
- * omnigent/cli.py (both hardcode `Path.home()/".omnigent"`). The auth-token
+ * omnigent/cli/commands.py (both hardcode `Path.home()/".omnigent"`). The auth-token
  * store and the daemon registry live here — NOT under the data dir. Only the
  * local-server pidfile honors `$OMNIGENT_DATA_DIR` (see {@link localDataDir}).
  *
@@ -259,7 +259,7 @@ async function localServerHealthy(timeoutMs = 1500) {
 
 /**
  * The CLI binary's two console-script names — both resolve to the same entry
- * point (`omnigent.cli:main`); `omni` is the short alias. We probe `omnigent`
+ * point (`omnigent.cli.commands:main`); `omni` is the short alias. We probe `omnigent`
  * first (canonical) but accept `omni` so a machine that only installed the
  * alias still resolves. See pyproject.toml `[project.scripts]`.
  */
@@ -443,7 +443,7 @@ function runCli(command, args, { timeoutMs = DEFAULT_TIMEOUT_MS } = {}) {
 /**
  * Whether the CLI holds valid stored credentials for a server — read straight
  * from `~/.omnigent/auth_tokens.json` (no subprocess), mirroring
- * omnigent/cli_auth.py: keyed by the trailing-slash-stripped URL, a record is
+ * omnigent/cli/auth.py: keyed by the trailing-slash-stripped URL, a record is
  * valid if it's a Databricks pointer (has `workspace_host`) or a non-expired
  * session token. The CLI's `state_dir()` is hardcoded to `~/.omnigent`.
  *
@@ -478,7 +478,7 @@ function serverAuthed(serverUrl) {
  * for OIDC / Databricks, and fails fast for password (TTY) modes when run
  * without a terminal. The default timeout is generous (~300s) so a human
  * completing the browser sign-in isn't SIGKILLed mid-flow — the CLI's own OIDC
- * ticket deadline (300s, `_CLI_LOGIN_TIMEOUT_SECONDS` in omnigent/cli.py)
+ * ticket deadline (300s, `_CLI_LOGIN_TIMEOUT_SECONDS` in omnigent/cli/commands.py)
  * governs first.
  *
  * @param {string} cliPath
@@ -832,7 +832,7 @@ function matchesServer(daemon, serverUrl) {
 
 /**
  * Directory holding per-target daemon registry records, mirroring
- * `_daemon_registry_dir()` in omnigent/cli.py (`<state_dir>/daemons`).
+ * `_daemon_registry_dir()` in omnigent/cli/commands.py (`<state_dir>/daemons`).
  *
  * @returns {string}
  */
@@ -842,7 +842,7 @@ function daemonRegistryDir() {
 
 /**
  * Parse one decoded daemon registry record into the subset the desktop needs.
- * Mirrors the validation in `_record_from_json()` (omnigent/cli.py): a usable
+ * Mirrors the validation in `_record_from_json()` (omnigent/cli/commands.py): a usable
  * record needs a positive integer `pid`, a non-empty `target`, and a known
  * `mode`. Returns null for malformed records.
  *
@@ -915,7 +915,7 @@ function readDaemonRecords() {
 
 /**
  * The Omnigent server URL a daemon record talks to, mirroring
- * `_daemon_base_url()` (omnigent/cli.py): a local-mode daemon's URL lives in
+ * `_daemon_base_url()` (omnigent/cli/commands.py): a local-mode daemon's URL lives in
  * `resolved_server_url` (falling back to a healthy local server's URL); a
  * server-mode daemon's is its `server_url`/`target`.
  *
@@ -938,7 +938,7 @@ function daemonServerUrl(record) {
  * (no token is stored — the SDK mints one per request) or when nothing is stored
  * for this URL.
  *
- * Unlike `_remote_headers()` (omnigent/chat.py), this deliberately does NOT
+ * Unlike `_remote_headers()` (omnigent/cli/chat.py), this deliberately does NOT
  * honor `OMNIGENT_REMOTE_AUTH_TOKEN`. That token is destination-independent — it
  * authenticates to whatever URL it's sent to — and this function's only caller
  * (the status probe) targets a URL adjacent to an on-disk daemon record, so a
@@ -972,7 +972,7 @@ function bearerTokenFor(serverUrl) {
 /**
  * The "basic request" that detects whether a host's tunnel is up: a single
  * `GET {serverUrl}/v1/hosts/{host_id}`, reading `body.status` — the same probe
- * `_add_daemon_host_status()` (omnigent/cli.py) makes, minus the per-session
+ * `_add_daemon_host_status()` (omnigent/cli/commands.py) makes, minus the per-session
  * runner enumeration. Loopback servers are single-user (no auth); a remote
  * server needs a bearer ({@link bearerTokenFor}). When no bearer is obtainable
  * in-process (a Databricks-pointer login, or auth supplied only via the SDK /
@@ -1018,7 +1018,7 @@ async function probeHostTunnel(serverUrl, hostId, { timeoutMs = 2000 } = {}) {
  * {serverUrl}/v1/me`. A 200 means authed; anything else (a 401, or a
  * Databricks-edge 302 to the workspace OAuth page) means a login is needed —
  * mirroring `_ensure_databricks_server_auth()` and the `login` command in
- * omnigent/cli.py, so the desktop and CLI agree on "is auth needed?".
+ * omnigent/cli/commands.py, so the desktop and CLI agree on "is auth needed?".
  *
  * Sends a stored session token ({@link bearerTokenFor}) when one exists, so an
  * already-authed OIDC/accounts server answers 200 and we skip a needless

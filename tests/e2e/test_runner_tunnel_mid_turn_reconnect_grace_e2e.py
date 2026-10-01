@@ -50,7 +50,7 @@ from pathlib import Path
 import httpx
 import pytest
 
-from omnigent.runner.identity import token_bound_runner_id
+from omnigent.util.runner_identity import token_bound_runner_id
 from tests._helpers.compat import apply_runner_env, apply_server_env
 from tests.e2e.conftest import (
     _REPO_ROOT,
@@ -280,7 +280,7 @@ class _ReconnectStack:
             [
                 sys.executable,
                 "-m",
-                "omnigent.cli",
+                "omnigent.cli.commands",
                 "server",
                 "--host",
                 "127.0.0.1",
@@ -377,7 +377,7 @@ class _Replica:
             [
                 sys.executable,
                 "-m",
-                "omnigent.cli",
+                "omnigent.cli.commands",
                 "server",
                 "--host",
                 "127.0.0.1",

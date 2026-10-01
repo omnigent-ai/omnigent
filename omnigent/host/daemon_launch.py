@@ -21,7 +21,7 @@ import click
 import httpx
 
 from omnigent.harnesses.claude_native.bridge import url_component
-from omnigent.process_logging import display_log_path, process_log_dir
+from omnigent.observability.process_logging import display_log_path, process_log_dir
 
 # Steady-state poll cadence while waiting for a daemon-spawned runner to
 # connect its tunnel or for a resource to appear.
@@ -91,7 +91,7 @@ def open_daemon_client(
     on a single server replica. Baking the host_id routing header into the
     client's headers at construction pins all of them to that replica, ahead
     of the first request regardless of the caller's call order. The builder
-    (:func:`~omnigent.cli_auth.databricks_request_headers`) emits the header
+    (:func:`~omnigent.cli.auth.databricks_request_headers`) emits the header
     only on a host-sharded mount, so an unsharded server is unaffected.
 
     :param base_url: Omnigent server base URL, e.g. the workspace API mount.
@@ -105,7 +105,7 @@ def open_daemon_client(
     """
     from omnigent_client._http import is_loopback_url
 
-    from omnigent.cli_auth import databricks_request_headers
+    from omnigent.cli.auth import databricks_request_headers
 
     pinned = {**headers, **databricks_request_headers(base_url, host_id=host_id)}
     # A proxy cannot reach a loopback server, so local targets bypass it.

@@ -163,7 +163,7 @@ def _acp_launcher_bundle(agent_command: str) -> bytes:
     :param agent_command: Command line that launches the fake ACP agent.
     :returns: The gzipped tarball bytes for the multipart session create.
     """
-    from omnigent.cli import _materialize_harness_launcher_file
+    from omnigent.cli.commands import _materialize_harness_launcher_file
     from omnigent.onboarding.acp_auth import AcpAgentEntry
 
     launcher = _materialize_harness_launcher_file(

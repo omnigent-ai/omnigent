@@ -32,12 +32,12 @@ import click
 import psutil  # type: ignore[import-untyped]
 
 from omnigent.config import global_config_path
-from omnigent.inner import _proc
-from omnigent.process_logging import (
+from omnigent.observability.process_logging import (
     PROCESS_LOG_FILE_ENV_VAR,
     child_logging_popen_kwargs,
     open_process_log_file,
 )
+from omnigent.util import proc as _proc
 
 _logger = logging.getLogger(__name__)
 
@@ -65,7 +65,7 @@ class LocalServerStartupError(click.ClickException):
     rejection: the real cause (a missing dependency, a port conflict, a
     schema mismatch) lives in the server log, and ``omnigent stop`` cannot
     fix it. The class-level marker (read by
-    :func:`omnigent.cli_diagnostics.suppresses_recovery_hint`) suppresses
+    :func:`omnigent.cli.diagnostics.suppresses_recovery_hint`) suppresses
     the otherwise-misleading stale-host recovery hint. Kept a
     ``ClickException`` so existing ``except click.ClickException`` handlers
     (e.g. in :func:`ensure_local_omnigent_server`) still catch it and its
@@ -86,7 +86,7 @@ def _local_data_dir() -> Path:
     if their Alembic heads have diverged the shared DB can't migrate and the
     daemon-backed local server fails to boot ("schema is out of date").
 
-    Must stay in lock-step with :func:`omnigent.chat._omnigent_persistent_dir`:
+    Must stay in lock-step with :func:`omnigent.cli.chat._omnigent_persistent_dir`:
     the local server's DB lives here and ``omnigent run`` resolves the
     resume DB there, so the two MUST agree. ``OMNIGENT_CONFIG_HOME`` is
     deliberately NOT consulted — it isolates *config* (``config.yaml``) only;
@@ -823,7 +823,7 @@ def _spawn_local_server(port: int, base_path: str) -> _SpawnedLocalServer:
                     # without adding the workspace to the startup import path.
                     "-P",
                     "-m",
-                    "omnigent.cli",
+                    "omnigent.cli.commands",
                     "server",
                     "--host",
                     "127.0.0.1",
@@ -1177,7 +1177,7 @@ def _read_log_tail(log_path: Path, max_lines: int = 50) -> str:
     :returns: The sanitized tail, or a short placeholder when the file is
         empty/unreadable (never raises).
     """
-    from omnigent.cli_diagnostics import redact_secrets
+    from omnigent.cli.diagnostics import redact_secrets
 
     try:
         with log_path.open("rb") as fh:

@@ -71,7 +71,7 @@ dependencies = [
     "anyio>=4.0,<5",
     "cachetools>=5.0,<7",
     "filelock>=3.0",
-    # _HostGroup (omnigent/cli.py) rewrites a leading positional server URL
+    # _HostGroup (omnigent/cli/commands.py) rewrites a leading positional server URL
     # into `--server` before Click parses it, so it no longer depends on
     # Click's internal `protected_args` (made read-only in click 8.2, slated
     # for removal in click 9). Upper bound `<10` only guards against an
@@ -101,12 +101,12 @@ dependencies = [
     "PyJWT[crypto]>=2.8,<3",
     "argon2-cffi>=23.1,<24",
     # PEP 440 version comparison for the update check / `omni upgrade`
-    # (omnigent/update_check.py, omnigent/cli.py): compares the installed
+    # (omnigent/cli/update_check.py, omnigent/cli/commands.py): compares the installed
     # version against the latest PyPI release. Previously only a
     # transitive dep; pinned here now that we import it directly.
     "packaging>=23,<26",
     # CA root bundle for client TLS verification (omnigent/tls.py,
-    # omnigent/inner/egress/ca.py). Required as a real fallback on uv /
+    # omnigent/sandbox/egress/ca.py). Required as a real fallback on uv /
     # python-build-standalone interpreters whose OpenSSL has no default cert
     # path; previously only transitive, pinned here now that we import it.
     "certifi>=2023.7",
@@ -408,8 +408,8 @@ dev = [
 # absorption. `omni` is installed as a short alias — both resolve to
 # the same entry point. (No former-name aliases: only `omnigent` and
 # `omni` ship, internal and OSS alike.)
-omnigent = "omnigent.cli:main"
-omni = "omnigent.cli:main"
+omnigent = "omnigent.cli.commands:main"
+omni = "omnigent.cli.commands:main"
 
 [tool.uv]
 # Keep plain `uv sync` aligned with the published base package. Repository
@@ -654,6 +654,9 @@ known-first-party = ["omnigent"]
 "omnigent/runtime/**/*.py" = [
     "ARG001", "ARG002", "BLE001", "B008", "RUF012",
 ]
+"omnigent/harnesses/runtime/*.py" = [
+    "ARG001", "ARG002", "BLE001", "B008", "RUF012",
+]
 "omnigent/terminals/**/*.py" = [
     "ARG001", "ARG002", "BLE001", "B008", "RUF012",
 ]
@@ -670,6 +673,9 @@ known-first-party = ["omnigent"]
 # Telemetry modules intentionally catch all exceptions at every boundary —
 # telemetry must never disrupt the application under any circumstances.
 "omnigent/telemetry/*.py" = ["BLE001", "SIM105"]
+"omnigent/observability/otel.py" = [
+    "ARG001", "ARG002", "BLE001", "B008", "RUF012",
+]
 "sdks/**/*.py" = [
     "ARG001", "ARG002", "BLE001", "B008", "RUF012",
 ]
@@ -685,4 +691,4 @@ known-first-party = ["omnigent"]
 # imports intentionally re-export implementation names and load route modules
 # for registration, so F401 remains expected in this package.
 "omnigent/server/routes/sessions/__init__.py" = ["ARG001", "ARG002", "BLE001", "E501", "F401"]
-"omnigent/server/routes/sessions/*.py" = ["ARG001", "ARG002", "BLE001", "E501", "F401"]
+"omnigent/server/routes/sessions/routes_*.py" = ["ARG001", "ARG002", "BLE001", "E501", "F401"]

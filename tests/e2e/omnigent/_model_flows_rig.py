@@ -261,7 +261,7 @@ class ModelFlowsRig:
             [
                 _rig_python(self.repo),
                 "-m",
-                "omnigent.cli",
+                "omnigent.cli.commands",
                 "server",
                 "--host",
                 "127.0.0.1",

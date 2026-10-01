@@ -9,7 +9,7 @@ from unittest.mock import Mock
 import httpx
 import pytest
 
-from omnigent.server.routes._sessions import orchestration
+from omnigent.server.routes.sessions import orchestration
 from omnigent.stores.conversation_store import ConversationStore
 
 

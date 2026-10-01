@@ -272,7 +272,7 @@ class _ScriptedRunnerClient:
 async def test_subagent_activity_waits_for_final_idle_after_buffered_turns(
     db_uri: str, outcome: str
 ) -> None:
-    from omnigent.server.routes._sessions.orchestration import _relay_runner_stream_once
+    from omnigent.server.routes.sessions.orchestration import _relay_runner_stream_once
 
     store = SqlAlchemyConversationStore(db_uri)
     parent = store.create_conversation()
@@ -629,7 +629,7 @@ async def test_relay_publishes_failed_status_on_tunnel_close(
     from omnigent.server.subagent_activity import record_subagent_activity
 
     monkeypatch.setattr(
-        "omnigent.server.routes._sessions.orchestration.RUNNER_DISCONNECT_GRACE_S",
+        "omnigent.server.routes.sessions.orchestration.RUNNER_DISCONNECT_GRACE_S",
         0.0,
     )
     sessions_module._runner_relay_tasks.clear()
@@ -825,7 +825,7 @@ async def test_relay_persists_disconnect_error_labels_on_tunnel_close(
     from omnigent.server.routes import sessions as sessions_module
 
     monkeypatch.setattr(
-        "omnigent.server.routes._sessions.orchestration.RUNNER_DISCONNECT_GRACE_S",
+        "omnigent.server.routes.sessions.orchestration.RUNNER_DISCONNECT_GRACE_S",
         0.0,
     )
     sessions_module._runner_relay_tasks.clear()
@@ -897,7 +897,7 @@ async def test_runner_recovery_clears_persisted_disconnect_error_labels(
     from omnigent.server.routes import sessions as sessions_module
 
     monkeypatch.setattr(
-        "omnigent.server.routes._sessions.orchestration.RUNNER_DISCONNECT_GRACE_S",
+        "omnigent.server.routes.sessions.orchestration.RUNNER_DISCONNECT_GRACE_S",
         0.0,
     )
     sessions_module._runner_relay_tasks.clear()
@@ -1117,7 +1117,7 @@ async def test_relay_running_edge_clears_stale_intentional_stop_marker(
     from omnigent.server.routes import sessions as sessions_module
 
     monkeypatch.setattr(
-        "omnigent.server.routes._sessions.orchestration.RUNNER_DISCONNECT_GRACE_S",
+        "omnigent.server.routes.sessions.orchestration.RUNNER_DISCONNECT_GRACE_S",
         0.0,
     )
     sessions_module._runner_relay_tasks.clear()
@@ -1210,7 +1210,7 @@ async def test_relay_completion_idle_clears_only_a_disconnect_failure(
     from omnigent.server.routes import sessions as sessions_module
 
     monkeypatch.setattr(
-        "omnigent.server.routes._sessions.orchestration.RUNNER_DISCONNECT_GRACE_S",
+        "omnigent.server.routes.sessions.orchestration.RUNNER_DISCONNECT_GRACE_S",
         0.0,
     )
     sessions_module._runner_relay_tasks.clear()
@@ -1315,11 +1315,11 @@ async def test_relay_backs_off_when_a_registered_runner_rejects_the_stream(
     from omnigent.server.routes import sessions as sessions_module
 
     monkeypatch.setattr(
-        "omnigent.server.routes._sessions.orchestration.RUNNER_DISCONNECT_GRACE_S",
+        "omnigent.server.routes.sessions.orchestration.RUNNER_DISCONNECT_GRACE_S",
         0.5,
     )
     monkeypatch.setattr(
-        "omnigent.server.routes._sessions.orchestration._RELAY_RETRY_INTERVAL_S",
+        "omnigent.server.routes.sessions.orchestration._RELAY_RETRY_INTERVAL_S",
         0.1,
     )
     sessions_module._runner_relay_tasks.clear()
@@ -1371,7 +1371,7 @@ async def test_relay_survives_a_failed_recovery_read_and_keeps_delivering(
     from omnigent.server.routes import sessions as sessions_module
 
     monkeypatch.setattr(
-        "omnigent.server.routes._sessions.orchestration.RUNNER_DISCONNECT_GRACE_S",
+        "omnigent.server.routes.sessions.orchestration.RUNNER_DISCONNECT_GRACE_S",
         0.0,
     )
     sessions_module._runner_relay_tasks.clear()
@@ -1454,7 +1454,7 @@ async def test_relay_stays_quiet_when_runner_leaves_an_idle_session(
     from omnigent.server.routes import sessions as sessions_module
 
     monkeypatch.setattr(
-        "omnigent.server.routes._sessions.orchestration.RUNNER_DISCONNECT_GRACE_S",
+        "omnigent.server.routes.sessions.orchestration.RUNNER_DISCONNECT_GRACE_S",
         0.0,
     )
     sessions_module._runner_relay_tasks.clear()
@@ -1540,7 +1540,7 @@ async def test_relay_fails_mid_turn_session_from_the_row_when_the_cache_is_cold(
     from omnigent.server.routes import sessions as sessions_module
 
     monkeypatch.setattr(
-        "omnigent.server.routes._sessions.orchestration.RUNNER_DISCONNECT_GRACE_S",
+        "omnigent.server.routes.sessions.orchestration.RUNNER_DISCONNECT_GRACE_S",
         0.0,
     )
     sessions_module._runner_relay_tasks.clear()
@@ -1599,7 +1599,7 @@ async def test_relay_reports_the_drop_when_the_live_status_read_fails(
     from omnigent.server.routes import sessions as sessions_module
 
     monkeypatch.setattr(
-        "omnigent.server.routes._sessions.orchestration.RUNNER_DISCONNECT_GRACE_S",
+        "omnigent.server.routes.sessions.orchestration.RUNNER_DISCONNECT_GRACE_S",
         0.0,
     )
     sessions_module._runner_relay_tasks.clear()
@@ -1688,7 +1688,7 @@ async def test_relay_retries_transport_drop_within_grace(
     from omnigent.server.routes import sessions as sessions_module
 
     monkeypatch.setattr(
-        "omnigent.server.routes._sessions.orchestration._RELAY_RETRY_INTERVAL_S",
+        "omnigent.server.routes.sessions.orchestration._RELAY_RETRY_INTERVAL_S",
         0.01,
     )
     sessions_module._runner_relay_tasks.clear()
@@ -1714,7 +1714,7 @@ async def test_relay_retries_transport_drop_within_grace(
         assert store.labels.get(session_id) is None
         # It is still recorded: one outage-start row naming the grace the turn
         # was held for, and no give-up row since the retry rode it out.
-        from omnigent.server.routes._sessions.orchestration import RUNNER_DISCONNECT_GRACE_S
+        from omnigent.server.routes.sessions.orchestration import RUNNER_DISCONNECT_GRACE_S
 
         events = [getattr(r, "event_name", None) for r in caplog.records]
         assert events.count("runner_stream_transport_lost") == 1
@@ -1863,7 +1863,7 @@ async def test_relay_does_not_fail_turn_during_server_shutdown(
     from omnigent.server.routes import sessions as sessions_module
 
     monkeypatch.setattr(
-        "omnigent.server.routes._sessions.orchestration.RUNNER_DISCONNECT_GRACE_S",
+        "omnigent.server.routes.sessions.orchestration.RUNNER_DISCONNECT_GRACE_S",
         0.0,
     )
     sessions_module._runner_relay_tasks.clear()
@@ -1920,7 +1920,7 @@ async def test_relay_stays_quiet_when_runner_is_live_on_another_replica(
     from omnigent.stores.conversation_store import SessionConnectivity
 
     monkeypatch.setattr(
-        "omnigent.server.routes._sessions.orchestration.RUNNER_DISCONNECT_GRACE_S",
+        "omnigent.server.routes.sessions.orchestration.RUNNER_DISCONNECT_GRACE_S",
         0.0,
     )
     sessions_module._runner_relay_tasks.clear()
@@ -2017,7 +2017,7 @@ async def test_relay_still_fails_mid_turn_session_when_stamp_is_not_newer(
     from omnigent.stores.conversation_store import SessionConnectivity
 
     monkeypatch.setattr(
-        "omnigent.server.routes._sessions.orchestration.RUNNER_DISCONNECT_GRACE_S",
+        "omnigent.server.routes.sessions.orchestration.RUNNER_DISCONNECT_GRACE_S",
         0.0,
     )
     sessions_module._runner_relay_tasks.clear()
@@ -2077,7 +2077,7 @@ def test_runner_disconnect_grace_exceeds_runner_worst_case_reconnect() -> None:
         _MAX_RECONNECT_DELAY_S,
         _RECONNECT_JITTER_FRACTION,
     )
-    from omnigent.server.routes._sessions.orchestration import RUNNER_DISCONNECT_GRACE_S
+    from omnigent.server.routes.sessions.orchestration import RUNNER_DISCONNECT_GRACE_S
 
     worst_case_reconnect_s = _MAX_RECONNECT_DELAY_S * (1 + _RECONNECT_JITTER_FRACTION)
     assert worst_case_reconnect_s < RUNNER_DISCONNECT_GRACE_S, (

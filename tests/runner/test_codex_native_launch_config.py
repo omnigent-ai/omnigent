@@ -17,9 +17,9 @@ import httpx
 import pytest
 
 import omnigent.runner.native.orchestration as _orchestration
-from omnigent import debug_logging
 from omnigent.errors import OmnigentError
-from omnigent.runner.app import _codex_native_launch_config
+from omnigent.observability import debug_logging
+from omnigent.runner.native.orchestration import _codex_native_launch_config
 
 
 @pytest.fixture(autouse=True)

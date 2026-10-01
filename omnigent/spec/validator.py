@@ -494,7 +494,7 @@ def _validate_compaction(spec: AgentSpec, result: ValidationResult) -> None:
 
 # Set of sandbox backends that hard-enforce network isolation
 # (and therefore can host an L7 egress proxy). Mirrors the loader's
-# allow-list in ``omnigent/inner/loader.py``. ``none`` is excluded
+# allow-list in ``omnigent/core/loader.py``. ``none`` is excluded
 # — it doesn't install a namespace or SBPL, so egress rules would be
 # inert decoration on the policy.
 _EGRESS_CAPABLE_BACKENDS = frozenset({"linux_bwrap", "darwin_seatbelt"})

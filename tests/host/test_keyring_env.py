@@ -9,10 +9,10 @@ from pathlib import Path
 
 import pytest
 
-from omnigent.cli import _build_host_daemon_env
+from omnigent.cli.commands import _build_host_daemon_env
+from omnigent.environments.os_env import build_helper_env
 from omnigent.host.connect import _build_runner_env
-from omnigent.inner.os_env import build_helper_env
-from omnigent.inner.sandbox import SandboxPolicy
+from omnigent.sandbox.core import SandboxPolicy
 
 _BACKEND_SOURCE = """\
 import json

@@ -6,10 +6,10 @@ import os
 
 import pytest
 
-from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
-from omnigent.inner.goose_executor import GooseExecutor
+from omnigent.core.datamodel import OSEnvSandboxSpec, OSEnvSpec
+from omnigent.harnesses.goose.executor import GooseExecutor
+from omnigent.harnesses.runtime.process_manager import _build_harness_spawn_env
 from omnigent.runner.app import _build_spawn_env_from_spec
-from omnigent.runtime.harnesses.process_manager import _build_harness_spawn_env
 from omnigent.spec.types import AgentSpec, ExecutorSpec
 
 

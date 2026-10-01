@@ -516,7 +516,7 @@ async def forward_kiro_session_to_omnigent(
     mirrored_external_session_id: str | None = None
     last_posted_cost: float | None = None
     last_posted_model: str | None = None
-    from omnigent.cli_auth import open_server_client
+    from omnigent.cli.auth import open_server_client
 
     async with open_server_client(base_url, headers=headers, auth=auth, timeout=timeout) as client:
         while True:

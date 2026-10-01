@@ -6,7 +6,7 @@ from typing import Any
 
 from fastapi import APIRouter, Request
 
-from omnigent.harness_plugins import harness_catalog, harness_setup_steps_by_spelling
+from omnigent.harnesses.registry import harness_catalog, harness_setup_steps_by_spelling
 from omnigent.server.auth import AuthProvider
 from omnigent.server.routes._auth_helpers import require_user
 

@@ -47,9 +47,9 @@ from typing import Any
 
 import pytest
 
+from omnigent.core.executor import ExecutorError, TurnComplete
 from omnigent.harnesses.kimi_native.bridge import write_tmux_target
-from omnigent.inner.executor import ExecutorError, TurnComplete
-from omnigent.inner.kimi_native_executor import KimiNativeExecutor
+from omnigent.harnesses.kimi_native.executor import KimiNativeExecutor
 
 # Boot slower than the bridge's 30s readiness gate (_TMUX_READY_TIMEOUT_S) but
 # only just — mirrors the live repro where kimi mounted ~5s after the gate gave

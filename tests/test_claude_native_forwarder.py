@@ -8170,7 +8170,7 @@ async def test_parent_output_forwards_while_child_history_is_blocked(
         ) as client:
             yield client
 
-    monkeypatch.setattr("omnigent.cli_auth.open_server_client", open_mock_client)
+    monkeypatch.setattr("omnigent.cli.auth.open_server_client", open_mock_client)
     task = asyncio.create_task(
         forward_claude_transcript_to_session(
             base_url="http://ap",
@@ -8238,7 +8238,7 @@ def _observe_subagent_scans(
             yield client
 
     monkeypatch.setattr(forwarder, "_forward_available_subagents", scan)
-    monkeypatch.setattr("omnigent.cli_auth.open_server_client", open_mock_client)
+    monkeypatch.setattr("omnigent.cli.auth.open_server_client", open_mock_client)
     return completed
 
 
@@ -10959,7 +10959,7 @@ async def test_degraded_sync_log_belongs_to_the_destination_session(
     caplog: pytest.LogCaptureFixture,
     http_status: int | None,
 ) -> None:
-    from omnigent.debug_logging import current_session_id_scope, record_to_row
+    from omnigent.observability.debug_logging import current_session_id_scope, record_to_row
 
     monkeypatch.setenv("OMNIGENT_RUNNER_PRIMARY_SESSION_ID", "parent-session")
     monkeypatch.setattr(forwarder, "_forward_health", forwarder._ForwardHealth())
@@ -11128,7 +11128,7 @@ def test_retry_tracker_transient_failures_escalate_degraded() -> None:
 
 
 def _subagent_drop_row(caplog: pytest.LogCaptureFixture) -> dict[str, Any]:
-    from omnigent.debug_logging import record_to_row
+    from omnigent.observability.debug_logging import record_to_row
 
     records = [
         record

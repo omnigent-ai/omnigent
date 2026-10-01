@@ -13,8 +13,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec, TerminalEnvSpec, WritePathSpec
-from omnigent.inner.os_env import create_os_environment
+from omnigent.core.datamodel import OSEnvSandboxSpec, OSEnvSpec, TerminalEnvSpec, WritePathSpec
+from omnigent.environments.os_env import create_os_environment
 from omnigent.runner.resource_registry import SessionResourceRegistry
 from omnigent.runner.tool_dispatch import _execute_os_env_tool, _execute_terminal_tool
 from omnigent.sandbox.copy_on_write import (

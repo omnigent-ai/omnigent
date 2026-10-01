@@ -18,7 +18,7 @@ Register statically in an agent's YAML, or dynamically on a running
 session via the policy API.
 
 Static, in an agent ``config.yaml`` (``policies:`` block, parsed by
-:mod:`omnigent.inner.loader` — ``handler`` + ``factory_params``)::
+:mod:`omnigent.core.loader` — ``handler`` + ``factory_params``)::
 
     policies:
       block_shell:

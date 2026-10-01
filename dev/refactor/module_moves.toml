@@ -1,0 +1,756 @@
+# Package reorganization map consumed by dev/refactor/relocate_modules.py.
+# Each [[move]] relocates a module or package and rewrites every in-repo reference.
+# Re-run `apply` on a fresh main to regenerate the move; run `rewrite` on an
+# in-flight branch to update its imports after the move lands.
+
+[[move]]
+old = "omnigent.inner.acp_executor"
+new = "omnigent.harnesses.acp.executor"
+
+[[move]]
+old = "omnigent.inner.acp_harness"
+new = "omnigent.harnesses.acp.harness"
+
+[[move]]
+old = "omnigent.inner.acp_subagents"
+new = "omnigent.harnesses.acp.subagents"
+
+[[move]]
+old = "omnigent.inner.acp_extension"
+new = "omnigent.harnesses.acp.extension"
+
+[[move]]
+old = "omnigent.inner._acp_omnigent_mcp"
+new = "omnigent.harnesses.acp.omnigent_mcp"
+
+[[move]]
+old = "omnigent.inner.antigravity_executor"
+new = "omnigent.harnesses.antigravity.executor"
+
+[[move]]
+old = "omnigent.inner.antigravity_harness"
+new = "omnigent.harnesses.antigravity.harness"
+
+[[move]]
+old = "omnigent.inner.claude_sdk_executor"
+new = "omnigent.harnesses.claude_sdk.executor"
+
+[[move]]
+old = "omnigent.inner.claude_sdk_harness"
+new = "omnigent.harnesses.claude_sdk.harness"
+
+[[move]]
+old = "omnigent.inner.claude_gateway_shim"
+new = "omnigent.harnesses.claude_sdk.gateway_shim"
+
+[[move]]
+old = "omnigent.inner.bundle_skills"
+new = "omnigent.harnesses.claude_sdk.bundle_skills"
+
+[[move]]
+old = "omnigent.inner.codex_executor"
+new = "omnigent.harnesses.codex.executor"
+
+[[move]]
+old = "omnigent.inner.codex_harness"
+new = "omnigent.harnesses.codex.harness"
+
+[[move]]
+old = "omnigent.inner.codex_worker"
+new = "omnigent.harnesses.codex.worker"
+
+[[move]]
+old = "omnigent.inner.codex_staging"
+new = "omnigent.harnesses.codex.staging"
+
+[[move]]
+old = "omnigent.inner.codex_goal_command"
+new = "omnigent.harnesses.codex.goal_command"
+
+[[move]]
+old = "omnigent.inner.copilot_executor"
+new = "omnigent.harnesses.copilot.executor"
+
+[[move]]
+old = "omnigent.inner.copilot_harness"
+new = "omnigent.harnesses.copilot.harness"
+
+[[move]]
+old = "omnigent.inner.cursor_executor"
+new = "omnigent.harnesses.cursor.executor"
+
+[[move]]
+old = "omnigent.inner.cursor_harness"
+new = "omnigent.harnesses.cursor.harness"
+
+[[move]]
+old = "omnigent.inner.cursor_policy_hook"
+new = "omnigent.harnesses.cursor.policy_hook"
+
+[[move]]
+old = "omnigent.inner.databricks_executor"
+new = "omnigent.harnesses.databricks.executor"
+
+[[move]]
+old = "omnigent.inner.goose_executor"
+new = "omnigent.harnesses.goose.executor"
+
+[[move]]
+old = "omnigent.inner.goose_harness"
+new = "omnigent.harnesses.goose.harness"
+
+[[move]]
+old = "omnigent.inner.hermes_executor"
+new = "omnigent.harnesses.hermes.executor"
+
+[[move]]
+old = "omnigent.inner.hermes_harness"
+new = "omnigent.harnesses.hermes.harness"
+
+[[move]]
+old = "omnigent.inner.hermes_policy_hook"
+new = "omnigent.harnesses.hermes.policy_hook"
+
+[[move]]
+old = "omnigent.inner.kimi_executor"
+new = "omnigent.harnesses.kimi.executor"
+
+[[move]]
+old = "omnigent.inner.kimi_harness"
+new = "omnigent.harnesses.kimi.harness"
+
+[[move]]
+old = "omnigent.inner.open_responses_sdk"
+new = "omnigent.harnesses.open_responses.executor"
+
+[[move]]
+old = "omnigent.inner.openai_agents_sdk_executor"
+new = "omnigent.harnesses.openai_agents.executor"
+
+[[move]]
+old = "omnigent.inner.openai_agents_sdk_harness"
+new = "omnigent.harnesses.openai_agents.harness"
+
+[[move]]
+old = "omnigent.inner.pi_executor"
+new = "omnigent.harnesses.pi.executor"
+
+[[move]]
+old = "omnigent.inner.pi_harness"
+new = "omnigent.harnesses.pi.harness"
+
+[[move]]
+old = "omnigent.inner.pi_settings"
+new = "omnigent.harnesses.pi.settings"
+
+[[move]]
+old = "omnigent.inner.qwen_executor"
+new = "omnigent.harnesses.qwen.executor"
+
+[[move]]
+old = "omnigent.inner.qwen_harness"
+new = "omnigent.harnesses.qwen.harness"
+
+[[move]]
+old = "omnigent.acp_cli_harnesses"
+new = "omnigent.harnesses.acp.cli_harnesses"
+
+[[move]]
+old = "omnigent.inner.antigravity_native_executor"
+new = "omnigent.harnesses.antigravity_native.executor"
+
+[[move]]
+old = "omnigent.inner.antigravity_native_harness"
+new = "omnigent.harnesses.antigravity_native.harness"
+
+[[move]]
+old = "omnigent.inner.claude_native_executor"
+new = "omnigent.harnesses.claude_native.executor"
+
+[[move]]
+old = "omnigent.inner.claude_native_harness"
+new = "omnigent.harnesses.claude_native.harness"
+
+[[move]]
+old = "omnigent.inner.codex_native_executor"
+new = "omnigent.harnesses.codex_native.executor"
+
+[[move]]
+old = "omnigent.inner.codex_native_harness"
+new = "omnigent.harnesses.codex_native.harness"
+
+[[move]]
+old = "omnigent.inner.cursor_native_executor"
+new = "omnigent.harnesses.cursor_native.executor"
+
+[[move]]
+old = "omnigent.inner.cursor_native_harness"
+new = "omnigent.harnesses.cursor_native.harness"
+
+[[move]]
+old = "omnigent.inner.devin_native_executor"
+new = "omnigent.harnesses.devin_native.executor"
+
+[[move]]
+old = "omnigent.inner.devin_native_harness"
+new = "omnigent.harnesses.devin_native.harness"
+
+[[move]]
+old = "omnigent.inner.goose_native_executor"
+new = "omnigent.harnesses.goose_native.executor"
+
+[[move]]
+old = "omnigent.inner.goose_native_harness"
+new = "omnigent.harnesses.goose_native.harness"
+
+[[move]]
+old = "omnigent.inner.hermes_native_executor"
+new = "omnigent.harnesses.hermes_native.executor"
+
+[[move]]
+old = "omnigent.inner.hermes_native_harness"
+new = "omnigent.harnesses.hermes_native.harness"
+
+[[move]]
+old = "omnigent.inner.kimi_native_executor"
+new = "omnigent.harnesses.kimi_native.executor"
+
+[[move]]
+old = "omnigent.inner.kimi_native_harness"
+new = "omnigent.harnesses.kimi_native.harness"
+
+[[move]]
+old = "omnigent.inner.kiro_native_executor"
+new = "omnigent.harnesses.kiro_native.executor"
+
+[[move]]
+old = "omnigent.inner.kiro_native_harness"
+new = "omnigent.harnesses.kiro_native.harness"
+
+[[move]]
+old = "omnigent.inner.opencode_native_executor"
+new = "omnigent.harnesses.opencode_native.executor"
+
+[[move]]
+old = "omnigent.inner.opencode_native_harness"
+new = "omnigent.harnesses.opencode_native.harness"
+
+[[move]]
+old = "omnigent.inner.pi_native_executor"
+new = "omnigent.harnesses.pi_native.executor"
+
+[[move]]
+old = "omnigent.inner.pi_native_harness"
+new = "omnigent.harnesses.pi_native.harness"
+
+[[move]]
+old = "omnigent.inner.qwen_native_executor"
+new = "omnigent.harnesses.qwen_native.executor"
+
+[[move]]
+old = "omnigent.inner.qwen_native_harness"
+new = "omnigent.harnesses.qwen_native.harness"
+
+[[move]]
+old = "omnigent.claude_launcher"
+new = "omnigent.harnesses.claude_native.launcher"
+
+[[move]]
+old = "omnigent.codex_approval_modes"
+new = "omnigent.harnesses.codex_native.approval_modes"
+
+[[move]]
+old = "omnigent.native.native_policy_hook"
+new = "omnigent.harnesses.native.policy_hook"
+
+[[move]]
+old = "omnigent.native.native_cost_popup"
+new = "omnigent.harnesses.native.cost_popup"
+
+[[move]]
+old = "omnigent.native._native_post_delivery"
+new = "omnigent.harnesses.native.post_delivery"
+
+[[move]]
+old = "omnigent.native.native_bridge_common"
+new = "omnigent.harnesses.native.bridge_common"
+
+[[move]]
+old = "omnigent.native.native_server_harness"
+new = "omnigent.harnesses.native.server_harness"
+
+[[move]]
+old = "omnigent.native.native_server_transport"
+new = "omnigent.harnesses.native.server_transport"
+
+[[move]]
+old = "omnigent.native.native_coding_agents"
+new = "omnigent.harnesses.native.coding_agents"
+
+[[move]]
+old = "omnigent.native.native_terminal"
+new = "omnigent.harnesses.native.terminal"
+
+[[move]]
+old = "omnigent.native._native_resume_hint"
+new = "omnigent.harnesses.native.resume_hint"
+
+[[move]]
+old = "omnigent.native._native_forwarder_health"
+new = "omnigent.harnesses.native.forwarder_health"
+
+[[move]]
+old = "omnigent.native.native_dispatch"
+new = "omnigent.harnesses.native.dispatch"
+
+[[move]]
+old = "omnigent.native.input_ready"
+new = "omnigent.harnesses.native.input_ready"
+
+[[move]]
+old = "omnigent.native.owner_claim"
+new = "omnigent.harnesses.native.owner_claim"
+
+[[move]]
+old = "omnigent.native.session_todos"
+new = "omnigent.harnesses.native.session_todos"
+
+[[move]]
+old = "omnigent.native.tool_observer_hook"
+new = "omnigent.harnesses.native.tool_observer_hook"
+
+[[move]]
+old = "omnigent.inner.hook_scripts"
+new = "omnigent.harnesses.native.hook_scripts"
+
+[[move]]
+old = "omnigent.harness_plugins"
+new = "omnigent.harnesses.registry"
+
+[[move]]
+old = "omnigent.harness_install_spec"
+new = "omnigent.harnesses.install_spec"
+
+[[move]]
+old = "omnigent.harness_aliases"
+new = "omnigent.harnesses.aliases"
+
+[[move]]
+old = "omnigent.harness_availability"
+new = "omnigent.harnesses.availability"
+
+[[move]]
+old = "omnigent.harness_capabilities"
+new = "omnigent.harnesses.capabilities"
+
+[[move]]
+old = "omnigent.harness_startup_config"
+new = "omnigent.harnesses.startup_config"
+
+[[move]]
+old = "omnigent._wrapper_labels"
+new = "omnigent.harnesses.wrapper_labels"
+
+[[move]]
+old = "omnigent.runtime.harnesses"
+new = "omnigent.harnesses.runtime"
+
+[[move]]
+old = "omnigent.inner.datamodel"
+new = "omnigent.core.datamodel"
+
+[[move]]
+old = "omnigent.inner.executor"
+new = "omnigent.core.executor"
+
+[[move]]
+old = "omnigent.inner.tools"
+new = "omnigent.core.tools"
+
+[[move]]
+old = "omnigent.inner.policies"
+new = "omnigent.core.policies"
+
+[[move]]
+old = "omnigent.inner.loader"
+new = "omnigent.core.loader"
+
+[[move]]
+old = "omnigent.inner.sandbox"
+new = "omnigent.sandbox.core"
+
+[[move]]
+old = "omnigent.inner.seatbelt_sandbox"
+new = "omnigent.sandbox.seatbelt"
+replace = true
+
+[[move]]
+old = "omnigent.inner.bwrap_sandbox"
+new = "omnigent.sandbox.bwrap"
+replace = true
+
+[[move]]
+old = "omnigent.inner.windows_jobobject_sandbox"
+new = "omnigent.sandbox.windows_jobobject"
+
+[[move]]
+old = "omnigent.inner._seccomp"
+new = "omnigent.sandbox.seccomp"
+
+[[move]]
+old = "omnigent.inner._cwd_scan"
+new = "omnigent.sandbox.cwd_scan"
+
+[[move]]
+old = "omnigent.inner.credential_proxy"
+new = "omnigent.sandbox.credential_proxy"
+
+[[move]]
+old = "omnigent.inner.egress"
+new = "omnigent.sandbox.egress"
+
+[[move]]
+old = "omnigent.inner.os_env"
+new = "omnigent.environments.os_env"
+
+[[move]]
+old = "omnigent.inner.os_env_serialization"
+new = "omnigent.environments.serialization"
+
+[[move]]
+old = "omnigent.inner.agent_env"
+new = "omnigent.environments.agent_env"
+
+[[move]]
+old = "omnigent.inner.terminal"
+new = "omnigent.terminals.terminal"
+
+[[move]]
+old = "omnigent.inner.terminal_clipboard"
+new = "omnigent.terminals.clipboard"
+
+[[move]]
+old = "omnigent.inference_config"
+new = "omnigent.models.inference_config"
+
+[[move]]
+old = "omnigent.gateway_inference"
+new = "omnigent.models.gateway_inference"
+
+[[move]]
+old = "omnigent.databricks_ai_gateway"
+new = "omnigent.models.databricks_ai_gateway"
+
+[[move]]
+old = "omnigent.inner.databricks_token"
+new = "omnigent.models.databricks_token"
+
+[[move]]
+old = "omnigent.inner.model_auth"
+new = "omnigent.models.signer.auth"
+
+[[move]]
+old = "omnigent.inner.model_credential"
+new = "omnigent.models.signer.credential"
+
+[[move]]
+old = "omnigent.inner.model_egress"
+new = "omnigent.models.signer.egress"
+
+[[move]]
+old = "omnigent.inner.model_signer"
+new = "omnigent.models.signer.lifecycle"
+
+[[move]]
+old = "omnigent.inner.model_signer_service"
+new = "omnigent.models.signer.service"
+
+[[move]]
+old = "omnigent.inner.model_signing"
+new = "omnigent.models.signer.signing"
+
+[[move]]
+old = "omnigent.debug_logging"
+new = "omnigent.observability.debug_logging"
+
+[[move]]
+old = "omnigent.process_logging"
+new = "omnigent.observability.process_logging"
+
+[[move]]
+old = "omnigent._startup_events"
+new = "omnigent.observability.startup_events"
+
+[[move]]
+old = "omnigent._startup_profile"
+new = "omnigent.observability.startup_profile"
+
+[[move]]
+old = "omnigent.runtime.telemetry"
+new = "omnigent.observability.otel"
+
+[[move]]
+old = "omnigent.inner.tracing"
+new = "omnigent.observability.tracing"
+
+[[move]]
+old = "omnigent._platform"
+new = "omnigent.util.portability"
+
+[[move]]
+old = "omnigent.cli_invocation"
+new = "omnigent.util.cli_invocation"
+
+[[move]]
+old = "omnigent.runner.identity"
+new = "omnigent.util.runner_identity"
+
+[[move]]
+old = "omnigent.inner._proc"
+new = "omnigent.util.proc"
+
+[[move]]
+old = "omnigent.inner.async_utils"
+new = "omnigent.util.async_utils"
+
+[[move]]
+old = "omnigent.inner._subprocess_lifecycle"
+new = "omnigent.util.subprocess_lifecycle"
+
+[[move]]
+old = "omnigent.inner._liveness_exec"
+new = "omnigent.util.liveness_exec"
+
+[[move]]
+old = "omnigent.inner.native_attachments"
+new = "omnigent.util.attachments"
+
+[[move]]
+old = "omnigent.cli"
+new = "omnigent.cli.commands"
+
+[[move]]
+old = "omnigent.chat"
+new = "omnigent.cli.chat"
+
+[[move]]
+old = "omnigent.cli_config"
+new = "omnigent.cli.config_commands"
+
+[[move]]
+old = "omnigent.cli_native"
+new = "omnigent.cli.native_commands"
+
+[[move]]
+old = "omnigent.cli_auth"
+new = "omnigent.cli.auth"
+
+[[move]]
+old = "omnigent.cli_common"
+new = "omnigent.cli.common"
+
+[[move]]
+old = "omnigent.cli_diagnostics"
+new = "omnigent.cli.diagnostics"
+
+[[move]]
+old = "omnigent.diagnostics"
+new = "omnigent.cli.diagnose"
+
+[[move]]
+old = "omnigent.cli_sandbox"
+new = "omnigent.cli.sandbox_commands"
+
+[[move]]
+old = "omnigent.smart_routing_cli"
+new = "omnigent.cli.smart_routing"
+
+[[move]]
+old = "omnigent.conversation_browser"
+new = "omnigent.cli.conversation_browser"
+
+[[move]]
+old = "omnigent.update_check"
+new = "omnigent.cli.update_check"
+
+[[move]]
+old = "omnigent.resume_dispatch"
+new = "omnigent.cli.resume"
+
+[[move]]
+old = "omnigent.integration_daemon"
+new = "omnigent.cli.integration_daemon"
+
+[[move]]
+old = "omnigent._runner_startup"
+new = "omnigent.cli.runner_startup"
+
+[[move]]
+old = "omnigent._terminal_picker_theme"
+new = "omnigent.cli.picker_theme"
+
+[[move]]
+old = "omnigent.crash_handler"
+new = "omnigent.cli.crash_handler"
+
+[[move]]
+old = "omnigent.crash_ui"
+new = "omnigent.cli.crash_ui"
+
+[[move]]
+old = "omnigent.inner.ui"
+new = "omnigent.cli.ui"
+
+[[move]]
+old = "omnigent.inner.banner"
+new = "omnigent.cli.banner"
+
+[[move]]
+old = "omnigent.inner.mascots"
+new = "omnigent.cli.mascots"
+
+[[move]]
+old = "omnigent.inner.wordmark"
+new = "omnigent.cli.wordmark"
+
+[[move]]
+old = "omnigent.server.routes._sessions.common"
+new = "omnigent.server.routes.sessions.common"
+
+[[move]]
+old = "omnigent.server.routes._sessions.helpers"
+new = "omnigent.server.routes.sessions.helpers"
+
+[[move]]
+old = "omnigent.server.routes._sessions.orchestration"
+new = "omnigent.server.routes.sessions.orchestration"
+
+[[move]]
+old = "omnigent.server.routes._session_harness_readiness"
+new = "omnigent.server.routes.sessions.harness_readiness"
+
+[[move]]
+old = "omnigent.server.routes._session_create_validation"
+new = "omnigent.server.routes.sessions.create_validation"
+
+[[move]]
+old = "omnigent.workspace_fs"
+new = "omnigent.host.workspace_fs"
+
+[[move]]
+old = "omnigent.install_ledger"
+new = "omnigent.onboarding.install_ledger"
+
+[[move]]
+old = "omnigent.session_event_batch"
+new = "omnigent.runtime.session_event_batch"
+
+[[move]]
+old = "omnigent._e2e_policy_callables"
+new = "omnigent.testing.e2e_policy_callables"
+
+[[alias]]
+old = "omnigent.harness_plugins"
+new = "omnigent.harnesses.registry"
+removal = "0.19.0"
+
+[[alias]]
+old = "omnigent.harness_install_spec"
+new = "omnigent.harnesses.install_spec"
+removal = "0.19.0"
+
+[[alias]]
+old = "omnigent.inner.datamodel"
+new = "omnigent.core.datamodel"
+removal = "0.19.0"
+
+[[alias]]
+old = "omnigent.inner.executor"
+new = "omnigent.core.executor"
+removal = "0.19.0"
+
+[[alias]]
+old = "omnigent.inner.tools"
+new = "omnigent.core.tools"
+removal = "0.19.0"
+
+[[alias]]
+old = "omnigent.inner.policies"
+new = "omnigent.core.policies"
+removal = "0.19.0"
+
+[[alias]]
+old = "omnigent.inner.loader"
+new = "omnigent.core.loader"
+removal = "0.19.0"
+
+[[alias]]
+old = "omnigent.runtime.harnesses._executor_adapter"
+new = "omnigent.harnesses.runtime._executor_adapter"
+removal = "0.19.0"
+
+[[alias]]
+old = "omnigent.runtime.harnesses._scaffold"
+new = "omnigent.harnesses.runtime._scaffold"
+removal = "0.19.0"
+
+[packages."omnigent.core"]
+doc = "Agent definition types and the executor contract, re-exported by :mod:`omnigent`."
+
+[packages."omnigent.cli"]
+doc = "The omnigent command line."
+
+[packages."omnigent.observability"]
+doc = "Process logging, debug event sinks, OpenTelemetry tracing, and startup milestones."
+
+[packages."omnigent.models.signer"]
+doc = "Trusted model-request signer: credentials stay outside the agent sandbox."
+
+[packages."omnigent.harnesses.native"]
+doc = "Infrastructure shared by native (terminal UI) harnesses."
+
+[packages."omnigent.harnesses.acp"]
+doc = "Generic Agent Client Protocol (ACP) harness and the ACP CLI catalog."
+
+[packages."omnigent.harnesses.antigravity"]
+doc = "Google Antigravity SDK harness."
+
+[packages."omnigent.harnesses.claude_sdk"]
+doc = "Claude Agent SDK harness."
+
+[packages."omnigent.harnesses.codex"]
+doc = "Codex App Server (headless) harness."
+
+[packages."omnigent.harnesses.copilot"]
+doc = "GitHub Copilot SDK harness."
+
+[packages."omnigent.harnesses.cursor"]
+doc = "Cursor SDK harness."
+
+[packages."omnigent.harnesses.databricks"]
+doc = "Databricks Foundation Model API executor."
+
+[packages."omnigent.harnesses.goose"]
+doc = "Goose (ACP mode) headless harness."
+
+[packages."omnigent.harnesses.hermes"]
+doc = "Hermes Agent CLI headless harness."
+
+[packages."omnigent.harnesses.kimi"]
+doc = "Kimi Code CLI headless harness."
+
+[packages."omnigent.harnesses.open_responses"]
+doc = "OpenAI Responses API executor."
+
+[packages."omnigent.harnesses.openai_agents"]
+doc = "OpenAI Agents SDK harness."
+
+[packages."omnigent.harnesses.pi"]
+doc = "Pi coding agent (RPC mode) harness."
+
+[packages."omnigent.harnesses.qwen"]
+doc = "Qwen Code (ACP mode) headless harness."
+
+[cleanup]
+delete_empty = ["omnigent.native", "omnigent.server.routes._sessions"]
+exclude = ["CHANGELOG.md", "uv.lock", "pnpm-lock.yaml", "**/package-lock.json", "dev/refactor/*", "tests/dev/test_relocate_modules.py", "AGENTS.md", "docs/ARCHITECTURE.md", "tests/test_architecture.py", "web/src/shell/NewChatDialog.test.tsx"]

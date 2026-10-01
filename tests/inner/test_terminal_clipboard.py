@@ -18,7 +18,7 @@ from unittest.mock import Mock
 
 import pytest
 
-from omnigent.inner import terminal_clipboard as clipboard
+from omnigent.terminals import clipboard
 
 
 @pytest.fixture

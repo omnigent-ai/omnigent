@@ -16,7 +16,7 @@ instead of polling. This module ships:
 All tools in this module are gated on the agent's top-level
 ``async:`` flag (see :attr:`AgentSpec.async_enabled`). The flag
 **defaults to ``True``** to match the legacy inner stack's
-default (``omnigent/inner/datamodel.py::AgentDef.async_enabled``),
+default (``omnigent/core/datamodel.py::AgentDef.async_enabled``),
 so agents that don't mention it still see the async surface and
 the same YAML produces the same tool list under Omnigent mode and the
 legacy path. Agents that explicitly want a minimal-tools surface
@@ -151,18 +151,12 @@ class SysCallAsyncTool(Tool):
 
     The handle round-trip uses ``handle_id`` as the canonical
     identifier (cancel via ``sys_cancel_async`` with that same
-    field). Runner dispatch also echoes ``task_id`` with an
-    identical value as a compatibility alias (remove in 0.8.0) for
-    clients that still read the older field name — prefer
-    ``handle_id``; do not confuse it with
-    :class:`SysCancelTaskTool`'s distinct ``task_id`` contract.
+    field).
 
     Handle fields:
 
     - ``handle_id`` — the freshly created async-work handle id
       (canonical; pass to ``sys_cancel_async``).
-    - ``task_id`` — compatibility alias, identical to ``handle_id``;
-      remove in 0.8.0.
     - ``tool_name`` — the TARGET tool's name (not
       ``"sys_call_async"``).
     - ``status`` — ``"in_progress"``.

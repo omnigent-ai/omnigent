@@ -11,10 +11,10 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 
-from omnigent.inner.codex_executor import _CodexAppServerSession, _populate_codex_home_config
-from omnigent.inner.codex_worker import CodexWorkerLaunch
-from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
-from omnigent.inner.model_signer import SignerReadiness, SignerStartError
+from omnigent.core.datamodel import OSEnvSandboxSpec, OSEnvSpec
+from omnigent.harnesses.codex.executor import _CodexAppServerSession, _populate_codex_home_config
+from omnigent.harnesses.codex.worker import CodexWorkerLaunch
+from omnigent.models.signer.lifecycle import SignerReadiness, SignerStartError
 
 
 class _Pipe:
@@ -150,9 +150,9 @@ async def test_signer_preflights_before_codex_state_and_worker_spawn(
         order.append("spawn-worker")
         return process
 
-    monkeypatch.setattr("omnigent.inner.codex_executor._populate_codex_home_config", _populate)
-    monkeypatch.setattr("omnigent.inner.codex_executor.prepare_codex_worker", _prepare)
-    monkeypatch.setattr("omnigent.inner.codex_executor._create_subprocess_exec", _spawn)
+    monkeypatch.setattr("omnigent.harnesses.codex.executor._populate_codex_home_config", _populate)
+    monkeypatch.setattr("omnigent.harnesses.codex.executor.prepare_codex_worker", _prepare)
+    monkeypatch.setattr("omnigent.harnesses.codex.executor._create_subprocess_exec", _spawn)
     session = _session(tmp_path, signer)
     session._request = AsyncMock(return_value={"result": {}})
 
@@ -175,11 +175,11 @@ async def test_required_catalog_failure_stops_before_worker_preparation(
     prepare = Mock()
     spawn = AsyncMock()
     monkeypatch.setattr(
-        "omnigent.inner.codex_executor._populate_codex_home_config",
+        "omnigent.harnesses.codex.executor._populate_codex_home_config",
         Mock(side_effect=RuntimeError("valid bundled model catalog")),
     )
-    monkeypatch.setattr("omnigent.inner.codex_executor.prepare_codex_worker", prepare)
-    monkeypatch.setattr("omnigent.inner.codex_executor._create_subprocess_exec", spawn)
+    monkeypatch.setattr("omnigent.harnesses.codex.executor.prepare_codex_worker", prepare)
+    monkeypatch.setattr("omnigent.harnesses.codex.executor._create_subprocess_exec", spawn)
     session = _session(tmp_path, signer)
 
     with pytest.raises(RuntimeError, match="valid bundled model catalog"):
@@ -202,9 +202,9 @@ async def test_signer_exit_before_worker_spawn_fails_startup(
         signer.exited.set()
         return CodexWorkerLaunch("/private/sandbox-launcher", sandboxed=True)
 
-    monkeypatch.setattr("omnigent.inner.codex_executor._populate_codex_home_config", Mock())
-    monkeypatch.setattr("omnigent.inner.codex_executor.prepare_codex_worker", _prepare)
-    monkeypatch.setattr("omnigent.inner.codex_executor._create_subprocess_exec", spawn)
+    monkeypatch.setattr("omnigent.harnesses.codex.executor._populate_codex_home_config", Mock())
+    monkeypatch.setattr("omnigent.harnesses.codex.executor.prepare_codex_worker", _prepare)
+    monkeypatch.setattr("omnigent.harnesses.codex.executor._create_subprocess_exec", spawn)
     session = _session(tmp_path, signer)
 
     with pytest.raises(SignerStartError, match="exited during worker startup"):
@@ -229,13 +229,13 @@ async def test_signer_exit_during_worker_spawn_tears_worker_down(
         await asyncio.sleep(0)
         return process
 
-    monkeypatch.setattr("omnigent.inner.codex_executor._populate_codex_home_config", Mock())
+    monkeypatch.setattr("omnigent.harnesses.codex.executor._populate_codex_home_config", Mock())
     monkeypatch.setattr(
-        "omnigent.inner.codex_executor.prepare_codex_worker",
+        "omnigent.harnesses.codex.executor.prepare_codex_worker",
         Mock(return_value=CodexWorkerLaunch("/private/sandbox-launcher", sandboxed=True)),
     )
-    monkeypatch.setattr("omnigent.inner.codex_executor._create_subprocess_exec", _spawn)
-    monkeypatch.setattr("omnigent.inner.codex_executor._terminate_process_tree", terminate)
+    monkeypatch.setattr("omnigent.harnesses.codex.executor._create_subprocess_exec", _spawn)
+    monkeypatch.setattr("omnigent.harnesses.codex.executor._terminate_process_tree", terminate)
     session = _session(tmp_path, signer)
 
     with pytest.raises(SignerStartError, match="exited during worker startup"):
@@ -254,13 +254,13 @@ async def test_signer_backed_home_excludes_host_credential_files(
     signer = _Signer([])
     process = _Process()
     populate = Mock()
-    monkeypatch.setattr("omnigent.inner.codex_executor._populate_codex_home_config", populate)
+    monkeypatch.setattr("omnigent.harnesses.codex.executor._populate_codex_home_config", populate)
     monkeypatch.setattr(
-        "omnigent.inner.codex_executor.prepare_codex_worker",
+        "omnigent.harnesses.codex.executor.prepare_codex_worker",
         Mock(return_value=CodexWorkerLaunch("/private/sandbox-launcher", sandboxed=True)),
     )
     monkeypatch.setattr(
-        "omnigent.inner.codex_executor._create_subprocess_exec",
+        "omnigent.harnesses.codex.executor._create_subprocess_exec",
         AsyncMock(return_value=process),
     )
     session = _session(tmp_path, signer)
@@ -284,13 +284,13 @@ async def test_signer_backed_home_is_private_and_outside_workspace(
 ) -> None:
     signer = _Signer([])
     process = _Process()
-    monkeypatch.setattr("omnigent.inner.codex_executor._populate_codex_home_config", Mock())
+    monkeypatch.setattr("omnigent.harnesses.codex.executor._populate_codex_home_config", Mock())
     monkeypatch.setattr(
-        "omnigent.inner.codex_executor.prepare_codex_worker",
+        "omnigent.harnesses.codex.executor.prepare_codex_worker",
         Mock(return_value=CodexWorkerLaunch("/private/sandbox-launcher", sandboxed=True)),
     )
     monkeypatch.setattr(
-        "omnigent.inner.codex_executor._create_subprocess_exec",
+        "omnigent.harnesses.codex.executor._create_subprocess_exec",
         AsyncMock(return_value=process),
     )
     session = _session(tmp_path, signer)
@@ -355,7 +355,7 @@ async def test_signer_preflight_failure_never_creates_codex_home_or_worker(
 ) -> None:
     signer = _Signer([], start_error=RuntimeError("PROVIDER_AUTH_REQUIRED"))
     spawn = AsyncMock()
-    monkeypatch.setattr("omnigent.inner.codex_executor._create_subprocess_exec", spawn)
+    monkeypatch.setattr("omnigent.harnesses.codex.executor._create_subprocess_exec", spawn)
     session = _session(tmp_path, signer)
 
     with pytest.raises(RuntimeError, match="PROVIDER_AUTH_REQUIRED"):
@@ -373,10 +373,10 @@ async def test_failure_after_signer_readiness_closes_signer_and_state(
     signer = _Signer([])
     spawn = AsyncMock()
     monkeypatch.setattr(
-        "omnigent.inner.codex_executor._populate_codex_home_config",
+        "omnigent.harnesses.codex.executor._populate_codex_home_config",
         Mock(side_effect=OSError("config failed")),
     )
-    monkeypatch.setattr("omnigent.inner.codex_executor._create_subprocess_exec", spawn)
+    monkeypatch.setattr("omnigent.harnesses.codex.executor._create_subprocess_exec", spawn)
     session = _session(tmp_path, signer)
 
     with pytest.raises(OSError, match="config failed"):
@@ -397,13 +397,13 @@ async def test_retry_uses_a_fresh_signer_after_failed_preflight(
     ready = _Signer(order)
     signers = iter((failed, ready))
     process = _Process()
-    monkeypatch.setattr("omnigent.inner.codex_executor._populate_codex_home_config", Mock())
+    monkeypatch.setattr("omnigent.harnesses.codex.executor._populate_codex_home_config", Mock())
     monkeypatch.setattr(
-        "omnigent.inner.codex_executor.prepare_codex_worker",
+        "omnigent.harnesses.codex.executor.prepare_codex_worker",
         Mock(return_value=CodexWorkerLaunch("/private/sandbox-launcher", sandboxed=True)),
     )
     monkeypatch.setattr(
-        "omnigent.inner.codex_executor._create_subprocess_exec",
+        "omnigent.harnesses.codex.executor._create_subprocess_exec",
         AsyncMock(return_value=process),
     )
     session = _CodexAppServerSession(
@@ -434,15 +434,15 @@ async def test_signer_exit_terminates_worker(
     process = _Process()
     terminate = Mock()
     monkeypatch.setattr(
-        "omnigent.inner.codex_executor.prepare_codex_worker",
+        "omnigent.harnesses.codex.executor.prepare_codex_worker",
         Mock(return_value=CodexWorkerLaunch("/private/sandbox-launcher", sandboxed=True)),
     )
     monkeypatch.setattr(
-        "omnigent.inner.codex_executor._create_subprocess_exec",
+        "omnigent.harnesses.codex.executor._create_subprocess_exec",
         AsyncMock(return_value=process),
     )
-    monkeypatch.setattr("omnigent.inner.codex_executor._populate_codex_home_config", Mock())
-    monkeypatch.setattr("omnigent.inner.codex_executor._terminate_process_tree", terminate)
+    monkeypatch.setattr("omnigent.harnesses.codex.executor._populate_codex_home_config", Mock())
+    monkeypatch.setattr("omnigent.harnesses.codex.executor._terminate_process_tree", terminate)
     session = _session(tmp_path, signer)
     session._request = AsyncMock(return_value={"result": {}})
     await session.start()
@@ -469,17 +469,17 @@ async def test_signer_exit_escalates_to_kill_for_term_ignoring_worker(
         process.killed.set()
 
     monkeypatch.setattr(
-        "omnigent.inner.codex_executor.prepare_codex_worker",
+        "omnigent.harnesses.codex.executor.prepare_codex_worker",
         Mock(return_value=CodexWorkerLaunch("/private/sandbox-launcher", sandboxed=True)),
     )
     monkeypatch.setattr(
-        "omnigent.inner.codex_executor._create_subprocess_exec",
+        "omnigent.harnesses.codex.executor._create_subprocess_exec",
         AsyncMock(return_value=process),
     )
-    monkeypatch.setattr("omnigent.inner.codex_executor._populate_codex_home_config", Mock())
-    monkeypatch.setattr("omnigent.inner.codex_executor._terminate_process_tree", terminate)
-    monkeypatch.setattr("omnigent.inner.codex_executor._kill_process_tree", _kill)
-    monkeypatch.setattr("omnigent.inner.codex_executor._WORKER_SHUTDOWN_TIMEOUT_SECONDS", 0.01)
+    monkeypatch.setattr("omnigent.harnesses.codex.executor._populate_codex_home_config", Mock())
+    monkeypatch.setattr("omnigent.harnesses.codex.executor._terminate_process_tree", terminate)
+    monkeypatch.setattr("omnigent.harnesses.codex.executor._kill_process_tree", _kill)
+    monkeypatch.setattr("omnigent.harnesses.codex.executor._WORKER_SHUTDOWN_TIMEOUT_SECONDS", 0.01)
     session = _session(tmp_path, signer)
     session._request = AsyncMock(return_value={"result": {}})
     await session.start()
@@ -507,15 +507,15 @@ async def test_runner_close_terminates_worker_without_waiting_for_signer(
         process.returncode = 0
 
     monkeypatch.setattr(
-        "omnigent.inner.codex_executor.prepare_codex_worker",
+        "omnigent.harnesses.codex.executor.prepare_codex_worker",
         Mock(return_value=CodexWorkerLaunch("/private/sandbox-launcher", sandboxed=True)),
     )
     monkeypatch.setattr(
-        "omnigent.inner.codex_executor._create_subprocess_exec",
+        "omnigent.harnesses.codex.executor._create_subprocess_exec",
         AsyncMock(return_value=process),
     )
-    monkeypatch.setattr("omnigent.inner.codex_executor._populate_codex_home_config", Mock())
-    monkeypatch.setattr("omnigent.inner.codex_executor._terminate_process_tree", _terminate)
+    monkeypatch.setattr("omnigent.harnesses.codex.executor._populate_codex_home_config", Mock())
+    monkeypatch.setattr("omnigent.harnesses.codex.executor._terminate_process_tree", _terminate)
     session = _session(tmp_path, signer)
     session._request = AsyncMock(return_value={"result": {}})
     await session.start()
@@ -533,16 +533,16 @@ async def test_cancelled_close_contains_worker_and_retains_incomplete_signer_cle
     process = _Process()
     terminate = Mock(side_effect=lambda proc: setattr(proc, "returncode", 0))
     monkeypatch.setattr(
-        "omnigent.inner.codex_executor.prepare_codex_worker",
+        "omnigent.harnesses.codex.executor.prepare_codex_worker",
         Mock(return_value=CodexWorkerLaunch("/private/sandbox-launcher", sandboxed=True)),
     )
     monkeypatch.setattr(
-        "omnigent.inner.codex_executor._create_subprocess_exec",
+        "omnigent.harnesses.codex.executor._create_subprocess_exec",
         AsyncMock(return_value=process),
     )
-    monkeypatch.setattr("omnigent.inner.codex_executor._populate_codex_home_config", Mock())
-    monkeypatch.setattr("omnigent.inner.codex_executor._terminate_process_tree", terminate)
-    monkeypatch.setattr("omnigent.inner.codex_executor._SIGNER_CLOSE_TIMEOUT_SECONDS", 0.01)
+    monkeypatch.setattr("omnigent.harnesses.codex.executor._populate_codex_home_config", Mock())
+    monkeypatch.setattr("omnigent.harnesses.codex.executor._terminate_process_tree", terminate)
+    monkeypatch.setattr("omnigent.harnesses.codex.executor._SIGNER_CLOSE_TIMEOUT_SECONDS", 0.01)
     session = _session(tmp_path, signer)
     session._request = AsyncMock(return_value={"result": {}})
     await session.start()
@@ -575,9 +575,9 @@ async def test_cancelled_start_reclaims_worker_prepared_in_background_thread(
         return worker
 
     spawn = AsyncMock()
-    monkeypatch.setattr("omnigent.inner.codex_executor.prepare_codex_worker", _prepare)
-    monkeypatch.setattr("omnigent.inner.codex_executor._create_subprocess_exec", spawn)
-    monkeypatch.setattr("omnigent.inner.codex_executor._populate_codex_home_config", Mock())
+    monkeypatch.setattr("omnigent.harnesses.codex.executor.prepare_codex_worker", _prepare)
+    monkeypatch.setattr("omnigent.harnesses.codex.executor._create_subprocess_exec", spawn)
+    monkeypatch.setattr("omnigent.harnesses.codex.executor._populate_codex_home_config", Mock())
     session = _session(tmp_path, signer)
 
     start_task = asyncio.create_task(session.start())
@@ -610,12 +610,12 @@ async def test_concurrent_close_during_spawn_reaps_returned_worker(
         return process
 
     monkeypatch.setattr(
-        "omnigent.inner.codex_executor.prepare_codex_worker",
+        "omnigent.harnesses.codex.executor.prepare_codex_worker",
         Mock(return_value=worker),
     )
-    monkeypatch.setattr("omnigent.inner.codex_executor._create_subprocess_exec", _spawn)
-    monkeypatch.setattr("omnigent.inner.codex_executor._populate_codex_home_config", Mock())
-    monkeypatch.setattr("omnigent.inner.codex_executor._terminate_process_tree", terminate)
+    monkeypatch.setattr("omnigent.harnesses.codex.executor._create_subprocess_exec", _spawn)
+    monkeypatch.setattr("omnigent.harnesses.codex.executor._populate_codex_home_config", Mock())
+    monkeypatch.setattr("omnigent.harnesses.codex.executor._terminate_process_tree", terminate)
     session = _session(tmp_path, signer)
 
     start_task = asyncio.create_task(session.start())

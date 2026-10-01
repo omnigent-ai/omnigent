@@ -36,16 +36,16 @@ import psutil
 import pytest
 from playwright.sync_api import Page, expect
 
-from omnigent._wrapper_labels import (
+from omnigent.harnesses.antigravity_native.bridge import bridge_dir_for_bridge_id, read_tmux_info
+from omnigent.harnesses.antigravity_native.main import _materialize_antigravity_agent_spec
+from omnigent.harnesses.wrapper_labels import (
     ANTIGRAVITY_NATIVE_WRAPPER_VALUE,
     UI_MODE_LABEL_KEY,
     UI_MODE_TERMINAL_VALUE,
     WRAPPER_LABEL_KEY,
 )
-from omnigent.harnesses.antigravity_native.bridge import bridge_dir_for_bridge_id, read_tmux_info
-from omnigent.harnesses.antigravity_native.main import _materialize_antigravity_agent_spec
 from omnigent.onboarding.gemini_auth import gemini_auth_has_credential
-from omnigent.runner.identity import token_bound_runner_id
+from omnigent.util.runner_identity import token_bound_runner_id
 from tests.e2e_ui.conftest import _find_free_port
 from tests.e2e_ui.shells.test_terminal_direct_attach import _BLOCK_LOOPBACK_DIALS
 

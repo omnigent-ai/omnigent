@@ -44,9 +44,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import quote
 
-from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
-from omnigent.inner.os_env import OSEnvironment
-from omnigent.inner.terminal import TerminalInstance, create_terminal_instance
+from omnigent.core.datamodel import OSEnvSpec, TerminalEnvSpec
+from omnigent.environments.os_env import OSEnvironment
+from omnigent.terminals.terminal import TerminalInstance, create_terminal_instance
 
 logger = logging.getLogger(__name__)
 
@@ -82,7 +82,7 @@ def conversation_link_for_id(
     # ``?o=<org>`` selector — keeping the terminal status-bar link in
     # lockstep with the CLI's ``Web UI:`` link instead of pointing at the
     # JSON API mount.
-    from omnigent.conversation_browser import conversation_url
+    from omnigent.cli.conversation_browser import conversation_url
 
     return conversation_url(base_url.strip(), conversation_id)
 

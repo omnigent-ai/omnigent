@@ -6,7 +6,7 @@ per-spawn token, ships it to the harness via its private env, and presents it on
 every request. The scaffold rejects ``/v1`` requests whose bearer token does not
 match. The gate is keyed on ``app.state.harness_auth_token`` so it is inert when
 no token is configured (POSIX, or an app built directly in a test) — see
-``omnigent/runtime/harnesses/_scaffold.py``.
+``omnigent/harnesses/runtime/_scaffold.py``.
 
 This test builds the scaffold app directly (no ``/tmp`` socket manager), so it
 runs on every platform.

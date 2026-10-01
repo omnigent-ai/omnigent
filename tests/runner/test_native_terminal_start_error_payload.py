@@ -19,9 +19,8 @@ from unittest.mock import Mock
 import httpx
 import pytest
 
-from omnigent.debug_logging import record_to_row
 from omnigent.errors import ErrorCode, OmnigentError
-from omnigent.inner.terminal import TerminalInstance
+from omnigent.observability.debug_logging import record_to_row
 from omnigent.runner.native import orchestration
 from omnigent.runner.native.orchestration import (
     _NATIVE_TERMINAL_START_FAILED_CODE,
@@ -30,6 +29,7 @@ from omnigent.runner.native.orchestration import (
     _publish_native_terminal_start_error,
 )
 from omnigent.terminals.registry import TerminalExitedDuringLaunch
+from omnigent.terminals.terminal import TerminalInstance
 
 _ERROR_ID_RE = re.compile(r" Error ID: (err_[0-9a-f]{32})\.$")
 

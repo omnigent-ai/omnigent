@@ -6,8 +6,8 @@ from typing import Any
 import pytest
 
 from omnigent.errors import HarnessTransportClosedError
-from omnigent.runtime.harnesses import _scaffold
-from omnigent.runtime.harnesses._scaffold import HarnessApp, TurnContext
+from omnigent.harnesses.runtime import _scaffold
+from omnigent.harnesses.runtime._scaffold import HarnessApp, TurnContext
 from omnigent.server.schemas import OutputTextDeltaEvent, RetryEvent
 
 

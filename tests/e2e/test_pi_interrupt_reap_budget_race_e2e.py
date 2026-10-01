@@ -34,13 +34,13 @@ import sys
 import textwrap
 from typing import Any
 
-from omnigent.inner.executor import TurnComplete
-from omnigent.inner.pi_executor import (
+from omnigent.core.executor import TurnComplete
+from omnigent.harnesses.pi.executor import (
     PiExecutor,
     _PiRpcSession,
     _PiSessionState,
 )
-from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+from omnigent.harnesses.runtime._executor_adapter import ExecutorAdapter
 
 # A child process that arms a SIGTERM-ignoring handler, prints ``READY`` once
 # the handler is live, then sleeps. Models a wedged Pi subprocess that will NOT
@@ -170,7 +170,7 @@ async def test_rpc_prompt_command_sets_streaming_behavior() -> None:
         captured["proc"] = proc
         return proc
 
-    import omnigent.inner.pi_executor as pi_mod
+    import omnigent.harnesses.pi.executor as pi_mod
 
     original_spawn = pi_mod._create_subprocess_exec
     pi_mod._create_subprocess_exec = _fake_spawn  # type: ignore[assignment]

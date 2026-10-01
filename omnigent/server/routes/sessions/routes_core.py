@@ -27,11 +27,7 @@ from fastapi.responses import Response
 from pydantic import ValidationError
 from starlette.datastructures import UploadFile as StarletteUploadFile
 
-from omnigent.codex_approval_modes import (
-    CODEX_NATIVE_PERMISSION_VALUES,
-)
 from omnigent.db.utils import generate_agent_id, generate_file_id
-from omnigent.debug_logging import add_audit_attrs, debug_event, set_current_runner_id
 from omnigent.entities import (
     Agent,
     CommentsFingerprint,
@@ -41,9 +37,14 @@ from omnigent.entities import (
 )
 from omnigent.entities.permission import SessionPermission
 from omnigent.errors import ErrorCategory, ErrorCode, ErrorImpact, ErrorPhase, OmnigentError
+from omnigent.harnesses.codex_native.approval_modes import (
+    CODEX_NATIVE_PERMISSION_VALUES,
+)
 from omnigent.models.model_override import validate_model_override
-from omnigent.runner.identity import (
-    RUNNER_TUNNEL_TOKEN_HEADER,
+from omnigent.observability.debug_logging import (
+    add_audit_attrs,
+    debug_event,
+    set_current_runner_id,
 )
 from omnigent.runner.routing import RunnerRouter
 from omnigent.runner.session_init_protocol import build_runner_session_init_payload
@@ -100,7 +101,7 @@ from omnigent.server.routes._errors import (
 )
 from omnigent.server.routes._errors import session_not_found as _session_not_found
 from omnigent.server.routes._origin import require_trusted_origin
-from omnigent.server.routes._sessions.common import (
+from omnigent.server.routes.sessions.common import (
     _CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY,
     _CLAUDE_NATIVE_PERMISSION_MODES,
     _CLAUDE_NATIVE_UI_LABEL_KEY,
@@ -117,7 +118,7 @@ from omnigent.server.routes._sessions.common import (
     get_server_runner_router,
     set_server_runner_router,
 )
-from omnigent.server.routes._sessions.helpers import (
+from omnigent.server.routes.sessions.helpers import (
     _TUI_INJECT_FORWARD_TIMEOUT_S,
     SessionLiveness,
     _agent_carries_cursor_fork_history,
@@ -164,7 +165,7 @@ from omnigent.server.routes._sessions.helpers import (
     _validated_subagent_routing_override,
     reconcile_orphaned_running_status,
 )
-from omnigent.server.routes._sessions.orchestration import (
+from omnigent.server.routes.sessions.orchestration import (
     _best_effort_stop,
     _build_session_list_item,
     _build_session_response,
@@ -231,6 +232,9 @@ from omnigent.util.reasoning_effort import (
     EFFORT_VALUES,
     validate_effort,
 )
+from omnigent.util.runner_identity import (
+    RUNNER_TUNNEL_TOKEN_HEADER,
+)
 from omnigent.util.session_lifecycle import (
     labels_with_closed_status,
 )
@@ -255,7 +259,7 @@ def _require_attachment_compatible_history(
     :returns: A retained filesystem attachment's name, or ``None``.
     :raises OmnigentError: If the target cannot open a referenced attachment.
     """
-    from omnigent.inner.native_attachments import FILESYSTEM_ATTACHMENT_HARNESSES
+    from omnigent.util.attachments import FILESYSTEM_ATTACHMENT_HARNESSES
 
     filename = _filesystem_attachment_in_history(
         session_id, conversation_store, file_store, up_to_response_id=up_to_response_id
@@ -537,8 +541,8 @@ def register_core_routes(
             HostLaunchRunnerFrame,
             encode_host_frame,
         )
-        from omnigent.runner.identity import token_bound_runner_id
         from omnigent.server.routes._host_launch import resolve_host_launch
+        from omnigent.util.runner_identity import token_bound_runner_id
 
         with creation_stage("create_acl_ms"):
             target = await asyncio.to_thread(
@@ -933,7 +937,7 @@ def register_core_routes(
             parent_session_id=parsed_metadata.parent_session_id,
             host_type=parsed_metadata.host_type,
         )
-        from omnigent.server.routes._session_create_validation import (
+        from omnigent.server.routes.sessions.create_validation import (
             resolve_project_session_create,
         )
 
@@ -977,7 +981,7 @@ def register_core_routes(
         # (mirroring the JSON path — a bad workspace never produces a
         # session) and persist the canonical path the host returned.
         if parsed_metadata.host_id is not None:
-            from omnigent.server.routes._session_create_validation import (
+            from omnigent.server.routes.sessions.create_validation import (
                 validate_uploaded_bundle_host_workspace,
             )
 
@@ -1002,7 +1006,7 @@ def register_core_routes(
             conversation_store,
         )
         from omnigent.models.model_catalog import spec_harness
-        from omnigent.server.routes._session_harness_readiness import (
+        from omnigent.server.routes.sessions.harness_readiness import (
             validate_create_harness_readiness,
         )
 
@@ -1081,7 +1085,7 @@ def register_core_routes(
         # sees). A sub-agent child (inherited runner) is never launched
         # here — it co-locates on the parent's runner.
         if parsed_metadata.host_id is not None and inherited_runner_id is None:
-            from omnigent.harness_aliases import canonicalize_harness
+            from omnigent.harnesses.aliases import canonicalize_harness
             from omnigent.models.model_catalog import spec_harness
 
             raw_harness = spec_harness(spec)
@@ -1828,7 +1832,7 @@ def register_core_routes(
             # to the trace that produced them. No-op when no span is
             # active (idle heartbeats/snapshots), keeping the frame
             # wire-identical in the common case.
-            from omnigent.runtime import telemetry
+            from omnigent.observability import otel as telemetry
 
             telemetry.record_message_payload(frame)
             telemetry.inject_trace_context(frame)
@@ -1915,7 +1919,7 @@ def register_core_routes(
                 # context the browser stamped into the frame, so the
                 # snapshot read (and its DB spans) nest under the
                 # client-originated trace.
-                from omnigent.runtime import telemetry
+                from omnigent.observability import otel as telemetry
 
                 with telemetry.consume_frame_span("session_updates.watch", msg):
                     async with emit_lock:
@@ -3101,7 +3105,7 @@ def register_core_routes(
         target_agent_id = body.agent_id
         switching_agent = target_agent_id is not None and target_agent_id != source.agent_id
         if target_agent_id is not None and switching_agent:
-            from omnigent.server.routes._session_create_validation import (
+            from omnigent.server.routes.sessions.create_validation import (
                 validate_session_agent,
             )
 
@@ -3114,8 +3118,8 @@ def register_core_routes(
             )
 
         if source.inference_snapshot is not None and switching_agent:
-            from omnigent.harness_aliases import canonicalize_harness
-            from omnigent.inference_config import resolve_bound_provider
+            from omnigent.harnesses.aliases import canonicalize_harness
+            from omnigent.models.inference_config import resolve_bound_provider
             from omnigent.runtime import get_agent_cache
 
             assert source.inference_snapshot is not None
@@ -3349,7 +3353,7 @@ def register_core_routes(
         # semantics. A shared source's foreign project retains the historical
         # terminal behavior: silently leave the fork unfiled.
         fork_project_id = None
-        from omnigent.server.routes._session_create_validation import (
+        from omnigent.server.routes.sessions.create_validation import (
             resolve_project_session_create,
         )
 
@@ -3416,7 +3420,7 @@ def register_core_routes(
                     break
                 files_after = files_page.last_id
 
-            from omnigent.inner.native_attachments import requires_filesystem
+            from omnigent.util.attachments import requires_filesystem
 
             filesystem_sources = [
                 stored for stored in fork_source_files if requires_filesystem(stored.filename)
@@ -3734,7 +3738,7 @@ def register_core_routes(
             file_store,
         )
         if retained_attachment is not None and (session.host_id or session.runner_id):
-            from omnigent.server.routes._sessions.helpers import (
+            from omnigent.server.routes.sessions.helpers import (
                 require_filesystem_attachment_runtime,
             )
 

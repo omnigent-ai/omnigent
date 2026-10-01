@@ -19,7 +19,7 @@ import pytest
 from fastapi import FastAPI, Request
 from PIL import Image
 
-from omnigent.native.native_coding_agents import (
+from omnigent.harnesses.native.coding_agents import (
     ANTIGRAVITY_NATIVE_AGENT_NAME,
     QWEN_NATIVE_AGENT_NAME,
 )
@@ -1095,7 +1095,7 @@ def test_ensure_default_native_agents_seeds_every_native_agent(
     the loop — or seeded under the wrong name/id — is caught here.
     """
     from omnigent.db.utils import builtin_agent_id
-    from omnigent.native.native_coding_agents import NATIVE_CODING_AGENTS
+    from omnigent.harnesses.native.coding_agents import NATIVE_CODING_AGENTS
 
     server_app._ensure_default_native_agents(
         seed_stores.agent_store,
@@ -1133,7 +1133,7 @@ def test_ensure_default_acp_agents_seeds_configured_agent(
     )
     monkeypatch.setattr("omnigent.onboarding.acp_auth.acp_agents", lambda *a, **k: [entry])
     # No builtin ACP CLI installed, so only the configured agent seeds.
-    monkeypatch.setattr("omnigent._platform.resolve_cli_binary", lambda _b, **k: None)
+    monkeypatch.setattr("omnigent.util.portability.resolve_cli_binary", lambda _b, **k: None)
 
     server_app._ensure_default_acp_agents(
         seed_stores.agent_store, seed_stores.artifact_store, seed_stores.agent_cache
@@ -1165,11 +1165,11 @@ def test_ensure_default_acp_agents_seeds_builtin_cli_rows_without_a_local_binary
     runner attached to it has them installed — the row is never seeded, so no
     per-host filter can bring it back.
     """
-    from omnigent.acp_cli_harnesses import ACP_CLI_HARNESSES
+    from omnigent.harnesses.acp.cli_harnesses import ACP_CLI_HARNESSES
 
     monkeypatch.setattr("omnigent.onboarding.acp_auth.acp_agents", lambda *a, **k: [])
     # No vendor CLI resolves here — the remote-server / app-container shape.
-    monkeypatch.setattr("omnigent._platform.resolve_cli_binary", lambda _b, **k: None)
+    monkeypatch.setattr("omnigent.util.portability.resolve_cli_binary", lambda _b, **k: None)
 
     server_app._ensure_default_acp_agents(
         seed_stores.agent_store, seed_stores.artifact_store, seed_stores.agent_cache
@@ -1206,7 +1206,7 @@ def test_ensure_default_acp_agents_configured_agent_beats_same_slug_builtin(
     monkeypatch.setattr("omnigent.onboarding.acp_auth.acp_agents", lambda *a, **k: [entry])
     # Both vendor CLIs are installed, so the devin row would otherwise seed too.
     monkeypatch.setattr(
-        "omnigent._platform.resolve_cli_binary", lambda _b, **k: "/usr/local/bin/x"
+        "omnigent.util.portability.resolve_cli_binary", lambda _b, **k: "/usr/local/bin/x"
     )
 
     server_app._ensure_default_acp_agents(
@@ -1242,10 +1242,10 @@ def test_ensure_default_acp_agents_seeds_no_slug_rows_without_acp_config(
     **What breaks if this fails**: the picker grows a row for a slug no config
     defines, and choosing it fails at spawn with an unresolvable ACP command.
     """
-    from omnigent.acp_cli_harnesses import ACP_CLI_HARNESSES
+    from omnigent.harnesses.acp.cli_harnesses import ACP_CLI_HARNESSES
 
     monkeypatch.setattr("omnigent.onboarding.acp_auth.acp_agents", lambda *a, **k: [])
-    monkeypatch.setattr("omnigent._platform.resolve_cli_binary", lambda _b, **k: None)
+    monkeypatch.setattr("omnigent.util.portability.resolve_cli_binary", lambda _b, **k: None)
 
     server_app._ensure_default_acp_agents(
         seed_stores.agent_store, seed_stores.artifact_store, seed_stores.agent_cache
@@ -1268,7 +1268,7 @@ def test_ensure_default_acp_agents_survives_unreadable_config(
         raise ValueError("bad acp: block")
 
     monkeypatch.setattr("omnigent.onboarding.acp_auth.acp_agents", _boom)
-    monkeypatch.setattr("omnigent._platform.resolve_cli_binary", lambda _b, **k: None)
+    monkeypatch.setattr("omnigent.util.portability.resolve_cli_binary", lambda _b, **k: None)
 
     # Must not raise — startup calls this and a bad user config can't take the
     # whole server down.
@@ -1315,12 +1315,12 @@ def test_ensure_default_native_agents_raises_when_provider_missing(
 def test_build_native_bundle_raises_without_materialize_hook() -> None:
     """A provider missing its ``materialize_agent_spec`` hook raises loudly."""
     from omnigent.errors import OmnigentError
-    from omnigent.harness_plugins import NativeHarnessProvider
+    from omnigent.harnesses.registry import NativeHarnessProvider
 
     provider = NativeHarnessProvider(
         key="ghost",
         run_native="omnigent.ghost_native:run_ghost_native",
-        auto_create_terminal="omnigent.runner.native:_launch_ghost",
+        auto_create_terminal="omnigent.runner.native.orchestration:_launch_ghost",
         input_ready_probe="omnigent.ghost_native.bridge:native_input_ready",
         materialize_agent_spec=None,
     )

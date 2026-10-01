@@ -1437,7 +1437,7 @@ def test_os_env_registration_noops_when_factory_returns_none(
 ) -> None:
     from omnigent.spec.types import OSEnvSpec
 
-    monkeypatch.setattr("omnigent.inner.os_env.create_os_environment", lambda _spec: None)
+    monkeypatch.setattr("omnigent.environments.os_env.create_os_environment", lambda _spec: None)
 
     mgr = ToolManager(AgentSpec(spec_version=1, os_env=OSEnvSpec()))
 

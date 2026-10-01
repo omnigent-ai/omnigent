@@ -29,23 +29,23 @@ _SYS_OS_TOOLS = frozenset({"sys_os_read", "sys_os_write", "sys_os_edit", "sys_os
 # PreToolUse hook contract. Single source of truth: the write policies in
 # ``omnigent.policies.builtins.orchestration`` build their gated sets from
 # this, and it must stay equal to ``_CLAUDE_NATIVE_EDIT_TOOLS`` in
-# ``omnigent.server.routes._sessions.common`` (asserted in the tests).
+# ``omnigent.server.routes.sessions.common`` (asserted in the tests).
 NATIVE_WRITE_TOOLS: frozenset[str] = frozenset({"Write", "Edit", "MultiEdit", "NotebookEdit"})
 
 # Claude Code and Codex native tool names surfaced via the PreToolUse /
-# PostToolUse hook contract (see ``omnigent.native.native_policy_hook``).
+# PostToolUse hook contract (see ``omnigent.harnesses.native.policy_hook``).
 # These bypass Omnigent' ``sys_os_*`` MCP tools and execute directly
 # inside the CLI subprocess.
 _NATIVE_OS_TOOLS = NATIVE_WRITE_TOOLS | {"Bash", "Read", "Glob", "Grep"}
 
 # Cursor SDK native tool names surfaced via the preToolUse hook
-# (see ``omnigent.inner.cursor_policy_hook``). Cursor uses ``Shell``
+# (see ``omnigent.harnesses.cursor.policy_hook``). Cursor uses ``Shell``
 # for its terminal tool (not ``Bash``). ``Read`` / ``Write`` / ``Edit``
 # are already in ``_NATIVE_OS_TOOLS`` above.
 _CURSOR_NATIVE_OS_TOOLS = frozenset({"Shell"})
 
 # Pi native tool names (lowercase), surfaced via the pi ``tool_call``
-# extension hook (see ``omnigent.inner.pi_executor._gate_native_tool``).
+# extension hook (see ``omnigent.harnesses.pi.executor._gate_native_tool``).
 # Pi runs these in-process and routes them through the same TOOL_CALL
 # policy verdict — but under its own names, distinct from the
 # Claude/Codex-cased ``_NATIVE_OS_TOOLS``. Pi uses the same argument keys
@@ -54,7 +54,7 @@ _CURSOR_NATIVE_OS_TOOLS = frozenset({"Shell"})
 _PI_NATIVE_OS_TOOLS = frozenset({"read", "bash", "write", "edit"})
 
 # Hermes Agent tool names surfaced via the ``pre_tool_call`` shell hook
-# (see ``omnigent.inner.hermes_policy_hook``). Hermes uses its own naming
+# (see ``omnigent.harnesses.hermes.policy_hook``). Hermes uses its own naming
 # convention for file/shell operations.
 _HERMES_OS_TOOLS = frozenset(
     {"terminal", "execute_code", "read_file", "write_file", "search_files"}

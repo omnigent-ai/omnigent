@@ -60,7 +60,7 @@ from omnigent.entities import Conversation, ScheduledTask
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.auth import LEVEL_OWNER, LEVEL_READ, RESERVED_USER_LOCAL, RESERVED_USER_PUBLIC
 from omnigent.server.host_registry import host_owner_scope
-from omnigent.server.routes._session_create_validation import (
+from omnigent.server.routes.sessions.create_validation import (
     validate_existing_host_workspace,
     validate_session_agent,
     validate_session_model_metadata,
@@ -719,7 +719,7 @@ async def _permission_mode_launch_args(deps: FireDeps, task: ScheduledTask) -> l
         return None
     if deps.agent_cache is None:
         return None
-    from omnigent.harness_aliases import canonicalize_harness
+    from omnigent.harnesses.aliases import canonicalize_harness
 
     try:
         agent = await asyncio.to_thread(deps.agent_store.get, task.agent_id)
@@ -787,7 +787,7 @@ async def _presentation_labels(deps: FireDeps, task: ScheduledTask) -> dict[str,
     Fail-safe: any resolution error omits the labels rather than guessing, so
     the session falls back to Chat-only rather than breaking the fire.
     """
-    from omnigent.native.native_coding_agents import native_coding_agent_for_agent_name
+    from omnigent.harnesses.native.coding_agents import native_coding_agent_for_agent_name
     from omnigent.server.routes.sessions import _repl_terminal_ui_labels
 
     try:

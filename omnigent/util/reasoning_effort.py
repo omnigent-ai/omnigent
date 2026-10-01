@@ -123,9 +123,9 @@ def efforts_for_harness(harness: str | None) -> frozenset[str] | None:
     # Imported inside the function: harness_plugins pulls in a large slice
     # of the package, and a module-level edge from here has produced an
     # import cycle before.
-    from omnigent.harness_aliases import canonicalize_harness
-    from omnigent.harness_capabilities import EffortFamily
-    from omnigent.harness_plugins import harness_capabilities
+    from omnigent.harnesses.aliases import canonicalize_harness
+    from omnigent.harnesses.capabilities import EffortFamily
+    from omnigent.harnesses.registry import harness_capabilities
 
     if harness is None:
         return None

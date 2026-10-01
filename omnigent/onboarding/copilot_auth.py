@@ -110,7 +110,7 @@ def copilot_sdk_installed() -> bool:
     """Return whether the Copilot SDK (the optional extra) is importable.
 
     The executor imports it lazily on the first turn
-    (:mod:`omnigent.inner.copilot_executor`), so a token can be set with no SDK;
+    (:mod:`omnigent.harnesses.copilot.executor`), so a token can be set with no SDK;
     setup uses this to detect that and offer to install it. The
     ``github-copilot-sdk`` package is imported as ``copilot``. Mirrors
     :func:`omnigent.onboarding.cursor_auth.cursor_sdk_installed` /
@@ -273,7 +273,7 @@ def copilot_token_removal_settings() -> dict[str, object] | None:
 def copilot_github_token_settings(ref: str) -> dict[str, object]:
     """Build the ``{"copilot": {...}}`` settings dict that records *ref*.
 
-    Handed to :func:`omnigent.cli._save_global_config` (a shallow update, so it
+    Handed to :func:`omnigent.cli.commands._save_global_config` (a shallow update, so it
     replaces the whole ``copilot:`` block) to persist the reference.
 
     Preserves any configured ``github_host`` — the saver replaces the whole

@@ -18,6 +18,7 @@ from sqlalchemy import Select, and_, select
 from sqlalchemy.orm import Session
 
 from omnigent.db.db_models import SqlSessionPermission, SqlUser, current_workspace_id
+from omnigent.entities.permission import LEVEL_OWNER
 from omnigent.errors import ErrorCode, OmnigentError
 
 
@@ -113,8 +114,6 @@ def lock_account(session: Session, user_id: str) -> SqlUser | None:
 
 def session_account_owner_query() -> Select[tuple[str, str | None]]:
     """Select live accounts registrations with an explicit session-owner grant."""
-    from omnigent.server.auth import LEVEL_OWNER
-
     return (
         select(
             SqlUser.id.label("session_owner"),

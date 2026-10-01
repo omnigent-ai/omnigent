@@ -249,7 +249,7 @@ class PolicyEngine:
             see :meth:`_evaluate_composed`.
         :returns: The composed :class:`PolicyResult`.
         """
-        from omnigent.runtime import telemetry
+        from omnigent.observability import otel as telemetry
 
         with telemetry.span(
             "policy.evaluate",

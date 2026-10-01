@@ -21,8 +21,8 @@ from typing import TYPE_CHECKING, Any
 import httpx
 from fastapi.responses import JSONResponse
 
-from omnigent.debug_logging import runner_primary_session_id
-from omnigent.native.native_coding_agents import native_coding_agent_for_harness
+from omnigent.harnesses.native.coding_agents import native_coding_agent_for_harness
+from omnigent.observability.debug_logging import runner_primary_session_id
 from omnigent.runner.policy_proxy import _ASK_GATE_DELIVERY_TIMEOUT
 from omnigent.util.json_types import JsonObject as _JsonObject
 

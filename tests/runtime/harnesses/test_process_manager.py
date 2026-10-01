@@ -1,5 +1,5 @@
 """
-Tests for :class:`omnigent.runtime.harnesses.process_manager.HarnessProcessManager`.
+Tests for :class:`omnigent.harnesses.runtime.process_manager.HarnessProcessManager`.
 
 Covers the lifecycle / behavior surface defined by §Process
 management of ``designs/SERVER_HARNESS_CONTRACT.md``: lazy spawn,
@@ -37,9 +37,9 @@ from pathlib import Path
 
 import pytest
 
-from omnigent.runtime.harnesses import _HARNESS_MODULES
-from omnigent.runtime.harnesses.paths import resolve_harness_tmp_parent
-from omnigent.runtime.harnesses.process_manager import (
+from omnigent.harnesses.runtime import _HARNESS_MODULES
+from omnigent.harnesses.runtime.paths import resolve_harness_tmp_parent
+from omnigent.harnesses.runtime.process_manager import (
     _AP_PID_FILE,
     _TMP_PARENT_ENV_VAR,
     HarnessProcessManager,
@@ -331,7 +331,7 @@ async def test_get_client_emits_harness_started_event(
     """
     await manager.start()
     try:
-        with caplog.at_level(logging.INFO, logger="omnigent.runtime.harnesses.process_manager"):
+        with caplog.at_level(logging.INFO, logger="omnigent.harnesses.runtime.process_manager"):
             await manager.get_client("conv_a", _TEST_HARNESS_NAME)
         started = [
             r for r in caplog.records if getattr(r, "event_name", None) == "harness_started"
@@ -1378,7 +1378,7 @@ async def test_runner_subprocess_exits_on_sigterm(
     """A harness runner exits promptly after a plain SIGTERM.
 
     This catches the failure mode where ``pkill`` left
-    ``omnigent.runtime.harnesses._runner`` processes alive because
+    ``omnigent.harnesses.runtime._runner`` processes alive because
     shutdown never reached uvicorn's normal exit path.
     """
     await manager.start()
@@ -1417,8 +1417,8 @@ async def test_runner_subprocess_exits_when_spawning_parent_exits(
         import asyncio
         import os
         import pathlib
-        from omnigent.runtime.harnesses import _HARNESS_MODULES
-        from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
+        from omnigent.harnesses.runtime import _HARNESS_MODULES
+        from omnigent.harnesses.runtime.process_manager import HarnessProcessManager
 
         async def main():
             _HARNESS_MODULES[{_TEST_HARNESS_NAME!r}] = {_TEST_HARNESS_MODULE!r}
@@ -1463,7 +1463,7 @@ async def test_runner_subprocess_hard_exits_when_sigterm_shutdown_wedges(
     The fixture starts a background task that ignores cancellation,
     which prevents uvicorn's graceful shutdown from reaching lifespan
     teardown. This exercises the fallback for plain
-    ``pkill -f omnigent.runtime.harnesses._runner``: the runner
+    ``pkill -f omnigent.harnesses.runtime._runner``: the runner
     should not remain alive forever just because graceful shutdown is
     stuck.
     """
@@ -1492,7 +1492,7 @@ async def test_orphan_sweep_escalates_to_sigkill(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Orphan sweep SIGKILLs runners that survive SIGTERM."""
-    from omnigent.runtime.harnesses import process_manager as pm_mod
+    from omnigent.harnesses.runtime import process_manager as pm_mod
 
     killed: list[tuple[int, signal.Signals]] = []
     calls = 0
@@ -1543,7 +1543,7 @@ async def test_mid_spawn_cancellation_reaps_subprocess(
     to leak it — unregistered, so ``release()`` no-ops and the idle
     reaper never sees it.
     """
-    from omnigent.runtime.harnesses import process_manager as pm_mod
+    from omnigent.harnesses.runtime import process_manager as pm_mod
 
     await manager.start()
     try:
@@ -1597,7 +1597,7 @@ async def test_mid_spawn_double_cancellation_still_reaps(
     is shielded, so the process is still collected and the task
     still ends cancelled.
     """
-    from omnigent.runtime.harnesses import process_manager as pm_mod
+    from omnigent.harnesses.runtime import process_manager as pm_mod
 
     await manager.start()
     try:
@@ -1671,7 +1671,7 @@ async def test_release_during_spawn_leaves_no_live_process(
     owned. Barriers pin the race: release is queued while bind is gated,
     then bind completes so both sides settle under the shared spawn lock.
     """
-    from omnigent.runtime.harnesses import process_manager as pm_mod
+    from omnigent.harnesses.runtime import process_manager as pm_mod
 
     await manager.start()
     get_task: asyncio.Task[object] | None = None
@@ -1743,7 +1743,7 @@ async def test_release_invalidates_queued_get_client(
     leaving ``has_session`` True after release. B must fail; a fresh
     ``get_client`` after release may still respawn.
     """
-    from omnigent.runtime.harnesses import process_manager as pm_mod
+    from omnigent.harnesses.runtime import process_manager as pm_mod
 
     await manager.start()
     get_a: asyncio.Task[object] | None = None
@@ -1829,7 +1829,7 @@ async def test_shutdown_during_spawn_leaves_no_live_process(
     Barriers pin the race; after both settle there must be no process,
     socket, or ``_entries`` record.
     """
-    from omnigent.runtime.harnesses import process_manager as pm_mod
+    from omnigent.harnesses.runtime import process_manager as pm_mod
 
     await manager.start()
     get_task: asyncio.Task[object] | None = None

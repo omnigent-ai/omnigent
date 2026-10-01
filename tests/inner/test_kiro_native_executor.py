@@ -6,8 +6,8 @@ from pathlib import Path
 
 import pytest
 
-from omnigent.inner.executor import ExecutorError, TurnComplete
-from omnigent.inner.kiro_native_executor import KiroNativeExecutor
+from omnigent.core.executor import ExecutorError, TurnComplete
+from omnigent.harnesses.kiro_native.executor import KiroNativeExecutor
 
 
 def test_kiro_native_executor_scaffold_capabilities() -> None:
@@ -29,7 +29,9 @@ async def test_kiro_native_executor_injects_latest_user_message(
     def _fake_inject(bridge_dir: Path, *, content: str) -> None:
         injected.append((bridge_dir, content))
 
-    monkeypatch.setattr("omnigent.inner.kiro_native_executor.inject_user_message", _fake_inject)
+    monkeypatch.setattr(
+        "omnigent.harnesses.kiro_native.executor.inject_user_message", _fake_inject
+    )
     executor = KiroNativeExecutor(bridge_dir=tmp_path)
 
     events = [
@@ -62,7 +64,9 @@ async def test_kiro_native_executor_surfaces_injection_failure(
         del bridge_dir, content
         raise RuntimeError("kiro terminal is no longer running")
 
-    monkeypatch.setattr("omnigent.inner.kiro_native_executor.inject_user_message", _fail_inject)
+    monkeypatch.setattr(
+        "omnigent.harnesses.kiro_native.executor.inject_user_message", _fail_inject
+    )
     executor = KiroNativeExecutor(bridge_dir=tmp_path)
 
     events = [

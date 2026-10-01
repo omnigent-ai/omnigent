@@ -26,9 +26,9 @@ from pathlib import Path
 
 import pytest
 
-from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
-from omnigent.inner.os_env import _handle_helper_request
-from omnigent.inner.sandbox import SandboxPolicy, _get_backend
+from omnigent.core.datamodel import OSEnvSandboxSpec, OSEnvSpec
+from omnigent.environments.os_env import _handle_helper_request
+from omnigent.sandbox.core import SandboxPolicy, _get_backend
 
 pytestmark = pytest.mark.skipif(
     sys.platform != "linux" or shutil.which("bwrap") is None,

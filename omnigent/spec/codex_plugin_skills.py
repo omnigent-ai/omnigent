@@ -44,7 +44,7 @@ def discover_codex_plugin_skills(
     codex_home: Path, skills_filter: str | list[str], *, cwd: Path | None = None
 ) -> list[SkillSpec]:
     """Ask Codex which plugin versions are installed, then parse their skills."""
-    from omnigent.inner.codex_executor import _find_codex_cli
+    from omnigent.harnesses.codex.executor import _find_codex_cli
 
     if skills_filter == "none" or skills_filter == []:
         return []

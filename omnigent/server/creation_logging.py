@@ -8,7 +8,7 @@ import time
 from collections.abc import Iterator
 from typing import Literal
 
-from omnigent.debug_logging import (
+from omnigent.observability.debug_logging import (
     add_audit_attrs,
     current_request_audit_attrs,
     debug_event,

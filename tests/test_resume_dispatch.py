@@ -1,5 +1,5 @@
 """
-Tests for :mod:`omnigent.resume_dispatch` — the top-level
+Tests for :mod:`omnigent.cli.resume` — the top-level
 ``omnigent resume`` dispatcher.
 
 The dispatcher's job is to translate the user's "take me back to
@@ -19,7 +19,7 @@ import click
 import httpx
 import pytest
 
-from omnigent import resume_dispatch
+from omnigent.cli import resume as resume_dispatch
 
 # ── run_resume — top-level entry ──────────────────────────
 
@@ -558,7 +558,7 @@ def test_read_wrapper_label_local_reads_persistent_store(
     :param tmp_path: Temporary persistent Omnigent directory.
     :returns: None.
     """
-    import omnigent.chat as chat_mod
+    import omnigent.cli.chat as chat_mod
     from omnigent.stores.conversation_store.sqlalchemy_store import (
         SqlAlchemyConversationStore,
     )
@@ -653,7 +653,7 @@ def test_read_wrapper_label_remote_returns_label_when_present(
 
     monkeypatch.setattr(httpx, "get", _fake_get)
     monkeypatch.setattr(
-        "omnigent.chat._remote_headers",
+        "omnigent.cli.chat._remote_headers",
         lambda *, server_url, host_id=None: {},
     )
 
@@ -690,7 +690,7 @@ def test_read_wrapper_label_remote_returns_none_when_label_missing(
 
     monkeypatch.setattr(httpx, "get", _fake_get)
     monkeypatch.setattr(
-        "omnigent.chat._remote_headers",
+        "omnigent.cli.chat._remote_headers",
         lambda *, server_url, host_id=None: {},
     )
 
@@ -719,7 +719,7 @@ def test_read_wrapper_label_remote_raises_on_404(
 
     monkeypatch.setattr(httpx, "get", _fake_get)
     monkeypatch.setattr(
-        "omnigent.chat._remote_headers",
+        "omnigent.cli.chat._remote_headers",
         lambda *, server_url, host_id=None: {},
     )
 

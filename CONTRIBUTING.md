@@ -324,7 +324,8 @@ areas mirror their source directory under `tests/`:
 | `runner/` | `runner/` |
 | `runtime/` | `runtime/` |
 | `tools/` | `tools/` |
-| `inner/` | `inner/` |
+| `harnesses/` (SDK harnesses), `core/` | `inner/` (these suites predate the move to `harnesses/` and `core/`) |
+| `cli/` | `cli/` |
 | `llms/` | `llms/` |
 | `db/` | `db/` (a schema migration especially warrants one) |
 | `policies/` | `policies/` |

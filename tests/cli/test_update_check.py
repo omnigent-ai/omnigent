@@ -1,4 +1,4 @@
-"""Tests for :mod:`omnigent.update_check`."""
+"""Tests for :mod:`omnigent.cli.update_check`."""
 
 from __future__ import annotations
 
@@ -12,8 +12,8 @@ from unittest.mock import patch
 import pytest
 from click.testing import CliRunner
 
-from omnigent.cli import cli
-from omnigent.update_check import (
+from omnigent.cli.commands import cli
+from omnigent.cli.update_check import (
     _STALENESS_SECONDS,
     _CacheEntry,
     _fetch_and_count,
@@ -43,14 +43,14 @@ def test_find_repo_root_finds_git_dir() -> None:
 def test_find_repo_root_no_git_integration(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Integration: ``_find_repo_root`` returns None when __file__ is outside any repo."""
+    """Integration: ``_find_repo_root`` returns None when the package is outside any repo."""
     fake_file = tmp_path / "omnigent" / "update_check.py"
     fake_file.parent.mkdir(parents=True)
     fake_file.write_text("")
 
-    import omnigent.update_check as mod
+    import omnigent.cli.update_check as mod
 
-    monkeypatch.setattr(mod, "__file__", str(fake_file))
+    monkeypatch.setattr(mod, "PACKAGE_ROOT", fake_file.parent)
     assert mod._find_repo_root() is None
 
 
@@ -83,9 +83,9 @@ def test_find_repo_root_ignores_unrelated_ancestor_git(
     fake_file = pkg_dir / "update_check.py"
     fake_file.write_text("")
 
-    import omnigent.update_check as mod
+    import omnigent.cli.update_check as mod
 
-    monkeypatch.setattr(mod, "__file__", str(fake_file))
+    monkeypatch.setattr(mod, "PACKAGE_ROOT", fake_file.parent)
     assert mod._find_repo_root() is None
 
 
@@ -109,9 +109,9 @@ def test_find_repo_root_requires_pyproject_alongside_git(
     fake_file = pkg_dir / "update_check.py"
     fake_file.write_text("")
 
-    import omnigent.update_check as mod
+    import omnigent.cli.update_check as mod
 
-    monkeypatch.setattr(mod, "__file__", str(fake_file))
+    monkeypatch.setattr(mod, "PACKAGE_ROOT", fake_file.parent)
     assert mod._find_repo_root() is None
 
 
@@ -128,9 +128,9 @@ def test_find_repo_root_accepts_git_plus_pyproject(
     fake_file = pkg_dir / "update_check.py"
     fake_file.write_text("")
 
-    import omnigent.update_check as mod
+    import omnigent.cli.update_check as mod
 
-    monkeypatch.setattr(mod, "__file__", str(fake_file))
+    monkeypatch.setattr(mod, "PACKAGE_ROOT", fake_file.parent)
     # Returns exactly the repo root — the parent of omnigent/.
     assert mod._find_repo_root() == repo
 
@@ -144,7 +144,7 @@ def test_read_cache_returns_none_when_missing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """``_read_cache`` returns None when the cache file does not exist."""
-    monkeypatch.setattr("omnigent.update_check._CACHE_FILE", tmp_path / "nope.json")
+    monkeypatch.setattr("omnigent.cli.update_check._CACHE_FILE", tmp_path / "nope.json")
     assert _read_cache() is None
 
 
@@ -154,7 +154,7 @@ def test_read_cache_returns_none_on_corrupt_json(
     """``_read_cache`` returns None when the cache file is not valid JSON."""
     cache_file = tmp_path / "bad.json"
     cache_file.write_text("not json at all")
-    monkeypatch.setattr("omnigent.update_check._CACHE_FILE", cache_file)
+    monkeypatch.setattr("omnigent.cli.update_check._CACHE_FILE", cache_file)
     assert _read_cache() is None
 
 
@@ -164,15 +164,15 @@ def test_read_cache_returns_none_on_missing_keys(
     """``_read_cache`` returns None when required keys are absent."""
     cache_file = tmp_path / "partial.json"
     cache_file.write_text(json.dumps({"last_check_epoch": 1.0}))
-    monkeypatch.setattr("omnigent.update_check._CACHE_FILE", cache_file)
+    monkeypatch.setattr("omnigent.cli.update_check._CACHE_FILE", cache_file)
     assert _read_cache() is None
 
 
 def test_write_then_read_cache_roundtrip(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Write + read roundtrip preserves values."""
     cache_file = tmp_path / ".update_check.json"
-    monkeypatch.setattr("omnigent.update_check._CACHE_DIR", tmp_path)
-    monkeypatch.setattr("omnigent.update_check._CACHE_FILE", cache_file)
+    monkeypatch.setattr("omnigent.cli.update_check._CACHE_DIR", tmp_path)
+    monkeypatch.setattr("omnigent.cli.update_check._CACHE_FILE", cache_file)
 
     entry = _CacheEntry(last_check_epoch=1716100000.0, commits_behind=5, head_sha="abc123")
     _write_cache(entry)
@@ -211,14 +211,14 @@ def test_is_stale_old() -> None:
 
 def test_fetch_and_count_git_not_found(tmp_path: Path) -> None:
     """Returns None when ``git`` is not on PATH."""
-    with patch("omnigent.update_check.subprocess.run", side_effect=FileNotFoundError):
+    with patch("omnigent.cli.update_check.subprocess.run", side_effect=FileNotFoundError):
         assert _fetch_and_count(tmp_path, "main") is None
 
 
 def test_fetch_and_count_fetch_fails(tmp_path: Path) -> None:
     """Returns None when ``git fetch`` exits non-zero."""
     with patch(
-        "omnigent.update_check.subprocess.run",
+        "omnigent.cli.update_check.subprocess.run",
         side_effect=subprocess.CalledProcessError(1, "git"),
     ):
         assert _fetch_and_count(tmp_path, "main") is None
@@ -227,7 +227,7 @@ def test_fetch_and_count_fetch_fails(tmp_path: Path) -> None:
 def test_fetch_and_count_fetch_timeout(tmp_path: Path) -> None:
     """Returns None when ``git fetch`` exceeds the timeout."""
     with patch(
-        "omnigent.update_check.subprocess.run",
+        "omnigent.cli.update_check.subprocess.run",
         side_effect=subprocess.TimeoutExpired("git", 5),
     ):
         assert _fetch_and_count(tmp_path, "main") is None
@@ -246,7 +246,7 @@ def test_fetch_and_count_success(tmp_path: Path) -> None:
         # git rev-list --count
         return subprocess.CompletedProcess(cmd, 0, stdout="7\n")
 
-    with patch("omnigent.update_check.subprocess.run", side_effect=fake_run):
+    with patch("omnigent.cli.update_check.subprocess.run", side_effect=fake_run):
         assert _fetch_and_count(tmp_path, "main") == 7
 
 
@@ -261,7 +261,7 @@ def test_fetch_and_count_revlist_fails(tmp_path: Path) -> None:
             return subprocess.CompletedProcess(cmd, 0)
         raise subprocess.CalledProcessError(1, "git")
 
-    with patch("omnigent.update_check.subprocess.run", side_effect=fake_run):
+    with patch("omnigent.cli.update_check.subprocess.run", side_effect=fake_run):
         assert _fetch_and_count(tmp_path, "main") is None
 
 
@@ -285,7 +285,7 @@ def test_run_check_falls_back_to_master(tmp_path: Path) -> None:
             return subprocess.CompletedProcess(cmd, 0)
         return subprocess.CompletedProcess(cmd, 0, stdout="2\n")
 
-    with patch("omnigent.update_check.subprocess.run", side_effect=fake_run):
+    with patch("omnigent.cli.update_check.subprocess.run", side_effect=fake_run):
         result = _run_check(tmp_path)
     assert result is not None
     assert result.commits_behind == 2
@@ -294,7 +294,7 @@ def test_run_check_falls_back_to_master(tmp_path: Path) -> None:
 def test_run_check_both_branches_fail(tmp_path: Path) -> None:
     """Returns None when both main and master fail."""
     with patch(
-        "omnigent.update_check.subprocess.run",
+        "omnigent.cli.update_check.subprocess.run",
         side_effect=subprocess.CalledProcessError(1, "git"),
     ):
         assert _run_check(tmp_path) is None
@@ -330,8 +330,8 @@ def test_no_repo_root_routes_to_wheel_check(
         nonlocal wheel_called
         wheel_called = True
 
-    monkeypatch.setattr("omnigent.update_check._run_installed_wheel_check", _stub_wheel_check)
-    with patch("omnigent.update_check._find_repo_root", return_value=None):
+    monkeypatch.setattr("omnigent.cli.update_check._run_installed_wheel_check", _stub_wheel_check)
+    with patch("omnigent.cli.update_check._find_repo_root", return_value=None):
         maybe_show_update_notice()
     # Dispatcher invoked the wheel path; no notice printed because we
     # stubbed it out — proves the dispatch is wired correctly.
@@ -347,14 +347,14 @@ def test_fresh_cache_shows_notice(
     """Prints notice when cache is fresh and ``commits_behind > 0``."""
     monkeypatch.delenv("OMNIGENT_NO_UPDATE_CHECK", raising=False)
     cache_file = tmp_path / ".update_check.json"
-    monkeypatch.setattr("omnigent.update_check._CACHE_DIR", tmp_path)
-    monkeypatch.setattr("omnigent.update_check._CACHE_FILE", cache_file)
+    monkeypatch.setattr("omnigent.cli.update_check._CACHE_DIR", tmp_path)
+    monkeypatch.setattr("omnigent.cli.update_check._CACHE_FILE", cache_file)
 
     # Write a fresh cache entry with commits_behind=3.
     entry = _CacheEntry(last_check_epoch=time.time(), commits_behind=3)
     _write_cache(entry)
 
-    with patch("omnigent.update_check._find_repo_root", return_value=tmp_path):
+    with patch("omnigent.cli.update_check._find_repo_root", return_value=tmp_path):
         maybe_show_update_notice()
 
     err = capsys.readouterr().err
@@ -370,8 +370,8 @@ def test_fresh_cache_clears_after_pull(
     """Notice disappears when HEAD moves (user ran ``git pull``)."""
     monkeypatch.delenv("OMNIGENT_NO_UPDATE_CHECK", raising=False)
     cache_file = tmp_path / ".update_check.json"
-    monkeypatch.setattr("omnigent.update_check._CACHE_DIR", tmp_path)
-    monkeypatch.setattr("omnigent.update_check._CACHE_FILE", cache_file)
+    monkeypatch.setattr("omnigent.cli.update_check._CACHE_DIR", tmp_path)
+    monkeypatch.setattr("omnigent.cli.update_check._CACHE_FILE", cache_file)
 
     # Cache says 3 behind, recorded at old HEAD sha.
     entry = _CacheEntry(
@@ -383,9 +383,9 @@ def test_fresh_cache_clears_after_pull(
 
     # Simulate: HEAD has moved (pull), and local rev-list now says 0.
     with (
-        patch("omnigent.update_check._find_repo_root", return_value=tmp_path),
-        patch("omnigent.update_check._get_head_sha", return_value="new_sha"),
-        patch("omnigent.update_check._local_rev_list_count", return_value=0),
+        patch("omnigent.cli.update_check._find_repo_root", return_value=tmp_path),
+        patch("omnigent.cli.update_check._get_head_sha", return_value="new_sha"),
+        patch("omnigent.cli.update_check._local_rev_list_count", return_value=0),
     ):
         maybe_show_update_notice()
 
@@ -407,13 +407,13 @@ def test_fresh_cache_no_notice_when_up_to_date(
     """No notice when cache is fresh and ``commits_behind == 0``."""
     monkeypatch.delenv("OMNIGENT_NO_UPDATE_CHECK", raising=False)
     cache_file = tmp_path / ".update_check.json"
-    monkeypatch.setattr("omnigent.update_check._CACHE_DIR", tmp_path)
-    monkeypatch.setattr("omnigent.update_check._CACHE_FILE", cache_file)
+    monkeypatch.setattr("omnigent.cli.update_check._CACHE_DIR", tmp_path)
+    monkeypatch.setattr("omnigent.cli.update_check._CACHE_FILE", cache_file)
 
     entry = _CacheEntry(last_check_epoch=time.time(), commits_behind=0)
     _write_cache(entry)
 
-    with patch("omnigent.update_check._find_repo_root", return_value=tmp_path):
+    with patch("omnigent.cli.update_check._find_repo_root", return_value=tmp_path):
         maybe_show_update_notice()
 
     assert capsys.readouterr().err == ""
@@ -427,8 +427,8 @@ def test_stale_cache_triggers_check(
     """Stale cache triggers a fresh check; notice printed if behind."""
     monkeypatch.delenv("OMNIGENT_NO_UPDATE_CHECK", raising=False)
     cache_file = tmp_path / ".update_check.json"
-    monkeypatch.setattr("omnigent.update_check._CACHE_DIR", tmp_path)
-    monkeypatch.setattr("omnigent.update_check._CACHE_FILE", cache_file)
+    monkeypatch.setattr("omnigent.cli.update_check._CACHE_DIR", tmp_path)
+    monkeypatch.setattr("omnigent.cli.update_check._CACHE_FILE", cache_file)
 
     # Write a stale cache.
     old_entry = _CacheEntry(
@@ -447,8 +447,8 @@ def test_stale_cache_triggers_check(
         return subprocess.CompletedProcess(cmd, 0, stdout="4\n")
 
     with (
-        patch("omnigent.update_check._find_repo_root", return_value=tmp_path),
-        patch("omnigent.update_check.subprocess.run", side_effect=fake_run),
+        patch("omnigent.cli.update_check._find_repo_root", return_value=tmp_path),
+        patch("omnigent.cli.update_check.subprocess.run", side_effect=fake_run),
     ):
         maybe_show_update_notice()
 
@@ -469,13 +469,13 @@ def test_check_failure_caches_zero(
     """When git check fails, caches ``commits_behind=0`` to avoid retry storm."""
     monkeypatch.delenv("OMNIGENT_NO_UPDATE_CHECK", raising=False)
     cache_file = tmp_path / ".update_check.json"
-    monkeypatch.setattr("omnigent.update_check._CACHE_DIR", tmp_path)
-    monkeypatch.setattr("omnigent.update_check._CACHE_FILE", cache_file)
+    monkeypatch.setattr("omnigent.cli.update_check._CACHE_DIR", tmp_path)
+    monkeypatch.setattr("omnigent.cli.update_check._CACHE_FILE", cache_file)
 
     with (
-        patch("omnigent.update_check._find_repo_root", return_value=tmp_path),
+        patch("omnigent.cli.update_check._find_repo_root", return_value=tmp_path),
         patch(
-            "omnigent.update_check.subprocess.run",
+            "omnigent.cli.update_check.subprocess.run",
             side_effect=subprocess.CalledProcessError(1, "git"),
         ),
     ):
@@ -498,7 +498,7 @@ def test_check_failure_caches_zero(
 import importlib.metadata  # noqa: E402
 import sys  # noqa: E402
 
-from omnigent.update_check import (  # noqa: E402
+from omnigent.cli.update_check import (  # noqa: E402
     _build_upgrade_suggestion,
     _InstalledWheelInfo,
     _parse_extras_from_spec,
@@ -548,7 +548,7 @@ def _block_build_info_import(monkeypatch: pytest.MonkeyPatch) -> None:
     We deliberately do NOT monkeypatch ``_read_build_info`` itself.
     If we did, tests of the function would unknowingly call a stub
     instead of the real implementation (because ``from
-    omnigent.update_check import _read_build_info`` inside a test
+    omnigent.cli.update_check import _read_build_info`` inside a test
     body would resolve to the stubbed module attribute).
     """
     monkeypatch.setitem(sys.modules, "omnigent._build_info", None)
@@ -569,7 +569,7 @@ def _no_real_background_refresh(monkeypatch: pytest.MonkeyPatch) -> None:
     hermetic; tests that assert the refresh *was* triggered patch it with
     their own recorder, which wins over this default.
     """
-    monkeypatch.setattr("omnigent.update_check._spawn_background_refresh", lambda: None)
+    monkeypatch.setattr("omnigent.cli.update_check._spawn_background_refresh", lambda: None)
 
 
 # A git URL with a recognizable host/path so assertions can match a
@@ -661,7 +661,7 @@ def test_read_wheel_info_uv_git_install(tmp_path: Path, monkeypatch: pytest.Monk
             "commit": _FAKE_COMMIT,
         },
     )
-    monkeypatch.setattr("omnigent.update_check._get_distribution", lambda: dist)
+    monkeypatch.setattr("omnigent.cli.update_check._get_distribution", lambda: dist)
 
     info = _read_installed_wheel_info()
 
@@ -759,7 +759,7 @@ def test_read_wheel_info_repairs_redacted_ssh_user(
             "commit": _FAKE_COMMIT,
         },
     )
-    monkeypatch.setattr("omnigent.update_check._get_distribution", lambda: dist)
+    monkeypatch.setattr("omnigent.cli.update_check._get_distribution", lambda: dist)
 
     info = _read_installed_wheel_info()
     assert info is not None
@@ -797,7 +797,7 @@ def test_read_wheel_info_editable_install_is_marked(
             "dir_info": {"editable": True},
         },
     )
-    monkeypatch.setattr("omnigent.update_check._get_distribution", lambda: dist)
+    monkeypatch.setattr("omnigent.cli.update_check._get_distribution", lambda: dist)
 
     info = _read_installed_wheel_info()
     assert info is not None
@@ -818,7 +818,7 @@ def test_read_wheel_info_pip_registry_install(
         # No uv_cache.json (pip doesn't write one).
         dir_mtime_epoch=install_time,
     )
-    monkeypatch.setattr("omnigent.update_check._get_distribution", lambda: dist)
+    monkeypatch.setattr("omnigent.cli.update_check._get_distribution", lambda: dist)
 
     info = _read_installed_wheel_info()
 
@@ -838,7 +838,7 @@ def test_read_wheel_info_returns_none_when_not_installed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Returns None when ``_get_distribution`` says we aren't installed."""
-    monkeypatch.setattr("omnigent.update_check._get_distribution", lambda: None)
+    monkeypatch.setattr("omnigent.cli.update_check._get_distribution", lambda: None)
     assert _read_installed_wheel_info() is None
 
 
@@ -856,7 +856,7 @@ def test_read_wheel_info_handles_corrupt_direct_url(
 
     os.utime(dist_info, (install_time, install_time))
     dist = importlib.metadata.PathDistribution(dist_info)
-    monkeypatch.setattr("omnigent.update_check._get_distribution", lambda: dist)
+    monkeypatch.setattr("omnigent.cli.update_check._get_distribution", lambda: dist)
 
     info = _read_installed_wheel_info()
     # We still get a result back — corrupt direct_url just means we
@@ -978,8 +978,8 @@ def test_pip_upgrade_suggestions_use_running_interpreter(
 
 def _point_cache_at(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Redirect the update-check cache at the per-test tmp dir."""
-    monkeypatch.setattr("omnigent.update_check._CACHE_DIR", tmp_path)
-    monkeypatch.setattr("omnigent.update_check._CACHE_FILE", tmp_path / ".update_check.json")
+    monkeypatch.setattr("omnigent.cli.update_check._CACHE_DIR", tmp_path)
+    monkeypatch.setattr("omnigent.cli.update_check._CACHE_FILE", tmp_path / ".update_check.json")
 
 
 def test_wheel_check_no_nag_when_up_to_date(
@@ -1004,7 +1004,7 @@ def test_wheel_check_no_nag_when_up_to_date(
         )
     )
     dist = _write_fake_dist_info(tmp_path, installer="uv")
-    monkeypatch.setattr("omnigent.update_check._get_distribution", lambda: dist)
+    monkeypatch.setattr("omnigent.cli.update_check._get_distribution", lambda: dist)
 
     _run_installed_wheel_check()
 
@@ -1028,7 +1028,7 @@ def test_wheel_check_no_nag_for_matching_dev_release(
         )
     )
     dist = _write_fake_dist_info(tmp_path, installer="uv", version="0.9.0.dev0")
-    monkeypatch.setattr("omnigent.update_check._get_distribution", lambda: dist)
+    monkeypatch.setattr("omnigent.cli.update_check._get_distribution", lambda: dist)
 
     _run_installed_wheel_check()
 
@@ -1052,7 +1052,7 @@ def test_wheel_check_nags_when_newer_release_available(
         )
     )
     dist = _write_fake_dist_info(tmp_path, installer="uv")
-    monkeypatch.setattr("omnigent.update_check._get_distribution", lambda: dist)
+    monkeypatch.setattr("omnigent.cli.update_check._get_distribution", lambda: dist)
 
     _run_installed_wheel_check()
 
@@ -1091,7 +1091,7 @@ def test_wheel_check_fires_once_per_release(
         )
     )
     dist = _write_fake_dist_info(tmp_path, installer="uv")
-    monkeypatch.setattr("omnigent.update_check._get_distribution", lambda: dist)
+    monkeypatch.setattr("omnigent.cli.update_check._get_distribution", lambda: dist)
 
     _run_installed_wheel_check()
 
@@ -1113,7 +1113,7 @@ def test_wheel_check_bails_for_editable_install(
     _point_cache_at(tmp_path, monkeypatch)
     spawned: list[bool] = []
     monkeypatch.setattr(
-        "omnigent.update_check._spawn_background_refresh", lambda: spawned.append(True)
+        "omnigent.cli.update_check._spawn_background_refresh", lambda: spawned.append(True)
     )
     dist = _write_fake_dist_info(
         tmp_path,
@@ -1123,7 +1123,7 @@ def test_wheel_check_bails_for_editable_install(
             "dir_info": {"editable": True},
         },
     )
-    monkeypatch.setattr("omnigent.update_check._get_distribution", lambda: dist)
+    monkeypatch.setattr("omnigent.cli.update_check._get_distribution", lambda: dist)
 
     _run_installed_wheel_check()
 
@@ -1137,7 +1137,7 @@ def test_wheel_check_bails_when_distribution_missing(
 ) -> None:
     """No installed distribution → silent no-op (running from source)."""
     monkeypatch.delenv("OMNIGENT_NO_UPDATE_CHECK", raising=False)
-    monkeypatch.setattr("omnigent.update_check._get_distribution", lambda: None)
+    monkeypatch.setattr("omnigent.cli.update_check._get_distribution", lambda: None)
     _run_installed_wheel_check()
     assert capsys.readouterr().err == ""
 
@@ -1165,10 +1165,10 @@ def test_wheel_check_refreshes_when_cache_stale(
     )
     spawned: list[bool] = []
     monkeypatch.setattr(
-        "omnigent.update_check._spawn_background_refresh", lambda: spawned.append(True)
+        "omnigent.cli.update_check._spawn_background_refresh", lambda: spawned.append(True)
     )
     dist = _write_fake_dist_info(tmp_path, installer="uv")
-    monkeypatch.setattr("omnigent.update_check._get_distribution", lambda: dist)
+    monkeypatch.setattr("omnigent.cli.update_check._get_distribution", lambda: dist)
 
     _run_installed_wheel_check()
 
@@ -1198,9 +1198,9 @@ def test_wheel_check_env_var_disables(
         )
     )
     dist = _write_fake_dist_info(tmp_path, installer="uv")
-    monkeypatch.setattr("omnigent.update_check._get_distribution", lambda: dist)
+    monkeypatch.setattr("omnigent.cli.update_check._get_distribution", lambda: dist)
     # No-clone scenario so the dispatcher routes to the wheel path.
-    with patch("omnigent.update_check._find_repo_root", return_value=None):
+    with patch("omnigent.cli.update_check._find_repo_root", return_value=None):
         maybe_show_update_notice()
 
     assert capsys.readouterr().err == ""
@@ -1230,11 +1230,11 @@ def test_wheel_check_ignores_clone_kind_cache(
     )
     spawned: list[bool] = []
     monkeypatch.setattr(
-        "omnigent.update_check._spawn_background_refresh", lambda: spawned.append(True)
+        "omnigent.cli.update_check._spawn_background_refresh", lambda: spawned.append(True)
     )
     dist = _write_fake_dist_info(tmp_path, installer="uv")
-    monkeypatch.setattr("omnigent.update_check._get_distribution", lambda: dist)
-    with patch("omnigent.update_check._find_repo_root", return_value=None):
+    monkeypatch.setattr("omnigent.cli.update_check._get_distribution", lambda: dist)
+    with patch("omnigent.cli.update_check._find_repo_root", return_value=None):
         maybe_show_update_notice()
 
     assert capsys.readouterr().err == ""
@@ -1248,7 +1248,7 @@ def test_wheel_check_ignores_clone_kind_cache(
 
 def test_is_newer_pep440_ordering() -> None:
     """``_is_newer`` orders versions by PEP 440, not lexically."""
-    from omnigent.update_check import _is_newer
+    from omnigent.cli.update_check import _is_newer
 
     assert _is_newer("0.2.0", "0.1.0") is True
     assert _is_newer("0.10.0", "0.9.0") is True  # lexical "0.10" < "0.9" — must not fool us
@@ -1261,7 +1261,7 @@ def test_is_newer_pep440_ordering() -> None:
 
 def test_is_newer_tolerates_garbage() -> None:
     """A non-PEP-440 latest never crashes the check."""
-    from omnigent.update_check import _is_newer
+    from omnigent.cli.update_check import _is_newer
 
     assert _is_newer("not-a-version", "0.1.0") is True  # falls back to != and non-empty
     assert _is_newer("", "0.1.0") is False
@@ -1269,7 +1269,7 @@ def test_is_newer_tolerates_garbage() -> None:
 
 def test_should_notify_release_treats_dev_build_as_current_release() -> None:
     """Matching finals stay quiet without hiding later release lines."""
-    from omnigent.update_check import _should_notify_release
+    from omnigent.cli.update_check import _should_notify_release
 
     assert _should_notify_release("0.9.0", "0.9.0.dev0") is False
     assert _should_notify_release("0.9.1", "0.9.0.dev0") is True
@@ -1317,15 +1317,15 @@ def _clear_index_env(monkeypatch: pytest.MonkeyPatch) -> None:
     dedicated ``test_resolve_index_url_from_*`` tests.
     """
     _delenv_index(monkeypatch)
-    monkeypatch.setattr("omnigent.update_check._index_from_uv_config", lambda: "")
-    monkeypatch.setattr("omnigent.update_check._index_from_pip_config", lambda: "")
+    monkeypatch.setattr("omnigent.cli.update_check._index_from_uv_config", lambda: "")
+    monkeypatch.setattr("omnigent.cli.update_check._index_from_pip_config", lambda: "")
 
 
 def test_fetch_latest_version_pep691_json(monkeypatch: pytest.MonkeyPatch) -> None:
     """PEP 691 ``versions`` → latest *stable* (pre/dev releases excluded)."""
     import httpx
 
-    from omnigent.update_check import fetch_latest_version
+    from omnigent.cli.update_check import fetch_latest_version
 
     _clear_index_env(monkeypatch)
     captured: dict[str, object] = {}
@@ -1353,7 +1353,7 @@ def test_fetch_latest_version_retries_transient_then_succeeds(
     """
     import httpx
 
-    from omnigent.update_check import fetch_latest_version
+    from omnigent.cli.update_check import fetch_latest_version
 
     _clear_index_env(monkeypatch)
     calls = {"n": 0}
@@ -1374,7 +1374,7 @@ def test_fetch_latest_version_no_retry_by_default(monkeypatch: pytest.MonkeyPatc
     """The background path (default ``attempts=1``) makes a single try."""
     import httpx
 
-    from omnigent.update_check import fetch_latest_version
+    from omnigent.cli.update_check import fetch_latest_version
 
     _clear_index_env(monkeypatch)
     calls = {"n": 0}
@@ -1393,7 +1393,7 @@ def test_fetch_latest_version_does_not_retry_non_200(monkeypatch: pytest.MonkeyP
     """A definitive non-200 reply is not retried, even with ``attempts=2``."""
     import httpx
 
-    from omnigent.update_check import fetch_latest_version
+    from omnigent.cli.update_check import fetch_latest_version
 
     _clear_index_env(monkeypatch)
     calls = {"n": 0}
@@ -1414,7 +1414,7 @@ def test_fetch_latest_version_from_files_when_no_versions_key(
     """An index without a ``versions`` key → derive from wheel/sdist filenames."""
     import httpx
 
-    from omnigent.update_check import fetch_latest_version
+    from omnigent.cli.update_check import fetch_latest_version
 
     _clear_index_env(monkeypatch)
     body = {
@@ -1434,7 +1434,7 @@ def test_fetch_latest_version_html_fallback(monkeypatch: pytest.MonkeyPatch) -> 
     """A PEP 503 HTML index (no JSON) → scrape filenames from the links."""
     import httpx
 
-    from omnigent.update_check import fetch_latest_version
+    from omnigent.cli.update_check import fetch_latest_version
 
     _clear_index_env(monkeypatch)
     html = (
@@ -1456,7 +1456,7 @@ def test_fetch_latest_version_none_when_only_prereleases(
     """Only pre-releases available → no stable release, returns ``None``."""
     import httpx
 
-    from omnigent.update_check import fetch_latest_version
+    from omnigent.cli.update_check import fetch_latest_version
 
     _clear_index_env(monkeypatch)
     monkeypatch.setattr(
@@ -1472,7 +1472,7 @@ def test_fetch_latest_version_include_prereleases(monkeypatch: pytest.MonkeyPatc
     """``include_prereleases=True`` surfaces an rc that the default hides."""
     import httpx
 
-    from omnigent.update_check import fetch_latest_version
+    from omnigent.cli.update_check import fetch_latest_version
 
     _clear_index_env(monkeypatch)
     monkeypatch.setattr(
@@ -1659,7 +1659,7 @@ def test_read_installed_wheel_info_uses_uv_tool_receipt(
 ) -> None:
     """``_read_installed_wheel_info`` reads extras from a uv tool receipt."""
     dist = _write_fake_dist_info(tmp_path, installer="uv")
-    monkeypatch.setattr("omnigent.update_check._get_distribution", lambda: dist)
+    monkeypatch.setattr("omnigent.cli.update_check._get_distribution", lambda: dist)
 
     tool_dir = tmp_path / "omnigent"
     bin_dir = tool_dir / "bin"
@@ -1684,7 +1684,7 @@ def test_read_installed_wheel_info_uv_pip_no_receipt_no_extras(
 ) -> None:
     """``uv pip install`` leaves no uv receipt, so extras stay empty."""
     dist = _write_fake_dist_info(tmp_path, installer="uv")
-    monkeypatch.setattr("omnigent.update_check._get_distribution", lambda: dist)
+    monkeypatch.setattr("omnigent.cli.update_check._get_distribution", lambda: dist)
     # A generic venv interpreter, not a uv tool directory.
     monkeypatch.setattr(sys, "executable", str(tmp_path / ".venv" / "bin" / "python"))
 
@@ -1723,7 +1723,7 @@ def test_fetch_latest_version_swallows_errors(monkeypatch: pytest.MonkeyPatch) -
     """Network error and non-200 both return ``None`` (never raise)."""
     import httpx
 
-    from omnigent.update_check import fetch_latest_version
+    from omnigent.cli.update_check import fetch_latest_version
 
     _clear_index_env(monkeypatch)
 
@@ -1739,7 +1739,7 @@ def test_fetch_latest_version_swallows_errors(monkeypatch: pytest.MonkeyPatch) -
 
 def test_resolve_index_url_precedence(monkeypatch: pytest.MonkeyPatch) -> None:
     """``_resolve_index_url`` follows env precedence and defaults to pypi.org/simple."""
-    from omnigent.update_check import _resolve_index_url
+    from omnigent.cli.update_check import _resolve_index_url
 
     _clear_index_env(monkeypatch)
     assert _resolve_index_url() == "https://pypi.org/simple"
@@ -1760,12 +1760,12 @@ def test_resolve_index_url_precedence(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def test_resolve_index_url_from_uv_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """No env var → uv.toml's ``index-url`` is used (corp-mirror-in-a-file case)."""
-    from omnigent.update_check import _resolve_index_url
+    from omnigent.cli.update_check import _resolve_index_url
 
     _delenv_index(monkeypatch)
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
     # Isolate the uv path under test from any real pip.conf on the box.
-    monkeypatch.setattr("omnigent.update_check._index_from_pip_config", lambda: "")
+    monkeypatch.setattr("omnigent.cli.update_check._index_from_pip_config", lambda: "")
     uv_toml = tmp_path / "uv" / "uv.toml"
     uv_toml.parent.mkdir(parents=True)
     uv_toml.write_text('index-url = "https://uvcfg.example/simple/"\n')
@@ -1777,11 +1777,11 @@ def test_resolve_index_url_from_uv_default_index_entry(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A ``[[index]]`` marked ``default = true`` wins; a plain one is ignored."""
-    from omnigent.update_check import _resolve_index_url
+    from omnigent.cli.update_check import _resolve_index_url
 
     _delenv_index(monkeypatch)
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
-    monkeypatch.setattr("omnigent.update_check._index_from_pip_config", lambda: "")
+    monkeypatch.setattr("omnigent.cli.update_check._index_from_pip_config", lambda: "")
     uv_toml = tmp_path / "uv" / "uv.toml"
     uv_toml.parent.mkdir(parents=True)
     uv_toml.write_text(
@@ -1796,11 +1796,11 @@ def test_resolve_index_url_ignores_non_default_uv_index(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A supplementary ``[[index]]`` (no ``default``) does not override pypi.org."""
-    from omnigent.update_check import _resolve_index_url
+    from omnigent.cli.update_check import _resolve_index_url
 
     _delenv_index(monkeypatch)
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
-    monkeypatch.setattr("omnigent.update_check._index_from_pip_config", lambda: "")
+    monkeypatch.setattr("omnigent.cli.update_check._index_from_pip_config", lambda: "")
     uv_toml = tmp_path / "uv" / "uv.toml"
     uv_toml.parent.mkdir(parents=True)
     uv_toml.write_text('[[index]]\nname = "extra"\nurl = "https://extra.example/simple"\n')
@@ -1812,11 +1812,11 @@ def test_resolve_index_url_from_pip_config(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """uv has nothing → pip.conf's ``[global] index-url`` is used."""
-    from omnigent.update_check import _resolve_index_url
+    from omnigent.cli.update_check import _resolve_index_url
 
     _delenv_index(monkeypatch)
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
-    monkeypatch.setattr("omnigent.update_check._index_from_uv_config", lambda: "")
+    monkeypatch.setattr("omnigent.cli.update_check._index_from_uv_config", lambda: "")
     pip_conf = tmp_path / "pip" / "pip.conf"
     pip_conf.parent.mkdir(parents=True)
     pip_conf.write_text("[global]\nindex-url = https://pipcfg.example/simple/\n")
@@ -1828,7 +1828,7 @@ def test_resolve_index_url_env_beats_config(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """An index env var takes precedence over a configured one."""
-    from omnigent.update_check import _resolve_index_url
+    from omnigent.cli.update_check import _resolve_index_url
 
     _delenv_index(monkeypatch)
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
@@ -1862,11 +1862,11 @@ def test_refresh_update_cache_writes_latest_and_preserves_notified(
         )
     )
     dist = _write_fake_dist_info(tmp_path, installer="uv")
-    monkeypatch.setattr("omnigent.update_check._get_distribution", lambda: dist)
-    monkeypatch.setattr("omnigent.update_check._find_repo_root", lambda: None)
-    monkeypatch.setattr("omnigent.update_check.fetch_latest_version", lambda: "0.2.0")
+    monkeypatch.setattr("omnigent.cli.update_check._get_distribution", lambda: dist)
+    monkeypatch.setattr("omnigent.cli.update_check._find_repo_root", lambda: None)
+    monkeypatch.setattr("omnigent.cli.update_check.fetch_latest_version", lambda: "0.2.0")
 
-    from omnigent.update_check import refresh_update_cache
+    from omnigent.cli.update_check import refresh_update_cache
 
     refresh_update_cache()
 
@@ -1884,14 +1884,14 @@ def test_refresh_update_cache_noop_for_clone(
     """In a dev clone, the PyPI refresh does nothing (git path owns it)."""
     monkeypatch.delenv("OMNIGENT_NO_UPDATE_CHECK", raising=False)
     _point_cache_at(tmp_path, monkeypatch)
-    monkeypatch.setattr("omnigent.update_check._find_repo_root", lambda: tmp_path)
+    monkeypatch.setattr("omnigent.cli.update_check._find_repo_root", lambda: tmp_path)
 
     def _must_not_fetch() -> str:
         raise AssertionError("PyPI fetch attempted in a dev clone")
 
-    monkeypatch.setattr("omnigent.update_check.fetch_latest_version", _must_not_fetch)
+    monkeypatch.setattr("omnigent.cli.update_check.fetch_latest_version", _must_not_fetch)
 
-    from omnigent.update_check import refresh_update_cache
+    from omnigent.cli.update_check import refresh_update_cache
 
     refresh_update_cache()  # must not raise
 
@@ -1901,16 +1901,16 @@ def test_upgrade_command_for_installed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """``upgrade_command_for_installed`` maps the install shape to a command."""
-    from omnigent.update_check import upgrade_command_for_installed
+    from omnigent.cli.update_check import upgrade_command_for_installed
 
     dist = _write_fake_dist_info(tmp_path, installer="uv")  # registry uv install
-    monkeypatch.setattr("omnigent.update_check._get_distribution", lambda: dist)
+    monkeypatch.setattr("omnigent.cli.update_check._get_distribution", lambda: dist)
     suggestion = upgrade_command_for_installed()
     assert suggestion is not None
     assert suggestion.command == "uv tool upgrade omnigent"
     assert suggestion.runnable is True
 
-    monkeypatch.setattr("omnigent.update_check._get_distribution", lambda: None)
+    monkeypatch.setattr("omnigent.cli.update_check._get_distribution", lambda: None)
     assert upgrade_command_for_installed() is None
 
 
@@ -1939,9 +1939,9 @@ def test_wheel_info_prefers_build_info_over_uv_cache(
             "commit": "uv_cache_commit_sha",
         },
     )
-    monkeypatch.setattr("omnigent.update_check._get_distribution", lambda: dist)
+    monkeypatch.setattr("omnigent.cli.update_check._get_distribution", lambda: dist)
     monkeypatch.setattr(
-        "omnigent.update_check._read_build_info",
+        "omnigent.cli.update_check._read_build_info",
         lambda: (build_time, "build_info_commit_sha"),
     )
 
@@ -1972,9 +1972,9 @@ def test_wheel_info_falls_back_to_uv_cache_when_build_info_missing(
             "commit": "uv_cache_sha",
         },
     )
-    monkeypatch.setattr("omnigent.update_check._get_distribution", lambda: dist)
+    monkeypatch.setattr("omnigent.cli.update_check._get_distribution", lambda: dist)
     # _build_info import returns None — simulates a source checkout.
-    monkeypatch.setattr("omnigent.update_check._read_build_info", lambda: None)
+    monkeypatch.setattr("omnigent.cli.update_check._read_build_info", lambda: None)
 
     info = _read_installed_wheel_info()
     assert info is not None
@@ -1988,8 +1988,8 @@ def test_wheel_info_falls_back_to_mtime_when_only_dist_info_available(
     """No _build_info, no uv_cache — fall back to dist-info mtime."""
     mtime = time.time() - 5 * 86400
     dist = _write_fake_dist_info(tmp_path, installer="pip", dir_mtime_epoch=mtime)
-    monkeypatch.setattr("omnigent.update_check._get_distribution", lambda: dist)
-    monkeypatch.setattr("omnigent.update_check._read_build_info", lambda: None)
+    monkeypatch.setattr("omnigent.cli.update_check._get_distribution", lambda: dist)
+    monkeypatch.setattr("omnigent.cli.update_check._read_build_info", lambda: None)
 
     info = _read_installed_wheel_info()
     assert info is not None
@@ -2017,9 +2017,9 @@ def test_wheel_info_build_info_empty_sha_does_not_clobber_direct_url_sha(
             "vcs_info": {"vcs": "git", "commit_id": _FAKE_COMMIT},
         },
     )
-    monkeypatch.setattr("omnigent.update_check._get_distribution", lambda: dist)
+    monkeypatch.setattr("omnigent.cli.update_check._get_distribution", lambda: dist)
     monkeypatch.setattr(
-        "omnigent.update_check._read_build_info",
+        "omnigent.cli.update_check._read_build_info",
         lambda: (build_time, ""),  # empty SHA from a no-git build
     )
 
@@ -2108,7 +2108,7 @@ def test_legacy_cache_without_kind_field_defaults_to_clone(
             }
         )
     )
-    monkeypatch.setattr("omnigent.update_check._CACHE_FILE", cache_file)
+    monkeypatch.setattr("omnigent.cli.update_check._CACHE_FILE", cache_file)
 
     entry = _read_cache()
     assert entry is not None
@@ -2135,7 +2135,7 @@ def test_run_upgrade_command_invokes_subprocess(
 
     from rich.console import Console
 
-    from omnigent.update_check import _run_upgrade_command
+    from omnigent.cli.update_check import _run_upgrade_command
 
     captured_args: list[list[str]] = []
 
@@ -2192,7 +2192,7 @@ def test_run_upgrade_command_returns_minus_one_when_binary_missing(
 
     from rich.console import Console
 
-    from omnigent.update_check import _run_upgrade_command
+    from omnigent.cli.update_check import _run_upgrade_command
 
     def _raise(*_args: object, **_kwargs: object) -> None:
         raise FileNotFoundError(2, "No such file or directory: 'uv'")
@@ -2225,7 +2225,7 @@ def test_format_version_falls_back_to_bare_version_when_build_info_missing() -> 
     """
     # The autouse fixture has already blocked sys.modules['omnigent._build_info']
     # via the None sentinel, so _read_build_info returns None.
-    from omnigent.cli import _format_version
+    from omnigent.cli.commands import _format_version
 
     out = _format_version()
     # Exact prefix match — if the format ever gains extra content
@@ -2250,7 +2250,7 @@ def test_format_version_includes_sha_and_build_time_when_present(
     """
     import types
 
-    from omnigent.cli import _format_version
+    from omnigent.cli.commands import _format_version
 
     fake_module = types.ModuleType("omnigent._build_info")
     # 2026-05-20T14:34:45Z exactly.
@@ -2277,7 +2277,7 @@ def test_format_version_omits_sha_when_build_info_has_empty_sha(
     """
     import types
 
-    from omnigent.cli import _format_version
+    from omnigent.cli.commands import _format_version
 
     fake_module = types.ModuleType("omnigent._build_info")
     fake_module.BUILD_TIME_EPOCH = 1779287685  # type: ignore[attr-defined]
@@ -2296,7 +2296,7 @@ def test_format_version_omits_sha_when_build_info_has_empty_sha(
 
 def test_split_vcs_url_strips_prefix_and_separates_revision() -> None:
     """``git+<url>@<rev>`` splits into the bare repo URL and the revision."""
-    from omnigent.update_check import _split_vcs_url
+    from omnigent.cli.update_check import _split_vcs_url
 
     assert _split_vcs_url("git+https://github.com/o/omnigent.git") == (
         "https://github.com/o/omnigent.git",
@@ -2314,7 +2314,7 @@ def test_split_vcs_url_strips_pip_fragment() -> None:
     Left on, the fragment would ride along into ``git ls-remote`` and match no
     ref, silently making the commit comparison indeterminate.
     """
-    from omnigent.update_check import _split_vcs_url
+    from omnigent.cli.update_check import _split_vcs_url
 
     assert _split_vcs_url("git+https://github.com/o/omnigent.git#egg=omnigent") == (
         "https://github.com/o/omnigent.git",
@@ -2328,7 +2328,7 @@ def test_split_vcs_url_strips_pip_fragment() -> None:
 
 def test_split_vcs_url_ssh_userinfo_is_not_a_revision() -> None:
     """An ``@`` in SSH userinfo (``git@host``) must not be read as a revision."""
-    from omnigent.update_check import _split_vcs_url
+    from omnigent.cli.update_check import _split_vcs_url
 
     assert _split_vcs_url("git+ssh://git@github.com/o/omnigent.git") == (
         "ssh://git@github.com/o/omnigent.git",
@@ -2368,7 +2368,7 @@ def test_wheel_check_skips_vcs_install(
         installer="uv",
         direct_url={"url": _FAKE_GIT_URL, "vcs_info": {"vcs": "git", "commit_id": _FAKE_COMMIT}},
     )
-    monkeypatch.setattr("omnigent.update_check._get_distribution", lambda: dist)
+    monkeypatch.setattr("omnigent.cli.update_check._get_distribution", lambda: dist)
 
     _run_installed_wheel_check()
 
@@ -2400,11 +2400,11 @@ def test_cli_upgrade_refuses_pip_and_prints_manual_command(
 ) -> None:
     """pip installs are refused because extras cannot be recovered."""
     monkeypatch.setattr(
-        "omnigent.update_check._read_installed_wheel_info",
+        "omnigent.cli.update_check._read_installed_wheel_info",
         lambda: _make_wheel_info(installer="pip", detected_installer="pip"),
     )
-    monkeypatch.setattr("omnigent.update_check._find_repo_root", lambda: None)
-    monkeypatch.setattr("omnigent.update_check._uv_tool_receipt_path", lambda: None)
+    monkeypatch.setattr("omnigent.cli.update_check._find_repo_root", lambda: None)
+    monkeypatch.setattr("omnigent.cli.update_check._uv_tool_receipt_path", lambda: None)
 
     runner = CliRunner()
     result = runner.invoke(cli, ["upgrade"])
@@ -2418,11 +2418,11 @@ def test_cli_upgrade_refuses_uv_pip_and_prints_manual_command(
 ) -> None:
     """uv pip installs without a tool receipt are refused."""
     monkeypatch.setattr(
-        "omnigent.update_check._read_installed_wheel_info",
+        "omnigent.cli.update_check._read_installed_wheel_info",
         lambda: _make_wheel_info(installer="uv", detected_installer="uv"),
     )
-    monkeypatch.setattr("omnigent.update_check._find_repo_root", lambda: None)
-    monkeypatch.setattr("omnigent.update_check._uv_tool_receipt_path", lambda: None)
+    monkeypatch.setattr("omnigent.cli.update_check._find_repo_root", lambda: None)
+    monkeypatch.setattr("omnigent.cli.update_check._uv_tool_receipt_path", lambda: None)
 
     runner = CliRunner()
     result = runner.invoke(cli, ["upgrade"])
@@ -2436,16 +2436,16 @@ def test_cli_upgrade_dry_run_uv_tool_with_extras(
 ) -> None:
     """``--dry-run`` prints the command without touching sessions or index."""
     monkeypatch.setattr(
-        "omnigent.update_check._read_installed_wheel_info",
+        "omnigent.cli.update_check._read_installed_wheel_info",
         lambda: _make_wheel_info(installer="uv", detected_installer="uv", extras=("all",)),
     )
-    monkeypatch.setattr("omnigent.update_check._find_repo_root", lambda: None)
+    monkeypatch.setattr("omnigent.cli.update_check._find_repo_root", lambda: None)
     monkeypatch.setattr(
-        "omnigent.update_check._uv_tool_receipt_path",
+        "omnigent.cli.update_check._uv_tool_receipt_path",
         lambda: Path("/fake/uv-receipt.toml"),
     )
-    monkeypatch.setattr("omnigent.update_check.fetch_latest_version", lambda **_: "0.2.0")
-    monkeypatch.setattr("omnigent.update_check._is_newer", lambda latest, current: True)
+    monkeypatch.setattr("omnigent.cli.update_check.fetch_latest_version", lambda **_: "0.2.0")
+    monkeypatch.setattr("omnigent.cli.update_check._is_newer", lambda latest, current: True)
 
     runner = CliRunner()
     result = runner.invoke(cli, ["upgrade", "--dry-run"])
@@ -2459,12 +2459,12 @@ def test_cli_upgrade_check_still_allows_pip(
 ) -> None:
     """``--check`` is not an auto-upgrade, so pip installs can use it."""
     monkeypatch.setattr(
-        "omnigent.update_check._read_installed_wheel_info",
+        "omnigent.cli.update_check._read_installed_wheel_info",
         lambda: _make_wheel_info(installer="pip", detected_installer="pip"),
     )
-    monkeypatch.setattr("omnigent.update_check._find_repo_root", lambda: None)
-    monkeypatch.setattr("omnigent.update_check.fetch_latest_version", lambda **_: "0.2.0")
-    monkeypatch.setattr("omnigent.update_check._is_newer", lambda latest, current: True)
+    monkeypatch.setattr("omnigent.cli.update_check._find_repo_root", lambda: None)
+    monkeypatch.setattr("omnigent.cli.update_check.fetch_latest_version", lambda **_: "0.2.0")
+    monkeypatch.setattr("omnigent.cli.update_check._is_newer", lambda latest, current: True)
 
     runner = CliRunner()
     result = runner.invoke(cli, ["upgrade", "--check"])
@@ -2478,7 +2478,7 @@ def test_read_installed_wheel_info_reads_pipx_metadata(
 ) -> None:
     """When inside a pipx venv, extras are read from pipx metadata."""
     dist = _write_fake_dist_info(tmp_path, installer="pip")
-    monkeypatch.setattr("omnigent.update_check._get_distribution", lambda: dist)
+    monkeypatch.setattr("omnigent.cli.update_check._get_distribution", lambda: dist)
 
     venv_dir = tmp_path / "pipx" / "venvs" / "omnigent"
     (venv_dir / "bin").mkdir(parents=True)

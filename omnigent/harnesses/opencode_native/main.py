@@ -31,12 +31,28 @@ import click
 import httpx
 import yaml
 
-from omnigent._runner_startup import RunnerStartupProgress, runner_startup_progress
-from omnigent._wrapper_labels import OPENCODE_NATIVE_WRAPPER_VALUE as _WRAPPER_LABEL_VALUE
-from omnigent._wrapper_labels import WRAPPER_LABEL_KEY as _WRAPPER_LABEL_KEY
-from omnigent.conversation_browser import conversation_url, open_conversation_link_if_enabled
+from omnigent.cli.conversation_browser import conversation_url, open_conversation_link_if_enabled
+from omnigent.cli.runner_startup import RunnerStartupProgress, runner_startup_progress
 from omnigent.entities.session_resources import terminal_resource_id
+from omnigent.harnesses.native.coding_agents import native_shell_terminal_spec
+from omnigent.harnesses.native.resume_hint import echo_native_resume_hint
+from omnigent.harnesses.native.terminal import (
+    DAEMON_HOST_ONLINE_TIMEOUT_S as _DAEMON_HOST_ONLINE_TIMEOUT_S,
+)
+from omnigent.harnesses.native.terminal import (
+    DAEMON_RUNNER_ONLINE_TIMEOUT_S as _DAEMON_RUNNER_ONLINE_TIMEOUT_S,
+)
+from omnigent.harnesses.native.terminal import (
+    DAEMON_TERMINAL_READY_TIMEOUT_S as _DAEMON_TERMINAL_READY_TIMEOUT_S,
+)
+from omnigent.harnesses.native.terminal import bind_session_runner as _bind_session_runner
+from omnigent.harnesses.native.terminal import (
+    normalize_extra_args as _normalize_extra_args,
+)
+from omnigent.harnesses.native.terminal import url_component
 from omnigent.harnesses.opencode_native.state import read_launch_state, write_launch_state
+from omnigent.harnesses.wrapper_labels import OPENCODE_NATIVE_WRAPPER_VALUE as _WRAPPER_LABEL_VALUE
+from omnigent.harnesses.wrapper_labels import WRAPPER_LABEL_KEY as _WRAPPER_LABEL_KEY
 from omnigent.host.daemon_launch import (
     error_text,
     launch_or_reuse_daemon_runner,
@@ -44,22 +60,6 @@ from omnigent.host.daemon_launch import (
     wait_for_host_online,
     wait_for_runner_online,
 )
-from omnigent.native._native_resume_hint import echo_native_resume_hint
-from omnigent.native.native_coding_agents import native_shell_terminal_spec
-from omnigent.native.native_terminal import (
-    DAEMON_HOST_ONLINE_TIMEOUT_S as _DAEMON_HOST_ONLINE_TIMEOUT_S,
-)
-from omnigent.native.native_terminal import (
-    DAEMON_RUNNER_ONLINE_TIMEOUT_S as _DAEMON_RUNNER_ONLINE_TIMEOUT_S,
-)
-from omnigent.native.native_terminal import (
-    DAEMON_TERMINAL_READY_TIMEOUT_S as _DAEMON_TERMINAL_READY_TIMEOUT_S,
-)
-from omnigent.native.native_terminal import bind_session_runner as _bind_session_runner
-from omnigent.native.native_terminal import (
-    normalize_extra_args as _normalize_extra_args,
-)
-from omnigent.native.native_terminal import url_component
 from omnigent.util.json_types import JsonObject as _JsonObject
 
 _logger = logging.getLogger(__name__)
@@ -160,7 +160,6 @@ def run_opencode_native(  # pragma: no cover
     server: str | None,
     session_id: str | None,
     extra_args: tuple[str, ...] | None = None,
-    opencode_args: tuple[str, ...] | None = None,
     resume_picker: bool = False,
     model: str | None = None,
     auto_open_conversation: bool = False,
@@ -176,15 +175,13 @@ def run_opencode_native(  # pragma: no cover
     :param server: Resolved Omnigent server URL. ``None`` is an error (the CLI
         must resolve a backend first).
     :param session_id: Optional existing Omnigent conversation id to resume.
-    :param opencode_args: Raw ``opencode`` CLI args to persist for the TUI.
+    :param extra_args: Raw ``opencode`` CLI args to persist for the TUI.
     :param resume_picker: When ``True``, run the opencode-native resume picker.
     :param model: Optional model id pinned on the materialized wrapper spec.
     :param auto_open_conversation: Open the browser conversation URL on launch.
     :returns: None after the terminal attach session ends.
     """
-    opencode_args = _normalize_extra_args(
-        extra_args=extra_args, legacy_args=opencode_args, legacy_param="opencode_args"
-    )
+    extra_args = _normalize_extra_args(extra_args)
     _preflight_local_tools()
     if server is None:
         raise click.ClickException(
@@ -198,7 +195,7 @@ def run_opencode_native(  # pragma: no cover
             spec_path,
             session_id=session_id,
             resume_picker=resume_picker,
-            opencode_args=opencode_args,
+            extra_args=extra_args,
             auto_open_conversation=auto_open_conversation,
         )
 
@@ -209,12 +206,12 @@ def _run_with_remote_server(  # pragma: no cover
     *,
     session_id: str | None,
     resume_picker: bool,
-    opencode_args: tuple[str, ...],
+    extra_args: tuple[str, ...],
     auto_open_conversation: bool = False,
 ) -> None:
     """Launch OpenCode on an Omnigent server via a daemon-spawned runner."""
-    from omnigent.chat import _bundle_agent, _remote_headers
-    from omnigent.cli import _ensure_host_daemon
+    from omnigent.cli.chat import _bundle_agent, _remote_headers
+    from omnigent.cli.commands import _ensure_host_daemon
     from omnigent.host.identity import load_or_create_host_identity
 
     headers = _remote_headers(server_url=base_url, host_id=None)
@@ -241,7 +238,7 @@ def _run_with_remote_server(  # pragma: no cover
                     headers=headers,
                     session_id=resolved_session_id,
                     session_bundle=bundle,
-                    opencode_args=opencode_args,
+                    extra_args=extra_args,
                     host_id=host_id,
                     workspace=str(Path.cwd().resolve()),
                     startup_progress=progress,
@@ -278,13 +275,13 @@ async def _prepare_opencode_terminal_via_daemon(  # pragma: no cover
     headers: dict[str, str],
     session_id: str | None,
     session_bundle: bytes | None,
-    opencode_args: tuple[str, ...],
+    extra_args: tuple[str, ...],
     host_id: str,
     workspace: str,
     startup_progress: RunnerStartupProgress | None = None,
 ) -> PreparedOpenCodeTerminal:
     """Create or resume an opencode-native session through a daemon runner."""
-    persist_args = list(opencode_args)
+    persist_args = list(extra_args)
     timeout = httpx.Timeout(30.0, read=120.0)
     async with open_daemon_client(base_url, headers, host_id, timeout=timeout) as client:
         reattached = session_id is not None

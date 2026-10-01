@@ -49,7 +49,7 @@ from pathlib import Path
 import httpx
 import pytest
 
-from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN, token_bound_runner_id
+from omnigent.util.runner_identity import OMNIGENT_INTERNAL_WS_ORIGIN, token_bound_runner_id
 from tests._helpers.compat import apply_runner_env, apply_server_env
 from tests.e2e.conftest import (
     configure_mock_llm,
@@ -154,7 +154,7 @@ class _WakeLossStack:
             [
                 sys.executable,
                 "-m",
-                "omnigent.cli",
+                "omnigent.cli.commands",
                 "server",
                 "--port",
                 str(self._port),

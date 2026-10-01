@@ -31,8 +31,7 @@ from omnigent.server.managed_hosts import (
     parse_sandbox_config,
     resolve_managed_agent_label,
 )
-from omnigent.server.routes import _session_create_validation as create_validation
-from omnigent.server.routes.sessions import create_sessions_router, routes_core
+from omnigent.server.routes.sessions import create_sessions_router, create_validation, routes_core
 from omnigent.stores.conversation_store import _FORK_ONLY_DROPPED_LABEL_KEYS
 
 # ── Minimal store stubs ──────────────────────────────────────────

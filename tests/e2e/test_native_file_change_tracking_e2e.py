@@ -19,7 +19,7 @@ from pathlib import Path
 import pytest
 
 from omnigent.harnesses.claude_native import bridge
-from omnigent.native.tool_observer_hook import hook_settings
+from omnigent.harnesses.native.tool_observer_hook import hook_settings
 from omnigent.runner.native_file_observer import native_file_changes
 from omnigent.runtime.filesystem_registry import AgentEditFilesystemRegistry
 

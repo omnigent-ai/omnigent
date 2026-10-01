@@ -13,15 +13,15 @@ import httpx
 import pytest
 from fastapi.responses import StreamingResponse
 
-from omnigent.runner import create_runner_app
-from omnigent.runner.tool_dispatch import dispatch_tool_locally
-from omnigent.runtime.harnesses._scaffold import (
+from omnigent.harnesses.runtime._scaffold import (
     HarnessApp,
     MessageEvent,
     ToolResultEvent,
     TurnContext,
 )
-from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
+from omnigent.harnesses.runtime.process_manager import HarnessProcessManager
+from omnigent.runner import create_runner_app
+from omnigent.runner.tool_dispatch import dispatch_tool_locally
 from omnigent.server.schemas import CreateResponseRequest
 from tests.runner.conftest import _FakeProcessManager, _runner_client
 from tests.runner.helpers import NullServerClient

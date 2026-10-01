@@ -6,8 +6,8 @@ import hashlib
 import tempfile
 from pathlib import Path, PurePosixPath, PureWindowsPath
 
+from omnigent.core.datamodel import OSEnvSpec
 from omnigent.errors import ErrorCode, OmnigentError
-from omnigent.inner.datamodel import OSEnvSpec
 from omnigent.spec import AgentSpec, ExtractionError, ToolRuntime, load
 
 
@@ -106,7 +106,7 @@ def validate_agent_bundle(
     The author of an HTTP-uploaded spec is not the
     server operator, so the server must never resolve env vars on their
     behalf — operator-authored specs resolve env at the client /
-    registration boundary instead (``omnigent.cli._resolve_bundle_env_vars``).
+    registration boundary instead (``omnigent.cli.commands._resolve_bundle_env_vars``).
 
     :param bundle_bytes: Raw bytes of the ``.tar.gz`` bundle.
     :param enforce_handler_allowlist: When ``True`` (the default),

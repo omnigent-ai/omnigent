@@ -273,7 +273,7 @@ async def test_codex_home_and_exposed_name_agree(
     ``brand-review``, and the codex resolver rejects the namespaced form —
     so the exposed name is dead on codex.
     """
-    from omnigent.inner.codex_executor import populate_codex_skills_from_bundle
+    from omnigent.harnesses.codex.executor import populate_codex_skills_from_bundle
     from omnigent.spec.skill_sources import SkillSourceContext, resolve_harness_skills
 
     home = tmp_path / "home"

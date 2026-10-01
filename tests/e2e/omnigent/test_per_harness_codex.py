@@ -11,7 +11,7 @@ cleanliness, assistant text length).
   message-stream translation in ``codex_executor.run_turn``).
 - The ``codex`` CLI binary disappears from PATH or its
   ``app-server`` subcommand changes its startup contract.
-- ``omnigent.cli._run_agent`` for the ``-p`` one-shot path
+- ``omnigent.cli.commands._run_agent`` for the ``-p`` one-shot path
   stops printing assistant text to stdout on turn complete.
 
 Design reference: ``designs/OMNIGENT_INTEGRATION.md`` §Phase 0

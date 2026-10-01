@@ -22,8 +22,8 @@ import httpx
 import pytest
 
 from omnigent.server.routes import sessions as _sessions_facade
-from omnigent.server.routes._sessions import common as _sessions_common
-from omnigent.server.routes._sessions import orchestration as _sessions_orchestration
+from omnigent.server.routes.sessions import common as _sessions_common
+from omnigent.server.routes.sessions import orchestration as _sessions_orchestration
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )

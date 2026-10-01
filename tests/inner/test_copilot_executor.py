@@ -1,4 +1,4 @@
-"""Tests for :class:`omnigent.inner.copilot_executor.CopilotExecutor`.
+"""Tests for :class:`omnigent.harnesses.copilot.executor.CopilotExecutor`.
 
 The copilot harness drives the GitHub Copilot SDK (``github-copilot-sdk``,
 imported as ``copilot``). The SDK is replaced with an injected fake module (so
@@ -21,8 +21,20 @@ from typing import Any
 
 import pytest
 
-from omnigent.inner import copilot_executor
-from omnigent.inner.copilot_executor import (
+from omnigent.core.executor import (
+    CompactionComplete,
+    ExecutorConfig,
+    ExecutorError,
+    Message,
+    ReasoningChunk,
+    TextChunk,
+    ToolCallComplete,
+    ToolCallRequest,
+    ToolCallStatus,
+    TurnComplete,
+)
+from omnigent.harnesses.copilot import executor as copilot_executor
+from omnigent.harnesses.copilot.executor import (
     COPILOT_HOST_ENV_VAR,
     CopilotExecutor,
     _accumulate_usage,
@@ -36,20 +48,8 @@ from omnigent.inner.copilot_executor import (
     _resolve_model,
     _resolve_reasoning_effort,
 )
-from omnigent.inner.executor import (
-    CompactionComplete,
-    ExecutorConfig,
-    ExecutorError,
-    Message,
-    ReasoningChunk,
-    TextChunk,
-    ToolCallComplete,
-    ToolCallRequest,
-    ToolCallStatus,
-    TurnComplete,
-)
+from omnigent.harnesses.runtime._executor_adapter import _bridge_one_dispatch
 from omnigent.onboarding import copilot_auth
-from omnigent.runtime.harnesses._executor_adapter import _bridge_one_dispatch
 from omnigent.runtime.mcp_tool_result import encode_mcp_image_result
 
 

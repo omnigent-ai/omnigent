@@ -136,7 +136,7 @@ def test_every_ui_test_area_is_mapped_or_listed() -> None:
 def test_every_cli_command_is_mapped_or_listed() -> None:
     import click
 
-    from omnigent.cli import cli
+    from omnigent.cli.commands import cli
 
     ctx = click.Context(cli)
     commands = {name for name in cli.list_commands(ctx) if not cli.get_command(ctx, name).hidden}

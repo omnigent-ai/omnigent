@@ -11,7 +11,7 @@ import httpx
 import respx
 from click.testing import CliRunner
 
-from omnigent.cli import cli
+from omnigent.cli.commands import cli
 from omnigent.util.server_url import ServerUrl
 
 _BASE = "http://localhost:6767"
@@ -58,7 +58,7 @@ _ITEMS_PAGE = {
 def _patch_server(base_url: str = _BASE) -> Any:
     """Patch the CLI so it uses *base_url* without spawning a real server."""
     return patch(
-        "omnigent.cli._resolve_attach_server_url",
+        "omnigent.cli.commands._resolve_attach_server_url",
         return_value=ServerUrl(base_url),
     )
 
@@ -104,7 +104,7 @@ def test_session_export_spog_url_sends_workspace_selector(
 ) -> None:
     """A pasted SPOG URL keeps its ``?o=`` selector in request headers."""
     monkeypatch.setattr(
-        "omnigent.cli._workspace_api_server_url",
+        "omnigent.cli.commands._workspace_api_server_url",
         lambda _server: _SPOG_API,
     )
     session_route = respx.get(f"{_SPOG_API}/v1/sessions/conv_abc123").mock(

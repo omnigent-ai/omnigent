@@ -11,7 +11,6 @@ import pytest
 from omnigent.db.utils import generate_agent_id
 from omnigent.entities import Conversation, MessageData, NewConversationItem
 from omnigent.errors import ErrorCode, OmnigentError
-from omnigent.inner.native_attachments import CAP_FILESYSTEM_ATTACHMENTS
 from omnigent.runner.session_init_protocol import (
     build_runner_session_init_payload,
     parse_runner_session_init_envelope,
@@ -26,6 +25,7 @@ from omnigent.stores.conversation_store import (
 )
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
+from omnigent.util.attachments import CAP_FILESYSTEM_ATTACHMENTS
 
 
 class _Registry:
@@ -214,7 +214,7 @@ def test_reconnect_init_envelope_carries_fork_history_directives(db_uri: str) ->
 
     # And the runner's own projection reads them as launch directives -- the
     # boolean the clone/rebuild branch gates on.
-    from omnigent.runner.app import _claude_launch_metadata_from_envelope
+    from omnigent.runner.native.orchestration import _claude_launch_metadata_from_envelope
 
     metadata = _claude_launch_metadata_from_envelope(envelope)
     assert metadata.fork_carry_history is True

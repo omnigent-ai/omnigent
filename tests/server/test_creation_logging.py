@@ -5,7 +5,7 @@ from __future__ import annotations
 import httpx
 import pytest
 
-from omnigent import debug_logging
+from omnigent.observability import debug_logging
 from omnigent.server import creation_logging
 from tests.debug_log_helpers import capture_debug_rows
 from tests.server.helpers import create_test_agent
@@ -150,7 +150,7 @@ async def test_publish_session_created_logs_parent_link_for_native_subagent() ->
     """
     from unittest.mock import MagicMock
 
-    from omnigent.server.routes._sessions.helpers import _publish_session_created
+    from omnigent.server.routes.sessions.helpers import _publish_session_created
 
     # The log fires before the subagent-activity write; a store whose lookup
     # returns None makes that write a clean no-op so the test stays focused.

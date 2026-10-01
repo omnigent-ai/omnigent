@@ -3480,7 +3480,7 @@ async def test_run_managed_wake_forwards_recorded_repo(
     monkeypatch: pytest.MonkeyPatch, raw_repo: str | None
 ) -> None:
     """The session's saved URL supplies wake prep, as it does for a fresh generation."""
-    from omnigent.server.routes._sessions import orchestration
+    from omnigent.server.routes.sessions import orchestration
 
     captured: dict[str, object] = {}
 
@@ -4707,7 +4707,7 @@ async def test_kick_managed_relaunch_defers_the_classifier_to_the_launch_task(
     so the claim-to-task region stays synchronous and only the winning caller
     ever pays for the read.
     """
-    from omnigent.server.routes._sessions import orchestration
+    from omnigent.server.routes.sessions import orchestration
 
     captured: dict[str, object] = {}
 
@@ -4772,7 +4772,7 @@ async def test_relaunch_claim_and_launch_task_are_one_synchronous_step(
     """
     import inspect
 
-    from omnigent.server.routes._sessions import orchestration
+    from omnigent.server.routes.sessions import orchestration
 
     assert not inspect.iscoroutinefunction(orchestration._kick_managed_relaunch), (
         "_kick_managed_relaunch must stay synchronous: an await between "
@@ -4809,7 +4809,7 @@ async def test_kick_managed_relaunch_without_agent_store_threads_none(
     """No agent store on app.state (a stripped app) degrades the relaunch to an
     unclassified runner rather than raising — a fail-safe deny, never a spurious
     label."""
-    from omnigent.server.routes._sessions import orchestration
+    from omnigent.server.routes.sessions import orchestration
 
     captured: dict[str, object] = {}
 
@@ -4850,7 +4850,7 @@ async def test_run_managed_launch_leaves_the_runner_unclassified(
     """Without both an agent store and a bound agent id there is nothing to
     resolve, and the launch proceeds with an unclassified runner rather than
     raising — the same fail-safe the gate itself applies."""
-    from omnigent.server.routes._sessions import orchestration
+    from omnigent.server.routes.sessions import orchestration
 
     captured: dict[str, object] = {}
 
@@ -4886,7 +4886,7 @@ async def test_run_managed_launch_resolves_the_classifier_on_its_own_task(
     so the request path never awaits between claiming and spawning, and a losing
     concurrent message never reaches this function at all.
     """
-    from omnigent.server.routes._sessions import orchestration
+    from omnigent.server.routes.sessions import orchestration
 
     captured: dict[str, object] = {}
 
@@ -4925,7 +4925,7 @@ async def test_run_managed_launch_omits_the_classifier_for_a_session_scoped_impo
     """A session-scoped agent named after a built-in resolves to no classifier
     even now that the resolve runs on the launch task — the gate travels with the
     read, so moving it did not weaken the anti-spoof property."""
-    from omnigent.server.routes._sessions import orchestration
+    from omnigent.server.routes.sessions import orchestration
 
     captured: dict[str, object] = {}
 
@@ -4967,7 +4967,7 @@ async def test_kick_managed_wake_defers_the_classifier_to_the_wake_task(
     claim-to-task region stays synchronous and only the winning caller pays for
     the read.
     """
-    from omnigent.server.routes._sessions import orchestration
+    from omnigent.server.routes.sessions import orchestration
 
     captured: dict[str, object] = {}
 
@@ -5018,7 +5018,7 @@ async def test_run_managed_wake_re_stamps_the_woken_runner(
     The wake task resolves the bound agent through the built-in gate and forwards
     the name into the resume, so the rebuilt runner carries its classifier again.
     """
-    from omnigent.server.routes._sessions import orchestration
+    from omnigent.server.routes.sessions import orchestration
 
     captured: dict[str, object] = {}
 
@@ -5060,7 +5060,7 @@ async def test_run_managed_wake_omits_the_classifier_for_a_session_scoped_impost
     the wake path too, so a wake cannot be used to obtain a label the initial
     launch would have refused.
     """
-    from omnigent.server.routes._sessions import orchestration
+    from omnigent.server.routes.sessions import orchestration
 
     captured: dict[str, object] = {}
 
@@ -5098,7 +5098,7 @@ async def test_run_managed_wake_recreates_a_definitively_gone_sandbox(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A gone wake reuses the host identity and create-time session metadata."""
-    from omnigent.server.routes._sessions import orchestration
+    from omnigent.server.routes.sessions import orchestration
 
     async def _resume(*args: object, **kwargs: object) -> None:
         raise SandboxGoneError("sandbox no longer exists")
@@ -5168,7 +5168,7 @@ async def test_recreated_sandbox_records_and_publishes_workspace_reset_notice(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Each fresh generation records and publishes one visible reset notice."""
-    from omnigent.server.routes._sessions import orchestration
+    from omnigent.server.routes.sessions import orchestration
 
     appended: list[object] = []
     surfaced: list[object] = []
@@ -5231,7 +5231,7 @@ async def test_concurrent_relaunch_messages_kick_a_single_launch(
     launch: the check→begin region carries no ``await``, so the loser
     rendezvouses on the winner's entry instead of double-launching a second Pod.
     """
-    from omnigent.server.routes._sessions import orchestration
+    from omnigent.server.routes.sessions import orchestration
 
     monkeypatch.setattr(orchestration, "host_resume_supported", lambda *a, **k: False)
 

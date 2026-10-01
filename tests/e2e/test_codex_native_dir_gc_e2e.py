@@ -33,7 +33,7 @@ import psutil
 import pytest
 
 from omnigent.harnesses.codex_native import bridge as codex_native_bridge
-from omnigent.native.native_coding_agents import CODEX_NATIVE_AGENT_NAME
+from omnigent.harnesses.native.coding_agents import CODEX_NATIVE_AGENT_NAME
 from tests._helpers.compat import apply_runner_env, compat_runner_cwd, runner_executable
 from tests.e2e.helpers import POLL_INTERVAL_S
 

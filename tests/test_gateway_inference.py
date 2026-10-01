@@ -5,9 +5,17 @@ from typing import Any
 
 import pytest
 
-from omnigent import gateway_inference
-from omnigent.databricks_ai_gateway import is_databricks_ai_gateway_url
-from omnigent.gateway_inference import (
+from omnigent.harnesses.claude_native import main as claude_native
+from omnigent.harnesses.claude_native.main import ClaudeNativeUcodeConfig
+from omnigent.harnesses.codex import executor as codex_executor
+from omnigent.harnesses.codex_native import app_server as codex_native_app_server
+from omnigent.harnesses.codex_native.app_server import (
+    NativeCodexLaunch,
+    native_codex_launch_base_url,
+)
+from omnigent.models import gateway_inference
+from omnigent.models.databricks_ai_gateway import is_databricks_ai_gateway_url
+from omnigent.models.gateway_inference import (
     CLAUDE_GATEWAY_HARNESSES,
     CODEX_GATEWAY_HARNESSES,
     claude_gateway_inference_backed,
@@ -16,14 +24,6 @@ from omnigent.gateway_inference import (
     gateway_inference_state,
     not_gateway_backed,
 )
-from omnigent.harnesses.claude_native import main as claude_native
-from omnigent.harnesses.claude_native.main import ClaudeNativeUcodeConfig
-from omnigent.harnesses.codex_native import app_server as codex_native_app_server
-from omnigent.harnesses.codex_native.app_server import (
-    NativeCodexLaunch,
-    native_codex_launch_base_url,
-)
-from omnigent.inner import codex_executor
 
 _GATEWAY_CODEX_URL = "https://example.cloud.databricks.com/ai-gateway/codex/v1"
 _GATEWAY_ANTHROPIC_URL = "https://example.cloud.databricks.com/ai-gateway/anthropic"

@@ -30,7 +30,7 @@ from omnigent.entities import (
     USER_SESSION_TITLE_MAX_CHARS,
     ConversationItem,
 )
-from omnigent.inner.native_attachments import reject_authored_framework_notices
+from omnigent.util.attachments import reject_authored_framework_notices
 
 # ── Shared ──────────────────────────────────────────────────────
 
@@ -4892,8 +4892,8 @@ class SubagentStartedEvent(_SSEEventBase):
     Runner-internal marker: the harness agent spawned a sub-agent.
 
     ACP agents that delegate report it in their own dialect (see
-    :mod:`omnigent.inner.acp_subagents`); the executor normalizes that to a
-    :class:`~omnigent.inner.executor.SubAgentStarted`, which the adapter emits as
+    :mod:`omnigent.harnesses.acp.subagents`); the executor normalizes that to a
+    :class:`~omnigent.core.executor.SubAgentStarted`, which the adapter emits as
     this event. The runner intercepts it in ``proxy_stream`` and POSTs
     ``external_subagent_start`` to the Omnigent server, minting a child session so
     the web "Subagents" panel lists one row per child. **Never** relayed to
@@ -4918,7 +4918,7 @@ class SubagentCompletedEvent(_SSEEventBase):
     Runner-internal marker: a previously-announced sub-agent finished.
 
     Emitted by the adapter from a
-    :class:`~omnigent.inner.executor.SubAgentCompleted`. The runner records the
+    :class:`~omnigent.core.executor.SubAgentCompleted`. The runner records the
     outcome on the child session minted for the matching ``child_key`` (status +
     the summary as its output). **Never** relayed to external clients.
 
@@ -4939,7 +4939,7 @@ class SubagentToolCallEvent(_SSEEventBase):
     Runner-internal marker: an ACP sub-agent ran a tool call.
 
     Emitted by the adapter from a
-    :class:`~omnigent.inner.executor.SubAgentToolCall` — a call the sub-agent
+    :class:`~omnigent.core.executor.SubAgentToolCall` — a call the sub-agent
     made inside its delegated work, which belongs in the child's transcript, not
     the parent stream. The runner appends it as a ``function_call`` conversation
     item on the child session minted for the matching ``child_key``. **Never**

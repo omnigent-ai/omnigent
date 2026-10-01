@@ -30,7 +30,6 @@ from sqlalchemy import (
 from sqlalchemy.orm import QueryableAttribute, Session, load_only
 from sqlalchemy.sql.selectable import Subquery
 
-from omnigent._wrapper_labels import UI_MODE_LABEL_KEY, WRAPPER_LABEL_KEY
 from omnigent.db.account_authority import AccountAuthority, require_active_account
 from omnigent.db.compression import encode as compress_text
 from omnigent.db.converters import sql_agent_to_entity
@@ -86,9 +85,11 @@ from omnigent.entities import (
     PagedList,
     parse_item_data,
 )
+from omnigent.entities.permission import LEVEL_OWNER, RESERVED_USER_PUBLIC
 from omnigent.errors import ErrorCode, OmnigentError, StaleCursorError
-from omnigent.native.native_coding_agents import native_coding_agent_for_wrapper_label
-from omnigent.native.session_todos import validate_session_todos
+from omnigent.harnesses.native.coding_agents import native_coding_agent_for_wrapper_label
+from omnigent.harnesses.native.session_todos import validate_session_todos
+from omnigent.harnesses.wrapper_labels import UI_MODE_LABEL_KEY, WRAPPER_LABEL_KEY
 from omnigent.session_import.models import IMPORT_SOURCE_LABEL_KEY
 from omnigent.stores.conversation_store import (
     _FORK_ONLY_DROPPED_LABEL_KEYS,
@@ -1919,8 +1920,6 @@ class SqlAlchemyConversationStore(ConversationStore):
         self, conversation_id: str, *, owner_only: bool = False
     ) -> AccountAuthority | None:
         """Read the owner grant and registration together, including external identities."""
-        from omnigent.server.auth import LEVEL_OWNER, RESERVED_USER_PUBLIC
-
         query = (
             select(SqlSessionPermission.user_id, SqlUser.account_generation)
             .outerjoin(
@@ -2540,8 +2539,6 @@ class SqlAlchemyConversationStore(ConversationStore):
             surfacing as one of their own folders.
         :returns: List of project names ordered ascending.
         """
-        from omnigent.server.auth import LEVEL_OWNER
-
         # ACL strategy mirrors list_conversations: single-DB pushes the
         # permission check into the labels query as correlated EXISTS (no
         # id materialization); split-DB keeps the prefetch fallback since a
@@ -2742,8 +2739,6 @@ class SqlAlchemyConversationStore(ConversationStore):
         :returns: A :class:`PagedList` of :class:`Conversation`
             objects.
         """
-        from omnigent.server.auth import LEVEL_OWNER
-
         sort_col = self._resolve_sort_column(sort_by)
         is_desc = order == "desc"
         sort_fn = desc if is_desc else asc

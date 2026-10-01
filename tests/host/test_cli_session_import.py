@@ -11,14 +11,14 @@ import httpx
 import respx
 from click.testing import CliRunner
 
-from omnigent.cli import _import_item_payload, cli
+from omnigent.cli.commands import _import_item_payload, cli
 
 _BASE = "http://localhost:6767"
 
 
 def _patch_server(base_url: str = _BASE) -> Any:
     """Patch the CLI so it uses *base_url* without spawning a real server."""
-    return patch("omnigent.cli._resolve_attach_server", return_value=base_url)
+    return patch("omnigent.cli.commands._resolve_attach_server", return_value=base_url)
 
 
 def _write_export(path: Path, *, meta: dict[str, Any], items: list[dict[str, Any]]) -> None:
@@ -160,7 +160,7 @@ def test_session_import_creates_session(tmp_path: Path) -> None:
 def test_session_import_falls_back_to_native_agent(tmp_path: Path) -> None:
     """When the exported agent_id 404s, import retries with the native agent."""
     from omnigent.db.utils import builtin_agent_id
-    from omnigent.native.native_coding_agents import native_coding_agent_for_harness
+    from omnigent.harnesses.native.coding_agents import native_coding_agent_for_harness
 
     native = native_coding_agent_for_harness("claude-native")
     assert native is not None

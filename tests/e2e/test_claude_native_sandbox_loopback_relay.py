@@ -281,7 +281,7 @@ def _start_server(tmp_path: Path) -> tuple[subprocess.Popen[bytes], str]:
         [
             sys.executable,
             "-c",
-            "from omnigent.cli import main; main()",
+            "from omnigent.cli.commands import main; main()",
             "server",
             "--host",
             "127.0.0.1",

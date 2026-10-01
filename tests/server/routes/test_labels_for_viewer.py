@@ -11,7 +11,7 @@ after per-repo storage would see no repo and clone an empty sandbox.
 from __future__ import annotations
 
 from omnigent.server.managed_hosts import MANAGED_REPO_LABEL_KEY
-from omnigent.server.routes._sessions.orchestration import _labels_for_viewer
+from omnigent.server.routes.sessions.orchestration import _labels_for_viewer
 from omnigent.stores.conversation_store import pinned_label_key
 
 

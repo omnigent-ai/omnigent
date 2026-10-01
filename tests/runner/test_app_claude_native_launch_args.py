@@ -20,11 +20,12 @@ from omnigent.harnesses.claude_native.main import (
     ClaudeNativeUcodeConfig,
     build_native_claude_terminal_env,
 )
-from omnigent.runner.app import _build_claude_native_base_args, _claude_terminal_env_unset
 from omnigent.runner.native.orchestration import (
     _ROUTED_SPAWN_ALLOWED_TOOLS,
+    _build_claude_native_base_args,
     _claude_launch_metadata_from_envelope,
     _claude_launch_permission_mode,
+    _claude_terminal_env_unset,
     _load_claude_launch_metadata,
     _load_legacy_claude_launch_metadata,
     _routed_spawn_launch_args,
@@ -677,7 +678,7 @@ async def test_runner_launch_error_is_logged_before_cancellable_diagnostic_drain
     monkeypatch.setattr(
         "omnigent.harnesses.claude_native.bridge.ensure_claude_workspace_trusted", lambda _: None
     )
-    monkeypatch.setattr("omnigent.inference_config.load_runtime_inference_config", dict)
+    monkeypatch.setattr("omnigent.models.inference_config.load_runtime_inference_config", dict)
     monkeypatch.setattr("omnigent.config.load_effective_config", dict)
     monkeypatch.setattr(orchestration, "resolve_cli_binary", lambda _: None)
     # Keep application traceback renderers out of this synchronization test.

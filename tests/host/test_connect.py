@@ -20,6 +20,7 @@ from websockets.datastructures import Headers
 from websockets.exceptions import ConnectionClosedError, InvalidStatus, InvalidURI
 from websockets.http11 import Response
 
+from omnigent.harnesses.runtime.paths import HARNESS_TMP_PARENT_ENV_VAR
 from omnigent.host import HOST_FATAL_EXIT_CODE
 from omnigent.host.connect import (
     HostConnectError,
@@ -71,7 +72,7 @@ from omnigent.host.frames import (
 from omnigent.host.identity import HostIdentity
 from omnigent.host.maintenance import HostMaintenanceJanitor
 from omnigent.host.runner_zygote import ZygoteUnavailable
-from omnigent.runner.identity import (
+from omnigent.util.runner_identity import (
     RUNNER_CONNECT_MARKER_ENV_VAR,
     RUNNER_DELEGATED_AUTH_ENV_VAR,
     RUNNER_HOST_OWNS_GLOBAL_CLEANUP_ENV_VAR,
@@ -84,7 +85,6 @@ from omnigent.runner.identity import (
     RUNNER_WORKSPACE_ENV_VAR,
     token_bound_runner_id,
 )
-from omnigent.runtime.harnesses.paths import HARNESS_TMP_PARENT_ENV_VAR
 
 pytestmark = pytest.mark.asyncio
 
@@ -3992,8 +3992,8 @@ def test_dispatch_trace_context_reaches_runner_but_not_daemon(
     dispatch and is reused, so a stale caller context stuck to it would
     funnel every later run into the first caller's dead trace.
     """
-    from omnigent.cli import _build_host_daemon_env
-    from omnigent.runtime.telemetry import (
+    from omnigent.cli.commands import _build_host_daemon_env
+    from omnigent.observability.otel import (
         DISPATCH_TRACEPARENT_ENV_VAR,
         DISPATCH_TRACESTATE_ENV_VAR,
     )
@@ -4036,7 +4036,7 @@ def test_build_runner_env_passthrough_survives_remote_daemon_hop(
     the passthrough on the second, so it must reach the runner; an unnamed secret
     must not.
     """
-    from omnigent.cli import _build_host_daemon_env
+    from omnigent.cli.commands import _build_host_daemon_env
 
     monkeypatch.setenv("PATH", "/usr/bin")
     monkeypatch.setenv("OMNIGENT_RUNNER_ENV_PASSTHROUGH", "DATABRICKS_LINEAR_API_KEY")
@@ -4070,7 +4070,7 @@ async def test_harness_stderr_opt_in_survives_daemon_and_runner_hops(
     setting: str | None,
 ) -> None:
     """Forward an explicit capture setting without enabling capture by default."""
-    from omnigent.cli import _build_host_daemon_env
+    from omnigent.cli.commands import _build_host_daemon_env
 
     flag_name = "OMNIGENT_HARNESS_STDERR_ENABLED"
     sibling_name = "OMNIGENT_HARNESS_STDERR_UNRELATED"
@@ -5117,7 +5117,7 @@ def test_build_connect_headers_adds_org_header(monkeypatch: pytest.MonkeyPatch) 
     monkeypatch.delenv("OMNIGENT_HOST_TOKEN", raising=False)
     monkeypatch.setattr(entry_mod, "_make_auth_token_factory", lambda *, server_url=None: None)
     monkeypatch.setattr(
-        "omnigent.cli_auth.load_databricks_org_id", lambda _url: "2850744067564480"
+        "omnigent.cli.auth.load_databricks_org_id", lambda _url: "2850744067564480"
     )
 
     headers = _host("https://acme.databricks.com/api/2.0/omnigent")._build_connect_headers()
@@ -5192,7 +5192,7 @@ def test_build_runner_env_carries_host_id() -> None:
     ``test_cli_auth.test_databricks_request_headers_slice_key``). With no
     host_id (a CLI-local runner), the env var is omitted.
     """
-    from omnigent.runner.identity import RUNNER_SLICE_KEY_ENV_VAR
+    from omnigent.util.runner_identity import RUNNER_SLICE_KEY_ENV_VAR
 
     def _env(*, server_url: str, host_id: str | None) -> dict[str, str]:
         return _build_runner_env(
@@ -8199,7 +8199,7 @@ def test_fs_search_reuses_the_changed_files_snapshot_across_requests(
     )
     (ws / "zzz").mkdir()
     (ws / "zzz" / "scratch.txt").write_text("untracked")
-    monkeypatch.setattr("omnigent.workspace_fs._SEARCH_SCAN_BUDGET", 10)
+    monkeypatch.setattr("omnigent.host.workspace_fs._SEARCH_SCAN_BUDGET", 10)
     host = _make_host_process()
     try:
         changes = host._handle_fs_request(
@@ -8237,7 +8237,7 @@ def test_fs_reader_picks_up_a_repo_created_after_first_request(
         (many / f"f{i:02d}.txt").write_text("x")
     (ws / "zzz").mkdir()
     (ws / "zzz" / "target.jsonnet").write_text("y")
-    monkeypatch.setattr("omnigent.workspace_fs._SEARCH_SCAN_BUDGET", 10)
+    monkeypatch.setattr("omnigent.host.workspace_fs._SEARCH_SCAN_BUDGET", 10)
     host = _make_host_process()
     try:
         first = host._handle_fs_request(

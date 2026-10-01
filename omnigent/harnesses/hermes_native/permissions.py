@@ -179,7 +179,7 @@ async def supervise_hermes_approval_mirror(
     active: _PendingApproval | None = None
     episode = 0
     timeout = httpx.Timeout(_POST_TIMEOUT_S, connect=10.0)
-    from omnigent.cli_auth import open_server_client
+    from omnigent.cli.auth import open_server_client
 
     async with open_server_client(base_url, headers=headers, auth=auth, timeout=timeout) as client:
         while True:

@@ -54,6 +54,7 @@ from omnigent_client._events import ResponseCompleted, ResponseFailed
 from omnigent_client._files import FilesNamespace
 from omnigent_client._sessions import SessionsNamespace
 
+from omnigent.harnesses.runtime import _HARNESS_MODULES
 from omnigent.repl._repl import _SessionsChatReplAdapter
 from omnigent.runner.app import create_runner_app
 from omnigent.runner.transports.ws_tunnel.frames import (
@@ -73,7 +74,6 @@ from omnigent.runtime import (
     set_runner_router,
 )
 from omnigent.runtime.agent_cache import AgentCache
-from omnigent.runtime.harnesses import _HARNESS_MODULES
 from omnigent.server.app import create_app
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.artifact_store.local import LocalArtifactStore
@@ -850,7 +850,7 @@ async def test_on_runner_connect_restarts_relay_via_router(
     # Zero the reconnect grace: this test needs the deregistered relay to
     # die promptly so the reconnect hook's restart path is what revives it.
     monkeypatch.setattr(
-        "omnigent.server.routes._sessions.orchestration.RUNNER_DISCONNECT_GRACE_S",
+        "omnigent.server.routes.sessions.orchestration.RUNNER_DISCONNECT_GRACE_S",
         0.0,
     )
     ap_client = tunnel_three_layer_stack.ap_client
@@ -1314,7 +1314,7 @@ async def test_on_runner_connect_clears_stale_sandbox_failure(
     banner must clear -- the sandbox is operational.
     """
     from omnigent.server.routes import sessions as sessions_module
-    from omnigent.server.routes._sessions.common import _session_sandbox_status_cache
+    from omnigent.server.routes.sessions.common import _session_sandbox_status_cache
     from omnigent.server.schemas import SandboxStatus
 
     ap_client = tunnel_three_layer_stack.ap_client
@@ -1355,7 +1355,7 @@ async def test_on_runner_connect_keeps_in_flight_sandbox_launch(
     runner's reconnect says nothing about it and must leave it alone.
     """
     from omnigent.server.routes import sessions as sessions_module
-    from omnigent.server.routes._sessions.common import _session_sandbox_status_cache
+    from omnigent.server.routes.sessions.common import _session_sandbox_status_cache
     from omnigent.server.schemas import SandboxStatus
 
     ap_client = tunnel_three_layer_stack.ap_client
@@ -1385,7 +1385,7 @@ async def test_on_runner_connect_no_op_when_no_sandbox_failure(
 ) -> None:
     """Reconnect does not inject a sandbox-ready event for non-sandbox sessions."""
     from omnigent.server.routes import sessions as sessions_module
-    from omnigent.server.routes._sessions.common import _session_sandbox_status_cache
+    from omnigent.server.routes.sessions.common import _session_sandbox_status_cache
 
     ap_client = tunnel_three_layer_stack.ap_client
     ap_app = tunnel_three_layer_stack.ap_app

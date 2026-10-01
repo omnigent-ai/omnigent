@@ -22,11 +22,11 @@ from omnigent.harnesses.claude_native.bridge import (
     bridge_dir_for_conversation_id,
     write_tmux_target,
 )
-from omnigent.inner.terminal import TerminalInstance
 from omnigent.runner import app as runner_app_module
 from omnigent.runner import create_runner_app
 from omnigent.spec.types import AgentSpec, ExecutorSpec
 from omnigent.terminals import TerminalRegistry
+from omnigent.terminals.terminal import TerminalInstance
 from tests.runner.conftest import (
     _FakeProcessManager,
     _runner_client,
@@ -115,10 +115,6 @@ async def _open_claude_native_session(
         "omnigent.runner.native.orchestration._auto_create_claude_terminal",
         _stub_auto_create,
     )
-    monkeypatch.setattr(
-        "omnigent.runner.native._auto_create_claude_terminal",
-        _stub_auto_create,
-    )
 
     async def _stub_launch_claude(ctx: Any) -> SessionResourceView:
         return await _stub_auto_create(ctx.session_id, ctx.resource_registry, ctx.publish_event)
@@ -127,7 +123,6 @@ async def _open_claude_native_session(
         "omnigent.runner.native.orchestration._launch_claude",
         _stub_launch_claude,
     )
-    monkeypatch.setattr("omnigent.runner.native._launch_claude", _stub_launch_claude)
     # No ``raising=False``: a renamed constant must fail the test loudly rather
     # than silently leave the real 30s budget in place.
     monkeypatch.setattr(runner_app_module, "_CLAUDE_PANE_READY_TIMEOUT_S", 0.2)
@@ -270,10 +265,6 @@ async def test_model_change_heals_before_read_model_env(
         "omnigent.runner.native.orchestration._auto_create_claude_terminal",
         _tracking_auto_create,
     )
-    monkeypatch.setattr(
-        "omnigent.runner.native._auto_create_claude_terminal",
-        _tracking_auto_create,
-    )
 
     async def _tracking_launch(ctx: Any) -> SessionResourceView:
         return await _tracking_auto_create(
@@ -284,7 +275,6 @@ async def test_model_change_heals_before_read_model_env(
         "omnigent.runner.native.orchestration._launch_claude",
         _tracking_launch,
     )
-    monkeypatch.setattr("omnigent.runner.native._launch_claude", _tracking_launch)
     monkeypatch.setattr(
         claude_native_bridge,
         "read_model_env",
@@ -588,16 +578,14 @@ async def test_recreated_pane_is_waited_for_before_injection(
     async def _recreating_launch(ctx: Any) -> SessionResourceView:
         return await _recreating_auto_create(ctx.session_id, None, None)
 
-    for target in (
+    monkeypatch.setattr(
         "omnigent.runner.native.orchestration._auto_create_claude_terminal",
-        "omnigent.runner.native._auto_create_claude_terminal",
-    ):
-        monkeypatch.setattr(target, _recreating_auto_create)
-    for target in (
+        _recreating_auto_create,
+    )
+    monkeypatch.setattr(
         "omnigent.runner.native.orchestration._launch_claude",
-        "omnigent.runner.native._launch_claude",
-    ):
-        monkeypatch.setattr(target, _recreating_launch)
+        _recreating_launch,
+    )
 
     captured: list[str] = []
     # Not ready for the first two polls, as a booting TUI would be.

@@ -12,7 +12,7 @@ Application Default Credentials selectors. A user who runs
 
 -- and then starts Omnigent in the background finds every one of them missing
 from the detached daemon, and therefore missing from every runner the daemon
-spawns. ``_build_host_daemon_env`` (omnigent/cli.py) filters ``os.environ``
+spawns. ``_build_host_daemon_env`` (omnigent/cli/commands.py) filters ``os.environ``
 through ``_RUNNER_ENV_ALLOWLIST`` + ``_LOCAL_DAEMON_ENV_ALLOWLIST`` + their
 prefix sets, none of which named the ADC selectors or the gcloud config
 selectors before the fix (the fix adds exact names only -- deliberately not a
@@ -57,7 +57,7 @@ from pathlib import Path
 import httpx
 import pytest
 
-from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN, RUNNER_PARENT_PID_ENV_VAR
+from omnigent.util.runner_identity import OMNIGENT_INTERNAL_WS_ORIGIN, RUNNER_PARENT_PID_ENV_VAR
 from tests.e2e.conftest import lookup_agent_id, register_inline_agent
 from tests.e2e.omnigent.test_host_ctrl_c_stop_server import (
     _connect_env,

@@ -34,8 +34,8 @@ from rich.console import Console
 # time *while* Popen is patched would evaluate ``subprocess.Popen[...]``
 # generic aliases in the import chain against the stub (not subscriptable).
 import omnigent.host.connect
-from omnigent import cli
-from omnigent.cli import (
+from omnigent.cli import commands as cli
+from omnigent.cli.commands import (
     _build_host_daemon_env,
     _discover_local_server_url,
     _ensure_backend,
@@ -43,7 +43,7 @@ from omnigent.cli import (
     _resolve_attach_server,
     _resolve_host_server,
 )
-from omnigent.cli import (
+from omnigent.cli.commands import (
     cli as cli_group,
 )
 from omnigent.host.local_server import LocalServerStartup
@@ -985,7 +985,7 @@ def test_registration_timeout_names_unreachable_server_and_skips_stale_host_hint
     The stale-host recovery hint targets HTTP 401 tunnel rejections; a
     connection-refused failure cannot be one, so the hint is suppressed.
     """
-    from omnigent.cli_diagnostics import suppresses_recovery_hint
+    from omnigent.cli.diagnostics import suppresses_recovery_hint
 
     _patch_registration_wait(
         monkeypatch,
@@ -1060,7 +1060,7 @@ def test_registration_timeout_keeps_hint_when_server_answered_then_dropped(
     the generic registration timeout — with its recovery hint — applies,
     not the unreachable-server wording.
     """
-    from omnigent.cli_diagnostics import suppresses_recovery_hint
+    from omnigent.cli.diagnostics import suppresses_recovery_hint
 
     responses = iter([cli._HostHttpResult(status_code=200, body={"status": "offline"})])
     refused = cli._HostHttpResult(
@@ -1091,7 +1091,7 @@ def test_registration_timeout_keeps_stale_host_hint_when_server_answers(
     tunnel), so the generic timeout still names the server but the
     recovery hint stays.
     """
-    from omnigent.cli_diagnostics import suppresses_recovery_hint
+    from omnigent.cli.diagnostics import suppresses_recovery_hint
 
     _patch_registration_wait(
         monkeypatch, cli._HostHttpResult(status_code=200, body={"status": "offline"})
@@ -2712,9 +2712,9 @@ def test_claude_command_routes_server_through_ensure_backend(
     The empty/local value must be turned into the concrete daemon-backed URL
     and passed to ``run_claude_native`` — never forwarded raw.
     """
-    monkeypatch.setattr("omnigent.cli._load_effective_config", dict)
+    monkeypatch.setattr("omnigent.cli.commands._load_effective_config", dict)
     monkeypatch.setattr(
-        "omnigent.cli._ensure_backend",
+        "omnigent.cli.commands._ensure_backend",
         lambda server: "http://127.0.0.1:8123",
     )
     captured: dict[str, object] = {}
@@ -2740,7 +2740,7 @@ def _capture_run_chat(monkeypatch: pytest.MonkeyPatch) -> dict[str, object]:
     def _stub(**kwargs: object) -> None:
         captured.update(kwargs)
 
-    monkeypatch.setattr("omnigent.chat.run_chat", _stub)
+    monkeypatch.setattr("omnigent.cli.chat.run_chat", _stub)
     return captured
 
 
@@ -2753,7 +2753,7 @@ def test_run_reads_server_from_config(monkeypatch: pytest.MonkeyPatch) -> None:
     reach ``run_chat`` as ``server_url``.
     """
     monkeypatch.setattr(
-        "omnigent.cli._load_effective_config",
+        "omnigent.cli.commands._load_effective_config",
         lambda: {
             "server": "https://config-default.example.com",
             "model": "databricks-claude-sonnet-4-6",
@@ -2771,7 +2771,7 @@ def test_run_reads_server_from_config(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_run_explicit_server_overrides_config(monkeypatch: pytest.MonkeyPatch) -> None:
     """An explicit ``--server`` wins over the configured default."""
     monkeypatch.setattr(
-        "omnigent.cli._load_effective_config",
+        "omnigent.cli.commands._load_effective_config",
         lambda: {"server": "https://config-default.example.com"},
     )
     captured = _capture_run_chat(monkeypatch)
@@ -2832,7 +2832,7 @@ def _patch_auth_preflight(
     import httpx
 
     monkeypatch.setattr(
-        "omnigent.chat._remote_headers",
+        "omnigent.cli.chat._remote_headers",
         lambda server_url=None, *, host_id=None: {},
     )
     monkeypatch.setattr(httpx, "get", lambda url, **kw: _databricks_probe_response(probe_status))
@@ -2906,7 +2906,7 @@ def test_databricks_preflight_silent_sdk_refresh_skips_login(
     requests: list[dict[str, object]] = []
     stored: list[tuple[str, str, str | None]] = []
     monkeypatch.setattr(
-        "omnigent.chat._remote_headers",
+        "omnigent.cli.chat._remote_headers",
         lambda server_url=None, *, host_id=None: {"Authorization": "Bearer expired"},
     )
 
@@ -2921,7 +2921,7 @@ def test_databricks_preflight_silent_sdk_refresh_skips_login(
         lambda workspace: cli._DatabricksWorkspaceAuthInfo(token="fresh-token", profile_name=None),
     )
     monkeypatch.setattr(cli, "_databricks_login", lambda *args, **kwargs: pytest.fail("login"))
-    monkeypatch.setattr("omnigent.cli_auth.load_databricks_org_id", lambda server: "123")
+    monkeypatch.setattr("omnigent.cli.auth.load_databricks_org_id", lambda server: "123")
 
     def _store(
         server: str,
@@ -2931,7 +2931,7 @@ def test_databricks_preflight_silent_sdk_refresh_skips_login(
     ) -> None:
         stored.append((server, workspace, org_id))
 
-    monkeypatch.setattr("omnigent.cli_auth.store_databricks_auth", _store)
+    monkeypatch.setattr("omnigent.cli.auth.store_databricks_auth", _store)
 
     cli._ensure_databricks_server_auth(_HOST_DATABRICKS_SERVER, non_interactive=True)
 
@@ -2964,10 +2964,10 @@ def test_databricks_preflight_uses_cli_workspace_id_for_workspace_mount(
     monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(cfg_path))
 
     monkeypatch.setattr(
-        "omnigent.chat._remote_headers",
+        "omnigent.cli.chat._remote_headers",
         lambda server_url=None, *, host_id=None: {},
     )
-    monkeypatch.setattr("omnigent.cli_auth.load_databricks_org_id", lambda server: None)
+    monkeypatch.setattr("omnigent.cli.auth.load_databricks_org_id", lambda server: None)
     monkeypatch.setattr(
         cli,
         "_databricks_workspace_auth_info",
@@ -3000,7 +3000,7 @@ def test_databricks_preflight_uses_cli_workspace_id_for_workspace_mount(
         stored.append((server, workspace, org_id))
 
     monkeypatch.setattr(httpx, "get", _get)
-    monkeypatch.setattr("omnigent.cli_auth.store_databricks_auth", _store)
+    monkeypatch.setattr("omnigent.cli.auth.store_databricks_auth", _store)
 
     cli._ensure_databricks_server_auth(server, non_interactive=True)
 
@@ -3021,7 +3021,7 @@ def test_databricks_preflight_refresh_handles_duplicate_workspace_profiles(
     """
     import httpx
 
-    from omnigent.inner import databricks_executor
+    from omnigent.harnesses.databricks import executor as databricks_executor
 
     cfg_path = tmp_path / "databrickscfg"
     cfg_path.write_text(
@@ -3034,10 +3034,10 @@ def test_databricks_preflight_refresh_handles_duplicate_workspace_profiles(
     )
     monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(cfg_path))
     monkeypatch.setattr(
-        "omnigent.chat._remote_headers",
+        "omnigent.cli.chat._remote_headers",
         lambda server_url=None, *, host_id=None: {"Authorization": "Bearer expired-token"},
     )
-    monkeypatch.setattr("omnigent.cli_auth.load_databricks_org_id", lambda server: None)
+    monkeypatch.setattr("omnigent.cli.auth.load_databricks_org_id", lambda server: None)
 
     attempts: list[tuple[str, object]] = []
 
@@ -3088,7 +3088,7 @@ def test_databricks_preflight_refresh_handles_duplicate_workspace_profiles(
     monkeypatch.setattr(databricks_executor.subprocess, "run", _run_databricks)
     monkeypatch.setattr(httpx, "get", _get)
     monkeypatch.setattr(cli, "_databricks_login", lambda *args, **kwargs: pytest.fail("login"))
-    monkeypatch.setattr("omnigent.cli_auth.store_databricks_auth", _store)
+    monkeypatch.setattr("omnigent.cli.auth.store_databricks_auth", _store)
 
     cli._ensure_databricks_server_auth(_HOST_DATABRICKS_SERVER, non_interactive=True)
 
@@ -3201,14 +3201,14 @@ def _patch_rejected_credential_preflight(
         )
 
     monkeypatch.setattr(
-        "omnigent.chat._remote_headers",
+        "omnigent.cli.chat._remote_headers",
         lambda server_url=None, *, host_id=None: {"Authorization": "Bearer stale"},
     )
     monkeypatch.setattr(httpx, "get", _get)
     monkeypatch.setattr(
-        "omnigent.cli_auth.load_databricks_workspace_host", lambda server: pointer_workspace
+        "omnigent.cli.auth.load_databricks_workspace_host", lambda server: pointer_workspace
     )
-    monkeypatch.setattr("omnigent.cli_auth.load_databricks_org_id", lambda server: None)
+    monkeypatch.setattr("omnigent.cli.auth.load_databricks_org_id", lambda server: None)
     monkeypatch.setattr(cli, "_databricks_workspace_auth_info", lambda workspace: None)
     monkeypatch.setattr(
         cli, "_databricks_login", lambda *args, **kwargs: pytest.fail("browser login ran")
@@ -3309,15 +3309,15 @@ def test_databricks_preflight_rejected_credential_recovers_via_sdk_refresh(
         )
 
     monkeypatch.setattr(
-        "omnigent.chat._remote_headers",
+        "omnigent.cli.chat._remote_headers",
         lambda server_url=None, *, host_id=None: {"Authorization": "Bearer stale"},
     )
     monkeypatch.setattr(httpx, "get", _get)
     monkeypatch.setattr(
-        "omnigent.cli_auth.load_databricks_workspace_host",
+        "omnigent.cli.auth.load_databricks_workspace_host",
         lambda server: "https://example.databricks.com",
     )
-    monkeypatch.setattr("omnigent.cli_auth.load_databricks_org_id", lambda server: None)
+    monkeypatch.setattr("omnigent.cli.auth.load_databricks_org_id", lambda server: None)
     monkeypatch.setattr(
         cli,
         "_databricks_workspace_auth_info",
@@ -3327,7 +3327,7 @@ def test_databricks_preflight_rejected_credential_recovers_via_sdk_refresh(
         cli, "_databricks_login", lambda *args, **kwargs: pytest.fail("browser login ran")
     )
     monkeypatch.setattr(
-        "omnigent.cli_auth.store_databricks_auth",
+        "omnigent.cli.auth.store_databricks_auth",
         lambda server, workspace, user_id=None, org_id=None: stored.append((server, workspace)),
     )
 
@@ -3713,7 +3713,7 @@ def test_resume_command_expands_server_url(monkeypatch: pytest.MonkeyPatch) -> N
     monkeypatch.setattr(cli, "_workspace_api_server_url", _expand_marker)
     captured: dict[str, object] = {}
     monkeypatch.setattr(
-        "omnigent.resume_dispatch.run_resume",
+        "omnigent.cli.resume.run_resume",
         lambda **kwargs: captured.update(kwargs),
     )
 
@@ -3737,7 +3737,7 @@ def test_resume_command_without_server_skips_expansion(
     )
     captured: dict[str, object] = {}
     monkeypatch.setattr(
-        "omnigent.resume_dispatch.run_resume",
+        "omnigent.cli.resume.run_resume",
         lambda **kwargs: captured.update(kwargs),
     )
 
@@ -3753,7 +3753,7 @@ def test_resume_command_defaults_scheme_https(monkeypatch: pytest.MonkeyPatch) -
     monkeypatch.setattr(cli, "_workspace_api_server_url", _recording_expander(seen))
     captured: dict[str, object] = {}
     monkeypatch.setattr(
-        "omnigent.resume_dispatch.run_resume",
+        "omnigent.cli.resume.run_resume",
         lambda **kwargs: captured.update(kwargs),
     )
 

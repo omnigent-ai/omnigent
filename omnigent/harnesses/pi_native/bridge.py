@@ -15,11 +15,11 @@ from importlib.resources import files
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from omnigent.native import native_bridge_common
+from omnigent.harnesses.native import bridge_common as native_bridge_common
 from omnigent.util.json_types import JsonObject as _JsonObject
 
 if TYPE_CHECKING:
-    from omnigent.inner.terminal import TerminalInstance
+    from omnigent.terminals.terminal import TerminalInstance
 
 # Per-process tiebreaker for inbox ordering. The extension delivers inbox
 # files in lexicographic filename order, so a high-resolution timestamp alone

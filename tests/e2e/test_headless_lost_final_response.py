@@ -129,7 +129,7 @@ def test_headless_prompt_reconciles_saved_final_response_after_missed_completion
     from omnigent_client import OmnigentClient, QueryResult
     from omnigent_client._sessions_chat import SessionsChat
 
-    from omnigent.chat import _persisted_turn_text, _query_sessions_once
+    from omnigent.cli.chat import _persisted_turn_text, _query_sessions_once
 
     assert mock_llm_server_url is not None, "reproduction requires the mock LLM server"
 

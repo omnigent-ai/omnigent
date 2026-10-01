@@ -4021,7 +4021,7 @@ async def test_codex_hook_gap_verdict_returned_on_repost(
     later — the click dropped, the codex sub-agent still blocked.
     """
     from omnigent.runtime import pending_elicitations
-    from omnigent.server.routes._sessions import orchestration
+    from omnigent.server.routes.sessions import orchestration
 
     grace_started = asyncio.Event()
     release_grace = asyncio.Event()

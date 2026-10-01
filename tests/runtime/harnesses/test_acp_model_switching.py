@@ -11,8 +11,8 @@ from pathlib import Path
 import pytest
 import yaml
 
+from omnigent.harnesses.runtime.process_manager import HarnessProcessManager
 from omnigent.runner.app import _build_spawn_env_from_spec
-from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
 from omnigent.spec.types import AgentSpec, ExecutorSpec, ProviderAuth
 
 _FAKE_ACP_AGENT = r"""

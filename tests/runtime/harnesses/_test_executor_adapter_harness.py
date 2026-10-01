@@ -29,7 +29,7 @@ from collections.abc import AsyncIterator, Callable
 
 from fastapi import FastAPI
 
-from omnigent.inner.executor import (
+from omnigent.core.executor import (
     Executor,
     ExecutorConfig,
     ExecutorError,
@@ -43,8 +43,8 @@ from omnigent.inner.executor import (
     TurnCancelled,
     TurnComplete,
 )
-from omnigent.inner.model_auth import ProviderAuthRequired
-from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+from omnigent.harnesses.runtime._executor_adapter import ExecutorAdapter
+from omnigent.models.signer.auth import ProviderAuthRequired
 
 _SCRIPT_ENV_VAR = "MOCK_EXECUTOR_SCRIPT"
 _CAPTURE_PATH_ENV_VAR = "MOCK_EXECUTOR_CAPTURE_PATH"

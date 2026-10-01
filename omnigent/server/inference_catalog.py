@@ -11,8 +11,9 @@ from urllib.parse import urlsplit
 import httpx
 
 from omnigent.errors import ErrorCode, OmnigentError
-from omnigent.harness_aliases import canonicalize_harness
-from omnigent.inference_config import (
+from omnigent.harnesses.aliases import canonicalize_harness
+from omnigent.models import model_catalog
+from omnigent.models.inference_config import (
     HarnessInferenceBinding,
     binding_for_harness,
     inference_revision,
@@ -21,7 +22,6 @@ from omnigent.inference_config import (
     resolve_bound_provider,
     validate_inference_credentials,
 )
-from omnigent.models import model_catalog
 from omnigent.models.model_catalog import ModelEntry, ResolvedModelProvider
 from omnigent.models.model_metadata import ModelCapability, ModelWireAPI
 from omnigent.onboarding.provider_config import ProviderEntry, load_providers, resolve_secret

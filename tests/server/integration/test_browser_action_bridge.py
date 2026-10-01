@@ -534,7 +534,7 @@ async def test_browser_screenshot_reaches_adapters_and_replay_as_image(
 
     envelope = json.loads(output)
     if adapter == "codex":
-        from omnigent.inner.codex_executor import _dynamic_tool_result_payload
+        from omnigent.harnesses.codex.executor import _dynamic_tool_result_payload
 
         native = _dynamic_tool_result_payload(envelope)
         assert native["success"] is True
@@ -551,7 +551,7 @@ async def test_browser_screenshot_reaches_adapters_and_replay_as_image(
             from claude_agent_sdk import create_sdk_mcp_server
             from mcp.types import CallToolRequest, CallToolRequestParams
 
-            from omnigent.inner.claude_sdk_executor import _build_mcp_tools
+            from omnigent.harnesses.claude_sdk.executor import _build_mcp_tools
 
             async def execute(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
                 assert name == "browser_screenshot"

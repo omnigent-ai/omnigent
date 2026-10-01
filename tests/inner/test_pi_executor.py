@@ -17,8 +17,7 @@ from urllib.parse import urlparse
 
 import pytest
 
-from omnigent.inner.databricks_executor import DatabricksCredentials
-from omnigent.inner.executor import (
+from omnigent.core.executor import (
     ExecutorConfig,
     ExecutorError,
     ReasoningChunk,
@@ -28,7 +27,8 @@ from omnigent.inner.executor import (
     ToolCallStatus,
     TurnComplete,
 )
-from omnigent.inner.pi_executor import (
+from omnigent.harnesses.databricks.executor import DatabricksCredentials
+from omnigent.harnesses.pi.executor import (
     PiExecutor,
     PiSubprocessConfig,
     _build_models_json,
@@ -43,9 +43,9 @@ from omnigent.inner.pi_executor import (
     _split_pi_prompt,
     _ToolServer,
 )
+from omnigent.harnesses.runtime._scaffold import PolicyVerdictPayload
 from omnigent.models.model_catalog import ModelEntry
 from omnigent.models.model_metadata import ModelMetadata, ModelWireAPI
-from omnigent.runtime.harnesses._scaffold import PolicyVerdictPayload
 
 
 def _cancel_all_tasks(loop):
@@ -831,8 +831,8 @@ def test_ensure_rpc_launch_selector_matches_registration(base_urls, model, expec
             assert model not in [e.get("id") for e in provider["models"]], name
 
     with (
-        patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"),
-        patch("omnigent.inner.pi_executor._fetch_shell_command_token", return_value="tok"),
+        patch("omnigent.harnesses.pi.executor._find_pi_cli", return_value="/usr/bin/pi"),
+        patch("omnigent.harnesses.pi.executor._fetch_shell_command_token", return_value="tok"),
     ):
         executor = PiExecutor(
             gateway=True,
@@ -1648,20 +1648,20 @@ class TestPiRpcSession(unittest.TestCase):
 
 class TestPiExecutorConstructor(unittest.TestCase):
     def test_constructor_finds_pi(self):
-        with patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"):
+        with patch("omnigent.harnesses.pi.executor._find_pi_cli", return_value="/usr/bin/pi"):
             executor = PiExecutor()
         self.assertEqual(executor._pi_path, "/usr/bin/pi")
 
     def test_constructor_raises_when_pi_not_found(self):
-        with patch("omnigent.inner.pi_executor._find_pi_cli", return_value=None):
+        with patch("omnigent.harnesses.pi.executor._find_pi_cli", return_value=None):
             with self.assertRaises(ImportError):
                 PiExecutor()
 
     def test_constructor_databricks_with_env(self):
         with (
-            patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"),
+            patch("omnigent.harnesses.pi.executor._find_pi_cli", return_value="/usr/bin/pi"),
             patch(
-                "omnigent.inner.pi_executor._read_databrickscfg",
+                "omnigent.harnesses.pi.executor._read_databrickscfg",
                 return_value=DatabricksCredentials(host="https://h.example.com", token="tok"),
             ),
         ):
@@ -1672,8 +1672,8 @@ class TestPiExecutorConstructor(unittest.TestCase):
 
     def test_constructor_databricks_with_host_override_requires_auth_command(self):
         with (
-            patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"),
-            patch("omnigent.inner.pi_executor._read_databrickscfg") as read_cfg,
+            patch("omnigent.harnesses.pi.executor._find_pi_cli", return_value="/usr/bin/pi"),
+            patch("omnigent.harnesses.pi.executor._read_databrickscfg") as read_cfg,
         ):
             with self.assertRaisesRegex(OSError, "requires a gateway auth command"):
                 PiExecutor(
@@ -1686,10 +1686,10 @@ class TestPiExecutorConstructor(unittest.TestCase):
 
     def test_constructor_databricks_with_auth_command(self):
         with (
-            patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"),
-            patch("omnigent.inner.pi_executor._read_databrickscfg") as read_cfg,
+            patch("omnigent.harnesses.pi.executor._find_pi_cli", return_value="/usr/bin/pi"),
+            patch("omnigent.harnesses.pi.executor._read_databrickscfg") as read_cfg,
             patch(
-                "omnigent.inner.pi_executor._fetch_shell_command_token",
+                "omnigent.harnesses.pi.executor._fetch_shell_command_token",
                 return_value="command-token",
             ) as fetch_command_token,
         ):
@@ -1714,40 +1714,40 @@ class TestPiExecutorConstructor(unittest.TestCase):
 
     def test_constructor_databricks_no_creds_raises(self):
         with (
-            patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"),
+            patch("omnigent.harnesses.pi.executor._find_pi_cli", return_value="/usr/bin/pi"),
             patch.dict("os.environ", {}, clear=True),
-            patch("omnigent.inner.pi_executor._read_databrickscfg", return_value=None),
+            patch("omnigent.harnesses.pi.executor._read_databrickscfg", return_value=None),
         ):
             with self.assertRaises(EnvironmentError):
                 PiExecutor(gateway=True)
 
     def test_constructor_with_model_override(self):
-        with patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"):
+        with patch("omnigent.harnesses.pi.executor._find_pi_cli", return_value="/usr/bin/pi"):
             executor = PiExecutor(model="my-model")
         self.assertEqual(executor._model_override, "my-model")
 
     def test_supports_streaming(self):
-        with patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"):
+        with patch("omnigent.harnesses.pi.executor._find_pi_cli", return_value="/usr/bin/pi"):
             executor = PiExecutor()
         self.assertTrue(executor.supports_streaming())
 
     def test_supports_tool_calling(self):
-        with patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"):
+        with patch("omnigent.harnesses.pi.executor._find_pi_cli", return_value="/usr/bin/pi"):
             executor = PiExecutor()
         self.assertTrue(executor.supports_tool_calling())
 
     def test_handles_tools_internally(self):
-        with patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"):
+        with patch("omnigent.harnesses.pi.executor._find_pi_cli", return_value="/usr/bin/pi"):
             executor = PiExecutor()
         self.assertTrue(executor.handles_tools_internally())
 
     def test_supports_live_message_queue(self):
-        with patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"):
+        with patch("omnigent.harnesses.pi.executor._find_pi_cli", return_value="/usr/bin/pi"):
             executor = PiExecutor()
         self.assertTrue(executor.supports_live_message_queue())
 
     def test_no_tools_flag_in_extra_args(self):
-        with patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"):
+        with patch("omnigent.harnesses.pi.executor._find_pi_cli", return_value="/usr/bin/pi"):
             executor = PiExecutor()
         self.assertIn("--no-tools", executor._extra_args)
 
@@ -1769,7 +1769,7 @@ class TestGateNativeTool(unittest.TestCase):
 
     @staticmethod
     def _executor():
-        with patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"):
+        with patch("omnigent.harnesses.pi.executor._find_pi_cli", return_value="/usr/bin/pi"):
             return PiExecutor()
 
     def test_deny_verdict_blocks_with_reason(self):
@@ -1843,7 +1843,7 @@ class TestResolveModel(unittest.TestCase):
         # precedence, mid-session model overrides would silently
         # no-op on the pi harness. Mirrors ``cfg.model`` precedence
         # in claude-sdk / codex / openai-agents.
-        with patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"):
+        with patch("omnigent.harnesses.pi.executor._find_pi_cli", return_value="/usr/bin/pi"):
             executor = PiExecutor(model="constructor-default")
         self.assertEqual(
             _run(executor._resolve_model(ExecutorConfig(model="cfg-override"))),
@@ -1854,7 +1854,7 @@ class TestResolveModel(unittest.TestCase):
         # Constructor value acts as the spec-level default when
         # ``cfg.model`` is None (no per-turn ``/model`` override
         # in effect).
-        with patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"):
+        with patch("omnigent.harnesses.pi.executor._find_pi_cli", return_value="/usr/bin/pi"):
             executor = PiExecutor(model="constructor-default")
         self.assertEqual(
             _run(executor._resolve_model(ExecutorConfig(model=None))),
@@ -1866,7 +1866,7 @@ class TestResolveModel(unittest.TestCase):
         # neither a constructor default nor a per-turn override
         # actively set on the spec, ``cfg.model`` still flows
         # through unchanged.
-        with patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"):
+        with patch("omnigent.harnesses.pi.executor._find_pi_cli", return_value="/usr/bin/pi"):
             executor = PiExecutor()
         self.assertEqual(
             _run(executor._resolve_model(ExecutorConfig(model="config-model"))),
@@ -1882,9 +1882,9 @@ class TestResolveModel(unittest.TestCase):
 class TestBuildEnvAndDir(unittest.TestCase):
     def test_databricks_creates_models_json(self):
         with (
-            patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"),
+            patch("omnigent.harnesses.pi.executor._find_pi_cli", return_value="/usr/bin/pi"),
             patch(
-                "omnigent.inner.pi_executor._read_databrickscfg",
+                "omnigent.harnesses.pi.executor._read_databrickscfg",
                 return_value=DatabricksCredentials(host="https://h.example.com", token="tok"),
             ),
         ):
@@ -1910,7 +1910,7 @@ class TestBuildEnvAndDir(unittest.TestCase):
             shutil.rmtree(config.tmp_dir, ignore_errors=True)
 
     def test_tools_generate_extension_js(self):
-        with patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"):
+        with patch("omnigent.harnesses.pi.executor._find_pi_cli", return_value="/usr/bin/pi"):
             executor = PiExecutor()
 
         tools = [
@@ -1951,13 +1951,13 @@ def test_gateway_seeds_managed_settings_from_global_agent(
     )
     (global_agent / "npm").mkdir()
     monkeypatch.setattr(
-        "omnigent.inner.pi_settings.DEFAULT_PI_AGENT_DIR",
+        "omnigent.harnesses.pi.settings.DEFAULT_PI_AGENT_DIR",
         global_agent,
     )
     with (
-        patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"),
+        patch("omnigent.harnesses.pi.executor._find_pi_cli", return_value="/usr/bin/pi"),
         patch(
-            "omnigent.inner.pi_executor._read_databrickscfg",
+            "omnigent.harnesses.pi.executor._read_databrickscfg",
             return_value=DatabricksCredentials(host="https://h.example.com", token="tok"),
         ),
     ):
@@ -1990,7 +1990,7 @@ def test_pi_extra_args_disable_native_tools_by_default() -> None:
     no-op, but pi parses ``--tools `` as an error in some flag
     parsers, so we just omit it.
     """
-    with patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"):
+    with patch("omnigent.harnesses.pi.executor._find_pi_cli", return_value="/usr/bin/pi"):
         executor = PiExecutor()
     config = executor._build_env_and_dir([], None, None, None)
     try:
@@ -2017,7 +2017,7 @@ def test_pi_tools_arg_allowlists_bridged_tool_names() -> None:
     alone wiped out extension tools and the model reported "I
     don't have a calculate tool available."
     """
-    with patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"):
+    with patch("omnigent.harnesses.pi.executor._find_pi_cli", return_value="/usr/bin/pi"):
         executor = PiExecutor()
     tools = [
         {"name": "calculate", "description": "x", "parameters": {"type": "object"}},
@@ -2056,7 +2056,7 @@ def test_pi_tools_arg_skips_unnamed_entries() -> None:
     can't drift apart and produce a name in one but not the
     other.
     """
-    with patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"):
+    with patch("omnigent.harnesses.pi.executor._find_pi_cli", return_value="/usr/bin/pi"):
         executor = PiExecutor()
     tools = [
         {"name": "good", "description": "x", "parameters": {"type": "object"}},
@@ -2087,7 +2087,7 @@ def test_pi_tools_arg_skips_unnamed_entries() -> None:
 
 class TestRunTurn(unittest.TestCase):
     def _make_executor(self):
-        with patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"):
+        with patch("omnigent.harnesses.pi.executor._find_pi_cli", return_value="/usr/bin/pi"):
             return PiExecutor()
 
     def test_empty_user_message_returns_turn_complete(self):
@@ -2369,7 +2369,7 @@ class TestRunTurn(unittest.TestCase):
 
             try:
                 with patch(
-                    "omnigent.inner.pi_executor._TURN_STDOUT_IDLE_TIMEOUT_S",
+                    "omnigent.harnesses.pi.executor._TURN_STDOUT_IDLE_TIMEOUT_S",
                     0.05,
                 ):
                     events = [
@@ -2732,7 +2732,7 @@ def _executor_with_scripted_rpc(lines: list[str], model: str | None = None) -> P
     :returns: Executor with ``_ensure_rpc`` patched to a fake session
         pre-loaded with ``lines``.
     """
-    with patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"):
+    with patch("omnigent.harnesses.pi.executor._find_pi_cli", return_value="/usr/bin/pi"):
         executor = PiExecutor(model=model)
     fake_rpc = _PiRpcSession()
     fake_rpc._line_queue = asyncio.Queue()
@@ -2751,9 +2751,9 @@ def _executor_with_scripted_rpc(lines: list[str], model: str | None = None) -> P
 @pytest.mark.parametrize("is_error", [False, True])
 async def test_pi_native_tool_results_survive_adapter_and_persistence(is_error: bool) -> None:
     """Native results pair by Pi ID, including overlapping calls of the same tool."""
-    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
-    from omnigent.runtime.harnesses._scaffold import TurnContext
-    from omnigent.server.routes._sessions.helpers import _extract_persistent_item_from_sse
+    from omnigent.harnesses.runtime._executor_adapter import ExecutorAdapter
+    from omnigent.harnesses.runtime._scaffold import TurnContext
+    from omnigent.server.routes.sessions.helpers import _extract_persistent_item_from_sse
 
     starts = [
         {
@@ -2809,9 +2809,9 @@ async def test_pi_native_tool_results_survive_adapter_and_persistence(is_error: 
 @pytest.mark.parametrize("callback_first", [False, True])
 async def test_pi_bridge_correlates_out_of_order_tcp_and_stdout(callback_first: bool) -> None:
     """TCP callbacks keep their own IDs even before stdout or in reverse call order."""
-    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
-    from omnigent.runtime.harnesses._scaffold import TurnContext
-    from omnigent.server.routes._sessions.helpers import _extract_persistent_item_from_sse
+    from omnigent.harnesses.runtime._executor_adapter import ExecutorAdapter
+    from omnigent.harnesses.runtime._scaffold import TurnContext
+    from omnigent.server.routes.sessions.helpers import _extract_persistent_item_from_sse
 
     starts = [
         {
@@ -3111,13 +3111,13 @@ def test_pi_thinking_and_text_delta_ordering_preserved() -> None:
 
 class TestSessionManagement(unittest.TestCase):
     def test_session_key_from_session_id(self):
-        with patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"):
+        with patch("omnigent.harnesses.pi.executor._find_pi_cli", return_value="/usr/bin/pi"):
             executor = PiExecutor()
         key = executor._session_key([{"role": "user", "content": "hi", "session_id": "abc"}])
         self.assertEqual(key, "abc")
 
     def test_session_key_from_metadata(self):
-        with patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"):
+        with patch("omnigent.harnesses.pi.executor._find_pi_cli", return_value="/usr/bin/pi"):
             executor = PiExecutor()
         key = executor._session_key(
             [{"role": "user", "content": "hi", "metadata": {"session_id": "xyz"}}]
@@ -3125,19 +3125,19 @@ class TestSessionManagement(unittest.TestCase):
         self.assertEqual(key, "xyz")
 
     def test_session_key_default(self):
-        with patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"):
+        with patch("omnigent.harnesses.pi.executor._find_pi_cli", return_value="/usr/bin/pi"):
             executor = PiExecutor()
         key = executor._session_key([{"role": "user", "content": "hi"}])
         self.assertEqual(key, "__default__")
 
     def test_close_session(self):
         async def _test():
-            with patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"):
+            with patch("omnigent.harnesses.pi.executor._find_pi_cli", return_value="/usr/bin/pi"):
                 executor = PiExecutor()
 
             mock_rpc = MagicMock()
             mock_rpc.close = AsyncMock()
-            from omnigent.inner.pi_executor import _PiSessionState
+            from omnigent.harnesses.pi.executor import _PiSessionState
 
             executor._session_states["test"] = _PiSessionState(rpc=mock_rpc)
 
@@ -3149,12 +3149,12 @@ class TestSessionManagement(unittest.TestCase):
 
     def test_enqueue_session_message(self):
         async def _test():
-            with patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"):
+            with patch("omnigent.harnesses.pi.executor._find_pi_cli", return_value="/usr/bin/pi"):
                 executor = PiExecutor()
 
             mock_rpc = MagicMock()
             mock_rpc.send_command = AsyncMock()
-            from omnigent.inner.pi_executor import _PiSessionState
+            from omnigent.harnesses.pi.executor import _PiSessionState
 
             executor._session_states["test"] = _PiSessionState(rpc=mock_rpc)
 
@@ -3169,7 +3169,7 @@ class TestSessionManagement(unittest.TestCase):
 
     def test_enqueue_session_message_no_session(self):
         async def _test():
-            with patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"):
+            with patch("omnigent.harnesses.pi.executor._find_pi_cli", return_value="/usr/bin/pi"):
                 executor = PiExecutor()
 
             result = await executor.enqueue_session_message("nonexistent", "STOP")
@@ -3189,13 +3189,13 @@ class TestSessionManagement(unittest.TestCase):
         """
 
         async def _test():
-            with patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"):
+            with patch("omnigent.harnesses.pi.executor._find_pi_cli", return_value="/usr/bin/pi"):
                 executor = PiExecutor()
 
             mock_rpc = MagicMock()
             mock_rpc.send_command = AsyncMock()
             mock_rpc.close = AsyncMock()
-            from omnigent.inner.pi_executor import _PiSessionState
+            from omnigent.harnesses.pi.executor import _PiSessionState
 
             executor._session_states["test"] = _PiSessionState(rpc=mock_rpc)
 
@@ -3221,14 +3221,14 @@ class TestSessionManagement(unittest.TestCase):
 class TestClose(unittest.TestCase):
     def test_close_all_sessions_and_tool_server(self):
         async def _test():
-            with patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"):
+            with patch("omnigent.harnesses.pi.executor._find_pi_cli", return_value="/usr/bin/pi"):
                 executor = PiExecutor()
 
             mock_rpc1 = MagicMock()
             mock_rpc1.close = AsyncMock()
             mock_rpc2 = MagicMock()
             mock_rpc2.close = AsyncMock()
-            from omnigent.inner.pi_executor import _PiSessionState
+            from omnigent.harnesses.pi.executor import _PiSessionState
 
             executor._session_states["s1"] = _PiSessionState(rpc=mock_rpc1)
             executor._session_states["s2"] = _PiSessionState(rpc=mock_rpc2)
@@ -3254,7 +3254,7 @@ class TestBlockedToolDetection(unittest.TestCase):
     """Verify that policy-blocked tool results are detected and mapped to BLOCKED status."""
 
     def _make_executor(self):
-        with patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"):
+        with patch("omnigent.harnesses.pi.executor._find_pi_cli", return_value="/usr/bin/pi"):
             return PiExecutor()
 
     def _run_with_events(self, event_lines):
@@ -3422,7 +3422,7 @@ def test_resolve_pi_skill_args_all(tmp_path: Path) -> None:
     Failing this test means the resolver's ``"all"`` branch dropped
     bundle skills, host skills, or both.
     """
-    from omnigent.inner.pi_executor import _resolve_pi_skill_args
+    from omnigent.harnesses.pi.executor import _resolve_pi_skill_args
 
     bundle = tmp_path / "bundle"
     skills_root = bundle / "skills"
@@ -3453,7 +3453,7 @@ def test_resolve_pi_skill_args_none(tmp_path: Path) -> None:
     ``--no-skills`` per Pi's flag semantics, so the hermetic case
     must be empty everywhere.
     """
-    from omnigent.inner.pi_executor import _resolve_pi_skill_args
+    from omnigent.harnesses.pi.executor import _resolve_pi_skill_args
 
     bundle = tmp_path / "bundle"
     skills_root = bundle / "skills"
@@ -3479,7 +3479,7 @@ def test_resolve_pi_skill_args_named_subset(tmp_path: Path) -> None:
     a ``--skill`` flag pointing at a non-existent path would crash
     Pi at startup.
     """
-    from omnigent.inner.pi_executor import _resolve_pi_skill_args
+    from omnigent.harnesses.pi.executor import _resolve_pi_skill_args
 
     bundle = tmp_path / "bundle"
     skills_root = bundle / "skills"
@@ -3511,7 +3511,7 @@ def test_resolve_pi_skill_args_no_bundle() -> None:
     Catches a regression where the resolver would crash on missing
     bundle — the agent would fail to spawn at all.
     """
-    from omnigent.inner.pi_executor import _resolve_pi_skill_args
+    from omnigent.harnesses.pi.executor import _resolve_pi_skill_args
 
     assert _resolve_pi_skill_args("all", None) == []
     assert _resolve_pi_skill_args("none", None) == ["--no-skills"]
@@ -3543,9 +3543,9 @@ def test_profile_gateway_resolves_databricks_default_model() -> None:
     by ``test_profile_gateway_uses_discovered_model``.
     """
     with (
-        patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"),
+        patch("omnigent.harnesses.pi.executor._find_pi_cli", return_value="/usr/bin/pi"),
         patch(
-            "omnigent.inner.pi_executor._read_databrickscfg",
+            "omnigent.harnesses.pi.executor._read_databrickscfg",
             return_value=DatabricksCredentials(host="https://h.example.com", token="tok"),
         ),
     ):
@@ -3567,9 +3567,9 @@ def test_profile_gateway_uses_discovered_model() -> None:
     bundled ``databricks-*`` catalog default.
     """
     with (
-        patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"),
+        patch("omnigent.harnesses.pi.executor._find_pi_cli", return_value="/usr/bin/pi"),
         patch(
-            "omnigent.inner.pi_executor._read_databrickscfg",
+            "omnigent.harnesses.pi.executor._read_databrickscfg",
             return_value=DatabricksCredentials(host="https://h.example.com", token="tok"),
         ),
     ):
@@ -3592,9 +3592,9 @@ def test_catalog_default_is_registered_in_models_json() -> None:
     """Pi registers a catalog-selected gateway default before launch."""
     catalog_default = "databricks-claude-catalog-default"
     with (
-        patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"),
+        patch("omnigent.harnesses.pi.executor._find_pi_cli", return_value="/usr/bin/pi"),
         patch(
-            "omnigent.inner.pi_executor._read_databrickscfg",
+            "omnigent.harnesses.pi.executor._read_databrickscfg",
             return_value=DatabricksCredentials(host="https://h.example.com", token="tok"),
         ),
         # Live discovery unavailable → the bundled catalog default is used.
@@ -3628,9 +3628,9 @@ def test_profile_gateway_default_does_not_clobber_explicit_model() -> None:
     state pinned deliberately.
     """
     with (
-        patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"),
+        patch("omnigent.harnesses.pi.executor._find_pi_cli", return_value="/usr/bin/pi"),
         patch(
-            "omnigent.inner.pi_executor._read_databrickscfg",
+            "omnigent.harnesses.pi.executor._read_databrickscfg",
             return_value=DatabricksCredentials(host="https://h.example.com", token="tok"),
         ),
     ):
@@ -3649,9 +3649,9 @@ def test_gateway_wire_catalog_fetches_once_and_indexes_aliases() -> None:
         ),
     )
     with (
-        patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"),
+        patch("omnigent.harnesses.pi.executor._find_pi_cli", return_value="/usr/bin/pi"),
         patch(
-            "omnigent.inner.pi_executor._read_databrickscfg",
+            "omnigent.harnesses.pi.executor._read_databrickscfg",
             return_value=DatabricksCredentials(host="https://h.example.com", token="tok"),
         ),
         patch(
@@ -3688,9 +3688,9 @@ def test_gateway_wire_catalog_fetches_once_and_indexes_aliases() -> None:
 def test_gateway_wire_catalog_failure_is_cached() -> None:
     """A catalog outage does not delay every later Pi subprocess startup."""
     with (
-        patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"),
+        patch("omnigent.harnesses.pi.executor._find_pi_cli", return_value="/usr/bin/pi"),
         patch(
-            "omnigent.inner.pi_executor._read_databrickscfg",
+            "omnigent.harnesses.pi.executor._read_databrickscfg",
             return_value=DatabricksCredentials(host="https://h.example.com", token="tok"),
         ),
         patch(
@@ -3715,9 +3715,9 @@ def test_gateway_catalog_keeps_live_models_when_mlflow_enrichment_fails() -> Non
         ),
     )
     with (
-        patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"),
+        patch("omnigent.harnesses.pi.executor._find_pi_cli", return_value="/usr/bin/pi"),
         patch(
-            "omnigent.inner.pi_executor._read_databrickscfg",
+            "omnigent.harnesses.pi.executor._read_databrickscfg",
             return_value=DatabricksCredentials(host="https://h.example.com", token="tok"),
         ),
         patch(
@@ -3739,9 +3739,9 @@ def test_gateway_catalog_keeps_live_models_when_mlflow_enrichment_fails() -> Non
 def test_dedicated_gateway_fetches_wire_catalog_from_workspace_host() -> None:
     """Dedicated gateway hosts resolve their workspace before UC discovery."""
     with (
-        patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"),
+        patch("omnigent.harnesses.pi.executor._find_pi_cli", return_value="/usr/bin/pi"),
         patch(
-            "omnigent.inner.pi_executor._fetch_shell_command_token",
+            "omnigent.harnesses.pi.executor._fetch_shell_command_token",
             return_value="gateway-token",
         ),
         patch(
@@ -3771,9 +3771,9 @@ def test_dedicated_gateway_fetches_wire_catalog_from_workspace_host() -> None:
 def test_generic_anthropic_gateway_skips_databricks_wire_catalog() -> None:
     """A generic provider must not receive Databricks workspace API requests."""
     with (
-        patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"),
+        patch("omnigent.harnesses.pi.executor._find_pi_cli", return_value="/usr/bin/pi"),
         patch(
-            "omnigent.inner.pi_executor._fetch_shell_command_token",
+            "omnigent.harnesses.pi.executor._fetch_shell_command_token",
             return_value="provider-key",
         ),
         patch("omnigent.models.model_catalog.fetch_databricks_model_service_entries") as fetch,
@@ -3800,9 +3800,9 @@ def test_ucode_gateway_host_path_does_not_inject_default_model() -> None:
     producer-side model resolution bugs instead of failing visibly.
     """
     with (
-        patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"),
+        patch("omnigent.harnesses.pi.executor._find_pi_cli", return_value="/usr/bin/pi"),
         patch(
-            "omnigent.inner.pi_executor._fetch_shell_command_token",
+            "omnigent.harnesses.pi.executor._fetch_shell_command_token",
             return_value="command-token",
         ),
     ):
@@ -3820,7 +3820,7 @@ def test_non_gateway_path_does_not_inject_default_model() -> None:
     model stays ``None`` so pi picks its own default — a ``databricks-*``
     id would not resolve outside the gateway's models.json.
     """
-    with patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"):
+    with patch("omnigent.harnesses.pi.executor._find_pi_cli", return_value="/usr/bin/pi"):
         executor = PiExecutor()
     assert _run(executor._resolve_model(ExecutorConfig(model=None))) is None
 
@@ -4036,7 +4036,7 @@ def test_clean_pi_env_excludes_host_secrets(monkeypatch) -> None:
 
     :param monkeypatch: Pytest monkeypatch fixture.
     """
-    from omnigent.inner.pi_executor import _clean_pi_env
+    from omnigent.harnesses.pi.executor import _clean_pi_env
 
     monkeypatch.setenv("DATABRICKS_TOKEN", "dapi-secret")
     monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "aws-secret")
@@ -4069,7 +4069,7 @@ def test_clean_pi_env_extra_allowed_is_exact_opt_in(monkeypatch) -> None:
 
     :param monkeypatch: Pytest monkeypatch fixture.
     """
-    from omnigent.inner.pi_executor import _clean_pi_env
+    from omnigent.harnesses.pi.executor import _clean_pi_env
 
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
     monkeypatch.setenv("DATABRICKS_TOKEN", "dapi-secret")
@@ -4091,7 +4091,7 @@ def test_clean_pi_env_passes_pi_and_proxy_config(monkeypatch) -> None:
 
     :param monkeypatch: Pytest monkeypatch fixture.
     """
-    from omnigent.inner.pi_executor import _clean_pi_env
+    from omnigent.harnesses.pi.executor import _clean_pi_env
 
     monkeypatch.setenv("PI_SKIP_VERSION_CHECK", "1")
     monkeypatch.setenv("HTTPS_PROXY", "http://proxy:8080")
@@ -4113,8 +4113,8 @@ def test_clean_pi_env_includes_omnigent_session_marker(monkeypatch) -> None:
 
     :param monkeypatch: Pytest monkeypatch fixture.
     """
-    from omnigent.inner.pi_executor import _clean_pi_env
-    from omnigent.runner.identity import (
+    from omnigent.harnesses.pi.executor import _clean_pi_env
+    from omnigent.util.runner_identity import (
         OMNIGENT_SESSION_ENV_VALUE,
         OMNIGENT_SESSION_ENV_VAR,
     )
@@ -4137,7 +4137,7 @@ def test_rpc_start_spawns_with_exact_env(monkeypatch) -> None:
 
     :param monkeypatch: Pytest monkeypatch fixture.
     """
-    from omnigent.inner import pi_executor as pi_mod
+    from omnigent.harnesses.pi import executor as pi_mod
 
     monkeypatch.setenv("FAKE_HOST_SECRET", "PWNED")
     captured: dict[str, dict[str, str]] = {}
@@ -4240,7 +4240,7 @@ def test_rpc_start_log_does_not_leak_system_prompt(
     :param monkeypatch: Pytest monkeypatch fixture.
     :param caplog: Pytest log-capture fixture.
     """
-    from omnigent.inner import pi_executor as pi_mod
+    from omnigent.harnesses.pi import executor as pi_mod
 
     test_prompt = "TOP-SECRET-SYSTEM-PROMPT-DO-NOT-LOG-12345"
 
@@ -4261,7 +4261,7 @@ def test_rpc_start_log_does_not_leak_system_prompt(
         )
         await rpc.close()
 
-    with caplog.at_level(logging.DEBUG, logger="omnigent.inner.pi_executor"):
+    with caplog.at_level(logging.DEBUG, logger="omnigent.harnesses.pi.executor"):
         _run(_test())
 
     spawn_logs = [
@@ -4291,7 +4291,7 @@ def test_run_turn_spawn_log_redacts_system_prompt_end_to_end(
     :param monkeypatch: Pytest monkeypatch fixture.
     :param caplog: Pytest log-capture fixture.
     """
-    from omnigent.inner import pi_executor as pi_mod
+    from omnigent.harnesses.pi import executor as pi_mod
 
     test_prompt = "END-TO-END-SYSTEM-PROMPT-LEAK-SENTINEL-67890"
     captured: dict[str, list[str]] = {}
@@ -4328,7 +4328,7 @@ def test_run_turn_spawn_log_redacts_system_prompt_end_to_end(
         finally:
             await executor.close()
 
-    with caplog.at_level(logging.DEBUG, logger="omnigent.inner.pi_executor"):
+    with caplog.at_level(logging.DEBUG, logger="omnigent.harnesses.pi.executor"):
         events = _run(_test())
 
     turn_complete = [e for e in events if isinstance(e, TurnComplete)]
@@ -4384,7 +4384,7 @@ def test_run_turn_spawn_env_has_no_host_secrets(monkeypatch) -> None:
 
     :param monkeypatch: Pytest monkeypatch fixture.
     """
-    from omnigent.inner import pi_executor as pi_mod
+    from omnigent.harnesses.pi import executor as pi_mod
 
     monkeypatch.setenv("FAKE_HOST_SECRET", "PWNED")
     captured: dict[str, dict[str, str]] = {}
@@ -4408,7 +4408,7 @@ def test_run_turn_spawn_env_has_no_host_secrets(monkeypatch) -> None:
     monkeypatch.setattr(pi_mod, "_create_subprocess_exec", _fake_spawn)
 
     async def _test():
-        with patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"):
+        with patch("omnigent.harnesses.pi.executor._find_pi_cli", return_value="/usr/bin/pi"):
             executor = PiExecutor()
         try:
             return [
@@ -4447,8 +4447,8 @@ def test_run_turn_spawn_env_honors_spec_env_passthrough(monkeypatch) -> None:
 
     :param monkeypatch: Pytest monkeypatch fixture.
     """
-    from omnigent.inner import pi_executor as pi_mod
-    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+    from omnigent.core.datamodel import OSEnvSandboxSpec, OSEnvSpec
+    from omnigent.harnesses.pi import executor as pi_mod
 
     monkeypatch.setenv("MY_OPTED_TOKEN", "opted-in-value")
     monkeypatch.setenv("FAKE_HOST_SECRET", "PWNED")
@@ -4467,7 +4467,7 @@ def test_run_turn_spawn_env_honors_spec_env_passthrough(monkeypatch) -> None:
     monkeypatch.setattr(pi_mod, "_create_subprocess_exec", _fake_spawn)
 
     async def _test():
-        with patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"):
+        with patch("omnigent.harnesses.pi.executor._find_pi_cli", return_value="/usr/bin/pi"):
             # ``type="none"`` skips the sandbox wrap so the test stays
             # platform-independent; env scrubbing applies either way.
             executor = PiExecutor(
@@ -4513,9 +4513,9 @@ def test_pi_sandbox_launcher_policy_carries_spawn_env_allowlist(monkeypatch, tmp
     :param tmp_path: Pytest tmp dir used as the sandbox cwd so the
         policy resolve walks a tiny tree.
     """
-    from omnigent.inner import sandbox as sandbox_mod
-    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
-    from omnigent.inner.sandbox import SandboxPolicy
+    from omnigent.core.datamodel import OSEnvSandboxSpec, OSEnvSpec
+    from omnigent.sandbox import core as sandbox_mod
+    from omnigent.sandbox.core import SandboxPolicy
 
     monkeypatch.setenv("FAKE_HOST_SECRET", "PWNED")
     captured: dict[str, SandboxPolicy] = {}
@@ -4540,7 +4540,7 @@ def test_pi_sandbox_launcher_policy_carries_spawn_env_allowlist(monkeypatch, tmp
     monkeypatch.setattr(sandbox_mod, "resolve_sandbox", _fake_resolve_sandbox)
     monkeypatch.setattr(sandbox_mod, "create_exec_launcher", _fake_create_exec_launcher)
 
-    with patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"):
+    with patch("omnigent.harnesses.pi.executor._find_pi_cli", return_value="/usr/bin/pi"):
         executor = PiExecutor(
             cwd=str(tmp_path),
             os_env=OSEnvSpec(sandbox=OSEnvSandboxSpec(type="linux_bwrap")),
@@ -4576,7 +4576,7 @@ def test_run_turn_bridge_extension_carries_live_server_token(monkeypatch) -> Non
 
     :param monkeypatch: Pytest monkeypatch fixture.
     """
-    from omnigent.inner import pi_executor as pi_mod
+    from omnigent.harnesses.pi import executor as pi_mod
 
     captured: dict[str, str] = {}
 
@@ -4600,7 +4600,7 @@ def test_run_turn_bridge_extension_carries_live_server_token(monkeypatch) -> Non
     tools = [{"name": "lookup", "description": "x", "parameters": {"type": "object"}}]
 
     async def _test():
-        with patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"):
+        with patch("omnigent.harnesses.pi.executor._find_pi_cli", return_value="/usr/bin/pi"):
             executor = PiExecutor()
         try:
             events = [
@@ -4985,9 +4985,9 @@ def _live_session_executor(
     :returns: ``(executor, rpc)`` — the rpc's ``process.stdin.data`` records
         every command the executor sent, in order.
     """
-    from omnigent.inner.pi_executor import _PiSessionState
+    from omnigent.harnesses.pi.executor import _PiSessionState
 
-    with patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"):
+    with patch("omnigent.harnesses.pi.executor._find_pi_cli", return_value="/usr/bin/pi"):
         executor = PiExecutor()
     rpc = _PiRpcSession()
     rpc._line_queue = asyncio.Queue()
@@ -5012,7 +5012,7 @@ def _sent_commands(rpc: _PiRpcSession) -> list[dict]:
 
 def test_pi_thinking_from_config_translates_and_clears() -> None:
     """Canonical effort → pi level; a clear value or absence → ``None``."""
-    from omnigent.inner.pi_executor import _pi_thinking_from_config
+    from omnigent.harnesses.pi.executor import _pi_thinking_from_config
 
     assert _pi_thinking_from_config(ExecutorConfig(extra={"reasoning_effort": "high"})) == "high"
     assert _pi_thinking_from_config(ExecutorConfig(extra={"reasoning_effort": "none"})) == "off"
@@ -5024,7 +5024,7 @@ def test_pi_thinking_from_config_translates_and_clears() -> None:
 
 def test_run_turn_spawns_pi_with_thinking_flag(monkeypatch) -> None:
     """``reasoning_effort=high`` reaches the pi subprocess as ``--thinking high``."""
-    from omnigent.inner import pi_executor as pi_mod
+    from omnigent.harnesses.pi import executor as pi_mod
 
     captured: dict[str, tuple[str, ...]] = {}
 
@@ -5041,7 +5041,7 @@ def test_run_turn_spawns_pi_with_thinking_flag(monkeypatch) -> None:
     monkeypatch.setattr(pi_mod, "_create_subprocess_exec", _fake_spawn)
 
     async def _test():
-        with patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"):
+        with patch("omnigent.harnesses.pi.executor._find_pi_cli", return_value="/usr/bin/pi"):
             executor = PiExecutor()
         events = [
             e
@@ -5119,7 +5119,7 @@ def test_unsupported_thinking_level_clamps_with_warning(caplog) -> None:
             )
         ]
 
-    with caplog.at_level(logging.WARNING, logger="omnigent.inner.pi_executor"):
+    with caplog.at_level(logging.WARNING, logger="omnigent.harnesses.pi.executor"):
         _run(_test())
 
     commands = _sent_commands(rpc)
@@ -5161,7 +5161,7 @@ def test_midsession_effort_clear_leaves_level_untouched() -> None:
 
 def test_unsupported_effort_value_fails_the_turn() -> None:
     """An effort outside pi's ladder surfaces a non-retryable executor error."""
-    with patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"):
+    with patch("omnigent.harnesses.pi.executor._find_pi_cli", return_value="/usr/bin/pi"):
         executor = PiExecutor()
 
     async def _test():
@@ -5190,7 +5190,7 @@ def test_run_turn_prompt_command_includes_streaming_behavior():
     interrupt where the reap races the slice) surfaces Pi's raw
     'Agent is already processing' protocol error instead of queuing the prompt.
     """
-    with patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"):
+    with patch("omnigent.harnesses.pi.executor._find_pi_cli", return_value="/usr/bin/pi"):
         executor = PiExecutor()
 
     fake_rpc = _PiRpcSession()

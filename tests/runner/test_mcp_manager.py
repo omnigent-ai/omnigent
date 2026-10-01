@@ -298,7 +298,7 @@ async def test_invalid_tool_name_is_filtered(
     filter at schema-injection time and log a warning instead.
     """
     # Force the `omnigent` package logger to propagate so caplog
-    # captures warnings. Defensive: ``omnigent.cli_diagnostics
+    # captures warnings. Defensive: ``omnigent.cli.diagnostics
     # .setup_cli_logging`` sets ``omnigent.propagate = False`` and
     # if a sibling test on this xdist worker invoked it via a fixture
     # that didn't tear down (e.g. crash mid-test), the False sticks

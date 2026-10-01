@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 from unittest.mock import Mock
 
-from omnigent.inner._subprocess_lifecycle import terminate_subprocess
+from omnigent.util.subprocess_lifecycle import terminate_subprocess
 
 
 class _NeverReapedProcess:

@@ -14,10 +14,10 @@ import httpx
 import pytest
 from fastapi import FastAPI
 
+from omnigent.core.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.entities import DEFAULT_ENVIRONMENT_ID
 from omnigent.entities.environment_filesystem import FilesystemPathNotFound
-from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
-from omnigent.inner.os_env import create_os_environment
+from omnigent.environments.os_env import create_os_environment
 from omnigent.runner import create_runner_app
 from omnigent.runner.environment_filesystem import CallerProcessFilesystem, search_indexed_paths
 from omnigent.runner.resource_registry import SessionResourceRegistry

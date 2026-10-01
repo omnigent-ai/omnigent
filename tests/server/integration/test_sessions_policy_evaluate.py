@@ -1410,8 +1410,8 @@ def auth_app(runtime_init: None, db_uri: str, tmp_path: Path) -> FastAPI:
 @pytest_asyncio.fixture()
 async def auth_client(auth_app: FastAPI, mock_llm: Any, tmp_path: Path):
     """Async client against the auth-enabled app."""
+    from omnigent.harnesses.runtime.process_manager import HarnessProcessManager
     from omnigent.runtime import set_harness_process_manager
-    from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
 
     pm = HarnessProcessManager(tmp_parent=tmp_path / "harness_pm")
     await pm.start()

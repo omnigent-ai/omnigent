@@ -33,8 +33,8 @@ from pathlib import Path
 
 import pytest
 
-from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
-from omnigent.inner.os_env import create_os_environment
+from omnigent.core.datamodel import OSEnvSandboxSpec, OSEnvSpec
+from omnigent.environments.os_env import create_os_environment
 from tests.inner.sandbox.conftest import _repo_root_for_pythonpath, run_async
 
 _BWRAP = shutil.which("bwrap")
@@ -90,7 +90,7 @@ def test_missing_write_root_survives_into_bwrap_argv(tmp_path: Path) -> None:
     source directory exists by spawn time (backend pre-creates it) or the
     launcher uses a hard ``--bind`` that fails loud instead of silently.
     """
-    from omnigent.inner.bwrap_sandbox import BwrapSandboxBackend
+    from omnigent.sandbox.bwrap import BwrapSandboxBackend
 
     workspace = tmp_path / "ws"
     workspace.mkdir()

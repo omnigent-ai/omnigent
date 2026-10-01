@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from omnigent.native._native_resume_hint import (
+from omnigent.harnesses.native.resume_hint import (
     echo_native_cold_resume_hint,
     format_native_resume_command,
 )

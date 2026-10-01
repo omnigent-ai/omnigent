@@ -34,9 +34,9 @@ from unittest.mock import patch
 
 import pytest
 
-from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
-from omnigent.inner.sandbox import SandboxPolicy, with_denied_unix_sockets
-from omnigent.inner.seatbelt_sandbox import (
+from omnigent.core.datamodel import OSEnvSandboxSpec, OSEnvSpec
+from omnigent.sandbox.core import SandboxPolicy, with_denied_unix_sockets
+from omnigent.sandbox.seatbelt import (
     _DEFAULT_CWD_ALLOW_HIDDEN,
     _DEFAULT_READ_SUBPATHS,
     _SANDBOX_EXEC_PATH,
@@ -255,7 +255,7 @@ def test_resolve_raises_on_non_darwin() -> None:
         type="caller_process",
         sandbox=OSEnvSandboxSpec(type="darwin_seatbelt"),
     )
-    with patch("omnigent.inner.seatbelt_sandbox.sys.platform", "linux"):
+    with patch("omnigent.sandbox.seatbelt.sys.platform", "linux"):
         with pytest.raises(OSError, match="only available on macOS"):
             backend.resolve(spec, Path.cwd())
 
@@ -272,8 +272,8 @@ def test_resolve_raises_when_sandbox_exec_missing() -> None:
         type="caller_process",
         sandbox=OSEnvSandboxSpec(type="darwin_seatbelt"),
     )
-    with patch("omnigent.inner.seatbelt_sandbox.sys.platform", "darwin"):
-        with patch("omnigent.inner.seatbelt_sandbox.shutil.which", return_value=None):
+    with patch("omnigent.sandbox.seatbelt.sys.platform", "darwin"):
+        with patch("omnigent.sandbox.seatbelt.shutil.which", return_value=None):
             with pytest.raises(OSError, match="sandbox-exec"):
                 backend.resolve(spec, Path.cwd())
 
@@ -325,7 +325,7 @@ def _safe_helper_argv(tmp_path: Path) -> list[str]:
         # ``/Users`` (macOS dev).
         interpreter.write_text("#!/usr/bin/env python3\n")
         interpreter.chmod(0o755)
-    return [str(interpreter), "-m", "omnigent.inner.os_env", "helper", "X"]
+    return [str(interpreter), "-m", "omnigent.environments.os_env", "helper", "X"]
 
 
 def test_wrap_launcher_argv_starts_with_sandbox_exec_and_appends_inner_argv(
@@ -978,7 +978,7 @@ def test_ensure_executable_visible_does_not_widen_when_venv_is_under_cwd() -> No
     """
     cwd = Path("/Users/me/proj")
     venv_python = cwd / ".venv" / "bin" / "python3"
-    argv = [str(venv_python), "-m", "omnigent.inner.os_env", "helper"]
+    argv = [str(venv_python), "-m", "omnigent.environments.os_env", "helper"]
     extras = _ensure_executable_visible(argv, cwd)
     assert extras == [], (
         f"Got extra_read_paths={extras!r} for a venv UNDER cwd; "
@@ -1576,10 +1576,10 @@ def test_ensure_executable_visible_falls_back_to_install_root_for_uv_layout(
     # ``/tmp/...``. Either way the topmost is a real path on disk.
     topmost_str = "/" + str(install_root).lstrip("/").split("/", 1)[0]
     with patch(
-        "omnigent.inner.seatbelt_sandbox._UNSAFE_WIDEN_ANCESTORS",
+        "omnigent.sandbox.seatbelt._UNSAFE_WIDEN_ANCESTORS",
         frozenset({topmost_str}),
     ):
-        with caplog.at_level("WARNING", logger="omnigent.inner.seatbelt_sandbox"):
+        with caplog.at_level("WARNING", logger="omnigent.sandbox.seatbelt"):
             extras = _ensure_executable_visible(argv, cwd)
 
     assert extras, (
@@ -1641,7 +1641,7 @@ def test_ensure_executable_visible_still_raises_for_non_python_home_layouts(
 
     topmost_str = "/" + str(fake_root).lstrip("/").split("/", 1)[0]
     with patch(
-        "omnigent.inner.seatbelt_sandbox._UNSAFE_WIDEN_ANCESTORS",
+        "omnigent.sandbox.seatbelt._UNSAFE_WIDEN_ANCESTORS",
         frozenset({topmost_str}),
     ):
         with pytest.raises(OSError) as exc:
@@ -1675,7 +1675,7 @@ def test_h4_resolve_root_does_not_expand_env_vars_and_warns(
     emitted so over-broad expansions stand out in logs.
     """
     monkeypatch.setenv("LOG_DIR", "/")
-    with caplog.at_level("WARNING", logger="omnigent.inner.seatbelt_sandbox"):
+    with caplog.at_level("WARNING", logger="omnigent.sandbox.seatbelt"):
         resolved = _resolve_root(tmp_path, "$LOG_DIR/audit")
     # The literal ``$LOG_DIR`` survives — resolved path ends with
     # the unexpanded segment, NOT with ``/audit`` rooted at ``/``.
@@ -1701,7 +1701,7 @@ def test_l5_resolve_root_warns_on_broad_paths(
     ``/var``, …). Not blocked — some legitimate agents need a wide
     grant — but the warning makes the choice auditable in logs.
     """
-    with caplog.at_level("WARNING", logger="omnigent.inner.seatbelt_sandbox"):
+    with caplog.at_level("WARNING", logger="omnigent.sandbox.seatbelt"):
         _resolve_root(tmp_path, "/")
     assert any("near-unrestricted" in record.message for record in caplog.records), (
         "Resolver should warn when a spec path resolves to a "
@@ -1924,7 +1924,7 @@ def test_m7_resolve_warns_when_cwd_allow_hidden_contains_sensitive_dotfile(
             cwd_allow_hidden=[".aws", ".ssh", ".venv"],
         ),
     )
-    with caplog.at_level("WARNING", logger="omnigent.inner.seatbelt_sandbox"):
+    with caplog.at_level("WARNING", logger="omnigent.sandbox.seatbelt"):
         backend.resolve(spec, Path.cwd())
     msgs = " ".join(record.message for record in caplog.records)
     assert ".aws" in msgs and ".ssh" in msgs, (
@@ -2340,7 +2340,7 @@ def test_framework_write_root_dotfiles_not_masked(tmp_path: Path) -> None:
     reset every egress connection. A genuine user write root is still
     scanned.
     """
-    from omnigent.inner.sandbox import with_additional_write_roots
+    from omnigent.sandbox.core import with_additional_write_roots
 
     cwd = tmp_path / "work"
     cwd.mkdir()
@@ -2425,7 +2425,7 @@ def test_wrap_launcher_argv_grants_uv_versionless_hop_literal(tmp_path: Path) ->
     backend = _make_backend()
     policy = _make_policy(cwd, allow_hidden=[".venv"])
     argv = backend.wrap_launcher_argv(
-        [str(tool_exe), "-m", "omnigent.inner.os_env", "helper", "X"], policy, cwd
+        [str(tool_exe), "-m", "omnigent.environments.os_env", "helper", "X"], policy, cwd
     )
     profile = Path(argv[2]).read_text()
 
@@ -2538,10 +2538,10 @@ def test_wrap_launcher_argv_target_with_unsafe_parent_degrades_not_raises(
     backend = _make_backend()
     policy = _make_policy(cwd, allow_hidden=[".venv"])
     with patch(
-        "omnigent.inner.seatbelt_sandbox._UNSAFE_WIDEN_ANCESTORS",
+        "omnigent.sandbox.seatbelt._UNSAFE_WIDEN_ANCESTORS",
         frozenset({str(fake_home)}),
     ):
-        with caplog.at_level("WARNING", logger="omnigent.inner.seatbelt_sandbox"):
+        with caplog.at_level("WARNING", logger="omnigent.sandbox.seatbelt"):
             argv = backend.wrap_launcher_argv(
                 _safe_helper_argv(cwd), policy, cwd, target=str(binary)
             )
@@ -2616,7 +2616,7 @@ def test_run_launcher_spawn_wrap_private_tmpdir_boots_under_seatbelt(
     import subprocess
     import tempfile
 
-    from omnigent.inner.sandbox import _project_root, create_exec_launcher
+    from omnigent.sandbox.core import _project_root, create_exec_launcher
 
     if _shutil.which("sandbox-exec") is None:
         pytest.skip("sandbox-exec not on PATH")

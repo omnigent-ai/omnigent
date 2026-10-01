@@ -26,7 +26,7 @@ from omnigent.harnesses.claude_native.bridge import (
     validate_claude_hook_interpreter_compatibility,
     write_active_session_id,
 )
-from omnigent.native import native_policy_hook
+from omnigent.harnesses.native import policy_hook as native_policy_hook
 from tests.native_hook_helpers import make_failing_client
 
 
@@ -207,12 +207,12 @@ def test_session_start_hook_maps_workspace_hosted_server_to_ui_mount(
     with the ``?o=<org>`` selector — matching the CLI's ``Web UI:``
     line and the tmux status bar.
     """
-    from omnigent.cli_auth import store_databricks_auth
+    from omnigent.cli.auth import store_databricks_auth
 
     monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
     monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path / "root")
     monkeypatch.setattr(
-        "omnigent.cli_auth._token_file_path",
+        "omnigent.cli.auth._token_file_path",
         lambda: tmp_path / "auth_tokens.json",
     )
     server = "https://example.databricks.com/api/2.0/omnigent"
@@ -1500,38 +1500,6 @@ def test_evaluate_policy_post_tool_use_converts_and_returns_context(
     result = json.loads(captured.out)
     assert "Policy violation" in result["hookSpecificOutput"]["additionalContext"]
     assert "Sensitive data in output" in result["hookSpecificOutput"]["additionalContext"]
-    assert captured.err == ""
-
-
-def test_ask_user_question_subcommand_is_a_silent_noop(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    """
-    The retired ``ask-user-question`` forwarder exits 0 with no output.
-
-    Settings written before it was retired still invoke it until the
-    terminal restarts. It must never reach the server — that parked a
-    second elicitation for the question — and must not block the tool,
-    so Claude Code proceeds to the PermissionRequest hook.
-    """
-    monkeypatch.setattr(
-        claude_native_hook,
-        "_post_hook_with_reattach",
-        lambda *_args, **_kwargs: pytest.fail("retired ask-user-question hook posted"),
-    )
-    payload = {
-        "hook_event_name": "PreToolUse",
-        "tool_name": "AskUserQuestion",
-        "tool_input": {"questions": []},
-        "permission_mode": "bypassPermissions",
-    }
-    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(payload)))
-
-    exit_code = claude_native_hook.main(["ask-user-question", "--bridge-dir", str(tmp_path)])
-
-    captured = capsys.readouterr()
-    assert exit_code == 0
-    assert captured.out == ""
     assert captured.err == ""
 
 

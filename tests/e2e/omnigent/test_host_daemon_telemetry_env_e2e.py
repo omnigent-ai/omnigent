@@ -39,7 +39,7 @@ from pathlib import Path
 import httpx
 import pytest
 
-from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN
+from omnigent.util.runner_identity import OMNIGENT_INTERNAL_WS_ORIGIN
 from tests.e2e.omnigent.test_host_ctrl_c_stop_server import (
     _connect_env,
     _read_local_server_record,

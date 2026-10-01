@@ -8,7 +8,7 @@ every bundled agent dies at launch::
     $ omnigent debby -p "hello"
     UnicodeDecodeError: 'gbk' codec can't decode byte 0x94 in position 10
 
-``_bundled_agent_brain_harness`` (``omnigent/cli.py``) reads the bundled
+``_bundled_agent_brain_harness`` (``omnigent/cli/commands.py``) reads the bundled
 agent's ``config.yaml`` with ``Path.read_text()`` and no ``encoding=``, so
 the read uses ``locale.getpreferredencoding()``. The file begins with a
 UTF-8 em-dash (``# Debby — ...``), and the ``except (OSError,

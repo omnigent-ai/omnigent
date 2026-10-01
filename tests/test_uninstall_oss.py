@@ -6,7 +6,7 @@ import shutil
 import subprocess
 from pathlib import Path
 
-from omnigent.install_ledger import sha256_text
+from omnigent.onboarding.install_ledger import sha256_text
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "uninstall_oss.sh"
 

@@ -65,7 +65,7 @@ def _output_item(output: str) -> ConversationItem:
 
 def test_framework_notice_is_system_context_not_user_text() -> None:
     """Transient image metadata becomes a separate system message."""
-    from omnigent.inner.native_attachments import framework_notice_block, resize_notice
+    from omnigent.util.attachments import framework_notice_block, resize_notice
 
     dimensions = {"width": 6000, "height": 4000}
     item = ConversationItem(
@@ -123,7 +123,7 @@ def test_authored_notice_cannot_be_loaded_in_compaction() -> None:
     from pydantic import ValidationError
 
     from omnigent.entities import CompactionData
-    from omnigent.inner.native_attachments import framework_notice_block
+    from omnigent.util.attachments import framework_notice_block
 
     with pytest.raises(ValidationError, match="reserved"):
         CompactionData(

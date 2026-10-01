@@ -38,7 +38,7 @@ import pytest
 import yaml
 
 from omnigent.host import HOST_FATAL_EXIT_CODE
-from omnigent.process_logging import PROCESS_LOG_FILE_ENV_VAR
+from omnigent.observability.process_logging import PROCESS_LOG_FILE_ENV_VAR
 from tests._helpers.compat import apply_runner_env, compat_runner_cwd, runner_executable
 from tests.e2e.conftest import POLL_INTERVAL_S
 

@@ -1,6 +1,6 @@
 ---
 name: copilot-sdk-e2e-dev
-description: Spin up a live local Omnigent server and exercise the GitHub Copilot SDK harness end-to-end — build copilot agents, run real turns, smoke-test, and bug-bash. Load when developing, testing, or debugging the copilot harness (omnigent/inner/copilot_executor.py, copilot_harness.py, omnigent/onboarding/copilot_auth.py) or its auth / model / tool-bridge behavior.
+description: Spin up a live local Omnigent server and exercise the GitHub Copilot SDK harness end-to-end — build copilot agents, run real turns, smoke-test, and bug-bash. Load when developing, testing, or debugging the copilot harness (omnigent/harnesses/copilot/executor.py, copilot_harness.py, omnigent/onboarding/copilot_auth.py) or its auth / model / tool-bridge behavior.
 ---
 
 # Copilot SDK harness: end-to-end dev & testing
@@ -163,8 +163,8 @@ final answer lands server-side — read it over the AP API
 
 ## Code & tests
 
-- **Executor (SDK bridge):** `omnigent/inner/copilot_executor.py`
-- **Wrap (HARNESS_COPILOT_* env → executor):** `omnigent/inner/copilot_harness.py`
+- **Executor (SDK bridge):** `omnigent/harnesses/copilot/executor.py`
+- **Wrap (HARNESS_COPILOT_* env → executor):** `omnigent/harnesses/copilot/harness.py`
 - **Auth / token resolution:** `omnigent/onboarding/copilot_auth.py`
 - **Spawn env:** `_build_copilot_spawn_env` in `omnigent/runtime/workflow.py`
 

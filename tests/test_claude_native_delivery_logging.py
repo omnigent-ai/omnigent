@@ -8,8 +8,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from omnigent.debug_logging import current_session_id_scope, record_to_row
 from omnigent.harnesses.claude_native import bridge, delivery_diagnostics
+from omnigent.observability.debug_logging import current_session_id_scope, record_to_row
 
 
 @pytest.mark.parametrize(

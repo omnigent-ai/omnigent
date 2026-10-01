@@ -41,165 +41,167 @@ import importlib  # noqa: E402
 from typing import TYPE_CHECKING, Any  # noqa: E402
 
 if TYPE_CHECKING:
-    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor as ClaudeSDKExecutor
-    from omnigent.inner.codex_executor import CodexExecutor as CodexExecutor
-    from omnigent.inner.databricks_executor import DatabricksExecutor as DatabricksExecutor
-    from omnigent.inner.datamodel import (
+    from omnigent.core.datamodel import (
         AgentDef as AgentDef,
     )
-    from omnigent.inner.datamodel import (
+    from omnigent.core.datamodel import (
         Connection as Connection,
     )
-    from omnigent.inner.datamodel import (
+    from omnigent.core.datamodel import (
         Credentials as Credentials,
     )
-    from omnigent.inner.datamodel import (
+    from omnigent.core.datamodel import (
         History as History,
     )
-    from omnigent.inner.datamodel import (
+    from omnigent.core.datamodel import (
         Memory as Memory,
     )
-    from omnigent.inner.datamodel import (
+    from omnigent.core.datamodel import (
         MemoryConfig as MemoryConfig,
     )
-    from omnigent.inner.datamodel import (
+    from omnigent.core.datamodel import (
         Message as Message,
     )
-    from omnigent.inner.datamodel import (
+    from omnigent.core.datamodel import (
         ParamDef as ParamDef,
     )
-    from omnigent.inner.datamodel import (
+    from omnigent.core.datamodel import (
         SessionState as SessionState,
     )
-    from omnigent.inner.executor import (
+    from omnigent.core.executor import (
         Executor as Executor,
     )
-    from omnigent.inner.executor import (
+    from omnigent.core.executor import (
         ExecutorConfig as ExecutorConfig,
     )
-    from omnigent.inner.executor import (
+    from omnigent.core.executor import (
         ExecutorError as ExecutorError,
     )
-    from omnigent.inner.executor import (
+    from omnigent.core.executor import (
         ExecutorEvent as ExecutorEvent,
     )
-    from omnigent.inner.executor import (
+    from omnigent.core.executor import (
         TextChunk as TextChunk,
     )
-    from omnigent.inner.executor import (
+    from omnigent.core.executor import (
         ToolCallComplete as ToolCallComplete,
     )
-    from omnigent.inner.executor import (
+    from omnigent.core.executor import (
         ToolCallRequest as ToolCallRequest,
     )
-    from omnigent.inner.executor import (
+    from omnigent.core.executor import (
         TurnCancelled as TurnCancelled,
     )
-    from omnigent.inner.executor import (
+    from omnigent.core.executor import (
         TurnComplete as TurnComplete,
     )
-    from omnigent.inner.loader import load_agent_def as load_agent_def
-    from omnigent.inner.open_responses_sdk import OpenResponsesExecutor as OpenResponsesExecutor
-    from omnigent.inner.openai_agents_sdk_executor import (
-        OpenAIAgentsSDKExecutor as OpenAIAgentsSDKExecutor,
-    )
-    from omnigent.inner.policies import (
+    from omnigent.core.loader import load_agent_def as load_agent_def
+    from omnigent.core.policies import (
         FunctionPolicy as FunctionPolicy,
     )
-    from omnigent.inner.policies import (
+    from omnigent.core.policies import (
         Policy as Policy,
     )
-    from omnigent.inner.policies import (
+    from omnigent.core.policies import (
         PolicyAction as PolicyAction,
     )
-    from omnigent.inner.policies import (
+    from omnigent.core.policies import (
         PolicyResult as PolicyResult,
     )
-    from omnigent.inner.policies import (
+    from omnigent.core.policies import (
         PromptPolicy as PromptPolicy,
     )
-    from omnigent.inner.tools import (
+    from omnigent.core.tools import (
         AgentTool as AgentTool,
     )
-    from omnigent.inner.tools import (
+    from omnigent.core.tools import (
         CancellableFunctionTool as CancellableFunctionTool,
     )
-    from omnigent.inner.tools import (
+    from omnigent.core.tools import (
         FunctionTool as FunctionTool,
     )
-    from omnigent.inner.tools import (
+    from omnigent.core.tools import (
         HandoffTool as HandoffTool,
     )
-    from omnigent.inner.tools import (
+    from omnigent.core.tools import (
         InheritedTool as InheritedTool,
     )
-    from omnigent.inner.tools import (
+    from omnigent.core.tools import (
         MCPTool as MCPTool,
     )
-    from omnigent.inner.tools import (
+    from omnigent.core.tools import (
         SkillTool as SkillTool,
     )
-    from omnigent.inner.tools import (
+    from omnigent.core.tools import (
         Tool as Tool,
     )
-    from omnigent.inner.tracing import (
+    from omnigent.harnesses.claude_sdk.executor import ClaudeSDKExecutor as ClaudeSDKExecutor
+    from omnigent.harnesses.codex.executor import CodexExecutor as CodexExecutor
+    from omnigent.harnesses.databricks.executor import DatabricksExecutor as DatabricksExecutor
+    from omnigent.harnesses.open_responses.executor import (
+        OpenResponsesExecutor as OpenResponsesExecutor,
+    )
+    from omnigent.harnesses.openai_agents.executor import (
+        OpenAIAgentsSDKExecutor as OpenAIAgentsSDKExecutor,
+    )
+    from omnigent.observability.tracing import (
         disable_tracing as disable_tracing,
     )
-    from omnigent.inner.tracing import (
+    from omnigent.observability.tracing import (
         enable_tracing as enable_tracing,
     )
-    from omnigent.inner.tracing import (
+    from omnigent.observability.tracing import (
         is_tracing_enabled as is_tracing_enabled,
     )
 
 # Public name → defining module for the always-present re-exports.
 _LAZY_EXPORTS = {
-    "AgentDef": "omnigent.inner.datamodel",
-    "Connection": "omnigent.inner.datamodel",
-    "Credentials": "omnigent.inner.datamodel",
-    "History": "omnigent.inner.datamodel",
-    "Memory": "omnigent.inner.datamodel",
-    "MemoryConfig": "omnigent.inner.datamodel",
-    "Message": "omnigent.inner.datamodel",
-    "ParamDef": "omnigent.inner.datamodel",
-    "SessionState": "omnigent.inner.datamodel",
-    "Executor": "omnigent.inner.executor",
-    "ExecutorConfig": "omnigent.inner.executor",
-    "ExecutorError": "omnigent.inner.executor",
-    "ExecutorEvent": "omnigent.inner.executor",
-    "TextChunk": "omnigent.inner.executor",
-    "ToolCallComplete": "omnigent.inner.executor",
-    "ToolCallRequest": "omnigent.inner.executor",
-    "TurnCancelled": "omnigent.inner.executor",
-    "TurnComplete": "omnigent.inner.executor",
-    "FunctionPolicy": "omnigent.inner.policies",
-    "Policy": "omnigent.inner.policies",
-    "PolicyAction": "omnigent.inner.policies",
-    "PolicyResult": "omnigent.inner.policies",
-    "PromptPolicy": "omnigent.inner.policies",
-    "AgentTool": "omnigent.inner.tools",
-    "CancellableFunctionTool": "omnigent.inner.tools",
-    "FunctionTool": "omnigent.inner.tools",
-    "HandoffTool": "omnigent.inner.tools",
-    "InheritedTool": "omnigent.inner.tools",
-    "MCPTool": "omnigent.inner.tools",
-    "SkillTool": "omnigent.inner.tools",
-    "Tool": "omnigent.inner.tools",
-    "load_agent_def": "omnigent.inner.loader",
-    "disable_tracing": "omnigent.inner.tracing",
-    "enable_tracing": "omnigent.inner.tracing",
-    "is_tracing_enabled": "omnigent.inner.tracing",
+    "AgentDef": "omnigent.core.datamodel",
+    "Connection": "omnigent.core.datamodel",
+    "Credentials": "omnigent.core.datamodel",
+    "History": "omnigent.core.datamodel",
+    "Memory": "omnigent.core.datamodel",
+    "MemoryConfig": "omnigent.core.datamodel",
+    "Message": "omnigent.core.datamodel",
+    "ParamDef": "omnigent.core.datamodel",
+    "SessionState": "omnigent.core.datamodel",
+    "Executor": "omnigent.core.executor",
+    "ExecutorConfig": "omnigent.core.executor",
+    "ExecutorError": "omnigent.core.executor",
+    "ExecutorEvent": "omnigent.core.executor",
+    "TextChunk": "omnigent.core.executor",
+    "ToolCallComplete": "omnigent.core.executor",
+    "ToolCallRequest": "omnigent.core.executor",
+    "TurnCancelled": "omnigent.core.executor",
+    "TurnComplete": "omnigent.core.executor",
+    "FunctionPolicy": "omnigent.core.policies",
+    "Policy": "omnigent.core.policies",
+    "PolicyAction": "omnigent.core.policies",
+    "PolicyResult": "omnigent.core.policies",
+    "PromptPolicy": "omnigent.core.policies",
+    "AgentTool": "omnigent.core.tools",
+    "CancellableFunctionTool": "omnigent.core.tools",
+    "FunctionTool": "omnigent.core.tools",
+    "HandoffTool": "omnigent.core.tools",
+    "InheritedTool": "omnigent.core.tools",
+    "MCPTool": "omnigent.core.tools",
+    "SkillTool": "omnigent.core.tools",
+    "Tool": "omnigent.core.tools",
+    "load_agent_def": "omnigent.core.loader",
+    "disable_tracing": "omnigent.observability.tracing",
+    "enable_tracing": "omnigent.observability.tracing",
+    "is_tracing_enabled": "omnigent.observability.tracing",
 }
 
 # Optional executors resolve to ``None`` when their extra's dependencies are
 # absent, matching the former eager try/except imports. Databricks also
 # tolerates ``OSError``: its SDK can raise one probing credentials at import.
 _OPTIONAL_EXPORTS = {
-    "DatabricksExecutor": ("omnigent.inner.databricks_executor", (OSError, ImportError)),
-    "ClaudeSDKExecutor": ("omnigent.inner.claude_sdk_executor", (ImportError,)),
-    "OpenResponsesExecutor": ("omnigent.inner.open_responses_sdk", (ImportError,)),
-    "OpenAIAgentsSDKExecutor": ("omnigent.inner.openai_agents_sdk_executor", (ImportError,)),
-    "CodexExecutor": ("omnigent.inner.codex_executor", (ImportError,)),
+    "DatabricksExecutor": ("omnigent.harnesses.databricks.executor", (OSError, ImportError)),
+    "ClaudeSDKExecutor": ("omnigent.harnesses.claude_sdk.executor", (ImportError,)),
+    "OpenResponsesExecutor": ("omnigent.harnesses.open_responses.executor", (ImportError,)),
+    "OpenAIAgentsSDKExecutor": ("omnigent.harnesses.openai_agents.executor", (ImportError,)),
+    "CodexExecutor": ("omnigent.harnesses.codex.executor", (ImportError,)),
 }
 
 

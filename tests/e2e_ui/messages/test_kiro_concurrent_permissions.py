@@ -399,13 +399,13 @@ def _create_kiro_native_session(base_url: str, runner_id: str, workspace: Path) 
     import tarfile
     import tempfile
 
-    from omnigent._wrapper_labels import (
+    from omnigent.harnesses.kiro_native.main import _materialize_kiro_agent_spec
+    from omnigent.harnesses.wrapper_labels import (
         KIRO_NATIVE_WRAPPER_VALUE,
         UI_MODE_LABEL_KEY,
         UI_MODE_TERMINAL_VALUE,
         WRAPPER_LABEL_KEY,
     )
-    from omnigent.harnesses.kiro_native.main import _materialize_kiro_agent_spec
 
     with tempfile.TemporaryDirectory() as tmp:
         spec_path = _materialize_kiro_agent_spec(Path(tmp), model=None)
@@ -458,7 +458,7 @@ def kiro_shim_session(
         pytest.skip("kiro permission-mirror e2e requires an isolated spawned server")
 
     from omnigent.harnesses.kiro_native.bridge import bridge_dir_for_session_id
-    from omnigent.runner.identity import token_bound_runner_id
+    from omnigent.util.runner_identity import token_bound_runner_id
 
     server_tmp = tmp_path_factory.mktemp("e2e_ui_kiro_shim_server")
     shim_path = server_tmp / "kiro-cli"
@@ -509,7 +509,7 @@ def kiro_shim_session(
                 sys.executable,
                 "-c",
                 "import omnigent.server.presence as _p; _p._LEAVE_GRACE_S = 1.0; "
-                + "from omnigent.cli import main; main()",
+                + "from omnigent.cli.commands import main; main()",
                 "server",
                 "--host",
                 "127.0.0.1",

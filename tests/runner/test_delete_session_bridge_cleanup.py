@@ -67,9 +67,9 @@ from omnigent.harnesses.pi_native.bridge import (
 from omnigent.harnesses.qwen_native.bridge import (
     bridge_dir_for_session_id as qwen_bridge_dir,
 )
-from omnigent.inner.native_attachments import attachment_cache_dir, materialize_attachment
 from omnigent.runner import create_runner_app
 from omnigent.spec.types import AgentSpec, ExecutorSpec
+from omnigent.util.attachments import attachment_cache_dir, materialize_attachment
 from tests.runner.conftest import _runner_client
 from tests.runner.helpers import NullServerClient
 

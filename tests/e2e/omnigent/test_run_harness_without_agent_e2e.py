@@ -17,8 +17,8 @@ from pathlib import Path
 
 import pytest
 
-from omnigent.acp_cli_harnesses import ACP_CLI_HARNESSES
-from omnigent.runtime.harnesses import _HARNESS_MODULES
+from omnigent.harnesses.acp.cli_harnesses import ACP_CLI_HARNESSES
+from omnigent.harnesses.runtime import _HARNESS_MODULES
 from omnigent.spec._omnigent_compat import OMNIGENT_HARNESSES
 from tests.e2e._harness_probes import (
     HARNESS_IDS,

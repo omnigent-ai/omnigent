@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
-from omnigent.process_logging import data_dir
+from omnigent.observability.process_logging import data_dir
 
 LAUNCHD_LABEL = "ai.omnigent.host"
 SYSTEMD_UNIT = "omnigent-host.service"
@@ -248,7 +248,7 @@ def _enable_systemd(service: HostService, content: bytes) -> None:
 
 def _record_service(service: HostService) -> None:
     """Add the service to the uninstall ledger."""
-    from omnigent.install_ledger import LaunchAgentEntry, record_launch_agent
+    from omnigent.onboarding.install_ledger import LaunchAgentEntry, record_launch_agent
 
     try:
         record_launch_agent(
@@ -268,7 +268,7 @@ def _record_service(service: HostService) -> None:
 
 def _forget_service(service: HostService) -> None:
     """Remove the service from install ledgers."""
-    from omnigent.install_ledger import remove_launch_agent
+    from omnigent.onboarding.install_ledger import remove_launch_agent
 
     try:
         remove_launch_agent(kind=service.kind, label=service.label)

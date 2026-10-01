@@ -12,8 +12,8 @@ import respx
 from click import ClickException, UsageError
 from click.testing import CliRunner
 
-from omnigent.cli import _reject_smart_routing_prompt, _smart_routing_decision, cli
-from omnigent.smart_routing_cli import (
+from omnigent.cli.commands import _reject_smart_routing_prompt, _smart_routing_decision, cli
+from omnigent.cli.smart_routing import (
     ROUTING_SESSION_LABELS,
     arm_smart_routing_session,
     check_smart_routing_available,
@@ -33,12 +33,12 @@ def _no_local_gateway_answer(monkeypatch: pytest.MonkeyPatch) -> None:
     live would make every case depend on the developer's ``~/.omnigent``. Cases
     about the local gate override it explicitly.
     """
-    monkeypatch.setattr("omnigent.smart_routing_cli.local_gateway_inference", dict)
+    monkeypatch.setattr("omnigent.cli.smart_routing.local_gateway_inference", dict)
 
 
 def _mock_local_gateway(monkeypatch: pytest.MonkeyPatch, gateway: dict[str, bool]) -> None:
     monkeypatch.setattr(
-        "omnigent.smart_routing_cli.local_gateway_inference", lambda: dict(gateway)
+        "omnigent.cli.smart_routing.local_gateway_inference", lambda: dict(gateway)
     )
 
 
@@ -306,12 +306,12 @@ def test_preflight_routing_disabled_is_reported_before_the_gateway_gate(
 
 def test_local_gateway_inference_never_raises(monkeypatch: pytest.MonkeyPatch) -> None:
     """An unevaluable local map is unknown, and unknown does not gate."""
-    from omnigent import smart_routing_cli
+    from omnigent.cli import smart_routing as smart_routing_cli
 
     def _boom() -> dict[str, bool]:
         raise RuntimeError("no config")
 
-    monkeypatch.setattr("omnigent.gateway_inference.gateway_inference_map", _boom)
+    monkeypatch.setattr("omnigent.models.gateway_inference.gateway_inference_map", _boom)
 
     assert smart_routing_cli.local_gateway_inference() == {}
 
@@ -412,8 +412,8 @@ def test_arming_fails_open(mock_kwargs: dict[str, Any], notice_contains: str) ->
 @pytest.fixture
 def _routing_env(monkeypatch: pytest.MonkeyPatch) -> None:
     """Point the launch helpers at a fake backend, daemon, and host identity."""
-    monkeypatch.setattr("omnigent.cli._ensure_backend", lambda _s: _BASE)
-    monkeypatch.setattr("omnigent.cli._ensure_host_daemon", lambda _s: False)
+    monkeypatch.setattr("omnigent.cli.commands._ensure_backend", lambda _s: _BASE)
+    monkeypatch.setattr("omnigent.cli.commands._ensure_host_daemon", lambda _s: False)
     monkeypatch.setattr(
         "omnigent.host.identity.load_or_create_host_identity",
         lambda: type("_Id", (), {"host_id": _HOST_ID})(),
@@ -469,7 +469,7 @@ def test_the_routing_preflight_reads_are_not_on_the_creates_long_budget() -> Non
     which does real work. Asserted against the constants so the two stay
     distinguishable.
     """
-    from omnigent.smart_routing_cli import _PREFLIGHT_TIMEOUT, _TIMEOUT
+    from omnigent.cli.smart_routing import _PREFLIGHT_TIMEOUT, _TIMEOUT
 
     assert _PREFLIGHT_TIMEOUT.read is not None
     assert _PREFLIGHT_TIMEOUT.connect is not None
@@ -522,25 +522,6 @@ def test_smart_routing_with_a_resume_is_rejected(args: list[str]) -> None:
     assert "routes a new session" in result.output
 
 
-@pytest.mark.parametrize(
-    "args",
-    [
-        ["run", "--smart-routing"],
-        ["run", "--smart-routing", "-p", "review the last commit"],
-        ["run", "--harness", "claude-native", "--smart-routing", "-p", "hi"],
-    ],
-)
-def test_run_smart_routing_is_removed(args: list[str]) -> None:
-    # `run` never routed from inside a harness, and its create-time route is
-    # gone — the rejection has to name both surfaces that still route.
-    result = CliRunner().invoke(cli, args)
-
-    assert result.exit_code == 1, result.output
-    assert "per-harness first-message only" in result.output
-    assert "omnigent claude --smart-routing" in result.output
-    assert "web UI" in result.output
-
-
 def test_run_no_longer_advertises_smart_routing() -> None:
     result = CliRunner().invoke(cli, ["run", "--help"])
 
@@ -567,7 +548,7 @@ def test_a_subcommand_arms_the_session_and_launches_bare(
     _mock_hosts({f"{command}-native": True})
     route = _mock_create(harness=f"{command}-native")
     captured: dict[str, Any] = {}
-    monkeypatch.setattr("omnigent.cli._load_effective_config", dict)
+    monkeypatch.setattr("omnigent.cli.commands._load_effective_config", dict)
     monkeypatch.setattr(launcher, lambda **kw: captured.update(kw))
 
     result = CliRunner().invoke(cli, [command, "--smart-routing"])
@@ -595,7 +576,7 @@ def test_an_explicit_model_survives_arming(
     _mock_hosts(None)
     _mock_create(harness="codex-native")
     captured: dict[str, Any] = {}
-    monkeypatch.setattr("omnigent.cli._load_effective_config", dict)
+    monkeypatch.setattr("omnigent.cli.commands._load_effective_config", dict)
     monkeypatch.setattr(
         "omnigent.harnesses.codex_native.main.run_codex_native", lambda **kw: captured.update(kw)
     )
@@ -615,7 +596,7 @@ def test_a_subcommand_falls_back_to_a_fresh_session(
     _mock_hosts(None)
     respx.post(f"{_BASE}/v1/sessions").mock(return_value=httpx.Response(500, text="boom"))
     captured: dict[str, Any] = {}
-    monkeypatch.setattr("omnigent.cli._load_effective_config", dict)
+    monkeypatch.setattr("omnigent.cli.commands._load_effective_config", dict)
     monkeypatch.setattr(
         "omnigent.harnesses.claude_native.main.run_claude_native", lambda **kw: captured.update(kw)
     )
@@ -646,7 +627,7 @@ def test_a_create_rejected_for_a_non_routing_reason_says_so_and_still_launches(
         return_value=httpx.Response(400, text="runner is offline")
     )
     captured: dict[str, Any] = {}
-    monkeypatch.setattr("omnigent.cli._load_effective_config", dict)
+    monkeypatch.setattr("omnigent.cli.commands._load_effective_config", dict)
     monkeypatch.setattr(
         "omnigent.harnesses.claude_native.main.run_claude_native", lambda **kw: captured.update(kw)
     )
@@ -674,7 +655,7 @@ def test_an_unavailable_preflight_blocks_the_launch(
     def _must_not_launch(**_kwargs: Any) -> None:
         raise AssertionError("wrapper launched despite unavailable routing")
 
-    monkeypatch.setattr("omnigent.cli._load_effective_config", dict)
+    monkeypatch.setattr("omnigent.cli.commands._load_effective_config", dict)
     monkeypatch.setattr(
         "omnigent.harnesses.claude_native.main.run_claude_native", _must_not_launch
     )
@@ -731,7 +712,7 @@ def test_smart_routing_entry_points_error_on_an_ungatewayed_harness(
     def _must_not_launch(**_kwargs: Any) -> None:
         raise AssertionError("wrapper launched despite ungatewayed inference")
 
-    monkeypatch.setattr("omnigent.cli._load_effective_config", dict)
+    monkeypatch.setattr("omnigent.cli.commands._load_effective_config", dict)
     monkeypatch.setattr(
         "omnigent.harnesses.claude_native.main.run_claude_native", _must_not_launch
     )

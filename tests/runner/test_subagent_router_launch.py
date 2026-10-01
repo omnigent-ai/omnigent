@@ -10,8 +10,8 @@ from typing import Any
 
 import pytest
 
-from omnigent.inner.codex_executor import CODEX_EXTENDED_CATALOG_ENV_VAR
-from omnigent.inner.hook_scripts.subagent_router import read_router_endpoint
+from omnigent.harnesses.codex.executor import CODEX_EXTENDED_CATALOG_ENV_VAR
+from omnigent.harnesses.native.hook_scripts.subagent_router import read_router_endpoint
 from omnigent.runner import subagent_routing
 from omnigent.runner.app import _build_spawn_env_from_spec, _ensure_session_subagent_router
 from omnigent.runner.native.orchestration import _start_subagent_router_for_native_session

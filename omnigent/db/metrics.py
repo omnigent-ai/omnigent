@@ -9,7 +9,7 @@ from typing import Literal, Protocol
 from opentelemetry import metrics as otel_metrics
 from opentelemetry.util.types import Attributes
 
-from omnigent.runtime.telemetry import telemetry_enabled
+from omnigent.observability.otel import telemetry_enabled
 
 _logger = logging.getLogger(__name__)
 

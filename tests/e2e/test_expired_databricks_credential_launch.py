@@ -273,7 +273,7 @@ def test_expired_databricks_credential_offers_reauth_not_edge_403(
         [
             sys.executable,
             "-m",
-            "omnigent.cli",
+            "omnigent.cli.commands",
             "run",
             str(agent_yaml),
             "--server",

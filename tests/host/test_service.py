@@ -216,7 +216,7 @@ def test_host_service_rejects_unsupported_platform(monkeypatch: pytest.MonkeyPat
 
 
 def test_service_entry_maps_fatal_host_exit(monkeypatch: pytest.MonkeyPatch) -> None:
-    from omnigent.cli import cli
+    from omnigent.cli.commands import cli
     from omnigent.host import HOST_FATAL_EXIT_CODE, service_entry
 
     monkeypatch.setattr(sys, "argv", ["service-entry", "--local"])

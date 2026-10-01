@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from omnigent.inner.mascots import (
+from omnigent.cli.mascots import (
     MASCOT_ART_COL_WIDTH,
     MASCOT_ART_COLOR,
     MASCOT_ART_LINES,

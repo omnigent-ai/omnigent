@@ -19,15 +19,15 @@ from omnigent.entities import Conversation, ConversationItem
 from omnigent.entities.agent import Agent, LoadedAgent
 from omnigent.entities.conversation import FunctionCallData
 from omnigent.policies.types import EvaluationContext, PolicyAction, PolicyResult
-from omnigent.server.routes._sessions.orchestration import (
-    _evaluate_policy_with_fresh_engine,
-)
 from omnigent.server.routes.sessions import (
     _build_evaluation_context,
     _build_skill_slash_command_policy_body,
     _evaluate_input_policy,
     _evaluate_tool_call_policy,
     _persist_policy_deny_sentinel,
+)
+from omnigent.server.routes.sessions.orchestration import (
+    _evaluate_policy_with_fresh_engine,
 )
 from omnigent.server.schemas import SessionEventInput
 from omnigent.spec import AgentSpec

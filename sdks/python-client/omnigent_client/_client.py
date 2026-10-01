@@ -7,7 +7,7 @@ from typing import Any, Literal, overload
 
 import httpx
 
-from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN
+from omnigent.util.runner_identity import OMNIGENT_INTERNAL_WS_ORIGIN
 
 from ._errors import OmnigentError
 from ._files import FilesNamespace

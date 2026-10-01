@@ -259,7 +259,7 @@ def test_efforts_for_harness_distinguishes_unsupported_from_unknown() -> None:
 
 def test_efforts_for_harness_resolves_aliases() -> None:
     """An alias resolves to the same vocabulary as its canonical name."""
-    from omnigent.harness_aliases import canonicalize_harness
+    from omnigent.harnesses.aliases import canonicalize_harness
     from omnigent.util.reasoning_effort import efforts_for_harness
 
     canonical = canonicalize_harness("claude-code") or "claude-code"

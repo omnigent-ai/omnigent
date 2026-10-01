@@ -111,7 +111,7 @@ def _claude_servers(home: Path, env: Mapping[str, str]) -> list[McpServerSummary
 
 def _codex_servers() -> list[McpServerSummary]:
     """``[mcp_servers.*]`` tables from the user's Codex ``config.toml``."""
-    from omnigent.inner.codex_executor import _codex_home_config_source_from_env
+    from omnigent.harnesses.codex.executor import _codex_home_config_source_from_env
 
     path = _codex_home_config_source_from_env() / "config.toml"
     try:

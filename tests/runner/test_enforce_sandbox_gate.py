@@ -139,7 +139,7 @@ def _spec_with_enforce_sandbox(
     :returns: An ``AgentSpec`` with guardrails containing the
         ``enforce_sandbox`` policy.
     """
-    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+    from omnigent.core.datamodel import OSEnvSandboxSpec, OSEnvSpec
 
     factory_args: dict[str, Any] = {
         "sandbox_type": sandbox_type,
@@ -260,7 +260,7 @@ async def test_enforce_sandbox_no_policy_leaves_spec_unchanged() -> None:
     Control test: ensures the gate is a no-op when no policy applies.
     If this fails, the gate is mutating specs unconditionally.
     """
-    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+    from omnigent.core.datamodel import OSEnvSandboxSpec, OSEnvSpec
 
     spec = AgentSpec(
         spec_version=1,
@@ -366,7 +366,7 @@ async def test_create_session_seeds_model_override_into_spawn_env() -> None:
     ``tests/runtime/harnesses/test_process_manager.py::
     test_get_client_seeds_model_and_reuses_without_respawn``.
     """
-    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+    from omnigent.core.datamodel import OSEnvSandboxSpec, OSEnvSpec
 
     spec = AgentSpec(
         spec_version=1,
@@ -462,7 +462,7 @@ async def test_create_session_seeds_model_override_from_envelope() -> None:
     initial spawn — never falling back to a server GET. The server client
     here would raise on any GET, proving the value came from the envelope.
     """
-    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+    from omnigent.core.datamodel import OSEnvSandboxSpec, OSEnvSpec
 
     class _NoSnapshotGetServerClient(NullServerClient):
         """Fails a session-snapshot GET so a stray fallback read is caught.
@@ -536,7 +536,7 @@ async def test_reinit_after_model_switch_seeds_fresh_override() -> None:
     legacy fallback reads it fresh each init, so switching the server-side
     override between two inits must change the seeded spawn env.
     """
-    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+    from omnigent.core.datamodel import OSEnvSandboxSpec, OSEnvSpec
 
     spec = AgentSpec(
         spec_version=1,

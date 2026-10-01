@@ -12,7 +12,7 @@ import yaml
 from omnigent.entities.conversation import Conversation
 from omnigent.errors import OmnigentError
 from omnigent.runner.app import _build_spawn_env_from_spec
-from omnigent.server.routes._sessions import orchestration as orch
+from omnigent.server.routes.sessions import orchestration as orch
 from omnigent.spec.types import AgentSpec, ExecutorSpec, ProviderAuth
 
 

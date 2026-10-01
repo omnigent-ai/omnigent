@@ -20,7 +20,7 @@ import httpx
 import pytest
 import yaml as _yaml
 
-from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN
+from omnigent.util.runner_identity import OMNIGENT_INTERNAL_WS_ORIGIN
 from tests.e2e.conftest import (
     configure_mock_llm,
     find_free_port,
@@ -147,7 +147,7 @@ def test_chat_local_starts_server_and_agent_responds(
     - Agent bundle not registered → agent lookup in GET /v1/agents fails.
     - Agent config invalid → session turn fails.
     """
-    from omnigent.chat import (
+    from omnigent.cli.chat import (
         _start_local_server,
         _stop_local_server,
         _wait_for_server,
@@ -235,7 +235,7 @@ def test_chat_local_accepts_omnigent_yaml_file(
     :param mock_llm_server_url: Mock LLM server base URL.
     :param tmp_path: Per-test temp dir for the YAML fixture.
     """
-    from omnigent.chat import (
+    from omnigent.cli.chat import (
         _start_local_server,
         _stop_local_server,
         _wait_for_server,
@@ -333,7 +333,7 @@ def test_chat_remote_pick_agent(
     - _pick_agent can't parse server agent listing response.
     - Agent name extraction broken.
     """
-    from omnigent.chat import (
+    from omnigent.cli.chat import (
         _pick_agent,
         _start_local_server,
         _stop_local_server,

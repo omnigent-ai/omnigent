@@ -400,7 +400,7 @@ def test_run_omnigent_coding_supervisor_spawns_codex_worker_to_list_files(
     assert "Codex App Server error" not in combined, (
         f"Codex App Server error surfaced — profile propagation "
         f"regressed. Check _propagate_profile_to_environment in "
-        f"omnigent/cli.py. "
+        f"omnigent/cli/commands.py. "
         f"stderr tail:\n{result.stderr[-2000:]}"
     )
     assert "403 Invalid access token" not in combined, (

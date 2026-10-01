@@ -12,7 +12,7 @@ from typing import Any
 
 import pytest
 
-from omnigent.inner.hook_scripts.subagent_router import read_router_endpoint
+from omnigent.harnesses.native.hook_scripts.subagent_router import read_router_endpoint
 from omnigent.runner import turn_routing
 from omnigent.runner.turn_routing import (
     ADVERTISEMENT_FILE,
@@ -1286,10 +1286,10 @@ def test_every_routing_budget_stays_inside_the_owners_ceiling() -> None:
     (~3s measured) plus the routing call (~1.6s), so every hook budget must
     clear that comfortably while staying at or under the 15s ceiling.
     """
-    from omnigent.inner.hook_scripts.subagent_router import (
+    from omnigent.harnesses.native.hook_scripts.subagent_router import (
         HOOK_TIMEOUT_S as SPAWN_HOOK_TIMEOUT_S,
     )
-    from omnigent.inner.hook_scripts.subagent_router import (
+    from omnigent.harnesses.native.hook_scripts.subagent_router import (
         REQUEST_TIMEOUT_S as SPAWN_REQUEST_TIMEOUT_S,
     )
     from omnigent.runner import subagent_routing, turn_routing
@@ -1338,7 +1338,10 @@ def test_the_subagent_ladder_is_strictly_decreasing_inwards() -> None:
     cross-reference (the script is stdlib-only and cannot import it), so the
     two spellings must agree or the documented ladder is fiction.
     """
-    from omnigent.inner.hook_scripts.subagent_router import HOOK_TIMEOUT_S, REQUEST_TIMEOUT_S
+    from omnigent.harnesses.native.hook_scripts.subagent_router import (
+        HOOK_TIMEOUT_S,
+        REQUEST_TIMEOUT_S,
+    )
     from omnigent.runner.subagent_routing import (
         HOOK_REQUEST_TIMEOUT_S,
         RELAY_TIMEOUT_S,
@@ -1873,8 +1876,11 @@ def test_the_subagent_hook_budget_is_strictly_outside_its_request_budget() -> No
     request timed out and the harness saw a dead hook instead of "no opinion".
     The other two paths already carried headroom.
     """
-    from omnigent.inner.codex_executor import _CODEX_ROUTER_HOOK_TIMEOUT_SECONDS
-    from omnigent.inner.hook_scripts.subagent_router import HOOK_TIMEOUT_S, REQUEST_TIMEOUT_S
+    from omnigent.harnesses.codex.executor import _CODEX_ROUTER_HOOK_TIMEOUT_SECONDS
+    from omnigent.harnesses.native.hook_scripts.subagent_router import (
+        HOOK_TIMEOUT_S,
+        REQUEST_TIMEOUT_S,
+    )
     from omnigent.runner.subagent_routing import RELAY_TIMEOUT_S
 
     assert HOOK_TIMEOUT_S > REQUEST_TIMEOUT_S > RELAY_TIMEOUT_S
@@ -1886,8 +1892,11 @@ def test_the_claude_sdk_spawn_hook_is_registered_outside_its_own_request() -> No
     """The in-process claude-sdk hook reads the outer constant, not the inner."""
     import inspect
 
-    from omnigent.inner import claude_sdk_executor
-    from omnigent.inner.hook_scripts.subagent_router import HOOK_TIMEOUT_S, REQUEST_TIMEOUT_S
+    from omnigent.harnesses.claude_sdk import executor as claude_sdk_executor
+    from omnigent.harnesses.native.hook_scripts.subagent_router import (
+        HOOK_TIMEOUT_S,
+        REQUEST_TIMEOUT_S,
+    )
 
     source = inspect.getsource(claude_sdk_executor)
     assert "timeout=subagent_router.HOOK_TIMEOUT_S" in source

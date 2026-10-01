@@ -18,7 +18,7 @@ from omnigent.harnesses.codex_native.bridge import (
     write_bridge_state,
     write_policy_hook_config,
 )
-from omnigent.native import native_policy_hook
+from omnigent.harnesses.native import policy_hook as native_policy_hook
 from tests.native_hook_helpers import make_failing_client
 
 

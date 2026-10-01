@@ -38,8 +38,8 @@ from typing import TYPE_CHECKING, Protocol, cast
 from omnigent.util.json_types import JsonObject as _JsonObject
 
 if TYPE_CHECKING:
-    from omnigent.inner.datamodel import OSEnvSpec
-    from omnigent.inner.os_env import OSEnvironment
+    from omnigent.core.datamodel import OSEnvSpec
+    from omnigent.environments.os_env import OSEnvironment
     from omnigent.runner.mcp_manager import RunnerMcpManager
     from omnigent.runner.resource_registry import SessionResourceRegistry
     from omnigent.runtime.filesystem_registry import FilesystemRegistry
@@ -48,20 +48,20 @@ if TYPE_CHECKING:
 
 import httpx
 
-from omnigent.debug_logging import runner_primary_session_id
-from omnigent.harness_aliases import (
+from omnigent.core.executor import ToolCallStatus, classify_tool_result
+from omnigent.harnesses.aliases import (
     canonicalize_harness,
     is_native_harness,
     native_terminal_name,
 )
-from omnigent.inner.executor import ToolCallStatus, classify_tool_result
+from omnigent.harnesses.native.coding_agents import public_agent_name
 from omnigent.models.model_override import (
     harness_supports_model_override,
     model_family_mismatch,
     normalize_model_for_provider,
     validate_model_override,
 )
-from omnigent.native.native_coding_agents import public_agent_name
+from omnigent.observability.debug_logging import runner_primary_session_id
 from omnigent.runtime import pending_elicitations
 from omnigent.runtime.mcp_tool_result import encode_mcp_image_result, native_image_payload
 from omnigent.tools import ToolManager
@@ -2247,7 +2247,7 @@ def _subagent_allowed_harnesses(
 def _dispatch_model_mismatch(harness: str, model: str) -> str | None:
     """Treat configured model IDs as opaque; legacy sessions retain family checks."""
     from omnigent.errors import OmnigentError
-    from omnigent.inference_config import (
+    from omnigent.models.inference_config import (
         binding_for_harness,
         load_runtime_inference_config,
         resolve_bound_model,
@@ -2275,7 +2275,7 @@ def _harness_has_inference_binding(harness: str) -> bool:
     :param harness: The child's resolved harness, e.g. ``"opencode-native"``.
     :returns: ``True`` when a binding is configured for the harness.
     """
-    from omnigent.inference_config import binding_for_harness, load_runtime_inference_config
+    from omnigent.models.inference_config import binding_for_harness, load_runtime_inference_config
 
     return binding_for_harness(load_runtime_inference_config(), harness) is not None
 
@@ -2294,8 +2294,8 @@ def _harness_vendor_key(canon: str) -> str:
     :param canon: A canonical harness id, e.g. ``"claude-sdk"``.
     :returns: The vendor key, e.g. ``"claude"``.
     """
-    from omnigent.harness_capabilities import ModelFamily
-    from omnigent.harness_plugins import harness_capabilities
+    from omnigent.harnesses.capabilities import ModelFamily
+    from omnigent.harnesses.registry import harness_capabilities
 
     caps = harness_capabilities()
     cap = caps.get(canon) or caps.get(canon.replace("_", "-"))
@@ -2359,7 +2359,7 @@ def _normalize_subagent_model(
     :param harness: The child's declared harness, e.g. ``"claude-native"``.
     :returns: The id to persist as ``model_override``.
     """
-    from omnigent.inference_config import binding_for_harness, load_runtime_inference_config
+    from omnigent.models.inference_config import binding_for_harness, load_runtime_inference_config
     from omnigent.models.model_catalog import resolve_model_provider
 
     # ACP commands own their model namespace, even when provider credentials are shared.
@@ -5603,7 +5603,7 @@ async def _agent_list_host_readiness(
     conversation_id: str | None,
 ) -> _JsonObject | None:
     """Use the runner's host identity, with a bounded legacy session fallback."""
-    from omnigent.runner.identity import RUNNER_SLICE_KEY_ENV_VAR
+    from omnigent.util.runner_identity import RUNNER_SLICE_KEY_ENV_VAR
 
     try:
         async with asyncio.timeout(_AGENT_READINESS_TIMEOUT_S):
@@ -5717,7 +5717,7 @@ async def _agent_list_via_rest(
         remaining_configs[:source_limit],
     )
     listing["builtins"] = _in_spawn_family(listing["builtins"], family)
-    from omnigent.harness_availability import harness_launch_availability
+    from omnigent.harnesses.availability import harness_launch_availability
 
     for row in listing["builtins"]:
         available, reason = harness_launch_availability(
@@ -6960,7 +6960,7 @@ def _clone_os_env_spec(spec: OSEnvSpec) -> OSEnvSpec:
     other's view — a real hazard when the same parent spec is reused
     across many runner-local sys_os_* dispatches).
 
-    Symmetric with :func:`omnigent.inner.terminal._clone_sandbox_spec`;
+    Symmetric with :func:`omnigent.terminals.terminal._clone_sandbox_spec`;
     both fixes close the same class of bug where hand-enumerated
     field copies silently drop newly-added security-critical fields
     such as ``egress_rules`` and ``egress_allow_private_destinations``.
@@ -7035,7 +7035,7 @@ def _effective_runner_os_env_spec(
         Overrides the spec's cwd when set.
     :returns: An ``OSEnvSpec`` with a concrete cwd.
     """
-    from omnigent.inner.datamodel import OSEnvSpec
+    from omnigent.core.datamodel import OSEnvSpec
 
     configured = getattr(agent_spec, "os_env", None) if agent_spec is not None else None
     if configured is not None:
@@ -7072,7 +7072,7 @@ async def _seed_os_env_snapshot(
     Silently skips when the file does not yet exist (new-file creates have no
     baseline) or when any other read error occurs.
 
-    :param os_env: The :class:`~omnigent.inner.os_env.OSEnvironment` used for
+    :param os_env: The :class:`~omnigent.environments.os_env.OSEnvironment` used for
         the current tool dispatch — reused to avoid opening a second connection.
     :param path: Path argument forwarded from the tool call, e.g. ``"src/foo.py"``.
     :param filesystem_registry: Registry that stores the snapshot.
@@ -7117,7 +7117,7 @@ async def _execute_os_env_tool(
         session.
     :returns: Serialized tool result string.
     """
-    from omnigent.inner.os_env import _DEFAULT_READ_LIMIT, create_os_environment
+    from omnigent.environments.os_env import _DEFAULT_READ_LIMIT, create_os_environment
 
     os_env = None
     owns_environment = True
@@ -7309,8 +7309,6 @@ async def _execute_rest_tool(
             return json.dumps(
                 {
                     "handle_id": session_id,
-                    # Compatibility alias for older clients; remove in 0.8.0.
-                    "task_id": session_id,
                     "status": "running",
                 }
             )
@@ -7318,8 +7316,7 @@ async def _execute_rest_tool(
             return f"Error: sys_call_async failed: {exc}"
 
     if tool_name == SysCancelAsyncTool.name():
-        # ``task_id`` fallback supports older clients; remove in 0.8.0.
-        handle_id = args.get("handle_id") or args.get("task_id", "")
+        handle_id = args.get("handle_id", "")
         try:
             resp = await server_client.post(
                 f"/v1/sessions/{handle_id}/events",
@@ -8301,11 +8298,8 @@ def _spawn_async_tool(
         async terminal-tool launches.
     :param effective_harness: Harness the session actually runs, used to judge
         the target against the surface the session was advertised.
-    :returns: JSON handle string with canonical ``handle_id``,
-        plus compatibility ``task_id`` (identical value; remove in 0.8.0),
-        ``tool_name``, ``status``, and ``message``. Prefer
-        ``handle_id``; ``task_id`` exists only so older clients
-        that still parse the pre-handle_id field keep working.
+    :returns: JSON handle string with ``handle_id``, ``tool_name``,
+        ``status``, and ``message``.
     """
     target_tool = args.get("tool")
     target_args = args.get("args", "{}")
@@ -8444,8 +8438,6 @@ def _spawn_async_tool(
     return json.dumps(
         {
             "handle_id": handle_id,
-            # Compatibility alias for older clients; remove in 0.8.0.
-            "task_id": handle_id,
             "tool_name": target_tool,
             "status": "in_progress",
             "message": (
@@ -8470,12 +8462,11 @@ def _cancel_async_tool_result(
     ``asyncio.wait`` returns immediately — the underlying
     thread may keep running but the task won't block on it.
 
-    :param args: Must contain ``"handle_id"`` (``"task_id"`` is
-        accepted as a legacy alias).
+    :param args: Must contain ``"handle_id"``.
     :returns: Structured local-cancel result. ``try_subagent_cancel``
         is true only when no local async task matched.
     """
-    handle_id = args.get("handle_id") or args.get("task_id")
+    handle_id = args.get("handle_id")
     if not isinstance(handle_id, str) or not handle_id:
         return _CancelAsyncToolResult('Error: sys_cancel_async requires "handle_id"')
     if session_async_tasks is None:
@@ -8502,8 +8493,7 @@ def _cancel_async_tool(
     """
     Cancel an in-flight async tool by handle_id.
 
-    :param args: Must contain ``"handle_id"`` (``"task_id"`` is
-        accepted as a legacy alias).
+    :param args: Must contain ``"handle_id"``.
     :param session_async_tasks: Per-session async task map, or
         ``None`` when async inbox state is unavailable.
     :returns: Confirmation or error string.
@@ -8525,9 +8515,9 @@ async def _execute_task_lifecycle_tool(
     Runner-local handler for ``sys_cancel_task``.
 
     The generic cancel path first tries the in-memory async dispatches
-    tracked in ``session_async_tasks``. If no async tool handle matches,
-    it falls through to the sub-agent work registry so handles returned
-    by ``sys_session_send`` can be cancelled by task id.
+    tracked in ``session_async_tasks`` by handle_id. If no async tool
+    handle matches, it falls through to the sub-agent work registry so
+    handles returned by ``sys_session_send`` can be cancelled by task_id.
 
     :param args: Parsed JSON arguments from the LLM.
     :param session_async_tasks: Per-session async task map
@@ -8537,8 +8527,14 @@ async def _execute_task_lifecycle_tool(
     :param server_client: HTTP client pointed at the Omnigent server.
     :returns: JSON-encoded result string.
     """
+    # sys_cancel_task uses "task_id"; normalise to handle_id so
+    # _cancel_async_tool_result can check the in-memory async dispatch table.
+    task_id_arg = args.get("task_id")
+    normalised: _JsonObject = dict(args)
+    if task_id_arg and not normalised.get("handle_id"):
+        normalised = {**args, "handle_id": task_id_arg}
     async_result = _cancel_async_tool_result(
-        args,
+        normalised,
         session_async_tasks=session_async_tasks,
     )
     if not async_result.try_subagent_cancel:

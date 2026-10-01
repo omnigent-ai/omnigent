@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from omnigent.codex_approval_modes import (
+from omnigent.harnesses.codex_native.approval_modes import (
     CODEX_NATIVE_PERMISSION_PRESETS,
     CODEX_NATIVE_PERMISSION_VALUES,
     codex_permission_preset,

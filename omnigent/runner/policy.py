@@ -41,7 +41,7 @@ import logging
 from dataclasses import dataclass, replace
 from typing import Literal
 
-from omnigent.debug_logging import runner_primary_session_id
+from omnigent.observability.debug_logging import runner_primary_session_id
 from omnigent.policies import FunctionPolicy, resolve_function_policy
 from omnigent.policies.types import EvaluationContext, PolicyResult
 from omnigent.spec.types import (

@@ -15,8 +15,8 @@ from typing import Any
 
 import pytest
 
-from omnigent.inner import codex_executor
-from omnigent.inner.codex_executor import (
+from omnigent.harnesses.codex import executor as codex_executor
+from omnigent.harnesses.codex.executor import (
     extended_model_catalog,
     set_codex_model_catalog_path,
     write_codex_model_catalog,

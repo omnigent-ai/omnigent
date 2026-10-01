@@ -2,7 +2,7 @@
 
 The chat-first sibling of ``test_goose_native_cli_e2e``. The ``goose`` harness
 runs Block's Goose over the Agent Client Protocol (``goose acp``):
-:class:`omnigent.inner.goose_executor.GooseExecutor` spawns the subprocess,
+:class:`omnigent.harnesses.goose.executor.GooseExecutor` spawns the subprocess,
 streams ``agent_message_chunk`` updates as chat text, and routes Goose's mid-turn
 ``session/request_permission`` through Omnigent's TOOL_CALL policy + human-consent
 elicitation (the same bridges the runner's ExecutorAdapter installs). This test
@@ -33,8 +33,8 @@ from pathlib import Path
 
 import pytest
 
-from omnigent.inner.executor import ExecutorError, TextChunk, TurnComplete
-from omnigent.inner.goose_executor import GooseExecutor
+from omnigent.core.executor import ExecutorError, TextChunk, TurnComplete
+from omnigent.harnesses.goose.executor import GooseExecutor
 
 pytestmark = pytest.mark.skipif(
     os.environ.get("OMNIGENT_E2E_GOOSE") != "1"

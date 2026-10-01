@@ -16,10 +16,10 @@ from typing import TYPE_CHECKING
 import httpx
 
 from omnigent.errors import ErrorCode, OmnigentError
-from omnigent.harness_aliases import canonicalize_harness
+from omnigent.harnesses.aliases import canonicalize_harness
+from omnigent.harnesses.runtime import _HARNESS_MODULES
+from omnigent.observability import otel as telemetry
 from omnigent.runner.transports.ws_tunnel.transport import WSTunnelTransport
-from omnigent.runtime import telemetry
-from omnigent.runtime.harnesses import _HARNESS_MODULES
 from omnigent.spec import AgentSpec
 
 if TYPE_CHECKING:

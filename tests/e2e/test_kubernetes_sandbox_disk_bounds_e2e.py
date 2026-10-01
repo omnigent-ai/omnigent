@@ -120,7 +120,7 @@ def _spawn_server(
         [
             sys.executable,
             "-m",
-            "omnigent.cli",
+            "omnigent.cli.commands",
             "server",
             "--port",
             str(port),

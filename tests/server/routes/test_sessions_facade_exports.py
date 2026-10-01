@@ -20,7 +20,7 @@ def test_harness_override_executor_type_reexported() -> None:
     it is reachable through both the facade and the calling module's namespace.
     """
     from omnigent.server.routes import sessions as facade
-    from omnigent.server.routes._sessions import orchestration
+    from omnigent.server.routes.sessions import orchestration
 
     assert callable(facade._validated_harness_override_executor_type)
     assert callable(orchestration._validated_harness_override_executor_type)

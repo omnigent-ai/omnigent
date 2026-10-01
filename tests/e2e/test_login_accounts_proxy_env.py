@@ -120,7 +120,7 @@ def accounts_server(tmp_path: Path) -> Iterator[str]:
         [
             server_executable(),
             "-m",
-            "omnigent.cli",
+            "omnigent.cli.commands",
             "server",
             "--port",
             str(port),
@@ -165,7 +165,7 @@ def test_login_detects_accounts_auth_despite_proxy_env(
 
     child = pexpect.spawn(
         sys.executable,
-        ["-m", "omnigent.cli", "login", accounts_server],
+        ["-m", "omnigent.cli.commands", "login", accounts_server],
         env=env,
         cwd=str(_REPO_ROOT),
         encoding="utf-8",

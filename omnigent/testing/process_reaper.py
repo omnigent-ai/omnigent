@@ -1,7 +1,7 @@
 """Reap Omnigent processes leaked by a test session.
 
 Tests spawn real Omnigent subprocesses — detached host daemons
-(``omnigent.host._daemon_entry``), local servers (``omnigent.cli server``),
+(``omnigent.host._daemon_entry``), local servers (``omnigent.cli.commands server``),
 and runner zygotes (``omnigent.runner._zygote``). They are started with
 ``start_new_session=True``, so nothing reaps them when pytest exits:
 survivors squat the local server's preferred port (6767, displacing a

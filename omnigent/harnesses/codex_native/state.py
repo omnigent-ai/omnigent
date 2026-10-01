@@ -20,7 +20,7 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
-from omnigent.process_logging import data_dir
+from omnigent.observability.process_logging import data_dir
 
 _STATE_ROOT_ENV_VAR = "OMNIGENT_CODEX_NATIVE_STATE_DIR"
 _logger = logging.getLogger(__name__)

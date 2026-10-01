@@ -5,7 +5,7 @@ from concurrent.futures import ThreadPoolExecutor
 import pytest
 from sqlalchemy import update
 
-from omnigent.native.session_todos import validate_session_todos
+from omnigent.harnesses.native.session_todos import validate_session_todos
 from omnigent.stores.conversation_store import sqlalchemy_store as store_module
 
 TODOS = [{"content": "Verify the example", "status": "in_progress", "activeForm": "Verifying"}]

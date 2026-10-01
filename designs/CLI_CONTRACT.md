@@ -4,14 +4,14 @@ This is the contract every `omnigent` command follows when it writes to a
 terminal, so the whole CLI reads as one coherent, branded product. The
 runtime lives in two small modules:
 
-- **`omnigent/inner/ui.py`** — the styling layer: shared consoles, the
+- **`omnigent/cli/ui.py`** — the styling layer: shared consoles, the
   brand palette/theme, and the status/structure helpers. This is the
   module command code should import.
-- **`omnigent/inner/wordmark.py`** — the brand art: the Otto + "omnigent"
+- **`omnigent/cli/wordmark.py`** — the brand art: the Otto + "omnigent"
   wordmark lockup and the compact one-line brandmark. Imported by `ui`.
 
 The interactive REPL header keeps its own builder
-(`omnigent/inner/banner.py`) — that's the live-session box, not part of
+(`omnigent/cli/banner.py`) — that's the live-session box, not part of
 this non-interactive contract.
 
 ## The one rule: stdout is data, stderr is decoration
@@ -47,11 +47,11 @@ One brand accent; semantic colors stay conventional. Defined as a
 | `omni.muted`   | dim                | Metadata, secondary text             |
 
 `#F43BA6` is Otto's magenta — the single source is
-`omnigent.inner.mascots.MASCOT_ART_COLOR`, re-exported as `ui.ACCENT`.
+`omnigent.cli.mascots.MASCOT_ART_COLOR`, re-exported as `ui.ACCENT`.
 The `scripts/install_oss.sh` installer mirrors the same accent
 (`\033[38;2;244;59;166m`) so the installer and the tool agree.
 
-## Helper API (`omnigent.inner.ui`)
+## Helper API (`omnigent.cli.ui`)
 
 Status lines — consistent glyph + color, correct stream:
 

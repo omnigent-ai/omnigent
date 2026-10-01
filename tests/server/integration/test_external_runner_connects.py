@@ -103,7 +103,7 @@ def test_external_runner_connects_to_local_server(
     os.environ.update(clean_env)
 
     try:
-        from omnigent.cli import _start_cli_runner_process, _stop_cli_runner_process
+        from omnigent.cli.commands import _start_cli_runner_process, _stop_cli_runner_process
 
         runner = _start_cli_runner_process(
             server_url=base_url,

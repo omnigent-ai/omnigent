@@ -42,7 +42,7 @@ from typing import Protocol
 
 import httpx
 
-from omnigent.debug_logging import runner_primary_session_id
+from omnigent.observability.debug_logging import runner_primary_session_id
 from omnigent.runner.transports.ws_tunnel.frames import (
     Frame,
     HelloFrame,

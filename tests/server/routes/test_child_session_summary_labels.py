@@ -11,7 +11,7 @@ strip.
 from __future__ import annotations
 
 from omnigent.entities import Conversation
-from omnigent.server.routes._sessions.helpers import (
+from omnigent.server.routes.sessions.helpers import (
     _child_session_summary_from_conversation,
 )
 from omnigent.stores.conversation_store import pinned_label_key

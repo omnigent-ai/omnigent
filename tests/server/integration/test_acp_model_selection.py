@@ -13,8 +13,8 @@ import yaml
 
 from omnigent.runner.app import _build_spawn_env_from_spec
 from omnigent.runtime import get_agent_cache, get_agent_store, get_conversation_store
-from omnigent.server.routes._sessions import orchestration
-from omnigent.server.routes._sessions.helpers import _load_agent_spec_for_session
+from omnigent.server.routes.sessions import orchestration
+from omnigent.server.routes.sessions.helpers import _load_agent_spec_for_session
 from tests.server.helpers import build_agent_bundle, create_test_agent
 
 pytestmark = pytest.mark.asyncio

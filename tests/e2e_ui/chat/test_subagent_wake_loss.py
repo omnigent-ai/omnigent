@@ -93,7 +93,7 @@ def _register_parent_with_researcher(
     :param mock_base: Mock LLM ``/v1`` base URL.
     :returns: The new session id.
     """
-    from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN
+    from omnigent.util.runner_identity import OMNIGENT_INTERNAL_WS_ORIGIN
     from tests.e2e.conftest import lookup_agent_id, register_inline_agent
 
     parent_name = register_inline_agent(

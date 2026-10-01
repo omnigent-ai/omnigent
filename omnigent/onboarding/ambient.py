@@ -589,7 +589,7 @@ def claude_managed_gateway_display_name(paths: tuple[Path, ...] | None = None) -
         return "Claude Code gateway"
     # Lazy: the gateway-URL allowlist lives in its own module and is only
     # needed once a base URL is actually present.
-    from omnigent.databricks_ai_gateway import is_databricks_ai_gateway_url
+    from omnigent.models.databricks_ai_gateway import is_databricks_ai_gateway_url
 
     if is_databricks_ai_gateway_url(base_url):
         return "Databricks AI Gateway"

@@ -14,15 +14,15 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 
-from omnigent.inner.codex_executor import _CodexAppServerSession
-from omnigent.inner.codex_worker import (
+from omnigent.core.datamodel import OSEnvSandboxSpec, OSEnvSpec
+from omnigent.harnesses.codex.executor import _CodexAppServerSession
+from omnigent.harnesses.codex.worker import (
     _BROKERED_AUTH_SECRET_ENV,
     prepare_codex_catalog_probe,
     prepare_codex_worker,
 )
-from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
-from omnigent.inner.model_signer import SignerReadiness
-from omnigent.inner.sandbox import SandboxPolicy, with_additional_write_roots
+from omnigent.models.signer.lifecycle import SignerReadiness
+from omnigent.sandbox.core import SandboxPolicy, with_additional_write_roots
 
 
 class _Pipe:
@@ -61,11 +61,11 @@ def test_active_sandbox_wrap_failure_is_not_downgraded(
     codex_home.mkdir()
 
     monkeypatch.setattr(
-        "omnigent.inner.codex_worker.resolve_sandbox",
+        "omnigent.harnesses.codex.worker.resolve_sandbox",
         Mock(return_value=_active_policy(tmp_path)),
     )
     monkeypatch.setattr(
-        "omnigent.inner.codex_worker.get_backend",
+        "omnigent.harnesses.codex.worker.get_backend",
         Mock(side_effect=OSError("seatbelt unavailable")),
     )
 
@@ -93,11 +93,11 @@ def test_active_sandbox_preflights_before_creating_launcher(
     create_launcher = Mock()
 
     monkeypatch.setattr(
-        "omnigent.inner.codex_worker.resolve_sandbox",
+        "omnigent.harnesses.codex.worker.resolve_sandbox",
         Mock(return_value=_active_policy(tmp_path)),
     )
-    monkeypatch.setattr("omnigent.inner.codex_worker.get_backend", Mock(return_value=backend))
-    monkeypatch.setattr("omnigent.inner.codex_worker.create_exec_launcher", create_launcher)
+    monkeypatch.setattr("omnigent.harnesses.codex.worker.get_backend", Mock(return_value=backend))
+    monkeypatch.setattr("omnigent.harnesses.codex.worker.create_exec_launcher", create_launcher)
 
     with pytest.raises(OSError, match="cannot wrap"):
         prepare_codex_worker(
@@ -132,11 +132,11 @@ def test_successful_active_sandbox_returns_owned_launcher(
         return str(launcher)
 
     monkeypatch.setattr(
-        "omnigent.inner.codex_worker.resolve_sandbox",
+        "omnigent.harnesses.codex.worker.resolve_sandbox",
         Mock(return_value=_active_policy(tmp_path)),
     )
-    monkeypatch.setattr("omnigent.inner.codex_worker.get_backend", Mock(return_value=backend))
-    monkeypatch.setattr("omnigent.inner.codex_worker.create_exec_launcher", _create_launcher)
+    monkeypatch.setattr("omnigent.harnesses.codex.worker.get_backend", Mock(return_value=backend))
+    monkeypatch.setattr("omnigent.harnesses.codex.worker.create_exec_launcher", _create_launcher)
 
     worker = prepare_codex_worker(
         codex_path=str(codex),
@@ -182,11 +182,11 @@ def test_worker_grants_only_selected_skills_directory_read_only(
     backend.wrap_launcher_argv.return_value = ["/usr/bin/sandbox-exec", str(codex)]
     create_launcher = Mock(return_value=str(launcher))
     monkeypatch.setattr(
-        "omnigent.inner.codex_worker.resolve_sandbox",
+        "omnigent.harnesses.codex.worker.resolve_sandbox",
         Mock(return_value=_active_policy(workspace)),
     )
-    monkeypatch.setattr("omnigent.inner.codex_worker.get_backend", Mock(return_value=backend))
-    monkeypatch.setattr("omnigent.inner.codex_worker.create_exec_launcher", create_launcher)
+    monkeypatch.setattr("omnigent.harnesses.codex.worker.get_backend", Mock(return_value=backend))
+    monkeypatch.setattr("omnigent.harnesses.codex.worker.create_exec_launcher", create_launcher)
 
     worker = prepare_codex_worker(
         codex_path=str(codex),
@@ -242,11 +242,11 @@ def test_brokered_catalog_probe_is_network_denied(
         return str(launcher)
 
     monkeypatch.setattr(
-        "omnigent.inner.codex_worker.resolve_sandbox",
+        "omnigent.harnesses.codex.worker.resolve_sandbox",
         Mock(return_value=_active_policy(tmp_path)),
     )
-    monkeypatch.setattr("omnigent.inner.codex_worker.get_backend", Mock(return_value=backend))
-    monkeypatch.setattr("omnigent.inner.codex_worker.create_exec_launcher", _create_launcher)
+    monkeypatch.setattr("omnigent.harnesses.codex.worker.get_backend", Mock(return_value=backend))
+    monkeypatch.setattr("omnigent.harnesses.codex.worker.create_exec_launcher", _create_launcher)
 
     probe = prepare_codex_catalog_probe(
         codex_path=str(codex),
@@ -298,13 +298,13 @@ def test_non_signer_egress_rules_route_only_through_owned_proxy(
 
     start_proxy = Mock(return_value=handle)
     monkeypatch.setattr(
-        "omnigent.inner.codex_worker.resolve_sandbox",
+        "omnigent.harnesses.codex.worker.resolve_sandbox",
         Mock(return_value=_active_policy(tmp_path)),
     )
-    monkeypatch.setattr("omnigent.inner.codex_worker.get_backend", Mock(return_value=backend))
-    monkeypatch.setattr("omnigent.inner.codex_worker.create_exec_launcher", _create_launcher)
-    monkeypatch.setattr("omnigent.inner.codex_worker.create_private_tmpdir", _create_tmpdir)
-    monkeypatch.setattr("omnigent.inner.codex_worker.start_egress_proxy", start_proxy)
+    monkeypatch.setattr("omnigent.harnesses.codex.worker.get_backend", Mock(return_value=backend))
+    monkeypatch.setattr("omnigent.harnesses.codex.worker.create_exec_launcher", _create_launcher)
+    monkeypatch.setattr("omnigent.harnesses.codex.worker.create_private_tmpdir", _create_tmpdir)
+    monkeypatch.setattr("omnigent.harnesses.codex.worker.start_egress_proxy", start_proxy)
     worker_env = {"PATH": os.environ["PATH"], "CODEX_HOME": str(codex_home)}
 
     worker = prepare_codex_worker(
@@ -366,17 +366,17 @@ def test_non_signer_egress_setup_rolls_back_before_return(
         return egress_tmpdir
 
     monkeypatch.setattr(
-        "omnigent.inner.codex_worker.resolve_sandbox",
+        "omnigent.harnesses.codex.worker.resolve_sandbox",
         Mock(return_value=_active_policy(tmp_path)),
     )
-    monkeypatch.setattr("omnigent.inner.codex_worker.get_backend", Mock(return_value=backend))
+    monkeypatch.setattr("omnigent.harnesses.codex.worker.get_backend", Mock(return_value=backend))
     monkeypatch.setattr(
-        "omnigent.inner.codex_worker.create_exec_launcher",
+        "omnigent.harnesses.codex.worker.create_exec_launcher",
         Mock(side_effect=OSError("launcher failed")),
     )
-    monkeypatch.setattr("omnigent.inner.codex_worker.create_private_tmpdir", _create_tmpdir)
+    monkeypatch.setattr("omnigent.harnesses.codex.worker.create_private_tmpdir", _create_tmpdir)
     monkeypatch.setattr(
-        "omnigent.inner.codex_worker.start_egress_proxy",
+        "omnigent.harnesses.codex.worker.start_egress_proxy",
         Mock(return_value=handle),
     )
 
@@ -431,11 +431,11 @@ def test_signer_readiness_adds_only_relay_and_public_ca(
         return str(launcher)
 
     monkeypatch.setattr(
-        "omnigent.inner.codex_worker.resolve_sandbox",
+        "omnigent.harnesses.codex.worker.resolve_sandbox",
         Mock(return_value=_active_policy(tmp_path)),
     )
-    monkeypatch.setattr("omnigent.inner.codex_worker.get_backend", Mock(return_value=backend))
-    monkeypatch.setattr("omnigent.inner.codex_worker.create_exec_launcher", _create_launcher)
+    monkeypatch.setattr("omnigent.harnesses.codex.worker.get_backend", Mock(return_value=backend))
+    monkeypatch.setattr("omnigent.harnesses.codex.worker.create_exec_launcher", _create_launcher)
     secret_env = {
         name: f"host-secret-{index}" for index, name in enumerate(_BROKERED_AUTH_SECRET_ENV)
     }
@@ -552,11 +552,11 @@ async def test_session_containment_failure_prevents_worker_spawn(
 ) -> None:
     spawn = AsyncMock()
     monkeypatch.setattr(
-        "omnigent.inner.codex_executor.prepare_codex_worker",
+        "omnigent.harnesses.codex.executor.prepare_codex_worker",
         Mock(side_effect=OSError("containment failed")),
     )
-    monkeypatch.setattr("omnigent.inner.codex_executor._create_subprocess_exec", spawn)
-    monkeypatch.setattr("omnigent.inner.codex_executor._populate_codex_home_config", Mock())
+    monkeypatch.setattr("omnigent.harnesses.codex.executor._create_subprocess_exec", spawn)
+    monkeypatch.setattr("omnigent.harnesses.codex.executor._populate_codex_home_config", Mock())
 
     session = _CodexAppServerSession(
         codex_path="/bin/echo",
@@ -588,11 +588,11 @@ async def test_session_spawns_owned_launcher_and_releases_it(
     process.wait = AsyncMock(return_value=0)
     spawn = AsyncMock(return_value=process)
     monkeypatch.setattr(
-        "omnigent.inner.codex_executor.prepare_codex_worker",
+        "omnigent.harnesses.codex.executor.prepare_codex_worker",
         Mock(return_value=worker),
     )
-    monkeypatch.setattr("omnigent.inner.codex_executor._create_subprocess_exec", spawn)
-    monkeypatch.setattr("omnigent.inner.codex_executor._populate_codex_home_config", Mock())
+    monkeypatch.setattr("omnigent.harnesses.codex.executor._create_subprocess_exec", spawn)
+    monkeypatch.setattr("omnigent.harnesses.codex.executor._populate_codex_home_config", Mock())
 
     session = _CodexAppServerSession(
         codex_path="/bin/echo",
@@ -606,7 +606,7 @@ async def test_session_spawns_owned_launcher_and_releases_it(
     await session.start()
 
     assert spawn.await_args is not None
-    assert Path(spawn.await_args.args[1]).name == "_liveness_exec.py"
+    assert Path(spawn.await_args.args[1]).name == "liveness_exec.py"
     assert "/private/sandbox-launcher" in spawn.await_args.args
     assert spawn.await_args.kwargs["pass_fds"]
     assert session._containment_confirmed
@@ -620,14 +620,14 @@ async def test_spawn_failure_releases_launcher_and_private_home(
 ) -> None:
     worker = Mock(launch_path="/private/sandbox-launcher", sandboxed=True)
     monkeypatch.setattr(
-        "omnigent.inner.codex_executor.prepare_codex_worker",
+        "omnigent.harnesses.codex.executor.prepare_codex_worker",
         Mock(return_value=worker),
     )
     monkeypatch.setattr(
-        "omnigent.inner.codex_executor._create_subprocess_exec",
+        "omnigent.harnesses.codex.executor._create_subprocess_exec",
         AsyncMock(side_effect=OSError("spawn failed")),
     )
-    monkeypatch.setattr("omnigent.inner.codex_executor._populate_codex_home_config", Mock())
+    monkeypatch.setattr("omnigent.harnesses.codex.executor._populate_codex_home_config", Mock())
     session = _CodexAppServerSession(
         codex_path="/bin/echo",
         cwd=str(tmp_path),

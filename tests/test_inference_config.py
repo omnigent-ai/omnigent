@@ -11,7 +11,7 @@ from typing import Any
 import pytest
 
 from omnigent.errors import ErrorCode, OmnigentError
-from omnigent.inference_config import (
+from omnigent.models.inference_config import (
     binding_for_harness,
     inference_config_scope,
     inference_revision,

@@ -126,14 +126,14 @@ def _resolve_gateway_env_from_spawn_env(env: dict[str, str]) -> dict[str, str]:
     """Resolve gateway credentials exactly as the claude-sdk harness does.
 
     Mirrors ``_build_claude_sdk_executor`` in
-    ``omnigent/inner/claude_sdk_harness.py``: the spawn env's gateway
+    ``omnigent/harnesses/claude_sdk/harness.py``: the spawn env's gateway
     values (any of which may be absent) are threaded into
-    :func:`~omnigent.inner.claude_sdk_executor._resolve_gateway_env`.
+    :func:`~omnigent.harnesses.claude_sdk.executor._resolve_gateway_env`.
 
     :param env: The spawn-env dict from :func:`_build_claude_sdk_spawn_env`.
     :returns: The resolved gateway env (``{}`` means "no credentials").
     """
-    from omnigent.inner.claude_sdk_executor import _resolve_gateway_env
+    from omnigent.harnesses.claude_sdk.executor import _resolve_gateway_env
 
     return _resolve_gateway_env(
         env.get("HARNESS_CLAUDE_SDK_DATABRICKS_PROFILE"),
@@ -217,7 +217,7 @@ def test_executor_constructs_with_oauth_profile(
     for every launch with an OAuth U2M profile. After the fix it constructs
     and carries a usable ``ANTHROPIC_BASE_URL`` in its spawn extra-env.
     """
-    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+    from omnigent.harnesses.claude_sdk.executor import ClaudeSDKExecutor
 
     spec = _make_claude_databricks_spec()
     env = _build_claude_sdk_spawn_env(spec, workdir=None)

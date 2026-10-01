@@ -11,8 +11,8 @@ import pytest
 import yaml
 
 import omnigent.onboarding.harness_install as hi
-from omnigent.acp_cli_harnesses import ACP_CLI_HARNESSES
-from omnigent.harness_availability import HARNESS_VERSION_TOO_LOW
+from omnigent.harnesses.acp.cli_harnesses import ACP_CLI_HARNESSES
+from omnigent.harnesses.availability import HARNESS_VERSION_TOO_LOW
 from omnigent.onboarding.harness_readiness import (
     _READINESS_PROBE_MAX_WORKERS,
     configured_harness_map,
@@ -86,7 +86,7 @@ def _isolate_cli_credentials(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) ->
     # an OMNIGENT_CODEX_PATH override and probes on-disk global install dirs.
     # Clear the override and stub the fallback dirs so a developer's real codex
     # install can't flip the binary-missing verdict these tests assert.
-    import omnigent._platform as platform
+    import omnigent.util.portability as platform
 
     monkeypatch.delenv("OMNIGENT_CODEX_PATH", raising=False)
     monkeypatch.setattr(platform, "_cli_fallback_dirs", lambda: ())

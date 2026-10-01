@@ -4,12 +4,12 @@ from __future__ import annotations
 
 import pytest
 
-from omnigent.inner.model_egress import (
+from omnigent.models.signer.egress import (
     FrozenModelRoute,
     ProviderModelBinding,
     resolve_model_routes,
 )
-from omnigent.inner.model_signer import SignerLaunchConfig
+from omnigent.models.signer.lifecycle import SignerLaunchConfig
 
 _HOST = "workspace.cloud.databricks.com"
 _PREFIX = "/serving-endpoints/openai"

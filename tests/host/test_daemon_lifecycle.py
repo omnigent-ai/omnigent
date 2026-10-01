@@ -63,7 +63,7 @@ def test_equivalent_server_urls_share_record_path(tmp_path: Path) -> None:
 def test_find_daemon_record_reuses_legacy_url_spelling(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from omnigent import cli
+    from omnigent.cli import commands as cli
 
     monkeypatch.setattr(cli, "_HOST_PID_PATH", tmp_path / "host.pid")
     legacy_target = "https://X.Example.COM:443/api"
@@ -86,7 +86,7 @@ def test_find_daemon_record_reuses_legacy_url_spelling(
 def test_reuse_legacy_record_probes_its_original_lock_path(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from omnigent import cli
+    from omnigent.cli import commands as cli
 
     monkeypatch.setattr(cli, "_HOST_PID_PATH", tmp_path / "host.pid")
     legacy_target = "https://X.Example.COM:443/api"
@@ -218,7 +218,7 @@ def test_background_daemon_claims_record_before_connecting(
     """The elected child owns and records the target before opening a tunnel."""
     from omnigent.host import _daemon_entry
     from omnigent.host import identity as identity_module
-    from omnigent.process_logging import DATA_DIR_ENV_VAR
+    from omnigent.observability.process_logging import DATA_DIR_ENV_VAR
 
     target = "https://server.example.com"
     log_path = tmp_path / "host.log"
@@ -226,7 +226,8 @@ def test_background_daemon_claims_record_before_connecting(
     monkeypatch.setenv("OMNIGENT_HOST_DAEMON_CONFIG_SIG", "config-signature")
     monkeypatch.setattr(sys, "argv", ["omnigent.host._daemon_entry", "--server", target])
     monkeypatch.setattr(
-        "omnigent.process_logging.configure_process_logging", lambda *_a, **_kw: log_path
+        "omnigent.observability.process_logging.configure_process_logging",
+        lambda *_a, **_kw: log_path,
     )
     monkeypatch.setattr(
         identity_module,
@@ -258,13 +259,13 @@ def test_background_daemon_loser_exits_before_connecting(
 ) -> None:
     """A second child for one target exits without replacing the live owner."""
     from omnigent.host import _daemon_entry
-    from omnigent.process_logging import DATA_DIR_ENV_VAR
+    from omnigent.observability.process_logging import DATA_DIR_ENV_VAR
 
     target = "https://server.example.com"
     monkeypatch.setenv(DATA_DIR_ENV_VAR, str(tmp_path))
     monkeypatch.setattr(sys, "argv", ["omnigent.host._daemon_entry", "--server", target])
     monkeypatch.setattr(
-        "omnigent.process_logging.configure_process_logging",
+        "omnigent.observability.process_logging.configure_process_logging",
         lambda *_a, **_kw: tmp_path / "loser.log",
     )
     monkeypatch.setattr(
@@ -283,7 +284,7 @@ def test_background_daemon_loser_exits_before_connecting(
 
 
 def _record(target: str, pid: int) -> HostDaemonRecord:
-    from omnigent import cli
+    from omnigent.cli import commands as cli
 
     return cli._HostDaemonRecord(
         pid=pid,
@@ -298,7 +299,7 @@ def _record(target: str, pid: int) -> HostDaemonRecord:
 def test_daemon_owner_is_live_flock_then_pid(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from omnigent import cli
+    from omnigent.cli import commands as cli
 
     monkeypatch.setattr(cli, "_HOST_PID_PATH", tmp_path / "host.pid")
     target = "local"
@@ -326,7 +327,7 @@ def test_daemon_owner_is_live_flock_then_pid(
 def test_live_daemon_conflict_uses_flock_then_pid(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from omnigent import cli
+    from omnigent.cli import commands as cli
 
     monkeypatch.setattr(cli, "_HOST_PID_PATH", tmp_path / "host.pid")
     target = "local"
@@ -348,7 +349,7 @@ def test_live_daemon_conflict_uses_flock_then_pid(
 def test_live_daemon_conflict_probes_legacy_record_lock_path(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from omnigent import cli
+    from omnigent.cli import commands as cli
 
     monkeypatch.setattr(cli, "_HOST_PID_PATH", tmp_path / "host.pid")
     legacy_target = "https://X.Example.COM:443/api"

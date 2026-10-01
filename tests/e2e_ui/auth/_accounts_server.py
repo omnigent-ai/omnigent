@@ -176,7 +176,7 @@ def spawn_accounts_server(mock_llm_server_url: str, server_tmp) -> Iterator[Acco
         [
             sys.executable,
             "-c",
-            "from omnigent.cli import main; main()",
+            "from omnigent.cli.commands import main; main()",
             "server",
             "--host",
             "127.0.0.1",

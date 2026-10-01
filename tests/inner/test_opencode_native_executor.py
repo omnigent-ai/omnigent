@@ -9,6 +9,7 @@ from typing import Any
 import httpx
 import pytest
 
+from omnigent.core.executor import ExecutorError, TurnComplete
 from omnigent.harnesses.opencode_native import http_transport as transport_mod
 from omnigent.harnesses.opencode_native.bridge import (
     OPENCODE_NATIVE_REQUEST_SESSION_ID_ENV_VAR,
@@ -16,8 +17,7 @@ from omnigent.harnesses.opencode_native.bridge import (
     write_bridge_state,
 )
 from omnigent.harnesses.opencode_native.client import OpenCodeClient
-from omnigent.inner.executor import ExecutorError, TurnComplete
-from omnigent.inner.opencode_native_executor import OpenCodeNativeExecutor
+from omnigent.harnesses.opencode_native.executor import OpenCodeNativeExecutor
 
 _PNG_B64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="  # noqa: E501
 _PNG_DATA_URI = f"data:image/png;base64,{_PNG_B64}"
@@ -316,7 +316,7 @@ def test_harness_create_app_builds_fastapi() -> None:
     """The ``opencode-native`` harness module builds a FastAPI app (lazy executor)."""
     from fastapi import FastAPI
 
-    from omnigent.inner.opencode_native_harness import create_app
+    from omnigent.harnesses.opencode_native.harness import create_app
 
     assert isinstance(create_app(), FastAPI)
 
@@ -326,7 +326,7 @@ def test_harness_executor_factory_builds_from_env(
 ) -> None:
     """The harness executor factory constructs an executor from the spawn env."""
     from omnigent.harnesses.opencode_native.bridge import OPENCODE_NATIVE_BRIDGE_DIR_ENV_VAR
-    from omnigent.inner.opencode_native_harness import _build_opencode_native_executor
+    from omnigent.harnesses.opencode_native.harness import _build_opencode_native_executor
 
     monkeypatch.setenv(OPENCODE_NATIVE_BRIDGE_DIR_ENV_VAR, str(tmp_path))
     assert isinstance(_build_opencode_native_executor(), OpenCodeNativeExecutor)

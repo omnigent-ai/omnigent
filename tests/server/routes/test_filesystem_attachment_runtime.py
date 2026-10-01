@@ -6,11 +6,11 @@ import pytest
 
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.host.frames import HostHelloFrame, decode_host_frame, encode_host_frame
-from omnigent.inner.native_attachments import CAP_FILESYSTEM_ATTACHMENTS
 from omnigent.runner.transports.ws_tunnel.frames import HelloFrame, decode_frame, encode_frame
 from omnigent.runner.transports.ws_tunnel.registry import TunnelRegistry
 from omnigent.server.host_registry import HostRegistry
-from omnigent.server.routes._sessions.helpers import require_filesystem_attachment_runtime
+from omnigent.server.routes.sessions.helpers import require_filesystem_attachment_runtime
+from omnigent.util.attachments import CAP_FILESYSTEM_ATTACHMENTS
 
 
 @pytest.mark.asyncio

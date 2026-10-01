@@ -11,8 +11,8 @@ from types import SimpleNamespace
 
 import pytest
 
-import omnigent.inner.terminal as terminal_mod
-from omnigent.native import owner_claim
+import omnigent.terminals.terminal as terminal_mod
+from omnigent.harnesses.native import owner_claim
 
 
 @pytest.mark.parametrize("failure", ["spawn", "timeout", "nonzero"])

@@ -8,7 +8,7 @@ import sys
 
 import pytest
 
-from omnigent.runner.identity import (
+from omnigent.util.runner_identity import (
     RUNNER_AUTH_SECRET_ENV_VARS,
     RUNNER_CONNECT_MARKER_ENV_VAR,
     RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR,
@@ -107,7 +107,7 @@ def test_strip_runner_auth_secrets_does_not_mutate_input() -> None:
 
 
 def test_importing_identity_does_not_pull_in_fastapi() -> None:
-    """``import omnigent.runner.identity`` stays free of the FastAPI stack.
+    """``import omnigent.util.runner_identity`` stays free of the FastAPI stack.
 
     The helper is imported at every runner→child spawn boundary —
     including the sandbox launcher, which re-execs a fresh interpreter
@@ -125,7 +125,7 @@ def test_importing_identity_does_not_pull_in_fastapi() -> None:
     """
     probe = (
         "import sys\n"
-        "import omnigent.runner.identity\n"
+        "import omnigent.util.runner_identity\n"
         "assert 'fastapi' not in sys.modules, 'fastapi loaded via identity import'\n"
         "assert 'omnigent.runner.app' not in sys.modules, "
         "'runner.app loaded via identity import'\n"

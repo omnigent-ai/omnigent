@@ -1,6 +1,6 @@
 """E2E coverage for the ``OMNIGENT_MODEL`` env-var fallback on ``omnigent run``.
 
-The fallback fires in ``omnigent/chat.py:_apply_overrides_to_raw`` when the
+The fallback fires in ``omnigent/cli/chat.py:_apply_overrides_to_raw`` when the
 spec has no ``executor.model`` / ``executor.harness`` and no ``--model`` /
 ``--harness`` flag is passed. Helper-level coverage lives in
 ``tests/cli/test_chat.py``; this file spawns a real subprocess so a regression

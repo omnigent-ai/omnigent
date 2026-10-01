@@ -35,7 +35,7 @@ def _profile_from_config() -> str | None:
        ``runtime/workflow.py`` ``DATABRICKS_KIND`` branch), so the bench must too
        or a no-flag run would go offline where ``omni run`` goes live.
 
-    All imports are lazy so importing this module never drags in ``omnigent.cli``
+    All imports are lazy so importing this module never drags in ``omnigent.cli.commands``
     at load time.
     """
     from omnigent.config import load_effective_config, load_global_config

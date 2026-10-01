@@ -7,7 +7,7 @@ the workspace over the host tunnel instead of returning 502. This module
 mirrors ``_host_worktree``: enqueue a ``host.fs_request`` frame, register
 a future on the host connection, and await the ``host.fs_result``.
 
-The host runs :class:`omnigent.workspace_fs.WorkspaceReader` and returns
+The host runs :class:`omnigent.host.workspace_fs.WorkspaceReader` and returns
 the same JSON the runner's filesystem endpoints would, so the endpoint
 layer and the frontend cannot tell which side answered.
 """

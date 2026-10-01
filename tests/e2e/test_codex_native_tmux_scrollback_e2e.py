@@ -57,7 +57,7 @@ from pathlib import Path
 import pexpect
 import pytest
 
-from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec, TerminalEnvSpec
+from omnigent.core.datamodel import OSEnvSandboxSpec, OSEnvSpec, TerminalEnvSpec
 from omnigent.terminals import TerminalRegistry
 
 pytestmark = pytest.mark.skipif(shutil.which("tmux") is None, reason="requires tmux on PATH")

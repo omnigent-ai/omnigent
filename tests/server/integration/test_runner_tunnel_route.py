@@ -19,7 +19,6 @@ from starlette.requests import HTTPConnection
 
 from omnigent.errors import OmnigentError
 from omnigent.runner import create_runner_app
-from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
 from omnigent.runner.transports.ws_tunnel.frames import (
     EVENT_INGEST_CAPABILITY,
     EventAckFrame,
@@ -36,6 +35,7 @@ from omnigent.runner.transports.ws_tunnel.serve import dispatch_via_asgi
 from omnigent.runner.transports.ws_tunnel.transport import WSTunnelTransport
 from omnigent.server.auth import RESERVED_USER_LOCAL, AuthProvider
 from omnigent.server.routes.runner_tunnel import create_runner_tunnel_router
+from omnigent.util.runner_identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
 from tests.budgets import budget
 from tests.runner.helpers import NullServerClient
 

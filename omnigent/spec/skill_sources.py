@@ -116,7 +116,7 @@ def skill_source_context_from_env(
     configured_claude_dir = os.environ.get("CLAUDE_CONFIG_DIR")
     codex_home: Path | None = None
     if _harness_family(harness) == "codex":
-        from omnigent.inner.codex_executor import _codex_home_config_source_from_env
+        from omnigent.harnesses.codex.executor import _codex_home_config_source_from_env
 
         # Nested runners can inherit a private Codex home; use its original source.
         codex_home = _codex_home_config_source_from_env()
@@ -233,7 +233,7 @@ def resolve_harness_skills(ctx: SkillSourceContext, harness: str | None) -> list
         internal orchestration skills, not user-typeable slash commands
         (applied uniformly across every harness).
     """
-    from omnigent.harness_aliases import is_native_harness
+    from omnigent.harnesses.aliases import is_native_harness
 
     family = _harness_family(harness)
     provider = _SKILL_SOURCES.get(family, _generic_host_skills)
@@ -249,7 +249,7 @@ def resolve_session_skills(
     spec: AgentSpec, roots: tuple[Path, ...], bundle_dir: Path | None
 ) -> list[SkillSpec]:
     """Use identical precedence and filters for menu discovery and invocation."""
-    from omnigent.harness_aliases import canonicalize_harness
+    from omnigent.harnesses.aliases import canonicalize_harness
 
     merged = [s for s in spec.skills if s.user_invocable]
     seen = {s.name for s in spec.skills}
@@ -499,7 +499,7 @@ def codex_host_skills(ctx: SkillSourceContext) -> list[SkillSpec]:
     standalone sources. Ask the CLI for installed versions and enabled state
     so plugin namespaces survive and stale cached skills stay hidden.
     """
-    from omnigent.inner.codex_executor import codex_skill_sources, select_codex_skill_dirs
+    from omnigent.harnesses.codex.executor import codex_skill_sources, select_codex_skill_dirs
     from omnigent.spec.codex_plugin_skills import discover_codex_plugin_skills
 
     host_override = ctx.codex_home if ctx.is_native else None

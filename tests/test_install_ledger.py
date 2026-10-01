@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from omnigent import install_ledger
+from omnigent.onboarding import install_ledger
 
 
 def test_install_ledger_round_trip_and_mode(tmp_path: Path, monkeypatch) -> None:

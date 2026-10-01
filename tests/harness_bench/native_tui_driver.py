@@ -20,15 +20,15 @@ from pathlib import Path
 
 import httpx
 
-from omnigent.harness_capabilities import AuthModel, IntegrationMode
-from omnigent.harness_plugins import harness_capabilities
+from omnigent.harnesses.capabilities import AuthModel, IntegrationMode
+from omnigent.harnesses.native.terminal import bind_session_runner
+from omnigent.harnesses.registry import harness_capabilities
 from omnigent.host.daemon_launch import (
     launch_or_reuse_daemon_runner,
     wait_for_host_online,
     wait_for_runner_online,
 )
-from omnigent.native.native_terminal import bind_session_runner
-from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN
+from omnigent.util.runner_identity import OMNIGENT_INTERNAL_WS_ORIGIN
 from tests._helpers.compat import apply_runner_env, compat_runner_cwd, runner_executable
 from tests._helpers.live_server import find_free_port
 from tests.e2e._harness_probes import cli_unavailable_reason
@@ -167,7 +167,7 @@ def native_vendor(harness: str) -> NativeVendor | None:
     """Derive the :class:`NativeVendor` for *harness* from its capabilities.
 
     Returns ``None`` unless the harness declares ``integration_mode ==
-    NATIVE_TUI`` in :func:`omnigent.harness_plugins.harness_capabilities`
+    NATIVE_TUI`` in :func:`omnigent.harnesses.registry.harness_capabilities`
     (which already discovers community plugins via entry points), so any
     native-tui harness is drivable by name with no per-vendor table here.
     ``native-server`` harnesses (e.g. opencode-native) are a different

@@ -7,7 +7,7 @@ import pytest
 from sqlalchemy import event
 
 from omnigent.entities import MessageData, NewConversationItem
-from omnigent.server.routes._sessions.orchestration import (
+from omnigent.server.routes.sessions.orchestration import (
     _persist_external_conversation_item,
     _persist_external_conversation_items,
 )

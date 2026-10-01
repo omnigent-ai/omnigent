@@ -31,7 +31,7 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 
 # The binary omnigent installs and drives for the Antigravity native harness
 # (see agy_binary_path() in omnigent/antigravity_native_launch.py and the
-# "agy" aliases in omnigent/harness_plugins.py).
+# "agy" aliases in omnigent/harnesses/registry.py).
 _LAUNCHED_BINARY = "agy"
 
 _BENCH_CMD = [

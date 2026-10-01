@@ -287,7 +287,7 @@ def test_session_resources_e2e(
     :param tmp_path: Pytest temp directory for the agent YAML
         and SQLite database.
     """
-    from omnigent.runner.identity import token_bound_runner_id
+    from omnigent.util.runner_identity import token_bound_runner_id
 
     python = omnigent_python
     repo_root = omnigent_repo_root
@@ -514,7 +514,7 @@ def test_direct_attach_e2e(
     import websockets
     from websockets.exceptions import InvalidStatus
 
-    from omnigent.runner.identity import token_bound_runner_id
+    from omnigent.util.runner_identity import token_bound_runner_id
 
     python = omnigent_python
     repo_root = omnigent_repo_root

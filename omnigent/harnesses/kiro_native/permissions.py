@@ -204,7 +204,7 @@ async def supervise_kiro_permission_mirror(
     pending: dict[str, _PendingPermission] = {}
     queued: dict[str, KiroPermissionRequest] = {}
     timeout = httpx.Timeout(_POST_TIMEOUT_S, connect=10.0)
-    from omnigent.cli_auth import open_server_client
+    from omnigent.cli.auth import open_server_client
 
     async with open_server_client(base_url, headers=headers, auth=auth, timeout=timeout) as client:
         while True:

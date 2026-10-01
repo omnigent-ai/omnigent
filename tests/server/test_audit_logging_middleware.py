@@ -14,7 +14,7 @@ import pytest
 from fastapi import FastAPI
 from starlette.requests import Request
 
-from omnigent import debug_logging as dl
+from omnigent.observability import debug_logging as dl
 from omnigent.server.app import _resolve_audit_route
 
 

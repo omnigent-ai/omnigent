@@ -32,8 +32,8 @@ import httpx
 import pytest
 import yaml
 
-from omnigent.native.native_coding_agents import CLAUDE_NATIVE_AGENT_NAME
-from omnigent.process_logging import PROCESS_LOG_FILE_ENV_VAR
+from omnigent.harnesses.native.coding_agents import CLAUDE_NATIVE_AGENT_NAME
+from omnigent.observability.process_logging import PROCESS_LOG_FILE_ENV_VAR
 from tests._helpers.compat import apply_runner_env, compat_runner_cwd, runner_executable
 from tests.e2e.conftest import (
     POLL_INTERVAL_S,

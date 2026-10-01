@@ -394,7 +394,7 @@ the stored `{token, user_id, expires_at}` record simply lapsed, default
   the client persisting) into a permanently revoked grant. Only the
   short-lived access token is renewed; revocation and the absolute lifetime
   cap still bound exposure. Device grants keep rotating.
-- **Renewal** — `omnigent.cli_auth.refresh_stored_token` POSTs
+- **Renewal** — `omnigent.cli.auth.refresh_stored_token` POSTs
   `grant_type=refresh_token`, persists the result, and returns the
   fresh access token. The runner/host auth-token factory
   calls it when the stored token lapses, and the host tunnel rebuilds

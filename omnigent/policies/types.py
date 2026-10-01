@@ -75,7 +75,7 @@ _log = logging.getLogger(__name__)
 # phases.
 #
 # Defined once here so the enforcement sites
-# (``omnigent.runner.app`` and ``omnigent.runtime.harnesses._scaffold``)
+# (``omnigent.runner.app`` and ``omnigent.harnesses.runtime._scaffold``)
 # can't drift if the set of fail-closed phases changes.
 FAIL_CLOSED_PHASES: tuple[str, ...] = ("PHASE_TOOL_CALL", "PHASE_REQUEST")
 

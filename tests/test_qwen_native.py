@@ -283,7 +283,7 @@ async def test_prepare_reattaches_running_terminal(monkeypatch: pytest.MonkeyPat
         headers={},
         session_id="conv",
         session_bundle=None,
-        qwen_args=(),
+        extra_args=(),
         host_id="host",
         workspace="/ws",
     )
@@ -303,7 +303,7 @@ async def test_prepare_rejects_non_qwen_session(monkeypatch: pytest.MonkeyPatch)
             headers={},
             session_id="conv",
             session_bundle=None,
-            qwen_args=(),
+            extra_args=(),
             host_id="host",
             workspace="/ws",
         )
@@ -325,7 +325,7 @@ async def test_prepare_creates_and_launches_terminal(monkeypatch: pytest.MonkeyP
         headers={},
         session_id=None,
         session_bundle=b"bundle",
-        qwen_args=("-m", "x"),
+        extra_args=("-m", "x"),
         host_id="host",
         workspace="/ws",
     )
@@ -342,7 +342,7 @@ async def test_prepare_requires_bundle_for_new_session() -> None:
             headers={},
             session_id=None,
             session_bundle=None,
-            qwen_args=(),
+            extra_args=(),
             host_id="host",
             workspace="/ws",
         )

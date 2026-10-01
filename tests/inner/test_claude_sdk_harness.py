@@ -22,8 +22,8 @@ from unittest.mock import patch
 
 import pytest
 
-from omnigent.inner import claude_sdk_harness
-from omnigent.runtime.harnesses import _HARNESS_MODULES
+from omnigent.harnesses.claude_sdk import harness as claude_sdk_harness
+from omnigent.harnesses.runtime import _HARNESS_MODULES
 
 
 def test_harness_module_registered_in_module_registry() -> None:
@@ -32,8 +32,8 @@ def test_harness_module_registered_in_module_registry() -> None:
     Without this entry, the runner subprocess can't find the wrap
     when AP-side tries to spawn it.
     """
-    assert _HARNESS_MODULES.get("claude-sdk") == "omnigent.inner.claude_sdk_harness"
-    assert _HARNESS_MODULES.get("claude") == "omnigent.inner.claude_sdk_harness"
+    assert _HARNESS_MODULES.get("claude-sdk") == "omnigent.harnesses.claude_sdk.harness"
+    assert _HARNESS_MODULES.get("claude") == "omnigent.harnesses.claude_sdk.harness"
 
 
 def test_create_app_returns_fastapi_with_required_routes() -> None:
@@ -109,7 +109,7 @@ def test_executor_factory_reads_env_vars(
         captured["gateway_auth_refresh_interval_ms"] = gateway_auth_refresh_interval_ms
 
     with patch(
-        "omnigent.inner.claude_sdk_harness.ClaudeSDKExecutor.__init__",
+        "omnigent.harnesses.claude_sdk.harness.ClaudeSDKExecutor.__init__",
         _fake_init,
     ):
         claude_sdk_harness._build_claude_sdk_executor()
@@ -159,7 +159,7 @@ def test_executor_factory_cwd_falls_back_to_runner_workspace(
         captured["cwd"] = cwd
 
     with patch(
-        "omnigent.inner.claude_sdk_harness.ClaudeSDKExecutor.__init__",
+        "omnigent.harnesses.claude_sdk.harness.ClaudeSDKExecutor.__init__",
         _fake_init,
     ):
         claude_sdk_harness._build_claude_sdk_executor()
@@ -181,7 +181,7 @@ def test_executor_factory_explicit_cwd_wins_over_workspace(
         captured["cwd"] = cwd
 
     with patch(
-        "omnigent.inner.claude_sdk_harness.ClaudeSDKExecutor.__init__",
+        "omnigent.harnesses.claude_sdk.harness.ClaudeSDKExecutor.__init__",
         _fake_init,
     ):
         claude_sdk_harness._build_claude_sdk_executor()
@@ -240,7 +240,7 @@ def test_executor_factory_decodes_os_env_json(
         captured["os_env"] = os_env
 
     with patch(
-        "omnigent.inner.claude_sdk_harness.ClaudeSDKExecutor.__init__",
+        "omnigent.harnesses.claude_sdk.harness.ClaudeSDKExecutor.__init__",
         _fake_init,
     ):
         claude_sdk_harness._build_claude_sdk_executor()
@@ -290,7 +290,7 @@ def test_executor_factory_falls_back_on_malformed_os_env_json(
         captured["os_env"] = os_env
 
     with patch(
-        "omnigent.inner.claude_sdk_harness.ClaudeSDKExecutor.__init__",
+        "omnigent.harnesses.claude_sdk.harness.ClaudeSDKExecutor.__init__",
         _fake_init,
     ):
         claude_sdk_harness._build_claude_sdk_executor()
@@ -339,7 +339,7 @@ def test_databricks_env_var_truthy_parsing(
         captured.update(kwargs)
 
     with patch(
-        "omnigent.inner.claude_sdk_harness.ClaudeSDKExecutor.__init__",
+        "omnigent.harnesses.claude_sdk.harness.ClaudeSDKExecutor.__init__",
         _fake_init,
     ):
         claude_sdk_harness._build_claude_sdk_executor()
@@ -378,7 +378,7 @@ def test_skills_filter_env_var_decodes(
         captured.update(kwargs)
 
     with patch(
-        "omnigent.inner.claude_sdk_harness.ClaudeSDKExecutor.__init__",
+        "omnigent.harnesses.claude_sdk.harness.ClaudeSDKExecutor.__init__",
         _fake_init,
     ):
         claude_sdk_harness._build_claude_sdk_executor()
@@ -402,7 +402,7 @@ def test_skills_filter_env_var_missing_falls_back_to_all(
         captured.update(kwargs)
 
     with patch(
-        "omnigent.inner.claude_sdk_harness.ClaudeSDKExecutor.__init__",
+        "omnigent.harnesses.claude_sdk.harness.ClaudeSDKExecutor.__init__",
         _fake_init,
     ):
         claude_sdk_harness._build_claude_sdk_executor()
@@ -427,7 +427,7 @@ def test_skills_filter_env_var_malformed_json_falls_back_to_all(
         captured.update(kwargs)
 
     with patch(
-        "omnigent.inner.claude_sdk_harness.ClaudeSDKExecutor.__init__",
+        "omnigent.harnesses.claude_sdk.harness.ClaudeSDKExecutor.__init__",
         _fake_init,
     ):
         claude_sdk_harness._build_claude_sdk_executor()
@@ -458,7 +458,7 @@ def test_bundle_dir_and_agent_name_env_vars_thread_through(
         captured.update(kwargs)
 
     with patch(
-        "omnigent.inner.claude_sdk_harness.ClaudeSDKExecutor.__init__",
+        "omnigent.harnesses.claude_sdk.harness.ClaudeSDKExecutor.__init__",
         _fake_init,
     ):
         claude_sdk_harness._build_claude_sdk_executor()
@@ -484,7 +484,7 @@ def test_bundle_dir_unset_passes_none(
         captured.update(kwargs)
 
     with patch(
-        "omnigent.inner.claude_sdk_harness.ClaudeSDKExecutor.__init__",
+        "omnigent.harnesses.claude_sdk.harness.ClaudeSDKExecutor.__init__",
         _fake_init,
     ):
         claude_sdk_harness._build_claude_sdk_executor()

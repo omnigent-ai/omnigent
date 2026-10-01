@@ -1,4 +1,4 @@
-"""Tests for the generic ACP executor (:mod:`omnigent.inner.acp_executor`).
+"""Tests for the generic ACP executor (:mod:`omnigent.harnesses.acp.executor`).
 
 Two layers:
 
@@ -24,17 +24,8 @@ from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 
-from omnigent.inner import _proc
-from omnigent.inner import acp_executor as acp_executor_module
-from omnigent.inner._acp_omnigent_mcp import OmnigentAcpMcp, _to_acp_mcp_servers
-from omnigent.inner.acp_executor import (
-    AcpAgentConfig,
-    AcpExecutor,
-    _is_auth_required_error,
-    _unattended_auth_method_id,
-)
-from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
-from omnigent.inner.executor import (
+from omnigent.core.datamodel import OSEnvSandboxSpec, OSEnvSpec
+from omnigent.core.executor import (
     ExecutorConfig,
     ExecutorError,
     ReasoningChunk,
@@ -48,6 +39,15 @@ from omnigent.inner.executor import (
     TurnComplete,
     describe_exception,
 )
+from omnigent.harnesses.acp import executor as acp_executor_module
+from omnigent.harnesses.acp.executor import (
+    AcpAgentConfig,
+    AcpExecutor,
+    _is_auth_required_error,
+    _unattended_auth_method_id,
+)
+from omnigent.harnesses.acp.omnigent_mcp import OmnigentAcpMcp, _to_acp_mcp_servers
+from omnigent.util import proc as _proc
 
 # ---------------------------------------------------------------------------
 # Construction / argv
@@ -646,7 +646,7 @@ class _FakeSubAgentDialect:
 
     def read(self, update: dict[str, object]) -> tuple[object, ...]:
         """Return start / activity / end for ``acme.dev/{spawn,work,done}``."""
-        from omnigent.inner.acp_subagents import SubAgentActivity, SubAgentEnd, SubAgentStart
+        from omnigent.harnesses.acp.subagents import SubAgentActivity, SubAgentEnd, SubAgentStart
 
         if isinstance(update.get("acme.dev/spawn"), dict):
             return (SubAgentStart(child_key="w1", title="worker", task="do a thing"),)
@@ -663,7 +663,7 @@ class _FakeSubAgentDialect:
 
 def _extended_executor() -> AcpExecutor:
     """An executor whose extension supplies one dialect (a vendor's wrap does this)."""
-    from omnigent.inner.acp_extension import AcpExtension
+    from omnigent.harnesses.acp.extension import AcpExtension
 
     return AcpExecutor(
         AcpAgentConfig(command="x"),
@@ -880,8 +880,8 @@ async def test_native_call_before_a_bridge_call_keeps_each_call_id(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The reported defect: a native call ahead of a bridge call stole its id."""
-    import omnigent.runtime.harnesses._executor_adapter as adapter_module
-    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    import omnigent.harnesses.runtime._executor_adapter as adapter_module
+    from omnigent.harnesses.runtime._executor_adapter import ExecutorAdapter
 
     ex = AcpExecutor(AcpAgentConfig(command="x"))
     ex._bridge_tool_aliases = frozenset({"sys_session_get_info"})
@@ -1309,7 +1309,7 @@ async def test_bypass_never_sends_the_agents_own_bypass_option() -> None:
 
 def test_harness_wrap_reads_permission_mode(monkeypatch: pytest.MonkeyPatch) -> None:
     """The wrap decodes the forwarded mode, closing spawn env → child config."""
-    from omnigent.inner import acp_harness
+    from omnigent.harnesses.acp import harness as acp_harness
 
     monkeypatch.setenv("HARNESS_ACP_COMMAND", "devin acp")
     monkeypatch.setenv("HARNESS_ACP_PERMISSION_MODE", "bypassPermissions")
@@ -1321,7 +1321,7 @@ def test_harness_wrap_reads_permission_mode(monkeypatch: pytest.MonkeyPatch) -> 
 
 def test_harness_wrap_permission_mode_defaults_to_auto(monkeypatch: pytest.MonkeyPatch) -> None:
     """An unset (or blank) var leaves the wrap prompting, as before this option."""
-    from omnigent.inner import acp_harness
+    from omnigent.harnesses.acp import harness as acp_harness
 
     monkeypatch.setenv("HARNESS_ACP_COMMAND", "devin acp")
     monkeypatch.delenv("HARNESS_ACP_PERMISSION_MODE", raising=False)
@@ -1712,7 +1712,7 @@ async def test_interrupt_noop_without_session() -> None:
 
 
 def test_harness_wrap_requires_command(monkeypatch: pytest.MonkeyPatch) -> None:
-    from omnigent.inner import acp_harness
+    from omnigent.harnesses.acp import harness as acp_harness
 
     monkeypatch.delenv("HARNESS_ACP_COMMAND", raising=False)
     with pytest.raises(RuntimeError, match="HARNESS_ACP_COMMAND"):
@@ -1720,7 +1720,7 @@ def test_harness_wrap_requires_command(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_harness_wrap_builds_executor(monkeypatch: pytest.MonkeyPatch) -> None:
-    from omnigent.inner import acp_harness
+    from omnigent.harnesses.acp import harness as acp_harness
 
     monkeypatch.setenv("HARNESS_ACP_COMMAND", "goose acp")
     monkeypatch.setenv("HARNESS_ACP_NAME", "Goose")
@@ -1740,7 +1740,7 @@ def test_harness_wrap_builds_executor(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def test_harness_wrap_reads_inject_system_prompt(monkeypatch: pytest.MonkeyPatch) -> None:
     """HARNESS_ACP_INJECT_SYSTEM_PROMPT=0 sets inject_system_prompt=False (#4917)."""
-    from omnigent.inner import acp_harness
+    from omnigent.harnesses.acp import harness as acp_harness
 
     monkeypatch.setenv("HARNESS_ACP_COMMAND", "omp acp")
     monkeypatch.setenv("HARNESS_ACP_INJECT_SYSTEM_PROMPT", "0")
@@ -1753,7 +1753,7 @@ def test_harness_wrap_inject_system_prompt_defaults_to_true(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """inject_system_prompt defaults to True when env var is absent."""
-    from omnigent.inner import acp_harness
+    from omnigent.harnesses.acp import harness as acp_harness
 
     monkeypatch.setenv("HARNESS_ACP_COMMAND", "goose acp")
     monkeypatch.delenv("HARNESS_ACP_INJECT_SYSTEM_PROMPT", raising=False)
@@ -1764,7 +1764,7 @@ def test_harness_wrap_inject_system_prompt_defaults_to_true(
 
 def test_harness_wrap_reads_env_passthrough_names(monkeypatch: pytest.MonkeyPatch) -> None:
     """The wrap decodes the forwarded names, closing parent → child → spawn env."""
-    from omnigent.inner import acp_harness
+    from omnigent.harnesses.acp import harness as acp_harness
 
     monkeypatch.setenv("HARNESS_ACP_COMMAND", "grok agent stdio")
     monkeypatch.setenv("HARNESS_ACP_ENV_PASSTHROUGH", "XAI_API_KEY, GROK_TOKEN ,")

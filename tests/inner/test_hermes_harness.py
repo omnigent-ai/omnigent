@@ -15,8 +15,8 @@ from __future__ import annotations
 
 import pytest
 
-from omnigent.inner import hermes_harness
-from omnigent.runtime.harnesses import _HARNESS_MODULES
+from omnigent.harnesses.hermes import harness as hermes_harness
+from omnigent.harnesses.runtime import _HARNESS_MODULES
 
 
 def test_harness_module_registered_in_module_registry() -> None:
@@ -25,7 +25,7 @@ def test_harness_module_registered_in_module_registry() -> None:
     Without this entry, the runner subprocess can't find the wrap
     when AP-side tries to spawn it for a ``harness: hermes`` spec.
     """
-    assert _HARNESS_MODULES.get("hermes") == "omnigent.inner.hermes_harness"
+    assert _HARNESS_MODULES.get("hermes") == "omnigent.harnesses.hermes.harness"
 
 
 def test_create_app_returns_fastapi_with_required_routes() -> None:
@@ -60,8 +60,7 @@ def test_executor_factory_reads_env_vars(
     """
     monkeypatch.setenv("HARNESS_HERMES_MODEL", "test-model-id")
     monkeypatch.setenv("HARNESS_HERMES_CWD", "/tmp/test-cwd")
-    monkeypatch.setenv("HARNESS_HERMES_PATH", "/custom/path/hermes")
-    monkeypatch.delenv("OMNIGENT_HERMES_PATH", raising=False)
+    monkeypatch.setenv("OMNIGENT_HERMES_PATH", "/custom/path/hermes")
 
     executor = hermes_harness._build_hermes_executor()
 
@@ -76,7 +75,6 @@ def test_executor_factory_defaults_when_env_unset(
     """Factory uses sensible defaults when env vars are not set."""
     monkeypatch.delenv("HARNESS_HERMES_MODEL", raising=False)
     monkeypatch.delenv("HARNESS_HERMES_CWD", raising=False)
-    monkeypatch.delenv("HARNESS_HERMES_PATH", raising=False)
     monkeypatch.delenv("OMNIGENT_HERMES_PATH", raising=False)
 
     executor = hermes_harness._build_hermes_executor()

@@ -54,9 +54,9 @@ from mcp.types import (
 )
 from mcp.types import Tool as McpToolDef
 
-from omnigent.runner.identity import strip_runner_auth_secrets
 from omnigent.runtime.mcp_tool_result import encode_mcp_image_result, native_image_payload
 from omnigent.spec.types import MCPServerConfig, RetryPolicy
+from omnigent.util.runner_identity import strip_runner_auth_secrets
 
 _T = TypeVar("_T")
 

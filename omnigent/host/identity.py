@@ -282,7 +282,7 @@ def load_host_identity_if_present(
     hand-edited ``config.yaml``) — or exactly one identity env var set — yields
     ``None`` rather than raising. This path is the passive slice-key fallback
     that every request's header builder funnels through
-    (:func:`omnigent.cli_auth.databricks_request_headers`), so a bad id must
+    (:func:`omnigent.cli.auth.databricks_request_headers`), so a bad id must
     mean only "don't emit a slice key," never crash unrelated commands (login,
     chat, session list). The loud, actionable fail-fast lives on the
     ``omnigent host`` launch path (:func:`load_or_create_host_identity`), where

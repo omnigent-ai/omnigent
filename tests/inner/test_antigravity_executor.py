@@ -1,5 +1,5 @@
 """
-Unit tests for :class:`omnigent.inner.antigravity_executor.AntigravityExecutor`.
+Unit tests for :class:`omnigent.harnesses.antigravity.executor.AntigravityExecutor`.
 
 The fakes here mirror the real ``google.antigravity`` streaming surface the
 executor depends on: ``agent.conversation`` yields :class:`Step` objects from
@@ -21,9 +21,7 @@ from typing import Any
 
 import pytest
 
-from omnigent.inner import antigravity_executor as ag
-from omnigent.inner.antigravity_executor import AntigravityExecutor, _latest_user_text
-from omnigent.inner.executor import (
+from omnigent.core.executor import (
     ExecutorConfig,
     ExecutorError,
     ReasoningChunk,
@@ -34,6 +32,8 @@ from omnigent.inner.executor import (
     TurnCancelled,
     TurnComplete,
 )
+from omnigent.harnesses.antigravity import executor as ag
+from omnigent.harnesses.antigravity.executor import AntigravityExecutor, _latest_user_text
 from omnigent.llms._usage_observer import add_observer
 
 # ── Fakes mirroring the real SDK streaming shapes ───────────────────────

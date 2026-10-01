@@ -11,7 +11,8 @@ from typing import Any
 
 import pytest
 
-import omnigent.inner.codex_native_executor as codex_native_executor
+import omnigent.harnesses.codex_native.executor as codex_native_executor
+from omnigent.core.executor import ExecutorConfig, ExecutorError, TurnComplete
 from omnigent.harnesses.codex_native.app_server import CodexAppServerResponseError
 from omnigent.harnesses.codex_native.bridge import (
     CodexNativeBridgeState,
@@ -22,9 +23,8 @@ from omnigent.harnesses.codex_native.bridge import (
     write_bridge_startup_timeout,
     write_bridge_state,
 )
-from omnigent.inner.codex_native_executor import CodexNativeExecutor
-from omnigent.inner.executor import ExecutorConfig, ExecutorError, TurnComplete
-from omnigent.inner.native_attachments import attachment_cache_dir
+from omnigent.harnesses.codex_native.executor import CodexNativeExecutor
+from omnigent.util.attachments import attachment_cache_dir
 
 # A 1x1 transparent PNG, base64-encoded — a real decodable image small
 # enough to embed, used to prove image blocks are materialized to disk
@@ -509,8 +509,8 @@ def test_resize_notice_is_encoded_in_model_visible_image_path(
 
 
 def test_resize_paths_preserve_multiple_images_and_cached_originals(tmp_path: Path) -> None:
-    from omnigent.inner.codex_native_executor import _content_to_input_items
-    from omnigent.inner.native_attachments import framework_notice_block
+    from omnigent.harnesses.codex_native.executor import _content_to_input_items
+    from omnigent.util.attachments import framework_notice_block
 
     content = []
     for image_bytes, dimensions in [
@@ -714,7 +714,7 @@ def test_zip_submitted_as_an_image_block_still_uses_a_file_reference(
     block carrying the authoritative filename. Taking the image branch would
     stage it in the bridge dir and hand codex a localImage it cannot open.
     """
-    from omnigent.inner.codex_native_executor import _content_to_input_items
+    from omnigent.harnesses.codex_native.executor import _content_to_input_items
 
     workspace = tmp_path / "repo"
     workspace.mkdir()
@@ -980,7 +980,7 @@ def test_steer_does_not_retry_ambiguous_or_unrelated_errors(
     assert state is not None
     assert state.active_turn_id == "turn_maybe_active"
 
-    from omnigent.debug_logging import record_to_row
+    from omnigent.observability.debug_logging import record_to_row
 
     record = next(
         record
@@ -2051,7 +2051,7 @@ def test_turn_error_names_pending_mcp_servers(
     assert [type(event) for event in events] == [ExecutorError]
     assert "MCP startup still waiting on storage-console" in events[0].message
 
-    from omnigent.debug_logging import record_to_row
+    from omnigent.observability.debug_logging import record_to_row
 
     records = [
         record

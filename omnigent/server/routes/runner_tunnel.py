@@ -27,9 +27,8 @@ from typing import TypedDict, cast
 from fastapi import APIRouter, Request, WebSocket, WebSocketDisconnect
 from starlette.websockets import WebSocketState
 
-from omnigent.debug_logging import debug_event
 from omnigent.errors import ErrorCategory, ErrorCode, ErrorImpact, ErrorPhase, OmnigentError
-from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
+from omnigent.observability.debug_logging import debug_event
 from omnigent.runner.transports.ws_tunnel.frames import (
     EVENT_INGEST_CAPABILITY,
     EventAckFrame,
@@ -48,6 +47,7 @@ from omnigent.server import managed_host_keepalive, session_live_state, shutdown
 from omnigent.server.auth import RESERVED_USER_LOCAL, AuthProvider
 from omnigent.server.host_registry import RunnerExitReports
 from omnigent.server.routes._auth_helpers import require_user
+from omnigent.util.runner_identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
 
 _logger = logging.getLogger(__name__)
 

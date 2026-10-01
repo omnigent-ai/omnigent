@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from omnigent.native import owner_claim
+from omnigent.harnesses.native import owner_claim
 
 
 def test_owner_claim_round_trip(tmp_path: Path) -> None:

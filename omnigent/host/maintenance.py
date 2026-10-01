@@ -12,7 +12,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Literal
 
-from omnigent.debug_logging import debug_event
+from omnigent.observability.debug_logging import debug_event
 
 try:
     import fcntl
@@ -106,11 +106,11 @@ class HostMaintenanceJanitor:
         harness_tmp_parent: Path | None = None,
     ) -> HostMaintenanceJanitor:
         """Build the machine-global cleanup stages for a host daemon."""
-        from omnigent.process_logging import data_dir
-        from omnigent.runtime.harnesses.paths import (
+        from omnigent.harnesses.runtime.paths import (
             absolute_harness_tmp_parent,
             resolve_harness_tmp_parent,
         )
+        from omnigent.observability.process_logging import data_dir
 
         resolved_harness_tmp_parent = (
             absolute_harness_tmp_parent(harness_tmp_parent)
@@ -119,7 +119,7 @@ class HostMaintenanceJanitor:
         )
 
         async def _reap_harness_processes() -> None:
-            from omnigent.runtime.harnesses.process_manager import (
+            from omnigent.harnesses.runtime.process_manager import (
                 sweep_orphaned_harness_processes,
             )
 
@@ -133,12 +133,12 @@ class HostMaintenanceJanitor:
             return await _run_sync_stage(reconcile_codex_native_process_registry)
 
         async def _reap_terminals() -> object:
-            from omnigent.inner.terminal import reap_orphaned_terminals
+            from omnigent.terminals.terminal import reap_orphaned_terminals
 
             return await _run_sync_stage(reap_orphaned_terminals)
 
         async def _reap_native_bridge_dirs() -> object:
-            from omnigent.native.native_bridge_common import reap_orphaned_native_bridge_dirs
+            from omnigent.harnesses.native.bridge_common import reap_orphaned_native_bridge_dirs
 
             return await _run_sync_stage(reap_orphaned_native_bridge_dirs)
 

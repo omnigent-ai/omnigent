@@ -37,7 +37,7 @@ from typing import Any
 import httpx
 import pytest
 
-from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN
+from omnigent.util.runner_identity import OMNIGENT_INTERNAL_WS_ORIGIN
 from tests.e2e.conftest import configure_mock_llm, find_free_port, reset_mock_llm
 
 pexpect = pytest.importorskip("pexpect")
@@ -190,7 +190,7 @@ def proxied_gated_session(
     """Boot server + runner with the always-ask agent, create a session,
     and put a one-shot fault proxy in front of the server.
     """
-    from omnigent.chat import _start_local_server, _stop_local_server, _wait_for_server
+    from omnigent.cli.chat import _start_local_server, _stop_local_server, _wait_for_server
 
     reset_mock_llm(mock_llm_server_url)
     # The always-ask policy gates the turn BEFORE the LLM; once the
@@ -362,7 +362,7 @@ def test_repl_survives_transient_transport_error_on_elicitation_resolve(
         sys.executable,
         [
             "-m",
-            "omnigent.cli",
+            "omnigent.cli.commands",
             "attach",
             sess.session_id,
             "--server",

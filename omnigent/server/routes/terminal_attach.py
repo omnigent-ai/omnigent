@@ -75,8 +75,8 @@ from typing import Final
 from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect, WebSocketException
 from starlette import status
 
-from omnigent.debug_logging import debug_event
 from omnigent.errors import OmnigentError
+from omnigent.observability.debug_logging import debug_event
 from omnigent.runtime import (
     get_runner_ws_factory,
     get_terminal_registry,
@@ -201,7 +201,7 @@ def create_terminal_attach_router(
                 )
                 return
             try:
-                from omnigent.runtime import telemetry
+                from omnigent.observability import otel as telemetry
 
                 with telemetry.span(
                     "terminal.attach",
@@ -254,7 +254,7 @@ def create_terminal_attach_router(
             )
             return
 
-        from omnigent.runtime import telemetry
+        from omnigent.observability import otel as telemetry
 
         with telemetry.span(
             "terminal.attach",

@@ -17,8 +17,7 @@ from pathlib import Path
 import httpx
 import pytest
 
-from omnigent.runner.identity import RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR
-from omnigent.runtime.harnesses.process_manager import (
+from omnigent.harnesses.runtime.process_manager import (
     HarnessProcessManager,
     _acp_startup_config,
     _build_harness_spawn_env,
@@ -26,6 +25,7 @@ from omnigent.runtime.harnesses.process_manager import (
     _model_env_key,
     _SubprocessEntry,
 )
+from omnigent.util.runner_identity import RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR
 
 
 class _AliveProc:

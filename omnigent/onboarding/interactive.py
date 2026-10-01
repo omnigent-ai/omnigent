@@ -35,7 +35,7 @@ from rich.cells import cell_len
 from rich.console import Console
 from rich.text import Text
 
-from omnigent._platform import IS_WINDOWS
+from omnigent.util.portability import IS_WINDOWS
 
 # Reuse the REPL theme picker's palette verbatim so the selector is
 # visually identical to ``_theme_picker.py`` (``_ACCENT`` / ``_MUTED``).

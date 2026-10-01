@@ -50,12 +50,12 @@ from omnigent.harnesses.codex_native.bridge import (
     read_bridge_state,
     write_bridge_state,
 )
-from omnigent.inner.codex_native_executor import CodexNativeExecutor
-from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
-from omnigent.runtime.harnesses._scaffold import TurnContext
+from omnigent.harnesses.codex_native.executor import CodexNativeExecutor
+from omnigent.harnesses.runtime._executor_adapter import ExecutorAdapter
+from omnigent.harnesses.runtime._scaffold import TurnContext
 from omnigent.server.schemas import CreateResponseRequest
 
-_ADAPTER_LOGGER = "omnigent.runtime.harnesses._executor_adapter"
+_ADAPTER_LOGGER = "omnigent.harnesses.runtime._executor_adapter"
 
 #: Stable prefix of the abnormal-exit cleanup failure log (the KPI signature).
 _FAILURE_LOG_PREFIX = "abnormal-exit interrupt of inner session"

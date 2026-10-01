@@ -74,7 +74,7 @@ async def test_host_janitor_uses_absolute_unresolved_harness_tmp_parent(
         observed_roots.append(tmp_parent)
 
     monkeypatch.setattr(
-        "omnigent.runtime.harnesses.process_manager.sweep_orphaned_harness_processes",
+        "omnigent.harnesses.runtime.process_manager.sweep_orphaned_harness_processes",
         _sweep,
     )
     janitor = HostMaintenanceJanitor.for_host(harness_tmp_parent=configured_root)
@@ -98,16 +98,16 @@ async def test_runner_lifecycle_trigger_reaps_native_bridge_dirs(
         assert tmp_parent is not None
 
     monkeypatch.setattr(
-        "omnigent.runtime.harnesses.process_manager.sweep_orphaned_harness_processes",
+        "omnigent.harnesses.runtime.process_manager.sweep_orphaned_harness_processes",
         _sweep_harness_processes,
     )
     monkeypatch.setattr(
         "omnigent.harnesses.codex_native.process_registry.reconcile_codex_native_process_registry",
         lambda: None,
     )
-    monkeypatch.setattr("omnigent.inner.terminal.reap_orphaned_terminals", lambda: None)
+    monkeypatch.setattr("omnigent.terminals.terminal.reap_orphaned_terminals", lambda: None)
     monkeypatch.setattr(
-        "omnigent.native.native_bridge_common.reap_orphaned_native_bridge_dirs",
+        "omnigent.harnesses.native.bridge_common.reap_orphaned_native_bridge_dirs",
         lambda: bridge_sweeps.append(1) or 2,
     )
     janitor = HostMaintenanceJanitor.for_host(harness_tmp_parent=tmp_path / "harness-sockets")

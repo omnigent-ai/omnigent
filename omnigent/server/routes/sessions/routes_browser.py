@@ -34,7 +34,7 @@ from omnigent.server.routes._auth_helpers import (
 from omnigent.server.routes._auth_helpers import (
     require_access_and_level as _require_access_and_level,
 )
-from omnigent.server.routes._sessions.common import (
+from omnigent.server.routes.sessions.common import (
     _BROWSER_ACTION_NO_RENDERER_RESULT,
     _BROWSER_ACTION_TIMEOUT_RESULT,
     _browser_action_claim_events,

@@ -10,7 +10,7 @@ project root to ``sys.path`` of the test process — but
 :func:`asyncio.create_subprocess_exec` only inherits the OS env
 (``PYTHONPATH``), not the parent's ``sys.path`` mutations. Without
 this fixture the runner subprocess starts with no project root on
-its path and fails to import either ``omnigent.runtime.harnesses._runner``
+its path and fails to import either ``omnigent.harnesses.runtime._runner``
 or the test harness module.
 
 The fixture is autouse-scoped to this directory, so every spawn

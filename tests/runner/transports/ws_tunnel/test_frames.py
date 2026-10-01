@@ -96,7 +96,7 @@ def test_hello_round_trip() -> None:
 
 def test_hello_attachment_capability_round_trip() -> None:
     """New capabilities survive hello; legacy hellos keep their original shape."""
-    from omnigent.inner.native_attachments import CAP_FILESYSTEM_ATTACHMENTS
+    from omnigent.util.attachments import CAP_FILESYSTEM_ATTACHMENTS
 
     legacy = HelloFrame(runner_version="0.14.0", frame_protocol_version=1)
     assert "capabilities" not in json.loads(encode_frame(legacy))

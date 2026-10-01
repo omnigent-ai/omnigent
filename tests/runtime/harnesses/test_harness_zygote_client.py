@@ -16,15 +16,15 @@ import socket
 
 import pytest
 
+from omnigent.harnesses.runtime._harness_zygote_client import (
+    HarnessZygoteClient,
+    ZygoteHarnessProc,
+    ZygoteHarnessUnavailable,
+)
 from omnigent.host.runner_zygote import ZygoteManager
 from omnigent.runner._zygote import (
     _ZYGOTE_TEST_CHILD_EXIT_ENV_VAR,
     ZYGOTE_HARNESS_FD_ENV_VAR,
-)
-from omnigent.runtime.harnesses._harness_zygote_client import (
-    HarnessZygoteClient,
-    ZygoteHarnessProc,
-    ZygoteHarnessUnavailable,
 )
 
 # os.fork / AF_UNIX socketpair are POSIX-only.
@@ -147,7 +147,7 @@ async def test_wait_surfaces_failure_when_zygote_dies_and_harness_gone(
     :param zygote: The started zygote fixture.
     :param tmp_path: Temp dir for the harness log.
     """
-    from omnigent.runtime.harnesses._harness_zygote_client import _ZYGOTE_LOST_EXIT_CODE
+    from omnigent.harnesses.runtime._harness_zygote_client import _ZYGOTE_LOST_EXIT_CODE
 
     client = _client_on(zygote)
     # A harness that stays alive so we control when it dies.

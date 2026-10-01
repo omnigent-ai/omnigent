@@ -266,7 +266,7 @@ def _runner_pids() -> set[int]:
     for module in (
         "omnigent.host._daemon_entry",
         "omnigent.runner._entry",
-        "omnigent.runtime.harnesses._runner",
+        "omnigent.harnesses.runtime._runner",
     ):
         try:
             out = subprocess.run(

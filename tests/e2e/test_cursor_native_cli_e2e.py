@@ -5,7 +5,7 @@ The cursor-native sibling of ``test_codex_native_cli_cwd_e2e`` /
 harness: ``omnigent cursor`` launches the official ``cursor-agent`` TUI in a
 runner-owned tmux pane, and each web-UI turn is injected into that pane
 (bracketed paste + Enter) by
-:class:`omnigent.inner.cursor_native_executor.CursorNativeExecutor`. The TUI's
+:class:`omnigent.harnesses.cursor_native.executor.CursorNativeExecutor`. The TUI's
 own conversation store is tailed by
 :mod:`omnigent.harnesses.cursor_native.forwarder`, which mirrors ``cursor-agent``'s
 replies back onto the Omnigent conversation as assistant items.

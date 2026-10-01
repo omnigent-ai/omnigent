@@ -27,7 +27,7 @@ import pytest
 from playwright.sync_api import Page
 
 from omnigent.models.model_fallbacks import CODEX_DEFAULT_MODEL
-from omnigent.runner.identity import token_bound_runner_id
+from omnigent.util.runner_identity import token_bound_runner_id
 from tests.e2e_ui.conftest import (
     _REPO_ROOT,
     _codex_cli_supports_mocked_app_server,
@@ -208,7 +208,7 @@ def unpinned_codex_astra_session(
     server_command = [
         sys.executable,
         "-c",
-        "from omnigent.cli import main; main()",
+        "from omnigent.cli.commands import main; main()",
         "server",
         "--host",
         "127.0.0.1",

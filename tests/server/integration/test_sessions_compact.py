@@ -375,7 +375,7 @@ async def test_external_compaction_status_anchors_started_at_to_first_report(
     reload. completed/failed must clear the anchor so the next compaction
     starts a fresh clock.
     """
-    from omnigent.server.routes._sessions import helpers as sessions_helpers
+    from omnigent.server.routes.sessions import helpers as sessions_helpers
 
     published: list[tuple[str, dict[str, Any]]] = []
 

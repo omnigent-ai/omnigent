@@ -11,7 +11,7 @@ from pathlib import Path
 import httpx
 import pytest
 
-from omnigent import debug_logging as dl
+from omnigent.observability import debug_logging as dl
 
 _INSERT_URL = (
     "https://3272836215725701.zerobus.us-west-2.cloud.databricks.com"

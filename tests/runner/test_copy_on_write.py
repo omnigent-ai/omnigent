@@ -6,7 +6,7 @@ from unittest.mock import Mock
 
 import pytest
 
-from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec, WritePathSpec
+from omnigent.core.datamodel import OSEnvSandboxSpec, OSEnvSpec, WritePathSpec
 from omnigent.runner.resource_registry import SessionResourceRegistry
 
 
@@ -63,9 +63,9 @@ async def test_terminal_consumers_close_before_owner(spec, tmp_path, monkeypatch
 
 
 def test_harness_spawn_transports_prepared_session_namespace(spec, tmp_path, monkeypatch):
-    from omnigent.inner.sandbox import SandboxPolicy
     from omnigent.runner.app import _build_spawn_env_from_spec
     from omnigent.sandbox.copy_on_write import SHARED_ENVIRONMENT_VAR, attach_shared_environment
+    from omnigent.sandbox.core import SandboxPolicy
     from omnigent.spec.types import AgentSpec, ExecutorSpec
 
     agent = AgentSpec(
@@ -290,8 +290,8 @@ async def test_background_turn_registers_tools_from_shared_environment(
 ):
     import asyncio
 
-    from omnigent.inner.sandbox import SandboxPolicy
     from omnigent.runner import create_runner_app
+    from omnigent.sandbox.core import SandboxPolicy
     from omnigent.spec.types import AgentSpec, ExecutorSpec
     from tests.runner.conftest import _FakeProcessManager, _runner_client, _ScriptedHarnessClient
     from tests.runner.helpers import NullServerClient
@@ -319,7 +319,7 @@ async def test_background_turn_registers_tools_from_shared_environment(
         "omnigent.runtime.workflow._build_openai_agents_sdk_spawn_env", lambda spec: {}
     )
     monkeypatch.setattr(
-        "omnigent.inner.os_env.create_os_environment",
+        "omnigent.environments.os_env.create_os_environment",
         Mock(side_effect=ValueError("unresolved cwd")),
     )
 

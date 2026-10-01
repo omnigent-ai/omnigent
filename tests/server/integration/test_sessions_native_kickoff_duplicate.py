@@ -8,11 +8,11 @@ from typing import Any
 import httpx
 import pytest
 
-from omnigent._wrapper_labels import WRAPPER_LABEL_KEY
-from omnigent.harness_plugins import (
+from omnigent.harnesses.registry import (
     CLAUDE_NATIVE_CODING_AGENT,
     CODEX_NATIVE_CODING_AGENT,
 )
+from omnigent.harnesses.wrapper_labels import WRAPPER_LABEL_KEY
 from omnigent.server.routes import sessions as sessions_routes
 from tests.server.helpers import create_test_agent
 

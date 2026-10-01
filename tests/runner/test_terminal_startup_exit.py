@@ -8,9 +8,8 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from omnigent.debug_logging import record_to_row
-from omnigent.inner.datamodel import TerminalEnvSpec
-from omnigent.inner.terminal import TerminalCreateResult
+from omnigent.core.datamodel import TerminalEnvSpec
+from omnigent.observability.debug_logging import record_to_row
 from omnigent.runner.native import orchestration
 from omnigent.runner.resource_registry import (
     CLAUDE_NATIVE_TERMINAL_ROLE,
@@ -21,6 +20,7 @@ from omnigent.runner.resource_registry import (
 )
 from omnigent.terminals import registry as terminal_registry_module
 from omnigent.terminals.registry import TerminalRegistry
+from omnigent.terminals.terminal import TerminalCreateResult
 from tests.runner.helpers import make_test_terminal_instance
 
 

@@ -44,8 +44,8 @@ from pathlib import Path
 
 import pytest
 
-from omnigent import cli
-from omnigent.cli import _ensure_host_daemon
+from omnigent.cli import commands as cli
+from omnigent.cli.commands import _ensure_host_daemon
 
 _PID_A = 7771  # first-entry spawner (winner)
 _PID_B = 7772  # second-entry spawner (loser)

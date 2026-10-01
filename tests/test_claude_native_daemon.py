@@ -21,8 +21,8 @@ import pytest
 from omnigent.harnesses.claude_native import main as claude_native
 from omnigent.harnesses.claude_native.bridge import BRIDGE_ID_LABEL_KEY
 from omnigent.harnesses.codex_native import main as codex_native
+from omnigent.harnesses.native import terminal as native_terminal
 from omnigent.host import daemon_launch
-from omnigent.native import native_terminal
 
 pytestmark = pytest.mark.asyncio
 
@@ -247,11 +247,11 @@ def _install_daemon_seam_mocks(
         to.
     :returns: None.
     """
-    monkeypatch.setattr("omnigent.chat._remote_headers", lambda server_url=None, **k: {})
-    monkeypatch.setattr("omnigent.chat._server_auth", lambda server_url=None, **k: None)
-    monkeypatch.setattr("omnigent.chat._bundle_agent", lambda path: b"bundle")
+    monkeypatch.setattr("omnigent.cli.chat._remote_headers", lambda server_url=None, **k: {})
+    monkeypatch.setattr("omnigent.cli.chat._server_auth", lambda server_url=None, **k: None)
+    monkeypatch.setattr("omnigent.cli.chat._bundle_agent", lambda path: b"bundle")
     monkeypatch.setattr(
-        "omnigent.cli._ensure_host_daemon",
+        "omnigent.cli.commands._ensure_host_daemon",
         lambda url: ensured.append(url),
     )
     monkeypatch.setattr(
@@ -320,7 +320,7 @@ def test_run_with_remote_server_routes_through_daemon(
         spec_path,
         session_id=None,
         resume_picker=False,
-        claude_args=("--dangerously-skip-permissions",),
+        extra_args=("--dangerously-skip-permissions",),
     )
 
     # Daemon start is now _ensure_backend's responsibility (called from
@@ -329,7 +329,7 @@ def test_run_with_remote_server_routes_through_daemon(
     # the cwd workspace, and the user's args.
     assert captured["host_id"] == "host_1"
     assert captured["workspace"] == str(tmp_path.resolve())
-    assert captured["claude_args"] == ("--dangerously-skip-permissions",)
+    assert captured["extra_args"] == ("--dangerously-skip-permissions",)
     assert captured["session_id"] is None
 
 
@@ -368,7 +368,7 @@ def test_run_with_remote_server_detach_prints_resume_hint(
         spec_path,
         session_id="conv_existing",
         resume_picker=False,
-        claude_args=(),
+        extra_args=(),
     )
 
     err = capsys.readouterr().err
@@ -426,7 +426,7 @@ def test_run_with_remote_server_unreachable_server_raises_clean_error(
             spec_path,
             session_id=None,
             resume_picker=False,
-            claude_args=(),
+            extra_args=(),
         )
 
     assert "Could not reach the omnigent server at https://unreachable.example" in str(

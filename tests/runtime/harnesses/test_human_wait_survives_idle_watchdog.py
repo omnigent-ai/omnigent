@@ -52,8 +52,8 @@ from typing import Any
 import httpx
 import pytest
 
-from omnigent.runtime.harnesses import _HARNESS_MODULES
-from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
+from omnigent.harnesses.runtime import _HARNESS_MODULES
+from omnigent.harnesses.runtime.process_manager import HarnessProcessManager
 
 _TEST_HARNESS_NAME = "scaffold_fixture"
 _TEST_HARNESS_MODULE = "tests.runtime.harnesses._test_scaffold_harnesses"

@@ -390,7 +390,7 @@ async def test_gateway_inference_reconverges_after_a_server_restart(
     host reconnects and re-reports "claude is off-gateway", selection drops back
     to the built-in judge — permanently, with nothing to migrate or backfill.
     """
-    from omnigent.server.routes._sessions.common import set_server_host_registry
+    from omnigent.server.routes.sessions.common import set_server_host_registry
     from omnigent.server.routing_backend import RoutingBackends, gateway_backs_all, select_router
 
     external = object()

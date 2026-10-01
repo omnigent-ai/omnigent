@@ -4,7 +4,7 @@ Drives a custom ``openai-agents`` agent ("echo_probe") through five real chat
 turns via the web composer and asserts two properties that historically
 regressed on the native forwarder:
 
-1. **Render parity with the TUI.** The terminal UI (``omnigent/chat.py``) and
+1. **Render parity with the TUI.** The terminal UI (``omnigent/cli/chat.py``) and
    the web SPA both render from the SAME canonical transcript,
    ``GET /v1/sessions/{id}/items``. So "renders exactly the same as the TUI"
    is checked by treating that transcript as ground truth: every per-turn

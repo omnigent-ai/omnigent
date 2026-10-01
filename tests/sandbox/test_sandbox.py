@@ -2,7 +2,7 @@
 Tests for the sandbox wrapper package.
 
 The wrapper is pure re-exports of the existing
-``omnigent.inner.sandbox`` surface, so the tests only verify two
+``omnigent.sandbox.core`` surface, so the tests only verify two
 properties: every name the ``__all__`` lists is importable, and the
 wrapped names are the same Python objects as their inner
 counterparts. Behavioral tests for the underlying implementation live
@@ -12,8 +12,8 @@ directly.
 
 from __future__ import annotations
 
-import omnigent.inner.bwrap_sandbox as inner_bwrap
-import omnigent.inner.sandbox as inner_sandbox
+import omnigent.sandbox.bwrap as inner_bwrap
+import omnigent.sandbox.core as inner_sandbox
 from omnigent import sandbox
 from omnigent.sandbox import bwrap
 
@@ -34,7 +34,7 @@ def test_sandbox_all_symbols_importable() -> None:
 def test_sandbox_reexports_are_inner_objects() -> None:
     """
     The re-exported symbols are the same Python objects as the originals
-    in ``omnigent.inner.sandbox``.
+    in ``omnigent.sandbox.core``.
 
     Identity (``is``) — not equality — because anything else means the
     wrapper has accidentally introduced a parallel definition. Drift here
@@ -72,7 +72,7 @@ def test_bwrap_all_symbols_importable() -> None:
 def test_bwrap_reexports_are_inner_objects() -> None:
     """
     ``BwrapSandboxBackend`` re-exports the same identity as
-    ``omnigent.inner.bwrap_sandbox``.
+    ``omnigent.sandbox.bwrap``.
 
     ``isinstance`` checks against the wrapper class must succeed for
     the registration side effect to be observable through the
@@ -114,11 +114,11 @@ def test_default_sandbox_for_platform_is_bwrap_on_linux_regardless_of_binary() -
     import sys
     from unittest.mock import patch
 
-    from omnigent.inner.datamodel import OSEnvSandboxSpec
+    from omnigent.core.datamodel import OSEnvSandboxSpec
 
     with (
         patch.object(sys, "platform", "linux"),
-        patch("omnigent.inner.sandbox.shutil.which", return_value=None),
+        patch("omnigent.sandbox.core.shutil.which", return_value=None),
     ):
         spec = inner_sandbox._default_sandbox_for_platform()
     assert isinstance(spec, OSEnvSandboxSpec)
@@ -138,11 +138,11 @@ def test_default_sandbox_for_platform_is_seatbelt_on_macos_regardless_of_binary(
     import sys
     from unittest.mock import patch
 
-    from omnigent.inner.datamodel import OSEnvSandboxSpec
+    from omnigent.core.datamodel import OSEnvSandboxSpec
 
     with (
         patch.object(sys, "platform", "darwin"),
-        patch("omnigent.inner.sandbox.shutil.which", return_value=None),
+        patch("omnigent.sandbox.core.shutil.which", return_value=None),
     ):
         spec = inner_sandbox._default_sandbox_for_platform()
     assert isinstance(spec, OSEnvSandboxSpec)

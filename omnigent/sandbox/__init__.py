@@ -4,7 +4,7 @@ Sandbox primitive — wraps the existing inner implementation.
 This module is the canonical sandbox surface for new code (per
 ``designs/SERVER_HARNESS_CONTRACT.md`` §Sandbox primitives). It
 re-exports the resolution + activation API from
-``omnigent.inner.sandbox`` without copying or re-implementing any
+``omnigent.sandbox.core`` without copying or re-implementing any
 logic. The implementation continues to live under ``inner/`` and
 legacy consumers there keep importing from ``inner.sandbox``
 directly.
@@ -24,7 +24,7 @@ them would force consumers to reach back into ``inner.sandbox``.
 
 from __future__ import annotations
 
-from omnigent.inner.sandbox import (
+from omnigent.sandbox.core import (
     SandboxBackend,
     SandboxPolicy,
     activate_sandbox,

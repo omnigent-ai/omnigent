@@ -97,7 +97,7 @@ def _forwarded_claude_args(use_native_config: bool, sentinel: str) -> tuple[str,
     :param sentinel: The ``-p`` prompt value to forward.
     :returns: The forwarded ``claude`` args, prompt included.
     """
-    import omnigent.cli as _cli
+    import omnigent.cli.commands as _cli
     import omnigent.harnesses.claude_native.main as claude_native
 
     captured: dict[str, Any] = {}

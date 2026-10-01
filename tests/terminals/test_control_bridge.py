@@ -25,8 +25,7 @@ from pathlib import Path
 import pytest
 from fastapi import WebSocketDisconnect
 
-from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec, TerminalEnvSpec
-from omnigent.inner.terminal import create_terminal_instance
+from omnigent.core.datamodel import OSEnvSandboxSpec, OSEnvSpec, TerminalEnvSpec
 from omnigent.terminals.control_bridge import (
     _SEND_KEYS_HEX_BYTES_PER_CALL,
     _clipboard_buffer_name,
@@ -35,6 +34,7 @@ from omnigent.terminals.control_bridge import (
     bridge_tmux_control_to_websocket,
     unescape_control_output,
 )
+from omnigent.terminals.terminal import create_terminal_instance
 
 _HAS_TMUX = shutil.which("tmux") is not None
 

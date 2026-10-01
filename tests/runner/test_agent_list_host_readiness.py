@@ -54,15 +54,15 @@ async def test_agent_list_inherits_host_and_reports_availability(report: dict | 
 
 @pytest.fixture(autouse=True)
 def isolate_runner_identity(monkeypatch: pytest.MonkeyPatch) -> None:
-    from omnigent.runner.identity import RUNNER_SLICE_KEY_ENV_VAR
+    from omnigent.util.runner_identity import RUNNER_SLICE_KEY_ENV_VAR
 
     monkeypatch.delenv(RUNNER_SLICE_KEY_ENV_VAR, raising=False)
 
 
 @pytest.mark.asyncio
 async def test_runner_identity_skips_session_reads(monkeypatch: pytest.MonkeyPatch) -> None:
-    from omnigent.runner.identity import RUNNER_SLICE_KEY_ENV_VAR
     from omnigent.runner.tool_dispatch import _agent_list_host_readiness
+    from omnigent.util.runner_identity import RUNNER_SLICE_KEY_ENV_VAR
 
     monkeypatch.setenv(RUNNER_SLICE_KEY_ENV_VAR, "host_test")
     paths = []
@@ -125,7 +125,7 @@ async def test_readiness_has_total_deadline(monkeypatch: pytest.MonkeyPatch) -> 
 async def test_discovery_reads_run_concurrently(monkeypatch: pytest.MonkeyPatch) -> None:
     import asyncio
 
-    from omnigent.runner.identity import RUNNER_SLICE_KEY_ENV_VAR
+    from omnigent.util.runner_identity import RUNNER_SLICE_KEY_ENV_VAR
 
     monkeypatch.setenv(RUNNER_SLICE_KEY_ENV_VAR, "host_test")
     arrived: set[str] = set()

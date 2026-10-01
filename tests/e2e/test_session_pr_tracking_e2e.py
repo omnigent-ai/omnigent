@@ -18,9 +18,9 @@ import httpx
 import pytest
 
 from omnigent.harnesses.claude_native import bridge
-from omnigent.native.tool_observer_hook import hook_settings
+from omnigent.harnesses.native.tool_observer_hook import hook_settings
+from omnigent.host.workspace_fs import WorkspaceReader
 from omnigent.runner.session_prs import SessionPrRegistry
-from omnigent.workspace_fs import WorkspaceReader
 
 
 @pytest.mark.parametrize("harness", ["claude_native", "codex_native"])

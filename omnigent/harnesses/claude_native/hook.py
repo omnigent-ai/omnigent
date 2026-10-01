@@ -187,17 +187,11 @@ def main(argv: list[str] | None = None) -> int:
     """
     raw_argv = sys.argv[1:] if argv is None else argv
     if raw_argv and raw_argv[0] == "observe-tool":
-        from omnigent.native.tool_observer_hook import main as observe_main
+        from omnigent.harnesses.native.tool_observer_hook import main as observe_main
 
         return observe_main(raw_argv[1:])
     if raw_argv and raw_argv[0] == "permission-request":
         return _main_permission_request(raw_argv[1:])
-    if raw_argv and raw_argv[0] == "ask-user-question":
-        # Retired PreToolUse forwarder: settings written before the upgrade
-        # still name it until the terminal restarts. Exit 0 with no output so
-        # Claude proceeds to the PermissionRequest hook. Remove in 0.16.0.
-        sys.stdin.read()
-        return 0
     if raw_argv and raw_argv[0] == "evaluate-policy":
         return _main_evaluate_policy(raw_argv[1:])
     if raw_argv and raw_argv[0] == "route-turn":
@@ -390,7 +384,7 @@ def _rotate_session_on_clear(bridge_dir: Path) -> str | None:
     # _RunnerDatabricksAuth, so key the reused headers dict from the runner-env
     # host_id (databricks_request_headers reads OMNIGENT_RUNNER_SLICE_KEY when no
     # explicit host_id; emitted only on the workspace mount).
-    from omnigent.cli_auth import databricks_request_headers
+    from omnigent.cli.auth import databricks_request_headers
 
     headers.update(databricks_request_headers(ap_server_url))
     try:
@@ -448,7 +442,7 @@ def _rotate_session_on_fork(bridge_dir: Path) -> str | None:
     # _RunnerDatabricksAuth, so key the reused headers dict from the runner-env
     # host_id (databricks_request_headers reads OMNIGENT_RUNNER_SLICE_KEY when no
     # explicit host_id; emitted only on the workspace mount).
-    from omnigent.cli_auth import databricks_request_headers
+    from omnigent.cli.auth import databricks_request_headers
 
     headers.update(databricks_request_headers(ap_server_url))
     try:
@@ -660,7 +654,7 @@ def _conversation_url_for_active_session(
         # ``ap_server_url`` is the API base; route through the shared
         # builder so workspace-hosted servers land on the ``/omnigent``
         # SPA mount (with ``?o=<org>``) rather than the JSON API mount.
-        from omnigent.conversation_browser import conversation_url
+        from omnigent.cli.conversation_browser import conversation_url
 
         return conversation_url(ap_server_url, session_id)
     return fallback_url
@@ -764,7 +758,7 @@ def _post_hook_with_reattach(
     backoff_s = _PERMISSION_RETRY_INITIAL_BACKOFF_S
     import httpx
 
-    from omnigent.native.native_policy_hook import _is_login_redirect_or_unauthorized
+    from omnigent.harnesses.native.policy_hook import _is_login_redirect_or_unauthorized
 
     timeout = httpx.Timeout(_PERMISSION_TIMEOUT_S, connect=_PERMISSION_CONNECT_TIMEOUT_S)
     # Absolute backstop: even a run of held-poll severs (which don't count
@@ -885,7 +879,7 @@ def _main_permission_request(argv: list[str]) -> int:
     :returns: Process exit code. Returns ``0`` on transport failures so
         Claude Code falls back to its terminal prompt.
     """
-    from omnigent.native.native_policy_hook import policy_hook_reauth
+    from omnigent.harnesses.native.policy_hook import policy_hook_reauth
 
     args = _parse_permission_args(argv)
     raw = sys.stdin.read()
@@ -916,7 +910,7 @@ def _main_permission_request(argv: list[str]) -> int:
     # registry on the replica holding this session's runner tunnel; an unkeyed
     # POST lands elsewhere and the approval is silently lost. Key from the
     # runner-env host_id (reads OMNIGENT_RUNNER_SLICE_KEY; workspace mount only).
-    from omnigent.cli_auth import databricks_request_headers
+    from omnigent.cli.auth import databricks_request_headers
 
     headers.update(databricks_request_headers(ap_server_url))
     url = (
@@ -957,7 +951,7 @@ def _main_evaluate_policy(argv: list[str]) -> int:
     default when no policy matches) emits no output — "no opinion" — so
     Claude's own permission prompt still fires and the
     ``PermissionRequest`` hook can route it to the web UI. See
-    :func:`omnigent.native.native_policy_hook.evaluation_response_to_hook_output`.
+    :func:`omnigent.harnesses.native.policy_hook.evaluation_response_to_hook_output`.
 
     For ``UserPromptSubmit``, this is the request-phase gate for native
     sessions (the server-level ``_evaluate_input_policy`` skips native
@@ -989,7 +983,7 @@ def _main_evaluate_policy(argv: list[str]) -> int:
     :returns: Process exit code. Always ``0`` — blocking verdicts
         are expressed via the JSON output, not exit codes.
     """
-    from omnigent.native.native_policy_hook import (
+    from omnigent.harnesses.native.policy_hook import (
         evaluation_response_to_hook_output,
         fail_ask_hook_output,
         hook_payload_to_evaluation_request,
@@ -1055,7 +1049,7 @@ def _main_evaluate_policy(argv: list[str]) -> int:
         # This posts to the session's policy registry on the replica holding its
         # tunnel; key from the runner-env host_id so it isn't misrouted. (The
         # relay branch above targets a relay token URL, so it needs no key.)
-        from omnigent.cli_auth import databricks_request_headers
+        from omnigent.cli.auth import databricks_request_headers
 
         headers.update(databricks_request_headers(ap_server_url))
         session_component = url_component(session_id)
@@ -1237,7 +1231,7 @@ def _main_route_turn(argv: list[str]) -> int:
     if not isinstance(prompt, str) or not prompt.strip():
         return 0
 
-    from omnigent.inner.hook_scripts.subagent_router import read_router_endpoint
+    from omnigent.harnesses.native.hook_scripts.subagent_router import read_router_endpoint
 
     endpoint = read_router_endpoint(bridge_dir, filename=ADVERTISEMENT_FILE)
     if endpoint is None:

@@ -364,7 +364,7 @@ def fetch_model_pricing_with_provider(
     # Step 1: Check provider config custom pricing first (configured rates take precedence)
     # Canonicalize harness to handle SDK executor spellings (claude_sdk -> claude-sdk)
     if provider_config is not None and harness is not None:
-        from omnigent.harness_aliases import canonicalize_harness
+        from omnigent.harnesses.aliases import canonicalize_harness
 
         canonical_harness = canonicalize_harness(harness) or harness
         # Lazy import to avoid circular dependency. provider_config imports

@@ -14,9 +14,9 @@ from unittest.mock import patch
 
 import pytest
 
-from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
-from omnigent.inner.os_env import create_os_environment
-from omnigent.inner.sandbox import create_exec_launcher, resolve_sandbox
+from omnigent.core.datamodel import OSEnvSandboxSpec, OSEnvSpec
+from omnigent.environments.os_env import create_os_environment
+from omnigent.sandbox.core import create_exec_launcher, resolve_sandbox
 from tests.inner.sandbox.conftest import run_async
 
 pytestmark = pytest.mark.skipif(
@@ -96,7 +96,7 @@ def desktop_keyring(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator
 def test_runner_and_granted_goose_read_real_desktop_keyring(
     desktop_keyring: Path, tmp_path: Path, recipient: str
 ) -> None:
-    from omnigent.cli import _build_host_daemon_env
+    from omnigent.cli.commands import _build_host_daemon_env
     from omnigent.host.connect import _build_runner_env
 
     env = _build_runner_env(
@@ -108,9 +108,9 @@ def test_runner_and_granted_goose_read_real_desktop_keyring(
         parent_pid=os.getpid(),
     )
     if recipient == "goose":
-        from omnigent.inner.goose_executor import GooseExecutor
+        from omnigent.harnesses.goose.executor import GooseExecutor
+        from omnigent.harnesses.runtime.process_manager import _build_harness_spawn_env
         from omnigent.runner.app import _build_spawn_env_from_spec
-        from omnigent.runtime.harnesses.process_manager import _build_harness_spawn_env
         from omnigent.spec.types import AgentSpec, ExecutorSpec
 
         os_env = OSEnvSpec(

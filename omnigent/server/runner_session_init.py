@@ -9,9 +9,9 @@ from uuid import uuid4
 
 import httpx
 
-from omnigent.debug_logging import debug_event, runner_log_scope
 from omnigent.entities import Conversation
 from omnigent.errors import ErrorCategory
+from omnigent.observability.debug_logging import debug_event, runner_log_scope
 from omnigent.runner.session_init_protocol import build_runner_session_init_payload
 
 if TYPE_CHECKING:
@@ -101,7 +101,7 @@ class RunnerSessionInitializer:
 
             async def post_session_init() -> httpx.Response:
                 if self._conversation_store is not None and self._file_store is not None:
-                    from omnigent.server.routes._sessions.helpers import (
+                    from omnigent.server.routes.sessions.helpers import (
                         _filesystem_attachment_in_history,
                         require_filesystem_attachment_runtime,
                     )

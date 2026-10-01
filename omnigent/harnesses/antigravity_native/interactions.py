@@ -188,7 +188,7 @@ async def _inject_via_tui(keys: list[str]) -> None:
     # without eagerly pulling the bridge env helpers, and resolve the bridge dir
     # the same way the executor does.
     from omnigent.harnesses.antigravity_native.bridge import send_interaction_keys_via_tui
-    from omnigent.inner.antigravity_native_executor import _bridge_dir_from_env
+    from omnigent.harnesses.antigravity_native.executor import _bridge_dir_from_env
 
     bridge_dir = _bridge_dir_from_env()
     await asyncio.to_thread(send_interaction_keys_via_tui, bridge_dir, *keys)

@@ -22,14 +22,14 @@ import httpx
 import pytest
 import yaml
 
-from omnigent._wrapper_labels import (
+from omnigent.harnesses.codex_native.bridge import bridge_dir_for_bridge_id, read_bridge_state
+from omnigent.harnesses.codex_native.main import _materialize_codex_agent_spec
+from omnigent.harnesses.wrapper_labels import (
     CODEX_NATIVE_WRAPPER_VALUE,
     UI_MODE_LABEL_KEY,
     UI_MODE_TERMINAL_VALUE,
     WRAPPER_LABEL_KEY,
 )
-from omnigent.harnesses.codex_native.bridge import bridge_dir_for_bridge_id, read_bridge_state
-from omnigent.harnesses.codex_native.main import _materialize_codex_agent_spec
 from tests.e2e.conftest import configure_mock_llm, release_mock_gate
 from tests.e2e.test_host_codex_native_e2e import _poll_for_assistant_marker, _send_user_text
 

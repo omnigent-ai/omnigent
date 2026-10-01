@@ -96,7 +96,7 @@ async def codex_launch_harness(
     monkeypatch.setenv("RUNNER_SERVER_URL", "http://runner.test")
     monkeypatch.setattr("omnigent.config.load_effective_config", dict)
     monkeypatch.setattr("omnigent.runner._entry._make_auth_token_factory", lambda: None)
-    monkeypatch.setattr("omnigent.inner.codex_executor._find_codex_cli", lambda: _CODEX_PATH)
+    monkeypatch.setattr("omnigent.harnesses.codex.executor._find_codex_cli", lambda: _CODEX_PATH)
     monkeypatch.setattr(codex_app, "_find_codex_cli", lambda: _CODEX_PATH)
     monkeypatch.setattr(
         "omnigent.harnesses.codex_native.process_registry.reap_codex_native_processes_for_state_dir",
@@ -577,10 +577,10 @@ async def test_first_message_does_not_reintroduce_retired_prelaunch_override(
     codex_launch_harness: _LaunchHarness,
 ) -> None:
     """An ordinary queued message keeps the working fallback even with an old snapshot."""
-    from omnigent._wrapper_labels import CODEX_NATIVE_WRAPPER_VALUE, WRAPPER_LABEL_KEY
     from omnigent.entities.conversation import Conversation
-    from omnigent.runtime.harnesses._scaffold import MessageEvent
-    from omnigent.server.routes._sessions.orchestration import _build_native_terminal_message_event
+    from omnigent.harnesses.runtime._scaffold import MessageEvent
+    from omnigent.harnesses.wrapper_labels import CODEX_NATIVE_WRAPPER_VALUE, WRAPPER_LABEL_KEY
+    from omnigent.server.routes.sessions.orchestration import _build_native_terminal_message_event
     from omnigent.server.schemas import SessionEventInput
 
     harness = codex_launch_harness

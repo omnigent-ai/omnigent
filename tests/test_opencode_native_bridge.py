@@ -368,7 +368,7 @@ def test_prepare_bridge_dir_excludes_concurrent_orphan_prune(
         "write_owner_pid_marker",
         _pause_before_owner_write,
     )
-    monkeypatch.setattr("omnigent.inner.terminal._process_alive", lambda _pid: False)
+    monkeypatch.setattr("omnigent.terminals.terminal._process_alive", lambda _pid: False)
     prepare_thread = threading.Thread(target=_prepare_replacement)
     prepare_thread.start()
     try:

@@ -15,7 +15,7 @@ the single place that translates between the two.
 
 Codes are STABLE and append-only: never renumber or reuse a shipped code,
 and leave gaps rather than reordering, so old rows keep their meaning.
-This mirrors :data:`omnigent.server.auth.LEVEL_READ` and friends, the
+This mirrors :data:`omnigent.entities.permission.LEVEL_READ` and friends, the
 existing int-coded ``session_permissions.level``.
 """
 

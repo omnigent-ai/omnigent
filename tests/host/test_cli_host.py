@@ -16,8 +16,13 @@ import psutil
 import pytest
 from click.testing import CliRunner
 
-from omnigent import cli as cli_module
-from omnigent.cli import _add_daemon_host_status, _ensure_host_daemon, _host_daemon_alive, cli
+from omnigent.cli import commands as cli_module
+from omnigent.cli.commands import (
+    _add_daemon_host_status,
+    _ensure_host_daemon,
+    _host_daemon_alive,
+    cli,
+)
 from omnigent.host.local_server import LocalServerStartup
 
 
@@ -74,7 +79,7 @@ def test_host_pid_path_honors_data_dir_at_import(tmp_path: Path) -> None:
         [
             sys.executable,
             "-c",
-            "from omnigent.cli import _HOST_PID_PATH; print(_HOST_PID_PATH)",
+            "from omnigent.cli.commands import _HOST_PID_PATH; print(_HOST_PID_PATH)",
         ],
         env=env,
         check=True,
@@ -114,7 +119,7 @@ def test_host_no_server_starts_local_backend(
     server spawn and the (blocking) daemon loop so the command returns.
     """
     monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
-    monkeypatch.setattr("omnigent.cli._HOST_PID_PATH", tmp_path / "host.pid")
+    monkeypatch.setattr("omnigent.cli.commands._HOST_PID_PATH", tmp_path / "host.pid")
     captured_url: list[str] = []
 
     def _fake_run(server_url: str, **kwargs: object) -> None:
@@ -124,7 +129,7 @@ def test_host_no_server_starts_local_backend(
         # spawned=False: this test only checks URL resolution; reused keeps
         # the Ctrl-C stop-server prompt out of the picture (it has its own tests).
         patch(
-            "omnigent.cli.ensure_local_omnigent_server",
+            "omnigent.cli.commands.ensure_local_omnigent_server",
             lambda: LocalServerStartup(url="http://127.0.0.1:8123", spawned=False),
         ),
         patch("omnigent.host.connect.run_host_process", _fake_run),
@@ -150,7 +155,7 @@ def test_host_reads_server_from_global_config(
     """
     (tmp_path / "config.yaml").write_text("server: https://from-config.example.com\n")
     monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
-    monkeypatch.setattr("omnigent.cli._HOST_PID_PATH", tmp_path / "host.pid")
+    monkeypatch.setattr("omnigent.cli.commands._HOST_PID_PATH", tmp_path / "host.pid")
 
     captured_url: list[str] = []
 
@@ -180,7 +185,7 @@ def test_host_accepts_server_as_positional(
     and the command exits non-zero — so this test fails loud.
     """
     monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
-    monkeypatch.setattr("omnigent.cli._HOST_PID_PATH", tmp_path / "host.pid")
+    monkeypatch.setattr("omnigent.cli.commands._HOST_PID_PATH", tmp_path / "host.pid")
     runs: list[_HostRun] = []
 
     def _fake_run(server_url: str, **kwargs: object) -> None:
@@ -213,7 +218,7 @@ def test_host_accepts_option_after_positional_server(
     non-zero with "Unexpected extra argument(s)".
     """
     monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
-    monkeypatch.setattr("omnigent.cli._HOST_PID_PATH", tmp_path / "host.pid")
+    monkeypatch.setattr("omnigent.cli.commands._HOST_PID_PATH", tmp_path / "host.pid")
     runs: list[_HostRun] = []
 
     def _fake_run(server_url: str, **kwargs: object) -> None:
@@ -242,7 +247,7 @@ def test_host_accepts_empty_positional_as_local_marker(
     """
     (tmp_path / "config.yaml").write_text("server: https://from-config.example.com\n")
     monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
-    monkeypatch.setattr("omnigent.cli._HOST_PID_PATH", tmp_path / "host.pid")
+    monkeypatch.setattr("omnigent.cli.commands._HOST_PID_PATH", tmp_path / "host.pid")
     runs: list[_HostRun] = []
 
     def _fake_run(server_url: str, **kwargs: object) -> None:
@@ -252,7 +257,7 @@ def test_host_accepts_empty_positional_as_local_marker(
         # spawned=False: this test only checks the empty-string local-mode URL
         # resolution; reused keeps the Ctrl-C stop-server prompt out of scope.
         patch(
-            "omnigent.cli.ensure_local_omnigent_server",
+            "omnigent.cli.commands.ensure_local_omnigent_server",
             lambda: LocalServerStartup(url="http://127.0.0.1:8123", spawned=False),
         ),
         patch("omnigent.host.connect.run_host_process", _fake_run),
@@ -279,7 +284,7 @@ def test_host_status_subcommand_still_dispatches(
     loop is never called and the status path is taken instead.
     """
     monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
-    monkeypatch.setattr("omnigent.cli._HOST_PID_PATH", tmp_path / "host.pid")
+    monkeypatch.setattr("omnigent.cli.commands._HOST_PID_PATH", tmp_path / "host.pid")
     runs: list[_HostRun] = []
     selected_calls: list[dict[str, object]] = []
 
@@ -292,7 +297,7 @@ def test_host_status_subcommand_still_dispatches(
 
     with (
         patch("omnigent.host.connect.run_host_process", _fake_run),
-        patch("omnigent.cli._selected_daemon_records", _fake_selected),
+        patch("omnigent.cli.commands._selected_daemon_records", _fake_selected),
     ):
         runner = CliRunner()
         result = runner.invoke(cli, ["host", "status"])
@@ -330,9 +335,9 @@ def test_host_enable_subcommand_installs_user_service(
         captured.append((server_url, environment))
         return HostService(kind="systemd_user", path=service_path, label=service_path.name)
 
-    monkeypatch.setattr("omnigent.cli._find_daemon_record", lambda target: None)
+    monkeypatch.setattr("omnigent.cli.commands._find_daemon_record", lambda target: None)
     monkeypatch.setattr(
-        "omnigent.cli._build_host_daemon_env",
+        "omnigent.cli.commands._build_host_daemon_env",
         lambda *, server_url: {"HOME": str(tmp_path)},
     )
     monkeypatch.setattr("omnigent.host.service.enable_user_host_service", _enable)
@@ -359,7 +364,7 @@ def test_host_disable_subcommand_removes_user_service(
         return HostService(kind="systemd_user", path=service_path, label=service_path.name)
 
     monkeypatch.setattr("omnigent.host.service.disable_user_host_service", _disable)
-    monkeypatch.setattr("omnigent.cli._list_daemon_records", list)
+    monkeypatch.setattr("omnigent.cli.commands._list_daemon_records", list)
 
     result = CliRunner().invoke(cli, ["host", "disable"])
 
@@ -381,7 +386,7 @@ def test_host_rejects_unknown_plain_token_as_subcommand(
     starting the foreground daemon with ``server_url="sessions"``.
     """
     monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
-    monkeypatch.setattr("omnigent.cli._HOST_PID_PATH", tmp_path / "host.pid")
+    monkeypatch.setattr("omnigent.cli.commands._HOST_PID_PATH", tmp_path / "host.pid")
     runs: list[_HostRun] = []
 
     def _fake_run(server_url: str, **kwargs: object) -> None:
@@ -408,7 +413,7 @@ def test_host_rejects_positional_and_server_option_together(
     regresses, one value would silently win and this test fails.
     """
     monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
-    monkeypatch.setattr("omnigent.cli._HOST_PID_PATH", tmp_path / "host.pid")
+    monkeypatch.setattr("omnigent.cli.commands._HOST_PID_PATH", tmp_path / "host.pid")
     runs: list[_HostRun] = []
 
     def _fake_run(server_url: str, **kwargs: object) -> None:
@@ -438,7 +443,7 @@ def test_host_daemon_alive_returns_false_when_no_pid_file(
     If it returns True, the auto-launch would skip spawning a
     daemon even on a fresh machine.
     """
-    with patch("omnigent.cli._HOST_PID_PATH", tmp_path / "host.pid"):
+    with patch("omnigent.cli.commands._HOST_PID_PATH", tmp_path / "host.pid"):
         assert _host_daemon_alive() is False
 
 
@@ -455,7 +460,7 @@ def test_host_daemon_alive_returns_false_for_dead_pid(
     pid_path = tmp_path / "host.pid"
     # PID 99999999 almost certainly doesn't exist.
     pid_path.write_text("99999999\nhttp://localhost:8000\n")
-    with patch("omnigent.cli._HOST_PID_PATH", pid_path):
+    with patch("omnigent.cli.commands._HOST_PID_PATH", pid_path):
         assert _host_daemon_alive() is False
 
 
@@ -493,9 +498,11 @@ def test_ensure_host_daemon_writes_pid_file(
         return proc
 
     with (
-        patch("omnigent.cli._HOST_PID_PATH", pid_path),
-        patch("omnigent.cli.subprocess.Popen", side_effect=_fake_popen),
-        patch("omnigent.cli._wait_for_daemon_claim", side_effect=_persist_fake_daemon_claim),
+        patch("omnigent.cli.commands._HOST_PID_PATH", pid_path),
+        patch("omnigent.cli.commands.subprocess.Popen", side_effect=_fake_popen),
+        patch(
+            "omnigent.cli.commands._wait_for_daemon_claim", side_effect=_persist_fake_daemon_claim
+        ),
     ):
         _ensure_host_daemon("http://localhost:8000")
 
@@ -545,12 +552,14 @@ def test_ensure_host_daemon_keeps_old_for_different_server(
         return _SpawnedDaemon(pid=spawned_pids.pop(0))
 
     with (
-        patch("omnigent.cli._HOST_PID_PATH", pid_path),
-        patch("omnigent.cli._pid_is_recorded_daemon", lambda record: True),
-        patch("omnigent.cli._pid_alive", lambda pid: pid in {4242, 4243}),
-        patch("omnigent.cli.os.kill", lambda pid, sig: killed.append(pid)),
-        patch("omnigent.cli.subprocess.Popen", side_effect=_fake_popen),
-        patch("omnigent.cli._wait_for_daemon_claim", side_effect=_persist_fake_daemon_claim),
+        patch("omnigent.cli.commands._HOST_PID_PATH", pid_path),
+        patch("omnigent.cli.commands._pid_is_recorded_daemon", lambda record: True),
+        patch("omnigent.cli.commands._pid_alive", lambda pid: pid in {4242, 4243}),
+        patch("omnigent.cli.commands.os.kill", lambda pid, sig: killed.append(pid)),
+        patch("omnigent.cli.commands.subprocess.Popen", side_effect=_fake_popen),
+        patch(
+            "omnigent.cli.commands._wait_for_daemon_claim", side_effect=_persist_fake_daemon_claim
+        ),
     ):
         _ensure_host_daemon("http://old-server:8000")
         _ensure_host_daemon("http://new-server:9000")
@@ -601,8 +610,8 @@ def test_ensure_host_daemon_skips_if_alive(
         return original_popen(args, **kwargs)
 
     with (
-        patch("omnigent.cli._HOST_PID_PATH", pid_path),
-        patch("omnigent.cli.subprocess.Popen", side_effect=_counting_popen),
+        patch("omnigent.cli.commands._HOST_PID_PATH", pid_path),
+        patch("omnigent.cli.commands.subprocess.Popen", side_effect=_counting_popen),
     ):
         _ensure_host_daemon("http://localhost:8000")
 
@@ -623,7 +632,7 @@ def test_host_stop_treats_zombie_daemon_as_dead(
     with ``--force``) fail forever with "did not exit" and blocks every
     subsequent ``host`` start with "already running".
     """
-    monkeypatch.setattr("omnigent.cli._HOST_PID_PATH", tmp_path / "host.pid")
+    monkeypatch.setattr("omnigent.cli.commands._HOST_PID_PATH", tmp_path / "host.pid")
 
     zombie_pid = os.fork()
     if zombie_pid == 0:
@@ -694,7 +703,7 @@ def test_host_stop_drops_stale_foreign_daemon_record(
     raises ``PermissionError``. Stop must treat the record as stale — warn
     and delete it — instead of crashing on the EPERM, even with ``--force``.
     """
-    monkeypatch.setattr("omnigent.cli._HOST_PID_PATH", tmp_path / "host.pid")
+    monkeypatch.setattr("omnigent.cli.commands._HOST_PID_PATH", tmp_path / "host.pid")
 
     daemons_dir = tmp_path / "daemons"
     daemons_dir.mkdir()
@@ -722,10 +731,10 @@ def test_host_stop_drops_stale_foreign_daemon_record(
         """Simulate signalling a pid owned by another user (EPERM)."""
         raise PermissionError(1, "Operation not permitted")
 
-    monkeypatch.setattr("omnigent.cli._pid_alive", lambda pid: True)
+    monkeypatch.setattr("omnigent.cli.commands._pid_alive", lambda pid: True)
     # Identity is not what this test exercises — force the os.kill EPERM path.
-    monkeypatch.setattr("omnigent.cli._pid_is_recorded_daemon", lambda record: True)
-    monkeypatch.setattr("omnigent.cli.os.kill", _eperm_kill)
+    monkeypatch.setattr("omnigent.cli.commands._pid_is_recorded_daemon", lambda record: True)
+    monkeypatch.setattr("omnigent.cli.commands.os.kill", _eperm_kill)
 
     runner = CliRunner()
     result = runner.invoke(cli, ["host", "stop", "--all", "--daemon-only", "--force"])
@@ -764,7 +773,7 @@ def test_add_daemon_host_status_skips_http_for_dead_process() -> None:
         "host_status": None,
         "error": None,
     }
-    with patch("omnigent.cli._host_http_json", _fake_http):
+    with patch("omnigent.cli.commands._host_http_json", _fake_http):
         _add_daemon_host_status(payload)
 
     assert payload["host_status"] == "offline"
@@ -782,7 +791,7 @@ def test_host_http_json_handles_remote_headers_oserror() -> None:
     converted to a graceful _HostHttpResult(status_code=0) like any other
     transport failure.
     """
-    from omnigent.cli import _host_http_headers_cache, _host_http_json
+    from omnigent.cli.commands import _host_http_headers_cache, _host_http_json
 
     # Clear cache so the resolution path is exercised.
     url = "https://oserror-test.example.com"
@@ -791,7 +800,7 @@ def test_host_http_json_handles_remote_headers_oserror() -> None:
     def _raise_oserror(*_args: object, **_kwargs: object) -> object:
         raise OSError("credential file not found")
 
-    with patch("omnigent.chat._remote_headers", _raise_oserror):
+    with patch("omnigent.cli.chat._remote_headers", _raise_oserror):
         result = _host_http_json(base_url=url, method="GET", path="/v1/test")
 
     assert result.status_code == 0
@@ -817,27 +826,29 @@ def _patch_background_host_spawn(
     :param pid: Fake pid the stub spawn reports, e.g. ``4242``.
     :returns: The recorded spawn argv list and the fake daemon log path.
     """
-    from omnigent.cli import _SpawnedDaemonProcess
+    from omnigent.cli.commands import _SpawnedDaemonProcess
 
     monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
-    monkeypatch.setattr("omnigent.cli._HOST_PID_PATH", tmp_path / "host.pid")
+    monkeypatch.setattr("omnigent.cli.commands._HOST_PID_PATH", tmp_path / "host.pid")
     # No fixed grace: the stubbed pid is trivially "alive", so waiting for it
     # only slows the test down.
-    monkeypatch.setattr("omnigent.cli._BACKGROUND_HOST_GRACE_S", 0.0)
+    monkeypatch.setattr("omnigent.cli.commands._BACKGROUND_HOST_GRACE_S", 0.0)
     monkeypatch.setattr(
-        "omnigent.cli._pid_is_recorded_daemon",
+        "omnigent.cli.commands._pid_is_recorded_daemon",
         lambda record: cli_module._pid_alive(record.pid),
     )
-    monkeypatch.setattr("omnigent.cli._pid_alive", lambda checked: checked == pid)
-    monkeypatch.setattr("omnigent.cli._daemon_host_online", lambda record, **kwargs: True)
+    monkeypatch.setattr("omnigent.cli.commands._pid_alive", lambda checked: checked == pid)
+    monkeypatch.setattr("omnigent.cli.commands._daemon_host_online", lambda record, **kwargs: True)
     monkeypatch.setattr(
-        "omnigent.cli._daemon_host_status_probe",
+        "omnigent.cli.commands._daemon_host_status_probe",
         lambda record, **kwargs: cli_module._HostHttpResult(
             status_code=200, body={"status": "online"}
         ),
     )
     # Local mode waits for the server the daemon owns; no real server here.
-    monkeypatch.setattr("omnigent.cli._discover_local_server_url", lambda: "http://127.0.0.1:6767")
+    monkeypatch.setattr(
+        "omnigent.cli.commands._discover_local_server_url", lambda: "http://127.0.0.1:6767"
+    )
     log_path = tmp_path / "host-test.log"
     log_path.write_text("")
     spawned_args: list[list[str]] = []
@@ -853,8 +864,8 @@ def _patch_background_host_spawn(
         spawned_args.append(args)
         return _SpawnedDaemonProcess(pid=pid, log_path=str(log_path))
 
-    monkeypatch.setattr("omnigent.cli._spawn_host_daemon_process", _fake_spawn)
-    monkeypatch.setattr("omnigent.cli._wait_for_daemon_claim", _persist_fake_daemon_claim)
+    monkeypatch.setattr("omnigent.cli.commands._spawn_host_daemon_process", _fake_spawn)
+    monkeypatch.setattr("omnigent.cli.commands._wait_for_daemon_claim", _persist_fake_daemon_claim)
     return spawned_args, log_path
 
 
@@ -892,22 +903,24 @@ def test_host_background_fails_when_daemon_never_registers(
     """A live PID without a registered channel must not be reported as started."""
     _spawned, log_path = _patch_background_host_spawn(monkeypatch, tmp_path)
     log_path.write_text("Host registration failed: database unavailable\n")
-    monkeypatch.setattr("omnigent.cli._daemon_host_online", lambda record, **kwargs: False)
+    monkeypatch.setattr(
+        "omnigent.cli.commands._daemon_host_online", lambda record, **kwargs: False
+    )
     # The server answers (host row offline), so the failure is the generic
     # registration timeout rather than the unreachable-server error.
     monkeypatch.setattr(
-        "omnigent.cli._daemon_host_status_probe",
+        "omnigent.cli.commands._daemon_host_status_probe",
         lambda record, **kwargs: cli_module._HostHttpResult(
             status_code=200, body={"status": "offline"}
         ),
     )
-    monkeypatch.setattr("omnigent.cli._BACKGROUND_HOST_REGISTRATION_GRACE_S", 0.0)
+    monkeypatch.setattr("omnigent.cli.commands._BACKGROUND_HOST_REGISTRATION_GRACE_S", 0.0)
     monkeypatch.setattr(
-        "omnigent.cli._ensure_databricks_server_auth", lambda *args, **kwargs: None
+        "omnigent.cli.commands._ensure_databricks_server_auth", lambda *args, **kwargs: None
     )
     terminated: list[int] = []
     monkeypatch.setattr(
-        "omnigent.cli._terminate_daemon",
+        "omnigent.cli.commands._terminate_daemon",
         lambda record, *, force: terminated.append(record.pid),
     )
 
@@ -945,7 +958,7 @@ def test_host_background_does_not_block(
             "omnigent.host.connect.run_host_process",
             lambda server_url, **kwargs: foreground_runs.append(server_url),
         ),
-        patch("omnigent.cli.ensure_local_omnigent_server", _fail_local_server),
+        patch("omnigent.cli.commands.ensure_local_omnigent_server", _fail_local_server),
     ):
         result = CliRunner().invoke(cli, ["host", "--background"])
 
@@ -963,7 +976,7 @@ def test_host_background_reuses_running_daemon(
     Two daemons for one target would register the same machine twice; the
     command reports the existing pid and returns.
     """
-    from omnigent.cli import (
+    from omnigent.cli.commands import (
         _LOCAL_DAEMON_MARKER,
         _HostDaemonRecord,
         _write_daemon_record,
@@ -972,10 +985,12 @@ def test_host_background_reuses_running_daemon(
 
     spawned_args, _ = _patch_background_host_spawn(monkeypatch, tmp_path)
     monkeypatch.setattr(
-        "omnigent.cli._pid_is_recorded_daemon",
+        "omnigent.cli.commands._pid_is_recorded_daemon",
         lambda record: cli_module._pid_alive(record.pid),
     )
-    monkeypatch.setattr("omnigent.cli._pid_alive", lambda checked: checked in {4242, 5150})
+    monkeypatch.setattr(
+        "omnigent.cli.commands._pid_alive", lambda checked: checked in {4242, 5150}
+    )
     _write_daemon_record(
         _HostDaemonRecord(
             pid=5150,
@@ -1014,7 +1029,7 @@ def test_recycled_pid_record_is_pruned_and_host_claims(
     wifianalyticsd. With identity validation the record is pruned and the
     foreground host claims its target normally.
     """
-    from omnigent.cli import (
+    from omnigent.cli.commands import (
         _claim_foreground_daemon_record,
         _daemon_record_path,
         _HostDaemonRecord,
@@ -1023,10 +1038,10 @@ def test_recycled_pid_record_is_pruned_and_host_claims(
         server_config_signature,
     )
 
-    monkeypatch.setattr("omnigent.cli._HOST_PID_PATH", tmp_path / "host.pid")
-    monkeypatch.setattr("omnigent.cli._pid_alive", lambda pid: True)
+    monkeypatch.setattr("omnigent.cli.commands._HOST_PID_PATH", tmp_path / "host.pid")
+    monkeypatch.setattr("omnigent.cli.commands._pid_alive", lambda pid: True)
     # Alive but NOT the daemon we recorded: the recycled-pid signature.
-    monkeypatch.setattr("omnigent.cli._pid_is_recorded_daemon", lambda record: False)
+    monkeypatch.setattr("omnigent.cli.commands._pid_is_recorded_daemon", lambda record: False)
 
     stale = _HostDaemonRecord(
         pid=724,
@@ -1070,7 +1085,7 @@ def test_terminate_daemon_recycled_pid_discards_record_without_signalling(
     by this user, which os.kill WOULD terminate). Stop must warn, drop the
     stale record, and continue — killing nothing and not crashing.
     """
-    from omnigent.cli import (
+    from omnigent.cli.commands import (
         _daemon_record_path,
         _HostDaemonRecord,
         _read_daemon_record,
@@ -1089,16 +1104,16 @@ def test_terminate_daemon_recycled_pid_discards_record_without_signalling(
         host_id=None,
         config_sig=server_config_signature(),
     )
-    monkeypatch.setattr("omnigent.cli._HOST_PID_PATH", tmp_path / "host.pid")
+    monkeypatch.setattr("omnigent.cli.commands._HOST_PID_PATH", tmp_path / "host.pid")
     _write_daemon_record(record)
 
-    monkeypatch.setattr("omnigent.cli._pid_alive", lambda pid: True)
-    monkeypatch.setattr("omnigent.cli._pid_is_recorded_daemon", lambda rec: False)
+    monkeypatch.setattr("omnigent.cli.commands._pid_alive", lambda pid: True)
+    monkeypatch.setattr("omnigent.cli.commands._pid_is_recorded_daemon", lambda rec: False)
 
     def _forbidden_kill(pid: int, sig: int) -> None:
         raise AssertionError(f"os.kill({pid}, {sig}) reached for a recycled pid")
 
-    monkeypatch.setattr("omnigent.cli.os.kill", _forbidden_kill)
+    monkeypatch.setattr("omnigent.cli.commands.os.kill", _forbidden_kill)
 
     _terminate_daemon(record, force=False)
 
@@ -1117,7 +1132,7 @@ def test_terminate_daemon_permission_error_discards_record(
     Last-resort guard for when identity validation can't rule the pid out
     (e.g. an unreadable creation time) but the signal is refused.
     """
-    from omnigent.cli import (
+    from omnigent.cli.commands import (
         _daemon_record_path,
         _HostDaemonRecord,
         _read_daemon_record,
@@ -1136,16 +1151,16 @@ def test_terminate_daemon_permission_error_discards_record(
         host_id=None,
         config_sig=server_config_signature(),
     )
-    monkeypatch.setattr("omnigent.cli._HOST_PID_PATH", tmp_path / "host.pid")
+    monkeypatch.setattr("omnigent.cli.commands._HOST_PID_PATH", tmp_path / "host.pid")
     _write_daemon_record(record)
 
-    monkeypatch.setattr("omnigent.cli._pid_alive", lambda pid: True)
-    monkeypatch.setattr("omnigent.cli._pid_is_recorded_daemon", lambda rec: True)
+    monkeypatch.setattr("omnigent.cli.commands._pid_alive", lambda pid: True)
+    monkeypatch.setattr("omnigent.cli.commands._pid_is_recorded_daemon", lambda rec: True)
 
     def _eperm_kill(pid: int, sig: int) -> None:
         raise PermissionError(1, "Operation not permitted")
 
-    monkeypatch.setattr("omnigent.cli.os.kill", _eperm_kill)
+    monkeypatch.setattr("omnigent.cli.commands.os.kill", _eperm_kill)
 
     _terminate_daemon(record, force=False)
 
@@ -1161,7 +1176,7 @@ def test_pid_identity_survives_slow_daemon_startup() -> None:
     identity check must be one-sided: creation before ``started_at`` is
     always ours, no matter how much earlier.
     """
-    from omnigent.cli import _HostDaemonRecord, _pid_is_recorded_daemon
+    from omnigent.cli.commands import _HostDaemonRecord, _pid_is_recorded_daemon
 
     created = psutil.Process(os.getpid()).create_time()
     record = _HostDaemonRecord(
@@ -1184,7 +1199,7 @@ def test_pid_identity_rejects_pid_created_after_record() -> None:
     predates it — the post-reboot signature, where the original daemon died
     and the kernel handed its pid to a fresh process.
     """
-    from omnigent.cli import _HostDaemonRecord, _pid_is_recorded_daemon
+    from omnigent.cli.commands import _HostDaemonRecord, _pid_is_recorded_daemon
 
     created = psutil.Process(os.getpid()).create_time()
     record = _HostDaemonRecord(
@@ -1202,7 +1217,7 @@ def test_pid_identity_rejects_pid_created_after_record() -> None:
 
 def test_pid_identity_legacy_record_without_start_time_is_alive_only() -> None:
     """Records lacking a real ``started_at`` fall back to bare liveness."""
-    from omnigent.cli import _HostDaemonRecord, _pid_is_recorded_daemon
+    from omnigent.cli.commands import _HostDaemonRecord, _pid_is_recorded_daemon
 
     record = _HostDaemonRecord(
         pid=os.getpid(),
@@ -1221,10 +1236,10 @@ def test_host_status_reports_recycled_pid_daemon_offline(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Status must not call a recycled pid an online daemon process."""
-    from omnigent.cli import _base_daemon_status_payload, _HostDaemonRecord
+    from omnigent.cli.commands import _base_daemon_status_payload, _HostDaemonRecord
 
-    monkeypatch.setattr("omnigent.cli._pid_alive", lambda pid: True)
-    monkeypatch.setattr("omnigent.cli._pid_is_recorded_daemon", lambda record: False)
+    monkeypatch.setattr("omnigent.cli.commands._pid_alive", lambda pid: True)
+    monkeypatch.setattr("omnigent.cli.commands._pid_is_recorded_daemon", lambda record: False)
     record = _HostDaemonRecord(
         pid=724,
         target="https://omnigent.example.com",
@@ -1261,7 +1276,7 @@ def test_host_background_signs_in_before_spawning(
         assert spawned_args == [], "sign-in must precede the daemon spawn"
         auth_calls.append((server, non_interactive))
 
-    monkeypatch.setattr("omnigent.cli._ensure_databricks_server_auth", _fake_auth)
+    monkeypatch.setattr("omnigent.cli.commands._ensure_databricks_server_auth", _fake_auth)
 
     result = CliRunner().invoke(
         cli, ["host", "--background", "--server", "https://example.databricksapps.com"]
@@ -1330,7 +1345,7 @@ def test_start_hosts_on_explicit_server(
         """
         auth_calls.append((server, non_interactive))
 
-    monkeypatch.setattr("omnigent.cli._ensure_databricks_server_auth", _fake_auth)
+    monkeypatch.setattr("omnigent.cli.commands._ensure_databricks_server_auth", _fake_auth)
 
     result = CliRunner().invoke(
         cli, ["start", "--server", "https://example.databricksapps.com", "--non-interactive"]
@@ -1389,18 +1404,18 @@ def test_host_web_ui_open_gates(
     if config_content is not None:
         (tmp_path / "config.yaml").write_text(config_content)
     monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
-    monkeypatch.setattr("omnigent.cli._HOST_PID_PATH", tmp_path / "host.pid")
-    monkeypatch.setattr("omnigent.cli._stdin_is_tty", lambda: is_tty)
+    monkeypatch.setattr("omnigent.cli.commands._HOST_PID_PATH", tmp_path / "host.pid")
+    monkeypatch.setattr("omnigent.cli.commands._stdin_is_tty", lambda: is_tty)
     opened: list[str] = []
 
     with (
         patch(
-            "omnigent.cli.ensure_local_omnigent_server",
+            "omnigent.cli.commands.ensure_local_omnigent_server",
             lambda: LocalServerStartup(url="http://127.0.0.1:8123", spawned=False),
         ),
         patch("omnigent.host.connect.run_host_process", lambda server_url, **kwargs: None),
         patch(
-            "omnigent.conversation_browser.open_conversation_url",
+            "omnigent.cli.conversation_browser.open_conversation_url",
             lambda url: opened.append(url) or True,
         ),
     ):
@@ -1420,15 +1435,15 @@ def test_host_remote_web_ui_open_preference(
 ) -> None:
     """Honor the browser preference on remote hosts while preserving sign-in."""
     monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
-    monkeypatch.setattr("omnigent.cli._HOST_PID_PATH", tmp_path / "host.pid")
-    monkeypatch.setattr("omnigent.cli._stdin_is_tty", lambda: True)
+    monkeypatch.setattr("omnigent.cli.commands._HOST_PID_PATH", tmp_path / "host.pid")
+    monkeypatch.setattr("omnigent.cli.commands._stdin_is_tty", lambda: True)
     opened: list[str] = []
 
     with (
-        patch("omnigent.cli._ensure_databricks_server_auth") as auth,
+        patch("omnigent.cli.commands._ensure_databricks_server_auth") as auth,
         patch("omnigent.host.connect.run_host_process", lambda server_url, **kwargs: None),
         patch(
-            "omnigent.conversation_browser.open_conversation_url",
+            "omnigent.cli.conversation_browser.open_conversation_url",
             lambda url: opened.append(url) or True,
         ),
     ):
@@ -1470,11 +1485,11 @@ def test_background_host_web_ui_open_preference(
 ) -> None:
     """Both background entry points honor the flag and environment preference."""
     _patch_background_host_spawn(monkeypatch, tmp_path)
-    monkeypatch.setattr("omnigent.cli._stdin_is_tty", lambda: True)
+    monkeypatch.setattr("omnigent.cli.commands._stdin_is_tty", lambda: True)
     opened: list[str] = []
 
     with patch(
-        "omnigent.conversation_browser.open_conversation_url",
+        "omnigent.cli.conversation_browser.open_conversation_url",
         lambda url: opened.append(url) or True,
     ):
         result = CliRunner().invoke(

@@ -148,7 +148,7 @@ def test_researcher_inherits_parent_sandbox_egress() -> None:
     a sandbox-less child silently bypassed an egress-restricted parent's
     allowlist (e.g. reaching localhost / IMDS the parent blocked).
     """
-    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+    from omnigent.core.datamodel import OSEnvSandboxSpec, OSEnvSpec
 
     sandbox = OSEnvSandboxSpec(
         egress_rules=["GET api.example.com/**"],
@@ -226,7 +226,7 @@ def test_parent_with_os_env_skips_bwrap_probe(
     verbatim path: its sandbox posture is its own to configure, so the
     probe must not second-guess it.
     """
-    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+    from omnigent.core.datamodel import OSEnvSandboxSpec, OSEnvSpec
 
     monkeypatch.setattr(sys, "platform", "linux")
     monkeypatch.setattr(shutil, "which", lambda cmd: None)

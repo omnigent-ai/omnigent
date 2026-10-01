@@ -511,7 +511,7 @@ def test_spawn_local_server_preserves_runtime_and_workspace(
     args = popen.call_args.args[0]
     kwargs = popen.call_args.kwargs
     module_index = args.index("-m")
-    assert args[module_index + 1 : module_index + 3] == ["omnigent.cli", "server"]
+    assert args[module_index + 1 : module_index + 3] == ["omnigent.cli.commands", "server"]
     # Exercise the captured interpreter options without starting a server
     # or inheriting the developer's credentials.
     probe_env = {
@@ -531,8 +531,8 @@ def test_spawn_local_server_preserves_runtime_and_workspace(
         # --help runs the CLI entry without starting a server.
         with contextlib.redirect_stdout(io.StringIO()):
             try:
-                sys.argv = ["omnigent.cli", "--help"]
-                runpy.run_module("omnigent.cli", run_name="__main__")
+                sys.argv = ["omnigent.cli.commands", "--help"]
+                runpy.run_module("omnigent.cli.commands", run_name="__main__")
             except SystemExit as exc:
                 assert exc.code == 0, exc.code
 

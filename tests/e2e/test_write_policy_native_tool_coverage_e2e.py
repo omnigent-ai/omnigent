@@ -34,7 +34,7 @@ from typing import Any
 import httpx
 import pytest
 
-from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN
+from omnigent.util.runner_identity import OMNIGENT_INTERNAL_WS_ORIGIN
 
 _READ_ONLY_HANDLER = "omnigent.policies.builtins.orchestration.read_only_os"
 _WORKTREE_GUARD_HANDLER = "omnigent.policies.builtins.orchestration.worktree_guard"

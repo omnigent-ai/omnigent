@@ -110,7 +110,7 @@ def _ensure_default_sandbox_runnable() -> None:
 
     A parent with no ``os_env`` leaves the researcher's ``sandbox``
     unset, which resolves to the platform default (see
-    ``omnigent.inner.sandbox._default_sandbox_for_platform``) without
+    ``omnigent.sandbox.core._default_sandbox_for_platform``) without
     probing for its binary. The spawn then failed mid-run with a hint
     to set ``os_env.sandbox.type`` — unreachable for a spawn-only
     parent, which cannot add an ``os_env`` block without also
@@ -164,7 +164,7 @@ def build_researcher_spec(parent_spec: AgentSpec) -> AgentSpec:
       rules, private-destination policy). The runner treats the
       resolved child spec as authoritative for ``sys_os_*`` and only
       wires the egress proxy from ``spec.sandbox`` (see
-      ``omnigent/inner/os_env.py::create_os_environment``). If the
+      ``omnigent/environments/os_env.py::create_os_environment``). If the
       child dropped the parent's sandbox, an egress-restricted parent
       would silently gain an unrestricted network path through the
       researcher — so the child must never be more privileged than
@@ -180,7 +180,7 @@ def build_researcher_spec(parent_spec: AgentSpec) -> AgentSpec:
         sandbox cannot run on this host (missing ``bwrap`` on Linux,
         ``sandbox-exec`` on macOS).
     """
-    from omnigent.inner.datamodel import OSEnvSpec
+    from omnigent.core.datamodel import OSEnvSpec
 
     parent_os_env = parent_spec.os_env
     if parent_os_env is None:

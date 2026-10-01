@@ -66,7 +66,7 @@ from tests.e2e.test_subagent_model_inheritance_e2e import (
 _PINNED_MODEL = "gpt-5-4-mini"
 
 # The process manager's model-switch teardown line
-# (omnigent/runtime/harnesses/process_manager.py, reason
+# (omnigent/harnesses/runtime/process_manager.py, reason
 # ``harness_respawn_model_switch``). Matched per child conversation id.
 _RESPAWN_LINE = "model changed {prior!r} -> {requested!r}; respawning"
 

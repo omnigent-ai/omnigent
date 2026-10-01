@@ -3,7 +3,7 @@
 This is the **discovery / read / control helper** for the native agy paths: the
 RPC read driver (:mod:`omnigent.harnesses.antigravity_native.reader`, which polls/streams
 trajectory steps to mirror agy's conversation) and the native executor
-(:mod:`omnigent.inner.antigravity_native_executor`, which delivers web/mobile
+(:mod:`omnigent.harnesses.antigravity_native.executor`, which delivers web/mobile
 turns). It provides, over agy's connect-RPC surface:
 
 * **conversation-ownership discovery** (:func:`resolve_language_server_port` /

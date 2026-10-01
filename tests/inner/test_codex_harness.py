@@ -19,9 +19,9 @@ from unittest.mock import patch
 
 import pytest
 
-from omnigent.inner import codex_harness
-from omnigent.inner.model_signer import SignerLaunchConfig
-from omnigent.runtime.harnesses import _HARNESS_MODULES
+from omnigent.harnesses.codex import harness as codex_harness
+from omnigent.harnesses.runtime import _HARNESS_MODULES
+from omnigent.models.signer.lifecycle import SignerLaunchConfig
 
 
 def test_harness_module_registered_in_module_registry() -> None:
@@ -30,7 +30,7 @@ def test_harness_module_registered_in_module_registry() -> None:
     Without this entry, the runner subprocess can't find the wrap
     when AP-side tries to spawn it for a ``harness: codex`` spec.
     """
-    assert _HARNESS_MODULES.get("codex") == "omnigent.inner.codex_harness"
+    assert _HARNESS_MODULES.get("codex") == "omnigent.harnesses.codex.harness"
 
 
 def test_create_app_returns_fastapi_with_required_routes() -> None:
@@ -75,8 +75,7 @@ def test_executor_factory_reads_env_vars(
     monkeypatch.setenv("HARNESS_CODEX_GATEWAY_AUTH_COMMAND", "printf token")
     monkeypatch.setenv("HARNESS_CODEX_GATEWAY_AUTH_REFRESH_INTERVAL_MS", "900000")
     monkeypatch.setenv("HARNESS_CODEX_CWD", "/tmp/test-cwd")
-    monkeypatch.setenv("HARNESS_CODEX_PATH", "/usr/local/bin/codex")
-    monkeypatch.delenv("OMNIGENT_CODEX_PATH", raising=False)
+    monkeypatch.setenv("OMNIGENT_CODEX_PATH", "/usr/local/bin/codex")
     monkeypatch.setenv("HARNESS_CODEX_ENABLE_WEB_SEARCH", "false")
     monkeypatch.setenv("HARNESS_CODEX_DISABLE_NATIVE_TOOLS", "true")
 
@@ -113,7 +112,7 @@ def test_executor_factory_reads_env_vars(
         captured["disable_native_tools"] = disable_native_tools
 
     with patch(
-        "omnigent.inner.codex_harness.CodexExecutor.__init__",
+        "omnigent.harnesses.codex.harness.CodexExecutor.__init__",
         _fake_init,
     ):
         codex_harness._build_codex_executor()
@@ -159,7 +158,7 @@ def test_executor_factory_passes_runner_selected_skills_directory(
     def _fake_init(self: Any, **kwargs: Any) -> None:
         captured.update(kwargs)
 
-    with patch("omnigent.inner.codex_harness.CodexExecutor.__init__", _fake_init):
+    with patch("omnigent.harnesses.codex.harness.CodexExecutor.__init__", _fake_init):
         codex_harness._build_codex_executor()
 
     assert captured["skills_dir"] == (skills_dir if configured else None)
@@ -188,7 +187,7 @@ def test_executor_factory_builds_registered_ucode_signer_authority(
     def _fake_init(self: Any, **kwargs: Any) -> None:
         captured.update(kwargs)
 
-    with patch("omnigent.inner.codex_harness.CodexExecutor.__init__", _fake_init):
+    with patch("omnigent.harnesses.codex.harness.CodexExecutor.__init__", _fake_init):
         codex_harness._build_codex_executor()
 
     signer = captured["signer_launch_config"]
@@ -285,7 +284,7 @@ def test_executor_factory_cwd_falls_back_to_runner_workspace(
         captured["cwd"] = cwd
 
     with patch(
-        "omnigent.inner.codex_harness.CodexExecutor.__init__",
+        "omnigent.harnesses.codex.harness.CodexExecutor.__init__",
         _fake_init,
     ):
         codex_harness._build_codex_executor()
@@ -307,7 +306,7 @@ def test_executor_factory_explicit_cwd_wins_over_workspace(
         captured["cwd"] = cwd
 
     with patch(
-        "omnigent.inner.codex_harness.CodexExecutor.__init__",
+        "omnigent.harnesses.codex.harness.CodexExecutor.__init__",
         _fake_init,
     ):
         codex_harness._build_codex_executor()
@@ -329,7 +328,7 @@ def test_executor_factory_blank_cwd_env_vars_pass_none(
         captured["cwd"] = cwd
 
     with patch(
-        "omnigent.inner.codex_harness.CodexExecutor.__init__",
+        "omnigent.harnesses.codex.harness.CodexExecutor.__init__",
         _fake_init,
     ):
         codex_harness._build_codex_executor()
@@ -376,7 +375,7 @@ def test_executor_factory_decodes_os_env_json(
         captured["os_env"] = kwargs["os_env"]
 
     with patch(
-        "omnigent.inner.codex_harness.CodexExecutor.__init__",
+        "omnigent.harnesses.codex.harness.CodexExecutor.__init__",
         _fake_init,
     ):
         codex_harness._build_codex_executor()
@@ -413,7 +412,7 @@ def test_executor_factory_falls_back_on_malformed_os_env_json(
         captured["os_env"] = kwargs["os_env"]
 
     with patch(
-        "omnigent.inner.codex_harness.CodexExecutor.__init__",
+        "omnigent.harnesses.codex.harness.CodexExecutor.__init__",
         _fake_init,
     ):
         codex_harness._build_codex_executor()
@@ -456,7 +455,7 @@ def test_databricks_env_var_truthy_parsing(
         captured.update(kwargs)
 
     with patch(
-        "omnigent.inner.codex_harness.CodexExecutor.__init__",
+        "omnigent.harnesses.codex.harness.CodexExecutor.__init__",
         _fake_init,
     ):
         codex_harness._build_codex_executor()
@@ -500,7 +499,7 @@ def test_enable_web_search_default_is_true(
         captured.update(kwargs)
 
     with patch(
-        "omnigent.inner.codex_harness.CodexExecutor.__init__",
+        "omnigent.harnesses.codex.harness.CodexExecutor.__init__",
         _fake_init,
     ):
         codex_harness._build_codex_executor()
@@ -540,7 +539,7 @@ def test_disable_native_tools_default_is_false(
         captured.update(kwargs)
 
     with patch(
-        "omnigent.inner.codex_harness.CodexExecutor.__init__",
+        "omnigent.harnesses.codex.harness.CodexExecutor.__init__",
         _fake_init,
     ):
         codex_harness._build_codex_executor()
@@ -579,7 +578,7 @@ def test_skills_filter_env_var_decodes(
         captured.update(kwargs)
 
     with patch(
-        "omnigent.inner.codex_harness.CodexExecutor.__init__",
+        "omnigent.harnesses.codex.harness.CodexExecutor.__init__",
         _fake_init,
     ):
         codex_harness._build_codex_executor()
@@ -598,7 +597,7 @@ def test_skills_filter_env_var_missing_falls_back_to_all(
         captured.update(kwargs)
 
     with patch(
-        "omnigent.inner.codex_harness.CodexExecutor.__init__",
+        "omnigent.harnesses.codex.harness.CodexExecutor.__init__",
         _fake_init,
     ):
         codex_harness._build_codex_executor()
@@ -626,7 +625,7 @@ def test_bundle_dir_and_agent_name_env_vars_thread_through(
         captured.update(kwargs)
 
     with patch(
-        "omnigent.inner.codex_harness.CodexExecutor.__init__",
+        "omnigent.harnesses.codex.harness.CodexExecutor.__init__",
         _fake_init,
     ):
         codex_harness._build_codex_executor()
@@ -647,7 +646,7 @@ def test_bundle_dir_unset_passes_none(
         captured.update(kwargs)
 
     with patch(
-        "omnigent.inner.codex_harness.CodexExecutor.__init__",
+        "omnigent.harnesses.codex.harness.CodexExecutor.__init__",
         _fake_init,
     ):
         codex_harness._build_codex_executor()

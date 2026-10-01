@@ -9,8 +9,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
-from omnigent.inner.os_env import (
+from omnigent.core.datamodel import OSEnvSandboxSpec, OSEnvSpec
+from omnigent.environments.os_env import (
     _copy_tree,
     create_os_environment,
 )
@@ -252,7 +252,7 @@ class TestForkedOSEnvironment(unittest.TestCase):
 
 class TestForkYAMLLoading(unittest.TestCase):
     def test_loader_parses_fork_field(self):
-        from omnigent.inner.loader import load_agent_def
+        from omnigent.core.loader import load_agent_def
 
         agent = load_agent_def(
             {
@@ -266,7 +266,7 @@ class TestForkYAMLLoading(unittest.TestCase):
         self.assertTrue(agent.os_env.fork)
 
     def test_loader_default_fork_false(self):
-        from omnigent.inner.loader import load_agent_def
+        from omnigent.core.loader import load_agent_def
 
         agent = load_agent_def(
             {

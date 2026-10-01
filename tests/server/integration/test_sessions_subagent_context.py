@@ -44,7 +44,7 @@ from omnigent.runtime import set_runner_router
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.app import create_app
 from omnigent.server.auth import RESERVED_USER_LOCAL
-from omnigent.server.routes._sessions.common import (
+from omnigent.server.routes.sessions.common import (
     _CLAUDE_NATIVE_WRAPPER_LABEL_KEY,
     _CODEX_NATIVE_WRAPPER_LABEL_VALUE,
 )
@@ -420,8 +420,8 @@ async def replica_lag_client(
     tmp_path: Path,
 ) -> AsyncIterator[httpx.AsyncClient]:
     """:returns: HTTP client wired to the auth-enabled, lagging-read app."""
+    from omnigent.harnesses.runtime.process_manager import HarnessProcessManager
     from omnigent.runtime import set_harness_process_manager
-    from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
 
     pm = HarnessProcessManager(tmp_parent=tmp_path / "harness_pm")
     await pm.start()

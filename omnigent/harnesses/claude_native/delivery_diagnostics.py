@@ -79,7 +79,7 @@ def trace_delivery(
         def wrapped(bridge_dir: Path, *, content: str, **kwargs: Any) -> Any:
             try:
                 # Hooks import this module on every invocation; keep the sink lazy.
-                from omnigent.debug_logging import current_session_id, debug_event
+                from omnigent.observability.debug_logging import current_session_id, debug_event
 
                 started = time.monotonic()
                 trace = _PromptDeliveryTrace(

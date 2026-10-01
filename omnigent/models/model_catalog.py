@@ -45,8 +45,7 @@ import click
 import httpx
 from cachetools import TTLCache
 
-from omnigent._platform import default_shell_argv
-from omnigent.harness_aliases import canonicalize_harness
+from omnigent.harnesses.aliases import canonicalize_harness
 from omnigent.llms.anthropic_model_metadata import parse_anthropic_model_metadata
 from omnigent.models.model_metadata import (
     ModelCapability,
@@ -75,6 +74,7 @@ from omnigent.onboarding.provider_config import (
 )
 from omnigent.runtime.credentials.databricks import resolve_databricks_workspace
 from omnigent.util.json_types import JsonObject as _JsonObject
+from omnigent.util.portability import default_shell_argv
 
 if TYPE_CHECKING:
     from omnigent.onboarding.providers import ModelInfo
@@ -841,7 +841,7 @@ def _acp_launch_model(spec: AgentSpec) -> str | None:
         retain the legacy filtering of inherited Databricks spec models.
     """
     model = getattr(spec.executor, "model", None)
-    from omnigent.inference_config import (
+    from omnigent.models.inference_config import (
         binding_for_harness,
         load_runtime_inference_config,
         resolve_bound_model,
@@ -887,7 +887,10 @@ def _acp_provider_entry(spec: AgentSpec) -> ProviderEntry | None:
     :raises OmnigentError: If the explicitly selected provider cannot be resolved.
     """
     from omnigent.errors import ErrorCode, OmnigentError
-    from omnigent.inference_config import load_runtime_inference_config, resolve_bound_provider
+    from omnigent.models.inference_config import (
+        load_runtime_inference_config,
+        resolve_bound_provider,
+    )
     from omnigent.runtime.workflow import _resolve_provider_for_build
     from omnigent.spec.types import ProviderAuth
 
@@ -939,7 +942,7 @@ def acp_curated_models(spec: object) -> tuple[str, ...]:
         first; empty for unbound, unconfigured, or default-only providers.
     :raises OmnigentError: If an explicitly selected provider cannot be resolved.
     """
-    from omnigent.inference_config import binding_for_harness, load_runtime_inference_config
+    from omnigent.models.inference_config import binding_for_harness, load_runtime_inference_config
 
     agent_spec = cast("AgentSpec", spec)
     binding = binding_for_harness(
@@ -971,7 +974,7 @@ def validate_acp_model(spec: object, model: str | None) -> None:
     :raises OmnigentError: If the provider cannot be resolved or excludes the model.
     """
     from omnigent.errors import ErrorCode, OmnigentError
-    from omnigent.inference_config import (
+    from omnigent.models.inference_config import (
         binding_for_harness,
         load_runtime_inference_config,
         resolve_bound_model,
@@ -1119,7 +1122,7 @@ def list_models_for_worker(
         listing = _listing_for_provider(provider, transport=transport)
     if harness is None:
         return listing
-    from omnigent.inference_config import binding_for_harness, load_runtime_inference_config
+    from omnigent.models.inference_config import binding_for_harness, load_runtime_inference_config
 
     binding = binding_for_harness(load_runtime_inference_config(), harness)
     if binding is not None:

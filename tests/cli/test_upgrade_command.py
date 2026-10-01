@@ -1,4 +1,4 @@
-"""Tests for the ``omni upgrade`` command (omnigent.cli.upgrade)."""
+"""Tests for the ``omni upgrade`` command (omnigent.cli.commands.upgrade)."""
 
 from __future__ import annotations
 
@@ -7,9 +7,8 @@ from pathlib import Path
 import pytest
 from click.testing import CliRunner
 
-from omnigent.cli import cli
-from omnigent.host.local_server import LocalServerInfo
-from omnigent.update_check import (
+from omnigent.cli.commands import cli
+from omnigent.cli.update_check import (
     _build_nightly_upgrade_suggestion,
     _build_upgrade_suggestion,
     _InstalledWheelInfo,
@@ -17,6 +16,7 @@ from omnigent.update_check import (
     _upgrade_failure_message,
     _uv_python_pin,
 )
+from omnigent.host.local_server import LocalServerInfo
 
 # uv upgrade commands pin the interpreter omnigent is running under, so
 # expectations derive the flag instead of hardcoding a python version.
@@ -60,28 +60,33 @@ def _wheel_install(monkeypatch: pytest.MonkeyPatch) -> None:
     import importlib.metadata
 
     monkeypatch.setattr(importlib.metadata, "version", lambda _name: "0.1.0")
-    monkeypatch.setattr("omnigent.update_check._find_repo_root", lambda: None)
-    monkeypatch.setattr("omnigent.update_check._read_installed_wheel_info", _uv_registry_info)
+    monkeypatch.setattr("omnigent.cli.update_check._find_repo_root", lambda: None)
+    monkeypatch.setattr("omnigent.cli.update_check._read_installed_wheel_info", _uv_registry_info)
     # Pretend a uv tool receipt exists so the install is not mistaken for uv pip.
     monkeypatch.setattr(
-        "omnigent.update_check._uv_tool_receipt_path", lambda: Path("/dev/null/uv-receipt.toml")
+        "omnigent.cli.update_check._uv_tool_receipt_path",
+        lambda: Path("/dev/null/uv-receipt.toml"),
     )
     # Neutralize the process side effects unless a test opts in to assert them.
     monkeypatch.setattr(
-        "omnigent.cli.local_server_status",
+        "omnigent.cli.commands.local_server_status",
         lambda: LocalServerInfo(running=False, pid=None, port=None, url=None),
     )
-    monkeypatch.setattr("omnigent.cli._stop_local_server_and_daemon", lambda *, force: False)
+    monkeypatch.setattr(
+        "omnigent.cli.commands._stop_local_server_and_daemon", lambda *, force: False
+    )
 
 
 def test_upgrade_up_to_date(monkeypatch: pytest.MonkeyPatch, _wheel_install: None) -> None:
     """Latest == installed → reports up to date, exit 0, nothing stopped/run."""
-    monkeypatch.setattr("omnigent.update_check.fetch_latest_version", lambda *_a, **_k: "0.1.0")
+    monkeypatch.setattr(
+        "omnigent.cli.update_check.fetch_latest_version", lambda *_a, **_k: "0.1.0"
+    )
 
     def _must_not_run(*_a: object, **_k: object) -> int:
         raise AssertionError("upgrade command ran while already up to date")
 
-    monkeypatch.setattr("omnigent.update_check._run_upgrade_command", _must_not_run)
+    monkeypatch.setattr("omnigent.cli.update_check._run_upgrade_command", _must_not_run)
 
     result = CliRunner().invoke(cli, ["upgrade"])
 
@@ -94,12 +99,14 @@ def test_upgrade_check_reports_newer_and_exits_nonzero(
     monkeypatch: pytest.MonkeyPatch, _wheel_install: None
 ) -> None:
     """``--check`` with a newer release → prints the delta and exits non-zero, no upgrade."""
-    monkeypatch.setattr("omnigent.update_check.fetch_latest_version", lambda *_a, **_k: "0.2.0")
+    monkeypatch.setattr(
+        "omnigent.cli.update_check.fetch_latest_version", lambda *_a, **_k: "0.2.0"
+    )
 
     def _must_not_run(*_a: object, **_k: object) -> int:
         raise AssertionError("--check must not run the upgrade")
 
-    monkeypatch.setattr("omnigent.update_check._run_upgrade_command", _must_not_run)
+    monkeypatch.setattr("omnigent.cli.update_check._run_upgrade_command", _must_not_run)
 
     result = CliRunner().invoke(cli, ["upgrade", "--check"])
 
@@ -111,18 +118,20 @@ def test_upgrade_runs_installer_and_drains_first(
     monkeypatch: pytest.MonkeyPatch, _wheel_install: None
 ) -> None:
     """A newer release → drain (no force), stop the server, run the uv command."""
-    monkeypatch.setattr("omnigent.update_check.fetch_latest_version", lambda *_a, **_k: "0.2.0")
+    monkeypatch.setattr(
+        "omnigent.cli.update_check.fetch_latest_version", lambda *_a, **_k: "0.2.0"
+    )
 
     events: list[str] = []
     monkeypatch.setattr(
-        "omnigent.cli._wait_for_local_sessions_to_drain", lambda: events.append("drained")
+        "omnigent.cli.commands._wait_for_local_sessions_to_drain", lambda: events.append("drained")
     )
 
     def _stop(*, force: bool) -> bool:
         events.append(f"stop(force={force})")
         return True
 
-    monkeypatch.setattr("omnigent.cli._stop_local_server_and_daemon", _stop)
+    monkeypatch.setattr("omnigent.cli.commands._stop_local_server_and_daemon", _stop)
 
     ran: list[str] = []
 
@@ -130,11 +139,11 @@ def test_upgrade_runs_installer_and_drains_first(
         ran.append(command)
         return 0
 
-    monkeypatch.setattr("omnigent.update_check._run_upgrade_command", _run)
+    monkeypatch.setattr("omnigent.cli.update_check._run_upgrade_command", _run)
     # The post-upgrade verification re-reads the installed version in a fresh
     # subprocess; stub it to report the version the installer "moved" to.
     monkeypatch.setattr(
-        "omnigent.update_check._probe_installed_distribution", lambda: ("0.2.0", None)
+        "omnigent.cli.update_check._probe_installed_distribution", lambda: ("0.2.0", None)
     )
 
     result = CliRunner().invoke(cli, ["upgrade"])
@@ -150,21 +159,23 @@ def test_upgrade_force_skips_drain_and_force_stops(
     monkeypatch: pytest.MonkeyPatch, _wheel_install: None
 ) -> None:
     """``--force`` skips the drain wait and force-stops the server."""
-    monkeypatch.setattr("omnigent.update_check.fetch_latest_version", lambda *_a, **_k: "0.2.0")
+    monkeypatch.setattr(
+        "omnigent.cli.update_check.fetch_latest_version", lambda *_a, **_k: "0.2.0"
+    )
 
     def _no_drain() -> None:
         raise AssertionError("--force must not wait for sessions to drain")
 
-    monkeypatch.setattr("omnigent.cli._wait_for_local_sessions_to_drain", _no_drain)
+    monkeypatch.setattr("omnigent.cli.commands._wait_for_local_sessions_to_drain", _no_drain)
 
     stop_calls: list[bool] = []
     monkeypatch.setattr(
-        "omnigent.cli._stop_local_server_and_daemon",
+        "omnigent.cli.commands._stop_local_server_and_daemon",
         lambda *, force: stop_calls.append(force) or False,
     )
-    monkeypatch.setattr("omnigent.update_check._run_upgrade_command", lambda *_a, **_k: 0)
+    monkeypatch.setattr("omnigent.cli.update_check._run_upgrade_command", lambda *_a, **_k: 0)
     monkeypatch.setattr(
-        "omnigent.update_check._probe_installed_distribution", lambda: ("0.2.0", None)
+        "omnigent.cli.update_check._probe_installed_distribution", lambda: ("0.2.0", None)
     )
 
     result = CliRunner().invoke(cli, ["upgrade", "--force"])
@@ -177,8 +188,10 @@ def test_upgrade_install_failure_surfaces(
     monkeypatch: pytest.MonkeyPatch, _wheel_install: None
 ) -> None:
     """A non-zero installer exit → ClickException naming the status, exit non-zero."""
-    monkeypatch.setattr("omnigent.update_check.fetch_latest_version", lambda *_a, **_k: "0.2.0")
-    monkeypatch.setattr("omnigent.update_check._run_upgrade_command", lambda *_a, **_k: 3)
+    monkeypatch.setattr(
+        "omnigent.cli.update_check.fetch_latest_version", lambda *_a, **_k: "0.2.0"
+    )
+    monkeypatch.setattr("omnigent.cli.update_check._run_upgrade_command", lambda *_a, **_k: 3)
 
     result = CliRunner().invoke(cli, ["upgrade"])
 
@@ -188,7 +201,7 @@ def test_upgrade_install_failure_surfaces(
 
 def test_upgrade_index_unreachable(monkeypatch: pytest.MonkeyPatch, _wheel_install: None) -> None:
     """Index unreachable → clear error, no upgrade attempted."""
-    monkeypatch.setattr("omnigent.update_check.fetch_latest_version", lambda *_a, **_k: None)
+    monkeypatch.setattr("omnigent.cli.update_check.fetch_latest_version", lambda *_a, **_k: None)
 
     result = CliRunner().invoke(cli, ["upgrade"])
 
@@ -198,7 +211,7 @@ def test_upgrade_index_unreachable(monkeypatch: pytest.MonkeyPatch, _wheel_insta
 
 def test_upgrade_rejects_dev_clone(monkeypatch: pytest.MonkeyPatch, _wheel_install: None) -> None:
     """A source checkout is redirected to ``git pull``, not upgraded."""
-    monkeypatch.setattr("omnigent.update_check._find_repo_root", lambda: Path("/repo"))
+    monkeypatch.setattr("omnigent.cli.update_check._find_repo_root", lambda: Path("/repo"))
 
     result = CliRunner().invoke(cli, ["upgrade"])
 
@@ -217,7 +230,7 @@ def test_upgrade_rejects_editable(monkeypatch: pytest.MonkeyPatch, _wheel_instal
         package_version="0.1.0",
         detected_installer="uv",
     )
-    monkeypatch.setattr("omnigent.update_check._read_installed_wheel_info", lambda: editable)
+    monkeypatch.setattr("omnigent.cli.update_check._read_installed_wheel_info", lambda: editable)
 
     result = CliRunner().invoke(cli, ["upgrade"])
 
@@ -235,7 +248,7 @@ def test_upgrade_pre_check_detects_release_candidate(
         captured["include_prereleases"] = include_prereleases
         return "0.1.1rc1" if include_prereleases else "0.1.0"
 
-    monkeypatch.setattr("omnigent.update_check.fetch_latest_version", _fetch)
+    monkeypatch.setattr("omnigent.cli.update_check.fetch_latest_version", _fetch)
 
     result = CliRunner().invoke(cli, ["upgrade", "--pre", "--check"])
 
@@ -252,7 +265,7 @@ def test_upgrade_without_pre_ignores_release_candidate(
     def _fetch(include_prereleases: bool = False, **_kw: object) -> str | None:
         return "0.1.1rc1" if include_prereleases else "0.1.0"
 
-    monkeypatch.setattr("omnigent.update_check.fetch_latest_version", _fetch)
+    monkeypatch.setattr("omnigent.cli.update_check.fetch_latest_version", _fetch)
 
     result = CliRunner().invoke(cli, ["upgrade", "--check"])
 
@@ -264,7 +277,7 @@ def test_count_running_sessions_ignores_idle_connected(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Only ``status == "running"`` sessions count; idle-connected ones don't."""
-    from omnigent.cli import _count_running_sessions, _SessionPagesResult
+    from omnigent.cli.commands import _count_running_sessions, _SessionPagesResult
 
     sessions = [
         {"id": "a", "status": "idle"},
@@ -274,7 +287,7 @@ def test_count_running_sessions_ignores_idle_connected(
         {"id": "e"},  # missing status → not running
     ]
     monkeypatch.setattr(
-        "omnigent.cli._fetch_session_pages",
+        "omnigent.cli.commands._fetch_session_pages",
         lambda **_kw: _SessionPagesResult(sessions=sessions, error=None),
     )
 
@@ -289,14 +302,14 @@ def test_drain_returns_immediately_when_only_idle_connected(
     Previously the drain counted *connected* sessions, so a box with idle
     sessions holding their connection open hung ``omni upgrade`` forever.
     """
-    from omnigent.cli import _SessionPagesResult, _wait_for_local_sessions_to_drain
+    from omnigent.cli.commands import _SessionPagesResult, _wait_for_local_sessions_to_drain
 
     monkeypatch.setattr(
-        "omnigent.cli.local_server_status",
+        "omnigent.cli.commands.local_server_status",
         lambda: LocalServerInfo(running=True, pid=1, port=6767, url="http://127.0.0.1:6767"),
     )
     monkeypatch.setattr(
-        "omnigent.cli._fetch_session_pages",
+        "omnigent.cli.commands._fetch_session_pages",
         lambda **_kw: _SessionPagesResult(
             sessions=[{"id": f"conv_{i}", "status": "idle"} for i in range(39)], error=None
         ),
@@ -312,18 +325,20 @@ def test_upgrade_pre_passes_prerelease_flag_to_installer(
 ) -> None:
     """``--pre`` upgrade runs the uv command with ``--prerelease allow``."""
     monkeypatch.setattr(
-        "omnigent.update_check.fetch_latest_version",
+        "omnigent.cli.update_check.fetch_latest_version",
         lambda include_prereleases=False, **_kw: "0.1.1rc1",
     )
-    monkeypatch.setattr("omnigent.cli._wait_for_local_sessions_to_drain", lambda: None)
-    monkeypatch.setattr("omnigent.cli._stop_local_server_and_daemon", lambda *, force: False)
+    monkeypatch.setattr("omnigent.cli.commands._wait_for_local_sessions_to_drain", lambda: None)
+    monkeypatch.setattr(
+        "omnigent.cli.commands._stop_local_server_and_daemon", lambda *, force: False
+    )
     ran: list[str] = []
     monkeypatch.setattr(
-        "omnigent.update_check._run_upgrade_command",
+        "omnigent.cli.update_check._run_upgrade_command",
         lambda command, _console: ran.append(command) or 0,
     )
     monkeypatch.setattr(
-        "omnigent.update_check._probe_installed_distribution", lambda: ("0.1.1rc1", None)
+        "omnigent.cli.update_check._probe_installed_distribution", lambda: ("0.1.1rc1", None)
     )
 
     result = CliRunner().invoke(cli, ["upgrade", "--pre"])
@@ -353,12 +368,14 @@ def test_update_is_alias_for_upgrade_same_callback() -> None:
 
 def test_update_up_to_date(monkeypatch: pytest.MonkeyPatch, _wheel_install: None) -> None:
     """``omni update`` runs the upgrade flow end-to-end (up-to-date path)."""
-    monkeypatch.setattr("omnigent.update_check.fetch_latest_version", lambda *_a, **_k: "0.1.0")
+    monkeypatch.setattr(
+        "omnigent.cli.update_check.fetch_latest_version", lambda *_a, **_k: "0.1.0"
+    )
 
     def _must_not_run(*_a: object, **_k: object) -> int:
         raise AssertionError("upgrade command ran while already up to date")
 
-    monkeypatch.setattr("omnigent.update_check._run_upgrade_command", _must_not_run)
+    monkeypatch.setattr("omnigent.cli.update_check._run_upgrade_command", _must_not_run)
 
     result = CliRunner().invoke(cli, ["update"])
 
@@ -371,12 +388,14 @@ def test_update_check_matches_upgrade_check(
     monkeypatch: pytest.MonkeyPatch, _wheel_install: None
 ) -> None:
     """``update --check`` behaves identically to ``upgrade --check``."""
-    monkeypatch.setattr("omnigent.update_check.fetch_latest_version", lambda *_a, **_k: "0.2.0")
+    monkeypatch.setattr(
+        "omnigent.cli.update_check.fetch_latest_version", lambda *_a, **_k: "0.2.0"
+    )
 
     def _must_not_run(*_a: object, **_k: object) -> int:
         raise AssertionError("--check must not run the upgrade")
 
-    monkeypatch.setattr("omnigent.update_check._run_upgrade_command", _must_not_run)
+    monkeypatch.setattr("omnigent.cli.update_check._run_upgrade_command", _must_not_run)
 
     runner = CliRunner()
     update_result = runner.invoke(cli, ["update", "--check"])
@@ -389,7 +408,7 @@ def test_update_check_matches_upgrade_check(
 
 def test_update_suppresses_update_check_like_upgrade() -> None:
     """``update`` is special-cased alongside ``upgrade`` in the skip set."""
-    from omnigent.cli import _should_skip_update_check
+    from omnigent.cli.commands import _should_skip_update_check
 
     assert _should_skip_update_check(["update"]) is True
     assert _should_skip_update_check(["upgrade"]) is True
@@ -405,11 +424,13 @@ def test_upgrade_noop_install_reports_failure_not_success(
     cache). The old code printed "✓ Upgraded to v0.2.0" anyway, so the next
     ``--check`` kept reporting the same update — the bug this guards against.
     """
-    monkeypatch.setattr("omnigent.update_check.fetch_latest_version", lambda *_a, **_k: "0.2.0")
-    monkeypatch.setattr("omnigent.update_check._run_upgrade_command", lambda *_a, **_k: 0)
+    monkeypatch.setattr(
+        "omnigent.cli.update_check.fetch_latest_version", lambda *_a, **_k: "0.2.0"
+    )
+    monkeypatch.setattr("omnigent.cli.update_check._run_upgrade_command", lambda *_a, **_k: 0)
     # The installer ran (exit 0) but the version is unchanged.
     monkeypatch.setattr(
-        "omnigent.update_check._probe_installed_distribution", lambda: ("0.1.0", None)
+        "omnigent.cli.update_check._probe_installed_distribution", lambda: ("0.1.0", None)
     )
 
     result = CliRunner().invoke(cli, ["upgrade"])
@@ -423,10 +444,12 @@ def test_upgrade_unconfirmed_version_is_honest(
     monkeypatch: pytest.MonkeyPatch, _wheel_install: None
 ) -> None:
     """When the new version can't be read back, don't assert a version."""
-    monkeypatch.setattr("omnigent.update_check.fetch_latest_version", lambda *_a, **_k: "0.2.0")
-    monkeypatch.setattr("omnigent.update_check._run_upgrade_command", lambda *_a, **_k: 0)
     monkeypatch.setattr(
-        "omnigent.update_check._probe_installed_distribution", lambda: (None, None)
+        "omnigent.cli.update_check.fetch_latest_version", lambda *_a, **_k: "0.2.0"
+    )
+    monkeypatch.setattr("omnigent.cli.update_check._run_upgrade_command", lambda *_a, **_k: 0)
+    monkeypatch.setattr(
+        "omnigent.cli.update_check._probe_installed_distribution", lambda: (None, None)
     )
 
     result = CliRunner().invoke(cli, ["upgrade"])
@@ -440,18 +463,18 @@ def test_upgrade_git_install_up_to_date(
     monkeypatch: pytest.MonkeyPatch, _wheel_install: None
 ) -> None:
     """A git install whose ref hasn't moved reports up to date by commit."""
-    monkeypatch.setattr("omnigent.update_check._read_installed_wheel_info", _git_install_info)
+    monkeypatch.setattr("omnigent.cli.update_check._read_installed_wheel_info", _git_install_info)
     # fetch_latest_version must never be consulted for a git install.
     monkeypatch.setattr(
-        "omnigent.update_check.fetch_latest_version",
+        "omnigent.cli.update_check.fetch_latest_version",
         lambda *_a, **_k: pytest.fail("git install must not query PyPI"),
     )
-    monkeypatch.setattr("omnigent.update_check._remote_git_head", lambda _url: "a" * 40)
+    monkeypatch.setattr("omnigent.cli.update_check._remote_git_head", lambda _url: "a" * 40)
 
     def _must_not_run(*_a: object, **_k: object) -> int:
         raise AssertionError("nothing to re-pull when already at the ref HEAD")
 
-    monkeypatch.setattr("omnigent.update_check._run_upgrade_command", _must_not_run)
+    monkeypatch.setattr("omnigent.cli.update_check._run_upgrade_command", _must_not_run)
 
     result = CliRunner().invoke(cli, ["upgrade"])
 
@@ -463,13 +486,13 @@ def test_upgrade_git_check_behind_exits_nonzero(
     monkeypatch: pytest.MonkeyPatch, _wheel_install: None
 ) -> None:
     """``--check`` on a git install behind its ref reports the delta, exits non-zero."""
-    monkeypatch.setattr("omnigent.update_check._read_installed_wheel_info", _git_install_info)
-    monkeypatch.setattr("omnigent.update_check._remote_git_head", lambda _url: "b" * 40)
+    monkeypatch.setattr("omnigent.cli.update_check._read_installed_wheel_info", _git_install_info)
+    monkeypatch.setattr("omnigent.cli.update_check._remote_git_head", lambda _url: "b" * 40)
 
     def _must_not_run(*_a: object, **_k: object) -> int:
         raise AssertionError("--check must not re-pull")
 
-    monkeypatch.setattr("omnigent.update_check._run_upgrade_command", _must_not_run)
+    monkeypatch.setattr("omnigent.cli.update_check._run_upgrade_command", _must_not_run)
 
     result = CliRunner().invoke(cli, ["upgrade", "--check"])
 
@@ -481,17 +504,17 @@ def test_upgrade_git_install_repulls_and_verifies_commit(
     monkeypatch: pytest.MonkeyPatch, _wheel_install: None
 ) -> None:
     """A git install behind its ref re-pulls and reports the NEW commit."""
-    monkeypatch.setattr("omnigent.update_check._read_installed_wheel_info", _git_install_info)
-    monkeypatch.setattr("omnigent.update_check._remote_git_head", lambda _url: "b" * 40)
+    monkeypatch.setattr("omnigent.cli.update_check._read_installed_wheel_info", _git_install_info)
+    monkeypatch.setattr("omnigent.cli.update_check._remote_git_head", lambda _url: "b" * 40)
 
     ran: list[str] = []
     monkeypatch.setattr(
-        "omnigent.update_check._run_upgrade_command",
+        "omnigent.cli.update_check._run_upgrade_command",
         lambda command, _console: ran.append(command) or 0,
     )
     # After re-pull the install is at the new commit.
     monkeypatch.setattr(
-        "omnigent.update_check._probe_installed_distribution", lambda: ("0.1.0", "b" * 40)
+        "omnigent.cli.update_check._probe_installed_distribution", lambda: ("0.1.0", "b" * 40)
     )
 
     result = CliRunner().invoke(cli, ["upgrade"])
@@ -507,12 +530,12 @@ def test_upgrade_git_install_noop_does_not_claim_update(
     monkeypatch: pytest.MonkeyPatch, _wheel_install: None
 ) -> None:
     """If the re-pull leaves the commit unchanged, say so — don't claim an update."""
-    monkeypatch.setattr("omnigent.update_check._read_installed_wheel_info", _git_install_info)
+    monkeypatch.setattr("omnigent.cli.update_check._read_installed_wheel_info", _git_install_info)
     # Remote unknown (e.g. offline) → re-pull anyway, then verify by commit.
-    monkeypatch.setattr("omnigent.update_check._remote_git_head", lambda _url: None)
-    monkeypatch.setattr("omnigent.update_check._run_upgrade_command", lambda *_a, **_k: 0)
+    monkeypatch.setattr("omnigent.cli.update_check._remote_git_head", lambda _url: None)
+    monkeypatch.setattr("omnigent.cli.update_check._run_upgrade_command", lambda *_a, **_k: 0)
     monkeypatch.setattr(
-        "omnigent.update_check._probe_installed_distribution", lambda: ("0.1.0", "a" * 40)
+        "omnigent.cli.update_check._probe_installed_distribution", lambda: ("0.1.0", "a" * 40)
     )
 
     result = CliRunner().invoke(cli, ["upgrade"])
@@ -527,13 +550,13 @@ def test_upgrade_git_confirmed_behind_but_repull_noop_fails(
 ) -> None:
     """Regression: known-behind git install whose re-pull doesn't move the commit
     must FAIL, not silently exit 0 (else it recreates the loop on the git path)."""
-    monkeypatch.setattr("omnigent.update_check._read_installed_wheel_info", _git_install_info)
+    monkeypatch.setattr("omnigent.cli.update_check._read_installed_wheel_info", _git_install_info)
     # Remote HEAD differs from the installed commit ("a"*40) → positively behind.
-    monkeypatch.setattr("omnigent.update_check._remote_git_head", lambda _url: "b" * 40)
-    monkeypatch.setattr("omnigent.update_check._run_upgrade_command", lambda *_a, **_k: 0)
+    monkeypatch.setattr("omnigent.cli.update_check._remote_git_head", lambda _url: "b" * 40)
+    monkeypatch.setattr("omnigent.cli.update_check._run_upgrade_command", lambda *_a, **_k: 0)
     # …but the re-pull left the install on the SAME commit (pinned ref / cached).
     monkeypatch.setattr(
-        "omnigent.update_check._probe_installed_distribution", lambda: ("0.1.0", "a" * 40)
+        "omnigent.cli.update_check._probe_installed_distribution", lambda: ("0.1.0", "a" * 40)
     )
 
     result = CliRunner().invoke(cli, ["upgrade"])
@@ -604,12 +627,12 @@ def test_nightly_suggestion_shapes_per_installer() -> None:
 
 def test_upgrade_nightly_up_to_date(monkeypatch: pytest.MonkeyPatch, _wheel_install: None) -> None:
     """Installed version == newest nightly → no-op, nothing stopped or run."""
-    monkeypatch.setattr("omnigent.update_check._latest_nightly_version", lambda: "0.1.0")
+    monkeypatch.setattr("omnigent.cli.update_check._latest_nightly_version", lambda: "0.1.0")
 
     def _must_not_run(*_a: object, **_k: object) -> int:
         raise AssertionError("upgrade command ran while already on the newest nightly")
 
-    monkeypatch.setattr("omnigent.update_check._run_upgrade_command", _must_not_run)
+    monkeypatch.setattr("omnigent.cli.update_check._run_upgrade_command", _must_not_run)
 
     result = CliRunner().invoke(cli, ["upgrade", "--nightly"])
 
@@ -622,7 +645,7 @@ def test_upgrade_nightly_installs_pinned_tag(
 ) -> None:
     """A newer nightly → runs the git-pinned installer command and verifies."""
     monkeypatch.setattr(
-        "omnigent.update_check._latest_nightly_version", lambda: "0.2.0.dev20260804"
+        "omnigent.cli.update_check._latest_nightly_version", lambda: "0.2.0.dev20260804"
     )
 
     ran: list[str] = []
@@ -631,9 +654,9 @@ def test_upgrade_nightly_installs_pinned_tag(
         ran.append(command)
         return 0
 
-    monkeypatch.setattr("omnigent.update_check._run_upgrade_command", _run)
+    monkeypatch.setattr("omnigent.cli.update_check._run_upgrade_command", _run)
     monkeypatch.setattr(
-        "omnigent.update_check._probe_installed_distribution",
+        "omnigent.cli.update_check._probe_installed_distribution",
         lambda: ("0.2.0.dev20260804", None),
     )
 
@@ -652,13 +675,13 @@ def test_upgrade_nightly_check_exits_nonzero(
 ) -> None:
     """``--nightly --check`` with a different nightly → report and exit 1, no upgrade."""
     monkeypatch.setattr(
-        "omnigent.update_check._latest_nightly_version", lambda: "0.2.0.dev20260804"
+        "omnigent.cli.update_check._latest_nightly_version", lambda: "0.2.0.dev20260804"
     )
 
     def _must_not_run(*_a: object, **_k: object) -> int:
         raise AssertionError("--check must not run the upgrade")
 
-    monkeypatch.setattr("omnigent.update_check._run_upgrade_command", _must_not_run)
+    monkeypatch.setattr("omnigent.cli.update_check._run_upgrade_command", _must_not_run)
 
     result = CliRunner().invoke(cli, ["upgrade", "--nightly", "--check"])
 
@@ -670,7 +693,7 @@ def test_upgrade_nightly_no_tags_is_actionable(
     monkeypatch: pytest.MonkeyPatch, _wheel_install: None
 ) -> None:
     """No nightly tag reachable → a clear error, not a crash or a PyPI fallback."""
-    monkeypatch.setattr("omnigent.update_check._latest_nightly_version", lambda: None)
+    monkeypatch.setattr("omnigent.cli.update_check._latest_nightly_version", lambda: None)
 
     result = CliRunner().invoke(cli, ["upgrade", "--nightly"])
 
@@ -715,15 +738,15 @@ def test_upgrade_nightly_refuses_registry_pip(
         package_version="0.1.0",
         detected_installer="pip",
     )
-    monkeypatch.setattr("omnigent.update_check._read_installed_wheel_info", lambda: pip_info)
+    monkeypatch.setattr("omnigent.cli.update_check._read_installed_wheel_info", lambda: pip_info)
     monkeypatch.setattr(
-        "omnigent.update_check._latest_nightly_version", lambda: "0.2.0.dev20260804"
+        "omnigent.cli.update_check._latest_nightly_version", lambda: "0.2.0.dev20260804"
     )
 
     def _must_not_run(*_a: object, **_k: object) -> int:
         raise AssertionError("refused install shape must not run the installer")
 
-    monkeypatch.setattr("omnigent.update_check._run_upgrade_command", _must_not_run)
+    monkeypatch.setattr("omnigent.cli.update_check._run_upgrade_command", _must_not_run)
 
     result = CliRunner().invoke(cli, ["upgrade", "--nightly"])
 
@@ -737,13 +760,13 @@ def test_upgrade_nightly_dry_run_prints_without_running(
 ) -> None:
     """``--nightly --dry-run`` prints the command and exits before any side effects."""
     monkeypatch.setattr(
-        "omnigent.update_check._latest_nightly_version", lambda: "0.2.0.dev20260804"
+        "omnigent.cli.update_check._latest_nightly_version", lambda: "0.2.0.dev20260804"
     )
 
     def _must_not_run(*_a: object, **_k: object) -> int:
         raise AssertionError("--dry-run must not run the upgrade")
 
-    monkeypatch.setattr("omnigent.update_check._run_upgrade_command", _must_not_run)
+    monkeypatch.setattr("omnigent.cli.update_check._run_upgrade_command", _must_not_run)
 
     result = CliRunner().invoke(cli, ["upgrade", "--nightly", "--dry-run"])
 
@@ -826,7 +849,7 @@ def test_upgrade_failure_message_reports_a_destroyed_install(
 ) -> None:
     """A failed upgrade must not claim the old install survived when it didn't."""
     monkeypatch.setattr(
-        "omnigent.update_check._probe_installed_distribution", lambda: (None, None)
+        "omnigent.cli.update_check._probe_installed_distribution", lambda: (None, None)
     )
 
     message = _upgrade_failure_message(1, {"databricks"})
@@ -844,7 +867,7 @@ def test_upgrade_failure_message_confirms_a_surviving_install(
 ) -> None:
     """When the probe still finds omnigent, the reassuring message is correct."""
     monkeypatch.setattr(
-        "omnigent.update_check._probe_installed_distribution", lambda: ("0.8.2", None)
+        "omnigent.cli.update_check._probe_installed_distribution", lambda: ("0.8.2", None)
     )
 
     message = _upgrade_failure_message(1)
@@ -863,12 +886,12 @@ def test_upgrade_nightly_failure_surfaces_recovery_when_install_is_gone(
     ``omni`` was actually gone.
     """
     monkeypatch.setattr(
-        "omnigent.update_check._latest_nightly_version", lambda: "0.2.0.dev20260804"
+        "omnigent.cli.update_check._latest_nightly_version", lambda: "0.2.0.dev20260804"
     )
-    monkeypatch.setattr("omnigent.update_check._run_upgrade_command", lambda *_a: 1)
+    monkeypatch.setattr("omnigent.cli.update_check._run_upgrade_command", lambda *_a: 1)
     # The installer replaced the environment, then the build failed.
     monkeypatch.setattr(
-        "omnigent.update_check._probe_installed_distribution", lambda: (None, None)
+        "omnigent.cli.update_check._probe_installed_distribution", lambda: (None, None)
     )
 
     result = CliRunner().invoke(cli, ["upgrade", "--nightly"])

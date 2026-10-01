@@ -18,7 +18,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from fastapi.testclient import TestClient
 
-import omnigent.server.routes._sessions.orchestration as orchestration_mod
+import omnigent.server.routes.sessions.orchestration as orchestration_mod
 import omnigent.server.routes.sessions.routes_events as routes_events_mod
 from omnigent.entities import NewConversationItem
 from omnigent.entities.conversation import Conversation, ConversationItem

@@ -34,18 +34,18 @@ from omnigent.entities import (
     NewConversationItem,
 )
 from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.harnesses.native.coding_agents import CLAUDE_NATIVE_AGENT_NAME
 from omnigent.host.frames import HostHelloFrame
 from omnigent.llms.context_window import ModelPricing
-from omnigent.native.native_coding_agents import CLAUDE_NATIVE_AGENT_NAME
 from omnigent.runner.transports.ws_tunnel.frames import EventBatchFrame
 from omnigent.runtime import inflight_text
+from omnigent.runtime.session_event_batch import MAX_SESSION_EVENT_REQUEST_BYTES
 from omnigent.runtime.tool_output import MAX_TOOL_OUTPUT_BYTES
 from omnigent.server.background_session_titles import BackgroundTitleRequest
-from omnigent.server.routes._sessions.helpers import (
+from omnigent.server.routes.sessions.helpers import (
     _NativeTerminalEnsureOutcome,
     _RunnerForwardResult,
 )
-from omnigent.session_event_batch import MAX_SESSION_EVENT_REQUEST_BYTES
 from omnigent.spec.types import SkillSpec
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
@@ -651,7 +651,7 @@ async def test_native_transcript_preserves_browser_title_preference(
     ) as runner:
         monkeypatch.setattr(sessions_module, "_get_runner_client", AsyncMock(return_value=runner))
         monkeypatch.setattr(
-            "omnigent.server.routes._sessions.orchestration._get_runner_client",
+            "omnigent.server.routes.sessions.orchestration._get_runner_client",
             AsyncMock(return_value=runner),
         )
         agent = await create_test_agent(client, name="claude-native-ui")
@@ -735,7 +735,7 @@ async def test_native_message_repeat_with_same_stable_id_forwards_once(
     ) as runner:
         monkeypatch.setattr(sessions_module, "_get_runner_client", AsyncMock(return_value=runner))
         monkeypatch.setattr(
-            "omnigent.server.routes._sessions.orchestration._get_runner_client",
+            "omnigent.server.routes.sessions.orchestration._get_runner_client",
             AsyncMock(return_value=runner),
         )
         agent = await create_test_agent(client, name="claude-native-ui")
@@ -9695,7 +9695,7 @@ async def test_retry_session_retries_native_terminal_ensure_after_runner_reconne
 ) -> None:
     """Retry-session recovery waits for a dropped runner and repeats the terminal ensure."""
     from omnigent.runner.routing import RunnerRouter
-    from omnigent.server.routes._sessions import orchestration as orchestration_module
+    from omnigent.server.routes.sessions import orchestration as orchestration_module
     from omnigent.server.routes.sessions import routes_events
 
     agent = await create_test_agent(
@@ -9855,12 +9855,12 @@ async def test_interrupt_codex_side_chat_targets_its_turn_on_parent_runner(
     case: str,
 ) -> None:
     from omnigent.server.routes import sessions as sessions_module
-    from omnigent.server.routes._sessions.common import (
+    from omnigent.server.routes.sessions import routes_events
+    from omnigent.server.routes.sessions.common import (
         _interrupt_fenced_sessions,
         _session_active_response_cache,
         _session_status_cache,
     )
-    from omnigent.server.routes.sessions import routes_events
 
     agent = await create_test_agent(client)
     parent = await _create_session(

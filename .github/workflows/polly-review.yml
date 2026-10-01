@@ -484,7 +484,7 @@ jobs:
               flags=re.M,
           )
           touches_entry_points = any(
-              (path.startswith(("web/src/", "omnigent/harnesses/")) or re.fullmatch(r"omnigent/cli\w*\.py", path))
+              path.startswith(("web/src/", "omnigent/harnesses/", "omnigent/cli/"))
               and not re.search(r"\.(test|stories)\.[jt]sx?$", path)
               for path in changed_paths
           )

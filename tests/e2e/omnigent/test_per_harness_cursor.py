@@ -36,7 +36,7 @@ cleanly when the key is absent.
   injection).
 - The ``cursor-sdk`` API contract changes (``AsyncAgent`` / ``AsyncClient`` /
   ``run.messages()`` shape).
-- ``omnigent.cli`` for the ``-p`` one-shot path stops printing assistant text
+- ``omnigent.cli.commands`` for the ``-p`` one-shot path stops printing assistant text
   to stdout on turn complete, or harness dispatch for ``cursor`` regresses.
 """
 

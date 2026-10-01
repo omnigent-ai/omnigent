@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import pytest
 
-from omnigent.runner.app import _cursor_native_resume_args
+from omnigent.runner.native.orchestration import _cursor_native_resume_args
 
 # A real cursor chat id is a UUID (hex + dashes).
 _CHAT = "0ef42bbf-3b80-4bec-ac39-ca46531cbc47"

@@ -49,8 +49,8 @@ class _FakeRunnerClient:
 
 @pytest.mark.asyncio
 async def test_forward_side_chat_turn_redirects_to_parent_with_thread_id() -> None:
-    from omnigent.server.routes._sessions import orchestration as orch
-    from omnigent.server.routes._sessions.common import _CODEX_NATIVE_SUBAGENT_THREAD_ID_LABEL_KEY
+    from omnigent.server.routes.sessions import orchestration as orch
+    from omnigent.server.routes.sessions.common import _CODEX_NATIVE_SUBAGENT_THREAD_ID_LABEL_KEY
 
     conv = SimpleNamespace(
         parent_conversation_id="conv_parent",
@@ -72,8 +72,8 @@ async def test_forward_side_chat_turn_redirects_to_parent_with_thread_id() -> No
 
 @pytest.mark.asyncio
 async def test_forward_side_chat_turn_falls_through_without_thread_or_parent() -> None:
-    from omnigent.server.routes._sessions import orchestration as orch
-    from omnigent.server.routes._sessions.common import _CODEX_NATIVE_SUBAGENT_THREAD_ID_LABEL_KEY
+    from omnigent.server.routes.sessions import orchestration as orch
+    from omnigent.server.routes.sessions.common import _CODEX_NATIVE_SUBAGENT_THREAD_ID_LABEL_KEY
 
     body = SimpleNamespace(data={"content": []})
     client = _FakeRunnerClient()

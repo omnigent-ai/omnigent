@@ -28,7 +28,6 @@ from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from starlette.websockets import WebSocketState
 
 from omnigent.db.db_models import InvalidUuidError, uuid_to_bytes
-from omnigent.debug_logging import debug_event, set_current_user_id
 from omnigent.errors import ErrorCategory, ErrorImpact, ErrorPhase
 from omnigent.host.frames import (
     IMPORT_SESSION_MAX_CONNECTION_REASSEMBLED_CHARS,
@@ -61,6 +60,7 @@ from omnigent.host.frames import (
     encode_host_frame,
 )
 from omnigent.host.identity import MANAGED_HOST_TOKEN_HEADER
+from omnigent.observability.debug_logging import debug_event, set_current_user_id
 from omnigent.runner.transports.ws_tunnel.frames import (
     PingFrame,
     PongFrame,

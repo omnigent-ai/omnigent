@@ -36,9 +36,9 @@ from typing import Any
 import httpx
 import pytest
 
-from omnigent.runtime.harnesses import _HARNESS_MODULES
-from omnigent.runtime.harnesses._scaffold import HarnessApp, TurnContext
-from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
+from omnigent.harnesses.runtime import _HARNESS_MODULES
+from omnigent.harnesses.runtime._scaffold import HarnessApp, TurnContext
+from omnigent.harnesses.runtime.process_manager import HarnessProcessManager
 from omnigent.server.schemas import (
     HeartbeatEvent,
     OutputItemDoneEvent,
@@ -249,7 +249,7 @@ async def test_no_retry_when_absolute_budget_below_one_idle_window(
     buys nothing; the expiry must fail immediately via the idle error so a
     post-ceiling stall keeps dying promptly.
     """
-    from omnigent.runtime.harnesses import _scaffold
+    from omnigent.harnesses.runtime import _scaffold
 
     attempts = 0
 
@@ -284,7 +284,7 @@ async def test_no_retry_when_absolute_budget_below_one_idle_window(
 
 async def test_cancelled_turn_is_not_retried(monkeypatch: pytest.MonkeyPatch) -> None:
     """A turn cancelled while wedged must not be re-run by recovery."""
-    from omnigent.runtime.harnesses import _scaffold
+    from omnigent.harnesses.runtime import _scaffold
 
     attempts = 0
 
@@ -318,7 +318,7 @@ async def test_recovered_turn_failure_counts_only_final_attempt_in_message(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The exhausted-recovery error reports the retry count accurately."""
-    from omnigent.runtime.harnesses import _scaffold
+    from omnigent.harnesses.runtime import _scaffold
 
     class _AlwaysWedgedApp(HarnessApp):
         async def run_turn(self, request: Any, ctx: TurnContext) -> None:
@@ -344,7 +344,7 @@ async def test_recovered_turn_failure_counts_only_final_attempt_in_message(
 
 
 async def test_partial_output_is_not_replayed(monkeypatch: pytest.MonkeyPatch) -> None:
-    from omnigent.runtime.harnesses import _scaffold
+    from omnigent.harnesses.runtime import _scaffold
 
     attempts = 0
 
@@ -370,7 +370,7 @@ async def test_partial_output_is_not_replayed(monkeypatch: pytest.MonkeyPatch) -
 async def test_counting_tool_is_executed_once_before_wedge(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from omnigent.runtime.harnesses import _scaffold
+    from omnigent.harnesses.runtime import _scaffold
 
     attempts = 0
     executions = 0
@@ -418,7 +418,7 @@ async def test_counting_tool_is_executed_once_before_wedge(
 
 @pytest.mark.parametrize("phase", ["PHASE_LLM_REQUEST", "PHASE_TOOL_CALL"])
 async def test_policy_handshake_replay_gate(monkeypatch: pytest.MonkeyPatch, phase: str) -> None:
-    from omnigent.runtime.harnesses import _scaffold
+    from omnigent.harnesses.runtime import _scaffold
 
     attempts = 0
 

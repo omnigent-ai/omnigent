@@ -11,7 +11,7 @@ Both render the **same** grouped, kind-annotated view of the configured
 providers and the same per-family default markers, so the heavy lifting
 lives here as plain functions that take an already-parsed config and
 return display lines. The click command wiring stays in
-:mod:`omnigent.cli`; this module owns the look/feel and the
+:mod:`omnigent.cli.commands`; this module owns the look/feel and the
 config-shape construction so the two surfaces never drift apart.
 
 Persistence nuance (kept here so callers can't get it wrong): an **add**
@@ -56,7 +56,7 @@ from omnigent.onboarding.provider_config import (
 # README.oss.md) instead of a cramped 1-cell text glyph — that VS16, not extra
 # padding, is what aligns the subscription label with the wider glyphs.
 # (rich >= 14's cell_len counts such a VS16-forced wide emoji as 2 cells —
-# see omnigent.inner.banner._display_width.)
+# see omnigent.cli.banner._display_width.)
 _KIND_GLYPH: dict[str, str] = {
     KEY_KIND: "\N{KEY}",
     SUBSCRIPTION_KIND: "\N{ADMISSION TICKETS}\N{VARIATION SELECTOR-16}",

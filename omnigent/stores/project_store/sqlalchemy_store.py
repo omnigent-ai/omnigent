@@ -25,8 +25,8 @@ from omnigent.db.utils import (
     run_write_transaction,
 )
 from omnigent.entities import Project
+from omnigent.entities.permission import RESERVED_USER_LOCAL
 from omnigent.errors import ErrorCode, OmnigentError
-from omnigent.server.auth import RESERVED_USER_LOCAL
 from omnigent.stores.project_store import ProjectOrderPreference, ProjectStore
 
 # Max serialized length of a project's config blob. The value is persisted

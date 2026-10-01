@@ -2,10 +2,10 @@
 
 Reproduces the stop-button no-interrupt defect: the ``hermes`` and
 ``qwen`` SDK executors historically inherited the base no-op
-``interrupt_session`` (``omnigent/inner/executor.py``), so clicking the web
+``interrupt_session`` (``omnigent/core/executor.py``), so clicking the web
 Stop button while a turn was in flight cancelled nothing — the active harness
 CLI subprocess kept running to completion, unlike kimi
-(``omnigent/inner/kimi_executor.py``) which terminates it.
+(``omnigent/harnesses/kimi/executor.py``) which terminates it.
 
 Journey per harness:
 
@@ -228,7 +228,7 @@ def stub_harness_runner(
     Yields ``(runner_id, state_dir)``: the runner to bind sessions to, and
     the dir the stubs write their pid/cancel markers into.
     """
-    from omnigent.runner.identity import token_bound_runner_id
+    from omnigent.util.runner_identity import token_bound_runner_id
 
     state_dir = tmp_path_factory.mktemp("harness_stub_state")
     bin_dir = tmp_path_factory.mktemp("harness_stub_bin")

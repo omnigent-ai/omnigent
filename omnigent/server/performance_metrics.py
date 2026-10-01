@@ -22,7 +22,7 @@ from opentelemetry import metrics as otel_metrics
 from opentelemetry.util.types import Attributes
 from uvicorn.logging import AccessFormatter
 
-from omnigent.process_logging import log_record_display_fields
+from omnigent.observability.process_logging import log_record_display_fields
 
 _DEFAULT_WINDOWS_SECONDS = (1.0, 10.0, 30.0)
 _BYTES_PER_MIB = 1024 * 1024

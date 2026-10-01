@@ -7,7 +7,7 @@ independently from the raw prompt diverges from the persisted seed for
 multi-block first-turn content: a native session that attaches a file sends
 the user's typed text plus a standalone ``"[Attached: <path>]"``
 ``input_text`` block (see ``omnigent/inner/*_native_executor.py`` /
-``omnigent/inner/native_attachments.py``), and
+``omnigent/util/attachments.py``), and
 ``synthesize_conversation_title`` drops a line that is *exactly* an
 attachment marker, so:
 
@@ -43,7 +43,7 @@ from omnigent.server.background_session_titles import (
     BackgroundTitleRequest,
     prepare_background_session_title,
 )
-from omnigent.server.routes._sessions.helpers import _seed_missing_title_from_user_message
+from omnigent.server.routes.sessions.helpers import _seed_missing_title_from_user_message
 from omnigent.server.schemas import SessionEventInput
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 

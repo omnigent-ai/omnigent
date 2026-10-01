@@ -17,13 +17,13 @@ from typing import Any, TypeVar
 
 import httpx
 
-from omnigent.debug_logging import debug_event
 from omnigent.llms.errors import (
     ContextWindowExceededError,
     LLMErrorDetail,
     PermanentLLMError,
     RetryableLLMError,
 )
+from omnigent.observability.debug_logging import debug_event
 from omnigent.spec.types import RetryPolicy
 
 _logger = logging.getLogger(__name__)

@@ -6,8 +6,8 @@ from pathlib import Path
 
 import pytest
 
-from omnigent.inner.devin_native_executor import DevinNativeExecutor
-from omnigent.inner.executor import ExecutorConfig, ExecutorError, TurnComplete
+from omnigent.core.executor import ExecutorConfig, ExecutorError, TurnComplete
+from omnigent.harnesses.devin_native.executor import DevinNativeExecutor
 
 
 @pytest.fixture()
@@ -22,10 +22,10 @@ def injections(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, str]]:
         calls.append(("model", model))
 
     monkeypatch.setattr(
-        "omnigent.inner.devin_native_executor.inject_user_message", _inject_user_message
+        "omnigent.harnesses.devin_native.executor.inject_user_message", _inject_user_message
     )
     monkeypatch.setattr(
-        "omnigent.inner.devin_native_executor.inject_model_command", _inject_model_command
+        "omnigent.harnesses.devin_native.executor.inject_model_command", _inject_model_command
     )
     return calls
 
@@ -162,7 +162,7 @@ class TestRunTurn:
         def _boom(_bridge_dir: Path, *, content: str, **_kw: object) -> None:
             raise RuntimeError("the Devin terminal is no longer running")
 
-        monkeypatch.setattr("omnigent.inner.devin_native_executor.inject_user_message", _boom)
+        monkeypatch.setattr("omnigent.harnesses.devin_native.executor.inject_user_message", _boom)
         events = await _run(_executor(tmp_path), "hi")
         assert isinstance(events[0], ExecutorError)
         assert "no longer running" in events[0].message

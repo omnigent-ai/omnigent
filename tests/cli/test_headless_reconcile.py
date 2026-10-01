@@ -7,7 +7,7 @@ import httpx
 import pytest
 from omnigent_client import OmnigentClient
 
-from omnigent.chat import _query_sessions_once
+from omnigent.cli.chat import _query_sessions_once
 
 
 @pytest.mark.parametrize("completion_stream", [2, 3], ids=["probe", "later-turn"])

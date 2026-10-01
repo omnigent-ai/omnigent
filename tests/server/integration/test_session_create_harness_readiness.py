@@ -27,7 +27,7 @@ async def test_child_create_rejects_unavailable_harness(
     store = SqlAlchemyConversationStore(db_uri)
     store.set_host_id(parent["id"], "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", workspace="/tmp/workspace")
     store.set_runner_id(parent["id"], "runner_test")
-    from omnigent.harness_availability import HarnessAvailability
+    from omnigent.harnesses.availability import HarnessAvailability
     from omnigent.stores.host_store import HostStore
 
     report: dict[str, HarnessAvailability] = {"claude-sdk": True}
@@ -111,8 +111,8 @@ async def test_top_level_create_rejects_unavailable_harness(
 ) -> None:
     from unittest.mock import AsyncMock
 
-    from omnigent.server.routes import _session_create_validation
-    from omnigent.server.routes._sessions import orchestration
+    from omnigent.server.routes.sessions import create_validation as _session_create_validation
+    from omnigent.server.routes.sessions import orchestration
     from omnigent.stores.host_store import HostStore
 
     monkeypatch.setattr(
@@ -168,7 +168,7 @@ async def test_agent_id_child_uses_parent_host_even_if_request_names_another(
 ) -> None:
     from unittest.mock import AsyncMock
 
-    from omnigent.server.routes._sessions import orchestration
+    from omnigent.server.routes.sessions import orchestration
     from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
     from omnigent.stores.host_store import HostStore
 
@@ -221,7 +221,7 @@ async def test_loaded_parent_does_not_require_another_session_read(
     db_uri: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from omnigent.server.routes._session_harness_readiness import validate_create_harness_readiness
+    from omnigent.server.routes.sessions.harness_readiness import validate_create_harness_readiness
     from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
     from omnigent.stores.host_store import HostStore
 
@@ -264,7 +264,7 @@ async def test_nested_parent_readiness_has_bounded_reads(
     from unittest.mock import Mock
 
     from omnigent.errors import OmnigentError
-    from omnigent.server.routes._session_harness_readiness import validate_create_harness_readiness
+    from omnigent.server.routes.sessions.harness_readiness import validate_create_harness_readiness
     from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
     from omnigent.stores.host_store import HostStore
 

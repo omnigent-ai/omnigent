@@ -149,7 +149,7 @@ def spawn_multi_user_server(
         [
             sys.executable,
             "-c",
-            "from omnigent.cli import main; main()",
+            "from omnigent.cli.commands import main; main()",
             "server",
             "--host",
             "127.0.0.1",

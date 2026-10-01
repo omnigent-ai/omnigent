@@ -224,7 +224,7 @@ def test_repl_run_routes_harness_through_new_harness_contract(
         sys.executable,
         [
             "-m",
-            "omnigent.cli",
+            "omnigent.cli.commands",
             "run",
             "tests/resources/examples/hello_world.yaml",
             "--harness",

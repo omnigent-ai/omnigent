@@ -1,4 +1,4 @@
-"""Tests for :mod:`omnigent.workspace_fs`.
+"""Tests for :mod:`omnigent.host.workspace_fs`.
 
 The :class:`WorkspaceReader` serves the web file panel (browse, changed
 files, diffs, search, file content) directly from disk when a session's
@@ -17,7 +17,7 @@ from pathlib import Path
 
 import pytest
 
-from omnigent.workspace_fs import WorkspaceReader, WorkspaceReaderError
+from omnigent.host.workspace_fs import WorkspaceReader, WorkspaceReaderError
 
 
 def _git_env() -> dict[str, str]:
@@ -121,7 +121,7 @@ def test_read_oversize_file_is_capped_and_flagged(tmp_path: Path, monkeypatch) -
     slurping the whole file, so a huge file can't OOM the host. Uses a tiny cap
     so the test writes only a few bytes.
     """
-    monkeypatch.setattr("omnigent.workspace_fs._MAX_READ_BYTES", 8)
+    monkeypatch.setattr("omnigent.host.workspace_fs._MAX_READ_BYTES", 8)
     (tmp_path / "big.txt").write_text("0123456789abcdef")  # 16 bytes > cap 8
     reader = WorkspaceReader(tmp_path)
 
@@ -139,7 +139,7 @@ def test_oversize_text_split_on_codepoint_stays_text(tmp_path: Path, monkeypatch
     trailing codepoint keeps the file classified as text (matching the runner's
     boundary-safe truncation) instead of flipping it to base64.
     """
-    monkeypatch.setattr("omnigent.workspace_fs._MAX_READ_BYTES", 4)
+    monkeypatch.setattr("omnigent.host.workspace_fs._MAX_READ_BYTES", 4)
     # "aé" → b"a\xc3\xa9"; cap 4 keeps "aé" whole, so pad so the cap lands
     # inside the é: 3 ASCII + é = b"abc\xc3\xa9", cap 4 splits the é.
     (tmp_path / "u.txt").write_text("abcé")
@@ -159,7 +159,7 @@ def test_oversize_binary_still_serves_base64(tmp_path: Path, monkeypatch) -> Non
     a binary file has invalid bytes earlier in the buffer and must fall through
     to base64.
     """
-    monkeypatch.setattr("omnigent.workspace_fs._MAX_READ_BYTES", 4)
+    monkeypatch.setattr("omnigent.host.workspace_fs._MAX_READ_BYTES", 4)
     (tmp_path / "b.bin").write_bytes(b"\xff\xfe\x00\x01\x02\x03")  # 6 bytes > cap 4
     reader = WorkspaceReader(tmp_path)
 
@@ -311,7 +311,7 @@ def test_search_defers_deep_noise_subtree_to_reach_later_real_dir(
     target.mkdir(parents=True)
     (target / "keep.txt").write_text("y")
 
-    monkeypatch.setattr("omnigent.workspace_fs._SEARCH_SCAN_BUDGET", 20)
+    monkeypatch.setattr("omnigent.host.workspace_fs._SEARCH_SCAN_BUDGET", 20)
     reader = WorkspaceReader(tmp_path)
 
     result = reader.search("target")
@@ -451,7 +451,7 @@ def test_github_info_without_gh_reports_no_pr(tmp_path: Path, monkeypatch) -> No
 
     The tab is a pure PR view, so ``base_ref`` stays null until a PR resolves it.
     """
-    from omnigent import workspace_fs
+    from omnigent.host import workspace_fs
 
     _git_branch_repo(tmp_path)
     monkeypatch.setattr(workspace_fs.github_resource.shutil, "which", lambda _name: None)
@@ -467,7 +467,7 @@ def test_github_info_without_gh_reports_no_pr(tmp_path: Path, monkeypatch) -> No
 
 def test_github_changes_lists_pr_files(tmp_path: Path, monkeypatch) -> None:
     """``github_changes`` delegates to the gh-backed PR file list."""
-    from omnigent import workspace_fs
+    from omnigent.host import workspace_fs
 
     _git_branch_repo(tmp_path)
 
@@ -504,7 +504,7 @@ def test_github_file_diff_returns_before_after(tmp_path: Path) -> None:
 
 def test_github_pr_diff_returns_whole_patch(tmp_path: Path, monkeypatch) -> None:
     """``github_pr_diff`` resolves the PR number, then delegates to ``gh pr diff <n>``."""
-    from omnigent import workspace_fs
+    from omnigent.host import workspace_fs
 
     _git_branch_repo(tmp_path)
 
@@ -543,7 +543,7 @@ def test_search_finds_tracked_files_past_the_scan_budget(
         ["git", "commit", "-m", "more"], cwd=tmp_path, check=True, capture_output=True, env=env
     )
     (tmp_path / "zzz" / "scratch.txt").write_text("untracked")
-    monkeypatch.setattr("omnigent.workspace_fs._SEARCH_SCAN_BUDGET", 10)
+    monkeypatch.setattr("omnigent.host.workspace_fs._SEARCH_SCAN_BUDGET", 10)
     reader = WorkspaceReader(tmp_path)
 
     result = reader.search("target")
@@ -569,7 +569,7 @@ def test_search_walk_skips_git_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPat
     budget; the walk used to spend all of it there and miss every real file."""
     _git_repo(tmp_path)
     (tmp_path / "zz.txt").write_text("x")  # untracked: only the walk can find it
-    monkeypatch.setattr("omnigent.workspace_fs._SEARCH_SCAN_BUDGET", 10)
+    monkeypatch.setattr("omnigent.host.workspace_fs._SEARCH_SCAN_BUDGET", 10)
     reader = WorkspaceReader(tmp_path)
 
     result = reader.search("zz")
@@ -605,7 +605,7 @@ def test_search_still_finds_gitignored_files_after_git_status(tmp_path: Path) ->
 def test_search_from_filesystem_root_keeps_paths_intact(monkeypatch: pytest.MonkeyPatch) -> None:
     """A reader rooted at ``/`` slices result paths off a root that already ends
     in the separator; slicing one more character used to turn ``etc`` into ``tc``."""
-    monkeypatch.setattr("omnigent.workspace_fs._SEARCH_SCAN_BUDGET", 60)
+    monkeypatch.setattr("omnigent.host.workspace_fs._SEARCH_SCAN_BUDGET", 60)
     reader = WorkspaceReader(Path("/"))
 
     result = reader.search("etc")

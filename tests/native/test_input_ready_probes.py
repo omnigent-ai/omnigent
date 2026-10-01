@@ -19,10 +19,10 @@ from omnigent.harnesses.goose_native import bridge as goose_bridge
 from omnigent.harnesses.hermes_native import bridge as hermes_bridge
 from omnigent.harnesses.kimi_native import bridge as kimi_bridge
 from omnigent.harnesses.kiro_native import bridge as kiro_bridge
+from omnigent.harnesses.native.input_ready import PaneSettledProbe
 from omnigent.harnesses.opencode_native import bridge as opencode_bridge
 from omnigent.harnesses.qwen_native import bridge as qwen_bridge
-from omnigent.inner.terminal import TerminalInstance
-from omnigent.native.input_ready import PaneSettledProbe
+from omnigent.terminals.terminal import TerminalInstance
 from tests.runner.helpers import make_test_terminal_instance
 
 _KIMI_FIXTURES = Path(__file__).parents[1] / "fixtures" / "kimi_native"

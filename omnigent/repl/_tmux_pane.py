@@ -156,27 +156,27 @@ def _resolve_omnigent_argv() -> list[str]:
        :func:`shutil.which` against the running process's PATH.
        The Python process inherits PATH from the user's shell at
        launch, so an activated venv typically resolves correctly.
-    3. Fallback — ``[sys.executable, "-m", "omnigent.cli"]``.
+    3. Fallback — ``[sys.executable, "-m", "omnigent.cli.commands"]``.
        Always works because if Python is running this code, the
-       ``omnigent.cli`` module is importable. Trades aesthetics
-       (the binding shows ``python -m omnigent.cli``) for
+       ``omnigent.cli.commands`` module is importable. Trades aesthetics
+       (the binding shows ``python -m omnigent.cli.commands``) for
        reliability across exotic launch shapes.
 
     :returns: A list of one or two argv elements. Length-1 means
         a single executable; length-3 means
-        ``[python, "-m", "omnigent.cli"]``. The caller appends
+        ``[python, "-m", "omnigent.cli.commands"]``. The caller appends
         the subcommand and its args (e.g. ``["pane-split", "-v",
         ...]``) to this prefix.
     """
     argv0 = sys.argv[0] if sys.argv else ""
-    # When the process was launched via ``python -m omnigent.cli``
+    # When the process was launched via ``python -m omnigent.cli.commands``
     # (the chooser's fallback path), ``sys.argv[0]`` is the path to
     # ``cli.py`` itself — not a directly callable executable. Don't
     # try to exec it as a binary; round-trip through python -m again
     # so the recursive case (split → picker → new REPL → which
     # itself wants to install wrappers in tmux) keeps working.
     if argv0.endswith(".py"):
-        return [sys.executable, "-m", "omnigent.cli"]
+        return [sys.executable, "-m", "omnigent.cli.commands"]
     if argv0 and ("/" in argv0 or os.sep in argv0):
         # Path-shaped — make absolute. ``abspath`` handles relative
         # paths against the current working directory.
@@ -186,15 +186,15 @@ def _resolve_omnigent_argv() -> list[str]:
         if resolved:
             return [os.path.abspath(resolved)]
     # Last resort: invoke via the running interpreter. The
-    # ``omnigent.cli`` module is importable since we're running
+    # ``omnigent.cli.commands`` module is importable since we're running
     # inside it, so this exec form always succeeds.
-    return [sys.executable, "-m", "omnigent.cli"]
+    return [sys.executable, "-m", "omnigent.cli.commands"]
 
 
 # User-facing click subcommand names that mark the start of the
 # user's args inside a ``launch_argv``. Anything BEFORE the first
 # match is the launcher prefix (the omnigent binary, ``python
-# -m omnigent.cli``, etc.) and gets stripped during
+# -m omnigent.cli.commands``, etc.) and gets stripped during
 # normalization. Keep in sync with ``cli.py:_CLICK_SUBCOMMANDS``;
 # duplicating the set here avoids importing ``cli`` from this
 # module (which would create an import cycle through ``run_repl``).
@@ -209,8 +209,8 @@ def _user_args_after_launcher(launch_argv: list[str]) -> list[str]:
     The launcher prefix can take many forms across invocations:
 
     - ``[<omnigent-binary>, run, …]`` (PATH-resolved console script)
-    - ``[<python>, -m, omnigent.cli, run, …]`` (python-m fallback)
-    - ``[<python>, -m, omnigent.cli, -m, omnigent.cli, run, …]``
+    - ``[<python>, -m, omnigent.cli.commands, run, …]`` (python-m fallback)
+    - ``[<python>, -m, omnigent.cli.commands, -m, omnigent.cli.commands, run, …]``
       (doubled prefix from an earlier buggy register_pane)
 
     This walker doesn't try to recognize all of them
@@ -456,7 +456,7 @@ def _wrap_binding(binding: SplitBinding, omnigent_argv: list[str]) -> None:
         :func:`_resolve_omnigent_argv`. Length 1 (e.g.
         ``["/venv/bin/omnigent"]``) for a direct binary
         invocation, or length 3 (``[sys.executable, "-m",
-        "omnigent.cli"]``) for the python-m fallback. Either
+        "omnigent.cli.commands"]``) for the python-m fallback. Either
         works because the entire prefix is shlex-quoted into
         the chooser shell command. The absolute path bypasses
         tmux's restricted PATH (the tmux server's environment
@@ -588,11 +588,11 @@ def register_pane(
     #
     # Idempotency under repeat calls: ``_user_args_after_launcher``
     # walks past leading launcher tokens (the omnigent binary,
-    # ``python``, ``-m``, ``omnigent.cli`` — including doubled
+    # ``python``, ``-m``, ``omnigent.cli.commands`` — including doubled
     # forms left by an earlier buggy register_pane) and returns
     # everything from the first user-facing click subcommand
     # onward. A regression where launch_argv accumulates extra
-    # ``-m omnigent.cli`` markers each time is exactly what this
+    # ``-m omnigent.cli.commands`` markers each time is exactly what this
     # repairs.
     user_args = _user_args_after_launcher(launch_argv)
     normalized_launch_argv = list(omnigent_argv) + user_args

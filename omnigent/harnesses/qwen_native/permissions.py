@@ -260,7 +260,7 @@ async def supervise_qwen_approval_mirror(
     # request_id -> {"elicitation_id": str, "task": asyncio.Task}
     pending: dict[str, _PendingApproval] = {}
     timeout = httpx.Timeout(_POST_TIMEOUT_S, connect=10.0)
-    from omnigent.cli_auth import open_server_client
+    from omnigent.cli.auth import open_server_client
 
     async with open_server_client(base_url, headers=headers, auth=auth, timeout=timeout) as client:
         while True:

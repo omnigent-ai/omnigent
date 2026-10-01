@@ -14,4 +14,4 @@ prompt: |
 policies:
   block_sentinel:
     type: function
-    handler: omnigent._e2e_policy_callables.block_on_sentinel
+    handler: omnigent.testing.e2e_policy_callables.block_on_sentinel

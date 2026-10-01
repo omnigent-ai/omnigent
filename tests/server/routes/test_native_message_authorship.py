@@ -10,7 +10,7 @@ import pytest
 from omnigent.harnesses.claude_native.bridge import read_transcript_items_since
 from omnigent.harnesses.claude_native.forwarder import _external_conversation_item_event
 from omnigent.runtime import pending_inputs
-from omnigent.server.routes._sessions.orchestration import _persist_external_conversation_item
+from omnigent.server.routes.sessions.orchestration import _persist_external_conversation_item
 from omnigent.server.schemas import SessionEventInput
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 

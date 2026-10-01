@@ -22,7 +22,7 @@ from omnigent.harnesses.pi_native.credentials import (
     resolve_pi_native_provider,
 )
 from omnigent.host.connect import _build_runner_env, _write_runner_inference_config
-from omnigent.inference_config import inference_config_scope, validate_inference_credentials
+from omnigent.models.inference_config import inference_config_scope, validate_inference_credentials
 from omnigent.models.model_catalog import (
     _acp_launch_model,
     acp_curated_models,
@@ -191,7 +191,7 @@ def test_bound_claude_sdk_preserves_a_literal_anthropic_prefix() -> None:
 async def test_bound_pi_sdk_preserves_literal_suffix_through_executor_factory(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from omnigent.inner.pi_harness import _build_pi_executor
+    from omnigent.harnesses.pi.harness import _build_pi_executor
     from omnigent.runtime.workflow import _build_pi_spawn_env
 
     profile = _profile()
@@ -208,8 +208,10 @@ async def test_bound_pi_sdk_preserves_literal_suffix_through_executor_factory(
         env = _build_pi_spawn_env(_spec("pi"))
     for name, value in env.items():
         monkeypatch.setenv(name, value)
-    monkeypatch.setattr("omnigent.inner.pi_harness.resolve_harness_path", lambda _: "/fake/pi")
-    monkeypatch.setattr("omnigent.inner.pi_executor._fetch_shell_command_token", lambda _: "token")
+    monkeypatch.setattr("omnigent.harnesses.pi.harness.resolve_harness_path", lambda _: "/fake/pi")
+    monkeypatch.setattr(
+        "omnigent.harnesses.pi.executor._fetch_shell_command_token", lambda _: "token"
+    )
     executor = _build_pi_executor()
     assert await executor._resolve_model(None) == "private/model[large]"
     assert env["HARNESS_PI_GATEWAY_OPENAI_WIRE_API"] == "responses"
@@ -460,7 +462,7 @@ def test_host_ucode_configures_only_connected_harness_bindings(
     assert isinstance(harnesses, dict)
     harnesses["pi"] = {"provider": "bifrost"}
     monkeypatch.setattr(
-        "omnigent.inner.databricks_executor._read_databrickscfg_host",
+        "omnigent.harnesses.databricks.executor._read_databrickscfg_host",
         lambda profile: "https://unity.example",
     )
     monkeypatch.setattr(

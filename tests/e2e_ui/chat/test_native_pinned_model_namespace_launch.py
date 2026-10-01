@@ -163,7 +163,7 @@ def native_launch_rig(
     base_url = f"http://127.0.0.1:{port}"
     binding_token = secrets.token_urlsafe(32)
 
-    from omnigent.runner.identity import token_bound_runner_id
+    from omnigent.util.runner_identity import token_bound_runner_id
 
     runner_id = token_bound_runner_id(binding_token)
 
@@ -204,7 +204,7 @@ def native_launch_rig(
             [
                 sys.executable,
                 "-m",
-                "omnigent.cli",
+                "omnigent.cli.commands",
                 "server",
                 "--host",
                 "127.0.0.1",
@@ -363,7 +363,7 @@ def _create_unbound_native_session(base_url: str, harness: str) -> str:
     :param harness: ``"codex"`` or ``"claude"``.
     :returns: The new session/conversation id.
     """
-    from omnigent._wrapper_labels import (
+    from omnigent.harnesses.wrapper_labels import (
         CLAUDE_NATIVE_WRAPPER_VALUE,
         CODEX_NATIVE_WRAPPER_VALUE,
         UI_MODE_LABEL_KEY,

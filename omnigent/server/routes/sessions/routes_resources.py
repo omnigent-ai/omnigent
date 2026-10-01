@@ -32,7 +32,7 @@ from omnigent.entities import (
 )
 from omnigent.entities.session_resources import session_resource_view_to_dict
 from omnigent.errors import ErrorCode, OmnigentError
-from omnigent.native.native_coding_agents import (
+from omnigent.harnesses.native.coding_agents import (
     native_coding_agent_for_agent_name,
     native_coding_agent_for_terminal_name,
 )
@@ -65,13 +65,13 @@ from omnigent.server.routes._content_type import (
 from omnigent.server.routes._errors import session_not_found as _session_not_found
 from omnigent.server.routes._gzip_route import GZipFileContentRoute, skip_gzip
 from omnigent.server.routes._origin import require_trusted_origin
-from omnigent.server.routes._sessions.common import (
+from omnigent.server.routes.sessions.common import (
     _logger,
     get_server_runner_router,
     host_interactive_shells_for_request,
     set_server_runner_router,
 )
-from omnigent.server.routes._sessions.helpers import (
+from omnigent.server.routes.sessions.helpers import (
     FILE_CONTENT_CACHE_CONTROL,
     _ancestor_session_ids,
     _attachment_disposition,
@@ -91,7 +91,7 @@ from omnigent.server.routes._sessions.helpers import (
     _stored_file_to_resource,
     require_filesystem_attachment_runtime,
 )
-from omnigent.server.routes._sessions.orchestration import (
+from omnigent.server.routes.sessions.orchestration import (
     ensure_runner_connected,
 )
 from omnigent.server.schemas import (
@@ -528,7 +528,7 @@ def register_resources_routes(
         is still connected, the read is served from the workspace over
         the host tunnel instead — the file panel stays live without
         waking the agent. The host runs
-        :class:`omnigent.workspace_fs.WorkspaceReader` and returns the
+        :class:`omnigent.host.workspace_fs.WorkspaceReader` and returns the
         same JSON the runner would, so the response shape is identical.
 
         :param session_id: Session/conversation identifier.
@@ -596,7 +596,7 @@ def register_resources_routes(
         :returns: ``(roots, unconfined, workspace)``, or ``None`` when the
             session has no workspace or spec to resolve.
         """
-        from omnigent.inner.sandbox import is_unconfined, reachable_roots, resolve_sandbox
+        from omnigent.sandbox.core import is_unconfined, reachable_roots, resolve_sandbox
 
         if not conversation.workspace:
             return None
@@ -1137,7 +1137,7 @@ def register_resources_routes(
         if host_registry.get(conversation.host_id) is None:
             return None
 
-        from omnigent.inner.sandbox import reach_payload
+        from omnigent.sandbox.core import reach_payload
 
         metadata: dict[str, Any] = {"root": conversation.workspace}
         # Advertise the same reach the runner would. Without it the file
@@ -1649,7 +1649,6 @@ def register_resources_routes(
                 "filename is required",
                 code=ErrorCode.INVALID_INPUT,
             )
-        from omnigent.inner.native_attachments import requires_filesystem
         from omnigent.runtime.content_resolver import (
             _COMPRESSIBLE_IMAGE_MIMES,
             MAX_ATTACHMENT_UPLOAD_BYTES,
@@ -1661,6 +1660,7 @@ def register_resources_routes(
             image_filename_for_content_type,
             image_needs_compression,
         )
+        from omnigent.util.attachments import requires_filesystem
 
         # Validate the type and limits before buffering the file.
         content_type = _resolve_content_type(
@@ -2042,7 +2042,7 @@ def register_resources_routes(
 
         # Files requiring filesystem tools entering a session pass the same checks as an upload,
         # held under the same lock, so a copy can't skip the harness or quotas.
-        from omnigent.inner.native_attachments import requires_filesystem
+        from omnigent.util.attachments import requires_filesystem
 
         filesystem_sources = [
             stored

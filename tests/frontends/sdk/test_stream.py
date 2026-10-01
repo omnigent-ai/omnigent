@@ -653,7 +653,7 @@ async def test_tool_call_dedupe_by_call_id_under_mcp_path(
     parses the ``tool_use`` block, and a post-stream
     action_required event emitted when the SDK invokes the
     MCP-server handler. The adapter
-    (``omnigent/runtime/harnesses/_executor_adapter.py``)
+    (``omnigent/harnesses/runtime/_executor_adapter.py``)
     threads the SDK's ``tool_use_id`` through both so they
     share a ``call_id``; this dedup is what keeps the REPL from
     rendering ``⏵ tool_name`` twice.

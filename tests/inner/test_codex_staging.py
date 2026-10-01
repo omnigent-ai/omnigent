@@ -11,8 +11,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from omnigent.inner import codex_staging
-from omnigent.inner.codex_staging import (
+from omnigent.harnesses.codex import staging as codex_staging
+from omnigent.harnesses.codex.staging import (
     CODEX_SKILLS_PREFIX,
     _staging_root_path,
     codex_home_staging_root,

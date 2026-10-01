@@ -97,7 +97,7 @@ from omnigent.harnesses.antigravity_native.steps import (
     pending_interaction,
 )
 from omnigent.harnesses.claude_native.bridge import url_component
-from omnigent.native._native_post_delivery import post_session_event_with_retry
+from omnigent.harnesses.native.post_delivery import post_session_event_with_retry
 from omnigent.server.schemas import ElicitationRequestParams, ElicitationResult
 
 _logger = logging.getLogger(__name__)
@@ -2975,7 +2975,7 @@ def _adopt_cascade_in_place(bridge_dir: Path, session_id: str, new_cascade_id: s
     The cold-start ``StartCascade`` cascade is a headless placeholder the agy TUI
     never displays; the agy TUI mints its OWN cascade on the first typed turn
     (web turns are typed into the TUI — see
-    :meth:`omnigent.inner.antigravity_native_executor.AntigravityNativeExecutor._deliver`).
+    :meth:`omnigent.harnesses.antigravity_native.executor.AntigravityNativeExecutor._deliver`).
     The first transition off a never-used bound cascade is therefore the
     conversation STARTING, not a ``/clear`` — so adopt the new cascade in the
     SAME Omnigent session by rewriting bridge state's conversation id (the reader
@@ -3272,7 +3272,7 @@ async def run_reader_with_bridge(
     # would keep targeting the rotated-away session).
     current = {"session_id": session_id}
 
-    from omnigent.cli_auth import open_server_client
+    from omnigent.cli.auth import open_server_client
 
     async with open_server_client(
         base_url,

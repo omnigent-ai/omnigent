@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from omnigent.inner.native_attachments import expand_framework_notices
+from omnigent.util.attachments import expand_framework_notices
 
 _SUMMARIZATION_BASE_PROMPT = (
     "Summarize the conversation above so that a future assistant can continue\n"

@@ -55,8 +55,8 @@ import pytest
 import yaml
 
 from omnigent.db.enum_codecs import SESSION_LIVE_STATUS
-from omnigent.runner.identity import token_bound_runner_id
 from omnigent.stores.conversation_store import RUNNER_LIVENESS_TTL_S
+from omnigent.util.runner_identity import token_bound_runner_id
 from tests._helpers.compat import (
     apply_runner_env,
     apply_server_env,
@@ -134,7 +134,7 @@ def _spawn_server(
     args = [
         server_executable(),
         "-m",
-        "omnigent.cli",
+        "omnigent.cli.commands",
         "server",
         "--port",
         str(port),

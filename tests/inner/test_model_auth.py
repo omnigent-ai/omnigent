@@ -9,8 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from omnigent.inner._proc import process_alive
-from omnigent.inner.model_auth import (
+from omnigent.models.signer.auth import (
     PROVIDER_AUTH_REQUIRED,
     ProviderAuthRequired,
     _resolve_ucode_executable,
@@ -18,6 +17,7 @@ from omnigent.inner.model_auth import (
     _ucode_auth_token_argv,
     mint_ucode_token,
 )
+from omnigent.util.proc import process_alive
 
 _HOST = "https://workspace.cloud.databricks.com"
 _PROFILE = "agent-profile"
@@ -90,7 +90,7 @@ async def test_ucode_replacement_after_validation_fails_before_exec(
         return resolved
 
     monkeypatch.setattr(
-        "omnigent.inner.model_auth._resolve_ucode_executable", _resolve_then_replace
+        "omnigent.models.signer.auth._resolve_ucode_executable", _resolve_then_replace
     )
 
     with pytest.raises(ProviderAuthRequired):

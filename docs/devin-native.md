@@ -175,6 +175,6 @@ the executor declares `supports_live_message_queue()`.
 | `omnigent/harnesses/devin_native/bridge.py` | Bridge dir, session config + hook registration, tmux inject/interrupt |
 | `omnigent/harnesses/devin_native/hook.py` | Lifecycle-hook subprocess: record, policy, elicitation |
 | `omnigent/harnesses/devin_native/forwarder.py` | `hooks.jsonl` + ATIF → Omnigent conversation items |
-| `omnigent/inner/devin_native_executor.py` | Web turn → tmux injection, `/model` switch |
-| `omnigent/inner/devin_native_harness.py` | `harness: devin-native` FastAPI app |
+| `omnigent/harnesses/devin_native/executor.py` | Web turn → tmux injection, `/model` switch |
+| `omnigent/harnesses/devin_native/harness.py` | `harness: devin-native` FastAPI app |
 | `omnigent/runner/native/orchestration.py` | `_auto_create_devin_terminal` / `_launch_devin` |

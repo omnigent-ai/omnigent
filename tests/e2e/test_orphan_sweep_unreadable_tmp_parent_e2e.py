@@ -84,7 +84,7 @@ def _boot_server_and_wait_health(
         [
             sys.executable,
             "-m",
-            "omnigent.cli",
+            "omnigent.cli.commands",
             "server",
             "--port",
             str(port),

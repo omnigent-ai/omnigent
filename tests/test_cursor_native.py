@@ -81,7 +81,7 @@ async def test_cursor_resume_to_live_terminal_is_marked_as_reattach(
         headers={},
         session_id="conv_cursor",
         session_bundle=None,
-        cursor_args=("-f",),
+        extra_args=("-f",),
         host_id="host_1",
         workspace="/workspace",
     )
@@ -111,7 +111,7 @@ async def test_cursor_resume_without_live_terminal_is_marked_as_cold_resume(
         headers={},
         session_id="conv_cursor",
         session_bundle=None,
-        cursor_args=("-f",),
+        extra_args=("-f",),
         host_id="host_1",
         workspace="/workspace",
     )
@@ -150,7 +150,7 @@ async def test_cursor_cold_resume_pins_model(
         headers={},
         session_id="conv_cursor",
         session_bundle=None,
-        cursor_args=("-f",),
+        extra_args=("-f",),
         model="gpt-5.2",
         host_id="host_1",
         workspace="/workspace",

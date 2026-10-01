@@ -8,7 +8,7 @@ from typing import Any
 import pytest
 
 from omnigent.harnesses.claude_native.bridge import build_hook_settings, prepare_bridge_dir
-from omnigent.inner.hook_scripts.subagent_router import AGENT_TOOL_MATCHER
+from omnigent.harnesses.native.hook_scripts.subagent_router import AGENT_TOOL_MATCHER
 
 #: Claude Code's default command-hook timeout for ``UserPromptSubmit``, which is
 #: shorter than the default for other events. Not importable — it is the CLI's,
@@ -54,12 +54,12 @@ def test_router_hook_registered_when_router_dir_set(tmp_path: Path) -> None:
     assert len(entries) == 1
     hook = entries[0]["hooks"][0]
     assert hook["type"] == "command"
-    assert "omnigent.inner.hook_scripts.claude_router_hook" in hook["command"]
+    assert "omnigent.harnesses.native.hook_scripts.claude_router_hook" in hook["command"]
     assert f"--bridge-dir {bridge_dir}" in hook["command"]
     assert f"--router-dir {bridge_dir}" in hook["command"]
     # Derived from the hook script's own request budget, so it always exceeds
     # it and the script's fail-open branch runs before Claude kills the hook.
-    from omnigent.inner.hook_scripts.subagent_router import HOOK_TIMEOUT_S
+    from omnigent.harnesses.native.hook_scripts.subagent_router import HOOK_TIMEOUT_S
 
     assert hook["timeout"] == int(HOOK_TIMEOUT_S)
 
@@ -153,7 +153,7 @@ def test_the_subagent_router_hook_is_registered_above_its_own_request_budget(
     tmp_path: Path,
 ) -> None:
     """Add #23, the other claude hook: same relation, its own two constants."""
-    from omnigent.inner.hook_scripts.subagent_router import REQUEST_TIMEOUT_S
+    from omnigent.harnesses.native.hook_scripts.subagent_router import REQUEST_TIMEOUT_S
 
     bridge_dir = _bridge_dir(tmp_path)
     settings = build_hook_settings(bridge_dir, subagent_router_dir=bridge_dir)

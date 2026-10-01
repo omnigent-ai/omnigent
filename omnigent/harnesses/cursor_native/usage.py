@@ -296,7 +296,7 @@ async def forward_cursor_usage_to_session(
 
     acc = _read_usage_state(bridge_dir)
     timeout = httpx.Timeout(_POST_TIMEOUT_S)
-    from omnigent.cli_auth import open_server_client
+    from omnigent.cli.auth import open_server_client
 
     async with open_server_client(base_url, headers=headers, auth=auth, timeout=timeout) as client:
         while True:

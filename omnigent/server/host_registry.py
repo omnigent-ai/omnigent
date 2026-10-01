@@ -12,7 +12,7 @@ request/response traffic. No per-request reassembly queues needed.
 
 The registry also holds what connected hosts *report* about themselves and
 nothing persists — today the per-family gateway-inference map (see
-:mod:`omnigent.gateway_inference`) and interactive-shell inventory. They are
+:mod:`omnigent.models.gateway_inference`) and interactive-shell inventory. They are
 delivered on the connect handshake, so a replica that has never seen a host
 simply knows nothing about them until the host reconnects and re-reports.
 """
@@ -31,7 +31,6 @@ from typing import Any, Protocol
 
 from cachetools import TTLCache
 
-from omnigent._platform import normalize_interactive_shells
 from omnigent.db.account_authority import (
     AccountAuthority,
     account_generation,
@@ -44,6 +43,7 @@ from omnigent.host.frames import (
     HostMcpServersResultFrame,
     HostSkillsResultFrame,
 )
+from omnigent.util.portability import normalize_interactive_shells
 
 _logger = logging.getLogger(__name__)
 

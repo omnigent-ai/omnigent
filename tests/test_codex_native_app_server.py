@@ -23,6 +23,10 @@ try:
 except ImportError:  # pragma: no cover - Python < 3.11
     import tomli as tomllib  # type: ignore[no-redef]
 
+from omnigent.harnesses.codex.executor import (
+    _populate_codex_home_config,
+    _provider_codex_config_overrides,
+)
 from omnigent.harnesses.codex_native import app_server, launch_args
 from omnigent.harnesses.codex_native.app_server import (
     _FRAMEWORK_APPROVED_TOOLS,
@@ -47,10 +51,6 @@ from omnigent.harnesses.codex_native.app_server import (
     trust_native_policy_hooks,
 )
 from omnigent.harnesses.codex_native.hook import _EVALUATE_POLICY_TIMEOUT_S
-from omnigent.inner.codex_executor import (
-    _populate_codex_home_config,
-    _provider_codex_config_overrides,
-)
 
 
 @pytest.mark.parametrize(
@@ -2468,7 +2468,7 @@ async def test_start_writes_fresh_mcp_config_without_leading_blanks(
 
 def _stub_model_catalog_probe(monkeypatch: pytest.MonkeyPatch) -> list[str]:
     """Replace the ``codex debug models`` probe and record its calls."""
-    from omnigent.inner import codex_executor
+    from omnigent.harnesses.codex import executor as codex_executor
 
     probes: list[str] = []
 
@@ -2561,7 +2561,7 @@ async def test_a_smart_routing_codex_native_session_gains_the_spawn_apparatus(
     pinned Smart Routing session's spawns did not merely go unrouted, they
     stalled on an approval prompt nobody was watching.
     """
-    from omnigent.inner.codex_executor import (
+    from omnigent.harnesses.codex.executor import (
         CODEX_EXTENDED_CATALOG_ENV_VAR,
         CODEX_ROUTER_DIR_ENV_VAR,
         CODEX_ROUTER_SESSION_ID_ENV_VAR,
@@ -2597,7 +2597,7 @@ async def test_an_old_codex_degrades_a_routed_session_to_catalog_only(
     catalog (keyed off its own env var) stays. The gear still offers the
     subagent-routing row; the choice simply no-ops until codex is upgraded.
     """
-    from omnigent.inner.codex_executor import (
+    from omnigent.harnesses.codex.executor import (
         CODEX_EXTENDED_CATALOG_ENV_VAR,
         CODEX_ROUTER_DIR_ENV_VAR,
         CODEX_ROUTER_SESSION_ID_ENV_VAR,
@@ -2662,7 +2662,7 @@ async def test_native_codex_materializes_provider_auth_for_app_server_and_tui(
         config_overrides=server.config_overrides,
     )
     remote_argv = codex_native_app_server.build_codex_remote_args(
-        codex_args=(),
+        extra_args=(),
         thread_id=None,
         remote_url="ws://127.0.0.1:9876",
         config_overrides=tuple(server.config_overrides),
@@ -2701,7 +2701,7 @@ def test_remote_codex_rejects_unmaterialized_provider_config() -> None:
 
     with pytest.raises(ValueError, match="must be materialized"):
         codex_native_app_server.build_codex_remote_args(
-            codex_args=(),
+            extra_args=(),
             thread_id=None,
             remote_url="ws://127.0.0.1:9876",
             config_overrides=(provider_override,),
@@ -3129,7 +3129,7 @@ async def test_old_codex_with_routing_armed_keeps_user_hooks(
     ``hooks.json`` has to stay symlinked into the private home. Fails if
     the routing arm drops the symlink and nothing takes its place.
     """
-    from omnigent.inner.codex_executor import CODEX_ROUTER_DIR_ENV_VAR
+    from omnigent.harnesses.codex.executor import CODEX_ROUTER_DIR_ENV_VAR
 
     real_codex_home = tmp_path / "real-codex-home"
     real_codex_home.mkdir()
@@ -3409,7 +3409,7 @@ class TestPinCodexConfigEffort:
 # and would leave them untrusted (a silent fail-open on the spawn gate).
 
 _ROUTER_GATE_COMMAND = (
-    "/venv/bin/python -m omnigent.inner.hook_scripts.codex_router_hook "
+    "/venv/bin/python -m omnigent.harnesses.native.hook_scripts.codex_router_hook "
     "route-subagent --bridge-dir /b --harness codex-native"
 )
 
@@ -3475,7 +3475,7 @@ async def test_trust_step_covers_router_hooks_when_routing_armed(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """The startup trust step trusts the routing hooks alongside the policy hook."""
-    from omnigent.inner.codex_executor import CODEX_ROUTER_DIR_ENV_VAR
+    from omnigent.harnesses.codex.executor import CODEX_ROUTER_DIR_ENV_VAR
 
     client = _FakeCodexClient(
         hooks=[
@@ -3730,7 +3730,7 @@ def test_routed_spawn_note_appends_then_restores_the_user_base(tmp_path: Path) -
     launch and gone again on a resumed / pinned launch, which is what keeps a
     session that leaves auto-harness mode from carrying stale routing framing.
     """
-    from omnigent.inner.hook_scripts.subagent_router import smart_routing_spawn_note
+    from omnigent.harnesses.native.hook_scripts.subagent_router import smart_routing_spawn_note
 
     note = smart_routing_spawn_note("codex-native")
     codex_home = tmp_path / "codex-home"

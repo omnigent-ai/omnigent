@@ -24,15 +24,10 @@ import click
 import httpx
 import yaml
 
-from omnigent._runner_startup import RunnerStartupProgress, runner_startup_progress
-from omnigent._startup_events import record_startup_event
-from omnigent._wrapper_labels import (
-    CODEX_NATIVE_WRAPPER_VALUE as _WRAPPER_LABEL_VALUE,
-)
-from omnigent._wrapper_labels import WRAPPER_LABEL_KEY as _WRAPPER_LABEL_KEY
-from omnigent.conversation_browser import conversation_url, open_conversation_link_if_enabled
+from omnigent.cli.conversation_browser import conversation_url, open_conversation_link_if_enabled
+from omnigent.cli.runner_startup import RunnerStartupProgress, runner_startup_progress
 from omnigent.entities.session_resources import terminal_resource_id
-from omnigent.harness_availability import (
+from omnigent.harnesses.availability import (
     HARNESS_BINARY_MISSING,
     HARNESS_NEEDS_AUTH,
     HARNESS_VERSION_TOO_LOW,
@@ -74,6 +69,30 @@ from omnigent.harnesses.codex_native.forwarder import (
     supervise_forwarder,
 )
 from omnigent.harnesses.codex_native.state import read_launch_state, write_launch_state
+from omnigent.harnesses.native.coding_agents import native_shell_terminal_spec
+from omnigent.harnesses.native.resume_hint import echo_native_resume_hint
+from omnigent.harnesses.native.terminal import (
+    DAEMON_HOST_ONLINE_TIMEOUT_S as _DAEMON_HOST_ONLINE_TIMEOUT_S,
+)
+from omnigent.harnesses.native.terminal import (
+    DAEMON_RUNNER_ONLINE_TIMEOUT_S as _DAEMON_RUNNER_ONLINE_TIMEOUT_S,
+)
+from omnigent.harnesses.native.terminal import (
+    DAEMON_TERMINAL_READY_TIMEOUT_S as _DAEMON_TERMINAL_READY_TIMEOUT_S,
+)
+from omnigent.harnesses.native.terminal import (
+    bind_session_runner as _bind_session_runner,
+)
+from omnigent.harnesses.native.terminal import (
+    normalize_extra_args as _normalize_extra_args,
+)
+from omnigent.harnesses.native.terminal import (
+    terminal_attach_url as _attach_url,
+)
+from omnigent.harnesses.wrapper_labels import (
+    CODEX_NATIVE_WRAPPER_VALUE as _WRAPPER_LABEL_VALUE,
+)
+from omnigent.harnesses.wrapper_labels import WRAPPER_LABEL_KEY as _WRAPPER_LABEL_KEY
 from omnigent.host.daemon_launch import (
     error_text,
     launch_or_reuse_daemon_runner,
@@ -81,26 +100,7 @@ from omnigent.host.daemon_launch import (
     wait_for_host_online,
     wait_for_runner_online,
 )
-from omnigent.native._native_resume_hint import echo_native_resume_hint
-from omnigent.native.native_coding_agents import native_shell_terminal_spec
-from omnigent.native.native_terminal import (
-    DAEMON_HOST_ONLINE_TIMEOUT_S as _DAEMON_HOST_ONLINE_TIMEOUT_S,
-)
-from omnigent.native.native_terminal import (
-    DAEMON_RUNNER_ONLINE_TIMEOUT_S as _DAEMON_RUNNER_ONLINE_TIMEOUT_S,
-)
-from omnigent.native.native_terminal import (
-    DAEMON_TERMINAL_READY_TIMEOUT_S as _DAEMON_TERMINAL_READY_TIMEOUT_S,
-)
-from omnigent.native.native_terminal import (
-    bind_session_runner as _bind_session_runner,
-)
-from omnigent.native.native_terminal import (
-    normalize_extra_args as _normalize_extra_args,
-)
-from omnigent.native.native_terminal import (
-    terminal_attach_url as _attach_url,
-)
+from omnigent.observability.startup_events import record_startup_event
 from omnigent.runtime.tool_result_replay import sanitize_replayed_image_blocks
 from omnigent.util.json_types import JsonObject as _JsonObject
 
@@ -156,7 +156,7 @@ def _resolve_codex_auth_source() -> _CodexAuthSource:
 
     :returns: Local Codex auth source to inspect synchronously.
     """
-    from omnigent.inner.codex_executor import _codex_home_config_source_from_env
+    from omnigent.harnesses.codex.executor import _codex_home_config_source_from_env
 
     codex_home = _codex_home_config_source_from_env()
     return _CodexAuthSource(
@@ -217,9 +217,9 @@ def _codex_auth_json_has_available_credential(auth_path: Path) -> bool:
 
 def _find_codex_cli() -> str | None:
     """Return the resolved path to the Codex CLI binary, if any."""
-    from omnigent._platform import resolve_cli_binary
     from omnigent.onboarding.harness_install import harness_install_spec
     from omnigent.onboarding.provider_config import OPENAI_FAMILY
+    from omnigent.util.portability import resolve_cli_binary
 
     spec = harness_install_spec(OPENAI_FAMILY)
     if spec is None:
@@ -300,7 +300,7 @@ def _codex_auth_unavailable_reason() -> HarnessUnavailableReason | None:
     try:
         source = _resolve_codex_auth_source()
         if defers_to_codex_config:
-            from omnigent.inner.codex_executor import _clean_codex_env
+            from omnigent.harnesses.codex.executor import _clean_codex_env
             from omnigent.onboarding.codex_auth_readiness import codex_config_effective_auth
 
             config_auth = codex_config_effective_auth(source.config_path, env=_clean_codex_env())
@@ -417,7 +417,6 @@ def run_codex_native(
     server: str | None,
     session_id: str | None,
     extra_args: tuple[str, ...] | None = None,
-    codex_args: tuple[str, ...] | None = None,
     resume_picker: bool = False,
     command: str = _DEFAULT_CODEX_COMMAND,
     model: str | None = None,
@@ -431,7 +430,6 @@ def run_codex_native(
         ``"http://127.0.0.1:8123"``.
     :param session_id: Optional existing Omnigent conversation id,
         e.g. ``"conv_abc123"``.
-    :param codex_args: Raw Codex CLI args to pass before ``resume``.
     :param resume_picker: ``True`` runs the Codex-native picker.
     :param command: Codex executable, e.g. ``"codex"``.
     :param model: Optional model id, e.g. ``"gpt-5.4-mini"``.
@@ -441,9 +439,7 @@ def run_codex_native(
     :returns: None after the terminal attach session ends.
     :raises click.ClickException: If setup fails.
     """
-    codex_args = _normalize_extra_args(
-        extra_args=extra_args, legacy_args=codex_args, legacy_param="codex_args"
-    )
+    extra_args = _normalize_extra_args(extra_args)
     resolved_command = command.strip()
     if not resolved_command:
         raise click.ClickException("Codex command must not be empty.")
@@ -460,7 +456,7 @@ def run_codex_native(
             spec_path,
             session_id=session_id,
             resume_picker=resume_picker,
-            codex_args=codex_args,
+            extra_args=extra_args,
             model=model,
             prompt=prompt,
             auto_open_conversation=auto_open_conversation,
@@ -636,7 +632,7 @@ def _wrapper_spec_raw_instructions(spec_path: Path) -> str | None:
     """Resolve raw author instructions from the wrapper's agent spec.
 
     Reuses :func:`omnigent.spec.load` (the same loader
-    :func:`~omnigent.cli._bundle` and the server use for both an agent-image
+    :func:`~omnigent.cli.commands._bundle` and the server use for both an agent-image
     directory and a standalone single-file YAML) so the value matches exactly
     what ``AgentSpec.instructions`` resolves to — including the
     ``instructions:`` file precedence over ``prompt:`` — rather than
@@ -668,7 +664,7 @@ def _run_with_local_server(
     *,
     session_id: str | None,
     resume_picker: bool,
-    codex_args: tuple[str, ...],
+    extra_args: tuple[str, ...],
     command: str,
     model: str | None,
     prompt: str | None,
@@ -680,7 +676,7 @@ def _run_with_local_server(
     :param spec_path: Generated Codex wrapper agent spec.
     :param session_id: Optional existing Omnigent session id.
     :param resume_picker: When ``True``, run the Codex-native picker.
-    :param codex_args: Raw Codex CLI args.
+    :param extra_args: Raw Codex CLI args.
     :param command: Codex executable to run.
     :param model: Optional Codex model id.
     :param prompt: Optional first prompt.
@@ -688,7 +684,7 @@ def _run_with_local_server(
         browser conversation URL after the session is prepared.
     :returns: None.
     """
-    from omnigent.chat import (
+    from omnigent.cli.chat import (
         _bundle_agent,
         _find_free_port,
         _start_local_server,
@@ -726,7 +722,7 @@ def _run_with_local_server(
                     session_id=resolved_session_id,
                     runner_id=server_handle.runner_id,
                     session_bundle=bundle,
-                    codex_args=codex_args,
+                    extra_args=extra_args,
                     command=command,
                     model=model,
                     startup_progress=progress,
@@ -770,7 +766,7 @@ def _run_with_remote_server(
     *,
     session_id: str | None,
     resume_picker: bool,
-    codex_args: tuple[str, ...],
+    extra_args: tuple[str, ...],
     model: str | None,
     prompt: str | None,
     auto_open_conversation: bool = False,
@@ -783,15 +779,15 @@ def _run_with_remote_server(
     :param spec_path: Generated Codex wrapper agent spec.
     :param session_id: Optional existing Omnigent session id.
     :param resume_picker: When ``True``, run the Codex-native picker.
-    :param codex_args: Raw Codex CLI args.
+    :param extra_args: Raw Codex CLI args.
     :param model: Optional Codex model id.
     :param prompt: Optional first prompt.
     :param auto_open_conversation: When ``True``, open the
         browser conversation URL after the session is prepared.
     :returns: None.
     """
-    from omnigent.chat import _bundle_agent, _remote_headers, _server_auth
-    from omnigent.cli import _ensure_host_daemon
+    from omnigent.cli.chat import _bundle_agent, _remote_headers, _server_auth
+    from omnigent.cli.commands import _ensure_host_daemon
     from omnigent.host.identity import load_or_create_host_identity
 
     # This machine's host id keys the WebSocket attach handshake (and its
@@ -827,7 +823,7 @@ def _run_with_remote_server(
                     headers=headers,
                     session_id=resolved_session_id,
                     session_bundle=bundle,
-                    codex_args=codex_args,
+                    extra_args=extra_args,
                     model=model,
                     host_id=host_id,
                     workspace=str(Path.cwd().resolve()),
@@ -894,7 +890,7 @@ async def _prepare_codex_terminal_via_daemon(
     headers: dict[str, str],
     session_id: str | None,
     session_bundle: bytes | None,
-    codex_args: tuple[str, ...],
+    extra_args: tuple[str, ...],
     model: str | None,
     host_id: str,
     workspace: str,
@@ -914,7 +910,7 @@ async def _prepare_codex_terminal_via_daemon(
         fresh session.
     :param session_bundle: Gzipped Codex wrapper bundle. Required when
         *session_id* is ``None``.
-    :param codex_args: User pass-through Codex args, e.g.
+    :param extra_args: User pass-through Codex args, e.g.
         ``("--config", "approval_policy=on-request")``.
     :param model: Optional model override for this launch, e.g.
         ``"gpt-5.4-mini"``.
@@ -926,7 +922,7 @@ async def _prepare_codex_terminal_via_daemon(
     :returns: Prepared terminal details for attaching.
     :raises click.ClickException: If setup fails.
     """
-    persist_args = list(codex_args)
+    persist_args = list(extra_args)
     timeout = httpx.Timeout(30.0, read=120.0)
     async with open_daemon_client(base_url, headers, host_id, timeout=timeout) as client:
         reattached = session_id is not None
@@ -1111,7 +1107,7 @@ async def _post_initial_prompt(
     :returns: None.
     :raises click.ClickException: If Omnigent rejects the prompt.
     """
-    from omnigent.cli_auth import open_server_client
+    from omnigent.cli.auth import open_server_client
 
     async with open_server_client(
         base_url,
@@ -1142,7 +1138,7 @@ async def _prepare_codex_terminal(
     session_id: str | None,
     runner_id: str | None,
     session_bundle: bytes | None,
-    codex_args: tuple[str, ...],
+    extra_args: tuple[str, ...],
     command: str,
     model: str | None,
     startup_progress: RunnerStartupProgress | None = None,
@@ -1156,7 +1152,7 @@ async def _prepare_codex_terminal(
     :param session_id: Optional existing session id.
     :param runner_id: Runner id to bind.
     :param session_bundle: Gzipped agent bundle for new sessions.
-    :param codex_args: Raw Codex CLI args.
+    :param extra_args: Raw Codex CLI args.
     :param command: Codex executable.
     :param model: Optional model id.
     :param startup_progress: Optional user-visible progress renderer,
@@ -1168,7 +1164,7 @@ async def _prepare_codex_terminal(
     :returns: Prepared terminal details.
     """
     timeout = httpx.Timeout(30.0, read=120.0)
-    from omnigent.cli_auth import open_server_client
+    from omnigent.cli.auth import open_server_client
 
     async with open_server_client(base_url, headers=headers, timeout=timeout) as client:
         bridge_id: str
@@ -1245,7 +1241,7 @@ async def _prepare_codex_terminal(
                 workspace=Path.cwd().resolve(),
                 model_provider=codex_session_meta_model_provider(_codex_launch),
                 codex_path=command,
-                terminal_launch_args=codex_args,
+                terminal_launch_args=extra_args,
             )
         # Listen on a loopback WebSocket, mirroring the host-spawned
         # runner (``runner/app.py`` ``_auto_create_codex_terminal``).
@@ -1269,7 +1265,7 @@ async def _prepare_codex_terminal(
             ap_server_url=base_url,
             ap_auth_headers=headers,
             developer_instructions=developer_instructions,
-            terminal_launch_args=codex_args,
+            terminal_launch_args=extra_args,
         )
         app_server.listen_url = codex_ws_url
         event_client: CodexAppServerClient | None = None
@@ -1287,7 +1283,7 @@ async def _prepare_codex_terminal(
                 event_client = await preload_codex_thread_for_resume(
                     codex_ws_url,
                     thread_id,
-                    terminal_launch_args=codex_args,
+                    terminal_launch_args=extra_args,
                     cwd=Path.cwd(),
                     retain_client=codex_remote_resume_omits_permission_args(
                         app_server.codex_cli_version
@@ -1309,7 +1305,7 @@ async def _prepare_codex_terminal(
             launched_terminal = await _launch_codex_terminal(
                 client,
                 session_id,
-                codex_args=codex_args,
+                extra_args=extra_args,
                 command=command,
                 thread_id=thread_id,
                 remote_url=codex_ws_url,
@@ -1517,7 +1513,7 @@ async def _initialize_fresh_terminal_thread(
         raise click.ClickException("Codex event listener was not initialized.")
     app_server_url = _require_codex_app_server_url(prepared)
     thread_id = await _wait_for_thread_started(prepared.event_client)
-    from omnigent.cli_auth import open_server_client
+    from omnigent.cli.auth import open_server_client
 
     async with open_server_client(
         base_url,
@@ -1978,7 +1974,7 @@ async def _ensure_local_codex_resume_rollout(
             )
             return existing
         raise
-    from omnigent.inner.native_attachments import resolve_session_item_file_references
+    from omnigent.util.attachments import resolve_session_item_file_references
 
     # History stores attachments as raw file_ids; restore the files so the
     # rebuilt thread can open local cached copies, as on a live turn.
@@ -1987,7 +1983,7 @@ async def _ensure_local_codex_resume_rollout(
     target = _codex_resume_rollout_path(codex_home, external_session_id)
     cli_version = None
     if codex_path is not None:
-        from omnigent.inner.codex_executor import _codex_cli_version
+        from omnigent.harnesses.codex.executor import _codex_cli_version
 
         version_tuple = await _codex_cli_version(codex_path)
         if version_tuple is not None:
@@ -2671,7 +2667,7 @@ def _codex_items_with_attachment_references(
     :param bridge_dir: Session bridge path identifying the attachment cache.
     :returns: The same items with attachment blocks turned into ``input_text``.
     """
-    from omnigent.inner.native_attachments import attachment_reference_line
+    from omnigent.util.attachments import attachment_reference_line
 
     for item in items:
         content = item.get("content")
@@ -2839,7 +2835,7 @@ async def _launch_codex_terminal(
     client: httpx.AsyncClient,
     session_id: str,
     *,
-    codex_args: tuple[str, ...],
+    extra_args: tuple[str, ...],
     command: str,
     thread_id: str | None,
     remote_url: str,
@@ -2852,7 +2848,7 @@ async def _launch_codex_terminal(
 
     :param client: HTTP client pointed at AP.
     :param session_id: Omnigent session id.
-    :param codex_args: Raw Codex CLI args.
+    :param extra_args: Raw Codex CLI args.
     :param command: Codex executable.
     :param thread_id: Codex thread id to resume. ``None`` starts a
         fresh remote Codex TUI thread.
@@ -2869,7 +2865,7 @@ async def _launch_codex_terminal(
     :returns: Launched terminal resource details.
     """
     terminal_args = build_codex_remote_args(
-        codex_args=codex_args,
+        extra_args=extra_args,
         thread_id=thread_id,
         remote_url=remote_url,
         config_overrides=config_overrides,
@@ -3049,7 +3045,7 @@ async def _close_codex_terminal(
     :param terminal_id: Terminal resource id.
     :returns: None.
     """
-    from omnigent.cli_auth import open_server_client
+    from omnigent.cli.auth import open_server_client
 
     with contextlib.suppress(Exception):
         async with open_server_client(

@@ -1,6 +1,6 @@
 """Tests for the cross-platform process/platform primitives and Windows backend.
 
-Covers omnigent._platform, omnigent.inner._proc, the harness IPC endpoint
+Covers omnigent.util.portability, omnigent.util.proc, the harness IPC endpoint
 abstraction, and the windows_jobobject sandbox backend. The platform-specific
 assertions are gated with ``posix_only`` / ``windows_only`` markers so the
 file runs on both Linux CI and a Windows box.
@@ -20,8 +20,8 @@ from unittest.mock import Mock
 import psutil
 import pytest
 
-from omnigent import _platform
-from omnigent.inner import _proc
+from omnigent.util import portability as _platform
+from omnigent.util import proc as _proc
 
 
 def _spin_cmd() -> list[str]:
@@ -412,7 +412,7 @@ def test_kill_tree_reaps_descendant_that_left_process_group(tmp_path: Path) -> N
 
 
 def test_endpoint_uds_variant_shape() -> None:
-    from omnigent.runtime.harnesses.process_manager import _HarnessEndpoint
+    from omnigent.harnesses.runtime.process_manager import _HarnessEndpoint
 
     ep = _HarnessEndpoint(socket_path=Path("/tmp/x/conv.sock"))
     assert ep.is_uds is True
@@ -421,7 +421,7 @@ def test_endpoint_uds_variant_shape() -> None:
 
 
 def test_endpoint_tcp_variant_shape() -> None:
-    from omnigent.runtime.harnesses.process_manager import _HarnessEndpoint
+    from omnigent.harnesses.runtime.process_manager import _HarnessEndpoint
 
     ep = _HarnessEndpoint(host="127.0.0.1", port=54321)
     assert ep.is_uds is False
@@ -430,7 +430,7 @@ def test_endpoint_tcp_variant_shape() -> None:
 
 
 def test_endpoint_create_picks_platform_transport() -> None:
-    from omnigent.runtime.harnesses.process_manager import _HarnessEndpoint
+    from omnigent.harnesses.runtime.process_manager import _HarnessEndpoint
 
     ep = _HarnessEndpoint.create(Path("/tmp/inst"), "conv_x")
     assert ep.is_uds == (os.name != "nt")
@@ -443,15 +443,15 @@ def test_endpoint_create_picks_platform_transport() -> None:
 
 @pytest.mark.windows_only
 def test_windows_jobobject_is_platform_default() -> None:
-    from omnigent.inner import sandbox
+    from omnigent.sandbox import core as sandbox
 
     assert sandbox._default_sandbox_for_platform().type == "windows_jobobject"
 
 
 @pytest.mark.windows_only
 def test_windows_jobobject_kill_on_close_terminates_tree() -> None:
-    from omnigent.inner.sandbox import SandboxPolicy
-    from omnigent.inner.windows_jobobject_sandbox import WindowsJobObjectSandboxBackend
+    from omnigent.sandbox.core import SandboxPolicy
+    from omnigent.sandbox.windows_jobobject import WindowsJobObjectSandboxBackend
 
     backend = WindowsJobObjectSandboxBackend()
     policy = SandboxPolicy(
@@ -476,8 +476,8 @@ def test_windows_jobobject_kill_on_close_terminates_tree() -> None:
 
 @pytest.mark.windows_only
 def test_explicit_bwrap_errors_loudly_on_windows() -> None:
-    from omnigent.inner import sandbox
-    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+    from omnigent.core.datamodel import OSEnvSandboxSpec, OSEnvSpec
+    from omnigent.sandbox import core as sandbox
 
     sandbox._ensure_builtin_backends()
     backend = sandbox.get_backend("linux_bwrap")
@@ -487,7 +487,7 @@ def test_explicit_bwrap_errors_loudly_on_windows() -> None:
 
 @pytest.mark.posix_only
 def test_posix_default_sandbox_is_not_jobobject() -> None:
-    from omnigent.inner import sandbox
+    from omnigent.sandbox import core as sandbox
 
     assert sandbox._default_sandbox_for_platform().type in {"linux_bwrap", "darwin_seatbelt"}
 
@@ -498,8 +498,8 @@ def test_helper_env_keeps_systemroot_so_child_can_import_asyncio() -> None:
     # makes any spawned `python -m omnigent...` die at `import asyncio` with
     # WinError 10106 (Winsock loads providers from %SystemRoot%). The os_env
     # allowlist must carry the Windows system vars.
-    from omnigent.inner.os_env import build_helper_env
-    from omnigent.inner.sandbox import SandboxPolicy
+    from omnigent.environments.os_env import build_helper_env
+    from omnigent.sandbox.core import SandboxPolicy
 
     policy = SandboxPolicy(
         backend_type="windows_jobobject",

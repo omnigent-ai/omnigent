@@ -11,9 +11,8 @@ from pathlib import Path
 
 import pytest
 
-from omnigent._platform import IS_POSIX
-from omnigent.debug_logging import record_to_row
-from omnigent.process_logging import (
+from omnigent.observability.debug_logging import record_to_row
+from omnigent.observability.process_logging import (
     DATA_DIR_ENV_VAR,
     LOG_FORCE_COLOR_ENV_VAR,
     LOG_TO_STDERR_ENV_VAR,
@@ -35,6 +34,7 @@ from omnigent.process_logging import (
     terminal_stream_handler,
     terminal_supports_color,
 )
+from omnigent.util.portability import IS_POSIX
 
 
 @pytest.mark.skipif(not IS_POSIX, reason="pass_fds is POSIX-only")
@@ -531,7 +531,7 @@ def test_process_log_reference_names_this_process_log_file(
     :param monkeypatch: Pytest monkeypatch fixture.
     :param tmp_path: Pytest temp dir, used as a fake ``$HOME``.
     """
-    monkeypatch.setattr("omnigent.process_logging._current_process_log_path", None)
+    monkeypatch.setattr("omnigent.observability.process_logging._current_process_log_path", None)
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     log_path = tmp_path / ".omnigent" / "logs" / "runner" / "runner-conv_ab12.log"
     monkeypatch.setenv(PROCESS_LOG_FILE_ENV_VAR, str(log_path))
@@ -551,7 +551,7 @@ def test_process_log_reference_falls_back_to_the_destination_dir(
     :param monkeypatch: Pytest monkeypatch fixture.
     :param tmp_path: Pytest temp dir, used as the runtime data dir.
     """
-    monkeypatch.setattr("omnigent.process_logging._current_process_log_path", None)
+    monkeypatch.setattr("omnigent.observability.process_logging._current_process_log_path", None)
     monkeypatch.setattr(Path, "home", lambda: tmp_path / "elsewhere")
     monkeypatch.delenv(PROCESS_LOG_FILE_ENV_VAR, raising=False)
     monkeypatch.setenv(DATA_DIR_ENV_VAR, str(tmp_path / "data"))
@@ -573,7 +573,7 @@ def test_process_log_dir_reference_follows_the_data_dir(
     :param tmp_path: Pytest temp dir, used as the runtime data dir.
     """
     monkeypatch.setattr(
-        "omnigent.process_logging._current_process_log_path",
+        "omnigent.observability.process_logging._current_process_log_path",
         tmp_path / "mine" / "cli.log",
     )
     monkeypatch.setattr(Path, "home", lambda: tmp_path / "elsewhere")
@@ -594,7 +594,7 @@ def test_configure_process_logging_publishes_its_log_path(
     :param monkeypatch: Pytest monkeypatch fixture.
     :param tmp_path: Pytest temp dir holding the log file.
     """
-    monkeypatch.setattr("omnigent.process_logging._current_process_log_path", None)
+    monkeypatch.setattr("omnigent.observability.process_logging._current_process_log_path", None)
     monkeypatch.delenv(PROCESS_LOG_FILE_ENV_VAR, raising=False)
     log_path = tmp_path / "runner-self-allocated.log"
     logger_name = "omnigent.test_process_logging"
@@ -618,7 +618,7 @@ def test_configure_process_logging_forwards_custom_debug_log_send(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    from omnigent import debug_logging
+    from omnigent.observability import debug_logging
 
     captured: list[object] = []
 
@@ -681,10 +681,10 @@ def test_configure_registers_the_empty_log_sweep_for_self_allocated_paths(
     """
     registered: list[tuple[object, ...]] = []
     monkeypatch.setattr(
-        "omnigent.process_logging.atexit.register",
+        "omnigent.observability.process_logging.atexit.register",
         lambda fn, *args: registered.append((fn, *args)),
     )
-    monkeypatch.setattr("omnigent.process_logging._current_process_log_path", None)
+    monkeypatch.setattr("omnigent.observability.process_logging._current_process_log_path", None)
     monkeypatch.delenv(PROCESS_LOG_FILE_ENV_VAR, raising=False)
     monkeypatch.setenv(DATA_DIR_ENV_VAR, str(tmp_path))
     logger_name = "omnigent.test_empty_log_sweep"

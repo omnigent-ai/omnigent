@@ -8,16 +8,16 @@ from types import SimpleNamespace
 
 import pytest
 
-import omnigent.cli as cli
-import omnigent.cli_config as cli_config
-from omnigent.cli import _load_global_config
+import omnigent.cli.commands as cli
+import omnigent.cli.config_commands as cli_config
+from omnigent.cli.commands import _load_global_config
 
 
 @pytest.fixture
 def _isolated_config(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
     """Point the global config at a tmp file so saves don't touch ``~/.omnigent``."""
     path = tmp_path / "config.yaml"
-    monkeypatch.setattr("omnigent.cli._GLOBAL_CONFIG_PATH", path)
+    monkeypatch.setattr("omnigent.cli.commands._GLOBAL_CONFIG_PATH", path)
     return path
 
 

@@ -293,7 +293,7 @@ const BY_SUBAGENT_WRAPPER = new Map<string, NativeCodingAgentSpec>(
 );
 
 // Reversed harness spellings that fold to a canonical native `harness`.
-// Mirrors omnigent.harness_aliases.NATIVE_HARNESSES on the server, which
+// Mirrors omnigent.harnesses.aliases.NATIVE_HARNESSES on the server, which
 // accepts both the canonical and reversed native spellings (claude/codex
 // only use the canonical form, so they need no reversed entry here).
 const HARNESS_ALIASES: Record<string, string> = {

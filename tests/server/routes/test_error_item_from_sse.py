@@ -7,7 +7,7 @@ the runner so downstream stores the right ``ErrorData.source`` (llm vs execution
 from __future__ import annotations
 
 from omnigent.entities.conversation import ErrorData
-from omnigent.server.routes._sessions.helpers import _error_item_from_sse
+from omnigent.server.routes.sessions.helpers import _error_item_from_sse
 
 
 def _failed_event(

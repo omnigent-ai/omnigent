@@ -15,7 +15,7 @@ which makes stability and reliability work hard. Static analysis alone has prove
 unreliable; we want to incorporate signal from **real usage** by tracing every RPC,
 message, and cross-process call.
 
-Today there is a partial telemetry layer (`omnigent/runtime/telemetry.py`) built on
+Today there is a partial telemetry layer (`omnigent/observability/otel.py`) built on
 MLflow Tracing + OpenTelemetry, but:
 
 - Trace context is **never propagated over the wire**. Instead each layer on the
@@ -253,7 +253,7 @@ Server, Policy Server, Server database.** Choke points below are from the codeba
 
 ## 7. SDK / provider setup
 
-Build on the existing `omnigent/runtime/telemetry.py` `init()`; it already establishes a
+Build on the existing `omnigent/observability/otel.py` `init()`; it already establishes a
 **unified global `TracerProvider`** shared between MLflow and raw OTel
 (`MLFLOW_USE_DEFAULT_TRACER_PROVIDER=false`) and flips OTLP export on when
 `OTEL_EXPORTER_OTLP_ENDPOINT` is set. Changes:

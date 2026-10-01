@@ -11,7 +11,6 @@ import pytest
 import yaml
 from click import ClickException
 
-from omnigent._wrapper_labels import KIRO_NATIVE_WRAPPER_VALUE, WRAPPER_LABEL_KEY
 from omnigent.harnesses.kiro_native.main import (
     _KIRO_PATH_ENV,
     LaunchedKiroTerminal,
@@ -35,6 +34,7 @@ from omnigent.harnesses.kiro_native.main import (
     resolve_kiro_executable,
     run_kiro_native,
 )
+from omnigent.harnesses.wrapper_labels import KIRO_NATIVE_WRAPPER_VALUE, WRAPPER_LABEL_KEY
 
 _NO_JSON = object()
 
@@ -350,7 +350,7 @@ def test_run_kiro_native_requires_server(monkeypatch: pytest.MonkeyPatch) -> Non
     monkeypatch.setattr("omnigent.harnesses.kiro_native.main._preflight_local_tools", lambda: None)
 
     with pytest.raises(ClickException, match="resolved Omnigent server URL"):
-        run_kiro_native(server=None, session_id=None, kiro_args=())
+        run_kiro_native(server=None, session_id=None, extra_args=())
 
 
 def test_run_kiro_native_materializes_spec_and_delegates(
@@ -372,7 +372,7 @@ def test_run_kiro_native_materializes_spec_and_delegates(
     run_kiro_native(
         server="http://server/",
         session_id=None,
-        kiro_args=("--foo",),
+        extra_args=("--foo",),
         model="claude",
         prompt="hi",
     )

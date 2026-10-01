@@ -516,7 +516,7 @@ function* processEvent(state: ReducerState, event: StreamEvent): Generator<AnyBl
       // emitted as the inner SDK parses the `tool_use` block, and a
       // post-stream action_required event emitted when the SDK
       // invokes the MCP-server handler. The adapter
-      // (omnigent/runtime/harnesses/_executor_adapter.py) threads
+      // (omnigent/harnesses/runtime/_executor_adapter.py) threads
       // the SDK's `tool_use_id` through both so they share a callId;
       // this block keeps the first occurrence (the inline render)
       // and drops the second so the renderer doesn't draw the call

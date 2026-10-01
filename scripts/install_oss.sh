@@ -56,7 +56,7 @@ init_style() {
     BOLD="${ESC}[1m"
     DIM="${ESC}[2m"
     # Brand accent — Otto's magenta-pink (#F43BA6), matching the Python CLI
-    # palette in omnigent/inner/ui.py so the installer and the tool agree.
+    # palette in omnigent/cli/ui.py so the installer and the tool agree.
     MAGENTA="${ESC}[38;2;244;59;166m"
     GREEN="${ESC}[32m"
     YELLOW="${ESC}[33m"
@@ -65,7 +65,7 @@ init_style() {
 }
 
 # The Otto + "omnigent" wordmark lockup, printed once at the top of an
-# interactive install. Mirrors omnigent.inner.wordmark.lockup_lines(); the
+# interactive install. Mirrors omnigent.cli.wordmark.lockup_lines(); the
 # whole lockup is painted in the brand magenta (flat — no gradient in sh).
 # Skipped off a TTY (use_terminal_ui) so piped/CI installs stay clean.
 print_banner() {

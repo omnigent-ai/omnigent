@@ -1,4 +1,4 @@
-"""Tests for :mod:`omnigent.cli_invocation`.
+"""Tests for :mod:`omnigent.util.cli_invocation`.
 
 Followup hints must name the configured wrapper (``isaac omni stop``) when
 ``OMNIGENT_WRAPPER_COMMAND`` is set, and fall back to the naked binary token
@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import pytest
 
-from omnigent.cli_invocation import DEFAULT_CLI_NAME, WRAPPER_COMMAND_ENV, cli_invocation
+from omnigent.util.cli_invocation import DEFAULT_CLI_NAME, WRAPPER_COMMAND_ENV, cli_invocation
 
 
 def test_defaults_to_omnigent_when_wrapper_unset() -> None:

@@ -9,7 +9,7 @@ from omnigent.llms.summarize import build_summarization_input
 
 @pytest.mark.parametrize("last_role", ["user", "assistant"])
 def test_summarization_renders_notices_without_extra_user_turns(last_role: str) -> None:
-    from omnigent.inner.native_attachments import framework_notice_block, resize_notice
+    from omnigent.util.attachments import framework_notice_block, resize_notice
 
     dimensions = {"width": 6000, "height": 4000}
     content = [

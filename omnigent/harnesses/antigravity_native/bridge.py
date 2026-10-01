@@ -18,10 +18,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from omnigent.native import native_bridge_common
+from omnigent.harnesses.native import bridge_common as native_bridge_common
 
 if TYPE_CHECKING:
-    from omnigent.inner.terminal import TerminalInstance
+    from omnigent.terminals.terminal import TerminalInstance
 
 _logger = logging.getLogger(__name__)
 
@@ -60,95 +60,6 @@ def is_placeholder_conversation_id(conversation_id: str) -> bool:
 # discovery) so a change to agy's data-dir layout is a one-line edit. (The
 # onboarding/auth layer keeps its own ``~/.gemini`` OAuth root in ``gemini_auth``
 # — a broader, distinct concern that must not depend on this harness module.)
-AGY_APP_DATA_DIR = Path.home() / ".gemini" / "antigravity-cli"
-
-# agy persists onboarding completion in this HOME-global cache file. On a first
-# run where it is absent, agy launches an interactive TUI onboarding wizard
-# (login method, then color-scheme / telemetry steps) that has no pre-emptive
-# flag and no PermissionRequest-style hook. On a host-spawned (web-driven) or
-# otherwise headless launch there is no TTY to answer it, so agy hangs and the
-# web UI shows nothing. Seeding ``onboardingComplete`` here suppresses the
-# wizard, mirroring how ``claude_native_bridge.ensure_claude_workspace_trusted``
-# pre-accepts Claude's ``hasCompletedOnboarding`` gate. The agy OAuth token is a
-# separate per-host secret (seeded outside this code path); this file carries no
-# credential — only the three onboarding-state booleans.
-_AGY_ONBOARDING_MARKER = AGY_APP_DATA_DIR / "cache" / "onboarding.json"
-# The exact keys agy itself writes on a completed consumer (subscription)
-# onboarding — captured ground-truth from a real onboarded profile. Enterprise
-# onboarding is a distinct flow Omnigent does not drive, so it stays ``False``.
-_AGY_ONBOARDING_COMPLETE_STATE: dict[str, object] = {
-    "consumerOnboardingComplete": True,
-    "enterpriseOnboardingComplete": False,
-    "onboardingComplete": True,
-}
-
-
-def ensure_agy_onboarding_complete() -> None:
-    """Pre-accept agy's first-run onboarding wizard so a headless launch never blocks.
-
-    Idempotently seeds ``onboardingComplete`` (and the sibling consumer/enterprise
-    flags) into agy's ``~/.gemini/antigravity-cli/cache/onboarding.json`` so the
-    interactive TUI onboarding wizard does not stall a host-spawned or headless
-    ``agy`` launch that has no TTY to answer it.
-
-    .. deprecated:: 0.9.0
-        No longer called by either launch path; slated for removal in 0.10.0.
-        Both launches now scope agy to a per-session ``--gemini_dir``, where
-        :func:`seed_isolated_agy_home` writes this same marker — so seeding the
-        real ``~/.gemini`` copy only wrote the user's tree for a file agy never
-        reads. Use :func:`seed_isolated_agy_home` instead.
-
-    Any unrecognised keys already in the file are preserved (the three known keys
-    are merged over them), and the write is skipped entirely when all three
-    already hold their exact boolean values — so a returning user's agy state is
-    never churned. Unlike
-    ``~/.claude.json`` (which holds the Claude OAuth account block and is treated
-    fail-loud), this file is a regenerable, non-secret agy cache: an existing
-    file that is unreadable or not a JSON object is treated as absent and
-    overwritten with the known-complete state rather than raising.
-
-    :returns: None.
-    :raises OSError: If the marker directory cannot be created or the file cannot
-        be written (e.g. an unwritable home directory). Surfaced rather than
-        swallowed: a missing marker means agy will hang on the wizard, so a write
-        failure is a real, launch-blocking fault worth failing loudly on.
-    """
-    marker = _AGY_ONBOARDING_MARKER
-    existing: dict[str, object] = {}
-    if marker.is_file():
-        try:
-            loaded = json.loads(marker.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            # Regenerable non-secret cache: an unreadable (OSError), non-UTF-8
-            # (UnicodeDecodeError) or malformed-JSON (json.JSONDecodeError) marker
-            # would make agy re-run onboarding anyway, so overwrite from an empty
-            # base. ValueError is the common supertype of both decode failures.
-            loaded = None
-        if isinstance(loaded, dict):
-            existing = loaded
-    # Type-strict identity (``is``, not ``==``) so a stored numeric ``1``/``0``
-    # (which ``==`` True/False in Python) is NOT accepted as the boolean state but
-    # is normalised on write — matching this module's ``read_bridge_state``, which
-    # likewise rejects bool/int conflation.
-    if all(existing.get(key) is value for key, value in _AGY_ONBOARDING_COMPLETE_STATE.items()):
-        return
-    merged: dict[str, object] = {**existing, **_AGY_ONBOARDING_COMPLETE_STATE}
-    marker.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_name = tempfile.mkstemp(prefix=f"{marker.name}.", dir=str(marker.parent))
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump(merged, handle, sort_keys=True)
-            handle.write("\n")
-            # fsync before the atomic replace so a crash/power-loss cannot leave a
-            # present-but-empty marker that would send agy back into the wizard
-            # (matches ``claude_native_bridge._atomic_write_user_json``).
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(tmp_name, marker)
-    finally:
-        if os.path.exists(tmp_name):
-            os.unlink(tmp_name)
-    _logger.info("Seeded agy onboarding-complete marker at %s", marker)
 
 
 def bridge_root() -> Path:
@@ -811,8 +722,7 @@ def ensure_agy_feedback_survey_disabled(home: Path) -> None:
         return
     except UnicodeDecodeError:
         # read_text raises this (a ValueError, not an OSError) on non-UTF-8 bytes;
-        # treat it like malformed JSON and never clobber the file (mirrors the
-        # ``(OSError, ValueError)`` read guard in ensure_agy_onboarding_complete).
+        # treat it like malformed JSON and never clobber the file.
         _logger.warning(
             "agy settings.json at %s is not valid UTF-8; leaving it untouched",
             settings_path,
@@ -822,8 +732,7 @@ def ensure_agy_feedback_survey_disabled(home: Path) -> None:
         try:
             loaded = json.loads(raw)
         except ValueError:
-            # json.JSONDecodeError subclasses ValueError; catch the supertype to
-            # match the decode-family guard in ensure_agy_onboarding_complete.
+            # json.JSONDecodeError subclasses ValueError; catch the supertype.
             _logger.warning(
                 "agy settings.json at %s is not valid JSON; leaving it untouched "
                 "(the feedback survey may still appear)",
@@ -862,7 +771,7 @@ def ensure_agy_feedback_survey_disabled(home: Path) -> None:
                 json.dump(data, handle, indent=2, sort_keys=True)
                 handle.write("\n")
                 handle.flush()
-                os.fsync(handle.fileno())  # crash-safe, mirrors ensure_agy_onboarding_complete
+                os.fsync(handle.fileno())  # crash-safe atomic write
             os.replace(tmp_name, settings_path)
         finally:
             if os.path.exists(tmp_name):

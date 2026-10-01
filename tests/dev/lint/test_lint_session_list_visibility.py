@@ -15,7 +15,7 @@ from dev.lint import lint_session_list_visibility as lint
 @pytest.mark.parametrize(
     "path",
     [
-        "omnigent/cli.py",
+        "omnigent/cli/commands.py",
         "omnigent/server/client.py",
         "sdks/python-client/client.py",
         "web/src/hooks/sessions.ts",

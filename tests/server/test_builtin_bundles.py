@@ -20,8 +20,8 @@ import pytest
 import yaml
 
 from omnigent.errors import OmnigentError
-from omnigent.harness_plugins import native_provider_for_key
-from omnigent.native.native_coding_agents import NATIVE_CODING_AGENTS as _NATIVE_CODING_AGENTS
+from omnigent.harnesses.native.coding_agents import NATIVE_CODING_AGENTS as _NATIVE_CODING_AGENTS
+from omnigent.harnesses.registry import native_provider_for_key
 from omnigent.server import app
 from omnigent.spec import load, materialize_bundle
 
@@ -264,7 +264,7 @@ def test_native_seed_ids_are_byte_stable() -> None:
     drift when the 11 hand-written seed helpers collapse into one loop.
     """
     from omnigent.db.utils import builtin_agent_id
-    from omnigent.native.native_coding_agents import NATIVE_CODING_AGENTS
+    from omnigent.harnesses.native.coding_agents import NATIVE_CODING_AGENTS
 
     actual = {a.agent_name: builtin_agent_id(a.agent_name) for a in NATIVE_CODING_AGENTS}
     assert actual == _EXPECTED_BUILTIN_AGENT_IDS, (
@@ -279,8 +279,8 @@ def test_native_seed_loop_covers_every_native_agent() -> None:
     A native agent with no provider row would be silently dropped from the
     seeded set (the loop raises instead — this pins that contract).
     """
-    from omnigent.harness_plugins import native_provider_for_key
-    from omnigent.native.native_coding_agents import NATIVE_CODING_AGENTS
+    from omnigent.harnesses.native.coding_agents import NATIVE_CODING_AGENTS
+    from omnigent.harnesses.registry import native_provider_for_key
 
     missing = [a.key for a in NATIVE_CODING_AGENTS if native_provider_for_key(a.key) is None]
     assert missing == [], f"native agents without a provider row to seed from: {missing}"

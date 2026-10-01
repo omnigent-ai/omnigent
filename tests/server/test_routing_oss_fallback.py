@@ -225,7 +225,7 @@ async def test_the_oss_config_routes_with_its_judge(router: MockRouter) -> None:
     default for a workspace that HAS the API — and the judge covers the one
     that does not.
     """
-    from omnigent.cli import _build_routing_backends
+    from omnigent.cli.commands import _build_routing_backends
 
     router.disabled = True
     host = router.base_url[: -len("/ai-gateway/routing/v1")]

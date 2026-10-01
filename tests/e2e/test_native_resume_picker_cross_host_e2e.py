@@ -155,7 +155,7 @@ def _wrapper_bundle() -> bytes:
 
 def _create_wrapper_session(server_url: str, title: str) -> str:
     """Create a claude-native wrapper session (labels as the CLI stamps)."""
-    from omnigent._wrapper_labels import (
+    from omnigent.harnesses.wrapper_labels import (
         CLAUDE_NATIVE_WRAPPER_VALUE,
         UI_MODE_LABEL_KEY,
         UI_MODE_TERMINAL_VALUE,
@@ -208,7 +208,7 @@ def _boot_server(root: Path) -> tuple[subprocess.Popen, str]:
         [
             _python(),
             "-m",
-            "omnigent.cli",
+            "omnigent.cli.commands",
             "server",
             "--port",
             str(port),
@@ -311,7 +311,7 @@ def _run_resume_picker_cli(
     env = _subprocess_env(env_home)
     env["PATH"] = f"{stub_bin}{os.pathsep}{env.get('PATH', '')}"
     return subprocess.run(
-        [_python(), "-m", "omnigent.cli", "claude", "--server", server_url, "--resume"],
+        [_python(), "-m", "omnigent.cli.commands", "claude", "--server", server_url, "--resume"],
         env=env,
         input="q\n",
         capture_output=True,

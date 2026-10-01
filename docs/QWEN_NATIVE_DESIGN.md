@@ -283,20 +283,20 @@ trade-offs; one is inherent to the embedded-terminal UX.
 
 | New file | Role |
 |---|---|
-| `omnigent/inner/qwen_native_executor.py` | `submit` via input-file; `supports_streaming=False`, `supports_live_message_queue=True` |
-| `omnigent/inner/qwen_native_harness.py` | `create_app()` factory |
+| `omnigent/harnesses/qwen_native/executor.py` | `submit` via input-file; `supports_streaming=False`, `supports_live_message_queue=True` |
+| `omnigent/harnesses/qwen_native/harness.py` | `create_app()` factory |
 | `omnigent/qwen_native_bridge.py` | input-file append (`submit` / `confirmation_response`), tmux.json, `inject_interrupt` (Escape), `kill_session`, `build_qwen_native_spawn_env` |
 | `omnigent/qwen_native_forwarder.py` | tail `--json-file`, mirror transcript, drive the permission gate |
 | `omnigent/qwen_native.py` | `omnigent qwen` wrapper (clone `goose_native.py`) |
 
 ## Registration touch-points (one-liners, beside the goose entries)
 
-- `omnigent/runtime/harnesses/__init__.py` → `"qwen-native": "omnigent.inner.qwen_native_harness"`
-- `omnigent/harness_aliases.py` → add `qwen-native` + `native-qwen` to `NATIVE_HARNESSES`
-- `omnigent/native_coding_agents.py` + `omnigent/_wrapper_labels.py` → `QWEN_NATIVE_*`
+- `omnigent/harnesses/runtime/__init__.py` → `"qwen-native": "omnigent.harnesses.qwen_native.harness"`
+- `omnigent/harnesses/aliases.py` → add `qwen-native` + `native-qwen` to `NATIVE_HARNESSES`
+- `omnigent/native_coding_agents.py` + `omnigent/harnesses/wrapper_labels.py` → `QWEN_NATIVE_*`
 - `omnigent/onboarding/harness_install.py` → `_HARNESS_NAME_TO_KEY` → existing `QWEN_KEY`
 - `omnigent/runner/app.py` → `_auto_create_qwen_terminal` + the ~7 goose-native dispatch sites
-- `omnigent/cli.py` → `omnigent qwen` command
+- `omnigent/cli/commands.py` → `omnigent qwen` command
 
 > Naming: keep `qwen` = ACP (piped); add `qwen-native` / `native-qwen` for the TUI,
 > mirroring how `goose` and `goose-native` coexist. The default can be flipped later.

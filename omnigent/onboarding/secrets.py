@@ -64,7 +64,7 @@ def _keyring_disabled() -> bool:
     """Return whether the file backend is forced via the environment.
 
     Mirrors the repo's truthy-env convention (see
-    :func:`omnigent.runtime.telemetry._env_bool`): ``"true"`` / ``"1"`` /
+    :func:`omnigent.observability.otel._env_bool`): ``"true"`` / ``"1"`` /
     ``"yes"`` (case-insensitive) count as set; anything else (including
     unset) does not.
 

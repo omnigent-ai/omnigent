@@ -1,5 +1,5 @@
 """
-Tests for ``omnigent.inner.bundle_skills`` — the shared helpers that
+Tests for ``omnigent.harnesses.claude_sdk.bundle_skills`` — the shared helpers that
 expose an agent bundle's skills to a Claude harness (the SDK executor and
 the ``claude-native`` CLI launch path both use these so they stay in
 lockstep).
@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pytest
 
-from omnigent.inner.bundle_skills import (
+from omnigent.harnesses.claude_sdk.bundle_skills import (
     claude_native_skill_args,
     ensure_bundle_plugin_manifest,
 )

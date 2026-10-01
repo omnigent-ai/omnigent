@@ -42,7 +42,7 @@ import pytest
 import yaml
 from playwright.sync_api import Locator, Page, Response, Route, expect
 
-from omnigent.inner.kimi_executor import _resolve_kimi_binary
+from omnigent.harnesses.kimi.executor import _resolve_kimi_binary
 from tests.e2e_ui.chat.test_session_usage_loading import _session_read_matcher
 from tests.e2e_ui.conftest import _ensure_runner_online, _server_state, configure_mock_llm
 

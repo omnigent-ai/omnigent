@@ -14,12 +14,12 @@ import time
 from pathlib import Path
 from typing import TYPE_CHECKING, TypedDict
 
-from omnigent._platform import stable_user_id
 from omnigent.harnesses.claude_native import bridge as claude_bridge
 from omnigent.util.json_types import JsonObject as _JsonObject
+from omnigent.util.portability import stable_user_id
 
 if TYPE_CHECKING:
-    from omnigent.inner.terminal import TerminalInstance
+    from omnigent.terminals.terminal import TerminalInstance
 
 
 class _McpServerEntry(TypedDict):

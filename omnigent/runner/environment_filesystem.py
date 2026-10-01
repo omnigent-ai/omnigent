@@ -32,24 +32,24 @@ from omnigent.entities.environment_filesystem import (
     WriteFileResult,
 )
 from omnigent.entities.pagination import PagedList
-from omnigent.inner._cwd_scan import _DEFAULT_DEPRIORITIZED_DIRS
-from omnigent.inner.async_utils import run_sync_on_thread
-from omnigent.inner.os_env import (
+from omnigent.environments.os_env import (
     _DEFAULT_READ_LIMIT,
     _edit_impl,
     _read_impl,
     _write_impl,
 )
-from omnigent.inner.sandbox import (
+from omnigent.sandbox.core import (
     ReachableRoot,
     contained_realpath,
     containment_prefix,
     is_unconfined,
     reachable_roots,
 )
+from omnigent.sandbox.cwd_scan import _DEFAULT_DEPRIORITIZED_DIRS
+from omnigent.util.async_utils import run_sync_on_thread
 
 if TYPE_CHECKING:
-    from omnigent.inner.os_env import OpResult, OSEnvironment
+    from omnigent.environments.os_env import OpResult, OSEnvironment
     from omnigent.runtime.filesystem_registry import FilesystemRegistry
 
 _MAX_READ_BYTES = 10 * 1024 * 1024  # 10 MiB
@@ -507,8 +507,8 @@ def resolve_browse_target(
       grant still never admits a write.
 
     :param absolute_path: Absolute path supplied by the caller.
-    :param roots: Grants from :func:`omnigent.inner.sandbox.reachable_roots`.
-    :param unconfined: Result of :func:`omnigent.inner.sandbox.is_unconfined`.
+    :param roots: Grants from :func:`omnigent.sandbox.core.reachable_roots`.
+    :param unconfined: Result of :func:`omnigent.sandbox.core.is_unconfined`.
     :param need_write: ``True`` for mutating operations, which read grants
         do not admit.
     :returns: The resolved absolute path.

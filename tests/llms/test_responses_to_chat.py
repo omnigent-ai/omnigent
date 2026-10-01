@@ -33,12 +33,12 @@ def test_instructions_become_system_message() -> None:
 @pytest.mark.parametrize("provider", ["anthropic", "bedrock", "gemini", "databricks"])
 def test_resize_notice_stays_system_context_across_providers(provider: str) -> None:
     from omnigent.entities import ConversationItem, MessageData
-    from omnigent.inner.native_attachments import framework_notice_block, resize_notice
     from omnigent.llms.adapters.anthropic import _chat_to_anthropic
     from omnigent.llms.adapters.bedrock import _messages_to_converse
     from omnigent.llms.adapters.databricks import DatabricksAdapter
     from omnigent.llms.adapters.gemini import _chat_to_gemini
     from omnigent.runtime.prompt import history_to_input_items
+    from omnigent.util.attachments import framework_notice_block, resize_notice
 
     dimensions = {"width": 6000, "height": 4000}
     notice = resize_notice(dimensions)

@@ -173,7 +173,7 @@ async def test_bad_source_id_is_rejected(client: httpx.AsyncClient) -> None:
 def test_client_cannot_smuggle_a_stable_id() -> None:
     """``stable_id`` is internal-only: a client key inside event data is
     dropped by the item builder, never bound onto the entity."""
-    from omnigent.server.routes._sessions.helpers import _build_new_item
+    from omnigent.server.routes.sessions.helpers import _build_new_item
     from omnigent.server.schemas import SessionEventInput
 
     body = SessionEventInput(

@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import asyncio
 
-from omnigent.runtime.harnesses._scaffold import HeartbeatEvent, TurnContext
+from omnigent.harnesses.runtime._scaffold import HeartbeatEvent, TurnContext
 from omnigent.server.schemas import (
     ElicitationRequestParams,
     ElicitationResult,

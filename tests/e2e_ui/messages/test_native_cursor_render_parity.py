@@ -7,7 +7,7 @@ the SAME canonical transcript (``GET /v1/sessions/{id}/items``) the TUI prints.
 A native forwarder (:mod:`omnigent.harnesses.cursor_native.forwarder`) tails
 ``cursor-agent``'s own chat store and mirrors the transcript back OUT as
 conversation items; web-composer messages are injected INTO the TUI's tmux pane
-by :class:`omnigent.inner.cursor_native_executor.CursorNativeExecutor`. This
+by :class:`omnigent.harnesses.cursor_native.executor.CursorNativeExecutor`. This
 suite asserts that round-trips both ways and renders exactly once — the same
 three properties the codex/claude native forwarders are pinned against
 (:mod:`tests.e2e_ui.messages.test_native_codex_render_parity`):
@@ -46,7 +46,7 @@ every PR — :func:`test_native_cursor_mirror_renders_without_live_agent` covers
 the same Omnigent-owned half (the forwarder mirroring cursor's transcript OUT as
 conversation items the SPA renders as bubbles) with no live ``cursor-agent`` and
 no LLM. ``cursor-agent`` has no OpenAI-compatible / custom-endpoint shim (see
-``omnigent.inner.cursor_harness``), so it cannot be pointed at the mock LLM the
+``omnigent.harnesses.cursor.harness``), so it cannot be pointed at the mock LLM the
 custom-agent suites use; instead this test seeds a cursor chat store and runs the
 real :func:`omnigent.harnesses.cursor_native.forwarder.forward_cursor_store_to_session`
 against the spawned server, so the mirror→server→web path runs on every PR.

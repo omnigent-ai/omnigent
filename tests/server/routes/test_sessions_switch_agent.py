@@ -1032,7 +1032,7 @@ def test_switch_checks_attachment_history_before_mutation(
     if old_runtime:
         from fastapi import HTTPException
 
-        from omnigent.server.routes._sessions import helpers
+        from omnigent.server.routes.sessions import helpers
 
         source.host_id, source.runner_id = "host-old", "runner-old"
 

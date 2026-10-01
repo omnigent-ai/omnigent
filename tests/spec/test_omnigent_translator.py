@@ -16,10 +16,10 @@ from __future__ import annotations
 
 import pytest
 
+from omnigent.core.datamodel import AgentDef, OSEnvSpec
+from omnigent.core.datamodel import ExecutorSpec as OmniExecutorSpec
+from omnigent.core.tools import AgentTool, FunctionTool
 from omnigent.errors import OmnigentError
-from omnigent.inner.datamodel import AgentDef, OSEnvSpec
-from omnigent.inner.datamodel import ExecutorSpec as OmniExecutorSpec
-from omnigent.inner.tools import AgentTool, FunctionTool
 from omnigent.spec import (
     AgentSpec,
     ExecutorSpec,

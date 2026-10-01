@@ -35,11 +35,9 @@ import importlib
 from collections.abc import Callable
 from typing import Any, TypeAlias, cast
 
-from omnigent.errors import ErrorCode, OmnigentError
-from omnigent.harness_aliases import canonicalize_harness
-from omnigent.inner.datamodel import AgentDef, OSEnvSpec, TerminalEnvSpec
-from omnigent.inner.datamodel import ExecutorSpec as OmniExecutorSpec
-from omnigent.inner.tools import (
+from omnigent.core.datamodel import AgentDef, OSEnvSpec, TerminalEnvSpec
+from omnigent.core.datamodel import ExecutorSpec as OmniExecutorSpec
+from omnigent.core.tools import (
     AgentTool,
     CancellableFunctionTool,
     FunctionTool,
@@ -48,6 +46,8 @@ from omnigent.inner.tools import (
     Tool,
     _schema_from_callable,
 )
+from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.harnesses.aliases import canonicalize_harness
 from omnigent.llms.routing import infer_harness_from_model as _infer_harness_from_model
 from omnigent.spec.types import (
     AgentSpec,
@@ -859,7 +859,7 @@ def _resolve_profile_to_connection(profile: str) -> dict[str, str] | None:
     # Import locally to avoid a top-level dependency on omnigent
     # runtime details from the spec module — only this single
     # translator path needs it.
-    from omnigent.inner.databricks_executor import _read_databrickscfg
+    from omnigent.harnesses.databricks.executor import _read_databrickscfg
 
     creds = _read_databrickscfg(profile)
     if creds is None:
@@ -979,7 +979,7 @@ def agent_def_to_agent_spec(
     _fail_on_unsupported_concepts_def(agent_def)
     name = _translate_name_from_def(agent_def.name)
     # ``instructions:`` (resolved from a sibling file or inline text by
-    # ``omnigent.inner.loader.load_agent_def``) wins over ``prompt:``
+    # ``omnigent.core.loader.load_agent_def``) wins over ``prompt:``
     # when both are present. Authors who write ``instructions:
     # AGENTS.md`` are deliberately pointing at a file, and the
     # alternative — silently dropping it in favor of an inline
@@ -1356,7 +1356,7 @@ def _agent_tool_to_sub_spec(
     :param raw_executor: The raw ``executor:`` dict for this inline
         AgentTool taken directly from the parent's YAML (before
         omnigent' dataclass parsing dropped unknown keys). When set,
-        fields the omnigent :class:`~omnigent.inner.datamodel.ExecutorSpec`
+        fields the omnigent :class:`~omnigent.core.datamodel.ExecutorSpec`
         datamodel does not expose — ``auth`` and ``use_responses`` —
         are read from this dict and forwarded into the child's
         :class:`ExecutorSpec` via :func:`_translate_executor_from_def`.
@@ -1681,7 +1681,7 @@ def _translate_executor_from_def(
         into ``executor.config`` so the harness subprocess reads the
         correct API surface and reasoning replay policy. The omnigent
         loader silently drops unknown fields on its own
-        :class:`~omnigent.inner.datamodel.ExecutorSpec`, so we
+        :class:`~omnigent.core.datamodel.ExecutorSpec`, so we
         have to recover this field from the raw dict here.
     :returns: An :class:`ExecutorSpec` with ``type="omnigent"``
         when a harness is known.
@@ -1710,7 +1710,7 @@ def _translate_executor_from_def(
     # ``runner/app.py``). Canonicalizing it away here silently spawned the first
     # configured agent instead of the requested one, so keep the full id for
     # ``acp:`` and canonicalize everything else (so aliases still resolve).
-    # Mirrors ``_materialize_harness_launcher_file`` in ``omnigent/cli.py``.
+    # Mirrors ``_materialize_harness_launcher_file`` in ``omnigent/cli/commands.py``.
     _canonical_harness = canonicalize_harness(harness) or ""
     harness = harness if _canonical_harness == "acp" and ":" in harness else _canonical_harness
     profile = oa_executor.profile if oa_executor is not None else None

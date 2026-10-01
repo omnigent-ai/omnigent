@@ -39,9 +39,9 @@ import time
 from pathlib import Path
 from typing import BinaryIO
 
-from omnigent.inner import _proc
-from omnigent.process_logging import child_logging_popen_kwargs
+from omnigent.observability.process_logging import child_logging_popen_kwargs
 from omnigent.runner._zygote import ZYGOTE_CONTROL_FD_ENV_VAR
+from omnigent.util import proc as _proc
 
 logger = logging.getLogger(__name__)
 

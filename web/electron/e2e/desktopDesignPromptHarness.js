@@ -113,7 +113,7 @@ async function startDesignBackend(tmpDir) {
       "server",
       [
         "-c",
-        "from omnigent.cli import main; main()",
+        "from omnigent.cli.commands import main; main()",
         "server",
         "--host",
         "127.0.0.1",

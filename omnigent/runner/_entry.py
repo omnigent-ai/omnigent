@@ -26,17 +26,17 @@ from typing import TYPE_CHECKING, cast
 import httpx
 from fastapi import FastAPI
 
-from omnigent._platform import IS_WINDOWS, normalize_interactive_shells
-from omnigent.debug_logging import debug_event, runner_primary_session_id
-from omnigent.inner import _proc
+from omnigent.observability.debug_logging import debug_event, runner_primary_session_id
 from omnigent.runner.transports.ws_tunnel.serve import RUNNER_TUNNEL_REJECTION_PREFIX
+from omnigent.util import proc as _proc
+from omnigent.util.portability import IS_WINDOWS, normalize_interactive_shells
 from omnigent.util.threaded_auth import ThreadedAuth
 from omnigent.version import VERSION
 
 if TYPE_CHECKING:
     from types import TracebackType
 
-    from omnigent.runner.native import ResolvedSpec
+    from omnigent.runner.native.orchestration import ResolvedSpec
     from omnigent.runner.transports.ws_tunnel.serve import _ASGIApp
     from omnigent.spec.types import AgentSpec
 
@@ -76,7 +76,7 @@ _runner_auth_factory: Callable[[], str | None] | None = None
 
 def _host_interactive_shells_from_env() -> list[str] | None:
     """Read the host daemon's ordered shell inventory from runner wiring."""
-    from omnigent.runner.identity import RUNNER_INTERACTIVE_SHELLS_ENV_VAR
+    from omnigent.util.runner_identity import RUNNER_INTERACTIVE_SHELLS_ENV_VAR
 
     raw = os.environ.get(RUNNER_INTERACTIVE_SHELLS_ENV_VAR)
     if raw is None:
@@ -91,7 +91,7 @@ def _host_interactive_shells_from_env() -> list[str] | None:
 
 def _apply_host_interactive_shells(spec: AgentSpec) -> None:
     """Replace a native wrapper's portable terminals with its host inventory."""
-    from omnigent.native.native_coding_agents import (
+    from omnigent.harnesses.native.coding_agents import (
         native_coding_agent_for_agent_name,
         native_shell_terminal_specs,
     )
@@ -347,7 +347,7 @@ class _RunnerDatabricksAuth(ThreadedAuth):
         # account (the forwarder's POST /events otherwise 403s). Empty when
         # none recorded. Set once here; it persists across the retry yield.
         if self._server_url:
-            from omnigent.cli_auth import databricks_request_headers
+            from omnigent.cli.auth import databricks_request_headers
 
             request.headers.update(databricks_request_headers(self._server_url))
         if self._factory is not None:
@@ -637,7 +637,7 @@ def _make_auth_token_factory(
     # Consume the host bearer before any credential discovery. Removing it
     # from os.environ here ensures later harness/terminal children cannot
     # inherit it even if a spawn path bypasses the standard secret scrubber.
-    from omnigent.runner.identity import (
+    from omnigent.util.runner_identity import (
         RUNNER_DELEGATED_AUTH_ENV_VAR,
         RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR,
         RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR,
@@ -655,7 +655,7 @@ def _make_auth_token_factory(
         )
         return _InitialAuthTokenFactory(initial_token, resolved_server_url)
 
-    from omnigent.inner.databricks_executor import _ReusedDatabricksTokenSource
+    from omnigent.harnesses.databricks.executor import _ReusedDatabricksTokenSource
 
     # Prefer the host-launched runner's owner-bound capability so user
     # credentials stay out of the runner and credential discovery is skipped.
@@ -683,7 +683,7 @@ def _make_auth_token_factory(
         """
         # Check stored OIDC token first.
         if resolved_server_url:
-            from omnigent.cli_auth import (
+            from omnigent.cli.auth import (
                 REFRESH_MIN_REMAINING_SECONDS,
                 load_token,
                 refresh_stored_token,
@@ -781,7 +781,7 @@ def _make_managed_mint_factory(
         latches ``proxy_auth_failed`` instead, which
         :class:`_InitialAuthTokenFactory` answers by re-resolving SDK/OIDC.
     """
-    from omnigent.runner.identity import token_bound_runner_id
+    from omnigent.util.runner_identity import token_bound_runner_id
 
     runner_id = token_bound_runner_id(binding_token)
     mint_url = f"{server_url.rstrip('/')}/v1/runners/{runner_id}/token"
@@ -1014,8 +1014,8 @@ def _mint_managed_owner_token(
     """
     from omnigent_client._http import is_loopback_url
 
-    from omnigent.cli_auth import databricks_request_headers
-    from omnigent.runner.identity import (
+    from omnigent.cli.auth import databricks_request_headers
+    from omnigent.util.runner_identity import (
         OMNIGENT_INTERNAL_WS_ORIGIN,
         RUNNER_TUNNEL_TOKEN_HEADER,
     )
@@ -1040,7 +1040,7 @@ def _runner_tunnel_binding_token_from_env() -> str | None:
         per-tunnel binding.
     :raises RuntimeError: If the token env var is set but empty.
     """
-    from omnigent.runner.identity import RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR
+    from omnigent.util.runner_identity import RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR
 
     token = os.environ.get(RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR)
     if token is None:
@@ -1062,7 +1062,7 @@ def _runner_parent_pid_from_env() -> int | None:
     :raises RuntimeError: If the configured parent pid is empty,
         non-integer, or not positive.
     """
-    from omnigent.runner.identity import RUNNER_PARENT_PID_ENV_VAR
+    from omnigent.util.runner_identity import RUNNER_PARENT_PID_ENV_VAR
 
     raw_parent_pid = os.environ.get(RUNNER_PARENT_PID_ENV_VAR)
     if raw_parent_pid is None:
@@ -1081,7 +1081,7 @@ def _runner_parent_pid_from_env() -> int | None:
 
 def _runner_host_owns_global_cleanup_from_env() -> bool:
     """Return whether the host daemon owns machine-global cleanup."""
-    from omnigent.runner.identity import RUNNER_HOST_OWNS_GLOBAL_CLEANUP_ENV_VAR
+    from omnigent.util.runner_identity import RUNNER_HOST_OWNS_GLOBAL_CLEANUP_ENV_VAR
 
     return os.environ.get(RUNNER_HOST_OWNS_GLOBAL_CLEANUP_ENV_VAR) == "1"
 
@@ -1198,7 +1198,7 @@ def _runner_workspace_from_env() -> Path | None:
         affinity.
     :raises RuntimeError: If the workspace env var is set but empty.
     """
-    from omnigent.runner.identity import RUNNER_WORKSPACE_ENV_VAR
+    from omnigent.util.runner_identity import RUNNER_WORKSPACE_ENV_VAR
 
     raw = os.environ.get(RUNNER_WORKSPACE_ENV_VAR)
     if raw is None:
@@ -1214,7 +1214,7 @@ def _runner_isolate_session_from_env() -> bool:
 
     See :data:`RUNNER_ISOLATE_SESSION_ENV_VAR` for the contract.
     """
-    from omnigent.runner.identity import RUNNER_ISOLATE_SESSION_ENV_VAR
+    from omnigent.util.runner_identity import RUNNER_ISOLATE_SESSION_ENV_VAR
 
     return os.environ.get(RUNNER_ISOLATE_SESSION_ENV_VAR, "").strip() == "1"
 
@@ -1270,7 +1270,7 @@ async def _resolve_agent_spec_from_server(
     :raises RuntimeError: If the server returns a non-200 status
         other than 404.
     """
-    from omnigent.runner.native import ResolvedSpec
+    from omnigent.runner.native.orchestration import ResolvedSpec
     from omnigent.spec import load
 
     if session_id is None:
@@ -1331,9 +1331,10 @@ def create_app(
         the app builds its own.
     :returns: A runner FastAPI app exposing the harness-contract subset.
     """
-    from omnigent.cli_auth import open_server_client
+    from omnigent.cli.auth import open_server_client
+    from omnigent.harnesses.runtime.process_manager import HarnessProcessManager
     from omnigent.runner.app import create_runner_app
-    from omnigent.runner.identity import (
+    from omnigent.util.runner_identity import (
         OMNIGENT_INTERNAL_WS_ORIGIN,
         OMNIGENT_SESSION_ENV_VALUE,
         OMNIGENT_SESSION_ENV_VAR,
@@ -1341,7 +1342,6 @@ def create_app(
         RUNNER_TUNNEL_TOKEN_HEADER,
         get_stable_runner_id,
     )
-    from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
 
     server_url = _server_url_from_env()
     runner_workspace = _runner_workspace_from_env()
@@ -1455,8 +1455,8 @@ def create_app(
     host_owns_global_cleanup = _runner_host_owns_global_cleanup_from_env()
 
     # Out-of-process runner owns its own TerminalRegistry.
-    from omnigent.inner.terminal import reap_orphaned_terminals
     from omnigent.terminals import TerminalRegistry
+    from omnigent.terminals.terminal import reap_orphaned_terminals
 
     _terminal_registry = TerminalRegistry(conversation_link_base_url=server_url)
     if not host_owns_global_cleanup:
@@ -1469,7 +1469,7 @@ def create_app(
             )
 
         try:
-            from omnigent.native.native_bridge_common import reap_orphaned_native_bridge_dirs
+            from omnigent.harnesses.native.bridge_common import reap_orphaned_native_bridge_dirs
 
             _reaped_bridge_dirs = reap_orphaned_native_bridge_dirs()
             if _reaped_bridge_dirs:
@@ -1563,7 +1563,7 @@ def create_app(
         if _pane_reaper is not None:
             await _pane_reaper.shutdown()
         # Host shutdown skips per-session deletion, so close native servers here.
-        from omnigent.runner.native import (
+        from omnigent.runner.native.orchestration import (
             teardown_all_codex_native_app_servers,
             teardown_all_opencode_native_servers,
         )
@@ -1640,8 +1640,8 @@ async def _run_tunnel_from_env() -> None:
     """
     from concurrent.futures import ThreadPoolExecutor
 
-    from omnigent.runner.identity import get_stable_runner_id
     from omnigent.runner.transports.ws_tunnel.serve import serve_tunnel
+    from omnigent.util.runner_identity import get_stable_runner_id
 
     # Bound the asyncio default executor before anything uses it (create_app,
     # telemetry, and every to_thread offload). Setting it here means Python's
@@ -1673,7 +1673,7 @@ async def _run_tunnel_from_env() -> None:
     # can emit spans for agent turns, tool calls, and LLM interactions.
     # No-op when OTEL_EXPORTER_OTLP_ENDPOINT is unset.
     try:
-        from omnigent.runtime import telemetry
+        from omnigent.observability import otel as telemetry
 
         telemetry.init("omni-runner")
     except Exception:  # noqa: BLE001 — best-effort; tracing failure must not crash the runner
@@ -1987,7 +1987,7 @@ def _install_signal_handlers(
     for sig in (signal.SIGINT, signal.SIGTERM):
         _try_add_handler(sig, _handle_shutdown_signal, sig)
     if adopted_event is not None:
-        from omnigent.runner.identity import RUNNER_ADOPT_SIGNAL
+        from omnigent.util.runner_identity import RUNNER_ADOPT_SIGNAL
 
         if RUNNER_ADOPT_SIGNAL is None:
             return
@@ -2052,8 +2052,8 @@ def _maybe_prewarm_ambient_detection() -> None:
     runners and hosts that predate it), so other harnesses don't pay a
     speculative subprocess on every launch.
     """
-    from omnigent.harness_plugins import CLAUDE_NATIVE_CODING_AGENT
-    from omnigent.runner.identity import RUNNER_LAUNCH_HARNESS_ENV_VAR
+    from omnigent.harnesses.registry import CLAUDE_NATIVE_CODING_AGENT
+    from omnigent.util.runner_identity import RUNNER_LAUNCH_HARNESS_ENV_VAR
 
     if os.environ.get(RUNNER_LAUNCH_HARNESS_ENV_VAR) != CLAUDE_NATIVE_CODING_AGENT.harness:
         return
@@ -2067,7 +2067,7 @@ def main() -> None:
 
     :returns: None.
     """
-    from omnigent.process_logging import configure_process_logging
+    from omnigent.observability.process_logging import configure_process_logging
 
     # Spawned with -P, so the workspace is not on sys.path. Re-add it now that
     # the real omnigent is imported (it can no longer be shadowed) so

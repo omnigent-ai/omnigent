@@ -35,16 +35,15 @@ from pathlib import Path
 
 import omnigent.onboarding.gemini_auth as _gemini_auth
 import omnigent.onboarding.kimi_auth as _kimi_auth
-from omnigent._platform import IS_WINDOWS, resolve_cli_binary
-from omnigent.harness_aliases import HARNESS_ALIASES, NATIVE_HARNESSES, canonicalize_harness
-from omnigent.harness_availability import (
+from omnigent.harnesses.aliases import HARNESS_ALIASES, NATIVE_HARNESSES, canonicalize_harness
+from omnigent.harnesses.availability import (
     CODEX_CANONICAL_HARNESSES,
     HARNESS_BINARY_MISSING,
     HARNESS_NEEDS_AUTH,
     HARNESS_VERSION_TOO_LOW,
     HarnessAvailability,
 )
-from omnigent.harness_plugins import harness_install_keys, valid_harnesses
+from omnigent.harnesses.registry import harness_install_keys, valid_harnesses
 from omnigent.onboarding.harness_install import (
     COPILOT_KEY,
     CURSOR_KEY,
@@ -75,6 +74,7 @@ from omnigent.onboarding.provider_config import (
     default_provider_for_harness,
     load_config,
 )
+from omnigent.util.portability import IS_WINDOWS, resolve_cli_binary
 
 # In-process SDK harnesses: no CLI binary to gate on. The launch gate never
 # blocks them (spec-level auth is invisible here), but the picker map reports
@@ -277,7 +277,7 @@ def _harness_availability_core(harness: str) -> HarnessAvailability:
         # also gate on SDK presence: this mirrors ``antigravity`` (also SDK-only
         # and now-optional, never gated on the SDK). A missing SDK surfaces as
         # the executor's import error on the first turn
-        # (:mod:`omnigent.inner.cursor_executor`); gating here would only
+        # (:mod:`omnigent.harnesses.cursor.executor`); gating here would only
         # duplicate that, less actionably. So cursor keeps its single key check.
         from omnigent.onboarding.cursor_auth import cursor_api_key_configured
 

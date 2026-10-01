@@ -24,7 +24,7 @@ given capability:
 2. **The `Executor` capability flags** — `supports_streaming()`,
    `supports_live_message_queue()`, `supports_tool_boundary_interrupt()`,
    `supports_stepwise_internal_turns()`, `handles_tools_internally()` in
-   `omnigent/inner/executor.py:541`.
+   `omnigent/core/executor.py:541`.
 3. **`omnigent/model_override.py`** — already encodes per-harness facts
    declaratively (`_SDK_MODEL_OVERRIDE_HARNESSES`, the `_*_FAMILY_HARNESSES`
    sets, single- vs multi-model rules).
@@ -57,7 +57,7 @@ production surprise.
 ## Key constraint: registration is a hardcoded dict today
 
 Harnesses register via a literal `_HARNESS_MODULES: dict[str, str]` mapping
-harness name to module path in `omnigent/runtime/harnesses/__init__.py:34`.
+harness name to module path in `omnigent/harnesses/runtime/__init__.py:34`.
 There is **no entry-point / plugin discovery** mechanism. An out-of-repo harness
 cannot even register without editing that file — the same shared-file conflict
 pain tracked in #899, whose proposed fix was per-harness self-registration.

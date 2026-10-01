@@ -14,7 +14,7 @@ from pathlib import Path
 import httpx
 from playwright.sync_api import Page, expect
 
-from omnigent.inner.hook_scripts.subagent_router import build_route_request
+from omnigent.harnesses.native.hook_scripts.subagent_router import build_route_request
 from omnigent.runner.subagent_routing import make_server_relay_resolver, start_subagent_router
 from tests.e2e_ui.conftest import seed_committed_turn
 

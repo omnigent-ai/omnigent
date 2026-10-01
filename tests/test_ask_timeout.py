@@ -15,9 +15,9 @@ unreachable server still fails out promptly. If any delivery budget drops
 below ``DEFAULT_ASK_TIMEOUT`` again, these fail loudly.
 """
 
+import omnigent.harnesses.runtime._scaffold as scaffold
 import omnigent.runner.pending_approvals as pending_approvals
 import omnigent.runner.tool_dispatch as tool_dispatch
-import omnigent.runtime.harnesses._scaffold as scaffold
 from omnigent.runner import policy_proxy
 from omnigent.spec.types import DEFAULT_ASK_TIMEOUT
 

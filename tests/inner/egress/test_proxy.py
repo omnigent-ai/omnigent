@@ -1,4 +1,4 @@
-"""Tests for omnigent.inner.egress.proxy — MITM proxy with rule enforcement."""
+"""Tests for omnigent.sandbox.egress.proxy — MITM proxy with rule enforcement."""
 
 from __future__ import annotations
 
@@ -16,17 +16,17 @@ from unittest.mock import Mock
 
 import pytest
 
-from omnigent.inner.credential_proxy import (
+from omnigent.sandbox.core import SandboxPolicy
+from omnigent.sandbox.credential_proxy import (
     SYNTHETIC_CREDENTIAL_PREFIX,
     CredentialRewriteRule,
     RefreshingSecretProvider,
     prepare_credential_proxy_runtime,
 )
-from omnigent.inner.egress.ca import ensure_ca, ensure_ca_bundle
-from omnigent.inner.egress.certs import HostCertCache
-from omnigent.inner.egress.proxy import EgressProxy
-from omnigent.inner.egress.rules import parse_rules
-from omnigent.inner.sandbox import SandboxPolicy
+from omnigent.sandbox.egress.ca import ensure_ca, ensure_ca_bundle
+from omnigent.sandbox.egress.certs import HostCertCache
+from omnigent.sandbox.egress.proxy import EgressProxy
+from omnigent.sandbox.egress.rules import parse_rules
 from omnigent.spec.parser import _parse_credential_proxy
 
 
@@ -2133,7 +2133,7 @@ async def test_running_proxy_refreshes_after_idle_and_recovers_from_source_failu
     token_file.write_text("startup-token")
     clock = Mock(return_value=0.0)
     monkeypatch.setattr(
-        "omnigent.inner.credential_proxy.RefreshingSecretProvider",
+        "omnigent.sandbox.credential_proxy.RefreshingSecretProvider",
         partial(RefreshingSecretProvider, clock=clock),
     )
     spec = _parse_credential_proxy(

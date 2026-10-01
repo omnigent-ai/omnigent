@@ -115,7 +115,7 @@ def _register_mcp_echo_agent(
             tar.addfile(info, io.BytesIO(yaml_bytes))
         bundle = buf.getvalue()
 
-    from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN
+    from omnigent.util.runner_identity import OMNIGENT_INTERNAL_WS_ORIGIN
 
     resp = client.post(
         "/v1/sessions",

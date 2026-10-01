@@ -671,7 +671,7 @@ async def test_native_wrapper_task_stamps_terminal_first_labels() -> None:
     so the web UI shows the Chat/Terminal switcher; the fire path must stamp the
     same labels or the session renders Chat-only with no way to its terminal.
     """
-    from omnigent.native.native_coding_agents import PI_NATIVE_AGENT_NAME
+    from omnigent.harnesses.native.coding_agents import PI_NATIVE_AGENT_NAME
 
     conv_store = FakeConversationStore()
     store = FakeScheduledTaskStore(rows={"task_1": _task()})
@@ -756,7 +756,7 @@ async def test_native_wrapper_labels_resolve_without_agent_cache() -> None:
     cache dependency — a deployment with no fire-deps cache must not silently
     drop the switcher for a Pi/OpenCode/etc. automation.
     """
-    from omnigent.native.native_coding_agents import PI_NATIVE_AGENT_NAME
+    from omnigent.harnesses.native.coding_agents import PI_NATIVE_AGENT_NAME
 
     conv_store = FakeConversationStore()
     store = FakeScheduledTaskStore(rows={"task_1": _task()})

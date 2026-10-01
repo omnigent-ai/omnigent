@@ -61,7 +61,7 @@ Mutations are tightly gated:
 These were checked by reading the code during the initial audit and are safe to
 dismiss as false positives:
 
-- `py/clear-text-logging-sensitive-data` @ `omnigent/inner/claude_sdk_executor.py`
+- `py/clear-text-logging-sensitive-data` @ `omnigent/harnesses/claude_sdk/executor.py`
   — the `logger.info` logs `model / gateway / base_url / tool-count`, no secret.
 - `py/weak-sensitive-data-hashing` @ `omnigent/model_catalog.py:225` — SHA256 is
   used to build a non-secret 16-char **cache fingerprint**, not to store a

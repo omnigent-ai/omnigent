@@ -13,9 +13,9 @@ from pathlib import Path
 import pytest
 import tomllib
 
+from omnigent.core.executor import ExecutorError, TurnComplete
+from omnigent.harnesses.codex.harness import _build_codex_executor
 from omnigent.harnesses.codex_native.app_server import resolve_native_codex_launch
-from omnigent.inner.codex_harness import _build_codex_executor
-from omnigent.inner.executor import ExecutorError, TurnComplete
 from omnigent.runtime.workflow import _build_codex_spawn_env
 from omnigent.spec.types import AgentSpec, ApiKeyAuth, ExecutorSpec
 from tests.e2e._harness_probes import cli_unavailable_reason

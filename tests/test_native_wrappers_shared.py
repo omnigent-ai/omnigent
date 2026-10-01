@@ -14,7 +14,6 @@ import asyncio
 import contextlib
 import importlib
 import json
-import warnings
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -627,7 +626,7 @@ class _Recorder:
             "headers": {},
             "session_id": None,
             "session_bundle": b"bundle",
-            f"{self.w.key}_args": (),
+            "extra_args": (),
             "host_id": "host_1",
             "workspace": "/work",
             "startup_progress": SimpleNamespace(update=self.progress.append),
@@ -649,7 +648,7 @@ def daemon(w: _Wrapper, monkeypatch: pytest.MonkeyPatch) -> _Recorder:
 async def test_prepare_fresh_session_creates_launches_and_waits(
     w: _Wrapper, daemon: _Recorder
 ) -> None:
-    prepared = await daemon.prepare(**{f"{w.key}_args": ("--fast",)})
+    prepared = await daemon.prepare(extra_args=("--fast",))
 
     assert prepared.session_id == "conv_new" and prepared.terminal_id == "terminal_ready"
     assert prepared.reattached is False
@@ -695,7 +694,7 @@ async def test_prepare_reattaches_to_a_live_terminal(
 ) -> None:
     daemon.running = _launched(w, "terminal_live")
 
-    prepared = await daemon.prepare(session_id="conv_1", **{f"{w.key}_args": ("--x",)})
+    prepared = await daemon.prepare(session_id="conv_1", extra_args=("--x",))
 
     assert prepared.reattached is True and prepared.terminal_id == "terminal_live"
     assert "launch" not in daemon.names() and "patch" not in daemon.names()
@@ -733,7 +732,7 @@ async def test_prepare_relaunches_an_exited_terminal(w: _Wrapper, daemon: _Recor
 async def test_prepare_persists_new_launch_args_when_relaunching(
     w: _Wrapper, daemon: _Recorder
 ) -> None:
-    await daemon.prepare(session_id="conv_1", **{f"{w.key}_args": ("--new",)})
+    await daemon.prepare(session_id="conv_1", extra_args=("--new",))
 
     assert ("patch", "/v1/sessions/conv_1", {"terminal_launch_args": ["--new"]}) in daemon.events
     assert f"Updating {w.label} session..." in daemon.progress
@@ -743,7 +742,7 @@ async def test_prepare_surfaces_launch_arg_update_failures(w: _Wrapper, daemon: 
     daemon.patch_status = 500
 
     with pytest.raises(click.ClickException) as excinfo:
-        await daemon.prepare(session_id="conv_1", **{f"{w.key}_args": ("--new",)})
+        await daemon.prepare(session_id="conv_1", extra_args=("--new",))
 
     assert f"{w.label} session launch config update failed (500): nope" in excinfo.value.message
     assert "launch" not in daemon.names()
@@ -792,24 +791,7 @@ def test_run_native_generates_spec_and_delegates(
     assert call["spec_exists"] is True
     assert call["session_id"] == "conv_1" and call["resume_picker"] is True
     assert call["auto_open_conversation"] is True
-    assert call[f"{w.key}_args"] == ("--a", "--b")
-
-
-def test_run_native_accepts_the_deprecated_args_alias(
-    w: _Wrapper, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setattr(w.module, "_preflight_local_tools", lambda: None)
-    calls: list[dict[str, Any]] = []
-    monkeypatch.setattr(
-        w.module, "_run_with_remote_server", lambda base_url, spec_path, **kw: calls.append(kw)
-    )
-
-    with warnings.catch_warnings(record=True) as caught:
-        warnings.simplefilter("always")
-        w.fn("run_{k}_native")(server="http://s", session_id=None, **{f"{w.key}_args": ("--old",)})
-
-    assert calls[0][f"{w.key}_args"] == ("--old",)
-    assert any(issubclass(item.category, DeprecationWarning) for item in caught)
+    assert call["extra_args"] == ("--a", "--b")
 
 
 @dataclass
@@ -825,10 +807,10 @@ def remote(w: _Wrapper, monkeypatch: pytest.MonkeyPatch) -> _RemoteHarness:
     events: list[tuple[Any, ...]] = []
     prepared = replace(_prepared(w, Path("/tmp/s"), "t:0"), session_id="conv_prepared")
 
-    monkeypatch.setattr("omnigent.chat._remote_headers", lambda **kw: {"X-Auth": "1"})
-    monkeypatch.setattr("omnigent.chat._bundle_agent", lambda path: b"bundled")
+    monkeypatch.setattr("omnigent.cli.chat._remote_headers", lambda **kw: {"X-Auth": "1"})
+    monkeypatch.setattr("omnigent.cli.chat._bundle_agent", lambda path: b"bundled")
     monkeypatch.setattr(
-        "omnigent.cli._ensure_host_daemon", lambda url: events.append(("daemon", url))
+        "omnigent.cli.commands._ensure_host_daemon", lambda url: events.append(("daemon", url))
     )
     monkeypatch.setattr(
         "omnigent.host.identity.load_or_create_host_identity",
@@ -872,7 +854,7 @@ def _run_remote(w: _Wrapper, **overrides: Any) -> None:
     kwargs: dict[str, Any] = {
         "session_id": None,
         "resume_picker": False,
-        f"{w.key}_args": (),
+        "extra_args": (),
         "auto_open_conversation": False,
     }
     kwargs.update(overrides)
@@ -949,25 +931,9 @@ def pi() -> ModuleType:
     return importlib.import_module("omnigent.harnesses.pi_native.main")
 
 
-def test_pi_prefers_canonical_path_env_over_legacy(pi: ModuleType) -> None:
-    env = {"OMNIGENT_PI_PATH": " /new/pi ", "HARNESS_PI_PATH": "/old/pi"}
-
-    assert pi._configured_pi_command(env) == "/new/pi"
-
-
-def test_pi_falls_back_to_deprecated_env_with_a_warning(
-    pi: ModuleType, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    warned: list[tuple[str, str]] = []
-    monkeypatch.setattr(
-        "omnigent.harness_startup_config._warn_legacy_path",
-        lambda legacy, canonical: warned.append((legacy, canonical)),
-    )
-
-    assert pi._configured_pi_command({"HARNESS_PI_PATH": " /old/pi "}) == "/old/pi"
-    assert warned == [("HARNESS_PI_PATH", "OMNIGENT_PI_PATH")]
+def test_pi_uses_canonical_path_env(pi: ModuleType) -> None:
+    assert pi._configured_pi_command({"OMNIGENT_PI_PATH": " /new/pi "}) == "/new/pi"
     assert pi._configured_pi_command({}) == "pi"
-    assert warned == [("HARNESS_PI_PATH", "OMNIGENT_PI_PATH")]
 
 
 class _Completed:

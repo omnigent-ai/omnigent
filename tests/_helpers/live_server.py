@@ -1,5 +1,5 @@
 """
-Shared startup helpers for real ``omnigent.cli server`` subprocesses.
+Shared startup helpers for real ``omnigent.cli.commands server`` subprocesses.
 
 Use :func:`isolated_local_server` for single-user regression tests with a
 temporary database and local header auth. It owns startup, health polling,
@@ -11,7 +11,7 @@ The credential/profile-aware API provides three primitives:
 - :func:`find_free_port` — pick a free TCP port for the server.
 - :func:`make_live_server_fixture` — factory that builds a
   session-scoped pytest fixture starting a real
-  ``omnigent.cli server`` subprocess. The subprocess inherits
+  ``omnigent.cli.commands server`` subprocess. The subprocess inherits
   per-harness env vars per the harness/profile selection.
 - :func:`upload_agent` — tar+gzip an agent directory and upload
   via multipart ``POST /v1/sessions``.
@@ -121,7 +121,7 @@ def terminate_process(proc: subprocess.Popen[bytes] | subprocess.Popen[str] | No
 def isolated_local_server(
     tmp_path: Path,
     *,
-    bootstrap: str = "from omnigent.cli import main\n\nmain()\n",
+    bootstrap: str = "from omnigent.cli.commands import main\n\nmain()\n",
     poll_interval: float = 0.5,
     health_timeout: float = 120.0,
 ) -> Iterator[str]:
@@ -252,7 +252,7 @@ def start_live_server(
     log_path: Path,
 ) -> tuple[subprocess.Popen[bytes], str]:
     """
-    Spawn an ``omnigent.cli server`` subprocess and wait for
+    Spawn an ``omnigent.cli.commands server`` subprocess and wait for
     health.
 
     :param creds: Harness credentials to thread into the subprocess.
@@ -287,7 +287,7 @@ def start_live_server(
             # system Python 2.7 and SyntaxError.
             server_executable(),
             "-m",
-            "omnigent.cli",
+            "omnigent.cli.commands",
             "server",
             "--port",
             str(port),
@@ -328,7 +328,7 @@ def make_live_server_fixture(
 ):
     """
     Build a session-scoped pytest fixture starting an
-    ``omnigent.cli server`` subprocess.
+    ``omnigent.cli.commands server`` subprocess.
 
     Returned fixture yields the server's base URL. Teardown sends
     SIGTERM, escalates to SIGKILL after 10s.

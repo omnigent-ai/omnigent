@@ -51,8 +51,8 @@ import httpx
 
 from omnigent.harnesses.cursor_native import status as cursor_native_status
 from omnigent.harnesses.cursor_native.bridge import FORK_HISTORY_CLOSE_TAG, FORK_HISTORY_OPEN_TAG
-from omnigent.inner.native_attachments import ATTACHMENT_MARKER_STRIP_PATTERN
-from omnigent.native._native_post_delivery import post_may_have_been_delivered
+from omnigent.harnesses.native.post_delivery import post_may_have_been_delivered
+from omnigent.util.attachments import ATTACHMENT_MARKER_STRIP_PATTERN
 
 _logger = logging.getLogger(__name__)
 

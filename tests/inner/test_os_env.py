@@ -1,4 +1,4 @@
-"""Unit tests for :mod:`omnigent.inner.os_env` helper-env construction."""
+"""Unit tests for :mod:`omnigent.environments.os_env` helper-env construction."""
 
 from __future__ import annotations
 
@@ -11,8 +11,8 @@ from pathlib import Path
 
 import pytest
 
-from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
-from omnigent.inner.os_env import (
+from omnigent.core.datamodel import OSEnvSandboxSpec, OSEnvSpec
+from omnigent.environments.os_env import (
     _child_shell_env,
     _project_root,
     _read_impl,
@@ -20,8 +20,8 @@ from omnigent.inner.os_env import (
     build_helper_env,
     create_os_environment,
 )
-from omnigent.inner.sandbox import SandboxPolicy
-from omnigent.runner.identity import (
+from omnigent.sandbox.core import SandboxPolicy
+from omnigent.util.runner_identity import (
     OMNIGENT_SESSION_ENV_VALUE,
     OMNIGENT_SESSION_ENV_VAR,
     RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR,

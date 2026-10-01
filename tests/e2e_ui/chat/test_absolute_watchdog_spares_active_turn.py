@@ -123,7 +123,7 @@ def short_watchdog_runner(
 
     The harness scaffold reads ``HARNESS_TURN_ABSOLUTE_TIMEOUT_S`` /
     ``HARNESS_TURN_TIMEOUT_S`` from its process environment at import
-    (``omnigent/runtime/harnesses/_scaffold.py``), and the runner's
+    (``omnigent/harnesses/runtime/_scaffold.py``), and the runner's
     ``_build_harness_spawn_env`` passes the runner's own environment through
     to every spawned harness. A dedicated runner (same pattern as
     ``stub_harness_runner`` in ``test_stop_button_interrupts_turn.py``) keeps
@@ -132,7 +132,7 @@ def short_watchdog_runner(
 
     Yields the runner id to bind sessions to.
     """
-    from omnigent.runner.identity import token_bound_runner_id
+    from omnigent.util.runner_identity import token_bound_runner_id
 
     runner_tmp = tmp_path_factory.mktemp("watchdog_runner")
     log_path = runner_tmp / "runner.log"

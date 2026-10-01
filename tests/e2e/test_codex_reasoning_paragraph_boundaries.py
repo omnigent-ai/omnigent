@@ -14,7 +14,7 @@ Two user-visible failure modes on a Codex-harness session's reasoning stream:
 
 Both stem from the same missing boundary: Codex's app-server emits each
 reasoning paragraph as a distinct item (``item/reasoning/textDelta`` with a
-new ``itemId``), but ``omnigent/inner/codex_executor.py``'s handler ignores
+new ``itemId``), but ``omnigent/harnesses/codex/executor.py``'s handler ignores
 ``itemId`` and emits every delta as a bare ``reasoning_text`` chunk — it
 never emits a ``ReasoningChunk(event_type="reasoning_started")`` marker
 when a new reasoning item begins. Downstream (the workflow's
@@ -60,9 +60,9 @@ from omnigent_client._sse import _parse_event
 from omnigent_client._stream import BlockStream
 from omnigent_client._types import Response
 
-from omnigent.inner.codex_executor import _CodexAppServerSession
-from omnigent.inner.executor import Executor, TurnComplete
-from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+from omnigent.core.executor import Executor, TurnComplete
+from omnigent.harnesses.codex.executor import _CodexAppServerSession
+from omnigent.harnesses.runtime._executor_adapter import ExecutorAdapter
 
 # The exact reasoning text from the bug report's screenshot.
 _PARA_1 = (

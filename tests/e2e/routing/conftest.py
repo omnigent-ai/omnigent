@@ -37,7 +37,7 @@ import httpx
 import pytest
 import yaml
 
-from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN
+from omnigent.util.runner_identity import OMNIGENT_INTERNAL_WS_ORIGIN
 from tests.e2e.routing._helpers import POLL_INTERVAL_S, wait_for
 from tests.e2e.routing._mock_router import MockRouter, serve_mock_router
 
@@ -185,7 +185,7 @@ def routing_server(
         [
             sys.executable,
             "-m",
-            "omnigent.cli",
+            "omnigent.cli.commands",
             "server",
             "--port",
             str(port),

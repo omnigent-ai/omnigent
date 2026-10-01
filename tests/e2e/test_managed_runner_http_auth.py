@@ -56,15 +56,15 @@ from omnigent.runner._entry import (
     _ManagedMintTokenFactory,
     _RunnerDatabricksAuth,
 )
-from omnigent.runner.identity import (
+from omnigent.stores.conversation_store.sqlalchemy_store import (
+    SqlAlchemyConversationStore,
+)
+from omnigent.util.runner_identity import (
     OMNIGENT_INTERNAL_WS_ORIGIN,
     RUNNER_DELEGATED_AUTH_ENV_VAR,
     RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR,
     RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR,
     token_bound_runner_id,
-)
-from omnigent.stores.conversation_store.sqlalchemy_store import (
-    SqlAlchemyConversationStore,
 )
 from tests._helpers.compat import apply_server_env, compat_server_cwd, server_executable
 from tests._helpers.live_server import find_free_port
@@ -153,7 +153,7 @@ def accounts_server(tmp_path: Path) -> Iterator[tuple[str, str]]:
         [
             server_executable(),
             "-m",
-            "omnigent.cli",
+            "omnigent.cli.commands",
             "server",
             "--port",
             str(port),
@@ -363,7 +363,7 @@ def test_managed_runner_callback_authenticates_end_to_end(
     #    Databricks config. Forcing both credential sources to miss is what a
     #    fresh sandbox actually is, and it routes _make_auth_token_factory to
     #    the managed-mint tier under test.
-    from omnigent.inner.databricks_executor import DatabricksAuthError
+    from omnigent.harnesses.databricks.executor import DatabricksAuthError
 
     def _no_databricks_creds(*args: object, **kwargs: object) -> tuple[object, str]:
         """Stand in for _resolve_databricks_auth in a credential-less sandbox."""
@@ -371,9 +371,9 @@ def test_managed_runner_callback_authenticates_end_to_end(
 
     monkeypatch.setenv("RUNNER_SERVER_URL", base_url)
     monkeypatch.setenv(RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR, _BINDING_TOKEN)
-    monkeypatch.setattr("omnigent.cli_auth.load_token", lambda _url, **_kw: None)
+    monkeypatch.setattr("omnigent.cli.auth.load_token", lambda _url, **_kw: None)
     monkeypatch.setattr(
-        "omnigent.inner.databricks_executor._resolve_databricks_auth",
+        "omnigent.harnesses.databricks.executor._resolve_databricks_auth",
         _no_databricks_creds,
     )
 
@@ -440,7 +440,7 @@ def test_managed_runner_survives_mint_403_after_token_expiry(
         monkeypatch.setenv(RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR, _BINDING_TOKEN)
         monkeypatch.setenv(RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR, owner_cookie)
         monkeypatch.setenv(RUNNER_DELEGATED_AUTH_ENV_VAR, "1")
-        monkeypatch.setattr("omnigent.cli_auth.load_token", lambda _url, **_kw: owner_cookie)
+        monkeypatch.setattr("omnigent.cli.auth.load_token", lambda _url, **_kw: owner_cookie)
 
         factory = _make_auth_token_factory()
         assert isinstance(factory, _InitialAuthTokenFactory)

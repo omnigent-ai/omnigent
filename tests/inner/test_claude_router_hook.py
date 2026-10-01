@@ -8,7 +8,7 @@ from typing import Any
 
 import pytest
 
-from omnigent.inner.hook_scripts import claude_router_hook, subagent_router
+from omnigent.harnesses.native.hook_scripts import claude_router_hook, subagent_router
 from omnigent.models.claude_model_vocabulary import claude_model_alias
 from tests.inner.conftest import advertise_relay_tools, advertise_router
 
@@ -588,7 +588,7 @@ class _FakeOptions:
 
 
 def _install() -> _FakeOptions:
-    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+    from omnigent.harnesses.claude_sdk.executor import ClaudeSDKExecutor
 
     options = _FakeOptions()
     ClaudeSDKExecutor()._install_subagent_router_hook(_FakeSDK(), options, "parent-model")  # type: ignore[arg-type]

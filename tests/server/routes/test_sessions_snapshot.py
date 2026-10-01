@@ -418,7 +418,7 @@ async def test_session_snapshot_unresolvable_sub_agent_warns_and_reports_parent(
     monkeypatch.setattr("omnigent.runtime.get_runner_client", lambda: None)
     monkeypatch.setattr("omnigent.runtime.get_runner_router", lambda: None)
 
-    with caplog.at_level(logging.WARNING, logger="omnigent.server.routes._sessions.orchestration"):
+    with caplog.at_level(logging.WARNING, logger="omnigent.server.routes.sessions.orchestration"):
         child = await _get_session_snapshot(
             conv_store,  # type: ignore[arg-type]
             "conv_child",
@@ -743,7 +743,7 @@ async def test_session_snapshot_status_probe_is_bounded_and_backed_off(
     dropped, and nothing was cached, so the next snapshot waited again.
     """
     from omnigent.server.routes import sessions as _mod
-    from omnigent.server.routes._sessions import orchestration
+    from omnigent.server.routes.sessions import orchestration
 
     session_id = "0a4d2f9c6b1e4e8f9c3a7d5b2e1f0a9c"
     _mod._session_status_cache.pop(session_id, None)
@@ -778,7 +778,7 @@ async def test_session_snapshot_concurrent_cache_misses_share_one_status_probe()
     cannot come from two probes merely running back to back.
     """
     from omnigent.server.routes import sessions as _mod
-    from omnigent.server.routes._sessions import orchestration
+    from omnigent.server.routes.sessions import orchestration
 
     session_id = "4e8b6d3a0f5c4c2d9a7e9b6f5c3d4e1a"
     _mod._session_status_cache.pop(session_id, None)
@@ -806,7 +806,7 @@ async def test_session_snapshot_concurrent_cache_misses_share_one_status_probe()
 async def test_session_snapshot_cancelled_caller_does_not_abort_shared_status_probe() -> None:
     """Cancelling one caller's snapshot leaves the shared probe running for the rest."""
     from omnigent.server.routes import sessions as _mod
-    from omnigent.server.routes._sessions import orchestration
+    from omnigent.server.routes.sessions import orchestration
 
     session_id = "5f9c7e4b1a2d4d3e8b0f1c9d6e5a7b2c"
     _mod._session_status_cache.pop(session_id, None)
@@ -837,7 +837,7 @@ async def test_session_snapshot_status_probe_resumes_after_backoff(
 ) -> None:
     """Once the backoff has elapsed the next snapshot probes the runner again."""
     from omnigent.server.routes import sessions as _mod
-    from omnigent.server.routes._sessions import orchestration
+    from omnigent.server.routes.sessions import orchestration
 
     session_id = "1b5e3a0d7c2f4f9a8d4b6e3c2f0a1b8d"
     _mod._session_status_cache.pop(session_id, None)
@@ -901,7 +901,7 @@ async def test_session_snapshot_slow_non_200_probe_enters_backoff(
 ) -> None:
     """A non-200 that took longer than the slow threshold is treated like a failed probe."""
     from omnigent.server.routes import sessions as _mod
-    from omnigent.server.routes._sessions import orchestration
+    from omnigent.server.routes.sessions import orchestration
 
     session_id = "6a0d8f5c2b7e4e4f9c1a3b8d7e6f5a4b"
     _mod._session_status_cache.pop(session_id, None)
@@ -945,7 +945,7 @@ async def test_session_snapshot_probe_backoff_doubles_per_slow_probe_and_resets_
     import time
 
     from omnigent.server.routes import sessions as _mod
-    from omnigent.server.routes._sessions import orchestration
+    from omnigent.server.routes.sessions import orchestration
 
     session_id = "7b1e9a6d3c8f4f5a0d2b4c9e8f7a6b5c"
     _mod._session_status_cache.pop(session_id, None)
@@ -1024,7 +1024,7 @@ async def test_session_snapshot_probe_backoff_is_discarded_when_the_runner_chang
 ) -> None:
     """A skip window recorded against one runner does not silence probes of its replacement."""
     from omnigent.server.routes import sessions as _mod
-    from omnigent.server.routes._sessions import orchestration
+    from omnigent.server.routes.sessions import orchestration
 
     session_id = "9d3a1c8f6b5e4e7d0f2a4b6c8e1d3f5a"
     _mod._session_status_cache.pop(session_id, None)
@@ -1065,7 +1065,7 @@ async def test_session_snapshot_status_probe_bound_holds_over_the_tunnel_transpo
     from omnigent.runner.transports.ws_tunnel.registry import TunnelRegistry
     from omnigent.runner.transports.ws_tunnel.transport import WSTunnelTransport
     from omnigent.server.routes import sessions as _mod
-    from omnigent.server.routes._sessions import orchestration
+    from omnigent.server.routes.sessions import orchestration
 
     class _IdleWS:
         async def send_text(self, data: str) -> None:
@@ -1375,12 +1375,7 @@ async def test_session_snapshot_includes_model_options_from_runner(
 async def test_kiro_session_snapshot_loads_runner_model_catalog(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """An older runner without the unified route still fills the picker.
-
-    The fake runner 404s ``/model-options`` (it predates the unified
-    route), so the server's loader must drop to the legacy harness-named
-    route and serve its rows — the compat lane until 0.11.0.
-    """
+    """The unified /model-options route fills the picker for kiro sessions."""
     from omnigent.server.routes import sessions as _mod
 
     _mod._model_options_cache.clear()
@@ -1402,8 +1397,6 @@ async def test_kiro_session_snapshot_loads_runner_model_catalog(
             del timeout
             self.get_calls.append(url)
             if url.endswith("/model-options"):
-                return _FakeResponse({"detail": "Not Found"}, status_code=404)
-            if url.endswith("/kiro-model-options"):
                 return _FakeResponse(
                     {
                         "models": [
@@ -1445,9 +1438,7 @@ async def test_kiro_session_snapshot_loads_runner_model_catalog(
     await _drain_model_options(session_id)
     snapshot = await _get_session_snapshot(conv_store, session_id)  # type: ignore[arg-type]
 
-    # The unified route was tried first, then the legacy alias filled in.
     assert f"/v1/sessions/{session_id}/model-options" in fake_client.get_calls
-    assert f"/v1/sessions/{session_id}/kiro-model-options" in fake_client.get_calls
     assert [model.id for model in snapshot.model_options] == ["provider-latest"]
     assert snapshot.model_options[0].model_dump()["description"] == (
         "Provider supplied description"
@@ -2657,7 +2648,7 @@ def test_status_error_identity_requires_an_unambiguous_response(
     response_id: str | None, names: list[str], expected: str | None
 ) -> None:
     from omnigent.entities import MessageData
-    from omnigent.server.routes._sessions.helpers import _response_agent_name_from_store
+    from omnigent.server.routes.sessions.helpers import _response_agent_name_from_store
 
     items = [
         SimpleNamespace(
@@ -2885,7 +2876,7 @@ async def test_side_chat_fork_sealed_on_runner_divergence() -> None:
     """A resumed/relaunched host gives the parent a fresh ``runner_id`` while the
     side-chat child keeps its birth one. The divergence means the ephemeral fork's
     owning runner is gone, so the child seals read-only."""
-    from omnigent.server.routes._sessions.orchestration import (
+    from omnigent.server.routes.sessions.orchestration import (
         _codex_side_chat_fork_sealed,
     )
 
@@ -2898,7 +2889,7 @@ async def test_side_chat_fork_sealed_on_runner_divergence() -> None:
 async def test_side_chat_fork_not_sealed_when_runner_matches() -> None:
     """A plain page reload keeps the same live runner, so parent and child agree
     and the still-reachable fork stays sendable."""
-    from omnigent.server.routes._sessions.orchestration import (
+    from omnigent.server.routes.sessions.orchestration import (
         _codex_side_chat_fork_sealed,
     )
 
@@ -2912,7 +2903,7 @@ async def test_side_chat_fork_seal_only_applies_to_side_chats() -> None:
     """The seal is gated to the ``/side`` nickname. An ordinary codex sub-agent
     (durable, not an ephemeral fork) with a diverged runner must NOT be sealed —
     and a non-codex row is ignored entirely."""
-    from omnigent.server.routes._sessions.orchestration import (
+    from omnigent.server.routes.sessions.orchestration import (
         _codex_side_chat_fork_sealed,
     )
 
@@ -2932,7 +2923,7 @@ async def test_side_chat_fork_not_sealed_without_reliable_signal() -> None:
     """Missing signals can't prove the fork is gone, so the child stays sendable:
     a child with no runner_id, no parent link, or a parent that has no runner_id
     (never diverged) is not sealed."""
-    from omnigent.server.routes._sessions.orchestration import (
+    from omnigent.server.routes.sessions.orchestration import (
         _codex_side_chat_fork_sealed,
     )
 

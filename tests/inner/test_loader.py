@@ -11,10 +11,10 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from omnigent.inner.datamodel import ExecutorSpec, OSEnvSandboxSpec, OSEnvSpec
-from omnigent.inner.loader import load_agent_def
-from omnigent.inner.policies import FunctionPolicy, PromptPolicy
-from omnigent.inner.tools import (
+from omnigent.core.datamodel import ExecutorSpec, OSEnvSandboxSpec, OSEnvSpec
+from omnigent.core.loader import load_agent_def
+from omnigent.core.policies import FunctionPolicy, PromptPolicy
+from omnigent.core.tools import (
     AgentTool,
     CancellableFunctionTool,
     FunctionTool,
@@ -445,7 +445,7 @@ class TestLoadFromDict(unittest.TestCase):
         )
 
     def test_os_env_auto_sandbox_uses_platform_default(self):
-        from omnigent.inner.sandbox import _default_sandbox_for_platform
+        from omnigent.sandbox.core import _default_sandbox_for_platform
 
         agent = load_agent_def(
             {
@@ -463,7 +463,7 @@ class TestLoadFromDict(unittest.TestCase):
         self.assertEqual(agent.os_env.sandbox.write_paths, ["."])
 
     def test_os_env_omitted_sandbox_type_uses_platform_default(self):
-        from omnigent.inner.sandbox import _default_sandbox_for_platform
+        from omnigent.sandbox.core import _default_sandbox_for_platform
 
         agent = load_agent_def(
             {

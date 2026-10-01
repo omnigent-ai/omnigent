@@ -12,6 +12,7 @@ from typing import Any
 import httpx
 import pytest
 
+import omnigent.runner.native.orchestration as _native_orch
 from omnigent.entities.session_resources import SessionResourceView
 from omnigent.harnesses.claude_native import bridge as claude_native_bridge
 from omnigent.harnesses.codex_native import bridge as codex_native_bridge
@@ -354,7 +355,7 @@ async def test_cancel_auto_forwarder_task_cancels_and_awaits_registered_task() -
 
     try:
         task = asyncio.create_task(_parked())
-        runner_app_mod._register_auto_forwarder_task(session_id, task)
+        _native_orch._register_auto_forwarder_task(session_id, task)
         # Yield so the coroutine body starts (a never-started task would be
         # dropped without ever entering the except branch).
         await asyncio.sleep(0)
@@ -373,11 +374,11 @@ async def test_cancel_auto_forwarder_task_cancels_and_awaits_registered_task() -
         # actually interrupted, not skipped.
         assert run.cancelled is True
         # The slot is freed for the successor registration.
-        assert session_id not in runner_app_mod._AUTO_FORWARDER_TASKS
+        assert session_id not in _native_orch._AUTO_FORWARDER_TASKS
         # Idempotent: a second cancel with no registered task is a no-op.
         await runner_app_mod._cancel_auto_forwarder_task(session_id)
     finally:
-        runner_app_mod._AUTO_FORWARDER_TASKS.pop(session_id, None)
+        _native_orch._AUTO_FORWARDER_TASKS.pop(session_id, None)
         await _drain_forwarder_runs([run])
 
 
@@ -410,20 +411,20 @@ async def test_teardown_codex_native_app_server_cancels_forwarder_and_closes_ser
 
     try:
         task = asyncio.create_task(_parked())
-        runner_app_mod._register_auto_forwarder_task(session_id, task)
-        runner_app_mod._AUTO_CODEX_APP_SERVERS[session_id] = _FakeAppServer()
+        _native_orch._register_auto_forwarder_task(session_id, task)
+        _native_orch._AUTO_CODEX_APP_SERVERS[session_id] = _FakeAppServer()
         await asyncio.sleep(0)
 
-        await runner_app_mod.teardown_codex_native_app_server(session_id)
+        await _native_orch.teardown_codex_native_app_server(session_id)
 
         assert task.cancelled(), "forwarder must be finished-cancelled after teardown"
         assert run.cancelled is True
         assert closed is True, "registered codex app-server must be closed"
-        assert session_id not in runner_app_mod._AUTO_CODEX_APP_SERVERS
-        assert session_id not in runner_app_mod._AUTO_FORWARDER_TASKS
+        assert session_id not in _native_orch._AUTO_CODEX_APP_SERVERS
+        assert session_id not in _native_orch._AUTO_FORWARDER_TASKS
     finally:
-        runner_app_mod._AUTO_FORWARDER_TASKS.pop(session_id, None)
-        runner_app_mod._AUTO_CODEX_APP_SERVERS.pop(session_id, None)
+        _native_orch._AUTO_FORWARDER_TASKS.pop(session_id, None)
+        _native_orch._AUTO_CODEX_APP_SERVERS.pop(session_id, None)
         await _drain_forwarder_runs([run])
 
 
@@ -445,16 +446,16 @@ async def test_teardown_codex_native_app_server_noop_without_registered_server()
 
     try:
         task = asyncio.create_task(_parked())
-        runner_app_mod._register_auto_forwarder_task(session_id, task)
+        _native_orch._register_auto_forwarder_task(session_id, task)
         await asyncio.sleep(0)
 
-        await runner_app_mod.teardown_codex_native_app_server(session_id)
+        await _native_orch.teardown_codex_native_app_server(session_id)
 
         # No registered codex app-server -> the forwarder is left untouched.
         assert not task.done()
-        assert session_id in runner_app_mod._AUTO_FORWARDER_TASKS
+        assert session_id in _native_orch._AUTO_FORWARDER_TASKS
     finally:
-        runner_app_mod._AUTO_FORWARDER_TASKS.pop(session_id, None)
+        _native_orch._AUTO_FORWARDER_TASKS.pop(session_id, None)
         await _drain_forwarder_runs([run])
 
 
@@ -498,22 +499,22 @@ async def test_teardown_all_codex_native_app_servers_closes_every_session() -> N
     try:
         for sid, run in zip(session_ids, runs, strict=True):
             task = asyncio.create_task(_make_parked(run)())
-            runner_app_mod._register_auto_forwarder_task(sid, task)
-            runner_app_mod._AUTO_CODEX_APP_SERVERS[sid] = _FakeAppServer(sid)
+            _native_orch._register_auto_forwarder_task(sid, task)
+            _native_orch._AUTO_CODEX_APP_SERVERS[sid] = _FakeAppServer(sid)
         await asyncio.sleep(0)
 
-        await runner_app_mod.teardown_all_codex_native_app_servers()
+        await _native_orch.teardown_all_codex_native_app_servers()
 
         assert sorted(closed) == sorted(session_ids), "every app-server must be closed"
-        assert all(sid not in runner_app_mod._AUTO_CODEX_APP_SERVERS for sid in session_ids)
-        assert all(sid not in runner_app_mod._AUTO_FORWARDER_TASKS for sid in session_ids)
+        assert all(sid not in _native_orch._AUTO_CODEX_APP_SERVERS for sid in session_ids)
+        assert all(sid not in _native_orch._AUTO_FORWARDER_TASKS for sid in session_ids)
         assert all(run.cancelled for run in runs), "every forwarder must be cancelled"
         # Idempotent: a second sweep with an empty registry is a no-op.
-        await runner_app_mod.teardown_all_codex_native_app_servers()
+        await _native_orch.teardown_all_codex_native_app_servers()
     finally:
         for sid in session_ids:
-            runner_app_mod._AUTO_FORWARDER_TASKS.pop(sid, None)
-            runner_app_mod._AUTO_CODEX_APP_SERVERS.pop(sid, None)
+            _native_orch._AUTO_FORWARDER_TASKS.pop(sid, None)
+            _native_orch._AUTO_CODEX_APP_SERVERS.pop(sid, None)
         await _drain_forwarder_runs(runs)
 
 
@@ -548,21 +549,21 @@ async def test_teardown_all_opencode_native_servers_closes_every_session() -> No
     try:
         for sid, run in zip(session_ids, runs, strict=True):
             task = asyncio.create_task(_make_parked(run)())
-            runner_app_mod._register_auto_forwarder_task(sid, task)
+            _native_orch._register_auto_forwarder_task(sid, task)
             runner_app_mod._AUTO_OPENCODE_SERVERS[sid] = _FakeServer(sid)
         await asyncio.sleep(0)
 
-        await runner_app_mod.teardown_all_opencode_native_servers()
+        await _native_orch.teardown_all_opencode_native_servers()
 
         assert sorted(closed) == sorted(session_ids), "every opencode server must be closed"
         assert all(sid not in runner_app_mod._AUTO_OPENCODE_SERVERS for sid in session_ids)
-        assert all(sid not in runner_app_mod._AUTO_FORWARDER_TASKS for sid in session_ids)
+        assert all(sid not in _native_orch._AUTO_FORWARDER_TASKS for sid in session_ids)
         assert all(run.cancelled for run in runs), "every forwarder must be cancelled"
         # Idempotent: a second sweep with an empty registry is a no-op.
-        await runner_app_mod.teardown_all_opencode_native_servers()
+        await _native_orch.teardown_all_opencode_native_servers()
     finally:
         for sid in session_ids:
-            runner_app_mod._AUTO_FORWARDER_TASKS.pop(sid, None)
+            _native_orch._AUTO_FORWARDER_TASKS.pop(sid, None)
             runner_app_mod._AUTO_OPENCODE_SERVERS.pop(sid, None)
         await _drain_forwarder_runs(runs)
 
@@ -600,11 +601,11 @@ async def test_teardown_all_opencode_native_servers_survives_a_failing_close() -
     try:
         for sid, run in zip(session_ids, runs, strict=True):
             task = asyncio.create_task(_make_parked(run)())
-            runner_app_mod._register_auto_forwarder_task(sid, task)
+            _native_orch._register_auto_forwarder_task(sid, task)
             runner_app_mod._AUTO_OPENCODE_SERVERS[sid] = _FakeServer(sid, fail=sid == failing_id)
         await asyncio.sleep(0)
 
-        await runner_app_mod.teardown_all_opencode_native_servers()
+        await _native_orch.teardown_all_opencode_native_servers()
 
         assert sorted(attempted) == sorted(session_ids), (
             "a failing close aborted the sweep; the remaining opencode servers were never reaped"
@@ -612,11 +613,11 @@ async def test_teardown_all_opencode_native_servers_survives_a_failing_close() -
         assert all(sid not in runner_app_mod._AUTO_OPENCODE_SERVERS for sid in session_ids), (
             "a failing close left a stale registry entry behind"
         )
-        assert all(sid not in runner_app_mod._AUTO_FORWARDER_TASKS for sid in session_ids)
+        assert all(sid not in _native_orch._AUTO_FORWARDER_TASKS for sid in session_ids)
         assert all(run.cancelled for run in runs), "every forwarder must be cancelled"
     finally:
         for sid in session_ids:
-            runner_app_mod._AUTO_FORWARDER_TASKS.pop(sid, None)
+            _native_orch._AUTO_FORWARDER_TASKS.pop(sid, None)
             runner_app_mod._AUTO_OPENCODE_SERVERS.pop(sid, None)
         await _drain_forwarder_runs(runs)
 
@@ -650,11 +651,11 @@ async def test_register_auto_forwarder_task_replaces_incumbent_and_survives_stal
 
     try:
         task_a = asyncio.create_task(_parked(run_a))
-        runner_app_mod._register_auto_forwarder_task(session_id, task_a)
+        _native_orch._register_auto_forwarder_task(session_id, task_a)
         await asyncio.sleep(0)
 
         task_b = asyncio.create_task(_parked(run_b))
-        runner_app_mod._register_auto_forwarder_task(session_id, task_b)
+        _native_orch._register_auto_forwarder_task(session_id, task_b)
 
         # Claim 1: the incumbent was cancelled by the replacement.
         await asyncio.wait({task_a})
@@ -667,7 +668,7 @@ async def test_register_auto_forwarder_task_replaces_incumbent_and_survives_stal
         await asyncio.sleep(0)
 
         # Claim 2: the stale callback did not evict the successor.
-        assert runner_app_mod._AUTO_FORWARDER_TASKS.get(session_id) is task_b, (
+        assert _native_orch._AUTO_FORWARDER_TASKS.get(session_id) is task_b, (
             "Task A's done-callback evicted task B — eviction must be "
             "identity-checked so a predecessor's completion cannot drop the "
             "live successor's registration."
@@ -675,7 +676,7 @@ async def test_register_auto_forwarder_task_replaces_incumbent_and_survives_stal
         # The successor must still be running — done here means A's cancel hit B.
         assert not task_b.done()
     finally:
-        runner_app_mod._AUTO_FORWARDER_TASKS.pop(session_id, None)
+        _native_orch._AUTO_FORWARDER_TASKS.pop(session_id, None)
         await _drain_forwarder_runs([run_a, run_b])
 
 
@@ -703,8 +704,8 @@ async def test_auto_forwarder_registry_isolates_sessions_and_evicts_completed() 
     try:
         task_a = asyncio.create_task(_parked(run_a))
         task_b = asyncio.create_task(_parked(run_b))
-        runner_app_mod._register_auto_forwarder_task("4263b99f5e92593cafda836bdb6b7690", task_a)
-        runner_app_mod._register_auto_forwarder_task("414de30f273a0a21428e869a1d7a2a3d", task_b)
+        _native_orch._register_auto_forwarder_task("4263b99f5e92593cafda836bdb6b7690", task_a)
+        _native_orch._register_auto_forwarder_task("414de30f273a0a21428e869a1d7a2a3d", task_b)
         await asyncio.sleep(0)
 
         await runner_app_mod._cancel_auto_forwarder_task("4263b99f5e92593cafda836bdb6b7690")
@@ -714,18 +715,16 @@ async def test_auto_forwarder_registry_isolates_sessions_and_evicts_completed() 
         # by session id must not regress to whole-registry cancellation.
         assert run_b.cancelled is False
         assert not task_b.done()
-        assert (
-            runner_app_mod._AUTO_FORWARDER_TASKS.get("414de30f273a0a21428e869a1d7a2a3d") is task_b
-        )
+        assert _native_orch._AUTO_FORWARDER_TASKS.get("414de30f273a0a21428e869a1d7a2a3d") is task_b
 
         # Natural completion evicts the entry (no leak for finished tasks).
         task_b.cancel()
         await asyncio.wait({task_b})
         await asyncio.sleep(0)
-        assert "414de30f273a0a21428e869a1d7a2a3d" not in runner_app_mod._AUTO_FORWARDER_TASKS
+        assert "414de30f273a0a21428e869a1d7a2a3d" not in _native_orch._AUTO_FORWARDER_TASKS
     finally:
-        runner_app_mod._AUTO_FORWARDER_TASKS.pop("4263b99f5e92593cafda836bdb6b7690", None)
-        runner_app_mod._AUTO_FORWARDER_TASKS.pop("414de30f273a0a21428e869a1d7a2a3d", None)
+        _native_orch._AUTO_FORWARDER_TASKS.pop("4263b99f5e92593cafda836bdb6b7690", None)
+        _native_orch._AUTO_FORWARDER_TASKS.pop("414de30f273a0a21428e869a1d7a2a3d", None)
         await _drain_forwarder_runs([run_a, run_b])
 
 
@@ -798,7 +797,7 @@ async def test_auto_create_claude_terminal_recreate_cancels_prior_forwarder(
             )
 
     try:
-        await runner_app_mod._auto_create_claude_terminal(
+        await _native_orch._auto_create_claude_terminal(
             session_id,
             _FakeResourceRegistry(),  # type: ignore[arg-type]
             lambda _sid, _evt: None,
@@ -809,7 +808,7 @@ async def test_auto_create_claude_terminal_recreate_cancels_prior_forwarder(
         await asyncio.sleep(0)
 
         # The recovery path: terminal resource gone, ensure re-creates.
-        await runner_app_mod._auto_create_claude_terminal(
+        await _native_orch._auto_create_claude_terminal(
             session_id,
             _FakeResourceRegistry(),  # type: ignore[arg-type]
             lambda _sid, _evt: None,
@@ -836,12 +835,12 @@ async def test_auto_create_claude_terminal_recreate_cancels_prior_forwarder(
         assert len(live_runs) == 1
         # The registry holds exactly the live task for this session, keyed
         # by session id — this is the strong reference that keeps it alive.
-        registered = runner_app_mod._AUTO_FORWARDER_TASKS.get(session_id)
+        registered = _native_orch._AUTO_FORWARDER_TASKS.get(session_id)
         assert registered is live_runs[0].task
         # Still running: a done survivor would leave the session unmirrored.
         assert not registered.done()
     finally:
-        runner_app_mod._AUTO_FORWARDER_TASKS.pop(session_id, None)
+        _native_orch._AUTO_FORWARDER_TASKS.pop(session_id, None)
         await _drain_forwarder_runs(runs)
 
 
@@ -1030,8 +1029,7 @@ async def test_auto_create_codex_terminal_recovers_without_restarting_healthy_se
     monkeypatch.setattr(codex_app_mod, "CodexAppServerClient", _UnexpectedDiscoveryClient)
     monkeypatch.setattr(codex_app_mod, "preload_codex_thread_for_resume", _fake_preload_thread)
     monkeypatch.setattr(
-        runner_app_mod,
-        "_codex_forward_known_thread",
+        "omnigent.runner.native.orchestration._codex_forward_known_thread",
         _parking_forward_known_thread,
     )
 
@@ -1045,7 +1043,7 @@ async def test_auto_create_codex_terminal_recovers_without_restarting_healthy_se
     )
 
     try:
-        await runner_app_mod._auto_create_codex_terminal(
+        await _native_orch._auto_create_codex_terminal(
             session_id,
             _FakeResourceRegistry(),  # type: ignore[arg-type]
             lambda _sid, _evt: None,
@@ -1055,7 +1053,7 @@ async def test_auto_create_codex_terminal_recovers_without_restarting_healthy_se
         await asyncio.sleep(0)
 
         original_server = app_servers[0]
-        original_forwarder = runner_app_mod._AUTO_FORWARDER_TASKS[session_id]
+        original_forwarder = _native_orch._AUTO_FORWARDER_TASKS[session_id]
         bridge_dir = codex_native_bridge.bridge_dir_for_bridge_id(session_id)
         bridge_state = codex_native_bridge.read_bridge_state(bridge_dir)
         assert bridge_state is not None
@@ -1078,7 +1076,7 @@ async def test_auto_create_codex_terminal_recovers_without_restarting_healthy_se
                 ),
             )
 
-        recovery = runner_app_mod._auto_create_codex_terminal(
+        recovery = _native_orch._auto_create_codex_terminal(
             session_id,
             _FakeResourceRegistry(),  # type: ignore[arg-type]
             lambda _sid, _evt: None,
@@ -1100,12 +1098,12 @@ async def test_auto_create_codex_terminal_recovers_without_restarting_healthy_se
         assert len(runs) == (1 if reused else 2)
         assert runs[0].cancelled is not reused
         if reused:
-            assert runner_app_mod._AUTO_CODEX_APP_SERVERS[session_id] is original_server
-            assert runner_app_mod._AUTO_FORWARDER_TASKS[session_id] is original_forwarder
+            assert _native_orch._AUTO_CODEX_APP_SERVERS[session_id] is original_server
+            assert _native_orch._AUTO_FORWARDER_TASKS[session_id] is original_forwarder
             assert not original_server.closed
             assert codex_native_bridge.read_bridge_state(bridge_dir) == bridge_state
         else:
-            assert runner_app_mod._AUTO_CODEX_APP_SERVERS[session_id] is app_servers[1]
+            assert _native_orch._AUTO_CODEX_APP_SERVERS[session_id] is app_servers[1]
             assert runs[1].cancelled is False
         assert len(launched_specs) == 2
         for spec in launched_specs:
@@ -1116,13 +1114,13 @@ async def test_auto_create_codex_terminal_recovers_without_restarting_healthy_se
         live_runs = [run for run in runs if not run.cancelled]
         # Exactly one live forwarder mirrors the thread for the session.
         assert len(live_runs) == 1
-        registered = runner_app_mod._AUTO_FORWARDER_TASKS.get(session_id)
+        registered = _native_orch._AUTO_FORWARDER_TASKS.get(session_id)
         assert registered is live_runs[0].task
         # Still running: a done survivor would leave the session unmirrored.
         assert not registered.done()
     finally:
-        runner_app_mod._AUTO_FORWARDER_TASKS.pop(session_id, None)
-        runner_app_mod._AUTO_CODEX_APP_SERVERS.pop(session_id, None)
+        _native_orch._AUTO_FORWARDER_TASKS.pop(session_id, None)
+        _native_orch._AUTO_CODEX_APP_SERVERS.pop(session_id, None)
         await _drain_forwarder_runs(runs)
 
 
@@ -1154,17 +1152,17 @@ async def test_forwarder_task_exit_paths_are_logged(
     try:
         with caplog.at_level(logging.INFO, logger="omnigent.runner.app"):
             parked_task = asyncio.create_task(_parked(), name="claude-forwarder-cancelled")
-            runner_app_mod._register_auto_forwarder_task(cancelled_id, parked_task)
+            _native_orch._register_auto_forwarder_task(cancelled_id, parked_task)
             await asyncio.sleep(0)
             parked_task.cancel()
             await asyncio.wait([parked_task])
 
             raising_task = asyncio.create_task(_raises(), name="claude-forwarder-died")
-            runner_app_mod._register_auto_forwarder_task(died_id, raising_task)
+            _native_orch._register_auto_forwarder_task(died_id, raising_task)
             await asyncio.wait([raising_task])
 
             returning_task = asyncio.create_task(_returns(), name="claude-forwarder-returned")
-            runner_app_mod._register_auto_forwarder_task(returned_id, returning_task)
+            _native_orch._register_auto_forwarder_task(returned_id, returning_task)
             await asyncio.wait([returning_task])
             # Done callbacks run via call_soon after task completion.
             await asyncio.sleep(0)
@@ -1187,7 +1185,7 @@ async def test_forwarder_task_exit_paths_are_logged(
         assert _obits(logging.WARNING, "returned; session mirroring has stopped")
     finally:
         for sid in (cancelled_id, died_id, returned_id):
-            runner_app_mod._AUTO_FORWARDER_TASKS.pop(sid, None)
+            _native_orch._AUTO_FORWARDER_TASKS.pop(sid, None)
 
 
 async def test_auto_create_codex_terminal_refused_resume_closes_app_server(
@@ -1336,7 +1334,7 @@ async def test_auto_create_codex_terminal_refused_resume_closes_app_server(
 
     try:
         with pytest.raises(RuntimeError, match="active writer"):
-            await runner_app_mod._auto_create_codex_terminal(
+            await _native_orch._auto_create_codex_terminal(
                 session_id,
                 _UnreachableResourceRegistry(),  # type: ignore[arg-type]
                 lambda _sid, _evt: None,
@@ -1344,12 +1342,12 @@ async def test_auto_create_codex_terminal_refused_resume_closes_app_server(
                 server_client=_SnapshotServerClient(),  # type: ignore[arg-type]
             )
         assert closed == ["closed"], "refused resume left the app-server running"
-        assert session_id not in runner_app_mod._AUTO_CODEX_APP_SERVERS, (
+        assert session_id not in _native_orch._AUTO_CODEX_APP_SERVERS, (
             "failed create left its app-server tracked; the next attempt would "
             "overwrite (and leak) it"
         )
     finally:
-        runner_app_mod._AUTO_CODEX_APP_SERVERS.pop(session_id, None)
+        _native_orch._AUTO_CODEX_APP_SERVERS.pop(session_id, None)
 
 
 async def test_auto_create_codex_terminal_unreadable_thread_starts_fresh(
@@ -1553,9 +1551,13 @@ async def test_auto_create_codex_terminal_unreadable_thread_starts_fresh(
     monkeypatch.setattr(codex_app_mod, "CodexAppServerClient", _RecordingClient)
     monkeypatch.setattr(codex_app_mod, "preload_codex_thread_for_resume", _unreadable_preload)
     monkeypatch.setattr(
-        runner_app_mod, "_codex_discover_thread_and_forward", _parking_discover_thread
+        "omnigent.runner.native.orchestration._codex_discover_thread_and_forward",
+        _parking_discover_thread,
     )
-    monkeypatch.setattr(runner_app_mod, "_codex_forward_known_thread", _unexpected_known_thread)
+    monkeypatch.setattr(
+        "omnigent.runner.native.orchestration._codex_forward_known_thread",
+        _unexpected_known_thread,
+    )
 
     agent_spec = AgentSpec(
         spec_version=1,
@@ -1568,7 +1570,7 @@ async def test_auto_create_codex_terminal_unreadable_thread_starts_fresh(
 
     try:
         with caplog.at_level(logging.WARNING, logger="omnigent.runner.app"):
-            await runner_app_mod._auto_create_codex_terminal(
+            await _native_orch._auto_create_codex_terminal(
                 session_id,
                 _FakeResourceRegistry(),  # type: ignore[arg-type]
                 lambda _sid, _evt: None,
@@ -1604,6 +1606,6 @@ async def test_auto_create_codex_terminal_unreadable_thread_starts_fresh(
             if record.levelno == logging.WARNING
         ), "dropping the Codex-side context must leave a warning naming the thread"
     finally:
-        runner_app_mod._AUTO_FORWARDER_TASKS.pop(session_id, None)
-        runner_app_mod._AUTO_CODEX_APP_SERVERS.pop(session_id, None)
+        _native_orch._AUTO_FORWARDER_TASKS.pop(session_id, None)
+        _native_orch._AUTO_CODEX_APP_SERVERS.pop(session_id, None)
         await _drain_forwarder_runs(runs)

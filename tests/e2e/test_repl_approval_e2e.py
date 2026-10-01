@@ -67,7 +67,7 @@ _SUBAGENT_TOOL_GATE_DIR = _FIXTURES_DIR / "e2e-subagent-tool-gate"
 #
 # This MUST exceed the CLI's own internal cold-start budget, which is
 # sequential on the critical path of every launch
-# (``_prepare_chat_session_via_daemon`` in omnigent/chat.py):
+# (``_prepare_chat_session_via_daemon`` in omnigent/cli/chat.py):
 #
 #   wait_for_host_online           up to 30s  (_DAEMON_CHAT_HOST_ONLINE_TIMEOUT_S)
 #   launch_or_reuse_daemon_runner  ~16.5s     (transient-409 host-reconnect retry)

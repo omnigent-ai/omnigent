@@ -65,7 +65,7 @@ async def test_host_start_does_not_block_on_orphan_bridge_reap(
         return 0
 
     monkeypatch.setattr(
-        "omnigent.native.native_bridge_common.reap_orphaned_native_bridge_dirs",
+        "omnigent.harnesses.native.bridge_common.reap_orphaned_native_bridge_dirs",
         _blocking_sweep,
     )
 

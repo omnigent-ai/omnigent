@@ -119,7 +119,7 @@ def codex_native_mock_session(
     if not _codex_cli_supports_mocked_app_server(codex_path):
         pytest.skip("codex CLI >= 0.139.0 is required for the codex-native /compact e2e")
 
-    from omnigent.runner.identity import token_bound_runner_id
+    from omnigent.util.runner_identity import token_bound_runner_id
 
     server_tmp = tmp_path_factory.mktemp("e2e_ui_codex_compact_server")
     config_home = server_tmp / "config-home"
@@ -180,7 +180,7 @@ def codex_native_mock_session(
             [
                 sys.executable,
                 "-m",
-                "omnigent.cli",
+                "omnigent.cli.commands",
                 "server",
                 "--host",
                 "127.0.0.1",

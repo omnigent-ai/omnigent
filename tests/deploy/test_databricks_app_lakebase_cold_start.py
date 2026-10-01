@@ -160,7 +160,7 @@ def _stub_downstream_boot(monkeypatch: pytest.MonkeyPatch) -> None:
 
     monkeypatch.setattr(runtime, "init", lambda **kw: None)
 
-    import omnigent.runtime.telemetry as telemetry
+    import omnigent.observability.otel as telemetry
 
     monkeypatch.setattr(telemetry, "init", lambda: None)
 

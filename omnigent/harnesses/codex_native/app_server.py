@@ -33,7 +33,26 @@ if TYPE_CHECKING:
     from omnigent.onboarding.provider_config import ProviderEntry
     from omnigent.spec.types import AgentSpec
 
-from omnigent.cli_invocation import cli_invocation
+from omnigent.harnesses.codex.executor import (
+    _CODEX_ROUTER_HOOK_MODULE,
+    _clean_codex_env,
+    _codex_cli_version,
+    _codex_home_config_source_from_env,
+    _databricks_codex_auth_command,
+    _databricks_codex_base_url,
+    _databricks_codex_config_overrides,
+    _find_codex_cli,
+    _populate_codex_home_config,
+    _provider_codex_config_overrides,
+    codex_extended_catalog_requested,
+    codex_router_bridge_dir,
+    codex_router_hooks_settings,
+    codex_router_session_id,
+    codex_routing_hook_skip_reason,
+    materialize_codex_provider_config,
+    read_codex_model_catalog,
+    write_codex_hooks_file,
+)
 from omnigent.harnesses.codex_native.bridge import write_policy_hook_config
 from omnigent.harnesses.codex_native.launch_args import (
     _write_private_config,
@@ -58,38 +77,19 @@ from omnigent.harnesses.codex_native.stderr_diagnostics import (
     codex_app_server_diagnostic_env,
     report_capture_start_failure,
 )
-from omnigent.inner import _proc
-from omnigent.inner.codex_executor import (
-    _CODEX_ROUTER_HOOK_MODULE,
-    _clean_codex_env,
-    _codex_cli_version,
-    _codex_home_config_source_from_env,
-    _databricks_codex_auth_command,
-    _databricks_codex_base_url,
-    _databricks_codex_config_overrides,
-    _find_codex_cli,
-    _populate_codex_home_config,
-    _provider_codex_config_overrides,
-    codex_extended_catalog_requested,
-    codex_router_bridge_dir,
-    codex_router_hooks_settings,
-    codex_router_session_id,
-    codex_routing_hook_skip_reason,
-    materialize_codex_provider_config,
-    read_codex_model_catalog,
-    write_codex_hooks_file,
-)
-from omnigent.inner.databricks_executor import (
+from omnigent.harnesses.databricks.executor import (
     _databricks_gateway_host,
     _read_databrickscfg_host,
 )
 from omnigent.models.codex_model_vocabulary import codex_reachable_model_slug, codex_spawn_model
-from omnigent.process_logging import (
+from omnigent.observability.process_logging import (
     harness_stderr_capture_enabled,
     log_info_once,
     log_once,
     redact_log_text,
 )
+from omnigent.util import proc as _proc
+from omnigent.util.cli_invocation import cli_invocation
 from omnigent.util.reasoning_effort import CODEX_NATIVE_EFFORTS
 
 _logger = logging.getLogger(__name__)
@@ -2430,7 +2430,7 @@ def _turn_router_advertised(bridge_dir: Path) -> bool:
     :returns: ``True`` when a usable ``turn_router.json`` is present, i.e. the
         session launched with Smart Routing on.
     """
-    from omnigent.inner.hook_scripts.subagent_router import read_router_endpoint
+    from omnigent.harnesses.native.hook_scripts.subagent_router import read_router_endpoint
     from omnigent.runner.turn_routing import ADVERTISEMENT_FILE
 
     return read_router_endpoint(bridge_dir, filename=ADVERTISEMENT_FILE) is not None
@@ -2467,7 +2467,7 @@ def _codex_policy_hooks_settings(
         "command": _codex_policy_hook_command(bridge_dir, python_executable),
         "timeout": _POLICY_HOOK_TIMEOUT_SECONDS,
     }
-    from omnigent.native.tool_observer_hook import hook_settings
+    from omnigent.harnesses.native.tool_observer_hook import hook_settings
 
     observer = hook_settings(bridge_dir, python_executable or sys.executable, _POLICY_HOOK_MODULE)
     prompt_submit: list[_JsonObject] = [hook]
@@ -3358,7 +3358,7 @@ def _config_default_provider_base_url() -> str | None:
     """
     import tomllib
 
-    from omnigent.inner.codex_executor import _codex_home_config_source_from_env
+    from omnigent.harnesses.codex.executor import _codex_home_config_source_from_env
     from omnigent.onboarding.detected import codex_config_provider_dismissed
     from omnigent.onboarding.provider_config import load_config
 
@@ -3404,7 +3404,7 @@ def _config_toml_provider_base_url(provider_name: str) -> str | None:
     """
     import tomllib
 
-    from omnigent.inner.codex_executor import _codex_home_config_source_from_env
+    from omnigent.harnesses.codex.executor import _codex_home_config_source_from_env
 
     config_path = _codex_home_config_source_from_env() / "config.toml"
     try:
@@ -3683,7 +3683,7 @@ def resolve_native_codex_launch(
         config (issue #2744 — parity with the in-process codex harness).
     :returns: The resolved :class:`NativeCodexLaunch`.
     """
-    from omnigent.inference_config import (
+    from omnigent.models.inference_config import (
         load_runtime_inference_config,
         resolve_bound_model,
         resolve_bound_provider,
@@ -3832,11 +3832,11 @@ def resolve_native_codex_launch(
         # Use the managed host's Databricks broker only when no provider or
         # explicit API-key auth selected a route. Host boot populated ucode
         # state so the model resolves to a served id.
+        from omnigent.harnesses.databricks.executor import _read_databrickscfg_host
         from omnigent.host.databricks_credential import (
             HOST_DATABRICKS_PROFILE,
             broker_token_command,
         )
-        from omnigent.inner.databricks_executor import _read_databrickscfg_host
 
         connect_host = _read_databrickscfg_host(HOST_DATABRICKS_PROFILE)
         if connect_host and broker_token_command(connect_host.rstrip("/")):
@@ -4314,7 +4314,7 @@ _CODEX_BYPASS_HOOK_TRUST_FLAG = "--dangerously-bypass-hook-trust"
 _CODEX_APPROVAL_SANDBOX_FLAGS = frozenset({"--sandbox", "-s", "--ask-for-approval", "-a"})
 
 
-def _strip_approval_sandbox_flags(codex_args: tuple[str, ...]) -> list[str]:
+def _strip_approval_sandbox_flags(extra_args: tuple[str, ...]) -> list[str]:
     """
     Drop granular approval/sandbox flags (and values) when bypass is on.
 
@@ -4337,19 +4337,19 @@ def _strip_approval_sandbox_flags(codex_args: tuple[str, ...]) -> list[str]:
     re-add a single canonical copy. Unrelated args (model, config
     overrides, ...) pass through untouched.
 
-    :param codex_args: Raw Codex CLI args, e.g.
+    :param extra_args: Raw Codex CLI args, e.g.
         ``("--sandbox", "read-only", "--model", "gpt-5.4-mini")``.
-    :returns: ``codex_args`` with the conflicting flags removed, e.g.
+    :returns: ``extra_args`` with the conflicting flags removed, e.g.
         ``["--model", "gpt-5.4-mini"]``.
     """
-    codex_args = tuple(canonical_codex_launch_args(codex_args))
+    extra_args = tuple(canonical_codex_launch_args(extra_args))
     cleaned: list[str] = []
     i = 0
-    n = len(codex_args)
+    n = len(extra_args)
     while i < n:
-        arg = codex_args[i]
+        arg = extra_args[i]
         if arg == "--":
-            cleaned.extend(codex_args[i:])
+            cleaned.extend(extra_args[i:])
             break
         if arg in _CODEX_APPROVAL_SANDBOX_FLAGS:
             # ``--flag value``: drop the flag, and consume the NEXT token as
@@ -4357,7 +4357,7 @@ def _strip_approval_sandbox_flags(codex_args: tuple[str, ...]) -> list[str]:
             # does not itself start with ``-`` (a leading ``-`` marks a
             # separate flag, e.g. ``("--sandbox", "--model", "gpt")`` keeps
             # ``--model``; a trailing flag at end-of-list consumes nothing).
-            if i + 1 < n and not codex_args[i + 1].startswith("-"):
+            if i + 1 < n and not extra_args[i + 1].startswith("-"):
                 i += 2
             else:
                 i += 1
@@ -4376,9 +4376,9 @@ def _strip_approval_sandbox_flags(codex_args: tuple[str, ...]) -> list[str]:
     return cleaned
 
 
-def _strip_codex_resume_permission_args(codex_args: tuple[str, ...]) -> list[str]:
+def _strip_codex_resume_permission_args(extra_args: tuple[str, ...]) -> list[str]:
     """Omit permissions configured on the app-server at startup or thread/resume."""
-    args = _strip_approval_sandbox_flags(codex_args)
+    args = _strip_approval_sandbox_flags(extra_args)
     cleaned: list[str] = []
     index = 0
     while index < len(args):
@@ -4420,7 +4420,7 @@ def codex_remote_resume_omits_permission_args(
 
 def build_codex_remote_args(
     *,
-    codex_args: tuple[str, ...],
+    extra_args: tuple[str, ...],
     thread_id: str | None,
     remote_url: str,
     config_overrides: tuple[str, ...] = (),
@@ -4454,7 +4454,7 @@ def build_codex_remote_args(
     thread immediately. Codex global ``-c`` flags must precede the
     ``resume`` subcommand, so they are emitted first.
 
-    :param codex_args: Raw Codex CLI args that precede the attach flags,
+    :param extra_args: Raw Codex CLI args that precede the attach flags,
         e.g. ``("--model", "gpt-5.4-mini")``. Empty when the thread's own
         settings already cover everything.
     :param thread_id: Codex thread id to resume, e.g. ``"thread_abc123"``.
@@ -4476,7 +4476,7 @@ def build_codex_remote_args(
         resume, emit a single
         ``--dangerously-bypass-approvals-and-sandbox`` flag and strip any
         conflicting ``--sandbox`` / ``--ask-for-approval`` pairs from
-        *codex_args* (codex aborts at startup if the bypass flag is
+        *extra_args* (codex aborts at startup if the bypass flag is
         combined with either). DANGEROUS: this disables both the approval
         prompts and the command sandbox; it is gated behind an explicit,
         typed-confirmation opt-in in the web UI. Default ``False`` keeps
@@ -4502,9 +4502,9 @@ def build_codex_remote_args(
     if bypass_sandbox:
         # Strip the conflicting granular flags, then prepend one canonical
         # bypass flag (a global flag, so it precedes any ``resume``).
-        passthrough = [_CODEX_BYPASS_SANDBOX_FLAG, *_strip_approval_sandbox_flags(codex_args)]
+        passthrough = [_CODEX_BYPASS_SANDBOX_FLAG, *_strip_approval_sandbox_flags(extra_args)]
     else:
-        passthrough = normalize_codex_permission_launch_args(codex_args)
+        passthrough = normalize_codex_permission_launch_args(extra_args)
     passthrough = without_codex_config_profile(passthrough)
     if bypass_hook_trust:
         passthrough = [_CODEX_BYPASS_HOOK_TRUST_FLAG, *passthrough]
@@ -4514,7 +4514,7 @@ def build_codex_remote_args(
         return [*override_args, *passthrough, "resume", "--remote", remote_url, thread_id]
     # Codex rejects explicit permission overrides on remote resume, even
     # when they match the app-server policy. config_overrides went to server
-    # startup; codex_args went to preload's thread/resume call.
+    # startup; extra_args went to preload's thread/resume call.
     resume_args = _strip_codex_resume_permission_args((*override_args, *passthrough))
     return [*resume_args, "resume", "--remote", remote_url, thread_id]
 

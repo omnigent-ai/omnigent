@@ -33,8 +33,8 @@ from unittest.mock import patch
 import pytest
 
 from omnigent.entities import Conversation, ConversationItem
-from omnigent.server.routes._sessions.common import _llm_response_denied_turns
-from omnigent.server.routes._sessions.helpers import _flush_relay_text
+from omnigent.server.routes.sessions.common import _llm_response_denied_turns
+from omnigent.server.routes.sessions.helpers import _flush_relay_text
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
@@ -156,7 +156,7 @@ async def test_flush_evaluates_response_phase_at_terminal() -> None:
 
     with (
         patch(
-            "omnigent.server.routes._sessions.helpers._evaluate_output_policy",
+            "omnigent.server.routes.sessions.helpers._evaluate_output_policy",
             _fake_output_policy,
         ),
         patch("omnigent.runtime._globals._agent_store", object()),
@@ -186,7 +186,7 @@ async def test_flush_response_phase_allow_persists_unmodified() -> None:
 
     with (
         patch(
-            "omnigent.server.routes._sessions.helpers._evaluate_output_policy",
+            "omnigent.server.routes.sessions.helpers._evaluate_output_policy",
             _allow,
         ),
         patch("omnigent.runtime._globals._agent_store", object()),
@@ -216,7 +216,7 @@ async def test_flush_response_phase_failure_fails_open() -> None:
 
     with (
         patch(
-            "omnigent.server.routes._sessions.helpers._evaluate_output_policy",
+            "omnigent.server.routes.sessions.helpers._evaluate_output_policy",
             _boom,
         ),
         patch("omnigent.runtime._globals._agent_store", object()),
@@ -294,7 +294,7 @@ async def test_flush_persist_failure_leaves_buffer_for_retry() -> None:
     store = _FailingStore()
     text_acc = [_DENIED_TEXT]
 
-    with patch("omnigent.server.routes._sessions.helpers._publish_policy_deny"):
+    with patch("omnigent.server.routes.sessions.helpers._publish_policy_deny"):
         await _flush_relay_text(
             store,  # type: ignore[arg-type]
             "conv_retry_1",
@@ -342,11 +342,11 @@ async def test_response_phase_deny_survives_persist_failure_retry() -> None:
 
     with (
         patch(
-            "omnigent.server.routes._sessions.helpers._evaluate_output_policy",
+            "omnigent.server.routes.sessions.helpers._evaluate_output_policy",
             _deny_once_then_allow,
         ),
         patch("omnigent.runtime._globals._agent_store", object()),
-        patch("omnigent.server.routes._sessions.helpers._publish_policy_deny"),
+        patch("omnigent.server.routes.sessions.helpers._publish_policy_deny"),
     ):
         # First flush: DENY computed, persist fails — buffer must now
         # hold the sentinel.
@@ -392,11 +392,11 @@ async def test_mid_turn_boundary_flush_gates_response_phase() -> None:
 
     with (
         patch(
-            "omnigent.server.routes._sessions.helpers._evaluate_output_policy",
+            "omnigent.server.routes.sessions.helpers._evaluate_output_policy",
             _deny,
         ),
         patch("omnigent.runtime._globals._agent_store", object()),
-        patch("omnigent.server.routes._sessions.helpers._publish_policy_deny"),
+        patch("omnigent.server.routes.sessions.helpers._publish_policy_deny"),
     ):
         # Same call shape the relay's function_call-boundary flush uses.
         await _flush_relay_text(

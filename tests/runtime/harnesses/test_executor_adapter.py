@@ -1,9 +1,9 @@
 """
-Tests for :class:`omnigent.runtime.harnesses._executor_adapter.ExecutorAdapter`.
+Tests for :class:`omnigent.harnesses.runtime._executor_adapter.ExecutorAdapter`.
 
 End-to-end through real subprocesses spawned via the same
 :class:`HarnessProcessManager` used in production. Uses
-:class:`omnigent.inner.executor.MockExecutor` as the inner
+:class:`omnigent.core.executor.MockExecutor` as the inner
 executor — no real LLM SDK required. The adapter's per-event
 translation contract is what's under test; per-harness
 configuration (Claude SDK CLI discovery, Codex subprocess setup,
@@ -25,9 +25,9 @@ from typing import Any
 import httpx
 import pytest
 
-from omnigent.inner.executor import Executor
-from omnigent.runtime.harnesses import _HARNESS_MODULES
-from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
+from omnigent.core.executor import Executor
+from omnigent.harnesses.runtime import _HARNESS_MODULES
+from omnigent.harnesses.runtime.process_manager import HarnessProcessManager
 
 _TEST_HARNESS_NAME = "executor_adapter_fixture"
 _TEST_HARNESS_MODULE = "tests.runtime.harnesses._test_executor_adapter_harness"
@@ -423,9 +423,9 @@ async def test_executor_error_preserves_only_explicitly_idle_sessions(
     import asyncio
     from unittest.mock import AsyncMock, Mock
 
-    from omnigent.inner.executor import ExecutorError, MockExecutor, TextChunk
-    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
-    from omnigent.runtime.harnesses._scaffold import TurnContext
+    from omnigent.core.executor import ExecutorError, MockExecutor, TextChunk
+    from omnigent.harnesses.runtime._executor_adapter import ExecutorAdapter
+    from omnigent.harnesses.runtime._scaffold import TurnContext
     from omnigent.server.schemas import CreateResponseRequest
 
     executor = MockExecutor()
@@ -571,7 +571,7 @@ def test_build_error_detail_keeps_inner_executor_error_fields() -> None:
     and next step, so the web card reads as that failure instead of as a bare
     ``RuntimeError``.
     """
-    from omnigent.runtime.harnesses._executor_adapter import (
+    from omnigent.harnesses.runtime._executor_adapter import (
         ExecutorAdapter,
         InnerExecutorError,
     )
@@ -605,12 +605,12 @@ async def test_coded_executor_error_is_raised_with_its_code() -> None:
     """
     import asyncio
 
-    from omnigent.inner.executor import ExecutorError, MockExecutor
-    from omnigent.runtime.harnesses._executor_adapter import (
+    from omnigent.core.executor import ExecutorError, MockExecutor
+    from omnigent.harnesses.runtime._executor_adapter import (
         ExecutorAdapter,
         InnerExecutorError,
     )
-    from omnigent.runtime.harnesses._scaffold import TurnContext
+    from omnigent.harnesses.runtime._scaffold import TurnContext
     from omnigent.server.schemas import CreateResponseRequest
 
     executor = MockExecutor()
@@ -657,9 +657,9 @@ def test_build_error_detail_uses_omnigent_error_code() -> None:
     timeout as permanent. The whole point of step 5j is the
     structured ``code + retryable`` flowing through.
     """
+    from omnigent.harnesses.runtime._executor_adapter import ExecutorAdapter
+    from omnigent.harnesses.runtime._scaffold import HarnessApp
     from omnigent.llms.errors import LLMErrorDetail, RetryableLLMError
-    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
-    from omnigent.runtime.harnesses._scaffold import HarnessApp
 
     adapter = ExecutorAdapter(executor_factory=lambda: _StubExecutor())
     error = RetryableLLMError(
@@ -698,7 +698,7 @@ def test_classify_openai_exception_maps_known_types() -> None:
     """
     import openai
 
-    from omnigent.runtime.harnesses._executor_adapter import (
+    from omnigent.harnesses.runtime._executor_adapter import (
         _classify_openai_exception,
     )
 
@@ -746,7 +746,7 @@ def test_classify_openai_exception_context_length_exceeded_direct() -> None:
     """
     import openai
 
-    from omnigent.runtime.harnesses._executor_adapter import (
+    from omnigent.harnesses.runtime._executor_adapter import (
         _classify_openai_exception,
     )
 
@@ -770,7 +770,7 @@ def test_classify_openai_exception_context_length_exceeded_wrapped() -> None:
     """
     import openai
 
-    from omnigent.runtime.harnesses._executor_adapter import (
+    from omnigent.harnesses.runtime._executor_adapter import (
         _classify_openai_exception,
     )
 
@@ -801,7 +801,7 @@ def test_classify_claude_sdk_exception_maps_connection_error() -> None:
     """
     import claude_agent_sdk
 
-    from omnigent.runtime.harnesses._executor_adapter import (
+    from omnigent.harnesses.runtime._executor_adapter import (
         _classify_claude_sdk_exception,
     )
 
@@ -827,7 +827,7 @@ def test_classify_httpx_exception_maps_timeout_and_connect() -> None:
     httpx layer (rather than inside the SDK's wrapper) would
     not be retryable.
     """
-    from omnigent.runtime.harnesses._executor_adapter import (
+    from omnigent.harnesses.runtime._executor_adapter import (
         _classify_httpx_exception,
     )
 
@@ -854,7 +854,7 @@ def test_classify_anthropic_exception_returns_none_when_sdk_not_installed() -> N
     error in environments that don't ship the SDK (e.g. the
     openai-agents wrap deployment).
     """
-    from omnigent.runtime.harnesses._executor_adapter import (
+    from omnigent.harnesses.runtime._executor_adapter import (
         _classify_anthropic_exception,
     )
 
@@ -921,7 +921,7 @@ def test_classify_anthropic_exception_maps_known_types(
     fake_anthropic.InternalServerError = _InternalServer  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, "anthropic", fake_anthropic)
 
-    from omnigent.runtime.harnesses._executor_adapter import (
+    from omnigent.harnesses.runtime._executor_adapter import (
         _classify_anthropic_exception,
     )
 
@@ -958,7 +958,7 @@ def test_classify_inner_exception_dispatches_across_sdks(
 
     import openai
 
-    from omnigent.runtime.harnesses._executor_adapter import (
+    from omnigent.harnesses.runtime._executor_adapter import (
         classify_inner_exception,
     )
 
@@ -1038,7 +1038,7 @@ def test_translate_input_to_messages_reconstructs_full_history() -> None:
     context and answers "What?" the way the user reported
     against ``--resume``.
     """
-    from omnigent.runtime.harnesses._executor_adapter import (
+    from omnigent.harnesses.runtime._executor_adapter import (
         _translate_input_to_messages,
     )
 
@@ -1088,7 +1088,7 @@ def test_translate_input_to_messages_string_input_fallback() -> None:
     user-role :class:`Message` so the inner executor's
     single-turn path keeps working.
     """
-    from omnigent.runtime.harnesses._executor_adapter import (
+    from omnigent.harnesses.runtime._executor_adapter import (
         _translate_input_to_messages,
     )
 
@@ -1108,7 +1108,7 @@ def test_translate_input_to_messages_legacy_content_blocks_fallback() -> None:
     future cleanup doesn't accidentally drop bare-block
     callers.
     """
-    from omnigent.runtime.harnesses._executor_adapter import (
+    from omnigent.harnesses.runtime._executor_adapter import (
         _translate_input_to_messages,
     )
 
@@ -1138,7 +1138,7 @@ def test_translate_input_to_messages_drops_empty_message_blocks() -> None:
     serialized "Conversation so far:" prefix focused on the
     parts the LLM actually benefits from.
     """
-    from omnigent.runtime.harnesses._executor_adapter import (
+    from omnigent.harnesses.runtime._executor_adapter import (
         _translate_input_to_messages,
     )
 
@@ -1236,8 +1236,8 @@ def test_translate_event_mcp_tool_call_request_emits_observed_with_bare_name() -
     Pinning the bare-name contract here keeps the adapter's
     emission consistent with the rest of the Omnigent wire path.
     """
-    from omnigent.inner.executor import ToolCallRequest
-    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.core.executor import ToolCallRequest
+    from omnigent.harnesses.runtime._executor_adapter import ExecutorAdapter
 
     adapter = ExecutorAdapter(executor_factory=lambda: _StubExecutor())
     ctx = _RecordingTurnContext(response_id="resp_test")
@@ -1287,8 +1287,8 @@ def test_tool_call_complete_suppressed_for_dispatched_executor() -> None:
     """A normal internally-handling executor's ``ToolCallComplete`` is
     suppressed mid-turn (its tools round-trip through dispatch_tool, which
     emits the output) — the existing dedup contract."""
-    from omnigent.inner.executor import ToolCallComplete, ToolCallStatus
-    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.core.executor import ToolCallComplete, ToolCallStatus
+    from omnigent.harnesses.runtime._executor_adapter import ExecutorAdapter
 
     adapter = ExecutorAdapter(executor_factory=lambda: _StubExecutor())
     adapter._executor = _StubExecutor()  # type: ignore[assignment]
@@ -1318,8 +1318,8 @@ def test_observed_tool_call_reemits_a_completed_function_call() -> None:
     function_call (which persists), then the function_call_output. Same call_id →
     the web dedupes the live in_progress render and this one into a single card.
     """
-    from omnigent.inner.executor import ToolCallComplete, ToolCallRequest, ToolCallStatus
-    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.core.executor import ToolCallComplete, ToolCallRequest, ToolCallStatus
+    from omnigent.harnesses.runtime._executor_adapter import ExecutorAdapter
 
     adapter = ExecutorAdapter(executor_factory=lambda: _StubExecutor())
     ctx = _RecordingTurnContext(response_id="resp_obs")
@@ -1360,8 +1360,8 @@ def test_uncached_completion_reemits_no_function_call() -> None:
     is what keeps the re-emission from firing for a call whose durable completed
     form some other path already produced (see the observed_call_completed test).
     """
-    from omnigent.inner.executor import ToolCallComplete, ToolCallStatus
-    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.core.executor import ToolCallComplete, ToolCallStatus
+    from omnigent.harnesses.runtime._executor_adapter import ExecutorAdapter
 
     adapter = ExecutorAdapter(executor_factory=lambda: _StubExecutor())
     ctx = _RecordingTurnContext(response_id="resp_obs")
@@ -1389,8 +1389,8 @@ def test_observed_call_completed_request_is_not_reemitted_at_completion() -> Non
     completed card. Regression guard: without the cache pop, this observed call
     would render (and persist) two identical completed cards.
     """
-    from omnigent.inner.executor import ToolCallComplete, ToolCallRequest, ToolCallStatus
-    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.core.executor import ToolCallComplete, ToolCallRequest, ToolCallStatus
+    from omnigent.harnesses.runtime._executor_adapter import ExecutorAdapter
 
     adapter = ExecutorAdapter(executor_factory=lambda: _StubExecutor())
     ctx = _RecordingTurnContext(response_id="resp_obs")
@@ -1432,8 +1432,8 @@ def test_dispatched_call_does_not_reemit_a_completed_function_call() -> None:
     function_call via dispatch_tool, so the ToolCallComplete short-circuits before
     the re-emission. Re-emitting here would double the card.
     """
-    from omnigent.inner.executor import ToolCallComplete, ToolCallStatus
-    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.core.executor import ToolCallComplete, ToolCallStatus
+    from omnigent.harnesses.runtime._executor_adapter import ExecutorAdapter
 
     adapter = ExecutorAdapter(executor_factory=lambda: _StubExecutor())
     ctx = _RecordingTurnContext()
@@ -1462,8 +1462,8 @@ def test_translate_event_mcp_request_queues_tool_use_id_for_dispatch() -> None:
     observed call_id — and the SDK client can't dedupe, so the
     REPL renders ``⏵ tool_name`` twice.
     """
-    from omnigent.inner.executor import ToolCallRequest
-    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.core.executor import ToolCallRequest
+    from omnigent.harnesses.runtime._executor_adapter import ExecutorAdapter
 
     adapter = ExecutorAdapter(executor_factory=lambda: _StubExecutor())
     ctx = _RecordingTurnContext()
@@ -1516,8 +1516,8 @@ def test_translate_event_non_mcp_request_queues_tool_use_id() -> None:
     Executors that observe a tool already run by the native harness mark
     it ``internally_executed`` and bypass this queue entirely.
     """
-    from omnigent.inner.executor import ToolCallRequest
-    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.core.executor import ToolCallRequest
+    from omnigent.harnesses.runtime._executor_adapter import ExecutorAdapter
 
     adapter = ExecutorAdapter(executor_factory=lambda: _StubExecutor())
     ctx = _RecordingTurnContext()
@@ -1546,8 +1546,8 @@ def test_translate_event_non_mcp_request_queues_tool_use_id() -> None:
 def test_internally_executed_tool_bypasses_dispatch_correlation_queue() -> None:
     """Keep an observed native tool from corrupting a later dispatch identity."""
 
-    from omnigent.inner.executor import ToolCallComplete, ToolCallRequest, ToolCallStatus
-    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.core.executor import ToolCallComplete, ToolCallRequest, ToolCallStatus
+    from omnigent.harnesses.runtime._executor_adapter import ExecutorAdapter
 
     adapter = ExecutorAdapter(executor_factory=lambda: _StubExecutor())
     ctx = _RecordingTurnContext()
@@ -1590,8 +1590,8 @@ def test_translate_event_request_without_tool_use_id_does_not_queue() -> None:
     to correlate, and pushing ``None`` (or any sentinel)
     would mis-pair a later dispatch against a non-existent id.
     """
-    from omnigent.inner.executor import ToolCallRequest
-    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.core.executor import ToolCallRequest
+    from omnigent.harnesses.runtime._executor_adapter import ExecutorAdapter
 
     adapter = ExecutorAdapter(executor_factory=lambda: _StubExecutor())
     ctx = _RecordingTurnContext()
@@ -1633,7 +1633,7 @@ def test_run_turn_clears_mcp_queue_at_turn_start() -> None:
     state-check is more decisive than threading a complete
     turn through HarnessProcessManager.
     """
-    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.harnesses.runtime._executor_adapter import ExecutorAdapter
 
     adapter = ExecutorAdapter(executor_factory=lambda: _StubExecutor())
     # Simulate stale state from a prior turn that never drained.
@@ -1678,7 +1678,7 @@ async def test_stable_tool_executor_pops_queue_for_bare_tool_name() -> None:
     callback receives the bare name, so the pop must NOT gate
     on the prefix.
     """
-    from omnigent.runtime.harnesses._executor_adapter import (
+    from omnigent.harnesses.runtime._executor_adapter import (
         ExecutorAdapter,
         _bridge_one_dispatch,
     )
@@ -1780,8 +1780,8 @@ async def test_observed_and_dispatched_call_ids_match_for_openai_agents() -> Non
     MCP-prefix gate on the queue push will fail this test
     immediately.
     """
-    from omnigent.inner.executor import ToolCallRequest
-    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.core.executor import ToolCallRequest
+    from omnigent.harnesses.runtime._executor_adapter import ExecutorAdapter
 
     adapter = ExecutorAdapter(executor_factory=lambda: _StubExecutor())
     ctx = _RecordingTurnContext()
@@ -1870,9 +1870,9 @@ async def test_observed_and_dispatched_call_ids_match_for_openai_agents() -> Non
 @pytest.mark.asyncio
 async def test_executor_adapter_builds_config_from_request() -> None:
     """Forwards request controls but not agent name as executor model."""
-    from omnigent.inner.executor import Executor, ExecutorConfig, Message, ToolSpec, TurnComplete
-    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
-    from omnigent.runtime.harnesses._scaffold import TurnContext
+    from omnigent.core.executor import Executor, ExecutorConfig, Message, ToolSpec, TurnComplete
+    from omnigent.harnesses.runtime._executor_adapter import ExecutorAdapter
+    from omnigent.harnesses.runtime._scaffold import TurnContext
     from omnigent.server.schemas import CreateResponseRequest
 
     captured: dict[str, object] = {}
@@ -1921,9 +1921,9 @@ async def test_executor_adapter_forwards_model_override_to_config() -> None:
     Without this, every harness-backed agent silently ignores
     ``/model``.
     """
-    from omnigent.inner.executor import Executor, ExecutorConfig, Message, ToolSpec, TurnComplete
-    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
-    from omnigent.runtime.harnesses._scaffold import TurnContext
+    from omnigent.core.executor import Executor, ExecutorConfig, Message, ToolSpec, TurnComplete
+    from omnigent.harnesses.runtime._executor_adapter import ExecutorAdapter
+    from omnigent.harnesses.runtime._scaffold import TurnContext
     from omnigent.server.schemas import CreateResponseRequest
 
     captured: dict[str, object] = {}
@@ -2031,7 +2031,7 @@ async def test_watch_injections_emits_consumed_marker_on_accept() -> None:
     """
     import asyncio as _aio
 
-    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.harnesses.runtime._executor_adapter import ExecutorAdapter
     from omnigent.server.schemas import CreateResponseRequest, InjectionConsumedEvent
 
     executor = _AcceptingInjectionExecutor()
@@ -2075,7 +2075,7 @@ async def test_watch_injections_drops_injection_when_turn_cancelled() -> None:
     """
     import asyncio as _aio
 
-    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.harnesses.runtime._executor_adapter import ExecutorAdapter
     from omnigent.server.schemas import CreateResponseRequest
 
     executor = _AcceptingInjectionExecutor()
@@ -2106,7 +2106,7 @@ async def test_watch_injections_no_marker_without_injection_id() -> None:
     """
     import asyncio as _aio
 
-    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.harnesses.runtime._executor_adapter import ExecutorAdapter
     from omnigent.server.schemas import CreateResponseRequest
 
     executor = _AcceptingInjectionExecutor()
@@ -2163,8 +2163,8 @@ async def test_interrupt_drops_inner_session_synchronously() -> None:
     """
     import asyncio as _aio
 
-    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
-    from omnigent.runtime.harnesses._scaffold import TurnContext
+    from omnigent.harnesses.runtime._executor_adapter import ExecutorAdapter
+    from omnigent.harnesses.runtime._scaffold import TurnContext
 
     executor = _InterruptTrackingExecutor()
     adapter = ExecutorAdapter(executor_factory=lambda: executor, session_key="sk")
@@ -2204,8 +2204,8 @@ def test_internal_errored_tool_complete_emits_output_with_real_call_id() -> None
     id and is NEVER ``call_id == ""`` (the pre-fix coercion that orphaned the
     result and left the call a perpetual in-progress card).
     """
-    from omnigent.inner.executor import ToolCallComplete, ToolCallRequest, ToolCallStatus
-    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.core.executor import ToolCallComplete, ToolCallRequest, ToolCallStatus
+    from omnigent.harnesses.runtime._executor_adapter import ExecutorAdapter
 
     adapter = ExecutorAdapter(executor_factory=lambda: _StubExecutor())
     ctx = _RecordingTurnContext()
@@ -2257,8 +2257,8 @@ def test_internal_errored_tool_complete_emits_output_with_real_call_id() -> None
 def test_completed_observed_tool_request_is_durable() -> None:
     """Mark the completed observation durable while retaining the live start."""
 
-    from omnigent.inner.executor import ToolCallRequest
-    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.core.executor import ToolCallRequest
+    from omnigent.harnesses.runtime._executor_adapter import ExecutorAdapter
 
     adapter = ExecutorAdapter(executor_factory=lambda: _StubExecutor())
     ctx = _RecordingTurnContext()
@@ -2307,8 +2307,8 @@ def test_dispatched_id_tool_complete_is_suppressed() -> None:
     stream and produce a ghost "Waiting for output" card in the Web UI. So a
     ``ToolCallComplete`` carrying a dispatched id must produce NO emit.
     """
-    from omnigent.inner.executor import ToolCallComplete, ToolCallStatus
-    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.core.executor import ToolCallComplete, ToolCallStatus
+    from omnigent.harnesses.runtime._executor_adapter import ExecutorAdapter
 
     adapter = ExecutorAdapter(executor_factory=lambda: _StubExecutor())
     ctx = _RecordingTurnContext()
@@ -2344,8 +2344,8 @@ def test_non_dispatched_id_tool_complete_emits_output() -> None:
     ``dispatch_tool`` round-trip) has its completion as the ONLY output source, so
     it must surface a paired ``function_call_output``.
     """
-    from omnigent.inner.executor import ToolCallComplete, ToolCallStatus
-    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.core.executor import ToolCallComplete, ToolCallStatus
+    from omnigent.harnesses.runtime._executor_adapter import ExecutorAdapter
 
     adapter = ExecutorAdapter(executor_factory=lambda: _StubExecutor())
     ctx = _RecordingTurnContext()
@@ -2383,8 +2383,8 @@ def test_idless_tool_complete_is_suppressed() -> None:
     id-scoped suppression must keep doing so (the ``or ""`` coercion alone left
     this path unguarded).
     """
-    from omnigent.inner.executor import ToolCallComplete, ToolCallStatus
-    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.core.executor import ToolCallComplete, ToolCallStatus
+    from omnigent.harnesses.runtime._executor_adapter import ExecutorAdapter
 
     adapter = ExecutorAdapter(executor_factory=lambda: _StubExecutor())
     ctx = _RecordingTurnContext()
@@ -2414,7 +2414,7 @@ async def test_policy_evaluator_no_active_turn_context_is_phase_aware() -> None:
     phases and the post-execution result phase fail open so a transient desync
     does not needlessly wedge them — matching the runner's phase-aware default.
     """
-    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.harnesses.runtime._executor_adapter import ExecutorAdapter
 
     adapter = ExecutorAdapter(executor_factory=lambda: _StubExecutor())
     adapter._current_ctx = None
@@ -2473,7 +2473,7 @@ async def test_elicitation_choice_handler_asks_for_one_button_per_option() -> No
     half silently collapses the card back to Approve/Reject, so it is asserted
     exactly here.
     """
-    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.harnesses.runtime._executor_adapter import ExecutorAdapter
     from omnigent.server.schemas import ElicitationResult
 
     adapter = ExecutorAdapter(executor_factory=lambda: _StubExecutor())
@@ -2507,7 +2507,7 @@ async def test_elicitation_choice_handler_asks_for_one_button_per_option() -> No
 @pytest.mark.asyncio
 async def test_elicitation_choice_handler_declines_on_a_dismissed_card() -> None:
     """A declined card returns no choice and signals cancellation, as before."""
-    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.harnesses.runtime._executor_adapter import ExecutorAdapter
     from omnigent.server.schemas import ElicitationResult
 
     adapter = ExecutorAdapter(executor_factory=lambda: _StubExecutor())
@@ -2523,7 +2523,7 @@ async def test_elicitation_choice_handler_declines_on_a_dismissed_card() -> None
 @pytest.mark.asyncio
 async def test_elicitation_choice_handler_declines_without_a_turn() -> None:
     """An orphaned callback declines rather than granting a scope unreviewed."""
-    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.harnesses.runtime._executor_adapter import ExecutorAdapter
 
     adapter = ExecutorAdapter(executor_factory=lambda: _StubExecutor())
     assert adapter._current_ctx is None
@@ -2543,9 +2543,9 @@ async def test_run_turn_installs_the_choice_bridge_only_where_supported() -> Non
     """
     import asyncio
 
-    from omnigent.inner.executor import Executor, ExecutorConfig, Message, ToolSpec, TurnComplete
-    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
-    from omnigent.runtime.harnesses._scaffold import TurnContext
+    from omnigent.core.executor import Executor, ExecutorConfig, Message, ToolSpec, TurnComplete
+    from omnigent.harnesses.runtime._executor_adapter import ExecutorAdapter
+    from omnigent.harnesses.runtime._scaffold import TurnContext
     from omnigent.server.schemas import CreateResponseRequest
 
     class _ChoiceCapableExecutor(Executor):
@@ -2595,8 +2595,8 @@ def test_translate_event_emits_subagent_started() -> None:
     into a child session. If it stops emitting, the Subagents panel goes empty
     for the agent.
     """
-    from omnigent.inner.executor import SubAgentStarted
-    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.core.executor import SubAgentStarted
+    from omnigent.harnesses.runtime._executor_adapter import ExecutorAdapter
     from omnigent.server.schemas import SubagentStartedEvent
 
     adapter = ExecutorAdapter(executor_factory=lambda: _StubExecutor())
@@ -2618,8 +2618,8 @@ def test_translate_event_emits_subagent_started() -> None:
 
 def test_translate_event_emits_subagent_completed() -> None:
     """A ``SubAgentCompleted`` becomes the runner-internal ``subagent.completed`` SSE event."""
-    from omnigent.inner.executor import SubAgentCompleted
-    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.core.executor import SubAgentCompleted
+    from omnigent.harnesses.runtime._executor_adapter import ExecutorAdapter
     from omnigent.server.schemas import SubagentCompletedEvent
 
     adapter = ExecutorAdapter(executor_factory=lambda: _StubExecutor())
@@ -2645,8 +2645,8 @@ def test_translate_event_emits_subagent_tool_call() -> None:
     The runner appends this to the child transcript as a ``function_call`` card,
     so ``arguments`` must be the JSON-encoded string the item expects.
     """
-    from omnigent.inner.executor import SubAgentToolCall
-    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.core.executor import SubAgentToolCall
+    from omnigent.harnesses.runtime._executor_adapter import ExecutorAdapter
     from omnigent.server.schemas import SubagentToolCallEvent
 
     adapter = ExecutorAdapter(executor_factory=lambda: _StubExecutor())
@@ -2680,8 +2680,8 @@ def test_interrupt_slice_covers_pi_rpc_session_close_reap_budget() -> None:
     SIGKILL fallback never runs and the Pi subprocess is orphaned. The fix
     raises the slice to 3.0s to give close() room to time out cleanly first.
     """
-    from omnigent.inner.pi_executor import _RPC_SESSION_CLOSE_REAP_TIMEOUT_S
-    from omnigent.runtime.harnesses._executor_adapter import _INTERRUPT_SLICE_S
+    from omnigent.harnesses.pi.executor import _RPC_SESSION_CLOSE_REAP_TIMEOUT_S
+    from omnigent.harnesses.runtime._executor_adapter import _INTERRUPT_SLICE_S
 
     assert _INTERRUPT_SLICE_S >= _RPC_SESSION_CLOSE_REAP_TIMEOUT_S, (
         f"_INTERRUPT_SLICE_S={_INTERRUPT_SLICE_S} is shorter than "
@@ -2692,9 +2692,9 @@ def test_interrupt_slice_covers_pi_rpc_session_close_reap_budget() -> None:
 
 
 def test_observer_records_raw_output_in_omnigent_session(tmp_path, monkeypatch) -> None:
-    from omnigent.inner.executor import ToolCallComplete, ToolCallRequest, ToolCallStatus
+    from omnigent.core.executor import ToolCallComplete, ToolCallRequest, ToolCallStatus
+    from omnigent.harnesses.runtime._executor_adapter import ExecutorAdapter
     from omnigent.runner.session_prs import SessionPrRegistry
-    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
 
     monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
     adapter = ExecutorAdapter(executor_factory=_StubExecutor)

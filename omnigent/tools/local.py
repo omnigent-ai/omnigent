@@ -49,11 +49,11 @@ from typing import Any
 
 from omnigent_client.tools import ToolMetadata, get_tool_metadata
 
-from omnigent.runner.identity import strip_runner_auth_secrets
 from omnigent.spec.types import LocalToolInfo, SandboxConfig, ToolRuntime
 from omnigent.tools._pep723 import parse_inline_metadata
 from omnigent.tools._srt import wrap_with_srt
 from omnigent.tools.base import Tool, ToolContext
+from omnigent.util.runner_identity import strip_runner_auth_secrets
 
 _logger = logging.getLogger(__name__)
 

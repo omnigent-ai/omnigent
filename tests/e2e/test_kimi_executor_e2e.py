@@ -1,9 +1,9 @@
-"""End-to-end tests for :class:`omnigent.inner.kimi_executor.KimiExecutor`.
+"""End-to-end tests for :class:`omnigent.harnesses.kimi.executor.KimiExecutor`.
 
 Real-binary tests gated on:
 
 - ``OMNIGENT_E2E_KIMI=1`` in the environment, and
-- the ``kimi`` binary (or whichever ``HARNESS_KIMI_PATH`` points at)
+- the ``kimi`` binary (or whichever ``OMNIGENT_KIMI_PATH`` points at)
   present on PATH.
 
 When either gate fails the test is skipped — keeps CI green without the
@@ -23,8 +23,8 @@ from typing import Any
 
 import pytest
 
-from omnigent.inner.executor import TextChunk, TurnComplete
-from omnigent.inner.kimi_executor import KimiExecutor, _resolve_kimi_binary
+from omnigent.core.executor import TextChunk, TurnComplete
+from omnigent.harnesses.kimi.executor import KimiExecutor, _resolve_kimi_binary
 
 
 def _kimi_e2e_enabled() -> bool:
@@ -37,7 +37,7 @@ pytestmark = pytest.mark.skipif(
     not _kimi_e2e_enabled(),
     reason=(
         "Real-binary e2e: requires OMNIGENT_E2E_KIMI=1 and the ``kimi`` (or "
-        "HARNESS_KIMI_PATH) binary on PATH. Install via "
+        "OMNIGENT_KIMI_PATH) binary on PATH. Install via "
         "`curl -fsSL https://code.kimi.com/kimi-code/install.sh | bash` and "
         "run ``kimi login`` once, then re-run with OMNIGENT_E2E_KIMI=1."
     ),

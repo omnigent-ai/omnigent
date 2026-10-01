@@ -1,7 +1,7 @@
 """OpenCode HTTP + SSE implementation of :class:`NativeServerTransport`.
 
 All OpenCode wire details live here;
-:class:`omnigent.native.native_server_harness.NativeServerHarness` drives it through
+:class:`omnigent.harnesses.native.server_harness.NativeServerHarness` drives it through
 the transport protocol only.
 
 The transport can build its client from three sources, in priority order:
@@ -17,6 +17,13 @@ from collections.abc import AsyncIterator, Callable, Mapping
 from pathlib import Path
 from typing import TypeAlias
 
+from omnigent.harnesses.native.server_transport import (
+    NativeEvent,
+    NativeLaunchConfig,
+    NativePermissionDecision,
+    NativePrompt,
+    NativeServerHandle,
+)
 from omnigent.harnesses.opencode_native.app_server import (
     OpenCodeNativeServer,
     build_opencode_attach_args,
@@ -25,13 +32,6 @@ from omnigent.harnesses.opencode_native.app_server import (
 )
 from omnigent.harnesses.opencode_native.bridge import read_bridge_state
 from omnigent.harnesses.opencode_native.client import OpenCodeClient
-from omnigent.native.native_server_transport import (
-    NativeEvent,
-    NativeLaunchConfig,
-    NativePermissionDecision,
-    NativePrompt,
-    NativeServerHandle,
-)
 from omnigent.util.json_types import JsonObject as _JsonObject
 
 _logger = logging.getLogger(__name__)
@@ -279,7 +279,7 @@ class OpenCodeHttpTransport:
             server_url=server_url,
             workspace=launch.workspace,
             session_id=session_id,
-            opencode_args=launch.terminal_launch_args,
+            extra_args=launch.terminal_launch_args,
         )
         env: Mapping[str, str] = (
             opencode_terminal_env(self._server) if self._server is not None else {}

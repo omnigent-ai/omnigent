@@ -57,8 +57,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
 
-from omnigent.process_logging import LOG_TTY_FD_ENV_VAR, env_truthy
-from omnigent.runner.identity import RUNNER_WORKSPACE_ENV_VAR
+from omnigent.observability.process_logging import LOG_TTY_FD_ENV_VAR, env_truthy
+from omnigent.util.runner_identity import RUNNER_WORKSPACE_ENV_VAR
 
 # Env var the daemon sets to the inherited control-socket fd number.
 ZYGOTE_CONTROL_FD_ENV_VAR = "OMNIGENT_RUNNER_ZYGOTE_CONTROL_FD"
@@ -189,13 +189,13 @@ def _import_runner_graph() -> None:
     heaviest part is the fastapi/pydantic/omnigent-core graph the runner
     already holds, so this adds little resident cost).
     """
+    from omnigent.harnesses.runtime import _runner as _harness_runner  # noqa: F401
     from omnigent.runner import _entry, app, native  # noqa: F401
     from omnigent.runner.background_titles import (  # noqa: F401
         claude_native,
         codex_native,
         sdk,
     )
-    from omnigent.runtime.harnesses import _runner as _harness_runner  # noqa: F401
 
 
 def _wire_child_stdio(log_path: str | None) -> None:
@@ -317,7 +317,7 @@ def _maybe_run_test_seam() -> None:
 def _run_harness_child(request: dict[str, Any]) -> None:
     """Execute a harness subprocess in the freshly forked child. Never returns.
 
-    Reproduces ``python -m omnigent.runtime.harnesses._runner`` (which the
+    Reproduces ``python -m omnigent.harnesses.runtime._runner`` (which the
     process manager would otherwise exec) in-process, so the harness shares the
     zygote's already-imported graph copy-on-write. The fork handler has already
     closed every inherited zygote control socket.
@@ -332,7 +332,7 @@ def _run_harness_child(request: dict[str, Any]) -> None:
     # A directly-exec'd harness inherits the runner's stdout/stderr; a
     # zygote-forked one inherits the zygote's, so point it at the harness log
     # (from PROCESS_LOG_FILE) to keep operator-visible output where it belongs.
-    from omnigent.process_logging import PROCESS_LOG_FILE_ENV_VAR
+    from omnigent.observability.process_logging import PROCESS_LOG_FILE_ENV_VAR
 
     _wire_child_stdio(os.environ.get(PROCESS_LOG_FILE_ENV_VAR))
 
@@ -369,7 +369,7 @@ def _run_harness_child(request: dict[str, Any]) -> None:
         sys.stdout.flush()
         os._exit(int(test_exit))
 
-    from omnigent.runtime.harnesses._runner import main
+    from omnigent.harnesses.runtime._runner import main
 
     main(list(request.get("argv") or []))
 

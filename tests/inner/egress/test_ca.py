@@ -1,4 +1,4 @@
-"""Tests for omnigent.inner.egress.ca — CA generation and bundle creation."""
+"""Tests for omnigent.sandbox.egress.ca — CA generation and bundle creation."""
 
 from __future__ import annotations
 
@@ -11,8 +11,8 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.x509.oid import NameOID
 
-from omnigent.inner.egress import ca as ca_module
-from omnigent.inner.egress.ca import ensure_ca, ensure_ca_bundle
+from omnigent.sandbox.egress import ca as ca_module
+from omnigent.sandbox.egress.ca import ensure_ca, ensure_ca_bundle
 
 
 def test_ensure_ca_generates_new_ca(tmp_path: Path) -> None:

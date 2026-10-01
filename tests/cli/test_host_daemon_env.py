@@ -10,13 +10,13 @@ from unittest.mock import patch
 import keyring.errors
 import pytest
 
-from omnigent.cli import _build_host_daemon_env
+from omnigent.cli.commands import _build_host_daemon_env
 from omnigent.host.connect import (
     RUNNER_ENV_PASSTHROUGH_ENV_VAR,
     _build_runner_env,
 )
 from omnigent.onboarding.provider_config import resolve_secret
-from omnigent.runner.identity import (
+from omnigent.util.runner_identity import (
     RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR,
     strip_runner_auth_secrets,
 )

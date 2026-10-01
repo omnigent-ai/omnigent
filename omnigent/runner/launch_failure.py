@@ -19,8 +19,8 @@ import re
 from collections.abc import Callable
 from dataclasses import dataclass
 
-from omnigent.cli_invocation import cli_invocation
 from omnigent.errors import ErrorCategory
+from omnigent.util.cli_invocation import cli_invocation
 
 __all__ = [
     "FailureDiagnosis",

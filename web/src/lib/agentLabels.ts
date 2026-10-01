@@ -164,7 +164,7 @@ const NO_ACP_HARNESSES: ReadonlySet<string> = new Set<string>();
  * user-configured ``acp:<slug>`` agents alike.
  *
  * Server-derived on purpose: a new builtin ACP row is one data entry in
- * ``omnigent/acp_cli_harnesses.py``, and the picker recognizes it (grouping +
+ * ``omnigent/harnesses/acp/cli_harnesses.py``, and the picker recognizes it (grouping +
  * label) with no frontend change. Empty until the catalog loads, and on a
  * server too old to report capabilities — callers fall back to the id
  * heuristic in ``agentGrouping``.

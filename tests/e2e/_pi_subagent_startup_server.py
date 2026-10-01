@@ -147,7 +147,7 @@ class PiStartupObservationMiddleware:
 def main() -> None:
     """Add observation middleware, then delegate startup to the real server CLI."""
     import omnigent.server.app as server_app
-    from omnigent.cli import cli
+    from omnigent.cli.commands import cli
 
     evidence_dir = Path(os.environ["PI_STARTUP_TEST_EVIDENCE_DIR"])
     real_create_app = server_app.create_app

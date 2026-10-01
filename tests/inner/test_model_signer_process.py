@@ -16,18 +16,18 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 
-from omnigent.inner._proc import process_alive
-from omnigent.inner.egress.proxy import EgressProxy
-from omnigent.inner.egress.relay import start_relay
-from omnigent.inner.model_egress import FrozenModelRoute
-from omnigent.inner.model_signer import (
+from omnigent.models.signer.egress import FrozenModelRoute
+from omnigent.models.signer.lifecycle import (
     ProviderAuthRequired,
     SignerLaunchConfig,
     SignerStartError,
     SubprocessModelSigner,
     _parse_readiness,
 )
-from omnigent.inner.model_signer_service import _SignerRelay
+from omnigent.models.signer.service import _SignerRelay
+from omnigent.sandbox.egress.proxy import EgressProxy
+from omnigent.sandbox.egress.relay import start_relay
+from omnigent.util.proc import process_alive
 
 
 def _config(binding_id: str) -> SignerLaunchConfig:
@@ -191,7 +191,7 @@ async def test_signer_receives_non_secret_config_and_returns_readiness(
     child = tmp_path / "signer_child.py"
     _write_child(child)
     monkeypatch.setattr(
-        "omnigent.inner.model_signer._signer_child_argv",
+        "omnigent.models.signer.lifecycle._signer_child_argv",
         lambda: [sys.executable, str(child)],
     )
     signer = SubprocessModelSigner(_config("ok"))
@@ -213,7 +213,7 @@ async def test_readiness_with_secret_field_is_rejected(
     child = tmp_path / "signer_child.py"
     _write_child(child)
     monkeypatch.setattr(
-        "omnigent.inner.model_signer._signer_child_argv",
+        "omnigent.models.signer.lifecycle._signer_child_argv",
         lambda: [sys.executable, str(child)],
     )
     signer = SubprocessModelSigner(_config("extra-field"))
@@ -232,7 +232,7 @@ async def test_helper_stderr_is_not_exposed_in_start_error(
     child = tmp_path / "signer_child.py"
     _write_child(child)
     monkeypatch.setattr(
-        "omnigent.inner.model_signer._signer_child_argv",
+        "omnigent.models.signer.lifecycle._signer_child_argv",
         lambda: [sys.executable, str(child)],
     )
     signer = SubprocessModelSigner(_config("stderr"))
@@ -251,7 +251,7 @@ async def test_cancelled_signer_start_terminates_child(
     child = tmp_path / "signer_child.py"
     _write_child(child)
     monkeypatch.setattr(
-        "omnigent.inner.model_signer._signer_child_argv",
+        "omnigent.models.signer.lifecycle._signer_child_argv",
         lambda: [sys.executable, str(child)],
     )
     signer = SubprocessModelSigner(_config("hang"))

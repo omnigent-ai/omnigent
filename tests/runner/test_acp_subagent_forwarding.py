@@ -2,7 +2,7 @@
 
 The runner intercepts the runner-internal ``subagent.started`` / ``subagent.completed``
 SSE events (which the adapter emits from an ACP agent's normalized sub-agent
-lifecycle — see :mod:`omnigent.inner.acp_subagents`) and mints / fills a child
+lifecycle — see :mod:`omnigent.harnesses.acp.subagents`) and mints / fills a child
 session via ``external_acp_subagent_start``, ``external_conversation_item``, and
 ``external_session_status``.
 

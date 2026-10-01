@@ -1,10 +1,10 @@
-"""Tests for omnigent.inner.egress.rules — DSL parsing and matching."""
+"""Tests for omnigent.sandbox.egress.rules — DSL parsing and matching."""
 
 from __future__ import annotations
 
 import pytest
 
-from omnigent.inner.egress.rules import (
+from omnigent.sandbox.egress.rules import (
     check_host,
     check_request,
     parse_rule,

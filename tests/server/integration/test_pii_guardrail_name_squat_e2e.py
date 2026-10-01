@@ -50,7 +50,6 @@ import pytest_asyncio
 from fastapi import FastAPI
 
 from omnigent.policies.types import EvaluationContext
-from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.runtime.policies import build_policy_engine
 from omnigent.runtime.policies import builder as policy_builder
@@ -62,6 +61,7 @@ from omnigent.stores.artifact_store.local import LocalArtifactStore
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
 from omnigent.stores.policy_store.sqlalchemy_store import SqlAlchemyPolicyStore
+from omnigent.util.runner_identity import OMNIGENT_INTERNAL_WS_ORIGIN
 from tests.server.conftest import ControllableMockClient
 
 pytestmark = pytest.mark.asyncio
@@ -125,8 +125,8 @@ async def policy_client(
     :param tmp_path: Pytest temp dir for the harness process manager.
     :yields: A ready-to-use :class:`httpx.AsyncClient`.
     """
+    from omnigent.harnesses.runtime.process_manager import HarnessProcessManager
     from omnigent.runtime import set_harness_process_manager
-    from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
 
     pm = HarnessProcessManager(tmp_parent=tmp_path / "harness_pm")
     await pm.start()

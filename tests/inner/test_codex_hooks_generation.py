@@ -11,8 +11,8 @@ from typing import Any
 
 import pytest
 
-from omnigent.inner import codex_executor
-from omnigent.inner.codex_executor import (
+from omnigent.harnesses.codex import executor as codex_executor
+from omnigent.harnesses.codex.executor import (
     CODEX_EXTENDED_CATALOG_ENV_VAR,
     CODEX_ROUTER_DIR_ENV_VAR,
     CODEX_ROUTER_SESSION_ID_ENV_VAR,
@@ -25,7 +25,7 @@ from omnigent.inner.codex_executor import (
     merge_codex_user_hooks,
     write_codex_router_hooks_file,
 )
-from omnigent.inner.hook_scripts.subagent_router import REQUEST_TIMEOUT_S
+from omnigent.harnesses.native.hook_scripts.subagent_router import REQUEST_TIMEOUT_S
 
 _USER_HOOKS = {
     "hooks": {

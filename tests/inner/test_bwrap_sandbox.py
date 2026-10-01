@@ -38,8 +38,9 @@ from unittest.mock import patch
 
 import pytest
 
-from omnigent.inner import bwrap_sandbox
-from omnigent.inner.bwrap_sandbox import (
+from omnigent.core.datamodel import OSEnvSandboxSpec, OSEnvSpec
+from omnigent.sandbox import bwrap as bwrap_sandbox
+from omnigent.sandbox.bwrap import (
     _ALLOWED_SOCKET_FAMILIES,
     _CLONE_NEW_FLAG_BITS,
     _DEFAULT_CWD_ALLOW_HIDDEN,
@@ -50,8 +51,7 @@ from omnigent.inner.bwrap_sandbox import (
     _detect_host_sandbox_backend,
     _should_bind_host_proc,
 )
-from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
-from omnigent.inner.sandbox import SandboxPolicy, with_denied_unix_sockets
+from omnigent.sandbox.core import SandboxPolicy, with_denied_unix_sockets
 
 BWRAP_AVAILABLE = shutil.which("bwrap") is not None
 
@@ -169,7 +169,7 @@ def _run_helper_probe(
 
     The probe runs as: ``[python, "-c", probe_script]`` wrapped by
     :meth:`wrap_launcher_argv`. Inside the script, the test must
-    call :func:`omnigent.inner.sandbox.activate_sandbox` with the
+    call :func:`omnigent.sandbox.core.activate_sandbox` with the
     deserialised policy itself if it wants the seccomp profile to
     engage — :meth:`activate` is what installs the seccomp BPF.
 
@@ -354,7 +354,7 @@ def test_resolve_raises_on_non_linux() -> None:
         type="caller_process",
         sandbox=OSEnvSandboxSpec(type="linux_bwrap"),
     )
-    with patch("omnigent.inner.bwrap_sandbox.sys.platform", "darwin"):
+    with patch("omnigent.sandbox.bwrap.sys.platform", "darwin"):
         with pytest.raises(OSError, match="only available on Linux"):
             backend.resolve(spec, Path.cwd())
 
@@ -371,7 +371,7 @@ def test_resolve_raises_when_bwrap_missing() -> None:
         type="caller_process",
         sandbox=OSEnvSandboxSpec(type="linux_bwrap"),
     )
-    with patch("omnigent.inner.bwrap_sandbox.shutil.which", return_value=None):
+    with patch("omnigent.sandbox.bwrap.shutil.which", return_value=None):
         with pytest.raises(OSError, match="bwrap"):
             backend.resolve(spec, Path.cwd())
 
@@ -397,7 +397,7 @@ def test_wrap_launcher_argv_starts_with_bwrap_and_ends_with_command(
     backend = _make_backend()
     policy = _make_policy(tmp_path)
     argv = backend.wrap_launcher_argv(
-        [sys.executable, "-m", "omnigent.inner.os_env", "helper", "X"],
+        [sys.executable, "-m", "omnigent.environments.os_env", "helper", "X"],
         policy,
         tmp_path,
     )
@@ -408,7 +408,7 @@ def test_wrap_launcher_argv_starts_with_bwrap_and_ends_with_command(
     assert argv[dash_idx + 1 :] == [
         sys.executable,
         "-m",
-        "omnigent.inner.os_env",
+        "omnigent.environments.os_env",
         "helper",
         "X",
     ]
@@ -1525,7 +1525,7 @@ def test_framework_write_root_dotfiles_not_masked(tmp_path: Path) -> None:
     ``test_egress_e2e`` failures). A genuine user write root is still
     scanned.
     """
-    from omnigent.inner.sandbox import with_additional_write_roots
+    from omnigent.sandbox.core import with_additional_write_roots
 
     cwd = tmp_path / "work"
     cwd.mkdir()
@@ -1569,8 +1569,8 @@ def test_dotfile_masking_skips_target_that_vanished_after_scan(
     where coverage.py's transient ``.coverage.*`` files raced the scan).
     A persistent dotfile alongside it is still masked.
     """
-    from omnigent.inner import bwrap_sandbox
-    from omnigent.inner._cwd_scan import MaskedEntry
+    from omnigent.sandbox import bwrap as bwrap_sandbox
+    from omnigent.sandbox.cwd_scan import MaskedEntry
 
     cwd = tmp_path.resolve(strict=False)
     (tmp_path / ".env").write_text("SECRET=42")
@@ -1827,7 +1827,7 @@ def test_seccomp_blocks_dangerous_socket_families_inside_helper(tmp_path: Path) 
     """
     probe = """
 import base64, json, socket, sys
-from omnigent.inner.sandbox import SandboxPolicy, activate_sandbox
+from omnigent.sandbox.core import SandboxPolicy, activate_sandbox
 
 policy = SandboxPolicy.from_jsonable(
     json.loads(base64.urlsafe_b64decode(sys.argv[1]).decode("utf-8"))
@@ -1880,7 +1880,7 @@ def test_seccomp_blocks_unshare_and_setns_inside_helper(tmp_path: Path) -> None:
     """
     probe = """
 import base64, ctypes, errno, json, sys
-from omnigent.inner.sandbox import SandboxPolicy, activate_sandbox
+from omnigent.sandbox.core import SandboxPolicy, activate_sandbox
 policy = SandboxPolicy.from_jsonable(
     json.loads(base64.urlsafe_b64decode(sys.argv[1]).decode("utf-8"))
 )
@@ -1933,7 +1933,7 @@ def test_seccomp_blocks_clone_with_namespace_flags_inside_helper(
     """
     probe = """
 import base64, ctypes, errno, json, signal, sys
-from omnigent.inner.sandbox import SandboxPolicy, activate_sandbox
+from omnigent.sandbox.core import SandboxPolicy, activate_sandbox
 policy = SandboxPolicy.from_jsonable(
     json.loads(base64.urlsafe_b64decode(sys.argv[1]).decode("utf-8"))
 )
@@ -2052,7 +2052,7 @@ def test_seccomp_extra_rules_block_clone3_outright() -> None:
     """
     import errno
 
-    from omnigent.inner._seccomp import scmp_act_errno
+    from omnigent.sandbox.seccomp import scmp_act_errno
 
     rules = _bwrap_extra_seccomp_rules()
     clone3 = [r for r in rules if r.syscall == "clone3"]
@@ -2073,7 +2073,7 @@ def test_seccomp_extra_rules_socket_allowlist() -> None:
     using range-based deny rules: individual denies for the gaps plus
     a ``SCMP_CMP_GE`` rule that catches all families >= 11 (future-proof).
     """
-    from omnigent.inner._seccomp import SCMP_CMP_EQ, SCMP_CMP_GE
+    from omnigent.sandbox.seccomp import SCMP_CMP_EQ, SCMP_CMP_GE
 
     rules = _bwrap_extra_seccomp_rules()
     socket_rules = [r for r in rules if r.syscall == "socket"]
@@ -2185,7 +2185,7 @@ def test_run_launcher_spawn_wrap_private_tmpdir_boots_under_bwrap(tmp_path: Path
     """
     import tempfile
 
-    from omnigent.inner.sandbox import _project_root, create_exec_launcher
+    from omnigent.sandbox.core import _project_root, create_exec_launcher
 
     cwd = tmp_path
     target = cwd / "tmp_probe.py"
@@ -2248,7 +2248,7 @@ def _stage_codex_skills_root(tmproot: Path) -> tuple[Path, Path]:
 
     :returns: ``(home, skills)`` — the staged home and its skills subdir.
     """
-    from omnigent.inner.codex_staging import CODEX_HOME_PREFIX
+    from omnigent.harnesses.codex.staging import CODEX_HOME_PREFIX
 
     suffix = f"-{os.getuid()}" if hasattr(os, "getuid") else ""
     root = tmproot / f"omnigent-codex-homes{suffix}"

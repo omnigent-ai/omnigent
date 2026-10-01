@@ -11,7 +11,7 @@ from unittest.mock import AsyncMock
 import pytest
 from fastapi.responses import JSONResponse
 
-from omnigent.harness_plugins import CODEX_NATIVE_CODING_AGENT
+from omnigent.harnesses.registry import CODEX_NATIVE_CODING_AGENT
 from omnigent.runner.codex.goal import CodexGoalRunner
 
 

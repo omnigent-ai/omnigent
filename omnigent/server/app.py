@@ -30,21 +30,7 @@ from starlette.responses import Response
 from starlette.routing import Match, Mount, Route
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
-from omnigent._platform import resolve_repo_symlink
 from omnigent.db.db_models import InvalidUuidError
-from omnigent.debug_logging import (
-    add_audit_attrs,
-    audit_event_logger,
-    current_request_audit_attrs,
-    debug_event,
-    debug_sink_enabled,
-    reset_request_audit_attrs,
-    runner_log_scope,
-    set_current_request_id,
-    set_current_runner_id,
-    set_current_session_id,
-    set_current_user_id,
-)
 from omnigent.errors import (
     ErrorCategory,
     ErrorCode,
@@ -60,9 +46,23 @@ from omnigent.extensions.assets import (
     parse_dev_bundle_overrides,
 )
 from omnigent.extensions.registry import plugin_state as load_extension_plugin_state
-from omnigent.harness_plugins import (
+from omnigent.harnesses.registry import (
     NativeHarnessProvider,
     native_provider_for_key,
+)
+from omnigent.harnesses.runtime.process_manager import HarnessProcessManager
+from omnigent.observability.debug_logging import (
+    add_audit_attrs,
+    audit_event_logger,
+    current_request_audit_attrs,
+    debug_event,
+    debug_sink_enabled,
+    reset_request_audit_attrs,
+    runner_log_scope,
+    set_current_request_id,
+    set_current_runner_id,
+    set_current_session_id,
+    set_current_user_id,
 )
 from omnigent.resources import examples as _examples_resources
 from omnigent.runtime import (
@@ -74,7 +74,6 @@ from omnigent.runtime import (
     set_runner_ws_factory,
 )
 from omnigent.runtime.agent_cache import AgentCache
-from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
 from omnigent.server import managed_host_keepalive, session_live_state, shutdown_state
 from omnigent.server.auth import AuthProvider, SharingMode
 from omnigent.server.background_session_titles import (
@@ -138,6 +137,7 @@ from omnigent.stores.permission_store import PermissionStore
 from omnigent.stores.policy_store import PolicyStore
 from omnigent.stores.project_store import ProjectStore
 from omnigent.stores.scheduled_task_store import ScheduledTaskStore
+from omnigent.util.portability import resolve_repo_symlink
 
 _logger = logging.getLogger(__name__)
 
@@ -501,7 +501,7 @@ def _session_id_from_request(request: Request) -> str | None:
     conversation id in the debug-logs table. Parsed from the path here (rather
     than the matched route param) because a handler may raise before the id is
     otherwise in scope; the ambient request-scoped session ContextVar bound by
-    the middleware (:func:`omnigent.debug_logging.set_current_session_id`) covers
+    the middleware (:func:`omnigent.observability.debug_logging.set_current_session_id`) covers
     the non-exception records.
     """
     match = _SESSION_PATH_RE.search(request.url.path)
@@ -835,7 +835,7 @@ def _ensure_builtin_agent(
 
     This replaces the old seed-once behavior, which skipped on row
     existence and so served a stale spec after the wheel shipped a new
-    one. Mirrors the upsert in :func:`omnigent.cli._register_yaml_bundle`.
+    one. Mirrors the upsert in :func:`omnigent.cli.commands._register_yaml_bundle`.
 
     :param agent_store: Store for agent metadata.
     :param artifact_store: Store for agent bundles.
@@ -999,7 +999,7 @@ def _build_native_bundle(provider: NativeHarnessProvider) -> bytes:
     import inspect
     import tempfile
 
-    from omnigent.native.native_dispatch import resolve_hook
+    from omnigent.harnesses.native.dispatch import resolve_hook
     from omnigent.spec import materialize_bundle
 
     materialize = resolve_hook(provider, "materialize_agent_spec")
@@ -1036,7 +1036,7 @@ def _ensure_default_native_agents(
     :param artifact_store: Store for agent bundles.
     :param agent_cache: Cache for loaded agent specs.
     """
-    from omnigent.native.native_coding_agents import NATIVE_CODING_AGENTS
+    from omnigent.harnesses.native.coding_agents import NATIVE_CODING_AGENTS
 
     for agent in NATIVE_CODING_AGENTS:
         provider = native_provider_for_key(agent.key)
@@ -1137,7 +1137,7 @@ def _ensure_default_acp_agents(
     :param artifact_store: Store for agent bundles.
     :param agent_cache: Cache for loaded agent specs.
     """
-    from omnigent.acp_cli_harnesses import ACP_CLI_HARNESSES
+    from omnigent.harnesses.acp.cli_harnesses import ACP_CLI_HARNESSES
 
     # (1) User-configured acp:<slug> agents — "set up" == present in config.
     try:
@@ -1816,7 +1816,7 @@ def create_app(
     )
 
     app = FastAPI(title="Omnigent Server", lifespan=_lifespan)
-    from omnigent.runtime import telemetry
+    from omnigent.observability import otel as telemetry
 
     telemetry.instrument_fastapi_app(app)
     # Expose the registry on app.state so integration tests and
@@ -3521,14 +3521,14 @@ def create_app(
             is_parent_owned_subagent,
             restore_active_children,
         )
-        from omnigent.server.routes._sessions.common import (
-            _session_sandbox_status_cache,
-        )
         from omnigent.server.routes.sessions import (
             _ensure_runner_relay,
             _publish_runner_recovered_status,
             _publish_sandbox_status,
             prefetch_session_routing_catalogs,
+        )
+        from omnigent.server.routes.sessions.common import (
+            _session_sandbox_status_cache,
         )
 
         # Stamp liveness immediately so other replicas see the runner

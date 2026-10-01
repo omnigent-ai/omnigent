@@ -292,26 +292,6 @@ def test_a_model_only_unity_catalog_serves_keeps_its_own_spelling() -> None:
     }
 
 
-def test_family_shim_warns_and_delegates_to_the_catalog() -> None:
-    from omnigent.models.databricks_model_discovery import discover_databricks_claude_models
-
-    def _handler(request: httpx.Request) -> httpx.Response:
-        payload = (
-            {"model_services": [{"name": "model-services/system.ai.claude-opus-5"}]}
-            if request.url.path.endswith("/model-services")
-            else {"data": []}
-        )
-        return httpx.Response(200, json=payload, request=request)
-
-    with pytest.warns(DeprecationWarning, match="v0.10.0"):
-        families = discover_databricks_claude_models(
-            "https://workspace.example.com",
-            "token",
-            transport=httpx.MockTransport(_handler),
-        )
-    assert families == {"opus": "system.ai.claude-opus-5"}
-
-
 def _discover_codex(model_services: list[dict[str, str]]) -> tuple[str, ...]:
     """Run codex discovery against a canned ``system.ai`` model-services page."""
     from omnigent.models.databricks_model_discovery import discover_databricks_codex_models

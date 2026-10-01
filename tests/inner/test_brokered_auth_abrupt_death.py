@@ -14,7 +14,7 @@ from pathlib import Path
 import psutil
 import pytest
 
-from omnigent.inner._proc import process_alive
+from omnigent.util.proc import process_alive
 
 
 @pytest.mark.skipif(os.name != "posix", reason="requires POSIX process groups")
@@ -41,9 +41,10 @@ import psutil
 import sys
 from pathlib import Path
 
-from omnigent.inner import _liveness_exec, _proc
-from omnigent.inner.model_egress import FrozenModelRoute
-from omnigent.inner.model_signer import SignerLaunchConfig, SubprocessModelSigner
+from omnigent.util import liveness_exec as _liveness_exec
+from omnigent.util import proc as _proc
+from omnigent.models.signer.egress import FrozenModelRoute
+from omnigent.models.signer.lifecycle import SignerLaunchConfig, SubprocessModelSigner
 
 async def main():
     state_path, worker_path = map(Path, sys.argv[1:])

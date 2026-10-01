@@ -84,7 +84,7 @@ def test_build_attach_args_without_session() -> None:
         server_url="http://127.0.0.1:49231",
         workspace="/repo",
         session_id=None,
-        opencode_args=("--extra",),
+        extra_args=("--extra",),
     )
     assert "--session" not in args
     assert args[-1] == "--extra"

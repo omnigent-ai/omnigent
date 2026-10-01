@@ -1,4 +1,4 @@
-"""Tests for omnigent.cli's locale-independent config I/O.
+"""Tests for omnigent.cli.commands's locale-independent config I/O.
 
 omnigent-authored files (bundled agent configs, agent specs, daemon
 records, the global config) are UTF-8 on disk. Reading them must not
@@ -17,7 +17,7 @@ from pathlib import Path
 
 import pytest
 
-from omnigent.cli import (
+from omnigent.cli.commands import (
     _bundled_agent_brain_harness,
     _load_existing_host_id,
     _peek_default_agent_harness,
@@ -61,7 +61,7 @@ def test_bundled_and_user_config_reads_survive_non_utf8_locale(tmp_path: Path) -
         "if 'utf' in enc.replace('-', '').lower():\n"
         "    print('SKIP:' + enc)\n"
         "    sys.exit(0)\n"
-        "from omnigent.cli import _bundled_agent_brain_harness, _load_config\n"
+        "from omnigent.cli.commands import _bundled_agent_brain_harness, _load_config\n"
         "print('HARNESS:' + str(_bundled_agent_brain_harness('debby')))\n"
         # stdout is ASCII under this locale, so compare in-process and
         # print only ASCII markers.
@@ -93,7 +93,7 @@ def test_bundled_agent_brain_harness_treats_undecodable_config_as_unreadable(
 ) -> None:
     """An undecodable bundled config yields ``None``, not a decode crash."""
     (tmp_path / "config.yaml").write_bytes(_UNDECODABLE_YAML)
-    monkeypatch.setattr("omnigent.cli._bundled_example_path", lambda name: str(tmp_path))
+    monkeypatch.setattr("omnigent.cli.commands._bundled_example_path", lambda name: str(tmp_path))
     assert _bundled_agent_brain_harness("debby") is None
 
 

@@ -279,7 +279,7 @@ def build_opencode_serve_args(
     *,
     hostname: str,
     port: int,
-    opencode_args: Sequence[str] = (),
+    extra_args: Sequence[str] = (),
 ) -> list[str]:
     """
     Build the ``opencode serve`` argv tail (after the executable).
@@ -289,11 +289,11 @@ def build_opencode_serve_args(
 
     :param hostname: Bind hostname, e.g. ``"127.0.0.1"``.
     :param port: Bind port.
-    :param opencode_args: Extra pass-through args.
+    :param extra_args: Extra pass-through args.
     :returns: Argv tail, e.g. ``["serve", "--hostname", "127.0.0.1",
         "--port", "49231"]``.
     """
-    return ["serve", "--hostname", hostname, "--port", str(port), *opencode_args]
+    return ["serve", "--hostname", hostname, "--port", str(port), *extra_args]
 
 
 def build_opencode_attach_args(
@@ -301,7 +301,7 @@ def build_opencode_attach_args(
     server_url: str,
     workspace: str,
     session_id: str | None,
-    opencode_args: Sequence[str] = (),
+    extra_args: Sequence[str] = (),
 ) -> list[str]:
     """
     Build the ``opencode attach`` argv for a terminal takeover.
@@ -314,13 +314,13 @@ def build_opencode_attach_args(
     :param workspace: Directory the TUI runs in (``--dir``).
     :param session_id: OpenCode session id to attach (``--session``), or
         ``None`` to let the TUI choose.
-    :param opencode_args: Extra pass-through args appended last.
+    :param extra_args: Extra pass-through args appended last.
     :returns: Argv tail after the executable.
     """
     args = ["attach", server_url, "--dir", workspace]
     if session_id:
         args.extend(["--session", session_id])
-    args.extend(opencode_args)
+    args.extend(extra_args)
     return args
 
 
@@ -397,7 +397,7 @@ class OpenCodeNativeServer:
     :param hostname: Bind hostname (always loopback).
     :param port: Explicit port; ``None`` allocates an ephemeral one.
     :param extra_env: Provider env merged into the launch environment.
-    :param opencode_args: Extra ``serve`` pass-through args.
+    :param extra_args: Extra ``serve`` pass-through args.
     :param verify_version: Whether to version-check the CLI on start.
     """
 
@@ -410,7 +410,7 @@ class OpenCodeNativeServer:
         hostname: str = "127.0.0.1",
         port: int | None = None,
         extra_env: Mapping[str, str] | None = None,
-        opencode_args: Sequence[str] = (),
+        extra_args: Sequence[str] = (),
         verify_version: bool = True,
     ) -> None:
         self.bridge_dir = bridge_dir
@@ -418,7 +418,7 @@ class OpenCodeNativeServer:
         self.hostname = hostname
         self._explicit_port = port
         self._extra_env = dict(extra_env or {})
-        self._opencode_args = tuple(opencode_args)
+        self._opencode_args = tuple(extra_args)
         self._verify_version = verify_version
         self.opencode_path = find_opencode_cli(opencode_path)
         self.auth_secret = ensure_auth_secret(bridge_dir)
@@ -463,7 +463,7 @@ class OpenCodeNativeServer:
             *build_opencode_serve_args(
                 hostname=self.hostname,
                 port=self.port,
-                opencode_args=self._opencode_args,
+                extra_args=self._opencode_args,
             ),
         ]
 

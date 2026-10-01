@@ -18,7 +18,7 @@ if TYPE_CHECKING:
 
 from fastapi.responses import JSONResponse, Response
 
-from omnigent.harness_plugins import CODEX_NATIVE_CODING_AGENT
+from omnigent.harnesses.registry import CODEX_NATIVE_CODING_AGENT
 
 
 class BridgeStateForSession(Protocol):

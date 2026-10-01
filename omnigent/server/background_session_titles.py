@@ -14,8 +14,8 @@ from omnigent.entities.conversation import (
     DEFAULT_GENERATED_TITLE_MAX_CHARS,
     USER_SESSION_TITLE_MAX_CHARS,
 )
-from omnigent.harness_aliases import canonicalize_harness
-from omnigent.harness_plugins import background_title_generators
+from omnigent.harnesses.aliases import canonicalize_harness
+from omnigent.harnesses.registry import background_title_generators
 from omnigent.runner.background_titles.service import FOLLOW_USER_LANGUAGE_TITLE_INSTRUCTION
 from omnigent.stores.conversation_store import ConversationStore
 

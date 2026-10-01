@@ -34,14 +34,14 @@ from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
 from typing import Any
 
 from omnigent.db.workspace_cache import WorkspaceScopedCache
-from omnigent.debug_logging import (
+from omnigent.errors import ErrorImpact, ErrorPhase
+from omnigent.observability.debug_logging import (
     audit_event_logger,
     debug_event,
     debug_sink_enabled,
     sse_event_logger,
     sse_logging_enabled,
 )
-from omnigent.errors import ErrorImpact, ErrorPhase
 from omnigent.runtime import inflight_text, pending_elicitations
 
 _logger = logging.getLogger(__name__)
@@ -89,7 +89,7 @@ def _enqueue_or_overflow(
 
 
 # ── SSE-event debug logging (ZeroBus table and/or local file; see
-# omnigent.debug_logging) ─────────────────────────────────────────────────────
+# omnigent.observability.debug_logging) ─────────────────────────────────────────────────────
 # Frequent, low-signal events not worth a debug-log row.
 _SSE_SKIP_TYPES = frozenset(
     {"session.terminal.activity", "session.heartbeat", "response.heartbeat"}

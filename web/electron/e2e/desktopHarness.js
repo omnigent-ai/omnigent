@@ -210,7 +210,7 @@ async function spawnServer(tmpDir) {
     PYTHON,
     [
       "-c",
-      "from omnigent.cli import main; main()",
+      "from omnigent.cli.commands import main; main()",
       "server",
       "--host",
       "127.0.0.1",

@@ -83,7 +83,7 @@ async def test_runner_relay_recovers_from_http_error_response(
     readiness.
     """
     from omnigent.server.routes import sessions as sessions_module
-    from omnigent.server.routes._sessions import orchestration
+    from omnigent.server.routes.sessions import orchestration
 
     monkeypatch.setattr(orchestration, "_RUNNER_RELAY_READY_TIMEOUT_S", _READY_TIMEOUT_S)
 

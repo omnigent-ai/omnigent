@@ -114,7 +114,7 @@ def web_search_native_passthrough_provider(
     """
     if not model or model.startswith("databricks-"):
         return None
-    from omnigent.harness_aliases import canonicalize_harness
+    from omnigent.harnesses.aliases import canonicalize_harness
     from omnigent.onboarding.provider_config import _EXECUTOR_TYPE_HARNESS_ALIASES
 
     if not harness or harness == "omnigent":

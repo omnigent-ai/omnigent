@@ -6,20 +6,20 @@ from pathlib import Path
 
 import pytest
 
-from omnigent._wrapper_labels import (
-    KIRO_NATIVE_WRAPPER_VALUE,
-    PI_NATIVE_WRAPPER_VALUE,
-    UI_MODE_LABEL_KEY,
-    UI_MODE_TERMINAL_VALUE,
-    WRAPPER_LABEL_KEY,
-)
-from omnigent.harness_plugins import KIRO_NATIVE_CODING_AGENT, PI_NATIVE_CODING_AGENT
-from omnigent.native.native_coding_agents import (
+from omnigent.harnesses.native.coding_agents import (
     native_coding_agent_for_harness,
     native_coding_agent_for_wrapper_label,
     native_shell_terminal_spec,
     native_shell_terminal_specs,
     public_agent_name,
+)
+from omnigent.harnesses.registry import KIRO_NATIVE_CODING_AGENT, PI_NATIVE_CODING_AGENT
+from omnigent.harnesses.wrapper_labels import (
+    KIRO_NATIVE_WRAPPER_VALUE,
+    PI_NATIVE_WRAPPER_VALUE,
+    UI_MODE_LABEL_KEY,
+    UI_MODE_TERMINAL_VALUE,
+    WRAPPER_LABEL_KEY,
 )
 
 
@@ -126,7 +126,7 @@ def test_native_shell_terminal_spec_offers_installed_shells_default_first(
     shell with cwd override allowed.
     """
     monkeypatch.setattr(
-        "omnigent.native.native_coding_agents.installed_interactive_shells",
+        "omnigent.harnesses.native.coding_agents.installed_interactive_shells",
         lambda: ["fish", "bash", "zsh"],
     )
     spec = native_shell_terminal_spec()
@@ -146,7 +146,7 @@ def test_native_shell_terminal_spec_falls_back_to_bash(
 ) -> None:
     """The materialized spec retains discovery's non-empty bash fallback."""
     monkeypatch.setattr(
-        "omnigent.native.native_coding_agents.installed_interactive_shells",
+        "omnigent.harnesses.native.coding_agents.installed_interactive_shells",
         lambda: ["bash"],
     )
     spec = native_shell_terminal_spec()
@@ -159,7 +159,7 @@ def test_native_shell_terminal_specs_builds_runtime_specs(
 ) -> None:
     """A runner can replace the fallback with parsed host terminal specs."""
     monkeypatch.setattr(
-        "omnigent._platform._resolve_interactive_shell",
+        "omnigent.util.portability._resolve_interactive_shell",
         lambda shell: f"/resolved/{shell}",
     )
     spec = native_shell_terminal_specs(["zsh", "bash"])
@@ -185,7 +185,7 @@ def test_native_shell_terminal_specs_preserves_login_shell_path(
     fish.chmod(0o755)
     monkeypatch.setenv("SHELL", str(fish))
     monkeypatch.setattr("shutil.which", lambda _name: None)
-    monkeypatch.setattr("omnigent._platform._INTERACTIVE_SHELL_DIRS", ())
+    monkeypatch.setattr("omnigent.util.portability._INTERACTIVE_SHELL_DIRS", ())
 
     spec = native_shell_terminal_specs(["fish"])
 

@@ -101,14 +101,14 @@ def test_resolve_argv_reroutes_script_path_through_python_m(
     monkeypatch.setattr(sys, "executable", "/venv/bin/python")
 
     # A ``.py`` argv0 isn't executable; re-enter through ``python -m`` instead.
-    assert _resolve_omnigent_argv() == ["/venv/bin/python", "-m", "omnigent.cli"]
+    assert _resolve_omnigent_argv() == ["/venv/bin/python", "-m", "omnigent.cli.commands"]
 
 
 def test_resolve_argv_falls_back_when_argv_is_empty(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(sys, "argv", [])
     monkeypatch.setattr(sys, "executable", "/venv/bin/python")
 
-    assert _resolve_omnigent_argv() == ["/venv/bin/python", "-m", "omnigent.cli"]
+    assert _resolve_omnigent_argv() == ["/venv/bin/python", "-m", "omnigent.cli.commands"]
 
 
 def test_resolve_argv_makes_relative_path_absolute(
@@ -127,8 +127,8 @@ def test_resolve_argv_makes_relative_path_absolute(
     ("launch_argv", "expected"),
     [
         (["/bin/omnigent", "run", "agent.yaml"], ["run", "agent.yaml"]),
-        (["python", "-m", "omnigent.cli", "attach", "conv_1"], ["attach", "conv_1"]),
-        (["python", "-m", "omnigent.cli", "-m", "omnigent.cli", "run"], ["run"]),
+        (["python", "-m", "omnigent.cli.commands", "attach", "conv_1"], ["attach", "conv_1"]),
+        (["python", "-m", "omnigent.cli.commands", "-m", "omnigent.cli.commands", "run"], ["run"]),
         (["omnigent", "--version"], []),
         ([], []),
     ],

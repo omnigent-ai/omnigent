@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, Protocol, cast
 
 import httpx
 
-from omnigent.harness_plugins import (
+from omnigent.harnesses.registry import (
     BackgroundTitleGeneratorSpec,
     background_title_generators,
     load_object,

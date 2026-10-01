@@ -12,8 +12,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from omnigent import _startup_events as startup
-from omnigent import debug_logging
+from omnigent.observability import debug_logging
+from omnigent.observability import startup_events as startup
 
 
 @pytest.fixture(autouse=True)
@@ -90,7 +90,7 @@ def test_host_state_event_carries_deterministic_process_classification(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """A native launch records whether the host process predated the command."""
-    from omnigent import cli
+    from omnigent.cli import commands as cli
 
     caplog.set_level(logging.INFO, logger="omnigent.startup")
     record = SimpleNamespace(pid=1234)
@@ -119,7 +119,8 @@ def test_remote_backend_preserves_startup_context_in_host_thread(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """Remote CLI launches retain startup telemetry in the daemon worker."""
-    from omnigent import _runner_startup, cli
+    from omnigent.cli import commands as cli
+    from omnigent.cli import runner_startup as _runner_startup
 
     caplog.set_level(logging.INFO, logger="omnigent.startup")
     monkeypatch.setattr(
@@ -264,7 +265,7 @@ def test_structured_rows_reach_existing_debug_sink(monkeypatch: pytest.MonkeyPat
 def test_warning_cli_level_does_not_drop_uploaded_events(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    from omnigent import cli_diagnostics
+    from omnigent.cli import diagnostics as cli_diagnostics
 
     monkeypatch.setenv("OMNIGENT_LOG_LEVEL", "WARNING")
     monkeypatch.setattr(cli_diagnostics, "_log_dir", lambda: tmp_path)
@@ -342,7 +343,7 @@ def test_native_callback_tracks_backend_failure_before_launch(
 ) -> None:
     from click.testing import CliRunner
 
-    from omnigent import cli as cli_module
+    from omnigent.cli import commands as cli_module
 
     caplog.set_level(logging.INFO, logger="omnigent.startup")
     monkeypatch.setattr(cli_module, "_load_effective_config", dict)

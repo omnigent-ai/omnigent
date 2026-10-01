@@ -17,7 +17,7 @@ import json
 
 import pytest
 
-from omnigent.runtime.harnesses import _HARNESS_MODULES
+from omnigent.harnesses.runtime import _HARNESS_MODULES
 from tests.harness_bench.bench import BenchMatrix, run_bench, run_harness
 from tests.harness_bench.driver import SdkInprocDriver
 from tests.harness_bench.manifest import OFFICIAL_PROFILES
@@ -61,7 +61,7 @@ def test_declared_covers_every_p0_dimension(profile: BenchProfile) -> None:
 
 
 def test_streaming_capability_declares_binary_verdict() -> None:
-    from omnigent.harness_plugins import harness_capabilities
+    from omnigent.harnesses.registry import harness_capabilities
     from tests.harness_bench.manifest import _declared_from_capabilities
 
     caps = harness_capabilities()
@@ -78,7 +78,7 @@ def test_streaming_capability_declares_binary_verdict() -> None:
 
 
 def test_remaining_capabilities_map_to_declared_verdicts(monkeypatch: pytest.MonkeyPatch) -> None:
-    from omnigent.harness_capabilities import (
+    from omnigent.harnesses.capabilities import (
         AuthModel,
         EffortFamily,
         Elicitation,
@@ -143,7 +143,7 @@ def test_resolve_registered_harness_by_name() -> None:
     ACP_SUBPROCESS harness, so it lands on the SDK-wrap driver family
     (transport "sdk-inproc"), not native-tui.
     """
-    from omnigent.harness_plugins import harness_modules
+    from omnigent.harnesses.registry import harness_modules
 
     if "acp" not in harness_modules():
         pytest.skip("acp harness not registered in this build")
@@ -169,7 +169,7 @@ def test_resolve_entry_point_plugin_and_alias() -> None:
     skip-gates on its install-spec binary. Gated on the plugin being installed
     so a build without it still passes.
     """
-    from omnigent.harness_plugins import harness_aliases
+    from omnigent.harnesses.registry import harness_aliases
 
     if harness_aliases().get("rovo") != "rovo-cli":
         pytest.skip("omnigent-rovo plugin not installed")
@@ -192,7 +192,7 @@ def test_registry_profile_happy_path_no_plugin(monkeypatch: pytest.MonkeyPatch) 
     from types import SimpleNamespace
 
     import tests.harness_bench.manifest as man
-    from omnigent.harness_capabilities import AuthModel, IntegrationMode
+    from omnigent.harnesses.capabilities import AuthModel, IntegrationMode
 
     class _Spec:
         binary = "fakebin"
@@ -228,7 +228,7 @@ def test_registry_refuses_native_server_mode(monkeypatch: pytest.MonkeyPatch) ->
     from types import SimpleNamespace
 
     import tests.harness_bench.manifest as man
-    from omnigent.harness_capabilities import AuthModel, IntegrationMode
+    from omnigent.harnesses.capabilities import AuthModel, IntegrationMode
 
     caps = SimpleNamespace(
         integration_mode=IntegrationMode.NATIVE_SERVER,

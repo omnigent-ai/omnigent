@@ -5541,7 +5541,7 @@ def test_switch_conversation_agent_cross_family_resets_and_relabels(
     cross-family switch resets model settings, clears the native session
     id, and replaces the harness-presentation labels.
     """
-    from omnigent._wrapper_labels import (
+    from omnigent.harnesses.wrapper_labels import (
         CODEX_NATIVE_WRAPPER_VALUE,
         UI_MODE_LABEL_KEY,
         UI_MODE_TERMINAL_VALUE,
@@ -5653,7 +5653,7 @@ def test_switch_conversation_agent_same_family_keeps_model_settings(
     presentation labels) drops the old ui/wrapper labels and does not stamp
     the carry-history directive.
     """
-    from omnigent._wrapper_labels import (
+    from omnigent.harnesses.wrapper_labels import (
         UI_MODE_LABEL_KEY,
         UI_MODE_TERMINAL_VALUE,
         WRAPPER_LABEL_KEY,

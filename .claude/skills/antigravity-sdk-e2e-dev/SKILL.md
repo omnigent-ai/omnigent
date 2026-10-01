@@ -1,6 +1,6 @@
 ---
 name: antigravity-sdk-e2e-dev
-description: Spin up a live local Omnigent server and exercise the Antigravity (Gemini) SDK harness end-to-end — build antigravity agents, run real turns, smoke-test, and bug-bash. Load when developing, testing, or debugging the antigravity harness (omnigent/inner/antigravity_executor.py, antigravity_harness.py, omnigent/onboarding/antigravity_auth.py) or its auth / model / tool-bridge behavior.
+description: Spin up a live local Omnigent server and exercise the Antigravity (Gemini) SDK harness end-to-end — build antigravity agents, run real turns, smoke-test, and bug-bash. Load when developing, testing, or debugging the antigravity harness (omnigent/harnesses/antigravity/executor.py, antigravity_harness.py, omnigent/onboarding/antigravity_auth.py) or its auth / model / tool-bridge behavior.
 ---
 
 # Antigravity SDK harness: end-to-end dev & testing
@@ -139,8 +139,8 @@ streaming, harness.
 
 ## Code & tests
 
-- **Executor (SDK driver):** `omnigent/inner/antigravity_executor.py`
-- **Wrap (HARNESS_ANTIGRAVITY_* env → executor):** `omnigent/inner/antigravity_harness.py`
+- **Executor (SDK driver):** `omnigent/harnesses/antigravity/executor.py`
+- **Wrap (HARNESS_ANTIGRAVITY_* env → executor):** `omnigent/harnesses/antigravity/harness.py`
 - **Auth / key resolution:** `omnigent/onboarding/antigravity_auth.py`
 - **Spawn env:** `_build_antigravity_spawn_env` in `omnigent/runtime/workflow.py`
 

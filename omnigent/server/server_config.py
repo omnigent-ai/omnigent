@@ -1,7 +1,7 @@
 """Server-side YAML config for the non-CLI entrypoints.
 
 The ``omnigent server`` CLI already takes ``-c/--config`` and reads a
-YAML file (see ``omnigent/cli.py``). The hosted entrypoints —
+YAML file (see ``omnigent/cli/commands.py``). The hosted entrypoints —
 ``deploy/docker/entrypoint.py`` and ``deploy/databricks/src/app.py`` —
 don't go through that CLI; they build the app directly from env vars.
 This module gives those entrypoints the *same* config-file experience a
@@ -204,9 +204,9 @@ def filesystem_attachment_upload_limit() -> int:
     """Max byte size of a single filesystem attachment.
 
     Config key ``filesystem_attachment_max_bytes``; defaults to
-    :data:`omnigent.inner.native_attachments.MAX_FILESYSTEM_ATTACHMENT_UPLOAD_BYTES`.
+    :data:`omnigent.util.attachments.MAX_FILESYSTEM_ATTACHMENT_UPLOAD_BYTES`.
     """
-    from omnigent.inner.native_attachments import MAX_FILESYSTEM_ATTACHMENT_UPLOAD_BYTES
+    from omnigent.util.attachments import MAX_FILESYSTEM_ATTACHMENT_UPLOAD_BYTES
 
     return _config_positive_int(
         "filesystem_attachment_max_bytes", MAX_FILESYSTEM_ATTACHMENT_UPLOAD_BYTES
@@ -217,9 +217,9 @@ def filesystem_attachment_file_limit() -> int:
     """Max number of filesystem attachments one session may hold.
 
     Config key ``filesystem_attachment_max_files``; defaults to
-    :data:`omnigent.inner.native_attachments.MAX_SESSION_FILESYSTEM_ATTACHMENTS`.
+    :data:`omnigent.util.attachments.MAX_SESSION_FILESYSTEM_ATTACHMENTS`.
     """
-    from omnigent.inner.native_attachments import MAX_SESSION_FILESYSTEM_ATTACHMENTS
+    from omnigent.util.attachments import MAX_SESSION_FILESYSTEM_ATTACHMENTS
 
     return _config_positive_int(
         "filesystem_attachment_max_files", MAX_SESSION_FILESYSTEM_ATTACHMENTS
@@ -230,9 +230,9 @@ def filesystem_attachment_total_bytes_limit() -> int:
     """Max summed bytes of filesystem attachments per session.
 
     Config key ``filesystem_attachment_max_total_bytes``; defaults to
-    :data:`omnigent.inner.native_attachments.MAX_SESSION_FILESYSTEM_ATTACHMENT_BYTES`.
+    :data:`omnigent.util.attachments.MAX_SESSION_FILESYSTEM_ATTACHMENT_BYTES`.
     """
-    from omnigent.inner.native_attachments import MAX_SESSION_FILESYSTEM_ATTACHMENT_BYTES
+    from omnigent.util.attachments import MAX_SESSION_FILESYSTEM_ATTACHMENT_BYTES
 
     return _config_positive_int(
         "filesystem_attachment_max_total_bytes", MAX_SESSION_FILESYSTEM_ATTACHMENT_BYTES

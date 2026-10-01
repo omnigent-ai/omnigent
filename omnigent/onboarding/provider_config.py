@@ -49,10 +49,10 @@ import os
 from dataclasses import dataclass, field, replace
 from typing import Literal
 
-from omnigent.cli_invocation import cli_invocation
 from omnigent.errors import ErrorCode, OmnigentError
-from omnigent.harness_aliases import canonicalize_harness
+from omnigent.harnesses.aliases import canonicalize_harness
 from omnigent.spec.parser import check_unresolved_env_vars
+from omnigent.util.cli_invocation import cli_invocation
 from omnigent.util.env_credentials import (
     _ENV_REF_RE,
     env_names_with_omnigent_prefix,
@@ -947,7 +947,7 @@ def _parse_provider(name: str, raw: dict[str, object]) -> ProviderEntry:
     # The (possibly family-scoped) default flag — resolved per-kind below
     # once the served families are known. The repo's YAML loader strips
     # implicit scalar resolvers (the Norway-problem guard in
-    # omnigent/inner/loader.py), so a YAML ``default: true`` arrives as
+    # omnigent/core/loader.py), so a YAML ``default: true`` arrives as
     # the string ``"true"``; the programmatic config-writing path uses a
     # real bool / family-name / list — :func:`_parse_default_families`
     # accepts all forms. The per-family "at most one default per family"
@@ -1109,7 +1109,7 @@ def load_config() -> dict[str, object]:
         ``{"providers": {"openrouter": {"kind": "gateway", ...}}}``, or
         ``{}`` when the config file is missing, empty, or unreadable.
     """
-    from omnigent.inference_config import load_runtime_inference_config
+    from omnigent.models.inference_config import load_runtime_inference_config
 
     return load_runtime_inference_config()
 
@@ -1567,8 +1567,8 @@ def harness_owns_its_credential(harness: str) -> bool:
     :param harness: The harness name, canonical or ``acp:<slug>``.
     :returns: ``True`` when the harness owns its own credential.
     """
-    from omnigent.harness_capabilities import AuthModel, IntegrationMode
-    from omnigent.harness_plugins import harness_capabilities
+    from omnigent.harnesses.capabilities import AuthModel, IntegrationMode
+    from omnigent.harnesses.registry import harness_capabilities
 
     canonical = canonicalize_harness(harness) or harness
     if canonical in _HARNESS_FAMILY:
