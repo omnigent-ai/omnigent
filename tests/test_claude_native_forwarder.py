@@ -1774,22 +1774,43 @@ async def test_forwarder_ignores_subagent_stop_failure_hook(
 
 
 @pytest.mark.asyncio
-async def test_forwarder_ignores_background_subagent_stop_failure_by_session_id(
+@pytest.mark.parametrize(
+    ("subagent_session_id", "subagent_transcript_name", "subagent_fields"),
+    [
+        # Background subagent: foreign session id, non-``subagents/`` path.
+        pytest.param("bg-agent-session", "bg-agent.jsonl", {}, id="background-by-session-id"),
+        # In-process subagent: parent's session id and path; only ``agent_id`` marks it.
+        pytest.param(
+            "parent-session",
+            "session.jsonl",
+            {
+                "agent_id": "a4892977eed616593",
+                "agent_type": "general-purpose",
+                "error": "unknown",
+                "last_assistant_message": 'API Error: 499 {"error_code":"CANCELLED","message":""}',
+            },
+            id="in-process-by-agent-id",
+        ),
+    ],
+)
+async def test_forwarder_ignores_subagent_stop_failure_without_subagents_path(
     tmp_path: Path,
+    subagent_session_id: str,
+    subagent_transcript_name: str,
+    subagent_fields: dict[str, str],
 ) -> None:
     """
-    A background subagent's ``StopFailure`` (foreign session id, non-``subagents/``
-    path) must not flip the parent to ``failed``.
+    A subagent's ``StopFailure`` must not flip the parent to ``failed``.
 
     The subsequent parent ``Stop`` acts as an anchor: the forwarder must
-    emit exactly one POST (``idle``), proving it ran and that the background
+    emit exactly one POST (``idle``), proving it ran and that the
     subagent's ``StopFailure`` was silently skipped.
     """
     bridge_dir = tmp_path / "bridge"
     parent_transcript = tmp_path / "session.jsonl"
     parent_transcript.write_text("", encoding="utf-8")
-    background_transcript = tmp_path / "bg-agent.jsonl"
-    background_transcript.write_text("", encoding="utf-8")
+    subagent_transcript = tmp_path / subagent_transcript_name
+    subagent_transcript.write_text("", encoding="utf-8")
 
     record_hook_event(
         bridge_dir,
@@ -1799,13 +1820,13 @@ async def test_forwarder_ignores_background_subagent_stop_failure_by_session_id(
             "transcript_path": str(parent_transcript),
         },
     )
-    # Background subagent fails — foreign session id, non-subagents path.
     record_hook_event(
         bridge_dir,
         {
             "hook_event_name": "StopFailure",
-            "session_id": "bg-agent-session",
-            "transcript_path": str(background_transcript),
+            "session_id": subagent_session_id,
+            "transcript_path": str(subagent_transcript),
+            **subagent_fields,
         },
     )
     # Parent turn ends normally — anchor that proves the forwarder ran.
@@ -1842,8 +1863,8 @@ async def test_forwarder_ignores_background_subagent_stop_failure_by_session_id(
         server.server_close()
         thread.join(timeout=5.0)
 
-    # If background StopFailure was wrongly forwarded, first would be
-    # ``failed``; the fix ensures only the parent's ``idle`` arrives.
+    # If the subagent StopFailure was wrongly forwarded, first would be
+    # ``failed``; only the parent's ``idle`` should arrive.
     assert first["body"] == {
         "type": "external_session_status",
         "data": {"status": "idle", "background_task_count": 0, "turn_completed": True},

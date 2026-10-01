@@ -898,6 +898,9 @@ class ClaudeHookRecord:
     :param transcript_path: Claude transcript path from the hook
         payload, e.g. ``"/home/user/.claude/projects/x/session.jsonl"``,
         or ``None`` when absent.
+    :param agent_id: Claude subagent id from the hook payload, e.g.
+        ``"a4892977eed616593"``. Claude Code sets it only for hooks fired
+        inside a subagent; ``None`` for the parent process.
     :param previous_claude_session_id: Claude session id that was
         active immediately before this hook, e.g.
         ``"a1b2c3d4-1234-5678-9abc-def012345678"``, or ``None``
@@ -955,6 +958,7 @@ class ClaudeHookRecord:
     source: str | None = None
     claude_session_id: str | None = None
     transcript_path: Path | None = None
+    agent_id: str | None = None
     previous_claude_session_id: str | None = None
     claude_session_was_seen: bool | None = None
     clear_rotated_to: str | None = None
@@ -3586,9 +3590,9 @@ def stop_hook_seen_since(bridge_dir: Path, start_event_count: int) -> bool:
     Return whether Claude reported a stop event after a hook cursor.
 
     Only counts stop events from the parent Claude process — subagent
-    stop events (whose ``transcript_path`` contains a ``subagents/``
-    component) are ignored so a finishing subagent does not
-    prematurely signal the parent turn as complete.
+    stop events (carrying an ``agent_id``, or whose ``transcript_path``
+    contains a ``subagents/`` component) are ignored so a finishing
+    subagent does not prematurely signal the parent turn as complete.
 
     :param bridge_dir: Bridge directory path.
     :param start_event_count: Hook record count captured before a
@@ -3613,6 +3617,8 @@ def stop_hook_seen_since(bridge_dir: Path, start_event_count: int) -> bool:
                         payload.get("transcript_path") if isinstance(payload, dict) else None
                     )
                     if isinstance(transcript_path, str) and "/subagents/" in transcript_path:
+                        continue
+                    if isinstance(payload, dict) and payload.get("agent_id"):
                         continue
                     return True
     except FileNotFoundError:
@@ -3694,6 +3700,7 @@ def _hook_record_from_jsonl_record(record: _JsonlRecord) -> ClaudeHookRecord:
     raw_recorded_at = envelope.get("recorded_at") if isinstance(envelope, dict) else None
     raw_claude_session_id = payload.get("session_id") if isinstance(payload, dict) else None
     raw_transcript_path = payload.get("transcript_path") if isinstance(payload, dict) else None
+    raw_agent_id = payload.get("agent_id") if isinstance(payload, dict) else None
     raw_previous_claude_session_id = (
         payload.get("omnigent_previous_claude_session_id") if isinstance(payload, dict) else None
     )
@@ -3804,6 +3811,7 @@ def _hook_record_from_jsonl_record(record: _JsonlRecord) -> ClaudeHookRecord:
             if isinstance(raw_transcript_path, str) and raw_transcript_path
             else None
         ),
+        agent_id=raw_agent_id if isinstance(raw_agent_id, str) and raw_agent_id else None,
         previous_claude_session_id=(
             raw_previous_claude_session_id
             if isinstance(raw_previous_claude_session_id, str) and raw_previous_claude_session_id

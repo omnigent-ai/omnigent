@@ -22,6 +22,8 @@ from typing import Any
 import httpx
 import pytest
 
+from omnigent.runner import subagent_work
+
 
 def _spec_with_worker(
     harness: str,
@@ -78,7 +80,7 @@ async def _dispatch_without_model(
 
     create_bodies: list[dict[str, Any]] = []
     monkeypatch.setattr(runner_app, "get_session_agent_id", lambda _sid: "ag_parent")
-    monkeypatch.setattr(runner_app, "register_child_session", lambda *a, **k: None)
+    monkeypatch.setattr(subagent_work, "register_child_session", lambda *a, **k: None)
     session_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
 
     async def _server_handler(request: httpx.Request) -> httpx.Response:
@@ -119,8 +121,8 @@ async def _dispatch_without_model(
                 session_inbox=session_inbox,
             )
         finally:
-            runner_app.unregister_subagent_work("conv_child_inherit")
-            runner_app._session_inboxes_ref.pop(conv_id, None)
+            subagent_work.unregister_subagent_work("conv_child_inherit")
+            subagent_work._session_inboxes_ref.pop(conv_id, None)
     payload = json.loads(output)
     assert payload["status"] == "launching", output
     assert len(create_bodies) == 1, "fresh named send must create exactly one child"

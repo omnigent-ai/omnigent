@@ -369,14 +369,25 @@ async function launchDesktop(opts) {
   const userDataDir = opts.userDataDir || fs.mkdtempSync(path.join(os.tmpdir(), "omni-desktop-"));
   fs.mkdirSync(userDataDir, { recursive: true });
   if (opts.serverUrl) {
-    fs.writeFileSync(
-      path.join(userDataDir, "settings.json"),
-      JSON.stringify({ server_url: opts.serverUrl }, null, 2),
-    );
+    // Seed both profile locations, matching main.js's development userData path.
+    for (const profile of [userDataDir, path.join(userDataDir, "Omnigent Dev")]) {
+      fs.mkdirSync(profile, { recursive: true });
+      fs.writeFileSync(
+        path.join(profile, "settings.json"),
+        JSON.stringify({ server_url: opts.serverUrl }, null, 2),
+      );
+    }
   }
   fs.mkdirSync(opts.recordDir, { recursive: true });
 
-  const args = [APP_ROOT, `--user-data-dir=${userDataDir}`];
+  // Development builds derive userData from appData, overriding --user-data-dir.
+  // Redirect both before main.js loads so tests cannot touch a developer profile.
+  const profileBootstrap = path.join(userDataDir, "isolate-profile.cjs");
+  fs.writeFileSync(
+    profileBootstrap,
+    `require("electron").app.setPath("appData", ${JSON.stringify(userDataDir)});\n`,
+  );
+  const args = ["-r", profileBootstrap, APP_ROOT, `--user-data-dir=${userDataDir}`];
   // Headless-Linux / CI hardening, gated on the same env var the Python e2e_ui
   // suite uses (conftest.browser_type_launch_args). Under xvfb — and especially
   // as root or in a container — Electron's Chromium refuses to start without
@@ -411,11 +422,30 @@ async function launchDesktop(opts) {
     await stopDisplayCapture();
     throw err;
   }
-  // If firstWindow() throws after launch() succeeded, close the app here so the
+  // If locating the shell fails after launch succeeds, close the app so the
   // Electron process isn't orphaned (the caller never got a handle to close).
   let window;
   try {
-    window = await electronApp.firstWindow();
+    // Native overlays can appear before the shell. Wait for its loaded page
+    // instead of treating the first WebContents as the application window.
+    const deadline = Date.now() + 20_000;
+    for (;;) {
+      window = electronApp.windows().find((page) => {
+        const url = page.url();
+        return (
+          /^https?:/.test(url) ||
+          /\/setup\/index\.html/.test(url) ||
+          /\/server-selector-v2\/server-selector-v2\.html/.test(url)
+        );
+      });
+      if (window) break;
+      if (Date.now() > deadline) {
+        const urls = electronApp.windows().map((page) => page.url());
+        throw new Error(`Desktop shell window did not load; saw: ${JSON.stringify(urls)}`);
+      }
+      // oxlint-disable-next-line no-await-in-loop -- Wait for the shell's navigation.
+      await sleep(50);
+    }
   } catch (err) {
     await electronApp.close().catch(() => {});
     await stopDisplayCapture();

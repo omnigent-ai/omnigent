@@ -7996,6 +7996,48 @@ def test_stop_hook_seen_since_ignores_subagent_stop(
     assert stop_hook_seen_since(bridge_dir, cursor)
 
 
+def test_stop_hook_seen_since_skips_in_process_subagent_stop(tmp_path: Path) -> None:
+    """
+    ``stop_hook_seen_since`` must skip a stop carrying ``agent_id``.
+
+    In-process subagents fire ``Stop`` / ``StopFailure`` with the parent's
+    session id and transcript path; only ``agent_id`` identifies them.
+    """
+    bridge_dir = tmp_path / "bridge"
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text("", encoding="utf-8")
+
+    record_hook_event(
+        bridge_dir,
+        {
+            "hook_event_name": "SessionStart",
+            "session_id": "parent",
+            "transcript_path": str(transcript_path),
+        },
+    )
+    cursor = 1
+    record_hook_event(
+        bridge_dir,
+        {
+            "hook_event_name": "StopFailure",
+            "session_id": "parent",
+            "transcript_path": str(transcript_path),
+            "agent_id": "a4892977eed616593",
+        },
+    )
+    assert not stop_hook_seen_since(bridge_dir, cursor)
+
+    record_hook_event(
+        bridge_dir,
+        {
+            "hook_event_name": "Stop",
+            "session_id": "parent",
+            "transcript_path": str(transcript_path),
+        },
+    )
+    assert stop_hook_seen_since(bridge_dir, cursor)
+
+
 def test_stop_hook_seen_since_detects_stop_without_transcript_path(
     tmp_path: Path,
 ) -> None:

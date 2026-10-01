@@ -25,6 +25,8 @@ the header menu), and each place is a separate entry point.
   dialog with the command to run; the desktop app can reconnect a local host
   itself. States: reconnecting (spinner), reconnect failed (retry), host offline.
 - `resume-imported`: an imported session can be resumed onto a chosen local host.
+- `browser-storage`: browser tabs, including the agent browser, share cookies
+  within a session; different sessions stay isolated. Navigation stays per-tab.
 
 ## How to get to it (user POV)
 
@@ -49,6 +51,9 @@ when a local session is stranded). In the desktop app, reconnect acts directly.
 
 **Mobile:** the header menu and the sidebar drawer offer the same actions; touch
 devices fold some row controls into the menu.
+
+**Desktop browser:** select Browser or **+ → Browser** in the Workspace panel.
+Agent browser requests and chat links with in-app opening enabled use the pinned Browser.
 
 ## Driving it with the repro environment
 
@@ -101,9 +106,16 @@ plain `uv run pytest`, which starts a private server for the test.
   `tests/e2e_ui/sessions/test_reconnect_local_host_from_app.py::test_desktop_reconnect_failure_offers_retry`
 - **`resume-imported` (own environment):**
   `tests/e2e_ui/sessions/test_imported_session_resume.py::test_imported_session_resumes_onto_chosen_local_host`
+- **`browser-storage` (real Electron, own environment):**
+  `web/electron/e2e/desktop_cookie_isolation.e2e.js`. Sign into a site in one
+  tab, open it in another tab and the agent browser, and confirm both are signed
+  in. Another session should be signed out. Log out and refresh the same-session
+  tabs; all should be signed out.
 
 ## Gotchas
 
+- Browser storage sharing is limited to one desktop window and app run;
+  restarting the app clears it. Closing an individual tab does not.
 - Archive and unarchive exist on the row, in bulk selection, and in the header
   menu. A fix to one of these does not reach the others; check each, and check
   that the undo toast restores the session.

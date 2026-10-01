@@ -485,7 +485,9 @@ def test_codex_native_subagent_wrapper_is_recognized() -> None:
     wake would inject "[System: sub-agent … finished …]" into the chat the user
     is reading.
     """
-    from omnigent.runner.app import is_codex_native_subagent_wrapper
+    from omnigent.runner.subagent_work import (
+        is_codex_native_subagent_wrapper,
+    )
 
     assert is_codex_native_subagent_wrapper("codex-native-ui-subagent") is True
     # other harnesses' sub-agents still deliver through the inbox

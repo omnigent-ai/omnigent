@@ -3492,9 +3492,12 @@ def _is_subagent_hook_record(
     Return whether a hook record originated from a Claude subagent.
 
     Primary: a session id absent from the set of ids ever pinned to
-    this bridge belongs to a background subagent process. Fallback:
-    the ``subagents/`` path component for synchronous subagents.
+    this bridge belongs to a background subagent process. In-process
+    subagents share the parent's session id and transcript path, so an
+    ``agent_id`` marks them. Fallback: the ``subagents/`` path component.
     """
+    if record.agent_id is not None:
+        return True
     # Primary: id not in any id the parent has ever held → subagent.
     if (
         parent_claude_session_ids

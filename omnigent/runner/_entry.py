@@ -1539,7 +1539,7 @@ def create_app(
         # work handle open forever with no error surfaced. The app's
         # wake-scheduling seam is passed so a reaped failure also wakes the
         # idle parent — the inbox insert alone would never be read.
-        from omnigent.runner.app import run_subagent_launch_reaper
+        from omnigent.runner.subagent_work import run_subagent_launch_reaper
 
         app.state.subagent_launch_reaper = asyncio.create_task(
             run_subagent_launch_reaper(
