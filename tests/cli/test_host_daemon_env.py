@@ -35,6 +35,35 @@ _PROXY_ENV: Final = {
 
 
 @pytest.mark.parametrize("server_url", [None, _REMOTE_SERVER_URL])
+def test_runner_env_passthrough_named_vars_survive_daemon_and_runner_hops(
+    monkeypatch: pytest.MonkeyPatch,
+    server_url: str | None,
+) -> None:
+    """``OMNIGENT_RUNNER_ENV_PASSTHROUGH`` forwards only the named values across both hops."""
+    motion_bin = "/opt/motion/bin/motion-core"
+    monkeypatch.setenv("PATH", "/usr/bin")
+    monkeypatch.setenv(RUNNER_ENV_PASSTHROUGH_ENV_VAR, "MOTION_CORE_BIN")
+    monkeypatch.setenv("MOTION_CORE_BIN", motion_bin)
+    monkeypatch.setenv("MOTION_UNLISTED_SECRET", "must-not-forward")
+    monkeypatch.setattr("omnigent.onboarding.provider_config.load_config", dict)
+
+    daemon_env = _build_host_daemon_env(server_url=server_url)
+    runner_env = _build_runner_env(
+        daemon_env,
+        server_url=server_url or "http://localhost:6767",
+        runner_id="runner_motion_passthrough",
+        binding_token="synthetic-binding-token",
+        workspace="/tmp/workspace",
+        parent_pid=12345,
+    )
+
+    for env in (daemon_env, runner_env):
+        assert env[RUNNER_ENV_PASSTHROUGH_ENV_VAR] == "MOTION_CORE_BIN"
+        assert env["MOTION_CORE_BIN"] == motion_bin
+        assert "MOTION_UNLISTED_SECRET" not in env
+
+
+@pytest.mark.parametrize("server_url", [None, _REMOTE_SERVER_URL])
 @pytest.mark.parametrize("codex_path", [None, "/selected install/bin/codex"])
 def test_codex_executable_selection_survives_daemon_and_runner_boundaries(
     monkeypatch: pytest.MonkeyPatch,

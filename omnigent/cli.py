@@ -3583,6 +3583,7 @@ def _build_host_daemon_env(
     from omnigent.host.connect import (
         _RUNNER_ENV_ALLOWLIST,
         _RUNNER_ENV_ALLOWLIST_PREFIXES,
+        RUNNER_ENV_PASSTHROUGH_ENV_VAR,
     )
     from omnigent.host.identity import (
         HOST_ID_ENV_VAR,
@@ -3634,6 +3635,14 @@ def _build_host_daemon_env(
 
     env.pop(DISPATCH_TRACEPARENT_ENV_VAR, None)
     env.pop(DISPATCH_TRACESTATE_ENV_VAR, None)
+    passthrough_names = {
+        name.strip()
+        for name in os.environ.get(RUNNER_ENV_PASSTHROUGH_ENV_VAR, "").split(",")
+        if name.strip()
+    }
+    for name in passthrough_names:
+        if name in os.environ:
+            env[name] = os.environ[name]
     return env
 
 
