@@ -528,15 +528,11 @@ describe("ForkSessionDialog", () => {
     // Custom agents discovered from session scans start with harness=null and
     // a sessionId. Without eager prefetch, forkTargetCarriesHistory(null)
     // returns false and they never appear in the fork picker.
-    const customAgent: AvailableAgent = {
-      id: "ag_custom",
-      name: "my-agent",
+    const customAgent: AvailableAgent = testAgent("ag_custom", "my-agent", {
       display_name: "My Agent",
-      description: null,
       harness: null,
-      skills: [],
       sessionId: "conv_custom",
-    };
+    });
     setAgents([...AVAILABLE_AGENTS, customAgent], "claude-sdk");
 
     renderDialog();

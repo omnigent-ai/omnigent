@@ -1,6 +1,6 @@
 import type { AvailableAgent } from "@/hooks/useAvailableAgents";
 
-/** A fresh catalog record; identity and scenario-specific fields stay at the call site. */
+/** A fresh available-agent record; identity and scenario-specific fields stay at the call site. */
 export function testAgent(
   id: string,
   name: string,

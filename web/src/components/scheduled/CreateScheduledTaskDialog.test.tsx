@@ -242,24 +242,16 @@ describe("agent picker readiness (needs-setup badges)", () => {
     vi.mocked(agentsHook.useAvailableAgents).mockReturnValue({
       data: [
         ...AGENTS,
-        {
-          id: "ag_jcode",
-          name: "jcode",
+        testAgent("ag_jcode", "jcode", {
           display_name: "Jcode",
-          description: null,
           harness: "jcode",
-          skills: [],
           acpHarness: true,
-        },
-        {
-          id: "ag_grok",
-          name: "grok",
+        }),
+        testAgent("ag_grok", "grok", {
           display_name: "Grok Build",
-          description: null,
           harness: "grok",
-          skills: [],
           acpHarness: true,
-        },
+        }),
       ],
     } as unknown as ReturnType<typeof agentsHook.useAvailableAgents>);
 

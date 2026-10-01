@@ -889,15 +889,11 @@ describe("useAvailableAgents", () => {
 describe("prefetchAvailableAgentDetails", () => {
   it("patches harness, description, and skills into the cache on success", async () => {
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-    const agent = {
-      id: "ag_doc",
-      name: "doc-writer",
+    const agent = testAgent("ag_doc", "doc-writer", {
       display_name: "Doc-writer",
-      description: null,
       harness: null,
-      skills: [],
       sessionId: "conv_3",
-    };
+    });
     queryClient.setQueryData(["available-agents"], [agent]);
 
     fetchMock.mockResolvedValueOnce(
@@ -929,15 +925,11 @@ describe("prefetchAvailableAgentDetails", () => {
 
   it("is a no-op when harness is already populated", async () => {
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-    const agent = {
-      id: "ag_doc",
-      name: "doc-writer",
+    const agent = testAgent("ag_doc", "doc-writer", {
       display_name: "Doc-writer",
-      description: null,
       harness: "claude-sdk",
-      skills: [],
       sessionId: "conv_3",
-    };
+    });
     queryClient.setQueryData(["available-agents"], [agent]);
 
     await prefetchAvailableAgentDetails(agent, queryClient);
@@ -961,15 +953,11 @@ describe("prefetchAvailableAgentDetails", () => {
 
   it("leaves the agent name-only when the enrich fetch fails", async () => {
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-    const agent = {
-      id: "ag_doc",
-      name: "doc-writer",
+    const agent = testAgent("ag_doc", "doc-writer", {
       display_name: "Doc-writer",
-      description: null,
       harness: null,
-      skills: [],
       sessionId: "conv_3",
-    };
+    });
     queryClient.setQueryData(["available-agents"], [agent]);
 
     fetchMock.mockResolvedValueOnce(mockResponse({ detail: "boom" }, { ok: false, status: 500 }));
@@ -990,15 +978,11 @@ describe("prefetchAvailableAgentDetails", () => {
       display_name: "Kiro",
       harness: "kiro-native",
     });
-    const kiroShadow = {
-      id: "ag_session_kiro",
-      name: "kiro-naitive",
+    const kiroShadow = testAgent("ag_session_kiro", "kiro-naitive", {
       display_name: "Kiro-naitive",
-      description: null,
       harness: null,
-      skills: [],
       sessionId: "conv_kiro",
-    };
+    });
     queryClient.setQueryData(["available-agents"], [kiroBuiltin, kiroShadow]);
 
     fetchMock.mockResolvedValueOnce(
