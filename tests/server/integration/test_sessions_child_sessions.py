@@ -2037,15 +2037,30 @@ async def test_subagent_message_503s_when_heal_finds_no_live_ancestor(
     assert resp.status_code == 503, resp.text
 
 
-async def test_side_chat_message_seals_when_its_runner_is_gone(
+@pytest.mark.parametrize(
+    ("parent_runner", "expected_status"),
+    [("runner_replacement", 409), ("runner_side", 202)],
+    ids=["parent-relaunched", "transient-outage"],
+)
+async def test_side_chat_message_after_runner_loss(
     client: httpx.AsyncClient,
     db_uri: str,
     monkeypatch: pytest.MonkeyPatch,
+    parent_runner: str,
+    expected_status: int,
 ) -> None:
-    """A codex side chat's fork dies with its runner, so the send seals it read-only."""
-    child = await _create_native_child(client, name="msg-side-chat-sealed")
+    """Only a replaced parent runner proves the fork is gone; an outage is not sealed."""
+    child = await _create_native_child(client, name=f"msg-side-chat-{expected_status}")
     conv_store = SqlAlchemyConversationStore(db_uri)
-    conv_store.set_labels(child["id"], {"omnigent.codex_native.agent_nickname": "Side chat"})
+    conv_store.set_labels(
+        child["id"],
+        {
+            "omnigent.wrapper": "codex-native-ui-subagent",
+            "omnigent.codex_native.agent_nickname": "Side chat",
+        },
+    )
+    conv_store.replace_runner_id(child["id"], "runner_side")
+    conv_store.replace_runner_id(child["parent_session_id"], parent_runner)
 
     async def _none(*_args: Any, **_kwargs: Any) -> None:
         return None
@@ -2059,11 +2074,11 @@ async def test_side_chat_message_seals_when_its_runner_is_gone(
     }
     resp = await client.post(f"/v1/sessions/{child['id']}/events", json=message)
 
-    assert resp.status_code == 409, resp.text
-    sealed = conv_store.get_conversation(child["id"])
-    assert sealed is not None
-    assert sealed.labels.get(CLOSED_LABEL_KEY) == CLOSED_LABEL_VALUE
-    assert conv_store.list_items(child["id"]).data == []
+    assert resp.status_code == expected_status, resp.text
+    if expected_status == 409:
+        assert conv_store.list_items(child["id"]).data == []
+    after = conv_store.get_conversation(child["id"])
+    assert after is not None and CLOSED_LABEL_KEY not in after.labels
 
 
 async def test_non_subagent_session_not_healed_via_parent(
