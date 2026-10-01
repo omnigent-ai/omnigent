@@ -191,6 +191,10 @@ def without_codex_config_profile(args: Sequence[str]) -> list[str]:
     return canonical
 
 
+#: Journal of :func:`materialize_codex_config_profile` in the private home.
+_PROFILE_STATE_FILENAME = ".omnigent-config-profile.toml"
+
+
 def _merge_tables(base: dict[str, Any], overlay: dict[str, Any]) -> None:
     for key, value in overlay.items():
         if isinstance(value, dict) and isinstance(base.get(key), dict):
@@ -250,9 +254,25 @@ def _profile_base(state_path: Path, current: dict[str, Any]) -> dict[str, Any]:
     return base
 
 
+def codex_config_profile_update_pending(codex_home: Path) -> bool:
+    """Whether a profile update was interrupted before its journal was finalized.
+
+    Recovery accepts the private config only as last applied or pending, so
+    other launch steps must not edit it until the next profile write completes.
+    An unreadable journal also counts, since recovery rejects it.
+    """
+    try:
+        state = tomlkit.parse((codex_home / _PROFILE_STATE_FILENAME).read_text()).unwrap()
+    except FileNotFoundError:
+        return False
+    except (OSError, UnicodeDecodeError, TOMLKitError):
+        return True
+    return "pending" in state
+
+
 def validate_codex_config_profile_state(codex_home: Path) -> None:
     """Validate an existing profile journal without modifying private config."""
-    state_path = codex_home / ".omnigent-config-profile.toml"
+    state_path = codex_home / _PROFILE_STATE_FILENAME
     if not state_path.exists():
         return
     config_path = codex_home / "config.toml"
@@ -276,7 +296,7 @@ def materialize_codex_config_profile(
     Journal atomic file replacements so interrupted updates can be retried.
     Never modify the source home.
     """
-    state_path = codex_home / ".omnigent-config-profile.toml"
+    state_path = codex_home / _PROFILE_STATE_FILENAME
     if profile is None and not state_path.exists():
         return
     if codex_home.resolve() == source_home.resolve():
