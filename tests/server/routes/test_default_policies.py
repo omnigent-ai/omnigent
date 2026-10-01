@@ -65,7 +65,7 @@ def policy_app_with_auth(runtime_init: None, db_uri: str, tmp_path: Path) -> Fas
 async def policy_client(
     policy_app: FastAPI,
 ) -> AsyncIterator[httpx.AsyncClient]:
-    """HTTP client wired to the policy-enabled app."""
+    """Route-only client; deliberately omits harness and runtime policy wiring."""
     transport = httpx.ASGITransport(app=policy_app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
         yield c

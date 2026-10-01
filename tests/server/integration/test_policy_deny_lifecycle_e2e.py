@@ -22,6 +22,7 @@ import pytest
 import pytest_asyncio
 
 from tests.server.conftest import ControllableMockClient
+from tests.server.helpers import create_session_for_agent as _create_session
 from tests.server.helpers import create_test_agent
 
 pytestmark = pytest.mark.asyncio
@@ -55,18 +56,6 @@ async def policy_client(
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
-
-
-async def _create_session(client: httpx.AsyncClient, agent_id: str) -> str:
-    """Create a session bound to an agent and return its id.
-
-    :param client: Test HTTP client.
-    :param agent_id: Agent to bind.
-    :returns: New session id.
-    """
-    resp = await client.post("/v1/sessions", json={"agent_id": agent_id})
-    assert resp.status_code == 201, f"session create failed: {resp.status_code} {resp.text}"
-    return resp.json()["id"]
 
 
 async def _attach_deny_policy(
