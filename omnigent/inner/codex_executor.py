@@ -747,6 +747,11 @@ def codex_skill_sources(
     host = (codex_home if codex_home is not None else home / ".codex") / "skills"
     if host.is_dir():
         sources.append(host)
+    # Shared vendor-neutral skills (the tree the Antigravity provider also
+    # reads) come last so a Codex-specific skill of the same name wins.
+    shared = home / ".agents" / "skills"
+    if shared.is_dir():
+        sources.append(shared)
     return sources
 
 
