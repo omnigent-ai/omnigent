@@ -2394,6 +2394,15 @@ async def test_start_refreshes_shared_mcp_servers_across_relaunches(
     assert resumed["model"] == "private-model-choice"
     assert resumed["projects"]["/private-project"]["trust_level"] == "trusted"
 
+    source_config.write_text("", encoding="utf-8")
+    await server.start()
+    await server.close()
+
+    resumed = tomllib.loads((codex_home / "config.toml").read_text())
+    assert set(resumed["mcp_servers"]) == {"omnigent"}
+    assert resumed["model"] == "private-model-choice"
+    assert resumed["projects"]["/private-project"]["trust_level"] == "trusted"
+
 
 async def test_mcp_inventory_mismatch_fails_before_process_start(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -2466,10 +2475,10 @@ def test_shared_mcp_server_config_matches_keeps_live_session_on_invalid_source(
     assert app_server.shared_mcp_server_config_matches(
         private_home, source_home, None, codex_version=(0, 154, 0)
     )
+    (source_home / "config.toml").write_text("", encoding="utf-8")
     assert app_server.shared_mcp_server_config_matches(
         private_home, source_home, "removed", codex_version=(0, 154, 0)
     )
-    (source_home / "config.toml").write_text("", encoding="utf-8")
     (private_home / "config.toml").write_text("[mcp_servers", encoding="utf-8")
     assert app_server.shared_mcp_server_config_matches(
         private_home, source_home, None, codex_version=(0, 154, 0)

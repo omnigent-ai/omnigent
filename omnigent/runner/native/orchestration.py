@@ -4807,7 +4807,8 @@ async def _auto_create_codex_terminal(
         assert app_server is not None and bridge_state is not None
         if refresh_deferred:
             _logger.info(
-                "Deferring Codex MCP config refresh until the active turn ends: session=%s",
+                "Keeping Codex MCP config for active turn; refresh will occur on "
+                "the next terminal recreation or app-server launch: session=%s",
                 session_id,
                 extra={"session_id": session_id},
             )

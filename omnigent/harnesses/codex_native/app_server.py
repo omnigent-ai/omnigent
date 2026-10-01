@@ -903,7 +903,10 @@ def shared_mcp_server_config_matches(
     *,
     codex_version: tuple[int, int, int] | None,
 ) -> bool:
-    """Return whether a live app-server has the current valid shared MCP config."""
+    """Return whether a live app-server has the current valid shared MCP config.
+
+    Incomplete config keeps a healthy live server usable; cold launch validates it.
+    """
     try:
         expected = effective_codex_mcp_servers(
             source_home,
@@ -911,8 +914,7 @@ def shared_mcp_server_config_matches(
             codex_version=codex_version,
         )
     except (OSError, ValueError):
-        # Keep a healthy live session usable while shared config is incomplete.
-        # A cold launch still validates the source and reports the error.
+        # Tolerate incomplete shared config while the app-server is live.
         return True
     expected.pop("omnigent", None)
     config_path = codex_home / "config.toml"
@@ -921,8 +923,7 @@ def shared_mcp_server_config_matches(
     try:
         document = tomlkit.parse(config_path.read_text(encoding="utf-8")).unwrap()
     except (OSError, ValueError):
-        # Keep the already-running app-server usable while its private file is
-        # incomplete. A cold launch still validates the private layer loudly.
+        # Tolerate an incomplete private file while the app-server is live.
         return True
     configured = document.get("mcp_servers")
     actual = dict(configured) if isinstance(configured, dict) else {}
