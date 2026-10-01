@@ -252,12 +252,8 @@ def read_session_status(path: Path) -> SessionStatus | None:
     )
 
 
-# Attempts to resolve the file before giving up and leaving the PTY
-# watcher authoritative for the session's lifetime. At the claude-native
-# poll cadence (~0.2s) this is a few seconds — long enough for a booting
-# Claude to write its file and for the first hook to report the session
-# id, short enough that an old Claude (pre-v2.1.139, no file) or a broken
-# config dir falls back promptly without scanning forever.
+# Bound status-file discovery while allowing slow Claude startup.
+# Backoff can stretch these 40 ticks beyond the 0.2s base cadence.
 _MAX_RESOLVE_ATTEMPTS = 40
 
 
@@ -416,6 +412,12 @@ class SessionStatusPoller:
         )
         self._last_mtime = None
         self._last_edge = None
+
+    @property
+    def reports_idle(self) -> bool:
+        """Whether the file's last readable status mapped to runner ``idle``."""
+        status = self._last_status
+        return status is not None and status.runner_status == IDLE
 
     @property
     def blocked_on(self) -> str | None:
