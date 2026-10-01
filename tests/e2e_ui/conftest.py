@@ -46,6 +46,7 @@ import subprocess
 import sys
 import tarfile
 import time
+import warnings
 from collections.abc import Callable, Generator, Iterator
 from dataclasses import dataclass
 from pathlib import Path
@@ -2378,8 +2379,16 @@ def _stop_recorded_context(item: pytest.Item) -> None:
     if context is None or not context.pages:
         return
     # pytest-playwright's close wrapper still takes its screenshots and traces.
-    with contextlib.suppress(Error):
+    try:
         context.close()
+    except Error as exc:
+        # A diagnostic from the report hook must not replace the test result,
+        # even when the suite promotes warnings to errors.
+        with warnings.catch_warnings():
+            warnings.simplefilter("always", pytest.PytestWarning)
+            item.warn(
+                pytest.PytestWarning(f"Could not finalize recording for {item.nodeid}: {exc}")
+            )
 
 
 @pytest.hookimpl(hookwrapper=True)

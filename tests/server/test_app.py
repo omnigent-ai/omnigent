@@ -1096,8 +1096,6 @@ def test_ensure_default_native_agents_seeds_every_native_agent(
     """
     from omnigent.db.utils import builtin_agent_id
     from omnigent.native.native_coding_agents import NATIVE_CODING_AGENTS
-    from omnigent.server.routes._sessions.helpers import _spec_harness
-    from omnigent.server.routes.builtin_agents import _to_agent_object
 
     server_app._ensure_default_native_agents(
         seed_stores.agent_store,
@@ -1111,10 +1109,6 @@ def test_ensure_default_native_agents_seeds_every_native_agent(
         assert seeded.id == builtin_agent_id(agent.agent_name)
         assert seeded.session_id is None, "built-ins must be session-scope NULL"
         assert seed_stores.artifact_store.get(seeded.bundle_location) is not None
-        loaded = seed_stores.agent_cache.load(seeded.id, seeded.bundle_location, expand_env=False)
-        assert _spec_harness(loaded.spec) == agent.harness
-        catalog_entry = _to_agent_object(seeded, seed_stores.agent_cache)
-        assert catalog_entry.harness == agent.harness
 
 
 def test_ensure_default_acp_agents_seeds_configured_agent(

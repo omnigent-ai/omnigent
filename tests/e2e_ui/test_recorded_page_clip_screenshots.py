@@ -175,54 +175,37 @@ def test_recorded_jpeg_clip_preserves_quality_and_path(
     assert actual.quantization == expected_quantization
 
 
-@pytest.mark.parametrize("recorded", [False, True])
-@pytest.mark.parametrize(
-    "clip",
-    [
-        {"x": 2000, "y": 2000, "width": 20, "height": 20},
-        {"x": 0, "y": 0, "width": 0, "height": 20},
-    ],
-)
-def test_invalid_clip_raises_playwright_error(
-    browser: Browser, tmp_path: Path, recorded: bool, clip: dict[str, int]
-) -> None:
-    _skip_unless_chromium(browser)
-    context = browser.new_context(record_video_dir=str(tmp_path / "video") if recorded else None)
-    try:
-        page = context.new_page()
-        page.set_content(_PAGE)
-        with pytest.raises(Error):
-            page.screenshot(clip=clip)
-    finally:
-        context.close()
-
-
 @pytest.mark.parametrize("api", ["sync", "async"])
 @pytest.mark.parametrize(
-    "options",
+    ("options", "exact_message"),
     [
-        pytest.param({"type": "png", "quality": 80}, id="png-quality"),
-        pytest.param({"quality": 0}, id="implicit-png-quality"),
-        pytest.param({"type": "webp"}, id="unsupported-format"),
-        pytest.param({"type": ""}, id="empty-format"),
-        pytest.param({"path": "probe.webp"}, id="unsupported-extension"),
-        pytest.param({"path": "probe"}, id="missing-extension"),
-        pytest.param({"type": "jpeg", "quality": -1}, id="negative-quality"),
-        pytest.param({"type": "jpeg", "quality": 101}, id="excessive-quality"),
-        pytest.param({"type": "jpeg", "quality": 80.5}, id="fractional-quality"),
-        pytest.param({"type": "jpeg", "quality": "80"}, id="string-quality"),
-        pytest.param({"type": "jpeg", "quality": True}, id="boolean-quality"),
-        pytest.param({"clip": {"x": 0, "y": 0, "height": 10}}, id="missing-width"),
-        pytest.param({"clip": []}, id="non-object-clip"),
-        pytest.param({"clip": {**_CLIP, "x": "40"}}, id="string-coordinate"),
-        pytest.param({"clip": {**_CLIP, "x": True}}, id="boolean-coordinate"),
-        pytest.param({"clip": {**_CLIP, "width": 0}}, id="zero-width"),
+        pytest.param({"type": "png", "quality": 80}, True, id="png-quality"),
+        pytest.param({"quality": 0}, True, id="implicit-png-quality"),
+        pytest.param({"type": "webp"}, True, id="unsupported-format"),
+        pytest.param({"type": ""}, True, id="empty-format"),
+        pytest.param({"path": "probe.webp"}, True, id="unsupported-extension"),
+        pytest.param({"path": "probe"}, True, id="missing-extension"),
+        pytest.param({"type": "jpeg", "quality": -1}, True, id="negative-quality"),
+        pytest.param({"type": "jpeg", "quality": 101}, True, id="excessive-quality"),
+        pytest.param({"type": "jpeg", "quality": 80.5}, True, id="fractional-quality"),
+        pytest.param({"type": "jpeg", "quality": "80"}, True, id="string-quality"),
+        pytest.param({"type": "jpeg", "quality": True}, True, id="boolean-quality"),
+        pytest.param({"clip": {"x": 0, "y": 0, "height": 10}}, True, id="missing-width"),
+        pytest.param({"clip": []}, True, id="non-object-clip"),
+        pytest.param({"clip": {**_CLIP, "x": "40"}}, True, id="string-coordinate"),
+        pytest.param({"clip": {**_CLIP, "x": True}}, True, id="boolean-coordinate"),
+        pytest.param({"clip": {**_CLIP, "width": 0}}, True, id="zero-width"),
+        pytest.param(
+            {"clip": {"x": 2000, "y": 2000, "width": 20, "height": 20}},
+            False,
+            id="outside-image",
+        ),
     ],
 )
 def test_invalid_screenshot_options_match_native(
-    browser: Browser, tmp_path: Path, api: str, options: dict[str, Any]
+    browser: Browser, tmp_path: Path, api: str, options: dict[str, Any], exact_message: bool
 ) -> None:
-    """Recording must preserve Playwright's error type and validation message."""
+    """Preserve Playwright errors, including exact messages for native validation."""
     _skip_unless_chromium(browser)
     kwargs = {"clip": _CLIP, **options}
     if "path" in kwargs:
@@ -265,7 +248,11 @@ def test_invalid_screenshot_options_match_native(
             finally:
                 context.close()
 
-    assert errors[0] == errors[1]
+    if exact_message:
+        assert errors[0] == errors[1]
+    else:
+        # Locally cropped geometry errors lack Playwright's API-call prefix.
+        assert all("Clipped area is either empty or outside" in message for message in errors)
     if "path" in kwargs:
         assert not kwargs["path"].exists()
 

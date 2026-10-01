@@ -202,6 +202,44 @@ def test_journey(context):
     pytester.runpytest_subprocess("-q").assert_outcomes(passed=1)
 
 
+@pytest.mark.parametrize("fails", [False, True], ids=["passing", "failing"])
+@pytest.mark.parametrize("warning_flags", [(), ("-W", "error")], ids=["default", "warnings-error"])
+def test_context_close_error_is_reported_without_changing_the_test_result(
+    pytester: pytest.Pytester,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    fails: bool,
+    warning_flags: tuple[str, ...],
+) -> None:
+    _configure(pytester, monkeypatch, record_dir=tmp_path / "raw")
+    pytester.makepyfile(
+        _FAKE_CONTEXT
+        + f"""
+from playwright.sync_api import Error
+
+class BrokenContext(FakeContext):
+    def close(self):
+        raise Error("recording transport disconnected")
+
+@pytest.fixture
+def context():
+    return BrokenContext()
+
+def test_journey(context):
+    assert not {fails!r}, "original journey assertion"
+"""
+    )
+
+    result = pytester.runpytest_subprocess("-q", *warning_flags)
+    result.assert_outcomes(passed=int(not fails), failed=int(fails))
+    output = result.stdout.str() + result.stderr.str()
+    assert "Could not finalize recording for" in output
+    assert "::test_journey" in output
+    assert "recording transport disconnected" in output
+    if fails:
+        assert "original journey assertion" in output
+
+
 def test_record_dir_films_the_page_fixture(
     pytester: pytest.Pytester, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
