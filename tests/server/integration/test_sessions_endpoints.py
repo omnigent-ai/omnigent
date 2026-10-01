@@ -5284,14 +5284,12 @@ async def test_post_external_session_status_failed_forwards_persisted_assistant_
         forwarded.append({"path": request.url.path, "body": json.loads(request.content)})
         return httpx.Response(204)
 
-    fake_runner = httpx.AsyncClient(
+    async with httpx.AsyncClient(
         transport=httpx.MockTransport(_handler),
         base_url="http://runner",
-    )
-
-    _route_to_runner(monkeypatch, fake_runner)
-    _capture_published(monkeypatch, published)
-    try:
+    ) as fake_runner:
+        _route_to_runner(monkeypatch, fake_runner)
+        _capture_published(monkeypatch, published)
         agent = await create_test_agent(client, sub_agents=[{"name": "worker"}])
         parent = await _create_session(client, agent["id"])
         child_resp = await client.post(
@@ -5329,8 +5327,6 @@ async def test_post_external_session_status_failed_forwards_persisted_assistant_
             f"/v1/sessions/{child['id']}/events",
             json={"type": "external_session_status", "data": {"status": "failed"}},
         )
-    finally:
-        await fake_runner.aclose()
 
     assert status_resp.status_code == 202, status_resp.text
     assert forwarded, "the failed edge was never forwarded to the runner"
@@ -9951,32 +9947,30 @@ async def test_interrupt_forward_success_keeps_stop_fence(
         del request
         return httpx.Response(202)
 
-    fake_runner = httpx.AsyncClient(
+    async with httpx.AsyncClient(
         transport=httpx.MockTransport(_handler),
         base_url="http://runner",
-    )
+    ) as fake_runner:
+        _route_to_runner(monkeypatch, fake_runner)
+        session_id: str | None = None
+        try:
+            agent = await create_test_agent(client)
+            session = await _create_session(client, agent["id"])
+            session_id = session["id"]
 
-    _route_to_runner(monkeypatch, fake_runner)
-    session_id: str | None = None
-    try:
-        agent = await create_test_agent(client)
-        session = await _create_session(client, agent["id"])
-        session_id = session["id"]
-
-        resp = await client.post(
-            f"/v1/sessions/{session_id}/events",
-            json={"type": "interrupt", "data": {}},
-        )
-        assert resp.status_code == 202, resp.text
-        # 2xx from the runner = the cancel landed; the fence must stay so
-        # the dying turn's trailing response.* events are suppressed.
-        assert session_id in _interrupt_fenced_sessions, (
-            "a delivered interrupt must keep the fence installed"
-        )
-    finally:
-        if session_id is not None:
-            _interrupt_fenced_sessions.discard(session_id)
-        await fake_runner.aclose()
+            resp = await client.post(
+                f"/v1/sessions/{session_id}/events",
+                json={"type": "interrupt", "data": {}},
+            )
+            assert resp.status_code == 202, resp.text
+            # 2xx from the runner = the cancel landed; the fence must stay so
+            # the dying turn's trailing response.* events are suppressed.
+            assert session_id in _interrupt_fenced_sessions, (
+                "a delivered interrupt must keep the fence installed"
+            )
+        finally:
+            if session_id is not None:
+                _interrupt_fenced_sessions.discard(session_id)
 
 
 @dataclass
