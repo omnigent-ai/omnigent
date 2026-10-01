@@ -128,6 +128,25 @@ export function useHasSessionDraft(conversationId: string): boolean {
   );
 }
 
+const ignoreDrafts = () => () => {};
+
+function draftIdsKey(): string {
+  return [...sessionDrafts.keys()].filter(hasSessionDraft).sort().join(" ");
+}
+
+/**
+ * The ids holding a draft, as one string that changes only when a draft appears
+ * or clears — so typing doesn't re-render a subscriber. Disabled: "" and no
+ * subscription.
+ */
+export function useSessionDraftIds(enabled = true): string {
+  return useSyncExternalStore(
+    enabled ? subscribe : ignoreDrafts,
+    enabled ? draftIdsKey : () => "",
+    () => "",
+  );
+}
+
 /** Clear all drafts, primarily for logout/reset flows and isolated tests. */
 export function clearSessionDrafts(): void {
   sessionDrafts.clear();

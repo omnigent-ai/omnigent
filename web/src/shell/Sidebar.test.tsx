@@ -17,6 +17,7 @@ import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { ALT_KEY, ARIA_MOD_KEY, MOD_KEY } from "@/components/KeyboardShortcut";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { Conversation } from "@/hooks/useConversations";
+import type * as PullRequestsModule from "@/hooks/usePullRequests";
 import {
   markConversationRead,
   markConversationSeen,
@@ -46,6 +47,7 @@ const {
   pinnedIdsRef,
   projectSessionsMock,
   useHostsMock,
+  usePullRequestInfoMock,
 } = vi.hoisted(() => ({
   projectsMock: [] as string[],
   projectRowsRef: { current: undefined as { id: string; name: string }[] | undefined },
@@ -73,8 +75,14 @@ const {
   // prove a folder fetches its members independently of the global window.
   projectSessionsMock: { current: {} as Record<string, unknown[]> },
   useHostsMock: vi.fn(),
+  usePullRequestInfoMock: vi.fn(),
 }));
 
+// The session tooltip reads repo / PR / branch from the session's GitHub info.
+vi.mock("@/hooks/usePullRequests", async (importOriginal) => ({
+  ...(await importOriginal<typeof PullRequestsModule>()),
+  usePullRequestInfo: usePullRequestInfoMock,
+}));
 vi.mock("@/hooks/useHosts", () => ({
   useHosts: useHostsMock,
   // The project-settings dialog (mounted by Sidebar rows) resolves model
@@ -273,6 +281,8 @@ beforeEach(() => {
   useConvMock.mockReset();
   useHostsMock.mockReset();
   useHostsMock.mockReturnValue({ data: [] });
+  usePullRequestInfoMock.mockReset();
+  usePullRequestInfoMock.mockReturnValue({ data: undefined });
   localStorage.clear();
   resetReadStateForTests();
   clearSessionDrafts();
@@ -3105,6 +3115,80 @@ describe("Sidebar view options", () => {
     expect(groupHeaders()).toEqual(["Done"]);
   });
 
+  it("moves a session into Draft live, holding groups while the pointer is over the list", () => {
+    localStorage.setItem("omnigent:sidebar-view", JSON.stringify({ grouping: "status" }));
+    mockConversations([
+      conv("conv_a", "Codex", { status: "idle" }),
+      conv("conv_b", "Codex", { status: "idle" }),
+    ]);
+    renderSidebar();
+    expect(groupHeaders()).toEqual(["Done"]);
+
+    // A change under the cursor waits, so a click can't land on a moved row.
+    const list = screen.getByTestId("sidebar-conversation-list");
+    fireEvent.mouseOver(list);
+    act(() => setSessionDraft("conv_a", { text: "half-typed", files: [] }));
+    expect(groupHeaders()).toEqual(["Done"]);
+
+    fireEvent.mouseOut(list, { relatedTarget: document.body });
+    expect(groupHeaders()).toEqual(["Draft", "Done"]);
+    expect(within(groupSection("Draft")).getByText("conv_a")).toBeInTheDocument();
+
+    // With the pointer away, a new draft regroups at once (no list refresh).
+    act(() => setSessionDraft("conv_b", { text: "another", files: [] }));
+    expect(groupHeaders()).toEqual(["Draft"]);
+  });
+
+  it("keeps Load more while any group is expanded", () => {
+    localStorage.setItem("omnigent:sidebar-view", JSON.stringify({ grouping: "status" }));
+    const rows = [
+      conv("conv_running", "Codex", { status: "running", updated_at: 200 }),
+      conv("conv_done", "Codex", { status: "idle", updated_at: 100 }),
+    ];
+    useConvMock.mockImplementation(
+      () =>
+        ({
+          data: {
+            pages: [{ data: rows, first_id: rows[0]!.id, last_id: rows[1]!.id, has_more: true }],
+            pageParams: [undefined],
+          },
+          isLoading: false,
+          isError: false,
+          error: null,
+          fetchNextPage: vi.fn(),
+          hasNextPage: true,
+          isFetchingNextPage: false,
+        }) as unknown as ReturnType<typeof useConversations>,
+    );
+    renderSidebar();
+    expect(screen.getByRole("button", { name: "Load more" })).toBeInTheDocument();
+
+    // A next page can land in any group, so collapsing only the last one
+    // mustn't stall pagination; collapsing every group does.
+    fireEvent.click(screen.getByRole("button", { name: "Done" }));
+    expect(screen.getByRole("button", { name: "Load more" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Working" }));
+    expect(screen.queryByRole("button", { name: "Load more" })).toBeNull();
+  });
+
+  it("leaves project selection when the grouping changes", () => {
+    projectsMock.push("Customer X");
+    mockConversations([
+      conv("conv_filed", "Claude Code", { labels: { omni_project: "Customer X" } }),
+    ]);
+    renderSidebar();
+    fireEvent.click(screen.getByRole("button", { name: /^Customer X/ }));
+    openProjectsMenu();
+    fireEvent.click(screen.getByTestId("projects-select-sessions"));
+    expect(screen.getByRole("button", { name: "Exit selection mode" })).toBeInTheDocument();
+
+    // Grouped views hide Projects (and its bulk bar), so selection ends.
+    openViewSubmenu("session-grouping-menu");
+    fireEvent.click(screen.getByTestId("session-grouping-status"));
+    expect(screen.queryByRole("button", { name: "Exit selection mode" })).toBeNull();
+    expect(screen.getByTestId("toggle-selection-mode")).toBeInTheDocument();
+  });
+
   it("groups sessions by updated day from the persisted preference", () => {
     localStorage.setItem("omnigent:sidebar-view", JSON.stringify({ grouping: "updated" }));
     mockConversations([
@@ -3173,6 +3257,52 @@ describe("Sidebar view options", () => {
       "environment",
       "branch",
     ]);
+  });
+
+  it("adds the harness and on-demand repo, PR and branch to the session tooltip", async () => {
+    usePullRequestInfoMock.mockReturnValue({
+      data: {
+        object: "session.github.info",
+        available: true,
+        branch: "onboarding-flow",
+        repo: { name_with_owner: "omnigent-ai/omnigent" },
+        pr: { number: 419, state: "OPEN", is_draft: true },
+      },
+    });
+    mockConversations([
+      conv("conv_gh", "claude-native-ui", {
+        workspace: "/Users/me/omnigent",
+        labels: { "omnigent.wrapper": "claude-code-native-ui" },
+      }),
+      conv("conv_no_workspace", "Codex"),
+    ]);
+    renderSidebar();
+    // Closed tooltips don't fetch: rows only ask for GitHub info once opened.
+    expect(usePullRequestInfoMock).not.toHaveBeenCalled();
+
+    fireEvent.pointerMove(screen.getByRole("link", { name: "conv_gh" }), { pointerType: "mouse" });
+    await waitFor(() => {
+      const tooltip = screen.getByTestId("session-tooltip-content");
+      expect(within(tooltip).getByRole("img", { name: "Claude Code harness" })).toBeTruthy();
+      expect(within(tooltip).getByTestId("session-tooltip-repo")).toHaveTextContent("Repoomnigent");
+      expect(within(tooltip).getByTestId("session-tooltip-pr")).toHaveTextContent("PR#419 · Draft");
+      expect(within(tooltip).getByTestId("session-tooltip-branch")).toHaveTextContent(
+        "Branchonboarding-flow",
+      );
+    });
+    expect(usePullRequestInfoMock).toHaveBeenCalledWith("conv_gh");
+  });
+
+  it("skips the GitHub lookup for a session without a workspace", async () => {
+    mockConversations([conv("conv_bare", "Codex", { owner: null })]);
+    renderSidebar();
+
+    fireEvent.pointerMove(screen.getByRole("link", { name: "conv_bare" }), {
+      pointerType: "mouse",
+    });
+    await screen.findByTestId("session-tooltip-content");
+    expect(usePullRequestInfoMock).toHaveBeenCalledWith(undefined);
+    expect(screen.queryByTestId("session-tooltip-repo")).toBeNull();
   });
 
   it("names the creator in the session tooltip", async () => {
