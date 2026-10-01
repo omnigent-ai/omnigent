@@ -810,14 +810,10 @@ export interface ConversationState {
     stableId?: string;
     replyDraft?: StoredReplyDraft;
     /**
-     * `true` when the send is known refused: the server answered the POST with
-     * an Omnigent error code (e.g. the runner rejected the forward), a
-     * reconnect snapshot reported that rejection after the answer was lost, or
-     * an untouched retry of such a send failed unanswered. Persistence precedes
-     * runner acceptance, so a refused send's item in the transcript is not
-     * delivery proof; only a live `session_input_consumed` retracts the draft.
-     * `false` for a transport failure, where the item's presence proves the
-     * acknowledgement alone was lost.
+     * The send is known refused (an error answer to the POST, a snapshot
+     * rejection naming its item, or an unanswered untouched retry of such a
+     * send): its persisted item cannot prove delivery; only a live
+     * `session_input_consumed` can. `false` for a plain transport failure.
      */
     serverRefused?: boolean;
   } | null;
@@ -1449,6 +1445,14 @@ interface SendChain {
   tail: Promise<void>;
 }
 const sendChains = new Map<string | symbol, SendChain>();
+
+/**
+ * Sends whose POST has not settled, by stable id, flagged `true` once a live
+ * `session_input_consumed` named the id. Read by `send()`'s failure path: that
+ * acknowledgement proves THIS attempt was taken even when the POST's answer is
+ * lost and an earlier refused attempt's item already sits in the transcript.
+ */
+const inFlightSends = new Map<string, boolean>();
 
 // Sends with no conversation id yet (brand-new chat) serialize together: the
 // session is created inside the chained work, so they can't key by id. A
@@ -2343,6 +2347,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       return state?.pendingUserMessages.some((p) => p.tempId === tempId && p.initialDraft);
     };
 
+    inFlightSends.set(stableId, false);
     try {
       await waitForPrior();
       if (initialDraft && !initialSendPending()) return;
@@ -2493,10 +2498,11 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       // and restoring a draft would repopulate the composer with a sent prompt.
       const draftState =
         draftSessionId === null ? get() : (setterForState(draftSessionId) ?? get());
-      const deliveredDespiteFailure = committedItemProvesDelivery(draftState.blocks, {
-        stableId,
-        serverRefused,
-      });
+      // A live `session_input_consumed` for this very attempt outranks all of
+      // that: the runner took it, whatever became of the POST's answer.
+      const deliveredDespiteFailure =
+        inFlightSends.get(stableId) === true ||
+        committedItemProvesDelivery(draftState.blocks, { stableId, serverRefused });
       if (
         !callerHandlesError &&
         !deliveredDespiteFailure &&
@@ -2561,6 +2567,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         }
       }
     } finally {
+      inFlightSends.delete(stableId);
       // Release the next queued send regardless of success/failure so one
       // failed POST can't stall the chain forever.
       releaseSend();
@@ -7263,6 +7270,7 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       // This committed item may be a send whose POST failed client-side —
       // its arrival proves that send was delivered, so retract the draft
       // before it (re)populates the composer with an already-sent prompt.
+      if (inFlightSends.has(event.itemId)) inFlightSends.set(event.itemId, true);
       applyToConversation((s) => retractDeliveredSendDraft(s, new Set([event.itemId]), "consumed"));
       // Hidden meta inputs stay hidden — except a background-task wake,
       // which `userContentFromEvent` re-labels as a system marker.

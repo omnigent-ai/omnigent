@@ -5569,6 +5569,45 @@ describe("chatStore — delivered-but-unacked send", () => {
     });
   });
 
+  it("hands back no draft when a refused retry is acknowledged before its POST dies", async () => {
+    const stableId = "f".repeat(32);
+    armRestoredDraft(stableId, { serverRefused: true });
+    useChatStore.setState({
+      blocks: itemsToBlocks([{ ...userMessage("refused_first", "resend me"), id: stableId }]),
+    });
+    // The retry's POST stays in flight until the test fails it.
+    let failPost!: (reason: Error) => void;
+    const pending = new Promise<Response>((_resolve, reject) => {
+      failPost = reject;
+    });
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input).endsWith("/v1/sessions/conv_existing/events") && init?.method === "POST") {
+        return pending;
+      }
+      return defaultFetchHandler(input, init);
+    });
+
+    const sending = useChatStore.getState().send("resend me", "agent_xyz");
+    await vi.waitFor(() => expect(postedEvent().data.stable_id).toBe(stableId));
+    // The runner took the retry: its acknowledgement arrives over the stream
+    // before the POST settles, and then the POST's own answer is lost.
+    handleSessionEvent({
+      type: "session_input_consumed",
+      itemId: stableId,
+      itemType: "message",
+      data: { role: "user", content: [{ type: "input_text", text: "resend me" }] },
+    });
+    failPost(new TypeError("Failed to fetch"));
+    await sending;
+
+    // The live acknowledgement outranks the carried-over refusal: nothing is
+    // restored for a prompt the runner has confirmed taking.
+    const state = useChatStore.getState();
+    expect(state.failedSendDraft).toBeNull();
+    expect(state.restoredSendDraft).toBeNull();
+    expect(state.pendingRetryStableId).toBeNull();
+  });
+
   it("mints a fresh stable id when the restored draft was edited before the resend", async () => {
     const stableId = "d".repeat(32);
     armRestoredDraft(stableId);
