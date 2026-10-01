@@ -107,6 +107,7 @@ from omnigent.runtime.mcp_tool_result import decode_mcp_image_result
 from omnigent.spec.types import RetryPolicy
 from omnigent.util import proc as _proc
 from omnigent.util.async_utils import run_sync_on_thread
+from omnigent.util.package_root import PACKAGE_ROOT
 from omnigent.util.portability import resolve_cli_binary
 from omnigent.util.reasoning_effort import CODEX_EFFORTS, EFFORT_ALIASES, validate_effort
 from omnigent.util.subprocess_lifecycle import close_subprocess_transport, terminate_subprocess
@@ -2986,7 +2987,7 @@ class _CodexAppServerSession:
                 os.set_inheritable(liveness_read_fd, True)
                 spawn_argv = [
                     sys.executable,
-                    str(Path(__file__).with_name("_liveness_exec.py")),
+                    str(PACKAGE_ROOT / "util" / "liveness_exec.py"),
                     "--liveness-fd",
                     str(liveness_read_fd),
                     *argv,

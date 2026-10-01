@@ -24,8 +24,9 @@ from omnigent.sandbox.egress.controller import (
     apply_egress_env,
     start_egress_proxy,
 )
+from omnigent.util.package_root import PACKAGE_ROOT
 
-_FRAMEWORK_PACKAGE_ROOT = Path(__file__).resolve().parents[1]
+_FRAMEWORK_PACKAGE_ROOT = PACKAGE_ROOT
 _BROKERED_AUTH_SECRET_ENV = frozenset(
     {
         "DATABRICKS_BEARER",

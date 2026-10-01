@@ -838,7 +838,7 @@ class CursorExecutor(Executor):
         server_url = os.environ.get("RUNNER_SERVER_URL", "")
         conv_id = _get_conversation_id()
         if server_url and conv_id:
-            hook_script = str(Path(__file__).with_name("cursor_policy_hook.py"))
+            hook_script = str(Path(__file__).with_name("policy_hook.py"))
             state.hooks_file = _write_cursor_hooks(cwd, hook_script, server_url, conv_id)
 
         # Spawn the bridge with the process cwd pointing at the workspace so

@@ -25,6 +25,7 @@ from omnigent.onboarding.sandboxes import (
     get_launcher,
 )
 from omnigent.util.cli_invocation import cli_invocation
+from omnigent.util.package_root import PACKAGE_ROOT
 
 
 def _omnigent_repo_root() -> Path:
@@ -38,7 +39,7 @@ def _omnigent_repo_root() -> Path:
        that contains both ``sdks/python-client`` and ``omnigent``.
        This succeeds when the user runs ``omnigent sandbox …`` from
        inside a checkout.
-    2. Fall back to ``Path(__file__).resolve().parents[1]`` so an
+    2. Fall back to the directory holding the installed package so an
        editable install (``pip install -e .``) still works when the
        user invokes from outside the checkout.
 
@@ -48,13 +49,10 @@ def _omnigent_repo_root() -> Path:
     """
     cwd = Path.cwd().resolve()
     candidates: list[Path] = [cwd, *cwd.parents]
-    # ``cli_sandbox.py`` lives at ``<repo>/omnigent/cli_sandbox.py``;
-    # parents[1] is the repo root that hosts ``sdks/`` and
-    # ``omnigent/``. Editable installs (``pip install -e .``) point
-    # ``__file__`` into the checkout, so this branch covers the "invoke
-    # from outside cwd" case. Wheel installs land in site-packages where
-    # the parent check below will (correctly) miss and we raise.
-    candidates.append(Path(__file__).resolve().parents[1])
+    # Editable installs (``pip install -e .``) put the package inside the
+    # checkout, whose root hosts ``sdks/`` and ``omnigent/``. Wheel installs
+    # land in site-packages, where the check below misses and we raise.
+    candidates.append(PACKAGE_ROOT.parent)
     for candidate in candidates:
         if (candidate / "sdks" / "python-client").is_dir() and (candidate / "omnigent").is_dir():
             return candidate

@@ -73,6 +73,7 @@ from omnigent.spec.parser import discover_host_skills
 from omnigent.spec.types import AgentSpec, SkillSpec
 from omnigent.util import proc as _proc
 from omnigent.util.cli_invocation import cli_invocation
+from omnigent.util.package_root import PACKAGE_ROOT
 
 if TYPE_CHECKING:
     from omnigent.cli.runner_startup import RunnerStartupProgress
@@ -2177,7 +2178,7 @@ def _chat_local(
         try:
             _wait_for_server(port, server)
             base_url = f"http://127.0.0.1:{port}"
-            _web_ui_dist = Path(__file__).parent / "server" / "static" / "web-ui"
+            _web_ui_dist = PACKAGE_ROOT / "server" / "static" / "web-ui"
             if _web_ui_dist.is_dir() and (_web_ui_dist / "index.html").is_file():
                 console.print(f"\n  Web UI: [bold]{base_url}[/bold]")
                 console.print("  Open in your browser for a visual interface\n")

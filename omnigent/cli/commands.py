@@ -101,6 +101,7 @@ from omnigent.onboarding.sandboxes import available_providers as _sandbox_provid
 from omnigent.util import proc as _proc
 from omnigent.util.cli_invocation import WRAPPER_COMMAND_ENV, cli_invocation
 from omnigent.util.json_types import JsonObject as _JsonObject
+from omnigent.util.package_root import PACKAGE_ROOT
 from omnigent.util.portability import IS_WINDOWS, resolve_repo_symlink
 from omnigent.util.server_url import ServerUrl
 from omnigent.util.server_url import org_id_from_url as _org_id_from_url
@@ -1954,7 +1955,7 @@ def _finish_cli_profile(profiler: Any, output_path: Path) -> None:  # type: igno
     total_time = float(stats_state["total_tt"])
     total_calls = int(stats_state["total_calls"])
     primitive_calls = int(stats_state["prim_calls"])
-    package_root = Path(__file__).resolve().parent
+    package_root = PACKAGE_ROOT
     source_root = package_root.parent
 
     # (filename, line, function, primitive calls, total calls, self, cumulative)
@@ -4995,7 +4996,7 @@ def stop(force: bool) -> None:
 
 def _uninstall_script_path() -> Path:
     """Return an executable uninstall script path for source and wheel installs."""
-    repo_script = Path(__file__).resolve().parent.parent / "scripts" / "uninstall_oss.sh"
+    repo_script = PACKAGE_ROOT.parent / "scripts" / "uninstall_oss.sh"
     if repo_script.exists():
         return repo_script
     try:

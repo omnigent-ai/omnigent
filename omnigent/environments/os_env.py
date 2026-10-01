@@ -44,6 +44,7 @@ from omnigent.sandbox.credential_proxy import (
 )
 from omnigent.util.async_utils import run_sync_on_thread
 from omnigent.util.json_types import JsonValue
+from omnigent.util.package_root import PACKAGE_ROOT
 from omnigent.util.portability import IS_WINDOWS, WINDOWS_ENV_PASSTHROUGH
 from omnigent.util.runner_identity import (
     OMNIGENT_SESSION_ENV_VAR,
@@ -1612,7 +1613,7 @@ def _shell_argv(shell_path: str, command: str) -> list[str]:
 def _project_root() -> Path:
     # File lives at omnigent/environments/os_env.py; climb two levels to the
     # repo root that hosts `omnigent/` as a package.
-    return Path(__file__).resolve().parents[2]
+    return PACKAGE_ROOT.parent
 
 
 def _same_path(entry: str, root: Path) -> bool:

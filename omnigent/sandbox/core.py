@@ -25,6 +25,7 @@ from omnigent.core.datamodel import (
 )
 from omnigent.environments.agent_env import DESKTOP_SESSION_ENV_VARS
 from omnigent.util.json_types import JsonValue
+from omnigent.util.package_root import PACKAGE_ROOT
 from omnigent.util.runner_identity import RUNNER_AUTH_SECRET_ENV_VARS
 
 logger = logging.getLogger(__name__)
@@ -1312,13 +1313,13 @@ def _get_backend(type_name: str) -> SandboxBackend:
 
 def _ensure_builtin_backends() -> None:
     if "linux_bwrap" not in _BACKENDS:
-        from omnigent.sandbox import bwrap as bwrap_sandbox
+        pass
     if "darwin_seatbelt" not in _BACKENDS:
-        from omnigent.sandbox import seatbelt as seatbelt_sandbox
+        pass
     # Windows-only: the backend module touches ctypes.windll, so import it
     # solely on Windows to keep the POSIX import graph clean.
     if os.name == "nt" and "windows_jobobject" not in _BACKENDS:
-        from omnigent.sandbox import windows_jobobject as windows_jobobject_sandbox
+        pass
 
 
 def _default_sandbox_for_platform() -> OSEnvSandboxSpec:
@@ -1386,7 +1387,7 @@ def _resolve_sandbox_type(raw_type: str | None) -> str:
 def _project_root() -> Path:
     # File lives at omnigent/sandbox/core.py; climb two levels to the
     # repo root that hosts `omnigent/` as a package.
-    return Path(__file__).resolve().parents[2]
+    return PACKAGE_ROOT.parent
 
 
 def _encode_json_arg(value: JsonValue) -> str:

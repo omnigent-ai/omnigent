@@ -50,6 +50,8 @@ from typing import TYPE_CHECKING
 
 import tomllib
 
+from omnigent.util.package_root import PACKAGE_ROOT
+
 if TYPE_CHECKING:
     # Imported only for type hints; the heavy/optional imports remain lazy
     # at runtime so importing this module stays cheap.
@@ -716,7 +718,7 @@ def _find_repo_root() -> Path | None:
     :returns: The repo root ``Path`` for a dev clone, or ``None``
         for any installed-wheel scenario.
     """
-    package_dir = Path(__file__).resolve().parent  # <candidate>/omnigent/
+    package_dir = PACKAGE_ROOT  # <candidate>/omnigent/
     candidate = package_dir.parent
     # ``.git`` may be a directory (a normal clone) or a file (a git
     # worktree), so check for existence rather than requiring a dir.

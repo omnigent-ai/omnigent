@@ -42,7 +42,7 @@ _HARNESSES = [
 def decode_sandbox(
     request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
 ) -> Callable[[OSEnvSandboxSpec], OSEnvSandboxSpec]:
-    harness = importlib.import_module(f"omnigent.inner.{request.param}_harness")
+    harness = importlib.import_module(f"omnigent.harnesses.{request.param}.harness")
 
     def decode(sandbox: OSEnvSandboxSpec) -> OSEnvSandboxSpec:
         payload = _serialize_os_env(OSEnvSpec(sandbox=sandbox))
@@ -137,7 +137,7 @@ def test_harness_preserves_absent_and_empty_credential_proxy(
 def test_harness_rejects_invalid_nested_credential_policy(
     harness_name: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    harness = importlib.import_module(f"omnigent.inner.{harness_name}_harness")
+    harness = importlib.import_module(f"omnigent.harnesses.{harness_name}.harness")
     monkeypatch.setenv(
         harness._ENV_OS_ENV,
         '{"sandbox": {"type": "linux_bwrap", "credential_proxy": {"entries": "invalid"}}}',

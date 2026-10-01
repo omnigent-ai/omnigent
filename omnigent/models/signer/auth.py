@@ -15,6 +15,7 @@ from urllib.parse import urlsplit
 
 from omnigent.sandbox.egress.rules import is_dns_safe_host
 from omnigent.util import proc as _proc
+from omnigent.util.package_root import PACKAGE_ROOT
 from omnigent.util.subprocess_lifecycle import close_subprocess_transport, terminate_subprocess
 
 PROVIDER_AUTH_REQUIRED = "PROVIDER_AUTH_REQUIRED"
@@ -211,7 +212,7 @@ async def mint_ucode_token(*, host: str, profile: str) -> str:
             os.set_inheritable(liveness_read_fd, True)
             helper_argv = [
                 sys.executable,
-                str(Path(__file__).with_name("_liveness_exec.py")),
+                str(PACKAGE_ROOT / "util" / "liveness_exec.py"),
                 "--liveness-fd",
                 str(liveness_read_fd),
                 *helper_argv,
