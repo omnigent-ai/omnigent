@@ -753,4 +753,4 @@ doc = "Qwen Code (ACP mode) headless harness."
 
 [cleanup]
 delete_empty = ["omnigent.native", "omnigent.server.routes._sessions"]
-exclude = ["CHANGELOG.md", "uv.lock", "pnpm-lock.yaml", "**/package-lock.json", "dev/refactor/*", "tests/dev/test_relocate_modules.py", "AGENTS.md", "docs/ARCHITECTURE.md"]
+exclude = ["CHANGELOG.md", "uv.lock", "pnpm-lock.yaml", "**/package-lock.json", "dev/refactor/*", "tests/dev/test_relocate_modules.py", "AGENTS.md", "docs/ARCHITECTURE.md", "tests/test_architecture.py", "web/src/shell/NewChatDialog.test.tsx"]
