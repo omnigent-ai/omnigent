@@ -6902,7 +6902,7 @@
                 "type": "null"
               }
             ],
-            "description": "Error details from the most recently failed task. Only present when `status == \"failed\"` and the task stored an error. Lets clients display the failure reason on historical load without relying on the transient `response.error` SSE event (which may have been emitted before the web client subscribed). Format mirrors the `RetryErrorDetail` SSE shape: `{\"code\": \"executor_error\", \"message\": \"...\"}`. `None` in all other cases.",
+            "description": "Error details from the most recently failed task. Only present when `status == \"failed\"` and the task stored an error. Lets clients display the failure reason on historical load without relying on the transient `response.error` SSE event (which may have been emitted before the web client subscribed). Format mirrors the `RetryErrorDetail` SSE shape: `{\"code\": \"executor_error\", \"message\": \"...\"}`. A `runner_rejected_event` failure also carries `item_id`, the persisted item the runner refused, so a web client whose POST answer was lost can match the refusal to its own send. `None` in all other cases.",
             "title": "Last Task Error"
           },
           "last_total_tokens": {
