@@ -41,6 +41,7 @@ from omnigent.harnesses.codex_native.launch_args import (
     canonical_codex_launch_args,
     codex_config_profile,
     materialize_codex_config_profile,
+    read_codex_mcp_servers,
     validate_codex_config_profile_state,
     without_codex_config_profile,
 )
@@ -71,6 +72,7 @@ from omnigent.inner.codex_executor import (
     _populate_codex_home_config,
     _provider_codex_config_overrides,
     codex_extended_catalog_requested,
+    codex_minimal_config_requested,
     codex_router_bridge_dir,
     codex_router_hooks_settings,
     codex_router_session_id,
@@ -190,57 +192,6 @@ def _format_codex_version(version: tuple[int, int, int] | None) -> str:
     if version is None:
         return "unknown"
     return ".".join(str(part) for part in version)
-
-
-def _toml_table_header_name(line: str) -> str | None:
-    """
-    Return the TOML table name declared by *line*, if any.
-
-    This intentionally recognizes only normal table headers because the
-    injected Codex MCP server config is a normal table. Array tables are
-    left untouched.
-
-    :param line: One config line, e.g.
-        ``"[mcp_servers.omnigent] # generated\n"``.
-    :returns: The table name, e.g. ``"mcp_servers.omnigent"``, or
-        ``None`` when *line* is not a normal table header.
-    """
-    stripped = line.strip()
-    if not stripped.startswith("["):
-        return None
-    if stripped.startswith("[["):
-        return None
-    end = stripped.find("]")
-    if end < 0:
-        return None
-    suffix = stripped[end + 1 :].strip()
-    if suffix and not suffix.startswith("#"):
-        return None
-    return stripped[1:end].strip()
-
-
-def _remove_toml_table(text: str, table_name: str) -> str:
-    """
-    Remove one TOML table and its subtables from a config document.
-
-    Used for generated private Codex config before appending the
-    Omnigent MCP server table. This avoids accumulating duplicate
-    ``[mcp_servers.omnigent]`` sections across terminal relaunches.
-
-    :param text: TOML document text.
-    :param table_name: Table name to remove, e.g.
-        ``"mcp_servers.omnigent"``.
-    :returns: TOML text with the target table block removed.
-    """
-    kept: list[str] = []
-    skipping = False
-    for line in text.splitlines(keepends=True):
-        header = _toml_table_header_name(line)
-        if header is not None:
-            skipping = header == table_name or header.startswith(f"{table_name}.")
-        if not skipping:
-            kept.append(line)
-    return "".join(kept).rstrip()
 
 
 #: Omnigent tools the framework calls on every session's behalf, pre-approved
@@ -807,10 +758,11 @@ def _inject_mcp_server_config(
     bridge_dir: Path,
     python_executable: str | None = None,
     *,
+    mcp_servers: _JsonObject,
     routed_spawns: bool = False,
 ) -> None:
     """
-    Upsert Omnigent MCP server config into ``config.toml``.
+    Refresh user MCPs and inject Omnigent's relay into the private config.
 
     Writes a ``[mcp_servers.omnigent]`` section that points Codex
     at the ``serve-mcp`` subprocess. This supplements the ``-c``
@@ -823,30 +775,28 @@ def _inject_mcp_server_config(
         and ``tool_relay.json``.
     :param python_executable: Python executable for serve-mcp.
         ``None`` uses :data:`sys.executable`.
+    :param mcp_servers: Current source-owned MCP inventory, including profile overrides.
     :param routed_spawns: ``True`` for an auto-harness Smart Routing session,
         which pre-approves the cross-harness redirect tools too.
     :returns: None.
     """
     config_path = codex_home / "config.toml"
-    # Materialize the symlink from _populate_codex_home_config before
-    # editing so the user's real config.toml stays untouched.
-    if config_path.is_symlink():
-        target = config_path.resolve()
-        config_path.unlink()
-        if target.is_file():
-            import shutil
-
-            shutil.copy2(target, config_path)
-    if config_path.exists():
-        existing = config_path.read_text(encoding="utf-8")
-    else:
-        existing = ""
-    updated = _remove_toml_table(existing, "mcp_servers.omnigent")
+    document = (
+        tomlkit.parse(config_path.read_text(encoding="utf-8"))
+        if config_path.exists()
+        else tomlkit.document()
+    )
+    # Replace, rather than merge, so deleted servers and fields do not survive.
+    servers = {name: config for name, config in mcp_servers.items() if name != "omnigent"}
+    document.pop("mcp_servers", None)
+    if servers:
+        document["mcp_servers"] = servers
+    updated = tomlkit.dumps(document).rstrip()
     section = _codex_mcp_server_config_section(
         bridge_dir, python_executable, routed_spawns=routed_spawns
     )
     rendered = f"{updated}\n\n{section}" if updated else section
-    config_path.write_text(rendered, encoding="utf-8")
+    _write_private_config(config_path, rendered)
 
 
 class CodexAppServerResponseError(RuntimeError):
@@ -1883,6 +1833,12 @@ class CodexNativeAppServer:
 
         :returns: None.
         """
+        config_source = _codex_home_config_source_from_env()
+        if self.codex_home.resolve() == config_source.resolve():
+            raise ValueError(
+                "Omnigent could not isolate this session's Codex configuration. "
+                "Startup was stopped to protect your shared config. Please report this as a bug."
+            )
         self.codex_home.mkdir(mode=0o700, parents=True, exist_ok=True)
         os.chmod(self.codex_home, 0o700)
         if self.listen_url is None or self.listen_url.startswith("unix://"):
@@ -1920,7 +1876,13 @@ class CodexNativeAppServer:
                 router_bridge_dir = None
         self.router_hooks_registered = router_bridge_dir is not None and policy_hooks_supported
         routed_spawns = router_bridge_dir is not None
-        config_source = _codex_home_config_source_from_env()
+        minimal_config = codex_minimal_config_requested()
+        mcp_servers = read_codex_mcp_servers(
+            config_source,
+            self.config_profile,
+            codex_version=codex_version,
+            minimal_config=minimal_config,
+        )
         model_migration_target: str | None = None
         if self.trust_project and self.pinned_model:
             catalog: object = self.model_catalog_rows
@@ -1947,6 +1909,7 @@ class CodexNativeAppServer:
             inject_hooks=self.router_hooks_registered,
             extend_model_catalog=codex_extended_catalog_requested(self.env),
             supported_efforts=CODEX_NATIVE_EFFORTS,
+            minimal_config=minimal_config,
         )
         compose_profile_instructions = _materialize_codex_profile_for_start(
             self.codex_home,
@@ -1964,6 +1927,7 @@ class CodexNativeAppServer:
             self.codex_home,
             self.bridge_dir,
             self.python_executable,
+            mcp_servers=mcp_servers,
             routed_spawns=routed_spawns,
         )
         if self.pinned_model:

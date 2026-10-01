@@ -7,6 +7,7 @@ import {
   CheckIcon,
   XIcon,
   AlertTriangleIcon,
+  RefreshCwIcon,
   SearchIcon,
 } from "lucide-react";
 import { type ReactNode, useEffect, useRef, useState } from "react";
@@ -399,8 +400,8 @@ interface WorkspacePickerProps {
  * File-browser directory picker for choosing a workspace.
  *
  * The reference-style chrome separates path navigation from listing search:
- * a header provides up / workspace / home / typed-path / hidden / close
- * controls, while a dedicated search row filters the current directory.
+ * a header provides up / workspace / home / typed-path / hidden / refresh /
+ * close controls, while a dedicated search row filters the current directory.
  * Clicking a folder navigates into it; files stay visible but disabled because
  * workspaces must be directories. Commit-style callers get the persistent
  * Cancel / Confirm footer. The picker always uses the canonical full-frame
@@ -472,7 +473,14 @@ export function WorkspacePicker({
     setCreateError(null);
   }, [hostId]);
 
-  const { data, isLoading, isFetching, error, isPlaceholderData } = useHostFilesystem(hostId, path);
+  const {
+    data,
+    isLoading,
+    isFetching,
+    error,
+    isPlaceholderData,
+    refetch: refetchListing,
+  } = useHostFilesystem(hostId, path);
   const navigationPending = Boolean(isLoading || isFetching || isPlaceholderData);
 
   // Resolve the host's home dir independently of where the picker is
@@ -523,6 +531,7 @@ export function WorkspacePicker({
     isFetching: worktreesFetching,
     isPlaceholderData: worktreesPlaceholder,
     error: worktreesError,
+    refetch: refetchWorktrees,
   } = useHostWorktrees(hostId, worktreeQueryPath);
   const worktreesPending = Boolean(worktreesFetching || worktreesPlaceholder);
   const verifiedGitWorktrees = useVerifiedGitWorktrees({
@@ -654,6 +663,17 @@ export function WorkspacePicker({
       return;
     }
     onSelect?.(selectedWorktreePath ?? currentAbsolute);
+  }
+
+  // Nothing re-polls the host while the picker stays open, so a folder or
+  // worktree created outside Omnigent (e.g. `git worktree add` in a terminal)
+  // would not appear until the user navigated away and back.
+  function refreshListing() {
+    if (hostId === null) return;
+    void refetchListing();
+    // A disabled worktree query has no repo path; refetching it would
+    // request the host's worktrees for "".
+    if (worktreeQueryPath !== null) void refetchWorktrees();
   }
 
   // Directory the "New folder" action creates in. A resolved absolute
@@ -822,6 +842,13 @@ export function WorkspacePicker({
           }
           onClick={() => setShowHidden((v) => !v)}
           testId="workspace-picker-show-hidden"
+        />
+        <PickerIconButton
+          label="Refresh"
+          icon={<RefreshCwIcon className={showGitDialog ? "size-4" : "size-5"} />}
+          onClick={refreshListing}
+          disabled={hostId === null || navigationPending || worktreesFetching}
+          testId="workspace-picker-refresh"
         />
         {onClose && (
           <PickerIconButton
