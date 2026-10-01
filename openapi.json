@@ -4024,6 +4024,258 @@
         "title": "ProjectOrderResponse",
         "type": "object"
       },
+      "ProjectSessionCreateRequest": {
+        "description": "Project-opted create shape whose agent may be filled by the server.\n\nThe public legacy `SessionCreateRequest` deliberately keeps\n`agent_id` required so requests without `project_id` retain their exact\nvalidation and OpenAPI contract.",
+        "properties": {
+          "agent_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Agent Id"
+          },
+          "cost_control_mode_override": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Cost Control Mode Override"
+          },
+          "git": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SessionGitOptions"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "harness_override": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Harness Override"
+          },
+          "host_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Host Id"
+          },
+          "host_type": {
+            "default": "external",
+            "enum": [
+              "external",
+              "managed"
+            ],
+            "title": "Host Type",
+            "type": "string"
+          },
+          "inference_configuration_revision": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Inference Configuration Revision"
+          },
+          "initial_items": {
+            "items": {
+              "$ref": "#/components/schemas/SessionEventInput"
+            },
+            "title": "Initial Items",
+            "type": "array"
+          },
+          "labels": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "title": "Labels",
+            "type": "object"
+          },
+          "model_override": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Model Override"
+          },
+          "parent_session_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Parent Session Id"
+          },
+          "project_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Project Id"
+          },
+          "reasoning_effort": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Reasoning Effort"
+          },
+          "sandbox_provider": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Sandbox Provider"
+          },
+          "smart_routing_message": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Smart Routing Message"
+          },
+          "sub_agent_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Sub Agent Name"
+          },
+          "subagent_routing_override": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Subagent Routing Override"
+          },
+          "terminal_launch_args": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Terminal Launch Args"
+          },
+          "title": {
+            "anyOf": [
+              {
+                "maxLength": 200,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Title"
+          },
+          "workspace": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Workspace"
+          },
+          "workspaces": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Workspaces"
+          }
+        },
+        "title": "ProjectSessionCreateRequest",
+        "type": "object"
+      },
       "QueuedEvent": {
         "description": "Optional event emitted between `created` and `in_progress`\nfor background tasks that are queued before they start.\n\nForeground streaming responses skip this event.",
         "properties": {
@@ -5415,6 +5667,398 @@
         "title": "SessionCollaborationModeEvent",
         "type": "object"
       },
+      "SessionCreateMetadata": {
+        "additionalProperties": false,
+        "description": "Metadata JSON part for multipart `POST /v1/sessions`.\n\nThe uploaded agent tarball supplies the agent spec. This JSON\npart carries only session-level metadata so request metadata\ncannot disagree with the agent bundle.",
+        "properties": {
+          "host_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Optional host to launch the runner on, e.g. `\"host_a1b2c3d4...\"`. When set, the server generates a binding token, writes the expected runner_id to the session row, and sends a `host.launch_runner` frame to the host. `None` for CLI-initiated sessions where the caller manages runner spawning.",
+            "title": "Host Id"
+          },
+          "host_type": {
+            "default": "external",
+            "description": "How the session's host is obtained \u2014 `\"external\"` (the default: the caller manages the runner, e.g. a local `omnigent run`) or `\"managed\"` (the server provisions a sandbox host). The uploaded bundle's session-scoped agent runs on the provisioned sandbox; its spec is fetched by the managed runner over its tunnel, same as any session-scoped agent.",
+            "enum": [
+              "external",
+              "managed"
+            ],
+            "title": "Host Type",
+            "type": "string"
+          },
+          "inference_configuration_revision": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Inference Configuration Revision"
+          },
+          "labels": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "description": "Initial guardrails labels to set on the session. Empty dict (the default) starts with no labels.",
+            "title": "Labels",
+            "type": "object"
+          },
+          "parent_session_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Optional parent session id, e.g. `\"conv_abc123\"`. When set, the new session is created as a sub-agent child of that session (`kind=\"sub_agent\"`) and inherits the parent's runner binding for co-location. The caller must have READ access to the parent. `None` creates a top-level session.",
+            "title": "Parent Session Id"
+          },
+          "project_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Project Id"
+          },
+          "reasoning_effort": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Optional per-session reasoning-effort hint. Accepted metadata values are `\"none\"`, `\"minimal\"`, `\"low\"`, `\"medium\"`, `\"high\"`, `\"xhigh\"`, `\"max\"`, and `\"ultra\"`. Provider-specific support is validated when a turn executes. `None` means use the agent default.",
+            "title": "Reasoning Effort"
+          },
+          "sandbox_provider": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Which configured sandbox provider to provision on `host_type: \"managed\"` (one of the server's `sandbox_providers`); `None` takes the server's first. Only valid with `host_type: \"managed\"`.",
+            "title": "Sandbox Provider"
+          },
+          "terminal_launch_args": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Optional pass-through CLI args for a native terminal wrapper (claude / codex), e.g. `[\"--dangerously-skip-permissions\"]`. Set at create-time so the runner has them before it boots. Bounds (count / length) are validated server-side. `None` for non-native sessions. See designs/NATIVE_RUNNER_SERVER_LAUNCH.md.",
+            "title": "Terminal Launch Args"
+          },
+          "title": {
+            "anyOf": [
+              {
+                "maxLength": 200,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Optional human-readable title for the session, e.g. `\"debugging auth flow\"`.",
+            "title": "Title"
+          },
+          "workspace": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Absolute path on the host where the runner should start, e.g. `\"/Users/corey/universe/src/foo\"`. Required when `host_id` is set; validated against the uploaded agent's `os_env.cwd` boundary at session create (per designs/SESSION_WORKSPACE_SELECTION.md). Optional otherwise.",
+            "title": "Workspace"
+          }
+        },
+        "title": "SessionCreateMetadata",
+        "type": "object"
+      },
+      "SessionCreateRequest": {
+        "description": "Legacy create shape, preserving required-string `agent_id`.",
+        "properties": {
+          "agent_id": {
+            "title": "Agent Id",
+            "type": "string"
+          },
+          "cost_control_mode_override": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Cost Control Mode Override"
+          },
+          "git": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SessionGitOptions"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "harness_override": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Harness Override"
+          },
+          "host_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Host Id"
+          },
+          "host_type": {
+            "default": "external",
+            "enum": [
+              "external",
+              "managed"
+            ],
+            "title": "Host Type",
+            "type": "string"
+          },
+          "inference_configuration_revision": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Inference Configuration Revision"
+          },
+          "initial_items": {
+            "items": {
+              "$ref": "#/components/schemas/SessionEventInput"
+            },
+            "title": "Initial Items",
+            "type": "array"
+          },
+          "labels": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "title": "Labels",
+            "type": "object"
+          },
+          "model_override": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Model Override"
+          },
+          "parent_session_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Parent Session Id"
+          },
+          "project_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Project Id"
+          },
+          "reasoning_effort": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Reasoning Effort"
+          },
+          "sandbox_provider": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Sandbox Provider"
+          },
+          "smart_routing_message": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Smart Routing Message"
+          },
+          "sub_agent_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Sub Agent Name"
+          },
+          "subagent_routing_override": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Subagent Routing Override"
+          },
+          "terminal_launch_args": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Terminal Launch Args"
+          },
+          "title": {
+            "anyOf": [
+              {
+                "maxLength": 200,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Title"
+          },
+          "workspace": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Workspace"
+          },
+          "workspaces": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Workspaces"
+          }
+        },
+        "required": [
+          "agent_id"
+        ],
+        "title": "SessionCreateRequest",
+        "type": "object"
+      },
       "SessionCreatedEvent": {
         "description": "A child (sub-agent) session was spawned from this session.\n\nEmitted by `omnigent/tools/builtins/spawn.py:_spawn_one`\nonto the **parent** session's conversation stream after the\nchild conversation row is created and the child task has been\nstarted. Per the session-rearchitecture spec \u00a73 (\"Event types\nand direction\") and \u00a77 (\"Flow: client interacts with\nsub-agent\"), this lets clients watching the parent session's\nSSE subscribe directly to the child's stream without polling\nhistory for the tunneled `function_call` item.\n\nThe wire shape is FLAT (not enveloped):\n`{\"type\": \"session.created\", \"conversation_id\": <parent>, \"child_session_id\": <child>, \"agent_id\": <agent or None>, \"parent_session_id\": <parent>, \"sequence_number\": null}`.\n\nThe existing tunneled `function_call` ConversationItem\n(carried inside `OutputItemDoneEvent`) is retained\nfor compatibility \u2014 clients that don't yet implement the\n\"subscribe to child stream\" pattern can keep rendering sub-\nagent calls from the parent's persistent history.",
         "properties": {
@@ -5480,6 +6124,70 @@
           "child_session_id"
         ],
         "title": "SessionCreatedEvent",
+        "type": "object"
+      },
+      "SessionEventInput": {
+        "description": "A single client-submitted event/input item for a session.\n\nUsed both as an element of `initial_items` on session\ncreation and as the body of `POST /v1/sessions/{id}/events`.\nCarries a discriminator (`type`) and a free-form `data`\npayload whose shape is interpreted by the route layer based\non `type` (e.g. user message, function-call output,\napproval, interrupt).",
+        "properties": {
+          "created_by": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Optional internal attribution actor for runner- originated events that are triggered by a prior human turn.",
+            "title": "Created By"
+          },
+          "data": {
+            "additionalProperties": true,
+            "description": "Type-specific payload. Shape varies by `type`; for `\"message\"` this looks like `{\"role\": \"user\", \"content\": [{\"type\": \"input_text\", \"text\": \"Hello\"}]}`. For `\"interrupt\"` this is typically `{}`.",
+            "title": "Data",
+            "type": "object"
+          },
+          "model_override": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Optional per-event LLM model override used when this event starts a fresh agent turn. Distinct from the session's bound agent; it substitutes for the agent spec's `llm.model` for that turn.",
+            "title": "Model Override"
+          },
+          "tools": {
+            "anyOf": [
+              {
+                "items": {
+                  "additionalProperties": true,
+                  "type": "object"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Optional OpenAI function-tool dicts registered when this event creates a new task. Mirrors `CreateResponseRequest.tools`, e.g. `[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"...\", \"parameters\": {...}}}]`. Ignored when the event steers into an active task: that task's tools are fixed at start time.",
+            "title": "Tools"
+          },
+          "type": {
+            "description": "Discriminator for the event/input kind, e.g. `\"message\"`, `\"function_call_output\"`, `\"interrupt\"`.",
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type"
+        ],
+        "title": "SessionEventInput",
         "type": "object"
       },
       "SessionForkRequest": {
@@ -11368,6 +12076,47 @@
       "post": {
         "description": "Create a session.\n\n`application/json` preserves the existing contract: bind to\nan already-registered agent by `agent_id` and return the full\nsession snapshot. `multipart/form-data` is the Alpha\nrunner-state create path: the request carries a JSON\n`metadata` part and a `bundle` file part, then the server\nstores the bundle and creates the conversation row plus\nsession-scoped agent row in one database transaction.\n\n**Returns:** `SessionResponse` for JSON create, or `CreatedSessionResponse` for bundled create.\n\n**Raises**\n\n- `OmnigentError` \u2014 If metadata, bundle, or agent lookup validation fails, artifact storage is unavailable, or database creation fails.",
         "operationId": "create_session_v1_sessions_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "anyOf": [
+                  {
+                    "$ref": "#/components/schemas/SessionCreateRequest"
+                  },
+                  {
+                    "$ref": "#/components/schemas/ProjectSessionCreateRequest"
+                  }
+                ]
+              }
+            },
+            "multipart/form-data": {
+              "encoding": {
+                "metadata": {
+                  "contentType": "application/json"
+                }
+              },
+              "schema": {
+                "properties": {
+                  "bundle": {
+                    "contentMediaType": "application/gzip",
+                    "description": "Gzipped tar of the agent directory.",
+                    "type": "string"
+                  },
+                  "metadata": {
+                    "$ref": "#/components/schemas/SessionCreateMetadata"
+                  }
+                },
+                "required": [
+                  "metadata",
+                  "bundle"
+                ],
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
         "responses": {
           "201": {
             "content": {
