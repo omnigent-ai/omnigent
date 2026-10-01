@@ -30,19 +30,23 @@ export interface InventoryMcpServer {
   harness: BrandHarness;
   /** Secondary label, e.g. the bundling plugin or a remote server's hostname. */
   detail?: string;
+  /** Plugin that bundles the server, e.g. ``"figma"``. */
+  plugin?: string;
 }
 
 export interface InventorySkill {
   id: string;
   name: string;
   harness: BrandHarness;
+  description?: string;
 }
 
 export interface InventoryPlugin {
   id: string;
   name: string;
   harness: BrandHarness;
-  skillCount?: number;
+  /** Its skill names, without the ``plugin:`` prefix. */
+  skills: string[];
 }
 
 export interface HarnessInventoryContext {
@@ -101,17 +105,17 @@ function isBrandHarness(value: string): value is BrandHarness {
   return (BRAND_HARNESSES as readonly string[]).includes(value);
 }
 
-/** Split `plugin:skill` names into per-plugin counts; the rest are plain skills. */
+/** Split `plugin:skill` names into per-plugin skill names; the rest are plain skills. */
 function splitPluginSkills(skills: SkillSummary[]) {
-  const plain: string[] = [];
-  const plugins = new Map<string, number>();
-  for (const { name } of skills) {
-    const split = name.indexOf(":");
+  const plain: SkillSummary[] = [];
+  const plugins = new Map<string, string[]>();
+  for (const skill of skills) {
+    const split = skill.name.indexOf(":");
     if (split > 0) {
-      const plugin = name.slice(0, split);
-      plugins.set(plugin, (plugins.get(plugin) ?? 0) + 1);
+      const plugin = skill.name.slice(0, split);
+      plugins.set(plugin, [...(plugins.get(plugin) ?? []), skill.name.slice(split + 1)]);
     } else {
-      plain.push(name);
+      plain.push(skill);
     }
   }
   return { plain, plugins };
@@ -135,10 +139,12 @@ export function buildInventoryContext(
       });
     }
     const { plain, plugins } = splitPluginSkills(skillsByHarness[harness] ?? []);
-    for (const name of plain) context.skills.push({ id: `${harness}:${name}`, name, harness });
+    for (const { name, description } of plain) {
+      context.skills.push({ id: `${harness}:${name}`, name, harness, description });
+    }
     const mcps = mcpServers.filter((server) => server.harness === harness);
     for (const server of mcps) {
-      if (server.plugin && !plugins.has(server.plugin)) plugins.set(server.plugin, 0);
+      if (server.plugin && !plugins.has(server.plugin)) plugins.set(server.plugin, []);
       const detail = [server.plugin && `${server.plugin} plugin`, server.url_host]
         .filter(Boolean)
         .join(" · ");
@@ -147,15 +153,11 @@ export function buildInventoryContext(
         name: server.name,
         harness,
         detail: detail || undefined,
+        plugin: server.plugin ?? undefined,
       });
     }
-    for (const [name, count] of plugins) {
-      context.plugins.push({
-        id: `${harness}:${name}`,
-        name,
-        harness,
-        skillCount: count > 0 ? count : undefined,
-      });
+    for (const [name, skills] of plugins) {
+      context.plugins.push({ id: `${harness}:${name}`, name, harness, skills });
     }
   }
   return context;

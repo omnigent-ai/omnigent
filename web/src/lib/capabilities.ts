@@ -57,7 +57,7 @@ export interface Branding {
 }
 
 /** Release features understood by this frontend build. */
-export type FeatureKey = "usage_page" | "harness_install" | "canvas" | "customize";
+export type FeatureKey = "usage_page" | "harness_install" | "canvas" | "harnesses";
 
 /** Deployment-wide release-feature values advertised by the server. */
 export type FeatureValues = Record<string, boolean>;

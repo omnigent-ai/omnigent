@@ -103,8 +103,8 @@ describe("useHarnessInventory", () => {
     expect(result.current.context).toEqual({
       credentials: [{ harness: "claude", source: "Databricks AI Gateway" }],
       skills: [
-        { id: "claude:review", name: "review", harness: "claude" },
-        { id: "codex:fix", name: "fix", harness: "codex" },
+        { id: "claude:review", name: "review", harness: "claude", description: "" },
+        { id: "codex:fix", name: "fix", harness: "codex", description: "" },
       ],
       mcps: [
         { id: "claude:github", name: "github", harness: "claude", detail: undefined },
@@ -113,12 +113,13 @@ describe("useHarnessInventory", () => {
           name: "figma",
           harness: "claude",
           detail: "figma plugin · mcp.figma.com",
+          plugin: "figma",
         },
         { id: "codex:docs", name: "docs", harness: "codex", detail: undefined },
       ],
       plugins: [
-        { id: "claude:toolkit", name: "toolkit", harness: "claude", skillCount: 2 },
-        { id: "claude:figma", name: "figma", harness: "claude", skillCount: undefined },
+        { id: "claude:toolkit", name: "toolkit", harness: "claude", skills: ["lint", "ship"] },
+        { id: "claude:figma", name: "figma", harness: "claude", skills: [] },
       ],
     });
   });

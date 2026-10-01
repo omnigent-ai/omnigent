@@ -257,7 +257,7 @@ import {
   readBackgroundSessionTitlesEnabled,
   writeBackgroundSessionTitlesEnabled,
 } from "@/lib/backgroundSessionTitlesPreferences";
-import { SettingsCustomizeSection } from "./settings/SettingsCustomizeSection";
+import { SettingsHarnessesSection } from "./settings/SettingsHarnessesSection";
 import { ReviewImportsPanel } from "@/components/onboarding/HostImportReview";
 
 // Admin-only management surfaces, rendered as the Members / Policies settings
@@ -285,7 +285,7 @@ export function SettingsPage() {
   // A login session exists (accounts OR OIDC) when the server advertises a
   // login_url; gates the Account section so SSO users get it too.
   const hasAuthSession = info !== "loading" && info.login_url !== null;
-  const { section, subSection } = useSettingsRoute();
+  const { section, harness } = useSettingsRoute();
   // Per-section page view: `settings.appearance`, `settings.account`, etc. The
   // hook re-keys on pathname, so switching sections re-fires under the new id.
   // `section` is a closed SettingsSectionId union (no PII / unbounded values).
@@ -312,17 +312,11 @@ export function SettingsPage() {
     );
   }
 
-  // Nested sections own their own layout. useSettingsRoute only sets
-  // subSection for a valid, feature-enabled customize route, so no extra
-  // flag check is needed here.
-  if (section === "customize" && subSection) {
-    return <SettingsCustomizeSection subSection={subSection} />;
-  }
-
   return (
     <PageScroll contentClassName="px-8" extraBottom="2.5rem">
       {section === "appearance" && <AppearanceSection />}
       {section === "general" && <GeneralSection />}
+      {section === "harnesses" && <SettingsHarnessesSection harness={harness} />}
       {section === "git" && <GitSection />}
       {section === "integrations" && <IntegrationsSection />}
       {section === "shortcuts" && <ShortcutsSection />}
