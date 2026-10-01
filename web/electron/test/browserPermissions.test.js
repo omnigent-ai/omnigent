@@ -132,6 +132,7 @@ describe("browser local network permissions", () => {
     b.destroy();
     assert.equal(b.check(), false);
     assert.equal(await b.request(), false);
+    assert.equal(b.dialogs.length, 1, "closing a tab must not queue another prompt");
     assert.equal(a.check(), true);
     assert.equal(await a.request(), true);
   });
@@ -157,6 +158,44 @@ describe("browser local network permissions", () => {
     b.respond("deny");
     await tick();
     assert.equal(a.check(), false, "a saved denial revokes the sibling tab's one-visit grant");
+  });
+
+  for (const choice of ["allow-once", "always-allow"]) {
+    it(`uses only saved grants for context-free checks when all tabs are hidden: ${choice}`, async () => {
+      const session = permissionSession();
+      const saved = storage();
+      const a = harness({ session, saved });
+      const b = harness({ session, saved, visible: false });
+      const result = a.request();
+      await tick();
+      a.respond(choice);
+      assert.equal(await result, true);
+      a.setVisible(false);
+      const details = { embeddingOrigin: ORIGIN };
+      assert.equal(a.check("loopback-network", ORIGIN, details, null), choice === "always-allow");
+      assert.equal(a.check("media", ORIGIN, details, null), false);
+      assert.equal(a.check("loopback-network", ORIGIN, {}, null), false);
+      assert.equal(a.check("loopback-network", "https://other.example", details, null), false);
+      await tick();
+      assert.equal(a.dialogs.length, 1);
+      assert.equal(b.dialogs.length, 0);
+      b.navigate("https://other.example");
+      b.setVisible(true);
+      assert.equal(a.check("loopback-network", ORIGIN, details, null), choice === "always-allow");
+      saved.store.set(ORIGIN, false);
+      assert.equal(a.check("loopback-network", ORIGIN, details, null), false);
+    });
+  }
+
+  it("tolerates a discarded request after its tab is destroyed", () => {
+    const session = permissionSession();
+    const h = harness({ session });
+    h.destroy();
+    assert.doesNotThrow(() => {
+      session.requestHandler(h.wc, "loopback-network", () => {
+        throw new Error("Request discarded");
+      });
+    });
   });
 
   for (const permission of NETWORK_PERMISSIONS) {

@@ -42,8 +42,8 @@ const DEFAULT_CAP = 10;
  */
 function agentPartition(scope, viewId) {
   let conversationId = viewId;
-  // Match browserViewId in web/src/hooks/useBrowserTabs.ts; only storage uses
-  // the owning session ID. Navigation and lifecycle remain keyed by view ID.
+  // Session IDs are UUID hex strings; tab keys follow browserViewId in
+  // web/src/hooks/useBrowserTabs.ts. Only storage uses the owning session ID.
   const tab = /^browser-tab:([^:]+):[^:]+$/.exec(viewId);
   if (tab) {
     try {

@@ -369,7 +369,7 @@ async function launchDesktop(opts) {
   const userDataDir = opts.userDataDir || fs.mkdtempSync(path.join(os.tmpdir(), "omni-desktop-"));
   fs.mkdirSync(userDataDir, { recursive: true });
   if (opts.serverUrl) {
-    // Seed both release and development profile locations.
+    // Seed both profile locations, matching main.js's development userData path.
     for (const profile of [userDataDir, path.join(userDataDir, "Omnigent Dev")]) {
       fs.mkdirSync(profile, { recursive: true });
       fs.writeFileSync(
@@ -432,10 +432,17 @@ async function launchDesktop(opts) {
     for (;;) {
       window = electronApp.windows().find((page) => {
         const url = page.url();
-        return /^https?:/.test(url) || /\/(setup|server-selector-v2)\/index\.html/.test(url);
+        return (
+          /^https?:/.test(url) ||
+          /\/setup\/index\.html/.test(url) ||
+          /\/server-selector-v2\/server-selector-v2\.html/.test(url)
+        );
       });
       if (window) break;
-      if (Date.now() > deadline) throw new Error("Desktop shell window did not load");
+      if (Date.now() > deadline) {
+        const urls = electronApp.windows().map((page) => page.url());
+        throw new Error(`Desktop shell window did not load; saw: ${JSON.stringify(urls)}`);
+      }
       // oxlint-disable-next-line no-await-in-loop -- Wait for the shell's navigation.
       await sleep(50);
     }

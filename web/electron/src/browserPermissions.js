@@ -19,14 +19,25 @@ function policiesForSession(session) {
   session.setPermissionRequestHandler((contents, permission, callback, details) => {
     const policy = policies.get(contents);
     if (policy) policy.request(contents, permission, callback, details);
-    else callback(false);
+    else {
+      try {
+        callback(false);
+      } catch {
+        // Chromium may have discarded the request during teardown.
+      }
+    }
   });
   session.setPermissionCheckHandler((contents, permission, origin, details) => {
     // Context-free checks can only be attributed to the foreground tab.
     const policy = contents
       ? policies.get(contents)
       : [...policies.values()].find((candidate) => candidate.canPrompt());
-    return policy?.check(contents, permission, origin, details) ?? false;
+    if (policy?.check(contents, permission, origin, details)) return true;
+    // Unattributed background checks may use saved site grants, but cannot
+    // borrow a hidden tab's one-visit consent or open a prompt.
+    return (
+      !contents && [...policies.values()].some((p) => p.checkSaved(permission, origin, details))
+    );
   });
   sessionPolicies.set(session, policies);
   return policies;
@@ -69,7 +80,7 @@ function createBrowserPermissionStore({ loadSettings, saveSettings }) {
   };
 }
 
-/** Install before constructing the view, then attach its webContents. */
+/** Install before constructing the view, then attach exactly once to its webContents. */
 function registerBrowserPermissions(session, { canPrompt, showPrompt, store }) {
   const policies = policiesForSession(session);
   const visits = new Map();
@@ -189,12 +200,19 @@ function registerBrowserPermissions(session, { canPrompt, showPrompt, store }) {
     return false;
   }
 
+  function checkSaved(permission, requestingOrigin, details = {}) {
+    if (!LOCAL_NETWORK_PERMISSIONS.has(permission)) return false;
+    const ctx = context(null, requestingOrigin, details, true);
+    return !!ctx && store.get(ctx.origin) === true;
+  }
+
   return {
     attach(webContents) {
       contents = webContents;
       policies.set(contents, {
         request: handleRequest,
         check: handleCheck,
+        checkSaved,
         canPrompt: () => canPrompt(contents),
       });
       contents.on("did-start-navigation", (_event, url, isInPlace, isMainFrame) => {
