@@ -39,26 +39,6 @@ from typing import TypedDict
 
 _logger = logging.getLogger(__name__)
 
-# The release in which the legacy ``HARNESS_<NAME>_PATH`` read is removed.
-# Deprecated in v0.6.0; two versions of back-compat, then removal.
-_LEGACY_PATH_REMOVAL_VERSION = "v0.8.0"
-
-# Legacy ``HARNESS_*_PATH`` env vars and their canonical ``OMNIGENT_<NAME>_PATH``
-# replacement. Keep in sync with the ``_LEGACY_ENV_*`` constants in the inner
-# harness modules. Remove this mapping (and the legacy reads) in v0.8.0.
-_LEGACY_PATH_VARS: dict[str, str] = {
-    "HARNESS_CODEX_PATH": "OMNIGENT_CODEX_PATH",
-    "HARNESS_PI_PATH": "OMNIGENT_PI_PATH",
-    "HARNESS_KIMI_PATH": "OMNIGENT_KIMI_PATH",
-    "HARNESS_GOOSE_PATH": "OMNIGENT_GOOSE_PATH",
-    "HARNESS_QWEN_PATH": "OMNIGENT_QWEN_PATH",
-    "HARNESS_HERMES_PATH": "OMNIGENT_HERMES_PATH",
-}
-
-# Legacy ``HARNESS_*_PATH`` vars we have already warned about in this process,
-# so a long-lived runner doesn't spam the deprecation once per session.
-_LEGACY_PATH_WARNED: set[str] = set()
-
 # Keys read from a per-harness override entry in the ``harness:`` mapping.
 _OVERRIDE_KEY_COMMAND = "command"
 _OVERRIDE_KEY_ARGS = "args"
@@ -103,69 +83,22 @@ def _harness_path_env_var(canonical: str) -> str:
 
 
 def resolve_harness_path(canonical: str) -> str | None:
-    """Resolve a harness binary-path override from env, warning on legacy use.
+    """Resolve a harness binary-path override from the ``OMNIGENT_<base>_PATH`` env var.
 
-    Precedence: the canonical ``OMNIGENT_<base>_PATH`` env var, then the
-    deprecated ``HARNESS_<base>_PATH`` (emitting a one-time-per-process
-    deprecation warning naming the replacement and removal version), then
-    ``None`` so the caller falls back to ``PATH``. *base* is *canonical* with
-    the ``-native`` suffix stripped, so a harness's headless and native forms
-    share one env var.
+    Returns the value when set, otherwise ``None`` so the caller falls back to
+    ``PATH``. *base* is *canonical* with the ``-native`` suffix stripped, so a
+    harness's headless and native forms share one env var.
 
     Use this from the inner harness wraps (runner-side) to locate the vendor
     CLI binary. The CLI side uses :func:`resolve_harness_command` instead,
     which adds the ``--command`` flag and config layers on top of this env read.
 
     :param canonical: A harness id (e.g. ``"codex"`` or ``"pi-native"``).
-    :returns: The override path/name, or ``None`` when neither env var is set.
+    :returns: The override path/name, or ``None`` when the env var is unset.
     """
     canonical_env = _harness_path_env_var(canonical)
     value = os.environ.get(canonical_env, "").strip()
-    if value:
-        return value
-    base = _HARNESS_BINARY_BASE.get(canonical) or canonical.removesuffix("-native")
-    legacy_env = f"HARNESS_{base.upper().replace('-', '_')}_PATH"
-    # Only honor the legacy fallback for the 6 harnesses that historically
-    # documented a ``HARNESS_*_PATH`` var. Other harnesses (cursor, kiro,
-    # opencode, antigravity, …) never had one — honoring a speculative
-    # ``HARNESS_CURSOR_PATH`` would invent a new knob under a deprecated name.
-    if legacy_env not in _LEGACY_PATH_VARS:
-        return None
-    legacy = os.environ.get(legacy_env, "").strip()
-    if legacy:
-        _warn_legacy_path(legacy_env, canonical_env)
-        return legacy
-    return None
-
-
-def _warn_legacy_path(legacy_env: str, canonical_env: str) -> None:
-    """Emit a one-time-per-process deprecation warning for *legacy_env*."""
-    if legacy_env in _LEGACY_PATH_WARNED:
-        return
-    _LEGACY_PATH_WARNED.add(legacy_env)
-    _logger.warning(
-        "%s is deprecated; set %s instead. %s support will be removed in %s.",
-        legacy_env,
-        canonical_env,
-        legacy_env,
-        _LEGACY_PATH_REMOVAL_VERSION,
-    )
-
-
-def legacy_harness_path_env_vars_set() -> list[tuple[str, str]]:
-    """Return ``(legacy_var, canonical_replacement)`` for each deprecated
-    ``HARNESS_*_PATH`` env var currently set in the environment.
-
-    Used by the CLI entrypoint to surface a terminal-visible deprecation
-    notice at startup (before any command runs), so a user with a legacy var
-    in their shell/systemd/CI sees the replacement regardless of which harness
-    they launch or whether the run is local or remote. One line per set var.
-    """
-    return [
-        (legacy, canonical)
-        for legacy, canonical in _LEGACY_PATH_VARS.items()
-        if os.environ.get(legacy, "").strip()
-    ]
+    return value or None
 
 
 def resolve_harness_config(
@@ -304,10 +237,6 @@ def resolve_harness_command(
     if explicit and explicit.strip():
         return explicit.strip()
     canonical = _canonicalize(harness)
-    # Check both the canonical OMNIGENT_* and the deprecated HARNESS_* env var
-    # (via resolve_harness_path, which warns on legacy use) so that env always
-    # wins over config per the shared precedence — a legacy HARNESS_* must not
-    # be shadowed by a config ``harness.<id>.command``.
     env_value = resolve_harness_path(canonical)
     if env_value:
         return env_value
@@ -373,11 +302,10 @@ def config_harness_path_override(
         or ``None`` when config has no override or the ambient env var is set.
     """
     canonical = _canonicalize(harness)
-    # Ambient env wins over config — check BOTH the canonical OMNIGENT_* and
-    # the deprecated HARNESS_* (via resolve_harness_path, which warns on legacy
-    # use) so a legacy HARNESS_* isn't shadowed by a config ``command``.
+    # Ambient env wins over config — the ``OMNIGENT_<NAME>_PATH`` env var is
+    # the single override knob; if it's set, skip the config layer.
     if resolve_harness_path(canonical) is not None:
-        return None  # ambient env already wins (canonical or legacy)
+        return None  # ambient env already wins
     _, overrides = resolve_harness_config(cfg)
     entry = overrides.get(canonical)
     if entry is None:

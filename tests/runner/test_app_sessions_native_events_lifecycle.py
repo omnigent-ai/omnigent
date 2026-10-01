@@ -491,7 +491,7 @@ async def test_kiro_native_model_options_use_cli_catalog(
             json={"session_id": conv_id, "agent_id": "ag_1"},
         )
         assert create_resp.status_code == 201, create_resp.text
-        response = await client.get(f"/v1/sessions/{conv_id}/kiro-model-options")
+        response = await client.get(f"/v1/sessions/{conv_id}/model-options")
 
     assert response.status_code == 200
     assert response.json() == {"models": expected}
@@ -529,7 +529,7 @@ async def test_kiro_native_model_options_failure_is_retryable(
             json={"session_id": conv_id, "agent_id": "ag_1"},
         )
         assert create_resp.status_code == 201, create_resp.text
-        response = await client.get(f"/v1/sessions/{conv_id}/kiro-model-options")
+        response = await client.get(f"/v1/sessions/{conv_id}/model-options")
 
     assert response.status_code == 503, response.text
     assert response.json()["error"] == "kiro_native_model_options_failed"
@@ -583,7 +583,7 @@ async def test_cursor_native_model_options_use_cli_catalog(
             json={"session_id": conv_id, "agent_id": "ag_1"},
         )
         assert create_resp.status_code == 201, create_resp.text
-        response = await client.get(f"/v1/sessions/{conv_id}/cursor-model-options")
+        response = await client.get(f"/v1/sessions/{conv_id}/model-options")
         event_response = await client.post(
             f"/v1/sessions/{conv_id}/events",
             json={"type": "model_change", "model": "provider-latest"},
@@ -638,7 +638,7 @@ async def test_cursor_native_model_options_failure_is_retryable(
             json={"session_id": conv_id, "agent_id": "ag_1"},
         )
         assert create_resp.status_code == 201, create_resp.text
-        response = await client.get(f"/v1/sessions/{conv_id}/cursor-model-options")
+        response = await client.get(f"/v1/sessions/{conv_id}/model-options")
 
     assert response.status_code == 503, response.text
     assert response.json()["error"] == "cursor_native_model_options_failed"
@@ -697,7 +697,7 @@ async def test_opencode_native_model_options_uses_cli_catalog(
             json={"session_id": conv_id, "agent_id": "ag_1"},
         )
         assert create_resp.status_code == 201, create_resp.text
-        response = await client.get(f"/v1/sessions/{conv_id}/codex-model-options")
+        response = await client.get(f"/v1/sessions/{conv_id}/model-options")
 
     assert response.status_code == 200
     assert response.json() == {
@@ -829,7 +829,7 @@ async def test_codex_native_model_options_returns_503_until_bridge_state_exists(
         )
         assert create_resp.status_code == 201, create_resp.text
 
-        resp = await client.get(f"/v1/sessions/{conv_id}/codex-model-options")
+        resp = await client.get(f"/v1/sessions/{conv_id}/model-options")
 
     # A retryable 503 keeps the AP server from caching an empty model list;
     # returning 200 here would recreate the missing-picker regression.
@@ -1009,7 +1009,7 @@ async def test_codex_native_model_options_query_model_list(
         )
         assert create_resp.status_code == 201, create_resp.text
 
-        resp = await client.get(f"/v1/sessions/{conv_id}/codex-model-options")
+        resp = await client.get(f"/v1/sessions/{conv_id}/model-options")
 
     assert resp.status_code == 200, resp.text
     expected_models: list[dict[str, object]] = [
@@ -1159,7 +1159,7 @@ async def test_codex_model_catalog_writeback_uses_session_provider(
             )
             assert created.status_code == 201, created.text
             fake_client.model_list_responses = [{"result": {"data": live_rows}}]
-            response = await client.get(f"/v1/sessions/{session_id}/codex-model-options")
+            response = await client.get(f"/v1/sessions/{session_id}/model-options")
             assert response.status_code == 200, response.text
             assert response.json()["models"] == codex.mark_launch_default(
                 live_rows, "second-picker"
@@ -1312,8 +1312,8 @@ async def test_claude_native_model_options_use_session_launch_catalog(
             json={"session_id": conv_id, "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
         )
         assert create_resp.status_code == 201, create_resp.text
-        first = await client.get(f"/v1/sessions/{conv_id}/claude-model-options")
-        second = await client.get(f"/v1/sessions/{conv_id}/claude-model-options")
+        first = await client.get(f"/v1/sessions/{conv_id}/model-options")
+        second = await client.get(f"/v1/sessions/{conv_id}/model-options")
 
     expected = {
         "models": [
@@ -1434,7 +1434,7 @@ async def test_claude_native_model_options_refresh_the_bridge_vocabulary(
             json={"session_id": conv_id, "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
         )
         assert create_resp.status_code == 201, create_resp.text
-        listing = await client.get(f"/v1/sessions/{conv_id}/claude-model-options")
+        listing = await client.get(f"/v1/sessions/{conv_id}/model-options")
 
     assert listing.status_code == 200, listing.text
     assert recorded, "the listing must refresh the bridge vocabulary"
@@ -1542,7 +1542,7 @@ async def test_claude_native_model_options_serves_probe_rows_after_pending(
             json={"session_id": conv_id, "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
         )
         assert create_resp.status_code == 201, create_resp.text
-        pending = await client.get(f"/v1/sessions/{conv_id}/claude-model-options")
+        pending = await client.get(f"/v1/sessions/{conv_id}/model-options")
         assert pending.status_code == 503
         assert pending.json()["error"] == "claude_native_model_options_pending"
         release.set()
@@ -1550,8 +1550,8 @@ async def test_claude_native_model_options_serves_probe_rows_after_pending(
         # Keep it that tight here and a loaded machine answers 503 again
         # before the woken probe is even scheduled.
         monkeypatch.setattr(runner_app_module, "_CLAUDE_MODEL_OPTIONS_INLINE_WAIT_S", 5.0)
-        resolved = await client.get(f"/v1/sessions/{conv_id}/claude-model-options")
-        cached = await client.get(f"/v1/sessions/{conv_id}/claude-model-options")
+        resolved = await client.get(f"/v1/sessions/{conv_id}/model-options")
+        cached = await client.get(f"/v1/sessions/{conv_id}/model-options")
 
     assert resolved.status_code == 200
     # The harness's probed rows are the catalog — no configured or static
@@ -1638,7 +1638,7 @@ async def test_claude_native_model_options_config_error_is_not_retryable(
             json={"session_id": conv_id, "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
         )
         assert create_resp.status_code == 201, create_resp.text
-        resp = await client.get(f"/v1/sessions/{conv_id}/claude-model-options")
+        resp = await client.get(f"/v1/sessions/{conv_id}/model-options")
 
     assert resp.status_code == 424
     body = resp.json()
@@ -1749,13 +1749,13 @@ async def test_claude_native_model_options_expire_and_reread_the_store(
             json={"session_id": conv_id, "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
         )
         assert create_resp.status_code == 201, create_resp.text
-        first = await client.get(f"/v1/sessions/{conv_id}/claude-model-options")
+        first = await client.get(f"/v1/sessions/{conv_id}/model-options")
         # The store converges on its own (a background re-probe); the
         # expired entry must pick that up on the next read.
         model_catalog_store.write_catalog(
             "claude-native", claude_catalog_fingerprint(config), refreshed
         )
-        second = await client.get(f"/v1/sessions/{conv_id}/claude-model-options")
+        second = await client.get(f"/v1/sessions/{conv_id}/model-options")
 
     assert first.status_code == 200
     assert [row["model"] for row in first.json()["models"]] == ["system.ai.claude-opus-4-10"]
@@ -1848,10 +1848,10 @@ async def test_claude_native_model_options_retire_when_a_launch_records_its_conf
             json={"session_id": conv_id, "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
         )
         assert create_resp.status_code == 201, create_resp.text
-        before = await client.get(f"/v1/sessions/{conv_id}/claude-model-options")
+        before = await client.get(f"/v1/sessions/{conv_id}/model-options")
         # The next launch resolves another provider (a re-pointed default).
         recorders[-1](conv_id, _config("system.ai.claude-opus-5"))
-        after = await client.get(f"/v1/sessions/{conv_id}/claude-model-options")
+        after = await client.get(f"/v1/sessions/{conv_id}/model-options")
 
     assert [row["model"] for row in before.json()["models"]] == ["system.ai.claude-opus-4-10"]
     assert [row["model"] for row in after.json()["models"]] == ["system.ai.claude-opus-5"]

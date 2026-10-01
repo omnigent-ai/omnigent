@@ -4314,7 +4314,7 @@ _CODEX_BYPASS_HOOK_TRUST_FLAG = "--dangerously-bypass-hook-trust"
 _CODEX_APPROVAL_SANDBOX_FLAGS = frozenset({"--sandbox", "-s", "--ask-for-approval", "-a"})
 
 
-def _strip_approval_sandbox_flags(codex_args: tuple[str, ...]) -> list[str]:
+def _strip_approval_sandbox_flags(extra_args: tuple[str, ...]) -> list[str]:
     """
     Drop granular approval/sandbox flags (and values) when bypass is on.
 
@@ -4337,19 +4337,19 @@ def _strip_approval_sandbox_flags(codex_args: tuple[str, ...]) -> list[str]:
     re-add a single canonical copy. Unrelated args (model, config
     overrides, ...) pass through untouched.
 
-    :param codex_args: Raw Codex CLI args, e.g.
+    :param extra_args: Raw Codex CLI args, e.g.
         ``("--sandbox", "read-only", "--model", "gpt-5.4-mini")``.
-    :returns: ``codex_args`` with the conflicting flags removed, e.g.
+    :returns: ``extra_args`` with the conflicting flags removed, e.g.
         ``["--model", "gpt-5.4-mini"]``.
     """
-    codex_args = tuple(canonical_codex_launch_args(codex_args))
+    extra_args = tuple(canonical_codex_launch_args(extra_args))
     cleaned: list[str] = []
     i = 0
-    n = len(codex_args)
+    n = len(extra_args)
     while i < n:
-        arg = codex_args[i]
+        arg = extra_args[i]
         if arg == "--":
-            cleaned.extend(codex_args[i:])
+            cleaned.extend(extra_args[i:])
             break
         if arg in _CODEX_APPROVAL_SANDBOX_FLAGS:
             # ``--flag value``: drop the flag, and consume the NEXT token as
@@ -4357,7 +4357,7 @@ def _strip_approval_sandbox_flags(codex_args: tuple[str, ...]) -> list[str]:
             # does not itself start with ``-`` (a leading ``-`` marks a
             # separate flag, e.g. ``("--sandbox", "--model", "gpt")`` keeps
             # ``--model``; a trailing flag at end-of-list consumes nothing).
-            if i + 1 < n and not codex_args[i + 1].startswith("-"):
+            if i + 1 < n and not extra_args[i + 1].startswith("-"):
                 i += 2
             else:
                 i += 1
@@ -4376,9 +4376,9 @@ def _strip_approval_sandbox_flags(codex_args: tuple[str, ...]) -> list[str]:
     return cleaned
 
 
-def _strip_codex_resume_permission_args(codex_args: tuple[str, ...]) -> list[str]:
+def _strip_codex_resume_permission_args(extra_args: tuple[str, ...]) -> list[str]:
     """Omit permissions configured on the app-server at startup or thread/resume."""
-    args = _strip_approval_sandbox_flags(codex_args)
+    args = _strip_approval_sandbox_flags(extra_args)
     cleaned: list[str] = []
     index = 0
     while index < len(args):
@@ -4420,7 +4420,7 @@ def codex_remote_resume_omits_permission_args(
 
 def build_codex_remote_args(
     *,
-    codex_args: tuple[str, ...],
+    extra_args: tuple[str, ...],
     thread_id: str | None,
     remote_url: str,
     config_overrides: tuple[str, ...] = (),
@@ -4454,7 +4454,7 @@ def build_codex_remote_args(
     thread immediately. Codex global ``-c`` flags must precede the
     ``resume`` subcommand, so they are emitted first.
 
-    :param codex_args: Raw Codex CLI args that precede the attach flags,
+    :param extra_args: Raw Codex CLI args that precede the attach flags,
         e.g. ``("--model", "gpt-5.4-mini")``. Empty when the thread's own
         settings already cover everything.
     :param thread_id: Codex thread id to resume, e.g. ``"thread_abc123"``.
@@ -4476,7 +4476,7 @@ def build_codex_remote_args(
         resume, emit a single
         ``--dangerously-bypass-approvals-and-sandbox`` flag and strip any
         conflicting ``--sandbox`` / ``--ask-for-approval`` pairs from
-        *codex_args* (codex aborts at startup if the bypass flag is
+        *extra_args* (codex aborts at startup if the bypass flag is
         combined with either). DANGEROUS: this disables both the approval
         prompts and the command sandbox; it is gated behind an explicit,
         typed-confirmation opt-in in the web UI. Default ``False`` keeps
@@ -4502,9 +4502,9 @@ def build_codex_remote_args(
     if bypass_sandbox:
         # Strip the conflicting granular flags, then prepend one canonical
         # bypass flag (a global flag, so it precedes any ``resume``).
-        passthrough = [_CODEX_BYPASS_SANDBOX_FLAG, *_strip_approval_sandbox_flags(codex_args)]
+        passthrough = [_CODEX_BYPASS_SANDBOX_FLAG, *_strip_approval_sandbox_flags(extra_args)]
     else:
-        passthrough = normalize_codex_permission_launch_args(codex_args)
+        passthrough = normalize_codex_permission_launch_args(extra_args)
     passthrough = without_codex_config_profile(passthrough)
     if bypass_hook_trust:
         passthrough = [_CODEX_BYPASS_HOOK_TRUST_FLAG, *passthrough]
@@ -4514,7 +4514,7 @@ def build_codex_remote_args(
         return [*override_args, *passthrough, "resume", "--remote", remote_url, thread_id]
     # Codex rejects explicit permission overrides on remote resume, even
     # when they match the app-server policy. config_overrides went to server
-    # startup; codex_args went to preload's thread/resume call.
+    # startup; extra_args went to preload's thread/resume call.
     resume_args = _strip_codex_resume_permission_args((*override_args, *passthrough))
     return [*resume_args, "resume", "--remote", remote_url, thread_id]
 

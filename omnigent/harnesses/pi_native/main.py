@@ -53,8 +53,6 @@ _logger = logging.getLogger(__name__)
 
 _DEFAULT_PI_COMMAND = "pi"
 _PI_PATH_ENV = "OMNIGENT_PI_PATH"
-# Deprecated alias — remove in v0.8.0 (read via the legacy branch below, which warns).
-_LEGACY_HARNESS_PI_PATH_ENV = "HARNESS_PI_PATH"
 _AGENT_NAME = "pi-native-ui"
 _TERMINAL_NAME = "pi"
 _TERMINAL_SESSION_KEY = "main"
@@ -95,20 +93,9 @@ class PreparedPiTerminal:
 def _configured_pi_command(env: Mapping[str, str]) -> str:
     """Return the configured Pi executable name/path from *env*.
 
-    Reads ``OMNIGENT_PI_PATH`` (canonical) then the deprecated
-    ``HARNESS_PI_PATH`` (emitting a one-time-per-process deprecation warning
-    via the shared helper so wording/dedupe stay consistent).
+    Reads ``OMNIGENT_PI_PATH`` and falls back to ``"pi"``.
     """
-    value = env.get(_PI_PATH_ENV, "").strip()
-    if value:
-        return value
-    legacy = env.get(_LEGACY_HARNESS_PI_PATH_ENV, "").strip()
-    if legacy:
-        from omnigent.harness_startup_config import _warn_legacy_path
-
-        _warn_legacy_path(_LEGACY_HARNESS_PI_PATH_ENV, _PI_PATH_ENV)
-        return legacy
-    return _DEFAULT_PI_COMMAND
+    return env.get(_PI_PATH_ENV, "").strip() or _DEFAULT_PI_COMMAND
 
 
 def resolve_pi_executable(
@@ -190,14 +177,14 @@ def pi_supports_approve(executable: str) -> bool:
 
 
 def build_pi_launch(
-    pi_args: Sequence[str],
+    extra_args: Sequence[str],
     *,
     env: Mapping[str, str] | None = None,
     which: Callable[[str], str | None] | None = None,
 ) -> NativePiLaunch:
     """Build the argv for a native Pi process."""
     executable = resolve_pi_executable(env=env, which=which)
-    return NativePiLaunch(executable=executable, argv=[executable, *pi_args])
+    return NativePiLaunch(executable=executable, argv=[executable, *extra_args])
 
 
 def run_pi_native(
@@ -205,7 +192,6 @@ def run_pi_native(
     server: str | None,
     session_id: str | None,
     extra_args: tuple[str, ...] | None = None,
-    pi_args: tuple[str, ...] | None = None,
     resume_picker: bool = False,
     auto_open_conversation: bool = False,
 ) -> None:
@@ -214,15 +200,13 @@ def run_pi_native(
 
     :param server: Resolved Omnigent server URL.
     :param session_id: Optional existing Omnigent conversation id.
-    :param pi_args: Raw Pi CLI args to persist for the runner-owned TUI.
+    :param extra_args: Raw Pi CLI args to persist for the runner-owned TUI.
     :param resume_picker: ``True`` runs the Pi-native picker.
     :param auto_open_conversation: When ``True``, open the browser
         conversation URL after launch.
     :returns: None after the terminal attach session ends.
     """
-    pi_args = _normalize_extra_args(
-        extra_args=extra_args, legacy_args=pi_args, legacy_param="pi_args"
-    )
+    extra_args = _normalize_extra_args(extra_args)
     _preflight_local_tools()
     if server is None:
         raise click.ClickException(
@@ -236,7 +220,7 @@ def run_pi_native(
             spec_path,
             session_id=session_id,
             resume_picker=resume_picker,
-            pi_args=pi_args,
+            extra_args=extra_args,
             auto_open_conversation=auto_open_conversation,
         )
 
@@ -276,7 +260,7 @@ def _run_with_remote_server(
     *,
     session_id: str | None,
     resume_picker: bool,
-    pi_args: tuple[str, ...],
+    extra_args: tuple[str, ...],
     auto_open_conversation: bool = False,
 ) -> None:
     """
@@ -286,7 +270,7 @@ def _run_with_remote_server(
     :param spec_path: Generated Pi wrapper agent spec.
     :param session_id: Optional existing Omnigent session id.
     :param resume_picker: When ``True``, run the Pi-native picker.
-    :param pi_args: Raw Pi CLI args.
+    :param extra_args: Raw Pi CLI args.
     :param auto_open_conversation: Whether to open the web conversation URL.
     """
     from omnigent.chat import _bundle_agent, _remote_headers
@@ -315,7 +299,7 @@ def _run_with_remote_server(
                     headers=headers,
                     session_id=resolved_session_id,
                     session_bundle=bundle,
-                    pi_args=pi_args,
+                    extra_args=extra_args,
                     host_id=host_id,
                     workspace=str(Path.cwd().resolve()),
                     startup_progress=progress,
@@ -350,7 +334,7 @@ async def _prepare_pi_terminal_via_daemon(
     headers: dict[str, str],
     session_id: str | None,
     session_bundle: bytes | None,
-    pi_args: tuple[str, ...],
+    extra_args: tuple[str, ...],
     host_id: str,
     workspace: str,
     startup_progress: RunnerStartupProgress | None = None,
@@ -362,13 +346,13 @@ async def _prepare_pi_terminal_via_daemon(
     :param headers: HTTP auth headers for Omnigent requests.
     :param session_id: Existing session id to resume, or ``None``.
     :param session_bundle: Gzipped Pi wrapper bundle for fresh sessions.
-    :param pi_args: User pass-through Pi args.
+    :param extra_args: User pass-through Pi args.
     :param host_id: Local host daemon id.
     :param workspace: Absolute workspace path for the runner cwd.
     :param startup_progress: Optional user-visible progress renderer.
     :returns: Prepared terminal details for attaching.
     """
-    persist_args = list(pi_args)
+    persist_args = list(extra_args)
     timeout = httpx.Timeout(30.0, read=120.0)
     async with open_daemon_client(base_url, headers, host_id, timeout=timeout) as client:
         reattached = session_id is not None

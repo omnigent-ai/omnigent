@@ -2063,7 +2063,7 @@ async def _post_model_change_with_status_sequence(
             app.state.native_pane_status["68c7c1acc5eeec3978c5e62043da51a5"] = pane_status
         if picker_source == "session" or empty_session_catalog:
             catalog = await client.get(
-                "/v1/sessions/68c7c1acc5eeec3978c5e62043da51a5/claude-model-options"
+                "/v1/sessions/68c7c1acc5eeec3978c5e62043da51a5/model-options"
             )
             assert catalog.status_code == 200, catalog.text
         response = await client.post(

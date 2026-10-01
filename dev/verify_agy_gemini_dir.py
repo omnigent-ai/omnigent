@@ -113,7 +113,7 @@ async def _run(sandbox: Path) -> tuple[list[str], dict[str, str], Path, set[str]
         bridge_id=bridge_id,
         conversation_id="agy_conv_placeholder",
         resume=False,
-        antigravity_args=(),
+        extra_args=(),
         command="agy",
         model=None,
         permission_mode=None,

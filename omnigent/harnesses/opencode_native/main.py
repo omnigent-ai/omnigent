@@ -160,7 +160,6 @@ def run_opencode_native(  # pragma: no cover
     server: str | None,
     session_id: str | None,
     extra_args: tuple[str, ...] | None = None,
-    opencode_args: tuple[str, ...] | None = None,
     resume_picker: bool = False,
     model: str | None = None,
     auto_open_conversation: bool = False,
@@ -176,15 +175,13 @@ def run_opencode_native(  # pragma: no cover
     :param server: Resolved Omnigent server URL. ``None`` is an error (the CLI
         must resolve a backend first).
     :param session_id: Optional existing Omnigent conversation id to resume.
-    :param opencode_args: Raw ``opencode`` CLI args to persist for the TUI.
+    :param extra_args: Raw ``opencode`` CLI args to persist for the TUI.
     :param resume_picker: When ``True``, run the opencode-native resume picker.
     :param model: Optional model id pinned on the materialized wrapper spec.
     :param auto_open_conversation: Open the browser conversation URL on launch.
     :returns: None after the terminal attach session ends.
     """
-    opencode_args = _normalize_extra_args(
-        extra_args=extra_args, legacy_args=opencode_args, legacy_param="opencode_args"
-    )
+    extra_args = _normalize_extra_args(extra_args)
     _preflight_local_tools()
     if server is None:
         raise click.ClickException(
@@ -198,7 +195,7 @@ def run_opencode_native(  # pragma: no cover
             spec_path,
             session_id=session_id,
             resume_picker=resume_picker,
-            opencode_args=opencode_args,
+            extra_args=extra_args,
             auto_open_conversation=auto_open_conversation,
         )
 
@@ -209,7 +206,7 @@ def _run_with_remote_server(  # pragma: no cover
     *,
     session_id: str | None,
     resume_picker: bool,
-    opencode_args: tuple[str, ...],
+    extra_args: tuple[str, ...],
     auto_open_conversation: bool = False,
 ) -> None:
     """Launch OpenCode on an Omnigent server via a daemon-spawned runner."""
@@ -241,7 +238,7 @@ def _run_with_remote_server(  # pragma: no cover
                     headers=headers,
                     session_id=resolved_session_id,
                     session_bundle=bundle,
-                    opencode_args=opencode_args,
+                    extra_args=extra_args,
                     host_id=host_id,
                     workspace=str(Path.cwd().resolve()),
                     startup_progress=progress,
@@ -278,13 +275,13 @@ async def _prepare_opencode_terminal_via_daemon(  # pragma: no cover
     headers: dict[str, str],
     session_id: str | None,
     session_bundle: bytes | None,
-    opencode_args: tuple[str, ...],
+    extra_args: tuple[str, ...],
     host_id: str,
     workspace: str,
     startup_progress: RunnerStartupProgress | None = None,
 ) -> PreparedOpenCodeTerminal:
     """Create or resume an opencode-native session through a daemon runner."""
-    persist_args = list(opencode_args)
+    persist_args = list(extra_args)
     timeout = httpx.Timeout(30.0, read=120.0)
     async with open_daemon_client(base_url, headers, host_id, timeout=timeout) as client:
         reattached = session_id is not None

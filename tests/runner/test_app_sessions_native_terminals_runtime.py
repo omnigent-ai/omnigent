@@ -2111,7 +2111,6 @@ async def _run_antigravity_auto_create(
         return (("agy",), {"AGY_ENV": "1"})
 
     monkeypatch.setattr(launch_mod, "build_agy_launch", _fake_build_agy_launch)
-    monkeypatch.setattr(bridge_mod, "ensure_agy_onboarding_complete", lambda: None)
     # Auto-create now spawns the RPC reader (NOT the transcript forwarder); stub
     # ``supervise_reader`` at its definition module (the helper imports it lazily)
     # so the test does not start a real one. The reader is wrapped in
@@ -2855,7 +2854,6 @@ async def test_auto_create_antigravity_wires_reader_task_and_interaction_bridge(
     monkeypatch.setattr(
         launch_mod, "build_agy_launch", lambda **_kwargs: (("agy",), {"AGY_ENV": "1"})
     )
-    monkeypatch.setattr(bridge_mod, "ensure_agy_onboarding_complete", lambda: None)
     monkeypatch.setattr(runner_app_mod, "_terminal_tmux_pane", lambda *_a, **_k: (None, None))
     # Skip the 11a cold-start network work (resume launch → no StartCascade).
     resume_id = "efb134b2-d69f-43de-bb54-c9ece346d8a3"
@@ -3033,7 +3031,6 @@ async def test_auto_create_antigravity_wires_omnigent_mcp_relay(
     (tmp_path / "workspace").mkdir(parents=True, exist_ok=True)
     monkeypatch.delenv("DATABRICKS_CONFIG_PROFILE", raising=False)
     monkeypatch.setattr("omnigent.runner._entry._make_auth_token_factory", lambda: None)
-    monkeypatch.setattr(bridge_mod, "ensure_agy_onboarding_complete", lambda: None)
     monkeypatch.setattr(runner_app_mod, "_terminal_tmux_pane", lambda *_a, **_k: (None, None))
     monkeypatch.setattr(rpc_mod, "_candidate_agy_rpc_ports", list)
 
@@ -3175,7 +3172,6 @@ async def test_auto_create_antigravity_prepends_gemini_dir_to_generated_flags(
     (tmp_path / "workspace").mkdir(parents=True, exist_ok=True)
     monkeypatch.delenv("DATABRICKS_CONFIG_PROFILE", raising=False)
     monkeypatch.setattr("omnigent.runner._entry._make_auth_token_factory", lambda: None)
-    monkeypatch.setattr(bridge_mod, "ensure_agy_onboarding_complete", lambda: None)
     monkeypatch.setattr(runner_app_mod, "_terminal_tmux_pane", lambda *_a, **_k: (None, None))
     monkeypatch.setattr(rpc_mod, "_candidate_agy_rpc_ports", list)
 

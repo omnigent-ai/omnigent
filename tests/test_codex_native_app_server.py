@@ -2662,7 +2662,7 @@ async def test_native_codex_materializes_provider_auth_for_app_server_and_tui(
         config_overrides=server.config_overrides,
     )
     remote_argv = codex_native_app_server.build_codex_remote_args(
-        codex_args=(),
+        extra_args=(),
         thread_id=None,
         remote_url="ws://127.0.0.1:9876",
         config_overrides=tuple(server.config_overrides),
@@ -2701,7 +2701,7 @@ def test_remote_codex_rejects_unmaterialized_provider_config() -> None:
 
     with pytest.raises(ValueError, match="must be materialized"):
         codex_native_app_server.build_codex_remote_args(
-            codex_args=(),
+            extra_args=(),
             thread_id=None,
             remote_url="ws://127.0.0.1:9876",
             config_overrides=(provider_override,),

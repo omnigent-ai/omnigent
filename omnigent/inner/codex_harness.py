@@ -41,8 +41,7 @@ Env vars read at startup:
   the Codex CLI in. ``None`` falls back to ``OMNIGENT_RUNNER_WORKSPACE``
   if set, then to the subprocess's inherited cwd.
 - ``OMNIGENT_CODEX_PATH``: absolute path to a ``codex`` CLI binary.
-  ``None`` searches ``PATH``. (Legacy ``HARNESS_CODEX_PATH`` still honored,
-  deprecated.)
+  ``None`` searches ``PATH``.
 - ``HARNESS_CODEX_ENABLE_WEB_SEARCH``: ``"1"`` / ``"true"`` to
   leave Codex's built-in ``web_search`` tool enabled. ``"0"`` /
   ``"false"`` disables it (forces the model to use only
@@ -115,9 +114,6 @@ _ENV_MODEL_PROVIDER = "HARNESS_CODEX_MODEL_PROVIDER"
 _ENV_GATEWAY_HOST = "HARNESS_CODEX_GATEWAY_HOST"
 _ENV_CWD = "HARNESS_CODEX_CWD"
 _ENV_CODEX_PATH = "OMNIGENT_CODEX_PATH"
-# Deprecated alias — read via resolve_harness_path() which warns on use.
-# Remove this constant and the HARNESS_CODEX_PATH read in v0.8.0.
-_LEGACY_ENV_CODEX_PATH = "HARNESS_CODEX_PATH"
 _ENV_ENABLE_WEB_SEARCH = "HARNESS_CODEX_ENABLE_WEB_SEARCH"
 _ENV_DISABLE_NATIVE_TOOLS = "HARNESS_CODEX_DISABLE_NATIVE_TOOLS"
 _ENV_OS_ENV = "HARNESS_CODEX_OS_ENV"
@@ -338,7 +334,7 @@ def _build_codex_executor() -> Executor:
 
     :returns: A configured :class:`CodexExecutor` instance.
     :raises ImportError: If the ``codex`` CLI isn't on PATH and
-        ``OMNIGENT_CODEX_PATH`` (legacy ``HARNESS_CODEX_PATH``) isn't set — the inner executor's
+        ``OMNIGENT_CODEX_PATH`` isn't set — the inner executor's
         constructor surfaces this as a clear ImportError.
     :raises OSError: If ``HARNESS_CODEX_GATEWAY`` is set but
         credentials are missing — the inner executor's

@@ -3,7 +3,7 @@
 Real-binary tests gated on:
 
 - ``OMNIGENT_E2E_KIMI=1`` in the environment, and
-- the ``kimi`` binary (or whichever ``HARNESS_KIMI_PATH`` points at)
+- the ``kimi`` binary (or whichever ``OMNIGENT_KIMI_PATH`` points at)
   present on PATH.
 
 When either gate fails the test is skipped — keeps CI green without the
@@ -37,7 +37,7 @@ pytestmark = pytest.mark.skipif(
     not _kimi_e2e_enabled(),
     reason=(
         "Real-binary e2e: requires OMNIGENT_E2E_KIMI=1 and the ``kimi`` (or "
-        "HARNESS_KIMI_PATH) binary on PATH. Install via "
+        "OMNIGENT_KIMI_PATH) binary on PATH. Install via "
         "`curl -fsSL https://code.kimi.com/kimi-code/install.sh | bash` and "
         "run ``kimi login`` once, then re-run with OMNIGENT_E2E_KIMI=1."
     ),

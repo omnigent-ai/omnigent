@@ -522,25 +522,6 @@ def test_smart_routing_with_a_resume_is_rejected(args: list[str]) -> None:
     assert "routes a new session" in result.output
 
 
-@pytest.mark.parametrize(
-    "args",
-    [
-        ["run", "--smart-routing"],
-        ["run", "--smart-routing", "-p", "review the last commit"],
-        ["run", "--harness", "claude-native", "--smart-routing", "-p", "hi"],
-    ],
-)
-def test_run_smart_routing_is_removed(args: list[str]) -> None:
-    # `run` never routed from inside a harness, and its create-time route is
-    # gone — the rejection has to name both surfaces that still route.
-    result = CliRunner().invoke(cli, args)
-
-    assert result.exit_code == 1, result.output
-    assert "per-harness first-message only" in result.output
-    assert "omnigent claude --smart-routing" in result.output
-    assert "web UI" in result.output
-
-
 def test_run_no_longer_advertises_smart_routing() -> None:
     result = CliRunner().invoke(cli, ["run", "--help"])
 

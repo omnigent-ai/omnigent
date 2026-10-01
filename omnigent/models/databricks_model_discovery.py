@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import logging
 import re
-import warnings
 from collections.abc import Iterable
 from dataclasses import dataclass
 
@@ -315,40 +314,6 @@ def discover_databricks_claude_catalog(
     # A successful permission-aware UC listing is authoritative even when the
     # compatibility endpoint is not enabled.
     return DatabricksClaudeCatalog(families={}, model_ids=())
-
-
-def discover_databricks_claude_models(
-    workspace_url: str,
-    token: str,
-    *,
-    transport: httpx.BaseTransport | None = None,
-) -> dict[str, str]:
-    """Discover the live Claude family mapping for a Databricks workspace.
-
-    .. deprecated:: 0.8.0
-        Use :func:`discover_databricks_claude_catalog` and read its
-        ``families``, which also carries every servable id. Removed in
-        ``v0.10.0``.
-
-    :param workspace_url: Workspace origin, e.g. ``"https://example.com"``.
-    :param token: Workspace bearer token.
-    :param transport: Optional HTTP transport used by tests.
-    :returns: Family aliases mapped to routable model ids. An empty mapping is
-        authoritative: the listing answered and no Claude models are exposed.
-    :raises httpx.HTTPError: Same contract as the catalog lookup.
-    :raises ValueError: Same contract as the catalog lookup.
-    """
-    warnings.warn(
-        "discover_databricks_claude_models() is deprecated and will be removed in "
-        "v0.10.0; call discover_databricks_claude_catalog() and read .families.",
-        DeprecationWarning,
-        stacklevel=2,
-    )
-    return discover_databricks_claude_catalog(
-        workspace_url,
-        token,
-        transport=transport,
-    ).families
 
 
 # DATABRICKS-PATCH(codex-live-model-discovery)

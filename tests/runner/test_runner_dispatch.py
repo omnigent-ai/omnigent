@@ -9218,7 +9218,7 @@ async def test_spawn_handle_round_trips_to_sys_cancel_async(
         **spawn_kw,
     )
     handle = json.loads(handle_raw)
-    assert handle["task_id"] == handle["handle_id"]
+    assert "task_id" not in handle
     assert handle["status"] == "in_progress"
     assert "sys_cancel_async" in handle["message"]
     assert f"handle_id={handle['handle_id']!r}" in handle["message"]

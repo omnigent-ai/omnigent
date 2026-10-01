@@ -139,33 +139,10 @@ def test_command_config_wins_over_default(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.delenv("OMNIGENT_CODEX_PATH", raising=False)
-    monkeypatch.delenv("HARNESS_CODEX_PATH", raising=False)
     cfg = {"harness": {"codex": {"command": "/config/codex"}}}
     assert (
         resolve_harness_command("codex", default="codex", explicit=None, cfg=cfg)
         == "/config/codex"
-    )
-
-
-def test_command_legacy_env_wins_over_config(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A deprecated ``HARNESS_*_PATH`` env var still wins over config ``command``.
-
-    Per the shared ``env > config > default`` precedence, the legacy env var
-    must not be shadowed by a config override — otherwise a user migrating
-    from ``HARNESS_*_PATH`` to the new config form would silently get the
-    config value instead of their env var during the deprecation window.
-    """
-    from omnigent.harness_startup_config import _LEGACY_PATH_WARNED
-
-    _LEGACY_PATH_WARNED.discard("HARNESS_CODEX_PATH")
-    monkeypatch.delenv("OMNIGENT_CODEX_PATH", raising=False)
-    monkeypatch.setenv("HARNESS_CODEX_PATH", "/legacy/env/codex")
-    cfg = {"harness": {"codex": {"command": "/config/codex"}}}
-    assert (
-        resolve_harness_command("codex", default="codex", explicit=None, cfg=cfg)
-        == "/legacy/env/codex"
     )
 
 
@@ -210,74 +187,17 @@ def test_command_empty_explicit_falls_through(
     )
 
 
-# ── resolve_harness_path (env deprecation) ──────────────────────────
+# ── resolve_harness_path ─────────────────────────────────────────────
 
 
 def test_resolve_harness_path_canonical_env_wins(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("OMNIGENT_CODEX_PATH", "/canonical/codex")
-    monkeypatch.setenv("HARNESS_CODEX_PATH", "/legacy/codex")
     assert resolve_harness_path("codex") == "/canonical/codex"
-
-
-def test_resolve_harness_path_legacy_env_warns(monkeypatch: pytest.MonkeyPatch, caplog) -> None:
-    """A legacy ``HARNESS_<NAME>_PATH`` value is returned + a deprecation warning."""
-    from omnigent.harness_startup_config import _LEGACY_PATH_WARNED
-
-    _LEGACY_PATH_WARNED.discard("HARNESS_CODEX_PATH")  # ensure not pre-warned
-    monkeypatch.delenv("OMNIGENT_CODEX_PATH", raising=False)
-    monkeypatch.setenv("HARNESS_CODEX_PATH", "/legacy/codex")
-
-    with caplog.at_level("WARNING"):
-        assert resolve_harness_path("codex") == "/legacy/codex"
-
-    assert any(
-        "HARNESS_CODEX_PATH" in r.message and "deprecated" in r.message and "v0.8.0" in r.message
-        for r in caplog.records
-    )
-
-
-def test_resolve_harness_path_legacy_warns_only_once(
-    monkeypatch: pytest.MonkeyPatch, caplog
-) -> None:
-    """The deprecation warning fires once per process per legacy var."""
-    from omnigent.harness_startup_config import _LEGACY_PATH_WARNED
-
-    _LEGACY_PATH_WARNED.discard("HARNESS_CODEX_PATH")
-    monkeypatch.delenv("OMNIGENT_CODEX_PATH", raising=False)
-    monkeypatch.setenv("HARNESS_CODEX_PATH", "/legacy/codex")
-
-    with caplog.at_level("WARNING"):
-        resolve_harness_path("codex")
-        resolve_harness_path("codex")
-        resolve_harness_path("codex")
-
-    warns = [
-        r
-        for r in caplog.records
-        if "HARNESS_CODEX_PATH" in r.message and "deprecated" in r.message
-    ]
-    assert len(warns) == 1
 
 
 def test_resolve_harness_path_neither_set_returns_none(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("OMNIGENT_CODEX_PATH", raising=False)
-    monkeypatch.delenv("HARNESS_CODEX_PATH", raising=False)
     assert resolve_harness_path("codex") is None
-
-
-def test_resolve_harness_path_ignores_non_registry_legacy_var(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A speculative ``HARNESS_*_PATH`` for a harness that never had one is ignored.
-
-    Only the 6 headless harnesses (codex/pi/kimi/goose/qwen/hermes) historically
-    documented a ``HARNESS_*_PATH``. Other harnesses (e.g. cursor) never did —
-    honoring ``HARNESS_CURSOR_PATH`` would invent a new knob under a deprecated
-    name, so it's ignored (only the canonical ``OMNIGENT_CURSOR_PATH`` works).
-    """
-    monkeypatch.delenv("OMNIGENT_CURSOR_PATH", raising=False)
-    monkeypatch.setenv("HARNESS_CURSOR_PATH", "/speculative/cursor")
-    assert resolve_harness_path("cursor") is None
 
 
 def test_resolve_harness_path_strips_native_suffix() -> None:

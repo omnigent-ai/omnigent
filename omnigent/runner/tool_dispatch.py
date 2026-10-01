@@ -7308,8 +7308,6 @@ async def _execute_rest_tool(
             return json.dumps(
                 {
                     "handle_id": session_id,
-                    # Compatibility alias for older clients; remove in 0.8.0.
-                    "task_id": session_id,
                     "status": "running",
                 }
             )
@@ -7317,8 +7315,7 @@ async def _execute_rest_tool(
             return f"Error: sys_call_async failed: {exc}"
 
     if tool_name == SysCancelAsyncTool.name():
-        # ``task_id`` fallback supports older clients; remove in 0.8.0.
-        handle_id = args.get("handle_id") or args.get("task_id", "")
+        handle_id = args.get("handle_id", "")
         try:
             resp = await server_client.post(
                 f"/v1/sessions/{handle_id}/events",
@@ -8300,11 +8297,8 @@ def _spawn_async_tool(
         async terminal-tool launches.
     :param effective_harness: Harness the session actually runs, used to judge
         the target against the surface the session was advertised.
-    :returns: JSON handle string with canonical ``handle_id``,
-        plus compatibility ``task_id`` (identical value; remove in 0.8.0),
-        ``tool_name``, ``status``, and ``message``. Prefer
-        ``handle_id``; ``task_id`` exists only so older clients
-        that still parse the pre-handle_id field keep working.
+    :returns: JSON handle string with ``handle_id``, ``tool_name``,
+        ``status``, and ``message``.
     """
     target_tool = args.get("tool")
     target_args = args.get("args", "{}")
@@ -8443,8 +8437,6 @@ def _spawn_async_tool(
     return json.dumps(
         {
             "handle_id": handle_id,
-            # Compatibility alias for older clients; remove in 0.8.0.
-            "task_id": handle_id,
             "tool_name": target_tool,
             "status": "in_progress",
             "message": (
@@ -8469,12 +8461,11 @@ def _cancel_async_tool_result(
     ``asyncio.wait`` returns immediately — the underlying
     thread may keep running but the task won't block on it.
 
-    :param args: Must contain ``"handle_id"`` (``"task_id"`` is
-        accepted as a legacy alias).
+    :param args: Must contain ``"handle_id"``.
     :returns: Structured local-cancel result. ``try_subagent_cancel``
         is true only when no local async task matched.
     """
-    handle_id = args.get("handle_id") or args.get("task_id")
+    handle_id = args.get("handle_id")
     if not isinstance(handle_id, str) or not handle_id:
         return _CancelAsyncToolResult('Error: sys_cancel_async requires "handle_id"')
     if session_async_tasks is None:
@@ -8501,8 +8492,7 @@ def _cancel_async_tool(
     """
     Cancel an in-flight async tool by handle_id.
 
-    :param args: Must contain ``"handle_id"`` (``"task_id"`` is
-        accepted as a legacy alias).
+    :param args: Must contain ``"handle_id"``.
     :param session_async_tasks: Per-session async task map, or
         ``None`` when async inbox state is unavailable.
     :returns: Confirmation or error string.
@@ -8524,9 +8514,9 @@ async def _execute_task_lifecycle_tool(
     Runner-local handler for ``sys_cancel_task``.
 
     The generic cancel path first tries the in-memory async dispatches
-    tracked in ``session_async_tasks``. If no async tool handle matches,
-    it falls through to the sub-agent work registry so handles returned
-    by ``sys_session_send`` can be cancelled by task id.
+    tracked in ``session_async_tasks`` by handle_id. If no async tool
+    handle matches, it falls through to the sub-agent work registry so
+    handles returned by ``sys_session_send`` can be cancelled by task_id.
 
     :param args: Parsed JSON arguments from the LLM.
     :param session_async_tasks: Per-session async task map
@@ -8536,8 +8526,14 @@ async def _execute_task_lifecycle_tool(
     :param server_client: HTTP client pointed at the Omnigent server.
     :returns: JSON-encoded result string.
     """
+    # sys_cancel_task uses "task_id"; normalise to handle_id so
+    # _cancel_async_tool_result can check the in-memory async dispatch table.
+    task_id_arg = args.get("task_id")
+    normalised: _JsonObject = dict(args)
+    if task_id_arg and not normalised.get("handle_id"):
+        normalised = {**args, "handle_id": task_id_arg}
     async_result = _cancel_async_tool_result(
-        args,
+        normalised,
         session_async_tasks=session_async_tasks,
     )
     if not async_result.try_subagent_cancel:

@@ -320,7 +320,7 @@ def test_run_with_remote_server_routes_through_daemon(
         spec_path,
         session_id=None,
         resume_picker=False,
-        claude_args=("--dangerously-skip-permissions",),
+        extra_args=("--dangerously-skip-permissions",),
     )
 
     # Daemon start is now _ensure_backend's responsibility (called from
@@ -329,7 +329,7 @@ def test_run_with_remote_server_routes_through_daemon(
     # the cwd workspace, and the user's args.
     assert captured["host_id"] == "host_1"
     assert captured["workspace"] == str(tmp_path.resolve())
-    assert captured["claude_args"] == ("--dangerously-skip-permissions",)
+    assert captured["extra_args"] == ("--dangerously-skip-permissions",)
     assert captured["session_id"] is None
 
 
@@ -368,7 +368,7 @@ def test_run_with_remote_server_detach_prints_resume_hint(
         spec_path,
         session_id="conv_existing",
         resume_picker=False,
-        claude_args=(),
+        extra_args=(),
     )
 
     err = capsys.readouterr().err
@@ -426,7 +426,7 @@ def test_run_with_remote_server_unreachable_server_raises_clean_error(
             spec_path,
             session_id=None,
             resume_picker=False,
-            claude_args=(),
+            extra_args=(),
         )
 
     assert "Could not reach the omnigent server at https://unreachable.example" in str(

@@ -1461,8 +1461,7 @@ def test_build_goose_executor_reads_env(monkeypatch) -> None:
     monkeypatch.setenv("HARNESS_GOOSE_MODEL", "claude-x")
     monkeypatch.setenv("HARNESS_GOOSE_PROVIDER", "anthropic")
     monkeypatch.setenv("HARNESS_GOOSE_CWD", "/work")
-    monkeypatch.setenv("HARNESS_GOOSE_PATH", "/bin/goose")
-    monkeypatch.delenv("OMNIGENT_GOOSE_PATH", raising=False)
+    monkeypatch.setenv("OMNIGENT_GOOSE_PATH", "/bin/goose")
     monkeypatch.setenv("HARNESS_GOOSE_BUILTINS", "developer, computercontroller")
     monkeypatch.delenv("HARNESS_GOOSE_OS_ENV", raising=False)
     ex = goose_harness._build_goose_executor()
@@ -1480,7 +1479,6 @@ def test_build_goose_executor_defaults(monkeypatch) -> None:
         "HARNESS_GOOSE_MODEL",
         "HARNESS_GOOSE_PROVIDER",
         "HARNESS_GOOSE_CWD",
-        "HARNESS_GOOSE_PATH",
         "HARNESS_GOOSE_BUILTINS",
         "OMNIGENT_RUNNER_WORKSPACE",
         "OMNIGENT_GOOSE_PATH",

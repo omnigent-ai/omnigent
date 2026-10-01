@@ -1813,7 +1813,7 @@ async def _auto_create_opencode_terminal(
                     server_url=server.base_url,
                     workspace=workspace,
                     session_id=opencode_session_id,
-                    opencode_args=tuple(launch_config.terminal_launch_args or ()),
+                    extra_args=tuple(launch_config.terminal_launch_args or ()),
                 ),
                 env=opencode_terminal_env(server),
                 scrollback=100_000,
@@ -4523,7 +4523,7 @@ async def _launch_codex_native_tui(
     workspace = str(launch_config.workspace)
     agent_os_env = _agent_os_env_from_spec(agent_spec)
     codex_remote_args = build_codex_remote_args(
-        codex_args=tuple(launch_config.terminal_launch_args or ()),
+        extra_args=tuple(launch_config.terminal_launch_args or ()),
         thread_id=thread_id,
         remote_url=codex_ws_url,
         bypass_sandbox=launch_config.bypass_sandbox,

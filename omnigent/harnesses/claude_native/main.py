@@ -1571,7 +1571,6 @@ def run_claude_native(
     server: str | None,
     session_id: str | None,
     extra_args: tuple[str, ...] | None = None,
-    claude_args: tuple[str, ...] | None = None,
     resume_picker: bool = False,
     prompt: str | None = None,
     command: str = _DEFAULT_CLAUDE_COMMAND,
@@ -1587,7 +1586,7 @@ def run_claude_native(
     :param session_id: Optional existing session to bind and reuse,
         e.g. ``"conv_abc123"``. ``None`` creates a new bundled
         session.
-    :param claude_args: Args after ``claude``, e.g.
+    :param extra_args: Args after ``claude``, e.g.
         ``("--dangerously-skip-permissions",)``. Stray ``--resume`` /
         ``-r`` is stripped defensively (Omnigent owns resume).
     :param resume_picker: ``True`` runs the claude-native picker
@@ -1614,9 +1613,7 @@ def run_claude_native(
     :returns: None after the attach session ends.
     :raises click.ClickException: If setup, launch, or attach fails.
     """
-    claude_args = _normalize_extra_args(
-        extra_args=extra_args, legacy_args=claude_args, legacy_param="claude_args"
-    )
+    extra_args = _normalize_extra_args(extra_args)
     startup_profiler = startup_profiler or StartupProfiler.from_env(
         name="omnigent claude",
         env_var=_CLAUDE_STARTUP_PROFILE_ENV_VAR,
@@ -1628,7 +1625,7 @@ def run_claude_native(
     startup_profiler.mark("checking local tools")
     _preflight_local_tools(resolved_command)
     startup_profiler.mark("local tools ready")
-    sanitized_args = _strip_resume_from_claude_args(claude_args)
+    sanitized_args = _strip_resume_from_claude_args(extra_args)
     # Claude Code takes the initial prompt as a positional argument, so it
     # rides along with the launch args (persisted for the runner on the remote
     # path). One argv entry keeps newlines and quotes intact. The prompt goes
@@ -1658,7 +1655,7 @@ def run_claude_native(
                 spec_path,
                 session_id=session_id,
                 resume_picker=resume_picker,
-                claude_args=sanitized_args,
+                extra_args=sanitized_args,
                 command=resolved_command,
                 claude_config=claude_config,
                 auto_open_conversation=auto_open_conversation,
@@ -1673,7 +1670,7 @@ def run_claude_native(
                 spec_path,
                 session_id=session_id,
                 resume_picker=resume_picker,
-                claude_args=sanitized_args,
+                extra_args=sanitized_args,
                 auto_open_conversation=auto_open_conversation,
                 startup_profiler=startup_profiler,
             )
@@ -2754,7 +2751,7 @@ def _strip_resume_from_claude_args(args: tuple[str, ...]) -> tuple[str, ...]:
     upstream Claude, which would apply it to its own session-id
     namespace.
 
-    :param args: Raw ``claude_args`` from Click pass-through.
+    :param args: Raw ``extra_args`` from Click pass-through.
     :returns: Args with stray ``--resume`` / ``-r`` removed.
     """
     out: list[str] = []
@@ -3594,7 +3591,7 @@ def _run_with_local_server(
     *,
     session_id: str | None,
     resume_picker: bool,
-    claude_args: tuple[str, ...],
+    extra_args: tuple[str, ...],
     command: str,
     claude_config: ClaudeNativeUcodeConfig | None = None,
     auto_open_conversation: bool = False,
@@ -3606,7 +3603,7 @@ def _run_with_local_server(
     :param spec_path: Generated Claude wrapper agent spec.
     :param session_id: Optional existing session id.
     :param resume_picker: When ``True`` and ``session_id is None``, run the picker.
-    :param claude_args: Claude CLI args.
+    :param extra_args: Claude CLI args.
     :param command: Executable to run in the terminal resource.
     :param claude_config: Optional ucode-derived Claude Code config.
     :param auto_open_conversation: When ``True``, open the
@@ -3683,7 +3680,7 @@ def _run_with_local_server(
                     session_id=resolved_session_id,
                     runner_id=server_handle.runner_id,
                     session_bundle=bundle,
-                    claude_args=claude_args,
+                    extra_args=extra_args,
                     command=command,
                     claude_config=claude_config,
                     startup_profiler=startup_profiler,
@@ -4523,7 +4520,7 @@ async def _prepare_claude_terminal_via_daemon(
     headers: dict[str, str],
     session_id: str | None,
     session_bundle: bytes | None,
-    claude_args: tuple[str, ...],
+    extra_args: tuple[str, ...],
     host_id: str,
     workspace: str,
     startup_profiler: StartupProfiler | None = None,
@@ -4547,7 +4544,7 @@ async def _prepare_claude_terminal_via_daemon(
         create a fresh session from *session_bundle*.
     :param session_bundle: Gzipped agent bundle, required when
         *session_id* is ``None``.
-    :param claude_args: User pass-through ``claude`` args. ``--resume``
+    :param extra_args: User pass-through ``claude`` args. ``--resume``
         is stripped (the runner derives it from the session's
         ``external_session_id``); the rest are persisted as the
         session's ``terminal_launch_args`` so the runner launches with
@@ -4567,7 +4564,7 @@ async def _prepare_claude_terminal_via_daemon(
     from omnigent.harnesses.claude_native.bridge import bridge_dir_for_conversation_id
 
     startup_profiler = startup_profiler or StartupProfiler(name="omnigent claude", enabled=False)
-    persist_args = list(_strip_resume_from_claude_args(claude_args))
+    persist_args = list(_strip_resume_from_claude_args(extra_args))
     timeout = httpx.Timeout(30.0, read=120.0)
     async with open_daemon_client(base_url, headers, host_id, timeout=timeout) as client:
         startup_profiler.mark("daemon prepare http client ready")
@@ -4760,7 +4757,7 @@ def _run_with_remote_server(
     *,
     session_id: str | None,
     resume_picker: bool,
-    claude_args: tuple[str, ...],
+    extra_args: tuple[str, ...],
     auto_open_conversation: bool = False,
     startup_profiler: StartupProfiler | None = None,
 ) -> None:
@@ -4782,7 +4779,7 @@ def _run_with_remote_server(
     :param spec_path: Generated Claude wrapper agent spec.
     :param session_id: Optional existing session id.
     :param resume_picker: When ``True`` and ``session_id is None``, run the picker.
-    :param claude_args: Claude CLI args, persisted on the session as
+    :param extra_args: Claude CLI args, persisted on the session as
         ``terminal_launch_args`` for the runner to apply. (The runner
         launches ``claude`` itself and derives the ucode config from the
         provider config, so this path takes neither a ``command`` nor a
@@ -4881,7 +4878,7 @@ def _run_with_remote_server(
                         headers=headers,
                         session_id=resolved_session_id,
                         session_bundle=bundle,
-                        claude_args=claude_args,
+                        extra_args=extra_args,
                         host_id=host_id,
                         workspace=str(Path.cwd().resolve()),
                         startup_profiler=startup_profiler,
@@ -4982,7 +4979,7 @@ async def _prepare_claude_terminal(
     session_id: str | None,
     runner_id: str | None,
     session_bundle: bytes | None,
-    claude_args: tuple[str, ...],
+    extra_args: tuple[str, ...],
     command: str,
     claude_config: ClaudeNativeUcodeConfig | None = None,
     startup_profiler: StartupProfiler | None = None,
@@ -4998,7 +4995,7 @@ async def _prepare_claude_terminal(
     :param runner_id: Runner id to bind to the session.
     :param session_bundle: Gzipped agent bundle for new sessions.
         Required when *session_id* is ``None``.
-    :param claude_args: Claude CLI args.
+    :param extra_args: Claude CLI args.
     :param command: Executable to run in the terminal resource.
     :param claude_config: Optional ucode-derived Claude Code config.
     :param startup_profiler: Optional startup profiler for timing
@@ -5150,7 +5147,7 @@ async def _prepare_claude_terminal(
         terminal_id = await _launch_claude_terminal(
             client,
             session_id,
-            (*cold_resume_args, *claude_args),
+            (*cold_resume_args, *extra_args),
             command=command,
             bridge_dir=bridge_dir,
             claude_config=claude_config,
@@ -6198,7 +6195,7 @@ async def _create_claude_session(
 async def _launch_claude_terminal(
     client: httpx.AsyncClient,
     session_id: str,
-    claude_args: tuple[str, ...],
+    extra_args: tuple[str, ...],
     *,
     command: str,
     bridge_dir: Path,
@@ -6215,7 +6212,7 @@ async def _launch_claude_terminal(
         subprocess posts back to the same server with the same auth the
         wrapper already negotiated.
     :param session_id: Session/conversation id.
-    :param claude_args: Claude CLI args.
+    :param extra_args: Claude CLI args.
     :param command: Executable to run in the terminal resource.
     :param bridge_dir: Bridge directory shared with Claude's MCP
         MCP server and the web-chat harness.
@@ -6229,7 +6226,7 @@ async def _launch_claude_terminal(
     :raises click.ClickException: If terminal launch fails.
     """
     body = _claude_terminal_request(
-        claude_args,
+        extra_args,
         command=command,
         bridge_dir=bridge_dir,
         ap_server_url=str(client.base_url),
@@ -6375,7 +6372,7 @@ async def _read_claude_terminal_tmux(
 
 
 def _claude_terminal_request(
-    claude_args: tuple[str, ...],
+    extra_args: tuple[str, ...],
     *,
     command: str,
     bridge_dir: Path,
@@ -6388,7 +6385,7 @@ def _claude_terminal_request(
     """
     Build the terminal resource creation body for Claude Code.
 
-    :param claude_args: Claude CLI args.
+    :param extra_args: Claude CLI args.
     :param command: Executable to run in the terminal resource.
     :param bridge_dir: Bridge directory shared with Claude's MCP
         server and the web-chat harness.
@@ -6406,12 +6403,12 @@ def _claude_terminal_request(
         for this native session.
     :returns: JSON body for ``POST /resources/terminals``.
     """
-    claude_args = _merge_default_model_arg(
-        claude_args,
+    extra_args = _merge_default_model_arg(
+        extra_args,
         model=claude_config.model if claude_config is not None else None,
     )
     args = augment_claude_args(
-        claude_args,
+        extra_args,
         bridge_dir=bridge_dir,
         ap_server_url=ap_server_url,
         ap_auth_headers=ap_auth_headers,
@@ -6468,25 +6465,25 @@ def _claude_terminal_request(
 
 
 def _merge_default_model_arg(
-    claude_args: tuple[str, ...],
+    extra_args: tuple[str, ...],
     *,
     model: str | None,
 ) -> tuple[str, ...]:
     """
     Add a ucode model default unless the user already selected one.
 
-    :param claude_args: User-provided Claude Code args, e.g.
+    :param extra_args: User-provided Claude Code args, e.g.
         ``("--model", "sonnet")``.
     :param model: Ucode model id, e.g.
         ``"databricks-claude-opus-4-7"``.
     :returns: Args with ``--model <model>`` appended when appropriate.
     """
     if not model:
-        return claude_args
-    for arg in claude_args:
+        return extra_args
+    for arg in extra_args:
         if arg == "--model" or arg.startswith("--model="):
-            return claude_args
-    return (*claude_args, "--model", model)
+            return extra_args
+    return (*extra_args, "--model", model)
 
 
 async def attach_local_terminal(

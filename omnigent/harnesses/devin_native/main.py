@@ -512,7 +512,7 @@ def devin_model_families(
 
 
 def build_devin_launch(
-    devin_args: Sequence[str],
+    extra_args: Sequence[str],
     *,
     bridge_dir: Path,
     config_path: Path,
@@ -530,7 +530,7 @@ def build_devin_launch(
 
     executable = resolve_devin_executable(env=env, which=which)
     args = build_devin_launch_args(
-        devin_args,
+        extra_args,
         config_path=config_path,
         export_path_value=export_file,
         model=model,
@@ -546,7 +546,6 @@ def run_devin_native(
     server: str | None,
     session_id: str | None,
     extra_args: tuple[str, ...] | None = None,
-    devin_args: tuple[str, ...] | None = None,
     resume_picker: bool = False,
     model: str | None = None,
     effort: str | None = None,
@@ -556,9 +555,7 @@ def run_devin_native(
     auto_open_conversation: bool = False,
 ) -> None:
     """Launch the Devin TUI in an Omnigent terminal."""
-    devin_args = _normalize_extra_args(
-        extra_args=extra_args, legacy_args=devin_args, legacy_param="devin_args"
-    )
+    extra_args = _normalize_extra_args(extra_args)
     _preflight_local_tools()
     if server is None:
         raise click.ClickException(
@@ -573,7 +570,7 @@ def run_devin_native(
             spec_path,
             session_id=session_id,
             resume_picker=resume_picker,
-            devin_args=devin_args,
+            extra_args=extra_args,
             model=resolved_model,
             permission_mode=permission_mode,
             sandbox=sandbox,
@@ -646,7 +643,7 @@ def _run_with_remote_server(
     *,
     session_id: str | None,
     resume_picker: bool,
-    devin_args: tuple[str, ...],
+    extra_args: tuple[str, ...],
     model: str | None = None,
     permission_mode: str | None = None,
     sandbox: bool = False,
@@ -680,7 +677,7 @@ def _run_with_remote_server(
                     headers=headers,
                     session_id=resolved_session_id,
                     session_bundle=bundle,
-                    devin_args=devin_args,
+                    extra_args=extra_args,
                     model=model,
                     permission_mode=permission_mode,
                     sandbox=sandbox,
@@ -721,7 +718,7 @@ async def _prepare_devin_terminal_via_daemon(
     headers: dict[str, str],
     session_id: str | None,
     session_bundle: bytes | None,
-    devin_args: tuple[str, ...],
+    extra_args: tuple[str, ...],
     model: str | None,
     permission_mode: str | None,
     sandbox: bool,
@@ -731,7 +728,7 @@ async def _prepare_devin_terminal_via_daemon(
     startup_progress: RunnerStartupProgress | None = None,
 ) -> PreparedDevinTerminal:
     """Create or resume a devin-native session through a daemon runner."""
-    persist_args = list(devin_args)
+    persist_args = list(extra_args)
     if model:
         persist_args[:0] = ["--model", model]
     if permission_mode:

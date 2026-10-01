@@ -12499,7 +12499,6 @@ def create_runner_app(
             return JSONResponse(status_code=200, content={"workers": {}})
         return JSONResponse(status_code=200, content={"workers": catalog})
 
-    @app.get("/v1/sessions/{session_id}/codex-model-options")
     async def get_session_codex_model_options(session_id: str) -> JSONResponse:
         harness = _session_harness_name(session_id)
         if harness not in ("codex-native", "opencode-native"):
@@ -12564,7 +12563,6 @@ def create_runner_app(
                 },
             )
 
-    @app.get("/v1/sessions/{session_id}/kiro-model-options")
     async def get_session_kiro_model_options(session_id: str) -> JSONResponse:
         if _session_harness_name(session_id) != "kiro-native":
             return JSONResponse(status_code=200, content={"models": []})
@@ -12591,7 +12589,6 @@ def create_runner_app(
             content={"models": _with_model_configuration_source(session_id, models)},
         )
 
-    @app.get("/v1/sessions/{session_id}/devin-model-options")
     async def get_session_devin_model_options(session_id: str) -> JSONResponse:
         if _session_harness_name(session_id) != "devin-native":
             return JSONResponse(status_code=200, content={"models": []})
@@ -12615,7 +12612,6 @@ def create_runner_app(
             )
         return JSONResponse(status_code=200, content={"models": models})
 
-    @app.get("/v1/sessions/{session_id}/cursor-model-options")
     async def get_session_cursor_model_options(session_id: str) -> JSONResponse:
         if _session_harness_name(session_id) != "cursor-native":
             return JSONResponse(status_code=200, content={"models": []})
@@ -12672,7 +12668,6 @@ def create_runner_app(
             return [dict(row) for row in rows]
         return [{**row, "source": source} for row in rows]
 
-    @app.get("/v1/sessions/{session_id}/claude-model-options")
     async def get_session_claude_model_options(session_id: str) -> JSONResponse:
         if _session_harness_name(session_id) != "claude-native":
             return JSONResponse(status_code=200, content={"models": []})
@@ -12779,12 +12774,7 @@ def create_runner_app(
 
     @app.get("/v1/sessions/{session_id}/model-options")
     async def get_session_model_options(session_id: str) -> JSONResponse:
-        """One route for every harness family's session model listing.
-
-        The runner derives the harness from the session — the four
-        harness-named routes above/below remain as compatibility aliases
-        for older servers (deprecated; remove in 0.11.0).
-        """
+        """One route for every harness family's session model listing."""
         harness = _session_harness_name(session_id)
         if harness == "claude-native":
             return await get_session_claude_model_options(session_id)

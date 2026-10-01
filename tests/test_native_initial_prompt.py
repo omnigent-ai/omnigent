@@ -55,7 +55,7 @@ def test_prompt_rides_as_claudes_leading_positional_argument(
         prompt="review the last commit",
     )
 
-    assert captured["claude_args"] == (
+    assert captured["extra_args"] == (
         "review the last commit",
         "--dangerously-skip-permissions",
     )
@@ -78,7 +78,7 @@ def test_prompt_precedes_variadic_value_flags(monkeypatch: pytest.MonkeyPatch) -
         prompt="hello",
     )
 
-    assert captured["claude_args"] == ("hello", "--model", "haiku", "--mcp-config", "mcp.json")
+    assert captured["extra_args"] == ("hello", "--model", "haiku", "--mcp-config", "mcp.json")
 
 
 def test_multiline_prompt_stays_one_argv_entry(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -95,7 +95,7 @@ def test_multiline_prompt_stays_one_argv_entry(monkeypatch: pytest.MonkeyPatch) 
         prompt=_MULTILINE,
     )
 
-    assert captured["claude_args"] == (_MULTILINE,)
+    assert captured["extra_args"] == (_MULTILINE,)
 
 
 def test_prompt_is_added_after_resume_args_are_stripped(
@@ -111,7 +111,7 @@ def test_prompt_is_added_after_resume_args_are_stripped(
         prompt="hello",
     )
 
-    assert captured["claude_args"] == ("hello", "--verbose")
+    assert captured["extra_args"] == ("hello", "--verbose")
 
 
 def test_local_launch_path_also_receives_the_prompt(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -119,7 +119,7 @@ def test_local_launch_path_also_receives_the_prompt(monkeypatch: pytest.MonkeyPa
 
     claude_native.run_claude_native(server=None, session_id=None, prompt="hello")
 
-    assert captured["claude_args"] == ("hello",)
+    assert captured["extra_args"] == ("hello",)
 
 
 @pytest.mark.parametrize("prompt", [None, "", "   "])
@@ -134,4 +134,4 @@ def test_no_prompt_adds_no_argument(monkeypatch: pytest.MonkeyPatch, prompt: str
         prompt=prompt,
     )
 
-    assert captured["claude_args"] == ("--verbose",)
+    assert captured["extra_args"] == ("--verbose",)

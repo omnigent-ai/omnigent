@@ -1269,68 +1269,6 @@ def test_pi_config_command_threads_to_harness_path_env_var(
     assert os.environ["OMNIGENT_PI_PATH"] == "/custom/pi"
 
 
-# ── legacy HARNESS_*_PATH deprecation notice ───────────────────────────
-
-
-def test_cli_warns_deprecated_harness_path_env_vars(
-    monkeypatch: pytest.MonkeyPatch,
-    capsys,
-) -> None:
-    """A set ``HARNESS_*_PATH`` produces a terminal-visible deprecation notice."""
-    from omnigent.cli import _warn_deprecated_harness_path_env_vars
-
-    monkeypatch.setenv("HARNESS_CODEX_PATH", "/usr/local/bin/codex")
-    monkeypatch.setenv("HARNESS_PI_PATH", "/custom/pi")
-    monkeypatch.delenv("OMNIGENT_CODEX_PATH", raising=False)
-    monkeypatch.delenv("OMNIGENT_PI_PATH", raising=False)
-    # The notice is stderr + isatty gated; force tty on so the helper emits.
-    monkeypatch.setattr("sys.stderr.isatty", lambda: True)
-
-    _warn_deprecated_harness_path_env_vars()
-
-    out = capsys.readouterr().err
-    assert "HARNESS_CODEX_PATH is deprecated" in out
-    assert "set OMNIGENT_CODEX_PATH instead" in out
-    assert "HARNESS_PI_PATH is deprecated" in out
-    assert "set OMNIGENT_PI_PATH instead" in out
-    assert "v0.8.0" in out
-
-
-def test_cli_no_deprecation_notice_when_no_legacy_var_set(
-    monkeypatch: pytest.MonkeyPatch,
-    capsys,
-) -> None:
-    """No legacy ``HARNESS_*_PATH`` set → no notice."""
-    from omnigent.cli import _warn_deprecated_harness_path_env_vars
-
-    for v in (
-        "HARNESS_CODEX_PATH",
-        "HARNESS_PI_PATH",
-        "HARNESS_KIMI_PATH",
-        "HARNESS_GOOSE_PATH",
-        "HARNESS_QWEN_PATH",
-        "HARNESS_HERMES_PATH",
-    ):
-        monkeypatch.delenv(v, raising=False)
-    monkeypatch.setattr("sys.stderr.isatty", lambda: True)
-
-    _warn_deprecated_harness_path_env_vars()
-
-    assert capsys.readouterr().err == ""
-
-
-def test_cli_no_deprecation_notice_in_non_tty(monkeypatch: pytest.MonkeyPatch, capsys) -> None:
-    """The notice is suppressed when stderr is not a tty (pipes/CI)."""
-    from omnigent.cli import _warn_deprecated_harness_path_env_vars
-
-    monkeypatch.setenv("HARNESS_CODEX_PATH", "/usr/local/bin/codex")
-    monkeypatch.setattr("sys.stderr.isatty", lambda: False)
-
-    _warn_deprecated_harness_path_env_vars()
-
-    assert capsys.readouterr().err == ""
-
-
 # ── bundled-agent shorthands (omnigent polly / omnigent debby) ──────────
 
 

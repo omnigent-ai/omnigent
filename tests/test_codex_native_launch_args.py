@@ -83,7 +83,7 @@ def test_codex_paths_expand_windows_home_with_either_separator(
 def test_remote_resume_option_spellings(args: tuple[str, ...], expected: dict) -> None:
     assert app_server._codex_resume_permission_params(args) == expected
     assert app_server.build_codex_remote_args(
-        codex_args=args, thread_id="thread-test", remote_url="ws://127.0.0.1:9876"
+        extra_args=args, thread_id="thread-test", remote_url="ws://127.0.0.1:9876"
     ) == ["resume", "--remote", "ws://127.0.0.1:9876", "thread-test"]
 
 
@@ -102,7 +102,7 @@ def test_profile_selector_applied_by_server_not_terminal(args: tuple[str, ...]) 
     assert app_server._codex_resume_permission_params(args) == {}
     for thread_id in (None, "thread-test"):
         result = app_server.build_codex_remote_args(
-            codex_args=args, thread_id=thread_id, remote_url="ws://127.0.0.1:9876"
+            extra_args=args, thread_id=thread_id, remote_url="ws://127.0.0.1:9876"
         )
         assert "strict" not in result
         assert "-c" not in result
@@ -357,7 +357,7 @@ async def test_remote_resume_add_dir_preserves_configured_roots(
     ]
     assert resume["config"]["sandbox_workspace_write.network_access"] is False
     assert app_server.build_codex_remote_args(
-        codex_args=args, thread_id="thread-test", remote_url="ws://127.0.0.1:9876"
+        extra_args=args, thread_id="thread-test", remote_url="ws://127.0.0.1:9876"
     ) == ["resume", "--remote", "ws://127.0.0.1:9876", "thread-test"]
 
 

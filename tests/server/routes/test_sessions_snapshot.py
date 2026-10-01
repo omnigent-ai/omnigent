@@ -1375,12 +1375,7 @@ async def test_session_snapshot_includes_model_options_from_runner(
 async def test_kiro_session_snapshot_loads_runner_model_catalog(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """An older runner without the unified route still fills the picker.
-
-    The fake runner 404s ``/model-options`` (it predates the unified
-    route), so the server's loader must drop to the legacy harness-named
-    route and serve its rows — the compat lane until 0.11.0.
-    """
+    """The unified /model-options route fills the picker for kiro sessions."""
     from omnigent.server.routes import sessions as _mod
 
     _mod._model_options_cache.clear()
@@ -1402,8 +1397,6 @@ async def test_kiro_session_snapshot_loads_runner_model_catalog(
             del timeout
             self.get_calls.append(url)
             if url.endswith("/model-options"):
-                return _FakeResponse({"detail": "Not Found"}, status_code=404)
-            if url.endswith("/kiro-model-options"):
                 return _FakeResponse(
                     {
                         "models": [
@@ -1445,9 +1438,7 @@ async def test_kiro_session_snapshot_loads_runner_model_catalog(
     await _drain_model_options(session_id)
     snapshot = await _get_session_snapshot(conv_store, session_id)  # type: ignore[arg-type]
 
-    # The unified route was tried first, then the legacy alias filled in.
     assert f"/v1/sessions/{session_id}/model-options" in fake_client.get_calls
-    assert f"/v1/sessions/{session_id}/kiro-model-options" in fake_client.get_calls
     assert [model.id for model in snapshot.model_options] == ["provider-latest"]
     assert snapshot.model_options[0].model_dump()["description"] == (
         "Provider supplied description"

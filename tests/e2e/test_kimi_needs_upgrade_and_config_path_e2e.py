@@ -101,7 +101,6 @@ def _base_env(home: Path, bin_dir: Path) -> dict[str, str]:
         "KIMI_CODE_HOME",
         "OMNIGENT_DATA_DIR",
         "OMNIGENT_KIMI_PATH",
-        "HARNESS_KIMI_PATH",
     ):
         env.pop(var, None)
     env["OMNIGENT_CONFIG_HOME"] = str(home / ".omnigent")

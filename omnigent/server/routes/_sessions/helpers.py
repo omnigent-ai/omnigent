@@ -11166,7 +11166,6 @@ async def _load_model_options(
     runner_client: httpx.AsyncClient,
     session_id: str,
     path: str,
-    fallback_path: str | None = None,
 ) -> None:
     """
     Background single-flight fetch of a session's native model catalog.
@@ -11175,10 +11174,6 @@ async def _load_model_options(
     :param session_id: Session/conversation identifier, e.g. ``"conv_abc"``.
     :param path: Runner route to query — the unified
         ``"/v1/sessions/conv_abc/model-options"``.
-    :param fallback_path: Legacy harness-named route to fall back to when
-        *path* 404s (an older runner without the unified route), e.g.
-        ``"/v1/sessions/conv_abc/cursor-model-options"``. ``None`` disables
-        the fallback.
     """
     # Read the retry schedule off the facade so tests patching
     # ``sessions._MODEL_OPTIONS_RETRY_DELAYS_S`` reach this impl.
@@ -11196,11 +11191,6 @@ async def _load_model_options(
             )
             return
         if resp.status_code != 200:
-            # An older runner has no unified route; drop to the harness-named
-            # one without consuming a retry.
-            if resp.status_code == 404 and fallback_path and path != fallback_path:
-                path = fallback_path
-                continue
             # 503 means the native backend (Codex app-server bridge / cursor
             # login) is still booting. Keep the background single-flight alive
             # so the web picker fills without a second manual refresh.
@@ -11333,17 +11323,15 @@ def prefetch_session_routing_catalogs(
     if not routing_class.routing_enabled:
         return
 
-    endpoint = _MODEL_OPTIONS_ENDPOINT_BY_WRAPPER.get(
-        conv.labels.get(_CLAUDE_NATIVE_WRAPPER_LABEL_KEY) or ""
-    )
-    if endpoint is not None and session_id not in _model_options_inflight:
+    wrapper = conv.labels.get(_CLAUDE_NATIVE_WRAPPER_LABEL_KEY) or ""
+    has_model_options = _MODEL_OPTIONS_ENDPOINT_BY_WRAPPER.get(wrapper) is not None
+    if has_model_options and session_id not in _model_options_inflight:
         options_task = asyncio.create_task(
             _run_catalog_prefetch(
                 _load_model_options(
                     runner_client,
                     session_id,
                     f"/v1/sessions/{session_id}/model-options",
-                    fallback_path=f"/v1/sessions/{session_id}/{endpoint}",
                 ),
                 session_id,
             )

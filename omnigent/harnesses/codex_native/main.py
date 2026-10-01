@@ -417,7 +417,6 @@ def run_codex_native(
     server: str | None,
     session_id: str | None,
     extra_args: tuple[str, ...] | None = None,
-    codex_args: tuple[str, ...] | None = None,
     resume_picker: bool = False,
     command: str = _DEFAULT_CODEX_COMMAND,
     model: str | None = None,
@@ -431,7 +430,6 @@ def run_codex_native(
         ``"http://127.0.0.1:8123"``.
     :param session_id: Optional existing Omnigent conversation id,
         e.g. ``"conv_abc123"``.
-    :param codex_args: Raw Codex CLI args to pass before ``resume``.
     :param resume_picker: ``True`` runs the Codex-native picker.
     :param command: Codex executable, e.g. ``"codex"``.
     :param model: Optional model id, e.g. ``"gpt-5.4-mini"``.
@@ -441,9 +439,7 @@ def run_codex_native(
     :returns: None after the terminal attach session ends.
     :raises click.ClickException: If setup fails.
     """
-    codex_args = _normalize_extra_args(
-        extra_args=extra_args, legacy_args=codex_args, legacy_param="codex_args"
-    )
+    extra_args = _normalize_extra_args(extra_args)
     resolved_command = command.strip()
     if not resolved_command:
         raise click.ClickException("Codex command must not be empty.")
@@ -460,7 +456,7 @@ def run_codex_native(
             spec_path,
             session_id=session_id,
             resume_picker=resume_picker,
-            codex_args=codex_args,
+            extra_args=extra_args,
             model=model,
             prompt=prompt,
             auto_open_conversation=auto_open_conversation,
@@ -668,7 +664,7 @@ def _run_with_local_server(
     *,
     session_id: str | None,
     resume_picker: bool,
-    codex_args: tuple[str, ...],
+    extra_args: tuple[str, ...],
     command: str,
     model: str | None,
     prompt: str | None,
@@ -680,7 +676,7 @@ def _run_with_local_server(
     :param spec_path: Generated Codex wrapper agent spec.
     :param session_id: Optional existing Omnigent session id.
     :param resume_picker: When ``True``, run the Codex-native picker.
-    :param codex_args: Raw Codex CLI args.
+    :param extra_args: Raw Codex CLI args.
     :param command: Codex executable to run.
     :param model: Optional Codex model id.
     :param prompt: Optional first prompt.
@@ -726,7 +722,7 @@ def _run_with_local_server(
                     session_id=resolved_session_id,
                     runner_id=server_handle.runner_id,
                     session_bundle=bundle,
-                    codex_args=codex_args,
+                    extra_args=extra_args,
                     command=command,
                     model=model,
                     startup_progress=progress,
@@ -770,7 +766,7 @@ def _run_with_remote_server(
     *,
     session_id: str | None,
     resume_picker: bool,
-    codex_args: tuple[str, ...],
+    extra_args: tuple[str, ...],
     model: str | None,
     prompt: str | None,
     auto_open_conversation: bool = False,
@@ -783,7 +779,7 @@ def _run_with_remote_server(
     :param spec_path: Generated Codex wrapper agent spec.
     :param session_id: Optional existing Omnigent session id.
     :param resume_picker: When ``True``, run the Codex-native picker.
-    :param codex_args: Raw Codex CLI args.
+    :param extra_args: Raw Codex CLI args.
     :param model: Optional Codex model id.
     :param prompt: Optional first prompt.
     :param auto_open_conversation: When ``True``, open the
@@ -827,7 +823,7 @@ def _run_with_remote_server(
                     headers=headers,
                     session_id=resolved_session_id,
                     session_bundle=bundle,
-                    codex_args=codex_args,
+                    extra_args=extra_args,
                     model=model,
                     host_id=host_id,
                     workspace=str(Path.cwd().resolve()),
@@ -894,7 +890,7 @@ async def _prepare_codex_terminal_via_daemon(
     headers: dict[str, str],
     session_id: str | None,
     session_bundle: bytes | None,
-    codex_args: tuple[str, ...],
+    extra_args: tuple[str, ...],
     model: str | None,
     host_id: str,
     workspace: str,
@@ -914,7 +910,7 @@ async def _prepare_codex_terminal_via_daemon(
         fresh session.
     :param session_bundle: Gzipped Codex wrapper bundle. Required when
         *session_id* is ``None``.
-    :param codex_args: User pass-through Codex args, e.g.
+    :param extra_args: User pass-through Codex args, e.g.
         ``("--config", "approval_policy=on-request")``.
     :param model: Optional model override for this launch, e.g.
         ``"gpt-5.4-mini"``.
@@ -926,7 +922,7 @@ async def _prepare_codex_terminal_via_daemon(
     :returns: Prepared terminal details for attaching.
     :raises click.ClickException: If setup fails.
     """
-    persist_args = list(codex_args)
+    persist_args = list(extra_args)
     timeout = httpx.Timeout(30.0, read=120.0)
     async with open_daemon_client(base_url, headers, host_id, timeout=timeout) as client:
         reattached = session_id is not None
@@ -1142,7 +1138,7 @@ async def _prepare_codex_terminal(
     session_id: str | None,
     runner_id: str | None,
     session_bundle: bytes | None,
-    codex_args: tuple[str, ...],
+    extra_args: tuple[str, ...],
     command: str,
     model: str | None,
     startup_progress: RunnerStartupProgress | None = None,
@@ -1156,7 +1152,7 @@ async def _prepare_codex_terminal(
     :param session_id: Optional existing session id.
     :param runner_id: Runner id to bind.
     :param session_bundle: Gzipped agent bundle for new sessions.
-    :param codex_args: Raw Codex CLI args.
+    :param extra_args: Raw Codex CLI args.
     :param command: Codex executable.
     :param model: Optional model id.
     :param startup_progress: Optional user-visible progress renderer,
@@ -1245,7 +1241,7 @@ async def _prepare_codex_terminal(
                 workspace=Path.cwd().resolve(),
                 model_provider=codex_session_meta_model_provider(_codex_launch),
                 codex_path=command,
-                terminal_launch_args=codex_args,
+                terminal_launch_args=extra_args,
             )
         # Listen on a loopback WebSocket, mirroring the host-spawned
         # runner (``runner/app.py`` ``_auto_create_codex_terminal``).
@@ -1269,7 +1265,7 @@ async def _prepare_codex_terminal(
             ap_server_url=base_url,
             ap_auth_headers=headers,
             developer_instructions=developer_instructions,
-            terminal_launch_args=codex_args,
+            terminal_launch_args=extra_args,
         )
         app_server.listen_url = codex_ws_url
         event_client: CodexAppServerClient | None = None
@@ -1287,7 +1283,7 @@ async def _prepare_codex_terminal(
                 event_client = await preload_codex_thread_for_resume(
                     codex_ws_url,
                     thread_id,
-                    terminal_launch_args=codex_args,
+                    terminal_launch_args=extra_args,
                     cwd=Path.cwd(),
                     retain_client=codex_remote_resume_omits_permission_args(
                         app_server.codex_cli_version
@@ -1309,7 +1305,7 @@ async def _prepare_codex_terminal(
             launched_terminal = await _launch_codex_terminal(
                 client,
                 session_id,
-                codex_args=codex_args,
+                extra_args=extra_args,
                 command=command,
                 thread_id=thread_id,
                 remote_url=codex_ws_url,
@@ -2839,7 +2835,7 @@ async def _launch_codex_terminal(
     client: httpx.AsyncClient,
     session_id: str,
     *,
-    codex_args: tuple[str, ...],
+    extra_args: tuple[str, ...],
     command: str,
     thread_id: str | None,
     remote_url: str,
@@ -2852,7 +2848,7 @@ async def _launch_codex_terminal(
 
     :param client: HTTP client pointed at AP.
     :param session_id: Omnigent session id.
-    :param codex_args: Raw Codex CLI args.
+    :param extra_args: Raw Codex CLI args.
     :param command: Codex executable.
     :param thread_id: Codex thread id to resume. ``None`` starts a
         fresh remote Codex TUI thread.
@@ -2869,7 +2865,7 @@ async def _launch_codex_terminal(
     :returns: Launched terminal resource details.
     """
     terminal_args = build_codex_remote_args(
-        codex_args=codex_args,
+        extra_args=extra_args,
         thread_id=thread_id,
         remote_url=remote_url,
         config_overrides=config_overrides,

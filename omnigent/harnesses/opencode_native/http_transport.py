@@ -279,7 +279,7 @@ class OpenCodeHttpTransport:
             server_url=server_url,
             workspace=launch.workspace,
             session_id=session_id,
-            opencode_args=launch.terminal_launch_args,
+            extra_args=launch.terminal_launch_args,
         )
         env: Mapping[str, str] = (
             opencode_terminal_env(self._server) if self._server is not None else {}

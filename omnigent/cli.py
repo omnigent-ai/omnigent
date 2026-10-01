@@ -2170,30 +2170,6 @@ def _should_skip_update_check(argv: list[str]) -> bool:
     }
 
 
-def _warn_deprecated_harness_path_env_vars() -> None:
-    """Print a terminal-visible deprecation notice for legacy ``HARNESS_*_PATH``.
-
-    These were the documented per-harness binary override knobs; they're now
-    replaced by ``OMNIGENT_<NAME>_PATH`` (one var per binary, ``-native`` suffix
-    stripped). The legacy read still works but is slated for removal in
-    v0.8.0. Surface the replacement at CLI startup so a user with a legacy var
-    in their shell/systemd/CI sees it regardless of which harness they launch
-    or whether the run is local or remote (the runner-side log warning only
-    reaches users on local launches). Gated to interactive stderr to avoid
-    noise in pipes/CI logs.
-    """
-    if not sys.stderr.isatty():
-        return
-    from omnigent.harness_startup_config import legacy_harness_path_env_vars_set
-
-    for legacy, canonical in legacy_harness_path_env_vars_set():
-        click.echo(
-            f"omnigent: {legacy} is deprecated; set {canonical} instead. "
-            f"{legacy} support will be removed in v0.8.0.",
-            err=True,
-        )
-
-
 REQUIRE_WRAPPER_ENV = "OMNIGENT_REQUIRE_WRAPPER"
 WRAPPER_BYPASS_ENV = "OMNIGENT_WRAPPER_BYPASS"
 
@@ -2409,14 +2385,6 @@ def main() -> None:
         from omnigent.update_check import maybe_show_update_notice
 
         maybe_show_update_notice()
-
-    # Terminal-visible deprecation notice for legacy ``HARNESS_*_PATH`` env
-    # vars (now ``OMNIGENT_<NAME>_PATH``). Same gating as the update notice so
-    # help/version/upgrade invocations stay quiet. The runner-side log warning
-    # only reaches users on local launches; this reaches the terminal for every
-    # interactive invocation regardless of local-vs-remote.
-    if not _should_skip_update_check(argv):
-        _warn_deprecated_harness_path_env_vars()
 
     try:
         cli(args=argv, standalone_mode=False)
@@ -7304,17 +7272,6 @@ _CONTINUE_HELP = "Continue the most recent conversation for this agent."
 _NO_SESSION_HELP = "Use a fresh temporary local session store for this run."
 
 
-#: ``run --smart-routing`` is gone; the flag survives only to say where routing
-#: moved. Remove the option (and the check that raises this) in 0.11.
-def _run_smart_routing_removed() -> str:
-    # Wrapper resolved at call time so the hint honors OMNIGENT_WRAPPER_COMMAND.
-    return (
-        "CLI smart routing is per-harness first-message only; use the web UI for "
-        f"router-picked harnesses. Run `{cli_invocation()} claude --smart-routing` or "
-        f"`{cli_invocation()} codex --smart-routing` to route this harness's first typed message."
-    )
-
-
 _FORK_HELP = "Fork an existing session by id and open the REPL on the fork."
 _LOG_HELP = "Write a JSON dump of the conversation to ~/.omnigent/logs/ on exit."
 
@@ -8419,14 +8376,6 @@ def attach(
 )
 @click.option("--harness", default=None, help=_RUN_HARNESS_HELP)
 @click.option(
-    "--smart-routing",
-    "smart_routing",
-    is_flag=True,
-    default=False,
-    hidden=True,
-    help=f"[REMOVED] Use `{cli_invocation()} claude|codex --smart-routing` or the web UI.",
-)
-@click.option(
     "--from-openclaw",
     "from_openclaw",
     default=None,
@@ -8501,7 +8450,6 @@ def run(
     target: str | None,
     tools: str | None,
     harness: str | None,
-    smart_routing: bool,
     from_openclaw: str | None,
     model: str | None,
     prompt: str | None,
@@ -8558,10 +8506,6 @@ def run(
     from omnigent.runtime.telemetry import capture_dispatch_trace_context
 
     capture_dispatch_trace_context()
-    # Rejected before anything is resolved: `run` never routed in-harness, and
-    # its create-time route is gone.
-    if smart_routing:
-        raise click.ClickException(_run_smart_routing_removed())
     # Apply config defaults for any value the user did not pass explicitly.
     # Explicit CLI args always take precedence; project-local config overrides
     # global config, which provides user-level defaults.

@@ -1914,46 +1914,7 @@ def test_spawn_env_no_command_emits_no_path(
     env = _call_builder(builder, spec)
 
     suffix = harness.upper()
-    # Neither the canonical OMNIGENT_* nor the legacy HARNESS_* is emitted.
     assert f"OMNIGENT_{suffix}_PATH" not in env
-    assert f"HARNESS_{suffix}_PATH" not in env
-
-
-@pytest.mark.parametrize(
-    ("harness", "builder"),
-    [
-        ("codex", _build_codex_spawn_env),
-        ("pi", _build_pi_spawn_env),
-        ("kimi", _build_kimi_spawn_env),
-        ("goose", _build_goose_spawn_env),
-        ("qwen", _build_qwen_spawn_env),
-    ],
-)
-def test_spawn_env_legacy_env_wins_over_config_command(
-    monkeypatch: pytest.MonkeyPatch,
-    config_home: Path,
-    harness: str,
-    builder: object,
-) -> None:
-    """A deprecated ``HARNESS_<NAME>_PATH`` env var wins over config ``command``.
-
-    Per ``env > config``, the legacy env var must not be shadowed by config.
-    """
-    from omnigent.harness_startup_config import _LEGACY_PATH_WARNED
-
-    legacy_var = f"HARNESS_{harness.upper()}_PATH"
-    _LEGACY_PATH_WARNED.discard(legacy_var)
-    monkeypatch.delenv(f"OMNIGENT_{harness.upper()}_PATH", raising=False)
-    monkeypatch.setenv(legacy_var, "/legacy/bin")
-    cfg = _openai_default_config()
-    cfg["harness"] = {harness: {"command": "/config/bin"}}
-    _write_config(config_home, cfg)
-    spec = _make_spec(harness=harness)
-
-    env = _call_builder(builder, spec)
-
-    # The builder must not set OMNIGENT_* from config when the legacy env wins.
-    assert f"OMNIGENT_{harness.upper()}_PATH" not in env
 
 
 # ── Ambient-isolation controls ─────────────────────────────────────────────

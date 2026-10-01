@@ -186,7 +186,7 @@ def list_kiro_cli_model_options(
 
 
 def build_kiro_launch(
-    kiro_args: Sequence[str],
+    extra_args: Sequence[str],
     *,
     model: str | None = None,
     prompt: str | None = None,
@@ -201,7 +201,7 @@ def build_kiro_launch(
         argv.extend(["--resume-id", resume_id])
     if model:
         argv.extend(["--model", model])
-    argv.extend(kiro_args)
+    argv.extend(extra_args)
     if prompt:
         argv.append(prompt)
     return NativeKiroLaunch(executable=executable, argv=argv)
@@ -212,16 +212,13 @@ def run_kiro_native(
     server: str | None,
     session_id: str | None,
     extra_args: tuple[str, ...] | None = None,
-    kiro_args: tuple[str, ...] | None = None,
     resume_picker: bool = False,
     model: str | None = None,
     prompt: str | None = None,
     auto_open_conversation: bool = False,
 ) -> None:
     """Launch the Kiro TUI in an Omnigent terminal."""
-    kiro_args = _normalize_extra_args(
-        extra_args=extra_args, legacy_args=kiro_args, legacy_param="kiro_args"
-    )
+    extra_args = _normalize_extra_args(extra_args)
     _preflight_local_tools()
     if server is None:
         raise click.ClickException(
@@ -235,7 +232,7 @@ def run_kiro_native(
             spec_path,
             session_id=session_id,
             resume_picker=resume_picker,
-            kiro_args=kiro_args,
+            extra_args=extra_args,
             model=model,
             prompt=prompt,
             auto_open_conversation=auto_open_conversation,
@@ -274,7 +271,7 @@ def _run_with_remote_server(
     *,
     session_id: str | None,
     resume_picker: bool,
-    kiro_args: tuple[str, ...],
+    extra_args: tuple[str, ...],
     model: str | None = None,
     prompt: str | None = None,
     auto_open_conversation: bool = False,
@@ -306,7 +303,7 @@ def _run_with_remote_server(
                     headers=headers,
                     session_id=resolved_session_id,
                     session_bundle=bundle,
-                    kiro_args=kiro_args,
+                    extra_args=extra_args,
                     model=model,
                     prompt=prompt,
                     host_id=host_id,
@@ -345,7 +342,7 @@ async def _prepare_kiro_terminal_via_daemon(
     headers: dict[str, str],
     session_id: str | None,
     session_bundle: bytes | None,
-    kiro_args: tuple[str, ...],
+    extra_args: tuple[str, ...],
     model: str | None,
     prompt: str | None,
     host_id: str,
@@ -353,7 +350,7 @@ async def _prepare_kiro_terminal_via_daemon(
     startup_progress: RunnerStartupProgress | None = None,
 ) -> PreparedKiroTerminal:
     """Create or resume a kiro-native session through a daemon runner."""
-    persist_args = list(kiro_args)
+    persist_args = list(extra_args)
     if model:
         persist_args[:0] = ["--model", model]
     if prompt:

@@ -1371,7 +1371,7 @@ def test_remote_run_preflights_local_claude_binary(
         claude_native.run_claude_native(
             server="https://example.com/",
             session_id="conv_abc",
-            claude_args=("--resume", "claude-native"),
+            extra_args=("--resume", "claude-native"),
             command="missing-claude",
         )
 
@@ -1429,7 +1429,7 @@ def test_local_run_preflights_local_claude_binary(
         claude_native.run_claude_native(
             server=None,
             session_id=None,
-            claude_args=(),
+            extra_args=(),
             command="missing-claude",
         )
 
@@ -1461,7 +1461,7 @@ def test_run_preflights_local_tmux(monkeypatch: pytest.MonkeyPatch) -> None:
         claude_native.run_claude_native(
             server=None,
             session_id=None,
-            claude_args=(),
+            extra_args=(),
             command="claude",
         )
 
@@ -1549,7 +1549,7 @@ def test_local_run_persists_launch_state_on_fresh_session(
         spec_path,
         session_id=None,
         resume_picker=False,
-        claude_args=(),
+        extra_args=(),
         command="claude",
         auto_open_conversation=True,
     )
@@ -1650,7 +1650,7 @@ def test_run_with_local_server_threads_raw_instructions_to_prepare_terminal_fres
         spec_path,
         session_id=None,
         resume_picker=False,
-        claude_args=(),
+        extra_args=(),
         command="claude",
         auto_open_conversation=False,
     )
@@ -1737,7 +1737,7 @@ def test_run_with_local_server_threads_raw_instructions_to_prepare_terminal_cold
         spec_path,
         session_id="conv_cold_resume_raw",
         resume_picker=False,
-        claude_args=(),
+        extra_args=(),
         command="claude",
         auto_open_conversation=False,
     )
@@ -1827,7 +1827,7 @@ def test_local_resume_does_not_print_redundant_resume_hint(
         spec_path,
         session_id="conv_existing",
         resume_picker=False,
-        claude_args=(),
+        extra_args=(),
         command="claude",
     )
 
@@ -1923,7 +1923,7 @@ def test_remote_daemon_run_attaches_without_cli_forwarder(
         spec_path,
         session_id=None,
         resume_picker=False,
-        claude_args=("--allowedTools", "Read"),
+        extra_args=("--allowedTools", "Read"),
     )
 
     assert recorded_launches == ["conv_daemon"]
@@ -2102,7 +2102,7 @@ async def test_prepare_daemon_terminal_reports_progress_steps(
         headers={},
         session_id=None,
         session_bundle=b"bundle",
-        claude_args=("--print", "hi"),
+        extra_args=("--print", "hi"),
         host_id="host_progress",
         workspace="/workspace",
         startup_progress=progress,
@@ -2587,7 +2587,7 @@ async def test_prepare_reattaches_existing_claude_terminal(
         session_id="conv_abc",
         runner_id="runner_new",
         session_bundle=None,
-        claude_args=(),
+        extra_args=(),
         command="claude",
     )
 
@@ -6138,7 +6138,7 @@ async def test_prepare_claude_terminal_cold_resume_injects_external_session_id(
             session_id="conv_abc",
             runner_id="runner_xyz",
             session_bundle=None,
-            claude_args=("--print", "hello"),
+            extra_args=("--print", "hello"),
             command="claude",
             append_system_prompt="Wrapper bridge instructions.",
         )
@@ -6254,7 +6254,7 @@ async def test_prepare_claude_terminal_fresh_session_is_not_cold_resumed(
             session_id=None,
             runner_id="runner_xyz",
             session_bundle=b"fake-bundle",
-            claude_args=(),
+            extra_args=(),
             command="claude",
             append_system_prompt="Fresh session bridge instructions.",
         )

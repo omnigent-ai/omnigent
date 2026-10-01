@@ -192,12 +192,6 @@ def main(argv: list[str] | None = None) -> int:
         return observe_main(raw_argv[1:])
     if raw_argv and raw_argv[0] == "permission-request":
         return _main_permission_request(raw_argv[1:])
-    if raw_argv and raw_argv[0] == "ask-user-question":
-        # Retired PreToolUse forwarder: settings written before the upgrade
-        # still name it until the terminal restarts. Exit 0 with no output so
-        # Claude proceeds to the PermissionRequest hook. Remove in 0.16.0.
-        sys.stdin.read()
-        return 0
     if raw_argv and raw_argv[0] == "evaluate-policy":
         return _main_evaluate_policy(raw_argv[1:])
     if raw_argv and raw_argv[0] == "route-turn":

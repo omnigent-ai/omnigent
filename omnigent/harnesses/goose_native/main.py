@@ -147,14 +147,14 @@ def resolve_goose_executable(
 
 
 def build_goose_launch(
-    goose_args: Sequence[str],
+    extra_args: Sequence[str],
     *,
     env: Mapping[str, str] | None = None,
     which: Callable[[str], str | None] | None = None,
 ) -> NativeGooseLaunch:
     """Build the argv for a native Goose process."""
     executable = resolve_goose_executable(env=env, which=which)
-    return NativeGooseLaunch(executable=executable, argv=[executable, *goose_args])
+    return NativeGooseLaunch(executable=executable, argv=[executable, *extra_args])
 
 
 def run_goose_native(
@@ -162,7 +162,6 @@ def run_goose_native(
     server: str | None,
     session_id: str | None,
     extra_args: tuple[str, ...] | None = None,
-    goose_args: tuple[str, ...] | None = None,
     resume_picker: bool = False,
     auto_open_conversation: bool = False,
 ) -> None:
@@ -171,15 +170,13 @@ def run_goose_native(
 
     :param server: Resolved Omnigent server URL.
     :param session_id: Optional existing Omnigent conversation id.
-    :param goose_args: Raw goose CLI args to persist for the runner-owned TUI.
+    :param extra_args: Raw goose CLI args to persist for the runner-owned TUI.
     :param resume_picker: ``True`` runs the goose-native picker.
     :param auto_open_conversation: When ``True``, open the browser conversation
         URL after launch.
     :returns: None after the terminal attach session ends.
     """
-    goose_args = _normalize_extra_args(
-        extra_args=extra_args, legacy_args=goose_args, legacy_param="goose_args"
-    )
+    extra_args = _normalize_extra_args(extra_args)
     _preflight_local_tools()
     if server is None:
         raise click.ClickException(
@@ -193,7 +190,7 @@ def run_goose_native(
             spec_path,
             session_id=session_id,
             resume_picker=resume_picker,
-            goose_args=goose_args,
+            extra_args=extra_args,
             auto_open_conversation=auto_open_conversation,
         )
 
@@ -233,7 +230,7 @@ def _run_with_remote_server(
     *,
     session_id: str | None,
     resume_picker: bool,
-    goose_args: tuple[str, ...],
+    extra_args: tuple[str, ...],
     auto_open_conversation: bool = False,
 ) -> None:
     """
@@ -243,7 +240,7 @@ def _run_with_remote_server(
     :param spec_path: Generated Goose wrapper agent spec.
     :param session_id: Optional existing Omnigent session id.
     :param resume_picker: When ``True``, run the goose-native picker.
-    :param goose_args: Raw goose CLI args.
+    :param extra_args: Raw goose CLI args.
     :param auto_open_conversation: Whether to open the web conversation URL.
     """
     from omnigent.chat import _bundle_agent, _remote_headers
@@ -272,7 +269,7 @@ def _run_with_remote_server(
                     headers=headers,
                     session_id=resolved_session_id,
                     session_bundle=bundle,
-                    goose_args=goose_args,
+                    extra_args=extra_args,
                     host_id=host_id,
                     workspace=str(Path.cwd().resolve()),
                     startup_progress=progress,
@@ -309,7 +306,7 @@ async def _prepare_goose_terminal_via_daemon(
     headers: dict[str, str],
     session_id: str | None,
     session_bundle: bytes | None,
-    goose_args: tuple[str, ...],
+    extra_args: tuple[str, ...],
     host_id: str,
     workspace: str,
     startup_progress: RunnerStartupProgress | None = None,
@@ -319,7 +316,7 @@ async def _prepare_goose_terminal_via_daemon(
 
     :returns: Prepared terminal details for attaching.
     """
-    persist_args = list(goose_args)
+    persist_args = list(extra_args)
     timeout = httpx.Timeout(30.0, read=120.0)
     async with open_daemon_client(base_url, headers, host_id, timeout=timeout) as client:
         reattached = False

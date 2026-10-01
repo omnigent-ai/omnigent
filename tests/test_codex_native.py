@@ -920,7 +920,7 @@ def test_codex_resume_permission_params_repairs_legacy_full_access_profile() -> 
         "approvalsReviewer": "user",
     }
     assert codex_native_app_server.build_codex_remote_args(
-        codex_args=tuple(args),
+        extra_args=tuple(args),
         thread_id="thread_x",
         remote_url="ws://127.0.0.1:9876",
     ) == [
@@ -1002,7 +1002,7 @@ def test_remote_resume_applies_permissions_only_on_app_server(
     ]
     assert fake_client.closed
     assert codex_native_app_server.build_codex_remote_args(
-        codex_args=launch_args,
+        extra_args=launch_args,
         thread_id="thread_test",
         remote_url="ws://127.0.0.1:9876",
         config_overrides=('model_provider="test-provider"',),
@@ -1029,7 +1029,7 @@ def test_remote_resume_omits_app_server_permission_config(
         'model_provider="test-provider"',
     )
     assert codex_native_app_server.build_codex_remote_args(
-        codex_args=(),
+        extra_args=(),
         thread_id="thread_test",
         remote_url="ws://127.0.0.1:9876",
         config_overrides=overrides,
@@ -1129,19 +1129,19 @@ def test_remote_resume_transfers_permission_config_to_preload(
         )
     ]
     assert codex_native_app_server.build_codex_remote_args(
-        codex_args=launch_args,
+        extra_args=launch_args,
         thread_id="thread_test",
         remote_url="ws://127.0.0.1:9876",
         codex_cli_version=(0, 155, 0),
     ) == ["resume", "--remote", "ws://127.0.0.1:9876", "thread_test"]
     assert codex_native_app_server.build_codex_remote_args(
-        codex_args=launch_args,
+        extra_args=launch_args,
         thread_id="thread_test",
         remote_url="ws://127.0.0.1:9876",
         codex_cli_version=(0, 153, 1),
     ) == [*launch_args, "resume", "--remote", "ws://127.0.0.1:9876", "thread_test"]
     assert codex_native_app_server.build_codex_remote_args(
-        codex_args=launch_args,
+        extra_args=launch_args,
         thread_id=None,
         remote_url="ws://127.0.0.1:9876",
         codex_cli_version=(0, 155, 0),
@@ -1168,7 +1168,7 @@ def test_remote_resume_merges_permission_config_without_dropping_profile() -> No
         "config": {"permissions.restricted.network.enabled": False, "network.enabled": False},
     }
     assert codex_native_app_server.build_codex_remote_args(
-        codex_args=launch_args,
+        extra_args=launch_args,
         thread_id="thread_test",
         remote_url="ws://127.0.0.1:9876",
     ) == ["-c", 'model="test-model"', "resume", "--remote", "ws://127.0.0.1:9876", "thread_test"]
@@ -1219,7 +1219,7 @@ def test_remote_resume_preserves_overlapping_permission_config_order(
         "config": expected_config,
     }
     assert codex_native_app_server.build_codex_remote_args(
-        codex_args=launch_args,
+        extra_args=launch_args,
         thread_id="thread_test",
         remote_url="ws://127.0.0.1:9876",
     ) == ["resume", "--remote", "ws://127.0.0.1:9876", "thread_test"]
@@ -1231,7 +1231,7 @@ def test_remote_resume_preserves_legacy_bypass_args(
 ) -> None:
     """Older TUIs need the bypass settings even after app-server preload."""
     assert codex_native_app_server.build_codex_remote_args(
-        codex_args=("-a", "on-request", "-s", "read-only", "--model", "test-model"),
+        extra_args=("-a", "on-request", "-s", "read-only", "--model", "test-model"),
         thread_id="thread_test",
         remote_url="ws://127.0.0.1:9876",
         config_overrides=('approval_policy="never"', 'sandbox_mode="danger-full-access"'),
@@ -1273,7 +1273,7 @@ def test_remote_resume_preserves_legacy_bypass_args(
 def test_remote_resume_preserves_settings_not_applied_by_preload(args: tuple[str, ...]) -> None:
     """Do not silently discard unsupported policy settings or unrelated config."""
     assert codex_native_app_server.build_codex_remote_args(
-        codex_args=args,
+        extra_args=args,
         thread_id="thread_test",
         remote_url="ws://127.0.0.1:9876",
     ) == [*args, "resume", "--remote", "ws://127.0.0.1:9876", "thread_test"]
@@ -1622,7 +1622,7 @@ def test_build_codex_remote_args_passes_transport_verbatim(
     """
     assert (
         codex_native_app_server.build_codex_remote_args(
-            codex_args=codex_args,
+            extra_args=codex_args,
             thread_id=thread_id,
             remote_url=remote_url,
         )
@@ -1684,7 +1684,7 @@ def test_build_codex_remote_args_emits_config_overrides_before_subcommand(
     """
     assert (
         codex_native_app_server.build_codex_remote_args(
-            codex_args=(),
+            extra_args=(),
             thread_id=thread_id,
             remote_url="ws://127.0.0.1:9876",
             config_overrides=(
@@ -1760,7 +1760,7 @@ def test_build_codex_remote_args_default_keeps_approval_flags_no_bypass() -> Non
     chosen approval preset or silently escalate to full bypass.
     """
     args = codex_native_app_server.build_codex_remote_args(
-        codex_args=("--sandbox", "read-only", "--ask-for-approval", "on-request"),
+        extra_args=("--sandbox", "read-only", "--ask-for-approval", "on-request"),
         thread_id=None,
         remote_url="ws://127.0.0.1:9876",
     )
@@ -1828,7 +1828,7 @@ def test_build_codex_remote_args_bypass_emits_flag_and_strips_conflicts(
     """
     assert (
         codex_native_app_server.build_codex_remote_args(
-            codex_args=codex_args,
+            extra_args=codex_args,
             thread_id=thread_id,
             remote_url="ws://127.0.0.1:9876",
             bypass_sandbox=True,
@@ -1845,7 +1845,7 @@ def test_build_codex_remote_args_bypass_hook_trust_prepends_flag() -> None:
     a live terminal user.
     """
     args = codex_native_app_server.build_codex_remote_args(
-        codex_args=(),
+        extra_args=(),
         thread_id=None,
         remote_url="ws://127.0.0.1:9876",
         bypass_hook_trust=True,
@@ -1858,7 +1858,7 @@ def test_build_codex_remote_args_bypass_hook_trust_prepends_flag() -> None:
 def test_build_codex_remote_args_bypass_hook_trust_with_resume() -> None:
     """``bypass_hook_trust=True`` flag precedes the ``resume`` subcommand."""
     args = codex_native_app_server.build_codex_remote_args(
-        codex_args=(),
+        extra_args=(),
         thread_id="thread-abc",
         remote_url="ws://127.0.0.1:9876",
         bypass_hook_trust=True,
@@ -1871,7 +1871,7 @@ def test_build_codex_remote_args_bypass_hook_trust_with_resume() -> None:
 def test_build_codex_remote_args_bypass_hook_trust_default_false() -> None:
     """``bypass_hook_trust`` defaults to ``False``; flag is absent."""
     args = codex_native_app_server.build_codex_remote_args(
-        codex_args=(),
+        extra_args=(),
         thread_id=None,
         remote_url="ws://127.0.0.1:9876",
     )
@@ -7846,7 +7846,7 @@ def test_local_run_prints_resume_hint_after_attach(
         spec_path,
         session_id=None,
         resume_picker=False,
-        codex_args=(),
+        extra_args=(),
         command="codex",
         model=None,
         prompt=None,
@@ -7957,7 +7957,7 @@ def test_local_run_resume_hint_follows_native_new_rotation(
         spec_path,
         session_id=None,
         resume_picker=False,
-        codex_args=(),
+        extra_args=(),
         command="codex",
         model=None,
         prompt=None,
@@ -8045,7 +8045,7 @@ def test_local_resume_does_not_print_redundant_resume_hint(
         spec_path,
         session_id="conv_codex_existing",
         resume_picker=False,
-        codex_args=(),
+        extra_args=(),
         command="codex",
         model=None,
         prompt=None,
@@ -8089,7 +8089,7 @@ def test_run_codex_native_does_not_require_local_codex_binary(
         *,
         session_id: str | None,
         resume_picker: bool,
-        codex_args: tuple[str, ...],
+        extra_args: tuple[str, ...],
         model: str | None,
         prompt: str | None,
         auto_open_conversation: bool,
@@ -8105,7 +8105,7 @@ def test_run_codex_native_does_not_require_local_codex_binary(
             spec_path,
             session_id,
             resume_picker,
-            codex_args,
+            extra_args,
             model,
             prompt,
             auto_open_conversation,
@@ -8118,7 +8118,7 @@ def test_run_codex_native_does_not_require_local_codex_binary(
     codex_native.run_codex_native(
         server="http://localhost:8000",
         session_id=None,
-        codex_args=(),
+        extra_args=(),
         command="codex",
     )
 
@@ -8367,7 +8367,7 @@ def test_run_with_remote_server_aligns_cwd_before_daemon_prepare(
         tmp_path / "codex.yaml",
         session_id="conv_abc",
         resume_picker=False,
-        codex_args=(),
+        extra_args=(),
         model=None,
         prompt=None,
     )
@@ -8447,7 +8447,7 @@ def test_run_with_local_server_records_fresh_session_before_attach(
         tmp_path / "codex.yaml",
         session_id=None,
         resume_picker=False,
-        codex_args=(),
+        extra_args=(),
         command="/opt/codex/bin/codex",
         model=None,
         prompt=None,
@@ -8516,7 +8516,7 @@ async def test_prepare_codex_terminal_fresh_session_passes_developer_instruction
             session_id=None,
             runner_id=None,
             session_bundle=b"fake-bundle",
-            codex_args=(),
+            extra_args=(),
             command="codex",
             model=None,
             developer_instructions="Be a concise, careful coding assistant.",
@@ -8602,7 +8602,7 @@ async def test_prepare_codex_terminal_closes_resources_when_cleanup_is_interrupt
             session_id="conv_test",
             runner_id=None,
             session_bundle=None,
-            codex_args=(),
+            extra_args=(),
             command="codex",
             model=None,
         )
@@ -8660,7 +8660,7 @@ def test_run_with_local_server_threads_raw_instructions_to_prepare_terminal_fres
             spec_path,
             session_id=None,
             resume_picker=False,
-            codex_args=(),
+            extra_args=(),
             command="codex",
             model=None,
             prompt=None,
@@ -8742,7 +8742,7 @@ def test_run_with_local_server_threads_raw_instructions_to_prepare_terminal_resu
             spec_path,
             session_id="conv_resume_wiring",
             resume_picker=False,
-            codex_args=(),
+            extra_args=(),
             command="codex",
             model=None,
             prompt=None,
@@ -8848,7 +8848,7 @@ async def test_prepare_codex_terminal_via_daemon_creates_runner_and_ensures_term
                 headers={},
                 session_id=None,
                 session_bundle=b"bundle",
-                codex_args=("--config", "approval_policy=on-request"),
+                extra_args=("--config", "approval_policy=on-request"),
                 model="gpt-5.4-mini",
                 host_id="host_local",
                 workspace="/repo",
@@ -9001,7 +9001,7 @@ async def test_prepare_codex_terminal_via_daemon_overlaps_create_and_host_wait(
         headers={},
         session_id=None,
         session_bundle=b"bundle",
-        codex_args=(),
+        extra_args=(),
         model=None,
         host_id="host_local",
         workspace="/repo",
@@ -9104,7 +9104,7 @@ async def test_prepare_codex_terminal_via_daemon_live_resume_skips_config_patch(
         headers={},
         session_id="conv_live",
         session_bundle=None,
-        codex_args=("--model", "gpt-5.4-mini"),
+        extra_args=("--model", "gpt-5.4-mini"),
         model="gpt-5.4-mini",
         host_id="host_local",
         workspace="/repo",
@@ -9222,7 +9222,7 @@ async def test_prepare_codex_terminal_hot_resume_does_not_rewrite_rollout(
         session_id=session_id,
         runner_id="runner_local",
         session_bundle=None,
-        codex_args=(),
+        extra_args=(),
         command="/opt/codex/bin/codex",
         model=None,
     )
@@ -9373,7 +9373,7 @@ def test_launch_codex_terminal_starts_fresh_remote_tui() -> None:
         codex_native._launch_codex_terminal(
             client,  # type: ignore[arg-type]
             "conv_abc",
-            codex_args=("-c", "approval_policy=on-request"),
+            extra_args=("-c", "approval_policy=on-request"),
             command="/opt/codex/bin/codex",
             thread_id=None,
             remote_url="ws://127.0.0.1:9876",
@@ -9419,7 +9419,7 @@ def test_launch_codex_terminal_uses_remote_resume_order(
         codex_native._launch_codex_terminal(
             client,  # type: ignore[arg-type]
             "conv_abc",
-            codex_args=("-c", "approval_policy=on-request"),
+            extra_args=("-c", "approval_policy=on-request"),
             command="/opt/codex/bin/codex",
             thread_id="thread_123",
             remote_url="ws://127.0.0.1:9876",
@@ -9489,7 +9489,7 @@ def test_launch_codex_terminal_extracts_tmux_attach_metadata(
         codex_native._launch_codex_terminal(
             client,  # type: ignore[arg-type]
             "conv_abc",
-            codex_args=(),
+            extra_args=(),
             command="/opt/codex/bin/codex",
             thread_id="thread_123",
             remote_url="ws://127.0.0.1:9876",

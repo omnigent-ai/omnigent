@@ -146,14 +146,14 @@ def resolve_hermes_executable(
 
 
 def build_hermes_launch(
-    hermes_args: Sequence[str],
+    extra_args: Sequence[str],
     *,
     env: Mapping[str, str] | None = None,
     which: Callable[[str], str | None] | None = None,
 ) -> NativeHermesLaunch:
     """Build the argv for a native Hermes process."""
     executable = resolve_hermes_executable(env=env, which=which)
-    return NativeHermesLaunch(executable=executable, argv=[executable, *hermes_args])
+    return NativeHermesLaunch(executable=executable, argv=[executable, *extra_args])
 
 
 def run_hermes_native(
@@ -161,7 +161,6 @@ def run_hermes_native(
     server: str | None,
     session_id: str | None,
     extra_args: tuple[str, ...] | None = None,
-    hermes_args: tuple[str, ...] | None = None,
     resume_picker: bool = False,
     auto_open_conversation: bool = False,
 ) -> None:
@@ -170,15 +169,13 @@ def run_hermes_native(
 
     :param server: Resolved Omnigent server URL.
     :param session_id: Optional existing Omnigent conversation id.
-    :param hermes_args: Raw hermes CLI args to persist for the runner-owned TUI.
+    :param extra_args: Raw hermes CLI args to persist for the runner-owned TUI.
     :param resume_picker: ``True`` runs the hermes-native picker.
     :param auto_open_conversation: When ``True``, open the browser conversation
         URL after launch.
     :returns: None after the terminal attach session ends.
     """
-    hermes_args = _normalize_extra_args(
-        extra_args=extra_args, legacy_args=hermes_args, legacy_param="hermes_args"
-    )
+    extra_args = _normalize_extra_args(extra_args)
     _preflight_local_tools()
     if server is None:
         raise click.ClickException(
@@ -192,7 +189,7 @@ def run_hermes_native(
             spec_path,
             session_id=session_id,
             resume_picker=resume_picker,
-            hermes_args=hermes_args,
+            extra_args=extra_args,
             auto_open_conversation=auto_open_conversation,
         )
 
@@ -231,7 +228,7 @@ def _run_with_remote_server(
     *,
     session_id: str | None,
     resume_picker: bool,
-    hermes_args: tuple[str, ...],
+    extra_args: tuple[str, ...],
     auto_open_conversation: bool = False,
 ) -> None:
     """
@@ -241,7 +238,7 @@ def _run_with_remote_server(
     :param spec_path: Generated Hermes wrapper agent spec.
     :param session_id: Optional existing Omnigent session id.
     :param resume_picker: When ``True``, run the hermes-native picker.
-    :param hermes_args: Raw hermes CLI args.
+    :param extra_args: Raw hermes CLI args.
     :param auto_open_conversation: Whether to open the web conversation URL.
     """
     from omnigent.chat import _bundle_agent, _remote_headers
@@ -270,7 +267,7 @@ def _run_with_remote_server(
                     headers=headers,
                     session_id=resolved_session_id,
                     session_bundle=bundle,
-                    hermes_args=hermes_args,
+                    extra_args=extra_args,
                     host_id=host_id,
                     workspace=str(Path.cwd().resolve()),
                     startup_progress=progress,
@@ -307,7 +304,7 @@ async def _prepare_hermes_terminal_via_daemon(
     headers: dict[str, str],
     session_id: str | None,
     session_bundle: bytes | None,
-    hermes_args: tuple[str, ...],
+    extra_args: tuple[str, ...],
     host_id: str,
     workspace: str,
     startup_progress: RunnerStartupProgress | None = None,
@@ -317,7 +314,7 @@ async def _prepare_hermes_terminal_via_daemon(
 
     :returns: Prepared terminal details for attaching.
     """
-    persist_args = list(hermes_args)
+    persist_args = list(extra_args)
     timeout = httpx.Timeout(30.0, read=120.0)
     async with open_daemon_client(base_url, headers, host_id, timeout=timeout) as client:
         reattached = False

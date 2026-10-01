@@ -1503,38 +1503,6 @@ def test_evaluate_policy_post_tool_use_converts_and_returns_context(
     assert captured.err == ""
 
 
-def test_ask_user_question_subcommand_is_a_silent_noop(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    """
-    The retired ``ask-user-question`` forwarder exits 0 with no output.
-
-    Settings written before it was retired still invoke it until the
-    terminal restarts. It must never reach the server — that parked a
-    second elicitation for the question — and must not block the tool,
-    so Claude Code proceeds to the PermissionRequest hook.
-    """
-    monkeypatch.setattr(
-        claude_native_hook,
-        "_post_hook_with_reattach",
-        lambda *_args, **_kwargs: pytest.fail("retired ask-user-question hook posted"),
-    )
-    payload = {
-        "hook_event_name": "PreToolUse",
-        "tool_name": "AskUserQuestion",
-        "tool_input": {"questions": []},
-        "permission_mode": "bypassPermissions",
-    }
-    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(payload)))
-
-    exit_code = claude_native_hook.main(["ask-user-question", "--bridge-dir", str(tmp_path)])
-
-    captured = capsys.readouterr()
-    assert exit_code == 0
-    assert captured.out == ""
-    assert captured.err == ""
-
-
 @pytest.mark.parametrize("mode", ["connect_error", "non_2xx", "empty_body", "malformed_json"])
 def test_evaluate_policy_pre_tool_use_fails_closed_when_verdict_unavailable(
     tmp_path: Path,

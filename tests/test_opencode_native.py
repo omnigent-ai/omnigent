@@ -596,7 +596,7 @@ def test_run_with_remote_server_aligns_cwd_before_daemon_prepare(
         tmp_path / "spec.yaml",
         session_id="conv_abc",
         resume_picker=False,
-        opencode_args=(),
+        extra_args=(),
     )
 
     assert order == ["align", "ensure-daemon", "prepare", "attach"]
@@ -666,7 +666,7 @@ def test_run_with_remote_server_records_launch_after_create(
         tmp_path / "spec.yaml",
         session_id=None,
         resume_picker=False,
-        opencode_args=(),
+        extra_args=(),
     )
 
     assert order == ["ensure-daemon", "prepare", "record", "attach"]
