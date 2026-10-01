@@ -2484,13 +2484,8 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       // (`failedSendDraft` is conversation-scoped); the composer reads whichever
       // conversation is active and guards on the id before restoring.
       const draftSessionId = postedSessionId ?? submitConversationId;
-      // An Omnigent error code means the server itself answered: it persisted
-      // the message but refused to dispatch it (e.g. the runner rejected the
-      // forward), so the item turning up in the transcript, now or in a later
-      // snapshot, must not retract the draft. A transport failure or a
-      // code-less proxy error leaves the send's fate unknown, and a persisted
-      // item then does prove delivery, unless this was the untouched retry of
-      // a refused send: its item predates the attempt (see `retriesRefusedSend`).
+      // A coded error confirms refusal; a transport failure leaves delivery
+      // unknown unless this retries a previously refused send.
       const answeredWithRefusal = err instanceof ApiError && err.code !== null;
       const serverRefused = answeredWithRefusal || retriesRefusedSend;
       // A network failure can lose only the POST's response: if the message's
@@ -6435,8 +6430,10 @@ function retractDeliveredSendDraft(
  * rejected that very item: the server persists the rejection, item id included,
  * before answering the POST, so a refusal whose answer was lost still surfaces
  * here. Such a draft is flagged `serverRefused` and kept, text and retry id
- * included. Servers predating the item id record only the session-wide failure,
- * which then stands for any draft the snapshot holds.
+ * included. An attributed rejection speaks for its item whatever the session is
+ * doing now; the unattributed record of a server predating the item id stands
+ * for any draft the snapshot holds, but only while the session is still
+ * `failed` by it.
  *
  * @param s - The conversation's state.
  * @param itemIds - Item ids the snapshot holds.
@@ -6449,10 +6446,10 @@ function reconcileSendDraftWithSnapshot(
   session: Session,
 ): Partial<ChatState> {
   const rejection =
-    session.status === "failed" && session.lastTaskError?.code === "runner_rejected_event"
-      ? session.lastTaskError
-      : null;
-  if (rejection === null) return retractDeliveredSendDraft(s, itemIds, "persisted");
+    session.lastTaskError?.code === "runner_rejected_event" ? session.lastTaskError : null;
+  if (rejection === null || (rejection.item_id === undefined && session.status !== "failed")) {
+    return retractDeliveredSendDraft(s, itemIds, "persisted");
+  }
   const refused = (stableId: string | undefined): boolean =>
     stableId !== undefined &&
     itemIds.has(stableId) &&

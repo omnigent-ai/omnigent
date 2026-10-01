@@ -12160,11 +12160,16 @@ describe("chatStore — startStreamPump reconnect loop", () => {
   });
 
   /**
-   * Serve `id`'s snapshot as failed by a runner rejection: the server records
-   * the rejection (naming `rejectedItemId` when it knows it) before answering
-   * the POST, so it is there even when that answer never reached the client.
+   * Serve `id`'s snapshot with a recorded runner rejection: the server records
+   * it (naming `rejectedItemId` when it knows it) before answering the POST, so
+   * it is there even when that answer never reached the client. `status` is
+   * `failed` right after the rejection, or what a later send left behind.
    */
-  function serveRunnerRejectedSnapshot(id: string, rejectedItemId?: string): void {
+  function serveRunnerRejectedSnapshot(
+    id: string,
+    rejectedItemId?: string,
+    status: "failed" | "running" = "failed",
+  ): void {
     const routed = fetchMock.getMockImplementation()!;
     fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
       if (
@@ -12174,7 +12179,7 @@ describe("chatStore — startStreamPump reconnect loop", () => {
         return mockResponse({
           id,
           agent_id: "agent_xyz",
-          status: "failed",
+          status,
           created_at: 0,
           items: sessionSnapshots.get(id) ?? [],
           last_task_error: {
@@ -12198,11 +12203,12 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     id: string,
     stableId: string,
     rejectedItemId?: string,
+    status: "failed" | "running" = "failed",
   ): Promise<ReturnType<typeof useChatStore.getState>> {
     const before = userMessage(`${id}_pre`, "before the gap");
     seedSession(id, [before]);
     const sinks = routeStreamOpens();
-    serveRunnerRejectedSnapshot(id, rejectedItemId);
+    serveRunnerRejectedSnapshot(id, rejectedItemId, status);
     const controller = new AbortController();
     useChatStore.setState({
       conversationId: id,
@@ -12277,6 +12283,40 @@ describe("chatStore — startStreamPump reconnect loop", () => {
       "f".repeat(32),
     );
 
+    expect(state.restoredSendDraft).toMatchObject({ stableId, delivered: true });
+    expect(state.pendingRetryStableId).toBeNull();
+  });
+
+  it("keeps an attributed rejection in force after the session has moved on", async () => {
+    const stableId = "e".repeat(32);
+    // Another client's send has since taken the session to `running`; the
+    // recorded rejection still names our item, and nothing has run it.
+    const state = await reconnectAfterRunnerRejection(
+      "conv_draft_rejected_running",
+      stableId,
+      stableId,
+      "running",
+    );
+
+    expect(state.restoredSendDraft).toMatchObject({
+      stableId,
+      delivered: false,
+      serverRefused: true,
+    });
+    expect(state.pendingRetryStableId).toBe(stableId);
+  });
+
+  it("lets an unattributed rejection lapse once the session is no longer failed", async () => {
+    const stableId = "e".repeat(32);
+    const state = await reconnectAfterRunnerRejection(
+      "conv_draft_rejected_old_running",
+      stableId,
+      undefined,
+      "running",
+    );
+
+    // With no item to match, an older server's session-wide record speaks only
+    // while the session is still failed by it; afterwards the item is delivery.
     expect(state.restoredSendDraft).toMatchObject({ stableId, delivered: true });
     expect(state.pendingRetryStableId).toBeNull();
   });
