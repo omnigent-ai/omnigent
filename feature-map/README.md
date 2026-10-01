@@ -31,17 +31,19 @@ check that they exist at the checkout revision before using them.
 - Launch the isolated environment from the [skill](skills/verify-omnigent/SKILL.md#launch). It
   starts a server, runner, and mock model server on private ports with its own
   config, data, Claude, and Codex directories.
-- Run every drive through `verify-env run -- ...` (or, in CI,
+- Run drives that reuse this instance through `verify-env run -- ...` (or, in CI,
   `python -m dev.repro_env exec -- ...`) so the process receives the
-  environment's server, model, and runner URLs.
+  environment's server, model, and runner URLs. Tests marked "own environment"
+  and component tests use the separate commands in each feature file.
 - Never drive an instance this run did not start. A host daemon, a developer
   server, or another agent's environment is out of bounds.
 
 ## Driving conventions
 
 - Prefer an existing test over hand-driving. Each feature file names the tests
-  that exercise its entry points. Run them with `--ui-skip-build`, recording
-  enabled, and an output directory under the evidence location.
+  that exercise its entry points. For E2E UI tests, use `--ui-skip-build` after
+  building this checkout, recording enabled, and an output directory under the
+  evidence location. Server and component tests do not use browser flags.
 - Hand-drive only the entry points no test covers, using Playwright against
   `OMNIGENT_REPRO_SERVER_URL`. Use roles and accessible names first.
 - Script model replies with the mock helpers in `tests/e2e_ui/conftest.py`
@@ -91,11 +93,12 @@ user-visible behavior. It then uses exactly these four H2 sections in order:
   terminal, shell terminals, and terminal reattachment.
 - [Native harnesses](./native-harnesses.md) is the matrix of every native
   harness against launch, authentication, model and effort selection,
-  approvals, resume, and terminal behavior.
+  approvals, resume, and terminal behavior, with Codex disconnect test boundaries.
 - [Login and host authentication](./login-and-host-auth.md) covers
-  `omnigent login`, host daemon credentials, and Databricks auth modes.
-- [Sessions](./sessions.md) covers the sidebar, fork, archive, reconnect,
-  and resume.
+  `omnigent login`, host daemon credentials, Databricks auth modes, and embedded
+  authentication for project writes.
+- [Sessions](./sessions.md) covers the sidebar, whole-session and message forks,
+  custom-agent targets, fork access checks, archive, reconnect, and resume.
 
 ## Not yet mapped
 
@@ -141,6 +144,12 @@ map an area, remove it here in the same change.
   `omnigent copilot`
 - Integrations, extensions, and remote sandboxes: `omnigent integration`,
   `omnigent extensions`, `omnigent sandbox`
+
+**Partly mapped:** embedded authentication covers project writes and supporting
+account-context tests; other resource APIs and real identity-provider journeys
+remain unmapped. Native disconnect recipes cover Codex transport/startup and
+browser stream recovery, not live reconnect across every harness. The
+header-menu/custom-agent fork combination still needs a manual browser drive.
 
 **No UI test lane yet:** Slack, the iOS and Android apps, policies and cost
 budgets, MCP servers, sandbox providers, and smart routing.
