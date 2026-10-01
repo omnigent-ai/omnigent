@@ -629,7 +629,7 @@ def build_native_relay_tool_schemas(
         from omnigent.tools.local import LocalToolLoadError
         from omnigent.tools.manager import ToolManager
 
-        effective_workdir = local_tool_workdir
+        effective_workdir = _coerce_local_tool_workdir(local_tool_workdir)
         manager: ToolManager | None = None
         relay_local_names: frozenset[str] = frozenset()
         try:
@@ -1002,6 +1002,13 @@ def should_dispatch_locally(tool_name: str) -> bool:
     return tool_name in _ALL_LOCAL_TOOLS
 
 
+def _coerce_local_tool_workdir(workdir: Path | str | None) -> Path | None:
+    """Normalize bundle/workdir inputs for granted-surface and ToolManager paths."""
+    if workdir is None:
+        return None
+    return workdir if isinstance(workdir, Path) else Path(workdir)
+
+
 # Granted tool names per live AgentSpec + effective harness, keyed by
 # ``id(spec)`` because AgentSpec is an unhashable dataclass. The weakref
 # guards against id reuse after the spec is garbage-collected.
@@ -1056,6 +1063,7 @@ def _granted_tool_names(
     :raises Exception: Propagates ``ToolManager`` construction failures so
         callers can fail closed instead of guessing at the surface.
     """
+    local_tool_workdir = _coerce_local_tool_workdir(local_tool_workdir)
     workdir_key = str(local_tool_workdir.resolve()) if local_tool_workdir is not None else None
     cache_key = (id(agent_spec), harness, workdir_key)
     cached = _granted_tool_names_cache.get(cache_key)
@@ -1142,6 +1150,7 @@ def _is_spec_local_python_tool(
 ) -> bool:
     if agent_spec is None:
         return False
+    local_tool_workdir = _coerce_local_tool_workdir(local_tool_workdir)
     local_tools = agent_spec.local_tools or []
     if any(
         info.name == tool_name and info.language == "python" and info.path for info in local_tools
@@ -6641,9 +6650,9 @@ async def execute_tool(
     # MCP dispatch resolves the target against the spec inside the MCP
     # manager; every other branch is gated on the spec's granted surface.
     resolved_local_workdir = (
-        runner_workspace
+        _coerce_local_tool_workdir(runner_workspace)
         if local_tool_workdir is _UNSET_LOCAL_TOOL_WORKDIR
-        else cast(Path | None, local_tool_workdir)
+        else _coerce_local_tool_workdir(cast(Path | str | None, local_tool_workdir))
     )
     if mcp_manager is None:
         refusal = _ungranted_tool_reason(
@@ -6885,11 +6894,7 @@ async def execute_tool(
         elif _is_spec_local_python_tool(
             tool_name,
             agent_spec,
-            local_tool_workdir=(
-                runner_workspace
-                if local_tool_workdir is _UNSET_LOCAL_TOOL_WORKDIR
-                else cast(Path | None, local_tool_workdir)
-            ),
+            local_tool_workdir=resolved_local_workdir,
         ):
             output = await _execute_local_python_tool(
                 tool_name,
@@ -6899,11 +6904,7 @@ async def execute_tool(
                 task_id=task_id,
                 agent_id=agent_id,
                 runner_workspace=runner_workspace,
-                local_tool_workdir=(
-                    runner_workspace
-                    if local_tool_workdir is _UNSET_LOCAL_TOOL_WORKDIR
-                    else cast(Path | None, local_tool_workdir)
-                ),
+                local_tool_workdir=resolved_local_workdir,
             )
         elif _is_uc_function_tool(tool_name, agent_spec):
             output = await _execute_uc_function_tool(tool_name, args, agent_spec=agent_spec)
