@@ -67,6 +67,7 @@ import {
   ACTIVE_SESSION_STATUS_RECONCILE_INTERVAL_MS,
   ACTIVE_SESSION_STATUS_RECONCILE_TIMEOUT_MS,
   beginLocalConversation,
+  committedItemProvesDelivery,
   consumePendingInitialPrompt,
   handleSessionEvent,
   hydrateLocalConversation,
@@ -5684,7 +5685,7 @@ describe("chatStore — delivered-but-unacked send", () => {
     expect(useChatStore.getState().failedSendDraft).toBeNull();
   });
 
-  it("lets the transcript item stand as delivery when the verdict fetch fails too", async () => {
+  it("restores the draft unsettled when the verdict fetch fails too", async () => {
     const stableId = "c".repeat(32);
     failPostWithItemInTranscript(stableId, () => {
       throw new TypeError("Failed to fetch");
@@ -5692,9 +5693,17 @@ describe("chatStore — delivered-but-unacked send", () => {
 
     await useChatStore.getState().send("resend me", "agent_xyz");
 
-    // Same rule as on reconnect: with no refusal on record, the item is the
-    // durable trace of a lost acknowledgement.
-    expect(useChatStore.getState().failedSendDraft).toBeNull();
+    // Nothing affirmative either way: the text comes back, flagged so the
+    // composer does not drop it on the stale item, and the next live
+    // acknowledgement or snapshot settles it.
+    const draft = useChatStore.getState().failedSendDraft;
+    expect(draft).toMatchObject({
+      text: "resend me",
+      stableId,
+      serverRefused: false,
+      unsettled: true,
+    });
+    expect(committedItemProvesDelivery(useChatStore.getState().blocks, draft!)).toBe(false);
   });
 
   it("mints a fresh stable id when the restored draft was edited before the resend", async () => {

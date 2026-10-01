@@ -816,6 +816,13 @@ export interface ConversationState {
      * `session_input_consumed` can. `false` for a plain transport failure.
      */
     serverRefused?: boolean;
+    /**
+     * The POST got no answer and the follow-up verdict fetch failed too, so
+     * the item in the transcript may predate the runner's verdict. The composer
+     * restores the text regardless; the next live acknowledgement or snapshot
+     * settles it (see `committedItemProvesDelivery`).
+     */
+    unsettled?: boolean;
   } | null;
   /**
    * Stable id set by the failedSendDraft restore path so the next send()
@@ -2493,6 +2500,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       // A live `session_input_consumed` for this very attempt proves the runner
       // took it, whatever became of the POST's answer.
       let deliveredDespiteFailure = inFlightSends.get(stableId) === true;
+      let unsettled = false;
       if (
         !deliveredDespiteFailure &&
         !serverRefused &&
@@ -2502,11 +2510,12 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         // Only a snapshot can have put the item in the transcript, and it may
         // predate the runner's verdict (the server persists before it forwards).
         // The server records a rejection before answering the POST, so a fresh
-        // snapshot settles it; if that fetch fails too, the item stands as
-        // delivery, as it does on reconnect.
+        // snapshot settles it; if that fetch fails too, the draft comes back
+        // unsettled and the next live acknowledgement or snapshot decides.
         const verdict = await sendVerdictFromServer(draftSessionId, stableId);
         if (verdict === "refused") serverRefused = true;
-        else deliveredDespiteFailure = true;
+        else if (verdict === "delivered") deliveredDespiteFailure = true;
+        else unsettled = true;
       }
       if (
         !callerHandlesError &&
@@ -2521,6 +2530,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
             files: files ?? [],
             stableId,
             serverRefused,
+            ...(unsettled ? { unsettled: true } : {}),
             ...(opts?.replyDraft ? { replyDraft: opts.replyDraft } : {}),
           },
         });
@@ -6329,19 +6339,21 @@ export function hasCommittedItem(blocks: AnyBlock[], itemId: string): boolean {
  * The item under the send's stable id must be in `blocks`, and the server must
  * not have refused the send: a refused message is persisted too, so its
  * presence in the transcript says nothing about the runner having taken it
- * (see `retractDeliveredSendDraft`).
+ * (see `retractDeliveredSendDraft`). Nor is an unsettled draft proven: the item
+ * it sees may predate the verdict (see `failedSendDraft.unsettled`).
  *
  * @param blocks - The conversation's rendered blocks.
- * @param draft - The failed send's stable id and refusal status.
+ * @param draft - The failed send's stable id and what is known of its fate.
  * @returns `true` when restoring the draft would prime a duplicate send.
  */
 export function committedItemProvesDelivery(
   blocks: AnyBlock[],
-  draft: { stableId?: string; serverRefused?: boolean },
+  draft: { stableId?: string; serverRefused?: boolean; unsettled?: boolean },
 ): boolean {
   return (
     draft.stableId !== undefined &&
     draft.serverRefused !== true &&
+    draft.unsettled !== true &&
     hasCommittedItem(blocks, draft.stableId)
   );
 }
