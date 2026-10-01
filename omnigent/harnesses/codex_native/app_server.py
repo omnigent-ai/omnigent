@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import copy
 import hashlib
 import json
 import logging
@@ -919,9 +918,14 @@ def shared_mcp_server_config_matches(
     config_path = codex_home / "config.toml"
     if not config_path.exists():
         return not expected
-    document = tomlkit.parse(config_path.read_text(encoding="utf-8")).unwrap()
+    try:
+        document = tomlkit.parse(config_path.read_text(encoding="utf-8")).unwrap()
+    except (OSError, ValueError):
+        # Keep the already-running app-server usable while its private file is
+        # incomplete. A cold launch still validates the private layer loudly.
+        return True
     configured = document.get("mcp_servers")
-    actual = copy.deepcopy(configured) if isinstance(configured, dict) else {}
+    actual = dict(configured) if isinstance(configured, dict) else {}
     actual.pop("omnigent", None)
     return actual == expected
 

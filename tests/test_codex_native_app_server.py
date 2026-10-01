@@ -2469,6 +2469,11 @@ def test_shared_mcp_server_config_matches_keeps_live_session_on_invalid_source(
     assert app_server.shared_mcp_server_config_matches(
         private_home, source_home, "removed", codex_version=(0, 154, 0)
     )
+    (source_home / "config.toml").write_text("", encoding="utf-8")
+    (private_home / "config.toml").write_text("[mcp_servers", encoding="utf-8")
+    assert app_server.shared_mcp_server_config_matches(
+        private_home, source_home, None, codex_version=(0, 154, 0)
+    )
 
 
 async def test_start_can_delegate_global_process_reconciliation(

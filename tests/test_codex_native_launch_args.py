@@ -355,6 +355,36 @@ def test_effective_mcp_servers_merge_shared_base_and_selected_profile(tmp_path: 
     }
 
 
+def test_effective_mcp_servers_support_legacy_inline_profiles(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "config.toml").write_text(
+        '[mcp_servers.base]\ncommand = "base"\n'
+        '[profiles.legacy.mcp_servers.profile]\ncommand = "profile"\n'
+    )
+
+    assert effective_codex_mcp_servers(source, "legacy", codex_version=(0, 120, 0)) == {
+        "base": {"command": "base"},
+        "profile": {"command": "profile"},
+    }
+
+
+def test_effective_mcp_servers_rejects_invalid_inventory_and_missing_profile(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    config = source / "config.toml"
+    config.write_text('mcp_servers = "invalid"\n', encoding="utf-8")
+
+    with pytest.raises(ValueError, match="mcp_servers configuration must be a table"):
+        effective_codex_mcp_servers(source, None, codex_version=(0, 154, 0))
+
+    config.write_text("", encoding="utf-8")
+    with pytest.raises(FileNotFoundError):
+        effective_codex_mcp_servers(source, "missing", codex_version=(0, 154, 0))
+
+
 async def test_remote_resume_add_dir_preserves_configured_roots(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
