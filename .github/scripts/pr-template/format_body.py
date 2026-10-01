@@ -62,10 +62,24 @@ def format_body(body: str) -> str:
     )
     body = _append_section(
         body,
+        "Release notes",
+        "Should this change be included in the release notes? Choose exactly one.\n\n"
+        "- [ ] No — no noteworthy user-facing change.\n"
+        "- [ ] Yes — include the entry in the Changelog section below.\n\n"
+        "<!-- Choose Yes for user-facing features, bug fixes, and UX improvements, "
+        "including small changes. Breaking changes must choose Yes and describe "
+        "the compatibility impact in Changelog. Choose No for internal changes "
+        "with no user impact. Keep this section and both checkboxes. This records "
+        "the author's recommendation; maintainers curate the release notes. -->",
+    )
+    body = _append_section(
+        body,
         "Changelog",
         "<!-- One line, in the user's voice, describing the user-facing change; "
-        "the category comes from the 'Type of change' boxes above. DELETE this "
-        "section if the change isn't noteworthy (a Breaking change must keep it). "
+        "the category comes from the 'Type of change' boxes above. If Release "
+        "notes is Yes, replace the placeholder with your entry. If No, DELETE "
+        "this section; the complete changelog still credits the PR using its title. "
+        "A Breaking change must keep this section and describe compatibility impact. "
         "-->\n\n<Add a line to describe the change, else delete this section>",
     )
     return body.rstrip() + "\n"

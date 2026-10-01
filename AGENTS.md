@@ -24,7 +24,8 @@ Use `just` for common tasks; run `just --list` for grouped recipes.
 
 When you open a pull request, fill in the repo's PR template at
 `.github/pull_request_template.md` (case-sensitive on Linux — note the lowercase
-filename). Keep every section and checkbox row so reviewers can skim them.
+filename). Keep every section and checkbox row so reviewers can skim them,
+except the optional Changelog section as described below.
 
 - **Summary** — what changed and why.
 - **Test Plan** — how you verified it.
@@ -36,6 +37,14 @@ filename). Keep every section and checkbox row so reviewers can skim them.
   each).
 - **Coverage notes** — required if you checked "Manual verification completed"
   or "Not applicable".
+- **Release notes** — choose exactly one Yes/No checkbox and keep both rows.
+  Choose Yes for user-facing features, bug fixes, and UX improvements, even
+  small ones; choose No for internal changes with no user impact. Breaking
+  changes must choose Yes. This is the author's recommendation for maintainers
+  curating the release notes.
+- **Changelog** — if Release notes is Yes, write one line describing the change
+  for users, including compatibility impact for breaking changes. If No, delete
+  this section; the complete changelog still credits the PR using its title.
 
 Generate the description from the actual diff and this session's context — lead
 with the motivation, then the change. Don't pass a `--body` that skips these
