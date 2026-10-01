@@ -31,6 +31,7 @@ from tests.runner.conftest import (
     _sse,
 )
 from tests.runner.helpers import NullServerClient
+from tests.runner.native_helpers import _harness_spec
 
 
 @pytest.fixture(autouse=True)
@@ -75,7 +76,6 @@ async def test_events_effort_change_on_native_session_skips_inject_for_unsupport
     Pins that the validation lives in the runner (where the
     harness-specific knowledge belongs), not in the Omnigent server.
     """
-    from omnigent.spec.types import ExecutorSpec
 
     def _fake_inject(
         bridge_dir: Any,
@@ -94,11 +94,7 @@ async def test_events_effort_change_on_native_session_skips_inject_for_unsupport
 
     monkeypatch.setattr(claude_native_bridge, "inject_slash_command", _fake_inject)
 
-    native_spec = AgentSpec(
-        spec_version=1,
-        name="t",
-        executor=ExecutorSpec(type="omnigent", config={"harness": "claude-native"}),
-    )
+    native_spec = _harness_spec("claude-native")
 
     app, _ = await _build_app_for_spec(native_spec)
 
@@ -141,7 +137,6 @@ async def test_events_effort_change_on_native_session_returns_503_when_bridge_no
     still returns 200 with the persisted value — the next spawn
     will apply the new effort via ``--effort``.
     """
-    from omnigent.spec.types import ExecutorSpec
 
     def _fake_inject(
         bridge_dir: Any,
@@ -157,11 +152,7 @@ async def test_events_effort_change_on_native_session_returns_503_when_bridge_no
 
     monkeypatch.setattr(claude_native_bridge, "inject_slash_command", _fake_inject)
 
-    native_spec = AgentSpec(
-        spec_version=1,
-        name="t",
-        executor=ExecutorSpec(type="omnigent", config={"harness": "claude-native"}),
-    )
+    native_spec = _harness_spec("claude-native")
 
     app, _ = await _build_app_for_spec(native_spec)
 
@@ -207,7 +198,6 @@ async def test_events_effort_change_on_non_native_session_is_204_noop(
     accept the event and 204 — never reach the slash-command injector, never
     forward to the harness scaffold.
     """
-    from omnigent.spec.types import ExecutorSpec
 
     def _fake_inject(
         bridge_dir: Any,
@@ -272,7 +262,6 @@ async def test_events_permission_mode_change_on_native_session_switches_and_echo
     regression returning 204 (or dropping the body) would leave the web UI
     showing a mode the session isn't in.
     """
-    from omnigent.spec.types import ExecutorSpec
 
     calls: list[str] = []
 
@@ -284,11 +273,7 @@ async def test_events_permission_mode_change_on_native_session_switches_and_echo
 
     monkeypatch.setattr(claude_native_bridge, "set_permission_mode", _fake_set_mode)
 
-    native_spec = AgentSpec(
-        spec_version=1,
-        name="t",
-        executor=ExecutorSpec(type="omnigent", config={"harness": "claude-native"}),
-    )
+    native_spec = _harness_spec("claude-native")
 
     app, _ = await _build_app_for_spec(native_spec)
 
@@ -323,7 +308,6 @@ async def test_events_permission_mode_change_returns_503_when_mode_unreachable(
     The Omnigent server treats a non-2xx as "the pane did not move" and skips
     persisting the label, so this must not report success.
     """
-    from omnigent.spec.types import ExecutorSpec
 
     def _fake_set_mode(bridge_dir: Any, *, mode: str, timeout_s: float) -> str:
         """Fail the way an unreachable mode does."""
@@ -332,11 +316,7 @@ async def test_events_permission_mode_change_returns_503_when_mode_unreachable(
 
     monkeypatch.setattr(claude_native_bridge, "set_permission_mode", _fake_set_mode)
 
-    native_spec = AgentSpec(
-        spec_version=1,
-        name="t",
-        executor=ExecutorSpec(type="omnigent", config={"harness": "claude-native"}),
-    )
+    native_spec = _harness_spec("claude-native")
 
     app, _ = await _build_app_for_spec(native_spec)
 
@@ -373,7 +353,6 @@ async def test_events_permission_mode_change_on_non_native_session_is_204_noop(
     No other harness has Claude's shift+tab cycle, so the dispatch must
     short-circuit before reaching the bridge.
     """
-    from omnigent.spec.types import ExecutorSpec
 
     def _fake_set_mode(bridge_dir: Any, *, mode: str, timeout_s: float) -> str:
         """Fail the test if a non-native session reaches the bridge."""
@@ -433,7 +412,6 @@ async def test_events_compact_on_native_session_types_slash_command(
     error instead of the native compact succeeding.
     """
     from omnigent.runner.app import _session_event_queues_ref
-    from omnigent.spec.types import ExecutorSpec
 
     captured: list[Any] = []
 
@@ -450,11 +428,7 @@ async def test_events_compact_on_native_session_types_slash_command(
 
     monkeypatch.setattr(claude_native_bridge, "inject_slash_command", _fake_inject)
 
-    native_spec = AgentSpec(
-        spec_version=1,
-        name="t",
-        executor=ExecutorSpec(type="omnigent", config={"harness": "claude-native"}),
-    )
+    native_spec = _harness_spec("claude-native")
 
     app, _ = await _build_app_for_spec(native_spec)
 
@@ -531,7 +505,6 @@ async def test_events_compact_on_native_session_returns_503_when_bridge_not_read
     server treats a non-200/204 runner response as an error rather
     than silently running its own (wrong) compaction.
     """
-    from omnigent.spec.types import ExecutorSpec
 
     def _fake_inject(
         bridge_dir: Any,
@@ -547,11 +520,7 @@ async def test_events_compact_on_native_session_returns_503_when_bridge_not_read
 
     monkeypatch.setattr(claude_native_bridge, "inject_slash_command", _fake_inject)
 
-    native_spec = AgentSpec(
-        spec_version=1,
-        name="t",
-        executor=ExecutorSpec(type="omnigent", config={"harness": "claude-native"}),
-    )
+    native_spec = _harness_spec("claude-native")
 
     app, _ = await _build_app_for_spec(native_spec)
 
@@ -627,11 +596,7 @@ async def test_events_compact_on_codex_native_types_settles_then_submits(
     monkeypatch.setattr(claude_native_bridge, "_run_tmux", _fake_run_tmux)
     monkeypatch.setattr(runner_app, "time", _RecordingTime())
 
-    codex_native_spec = AgentSpec(
-        spec_version=1,
-        name="t",
-        executor=ExecutorSpec(type="omnigent", config={"harness": "codex-native"}),
-    )
+    codex_native_spec = _harness_spec("codex-native")
 
     conv_id = "9864122f95f2f013c9599f4014725784"
     terminal_registry = TerminalRegistry()
@@ -704,11 +669,7 @@ async def test_events_compact_on_codex_native_returns_503_when_no_terminal() -> 
     Without a running codex terminal the ``/compact`` slash command has
     nowhere to go. 503 tells the caller to reconnect first.
     """
-    codex_native_spec = AgentSpec(
-        spec_version=1,
-        name="t",
-        executor=ExecutorSpec(type="omnigent", config={"harness": "codex-native"}),
-    )
+    codex_native_spec = _harness_spec("codex-native")
 
     conv_id = "4be2f8fe2204fade6a89dafade0a0fd2"
     # Empty registry — no codex terminal registered.
@@ -755,11 +716,7 @@ async def test_events_compact_on_codex_native_returns_503_on_tmux_failure(
 
     monkeypatch.setattr(claude_native_bridge, "_run_tmux", _failing_run_tmux)
 
-    codex_native_spec = AgentSpec(
-        spec_version=1,
-        name="t",
-        executor=ExecutorSpec(type="omnigent", config={"harness": "codex-native"}),
-    )
+    codex_native_spec = _harness_spec("codex-native")
 
     conv_id = "e5d09a0ff8458b2d6abb7f0c7deda0d3"
     terminal_registry = TerminalRegistry()
@@ -824,7 +781,6 @@ async def test_events_compact_on_cursor_native_pastes_summarize_and_raises_spinn
        ``tests/test_cursor_native_forwarder.py``).
     """
     from omnigent.runner.app import _session_event_queues_ref
-    from omnigent.spec.types import ExecutorSpec
 
     monkeypatch.setattr(cursor_native_bridge, "_BRIDGE_ROOT", tmp_path / "cursor-bridge")
 
@@ -836,11 +792,7 @@ async def test_events_compact_on_cursor_native_pastes_summarize_and_raises_spinn
 
     monkeypatch.setattr(cursor_native_bridge, "inject_user_message", _fake_inject)
 
-    cursor_native_spec = AgentSpec(
-        spec_version=1,
-        name="t",
-        executor=ExecutorSpec(type="omnigent", config={"harness": "cursor-native"}),
-    )
+    cursor_native_spec = _harness_spec("cursor-native")
 
     conv_id = "764ebbade28dd774a5d673378c034933"
     app, _ = await _build_app_for_spec(cursor_native_spec)
@@ -934,7 +886,6 @@ async def test_events_compact_on_cursor_native_503_dismisses_spinner_on_inject_f
     latter is unique to cursor's bracketed-paste path.
     """
     from omnigent.runner.app import _session_event_queues_ref
-    from omnigent.spec.types import ExecutorSpec
 
     monkeypatch.setattr(cursor_native_bridge, "_BRIDGE_ROOT", tmp_path / "cursor-bridge")
 
@@ -945,11 +896,7 @@ async def test_events_compact_on_cursor_native_503_dismisses_spinner_on_inject_f
 
     monkeypatch.setattr(cursor_native_bridge, "inject_user_message", _fake_inject)
 
-    cursor_native_spec = AgentSpec(
-        spec_version=1,
-        name="t",
-        executor=ExecutorSpec(type="omnigent", config={"harness": "cursor-native"}),
-    )
+    cursor_native_spec = _harness_spec("cursor-native")
 
     conv_id = uuid.uuid4().hex
     app, _ = await _build_app_for_spec(cursor_native_spec)
@@ -1019,16 +966,11 @@ async def test_events_compact_on_pi_native_enqueues_compact_payload(
     """
     import omnigent.harnesses.pi_native.bridge as pi_native_bridge
     from omnigent.runner.app import _session_event_queues_ref
-    from omnigent.spec.types import ExecutorSpec
 
     conv_id = "03f435963d78fe4ea313325f729eefc5"
     monkeypatch.setattr(pi_native_bridge, "_BRIDGE_ROOT", tmp_path / "pi-bridge")
 
-    pi_native_spec = AgentSpec(
-        spec_version=1,
-        name="t",
-        executor=ExecutorSpec(type="omnigent", config={"harness": "pi-native"}),
-    )
+    pi_native_spec = _harness_spec("pi-native")
 
     app, _ = await _build_app_for_spec(pi_native_spec)
 
@@ -1095,7 +1037,6 @@ async def test_events_compact_on_pi_native_returns_503_when_inbox_unwritable(
     request; the Omnigent server then treats it as not-handled.
     """
     import omnigent.harnesses.pi_native.bridge as pi_native_bridge
-    from omnigent.spec.types import ExecutorSpec
 
     conv_id = "9c52b3dbe1d543718c1678a256017326"
     monkeypatch.setattr(pi_native_bridge, "_BRIDGE_ROOT", tmp_path / "pi-bridge")
@@ -1106,11 +1047,7 @@ async def test_events_compact_on_pi_native_returns_503_when_inbox_unwritable(
 
     monkeypatch.setattr(pi_native_bridge, "enqueue_compact", _boom)
 
-    pi_native_spec = AgentSpec(
-        spec_version=1,
-        name="t",
-        executor=ExecutorSpec(type="omnigent", config={"harness": "pi-native"}),
-    )
+    pi_native_spec = _harness_spec("pi-native")
 
     app, _ = await _build_app_for_spec(pi_native_spec)
 
@@ -1154,7 +1091,6 @@ async def test_events_compact_on_qwen_native_submits_compress_and_raises_spinner
     the ``chat_compression`` record lands (covered in test_qwen_native_forwarder).
     """
     from omnigent.runner.app import _session_event_queues_ref
-    from omnigent.spec.types import ExecutorSpec
 
     captured: list[tuple[Any, str]] = []
 
@@ -1164,11 +1100,7 @@ async def test_events_compact_on_qwen_native_submits_compress_and_raises_spinner
 
     monkeypatch.setattr(qwen_native_bridge, "submit_user_message", _fake_submit)
 
-    qwen_native_spec = AgentSpec(
-        spec_version=1,
-        name="t",
-        executor=ExecutorSpec(type="omnigent", config={"harness": "qwen-native"}),
-    )
+    qwen_native_spec = _harness_spec("qwen-native")
 
     conv_id = "233c1fedaaeb18c91267904e79b7d10c"
     app, _ = await _build_app_for_spec(qwen_native_spec)
@@ -1218,7 +1150,6 @@ async def test_events_compact_on_qwen_native_503_dismisses_spinner_on_submit_fai
 ) -> None:
     """A submit failure surfaces as 503 AND dismisses the spinner (in_progress->failed)."""
     from omnigent.runner.app import _session_event_queues_ref
-    from omnigent.spec.types import ExecutorSpec
 
     def _fake_submit(bridge_dir: Any, *, content: str) -> None:
         del bridge_dir, content
@@ -1226,11 +1157,7 @@ async def test_events_compact_on_qwen_native_503_dismisses_spinner_on_submit_fai
 
     monkeypatch.setattr(qwen_native_bridge, "submit_user_message", _fake_submit)
 
-    qwen_native_spec = AgentSpec(
-        spec_version=1,
-        name="t",
-        executor=ExecutorSpec(type="omnigent", config={"harness": "qwen-native"}),
-    )
+    qwen_native_spec = _harness_spec("qwen-native")
 
     conv_id = "7c94e9a0306b300d81233cccef543a84"
     app, _ = await _build_app_for_spec(qwen_native_spec)
@@ -1360,14 +1287,9 @@ async def _drive_opencode_native_compact(
     from omnigent.harnesses.opencode_native.bridge import OpenCodeNativeBridgeState
     from omnigent.harnesses.opencode_native.client import OpenCodeSession
     from omnigent.runner.app import _AUTO_OPENCODE_SERVERS, _session_event_queues_ref
-    from omnigent.spec.types import ExecutorSpec
     from tests.runner.helpers import make_test_terminal_instance
 
-    opencode_native_spec = AgentSpec(
-        spec_version=1,
-        name="t",
-        executor=ExecutorSpec(type="omnigent", config={"harness": "opencode-native"}),
-    )
+    opencode_native_spec = _harness_spec("opencode-native")
 
     async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
         """Return the opencode-native spec for any agent_id."""
@@ -1695,7 +1617,6 @@ async def test_events_compact_on_non_native_session_is_204_noop(
     slash-command injector. The server then returns a 400 to the client
     (SDK harnesses control their own context; AP-side compaction is not available).
     """
-    from omnigent.spec.types import ExecutorSpec
 
     def _fake_inject(
         bridge_dir: Any,
@@ -1792,7 +1713,6 @@ async def test_events_native_dispatch_resolves_bridge_id_via_label_lookup(
     the assertion fails.
     """
     from omnigent.runner import app as runner_app_module
-    from omnigent.spec.types import ExecutorSpec
 
     captured_bridge_dir: list[Any] = []
 
@@ -1816,11 +1736,7 @@ async def test_events_native_dispatch_resolves_bridge_id_via_label_lookup(
         _fake_bridge_id_lookup,
     )
 
-    native_spec = AgentSpec(
-        spec_version=1,
-        name="t",
-        executor=ExecutorSpec(type="omnigent", config={"harness": "claude-native"}),
-    )
+    native_spec = _harness_spec("claude-native")
 
     app, _ = await _build_app_for_spec(native_spec)
 
@@ -1873,7 +1789,6 @@ async def test_events_model_change_on_native_session_types_slash_command(
     assembles the right slash command.
     """
     from omnigent.runner.app import _session_event_queues_ref
-    from omnigent.spec.types import ExecutorSpec
 
     captured: list[Any] = []
 
@@ -1897,11 +1812,7 @@ async def test_events_model_change_on_native_session_types_slash_command(
         lambda _bridge_dir: {"ANTHROPIC_CUSTOM_MODEL_OPTION": "claude-opus-4-7"},
     )
 
-    native_spec = AgentSpec(
-        spec_version=1,
-        name="t",
-        executor=ExecutorSpec(type="omnigent", config={"harness": "claude-native"}),
-    )
+    native_spec = _harness_spec("claude-native")
 
     app, _ = await _build_app_for_spec(native_spec)
 
@@ -1977,7 +1888,6 @@ async def _post_model_change_with_status_sequence(
     :returns: The ``/events`` HTTP response.
     """
     from omnigent.runner import app as runner_app_module
-    from omnigent.spec.types import ExecutorSpec
 
     commands: list[str] = []
 
@@ -2034,11 +1944,7 @@ async def _post_model_change_with_status_sequence(
     monkeypatch.setattr(runner_app_module, "_CLAUDE_MODEL_CONFIRM_TIMEOUT_S", 0.3)
     monkeypatch.setattr(runner_app_module, "_CLAUDE_MODEL_CONFIRM_POLL_S", 0.01)
 
-    native_spec = AgentSpec(
-        spec_version=1,
-        name="t",
-        executor=ExecutorSpec(type="omnigent", config={"harness": "claude-native"}),
-    )
+    native_spec = _harness_spec("claude-native")
 
     async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
         del agent_id, session_id
@@ -2356,11 +2262,7 @@ async def test_events_model_change_applies_the_picked_alias_verbatim(
         lambda *, spec: config,
     )
 
-    native_spec = AgentSpec(
-        spec_version=1,
-        name="t",
-        executor=ExecutorSpec(type="omnigent", config={"harness": "claude-native"}),
-    )
+    native_spec = _harness_spec("claude-native")
 
     app, _ = await _build_app_for_spec(native_spec)
     conv_id = uuid.uuid4().hex
@@ -2396,7 +2298,6 @@ async def test_events_model_change_rejects_a_model_the_picker_cannot_spell(
     old model while the handler reports success, so the session's recorded
     model diverges from the one it is running.
     """
-    from omnigent.spec.types import ExecutorSpec
 
     captured: list[Any] = []
 
@@ -2413,11 +2314,7 @@ async def test_events_model_change_rejects_a_model_the_picker_cannot_spell(
         lambda _bridge_dir: {"ANTHROPIC_DEFAULT_OPUS_MODEL": "databricks-claude-opus-5"},
     )
 
-    native_spec = AgentSpec(
-        spec_version=1,
-        name="t",
-        executor=ExecutorSpec(type="omnigent", config={"harness": "claude-native"}),
-    )
+    native_spec = _harness_spec("claude-native")
 
     app, _ = await _build_app_for_spec(native_spec)
 
@@ -2453,7 +2350,6 @@ async def test_events_model_change_on_kiro_session_types_slash_command(
     Mirrors ``test_events_model_change_on_native_session_types_slash_command``.
     """
     from omnigent.runner.app import _session_event_queues_ref
-    from omnigent.spec.types import ExecutorSpec
 
     captured: list[Any] = []
 
@@ -2463,11 +2359,7 @@ async def test_events_model_change_on_kiro_session_types_slash_command(
 
     monkeypatch.setattr(kiro_native_bridge, "inject_model_command", _fake_inject)
 
-    native_spec = AgentSpec(
-        spec_version=1,
-        name="t",
-        executor=ExecutorSpec(type="omnigent", config={"harness": "kiro-native"}),
-    )
+    native_spec = _harness_spec("kiro-native")
 
     app, _ = await _build_app_for_spec(native_spec)
 
@@ -2520,7 +2412,6 @@ async def test_events_model_change_on_native_session_skips_inject_for_empty_or_n
     Pins that the empty-value validation lives in the runner native
     handler, not in the Omnigent server.
     """
-    from omnigent.spec.types import ExecutorSpec
 
     def _fake_inject(
         bridge_dir: Any,
@@ -2539,11 +2430,7 @@ async def test_events_model_change_on_native_session_skips_inject_for_empty_or_n
 
     monkeypatch.setattr(claude_native_bridge, "inject_slash_command", _fake_inject)
 
-    native_spec = AgentSpec(
-        spec_version=1,
-        name="t",
-        executor=ExecutorSpec(type="omnigent", config={"harness": "claude-native"}),
-    )
+    native_spec = _harness_spec("claude-native")
 
     app, _ = await _build_app_for_spec(native_spec)
 
@@ -2582,7 +2469,6 @@ async def test_events_model_change_on_native_session_returns_503_when_bridge_not
     swallows this 503 and still returns 200 with the persisted
     value — the next spawn applies the new model via ``--model``.
     """
-    from omnigent.spec.types import ExecutorSpec
 
     def _fake_inject(
         bridge_dir: Any,
@@ -2598,11 +2484,7 @@ async def test_events_model_change_on_native_session_returns_503_when_bridge_not
 
     monkeypatch.setattr(claude_native_bridge, "inject_slash_command", _fake_inject)
 
-    native_spec = AgentSpec(
-        spec_version=1,
-        name="t",
-        executor=ExecutorSpec(type="omnigent", config={"harness": "claude-native"}),
-    )
+    native_spec = _harness_spec("claude-native")
 
     app, _ = await _build_app_for_spec(native_spec)
 
@@ -2644,7 +2526,6 @@ async def test_events_model_change_on_non_native_session_is_204_noop(
     must accept the event with a 204 — never reach the slash-command
     injector.
     """
-    from omnigent.spec.types import ExecutorSpec
 
     def _fake_inject(
         bridge_dir: Any,
@@ -2705,7 +2586,6 @@ async def test_events_model_change_on_cursor_native_session_types_slash_command(
     (not the claude slash injector and not a 204 no-op) and pass the
     model id straight through.
     """
-    from omnigent.spec.types import ExecutorSpec
 
     captured: list[tuple[Any, str, str | None, float]] = []
 
@@ -2721,11 +2601,7 @@ async def test_events_model_change_on_cursor_native_session_types_slash_command(
 
     monkeypatch.setattr(cursor_native_bridge, "inject_model_command", _fake_inject)
 
-    native_spec = AgentSpec(
-        spec_version=1,
-        name="t",
-        executor=ExecutorSpec(type="omnigent", config={"harness": "cursor-native"}),
-    )
+    native_spec = _harness_spec("cursor-native")
 
     app, _ = await _build_app_for_spec(native_spec)
 
@@ -2768,7 +2644,6 @@ async def test_events_model_change_on_cursor_native_session_skips_inject_for_emp
     clear only takes effect on the next spawn — mirrors the claude-native
     skip test.
     """
-    from omnigent.spec.types import ExecutorSpec
 
     def _fake_inject(bridge_dir: Any, *, model: str, timeout_s: float) -> None:
         """Fail the test if the runner reaches inject for an empty value."""
@@ -2777,11 +2652,7 @@ async def test_events_model_change_on_cursor_native_session_skips_inject_for_emp
 
     monkeypatch.setattr(cursor_native_bridge, "inject_model_command", _fake_inject)
 
-    native_spec = AgentSpec(
-        spec_version=1,
-        name="t",
-        executor=ExecutorSpec(type="omnigent", config={"harness": "cursor-native"}),
-    )
+    native_spec = _harness_spec("cursor-native")
 
     app, _ = await _build_app_for_spec(native_spec)
 
@@ -2817,7 +2688,6 @@ async def test_events_model_change_on_cursor_native_session_returns_503_when_not
     (pane not attached yet) returns 503 with the cursor-specific error
     code; Omnigent server swallows it and the next spawn applies ``--model``.
     """
-    from omnigent.spec.types import ExecutorSpec
 
     def _fake_inject(
         bridge_dir: Any,
@@ -2832,11 +2702,7 @@ async def test_events_model_change_on_cursor_native_session_returns_503_when_not
 
     monkeypatch.setattr(cursor_native_bridge, "inject_model_command", _fake_inject)
 
-    native_spec = AgentSpec(
-        spec_version=1,
-        name="t",
-        executor=ExecutorSpec(type="omnigent", config={"harness": "cursor-native"}),
-    )
+    native_spec = _harness_spec("cursor-native")
 
     app, _ = await _build_app_for_spec(native_spec)
 
@@ -2877,13 +2743,8 @@ async def test_events_effort_change_on_cursor_native_session_is_disabled_noop(
     effort value (cursor-native is excluded from the effort_change gate, and the
     effort injector no longer exists).
     """
-    from omnigent.spec.types import ExecutorSpec
 
-    native_spec = AgentSpec(
-        spec_version=1,
-        name="t",
-        executor=ExecutorSpec(type="omnigent", config={"harness": "cursor-native"}),
-    )
+    native_spec = _harness_spec("cursor-native")
 
     app, _ = await _build_app_for_spec(native_spec)
 
@@ -2957,11 +2818,7 @@ async def test_events_compact_on_claude_sdk_session_dispatches_compact_turn() ->
     hc = _ScriptedHarnessClient(sse_frames)
     pm = _FakeProcessManager(hc)
 
-    sdk_spec = AgentSpec(
-        spec_version=1,
-        name="t",
-        executor=ExecutorSpec(type="omnigent", config={"harness": "claude-sdk"}),
-    )
+    sdk_spec = _harness_spec("claude-sdk")
 
     async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
         """Return the claude-sdk spec for any agent_id."""
@@ -3031,11 +2888,7 @@ async def test_events_compact_on_claude_sdk_buffers_behind_active_turn() -> None
     hc = _ScriptedHarnessClient([])
     pm = _FakeProcessManager(hc)
 
-    sdk_spec = AgentSpec(
-        spec_version=1,
-        name="t",
-        executor=ExecutorSpec(type="omnigent", config={"harness": "claude-sdk"}),
-    )
+    sdk_spec = _harness_spec("claude-sdk")
 
     async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
         """Return the claude-sdk spec for any agent_id."""
@@ -3132,11 +2985,7 @@ def _build_claude_sdk_compact_app(
     hc = _ScriptedHarnessClient(sse_frames)
     pm = _FakeProcessManager(hc)
 
-    sdk_spec = AgentSpec(
-        spec_version=1,
-        name="t",
-        executor=ExecutorSpec(type="omnigent", config={"harness": "claude-sdk"}),
-    )
+    sdk_spec = _harness_spec("claude-sdk")
 
     async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
         del agent_id, session_id
@@ -3323,11 +3172,7 @@ async def test_events_compact_on_claude_sdk_clears_flag_on_pre_stream_failure() 
 
     hc = _ScriptedHarnessClient([])
     pm = _FailingProcessManager(hc)
-    sdk_spec = AgentSpec(
-        spec_version=1,
-        name="t",
-        executor=ExecutorSpec(type="omnigent", config={"harness": "claude-sdk"}),
-    )
+    sdk_spec = _harness_spec("claude-sdk")
 
     async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
         del agent_id, session_id
