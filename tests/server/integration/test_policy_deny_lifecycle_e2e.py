@@ -16,15 +16,12 @@ only must not block ``input`` (REQUEST) phase messages.
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
-from pathlib import Path
 
 import httpx
 import pytest
 import pytest_asyncio
-from fastapi import FastAPI
 
-from omnigent.stores.policy_store.sqlalchemy_store import SqlAlchemyPolicyStore
-from tests.server.conftest import ControllableMockClient, _app_client
+from tests.server.conftest import ControllableMockClient
 from tests.server.helpers import create_test_agent
 
 pytestmark = pytest.mark.asyncio
@@ -35,34 +32,26 @@ pytestmark = pytest.mark.asyncio
 
 @pytest_asyncio.fixture()
 async def policy_client(
-    policy_app: FastAPI,
-    mock_llm: ControllableMockClient,
-    db_uri: str,
-    tmp_path: Path,
+    policy_client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
 ) -> AsyncIterator[httpx.AsyncClient]:
-    """Policy client allowing the fixed-action factory used by DENY scenarios."""
-    async with _app_client(policy_app, mock_llm, tmp_path) as client:
-        # Patch the runtime global so the policy engine picks up session policies.
-        policy_store = SqlAlchemyPolicyStore(db_uri)
-        monkeypatch.setattr("omnigent.runtime._globals._policy_store", policy_store)
+    """Extend the parent policy client with the DENY scenarios' factory allowlist."""
+    # Allow the make_fixed_action_callable factory through the registry
+    # allowlist. In production this would be added via policy_modules config.
+    # Patch at the use site (the route module imports the function directly).
+    from omnigent.server.routes import session_policies as _sp_mod
 
-        # Allow the make_fixed_action_callable factory through the registry
-        # allowlist. In production this would be added via policy_modules config.
-        # Patch at the use site (the route module imports the function directly).
-        from omnigent.server.routes import session_policies as _sp_mod
+    _original_is_registered = _sp_mod.is_registered_handler
+    monkeypatch.setattr(
+        _sp_mod,
+        "is_registered_handler",
+        lambda handler: (
+            handler == "omnigent.policies.function.make_fixed_action_callable"
+            or _original_is_registered(handler)
+        ),
+    )
 
-        _original_is_registered = _sp_mod.is_registered_handler
-        monkeypatch.setattr(
-            _sp_mod,
-            "is_registered_handler",
-            lambda handler: (
-                handler == "omnigent.policies.function.make_fixed_action_callable"
-                or _original_is_registered(handler)
-            ),
-        )
-
-        yield client
+    yield policy_client
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
