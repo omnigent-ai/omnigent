@@ -275,25 +275,83 @@ def path_to_module(path: Path, root: Path) -> str | None:
     return ".".join(parts)
 
 
+def _dir_is_stubs_only(dir_path: Path, root: Path, alias_old_set: set[str]) -> bool:
+    """True if every non-__init__.py file under *dir_path* is a known alias stub."""
+    py_files = [f for f in dir_path.rglob("*.py") if f.name != "__init__.py"]
+    if not py_files:
+        return True  # Only __init__.py (possibly a re-export stub itself)
+    return all(path_to_module(f, root) in alias_old_set for f in py_files)
+
+
+def _detect_already_moved(
+    move: MoveEntry,
+    old_path: Path | None,
+    new_path: Path | None,
+    alias_old_set: set[str],
+    root: Path,
+) -> bool:
+    """True when this move has already been applied to the working tree.
+
+    Conditions (any one is sufficient, given new_path exists):
+    - old path is missing (simple case)
+    - old path is a file that is a known ``[[alias]]`` stub
+    - old path is a dir and ``new.startswith(old + ".")`` — the old path is
+      the new package created by a file→package rename (e.g. cli.py → cli/)
+    - old path is a dir whose non-init .py files are all alias stubs
+    """
+    if new_path is None:
+        return False  # New location does not exist yet — not moved
+    if old_path is None:
+        return True  # Old gone, new present
+    if old_path.is_file() and move.old in alias_old_set:
+        return True  # Stub file at old location
+    if old_path.is_dir() and move.new.startswith(move.old + "."):
+        # The old dir IS the new package created by the file→package rename.
+        return True
+    if old_path.is_dir() and _dir_is_stubs_only(old_path, root, alias_old_set):
+        return True  # Old dir contains only stubs
+    return False
+
+
+def _build_expanded_new_names(rename_map: dict[str, str]) -> frozenset[str]:
+    """Return new module names AND all their parent packages.
+
+    Used by the post-move callback to detect already-new-style references.
+    """
+    names: set[str] = set()
+    for new in rename_map.values():
+        parts = new.split(".")
+        for n in range(1, len(parts) + 1):
+            names.add(".".join(parts[:n]))
+    return frozenset(names)
+
+
 def expand_rename_map(
     moves: list[MoveEntry],
     root: Path,
+    aliases: list[AliasEntry] | None = None,
 ) -> tuple[dict[str, str], set[str]]:
     """Build a complete old→new mapping, expanding package submodules.
 
     Returns (rename_map, package_olds) where *package_olds* is the set of
     old module names that are packages (not individual files).
+
+    After ``apply`` has run, old paths may coincide with new artefacts
+    (alias stubs, the new package created by a file→package rename, …).
+    Pass *aliases* to enable correct "already-moved" detection and avoid
+    false submodule expansion from new-style paths.
     """
+    alias_old_set: set[str] = {a.old for a in aliases} if aliases else set()
     rename_map: dict[str, str] = {}
     package_olds: set[str] = set()
 
     for move in moves:
         rename_map[move.old] = move.new
         old_path = module_to_path(move.old, root)
-        scan_path = old_path
-        if scan_path is None:
-            # Already moved — scan new location to enumerate submodules.
-            scan_path = module_to_path(move.new, root)
+        new_path = module_to_path(move.new, root)
+
+        already_moved = _detect_already_moved(move, old_path, new_path, alias_old_set, root)
+        scan_path = new_path if already_moved else old_path
 
         if scan_path is not None and scan_path.is_dir():
             package_olds.add(move.old)
@@ -344,6 +402,7 @@ def is_binary(path: Path) -> bool:
 def build_text_replacer(
     rename_map: dict[str, str],
     package_olds: set[str],
+    post_move: bool = False,
 ) -> tuple[re.Pattern[str], Callable[[re.Match[str]], str]]:
     """Build (finder, callback) for fast single-pass text rewriting.
 
@@ -354,6 +413,15 @@ def build_text_replacer(
     *finder* is the fast candidate-detection pattern.
     *callback* is passed to ``finder.sub(callback, text)``; it enforces the
     same boundary rules as the old per-alternative patterns.
+
+    When *post_move* is True (``rewrite``/``check`` run after ``apply``), the
+    callback applies a new-style guard: if the longest prefix of a candidate
+    that is a **new** name is strictly longer than the longest **old** prefix,
+    or equals it AND the candidate itself IS a new name, the candidate is left
+    unchanged.  This prevents double-rewriting tokens like
+    ``omnigent.cli.commands.main`` (where ``omnigent.cli.commands`` is already
+    the new location) or ``from omnigent.cli import x`` (where ``omnigent.cli``
+    is now the new package).  See README for the residual ambiguity.
     """
     # Populate subs dicts
     dotted_subs: dict[str, str] = {}  # dotted module names → dotted new names
@@ -421,6 +489,9 @@ def build_text_replacer(
 
         # ---- dotted-name form: O(depth) lookup by splitting on "." ------
         parts_dot = candidate.split(".")
+        # Find the longest old-name key that matches.
+        old_key: str | None = None
+        old_after: str = ""
         for n in range(len(parts_dot), 0, -1):
             key = ".".join(parts_dot[:n])
             if key not in dotted_subs:
@@ -434,8 +505,32 @@ def build_text_replacer(
             ext_check = after_key if after_key else char_after
             if _is_file_ext(ext_check):
                 continue
-            return dotted_subs[key] + after_key
-        return candidate
+            old_key = key
+            old_after = after_key
+            break
+
+        if old_key is None:
+            return candidate
+
+        if post_move:
+            # Guard: if the candidate is already a new-style name, leave it.
+            # Find the longest prefix of *candidate* that is in expanded_new_names.
+            new_match_len = 0
+            for n in range(len(parts_dot), 0, -1):
+                prefix = ".".join(parts_dot[:n])
+                if prefix in expanded_new_names:
+                    new_match_len = len(prefix)
+                    break
+            old_match_len = len(old_key)
+            if new_match_len > old_match_len:
+                return candidate  # Longer new prefix → definitely already new-style
+            if new_match_len == old_match_len == len(candidate):
+                return candidate  # Candidate IS exactly a new name
+
+        return dotted_subs[old_key] + old_after
+
+    if post_move:
+        expanded_new_names = _build_expanded_new_names(rename_map)
 
     return finder, callback
 
@@ -578,8 +673,45 @@ def _make_import_stmt(
     return indent + stmt
 
 
+_TRAILING_COMMENT_RE = re.compile(r"((?:  *| *\t)#.*?)(\n?)$")
+_INNER_COMMENT_RE = re.compile(r"(?:  *| *\t)#")
+
+
+def _extract_trailing_comment(text: str) -> tuple[str, str]:
+    """Return (text_without_comment, comment_with_space) for a single line.
+
+    e.g. ``"from foo import bar  # noqa: F401\\n"``
+    → ``("from foo import bar", "  # noqa: F401")``
+    """
+    m = _TRAILING_COMMENT_RE.search(text)
+    if m:
+        comment = m.group(1)
+        eol = m.group(2)
+        stripped = text[: m.start()]
+        return stripped.rstrip(), comment + eol
+    return text.rstrip("\n"), "\n" if text.endswith("\n") else ""
+
+
+def _has_inner_comments(lines_block: list[str]) -> bool:
+    """True if any interior line of a multi-line import block has a comment."""
+    for line in lines_block[1:]:  # Skip first line; check interior/last lines
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            return True
+        if _INNER_COMMENT_RE.search(line):
+            return True
+    return False
+
+
 def rewrite_absolute_imports(source: str, rename_map: dict[str, str]) -> str:
-    """Rewrite ``from P import n`` statements where P.n is a moved module."""
+    """Rewrite ``from P import n`` statements where P.n is a moved module.
+
+    Preserves trailing comments (``# noqa``, ``# type:``, ``# pragma`` …):
+    - The trailing comment of the *last* line of the original statement is
+      appended to every generated replacement statement.
+    - Multi-line imports that contain inner comments that cannot be placed are
+      left unchanged and trigger a warning.
+    """
     try:
         tree = ast.parse(source)
     except SyntaxError:
@@ -588,6 +720,7 @@ def rewrite_absolute_imports(source: str, rename_map: dict[str, str]) -> str:
     lines = source.splitlines(keepends=True)
     # Edits: (start_line_0idx, end_line_0idx_exclusive, new_text)
     edits: list[tuple[int, int, str]] = []
+    warnings_out: list[str] = []
 
     for node in ast.walk(tree):
         if not isinstance(node, ast.ImportFrom) or node.level != 0:
@@ -621,6 +754,26 @@ def rewrite_absolute_imports(source: str, rename_map: dict[str, str]) -> str:
             else:
                 break
 
+        # Extract the original block for comment analysis.
+        orig_block = lines[start_line:end_line]
+
+        # Check for inner comments in multi-line imports (can't be placed safely).
+        if len(orig_block) > 1 and _has_inner_comments(orig_block):
+            warnings_out.append(
+                f"line {node.lineno}: multi-line import with inner comments "
+                "cannot be rewritten automatically — left unchanged"
+            )
+            continue
+
+        # Extract trailing comment from the last line (e.g. a noqa or type-ignore marker).
+        last_line = orig_block[-1] if orig_block else ""
+        _, trailing = _extract_trailing_comment(last_line)
+        # Normalise: ensure trailing always ends with newline.
+        if trailing and not trailing.endswith("\n"):
+            trailing += "\n"
+        if not trailing:
+            trailing = "\n"
+
         new_stmts: list[str] = []
 
         for al, new_full in moved_aliases:
@@ -636,7 +789,13 @@ def rewrite_absolute_imports(source: str, rename_map: dict[str, str]) -> str:
             )
             new_stmts.append(f"{indent}from {module} import {kept_str}")
 
-        new_text = "\n".join(new_stmts) + "\n"
+        # Attach the trailing comment to every emitted statement.
+        if len(new_stmts) == 1:
+            new_text = new_stmts[0] + trailing
+        else:
+            # Multiple statements: put the comment on the last one; add newlines between.
+            new_text = "\n".join(new_stmts[:-1]) + "\n" + new_stmts[-1] + trailing
+
         edits.append((start_line, end_line, new_text))
 
     if not edits:
@@ -764,8 +923,10 @@ def perform_moves(
     packages_def: list[PackageDef],
     dry_run: bool,
     report: Report,
+    aliases: list[AliasEntry] | None = None,
 ) -> None:
     """Execute git mv operations for each [[move]] entry."""
+    alias_old_set: set[str] = {a.old for a in aliases} if aliases else set()
 
     def _ensure_parents(dest: Path) -> None:
         if not dry_run:
@@ -773,16 +934,15 @@ def perform_moves(
 
     for move in moves:
         old_path = module_to_path(move.old, root)
+        new_path = module_to_path(move.new, root)
 
-        # Idempotency: if old is gone and new exists, skip.
+        # Idempotency: skip moves that have already been applied.
+        if _detect_already_moved(move, old_path, new_path, alias_old_set, root):
+            report.moves_skipped.append(f"{move.old} -> {move.new} (already moved)")
+            continue
+
         if old_path is None:
-            new_as_file = root / (move.new.replace(".", "/") + ".py")
-            new_as_pkg = root / move.new.replace(".", "/")
-            new_pkg_init = new_as_pkg / "__init__.py"
-            if new_as_file.exists() or (new_as_pkg.is_dir() and new_pkg_init.exists()):
-                report.moves_skipped.append(f"{move.old} -> {move.new} (already moved)")
-                continue
-            # Neither exists — nothing to do.
+            # Source not found and not an already-moved case → warn.
             report.moves_skipped.append(f"{move.old} -> {move.new} (source not found)")
             continue
 
@@ -909,8 +1069,18 @@ def run_ruff(root: Path, changed_files: list[Path]) -> None:
 # ---------------------------------------------------------------------------
 
 
-def validate(moves: list[MoveEntry], root: Path) -> list[str]:
-    """Return a list of validation errors (empty = OK)."""
+def validate(
+    moves: list[MoveEntry],
+    root: Path,
+    aliases: list[AliasEntry] | None = None,
+) -> list[str]:
+    """Return a list of validation errors (empty = OK).
+
+    Already-moved entries (detected via *aliases* and the file-to-package
+    heuristic) are silently skipped so that re-running ``apply`` on an
+    already-applied tree exits 0.
+    """
+    alias_old_set: set[str] = {a.old for a in aliases} if aliases else set()
     errors: list[str] = []
     seen_new: dict[str, str] = {}
 
@@ -923,17 +1093,17 @@ def validate(moves: list[MoveEntry], root: Path) -> list[str]:
         seen_new[move.new] = move.old
 
         old_path = module_to_path(move.old, root)
+        new_path = module_to_path(move.new, root)
+
+        if _detect_already_moved(move, old_path, new_path, alias_old_set, root):
+            continue  # Idempotent: already applied
+
         if old_path is None:
-            # Check idempotent case: new already exists.
-            new_as_file = root / (move.new.replace(".", "/") + ".py")
-            new_as_pkg = root / move.new.replace(".", "/")
-            if not new_as_file.exists() and not (
-                new_as_pkg.is_dir() and (new_as_pkg / "__init__.py").exists()
-            ):
-                errors.append(
-                    f"Source {move.old!r} not found (expected "
-                    f"{root}/{move.old.replace('.', '/')}.py or dir)"
-                )
+            # Source genuinely missing (not an "already moved" case).
+            errors.append(
+                f"Source {move.old!r} not found (expected "
+                f"{root}/{move.old.replace('.', '/')}.py or dir)"
+            )
             continue
 
         dest_file = root / (move.new.replace(".", "/") + ".py")
@@ -971,14 +1141,14 @@ def cmd_apply(args: argparse.Namespace) -> None:
         config = parse_map(map_file)
 
         # Step 1: Validate.
-        errors = validate(config.moves, repo)
+        errors = validate(config.moves, repo, aliases=config.aliases)
         if errors:
             for err in errors:
                 print(f"error: {err}", file=sys.stderr)
             sys.exit(1)
 
         # Build rename_map from the CURRENT state (before moves).
-        rename_map, package_olds = expand_rename_map(config.moves, repo)
+        rename_map, package_olds = expand_rename_map(config.moves, repo, aliases=config.aliases)
         first_segs = _first_segments(rename_map)
 
         # Collect all tracked files (before moves); skip symlinks and non-files.
@@ -1016,14 +1186,24 @@ def cmd_apply(args: argparse.Namespace) -> None:
         tp = _phase("2-relative-imports", tp)
 
         # Step 3: Moves.
-        perform_moves(config.moves, repo, config.packages, dry_run=dry_run, report=report)
+        perform_moves(
+            config.moves,
+            repo,
+            config.packages,
+            dry_run=dry_run,
+            report=report,
+            aliases=config.aliases,
+        )
         tp = _phase("3-moves", tp)
 
         # After moves, re-collect tracked files; skip symlinks and non-files.
         tracked = [p for p in get_tracked_files(repo) if is_regular_file(p)]
 
         # Step 4 & 5: Python import rewrite + text rewrite.
-        finder, callback = build_text_replacer(rename_map, package_olds)
+        # When every move was already done (second run), use post-move semantics so
+        # already-new-style references are not double-rewritten.
+        post_move_apply = not report.moves_done
+        finder, callback = build_text_replacer(rename_map, package_olds, post_move=post_move_apply)
         # Pre-compile warning pattern once (avoid per-key regex compilation per file).
         dyn_re = _make_dyn_ref_re(rename_map)
 
@@ -1105,8 +1285,9 @@ def cmd_rewrite(args: argparse.Namespace) -> None:
     config = parse_map(map_file)
     report = Report()
 
-    rename_map, package_olds = expand_rename_map(config.moves, repo)
-    finder, callback = build_text_replacer(rename_map, package_olds)
+    rename_map, package_olds = expand_rename_map(config.moves, repo, aliases=config.aliases)
+    # post_move=True: leave already-new-style references unchanged.
+    finder, callback = build_text_replacer(rename_map, package_olds, post_move=True)
     first_segs = _first_segments(rename_map)
     exclude = config.cleanup.exclude
 
@@ -1158,8 +1339,9 @@ def cmd_check(args: argparse.Namespace) -> None:
     map_file = Path(args.map).resolve()
     config = parse_map(map_file)
 
-    rename_map, package_olds = expand_rename_map(config.moves, repo)
-    finder, _callback = build_text_replacer(rename_map, package_olds)
+    rename_map, package_olds = expand_rename_map(config.moves, repo, aliases=config.aliases)
+    # post_move=True: new-style references are not flagged as hits.
+    finder, callback = build_text_replacer(rename_map, package_olds, post_move=True)
     first_segs = _first_segments(rename_map)
     exclude = config.cleanup.exclude
 
@@ -1187,7 +1369,7 @@ def cmd_check(args: argparse.Namespace) -> None:
         matches = finder.findall(text)
         # Filter to only those that the callback would actually replace
         # (i.e., are genuine old-name references, not just candidates).
-        real_hits = {m for m in matches if finder.sub(_callback, m) != m}
+        real_hits = {m for m in matches if finder.sub(callback, m) != m}
         if real_hits:
             rel = str(path.relative_to(repo))
             for m in sorted(real_hits):

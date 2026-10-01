@@ -1183,3 +1183,241 @@ def test_apply_new_package_named_like_old_module_is_not_rewritten_twice(tmp_path
     assert "import pkg.cli.commands" in consumer
     assert "pkg.cli.commands.main()" in consumer
     assert "pkg.cli.commands import ui" not in consumer
+
+
+# ---------------------------------------------------------------------------
+# Bug 1 + 3: apply+check exits 0, idempotent second apply
+# ---------------------------------------------------------------------------
+
+
+def test_apply_check_exits_0_with_aliases_and_collision(tmp_path):
+    """After apply: check must return 0 when aliases + file→pkg collision present.
+
+    Fixture:
+    - pkg.cli (file cli.py) → pkg.cli.commands  (file→package collision)
+    - pkg.inner.foo → pkg.harnesses.foo  (package submodule move)
+    - alias: pkg.inner.foo → pkg.harnesses.foo  (stub left behind)
+    """
+    root = make_repo(tmp_path)
+    write_file(root, "pkg/__init__.py", "")
+    write_file(root, "pkg/cli.py", "def main(): pass\n")
+    write_file(root, "pkg/inner/__init__.py", "")
+    write_file(root, "pkg/inner/foo.py", "X = 1\n")
+    write_file(root, "pkg/consumer.py", "from pkg.cli import main\nfrom pkg.inner.foo import X\n")
+    commit_all(root)
+
+    map_file = write_file(
+        root,
+        "map.toml",
+        """\
+        [[move]]
+        old = "pkg.cli"
+        new = "pkg.cli.commands"
+
+        [[move]]
+        old = "pkg.inner.foo"
+        new = "pkg.harnesses.foo"
+
+        [[alias]]
+        old = "pkg.inner.foo"
+        new = "pkg.harnesses.foo"
+        removal = "0.19.0"
+        """,
+    )
+
+    args = make_args(map=str(map_file), repo=str(root))
+    cmd_apply(args)
+    _git(root, "add", "-A")
+    _git(root, "commit", "-m", "after apply")
+
+    # check must exit 0 — no false positives from the new cli/ package
+    check_args = make_args(map=str(map_file), repo=str(root))
+    cmd_check(check_args)  # must not raise SystemExit(1)
+
+
+def test_apply_idempotent_second_run_exits_0(tmp_path):
+    """Applying twice must be a no-op on the second run."""
+    root = make_repo(tmp_path)
+    write_file(root, "pkg/__init__.py", "")
+    write_file(root, "pkg/cli.py", "def main(): pass\n")
+    write_file(root, "pkg/inner/__init__.py", "")
+    write_file(root, "pkg/inner/foo.py", "X = 1\n")
+    write_file(root, "pkg/consumer.py", "from pkg.cli import main\nfrom pkg.inner.foo import X\n")
+    commit_all(root)
+
+    map_file = write_file(
+        root,
+        "map.toml",
+        """\
+        [[move]]
+        old = "pkg.cli"
+        new = "pkg.cli.commands"
+
+        [[move]]
+        old = "pkg.inner.foo"
+        new = "pkg.harnesses.foo"
+
+        [[alias]]
+        old = "pkg.inner.foo"
+        new = "pkg.harnesses.foo"
+        removal = "0.19.0"
+        """,
+    )
+
+    args = make_args(map=str(map_file), repo=str(root))
+    cmd_apply(args)
+    _git(root, "add", "-A")
+    _git(root, "commit", "-m", "after first apply")
+
+    # Second apply must exit 0 and change nothing.
+    cmd_apply(args)  # must not raise
+
+    # git status should show no changes
+    result = subprocess.run(
+        ["git", "status", "--porcelain"],
+        cwd=root,
+        capture_output=True,
+        text=True,
+    )
+    assert result.stdout.strip() == "", f"unexpected changes: {result.stdout}"
+
+
+# ---------------------------------------------------------------------------
+# Bug 2: post-move rewrite leaves new-style refs alone
+# ---------------------------------------------------------------------------
+
+
+def test_post_move_rewrite_mixed_refs(tmp_path):
+    """rewrite (post-move) rewrites only old-style refs, leaves new-style alone."""
+    root = make_repo(tmp_path)
+    write_file(root, "pkg/__init__.py", "")
+    write_file(root, "pkg/harnesses/__init__.py", "")
+    write_file(root, "pkg/harnesses/ui.py", "class UI: pass\n")
+    write_file(root, "pkg/cli/__init__.py", "")
+    write_file(root, "pkg/cli/commands.py", "def main(): pass\n")
+
+    mixed = (
+        "from pkg.cli import ui\n"  # new-style: pkg.cli is the new package
+        "import pkg.cli.commands.main\n"  # new-style: already rewritten
+        "import pkg.inner.ui\n"  # old-style: should → pkg.harnesses.ui
+        "from pkg.inner import ui\n"  # old-style: should → from pkg.harnesses import ui
+        "import pkg.cli.main\n"  # old-style: should → pkg.cli.commands.main
+    )
+    write_file(root, "pkg/consumer.py", mixed)
+    commit_all(root)
+
+    map_file = write_file(
+        root,
+        "map.toml",
+        """\
+        [[move]]
+        old = "pkg.cli"
+        new = "pkg.cli.commands"
+
+        [[move]]
+        old = "pkg.inner.ui"
+        new = "pkg.harnesses.ui"
+        """,
+    )
+
+    args = make_args(map=str(map_file), repo=str(root))
+    cmd_rewrite(args)
+
+    consumer = (root / "pkg" / "consumer.py").read_text()
+
+    # Old-style: must be rewritten
+    assert "pkg.inner.ui" not in consumer
+    assert "from pkg.inner import ui" not in consumer
+    assert "pkg.harnesses.ui" in consumer
+
+    # New-style: must NOT be double-rewritten
+    assert "pkg.cli.commands.main" in consumer  # already new-style stays
+    assert "pkg.cli.commands.commands.main" not in consumer  # no double-rewrite
+    # from pkg.cli import ui stays (pkg.cli is now the package)
+    assert "from pkg.cli import ui" in consumer
+
+
+# ---------------------------------------------------------------------------
+# Comment preservation in rewrite_absolute_imports
+# ---------------------------------------------------------------------------
+
+
+def test_rewrite_preserves_trailing_noqa():
+    """# noqa comment on an import line is preserved after rewrite."""
+    src = "from pkg.inner import foo_exec  # noqa: F401\n"
+    result = rewrite_absolute_imports(src, {"pkg.inner.foo_exec": "pkg.harnesses.foo.executor"})
+    assert "# noqa: F401" in result
+    assert "pkg.harnesses.foo" in result
+
+
+def test_rewrite_preserves_trailing_comment_in_if_block():
+    """Trailing comment on a relative-turned-absolute import inside an if block."""
+    src = textwrap.dedent(
+        """\
+        if True:
+            from pkg.inner import bwrap  # noqa: F401
+        """
+    )
+    result = rewrite_absolute_imports(src, {"pkg.inner.bwrap": "pkg.harnesses.bwrap"})
+    assert "# noqa: F401" in result
+    assert "pkg.harnesses" in result
+
+
+def test_rewrite_multiline_no_inner_comment():
+    """Multi-line import without inner comments is rewritten normally."""
+    src = textwrap.dedent(
+        """\
+        from pkg.inner import (
+            foo_exec,
+            bar_exec,
+        )
+        """
+    )
+    result = rewrite_absolute_imports(
+        src,
+        {
+            "pkg.inner.foo_exec": "pkg.harnesses.foo.executor",
+            "pkg.inner.bar_exec": "pkg.harnesses.bar.executor",
+        },
+    )
+    assert "pkg.harnesses.foo" in result
+    assert "pkg.harnesses.bar" in result
+
+
+def test_rewrite_multiline_with_inner_comment_left_unchanged():
+    """Multi-line import with an inner comment is left unchanged (cannot be placed)."""
+    src = textwrap.dedent(
+        """\
+        from pkg.inner import (
+            foo_exec,  # keep this!
+            bar_exec,
+        )
+        """
+    )
+    result = rewrite_absolute_imports(
+        src,
+        {
+            "pkg.inner.foo_exec": "pkg.harnesses.foo.executor",
+            "pkg.inner.bar_exec": "pkg.harnesses.bar.executor",
+        },
+    )
+    # Must be unchanged — inner comment cannot be placed
+    assert result == src
+
+
+def test_rewrite_trailing_comment_on_last_moved_stmt():
+    """The comment goes on the LAST emitted statement when multiple are generated."""
+    src = "from pkg.inner import a, b  # type: ignore[import]\n"
+    result = rewrite_absolute_imports(
+        src,
+        {
+            "pkg.inner.a": "pkg.new.a",
+            "pkg.inner.b": "pkg.new.b",
+        },
+    )
+    lines = [ln for ln in result.splitlines() if ln.strip()]
+    # Exactly two import lines emitted
+    assert len(lines) == 2
+    # Comment must appear on the last line only
+    assert "# type: ignore" in lines[-1]
+    assert "# type: ignore" not in lines[0]
