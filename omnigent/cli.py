@@ -3643,6 +3643,9 @@ def _build_host_daemon_env(
     for name in passthrough_names:
         if name in os.environ:
             env[name] = os.environ[name]
+    # Passthrough is operator-controlled; never revive dispatch-scoped trace vars.
+    env.pop(DISPATCH_TRACEPARENT_ENV_VAR, None)
+    env.pop(DISPATCH_TRACESTATE_ENV_VAR, None)
     return env
 
 

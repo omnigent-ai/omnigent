@@ -20,6 +20,10 @@ from omnigent.runner.identity import (
     RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR,
     strip_runner_auth_secrets,
 )
+from omnigent.runtime.telemetry import (
+    DISPATCH_TRACEPARENT_ENV_VAR,
+    DISPATCH_TRACESTATE_ENV_VAR,
+)
 
 _REMOTE_SERVER_URL: Final = "https://example.databricksapps.com"
 _PROXY_ENV: Final = {
@@ -61,6 +65,29 @@ def test_runner_env_passthrough_named_vars_survive_daemon_and_runner_hops(
         assert env[RUNNER_ENV_PASSTHROUGH_ENV_VAR] == "MOTION_CORE_BIN"
         assert env["MOTION_CORE_BIN"] == motion_bin
         assert "MOTION_UNLISTED_SECRET" not in env
+
+
+@pytest.mark.parametrize("server_url", [None, _REMOTE_SERVER_URL])
+def test_dispatch_trace_vars_never_reach_daemon_via_passthrough(
+    monkeypatch: pytest.MonkeyPatch,
+    server_url: str | None,
+) -> None:
+    """Explicit passthrough cannot re-inject dispatch-scoped trace context into daemons."""
+    motion_bin = "/opt/motion/bin/motion-core"
+    traceparent = "00-9fb2e1cf8fbe9c5ecb7742f04c351500-662a3348b2576ccf-01"
+    passthrough = f"MOTION_CORE_BIN,{DISPATCH_TRACEPARENT_ENV_VAR},{DISPATCH_TRACESTATE_ENV_VAR}"
+    monkeypatch.setenv("PATH", "/usr/bin")
+    monkeypatch.setenv(RUNNER_ENV_PASSTHROUGH_ENV_VAR, passthrough)
+    monkeypatch.setenv("MOTION_CORE_BIN", motion_bin)
+    monkeypatch.setenv(DISPATCH_TRACEPARENT_ENV_VAR, traceparent)
+    monkeypatch.setenv(DISPATCH_TRACESTATE_ENV_VAR, "vendor=abc")
+    monkeypatch.setattr("omnigent.onboarding.provider_config.load_config", dict)
+
+    daemon_env = _build_host_daemon_env(server_url=server_url)
+
+    assert daemon_env["MOTION_CORE_BIN"] == motion_bin
+    assert DISPATCH_TRACEPARENT_ENV_VAR not in daemon_env
+    assert DISPATCH_TRACESTATE_ENV_VAR not in daemon_env
 
 
 @pytest.mark.parametrize("server_url", [None, _REMOTE_SERVER_URL])
