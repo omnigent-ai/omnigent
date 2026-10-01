@@ -5312,6 +5312,8 @@ describe("chatStore — send (file attachments)", () => {
       text: "summarize these photos",
       files: [zip],
       stableId: expect.any(String),
+      // A 415 carries no Omnigent error code: the message was never sent.
+      serverRefused: false,
     });
     const error = state.blocks.at(-1) as { type: string; message: string };
     expect(error.type).toBe("error");
