@@ -23,7 +23,6 @@ _COMPOSER = "Send a message…"
 _ASSISTANT = '[data-testid="message-bubble"][data-role="assistant"]'
 _WORKING = '[data-testid="working-indicator"]'
 _ERROR_PILL = '[data-testid="error-pill"]'
-_ERROR_CONTENT = '[data-testid="error-message-content"]'
 
 _TERMINATED_TEXT = "Cannot write to terminated process"
 
@@ -172,7 +171,6 @@ def test_next_turn_recovers_when_claude_cli_was_terminated(
             _send(page, f"Say ack. {token1}")
             expect(page.locator(_ASSISTANT).first).to_be_visible(timeout=180_000)
             expect(page.locator(_WORKING)).to_have_count(0, timeout=180_000)
-            assistant_after_turn1 = page.locator(_ASSISTANT).count()
 
             new_pids: set[int] = set()
             deadline = time.time() + 30
@@ -206,24 +204,9 @@ def test_next_turn_recovers_when_claude_cli_was_terminated(
 
             _send(page, f"Continue. {token2}")
 
-            terminal_deadline = time.time() + 240
-            error_present = False
-            while time.time() < terminal_deadline:
-                error_present = page.locator(_ERROR_PILL).count() > 0
-                reply_present = page.locator(_ASSISTANT).count() > assistant_after_turn1
-                if error_present or reply_present:
-                    break
-                page.wait_for_timeout(500)
-
-            if error_present:
-                try:
-                    page.locator(_ERROR_PILL).first.click()
-                    expect(page.locator(_ERROR_CONTENT)).to_be_visible(timeout=5_000)
-                    page.wait_for_timeout(1_500)
-                except Exception:  # best-effort surfacing for the recording only
-                    pass
-
-            expect(page.get_by_text("ack two")).to_be_visible(timeout=60_000)
+            # The recovered turn spawns a fresh CLI and replays history, so allow
+            # the same budget the pre-fix polling loop used before asserting.
+            expect(page.get_by_text("ack two")).to_be_visible(timeout=240_000)
             expect(page.locator(_ERROR_PILL)).to_have_count(0)
             expect(page.get_by_text(_TERMINATED_TEXT)).to_have_count(0)
         finally:
