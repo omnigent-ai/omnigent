@@ -38,10 +38,12 @@ except the optional Changelog section as described below.
 - **Coverage notes** — required if you checked "Manual verification completed"
   or "Not applicable".
 - **Release notes** — choose exactly one Yes/No checkbox and keep both rows.
-  Choose Yes for user-facing features, bug fixes, and UX improvements, even
-  small ones; choose No for internal changes with no user impact. Breaking
-  changes must choose Yes. This is the author's recommendation for maintainers
-  curating the release notes.
+  Choose Yes only for outstanding user-facing features, bug fixes, UX changes,
+  and breaking changes. Breaking changes must choose Yes. Features behind a
+  feature flag are eligible only once the flag is enabled for users. Choose No
+  for small fixes or improvements, features behind disabled flags, and internal
+  changes with no user impact. This is the author's recommendation for
+  maintainers curating the release notes.
 - **Changelog** — if Release notes is Yes, write one line describing the change
   for users, including compatibility impact for breaking changes. If No, delete
   this section; the complete changelog still credits the PR using its title.

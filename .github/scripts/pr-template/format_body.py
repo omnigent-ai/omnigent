@@ -66,10 +66,12 @@ def format_body(body: str) -> str:
         "Should this change be included in the release notes? Choose exactly one.\n\n"
         "- [ ] No — no noteworthy user-facing change.\n"
         "- [ ] Yes — include the entry in the Changelog section.\n\n"
-        "<!-- Choose Yes for user-facing features, bug fixes, and UX improvements, "
-        "including small changes. Breaking changes must choose Yes and describe "
-        "the compatibility impact in Changelog. Choose No for internal changes "
-        "with no user impact. Keep this section and both checkboxes. This records "
+        "<!-- Choose Yes only for outstanding user-facing features, bug fixes, UX "
+        "changes, and breaking changes. Breaking changes must choose Yes and describe "
+        "the compatibility impact in Changelog. Features behind a feature flag are "
+        "eligible only once the flag is enabled for users. Choose No for small fixes "
+        "or improvements, features behind disabled flags, and internal changes with "
+        "no user impact. Keep this section and both checkboxes. This records "
         "the author's recommendation; maintainers curate the release notes. -->",
     )
     body = _append_section(

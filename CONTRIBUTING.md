@@ -390,12 +390,14 @@ request enforces this, so unsigned commits will block merging.
   section showing the new behaviour, so reviewers can see it without checking
   out the branch.
 - Under **Release notes**, choose exactly one Yes/No checkbox and keep both
-  rows. Choose Yes for user-facing features, bug fixes, and UX improvements,
-  including small changes; write one line for users in **Changelog**. Breaking
-  changes must choose Yes and describe the compatibility impact. Choose No for
-  internal changes with no user impact and delete the Changelog section. The
-  complete changelog still credits the PR using its title. This records your
-  recommendation; maintainers curate the release notes.
+  rows. Choose Yes only for outstanding user-facing features, bug fixes, UX
+  changes, and breaking changes; write one line for users in **Changelog**.
+  Breaking changes must choose Yes and describe the compatibility impact.
+  Features behind a feature flag are eligible only once the flag is enabled for
+  users. Choose No for small fixes or improvements, features behind disabled
+  flags, and internal changes with no user impact, and delete the Changelog
+  section. The complete changelog still credits the PR using its title. This
+  records your recommendation; maintainers curate the release notes.
 
 ### Database migration reviews
 
