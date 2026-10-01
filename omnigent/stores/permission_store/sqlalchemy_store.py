@@ -25,7 +25,7 @@ from omnigent.db.utils import (
     run_write_transaction,
 )
 from omnigent.entities import Account, ResolvedAccess, SessionPermission
-from omnigent.server.auth import (
+from omnigent.entities.permission import (
     LEVEL_OWNER,
     RESERVED_USER_LOCAL,
     RESERVED_USER_PUBLIC,

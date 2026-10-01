@@ -4,6 +4,16 @@ from __future__ import annotations
 
 import dataclasses
 
+# Grant levels on a session; access checks compare with ``>=``.
+LEVEL_READ = 1
+LEVEL_EDIT = 2
+LEVEL_MANAGE = 3
+LEVEL_OWNER = 4
+
+# The single-user local identity and the public-access grantee.
+RESERVED_USER_LOCAL = "local"
+RESERVED_USER_PUBLIC = "__public__"
+
 
 @dataclasses.dataclass
 class SessionPermission:

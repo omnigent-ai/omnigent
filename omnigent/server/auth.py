@@ -40,13 +40,18 @@ from typing import TYPE_CHECKING
 
 from starlette.requests import HTTPConnection
 
+from omnigent.entities.permission import LEVEL_EDIT as LEVEL_EDIT
+from omnigent.entities.permission import LEVEL_MANAGE as LEVEL_MANAGE
+from omnigent.entities.permission import LEVEL_OWNER as LEVEL_OWNER
+from omnigent.entities.permission import LEVEL_READ as LEVEL_READ
+from omnigent.entities.permission import RESERVED_USER_LOCAL as RESERVED_USER_LOCAL
+from omnigent.entities.permission import RESERVED_USER_PUBLIC as RESERVED_USER_PUBLIC
+
 logger = logging.getLogger(__name__)
 
 # Opt-in multi-user switch.
 _AUTH_ENABLED_ENV = "OMNIGENT_AUTH_ENABLED"
 
-RESERVED_USER_LOCAL = "local"
-RESERVED_USER_PUBLIC = "__public__"
 _RESERVED_USERS = frozenset({RESERVED_USER_LOCAL, RESERVED_USER_PUBLIC})
 _TRUTHY_STRINGS = ("1", "true", "yes")
 
@@ -118,11 +123,6 @@ _DEFAULT_AUTH_HEADER = "X-Forwarded-Email"
 # email used everywhere else. Unset (the default) strips nothing. See
 # :func:`resolve_auth_header_strip_prefix`.
 _AUTH_HEADER_STRIP_PREFIX_ENV = "OMNIGENT_AUTH_HEADER_STRIP_PREFIX"
-
-LEVEL_READ = 1
-LEVEL_EDIT = 2
-LEVEL_MANAGE = 3
-LEVEL_OWNER = 4
 
 
 class SharingMode(str, Enum):
