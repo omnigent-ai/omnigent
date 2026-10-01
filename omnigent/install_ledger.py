@@ -14,6 +14,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import NotRequired, TypedDict, cast
 
+from omnigent.claude_paths import claude_json_path
 from omnigent.util.json_types import JsonObject as _JsonObject
 
 SCHEMA_VERSION = 1
@@ -462,7 +463,7 @@ def observed_external_configs(*, deep: bool) -> list[ExternalConfigEntry]:
     candidates = [
         (cwd / ".cursor" / "mcp.json", "mcpServers.omnigent", "json"),
         (cwd / ".kiro" / "settings" / "mcp.json", "mcpServers.omnigent", "json"),
-        (Path.home() / ".claude.json", "mcpServers.omnigent", "json"),
+        (claude_json_path(), "mcpServers.omnigent", "json"),
         (Path.home() / ".codex" / "config.toml", "mcp_servers.omnigent", "toml"),
     ]
     entries: list[ExternalConfigEntry] = []
