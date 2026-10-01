@@ -23,7 +23,7 @@
     "               LAST matching area in this array wins per file. So broad prefixes",
     "               MUST come before their more-specific children:",
     "                 - 'web/' before 'web/electron/' and 'web/ios/'",
-    "                 - 'omnigent/inner/' before every 'omnigent/inner/<harness>_'.",
+    "                 - 'omnigent/harnesses/' (in inner) before every 'omnigent/harnesses/<harness>/'.",
     "  owners     - candidate reviewers/assignees. Must be maintainers in",
     "               .github/MAINTAINER. 2+ each. NOTE: @hzub is intentionally NOT an",
     "               owner anywhere (a reviewer test relies on hzub being in MAINTAINER",
@@ -90,7 +90,14 @@
       "label": "comp:harnesses",
       "definition": "Core agent runtime and the harness/executor layer shared by all harnesses (loader, executor base, tool bridge, sandboxes). Harness-specific code has its own areas below.",
       "paths": [
-        "omnigent/inner/"
+        "omnigent/inner/",
+        "omnigent/core/",
+        "omnigent/environments/",
+        "omnigent/util/",
+        "omnigent/observability/",
+        "omnigent/models/signer/",
+        "omnigent/cli/",
+        "omnigent/harnesses/"
       ],
       "owners": [
         "SabhyaC26",
@@ -337,8 +344,8 @@
       "label": "comp:harnesses",
       "definition": "The Claude harness family: the Claude SDK executor/harness (claude-sdk) and the native Claude Code terminal integration.",
       "paths": [
-        "omnigent/inner/claude_",
-        "omnigent/claude_native"
+        "omnigent/harnesses/claude_sdk/",
+        "omnigent/harnesses/claude_native/"
       ],
       "owners": [
         "SabhyaC26",
@@ -352,10 +359,10 @@
       "label": "comp:harnesses",
       "definition": "The Codex / OpenAI harness family: the OpenAI Agents SDK executor/harness, the open-responses SDK, and the native Codex integration.",
       "paths": [
-        "omnigent/inner/codex_",
-        "omnigent/inner/openai_",
-        "omnigent/harnesses/open_responses/executor.py",
-        "omnigent/codex_native"
+        "omnigent/harnesses/codex/",
+        "omnigent/harnesses/openai_agents/",
+        "omnigent/harnesses/open_responses/",
+        "omnigent/harnesses/codex_native/"
       ],
       "owners": [
         "SabhyaC26",
@@ -369,8 +376,8 @@
       "label": "comp:harnesses",
       "definition": "The Cursor harness: SDK executor/harness and the native Cursor integration.",
       "paths": [
-        "omnigent/inner/cursor_",
-        "omnigent/cursor_native"
+        "omnigent/harnesses/cursor/",
+        "omnigent/harnesses/cursor_native/"
       ],
       "owners": [
         "SabhyaC26",
@@ -384,8 +391,8 @@
       "label": "comp:harnesses",
       "definition": "The Antigravity (Gemini) harness: SDK executor/harness, native integration, and Gemini/Antigravity auth.",
       "paths": [
-        "omnigent/inner/antigravity_",
-        "omnigent/antigravity_native",
+        "omnigent/harnesses/antigravity/",
+        "omnigent/harnesses/antigravity_native/",
         "omnigent/onboarding/antigravity_auth.py",
         "omnigent/onboarding/gemini_auth.py"
       ],
@@ -401,8 +408,8 @@
       "label": "comp:harnesses",
       "definition": "The Goose harness: SDK executor/harness, native TUI/ACP integration, and Goose auth.",
       "paths": [
-        "omnigent/inner/goose_",
-        "omnigent/goose_native",
+        "omnigent/harnesses/goose/",
+        "omnigent/harnesses/goose_native/",
         "omnigent/onboarding/goose_auth.py"
       ],
       "owners": [
@@ -417,8 +424,8 @@
       "label": "comp:harnesses",
       "definition": "The Hermes harness: SDK executor/harness and the native Hermes integration.",
       "paths": [
-        "omnigent/inner/hermes_",
-        "omnigent/hermes_native"
+        "omnigent/harnesses/hermes/",
+        "omnigent/harnesses/hermes_native/"
       ],
       "owners": [
         "SabhyaC26",
@@ -432,8 +439,8 @@
       "label": "comp:harnesses",
       "definition": "The Kimi harness: SDK executor/harness and the native Kimi integration.",
       "paths": [
-        "omnigent/inner/kimi_",
-        "omnigent/kimi_native"
+        "omnigent/harnesses/kimi/",
+        "omnigent/harnesses/kimi_native/"
       ],
       "owners": [
         "SabhyaC26",
@@ -447,8 +454,7 @@
       "label": "comp:harnesses",
       "definition": "The Kiro harness: SDK executor/harness and the native Kiro integration.",
       "paths": [
-        "omnigent/inner/kiro_",
-        "omnigent/kiro_native"
+        "omnigent/harnesses/kiro_native/"
       ],
       "owners": [
         "SabhyaC26",
@@ -462,8 +468,7 @@
       "label": "comp:harnesses",
       "definition": "The OpenCode harness: SDK executor/harness, native integration, HTTP transport, and OpenCode auth.",
       "paths": [
-        "omnigent/inner/opencode_",
-        "omnigent/opencode_",
+        "omnigent/harnesses/opencode_native/",
         "omnigent/onboarding/opencode_auth.py"
       ],
       "owners": [
@@ -478,8 +483,8 @@
       "label": "comp:harnesses",
       "definition": "The Pi harness: SDK executor/harness and the native Pi integration.",
       "paths": [
-        "omnigent/inner/pi_",
-        "omnigent/pi_native"
+        "omnigent/harnesses/pi/",
+        "omnigent/harnesses/pi_native/"
       ],
       "owners": [
         "SabhyaC26",
@@ -493,8 +498,8 @@
       "label": "comp:harnesses",
       "definition": "The Qwen harness: SDK executor/harness and the native Qwen integration.",
       "paths": [
-        "omnigent/inner/qwen_",
-        "omnigent/qwen_native"
+        "omnigent/harnesses/qwen/",
+        "omnigent/harnesses/qwen_native/"
       ],
       "owners": [
         "SabhyaC26",
@@ -508,7 +513,7 @@
       "label": "comp:harnesses",
       "definition": "The GitHub Copilot harness: SDK executor/harness and Copilot auth.",
       "paths": [
-        "omnigent/inner/copilot_",
+        "omnigent/harnesses/copilot/",
         "omnigent/onboarding/copilot_auth.py"
       ],
       "owners": [
