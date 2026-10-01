@@ -1462,14 +1462,20 @@ def _usage_event(input_tokens: int, context_window: int = 200_000) -> dict[str, 
     }
 
 
-def _write_forwarder_bridge(bridge_dir: Path, *, active_turn_id: str | None) -> None:
-    """Write the common thread state, keeping the active turn explicit."""
+def _write_forwarder_bridge(
+    bridge_dir: Path,
+    *,
+    active_turn_id: str | None,
+    session_id: str = "conv_123",
+    thread_id: str = "thread_123",
+) -> None:
+    """Write bridge state with overridable identities and an explicit active turn."""
     write_bridge_state(
         bridge_dir,
         CodexNativeBridgeState(
-            session_id="conv_123",
+            session_id=session_id,
             socket_path=str(bridge_dir / "app-server.sock"),
-            thread_id="thread_123",
+            thread_id=thread_id,
             codex_home=str(bridge_dir / "codex-home"),
             active_turn_id=active_turn_id,
         ),
@@ -1488,12 +1494,17 @@ def _recording_forwarder_client(posted: list[dict[str, Any]]) -> httpx.AsyncClie
     )
 
 
-def _forwarder_context(client: httpx.AsyncClient, bridge_dir: Path) -> dict[str, Any]:
-    """Build fresh per-call state for handlers that do not share turn trackers."""
+def _forwarder_context(
+    client: httpx.AsyncClient,
+    bridge_dir: Path,
+    *,
+    session_id: str = "conv_123",
+) -> dict[str, Any]:
+    """Build fresh per-call trackers bound to the requested session."""
     return {
-        "session_id": "conv_123",
+        "session_id": session_id,
         "bridge_dir": bridge_dir,
-        "usage_coalescer": _usage_coalescer(client),
+        "usage_coalescer": _usage_coalescer(client, session_id),
         "elicitation_tracker": _elicitation_tracker(),
     }
 
@@ -2568,14 +2579,8 @@ def test_forwarder_ignores_thread_started_for_current_codex_thread(tmp_path: Pat
     already bound it. This fails if the rotation detector treats every
     ``thread/started`` as a clear-session boundary.
     """
-    write_bridge_state(
-        tmp_path,
-        CodexNativeBridgeState(
-            session_id="conv_old",
-            socket_path=str(tmp_path / "app-server.sock"),
-            thread_id="thread_old",
-            codex_home=str(tmp_path / "codex-home"),
-        ),
+    _write_forwarder_bridge(
+        tmp_path, session_id="conv_old", thread_id="thread_old", active_turn_id=None
     )
 
     async def run() -> bool:
@@ -2625,14 +2630,8 @@ def test_forwarder_rotates_session_on_new_codex_thread_and_posts_to_new_session(
     thread, and send subsequent status/history events to the new AP
     session.
     """
-    write_bridge_state(
-        tmp_path,
-        CodexNativeBridgeState(
-            session_id="conv_old",
-            socket_path=str(tmp_path / "app-server.sock"),
-            thread_id="thread_old",
-            codex_home=str(tmp_path / "codex-home"),
-        ),
+    _write_forwarder_bridge(
+        tmp_path, session_id="conv_old", thread_id="thread_old", active_turn_id=None
     )
     fake_client = _FakeCodexAppServerClient()
     requests: list[tuple[str, str, dict[str, Any] | None]] = []
@@ -5398,14 +5397,8 @@ def test_supervise_forwarder_rotation_clears_unparented_pending_child_threads(
 
     :param tmp_path: Pytest temporary directory.
     """
-    write_bridge_state(
-        tmp_path,
-        CodexNativeBridgeState(
-            session_id="conv_old",
-            socket_path=str(tmp_path / "app-server.sock"),
-            thread_id="thread_old",
-            codex_home=str(tmp_path / "codex-home"),
-        ),
+    _write_forwarder_bridge(
+        tmp_path, session_id="conv_old", thread_id="thread_old", active_turn_id=None
     )
     unparented_child_started = {
         "method": "thread/started",
@@ -10229,13 +10222,8 @@ def test_forwarder_routes_live_child_items_to_child_session(
         ) as client:
             await codex_native_forwarder._handle_event(
                 client,
-                session_id="conv_parent",
-                bridge_dir=tmp_path,
+                **_forwarder_context(client, tmp_path, session_id="conv_parent"),
                 event=live_child_event,
-                usage_coalescer=codex_native_forwarder._SessionUsageCoalescer(
-                    client, "conv_parent"
-                ),
-                elicitation_tracker=_elicitation_tracker(),
                 expected_thread_id="thread_parent",
                 forwarder_state=state,
             )
@@ -10288,13 +10276,8 @@ def test_forwarder_collab_item_started_registers_child_before_completed(
         ) as client:
             await codex_native_forwarder._handle_event(
                 client,
-                session_id="conv_parent",
-                bridge_dir=tmp_path,
+                **_forwarder_context(client, tmp_path, session_id="conv_parent"),
                 event=started_event,
-                usage_coalescer=codex_native_forwarder._SessionUsageCoalescer(
-                    client, "conv_parent"
-                ),
-                elicitation_tracker=_elicitation_tracker(),
                 expected_thread_id="thread_parent",
                 forwarder_state=state,
             )
