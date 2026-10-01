@@ -1907,7 +1907,7 @@ function ConversationList({
         ? groupConversations(byUpdated, statusOf, STATUS_BUCKETS).flatMap((g) => g.conversations)
         : byUpdated;
     if (!grouped) return { pinned, sessions: ordered, projectGroups, groupTitles: null };
-    // ponytail: buckets use render-time "now", so a day rollover shows on the next list update.
+    // Buckets use render-time "now", so a day rollover shows on the next list update.
     const now = new Date();
     const groupTitles = new Map<string, string>(
       ordered.map((c) => [
@@ -2760,10 +2760,9 @@ function ConversationList({
               and Projects is empty for Shared and Archived. */}
                   {/* Archived sessions are no longer listed here — they live on the
               Settings page ("Archived chats"), reachable from the footer. */}
-                  {/* Infinite-scroll sentinel for the global list. Pagination extends
-              the Chats list, so it hides with a collapsed Chats group — a loader
-              under a collapsed group reads orphaned. A new page can land in any
-              group, so grouped views keep it while any group is expanded. */}
+                  {/* Infinite-scroll sentinel. A new page can land in any group, so
+              it hides only when every visible group is collapsed (a loader under
+              a collapsed group reads orphaned). */}
                   {!(sessionGroups
                     ? sessionGroups.every((g) => effectiveCollapsedSections.includes(g.title))
                     : effectiveCollapsedSections.includes("Chats")) && (

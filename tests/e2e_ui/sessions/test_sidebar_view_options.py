@@ -107,8 +107,11 @@ def test_status_grouping_and_show_toggles_persist_across_reload(
     expect(idle_row.get_by_test_id("session-row-meta")).to_be_visible()
 
 
-def test_tooltip_fetches_repo_and_pr_only_when_opened(page: Page, stubbed_sidebar: str) -> None:
+def test_tooltip_fetches_repo_and_pr_only_when_opened(
+    page: Page, request: pytest.FixtureRequest
+) -> None:
     """Hovering a workspace session loads its repo and PR into the tooltip on demand."""
+    base_url = request.config.getoption("--ui-base-url") or request.getfixturevalue("live_server")
     github_requests: list[str] = []
 
     def serve_github(route: Route) -> None:
@@ -123,7 +126,13 @@ def test_tooltip_fetches_repo_and_pr_only_when_opened(page: Page, stubbed_sideba
             }
         )
 
+    # Register every route BEFORE navigating, so an eager fetch during mount is
+    # counted — otherwise the empty-request assertion can't detect it.
+    page.route_web_socket("**/v1/sessions/updates*", lambda _socket: None)
+    page.route("**/v1/sessions?*", _serve_sessions)
     page.route("**/v1/sessions/*/resources/github*", serve_github)
+    page.goto(base_url)
+    expect(page.get_by_text("Idle session", exact=True)).to_be_visible(timeout=30_000)
     page.wait_for_load_state("networkidle")
     assert github_requests == []
 
