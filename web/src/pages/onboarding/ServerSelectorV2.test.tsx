@@ -376,6 +376,27 @@ describe("ServerSelectorV2", () => {
     fireEvent.click(await screen.findByRole("button", { name: /(install|open) omnigent/i }));
   }
 
+  it("the runner step offers Install only when the install would run", async () => {
+    const renderRunnerStep = (bundledCli: boolean) => {
+      render(
+        <ServerSelectorV2
+          setup={makeSetup({
+            installed: false,
+            onInstallCli: vi.fn(),
+            managedServers: ["https://team.example.com/"],
+            getRunnerOptions: vi.fn().mockResolvedValue({ remote: false, bundledCli }),
+          })}
+        />,
+      );
+      fireEvent.click(screen.getByRole("button", { name: /join your team \(team\)/i }));
+    };
+    renderRunnerStep(true);
+    expect(await screen.findByRole("button", { name: "Open Omnigent" })).toBeInTheDocument();
+    cleanup();
+    renderRunnerStep(false);
+    expect(await screen.findByRole("button", { name: "Install Omnigent" })).toBeInTheDocument();
+  });
+
   it("a remote runner connects first, streaming its output, then opens the server, with no local install", async () => {
     let finishRunner: (v: { ok: boolean }) => void = () => {};
     let emit: (line: string) => void = () => {};

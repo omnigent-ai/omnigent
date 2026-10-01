@@ -1,5 +1,5 @@
 // Bottom-of-screen footer for the landing screen: app/community links + a
-// "Maintained by Databricks" note, mirroring the design. Links open in the
+// "Maintained by" note, mirroring the design. Links open in the
 // user's real browser (window.open on the file:// page is routed out by the
 // shell's popup policy, same as the Cloud-docs button).
 
@@ -13,7 +13,7 @@ const LINKS: { key: string; label: string; icon: ReactNode; href: string }[] = [
     key: "ios",
     label: "iOS App",
     icon: <AppleGlyph />,
-    href: "https://omnigent.ai/docs/interact/mobile#ios-app",
+    href: "https://apps.apple.com/us/app/omnigent/id6783102694",
   },
   {
     key: "android",
@@ -54,7 +54,7 @@ export function LandingFooter() {
         •
       </span>
       <span className="whitespace-nowrap px-2 text-base text-muted-foreground">
-        Maintained by Databricks
+        Maintained by Databricks and the Omnigent community
       </span>
     </div>
   );
