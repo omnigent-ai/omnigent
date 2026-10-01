@@ -26,13 +26,11 @@ real. No credentials or live model calls are required::
 from __future__ import annotations
 
 import contextlib
-import io
 import json
 import os
 import shutil
 import subprocess
 import sys
-import tarfile
 import time
 import uuid
 from collections.abc import Iterator
@@ -45,6 +43,7 @@ import yaml
 
 from omnigent.onboarding.ambient import CLAUDE_CODE_MANAGED_SETTINGS_PATHS
 from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN, token_bound_runner_id
+from tests._helpers.session import bundle_files, post_session_bundle
 from tests.e2e.conftest import find_free_port
 
 pytestmark = pytest.mark.timeout(360, method="signal")
@@ -299,17 +298,9 @@ def _register_parent(client: httpx.Client, mock_url: str) -> str:
             }
         },
     }
-    buf = io.BytesIO()
-    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
-        data = yaml.safe_dump(spec).encode()
-        info = tarfile.TarInfo(f"{name}.yaml")
-        info.size = len(data)
-        tar.addfile(info, io.BytesIO(data))
-    resp = client.post(
-        "/v1/sessions",
-        data={"metadata": json.dumps({})},
-        files={"bundle": ("agent.tar.gz", buf.getvalue(), "application/gzip")},
-    )
+    data = yaml.safe_dump(spec).encode()
+    bundle_bytes = bundle_files({f"{name}.yaml": data})
+    resp = post_session_bundle(client.post, "/v1/sessions", bundle_bytes)
     assert resp.status_code in (200, 201, 409), f"{resp.status_code} {resp.text[:400]}"
     listing = client.get(
         "/v1/sessions", params={"visibility": "all", "agent_name": name, "limit": 1}

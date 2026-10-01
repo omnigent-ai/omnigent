@@ -1,3 +1,4 @@
+import { testAgent } from "@/test/agentFixtures";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
 import type { ReactNode } from "react";
@@ -888,15 +889,11 @@ describe("useAvailableAgents", () => {
 describe("prefetchAvailableAgentDetails", () => {
   it("patches harness, description, and skills into the cache on success", async () => {
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-    const agent = {
-      id: "ag_doc",
-      name: "doc-writer",
+    const agent = testAgent("ag_doc", "doc-writer", {
       display_name: "Doc-writer",
-      description: null,
       harness: null,
-      skills: [],
       sessionId: "conv_3",
-    };
+    });
     queryClient.setQueryData(["available-agents"], [agent]);
 
     fetchMock.mockResolvedValueOnce(
@@ -928,15 +925,11 @@ describe("prefetchAvailableAgentDetails", () => {
 
   it("is a no-op when harness is already populated", async () => {
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-    const agent = {
-      id: "ag_doc",
-      name: "doc-writer",
+    const agent = testAgent("ag_doc", "doc-writer", {
       display_name: "Doc-writer",
-      description: null,
       harness: "claude-sdk",
-      skills: [],
       sessionId: "conv_3",
-    };
+    });
     queryClient.setQueryData(["available-agents"], [agent]);
 
     await prefetchAvailableAgentDetails(agent, queryClient);
@@ -947,14 +940,10 @@ describe("prefetchAvailableAgentDetails", () => {
 
   it("is a no-op when sessionId is absent (catalog agent)", async () => {
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-    const agent = {
-      id: "ag_native",
-      name: "claude-native-ui",
+    const agent = testAgent("ag_native", "claude-native-ui", {
       display_name: "Claude Code",
-      description: null,
       harness: null,
-      skills: [],
-    };
+    });
     queryClient.setQueryData(["available-agents"], [agent]);
 
     await prefetchAvailableAgentDetails(agent, queryClient);
@@ -964,15 +953,11 @@ describe("prefetchAvailableAgentDetails", () => {
 
   it("leaves the agent name-only when the enrich fetch fails", async () => {
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-    const agent = {
-      id: "ag_doc",
-      name: "doc-writer",
+    const agent = testAgent("ag_doc", "doc-writer", {
       display_name: "Doc-writer",
-      description: null,
       harness: null,
-      skills: [],
       sessionId: "conv_3",
-    };
+    });
     queryClient.setQueryData(["available-agents"], [agent]);
 
     fetchMock.mockResolvedValueOnce(mockResponse({ detail: "boom" }, { ok: false, status: 500 }));
@@ -989,23 +974,15 @@ describe("prefetchAvailableAgentDetails", () => {
     // prefetchAvailableAgentDetails detects harness: "kiro-native" after
     // enrichment and removes the agent since a seeded kiro built-in exists.
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-    const kiroBuiltin = {
-      id: "ag_kiro",
-      name: "kiro-native-ui",
+    const kiroBuiltin = testAgent("ag_kiro", "kiro-native-ui", {
       display_name: "Kiro",
-      description: null,
       harness: "kiro-native",
-      skills: [],
-    };
-    const kiroShadow = {
-      id: "ag_session_kiro",
-      name: "kiro-naitive",
+    });
+    const kiroShadow = testAgent("ag_session_kiro", "kiro-naitive", {
       display_name: "Kiro-naitive",
-      description: null,
       harness: null,
-      skills: [],
       sessionId: "conv_kiro",
-    };
+    });
     queryClient.setQueryData(["available-agents"], [kiroBuiltin, kiroShadow]);
 
     fetchMock.mockResolvedValueOnce(

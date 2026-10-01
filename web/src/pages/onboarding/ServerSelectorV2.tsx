@@ -393,7 +393,8 @@ export function ServerSelectorV2({ setup }: { setup: ServerSelectorV2Setup }) {
         {step === "runner" && runnerTarget !== null && (
           <RunnerStep
             remoteAvailable={runnerTarget.remote}
-            installed={setup.installed}
+            // A bundled host CLI skips the install, so the action only opens.
+            installed={setup.installed || runnerTarget.bundledCli}
             error={runnerError}
             connection={connection}
             onCancelConnect={cancelConnect}

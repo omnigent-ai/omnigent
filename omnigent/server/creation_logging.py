@@ -54,8 +54,17 @@ def creation_metadata(*, parent_session_id: str | None, host_type: str) -> None:
     )
 
 
-def session_created(session_id: str, runner_id: str | None = None) -> None:
-    """Publish the request-to-session link immediately after persistence."""
+def session_created(
+    session_id: str,
+    runner_id: str | None = None,
+    parent_session_id: str | None = None,
+) -> None:
+    """Publish the request-to-session link immediately after persistence.
+
+    ``parent_session_id`` is the spawning parent for a sub-agent child (``None``
+    for a top-level session); logging it on the creation row is what lets a
+    debug-log query join a child back to its parent session.
+    """
     set_current_session_id(session_id)
     set_current_runner_id(runner_id)
     add_audit_attrs(session_id=session_id, runner_id=runner_id)
@@ -65,6 +74,7 @@ def session_created(session_id: str, runner_id: str | None = None) -> None:
             "session_created",
             session_id=session_id,
             runner_id=runner_id,
+            parent_session_id=parent_session_id,
             creation_kind=current_request_audit_attrs().get("creation_kind", "unknown"),
         ),
     )
