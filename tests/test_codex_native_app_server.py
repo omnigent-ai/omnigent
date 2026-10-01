@@ -2459,11 +2459,21 @@ async def test_mcp_inventory_mismatch_fails_before_process_start(
 
 
 def test_mcp_inventory_validation_identifies_invalid_config(tmp_path: Path) -> None:
-    config_path = tmp_path / "config.toml"
+    private_home = tmp_path / "private"
+    source_home = tmp_path / "source"
+    private_home.mkdir()
+    source_home.mkdir()
+    config_path = private_home / "config.toml"
     config_path.write_text("[mcp_servers", encoding="utf-8")
 
+    with pytest.raises(RuntimeError, match="Invalid Codex MCP inventory config") as sync_error:
+        app_server._sync_shared_mcp_server_config(
+            private_home, source_home, None, codex_version=(0, 154, 0)
+        )
+    assert str(config_path) in str(sync_error.value)
+
     with pytest.raises(RuntimeError, match="Invalid Codex MCP inventory config") as error:
-        app_server._validate_mcp_server_inventory(tmp_path, frozenset())
+        app_server._validate_mcp_server_inventory(private_home, frozenset())
     assert str(config_path) in str(error.value)
 
 

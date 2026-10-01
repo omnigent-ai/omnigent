@@ -870,11 +870,14 @@ def _sync_shared_mcp_server_config(
     # bridge command immediately after the shared inventory is refreshed.
     servers.pop("omnigent", None)
     config_path = codex_home / "config.toml"
-    document = (
-        tomlkit.parse(config_path.read_text(encoding="utf-8"))
-        if config_path.exists()
-        else tomlkit.document()
-    )
+    try:
+        document = (
+            tomlkit.parse(config_path.read_text(encoding="utf-8"))
+            if config_path.exists()
+            else tomlkit.document()
+        )
+    except (OSError, tomlkit.exceptions.TOMLKitError) as error:
+        raise RuntimeError(f"Invalid Codex MCP inventory config: {config_path}") from error
     if servers:
         document["mcp_servers"] = servers
     else:
@@ -923,6 +926,10 @@ def shared_mcp_server_config_matches(
         )
     except (OSError, ValueError, tomlkit.exceptions.TOMLKitError):
         # Tolerate incomplete shared config while the app-server is live.
+        _logger.warning(
+            "Unreadable shared Codex MCP config; keeping live session: %s",
+            source_home,
+        )
         return True
     expected.pop("omnigent", None)
     config_path = codex_home / "config.toml"
@@ -930,8 +937,12 @@ def shared_mcp_server_config_matches(
         return not expected
     try:
         document = tomlkit.parse(config_path.read_text(encoding="utf-8")).unwrap()
-    except (OSError, ValueError, tomlkit.exceptions.TOMLKitError):
+    except (OSError, tomlkit.exceptions.TOMLKitError):
         # Tolerate an incomplete private file while the app-server is live.
+        _logger.warning(
+            "Unreadable private Codex config; keeping live session: %s",
+            config_path,
+        )
         return True
     configured = document.get("mcp_servers")
     actual = dict(configured) if isinstance(configured, dict) else {}

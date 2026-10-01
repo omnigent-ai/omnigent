@@ -4775,26 +4775,36 @@ async def _auto_create_codex_terminal(
     app_server = _AUTO_CODEX_APP_SERVERS.get(session_id)
     forwarder = _AUTO_FORWARDER_TASKS.get(session_id)
     bridge_state = read_bridge_state(bridge_dir)
-    process = getattr(app_server, "proc", None)
-    backend_reusable = (
-        app_server is not None
-        and process is not None
-        and process.returncode is None
-        and forwarder is not None
-        and not forwarder.done()
-        and bridge_state is not None
-        and bridge_state.thread_id == launch_config.external_session_id
-        and bridge_state.socket_path == app_server.listen_url
-        and bridge_state.codex_home == str(app_server.codex_home)
-    )
+
+    def _backend_reusable(
+        candidate_forwarder: asyncio.Task[object] | None,
+        candidate_bridge_state: CodexNativeBridgeState | None,
+    ) -> bool:
+        process = getattr(app_server, "proc", None)
+        return (
+            app_server is not None
+            and process is not None
+            and process.returncode is None
+            and candidate_forwarder is not None
+            and not candidate_forwarder.done()
+            and candidate_bridge_state is not None
+            and candidate_bridge_state.thread_id == launch_config.external_session_id
+            and candidate_bridge_state.socket_path == app_server.listen_url
+            and candidate_bridge_state.codex_home == str(app_server.codex_home)
+        )
+
+    backend_reusable = _backend_reusable(forwarder, bridge_state)
     shared_mcp_config_current = False
     if backend_reusable:
+        if app_server is None:
+            raise RuntimeError("Reusable Codex backend is missing its app-server")
         from omnigent.inner.codex_executor import _codex_home_config_source_from_env
 
+        config_source = await asyncio.to_thread(_codex_home_config_source_from_env)
         shared_mcp_config_current = await asyncio.to_thread(
             shared_mcp_server_config_matches,
             app_server.codex_home,
-            _codex_home_config_source_from_env(),
+            config_source,
             getattr(app_server, "config_profile", None),
             codex_version=getattr(app_server, "codex_cli_version", None),
         )
@@ -4805,7 +4815,8 @@ async def _auto_create_codex_terminal(
         and bridge_state.active_turn_id is not None
     )
     if backend_reusable and (shared_mcp_config_current or refresh_deferred):
-        assert app_server is not None and bridge_state is not None
+        if app_server is None or bridge_state is None:
+            raise RuntimeError("Reusable Codex backend is missing live state")
         if refresh_deferred:
             _logger.info(
                 "Keeping Codex MCP config for active turn; refresh will occur on "
@@ -4831,12 +4842,6 @@ async def _auto_create_codex_terminal(
             agent_spec=agent_spec,
         )
         return launched.view
-    if backend_reusable:
-        _logger.info(
-            "Restarting Codex app-server to apply shared MCP config for session=%s",
-            session_id,
-            extra={"session_id": session_id},
-        )
     # Route across all offerings: a configured provider (omnigent setup),
     # a Databricks ucode profile from provider config, or Codex's own
     # login — parity with the in-process codex harness and the CLI path.
@@ -4972,23 +4977,15 @@ async def _auto_create_codex_terminal(
     _session_meta_provider = codex_session_meta_model_provider(_codex_launch)
     if backend_reusable and not shared_mcp_config_current:
         latest_bridge_state = read_bridge_state(bridge_dir)
-        process = getattr(app_server, "proc", None)
-        backend_still_reusable = (
-            app_server is not None
-            and process is not None
-            and process.returncode is None
-            and forwarder is not None
-            and not forwarder.done()
-            and latest_bridge_state is not None
-            and latest_bridge_state.thread_id == launch_config.external_session_id
-            and latest_bridge_state.socket_path == app_server.listen_url
-            and latest_bridge_state.codex_home == str(app_server.codex_home)
-        )
+        latest_forwarder = _AUTO_FORWARDER_TASKS.get(session_id)
+        backend_still_reusable = _backend_reusable(latest_forwarder, latest_bridge_state)
         if (
             backend_still_reusable
             and latest_bridge_state is not None
             and latest_bridge_state.active_turn_id is not None
         ):
+            if app_server is None:
+                raise RuntimeError("Reusable Codex backend is missing its app-server")
             _logger.info(
                 "Keeping Codex MCP config for newly active turn; refresh will occur "
                 "on the next terminal recreation or app-server launch: session=%s",
@@ -5005,7 +5002,19 @@ async def _auto_create_codex_terminal(
                 thread_id=latest_bridge_state.thread_id,
                 agent_spec=agent_spec,
             )
+            if pick_to_reset is not None and server_client is not None:
+                await _clear_session_model_override(
+                    session_id,
+                    server_client,
+                    expected_model_override=pick_to_reset,
+                )
             return launched.view
+    if backend_reusable:
+        _logger.info(
+            "Restarting Codex app-server to apply shared MCP config for session=%s",
+            session_id,
+            extra={"session_id": session_id},
+        )
     # Cancel any surviving forwarder first so its teardown closes the OLD app-server,
     # not the one registered below — and so it can't mirror alongside the new one.
     await _cancel_auto_forwarder_task(session_id)
