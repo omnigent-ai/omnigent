@@ -10628,6 +10628,7 @@ def host_stop(
     if not records:
         click.echo("No matching host daemon found.")
         return
+    stopped_local_daemon = False
     for record in records:
         stopped = 0
         if not daemon_only and not force:
@@ -10647,6 +10648,16 @@ def host_stop(
             )
         else:
             click.echo(f"Stopped {target} daemon pid={record.pid}; sessions_stopped={stopped}.")
+        if record.target == _LOCAL_DAEMON_MARKER and outcome != _STOP_DROPPED_FOREIGN:
+            stopped_local_daemon = True
+    if stopped_local_daemon:
+        # `host stop` only stops hosting; the local server keeps running (so its
+        # web UI / history survive). Point users at the full stop so a wedged
+        # server doesn't look like it survived a restart.
+        click.echo(
+            "This stops hosting only — the local Omnigent server (web UI / history) "
+            f"stays up. Run `{cli_invocation()} stop` to stop it too."
+        )
 
 
 @host.command("stop-session")

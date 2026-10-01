@@ -2315,6 +2315,76 @@ def test_host_stop_undiscoverable_local_server_degrades_to_daemon_only(
     assert "sessions_stopped=0" in result.output
 
 
+def test_host_stop_local_daemon_points_at_full_stop(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Stopping the local daemon reminds the user the server stays up.
+
+    ``host stop`` stops hosting only; the detached local server (web UI /
+    history) keeps running, so a wedged server can look like it survived a
+    restart. The command points at the full ``stop`` to clear that up.
+    """
+    monkeypatch.setattr(cli, "_HOST_PID_PATH", tmp_path / "host.pid")
+    _write_daemon_registry_record(
+        tmp_path,
+        pid=4242,
+        target="local",
+        mode="local",
+        server_url=None,
+    )
+    monkeypatch.setattr(cli, "local_server_url_if_healthy", lambda: None)
+    monkeypatch.setattr(cli, "_local_server_confirmed_dead", lambda: True)
+    monkeypatch.setattr(
+        cli,
+        "_host_http_json",
+        lambda **kwargs: pytest.fail(f"unexpected HTTP call: {kwargs}"),
+    )
+    monkeypatch.setattr(
+        cli,
+        "_terminate_daemon",
+        lambda record, *, force: cli._STOP_TERMINATED,
+    )
+
+    result = CliRunner().invoke(cli_group, ["host", "stop", "--server", ""])
+
+    assert result.exit_code == 0, result.output
+    assert "the local Omnigent server (web UI / history)" in result.output
+    assert f"{cli.cli_invocation()} stop" in result.output
+
+
+def test_host_stop_remote_daemon_omits_local_server_hint(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A remote ``--server`` stop says nothing about a local server."""
+    monkeypatch.setattr(cli, "_HOST_PID_PATH", tmp_path / "host.pid")
+    _write_daemon_registry_record(
+        tmp_path,
+        pid=4242,
+        target="https://server.example.com",
+        mode="server",
+        server_url="https://server.example.com",
+    )
+    monkeypatch.setattr(
+        cli,
+        "_host_http_json",
+        lambda **kwargs: pytest.fail(f"unexpected HTTP call: {kwargs}"),
+    )
+    monkeypatch.setattr(
+        cli,
+        "_terminate_daemon",
+        lambda record, *, force: cli._STOP_TERMINATED,
+    )
+
+    result = CliRunner().invoke(
+        cli_group,
+        ["host", "stop", "--server", "https://server.example.com", "--force"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "the local Omnigent server" not in result.output
+    assert f"{cli.cli_invocation()} stop" not in result.output
+
+
 def test_host_stop_server_url_matches_local_daemon_serving_it(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
