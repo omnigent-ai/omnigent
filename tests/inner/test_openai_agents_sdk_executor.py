@@ -2648,8 +2648,8 @@ def test_turn_usage_no_cached_tokens_omits_cache_key() -> None:
 
 def test_turn_usage_cached_tokens_clamped_to_input() -> None:
     """
-    More cached than input tokens (a malformed response) must clamp to the
-    input total instead of driving ``input_tokens`` negative.
+    Malformed cached > input clamps per response, so it neither drives
+    ``input_tokens`` negative nor absorbs another response's uncached input.
     """
 
     async def _t() -> None:
@@ -2660,7 +2660,12 @@ def test_turn_usage_cached_tokens_clamped_to_input() -> None:
                 usage=_sdk_usage(
                     input_tokens=1000, output_tokens=50, total_tokens=1050, cached_tokens=1500
                 )
-            )
+            ),
+            _FakeRawResponse(
+                usage=_sdk_usage(
+                    input_tokens=2000, output_tokens=100, total_tokens=2100, cached_tokens=500
+                )
+            ),
         ]
         _FakeRunner.next_result = result
         executor = OpenAIAgentsSDKExecutor(client=object())
@@ -2680,9 +2685,10 @@ def test_turn_usage_cached_tokens_clamped_to_input() -> None:
         turn_complete = next(e for e in events if isinstance(e, TurnComplete))
         usage = turn_complete.usage
         assert usage is not None
-        assert usage["input_tokens"] == 0
-        assert usage["cache_read_input_tokens"] == 1000
-        assert usage["total_tokens"] == 1050
+        # First response clamps 1500 -> 1000; the second keeps its 500.
+        assert usage["cache_read_input_tokens"] == 1500
+        assert usage["input_tokens"] == 1500
+        assert usage["total_tokens"] == 3150
 
     _run(_t())
 
