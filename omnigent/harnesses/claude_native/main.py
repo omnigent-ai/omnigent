@@ -191,6 +191,7 @@ _UCODE_CLAUDE_AGENT_NAME = "claude"
 _UCODE_CLAUDE_BASE_URL_ENV = "ANTHROPIC_BASE_URL"
 _ANTHROPIC_MODEL_ENV = "ANTHROPIC_MODEL"
 _ANTHROPIC_API_KEY_ENV = "ANTHROPIC_API_KEY"
+_ANTHROPIC_AUTH_TOKEN_ENV = "ANTHROPIC_AUTH_TOKEN"
 _ANTHROPIC_BEDROCK_BASE_URL_ENV = "ANTHROPIC_BEDROCK_BASE_URL"
 _AWS_BEARER_TOKEN_BEDROCK_ENV = "AWS_BEARER_TOKEN_BEDROCK"
 _CLAUDE_CODE_USE_BEDROCK_ENV = "CLAUDE_CODE_USE_BEDROCK"
@@ -211,6 +212,7 @@ _CLAUDE_NONESSENTIAL_TRAFFIC_ENV = "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"
 _CLAUDE_RESUME_ITEMS_PAGE_LIMIT = 1000
 _CLAUDE_RESUME_ITEMS_PAGE_LIMIT_FLOOR = 100
 _CLAUDE_MODEL_PROBE_TIMEOUT_S = 20.0
+_AMBIENT_GATEWAY_LISTING_TIMEOUT_S = 10.0
 #: Wall-clock cap for the per-alias resolution fan-out as a whole; aliases
 #: still unresolved when it expires keep their bare rows (the cache's
 #: revalidation retries them later). Startup dominates each run and
@@ -451,8 +453,10 @@ def _ambient_env_is_non_anthropic_gateway() -> bool:
 
     Used as the ``claude_config is None`` counterpart to
     :func:`_serves_canonical_anthropic_ids`: when managed settings (e.g. Isaac)
-    set ``ANTHROPIC_BASE_URL`` to a Databricks gateway, the catalog and its
-    fingerprint must treat the env as a non-canonical endpoint.
+    or the shell export ``ANTHROPIC_BASE_URL`` for a gateway, the catalog keys
+    its fingerprint on that endpoint and asks it what it serves
+    (:func:`_ambient_gateway_serves_canonical_ids`) before keeping bare
+    Anthropic ids.
     """
     from urllib.parse import urlparse
 
@@ -461,6 +465,67 @@ def _ambient_env_is_non_anthropic_gateway() -> bool:
         return False
     host = (urlparse(base_url).hostname or "").lower()
     return host != "anthropic.com" and not host.endswith(".anthropic.com")
+
+
+def _ambient_env_is_databricks_gateway() -> bool:
+    """Whether the ambient ``ANTHROPIC_BASE_URL`` names a Databricks AI Gateway."""
+    from omnigent.databricks_ai_gateway import is_databricks_ai_gateway_url
+
+    return is_databricks_ai_gateway_url(os.environ.get(_UCODE_CLAUDE_BASE_URL_ENV, ""))
+
+
+def _ambient_custom_headers() -> dict[str, str]:
+    """The ``ANTHROPIC_CUSTOM_HEADERS`` Claude Code sends, one ``Name: value`` per line."""
+    headers: dict[str, str] = {}
+    for line in os.environ.get(_CLAUDE_CODE_CUSTOM_HEADERS_ENV, "").splitlines():
+        name, separator, value = line.partition(":")
+        if separator and name.strip():
+            headers[name.strip()] = value.strip()
+    return headers
+
+
+def _ambient_gateway_serves_canonical_ids(
+    *, transport: httpx.BaseTransport | None = None
+) -> bool | None:
+    """Whether the ambient gateway's listing names bare ``claude-*`` ids; ``None`` when unknown."""
+    base_url = os.environ.get(_UCODE_CLAUDE_BASE_URL_ENV, "")
+    if not base_url:
+        return None
+    # The same credential Claude Code sends to this gateway.
+    headers = {"anthropic-version": model_catalog._ANTHROPIC_API_VERSION}
+    token = os.environ.get(_ANTHROPIC_AUTH_TOKEN_ENV) or os.environ.get(_ANTHROPIC_API_KEY_ENV)
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+        headers["x-api-key"] = token
+    headers.update(_ambient_custom_headers())
+    try:
+        with httpx.Client(
+            transport=transport, timeout=_AMBIENT_GATEWAY_LISTING_TIMEOUT_S
+        ) as client:
+            response = client.get(
+                model_catalog._models_url(base_url),
+                # LiteLLM hides wildcard routes such as claude-* unless asked; others ignore this.
+                params={"return_wildcard_routes": "true"},
+                headers=headers,
+            )
+            response.raise_for_status()
+            payload = response.json()
+    except (httpx.HTTPError, ValueError, OSError) as exc:
+        _logger.info(
+            "ambient Claude gateway %s did not list its models (%s); keeping the CLI's rows",
+            base_url,
+            exc,
+        )
+        return None
+    data = payload.get("data") if isinstance(payload, dict) else None
+    ids = [
+        item["id"]
+        for item in (data if isinstance(data, list) else [])
+        if isinstance(item, dict) and isinstance(item.get("id"), str) and item["id"]
+    ]
+    if not ids:
+        return None
+    return any(model_id == "*" or model_id.startswith("claude-") for model_id in ids)
 
 
 def _claude_family(token: str) -> str | None:
@@ -1300,7 +1365,7 @@ def claude_catalog_fingerprint(claude_config: ClaudeNativeUcodeConfig | None) ->
     ambient_gateway = os.environ.get(_UCODE_CLAUDE_BASE_URL_ENV) if claude_config is None else None
     return fingerprint_of(
         "claude-native",
-        "control-picker-v3",
+        "control-picker-v4",
         sorted(claude_config.env.items()) if claude_config is not None else None,
         claude_config.api_key_helper if claude_config is not None else None,
         claude_config.model if claude_config is not None else None,
@@ -1320,7 +1385,10 @@ async def claude_model_catalog(
     Rows come from the harness's own enumeration alone (no configured/static
     merge). Servability filtering matches the listing composition: on a
     non-canonical endpoint, aliases resolving to bare Anthropic ids are
-    dropped unless the provider explicitly declares them routable. The
+    dropped unless the provider explicitly declares them routable. With no
+    config, an ambient ``ANTHROPIC_BASE_URL`` gateway is asked what it serves;
+    an unreadable listing keeps the CLI's rows, except on a Databricks AI
+    Gateway, whose namespaced ids reject bare Anthropic spellings. The
     default marker is what a Default launch of this config
     actually runs: the config's own launch pin when the provider resolves
     one (those launches pass ``--model`` explicitly), else the enumeration
@@ -1338,9 +1406,13 @@ async def claude_model_catalog(
         return []
     rows = list(probe.alias_rows)
     declared_models = set(claude_config.routable_models) if claude_config is not None else set()
-    _non_canonical = (
-        claude_config is not None and not _serves_canonical_anthropic_ids(claude_config)
-    ) or (claude_config is None and _ambient_env_is_non_anthropic_gateway())
+    if claude_config is not None:
+        _non_canonical = not _serves_canonical_anthropic_ids(claude_config)
+    elif _ambient_env_is_non_anthropic_gateway():
+        serves = await asyncio.to_thread(_ambient_gateway_serves_canonical_ids)
+        _non_canonical = not serves if serves is not None else _ambient_env_is_databricks_gateway()
+    else:
+        _non_canonical = False
     if _non_canonical:
         rows = [
             row
@@ -1368,11 +1440,8 @@ async def claude_model_catalog(
         # Append the observed default as its own honest row — but never
         # claim a bare Anthropic id is launchable on an endpoint that
         # rejects that spelling.
-        _canonical_ids_ok = (
-            claude_config is None and not _ambient_env_is_non_anthropic_gateway()
-        ) or (claude_config is not None and _serves_canonical_anthropic_ids(claude_config))
         servable = (
-            _canonical_ids_ok
+            not _non_canonical
             or not default_model.startswith("claude-")
             or default_model in declared_models
         )

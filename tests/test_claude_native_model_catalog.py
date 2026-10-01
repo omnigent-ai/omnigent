@@ -8,9 +8,22 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+import httpx
 import pytest
 
 from omnigent.harnesses.claude_native import main as claude_native
+
+
+@pytest.fixture(autouse=True)
+def _no_ambient_anthropic_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The catalog reads the ambient Anthropic env; start every test without one."""
+    for name in (
+        "ANTHROPIC_BASE_URL",
+        "ANTHROPIC_AUTH_TOKEN",
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_CUSTOM_HEADERS",
+    ):
+        monkeypatch.delenv(name, raising=False)
 
 
 def _stub_picker(
@@ -289,3 +302,147 @@ async def test_catalog_keeps_enabled_fable_and_future_picker_models(
         },
         {"id": "future", "model": "vendor-future", "displayName": "Future model"},
     ]
+
+
+# The CLI's picker through an Anthropic passthrough gateway: every alias resolves
+# to a bare canonical id, exactly as it does against api.anthropic.com.
+_PASSTHROUGH_PICKER: list[dict[str, Any]] = [
+    {"value": "default", "resolvedModel": "claude-opus-5[1m]", "displayName": "Default"},
+    {
+        "value": "opus[1m]",
+        "resolvedModel": "claude-opus-5[1m]",
+        "displayName": "Opus (1M context)",
+    },
+    {"value": "sonnet", "resolvedModel": "claude-sonnet-5", "displayName": "Sonnet"},
+    {"value": "haiku", "resolvedModel": "claude-haiku-4-5", "displayName": "Haiku"},
+]
+_PASSTHROUGH_ROWS: list[dict[str, object]] = [
+    {
+        "id": "opus[1m]",
+        "model": "claude-opus-5[1m]",
+        "displayName": "Opus (1M context)",
+        "isDefault": True,
+    },
+    {"id": "sonnet", "model": "claude-sonnet-5", "displayName": "Sonnet"},
+    {"id": "haiku", "model": "claude-haiku-4-5", "displayName": "Haiku"},
+]
+
+
+def _stub_ambient_gateway(
+    monkeypatch: pytest.MonkeyPatch, base_url: str, serves: bool | None
+) -> None:
+    """Point the ambient env at *base_url* whose ``/v1/models`` answer is *serves*."""
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", base_url)
+    monkeypatch.setattr(
+        claude_native, "_ambient_gateway_serves_canonical_ids", lambda: serves, raising=False
+    )
+
+
+@pytest.mark.parametrize("serves", [True, None], ids=["lists-claude-ids", "listing-undetermined"])
+async def test_ambient_gateway_catalog_keeps_the_clis_canonical_rows(
+    monkeypatch: pytest.MonkeyPatch, serves: bool | None
+) -> None:
+    """The CLI's rows stay whether the listing confirms ``claude-*`` or cannot be read."""
+    _stub_picker(monkeypatch, _PASSTHROUGH_PICKER, default="claude-opus-5[1m]")
+    _stub_ambient_gateway(monkeypatch, "http://litellm.local", serves)
+    assert await claude_native.claude_model_catalog(None) == _PASSTHROUGH_ROWS
+
+
+async def test_ambient_gateway_catalog_drops_canonical_rows_when_the_listing_is_namespaced(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A gateway that lists only namespaced ids cannot route the bare ones."""
+    gateway_row = {
+        "value": "gateway-opus",
+        "resolvedModel": "anthropic/claude-opus-5",
+        "displayName": "Opus (gateway)",
+    }
+    _stub_picker(monkeypatch, [*_PASSTHROUGH_PICKER, gateway_row], default="claude-opus-5[1m]")
+    _stub_ambient_gateway(monkeypatch, "http://openrouter.local/api/v1", False)
+    assert await claude_native.claude_model_catalog(None) == [
+        {"id": "gateway-opus", "model": "anthropic/claude-opus-5", "displayName": "Opus (gateway)"}
+    ]
+
+
+async def test_ambient_databricks_gateway_catalog_drops_canonical_rows_without_a_listing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A Databricks AI Gateway routes only its own ids even when it lists nothing."""
+    databricks_row = {
+        "value": "opus",
+        "resolvedModel": "databricks-claude-opus-5",
+        "displayName": "Opus",
+    }
+    _stub_picker(
+        monkeypatch, [*_PASSTHROUGH_PICKER, databricks_row], default="databricks-claude-opus-5"
+    )
+    _stub_ambient_gateway(
+        monkeypatch, "https://example.cloud.databricks.com/ai-gateway/anthropic", None
+    )
+    assert await claude_native.claude_model_catalog(None) == [
+        {
+            "id": "opus",
+            "model": "databricks-claude-opus-5",
+            "displayName": "Opus",
+            "isDefault": True,
+        }
+    ]
+
+
+@pytest.mark.parametrize(
+    ("status", "payload", "expected"),
+    [
+        (200, {"object": "list", "data": [{"id": "claude-*", "object": "model"}]}, True),
+        (200, {"data": [{"id": "gpt-5"}, {"id": "claude-sonnet-5"}]}, True),
+        (200, {"data": [{"id": "anthropic/claude-sonnet-5"}, {"id": "gpt-5"}]}, False),
+        (200, {"data": []}, None),
+        (200, {"models": ["claude-sonnet-5"]}, None),
+        (401, {"error": {"message": "invalid key"}}, None),
+    ],
+    ids=["wildcard", "concrete", "namespaced", "empty", "unparseable", "unauthorized"],
+)
+def test_ambient_gateway_listing_classifies_what_the_gateway_serves(
+    monkeypatch: pytest.MonkeyPatch,
+    status: int,
+    payload: dict[str, Any],
+    expected: bool | None,
+) -> None:
+    """``/v1/models`` is asked for wildcard routes with the credential Claude Code sends."""
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "http://litellm.local/v1")
+    monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "gateway-bearer")
+    monkeypatch.setenv(
+        "ANTHROPIC_CUSTOM_HEADERS", "x-litellm-api-key: virtual-key\nX-Team: platform"
+    )
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(status, json=payload)
+
+    result = claude_native._ambient_gateway_serves_canonical_ids(
+        transport=httpx.MockTransport(handler)
+    )
+
+    assert result is expected
+    (request,) = requests
+    assert str(request.url) == "http://litellm.local/v1/models?return_wildcard_routes=true"
+    assert request.headers["authorization"] == "Bearer gateway-bearer"
+    assert request.headers["x-api-key"] == "gateway-bearer"
+    assert request.headers["x-litellm-api-key"] == "virtual-key"
+    assert request.headers["x-team"] == "platform"
+
+
+def test_ambient_gateway_listing_is_undetermined_when_unreachable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "http://litellm.local")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("connection refused", request=request)
+
+    transport = httpx.MockTransport(handler)
+    assert claude_native._ambient_gateway_serves_canonical_ids(transport=transport) is None
+
+
+def test_ambient_gateway_listing_is_skipped_without_an_ambient_gateway() -> None:
+    assert claude_native._ambient_gateway_serves_canonical_ids() is None

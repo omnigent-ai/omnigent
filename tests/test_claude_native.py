@@ -11373,9 +11373,9 @@ async def test_claude_model_catalog_filters_canonical_ids_for_ambient_gateway(
 ) -> None:
     """When claude_config is None but ANTHROPIC_BASE_URL is a gateway, filter canonical IDs.
 
-    Managed settings (e.g. Isaac) may set ANTHROPIC_BASE_URL to a Databricks
-    gateway. The catalog must filter canonical claude-* IDs even when
-    claude_config is None.
+    Managed settings (e.g. Isaac) may set ANTHROPIC_BASE_URL to a Databricks AI
+    Gateway, which routes only its own ids and lists nothing at /v1/models. The
+    catalog must filter canonical claude-* IDs even when claude_config is None.
     """
 
     async def _fake_probe(config: object) -> claude_native.ClaudeModelProbe:
@@ -11395,7 +11395,12 @@ async def test_claude_model_catalog_filters_canonical_ids_for_ambient_gateway(
         )
 
     monkeypatch.setattr(claude_native, "probe_claude_model_options", _fake_probe)
-    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://gw.example.com/anthropic")
+    monkeypatch.setattr(
+        claude_native, "_ambient_gateway_serves_canonical_ids", lambda: None, raising=False
+    )
+    monkeypatch.setenv(
+        "ANTHROPIC_BASE_URL", "https://example.cloud.databricks.com/ai-gateway/anthropic"
+    )
 
     rows = await claude_native.claude_model_catalog(None)
 
