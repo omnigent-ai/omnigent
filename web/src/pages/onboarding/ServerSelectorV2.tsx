@@ -62,7 +62,7 @@ export interface ServerSelectorV2Setup {
   recentServers: string[];
   /** Organization-provided server URLs. */
   managedServers: string[];
-  /** Display names for managed servers, server URL → name (MDM serverNames). */
+  /** Display names for managed servers, server URL → name (from the MDM URL). */
   managedServerNames?: Record<string, string>;
   /** Whether the `omnigent` CLI is already installed. Drives the "Install" vs
    *  "Start"/"Open" action label and whether install runs first. */

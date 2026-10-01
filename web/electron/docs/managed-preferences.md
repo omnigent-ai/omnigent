@@ -15,7 +15,6 @@ ai.omnigent.desktop
 | Key                                 | Type             | Required | Default | Description                                                                                                                                                                                     |
 | ----------------------------------- | ---------------- | -------- | ------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `serverUrls`                        | Array of strings | No       | `[]`    | Server URLs to offer, most-preferred first. Each must use `https://`. At most 10.                                                                                                               |
-| `serverNames`                       | Dictionary       | No       | `{}`    | Display names for servers in `serverUrls`: server URL → name, e.g. `Engineering`. Unnamed servers show their host.                                                                              |
 | `databricksInternalFeaturesEnabled` | Boolean          | No       | `false` | Enables Databricks-internal features (e.g. the Arca host option) on windows connected to a Databricks-managed server. Fails closed — anything but an explicit boolean `true` reads as disabled. |
 
 A schemeless host is accepted and interpreted as `https://`. Paths are
@@ -28,10 +27,15 @@ https://my-workspace.cloud.databricks.com/ml/omnigents
 Entries with the same origin are collapsed, keeping the first. An invalid type,
 an insecure or malformed entry, or more than 10 entries rejects the whole list.
 
-A `serverNames` key is matched to a `serverUrls` entry after the same
-normalization, so write it as it appears in `serverUrls`. Names are cosmetic:
-an entry that doesn't match a listed server, or has an empty name, is ignored
-on its own. The first managed server's name labels the connect screen's
+To give a server a display name, add an `omnigentServerName` query parameter
+to its entry. Omnigent removes the parameter before connecting:
+
+```text
+https://my-workspace.cloud.databricks.com/?o=123&omnigentServerName=Engineering
+```
+
+Encode spaces as `%20`, and write `&` as `&amp;` inside a plist. Unnamed servers
+show their host. The first managed server's name labels the connect screen's
 **Join your team** button; names also label the organization's servers in its
 dropdown and in the in-app server switcher.
 
@@ -96,14 +100,9 @@ this as a custom settings or managed preferences payload.
               <dict>
                 <key>serverUrls</key>
                 <array>
-                  <string>https://omnigent.corp.example.com</string>
+                  <string>https://omnigent.corp.example.com/?omnigentServerName=Engineering</string>
                   <string>https://my-workspace.cloud.databricks.com/ml/omnigents</string>
                 </array>
-                <key>serverNames</key>
-                <dict>
-                  <key>https://omnigent.corp.example.com</key>
-                  <string>Engineering</string>
-                </dict>
                 <key>databricksInternalFeaturesEnabled</key>
                 <false/>
               </dict>
@@ -152,10 +151,8 @@ API). For example, with a release build closed:
 
 ```bash
 defaults write ai.omnigent.desktop serverUrls -array \
-  "https://omnigent.corp.example.com" \
+  "https://omnigent.corp.example.com/?omnigentServerName=Engineering" \
   "https://my-workspace.cloud.databricks.com/ml/omnigents"
-defaults write ai.omnigent.desktop serverNames -dict \
-  "https://omnigent.corp.example.com" "Engineering"
 defaults write ai.omnigent.desktop databricksInternalFeaturesEnabled -bool true
 ```
 
@@ -163,10 +160,11 @@ Remove the test values with:
 
 ```bash
 defaults delete ai.omnigent.desktop serverUrls
-defaults delete ai.omnigent.desktop serverNames
 defaults delete ai.omnigent.desktop databricksInternalFeaturesEnabled
 ```
 
 For development, substitute `ai.omnigent.desktop-dev` in the commands above.
+A profile for `ai.omnigent.desktop` doesn't apply to local builds, so they can
+be tested on a machine that already has one.
 Production deployment should use an MDM-forced preference rather than a local
 user default.
