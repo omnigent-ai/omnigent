@@ -43,14 +43,14 @@ def test_find_repo_root_finds_git_dir() -> None:
 def test_find_repo_root_no_git_integration(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Integration: ``_find_repo_root`` returns None when __file__ is outside any repo."""
+    """Integration: ``_find_repo_root`` returns None when the package is outside any repo."""
     fake_file = tmp_path / "omnigent" / "update_check.py"
     fake_file.parent.mkdir(parents=True)
     fake_file.write_text("")
 
     import omnigent.cli.update_check as mod
 
-    monkeypatch.setattr(mod, "__file__", str(fake_file))
+    monkeypatch.setattr(mod, "PACKAGE_ROOT", fake_file.parent)
     assert mod._find_repo_root() is None
 
 
@@ -85,7 +85,7 @@ def test_find_repo_root_ignores_unrelated_ancestor_git(
 
     import omnigent.cli.update_check as mod
 
-    monkeypatch.setattr(mod, "__file__", str(fake_file))
+    monkeypatch.setattr(mod, "PACKAGE_ROOT", fake_file.parent)
     assert mod._find_repo_root() is None
 
 
@@ -111,7 +111,7 @@ def test_find_repo_root_requires_pyproject_alongside_git(
 
     import omnigent.cli.update_check as mod
 
-    monkeypatch.setattr(mod, "__file__", str(fake_file))
+    monkeypatch.setattr(mod, "PACKAGE_ROOT", fake_file.parent)
     assert mod._find_repo_root() is None
 
 
@@ -130,7 +130,7 @@ def test_find_repo_root_accepts_git_plus_pyproject(
 
     import omnigent.cli.update_check as mod
 
-    monkeypatch.setattr(mod, "__file__", str(fake_file))
+    monkeypatch.setattr(mod, "PACKAGE_ROOT", fake_file.parent)
     # Returns exactly the repo root — the parent of omnigent/.
     assert mod._find_repo_root() == repo
 

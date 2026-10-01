@@ -296,7 +296,7 @@ def test_write_policy_hook_config_creates_expected_files(tmp_path) -> None:
     assert "_OMNIGENT_SESSION_ID=session-123" in wrapper_text
     assert "_OMNIGENT_AUTH_HEADERS=" in wrapper_text
     assert sys.executable in wrapper_text
-    assert "hermes_policy_hook.py" in wrapper_text
+    assert "harnesses/hermes/policy_hook.py" in wrapper_text
 
     # config.yaml with hook registered.
     config = json.loads((hermes_home / "config.yaml").read_text())

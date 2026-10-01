@@ -1312,14 +1312,15 @@ def _get_backend(type_name: str) -> SandboxBackend:
 
 
 def _ensure_builtin_backends() -> None:
+    # Importing a backend module registers it.
     if "linux_bwrap" not in _BACKENDS:
-        pass
+        from omnigent.sandbox import bwrap  # noqa: F401
     if "darwin_seatbelt" not in _BACKENDS:
-        pass
+        from omnigent.sandbox import seatbelt  # noqa: F401
     # Windows-only: the backend module touches ctypes.windll, so import it
     # solely on Windows to keep the POSIX import graph clean.
     if os.name == "nt" and "windows_jobobject" not in _BACKENDS:
-        pass
+        from omnigent.sandbox import windows_jobobject  # noqa: F401
 
 
 def _default_sandbox_for_platform() -> OSEnvSandboxSpec:

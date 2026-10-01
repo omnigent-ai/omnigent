@@ -2218,3 +2218,6 @@ atexit.register(_cleanup_profile_files)
 
 
 register_backend(SeatbeltSandboxBackend())
+
+
+__all__ = ["SeatbeltSandboxBackend"]

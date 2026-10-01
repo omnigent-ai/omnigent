@@ -606,7 +606,7 @@ async def test_session_spawns_owned_launcher_and_releases_it(
     await session.start()
 
     assert spawn.await_args is not None
-    assert Path(spawn.await_args.args[1]).name == "_liveness_exec.py"
+    assert Path(spawn.await_args.args[1]).name == "liveness_exec.py"
     assert "/private/sandbox-launcher" in spawn.await_args.args
     assert spawn.await_args.kwargs["pass_fds"]
     assert session._containment_confirmed

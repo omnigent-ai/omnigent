@@ -41,7 +41,8 @@ import psutil
 import sys
 from pathlib import Path
 
-from omnigent.inner import _liveness_exec, _proc
+from omnigent.util import liveness_exec as _liveness_exec
+from omnigent.util import proc as _proc
 from omnigent.models.signer.egress import FrozenModelRoute
 from omnigent.models.signer.lifecycle import SignerLaunchConfig, SubprocessModelSigner
 

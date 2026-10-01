@@ -1414,3 +1414,6 @@ def _scratch_tmpdir(write_roots: list[Path]) -> Path | None:
 
 
 register_backend(BwrapSandboxBackend())
+
+
+__all__ = ["BwrapSandboxBackend"]
