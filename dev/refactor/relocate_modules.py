@@ -44,6 +44,7 @@ import fnmatch
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -863,7 +864,9 @@ def cleanup_empty_packages(
         if not dry_run:
             if init.exists():
                 git_rm(root, init)
-            # git rm may already have removed the directory when it became empty.
+            # Untracked bytecode would keep the emptied directory importable as a
+            # namespace package; git rm may already have removed the directory.
+            shutil.rmtree(pkg_path / "__pycache__", ignore_errors=True)
             if pkg_path.exists():
                 pkg_path.rmdir()
         report.moves_done.append(f"deleted empty package {module}")

@@ -897,6 +897,34 @@ def test_cleanup_delete_empty(tmp_path):
     assert not (root / "pkg" / "inner").exists()
 
 
+def test_cleanup_delete_empty_ignores_stale_bytecode(tmp_path):
+    """Untracked __pycache__ left by earlier imports does not block the deletion."""
+    root = make_repo(tmp_path)
+    write_file(root, "pkg/__init__.py", "")
+    write_file(root, "pkg/inner/__init__.py", "")
+    write_file(root, "pkg/inner/mod.py", "X = 1\n")
+    commit_all(root)
+    (root / "pkg" / "inner" / "__pycache__").mkdir()
+    (root / "pkg" / "inner" / "__pycache__" / "mod.cpython-312.pyc").write_bytes(b"\0")
+
+    map_file = write_file(
+        root,
+        "map.toml",
+        """\
+        [[move]]
+        old = "pkg.inner.mod"
+        new = "pkg.mod"
+
+        [cleanup]
+        delete_empty = ["pkg.inner"]
+        """,
+    )
+
+    cmd_apply(make_args(map=str(map_file), repo=str(root)))
+
+    assert not (root / "pkg" / "inner").exists()
+
+
 # ---------------------------------------------------------------------------
 # Integration: dry-run makes no changes
 # ---------------------------------------------------------------------------
