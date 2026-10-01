@@ -78,7 +78,7 @@ test coverage is not needed for this change.
 Should this change be included in the release notes? Choose exactly one.
 
 - [ ] No — no noteworthy user-facing change.
-- [ ] Yes — include the entry in the Changelog section below.
+- [ ] Yes — include the entry in the Changelog section.
 
 <!--
 Choose Yes for user-facing features, bug fixes, and UX changes, including small

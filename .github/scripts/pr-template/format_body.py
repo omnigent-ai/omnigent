@@ -65,7 +65,7 @@ def format_body(body: str) -> str:
         "Release notes",
         "Should this change be included in the release notes? Choose exactly one.\n\n"
         "- [ ] No — no noteworthy user-facing change.\n"
-        "- [ ] Yes — include the entry in the Changelog section below.\n\n"
+        "- [ ] Yes — include the entry in the Changelog section.\n\n"
         "<!-- Choose Yes for user-facing features, bug fixes, and UX improvements, "
         "including small changes. Breaking changes must choose Yes and describe "
         "the compatibility impact in Changelog. Choose No for internal changes "
