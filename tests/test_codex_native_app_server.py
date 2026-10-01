@@ -2346,17 +2346,23 @@ async def test_start_refreshes_shared_mcp_servers_across_relaunches(
         'model = "shared-at-creation"\n[mcp_servers.old]\ncommand = "old-command"\n',
         encoding="utf-8",
     )
+    (real_codex_home / "strict.config.toml").write_text(
+        '[mcp_servers.profile_only]\ncommand = "profile-command"\n',
+        encoding="utf-8",
+    )
     codex_home = tmp_path / "codex-home"
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     monkeypatch.setenv("CODEX_HOME", str(real_codex_home))
     _disable_codex_startup_rpc(monkeypatch)
     server = _test_app_server(tmp_path, codex_home, tmp_path / "bridge", workspace)
+    server.config_profile = "strict"
 
     await server.start()
     await server.close()
     private_config = tomlkit.parse((codex_home / "config.toml").read_text())
     private_config["model"] = "private-model-choice"
+    private_config["projects"] = {"/private-project": {"trust_level": "trusted"}}
     (codex_home / "config.toml").write_text(tomlkit.dumps(private_config))
 
     source_config.write_text(
@@ -2372,7 +2378,9 @@ async def test_start_refreshes_shared_mcp_servers_across_relaunches(
     assert resumed["model"] == "private-model-choice"
     assert resumed["mcp_servers"]["old"]["command"] == "updated-command"
     assert resumed["mcp_servers"]["added_after_creation"]["command"] == "new-command"
+    assert resumed["mcp_servers"]["profile_only"]["command"] == "profile-command"
 
+    server.config_profile = None
     source_config.write_text(
         '[mcp_servers.added_after_creation]\ncommand = "newest-command"\n',
         encoding="utf-8",
@@ -2384,17 +2392,38 @@ async def test_start_refreshes_shared_mcp_servers_across_relaunches(
     assert set(resumed["mcp_servers"]) == {"added_after_creation", "omnigent"}
     assert resumed["mcp_servers"]["added_after_creation"]["command"] == "newest-command"
     assert resumed["model"] == "private-model-choice"
+    assert resumed["projects"]["/private-project"]["trust_level"] == "trusted"
 
 
-def test_mcp_inventory_mismatch_fails_visibly(tmp_path: Path) -> None:
-    codex_home = tmp_path / "codex-home"
-    codex_home.mkdir()
-    (codex_home / "config.toml").write_text(
-        '[mcp_servers.omnigent]\ncommand = "relay"\n', encoding="utf-8"
+async def test_mcp_inventory_mismatch_fails_before_process_start(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source_home = tmp_path / "source"
+    source_home.mkdir()
+    (source_home / "config.toml").write_text(
+        '[mcp_servers.configured]\ncommand = "configured"\n', encoding="utf-8"
     )
+    codex_home = tmp_path / "codex-home"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(source_home))
+    monkeypatch.setattr(app_server, "_inject_mcp_server_config", lambda *_args, **_kwargs: None)
+    process_started = False
 
-    with pytest.raises(RuntimeError, match=r"missing=\['configured'\]"):
-        app_server._validate_mcp_server_inventory(codex_home, frozenset({"configured"}))
+    async def _codex_version(_path: str) -> tuple[int, int, int]:
+        return (0, 154, 0)
+
+    async def _unexpected_process_start(*_args: object, **_kwargs: object) -> None:
+        nonlocal process_started
+        process_started = True
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _unexpected_process_start)
+    monkeypatch.setattr(app_server, "_codex_cli_version", _codex_version)
+    server = _test_app_server(tmp_path, codex_home, tmp_path / "bridge", workspace)
+
+    with pytest.raises(RuntimeError, match=r"missing=\['omnigent'\]"):
+        await server.start()
+    assert not process_started
 
 
 def test_shared_mcp_server_config_matches_detects_content_changes(tmp_path: Path) -> None:

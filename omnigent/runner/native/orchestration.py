@@ -4797,8 +4797,20 @@ async def _auto_create_codex_terminal(
             getattr(app_server, "config_profile", None),
             codex_version=getattr(app_server, "codex_cli_version", None),
         )
-    if backend_reusable and shared_mcp_config_current:
+    refresh_deferred = (
+        backend_reusable
+        and not shared_mcp_config_current
+        and bridge_state is not None
+        and bridge_state.active_turn_id is not None
+    )
+    if backend_reusable and (shared_mcp_config_current or refresh_deferred):
         assert app_server is not None and bridge_state is not None
+        if refresh_deferred:
+            _logger.info(
+                "Deferring Codex MCP config refresh until the active turn ends: session=%s",
+                session_id,
+                extra={"session_id": session_id},
+            )
         # The TUI is auxiliary: replacing it must not restart an active turn,
         # reinitialize MCP, or cancel transcript forwarding.
         _logger.info(
@@ -4817,7 +4829,7 @@ async def _auto_create_codex_terminal(
             agent_spec=agent_spec,
         )
         return launched.view
-    if backend_reusable and not shared_mcp_config_current:
+    if backend_reusable:
         _logger.info(
             "Restarting Codex app-server to apply shared MCP config for session=%s",
             session_id,

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -853,6 +853,7 @@ async def test_auto_create_claude_terminal_recreate_cancels_prior_forwarder(
         "missing_bridge",
         "different_thread",
         "mcp_changed",
+        "mcp_changed_active_turn",
         "launch_error",
         "launch_cancelled",
     ],
@@ -1033,7 +1034,7 @@ async def test_auto_create_codex_terminal_recovers_without_restarting_healthy_se
 
     def _mcp_config_matches(*_args: Any, **_kwargs: Any) -> bool:
         mcp_config_checks.append(None)
-        return recovery_state != "mcp_changed"
+        return recovery_state not in {"mcp_changed", "mcp_changed_active_turn"}
 
     monkeypatch.setattr(
         codex_app_mod,
@@ -1088,6 +1089,9 @@ async def test_auto_create_codex_terminal_recovers_without_restarting_healthy_se
                     cwd=bridge_state.cwd,
                 ),
             )
+        elif recovery_state == "mcp_changed_active_turn":
+            bridge_state = replace(bridge_state, active_turn_id="turn-in-progress")
+            codex_native_bridge.write_bridge_state(bridge_dir, bridge_state)
 
         recovery = runner_app_mod._auto_create_codex_terminal(
             session_id,
@@ -1106,10 +1110,22 @@ async def test_auto_create_codex_terminal_recovers_without_restarting_healthy_se
             await recovery
         await asyncio.sleep(0)
 
-        reused = recovery_state in {"live", "launch_error", "launch_cancelled"}
+        reused = recovery_state in {
+            "live",
+            "mcp_changed_active_turn",
+            "launch_error",
+            "launch_cancelled",
+        }
         expected_config_checks = (
             1
-            if recovery_state in {"live", "mcp_changed", "launch_error", "launch_cancelled"}
+            if recovery_state
+            in {
+                "live",
+                "mcp_changed",
+                "mcp_changed_active_turn",
+                "launch_error",
+                "launch_cancelled",
+            }
             else 0
         )
         assert len(mcp_config_checks) == expected_config_checks
