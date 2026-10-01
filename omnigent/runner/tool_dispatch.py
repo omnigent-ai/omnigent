@@ -5403,6 +5403,7 @@ async def _agent_list_fetch(
     *,
     after: str | None,
     limit: int,
+    exhausted: bool = False,
 ) -> _DiscoveryPage:
     """
     Fetch one cursor page of a paginated list endpoint.
@@ -5416,8 +5417,11 @@ async def _agent_list_fetch(
     :param server_client: HTTP client pointed at the Omnigent server.
     :param after: Server cursor from the previous page, if any.
     :param limit: Maximum number of source rows to fetch.
+    :param exhausted: Skip a source whose cursor has reached its end.
     :returns: Rows and server continuation metadata.
     """
+    if exhausted:
+        return _DiscoveryPage([], False)
     try:
         params: dict[str, str | int] = {"limit": limit, "order": "desc"}
         if path == "/v1/sessions":
@@ -5589,6 +5593,46 @@ def _in_spawn_family(builtins: list[_JsonObject], family: str | None) -> list[_J
     return kept
 
 
+_AGENT_READINESS_TIMEOUT_S = 5.0
+_AGENT_READINESS_MAX_DEPTH = 16
+
+
+async def _agent_list_host_readiness(
+    server_client: httpx.AsyncClient,
+    conversation_id: str | None,
+) -> _JsonObject | None:
+    """Use the runner's host identity, with a bounded legacy session fallback."""
+    from omnigent.runner.identity import RUNNER_SLICE_KEY_ENV_VAR
+
+    try:
+        async with asyncio.timeout(_AGENT_READINESS_TIMEOUT_S):
+            host_id = os.environ.get(RUNNER_SLICE_KEY_ENV_VAR)
+            if host_id:
+                return await _host_harnesses_or_none(host_id, server_client)
+            seen: set[str] = set()
+            while conversation_id and conversation_id not in seen:
+                if len(seen) >= _AGENT_READINESS_MAX_DEPTH:
+                    return None
+                seen.add(conversation_id)
+                response = await server_client.get(
+                    f"/v1/sessions/{conversation_id}",
+                    params={"include_items": "false", "include_liveness": "false"},
+                    timeout=_AGENT_READINESS_TIMEOUT_S,
+                )
+                if response.status_code != 200:
+                    return None
+                snapshot = _string_object_dict(response.json())
+                if snapshot is None:
+                    return None
+                host_id = _optional_string(snapshot.get("host_id"))
+                if host_id:
+                    return await _host_harnesses_or_none(host_id, server_client)
+                conversation_id = _optional_string(snapshot.get("parent_session_id"))
+    except (TimeoutError, httpx.HTTPError, ValueError):
+        return None
+    return None
+
+
 async def _agent_list_via_rest(
     server_client: httpx.AsyncClient,
     *,
@@ -5600,7 +5644,7 @@ async def _agent_list_via_rest(
     continued: bool,
 ) -> str:
     """
-    List launchable agents across built-ins, session-bound, and local.
+    List agents across built-ins, session-bound, and local, with host readiness.
 
     Fans out three independent reads — each degrades to an empty section
     on failure rather than failing the whole call:
@@ -5634,30 +5678,29 @@ async def _agent_list_via_rest(
         bounded page with continuation metadata.
     """
     source_limit = limit or _AGENT_LIST_PAGE_LIMIT
-    builtins_page = (
-        _DiscoveryPage([], False)
-        if cursor_state["builtins"][0] == _DISCOVERY_END
-        else await _agent_list_fetch(
+
+    spec = _effective_runner_os_env_spec(agent_spec, conversation_id, runner_workspace)
+    assert spec.cwd is not None
+    configs_dir = Path(spec.cwd) / _AGENT_CONFIG_SUBDIR
+    builtins_page, sessions_page, local_configs, readiness, family = await asyncio.gather(
+        _agent_list_fetch(
             "/v1/agents",
             server_client,
             after=cursor_state["builtins"][1],
             limit=source_limit,
-        )
-    )
-    sessions_page = (
-        _DiscoveryPage([], False)
-        if cursor_state["session_agents"][0] == _DISCOVERY_END
-        else await _agent_list_fetch(
+            exhausted=cursor_state["builtins"][0] == _DISCOVERY_END,
+        ),
+        _agent_list_fetch(
             "/v1/sessions",
             server_client,
             after=cursor_state["session_agents"][1],
             limit=source_limit,
-        )
+            exhausted=cursor_state["session_agents"][0] == _DISCOVERY_END,
+        ),
+        asyncio.to_thread(_scan_local_agent_configs, configs_dir),
+        _agent_list_host_readiness(server_client, conversation_id),
+        _spawn_family(server_client, conversation_id),
     )
-    spec = _effective_runner_os_env_spec(agent_spec, conversation_id, runner_workspace)
-    assert spec.cwd is not None
-    configs_dir = Path(spec.cwd) / _AGENT_CONFIG_SUBDIR
-    local_configs = await asyncio.to_thread(_scan_local_agent_configs, configs_dir)
     local_state, local_after = cursor_state["local_configs"]
     if local_state == _DISCOVERY_END:
         remaining_configs = []
@@ -5672,9 +5715,15 @@ async def _agent_list_via_rest(
         sessions_page.rows,
         remaining_configs[:source_limit],
     )
-    listing["builtins"] = _in_spawn_family(
-        listing["builtins"], await _spawn_family(server_client, conversation_id)
-    )
+    listing["builtins"] = _in_spawn_family(listing["builtins"], family)
+    from omnigent.harness_availability import harness_launch_availability
+
+    for row in listing["builtins"]:
+        available, reason = harness_launch_availability(
+            _optional_string(row.get("harness")), readiness
+        )
+        row["available_on_host"] = available
+        row["unavailable_reason"] = reason
     return _bounded_discovery_result(
         listing,
         limit=limit,
@@ -7088,7 +7137,14 @@ async def _execute_os_env_tool(
             )
             owns_environment = False
         else:
-            os_env = create_os_environment(effective_spec)
+            additional_read_roots = (
+                [resource_registry.codex_skills_dir(conversation_id)]
+                if resource_registry is not None and conversation_id is not None
+                else []
+            )
+            os_env = create_os_environment(
+                effective_spec, additional_read_roots=additional_read_roots
+            )
         if os_env is None:
             return "Error: unable to create OSEnvironment"
 

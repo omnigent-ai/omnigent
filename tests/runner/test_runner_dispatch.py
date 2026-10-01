@@ -7645,7 +7645,14 @@ async def test_sys_agent_list_merges_three_sources(tmp_path: Path) -> None:
     info = json.loads(output)
     # Built-ins projected from GET /v1/agents (id → agent_id).
     assert info["builtins"] == [
-        {"agent_id": "ag_b", "name": "claude-native-ui", "description": None, "harness": "claude"}
+        {
+            "agent_id": "ag_b",
+            "name": "claude-native-ui",
+            "description": None,
+            "harness": "claude",
+            "available_on_host": None,
+            "unavailable_reason": None,
+        }
     ]
     # Session-bound agents carry session_id so the caller can then
     # sys_agent_get / sys_agent_download them.

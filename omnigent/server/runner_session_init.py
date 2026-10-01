@@ -11,6 +11,7 @@ import httpx
 
 from omnigent.debug_logging import debug_event, runner_log_scope
 from omnigent.entities import Conversation
+from omnigent.errors import ErrorCategory
 from omnigent.runner.session_init_protocol import build_runner_session_init_payload
 
 if TYPE_CHECKING:
@@ -205,10 +206,21 @@ class RunnerSessionInitializer:
                     json=payload,
                     timeout=timeout,
                 )
-            except Exception:
+            except Exception as exc:
                 _logger.exception(
                     "Runner session initialization failed",
-                    extra=debug_event("runner_session_init_failed", stage="session_init"),
+                    extra=debug_event(
+                        "runner_session_init_failed",
+                        stage="session_init",
+                        # The request rides the runner's tunnel: a closed tunnel
+                        # (ConnectionError) or offline runner (httpx.ConnectError)
+                        # is the runner going away, not an upstream.
+                        error_category=(
+                            ErrorCategory.RUNNER.value
+                            if isinstance(exc, (ConnectionError, httpx.TransportError))
+                            else None
+                        ),
+                    ),
                 )
                 raise
             failed = not 200 <= response.status_code < 300

@@ -49,9 +49,15 @@ WORKSPACE_MISSING_ERROR_CODE = "workspace_missing"
 # feature simply omits the token (older hosts send no ``capabilities`` at all).
 # The runner intercepts codex ``/side`` and forks an ephemeral side-chat thread:
 CAP_CODEX_SIDE_CHAT = "codex_side_chat"
+# The host answers ``host.mcp_servers`` with its user-level MCP inventory:
+CAP_MCP_INVENTORY = "mcp_inventory"
 
 # Every capability THIS build supports; reported verbatim in the hello frame.
-HOST_CAPABILITIES: list[str] = [CAP_CODEX_SIDE_CHAT, CAP_FILESYSTEM_ATTACHMENTS]
+HOST_CAPABILITIES: list[str] = [
+    CAP_CODEX_SIDE_CHAT,
+    CAP_FILESYSTEM_ATTACHMENTS,
+    CAP_MCP_INVENTORY,
+]
 
 
 def workspace_missing_message(workspace: str | PathLike[str] | None) -> str:
@@ -136,6 +142,8 @@ class HostFrameKind(str, Enum):
     MODEL_OPTIONS_RESULT = "host.model_options_result"
     SKILLS = "host.skills"
     SKILLS_RESULT = "host.skills_result"
+    MCP_SERVERS = "host.mcp_servers"
+    MCP_SERVERS_RESULT = "host.mcp_servers_result"
     IMPORT_LOCAL = "host.import_local"
     IMPORT_LOCAL_BY_ID = "host.import_local_by_id"
     IMPORT_LOCAL_SESSION = "host.import_local_session"
@@ -1006,6 +1014,23 @@ class HostSkillsResultFrame:
 
 
 @dataclass
+class HostMcpServersFrame:
+    """Server → host: list the user-level MCP servers each harness loads."""
+
+    request_id: str
+
+
+@dataclass
+class HostMcpServersResultFrame:
+    """Host → server: MCP server names and metadata, never env, args, or URLs."""
+
+    request_id: str
+    status: str
+    mcp_servers: list[dict[str, str]] = field(default_factory=list)
+    error: str | None = None
+
+
+@dataclass
 class HostImportedLocalSession:
     """One local transcript the host read, normalized for import.
 
@@ -1165,6 +1190,8 @@ HostFrame = (
     | HostModelOptionsResultFrame
     | HostSkillsFrame
     | HostSkillsResultFrame
+    | HostMcpServersFrame
+    | HostMcpServersResultFrame
     | HostImportLocalFrame
     | HostImportLocalByIdFrame
     | HostImportLocalSessionFrame
@@ -1575,6 +1602,20 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "agent_id": frame.agent_id,
             }
         )
+    if isinstance(frame, HostMcpServersFrame):
+        return _encode_payload(
+            {"kind": HostFrameKind.MCP_SERVERS.value, "request_id": frame.request_id}
+        )
+    if isinstance(frame, HostMcpServersResultFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.MCP_SERVERS_RESULT.value,
+                "request_id": frame.request_id,
+                "status": frame.status,
+                "mcp_servers": frame.mcp_servers,
+                "error": frame.error,
+            }
+        )
     if isinstance(frame, HostImportLocalFrame):
         return _encode_payload(
             {
@@ -1947,6 +1988,10 @@ def _decode_known_host_frame(
             )
         case HostFrameKind.SKILLS_RESULT:
             return _decode_skills_result(msg)
+        case HostFrameKind.MCP_SERVERS:
+            return HostMcpServersFrame(request_id=_required_str(msg, "request_id"))
+        case HostFrameKind.MCP_SERVERS_RESULT:
+            return _decode_mcp_servers_result(msg)
         case HostFrameKind.IMPORT_LOCAL:
             return _decode_import_local(msg)
         case HostFrameKind.IMPORT_LOCAL_BY_ID:
@@ -2532,6 +2577,33 @@ def _decode_skills_result(msg: _JsonObject) -> HostSkillsResultFrame:
         error_code=_optional_nullable_str(msg, "error_code"),
         session_id=_optional_nullable_str(msg, "session_id"),
         agent_id=_optional_nullable_str(msg, "agent_id"),
+    )
+
+
+_MCP_SERVER_FIELDS = ("name", "harness", "transport", "scope")
+_MCP_SERVER_OPTIONAL_FIELDS = ("plugin", "url_host")
+
+
+def _decode_mcp_servers_result(msg: _JsonObject) -> HostMcpServersResultFrame:
+    """Decode MCP summaries, keeping only the allow-listed metadata fields."""
+    raw_servers = msg.get("mcp_servers", [])
+    if not isinstance(raw_servers, list):
+        raise ValueError("frame field must be a list of MCP server summaries: 'mcp_servers'")
+    servers: list[dict[str, str]] = []
+    for server in raw_servers:
+        if not isinstance(server, dict):
+            raise ValueError("frame field must be a list of MCP server summaries: 'mcp_servers'")
+        summary = {key: _required_str(server, key) for key in _MCP_SERVER_FIELDS}
+        for key in _MCP_SERVER_OPTIONAL_FIELDS:
+            value = _optional_nullable_str(server, key)
+            if value is not None:
+                summary[key] = value
+        servers.append(summary)
+    return HostMcpServersResultFrame(
+        request_id=_required_str(msg, "request_id"),
+        status=_required_str(msg, "status"),
+        mcp_servers=servers,
+        error=_optional_nullable_str(msg, "error"),
     )
 
 

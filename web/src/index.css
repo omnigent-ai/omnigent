@@ -1064,6 +1064,20 @@ aside[aria-label="Workspace"][data-maximized] {
   padding-right: min(var(--omnigent-safe-right), var(--omnigent-lateral-inset-cap));
 }
 
+/* At phone widths the open drawer's Search bubble pairs with the chat
+ * header's overflow bubble in the exposed chat strip beside it. The chat
+ * header sits at safe-top - 0.5rem (rule above), so mirror that offset here
+ * or the paired bubbles drift 0.5rem apart. Keeps the specificity of the
+ * padding rule above and follows it in source order so it wins the tie. */
+@media (width < 48rem) {
+  :is([data-ios-native], [data-android-native])
+    aside.conversations-sidebar:not(aside[aria-label="Workspace"] *):not([data-collapsed]):not(
+      .is-peek
+    ) {
+    padding-top: max(0px, calc(var(--omnigent-safe-top) - 0.5rem));
+  }
+}
+
 @media (width < 48rem) and (prefers-reduced-motion: reduce) {
   [data-ios-native] .conversations-sidebar {
     transition-duration: 1ms;
@@ -1276,6 +1290,15 @@ aside[aria-label="Workspace"][data-maximized] {
 }
 [data-streamdown="code-block-body"] {
   font-size: 0.875em;
+}
+/* Fallback mono fonts (e.g. JetBrains Mono) ship ligatures that can visually
+ * swallow spaces in CLI flags like `-c --markdown`; code must render literally. */
+[data-streamdown="inline-code"],
+[data-streamdown="code-block-body"] {
+  font-variant-ligatures: none;
+  font-feature-settings:
+    "liga" 0,
+    "calt" 0;
 }
 
 /* The transcript draws its own constant-height scrollbar (TranscriptScrollbar);

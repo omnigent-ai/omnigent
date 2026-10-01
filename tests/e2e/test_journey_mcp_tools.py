@@ -32,6 +32,7 @@ from typing import Any
 import httpx
 import yaml
 
+from tests._helpers.messages import all_message_text as _extract_all_text
 from tests.e2e.conftest import (
     configure_mock_llm,
     create_runner_bound_session,
@@ -125,18 +126,6 @@ def _register_mcp_echo_agent(
     if resp.status_code not in (200, 201, 409):
         raise RuntimeError(f"MCP agent register failed: {resp.status_code} {resp.text[:500]}")
     return name
-
-
-def _extract_all_text(body: dict[str, Any]) -> str:
-    """Concatenate all assistant message text blocks."""
-    parts: list[str] = []
-    for item in body.get("output", []):
-        if item.get("type") == "message":
-            for block in item.get("content", []):
-                text = block.get("text")
-                if text:
-                    parts.append(text)
-    return "\n".join(parts)
 
 
 def _get_function_call_outputs(

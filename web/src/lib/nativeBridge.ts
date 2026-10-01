@@ -164,6 +164,8 @@ export interface NativeViewModeParams {
  */
 interface ElectronDesktopApi extends NativeShellApi {
   kind: "electron";
+  /** The runner picked during onboarding for this server, returned once. */
+  takeOnboardingRunner?: () => Promise<"local" | "remote" | null>;
   /**
    * Desktop auto-update bridge — CONFIG ONLY on current shells. Update
    * notifications are shell-owned (native corner overlay + Server menu); this
@@ -341,10 +343,19 @@ export interface ServerPickerInfo {
   /** Origin this window is connected to, e.g. `"http://localhost:8000"`. */
   currentOrigin: string;
   /**
+   * The server URL the user picked when sign-in moved to `currentOrigin`'s host
+   * (it may carry a workspace `?o=` selector), else null. Absent on older shells.
+   */
+  currentServer?: string | null;
+  /** Recent URL → the server URL the user picked for it, for display. Absent on older shells. */
+  recentLabels?: Record<string, string>;
+  /**
    * Server URLs supplied through macOS Managed Preferences. Optional because a
    * newer server-served SPA can run inside a desktop shell that predates MDM.
    */
   managedServers?: string[];
+  /** Display names for managed servers, server URL → name. Absent on older shells. */
+  managedServerNames?: Record<string, string>;
   /** Recently-connected server URLs, most recent first. */
   recentServers: string[];
   /**
@@ -835,6 +846,18 @@ export async function getHostIdentity(): Promise<HostIdentity | null> {
     return await electron.getHostIdentity();
   } catch (err) {
     console.warn("[nativeBridge] electron getHostIdentity failed:", err);
+    return null;
+  }
+}
+
+/**
+ * The runner ("local" | "remote") picked during desktop onboarding for this
+ * server, handed over once; null otherwise or outside Electron.
+ */
+export async function takeOnboardingRunner(): Promise<"local" | "remote" | null> {
+  try {
+    return (await electronApi()?.takeOnboardingRunner?.()) ?? null;
+  } catch {
     return null;
   }
 }

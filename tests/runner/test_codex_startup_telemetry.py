@@ -167,6 +167,10 @@ async def test_startup_failure_is_visible_at_error_and_belongs_to_child(
     assert attributes["app_server_pid"] == 4242
     assert attributes.get("app_server_returncode") is None
     assert attributes["codex_version"] == "0.154.0"
+    assert attributes["error_impact"] == "blocking"
+    assert attributes["error_phase"] == "harness_startup"
+    # A live TUI leaves the category to the exception classifier.
+    assert "error_category" not in attributes
 
     row = record_to_row(record, source="runner")
     assert row["session_id"] == startup.session_id
@@ -371,8 +375,11 @@ async def test_timeout_captures_tui_exit_when_discovery_misses_it(
     assert record.attributes["app_server_state"] == "running"
     if capture == "1":
         assert "unexpected argument '--invalid'" in record.attributes["terminal_last_output"]
+        # The captured usage error attributes the dead TUI, not the timeout.
+        assert record.attributes["error_category"] == "config"
     else:
         assert "terminal_last_output" not in record.attributes
+        assert record.attributes["error_category"] == "runner"
 
 
 async def test_stale_terminal_exit_does_not_stop_replacement_launch(

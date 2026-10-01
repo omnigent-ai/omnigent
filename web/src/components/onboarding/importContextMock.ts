@@ -1,5 +1,5 @@
-// Sample harness setup for previewing the import modal (Storybook + the dev
-// `?import-preview` param) until discovery is backed by the host.
+// Sample harness setup for previewing the import modal in Storybook and the
+// dev-only `?import-preview` param, without a connected host.
 
 import type { ImportContext } from "./ImportContextModal";
 
@@ -21,29 +21,24 @@ export const MOCK_IMPORT_CONTEXT: ImportContext = {
   credentials: [
     { harness: "claude", source: "Databricks AI Gateway" },
     { harness: "codex", source: "Databricks (dbc-a5d4177a-49dc)" },
-    { harness: "cursor", source: "Cursor Enterprise" },
+    { harness: "cursor", source: "Signed in" },
   ],
   mcps: [
-    { id: "cursor:confluence", name: "confluence", harness: "cursor", toolCount: 9 },
+    { id: "cursor:confluence", name: "confluence", harness: "cursor" },
+    { id: "claude:databricks-v2", name: "databricks-v2", harness: "claude" },
+    { id: "codex:github", name: "github", harness: "codex" },
+    { id: "cursor:glean", name: "glean", harness: "cursor" },
+    { id: "cursor:google", name: "google", harness: "cursor" },
+    { id: "claude:jira", name: "jira", harness: "claude", detail: "mcp.atlassian.com" },
+    { id: "claude:safe", name: "safe", harness: "claude" },
+    { id: "cursor:slack", name: "slack", harness: "cursor" },
+    { id: "claude:web-search", name: "web-search", harness: "claude" },
+    { id: "codex:web_search", name: "web_search", harness: "codex" },
     {
-      id: "claude:databricks-v2",
-      name: "databricks-v2",
+      id: "claude:plugin:figma:figma",
+      name: "figma",
       harness: "claude",
-      toolCount: 18,
-    },
-    { id: "codex:github", name: "github", harness: "codex", toolCount: 4 },
-    { id: "cursor:glean", name: "glean", harness: "cursor", toolCount: 7 },
-    { id: "cursor:google", name: "google", harness: "cursor", toolCount: 70 },
-    { id: "claude:jira", name: "jira", harness: "claude", toolCount: 4 },
-    { id: "claude:safe", name: "safe", harness: "claude", toolCount: 5 },
-    { id: "cursor:slack", name: "slack", harness: "cursor", toolCount: 5 },
-    { id: "claude:web-search", name: "web-search", harness: "claude", toolCount: 1 },
-    { id: "codex:web_search", name: "web_search", harness: "codex", toolCount: 1 },
-    {
-      id: "cursor:plugin:figma:figma",
-      name: "plugin:figma:figma",
-      harness: "cursor",
-      toolCount: 36,
+      detail: "figma plugin · mcp.figma.com",
     },
   ],
   skills: [
@@ -53,6 +48,6 @@ export const MOCK_IMPORT_CONTEXT: ImportContext = {
   plugins: [
     { id: "claude:frontend-toolkit", name: "frontend-toolkit", harness: "claude", skillCount: 12 },
     { id: "claude:dev-productivity", name: "dev-productivity", harness: "claude", skillCount: 8 },
-    { id: "cursor:figma", name: "figma", harness: "cursor", skillCount: 1 },
+    { id: "claude:figma", name: "figma", harness: "claude", skillCount: 1 },
   ],
 };

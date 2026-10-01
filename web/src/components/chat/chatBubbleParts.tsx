@@ -47,6 +47,7 @@ import {
   RoutingDecisionCard,
 } from "@/components/blocks/StatusBlocks";
 import { SystemMessageView } from "@/components/blocks/SystemMessage";
+import { SubagentActivityMessage } from "@/components/blocks/SubagentActivityMessage";
 import { isSystemUserContent, parseSystemMessage } from "@/lib/systemMessage";
 import { Button } from "@/components/ui/button";
 import { BrandLogo } from "@/components/BrandLogo";
@@ -352,6 +353,7 @@ export function bubbleKey(bubble: Bubble): string {
   if (bubble.kind === "compaction_loading") return `compaction_loading:${bubble.itemId}`;
   if (bubble.kind === "compaction") return `compaction:${bubble.itemId}`;
   if (bubble.kind === "routing_decision") return `routing_decision:${bubble.itemId}`;
+  if (bubble.kind === "subagent_activity") return `subagent_activity:${bubble.itemId}`;
   return `assistant:${bubble.stableId}`;
 }
 
@@ -395,10 +397,14 @@ export function isBackgroundTasksOnly(
  * Whether the agent's own turn is in progress — server `running`/`waiting`, or
  * a local send in flight.
  */
+export function computeIsTurnActive(sessionStatus: SessionStatus, localSending: boolean): boolean {
+  return computeIsWorking(sessionStatus) || localSending;
+}
+
 function useAgentTurnActive(): boolean {
   const sessionStatus = useChatStore((s) => s.sessionStatus);
   const localSending = useChatStore((s) => s.status === "streaming");
-  return computeIsWorking(sessionStatus) || localSending;
+  return computeIsTurnActive(sessionStatus, localSending);
 }
 
 /**
@@ -419,9 +425,16 @@ export function workingIndicatorLabel(tick = 0, blockedOn: string | null = null)
 }
 
 export function WorkingIndicator() {
-  const bgCount = useChatStore((s) => s.backgroundTaskCount);
-  const blockedOn = useChatStore((s) => s.blockedOn);
-  const agentWorking = useAgentTurnActive();
+  const scopedConversationId = useContext(ConversationScopeContext);
+  const scopedState = useConversationEntryState(scopedConversationId);
+  const rootBgCount = useChatStore((s) => s.backgroundTaskCount);
+  const rootBlockedOn = useChatStore((s) => s.blockedOn);
+  const rootAgentWorking = useAgentTurnActive();
+  const bgCount = scopedConversationId ? scopedState.backgroundTaskCount : rootBgCount;
+  const blockedOn = scopedConversationId ? scopedState.blockedOn : rootBlockedOn;
+  const agentWorking = scopedConversationId
+    ? computeIsTurnActive(scopedState.sessionStatus, scopedState.status === "streaming")
+    : rootAgentWorking;
   const tick = useWorkingLabelTick();
   // Once the turn ends but background shells outlive it, BackgroundTaskPill owns
   // the state and the shimmer stays off (it would misread as the agent still
@@ -551,6 +564,9 @@ export const BubbleView = memo(
       return <CompactionLoadingIndicator createdAtS={bubble.createdAtS} />;
     }
     if (bubble.kind === "compaction") return <CompactionMarker />;
+    if (bubble.kind === "subagent_activity") {
+      return <SubagentActivityMessage data={bubble.data} />;
+    }
     if (bubble.kind === "routing_decision") {
       return (
         <RoutingDecisionCard

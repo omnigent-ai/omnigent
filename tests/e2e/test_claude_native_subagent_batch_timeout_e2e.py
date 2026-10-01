@@ -36,11 +36,6 @@ from __future__ import annotations
 import asyncio
 import io
 import json
-import os
-import signal
-import socket
-import subprocess
-import sys
 import tarfile
 import tempfile
 import time
@@ -50,19 +45,11 @@ from typing import Any
 import httpx
 import pytest
 
-_REPO_ROOT = Path(__file__).resolve().parents[2]
+from tests._helpers.live_server import isolated_local_server
 
 # CI shells can carry an egress proxy; every HTTP call here targets 127.0.0.1.
 _http = httpx.Client(trust_env=False)
 
-_PYTHONPATH = os.pathsep.join(
-    [
-        str(_REPO_ROOT),
-        str(_REPO_ROOT / "sdks" / "python-client"),
-        str(_REPO_ROOT / "sdks" / "ui"),
-        os.environ.get("PYTHONPATH", ""),
-    ]
-)
 
 # Server bootstrap: patch SqlAlchemyConversationStore.append to sleep 150 ms
 # per call, emulating one remote-store round trip, so per-entry appends cost
@@ -86,9 +73,6 @@ from omnigent.cli import main
 main()
 """
 
-_HEALTH_TIMEOUT_S = 120.0
-_POLL_S = 0.5
-
 # 100 items saturates MAX_SESSION_EVENT_BATCH_EVENTS; each has a distinct
 # source_id so the server's stable_id dedup can prove idempotency on re-post.
 _BATCH_SIZE = 100
@@ -98,73 +82,6 @@ _RESPONSE_ID = "resp-subagent-batch-timeout-test"
 # One 150 ms append per run is far inside the forwarder's 10 s timeout; 8 s
 # leaves generous headroom for a loaded CI box.
 _MAX_ELAPSED_S = 8.0
-
-
-def _find_free_port() -> int:
-    """Grab an ephemeral port for the spawned server."""
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        return int(sock.getsockname()[1])
-
-
-def _localhost_env(extra: dict[str, str]) -> dict[str, str]:
-    """Subprocess env with worktree imports and no proxy/credentials in the way.
-
-    :param extra: Overrides/additions applied after the base env.
-    :returns: Environment mapping for ``subprocess.Popen``.
-    """
-    env = {
-        **os.environ,
-        "PYTHONPATH": _PYTHONPATH,
-        "NO_PROXY": "127.0.0.1,localhost",
-        "no_proxy": "127.0.0.1,localhost",
-        # Header auth + single-user keeps the spawned server out of login
-        # mode; ambient auth/OIDC vars would otherwise 401 every call.
-        "OMNIGENT_AUTH_PROVIDER": "header",
-        "OMNIGENT_LOCAL_SINGLE_USER": "1",
-    }
-    for name in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
-        env.pop(name, None)
-    for name in list(env):
-        if (
-            name.startswith(("DATABRICKS_", "OMNIGENT_OIDC_"))
-            or name.endswith("_SECRET")
-            or name
-            in (
-                "ANTHROPIC_API_KEY",
-                "OMNIGENT_AUTH_ENABLED",
-                "OMNIGENT_RUNNER_TUNNEL_TOKEN",
-            )
-        ):
-            env.pop(name, None)
-    env.update(extra)
-    return env
-
-
-def _terminate(proc: subprocess.Popen[bytes] | None) -> None:
-    """Best-effort SIGTERM -> SIGKILL teardown for a spawned process."""
-    if proc is None or proc.poll() is not None:
-        return
-    proc.send_signal(signal.SIGTERM)
-    try:
-        proc.wait(timeout=10)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        proc.wait(timeout=5)
-
-
-def _wait_http_ok(url: str, deadline: float) -> None:
-    """Poll *url* until it returns 200 or *deadline* (monotonic) passes."""
-    last = "not polled"
-    while time.monotonic() < deadline:
-        try:
-            if _http.get(url, timeout=2.0).status_code == 200:
-                return
-            last = "non-200"
-        except httpx.HTTPError as exc:
-            last = f"{type(exc).__name__}: {exc}"
-        time.sleep(_POLL_S)
-    raise AssertionError(f"{url} never became healthy: {last}")
 
 
 def _create_claude_native_session(base_url: str) -> str:
@@ -385,35 +302,7 @@ def test_subagent_batch_100_items_completes_within_timeout(tmp_path: Path) -> No
     """
     from omnigent.harnesses.claude_native.forwarder import _POST_TIMEOUT_S
 
-    port = _find_free_port()
-    base_url = f"http://127.0.0.1:{port}"
-    db_path = tmp_path / "chat.db"
-    database_uri = f"sqlite:///{db_path}"
-
-    server_log = (tmp_path / "server.log").open("w")
-    server_proc: subprocess.Popen[bytes] | None = None
-    try:
-        server_proc = subprocess.Popen(
-            [
-                sys.executable,
-                "-c",
-                _SERVER_BOOTSTRAP_SLOW_APPEND,
-                "server",
-                "--host",
-                "127.0.0.1",
-                "--port",
-                str(port),
-                "--database-uri",
-                database_uri,
-                "--artifact-location",
-                str(tmp_path / "artifacts"),
-            ],
-            env=_localhost_env({}),
-            stdout=server_log,
-            stderr=subprocess.STDOUT,
-        )
-        _wait_http_ok(f"{base_url}/health", time.monotonic() + _HEALTH_TIMEOUT_S)
-
+    with isolated_local_server(tmp_path, bootstrap=_SERVER_BOOTSTRAP_SLOW_APPEND) as base_url:
         parent_id = _create_claude_native_session(base_url)
         child_id = asyncio.run(_setup_sessions(base_url, parent_id))
 
@@ -450,6 +339,3 @@ def test_subagent_batch_100_items_completes_within_timeout(tmp_path: Path) -> No
             "Re-post of the same batch changed the committed items; source_id-keyed "
             "dedup must be idempotent"
         )
-    finally:
-        _terminate(server_proc)
-        server_log.close()

@@ -2568,6 +2568,18 @@
             "description": "The tool's string result.",
             "title": "Output",
             "type": "string"
+          },
+          "subagent_return_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Native task id of an explicitly completed child.",
+            "title": "Subagent Return Id"
           }
         },
         "required": [
@@ -3232,6 +3244,85 @@
         "title": "McpServerStartup",
         "type": "object"
       },
+      "McpServerSummary": {
+        "description": "An MCP server a harness loads on the host, without secrets.",
+        "properties": {
+          "harness": {
+            "description": "Harness family that loads it: `claude`, `codex`, or `cursor`.",
+            "title": "Harness",
+            "type": "string"
+          },
+          "name": {
+            "description": "Server name as configured, e.g. `\"github\"`.",
+            "title": "Name",
+            "type": "string"
+          },
+          "plugin": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Plugin that bundles the server, e.g. `\"figma\"`.",
+            "title": "Plugin"
+          },
+          "scope": {
+            "const": "user",
+            "description": "Config scope; always `user` today.",
+            "title": "Scope",
+            "type": "string"
+          },
+          "transport": {
+            "description": "`stdio` for a local process, `http` for a remote server.",
+            "enum": [
+              "stdio",
+              "http"
+            ],
+            "title": "Transport",
+            "type": "string"
+          },
+          "url_host": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Hostname of a remote server, e.g. `\"mcp.linear.app\"`.",
+            "title": "Url Host"
+          }
+        },
+        "required": [
+          "name",
+          "harness",
+          "transport",
+          "scope"
+        ],
+        "title": "McpServerSummary",
+        "type": "object"
+      },
+      "McpServersResponse": {
+        "description": "User-level MCP servers discovered on a host.",
+        "properties": {
+          "mcp_servers": {
+            "items": {
+              "$ref": "#/components/schemas/McpServerSummary"
+            },
+            "title": "Mcp Servers",
+            "type": "array"
+          }
+        },
+        "required": [
+          "mcp_servers"
+        ],
+        "title": "McpServersResponse",
+        "type": "object"
+      },
       "MessageData": {
         "description": "Data for a message item (user or assistant).\n\n**Parameters**\n\n- `agent` \u2014 Agent name (required for assistant messages, absent for user). Serialized as `\"model\"` in JSON.",
         "properties": {
@@ -3287,6 +3378,24 @@
             ],
             "description": "Native live-preview stream finalized by this assistant message. Persisted so reconnect snapshots can suppress delayed preview chunks after the authoritative item.",
             "title": "Stream Message Id"
+          },
+          "subagent_return_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Native task id of an explicitly completed child.",
+            "title": "Subagent Return Id"
+          },
+          "user_authored": {
+            "default": false,
+            "description": "Confirmed or conservatively preserved user input; prevents legacy content cleanup from hiding literal agent markup.",
+            "title": "User Authored",
+            "type": "boolean"
           }
         },
         "required": [
@@ -9987,6 +10096,49 @@
           }
         },
         "summary": "Get Host Model Options",
+        "tags": [
+          "hosts"
+        ]
+      }
+    },
+    "/v1/hosts/{host_id}/mcp-servers": {
+      "get": {
+        "description": "List the user-level MCP servers configured for each harness on a host.\n\nReturns names and non-secret metadata only; the caller must own the host.",
+        "operationId": "get_mcp_servers_v1_hosts__host_id__mcp_servers_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "host_id",
+            "required": true,
+            "schema": {
+              "title": "Host Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/McpServersResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Mcp Servers",
         "tags": [
           "hosts"
         ]

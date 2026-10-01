@@ -20,6 +20,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 from omnigent.cli_invocation import cli_invocation
+from omnigent.errors import ErrorCategory
 
 __all__ = [
     "FailureDiagnosis",
@@ -39,11 +40,13 @@ class FailureDiagnosis:
         the user can act on.
     :param remediation: The concrete next step, e.g. a command to run or a
         config to change. ``None`` when there is no single clear fix.
+    :param category: Fault attribution stamped on the failure's log row.
     """
 
     title: str
     cause: str
     remediation: str | None = None
+    category: ErrorCategory = ErrorCategory.CONFIG
 
 
 @dataclass(frozen=True)
@@ -103,6 +106,18 @@ _MISSING_MARKERS = (
     "executable file not found",
 )
 
+# --- CLI rejected its arguments -----------------------------------------------
+# Usage errors from the agent CLI or a wrapper around it, e.g. a flag added by a
+# host-side launcher that this CLI version (or Omnigent's env) does not allow.
+_REJECTED_ARGUMENT_MARKERS = (
+    "unknown option",
+    "unrecognized option",
+    "unexpected argument",
+    "is disabled by claude_code_",
+    "usage: claude",
+    "usage: codex",
+)
+
 
 # Ordered most-specific first: the root case also reads like a permission /
 # auth problem, so it must win over the broader rules below it.
@@ -143,6 +158,22 @@ _TERMINAL_EXIT_MATCHERS: tuple[_TerminalMatcher, ...] = (
             remediation=(
                 f"Sign the agent in on the host (e.g. run its `/login`, "
                 f"or `{cli_invocation()} login`)."
+            ),
+        ),
+    ),
+    _TerminalMatcher(
+        "rejected_arguments",
+        lambda s: s.output_contains_any(_REJECTED_ARGUMENT_MARKERS),
+        FailureDiagnosis(
+            title="Agent CLI rejected its launch arguments",
+            cause=(
+                "The agent CLI exited at startup because it did not accept the "
+                "arguments it was started with, often from a wrapper script, shell "
+                "alias, or extra launch arguments configured on the host."
+            ),
+            remediation=(
+                "Check the agent's launcher and any extra arguments configured on "
+                "the host, then retry."
             ),
         ),
     ),

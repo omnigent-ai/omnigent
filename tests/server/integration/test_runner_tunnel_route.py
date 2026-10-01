@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import threading
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
 from functools import partial
@@ -20,6 +21,10 @@ from omnigent.errors import OmnigentError
 from omnigent.runner import create_runner_app
 from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
 from omnigent.runner.transports.ws_tunnel.frames import (
+    EVENT_INGEST_CAPABILITY,
+    EventAckFrame,
+    EventBatchFrame,
+    EventReadyFrame,
     HelloFrame,
     PingFrame,
     RequestFrame,
@@ -1024,6 +1029,397 @@ async def test_ws_tunnel_loopback_unauthenticated_registers_as_local() -> None:
         await communicator.send_input({"type": "websocket.disconnect", "code": 1000})
         with contextlib.suppress(asyncio.TimeoutError):
             await communicator.wait(timeout=budget(1.0))
+
+
+async def test_event_ingest_does_not_block_tunnel_receive_loop() -> None:
+    route = _tunnel_route_app()
+    started = asyncio.Event()
+    unblock = asyncio.Event()
+
+    async def ingest(**kwargs: object) -> EventAckFrame:
+        batch = kwargs["batch"]
+        assert isinstance(batch, EventBatchFrame)
+        started.set()
+        await unblock.wait()
+        return EventAckFrame(batch.id, len(batch.events))
+
+    route.app.state.runner_event_ingest = ingest
+    comm = await _connect_route(route.app, _TUNNEL_PATH)
+    try:
+        await comm.send_input(
+            {
+                "type": "websocket.receive",
+                "text": encode_frame(
+                    HelloFrame(
+                        runner_version="test",
+                        frame_protocol_version=1,
+                        capabilities=[EVENT_INGEST_CAPABILITY],
+                    )
+                ),
+            }
+        )
+        ready = await comm.receive_output(timeout=budget(1.0))
+        assert isinstance(decode_frame(ready["text"]), EventReadyFrame)
+        for i in range(3):
+            await comm.send_input(
+                {
+                    "type": "websocket.receive",
+                    "text": encode_frame(
+                        EventBatchFrame(
+                            id=f"batch-{i}",
+                            session_id="s",
+                            events=[{"type": "external_output_text_delta", "data": {}}],
+                        )
+                    ),
+                }
+            )
+        await asyncio.wait_for(started.wait(), timeout=budget(1.0))
+        # Two workers are in flight; the read loop remains free to reject
+        # the third request rather than waiting for a DB slot.
+        busy = await comm.receive_output(timeout=budget(1.0))
+        ack = decode_frame(busy["text"])
+        assert isinstance(ack, EventAckFrame)
+        assert ack.id == "batch-2"
+        assert ack.retryable and ack.applied == 0
+        unblock.set()
+        replies = [
+            decode_frame((await comm.receive_output(timeout=budget(1.0)))["text"])
+            for _ in range(2)
+        ]
+        assert {reply.id for reply in replies if isinstance(reply, EventAckFrame)} == {
+            "batch-0",
+            "batch-1",
+        }
+    finally:
+        unblock.set()
+        await comm.send_input({"type": "websocket.disconnect", "code": 1000})
+        with contextlib.suppress(asyncio.TimeoutError):
+            await comm.wait(timeout=budget(1.0))
+
+
+async def test_event_ingest_disconnect_before_worker_start_releases_slot() -> None:
+    route = _tunnel_route_app()
+
+    async def ingest(**kwargs: object) -> EventAckFrame:
+        batch = kwargs["batch"]
+        assert isinstance(batch, EventBatchFrame)
+        return EventAckFrame(batch.id, 1)
+
+    route.app.state.runner_event_ingest = ingest
+    comm = await _connect_route(route.app, _TUNNEL_PATH)
+    await comm.send_input(
+        {
+            "type": "websocket.receive",
+            "text": encode_frame(
+                HelloFrame(
+                    runner_version="test",
+                    frame_protocol_version=1,
+                    capabilities=[EVENT_INGEST_CAPABILITY],
+                )
+            ),
+        }
+    )
+    assert isinstance(
+        decode_frame((await comm.receive_output(timeout=budget(1.0)))["text"]),
+        EventReadyFrame,
+    )
+    await comm.send_input(
+        {
+            "type": "websocket.receive",
+            "text": encode_frame(
+                EventBatchFrame(
+                    id="before-disconnect",
+                    session_id="s",
+                    events=[{"type": "external_output_text_delta", "data": {}}],
+                )
+            ),
+        }
+    )
+    await comm.send_input({"type": "websocket.disconnect", "code": 1000})
+    with contextlib.suppress(asyncio.TimeoutError):
+        await comm.wait(timeout=budget(1.0))
+
+    async def capacity_restored() -> None:
+        while route.app.state.runner_event_ingest_slots._value != 16:
+            await asyncio.sleep(0.01)
+
+    await asyncio.wait_for(capacity_restored(), timeout=budget(1.0))
+    assert route.app.state.runner_event_ingest_active_counts.get(_RUNNER_ID, 0) == 0
+
+
+async def test_event_ingest_disconnect_keeps_running_db_work_charged() -> None:
+    route = _tunnel_route_app()
+    started = threading.Event()
+    release = threading.Event()
+
+    async def ingest(**kwargs: object) -> EventAckFrame:
+        batch = kwargs["batch"]
+        assert isinstance(batch, EventBatchFrame)
+
+        def blocking_db_work() -> None:
+            started.set()
+            release.wait(timeout=budget(10.0))
+
+        await asyncio.to_thread(blocking_db_work)
+        return EventAckFrame(batch.id, 1)
+
+    route.app.state.runner_event_ingest = ingest
+    comm = await _connect_route(route.app, _TUNNEL_PATH)
+    try:
+        await comm.send_input(
+            {
+                "type": "websocket.receive",
+                "text": encode_frame(
+                    HelloFrame(
+                        runner_version="test",
+                        frame_protocol_version=1,
+                        capabilities=[EVENT_INGEST_CAPABILITY],
+                    )
+                ),
+            }
+        )
+        assert isinstance(
+            decode_frame((await comm.receive_output(timeout=budget(1.0)))["text"]),
+            EventReadyFrame,
+        )
+        await comm.send_input(
+            {
+                "type": "websocket.receive",
+                "text": encode_frame(
+                    EventBatchFrame(
+                        id="running-db",
+                        session_id="s",
+                        events=[{"type": "external_output_text_delta", "data": {}}],
+                    )
+                ),
+            }
+        )
+        assert await asyncio.to_thread(started.wait, budget(1.0))
+        await comm.send_input({"type": "websocket.disconnect", "code": 1000})
+        with contextlib.suppress(asyncio.TimeoutError):
+            await comm.wait(timeout=budget(1.0))
+        assert route.app.state.runner_event_ingest_slots._value == 15
+        assert route.app.state.runner_event_ingest_active_counts[_RUNNER_ID] == 1
+    finally:
+        release.set()
+
+    async def capacity_restored() -> None:
+        while route.app.state.runner_event_ingest_slots._value != 16:
+            await asyncio.sleep(0.01)
+
+    await asyncio.wait_for(capacity_restored(), timeout=budget(1.0))
+    assert route.app.state.runner_event_ingest_active_counts.get(_RUNNER_ID, 0) == 0
+
+
+async def test_event_ingest_preserves_order_per_session() -> None:
+    route = _tunnel_route_app()
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+    entered: list[str] = []
+
+    async def ingest(**kwargs: object) -> EventAckFrame:
+        batch = kwargs["batch"]
+        assert isinstance(batch, EventBatchFrame)
+        entered.append(batch.id)
+        if batch.id == "first":
+            first_started.set()
+            await release_first.wait()
+        return EventAckFrame(batch.id, 1)
+
+    route.app.state.runner_event_ingest = ingest
+    comm = await _connect_route(route.app, _TUNNEL_PATH)
+    try:
+        hello = HelloFrame(
+            runner_version="test",
+            frame_protocol_version=1,
+            capabilities=[EVENT_INGEST_CAPABILITY],
+        )
+        await comm.send_input({"type": "websocket.receive", "text": encode_frame(hello)})
+        assert isinstance(
+            decode_frame((await comm.receive_output(timeout=budget(1.0)))["text"]),
+            EventReadyFrame,
+        )
+        for batch_id in ("first", "second"):
+            await comm.send_input(
+                {
+                    "type": "websocket.receive",
+                    "text": encode_frame(
+                        EventBatchFrame(
+                            id=batch_id,
+                            session_id="same-session",
+                            events=[{"type": "external_output_text_delta", "data": {}}],
+                        )
+                    ),
+                }
+            )
+        await asyncio.wait_for(first_started.wait(), timeout=budget(1.0))
+        await asyncio.sleep(0)
+        assert entered == ["first"]
+        release_first.set()
+        acks = [
+            decode_frame((await comm.receive_output(timeout=budget(1.0)))["text"])
+            for _ in range(2)
+        ]
+        assert [ack.id for ack in acks if isinstance(ack, EventAckFrame)] == ["first", "second"]
+    finally:
+        release_first.set()
+        await comm.send_input({"type": "websocket.disconnect", "code": 1000})
+        with contextlib.suppress(asyncio.TimeoutError):
+            await comm.wait(timeout=budget(1.0))
+
+
+async def test_event_ingest_other_session_progresses_while_one_is_blocked() -> None:
+    route = _tunnel_route_app()
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+
+    async def ingest(**kwargs: object) -> EventAckFrame:
+        batch = kwargs["batch"]
+        assert isinstance(batch, EventBatchFrame)
+        if batch.session_id == "a":
+            first_started.set()
+            await release_first.wait()
+        return EventAckFrame(batch.id, 1)
+
+    route.app.state.runner_event_ingest = ingest
+    comm = await _connect_route(route.app, _TUNNEL_PATH)
+    try:
+        await comm.send_input(
+            {
+                "type": "websocket.receive",
+                "text": encode_frame(
+                    HelloFrame(
+                        runner_version="test",
+                        frame_protocol_version=1,
+                        capabilities=[EVENT_INGEST_CAPABILITY],
+                    )
+                ),
+            }
+        )
+        assert isinstance(
+            decode_frame((await comm.receive_output(timeout=budget(1.0)))["text"]),
+            EventReadyFrame,
+        )
+        for session_id in ("a", "b"):
+            await comm.send_input(
+                {
+                    "type": "websocket.receive",
+                    "text": encode_frame(
+                        EventBatchFrame(
+                            id=session_id,
+                            session_id=session_id,
+                            events=[{"type": "external_output_text_delta", "data": {}}],
+                        )
+                    ),
+                }
+            )
+        await asyncio.wait_for(first_started.wait(), timeout=budget(1.0))
+        ack = decode_frame((await comm.receive_output(timeout=budget(1.0)))["text"])
+        assert isinstance(ack, EventAckFrame) and ack.id == "b"
+        release_first.set()
+        ack = decode_frame((await comm.receive_output(timeout=budget(1.0)))["text"])
+        assert isinstance(ack, EventAckFrame) and ack.id == "a"
+    finally:
+        release_first.set()
+        await comm.send_input({"type": "websocket.disconnect", "code": 1000})
+        with contextlib.suppress(asyncio.TimeoutError):
+            await comm.wait(timeout=budget(1.0))
+
+
+async def test_disconnected_batch_waiting_on_lock_cannot_apply_after_reconnect() -> None:
+    route = _tunnel_route_app()
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+    entered: list[str] = []
+
+    async def ingest(**kwargs: object) -> EventAckFrame:
+        batch = kwargs["batch"]
+        assert isinstance(batch, EventBatchFrame)
+        entered.append(batch.id)
+        if batch.id == "first":
+            first_started.set()
+            await release_first.wait()
+        return EventAckFrame(batch.id, 1)
+
+    async def connect() -> ApplicationCommunicator:
+        comm = await _connect_route(route.app, _TUNNEL_PATH)
+        hello = HelloFrame(
+            runner_version="test",
+            frame_protocol_version=1,
+            capabilities=[EVENT_INGEST_CAPABILITY],
+        )
+        await comm.send_input({"type": "websocket.receive", "text": encode_frame(hello)})
+        assert isinstance(
+            decode_frame((await comm.receive_output(timeout=budget(1.0)))["text"]),
+            EventReadyFrame,
+        )
+        return comm
+
+    route.app.state.runner_event_ingest = ingest
+    old = await connect()
+    old_closed = False
+    new: ApplicationCommunicator | None = None
+    try:
+        for batch_id in ("first", "stale-second"):
+            await old.send_input(
+                {
+                    "type": "websocket.receive",
+                    "text": encode_frame(
+                        EventBatchFrame(
+                            id=batch_id,
+                            session_id="same-session",
+                            events=[{"type": "external_output_text_delta", "data": {}}],
+                        )
+                    ),
+                }
+            )
+        await asyncio.wait_for(first_started.wait(), timeout=budget(1.0))
+
+        async def both_admitted() -> None:
+            while route.app.state.runner_event_ingest_active_counts.get(_RUNNER_ID, 0) < 2:
+                await asyncio.sleep(0.01)
+
+        await asyncio.wait_for(both_admitted(), timeout=budget(1.0))
+        await old.send_input({"type": "websocket.disconnect", "code": 1000})
+        with contextlib.suppress(asyncio.TimeoutError):
+            await old.wait(timeout=budget(1.0))
+        old_closed = True
+        new = await connect()
+        release_first.set()
+
+        async def old_work_finished() -> None:
+            while route.app.state.runner_event_ingest_active_counts.get(_RUNNER_ID, 0):
+                await asyncio.sleep(0.01)
+
+        await asyncio.wait_for(old_work_finished(), timeout=budget(1.0))
+        assert entered == ["first"]
+        await new.send_input(
+            {
+                "type": "websocket.receive",
+                "text": encode_frame(
+                    EventBatchFrame(
+                        id="new",
+                        session_id="same-session",
+                        events=[{"type": "external_output_text_delta", "data": {}}],
+                    )
+                ),
+            }
+        )
+        ack = decode_frame((await new.receive_output(timeout=budget(1.0)))["text"])
+        assert isinstance(ack, EventAckFrame) and ack.id == "new"
+        assert entered == ["first", "new"]
+    finally:
+        release_first.set()
+        try:
+            if new is not None:
+                await new.send_input({"type": "websocket.disconnect", "code": 1000})
+                with contextlib.suppress(asyncio.TimeoutError):
+                    await new.wait(timeout=budget(1.0))
+        finally:
+            if not old_closed:
+                await old.send_input({"type": "websocket.disconnect", "code": 1000})
+                with contextlib.suppress(asyncio.TimeoutError):
+                    await old.wait(timeout=budget(1.0))
 
 
 # ── Managed-runner token mint endpoint (POST /v1/runners/{id}/token) ──

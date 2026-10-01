@@ -44,42 +44,20 @@ import asyncio
 import contextlib
 import io
 import json
-import os
 import shutil
-import signal
-import socket
-import subprocess
-import sys
 import tarfile
 import tempfile
-import time
 from pathlib import Path
 from typing import Any
 
 import httpx
 import pytest
 
-_REPO_ROOT = Path(__file__).resolve().parents[2]
+from tests._helpers.live_server import isolated_local_server
 
 # CI shells can carry an egress proxy; every HTTP call here targets 127.0.0.1.
 _http = httpx.Client(trust_env=False)
 
-# The spawned server resolves worktree imports from the repo root and the SDKs.
-_PYTHONPATH = os.pathsep.join(
-    [
-        str(_REPO_ROOT),
-        str(_REPO_ROOT / "sdks" / "python-client"),
-        str(_REPO_ROOT / "sdks" / "ui"),
-        os.environ.get("PYTHONPATH", ""),
-    ]
-)
-
-# Plain server launch -- no store monkeypatch needed; this bug lives in the
-# forwarder's replay + the server's real (un-deduped) commit path.
-_SERVER_BOOTSTRAP = "from omnigent.cli import main\n\nmain()\n"
-
-_HEALTH_TIMEOUT_S = 120.0
-_POLL_S = 0.5
 
 # Three assistant transcript entries; the forwarder mirrors each as one
 # ``external_conversation_item``. Distinct markers let the assertion count how
@@ -87,76 +65,6 @@ _POLL_S = 0.5
 _MARKER_ALPHA = "stall-replay-alpha-committed-before-the-stall"
 _MARKER_BRAVO = "stall-replay-bravo-the-stalled-post"
 _MARKER_CHARLIE = "stall-replay-charlie-after-the-stall"
-
-
-def _find_free_port() -> int:
-    """Grab an ephemeral port for the spawned server."""
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        return int(sock.getsockname()[1])
-
-
-def _localhost_env(extra: dict[str, str]) -> dict[str, str]:
-    """Subprocess env with worktree imports and no proxy/credentials in the way.
-
-    :param extra: Overrides/additions applied after the base env.
-    :returns: Environment mapping for ``subprocess.Popen``.
-    """
-    env = {
-        **os.environ,
-        "PYTHONPATH": _PYTHONPATH,
-        "NO_PROXY": "127.0.0.1,localhost",
-        "no_proxy": "127.0.0.1,localhost",
-        # Header auth + single-user keeps the spawned server out of login
-        # mode; ambient auth/OIDC vars would otherwise 401 every call.
-        "OMNIGENT_AUTH_PROVIDER": "header",
-        "OMNIGENT_LOCAL_SINGLE_USER": "1",
-    }
-    for name in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
-        env.pop(name, None)
-    # Strip ambient credentials/config that would alter server behaviour:
-    # any Databricks or OIDC setting, any cookie/signing secret, and the
-    # specific provider/tunnel vars below.
-    for name in list(env):
-        if (
-            name.startswith(("DATABRICKS_", "OMNIGENT_OIDC_"))
-            or name.endswith("_SECRET")
-            or name
-            in (
-                "ANTHROPIC_API_KEY",
-                "OMNIGENT_AUTH_ENABLED",
-                "OMNIGENT_RUNNER_TUNNEL_TOKEN",
-            )
-        ):
-            env.pop(name, None)
-    env.update(extra)
-    return env
-
-
-def _terminate(proc: subprocess.Popen[bytes] | None) -> None:
-    """Best-effort SIGTERM -> SIGKILL teardown for a spawned process."""
-    if proc is None or proc.poll() is not None:
-        return
-    proc.send_signal(signal.SIGTERM)
-    try:
-        proc.wait(timeout=10)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        proc.wait(timeout=5)
-
-
-def _wait_http_ok(url: str, deadline: float) -> None:
-    """Poll *url* until it returns 200 or *deadline* (monotonic) passes."""
-    last = "not polled"
-    while time.monotonic() < deadline:
-        try:
-            if _http.get(url, timeout=2.0).status_code == 200:
-                return
-            last = "non-200"
-        except httpx.HTTPError as exc:
-            last = f"{type(exc).__name__}: {exc}"
-        time.sleep(_POLL_S)
-    raise AssertionError(f"{url} never became healthy: {last}")
 
 
 def _create_claude_native_session(base_url: str) -> str:
@@ -351,76 +259,48 @@ def test_forward_loop_stall_does_not_duplicate_committed_items(tmp_path: Path) -
 
     :param tmp_path: Per-test temp dir (server DB, artifacts, bridge dir).
     """
-    port = _find_free_port()
-    base_url = f"http://127.0.0.1:{port}"
-    db_path = tmp_path / "chat.db"
-    database_uri = f"sqlite:///{db_path}"
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     bridge_dir: Path | None = None
 
-    server_log = (tmp_path / "server.log").open("w")
-    server_proc: subprocess.Popen[bytes] | None = None
     try:
-        server_proc = subprocess.Popen(
-            [
-                sys.executable,
-                "-c",
-                _SERVER_BOOTSTRAP,
-                "server",
-                "--host",
-                "127.0.0.1",
-                "--port",
-                str(port),
-                "--database-uri",
-                database_uri,
-                "--artifact-location",
-                str(tmp_path / "artifacts"),
-            ],
-            env=_localhost_env({}),
-            stdout=server_log,
-            stderr=subprocess.STDOUT,
-        )
-        _wait_http_ok(f"{base_url}/health", time.monotonic() + _HEALTH_TIMEOUT_S)
+        with isolated_local_server(tmp_path) as base_url:
+            session_id = _create_claude_native_session(base_url)
+            # Root the bridge dir under the production claude-native bridge root
+            # (prepare_bridge_dir is the same helper the runner uses at launch), so
+            # the forwarder tails a genuinely-rooted bridge exactly as in production.
+            from omnigent.harnesses.claude_native.bridge import prepare_bridge_dir
 
-        session_id = _create_claude_native_session(base_url)
-        # Root the bridge dir under the production claude-native bridge root
-        # (prepare_bridge_dir is the same helper the runner uses at launch), so
-        # the forwarder tails a genuinely-rooted bridge exactly as in production.
-        from omnigent.harnesses.claude_native.bridge import prepare_bridge_dir
+            bridge_dir = prepare_bridge_dir(session_id, workspace=workspace)
+            _seed_transcript(bridge_dir)
 
-        bridge_dir = prepare_bridge_dir(session_id, workspace=workspace)
-        _seed_transcript(bridge_dir)
+            # Drive the real forwarder loop through one injected mid-batch stall.
+            asyncio.run(_drive_forwarder_through_a_stall(base_url, session_id, bridge_dir))
 
-        # Drive the real forwarder loop through one injected mid-batch stall.
-        asyncio.run(_drive_forwarder_through_a_stall(base_url, session_id, bridge_dir))
+            alpha = _count_marker(base_url, session_id, _MARKER_ALPHA)
+            bravo = _count_marker(base_url, session_id, _MARKER_BRAVO)
+            charlie = _count_marker(base_url, session_id, _MARKER_CHARLIE)
 
-        alpha = _count_marker(base_url, session_id, _MARKER_ALPHA)
-        bravo = _count_marker(base_url, session_id, _MARKER_BRAVO)
-        charlie = _count_marker(base_url, session_id, _MARKER_CHARLIE)
+            # Sanity: the batch was forwarded at all (the stall must not silently
+            # drop everything -- otherwise the duplication assertion is vacuous).
+            assert bravo >= 1 and charlie >= 1, (
+                "forwarder never delivered the post-stall items; "
+                f"alpha={alpha} bravo={bravo} charlie={charlie} -- "
+                f"server log tail:\n{(tmp_path / 'server.log').read_text()[-2000:]}"
+            )
 
-        # Sanity: the batch was forwarded at all (the stall must not silently
-        # drop everything -- otherwise the duplication assertion is vacuous).
-        assert bravo >= 1 and charlie >= 1, (
-            "forwarder never delivered the post-stall items; "
-            f"alpha={alpha} bravo={bravo} charlie={charlie} -- "
-            f"server log tail:\n{(tmp_path / 'server.log').read_text()[-2000:]}"
-        )
-
-        # The bug: ALPHA was committed before the stall, then re-committed when
-        # the deadline-cancelled batch replayed. Correct behavior is exactly
-        # one committed copy of each item.
-        assert alpha == 1, (
-            "The 300s forward-loop stall replayed the whole batch and "
-            "re-committed an already-committed transcript item: "
-            f"ALPHA committed {alpha} times (expected exactly 1). "
-            f"bravo={bravo} charlie={charlie}. Because "
-            "_post_external_conversation_item sends no source_id and the server "
-            "does not dedupe external_conversation_item events, every stall "
-            "replay duplicates rows until the database fills."
-        )
+            # The bug: ALPHA was committed before the stall, then re-committed when
+            # the deadline-cancelled batch replayed. Correct behavior is exactly
+            # one committed copy of each item.
+            assert alpha == 1, (
+                "The 300s forward-loop stall replayed the whole batch and "
+                "re-committed an already-committed transcript item: "
+                f"ALPHA committed {alpha} times (expected exactly 1). "
+                f"bravo={bravo} charlie={charlie}. Because "
+                "_post_external_conversation_item sends no source_id and the server "
+                "does not dedupe external_conversation_item events, every stall "
+                "replay duplicates rows until the database fills."
+            )
     finally:
-        _terminate(server_proc)
-        server_log.close()
         if bridge_dir is not None:
             shutil.rmtree(bridge_dir, ignore_errors=True)

@@ -1,6 +1,6 @@
 ---
 name: resolve-drive-pr
-description: Drive an open PR through current CI, independent Polly review, preview, and maintainer handoff.
+description: Drive an open PR through current CI, independent Polly and OCR reviews, preview, and maintainer handoff.
 ---
 
 # Drive an open PR
@@ -10,8 +10,8 @@ Read each resource when reaching its substep, preserving the publication mode:
 | Substep | Resource |
 | --- | --- |
 | 4.2, current CI and mergeability | [ci.md](ci.md) |
-| 4.3, independent Polly review | [polly.md](polly.md) |
-| 4.1, preview after CI and Polly are clean | [preview.md](preview.md) |
+| 4.3, independent Polly and OCR reviews | [polly.md](polly.md) |
+| 4.1, preview after CI and both reviews are clean | [preview.md](preview.md) |
 | 4.4, live-validation instructions | [validation-prompt.md](validation-prompt.md) |
 | 4.5, final review and maintainer handoff | [final-review.md](final-review.md) |
 
@@ -31,9 +31,9 @@ live-validation command, and a maintainer tagged. `skip_push` runs (author path
 that only committed locally) have no PR to land, so skip Step 4 entirely.
 Workflow-owned author runs also have no PR during the agent session: perform only
 the deferred body/prompt preparation called out in Step 4.4 before the final
-handoff, and leave preview, CI, Polly, GitHub comments, and maintainer tagging to
-the post-publication workflow. Once a directly published or reviewed PR is up you
-**stay on it** until CI is green and the review is clean, then hand it to a
+handoff, and leave preview, CI, both reviews, GitHub comments, and maintainer
+tagging to the post-publication workflow. Once a directly published or reviewed
+PR is up you **stay on it** until CI is green and the review is clean, then hand it to a
 human. The sub-steps overlap in time (kick off the preview and the first review,
 then poll), so don't serialize what can run concurrently.
 
@@ -95,12 +95,11 @@ can land a fix depends on where its branch lives:
     try-it-out command, then tag the maintainer. No takeover needed. (The approval
     is a bot indicator — the maintainer's approval still merges it.)
 
-Throughout, address the PR you're landing by its number `<pr>`. This whole step is
-a **bounded loop** — cap it at **~6 fix→(push-or-takeover)→re-check rounds**. A
-fork **takeover** is not one of those rounds: it opens a fresh PR and restarts CI +
-Polly from scratch on it, so treat it as a **reset** — the ~6-round budget applies
-to the new PR from that point, rather than being consumed by the takeover itself.
-If you're still red or still getting blocking findings after the budget, stop,
-leave the PR open with an honest summary comment of what's unresolved, and report
-`outcome: "partially_fixed"` with the specifics (see Output). Never loosen a test,
-skip a check, or merge to force green.
+Throughout, address the PR you're landing by its number `<pr>`. Continue until
+current CI and both independent reviews are settled; there is **no fixed
+review-round cap**. After every push, request both Polly and OCR for the new head
+(Step 4.3), including pushes for CI or conflict repairs. A fork takeover starts
+this loop on the replacement PR. If a concrete blocker or actual execution
+deadline prevents completion, leave a resumable checkpoint and report
+`outcome: "partially_fixed"` with the unresolved work (see Output). Never loosen
+a test, skip a check, or merge to force green.

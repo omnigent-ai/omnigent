@@ -36,6 +36,8 @@ from omnigent.host.frames import (
     HostListDirResultFrame,
     HostListWorktreesFrame,
     HostListWorktreesResultFrame,
+    HostMcpServersFrame,
+    HostMcpServersResultFrame,
     HostModelOptionsFrame,
     HostModelOptionsResultFrame,
     HostRemoveWorktreeFrame,
@@ -206,6 +208,78 @@ def test_skills_result_rejects_malformed_catalog(skills: object) -> None:
         decode_host_frame(
             json.dumps(
                 {"kind": "host.skills_result", "request_id": "r", "status": "ok", "skills": skills}
+            )
+        )
+
+
+@pytest.mark.parametrize(
+    "frame",
+    [
+        HostMcpServersFrame(request_id="req_mcp"),
+        HostMcpServersResultFrame(request_id="req_mcp", status="ok"),
+        HostMcpServersResultFrame(
+            request_id="req_mcp",
+            status="ok",
+            mcp_servers=[
+                {"name": "github", "harness": "claude", "transport": "stdio", "scope": "user"},
+                {
+                    "name": "figma",
+                    "harness": "cursor",
+                    "transport": "http",
+                    "scope": "user",
+                    "plugin": "figma",
+                    "url_host": "mcp.figma.com",
+                },
+            ],
+        ),
+        HostMcpServersResultFrame(request_id="req_mcp", status="failed", error="boom"),
+    ],
+)
+def test_mcp_servers_frames_round_trip(
+    frame: HostMcpServersFrame | HostMcpServersResultFrame,
+) -> None:
+    assert decode_host_frame(encode_host_frame(frame)) == frame
+
+
+def test_mcp_servers_result_keeps_only_allow_listed_fields() -> None:
+    frame = decode_host_frame(
+        json.dumps(
+            {
+                "kind": "host.mcp_servers_result",
+                "request_id": "r",
+                "status": "ok",
+                "mcp_servers": [
+                    {
+                        "name": "github",
+                        "harness": "claude",
+                        "transport": "stdio",
+                        "scope": "user",
+                        "env": {"TOKEN": "secret"},
+                        "command": "secret",
+                    }
+                ],
+            }
+        )
+    )
+    assert isinstance(frame, HostMcpServersResultFrame)
+    assert frame.mcp_servers == [
+        {"name": "github", "harness": "claude", "transport": "stdio", "scope": "user"}
+    ]
+
+
+@pytest.mark.parametrize(
+    "servers", [{}, ["github"], [{"name": "github"}], [{"name": 1, "harness": "claude"}]]
+)
+def test_mcp_servers_result_rejects_malformed_inventory(servers: object) -> None:
+    with pytest.raises(ValueError):
+        decode_host_frame(
+            json.dumps(
+                {
+                    "kind": "host.mcp_servers_result",
+                    "request_id": "r",
+                    "status": "ok",
+                    "mcp_servers": servers,
+                }
             )
         )
 

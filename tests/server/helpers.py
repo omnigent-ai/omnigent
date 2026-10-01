@@ -1120,3 +1120,19 @@ def echo_runner_client() -> httpx.AsyncClient:
         base_url="http://runner.test",
         transport=httpx.MockTransport(_handler),
     )
+
+
+def websocket_scope(path: str) -> dict[str, object]:
+    """Build a minimal ASGI WebSocket scope for the host tunnel."""
+    return {
+        "type": "websocket",
+        "asgi": {"version": "3.0"},
+        "scheme": "ws",
+        "path": path,
+        "raw_path": path.encode("ascii"),
+        "query_string": b"",
+        "headers": [],
+        "client": ("127.0.0.1", 50000),
+        "server": ("testserver", 80),
+        "subprotocols": [],
+    }

@@ -201,6 +201,9 @@ class EvaluationContext:
         ``llm:`` config. The client is shared across all policies
         in one engine; each call should pass ``model`` and
         ``connection_params`` from the engine's resolved config.
+    :param conversation_id: The conversation this evaluation belongs
+        to. Surfaced as ``event["context"]["conversation_id"]``.
+        ``None`` only in contexts with no engine.
     """
 
     phase: Phase
@@ -216,6 +219,7 @@ class EvaluationContext:
     harness: str | None = None
     labels: dict[str, str] | None = None
     llm_client: PolicyLLMClient | None = None
+    conversation_id: str | None = None
 
 
 @dataclass(frozen=True)

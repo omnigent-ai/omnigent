@@ -15,6 +15,11 @@ Everything else below — which surface to drive, how to stand the recorder up, 
 the per-surface mechanics — is identical for both. Each agent's own AGENTS.md says
 which clip `kind` it produces and where it goes; this file is the how.
 
+The recording driver may be an existing test or a temporary journey script,
+separate from the selected regression coverage. Retain its source and command
+as evidence for before/after replay. Recording does not require committing the
+driver as a permanent test.
+
 ## When to record
 
 Record the user action and the product's response:
@@ -123,7 +128,7 @@ cause is named from what you observed rather than guessed.
 
 ## `web` facets
 
-Run the authored Playwright test with recording on.
+Run the selected Playwright journey driver with recording on.
 
 **Record via `OMNIGENT_E2E_RECORD_DIR`, not `--video on`.** `--video on` only
 instruments pytest-playwright's own `page` fixture. Many e2e_ui tests (e.g. the
@@ -175,7 +180,8 @@ can't show — iOS safe-area / Dynamic Island insets, the system-browser OIDC ho
 the native setup screen. Those need a real simulator/emulator screen recording,
 which no CI path provisions today; keep `recordings: []` for such a facet and name
 the missing device toolchain in your evidence (a real environment limit, not a
-`not_reproduced`). The authored test still ships.
+`not_reproduced`). Keep the available test evidence and selected regression
+coverage; missing footage does not change which tests belong in the PR.
 
 ## `terminal` facets
 
@@ -187,7 +193,7 @@ alongside as machine-checkable evidence.
 **For a native-harness pane** (claude/codex/cursor/goose/hermes/kiro/… — the bug
 is in a real harness CLI's output), don't hand-roll the launch: the existing
 render-parity tests already drive the *real* CLI against the mock LLM with the
-terminal view shown, so **copy the closest one**
+terminal view shown, so **reuse or adapt the closest one**
 (`tests/e2e_ui/messages/test_native_<harness>_render_parity.py`, which use the
 `native_<harness>_session` / `native_<harness>_mock_session` fixtures in
 `tests/e2e_ui/conftest.py`) and adapt its scripted turns to your journey. These
@@ -229,8 +235,8 @@ tape and note that rendering was skipped.
   won't render (server boot times out, `ttyd` missing, VHS unavailable), do
   **not** substitute a recording of `pytest … FAILS` / an `AssertionError`. That
   films the regression artifact, not the failure a user sees. Keep
-  `recordings: []` and name the blocker; the authored test still ships, it just
-  isn't the video.
+  `recordings: []` and name the blocker. Keep the test evidence separately and
+  commit only the selected permanent regression coverage.
 
 ## `desktop` facets (Electron shell)
 

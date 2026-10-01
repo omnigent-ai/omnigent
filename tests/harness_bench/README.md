@@ -37,8 +37,42 @@ python -m tests.harness_bench --jobs 4 --rich
 Without `--live` or `--no-live`, the CLI runs live when gateway credentials are
 resolvable and otherwise renders the declared matrix offline. Credential
 resolution follows `omni run`: existing ambient `OPENAI_*` routing is
-preserved; otherwise `--profile` overrides the configured profile. A
-non-zero exit means at least one `DRIFT` cell was found.
+preserved; otherwise `--profile` overrides the configured profile. By default,
+exit code 0 means no drift was found; it does not mean the probes ran.
+
+### Using results in automation
+
+Require observations explicitly before treating a run as a passing check:
+
+```bash
+python -m tests.harness_bench --live --require-complete \
+  --harness codex --dimension basic_turn,streaming,tool_calling \
+  --json --report harness-results.json
+```
+
+`--require-complete` requires an explicit `--live`; it never silently falls
+back to the declared matrix. Missing CLIs, startup failures, timeouts, probe
+exceptions, and other `SKIPPED`/`UNKNOWN` results make the selected run
+incomplete. Non-applicable dimensions are allowed. Select only the dimensions
+you intend to require, since some transports cannot observe all dimensions.
+
+| Exit | Meaning |
+| --- | --- |
+| 0 | No drift; with `--require-complete`, all selected checks also have conclusive observations. |
+| 1 | At least one observed capability differs from its declaration, even if other checks are incomplete. |
+| 2 | Invalid configuration, missing required credentials, or incomplete results with `--require-complete`. |
+
+Reports include coverage independently of drift: JSON has `complete` and
+`has_drift`; text and Markdown have a coverage line and reasons for missing
+observations. A complete run can still fail because of drift. Reports describe
+the selected harnesses, models, transports and dimensions, not the whole suite.
+
+This is a behavioral conformance suite, not the release latency benchmark in
+`dev/benchmarks/omnigent/`. Its offline tests are deterministic, but live turns
+still depend on model behavior, vendor login, CLI versions and timing. Pin those
+inputs and repeat a chosen slice before using it as a regression gate. A local
+mock provider validates the execution plumbing, not live model reliability.
+This option does not install a Resolve or repository-wide gate.
 
 ### Flags
 
@@ -51,6 +85,8 @@ non-zero exit means at least one `DRIFT` cell was found.
   vendor CLIs unasked.
 - `--profile NAME` -- optional Databricks profile override; it is not required
   when config or ambient `OPENAI_*` already supplies credentials.
+- `--require-complete` -- require conclusive results for every selected check;
+  must be paired with `--live`. See exit codes above.
 - `--harness NAME[=MODEL]` -- probe one harness (repeatable), optionally
   replacing that harness profile's model for this run. `NAME` accepts an
   official name or a `module:attr` / `module.ATTR` community `BenchProfile`.

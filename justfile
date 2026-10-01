@@ -115,7 +115,7 @@ electron-dev: _ensure-web _ensure-electron
 electron-build: _ensure-web _ensure-electron
     pnpm --filter ./web/electron run build
 
-# Build (if needed) and launch the packaged app (reads MDM managed prefs).
+# Build (if needed) and launch the development package (reads dev-domain prefs).
 # Flags: --rebuild (force a fresh build even if one exists),
 #        --v2-flow (force the new server-selector wizard on),
 #        --reset-state (first uninstall the CLI + wipe app data for a fresh
@@ -153,7 +153,7 @@ electron-run *flags:
         arm64) archdir="mac-arm64" ;;
         *) archdir="mac" ;;  # electron-builder names the x64 output "mac"
     esac
-    find_app() { ls -d "web/electron/dist/$archdir/Omnigent.app" 2>/dev/null | head -1 || true; }
+    find_app() { ls -d "web/electron/dist-dev/$archdir/Omnigent Dev.app" 2>/dev/null | head -1 || true; }
     app="$(find_app)"
     if [ "$rebuild" = 1 ] || [ -z "$app" ]; then
         echo "Building the packaged app (this takes a few minutes)…"
@@ -162,9 +162,9 @@ electron-run *flags:
         app="$(find_app)"
     fi
     [ -n "$app" ] || { echo "No $archdir build found after building."; exit 1; }
-    echo "Quitting any running Omnigent…"
-    osascript -e 'quit app "Omnigent"' 2>/dev/null || true
-    pkill -x Omnigent 2>/dev/null || true
+    echo "Quitting any running Omnigent Dev…"
+    osascript -e 'quit app "Omnigent Dev"' 2>/dev/null || true
+    pkill -x 'Omnigent Dev' 2>/dev/null || true
     sleep 1
     if [ "$reset_state" = 1 ]; then
         # Uninstall the CLI. The shared uninstaller exits non-zero both when no
@@ -183,9 +183,9 @@ electron-run *flags:
         # Wipe the desktop app data directly so a fresh-user reset works even with
         # no CLI installed (the uninstaller's global guard skips desktop-data in
         # that case). Intentional destroy — see the confirmation above.
-        rm -rf "$HOME/Library/Application Support/Omnigent" \
-               "$HOME/Library/Caches/Omnigent" \
-               "$HOME/Library/Logs/Omnigent"
+        rm -rf "$HOME/Library/Application Support/Omnigent Dev" \
+               "$HOME/Library/Caches/Omnigent Dev" \
+               "$HOME/Library/Logs/Omnigent Dev"
     fi
     if [ "$v2" = 1 ]; then
         echo "Launching $app (v2 flow forced)"

@@ -36,6 +36,8 @@ import {
   updateBridge,
 } from "@/lib/nativeBridge";
 import { onBrowserActionRequest } from "@/lib/browserActionBus";
+import { readAlwaysSteer } from "@/lib/alwaysSteerPreferences";
+import { shouldQueueSend } from "@/lib/messageQueue";
 import { onInAppLinkOpen } from "@/lib/openLinkInApp";
 import {
   buildDesignModePrompt,
@@ -123,6 +125,7 @@ import {
 import { TerminalsPanel } from "./TerminalsPanel";
 import { PermissionsModal } from "@/components/PermissionsModal";
 import { KeyboardShortcutsDialog } from "@/components/KeyboardShortcutsDialog";
+import { ImportReviewGate } from "@/components/onboarding/HostImportReview";
 import { CommandPalette } from "./CommandPalette";
 import { Toaster } from "@/components/ui/sonner";
 import { CloseShellDialog } from "./CloseShellDialog";
@@ -265,6 +268,7 @@ export function AppShell() {
       ? 720
       : undefined;
   const [searchParams, setSearchParams] = useSearchParams();
+  const agentsPanelRequested = searchParams.get("panel") === "agents";
   const [sidebarOpen, setSidebarOpen] = useState(initialSidebarOpen);
   // Extension pages own their top chrome. The shell header only carries the
   // collapsed-sidebar toggle there, so skip it while the sidebar is open and
@@ -949,11 +953,30 @@ export function AppShell() {
         const text = buildDesignModePrompt(payload.element, payload.prompt);
         const shot = designShotRef.current.get(cid);
         const file = dataUrlToFile(shot, `design-element-${submitId}.png`);
-        void useChatStore
-          .getState()
-          .send(text, boundAgentId, file ? [file] : undefined)
-          .then(() => signal(true, "Sent to agent."))
-          .catch((err: unknown) => signal(false, `Send failed: ${String(err)}`));
+        const chat = useChatStore.getState();
+        if (cid !== chat.conversationId) {
+          designShotRef.current.delete(cid);
+          signal(false, "Return to this session before sending.");
+          return;
+        }
+        const files = file ? [file] : undefined;
+        if (
+          shouldQueueSend(
+            cid,
+            chat.status,
+            chat.sessionStatus,
+            chat.queuedMessages,
+            readAlwaysSteer(),
+          )
+        ) {
+          chat.enqueueMessage(text, files);
+          signal(true, "Queued for agent.");
+        } else {
+          void chat
+            .send(text, boundAgentId, files)
+            .then(() => signal(true, "Sent to agent."))
+            .catch((err: unknown) => signal(false, `Send failed: ${String(err)}`));
+        }
         // Clear the stashed screenshot so a later submit without a fresh pick
         // doesn't reuse a stale crop.
         designShotRef.current.delete(cid);
@@ -1050,6 +1073,7 @@ export function AppShell() {
       return;
     }
     const persisted = readSessionWorkspaceState(conversationId);
+    const showAgents = searchParams.get("panel") === "agents";
 
     const storageKey = `omnigent.web.panel-key:${conversationId}`;
     const stored = sessionStorage.getItem(storageKey);
@@ -1058,7 +1082,7 @@ export function AppShell() {
       agentTerminal === null ? PANEL_NO_TERMINAL_KEY : terminalTabKey(agentTerminal);
     const defaultToTerminal = terminalFirst && readTranscriptViewDefault() === "terminal";
     setPanelInitialKeyState(
-      requestedView === "chat"
+      showAgents || requestedView === "chat"
         ? null
         : requestedView === "terminal"
           ? resolveTerminalViewKey(stored, terminalKey)
@@ -1086,7 +1110,7 @@ export function AppShell() {
     const persistedFiles = persisted.openFiles ?? [];
     const nextOpenFiles =
       urlFile && !persistedFiles.includes(urlFile) ? [...persistedFiles, urlFile] : persistedFiles;
-    const nextSelected = urlFile ?? persisted.selectedFilePath ?? null;
+    const nextSelected = showAgents ? null : (urlFile ?? persisted.selectedFilePath ?? null);
     setOpenFiles(nextOpenFiles);
     setSelectedFilePath(nextSelected);
     // The tab strip derives from the live terminal list, so there's nothing to
@@ -1109,6 +1133,11 @@ export function AppShell() {
     if (nextSelected && nextTab !== "files" && nextTab !== "changes") {
       nextTab = "files";
     }
+    if (showAgents) {
+      nextTab = "subagents";
+      setSelectedTerminalKey(null);
+      setSubagentsPanelOpen(isMobileViewport());
+    }
     setRightRailTab(nextTab);
 
     // Restore the rail open-state for this session. A deep link / reload that
@@ -1119,7 +1148,7 @@ export function AppShell() {
     // session's saved open-state.
     const commentParam = searchParams.get("comment");
     const hasWorkspaceUrlSignal =
-      urlFile !== null || (commentParam !== null && commentParam !== "");
+      showAgents || urlFile !== null || (commentParam !== null && commentParam !== "");
     setRightPanelOpen((persisted.open ?? readDefaultWorkspacePanelOpen()) || hasWorkspaceUrlSignal);
 
     stateConvRef.current = conversationId;
@@ -1143,14 +1172,14 @@ export function AppShell() {
       setPanelInitialKeyState(null);
     } else if (requestedView === "terminal") {
       setPanelInitialKeyState(resolveTerminalViewKey(stored, terminalKey));
-    } else if (stored === CHAT_VIEW_STORAGE_VALUE) {
+    } else if (agentsPanelRequested || stored === CHAT_VIEW_STORAGE_VALUE) {
       setPanelInitialKeyState(null);
     } else if (stored !== null) {
       setPanelInitialKeyState(stored);
     } else if (readTranscriptViewDefault() === "terminal") {
       setPanelInitialKeyState(terminalKey);
     }
-  }, [agentTerminal, conversationId, searchParams, terminalFirst]);
+  }, [agentTerminal, agentsPanelRequested, conversationId, searchParams, terminalFirst]);
 
   // Validate the latest selection, including a tab queued by session restoration.
   useEffect(() => {
@@ -1166,6 +1195,25 @@ export function AppShell() {
       );
     });
   }, [railTabsAvailable, rightRailTab]);
+
+  // Selecting the current agent removes the panel query without changing sessions.
+  useEffect(() => {
+    if (!conversationId || !agentsPanelRequested) {
+      setSubagentsPanelOpen(false);
+      return;
+    }
+    setPanelInitialKeyState(null);
+    sessionStorage.setItem(`omnigent.web.panel-key:${conversationId}`, CHAT_VIEW_STORAGE_VALUE);
+    setSelectedFilePath(null);
+    setSelectedTerminalKey(null);
+    setExecutionLogsKey(null);
+    setFilesPanelOpen(false);
+    setShellsPanelOpen(false);
+    setGithubPanelOpen(false);
+    setRightRailTab("subagents");
+    setRightPanelOpen(true);
+    setSubagentsPanelOpen(isMobileViewport());
+  }, [conversationId, agentsPanelRequested]);
 
   // Persist the per-session rail tab + open file tabs whenever they change.
   // Keyed on the state (not conversationId) and targeted at the conversation
@@ -2474,6 +2522,8 @@ export function AppShell() {
           {/* Keyboard-shortcuts reference. Self-contained (owns its open state +
               ⌘/Ctrl+/ opener); ungated so it works on every route. */}
           <KeyboardShortcutsDialog />
+          {/* Opens the import modal once per newly connected host. */}
+          {!isEmbedded && <ImportReviewGate />}
           {/* Dev-only `?import-preview` for the post-setup import modal. */}
           {ImportContextPreview && (
             <Suspense fallback={null}>

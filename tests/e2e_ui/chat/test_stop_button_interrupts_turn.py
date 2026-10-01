@@ -54,6 +54,7 @@ import contextlib
 import io
 import json
 import os
+import re
 import secrets
 import signal
 import subprocess
@@ -404,16 +405,24 @@ def test_composer_interrupts_running_turn(
         interrupt_button = page.get_by_role("button", name="Interrupt", exact=True)
         expect(interrupt_button).to_be_visible(timeout=30_000)
         if interrupt_control == "escape-after-reload":
+            metadata_route_intercepted = False
 
             def without_active_response(route: Route) -> None:
+                nonlocal metadata_route_intercepted
                 response = route.fetch()
                 snapshot = response.json()
                 if harness == "hermes":
                     snapshot["active_response_id"] = None
                 route.fulfill(response=response, json=snapshot)
+                metadata_route_intercepted = True
 
-            page.route(f"**/v1/sessions/{session_id}", without_active_response)
-            page.reload()
+            session_metadata_url = re.compile(rf".*/v1/sessions/{re.escape(session_id)}(?:\?.*)?$")
+            page.route(session_metadata_url, without_active_response)
+            # The document load can finish before this background snapshot, so
+            # wait for the routed response before checking the interception.
+            with page.expect_response(session_metadata_url):
+                page.reload()
+            assert metadata_route_intercepted, "session metadata response was not intercepted"
             expect(interrupt_button).to_be_visible(timeout=30_000)
             expect(interrupt_button).to_be_enabled()
             expected_placeholder = (

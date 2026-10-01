@@ -33,7 +33,7 @@ from unittest.mock import patch
 import httpx
 import pytest
 
-from tests.e2e_ui.conftest import _enforce_min_server_version, server_version
+from tests.helpers.ui_server_compat import _enforce_min_server_version, server_version
 
 
 @pytest.fixture(scope="session")

@@ -53,6 +53,28 @@ from omnigent.inner.codex_executor import (
 )
 
 
+@pytest.mark.parametrize(
+    ("code", "message", "expected"),
+    [
+        (-32600, "no active turn to steer", True),
+        (-32600, "no active turn to interrupt", True),
+        (-32600, " NO ACTIVE TURN TO INTERRUPT ", True),
+        (-32600, "expected active turn id `turn_a` but found `turn_b`", True),
+        (-32600, "expected active turn id turn_a but found turn_b", True),
+        (-32600, "thread not found", False),
+        (-32600, "invalid turn id", False),
+        (-32600, "expected active turn id", False),
+        (-32600, "cannot steer a review turn", False),
+        (-32603, "no active turn to interrupt", False),
+        (-32603, "expected active turn id turn_a but found turn_b", False),
+        (-32600, None, False),
+    ],
+)
+def test_is_stale_active_turn_error(code: int, message: str | None, expected: bool) -> None:
+    error = CodexAppServerResponseError({"code": code, "message": message})
+    assert app_server.is_stale_active_turn_error(error) is expected
+
+
 @pytest.mark.parametrize("method", ["turn/start", "turn/steer"])
 async def test_rejected_request_traceback_identifies_rpc(method: str) -> None:
     """RPC errors keep their structured payload and add only request identity."""

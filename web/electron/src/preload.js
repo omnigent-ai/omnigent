@@ -87,6 +87,9 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
     ipcRenderer.on("omnigent:open-path", listener);
     return () => ipcRenderer.removeListener("omnigent:open-path", listener);
   },
+  /** The runner picked during onboarding for this server ("local" |
+   *  "remote"), returned once, else null. */
+  takeOnboardingRunner: () => ipcRenderer.invoke("omnigent:take-onboarding-runner"),
   /**
    * Server picker data: the current origin plus organization-provided and
    * recently-connected server URLs. Resolves null off a connected server.
@@ -449,9 +452,25 @@ contextBridge.exposeInMainWorld("omnigentSetup", {
   },
   /** Organization-provided server URLs from macOS Managed Preferences. */
   getManagedServers: () => ipcRenderer.invoke("omnigent:get-managed-servers"),
+  /** Display names for those servers, server URL → name. */
+  getManagedServerNames: () => ipcRenderer.invoke("omnigent:get-managed-server-names"),
   /** Wizard capabilities, e.g. `{v2Forced}` — v2Forced disables "Switch to
    *  legacy" because the env var pins the selector on. */
   getSetupCapabilities: () => ipcRenderer.invoke("omnigent:get-setup-capabilities"),
+  /** Runners the onboarding runner step offers for `url`: `{remote, bundledCli}`.
+   *  @param {string} url */
+  getRunnerOptions: (url) => ipcRenderer.invoke("omnigent:get-runner-options", url),
+  /** Connect the onboarding runner ("local" | "remote") to `url`. Resolves
+   *  `{ok, error?}`; output streams via onRunnerConnectLog.
+   *  @param {string} url @param {"local"|"remote"} runner */
+  connectRunner: (url, runner) => ipcRenderer.invoke("omnigent:connect-runner", url, runner),
+  /** Subscribe to connectRunner output. Returns an unsubscribe function.
+   *  @param {(line: string) => void} callback */
+  onRunnerConnectLog: (callback) => {
+    const listener = (_event, payload) => callback(payload?.line ?? "");
+    ipcRenderer.on("omnigent:runner-connect-log", listener);
+    return () => ipcRenderer.removeListener("omnigent:runner-connect-log", listener);
+  },
   /** Live color-scheme override for the wizard (System/Light/Dark). Not
    *  persisted — resets to the OS default on relaunch.
    *  @param {"light"|"dark"|"system"} scheme */

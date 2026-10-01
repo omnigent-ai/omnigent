@@ -887,30 +887,39 @@ async def test_required_terminal_exit_while_running_is_failure(
     assert record.attributes["session_status_before_exit"] == "running"
 
 
-def test_trim_terminal_output_drops_whole_leading_lines() -> None:
-    # Over the char budget: the first surviving line must be a WHOLE line, never
-    # a mid-word fragment (the "rity reasons" cut). The final line — the one that
-    # matters — stays intact.
-    filler = "\n".join(f"line {i} " + "x" * 80 for i in range(200))
+def test_trim_terminal_output_keeps_character_tail() -> None:
+    # Over the char budget: keep the last N characters, marked as truncated.
+    filler = "\n".join(f"line {i} " + "x" * 150 for i in range(30))
     text = filler + "\n--dangerously-skip-permissions cannot be run for security reasons"
     trimmed = trim_terminal_output(text)
     assert trimmed is not None
-    assert len(trimmed) <= _TERMINAL_EXIT_OUTPUT_MAX_CHARS + 60  # + the omitted-lines marker
-    assert trimmed.startswith("... omitted ")
-    # The last line survived whole (not clipped mid-word).
-    assert trimmed.endswith("for security reasons")
-    # The first content line after the marker is a complete line.
-    first_content = trimmed.splitlines()[1]
-    assert first_content.startswith("line ")
+    marker, body = trimmed.split("\n", 1)
+    assert marker.startswith("... omitted ") and marker.endswith(" earlier character(s) ...")
+    assert len(body) == _TERMINAL_EXIT_OUTPUT_MAX_CHARS
+    assert body.endswith("for security reasons")
+
+
+def test_trim_terminal_output_keeps_long_line_before_final_line() -> None:
+    # A long error line followed by tmux's short "pane is dead" line must not be
+    # dropped wholesale, leaving only the pane-dead line.
+    usage = "Usage: codex [OPTIONS] " + "z" * (_TERMINAL_EXIT_OUTPUT_MAX_CHARS + 1000)
+    trimmed = trim_terminal_output(f"a\nb\n{usage}\npane is dead (status 2)")
+    assert trimmed is not None
+    assert trimmed.endswith("z\npane is dead (status 2)")
+    assert len(trimmed.split("\n", 1)[1]) == _TERMINAL_EXIT_OUTPUT_MAX_CHARS
 
 
 def test_trim_terminal_output_hard_clips_single_overlong_line() -> None:
-    # A single line longer than the budget has no line boundary to snap to, so
-    # it's clipped from the tail as a last resort.
     line = "y" * (_TERMINAL_EXIT_OUTPUT_MAX_CHARS + 500)
     trimmed = trim_terminal_output(line)
-    assert trimmed is not None
-    assert len(trimmed) == _TERMINAL_EXIT_OUTPUT_MAX_CHARS
+    assert (
+        trimmed
+        == f"... omitted 500 earlier character(s) ...\n{'y' * _TERMINAL_EXIT_OUTPUT_MAX_CHARS}"
+    )
+
+
+def test_trim_terminal_output_leaves_short_output_untouched() -> None:
+    assert trim_terminal_output("  boom\r\nexit 1\n") == "boom\nexit 1"
 
 
 def test_terminal_exit_diagnostics_reads_exit_status(tmp_path: Path) -> None:

@@ -82,6 +82,35 @@ def test_other_causes_keep_generic_startup_failure_code() -> None:
     assert "agent is no longer available" not in payload["message"]
 
 
+@pytest.mark.parametrize(
+    ("exc", "category"),
+    [
+        (RuntimeError("tmux server exited before the pane was ready"), "unknown"),
+        (OSError(28, "No space left on device"), "host"),
+        (
+            OmnigentError("agent gone", code=ErrorCode.SESSION_AGENT_MISSING),
+            "user",
+        ),
+    ],
+)
+def test_start_failure_log_row_is_blocking_with_derived_category(
+    caplog: pytest.LogCaptureFixture, exc: Exception, category: str
+) -> None:
+    """Every start failure blocks; its owner comes from the exception, and an
+    unrecognized one stays unknown rather than guessed."""
+    with caplog.at_level(logging.WARNING, logger=orchestration._logger.name):
+        _native_terminal_start_error_payload(exc, "Codex", session_id="conv_1")
+
+    [record] = [
+        r
+        for r in caplog.records
+        if getattr(r, "event_name", None) == "native_terminal_start_failed"
+    ]
+    attrs = record_to_row(record, source="runner")["attributes"]
+    assert attrs["error_impact"] == "blocking"
+    assert attrs["error_category"] == category
+
+
 def test_generic_cause_names_errno_without_free_form_text() -> None:
     """The generic startup-defect message now names a structured errno cause.
 

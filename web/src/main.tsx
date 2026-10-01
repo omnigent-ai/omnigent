@@ -5,6 +5,7 @@ import { StrictMode, useEffect, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { BrowserRouter } from "react-router-dom";
 import App from "./App.tsx";
+import { PageLoading } from "./components/PageLoading";
 import { ThemeProvider } from "./components/theme/ThemeProvider";
 import { TooltipProvider } from "./components/ui/tooltip";
 import { ImageLightboxProvider } from "./components/ImageLightbox";
@@ -180,9 +181,9 @@ root.render(
 );
 
 // `/v1/me` came back 401 with a login page and we're already on our way
-// there. Unmount to stop the shell's queries firing against an invalid
+// there. Replace the shell to stop its queries firing against an invalid
 // session mid-redirect. Header mode never lands here (no login page), so
 // a proxy-less deploy is unaffected.
 void bootIdentityGate.then(() => {
-  if (isLoginRedirectPending()) root.unmount();
+  if (isLoginRedirectPending()) root.render(<PageLoading label="Opening sign-in…" />);
 });

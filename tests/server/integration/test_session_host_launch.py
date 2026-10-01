@@ -66,6 +66,7 @@ from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
 from omnigent.stores.host_store import HostStore
 from tests.budgets import Deadline, budget
 from tests.server.helpers import create_test_agent
+from tests.server.helpers import websocket_scope as _websocket_scope
 
 pytestmark = pytest.mark.asyncio
 
@@ -132,26 +133,6 @@ def app(runtime_init: None, db_uri: str, tmp_path) -> FastAPI:
         comment_store=SqlAlchemyCommentStore(db_uri),
         host_store=HostStore(db_uri),
     )
-
-
-def _websocket_scope(path: str) -> dict[str, object]:
-    """Build a minimal ASGI WebSocket scope for the host tunnel.
-
-    :param path: WebSocket path, e.g. ``"/v1/hosts/<id>/tunnel"``.
-    :returns: ASGI WebSocket scope dict.
-    """
-    return {
-        "type": "websocket",
-        "asgi": {"version": "3.0"},
-        "scheme": "ws",
-        "path": path,
-        "raw_path": path.encode("ascii"),
-        "query_string": b"",
-        "headers": [],
-        "client": ("127.0.0.1", 50000),
-        "server": ("testserver", 80),
-        "subprotocols": [],
-    }
 
 
 async def _connect_host(app: FastAPI) -> ApplicationCommunicator:
@@ -508,33 +489,113 @@ async def test_inline_launch_stamps_terminal_view_label_at_creation(
     assert conv.labels.get("omnigent.ui") == "terminal"
 
 
-async def test_inline_launch_skips_terminal_view_label_for_native_harness(
+@pytest.mark.parametrize("harness", ["pi-native", "native-pi", "claude-native", "codex-native"])
+async def test_inline_launch_stamps_terminal_view_label_for_custom_native_harness(
     client: httpx.AsyncClient,
     app: FastAPI,
+    db_uri: str,
+    harness: str,
 ) -> None:
-    """A native-harness agent does not get the terminal-view label here.
-
-    Native harnesses run a vendor TUI instead of the omnigent REPL
-    terminal, so their runner never auto-creates one. Stamping the label
-    for them would leave the Web UI's spin-up spinner waiting on a
-    terminal that never arrives; they get terminal-first labels from the
-    native wrapper path instead.
-    """
+    """Custom native agents expose their terminal at creation and after reload."""
     comm = await _connect_host(app)
     agent = await create_test_agent(
         client,
-        executor={"type": "omnigent", "config": {"harness": "claude-native"}},
+        name="custom-native-agent",
+        executor={"type": "omnigent", "config": {"harness": harness}},
     )
 
     responder = asyncio.create_task(_serve_one_launch(comm, launch_status="launched"))
     resp = await client.post(
         "/v1/sessions",
-        json={"agent_id": agent["id"], "host_id": _HOST_ID, "workspace": _WORKSPACE},
+        json={
+            "agent_id": agent["id"],
+            "host_id": _HOST_ID,
+            "workspace": _WORKSPACE,
+            "labels": {"env": "test"},
+        },
     )
     await responder
 
     assert resp.status_code == 201, f"expected 201, got {resp.status_code}: {resp.text}"
-    assert "omnigent.ui" not in resp.json()["labels"]
+    body = resp.json()
+    expected_labels = {"env": "test", "omnigent.ui": "terminal"}
+    assert body["labels"] == expected_labels
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.get_conversation(body["id"])
+    assert conv is not None
+    assert conv.labels == expected_labels
+
+    listed = await client.get("/v1/sessions")
+    assert listed.status_code == 200
+    row = next(row for row in listed.json()["data"] if row["id"] == body["id"])
+    assert row["labels"] == expected_labels
+
+    # Existing sessions can predate the creation-time label.
+    store.delete_label(body["id"], "omnigent.ui")
+    snapshot = await client.get(f"/v1/sessions/{body['id']}")
+    assert snapshot.status_code == 200
+    assert snapshot.json()["labels"] == expected_labels
+
+
+@pytest.mark.parametrize(
+    "spec_harness,harness_override,terminal_view",
+    [
+        ("claude-sdk", "pi-native", True),
+        ("pi-native", "claude-sdk", False),
+        ("pi-native", "auto", False),
+    ],
+)
+async def test_custom_native_terminal_view_uses_harness_override(
+    client: httpx.AsyncClient,
+    spec_harness: str,
+    harness_override: str,
+    terminal_view: bool,
+) -> None:
+    """Only the effective native harness grants terminal access without a host."""
+    agent = await create_test_agent(
+        client,
+        executor={"type": "omnigent", "config": {"harness": spec_harness}},
+    )
+    response = await client.post(
+        "/v1/sessions",
+        json={"agent_id": agent["id"], "harness_override": harness_override},
+    )
+    assert response.status_code == 201, response.text
+    body = response.json()
+    assert (body["labels"].get("omnigent.ui") == "terminal") is terminal_view
+    assert "omnigent.wrapper" not in body["labels"]
+    snapshot = await client.get(f"/v1/sessions/{body['id']}")
+    assert snapshot.status_code == 200
+    assert (snapshot.json()["labels"].get("omnigent.ui") == "terminal") is terminal_view
+
+
+async def test_native_subagent_mirror_does_not_gain_terminal_view(
+    client: httpx.AsyncClient,
+) -> None:
+    """A native thread mirror inherits a harness but has no terminal of its own."""
+    agent = await create_test_agent(
+        client,
+        name="custom-native-parent",
+        executor={"type": "omnigent", "config": {"harness": "claude-native"}},
+    )
+    response = await client.post(
+        f"/v1/sessions/{agent['_session_id']}/events",
+        json={
+            "type": "external_subagent_start",
+            "data": {
+                "subagent_id": "terminal-view-mirror",
+                "agent_type": "worker",
+                "description": "Check terminal visibility",
+                "tool_use_id": "toolu_terminal_view_mirror",
+            },
+        },
+    )
+    assert response.status_code in (200, 202), response.text
+    child_id = response.json()["child_session_id"]
+    snapshot = await client.get(f"/v1/sessions/{child_id}")
+    assert snapshot.status_code == 200
+    assert snapshot.json()["harness"] == "claude-native"
+    assert "omnigent.ui" not in snapshot.json()["labels"]
 
 
 async def test_unbound_session_skips_terminal_view_label(
@@ -777,6 +838,7 @@ async def test_message_relaunch_deterministic_failure_persists_error_turn(
     launch_error: str,
     expected_fragments: tuple[str, ...],
     wrapper_command: str | None,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """A deterministic host relaunch refusal persists user msg + error.
 
@@ -810,6 +872,7 @@ async def test_message_relaunch_deterministic_failure_persists_error_turn(
         "_HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S",
         0.0,
     )
+    caplog.set_level(logging.WARNING)
 
     comm = await _connect_host(app)
     agent = await create_test_agent(
@@ -850,6 +913,16 @@ async def test_message_relaunch_deterministic_failure_persists_error_turn(
     finally:
         await relaunch_responder
         set_runner_client(None)
+
+    [refusal] = [r for r in caplog.records if r.getMessage() == "Host refused runner launch"]
+    # Mapped codes carry their owner; uncoded or unmapped ones are left to the
+    # host's own row.
+    expected_category = {
+        HARNESS_NOT_CONFIGURED_ERROR_CODE: "config",
+        WORKSPACE_MISSING_ERROR_CODE: "user",
+    }.get(launch_error_code or "")
+    assert refusal.attributes.get("error_category") == expected_category
+    assert refusal.attributes["error_impact"] == "blocking"
 
     if expected_error_code is None:
         # Unknown host categories may contain arbitrary runner output and
@@ -1254,8 +1327,10 @@ async def test_message_relaunch_host_failure_uncategorized_reports_startup_failu
     client: httpx.AsyncClient,
     app: FastAPI,
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """Report an uncategorized host refusal as a failed start, not launch."""
+    caplog.set_level(logging.WARNING)
     from omnigent.runtime import set_runner_client
     from omnigent.server.routes import sessions as sessions_module
     from omnigent.server.routes.sessions import routes_events
@@ -1295,6 +1370,10 @@ async def test_message_relaunch_host_failure_uncategorized_reports_startup_failu
     assert "failed to spawn runner: boom" in error["message"], error["message"]
     assert "The host launched" not in error["message"], error["message"]
     assert "never connected" not in error["message"], error["message"]
+    [refusal] = [r for r in caplog.records if r.getMessage() == "Host refused runner launch"]
+    # Uncoded: the host's own row carries the category.
+    assert refusal.attributes.get("error_category") is None
+    assert refusal.attributes["error_impact"] == "blocking"
 
     # The refusal text must never enter RunnerExitReports: the session
     # snapshot reads that store UNscoped (last_task_error), so a record
@@ -1311,8 +1390,10 @@ async def test_message_relaunch_unacknowledged_launch_is_not_claimed_as_launched
     client: httpx.AsyncClient,
     app: FastAPI,
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """Do not claim a launch when the host never acknowledged it."""
+    caplog.set_level(logging.WARNING)
     from omnigent.runtime import set_runner_client
     from omnigent.server.routes import sessions as sessions_module
     from omnigent.server.routes._sessions import helpers as sessions_helpers
@@ -1374,6 +1455,11 @@ async def test_message_relaunch_unacknowledged_launch_is_not_claimed_as_launched
     assert "never confirmed the launch" in error["message"], error["message"]
     assert "The host was asked to launch runner" in error["message"], error["message"]
     assert "The host launched" not in error["message"], error["message"]
+    [timeout] = [
+        r for r in caplog.records if r.getMessage() == "Host launch acknowledgement timed out"
+    ]
+    assert timeout.attributes["error_category"] == "host"
+    assert timeout.attributes["error_impact"] == "transient"
 
 
 async def test_message_relaunch_pre_connect_exit_surfaces_report_when_visible(

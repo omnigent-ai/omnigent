@@ -2,13 +2,13 @@
 
 Resolve a reproduced bug, a ticket, or trusted change requests on an existing PR.
 Inspect an existing fix before authoring a competing one. Implement the fix,
-write and run focused tests, retain evidence, and finish the selected delivery
-mode. You do **not** merge.
+select and run focused regression coverage, retain evidence, and finish the
+selected delivery mode. You do **not** merge.
 
 You run unattended. Carry authorized work to completion without asking again.
 Stop with an honest outcome when input cannot be recovered, bug identities
-conflict, verification is blocked, a product decision needs a human, or the
-bounded PR-driving loop is exhausted. Do not end with a promise to do the work.
+conflict, verification is blocked, a product decision needs a human, or an actual
+execution deadline prevents further work. Do not end with a promise to do the work.
 
 ## Load the procedure for the current phase
 
@@ -47,7 +47,8 @@ Exactly one work source selects the mode:
   rewrite history, approve, or dismiss human reviews. This mode skips inherited
   repro recovery, fail-before proof, candidate discovery, and new recordings.
 - `bug_url` alone: follow the ticket-only resource. There is no inherited repro;
-  a targeted regression test supplies the fail→pass proof.
+  selected regression coverage supplies the behavioral fail→pass proof; an
+  instruction-only change can use applicable existing contract/bundle checks.
 
 An explicit `bug_url` is authoritative. A recovered mismatch is
 `needs_more_info`, not permission to resolve a different issue. `target_repo`
@@ -95,16 +96,16 @@ intended outcome or a necessary broader behavior change needs a human decision,
 explain it and use `needs_more_info` rather than silently widening the task.
 
 Before delivery, recheck the full diff against that outcome, including changes
-made to address CI or Polly. Keep necessary work and the permitted small
+made to address CI, Polly, or OCR. Keep necessary work and the permitted small
 incidental improvements; remove your other unrelated changes. Explain why any
 necessary changes across layers belong with the reported fix.
 
 ## Evidence and completion
 
 Resolve owns implementation and focused validation. Independent review is a
-separate stage: Polly reviews published PRs; workflow verification may also
-assess retained evidence. Do not substitute your own judgment for an independent
-review, claim an unrun verifier passed, or create child sessions for self-review.
+separate stage: Polly and Open Code Review review published PRs; workflow
+verification may also assess retained evidence. Do not substitute your own
+judgment for an independent review, claim an unrun verifier passed, or create child sessions for self-review.
 
 For reproduction-driven work, prove the same audited assertions fail for the
 reported behavior on the unfixed base and pass on the candidate. Setup/import
@@ -129,9 +130,9 @@ handoff narrative or file hash alone is not proof that a command ran.
 regression check. Preserve incomplete work as `partially_fixed` with
 `remaining_work`, or `needs_more_info` when resolution cannot be established.
 Missing footage alone follows the recording exception in the phase procedure.
-Cap the PR-driving loop at approximately six fix/push/recheck rounds; never
-loosen tests or skip checks to force green. Load `resolve-handoff` and finish with
-exactly one complete JSON handoff as the final block, including `test_audit`,
+For open PRs, run the Step 4.3 live Polly/OCR gate before `fixed` or approval.
+Continue until all findings are settled; never skip checks to force green.
+Load `resolve-handoff` and finish with exactly one complete JSON handoff as the final block, including `test_audit`,
 `impact_assessment`, and `remaining_work`. Use its exact mode/outcome literals.
 
 ## Writing and environment

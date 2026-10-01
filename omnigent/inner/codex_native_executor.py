@@ -18,6 +18,7 @@ from omnigent.harnesses.codex_native.app_server import (
     CodexAppServerClient,
     CodexAppServerResponseError,
     client_for_transport,
+    is_stale_active_turn_error,
 )
 from omnigent.harnesses.codex_native.bridge import (
     CODEX_NATIVE_BRIDGE_DIR_ENV_VAR,
@@ -68,9 +69,6 @@ from omnigent.util.reasoning_effort import (
 
 _logger = logging.getLogger(__name__)
 
-_NO_ACTIVE_TURN_ERROR_CODE = -32600
-_NO_ACTIVE_TURN_ERROR_MESSAGE = "no active turn to steer"
-_ACTIVE_TURN_MISMATCH_MARKERS = ("expected active turn id", "but found")
 _LEGACY_BRIDGE_STATE_WAIT_SECONDS = 60.0
 _BRIDGE_STATE_FAST_POLL_SECONDS = 0.05
 _BRIDGE_STATE_FAST_POLL_WINDOW_SECONDS = 2.0
@@ -126,39 +124,6 @@ def _bridge_state_wait_seconds(bridge_dir: Path) -> float:
         _LEGACY_BRIDGE_STATE_WAIT_SECONDS,
         configured_timeout + CODEX_NATIVE_STARTUP_PUBLICATION_GRACE_SECONDS,
     )
-
-
-def _is_no_active_turn_to_steer(error: CodexAppServerResponseError) -> bool:
-    """Return whether Codex explicitly rejected a steer because the turn ended."""
-    return (
-        error.code == _NO_ACTIVE_TURN_ERROR_CODE
-        and error.message is not None
-        and error.message.strip().casefold() == _NO_ACTIVE_TURN_ERROR_MESSAGE
-    )
-
-
-def _is_active_turn_mismatch(error: CodexAppServerResponseError) -> bool:
-    """Return whether a newer turn replaced the one we recorded.
-
-    The app-server rejects a steer/interrupt with ``expected active turn id `X`
-    but found `Y``` (also code -32600) when a turn started after we read the
-    bridge's ``active_turn_id``. Match on the phrasing, not the ids, since the
-    message quotes them and the backtick formatting varies across builds.
-    """
-    if error.code != _NO_ACTIVE_TURN_ERROR_CODE or error.message is None:
-        return False
-    message = error.message.casefold()
-    return all(marker in message for marker in _ACTIVE_TURN_MISMATCH_MARKERS)
-
-
-def _is_stale_active_turn(error: CodexAppServerResponseError) -> bool:
-    """Return whether our recorded active turn is no longer the thread's active one.
-
-    Covers both -32600 shapes: the turn ended ("no active turn to steer") and a
-    newer turn replaced it ("expected active turn id X but found Y"). Both call
-    for the same recovery — re-read bridge state and retarget the live turn.
-    """
-    return _is_no_active_turn_to_steer(error) or _is_active_turn_mismatch(error)
 
 
 async def _start_codex_turn(
@@ -272,7 +237,7 @@ async def _inject_codex_turn(
         )
         return
     except CodexAppServerResponseError as error:
-        if not _is_stale_active_turn(error):
+        if not is_stale_active_turn_error(error):
             raise
 
     # Codex authoritatively says A is no longer the active turn (it ended, or a
@@ -437,7 +402,7 @@ class CodexNativeExecutor(Executor):
                     # The recorded turn already ended or was replaced by a
                     # newer one, so there is nothing left to interrupt — not a
                     # failure. The local cancel map was already flipped above.
-                    if not _is_stale_active_turn(error):
+                    if not is_stale_active_turn_error(error):
                         raise
                     # Drop the stale record unless a newer turn/started already
                     # replaced it.

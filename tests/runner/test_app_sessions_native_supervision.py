@@ -18,6 +18,7 @@ from omnigent.runner import create_runner_app
 from omnigent.spec.types import AgentSpec, ExecutorSpec
 from tests.runner.conftest import (
     _BlockingHarnessClient,
+    _build_app_for_spec,
     _build_interrupt_app,
     _drain_session_event_queue,
     _FakeProcessManager,
@@ -2512,17 +2513,7 @@ async def test_events_interrupt_on_native_session_injects_escape_without_marker(
         executor=ExecutorSpec(type="omnigent", config={"harness": "claude-native"}),
     )
 
-    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
-        """Return the native spec for any agent_id."""
-        del agent_id
-        return native_spec
-
-    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
-    app = create_runner_app(
-        process_manager=pm,  # type: ignore[arg-type]
-        spec_resolver=_resolver,
-        server_client=NullServerClient(),  # type: ignore[arg-type]
-    )
+    app, _ = await _build_app_for_spec(native_spec)
 
     async with _runner_client(app) as client:
         # POST /v1/sessions seeds _session_spec_cache so the
@@ -2792,17 +2783,7 @@ async def test_events_interrupt_on_native_session_503_skips_cleanup_when_inject_
         executor=ExecutorSpec(type="omnigent", config={"harness": "claude-native"}),
     )
 
-    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
-        """Return the native spec for any agent_id."""
-        del agent_id
-        return native_spec
-
-    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
-    app = create_runner_app(
-        process_manager=pm,  # type: ignore[arg-type]
-        spec_resolver=_resolver,
-        server_client=NullServerClient(),  # type: ignore[arg-type]
-    )
+    app, _ = await _build_app_for_spec(native_spec)
 
     async with _runner_client(app) as client:
         create_resp = await client.post(
