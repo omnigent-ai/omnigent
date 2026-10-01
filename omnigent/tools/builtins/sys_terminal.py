@@ -35,10 +35,10 @@ import threading
 from dataclasses import dataclass
 from typing import Any
 
-from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
-from omnigent.inner.terminal import TerminalInstance
+from omnigent.core.datamodel import OSEnvSpec, TerminalEnvSpec
 from omnigent.spec.types import AgentSpec
 from omnigent.terminals import TerminalRegistry
+from omnigent.terminals.terminal import TerminalInstance
 from omnigent.tools.base import Tool, ToolContext
 
 _logger = logging.getLogger(__name__)

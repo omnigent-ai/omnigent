@@ -42,15 +42,15 @@ from pathlib import Path
 
 import pytest
 
-from omnigent.inner.credential_proxy import SYNTHETIC_CREDENTIAL_PREFIX
-from omnigent.inner.datamodel import (
+from omnigent.core.datamodel import (
     CredentialProxyEntry,
     CredentialProxySpec,
     CredentialSourceSpec,
     OSEnvSandboxSpec,
     OSEnvSpec,
 )
-from omnigent.inner.os_env import create_os_environment
+from omnigent.environments.os_env import create_os_environment
+from omnigent.sandbox.credential_proxy import SYNTHETIC_CREDENTIAL_PREFIX
 from tests.inner.sandbox.conftest import run_async
 
 _PUBLIC_HOST_FOR_EGRESS = "example.com"
@@ -1222,17 +1222,17 @@ def test_credential_proxy_databricks_cli_materializes_cfg_and_swaps(
     - the sandbox cfg holds only the ``oa_cred_*`` placeholder, never the
       real token.
     """
-    from omnigent.inner.datamodel import DatabricksProfileBinding, DatabricksProxySpec
+    from omnigent.core.datamodel import DatabricksProfileBinding, DatabricksProxySpec
 
     real_token = "dbx-real-oauth-token-7c2"
     upstream = _CapturingUpstream()
     host_url = f"http://127.0.0.1:{upstream.port}"
     monkeypatch.setattr(
-        "omnigent.inner.credential_proxy._databricks_config",
+        "omnigent.sandbox.credential_proxy._databricks_config",
         lambda _profile: _FakeDatabricksConfig(host_url, real_token),
     )
     monkeypatch.setattr(
-        "omnigent.inner.credential_proxy._databricks_authenticate",
+        "omnigent.sandbox.credential_proxy._databricks_authenticate",
         lambda config: config.authenticate()["Authorization"].removeprefix("Bearer "),
     )
 

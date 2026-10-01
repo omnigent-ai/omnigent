@@ -13,7 +13,7 @@ from __future__ import annotations
 import httpx
 import pytest
 
-from omnigent.native import _native_forwarder_health as health
+from omnigent.harnesses.native import forwarder_health as health
 
 
 class _FakeClock:

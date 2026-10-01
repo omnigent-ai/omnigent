@@ -18,7 +18,17 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from omnigent.inner.codex_executor import (
+from omnigent.core.datamodel import OSEnvSandboxSpec, OSEnvSpec
+from omnigent.core.executor import (
+    ExecutorError,
+    ReasoningChunk,
+    TextChunk,
+    ToolCallComplete,
+    ToolCallRequest,
+    ToolCallStatus,
+    TurnComplete,
+)
+from omnigent.harnesses.codex.executor import (
     _TURN_EVENT_WARN_SECONDS,
     CodexExecutor,
     _build_initial_prompt,
@@ -36,26 +46,16 @@ from omnigent.inner.codex_executor import (
     _require_brokered_codex_version,
     _to_codex_input_items,
 )
-from omnigent.inner.codex_goal_command import (
+from omnigent.harnesses.codex.goal_command import (
     GOAL_OBJECTIVE_MAX_CHARS,
     goal_objective_length_error,
 )
-from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
-from omnigent.inner.executor import (
-    ExecutorError,
-    ReasoningChunk,
-    TextChunk,
-    ToolCallComplete,
-    ToolCallRequest,
-    ToolCallStatus,
-    TurnComplete,
-)
-from omnigent.inner.model_auth import ProviderAuthRequired
-from omnigent.inner.model_egress import FrozenModelRoute
-from omnigent.inner.model_signer import SignerLaunchConfig, SubprocessModelSigner
+from omnigent.harnesses.native import forwarder_health as native_forwarder_health
 from omnigent.models.codex_model_vocabulary import codex_spawn_model
 from omnigent.models.model_fallbacks import CODEX_DEFAULT_MODEL
-from omnigent.native import _native_forwarder_health as native_forwarder_health
+from omnigent.models.signer.auth import ProviderAuthRequired
+from omnigent.models.signer.egress import FrozenModelRoute
+from omnigent.models.signer.lifecycle import SignerLaunchConfig, SubprocessModelSigner
 
 
 def _run(coro):
@@ -224,9 +224,11 @@ class TestCodexExecutor(unittest.TestCase):
 
     def test_constructor_databricks_flag_with_profile(self):
         with (
-            patch("omnigent.inner.codex_executor._find_codex_cli", return_value="/usr/bin/codex"),
             patch(
-                "omnigent.inner.codex_executor._databricks_gateway_host",
+                "omnigent.harnesses.codex.executor._find_codex_cli", return_value="/usr/bin/codex"
+            ),
+            patch(
+                "omnigent.harnesses.codex.executor._databricks_gateway_host",
                 return_value="https://example.cloud.databricks.com",
             ),
         ):
@@ -242,7 +244,9 @@ class TestCodexExecutor(unittest.TestCase):
 
     def test_constructor_does_not_force_codex_debug_env_by_default(self):
         with (
-            patch("omnigent.inner.codex_executor._find_codex_cli", return_value="/usr/bin/codex"),
+            patch(
+                "omnigent.harnesses.codex.executor._find_codex_cli", return_value="/usr/bin/codex"
+            ),
             patch.dict("os.environ", {}, clear=True),
         ):
             executor = CodexExecutor()
@@ -252,10 +256,12 @@ class TestCodexExecutor(unittest.TestCase):
 
     def test_constructor_databricks_flag_with_profile_uses_profile_credentials(self):
         with (
-            patch("omnigent.inner.codex_executor._find_codex_cli", return_value="/usr/bin/codex"),
+            patch(
+                "omnigent.harnesses.codex.executor._find_codex_cli", return_value="/usr/bin/codex"
+            ),
             patch.dict("os.environ", {}, clear=True),
             patch(
-                "omnigent.inner.codex_executor._databricks_gateway_host",
+                "omnigent.harnesses.codex.executor._databricks_gateway_host",
                 return_value="https://example-profile-workspace.cloud.databricks.com",
             ),
         ):
@@ -305,9 +311,11 @@ class TestCodexExecutor(unittest.TestCase):
 
     def test_constructor_databricks_flag_with_host_override_skips_profile_lookup(self):
         with (
-            patch("omnigent.inner.codex_executor._find_codex_cli", return_value="/usr/bin/codex"),
+            patch(
+                "omnigent.harnesses.codex.executor._find_codex_cli", return_value="/usr/bin/codex"
+            ),
             patch.dict("os.environ", {}, clear=True),
-            patch("omnigent.inner.codex_executor._databricks_gateway_host") as gateway_host,
+            patch("omnigent.harnesses.codex.executor._databricks_gateway_host") as gateway_host,
         ):
             executor = CodexExecutor(
                 gateway=True,
@@ -335,7 +343,9 @@ class TestCodexExecutor(unittest.TestCase):
 
     def test_constructor_databricks_flag_with_host_override_requires_base_url(self):
         with (
-            patch("omnigent.inner.codex_executor._find_codex_cli", return_value="/usr/bin/codex"),
+            patch(
+                "omnigent.harnesses.codex.executor._find_codex_cli", return_value="/usr/bin/codex"
+            ),
             patch.dict("os.environ", {}, clear=True),
             self.assertRaisesRegex(OSError, "GATEWAY_BASE_URL"),
         ):
@@ -347,7 +357,9 @@ class TestCodexExecutor(unittest.TestCase):
 
     def test_constructor_databricks_flag_with_host_override_requires_auth_command(self):
         with (
-            patch("omnigent.inner.codex_executor._find_codex_cli", return_value="/usr/bin/codex"),
+            patch(
+                "omnigent.harnesses.codex.executor._find_codex_cli", return_value="/usr/bin/codex"
+            ),
             patch.dict("os.environ", {}, clear=True),
             self.assertRaisesRegex(OSError, "GATEWAY_AUTH_COMMAND"),
         ):
@@ -359,9 +371,11 @@ class TestCodexExecutor(unittest.TestCase):
 
     def test_constructor_databricks_flag_no_creds_raises(self):
         with (
-            patch("omnigent.inner.codex_executor._find_codex_cli", return_value="/usr/bin/codex"),
+            patch(
+                "omnigent.harnesses.codex.executor._find_codex_cli", return_value="/usr/bin/codex"
+            ),
             patch.dict("os.environ", {}, clear=True),
-            patch("omnigent.inner.codex_executor._databricks_gateway_host", return_value=None),
+            patch("omnigent.harnesses.codex.executor._databricks_gateway_host", return_value=None),
         ):
             with self.assertRaises(EnvironmentError):
                 CodexExecutor(gateway=True)
@@ -511,7 +525,7 @@ class TestCodexExecutor(unittest.TestCase):
         async def _t():
             fake_session = _FakeAppSession([[TurnComplete(response="done")]])
             with patch(
-                "omnigent.inner.codex_executor._databricks_gateway_host",
+                "omnigent.harnesses.codex.executor._databricks_gateway_host",
                 return_value="https://example.cloud.databricks.com",
             ):
                 executor = CodexExecutor(
@@ -1158,7 +1172,9 @@ class TestCodexExecutor(unittest.TestCase):
             session._proc = _FakeProcess()
             session._started = True
 
-            with patch("omnigent.inner.codex_executor._terminate_process_tree") as terminate_tree:
+            with patch(
+                "omnigent.harnesses.codex.executor._terminate_process_tree"
+            ) as terminate_tree:
                 await session.close()
 
             terminate_tree.assert_called_once()
@@ -1363,7 +1379,7 @@ class TestCodexExecutor(unittest.TestCase):
                 session._request = AsyncMock(return_value={"result": {}})
 
                 with patch(
-                    "omnigent.inner.codex_executor._create_subprocess_exec",
+                    "omnigent.harnesses.codex.executor._create_subprocess_exec",
                     new=_fake_create_subprocess_exec,
                 ):
                     await session.start()
@@ -1397,7 +1413,7 @@ class TestCodexExecutor(unittest.TestCase):
                 session._request = AsyncMock(return_value={"result": {}})
 
                 with patch(
-                    "omnigent.inner.codex_executor._create_subprocess_exec",
+                    "omnigent.harnesses.codex.executor._create_subprocess_exec",
                     new=_fake_create_subprocess_exec,
                 ):
                     await session.start()
@@ -1483,7 +1499,7 @@ class TestCodexExecutor(unittest.TestCase):
             session._request = AsyncMock(return_value={"result": {"turn": {"id": "turn-1"}}})
 
             original_warn = _TURN_EVENT_WARN_SECONDS
-            import omnigent.inner.codex_executor as codex_executor_module
+            import omnigent.harnesses.codex.executor as codex_executor_module
 
             codex_executor_module._TURN_EVENT_WARN_SECONDS = 0.05
             try:
@@ -1507,7 +1523,7 @@ class TestCodexExecutor(unittest.TestCase):
                     )
 
                 inject_task = asyncio.create_task(_inject_final_after_warning())
-                with self.assertLogs("omnigent.inner.codex_executor", level="WARNING") as cm:
+                with self.assertLogs("omnigent.harnesses.codex.executor", level="WARNING") as cm:
                     events = [
                         event
                         async for event in session.run_turn(
@@ -2899,7 +2915,7 @@ def test_format_codex_error_params_extracts_provider_error_from_nested_error() -
     report was exactly this: codex+claude-opus-4-6 on Databricks
     surfaced as "Codex App Server error" with zero diagnostic info.
     """
-    from omnigent.inner.codex_executor import _format_codex_error_params
+    from omnigent.harnesses.codex.executor import _format_codex_error_params
 
     params = {
         "error": {
@@ -2936,7 +2952,7 @@ def test_format_codex_error_params_falls_back_to_raw_when_no_known_fields() -> N
     params dict. We never want the user to see a bare
     "Codex App Server error" with no hint about what went wrong.
     """
-    from omnigent.inner.codex_executor import _format_codex_error_params
+    from omnigent.harnesses.codex.executor import _format_codex_error_params
 
     params = {"someField": "someValue", "willRetry": False}
     result = _format_codex_error_params(params)
@@ -2949,7 +2965,7 @@ def test_format_codex_error_params_handles_missing_params() -> None:
     None / empty / non-dict params must produce a stable fallback
     string — never crash, never empty.
     """
-    from omnigent.inner.codex_executor import _format_codex_error_params
+    from omnigent.harnesses.codex.executor import _format_codex_error_params
 
     assert "no params" in _format_codex_error_params(None)
     assert "no params" in _format_codex_error_params({})
@@ -2965,7 +2981,7 @@ def test_extract_codex_last_turn_usage_splits_cached_out_of_input() -> None:
     tokens at the full input rate. If ``input_tokens`` came back as 7 (not 6)
     and there were no ``cache_read_input_tokens`` key, the split regressed.
     """
-    from omnigent.inner.codex_executor import _extract_codex_last_turn_usage
+    from omnigent.harnesses.codex.executor import _extract_codex_last_turn_usage
 
     params = {
         "threadId": "t1",
@@ -2996,7 +3012,7 @@ def test_extract_codex_last_turn_usage_no_cache_key_when_uncached() -> None:
     Guards against synthesizing a phantom cache bucket (which would shrink
     the non-cached input the server bills at the full rate).
     """
-    from omnigent.inner.codex_executor import _extract_codex_last_turn_usage
+    from omnigent.harnesses.codex.executor import _extract_codex_last_turn_usage
 
     params = {"tokenUsage": {"last": {"inputTokens": 7, "outputTokens": 3, "totalTokens": 10}}}
     assert _extract_codex_last_turn_usage(params, "gpt-5.4-mini") == {
@@ -3017,7 +3033,7 @@ def test_extract_codex_last_turn_usage_stamps_resolved_model() -> None:
     accumulates, but ``session_usage.by_model`` silently never gets an entry
     for it (see ``_extract_codex_last_turn_usage``'s docstring).
     """
-    from omnigent.inner.codex_executor import _extract_codex_last_turn_usage
+    from omnigent.harnesses.codex.executor import _extract_codex_last_turn_usage
 
     params = {"tokenUsage": {"last": {"inputTokens": 7, "outputTokens": 3, "totalTokens": 10}}}
     assert _extract_codex_last_turn_usage(params, "databricks-gpt-5-5") == {
@@ -3036,7 +3052,7 @@ def test_extract_codex_last_turn_usage_stamps_resolved_model() -> None:
 
 def test_extract_codex_last_turn_usage_handles_missing_or_malformed() -> None:
     """Missing or non-dict shapes return None rather than raising."""
-    from omnigent.inner.codex_executor import _extract_codex_last_turn_usage
+    from omnigent.harnesses.codex.executor import _extract_codex_last_turn_usage
 
     assert _extract_codex_last_turn_usage(None, "gpt-5.4-mini") is None
     assert _extract_codex_last_turn_usage("not a dict", "gpt-5.4-mini") is None
@@ -3047,7 +3063,7 @@ def test_extract_codex_last_turn_usage_handles_missing_or_malformed() -> None:
 
 def test_extract_codex_thread_total_usage_reads_cumulative_counters() -> None:
     """``tokenUsage.total`` yields the raw cumulative thread counters."""
-    from omnigent.inner.codex_executor import _extract_codex_thread_total_usage
+    from omnigent.harnesses.codex.executor import _extract_codex_thread_total_usage
 
     params = {
         "tokenUsage": {
@@ -3070,7 +3086,7 @@ def test_extract_codex_thread_total_usage_reads_cumulative_counters() -> None:
 
 def test_extract_codex_thread_total_usage_rejects_missing_or_malformed() -> None:
     """Payloads without a usable ``total`` breakdown return None."""
-    from omnigent.inner.codex_executor import _extract_codex_thread_total_usage
+    from omnigent.harnesses.codex.executor import _extract_codex_thread_total_usage
 
     assert _extract_codex_thread_total_usage(None) is None
     assert _extract_codex_thread_total_usage("not a dict") is None
@@ -3087,7 +3103,7 @@ def test_extract_codex_thread_total_usage_rejects_missing_or_malformed() -> None
 
 def test_codex_turn_usage_from_totals_diffs_against_baseline() -> None:
     """Turn usage is the growth of cumulative counters, cached split out."""
-    from omnigent.inner.codex_executor import _codex_turn_usage_from_totals
+    from omnigent.harnesses.codex.executor import _codex_turn_usage_from_totals
 
     latest = {
         "inputTokens": 2200,
@@ -3127,7 +3143,7 @@ def test_codex_turn_usage_from_totals_diffs_against_baseline() -> None:
 
 def test_codex_turn_usage_from_totals_clamps_counter_resets() -> None:
     """Counters that shrank below the baseline clamp to zero, never negative."""
-    from omnigent.inner.codex_executor import _codex_turn_usage_from_totals
+    from omnigent.harnesses.codex.executor import _codex_turn_usage_from_totals
 
     latest = {
         "inputTokens": 50,
@@ -3152,7 +3168,7 @@ def test_codex_turn_usage_from_totals_clamps_counter_resets() -> None:
 def test_extract_codex_context_tokens_reads_last_total() -> None:
     """context_tokens is the latest ``last`` total (window fill), inclusive
     of cached tokens, independent of the cumulative ``total`` breakdown."""
-    from omnigent.inner.codex_executor import _extract_codex_context_tokens
+    from omnigent.harnesses.codex.executor import _extract_codex_context_tokens
 
     params = {
         "tokenUsage": {
@@ -3173,7 +3189,7 @@ def test_extract_codex_context_tokens_reads_last_total() -> None:
 def test_extract_codex_context_tokens_recomputes_when_total_absent() -> None:
     """With no ``last.totalTokens``, fill recomputes from input + output
     (input already includes cached, which occupies the window)."""
-    from omnigent.inner.codex_executor import _extract_codex_context_tokens
+    from omnigent.harnesses.codex.executor import _extract_codex_context_tokens
 
     params = {"tokenUsage": {"last": {"inputTokens": 100, "outputTokens": 25}}}
     assert _extract_codex_context_tokens(params) == 125
@@ -3181,7 +3197,7 @@ def test_extract_codex_context_tokens_recomputes_when_total_absent() -> None:
 
 def test_extract_codex_context_tokens_rejects_missing_or_malformed() -> None:
     """No usable ``last`` breakdown yields None (meter keeps its prior value)."""
-    from omnigent.inner.codex_executor import _extract_codex_context_tokens
+    from omnigent.harnesses.codex.executor import _extract_codex_context_tokens
 
     assert _extract_codex_context_tokens(None) is None
     assert _extract_codex_context_tokens("not a dict") is None
@@ -3215,7 +3231,7 @@ def test_populate_codex_skills_all(tmp_path: Path) -> None:
     the per-conversation ``$CODEX_HOME/skills/`` so codex's
     auto-discovery surfaces them all.
     """
-    from omnigent.inner.codex_executor import _populate_codex_skills
+    from omnigent.harnesses.codex.executor import _populate_codex_skills
 
     host_skills = tmp_path / "host"
     bundle_skills = tmp_path / "bundle"
@@ -3246,7 +3262,7 @@ def test_populate_codex_skills_none(tmp_path: Path) -> None:
     surface for ``skills: none`` even when host
     ``~/.codex/skills/`` is populated.
     """
-    from omnigent.inner.codex_executor import _populate_codex_skills
+    from omnigent.harnesses.codex.executor import _populate_codex_skills
 
     host_skills = tmp_path / "host"
     target = tmp_path / "codex_home_skills"
@@ -3271,7 +3287,7 @@ def test_populate_codex_skills_named_subset(tmp_path: Path) -> None:
     first-listed source (so callers can express priority by
     ordering ``sources``).
     """
-    from omnigent.inner.codex_executor import _populate_codex_skills
+    from omnigent.harnesses.codex.executor import _populate_codex_skills
 
     host_skills = tmp_path / "host"
     bundle_skills = tmp_path / "bundle"
@@ -3310,7 +3326,7 @@ def test_populate_codex_skills_from_bundle_links_bundle_skills(tmp_path: Path) -
     populated no skills). Fails if the bundle source isn't scanned or the
     target isn't created under ``<codex_home>/skills``.
     """
-    from omnigent.inner.codex_executor import populate_codex_skills_from_bundle
+    from omnigent.harnesses.codex.executor import populate_codex_skills_from_bundle
 
     bundle = tmp_path / "bundle"
     _make_skill_dir(bundle / "skills", "authoring")
@@ -3333,7 +3349,7 @@ def test_populate_codex_skills_copy_mode_materializes_real_directories(
     bundle directory dangles inside the tool namespace, reproducing the
     discoverable-but-unreadable failure the copy mode exists to prevent.
     """
-    from omnigent.inner.codex_executor import _populate_codex_skills
+    from omnigent.harnesses.codex.executor import _populate_codex_skills
 
     bundle_skills = tmp_path / "bundle"
     target = tmp_path / "codex_home_skills"
@@ -3360,7 +3376,7 @@ def test_populate_codex_skills_copy_mode_keeps_skill_symlinks_as_links(
     host credential file — into a mounted tree. Copied as a link, an escaping
     target simply dangles inside the namespace and stays unreadable.
     """
-    from omnigent.inner.codex_executor import _populate_codex_skills
+    from omnigent.harnesses.codex.executor import _populate_codex_skills
 
     secret = tmp_path / "host-secret.json"
     secret.write_text('{"token": "never-copy-into-a-mounted-tree"}')
@@ -3388,7 +3404,7 @@ def test_populate_codex_skills_copy_mode_never_materializes_linked_skills(
     ``copytree`` follows a linked *source*, which would copy an external
     directory's private files into the tree sandboxes are granted.
     """
-    from omnigent.inner.codex_executor import _populate_codex_skills
+    from omnigent.harnesses.codex.executor import _populate_codex_skills
 
     external = tmp_path / "external"
     _make_skill_dir(external, "alpha")
@@ -3423,8 +3439,8 @@ def test_populate_codex_skills_uses_junction_fallback_for_linked_skills(
     tmp_path: Path, linked_entry: str, copy_skills: bool
 ) -> None:
     """Linked skills use the directory-link fallback, never a materializing copy."""
-    from omnigent.inner import codex_staging
-    from omnigent.inner.codex_executor import _populate_codex_skills
+    from omnigent.harnesses.codex import staging as codex_staging
+    from omnigent.harnesses.codex.executor import _populate_codex_skills
 
     source = tmp_path / "source"
     skill = _make_skill_dir(source, "alpha")
@@ -3443,7 +3459,7 @@ def test_populate_codex_skills_uses_junction_fallback_for_linked_skills(
                 )
             },
         ),
-        patch("omnigent.inner.codex_executor.shutil.copytree") as copy,
+        patch("omnigent.harnesses.codex.executor.shutil.copytree") as copy,
     ):
         _populate_codex_skills(target, "all", [source], copy_skills=copy_skills)
 
@@ -3456,8 +3472,8 @@ def test_populate_codex_skills_never_copies_linked_sources_when_links_fail(
     tmp_path: Path, copy_skills: bool
 ) -> None:
     """Failure to preserve a directory link cannot authorize copying its target."""
-    from omnigent.inner import codex_staging
-    from omnigent.inner.codex_executor import _populate_codex_skills
+    from omnigent.harnesses.codex import staging as codex_staging
+    from omnigent.harnesses.codex.executor import _populate_codex_skills
 
     source = tmp_path / "source"
     skill = _make_skill_dir(source, "alpha")
@@ -3465,7 +3481,7 @@ def test_populate_codex_skills_never_copies_linked_sources_when_links_fail(
         patch.object(Path, "is_junction", lambda path: path == skill),
         patch.object(Path, "symlink_to", side_effect=OSError("links unavailable")),
         patch.object(codex_staging, "sys", SimpleNamespace(platform="linux")),
-        patch("omnigent.inner.codex_executor.shutil.copytree") as copy,
+        patch("omnigent.harnesses.codex.executor.shutil.copytree") as copy,
     ):
         _populate_codex_skills(tmp_path / "granted", "all", [source], copy_skills=copy_skills)
 
@@ -3477,7 +3493,7 @@ def test_populate_codex_skills_copy_mode_skips_junctions_at_every_depth(
     tmp_path: Path, relative_path: str, caplog: pytest.LogCaptureFixture
 ) -> None:
     """A traversable directory marked as a junction is excluded before copying."""
-    from omnigent.inner.codex_executor import _populate_codex_skills
+    from omnigent.harnesses.codex.executor import _populate_codex_skills
 
     source = tmp_path / "source"
     skill = _make_skill_dir(source, "alpha")
@@ -3501,7 +3517,7 @@ def test_populate_codex_skills_preserves_linked_junctions_without_symlink_privil
     """Real Windows junction-backed skills remain discoverable without symlink privilege."""
     import _winapi
 
-    from omnigent.inner.codex_executor import _populate_codex_skills
+    from omnigent.harnesses.codex.executor import _populate_codex_skills
 
     external = tmp_path / "external"
     skill = _make_skill_dir(external, "alpha")
@@ -3530,7 +3546,7 @@ def test_populate_codex_skills_copy_mode_skips_nested_junctions(
     """Copying an ordinary skill never traverses a real nested Windows junction."""
     import _winapi
 
-    from omnigent.inner.codex_executor import _populate_codex_skills
+    from omnigent.harnesses.codex.executor import _populate_codex_skills
 
     external = tmp_path / "external"
     external.mkdir()
@@ -3560,7 +3576,7 @@ def test_populate_codex_skills_from_bundle_sources_from_codex_home(tmp_path: Pat
     so a host skill under a custom ``$CODEX_HOME`` is picked up only when the
     override is supplied.
     """
-    from omnigent.inner.codex_executor import populate_codex_skills_from_bundle
+    from omnigent.harnesses.codex.executor import populate_codex_skills_from_bundle
 
     custom_codex_home = tmp_path / "custom-codex"
     _make_skill_dir(custom_codex_home / "skills", "host-skill")
@@ -3578,7 +3594,7 @@ def test_populate_codex_skills_from_bundle_none_leaves_no_dir(tmp_path: Path) ->
     ``skills_filter="none"`` produces no ``skills/`` dir even when the
     bundle ships skills — the codex-native parity for a hermetic agent.
     """
-    from omnigent.inner.codex_executor import populate_codex_skills_from_bundle
+    from omnigent.harnesses.codex.executor import populate_codex_skills_from_bundle
 
     bundle = tmp_path / "bundle"
     _make_skill_dir(bundle / "skills", "authoring")
@@ -3631,11 +3647,11 @@ async def test_embedded_codex_materializes_provider_auth_outside_argv(
 
     with (
         patch(
-            "omnigent.inner.codex_executor._create_subprocess_exec",
+            "omnigent.harnesses.codex.executor._create_subprocess_exec",
             new=_fake_create_subprocess_exec,
         ),
         patch(
-            "omnigent.inner.codex_executor._codex_home_config_source_from_env",
+            "omnigent.harnesses.codex.executor._codex_home_config_source_from_env",
             return_value=source_home,
         ),
     ):
@@ -3673,7 +3689,7 @@ def test_populate_codex_home_config_symlinks_auth_and_config(tmp_path: Path) -> 
     in-TUI ``/model`` command writes only to the session's private copy and
     never mutates the shared ``~/.codex/config.toml``.
     """
-    from omnigent.inner.codex_executor import _populate_codex_home_config
+    from omnigent.harnesses.codex.executor import _populate_codex_home_config
 
     source = tmp_path / "real_codex_home"
     source.mkdir()
@@ -3707,7 +3723,7 @@ def test_populate_codex_home_config_symlinks_remote_mcp_oauth(tmp_path: Path) ->
     ``mcp-oauth-locks/``. A private home missing them starts those servers
     unauthenticated while ``command =`` (stdio) servers still work.
     """
-    from omnigent.inner.codex_executor import _populate_codex_home_config
+    from omnigent.harnesses.codex.executor import _populate_codex_home_config
 
     source = tmp_path / "real_codex_home"
     source.mkdir()
@@ -3734,7 +3750,7 @@ def test_populate_codex_home_config_symlinks_memories(tmp_path: Path) -> None:
     user-defined rules in ``rules/``. Without symlinking them a private home
     starts with no memories and ignores the user's rules.
     """
-    from omnigent.inner.codex_executor import _populate_codex_home_config
+    from omnigent.harnesses.codex.executor import _populate_codex_home_config
 
     source = tmp_path / "real_codex_home"
     source.mkdir()
@@ -3769,7 +3785,7 @@ def test_populate_codex_home_config_symlinks_plugins_cache(tmp_path: Path) -> No
     home; sharing the one real cache keeps each session small. Only the
     ``cache`` subdir is shared — sibling scratch dirs stay session-local.
     """
-    from omnigent.inner.codex_executor import _populate_codex_home_config
+    from omnigent.harnesses.codex.executor import _populate_codex_home_config
 
     source = tmp_path / "real_codex_home"
     source.mkdir()
@@ -3793,7 +3809,7 @@ def test_populate_codex_home_config_symlinks_plugins_cache(tmp_path: Path) -> No
 
 def test_populate_codex_home_config_minimal_mode_skips_plugins_cache(tmp_path: Path) -> None:
     """Minimal (title-sidecar) mode does not link plugins — it runs no plugins."""
-    from omnigent.inner.codex_executor import _populate_codex_home_config
+    from omnigent.harnesses.codex.executor import _populate_codex_home_config
 
     source = tmp_path / "real_codex_home"
     source.mkdir()
@@ -3813,7 +3829,7 @@ def test_populate_codex_home_config_minimal_mode_keeps_only_provider_routing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Title sidecars retain auth/provider config without loading extensions."""
-    from omnigent.inner.codex_executor import _populate_codex_home_config
+    from omnigent.harnesses.codex.executor import _populate_codex_home_config
 
     source = tmp_path / "real_codex_home"
     source.mkdir()
@@ -3849,7 +3865,7 @@ def test_populate_codex_home_config_config_toml_copy_is_isolated(tmp_path: Path)
     ``~/.codex/config.toml`` and silently change another session's model or
     cost-policy enforcement.
     """
-    from omnigent.inner.codex_executor import _populate_codex_home_config
+    from omnigent.harnesses.codex.executor import _populate_codex_home_config
 
     source = tmp_path / "real_codex_home"
     source.mkdir()
@@ -3876,7 +3892,7 @@ def test_populate_codex_home_config_normalizes_deprecated_effort(tmp_path: Path)
     (a) the user's real config stays untouched and (b) keys inside tables
     are never rewritten.
     """
-    from omnigent.inner.codex_executor import _populate_codex_home_config
+    from omnigent.harnesses.codex.executor import _populate_codex_home_config
 
     source = tmp_path / "real_codex_home"
     source.mkdir()
@@ -3903,7 +3919,7 @@ def test_populate_codex_home_config_normalizes_deprecated_effort(tmp_path: Path)
 
 def test_populate_codex_home_config_keeps_valid_effort(tmp_path: Path) -> None:
     """A supported top-level effort value is copied verbatim."""
-    from omnigent.inner.codex_executor import _populate_codex_home_config
+    from omnigent.harnesses.codex.executor import _populate_codex_home_config
 
     source = tmp_path / "real_codex_home"
     source.mkdir()
@@ -3919,7 +3935,7 @@ def test_populate_codex_home_config_keeps_valid_effort(tmp_path: Path) -> None:
 
 def test_populate_codex_home_config_preserves_native_effort(tmp_path: Path) -> None:
     """Native Codex sessions preserve max and ultra reasoning effort."""
-    from omnigent.inner.codex_executor import _populate_codex_home_config
+    from omnigent.harnesses.codex.executor import _populate_codex_home_config
     from omnigent.util.reasoning_effort import CODEX_NATIVE_EFFORTS
 
     source = tmp_path / "real_codex_home"
@@ -3949,7 +3965,7 @@ def test_populate_codex_home_config_normalizes_effort_after_multiline_array(
     arrays), which must not be mistaken for a table header -- otherwise the
     still-top-level ``model_reasoning_effort`` past the array is skipped.
     """
-    from omnigent.inner.codex_executor import _populate_codex_home_config
+    from omnigent.harnesses.codex.executor import _populate_codex_home_config
 
     source = tmp_path / "real_codex_home"
     source.mkdir()
@@ -3984,7 +4000,7 @@ def test_populate_codex_home_config_missing_source_dir(tmp_path: Path) -> None:
     Handles the case where codex has never been run locally — the
     populator must no-op cleanly rather than raising on a missing path.
     """
-    from omnigent.inner.codex_executor import _populate_codex_home_config
+    from omnigent.harnesses.codex.executor import _populate_codex_home_config
 
     source = tmp_path / "nonexistent"
     target = tmp_path / "temp_codex_home"
@@ -3997,7 +4013,7 @@ def test_populate_codex_home_config_missing_source_dir(tmp_path: Path) -> None:
 
 def test_populate_codex_home_config_symlinks_hooks_json(tmp_path: Path) -> None:
     """``hooks.json`` is symlinked so user hooks fire inside the private home."""
-    from omnigent.inner.codex_executor import _populate_codex_home_config
+    from omnigent.harnesses.codex.executor import _populate_codex_home_config
 
     source = tmp_path / "real_codex_home"
     source.mkdir()
@@ -4016,7 +4032,7 @@ def test_populate_codex_home_config_hooks_json_skipped_in_minimal_mode(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """``hooks.json`` is not symlinked in minimal mode (title worker)."""
-    from omnigent.inner.codex_executor import _populate_codex_home_config
+    from omnigent.harnesses.codex.executor import _populate_codex_home_config
 
     source = tmp_path / "real_codex_home"
     source.mkdir()
@@ -4037,7 +4053,7 @@ def test_populate_codex_home_config_partial_files(tmp_path: Path) -> None:
     opt-in via ``codex auth``); ``config.toml`` is optional too. The
     populator must skip missing files silently.
     """
-    from omnigent.inner.codex_executor import _populate_codex_home_config
+    from omnigent.harnesses.codex.executor import _populate_codex_home_config
 
     source = tmp_path / "real_codex_home"
     source.mkdir()
@@ -4071,11 +4087,11 @@ def test_app_server_negotiates_direct_tools_from_server_version(
 ) -> None:
     """Only compatible servers receive the direct dynamic-tool setting."""
     monkeypatch.setattr(
-        "omnigent.inner.codex_executor._codex_home_config_source_from_env",
+        "omnigent.harnesses.codex.executor._codex_home_config_source_from_env",
         lambda: tmp_path / "empty-config",
     )
     monkeypatch.setattr(
-        "omnigent.inner.codex_executor.populate_codex_skills_from_bundle",
+        "omnigent.harnesses.codex.executor.populate_codex_skills_from_bundle",
         lambda *_args, **_kwargs: None,
     )
 
@@ -4103,7 +4119,7 @@ def test_app_server_negotiates_direct_tools_from_server_version(
             ]
         )
         with patch(
-            "omnigent.inner.codex_executor._create_subprocess_exec",
+            "omnigent.harnesses.codex.executor._create_subprocess_exec",
             new=AsyncMock(return_value=fake_process),
         ):
             try:
@@ -4194,7 +4210,7 @@ def test_app_server_start_uses_real_home_for_private_inherited_codex_home(
         session._request = AsyncMock(return_value={"result": {}})
 
         with patch(
-            "omnigent.inner.codex_executor._create_subprocess_exec",
+            "omnigent.harnesses.codex.executor._create_subprocess_exec",
             new=_fake_create_subprocess_exec,
         ):
             await session.start()
@@ -4271,7 +4287,7 @@ def test_app_server_start_preserves_custom_home_from_inherited_private_symlink(
         session._request = AsyncMock(return_value={"result": {}})
 
         with patch(
-            "omnigent.inner.codex_executor._create_subprocess_exec",
+            "omnigent.harnesses.codex.executor._create_subprocess_exec",
             new=_fake_create_subprocess_exec,
         ):
             await session.start()
@@ -4287,7 +4303,7 @@ def test_populate_codex_home_config_does_not_overwrite_existing(tmp_path: Path) 
     Guards against double-start races or manual overrides placed
     in the temp dir before the populator runs.
     """
-    from omnigent.inner.codex_executor import _populate_codex_home_config
+    from omnigent.harnesses.codex.executor import _populate_codex_home_config
 
     source = tmp_path / "real_codex_home"
     source.mkdir()
@@ -4323,7 +4339,7 @@ def test_materialize_codex_provider_config_applies_default_retry_policy(
     """
     import tomllib
 
-    from omnigent.inner.codex_executor import materialize_codex_provider_config
+    from omnigent.harnesses.codex.executor import materialize_codex_provider_config
     from omnigent.spec.types import RetryPolicy
 
     codex_home = tmp_path / "codex-home"
@@ -4343,7 +4359,7 @@ def test_materialize_codex_provider_config_applies_custom_retry_policy(tmp_path:
     """Agent-specific retry values override Codex provider defaults."""
     import tomllib
 
-    from omnigent.inner.codex_executor import materialize_codex_provider_config
+    from omnigent.harnesses.codex.executor import materialize_codex_provider_config
     from omnigent.spec.types import RetryPolicy
 
     codex_home = tmp_path / "codex-home"
@@ -4379,7 +4395,7 @@ def test_clean_codex_env_excludes_openai_api_key(monkeypatch) -> None:
     ``OPENAI_API_KEY`` into the subprocess would charge the user's
     developer account instead of their subscription plan.
     """
-    from omnigent.inner.codex_executor import _clean_codex_env
+    from omnigent.harnesses.codex.executor import _clean_codex_env
 
     monkeypatch.setenv("OPENAI_API_KEY", "sk-test-secret")
     monkeypatch.setenv("OPENAI_MAX_RETRIES", "3")
@@ -4444,7 +4460,7 @@ def test_clean_codex_env_includes_databricks_bearer(monkeypatch) -> None:
 
     :param monkeypatch: Pytest monkeypatch fixture.
     """
-    from omnigent.inner.codex_executor import _clean_codex_env
+    from omnigent.harnesses.codex.executor import _clean_codex_env
 
     monkeypatch.setenv("DATABRICKS_BEARER", "ci-bearer")
     monkeypatch.setenv("DATABRICKS_TOKEN", "stale-token")
@@ -4464,8 +4480,8 @@ def test_clean_codex_env_includes_omnigent_session_marker(monkeypatch) -> None:
 
     :param monkeypatch: Pytest monkeypatch fixture.
     """
-    from omnigent.inner.codex_executor import _clean_codex_env
-    from omnigent.runner.identity import (
+    from omnigent.harnesses.codex.executor import _clean_codex_env
+    from omnigent.util.runner_identity import (
         OMNIGENT_SESSION_ENV_VALUE,
         OMNIGENT_SESSION_ENV_VAR,
     )
@@ -4636,7 +4652,7 @@ async def test_codex_cli_version_parses_output(
     async def _fake_exec(*_args: Any, **_kwargs: Any) -> _FakeVersionProcess:
         return _FakeVersionProcess(stdout=output)
 
-    monkeypatch.setattr("omnigent.inner.codex_executor._create_subprocess_exec", _fake_exec)
+    monkeypatch.setattr("omnigent.harnesses.codex.executor._create_subprocess_exec", _fake_exec)
     assert await _codex_cli_version("/usr/local/bin/codex") == expected
 
 
@@ -4654,7 +4670,7 @@ async def test_codex_cli_version_returns_none_on_oserror(
     async def _boom(*_args: Any, **_kwargs: Any) -> None:
         raise OSError("no such binary")
 
-    monkeypatch.setattr("omnigent.inner.codex_executor._create_subprocess_exec", _boom)
+    monkeypatch.setattr("omnigent.harnesses.codex.executor._create_subprocess_exec", _boom)
     assert await _codex_cli_version("/usr/local/bin/codex") is None
 
 
@@ -4693,8 +4709,10 @@ async def test_codex_cli_version_times_out_and_kills_proc(
         return proc
 
     # Shrink the probe budget so the test does not actually wait the full 5s.
-    monkeypatch.setattr("omnigent.inner.codex_executor._CODEX_VERSION_PROBE_TIMEOUT_SECONDS", 0.05)
-    monkeypatch.setattr("omnigent.inner.codex_executor._create_subprocess_exec", _fake_exec)
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex.executor._CODEX_VERSION_PROBE_TIMEOUT_SECONDS", 0.05
+    )
+    monkeypatch.setattr("omnigent.harnesses.codex.executor._create_subprocess_exec", _fake_exec)
 
     assert await _codex_cli_version("/usr/local/bin/codex") is None
     # The stuck process was killed, not leaked.
@@ -4723,7 +4741,7 @@ async def test_brokered_codex_version_gate_rejects_unknown_wire_versions_before_
     async def _fake_exec(*_args: Any, **_kwargs: Any) -> _FakeVersionProcess:
         return _FakeVersionProcess(stdout=output)
 
-    monkeypatch.setattr("omnigent.inner.codex_executor._create_subprocess_exec", _fake_exec)
+    monkeypatch.setattr("omnigent.harnesses.codex.executor._create_subprocess_exec", _fake_exec)
 
     with pytest.raises(RuntimeError, match="unsupported Codex wire version"):
         await _require_brokered_codex_version("/usr/local/bin/codex")
@@ -4735,7 +4753,7 @@ async def test_brokered_codex_version_gate_accepts_tested_1460(
     async def _fake_exec(*_args: Any, **_kwargs: Any) -> _FakeVersionProcess:
         return _FakeVersionProcess(stdout=b"codex-cli 0.146.0\n")
 
-    monkeypatch.setattr("omnigent.inner.codex_executor._create_subprocess_exec", _fake_exec)
+    monkeypatch.setattr("omnigent.harnesses.codex.executor._create_subprocess_exec", _fake_exec)
 
     await _require_brokered_codex_version("/usr/local/bin/codex")
 
@@ -4747,7 +4765,7 @@ async def test_brokered_version_failure_precedes_signer_session_construction(
     version_gate = AsyncMock(side_effect=RuntimeError("unsupported Codex wire version"))
     app_session_factory = AsyncMock()
     monkeypatch.setattr(
-        "omnigent.inner.codex_executor._require_brokered_codex_version", version_gate
+        "omnigent.harnesses.codex.executor._require_brokered_codex_version", version_gate
     )
     signer_config = SignerLaunchConfig(
         binding_id="test-fake-provider-v1",
@@ -4789,7 +4807,7 @@ def test_model_provider_override_appends_pin() -> None:
     reaches the codex CLI, so the bridged config.toml's default provider
     silently routes the session instead.
     """
-    with patch("omnigent.inner.codex_executor._find_codex_cli", return_value="/usr/bin/codex"):
+    with patch("omnigent.harnesses.codex.executor._find_codex_cli", return_value="/usr/bin/codex"):
         executor = CodexExecutor(model_provider_override="Databricks")
     assert executor._codex_config_overrides == ['model_provider="Databricks"']
 
@@ -4802,7 +4820,7 @@ def test_model_provider_override_with_gateway_raises() -> None:
     means a misconfigured AP producer ships an ambiguous launch.
     """
     with (
-        patch("omnigent.inner.codex_executor._find_codex_cli", return_value="/usr/bin/codex"),
+        patch("omnigent.harnesses.codex.executor._find_codex_cli", return_value="/usr/bin/codex"),
         pytest.raises(OSError, match="mutually exclusive"),
     ):
         CodexExecutor(
@@ -4823,7 +4841,7 @@ def _mk_codex_skill(skills_dir: Path, name: str) -> None:
 
 
 def test_select_codex_skill_dirs_all_first_source_wins(tmp_path: Path) -> None:
-    from omnigent.inner.codex_executor import select_codex_skill_dirs
+    from omnigent.harnesses.codex.executor import select_codex_skill_dirs
 
     a, b = tmp_path / "a", tmp_path / "b"
     _mk_codex_skill(a, "shared")
@@ -4835,7 +4853,7 @@ def test_select_codex_skill_dirs_all_first_source_wins(tmp_path: Path) -> None:
 
 
 def test_select_codex_skill_dirs_none_and_list(tmp_path: Path) -> None:
-    from omnigent.inner.codex_executor import select_codex_skill_dirs
+    from omnigent.harnesses.codex.executor import select_codex_skill_dirs
 
     a = tmp_path / "a"
     _mk_codex_skill(a, "x")
@@ -4846,7 +4864,7 @@ def test_select_codex_skill_dirs_none_and_list(tmp_path: Path) -> None:
 
 def test_codex_skill_sources_order_bundle_then_host(tmp_path: Path) -> None:
     """codex_skill_sources lists <bundle>/skills before <home>/.codex/skills."""
-    from omnigent.inner.codex_executor import codex_skill_sources
+    from omnigent.harnesses.codex.executor import codex_skill_sources
 
     bundle = tmp_path / "bundle"
     (bundle / "skills").mkdir(parents=True)
@@ -4860,7 +4878,7 @@ def test_codex_skill_sources_order_bundle_then_host(tmp_path: Path) -> None:
 
 def test_codex_skill_sources_omits_absent_dirs(tmp_path: Path) -> None:
     """Only existing dirs are returned (bundle absent → host only)."""
-    from omnigent.inner.codex_executor import codex_skill_sources
+    from omnigent.harnesses.codex.executor import codex_skill_sources
 
     home = tmp_path / "home"
     (home / ".codex" / "skills").mkdir(parents=True)
@@ -4869,7 +4887,7 @@ def test_codex_skill_sources_omits_absent_dirs(tmp_path: Path) -> None:
 
 
 def test_clean_codex_env_honors_extra_allow(monkeypatch):
-    from omnigent.inner.codex_executor import _clean_codex_env
+    from omnigent.harnesses.codex.executor import _clean_codex_env
 
     monkeypatch.setenv("CRAWL4AI_API_TOKEN", "secret-tok")
     monkeypatch.setenv("COMPANIES_HOUSE_API_KEY", "ch-key")
@@ -4882,7 +4900,7 @@ def test_clean_codex_env_honors_extra_allow(monkeypatch):
 
 
 def test_clean_codex_env_deny_wins_over_extra_allow(monkeypatch):
-    from omnigent.inner.codex_executor import _clean_codex_env
+    from omnigent.harnesses.codex.executor import _clean_codex_env
 
     monkeypatch.setenv("OPENAI_API_KEY", "sk-stripped")
     # the deny rule (subscription auth) wins even if a caller declares it
@@ -4892,8 +4910,8 @@ def test_clean_codex_env_deny_wins_over_extra_allow(monkeypatch):
 def test_declared_passthrough_reads_sandbox_env_passthrough():
     # Codex consumes the shared helper in agent_env rather than keeping its own
     # copy; this still covers the codex spawn path's source of extra_allowed.
-    from omnigent.inner.agent_env import declared_passthrough as _declared_passthrough
-    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+    from omnigent.core.datamodel import OSEnvSandboxSpec, OSEnvSpec
+    from omnigent.environments.agent_env import declared_passthrough as _declared_passthrough
 
     # env_passthrough lives on os_env.sandbox, not os_env directly
     spec = OSEnvSpec(
@@ -4912,7 +4930,7 @@ def test_find_codex_cli_delegates_to_shared_resolver(monkeypatch):
     """``_find_codex_cli`` resolves codex via the shared resolver with the
     OMNIGENT_CODEX_PATH override. (The resolver's own PATH/override/fallback
     behavior is covered in tests/inner/test_proc_and_platform.py.)"""
-    from omnigent.inner import codex_executor as ce
+    from omnigent.harnesses.codex import executor as ce
 
     captured = {}
 
@@ -4962,14 +4980,14 @@ class TestCodexAppServerSessionHomeStaging(unittest.TestCase):
                 tool_executor=None,
             )
             with (
-                patch("omnigent.inner.codex_executor.populate_codex_skills_from_bundle"),
-                patch("omnigent.inner.codex_executor._populate_codex_home_config"),
+                patch("omnigent.harnesses.codex.executor.populate_codex_skills_from_bundle"),
+                patch("omnigent.harnesses.codex.executor._populate_codex_home_config"),
                 patch(
-                    "omnigent.inner.codex_executor._codex_home_config_source_from_env",
+                    "omnigent.harnesses.codex.executor._codex_home_config_source_from_env",
                     return_value=None,
                 ),
                 patch(
-                    "omnigent.inner.codex_executor._create_subprocess_exec",
+                    "omnigent.harnesses.codex.executor._create_subprocess_exec",
                     new_callable=AsyncMock,
                     side_effect=RuntimeError("stop"),
                 ),
@@ -4990,7 +5008,7 @@ class TestCodexAppServerSessionHomeStaging(unittest.TestCase):
         """
         import tempfile as _tempfile
 
-        from omnigent.inner.codex_staging import codex_home_staging_root
+        from omnigent.harnesses.codex.staging import codex_home_staging_root
 
         with _tempfile.TemporaryDirectory() as writable_dir:
             dir_used = self._run_start_and_capture_mkdtemp_dir(writable_dir)
@@ -5006,7 +5024,7 @@ class TestCodexAppServerSessionHomeStaging(unittest.TestCase):
         with (
             _tempfile.TemporaryDirectory() as writable_dir,
             patch(
-                "omnigent.inner.codex_executor.codex_home_staging_root",
+                "omnigent.harnesses.codex.executor.codex_home_staging_root",
                 side_effect=OSError("unwritable temp dir"),
             ),
         ):
@@ -5032,13 +5050,13 @@ class TestCodexAppServerSessionHomeStaging(unittest.TestCase):
                     **session_kwargs,
                 )
                 with (
-                    patch("omnigent.inner.codex_executor._populate_codex_home_config"),
+                    patch("omnigent.harnesses.codex.executor._populate_codex_home_config"),
                     patch(
-                        "omnigent.inner.codex_executor._codex_home_config_source_from_env",
+                        "omnigent.harnesses.codex.executor._codex_home_config_source_from_env",
                         return_value=None,
                     ),
                     patch(
-                        "omnigent.inner.codex_executor._create_subprocess_exec",
+                        "omnigent.harnesses.codex.executor._create_subprocess_exec",
                         new_callable=AsyncMock,
                         side_effect=_stop_before_spawn,
                     ) as spawn,
@@ -5066,7 +5084,7 @@ class TestCodexAppServerSessionHomeStaging(unittest.TestCase):
         """Windows without Developer Mode refuses symlinks. Startup must still
         succeed, with the published skill path inside the session's grant.
         """
-        from omnigent.inner import codex_staging
+        from omnigent.harnesses.codex import staging as codex_staging
 
         def _junction(target: str, link: str) -> None:
             os.symlink(target, link, target_is_directory=True)
@@ -5090,7 +5108,7 @@ class TestCodexAppServerSessionHomeStaging(unittest.TestCase):
         """Without any directory link, Codex must still start and discover the
         bundle's skills, and the degraded sandbox visibility must be reported.
         """
-        from omnigent.inner import codex_staging
+        from omnigent.harnesses.codex import staging as codex_staging
 
         def _check(codex_home: Path) -> None:
             skills = codex_home / "skills"
@@ -5103,7 +5121,7 @@ class TestCodexAppServerSessionHomeStaging(unittest.TestCase):
             with (
                 patch.object(Path, "symlink_to", side_effect=OSError(1314, "privilege not held")),
                 patch.object(codex_staging, "sys", SimpleNamespace(platform="linux")),
-                self.assertLogs("omnigent.inner.codex_executor", level="WARNING") as logs,
+                self.assertLogs("omnigent.harnesses.codex.executor", level="WARNING") as logs,
             ):
                 self._start_until_worker_spawn(_check, bundle_dir=bundle, skills_filter=["alpha"])
         self.assertTrue(any("restricted reads" in line for line in logs.output), logs.output)

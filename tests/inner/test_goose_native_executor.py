@@ -6,8 +6,8 @@ from pathlib import Path
 
 import pytest
 
-from omnigent.inner import goose_native_executor as gne
-from omnigent.inner.executor import ExecutorError, TurnComplete
+from omnigent.core.executor import ExecutorError, TurnComplete
+from omnigent.harnesses.goose_native import executor as gne
 
 
 def test_supports_flags(tmp_path: Path) -> None:

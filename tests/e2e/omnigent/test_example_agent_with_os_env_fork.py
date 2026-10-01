@@ -11,7 +11,7 @@ and Linux (hardlinks via ``os.link``). On Linux, enable
 
 **What breaks if this fails:**
 - Spec parser regresses on ``os_env.fork: true``.
-- The COW hardlink-tree setup in ``omnigent.inner.os_env``
+- The COW hardlink-tree setup in ``omnigent.environments.os_env``
   fails to create its private shadow directory.
 - Shell commands' hardlink-break logic regresses, leaking writes
   back to the original cwd.

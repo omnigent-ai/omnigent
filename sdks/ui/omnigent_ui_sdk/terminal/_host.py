@@ -1535,7 +1535,7 @@ class TerminalHost:
         # calls don't paint into the prompt-toolkit screen.
         # Restored in __aexit__.
         try:
-            from omnigent.cli_diagnostics import redirect_stderr_to_log
+            from omnigent.cli.diagnostics import redirect_stderr_to_log
 
             redirect_stderr_to_log()
         except Exception as err:
@@ -1580,7 +1580,7 @@ class TerminalHost:
         # may log or raise, and those should go to the real terminal
         # now that the TUI is tearing down.
         try:
-            from omnigent.cli_diagnostics import restore_stderr
+            from omnigent.cli.diagnostics import restore_stderr
 
             restore_stderr()
         except Exception as err:
@@ -2038,7 +2038,7 @@ class TerminalHost:
             updates land without manual intervention, loose enough
             that each tick's HTTP ``list_items`` round-trip doesn't
             hammer the server. Matches omnigent' overview polling
-            strategy (see ``omnigent/cli.py::_refresh_loop``),
+            strategy (see ``omnigent/cli/commands.py::_refresh_loop``),
             with the interval bumped from 50 ms → 500 ms because
             Omnigent' builder crosses a real HTTP boundary
             while omnigent' builder just reads in-process state.

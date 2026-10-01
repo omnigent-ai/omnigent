@@ -46,7 +46,7 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    from omnigent.process_logging import configure_process_logging
+    from omnigent.observability.process_logging import configure_process_logging
 
     log_path = configure_process_logging("host", force=True)
 

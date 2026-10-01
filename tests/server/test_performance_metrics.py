@@ -15,7 +15,7 @@ from fastapi import FastAPI, Request
 from opentelemetry.util.types import Attributes
 from starlette.types import Scope
 
-from omnigent.process_logging import DEFAULT_LOG_DATEFMT, DEFAULT_LOG_PREFIX_FORMAT
+from omnigent.observability.process_logging import DEFAULT_LOG_DATEFMT, DEFAULT_LOG_PREFIX_FORMAT
 from omnigent.server.performance_metrics import (
     RequestDurationAccessFormatter,
     ServerMetricsOtelPublisher,

@@ -12,14 +12,14 @@ from typing import Any
 
 import pytest
 
-from omnigent.harnesses.opencode_native.http_transport import (
-    OpenCodeHttpTransport,
-    build_prompt_payload,
-)
-from omnigent.native.native_server_transport import (
+from omnigent.harnesses.native.server_transport import (
     NativeLaunchConfig,
     NativePermissionDecision,
     NativePrompt,
+)
+from omnigent.harnesses.opencode_native.http_transport import (
+    OpenCodeHttpTransport,
+    build_prompt_payload,
 )
 
 # ── build_prompt_payload + part/model helpers ──────────────────────────────

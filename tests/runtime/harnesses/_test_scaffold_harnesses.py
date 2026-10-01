@@ -20,7 +20,7 @@ import os
 
 from fastapi import FastAPI
 
-from omnigent.runtime.harnesses._scaffold import HarnessApp, TurnContext
+from omnigent.harnesses.runtime._scaffold import HarnessApp, TurnContext
 from omnigent.server.schemas import (
     CreateResponseRequest,
     ElicitationRequestParams,

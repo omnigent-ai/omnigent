@@ -11,9 +11,9 @@ from __future__ import annotations
 
 import re
 
-from omnigent.harness_aliases import canonicalize_harness, is_native_harness
-from omnigent.harness_availability import CODEX_CANONICAL_HARNESSES
-from omnigent.harness_plugins import model_env_keys
+from omnigent.harnesses.aliases import canonicalize_harness, is_native_harness
+from omnigent.harnesses.availability import CODEX_CANONICAL_HARNESSES
+from omnigent.harnesses.registry import model_env_keys
 
 # Generous-but-safe upper bound; real ids ("databricks-claude-opus-4-8",
 # "us.anthropic.claude-sonnet-4-6") stay well under it.

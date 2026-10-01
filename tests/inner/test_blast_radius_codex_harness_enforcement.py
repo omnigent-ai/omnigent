@@ -20,7 +20,7 @@ The user journey the ticket describes:
 The mechanism, pinned deterministically here without a live LLM: the in-process
 Codex executor surfaces its internally-executed shell as an *observational*
 :class:`ToolCallRequest` named ``"shell"`` with ``internally_executed=True``
-(``omnigent/inner/codex_executor.py::_codex_builtin_tool_request``). ``"shell"``
+(``omnigent/harnesses/codex/executor.py::_codex_builtin_tool_request``). ``"shell"``
 is **not** in ``omnigent/policies/builtins/_shell.py::SHELL_TOOLS`` (which is
 ``{sys_os_shell, Bash, bash, Shell, terminal, developer__shell, shell}``), so when that
 observed name is run through the exact runner-side gate the runner builds from
@@ -50,7 +50,7 @@ import asyncio
 
 import pytest
 
-from omnigent.inner.codex_executor import _codex_builtin_tool_request
+from omnigent.harnesses.codex.executor import _codex_builtin_tool_request
 from omnigent.policies import resolve_function_policy
 from omnigent.policies.builtins._shell import SHELL_TOOLS
 from omnigent.runner.policy import RunnerToolPolicyGate, _GatedPolicy

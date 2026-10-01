@@ -16,7 +16,7 @@ instead of polling. This module ships:
 All tools in this module are gated on the agent's top-level
 ``async:`` flag (see :attr:`AgentSpec.async_enabled`). The flag
 **defaults to ``True``** to match the legacy inner stack's
-default (``omnigent/inner/datamodel.py::AgentDef.async_enabled``),
+default (``omnigent/core/datamodel.py::AgentDef.async_enabled``),
 so agents that don't mention it still see the async surface and
 the same YAML produces the same tool list under Omnigent mode and the
 legacy path. Agents that explicitly want a minimal-tools surface

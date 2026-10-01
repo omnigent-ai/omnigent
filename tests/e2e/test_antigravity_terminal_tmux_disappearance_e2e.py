@@ -21,12 +21,12 @@ from pathlib import Path
 import httpx
 import pytest
 
-import omnigent.inner.terminal as terminal_mod
-from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec, TerminalEnvSpec
-from omnigent.inner.terminal import TerminalInstance
+import omnigent.terminals.terminal as terminal_mod
+from omnigent.core.datamodel import OSEnvSandboxSpec, OSEnvSpec, TerminalEnvSpec
 from omnigent.runner import create_runner_app
 from omnigent.runner.resource_registry import SessionResourceRegistry
 from omnigent.terminals import TerminalRegistry
+from omnigent.terminals.terminal import TerminalInstance
 
 pytestmark = pytest.mark.skipif(shutil.which("tmux") is None, reason="requires tmux on PATH")
 

@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import pytest
 
-from omnigent.server.routes._sessions.orchestration import (
+from omnigent.server.routes.sessions.orchestration import (
     _persist_native_cumulative_usage,
 )
 from omnigent.stores.conversation_store.sqlalchemy_store import (
@@ -243,7 +243,7 @@ async def test_flush_with_stale_row_keeps_monotonic_clamp(db_uri: str) -> None:
     caller's row (otherwise the replay could roll the persisted/enforced cost
     back and double-count the daily rollup delta).
     """
-    from omnigent.server.routes._sessions.orchestration import (
+    from omnigent.server.routes.sessions.orchestration import (
         _persist_external_session_usage,
     )
     from omnigent.server.schemas import SessionEventInput
@@ -282,7 +282,7 @@ async def test_flush_with_supplied_row_skips_tree_root_rereads(db_uri: str) -> N
     from sqlalchemy import event as sa_event
 
     from omnigent.db.utils import _engine_cache
-    from omnigent.server.routes._sessions.orchestration import (
+    from omnigent.server.routes.sessions.orchestration import (
         _persist_external_session_usage,
     )
     from omnigent.server.schemas import SessionEventInput
@@ -330,7 +330,7 @@ async def test_flush_telemetry_reports_the_callers_installation_id(db_uri: str) 
     """
     from unittest.mock import patch
 
-    from omnigent.server.routes._sessions.orchestration import (
+    from omnigent.server.routes.sessions.orchestration import (
         _persist_external_session_usage,
     )
     from omnigent.server.schemas import SessionEventInput
@@ -342,7 +342,7 @@ async def test_flush_telemetry_reports_the_callers_installation_id(db_uri: str) 
 
     events: list = []
     with patch(
-        "omnigent.server.routes._sessions.orchestration._tel_emit",
+        "omnigent.server.routes.sessions.orchestration._tel_emit",
         side_effect=events.append,
     ):
         await _persist_external_session_usage(

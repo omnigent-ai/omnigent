@@ -67,7 +67,7 @@ def _cli_env(tmp_path: Path) -> dict[str, str]:
 def _run_cli(args: list[str], tmp_path: Path) -> subprocess.CompletedProcess[str]:
     """Run ``omnigent <args>`` exactly as a user would, capturing output.
 
-    Uses ``python -m omnigent.cli`` so the observable console behavior is
+    Uses ``python -m omnigent.cli.commands`` so the observable console behavior is
     deterministic (no interactive crash prompt in a non-TTY test run).
 
     :param args: CLI arguments after the ``omnigent`` program name.
@@ -75,7 +75,7 @@ def _run_cli(args: list[str], tmp_path: Path) -> subprocess.CompletedProcess[str
     :returns: The completed process with captured stdout/stderr.
     """
     return subprocess.run(
-        [sys.executable, "-m", "omnigent.cli", *args],
+        [sys.executable, "-m", "omnigent.cli.commands", *args],
         capture_output=True,
         text=True,
         timeout=_CLI_TIMEOUT_S,

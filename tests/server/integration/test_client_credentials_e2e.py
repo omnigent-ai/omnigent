@@ -108,8 +108,8 @@ def _build_app(
 
     db_url = f"sqlite:///{tmp_path}/test.db"
     from omnigent.db.utils import get_or_create_engine
+    from omnigent.observability import otel as telemetry
     from omnigent.runtime import init as init_runtime
-    from omnigent.runtime import telemetry
     from omnigent.runtime.agent_cache import AgentCache
     from omnigent.runtime.caps import RuntimeCaps
     from omnigent.server.accounts_store import SqlAlchemyAccountStore

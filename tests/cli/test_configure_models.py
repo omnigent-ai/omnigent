@@ -45,7 +45,7 @@ import tomllib
 import yaml
 from click.testing import CliRunner
 
-from omnigent.cli import cli
+from omnigent.cli.commands import cli
 from omnigent.onboarding import providers as provider_catalog
 from omnigent.onboarding import secrets
 from omnigent.onboarding.configure_models import (
@@ -742,7 +742,7 @@ def test_kind_glyph_uniform_display_width(kind: str) -> None:
     a VS16-forced wide emoji as the two cells terminals render). A regression
     that dropped the VS16 (or a glyph) yields width != 2.
     """
-    from omnigent.inner.banner import _display_width
+    from omnigent.cli.banner import _display_width
 
     g = kind_glyph(kind)
     width = _display_width(g)
@@ -1360,8 +1360,8 @@ def test_promote_global_auth_backfills_databricks_for_existing_configs(isolated_
     defaulting both families (the config only ever had the auth: block, so
     routing already used databricks for both).
     """
-    from omnigent.cli import _save_global_config
-    from omnigent.cli_config import _promote_global_auth_to_provider
+    from omnigent.cli.commands import _save_global_config
+    from omnigent.cli.config_commands import _promote_global_auth_to_provider
 
     _save_global_config({"auth": {"type": "databricks", "profile": "oss"}})
 
@@ -1387,8 +1387,8 @@ def test_promote_global_auth_respects_explicit_default(isolated_config) -> None:
     must NOT steal it — it only claims families with no existing default. Here
     an explicit anthropic key default is kept while databricks takes openai.
     """
-    from omnigent.cli import _save_global_config
-    from omnigent.cli_config import _promote_global_auth_to_provider
+    from omnigent.cli.commands import _save_global_config
+    from omnigent.cli.config_commands import _promote_global_auth_to_provider
 
     _save_global_config(
         {
@@ -1418,8 +1418,8 @@ def test_promote_global_auth_respects_explicit_default(isolated_config) -> None:
 
 def test_promote_global_auth_noop_without_databricks_auth(isolated_config) -> None:
     """No databricks ``auth:`` block → nothing to backfill (returns None)."""
-    from omnigent.cli import _save_global_config
-    from omnigent.cli_config import _promote_global_auth_to_provider
+    from omnigent.cli.commands import _save_global_config
+    from omnigent.cli.config_commands import _promote_global_auth_to_provider
 
     # An api_key auth block (not databricks) must not synthesize a databricks
     # provider, and a config with no auth: block at all is a clean no-op.
@@ -2118,7 +2118,8 @@ def test_overview_truncates_long_status_for_narrow_terminal(isolated_config, mon
     from omnigent.onboarding.opencode_auth import OpenCodeAuthSummary
 
     monkeypatch.setattr(
-        "omnigent.cli.shutil.get_terminal_size", lambda fallback: os.terminal_size((40, 24))
+        "omnigent.cli.commands.shutil.get_terminal_size",
+        lambda fallback: os.terminal_size((40, 24)),
     )
     monkeypatch.setattr(
         "omnigent.onboarding.opencode_auth.opencode_auth_summary",
@@ -2181,7 +2182,7 @@ def test_overview_dispatches_to_correct_manager(
     """
     called: list[str] = []
     monkeypatch.setattr(
-        f"omnigent.cli_config.{manager_attr}", lambda *a, **k: called.append(manager_attr)
+        f"omnigent.cli.config_commands.{manager_attr}", lambda *a, **k: called.append(manager_attr)
     )
     result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=f"{choice}\nq\n")
     assert result.exit_code == 0, result.output
@@ -2213,7 +2214,7 @@ def test_overview_status_color_distinguishes_missing_from_unconfigured(
     monkeypatch.setattr(
         "omnigent.onboarding.harness_install.harness_cli_installed", lambda family: False
     )
-    monkeypatch.setattr("omnigent._platform.resolve_cli_binary", lambda _name: None)
+    monkeypatch.setattr("omnigent.util.portability.resolve_cli_binary", lambda _name: None)
     options, selectable, _descriptions, _compact, _max_visible = _capture_setup_overview(
         monkeypatch
     )
@@ -3069,7 +3070,7 @@ def test_antigravity_sign_in_skips_sdk_install_prompt(isolated_config, monkeypat
         lambda: False,
     )
     prompt = Mock()
-    monkeypatch.setattr("omnigent.cli_config._prompt_install_antigravity", prompt)
+    monkeypatch.setattr("omnigent.cli.config_commands._prompt_install_antigravity", prompt)
     login = Mock(return_value=True)
     monkeypatch.setattr("omnigent.onboarding.harness_install.harness_login", login)
 
@@ -3487,7 +3488,7 @@ def test_claude_subscription_relabeled_as_managed_gateway(tmp_path, monkeypatch)
     """
     import json
 
-    from omnigent.cli_config import _compact_credential_label, _credential_label
+    from omnigent.cli.config_commands import _compact_credential_label, _credential_label
     from omnigent.onboarding import ambient
     from omnigent.onboarding.ambient import DetectedProvider
     from omnigent.onboarding.provider_config import ProviderEntry
@@ -3550,7 +3551,7 @@ def test_kind_glyph_falls_back_to_ascii_on_non_utf8_console(
     encode and keep the listing's columns aligned (2 display cells, same as
     the emoji it replaces).
     """
-    from omnigent.inner.banner import _display_width
+    from omnigent.cli.banner import _display_width
 
     legacy, _ = _cp1252_console()
     monkeypatch.setattr("omnigent.onboarding.configure_models.console", legacy)

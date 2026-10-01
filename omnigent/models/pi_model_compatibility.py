@@ -107,7 +107,7 @@ def pi_model_json_entry(model: ModelEntry) -> PiModelEntry:
     """Translate normalized catalog metadata into Pi's ``models.json`` schema.
 
     Shared by every surface that renders a Pi ``models.json`` — the spawned
-    harness in :mod:`omnigent.inner.pi_executor` and the interactive
+    harness in :mod:`omnigent.harnesses.pi.executor` and the interactive
     ``omnigent pi`` launch in :mod:`omnigent.harnesses.pi_native.credentials` — so both
     advertise the same limits for the same model. Pi defaults an entry with no
     ``contextWindow``/``maxTokens`` to 128000/16384, which silently truncates

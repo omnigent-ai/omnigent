@@ -90,14 +90,14 @@ class LocalServer:
 
         # Resolve the omnigent project root so Alembic can find
         # its migrations directory. Walk up from the agent path or
-        # from this file's location looking for omnigent/cli.py.
+        # from this file's location looking for omnigent/cli/commands.py.
         project_root = self._find_project_root()
 
         self._proc = subprocess.Popen(
             [
                 sys.executable,
                 "-m",
-                "omnigent.cli",
+                "omnigent.cli.commands",
                 "server",
                 "--host",
                 self._host,
@@ -121,7 +121,7 @@ class LocalServer:
         """Find the omnigent project root directory.
 
         Walks up from the agent path looking for a directory that
-        contains ``omnigent/cli.py``.
+        contains ``omnigent/cli/commands.py``.
         """
         # Try from agent path first.
         candidate = pathlib.Path(self._agent_path).resolve()

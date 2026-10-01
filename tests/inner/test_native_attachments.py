@@ -11,7 +11,7 @@ from typing import Any
 
 import pytest
 
-from omnigent.inner.native_attachments import (
+from omnigent.util.attachments import (
     ATTACHMENT_MARKER_STRIP_PATTERN,
     UNRESOLVED_ATTACHMENT_MARKER_PATTERN,
     DataUri,
@@ -46,7 +46,7 @@ def test_resize_alias_copy_failure_leaves_no_partial_cache(
         raise OSError("disk full")
 
     with monkeypatch.context() as patch:
-        patch.setattr("omnigent.inner.native_attachments.shutil.copyfile", fail_copy)
+        patch.setattr("omnigent.util.attachments.shutil.copyfile", fail_copy)
         assert codex_resize_metadata_path(path, dimensions) == path
     assert list(tmp_path.iterdir()) == [path]
     alias = codex_resize_metadata_path(path, dimensions)
@@ -164,7 +164,7 @@ def test_materialize_attachment_unresolved_file_id_logs_error(
     """
     block = {"type": "input_image", "file_id": "file_unresolved"}
 
-    with caplog.at_level(logging.ERROR, logger="omnigent.inner.native_attachments"):
+    with caplog.at_level(logging.ERROR, logger="omnigent.util.attachments"):
         path = materialize_attachment(block, tmp_path)
 
     assert path is None
@@ -491,7 +491,7 @@ async def test_re_resolution_takes_the_filename_from_stored_metadata() -> None:
 
 def test_client_server_filesystem_extension_parity() -> None:
     """Client and server accept the same filesystem attachment extensions."""
-    from omnigent.inner.native_attachments import _FILESYSTEM_ATTACHMENT_EXTENSIONS
+    from omnigent.util.attachments import _FILESYSTEM_ATTACHMENT_EXTENSIONS
 
     ts_path = Path(__file__).resolve().parents[2] / "web" / "src" / "lib" / "attachments.ts"
     if not ts_path.exists():

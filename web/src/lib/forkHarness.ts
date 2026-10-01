@@ -58,7 +58,7 @@ export function harnessFamily(
  * Whether a harness is a native CLI harness that carries fork/switch history
  * (Claude Code / Codex / Cursor / Pi / Antigravity / Qwen Code). These are the
  * native harnesses whose history the runner rebuilds or replays on a fork — the
- * subset of Python `NATIVE_HARNESSES` (`omnigent/harness_aliases.py`) that the
+ * subset of Python `NATIVE_HARNESSES` (`omnigent/harnesses/aliases.py`) that the
  * server gates in `_FORK_HISTORY_NATIVE_HARNESSES` /
  * `_CURSOR_FORK_HISTORY_HARNESSES` (`server/routes/sessions.py`). A native
  * harness that always starts fresh (e.g. goose-native) is intentionally absent

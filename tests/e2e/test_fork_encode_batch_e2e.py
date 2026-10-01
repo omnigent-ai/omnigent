@@ -95,7 +95,7 @@ def _batch_encode(self, data_jsons):
 _s.SqlAlchemyConversationStore._encode_item_data = _per_item_encode
 _s.SqlAlchemyConversationStore._encode_item_data_batch = _batch_encode
 
-from omnigent.cli import main
+from omnigent.cli.commands import main
 
 main()
 """

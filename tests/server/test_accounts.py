@@ -828,7 +828,7 @@ def test_bootstrap_init_password_loopback_writes_cli_token_no_autoopen(
     assert result.needs_setup is False
     assert result.open_url is None
     assert result.tui_token_written is True
-    from omnigent import cli_auth
+    from omnigent.cli import auth as cli_auth
 
     assert cli_auth.load_token(base_url) is not None
 
@@ -845,7 +845,7 @@ def test_bootstrap_refreshes_cli_token_on_returning_loopback_boot(
     that motivated this). Here the second boot uses a *different* base
     URL (new port) and must still produce a usable token for it.
     """
-    from omnigent import cli_auth
+    from omnigent.cli import auth as cli_auth
 
     first = bootstrap_admin(
         fresh_store,
@@ -992,8 +992,8 @@ def _build_accounts_app(
 
     db_url = f"sqlite:///{tmp_path}/test.db"
     from omnigent.db.utils import get_or_create_engine
+    from omnigent.observability import otel as telemetry
     from omnigent.runtime import init as init_runtime
-    from omnigent.runtime import telemetry
     from omnigent.runtime.agent_cache import AgentCache
     from omnigent.runtime.caps import RuntimeCaps
     from omnigent.server.app import create_app
@@ -1092,8 +1092,8 @@ def header_mode_app(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator
 
     db_url = f"sqlite:///{tmp_path}/header.db"
     from omnigent.db.utils import get_or_create_engine
+    from omnigent.observability import otel as telemetry
     from omnigent.runtime import init as init_runtime
-    from omnigent.runtime import telemetry
     from omnigent.runtime.agent_cache import AgentCache
     from omnigent.runtime.caps import RuntimeCaps
     from omnigent.server.app import create_app
@@ -1836,8 +1836,8 @@ def test_cli_accounts_login_happy_path_stores_token(
     import httpx as _httpx
     from click.testing import CliRunner
 
-    from omnigent import cli_auth
-    from omnigent.cli import cli
+    from omnigent.cli import auth as cli_auth
+    from omnigent.cli.commands import cli
 
     # Redirect $HOME so cli_auth.store_token writes into tmp.
     monkeypatch.setenv("HOME", str(tmp_path))
@@ -1917,7 +1917,7 @@ def test_cli_accounts_login_wrong_password_surfaces_clean_error(
     import httpx as _httpx
     from click.testing import CliRunner
 
-    from omnigent.cli import cli
+    from omnigent.cli.commands import cli
 
     monkeypatch.setenv("HOME", str(tmp_path))
 
@@ -1967,7 +1967,7 @@ def test_cli_accounts_login_network_failure_surfaces_clean_error(
     import httpx as _httpx
     from click.testing import CliRunner
 
-    from omnigent.cli import cli
+    from omnigent.cli.commands import cli
 
     monkeypatch.setenv("HOME", str(tmp_path))
 
@@ -2087,7 +2087,7 @@ def test_setup_writes_loopback_cli_token(
     the in-flight ``omnigent run`` is signed in immediately instead of
     401-ing until the next server boot.
     """
-    from omnigent import cli_auth
+    from omnigent.cli import auth as cli_auth
 
     client = accounts_app_needs_setup
     base_url = "http://localhost:8000"

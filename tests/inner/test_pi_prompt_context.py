@@ -18,9 +18,9 @@ from typing import Any
 
 import pytest
 
-from omnigent.chat import _bundle_agent
-from omnigent.inner import pi_executor
-from omnigent.inner.executor import ExecutorError, TurnComplete
+from omnigent.cli.chat import _bundle_agent
+from omnigent.core.executor import ExecutorError, TurnComplete
+from omnigent.harnesses.pi import executor as pi_executor
 from omnigent.runtime.prompt import build_instructions
 from omnigent.spec import AgentSpec, load
 

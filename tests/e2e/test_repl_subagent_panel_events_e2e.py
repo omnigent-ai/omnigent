@@ -40,7 +40,7 @@ import httpx
 import pytest
 from omnigent_client._sessions import SessionsNamespace
 
-from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN
+from omnigent.util.runner_identity import OMNIGENT_INTERNAL_WS_ORIGIN
 from tests.e2e.conftest import (
     configure_mock_llm,
     create_runner_bound_session,

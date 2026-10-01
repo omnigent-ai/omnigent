@@ -37,7 +37,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from omnigent.harnesses.codex_native import stderr_diagnostics
 from omnigent.harnesses.codex_native.app_server import CodexNativeAppServer
-from omnigent.process_logging import configure_process_logging
+from omnigent.observability.process_logging import configure_process_logging
 
 root = Path(sys.argv[1])
 fail_worker = sys.argv[2] == '1'

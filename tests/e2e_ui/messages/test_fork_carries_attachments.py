@@ -45,7 +45,7 @@ import pytest
 from playwright.sync_api import Page, expect
 
 from omnigent.entities import MessageData, NewConversationItem
-from omnigent.process_logging import process_log_dir
+from omnigent.observability.process_logging import process_log_dir
 from tests.e2e_ui.conftest import (
     _bind_session_runner,
     _server_state,

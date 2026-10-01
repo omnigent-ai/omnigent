@@ -12,7 +12,7 @@ from typing import Any
 
 import httpx
 
-from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
+from omnigent.harnesses.runtime.process_manager import HarnessProcessManager
 from tests.e2e._harness_probes import cli_unavailable_reason
 from tests.harness_bench.profile import BenchProfile
 from tests.harness_bench.runtime_env import bench_creds_skip_reason, resolve_bench_env

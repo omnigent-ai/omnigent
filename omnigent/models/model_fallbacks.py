@@ -164,7 +164,7 @@ _SMART_ROUTING_FALLBACKS: dict[str, StaticModelFallback] = {
     ),
     "codex_catalog_clone_source": StaticModelFallback(
         model_ids=("gpt-5.6-luna",),
-        owner="Codex extended catalog (omnigent.inner.codex_executor)",
+        owner="Codex extended catalog (omnigent.harnesses.codex.executor)",
         provenance="codex's own bundled catalog slug for the cheapest current arm",
         discovery_gap="codex's bundled catalog carries no entry for a gateway-only arm to clone",
     ),

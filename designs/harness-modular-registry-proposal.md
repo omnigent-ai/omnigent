@@ -10,7 +10,7 @@ Omnigent supports **headless / SDK harnesses** as community plugins today (see
 `HarnessContribution` entry point, fills `harness_modules` / `aliases` /
 `install_specs`, and core wires it in generically — because an SDK harness plugs
 in as *pure data*: one import-path string per harness, dispatched through
-`omnigent.runtime.harnesses._HARNESS_MODULES` and `runner/routing.py`.
+`omnigent.harnesses.runtime._HARNESS_MODULES` and `runner/routing.py`.
 
 **Native (terminal / TUI) harnesses are not pluggable.** A native harness wraps
 a real vendor CLI (Claude Code, Codex, Cursor, Pi, Goose, …) in a tmux/PTY or
@@ -20,7 +20,7 @@ editing core in ~10 places. The registry *rejects* any community contribution
 that sets `native_harnesses` or `native_agents`:
 
 ```python
-# omnigent/harness_plugins.py:716
+# omnigent/harnesses/registry.py:716
 if contribution.native_harnesses or contribution.native_agents:
     return (
         f"community harness plugin {entry_point_name!r} registers native terminal "
@@ -39,13 +39,13 @@ The **data model** is done. `NativeCodingAgent` is a frozen dataclass of stable
 wire metadata, contributions carry a tuple of them, and everything downstream
 reads them through registry accessors:
 
-- `omnigent/harness_plugins.py` — `NativeCodingAgent`, `HarnessContribution`
+- `omnigent/harnesses/registry.py` — `NativeCodingAgent`, `HarnessContribution`
   (fields `native_harnesses`, `native_agents`), `native_agents()`,
   `native_harnesses()`.
 - `omnigent/native_coding_agents.py` — indexes the registry rows by
   `agent_name` / `harness` / `wrapper_label` / `terminal_name`.
-- `omnigent/_wrapper_labels.py` — the canonical wrapper-label string constants.
-- `omnigent/harness_aliases.py` — canonicalization (`native-pi` → `pi-native`).
+- `omnigent/harnesses/wrapper_labels.py` — the canonical wrapper-label string constants.
+- `omnigent/harnesses/aliases.py` — canonicalization (`native-pi` → `pi-native`).
 
 Nothing in this proposal changes the *shape* of `NativeCodingAgent`; it adds a
 behavior side-channel and rewrites the dispatch that currently ignores it.
@@ -83,7 +83,7 @@ coupling left to untangle:
 - Plus the 11 `*_NATIVE_TERMINAL_ROLE` imports and the cost-popup bridge-dir
   dispatch (both in `app.py`).
 
-### 2. Native launch — `omnigent/cli.py` (~14.5k lines)
+### 2. Native launch — `omnigent/cli/commands.py` (~14.5k lines)
 
 Each native TUI is a hand-written `@cli.command` (`claude`, `codex`, `opencode`,
 `pi`, `cursor`, `kiro`, `goose`, `hermes`, `antigravity`, `qwen`, `kimi`), each
@@ -93,10 +93,10 @@ generates these.
 
 ### 3. Resume / resume-redirect
 
-- `omnigent/resume_dispatch.py:216` (`_dispatch_wrapper`) — the canonical
+- `omnigent/cli/resume.py:216` (`_dispatch_wrapper`) — the canonical
   11-branch `if native_agent.key == "<x>":` chain, each `import
   run_<x>_native`. Used by `omnigent resume`.
-- `omnigent/chat.py:1057` (`_redirect_native_resume_if_needed`) — a parallel,
+- `omnigent/cli/chat.py:1057` (`_redirect_native_resume_if_needed`) — a parallel,
   partially-covered (6 of 11) resume-redirect keyed on `native_agent.key`, with
   hand-written `_run_<x>_native_resume_redirect` helpers.
 
@@ -122,7 +122,7 @@ each paired with a `_build_<x>_native_bundle()` that imports
   and fork/switch gating.
 - `omnigent/runner/resource_registry.py` — 11 `*_NATIVE_TERMINAL_ROLE`
   constants + the native-role status set.
-- `omnigent/runtime/harnesses/__init__.py:36` — a **dead** `_HARNESS_MODULES`
+- `omnigent/harnesses/runtime/__init__.py:36` — a **dead** `_HARNESS_MODULES`
   literal listing every `<x>-native` module (overwritten at `:152`). Delete.
 
 ### 6. The web mirror — `web/src/lib/`
@@ -141,7 +141,7 @@ identity row; behavior lives in a sibling provider resolved lazily (respecting
 the plugin import rules — `get_contribution()` must stay import-light).
 
 ```python
-# omnigent/harness_plugins.py (new)
+# omnigent/harnesses/registry.py (new)
 @dataclass(frozen=True)
 class NativeHarnessProvider:
     """Import paths for a native harness's lifecycle hooks.
@@ -165,7 +165,7 @@ Add to `HarnessContribution`:
     native_providers: tuple[NativeHarnessProvider, ...] = ()
 ```
 
-And accessors in `omnigent/harness_plugins.py`:
+And accessors in `omnigent/harnesses/registry.py`:
 
 ```python
 def native_providers() -> tuple[NativeHarnessProvider, ...]: ...
@@ -245,7 +245,7 @@ no `if key ==` arm removed yet.
 Done:
 
 - **`cli.py`** ✅ (#3047) — native subcommand bodies moved into
-  `omnigent/cli_native.py` (they already delegate to `run_<x>_native`); `cli.py`
+  `omnigent/cli/native_commands.py` (they already delegate to `run_<x>_native`); `cli.py`
   registers them. `cli.py` is now 9.6k lines; `cli_native.py` 1.3k.
 - **`server/routes/sessions.py`** ✅ (#3097) — split into a facade
   (`sessions.py`, now 7.8k) that star-imports an impl package

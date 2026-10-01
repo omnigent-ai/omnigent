@@ -1,4 +1,4 @@
-"""Tests for :class:`omnigent.inner.cursor_executor.CursorExecutor`.
+"""Tests for :class:`omnigent.harnesses.cursor.executor.CursorExecutor`.
 
 The cursor harness drives the Cursor Python SDK (``cursor-sdk``). The SDK is
 replaced with an injected fake module (so no real bridge subprocess, API key, or
@@ -21,15 +21,7 @@ from typing import Any
 
 import pytest
 
-from omnigent.inner.cursor_executor import (
-    CursorExecutor,
-    UnresolvableCursorModelError,
-    _build_cursor_prompt,
-    _normalize_cursor_usage,
-    _resolve_model,
-    _sdk_message_to_events,
-)
-from omnigent.inner.executor import (
+from omnigent.core.executor import (
     ExecutorError,
     Message,
     ReasoningChunk,
@@ -39,6 +31,14 @@ from omnigent.inner.executor import (
     ToolCallStatus,
     TurnCancelled,
     TurnComplete,
+)
+from omnigent.harnesses.cursor.executor import (
+    CursorExecutor,
+    UnresolvableCursorModelError,
+    _build_cursor_prompt,
+    _normalize_cursor_usage,
+    _resolve_model,
+    _sdk_message_to_events,
 )
 
 
@@ -252,7 +252,7 @@ _CATALOG = [
 
 async def test_catalog_resolution_accepts_served_ids_verbatim() -> None:
     """An id the account catalog serves dispatches unchanged."""
-    from omnigent.inner.cursor_executor import _resolve_model_against_catalog
+    from omnigent.harnesses.cursor.executor import _resolve_model_against_catalog
 
     client = _CatalogClient(_CATALOG)
     for model_id in ("composer-2.5", "claude-opus-4-8", "gpt-5.5"):
@@ -261,7 +261,7 @@ async def test_catalog_resolution_accepts_served_ids_verbatim() -> None:
 
 async def test_catalog_resolution_maps_display_labels_to_ids() -> None:
     """A display label naming exactly one catalog entry maps to its id."""
-    from omnigent.inner.cursor_executor import _resolve_model_against_catalog
+    from omnigent.harnesses.cursor.executor import _resolve_model_against_catalog
 
     client = _CatalogClient(_CATALOG)
     assert await _resolve_model_against_catalog(client, "Composer", "crsr_x") == "composer-2.5"
@@ -269,7 +269,7 @@ async def test_catalog_resolution_maps_display_labels_to_ids() -> None:
 
 
 async def test_catalog_resolution_canonicalizes_case_and_rejects_ambiguous_labels() -> None:
-    from omnigent.inner.cursor_executor import _resolve_model_against_catalog
+    from omnigent.harnesses.cursor.executor import _resolve_model_against_catalog
 
     client = _CatalogClient([*_CATALOG, ("composer-3", "Composer 3")])
     assert await _resolve_model_against_catalog(client, "COMPOSER-2.5", None) == "composer-2.5"
@@ -281,7 +281,7 @@ async def test_catalog_resolution_canonicalizes_case_and_rejects_ambiguous_label
 
 async def test_catalog_resolution_rejects_unknown_ids_with_actionable_error() -> None:
     """A typo'd or unknown id fails loudly, naming the available models."""
-    from omnigent.inner.cursor_executor import _resolve_model_against_catalog
+    from omnigent.harnesses.cursor.executor import _resolve_model_against_catalog
 
     client = _CatalogClient(_CATALOG)
     for bad in ("composr-2.5", "composer-9999", "gpt-not-a-real-model", "my model"):
@@ -293,7 +293,7 @@ async def test_catalog_resolution_rejects_unknown_ids_with_actionable_error() ->
 
 async def test_catalog_resolution_never_blocks_auto_select_or_degrades_loudly() -> None:
     """auto-smart skips validation; a failing listing degrades, not blocks."""
-    from omnigent.inner.cursor_executor import _resolve_model_against_catalog
+    from omnigent.harnesses.cursor.executor import _resolve_model_against_catalog
 
     failing = _CatalogClient(exc=RuntimeError("listing unavailable"))
     assert await _resolve_model_against_catalog(failing, "auto-smart", "crsr_x") == "auto-smart"
@@ -312,7 +312,7 @@ def test_resolve_model_warns_when_dropping_a_pinned_model(
     otherwise a user who pinned a non-Cursor model has no idea it was ignored."""
     import logging
 
-    with caplog.at_level(logging.WARNING, logger="omnigent.inner.cursor_executor"):
+    with caplog.at_level(logging.WARNING, logger="omnigent.harnesses.cursor.executor"):
         assert _resolve_model("databricks-claude-opus-4-8") == "auto-smart"
     assert any(
         r.levelno == logging.WARNING and "not a Cursor model" in r.getMessage()
@@ -320,7 +320,7 @@ def test_resolve_model_warns_when_dropping_a_pinned_model(
     )
     # No warning when there was no explicit model to honor.
     caplog.clear()
-    with caplog.at_level(logging.WARNING, logger="omnigent.inner.cursor_executor"):
+    with caplog.at_level(logging.WARNING, logger="omnigent.harnesses.cursor.executor"):
         assert _resolve_model(None) == "auto-smart"
     assert not caplog.records
 
@@ -600,9 +600,9 @@ async def test_model_selection_through_spawn_env_and_harness_request(
 ) -> None:
     from unittest.mock import AsyncMock
 
-    from omnigent.inner.cursor_harness import _build_cursor_executor
-    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
-    from omnigent.runtime.harnesses._scaffold import PolicyVerdictPayload, TurnContext
+    from omnigent.harnesses.cursor.harness import _build_cursor_executor
+    from omnigent.harnesses.runtime._executor_adapter import ExecutorAdapter
+    from omnigent.harnesses.runtime._scaffold import PolicyVerdictPayload, TurnContext
     from omnigent.runtime.workflow import _build_cursor_spawn_env
     from omnigent.server.schemas import CreateResponseRequest
     from omnigent.spec.types import AgentSpec, ApiKeyAuth, ExecutorSpec
@@ -650,7 +650,7 @@ async def test_rejected_model_closes_bridge_and_same_session_recovers(
     monkeypatch: pytest.MonkeyPatch,
     start_with_valid_model: bool,
 ) -> None:
-    from omnigent.inner.executor import ExecutorConfig
+    from omnigent.core.executor import ExecutorConfig
 
     scripts = [
         {"messages": [_assistant("ok")], "result": "ok"} for _ in range(1 + start_with_valid_model)
@@ -698,7 +698,7 @@ async def test_usage_attributed_to_resolved_id_not_display_label(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Usage/cost records the catalog-resolved id, not the requested label."""
-    from omnigent.inner.executor import ExecutorConfig
+    from omnigent.core.executor import ExecutorConfig
 
     turn_ended = SimpleNamespace(
         type="turn-ended",
@@ -729,7 +729,7 @@ async def test_usage_attributed_to_resolved_id_not_display_label(
 async def test_equivalent_model_selections_reuse_agent(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from omnigent.inner.executor import ExecutorConfig
+    from omnigent.core.executor import ExecutorConfig
 
     selections = ["Composer", "Composer 2.5", "COMPOSER-2.5", "composer-2.5", "Composer"]
     scripts = [{"messages": [_assistant("ok")], "result": "ok"} for _ in selections]
@@ -753,7 +753,7 @@ async def test_equivalent_model_selections_reuse_agent(
 
 async def test_session_restart_on_model_change(monkeypatch: pytest.MonkeyPatch) -> None:
     """Switching to a genuinely different model rebuilds the agent."""
-    from omnigent.inner.executor import ExecutorConfig
+    from omnigent.core.executor import ExecutorConfig
 
     scripts = [
         {"messages": [_assistant("one")], "result": "one"},
@@ -992,7 +992,7 @@ async def test_custom_tool_execute_flags_nested_list_error_with_iserror() -> Non
 async def test_custom_tool_execute_times_out_to_iserror(monkeypatch: pytest.MonkeyPatch) -> None:
     """A tool that never completes must not block the daemon thread forever — the
     bounded wait surfaces a timeout tool error instead of hanging."""
-    monkeypatch.setattr("omnigent.inner.cursor_executor._TOOL_CALL_TIMEOUT_S", 0.05)
+    monkeypatch.setattr("omnigent.harnesses.cursor.executor._TOOL_CALL_TIMEOUT_S", 0.05)
 
     async def slow(name: str, args: dict[str, Any]) -> Any:
         await asyncio.sleep(30)
@@ -1366,7 +1366,7 @@ async def test_run_turn_captures_usage_from_turn_ended_update(
 
     notified: list[dict[str, Any]] = []
     monkeypatch.setattr(
-        "omnigent.inner.cursor_executor._notify_usage_from_dict",
+        "omnigent.harnesses.cursor.executor._notify_usage_from_dict",
         lambda *, model, usage: notified.append({"model": model, "usage": usage}),
     )
 
@@ -1404,7 +1404,7 @@ async def test_run_turn_usage_none_when_no_turn_ended_update(
 
     notified: list[dict[str, Any]] = []
     monkeypatch.setattr(
-        "omnigent.inner.cursor_executor._notify_usage_from_dict",
+        "omnigent.harnesses.cursor.executor._notify_usage_from_dict",
         lambda *, model, usage: notified.append({"model": model, "usage": usage}),
     )
 
@@ -2007,14 +2007,14 @@ def test_cursor_policy_hook_allow(monkeypatch: pytest.MonkeyPatch) -> None:
 
     stdin_data = json.dumps({"tool_name": "Bash", "tool_input": {"command": "ls"}})
 
-    from omnigent.inner import cursor_policy_hook
+    from omnigent.harnesses.cursor import policy_hook as cursor_policy_hook
 
     stdout = io.StringIO()
     with (
         patch.object(sys, "stdin", io.StringIO(stdin_data)),
         patch.object(sys, "stdout", stdout),
         patch(
-            "omnigent.native.native_policy_hook.post_evaluate_with_retry",
+            "omnigent.harnesses.native.policy_hook.post_evaluate_with_retry",
             return_value=_fake_evaluate_response("POLICY_ACTION_ALLOW"),
         ),
     ):
@@ -2034,14 +2034,14 @@ def test_cursor_policy_hook_deny(monkeypatch: pytest.MonkeyPatch) -> None:
 
     stdin_data = json.dumps({"tool_name": "Bash", "tool_input": {"command": "rm -rf /"}})
 
-    from omnigent.inner import cursor_policy_hook
+    from omnigent.harnesses.cursor import policy_hook as cursor_policy_hook
 
     stdout = io.StringIO()
     with (
         patch.object(sys, "stdin", io.StringIO(stdin_data)),
         patch.object(sys, "stdout", stdout),
         patch(
-            "omnigent.native.native_policy_hook.post_evaluate_with_retry",
+            "omnigent.harnesses.native.policy_hook.post_evaluate_with_retry",
             return_value=_fake_evaluate_response("POLICY_ACTION_DENY", "dangerous command"),
         ),
     ):
@@ -2063,14 +2063,14 @@ def test_cursor_policy_hook_network_error_fails_closed(monkeypatch: pytest.Monke
 
     stdin_data = json.dumps({"tool_name": "Bash", "tool_input": {"command": "ls"}})
 
-    from omnigent.inner import cursor_policy_hook
+    from omnigent.harnesses.cursor import policy_hook as cursor_policy_hook
 
     stdout = io.StringIO()
     with (
         patch.object(sys, "stdin", io.StringIO(stdin_data)),
         patch.object(sys, "stdout", stdout),
         patch(
-            "omnigent.native.native_policy_hook.post_evaluate_with_retry",
+            "omnigent.harnesses.native.policy_hook.post_evaluate_with_retry",
             return_value=(None, "connection error: simulated"),
         ),
     ):
@@ -2092,7 +2092,7 @@ def test_cursor_policy_hook_malformed_fails_closed(monkeypatch: pytest.MonkeyPat
 
     stdin_data = json.dumps({"tool_name": "Bash", "tool_input": {"command": "ls"}})
 
-    from omnigent.inner import cursor_policy_hook
+    from omnigent.harnesses.cursor import policy_hook as cursor_policy_hook
 
     def _raise() -> dict[str, object]:
         raise ValueError("not json")
@@ -2105,7 +2105,7 @@ def test_cursor_policy_hook_malformed_fails_closed(monkeypatch: pytest.MonkeyPat
         patch.object(sys, "stdin", io.StringIO(stdin_data)),
         patch.object(sys, "stdout", stdout),
         patch(
-            "omnigent.native.native_policy_hook.post_evaluate_with_retry",
+            "omnigent.harnesses.native.policy_hook.post_evaluate_with_retry",
             return_value=(resp, None),
         ),
     ):
@@ -2125,7 +2125,7 @@ def test_cursor_policy_hook_no_env_fails_open(monkeypatch: pytest.MonkeyPatch) -
     monkeypatch.delenv("_OMNIGENT_SERVER_URL", raising=False)
     monkeypatch.delenv("_OMNIGENT_SESSION_ID", raising=False)
 
-    from omnigent.inner import cursor_policy_hook
+    from omnigent.harnesses.cursor import policy_hook as cursor_policy_hook
 
     stdout = io.StringIO()
     with (
@@ -2148,14 +2148,14 @@ def test_cursor_policy_hook_ask_fails_closed(monkeypatch: pytest.MonkeyPatch) ->
 
     stdin_data = json.dumps({"tool_name": "Write", "tool_input": {}})
 
-    from omnigent.inner import cursor_policy_hook
+    from omnigent.harnesses.cursor import policy_hook as cursor_policy_hook
 
     stdout = io.StringIO()
     with (
         patch.object(sys, "stdin", io.StringIO(stdin_data)),
         patch.object(sys, "stdout", stdout),
         patch(
-            "omnigent.native.native_policy_hook.post_evaluate_with_retry",
+            "omnigent.harnesses.native.policy_hook.post_evaluate_with_retry",
             return_value=_fake_evaluate_response("POLICY_ACTION_ASK", "needs approval"),
         ),
     ):
@@ -2176,14 +2176,14 @@ def test_cursor_policy_hook_uses_long_read_timeout(monkeypatch: pytest.MonkeyPat
 
     stdin_data = json.dumps({"tool_name": "Bash", "tool_input": {}})
 
-    from omnigent.inner import cursor_policy_hook
+    from omnigent.harnesses.cursor import policy_hook as cursor_policy_hook
 
     mock_fn = MagicMock(return_value=_fake_evaluate_response("POLICY_ACTION_ALLOW"))
     stdout = io.StringIO()
     with (
         patch.object(sys, "stdin", io.StringIO(stdin_data)),
         patch.object(sys, "stdout", stdout),
-        patch("omnigent.native.native_policy_hook.post_evaluate_with_retry", mock_fn),
+        patch("omnigent.harnesses.native.policy_hook.post_evaluate_with_retry", mock_fn),
     ):
         cursor_policy_hook.main()
 

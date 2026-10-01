@@ -18,7 +18,7 @@ from click.testing import CliRunner
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from omnigent.cli import cli
+from omnigent.cli.commands import cli
 from omnigent.db.db_models import (
     SqlAccountToken,
     SqlComment,

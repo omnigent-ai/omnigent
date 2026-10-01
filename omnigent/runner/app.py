@@ -45,14 +45,6 @@ import httpx
 from fastapi import FastAPI, HTTPException, Query, Request, WebSocket
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
-from omnigent._platform import normalize_interactive_shells
-from omnigent.acp_cli_harnesses import ACP_CLI_HARNESSES
-from omnigent.debug_logging import (
-    debug_event,
-    phase_scope,
-    runner_primary_session_id,
-    set_current_session_id,
-)
 from omnigent.entities.session_resources import (
     DEFAULT_ENVIRONMENT_ID,
     SessionResourceView,
@@ -61,36 +53,39 @@ from omnigent.entities.session_resources import (
     terminal_resource_id,
 )
 from omnigent.errors import ErrorCategory, ErrorCode, ErrorImpact, ErrorPhase, OmnigentError
-from omnigent.harness_aliases import (
+from omnigent.harnesses.acp.cli_harnesses import ACP_CLI_HARNESSES
+from omnigent.harnesses.aliases import (
     canonicalize_harness,
     is_native_harness,
     native_terminal_name,
 )
-from omnigent.harness_availability import CODEX_CANONICAL_HARNESSES
-from omnigent.harness_capabilities import InstructionDelivery
-from omnigent.harness_plugins import (
+from omnigent.harnesses.availability import CODEX_CANONICAL_HARNESSES
+from omnigent.harnesses.capabilities import InstructionDelivery
+from omnigent.harnesses.native.coding_agents import (
+    native_coding_agent_for_agent_name,
+    native_coding_agent_for_harness,
+    native_coding_agent_for_terminal_name,
+)
+from omnigent.harnesses.registry import (
     harness_capabilities,
     load_object,
     model_env_keys,
     spawn_env_builders,
 )
-from omnigent.inner.native_attachments import (
-    framework_notice_block,
-    has_unresolved_file_id,
-    resolve_file_id_block,
-)
+from omnigent.harnesses.runtime.process_manager import HarnessProcessManager, NoLiveHarnessError
 from omnigent.llms.summarize import (
     build_summarization_input,
     build_summarization_prompt,
     extract_summary_text,
 )
-from omnigent.native.native_coding_agents import (
-    native_coding_agent_for_agent_name,
-    native_coding_agent_for_harness,
-    native_coding_agent_for_terminal_name,
+from omnigent.observability.debug_logging import (
+    debug_event,
+    phase_scope,
+    runner_primary_session_id,
+    set_current_session_id,
 )
+from omnigent.observability.process_logging import process_log_reference
 from omnigent.policies.types import FAIL_CLOSED_PHASES
-from omnigent.process_logging import process_log_reference
 from omnigent.runner import native as _native
 from omnigent.runner import pending_approvals
 from omnigent.runner.background_titles import (
@@ -177,7 +172,6 @@ from omnigent.runner.subagent_routing import (
     routing_class_from_snapshot,
     session_routing_class,
 )
-from omnigent.runtime.harnesses.process_manager import HarnessProcessManager, NoLiveHarnessError
 from omnigent.runtime.prompt import (
     build_instructions,
     build_instructions_nullable,
@@ -195,7 +189,13 @@ from omnigent.tools.builtins.load_skill import (
     find_skill_by_name,
     format_skill_meta_text,
 )
+from omnigent.util.attachments import (
+    framework_notice_block,
+    has_unresolved_file_id,
+    resolve_file_id_block,
+)
 from omnigent.util.json_types import JsonObject as _JsonObject
+from omnigent.util.portability import normalize_interactive_shells
 
 _logger = logging.getLogger(__name__)
 
@@ -965,7 +965,7 @@ async def _complete_acp_subagent_child(
     :param title: The sub-agent's display name, used as the summary message's
         author; falls back to *child_key* when empty.
     """
-    from omnigent.native._native_post_delivery import post_external_session_status
+    from omnigent.harnesses.native.post_delivery import post_external_session_status
 
     try:
         child_id = await asyncio.wait_for(
@@ -2892,7 +2892,7 @@ def _require_full_native_lock_coverage(
     forced into this built-in dispatch (that would turn a localized per-launch
     failure into the whole runner failing to construct).
     """
-    from omnigent.harness_plugins import _BUILTIN_NATIVE_PROVIDERS
+    from omnigent.harnesses.registry import _BUILTIN_NATIVE_PROVIDERS
 
     missing = {provider.key for provider in _BUILTIN_NATIVE_PROVIDERS} - set(dispatch)
     if missing:
@@ -2969,7 +2969,7 @@ def create_runner_app(
     _shutting_down = asyncio.Event()
     app.state.shutting_down = _shutting_down
 
-    from omnigent.runtime import telemetry
+    from omnigent.observability import otel as telemetry
 
     telemetry.instrument_fastapi_app(app)
 
@@ -5591,7 +5591,7 @@ def create_runner_app(
         sign-in address or hold back the "signed in" notice. With the harness
         known this is its one pane; otherwise any native agent pane.
         """
-        from omnigent.harness_plugins import native_agents
+        from omnigent.harnesses.registry import native_agents
 
         harness = _session_harness_name(conv_id)
         names = {agent.terminal_name for agent in native_agents() if agent.harness == harness}
@@ -6239,7 +6239,7 @@ def create_runner_app(
         # the same channel /compact uses — reading the popup to find the preset's
         # menu digit (row positions vary by codex build/platform, so we discover
         # it rather than hardcode it) and confirming Codex echoed the switch.
-        from omnigent.codex_approval_modes import codex_permission_preset
+        from omnigent.harnesses.codex_native.approval_modes import codex_permission_preset
 
         preset = codex_permission_preset(mode)
         if preset is None:
@@ -6735,14 +6735,14 @@ def create_runner_app(
             stored_claude_catalog_rows,
             stored_claude_picker_values,
         )
-        from omnigent.inference_config import (
-            binding_for_harness,
-            load_runtime_inference_config,
-            resolve_bound_model,
-        )
         from omnigent.models.claude_model_vocabulary import (
             claude_model_command_arg,
             picker_command_values,
+        )
+        from omnigent.models.inference_config import (
+            binding_for_harness,
+            load_runtime_inference_config,
+            resolve_bound_model,
         )
 
         if model is None or not model.strip():
@@ -7242,7 +7242,7 @@ def create_runner_app(
             bridge_dir_for_bridge_id,
             update_model_override,
         )
-        from omnigent.inference_config import (
+        from omnigent.models.inference_config import (
             binding_for_harness,
             load_runtime_inference_config,
             resolve_bound_model,
@@ -7374,11 +7374,11 @@ def create_runner_app(
         # Returns True once a digit is pressed for *label* (from the live popup,
         # or its conventional position on fallback); False when the popup was read
         # but lists no row for *label*.
-        from omnigent.codex_approval_modes import (
+        from omnigent.harnesses.claude_native.bridge import _capture_pane, _run_tmux
+        from omnigent.harnesses.codex_native.approval_modes import (
             CODEX_NATIVE_PERMISSION_PRESETS,
             codex_permissions_menu,
         )
-        from omnigent.harnesses.claude_native.bridge import _capture_pane, _run_tmux
 
         # Reset to a clean composer so the command submits: close any stray
         # menu/popup, then clear the line. C-u also wipes any text the TUI user
@@ -7443,8 +7443,10 @@ def create_runner_app(
         return True
 
     def _codex_permission_mode_confirmed(socket_path: str, target: str, label: str) -> bool:
-        from omnigent.codex_approval_modes import codex_permission_switch_confirmed
         from omnigent.harnesses.claude_native.bridge import _capture_pane
+        from omnigent.harnesses.codex_native.approval_modes import (
+            codex_permission_switch_confirmed,
+        )
 
         deadline = time.monotonic() + _CODEX_PERMISSION_CONFIRM_BUDGET_S
         while True:
@@ -7647,7 +7649,7 @@ def create_runner_app(
         message: str,
         policy_name: str | None = None,
     ) -> Response:
-        from omnigent.native.native_cost_popup import launch_cost_popup
+        from omnigent.harnesses.native.cost_popup import launch_cost_popup
 
         registry = resource_registry.terminal_registry
         instance = registry.get(conv_id, "codex", "main") if registry is not None else None
@@ -7681,7 +7683,7 @@ def create_runner_app(
         message: str,
         policy_name: str | None = None,
     ) -> Response:
-        from omnigent.native.native_cost_popup import launch_cost_popup
+        from omnigent.harnesses.native.cost_popup import launch_cost_popup
 
         registry = resource_registry.terminal_registry
         instance = registry.get(conv_id, "opencode", "main") if registry is not None else None
@@ -7714,7 +7716,7 @@ def create_runner_app(
         message: str,
         policy_name: str | None = None,
     ) -> Response:
-        from omnigent.native.native_cost_popup import launch_blocked_notice
+        from omnigent.harnesses.native.cost_popup import launch_blocked_notice
 
         registry = resource_registry.terminal_registry
         instance = registry.get(conv_id, "opencode", "main") if registry is not None else None
@@ -7741,7 +7743,7 @@ def create_runner_app(
         return Response(status_code=204)
 
     async def _native_cost_popup_config_file(conv_id: str, harness: str) -> Path:
-        from omnigent.cli_auth import databricks_request_headers
+        from omnigent.cli.auth import databricks_request_headers
         from omnigent.harnesses.opencode_native.bridge import write_cost_popup_config
         from omnigent.runner._entry import _make_auth_token_factory
 
@@ -7781,7 +7783,7 @@ def create_runner_app(
         harness = _session_harness_name(conv_id)
         if harness not in ("claude-native", "codex-native", "opencode-native"):
             return
-        from omnigent.native.native_cost_popup import launch_cost_popup, wait_for_tmux_client
+        from omnigent.harnesses.native.cost_popup import launch_cost_popup, wait_for_tmux_client
 
         attached = await asyncio.to_thread(
             wait_for_tmux_client, socket_path, tmux_target, timeout_s=5.0
@@ -11061,7 +11063,7 @@ def create_runner_app(
         :param agent_spec: Agent spec for the session, if any.
         :returns: JSON-ready ``{"unconfined": bool, "roots": [...]}``.
         """
-        from omnigent.inner.sandbox import (
+        from omnigent.sandbox.core import (
             ReachableRoot,
             is_unconfined,
             reach_payload,
@@ -11312,7 +11314,7 @@ def create_runner_app(
             if _ensure_result is not None:
                 return _ensure_result
 
-        from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
+        from omnigent.core.datamodel import OSEnvSpec, TerminalEnvSpec
 
         cwd_override = body.get("cwd")
         sandbox_override = body.get("sandbox")
@@ -13747,7 +13749,7 @@ def create_runner_app(
         and hasattr(_pane_reaper_registry, "native_panes")
     ):
         from omnigent.harnesses.claude_native.bridge import approval_wait_is_fresh
-        from omnigent.native.native_cost_popup import (
+        from omnigent.harnesses.native.cost_popup import (
             _tmux_last_client_input_at,
             _tmux_window_activity_at,
         )
@@ -13980,7 +13982,7 @@ _HARNESS_MODEL_ENV_KEY: dict[str, str] = {
     # it because it is a native harness.
     "antigravity": "HARNESS_ANTIGRAVITY_MODEL",
     # Kimi reads ``HARNESS_KIMI_MODEL`` in
-    # :mod:`omnigent.inner.kimi_executor`; without this mapping a per-session
+    # :mod:`omnigent.harnesses.kimi.executor`; without this mapping a per-session
     # ``/model`` override would silently drop on the kimi harness path.
     "kimi": "HARNESS_KIMI_MODEL",
     "qwen": "HARNESS_QWEN_MODEL",
@@ -14094,7 +14096,10 @@ def _build_spawn_env_from_spec(
 
     validate_copy_on_write_harness(getattr(spec, "os_env", None), harness)
     effective_spec = spec
-    from omnigent.inference_config import load_runtime_inference_config, parse_inference_config
+    from omnigent.models.inference_config import (
+        load_runtime_inference_config,
+        parse_inference_config,
+    )
 
     has_inference_bindings = bool(parse_inference_config(load_runtime_inference_config()))
     if has_inference_bindings and dataclasses.is_dataclass(spec):
@@ -14214,7 +14219,10 @@ def _build_spawn_env_from_spec(
         return None
 
     if env is not None:
-        from omnigent.inner.agent_env import desktop_session_passthrough, strip_desktop_session_env
+        from omnigent.environments.agent_env import (
+            desktop_session_passthrough,
+            strip_desktop_session_env,
+        )
 
         env = strip_desktop_session_env(env)
         env.update(desktop_session_passthrough(effective_spec.os_env))
@@ -14254,7 +14262,7 @@ def _build_spawn_env_from_spec(
             # bundled catalog has no entry for, so the session replaces that
             # catalog. Plain sessions get nothing here and never pay the
             # ``codex debug models`` probe.
-            from omnigent.inner.codex_executor import codex_extended_catalog_env
+            from omnigent.harnesses.codex.executor import codex_extended_catalog_env
 
             env.update(
                 codex_extended_catalog_env(session_routing_class(session_id).routing_enabled)
@@ -14345,7 +14353,7 @@ def _apply_sandbox_override_from_verdict(
     :param verdict_data: The ``PolicyVerdict.data`` payload, expected
         to be a dict with ``arguments.sandbox``.
     """
-    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+    from omnigent.core.datamodel import OSEnvSandboxSpec, OSEnvSpec
 
     if not isinstance(verdict_data, Mapping):
         return

@@ -164,8 +164,8 @@ try:
 
     import uvicorn
 
+    from omnigent.observability import otel as telemetry
     from omnigent.runtime import init as init_runtime
-    from omnigent.runtime import telemetry
     from omnigent.runtime.agent_cache import AgentCache
     from omnigent.runtime.caps import RuntimeCaps
     from omnigent.server.app import create_app

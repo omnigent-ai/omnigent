@@ -17,9 +17,9 @@ import httpx
 import yaml
 from fastapi import APIRouter, Request, Response, status
 
-from omnigent.debug_logging import add_audit_attrs
 from omnigent.entities import Agent
 from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.observability.debug_logging import add_audit_attrs
 from omnigent.runtime import session_stream
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.auth import LEVEL_OWNER, LEVEL_READ, AuthProvider, local_single_user_enabled

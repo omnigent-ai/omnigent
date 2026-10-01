@@ -19,7 +19,7 @@ echo and a ``◆ <model>`` header — the legacy ``You>`` / ``Agent>``
 banners were removed in the prompt-toolkit rewrite.
 
 **What breaks if this fails:**
-- ``omnigent.cli._run_agent`` REPL entrypoint stops booting
+- ``omnigent.cli.commands._run_agent`` REPL entrypoint stops booting
   under a PTY (prompt-toolkit layout errors, terminal-type
   handling regression).
 - The REPL stops echoing the submitted prompt with its ``❯``

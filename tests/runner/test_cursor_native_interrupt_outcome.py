@@ -17,7 +17,7 @@ from omnigent.harnesses.cursor_native import bridge
 from omnigent.harnesses.cursor_native import forwarder as fwd
 from omnigent.harnesses.cursor_native import status as cursor_status
 from omnigent.runner import app as runner_app
-from omnigent.server.routes._sessions.orchestration import (
+from omnigent.server.routes.sessions.orchestration import (
     _enrich_terminal_status_with_subagent_output,
 )
 from omnigent.spec.types import AgentSpec, ExecutorSpec

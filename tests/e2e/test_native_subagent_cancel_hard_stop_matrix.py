@@ -26,7 +26,7 @@ from typing import Any
 import httpx
 import pytest
 
-from omnigent._wrapper_labels import (
+from omnigent.harnesses.wrapper_labels import (
     CLAUDE_NATIVE_WRAPPER_VALUE,
     CURSOR_NATIVE_WRAPPER_VALUE,
     WRAPPER_LABEL_KEY,

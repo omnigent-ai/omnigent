@@ -9,7 +9,7 @@ deterministic and needs no real credentials.
 - ``omnigent.loader`` stops applying CLI ``--model`` as a
   fallback when the YAML omits ``executor.model``.
 - The default harness selection path regresses.
-- ``omnigent.cli._run_agent`` for the ``-p`` one-shot path
+- ``omnigent.cli.commands._run_agent`` for the ``-p`` one-shot path
   stops printing the assistant text on turn complete.
 """
 

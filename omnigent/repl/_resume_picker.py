@@ -44,24 +44,12 @@ if TYPE_CHECKING:
     from omnigent.entities.conversation import ConversationItem
     from omnigent.stores.conversation_store import ConversationStore
 
-from omnigent._terminal_picker_theme import (
+from omnigent.cli.picker_theme import (
     PICKER_ACCENT as _ACCENT,
 )
-from omnigent._terminal_picker_theme import (
+from omnigent.cli.picker_theme import (
     PICKER_MUTED as _MUTED,
 )
-
-# Wrapper label sentinel — single source of truth in
-# ``omnigent._wrapper_labels``. Imported here so the picker module
-# stays decoupled from the heavy ``claude_native`` import graph (tmux
-# / websocket code) while still rendering the right badge.
-from omnigent._wrapper_labels import (
-    CLAUDE_NATIVE_WRAPPER_VALUE as _CLAUDE_NATIVE_WRAPPER_LABEL_VALUE,
-)
-from omnigent._wrapper_labels import (
-    WRAPPER_LABEL_KEY as _CLAUDE_NATIVE_WRAPPER_LABEL_KEY,
-)
-from omnigent.harness_plugins import CODEX_NATIVE_CODING_AGENT
 
 # Client-side persistent launch state. The picker reads this per row
 # to render workspace metadata for native wrapper sessions. Decoupled
@@ -69,7 +57,19 @@ from omnigent.harness_plugins import CODEX_NATIVE_CODING_AGENT
 # tmux / websocket dependencies.
 from omnigent.harnesses.claude_native.state import read_launch_state as _read_claude_launch_state
 from omnigent.harnesses.codex_native.state import read_launch_state as _read_codex_launch_state
-from omnigent.native.native_coding_agents import native_coding_agent_for_wrapper_label
+from omnigent.harnesses.native.coding_agents import native_coding_agent_for_wrapper_label
+from omnigent.harnesses.registry import CODEX_NATIVE_CODING_AGENT
+
+# Wrapper label sentinel — single source of truth in
+# ``omnigent.harnesses.wrapper_labels``. Imported here so the picker module
+# stays decoupled from the heavy ``claude_native`` import graph (tmux
+# / websocket code) while still rendering the right badge.
+from omnigent.harnesses.wrapper_labels import (
+    CLAUDE_NATIVE_WRAPPER_VALUE as _CLAUDE_NATIVE_WRAPPER_LABEL_VALUE,
+)
+from omnigent.harnesses.wrapper_labels import (
+    WRAPPER_LABEL_KEY as _CLAUDE_NATIVE_WRAPPER_LABEL_KEY,
+)
 
 # Page size for the paginated picker.
 # Small enough that a 24-line terminal shows the whole page; big enough

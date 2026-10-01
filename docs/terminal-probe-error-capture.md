@@ -62,7 +62,7 @@ import asyncio
 import logging
 import tempfile
 from pathlib import Path
-from omnigent.inner.terminal import TerminalInstance
+from omnigent.terminals.terminal import TerminalInstance
 
 async def main():
     logging.basicConfig(level=logging.ERROR)

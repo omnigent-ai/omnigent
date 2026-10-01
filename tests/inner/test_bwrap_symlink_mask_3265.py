@@ -15,8 +15,8 @@ import subprocess
 
 import pytest
 
-from omnigent.inner.bwrap_sandbox import _dotfile_and_symlink_mask_args
-from omnigent.inner.sandbox import SandboxPolicy
+from omnigent.sandbox.bwrap import _dotfile_and_symlink_mask_args
+from omnigent.sandbox.core import SandboxPolicy
 
 _BWRAP = shutil.which("bwrap")
 

@@ -5,7 +5,7 @@ servers and host daemons running after the suite exits":
 
 1. run pytest on a CLI test that spawns a real detached Omnigent child,
 2. pytest exits (green) and removes its temp ``OMNIGENT_DATA_DIR``,
-3. ``ps`` still shows ``omnigent.host._daemon_entry`` / ``omnigent.cli
+3. ``ps`` still shows ``omnigent.host._daemon_entry`` / ``omnigent.cli.commands
    server`` / ``omnigent.runner._zygote`` processes spawned by the run —
    orphans that squat port 6767 (so a later ``omni start`` silently falls
    back to a random port) and keep serving with their database directory
@@ -66,12 +66,12 @@ import os
 
 from click.testing import CliRunner
 
-from omnigent.cli import cli
+from omnigent.cli.commands import cli
 
 
 def test_claude_command_spawns_detached_host_daemon(monkeypatch) -> None:
     captured = {}
-    monkeypatch.setattr("omnigent.cli._load_effective_config", dict)
+    monkeypatch.setattr("omnigent.cli.commands._load_effective_config", dict)
     monkeypatch.setattr(
         "omnigent.harnesses.claude_native.main.run_claude_native",
         lambda **kwargs: captured.update(kwargs),
@@ -190,7 +190,7 @@ def test_pytest_run_leaves_no_omnigent_processes(tmp_path: Path) -> None:
     from the run is still alive. Without session-teardown reaping this
     FAILS: the run leaves a ``python -m omnigent.host._daemon_entry``
     orphan behind (and, on runs that exercise the local-backend path,
-    ``omnigent.cli server`` / ``omnigent.runner._zygote`` orphans too) —
+    ``omnigent.cli.commands server`` / ``omnigent.runner._zygote`` orphans too) —
     free to squat port 6767 and to keep serving after its temp data dir
     is deleted.
     """

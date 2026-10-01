@@ -56,10 +56,10 @@ from pathlib import Path
 import httpx
 import pytest
 
-from omnigent.harness_startup_config import resolve_harness_path
+from omnigent.core.executor import ExecutorError
 from omnigent.harnesses.kimi_native.bridge import write_tmux_target
-from omnigent.inner.executor import ExecutorError
-from omnigent.inner.kimi_native_executor import KimiNativeExecutor
+from omnigent.harnesses.kimi_native.executor import KimiNativeExecutor
+from omnigent.harnesses.startup_config import resolve_harness_path
 from tests.e2e.conftest import (
     configure_mock_llm,
     release_mock_gate,

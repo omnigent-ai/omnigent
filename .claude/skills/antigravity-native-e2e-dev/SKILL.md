@@ -1,6 +1,6 @@
 ---
 name: antigravity-native-e2e-dev
-description: Spin up a live local Omnigent server + runner and exercise the native Antigravity (agy) TUI harness (antigravity-native) end-to-end — launch the real `agy` CLI via `omnigent antigravity`, drive turns through the web UI, smoke-test, and bug-bash. Load when developing, testing, or debugging the antigravity-native harness (omnigent/inner/antigravity_native_executor.py, omnigent/antigravity_native.py, antigravity_native_bridge.py, antigravity_native_rpc.py, antigravity_native_reader.py, antigravity_native_launch.py) or its agy launch / RPC mirror / tmux delivery / OAuth / MCP-relay behavior. NOT the in-process `antigravity` Gemini SDK harness.
+description: Spin up a live local Omnigent server + runner and exercise the native Antigravity (agy) TUI harness (antigravity-native) end-to-end — launch the real `agy` CLI via `omnigent antigravity`, drive turns through the web UI, smoke-test, and bug-bash. Load when developing, testing, or debugging the antigravity-native harness (omnigent/harnesses/antigravity_native/executor.py, omnigent/antigravity_native.py, antigravity_native_bridge.py, antigravity_native_rpc.py, antigravity_native_reader.py, antigravity_native_launch.py) or its agy launch / RPC mirror / tmux delivery / OAuth / MCP-relay behavior. NOT the in-process `antigravity` Gemini SDK harness.
 ---
 
 # Antigravity native harness: end-to-end dev & testing (local server/runner)
@@ -223,10 +223,10 @@ Key facts:
 
 ## Code & tests
 
-- **Executor (write path — types into the TUI):** `omnigent/inner/antigravity_native_executor.py`
-- **Harness wrap (`harness: antigravity-native`):** `omnigent/inner/antigravity_native_harness.py`
+- **Executor (write path — types into the TUI):** `omnigent/harnesses/antigravity_native/executor.py`
+- **Harness wrap (`harness: antigravity-native`):** `omnigent/harnesses/antigravity_native/harness.py`
 - **CLI launch / daemon-runner / tmux attach:** `omnigent/antigravity_native.py`
-  (`run_antigravity_native`); CLI command `antigravity(...)` in `omnigent/cli.py`
+  (`run_antigravity_native`); CLI command `antigravity(...)` in `omnigent/cli/commands.py`
 - **agy argv / auth-mode / permission flag:** `omnigent/antigravity_native_launch.py`
 - **Bridge (state, tmux delivery, isolated HOME, MCP relay):** `omnigent/antigravity_native_bridge.py`
 - **connect-RPC client (port discovery, send/cancel/interaction):** `omnigent/antigravity_native_rpc.py`

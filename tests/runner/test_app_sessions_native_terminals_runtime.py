@@ -369,10 +369,10 @@ async def test_auto_create_codex_terminal_keeps_loop_responsive_during_profile_r
         lambda _bridge_dir: None,
     )
     monkeypatch.setattr(
-        "omnigent.inner.codex_executor.populate_codex_skills_from_bundle",
+        "omnigent.harnesses.codex.executor.populate_codex_skills_from_bundle",
         lambda *_args, **_kwargs: None,
     )
-    monkeypatch.setattr("omnigent.inner.codex_executor._find_codex_cli", lambda: "codex")
+    monkeypatch.setattr("omnigent.harnesses.codex.executor._find_codex_cli", lambda: "codex")
     monkeypatch.setattr(codex_app_mod, "_find_codex_cli", lambda: "codex")
     monkeypatch.setattr(codex_app_mod, "_clean_codex_env", dict)
     monkeypatch.setattr(codex_app_mod, "_databricks_gateway_host", resolve_host)
@@ -436,8 +436,8 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
     :param monkeypatch: Pytest monkeypatch fixture.
     :returns: None.
     """
-    import omnigent.harness_startup_config as startup_config_mod
     import omnigent.harnesses.codex_native.app_server as codex_app_mod
+    import omnigent.harnesses.startup_config as startup_config_mod
     from omnigent.runner import app as runner_app_mod
 
     session_id = "76cbdcbbf84d4149b2a7d7441b6966c1"
@@ -1422,9 +1422,9 @@ async def test_auto_create_codex_terminal_uses_worktree_workspace_not_bundle_dir
     :param monkeypatch: Pytest monkeypatch fixture.
     :returns: None.
     """
-    import omnigent.harness_startup_config as startup_config_mod
     import omnigent.harnesses.codex_native.app_server as codex_app_mod
-    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+    import omnigent.harnesses.startup_config as startup_config_mod
+    from omnigent.core.datamodel import OSEnvSandboxSpec, OSEnvSpec
     from omnigent.runner import app as runner_app_mod
 
     session_id = "54e4d4410c43954c11e702f5a8646483"
@@ -1730,8 +1730,8 @@ async def test_auto_create_codex_terminal_starts_relay_at_session_creation(
     :param monkeypatch: Pytest monkeypatch fixture.
     :returns: None.
     """
-    import omnigent.harness_startup_config as startup_config_mod
     import omnigent.harnesses.codex_native.app_server as codex_app_mod
+    import omnigent.harnesses.startup_config as startup_config_mod
     from omnigent.runner import app as runner_app_mod
 
     session_id = "de154ca6405fb8912623984a14a2b044"

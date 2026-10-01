@@ -14,7 +14,7 @@ from omnigent.db.utils import builtin_agent_id
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.app import create_app
 from omnigent.server.auth import UnifiedAuthProvider
-from omnigent.server.routes._session_create_validation import (
+from omnigent.server.routes.sessions.create_validation import (
     resolve_project_session_create,
 )
 from omnigent.server.schemas import (

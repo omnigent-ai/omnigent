@@ -510,7 +510,7 @@ async def test_forward_loop_patches_external_session_id_once(tmp_path, monkeypat
     # headers), so intercept that — the loop no longer constructs
     # ``httpx.AsyncClient`` directly, so patching ``f.httpx`` would leave the
     # real factory client (and a real network call) in place.
-    monkeypatch.setattr("omnigent.cli_auth.open_server_client", _make_client)
+    monkeypatch.setattr("omnigent.cli.auth.open_server_client", _make_client)
 
     async def _sleep(_s):
         iteration["n"] += 1

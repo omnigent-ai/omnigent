@@ -10,7 +10,7 @@ from pathlib import Path
 import pytest
 from packaging.version import Version
 
-import omnigent._platform as _platform
+import omnigent.util.portability as _platform
 from omnigent.onboarding import harness_install as hi
 from omnigent.onboarding.provider_config import ANTHROPIC_FAMILY, GEMINI_FAMILY, OPENAI_FAMILY
 

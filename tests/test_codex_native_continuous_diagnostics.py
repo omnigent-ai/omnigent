@@ -15,14 +15,17 @@ from typing import cast
 
 import pytest
 
-from omnigent.debug_logging import record_to_row
 from omnigent.harnesses.codex_native import app_server, stderr_diagnostics
 from omnigent.harnesses.codex_native.bridge import (
     CodexNativeBridgeState,
     write_bridge_state,
 )
 from omnigent.harnesses.codex_native.diagnostics import collect_codex_startup_diagnostics
-from omnigent.process_logging import HARNESS_STDERR_ENABLED_ENV_VAR, RedactingLogFormatter
+from omnigent.observability.debug_logging import record_to_row
+from omnigent.observability.process_logging import (
+    HARNESS_STDERR_ENABLED_ENV_VAR,
+    RedactingLogFormatter,
+)
 
 
 class _Output(logging.Handler):

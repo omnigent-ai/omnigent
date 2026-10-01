@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-from omnigent import cli
+from omnigent.cli import commands as cli
 from omnigent.host import local_server
 
 

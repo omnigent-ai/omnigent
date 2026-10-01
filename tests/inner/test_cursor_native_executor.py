@@ -14,6 +14,8 @@ from pathlib import Path
 
 import pytest
 
+from omnigent.core.executor import ExecutorError
+from omnigent.harnesses.cursor_native import executor as cne
 from omnigent.harnesses.cursor_native.bridge import (
     BRIDGE_DIR_ENV_VAR,
     FORK_HISTORY_CLOSE_TAG,
@@ -35,14 +37,12 @@ from omnigent.harnesses.cursor_native.bridge import (
     write_mcp_config,
     write_tmux_target,
 )
-from omnigent.inner import cursor_native_executor as cne
-from omnigent.inner.cursor_native_executor import (
+from omnigent.harnesses.cursor_native.executor import (
     CursorNativeExecutor,
     _content_to_text,
     _latest_user_text,
 )
-from omnigent.inner.executor import ExecutorError
-from omnigent.inner.native_attachments import attachment_cache_dir
+from omnigent.util.attachments import attachment_cache_dir
 
 
 class TestContentExtraction:
@@ -403,9 +403,9 @@ class TestBridge:
 
 class TestRegistration:
     def test_harness_is_registered(self) -> None:
-        from omnigent.runtime.harnesses import _HARNESS_MODULES
+        from omnigent.harnesses.runtime import _HARNESS_MODULES
 
-        assert _HARNESS_MODULES["cursor-native"] == "omnigent.inner.cursor_native_harness"
+        assert _HARNESS_MODULES["cursor-native"] == "omnigent.harnesses.cursor_native.harness"
 
     def test_harness_is_allowlisted(self) -> None:
         from omnigent.spec._omnigent_compat import OMNIGENT_HARNESSES
@@ -416,13 +416,13 @@ class TestRegistration:
         # cursor-native launches the cursor-agent TUI in an omnigent terminal
         # (like claude/codex/pi-native), so the runner must treat it as a native
         # terminal harness.
-        from omnigent.harness_aliases import is_native_harness
+        from omnigent.harnesses.aliases import is_native_harness
 
         assert is_native_harness("cursor-native") is True
         assert is_native_harness("native-cursor") is True
 
     def test_native_coding_agent_record(self) -> None:
-        from omnigent.native.native_coding_agents import native_coding_agent_for_harness
+        from omnigent.harnesses.native.coding_agents import native_coding_agent_for_harness
 
         agent = native_coding_agent_for_harness("cursor-native")
         assert agent is not None

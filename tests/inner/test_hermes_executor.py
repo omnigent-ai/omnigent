@@ -19,13 +19,13 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from omnigent.inner.executor import (
+from omnigent.core.executor import (
     ExecutorConfig,
     ExecutorError,
     TextChunk,
     TurnComplete,
 )
-from omnigent.inner.hermes_executor import (
+from omnigent.harnesses.hermes.executor import (
     HermesExecutor,
     _build_hermes_args,
     _extract_last_user_message,
@@ -160,7 +160,7 @@ class TestSetupHermesHome:
         monkeypatch.setattr(hnb, "_BRIDGE_ROOT", tmp_path)
         monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:6767")
         monkeypatch.setattr(
-            "omnigent.inner.hermes_executor._get_conversation_id",
+            "omnigent.harnesses.hermes.executor._get_conversation_id",
             lambda: "conv_test123",
         )
         monkeypatch.setattr(pathlib.Path, "home", classmethod(lambda cls: tmp_path / "nohome"))

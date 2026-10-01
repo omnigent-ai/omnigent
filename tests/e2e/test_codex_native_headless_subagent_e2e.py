@@ -125,7 +125,7 @@ def credential_less_codex_rig(
     if shutil.which("codex") is None:
         pytest.skip("codex CLI is required for the codex-native headless repro")
 
-    from omnigent.runner.identity import token_bound_runner_id
+    from omnigent.util.runner_identity import token_bound_runner_id
 
     work = tmp_path_factory.mktemp("codex_headless_subagent")
     config_home = work / "config-home"
@@ -169,7 +169,7 @@ def credential_less_codex_rig(
             [
                 sys.executable,
                 "-m",
-                "omnigent.cli",
+                "omnigent.cli.commands",
                 "server",
                 "--host",
                 "127.0.0.1",

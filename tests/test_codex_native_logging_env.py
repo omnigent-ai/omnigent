@@ -14,7 +14,7 @@ from omnigent.harnesses.codex_native.stderr_diagnostics import (
     CODEX_DIAGNOSTIC_RUST_LOG,
     codex_app_server_diagnostic_env,
 )
-from omnigent.process_logging import HARNESS_STDERR_ENABLED_ENV_VAR
+from omnigent.observability.process_logging import HARNESS_STDERR_ENABLED_ENV_VAR
 
 
 def test_default_filter_supports_both_http_clients_without_legacy_payload_tracing() -> None:

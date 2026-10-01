@@ -19,7 +19,7 @@ from typing import Any
 
 import pytest
 
-from omnigent.runtime.harnesses._scaffold import (
+from omnigent.harnesses.runtime._scaffold import (
     PolicyVerdictEvent,
     PolicyVerdictPayload,
     TurnContext,
@@ -194,7 +194,7 @@ async def test_evaluate_policy_timeout_returns_allow(
     Fail-open prevents silent session hangs.
     """
     # Shrink timeout to 0.1s so the test runs fast.
-    import omnigent.runtime.harnesses._scaffold as _scaffold_mod
+    import omnigent.harnesses.runtime._scaffold as _scaffold_mod
 
     monkeypatch.setattr(_scaffold_mod, "_POLICY_EVAL_TIMEOUT_S", 0.1)
 
@@ -224,7 +224,7 @@ async def test_evaluate_policy_tool_call_timeout_fails_closed(
     the tool must be blocked, not allowed — the LLM-phase fail-open above
     must NOT extend to the tool *call*.
     """
-    import omnigent.runtime.harnesses._scaffold as _scaffold_mod
+    import omnigent.harnesses.runtime._scaffold as _scaffold_mod
 
     monkeypatch.setattr(_scaffold_mod, "_POLICY_EVAL_TIMEOUT_S", 0.1)
 
@@ -249,7 +249,7 @@ async def test_evaluate_policy_tool_result_timeout_fails_open(
     need not block — TOOL_RESULT fails OPEN like the advisory LLM phases,
     unlike TOOL_CALL. (Maintainer design decision — see PR review thread.)
     """
-    import omnigent.runtime.harnesses._scaffold as _scaffold_mod
+    import omnigent.harnesses.runtime._scaffold as _scaffold_mod
 
     monkeypatch.setattr(_scaffold_mod, "_POLICY_EVAL_TIMEOUT_S", 0.1)
 

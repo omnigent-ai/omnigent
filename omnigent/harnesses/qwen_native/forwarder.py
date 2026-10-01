@@ -63,7 +63,7 @@ from pathlib import Path
 import httpx
 
 from omnigent.harnesses.qwen_native.bridge import events_file_path
-from omnigent.inner.native_attachments import ATTACHMENT_MARKER_STRIP_PATTERN
+from omnigent.util.attachments import ATTACHMENT_MARKER_STRIP_PATTERN
 
 _logger = logging.getLogger(__name__)
 
@@ -481,7 +481,7 @@ async def forward_qwen_events_to_session(
     target = events_file or events_file_path(bridge_dir)
     state = _read_state(bridge_dir)
     timeout = httpx.Timeout(_POST_TIMEOUT_S)
-    from omnigent.cli_auth import open_server_client
+    from omnigent.cli.auth import open_server_client
 
     async with open_server_client(base_url, headers=headers, auth=auth, timeout=timeout) as client:
         while True:
@@ -693,7 +693,7 @@ async def supervise_qwen_compaction_mirror(
     except OSError:
         offset = 0  # not created yet; first poll reads from the start
     timeout = httpx.Timeout(_POST_TIMEOUT_S)
-    from omnigent.cli_auth import open_server_client
+    from omnigent.cli.auth import open_server_client
 
     async with open_server_client(base_url, headers=headers, auth=auth, timeout=timeout) as client:
         while True:

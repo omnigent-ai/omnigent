@@ -69,7 +69,7 @@ from pathlib import Path
 import httpx
 
 from omnigent.harnesses.hermes_native import status as hermes_native_status
-from omnigent.inner.native_attachments import ATTACHMENT_MARKER_STRIP_PATTERN
+from omnigent.util.attachments import ATTACHMENT_MARKER_STRIP_PATTERN
 
 _logger = logging.getLogger(__name__)
 
@@ -1120,7 +1120,7 @@ async def forward_hermes_store_to_session(
     # Omnigent server so we do it at most once per forwarder lifetime.
     _external_id_synced = False
     timeout = httpx.Timeout(_POST_TIMEOUT_S)
-    from omnigent.cli_auth import open_server_client
+    from omnigent.cli.auth import open_server_client
 
     async with open_server_client(base_url, headers=headers, auth=auth, timeout=timeout) as client:
         usage_tracker = _HermesUsageTracker(client, session_id, bridge_dir)

@@ -28,7 +28,7 @@ from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.auth import RESERVED_USER_LOCAL, AuthProvider
 from omnigent.server.routes._auth_helpers import require_user
 from omnigent.server.routes._host_launch import resolve_host_owner
-from omnigent.server.routes._session_create_validation import (
+from omnigent.server.routes.sessions.create_validation import (
     validate_existing_host_workspace,
     validate_permission_mode_agent_support,
     validate_session_agent,

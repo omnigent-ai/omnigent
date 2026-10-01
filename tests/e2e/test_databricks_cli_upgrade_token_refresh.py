@@ -134,7 +134,7 @@ def _start_server(tmp_path: Path) -> tuple[subprocess.Popen[bytes], str]:
         [
             sys.executable,
             "-c",
-            "from omnigent.cli import main; main()",
+            "from omnigent.cli.commands import main; main()",
             "server",
             "--host",
             "127.0.0.1",
@@ -208,7 +208,7 @@ def test_prompt_survives_databricks_cli_upgrade_mid_session(
     """A prompt survives a CLI upgrade under a live runner."""
     from databricks.sdk.oauth import HostMetadata
 
-    from omnigent.cli_auth import open_server_client
+    from omnigent.cli.auth import open_server_client
     from omnigent.harnesses.claude_native.bridge import (
         prepare_bridge_dir,
         start_tool_relay,

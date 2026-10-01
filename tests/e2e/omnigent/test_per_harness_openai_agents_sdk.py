@@ -13,7 +13,7 @@ stderr cleanliness, assistant text length).
 - The ``openai-agents`` Python package (``agents`` module) is
   missing from the omnigent venv or its public API changes
   incompatibly.
-- ``omnigent.cli._run_agent`` for the ``-p`` one-shot path
+- ``omnigent.cli.commands._run_agent`` for the ``-p`` one-shot path
   stops printing the assistant text on turn complete.
 
 Design reference: ``designs/OMNIGENT_INTEGRATION.md`` §Phase 0

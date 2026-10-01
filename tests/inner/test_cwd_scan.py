@@ -1,7 +1,7 @@
 """
 Shared cwd-walker decision tests for the sandbox backends.
 
-The walker in :mod:`omnigent.inner._cwd_scan` is consumed by every
+The walker in :mod:`omnigent.sandbox.cwd_scan` is consumed by every
 spawn-time sandbox backend (``linux_bwrap``, ``darwin_seatbelt``)
 to decide which cwd entries must be masked from the helper. Backend
 emit code (``--bind /dev/null`` / ``--tmpfs`` for bwrap, ``(deny
@@ -23,7 +23,7 @@ from pathlib import Path
 
 import pytest
 
-from omnigent.inner._cwd_scan import MaskedEntry, merge_scan_roots, scan_cwd_mask_entries
+from omnigent.sandbox.cwd_scan import MaskedEntry, merge_scan_roots, scan_cwd_mask_entries
 
 # The walker contract says ``safe_roots`` should include cwd plus the
 # backend-specific exposed mounts. For these decision-level tests we
@@ -433,7 +433,7 @@ def test_overflow_warn_returns_partial_mask_and_logs(
     (tmp_path / ".env").write_text("SECRET")
     for i in range(50):
         (tmp_path / f"file_{i}.txt").write_text("x")
-    caplog.set_level("WARNING", logger="omnigent.inner._cwd_scan")
+    caplog.set_level("WARNING", logger="omnigent.sandbox.cwd_scan")
     entries = _scan(tmp_path, max_entries=5, overflow="warn")
     env_entry = _entry_for(entries, tmp_path / ".env")
     assert env_entry is not None, (
@@ -736,7 +736,7 @@ def test_overflow_warn_message_distinguishes_partial_and_bounds_list(
         d = tmp_path / f"d{i:02d}"
         d.mkdir()
         (d / "f.txt").write_text("x")
-    caplog.set_level("CRITICAL", logger="omnigent.inner._cwd_scan")
+    caplog.set_level("CRITICAL", logger="omnigent.sandbox.cwd_scan")
     _scan(tmp_path, max_entries=15, overflow="warn")
     records = [r for r in caplog.records if "Mask is incomplete" in r.getMessage()]
     assert len(records) == 1, (

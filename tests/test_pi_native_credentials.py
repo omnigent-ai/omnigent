@@ -40,7 +40,7 @@ def test_resolves_databricks_default_to_anthropic_gateway(monkeypatch: pytest.Mo
     surface — which Pi speaks natively — and build a gateway provider with a
     bearer-token refresh command.
     """
-    from omnigent.inner import databricks_executor
+    from omnigent.harnesses.databricks import executor as databricks_executor
 
     def _host(profile: str | None) -> str:
         return "https://wkspc.example.com/"
@@ -61,7 +61,7 @@ def test_resolves_databricks_default_to_anthropic_gateway(monkeypatch: pytest.Mo
 
 def test_databricks_unresolvable_host_returns_none(monkeypatch: pytest.MonkeyPatch) -> None:
     """No host for the profile → fall back to Pi's own login (None)."""
-    from omnigent.inner import databricks_executor
+    from omnigent.harnesses.databricks import executor as databricks_executor
 
     def _no_host(profile: str | None) -> None:
         return None
@@ -78,7 +78,7 @@ def test_databricks_unresolvable_credentials_sets_warning(
     Pi launches fine (its ``!command`` apiKey may recover), but a silent dead
     session is worse than a visible notice — so the resolver flags it.
     """
-    from omnigent.inner import databricks_executor
+    from omnigent.harnesses.databricks import executor as databricks_executor
 
     monkeypatch.setattr(
         databricks_executor,
@@ -103,7 +103,7 @@ def test_databricks_model_list_failure_has_no_warning(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Creds resolve but the model-list fetch fails → benign, no warning."""
-    from omnigent.inner import databricks_executor
+    from omnigent.harnesses.databricks import executor as databricks_executor
     from omnigent.runtime.credentials import databricks as rt_databricks
 
     monkeypatch.setattr(
@@ -524,7 +524,7 @@ def test_run_auth_command_timeout_kills_the_helper(tmp_path: Path) -> None:
     import sys
     import time
 
-    from omnigent.inner._proc import process_alive
+    from omnigent.util.proc import process_alive
 
     pid_file = tmp_path / "helper.pid"
     helper = "import os, sys, time; open(sys.argv[1], 'w').write(str(os.getpid())); time.sleep(60)"
@@ -892,7 +892,7 @@ def test_provider_launch_gateway_routed_model_keeps_thinking_off(
     """
     provider = _databricks_provider_without_catalog(monkeypatch, "databricks-glm-5-2")
     monkeypatch.setattr(
-        "omnigent.inner.pi_settings.prepare_managed_pi_agent_dir",
+        "omnigent.harnesses.pi.settings.prepare_managed_pi_agent_dir",
         lambda *_args, **_kwargs: None,
     )
 
@@ -1779,7 +1779,7 @@ def test_model_override_beats_databricks_default(monkeypatch: pytest.MonkeyPatch
     so the rendered ``models.json`` selects the requested model rather than the
     ``databricks-claude-sonnet-4-6`` default.
     """
-    from omnigent.inner import databricks_executor
+    from omnigent.harnesses.databricks import executor as databricks_executor
 
     monkeypatch.setattr(
         databricks_executor,
@@ -2270,7 +2270,7 @@ def test_databricks_profile_registers_gpt_provider(monkeypatch: pytest.MonkeyPat
     The ``omnigent-openai`` provider targets ``/serving-endpoints`` so Pi's
     /model command exposes GPT models returned by the live serving-endpoints API.
     """
-    from omnigent.inner import databricks_executor
+    from omnigent.harnesses.databricks import executor as databricks_executor
 
     monkeypatch.setattr(
         databricks_executor,
@@ -2595,7 +2595,7 @@ def test_fetch_pi_model_lists_survives_catalog_outage(monkeypatch: pytest.Monkey
 
 def _mock_databricks_profile(monkeypatch: pytest.MonkeyPatch) -> None:
     """Point the Databricks profile path at a fake workspace with fake creds."""
-    from omnigent.inner import databricks_executor
+    from omnigent.harnesses.databricks import executor as databricks_executor
     from omnigent.runtime.credentials import databricks as db_creds_mod
 
     monkeypatch.setattr(
@@ -2920,7 +2920,7 @@ def test_uncataloged_model_launch_arg_matches_rendered_provider(
     """
     provider = _databricks_provider_without_catalog(monkeypatch, "databricks-glm-5-2")
     monkeypatch.setattr(
-        "omnigent.inner.pi_settings.prepare_managed_pi_agent_dir",
+        "omnigent.harnesses.pi.settings.prepare_managed_pi_agent_dir",
         lambda *_args, **_kwargs: None,
     )
 
@@ -3068,7 +3068,7 @@ def test_launch_renders_config_once(monkeypatch: pytest.MonkeyPatch, tmp_path: P
     """
     provider = _databricks_provider_without_catalog(monkeypatch, "databricks-glm-5-2")
     monkeypatch.setattr(
-        "omnigent.inner.pi_settings.prepare_managed_pi_agent_dir",
+        "omnigent.harnesses.pi.settings.prepare_managed_pi_agent_dir",
         lambda *_args, **_kwargs: None,
     )
     renders = 0
@@ -3460,7 +3460,7 @@ def test_connect_broker_managed_host_resolves_without_configured_provider(
     """
     from types import SimpleNamespace
 
-    from omnigent.inner import databricks_executor
+    from omnigent.harnesses.databricks import executor as databricks_executor
 
     monkeypatch.setattr(
         databricks_executor, "_read_databrickscfg_host", lambda profile: "https://ws.example"
@@ -3488,7 +3488,7 @@ def test_connect_broker_managed_host_resolves_without_configured_provider(
 def test_connect_broker_skipped_without_sidecar(monkeypatch: pytest.MonkeyPatch) -> None:
     """No broker sidecar (e.g. a laptop) → connect-broker branch no-ops → None,
     so non-sandbox auth is untouched."""
-    from omnigent.inner import databricks_executor
+    from omnigent.harnesses.databricks import executor as databricks_executor
 
     monkeypatch.setattr(
         databricks_executor, "_read_databrickscfg_host", lambda profile: "https://ws.example"
@@ -3611,7 +3611,7 @@ def test_provider_launch_scopes_picker_via_enabled_models(
     Users can still toggle the picker back to the full catalog.
     """
     monkeypatch.setattr(
-        "omnigent.inner.pi_settings.DEFAULT_PI_AGENT_DIR", tmp_path / "global-agent"
+        "omnigent.harnesses.pi.settings.DEFAULT_PI_AGENT_DIR", tmp_path / "global-agent"
     )
     provider = creds.PiProviderConfig(
         provider_id="omnigent",
@@ -3648,7 +3648,7 @@ def test_setup_single_model_preserves_picker_scope(
     prior_scope: list[str] | None,
 ) -> None:
     """Selecting a default in setup must not replace existing Pi picker preferences."""
-    from omnigent.inner import pi_settings
+    from omnigent.harnesses.pi import settings as pi_settings
     from omnigent.onboarding.configure_models import (
         build_gateway_provider_entry,
         build_key_provider_entry,
@@ -3712,7 +3712,7 @@ def test_provider_launch_without_curated_set_does_not_scope(
     global_settings = {"enabledModels": prior_scope} if prior_scope is not None else {}
     global_file = global_dir / "settings.json"
     global_file.write_text(json.dumps(global_settings), encoding="utf-8")
-    monkeypatch.setattr("omnigent.inner.pi_settings.DEFAULT_PI_AGENT_DIR", global_dir)
+    monkeypatch.setattr("omnigent.harnesses.pi.settings.DEFAULT_PI_AGENT_DIR", global_dir)
     provider = creds.PiProviderConfig(
         provider_id="omnigent",
         base_url="https://gateway.example/anthropic",

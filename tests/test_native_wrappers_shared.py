@@ -807,10 +807,10 @@ def remote(w: _Wrapper, monkeypatch: pytest.MonkeyPatch) -> _RemoteHarness:
     events: list[tuple[Any, ...]] = []
     prepared = replace(_prepared(w, Path("/tmp/s"), "t:0"), session_id="conv_prepared")
 
-    monkeypatch.setattr("omnigent.chat._remote_headers", lambda **kw: {"X-Auth": "1"})
-    monkeypatch.setattr("omnigent.chat._bundle_agent", lambda path: b"bundled")
+    monkeypatch.setattr("omnigent.cli.chat._remote_headers", lambda **kw: {"X-Auth": "1"})
+    monkeypatch.setattr("omnigent.cli.chat._bundle_agent", lambda path: b"bundled")
     monkeypatch.setattr(
-        "omnigent.cli._ensure_host_daemon", lambda url: events.append(("daemon", url))
+        "omnigent.cli.commands._ensure_host_daemon", lambda url: events.append(("daemon", url))
     )
     monkeypatch.setattr(
         "omnigent.host.identity.load_or_create_host_identity",

@@ -115,7 +115,7 @@ def _roundtrip(yaml_path: Path) -> None:
 
     :param yaml_path: Path to an omnigent YAML fixture.
     """
-    from omnigent.inner.loader import load_agent_def
+    from omnigent.core.loader import load_agent_def
 
     original = load_agent_def(yaml_path)
     spec = agent_def_to_agent_spec(original)
@@ -165,8 +165,8 @@ def test_roundtrip_hello_world_is_incomplete_for_omnigent(
     be a deliberate decision with a reviewer; the test guards
     against silent drift.
     """
+    from omnigent.core.loader import load_agent_def
     from omnigent.errors import OmnigentError
-    from omnigent.inner.loader import load_agent_def
 
     original = load_agent_def(hello_world_yaml)
     spec = agent_def_to_agent_spec(original)

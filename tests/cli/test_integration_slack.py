@@ -9,8 +9,8 @@ from unittest import mock
 import pytest
 from click.testing import CliRunner
 
-from omnigent.cli import cli
-from omnigent.integration_daemon import DaemonRecord, IntegrationDaemon
+from omnigent.cli.commands import cli
+from omnigent.cli.integration_daemon import DaemonRecord, IntegrationDaemon
 
 
 @pytest.fixture
@@ -38,7 +38,7 @@ def test_record_round_trip_and_prune(tmp_path: Path) -> None:
 
 def test_start_writes_record_detached(tmp_path: Path) -> None:
     d = IntegrationDaemon("slack", tmp_path)
-    with mock.patch("omnigent.integration_daemon.subprocess.Popen") as popen:
+    with mock.patch("omnigent.cli.integration_daemon.subprocess.Popen") as popen:
         popen.return_value.pid = 777
         record = d.start(["python", "-m", "omnigent_slack"], {"A": "b"})
     assert record.pid == 777
@@ -90,7 +90,7 @@ def test_confirm_alive_prunes_dead_record(tmp_path: Path) -> None:
 
 def test_slack_background_hint_when_not_installed(data_dir: Path) -> None:
     runner = CliRunner()
-    with mock.patch("omnigent.cli._slack_installed", return_value=False):
+    with mock.patch("omnigent.cli.commands._slack_installed", return_value=False):
         result = runner.invoke(cli, ["integration", "slack", "--background"])
     assert result.exit_code != 0
     assert "isn't installed" in result.output
@@ -99,7 +99,7 @@ def test_slack_background_hint_when_not_installed(data_dir: Path) -> None:
 
 def test_slack_foreground_hint_when_not_installed(data_dir: Path) -> None:
     runner = CliRunner()
-    with mock.patch("omnigent.cli._slack_installed", return_value=False):
+    with mock.patch("omnigent.cli.commands._slack_installed", return_value=False):
         result = runner.invoke(cli, ["integration", "slack"])
     assert result.exit_code != 0
     assert "isn't installed" in result.output
@@ -115,8 +115,8 @@ def test_slack_status_reports_not_running(data_dir: Path) -> None:
 def test_slack_background_status_stop_lifecycle(data_dir: Path) -> None:
     runner = CliRunner()
     with (
-        mock.patch("omnigent.cli._slack_installed", return_value=True),
-        mock.patch("omnigent.integration_daemon.subprocess.Popen") as popen,
+        mock.patch("omnigent.cli.commands._slack_installed", return_value=True),
+        mock.patch("omnigent.cli.integration_daemon.subprocess.Popen") as popen,
         # The spawned pid is a mock, not a real process — force liveness true so
         # status reports running. confirm_alive (startup-crash detection) has
         # its own tests; short-circuit it here so the happy path doesn't wait
@@ -158,8 +158,8 @@ def test_slack_background_reports_immediate_exit(data_dir: Path) -> None:
     """A daemon that dies on startup fails loudly with a log tail, not a lie."""
     runner = CliRunner()
     with (
-        mock.patch("omnigent.cli._slack_installed", return_value=True),
-        mock.patch("omnigent.integration_daemon.subprocess.Popen") as popen,
+        mock.patch("omnigent.cli.commands._slack_installed", return_value=True),
+        mock.patch("omnigent.cli.integration_daemon.subprocess.Popen") as popen,
         # Process is gone by the time confirm_alive checks.
         mock.patch.object(IntegrationDaemon, "_pid_alive", return_value=False),
         mock.patch.object(IntegrationDaemon, "read_log_tail", return_value="Traceback: boom"),
@@ -176,8 +176,8 @@ def test_slack_background_reports_immediate_exit(data_dir: Path) -> None:
 def test_slack_foreground_runs_subprocess(data_dir: Path) -> None:
     runner = CliRunner()
     with (
-        mock.patch("omnigent.cli._slack_installed", return_value=True),
-        mock.patch("omnigent.cli.subprocess.run") as run,
+        mock.patch("omnigent.cli.commands._slack_installed", return_value=True),
+        mock.patch("omnigent.cli.commands.subprocess.run") as run,
     ):
         run.return_value = mock.Mock(returncode=0)
         result = runner.invoke(cli, ["integration", "slack"])
@@ -205,9 +205,9 @@ def test_slack_foreground_refuses_when_daemon_running(data_dir: Path) -> None:
     )
     runner = CliRunner()
     with (
-        mock.patch("omnigent.cli._slack_installed", return_value=True),
+        mock.patch("omnigent.cli.commands._slack_installed", return_value=True),
         mock.patch.object(IntegrationDaemon, "_pid_alive", return_value=True),
-        mock.patch("omnigent.cli.subprocess.run") as run,
+        mock.patch("omnigent.cli.commands.subprocess.run") as run,
     ):
         result = runner.invoke(cli, ["integration", "slack"])
     assert result.exit_code != 0

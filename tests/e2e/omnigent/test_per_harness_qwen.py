@@ -12,7 +12,7 @@ the qwen harness.
   subprocess lifecycle, the ACP JSON-RPC 2.0 event protocol).
 - The ``qwen`` CLI binary disappears from PATH or changes its
   ``--acp`` startup contract.
-- ``omnigent.cli._run_agent`` for the ``-p`` one-shot path
+- ``omnigent.cli.commands._run_agent`` for the ``-p`` one-shot path
   stops printing assistant text to stdout on turn complete.
 
 Design reference: ``designs/OMNIGENT_INTEGRATION.md`` §Phase 0

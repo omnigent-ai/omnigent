@@ -66,7 +66,6 @@ from urllib import request
 from filelock import FileLock
 from filelock import Timeout as FileLockTimeout
 
-from omnigent._platform import IS_WINDOWS, is_wsl, stable_user_id
 from omnigent.harnesses.claude_native import delivery_diagnostics
 from omnigent.harnesses.claude_native.message_display_hook import MESSAGE_DELTAS_FILE
 from omnigent.harnesses.claude_native.status import CONTEXT_RAW_FILE
@@ -75,19 +74,20 @@ from omnigent.harnesses.kiro_native import bridge as kiro_bridge
 from omnigent.models.claude_model_vocabulary import MODEL_VOCABULARY_ENV_VARS
 from omnigent.models.model_metadata import concrete_reported_model
 from omnigent.util.json_types import JsonObject as _JsonObject
+from omnigent.util.portability import IS_WINDOWS, is_wsl, stable_user_id
 
 if TYPE_CHECKING:
     import httpx
 
-    from omnigent.inner.datamodel import OSEnvSandboxSpec
-    from omnigent.inner.os_env import OSEnvironment
-    from omnigent.inner.terminal import TerminalInstance
+    from omnigent.core.datamodel import OSEnvSandboxSpec
+    from omnigent.environments.os_env import OSEnvironment
     from omnigent.llms.context_window import ModelPricing
+    from omnigent.terminals.terminal import TerminalInstance
 
-from omnigent.inner.hook_scripts.subagent_router import (
+from omnigent.harnesses.native import bridge_common as native_bridge_common
+from omnigent.harnesses.native.hook_scripts.subagent_router import (
     AGENT_TOOL_MATCHER as CLAUDE_SUBAGENT_TOOL_MATCHER,
 )
-from omnigent.native import native_bridge_common
 from omnigent.tools.base import Tool, ToolContext
 from omnigent.util.reasoning_effort import CLAUDE_EFFORTS
 
@@ -1624,7 +1624,7 @@ def _bridge_sandbox_payload(sandbox: OSEnvSandboxSpec) -> dict[str, Any]:
     is expected — a real crash the first time sandboxed code dereferences
     ``.entries`` / ``.databricks`` on it. ``credential_proxy`` is resolved
     parent-side only and is never meant to cross a serialization boundary
-    in the first place — :func:`omnigent.inner.sandbox.SandboxPolicy.to_jsonable`
+    in the first place — :func:`omnigent.sandbox.core.SandboxPolicy.to_jsonable`
     excludes it for the same reason (it can carry a credential *source*,
     e.g. an env var name or a shell command, that has no business landing
     in a file on disk). Dropping it here matches that existing convention
@@ -2298,7 +2298,7 @@ def build_hook_settings(
         # publish live token deltas to the web UI.
         "MessageDisplay": [{"hooks": [message_display_hook]}],
     }
-    from omnigent.native.tool_observer_hook import hook_settings
+    from omnigent.harnesses.native.tool_observer_hook import hook_settings
 
     observer_hook = hook_settings(bridge_dir, python, "omnigent.harnesses.claude_native.hook")
     observer_hook["command"] = _pin_runner_tmpdir(cast(str, observer_hook["command"]))
@@ -2412,13 +2412,13 @@ def build_hook_settings(
             python,
             "-I",
             "-m",
-            "omnigent.inner.hook_scripts.claude_router_hook",
+            "omnigent.harnesses.native.hook_scripts.claude_router_hook",
             "--bridge-dir",
             str(bridge_dir),
             "--router-dir",
             str(subagent_router_dir),
         ]
-        from omnigent.inner.hook_scripts.subagent_router import HOOK_TIMEOUT_S
+        from omnigent.harnesses.native.hook_scripts.subagent_router import HOOK_TIMEOUT_S
 
         router_hook: _JsonObject = {
             "type": "command",
@@ -2634,7 +2634,7 @@ def augment_claude_args(
     if append_system_prompt:
         args.extend(["--append-system-prompt", append_system_prompt])
     # Imported here: bundle-skills parsing rides the spec graph; launch-only.
-    from omnigent.inner.bundle_skills import claude_native_skill_args
+    from omnigent.harnesses.claude_sdk.bundle_skills import claude_native_skill_args
 
     args.extend(
         claude_native_skill_args(
@@ -4427,7 +4427,7 @@ def kill_session(
 
     Claude-native sessions run the ``claude`` binary inside a tmux
     session on a per-session socket (see
-    :class:`omnigent.inner.terminal.TerminalInstance`). The only way
+    :class:`omnigent.terminals.terminal.TerminalInstance`). The only way
     a user can end such a session today is to re-attach to the tmux in
     their terminal and exit from inside it. This helper is the analog
     of that manual exit for the Omnigent web UI's "Stop session" affordance:
@@ -5040,7 +5040,7 @@ def display_cost_approval_popup(
     """
     Overlay a cost-budget approval modal on the Claude Code tmux pane.
 
-    Launches :mod:`omnigent.native.native_cost_popup` inside a
+    Launches :mod:`omnigent.harnesses.native.cost_popup` inside a
     ``tmux display-popup``, so a user working in the native terminal —
     not only the web ``ApprovalCard`` — can approve/decline a cost
     checkpoint. The popup script resolves the **same** elicitation Future
@@ -5055,7 +5055,7 @@ def display_cost_approval_popup(
     modal lives on the attached client until the user answers.
 
     Claude-native resolver for the harness-agnostic
-    :func:`omnigent.native.native_cost_popup.launch_cost_popup`: it reads the
+    :func:`omnigent.harnesses.native.cost_popup.launch_cost_popup`: it reads the
     pane's tmux socket/target from this bridge's ``tmux.json`` and points
     the popup at *config_file* for Omnigent routing (base URL + auth
     headers, so no token lands on the command line), then delegates. The
@@ -5089,7 +5089,7 @@ def display_cost_approval_popup(
         *timeout_s* (the pane isn't up yet); the caller treats this as a
         best-effort miss and the web card remains answerable.
     """
-    from omnigent.native.native_cost_popup import launch_cost_popup
+    from omnigent.harnesses.native.cost_popup import launch_cost_popup
 
     info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
     launch_cost_popup(
@@ -6324,8 +6324,8 @@ def _start_unix_control_server(
     :param handler_cls: Request handler class.
     :returns: The bound, listening server and its socket path (mode 0600).
     """
-    from omnigent.inner._proc import process_alive
-    from omnigent.runtime.harnesses.paths import resolve_harness_tmp_parent
+    from omnigent.harnesses.runtime.paths import resolve_harness_tmp_parent
+    from omnigent.util.proc import process_alive
 
     root = resolve_harness_tmp_parent()
     # A configured root may be nested (``OMNIGENT_HARNESS_TMP_PARENT=.tmp/oa``);
@@ -6574,7 +6574,7 @@ def _tool_relay_handler_factory(
             # Heavy policy imports stay off this module's import path (hook
             # subprocesses import it); the relay runs inside the runner
             # process where these modules are already loaded.
-            from omnigent.native.native_policy_hook import (
+            from omnigent.harnesses.native.policy_hook import (
                 evaluation_response_to_hook_output,
                 fail_ask_hook_output,
                 hook_payload_to_evaluation_request,
@@ -7346,8 +7346,8 @@ def _build_tools(config: _JsonObject) -> tuple[dict[str, Tool], Callable[[], Non
     # graph (~300 ms of interpreter startup), and this module is on the
     # import path of every per-chunk/per-tool-call Claude hook subprocess.
     # Only the bridge MCP server (launch path) ever builds these tools.
-    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
-    from omnigent.inner.os_env import create_os_environment
+    from omnigent.core.datamodel import OSEnvSandboxSpec, OSEnvSpec
+    from omnigent.environments.os_env import create_os_environment
     from omnigent.tools.builtins.os_env import build_os_env_tools
 
     workspace_raw = config.get("workspace")

@@ -6,7 +6,7 @@ of live ``inner.terminal.TerminalInstance`` objects backing the
 
 See ``designs/OMNIGENT_TERMINAL_BRIDGE.md`` for the design and the
 :class:`TerminalInstance` documentation in
-:mod:`omnigent.inner.terminal` for the underlying tmux machinery.
+:mod:`omnigent.terminals.terminal` for the underlying tmux machinery.
 """
 
 from omnigent.terminals.registry import TerminalListEntry, TerminalRegistry

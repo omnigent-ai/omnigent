@@ -27,8 +27,8 @@ the **static** one.
 
 | Layer | Where | Nature | Observable |
 |---|---|---|---|
-| **Static** (use this) | `omnigent.harness_plugins.harness_capabilities()` → `dict[str, HarnessCapabilities]` | *Declared* trait/claim, pre-spawn | Immediately, no subprocess |
-| Runtime | `omnigent.inner.executor.Executor.supports_streaming()` / `interrupt_session()` … | *Actual* in-subprocess behavior | Only after spawn |
+| **Static** (use this) | `omnigent.harnesses.registry.harness_capabilities()` → `dict[str, HarnessCapabilities]` | *Declared* trait/claim, pre-spawn | Immediately, no subprocess |
+| Runtime | `omnigent.core.executor.Executor.supports_streaming()` / `interrupt_session()` … | *Actual* in-subprocess behavior | Only after spawn |
 
 The manifest declares **expectations**, so it derives from the **static** layer.
 The bench's *probes* already measure the runtime behavior live — that is the
@@ -38,7 +38,7 @@ verification half, and it stays as-is.
 
 ## Where the data lives (PR #1847)
 
-- Type: `omnigent/harness_capabilities.py` → `HarnessCapabilities` (frozen
+- Type: `omnigent/harnesses/capabilities.py` → `HarnessCapabilities` (frozen
   dataclass) + enums `IntegrationMode`, `Elicitation`, `Resume`, `EffortFamily`,
   `ModelFamily`, `AuthModel`. Import-safe (no onboarding/provider imports), like
   `harness_install_spec.py`.
@@ -135,7 +135,7 @@ best-effort values are right.
 ## Adding a new axis (if a probe-only behavior needs backing)
 
 1. Add the field to `HarnessCapabilities` (+ `as_dict()`), in
-   `omnigent/harness_capabilities.py`.
+   `omnigent/harnesses/capabilities.py`.
 2. Fill it for all 23 in `_BUILTIN_CAPABILITIES`.
 3. If derivable from an existing constant, add a guard test in
    `tests/test_harness_capabilities.py` asserting the declaration matches its

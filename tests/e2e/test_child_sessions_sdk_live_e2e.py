@@ -25,7 +25,7 @@ import asyncio
 import httpx
 from omnigent_client._sessions import SessionsNamespace
 
-from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN
+from omnigent.util.runner_identity import OMNIGENT_INTERNAL_WS_ORIGIN
 from tests.e2e.conftest import create_runner_bound_session, lookup_agent_id
 
 

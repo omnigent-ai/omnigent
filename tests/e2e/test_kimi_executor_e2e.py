@@ -1,4 +1,4 @@
-"""End-to-end tests for :class:`omnigent.inner.kimi_executor.KimiExecutor`.
+"""End-to-end tests for :class:`omnigent.harnesses.kimi.executor.KimiExecutor`.
 
 Real-binary tests gated on:
 
@@ -23,8 +23,8 @@ from typing import Any
 
 import pytest
 
-from omnigent.inner.executor import TextChunk, TurnComplete
-from omnigent.inner.kimi_executor import KimiExecutor, _resolve_kimi_binary
+from omnigent.core.executor import TextChunk, TurnComplete
+from omnigent.harnesses.kimi.executor import KimiExecutor, _resolve_kimi_binary
 
 
 def _kimi_e2e_enabled() -> bool:

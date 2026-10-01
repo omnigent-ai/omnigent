@@ -20,7 +20,7 @@ from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 from opentelemetry.trace import StatusCode
 
-from omnigent.inner.tracing import TracingContext, enable_tracing
+from omnigent.observability.tracing import TracingContext, enable_tracing
 
 
 @pytest.fixture
@@ -147,7 +147,7 @@ def test_content_capture_off_by_default_drops_input_and_output(
     input.value / output.value are NOT set on agent + tool spans.
     Metadata attrs (agent.name, tool.name, gen_ai.*) still are.
     """
-    monkeypatch.setattr("omnigent.runtime.telemetry._capture_content", False)
+    monkeypatch.setattr("omnigent.observability.otel._capture_content", False)
 
     ctx = TracingContext()
     agent = ctx.start_agent_span(agent_name="a", user_message="PII: user@example.com")
@@ -172,7 +172,7 @@ def test_content_capture_on_includes_input_and_output(
     With OMNIGENT_OTEL_CAPTURE_CONTENT on, input.value and output.value
     appear on agent + tool spans.
     """
-    monkeypatch.setattr("omnigent.runtime.telemetry._capture_content", True)
+    monkeypatch.setattr("omnigent.observability.otel._capture_content", True)
 
     ctx = TracingContext()
     agent = ctx.start_agent_span(agent_name="a", user_message="explain X")
@@ -199,7 +199,7 @@ def test_content_capture_off_drops_error_message(
     nor in the status description). but the span is still flagged
     ERROR so failures stay visible.
     """
-    monkeypatch.setattr("omnigent.runtime.telemetry._capture_content", False)
+    monkeypatch.setattr("omnigent.observability.otel._capture_content", False)
 
     ctx = TracingContext()
     agent = ctx.start_agent_span(agent_name="a", user_message="hi")
@@ -224,7 +224,7 @@ def test_content_capture_on_includes_error_message(
     monkeypatch: pytest.MonkeyPatch,
 ):
     """With content capture on, the error text is recorded on the span."""
-    monkeypatch.setattr("omnigent.runtime.telemetry._capture_content", True)
+    monkeypatch.setattr("omnigent.observability.otel._capture_content", True)
 
     ctx = TracingContext()
     agent = ctx.start_agent_span(agent_name="a", user_message="hi")

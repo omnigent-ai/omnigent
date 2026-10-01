@@ -18,7 +18,6 @@ from pathlib import Path
 
 import httpx
 
-from omnigent.debug_logging import debug_event
 from omnigent.entities.session_resources import terminal_resource_id
 from omnigent.harnesses.claude_native.bridge import (
     BRIDGE_ID_LABEL_KEY,
@@ -50,16 +49,17 @@ from omnigent.harnesses.claude_native.bridge import (
 from omnigent.harnesses.claude_native.diagnostics import ClaudeDebugLogFollower
 from omnigent.harnesses.claude_native.message_display_hook import MESSAGE_DELTAS_FILE
 from omnigent.harnesses.claude_native.status import sync_raw_status_context
-from omnigent.inner.hook_scripts.subagent_router import AGENT_TOOL_NAMES
-from omnigent.models.model_metadata import concrete_reported_model
-from omnigent.native._native_post_delivery import (
+from omnigent.harnesses.native.hook_scripts.subagent_router import AGENT_TOOL_NAMES
+from omnigent.harnesses.native.post_delivery import (
     append_dead_letter,
     post_external_session_status,
     post_may_have_been_delivered,
 )
-from omnigent.process_logging import harness_stderr_capture_enabled
+from omnigent.models.model_metadata import concrete_reported_model
+from omnigent.observability.debug_logging import debug_event
+from omnigent.observability.process_logging import harness_stderr_capture_enabled
 from omnigent.runner.transports.ws_tunnel.event_delivery import RunnerEventDispatcher
-from omnigent.session_event_batch import (
+from omnigent.runtime.session_event_batch import (
     MAX_SESSION_EVENT_BATCH_EVENTS,
     encode_session_event_batch,
 )
@@ -1222,7 +1222,7 @@ async def forward_claude_transcript_to_session(
     observer_stderr_offset = 0
     transcript_diagnostics = _TranscriptDiscoveryDiagnostics(started_at=time.monotonic())
     timeout = httpx.Timeout(_POST_TIMEOUT_S)
-    from omnigent.cli_auth import open_server_client
+    from omnigent.cli.auth import open_server_client
 
     async with (
         _forward_claude_diagnostics(bridge_dir, session_id, poll_interval_s),
@@ -5159,7 +5159,7 @@ async def _post_external_conversation_item(
     :returns: None.
     :raises httpx.HTTPError: If the Omnigent request fails or is rejected.
     """
-    from omnigent.runtime import telemetry
+    from omnigent.observability import otel as telemetry
 
     # The forwarder is the decoupled response path (it tails Claude's
     # transcript and re-POSTs items under its own trace, not the request's).
@@ -5405,7 +5405,7 @@ async def _post_external_session_usage(
         payload["context_window"] = context_window
     if not payload:
         return
-    from omnigent.runtime import telemetry
+    from omnigent.observability import otel as telemetry
 
     # A native Claude turn runs to completion in the terminal, so the
     # harness executor's TurnComplete carries no usage and the agent span
@@ -5447,7 +5447,7 @@ def _gen_ai_usage_tokens(usage: Mapping[str, float | str] | None) -> dict[str, i
 
     :param usage: Usage payload posted to the Sessions API, or ``None``.
     :returns: Token counts keyed for
-        :func:`omnigent.runtime.telemetry.record_llm_usage`, e.g.
+        :func:`omnigent.observability.otel.record_llm_usage`, e.g.
         ``{"input_tokens": 1523, "output_tokens": 847}``. ``None`` when the
         payload carries no input/output counts.
     """

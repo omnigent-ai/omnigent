@@ -5,7 +5,7 @@ The legacy non-AP path registers ``sys_os_read``,
 ``sys_os_write``, ``sys_os_edit``, and ``sys_os_shell`` via the
 inner :mod:`omnigent.inner.session` when the agent's
 ``os_env`` is set. They wrap a shared
-:class:`omnigent.inner.os_env.OSEnvironment` instance so the
+:class:`omnigent.environments.os_env.OSEnvironment` instance so the
 same shell + cwd + sandbox is used across calls.
 
 The Omnigent path can't reuse those Session tool registrations
@@ -24,7 +24,7 @@ when the spec carries an ``os_env`` config.
 
 Why a separate module from ``builtins/spawn.py`` etc.: these
 tools depend on the inner os_env machinery
-(:func:`omnigent.inner.os_env.create_os_environment`,
+(:func:`omnigent.environments.os_env.create_os_environment`,
 :class:`OSEnvSpec`) which won't ship in the AP-only deployment
 once :mod:`omnigent.inner` retires. Keeping the dependency
 in one file makes that future deletion clean.
@@ -36,7 +36,7 @@ import json
 import logging
 from typing import Any
 
-from omnigent.inner.os_env import _DEFAULT_READ_LIMIT, OSEnvironment
+from omnigent.environments.os_env import _DEFAULT_READ_LIMIT, OSEnvironment
 from omnigent.tools.base import Tool, ToolContext
 
 _logger = logging.getLogger(__name__)

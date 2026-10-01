@@ -28,7 +28,7 @@ from omnigent.harnesses.claude_native.bridge import (
     BRIDGE_ID_LABEL_KEY,
     bridge_dir_for_bridge_id,
 )
-from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN, token_bound_runner_id
+from omnigent.util.runner_identity import OMNIGENT_INTERNAL_WS_ORIGIN, token_bound_runner_id
 from tests.e2e.test_host_claude_native_e2e import _poll_for_assistant_marker
 from tests.e2e.test_host_claude_native_fork_e2e import _send_user_message
 from tests.server.integration.mock_llm_server import (

@@ -11,10 +11,13 @@ from typing import Any
 
 import pytest
 
-from omnigent._platform import IS_POSIX
-from omnigent.debug_logging import record_to_row
 from omnigent.harnesses.claude_native import bridge, diagnostics
-from omnigent.process_logging import HARNESS_STDERR_ENABLED_ENV_VAR, RedactingLogFormatter
+from omnigent.observability.debug_logging import record_to_row
+from omnigent.observability.process_logging import (
+    HARNESS_STDERR_ENABLED_ENV_VAR,
+    RedactingLogFormatter,
+)
+from omnigent.util.portability import IS_POSIX
 
 pytestmark = pytest.mark.skipif(not IS_POSIX, reason="Native diagnostic files use POSIX bridges")
 

@@ -13,7 +13,6 @@ import pytest
 
 from omnigent.entities.session_resources import SessionResourceView, terminal_resource_id
 from omnigent.harnesses.codex_native import bridge as codex_native_bridge
-from omnigent.inner.terminal import TerminalInstance
 from omnigent.runner import create_runner_app
 from omnigent.runner.app import (
     _auto_create_repl_terminal,
@@ -25,6 +24,7 @@ from omnigent.runner.resource_registry import (
 )
 from omnigent.spec.types import AgentSpec, ExecutorSpec
 from omnigent.terminals import TerminalRegistry
+from omnigent.terminals.terminal import TerminalInstance
 from tests.runner.conftest import (
     _build_app_for_spec,
     _FakeProcessManager,
@@ -631,7 +631,7 @@ async def test_auto_create_repl_terminal_launches_attach_and_stamps_label(
     :param monkeypatch: Pytest monkeypatch fixture.
     :returns: None.
     """
-    from omnigent._wrapper_labels import UI_MODE_LABEL_KEY, UI_MODE_TERMINAL_VALUE
+    from omnigent.harnesses.wrapper_labels import UI_MODE_LABEL_KEY, UI_MODE_TERMINAL_VALUE
 
     session_id = "11c50cd73e9c32ccb0af5b9db291db8b"
     workspace = tmp_path / "workspace"
@@ -774,7 +774,7 @@ async def test_auto_create_repl_terminal_inherits_agent_sandbox(
     :param monkeypatch: Pytest monkeypatch fixture.
     :returns: None.
     """
-    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+    from omnigent.core.datamodel import OSEnvSandboxSpec, OSEnvSpec
 
     session_id = "f75bf7158ce8716ae3b934522271979c"
     workspace = tmp_path / "workspace"

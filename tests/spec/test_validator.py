@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+from omnigent.core.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.spec.types import (
     AgentSpec,
     CompactionConfig,

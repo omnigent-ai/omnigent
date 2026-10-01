@@ -121,7 +121,7 @@ def non_git_runner_id() -> str:
 
     :returns: Runner id string, e.g. ``"runner_token_abc123..."``.
     """
-    from omnigent.runner.identity import token_bound_runner_id
+    from omnigent.util.runner_identity import token_bound_runner_id
 
     if "runner_id" not in _non_git_runner_state:
         token = secrets.token_urlsafe(32)
@@ -174,7 +174,7 @@ def non_git_server(
         [
             sys.executable,
             "-m",
-            "omnigent.cli",
+            "omnigent.cli.commands",
             "server",
             "--port",
             str(port),

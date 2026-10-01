@@ -17,7 +17,7 @@ async def test_async_runner_auth_refreshes_outside_event_loop(
     monkeypatch: pytest.MonkeyPatch, status: int
 ) -> None:
     """HTTP callbacks and the native policy relay can use synchronous providers."""
-    monkeypatch.setattr("omnigent.cli_auth.databricks_request_headers", lambda *a, **k: {})
+    monkeypatch.setattr("omnigent.cli.auth.databricks_request_headers", lambda *a, **k: {})
     tokens = iter(["expired", "renewed"])
     sent: list[str] = []
 

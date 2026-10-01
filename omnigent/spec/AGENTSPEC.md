@@ -270,7 +270,7 @@ defaults apply: **5 seconds** for the initial HTTP connection handshake and
 **Security note — `${VAR}` is NOT expanded for uploaded bundles:**
 ``${VAR}`` references in MCP `url`, `headers`, `env`, and connection blocks
 are resolved against the spec author's *own* environment at the client /
-registration boundary (`omnigent.cli._resolve_bundle_env_vars`), never
+registration boundary (`omnigent.cli.commands._resolve_bundle_env_vars`), never
 at runtime by the server or runner for a tenant-uploaded
 (session-scoped) bundle. Expanding an uploaded spec's ``${VAR}`` against
 the server process env would let any tenant exfiltrate server-side

@@ -5,7 +5,7 @@ from __future__ import annotations
 import httpx
 import pytest
 
-from omnigent import debug_logging
+from omnigent.observability import debug_logging
 from omnigent.server import creation_logging
 from tests.debug_log_helpers import capture_debug_rows
 from tests.server.helpers import create_test_agent

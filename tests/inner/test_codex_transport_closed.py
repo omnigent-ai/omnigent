@@ -11,16 +11,16 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from omnigent.core.executor import TurnComplete
 from omnigent.errors import HarnessTransportClosedError
-from omnigent.inner.codex_executor import (
+from omnigent.harnesses.codex.executor import (
     CodexExecutor,
     _CodexAppServerSession,
     _CodexSessionState,
     _tool_signature,
 )
-from omnigent.inner.executor import TurnComplete
+from omnigent.harnesses.runtime import _executor_adapter
 from omnigent.models.model_fallbacks import CODEX_DEFAULT_MODEL
-from omnigent.runtime.harnesses import _executor_adapter
 from tests.inner.test_codex_executor import _FakeAppSession, _FakeProcess
 
 

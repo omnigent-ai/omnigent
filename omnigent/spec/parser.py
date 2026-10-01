@@ -19,8 +19,7 @@ from pydantic import (
     model_validator,
 )
 
-from omnigent.errors import ErrorCode, OmnigentError
-from omnigent.inner.datamodel import (
+from omnigent.core.datamodel import (
     DEFAULT_BASIC_USERNAME,
     CredentialProxyEntry,
     CredentialProxySpec,
@@ -32,7 +31,8 @@ from omnigent.inner.datamodel import (
     TerminalEnvSpec,
     parse_write_paths,
 )
-from omnigent.inner.sandbox import containment_prefix
+from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.sandbox.core import containment_prefix
 from omnigent.spec.types import (
     DEFAULT_ASK_TIMEOUT,
     AgentSpec,
@@ -286,7 +286,7 @@ def parse(root: Path, *, expand_env: bool = True) -> AgentSpec:
     # Top-level ``async:`` flag gates the LLM-callable async-dispatch
     # builtins (``sys_call_async``, ``sys_read_inbox``,
     # ``sys_cancel_async``). Defaults to True to match
-    # ``omnigent/inner/datamodel.py::AgentDef.async_enabled`` — the
+    # ``omnigent/core/datamodel.py::AgentDef.async_enabled`` — the
     # same YAML must produce the same tool surface under Omnigent mode and
     # the legacy inner stack. Agents that want to suppress the surface
     # declare ``async: false`` explicitly. ``bool()`` accepts YAML
@@ -296,7 +296,7 @@ def parse(root: Path, *, expand_env: bool = True) -> AgentSpec:
     # Top-level ``timers:`` flag gates the LLM-callable timer
     # builtins (``sys_timer_set``, ``sys_timer_cancel``).
     # Defaults to False to match
-    # ``omnigent/inner/datamodel.py::AgentDef.timers`` — agents
+    # ``omnigent/core/datamodel.py::AgentDef.timers`` — agents
     # opt into the timer surface explicitly. See step 10 of the
     # harness contract migration.
     timers = bool(raw.get("timers", False))
@@ -825,7 +825,7 @@ def _parse_os_env(
     config surface — a top-level ``os_env:`` mapping with
     ``type``, ``cwd``, ``sandbox: {...}``, ``fork``, and
     ``start_in_scratch`` keys. See
-    :class:`omnigent.inner.datamodel.OSEnvSpec` for the
+    :class:`omnigent.core.datamodel.OSEnvSpec` for the
     semantics of each field.
 
     :param raw: The raw ``os_env:`` value from config.yaml.
@@ -994,7 +994,7 @@ def _parse_os_env_sandbox(
     mask_paths = _parse_mask_paths(raw.get("mask_paths"))
     env_passthrough = _parse_env_passthrough(raw.get("env_passthrough"))
     egress_rules = _parse_egress_rules(raw.get("egress_rules"))
-    from omnigent.inner.sandbox import _default_sandbox_for_platform, _resolve_sandbox_type
+    from omnigent.sandbox.core import _default_sandbox_for_platform, _resolve_sandbox_type
 
     if "type" not in raw:
         sandbox_type = _default_sandbox_for_platform().type
@@ -1325,7 +1325,7 @@ def _parse_egress_rules(raw: object) -> list[str] | None:
     ``os_env.sandbox``.
 
     Each entry is validated at parse time via
-    :func:`~omnigent.inner.egress.rules.parse_rule` so syntax
+    :func:`~omnigent.sandbox.egress.rules.parse_rule` so syntax
     errors surface immediately rather than at proxy start time.
 
     :param raw: The raw value from the YAML mapping. ``None``
@@ -1343,7 +1343,7 @@ def _parse_egress_rules(raw: object) -> list[str] | None:
         )
     if not raw:
         return None
-    from omnigent.inner.egress.rules import parse_rule
+    from omnigent.sandbox.egress.rules import parse_rule
 
     validated: list[str] = []
     for i, entry in enumerate(raw):
@@ -1373,7 +1373,7 @@ def _parse_model_egress(raw: object) -> list[str] | None:
             "model_egress must be a non-empty list of HTTP egress rules",
             code=ErrorCode.INVALID_INPUT,
         )
-    from omnigent.inner.egress.rules import parse_rule
+    from omnigent.sandbox.egress.rules import parse_rule
 
     validated: list[str] = []
     for index, entry in enumerate(raw):
@@ -2103,7 +2103,7 @@ def _parse_credential_proxy_host(raw: str, *, field_path: str) -> str:
         characters outside the DNS grammar ``[A-Za-z0-9.-]`` (wildcards
         included — credentials bind to an exact host).
     """
-    from omnigent.inner.egress.rules import is_dns_safe_host
+    from omnigent.sandbox.egress.rules import is_dns_safe_host
 
     if not raw.strip():
         raise OmnigentError(

@@ -64,24 +64,14 @@ from omnigent_client._http import is_loopback_url
 from websockets.exceptions import ConnectionClosed, ConnectionClosedError, WebSocketException
 from websockets.frames import Close
 
-from omnigent._runner_startup import RunnerStartupProgress, runner_startup_progress
-from omnigent._startup_events import record_startup_event
-from omnigent._startup_profile import StartupProfiler
-from omnigent._terminal_picker_theme import (
+from omnigent.cli.conversation_browser import conversation_url, open_conversation_link_if_enabled
+from omnigent.cli.picker_theme import (
     PICKER_ACCENT as _PICKER_ACCENT,
 )
-from omnigent._terminal_picker_theme import (
+from omnigent.cli.picker_theme import (
     PICKER_MUTED as _PICKER_MUTED,
 )
-from omnigent._wrapper_labels import (
-    CLAUDE_NATIVE_WRAPPER_VALUE as _WRAPPER_LABEL_VALUE,
-)
-from omnigent._wrapper_labels import (
-    WRAPPER_LABEL_KEY as _WRAPPER_LABEL_KEY,
-)
-from omnigent.claude_launcher import resolve_claude_launch
-from omnigent.cli_invocation import cli_invocation
-from omnigent.conversation_browser import conversation_url, open_conversation_link_if_enabled
+from omnigent.cli.runner_startup import RunnerStartupProgress, runner_startup_progress
 from omnigent.entities.session_resources import terminal_resource_id
 from omnigent.harnesses.claude_native.bridge import (
     BRIDGE_ID_LABEL_KEY,
@@ -98,10 +88,37 @@ from omnigent.harnesses.claude_native.forwarder import (
     reset_transcript_forward_state,
     supervise_forwarder,
 )
+from omnigent.harnesses.claude_native.launcher import resolve_claude_launch
 from omnigent.harnesses.claude_native.state import (
     read_launch_state,
     redirect_launch_state,
     write_launch_state,
+)
+from omnigent.harnesses.native.coding_agents import native_shell_terminal_spec
+from omnigent.harnesses.native.resume_hint import echo_native_resume_hint
+from omnigent.harnesses.native.terminal import (
+    DAEMON_HOST_ONLINE_TIMEOUT_S as _DAEMON_HOST_ONLINE_TIMEOUT_S,
+)
+from omnigent.harnesses.native.terminal import (
+    DAEMON_RUNNER_ONLINE_TIMEOUT_S as _DAEMON_RUNNER_ONLINE_TIMEOUT_S,
+)
+from omnigent.harnesses.native.terminal import (
+    DAEMON_TERMINAL_READY_TIMEOUT_S as _DAEMON_TERMINAL_READY_TIMEOUT_S,
+)
+from omnigent.harnesses.native.terminal import (
+    bind_session_runner as _bind_session_runner,
+)
+from omnigent.harnesses.native.terminal import (
+    normalize_extra_args as _normalize_extra_args,
+)
+from omnigent.harnesses.native.terminal import (
+    terminal_attach_url as _attach_url,
+)
+from omnigent.harnesses.wrapper_labels import (
+    CLAUDE_NATIVE_WRAPPER_VALUE as _WRAPPER_LABEL_VALUE,
+)
+from omnigent.harnesses.wrapper_labels import (
+    WRAPPER_LABEL_KEY as _WRAPPER_LABEL_KEY,
 )
 from omnigent.host.daemon_launch import (
     daemon_poll_intervals,
@@ -120,31 +137,14 @@ from omnigent.models.claude_model_vocabulary import (
     claude_model_alias,
     served_canonical_overrides,
 )
-from omnigent.native._native_resume_hint import echo_native_resume_hint
-from omnigent.native.native_coding_agents import native_shell_terminal_spec
-from omnigent.native.native_terminal import (
-    DAEMON_HOST_ONLINE_TIMEOUT_S as _DAEMON_HOST_ONLINE_TIMEOUT_S,
-)
-from omnigent.native.native_terminal import (
-    DAEMON_RUNNER_ONLINE_TIMEOUT_S as _DAEMON_RUNNER_ONLINE_TIMEOUT_S,
-)
-from omnigent.native.native_terminal import (
-    DAEMON_TERMINAL_READY_TIMEOUT_S as _DAEMON_TERMINAL_READY_TIMEOUT_S,
-)
-from omnigent.native.native_terminal import (
-    bind_session_runner as _bind_session_runner,
-)
-from omnigent.native.native_terminal import (
-    normalize_extra_args as _normalize_extra_args,
-)
-from omnigent.native.native_terminal import (
-    terminal_attach_url as _attach_url,
-)
-from omnigent.process_logging import log_info_once
+from omnigent.observability.process_logging import log_info_once
+from omnigent.observability.startup_events import record_startup_event
+from omnigent.observability.startup_profile import StartupProfiler
 from omnigent.terminals.ws_common import (
     WS_CLOSE_TERMINAL_DETACHED,
     WS_CLOSE_TERMINAL_NOT_FOUND,
 )
+from omnigent.util.cli_invocation import cli_invocation
 
 _logger = logging.getLogger(__name__)
 
@@ -916,7 +916,7 @@ def _claude_model_probe_invocation(
     :param stream_input: Send control requests and /model over stdin.
     :returns: ``(command, launch_args, env)`` ready to exec.
     """
-    from omnigent.claude_launcher import resolve_claude_launch
+    from omnigent.harnesses.claude_native.launcher import resolve_claude_launch
 
     args = ["-p"]
     if stream_input:
@@ -1292,7 +1292,7 @@ def claude_catalog_fingerprint(claude_config: ClaudeNativeUcodeConfig | None) ->
     :param claude_config: The resolved launch config, or ``None``.
     :returns: A stable fingerprint string.
     """
-    from omnigent.claude_launcher import resolve_claude_launch
+    from omnigent.harnesses.claude_native.launcher import resolve_claude_launch
     from omnigent.models.model_catalog_store import binary_identity, fingerprint_of
     from omnigent.onboarding.ambient import claude_managed_model_picker
 
@@ -2989,7 +2989,7 @@ def _profile_pinned_auth_command(
     """
     if "databricks auth token" not in auth_command:
         return auth_command
-    from omnigent.inner.databricks_executor import databricks_bearer_token_command
+    from omnigent.harnesses.databricks.executor import databricks_bearer_token_command
 
     pinned = databricks_bearer_token_command(workspace_url, profile)
     if pinned == auth_command:
@@ -3303,12 +3303,12 @@ def _connect_broker_claude_config() -> ClaudeNativeUcodeConfig | None:
     Returns ``None`` off the managed connect path (profile is not the host connect
     profile, or no broker sidecar is present).
     """
+    from omnigent.harnesses.databricks.executor import _read_databrickscfg_host
     from omnigent.host.databricks_credential import (
         HOST_DATABRICKS_PROFILE,
         broker_token_command,
         https_url_on_workspace_host,
     )
-    from omnigent.inner.databricks_executor import _read_databrickscfg_host
 
     # Gate on the on-disk [omnigent] profile + broker sidecar, NOT on the
     # ``DATABRICKS_CONFIG_PROFILE`` env var: that var is deliberately stripped
@@ -3410,7 +3410,7 @@ def resolve_native_claude_config(
     :returns: The launch config, or ``None`` to use Claude's own login.
     """
     from omnigent.host.databricks_credential import api_key_auth_precludes_broker
-    from omnigent.inference_config import (
+    from omnigent.models.inference_config import (
         binding_for_harness,
         load_runtime_inference_config,
         resolve_bound_model,
@@ -3559,7 +3559,7 @@ def _wrapper_spec_raw_instructions(spec_path: Path) -> str | None:
     """Resolve raw author instructions from the wrapper's agent spec.
 
     Reuses :func:`omnigent.spec.load` (the same loader
-    :func:`~omnigent.cli._bundle` and the server use for both an agent-image
+    :func:`~omnigent.cli.commands._bundle` and the server use for both an agent-image
     directory and a standalone single-file YAML) so the value matches exactly
     what ``AgentSpec.instructions`` resolves to — including the
     ``instructions:`` file precedence over ``prompt:`` — rather than
@@ -3612,7 +3612,7 @@ def _run_with_local_server(
         marks. ``None`` disables output.
     :returns: None.
     """
-    from omnigent.chat import (
+    from omnigent.cli.chat import (
         _bundle_agent,
         _find_free_port,
         _start_local_server,
@@ -4237,7 +4237,7 @@ async def _is_terminal_resource_gone(
         f"/v1/sessions/{url_component(session_id)}"
         f"/resources/terminals/{url_component(terminal_id)}"
     )
-    from omnigent.cli_auth import open_server_client
+    from omnigent.cli.auth import open_server_client
 
     try:
         async with open_server_client(
@@ -4340,7 +4340,7 @@ async def _close_claude_terminal(
         f"/v1/sessions/{url_component(session_id)}"
         f"/resources/terminals/{url_component(terminal_id)}"
     )
-    from omnigent.cli_auth import open_server_client
+    from omnigent.cli.auth import open_server_client
 
     with contextlib.suppress(Exception):
         async with open_server_client(
@@ -4790,7 +4790,7 @@ def _run_with_remote_server(
         marks. ``None`` disables output.
     :returns: None.
     """
-    from omnigent.chat import _bundle_agent, _remote_headers, _server_auth
+    from omnigent.cli.chat import _bundle_agent, _remote_headers, _server_auth
     from omnigent.host.identity import load_or_create_host_identity
 
     startup_profiler = startup_profiler or StartupProfiler(name="omnigent claude", enabled=False)
@@ -5011,7 +5011,7 @@ async def _prepare_claude_terminal(
     """
     startup_profiler = startup_profiler or StartupProfiler(name="omnigent claude", enabled=False)
     timeout = httpx.Timeout(30.0, read=120.0)
-    from omnigent.cli_auth import open_server_client
+    from omnigent.cli.auth import open_server_client
 
     async with open_server_client(base_url, headers=headers, timeout=timeout) as client:
         startup_profiler.mark("prepare http client ready")
@@ -5362,7 +5362,7 @@ async def _ensure_local_claude_resume_transcript(
             )
             return target
         raise
-    from omnigent.inner.native_attachments import resolve_session_item_file_references
+    from omnigent.util.attachments import resolve_session_item_file_references
 
     # Items are persisted with unresolved file_id attachment blocks;
     # fetch the bytes back so the rebuilt transcript can reference a
@@ -5925,7 +5925,7 @@ def _claude_attachment_text_blocks_from_api_content(
     :param bridge_dir: Session bridge path identifying the attachment cache.
     :returns: Claude ``{"type": "text", "text": ...}`` blocks.
     """
-    from omnigent.inner.native_attachments import attachment_reference_line
+    from omnigent.util.attachments import attachment_reference_line
 
     if not isinstance(content, list):
         return []
@@ -6419,7 +6419,7 @@ def _claude_terminal_request(
     )
     # Let a registered launcher plugin (e.g. Databricks' isaac) rewrite the
     # command/args to wrap the same fully-augmented Claude launch. Identity by
-    # default. See omnigent.claude_launcher.
+    # default. See omnigent.harnesses.claude_native.launcher.
     command, args = resolve_claude_launch(command, args)
     spec: _JsonObject = {
         "command": command,
@@ -6620,7 +6620,7 @@ def _websocket_connect(
     """
     import websockets
 
-    from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN
+    from omnigent.util.runner_identity import OMNIGENT_INTERNAL_WS_ORIGIN
     from omnigent.util.tls import client_ssl_context
 
     # Identify as a first-party client so the server's WebSocket origin

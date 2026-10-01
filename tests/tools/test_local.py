@@ -13,7 +13,6 @@ from typing import Any
 
 import pytest
 
-from omnigent.runner.identity import RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR
 from omnigent.spec.types import LocalToolInfo, SandboxConfig, ToolRuntime
 from omnigent.tools.base import ToolContext
 from omnigent.tools.local import (
@@ -21,6 +20,7 @@ from omnigent.tools.local import (
     LocalToolLoadError,
     load_local_python_tools,
 )
+from omnigent.util.runner_identity import RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR
 
 
 @pytest.fixture(autouse=True)

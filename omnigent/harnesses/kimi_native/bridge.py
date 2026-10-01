@@ -26,11 +26,11 @@ from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from omnigent._platform import stable_user_id
 from omnigent.util.json_types import JsonObject as _JsonObject
+from omnigent.util.portability import stable_user_id
 
 if TYPE_CHECKING:
-    from omnigent.inner.terminal import TerminalInstance
+    from omnigent.terminals.terminal import TerminalInstance
 
 #: Env var carrying the bridge dir into the harness executor process.
 BRIDGE_DIR_ENV_VAR = "HARNESS_KIMI_NATIVE_BRIDGE_DIR"

@@ -67,16 +67,13 @@ from omnigent.entities.permission import SessionPermission
 from omnigent.entities.session_resources import session_resource_view_to_dict
 from omnigent.errors import ElicitationDeclinedError, ErrorCode, OmnigentError
 from omnigent.harnesses.codex_native.elicitation import codex_elicitation_id
+from omnigent.harnesses.native.coding_agents import (
+    native_coding_agent_for_terminal_name,
+)
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE as _HARNESS_NOT_CONFIGURED_ERROR_CODE,
 )
 from omnigent.models.model_override import validate_model_override
-from omnigent.native.native_coding_agents import (
-    native_coding_agent_for_terminal_name,
-)
-from omnigent.runner.identity import (
-    RUNNER_TUNNEL_TOKEN_HEADER,
-)
 from omnigent.runner.routing import RunnerRouter
 from omnigent.runtime import (
     get_agent_cache as _runtime_get_agent_cache,
@@ -168,12 +165,15 @@ from omnigent.util.reasoning_effort import (
     EFFORT_VALUES,
     validate_effort,
 )
+from omnigent.util.runner_identity import (
+    RUNNER_TUNNEL_TOKEN_HEADER,
+)
 
 # Shared constants, state, and small dataclasses live in the _sessions.common
 # leaf module; import them here so this module and its re-exporters see the same
 # objects. The mutable caches are shared by reference across the package.
 # isort: off
-from omnigent.server.routes._sessions.common import (
+from omnigent.server.routes.sessions.common import (
     COST_CONTROL_OVERRIDE_VALUES as COST_CONTROL_OVERRIDE_VALUES,
     _ALLOWED_EVENT_TYPES as _ALLOWED_EVENT_TYPES,
     _ANTIGRAVITY_NATIVE_ELICITATION_HOOK_TIMEOUT_S as _ANTIGRAVITY_NATIVE_ELICITATION_HOOK_TIMEOUT_S,
@@ -343,7 +343,7 @@ from omnigent.server.routes._sessions.common import (
 
 # Lower-layer helpers (SSE builders, publishers, persistence, runner-forward
 # primitives) live in _sessions.helpers.
-from omnigent.server.routes._sessions.helpers import (
+from omnigent.server.routes.sessions.helpers import (
     FILE_CONTENT_CACHE_CONTROL as FILE_CONTENT_CACHE_CONTROL,
     SessionLiveness as SessionLiveness,
     _HostLaunchAttempt as _HostLaunchAttempt,
@@ -549,61 +549,61 @@ from omnigent.server.routes._sessions.helpers import (
 # here at call time, so a facade patch is honored across module boundaries.
 # Bind the real bodies here rather than importing the proxies, so the facade
 # attribute is the implementation tests replace.
-from omnigent.server.routes._sessions.helpers import (
+from omnigent.server.routes.sessions.helpers import (
     _agent_carries_native_fork_history_impl as _agent_carries_native_fork_history,
 )
-from omnigent.server.routes._sessions.helpers import (
+from omnigent.server.routes.sessions.helpers import (
     _agent_is_native_impl as _agent_is_native,
 )
-from omnigent.server.routes._sessions.helpers import (
+from omnigent.server.routes.sessions.helpers import (
     _build_policy_engine_from_spec_impl as _build_policy_engine_from_spec,
 )
-from omnigent.server.routes._sessions.helpers import (
+from omnigent.server.routes.sessions.helpers import (
     _forward_session_change_to_runner_impl as _forward_session_change_to_runner,
 )
-from omnigent.server.routes._sessions.helpers import (
+from omnigent.server.routes.sessions.helpers import (
     _get_runner_client_for_resource_access_impl as _get_runner_client_for_resource_access,
 )
-from omnigent.server.routes._sessions.helpers import (
+from omnigent.server.routes.sessions.helpers import (
     _get_runner_client_impl as _get_runner_client,
 )
-from omnigent.server.routes._sessions.helpers import (
+from omnigent.server.routes.sessions.helpers import (
     _launch_runner_on_host_impl as _launch_runner_on_host,
 )
-from omnigent.server.routes._sessions.helpers import (
+from omnigent.server.routes.sessions.helpers import (
     _load_agent_spec_for_session_impl as _load_agent_spec_for_session,
 )
-from omnigent.server.routes._sessions.helpers import (
+from omnigent.server.routes.sessions.helpers import (
     _poll_request_disconnect_impl as _poll_request_disconnect,
 )
-from omnigent.server.routes._sessions.helpers import (
+from omnigent.server.routes.sessions.helpers import (
     _presentation_labels_for_agent_impl as _presentation_labels_for_agent,
 )
-from omnigent.server.routes._sessions.helpers import (
+from omnigent.server.routes.sessions.helpers import (
     _publish_sandbox_status_impl as _publish_sandbox_status,
 )
-from omnigent.server.routes._sessions.helpers import (
+from omnigent.server.routes.sessions.helpers import (
     _reset_runner_resources_after_switch_impl as _reset_runner_resources_after_switch,
 )
-from omnigent.server.routes._sessions.helpers import (
+from omnigent.server.routes.sessions.helpers import (
     _resolve_harness_impl as _resolve_harness,
 )
-from omnigent.server.routes._sessions.helpers import (
+from omnigent.server.routes.sessions.helpers import (
     _same_provider_family_impl as _same_provider_family,
 )
-from omnigent.server.routes._sessions.helpers import (
+from omnigent.server.routes.sessions.helpers import (
     _signal_terminal_resolved_harness_elicitation_impl as _signal_terminal_resolved_harness_elicitation,
 )
-from omnigent.server.routes._sessions.helpers import (
+from omnigent.server.routes.sessions.helpers import (
     _stop_session_via_runner_impl as _stop_session_via_runner,
 )
-from omnigent.server.routes._sessions.helpers import (
+from omnigent.server.routes.sessions.helpers import (
     _wait_for_runner_client_impl as _wait_for_runner_client,
 )
 
 # Higher-layer orchestration flows (runner relay, session-event dispatch,
 # native-terminal launch, MCP tool calls) live in _sessions.orchestration.
-from omnigent.server.routes._sessions.orchestration import (
+from omnigent.server.routes.sessions.orchestration import (
     RUNNER_DISCONNECT_GRACE_S as RUNNER_DISCONNECT_GRACE_S,
     _accumulate_session_usage as _accumulate_session_usage,
     _best_effort_stop as _best_effort_stop,
@@ -666,22 +666,22 @@ from omnigent.server.routes._sessions.orchestration import (
     configure_subagent_block_notifier as configure_subagent_block_notifier,
     ensure_runner_connected as ensure_runner_connected,
 )
-from omnigent.server.routes._sessions.orchestration import (
+from omnigent.server.routes.sessions.orchestration import (
     _dispatch_session_event_to_runner_impl as _dispatch_session_event_to_runner,
 )
-from omnigent.server.routes._sessions.orchestration import (
+from omnigent.server.routes.sessions.orchestration import (
     _ensure_runner_relay_ready_impl as _ensure_runner_relay_ready,
 )
-from omnigent.server.routes._sessions.orchestration import (
+from omnigent.server.routes.sessions.orchestration import (
     _hold_native_ask_gate_impl as _hold_native_ask_gate,
 )
-from omnigent.server.routes._sessions.orchestration import (
+from omnigent.server.routes.sessions.orchestration import (
     _kick_managed_wake_impl as _kick_managed_wake,
 )
-from omnigent.server.routes._sessions.orchestration import (
+from omnigent.server.routes.sessions.orchestration import (
     _mark_runner_sessions_offline_impl as _mark_runner_sessions_offline,
 )
-from omnigent.server.routes._sessions.orchestration import (
+from omnigent.server.routes.sessions.orchestration import (
     _publish_runner_recovered_status_impl as _publish_runner_recovered_status,
 )
 

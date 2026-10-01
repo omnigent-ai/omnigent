@@ -118,7 +118,7 @@ def build(
         set, the wrapper injects this list into the legacy
         callable's ``context["configured_phases"]`` on every
         evaluation — matching the contract
-        :class:`omnigent.inner.policies.FunctionPolicy`
+        :class:`omnigent.core.policies.FunctionPolicy`
         provides natively (``phase_context = {"configured_phases":
         list(self.on)}``). ``None`` means the wrapper does not
         add the key — used only by tests that build the shim
@@ -495,7 +495,7 @@ def _legacy_context(
     Agent-plane's engine context already carries ``labels``,
     and the per-policy ``configured_phases`` is captured at
     shim build time (matches
-    :class:`omnigent.inner.policies.FunctionPolicy.evaluate`,
+    :class:`omnigent.core.policies.FunctionPolicy.evaluate`,
     which sets ``phase_context = {"configured_phases":
     list(self.on)}``).
 

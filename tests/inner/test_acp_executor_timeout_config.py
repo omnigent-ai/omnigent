@@ -10,7 +10,7 @@ import pytest
 
 _TIMEOUT_ENV = "HARNESS_ACP_PROMPT_TIMEOUT_S"
 _PRINT_TIMEOUT = (
-    "from omnigent.inner.acp_executor import _PROMPT_TIMEOUT_SECONDS; "
+    "from omnigent.harnesses.acp.executor import _PROMPT_TIMEOUT_SECONDS; "
     "print(_PROMPT_TIMEOUT_SECONDS)"
 )
 

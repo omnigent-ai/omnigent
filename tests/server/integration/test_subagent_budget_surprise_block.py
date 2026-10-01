@@ -126,8 +126,8 @@ async def client(
     :param db_uri: Test database URI.
     :param monkeypatch: Pytest monkeypatch fixture.
     """
+    from omnigent.harnesses.runtime.process_manager import HarnessProcessManager
     from omnigent.runtime import _globals, set_harness_process_manager
-    from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
 
     pm = HarnessProcessManager(tmp_parent=tmp_path / "harness_pm")
     await pm.start()

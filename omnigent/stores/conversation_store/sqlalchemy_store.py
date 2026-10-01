@@ -30,7 +30,6 @@ from sqlalchemy import (
 from sqlalchemy.orm import QueryableAttribute, Session, load_only
 from sqlalchemy.sql.selectable import Subquery
 
-from omnigent._wrapper_labels import UI_MODE_LABEL_KEY, WRAPPER_LABEL_KEY
 from omnigent.db.account_authority import AccountAuthority, require_active_account
 from omnigent.db.compression import encode as compress_text
 from omnigent.db.converters import sql_agent_to_entity
@@ -88,8 +87,9 @@ from omnigent.entities import (
 )
 from omnigent.entities.permission import LEVEL_OWNER, RESERVED_USER_PUBLIC
 from omnigent.errors import ErrorCode, OmnigentError, StaleCursorError
-from omnigent.native.native_coding_agents import native_coding_agent_for_wrapper_label
-from omnigent.native.session_todos import validate_session_todos
+from omnigent.harnesses.native.coding_agents import native_coding_agent_for_wrapper_label
+from omnigent.harnesses.native.session_todos import validate_session_todos
+from omnigent.harnesses.wrapper_labels import UI_MODE_LABEL_KEY, WRAPPER_LABEL_KEY
 from omnigent.session_import.models import IMPORT_SOURCE_LABEL_KEY
 from omnigent.stores.conversation_store import (
     _FORK_ONLY_DROPPED_LABEL_KEYS,

@@ -16,8 +16,8 @@ from fastapi import (
 from fastapi.responses import Response
 
 from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.harnesses.native.coding_agents import native_coding_agent_for_agent_name
 from omnigent.host.identity import MANAGED_HOST_TOKEN_HEADER
-from omnigent.native.native_coding_agents import native_coding_agent_for_agent_name
 from omnigent.runner.routing import RunnerRouter
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.runtime.policies.approval import _ELICITATION_MODE
@@ -56,20 +56,20 @@ from omnigent.server.routes._auth_helpers import (
 from omnigent.server.routes._content_type import (
     require_json_content_type,
 )
-from omnigent.server.routes._sessions.common import (
+from omnigent.server.routes.sessions.common import (
     _TURN_ACTOR_LABEL,
     _logger,
     get_server_runner_router,
     host_interactive_shells_for_request,
     set_server_runner_router,
 )
-from omnigent.server.routes._sessions.helpers import (
+from omnigent.server.routes.sessions.helpers import (
     _build_actor,
     _handle_mcp_tools_list,
     _mcp_error_response,
     _mcp_ok_response,
 )
-from omnigent.server.routes._sessions.orchestration import (
+from omnigent.server.routes.sessions.orchestration import (
     _handle_mcp_tools_call,
 )
 from omnigent.server.routes.sessions.routes_permissions import (

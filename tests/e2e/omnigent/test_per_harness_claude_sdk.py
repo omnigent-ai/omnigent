@@ -9,7 +9,7 @@ assistant text length).
 - Omnigent' ``ClaudeSDKExecutor`` regresses (auth, MCP tool
   bridging, Claude Code binary discovery, or the message-stream
   translation in ``claude_sdk_executor.run_turn``).
-- ``omnigent.cli._run_agent`` for the ``-p`` one-shot path
+- ``omnigent.cli.commands._run_agent`` for the ``-p`` one-shot path
   stops printing the assistant text to stdout on turn complete.
 - The Claude Agent SDK dependency or the ``claude`` CLI binary
   goes missing from the Omnigent venv.

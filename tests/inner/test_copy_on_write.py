@@ -8,18 +8,18 @@ from unittest.mock import Mock
 
 import pytest
 
+from omnigent.core.datamodel import OSEnvSandboxSpec, OSEnvSpec, WritePathSpec, parse_write_paths
+from omnigent.core.loader import _parse_os_env_sandbox_spec
 from omnigent.errors import OmnigentError
-from omnigent.inner.bwrap_sandbox import BwrapSandboxBackend
-from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec, WritePathSpec, parse_write_paths
-from omnigent.inner.loader import _parse_os_env_sandbox_spec
-from omnigent.inner.sandbox import (
+from omnigent.sandbox.bwrap import BwrapSandboxBackend
+from omnigent.sandbox.copy_on_write import CopyOnWriteEnvironment, wrap_shared_namespace
+from omnigent.sandbox.core import (
     SandboxPolicy,
     resolve_sandbox,
     with_additional_read_roots,
     with_additional_write_files,
     with_additional_write_roots,
 )
-from omnigent.sandbox.copy_on_write import CopyOnWriteEnvironment, wrap_shared_namespace
 from omnigent.spec.parser import _parse_os_env_sandbox
 
 
@@ -85,8 +85,8 @@ def test_programmatic_configuration_cannot_bypass_backend_check(tmp_path: Path) 
 
 @pytest.fixture
 def backend(monkeypatch) -> BwrapSandboxBackend:
-    monkeypatch.setattr("omnigent.inner.bwrap_sandbox.sys.platform", "linux")
-    monkeypatch.setattr("omnigent.inner.bwrap_sandbox.shutil.which", lambda _: "/usr/bin/bwrap")
+    monkeypatch.setattr("omnigent.sandbox.bwrap.sys.platform", "linux")
+    monkeypatch.setattr("omnigent.sandbox.bwrap.shutil.which", lambda _: "/usr/bin/bwrap")
     return BwrapSandboxBackend()
 
 
@@ -224,7 +224,7 @@ def test_missing_bubblewrap_is_actionable(tmp_path, monkeypatch) -> None:
 def test_missing_bubblewrap_requirements_depend_on_grant(
     backend, tmp_path, monkeypatch, copy_on_write
 ) -> None:
-    monkeypatch.setattr("omnigent.inner.bwrap_sandbox.shutil.which", lambda _: None)
+    monkeypatch.setattr("omnigent.sandbox.bwrap.shutil.which", lambda _: None)
     spec = OSEnvSpec(sandbox=OSEnvSandboxSpec(write_paths=[WritePathSpec(".", copy_on_write)]))
     with pytest.raises(OSError) as error:
         backend.resolve(spec, tmp_path)
@@ -235,10 +235,10 @@ def test_missing_bubblewrap_requirements_depend_on_grant(
 
 @pytest.mark.parametrize("grants", [["."], [WritePathSpec(".", False)]])
 def test_persistent_grants_never_initialize_or_probe_cow(backend, tmp_path, monkeypatch, grants):
-    from omnigent.inner.os_env import create_os_environment
+    from omnigent.environments.os_env import create_os_environment
 
     constructor = Mock(side_effect=AssertionError("Ordinary writes must not initialize COW"))
-    monkeypatch.setattr("omnigent.inner.os_env.CopyOnWriteEnvironment", constructor)
+    monkeypatch.setattr("omnigent.environments.os_env.CopyOnWriteEnvironment", constructor)
     spec = OSEnvSpec(cwd=str(tmp_path), sandbox=OSEnvSandboxSpec(write_paths=grants))
     policy = backend.resolve(spec, tmp_path)
     environment = create_os_environment(spec, sandbox_policy=policy)
@@ -426,7 +426,7 @@ def test_stale_namespace_closes_pinned_descriptors(monkeypatch) -> None:
 
 @pytest.mark.parametrize("active", [False, True])
 def test_framework_runtime_handle_never_reaches_tool_environment(tmp_path, active) -> None:
-    from omnigent.inner.os_env import build_helper_env
+    from omnigent.environments.os_env import build_helper_env
     from omnigent.sandbox.copy_on_write import SHARED_ENVIRONMENT_VAR
 
     policy = _policy(tmp_path)
@@ -455,8 +455,8 @@ def test_framework_runtime_handle_matches_declared_roots(tmp_path, monkeypatch) 
 
 
 def test_terminal_cannot_override_copy_on_write_to_persistent_writes() -> None:
-    from omnigent.inner.datamodel import TerminalEnvSpec
-    from omnigent.inner.terminal import build_terminal_os_env_spec
+    from omnigent.core.datamodel import TerminalEnvSpec
+    from omnigent.terminals.terminal import build_terminal_os_env_spec
 
     parent = OSEnvSpec(
         sandbox=OSEnvSandboxSpec(type="linux_bwrap", write_paths=[WritePathSpec(".", True)])
@@ -492,7 +492,7 @@ def test_keeper_timeout_stops_process_tree(monkeypatch):
 def test_agent_parser_rejects_unshared_harness(tmp_path, harness, legacy):
     import yaml
 
-    from omnigent.inner.loader import _parse_agent_def
+    from omnigent.core.loader import _parse_agent_def
     from omnigent.spec.parser import parse
 
     config = {

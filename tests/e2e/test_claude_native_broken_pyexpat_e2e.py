@@ -3,7 +3,7 @@
 ``omnigent claude`` crashed at startup on macOS under a Homebrew Python 3.14
 whose ``pyexpat`` extension fails to ``dlopen`` (``Symbol not found:
 _XML_SetAllocTrackerActivationThreshold``). The auth-token-path lookup
-(``omnigent.cli_auth._token_file_path``) imports ``omnigent_ui_sdk.terminal``,
+(``omnigent.cli.auth._token_file_path``) imports ``omnigent_ui_sdk.terminal``,
 which pulls in prompt_toolkit; prompt_toolkit evaluates an ``HTML(...)`` template
 at module-import time, which parses XML and needs ``pyexpat``. A broken
 ``pyexpat`` therefore turns a plain state-directory lookup into a hard crash,

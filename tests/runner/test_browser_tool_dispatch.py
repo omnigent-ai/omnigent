@@ -296,7 +296,7 @@ def test_strip_browser_tool_schemas_covers_every_browser_name() -> None:
 @pytest.mark.asyncio
 async def test_screenshot_preserves_image_bytes_and_all_metadata() -> None:
     """Browser metadata and the decoded screenshot survive delivery and replay."""
-    from omnigent.inner.codex_executor import _dynamic_tool_result_payload
+    from omnigent.harnesses.codex.executor import _dynamic_tool_result_payload
     from omnigent.runtime.tool_result_replay import tool_result_content_blocks
     from tests._image_fixtures import _TINY_PNG_BASE64
 
@@ -410,7 +410,7 @@ async def test_screenshot_history_cap_keeps_metadata_and_explicit_image_omission
 async def test_screenshot_never_overrides_existing_failure_status(
     status: dict[str, object],
 ) -> None:
-    from omnigent.inner.executor import classify_tool_result
+    from omnigent.core.executor import classify_tool_result
     from tests._image_fixtures import _TINY_PNG_BASE64
 
     body = {"ok": True, "data_url": f"data:image/png;base64,{_TINY_PNG_BASE64}", **status}
@@ -427,7 +427,7 @@ async def test_screenshot_never_overrides_existing_failure_status(
 
 @pytest.mark.asyncio
 async def test_screenshot_normalizes_base64_without_changing_image_bytes() -> None:
-    from omnigent.inner.codex_executor import _dynamic_tool_result_payload
+    from omnigent.harnesses.codex.executor import _dynamic_tool_result_payload
     from tests._image_fixtures import _TINY_PNG_BASE64
 
     wrapped = "\n".join(

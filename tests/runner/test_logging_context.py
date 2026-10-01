@@ -5,7 +5,7 @@ import logging
 import httpx
 import pytest
 
-from omnigent import debug_logging as dl
+from omnigent.observability import debug_logging as dl
 from omnigent.runner import create_runner_app
 from tests.debug_log_helpers import capture_debug_rows
 from tests.runner.helpers import NullServerClient

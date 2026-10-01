@@ -99,7 +99,7 @@ _PYTHONPATH = os.pathsep.join(
 
 # First-party sentinel Origin so the multipart create passes the
 # require_trusted_origin guard regardless of which client issues it.
-from omnigent.runner.identity import (  # noqa: E402
+from omnigent.util.runner_identity import (  # noqa: E402
     OMNIGENT_INTERNAL_WS_ORIGIN,
     token_bound_runner_id,
 )
@@ -294,7 +294,7 @@ def test_native_claude_terminal_ensure_fails_when_agent_missing(
             [
                 sys.executable,
                 "-m",
-                "omnigent.cli",
+                "omnigent.cli.commands",
                 "server",
                 "--host",
                 "127.0.0.1",
@@ -485,13 +485,13 @@ def _create_claude_native_session_with_agent(base_url: str) -> tuple[str, str]:
     """
     import tempfile
 
-    from omnigent._wrapper_labels import (
+    from omnigent.harnesses.claude_native.main import _materialize_claude_agent_spec
+    from omnigent.harnesses.wrapper_labels import (
         CLAUDE_NATIVE_WRAPPER_VALUE,
         UI_MODE_LABEL_KEY,
         UI_MODE_TERMINAL_VALUE,
         WRAPPER_LABEL_KEY,
     )
-    from omnigent.harnesses.claude_native.main import _materialize_claude_agent_spec
 
     with tempfile.TemporaryDirectory() as tmp:
         yaml_text = _materialize_claude_agent_spec(Path(tmp)).read_text()
@@ -593,7 +593,7 @@ def test_native_claude_turn_fails_when_agent_missing(tmp_path: Path) -> None:
             [
                 sys.executable,
                 "-m",
-                "omnigent.cli",
+                "omnigent.cli.commands",
                 "server",
                 "--host",
                 "127.0.0.1",

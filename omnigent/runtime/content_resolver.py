@@ -16,8 +16,8 @@ import logging
 from typing import Any
 
 from omnigent.entities import ConversationItem, MessageData
-from omnigent.inner.native_attachments import framework_notice_block, resize_dimensions
 from omnigent.stores import ArtifactStore, FileStore
+from omnigent.util.attachments import framework_notice_block, resize_dimensions
 
 _logger = logging.getLogger(__name__)
 
@@ -664,7 +664,7 @@ def extract_text_attachments(
     :returns: A list of ``{"filename", "content_type", "text"}`` entries
         in order. Files requiring filesystem tools carry an empty ``text``.
     """
-    from omnigent.inner.native_attachments import requires_filesystem
+    from omnigent.util.attachments import requires_filesystem
 
     attachments: list[dict[str, str]] = []
     for block in content:
@@ -901,7 +901,7 @@ def _resolve_file_id_block(
     # Types requiring filesystem tools never reach a model as bytes (a native
     # harness reads them off disk instead), so inlining one here would send
     # a payload the provider can't interpret. Fail with an actionable error.
-    from omnigent.inner.native_attachments import requires_filesystem
+    from omnigent.util.attachments import requires_filesystem
 
     if requires_filesystem(file_meta.filename):
         if defer_filesystem_files:

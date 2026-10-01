@@ -14,7 +14,7 @@ from starlette.datastructures import State
 
 from omnigent.entities import Conversation
 from omnigent.errors import ErrorCode, OmnigentError
-from omnigent.harness_plugins import CODEX_NATIVE_CODING_AGENT
+from omnigent.harnesses.registry import CODEX_NATIVE_CODING_AGENT
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE as _HARNESS_NOT_CONFIGURED_ERROR_CODE,
 )

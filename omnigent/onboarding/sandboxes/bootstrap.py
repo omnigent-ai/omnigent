@@ -43,7 +43,7 @@ from urllib.parse import parse_qs, urlparse
 import click
 import httpx
 
-from omnigent.cli_invocation import cli_invocation
+from omnigent.util.cli_invocation import cli_invocation
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
@@ -405,7 +405,7 @@ def derive_workspace(server_url: str) -> DerivedWorkspace | None:
     # Deferred import: cli.py transitively imports this module at
     # startup, so a top-level import would be a cycle. The classifier
     # is cli-private; promoting it to a shared module is follow-up.
-    from omnigent.cli import _databricks_workspace_login_target
+    from omnigent.cli.commands import _databricks_workspace_login_target
 
     probe = _probe_server(server_url)
     if probe is None:

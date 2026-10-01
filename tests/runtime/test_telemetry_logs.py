@@ -1,6 +1,6 @@
 """
 Unit tests for the OTel log bridge wired up in
-``omnigent.runtime.telemetry``.
+``omnigent.observability.otel``.
 
 Exercises ``_init_otel_logs`` and verifies that log records emitted
 inside an active span carry the span's trace_id and span_id once the
@@ -23,7 +23,7 @@ from opentelemetry.sdk._logs.export import (
 )
 from opentelemetry.sdk.trace import TracerProvider
 
-from omnigent.runtime import telemetry
+from omnigent.observability import otel as telemetry
 
 _BRIDGE_NAME = "omnigent-otel-log-bridge"
 
@@ -63,7 +63,7 @@ def _opt_in_telemetry(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     try:
         yield
     finally:
-        from omnigent.inner.tracing import disable_tracing
+        from omnigent.observability.tracing import disable_tracing
 
         disable_tracing()
         telemetry._initialized = False

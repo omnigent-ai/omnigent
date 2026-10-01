@@ -2,9 +2,9 @@
 Regression test: ``omnigent setup`` warns when the installed tmux is too old.
 
 The harness-dependency preflight (``_warn_missing_harness_dependencies`` in
-``omnigent/cli_config.py``) only checks that a ``tmux`` binary exists on
+``omnigent/cli/config_commands.py``) only checks that a ``tmux`` binary exists on
 ``PATH`` — it never checks its version. The native tmux-backed harnesses
-(Claude, Codex, and every managed terminal in ``omnigent/inner/terminal.py``)
+(Claude, Codex, and every managed terminal in ``omnigent/terminals/terminal.py``)
 rely on tmux 3.x features, including the ``allow-passthrough`` option added
 in tmux 3.3. An ancient tmux (e.g. the 1.8 that CentOS 7 ships) therefore
 fails late instead of being flagged up front.

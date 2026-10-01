@@ -27,7 +27,7 @@ import pytest
 import pytest_asyncio
 
 from omnigent.db.utils import generate_agent_id
-from omnigent.server.routes._sessions.helpers import (
+from omnigent.server.routes.sessions.helpers import (
     _session_status_cache,
     reconcile_orphaned_running_status,
 )

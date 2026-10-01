@@ -28,7 +28,6 @@ from typing import TYPE_CHECKING, Literal
 
 from cachetools import TTLCache
 
-from omnigent.debug_logging import debug_event, runner_primary_session_id
 from omnigent.entities.pagination import PagedList
 from omnigent.entities.session_resources import (
     DEFAULT_ENVIRONMENT_ID,
@@ -40,17 +39,18 @@ from omnigent.entities.session_resources import (
     terminal_resource_id,
     terminal_resource_view,
 )
-from omnigent.inner.sandbox import contained_realpath, containment_prefix
-from omnigent.native.native_coding_agents import native_coding_agent_for_harness
-from omnigent.native.native_dispatch import resolve_hook_for_key
+from omnigent.harnesses.native.coding_agents import native_coding_agent_for_harness
+from omnigent.harnesses.native.dispatch import resolve_hook_for_key
+from omnigent.observability.debug_logging import debug_event, runner_primary_session_id
+from omnigent.sandbox.core import contained_realpath, containment_prefix
 
 if TYPE_CHECKING:
+    from omnigent.core.datamodel import OSEnvSpec, TerminalEnvSpec
+    from omnigent.environments.os_env import OSEnvironment
     from omnigent.harnesses.claude_native.status_file import SessionStatusPoller
-    from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
-    from omnigent.inner.os_env import OSEnvironment
-    from omnigent.inner.terminal import TerminalInstance
     from omnigent.spec.types import AgentSpec
     from omnigent.terminals.registry import TerminalRegistry
+    from omnigent.terminals.terminal import TerminalInstance
 
 _logger = logging.getLogger(__name__)
 
@@ -791,7 +791,7 @@ class SessionResourceRegistry:
 
     def _codex_skills_dir_locked(self, session_id: str) -> Path:
         """Allocate the session's skills directory while holding ``_lock``."""
-        from omnigent.inner.codex_staging import CODEX_SKILLS_PREFIX
+        from omnigent.harnesses.codex.staging import CODEX_SKILLS_PREFIX
 
         directory = self._codex_skills_dirs.get(session_id)
         if directory is None:
@@ -945,8 +945,8 @@ class SessionResourceRegistry:
             ``os_env`` field is ``None``.  Callers must gate on
             ``os_env`` presence before materialising an environment.
         """
-        from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
-        from omnigent.inner.os_env import create_os_environment
+        from omnigent.core.datamodel import OSEnvSandboxSpec, OSEnvSpec
+        from omnigent.environments.os_env import create_os_environment
 
         # Prefer the CLI launch workspace so that the OS environment
         # cwd matches the filesystem-registry watch path.  Fall back
@@ -1690,7 +1690,7 @@ class SessionResourceRegistry:
         redacted_last_output: str | None = None
         if resource_role == CODEX_NATIVE_TERMINAL_ROLE:
             from omnigent.harnesses.diagnostics import sanitize_diagnostic_text
-            from omnigent.process_logging import harness_stderr_capture_enabled
+            from omnigent.observability.process_logging import harness_stderr_capture_enabled
 
             if not before_observation or harness_stderr_capture_enabled():
                 # Redact the complete frame before trimming, so a long credential

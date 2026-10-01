@@ -20,8 +20,7 @@ from omnigent.errors import OmnigentError
 from omnigent.runtime import session_stream
 from omnigent.server import session_live_state
 from omnigent.server.routes import sessions
-from omnigent.server.routes._sessions import common
-from omnigent.server.routes.sessions import routes_events
+from omnigent.server.routes.sessions import common, routes_events
 from omnigent.server.schemas import BackgroundTaskInfo
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore

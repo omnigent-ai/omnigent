@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 import yaml
 
-from omnigent.chat import _bundle_agent
+from omnigent.cli.chat import _bundle_agent
 from omnigent.errors import OmnigentError
 from omnigent.spec import load
 from omnigent.spec.omnigent import agent_def_to_agent_spec, agent_spec_to_agent_def

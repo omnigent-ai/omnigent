@@ -43,7 +43,7 @@ def _multi_user(monkeypatch: pytest.MonkeyPatch) -> None:
     turn the marker off for the modules that read it.
     """
     from omnigent.server.routes import _auth_helpers
-    from omnigent.server.routes._sessions import orchestration
+    from omnigent.server.routes.sessions import orchestration
 
     monkeypatch.setattr(_auth_helpers, "local_single_user_enabled", lambda: False)
     monkeypatch.setattr(orchestration, "local_single_user_enabled", lambda: False)

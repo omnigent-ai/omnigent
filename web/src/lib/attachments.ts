@@ -139,7 +139,7 @@ const TEXT_CODE_EXTENSIONS = new Set([
 ]);
 
 // Archives, Office documents, and databases require filesystem tools.
-// Mirrors _FILESYSTEM_ATTACHMENT_EXTENSIONS in omnigent/inner/native_attachments.py.
+// Mirrors _FILESYSTEM_ATTACHMENT_EXTENSIONS in omnigent/util/attachments.py.
 const FILESYSTEM_ATTACHMENT_EXTENSIONS = new Set([
   ".zip",
   ".docx",

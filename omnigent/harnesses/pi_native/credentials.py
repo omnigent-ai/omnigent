@@ -32,14 +32,12 @@ from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple, NotRequired, TypeAlias, TypedDict, TypeGuard
 from urllib.parse import urlparse
 
-from omnigent._platform import default_shell_argv
-from omnigent.databricks_ai_gateway import (
+from omnigent.models import model_catalog
+from omnigent.models.databricks_ai_gateway import (
     DATABRICKS_AI_GATEWAY_LABEL,
     DATABRICKS_TRUSTED_HOST_SUFFIXES,
     is_databricks_ai_gateway_url,
 )
-from omnigent.inner._proc import kill_tree, spawn_kwargs
-from omnigent.models import model_catalog
 from omnigent.models.databricks_model_discovery import preferred_served_claude_model
 from omnigent.models.model_metadata import ModelWireAPI
 from omnigent.models.model_override import normalize_model_for_provider
@@ -69,6 +67,8 @@ from omnigent.onboarding.provider_config import (
     load_config,
 )
 from omnigent.runtime.credentials.databricks import resolve_databricks_workspace
+from omnigent.util.portability import default_shell_argv
+from omnigent.util.proc import kill_tree, spawn_kwargs
 from omnigent.util.reasoning_effort import (
     EFFORT_CLEAR_VALUES,
     PI_EFFORTS,
@@ -128,7 +128,7 @@ _DATABRICKS_GATEWAY_CODEX_SUFFIX = "/codex/v1"
 _DATABRICKS_GATEWAY_ANTHROPIC_SUFFIX = "/anthropic"
 
 # Aliases for the canonical Databricks AI Gateway predicate and its constants,
-# which live in :mod:`omnigent.databricks_ai_gateway` so every surface that must
+# which live in :mod:`omnigent.models.databricks_ai_gateway` so every surface that must
 # recognize the gateway agrees.
 _DATABRICKS_TRUSTED_HOST_SUFFIXES = DATABRICKS_TRUSTED_HOST_SUFFIXES
 _DATABRICKS_AI_GATEWAY_LABEL = DATABRICKS_AI_GATEWAY_LABEL
@@ -631,8 +631,8 @@ def _databricks_pi_provider(entry: ProviderEntry, *, model: str | None) -> PiPro
     """
     # Imported lazily: codex_executor pulls in heavy inner deps, and this
     # module is imported on the runner's session-create path.
-    from omnigent.inner.codex_executor import _databricks_codex_auth_command
-    from omnigent.inner.databricks_executor import _read_databrickscfg_host
+    from omnigent.harnesses.codex.executor import _databricks_codex_auth_command
+    from omnigent.harnesses.databricks.executor import _read_databrickscfg_host
 
     host = _read_databrickscfg_host(entry.profile)
     if not host:
@@ -719,11 +719,11 @@ def _connect_broker_pi_provider(*, model: str | None) -> PiProviderConfig | None
     boot) populated ucode state, so the model resolves to a served id rather than
     the legacy bundled-catalog default.
     """
+    from omnigent.harnesses.databricks.executor import _read_databrickscfg_host
     from omnigent.host.databricks_credential import (
         HOST_DATABRICKS_PROFILE,
         broker_token_command,
     )
-    from omnigent.inner.databricks_executor import _read_databrickscfg_host
     from omnigent.onboarding.provider_config import ProviderEntry
     from omnigent.onboarding.ucode_state import read_ucode_state
 
@@ -1046,7 +1046,7 @@ def _cli_config_databricks_transport(entry: ProviderEntry) -> CodexConfigTranspo
         # No explicit auth command (e.g. ucode config using ambient SDK auth).
         # Try to build a !command using the SDK, same as the databricks-kind path.
         try:
-            from omnigent.inner.codex_executor import _databricks_codex_auth_command
+            from omnigent.harnesses.codex.executor import _databricks_codex_auth_command
 
             ws = resolve_databricks_workspace(None)
             auth_cmd = _databricks_codex_auth_command(ws.host, None)
@@ -1704,7 +1704,7 @@ def resolve_pi_native_provider(
     :returns: The resolved provider config, or ``None`` to fall back to Pi's
         own credentials.
     """
-    from omnigent.inference_config import (
+    from omnigent.models.inference_config import (
         binding_for_harness,
         load_runtime_inference_config,
         resolve_bound_model,
@@ -2005,7 +2005,7 @@ def pi_native_provider_launch(
     # applies the session-level thinking before the compat check fires).
     # Passing None in the overlay makes _deep_merge_settings write null for the
     # key; Pi's getDefaultThinkingLevel() returns null (falsy) → no thinking.
-    from omnigent.inner.pi_settings import prepare_managed_pi_agent_dir
+    from omnigent.harnesses.pi.settings import prepare_managed_pi_agent_dir
 
     overlay: dict[str, object] = {"defaultThinkingLevel": None}
     # Only configured shortlists override the user's picker preferences.

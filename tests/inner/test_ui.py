@@ -1,10 +1,10 @@
-"""Tests for the shared CLI styling layer (``omnigent.inner.ui``)."""
+"""Tests for the shared CLI styling layer (``omnigent.cli.ui``)."""
 
 from __future__ import annotations
 
 import pytest
 
-from omnigent.inner import ui
+from omnigent.cli import ui
 
 
 def test_accent_is_brand_magenta() -> None:

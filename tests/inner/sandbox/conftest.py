@@ -40,7 +40,7 @@ from typing import Any
 
 import pytest
 
-from omnigent.inner.datamodel import CredentialProxySpec, OSEnvSandboxSpec
+from omnigent.core.datamodel import CredentialProxySpec, OSEnvSandboxSpec
 
 _BWRAP_AVAILABLE = shutil.which("bwrap") is not None
 _SANDBOX_EXEC_AVAILABLE = shutil.which("sandbox-exec") is not None
@@ -157,7 +157,7 @@ def sandbox_pythonpath_env(monkeypatch: pytest.MonkeyPatch) -> None:
 
     Helpers spawned with ``cwd`` set to a tempdir would otherwise
     fail with ``ModuleNotFoundError`` because the agent's own
-    bootstrap runs ``import omnigent.inner.os_env`` in the helper.
+    bootstrap runs ``import omnigent.environments.os_env`` in the helper.
     The active backend's ``env_passthrough`` is filtered, but
     ``PYTHONPATH`` is set explicitly on the spawn env so this
     fixture just preserves it for the parent process.

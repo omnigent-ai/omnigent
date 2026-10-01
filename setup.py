@@ -1,7 +1,7 @@
 """Custom setuptools build for omnigent.
 
 Generates ``omnigent/_build_info.py`` at wheel build time so the
-CLI's update-check (``omnigent/update_check.py``) can tell the user
+CLI's update-check (``omnigent/cli/update_check.py``) can tell the user
 when their installed build is stale without having to consult
 ``git`` or hit a remote endpoint at startup.
 

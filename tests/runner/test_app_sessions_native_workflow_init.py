@@ -17,7 +17,7 @@ import pytest
 
 from omnigent.entities.session_resources import SessionResourceView
 from omnigent.harnesses.codex_native.bridge import CODEX_NATIVE_BRIDGE_ID_LABEL_KEY
-from omnigent.native import native_dispatch
+from omnigent.harnesses.native import dispatch as native_dispatch
 from omnigent.runner import create_runner_app
 from omnigent.runner import tool_dispatch as _tool_dispatch
 from omnigent.runner.app import (
@@ -2102,7 +2102,7 @@ async def test_create_session_spawns_the_snapshot_harness_override() -> None:
     from the spec made init request a harness the turns never asked for: the
     mismatch tears down the override subprocess the kickoff turn is streaming
     through and replaces it with the spec's
-    (``omnigent/runtime/harnesses/process_manager.py:749-770``). When the
+    (``omnigent/harnesses/runtime/process_manager.py:749-770``). When the
     spec's harness is a native one, init also launches its terminal on top of
     that spawn, leaving two live processes for the one session.
     """

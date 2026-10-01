@@ -28,7 +28,7 @@
 - `omnigent/antigravity_native_reader.py` (create) — read driver: poll/stream trajectory steps → post items; owns dedup + the interaction-bridge loop.
 - `omnigent/antigravity_native_interactions.py` (create) — interaction bridge: detect→elicitation→deliver, with the timeout/re-read loop.
 - `omnigent/server/routes/_antigravity_elicitation.py` (create) — parse an agy `WAITING` interaction → `ElicitationRequestParams`, and map an `ElicitationResult` back to an `interaction` payload (mirrors `_codex_elicitation.py`).
-- `omnigent/inner/antigravity_native_executor.py` (modify) — `interrupt_session` → `CancelCascadeSteps`; (turns unchanged pending Task 1).
+- `omnigent/harnesses/antigravity_native/executor.py` (modify) — `interrupt_session` → `CancelCascadeSteps`; (turns unchanged pending Task 1).
 - `omnigent/runner/app.py` (modify) — auto-create the RPC reader instead of (or alongside, during cutover) the transcript forwarder.
 - `omnigent/antigravity_native_forwarder.py` (delete at cutover, Task 12).
 - Tests mirror each module under `tests/`.
@@ -207,7 +207,7 @@ def test_handle_user_interaction_raises_on_500(monkeypatch):
 
 ### Task 10: Executor — real interrupt via `CancelCascadeSteps`
 
-**Files:** Modify `omnigent/inner/antigravity_native_executor.py`; Test `tests/inner/test_antigravity_native_executor.py`
+**Files:** Modify `omnigent/harnesses/antigravity_native/executor.py`; Test `tests/inner/test_antigravity_native_executor.py`
 
 **Interfaces:**
 - Consumes: `cancel_cascade_steps` (Task 2), port discovery, bridge state (cascade id).
@@ -235,7 +235,7 @@ def test_handle_user_interaction_raises_on_500(monkeypatch):
 
 ### Task 12: Cutover — retire the transcript forwarder + durable cursor
 
-**Files:** Delete `omnigent/antigravity_native_forwarder.py`; Modify `omnigent/antigravity_native_bridge.py` (drop `forwarded_steps`/cursor), `omnigent/inner/antigravity_native_executor.py` (drop send-keys-only-for-interactions notes), references; relocate `OutboundEvent`/`_ToolCallIdAllocator` into `antigravity_native_steps.py`; delete `tests/test_antigravity_native_forwarder.py`.
+**Files:** Delete `omnigent/antigravity_native_forwarder.py`; Modify `omnigent/antigravity_native_bridge.py` (drop `forwarded_steps`/cursor), `omnigent/harnesses/antigravity_native/executor.py` (drop send-keys-only-for-interactions notes), references; relocate `OutboundEvent`/`_ToolCallIdAllocator` into `antigravity_native_steps.py`; delete `tests/test_antigravity_native_forwarder.py`.
 
 **Interfaces:** None new — removes dead code once the reader path is green.
 

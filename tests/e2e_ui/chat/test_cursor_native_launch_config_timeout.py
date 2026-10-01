@@ -387,7 +387,7 @@ def cursor_launch_rig(
     runner_server_url = f"http://127.0.0.1:{proxy.port}"
     binding_token = secrets.token_urlsafe(32)
 
-    from omnigent.runner.identity import token_bound_runner_id
+    from omnigent.util.runner_identity import token_bound_runner_id
 
     runner_id = token_bound_runner_id(binding_token)
 
@@ -440,7 +440,7 @@ def cursor_launch_rig(
             [
                 sys.executable,
                 "-m",
-                "omnigent.cli",
+                "omnigent.cli.commands",
                 "server",
                 "--host",
                 "127.0.0.1",
@@ -522,13 +522,13 @@ def _create_unbound_cursor_session(base_url: str) -> str:
     :param base_url: Real (non-proxied) server base URL.
     :returns: The new session/conversation id.
     """
-    from omnigent._wrapper_labels import (
+    from omnigent.harnesses.cursor_native.main import _materialize_cursor_agent_spec
+    from omnigent.harnesses.wrapper_labels import (
         CURSOR_NATIVE_WRAPPER_VALUE,
         UI_MODE_LABEL_KEY,
         UI_MODE_TERMINAL_VALUE,
         WRAPPER_LABEL_KEY,
     )
-    from omnigent.harnesses.cursor_native.main import _materialize_cursor_agent_spec
 
     with tempfile.TemporaryDirectory() as tmp:
         spec_path = _materialize_cursor_agent_spec(Path(tmp))

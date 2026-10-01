@@ -84,7 +84,7 @@ def _run_token_write(tmpdir: Path, session_id: str) -> dict:
 
 def _uid_scoped_dirname() -> str:
     """Name of the uid-scoped temp dir cursor-native anchors under."""
-    from omnigent._platform import stable_user_id
+    from omnigent.util.portability import stable_user_id
 
     return f"omnigent-{stable_user_id()}"
 

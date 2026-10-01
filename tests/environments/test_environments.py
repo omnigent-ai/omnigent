@@ -1,9 +1,9 @@
 """
 Tests for the environments wrapper package.
 
-The wrapper is pure re-exports of ``omnigent.inner.os_env`` and
+The wrapper is pure re-exports of ``omnigent.environments.os_env`` and
 the ``OSEnvSpec`` / ``OSEnvSandboxSpec`` dataclasses from
-``omnigent.inner.datamodel``. Tests only verify two properties:
+``omnigent.core.datamodel``. Tests only verify two properties:
 every name in ``__all__`` resolves on the wrapper module, and the
 re-exported objects are identity-equal to their inner counterparts.
 Behavioral coverage of ``OSEnvironment`` and the helper subprocess
@@ -13,8 +13,8 @@ directly.
 
 from __future__ import annotations
 
-import omnigent.inner.datamodel as inner_dm
-import omnigent.inner.os_env as inner_os_env
+import omnigent.core.datamodel as inner_dm
+import omnigent.environments.os_env as inner_os_env
 from omnigent import environments
 
 
@@ -34,7 +34,7 @@ def test_environments_all_symbols_importable() -> None:
 def test_environments_reexports_inner_os_env_objects() -> None:
     """
     The OS-environment classes and factories re-export the same Python
-    objects as ``omnigent.inner.os_env``.
+    objects as ``omnigent.environments.os_env``.
 
     Identity (``is``) — not equality — because anything else means a
     parallel definition has been introduced. Subclass/isinstance checks
@@ -50,7 +50,7 @@ def test_environments_reexports_inner_os_env_objects() -> None:
 def test_environments_reexports_inner_datamodel_specs() -> None:
     """
     ``OSEnvSpec`` and ``OSEnvSandboxSpec`` re-export the same dataclasses
-    as ``omnigent.inner.datamodel``.
+    as ``omnigent.core.datamodel``.
 
     Identity matters because these are dataclasses consumers instantiate
     directly (``OSEnvSpec(type="caller_process", ...)``) — a parallel copy

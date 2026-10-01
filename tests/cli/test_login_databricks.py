@@ -23,7 +23,7 @@ import httpx
 import pytest
 from click.testing import CliRunner
 
-import omnigent.cli as cli_mod
+import omnigent.cli.commands as cli_mod
 
 cli_group = cli_mod.cli
 
@@ -96,7 +96,7 @@ def token_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     :returns: The temp directory path.
     """
     monkeypatch.setattr(
-        "omnigent.cli_auth._token_file_path",
+        "omnigent.cli.auth._token_file_path",
         lambda: tmp_path / "auth_tokens.json",
     )
     monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
@@ -187,7 +187,7 @@ def test_login_apps_redirect_stores_pointer_record(
     The record (not a bearer) is what later commands resolve to fresh
     workspace tokens — this is the core of the no-profile Apps CUJ.
     """
-    from omnigent.cli_auth import load_databricks_workspace_host
+    from omnigent.cli.auth import load_databricks_workspace_host
 
     fake = _FakeHttpx(
         responses=[
@@ -217,7 +217,7 @@ def test_login_workspace_hosted_401_uses_url_host(
     the workspace IS the server host, and the record must key on the full
     server URL (path included).
     """
-    from omnigent.cli_auth import load_databricks_workspace_host
+    from omnigent.cli.auth import load_databricks_workspace_host
 
     fake = _FakeHttpx(
         responses=[
@@ -250,7 +250,7 @@ def test_login_account_host_inherits_cli_selected_workspace(
     it back and routes the account token to it (``params o=…``), succeeding
     unattended — and records the inherited id for later commands.
     """
-    from omnigent.cli_auth import load_databricks_org_id, load_databricks_workspace_host
+    from omnigent.cli.auth import load_databricks_org_id, load_databricks_workspace_host
 
     fake = _FakeHttpx(
         responses=[
@@ -284,7 +284,7 @@ def test_login_workspace_hosted_uses_cli_workspace_id_without_metadata(
     monkeypatch: pytest.MonkeyPatch, token_dir: Path
 ) -> None:
     """Workspace-hosted login can route with only the CLI profile workspace id."""
-    from omnigent.cli_auth import load_databricks_org_id, load_databricks_workspace_host
+    from omnigent.cli.auth import load_databricks_org_id, load_databricks_workspace_host
 
     fake = _FakeHttpx(
         responses=[
@@ -366,7 +366,7 @@ def test_login_workspace_hosted_with_selector_binds_and_succeeds(
     binds the grant to the workspace) and the verify probe (``params o=<id>``,
     which routes to it), and is recorded for later commands.
     """
-    from omnigent.cli_auth import load_databricks_org_id, load_databricks_workspace_host
+    from omnigent.cli.auth import load_databricks_org_id, load_databricks_workspace_host
 
     fake = _FakeHttpx(
         responses=[
@@ -406,7 +406,7 @@ def test_login_apps_fails_loud_without_databricks_extra(
     fallback to the OIDC flow would produce a baffling ticket-endpoint
     error instead.
     """
-    from omnigent.cli_auth import load_databricks_workspace_host
+    from omnigent.cli.auth import load_databricks_workspace_host
 
     fake = _FakeHttpx(responses=[_response(302, headers={"location": _APPS_REDIRECT})])
     _patch_login_env(monkeypatch, fake_httpx=fake, sdk_installed=False)
@@ -430,7 +430,7 @@ def test_login_runs_databricks_auth_login_when_no_cached_grant(
     isn't consulted anywhere. After login the token resolves and the
     record is stored.
     """
-    from omnigent.cli_auth import load_databricks_workspace_host
+    from omnigent.cli.auth import load_databricks_workspace_host
 
     fake = _FakeHttpx(
         responses=[
@@ -463,7 +463,7 @@ def test_login_fails_loud_when_app_rejects_workspace_token(
     can't reach the app; storing the record anyway would make every later
     command fail with the same opaque 403.
     """
-    from omnigent.cli_auth import load_databricks_workspace_host
+    from omnigent.cli.auth import load_databricks_workspace_host
 
     fake = _FakeHttpx(
         responses=[
@@ -512,7 +512,7 @@ def test_login_stale_cached_grant_triggers_fresh_login_and_retry(
     server 302s/403s. Failing outright would strand the user; the fresh
     login replaces the bad cache entry and the retry succeeds.
     """
-    from omnigent.cli_auth import load_databricks_workspace_host
+    from omnigent.cli.auth import load_databricks_workspace_host
 
     fake = _FakeHttpx(
         responses=[
@@ -640,7 +640,7 @@ def test_login_threads_org_id_through_workspace_login_and_verify(
     workspace (else it defaults to the account → HTTP 503). The selector is
     also persisted so later commands replay it.
     """
-    from omnigent.cli_auth import load_databricks_org_id, load_databricks_workspace_host
+    from omnigent.cli.auth import load_databricks_org_id, load_databricks_workspace_host
 
     fake = _FakeHttpx(
         responses=[
@@ -736,7 +736,7 @@ def test_login_accounts_mode_sets_default_server(
     """
     fake = _FakeHttpx(responses=[_response(401, body={"login_url": "/login"})])
     _patch_login_env(monkeypatch, fake_httpx=fake)
-    monkeypatch.setattr("omnigent.cli._accounts_login", lambda server: None)
+    monkeypatch.setattr("omnigent.cli.commands._accounts_login", lambda server: None)
 
     result = CliRunner().invoke(cli_group, ["login", "http://omni.internal:6767"])
 
@@ -1254,7 +1254,7 @@ def test_resolve_server_url_strips_query_and_expands(
     resolved = cli_mod._resolve_server_url(f"{_WORKSPACE}/?o=2850744067564480")
     assert resolved.api_base == _WORKSPACE_API_URL
     assert resolved.org_id == "2850744067564480"
-    from omnigent.cli_auth import databricks_request_headers
+    from omnigent.cli.auth import databricks_request_headers
 
     assert databricks_request_headers(resolved.api_base)["X-Databricks-Org-Id"] == (
         "2850744067564480"
@@ -1277,7 +1277,7 @@ def test_resolve_server_url_strips_query_on_full_mount(
     resolved = cli_mod._resolve_server_url(f"{_WORKSPACE_API_URL}?o=2850744067564480")
     assert resolved.api_base == _WORKSPACE_API_URL
     assert resolved.org_id == "2850744067564480"
-    from omnigent.cli_auth import databricks_request_headers
+    from omnigent.cli.auth import databricks_request_headers
 
     assert databricks_request_headers(resolved.api_base)["X-Databricks-Org-Id"] == (
         "2850744067564480"
@@ -1291,7 +1291,7 @@ def test_resolve_server_url_does_not_store_selector_off_managed_mount(
     """An arbitrary server query must not create managed routing state."""
     stored: list[tuple[str, str]] = []
     monkeypatch.setattr(
-        "omnigent.cli_auth.store_databricks_org_id",
+        "omnigent.cli.auth.store_databricks_org_id",
         lambda server, org_id: stored.append((server, org_id)),
     )
 
@@ -1316,7 +1316,7 @@ def test_resolve_server_url_reports_selector_persistence_failure(
         lambda _server: _WORKSPACE_API_URL,
     )
     monkeypatch.setattr(
-        "omnigent.cli_auth.store_databricks_org_id",
+        "omnigent.cli.auth.store_databricks_org_id",
         fail_to_store,
     )
 
@@ -1382,7 +1382,7 @@ def test_login_defaults_scheme_to_https(monkeypatch: pytest.MonkeyPatch, token_d
     to https so the probe reaches the workspace API proxy and the stored
     record keys on the https URL.
     """
-    from omnigent.cli_auth import load_databricks_workspace_host
+    from omnigent.cli.auth import load_databricks_workspace_host
 
     fake = _FakeHttpx(
         responses=[

@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import pytest
 
-from omnigent.runtime.harnesses.process_manager import (
+from omnigent.harnesses.runtime.process_manager import (
     _DEFAULT_IDLE_TIMEOUT_S,
     _HARNESS_IDLE_TIMEOUT_ENV,
     HarnessProcessManager,

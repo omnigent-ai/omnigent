@@ -96,7 +96,7 @@ async def test_logs_command_creates_current_session_zip_at_requested_path(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Passing a path to /logs bundles only current-session files."""
-    import omnigent.cli_diagnostics as cli_diagnostics
+    import omnigent.cli.diagnostics as cli_diagnostics
 
     logs = tmp_path / "logs"
     debug = tmp_path / "debug"

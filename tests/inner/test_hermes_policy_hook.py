@@ -13,7 +13,7 @@ import json
 
 import pytest
 
-from omnigent.inner import hermes_policy_hook
+from omnigent.harnesses.hermes import policy_hook as hermes_policy_hook
 
 
 @pytest.fixture
@@ -36,7 +36,7 @@ def _run(monkeypatch: pytest.MonkeyPatch, tool_name: str) -> tuple[dict, bool]:
         return _R()
 
     monkeypatch.setattr(
-        "omnigent.native.native_policy_hook.post_evaluate_with_retry", _spy, raising=True
+        "omnigent.harnesses.native.policy_hook.post_evaluate_with_retry", _spy, raising=True
     )
     monkeypatch.setattr(
         "sys.stdin",

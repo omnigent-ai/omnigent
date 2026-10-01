@@ -22,11 +22,11 @@ import pytest
 from omnigent.entities.conversation import Conversation
 from omnigent.policies.types import EvaluationContext, PolicyResult
 from omnigent.server.routes import sessions as sessions_mod
-from omnigent.server.routes._sessions import orchestration
 from omnigent.server.routes.sessions import (
     _handle_mcp_tools_call,
     _pending_policy_ask_writes,
     _PendingPolicyAskWrites,
+    orchestration,
 )
 from omnigent.spec.types import Phase, PolicyAction
 

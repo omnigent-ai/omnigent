@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pytest
 
-from omnigent import cli_diagnostics
+from omnigent.cli import diagnostics as cli_diagnostics
 
 
 @dataclass(frozen=True)
@@ -424,7 +424,7 @@ def test_main_logs_click_exceptions(
     :returns: ``None``.
     """
     del isolated_cli_diagnostics
-    from omnigent import cli as cli_module
+    from omnigent.cli import commands as cli_module
 
     # An unsupported --harness is a deterministic ClickException trigger that
     # raises before any daemon/network work. (A bare `omnigent run` no longer
@@ -610,9 +610,9 @@ def test_main_reports_unknown_command_without_recovery_hint(
 
     import click
 
-    import omnigent.cli as cli
+    import omnigent.cli.commands as cli
 
-    monkeypatch.setattr("omnigent.cli_diagnostics.setup_cli_logging", lambda argv: None)
+    monkeypatch.setattr("omnigent.cli.diagnostics.setup_cli_logging", lambda argv: None)
 
     def _unknown_command(*_args: object, **_kwargs: object) -> None:
         raise click.UsageError("No such command 'copilto'.")
@@ -643,7 +643,7 @@ def test_daemon_exit_error_carries_server_log_tail(
     """
     from types import SimpleNamespace
 
-    import omnigent.cli as cli
+    import omnigent.cli.commands as cli
     from omnigent.host import local_server
 
     monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
@@ -687,7 +687,7 @@ def test_daemon_exit_error_omits_tail_without_attributable_record(
     """
     from types import SimpleNamespace
 
-    import omnigent.cli as cli
+    import omnigent.cli.commands as cli
 
     monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
     log_dir = tmp_path / "logs" / "server"
@@ -761,11 +761,11 @@ def test_main_surfaces_install_command_on_stderr_without_recovery_hint(
     import contextlib
     import io
 
-    import omnigent.cli as cli
+    import omnigent.cli.commands as cli
     from omnigent.host.local_server import LocalServerStartupError
 
     # Keep the test hermetic: no diagnostics log files, no update check.
-    monkeypatch.setattr("omnigent.cli_diagnostics.setup_cli_logging", lambda argv: None)
+    monkeypatch.setattr("omnigent.cli.diagnostics.setup_cli_logging", lambda argv: None)
 
     def _boom(*_args: object, **_kwargs: object) -> None:
         raise LocalServerStartupError(

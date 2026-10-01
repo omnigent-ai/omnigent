@@ -8,7 +8,7 @@ from pathlib import Path
 import httpx
 import pytest
 
-from omnigent.native._native_post_delivery import (
+from omnigent.harnesses.native.post_delivery import (
     _DEAD_LETTER_BACKUP_FILE,
     _DEAD_LETTER_FILE,
     _DEAD_LETTER_MAX_BYTES,
@@ -568,8 +568,8 @@ async def test_retry_loop_records_exhausted_connectivity_failure_for_watchdog() 
     can name the real cause. Fails before the recording call was added (the
     health slot stays empty); passes after.
     """
-    from omnigent.native import _native_forwarder_health as health
-    from omnigent.native._native_post_delivery import post_session_event_with_retry
+    from omnigent.harnesses.native import forwarder_health as health
+    from omnigent.harnesses.native.post_delivery import post_session_event_with_retry
 
     class _AlwaysConnectError:
         """Stub client whose every POST fails to connect."""
@@ -611,8 +611,8 @@ async def test_retry_loop_success_clears_a_prior_connectivity_failure() -> None:
     the retry loop must empty the failure slot so the idle watchdog can't blame
     a long-resolved outage for a later, unrelated stall.
     """
-    from omnigent.native import _native_forwarder_health as health
-    from omnigent.native._native_post_delivery import post_session_event_with_retry
+    from omnigent.harnesses.native import forwarder_health as health
+    from omnigent.harnesses.native.post_delivery import post_session_event_with_retry
 
     class _Ok:
         """Stub client whose POST always succeeds with 200."""

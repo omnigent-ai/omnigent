@@ -14,8 +14,8 @@ from typing import Any
 
 import pytest
 
-from omnigent.inner import antigravity_harness
-from omnigent.runtime.harnesses import _HARNESS_MODULES
+from omnigent.harnesses.antigravity import harness as antigravity_harness
+from omnigent.harnesses.runtime import _HARNESS_MODULES
 
 
 def test_harness_module_registered_in_module_registry() -> None:
@@ -25,7 +25,7 @@ def test_harness_module_registered_in_module_registry() -> None:
     parent tries to spawn it for an ``executor.harness == "antigravity"``
     spec.
     """
-    assert _HARNESS_MODULES.get("antigravity") == "omnigent.inner.antigravity_harness"
+    assert _HARNESS_MODULES.get("antigravity") == "omnigent.harnesses.antigravity.harness"
 
 
 def test_create_app_returns_fastapi_with_required_routes() -> None:
@@ -64,7 +64,7 @@ def _capture_factory_kwargs(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
         captured.update(kwargs)
 
     monkeypatch.setattr(
-        "omnigent.inner.antigravity_harness.AntigravityExecutor.__init__", _fake_init
+        "omnigent.harnesses.antigravity.harness.AntigravityExecutor.__init__", _fake_init
     )
     antigravity_harness._build_antigravity_executor()
     return captured

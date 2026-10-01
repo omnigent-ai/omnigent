@@ -18,7 +18,7 @@ import click
 import pytest
 from click.testing import CliRunner
 
-from omnigent.cli import _require_existing_sqlite_db, cli
+from omnigent.cli.commands import _require_existing_sqlite_db, cli
 
 
 def test_missing_parent_dir_raises_actionable_error(tmp_path: Path) -> None:

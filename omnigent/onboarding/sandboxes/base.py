@@ -343,7 +343,7 @@ def render_host_config_write_command(host_config: dict[str, object]) -> str:
     Server-managed replacement semantics: the server OWNS the names/keys it
     injects. Entries recorded in the previous marker are removed first BY NAME,
     then the current payload merges in with
-    ``omnigent.cli._save_global_config``'s
+    ``omnigent.cli.commands._save_global_config``'s
     ``deep_merge_keys=("providers",)`` semantics — ``providers`` one
     level deep and every other top-level key wholesale. Removing by name (rather
     than only when unchanged) is deliberate: a renamed gateway must not leave

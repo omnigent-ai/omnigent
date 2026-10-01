@@ -4,7 +4,7 @@ Omnigent keeps all machine-local state in a single **runtime data directory**,
 `~/.omnigent` by default. This is where the runtime database, logs,
 credentials, per-harness session state, and process registries live.
 
-The root is resolved by `data_dir()` in `omnigent/process_logging.py`:
+The root is resolved by `data_dir()` in `omnigent/observability/process_logging.py`:
 
 ```python
 def data_dir() -> Path:
@@ -24,7 +24,7 @@ Two related resolvers exist for narrower scopes:
   `OMNIGENT_ADMIN_CREDENTIALS_PATH` (its parent dir anchors the data dir on a
   mounted volume) and otherwise falls back to `~/.omnigent`.
 - CLI and local-server flows resolve their data dir via `_local_data_dir()` in
-  `omnigent/host/local_server.py` (imported by `omnigent/cli.py`), which also
+  `omnigent/host/local_server.py` (imported by `omnigent/cli/commands.py`), which also
   honors `OMNIGENT_DATA_DIR`, else `~/.omnigent`. Two worktrees still share
   `~/.omnigent/chat.db` unless each sets `OMNIGENT_DATA_DIR` — that env var is
   the knob for isolating a worktree's runtime DB; there is no automatic split.
@@ -38,13 +38,13 @@ directly instead of going through `data_dir()`.
 | Path | Purpose | Defined in |
 |------|---------|------------|
 | `config.yaml` | User-level config: harness auth references, settings. Overridable with `OMNIGENT_CONFIG_HOME`. | `omnigent/config.py` |
-| `chat.db` (+ `-shm`, `-wal`) | Main SQLite runtime DB — conversations, sessions, messages. Machine-global unless a project-local `.omnigent/` is used. | `omnigent/cli.py`, `omnigent/host/local_server.py` |
-| `auth_tokens.json` / `auth_tokens.lock` | Per-server OIDC/session tokens keyed by server URL, written with user-only permissions, plus its lock file (`.json` is replaced by `.lock`, so it is `auth_tokens.lock`, not `auth_tokens.json.lock`). | `omnigent/cli_auth.py` |
+| `chat.db` (+ `-shm`, `-wal`) | Main SQLite runtime DB — conversations, sessions, messages. Machine-global unless a project-local `.omnigent/` is used. | `omnigent/cli/commands.py`, `omnigent/host/local_server.py` |
+| `auth_tokens.json` / `auth_tokens.lock` | Per-server OIDC/session tokens keyed by server URL, written with user-only permissions, plus its lock file (`.json` is replaced by `.lock`, so it is `auth_tokens.lock`, not `auth_tokens.json.lock`). | `omnigent/cli/auth.py` |
 | `local_server.pid` / `local_server.sig` | Recorded pid/port and signature of the running local server. | `omnigent/host/local_server.py` |
-| `host.pid` | Recorded pid of the local host process. | `omnigent/cli.py` |
+| `host.pid` | Recorded pid of the local host process. | `omnigent/cli/commands.py` |
 | `telemetry.json` | Telemetry state, including the persistent `installation_id`. | `omnigent/telemetry/installation_id.py` |
-| `.update_check.json` **†** | Cached result of the (potentially slow) update check. | `omnigent/update_check.py` |
-| `install_ledger.json` | Record of what the installer wrote, used by uninstall/purge. | `omnigent/install_ledger.py` |
+| `.update_check.json` **†** | Cached result of the (potentially slow) update check. | `omnigent/cli/update_check.py` |
+| `install_ledger.json` | Record of what the installer wrote, used by uninstall/purge. | `omnigent/onboarding/install_ledger.py` |
 | `admins`, `allowed_domains` | OSS server operator state: admin list and OIDC allowed-domains, co-located so operator-editable files live together. Operator-managed input files — the cited modules read them. A listed identity is promoted to the database admin flag on login (OIDC, accounts) or on first page load (header auth); removing it from `admins` does not revoke that flag, which must be cleared separately. | Read by `omnigent/server/admin_list.py`, `omnigent/server/oidc_access.py` |
 | `sharing_mode`, `public_sharing`, `default_public_sessions` | Server-side sharing settings, written from Settings > Sharing. Each overrides its boot default: `OMNIGENT_SHARING_MODE`, `OMNIGENT_PUBLIC_SHARING` and `OMNIGENT_DEFAULT_PUBLIC_SESSIONS` (`off` / `sandbox` / `all`, which new sessions start with public read access). | `omnigent/server/sharing_settings.py` |
 
@@ -52,16 +52,16 @@ directly instead of going through `data_dir()`.
 
 | Directory | Purpose | Defined in |
 |-----------|---------|------------|
-| `logs/` | Process logs split by role: `cli/`, `host/`, `runner/`, `server/`. | `logs_root()` / `process_log_dir()` in `omnigent/process_logging.py` |
-| `artifacts/` | Stored artifacts, one directory per artifact ID; paired with `chat.db`. | `omnigent/chat.py`, `omnigent/host/local_server.py` |
-| `attachments/` | Native harness attachment copies, grouped by an opaque session cache key. The original uploads remain in the server's configured artifact store. | `attachment_cache_dir()` in `omnigent/inner/native_attachments.py` |
-| `runners/` | Runner identity: `runner_id` (stable per-machine id), created by `identity.py`. Also holds per-runner workspace subdirs — `runner_<id>/` and, for token-bound remote `run --server` runners, `runner_token_<hash>/` — each with a `pending-tokens/` dir; those are created by the host/runner launch path, not `identity.py`. | `omnigent/runner/identity.py` (`runner_id`) |
+| `logs/` | Process logs split by role: `cli/`, `host/`, `runner/`, `server/`. | `logs_root()` / `process_log_dir()` in `omnigent/observability/process_logging.py` |
+| `artifacts/` | Stored artifacts, one directory per artifact ID; paired with `chat.db`. | `omnigent/cli/chat.py`, `omnigent/host/local_server.py` |
+| `attachments/` | Native harness attachment copies, grouped by an opaque session cache key. The original uploads remain in the server's configured artifact store. | `attachment_cache_dir()` in `omnigent/util/attachments.py` |
+| `runners/` | Runner identity: `runner_id` (stable per-machine id), created by `identity.py`. Also holds per-runner workspace subdirs — `runner_<id>/` and, for token-bound remote `run --server` runners, `runner_token_<hash>/` — each with a `pending-tokens/` dir; those are created by the host/runner launch path, not `identity.py`. | `omnigent/util/runner_identity.py` (`runner_id`) |
 | `daemons/` | Daemon lifecycle registry, one JSON record per target. | `daemon_registry_dir()` in `omnigent/host/daemon_lifecycle.py` |
-| `crashes/` | Crash reports, `crash-<timestamp>.md`. | `omnigent/crash_handler.py` |
+| `crashes/` | Crash reports, `crash-<timestamp>.md`. | `omnigent/cli/crash_handler.py` |
 | `cache/` | Derived caches: `model-catalogs/` (per-harness model lists) and `codex-model-probe/` **†**. | `omnigent/models/model_catalog_store.py`, `omnigent/harnesses/codex_native/app_server.py` |
 | `models/` **†** | Downloaded models, e.g. `dictation/asr` and `dictation/punct`. | `omnigent/server/dictation.py` |
-| `agents/` **†** | User-level agent directory (`_GLOBAL_AGENTS_DIR`). | `omnigent/cli.py` |
-| `profiles/` | cProfile output when CLI profiling is enabled. | `omnigent/cli.py` |
+| `agents/` **†** | User-level agent directory (`_GLOBAL_AGENTS_DIR`). | `omnigent/cli/commands.py` |
+| `profiles/` | cProfile output when CLI profiling is enabled. | `omnigent/cli/commands.py` |
 | `debug/` **†** | Per-session JSONL event tapes, `events-<session_id>.jsonl`. | `omnigent/repl/_event_tape.py` |
 
 ### Agent cache staging and recovery
@@ -152,7 +152,7 @@ data dir. See e.g. `omnigent/harnesses/qwen_native/bridge.py`.
 ## Notes
 
 - The canonical source of truth is the code, not this document. Start at
-  `data_dir()` in `omnigent/process_logging.py` and follow its callers; each
+  `data_dir()` in `omnigent/observability/process_logging.py` and follow its callers; each
   subsystem documents its own path in a docstring.
 - An existing `~/.omnigent` may also contain files this document doesn't list:
   backups you created by hand (e.g. `chat.db.bak*`, `chat1.db`) and leftovers

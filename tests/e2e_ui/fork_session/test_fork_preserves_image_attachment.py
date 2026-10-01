@@ -4,7 +4,7 @@
 ``file_id`` image block); the fork must also own a copy of the underlying
 session-scoped file resource that block references, so any consumer that
 resolves it against the FORK's own session id — the web chat renderer here,
-native harness executors elsewhere (``omnigent/inner/native_attachments.py``)
+native harness executors elsewhere (``omnigent/util/attachments.py``)
 — can load it.
 
 This drives the reported journey at the web surface: attach + send an image

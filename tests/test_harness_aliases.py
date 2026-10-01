@@ -1,10 +1,10 @@
-"""Tests for omnigent.harness_aliases."""
+"""Tests for omnigent.harnesses.aliases."""
 
 from __future__ import annotations
 
 import pytest
 
-from omnigent.harness_aliases import (
+from omnigent.harnesses.aliases import (
     canonicalize_harness,
     is_native_harness,
     native_terminal_name,

@@ -20,10 +20,10 @@ from typing import TYPE_CHECKING
 
 import tomllib
 
-from omnigent.native import native_bridge_common
+from omnigent.harnesses.native import bridge_common as native_bridge_common
 
 if TYPE_CHECKING:
-    from omnigent.inner.terminal import TerminalInstance
+    from omnigent.terminals.terminal import TerminalInstance
 
 CODEX_NATIVE_BRIDGE_ID_LABEL_KEY = "omnigent.codex_native.bridge_id"
 CODEX_NATIVE_BRIDGE_DIR_ENV_VAR = "HARNESS_CODEX_NATIVE_BRIDGE_DIR"
@@ -499,7 +499,7 @@ def read_codex_config_model(bridge_dir: Path) -> str | None:
     Per-session isolation: ``config.toml`` is **copied** (not symlinked)
     into each session's private ``CODEX_HOME`` by
     ``_populate_codex_home_config`` (see ``_CODEX_HOME_COPY_FILES`` in
-    ``omnigent.inner.codex_executor``), then seeded with the session's
+    ``omnigent.harnesses.codex.executor``), then seeded with the session's
     launch model by ``_pin_codex_config_model`` in
     ``omnigent.harnesses.codex_native.app_server``. An in-TUI ``/model`` writes
     only to that session's copy, so concurrent sessions do not interfere.

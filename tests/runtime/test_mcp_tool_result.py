@@ -15,11 +15,11 @@ from mcp.types import (
     TextContent,
 )
 
+from omnigent.core.executor import ToolCallStatus, classify_tool_result
 from omnigent.harnesses.claude_native.bridge import _mcp_response_from_tool_result
-from omnigent.inner.claude_sdk_executor import _build_mcp_tools
-from omnigent.inner.codex_executor import _dynamic_tool_result_payload
-from omnigent.inner.executor import ToolCallStatus, classify_tool_result
-from omnigent.runtime.harnesses._executor_adapter import _bridge_one_dispatch
+from omnigent.harnesses.claude_sdk.executor import _build_mcp_tools
+from omnigent.harnesses.codex.executor import _dynamic_tool_result_payload
+from omnigent.harnesses.runtime._executor_adapter import _bridge_one_dispatch
 from omnigent.runtime.mcp_tool_result import decode_mcp_image_result
 from omnigent.runtime.tool_result_replay import tool_result_content_blocks
 from omnigent.tools.mcp import _format_call_result

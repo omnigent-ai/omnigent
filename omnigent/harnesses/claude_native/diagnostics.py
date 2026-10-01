@@ -13,12 +13,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
 
-from omnigent.debug_logging import debug_event
 from omnigent.harnesses.diagnostics import (
     DIAGNOSTIC_TAIL_BYTES,
     bounded_diagnostic_tail,
 )
-from omnigent.process_logging import harness_stderr_capture_enabled
+from omnigent.observability.debug_logging import debug_event
+from omnigent.observability.process_logging import harness_stderr_capture_enabled
 
 CLAUDE_DEBUG_LOG_MARKER = "claude-debug-active.json"
 _READ_BYTES = 64 * 1024

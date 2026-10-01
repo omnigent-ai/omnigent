@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import pytest
 
-from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
-from omnigent.inner.codex_executor import CodexExecutor
-from omnigent.inner.executor import ExecutorConfig, ExecutorError, TurnComplete
-from omnigent.inner.openai_agents_sdk_executor import OpenAIAgentsSDKExecutor
+from omnigent.core.executor import ExecutorConfig, ExecutorError, TurnComplete
+from omnigent.harnesses.claude_sdk.executor import ClaudeSDKExecutor
+from omnigent.harnesses.codex.executor import CodexExecutor
+from omnigent.harnesses.openai_agents.executor import OpenAIAgentsSDKExecutor
 from omnigent.llms.adapters.anthropic import _effort_to_budget
 from omnigent.llms.errors import PermanentLLMError
 
@@ -83,11 +83,11 @@ async def test_openai_agents_coerces_max_to_xhigh(monkeypatch: pytest.MonkeyPatc
     """
     import types
 
-    from omnigent.inner.openai_agents_sdk_executor import _AgentsSessionState
+    from omnigent.harnesses.openai_agents.executor import _AgentsSessionState
 
     fake_agents = types.SimpleNamespace(OpenAIProvider=lambda **kwargs: types.SimpleNamespace())
     monkeypatch.setattr(
-        "omnigent.inner.openai_agents_sdk_executor._ensure_agents_sdk", lambda: fake_agents
+        "omnigent.harnesses.openai_agents.executor._ensure_agents_sdk", lambda: fake_agents
     )
     executor = OpenAIAgentsSDKExecutor(client=object())
     monkeypatch.setattr(

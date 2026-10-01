@@ -9,7 +9,7 @@ import pytest
 
 import omnigent.onboarding.harness_install as hi
 import omnigent.onboarding.harness_readiness as readiness
-from omnigent.harness_aliases import NATIVE_HARNESSES
+from omnigent.harnesses.aliases import NATIVE_HARNESSES
 
 
 @pytest.fixture(autouse=True)
@@ -23,7 +23,7 @@ def _isolate_credentials(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Non
 
     monkeypatch.setattr(_ca, "gh_cli_github_token", lambda host=None: None)
 
-    import omnigent._platform as _plat
+    import omnigent.util.portability as _plat
 
     monkeypatch.delenv("OMNIGENT_CODEX_PATH", raising=False)
     monkeypatch.setattr(_plat, "_cli_fallback_dirs", lambda: ())
@@ -55,7 +55,7 @@ def test_native_terminal_harness_unavailable_on_windows(
     harness: str,
 ) -> None:
     _all_clis_installed(monkeypatch)
-    import omnigent._platform as _plat
+    import omnigent.util.portability as _plat
 
     monkeypatch.setattr(_plat, "IS_WINDOWS", True)
     monkeypatch.setattr(readiness, "IS_WINDOWS", True)
@@ -69,7 +69,7 @@ def test_sdk_harnesses_remain_available_on_windows(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _all_clis_installed(monkeypatch)
-    import omnigent._platform as _plat
+    import omnigent.util.portability as _plat
 
     monkeypatch.setattr(_plat, "IS_WINDOWS", True)
     monkeypatch.setattr(readiness, "IS_WINDOWS", True)

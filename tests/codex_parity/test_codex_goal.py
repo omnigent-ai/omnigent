@@ -11,7 +11,7 @@ from fastapi.responses import JSONResponse
 
 from omnigent.entities import Conversation
 from omnigent.errors import OmnigentError
-from omnigent.inner.codex_executor import CodexExecutor
+from omnigent.harnesses.codex.executor import CodexExecutor
 from omnigent.server import app as app_module
 from omnigent.server.routes.sessions import create_sessions_router
 from tests.codex_parity.helpers import (

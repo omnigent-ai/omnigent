@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from omnigent._e2e_policy_callables import block_on_sentinel, taint_on_banana
+from omnigent.testing.e2e_policy_callables import block_on_sentinel, taint_on_banana
 
 
 def test_block_on_sentinel_allow_returns_fresh_decision() -> None:

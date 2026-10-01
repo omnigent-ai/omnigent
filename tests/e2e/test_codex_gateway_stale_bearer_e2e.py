@@ -35,8 +35,8 @@ from typing import Any
 
 import pytest
 
-from omnigent.inner.codex_executor import CodexExecutor
-from omnigent.inner.executor import ExecutorError, TurnComplete
+from omnigent.core.executor import ExecutorError, TurnComplete
+from omnigent.harnesses.codex.executor import CodexExecutor
 from omnigent.spec.types import RetryPolicy
 from tests.e2e._harness_probes import cli_unavailable_reason
 

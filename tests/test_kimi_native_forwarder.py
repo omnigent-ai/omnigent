@@ -24,7 +24,7 @@ import httpx
 import pytest
 
 import omnigent.harnesses.kimi_native.forwarder as fwd
-import omnigent.native._native_forwarder_health as forwarder_health
+import omnigent.harnesses.native.forwarder_health as forwarder_health
 from omnigent.harnesses.kimi_native.forwarder import (
     KimiWireItem,
     _discover_wire,

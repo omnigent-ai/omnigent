@@ -215,7 +215,7 @@ def test_server_startup_banner_does_not_print_db_password(tmp_path: Path) -> Non
                 [
                     sys.executable,
                     "-m",
-                    "omnigent.cli",
+                    "omnigent.cli.commands",
                     "server",
                     "--host",
                     "127.0.0.1",

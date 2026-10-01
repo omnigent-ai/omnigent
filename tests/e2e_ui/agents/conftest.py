@@ -58,7 +58,7 @@ def _joke_director_yaml(code_one: str, code_two: str) -> str:
     """Build the joke-director spec (parent + two comedian sub-agents).
 
     Mirrors the omnigent-flavored inline ``type: agent`` shape parsed by
-    ``omnigent/inner/loader.py:_parse_tool`` (same as the Hitchhiker's
+    ``omnigent/core/loader.py:_parse_tool`` (same as the Hitchhiker's
     fixture in the parent conftest). The parent must dispatch to BOTH
     comedians and relay their jokes verbatim; each joke's nonce appears
     only in that comedian's prompt, so a nonce in the parent's reply

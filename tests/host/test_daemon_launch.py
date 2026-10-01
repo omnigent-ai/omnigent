@@ -15,7 +15,7 @@ import click
 import httpx
 import pytest
 
-from omnigent.cli_auth import OMNIGENT_SLICE_KEY_HEADER
+from omnigent.cli.auth import OMNIGENT_SLICE_KEY_HEADER
 from omnigent.host import daemon_launch
 from omnigent.host.daemon_launch import (
     open_daemon_client,

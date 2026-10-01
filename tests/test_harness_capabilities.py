@@ -9,9 +9,9 @@ drift.
 
 from __future__ import annotations
 
-from omnigent import harness_plugins as hp
-from omnigent.harness_availability import CODEX_CANONICAL_HARNESSES
-from omnigent.harness_capabilities import (
+from omnigent.harnesses import registry as hp
+from omnigent.harnesses.availability import CODEX_CANONICAL_HARNESSES
+from omnigent.harnesses.capabilities import (
     AuthModel,
     EffortFamily,
     Elicitation,
@@ -22,7 +22,7 @@ from omnigent.harness_capabilities import (
     ModelFamily,
     Resume,
 )
-from omnigent.harness_plugins import (
+from omnigent.harnesses.registry import (
     HarnessContribution,
     harness_capabilities,
     harness_catalog,
@@ -220,7 +220,7 @@ def test_hermes_picker_row_has_spawn_env_plumbing() -> None:
     Hermes' model env key is what both threads ``/model`` into the spawn env and
     (via ``_SDK_MODEL_OVERRIDE_HARNESSES``) makes the server accept the override
     instead of rejecting it up front."""
-    from omnigent.harness_plugins import model_env_keys
+    from omnigent.harnesses.registry import model_env_keys
     from omnigent.models.model_override import harness_supports_model_override
 
     assert model_env_keys()["hermes"] == "HARNESS_HERMES_MODEL"
@@ -270,7 +270,7 @@ def test_fork_history_axis_matches_canonical_declarations() -> None:
     preamble set iff PREAMBLE. (The sets also carry reversed ``native-<x>``
     spellings — asserted separately below.)
     """
-    from omnigent.server.routes._sessions.common import (
+    from omnigent.server.routes.sessions.common import (
         _CURSOR_FORK_HISTORY_HARNESSES,
         _FORK_HISTORY_NATIVE_HARNESSES,
     )
@@ -289,7 +289,7 @@ def test_fork_history_derivation_preserves_prior_membership() -> None:
     present, or a fork silently loses history. The derived set may add extra
     reversed spellings that canonicalize into it (harmless at the read site).
     """
-    from omnigent.server.routes._sessions.common import (
+    from omnigent.server.routes.sessions.common import (
         _CURSOR_FORK_HISTORY_HARNESSES,
         _FORK_HISTORY_NATIVE_HARNESSES,
     )
@@ -323,8 +323,8 @@ def test_reversed_native_spellings_classify_fork_history() -> None:
     regression where an identically-behaving reversed-spelling agent silently
     loses fork history. Mirrors test_fork_reversed_native_spelling_carry_gating.
     """
-    from omnigent.harness_aliases import canonicalize_harness
-    from omnigent.server.routes._sessions.common import (
+    from omnigent.harnesses.aliases import canonicalize_harness
+    from omnigent.server.routes.sessions.common import (
         _CURSOR_FORK_HISTORY_HARNESSES,
         _FORK_HISTORY_NATIVE_HARNESSES,
     )

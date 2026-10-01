@@ -39,7 +39,7 @@ def current_anon_user_id() -> str | None:
         request user is bound (single-user mode, or a task started outside a
         request).
     """
-    from omnigent.debug_logging import current_user_id
+    from omnigent.observability.debug_logging import current_user_id
     from omnigent.telemetry.installation_id import get_installation_id
 
     return anon_user_id(current_user_id(), get_installation_id())

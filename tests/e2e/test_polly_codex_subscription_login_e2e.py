@@ -191,7 +191,7 @@ def test_polly_with_codex_subscription_does_not_fail_not_logged_in(
 
     child = pexpect.spawn(
         sys.executable,
-        ["-m", "omnigent.cli", "polly", "-p", "hi"],
+        ["-m", "omnigent.cli.commands", "polly", "-p", "hi"],
         cwd=str(workdir),
         env=_polly_env(fake_home),
         encoding="utf-8",

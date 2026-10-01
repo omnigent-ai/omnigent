@@ -174,7 +174,7 @@ def spec_probe_server(tmp_path_factory: pytest.TempPathFactory) -> Iterator[str]
             [
                 sys.executable,
                 "-m",
-                "omnigent.cli",
+                "omnigent.cli.commands",
                 "server",
                 "--host",
                 "127.0.0.1",

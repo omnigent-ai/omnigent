@@ -1,4 +1,4 @@
-"""The declarative builtin ACP CLI harness catalog (omnigent/acp_cli_harnesses.py).
+"""The declarative builtin ACP CLI harness catalog (omnigent/harnesses/acp/cli_harnesses.py).
 
 Two halves:
 
@@ -19,10 +19,11 @@ from pathlib import Path
 
 import pytest
 
-from omnigent.acp_cli_harnesses import ACP_CLI_HARNESSES, AcpCliHarness
-from omnigent.harness_aliases import canonicalize_harness
-from omnigent.harness_install_spec import HarnessInstallSpec
-from omnigent.harness_plugins import (
+from omnigent.core.datamodel import OSEnvSandboxSpec, OSEnvSpec
+from omnigent.harnesses.acp.cli_harnesses import ACP_CLI_HARNESSES, AcpCliHarness
+from omnigent.harnesses.aliases import canonicalize_harness
+from omnigent.harnesses.install_spec import HarnessInstallSpec
+from omnigent.harnesses.registry import (
     harness_capabilities,
     harness_install_keys,
     harness_labels,
@@ -30,7 +31,6 @@ from omnigent.harness_plugins import (
     install_specs,
     valid_harnesses,
 )
-from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.onboarding.harness_install import ui_setup_steps
 from omnigent.runtime.workflow import _build_acp_cli_spawn_env
 from omnigent.spec.types import AgentSpec, ExecutorSpec
@@ -85,7 +85,7 @@ def test_spawn_env_forwards_cwd_sandbox_and_quotes_command(
     # A resolved binary path containing a space must survive the round-trip
     # through the shlex-split command string.
     monkeypatch.setattr(
-        "omnigent._platform.resolve_cli_binary",
+        "omnigent.util.portability.resolve_cli_binary",
         lambda name, **k: "/opt/fake cli/fakecli" if name == "fakecli" else None,
     )
     os_env = OSEnvSpec(
@@ -242,7 +242,7 @@ def test_catalog_row_is_fully_registered(name: str) -> None:
 
     assert name in valid_harnesses()
     assert harness_labels()[name] == row.label
-    assert harness_modules()[name] == _VENDOR_WRAPS.get(name, "omnigent.inner.acp_harness")
+    assert harness_modules()[name] == _VENDOR_WRAPS.get(name, "omnigent.harnesses.acp.harness")
 
     caps = harness_capabilities()
     if name in _VENDOR_WRAPS:
@@ -307,11 +307,11 @@ def test_setup_drill_in_names_install_and_login(
     **What breaks if this fails**: a user picks the harness in setup and is told
     nothing about how to make it work.
     """
-    from omnigent import cli_config
+    from omnigent.cli import config_commands as cli_config
 
     row = ACP_CLI_HARNESSES[name]
     # Force the "not installed" branch so the install hint has to be shown.
-    monkeypatch.setattr("omnigent._platform.resolve_cli_binary", lambda _binary: None)
+    monkeypatch.setattr("omnigent.util.portability.resolve_cli_binary", lambda _binary: None)
     cli_config._show_acp_cli_harness(name)
 
     out = capsys.readouterr().out
@@ -325,7 +325,7 @@ def test_setup_drill_in_names_install_and_login(
 
 def test_setup_drill_in_ignores_unknown_row() -> None:
     """A stale key (concurrent config change) must not raise."""
-    from omnigent import cli_config
+    from omnigent.cli import config_commands as cli_config
 
     cli_config._show_acp_cli_harness("definitely-not-a-row")
 
@@ -340,7 +340,7 @@ def test_spawn_env_forwards_permission_mode(monkeypatch: pytest.MonkeyPatch) -> 
     """
     monkeypatch.setitem(ACP_CLI_HARNESSES, "fakecli", _FAKE_ROW)
     monkeypatch.setattr(
-        "omnigent._platform.resolve_cli_binary", lambda _b, **k: "/usr/bin/fakecli"
+        "omnigent.util.portability.resolve_cli_binary", lambda _b, **k: "/usr/bin/fakecli"
     )
 
     env = _build_acp_cli_spawn_env(

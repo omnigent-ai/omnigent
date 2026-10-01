@@ -14,8 +14,8 @@ from pathlib import Path
 
 import pytest
 
-import omnigent.server.routes._sessions.helpers as helpers
-from omnigent.debug_logging import _attributes
+import omnigent.server.routes.sessions.helpers as helpers
+from omnigent.observability.debug_logging import _attributes
 from omnigent.server.schemas import ErrorDetail
 
 # Statuses that are not failures. Anything else a publish site can pass —

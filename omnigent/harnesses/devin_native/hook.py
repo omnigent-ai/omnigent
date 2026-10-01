@@ -12,7 +12,7 @@ is that subprocess. It has three jobs:
 #. **Enforce Omnigent policy.** ``UserPromptSubmit`` (request phase),
    ``PreToolUse`` (tool-call phase) and ``PostToolUse`` (tool-result phase) are
    POSTed to ``/v1/sessions/{id}/policies/evaluate``. The shared
-   :mod:`omnigent.native.native_policy_hook` seam owns the request/response
+   :mod:`omnigent.harnesses.native.policy_hook` seam owns the request/response
    translation, including the fail-closed defaults, so devin behaves exactly
    like claude-native and codex-native here. An ASK verdict is resolved
    server-side (the POST parks until a human answers) and comes back as a hard
@@ -37,7 +37,7 @@ from pathlib import Path
 
 import httpx
 
-from omnigent.native.native_policy_hook import (
+from omnigent.harnesses.native.policy_hook import (
     _is_login_redirect_or_unauthorized,
     evaluation_response_to_hook_output,
     fail_closed_hook_output,
@@ -90,7 +90,7 @@ def _read_payload() -> _JsonObject | None:
 def _normalize_tool_result(payload: _JsonObject) -> _JsonObject:
     """Return *payload* with Devin's ``tool_response`` exposed as ``tool_output``.
 
-    :mod:`omnigent.native.native_policy_hook` reads a ``PostToolUse`` result from
+    :mod:`omnigent.harnesses.native.policy_hook` reads a ``PostToolUse`` result from
     ``tool_output`` (Claude Code / Codex spelling). Devin sends the richer
     ``tool_response`` object (``{"success", "output", "error"}``) instead, so
     normalize here rather than teaching the shared seam a third spelling.

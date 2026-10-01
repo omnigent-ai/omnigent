@@ -17,7 +17,7 @@ Three properties are covered, all against STABLE-on-main behavior:
    distinct sentinel token in its prompt. Each session's transcript must contain
    ONLY its own sentinel — proving the per-session SDK ``Agent``/``Conversation``
    reuse (keyed by ``session_key`` in
-   :class:`~omnigent.inner.antigravity_executor.AntigravityExecutor`) does not
+   :class:`~omnigent.harnesses.antigravity.executor.AntigravityExecutor`) does not
    leak one conversation's content into another's.
 2. **No orphaned ``localharness``** — snapshot the live ``localharness`` PIDs
    before a turn and again after it ends cleanly; the turn must not leave a NEW

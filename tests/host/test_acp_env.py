@@ -8,9 +8,9 @@ from unittest.mock import patch
 
 import pytest
 
-from omnigent.cli import _build_host_daemon_env
+from omnigent.cli.commands import _build_host_daemon_env
+from omnigent.harnesses.acp.harness import _build_acp_executor
 from omnigent.host.connect import _build_runner_env
-from omnigent.inner.acp_harness import _build_acp_executor
 from omnigent.runtime.workflow import _build_acp_spawn_env
 from omnigent.spec.types import AgentSpec, ExecutorSpec
 

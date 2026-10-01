@@ -282,7 +282,7 @@ def pytest_addoption(parser):
         action="store",
         default=None,
         help=(
-            "Base URL of an externally-managed `omnigent.cli server` to run "
+            "Base URL of an externally-managed `omnigent.cli.commands server` to run "
             "e2e tests against, e.g. `http://localhost:8080`. When set, "
             "server-fixtures skip the spawn step and yield this URL. Useful "
             "for iterating on tests against a long-running dev server "
@@ -644,7 +644,7 @@ def lowered_idle_thresholds(monkeypatch: pytest.MonkeyPatch) -> None:
     :param monkeypatch: Pytest's monkeypatch fixture; auto-restores
         the original constants at teardown.
     """
-    from omnigent.inner import terminal as terminal_module
+    from omnigent.terminals import terminal as terminal_module
 
     monkeypatch.setattr(terminal_module, "_IDLE_THRESHOLD_SECONDS", 0.4)
     monkeypatch.setattr(terminal_module, "_IDLE_POLL_INTERVAL_SECONDS", 0.1)

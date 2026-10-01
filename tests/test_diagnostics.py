@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import pytest
 
-from omnigent import diagnostics
-from omnigent.diagnostics import collect_snapshot
+from omnigent.cli import diagnose as diagnostics
+from omnigent.cli.diagnose import collect_snapshot
 from omnigent.version import VERSION
 
 

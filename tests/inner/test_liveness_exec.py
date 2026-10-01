@@ -8,7 +8,7 @@ from unittest.mock import Mock
 
 import pytest
 
-from omnigent.inner import _liveness_exec
+from omnigent.util import liveness_exec as _liveness_exec
 
 
 def test_refresh_census_does_not_adopt_reused_worker_pid(
@@ -36,12 +36,12 @@ def test_detached_reaper_fork_failure_falls_back_to_inline_teardown(
     pgid = os.getpid()
 
     monkeypatch.setattr(
-        "omnigent.inner._liveness_exec.os.fork",
+        "omnigent.util.liveness_exec.os.fork",
         Mock(side_effect=OSError("ENOMEM")),
     )
-    monkeypatch.setattr("omnigent.inner._liveness_exec._group_members", Mock(return_value=[]))
+    monkeypatch.setattr("omnigent.util.liveness_exec._group_members", Mock(return_value=[]))
     monkeypatch.setattr(
-        "omnigent.inner._liveness_exec._signal_members",
+        "omnigent.util.liveness_exec._signal_members",
         lambda group, sig: signals.append((group, sig)),
     )
 

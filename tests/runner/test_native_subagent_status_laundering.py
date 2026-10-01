@@ -41,7 +41,7 @@ async def test_trailing_idle_must_not_launder_failed_child_status() -> None:
     must still see the child as failed.
 
     The server enforces exactly this sticky-``failed`` invariant
-    (``omnigent/server/routes/_sessions/helpers.py`` — "``failed`` is sticky
+    (``omnigent/server/routes/sessions/helpers.py`` — "``failed`` is sticky
     against a trailing ``idle``"), but the runner's child fan-out has no such
     guard: ``_session_status_to_task_status("idle")`` returns ``"completed"``
     unconditionally, so the trailing ``idle`` republishes the parent-visible

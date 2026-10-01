@@ -1,6 +1,6 @@
 ---
 name: pi-native-e2e-dev
-description: Spin up a live local Omnigent server + runner and exercise the native Pi TUI harness (pi-native) end-to-end — launch the real `pi` CLI via `omnigent pi`, drive turns through the web/bridge, smoke-test, and bug-bash. Load when developing, testing, or debugging the pi-native harness (omnigent/inner/pi_native_executor.py, pi_native_harness.py, omnigent/pi_native.py, pi_native_bridge.py, pi_native_credentials.py) or its bridge / extension / auth / model behavior.
+description: Spin up a live local Omnigent server + runner and exercise the native Pi TUI harness (pi-native) end-to-end — launch the real `pi` CLI via `omnigent pi`, drive turns through the web/bridge, smoke-test, and bug-bash. Load when developing, testing, or debugging the pi-native harness (omnigent/harnesses/pi_native/executor.py, pi_native_harness.py, omnigent/pi_native.py, pi_native_bridge.py, pi_native_credentials.py) or its bridge / extension / auth / model behavior.
 ---
 
 # Pi native harness: end-to-end dev & testing (local server/runner)
@@ -198,10 +198,10 @@ that wires Pi's provider/model. Key env vars: `HARNESS_PI_NATIVE_BRIDGE_DIR`,
 
 ## Code & tests
 
-- **Executor (bridge enqueue):** `omnigent/inner/pi_native_executor.py`
-- **Harness wrap (`harness: pi-native`):** `omnigent/inner/pi_native_harness.py`
+- **Executor (bridge enqueue):** `omnigent/harnesses/pi_native/executor.py`
+- **Harness wrap (`harness: pi-native`):** `omnigent/harnesses/pi_native/harness.py`
 - **CLI launch / daemon-runner / tmux attach:** `omnigent/pi_native.py`
-  (`run_pi_native`); CLI command `pi(...)` in `omnigent/cli.py`
+  (`run_pi_native`); CLI command `pi(...)` in `omnigent/cli/commands.py`
 - **Bridge (inbox, extension/config writers):** `omnigent/pi_native_bridge.py`
 - **Auth/model → Pi `models.json`:** `omnigent/pi_native_credentials.py`
 - **Extension (JS, polls inbox, posts events/policies):**

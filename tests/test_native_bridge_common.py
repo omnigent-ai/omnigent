@@ -11,8 +11,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from omnigent.inner.native_attachments import attachment_cache_dir, materialize_attachment
-from omnigent.native import native_bridge_common
+from omnigent.harnesses.native import bridge_common as native_bridge_common
+from omnigent.util.attachments import attachment_cache_dir, materialize_attachment
 
 
 def test_write_owner_pid_marker_records_current_pid(tmp_path: Path) -> None:
@@ -101,7 +101,7 @@ def test_prune_retains_entry_when_eligibility_check_fails(
         (bridge_dir / native_bridge_common.OWNER_PID_FILENAME).write_text(
             "999999", encoding="utf-8"
         )
-    monkeypatch.setattr("omnigent.inner.terminal._process_alive", lambda _pid: False)
+    monkeypatch.setattr("omnigent.terminals.terminal._process_alive", lambda _pid: False)
 
     def _should_prune(bridge_dir: Path) -> bool:
         if bridge_dir == failing_dir:
@@ -123,7 +123,7 @@ def test_prune_retains_entry_reclaimed_during_eligibility_check(
     bridge_dir.mkdir(parents=True)
     marker = bridge_dir / native_bridge_common.OWNER_PID_FILENAME
     marker.write_text("999999", encoding="utf-8")
-    monkeypatch.setattr("omnigent.inner.terminal._process_alive", lambda _pid: False)
+    monkeypatch.setattr("omnigent.terminals.terminal._process_alive", lambda _pid: False)
 
     def _reclaim(_bridge_dir: Path) -> bool:
         marker.write_text(str(os.getpid()), encoding="utf-8")
@@ -141,7 +141,7 @@ def test_reap_invokes_prune_for_every_native_agent(monkeypatch: pytest.MonkeyPat
         SimpleNamespace(key="antigravity"),
         SimpleNamespace(key="opencode"),
     )
-    monkeypatch.setattr("omnigent.harness_plugins.native_agents", lambda: agents)
+    monkeypatch.setattr("omnigent.harnesses.registry.native_agents", lambda: agents)
 
     called: list[str] = []
 
@@ -183,7 +183,7 @@ def test_reap_skips_agents_without_a_prune_and_bad_modules(
         SimpleNamespace(key="not_a_real_harness"),  # import fails
         SimpleNamespace(key="claude"),  # the one real pruner
     )
-    monkeypatch.setattr("omnigent.harness_plugins.native_agents", lambda: agents)
+    monkeypatch.setattr("omnigent.harnesses.registry.native_agents", lambda: agents)
 
     called: list[str] = []
 
@@ -204,7 +204,7 @@ def test_reap_skips_agents_without_a_prune_and_bad_modules(
 def test_reap_isolates_a_failing_pruner(monkeypatch: pytest.MonkeyPatch) -> None:
     """One harness's prune raising must not abort the sweep of the others."""
     agents = (SimpleNamespace(key="codex"), SimpleNamespace(key="claude"))
-    monkeypatch.setattr("omnigent.harness_plugins.native_agents", lambda: agents)
+    monkeypatch.setattr("omnigent.harnesses.registry.native_agents", lambda: agents)
 
     def _boom() -> int:
         raise RuntimeError("boom")
@@ -225,7 +225,7 @@ def test_reap_isolates_a_module_that_raises_on_import(
     """A bridge module raising a non-ImportError at import time is skipped,
     never propagated — a broken transitive import must not crash startup."""
     agents = (SimpleNamespace(key="broken"), SimpleNamespace(key="claude"))
-    monkeypatch.setattr("omnigent.harness_plugins.native_agents", lambda: agents)
+    monkeypatch.setattr("omnigent.harnesses.registry.native_agents", lambda: agents)
 
     real_import = native_bridge_common.importlib.import_module
 
@@ -262,7 +262,7 @@ def test_reap_logs_an_unavailable_harness_below_error(
     maintenance housekeeping read as a mid-session failure.
     """
     agents = (SimpleNamespace(key="unavailable"), SimpleNamespace(key="claude"))
-    monkeypatch.setattr("omnigent.harness_plugins.native_agents", lambda: agents)
+    monkeypatch.setattr("omnigent.harnesses.registry.native_agents", lambda: agents)
 
     real_import = native_bridge_common.importlib.import_module
 
@@ -289,7 +289,7 @@ def test_reap_still_errors_on_a_module_that_raises_on_import(
 ) -> None:
     """A bridge that imports and then raises is a defect, and keeps its ERROR."""
     agents = (SimpleNamespace(key="broken"),)
-    monkeypatch.setattr("omnigent.harness_plugins.native_agents", lambda: agents)
+    monkeypatch.setattr("omnigent.harnesses.registry.native_agents", lambda: agents)
 
     real_import = native_bridge_common.importlib.import_module
 

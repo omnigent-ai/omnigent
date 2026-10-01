@@ -24,8 +24,8 @@ import tempfile
 import time
 from pathlib import Path
 
-from omnigent._platform import stable_user_id
-from omnigent.native.input_ready import PaneSettledProbe
+from omnigent.harnesses.native.input_ready import PaneSettledProbe
+from omnigent.util.portability import stable_user_id
 
 #: Env var carrying the bridge dir into the harness executor process.
 BRIDGE_DIR_ENV_VAR = "HARNESS_GOOSE_NATIVE_BRIDGE_DIR"

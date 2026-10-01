@@ -69,7 +69,7 @@ def _managed_pi(
     settings = {"enabledModels": enabled_models} if enabled_models is not None else {}
     settings_path = global_dir / "settings.json"
     settings_path.write_text(json.dumps(settings), encoding="utf-8")
-    monkeypatch.setattr("omnigent.inner.pi_settings.DEFAULT_PI_AGENT_DIR", global_dir)
+    monkeypatch.setattr("omnigent.harnesses.pi.settings.DEFAULT_PI_AGENT_DIR", global_dir)
     config = {
         "providers": {
             "demo": {

@@ -258,7 +258,7 @@ def test_background_budget_write_pins_owner_registration(
     from omnigent.db.utils import now_epoch, utc_day
     from omnigent.policies.schema import USER_DAILY_ASK_APPROVED_STATE_KEY
     from omnigent.runtime.policies.engine import PolicyEngine
-    from omnigent.server.routes._sessions.helpers import _record_daily_cost
+    from omnigent.server.routes.sessions.helpers import _record_daily_cost
     from omnigent.spec.types import StateUpdate, StateUpdateAction
 
     accounts = SqlAlchemyAccountStore(db_uri)

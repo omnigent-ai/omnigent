@@ -18,15 +18,16 @@ from unittest.mock import patch
 
 import pytest
 
-from omnigent.inner import kimi_executor, kimi_harness
-from omnigent.inner.executor import (
+from omnigent.core.executor import (
     ExecutorError,
     TextChunk,
     ToolCallComplete,
     ToolCallRequest,
     TurnComplete,
 )
-from omnigent.inner.kimi_executor import (
+from omnigent.harnesses.kimi import executor as kimi_executor
+from omnigent.harnesses.kimi import harness as kimi_harness
+from omnigent.harnesses.kimi.executor import (
     _SESSION_RESUME_RE,
     KimiExecutor,
     _latest_user_text,
@@ -34,7 +35,7 @@ from omnigent.inner.kimi_executor import (
     _resolve_kimi_binary,
     _resolve_skills_dirs,
 )
-from omnigent.runtime.harnesses import _HARNESS_MODULES
+from omnigent.harnesses.runtime import _HARNESS_MODULES
 from omnigent.spec._omnigent_compat import OMNIGENT_HARNESS_ALIASES, OMNIGENT_HARNESSES
 
 # ---------------------------------------------------------------------------
@@ -43,8 +44,8 @@ from omnigent.spec._omnigent_compat import OMNIGENT_HARNESS_ALIASES, OMNIGENT_HA
 
 
 def test_kimi_in_module_registry() -> None:
-    assert _HARNESS_MODULES.get("kimi") == "omnigent.inner.kimi_harness"
-    assert _HARNESS_MODULES.get("kimi-code") == "omnigent.inner.kimi_harness"
+    assert _HARNESS_MODULES.get("kimi") == "omnigent.harnesses.kimi.harness"
+    assert _HARNESS_MODULES.get("kimi-code") == "omnigent.harnesses.kimi.harness"
 
 
 def test_kimi_in_omnigent_harnesses_allowlist() -> None:
@@ -53,7 +54,7 @@ def test_kimi_in_omnigent_harnesses_allowlist() -> None:
 
 
 def test_kimi_canonical_alias_resolution() -> None:
-    from omnigent.harness_aliases import canonicalize_harness
+    from omnigent.harnesses.aliases import canonicalize_harness
 
     assert canonicalize_harness("kimi-code") == "kimi"
     assert canonicalize_harness("kimi") == "kimi"
@@ -85,7 +86,7 @@ def test_executor_factory_reads_env_vars(monkeypatch: pytest.MonkeyPatch) -> Non
         captured.update(kwargs)
 
     with patch(
-        "omnigent.inner.kimi_harness.KimiExecutor.__init__",
+        "omnigent.harnesses.kimi.harness.KimiExecutor.__init__",
         _fake_init,
     ):
         kimi_harness._build_kimi_executor()
@@ -118,7 +119,7 @@ def test_executor_factory_defaults_when_env_unset(monkeypatch: pytest.MonkeyPatc
         captured.update(kwargs)
 
     with patch(
-        "omnigent.inner.kimi_harness.KimiExecutor.__init__",
+        "omnigent.harnesses.kimi.harness.KimiExecutor.__init__",
         _fake_init,
     ):
         kimi_harness._build_kimi_executor()
@@ -146,7 +147,7 @@ def test_executor_factory_falls_back_to_runner_workspace_cwd(
 
     captured: dict[str, Any] = {}
     with patch(
-        "omnigent.inner.kimi_harness.KimiExecutor.__init__",
+        "omnigent.harnesses.kimi.harness.KimiExecutor.__init__",
         lambda self, **kwargs: captured.update(kwargs),
     ):
         kimi_harness._build_kimi_executor()
@@ -156,7 +157,7 @@ def test_executor_factory_falls_back_to_runner_workspace_cwd(
     monkeypatch.setenv("HARNESS_KIMI_CWD", "/tmp/explicit")
     captured.clear()
     with patch(
-        "omnigent.inner.kimi_harness.KimiExecutor.__init__",
+        "omnigent.harnesses.kimi.harness.KimiExecutor.__init__",
         lambda self, **kwargs: captured.update(kwargs),
     ):
         kimi_harness._build_kimi_executor()
@@ -171,7 +172,7 @@ def test_malformed_os_env_falls_back_to_default(monkeypatch: pytest.MonkeyPatch)
         captured["os_env"] = kwargs["os_env"]
 
     with patch(
-        "omnigent.inner.kimi_harness.KimiExecutor.__init__",
+        "omnigent.harnesses.kimi.harness.KimiExecutor.__init__",
         _fake_init,
     ):
         kimi_harness._build_kimi_executor()
@@ -249,7 +250,7 @@ def test_latest_user_text_drops_image_blocks_with_warning(
 ) -> None:
     import logging
 
-    caplog.set_level(logging.WARNING, logger="omnigent.inner.kimi_executor")
+    caplog.set_level(logging.WARNING, logger="omnigent.harnesses.kimi.executor")
     messages = [
         {
             "role": "user",
@@ -670,7 +671,7 @@ def test_run_turn_passes_generous_stream_limit(monkeypatch: pytest.MonkeyPatch) 
 
 def test_sandbox_launch_path_bare_binary_when_no_sandbox() -> None:
     """No os_env (or sandbox=none) → spawn the bare binary, never a launcher."""
-    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+    from omnigent.core.datamodel import OSEnvSandboxSpec, OSEnvSpec
 
     assert KimiExecutor(binary_path="kimi")._sandbox_launch_path(()) == "kimi"
 
@@ -686,8 +687,8 @@ def test_sandbox_launch_path_wraps_when_sandbox_requested(
 ) -> None:
     """A spec requesting confinement routes the binary through the platform
     sandbox launcher so kimi's in-process tools run jailed."""
-    from omnigent.inner import sandbox as sandbox_mod
-    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+    from omnigent.core.datamodel import OSEnvSandboxSpec, OSEnvSpec
+    from omnigent.sandbox import core as sandbox_mod
 
     class _ActivePolicy:
         active = True
@@ -935,7 +936,7 @@ def test_run_turn_missing_wire_log_reports_no_usage(
     and the extraction recovers once the log appears on a later turn."""
     import logging
 
-    caplog.set_level(logging.WARNING, logger="omnigent.inner.kimi_executor")
+    caplog.set_level(logging.WARNING, logger="omnigent.harnesses.kimi.executor")
     (tmp_path / "sessions").mkdir()
     events, ex = _run_stubbed_turn(monkeypatch, tmp_path, session_id="session_missing-1")
     turn = next(e for e in events if isinstance(e, TurnComplete))
@@ -1039,7 +1040,7 @@ def test_run_turn_malformed_wire_rows_are_skipped_whole(
 
     import logging
 
-    caplog.set_level(logging.WARNING, logger="omnigent.inner.kimi_executor")
+    caplog.set_level(logging.WARNING, logger="omnigent.harnesses.kimi.executor")
     events, _ex = _run_stubbed_turn(
         monkeypatch, tmp_path, session_id="session_mal-1", on_spawn=_write_mixed
     )
@@ -1309,9 +1310,9 @@ def test_sum_wire_usage_unreadable_file_logs_once(
     """An unreadable wire log reports no usage and leaves one diagnostic."""
     import logging
 
-    from omnigent.inner.kimi_executor import _sum_wire_usage
+    from omnigent.harnesses.kimi.executor import _sum_wire_usage
 
-    caplog.set_level(logging.WARNING, logger="omnigent.inner.kimi_executor")
+    caplog.set_level(logging.WARNING, logger="omnigent.harnesses.kimi.executor")
     unreadable = tmp_path / "wire.jsonl"
     unreadable.mkdir()  # opening a directory as a file raises OSError
 
@@ -1323,7 +1324,7 @@ def test_sum_wire_usage_unreadable_file_logs_once(
 
 
 def test_sum_wire_usage_counts_valid_final_row_without_newline(tmp_path: Path) -> None:
-    from omnigent.inner.kimi_executor import _sum_wire_usage
+    from omnigent.harnesses.kimi.executor import _sum_wire_usage
 
     wire = tmp_path / "wire.jsonl"
     row = _usage_row(input_other=7, output=2, time_ms=10)
@@ -1342,7 +1343,7 @@ def test_sum_wire_usage_counts_valid_final_row_without_newline(tmp_path: Path) -
 def test_sum_wire_usage_clears_stale_request_at_nonbillable_boundary(
     tmp_path: Path, boundary: str
 ) -> None:
-    from omnigent.inner.kimi_executor import _sum_wire_usage
+    from omnigent.harnesses.kimi.executor import _sum_wire_usage
 
     stale_request = {
         "type": "llm.request",
@@ -1445,7 +1446,7 @@ def test_run_turn_warns_once_when_tools_declared(
     """
     import logging
 
-    caplog.set_level(logging.WARNING, logger="omnigent.inner.kimi_executor")
+    caplog.set_level(logging.WARNING, logger="omnigent.harnesses.kimi.executor")
 
     def _make_fake() -> _FakeProcess:
         return _FakeProcess(

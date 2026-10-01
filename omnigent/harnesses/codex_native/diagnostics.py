@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from omnigent.harnesses.diagnostics import bounded_diagnostic_tail
-from omnigent.process_logging import harness_stderr_capture_enabled
+from omnigent.observability.process_logging import harness_stderr_capture_enabled
 
 if TYPE_CHECKING:
     from omnigent.harnesses.codex_native.app_server import CodexNativeAppServer

@@ -59,11 +59,11 @@ from omnigent.runner._entry import (
     _InitialAuthTokenFactory,
     _RunnerDatabricksAuth,
 )
-from omnigent.runner.identity import (
+from omnigent.runner.transports.ws_tunnel.serve import serve_tunnel
+from omnigent.util.runner_identity import (
     RUNNER_DELEGATED_AUTH_ENV_VAR,
     RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR,
 )
-from omnigent.runner.transports.ws_tunnel.serve import serve_tunnel
 from tests._helpers.live_server import find_free_port
 
 _BOOTSTRAP_BEARER = "expired-host-bootstrap-bearer"

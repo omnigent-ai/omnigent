@@ -124,7 +124,7 @@ def ap_server_with_shared_db() -> Iterator[tuple[str, str]]:
         [
             str(_REPO_ROOT / ".venv" / "bin" / "python"),
             "-m",
-            "omnigent.cli",
+            "omnigent.cli.commands",
             "server",
             "--port",
             str(port),

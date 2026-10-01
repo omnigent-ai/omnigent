@@ -20,7 +20,7 @@ import base64
 
 import databricks.sdk.config as _sdk_config_mod
 
-from omnigent.inner.executor import (
+from omnigent.core.executor import (
     ExecutorConfig,
     ExecutorError,
     ReasoningChunk,
@@ -30,7 +30,7 @@ from omnigent.inner.executor import (
     ToolCallStatus,
     TurnComplete,
 )
-from omnigent.inner.openai_agents_sdk_executor import (
+from omnigent.harnesses.openai_agents.executor import (
     OpenAIAgentsSDKExecutor,
     _normalize_content_blocks_for_chat,
     _normalize_responses_items_for_chat,
@@ -433,7 +433,7 @@ class TestOpenAIAgentsSDKExecutor(unittest.TestCase):
         async def _t():
             owned_client = _ClosableClient()
             with patch(
-                "omnigent.inner.openai_agents_sdk_executor._get_openai_async_client",
+                "omnigent.harnesses.openai_agents.executor._get_openai_async_client",
                 return_value=owned_client,
             ):
                 executor = OpenAIAgentsSDKExecutor()
@@ -453,7 +453,7 @@ class TestOpenAIAgentsSDKExecutor(unittest.TestCase):
             _FakeRunner.next_result = _FakeResult(events=[], final_output="done")
             executor = OpenAIAgentsSDKExecutor(client=object(), model="gpt-test")
             with patch(
-                "omnigent.inner.openai_agents_sdk_executor._ensure_agents_sdk",
+                "omnigent.harnesses.openai_agents.executor._ensure_agents_sdk",
                 return_value=_fake_agents_sdk(),
             ):
                 _ = [
@@ -482,7 +482,7 @@ class TestOpenAIAgentsSDKExecutor(unittest.TestCase):
                         reasoning_item_id_policy=policy,
                     )
                     with patch(
-                        "omnigent.inner.openai_agents_sdk_executor._ensure_agents_sdk",
+                        "omnigent.harnesses.openai_agents.executor._ensure_agents_sdk",
                         return_value=_fake_agents_sdk(),
                     ):
                         _ = [
@@ -561,7 +561,7 @@ class TestOpenAIAgentsSDKExecutor(unittest.TestCase):
             )
             executor = OpenAIAgentsSDKExecutor(client=object())
             with patch(
-                "omnigent.inner.openai_agents_sdk_executor._ensure_agents_sdk",
+                "omnigent.harnesses.openai_agents.executor._ensure_agents_sdk",
                 return_value=_fake_agents_sdk(),
             ):
                 events = [
@@ -610,7 +610,7 @@ class TestOpenAIAgentsSDKExecutor(unittest.TestCase):
             )
             executor = OpenAIAgentsSDKExecutor(client=object())
             with patch(
-                "omnigent.inner.openai_agents_sdk_executor._ensure_agents_sdk",
+                "omnigent.harnesses.openai_agents.executor._ensure_agents_sdk",
                 return_value=_fake_agents_sdk(),
             ):
                 events = [
@@ -640,7 +640,7 @@ class TestOpenAIAgentsSDKExecutor(unittest.TestCase):
             )
             executor = OpenAIAgentsSDKExecutor(client=client)
             with patch(
-                "omnigent.inner.openai_agents_sdk_executor._ensure_agents_sdk",
+                "omnigent.harnesses.openai_agents.executor._ensure_agents_sdk",
                 return_value=_fake_agents_sdk(),
             ):
                 events = [
@@ -670,7 +670,7 @@ class TestOpenAIAgentsSDKExecutor(unittest.TestCase):
             _FakeRunner.next_result = _FakeResult(events=[], final_output="done")
             executor = OpenAIAgentsSDKExecutor(client=object())
             with patch(
-                "omnigent.inner.openai_agents_sdk_executor._ensure_agents_sdk",
+                "omnigent.harnesses.openai_agents.executor._ensure_agents_sdk",
                 return_value=_fake_agents_sdk(),
             ):
                 events = [
@@ -696,7 +696,7 @@ class TestOpenAIAgentsSDKExecutor(unittest.TestCase):
             _FakeRunner.next_result = _FakeResult(events=[], final_output="done")
             executor = OpenAIAgentsSDKExecutor(client=object())
             with patch(
-                "omnigent.inner.openai_agents_sdk_executor._ensure_agents_sdk",
+                "omnigent.harnesses.openai_agents.executor._ensure_agents_sdk",
                 return_value=_fake_agents_sdk(),
             ):
                 events = [
@@ -723,7 +723,7 @@ class TestOpenAIAgentsSDKExecutor(unittest.TestCase):
             _FakeRunner.next_result = _FakeResult(events=[], final_output="done")
             executor = OpenAIAgentsSDKExecutor(client=object())
             with patch(
-                "omnigent.inner.openai_agents_sdk_executor._ensure_agents_sdk",
+                "omnigent.harnesses.openai_agents.executor._ensure_agents_sdk",
                 return_value=_fake_agents_sdk(),
             ):
                 events = [
@@ -754,7 +754,7 @@ class TestOpenAIAgentsSDKExecutor(unittest.TestCase):
             )
             executor = OpenAIAgentsSDKExecutor(client=object())
             with patch(
-                "omnigent.inner.openai_agents_sdk_executor._ensure_agents_sdk",
+                "omnigent.harnesses.openai_agents.executor._ensure_agents_sdk",
                 return_value=_fake_agents_sdk(),
             ):
                 events = [
@@ -797,7 +797,7 @@ class TestOpenAIAgentsSDKExecutor(unittest.TestCase):
             )
             executor = OpenAIAgentsSDKExecutor(client=object())
             with patch(
-                "omnigent.inner.openai_agents_sdk_executor._ensure_agents_sdk",
+                "omnigent.harnesses.openai_agents.executor._ensure_agents_sdk",
                 return_value=_fake_agents_sdk(),
             ):
                 events = [
@@ -828,7 +828,7 @@ class TestOpenAIAgentsSDKExecutor(unittest.TestCase):
             _FakeRunner.next_result = _FakeResult(events=[], final_output="one")
             executor = OpenAIAgentsSDKExecutor(client=object())
             with patch(
-                "omnigent.inner.openai_agents_sdk_executor._ensure_agents_sdk",
+                "omnigent.harnesses.openai_agents.executor._ensure_agents_sdk",
                 return_value=_fake_agents_sdk(),
             ):
                 events = [
@@ -875,7 +875,7 @@ class TestOpenAIAgentsSDKExecutor(unittest.TestCase):
             _FakeRunner.next_result = _FakeResult(events=[], final_output="one")
             executor = OpenAIAgentsSDKExecutor(client=object())
             with patch(
-                "omnigent.inner.openai_agents_sdk_executor._ensure_agents_sdk",
+                "omnigent.harnesses.openai_agents.executor._ensure_agents_sdk",
                 return_value=_fake_agents_sdk(),
             ):
                 _ = [
@@ -927,7 +927,7 @@ class TestOpenAIAgentsSDKExecutor(unittest.TestCase):
             _FakeRunner.next_result = _FakeResult(events=[], final_output="one")
             executor = OpenAIAgentsSDKExecutor(client=object())
             with patch(
-                "omnigent.inner.openai_agents_sdk_executor._ensure_agents_sdk",
+                "omnigent.harnesses.openai_agents.executor._ensure_agents_sdk",
                 return_value=_fake_agents_sdk(),
             ):
                 first_events = [
@@ -989,7 +989,7 @@ class TestOpenAIAgentsSDKExecutor(unittest.TestCase):
             _FakeRunner.last_calls = []
             executor = OpenAIAgentsSDKExecutor(client=object())
             with patch(
-                "omnigent.inner.openai_agents_sdk_executor._ensure_agents_sdk",
+                "omnigent.harnesses.openai_agents.executor._ensure_agents_sdk",
                 return_value=_fake_agents_sdk(),
             ):
                 _FakeRunner.next_result = _FakeResult(events=[], final_output="one")
@@ -1056,7 +1056,7 @@ class TestOpenAIAgentsSDKExecutor(unittest.TestCase):
             _FakeRunner.last_calls = []
             executor = OpenAIAgentsSDKExecutor(client=object())
             with patch(
-                "omnigent.inner.openai_agents_sdk_executor._ensure_agents_sdk",
+                "omnigent.harnesses.openai_agents.executor._ensure_agents_sdk",
                 return_value=_fake_agents_sdk(),
             ):
                 _FakeRunner.next_result = _FakeResult(events=[], final_output="one")
@@ -1115,7 +1115,7 @@ class TestOpenAIAgentsSDKExecutor(unittest.TestCase):
             _FakeRunner.next_result = first_result
             executor = OpenAIAgentsSDKExecutor(client=object())
             with patch(
-                "omnigent.inner.openai_agents_sdk_executor._ensure_agents_sdk",
+                "omnigent.harnesses.openai_agents.executor._ensure_agents_sdk",
                 return_value=_fake_agents_sdk(),
             ):
                 first_events = [
@@ -1167,7 +1167,7 @@ class TestOpenAIAgentsSDKExecutor(unittest.TestCase):
             )
             executor = OpenAIAgentsSDKExecutor(client=object())
             with patch(
-                "omnigent.inner.openai_agents_sdk_executor._ensure_agents_sdk",
+                "omnigent.harnesses.openai_agents.executor._ensure_agents_sdk",
                 return_value=_fake_agents_sdk(),
             ):
                 first_events = [
@@ -1288,7 +1288,7 @@ class TestOpenAIAgentsSDKExecutor(unittest.TestCase):
             _FakeRunner.last_calls = []
             executor = OpenAIAgentsSDKExecutor(client=object())
             with patch(
-                "omnigent.inner.openai_agents_sdk_executor._ensure_agents_sdk",
+                "omnigent.harnesses.openai_agents.executor._ensure_agents_sdk",
                 return_value=_fake_agents_sdk(),
             ):
                 _FakeRunner.next_result = _FakeResult(events=[], final_output="one")
@@ -1343,7 +1343,7 @@ class TestOpenAIAgentsSDKExecutor(unittest.TestCase):
             )
             executor = OpenAIAgentsSDKExecutor(client=object())
             with patch(
-                "omnigent.inner.openai_agents_sdk_executor._ensure_agents_sdk",
+                "omnigent.harnesses.openai_agents.executor._ensure_agents_sdk",
                 return_value=_fake_agents_sdk(),
             ):
                 events = [
@@ -1391,7 +1391,7 @@ class TestOpenAIAgentsSDKExecutor(unittest.TestCase):
             _FakeRunner.next_result = result
             executor = OpenAIAgentsSDKExecutor(client=object())
             with patch(
-                "omnigent.inner.openai_agents_sdk_executor._ensure_agents_sdk",
+                "omnigent.harnesses.openai_agents.executor._ensure_agents_sdk",
                 return_value=_fake_agents_sdk(),
             ):
                 events = [
@@ -1465,7 +1465,7 @@ class TestOpenAIAgentsSDKExecutor(unittest.TestCase):
             _FakeRunner.next_result = result
             executor = OpenAIAgentsSDKExecutor(client=object())
             with patch(
-                "omnigent.inner.openai_agents_sdk_executor._ensure_agents_sdk",
+                "omnigent.harnesses.openai_agents.executor._ensure_agents_sdk",
                 return_value=_fake_agents_sdk(),
             ):
                 events = [
@@ -1533,7 +1533,7 @@ class TestOpenAIAgentsSDKExecutor(unittest.TestCase):
             _FakeRunner.next_result = result
             executor = OpenAIAgentsSDKExecutor(client=object())
             with patch(
-                "omnigent.inner.openai_agents_sdk_executor._ensure_agents_sdk",
+                "omnigent.harnesses.openai_agents.executor._ensure_agents_sdk",
                 return_value=_fake_agents_sdk(),
             ):
                 events = [
@@ -1586,7 +1586,7 @@ def test_get_openai_client_profile_uses_callback_auth(monkeypatch):
     """
     import httpx
 
-    from omnigent.inner.openai_agents_sdk_executor import _get_openai_async_client
+    from omnigent.harnesses.openai_agents.executor import _get_openai_async_client
 
     monkeypatch.setenv("OPENAI_API_KEY", "should-not-be-used")
     monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
@@ -1626,8 +1626,8 @@ def test_get_openai_client_host_override_uses_ucode_auth_command(monkeypatch):
     """
     import httpx
 
-    import omnigent.inner.databricks_executor as db_exec
-    from omnigent.inner.openai_agents_sdk_executor import _get_openai_async_client
+    import omnigent.harnesses.databricks.executor as db_exec
+    from omnigent.harnesses.openai_agents.executor import _get_openai_async_client
 
     monkeypatch.setenv("OPENAI_API_KEY", "should-not-be-used")
     monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
@@ -1663,7 +1663,7 @@ def test_get_openai_client_host_override_requires_base_url(monkeypatch):
 
     :param monkeypatch: Pytest monkeypatch fixture.
     """
-    from omnigent.inner.openai_agents_sdk_executor import _get_openai_async_client
+    from omnigent.harnesses.openai_agents.executor import _get_openai_async_client
 
     monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
@@ -1681,7 +1681,7 @@ def test_get_openai_client_host_override_requires_auth_command(monkeypatch):
 
     :param monkeypatch: Pytest monkeypatch fixture.
     """
-    from omnigent.inner.openai_agents_sdk_executor import _get_openai_async_client
+    from omnigent.harnesses.openai_agents.executor import _get_openai_async_client
 
     monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
@@ -1709,7 +1709,7 @@ def test_get_openai_client_api_key_falls_back_to_env_base_url(monkeypatch):
 
     :param monkeypatch: Pytest monkeypatch fixture.
     """
-    from omnigent.inner.openai_agents_sdk_executor import _get_openai_async_client
+    from omnigent.harnesses.openai_agents.executor import _get_openai_async_client
 
     monkeypatch.setenv("OPENAI_BASE_URL", "https://gateway.example.com/ai-gateway/openai/v1")
 
@@ -1741,7 +1741,7 @@ def test_get_openai_client_api_key_override_wins_over_env_base_url(monkeypatch):
 
     :param monkeypatch: Pytest monkeypatch fixture.
     """
-    from omnigent.inner.openai_agents_sdk_executor import _get_openai_async_client
+    from omnigent.harnesses.openai_agents.executor import _get_openai_async_client
 
     monkeypatch.setenv("OPENAI_BASE_URL", "https://wrong-env.example.com/v1")
 
@@ -1771,7 +1771,7 @@ def test_get_openai_client_api_key_no_env_defaults_to_openai(monkeypatch):
 
     :param monkeypatch: Pytest monkeypatch fixture.
     """
-    from omnigent.inner.openai_agents_sdk_executor import _get_openai_async_client
+    from omnigent.harnesses.openai_agents.executor import _get_openai_async_client
 
     monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
 
@@ -1795,7 +1795,7 @@ def test_get_openai_client_no_profile_honors_env_vars(monkeypatch):
 
     :param monkeypatch: Pytest monkeypatch fixture.
     """
-    from omnigent.inner.openai_agents_sdk_executor import _get_openai_async_client
+    from omnigent.harnesses.openai_agents.executor import _get_openai_async_client
 
     monkeypatch.setenv("OPENAI_BASE_URL", "https://env-host.example.com/v1")
     monkeypatch.setenv("OPENAI_API_KEY", "env-key")
@@ -1821,7 +1821,7 @@ def test_get_openai_client_model_service_without_provider_fails_loudly(monkeypat
 
     :param monkeypatch: Pytest monkeypatch fixture.
     """
-    from omnigent.inner.openai_agents_sdk_executor import _get_openai_async_client
+    from omnigent.harnesses.openai_agents.executor import _get_openai_async_client
 
     monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
@@ -1840,7 +1840,7 @@ def test_get_openai_client_unpinned_model_does_not_route_to_databricks(monkeypat
 
     :param monkeypatch: Pytest monkeypatch fixture.
     """
-    from omnigent.inner.openai_agents_sdk_executor import _get_openai_async_client
+    from omnigent.harnesses.openai_agents.executor import _get_openai_async_client
 
     monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
@@ -1857,7 +1857,7 @@ def test_get_openai_client_databricks_model_still_uses_ambient_auth(monkeypatch)
 
     :param monkeypatch: Pytest monkeypatch fixture.
     """
-    from omnigent.inner.openai_agents_sdk_executor import _get_openai_async_client
+    from omnigent.harnesses.openai_agents.executor import _get_openai_async_client
 
     monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
@@ -1869,7 +1869,7 @@ def test_get_openai_client_databricks_model_still_uses_ambient_auth(monkeypatch)
         return httpx.BasicAuth("token", ""), "https://example.databricks.com"
 
     monkeypatch.setattr(
-        "omnigent.inner.databricks_executor._resolve_databricks_auth", _fake_resolve
+        "omnigent.harnesses.databricks.executor._resolve_databricks_auth", _fake_resolve
     )
 
     client = _get_openai_async_client(model="databricks-gpt-5-5")
@@ -1887,9 +1887,9 @@ def test_get_openai_client_invalid_profile_raises_auth_error(monkeypatch):
     """
     import pytest
 
-    import omnigent.inner.databricks_executor as db_exec
-    from omnigent.inner.databricks_executor import DatabricksAuthError
-    from omnigent.inner.openai_agents_sdk_executor import _get_openai_async_client
+    import omnigent.harnesses.databricks.executor as db_exec
+    from omnigent.harnesses.databricks.executor import DatabricksAuthError
+    from omnigent.harnesses.openai_agents.executor import _get_openai_async_client
 
     def _failing_config(**_kw):
         raise ValueError("no credentials")
@@ -1923,8 +1923,8 @@ def test_get_openai_client_invalid_profile_with_env_fallback_warns(monkeypatch, 
     """
     import logging
 
-    import omnigent.inner.databricks_executor as db_exec
-    from omnigent.inner.openai_agents_sdk_executor import _get_openai_async_client
+    import omnigent.harnesses.databricks.executor as db_exec
+    from omnigent.harnesses.openai_agents.executor import _get_openai_async_client
 
     def _failing_config(**_kw):
         raise ValueError("no credentials")
@@ -1969,8 +1969,8 @@ def test_get_openai_client_missing_databricks_sdk_raises_actionable_error(monkey
     """
     import pytest
 
-    import omnigent.inner.databricks_executor as db_exec
-    from omnigent.inner.openai_agents_sdk_executor import _get_openai_async_client
+    import omnigent.harnesses.databricks.executor as db_exec
+    from omnigent.harnesses.openai_agents.executor import _get_openai_async_client
 
     def _import_error(*_args, **_kw):
         raise ImportError("No module named 'databricks.sdk'")
@@ -1999,8 +1999,8 @@ def test_get_openai_client_missing_databricks_sdk_with_env_falls_through(monkeyp
     """
     import logging
 
-    import omnigent.inner.databricks_executor as db_exec
-    from omnigent.inner.openai_agents_sdk_executor import _get_openai_async_client
+    import omnigent.harnesses.databricks.executor as db_exec
+    from omnigent.harnesses.openai_agents.executor import _get_openai_async_client
 
     def _import_error(*_args, **_kw):
         raise ImportError("No module named 'databricks.sdk'")
@@ -2032,7 +2032,7 @@ def test_run_turn_auth_error_yields_actionable_message(monkeypatch):
 
     :param monkeypatch: Pytest monkeypatch fixture.
     """
-    from omnigent.inner.databricks_executor import DatabricksAuthError
+    from omnigent.harnesses.databricks.executor import DatabricksAuthError
 
     # DatabricksAuthError carries the actionable message; its __cause__ is
     # the raw SDK exception that is NOT suitable to show the user.
@@ -2047,7 +2047,7 @@ def test_run_turn_auth_error_yields_actionable_message(monkeypatch):
 
     executor = OpenAIAgentsSDKExecutor(client=object())
     with patch(
-        "omnigent.inner.openai_agents_sdk_executor._ensure_agents_sdk",
+        "omnigent.harnesses.openai_agents.executor._ensure_agents_sdk",
         return_value=_fake_agents_sdk(),
     ):
         events = _run(
@@ -2402,7 +2402,7 @@ def test_context_length_exceeded_re_raises() -> None:
         _FakeRunner.last_calls = []
         _FakeRunner.next_result = _FakeResult(events=[], final_output="", exception=_CtxExceeded())
         with patch(
-            "omnigent.inner.openai_agents_sdk_executor._ensure_agents_sdk",
+            "omnigent.harnesses.openai_agents.executor._ensure_agents_sdk",
             return_value=_fake_agents_sdk(),
         ):
             with pytest.raises(_CtxExceeded):
@@ -2465,7 +2465,7 @@ def test_policy_evaluator_deny_yields_executor_error() -> None:
         ]
 
         with patch(
-            "omnigent.inner.openai_agents_sdk_executor._ensure_agents_sdk",
+            "omnigent.harnesses.openai_agents.executor._ensure_agents_sdk",
             return_value=_fake_agents_sdk(),
         ):
             events = await _collect(executor.run_turn(messages, [], "Be helpful."))
@@ -2531,7 +2531,7 @@ def test_policy_evaluator_allow_proceeds_to_run() -> None:
         )
 
         with patch(
-            "omnigent.inner.openai_agents_sdk_executor._ensure_agents_sdk",
+            "omnigent.harnesses.openai_agents.executor._ensure_agents_sdk",
             return_value=_fake_agents_sdk(),
         ):
             events = await _collect(executor.run_turn(messages, [], "Be helpful."))
@@ -2578,7 +2578,7 @@ def test_turn_usage_subtracts_cached_tokens_from_input() -> None:
         _FakeRunner.next_result = result
         executor = OpenAIAgentsSDKExecutor(client=object())
         with patch(
-            "omnigent.inner.openai_agents_sdk_executor._ensure_agents_sdk",
+            "omnigent.harnesses.openai_agents.executor._ensure_agents_sdk",
             return_value=_fake_agents_sdk(),
         ):
             events = [
@@ -2625,7 +2625,7 @@ def test_turn_usage_no_cached_tokens_omits_cache_key() -> None:
         _FakeRunner.next_result = result
         executor = OpenAIAgentsSDKExecutor(client=object())
         with patch(
-            "omnigent.inner.openai_agents_sdk_executor._ensure_agents_sdk",
+            "omnigent.harnesses.openai_agents.executor._ensure_agents_sdk",
             return_value=_fake_agents_sdk(),
         ):
             events = [
@@ -2675,7 +2675,7 @@ def test_turn_usage_cached_tokens_clamped_to_input() -> None:
         _FakeRunner.next_result = result
         executor = OpenAIAgentsSDKExecutor(client=object())
         with patch(
-            "omnigent.inner.openai_agents_sdk_executor._ensure_agents_sdk",
+            "omnigent.harnesses.openai_agents.executor._ensure_agents_sdk",
             return_value=_fake_agents_sdk(),
         ):
             events = [
@@ -2722,7 +2722,7 @@ def test_turn_usage_cached_tokens_multi_call_sums_across_responses() -> None:
         _FakeRunner.next_result = result
         executor = OpenAIAgentsSDKExecutor(client=object())
         with patch(
-            "omnigent.inner.openai_agents_sdk_executor._ensure_agents_sdk",
+            "omnigent.harnesses.openai_agents.executor._ensure_agents_sdk",
             return_value=_fake_agents_sdk(),
         ):
             events = [
@@ -2827,7 +2827,7 @@ def test_empty_turn_retries_then_succeeds() -> None:
         ]
         executor = _make_databricks_executor()
         with patch(
-            "omnigent.inner.openai_agents_sdk_executor._ensure_agents_sdk",
+            "omnigent.harnesses.openai_agents.executor._ensure_agents_sdk",
             return_value=_fake_agents_sdk(),
         ):
             events = await _collect(
@@ -2880,7 +2880,7 @@ def test_empty_turn_retry_exhausted_yields_retryable_error() -> None:
         ]
         executor = _make_databricks_executor()
         with patch(
-            "omnigent.inner.openai_agents_sdk_executor._ensure_agents_sdk",
+            "omnigent.harnesses.openai_agents.executor._ensure_agents_sdk",
             return_value=_fake_agents_sdk(),
         ):
             events = await _collect(
@@ -2938,7 +2938,7 @@ def test_tool_call_without_text_is_not_retried() -> None:
         ]
         executor = _make_databricks_executor()
         with patch(
-            "omnigent.inner.openai_agents_sdk_executor._ensure_agents_sdk",
+            "omnigent.harnesses.openai_agents.executor._ensure_agents_sdk",
             return_value=_fake_agents_sdk(),
         ):
             events = await _collect(
@@ -2989,7 +2989,7 @@ def test_reasoning_only_turn_is_treated_as_empty() -> None:
         ]
         executor = _make_databricks_executor()
         with patch(
-            "omnigent.inner.openai_agents_sdk_executor._ensure_agents_sdk",
+            "omnigent.harnesses.openai_agents.executor._ensure_agents_sdk",
             return_value=_fake_agents_sdk(),
         ):
             events = await _collect(
@@ -3034,7 +3034,7 @@ def test_empty_turn_with_output_tokens_is_not_errored() -> None:
         ]
         executor = _make_databricks_executor()
         with patch(
-            "omnigent.inner.openai_agents_sdk_executor._ensure_agents_sdk",
+            "omnigent.harnesses.openai_agents.executor._ensure_agents_sdk",
             return_value=_fake_agents_sdk(),
         ):
             events = await _collect(
@@ -3108,7 +3108,7 @@ def test_empty_turn_retry_rewinds_sdk_session() -> None:
         fake_sdk.Runner = types.SimpleNamespace(run_streamed=_runner)
         executor = _make_databricks_executor()
         with patch(
-            "omnigent.inner.openai_agents_sdk_executor._ensure_agents_sdk",
+            "omnigent.harnesses.openai_agents.executor._ensure_agents_sdk",
             return_value=fake_sdk,
         ):
             events = await _collect(
@@ -3157,7 +3157,7 @@ class _FakeCompactionItem:
 def test_compaction_item_emits_compaction_complete() -> None:
     """When a compaction_item appears in result.new_items, a CompactionComplete
     event is yielded before TurnComplete."""
-    from omnigent.inner.executor import CompactionComplete
+    from omnigent.core.executor import CompactionComplete
 
     async def _t():
         _FakeRunner.last_calls = []
@@ -3171,7 +3171,7 @@ def test_compaction_item_emits_compaction_complete() -> None:
         )
         executor = OpenAIAgentsSDKExecutor(client=object())
         with patch(
-            "omnigent.inner.openai_agents_sdk_executor._ensure_agents_sdk",
+            "omnigent.harnesses.openai_agents.executor._ensure_agents_sdk",
             return_value=_fake_agents_sdk(),
         ):
             events = [
@@ -3200,7 +3200,7 @@ def test_compaction_item_emits_compaction_complete() -> None:
 
 def test_no_compaction_item_no_compaction_event() -> None:
     """When no compaction_item is in new_items, no CompactionComplete is yielded."""
-    from omnigent.inner.executor import CompactionComplete
+    from omnigent.core.executor import CompactionComplete
 
     async def _t():
         _FakeRunner.last_calls = []
@@ -3210,7 +3210,7 @@ def test_no_compaction_item_no_compaction_event() -> None:
         )
         executor = OpenAIAgentsSDKExecutor(client=object())
         with patch(
-            "omnigent.inner.openai_agents_sdk_executor._ensure_agents_sdk",
+            "omnigent.harnesses.openai_agents.executor._ensure_agents_sdk",
             return_value=_fake_agents_sdk(),
         ):
             events = [

@@ -2,7 +2,7 @@
 Parity tests for the wrapper-label string constants.
 
 The same key/value pair lives in five places — four Python modules
-import them from :mod:`omnigent._wrapper_labels`, and the server's
+import them from :mod:`omnigent.harnesses.wrapper_labels`, and the server's
 session routes hold their own copy for the message-bypass gate. A
 silent drift between any of these sites would re-introduce the
 resume-misroute bug class: the chat REPL would not detect a claude-native
@@ -16,7 +16,7 @@ sites.
 
 from __future__ import annotations
 
-from omnigent._wrapper_labels import (
+from omnigent.harnesses.wrapper_labels import (
     CLAUDE_NATIVE_WRAPPER_VALUE,
     CODEX_NATIVE_WRAPPER_VALUE,
     KIRO_NATIVE_WRAPPER_VALUE,
@@ -43,7 +43,7 @@ def test_claude_native_wrapper_constants_match_claude_native_module() -> None:
 
 def test_claude_native_wrapper_constants_match_chat_module() -> None:
     """
-    ``omnigent.chat`` imports the same key/value pair.
+    ``omnigent.cli.chat`` imports the same key/value pair.
 
     The chat module uses these in ``_is_claude_native_conversation``
     to decide whether to redirect a resume to the claude wrapper. A
@@ -51,7 +51,7 @@ def test_claude_native_wrapper_constants_match_chat_module() -> None:
     silently opens an Omnigent REPL on top of a tmux session it can't see —
     the misroute's root cause.
     """
-    from omnigent import chat
+    from omnigent.cli import chat
 
     assert chat._CLAUDE_NATIVE_WRAPPER_LABEL_KEY == WRAPPER_LABEL_KEY
     assert chat._CLAUDE_NATIVE_WRAPPER_LABEL_VALUE == CLAUDE_NATIVE_WRAPPER_VALUE
@@ -109,7 +109,7 @@ def test_codex_native_wrapper_constants_match_picker_module() -> None:
 
     The picker uses it to render the ``[codex]`` Runtime badge.
     """
-    from omnigent.harness_plugins import CODEX_NATIVE_CODING_AGENT
+    from omnigent.harnesses.registry import CODEX_NATIVE_CODING_AGENT
 
     assert CODEX_NATIVE_CODING_AGENT.wrapper_label == CODEX_NATIVE_WRAPPER_VALUE
 
@@ -135,7 +135,7 @@ def test_pi_native_wrapper_constants_match_pi_native_module() -> None:
 
 def test_pi_native_wrapper_constants_match_registry() -> None:
     """The native coding-agent registry owns the Pi wrapper metadata."""
-    from omnigent.harness_plugins import PI_NATIVE_CODING_AGENT
+    from omnigent.harnesses.registry import PI_NATIVE_CODING_AGENT
 
     assert PI_NATIVE_CODING_AGENT.agent_name == "pi-native-ui"
     assert PI_NATIVE_CODING_AGENT.harness == "pi-native"
@@ -145,7 +145,7 @@ def test_pi_native_wrapper_constants_match_registry() -> None:
 
 def test_kiro_native_wrapper_constants_match_registry() -> None:
     """The native coding-agent registry owns the Kiro wrapper metadata."""
-    from omnigent.harness_plugins import KIRO_NATIVE_CODING_AGENT
+    from omnigent.harnesses.registry import KIRO_NATIVE_CODING_AGENT
 
     assert KIRO_NATIVE_CODING_AGENT.agent_name == "kiro-native-ui"
     assert KIRO_NATIVE_CODING_AGENT.harness == "kiro-native"

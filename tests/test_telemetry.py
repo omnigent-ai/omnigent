@@ -420,7 +420,7 @@ def test_host_hello_frame_roundtrip_with_installation_id() -> None:
     from unittest.mock import patch
 
     from omnigent.host.frames import HostHelloFrame, decode_host_frame, encode_host_frame
-    from omnigent.runtime import telemetry as _telemetry_mod
+    from omnigent.observability import otel as _telemetry_mod
 
     frame = HostHelloFrame(
         version="0.1.0",
@@ -443,7 +443,7 @@ def test_host_hello_frame_roundtrip_none_installation_id() -> None:
     from unittest.mock import patch
 
     from omnigent.host.frames import HostHelloFrame, decode_host_frame, encode_host_frame
-    from omnigent.runtime import telemetry as _telemetry_mod
+    from omnigent.observability import otel as _telemetry_mod
 
     frame = HostHelloFrame(
         version="0.1.0",
@@ -800,7 +800,7 @@ def test_anon_user_id_without_installation_id() -> None:
 
 def test_current_anon_user_id_hashes_the_request_user() -> None:
     """The request-scoped user bound by the server middleware is hashed."""
-    from omnigent.debug_logging import current_user_id_scope
+    from omnigent.observability.debug_logging import current_user_id_scope
     from omnigent.telemetry.anon import anon_user_id, current_anon_user_id
 
     with (
@@ -816,7 +816,7 @@ def test_current_anon_user_id_hashes_the_request_user() -> None:
 
 def test_current_anon_user_id_none_without_a_request_user() -> None:
     """No bound request user (single-user mode, or outside a request) → ``None``."""
-    from omnigent.debug_logging import USER_ID_ENV_VAR, current_user_id_scope
+    from omnigent.observability.debug_logging import USER_ID_ENV_VAR, current_user_id_scope
     from omnigent.telemetry.anon import current_anon_user_id
 
     with (
@@ -938,7 +938,7 @@ def test_telemetry_request_headers_survives_a_failing_lookup() -> None:
 
 def test_server_request_headers_fold_in_the_installation_id() -> None:
     """Every request opened through the shared builder carries the header."""
-    from omnigent.cli_auth import databricks_request_headers
+    from omnigent.cli.auth import databricks_request_headers
     from omnigent.telemetry.request_headers import INSTALLATION_ID_HEADER
 
     with (

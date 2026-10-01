@@ -800,7 +800,7 @@ class ManagedSandboxDeployment:
             if config.managed_launch_supported and config.provider is not None:
                 launcher = config.launcher_factory()
                 caps[config.provider] = {"multi_repo": launcher.capabilities.multi_repo}
-                from omnigent.inference_config import parse_inference_config
+                from omnigent.models.inference_config import parse_inference_config
 
                 if parse_inference_config(config.host_config or {}):
                     caps[config.provider]["inference_models"] = True
@@ -1178,7 +1178,7 @@ def deployment_with_inference_snapshot(
     deployment: ManagedSandboxDeployment, snapshot: dict[str, Any] | None
 ) -> ManagedSandboxDeployment:
     """Restore saved inference settings while retaining current sandbox lifecycle settings."""
-    from omnigent.inference_config import snapshot_runtime_config
+    from omnigent.models.inference_config import snapshot_runtime_config
 
     runtime = snapshot_runtime_config(snapshot)
     if runtime is None:
@@ -1228,7 +1228,10 @@ def _parse_host_config(raw: dict[str, object]) -> dict[str, object] | None:
     # validation here yet still ride to the sandbox, where the merge writes
     # `providers: null` over any existing block — the silent degradation this
     # parse exists to prevent.
-    from omnigent.inference_config import parse_inference_config, validate_inference_credentials
+    from omnigent.models.inference_config import (
+        parse_inference_config,
+        validate_inference_credentials,
+    )
 
     if parse_inference_config(host_config):
         validate_inference_credentials(host_config)
@@ -1479,7 +1482,7 @@ def _parse_single_provider_sandbox_config(raw: dict[str, object]) -> ManagedSand
             raise ValueError(f"sandbox.model_discovery.{name} requires base_url")
         if not (discovery.get("api_key_ref") or discovery.get("auth_command")):
             raise ValueError(f"sandbox.model_discovery.{name} requires a credential reference")
-    from omnigent.inference_config import validate_inference_credentials
+    from omnigent.models.inference_config import validate_inference_credentials
 
     validate_inference_credentials({}, model_discovery)
     if provider == "agent_sandbox":

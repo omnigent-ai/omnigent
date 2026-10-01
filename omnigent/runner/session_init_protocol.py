@@ -65,7 +65,7 @@ def build_runner_session_init_payload(
     recovery_id: str | None = None,
 ) -> dict[str, object]:
     """Build the versioned initialization fields appended to the legacy body."""
-    from omnigent.inference_config import snapshot_runtime_config
+    from omnigent.models.inference_config import snapshot_runtime_config
 
     if conversation.agent_id is None:
         raise ValueError("runner session initialization requires an agent_id")
@@ -108,7 +108,7 @@ class RunnerInferenceConfigMismatch(ValueError):
 
 def validate_runner_inference_config(expected: dict[str, object] | None) -> None:
     """Require the session to use the provider map the runner loaded at launch."""
-    from omnigent.inference_config import load_runtime_inference_config
+    from omnigent.models.inference_config import load_runtime_inference_config
 
     actual = load_runtime_inference_config({})
     expected = expected or {}

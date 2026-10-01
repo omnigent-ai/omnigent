@@ -13,10 +13,10 @@ from typing import TYPE_CHECKING, Any
 from omnigent.runtime.caps import RuntimeCaps
 
 if TYPE_CHECKING:
+    from omnigent.harnesses.runtime.process_manager import HarnessProcessManager
     from omnigent.runner.resource_registry import SessionResourceRegistry
     from omnigent.runner.routing import RunnerRouter
     from omnigent.runtime.agent_cache import AgentCache
-    from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
     from omnigent.stores import (
         AgentStore,
         ArtifactStore,

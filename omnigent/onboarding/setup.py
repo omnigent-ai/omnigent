@@ -34,7 +34,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 from urllib.parse import urlparse
 
-from omnigent.cli_invocation import cli_invocation
+from omnigent.util.cli_invocation import cli_invocation
 
 if TYPE_CHECKING:
     from rich.console import Console

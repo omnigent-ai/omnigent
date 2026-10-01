@@ -9,11 +9,11 @@ from pathlib import Path
 
 import pytest
 
-from omnigent.inner.codex_executor import CodexExecutor, _require_brokered_codex_version
-from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
-from omnigent.inner.executor import TextChunk, TurnComplete
-from omnigent.inner.model_egress import FrozenModelRoute
-from omnigent.inner.model_signer import SignerLaunchConfig
+from omnigent.core.datamodel import OSEnvSandboxSpec, OSEnvSpec
+from omnigent.core.executor import TextChunk, TurnComplete
+from omnigent.harnesses.codex.executor import CodexExecutor, _require_brokered_codex_version
+from omnigent.models.signer.egress import FrozenModelRoute
+from omnigent.models.signer.lifecycle import SignerLaunchConfig
 
 _CODEX = Path("/opt/homebrew/bin/codex")
 _MARKER = "BROKERED_E2E_OK upstream_saw_signer_only_fake_bearer=true"

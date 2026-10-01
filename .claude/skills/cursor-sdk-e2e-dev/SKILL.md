@@ -1,6 +1,6 @@
 ---
 name: cursor-sdk-e2e-dev
-description: Spin up a live local Omnigent server and exercise the Cursor SDK harness end-to-end — build cursor agents, run real turns, smoke-test, and bug-bash. Load when developing, testing, or debugging the cursor harness (omnigent/inner/cursor_executor.py, cursor_harness.py, cursor_auth.py) or its auth / model / tool-bridge behavior.
+description: Spin up a live local Omnigent server and exercise the Cursor SDK harness end-to-end — build cursor agents, run real turns, smoke-test, and bug-bash. Load when developing, testing, or debugging the cursor harness (omnigent/harnesses/cursor/executor.py, cursor_harness.py, cursor_auth.py) or its auth / model / tool-bridge behavior.
 ---
 
 # Cursor SDK harness: end-to-end dev & testing
@@ -121,8 +121,8 @@ that works, the full stack is good: key, egress, bridge, harness.
 
 ## Code & tests
 
-- **Executor (SDK bridge):** `omnigent/inner/cursor_executor.py`
-- **Wrap (HARNESS_CURSOR_* env → executor):** `omnigent/inner/cursor_harness.py`
+- **Executor (SDK bridge):** `omnigent/harnesses/cursor/executor.py`
+- **Wrap (HARNESS_CURSOR_* env → executor):** `omnigent/harnesses/cursor/harness.py`
 - **Auth / key resolution:** `omnigent/onboarding/cursor_auth.py`
 - **Spawn env:** `_build_cursor_spawn_env` in `omnigent/runtime/workflow.py`
 

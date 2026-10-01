@@ -21,8 +21,8 @@ import pytest
 from omnigent.harnesses.claude_native import main as claude_native
 from omnigent.harnesses.claude_native.bridge import BRIDGE_ID_LABEL_KEY
 from omnigent.harnesses.codex_native import main as codex_native
+from omnigent.harnesses.native import terminal as native_terminal
 from omnigent.host import daemon_launch
-from omnigent.native import native_terminal
 
 pytestmark = pytest.mark.asyncio
 
@@ -247,11 +247,11 @@ def _install_daemon_seam_mocks(
         to.
     :returns: None.
     """
-    monkeypatch.setattr("omnigent.chat._remote_headers", lambda server_url=None, **k: {})
-    monkeypatch.setattr("omnigent.chat._server_auth", lambda server_url=None, **k: None)
-    monkeypatch.setattr("omnigent.chat._bundle_agent", lambda path: b"bundle")
+    monkeypatch.setattr("omnigent.cli.chat._remote_headers", lambda server_url=None, **k: {})
+    monkeypatch.setattr("omnigent.cli.chat._server_auth", lambda server_url=None, **k: None)
+    monkeypatch.setattr("omnigent.cli.chat._bundle_agent", lambda path: b"bundle")
     monkeypatch.setattr(
-        "omnigent.cli._ensure_host_daemon",
+        "omnigent.cli.commands._ensure_host_daemon",
         lambda url: ensured.append(url),
     )
     monkeypatch.setattr(

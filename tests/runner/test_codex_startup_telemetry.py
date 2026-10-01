@@ -13,7 +13,6 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from omnigent.debug_logging import PRIMARY_SESSION_ID_ENV_VAR, record_to_row
 from omnigent.harnesses.codex_native import forwarder
 from omnigent.harnesses.codex_native.app_server import CodexAppServerClient, CodexNativeAppServer
 from omnigent.harnesses.codex_native.bridge import (
@@ -21,9 +20,10 @@ from omnigent.harnesses.codex_native.bridge import (
     read_bridge_state,
     write_bridge_startup_error,
 )
-from omnigent.inner.terminal import TerminalInstance
-from omnigent.process_logging import RedactingLogFormatter
+from omnigent.observability.debug_logging import PRIMARY_SESSION_ID_ENV_VAR, record_to_row
+from omnigent.observability.process_logging import RedactingLogFormatter
 from omnigent.runner.native import orchestration
+from omnigent.terminals.terminal import TerminalInstance
 
 _STDERR_ENV = "OMNIGENT_HARNESS_STDERR_ENABLED"
 
@@ -799,7 +799,7 @@ async def test_success_starts_forwarder_without_reporting_startup_failure(
         forwarder, "wait_for_thread_started", AsyncMock(return_value="thread-ready")
     )
     monkeypatch.setattr(forwarder, "supervise_forwarder", supervise)
-    monkeypatch.setattr("omnigent.cli_auth.open_server_client", open_server_client)
+    monkeypatch.setattr("omnigent.cli.auth.open_server_client", open_server_client)
     monkeypatch.setattr("omnigent.runner._entry._make_auth_token_factory", lambda: None)
     monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:1")
 

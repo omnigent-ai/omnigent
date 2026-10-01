@@ -1232,7 +1232,7 @@ def test_codex_spec_databricks_auth_routes_via_synthesized_provider(
     the gateway + profile wiring the fold owns (no ``~/.databrickscfg`` needed).
     """
     _write_config(config_home, {})
-    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+    from omnigent.core.datamodel import OSEnvSandboxSpec, OSEnvSpec
     from omnigent.onboarding.ucode_state import UcodeAgentState, UcodeWorkspaceState
 
     endpoint = "https://workspace.databricks.com/ai-gateway/codex/v1"
@@ -1275,9 +1275,9 @@ def test_codex_spec_databricks_auth_routes_via_synthesized_provider(
     assert "HARNESS_CODEX_GATEWAY" not in env
     assert "HARNESS_CODEX_GATEWAY_AUTH_COMMAND" not in env
 
-    from omnigent.inner import codex_harness
-    from omnigent.inner.codex_executor import CodexExecutor
-    from omnigent.inner.model_signer import SignerLaunchConfig
+    from omnigent.harnesses.codex import harness as codex_harness
+    from omnigent.harnesses.codex.executor import CodexExecutor
+    from omnigent.models.signer.lifecycle import SignerLaunchConfig
 
     captured: dict[str, object] = {}
     original_init = CodexExecutor.__init__
@@ -1308,7 +1308,7 @@ def test_codex_spec_databricks_auth_routes_via_synthesized_provider(
 
 
 def test_codex_databricks_broker_fails_without_model_egress(config_home: Path) -> None:
-    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+    from omnigent.core.datamodel import OSEnvSandboxSpec, OSEnvSpec
 
     _write_config(config_home, {})
     spec = _make_spec(
@@ -1330,7 +1330,7 @@ def test_codex_databricks_broker_fails_without_model_egress(config_home: Path) -
 def test_codex_databricks_broker_rejects_ordinary_egress_rules(
     config_home: Path,
 ) -> None:
-    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+    from omnigent.core.datamodel import OSEnvSandboxSpec, OSEnvSpec
 
     _write_config(config_home, {})
     spec = _make_spec(
@@ -1714,7 +1714,7 @@ def test_kimi_os_env_serialized(config_home: Path) -> None:
     sandbox launcher never engages and kimi runs unconfined."""
     import json as _json
 
-    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+    from omnigent.core.datamodel import OSEnvSandboxSpec, OSEnvSpec
 
     _write_config(config_home, {"providers": {}})
     os_env = OSEnvSpec(
@@ -1779,7 +1779,7 @@ def test_hermes_os_env_serialized(config_home: Path) -> None:
     reported a sandbox."""
     import json as _json
 
-    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+    from omnigent.core.datamodel import OSEnvSandboxSpec, OSEnvSpec
 
     _write_config(config_home, {"providers": {}})
     os_env = OSEnvSpec(

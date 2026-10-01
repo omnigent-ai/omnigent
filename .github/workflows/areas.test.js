@@ -90,9 +90,9 @@ function resolve(fn) {
 }
 const cases = [
   ["omnigent/inner/foo.py", "inner"],
-  ["omnigent/inner/claude_sdk_executor.py", "harness-claude"],
-  ["omnigent/inner/kimi_executor.py", "harness-kimi"],
-  ["omnigent/inner/kiro_native_harness.py", "harness-kiro"],
+  ["omnigent/harnesses/claude_sdk/executor.py", "harness-claude"],
+  ["omnigent/harnesses/kimi/executor.py", "harness-kimi"],
+  ["omnigent/harnesses/kiro_native/harness.py", "harness-kiro"],
   ["web/src/main.tsx", "web"],
   ["web/ios/App.swift", "mobile-app"],
   ["web/android/app/src/main/MainActivity.kt", "android-app"],

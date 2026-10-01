@@ -1,4 +1,4 @@
-"""Unit tests for omnigent.inner.credential_proxy.
+"""Unit tests for omnigent.sandbox.credential_proxy.
 
 These cover the parent-side runtime: secret resolution from
 ``env`` / ``file`` / ``command`` sources, the default swap-on-access
@@ -16,20 +16,20 @@ from pathlib import Path
 
 import pytest
 
-from omnigent.errors import OmnigentError
-from omnigent.inner.credential_proxy import (
-    SYNTHETIC_CREDENTIAL_PREFIX,
-    CredentialProxyRuntime,
-    DatabricksProfileTokenProvider,
-    _prepare_databricks_runtime,
-    prepare_credential_proxy_runtime,
-)
-from omnigent.inner.datamodel import (
+from omnigent.core.datamodel import (
     CredentialProxyEntry,
     CredentialProxySpec,
     CredentialSourceSpec,
     DatabricksProfileBinding,
     DatabricksProxySpec,
+)
+from omnigent.errors import OmnigentError
+from omnigent.sandbox.credential_proxy import (
+    SYNTHETIC_CREDENTIAL_PREFIX,
+    CredentialProxyRuntime,
+    DatabricksProfileTokenProvider,
+    _prepare_databricks_runtime,
+    prepare_credential_proxy_runtime,
 )
 
 

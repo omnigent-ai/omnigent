@@ -1,4 +1,4 @@
-"""Unit tests for :mod:`omnigent.inner.terminal`."""
+"""Unit tests for :mod:`omnigent.terminals.terminal`."""
 
 from __future__ import annotations
 
@@ -19,19 +19,19 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-import omnigent.inner.terminal as terminal_mod
+import omnigent.terminals.terminal as terminal_mod
+from omnigent.core.datamodel import OSEnvSandboxSpec, OSEnvSpec, TerminalEnvSpec
 from omnigent.harnesses.diagnostics import sanitize_diagnostic_text
-from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec, TerminalEnvSpec
-from omnigent.inner.terminal import (
+from omnigent.harnesses.native import owner_claim
+from omnigent.runner.resource_registry import trim_terminal_output
+from omnigent.terminals.terminal import (
     TerminalInstance,
     _apply_utf8_locale_default,
     _has_utf8_locale,
     _is_utf8_locale_value,
     create_terminal_instance,
 )
-from omnigent.native import owner_claim
-from omnigent.runner.identity import RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR
-from omnigent.runner.resource_registry import trim_terminal_output
+from omnigent.util.runner_identity import RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR
 
 
 @dataclass
@@ -2865,7 +2865,7 @@ async def test_launch_strips_runner_binding_token_from_tmux_child(
 async def test_terminal_desktop_session_follows_sandbox_policy(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, inherit_env: bool, sandbox_active: bool
 ) -> None:
-    from omnigent.inner.sandbox import SandboxPolicy
+    from omnigent.sandbox.core import SandboxPolicy
 
     session_env = {
         "DBUS_SESSION_BUS_ADDRESS": "unix:path=/run/user/1000/bus",

@@ -18,13 +18,13 @@ import pytest
 
 import omnigent.harnesses.antigravity_native.bridge as bridge_mod
 import omnigent.harnesses.antigravity_native.main as _mod
-from omnigent._wrapper_labels import ANTIGRAVITY_NATIVE_WRAPPER_VALUE, WRAPPER_LABEL_KEY
 from omnigent.harnesses.antigravity_native.bridge import (
     ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY,
     read_bridge_state,
     read_tmux_info,
 )
 from omnigent.harnesses.antigravity_native.main import antigravity_terminal_resource_id
+from omnigent.harnesses.wrapper_labels import ANTIGRAVITY_NATIVE_WRAPPER_VALUE, WRAPPER_LABEL_KEY
 
 
 def _mock_client(handler: Callable[[httpx.Request], httpx.Response]) -> httpx.AsyncClient:

@@ -481,7 +481,7 @@ async def test_opencode_worker_with_binding_inherits_bare_bound_id(
         },
     }
     monkeypatch.setattr(
-        "omnigent.inference_config.load_runtime_inference_config",
+        "omnigent.models.inference_config.load_runtime_inference_config",
         lambda base_config=None: config,
     )
     bodies = await _dispatch_without_model(
@@ -520,7 +520,7 @@ async def test_opencode_worker_with_binding_skips_unlisted_id(
         },
     }
     monkeypatch.setattr(
-        "omnigent.inference_config.load_runtime_inference_config",
+        "omnigent.models.inference_config.load_runtime_inference_config",
         lambda base_config=None: config,
     )
     bodies = await _dispatch_without_model(
@@ -566,7 +566,7 @@ async def test_binding_lets_foreign_multi_model_child_inherit(
         },
     }
     monkeypatch.setattr(
-        "omnigent.inference_config.load_runtime_inference_config",
+        "omnigent.models.inference_config.load_runtime_inference_config",
         lambda base_config=None: config,
     )
     bodies = await _dispatch_without_model(

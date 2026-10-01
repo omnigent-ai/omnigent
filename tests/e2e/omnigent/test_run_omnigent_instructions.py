@@ -5,7 +5,7 @@ so the test proves the instructions file was loaded and used as
 the system prompt.
 
 **What breaks if this fails:**
-- ``omnigent/inner/loader.py::_resolve_instructions`` regresses.
+- ``omnigent/core/loader.py::_resolve_instructions`` regresses.
 - ``omnigent/spec/omnigent.py::agent_def_to_agent_spec`` stops
   preferring ``AgentDef.instructions`` over ``AgentDef.prompt``.
 - ``omnigent/spec/_omnigent_compat.py::is_omnigent_yaml``

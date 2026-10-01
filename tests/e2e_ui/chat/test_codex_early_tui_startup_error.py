@@ -118,7 +118,7 @@ def bad_flag_codex_session(
     base_url = f"http://127.0.0.1:{port}"
     binding_token = secrets.token_urlsafe(32)
 
-    from omnigent.runner.identity import token_bound_runner_id
+    from omnigent.util.runner_identity import token_bound_runner_id
 
     runner_id = token_bound_runner_id(binding_token)
 
@@ -152,7 +152,7 @@ def bad_flag_codex_session(
             [
                 sys.executable,
                 "-m",
-                "omnigent.cli",
+                "omnigent.cli.commands",
                 "server",
                 "--host",
                 "127.0.0.1",

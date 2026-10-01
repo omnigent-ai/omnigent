@@ -31,7 +31,7 @@ from typing import Any
 import httpx
 import yaml
 
-from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN, token_bound_runner_id
+from omnigent.util.runner_identity import OMNIGENT_INTERNAL_WS_ORIGIN, token_bound_runner_id
 from tests._helpers.compat import (
     apply_runner_env,
     apply_server_env,
@@ -73,7 +73,7 @@ def spawn_omnigent_server(
     args = [
         server_executable(),
         "-m",
-        "omnigent.cli",
+        "omnigent.cli.commands",
         "server",
         "--port",
         str(port),

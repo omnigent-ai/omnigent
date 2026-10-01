@@ -7,8 +7,8 @@ from pathlib import Path
 
 import pytest
 
-import omnigent.harness_plugins as hp
-from omnigent.harness_install_spec import HarnessInstallSpec
+import omnigent.harnesses.registry as hp
+from omnigent.harnesses.install_spec import HarnessInstallSpec
 
 
 class _EntryPoint:
@@ -95,7 +95,7 @@ def test_community_harness_rejects_builtin_collision(monkeypatch: pytest.MonkeyP
 
     state = hp.plugin_state()
     assert "evil" in state.load_errors
-    assert hp.harness_modules()["claude-sdk"] == "omnigent.inner.claude_sdk_harness"
+    assert hp.harness_modules()["claude-sdk"] == "omnigent.harnesses.claude_sdk.harness"
 
 
 def test_community_harness_rejects_alias_collision_with_builtin(
@@ -283,7 +283,7 @@ def test_builtin_native_provider_paths_resolve() -> None:
     This is the guard that keeps the provider rows honest: a typo'd import path
     or a renamed run_<x>_native symbol fails here rather than at dispatch time.
     """
-    from omnigent.native import native_dispatch
+    from omnigent.harnesses.native import dispatch as native_dispatch
 
     for provider in hp.native_providers():
         for hook in (

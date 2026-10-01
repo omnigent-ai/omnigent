@@ -33,7 +33,6 @@ from omnigent.llms.types import (
     ResponseStreamEvent,
     ResponseTextDeltaEvent,
 )
-from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN
 from omnigent.runtime import init as init_runtime
 from omnigent.runtime import pending_elicitations
 from omnigent.runtime.agent_cache import AgentCache
@@ -48,6 +47,7 @@ from omnigent.stores.conversation_store.sqlalchemy_store import (
 )
 from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
+from omnigent.util.runner_identity import OMNIGENT_INTERNAL_WS_ORIGIN
 
 # ── Controllable mock LLM ─────────────────────────────
 
@@ -641,8 +641,8 @@ async def _app_client(
     """Serve a real app and drain its harness/relay work before the loop closes."""
     # Initialize the HarnessProcessManager for tests that hit the
     # fallback executor path (when _runner_client is not set).
+    from omnigent.harnesses.runtime.process_manager import HarnessProcessManager
     from omnigent.runtime import set_harness_process_manager
-    from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
 
     pm = HarnessProcessManager(tmp_parent=tmp_path / "harness_pm")
     await pm.start()

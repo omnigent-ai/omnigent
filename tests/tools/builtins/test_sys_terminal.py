@@ -22,8 +22,8 @@ from typing import Any
 
 import pytest
 
+from omnigent.core.datamodel import OSEnvSandboxSpec, OSEnvSpec, TerminalEnvSpec
 from omnigent.entities.conversation import MessageData
-from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec, TerminalEnvSpec
 from omnigent.runtime import _globals
 from omnigent.spec.types import AgentSpec
 from omnigent.stores.conversation_store.sqlalchemy_store import (

@@ -35,7 +35,7 @@ verify spawn / health / round-trip behavior:
 Lives under ``tests/`` so it doesn't ship as production code; the
 test process registers the module path
 (``"tests.runtime.harnesses._test_harness"``) in
-:data:`omnigent.runtime.harnesses._HARNESS_MODULES` per test.
+:data:`omnigent.harnesses.runtime._HARNESS_MODULES` per test.
 """
 
 from __future__ import annotations

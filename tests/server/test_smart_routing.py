@@ -2494,7 +2494,7 @@ def test_parse_routing_tables_leaves_absent_or_malformed_tables_at_their_default
 
 def test_configured_tables_reach_the_behaviour_through_the_config_block() -> None:
     """End to end: a ``routing:`` block's tables drive the seam's decisions."""
-    from omnigent.cli import parse_routing_settings
+    from omnigent.cli.commands import parse_routing_settings
     from omnigent.server.smart_routing import RoutePick, route_option_source
 
     settings = parse_routing_settings(
@@ -2564,7 +2564,7 @@ def test_parse_routing_settings(
     cfg: dict[str, Any] | None,  # type: ignore[explicit-any]
     expected: dict[str, Any],  # type: ignore[explicit-any]
 ) -> None:
-    from omnigent.cli import parse_routing_settings
+    from omnigent.cli.commands import parse_routing_settings
     from omnigent.server.smart_routing import MODEL_ID_PREFIXES
 
     settings = parse_routing_settings(cfg)
@@ -2607,7 +2607,10 @@ def test_default_on_synthesizes_client_for_databricks_provider(
     global_providers: dict[str, Any] | None,  # type: ignore[explicit-any]
     expected_profile: str,
 ) -> None:
-    from omnigent.cli import _build_default_databricks_routing_client, parse_routing_settings
+    from omnigent.cli.commands import (
+        _build_default_databricks_routing_client,
+        parse_routing_settings,
+    )
     from omnigent.server.smart_routing import ExternalRoutingClient
 
     host = f"https://{expected_profile}.cloud.databricks.com"
@@ -2655,7 +2658,10 @@ def test_default_on_skips_without_a_routable_databricks_workspace(
     global_providers: dict[str, Any],  # type: ignore[explicit-any]
     resolve_error: Exception | None,
 ) -> None:
-    from omnigent.cli import _build_default_databricks_routing_client, parse_routing_settings
+    from omnigent.cli.commands import (
+        _build_default_databricks_routing_client,
+        parse_routing_settings,
+    )
 
     creds = MagicMock()
     creds.host = "https://ws.cloud.databricks.com"

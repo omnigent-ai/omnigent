@@ -27,7 +27,7 @@ _WORKSPACE_API = "https://ws.databricks.com/api/2.0/omnigent"
 def _isolated_auth_store(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Keep remembered synthetic selectors out of other tests and user state."""
     monkeypatch.setattr(
-        "omnigent.cli_auth._token_file_path",
+        "omnigent.cli.auth._token_file_path",
         lambda: tmp_path / "auth_tokens.json",
     )
 
@@ -88,10 +88,10 @@ def test_from_api_base_prefers_url_selector_over_store(tmp_path, monkeypatch) ->
     record must not override it, and the wire base must stay query-free
     (callers append paths like ``/v1/me``).
     """
-    from omnigent.cli_auth import store_databricks_auth
+    from omnigent.cli.auth import store_databricks_auth
 
     monkeypatch.setattr(
-        "omnigent.cli_auth._token_file_path",
+        "omnigent.cli.auth._token_file_path",
         lambda: tmp_path / "auth_tokens.json",
     )
     store_databricks_auth(_WORKSPACE_API, "https://ws.databricks.com", org_id="999")
@@ -104,10 +104,10 @@ def test_from_api_base_prefers_url_selector_over_store(tmp_path, monkeypatch) ->
 
 def test_from_api_base_falls_back_to_login_record(tmp_path, monkeypatch) -> None:
     """Without a URL selector, the ``omnigent login`` record supplies it."""
-    from omnigent.cli_auth import store_databricks_auth
+    from omnigent.cli.auth import store_databricks_auth
 
     monkeypatch.setattr(
-        "omnigent.cli_auth._token_file_path",
+        "omnigent.cli.auth._token_file_path",
         lambda: tmp_path / "auth_tokens.json",
     )
     store_databricks_auth(_WORKSPACE_API, "https://ws.databricks.com", org_id="999")
@@ -126,7 +126,7 @@ def test_display_round_trips_through_login_resolution(monkeypatch) -> None:
     server: the resolver expands the UI mount back to the API base and
     recaptures the selector.
     """
-    import omnigent.cli as cli_mod
+    import omnigent.cli.commands as cli_mod
 
     def fake_get(url: str, **kwargs: object):
         import httpx

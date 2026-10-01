@@ -47,7 +47,7 @@ from typing import TYPE_CHECKING, ClassVar
 
 import click
 
-from omnigent.inner import ui
+from omnigent.cli import ui
 from omnigent.onboarding.sandboxes.base import (
     DEFAULT_HOST_IMAGE,
     RemoteCommandResult,

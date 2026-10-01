@@ -37,7 +37,7 @@ from pathlib import Path
 
 from omnigent.harnesses.codex_native.app_server import CodexNativeAppServer
 from omnigent.harnesses.codex_native.stderr_diagnostics import codex_app_server_diagnostic_env
-from omnigent.process_logging import configure_process_logging
+from omnigent.observability.process_logging import configure_process_logging
 
 root = Path(sys.argv[1])
 codex = sys.argv[2]

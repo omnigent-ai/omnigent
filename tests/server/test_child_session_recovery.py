@@ -109,7 +109,7 @@ async def test_restore_active_descendants_and_idle_ancestor(recovery_tree: Any) 
 async def test_do_not_restore_excluded_children(
     recovery_tree: Any, monkeypatch: pytest.MonkeyPatch, exclusion: str
 ) -> None:
-    from omnigent.server.routes._sessions.common import _intentional_stop_sessions
+    from omnigent.server.routes.sessions.common import _intentional_stop_sessions
 
     store, parent, child, relay, _, initializer = recovery_tree
     row = child()
@@ -202,7 +202,7 @@ async def test_concurrent_rebind_is_preserved(
 async def test_child_finishing_after_scan_is_not_restored(
     recovery_tree: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from omnigent.server.routes._sessions.common import _session_status_cache
+    from omnigent.server.routes.sessions.common import _session_status_cache
 
     store, parent, child, relay, _, initializer = recovery_tree
     row = child()

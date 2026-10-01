@@ -13,7 +13,7 @@ from pathlib import Path
 
 import pytest
 
-from omnigent._platform import stable_user_id
+from omnigent.util.portability import stable_user_id
 
 pytestmark = pytest.mark.skipif(
     os.name != "posix",

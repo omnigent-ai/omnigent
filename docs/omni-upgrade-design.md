@@ -12,7 +12,7 @@ across PyPI releases. Three pieces ship together:
 
 ## Background
 
-- The CLI ships as `omnigent` / `omni` → `omnigent.cli:main()`; the installed
+- The CLI ships as `omnigent` / `omni` → `omnigent.cli.commands:main()`; the installed
   version comes from `importlib.metadata.version("omnigent")`.
 - Releases publish three lockstep packages (`omnigent`, `omnigent-client`,
   `omnigent-ui-sdk`) to PyPI via `.github/workflows/release-omnigent.yml`.
@@ -26,7 +26,7 @@ across PyPI releases. Three pieces ship together:
   process memory — which is what makes cycling a server safe.
 - PR #172 removed an earlier startup check that nagged on *install age* (it
   fired even when you were already on the latest version) and did a synchronous
-  `git fetch` on the hot path. The module (`omnigent/update_check.py`) stayed in
+  `git fetch` on the hot path. The module (`omnigent/cli/update_check.py`) stayed in
   the tree, dormant. This work rewires it correctly.
 
 ## Key constraint
@@ -57,7 +57,7 @@ no registered distribution contributes an empty version and is unaffected.)
 
 ## 2. `omni upgrade`
 
-`omnigent/cli.py`, command `upgrade`. Flow:
+`omnigent/cli/commands.py`, command `upgrade`. Flow:
 
 1. Bail on a source checkout / editable install (`_find_repo_root()` /
    `is_editable`) → tell the user to `git pull`.
@@ -81,7 +81,7 @@ Most of steps 2/5 reuse helpers that already existed in `update_check.py`.
 
 ## 3. "Release available" notice (the PR #172 redo)
 
-`omnigent/update_check.py`, installed-wheel path; wired into `main()` behind
+`omnigent/cli/update_check.py`, installed-wheel path; wired into `main()` behind
 `_should_skip_update_check(argv)` and a `sys.stderr.isatty()` gate.
 
 - **Only when newer**: compares installed vs. the cached latest version;

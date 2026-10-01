@@ -112,13 +112,13 @@ def _create_codex_session_with_workspace(
     :param workspace: The session workspace directory the user selected.
     :returns: The new session/conversation id.
     """
-    from omnigent._wrapper_labels import (
+    from omnigent.harnesses.codex_native.main import _materialize_codex_agent_spec
+    from omnigent.harnesses.wrapper_labels import (
         CODEX_NATIVE_WRAPPER_VALUE,
         UI_MODE_LABEL_KEY,
         UI_MODE_TERMINAL_VALUE,
         WRAPPER_LABEL_KEY,
     )
-    from omnigent.harnesses.codex_native.main import _materialize_codex_agent_spec
 
     with tempfile.TemporaryDirectory() as _tmp:
         spec_path = _materialize_codex_agent_spec(Path(_tmp), model=None)

@@ -51,7 +51,7 @@ import httpx
 import pytest
 import yaml
 
-from omnigent.process_logging import PROCESS_LOG_FILE_ENV_VAR
+from omnigent.observability.process_logging import PROCESS_LOG_FILE_ENV_VAR
 from tests._helpers.compat import apply_runner_env, runner_executable
 from tests.e2e.conftest import (
     POLL_INTERVAL_S,

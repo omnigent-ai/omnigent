@@ -7,7 +7,7 @@ that setting applies the same 30 s/90 s budget to every WebSocket route
 (session-updates, terminal-attach), which is deliberate: for an idle such socket
 the protocol PING/PONG is the only half-open detector, so the only effect is a
 slightly later half-open-socket reap (~120 s vs ~40 s), bounded and not a
-correctness change. See the comment on ``uvicorn.Config`` in ``omnigent/cli.py``.
+correctness change. See the comment on ``uvicorn.Config`` in ``omnigent/cli/commands.py``.
 """
 
 from __future__ import annotations

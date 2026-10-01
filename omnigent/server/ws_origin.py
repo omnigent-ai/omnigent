@@ -45,15 +45,15 @@ from urllib.parse import urlsplit
 
 from starlette.types import ASGIApp, Receive, Scope, Send
 
-from omnigent.process_logging import log_once
-from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN
+from omnigent.observability.process_logging import log_once
 from omnigent.server.auth import local_single_user_enabled
+from omnigent.util.runner_identity import OMNIGENT_INTERNAL_WS_ORIGIN
 
 _logger = logging.getLogger(__name__)
 
 # The sentinel ``Origin`` the project's own non-browser clients set is
 # defined alongside the tunnel handshake constants in
-# ``omnigent.runner.identity`` and re-exported here for the server-side
+# ``omnigent.util.runner_identity`` and re-exported here for the server-side
 # policy. See :data:`OMNIGENT_INTERNAL_WS_ORIGIN` there for rationale.
 __all__ = [
     "FORBIDDEN_ORIGIN_CLOSE_CODE",

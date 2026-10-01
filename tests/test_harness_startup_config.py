@@ -1,10 +1,10 @@
-"""Unit tests for :mod:`omnigent.harness_startup_config`."""
+"""Unit tests for :mod:`omnigent.harnesses.startup_config`."""
 
 from __future__ import annotations
 
 import pytest
 
-from omnigent.harness_startup_config import (
+from omnigent.harnesses.startup_config import (
     resolve_harness_args,
     resolve_harness_command,
     resolve_harness_config,
@@ -202,7 +202,7 @@ def test_resolve_harness_path_neither_set_returns_none(monkeypatch: pytest.Monke
 
 def test_resolve_harness_path_strips_native_suffix() -> None:
     """pi-native and pi share OMNIGENT_PI_PATH."""
-    import omnigent.harness_startup_config as m
+    import omnigent.harnesses.startup_config as m
 
     assert m._harness_path_env_var("pi-native") == "OMNIGENT_PI_PATH"
     assert m._harness_path_env_var("pi") == "OMNIGENT_PI_PATH"
@@ -274,8 +274,8 @@ def test_native_cli_persists_raw_args_not_config_merged(
     import click
     from click.testing import CliRunner
 
-    import omnigent.cli as _cli
-    import omnigent.cli_native as cli_native
+    import omnigent.cli.commands as _cli
+    import omnigent.cli.native_commands as cli_native
     import omnigent.harnesses.claude_native.main as claude_native
     import omnigent.harnesses.codex_native.main as codex_native
 
@@ -285,7 +285,7 @@ def test_native_cli_persists_raw_args_not_config_merged(
             "codex-native": {"command": "isaac", "args": ["codex", "--"]},
         }
     }
-    # Both are late-bound in cli_native to the omnigent.cli module (see _late_bound).
+    # Both are late-bound in cli_native to the omnigent.cli.commands module (see _late_bound).
     monkeypatch.setattr(_cli, "_load_effective_config", lambda: dict(cfg))
     monkeypatch.setattr(_cli, "_ensure_backend", lambda server: "https://example/api/2.0/omnigent")
 

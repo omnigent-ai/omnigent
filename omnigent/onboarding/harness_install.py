@@ -48,15 +48,15 @@ from typing import NamedTuple
 
 from packaging.version import InvalidVersion, Version
 
-from omnigent._platform import resolve_cli_binary
-from omnigent.acp_cli_harnesses import ACP_CLI_HARNESSES
-from omnigent.cli_invocation import cli_invocation
-from omnigent.harness_install_spec import HarnessInstallSpec, SetupStep
+from omnigent.harnesses.acp.cli_harnesses import ACP_CLI_HARNESSES
+from omnigent.harnesses.install_spec import HarnessInstallSpec, SetupStep
 from omnigent.harnesses.opencode_native.client import (
     OPENCODE_MAX_VERSION_EXCLUSIVE,
     OPENCODE_MIN_VERSION,
 )
 from omnigent.onboarding.provider_config import ANTHROPIC_FAMILY, GEMINI_FAMILY, OPENAI_FAMILY
+from omnigent.util.cli_invocation import cli_invocation
+from omnigent.util.portability import resolve_cli_binary
 
 # Pi is not a configure-menu family (the menu is Claude + Codex), but the
 # first-run ``run`` flow falls back to it, so it has install metadata too.
@@ -420,7 +420,7 @@ _UI_INSTALLABLE_HARNESS_TO_KEY: dict[str, str] = {
     QWEN_KEY: QWEN_KEY,
 }
 
-# Builtin ACP CLI harnesses (omnigent/acp_cli_harnesses.py) with an npm package
+# Builtin ACP CLI harnesses (omnigent/harnesses/acp/cli_harnesses.py) with an npm package
 # are one-click installable; rows shipping via curl/shell installers stay out,
 # like cursor/kimi above.
 for _acp_name, _acp_row in ACP_CLI_HARNESSES.items():
@@ -642,7 +642,7 @@ def ui_setup_steps(harness: str) -> list[SetupStep]:
 
 
 def _all_harness_install() -> dict[str, HarnessInstallSpec]:
-    from omnigent.harness_plugins import install_specs
+    from omnigent.harnesses.registry import install_specs
 
     merged = dict(_HARNESS_INSTALL)
     merged.update(install_specs())
@@ -650,7 +650,7 @@ def _all_harness_install() -> dict[str, HarnessInstallSpec]:
 
 
 def _all_harness_name_to_key() -> dict[str, str]:
-    from omnigent.harness_plugins import harness_install_keys
+    from omnigent.harnesses.registry import harness_install_keys
 
     merged = dict(_HARNESS_NAME_TO_KEY)
     merged.update(harness_install_keys())

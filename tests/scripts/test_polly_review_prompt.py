@@ -214,7 +214,7 @@ def test_bootstrap_failure_does_not_publish_guidance_or_prompt(
     ("changed_path", "expected"),
     [
         ("web/src/shell/Sidebar.tsx", True),
-        ("omnigent/cli.py", True),
+        ("omnigent/cli/commands.py", True),
         ("omnigent/harnesses/pi_native/launch.py", True),
         ("web/src/shell/Sidebar.test.tsx", False),
         ("docs/guide.md", False),

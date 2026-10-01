@@ -14,13 +14,13 @@ from omnigent.entities import (
     MessageData,
     NativeToolData,
 )
-from omnigent.inner.native_attachments import expand_framework_notices
 from omnigent.runtime.mcp_tool_result import decode_mcp_image_result
 from omnigent.runtime.tool_result_replay import (
     image_omitted_placeholder,
     strip_unparseable_image_output,
 )
 from omnigent.spec import AgentSpec
+from omnigent.util.attachments import expand_framework_notices
 
 # Shape of the wake notice the runner posts into a parent session when a
 # dispatched sub-agent finishes (``omnigent.runner.app._format_subagent_wake_notice``).

@@ -1281,8 +1281,8 @@ def test_run_banner_uses_magenta_mascot_color() -> None:
     border, and prompt marker all read as one accent regardless
     of mode.
     """
-    from omnigent.inner.banner import startup_banner_strings
-    from omnigent.inner.mascots import MASCOT_ART_COLOR
+    from omnigent.cli.banner import startup_banner_strings
+    from omnigent.cli.mascots import MASCOT_ART_COLOR
 
     assert MASCOT_ART_COLOR == "#F43BA6", (
         f"MASCOT_ART_COLOR must be the starfish magenta-pink brand "

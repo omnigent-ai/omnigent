@@ -21,7 +21,7 @@ import tomllib
 import yaml
 from PIL import Image
 
-from omnigent._runner_startup import RunnerStartupProgress
+from omnigent.cli.runner_startup import RunnerStartupProgress
 from omnigent.entities import CompactionData
 from omnigent.harnesses.codex_native import app_server as codex_native_app_server
 from omnigent.harnesses.codex_native import forwarder as codex_native_forwarder
@@ -33,8 +33,8 @@ from omnigent.harnesses.codex_native.bridge import (
     write_bridge_state,
 )
 from omnigent.harnesses.codex_native.elicitation import codex_elicitation_id
-from omnigent.inner.native_attachments import attachment_cache_dir
 from omnigent.spec import load
+from omnigent.util.attachments import attachment_cache_dir
 
 # The default-stance auto-review override normalize_codex_permission_launch_args
 # adds when no explicit approval/sandbox/reviewer/profile choice is present.
@@ -7823,11 +7823,11 @@ def test_local_run_prints_resume_hint_after_attach(
         """
         del kwargs
 
-    monkeypatch.setattr("omnigent.chat._find_free_port", lambda: 23456)
-    monkeypatch.setattr("omnigent.chat._start_local_server", fake_start_server)
-    monkeypatch.setattr("omnigent.chat._stop_local_server", lambda server: None)
-    monkeypatch.setattr("omnigent.chat._wait_for_server", lambda *a, **k: None)
-    monkeypatch.setattr("omnigent.chat._bundle_agent", lambda path: b"bundle")
+    monkeypatch.setattr("omnigent.cli.chat._find_free_port", lambda: 23456)
+    monkeypatch.setattr("omnigent.cli.chat._start_local_server", fake_start_server)
+    monkeypatch.setattr("omnigent.cli.chat._stop_local_server", lambda server: None)
+    monkeypatch.setattr("omnigent.cli.chat._wait_for_server", lambda *a, **k: None)
+    monkeypatch.setattr("omnigent.cli.chat._bundle_agent", lambda path: b"bundle")
     monkeypatch.setattr(codex_native, "_prepare_codex_terminal", fake_prepare)
     monkeypatch.setattr(codex_native, "_attach_with_forwarder", fake_attach_with_forwarder)
     monkeypatch.setattr(
@@ -7940,11 +7940,11 @@ def test_local_run_resume_hint_follows_native_new_rotation(
             ),
         )
 
-    monkeypatch.setattr("omnigent.chat._find_free_port", lambda: 23456)
-    monkeypatch.setattr("omnigent.chat._start_local_server", fake_start_server)
-    monkeypatch.setattr("omnigent.chat._stop_local_server", lambda server: None)
-    monkeypatch.setattr("omnigent.chat._wait_for_server", lambda *a, **k: None)
-    monkeypatch.setattr("omnigent.chat._bundle_agent", lambda path: b"bundle")
+    monkeypatch.setattr("omnigent.cli.chat._find_free_port", lambda: 23456)
+    monkeypatch.setattr("omnigent.cli.chat._start_local_server", fake_start_server)
+    monkeypatch.setattr("omnigent.cli.chat._stop_local_server", lambda server: None)
+    monkeypatch.setattr("omnigent.cli.chat._wait_for_server", lambda *a, **k: None)
+    monkeypatch.setattr("omnigent.cli.chat._bundle_agent", lambda path: b"bundle")
     monkeypatch.setattr(codex_native, "_prepare_codex_terminal", fake_prepare)
     monkeypatch.setattr(codex_native, "_attach_with_forwarder", fake_attach_with_forwarder)
     monkeypatch.setattr(
@@ -8034,10 +8034,10 @@ def test_local_resume_does_not_print_redundant_resume_hint(
         """
         del kwargs
 
-    monkeypatch.setattr("omnigent.chat._find_free_port", lambda: 23457)
-    monkeypatch.setattr("omnigent.chat._start_local_server", fake_start_server)
-    monkeypatch.setattr("omnigent.chat._stop_local_server", lambda server: None)
-    monkeypatch.setattr("omnigent.chat._wait_for_server", lambda *a, **k: None)
+    monkeypatch.setattr("omnigent.cli.chat._find_free_port", lambda: 23457)
+    monkeypatch.setattr("omnigent.cli.chat._start_local_server", fake_start_server)
+    monkeypatch.setattr("omnigent.cli.chat._stop_local_server", lambda server: None)
+    monkeypatch.setattr("omnigent.cli.chat._wait_for_server", lambda *a, **k: None)
     monkeypatch.setattr(codex_native, "_prepare_codex_terminal", fake_prepare)
     monkeypatch.setattr(codex_native, "_attach_with_forwarder", fake_attach_with_forwarder)
 
@@ -8271,8 +8271,8 @@ def test_run_with_remote_server_aligns_cwd_before_daemon_prepare(
     :param tmp_path: Temporary paths for prepared Codex details.
     :returns: None.
     """
-    import omnigent.chat as chat_mod
-    import omnigent.cli as cli_mod
+    import omnigent.cli.chat as chat_mod
+    import omnigent.cli.commands as cli_mod
     import omnigent.host.identity as identity_mod
 
     order: list[str] = []
@@ -8386,7 +8386,7 @@ def test_run_with_local_server_records_fresh_session_before_attach(
     :param tmp_path: Temporary paths for fake server and Codex details.
     :returns: None.
     """
-    import omnigent.chat as chat_mod
+    import omnigent.cli.chat as chat_mod
 
     order: list[str] = []
 
@@ -8646,11 +8646,11 @@ def test_run_with_local_server_threads_raw_instructions_to_prepare_terminal_fres
         captured.update(kwargs)
         raise _Sentinel
 
-    monkeypatch.setattr("omnigent.chat._find_free_port", lambda: 12401)
-    monkeypatch.setattr("omnigent.chat._start_local_server", fake_start_server)
-    monkeypatch.setattr("omnigent.chat._stop_local_server", lambda server: None)
-    monkeypatch.setattr("omnigent.chat._wait_for_server", lambda *a, **k: None)
-    monkeypatch.setattr("omnigent.chat._bundle_agent", lambda path: b"bundle")
+    monkeypatch.setattr("omnigent.cli.chat._find_free_port", lambda: 12401)
+    monkeypatch.setattr("omnigent.cli.chat._start_local_server", fake_start_server)
+    monkeypatch.setattr("omnigent.cli.chat._stop_local_server", lambda server: None)
+    monkeypatch.setattr("omnigent.cli.chat._wait_for_server", lambda *a, **k: None)
+    monkeypatch.setattr("omnigent.cli.chat._bundle_agent", lambda path: b"bundle")
     monkeypatch.setattr(codex_native, "_resolve_session_id_for_resume", lambda **kwargs: None)
     monkeypatch.setattr(codex_native, "_create_codex_session", _fake_create_session)
     monkeypatch.setattr(codex_native, "build_codex_native_server", _fake_build_codex_native_server)
@@ -8714,10 +8714,10 @@ def test_run_with_local_server_threads_raw_instructions_to_prepare_terminal_resu
         captured.update(kwargs)
         raise _Sentinel
 
-    monkeypatch.setattr("omnigent.chat._find_free_port", lambda: 12402)
-    monkeypatch.setattr("omnigent.chat._start_local_server", fake_start_server)
-    monkeypatch.setattr("omnigent.chat._stop_local_server", lambda server: None)
-    monkeypatch.setattr("omnigent.chat._wait_for_server", lambda *a, **k: None)
+    monkeypatch.setattr("omnigent.cli.chat._find_free_port", lambda: 12402)
+    monkeypatch.setattr("omnigent.cli.chat._start_local_server", fake_start_server)
+    monkeypatch.setattr("omnigent.cli.chat._stop_local_server", lambda server: None)
+    monkeypatch.setattr("omnigent.cli.chat._wait_for_server", lambda *a, **k: None)
     monkeypatch.setattr(
         codex_native,
         "_resolve_session_id_for_resume",
@@ -8772,7 +8772,7 @@ async def test_prepare_codex_terminal_via_daemon_creates_runner_and_ensures_term
     :param monkeypatch: Pytest monkeypatch fixture.
     :returns: None.
     """
-    from omnigent import _startup_events as startup
+    from omnigent.observability import startup_events as startup
 
     caplog.set_level("INFO", logger="omnigent.startup")
     original_async_client = httpx.AsyncClient
@@ -12728,7 +12728,7 @@ def test_resolve_native_codex_launch_connect_broker_managed_host(
 ) -> None:
     """No configured provider, but a managed connect host (host-only [omnigent]
     profile + broker sidecar) routes Codex through the gateway with broker auth."""
-    from omnigent.inner import databricks_executor
+    from omnigent.harnesses.databricks import executor as databricks_executor
     from omnigent.onboarding import ambient, detected, provider_config
     from omnigent.runtime import workflow
 
@@ -12766,7 +12766,7 @@ def test_resolve_native_codex_launch_no_broker_sidecar_falls_back_to_login(
 ) -> None:
     """No broker sidecar (e.g. a laptop) → connect-broker branch is skipped and
     Codex falls back to CLI login, so non-sandbox auth is untouched."""
-    from omnigent.inner import databricks_executor
+    from omnigent.harnesses.databricks import executor as databricks_executor
     from omnigent.onboarding import ambient, detected, provider_config
     from omnigent.runtime import workflow
 

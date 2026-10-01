@@ -45,7 +45,7 @@ import uvicorn
 from fastapi import FastAPI, Query, WebSocket
 from starlette import status
 
-from omnigent.debug_logging import runner_primary_session_id
+from omnigent.observability.debug_logging import runner_primary_session_id
 
 _logger = logging.getLogger(__name__)
 

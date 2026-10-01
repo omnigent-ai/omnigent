@@ -22,8 +22,7 @@ from fastapi import FastAPI, WebSocket
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
-from omnigent.process_logging import _log_once_seen
-from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN
+from omnigent.observability.process_logging import _log_once_seen
 from omnigent.server.ws_origin import (
     FORBIDDEN_ORIGIN_CLOSE_CODE,
     WebSocketOriginMiddleware,
@@ -31,6 +30,7 @@ from omnigent.server.ws_origin import (
     origin_hostname_is_loopback,
     parse_allowed_origins,
 )
+from omnigent.util.runner_identity import OMNIGENT_INTERNAL_WS_ORIGIN
 
 _LOCAL_ENV = "OMNIGENT_LOCAL_SINGLE_USER"
 _ALLOWLIST_ENV = "OMNIGENT_WS_ALLOWED_ORIGINS"

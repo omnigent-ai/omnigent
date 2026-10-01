@@ -23,7 +23,7 @@ false-fires on CPU stalls, only on a real suspend.
 Deliberately uses :func:`time.monotonic`, never the event loop's
 ``loop.time()``: uvloop's ``loop.time()`` is backed by libuv's clock, which
 *includes* sleep on macOS (see the same trap documented in
-``omnigent/runtime/harnesses/process_manager.py``), which would zero out the
+``omnigent/harnesses/runtime/process_manager.py``), which would zero out the
 divergence and silently disable detection. :func:`time.monotonic` is
 process-wide and loop-independent.
 

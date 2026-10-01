@@ -28,6 +28,12 @@ from unittest.mock import Mock
 
 import pytest
 
+from omnigent.core.datamodel import (
+    CredentialProxyEntry,
+    CredentialProxySpec,
+    CredentialSourceSpec,
+    OSEnvSandboxSpec,
+)
 from omnigent.harnesses.claude_native import bridge as claude_native_bridge
 from omnigent.harnesses.claude_native import hook as claude_native_hook
 from omnigent.harnesses.claude_native.bridge import (
@@ -65,13 +71,7 @@ from omnigent.harnesses.claude_native.bridge import (
     stop_hook_seen_since,
     write_tmux_target,
 )
-from omnigent.inner.datamodel import (
-    CredentialProxyEntry,
-    CredentialProxySpec,
-    CredentialSourceSpec,
-    OSEnvSandboxSpec,
-)
-from omnigent.native import native_cost_popup
+from omnigent.harnesses.native import cost_popup as native_cost_popup
 from omnigent.util.reasoning_effort import CLAUDE_EFFORTS
 
 
@@ -435,7 +435,7 @@ def test_prepare_bridge_dir_persists_and_applies_resolved_sandbox(
         return
 
     monkeypatch.setattr(
-        "omnigent.inner.os_env.create_os_environment",
+        "omnigent.environments.os_env.create_os_environment",
         _fake_create_os_environment,
     )
     _build_tools(config)
@@ -522,7 +522,7 @@ def test_prepare_bridge_dir_drops_credential_proxy_instead_of_corrupting_it(
         return
 
     monkeypatch.setattr(
-        "omnigent.inner.os_env.create_os_environment",
+        "omnigent.environments.os_env.create_os_environment",
         _fake_create_os_environment,
     )
     _build_tools(config)
@@ -5482,7 +5482,7 @@ def test_cycleable_permission_modes_match_the_server_patch_vocabulary() -> None:
     unreachable (rejected at the API after the UI offered it) or
     reachable but un-offerable. Pin them together.
     """
-    from omnigent.server.routes._sessions.common import _CLAUDE_NATIVE_PERMISSION_MODES
+    from omnigent.server.routes.sessions.common import _CLAUDE_NATIVE_PERMISSION_MODES
 
     assert set(claude_native_bridge.CYCLEABLE_PERMISSION_MODES) == set(
         _CLAUDE_NATIVE_PERMISSION_MODES
@@ -8191,7 +8191,7 @@ def test_display_cost_approval_popup_builds_detached_tmux_command(
     cost-popup module with all resolve inputs.
 
     Proves the modal targets the right tmux socket + pane + attached
-    client (``-c``), launches :mod:`omnigent.native.native_cost_popup`, and
+    client (``-c``), launches :mod:`omnigent.harnesses.native.cost_popup`, and
     forwards the session/elicitation/message plus THIS bridge's
     ``permission_hook.json`` (where the popup reads the Omnigent url/token). A
     failure means native approval would render at the wrong pane/client,
@@ -8239,7 +8239,7 @@ def test_display_cost_approval_popup_builds_detached_tmux_command(
     assert args[args.index("-t") + 1] == "claude:0.0"
     # Inner command runs the popup module with every resolve input.
     inner = shlex.split(args[-1])
-    assert "omnigent.native.native_cost_popup" in inner
+    assert "omnigent.harnesses.native.cost_popup" in inner
     assert "conv_abc123" in inner  # --session-id value
     assert "elicit_deadbeef" in inner  # --elicitation-id value
     assert "Cost $0.12 crossed the $0.10 checkpoint. Continue?" in inner  # --message

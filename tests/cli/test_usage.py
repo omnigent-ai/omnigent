@@ -9,7 +9,7 @@ import httpx
 import pytest
 from click.testing import CliRunner
 
-from omnigent.cli import _render_usage, cli
+from omnigent.cli.commands import _render_usage, cli
 
 _REPORT: dict[str, Any] = {
     "cost_today": 1.5,
@@ -110,9 +110,9 @@ class _FakeClient:
 
 @pytest.fixture()
 def _stub_usage_fetch(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr("omnigent.cli._load_effective_config", dict)
-    monkeypatch.setattr("omnigent.cli._resolve_attach_server", lambda *a, **k: "http://x")
-    monkeypatch.setattr("omnigent.chat._remote_headers", lambda **k: {})
+    monkeypatch.setattr("omnigent.cli.commands._load_effective_config", dict)
+    monkeypatch.setattr("omnigent.cli.commands._resolve_attach_server", lambda *a, **k: "http://x")
+    monkeypatch.setattr("omnigent.cli.chat._remote_headers", lambda **k: {})
     monkeypatch.setattr(httpx, "Client", _FakeClient)
 
 

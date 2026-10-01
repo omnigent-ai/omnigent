@@ -26,7 +26,7 @@ from dataclasses import dataclass
 # A host-sharded Databricks deployment mounts the API at this path; an
 # unsharded / single-replica server mounts elsewhere (usually the root).
 # This is the routing-relevant shape of a server URL (see
-# ``omnigent.cli_auth.databricks_request_headers``, which keys off it).
+# ``omnigent.cli.auth.databricks_request_headers``, which keys off it).
 WORKSPACE_API_PATH = "/api/2.0/omnigent"
 
 # The workspace SPA mount the web UI lives on — the URL shape users
@@ -40,7 +40,7 @@ def is_workspace_hosted_url(base_url: str) -> bool:
     True for the host-sharded mount (``https://<host>/api/2.0/omnigent``), which
     is the only deployment fronted by the sharding layer. Used to gate behavior
     that only applies there (see
-    :func:`omnigent.cli_auth.databricks_request_headers`).
+    :func:`omnigent.cli.auth.databricks_request_headers`).
 
     :param base_url: Omnigent server base URL, e.g.
         ``"https://example.databricks.com/api/2.0/omnigent"``.
@@ -117,7 +117,7 @@ class ServerUrl:
         if resolved.org_id is not None:
             return resolved
         # Deferred: cli_auth imports this module's constants at load time.
-        from omnigent.cli_auth import load_databricks_org_id
+        from omnigent.cli.auth import load_databricks_org_id
 
         return cls(
             api_base=resolved.api_base,

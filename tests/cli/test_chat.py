@@ -1,4 +1,4 @@
-"""Tests for omnigent.chat — omnigent chat CLI logic."""
+"""Tests for omnigent.cli.chat — omnigent chat CLI logic."""
 
 from __future__ import annotations
 
@@ -13,8 +13,8 @@ import pytest
 from omnigent_client import OmnigentError as ClientOmnigentError
 from omnigent_client import QueryResult
 
-import omnigent.chat as chat_module
-from omnigent.chat import (
+import omnigent.cli.chat as chat_module
+from omnigent.cli.chat import (
     _SERVER_READY_BACKOFF_POLL_SECONDS,
     _SERVER_READY_FAST_POLL_WINDOW_SECONDS,
     _SERVER_READY_INITIAL_POLL_SECONDS,
@@ -40,8 +40,8 @@ from omnigent.chat import (
     _wait_for_server,
     run_chat,
 )
-from omnigent.cli import _build_resume_parts
-from omnigent.inner.databricks_executor import DatabricksCredentials
+from omnigent.cli.commands import _build_resume_parts
+from omnigent.harnesses.databricks.executor import DatabricksCredentials
 from omnigent.models.model_resolver import ModelResolutionError
 from omnigent.spec import load as load_spec
 from omnigent.spec import validate as validate_spec
@@ -263,9 +263,9 @@ def test_wait_for_server_uses_fast_poll_before_backoff(
             raise __import__("httpx").ConnectError("not ready")
         return _Resp(200)
 
-    monkeypatch.setattr("omnigent.chat.time.monotonic", _fake_monotonic)
-    monkeypatch.setattr("omnigent.chat.time.sleep", _fake_sleep)
-    monkeypatch.setattr("omnigent.chat.httpx.get", _fake_get)
+    monkeypatch.setattr("omnigent.cli.chat.time.monotonic", _fake_monotonic)
+    monkeypatch.setattr("omnigent.cli.chat.time.sleep", _fake_sleep)
+    monkeypatch.setattr("omnigent.cli.chat.httpx.get", _fake_get)
 
     _wait_for_server(8123, server, timeout=5.0)
 
@@ -291,7 +291,7 @@ def test_raise_server_failed_truncates_log_to_tail(tmp_path: Path) -> None:
     truncation path is exercised: the head must be dropped, the tail
     must be preserved.
     """
-    from omnigent.chat import _SERVER_LOG_TAIL_LINES
+    from omnigent.cli.chat import _SERVER_LOG_TAIL_LINES
 
     log = tmp_path / "server.log"
     head_lines = [f"banner-line-{i}" for i in range(_SERVER_LOG_TAIL_LINES + 30)]
@@ -400,9 +400,9 @@ def test_wait_for_server_waits_for_runner_tunnel_status(
             return _Resp(200, next(status_bodies))
         raise AssertionError(f"unexpected URL: {url}")
 
-    monkeypatch.setattr("omnigent.chat.time.monotonic", _fake_monotonic)
-    monkeypatch.setattr("omnigent.chat.time.sleep", _fake_sleep)
-    monkeypatch.setattr("omnigent.chat.httpx.get", _fake_get)
+    monkeypatch.setattr("omnigent.cli.chat.time.monotonic", _fake_monotonic)
+    monkeypatch.setattr("omnigent.cli.chat.time.sleep", _fake_sleep)
+    monkeypatch.setattr("omnigent.cli.chat.httpx.get", _fake_get)
 
     _wait_for_server(8123, server, timeout=5.0)
 
@@ -428,7 +428,7 @@ def test_start_local_server_spawns_runner_as_sibling(
     via ``OMNIGENT_RUNNER_TUNNEL_TOKEN`` so it accepts exactly the
     sibling runner's tunnel. The runner is NOT a child of the server.
     """
-    from omnigent.cli import _CliRunnerProcess
+    from omnigent.cli.commands import _CliRunnerProcess
 
     class _Proc:
         """Minimal subprocess handle returned by the patched Popen."""
@@ -479,16 +479,16 @@ def test_start_local_server_spawns_runner_as_sibling(
     # Import before patching ``subprocess.Popen``. The runner package imports
     # MCP modules with ``subprocess.Popen[...]`` annotations, and patching the
     # process-global module first makes those imports fail in isolated runs.
-    import omnigent.runner.identity  # noqa: F401
+    import omnigent.util.runner_identity  # noqa: F401
 
-    monkeypatch.setattr("omnigent.chat.subprocess.Popen", _fake_popen)
-    monkeypatch.setattr("omnigent.chat._omnigent_log_dir", lambda: tmp_path / "logs")
+    monkeypatch.setattr("omnigent.cli.chat.subprocess.Popen", _fake_popen)
+    monkeypatch.setattr("omnigent.cli.chat._omnigent_log_dir", lambda: tmp_path / "logs")
     monkeypatch.setattr(
-        "omnigent.chat.load_spec",
+        "omnigent.cli.chat.load_spec",
         lambda _path: SimpleNamespace(executor=SimpleNamespace(profile=None)),
     )
     monkeypatch.setattr(
-        "omnigent.cli._start_cli_runner_process",
+        "omnigent.cli.commands._start_cli_runner_process",
         _fake_start_runner,
     )
     server = _start_local_server(tmp_path, 8765, ephemeral=True)
@@ -496,7 +496,7 @@ def test_start_local_server_spawns_runner_as_sibling(
     # Server subprocess was spawned.
     assert len(server_popen_calls) == 1
     assert server_popen_calls[0].args[2:6] == [
-        "omnigent.cli",
+        "omnigent.cli.commands",
         "server",
         "--host",
         "127.0.0.1",
@@ -559,9 +559,9 @@ def test_wait_for_remote_runner_uses_status_endpoint_and_auth(
         requested.append((url, headers))
         return _Resp(next(status_bodies))
 
-    monkeypatch.setattr("omnigent.chat.time.monotonic", _fake_monotonic)
-    monkeypatch.setattr("omnigent.chat.time.sleep", _fake_sleep)
-    monkeypatch.setattr("omnigent.chat.httpx.get", _fake_get)
+    monkeypatch.setattr("omnigent.cli.chat.time.monotonic", _fake_monotonic)
+    monkeypatch.setattr("omnigent.cli.chat.time.sleep", _fake_sleep)
+    monkeypatch.setattr("omnigent.cli.chat.httpx.get", _fake_get)
 
     _wait_for_remote_runner(
         "https://example.databricksapps.com",
@@ -618,7 +618,7 @@ def test_wait_for_remote_runner_fails_loud_on_auth_rejection(
         del url, headers, timeout
         return _Resp()
 
-    monkeypatch.setattr("omnigent.chat.httpx.get", _fake_get)
+    monkeypatch.setattr("omnigent.cli.chat.httpx.get", _fake_get)
 
     with pytest.raises(click.ClickException, match="status check was rejected \\(401\\)"):
         _wait_for_remote_runner(
@@ -680,10 +680,10 @@ def test_wait_for_remote_runner_timeout_surfaces_log_path(
         """
         return next(monotonic_values)
 
-    monkeypatch.setattr("omnigent.chat.time.monotonic", _fake_monotonic)
-    monkeypatch.setattr("omnigent.chat.time.sleep", lambda _s: None)
+    monkeypatch.setattr("omnigent.cli.chat.time.monotonic", _fake_monotonic)
+    monkeypatch.setattr("omnigent.cli.chat.time.sleep", lambda _s: None)
     monkeypatch.setattr(
-        "omnigent.chat.httpx.get",
+        "omnigent.cli.chat.httpx.get",
         lambda *_a, **_k: _Resp(),
     )
 
@@ -732,8 +732,8 @@ def test_wait_for_remote_runner_early_exit_surfaces_log_path(
     )
 
     proc = SimpleNamespace(poll=lambda: 1, returncode=1)
-    monkeypatch.setattr("omnigent.chat.time.monotonic", lambda: 0.0)
-    monkeypatch.setattr("omnigent.chat.time.sleep", lambda _s: None)
+    monkeypatch.setattr("omnigent.cli.chat.time.monotonic", lambda: 0.0)
+    monkeypatch.setattr("omnigent.cli.chat.time.sleep", lambda _s: None)
 
     def _fake_get(*_a, **_k):
         """Status probe never invoked because the runner is dead.
@@ -742,7 +742,7 @@ def test_wait_for_remote_runner_early_exit_surfaces_log_path(
         """
         raise AssertionError("should not reach httpx when runner already exited")
 
-    monkeypatch.setattr("omnigent.chat.httpx.get", _fake_get)
+    monkeypatch.setattr("omnigent.cli.chat.httpx.get", _fake_get)
 
     with pytest.raises(click.ClickException) as exc_info:
         _wait_for_remote_runner(
@@ -902,7 +902,7 @@ def test_run_chat_with_server_url_routes_through_daemon(
     ) -> None:
         calls["via_daemon"] = {"agent_path": agent_path, "base_url": base_url, **kwargs}
 
-    monkeypatch.setattr("omnigent.cli._ensure_backend", _fake_ensure_backend)
+    monkeypatch.setattr("omnigent.cli.commands._ensure_backend", _fake_ensure_backend)
     monkeypatch.setattr(chat_module, "_chat_via_daemon", _fake_via_daemon)
 
     run_chat(
@@ -1294,7 +1294,7 @@ def test_one_shot_run_stops_its_session(
     stopped: list[dict[str, object]] = []
     _wire_daemon_chat_stubs(monkeypatch)
     monkeypatch.setattr(
-        "omnigent.cli._stop_session_on_server",
+        "omnigent.cli.commands._stop_session_on_server",
         lambda **kwargs: stopped.append(kwargs),
     )
 
@@ -1329,7 +1329,7 @@ def test_interactive_run_leaves_its_session_online(
     stopped: list[dict[str, object]] = []
     _wire_daemon_chat_stubs(monkeypatch)
     monkeypatch.setattr(
-        "omnigent.cli._stop_session_on_server",
+        "omnigent.cli.commands._stop_session_on_server",
         lambda **kwargs: stopped.append(kwargs),
     )
 
@@ -1357,7 +1357,7 @@ def test_one_shot_teardown_failure_does_not_fail_the_run(
         raise click.ClickException("server said no")
 
     _wire_daemon_chat_stubs(monkeypatch)
-    monkeypatch.setattr("omnigent.cli._stop_session_on_server", _explode)
+    monkeypatch.setattr("omnigent.cli.commands._stop_session_on_server", _explode)
 
     _chat_via_daemon(
         str(agent_yaml),
@@ -1433,7 +1433,7 @@ def _patch_daemon_launch(monkeypatch: pytest.MonkeyPatch, captured: dict[str, ob
     monkeypatch.setattr("omnigent.host.daemon_launch.wait_for_host_online", _no_host_wait)
     monkeypatch.setattr("omnigent.host.daemon_launch.launch_or_reuse_daemon_runner", _fake_launch)
     monkeypatch.setattr("omnigent.host.daemon_launch.wait_for_runner_online", _no_runner_wait)
-    monkeypatch.setattr("omnigent.native.native_terminal.bind_session_runner", _fake_bind)
+    monkeypatch.setattr("omnigent.harnesses.native.terminal.bind_session_runner", _fake_bind)
 
 
 def test_prepare_chat_session_via_daemon_creates_fresh_and_launches(
@@ -1722,7 +1722,7 @@ def test_pick_agent_reports_unreachable_server_as_click_error(
 # ── OMNIGENT_MODEL env-var fallback ───────────────────
 #
 # These tests pin explicit-environment and discovered-default precedence on
-# the ``omnigent/cli.py`` → ``run_chat`` path.
+# the ``omnigent/cli/commands.py`` → ``run_chat`` path.
 
 
 def test_default_cli_model_resolves_catalog_when_env_unset(
@@ -2691,7 +2691,7 @@ def test_remote_headers_falls_back_to_ambient_databricks_creds(
     profile is threaded anymore) and put its token in the bearer header.
     """
     monkeypatch.delenv("OMNIGENT_REMOTE_AUTH_TOKEN", raising=False)
-    monkeypatch.setattr("omnigent.cli_auth.load_token", lambda _url: None)
+    monkeypatch.setattr("omnigent.cli.auth.load_token", lambda _url: None)
     monkeypatch.setattr(chat_module, "_stored_databricks_record_token", lambda _url: None)
     read_calls: list[object] = []
 
@@ -2720,10 +2720,10 @@ def test_remote_headers_adds_org_id_header(monkeypatch: pytest.MonkeyPatch) -> N
     whichever bearer the resolution chain produced.
     """
     monkeypatch.delenv("OMNIGENT_REMOTE_AUTH_TOKEN", raising=False)
-    monkeypatch.setattr("omnigent.cli_auth.load_token", lambda _url: None)
+    monkeypatch.setattr("omnigent.cli.auth.load_token", lambda _url: None)
     monkeypatch.setattr(chat_module, "_stored_databricks_record_token", lambda _url: "rec-tok")
     monkeypatch.setattr(
-        "omnigent.cli_auth.load_databricks_org_id", lambda _url: "2850744067564480"
+        "omnigent.cli.auth.load_databricks_org_id", lambda _url: "2850744067564480"
     )
 
     headers = _remote_headers(
@@ -2745,9 +2745,9 @@ def test_remote_headers_omits_org_when_no_record(monkeypatch: pytest.MonkeyPatch
     was recorded.
     """
     monkeypatch.delenv("OMNIGENT_REMOTE_AUTH_TOKEN", raising=False)
-    monkeypatch.setattr("omnigent.cli_auth.load_token", lambda _url: None)
+    monkeypatch.setattr("omnigent.cli.auth.load_token", lambda _url: None)
     monkeypatch.setattr(chat_module, "_stored_databricks_record_token", lambda _url: "rec-tok")
-    monkeypatch.setattr("omnigent.cli_auth.load_databricks_org_id", lambda _url: None)
+    monkeypatch.setattr("omnigent.cli.auth.load_databricks_org_id", lambda _url: None)
 
     headers = _remote_headers(
         server_url="https://single.databricks.com/api/2.0/omnigent", host_id=None
@@ -2769,9 +2769,9 @@ def test_remote_headers_keys_by_host_id_on_workspace_mount(
     sends none.
     """
     monkeypatch.delenv("OMNIGENT_REMOTE_AUTH_TOKEN", raising=False)
-    monkeypatch.setattr("omnigent.cli_auth.load_token", lambda _url: None)
+    monkeypatch.setattr("omnigent.cli.auth.load_token", lambda _url: None)
     monkeypatch.setattr(chat_module, "_stored_databricks_record_token", lambda _url: "rec-tok")
-    monkeypatch.setattr("omnigent.cli_auth.load_databricks_org_id", lambda _url: None)
+    monkeypatch.setattr("omnigent.cli.auth.load_databricks_org_id", lambda _url: None)
 
     mount = "https://acme.databricks.com/api/2.0/omnigent"
     assert (
@@ -2953,7 +2953,7 @@ def _make_run_context(**params: object) -> click.Context:
     :returns: A Click context whose ``.params`` dict reflects the
         given overrides applied on top of the command's defaults.
     """
-    from omnigent.cli import cli
+    from omnigent.cli.commands import cli
 
     run_cmd = cli.commands["run"]  # type: ignore[attr-defined]
     # Start with the declared defaults, then overlay the caller's overrides.
@@ -3085,9 +3085,9 @@ def _stub_run_repl_deps(
 
     monkeypatch.setattr(_repl_pkg, "run_repl", _fake_run_repl)
     monkeypatch.setattr("omnigent.repl._repl.run_repl", _fake_run_repl)
-    monkeypatch.setattr("omnigent.chat.OmnigentClient", _FakeClientCtx)
+    monkeypatch.setattr("omnigent.cli.chat.OmnigentClient", _FakeClientCtx)
     monkeypatch.setattr(
-        "omnigent.chat._server_auth", lambda server_url=None, *, session_id=None: None
+        "omnigent.cli.chat._server_auth", lambda server_url=None, *, session_id=None: None
     )
     monkeypatch.setattr(
         "omnigent.repl._tmux_pane.register_pane",
@@ -3258,7 +3258,7 @@ def test_databricks_token_auth_resolves_sdk_once(
     :param monkeypatch: Pytest monkeypatch fixture.
     :returns: None.
     """
-    import omnigent.inner.databricks_executor as dbx
+    import omnigent.harnesses.databricks.executor as dbx
 
     class _CountingConfig:
         """Config double whose authenticate() counts calls."""
@@ -3286,10 +3286,10 @@ def test_databricks_token_auth_resolves_sdk_once(
 
     monkeypatch.setattr(dbx, "_resolve_databricks_auth", _fake_resolve)
     monkeypatch.delenv(chat_module._REMOTE_AUTH_TOKEN_ENV, raising=False)  # skip static path
-    monkeypatch.setattr("omnigent.cli_auth.load_token", lambda _url: None)  # skip OIDC path
+    monkeypatch.setattr("omnigent.cli.auth.load_token", lambda _url: None)  # skip OIDC path
     # No Databricks Apps pointer record stored for this server → the auth
     # falls through to ambient SDK resolution rather than host-keyed lookup.
-    monkeypatch.setattr("omnigent.cli_auth.load_databricks_workspace_host", lambda _url: None)
+    monkeypatch.setattr("omnigent.cli.auth.load_databricks_workspace_host", lambda _url: None)
 
     auth = chat_module._DatabricksTokenAuth(server_url="https://ex.databricks.com")
 
@@ -3313,7 +3313,7 @@ def test_databricks_token_auth_re_resolves_when_reused_sdk_auth_goes_stale(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The client replaces stale SDK auth before retrying a mint."""
-    import omnigent.inner.databricks_executor as dbx
+    import omnigent.harnesses.databricks.executor as dbx
 
     class _Cfg:
         def __init__(self, token: str) -> None:
@@ -3335,8 +3335,8 @@ def test_databricks_token_auth_re_resolves_when_reused_sdk_auth_goes_stale(
 
     monkeypatch.setattr(dbx, "_resolve_databricks_auth", _fake_resolve)
     monkeypatch.delenv(chat_module._REMOTE_AUTH_TOKEN_ENV, raising=False)  # skip static path
-    monkeypatch.setattr("omnigent.cli_auth.load_token", lambda _url: None)  # skip OIDC path
-    monkeypatch.setattr("omnigent.cli_auth.load_databricks_workspace_host", lambda _url: None)
+    monkeypatch.setattr("omnigent.cli.auth.load_token", lambda _url: None)  # skip OIDC path
+    monkeypatch.setattr("omnigent.cli.auth.load_databricks_workspace_host", lambda _url: None)
 
     auth = chat_module._DatabricksTokenAuth(server_url="https://ex.databricks.com")
 
@@ -3362,9 +3362,9 @@ def test_databricks_token_auth_sets_org_header(monkeypatch: pytest.MonkeyPatch) 
     :returns: None.
     """
     monkeypatch.delenv(chat_module._REMOTE_AUTH_TOKEN_ENV, raising=False)
-    monkeypatch.setattr("omnigent.cli_auth.load_token", lambda _url: None)
+    monkeypatch.setattr("omnigent.cli.auth.load_token", lambda _url: None)
     monkeypatch.setattr(
-        "omnigent.cli_auth.databricks_request_headers",
+        "omnigent.cli.auth.databricks_request_headers",
         lambda _url, *, host_id=None: {"X-Databricks-Org-Id": "2850744067564480"},
     )
     # Isolate from real Databricks SDK resolution: the bearer is irrelevant
@@ -3456,12 +3456,12 @@ def test_await_accounts_setup_noop_when_token_present(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A CLI that already holds a token for the server does not probe/wait."""
-    monkeypatch.setattr("omnigent.cli_auth.load_token", lambda _url: "existing-token")
+    monkeypatch.setattr("omnigent.cli.auth.load_token", lambda _url: "existing-token")
 
     def _must_not_probe(*_a: object, **_k: object) -> object:
         raise AssertionError("must not call /v1/info when a token already exists")
 
-    monkeypatch.setattr("omnigent.chat.httpx.get", _must_not_probe)
+    monkeypatch.setattr("omnigent.cli.chat.httpx.get", _must_not_probe)
 
     chat_module._await_accounts_first_run_setup("http://127.0.0.1:8000")
 
@@ -3470,9 +3470,9 @@ def test_await_accounts_setup_noop_for_header_mode(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """When the server is not in accounts mode there is no admin to wait for."""
-    monkeypatch.setattr("omnigent.cli_auth.load_token", lambda _url: None)
+    monkeypatch.setattr("omnigent.cli.auth.load_token", lambda _url: None)
     monkeypatch.setattr(
-        "omnigent.chat.httpx.get",
+        "omnigent.cli.chat.httpx.get",
         lambda _url, timeout=5.0, trust_env=True: _info_response(
             {"accounts_enabled": False, "needs_setup": False}
         ),
@@ -3481,7 +3481,7 @@ def test_await_accounts_setup_noop_for_header_mode(
     def _must_not_sleep(_s: float) -> None:
         raise AssertionError("must not poll in header mode")
 
-    monkeypatch.setattr("omnigent.chat.time.sleep", _must_not_sleep)
+    monkeypatch.setattr("omnigent.cli.chat.time.sleep", _must_not_sleep)
 
     chat_module._await_accounts_first_run_setup("http://127.0.0.1:8000")
 
@@ -3503,14 +3503,14 @@ def test_await_accounts_setup_waits_then_continues(
         # None on the pre-check and the first poll; token on the second poll.
         return None if calls["n"] <= 2 else "minted-token"
 
-    monkeypatch.setattr("omnigent.cli_auth.load_token", _load)
+    monkeypatch.setattr("omnigent.cli.auth.load_token", _load)
     monkeypatch.setattr(
-        "omnigent.chat.httpx.get",
+        "omnigent.cli.chat.httpx.get",
         lambda _url, timeout=5.0, trust_env=True: _info_response(
             {"accounts_enabled": True, "needs_setup": True}
         ),
     )
-    monkeypatch.setattr("omnigent.chat.time.sleep", lambda _s: None)
+    monkeypatch.setattr("omnigent.cli.chat.time.sleep", lambda _s: None)
 
     chat_module._await_accounts_first_run_setup("http://127.0.0.1:8000")
 
@@ -3521,14 +3521,14 @@ def test_await_accounts_setup_times_out(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """If the admin is never created, the wait fails loud (no hang/traceback)."""
-    monkeypatch.setattr("omnigent.cli_auth.load_token", lambda _url: None)
+    monkeypatch.setattr("omnigent.cli.auth.load_token", lambda _url: None)
     monkeypatch.setattr(
-        "omnigent.chat.httpx.get",
+        "omnigent.cli.chat.httpx.get",
         lambda _url, timeout=5.0, trust_env=True: _info_response(
             {"accounts_enabled": True, "needs_setup": True}
         ),
     )
-    monkeypatch.setattr("omnigent.chat.time.sleep", lambda _s: None)
+    monkeypatch.setattr("omnigent.cli.chat.time.sleep", lambda _s: None)
 
     with pytest.raises(click.ClickException, match="Timed out"):
         chat_module._await_accounts_first_run_setup("http://127.0.0.1:8000", timeout_s=0.0)
@@ -3546,12 +3546,12 @@ def test_await_accounts_setup_tolerates_unparseable_proxy_env(
     launch used to die on the crash handler. The probe must swallow it and
     return, letting the normal path continue.
     """
-    monkeypatch.setattr("omnigent.cli_auth.load_token", lambda _url: None)
+    monkeypatch.setattr("omnigent.cli.auth.load_token", lambda _url: None)
 
     def _invalid_proxy_env(*_a: object, **_k: object) -> object:
         raise httpx.InvalidURL("Invalid port: ':'")
 
-    monkeypatch.setattr("omnigent.chat.httpx.get", _invalid_proxy_env)
+    monkeypatch.setattr("omnigent.cli.chat.httpx.get", _invalid_proxy_env)
 
     # Must not raise — the crash-handler path is exactly this escaping.
     chat_module._await_accounts_first_run_setup("http://127.0.0.1:8000")
@@ -3566,7 +3566,7 @@ def test_await_accounts_setup_probe_bypasses_env_proxy_for_loopback(
     configured proxy and can crash outright on a proxy value httpx cannot
     parse, so the probe must not read the proxy environment at all.
     """
-    monkeypatch.setattr("omnigent.cli_auth.load_token", lambda _url: None)
+    monkeypatch.setattr("omnigent.cli.auth.load_token", lambda _url: None)
     seen: dict[str, object] = {}
 
     def _fake_get(url: str, **kwargs: object) -> SimpleNamespace:
@@ -3574,7 +3574,7 @@ def test_await_accounts_setup_probe_bypasses_env_proxy_for_loopback(
         seen.update(kwargs)
         return _info_response({"accounts_enabled": False, "needs_setup": False})
 
-    monkeypatch.setattr("omnigent.chat.httpx.get", _fake_get)
+    monkeypatch.setattr("omnigent.cli.chat.httpx.get", _fake_get)
 
     chat_module._await_accounts_first_run_setup("http://127.0.0.1:8000")
 
@@ -3599,7 +3599,7 @@ def test_server_get_keeps_env_proxy_for_remote_targets(
         seen.update(kwargs)
         return SimpleNamespace(status_code=200)
 
-    monkeypatch.setattr("omnigent.chat.httpx.get", _fake_get)
+    monkeypatch.setattr("omnigent.cli.chat.httpx.get", _fake_get)
 
     chat_module._server_get("https://example.databricksapps.com/v1/info", timeout=5.0)
 
@@ -3693,8 +3693,8 @@ def test_wait_for_remote_runner_surfaces_unparseable_proxy_env(
     def _invalid_proxy_env(*_args: object, **_kwargs: object) -> object:
         raise httpx.InvalidURL("Invalid port: ':'")
 
-    monkeypatch.setattr("omnigent.chat.time.sleep", sleeps.append)
-    monkeypatch.setattr("omnigent.chat.httpx.get", _invalid_proxy_env)
+    monkeypatch.setattr("omnigent.cli.chat.time.sleep", sleeps.append)
+    monkeypatch.setattr("omnigent.cli.chat.httpx.get", _invalid_proxy_env)
 
     with pytest.raises(click.ClickException) as excinfo:
         _wait_for_remote_runner(
@@ -3810,7 +3810,7 @@ def test_run_attach_uses_session_snapshot_runner_online(
             )
         raise AssertionError(f"unexpected GET {url}")
 
-    monkeypatch.setattr("omnigent.chat.httpx.get", _fake_get)
+    monkeypatch.setattr("omnigent.cli.chat.httpx.get", _fake_get)
     connected = False
 
     def _must_not_connect(*_args: object, **_kwargs: object) -> None:
@@ -3861,7 +3861,7 @@ def test_run_attach_does_not_probe_owner_scoped_runner_status(
             )
         raise AssertionError(f"owner-scoped runner status probe leaked through: {url}")
 
-    monkeypatch.setattr("omnigent.chat.httpx.get", _fake_get)
+    monkeypatch.setattr("omnigent.cli.chat.httpx.get", _fake_get)
     captured: dict[str, object] = {}
 
     def _capture(base_url: str, _tool_handler: object, **kwargs: object) -> None:
@@ -4477,7 +4477,7 @@ def test_env_auth_injection_skipped_when_global_auth_configured(
     would silently hijack it — the exact failure mode that produced
     empty openai-agents replies in the e2e REPL suite.
     """
-    from omnigent.chat import _inject_openai_env_auth_if_needed
+    from omnigent.cli.chat import _inject_openai_env_auth_if_needed
 
     config_home = tmp_path / "config"
     config_home.mkdir()
@@ -4505,7 +4505,7 @@ def test_env_auth_injection_applies_when_nothing_configured(
     whose only credential is the shell's OPENAI_API_KEY the bake is what
     keeps ``run --harness openai-agents`` working at all.
     """
-    from omnigent.chat import _inject_openai_env_auth_if_needed
+    from omnigent.cli.chat import _inject_openai_env_auth_if_needed
 
     config_home = tmp_path / "config-empty"
     config_home.mkdir()
@@ -4532,7 +4532,7 @@ def test_redirect_native_resume_handles_cursor(monkeypatch: pytest.MonkeyPatch) 
     mirrored the same message from the cursor store — recording each user
     message twice. The redirect keeps the TUI the single source of turns.
     """
-    from omnigent._wrapper_labels import CURSOR_NATIVE_WRAPPER_VALUE
+    from omnigent.harnesses.wrapper_labels import CURSOR_NATIVE_WRAPPER_VALUE
 
     monkeypatch.setattr(
         chat_module,
@@ -4573,7 +4573,7 @@ def test_redirect_native_resume_covers_every_native_agent(
     REPL and double-posted. Routing through the provider seam covers all of them;
     goose stands in for the formerly-uncovered set here.
     """
-    from omnigent._wrapper_labels import GOOSE_NATIVE_WRAPPER_VALUE
+    from omnigent.harnesses.wrapper_labels import GOOSE_NATIVE_WRAPPER_VALUE
 
     monkeypatch.setattr(
         chat_module,
@@ -4633,7 +4633,7 @@ def test_cursor_native_resume_never_drives_an_omnigent_turn(
     is reached, so source (1) never happens and only the forwarder records the
     turn.
     """
-    from omnigent._wrapper_labels import CURSOR_NATIVE_WRAPPER_VALUE
+    from omnigent.harnesses.wrapper_labels import CURSOR_NATIVE_WRAPPER_VALUE
 
     monkeypatch.setattr(
         chat_module,

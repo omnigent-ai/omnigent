@@ -4,7 +4,7 @@ Core Omnigent contributes built-in sandbox providers directly. Optional
 community packages contribute additional providers through the
 ``omnigent.sandbox_providers`` entry point group.
 
-The registry mirrors the design of ``omnigent.harness_plugins``:
+The registry mirrors the design of ``omnigent.harnesses.registry``:
 contributions are merged into a single plugin state, validation keeps
 community provider code in the ``omnigent.community.sandbox`` namespace, and
 broken plugins are recorded but never break core startup.

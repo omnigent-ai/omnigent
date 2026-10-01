@@ -33,7 +33,7 @@ _SERVER = "http://omnigent.test"
 
 # The server's curated reason when a message POST outlives the managed-launch
 # rendezvous window (see ``_await_settled_managed_launch`` in
-# ``omnigent/server/routes/_sessions/helpers.py``).
+# ``omnigent/server/routes/sessions/helpers.py``).
 _PROVISIONING_REASON = "The session's managed sandbox is still provisioning; try again shortly"
 
 # Generous ceiling for the turn wait below — event-driven, so a healthy run

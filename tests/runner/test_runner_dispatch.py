@@ -4,7 +4,7 @@ The load-bearing assertion: the runner FastAPI app, when given a
 real :class:`HarnessProcessManager`, accepts a
 POST /v1/sessions/{conversation_id}/events?stream=true,
 spawns a harness subprocess (using the existing
-``omnigent/runtime/harnesses/`` machinery — NOT a parallel impl),
+``omnigent/harnesses/runtime/`` machinery — NOT a parallel impl),
 forwards the request to the harness via UDS, and streams the
 harness's SSE response back through the runner's own SSE response.
 
@@ -55,25 +55,32 @@ from fastapi import FastAPI
 from fastapi.responses import JSONResponse, Response
 from fastapi.responses import StreamingResponse as _StreamingResponse
 
-import omnigent.runtime.harnesses._executor_adapter as _adapter_mod_recovery
-from omnigent.inner.executor import (
+import omnigent.harnesses.runtime._executor_adapter as _adapter_mod_recovery
+from omnigent.core.executor import (
     Executor as _RecoveryExecutor,
 )
-from omnigent.inner.executor import (
+from omnigent.core.executor import (
     ExecutorConfig as _RecoveryExecutorConfig,
 )
-from omnigent.inner.executor import (
+from omnigent.core.executor import (
     ExecutorEvent as _RecoveryExecutorEvent,
 )
-from omnigent.inner.executor import (
+from omnigent.core.executor import (
     Message as _RecoveryMessage,
 )
-from omnigent.inner.executor import (
+from omnigent.core.executor import (
     ToolSpec as _RecoveryToolSpec,
 )
-from omnigent.inner.executor import (
+from omnigent.core.executor import (
     TurnComplete as _RecoveryTurnComplete,
 )
+from omnigent.harnesses.runtime import _HARNESS_MODULES
+from omnigent.harnesses.runtime._executor_adapter import (
+    _ORPHAN_RESYNC_THRESHOLD,
+    ExecutorAdapter,
+)
+from omnigent.harnesses.runtime._scaffold import ToolResultEvent as _ToolResultEvent
+from omnigent.harnesses.runtime.process_manager import HarnessProcessManager
 from omnigent.runner import create_runner_app
 from omnigent.runner.app import (
     _RUNNER_TURN_CONTEXT_DESYNC_CODE,
@@ -84,13 +91,6 @@ from omnigent.runner.app import (
     _normalize_turn_error,
     _resolve_harness_config,
 )
-from omnigent.runtime.harnesses import _HARNESS_MODULES
-from omnigent.runtime.harnesses._executor_adapter import (
-    _ORPHAN_RESYNC_THRESHOLD,
-    ExecutorAdapter,
-)
-from omnigent.runtime.harnesses._scaffold import ToolResultEvent as _ToolResultEvent
-from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
 from omnigent.runtime.prompt import EMBEDDED_BROWSER_PRIORITY_INSTRUCTION
 from omnigent.server.schemas import CreateResponseRequest as _CreateResponseRequest
 from omnigent.spec.types import AgentSpec, ExecutorSpec, SharePolicy, ToolsConfig
@@ -1959,7 +1959,7 @@ def test_build_spawn_env_routes_hermes(tmp_path: Path, monkeypatch: pytest.Monke
     :param tmp_path: Pytest temp dir for an isolated provider config.
     :param monkeypatch: Pytest monkeypatch fixture.
     """
-    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+    from omnigent.core.datamodel import OSEnvSandboxSpec, OSEnvSpec
 
     monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
     monkeypatch.setenv("OMNIGENT_DISABLE_KEYRING", "1")
@@ -2457,7 +2457,7 @@ async def test_runner_publishes_terminal_failed_when_harness_stream_fails(
 
 @pytest.mark.asyncio
 async def test_runner_os_env_tools_use_agent_spec_cwd() -> None:
-    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+    from omnigent.core.datamodel import OSEnvSandboxSpec, OSEnvSpec
     from omnigent.runner.tool_dispatch import _execute_os_env_tool
     from omnigent.spec.types import AgentSpec
 
@@ -2525,7 +2525,7 @@ async def test_runner_os_env_placeholder_cwd_uses_cli_workspace(
     :param tmp_path: Per-test temp root for workspace and fallback paths.
     :returns: None.
     """
-    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+    from omnigent.core.datamodel import OSEnvSandboxSpec, OSEnvSpec
     from omnigent.runner.tool_dispatch import _execute_os_env_tool
 
     workspace = tmp_path / "project"
@@ -2555,7 +2555,7 @@ async def test_runner_os_env_placeholder_cwd_uses_cli_workspace(
 
 @pytest.mark.asyncio
 async def test_runner_os_env_tools_default_to_conversation_workspace(monkeypatch) -> None:
-    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+    from omnigent.core.datamodel import OSEnvSandboxSpec, OSEnvSpec
     from omnigent.runner.tool_dispatch import _execute_os_env_tool
     from omnigent.spec.types import AgentSpec
 
@@ -2583,7 +2583,7 @@ def test_clone_os_env_spec_preserves_all_sandbox_fields() -> None:
     """Cloning an OSEnvSpec must preserve every sandbox field.
 
     Regression guard for the same class of bug previously fixed in
-    :func:`omnigent.inner.terminal._clone_sandbox_spec`: hand-enumerated
+    :func:`omnigent.terminals.terminal._clone_sandbox_spec`: hand-enumerated
     field copies silently drop security-critical fields (egress_rules,
     egress_allow_private_destinations, env_passthrough, etc.) when new
     fields are added to :class:`OSEnvSandboxSpec`. This test asserts the
@@ -2594,7 +2594,7 @@ def test_clone_os_env_spec_preserves_all_sandbox_fields() -> None:
     """
     import dataclasses
 
-    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+    from omnigent.core.datamodel import OSEnvSandboxSpec, OSEnvSpec
     from omnigent.runner.tool_dispatch import _clone_os_env_spec
 
     sandbox = OSEnvSandboxSpec(
@@ -2707,7 +2707,7 @@ def test_effective_runner_os_env_runner_workspace_overrides_absolute_spec_cwd(
     declaring ``cwd: ~/universe`` would silently relocate up to
     ``~/universe`` at runtime.
     """
-    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+    from omnigent.core.datamodel import OSEnvSandboxSpec, OSEnvSpec
     from omnigent.runner.tool_dispatch import _effective_runner_os_env_spec
     from omnigent.spec.types import AgentSpec
 
@@ -2746,7 +2746,7 @@ def test_effective_runner_os_env_absolute_spec_cwd_used_without_runner_workspace
     runs that construct an agent spec directly without the env
     var continue to honor whatever the spec declared.
     """
-    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+    from omnigent.core.datamodel import OSEnvSandboxSpec, OSEnvSpec
     from omnigent.runner.tool_dispatch import _effective_runner_os_env_spec
     from omnigent.spec.types import AgentSpec
 
@@ -2781,7 +2781,7 @@ async def test_runner_terminal_dispatch_passes_cli_workspace(
     :param tmp_path: Workspace path exported to the runner.
     :returns: None.
     """
-    from omnigent.inner.datamodel import TerminalEnvSpec
+    from omnigent.core.datamodel import TerminalEnvSpec
     from omnigent.runner.tool_dispatch import _execute_terminal_tool
     from omnigent.terminals import TerminalRegistry
     from omnigent.tools.base import ToolContext
@@ -5964,7 +5964,7 @@ def _install_cancel_pane(
     alive: bool | None,
 ) -> _CancelPane | None:
     """Install a fake terminal registry for one native child's ``main`` pane."""
-    from omnigent.native.native_coding_agents import native_coding_agent_for_wrapper_label
+    from omnigent.harnesses.native.coding_agents import native_coding_agent_for_wrapper_label
 
     agent = native_coding_agent_for_wrapper_label(wrapper_label)
     assert agent is not None, f"unknown wrapper {wrapper_label!r}"
@@ -7227,7 +7227,7 @@ def test_native_relay_advertises_terminal_tools_per_spec_gate(
         terminal-tool registration (which looks it up via
         ``get_terminal_registry()``) works without runtime ``init()``.
     """
-    from omnigent.inner.datamodel import TerminalEnvSpec
+    from omnigent.core.datamodel import TerminalEnvSpec
     from omnigent.runner.tool_dispatch import _NATIVE_RELAY_BUILTIN_TOOLS
     from omnigent.runtime import _globals as rt_globals
     from omnigent.terminals.registry import TerminalRegistry
@@ -9112,7 +9112,7 @@ async def test_approval_event_flattened_for_harness_scaffold() -> None:
     turn hangs after a human approves). The runner must translate the envelope
     into the flat event the scaffold validates — for every scaffold harness.
     """
-    from omnigent.runtime.harnesses._scaffold import ApprovalEvent
+    from omnigent.harnesses.runtime._scaffold import ApprovalEvent
 
     captured: dict[str, Any] = {}
 
@@ -9157,7 +9157,7 @@ async def test_approval_event_flattened_for_harness_scaffold() -> None:
 @pytest.mark.asyncio
 async def test_approval_event_without_content_flattened() -> None:
     """A decline verdict with no form content flattens without a ``content`` key."""
-    from omnigent.runtime.harnesses._scaffold import ApprovalEvent
+    from omnigent.harnesses.runtime._scaffold import ApprovalEvent
 
     captured: dict[str, Any] = {}
 
@@ -10728,7 +10728,7 @@ async def test_old_recovery_does_not_strip_nested_recovery_token() -> None:
 
 # ── Three-factor causal chain tests (from test_desync_live_repro) ─────────
 
-_ADAPTER_LOGGER_RECOVERY = "omnigent.runtime.harnesses._executor_adapter"
+_ADAPTER_LOGGER_RECOVERY = "omnigent.harnesses.runtime._executor_adapter"
 _APP_LOGGER_RECOVERY = "omnigent.runner.app"
 
 _ORPHAN_RESYNC_THRESHOLD_DEFAULT_RECOVERY = _ORPHAN_RESYNC_THRESHOLD
@@ -11107,7 +11107,7 @@ async def test_negative_control_runner_legacy_swallow_leaves_turn_wedged() -> No
 
 def _fake_entry(harness: str, model: str | None, returncode: int | None = None) -> Any:
     """Build a ``_SubprocessEntry`` with a fake process + client."""
-    from omnigent.runtime.harnesses.process_manager import _SubprocessEntry
+    from omnigent.harnesses.runtime.process_manager import _SubprocessEntry
 
     class _FakeProc:
         def __init__(self, rc: int | None) -> None:
@@ -11127,7 +11127,7 @@ async def test_get_client_signals_resync_on_model_and_agent_switch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Gap 1 (process-manager half): a model/agent-switch respawn fires the hook."""
-    from omnigent.runtime.harnesses.process_manager import (
+    from omnigent.harnesses.runtime.process_manager import (
         HarnessProcessManager,
         _model_env_key,
     )
@@ -11191,7 +11191,7 @@ async def test_get_client_isolates_respawn_hook_failure(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """A raising respawn hook must NOT break harness acquisition."""
-    from omnigent.runtime.harnesses.process_manager import (
+    from omnigent.harnesses.runtime.process_manager import (
         HarnessProcessManager,
         _model_env_key,
     )
@@ -11225,7 +11225,7 @@ async def test_get_client_isolates_respawn_hook_failure(
     pm._entries[conv] = _fake_entry(harness, "model-A")
     pm._in_flight_response_ids[conv] = "resp_live"
 
-    with caplog.at_level(logging.ERROR, logger="omnigent.runtime.harnesses.process_manager"):
+    with caplog.at_level(logging.ERROR, logger="omnigent.harnesses.runtime.process_manager"):
         client = await pm.get_client(conv, harness, env={model_key: "model-B"})
 
     assert spawned

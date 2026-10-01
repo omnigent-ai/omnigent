@@ -56,7 +56,7 @@ async def test_aenter_logs_stderr_redirect_failures(
         raise RuntimeError("redirect failed")
 
     monkeypatch.setattr(
-        "omnigent.cli_diagnostics.redirect_stderr_to_log",
+        "omnigent.cli.diagnostics.redirect_stderr_to_log",
         _raise_redirect_failure,
     )
     host = TerminalHost(model_name="test")
@@ -95,7 +95,7 @@ async def test_aexit_logs_stderr_restore_failures(
         raise RuntimeError("restore failed")
 
     monkeypatch.setattr(
-        "omnigent.cli_diagnostics.restore_stderr",
+        "omnigent.cli.diagnostics.restore_stderr",
         _raise_restore_failure,
     )
     host = TerminalHost(model_name="test")

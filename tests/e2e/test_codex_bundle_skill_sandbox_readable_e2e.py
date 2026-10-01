@@ -50,12 +50,12 @@ from pathlib import Path
 
 import pytest
 
+from omnigent.core.datamodel import OSEnvSandboxSpec, OSEnvSpec, WritePathSpec
 from omnigent.entities import DEFAULT_ENVIRONMENT_ID
-from omnigent.inner.bwrap_sandbox import BwrapSandboxBackend
-from omnigent.inner.codex_executor import _CodexAppServerSession
-from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec, WritePathSpec
-from omnigent.inner.os_env import CallerProcessOSEnvironment
+from omnigent.environments.os_env import CallerProcessOSEnvironment
+from omnigent.harnesses.codex.executor import _CodexAppServerSession
 from omnigent.runner.resource_registry import SessionResourceRegistry
+from omnigent.sandbox.bwrap import BwrapSandboxBackend
 from omnigent.spec.types import AgentSpec
 from tests.e2e._harness_probes import cli_unavailable_reason
 

@@ -11,7 +11,6 @@ import pytest
 import yaml
 from click import ClickException
 
-from omnigent._wrapper_labels import KIRO_NATIVE_WRAPPER_VALUE, WRAPPER_LABEL_KEY
 from omnigent.harnesses.kiro_native.main import (
     _KIRO_PATH_ENV,
     LaunchedKiroTerminal,
@@ -35,6 +34,7 @@ from omnigent.harnesses.kiro_native.main import (
     resolve_kiro_executable,
     run_kiro_native,
 )
+from omnigent.harnesses.wrapper_labels import KIRO_NATIVE_WRAPPER_VALUE, WRAPPER_LABEL_KEY
 
 _NO_JSON = object()
 

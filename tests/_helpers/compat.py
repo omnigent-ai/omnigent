@@ -4,7 +4,7 @@ Helpers for the version backwards-compatibility harness.
 See ``docs/SERVER_VERSION_COMPAT_CI.md``. Two independent redirect knobs and
 their version skips:
 
-1. **Server redirect (Config 1)** — pin the ``omnigent.cli server`` subprocess
+1. **Server redirect (Config 1)** — pin the ``omnigent.cli.commands server`` subprocess
    to an older build (``OMNIGENT_COMPAT_SERVER_PYTHON``) while the client,
    runner, host, and tests stay on main. Skip newer-than-server features with
    ``@pytest.mark.min_server_version(...)``.
@@ -112,7 +112,7 @@ def compat_server_python() -> str | None:
 
 def server_executable() -> str:
     """
-    Interpreter to launch ``omnigent.cli server`` with.
+    Interpreter to launch ``omnigent.cli.commands server`` with.
 
     :returns: The compat interpreter in compat mode, else ``sys.executable``
         (the test process's own python).

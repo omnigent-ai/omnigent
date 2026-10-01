@@ -10,10 +10,10 @@ the input area, and (c) pressing Enter accepts the match back into
 the input buffer.
 
 **What breaks if this fails:**
-- ``omnigent.cli`` removes the ``@kb.add("c-r")`` binding that
+- ``omnigent.cli.commands`` removes the ``@kb.add("c-r")`` binding that
   delegates to prompt-toolkit's
   ``start_reverse_incremental_search``.
-- ``omnigent.cli`` forgets to bind Enter while searching to
+- ``omnigent.cli.commands`` forgets to bind Enter while searching to
   prompt-toolkit's ``accept_search``, so the surfaced match
   cannot be selected.
 - ``SearchToolbar`` stops rendering its default

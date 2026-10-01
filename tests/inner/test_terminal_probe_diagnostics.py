@@ -15,10 +15,10 @@ from types import SimpleNamespace
 
 import pytest
 
-import omnigent.inner.terminal as terminal_mod
-from omnigent.debug_logging import record_to_row
-from omnigent.inner.terminal import TerminalInstance
-from omnigent.process_logging import RedactingLogFormatter
+import omnigent.terminals.terminal as terminal_mod
+from omnigent.observability.debug_logging import record_to_row
+from omnigent.observability.process_logging import RedactingLogFormatter
+from omnigent.terminals.terminal import TerminalInstance
 
 
 async def _run_watcher(instance: TerminalInstance, threaded: bool, on_exit) -> None:

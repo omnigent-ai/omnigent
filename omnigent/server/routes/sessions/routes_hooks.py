@@ -14,14 +14,14 @@ from fastapi import (
 )
 from fastapi.responses import Response
 
-from omnigent.debug_logging import add_audit_attrs
 from omnigent.entities import Conversation
 from omnigent.errors import ElicitationDeclinedError, ErrorCode, OmnigentError
 from omnigent.harnesses.codex_native.elicitation import codex_elicitation_id
-from omnigent.native.native_coding_agents import (
+from omnigent.harnesses.native.coding_agents import (
     native_coding_agent_for_harness,
     native_coding_agent_for_wrapper_label,
 )
+from omnigent.observability.debug_logging import add_audit_attrs
 from omnigent.runner.routing import RunnerRouter
 from omnigent.runtime import (
     get_agent_cache,
@@ -62,7 +62,7 @@ from omnigent.server.routes._codex_elicitation import parse_codex_elicitation_re
 from omnigent.server.routes._content_type import (
     require_json_content_type,
 )
-from omnigent.server.routes._sessions.common import (
+from omnigent.server.routes.sessions.common import (
     _EVALUATE_HOOK_ELICITATION_ID_RE,
     _TURN_ACTOR_LABEL,
     _llm_response_denied_turns,
@@ -71,7 +71,7 @@ from omnigent.server.routes._sessions.common import (
     get_server_runner_router,
     set_server_runner_router,
 )
-from omnigent.server.routes._sessions.helpers import (
+from omnigent.server.routes.sessions.helpers import (
     _allow_all_edits_eligible,
     _allow_auto_mode_eligible,
     _allow_remember_eligible,
@@ -87,7 +87,7 @@ from omnigent.server.routes._sessions.helpers import (
     _resolve_harness,
     _structured_ask_user_question,
 )
-from omnigent.server.routes._sessions.orchestration import (
+from omnigent.server.routes.sessions.orchestration import (
     _hold_native_ask_gate,
     _publish_and_wait_for_harness_elicitation,
     _spawn_gateway_backed,
@@ -1703,8 +1703,8 @@ def register_hooks_routes(
             decision_scope,
             resolve_turn_route,
         )
-        from omnigent.server.routes._sessions.helpers import _resolve_harness
-        from omnigent.server.routes._sessions.orchestration import (
+        from omnigent.server.routes.sessions.helpers import _resolve_harness
+        from omnigent.server.routes.sessions.orchestration import (
             _native_turn_catalog,
             _publish_routed_model,
             _stamp_routing_decision_label,

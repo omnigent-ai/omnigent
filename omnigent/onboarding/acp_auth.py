@@ -1,7 +1,7 @@
 """Generic ACP-agent registry for ``omnigent setup`` and the runtime.
 
 The generic ``acp`` harness (see :func:`omnigent.runtime.workflow._build_acp_spawn_env`
-and :mod:`omnigent.inner.acp_harness`) drives *any* agent that speaks the Agent
+and :mod:`omnigent.harnesses.acp.harness`) drives *any* agent that speaks the Agent
 Client Protocol. Which agents are available is pure user config: a list of named
 commands in a dedicated top-level ``acp:`` block of ``~/.omnigent/config.yaml``::
 
@@ -23,7 +23,7 @@ variable does not reach the agent. A dedicated block (not the shared gateway
 
 This module is pure read + settings-builder (mirroring
 :mod:`omnigent.onboarding.cursor_auth`): the CLI orchestrates writes through
-:func:`omnigent.cli._save_global_config` so there is no cli↔onboarding cycle.
+:func:`omnigent.cli.commands._save_global_config` so there is no cli↔onboarding cycle.
 """
 
 from __future__ import annotations
@@ -33,7 +33,7 @@ import shutil
 from collections.abc import Iterable
 from dataclasses import dataclass
 
-from omnigent.acp_cli_harnesses import ACP_CLI_HARNESSES
+from omnigent.harnesses.acp.cli_harnesses import ACP_CLI_HARNESSES
 from omnigent.onboarding.provider_config import load_config
 
 # The dedicated top-level config block and the list field inside it.
@@ -50,7 +50,7 @@ class AcpAgentEntry:
     :param name: Human display name, e.g. ``"Gemini CLI"``.
     :param command: The command to launch, e.g. ``"gemini --experimental-acp"``.
     :param model: Optional model id, applied to the agent's live session via a
-        warm switch (see :class:`omnigent.inner.acp_executor.AcpAgentConfig`).
+        warm switch (see :class:`omnigent.harnesses.acp.executor.AcpAgentConfig`).
     :param session_id_mode: ``"server"`` (default) or ``"client"``.
     :param send_model: Send the model in ``session/new`` (Qwen-shaped agents).
     :param omnigent_mcp: Lend Omnigent's builtin MCP relay in ``session/new``.
@@ -58,7 +58,7 @@ class AcpAgentEntry:
         ACP turn. Disable for agents that fully own their own system prompt (e.g.
         Pi forks like ``omp``) to prevent XML tool-call fragments from leaking
         into their responses when no MCP relay is active. See
-        :attr:`omnigent.inner.acp_executor.AcpAgentConfig.inject_system_prompt`.
+        :attr:`omnigent.harnesses.acp.executor.AcpAgentConfig.inject_system_prompt`.
     :param env_passthrough: Environment variable *names* the agent may read at
         spawn, e.g. ``("XAI_API_KEY",)``. The spawn env is deny-by-default and
         the executor cannot know which variable an arbitrary agent
@@ -201,7 +201,7 @@ def shadowed_builtin_acp_rows(entries: Iterable[AcpAgentEntry]) -> frozenset[str
     """Return the builtin ACP CLI row ids claimed by a configured ``acp:`` agent.
 
     A configured agent named "Devin" slugifies onto ``devin``, which is also a
-    builtin row id (:data:`omnigent.acp_cli_harnesses.ACP_CLI_HARNESSES`), so the
+    builtin row id (:data:`omnigent.harnesses.acp.cli_harnesses.ACP_CLI_HARNESSES`), so the
     two describe the same harness by the same name from different sources. The
     user's entry is the more specific intent — they wrote the exact command,
     often with a ``--model`` the fixed row argv cannot carry — so callers that
@@ -221,7 +221,7 @@ def shadowed_builtin_acp_rows(entries: Iterable[AcpAgentEntry]) -> frozenset[str
 def acp_agents_settings(entries: list[AcpAgentEntry]) -> dict[str, object]:
     """Build the ``{"acp": {"agents": [...]}}`` settings dict for persistence.
 
-    Handed to :func:`omnigent.cli._save_global_config` (a shallow update, so it
+    Handed to :func:`omnigent.cli.commands._save_global_config` (a shallow update, so it
     replaces the whole ``acp:`` block). Only the user-authored fields are
     written back — the derived ``slug`` is not persisted.
 

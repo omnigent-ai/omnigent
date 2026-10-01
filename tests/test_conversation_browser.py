@@ -6,7 +6,7 @@ import subprocess
 
 import pytest
 
-import omnigent.conversation_browser as browser
+import omnigent.cli.conversation_browser as browser
 
 
 def test_conversation_url_quotes_session_id() -> None:
@@ -204,11 +204,11 @@ def test_conversation_url_maps_workspace_hosted_server_to_ui_mount(tmp_path, mon
     ``/omnigent`` and carry ``?o=<org>`` recorded by ``omnigent
     login`` so multi-org workspaces open in the right one.
     """
-    from omnigent.cli_auth import store_databricks_auth
-    from omnigent.conversation_browser import conversation_url
+    from omnigent.cli.auth import store_databricks_auth
+    from omnigent.cli.conversation_browser import conversation_url
 
     monkeypatch.setattr(
-        "omnigent.cli_auth._token_file_path",
+        "omnigent.cli.auth._token_file_path",
         lambda: tmp_path / "auth_tokens.json",
     )
     server = "https://example.databricks.com/api/2.0/omnigent"
@@ -229,10 +229,10 @@ def test_conversation_url_workspace_hosted_without_org_record(tmp_path, monkeypa
     Single-org workspaces resolve fine without it; inventing an org id
     would be worse than omitting it.
     """
-    from omnigent.conversation_browser import conversation_url
+    from omnigent.cli.conversation_browser import conversation_url
 
     monkeypatch.setattr(
-        "omnigent.cli_auth._token_file_path",
+        "omnigent.cli.auth._token_file_path",
         lambda: tmp_path / "auth_tokens.json",
     )
 
@@ -243,10 +243,10 @@ def test_conversation_url_workspace_hosted_without_org_record(tmp_path, monkeypa
 
 def test_conversation_url_plain_server_unchanged(tmp_path, monkeypatch) -> None:
     """Non-workspace servers keep the plain /c/<id> link shape."""
-    from omnigent.conversation_browser import conversation_url
+    from omnigent.cli.conversation_browser import conversation_url
 
     monkeypatch.setattr(
-        "omnigent.cli_auth._token_file_path",
+        "omnigent.cli.auth._token_file_path",
         lambda: tmp_path / "auth_tokens.json",
     )
 
@@ -305,7 +305,7 @@ def test_strip_conversation_path_inverts_conversation_url(
     :param monkeypatch: Pytest monkeypatch fixture.
     :returns: None.
     """
-    monkeypatch.setattr("omnigent.cli_auth.load_databricks_org_id", lambda _url: None)
+    monkeypatch.setattr("omnigent.cli.auth.load_databricks_org_id", lambda _url: None)
     base = "https://app.databricksapps.com"
     link = browser.conversation_url(base, "conv_abc123")
     assert link == f"{base}/c/conv_abc123"

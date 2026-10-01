@@ -291,8 +291,8 @@ async def test_surface_probe_does_not_fork_the_working_tree(
     os_env_option: str,
 ) -> None:
     """Metadata probes never construct an environment, even for fork/scratch specs."""
-    from omnigent.inner import os_env as os_env_mod
-    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+    from omnigent.core.datamodel import OSEnvSandboxSpec, OSEnvSpec
+    from omnigent.environments import os_env as os_env_mod
 
     create_env = Mock(side_effect=AssertionError("metadata must not construct an OS environment"))
     monkeypatch.setattr(os_env_mod, "create_os_environment", create_env)

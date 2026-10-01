@@ -717,7 +717,7 @@ async def test_bound_opencode_switch_qualifies_the_literal_gateway_id(
 ) -> None:
     from unittest.mock import Mock
 
-    from omnigent.inference_config import inference_config_scope
+    from omnigent.models.inference_config import inference_config_scope
     from omnigent.spec.types import ExecutorSpec
 
     update = Mock(return_value=True)

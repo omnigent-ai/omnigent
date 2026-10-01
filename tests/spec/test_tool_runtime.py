@@ -12,8 +12,8 @@ from __future__ import annotations
 
 import pytest
 
-from omnigent.inner.loader import load_agent_def
-from omnigent.inner.tools import FunctionTool
+from omnigent.core.loader import load_agent_def
+from omnigent.core.tools import FunctionTool
 from omnigent.spec.types import (
     AgentSpec,
     ExecutorSpec,

@@ -4,8 +4,8 @@ from collections.abc import Iterator
 
 import pytest
 
-import omnigent.harness_plugins as hp
-from omnigent.native import native_dispatch
+import omnigent.harnesses.registry as hp
+from omnigent.harnesses.native import dispatch as native_dispatch
 
 
 @pytest.fixture(autouse=True)
@@ -17,9 +17,9 @@ def _reset_state() -> Iterator[None]:
 
 def test_resolve_colon_and_dot_paths() -> None:
     # module:attr form
-    assert native_dispatch.resolve("omnigent.harness_plugins:load_object") is hp.load_object
+    assert native_dispatch.resolve("omnigent.harnesses.registry:load_object") is hp.load_object
     # module.attr form
-    assert native_dispatch.resolve("omnigent.harness_plugins.load_object") is hp.load_object
+    assert native_dispatch.resolve("omnigent.harnesses.registry.load_object") is hp.load_object
 
 
 def test_resolve_reflects_monkeypatched_symbol(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -30,8 +30,8 @@ def test_resolve_reflects_monkeypatched_symbol(monkeypatch: pytest.MonkeyPatch) 
     and CLI hubs rely on, so resolution is deliberately uncached.
     """
     sentinel = object()
-    monkeypatch.setattr("omnigent.harness_plugins.native_agents", sentinel)
-    assert native_dispatch.resolve("omnigent.harness_plugins:native_agents") is sentinel
+    monkeypatch.setattr("omnigent.harnesses.registry.native_agents", sentinel)
+    assert native_dispatch.resolve("omnigent.harnesses.registry:native_agents") is sentinel
 
 
 def test_resolve_hook_returns_none_for_unset_optional_hook() -> None:

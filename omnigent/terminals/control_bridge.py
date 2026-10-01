@@ -52,7 +52,7 @@ from typing import Final
 
 from fastapi import WebSocket, WebSocketDisconnect
 
-from omnigent.inner.terminal_clipboard import MAX_CLIPBOARD_BYTES
+from omnigent.terminals.clipboard import MAX_CLIPBOARD_BYTES
 from omnigent.terminals.ws_common import (
     WS_CLOSE_INTERNAL_ERROR,
     WS_CLOSE_TERMINAL_DETACHED,

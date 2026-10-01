@@ -15,9 +15,10 @@ from typing import Any
 import httpx
 import pytest
 
-from omnigent.harness_plugins import BackgroundTitleGeneratorSpec
+from omnigent.harnesses.codex.executor import _provider_codex_config_overrides
 from omnigent.harnesses.codex_native.app_server import NativeCodexLaunch
-from omnigent.inner.codex_executor import _provider_codex_config_overrides
+from omnigent.harnesses.registry import BackgroundTitleGeneratorSpec
+from omnigent.harnesses.runtime.process_manager import _build_harness_spawn_env
 from omnigent.runner import create_runner_app
 from omnigent.runner.background_titles import BackgroundTitleContext
 from omnigent.runner.background_titles import claude_native as claude_native_titles
@@ -32,7 +33,6 @@ from omnigent.runner.background_titles.service import (
     background_title_model,
     build_background_title_instructions,
 )
-from omnigent.runtime.harnesses.process_manager import _build_harness_spawn_env
 from tests.runner.helpers import NullServerClient
 
 
@@ -491,7 +491,7 @@ async def test_claude_native_title_uses_tool_free_print_mode(
         lambda spec=None: claude_config,
     )
     monkeypatch.setattr(
-        "omnigent.claude_launcher.resolve_claude_launch",
+        "omnigent.harnesses.claude_native.launcher.resolve_claude_launch",
         lambda command, args: (command, args),
     )
     monkeypatch.setattr(asyncio, "create_subprocess_exec", create_subprocess_exec)
@@ -549,12 +549,12 @@ async def test_claude_native_title_skips_under_windows_native_claude_on_wsl(
         lambda spec=None: None,
     )
     monkeypatch.setattr(
-        "omnigent.claude_launcher.resolve_claude_launch",
+        "omnigent.harnesses.claude_native.launcher.resolve_claude_launch",
         lambda command, args: (command, args),
     )
     monkeypatch.setattr("omnigent.harnesses.claude_native.bridge.is_wsl", lambda: True)
     monkeypatch.setattr(
-        "omnigent._platform.resolve_cli_binary",
+        "omnigent.util.portability.resolve_cli_binary",
         lambda name, **kwargs: "/mnt/c/Users/example/AppData/Roaming/npm/claude.cmd",
     )
     monkeypatch.setattr(asyncio, "create_subprocess_exec", _unreached_subprocess_exec)
@@ -595,7 +595,7 @@ async def test_claude_native_title_prefers_title_model_over_session_sources(
         lambda spec=None: None,
     )
     monkeypatch.setattr(
-        "omnigent.claude_launcher.resolve_claude_launch",
+        "omnigent.harnesses.claude_native.launcher.resolve_claude_launch",
         lambda command, args: (command, args),
     )
     monkeypatch.setattr(asyncio, "create_subprocess_exec", create_subprocess_exec)
@@ -649,7 +649,7 @@ async def test_claude_native_title_kills_process_when_cancelled(
         lambda spec=None: None,
     )
     monkeypatch.setattr(
-        "omnigent.claude_launcher.resolve_claude_launch",
+        "omnigent.harnesses.claude_native.launcher.resolve_claude_launch",
         lambda command, args: (command, args),
     )
     monkeypatch.setattr(
@@ -767,7 +767,7 @@ async def test_codex_native_title_keeps_loop_responsive_during_profile_resolutio
         "omnigent.harnesses.codex_native.app_server._databricks_gateway_host", resolve_host
     )
     monkeypatch.setattr(
-        "omnigent.inner.codex_executor._codex_home_config_source_from_env",
+        "omnigent.harnesses.codex.executor._codex_home_config_source_from_env",
         lambda: tmp_path,
     )
     make_temp_dir = codex_native_titles.tempfile.TemporaryDirectory
@@ -874,7 +874,7 @@ async def test_codex_native_title_uses_ephemeral_tool_free_exec(
         lambda: "codex",
     )
     monkeypatch.setattr(
-        "omnigent.inner.codex_executor._codex_home_config_source_from_env",
+        "omnigent.harnesses.codex.executor._codex_home_config_source_from_env",
         lambda: source_home,
     )
 
@@ -952,7 +952,7 @@ async def test_codex_native_title_prefers_title_model_over_session_sources(
         lambda: "codex",
     )
     monkeypatch.setattr(
-        "omnigent.inner.codex_executor._codex_home_config_source_from_env",
+        "omnigent.harnesses.codex.executor._codex_home_config_source_from_env",
         lambda: source_home,
     )
     monkeypatch.setattr(asyncio, "create_subprocess_exec", create_subprocess_exec)
@@ -1011,7 +1011,7 @@ async def test_codex_native_title_kills_process_when_cancelled(
         lambda *args, **kwargs: asyncio.sleep(0, result=process),
     )
     monkeypatch.setattr(
-        "omnigent.inner._proc.kill_tree",
+        "omnigent.util.proc.kill_tree",
         lambda candidate: killed.append(candidate),
     )
 

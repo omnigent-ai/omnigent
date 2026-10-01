@@ -69,7 +69,7 @@ def main() -> None:
     cmd = [
         sys.executable,
         "-m",
-        "omnigent.cli",
+        "omnigent.cli.commands",
         "server",
         "--host",
         "0.0.0.0",

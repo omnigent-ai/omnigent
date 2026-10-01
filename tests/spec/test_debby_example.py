@@ -3,7 +3,7 @@
 Debby's "GPT" sub-agent must run on the ``codex`` harness, not
 ``openai-agents``. The openai-agents harness treats an unpinned model as a
 Databricks model (``is_databricks_model = model is None`` in
-``omnigent/inner/openai_agents_sdk_executor.py``) and, with no
+``omnigent/harnesses/openai_agents/executor.py``) and, with no
 ``OPENAI_API_KEY`` / ``OPENAI_BASE_URL`` in the environment, silently falls
 back to ambient Databricks credentials — routing the "GPT" head through the
 Databricks gateway instead of OpenAI. The ``codex`` harness is GPT-only, uses

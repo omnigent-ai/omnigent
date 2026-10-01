@@ -348,7 +348,7 @@ async def _fake_sandbox_host(
         dropping it garbage-collects the ASGI task, which tears the
         tunnel down and flips the host offline.
     """
-    from omnigent.runner.identity import token_bound_runner_id
+    from omnigent.util.runner_identity import token_bound_runner_id
 
     scope = _websocket_scope(f"/v1/hosts/{host_id}/tunnel")
     scope["headers"] = [(b"x-omnigent-host-token", token.encode("ascii"))]

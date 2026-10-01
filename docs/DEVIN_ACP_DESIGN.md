@@ -30,7 +30,7 @@ This document is three things:
 
 ## State of the world
 
-Devin rides the generic executor (`omnigent/inner/acp_executor.py`), so it starts
+Devin rides the generic executor (`omnigent/harnesses/acp/executor.py`), so it starts
 with everything that path already does and adds a Devin-specific sub-agent layer.
 The table is Devin-centric: **✓** works on `main`, **~** partial/caveated, **✗**
 absent. Where a gap has a tracking PR it is named; those are expanded under
@@ -78,16 +78,16 @@ kilocode, Qwen, and every BYO `acp:<slug>` agent already share.
 ### The mental model
 
 ```
-AcpSubAgentSource   (Protocol, generic)        omnigent/inner/acp_subagents.py
+AcpSubAgentSource   (Protocol, generic)        omnigent/harnesses/acp/subagents.py
    read(update) -> Sequence[SubAgentStart | SubAgentEnd]
         ▲ implements
 DevinSubAgentSource                            omnigent/inner/devin/subagents.py   ← vendor
         │ held by
-AcpExtension(name, subagent_sources=(...))     omnigent/inner/acp_extension.py     ← the seam
+AcpExtension(name, subagent_sources=(...))     omnigent/harnesses/acp/extension.py     ← the seam
    NO_ACP_EXTENSION    = ("acp",   ())         ← generic default: reads no vendor field
    DEVIN_ACP_EXTENSION = ("devin", (DevinSubAgentSource(),))   omnigent/inner/devin/__init__.py
         │ injected via  create_app(extension=...)
-AcpExecutor(config, *, extension=NO_ACP_EXTENSION)   omnigent/inner/acp_executor.py  ← generic
+AcpExecutor(config, *, extension=NO_ACP_EXTENSION)   omnigent/harnesses/acp/executor.py  ← generic
    consumes ext.subagent_sources — no vendor name anywhere
 ```
 
@@ -130,7 +130,7 @@ records the sub-agent's summary + status on the child.
 
 ### Key code
 
-The seam — `omnigent/inner/acp_extension.py`:
+The seam — `omnigent/harnesses/acp/extension.py`:
 
 ```python
 @dataclass(frozen=True)
@@ -164,7 +164,7 @@ def create_app():
 ```
 
 The generic executor consumes it with no vendor name in sight —
-`omnigent/inner/acp_executor.py`:
+`omnigent/harnesses/acp/executor.py`:
 
 ```python
 for sub in read_subagent_events(update, self._extension.subagent_sources):

@@ -16,7 +16,6 @@ from pathlib import Path
 
 import httpx
 
-from omnigent.codex_approval_modes import codex_permission_preset_from_thread_settings
 from omnigent.entities.session_resources import terminal_resource_id
 from omnigent.harnesses.claude_native.bridge import url_component
 from omnigent.harnesses.codex_native import side_chat
@@ -25,6 +24,9 @@ from omnigent.harnesses.codex_native.app_server import (
     CodexAppServerResponseError,
     CodexMessage,
     client_for_transport,
+)
+from omnigent.harnesses.codex_native.approval_modes import (
+    codex_permission_preset_from_thread_settings,
 )
 from omnigent.harnesses.codex_native.bridge import (
     CODEX_NATIVE_BRIDGE_ID_LABEL_KEY,
@@ -53,13 +55,13 @@ from omnigent.harnesses.codex_native.elicitation import (
 from omnigent.harnesses.codex_native.elicitation import (
     is_codex_request_id as _is_codex_request_id,
 )
-from omnigent.native._native_forwarder_health import (
+from omnigent.harnesses.native.forwarder_health import (
     note_post_success as note_native_post_success,
 )
-from omnigent.native._native_forwarder_health import (
+from omnigent.harnesses.native.forwarder_health import (
     record_post_failure as record_native_post_failure,
 )
-from omnigent.native._native_post_delivery import (
+from omnigent.harnesses.native.post_delivery import (
     RepostResult,
     append_dead_letter,
     post_may_have_been_delivered,
@@ -2075,7 +2077,7 @@ async def supervise_forwarder(
     if client is None:
         client = client_for_transport(app_server_url, client_name="omnigent-codex-forwarder")
         await client.connect()
-    from omnigent.cli_auth import open_server_client
+    from omnigent.cli.auth import open_server_client
 
     async with open_server_client(
         base_url,

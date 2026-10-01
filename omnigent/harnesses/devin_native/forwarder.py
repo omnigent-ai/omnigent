@@ -62,7 +62,7 @@ from omnigent.harnesses.devin_native.subagents import (
     reconstruct_transcript_chains,
     transcript_items,
 )
-from omnigent.native._native_post_delivery import post_external_session_status
+from omnigent.harnesses.native.post_delivery import post_external_session_status
 from omnigent.util.json_types import JsonObject as _JsonObject
 
 _logger = logging.getLogger(__name__)
@@ -779,7 +779,7 @@ async def forward_devin_hooks_to_session(
         a first attach to a log something else already wrote.
     :returns: Never normally returns; cancel the task to stop it.
     """
-    from omnigent.cli_auth import open_server_client
+    from omnigent.cli.auth import open_server_client
 
     state = _read_state(bridge_dir)
     # The cursor check is load-bearing, not belt-and-braces: bridge dirs are

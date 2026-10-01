@@ -16,7 +16,7 @@ from fastapi import FastAPI
 
 from omnigent.harnesses.claude_native import main as claude_native
 from omnigent.harnesses.codex_native import app_server as codex_native_app_server
-from omnigent.process_logging import PROCESS_LOG_FILE_ENV_VAR
+from omnigent.observability.process_logging import PROCESS_LOG_FILE_ENV_VAR
 from omnigent.runner import create_runner_app
 from omnigent.runner.mcp_manager import McpSchemasResult
 from omnigent.spec.types import AgentSpec, ExecutorSpec, MCPServerConfig
@@ -845,6 +845,8 @@ def pinned_runner_log(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
     :returns: The path the runner's error messages must name.
     """
     log_path = tmp_path / "runner-pinned.log"
-    monkeypatch.setattr("omnigent.process_logging._current_process_log_path", log_path)
+    monkeypatch.setattr(
+        "omnigent.observability.process_logging._current_process_log_path", log_path
+    )
     monkeypatch.setenv(PROCESS_LOG_FILE_ENV_VAR, str(log_path))
     return log_path

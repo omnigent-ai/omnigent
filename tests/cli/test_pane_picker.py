@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import pytest
 
-from omnigent.cli import _strip_one_shot_flags, _strip_resume_flags
+from omnigent.cli.commands import _strip_one_shot_flags, _strip_resume_flags
 
 
 @pytest.mark.parametrize(

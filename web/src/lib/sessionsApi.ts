@@ -1315,7 +1315,7 @@ export async function fetchSessionItemsPage(
  * Build a portable JSONL export of a session's transcript.
  *
  * Same format as `omnigent session export` (see `session_export` in
- * `omnigent/cli.py`): the first line is the session metadata
+ * `omnigent/cli/commands.py`): the first line is the session metadata
  * (`record_type: "session_meta"`), every following line is one committed
  * item (`record_type: "item"`) in chronological order, so the file
  * round-trips through `omnigent session import`. Records keep the raw

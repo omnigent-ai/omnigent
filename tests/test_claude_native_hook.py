@@ -26,7 +26,7 @@ from omnigent.harnesses.claude_native.bridge import (
     validate_claude_hook_interpreter_compatibility,
     write_active_session_id,
 )
-from omnigent.native import native_policy_hook
+from omnigent.harnesses.native import policy_hook as native_policy_hook
 from tests.native_hook_helpers import make_failing_client
 
 
@@ -207,12 +207,12 @@ def test_session_start_hook_maps_workspace_hosted_server_to_ui_mount(
     with the ``?o=<org>`` selector — matching the CLI's ``Web UI:``
     line and the tmux status bar.
     """
-    from omnigent.cli_auth import store_databricks_auth
+    from omnigent.cli.auth import store_databricks_auth
 
     monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
     monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path / "root")
     monkeypatch.setattr(
-        "omnigent.cli_auth._token_file_path",
+        "omnigent.cli.auth._token_file_path",
         lambda: tmp_path / "auth_tokens.json",
     )
     server = "https://example.databricks.com/api/2.0/omnigent"

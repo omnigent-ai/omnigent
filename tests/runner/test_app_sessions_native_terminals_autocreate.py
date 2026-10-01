@@ -14,6 +14,7 @@ from typing import Any
 import httpx
 import pytest
 
+from omnigent.core.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.entities.session_resources import SessionResourceView
 from omnigent.harnesses.antigravity_native.bridge import (
     ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY,
@@ -45,8 +46,6 @@ from omnigent.harnesses.codex_native.bridge import (
 )
 from omnigent.harnesses.cursor_native import bridge as cursor_native_bridge
 from omnigent.harnesses.kiro_native import bridge as kiro_native_bridge
-from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
-from omnigent.inner.terminal import TerminalInstance
 from omnigent.runner import app as runner_app
 from omnigent.runner import create_runner_app
 from omnigent.runner.app import (
@@ -73,6 +72,7 @@ from omnigent.runner.resource_registry import (
 from omnigent.runner.session_init_protocol import RunnerSessionInitEnvelope
 from omnigent.spec.types import AgentSpec, ExecutorSpec
 from omnigent.terminals import TerminalRegistry
+from omnigent.terminals.terminal import TerminalInstance
 from tests.runner.conftest import (
     _FakeProcessManager,
     _runner_client,
@@ -90,7 +90,7 @@ def test_read_relay_policy_config_returns_coords_from_tool_relay_json(
     tmp_path: Path,
 ) -> None:
     """read_relay_policy_config extracts relay URL, token, and session_id."""
-    from omnigent.native.native_policy_hook import read_relay_policy_config
+    from omnigent.harnesses.native.policy_hook import read_relay_policy_config
 
     bridge_dir = tmp_path / "bridge"
     bridge_dir.mkdir()
@@ -104,7 +104,7 @@ def test_read_relay_policy_config_returns_coords_from_tool_relay_json(
 
 def test_read_relay_policy_config_returns_none_when_missing(tmp_path: Path) -> None:
     """read_relay_policy_config returns None when tool_relay.json absent."""
-    from omnigent.native.native_policy_hook import read_relay_policy_config
+    from omnigent.harnesses.native.policy_hook import read_relay_policy_config
 
     assert read_relay_policy_config(tmp_path) is None
 
@@ -113,7 +113,7 @@ def test_read_relay_policy_config_returns_none_when_session_id_absent(
     tmp_path: Path,
 ) -> None:
     """read_relay_policy_config returns None when session_id absent (relay not policy-capable)."""
-    from omnigent.native.native_policy_hook import read_relay_policy_config
+    from omnigent.harnesses.native.policy_hook import read_relay_policy_config
 
     bridge_dir = tmp_path / "bridge"
     bridge_dir.mkdir()
@@ -898,7 +898,7 @@ async def test_auto_create_pi_terminal_inherits_agent_sandbox(
     import omnigent.harnesses.pi_native.bridge as pi_native_bridge
     import omnigent.harnesses.pi_native.credentials as pi_native_credentials
     import omnigent.harnesses.pi_native.main as pi_native
-    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+    from omnigent.core.datamodel import OSEnvSandboxSpec, OSEnvSpec
 
     monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
     monkeypatch.setattr(pi_native_bridge, "_BRIDGE_ROOT", tmp_path / "pi-bridge")
@@ -1128,7 +1128,7 @@ async def test_auto_create_claude_terminal_rejects_windows_native_claude_under_w
     monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(config_home))
     windows_claude = "/mnt/c/Users/example/AppData/Roaming/npm/claude.cmd"
     monkeypatch.setattr(
-        "omnigent._platform.shutil.which",
+        "omnigent.util.portability.shutil.which",
         lambda name: windows_claude if name == "claude" else None,
     )
 
@@ -1194,7 +1194,7 @@ async def test_auto_create_claude_terminal_rejects_windows_native_claude_env_ove
     # The override is an absolute path; resolution passes it through
     # rather than looking up the bare "claude" name.
     monkeypatch.setattr(
-        "omnigent._platform.shutil.which",
+        "omnigent.util.portability.shutil.which",
         lambda name: windows_claude if name == windows_claude else None,
     )
 
@@ -1261,7 +1261,7 @@ async def test_auto_create_claude_terminal_honors_compatible_claude_env_override
     monkeypatch.setenv("OMNIGENT_CLAUDE_PATH", str(compatible_override))
     windows_claude = "/mnt/c/Users/example/AppData/Roaming/npm/claude.cmd"
     monkeypatch.setattr(
-        "omnigent._platform.shutil.which",
+        "omnigent.util.portability.shutil.which",
         lambda name: (
             str(compatible_override)
             if name == str(compatible_override)
@@ -1375,7 +1375,7 @@ def test_agent_os_env_from_spec_unwraps_resolved_and_handles_none() -> None:
     return ``None`` when there is no spec — so the launch falls back to the
     platform default only when there is genuinely no agent policy to honour.
     """
-    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+    from omnigent.core.datamodel import OSEnvSandboxSpec, OSEnvSpec
 
     os_env = OSEnvSpec(type="caller_process", cwd=".", sandbox=OSEnvSandboxSpec(type="none"))
     bare = AgentSpec(
@@ -1508,7 +1508,7 @@ async def test_auto_create_claude_terminal_inherits_agent_sandbox(
     :param tmp_path: Pytest-provided temporary directory.
     :param monkeypatch: Pytest monkeypatch fixture.
     """
-    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+    from omnigent.core.datamodel import OSEnvSandboxSpec, OSEnvSpec
 
     monkeypatch.setattr(claude_native_bridge, "_TRUSTED_PARENT", tmp_path)
     monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "root")
@@ -4412,7 +4412,7 @@ async def test_auto_create_claude_terminal_launch_gate_folds_a_canonical_overrid
     spellings, launches on its own default instead and resets the pick to Default.
     """
     from omnigent.harnesses.claude_native.main import ClaudeNativeUcodeConfig
-    from omnigent.inference_config import inference_config_scope
+    from omnigent.models.inference_config import inference_config_scope
 
     monkeypatch.setattr(claude_native_bridge, "_TRUSTED_PARENT", tmp_path)
     monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "root")

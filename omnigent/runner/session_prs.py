@@ -16,7 +16,7 @@ from urllib.parse import urlsplit
 from filelock import FileLock
 from pydantic import BaseModel, Field
 
-from omnigent.process_logging import data_dir
+from omnigent.observability.process_logging import data_dir
 
 
 def _valid_hostname(host: str) -> bool:

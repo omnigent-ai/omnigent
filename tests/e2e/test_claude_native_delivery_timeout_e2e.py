@@ -43,6 +43,7 @@ from pathlib import Path
 
 import pytest
 
+from omnigent.core.executor import ExecutorError, TurnComplete
 from omnigent.harnesses.claude_native.bridge import (
     _BRIDGE_ROOT,
     _SUBMIT_VERIFY_TIMEOUT_S,
@@ -50,8 +51,7 @@ from omnigent.harnesses.claude_native.bridge import (
     inject_user_message,
     write_tmux_target,
 )
-from omnigent.inner.claude_native_executor import ClaudeNativeExecutor
-from omnigent.inner.executor import ExecutorError, TurnComplete
+from omnigent.harnesses.claude_native.executor import ClaudeNativeExecutor
 
 pytestmark = pytest.mark.skipif(shutil.which("tmux") is None, reason="requires tmux on PATH")
 
@@ -231,7 +231,7 @@ async def test_run_turn_completes_despite_stalled_submit(
     executor = ClaudeNativeExecutor(bridge_dir=bridge_dir)
 
     events = []
-    with caplog.at_level("ERROR", logger="omnigent.inner.claude_native_executor"):
+    with caplog.at_level("ERROR", logger="omnigent.harnesses.claude_native.executor"):
         start = time.monotonic()
         async for event in executor.run_turn(
             messages=[{"role": "user", "content": _MESSAGE}],

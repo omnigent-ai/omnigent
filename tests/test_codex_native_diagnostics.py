@@ -11,9 +11,12 @@ from typing import TYPE_CHECKING, cast
 
 import pytest
 
-from omnigent.debug_logging import record_to_row
 from omnigent.harnesses.codex_native.diagnostics import collect_codex_startup_diagnostics
-from omnigent.process_logging import HARNESS_STDERR_ENABLED_ENV_VAR, RedactingLogFormatter
+from omnigent.observability.debug_logging import record_to_row
+from omnigent.observability.process_logging import (
+    HARNESS_STDERR_ENABLED_ENV_VAR,
+    RedactingLogFormatter,
+)
 
 if TYPE_CHECKING:
     from omnigent.harnesses.codex_native.app_server import CodexNativeAppServer

@@ -20,7 +20,6 @@ from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
 from omnigent.entities.session_resources import SessionResourceView
-from omnigent.inner.terminal import TerminalInstance
 from omnigent.runner import create_runner_app
 from omnigent.runner.direct_attach import (
     allowed_origin_for_server,
@@ -33,6 +32,7 @@ from omnigent.runner.resource_registry import (
     SessionResourceRegistry,
 )
 from omnigent.terminals import TerminalRegistry
+from omnigent.terminals.terminal import TerminalInstance
 from tests.runner.helpers import NullServerClient, make_test_terminal_instance
 
 

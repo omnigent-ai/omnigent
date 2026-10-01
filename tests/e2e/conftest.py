@@ -41,7 +41,7 @@ import httpx
 import pytest
 import yaml
 
-from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN
+from omnigent.util.runner_identity import OMNIGENT_INTERNAL_WS_ORIGIN
 from tests._helpers.compat import (
     apply_runner_env,
     apply_server_env,
@@ -593,7 +593,7 @@ def live_runner_id() -> str:
     """
     import secrets as _secrets
 
-    from omnigent.runner.identity import token_bound_runner_id
+    from omnigent.util.runner_identity import token_bound_runner_id
 
     if "runner_id" not in _live_runner_state:
         token = _secrets.token_urlsafe(32)
@@ -715,7 +715,7 @@ def live_server(
         # sys.executable (it tracks the test process / client version).
         server_executable(),
         "-m",
-        "omnigent.cli",
+        "omnigent.cli.commands",
         "server",
         "--port",
         str(port),
@@ -1920,7 +1920,7 @@ def resume_test_server(
         [
             server_executable(),
             "-m",
-            "omnigent.cli",
+            "omnigent.cli.commands",
             "server",
             "--port",
             str(port),

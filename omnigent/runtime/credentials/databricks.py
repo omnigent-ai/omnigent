@@ -31,7 +31,7 @@ reusing a full OpenAI base URL would produce malformed URLs, so we
 resolve via the SDK and cfg file only.
 
 The SDK-based path mirrors (but does not import from)
-``omnigent/inner/databricks_executor.py:_read_databrickscfg``. The
+``omnigent/harnesses/databricks/executor.py:_read_databrickscfg``. The
 configparser fallback mirrors ``_read_databrickscfg_file_fallback`` in
 the same module. Once the ``inner/`` package is sunset (see
 ``designs/UNIFICATION.md``), both functions there should be deleted in

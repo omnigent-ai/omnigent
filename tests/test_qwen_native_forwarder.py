@@ -615,13 +615,13 @@ def test_spawn_env_carries_bridge_dir() -> None:
 
 
 def test_harness_registered_aliased_and_native() -> None:
-    from omnigent.harness_aliases import canonicalize_harness, is_native_harness
-    from omnigent.native.native_coding_agents import native_coding_agent_for_harness
-    from omnigent.runtime.harnesses import _HARNESS_MODULES
+    from omnigent.harnesses.aliases import canonicalize_harness, is_native_harness
+    from omnigent.harnesses.native.coding_agents import native_coding_agent_for_harness
+    from omnigent.harnesses.runtime import _HARNESS_MODULES
     from omnigent.spec._omnigent_compat import OMNIGENT_HARNESSES
 
     # Registry entry resolves to the harness module.
-    assert _HARNESS_MODULES["qwen-native"] == "omnigent.inner.qwen_native_harness"
+    assert _HARNESS_MODULES["qwen-native"] == "omnigent.harnesses.qwen_native.harness"
     # Allowlisted + recognized as a native-terminal harness (both spellings).
     assert "qwen-native" in OMNIGENT_HARNESSES
     assert is_native_harness("qwen-native") is True
@@ -636,7 +636,7 @@ def test_harness_registered_aliased_and_native() -> None:
 
 
 def test_harness_create_app_builds() -> None:
-    from omnigent.inner.qwen_native_harness import create_app
+    from omnigent.harnesses.qwen_native.harness import create_app
 
     app = create_app()
     assert app is not None

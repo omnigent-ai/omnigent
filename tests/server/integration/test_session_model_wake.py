@@ -10,11 +10,11 @@ import pytest
 
 from omnigent.entities import Conversation, ErrorData
 from omnigent.errors import ErrorCode, OmnigentError
-from omnigent.server.routes._sessions.helpers import (
+from omnigent.server.routes.sessions import routes_core
+from omnigent.server.routes.sessions.helpers import (
     _NativeTerminalEnsureOutcome,
     _RunnerForwardResult,
 )
-from omnigent.server.routes.sessions import routes_core
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.host_store import HostStore
 from tests.server.helpers import create_test_agent

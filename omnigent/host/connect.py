@@ -32,20 +32,6 @@ import psutil
 import websockets.asyncio.client
 from websockets.exceptions import ConnectionClosed, InvalidStatus, InvalidURI
 
-from omnigent._platform import (
-    IS_POSIX,
-    WINDOWS_ENV_PASSTHROUGH,
-    installed_interactive_shells,
-    normalize_interactive_shells,
-)
-from omnigent.cli_invocation import cli_invocation
-from omnigent.debug_logging import (
-    ORIGIN_WORKSPACE_ID_ENV_VAR,
-    PRIMARY_SESSION_ID_ENV_VAR,
-    USER_ID_ENV_VAR,
-    debug_event,
-    runner_log_scope,
-)
 from omnigent.errors import (
     ErrorCategory,
     ErrorImpact,
@@ -53,9 +39,13 @@ from omnigent.errors import (
     category_for_code,
     phase_for_code,
 )
-from omnigent.gateway_inference import gateway_inference_map
-from omnigent.harness_aliases import canonicalize_harness, is_claude_sdk_harness_name
-from omnigent.harness_availability import HARNESS_BINARY_MISSING, HarnessAvailability
+from omnigent.harnesses.aliases import canonicalize_harness, is_claude_sdk_harness_name
+from omnigent.harnesses.availability import HARNESS_BINARY_MISSING, HarnessAvailability
+from omnigent.harnesses.runtime.paths import (
+    HARNESS_TMP_PARENT_ENV_VAR,
+    absolute_harness_tmp_parent,
+    resolve_harness_tmp_parent,
+)
 from omnigent.host import HOST_FATAL_EXIT_CODE
 from omnigent.host.daemon_lifecycle import DaemonLifecycleLock
 from omnigent.host.frames import (
@@ -119,7 +109,26 @@ from omnigent.host.git_worktree import (
 from omnigent.host.identity import HostIdentity, load_or_create_host_identity
 from omnigent.host.maintenance import HostMaintenanceJanitor
 from omnigent.host.runner_zygote import ZygoteManager, ZygoteRunnerProc, ZygoteUnavailable
-from omnigent.inner import _proc
+from omnigent.models.gateway_inference import gateway_inference_map
+from omnigent.observability.debug_logging import (
+    ORIGIN_WORKSPACE_ID_ENV_VAR,
+    PRIMARY_SESSION_ID_ENV_VAR,
+    USER_ID_ENV_VAR,
+    debug_event,
+    runner_log_scope,
+)
+from omnigent.observability.process_logging import (
+    LOG_TTY_FD_ENV_VAR,
+    PROCESS_LOG_FILE_ENV_VAR,
+    child_logging_popen_kwargs,
+    configure_process_logging,
+    display_log_path,
+    env_truthy,
+    open_process_log_file,
+    process_log_dir,
+    redact_log_text,
+    should_log_to_stderr,
+)
 from omnigent.onboarding.harness_auth import (
     adopt_env_credential,
     detect_adoptable_credentials,
@@ -136,20 +145,29 @@ from omnigent.onboarding.harness_readiness import (
     harness_is_configured,
 )
 from omnigent.onboarding.provider_config import ANTHROPIC_FAMILY, OPENAI_FAMILY
-from omnigent.process_logging import (
-    LOG_TTY_FD_ENV_VAR,
-    PROCESS_LOG_FILE_ENV_VAR,
-    child_logging_popen_kwargs,
-    configure_process_logging,
-    display_log_path,
-    env_truthy,
-    open_process_log_file,
-    process_log_dir,
-    redact_log_text,
-    should_log_to_stderr,
-)
 from omnigent.runner._zygote import ZYGOTE_ENABLED_ENV_VAR
-from omnigent.runner.identity import (
+from omnigent.runner.transports.ws_tunnel.frames import (
+    PingFrame,
+    PongFrame,
+    decode_frame,
+    encode_frame,
+)
+from omnigent.runtime.websocket_metrics import (
+    record_websocket_connected,
+    record_websocket_disconnected,
+    websocket_close_code,
+    websocket_close_reason,
+)
+from omnigent.util import proc as _proc
+from omnigent.util.cli_invocation import cli_invocation
+from omnigent.util.env_credentials import env_names_with_omnigent_prefix
+from omnigent.util.portability import (
+    IS_POSIX,
+    WINDOWS_ENV_PASSTHROUGH,
+    installed_interactive_shells,
+    normalize_interactive_shells,
+)
+from omnigent.util.runner_identity import (
     RUNNER_CONNECT_MARKER_ENV_VAR,
     RUNNER_DELEGATED_AUTH_ENV_VAR,
     RUNNER_HOST_OWNS_GLOBAL_CLEANUP_ENV_VAR,
@@ -163,24 +181,6 @@ from omnigent.runner.identity import (
     RUNNER_WORKSPACE_ENV_VAR,
     token_bound_runner_id,
 )
-from omnigent.runner.transports.ws_tunnel.frames import (
-    PingFrame,
-    PongFrame,
-    decode_frame,
-    encode_frame,
-)
-from omnigent.runtime.harnesses.paths import (
-    HARNESS_TMP_PARENT_ENV_VAR,
-    absolute_harness_tmp_parent,
-    resolve_harness_tmp_parent,
-)
-from omnigent.runtime.websocket_metrics import (
-    record_websocket_connected,
-    record_websocket_disconnected,
-    websocket_close_code,
-    websocket_close_reason,
-)
-from omnigent.util.env_credentials import env_names_with_omnigent_prefix
 from omnigent.util.suspend_watch import watch_for_resume
 from omnigent.util.tls import client_ssl_context
 from omnigent.util.tunnel_limits import (
@@ -190,7 +190,7 @@ from omnigent.util.tunnel_limits import (
 from omnigent.version import VERSION
 
 if TYPE_CHECKING:
-    from omnigent.workspace_fs import WorkspaceReader
+    from omnigent.host.workspace_fs import WorkspaceReader
 
 # Workspaces whose fs reader (and change registry) stay warm between requests.
 _FS_READER_CACHE_SIZE = 8
@@ -598,8 +598,8 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         # Safe to propagate: not a secret.
         "OMNIGENT_CLAUDE_SDK_NO_SANDBOX",
         # Native-Claude launcher plugin selector: the entry-point NAME of a
-        # launcher registered in the ``omnigent.claude_launcher`` group (e.g.
-        # ``isaac``). Read by omnigent.claude_launcher.resolve_claude_launch in
+        # launcher registered in the ``omnigent.harnesses.claude_native.launcher`` group (e.g.
+        # ``isaac``). Read by omnigent.harnesses.claude_native.launcher.resolve_claude_launch in
         # the managed-host runner (``_auto_create_claude_terminal``) to wrap the
         # Claude launch through a downstream binary (e.g. Databricks' isaac).
         # The daemon→runner env strip would otherwise drop it, leaving the
@@ -927,7 +927,7 @@ def _write_runner_inference_config(session_id: str, inference_config: dict[str, 
     import hashlib
     import tempfile
 
-    from omnigent.process_logging import data_dir
+    from omnigent.observability.process_logging import data_dir
 
     payload = json.dumps(inference_config, sort_keys=True, separators=(",", ":"))
     session_key = hashlib.sha256(session_id.encode()).hexdigest()
@@ -1600,7 +1600,7 @@ class HostProcess:
             # token loader yields nothing, the dial goes out
             # unauthenticated, and the server's refusal looks like an
             # authorization or version-skew problem. Name the real cause.
-            from omnigent.cli_auth import stored_token_status
+            from omnigent.cli.auth import stored_token_status
 
             if stored_token_status(self._server_url) == "expired":
                 login_url = self._login_hint_url()
@@ -1805,7 +1805,7 @@ class HostProcess:
         #
         # Off the loop: the check runs ``<cli> --version``, up to 10s on a hung
         # CLI, which inline would stall the keepalive pong and every other frame.
-        from omnigent.inference_config import binding_for_harness
+        from omnigent.models.inference_config import binding_for_harness
 
         has_binding = (
             frame.harness is not None
@@ -3048,7 +3048,7 @@ class HostProcess:
     def _handle_fs_request(self, frame: HostFsRequestFrame) -> HostFsResultFrame:
         """Serve a read-only workspace filesystem request from the host.
 
-        Runs :class:`omnigent.workspace_fs.WorkspaceReader` against the
+        Runs :class:`omnigent.host.workspace_fs.WorkspaceReader` against the
         session's workspace so the web UI's file and GitHub panels keep
         working when the runner is offline but the host still holds the
         workspace on disk. Read-only and confined to the workspace root; it
@@ -3062,8 +3062,8 @@ class HostProcess:
         """
         from pathlib import Path
 
+        from omnigent.host.workspace_fs import WorkspaceReader, WorkspaceReaderError
         from omnigent.runtime.filesystem_registry import detect_git_root
-        from omnigent.workspace_fs import WorkspaceReader, WorkspaceReaderError
 
         try:
             expanded = os.path.expanduser(frame.workspace)
@@ -4296,7 +4296,7 @@ class HostProcess:
         if self._owner_user_id is not None:
             return
         try:
-            from omnigent.resume_dispatch import _resolve_current_user_id
+            from omnigent.cli.resume import _resolve_current_user_id
 
             request_headers = headers
             if request_headers is None:
@@ -4333,7 +4333,7 @@ class HostProcess:
             minted — ``{"Authorization": "Bearer <token>"}``.
         """
         from omnigent.host.identity import HOST_TOKEN_ENV_VAR, MANAGED_HOST_TOKEN_HEADER
-        from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN
+        from omnigent.util.runner_identity import OMNIGENT_INTERNAL_WS_ORIGIN
 
         # Identify as a first-party client so the server's WebSocket origin
         # guard (CSWSH protection) allows the handshake — the host process
@@ -4343,7 +4343,7 @@ class HostProcess:
         # Workspace routing: the tunnel handshake must name the workspace or
         # it routes to the account. Empty for single-workspace and managed
         # hosts (no recorded selector), so neither is affected.
-        from omnigent.cli_auth import databricks_request_headers
+        from omnigent.cli.auth import databricks_request_headers
 
         # Pin this host's tunnel to its replica via the host_id; the builder
         # emits the routing header only on a host-sharded deployment.
@@ -4629,7 +4629,7 @@ class HostProcess:
         # context the server stamped into the frame envelope, so the
         # host's work (and the result frame it sends back) nests under
         # the server request that triggered it.
-        from omnigent.runtime import telemetry
+        from omnigent.observability import otel as telemetry
 
         try:
             carrier = json.loads(raw)
@@ -4767,12 +4767,12 @@ def _generate_ucode_configs() -> None:
     the runner never has to fall back to a synchronous on-demand ``ucode
     configure`` when opencode first launches — the slow path for opencode startup.
     """
+    from omnigent.harnesses.databricks.executor import _read_databrickscfg_host
     from omnigent.host.databricks_credential import (
         HOST_DATABRICKS_PROFILE,
         broker_token_command,
     )
-    from omnigent.inference_config import binding_for_harness
-    from omnigent.inner.databricks_executor import _read_databrickscfg_host
+    from omnigent.models.inference_config import binding_for_harness
     from omnigent.onboarding.provider_config import load_config
     from omnigent.onboarding.ucode_setup import configure_ucode_for_sandbox
 
@@ -4860,7 +4860,7 @@ def run_host_process(
     # (e.g. handling launch_runner / stat / list_dir frames) into the
     # same distributed trace as the server that requested them. The
     # daemon inherits OTEL_*/MLFLOW_* config from the launching CLI.
-    from omnigent.runtime import telemetry
+    from omnigent.observability import otel as telemetry
 
     telemetry.init("omni-host")
 
@@ -4892,7 +4892,7 @@ def run_host_process(
     # own diagnostics go to the host destination.
     print(f"Session logs: {display_log_path(_runner_log_dir())}/")
     print(f"This host's log: {display_log_path(host_log_path)}")
-    from omnigent.cli_diagnostics import current_cli_log_path
+    from omnigent.cli.diagnostics import current_cli_log_path
 
     _cli_log = current_cli_log_path()
     if _cli_log is not None and _cli_log != host_log_path:

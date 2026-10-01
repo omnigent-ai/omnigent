@@ -25,7 +25,7 @@ class BenchProfile:
     """Self-declared bench metadata for one harness.
 
     :param harness: Harness name as registered in
-        ``omnigent.runtime.harnesses._HARNESS_MODULES`` (or resolvable by
+        ``omnigent.harnesses.runtime._HARNESS_MODULES`` (or resolvable by
         :func:`resolve_profile` for a community harness), e.g.
         ``"claude-sdk"``.
     :param model: A real model id the harness can route this run, threaded

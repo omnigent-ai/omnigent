@@ -20,8 +20,8 @@ from unittest.mock import patch
 
 import pytest
 
-from omnigent.inner import pi_harness
-from omnigent.runtime.harnesses import _HARNESS_MODULES
+from omnigent.harnesses.pi import harness as pi_harness
+from omnigent.harnesses.runtime import _HARNESS_MODULES
 
 
 def test_harness_module_registered_in_module_registry() -> None:
@@ -30,7 +30,7 @@ def test_harness_module_registered_in_module_registry() -> None:
     Without this entry, the runner subprocess can't find the wrap
     when AP-side tries to spawn it for a ``harness: pi`` spec.
     """
-    assert _HARNESS_MODULES.get("pi") == "omnigent.inner.pi_harness"
+    assert _HARNESS_MODULES.get("pi") == "omnigent.harnesses.pi.harness"
 
 
 def test_create_app_returns_fastapi_with_required_routes() -> None:
@@ -61,7 +61,7 @@ def test_executor_factory_reads_context_files(
         monkeypatch.delenv("HARNESS_PI_CONTEXT_FILES", raising=False)
     else:
         monkeypatch.setenv("HARNESS_PI_CONTEXT_FILES", value)
-    with patch("omnigent.inner.pi_harness.PiExecutor") as executor:
+    with patch("omnigent.harnesses.pi.harness.PiExecutor") as executor:
         pi_harness._build_pi_executor()
     assert executor.call_args.kwargs["context_files"] is (value != "false")
 
@@ -74,7 +74,7 @@ def test_executor_factory_reads_system_prompt_mode(
         monkeypatch.delenv("HARNESS_PI_SYSTEM_PROMPT_MODE", raising=False)
     else:
         monkeypatch.setenv("HARNESS_PI_SYSTEM_PROMPT_MODE", mode)
-    with patch("omnigent.inner.pi_harness.PiExecutor") as executor:
+    with patch("omnigent.harnesses.pi.harness.PiExecutor") as executor:
         pi_harness._build_pi_executor()
     assert executor.call_args.kwargs["system_prompt_mode"] == (mode or "append")
 
@@ -142,7 +142,7 @@ def test_executor_factory_reads_env_vars(
         captured["gateway_auth_command"] = gateway_auth_command
 
     with patch(
-        "omnigent.inner.pi_harness.PiExecutor.__init__",
+        "omnigent.harnesses.pi.harness.PiExecutor.__init__",
         _fake_init,
     ):
         pi_harness._build_pi_executor()
@@ -208,7 +208,7 @@ def test_executor_factory_decodes_os_env_json(
         captured["os_env"] = kwargs["os_env"]
 
     with patch(
-        "omnigent.inner.pi_harness.PiExecutor.__init__",
+        "omnigent.harnesses.pi.harness.PiExecutor.__init__",
         _fake_init,
     ):
         pi_harness._build_pi_executor()
@@ -239,7 +239,7 @@ def test_executor_factory_falls_back_on_malformed_os_env_json(
         captured["os_env"] = kwargs["os_env"]
 
     with patch(
-        "omnigent.inner.pi_harness.PiExecutor.__init__",
+        "omnigent.harnesses.pi.harness.PiExecutor.__init__",
         _fake_init,
     ):
         pi_harness._build_pi_executor()
@@ -281,7 +281,7 @@ def test_databricks_env_var_truthy_parsing(
         captured.update(kwargs)
 
     with patch(
-        "omnigent.inner.pi_harness.PiExecutor.__init__",
+        "omnigent.harnesses.pi.harness.PiExecutor.__init__",
         _fake_init,
     ):
         pi_harness._build_pi_executor()
@@ -319,7 +319,7 @@ def test_skills_filter_env_var_decodes(
         captured.update(kwargs)
 
     with patch(
-        "omnigent.inner.pi_harness.PiExecutor.__init__",
+        "omnigent.harnesses.pi.harness.PiExecutor.__init__",
         _fake_init,
     ):
         pi_harness._build_pi_executor()
@@ -338,7 +338,7 @@ def test_skills_filter_env_var_missing_falls_back_to_all(
         captured.update(kwargs)
 
     with patch(
-        "omnigent.inner.pi_harness.PiExecutor.__init__",
+        "omnigent.harnesses.pi.harness.PiExecutor.__init__",
         _fake_init,
     ):
         pi_harness._build_pi_executor()
@@ -366,7 +366,7 @@ def test_bundle_dir_and_agent_name_env_vars_thread_through(
         captured.update(kwargs)
 
     with patch(
-        "omnigent.inner.pi_harness.PiExecutor.__init__",
+        "omnigent.harnesses.pi.harness.PiExecutor.__init__",
         _fake_init,
     ):
         pi_harness._build_pi_executor()
@@ -388,7 +388,7 @@ def test_bundle_dir_unset_passes_none(
         captured.update(kwargs)
 
     with patch(
-        "omnigent.inner.pi_harness.PiExecutor.__init__",
+        "omnigent.harnesses.pi.harness.PiExecutor.__init__",
         _fake_init,
     ):
         pi_harness._build_pi_executor()

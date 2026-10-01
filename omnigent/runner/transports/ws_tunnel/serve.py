@@ -34,14 +34,7 @@ from websockets.exceptions import (
     WebSocketException,
 )
 
-from omnigent.cli_invocation import cli_invocation
-from omnigent.debug_logging import debug_event, runner_primary_session_id
-from omnigent.runner.identity import (
-    OMNIGENT_INTERNAL_WS_ORIGIN,
-    RUNNER_SLICE_KEY_ENV_VAR,
-    RUNNER_TUNNEL_TOKEN_HEADER,
-    touch_connect_marker,
-)
+from omnigent.observability.debug_logging import debug_event, runner_primary_session_id
 from omnigent.runner.transports.ws_tunnel.event_delivery import RunnerEventDispatcher
 from omnigent.runner.transports.ws_tunnel.frames import (
     EVENT_INGEST_CAPABILITY,
@@ -70,6 +63,13 @@ from omnigent.runtime.websocket_metrics import (
     websocket_close_code,
     websocket_close_reason,
 )
+from omnigent.util.cli_invocation import cli_invocation
+from omnigent.util.runner_identity import (
+    OMNIGENT_INTERNAL_WS_ORIGIN,
+    RUNNER_SLICE_KEY_ENV_VAR,
+    RUNNER_TUNNEL_TOKEN_HEADER,
+    touch_connect_marker,
+)
 from omnigent.util.suspend_watch import watch_for_resume
 from omnigent.util.tls import client_ssl_context
 from omnigent.util.tunnel_limits import (
@@ -88,7 +88,7 @@ _ASGIApp: TypeAlias = ASGIApp
 # WS-accept spike.
 #
 # The cap is tuned against the parent CLI's runner-startup budget
-# (``omnigent.chat._wait_for_remote_runner``, currently 60 s).
+# (``omnigent.cli.chat._wait_for_remote_runner``, currently 60 s).
 # An older 30 s cap meant a single bad attempt could eat half the
 # budget before the next reconnect even tried, so transient
 # disconnects during startup looked like total failure to the
@@ -907,7 +907,7 @@ async def _serve_tunnel_once(
     # Pair the bearer with the workspace-routing header: the handshake must
     # name the workspace or it routes to the account. Both empty for
     # single-workspace hosts / local unauthenticated runs.
-    from omnigent.cli_auth import databricks_request_headers
+    from omnigent.cli.auth import databricks_request_headers
 
     headers: dict[str, str] = {"Origin": OMNIGENT_INTERNAL_WS_ORIGIN}
     # Co-locate this runner's tunnel with its host's on one server replica: the
@@ -1211,7 +1211,7 @@ async def _send_hello(
     except Exception:  # noqa: BLE001 — telemetry errors must not abort hello
         pass
 
-    from omnigent.inner.native_attachments import CAP_FILESYSTEM_ATTACHMENTS
+    from omnigent.util.attachments import CAP_FILESYSTEM_ATTACHMENTS
 
     await send_text(
         encode_frame(

@@ -35,8 +35,8 @@ import pytest
 from fastapi import HTTPException
 from starlette.requests import Request
 
-from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN
 from omnigent.server.routes._origin import require_trusted_origin
+from omnigent.util.runner_identity import OMNIGENT_INTERNAL_WS_ORIGIN
 
 _LOCAL_ENV = "OMNIGENT_LOCAL_SINGLE_USER"
 _ALLOWLIST_ENV = "OMNIGENT_WS_ALLOWED_ORIGINS"

@@ -27,8 +27,8 @@ by an ``OSEnvSpec`` (Phase 2 step 9 / 12 / 11 candidates).
 
 from __future__ import annotations
 
-from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
-from omnigent.inner.os_env import (
+from omnigent.core.datamodel import OSEnvSandboxSpec, OSEnvSpec
+from omnigent.environments.os_env import (
     CallerProcessOSEnvironment,
     OSEnvironment,
     create_os_environment,

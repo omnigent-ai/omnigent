@@ -105,7 +105,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from omnigent.db.workspace_cache import WorkspaceScopedCache
-from omnigent.inner.native_attachments import ATTACHMENT_MARKER_STRIP_PATTERN
+from omnigent.util.attachments import ATTACHMENT_MARKER_STRIP_PATTERN
 
 # A pending entry is evicted this many seconds after it was recorded
 # if it was never drained by a matching persisted message. Covers the

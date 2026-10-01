@@ -39,7 +39,7 @@ from typing import TYPE_CHECKING, Protocol
 import httpx
 from fastapi.responses import JSONResponse, Response
 
-from omnigent.native.native_coding_agents import native_coding_agent_for_harness
+from omnigent.harnesses.native.coding_agents import native_coding_agent_for_harness
 from omnigent.runner.native.orchestration import (
     _cancel_auto_forwarder_task,
     _claude_native_bridge_id_for_session,
@@ -51,8 +51,8 @@ from omnigent.runner.resource_registry import (
 )
 
 if TYPE_CHECKING:
-    from omnigent.harness_plugins import NativeCodingAgent
     from omnigent.harnesses.codex_native.bridge import CodexNativeBridgeState
+    from omnigent.harnesses.registry import NativeCodingAgent
 
 
 class SubagentDeliveryAck(Protocol):
@@ -279,10 +279,10 @@ def native_agent_for_cancel(wrapper_label: str | None) -> NativeCodingAgent | No
 
     :param wrapper_label: ``omnigent.wrapper`` value, e.g. ``"goose-native-ui"``
         or ``"claude-code-native-ui-subagent"``.
-    :returns: The matching :class:`~omnigent.harness_plugins.NativeCodingAgent`,
+    :returns: The matching :class:`~omnigent.harnesses.registry.NativeCodingAgent`,
         or ``None`` when the label is missing or not native.
     """
-    from omnigent.native.native_coding_agents import (
+    from omnigent.harnesses.native.coding_agents import (
         NATIVE_CODING_AGENTS,
         native_coding_agent_for_wrapper_label,
     )

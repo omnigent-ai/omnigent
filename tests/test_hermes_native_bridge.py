@@ -340,7 +340,7 @@ def test_write_policy_hook_config_wrapper_execs_existing_hook(tmp_path) -> None:
 
     hook = _wrapper_hook_path(hermes_home / "omnigent-policy-hook.sh")
     assert hook.is_file(), f"wrapper execs a non-existent hook: {hook}"
-    from omnigent.inner import hermes_policy_hook
+    from omnigent.harnesses.hermes import policy_hook as hermes_policy_hook
 
     assert hook == Path(hermes_policy_hook.__file__).resolve()
 

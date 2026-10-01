@@ -1,4 +1,4 @@
-"""Tests for the generic sub-agent seam (:mod:`omnigent.inner.acp_subagents`).
+"""Tests for the generic sub-agent seam (:mod:`omnigent.harnesses.acp.subagents`).
 
 Vendor-free by design: this module must name no agent, so the fixtures here use
 invented dialects. Devin's real-frame coverage lives in
@@ -10,7 +10,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from typing import Any
 
-from omnigent.inner.acp_subagents import (
+from omnigent.harnesses.acp.subagents import (
     AcpSubAgentSource,
     SubAgentEnd,
     SubAgentEvent,

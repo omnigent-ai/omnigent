@@ -68,7 +68,7 @@ def _register_parent_with_writer(
     runner_id: str,
 ) -> str:
     """Register the orchestrator + writer sub-agent and bind a session to the runner."""
-    from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN
+    from omnigent.util.runner_identity import OMNIGENT_INTERNAL_WS_ORIGIN
     from tests.e2e.conftest import lookup_agent_id, register_inline_agent
 
     with httpx.Client(base_url=base_url, timeout=30.0) as client:

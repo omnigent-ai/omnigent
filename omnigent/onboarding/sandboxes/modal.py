@@ -34,7 +34,6 @@ from typing import TYPE_CHECKING, ClassVar
 
 import click
 
-from omnigent.cli_invocation import cli_invocation
 from omnigent.onboarding.sandboxes.base import (
     DEFAULT_HOST_IMAGE,
     RemoteCommandResult,
@@ -46,6 +45,7 @@ from omnigent.onboarding.sandboxes.base import (
     host_image_wheel_install_command,
 )
 from omnigent.onboarding.sandboxes.types import SandboxCapabilities
+from omnigent.util.cli_invocation import cli_invocation
 
 if TYPE_CHECKING:
     from collections.abc import Iterator

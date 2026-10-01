@@ -48,8 +48,8 @@ from pathlib import Path
 
 import httpx
 
-from omnigent.inner.native_attachments import ATTACHMENT_MARKER_STRIP_PATTERN
-from omnigent.native._native_post_delivery import post_external_session_status
+from omnigent.harnesses.native.post_delivery import post_external_session_status
+from omnigent.util.attachments import ATTACHMENT_MARKER_STRIP_PATTERN
 
 _logger = logging.getLogger(__name__)
 
@@ -648,7 +648,7 @@ async def forward_goose_store_to_session(
     # supervisor) if the replay's idle post hits a transient server error.
     needs_replay = goose_session_id is not None and last_id > 0
 
-    from omnigent.cli_auth import open_server_client
+    from omnigent.cli.auth import open_server_client
 
     async with open_server_client(base_url, headers=headers, auth=auth, timeout=timeout) as client:
         while True:

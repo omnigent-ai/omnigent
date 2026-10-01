@@ -11,8 +11,7 @@ import pytest
 
 from omnigent.entities.session_resources import terminal_resource_id
 from omnigent.harnesses.claude_native import bridge as claude_native_bridge
-from omnigent.inner.terminal import TerminalInstance
-from omnigent.native import native_cost_popup
+from omnigent.harnesses.native import cost_popup as native_cost_popup
 from omnigent.runner.app import create_runner_app
 from omnigent.runner.resource_registry import SessionResourceRegistry
 from omnigent.terminals.pane_reaper import (
@@ -24,6 +23,7 @@ from omnigent.terminals.pane_reaper import (
     resolve_native_pane_idle_timeout_s,
 )
 from omnigent.terminals.registry import TerminalRegistry
+from omnigent.terminals.terminal import TerminalInstance
 from tests.runner.helpers import NullServerClient
 
 

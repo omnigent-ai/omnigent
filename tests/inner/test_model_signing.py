@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import pytest
 
-from omnigent.inner.model_egress import FrozenModelRoute
-from omnigent.inner.model_signing import SigningRejected, reconstruct_signed_request
+from omnigent.models.signer.egress import FrozenModelRoute
+from omnigent.models.signer.signing import SigningRejected, reconstruct_signed_request
 
 _HOST = "workspace.cloud.databricks.com"
 _PATH = "/serving-endpoints/openai/responses"

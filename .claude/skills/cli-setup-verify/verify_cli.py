@@ -6,7 +6,7 @@ This is the reusable engine behind the ``cli-setup-verify`` skill (see
 
 1. Builds an **isolated config/data sandbox** so nothing the CLI writes ever
    lands in the real ``~/.omnigent`` — it sets the purpose-built
-   ``OMNIGENT_CONFIG_HOME`` / ``OMNIGENT_DATA_DIR`` knobs (``omnigent/cli.py``
+   ``OMNIGENT_CONFIG_HOME`` / ``OMNIGENT_DATA_DIR`` knobs (``omnigent/cli/commands.py``
    ``_CONFIG_HOME_ENV_VAR`` / ``_DATA_DIR_ENV_VAR``), strips leaked model
    credentials from the child env, and (optionally) points ``HOME`` and a
    minimal ``PATH`` at the sandbox to simulate a brand-new machine.
@@ -63,7 +63,7 @@ DEFAULT_ROWS = 24
 
 ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[a-zA-Z]")
 
-# Stable onboarding anchors (omnigent/cli.py:520, :10064, :10300).
+# Stable onboarding anchors (omnigent/cli/commands.py:520, :10064, :10300).
 ANCHOR_SEARCHING = "Searching for existing credentials"
 ANCHOR_CONFIGURE = "Configure harnesses"
 ANCHOR_NO_HARNESS = "Found no harnesses configured"

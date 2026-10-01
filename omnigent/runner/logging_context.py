@@ -2,7 +2,7 @@
 
 from starlette.types import ASGIApp, Receive, Scope, Send
 
-from omnigent.debug_logging import current_session_id_scope
+from omnigent.observability.debug_logging import current_session_id_scope
 
 
 class RunnerLogContextMiddleware:

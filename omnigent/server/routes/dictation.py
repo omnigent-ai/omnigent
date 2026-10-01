@@ -64,7 +64,7 @@ import anyio
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect, WebSocketException
 from starlette import status
 
-from omnigent.debug_logging import debug_event
+from omnigent.observability.debug_logging import debug_event
 from omnigent.server.auth import AuthProvider
 from omnigent.server.dictation import (
     DictationEngine,

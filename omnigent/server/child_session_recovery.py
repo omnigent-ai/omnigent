@@ -10,7 +10,7 @@ import httpx
 
 from omnigent.db.workspace_cache import WorkspaceScopedCache
 from omnigent.entities import Conversation
-from omnigent.harness_plugins import native_agents
+from omnigent.harnesses.registry import native_agents
 from omnigent.server.runner_session_init import RunnerSessionInitializer
 from omnigent.stores.conversation_store import ConversationNotFoundError, ConversationStore
 from omnigent.util.session_lifecycle import is_session_closed
@@ -53,7 +53,7 @@ def schedule_child_restoration(
 
 def is_parent_owned_subagent(conv: Conversation) -> bool:
     """Native mirrors belong to their parent's runtime, not a separate terminal."""
-    from omnigent.server.routes._sessions.common import (
+    from omnigent.server.routes.sessions.common import (
         _ACP_SUBAGENT_ID_LABEL_KEY,
         _ANTIGRAVITY_NATIVE_SUBAGENT_WRAPPER_LABEL_VALUE,
         _CLAUDE_NATIVE_WRAPPER_LABEL_KEY,
@@ -71,7 +71,7 @@ def is_parent_owned_subagent(conv: Conversation) -> bool:
 
 
 def _restorable(conv: Conversation) -> bool:
-    from omnigent.server.routes._sessions.common import (
+    from omnigent.server.routes.sessions.common import (
         _intentional_stop_sessions,
         _interrupt_fenced_sessions,
     )
@@ -86,8 +86,8 @@ def _restorable(conv: Conversation) -> bool:
 
 
 def _interrupted(conv: Conversation) -> bool:
-    from omnigent.server.routes._sessions.common import _session_status_cache
-    from omnigent.server.routes._sessions.helpers import _last_task_error_from_labels
+    from omnigent.server.routes.sessions.common import _session_status_cache
+    from omnigent.server.routes.sessions.helpers import _last_task_error_from_labels
 
     status = _session_status_cache.get(conv.id, conv.live_status)
     error = _last_task_error_from_labels(conv.labels)

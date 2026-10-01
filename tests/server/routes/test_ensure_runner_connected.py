@@ -17,7 +17,7 @@ import pytest
 from omnigent.entities.conversation import Conversation
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.host.frames import WORKSPACE_MISSING_ERROR_CODE as _WORKSPACE_MISSING_ERROR_CODE
-from omnigent.server.routes._sessions import orchestration
+from omnigent.server.routes.sessions import orchestration
 
 
 def _conv(**kwargs: Any) -> Conversation:

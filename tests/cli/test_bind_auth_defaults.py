@@ -16,7 +16,7 @@ import os
 
 import pytest
 
-from omnigent.cli import _apply_bind_auth_defaults
+from omnigent.cli.commands import _apply_bind_auth_defaults
 
 # The env vars the helper reads / writes. Cleared per-test so no
 # cross-test leakage.

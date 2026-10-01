@@ -10,7 +10,7 @@ from fastapi import APIRouter, HTTPException, Request
 
 from omnigent.entities import Conversation
 from omnigent.errors import ErrorCode, OmnigentError
-from omnigent.inference_config import (
+from omnigent.models.inference_config import (
     binding_for_harness,
     normalize_inference_harness,
     parse_inference_config,

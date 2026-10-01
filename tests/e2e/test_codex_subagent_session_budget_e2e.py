@@ -29,7 +29,7 @@ import httpx
 import pytest
 import yaml
 
-from omnigent.runner.identity import token_bound_runner_id
+from omnigent.util.runner_identity import token_bound_runner_id
 from tests.e2e.conftest import (
     configure_mock_llm,
     create_runner_bound_session,
@@ -124,7 +124,7 @@ def codex_budget_rig(
                     [
                         sys.executable,
                         "-m",
-                        "omnigent.cli",
+                        "omnigent.cli.commands",
                         "server",
                         "--host",
                         "127.0.0.1",

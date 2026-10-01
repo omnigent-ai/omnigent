@@ -5,18 +5,18 @@ from __future__ import annotations
 import httpx
 import pytest
 
-from omnigent.chat import (
+from omnigent.cli.auth import OMNIGENT_SLICE_KEY_HEADER
+from omnigent.cli.chat import (
     _DatabricksTokenAuth,
     get_session_host,
     set_session_host,
 )
-from omnigent.cli_auth import OMNIGENT_SLICE_KEY_HEADER
 
 
 @pytest.fixture(autouse=True)
 def _clear_map() -> None:
     """Reset the module-global session→host map between tests."""
-    from omnigent import chat
+    from omnigent.cli import chat
 
     chat._session_hosts.clear()
     yield

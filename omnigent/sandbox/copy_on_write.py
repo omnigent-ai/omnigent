@@ -14,11 +14,11 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
-from omnigent.inner._proc import kill_tree
+from omnigent.util.proc import kill_tree
 
 if TYPE_CHECKING:
-    from omnigent.inner.datamodel import OSEnvSpec
-    from omnigent.inner.sandbox import SandboxPolicy
+    from omnigent.core.datamodel import OSEnvSpec
+    from omnigent.sandbox.core import SandboxPolicy
 
 
 SHARED_ENVIRONMENT_VAR = "OMNIGENT_COPY_ON_WRITE_ENVIRONMENT"
@@ -32,7 +32,7 @@ def has_copy_on_write(spec: OSEnvSpec | None) -> bool:
 
 def validate_copy_on_write_harness(spec: OSEnvSpec | None, harness: str | None) -> None:
     """Reject harnesses whose native tools do not share the environment."""
-    from omnigent.harness_aliases import canonicalize_harness
+    from omnigent.harnesses.aliases import canonicalize_harness
 
     if has_copy_on_write(spec) and canonicalize_harness(harness) != "openai-agents":
         raise ValueError(

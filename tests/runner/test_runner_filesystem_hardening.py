@@ -15,10 +15,10 @@ from types import SimpleNamespace
 
 import pytest
 
-from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
-from omnigent.inner.os_env import _assert_within_cwd, _handle_helper_request
-from omnigent.inner.sandbox import SandboxPolicy
+from omnigent.core.datamodel import OSEnvSandboxSpec, OSEnvSpec
+from omnigent.environments.os_env import _assert_within_cwd, _handle_helper_request
 from omnigent.runner.resource_registry import SessionResourceRegistry
+from omnigent.sandbox.core import SandboxPolicy
 
 # ---------------------------------------------------------------------------
 # Helpers

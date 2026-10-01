@@ -1,5 +1,5 @@
 """
-Unit tests for the ``omnigent.runtime.telemetry`` helpers.
+Unit tests for the ``omnigent.observability.otel`` helpers.
 
 Exercises pure helpers (no spans created) and the trace-context
 wrapper with an in-memory OTel exporter so the tests stay fast
@@ -24,7 +24,7 @@ from opentelemetry.trace import (
     StatusCode,
 )
 
-from omnigent.runtime import telemetry
+from omnigent.observability import otel as telemetry
 
 _RESP_HEX = "d8e9f0a1b2c3d4e5f6a7b8c9d0e1f2a3"
 _RESP_ID = f"resp_{_RESP_HEX}"
@@ -61,7 +61,7 @@ def _opt_in_telemetry(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
         # init()/enable_tracing() in a telemetry test flips global tracing on
         # and never resets it; clear it so it can't leak "tracing on" into
         # other suites (e.g. the executor-adapter tests).
-        from omnigent.inner.tracing import disable_tracing
+        from omnigent.observability.tracing import disable_tracing
 
         disable_tracing()
         telemetry._initialized = False
@@ -811,7 +811,7 @@ def test_tracing_context_stamps_session_id_on_agent_span(
 
     :param in_memory_exporter: In-memory span exporter fixture.
     """
-    from omnigent.inner.tracing import TracingContext
+    from omnigent.observability.tracing import TracingContext
 
     tctx = TracingContext(session_id="d1f9214d74c38b9f9a9db17ed8352dc4")
     agent_span = tctx.start_agent_span("my-agent", "hello")

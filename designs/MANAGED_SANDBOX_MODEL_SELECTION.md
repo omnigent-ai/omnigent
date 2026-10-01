@@ -231,7 +231,7 @@ policy. Model reset chooses the saved default. Rejected native model changes
 restore the previous stored selection. Native adapters retain their actual
 harness identity and translate only their own framework provider prefixes.
 
-The shared code is in `omnigent/inference_config.py`; server discovery and
+The shared code is in `omnigent/models/inference_config.py`; server discovery and
 materialization are in `omnigent/server/inference_catalog.py`. The route boundary
 is `omnigent/server/routes/sandbox_inference.py`.
 

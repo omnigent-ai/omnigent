@@ -1,6 +1,6 @@
 ---
 name: cli-setup-verify
-description: Verify the Omnigent CLI's setup/onboarding flow, terminal UI/UX, and critical user journeys in a completely isolated, reproducible loop. Drives the real `omnigent` binary through a PTY (pexpect) inside a throwaway OMNIGENT_CONFIG_HOME / OMNIGENT_DATA_DIR sandbox that never touches the user's real ~/.omnigent, captures ANSI-stripped frames for UX inspection, and proves a change is verifiable via a before→fix→after baseline diff. Load when developing or reviewing a CLI setup/onboarding/REPL/picker change (omnigent/cli.py, omnigent/onboarding/*, omnigent/repl/*, scripts/install_oss.sh), reproducing a cold-start/first-run UX bug, or confirming a fix actually lands. Several agents can run it concurrently on separate worktrees.
+description: Verify the Omnigent CLI's setup/onboarding flow, terminal UI/UX, and critical user journeys in a completely isolated, reproducible loop. Drives the real `omnigent` binary through a PTY (pexpect) inside a throwaway OMNIGENT_CONFIG_HOME / OMNIGENT_DATA_DIR sandbox that never touches the user's real ~/.omnigent, captures ANSI-stripped frames for UX inspection, and proves a change is verifiable via a before→fix→after baseline diff. Load when developing or reviewing a CLI setup/onboarding/REPL/picker change (omnigent/cli/commands.py, omnigent/onboarding/*, omnigent/repl/*, scripts/install_oss.sh), reproducing a cold-start/first-run UX bug, or confirming a fix actually lands. Several agents can run it concurrently on separate worktrees.
 ---
 
 # Verifying the Omnigent CLI setup & UX in a closed loop
@@ -30,7 +30,7 @@ The real `~/.omnigent` here can be **many GB** (chat DB, runner logs, native
 harness state). The sandbox isolates every write three ways:
 
 - **`HOME` is redirected into the sandbox by default.** This is the load-bearing
-  one. `OMNIGENT_CONFIG_HOME` / `OMNIGENT_DATA_DIR` (`omnigent/cli.py`
+  one. `OMNIGENT_CONFIG_HOME` / `OMNIGENT_DATA_DIR` (`omnigent/cli/commands.py`
   `_CONFIG_HOME_ENV_VAR` / `_DATA_DIR_ENV_VAR`) redirect config + data — but the
   CLI's **diagnostics logger ignores them**: it writes a per-invocation
   `cli-*.log` under `state_dir()`, hardcoded to `Path.home()/.omnigent/logs`
@@ -201,10 +201,10 @@ fix is provable as a single check flip.
 
 ## Code under test
 
-- First-run dispatch / no-arg routing: `omnigent/cli.py` (`run`, the first-run
+- First-run dispatch / no-arg routing: `omnigent/cli/commands.py` (`run`, the first-run
   plan, `_run_configure_harnesses_interactive`).
 - Onboarding: `omnigent/onboarding/*` (`setup.py`, `interactive.py`,
   `configure_models.py`, `provider_selection.py`, `detected.py`).
 - TUI / REPL & pickers: `omnigent/repl/*` (`_repl.py`, `_theme_picker.py`,
-  `_resume_picker.py`), `omnigent/_terminal_picker_theme.py`.
+  `_resume_picker.py`), `omnigent/cli/picker_theme.py`.
 - Installer: `scripts/install_oss.sh`.

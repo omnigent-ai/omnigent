@@ -6,8 +6,8 @@ from pathlib import Path
 
 import pytest
 
-from omnigent.inner import hermes_native_executor as hne
-from omnigent.inner.executor import ExecutorError, TurnComplete
+from omnigent.core.executor import ExecutorError, TurnComplete
+from omnigent.harnesses.hermes_native import executor as hne
 
 
 def test_supports_flags(tmp_path: Path) -> None:

@@ -199,13 +199,13 @@ def _create_codex_native_session(base_url: str) -> str:
     import tarfile
     import tempfile
 
-    from omnigent._wrapper_labels import (
+    from omnigent.harnesses.codex_native.main import _materialize_codex_agent_spec
+    from omnigent.harnesses.wrapper_labels import (
         CODEX_NATIVE_WRAPPER_VALUE,
         UI_MODE_LABEL_KEY,
         UI_MODE_TERMINAL_VALUE,
         WRAPPER_LABEL_KEY,
     )
-    from omnigent.harnesses.codex_native.main import _materialize_codex_agent_spec
 
     with tempfile.TemporaryDirectory() as tmp:
         yaml_text = _materialize_codex_agent_spec(Path(tmp), model=None).read_text()
@@ -263,7 +263,7 @@ def test_codex_native_launch_recovers_from_transient_config_fetch_timeout(
     runner_log_file = tmp_path / "runner-process.log"
 
     binding_token = secrets.token_urlsafe(32)
-    from omnigent.runner.identity import token_bound_runner_id
+    from omnigent.util.runner_identity import token_bound_runner_id
 
     runner_id = token_bound_runner_id(binding_token)
 
@@ -280,7 +280,7 @@ def test_codex_native_launch_recovers_from_transient_config_fetch_timeout(
             [
                 sys.executable,
                 "-m",
-                "omnigent.cli",
+                "omnigent.cli.commands",
                 "server",
                 "--host",
                 "127.0.0.1",

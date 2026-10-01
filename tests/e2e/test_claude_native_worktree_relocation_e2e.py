@@ -102,13 +102,13 @@ def _create_claude_native_session(base_url: str) -> str:
     :param base_url: Spawned server base URL.
     :returns: The new session/conversation id.
     """
-    from omnigent._wrapper_labels import (
+    from omnigent.harnesses.claude_native.main import _materialize_claude_agent_spec
+    from omnigent.harnesses.wrapper_labels import (
         CLAUDE_NATIVE_WRAPPER_VALUE,
         UI_MODE_LABEL_KEY,
         UI_MODE_TERMINAL_VALUE,
         WRAPPER_LABEL_KEY,
     )
-    from omnigent.harnesses.claude_native.main import _materialize_claude_agent_spec
 
     with tempfile.TemporaryDirectory() as tmp:
         yaml_text = _materialize_claude_agent_spec(Path(tmp)).read_text()

@@ -1,4 +1,4 @@
-"""Unit tests for CLI OIDC token storage (omnigent/cli_auth.py).
+"""Unit tests for CLI OIDC token storage (omnigent/cli/auth.py).
 
 Tests the store/load/clear lifecycle for session tokens persisted
 by ``omnigent login``.
@@ -27,7 +27,7 @@ def token_dir(tmp_path, monkeypatch):
     :returns: The temp directory path.
     """
     monkeypatch.setattr(
-        "omnigent.cli_auth._token_file_path",
+        "omnigent.cli.auth._token_file_path",
         lambda: tmp_path / "auth_tokens.json",
     )
     return tmp_path
@@ -39,7 +39,7 @@ def test_store_and_load_token(token_dir) -> None:
     This is the happy path: ``omnigent login`` stores a token,
     ``omnigent run --server`` loads it.
     """
-    from omnigent.cli_auth import load_token, store_token
+    from omnigent.cli.auth import load_token, store_token
 
     store_token(
         server_url="http://localhost:8000",
@@ -59,7 +59,7 @@ def test_load_returns_none_when_no_file(token_dir) -> None:
     The first time a user runs ``omnigent run --server`` without
     having run ``omnigent login``, there should be no crash.
     """
-    from omnigent.cli_auth import load_token
+    from omnigent.cli.auth import load_token
 
     assert load_token("http://localhost:8000") is None
 
@@ -69,7 +69,7 @@ def test_load_returns_none_for_unknown_server(token_dir) -> None:
 
     A token stored for one server must not leak to another.
     """
-    from omnigent.cli_auth import load_token, store_token
+    from omnigent.cli.auth import load_token, store_token
 
     store_token(
         server_url="http://localhost:8000",
@@ -87,7 +87,7 @@ def test_load_returns_none_for_expired_token(token_dir) -> None:
     Expired tokens must not be used — the user needs to re-run
     ``omnigent login``.
     """
-    from omnigent.cli_auth import load_token, store_token
+    from omnigent.cli.auth import load_token, store_token
 
     store_token(
         server_url="http://localhost:8000",
@@ -104,7 +104,7 @@ def test_clear_token(token_dir) -> None:
 
     After clearing, load_token must return None.
     """
-    from omnigent.cli_auth import clear_token, load_token, store_token
+    from omnigent.cli.auth import clear_token, load_token, store_token
 
     store_token(
         server_url="http://localhost:8000",
@@ -123,7 +123,7 @@ def test_trailing_slash_normalization(token_dir) -> None:
     ``http://localhost:8000/`` and ``http://localhost:8000`` must
     resolve to the same stored token.
     """
-    from omnigent.cli_auth import load_token, store_token
+    from omnigent.cli.auth import load_token, store_token
 
     store_token(
         server_url="http://localhost:8000/",
@@ -142,7 +142,7 @@ def test_file_permissions(token_dir) -> None:
     Tokens are sensitive — they must not be world-readable.
     """
 
-    from omnigent.cli_auth import store_token
+    from omnigent.cli.auth import store_token
 
     store_token(
         server_url="http://localhost:8000",
@@ -166,7 +166,7 @@ def test_store_overwrites_existing(token_dir) -> None:
     Re-running ``omnigent login`` should update the token, not
     append.
     """
-    from omnigent.cli_auth import load_token, store_token
+    from omnigent.cli.auth import load_token, store_token
 
     store_token(
         server_url="http://localhost:8000",
@@ -189,7 +189,7 @@ def test_multiple_servers(token_dir) -> None:
 
     A user may have accounts on multiple servers.
     """
-    from omnigent.cli_auth import load_token, store_token
+    from omnigent.cli.auth import load_token, store_token
 
     store_token(
         server_url="http://localhost:8000",
@@ -217,7 +217,7 @@ def test_store_and_load_databricks_record(token_dir) -> None:
     ``omnigent login <apps-url>`` stores the record; the server-auth
     chain looks up the workspace host to mint fresh tokens.
     """
-    from omnigent.cli_auth import load_databricks_workspace_host, store_databricks_auth
+    from omnigent.cli.auth import load_databricks_workspace_host, store_databricks_auth
 
     store_databricks_auth(
         server_url="https://myapp-123.aws.databricksapps.com",
@@ -244,17 +244,17 @@ def test_pointer_record_reads_as_absent_without_expiry_warning(
     """
     import logging
 
-    from omnigent.cli_auth import load_token, store_databricks_auth
+    from omnigent.cli.auth import load_token, store_databricks_auth
 
     # The once-per-process dedupe must not mask the warning here.
-    monkeypatch.setattr("omnigent.cli_auth._warned_expired_servers", set())
+    monkeypatch.setattr("omnigent.cli.auth._warned_expired_servers", set())
 
     store_databricks_auth(
         server_url="https://myapp-123.aws.databricksapps.com",
         workspace_host="https://example.databricks.com",
     )
 
-    with caplog.at_level(logging.WARNING, logger="omnigent.cli_auth"):
+    with caplog.at_level(logging.WARNING, logger="omnigent.cli.auth"):
         assert load_token("https://myapp-123.aws.databricksapps.com") is None
 
     expiry_warnings = [r for r in caplog.records if "expired" in r.getMessage()]
@@ -273,9 +273,9 @@ def test_expired_session_token_still_warns(token_dir, monkeypatch, caplog) -> No
     import logging
     import time as time_mod
 
-    from omnigent.cli_auth import load_token, store_token
+    from omnigent.cli.auth import load_token, store_token
 
-    monkeypatch.setattr("omnigent.cli_auth._warned_expired_servers", set())
+    monkeypatch.setattr("omnigent.cli.auth._warned_expired_servers", set())
 
     store_token(
         server_url="http://localhost:8000",
@@ -284,7 +284,7 @@ def test_expired_session_token_still_warns(token_dir, monkeypatch, caplog) -> No
         expires_at=time_mod.time() - 10,
     )
 
-    with caplog.at_level(logging.WARNING, logger="omnigent.cli_auth"):
+    with caplog.at_level(logging.WARNING, logger="omnigent.cli.auth"):
         assert load_token("http://localhost:8000") is None
 
     assert any("expired" in r.getMessage() for r in caplog.records), (
@@ -299,7 +299,7 @@ def test_databricks_request_headers_org_only(token_dir) -> None:
     (equivalently to ``?o=``). A record with no org id (single-workspace
     host) yields no header, so those callers are unaffected.
     """
-    from omnigent.cli_auth import databricks_request_headers, store_databricks_auth
+    from omnigent.cli.auth import databricks_request_headers, store_databricks_auth
 
     store_databricks_auth(
         server_url="https://acme.databricks.com/api/2.0/omnigent",
@@ -319,7 +319,7 @@ def test_databricks_request_headers_org_only(token_dir) -> None:
 
 def test_databricks_request_headers_explicit_org_wins(token_dir) -> None:
     """The current URL selector overrides a stale stored workspace selector."""
-    from omnigent.cli_auth import databricks_request_headers, store_databricks_auth
+    from omnigent.cli.auth import databricks_request_headers, store_databricks_auth
 
     server = "https://acme.databricks.com/api/2.0/omnigent"
     store_databricks_auth(
@@ -333,7 +333,7 @@ def test_databricks_request_headers_explicit_org_wins(token_dir) -> None:
 
 def test_store_databricks_org_id_preserves_session_token(token_dir) -> None:
     """Remembering URL routing must not replace an existing login session."""
-    from omnigent.cli_auth import (
+    from omnigent.cli.auth import (
         load_databricks_org_id,
         load_token,
         store_databricks_org_id,
@@ -351,7 +351,7 @@ def test_store_databricks_org_id_preserves_session_token(token_dir) -> None:
 
 def test_store_token_preserves_databricks_org_id(token_dir) -> None:
     """Refreshing a login session must retain remembered routing."""
-    from omnigent.cli_auth import (
+    from omnigent.cli.auth import (
         load_databricks_org_id,
         store_databricks_org_id,
         store_token,
@@ -367,7 +367,7 @@ def test_store_token_preserves_databricks_org_id(token_dir) -> None:
 
 def test_store_databricks_org_id_preserves_databricks_pointer(token_dir) -> None:
     """Remembering routing must retain the workspace used to mint credentials."""
-    from omnigent.cli_auth import (
+    from omnigent.cli.auth import (
         load_databricks_org_id,
         load_databricks_workspace_host,
         store_databricks_auth,
@@ -386,7 +386,7 @@ def test_store_databricks_org_id_preserves_databricks_pointer(token_dir) -> None
 
 def test_store_databricks_pointer_preserves_org_id_when_unspecified(token_dir) -> None:
     """Updating a credential pointer must retain remembered routing."""
-    from omnigent.cli_auth import (
+    from omnigent.cli.auth import (
         load_databricks_org_id,
         store_databricks_auth,
         store_databricks_org_id,
@@ -408,7 +408,7 @@ def test_databricks_request_headers_pairs_bearer_and_org(token_dir) -> None:
     header. A missing token or selector is omitted, so single-workspace and
     local-unauthenticated callers are unaffected.
     """
-    from omnigent.cli_auth import databricks_request_headers, store_databricks_auth
+    from omnigent.cli.auth import databricks_request_headers, store_databricks_auth
 
     store_databricks_auth(
         server_url="https://acme.databricks.com/api/2.0/omnigent",
@@ -437,7 +437,7 @@ def test_databricks_request_headers_slice_key(token_dir) -> None:
     never has to reason about the deployment. On an unsharded server the key
     is dropped. When emitted, it travels alongside the bearer and ?o= header.
     """
-    from omnigent.cli_auth import databricks_request_headers, store_databricks_auth
+    from omnigent.cli.auth import databricks_request_headers, store_databricks_auth
 
     # Unsharded server: the slice key is DROPPED even though it was passed.
     assert databricks_request_headers("https://other.example.com", host_id="host_abc123") == {}
@@ -472,8 +472,8 @@ def test_databricks_request_headers_runner_env_default(
     An explicit host_id still wins, the env is honoured only on the workspace
     mount, and CLI / daemon callers (no such env) are unaffected.
     """
-    from omnigent.cli_auth import databricks_request_headers, store_databricks_auth
-    from omnigent.runner.identity import RUNNER_SLICE_KEY_ENV_VAR
+    from omnigent.cli.auth import databricks_request_headers, store_databricks_auth
+    from omnigent.util.runner_identity import RUNNER_SLICE_KEY_ENV_VAR
 
     store_databricks_auth(
         server_url="https://acme.databricks.com/api/2.0/omnigent",
@@ -511,7 +511,7 @@ def test_databricks_request_headers_slice_key_kill_switch(
     rollout fall back to the server's default (workspace-id) routing without a
     redeploy. Emission is ON by default; only the exact value "0" turns it off.
     """
-    from omnigent.cli_auth import databricks_request_headers, store_databricks_auth
+    from omnigent.cli.auth import databricks_request_headers, store_databricks_auth
 
     store_databricks_auth(
         server_url="https://acme.databricks.com/api/2.0/omnigent",
@@ -549,7 +549,7 @@ def test_databricks_request_headers_folds_extra_headers(token_dir, monkeypatch) 
     caller that hand-rolls a bare bearer misses them. Malformed / unset input is
     a no-op (prod-safe).
     """
-    from omnigent.cli_auth import databricks_request_headers, store_databricks_auth
+    from omnigent.cli.auth import databricks_request_headers, store_databricks_auth
 
     store_databricks_auth(
         server_url="https://acme.databricks.com/api/2.0/omnigent",
@@ -590,7 +590,7 @@ def test_load_token_returns_none_for_databricks_record(token_dir) -> None:
     stores only the workspace host. If load_token returned anything here,
     the JWT path would send a garbage Authorization header.
     """
-    from omnigent.cli_auth import load_token, store_databricks_auth
+    from omnigent.cli.auth import load_token, store_databricks_auth
 
     store_databricks_auth(
         server_url="https://myapp-123.aws.databricksapps.com",
@@ -608,7 +608,7 @@ def test_load_databricks_host_returns_none_for_jwt_record(token_dir) -> None:
     """
     import time
 
-    from omnigent.cli_auth import load_databricks_workspace_host, store_token
+    from omnigent.cli.auth import load_databricks_workspace_host, store_token
 
     store_token(
         server_url="http://localhost:8000",
@@ -626,7 +626,7 @@ def test_databricks_record_normalizes_workspace_trailing_slash(token_dir) -> Non
     ``Config(host=...)`` treats ``https://ws`` and ``https://ws/`` as
     distinct cache keys in some SDK paths — store one canonical form.
     """
-    from omnigent.cli_auth import load_databricks_workspace_host, store_databricks_auth
+    from omnigent.cli.auth import load_databricks_workspace_host, store_databricks_auth
 
     store_databricks_auth(
         server_url="https://myapp-123.aws.databricksapps.com/",
@@ -647,7 +647,7 @@ def test_databricks_record_overwrites_jwt_record(token_dir) -> None:
     """
     import time
 
-    from omnigent.cli_auth import (
+    from omnigent.cli.auth import (
         load_databricks_workspace_host,
         load_token,
         store_databricks_auth,
@@ -680,7 +680,7 @@ def test_store_token_persists_refresh_material(token_dir) -> None:
     """A refresh token stored at login survives the round trip."""
     import json
 
-    from omnigent.cli_auth import store_token
+    from omnigent.cli.auth import store_token
 
     store_token(
         "http://localhost:6767",
@@ -696,7 +696,7 @@ def test_store_token_persists_refresh_material(token_dir) -> None:
 def test_stored_token_status_classification(token_dir) -> None:
     """absent / expired / ok are distinguished — the host uses this to say
     "your login expired" instead of dialing into a misleading 403."""
-    from omnigent.cli_auth import store_token, stored_token_status
+    from omnigent.cli.auth import store_token, stored_token_status
 
     assert stored_token_status("http://localhost:6767") == "absent"
     store_token("http://localhost:6767", token="jwt", user_id="a@x", expires_at=time.time() - 10)
@@ -712,7 +712,7 @@ def test_refresh_stored_token_renews_and_rotates(token_dir, monkeypatch) -> None
 
     import httpx
 
-    from omnigent.cli_auth import load_token, refresh_stored_token, store_token
+    from omnigent.cli.auth import load_token, refresh_stored_token, store_token
 
     store_token(
         "http://localhost:6767",
@@ -752,7 +752,7 @@ def test_refresh_stored_token_renews_and_rotates(token_dir, monkeypatch) -> None
 
 def test_refresh_stored_token_no_material_is_none(token_dir) -> None:
     """Nothing to refresh (no entry, or no refresh token) → None, no I/O."""
-    from omnigent.cli_auth import refresh_stored_token, store_token
+    from omnigent.cli.auth import refresh_stored_token, store_token
 
     assert refresh_stored_token("http://localhost:6767") is None
     store_token("http://localhost:6767", token="jwt", user_id="a@x", expires_at=time.time() - 10)
@@ -766,7 +766,7 @@ def test_refresh_stored_token_refused_leaves_entry(token_dir, monkeypatch) -> No
 
     import httpx
 
-    from omnigent.cli_auth import refresh_stored_token, store_token
+    from omnigent.cli.auth import refresh_stored_token, store_token
 
     store_token(
         "http://localhost:6767",
@@ -799,7 +799,7 @@ def test_refresh_404_on_loopback_is_quiet(token_dir, monkeypatch, caplog) -> Non
 
     import httpx
 
-    from omnigent.cli_auth import refresh_stored_token, store_token
+    from omnigent.cli.auth import refresh_stored_token, store_token
 
     store_token(
         "http://localhost:6767",
@@ -813,7 +813,7 @@ def test_refresh_404_on_loopback_is_quiet(token_dir, monkeypatch, caplog) -> Non
         return httpx.Response(404, request=httpx.Request("POST", url))
 
     monkeypatch.setattr(httpx, "post", _fake_post)
-    with caplog.at_level(logging.DEBUG, logger="omnigent.cli_auth"):
+    with caplog.at_level(logging.DEBUG, logger="omnigent.cli.auth"):
         assert refresh_stored_token("http://localhost:6767") is None
     assert not any(r.levelno >= logging.WARNING for r in caplog.records)
     assert any(
@@ -834,7 +834,7 @@ def test_refresh_404_on_remote_warns_without_relogin_advice(
 
     import httpx
 
-    from omnigent.cli_auth import refresh_stored_token, store_token
+    from omnigent.cli.auth import refresh_stored_token, store_token
 
     url = "https://omni.example.com"
     store_token(
@@ -849,7 +849,7 @@ def test_refresh_404_on_remote_warns_without_relogin_advice(
         return httpx.Response(404, request=httpx.Request("POST", u))
 
     monkeypatch.setattr(httpx, "post", _fake_post)
-    with caplog.at_level(logging.WARNING, logger="omnigent.cli_auth"):
+    with caplog.at_level(logging.WARNING, logger="omnigent.cli.auth"):
         assert refresh_stored_token(url) is None
     warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
     assert any("404" in m for m in warnings)
@@ -858,7 +858,7 @@ def test_refresh_404_on_remote_warns_without_relogin_advice(
 
 def test_safe_log_url_strips_userinfo_and_query() -> None:
     """The log sanitizer drops credential-bearing URL parts, keeps identity."""
-    from omnigent.cli_auth import _safe_log_url
+    from omnigent.cli.auth import _safe_log_url
 
     # Userinfo and query (both can carry secrets) are removed; scheme, host,
     # port, and path (the useful, non-secret identity) are kept.
@@ -877,7 +877,7 @@ def test_refresh_refusal_log_redacts_url_credentials(token_dir, monkeypatch, cap
 
     import httpx
 
-    from omnigent.cli_auth import refresh_stored_token, store_token
+    from omnigent.cli.auth import refresh_stored_token, store_token
 
     url = "https://user:s3cr3t@omni.example.com/api?access_token=leak"
     store_token(
@@ -892,7 +892,7 @@ def test_refresh_refusal_log_redacts_url_credentials(token_dir, monkeypatch, cap
         return httpx.Response(403, json={"error": "denied"}, request=httpx.Request("POST", u))
 
     monkeypatch.setattr(httpx, "post", _fake_post)
-    with caplog.at_level(logging.WARNING, logger="omnigent.cli_auth"):
+    with caplog.at_level(logging.WARNING, logger="omnigent.cli.auth"):
         assert refresh_stored_token(url) is None
     messages = " ".join(r.getMessage() for r in caplog.records)
     assert "s3cr3t" not in messages and "leak" not in messages
@@ -904,7 +904,7 @@ def test_refresh_stored_token_skips_when_already_fresh(token_dir, monkeypatch) -
     without a network call (the lock-then-recheck path)."""
     import httpx
 
-    from omnigent.cli_auth import refresh_stored_token, store_token
+    from omnigent.cli.auth import refresh_stored_token, store_token
 
     store_token(
         "http://localhost:6767",
@@ -929,7 +929,7 @@ def test_refresh_no_material_does_not_touch_lock_file(token_dir, monkeypatch) ->
     skipping its Databricks SDK fallback and leaving valid credentials
     unused.
     """
-    from omnigent.cli_auth import refresh_stored_token, store_token
+    from omnigent.cli.auth import refresh_stored_token, store_token
 
     store_token("http://localhost:6767", token="jwt", user_id="a@x", expires_at=time.time() - 10)
 
@@ -944,7 +944,7 @@ def test_refresh_no_material_does_not_touch_lock_file(token_dir, monkeypatch) ->
 def test_refresh_survives_unwritable_state_dir(token_dir, monkeypatch) -> None:
     """A lock/persist failure degrades to None instead of raising, so the
     caller can still fall back to its other credential sources."""
-    import omnigent.cli_auth as ca
+    import omnigent.cli.auth as ca
 
     ca.store_token(
         "http://localhost:6767",
@@ -966,7 +966,7 @@ def test_refresh_survives_unwritable_state_dir(token_dir, monkeypatch) -> None:
 def test_load_token_min_remaining_declines_near_expiry(token_dir) -> None:
     """A token inside the renewal window reads as unusable so the caller
     refreshes instead of sending one that lapses mid-handshake."""
-    from omnigent.cli_auth import REFRESH_MIN_REMAINING_SECONDS, load_token, store_token
+    from omnigent.cli.auth import REFRESH_MIN_REMAINING_SECONDS, load_token, store_token
 
     store_token(
         "http://localhost:6767",
@@ -986,7 +986,7 @@ def test_load_token_min_remaining_declines_near_expiry(token_dir) -> None:
 def test_load_entry_tolerates_wrong_shaped_json(token_dir) -> None:
     """A token file holding valid JSON of the wrong shape reads as empty
     rather than raising AttributeError into the caller."""
-    from omnigent.cli_auth import load_token, stored_token_status
+    from omnigent.cli.auth import load_token, stored_token_status
 
     for bad in ("[]", "null", '"a string"'):
         (token_dir / "auth_tokens.json").write_text(bad)
@@ -1001,7 +1001,7 @@ def test_refresh_rejects_unusable_response_fields(token_dir, monkeypatch) -> Non
 
     import httpx
 
-    from omnigent.cli_auth import refresh_stored_token, store_token
+    from omnigent.cli.auth import refresh_stored_token, store_token
 
     def _seed():
         store_token(
@@ -1059,7 +1059,7 @@ def test_token_file_path_honors_data_dir_without_tui_sdk(tmp_path, monkeypatch) 
     pyexpat) crashed the CLI outright on interpreters whose ``pyexpat``
     extension cannot load.
     """
-    from omnigent.cli_auth import _token_file_path
+    from omnigent.cli.auth import _token_file_path
 
     monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
     _purge_tui_sdk_modules()
@@ -1072,7 +1072,7 @@ def test_token_file_path_honors_data_dir_without_tui_sdk(tmp_path, monkeypatch) 
 
 def test_token_file_path_defaults_to_home_state_dir(tmp_path, monkeypatch) -> None:
     """Without ``OMNIGENT_DATA_DIR`` the token file lives under ``~/.omnigent``."""
-    from omnigent.cli_auth import _token_file_path
+    from omnigent.cli.auth import _token_file_path
 
     monkeypatch.delenv("OMNIGENT_DATA_DIR", raising=False)
     monkeypatch.setenv("HOME", str(tmp_path))

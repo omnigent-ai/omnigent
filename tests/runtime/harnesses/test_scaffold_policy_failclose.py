@@ -15,8 +15,8 @@ import asyncio
 
 import pytest
 
-import omnigent.runtime.harnesses._scaffold as scaffold
-from omnigent.runtime.harnesses._scaffold import TurnContext
+import omnigent.harnesses.runtime._scaffold as scaffold
+from omnigent.harnesses.runtime._scaffold import TurnContext
 
 
 def _ctx() -> TurnContext:

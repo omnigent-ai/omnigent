@@ -162,7 +162,7 @@ def test_run_with_invalid_proxy_env_does_not_crash(
         [
             sys.executable,
             "-m",
-            "omnigent.cli",
+            "omnigent.cli.commands",
             "run",
             str(agent_yaml),
             "-p",
@@ -189,7 +189,7 @@ def test_run_with_invalid_proxy_env_does_not_crash(
         # The launch boots a local server/daemon before the crash point —
         # stop it so nothing leaks across tests.
         subprocess.run(
-            [sys.executable, "-m", "omnigent.cli", "stop"],
+            [sys.executable, "-m", "omnigent.cli.commands", "stop"],
             env=env,
             cwd=str(isolated_home),
             capture_output=True,

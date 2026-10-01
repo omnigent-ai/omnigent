@@ -33,7 +33,7 @@ import httpx
 import pytest
 import yaml as _yaml
 
-from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN
+from omnigent.util.runner_identity import OMNIGENT_INTERNAL_WS_ORIGIN
 from tests.e2e.conftest import (
     configure_mock_llm,
     find_free_port,
@@ -116,7 +116,7 @@ def registered_agent_server(
     Mirrors the remote-URL target: the caller knows only the agent's name,
     and must resolve its id from the server to create a session.
     """
-    from omnigent.chat import (
+    from omnigent.cli.chat import (
         _start_local_server,
         _stop_local_server,
         _wait_for_server,
@@ -313,7 +313,7 @@ def test_headless_prompt_without_bundle_uses_sessions_api(
     """
     from omnigent_client import OmnigentClient
 
-    from omnigent.chat import _query_sessions_once
+    from omnigent.cli.chat import _query_sessions_once
 
     server = registered_agent_server
 
@@ -345,7 +345,7 @@ def test_run_one_shot_without_bundle_answers(
     require a bundle and fall back to the legacy client query, so a
     remote-URL one-shot failed with ``Not Found``.
     """
-    from omnigent.chat import _run_one_shot
+    from omnigent.cli.chat import _run_one_shot
 
     server = registered_agent_server
 
@@ -456,7 +456,7 @@ def test_runner_adoption_matches_harness_aliases(agent_harness: str, advertised:
 
     from omnigent_client._sessions import SessionsNamespace
 
-    from omnigent.harness_aliases import canonicalize_harness
+    from omnigent.harnesses.aliases import canonicalize_harness
 
     class _Resp:
         status_code = 200

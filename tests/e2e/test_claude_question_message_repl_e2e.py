@@ -43,7 +43,7 @@ import httpx
 import pexpect
 import pytest
 
-from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN
+from omnigent.util.runner_identity import OMNIGENT_INTERNAL_WS_ORIGIN
 from tests.e2e._native_resume_helpers import (
     inject_user_message,
     wait_for_terminal_ready,
@@ -281,7 +281,7 @@ def test_web_followup_preserves_real_repl_question(
                     "server",
                     [
                         "-m",
-                        "omnigent.cli",
+                        "omnigent.cli.commands",
                         "server",
                         "--port",
                         str(port),
@@ -337,7 +337,7 @@ def test_web_followup_preserves_real_repl_question(
             repl_log = stack.enter_context((tmp_path / "repl.log").open("w"))
             repl = pexpect.spawn(
                 sys.executable,
-                ["-m", "omnigent.cli", "attach", session_id, "--server", server_url],
+                ["-m", "omnigent.cli.commands", "attach", session_id, "--server", server_url],
                 env=env,
                 cwd=workspace,
                 encoding="utf-8",

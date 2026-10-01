@@ -22,7 +22,7 @@ Local usage::
     OMNIGENT_E2E_ALLOW_DEV_BASE_URL=1 \
       uv run --no-sync pytest tests/e2e_ui --ui-base-url http://127.0.0.1:5173
 
-``omnigent server`` is documented at ``omnigent/cli.py:server``:
+``omnigent server`` is documented at ``omnigent/cli/commands.py:server``:
 it spins up uvicorn with the Omnigent app and spawns an out-of-process
 runner that reconnects over the WebSocket tunnel. The fixture passes
 ``--database-uri`` and ``--artifact-location`` pointing at the
@@ -847,18 +847,18 @@ def _spawn_runner_against_external_server(
     Used when ``--ui-base-url`` is set: the user owns the
     ``omnigent server`` process (and its pre-registered ``hello_world``
     agent), but the runner-bound fixtures still need a runner id this
-    process controls. Mirrors :func:`omnigent.cli._start_cli_runner_process`
+    process controls. Mirrors :func:`omnigent.cli.commands._start_cli_runner_process`
     minus the click plumbing, then polls
     ``GET /v1/runners/{id}/status`` until the WS tunnel is up.
 
     The unauthenticated local server derives ``expected_runner_id``
     from the binding token via
-    :func:`omnigent.runner.identity.token_bound_runner_id`, so we use
+    :func:`omnigent.util.runner_identity.token_bound_runner_id`, so we use
     the same derivation here rather than picking a human-friendly id.
     """
     import secrets
 
-    from omnigent.runner.identity import token_bound_runner_id
+    from omnigent.util.runner_identity import token_bound_runner_id
 
     runner_tmp = tmp_path_factory.mktemp("e2e_ui_external_runner")
     log_path = runner_tmp / "runner.log"
@@ -1016,7 +1016,7 @@ def live_server(
         builtin_dirs.append(str(probe_path))
     import secrets as _secrets
 
-    from omnigent.runner.identity import token_bound_runner_id
+    from omnigent.util.runner_identity import token_bound_runner_id
 
     binding_token = _secrets.token_urlsafe(32)
     runner_id = token_bound_runner_id(binding_token)
@@ -1067,7 +1067,7 @@ def live_server(
         # Mirrors ``python -m omnigent`` (omnigent/__main__.py).
         "-c",
         "import omnigent.server.presence as _p; _p._LEAVE_GRACE_S = 1.0; "
-        + "from omnigent.cli import main; main()",
+        + "from omnigent.cli.commands import main; main()",
         "server",
         "--host",
         "127.0.0.1",
@@ -1745,7 +1745,7 @@ def _two_agent_chat_yaml(verification_code: str, question_code: str) -> str:
 
     A parent agent (Arthur) with an inline ``type: agent`` sub-agent
     (Deep Thought) — the omnigent-flavored shape parsed by
-    ``omnigent/inner/loader.py:_parse_tool``, same as the
+    ``omnigent/core/loader.py:_parse_tool``, same as the
     ``named-sub-agent-test`` e2e fixture. The parent is forbidden from
     answering the Ultimate Question itself, and both nonces appear ONLY
     in the sub-agent's prompt: if either code shows up in the parent's
@@ -2521,13 +2521,13 @@ def _create_native_claude_session(
     import json as _json
     import tempfile
 
-    from omnigent._wrapper_labels import (
+    from omnigent.harnesses.claude_native.main import _materialize_claude_agent_spec
+    from omnigent.harnesses.wrapper_labels import (
         CLAUDE_NATIVE_WRAPPER_VALUE,
         UI_MODE_LABEL_KEY,
         UI_MODE_TERMINAL_VALUE,
         WRAPPER_LABEL_KEY,
     )
-    from omnigent.harnesses.claude_native.main import _materialize_claude_agent_spec
 
     with tempfile.TemporaryDirectory() as _tmp:
         spec_path = _materialize_claude_agent_spec(Path(_tmp))
@@ -2689,13 +2689,13 @@ def _create_native_codex_session(
     import json as _json
     import tempfile
 
-    from omnigent._wrapper_labels import (
+    from omnigent.harnesses.codex_native.main import _materialize_codex_agent_spec
+    from omnigent.harnesses.wrapper_labels import (
         CODEX_NATIVE_WRAPPER_VALUE,
         UI_MODE_LABEL_KEY,
         UI_MODE_TERMINAL_VALUE,
         WRAPPER_LABEL_KEY,
     )
-    from omnigent.harnesses.codex_native.main import _materialize_codex_agent_spec
 
     with tempfile.TemporaryDirectory() as _tmp:
         spec_path = _materialize_codex_agent_spec(Path(_tmp), model=model)
@@ -2950,7 +2950,7 @@ def mocked_native_codex_session(
 
     import secrets as _secrets
 
-    from omnigent.runner.identity import token_bound_runner_id
+    from omnigent.util.runner_identity import token_bound_runner_id
 
     binding_token = _secrets.token_urlsafe(32)
     runner_id = token_bound_runner_id(binding_token)
@@ -2980,7 +2980,7 @@ def mocked_native_codex_session(
         sys.executable,
         "-c",
         "import omnigent.server.presence as _p; _p._LEAVE_GRACE_S = 1.0; "
-        + "from omnigent.cli import main; main()",
+        + "from omnigent.cli.commands import main; main()",
         "server",
         "--host",
         "127.0.0.1",
@@ -3162,13 +3162,13 @@ def _create_native_cursor_session(
     import json as _json
     import tempfile
 
-    from omnigent._wrapper_labels import (
+    from omnigent.harnesses.cursor_native.main import _materialize_cursor_agent_spec
+    from omnigent.harnesses.wrapper_labels import (
         CURSOR_NATIVE_WRAPPER_VALUE,
         UI_MODE_LABEL_KEY,
         UI_MODE_TERMINAL_VALUE,
         WRAPPER_LABEL_KEY,
     )
-    from omnigent.harnesses.cursor_native.main import _materialize_cursor_agent_spec
 
     with tempfile.TemporaryDirectory() as _tmp:
         spec_path = _materialize_cursor_agent_spec(Path(_tmp))
@@ -3233,13 +3233,13 @@ def _create_native_goose_session(base_url: str, runner_id: str) -> str:
     import json as _json
     import tempfile
 
-    from omnigent._wrapper_labels import (
+    from omnigent.harnesses.goose_native.main import _materialize_goose_agent_spec
+    from omnigent.harnesses.wrapper_labels import (
         GOOSE_NATIVE_WRAPPER_VALUE,
         UI_MODE_LABEL_KEY,
         UI_MODE_TERMINAL_VALUE,
         WRAPPER_LABEL_KEY,
     )
-    from omnigent.harnesses.goose_native.main import _materialize_goose_agent_spec
 
     with tempfile.TemporaryDirectory() as _tmp:
         spec_path = _materialize_goose_agent_spec(Path(_tmp))
@@ -3322,13 +3322,13 @@ def _create_native_kiro_session(base_url: str, runner_id: str) -> str:
     import json as _json
     import tempfile
 
-    from omnigent._wrapper_labels import (
+    from omnigent.harnesses.kiro_native.main import _materialize_kiro_agent_spec
+    from omnigent.harnesses.wrapper_labels import (
         KIRO_NATIVE_WRAPPER_VALUE,
         UI_MODE_LABEL_KEY,
         UI_MODE_TERMINAL_VALUE,
         WRAPPER_LABEL_KEY,
     )
-    from omnigent.harnesses.kiro_native.main import _materialize_kiro_agent_spec
 
     with tempfile.TemporaryDirectory() as _tmp:
         spec_path = _materialize_kiro_agent_spec(Path(_tmp), model=None)
@@ -3411,13 +3411,13 @@ def _create_native_hermes_session(base_url: str, runner_id: str) -> str:
     import json as _json
     import tempfile
 
-    from omnigent._wrapper_labels import (
+    from omnigent.harnesses.hermes_native.main import _materialize_hermes_agent_spec
+    from omnigent.harnesses.wrapper_labels import (
         HERMES_NATIVE_WRAPPER_VALUE,
         UI_MODE_LABEL_KEY,
         UI_MODE_TERMINAL_VALUE,
         WRAPPER_LABEL_KEY,
     )
-    from omnigent.harnesses.hermes_native.main import _materialize_hermes_agent_spec
 
     with tempfile.TemporaryDirectory() as _tmp:
         spec_path = _materialize_hermes_agent_spec(Path(_tmp))

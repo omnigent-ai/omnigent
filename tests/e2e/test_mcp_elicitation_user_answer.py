@@ -243,7 +243,7 @@ def test_mcp_elicitation_delivers_user_selected_answer_not_schema_default(
         mock_llm_base_url=f"{mock_llm_server_url}/v1",
     )
 
-    from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN
+    from omnigent.util.runner_identity import OMNIGENT_INTERNAL_WS_ORIGIN
 
     resp = http_client.post(
         "/v1/sessions",

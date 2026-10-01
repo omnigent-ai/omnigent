@@ -36,7 +36,7 @@ from omnigent.server.auth import (
     UnifiedAuthProvider,
 )
 from omnigent.server.managed_hosts import parse_sandbox_config
-from omnigent.server.routes._sessions.helpers import _grant_default_public
+from omnigent.server.routes.sessions.helpers import _grant_default_public
 from omnigent.server.sharing_settings import (
     DefaultPublicSessions,
     new_session_starts_public,

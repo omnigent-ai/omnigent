@@ -679,7 +679,7 @@ def test_codex_menu_set_matches_executor_linked_set(tmp_path: Path) -> None:
     SAME skill set from the SAME sources (both via codex_skill_sources +
     select_codex_skill_dirs) — so a / menu entry is always actually linked.
     """
-    from omnigent.inner.codex_executor import (
+    from omnigent.harnesses.codex.executor import (
         codex_skill_sources,
         select_codex_skill_dirs,
     )

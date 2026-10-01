@@ -24,10 +24,11 @@ from pathlib import Path
 
 import pytest
 
+from omnigent.core.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.entities.environment_filesystem import PathUnreachable
-from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
-from omnigent.inner.os_env import _handle_helper_request, create_os_environment
-from omnigent.inner.sandbox import (
+from omnigent.environments.os_env import _handle_helper_request, create_os_environment
+from omnigent.runner.environment_filesystem import resolve_browse_target
+from omnigent.sandbox.core import (
     SandboxPolicy,
     contained_realpath,
     containment_prefix,
@@ -35,7 +36,6 @@ from omnigent.inner.sandbox import (
     reachable_roots,
     resolve_sandbox,
 )
-from omnigent.runner.environment_filesystem import resolve_browse_target
 
 
 def _grant_policy(

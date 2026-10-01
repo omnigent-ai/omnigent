@@ -6,7 +6,7 @@ import click
 import httpx
 import pytest
 
-from omnigent.native import native_terminal
+from omnigent.harnesses.native import terminal as native_terminal
 
 
 @pytest.mark.asyncio

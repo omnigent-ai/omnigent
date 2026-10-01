@@ -94,7 +94,7 @@ def _failing_list_items(self, conversation_id, limit=100, *args, **kwargs):
 
 _s.SqlAlchemyConversationStore.list_items = _failing_list_items
 
-from omnigent.cli import main
+from omnigent.cli.commands import main
 
 main()
 """
@@ -180,13 +180,13 @@ def _create_claude_native_session(base_url: str) -> str:
     import tarfile
     import tempfile
 
-    from omnigent._wrapper_labels import (
+    from omnigent.harnesses.claude_native.main import _materialize_claude_agent_spec
+    from omnigent.harnesses.wrapper_labels import (
         CLAUDE_NATIVE_WRAPPER_VALUE,
         UI_MODE_LABEL_KEY,
         UI_MODE_TERMINAL_VALUE,
         WRAPPER_LABEL_KEY,
     )
-    from omnigent.harnesses.claude_native.main import _materialize_claude_agent_spec
 
     with tempfile.TemporaryDirectory() as tmp:
         yaml_text = _materialize_claude_agent_spec(Path(tmp)).read_text()
@@ -320,7 +320,7 @@ def test_cold_resume_resumes_history_when_large_item_page_500s(
         return None
 
     binding_token = secrets.token_urlsafe(32)
-    from omnigent.runner.identity import token_bound_runner_id
+    from omnigent.util.runner_identity import token_bound_runner_id
 
     runner_id = token_bound_runner_id(binding_token)
 

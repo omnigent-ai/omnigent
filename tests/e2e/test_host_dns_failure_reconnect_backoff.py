@@ -88,7 +88,7 @@ def _announced_delays(log_path: Path) -> list[float]:
 
 def test_host_dns_failure_reconnect_backs_off(tmp_path: Path) -> None:
     """A DNS-failing host tunnel must back off, not retry at 2 Hz forever."""
-    from omnigent.process_logging import PROCESS_LOG_FILE_ENV_VAR
+    from omnigent.observability.process_logging import PROCESS_LOG_FILE_ENV_VAR
 
     inject_dir = tmp_path / "inject"
     inject_dir.mkdir()

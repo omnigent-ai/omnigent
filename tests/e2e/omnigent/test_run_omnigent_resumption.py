@@ -13,7 +13,7 @@ LLM in run #2, proving that the persistent omnigent store at
 **What breaks if this fails:**
 
 - The persistent store path regresses in
-  ``omnigent.chat._omnigent_persistent_dir`` or
+  ``omnigent.cli.chat._omnigent_persistent_dir`` or
   ``omnigent.inner.cli._build_omnigent_stores`` — e.g. someone
   flips back to ``mkdtemp`` and ``--continue`` silently
   starts a fresh conversation.
@@ -404,8 +404,8 @@ def test_run_omnigent_continue_works_across_oneshot_and_interactive_paths(
     ``omnigent.inner.cli._post_prompt_and_print``) MUST be
     visible to a subsequent interactive REPL ``--continue``
     (the subprocess-server path through
-    ``omnigent.chat._chat_local`` ->
-    ``omnigent.cli server``).
+    ``omnigent.cli.chat._chat_local`` ->
+    ``omnigent.cli.commands server``).
 
     Why this needs its own test: the two paths have separate
     agent-registration helpers

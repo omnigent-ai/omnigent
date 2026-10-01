@@ -13,7 +13,7 @@ cleanliness, assistant text length).
   Omnigent tools with ``pi.registerTool()``).
 - The ``pi`` CLI binary disappears from PATH or its
   ``--mode rpc`` subcommand changes its startup contract.
-- ``omnigent.cli._run_agent`` for the ``-p`` one-shot path
+- ``omnigent.cli.commands._run_agent`` for the ``-p`` one-shot path
   stops printing assistant text to stdout on turn complete.
 
 Design reference: ``designs/OMNIGENT_INTEGRATION.md`` §Phase 0

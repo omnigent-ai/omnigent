@@ -39,7 +39,7 @@ from omnigent.db.utils import (
     run_write_transaction,
 )
 from omnigent.errors import ErrorCode, OmnigentError
-from omnigent.harness_availability import HarnessAvailability, is_harness_availability
+from omnigent.harnesses.availability import HarnessAvailability, is_harness_availability
 
 # A host is considered live only if its row was touched (connect or
 # heartbeat) within this window. The host tunnel's ping loop writes a

@@ -2194,7 +2194,7 @@ async def route_session_harness(
         # "applied" while its pane keeps running the harness it booted on.
         # A verdict may still spell an offered harness as its WORKER name
         # (``claude_code``), which is the same harness, not an escape.
-        from omnigent.harness_aliases import canonicalize_harness
+        from omnigent.harnesses.aliases import canonicalize_harness
 
         _spelled = _WORKER_NAME_TO_HARNESS.get(chosen_harness) or canonicalize_harness(
             chosen_harness

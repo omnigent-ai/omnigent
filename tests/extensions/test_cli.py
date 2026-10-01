@@ -5,7 +5,7 @@ from types import MappingProxyType
 
 from click.testing import CliRunner
 
-from omnigent.cli import cli
+from omnigent.cli.commands import cli
 from omnigent.extensions import (
     EXTENSION_API_VERSION,
     ExtensionEntrypoints,

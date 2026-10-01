@@ -199,7 +199,7 @@ def reported_gateway_inference(
     host_id = getattr(host, "host_id", None) if host is not None else None
     if not isinstance(host_id, str):
         return None
-    from omnigent.server.routes._sessions.common import get_server_host_registry
+    from omnigent.server.routes.sessions.common import get_server_host_registry
 
     registry = get_server_host_registry()
     if registry is None:
@@ -222,7 +222,7 @@ def gateway_backs_all(
     :param harnesses: Harness ids to check, e.g. ``("claude-native",)``.
     :returns: ``True`` unless the host explicitly reports one as not backed.
     """
-    from omnigent.gateway_inference import not_gateway_backed
+    from omnigent.models.gateway_inference import not_gateway_backed
 
     return not not_gateway_backed(reported_gateway_inference(host), harnesses)
 

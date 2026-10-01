@@ -110,7 +110,7 @@ def cross_harness_rig(
     tmp_path: Path,
 ) -> Iterator[tuple[httpx.Client, Path, str, str]]:
     """Run an isolated server/runner with both native CLIs using the mock API."""
-    from omnigent.runner.identity import token_bound_runner_id
+    from omnigent.util.runner_identity import token_bound_runner_id
 
     for binary in ("codex", "claude", "tmux"):
         if shutil.which(binary) is None:
@@ -216,7 +216,7 @@ def cross_harness_rig(
                     [
                         sys.executable,
                         "-m",
-                        "omnigent.cli",
+                        "omnigent.cli.commands",
                         "server",
                         "--host",
                         "127.0.0.1",

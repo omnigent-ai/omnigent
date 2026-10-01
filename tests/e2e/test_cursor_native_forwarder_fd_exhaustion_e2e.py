@@ -250,7 +250,7 @@ def emfile_server() -> Iterator[str]:
         [
             sys.executable,
             "-m",
-            "omnigent.cli",
+            "omnigent.cli.commands",
             "server",
             "--port",
             str(port),

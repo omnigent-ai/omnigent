@@ -1,4 +1,4 @@
-"""Tests for ``omnigent._runner_startup`` (startup UX helpers).
+"""Tests for ``omnigent.cli.runner_startup`` (startup UX helpers).
 
 These cover the two pieces of UX added when local-runner startup
 fails or stalls:
@@ -24,7 +24,7 @@ import sys
 
 import pytest
 
-from omnigent._runner_startup import (
+from omnigent.cli.runner_startup import (
     _NO_SPINNER_ENV_VAR,
     STARTUP_PHASE_LABELS,
     _spinner_enabled,

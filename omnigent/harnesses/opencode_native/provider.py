@@ -83,7 +83,7 @@ def resolve_bound_opencode_gateway(
     *, model: str | None = None, auth: object = None
 ) -> OpenCodeGatewayResolution | None:
     """Resolve an explicit session binding without consulting Connect fallbacks."""
-    from omnigent.inference_config import (
+    from omnigent.models.inference_config import (
         binding_for_harness,
         load_runtime_inference_config,
         resolve_bound_model,
@@ -665,8 +665,8 @@ def _configure_opencode_on_demand() -> None:
     """Run ``ucode configure --agents opencode`` for the connect profile, minting
     via the broker. Used when the background boot configure has not yet written
     opencode's config at launch time. Best-effort and quiet."""
+    from omnigent.harnesses.databricks.executor import _read_databrickscfg_host
     from omnigent.host.databricks_credential import HOST_DATABRICKS_PROFILE, broker_token_command
-    from omnigent.inner.databricks_executor import _read_databrickscfg_host
     from omnigent.onboarding.ucode_setup import (
         build_ucode_configure_command_for_profile,
         find_ucode_command,

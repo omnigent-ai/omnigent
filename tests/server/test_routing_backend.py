@@ -15,7 +15,7 @@ from typing import Any
 import pytest
 
 from omnigent.server.host_registry import HostRegistry
-from omnigent.server.routes._sessions.common import set_server_host_registry
+from omnigent.server.routes.sessions.common import set_server_host_registry
 from omnigent.server.routing_backend import (
     RoutingBackends,
     backends_from_caps,

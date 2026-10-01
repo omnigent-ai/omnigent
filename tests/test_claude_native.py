@@ -29,19 +29,19 @@ import yaml
 from websockets.exceptions import ConnectionClosedError
 from websockets.frames import Close
 
-from omnigent._runner_startup import RunnerStartupProgress
-from omnigent._startup_profile import StartupProfiler
-from omnigent._terminal_picker_theme import PICKER_ACCENT, PICKER_MUTED
+from omnigent.cli.picker_theme import PICKER_ACCENT, PICKER_MUTED
+from omnigent.cli.runner_startup import RunnerStartupProgress
 from omnigent.harnesses.claude_native import main as claude_native
-from omnigent.inner.native_attachments import attachment_cache_dir
 from omnigent.models.databricks_model_discovery import DatabricksClaudeCatalog
-from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN
+from omnigent.observability.startup_profile import StartupProfiler
 from omnigent.runtime import tool_result_replay as trc
 from omnigent.spec import load_omnigent_yaml
 from omnigent.terminals.ws_common import (
     WS_CLOSE_TERMINAL_DETACHED,
     WS_CLOSE_TERMINAL_NOT_FOUND,
 )
+from omnigent.util.attachments import attachment_cache_dir
+from omnigent.util.runner_identity import OMNIGENT_INTERNAL_WS_ORIGIN
 from tests._image_fixtures import (
     _TINY_CMYK_JPEG_BASE64,
     _TINY_GIF_BASE64,
@@ -181,7 +181,7 @@ def test_claude_terminal_request_launcher_plugin_wraps(tmp_path, monkeypatch) ->
     argv.
     """
 
-    from omnigent.claude_launcher import ClaudeLauncher
+    from omnigent.harnesses.claude_native.launcher import ClaudeLauncher
 
     class _IsaacLauncher(ClaudeLauncher):
         def launch(self, command, args):
@@ -1526,11 +1526,11 @@ def test_local_run_persists_launch_state_on_fresh_session(
         return True
 
     monkeypatch.chdir(workspace)
-    monkeypatch.setattr("omnigent.chat._find_free_port", lambda: 12345)
-    monkeypatch.setattr("omnigent.chat._start_local_server", fake_start_server)
-    monkeypatch.setattr("omnigent.chat._stop_local_server", lambda server: None)
-    monkeypatch.setattr("omnigent.chat._wait_for_server", lambda *a, **k: None)
-    monkeypatch.setattr("omnigent.chat._bundle_agent", lambda path: b"bundle")
+    monkeypatch.setattr("omnigent.cli.chat._find_free_port", lambda: 12345)
+    monkeypatch.setattr("omnigent.cli.chat._start_local_server", fake_start_server)
+    monkeypatch.setattr("omnigent.cli.chat._stop_local_server", lambda server: None)
+    monkeypatch.setattr("omnigent.cli.chat._wait_for_server", lambda *a, **k: None)
+    monkeypatch.setattr("omnigent.cli.chat._bundle_agent", lambda path: b"bundle")
     monkeypatch.setattr(claude_native, "_prepare_claude_terminal", fake_prepare)
     monkeypatch.setattr(claude_native, "attach_local_terminal", fake_attach)
     monkeypatch.setattr(
@@ -1632,11 +1632,11 @@ def test_run_with_local_server_threads_raw_instructions_to_prepare_terminal_fres
         return True
 
     monkeypatch.chdir(workspace)
-    monkeypatch.setattr("omnigent.chat._find_free_port", lambda: 12346)
-    monkeypatch.setattr("omnigent.chat._start_local_server", fake_start_server)
-    monkeypatch.setattr("omnigent.chat._stop_local_server", lambda server: None)
-    monkeypatch.setattr("omnigent.chat._wait_for_server", lambda *a, **k: None)
-    monkeypatch.setattr("omnigent.chat._bundle_agent", lambda path: b"bundle")
+    monkeypatch.setattr("omnigent.cli.chat._find_free_port", lambda: 12346)
+    monkeypatch.setattr("omnigent.cli.chat._start_local_server", fake_start_server)
+    monkeypatch.setattr("omnigent.cli.chat._stop_local_server", lambda server: None)
+    monkeypatch.setattr("omnigent.cli.chat._wait_for_server", lambda *a, **k: None)
+    monkeypatch.setattr("omnigent.cli.chat._bundle_agent", lambda path: b"bundle")
     monkeypatch.setattr(claude_native, "_create_claude_session", _fake_create_session)
     monkeypatch.setattr(claude_native, "_bind_session_runner", _fake_bind_session_runner)
     monkeypatch.setattr(claude_native, "_launch_claude_terminal", _fake_launch_claude_terminal)
@@ -1719,10 +1719,10 @@ def test_run_with_local_server_threads_raw_instructions_to_prepare_terminal_cold
         return True
 
     monkeypatch.chdir(workspace)
-    monkeypatch.setattr("omnigent.chat._find_free_port", lambda: 12347)
-    monkeypatch.setattr("omnigent.chat._start_local_server", fake_start_server)
-    monkeypatch.setattr("omnigent.chat._stop_local_server", lambda server: None)
-    monkeypatch.setattr("omnigent.chat._wait_for_server", lambda *a, **k: None)
+    monkeypatch.setattr("omnigent.cli.chat._find_free_port", lambda: 12347)
+    monkeypatch.setattr("omnigent.cli.chat._start_local_server", fake_start_server)
+    monkeypatch.setattr("omnigent.cli.chat._stop_local_server", lambda server: None)
+    monkeypatch.setattr("omnigent.cli.chat._wait_for_server", lambda *a, **k: None)
     monkeypatch.setattr(claude_native, "_find_running_claude_terminal", _fake_find_running)
     monkeypatch.setattr(claude_native, "_fetch_claude_session_labels", _fake_fetch_labels)
     monkeypatch.setattr(claude_native, "_resolve_cold_resume_args", _fake_resolve_cold_resume_args)
@@ -1816,10 +1816,10 @@ def test_local_resume_does_not_print_redundant_resume_hint(
         del attach_url, headers, terminal_gone_probe
         return True
 
-    monkeypatch.setattr("omnigent.chat._find_free_port", lambda: 12346)
-    monkeypatch.setattr("omnigent.chat._start_local_server", fake_start_server)
-    monkeypatch.setattr("omnigent.chat._stop_local_server", lambda server: None)
-    monkeypatch.setattr("omnigent.chat._wait_for_server", lambda *a, **k: None)
+    monkeypatch.setattr("omnigent.cli.chat._find_free_port", lambda: 12346)
+    monkeypatch.setattr("omnigent.cli.chat._start_local_server", fake_start_server)
+    monkeypatch.setattr("omnigent.cli.chat._stop_local_server", lambda server: None)
+    monkeypatch.setattr("omnigent.cli.chat._wait_for_server", lambda *a, **k: None)
     monkeypatch.setattr(claude_native, "_prepare_claude_terminal", fake_prepare)
     monkeypatch.setattr(claude_native, "attach_local_terminal", fake_attach)
 
@@ -1889,13 +1889,13 @@ def test_remote_daemon_run_attaches_without_cli_forwarder(
         captured_attach.update(kwargs)
         return claude_native._AttachOutcome.EXITED
 
-    monkeypatch.setattr("omnigent.chat._bundle_agent", lambda path: b"bundle")
+    monkeypatch.setattr("omnigent.cli.chat._bundle_agent", lambda path: b"bundle")
     monkeypatch.setattr(
-        "omnigent.chat._remote_headers",
+        "omnigent.cli.chat._remote_headers",
         lambda server_url=None, **_kw: {"Authorization": "Bearer tok"},
     )
-    monkeypatch.setattr("omnigent.chat._server_auth", lambda server_url=None, **_kw: None)
-    monkeypatch.setattr("omnigent.cli._ensure_host_daemon", lambda base_url: None)
+    monkeypatch.setattr("omnigent.cli.chat._server_auth", lambda server_url=None, **_kw: None)
+    monkeypatch.setattr("omnigent.cli.commands._ensure_host_daemon", lambda base_url: None)
     monkeypatch.setattr(
         "omnigent.host.identity.load_or_create_host_identity",
         lambda: SimpleNamespace(host_id="host_test"),
@@ -6454,7 +6454,7 @@ def test_is_claude_native_conversation_returns_true_on_matching_label(
     a resume into the claude wrapper). A False negative here is
     exactly the resume misroute.
     """
-    from omnigent import chat
+    from omnigent.cli import chat
 
     def _fake_get(url: str, *, headers: dict[str, str], timeout: float) -> httpx.Response:
         """Canned 200 response with the claude-native wrapper label."""
@@ -6496,7 +6496,7 @@ def test_is_claude_native_conversation_returns_false_on_non_matching_label(
     The chat REPL stays on its normal AP-REPL path for these
     conversations.
     """
-    from omnigent import chat
+    from omnigent.cli import chat
 
     def _fake_get(_url: str, *, headers: dict[str, str], timeout: float) -> httpx.Response:
         """Canned 200 response with the parametrized labels."""
@@ -6530,7 +6530,7 @@ def test_is_claude_native_conversation_logs_warning_on_non_200(
     requires the right handler / propagation, which other tests'
     logging setup can disturb.
     """
-    from omnigent import chat
+    from omnigent.cli import chat
 
     def _fake_get(_url: str, *, headers: dict[str, str], timeout: float) -> httpx.Response:
         """Canned error response at the parametrized status code."""
@@ -6571,7 +6571,7 @@ def test_is_claude_native_conversation_returns_false_on_transport_error(
     own connect-fail error; we just record what we saw so a flaky
     server doesn't cause a silent misroute.
     """
-    from omnigent import chat
+    from omnigent.cli import chat
 
     def _raises(*_args: object, **_kwargs: object) -> httpx.Response:
         """Pretend the connect fails."""
@@ -11250,7 +11250,7 @@ def test_resolve_session_id_for_resume_partial_env_identity_is_concise(
 def _point_claude_at(monkeypatch: pytest.MonkeyPatch, path: Path) -> None:
     """Make the fingerprint resolve the Claude binary to *path*."""
     monkeypatch.setattr(
-        "omnigent.claude_launcher.resolve_claude_launch",
+        "omnigent.harnesses.claude_native.launcher.resolve_claude_launch",
         lambda command, args: (str(path), list(args)),
     )
 

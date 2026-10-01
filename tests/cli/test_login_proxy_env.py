@@ -28,7 +28,7 @@ import httpx
 import pytest
 from click.testing import CliRunner
 
-import omnigent.cli as cli_mod
+import omnigent.cli.commands as cli_mod
 
 cli_group = cli_mod.cli
 
@@ -53,7 +53,7 @@ def token_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     :returns: The temp directory path.
     """
     monkeypatch.setattr(
-        "omnigent.cli_auth._token_file_path",
+        "omnigent.cli.auth._token_file_path",
         lambda: tmp_path / "auth_tokens.json",
     )
     monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))

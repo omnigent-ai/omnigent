@@ -9,8 +9,8 @@ from collections.abc import Awaitable, Callable
 
 import pytest
 
-from omnigent.inner.model_auth import ProviderAuthRequired
-from omnigent.inner.model_credential import (
+from omnigent.models.signer.auth import ProviderAuthRequired
+from omnigent.models.signer.credential import (
     CredentialLifecycle,
     _authoritative_expiry,
 )

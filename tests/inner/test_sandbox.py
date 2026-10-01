@@ -15,12 +15,12 @@ import sys
 
 import pytest
 
-from omnigent.inner.sandbox import (
+from omnigent.sandbox.core import (
     SandboxPolicy,
     create_exec_launcher,
     run_launcher,
 )
-from omnigent.runner.identity import RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR
+from omnigent.util.runner_identity import RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR
 
 
 def _noop_policy() -> SandboxPolicy:
@@ -57,7 +57,7 @@ def test_run_launcher_emits_logger_checkpoints(caplog) -> None:
     erases the diagnostic signal the claude-sdk leg relies on to
     pinpoint a silent connect hang.
     """
-    with caplog.at_level(logging.INFO, logger="omnigent.inner.sandbox"):
+    with caplog.at_level(logging.INFO, logger="omnigent.sandbox.core"):
         rc = run_launcher(_noop_policy_arg(), sys.executable, ["-c", "pass"])
     assert rc == 0
 
@@ -104,7 +104,7 @@ def test_run_launcher_strips_runner_binding_token_from_target_env(monkeypatch) -
 
 def test_run_launcher_propagates_target_returncode(caplog) -> None:
     """``run_launcher`` returns the spawned target's exit code verbatim."""
-    with caplog.at_level(logging.INFO, logger="omnigent.inner.sandbox"):
+    with caplog.at_level(logging.INFO, logger="omnigent.sandbox.core"):
         rc = run_launcher(
             _noop_policy_arg(),
             sys.executable,
@@ -148,7 +148,7 @@ def test_run_launcher_wraps_target_with_strace_when_env_set(monkeypatch, caplog)
     trace=file`` to the spawned target's argv so the wrapper's stderr
     captures file-syscall denials (EACCES) from the sandbox.
     """
-    from omnigent.inner import sandbox as sb
+    from omnigent.sandbox import core as sb
 
     captured: list[list[str]] = []
 
@@ -167,7 +167,7 @@ def test_run_launcher_wraps_target_with_strace_when_env_set(monkeypatch, caplog)
     )
     monkeypatch.setenv("OMNIGENT_SANDBOX_STRACE", "1")
 
-    with caplog.at_level(logging.WARNING, logger="omnigent.inner.sandbox"):
+    with caplog.at_level(logging.WARNING, logger="omnigent.sandbox.core"):
         rc = sb.run_launcher(_noop_policy_arg(), "/bin/echo", ["hi"])
 
     assert rc == 0
@@ -185,7 +185,7 @@ def test_run_launcher_skips_strace_when_binary_missing(monkeypatch, caplog) -> N
     PATH, the wrapper must log a warning and run the target unwrapped
     rather than failing the spawn.
     """
-    from omnigent.inner import sandbox as sb
+    from omnigent.sandbox import core as sb
 
     captured: list[list[str]] = []
 
@@ -200,7 +200,7 @@ def test_run_launcher_skips_strace_when_binary_missing(monkeypatch, caplog) -> N
     monkeypatch.setattr(sb.shutil, "which", lambda name: None)
     monkeypatch.setenv("OMNIGENT_SANDBOX_STRACE", "1")
 
-    with caplog.at_level(logging.WARNING, logger="omnigent.inner.sandbox"):
+    with caplog.at_level(logging.WARNING, logger="omnigent.sandbox.core"):
         rc = sb.run_launcher(_noop_policy_arg(), "/bin/echo", ["hi"])
 
     assert rc == 0
@@ -238,7 +238,7 @@ def test_sandbox_policy_round_trips_spawn_env_allowlist() -> None:
 
 
 def test_credential_source_paths_survive_serialization_and_cloning(tmp_path: pathlib.Path) -> None:
-    from omnigent.inner.sandbox import with_additional_read_roots, with_additional_write_roots
+    from omnigent.sandbox.core import with_additional_read_roots, with_additional_write_roots
 
     policy = _noop_policy()
     protected = (tmp_path / "token.sock").resolve()
@@ -311,7 +311,7 @@ def test_with_additional_write_roots_records_mask_scan_skip_roots() -> None:
     """
     from pathlib import Path
 
-    from omnigent.inner.sandbox import with_additional_write_roots
+    from omnigent.sandbox.core import with_additional_write_roots
 
     policy = _noop_policy()
     scratch = Path("/tmp/omnigent-helper-ab12")
@@ -339,7 +339,7 @@ def test_with_denied_unix_sockets_resolves_dedupes_and_is_pure() -> None:
     """
     from pathlib import Path
 
-    from omnigent.inner.sandbox import with_denied_unix_sockets
+    from omnigent.sandbox.core import with_denied_unix_sockets
 
     policy = _noop_policy()
     sock = Path("/tmp/inst/tmux.sock")
@@ -359,7 +359,7 @@ def test_with_spawn_env_allowlist_sets_sorted_deduped_copy() -> None:
     policy unchanged rather than attaching an empty allowlist (which
     would prune EVERYTHING in the launcher).
     """
-    from omnigent.inner.sandbox import with_spawn_env_allowlist
+    from omnigent.sandbox.core import with_spawn_env_allowlist
 
     policy = _noop_policy()
 

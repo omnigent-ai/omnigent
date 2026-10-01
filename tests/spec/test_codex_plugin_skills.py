@@ -49,7 +49,7 @@ def _inventory(cli: Mock, *entries: dict[str, object]) -> None:
 
 @pytest.fixture(autouse=True)
 def codex_cli(monkeypatch: pytest.MonkeyPatch) -> Mock:
-    monkeypatch.setattr("omnigent.inner.codex_executor._find_codex_cli", lambda: "/test/codex")
+    monkeypatch.setattr("omnigent.harnesses.codex.executor._find_codex_cli", lambda: "/test/codex")
     cli = Mock()
     _inventory(cli, _entry())
     monkeypatch.setattr("omnigent.spec.codex_plugin_skills.subprocess.run", cli)

@@ -13,9 +13,8 @@ from fastapi.responses import JSONResponse
 from fastapi.testclient import TestClient
 
 from omnigent.errors import OmnigentError
-from omnigent.harness_plugins import CLAUDE_NATIVE_CODING_AGENT
+from omnigent.harnesses.registry import CLAUDE_NATIVE_CODING_AGENT
 from omnigent.host.frames import HOST_CAPABILITIES, HostHelloFrame
-from omnigent.inner.native_attachments import MAX_FILESYSTEM_ATTACHMENT_UPLOAD_BYTES
 from omnigent.runtime.content_resolver import (
     MAX_TEXT_UPLOAD_BYTES,
 )
@@ -27,6 +26,7 @@ from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
 from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
+from omnigent.util.attachments import MAX_FILESYSTEM_ATTACHMENT_UPLOAD_BYTES
 
 
 @pytest.fixture
@@ -443,7 +443,7 @@ def test_quota_counts_filesystem_files_past_any_page_boundary(
 
     from omnigent.entities import StoredFile
     from omnigent.entities.pagination import PagedList
-    from omnigent.server.routes._sessions.helpers import _enforce_filesystem_attachment_policy
+    from omnigent.server.routes.sessions.helpers import _enforce_filesystem_attachment_policy
 
     records = [
         StoredFile(id=f"f{i:03d}", created_at=i, filename=f"n{i}.txt", bytes=2) for i in range(30)

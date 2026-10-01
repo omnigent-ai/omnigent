@@ -96,8 +96,8 @@ async def policy_client(
     :param monkeypatch: Pytest monkeypatch fixture.
     :yields: A ready-to-use async HTTP client.
     """
+    from omnigent.harnesses.runtime.process_manager import HarnessProcessManager
     from omnigent.runtime import set_harness_process_manager
-    from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
 
     pm = HarnessProcessManager(tmp_parent=tmp_path / "harness_pm")
     await pm.start()

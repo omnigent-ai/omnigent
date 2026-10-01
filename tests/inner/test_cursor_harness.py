@@ -14,12 +14,12 @@ from unittest.mock import patch
 
 import pytest
 
-from omnigent.inner import cursor_harness
-from omnigent.runtime.harnesses import _HARNESS_MODULES
+from omnigent.harnesses.cursor import harness as cursor_harness
+from omnigent.harnesses.runtime import _HARNESS_MODULES
 
 
 def test_harness_module_registered_in_module_registry() -> None:
-    assert _HARNESS_MODULES.get("cursor") == "omnigent.inner.cursor_harness"
+    assert _HARNESS_MODULES.get("cursor") == "omnigent.harnesses.cursor.harness"
 
 
 def test_create_app_returns_fastapi_with_required_routes() -> None:
@@ -41,7 +41,7 @@ def test_executor_factory_reads_env_vars(monkeypatch: pytest.MonkeyPatch) -> Non
         captured.update(kwargs)
 
     with patch(
-        "omnigent.inner.cursor_harness.CursorExecutor.__init__",
+        "omnigent.harnesses.cursor.harness.CursorExecutor.__init__",
         _fake_init,
     ):
         cursor_harness._build_cursor_executor()
@@ -77,7 +77,7 @@ def test_executor_factory_unset_optional_env_passes_none(
         captured.update(kwargs)
 
     with patch(
-        "omnigent.inner.cursor_harness.CursorExecutor.__init__",
+        "omnigent.harnesses.cursor.harness.CursorExecutor.__init__",
         _fake_init,
     ):
         cursor_harness._build_cursor_executor()
@@ -104,7 +104,7 @@ def test_executor_factory_decodes_os_env_and_skills(monkeypatch: pytest.MonkeyPa
         captured.update(kwargs)
 
     with patch(
-        "omnigent.inner.cursor_harness.CursorExecutor.__init__",
+        "omnigent.harnesses.cursor.harness.CursorExecutor.__init__",
         _fake_init,
     ):
         cursor_harness._build_cursor_executor()
@@ -122,7 +122,7 @@ def test_malformed_os_env_falls_back_to_default(monkeypatch: pytest.MonkeyPatch)
         captured["os_env"] = kwargs["os_env"]
 
     with patch(
-        "omnigent.inner.cursor_harness.CursorExecutor.__init__",
+        "omnigent.harnesses.cursor.harness.CursorExecutor.__init__",
         _fake_init,
     ):
         cursor_harness._build_cursor_executor()

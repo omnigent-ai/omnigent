@@ -42,7 +42,7 @@ import httpx
 import pytest
 import yaml
 
-from omnigent.runner.identity import token_bound_runner_id
+from omnigent.util.runner_identity import token_bound_runner_id
 
 REPO = Path(__file__).resolve().parents[2]
 
@@ -149,7 +149,7 @@ def rig(tmp_path: Path) -> Iterator[dict[str, Any]]:
                 [
                     sys.executable,
                     "-m",
-                    "omnigent.cli",
+                    "omnigent.cli.commands",
                     "server",
                     "--port",
                     str(server_port),

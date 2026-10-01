@@ -6,7 +6,7 @@ import re
 import unicodedata
 from dataclasses import dataclass
 
-from omnigent.process_logging import redact_log_text
+from omnigent.observability.process_logging import redact_log_text
 
 DIAGNOSTIC_TAIL_BYTES = 64 * 1024
 _TERMINAL_ESCAPE = re.compile(

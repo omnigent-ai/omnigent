@@ -116,7 +116,7 @@ def write_model_config(
 
 
 def supervise(output: Path) -> None:
-    from omnigent.runner.identity import token_bound_runner_id
+    from omnigent.util.runner_identity import token_bound_runner_id
 
     state = json.loads((output / "environment.json").read_text())
     root = Path(state["workspace"])

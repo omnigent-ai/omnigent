@@ -23,11 +23,11 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec, TerminalEnvSpec
-from omnigent.inner.terminal import TerminalCreateResult, TerminalInstance
+from omnigent.core.datamodel import OSEnvSandboxSpec, OSEnvSpec, TerminalEnvSpec
 from omnigent.terminals import TerminalRegistry
 from omnigent.terminals import registry as registry_mod
 from omnigent.terminals.registry import TerminalListEntry, conversation_link_for_id
+from omnigent.terminals.terminal import TerminalCreateResult, TerminalInstance
 
 # ── Pure bookkeeping (no tmux) ────────────────────────────────
 
@@ -106,15 +106,15 @@ def test_conversation_link_for_id_maps_workspace_hosted_server_to_ui_mount(
     bar; the link must instead land on the ``/omnigent`` SPA mount and
     carry the ``?o=<org>`` selector ``omnigent login`` recorded, exactly
     like the CLI's ``Web UI:`` line. Pins parity with
-    :func:`omnigent.conversation_browser.conversation_url`.
+    :func:`omnigent.cli.conversation_browser.conversation_url`.
 
     :param tmp_path: Pytest tmp dir for the stubbed auth-token file.
     :param monkeypatch: Pytest monkeypatch fixture.
     """
-    from omnigent.cli_auth import store_databricks_auth
+    from omnigent.cli.auth import store_databricks_auth
 
     monkeypatch.setattr(
-        "omnigent.cli_auth._token_file_path",
+        "omnigent.cli.auth._token_file_path",
         lambda: tmp_path / "auth_tokens.json",
     )
     server = "https://example.databricks.com/api/2.0/omnigent"

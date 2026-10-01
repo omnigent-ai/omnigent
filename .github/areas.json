@@ -226,7 +226,7 @@
       "weight_source": "editorial",
       "definition": "Authentication, OIDC/OAuth, account login, and runtime credentials.",
       "paths": [
-        "omnigent/cli_auth.py",
+        "omnigent/cli/auth.py",
         "omnigent/runtime/credentials/",
         "omnigent/server/auth.py",
         "omnigent/server/oidc.py",
@@ -540,7 +540,7 @@
       "paths": [
         "omnigent/inner/codex_",
         "omnigent/inner/openai_",
-        "omnigent/inner/open_responses_sdk.py",
+        "omnigent/harnesses/open_responses/executor.py",
         "omnigent/codex_native"
       ],
       "owners": [

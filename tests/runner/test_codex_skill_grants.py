@@ -13,19 +13,19 @@ from pathlib import Path
 import httpx
 import pytest
 
+from omnigent.core.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.entities import DEFAULT_ENVIRONMENT_ID
-from omnigent.inference_config import inference_config_scope
-from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
-from omnigent.inner.os_env import CallerProcessOSEnvironment
+from omnigent.environments.os_env import CallerProcessOSEnvironment
+from omnigent.harnesses.runtime import _HARNESS_MODULES
+from omnigent.harnesses.runtime.process_manager import (
+    HarnessProcessManager,
+    _build_harness_spawn_env,
+)
+from omnigent.models.inference_config import inference_config_scope
 from omnigent.runner import create_runner_app
 from omnigent.runner.app import _build_spawn_env_from_spec
 from omnigent.runner.resource_registry import SessionResourceRegistry
 from omnigent.runner.tool_dispatch import _execute_os_env_tool
-from omnigent.runtime.harnesses import _HARNESS_MODULES
-from omnigent.runtime.harnesses.process_manager import (
-    HarnessProcessManager,
-    _build_harness_spawn_env,
-)
 from omnigent.spec.types import AgentSpec, ApiKeyAuth, ExecutorSpec
 from tests.runner.helpers import NullServerClient
 

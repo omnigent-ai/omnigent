@@ -24,10 +24,6 @@ from websockets.exceptions import (
 from websockets.frames import Close
 from websockets.http11 import Response
 
-from omnigent.runner.identity import (
-    OMNIGENT_INTERNAL_WS_ORIGIN,
-    RUNNER_TUNNEL_TOKEN_HEADER,
-)
 from omnigent.runner.transports.ws_tunnel import serve as serve_module
 from omnigent.runner.transports.ws_tunnel.frames import (
     PingFrame,
@@ -45,6 +41,10 @@ from omnigent.runner.transports.ws_tunnel.serve import (
     _websocket_close_code,
     _websocket_http_status,
     serve_tunnel,
+)
+from omnigent.util.runner_identity import (
+    OMNIGENT_INTERNAL_WS_ORIGIN,
+    RUNNER_TUNNEL_TOKEN_HEADER,
 )
 
 
@@ -793,7 +793,7 @@ async def test_serve_tunnel_once_sends_bearer_header(
     monkeypatch.setattr(websockets, "connect", _fake_connect)
     # No recorded ?o= selector, so no workspace-routing header rides the
     # handshake (keeps the asserted header set exact).
-    monkeypatch.setattr("omnigent.cli_auth.load_databricks_org_id", lambda _server_url: None)
+    monkeypatch.setattr("omnigent.cli.auth.load_databricks_org_id", lambda _server_url: None)
 
     import logging
 
@@ -855,8 +855,8 @@ async def test_serve_tunnel_once_sends_bearer_header(
         "ping_timeout": serve_module.TUNNEL_KEEPALIVE_PING_TIMEOUT_S,
     }
     assert isinstance(captured["sent"], str)
-    from omnigent.inner.native_attachments import CAP_FILESYSTEM_ATTACHMENTS
     from omnigent.runner.transports.ws_tunnel.frames import HelloFrame, decode_frame
+    from omnigent.util.attachments import CAP_FILESYSTEM_ATTACHMENTS
 
     hello = decode_frame(captured["sent"])
     assert isinstance(hello, HelloFrame)
@@ -921,7 +921,7 @@ async def test_serve_tunnel_once_sends_org_header(
 
     monkeypatch.setattr(websockets, "connect", _fake_connect)
     monkeypatch.setattr(
-        "omnigent.cli_auth.load_databricks_org_id", lambda _server_url: "2850744067564480"
+        "omnigent.cli.auth.load_databricks_org_id", lambda _server_url: "2850744067564480"
     )
 
     await _serve_tunnel_once(
@@ -969,7 +969,7 @@ async def test_serve_tunnel_once_reraises_received_recycle_close_code(
     import websockets
 
     monkeypatch.setattr(websockets, "connect", lambda *_a, **_kw: _CleanCloseCtx(1001))
-    monkeypatch.setattr("omnigent.cli_auth.load_databricks_org_id", lambda _url: None)
+    monkeypatch.setattr("omnigent.cli.auth.load_databricks_org_id", lambda _url: None)
 
     with pytest.raises(ConnectionClosedOK):
         await _serve_tunnel_once(
@@ -993,7 +993,7 @@ async def test_serve_tunnel_once_swallows_non_recycle_clean_close(
     import websockets
 
     monkeypatch.setattr(websockets, "connect", lambda *_a, **_kw: _CleanCloseCtx(1000))
-    monkeypatch.setattr("omnigent.cli_auth.load_databricks_org_id", lambda _url: None)
+    monkeypatch.setattr("omnigent.cli.auth.load_databricks_org_id", lambda _url: None)
 
     # No exception -> the function returned normally, same as today's
     # ``async for`` swallow of an ordinary clean close.
@@ -1119,7 +1119,7 @@ async def test_serve_tunnel_once_graceful_shutdown_returns_and_closes(
         return _Ctx()
 
     monkeypatch.setattr(websockets, "connect", _fake_connect)
-    monkeypatch.setattr("omnigent.cli_auth.load_databricks_org_id", lambda _server_url: None)
+    monkeypatch.setattr("omnigent.cli.auth.load_databricks_org_id", lambda _server_url: None)
 
     # Pre-arm the shutdown so the very first recv() race resolves to shutdown
     # (recv blocks forever). Deterministic — no real-time sleep to lose to load.
@@ -2098,7 +2098,7 @@ async def _capture_connect_kwargs(
 
     captured: dict[str, Any] = {}
     monkeypatch.setattr(websockets, "connect", _StubConnect(captured))
-    monkeypatch.setattr("omnigent.cli_auth.databricks_request_headers", lambda *_a, **_k: {})
+    monkeypatch.setattr("omnigent.cli.auth.databricks_request_headers", lambda *_a, **_k: {})
     await _serve_tunnel_once(
         None,  # type: ignore[arg-type]  # app unused: the stub ws closes immediately
         tunnel_url=tunnel_url,
@@ -2385,7 +2385,7 @@ async def test_serve_tunnel_once_suspend_resume_aborts_tunnel(
         await asyncio.Event().wait()
 
     monkeypatch.setattr(websockets, "connect", lambda *_a, **_kw: _Ctx())
-    monkeypatch.setattr("omnigent.cli_auth.load_databricks_org_id", lambda _url: None)
+    monkeypatch.setattr("omnigent.cli.auth.load_databricks_org_id", lambda _url: None)
     monkeypatch.setattr(serve_module, "watch_for_resume", _fake_watch)
 
     noted: list[bool] = []

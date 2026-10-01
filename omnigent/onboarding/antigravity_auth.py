@@ -161,6 +161,6 @@ def antigravity_api_key_settings(ref: str) -> dict[str, object]:
     """Build the ``{"antigravity": {"api_key_ref": ref}}`` settings dict.
 
     :param ref: The reference to record, e.g. ``"keychain:antigravity"``.
-    :returns: The settings dict for :func:`omnigent.cli._save_global_config`.
+    :returns: The settings dict for :func:`omnigent.cli.commands._save_global_config`.
     """
     return {ANTIGRAVITY_CONFIG_KEY: {_API_KEY_REF_FIELD: ref}}

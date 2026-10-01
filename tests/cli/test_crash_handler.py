@@ -1,4 +1,4 @@
-"""Tests for the friendly crash handler + UI (``omnigent.crash_handler``).
+"""Tests for the friendly crash handler + UI (``omnigent.cli.crash_handler``).
 
 Covers: report building, token redaction, save + rotation, plain
 (non-TTY) rendering, the interactive yes/no bug-filing flow with
@@ -21,8 +21,8 @@ from pathlib import Path
 
 import pytest
 
-from omnigent import crash_handler as ch
-from omnigent import crash_ui
+from omnigent.cli import crash_handler as ch
+from omnigent.cli import crash_ui
 from omnigent.version import VERSION
 
 

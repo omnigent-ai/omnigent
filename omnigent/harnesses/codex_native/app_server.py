@@ -33,7 +33,26 @@ if TYPE_CHECKING:
     from omnigent.onboarding.provider_config import ProviderEntry
     from omnigent.spec.types import AgentSpec
 
-from omnigent.cli_invocation import cli_invocation
+from omnigent.harnesses.codex.executor import (
+    _CODEX_ROUTER_HOOK_MODULE,
+    _clean_codex_env,
+    _codex_cli_version,
+    _codex_home_config_source_from_env,
+    _databricks_codex_auth_command,
+    _databricks_codex_base_url,
+    _databricks_codex_config_overrides,
+    _find_codex_cli,
+    _populate_codex_home_config,
+    _provider_codex_config_overrides,
+    codex_extended_catalog_requested,
+    codex_router_bridge_dir,
+    codex_router_hooks_settings,
+    codex_router_session_id,
+    codex_routing_hook_skip_reason,
+    materialize_codex_provider_config,
+    read_codex_model_catalog,
+    write_codex_hooks_file,
+)
 from omnigent.harnesses.codex_native.bridge import write_policy_hook_config
 from omnigent.harnesses.codex_native.launch_args import (
     _write_private_config,
@@ -58,38 +77,19 @@ from omnigent.harnesses.codex_native.stderr_diagnostics import (
     codex_app_server_diagnostic_env,
     report_capture_start_failure,
 )
-from omnigent.inner import _proc
-from omnigent.inner.codex_executor import (
-    _CODEX_ROUTER_HOOK_MODULE,
-    _clean_codex_env,
-    _codex_cli_version,
-    _codex_home_config_source_from_env,
-    _databricks_codex_auth_command,
-    _databricks_codex_base_url,
-    _databricks_codex_config_overrides,
-    _find_codex_cli,
-    _populate_codex_home_config,
-    _provider_codex_config_overrides,
-    codex_extended_catalog_requested,
-    codex_router_bridge_dir,
-    codex_router_hooks_settings,
-    codex_router_session_id,
-    codex_routing_hook_skip_reason,
-    materialize_codex_provider_config,
-    read_codex_model_catalog,
-    write_codex_hooks_file,
-)
-from omnigent.inner.databricks_executor import (
+from omnigent.harnesses.databricks.executor import (
     _databricks_gateway_host,
     _read_databrickscfg_host,
 )
 from omnigent.models.codex_model_vocabulary import codex_reachable_model_slug, codex_spawn_model
-from omnigent.process_logging import (
+from omnigent.observability.process_logging import (
     harness_stderr_capture_enabled,
     log_info_once,
     log_once,
     redact_log_text,
 )
+from omnigent.util import proc as _proc
+from omnigent.util.cli_invocation import cli_invocation
 from omnigent.util.reasoning_effort import CODEX_NATIVE_EFFORTS
 
 _logger = logging.getLogger(__name__)
@@ -2430,7 +2430,7 @@ def _turn_router_advertised(bridge_dir: Path) -> bool:
     :returns: ``True`` when a usable ``turn_router.json`` is present, i.e. the
         session launched with Smart Routing on.
     """
-    from omnigent.inner.hook_scripts.subagent_router import read_router_endpoint
+    from omnigent.harnesses.native.hook_scripts.subagent_router import read_router_endpoint
     from omnigent.runner.turn_routing import ADVERTISEMENT_FILE
 
     return read_router_endpoint(bridge_dir, filename=ADVERTISEMENT_FILE) is not None
@@ -2467,7 +2467,7 @@ def _codex_policy_hooks_settings(
         "command": _codex_policy_hook_command(bridge_dir, python_executable),
         "timeout": _POLICY_HOOK_TIMEOUT_SECONDS,
     }
-    from omnigent.native.tool_observer_hook import hook_settings
+    from omnigent.harnesses.native.tool_observer_hook import hook_settings
 
     observer = hook_settings(bridge_dir, python_executable or sys.executable, _POLICY_HOOK_MODULE)
     prompt_submit: list[_JsonObject] = [hook]
@@ -3358,7 +3358,7 @@ def _config_default_provider_base_url() -> str | None:
     """
     import tomllib
 
-    from omnigent.inner.codex_executor import _codex_home_config_source_from_env
+    from omnigent.harnesses.codex.executor import _codex_home_config_source_from_env
     from omnigent.onboarding.detected import codex_config_provider_dismissed
     from omnigent.onboarding.provider_config import load_config
 
@@ -3404,7 +3404,7 @@ def _config_toml_provider_base_url(provider_name: str) -> str | None:
     """
     import tomllib
 
-    from omnigent.inner.codex_executor import _codex_home_config_source_from_env
+    from omnigent.harnesses.codex.executor import _codex_home_config_source_from_env
 
     config_path = _codex_home_config_source_from_env() / "config.toml"
     try:
@@ -3683,7 +3683,7 @@ def resolve_native_codex_launch(
         config (issue #2744 — parity with the in-process codex harness).
     :returns: The resolved :class:`NativeCodexLaunch`.
     """
-    from omnigent.inference_config import (
+    from omnigent.models.inference_config import (
         load_runtime_inference_config,
         resolve_bound_model,
         resolve_bound_provider,
@@ -3832,11 +3832,11 @@ def resolve_native_codex_launch(
         # Use the managed host's Databricks broker only when no provider or
         # explicit API-key auth selected a route. Host boot populated ucode
         # state so the model resolves to a served id.
+        from omnigent.harnesses.databricks.executor import _read_databrickscfg_host
         from omnigent.host.databricks_credential import (
             HOST_DATABRICKS_PROFILE,
             broker_token_command,
         )
-        from omnigent.inner.databricks_executor import _read_databrickscfg_host
 
         connect_host = _read_databrickscfg_host(HOST_DATABRICKS_PROFILE)
         if connect_host and broker_token_command(connect_host.rstrip("/")):

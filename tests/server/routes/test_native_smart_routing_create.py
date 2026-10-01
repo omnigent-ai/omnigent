@@ -31,11 +31,11 @@ from omnigent.db.db_models import SqlConversation
 from omnigent.db.utils import generate_agent_id
 from omnigent.runner.subagent_routing import AUTO_HARNESS_LABEL_KEY, ROUTING_DECISION_LABEL_KEY
 from omnigent.server.host_registry import HostRegistry
-from omnigent.server.routes._sessions.common import (
+from omnigent.server.routes.sessions.common import (
     get_server_host_registry,
     set_server_host_registry,
 )
-from omnigent.server.routes._sessions.orchestration import (
+from omnigent.server.routes.sessions.orchestration import (
     _installed_native_harnesses,
     _pre_session_model_catalog,
 )
@@ -1109,7 +1109,7 @@ def test_ungatewayed_native_harnesses_reads_the_reported_gateway_map(
     expected: list[str],
     gateway_host_registry: HostRegistry,
 ) -> None:
-    from omnigent.server.routes._sessions.orchestration import _ungatewayed_native_harnesses
+    from omnigent.server.routes.sessions.orchestration import _ungatewayed_native_harnesses
 
     gateway_host_registry.record_gateway_inference(_GATEWAY_HOST_ID, gateway)
     assert _ungatewayed_native_harnesses(_host(None), AUTO_NATIVE_ROUTING_HARNESSES) == list(
@@ -1120,7 +1120,7 @@ def test_ungatewayed_native_harnesses_reads_the_reported_gateway_map(
 def test_ungatewayed_native_harnesses_without_a_host(
     gateway_host_registry: HostRegistry,
 ) -> None:
-    from omnigent.server.routes._sessions.orchestration import _ungatewayed_native_harnesses
+    from omnigent.server.routes.sessions.orchestration import _ungatewayed_native_harnesses
 
     assert _ungatewayed_native_harnesses(None, AUTO_NATIVE_ROUTING_HARNESSES) == []
 
@@ -1151,7 +1151,7 @@ async def test_auto_routing_is_refused_when_no_router_can_serve_an_off_gateway_a
     named: str,
 ) -> None:
     """Only fatal with no built-in judge: nothing is left to answer with."""
-    from omnigent.server.routes._sessions.orchestration import _resolve_native_smart_routing
+    from omnigent.server.routes.sessions.orchestration import _resolve_native_smart_routing
 
     body = SimpleNamespace(host_id="host_1", smart_routing_message=ROUTING_MESSAGE)
     routing_client = FakeRoutingClient(RoutingResult(model=CLAUDE_MODEL, rationale="sized task"))
@@ -1189,7 +1189,7 @@ _OFF_GATEWAY_CATALOG = {
 async def test_auto_routing_falls_back_to_the_built_in_judge_off_the_gateway(
     gateway: dict[str, bool],
 ) -> None:
-    from omnigent.server.routes._sessions import orchestration
+    from omnigent.server.routes.sessions import orchestration
 
     body = SimpleNamespace(host_id="host_1", smart_routing_message=ROUTING_MESSAGE)
     routing_client = FakeRoutingClient(
@@ -1223,7 +1223,7 @@ async def test_auto_routing_declines_off_the_gateway_when_the_host_answers_nothi
     The static table is every ``databricks-*`` endpoint, so offering it here
     would land the session on a model the ungatewayed pane cannot reach.
     """
-    from omnigent.server.routes._sessions import orchestration
+    from omnigent.server.routes.sessions import orchestration
 
     body = SimpleNamespace(host_id="host_1", smart_routing_message=ROUTING_MESSAGE)
     routing_client = FakeRoutingClient(RoutingResult(model=CLAUDE_MODEL, rationale="sized task"))
@@ -1242,7 +1242,7 @@ async def test_auto_routing_declines_off_the_gateway_when_the_host_answers_nothi
 
 
 async def test_auto_routing_still_runs_when_the_host_reports_no_gateway_map() -> None:
-    from omnigent.server.routes._sessions.orchestration import _resolve_native_smart_routing
+    from omnigent.server.routes.sessions.orchestration import _resolve_native_smart_routing
 
     body = SimpleNamespace(host_id="host_1", smart_routing_message=ROUTING_MESSAGE)
     routing_client = FakeRoutingClient(RoutingResult(model=GPT_MODEL, rationale="narrow change"))
@@ -1267,7 +1267,7 @@ async def test_a_judge_only_deployment_keeps_the_default_pane_and_routes_its_mod
     model — a normal Smart Routing session minus the harness half — rather
     than declining into a session with no terminal.
     """
-    from omnigent.server.routes._sessions.orchestration import _resolve_native_smart_routing
+    from omnigent.server.routes.sessions.orchestration import _resolve_native_smart_routing
 
     body = SimpleNamespace(host_id="host_1", smart_routing_message=ROUTING_MESSAGE)
     judge = FakeRoutingClient(RoutingResult(model=CLAUDE_MODEL, rationale="sized task"))
@@ -1290,7 +1290,7 @@ async def test_a_judge_only_deployment_keeps_the_default_pane_and_routes_its_mod
 
 async def test_a_judge_only_create_pins_nothing_when_the_pick_is_out_of_family() -> None:
     """One pane on offer means any pick resolves onto it — so check the family."""
-    from omnigent.server.routes._sessions.orchestration import _resolve_native_smart_routing
+    from omnigent.server.routes.sessions.orchestration import _resolve_native_smart_routing
 
     body = SimpleNamespace(host_id="host_1", smart_routing_message=ROUTING_MESSAGE)
     judge = FakeRoutingClient(RoutingResult(model=GPT_MODEL, rationale="narrow change"))
@@ -1312,7 +1312,7 @@ async def test_top_level_smart_routing_create_is_rejected_when_no_router_can_ser
     client: httpx.AsyncClient,
     db_uri: str,
 ) -> None:
-    from omnigent.server.routes._sessions import orchestration
+    from omnigent.server.routes.sessions import orchestration
 
     wrappers = await _native_wrappers(client, db_uri)
     routing_client = FakeRoutingClient(RoutingResult(model=CLAUDE_MODEL, rationale="sized task"))
@@ -1329,7 +1329,7 @@ async def test_top_level_smart_routing_create_succeeds_off_the_gateway_with_the_
     client: httpx.AsyncClient,
     db_uri: str,
 ) -> None:
-    from omnigent.server.routes._sessions import orchestration
+    from omnigent.server.routes.sessions import orchestration
 
     wrappers = await _native_wrappers(client, db_uri)
     routing_client = FakeRoutingClient(
@@ -1360,7 +1360,7 @@ async def test_fixed_harness_routing_create_is_rejected_when_no_router_can_serve
     db_uri: str,
     harness: str,
 ) -> None:
-    from omnigent.server.routes._sessions import orchestration
+    from omnigent.server.routes.sessions import orchestration
 
     wrappers = await _native_wrappers(client, db_uri)
     routing_client = FakeRoutingClient(RoutingResult(model=CLAUDE_MODEL, rationale="sized task"))
@@ -1382,7 +1382,7 @@ async def test_fixed_harness_routing_create_succeeds_off_the_gateway_with_the_ju
     db_uri: str,
     harness: str,
 ) -> None:
-    from omnigent.server.routes._sessions import orchestration
+    from omnigent.server.routes.sessions import orchestration
 
     wrappers = await _native_wrappers(client, db_uri)
     pick = _OFF_GATEWAY_CATALOG[harness][0]
@@ -1419,7 +1419,7 @@ async def test_a_pane_create_routes_with_the_judge_when_the_router_is_not_enable
     routing API enabled, so ``routes:select`` 404s. The session must still get
     a normal Smart Routing decision, from the judge.
     """
-    from omnigent.server.routes._sessions import orchestration
+    from omnigent.server.routes.sessions import orchestration
     from omnigent.server.routing_backend import RoutingBackends
 
     wrappers = await _native_wrappers(client, db_uri)
@@ -1474,7 +1474,7 @@ async def test_fixed_harness_create_is_allowed_when_its_own_family_is_backed(
     gateway: dict[str, bool],
     extra: dict[str, Any],  # type: ignore[explicit-any]
 ) -> None:
-    from omnigent.server.routes._sessions import orchestration
+    from omnigent.server.routes.sessions import orchestration
 
     wrappers = await _native_wrappers(client, db_uri)
     routing_client = FakeRoutingClient(RoutingResult(model=CLAUDE_MODEL, rationale="sized task"))
@@ -1492,7 +1492,7 @@ async def test_child_create_is_not_gated_by_the_parents_gateway_state(
     client: httpx.AsyncClient,
     db_uri: str,
 ) -> None:
-    from omnigent.server.routes._sessions import orchestration
+    from omnigent.server.routes.sessions import orchestration
 
     wrappers = await _native_wrappers(client, db_uri)
     parent = await client.post("/v1/sessions", json={"agent_id": wrappers["codex-native"]})
@@ -1519,7 +1519,7 @@ async def test_sdk_harness_create_is_not_gated_by_native_gateway_state(
     client: httpx.AsyncClient,
     db_uri: str,
 ) -> None:
-    from omnigent.server.routes._sessions import orchestration
+    from omnigent.server.routes.sessions import orchestration
 
     # An SDK harness runs its inference through the server, not a host CLI, so a
     # host whose native CLIs are off the gateway says nothing about it.
@@ -1721,7 +1721,7 @@ def _native_conv(  # type: ignore[explicit-any]
     routing: bool = False,
     archived: bool = False,
 ) -> Any:
-    from omnigent.harness_plugins import CLAUDE_NATIVE_CODING_AGENT
+    from omnigent.harnesses.registry import CLAUDE_NATIVE_CODING_AGENT
 
     return SimpleNamespace(
         id=session_id,
@@ -1734,7 +1734,7 @@ def _native_conv(  # type: ignore[explicit-any]
 
 async def test_turn_catalog_and_verdict_follow_the_panes_vocabulary() -> None:
     """The picker rows bound both what a turn may pick and what it may claim."""
-    from omnigent.server.routes._sessions.orchestration import (
+    from omnigent.server.routes.sessions.orchestration import (
         _model_options_cache,
         _native_turn_catalog,
         _routed_turn_model_spelling,
@@ -1790,7 +1790,7 @@ async def test_turn_catalog_and_verdict_follow_the_panes_vocabulary() -> None:
 
 
 async def test_turn_catalog_spells_managed_models_outside_claude_families() -> None:
-    from omnigent.server.routes._sessions.orchestration import (
+    from omnigent.server.routes.sessions.orchestration import (
         _model_options_cache,
         _native_turn_catalog,
         _routed_turn_model_spelling,
@@ -1815,7 +1815,7 @@ async def test_turn_catalog_spells_managed_models_outside_claude_families() -> N
 
 async def test_turn_catalog_refetches_a_stale_pre_launch_catalog() -> None:
     """A pre-launch host catalog never bounds a turn once a runner is bound."""
-    from omnigent.server.routes._sessions.orchestration import (
+    from omnigent.server.routes.sessions.orchestration import (
         _model_options_cache,
         _model_options_stale,
         _native_turn_catalog,
@@ -1871,13 +1871,13 @@ async def test_launch_prefetch_takes_the_stale_refresh_off_the_turn_path() -> No
     Started at launch instead, it has landed by the time the prompt arrives and
     the turn reads the cache — no wait, no second fetch.
     """
-    from omnigent.server.routes._sessions.orchestration import (
+    from omnigent.server.routes.sessions import prefetch_session_routing_catalogs
+    from omnigent.server.routes.sessions.orchestration import (
         _model_options_cache,
         _model_options_inflight,
         _model_options_stale,
         _native_turn_catalog,
     )
-    from omnigent.server.routes.sessions import prefetch_session_routing_catalogs
 
     session_id = "conv_prefetch_launch"
     conv = _native_conv(session_id, routing=True)
@@ -1944,9 +1944,9 @@ async def test_plain_session_gets_no_catalog_prefetch_on_runner_connect() -> Non
     per plain pane — work only Smart Routing ever reads — starving the session
     re-init running alongside it.
     """
-    from omnigent.server.routes._sessions.common import _catalog_prefetch_tasks
-    from omnigent.server.routes._sessions.orchestration import _model_options_inflight
     from omnigent.server.routes.sessions import prefetch_session_routing_catalogs
+    from omnigent.server.routes.sessions.common import _catalog_prefetch_tasks
+    from omnigent.server.routes.sessions.orchestration import _model_options_inflight
 
     session_id = "conv_prefetch_plain"
     requested: list[str] = []
@@ -1965,9 +1965,9 @@ async def test_plain_session_gets_no_catalog_prefetch_on_runner_connect() -> Non
 
 async def test_archived_routed_session_gets_no_catalog_prefetch() -> None:
     """An archived session is not going to route a turn, so it warms nothing."""
-    from omnigent.server.routes._sessions.common import _catalog_prefetch_tasks
-    from omnigent.server.routes._sessions.orchestration import _model_options_inflight
     from omnigent.server.routes.sessions import prefetch_session_routing_catalogs
+    from omnigent.server.routes.sessions.common import _catalog_prefetch_tasks
+    from omnigent.server.routes.sessions.orchestration import _model_options_inflight
 
     session_id = "conv_prefetch_archived"
     conv = _native_conv(session_id, routing=True, archived=True)
@@ -1987,12 +1987,12 @@ async def test_archived_routed_session_gets_no_catalog_prefetch() -> None:
 
 async def test_routed_live_session_still_warms_both_catalogs() -> None:
     """The gate keeps the case it was built for: a routed pane warms both."""
-    from omnigent.server.routes._sessions.common import _catalog_prefetch_tasks
-    from omnigent.server.routes._sessions.orchestration import (
+    from omnigent.server.routes.sessions import prefetch_session_routing_catalogs
+    from omnigent.server.routes.sessions.common import _catalog_prefetch_tasks
+    from omnigent.server.routes.sessions.orchestration import (
         _model_options_cache,
         _model_options_inflight,
     )
-    from omnigent.server.routes.sessions import prefetch_session_routing_catalogs
 
     session_id = "conv_prefetch_routed"
     conv = _native_conv(session_id, routing=True)
@@ -2028,9 +2028,9 @@ async def test_failing_prefetch_retrieves_its_own_exception(
     Nothing awaits these tasks, so an escaping error surfaces only as asyncio's
     unretrieved-exception warning at GC time — noise that hides real failures.
     """
-    from omnigent.server.routes._sessions.common import _catalog_prefetch_tasks
-    from omnigent.server.routes._sessions.orchestration import _model_options_inflight
     from omnigent.server.routes.sessions import prefetch_session_routing_catalogs
+    from omnigent.server.routes.sessions.common import _catalog_prefetch_tasks
+    from omnigent.server.routes.sessions.orchestration import _model_options_inflight
 
     session_id = "conv_prefetch_raises"
     conv = _native_conv(session_id, routing=True)
@@ -2054,7 +2054,7 @@ async def test_failing_prefetch_retrieves_its_own_exception(
 
 async def test_turn_catalog_keeps_a_stale_catalog_when_the_refetch_fails() -> None:
     """A stale vocabulary still bounds the turn when the runner cannot answer."""
-    from omnigent.server.routes._sessions.orchestration import (
+    from omnigent.server.routes.sessions.orchestration import (
         _model_options_cache,
         _model_options_stale,
         _native_turn_catalog,
@@ -2094,7 +2094,7 @@ async def test_turn_catalog_gives_up_on_a_refetch_that_never_finishes() -> None:
     """
     import asyncio
 
-    from omnigent.server.routes._sessions.orchestration import (
+    from omnigent.server.routes.sessions.orchestration import (
         _ROUTING_CATALOG_WAIT_S,
         _model_options_cache,
         _model_options_inflight,
@@ -2160,7 +2160,7 @@ async def test_routing_authorizes_host_ownership_before_touching_the_host() -> N
     """A foreign ``host_id`` is rejected before any host read or frame push."""
     from fastapi import HTTPException
 
-    from omnigent.server.routes._sessions.orchestration import _resolve_native_smart_routing
+    from omnigent.server.routes.sessions.orchestration import _resolve_native_smart_routing
 
     sent: list[str] = []
     conn = SimpleNamespace(host_id="host_1", pending_model_options={})
@@ -2298,7 +2298,7 @@ def test_routed_spelling_types_a_managed_picker_row_verbatim() -> None:
     pick was recorded as "not applied" and the pane kept its launch model.
     """
     from omnigent.entities import Conversation
-    from omnigent.server.routes._sessions import orchestration as _orchestration
+    from omnigent.server.routes.sessions import orchestration as _orchestration
 
     conv = Conversation(
         id="conv_managed",

@@ -291,7 +291,7 @@
    * Expand a bare Databricks workspace URL to its Omnigent web-UI mount.
    *
    * Mirrors the omni CLI's behavioral detection
-   * (``omnigent/cli.py:_workspace_api_server_url``): rather than match
+   * (``omnigent/cli/commands.py:_workspace_api_server_url``): rather than match
    * hostnames, probe the URL and adopt the mount only when the host answers
    * like a Databricks workspace — a response carrying the ``server: databricks``
    * header. URLs that already carry a path, or aren't https, are returned

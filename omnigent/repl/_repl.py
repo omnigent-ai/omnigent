@@ -69,8 +69,8 @@ from rich.console import RenderableType
 from rich.markup import escape
 from rich.text import Text
 
-from omnigent.cli_invocation import cli_invocation
 from omnigent.spec.types import SkillSpec
+from omnigent.util.cli_invocation import cli_invocation
 
 if TYPE_CHECKING:
     from omnigent_client._tool_handler import ToolCallInfo
@@ -506,7 +506,7 @@ def _render_startup_banner_ansi(
         ``None`` for the minimal banner.
     :returns: ANSI-styled string ready to be written to stdout.
     """
-    from omnigent.inner.banner import BannerLine, startup_banner_strings
+    from omnigent.cli.banner import BannerLine, startup_banner_strings
     from omnigent.util.server_url import display_server_url, is_workspace_hosted_url
 
     remote = _is_remote_server_url(server_url)
@@ -1755,7 +1755,7 @@ class _SessionsChatReplAdapter:
         if agent_id is None:
             raise RuntimeError(f"Could not resolve an agent id for {self._agent_name!r}")
         if self._runner_id is None:
-            from omnigent.harness_aliases import canonicalize_harness
+            from omnigent.harnesses.aliases import canonicalize_harness
 
             self._runner_id = await self._client.sessions.resolve_online_runner(
                 harness=agent.harness if agent is not None else None,
@@ -4304,7 +4304,7 @@ async def run_repl(
     from omnigent_ui_sdk import Overlay
 
     async def _overview_builder(target: OverlayTarget | None) -> RenderableType:
-        from omnigent.cli_diagnostics import current_cli_log_path
+        from omnigent.cli.diagnostics import current_cli_log_path
 
         if target is None:
             return Text.from_markup("[dim]No debug target available.[/dim]")
@@ -6166,7 +6166,7 @@ async def _cmd_compact(
     """Request proactive context compaction for the current conversation."""
     from rich.text import Text
 
-    from omnigent.harness_aliases import is_native_harness
+    from omnigent.harnesses.aliases import is_native_harness
 
     _harness = getattr(session, "harness", None)
     if _harness is not None and not is_native_harness(_harness):
@@ -6357,7 +6357,7 @@ async def _cmd_logs(
     """Create a zip bundle containing logs for the active REPL session."""
     from rich.text import Text
 
-    from omnigent.cli_diagnostics import current_cli_log_path
+    from omnigent.cli.diagnostics import current_cli_log_path
     from omnigent.repl._session_log import write_logs_zip, write_session_log
 
     output_path = pathlib.Path(arg).expanduser() if arg.strip() else None
@@ -6888,7 +6888,7 @@ class _TerminalInfo:
         the ``-S`` arg an attach command needs.
     :param target: Tmux target. Always ``"main"`` per the
         :class:`TerminalInstance.tmux_target` constant
-        (``omnigent/inner/terminal.py:167``); kept on the
+        (``omnigent/terminals/terminal.py:167``); kept on the
         struct for forward compatibility if that constant ever
         becomes per-terminal.
     :param conv_id: The conversation that owns this terminal
@@ -7449,7 +7449,7 @@ def _tmux_session_alive(socket: str, target: str) -> bool:
         ``"/tmp/omnigent-terminal-xyz/tmux.sock"``.
     :param target: Tmux session/target name. Always
         ``"main"`` per
-        :class:`omnigent.inner.terminal.TerminalInstance.tmux_target`.
+        :class:`omnigent.terminals.terminal.TerminalInstance.tmux_target`.
     :returns: ``True`` only when ``tmux has-session`` exits
         zero — i.e. the session is reachable on the socket.
     """
@@ -7585,7 +7585,7 @@ async def _build_debug_overview(
     1. **Session header** — ``Session: main``, Session ID
        (conversation id), Agent, Model, Response, Messages
        count. Matches :func:`_render_overview_session_text`
-       in ``omnigent/cli.py``.
+       in ``omnigent/cli/commands.py``.
     2. **Event stream** — all items from the conversation,
        paginated via :func:`_list_all_conversation_items`,
        re-rendered via
@@ -7824,7 +7824,7 @@ def _render_overview_event(
     Produces a header line ``[N] type=<event>`` followed by
     indented field lines (``name: ...``, ``args: ...``,
     ``status: ...``, ``result: ...``). The per-type field set
-    matches what ``omnigent/cli.py::_render_overview_item``
+    matches what ``omnigent/cli/commands.py::_render_overview_item``
     emits so the two overviews read identically.
 
     :param idx: 1-based index for the ``[N]`` header.

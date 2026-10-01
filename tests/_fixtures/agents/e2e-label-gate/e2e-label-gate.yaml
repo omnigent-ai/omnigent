@@ -22,7 +22,7 @@ label_schema:
 policies:
   taint_on_banana:
     type: function
-    handler: omnigent._e2e_policy_callables.taint_on_banana
+    handler: omnigent.testing.e2e_policy_callables.taint_on_banana
 
   deny_when_tainted:
     type: function

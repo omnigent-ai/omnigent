@@ -17,7 +17,7 @@ import httpx
 import pytest
 import yaml
 
-from omnigent.runner.identity import token_bound_runner_id
+from omnigent.util.runner_identity import token_bound_runner_id
 from tests.e2e.conftest import find_free_port
 
 _REPO = Path(__file__).resolve().parents[2]
@@ -139,7 +139,7 @@ def acp_server(
                     [
                         sys.executable,
                         "-m",
-                        "omnigent.cli",
+                        "omnigent.cli.commands",
                         "server",
                         "--host",
                         "127.0.0.1",

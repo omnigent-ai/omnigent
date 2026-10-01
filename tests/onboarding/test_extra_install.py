@@ -50,7 +50,7 @@ def test_installed_vcs_url_git_source(monkeypatch: pytest.MonkeyPatch) -> None:
     """Surfaces the ``vcs_url`` recorded for a git-source install."""
     url = "git+https://github.com/omnigent-ai/omnigent.git"
     monkeypatch.setattr(
-        "omnigent.update_check._read_installed_wheel_info",
+        "omnigent.cli.update_check._read_installed_wheel_info",
         lambda: SimpleNamespace(vcs_url=url),
     )
     assert _installed_vcs_url() == url
@@ -63,7 +63,7 @@ def test_installed_vcs_url_git_source(monkeypatch: pytest.MonkeyPatch) -> None:
 )
 def test_installed_vcs_url_none(monkeypatch: pytest.MonkeyPatch, info: object) -> None:
     """Returns ``None`` for registry installs and when the dist is absent."""
-    monkeypatch.setattr("omnigent.update_check._read_installed_wheel_info", lambda: info)
+    monkeypatch.setattr("omnigent.cli.update_check._read_installed_wheel_info", lambda: info)
     assert _installed_vcs_url() is None
 
 

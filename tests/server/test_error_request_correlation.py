@@ -8,7 +8,7 @@ import httpx
 import pytest
 from fastapi import FastAPI
 
-from omnigent.debug_logging import record_to_row
+from omnigent.observability.debug_logging import record_to_row
 
 
 @pytest.mark.asyncio

@@ -17,6 +17,7 @@ import httpx
 import pytest
 from fastapi import FastAPI
 
+from omnigent.core.datamodel import OSEnvSandboxSpec, OSEnvSpec, TerminalEnvSpec
 from omnigent.entities import DEFAULT_ENVIRONMENT_ID
 from omnigent.entities.session_resources import (
     SessionResourceView,
@@ -25,9 +26,7 @@ from omnigent.entities.session_resources import (
     terminal_resource_id,
     terminal_resource_view,
 )
-from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec, TerminalEnvSpec
-from omnigent.inner.os_env import EditEntry, OpResult, OSEnvironment, create_os_environment
-from omnigent.inner.terminal import TerminalInstance
+from omnigent.environments.os_env import EditEntry, OpResult, OSEnvironment, create_os_environment
 from omnigent.runner import create_runner_app
 from omnigent.runner import resource_registry as resource_registry_mod
 from omnigent.runner.resource_registry import (
@@ -39,6 +38,7 @@ from omnigent.runner.resource_registry import (
 )
 from omnigent.spec.types import AgentSpec, ExecutorSpec
 from omnigent.terminals import TerminalListEntry, TerminalRegistry
+from omnigent.terminals.terminal import TerminalInstance
 from tests.runner.conftest import _FakeProcessManager, _ScriptedHarnessClient
 from tests.runner.helpers import NullServerClient, make_test_terminal_instance
 
@@ -1109,7 +1109,7 @@ async def test_create_terminal_threads_agent_parent_os_env_through(
     ``omnigent claude`` wrapper) could spawn an unsandboxed
     terminal in a session whose YAML declared an egress allow-list.
     """
-    from omnigent.inner.datamodel import AgentDef, OSEnvSandboxSpec, OSEnvSpec
+    from omnigent.core.datamodel import AgentDef, OSEnvSandboxSpec, OSEnvSpec
 
     workspace = tmp_path / "workspace"
     workspace.mkdir()
@@ -1186,7 +1186,7 @@ async def test_create_terminal_uses_declared_terminal_spec_over_body(
     could spawn the YAML-declared terminal name with a completely
     different command.
     """
-    from omnigent.inner.datamodel import (
+    from omnigent.core.datamodel import (
         AgentDef,
         OSEnvSandboxSpec,
         OSEnvSpec,
@@ -1261,8 +1261,8 @@ async def test_create_terminal_rejects_unavailable_native_shell(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A mixed-version request cannot silently substitute another shell."""
-    from omnigent.inner.datamodel import AgentDef
-    from omnigent.native.native_coding_agents import (
+    from omnigent.core.datamodel import AgentDef
+    from omnigent.harnesses.native.coding_agents import (
         CLAUDE_NATIVE_AGENT_NAME,
         native_shell_terminal_specs,
     )
@@ -1273,7 +1273,7 @@ async def test_create_terminal_rejects_unavailable_native_shell(
     fish.chmod(0o755)
     monkeypatch.setenv("SHELL", str(fish))
     monkeypatch.setattr("shutil.which", lambda _name: None)
-    monkeypatch.setattr("omnigent._platform._INTERACTIVE_SHELL_DIRS", ())
+    monkeypatch.setattr("omnigent.util.portability._INTERACTIVE_SHELL_DIRS", ())
 
     agent = AgentDef(
         name=CLAUDE_NATIVE_AGENT_NAME,
@@ -1336,7 +1336,7 @@ async def test_create_terminal_resolves_declared_placeholder_cwd_to_workspace(
     workspace must be baked into the launched spec (never via
     ``cwd_override``, which the stub asserts stays ``None``).
     """
-    from omnigent.inner.datamodel import (
+    from omnigent.core.datamodel import (
         AgentDef,
         OSEnvSandboxSpec,
         OSEnvSpec,

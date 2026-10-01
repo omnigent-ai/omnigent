@@ -82,7 +82,7 @@ def _run_background_server(
 ) -> subprocess.CompletedProcess[str]:
     """Start a background server from the workspace and capture CLI output."""
     return subprocess.run(
-        [sys.executable, "-P", "-m", "omnigent.cli", "server", "--background"],
+        [sys.executable, "-P", "-m", "omnigent.cli.commands", "server", "--background"],
         cwd=str(workspace),
         env=env,
         capture_output=True,

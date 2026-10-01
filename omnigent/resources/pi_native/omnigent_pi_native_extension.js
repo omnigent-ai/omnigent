@@ -736,7 +736,7 @@ function toInt(value) {
  * Lift token usage out of one Pi assistant message.
  *
  * Mirrors the non-native executor's ``_extract_pi_turn_usage``
- * (omnigent/inner/pi_executor.py): Pi (``@earendil-works/pi-coding-agent``)
+ * (omnigent/harnesses/pi/executor.py): Pi (``@earendil-works/pi-coding-agent``)
  * carries a per-message ``usage`` object with ``input`` / ``output`` /
  * ``cacheRead`` / ``cacheWrite`` / ``totalTokens`` counts, and the message
  * carries the resolved ``model``. Pi's ``input`` is the NON-cached input

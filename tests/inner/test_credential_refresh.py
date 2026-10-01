@@ -16,20 +16,20 @@ from unittest.mock import Mock
 
 import pytest
 
-from omnigent.errors import OmnigentError
-from omnigent.inner.credential_proxy import (
-    RefreshingSecretProvider,
-    prepare_credential_proxy_runtime,
-)
-from omnigent.inner.datamodel import (
+from omnigent.core.datamodel import (
     CredentialProxyEntry,
     CredentialProxySpec,
     CredentialSourceSpec,
     OSEnvSandboxSpec,
     OSEnvSpec,
 )
-from omnigent.inner.egress.proxy import EgressProxy
-from omnigent.inner.sandbox import SandboxPolicy, resolve_sandbox
+from omnigent.errors import OmnigentError
+from omnigent.sandbox.core import SandboxPolicy, resolve_sandbox
+from omnigent.sandbox.credential_proxy import (
+    RefreshingSecretProvider,
+    prepare_credential_proxy_runtime,
+)
+from omnigent.sandbox.egress.proxy import EgressProxy
 from omnigent.spec.parser import _parse_credential_proxy
 
 
@@ -85,7 +85,7 @@ def test_runtime_auth_headers_pick_up_rotated_file_credentials(
     spec = _parse_credential_proxy([{"type": "gh_basic", "source": source}])
     clock = Mock(return_value=0.0)
     monkeypatch.setattr(
-        "omnigent.inner.credential_proxy.RefreshingSecretProvider",
+        "omnigent.sandbox.credential_proxy.RefreshingSecretProvider",
         partial(RefreshingSecretProvider, clock=clock),
     )
     runtime = prepare_credential_proxy_runtime(spec, parent_env={}, sandbox=sandbox)
@@ -133,7 +133,7 @@ def test_concurrent_requests_share_a_refresh(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, sandbox: SandboxPolicy
 ) -> None:
     resolve = Mock(side_effect=["initial", "replacement"])
-    monkeypatch.setattr("omnigent.inner.credential_proxy._resolve_secret", resolve)
+    monkeypatch.setattr("omnigent.sandbox.credential_proxy._resolve_secret", resolve)
     clock = Mock(return_value=0.0)
     provider = RefreshingSecretProvider(
         CredentialSourceSpec(
@@ -177,9 +177,9 @@ def test_host_bindings_share_one_provider_per_declaration(
 ) -> None:
     clock = Mock(return_value=0.0)
     resolver = Mock(side_effect=["first", "second", "renewed-first", "renewed-second"])
-    monkeypatch.setattr("omnigent.inner.credential_proxy._resolve_secret", resolver)
+    monkeypatch.setattr("omnigent.sandbox.credential_proxy._resolve_secret", resolver)
     monkeypatch.setattr(
-        "omnigent.inner.credential_proxy.RefreshingSecretProvider",
+        "omnigent.sandbox.credential_proxy.RefreshingSecretProvider",
         partial(RefreshingSecretProvider, clock=clock),
     )
     source = {"file": str(tmp_path / "token"), "refresh_interval_seconds": 60}
@@ -463,7 +463,7 @@ def test_native_sandbox_resolution_protects_sources_before_proxy_startup(
         ]
     )
     backend = Mock(resolve=Mock(return_value=sandbox))
-    monkeypatch.setattr("omnigent.inner.sandbox._get_backend", lambda name: backend)
+    monkeypatch.setattr("omnigent.sandbox.core._get_backend", lambda name: backend)
     spec = OSEnvSpec(sandbox=OSEnvSandboxSpec(type="linux_bwrap"))
     policy = resolve_sandbox(spec, sandbox.write_roots[0])
     assert policy.credential_source_paths == [path.resolve()]
@@ -494,7 +494,7 @@ def test_socket_deadline_bounds_dribbling_response(
                 pass
 
     path = short_tmp_parent / "slow.sock"
-    monkeypatch.setattr("omnigent.inner.credential_proxy._BROKER_SOURCE_TIMEOUT_SECONDS", 0.3)
+    monkeypatch.setattr("omnigent.sandbox.credential_proxy._BROKER_SOURCE_TIMEOUT_SECONDS", 0.3)
     with socketserver.UnixStreamServer(str(path), Handler) as server:
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
@@ -521,7 +521,7 @@ def test_socket_deadline_bounds_dribbling_response(
 def test_seatbelt_denies_sources_despite_implicit_read_grant(
     broker: tuple[Path, dict[str, object]], sandbox: SandboxPolicy, kind: str
 ) -> None:
-    from omnigent.inner.seatbelt_sandbox import _build_profile
+    from omnigent.sandbox.seatbelt import _build_profile
 
     path, _ = broker
     path = path.resolve()

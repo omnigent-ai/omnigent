@@ -755,7 +755,7 @@ def test_runner_token_uses_saved_account_authority(
 ):
     import uuid
 
-    from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
+    from omnigent.util.runner_identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
 
     admin, alice, stores, _ = setup_app
     created = create_session(alice)
@@ -1065,7 +1065,7 @@ async def test_existing_session_transfers_between_hosts(setup_app, workflow):
 
     from omnigent.host.daemon_launch import launch_or_reuse_daemon_runner
     from omnigent.host.frames import HostHelloFrame, encode_host_frame
-    from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
+    from omnigent.util.runner_identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
     from tests.server.integration.test_session_host_launch import (
         _serve_one_launch,
         _websocket_scope,

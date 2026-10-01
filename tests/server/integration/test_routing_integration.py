@@ -21,8 +21,8 @@ from omnigent.runner.subagent_routing import (
     AUTO_HARNESS_LABEL_KEY,
     ROUTING_DECISION_LABEL_KEY,
 )
-from omnigent.server.routes._sessions import orchestration as orchestration_module
-from omnigent.server.routes._sessions.common import get_server_host_registry
+from omnigent.server.routes.sessions import orchestration as orchestration_module
+from omnigent.server.routes.sessions.common import get_server_host_registry
 from omnigent.server.schemas import SessionEventInput
 from omnigent.server.smart_routing import RoutingResult
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
@@ -1292,7 +1292,7 @@ async def _claude_native_session(
     *,
     agent_name: str,
 ) -> tuple[Any, SqlAlchemyConversationStore]:
-    from omnigent.harness_plugins import CLAUDE_NATIVE_CODING_AGENT
+    from omnigent.harnesses.registry import CLAUDE_NATIVE_CODING_AGENT
 
     agent = await create_test_agent(client, name=agent_name)
     resp = await client.post(
@@ -1417,7 +1417,7 @@ async def _native_child(
     :param agent_name: Agent name to create the parent session with.
     :returns: The child conversation row and the store it lives in.
     """
-    from omnigent.harness_plugins import CLAUDE_NATIVE_CODING_AGENT
+    from omnigent.harnesses.registry import CLAUDE_NATIVE_CODING_AGENT
 
     agent = await create_test_agent(client, name=agent_name)
     parent = await client.post(
@@ -1566,7 +1566,7 @@ async def _parent_with_native_child_pane(
         mode, the only mode allowed cross-family spawns.
     :returns: ``(parent_id, child_conversation, conversation_store)``.
     """
-    from omnigent.harness_plugins import CLAUDE_NATIVE_CODING_AGENT
+    from omnigent.harnesses.registry import CLAUDE_NATIVE_CODING_AGENT
 
     agent = await create_test_agent(
         client,

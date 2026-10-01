@@ -8,13 +8,13 @@ from types import SimpleNamespace
 import httpx
 import pytest
 
-from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
-from omnigent.inner.native_attachments import FRAMEWORK_NOTICE_BLOCK_TYPE
-from omnigent.inner.openai_agents_sdk_executor import OpenAIAgentsSDKExecutor
+from omnigent.harnesses.claude_sdk.executor import ClaudeSDKExecutor
+from omnigent.harnesses.openai_agents.executor import OpenAIAgentsSDKExecutor
+from omnigent.harnesses.runtime._executor_adapter import ExecutorAdapter
+from omnigent.harnesses.runtime._scaffold import TurnContext
 from omnigent.runner.app import _resolve_forwarded_message_content
-from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
-from omnigent.runtime.harnesses._scaffold import TurnContext
 from omnigent.server.schemas import CreateResponseRequest
+from omnigent.util.attachments import FRAMEWORK_NOTICE_BLOCK_TYPE
 from tests.inner.test_openai_agents_sdk_executor import (
     _fake_agents_sdk,
     _FakeResult,
@@ -70,14 +70,14 @@ async def test_runner_upload_notices_reach_sdk_on_fresh_and_reused_sessions(
         monkeypatch.setattr(_FakeRunner, "next_results", [])
         monkeypatch.setattr(_FakeRunner, "next_result", _FakeResult([], final_output="done"))
         monkeypatch.setattr(
-            "omnigent.inner.openai_agents_sdk_executor._ensure_agents_sdk", _fake_agents_sdk
+            "omnigent.harnesses.openai_agents.executor._ensure_agents_sdk", _fake_agents_sdk
         )
         executor = OpenAIAgentsSDKExecutor(client=object(), model="test-model")
     else:
         sdk = SimpleNamespace(**vars(claude_agent_sdk))
         sdk.ClaudeSDKClient = Client
         sdk.ResultMessage = Result
-        monkeypatch.setattr("omnigent.inner.claude_sdk_executor._ensure_sdk", lambda: sdk)
+        monkeypatch.setattr("omnigent.harnesses.claude_sdk.executor._ensure_sdk", lambda: sdk)
         executor = ClaudeSDKExecutor()
 
     async def allow_policy(*args, **kwargs):
@@ -85,7 +85,7 @@ async def test_runner_upload_notices_reach_sdk_on_fresh_and_reused_sessions(
 
     executor._policy_evaluator = allow_policy
     monkeypatch.setattr(
-        "omnigent.runtime.harnesses._executor_adapter.is_tracing_enabled", lambda: False
+        "omnigent.harnesses.runtime._executor_adapter.is_tracing_enabled", lambda: False
     )
     adapter = ExecutorAdapter(lambda: executor, session_key="session")
     history = []

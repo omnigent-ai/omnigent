@@ -9,7 +9,7 @@ import { streamdownManualChunk } from "./vite.streamdown";
 
 // Databricks workspace-hosted omnigent is mounted behind the api-proxy at this
 // path; a local / self-hosted server mounts at the root. Mirrors the Python
-// WORKSPACE_API_PATH (omnigent/cli_auth.py) so both sides agree on the shape of
+// WORKSPACE_API_PATH (omnigent/cli/auth.py) so both sides agree on the shape of
 // a workspace URL.
 const WORKSPACE_API_PATH = "/api/2.0/omnigent";
 

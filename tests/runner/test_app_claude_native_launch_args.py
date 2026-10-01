@@ -677,7 +677,7 @@ async def test_runner_launch_error_is_logged_before_cancellable_diagnostic_drain
     monkeypatch.setattr(
         "omnigent.harnesses.claude_native.bridge.ensure_claude_workspace_trusted", lambda _: None
     )
-    monkeypatch.setattr("omnigent.inference_config.load_runtime_inference_config", dict)
+    monkeypatch.setattr("omnigent.models.inference_config.load_runtime_inference_config", dict)
     monkeypatch.setattr("omnigent.config.load_effective_config", dict)
     monkeypatch.setattr(orchestration, "resolve_cli_binary", lambda _: None)
     # Keep application traceback renderers out of this synchronization test.

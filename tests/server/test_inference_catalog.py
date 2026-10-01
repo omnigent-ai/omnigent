@@ -597,7 +597,7 @@ async def test_bifrost_does_not_require_unrelated_unity_connection(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_unbound_harness_keeps_its_baseline_when_a_binding_is_added_later():
-    from omnigent.inference_config import binding_for_harness
+    from omnigent.models.inference_config import binding_for_harness
     from omnigent.server.managed_hosts import deployment_with_inference_snapshot
 
     state = _state()

@@ -16,8 +16,8 @@ from pathlib import Path
 
 import pytest
 
-from omnigent.inner import pi_native_executor as pne
-from omnigent.inner.executor import ExecutorError, TurnComplete
+from omnigent.core.executor import ExecutorError, TurnComplete
+from omnigent.harnesses.pi_native import executor as pne
 
 
 def test_supports_flags(tmp_path: Path) -> None:

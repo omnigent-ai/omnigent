@@ -22,11 +22,11 @@ from omnigent.harnesses.claude_native.bridge import (
     bridge_dir_for_conversation_id,
     write_tmux_target,
 )
-from omnigent.inner.terminal import TerminalInstance
 from omnigent.runner import app as runner_app_module
 from omnigent.runner import create_runner_app
 from omnigent.spec.types import AgentSpec, ExecutorSpec
 from omnigent.terminals import TerminalRegistry
+from omnigent.terminals.terminal import TerminalInstance
 from tests.runner.conftest import (
     _FakeProcessManager,
     _runner_client,

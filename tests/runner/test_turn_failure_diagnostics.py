@@ -5,7 +5,7 @@ import logging
 
 import pytest
 
-from omnigent.debug_logging import record_to_row
+from omnigent.observability.debug_logging import record_to_row
 from omnigent.runner import create_runner_app
 from omnigent.spec.types import AgentSpec, ExecutorSpec
 from tests.runner.conftest import (

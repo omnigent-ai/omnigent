@@ -32,7 +32,7 @@ def _is_uv_tool_install() -> bool:
     ``uv tool install`` creates per-tool environments under a platform-specific
     ``uv/tools/<package>/`` directory.  Checking ``sys.prefix`` for the
     ``uv/tools/`` segment mirrors the ``pipx/venvs`` heuristic in
-    :func:`omnigent.update_check._looks_like_pipx_install`.
+    :func:`omnigent.cli.update_check._looks_like_pipx_install`.
 
     .. note::
 
@@ -47,13 +47,13 @@ def _installed_vcs_url() -> str | None:
     """Return the VCS URL omnigent was installed from, or ``None``.
 
     Reads the distribution's ``direct_url.json`` (PEP 610) via
-    :func:`omnigent.update_check._read_installed_wheel_info`, which normalizes
+    :func:`omnigent.cli.update_check._read_installed_wheel_info`, which normalizes
     the URL to the ``git+…`` form pip/uv accept back as an install target (and
     repairs an SSH user the installer redacted to ``****``). Returns ``None``
     for plain registry installs, so callers fall back to a bare ``omnigent``
     target.
     """
-    from omnigent.update_check import _read_installed_wheel_info
+    from omnigent.cli.update_check import _read_installed_wheel_info
 
     info = _read_installed_wheel_info()
     return info.vcs_url if info is not None else None

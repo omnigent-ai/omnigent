@@ -11,8 +11,8 @@ import shutil
 from pathlib import Path
 from typing import Any
 
+from omnigent.environments.os_env import OSEnvironment
 from omnigent.errors import ErrorCode, OmnigentError
-from omnigent.inner.os_env import OSEnvironment
 from omnigent.runtime import get_caps
 from omnigent.spec import AgentSpec
 from omnigent.spec.types import SharePolicy, ToolRuntime
@@ -266,7 +266,7 @@ class ToolManager:
         Register the timer builtins when the agent spec opts in.
 
         Gated on :attr:`AgentSpec.timers` (defaults to ``False`` to
-        match ``omnigent/inner/datamodel.py::AgentDef.timers``).
+        match ``omnigent/core/datamodel.py::AgentDef.timers``).
         Agents that want timer scheduling declare ``timers: true``
         at the top level of their YAML.
 
@@ -620,7 +620,7 @@ class ToolManager:
             ]
         else:
             if os_env is None:
-                from omnigent.inner.os_env import create_os_environment
+                from omnigent.environments.os_env import create_os_environment
 
                 os_env = create_os_environment(self._spec.os_env)
                 if os_env is None:

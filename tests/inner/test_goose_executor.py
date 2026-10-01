@@ -16,7 +16,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from omnigent.inner.executor import (
+from omnigent.core.executor import (
     ExecutorError,
     TextChunk,
     ToolCallComplete,
@@ -24,7 +24,7 @@ from omnigent.inner.executor import (
     ToolCallStatus,
     TurnComplete,
 )
-from omnigent.inner.goose_executor import GooseExecutor
+from omnigent.harnesses.goose.executor import GooseExecutor
 
 # ---------------------------------------------------------------------------
 # Construction / attribute defaults
@@ -297,7 +297,7 @@ class _FakeOSEnv:
 
 def test_fs_delegation_flag_tracks_os_env() -> None:
     """Delegation is on with an os_env, off without one or for a fork env."""
-    from omnigent.inner.datamodel import OSEnvSpec
+    from omnigent.core.datamodel import OSEnvSpec
 
     assert GooseExecutor()._fs_delegation is False
     assert GooseExecutor(os_env=OSEnvSpec(type="caller_process"))._fs_delegation is True
@@ -309,7 +309,7 @@ def test_fs_delegation_flag_tracks_os_env() -> None:
 @pytest.mark.asyncio
 async def test_initialize_advertises_fs_capability_per_delegation() -> None:
     """initialize advertises clientCapabilities.fs matching the delegation flag."""
-    from omnigent.inner.datamodel import OSEnvSpec
+    from omnigent.core.datamodel import OSEnvSpec
 
     init_result = {"result": {"agentCapabilities": {"promptCapabilities": {}}}}
 
@@ -333,7 +333,7 @@ async def test_initialize_advertises_fs_capability_per_delegation() -> None:
 @pytest.mark.asyncio
 async def test_fs_read_returns_content_and_maps_window() -> None:
     """fs/read_text_file reads through the OSEnvironment; line/limit → offset/limit."""
-    from omnigent.inner.datamodel import OSEnvSpec
+    from omnigent.core.datamodel import OSEnvSpec
 
     executor = GooseExecutor(os_env=OSEnvSpec(type="caller_process"))
     fake = _FakeOSEnv(read_result={"content": "hi\n", "encoding": "utf-8"})
@@ -357,7 +357,7 @@ async def test_fs_read_returns_content_and_maps_window() -> None:
 @pytest.mark.asyncio
 async def test_fs_read_missing_file_maps_to_enoent() -> None:
     """A 'no such file' read error maps to the ENOENT code (-32002)."""
-    from omnigent.inner.datamodel import OSEnvSpec
+    from omnigent.core.datamodel import OSEnvSpec
 
     executor = GooseExecutor(os_env=OSEnvSpec(type="caller_process"))
     executor._os_environment = _FakeOSEnv(  # type: ignore[assignment]
@@ -376,7 +376,7 @@ async def test_fs_read_missing_file_maps_to_enoent() -> None:
 @pytest.mark.asyncio
 async def test_fs_read_binary_file_is_rejected() -> None:
     """A non-utf-8 (binary) file is refused rather than returned as bytes."""
-    from omnigent.inner.datamodel import OSEnvSpec
+    from omnigent.core.datamodel import OSEnvSpec
 
     executor = GooseExecutor(os_env=OSEnvSpec(type="caller_process"))
     executor._os_environment = _FakeOSEnv(  # type: ignore[assignment]
@@ -395,7 +395,7 @@ async def test_fs_read_binary_file_is_rejected() -> None:
 @pytest.mark.asyncio
 async def test_fs_write_writes_through_os_env() -> None:
     """fs/write_text_file writes via the OSEnvironment and returns an empty result."""
-    from omnigent.inner.datamodel import OSEnvSpec
+    from omnigent.core.datamodel import OSEnvSpec
 
     executor = GooseExecutor(os_env=OSEnvSpec(type="caller_process"))
     fake = _FakeOSEnv(write_result={"path": "out.txt"})
@@ -439,7 +439,7 @@ async def test_fs_unsupported_when_delegation_off() -> None:
 @pytest.mark.asyncio
 async def test_fs_read_records_tool_call_events() -> None:
     """A delegated read buffers a paired ToolCallRequest + ToolCallComplete."""
-    from omnigent.inner.datamodel import OSEnvSpec
+    from omnigent.core.datamodel import OSEnvSpec
 
     executor = GooseExecutor(os_env=OSEnvSpec(type="caller_process"))
     executor._os_environment = _FakeOSEnv(  # type: ignore[assignment]
@@ -464,7 +464,7 @@ async def test_fs_read_records_tool_call_events() -> None:
 @pytest.mark.asyncio
 async def test_fs_write_records_tool_call_events() -> None:
     """A delegated write buffers a paired ToolCallRequest + ToolCallComplete."""
-    from omnigent.inner.datamodel import OSEnvSpec
+    from omnigent.core.datamodel import OSEnvSpec
 
     write_result = {"bytes": 3}
     executor = GooseExecutor(os_env=OSEnvSpec(type="caller_process"))
@@ -491,7 +491,7 @@ async def test_fs_write_records_tool_call_events() -> None:
 @pytest.mark.asyncio
 async def test_fs_read_blocked_by_call_policy() -> None:
     """A TOOL_CALL-phase DENY refuses the read by path before it runs."""
-    from omnigent.inner.datamodel import OSEnvSpec
+    from omnigent.core.datamodel import OSEnvSpec
 
     executor = GooseExecutor(os_env=OSEnvSpec(type="caller_process"))
     fake = _FakeOSEnv(read_result={"content": "secret", "encoding": "utf-8"})
@@ -517,7 +517,7 @@ async def test_fs_read_blocked_by_call_policy() -> None:
 @pytest.mark.asyncio
 async def test_fs_read_blocked_by_result_policy() -> None:
     """A TOOL_RESULT-phase DENY on read content refuses delivery and records BLOCKED."""
-    from omnigent.inner.datamodel import OSEnvSpec
+    from omnigent.core.datamodel import OSEnvSpec
 
     executor = GooseExecutor(os_env=OSEnvSpec(type="caller_process"))
     executor._os_environment = _FakeOSEnv(  # type: ignore[assignment]
@@ -546,7 +546,7 @@ async def test_fs_read_blocked_by_result_policy() -> None:
 @pytest.mark.asyncio
 async def test_fs_write_blocked_by_result_policy() -> None:
     """A TOOL_RESULT-phase DENY on the write result records BLOCKED."""
-    from omnigent.inner.datamodel import OSEnvSpec
+    from omnigent.core.datamodel import OSEnvSpec
 
     write_result = {"path": "out.txt", "bytes": 3, "marker": "actual"}
     executor = GooseExecutor(os_env=OSEnvSpec(type="caller_process"))
@@ -578,7 +578,7 @@ async def test_fs_write_blocked_by_result_policy() -> None:
 @pytest.mark.asyncio
 async def test_fs_write_blocked_by_call_policy_prevents_write() -> None:
     """A TOOL_CALL-phase DENY (path + content) prevents the write."""
-    from omnigent.inner.datamodel import OSEnvSpec
+    from omnigent.core.datamodel import OSEnvSpec
 
     executor = GooseExecutor(os_env=OSEnvSpec(type="caller_process"))
     fake = _FakeOSEnv(write_result={})
@@ -609,7 +609,7 @@ async def test_fs_write_blocked_by_call_policy_prevents_write() -> None:
 @pytest.mark.asyncio
 async def test_fs_write_call_policy_fails_closed() -> None:
     """A TOOL_CALL-phase eval error prevents the write (fail closed for side effects)."""
-    from omnigent.inner.datamodel import OSEnvSpec
+    from omnigent.core.datamodel import OSEnvSpec
 
     executor = GooseExecutor(os_env=OSEnvSpec(type="caller_process"))
     fake = _FakeOSEnv(write_result={})
@@ -637,7 +637,7 @@ async def test_fs_write_call_policy_fails_closed() -> None:
 @pytest.mark.asyncio
 async def test_fs_write_call_policy_ask_blocks() -> None:
     """A TOOL_CALL-phase ASK blocks the write (delegated fs has no elicitation path)."""
-    from omnigent.inner.datamodel import OSEnvSpec
+    from omnigent.core.datamodel import OSEnvSpec
 
     executor = GooseExecutor(os_env=OSEnvSpec(type="caller_process"))
     fake = _FakeOSEnv(write_result={})
@@ -663,7 +663,7 @@ async def test_fs_write_call_policy_ask_blocks() -> None:
 @pytest.mark.asyncio
 async def test_run_turn_surfaces_delegated_fs_ops() -> None:
     """run_turn drains recorded fs ops onto the turn stream as ToolCall events."""
-    from omnigent.inner.datamodel import OSEnvSpec
+    from omnigent.core.datamodel import OSEnvSpec
 
     executor = GooseExecutor(os_env=OSEnvSpec(type="caller_process"))
     executor._initialized = True
@@ -709,7 +709,7 @@ async def test_run_turn_surfaces_delegated_fs_ops() -> None:
 @pytest.mark.asyncio
 async def test_run_turn_records_stale_fs_op_from_prior_turn() -> None:
     """A stale server fs request answered at turn start is still audited, not dropped."""
-    from omnigent.inner.datamodel import OSEnvSpec
+    from omnigent.core.datamodel import OSEnvSpec
 
     executor = GooseExecutor(os_env=OSEnvSpec(type="caller_process"))
     executor._initialized = True
@@ -753,7 +753,7 @@ async def test_run_turn_records_stale_fs_op_from_prior_turn() -> None:
 @pytest.mark.asyncio
 async def test_close_releases_fs_os_environment() -> None:
     """close() tears down a lazily-created fs-delegation OSEnvironment."""
-    from omnigent.inner.datamodel import OSEnvSpec
+    from omnigent.core.datamodel import OSEnvSpec
 
     executor = GooseExecutor(os_env=OSEnvSpec(type="caller_process"))
     fake = _FakeOSEnv()
@@ -1125,7 +1125,7 @@ async def test_ensure_session_raises_on_missing_session_id() -> None:
 
 
 def test_sandbox_launch_path_bare_when_no_sandbox() -> None:
-    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+    from omnigent.core.datamodel import OSEnvSandboxSpec, OSEnvSpec
 
     # os_env=None → bare binary.
     assert GooseExecutor(goose_path="goose")._sandbox_launch_path(()) == "goose"
@@ -1139,9 +1139,9 @@ def test_sandbox_launch_path_bare_when_no_sandbox() -> None:
 def test_sandbox_launch_path_wraps_active_policy(monkeypatch, tmp_path) -> None:
     """An active sandbox wraps goose in a launcher with its config/state dirs as
     write roots and our spawn env names allowlisted."""
-    from omnigent.inner import sandbox as sandbox_mod
-    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
-    from omnigent.inner.sandbox import SandboxPolicy
+    from omnigent.core.datamodel import OSEnvSandboxSpec, OSEnvSpec
+    from omnigent.sandbox import core as sandbox_mod
+    from omnigent.sandbox.core import SandboxPolicy
 
     captured: dict = {}
 
@@ -1182,8 +1182,8 @@ def test_sandbox_launch_path_wraps_active_policy(monkeypatch, tmp_path) -> None:
 
 def test_sandbox_launch_path_falls_back_when_backend_unavailable(monkeypatch, tmp_path) -> None:
     """A backend failure degrades to the bare binary, never blocks startup."""
-    from omnigent.inner import sandbox as sandbox_mod
-    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+    from omnigent.core.datamodel import OSEnvSandboxSpec, OSEnvSpec
+    from omnigent.sandbox import core as sandbox_mod
 
     def _boom(_os_env, _cwd) -> None:
         raise NotImplementedError("no bwrap here")
@@ -1304,7 +1304,7 @@ async def test_run_turn_tracks_context_window_from_usage_update() -> None:
 
 
 def test_inline_text_file_data_variants() -> None:
-    from omnigent.inner.goose_executor import _inline_text_file_data
+    from omnigent.harnesses.goose.executor import _inline_text_file_data
 
     assert _inline_text_file_data("plain text") == "plain text"  # non-data-URI passthrough
     assert _inline_text_file_data("") == ""
@@ -1418,7 +1418,7 @@ async def test_respond_to_agent_request_exception_yields_error_reply() -> None:
 
 
 def test_resolve_os_env_default(monkeypatch) -> None:
-    from omnigent.inner import goose_harness
+    from omnigent.harnesses.goose import harness as goose_harness
 
     monkeypatch.delenv("HARNESS_GOOSE_OS_ENV", raising=False)
     spec = goose_harness._resolve_os_env()
@@ -1427,7 +1427,7 @@ def test_resolve_os_env_default(monkeypatch) -> None:
 
 
 def test_resolve_os_env_from_json(monkeypatch) -> None:
-    from omnigent.inner import goose_harness
+    from omnigent.harnesses.goose import harness as goose_harness
 
     monkeypatch.setenv(
         "HARNESS_GOOSE_OS_ENV",
@@ -1447,7 +1447,7 @@ def test_resolve_os_env_from_json(monkeypatch) -> None:
 
 
 def test_resolve_os_env_malformed_json_falls_back(monkeypatch) -> None:
-    from omnigent.inner import goose_harness
+    from omnigent.harnesses.goose import harness as goose_harness
 
     monkeypatch.setenv("HARNESS_GOOSE_OS_ENV", "{not valid json")
     spec = goose_harness._resolve_os_env()
@@ -1456,7 +1456,7 @@ def test_resolve_os_env_malformed_json_falls_back(monkeypatch) -> None:
 
 
 def test_build_goose_executor_reads_env(monkeypatch) -> None:
-    from omnigent.inner import goose_harness
+    from omnigent.harnesses.goose import harness as goose_harness
 
     monkeypatch.setenv("HARNESS_GOOSE_MODEL", "claude-x")
     monkeypatch.setenv("HARNESS_GOOSE_PROVIDER", "anthropic")
@@ -1473,7 +1473,7 @@ def test_build_goose_executor_reads_env(monkeypatch) -> None:
 
 
 def test_build_goose_executor_defaults(monkeypatch) -> None:
-    from omnigent.inner import goose_harness
+    from omnigent.harnesses.goose import harness as goose_harness
 
     for var in (
         "HARNESS_GOOSE_MODEL",
@@ -1493,6 +1493,6 @@ def test_build_goose_executor_defaults(monkeypatch) -> None:
 def test_create_app_returns_fastapi() -> None:
     from fastapi import FastAPI
 
-    from omnigent.inner import goose_harness
+    from omnigent.harnesses.goose import harness as goose_harness
 
     assert isinstance(goose_harness.create_app(), FastAPI)

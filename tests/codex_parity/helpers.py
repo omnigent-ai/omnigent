@@ -5,8 +5,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from omnigent.inner.codex_executor import CodexExecutor
-from omnigent.inner.executor import ExecutorConfig, TurnComplete
+from omnigent.core.executor import ExecutorConfig, TurnComplete
+from omnigent.harnesses.codex.executor import CodexExecutor
 
 
 def ev_response_created(response_id: str) -> dict[str, Any]:

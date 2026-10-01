@@ -101,7 +101,7 @@ def runner_under_test(
 
     :returns: Handles for the spawned runner and the server base URL.
     """
-    from omnigent.runner.identity import token_bound_runner_id
+    from omnigent.util.runner_identity import token_bound_runner_id
 
     binding_token = secrets.token_urlsafe(32)
     runner_id = token_bound_runner_id(binding_token)
@@ -138,7 +138,7 @@ def runner_under_test(
         [
             sys.executable,
             "-m",
-            "omnigent.cli",
+            "omnigent.cli.commands",
             "server",
             "--port",
             str(port),

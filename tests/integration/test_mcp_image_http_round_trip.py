@@ -149,7 +149,7 @@ async def test_images_and_late_text_survive_production_http_and_adapters(
     adapter: str,
 ) -> None:
     """Distinct stdio images reach each adapter with required trailing text."""
-    from omnigent.inner.codex_executor import _dynamic_tool_result_payload
+    from omnigent.harnesses.codex.executor import _dynamic_tool_result_payload
 
     session_id = _image_session(
         isolated_http_client, runner_id=live_runner_id, mock_url=mock_llm_server_url
@@ -185,7 +185,7 @@ async def test_images_and_late_text_survive_production_http_and_adapters(
             from claude_agent_sdk import create_sdk_mcp_server
             from mcp.types import CallToolRequest, CallToolRequestParams
 
-            from omnigent.inner.claude_sdk_executor import _build_mcp_tools
+            from omnigent.harnesses.claude_sdk.executor import _build_mcp_tools
 
             async def execute(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
                 assert name == _TOOL_NAME

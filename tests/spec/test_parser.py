@@ -12,7 +12,7 @@ import pytest
 import yaml
 
 from omnigent.errors import ErrorCode, OmnigentError
-from omnigent.inner import sandbox
+from omnigent.sandbox import core as sandbox
 from omnigent.spec import parser
 from omnigent.spec.parser import (
     AgentImageConfigMissingError,
@@ -2066,7 +2066,7 @@ def test_parse_os_env_caller_process(tmp_path: Path) -> None:
     What breaks if this fails: native Omnigent YAMLs cannot opt into
     sys_os_* tools — the whole point of step 5l.
     """
-    from omnigent.inner.datamodel import OSEnvSpec
+    from omnigent.core.datamodel import OSEnvSpec
 
     config = {
         "spec_version": 1,
@@ -2098,7 +2098,7 @@ def test_parse_os_env_with_sandbox(tmp_path: Path) -> None:
     runtime, leaving sys_os_* tools running with the agent's
     full process privileges.
     """
-    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+    from omnigent.core.datamodel import OSEnvSandboxSpec, OSEnvSpec
 
     config = {
         "spec_version": 1,
@@ -2132,7 +2132,7 @@ def test_parse_os_env_with_sandbox(tmp_path: Path) -> None:
 
 def test_parse_os_env_sandbox_auto_uses_platform_default(tmp_path: Path) -> None:
     """``sandbox.type: auto`` explicitly selects the platform default."""
-    from omnigent.inner.sandbox import _default_sandbox_for_platform
+    from omnigent.sandbox.core import _default_sandbox_for_platform
 
     config = {
         "spec_version": 1,
@@ -2154,7 +2154,7 @@ def test_parse_os_env_sandbox_auto_uses_platform_default(tmp_path: Path) -> None
 
 def test_parse_os_env_sandbox_omitted_type_uses_platform_default(tmp_path: Path) -> None:
     """An omitted ``sandbox.type`` selects the platform default."""
-    from omnigent.inner.sandbox import _default_sandbox_for_platform
+    from omnigent.sandbox.core import _default_sandbox_for_platform
 
     config = {
         "spec_version": 1,
@@ -3529,7 +3529,7 @@ def test_parse_os_env_sandbox_env_passthrough_default_none(tmp_path: Path) -> No
     Pinning the default here ensures that future spec changes don't
     silently flip the helper to "inherit everything from the parent",
     which would re-open the credential-leak vector
-    :func:`omnigent.inner.os_env.build_helper_env` is meant to close.
+    :func:`omnigent.environments.os_env.build_helper_env` is meant to close.
     """
     config = {
         "spec_version": 1,

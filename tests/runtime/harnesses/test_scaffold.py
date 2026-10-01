@@ -1,5 +1,5 @@
 """
-Tests for :class:`omnigent.runtime.harnesses._scaffold.HarnessApp`.
+Tests for :class:`omnigent.harnesses.runtime._scaffold.HarnessApp`.
 
 End-to-end through real subprocesses spawned via the same
 :class:`HarnessProcessManager` used in production. Each test
@@ -39,9 +39,9 @@ import httpx
 import pytest
 
 from omnigent.errors import ErrorCode, OmnigentError
-from omnigent.runtime.harnesses import _HARNESS_MODULES
-from omnigent.runtime.harnesses._scaffold import HarnessApp, TurnContext
-from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
+from omnigent.harnesses.runtime import _HARNESS_MODULES
+from omnigent.harnesses.runtime._scaffold import HarnessApp, TurnContext
+from omnigent.harnesses.runtime.process_manager import HarnessProcessManager
 from omnigent.runtime.tool_output import MAX_TOOL_OUTPUT_BYTES
 from omnigent.server.schemas import CreateResponseRequest
 
@@ -55,7 +55,7 @@ _TRUNCATION_MARKER = "[output truncated by omnigent:"
 
 
 def test_default_idle_watchdog_allows_one_hour_progress_free_calls() -> None:
-    from omnigent.runtime.harnesses import _scaffold
+    from omnigent.harnesses.runtime import _scaffold
 
     assert _scaffold._DEFAULT_TURN_IDLE_TIMEOUT_S == 3600.0
 
@@ -836,7 +836,7 @@ async def test_turn_stalling_past_absolute_ceiling_fails_via_idle_watchdog(
     ceiling — whichever first) fails it within ~idle_timeout, preserving the
     runaway backstop for a loop that stops making real progress.
     """
-    from omnigent.runtime.harnesses import _scaffold
+    from omnigent.harnesses.runtime import _scaffold
 
     class _StallsAfterProgressApp(HarnessApp):
         async def run_turn(self, request: Any, ctx: TurnContext) -> None:
@@ -1867,8 +1867,8 @@ async def test_idle_watchdog_attaches_recent_forwarder_post_failure(
     Fails on the unfixed watchdog (reason omits the forwarder cause); passes
     once the watchdog reads ``_native_forwarder_health``.
     """
-    from omnigent.native import _native_forwarder_health as health
-    from omnigent.runtime.harnesses import _scaffold
+    from omnigent.harnesses.native import forwarder_health as health
+    from omnigent.harnesses.runtime import _scaffold
 
     class _WedgedApp(HarnessApp):
         async def run_turn(self, request: Any, ctx: TurnContext) -> None:

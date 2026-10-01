@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from omnigent.inner.pi_settings import prepare_managed_pi_agent_dir
+from omnigent.harnesses.pi.settings import prepare_managed_pi_agent_dir
 
 
 def test_prepare_managed_pi_agent_dir_copies_settings_and_symlinks_npm(

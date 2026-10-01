@@ -1,4 +1,4 @@
-"""Unit tests for :class:`omnigent.native.native_server_harness.NativeServerHarness`.
+"""Unit tests for :class:`omnigent.harnesses.native.server_harness.NativeServerHarness`.
 
 Drives the transport-agnostic base directly over an in-memory fake transport,
 covering the run-turn / interrupt / enqueue orchestration (boot-poll, model
@@ -9,9 +9,9 @@ from __future__ import annotations
 
 from typing import Any
 
-from omnigent.inner.executor import ExecutorConfig, ExecutorError, TurnComplete
-from omnigent.native.native_server_harness import NativeServerHarness
-from omnigent.native.native_server_transport import NativePrompt
+from omnigent.core.executor import ExecutorConfig, ExecutorError, TurnComplete
+from omnigent.harnesses.native.server_harness import NativeServerHarness
+from omnigent.harnesses.native.server_transport import NativePrompt
 
 
 class _FakeTransport:

@@ -26,8 +26,8 @@ from enum import Enum
 from os import PathLike
 from typing import Any, NoReturn
 
-from omnigent.harness_availability import HarnessAvailability, is_harness_availability
-from omnigent.inner.native_attachments import CAP_FILESYSTEM_ATTACHMENTS
+from omnigent.harnesses.availability import HarnessAvailability, is_harness_availability
+from omnigent.util.attachments import CAP_FILESYSTEM_ATTACHMENTS
 from omnigent.util.json_types import JsonObject as _JsonObject
 from omnigent.util.tunnel_limits import RUNNER_TUNNEL_MAX_MESSAGE_BYTES
 
@@ -177,7 +177,7 @@ class HostHelloFrame:
     :param gateway_inference: Per-harness flag for whether that family's
         launch on this host resolves AI-Gateway-backed inference, e.g.
         ``{"claude-native": True, "codex": False}`` (see
-        ``omnigent.gateway_inference``). A family that could not be evaluated
+        ``omnigent.models.gateway_inference``). A family that could not be evaluated
         is omitted. ``None`` means unknown (an older host, or a startup probe
         that failed) — never treat it as "nothing is gateway-backed".
     :param interactive_shells: Ordered interactive shells installed on this
@@ -224,7 +224,7 @@ class HostHarnessReadinessFrame:
     :param gateway_inference: Per-harness flag for whether that family's
         launch on this host resolves AI-Gateway-backed inference, e.g.
         ``{"claude-native": True, "codex": False}`` (see
-        ``omnigent.gateway_inference``). A family that could not be evaluated
+        ``omnigent.models.gateway_inference``). A family that could not be evaluated
         is omitted. ``None`` means unknown (an older host that doesn't report
         it) — never treat it as "nothing is gateway-backed".
     """
@@ -758,7 +758,7 @@ class HostInstallHarnessResultFrame:
     :param gateway_inference: Per-harness flag for whether that family's
         launch on this host resolves AI-Gateway-backed inference, e.g.
         ``{"claude-native": True, "codex": False}`` (see
-        ``omnigent.gateway_inference``). A family that could not be evaluated
+        ``omnigent.models.gateway_inference``). A family that could not be evaluated
         is omitted. ``None`` means unknown (an older host that doesn't report
         it) — never treat it as "nothing is gateway-backed".
     :param error: Why the install failed, e.g. ``"npm not found"`` or
@@ -833,7 +833,7 @@ class HostStoreSecretResultFrame:
     :param gateway_inference: Per-harness flag for whether that family's
         launch on this host resolves AI-Gateway-backed inference, e.g.
         ``{"claude-native": True, "codex": False}`` (see
-        ``omnigent.gateway_inference``). A family that could not be evaluated
+        ``omnigent.models.gateway_inference``). A family that could not be evaluated
         is omitted. ``None`` means unknown (an older host that doesn't report
         it) — never treat it as "nothing is gateway-backed".
     :param error: Non-secret failure reason, e.g. ``"a gateway requires a
@@ -886,7 +886,7 @@ class HostFsRequestFrame:
     Serves the web UI's file panel (directory browse, changed files,
     diffs, search, file content) from the host when the session's runner
     is offline but the host still holds the workspace on disk. The host
-    runs :class:`omnigent.workspace_fs.WorkspaceReader` against
+    runs :class:`omnigent.host.workspace_fs.WorkspaceReader` against
     ``workspace`` and returns the same JSON the runner's filesystem
     endpoints would.
 
@@ -1217,7 +1217,7 @@ def _encode_payload(payload: _JsonObject) -> str:
     :param payload: The frame fields about to be serialized.
     :returns: The JSON wire string.
     """
-    from omnigent.runtime import telemetry
+    from omnigent.observability import otel as telemetry
 
     # Record the outbound body on the active span (redacted, gated by
     # content capture) before injecting propagation keys, so the span

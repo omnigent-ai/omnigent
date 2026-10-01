@@ -41,13 +41,13 @@ from typing import TYPE_CHECKING
 import yaml
 
 from omnigent.errors import ErrorCode, OmnigentError
-from omnigent.harness_aliases import canonicalize_harness
-from omnigent.harness_plugins import (
+from omnigent.harnesses.aliases import canonicalize_harness
+from omnigent.harnesses.registry import (
     accepted_harnesses,
     missing_install_packages,
     valid_harnesses,
 )
-from omnigent.harness_plugins import (
+from omnigent.harnesses.registry import (
     harness_aliases as registry_harness_aliases,
 )
 
@@ -74,7 +74,7 @@ OMNIGENT_EXECUTOR_TYPE = "omnigent"
 # designs/OMNIGENT_INTEGRATION.md §1.
 #
 # ``open-responses`` is the OpenAI Responses-API harness that
-# ``omnigent.inner.open_responses_sdk.OpenResponsesExecutor``
+# ``omnigent.harnesses.open_responses.executor.OpenResponsesExecutor``
 # implements; the executor_factory resolves it when the YAML
 # declares ``harness: open-responses``, so the adapter must
 # accept it too. It was missing from the initial allowlist, which
@@ -334,7 +334,7 @@ def load_omnigent_yaml(
     :param path: Path to an omnigent YAML file. Caller has
         already verified via :func:`is_omnigent_yaml`.
     :param enforce_handler_allowlist: Forwarded to
-        :func:`omnigent.inner.loader.load_agent_def` — when ``True``,
+        :func:`omnigent.core.loader.load_agent_def` — when ``True``,
         unregistered ``type: function`` policy handlers are rejected
         before the loader resolves/calls them (bundle-upload
         guard). See :func:`omnigent.spec.load`.
@@ -352,7 +352,7 @@ def load_omnigent_yaml(
         Python environment.
     """
     try:
-        from omnigent.inner.loader import load_agent_def
+        from omnigent.core.loader import load_agent_def
     except ImportError as exc:
         # Agent-plane can be pip-installed without the omnigent
         # source alongside (the repo layout has them as siblings,
@@ -371,7 +371,7 @@ def load_omnigent_yaml(
 
     import yaml as _yaml
 
-    from omnigent.inner.loader import _OmnigentYamlLoader
+    from omnigent.core.loader import _OmnigentYamlLoader
     from omnigent.spec.omnigent import agent_def_to_agent_spec
     from omnigent.spec.validator import validate
 

@@ -10,7 +10,7 @@ can't silently reopen the "tool cards vanish on refresh" bug.
 
 from __future__ import annotations
 
-from omnigent.server.routes._sessions.helpers import _extract_persistent_item_from_sse
+from omnigent.server.routes.sessions.helpers import _extract_persistent_item_from_sse
 
 
 def _output_item_done(item: dict[str, object]) -> dict[str, object]:

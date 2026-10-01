@@ -7,7 +7,7 @@ canonical transcript the TUI prints. A native forwarder
 (:mod:`omnigent.harnesses.hermes_native.forwarder`) tails Hermes' SQLite ``state.db`` and
 mirrors the transcript back OUT as conversation items; web-composer messages are
 injected INTO the TUI's tmux pane by
-:class:`omnigent.inner.hermes_native_executor.HermesNativeExecutor`. This suite is
+:class:`omnigent.harnesses.hermes_native.executor.HermesNativeExecutor`. This suite is
 the hermes sibling of ``test_native_goose_render_parity`` and asserts the same
 three properties:
 

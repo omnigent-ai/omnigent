@@ -15,7 +15,7 @@ import asyncio
 
 import pytest
 
-from omnigent.inner.agent_env import (
+from omnigent.environments.agent_env import (
     BASE_ALLOW_EXACT,
     BASE_ALLOW_PREFIXES,
     clean_agent_env,
@@ -86,13 +86,13 @@ def _bare(cls, **attrs):
 
 
 def _acp_spawn_env():
-    from omnigent.inner.acp_executor import AcpExecutor
+    from omnigent.harnesses.acp.executor import AcpExecutor
 
     return _bare(AcpExecutor)._build_spawn_env()
 
 
 def _goose_spawn_env():
-    from omnigent.inner.goose_executor import GooseExecutor
+    from omnigent.harnesses.goose.executor import GooseExecutor
 
     # Provider/gateway overrides are deliberate additions layered on top of the
     # filtered base, not leaks; stub them so this asserts the filtering alone.
@@ -100,7 +100,7 @@ def _goose_spawn_env():
 
 
 def _qwen_spawn_env():
-    from omnigent.inner.qwen_executor import QwenExecutor
+    from omnigent.harnesses.qwen.executor import QwenExecutor
 
     async def _no_gateway():
         return {}
@@ -109,13 +109,13 @@ def _qwen_spawn_env():
 
 
 def _kimi_spawn_env():
-    from omnigent.inner.kimi_executor import KimiExecutor
+    from omnigent.harnesses.kimi.executor import KimiExecutor
 
     return _bare(KimiExecutor)._build_spawn_env()
 
 
 def _hermes_spawn_env():
-    from omnigent.inner.hermes_executor import HermesExecutor
+    from omnigent.harnesses.hermes.executor import HermesExecutor
 
     # The no-HERMES_HOME branch: the one that used to pass env=None and inherit
     # the entire host environment, so it is the branch worth pinning.
@@ -123,13 +123,13 @@ def _hermes_spawn_env():
 
 
 def _pi_spawn_env():
-    from omnigent.inner.pi_executor import _clean_pi_env
+    from omnigent.harnesses.pi.executor import _clean_pi_env
 
     return _clean_pi_env()
 
 
 def _codex_spawn_env():
-    from omnigent.inner.codex_executor import _clean_codex_env
+    from omnigent.harnesses.codex.executor import _clean_codex_env
 
     return _clean_codex_env()
 
@@ -221,8 +221,8 @@ def test_desktop_session_requires_explicit_cli_passthrough(explicit):
 
 
 def test_goose_receives_declared_desktop_session(monkeypatch):
-    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
-    from omnigent.inner.goose_executor import GooseExecutor
+    from omnigent.core.datamodel import OSEnvSandboxSpec, OSEnvSpec
+    from omnigent.harnesses.goose.executor import GooseExecutor
 
     session_env = {
         "DBUS_SESSION_BUS_ADDRESS": "unix:path=/run/user/1000/bus",
@@ -296,7 +296,7 @@ def test_codex_passes_service_principal_m2m_credentials(hostile_env):
     """codex's own builder must let the SP M2M pair through, so a
     Databricks-gateway ``auth.command`` can mint an OAuth token on refresh.
     The canaried DATABRICKS_CONFIG_PROFILE / DATABRICKS_TOKEN must still not."""
-    from omnigent.inner.codex_executor import _clean_codex_env
+    from omnigent.harnesses.codex.executor import _clean_codex_env
 
     src = {
         **hostile_env,
@@ -341,7 +341,7 @@ def test_acp_agent_declaration_passes_only_what_it_names(hostile_env, monkeypatc
     with, so the agent names its variables. Everything it does not name stays
     withheld — a declaration must not reopen the whole environment.
     """
-    from omnigent.inner.acp_executor import AcpAgentConfig, AcpExecutor
+    from omnigent.harnesses.acp.executor import AcpAgentConfig, AcpExecutor
 
     monkeypatch.setattr("os.environ", {**hostile_env, "XAI_API_KEY": "declared-and-wanted"})
     ex = AcpExecutor(

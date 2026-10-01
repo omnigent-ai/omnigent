@@ -6,7 +6,7 @@ import logging
 from collections.abc import Iterator
 from contextlib import contextmanager
 
-from omnigent.debug_logging import record_to_row
+from omnigent.observability.debug_logging import record_to_row
 
 
 @contextmanager

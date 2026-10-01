@@ -502,7 +502,7 @@ from pathlib import Path
 
 import uvicorn
 
-from omnigent.cli import _create_artifact_store
+from omnigent.cli.commands import _create_artifact_store
 from omnigent.runtime import init as init_runtime
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.runtime.caps import RuntimeCaps
@@ -627,7 +627,7 @@ def _registered_runner(
         runner subprocess, e.g. mock LLM credentials.
     :yields: Registered runner id.
     """
-    from omnigent.cli import _start_cli_runner_process, _stop_cli_runner_process
+    from omnigent.cli.commands import _start_cli_runner_process, _stop_cli_runner_process
 
     runner = _start_cli_runner_process(
         server_url=base_url,
@@ -889,7 +889,7 @@ async def test_repl_reasoning_effort_threads_through(
     )
     set_fallback_mock_llm(mock_llm_server_url, _MODEL, "SESSION_REASONING_OK")
     with _running_server(omnigent_python, omnigent_repo_root, env, tmp_path) as server:
-        from omnigent.cli import _bundle
+        from omnigent.cli.commands import _bundle
 
         bundle = _bundle(yaml_path)
         with _registered_runner(

@@ -27,7 +27,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 
-from omnigent.process_logging import data_dir
+from omnigent.observability.process_logging import data_dir
 
 try:
     import fcntl

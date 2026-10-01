@@ -22,7 +22,7 @@ Differences from the Codex / Claude wrappers (Phase 1 scope):
   (:mod:`omnigent.harnesses.antigravity_native.reader`), which polls/streams agy's
   connect-RPC trajectory steps. Web-UI turns are delivered into the native agy
   conversation (the write path) by the native executor
-  (:mod:`omnigent.inner.antigravity_native_executor`) over the connect-RPC
+  (:mod:`omnigent.harnesses.antigravity_native.executor`) over the connect-RPC
   ``SendUserCascadeMessage`` method, which agy records as a real ``USER_INPUT``
   turn — NOT ``SendAgentMessage`` (recorded as a ``SYSTEM_MESSAGE``, which would
   never mirror as a user turn; see the executor module).
@@ -76,20 +76,8 @@ import click
 import httpx
 import yaml
 
-from omnigent._runner_startup import RunnerStartupProgress, runner_startup_progress
-from omnigent._wrapper_labels import (
-    ANTIGRAVITY_NATIVE_WRAPPER_VALUE as _WRAPPER_LABEL_VALUE,
-)
-from omnigent._wrapper_labels import (
-    UI_MODE_LABEL_KEY as _UI_MODE_LABEL_KEY,
-)
-from omnigent._wrapper_labels import (
-    UI_MODE_TERMINAL_VALUE as _UI_MODE_TERMINAL_VALUE,
-)
-from omnigent._wrapper_labels import (
-    WRAPPER_LABEL_KEY as _WRAPPER_LABEL_KEY,
-)
-from omnigent.conversation_browser import conversation_url, open_conversation_link_if_enabled
+from omnigent.cli.conversation_browser import conversation_url, open_conversation_link_if_enabled
+from omnigent.cli.runner_startup import RunnerStartupProgress, runner_startup_progress
 from omnigent.entities.session_resources import terminal_resource_id
 from omnigent.harnesses.antigravity_native.bridge import (
     AGY_PLACEHOLDER_CONVERSATION_PREFIX,
@@ -126,29 +114,41 @@ from omnigent.harnesses.claude_native.main import (
     _AttachOutcome,
     attach_local_terminal,
 )
+from omnigent.harnesses.native.coding_agents import native_shell_terminal_spec
+from omnigent.harnesses.native.resume_hint import echo_native_resume_hint
+from omnigent.harnesses.native.terminal import (
+    DAEMON_HOST_ONLINE_TIMEOUT_S as _DAEMON_HOST_ONLINE_TIMEOUT_S,
+)
+from omnigent.harnesses.native.terminal import (
+    DAEMON_RUNNER_ONLINE_TIMEOUT_S as _DAEMON_RUNNER_ONLINE_TIMEOUT_S,
+)
+from omnigent.harnesses.native.terminal import (
+    bind_session_runner as _bind_session_runner,
+)
+from omnigent.harnesses.native.terminal import (
+    normalize_extra_args as _normalize_extra_args,
+)
+from omnigent.harnesses.native.terminal import (
+    terminal_attach_url as _attach_url,
+)
+from omnigent.harnesses.wrapper_labels import (
+    ANTIGRAVITY_NATIVE_WRAPPER_VALUE as _WRAPPER_LABEL_VALUE,
+)
+from omnigent.harnesses.wrapper_labels import (
+    UI_MODE_LABEL_KEY as _UI_MODE_LABEL_KEY,
+)
+from omnigent.harnesses.wrapper_labels import (
+    UI_MODE_TERMINAL_VALUE as _UI_MODE_TERMINAL_VALUE,
+)
+from omnigent.harnesses.wrapper_labels import (
+    WRAPPER_LABEL_KEY as _WRAPPER_LABEL_KEY,
+)
 from omnigent.host.daemon_launch import (
     error_text,
     launch_or_reuse_daemon_runner,
     open_daemon_client,
     wait_for_host_online,
     wait_for_runner_online,
-)
-from omnigent.native._native_resume_hint import echo_native_resume_hint
-from omnigent.native.native_coding_agents import native_shell_terminal_spec
-from omnigent.native.native_terminal import (
-    DAEMON_HOST_ONLINE_TIMEOUT_S as _DAEMON_HOST_ONLINE_TIMEOUT_S,
-)
-from omnigent.native.native_terminal import (
-    DAEMON_RUNNER_ONLINE_TIMEOUT_S as _DAEMON_RUNNER_ONLINE_TIMEOUT_S,
-)
-from omnigent.native.native_terminal import (
-    bind_session_runner as _bind_session_runner,
-)
-from omnigent.native.native_terminal import (
-    normalize_extra_args as _normalize_extra_args,
-)
-from omnigent.native.native_terminal import (
-    terminal_attach_url as _attach_url,
 )
 
 _logger = logging.getLogger(__name__)
@@ -364,7 +364,7 @@ def _run_with_local_server(
         conversation URL after the session is prepared.
     :returns: None.
     """
-    from omnigent.chat import (
+    from omnigent.cli.chat import (
         _bundle_agent,
         _find_free_port,
         _start_local_server,
@@ -470,8 +470,8 @@ def _run_with_remote_server(
         conversation URL after the session is prepared.
     :returns: None.
     """
-    from omnigent.chat import _bundle_agent, _remote_headers
-    from omnigent.cli import _ensure_host_daemon
+    from omnigent.cli.chat import _bundle_agent, _remote_headers
+    from omnigent.cli.commands import _ensure_host_daemon
     from omnigent.host.identity import load_or_create_host_identity
 
     # This machine's host id keys the WebSocket attach handshake (and its
@@ -588,7 +588,7 @@ async def _prepare_antigravity_terminal(
     :raises click.ClickException: If any server operation fails.
     """
     timeout = httpx.Timeout(30.0, read=120.0)
-    from omnigent.cli_auth import open_server_client
+    from omnigent.cli.auth import open_server_client
 
     async with open_server_client(base_url, headers=headers, timeout=timeout) as client:
         bridge_id: str
@@ -1618,7 +1618,7 @@ async def _close_antigravity_terminal(
     :param terminal_id: Terminal resource id.
     :returns: None.
     """
-    from omnigent.cli_auth import open_server_client
+    from omnigent.cli.auth import open_server_client
 
     try:
         async with open_server_client(

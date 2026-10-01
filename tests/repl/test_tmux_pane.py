@@ -401,7 +401,7 @@ def test_wrap_binding_supports_python_m_fallback_argv(
 ) -> None:
     """
     When :func:`_resolve_omnigent_argv` falls back to
-    ``[sys.executable, "-m", "omnigent.cli"]`` (no resolvable
+    ``[sys.executable, "-m", "omnigent.cli.commands"]`` (no resolvable
     binary on the PATH the running process inherited), the
     wrapper must embed the full three-element argv into the
     chooser shell command.
@@ -415,15 +415,15 @@ def test_wrap_binding_supports_python_m_fallback_argv(
     monkeypatch.setattr(subprocess, "run", _make_capturing_runner(captured))
     _wrap_binding(
         SplitBinding(key='"', direction="v", original_command="split-window"),
-        ["/usr/bin/python3", "-m", "omnigent.cli"],
+        ["/usr/bin/python3", "-m", "omnigent.cli.commands"],
     )
     chooser = captured[0][8]
     # All three prefix tokens must appear, joined by spaces, BEFORE
     # the ``pane-split`` subcommand. If only the python path
     # appears, the fallback path was truncated.
-    assert "/usr/bin/python3 -m omnigent.cli pane-split -v" in chooser, (
+    assert "/usr/bin/python3 -m omnigent.cli.commands pane-split -v" in chooser, (
         f"python-m fallback prefix not propagated; got chooser={chooser!r}. "
-        f"If ``-m omnigent.cli`` is missing, the wrapper would invoke "
+        f"If ``-m omnigent.cli.commands`` is missing, the wrapper would invoke "
         f"the bare python interpreter without telling it what to run."
     )
 
@@ -482,8 +482,8 @@ def test_resolve_argv_falls_back_to_python_m_when_which_misses(
     When neither argv[0] inspection nor ``shutil.which`` can find a
     binary (degraded environment, sandboxed PATH, etc.), the
     resolver falls back to ``[sys.executable, "-m",
-    "omnigent.cli"]`` — bulletproof because if Python is
-    running this code, ``omnigent.cli`` is importable.
+    "omnigent.cli.commands"]`` — bulletproof because if Python is
+    running this code, ``omnigent.cli.commands`` is importable.
 
     Claim: the fallback is exactly three elements with the
     running interpreter and the correct module path. A regression
@@ -496,7 +496,7 @@ def test_resolve_argv_falls_back_to_python_m_when_which_misses(
     monkeypatch.setattr(shutil, "which", lambda name: None)
     monkeypatch.setattr("sys.executable", "/path/to/python")
     argv = _resolve_omnigent_argv()
-    assert argv == ["/path/to/python", "-m", "omnigent.cli"], (
+    assert argv == ["/path/to/python", "-m", "omnigent.cli.commands"], (
         f"python-m fallback regressed; got {argv!r}. The fallback is "
         f"the only path that works in environments where the omnigent "
         f"binary isn't directly findable, so silent breakage here means "
@@ -576,15 +576,15 @@ def test_register_pane_strips_existing_python_m_prefix_idempotently(
     """
     Register-twice scenario: the second invocation receives a
     launch_argv that ALREADY starts with
-    ``[<python>, -m, omnigent.cli, ...]`` (because the first
+    ``[<python>, -m, omnigent.cli.commands, ...]`` (because the first
     invocation normalized it and the user's REPL is now running
-    via ``python -m omnigent.cli``). The second invocation must
+    via ``python -m omnigent.cli.commands``). The second invocation must
     NOT re-prepend, which would produce a doubled
-    ``-m omnigent.cli -m omnigent.cli`` and break the picker
+    ``-m omnigent.cli.commands -m omnigent.cli.commands`` and break the picker
     when it tries to ``os.execvp`` the duplicated argv.
 
     Claim: after a second ``register_pane`` call, the stored
-    ``@omnigent-launch-argv`` has exactly one ``-m omnigent.cli``
+    ``@omnigent-launch-argv`` has exactly one ``-m omnigent.cli.commands``
     marker in the prefix — same shape as a first-time call.
     A regression that re-prepended the prefix would store a
     doubled form and crash the picker on subsequent splits.
@@ -610,13 +610,13 @@ def test_register_pane_strips_existing_python_m_prefix_idempotently(
     monkeypatch.setattr(subprocess, "run", fake_run)
 
     # Simulate the second register_pane invocation: launch_argv is
-    # ALREADY in [python, -m, omnigent.cli, run, ...] form —
+    # ALREADY in [python, -m, omnigent.cli.commands, run, ...] form —
     # what a pane-picker-launched REPL would see at boot.
     register_pane(
         conv_id="conv_x",
         agent_name="a",
         agent_yaml=None,
-        launch_argv=["/p/python", "-m", "omnigent.cli", "run", "/x.yaml", "--omnigent"],
+        launch_argv=["/p/python", "-m", "omnigent.cli.commands", "run", "/x.yaml", "--omnigent"],
         server_url=None,
     )
 
@@ -626,14 +626,14 @@ def test_register_pane_strips_existing_python_m_prefix_idempotently(
     assert stored_argv == [
         "/p/python",
         "-m",
-        "omnigent.cli",
+        "omnigent.cli.commands",
         "run",
         "/x.yaml",
         "--omnigent",
     ], (
         f"launch-argv regressed to a doubled form: {stored_argv!r}. The "
         f"picker calls ``os.execvp(argv[0], argv)``, so a doubled "
-        f"``-m omnigent.cli`` would crash with a Python module-import "
+        f"``-m omnigent.cli.commands`` would crash with a Python module-import "
         f"error or invoke a wrong subcommand."
     )
 
@@ -644,9 +644,9 @@ def test_register_pane_repairs_already_doubled_prefix(
 ) -> None:
     """
     Regression test for the live state observed on a real pane:
-    ``[python, -m, omnigent.cli, -m, omnigent.cli, run, ...]``
+    ``[python, -m, omnigent.cli.commands, -m, omnigent.cli.commands, run, ...]``
     — left there by an earlier register_pane that stripped only
-    one ``-m omnigent.cli`` prefix and re-prepended a fresh
+    one ``-m omnigent.cli.commands`` prefix and re-prepended a fresh
     one. The new normalization scans for the user's first
     subcommand (``run``) and slices from there, so any number
     of leading launcher tokens get collapsed to exactly one
@@ -684,9 +684,9 @@ def test_register_pane_repairs_already_doubled_prefix(
         launch_argv=[
             "/p/python",
             "-m",
-            "omnigent.cli",
+            "omnigent.cli.commands",
             "-m",
-            "omnigent.cli",
+            "omnigent.cli.commands",
             "run",
             "/x.yaml",
             "--omnigent",
@@ -702,7 +702,7 @@ def test_register_pane_repairs_already_doubled_prefix(
     assert stored_argv == [
         "/p/python",
         "-m",
-        "omnigent.cli",
+        "omnigent.cli.commands",
         "run",
         "/x.yaml",
         "--omnigent",

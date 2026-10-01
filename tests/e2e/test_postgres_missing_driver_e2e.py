@@ -8,7 +8,7 @@ start``, and the local server crashes at boot with a bare
 the server log file — the terminal shows a generic "daemon exited"
 error with no actionable guidance about the missing driver.
 
-Each test spawns the REAL CLI (``python -m omnigent.cli start``) in an
+Each test spawns the REAL CLI (``python -m omnigent.cli.commands start``) in an
 isolated ``$HOME`` so the daemon, pidfiles, and logs never touch the
 developer's ``~/.omnigent``. No Postgres server is needed: the failure
 fires at DBAPI import time, before any connection attempt.
@@ -96,7 +96,7 @@ def _run_start(home: Path, database_uri: str) -> subprocess.CompletedProcess[str
     env["PYTHONPATH"] = f"{_REPO_ROOT}{os.pathsep}{env.get('PYTHONPATH', '')}"
     env["OMNIGENT_DATABASE_URI"] = database_uri
     return subprocess.run(
-        [sys.executable, "-m", "omnigent.cli", "start"],
+        [sys.executable, "-m", "omnigent.cli.commands", "start"],
         env=env,
         cwd=str(home),
         capture_output=True,

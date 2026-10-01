@@ -15,7 +15,7 @@ import sys
 
 import pytest
 
-from omnigent import cli_auth
+from omnigent.cli import auth as cli_auth
 
 posix_only = pytest.mark.skipif(sys.platform == "win32", reason="POSIX mode bits")
 

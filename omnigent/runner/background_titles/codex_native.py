@@ -8,7 +8,7 @@ import logging
 import tempfile
 from pathlib import Path
 
-from omnigent.debug_logging import runner_primary_session_id
+from omnigent.observability.debug_logging import runner_primary_session_id
 from omnigent.runner.background_titles.service import (
     BACKGROUND_TITLE_INFERENCE_TIMEOUT_SECONDS,
     BackgroundTitleContext,
@@ -20,17 +20,17 @@ _logger = logging.getLogger("omnigent.runner.background_titles.codex_native")
 
 async def generate_background_title(context: BackgroundTitleContext) -> str | None:
     """Generate a title with an isolated native Codex exec process."""
-    from omnigent.harnesses.codex_native.app_server import (
-        build_codex_native_server,
-        resolve_native_codex_launch,
-    )
-    from omnigent.inner import _proc
-    from omnigent.inner.codex_executor import (
+    from omnigent.harnesses.codex.executor import (
         _codex_home_config_source_from_env,
         _populate_codex_home_config,
         materialize_codex_provider_config,
     )
+    from omnigent.harnesses.codex_native.app_server import (
+        build_codex_native_server,
+        resolve_native_codex_launch,
+    )
     from omnigent.runner.native.orchestration import _codex_native_model_from_spec
+    from omnigent.util import proc as _proc
     from omnigent.util.reasoning_effort import CODEX_NATIVE_EFFORTS
 
     model = (

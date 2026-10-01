@@ -83,7 +83,7 @@ from omnigent.harnesses.claude_native.bridge import (
     _claude_prompt_rendered,
     bridge_dir_for_bridge_id,
 )
-from omnigent.native.native_coding_agents import CLAUDE_NATIVE_AGENT_NAME
+from omnigent.harnesses.native.coding_agents import CLAUDE_NATIVE_AGENT_NAME
 from tests._helpers.compat import apply_runner_env, compat_runner_cwd, runner_executable
 from tests.e2e.helpers import POLL_INTERVAL_S
 

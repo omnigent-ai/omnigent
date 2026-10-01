@@ -14,7 +14,7 @@ from typing import Any
 import httpx
 import pytest
 
-from omnigent.server.routes._sessions.helpers import (
+from omnigent.server.routes.sessions.helpers import (
     _forward_session_change_to_runner_impl,
 )
 
@@ -37,7 +37,7 @@ async def test_transport_miss_warns_and_falls_back(
     :param caplog: Pytest log capture fixture.
     :returns: None.
     """
-    helpers = "omnigent.server.routes._sessions.helpers"
+    helpers = "omnigent.server.routes.sessions.helpers"
     monkeypatch.setattr(
         f"{helpers}._get_runner_client",
         lambda *a, **k: _async_return(_RefusingClient()),

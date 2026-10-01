@@ -2109,7 +2109,7 @@ async def test_events_managed_glm_switch_confirms_the_terminal_model(
 async def test_bound_claude_switch_preserves_private_model_id(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from omnigent.inference_config import inference_config_scope
+    from omnigent.models.inference_config import inference_config_scope
 
     selected = "private/model-b[large]"
     config = {

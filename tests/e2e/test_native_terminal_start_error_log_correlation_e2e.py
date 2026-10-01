@@ -73,7 +73,7 @@ _PYTHONPATH = os.pathsep.join(
     ]
 )
 
-from omnigent.runner.identity import (  # noqa: E402
+from omnigent.util.runner_identity import (  # noqa: E402
     OMNIGENT_INTERNAL_WS_ORIGIN,
     token_bound_runner_id,
 )
@@ -311,7 +311,7 @@ def _native_stack(tmp_path: Path, claude_stub_script: str, *, fail_tmux_launch: 
             [
                 sys.executable,
                 "-m",
-                "omnigent.cli",
+                "omnigent.cli.commands",
                 "server",
                 "--host",
                 "127.0.0.1",

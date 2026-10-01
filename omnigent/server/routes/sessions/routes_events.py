@@ -24,7 +24,6 @@ from starlette.datastructures import Headers
 from starlette.types import Message, Receive, Scope, Send
 
 from omnigent.db.workspace_cache import WorkspaceScopedCache
-from omnigent.debug_logging import add_audit_attrs, debug_event, mark_request_audit_suppressed
 from omnigent.entities import (
     Conversation,
     ErrorData,
@@ -43,7 +42,11 @@ from omnigent.host.frames import (
 from omnigent.host.frames import (
     workspace_missing_message as _workspace_missing_message,
 )
-from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
+from omnigent.observability.debug_logging import (
+    add_audit_attrs,
+    debug_event,
+    mark_request_audit_suppressed,
+)
 from omnigent.runner.launch_failure import classify_native_turn_error
 from omnigent.runner.routing import RunnerRouter, routing_host_id
 from omnigent.runner.transports.ws_tunnel.frames import (
@@ -57,6 +60,10 @@ from omnigent.runtime import (
 )
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.runtime.policies.approval import _ELICITATION_MODE
+from omnigent.runtime.session_event_batch import (
+    MAX_SESSION_EVENT_BATCH_EVENTS,
+    MAX_SESSION_EVENT_REQUEST_BYTES,
+)
 from omnigent.server import presence
 from omnigent.server._elicitation_registry import (
     _harness_elicitation_owners,
@@ -96,7 +103,7 @@ from omnigent.server.routes._auth_helpers import (
     require_user as _require_user,
 )
 from omnigent.server.routes._errors import session_not_found as _session_not_found
-from omnigent.server.routes._sessions.common import (
+from omnigent.server.routes.sessions.common import (
     _ALLOWED_EVENT_TYPES,
     _APPROVAL_TYPE,
     _CODEX_NATIVE_SUBAGENT_THREAD_ID_LABEL_KEY,
@@ -150,7 +157,7 @@ from omnigent.server.routes._sessions.common import (
     get_server_runner_router,
     set_server_runner_router,
 )
-from omnigent.server.routes._sessions.helpers import (
+from omnigent.server.routes.sessions.helpers import (
     _TUI_INJECT_FORWARD_TIMEOUT_S,
     SessionLiveness,
     _apply_pending_policy_ask_writes,
@@ -210,7 +217,7 @@ from omnigent.server.routes._sessions.helpers import (
     reconcile_orphaned_running_status,
     require_filesystem_attachment_runtime,
 )
-from omnigent.server.routes._sessions.orchestration import (
+from omnigent.server.routes.sessions.orchestration import (
     _best_effort_stop,
     _child_session_summaries_from_conversations,
     _dispatch_session_event_to_runner,
@@ -250,10 +257,6 @@ from omnigent.server.subagent_activity import (
     native_subagent_terminal_status,
     record_subagent_activity,
 )
-from omnigent.session_event_batch import (
-    MAX_SESSION_EVENT_BATCH_EVENTS,
-    MAX_SESSION_EVENT_REQUEST_BYTES,
-)
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.conversation_store import RUNNER_LIVENESS_TTL_S, runner_seen_is_fresh
@@ -273,6 +276,7 @@ from omnigent.telemetry.request_headers import (
     parse_installation_id_header as _tel_parse_installation_id,
 )
 from omnigent.tools.client_specified import parse_client_side_tool_specs
+from omnigent.util.runner_identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
 from omnigent.util.session_lifecycle import (
     is_session_closed,
 )
@@ -905,7 +909,7 @@ def register_events_routes(
                     code=ErrorCode.INVALID_INPUT,
                 ) from exc
         if body.type in ("message", _SLASH_COMMAND_TYPE):
-            from omnigent.inner.native_attachments import (
+            from omnigent.util.attachments import (
                 inline_filesystem_attachment_name,
                 requires_filesystem,
             )

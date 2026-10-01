@@ -105,7 +105,7 @@ class _HostCliHarness:
     def run_host(self, *args: str) -> subprocess.CompletedProcess[str]:
         """Run ``omnigent host <args>`` exactly as a user would."""
         return subprocess.run(
-            [sys.executable, "-m", "omnigent.cli", "host", *args],
+            [sys.executable, "-m", "omnigent.cli.commands", "host", *args],
             env=self.env,
             cwd=self.cwd,
             capture_output=True,

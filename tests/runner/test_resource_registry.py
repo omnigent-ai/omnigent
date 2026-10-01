@@ -13,10 +13,9 @@ from unittest.mock import Mock
 
 import pytest
 
+from omnigent.core.datamodel import OSEnvSandboxSpec, OSEnvSpec, TerminalEnvSpec
 from omnigent.entities import DEFAULT_ENVIRONMENT_ID
-from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec, TerminalEnvSpec
-from omnigent.inner.os_env import EditEntry, OpResult, OSEnvironment
-from omnigent.inner.terminal import TerminalInstance
+from omnigent.environments.os_env import EditEntry, OpResult, OSEnvironment
 from omnigent.runner.resource_registry import (
     _TERMINAL_EXIT_OUTPUT_MAX_CHARS,
     CLAUDE_NATIVE_TERMINAL_ROLE,
@@ -31,6 +30,7 @@ from omnigent.runner.resource_registry import (
     trim_terminal_output,
 )
 from omnigent.terminals import TerminalRegistry
+from omnigent.terminals.terminal import TerminalInstance
 from tests.runner.helpers import make_test_terminal_instance
 
 
@@ -1163,7 +1163,7 @@ def test_resolve_environment_default_pins_none_sandbox_when_no_agent_spec(
     :returns: None.
     """
     monkeypatch.setattr(
-        "omnigent.inner.sandbox.shutil.which",
+        "omnigent.sandbox.core.shutil.which",
         lambda name: "/usr/bin/bwrap",
     )
     monkeypatch.setenv("OMNIGENT_RUNNER_OS_ENV_ROOT", str(tmp_path))

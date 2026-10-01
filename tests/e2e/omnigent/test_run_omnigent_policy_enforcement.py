@@ -18,7 +18,7 @@ Omnigent' :class:`FunctionPolicy` dispatcher can't invoke
 (it passes ``(ctx, context)`` where ``ctx`` is an
 :class:`EvaluationContext` dataclass, not a dict). This test
 uses the omnigent-shaped
-``omnigent._e2e_policy_callables.block_on_sentinel``
+``omnigent.testing.e2e_policy_callables.block_on_sentinel``
 callable — an arity-1 callable matching Omnigent'
 convention — so the test proves the translator + engine
 integration works and isn't muddied by a separate callable-
@@ -56,7 +56,7 @@ _HARNESS_HARNESS_MODELS = [("openai-agents", "mock-model")]
 _HARNESS_IDS = ["openai-agents"]
 
 # Sentinel token that the ``block_on_sentinel`` policy callable
-# in ``omnigent/_e2e_policy_callables.py`` DENYs on. The token
+# in ``omnigent/testing/e2e_policy_callables.py`` DENYs on. The token
 # is deliberately unlikely to appear in model output; a real LLM
 # could otherwise generate it incidentally and mask a true
 # regression.
@@ -110,7 +110,7 @@ def policy_enforcement_yaml_factory(tmp_path: Path) -> Callable[[str, str], Path
                 "block_sentinel_input": {
                     "type": "function",
                     "on": ["request"],
-                    "handler": ("omnigent._e2e_policy_callables.block_on_sentinel"),
+                    "handler": ("omnigent.testing.e2e_policy_callables.block_on_sentinel"),
                 },
             },
         }

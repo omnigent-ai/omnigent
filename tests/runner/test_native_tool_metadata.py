@@ -10,7 +10,7 @@ from unittest.mock import Mock
 
 import pytest
 
-from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
+from omnigent.core.datamodel import OSEnvSpec, TerminalEnvSpec
 from omnigent.runner import create_runner_app, tool_dispatch
 from omnigent.runner.app import ResolvedSpec
 from omnigent.spec.types import AgentSpec, LocalToolInfo, ToolRuntime
@@ -126,7 +126,7 @@ async def test_cold_turn_schemas_preserve_local_tools_without_os_environment(
         return ResolvedSpec(spec=spec, workdir=tmp_path)
 
     create_env = Mock(side_effect=FileNotFoundError("metadata must not resolve the process cwd"))
-    monkeypatch.setattr("omnigent.inner.os_env.create_os_environment", create_env)
+    monkeypatch.setattr("omnigent.environments.os_env.create_os_environment", create_env)
     harness = _ScriptedHarnessClient(
         [_sse({"type": "response.completed", "response": {"id": "resp_metadata"}})]
     )

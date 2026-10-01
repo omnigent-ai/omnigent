@@ -280,7 +280,7 @@ def fs_ws_runner_id() -> str:
 
     :returns: Runner id string bound to a per-module binding token.
     """
-    from omnigent.runner.identity import token_bound_runner_id
+    from omnigent.util.runner_identity import token_bound_runner_id
 
     if "runner_id" not in _fs_ws_runner_state:
         token = secrets.token_urlsafe(32)
@@ -335,7 +335,7 @@ def fs_ws_server(
         [
             sys.executable,
             "-m",
-            "omnigent.cli",
+            "omnigent.cli.commands",
             "server",
             "--port",
             str(port),

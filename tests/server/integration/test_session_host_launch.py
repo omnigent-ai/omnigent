@@ -51,7 +51,6 @@ from omnigent.host.frames import (
     encode_host_frame,
 )
 from omnigent.host.identity import HostIdentity
-from omnigent.runner.identity import token_bound_runner_id
 from omnigent.runner.transports.ws_tunnel.frames import HelloFrame
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.app import create_app
@@ -64,6 +63,7 @@ from omnigent.stores.conversation_store.sqlalchemy_store import (
 )
 from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
 from omnigent.stores.host_store import HostStore
+from omnigent.util.runner_identity import token_bound_runner_id
 from tests.budgets import Deadline, budget
 from tests.server.helpers import create_test_agent
 from tests.server.helpers import websocket_scope as _websocket_scope
@@ -1396,7 +1396,7 @@ async def test_message_relaunch_unacknowledged_launch_is_not_claimed_as_launched
     caplog.set_level(logging.WARNING)
     from omnigent.runtime import set_runner_client
     from omnigent.server.routes import sessions as sessions_module
-    from omnigent.server.routes._sessions import helpers as sessions_helpers
+    from omnigent.server.routes.sessions import helpers as sessions_helpers
     from omnigent.server.routes.sessions import routes_events
 
     monkeypatch.setattr(sessions_module, "_HOST_BOUND_RUNNER_CONNECT_GRACE_S", 0.0)
@@ -2197,7 +2197,7 @@ async def test_codex_goal_relaunch_posts_session_init_before_goal_event(
     500s. Moving the init after the goal-event forward fails the ordering
     assertion.
     """
-    from omnigent._wrapper_labels import CODEX_NATIVE_WRAPPER_VALUE, WRAPPER_LABEL_KEY
+    from omnigent.harnesses.wrapper_labels import CODEX_NATIVE_WRAPPER_VALUE, WRAPPER_LABEL_KEY
     from omnigent.server.routes.codex import sessions as codex_sessions_module
 
     # Inline-launch a host-bound session (the goal relaunch path bails early
@@ -2407,7 +2407,7 @@ async def _serve_fs_requests(
 ) -> None:
     """Answer the host's ``host.fs_request`` round-trips from a real dir.
 
-    Runs the production :class:`omnigent.workspace_fs.WorkspaceReader`
+    Runs the production :class:`omnigent.host.workspace_fs.WorkspaceReader`
     against ``workspace_root`` — a real on-disk directory the test
     controls — for each fs request the server proxies, replying with the
     same ``host.fs_result`` shape the real host daemon sends. This is the
@@ -2424,7 +2424,7 @@ async def _serve_fs_requests(
     from pathlib import Path
 
     from omnigent.host.frames import HostFsRequestFrame, HostFsResultFrame
-    from omnigent.workspace_fs import WorkspaceReader, WorkspaceReaderError
+    from omnigent.host.workspace_fs import WorkspaceReader, WorkspaceReaderError
 
     reader = WorkspaceReader(Path(workspace_root))
     deadline = Deadline(30.0)

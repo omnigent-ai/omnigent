@@ -22,7 +22,7 @@ import pytest
 import yaml
 from playwright.sync_api import Page, expect
 
-from omnigent.process_logging import PROCESS_LOG_FILE_ENV_VAR
+from omnigent.observability.process_logging import PROCESS_LOG_FILE_ENV_VAR
 from tests.e2e_ui.conftest import _register_extra_agent
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]

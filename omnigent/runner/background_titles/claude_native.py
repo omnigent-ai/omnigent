@@ -8,7 +8,7 @@ import json
 import logging
 import os
 
-from omnigent.debug_logging import runner_primary_session_id
+from omnigent.observability.debug_logging import runner_primary_session_id
 from omnigent.runner.background_titles.service import (
     BACKGROUND_TITLE_INFERENCE_TIMEOUT_SECONDS,
     BackgroundTitleContext,
@@ -20,17 +20,17 @@ _logger = logging.getLogger("omnigent.runner.background_titles.claude_native")
 
 async def generate_background_title(context: BackgroundTitleContext) -> str | None:
     """Generate a title with an isolated Claude Code print-mode process."""
-    from omnigent._platform import resolve_cli_binary
-    from omnigent.claude_launcher import resolve_claude_launch
     from omnigent.harnesses.claude_native.bridge import (
         ClaudeNativeHookInterpreterMismatchError,
         validate_claude_hook_interpreter_compatibility,
     )
+    from omnigent.harnesses.claude_native.launcher import resolve_claude_launch
     from omnigent.harnesses.claude_native.main import (
         build_native_claude_terminal_env,
         resolve_native_claude_config,
     )
     from omnigent.runner.native.orchestration import _claude_terminal_env_unset
+    from omnigent.util.portability import resolve_cli_binary
 
     try:
         claude_config = resolve_native_claude_config(spec=None)

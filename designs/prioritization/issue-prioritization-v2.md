@@ -600,7 +600,7 @@ ranking takes.
 | 136 | 42 | medium | P2 | P2 | +192 | [#152](https://github.com/omnigent-ai/omnigent/issues/152) Harness availability is reported from binary presence, not from config |
 | 137 | 42 | medium | P3 | P2 ⚑ | +210 | [#147](https://github.com/omnigent-ai/omnigent/issues/147) Tracking: gradual decomposition of monolith modules (cli.py 9.1KLOC, c |
 | 138 | 40 | medium | P1 | P2 ⚑ | -96 | [#3101](https://github.com/omnigent-ai/omnigent/issues/3101) Docker/Kubernetes entrypoint never wires project_store — first-class P |
-| 139 | 40 | medium | P1 | P2 ⚑ | -61 | [#2429](https://github.com/omnigent-ai/omnigent/issues/2429) Server (python -m omnigent.cli server) CPU-spins indefinitely with no  |
+| 139 | 40 | medium | P1 | P2 ⚑ | -61 | [#2429](https://github.com/omnigent-ai/omnigent/issues/2429) Server (python -m omnigent.cli.commands server) CPU-spins indefinitely with no  |
 | 140 | 39 | medium | P1 | P2 ⚑ | -27 | [#1551](https://github.com/omnigent-ai/omnigent/issues/1551) opencode-native: blocking question tool not surfaced to web (no elicit |
 | 141 | 36 | medium | P2 | P2 | -7 | [#4009](https://github.com/omnigent-ai/omnigent/issues/4009) [Feature] No Go client for the session API, so every Go caller hand-ro |
 | 142 | 36 | medium | P1 | P2 ⚑ | -129 | [#3898](https://github.com/omnigent-ai/omnigent/issues/3898) [Bug] Pack function policies fail server-side input evaluation unless  |

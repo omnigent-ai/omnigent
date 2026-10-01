@@ -4,8 +4,8 @@ from pathlib import Path
 
 import pytest
 
-from omnigent.cli import _bundle
-from omnigent.inner.bundle_skills import claude_native_skill_args
+from omnigent.cli.commands import _bundle
+from omnigent.harnesses.claude_sdk.bundle_skills import claude_native_skill_args
 from omnigent.runner.tool_dispatch import _execute_skill_tool
 from omnigent.runtime.prompt import build_instructions
 from omnigent.server.bundles import validate_agent_bundle

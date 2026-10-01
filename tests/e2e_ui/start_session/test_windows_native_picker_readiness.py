@@ -56,7 +56,7 @@ _BROKEN_PRECONDITION_REASONS = frozenset({"binary-missing", "needs-auth", "versi
 _READINESS_PROBE_SOURCE = """
 import json, os
 import platform as platform_mod
-import omnigent._platform as omni_platform
+import omnigent.util.portability as omni_platform
 
 if os.environ.get("SIMULATE_WINDOWS") == "1":
     omni_platform.IS_WINDOWS = True

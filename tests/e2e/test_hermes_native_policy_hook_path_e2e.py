@@ -9,7 +9,7 @@ a ``pre_tool_call`` shell hook. That hook is a wrapper script that ``exec``s
 
 from ``omnigent/harnesses/hermes_native/bridge.py``, which resolves to
 ``omnigent/harnesses/hermes_native/inner/hermes_policy_hook.py`` -- a path that
-does not exist (the shipped hook is ``omnigent/inner/hermes_policy_hook.py``).
+does not exist (the shipped hook is ``omnigent/harnesses/hermes/policy_hook.py``).
 So every Hermes tool call runs a hook that Python cannot open: it exits 2 with
 ``can't open file ... [Errno 2] No such file or directory``, which Hermes treats
 as a ``pre_tool_call`` block. The tool never executes and its result is that

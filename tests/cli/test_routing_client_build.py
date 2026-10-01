@@ -14,7 +14,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from omnigent.cli import _build_routing_backends
+from omnigent.cli.commands import _build_routing_backends
 from omnigent.server.smart_routing import (
     ExternalRoutingClient,
     LLMRoutingClient,
@@ -96,7 +96,7 @@ def test_provider_none_configures_neither_backend(workspace: Any) -> None:
 def test_an_llm_block_alone_configures_only_the_built_in_judge() -> None:
     """No Databricks provider and no ``routing:`` block means judge only."""
     with (
-        patch("omnigent.cli._databricks_provider_profile", return_value=None),
+        patch("omnigent.cli.commands._databricks_provider_profile", return_value=None),
         _policy_client(),
     ):
         backends = _build_routing_backends({}, _server_llm(), RoutingSettings())
@@ -117,7 +117,7 @@ def test_a_databricks_deployment_without_an_llm_block_gets_only_the_gateway(
 
 def test_an_unusable_config_leaves_routing_off() -> None:
     """A default (non-external, non-none) provider with no ``llm:`` block."""
-    with patch("omnigent.cli._databricks_provider_profile", return_value=None):
+    with patch("omnigent.cli.commands._databricks_provider_profile", return_value=None):
         backends = _build_routing_backends(
             {"routing": {"provider": "judge"}}, None, RoutingSettings()
         )

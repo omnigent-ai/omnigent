@@ -63,7 +63,7 @@ recognized as the host, not a harness regression.
 - ``--continue`` stops seeding prior-turn history onto a fresh antigravity
   session (#278 regression — the SDK has no history-injection API, so prior
   turns are replayed as a plain-text ``"Conversation so far: ..."`` prefix).
-- ``omnigent.cli``'s ``run`` one-shot / interactive paths stop persisting the
+- ``omnigent.cli.commands``'s ``run`` one-shot / interactive paths stop persisting the
   assistant reply, or harness dispatch for ``antigravity`` regresses.
 
 **Scope note (stable-on-main behaviors only):** this file is authored off

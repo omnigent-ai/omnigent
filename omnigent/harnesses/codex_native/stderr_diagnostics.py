@@ -12,10 +12,10 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import cast
 
-from omnigent.debug_logging import debug_event
 from omnigent.harnesses.codex_native.bridge import read_bridge_state
 from omnigent.harnesses.diagnostics import DIAGNOSTIC_TAIL_BYTES, bounded_diagnostic_tail
-from omnigent.process_logging import harness_stderr_capture_enabled
+from omnigent.observability.debug_logging import debug_event
+from omnigent.observability.process_logging import harness_stderr_capture_enabled
 
 CODEX_DIAGNOSTIC_RUST_LOG = (
     "warn,codex_core::client=info,codex_core::tools::parallel=debug,"
