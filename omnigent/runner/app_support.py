@@ -2,15 +2,21 @@
 
 from __future__ import annotations
 
+import asyncio
+import dataclasses
 import logging
 from collections.abc import Awaitable, Callable
-from typing import Literal, TypeAlias, overload
+from pathlib import Path
+from typing import TYPE_CHECKING, Literal, TypeAlias, overload
 
 from omnigent.debug_logging import runner_primary_session_id
 from omnigent.process_logging import process_log_reference
 from omnigent.runner.native import ResolvedSpec
 from omnigent.spec.types import AgentSpec
 from omnigent.util.json_types import JsonObject as _JsonObject
+
+if TYPE_CHECKING:
+    from omnigent.harnesses.claude_native.bridge import ClaudeNativeToolRelay
 
 _logger = logging.getLogger("omnigent.runner.app")
 
@@ -80,3 +86,54 @@ class _BodyRequest:
 
     async def json(self) -> _JsonObject:
         return self._body
+
+
+@dataclasses.dataclass(frozen=True)
+class _CommentRelayBinding:
+    """A running comment relay plus the agent and bridge it was built for.
+
+    A relay advertises the tool surface of one agent spec and writes it into
+    one bridge directory. Recording both lets
+    ``_ensure_comment_relay_started`` notice that the session moved to a
+    different agent and replace the relay, instead of leaving the previous
+    agent's surface advertised to the new harness.
+
+    :param relay: The relay currently serving the session.
+    :param spec_entry: Resolved spec the advertised surface was built from,
+        compared by identity: the session spec cache hands back the same
+        object until an agent switch or an agent update evicts it, so a
+        changed object means the surface has to be rebuilt. ``None`` when
+        the spec could not be resolved and the fallback surface was used.
+    :param bridge_dir: Directory the relay wrote ``tool_relay.json`` into,
+        e.g. ``Path("/tmp/omnigent-bridge/conv_abc123")``.
+    """
+
+    relay: ClaudeNativeToolRelay
+    spec_entry: _SpecEntry | None
+    bridge_dir: Path
+
+
+def _require_full_native_lock_coverage(
+    dispatch: dict[str, dict[str, asyncio.Lock]],
+) -> dict[str, dict[str, asyncio.Lock]]:
+    """Fail fast if the native terminal lock dispatch is missing a harness.
+
+    The launch and ensure paths index this map by ``agent.key``; a native
+    harness absent from it raises ``KeyError`` mid terminal-ensure and surfaces
+    to the user as a "malformed runner response (HTTP 500)". Asserting coverage
+    at app construction catches a newly-added native harness that was not wired
+    here immediately, rather than only when someone starts that harness.
+
+    Scoped to the BUILT-IN native providers, not the merged registry: a
+    community-contributed native harness wires its own launcher and must not be
+    forced into this built-in dispatch (that would turn a localized per-launch
+    failure into the whole runner failing to construct).
+    """
+    from omnigent.harness_plugins import _BUILTIN_NATIVE_PROVIDERS
+
+    missing = {provider.key for provider in _BUILTIN_NATIVE_PROVIDERS} - set(dispatch)
+    if missing:
+        raise RuntimeError(
+            f"native terminal lock dispatch is missing built-in harness(es): {sorted(missing)}"
+        )
+    return dispatch

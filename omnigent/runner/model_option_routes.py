@@ -5,8 +5,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from collections.abc import Awaitable, Callable, Mapping, Sequence
-from typing import TYPE_CHECKING
+from collections.abc import Callable, Coroutine, Mapping, Sequence
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from omnigent.harnesses.claude_native.main import ClaudeNativeUcodeConfig
@@ -51,13 +51,13 @@ def register_model_option_routes(
     app: FastAPI,
     *,
     _claude_model_options_rows: dict[str, tuple[float, list[dict[str, object]]]],
-    _codex_native_model_options: Callable[[str], Awaitable[list[_JsonObject]]],
-    _opencode_native_model_options: Callable[[str], Awaitable[list[_JsonObject]]],
-    _resolve_session_agent_spec: Callable[[str], Awaitable[AgentSpec | None]],
+    _codex_native_model_options: Callable[[str], Coroutine[Any, Any, list[_JsonObject]]],
+    _opencode_native_model_options: Callable[[str], Coroutine[Any, Any, list[_JsonObject]]],
+    _resolve_session_agent_spec: Callable[[str], Coroutine[Any, Any, AgentSpec | None]],
     _resolve_session_claude_launch_config: Callable[
-        [str], Awaitable[ClaudeNativeUcodeConfig | None]
+        [str], Coroutine[Any, Any, ClaudeNativeUcodeConfig | None]
     ],
-    _resolve_session_skills: Callable[[str], Awaitable[list[SkillSpec]]],
+    _resolve_session_skills: Callable[[str], Coroutine[Any, Any, list[SkillSpec]]],
     _session_cursor_model_names: dict[str, dict[str, str]],
     _session_harness_name: Callable[[str], str | None],
     _session_spec_cache: dict[str, _SpecEntry | None],

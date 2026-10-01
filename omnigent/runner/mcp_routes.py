@@ -5,9 +5,9 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Callable, Coroutine, Mapping
 from pathlib import Path
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, cast
 
 if TYPE_CHECKING:
     from omnigent.llms.client import Client as LLMClient
@@ -80,15 +80,15 @@ def register_mcp_routes(
     app: FastAPI,
     *,
     _publish_event: Callable[[str, Mapping[str, object]], None],
-    _recover_undrained_subagent_results: Callable[[str], Awaitable[None]],
-    _resolve_conversation_id: Callable[[str], Awaitable[str | None]],
-    _resolve_session_agent_spec_or_none: Callable[[str], Awaitable[AgentSpec | None]],
-    _resolve_session_spec_entry: Callable[[str], Awaitable[_SpecEntry | None]],
+    _recover_undrained_subagent_results: Callable[[str], Coroutine[Any, Any, None]],
+    _resolve_conversation_id: Callable[[str], Coroutine[Any, Any, str | None]],
+    _resolve_session_agent_spec_or_none: Callable[[str], Coroutine[Any, Any, AgentSpec | None]],
+    _resolve_session_spec_entry: Callable[[str], Coroutine[Any, Any, _SpecEntry | None]],
     _session_agent_ids: dict[str, str],
     _session_async_tasks: dict[str, dict[str, tuple[asyncio.Task[str], asyncio.Event]]],
     _session_harness_name: Callable[[str], str | None],
     _session_inboxes: dict[str, asyncio.Queue[_JsonObject]],
-    _session_runtime_cwd: Callable[[str], Awaitable[Path | None]],
+    _session_runtime_cwd: Callable[[str], Coroutine[Any, Any, Path | None]],
     _session_spec_cache: dict[str, _SpecEntry | None],
     filesystem_registry: FilesystemRegistry | None,
     mcp_execution_registry: McpExecutionRegistry,
