@@ -177,6 +177,66 @@ def test_materialize_attachment_unresolved_file_id_logs_error(
     assert records[0].levelno == logging.ERROR
 
 
+def test_decode_attachment_block_unresolved_log_includes_block_type(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """
+    The unresolved file_id log includes the block type.
+
+    Proves the log message carries ``block_type=input_file`` (or the
+    actual type of the block) so operators can distinguish image vs
+    file attachment failures without inspecting raw block payloads.
+    """
+    block = {"type": "input_file", "file_id": "file_type_test"}
+
+    with caplog.at_level(logging.ERROR, logger="omnigent.inner.native_attachments"):
+        materialize_attachment(block, tmp_path)
+
+    records = [r for r in caplog.records if "unresolved file_id file_type_test" in r.getMessage()]
+    assert len(records) == 1
+    assert "block_type=input_file" in records[0].getMessage()
+
+
+def test_decode_attachment_block_unresolved_log_includes_filename_when_present(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """
+    The unresolved file_id log includes filename when the block has one.
+
+    The filename is user-provided metadata logged so operators can match
+    the error back to the user's upload. A failure here means the log
+    drops the only human-readable attachment identifier.
+    """
+    block = {"type": "input_file", "file_id": "file_named", "filename": "report.pdf"}
+
+    with caplog.at_level(logging.ERROR, logger="omnigent.inner.native_attachments"):
+        materialize_attachment(block, tmp_path)
+
+    records = [r for r in caplog.records if "unresolved file_id file_named" in r.getMessage()]
+    assert len(records) == 1
+    assert "filename='report.pdf'" in records[0].getMessage()
+
+
+def test_decode_attachment_block_unresolved_log_omits_filename_when_absent(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """
+    The unresolved file_id log omits the filename field when the block has none.
+
+    Avoids adding ``filename=''`` noise when the client did not provide
+    the optional name. A failure here means spurious empty-filename fields
+    clutter every unresolved-file log entry.
+    """
+    block = {"type": "input_image", "file_id": "file_noname"}
+
+    with caplog.at_level(logging.ERROR, logger="omnigent.inner.native_attachments"):
+        materialize_attachment(block, tmp_path)
+
+    records = [r for r in caplog.records if "unresolved file_id file_noname" in r.getMessage()]
+    assert len(records) == 1
+    assert "filename=" not in records[0].getMessage()
+
+
 def test_unresolved_attachment_marker_names_the_attachment() -> None:
     """
     The marker names the attachment by filename, falling back to file_id.

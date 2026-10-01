@@ -1136,6 +1136,181 @@ async def test_sessions_native_history_file_id_fetch_failure_is_nonfatal(
 
 
 @pytest.mark.asyncio
+async def test_history_file_id_fetch_failure_logs_structured_event(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A failed history file fetch emits a runner_file_id_fetch_failed debug event.
+
+    The event must record session_id, file_id, block_type, and from_history=True
+    so log queries can distinguish history re-resolution from current-turn failures.
+    """
+    import omnigent.runner.app as _runner_app
+
+    harness_client = _ScriptedHarnessClient(
+        [_sse({"type": "response.completed", "response": {"id": "resp_1"}})]
+    )
+    pm = _FakeProcessManager(harness_client)
+    server_client = _HistoryFileServerClient(fail_file_fetch=True)
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        server_client=server_client,  # type: ignore[arg-type]
+    )
+
+    session_id = "conv_hist_struct_log"
+    # Ensure no stale dedup entry from a prior test run.
+    _runner_app._logged_file_fetch_failures.pop(session_id, None)
+
+    async with _runner_client(app) as client:
+        with caplog.at_level(logging.WARNING, logger="omnigent.runner.app"):
+            await client.post(
+                f"/v1/sessions/{session_id}/events",
+                json={
+                    "type": "message",
+                    "role": "user",
+                    "agent_id": "ag_abc",
+                    "model": "test-agent",
+                    "content": [{"type": "input_text", "text": "what was that image?"}],
+                },
+            )
+
+    records = [
+        r
+        for r in caplog.records
+        if getattr(r, "event_name", None) == "runner_file_id_fetch_failed"
+    ]
+    assert len(records) == 1
+    attrs = getattr(records[0], "attributes", {})
+    assert attrs.get("from_history") is True
+    assert attrs.get("file_id") == "file_img"
+    assert attrs.get("block_type") == "input_image"
+    assert getattr(records[0], "session_id", None) == session_id
+
+
+@pytest.mark.asyncio
+async def test_history_file_id_fetch_failure_deduped_on_second_turn(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A repeated history fetch failure for the same file emits only one warning.
+
+    History blocks recur on every turn; the dedup set prevents log flooding
+    for the same (session_id, file_id) pair.
+    """
+    import omnigent.runner.app as _runner_app
+
+    harness_client = _ScriptedHarnessClient(
+        [
+            _sse({"type": "response.completed", "response": {"id": "resp_1"}}),
+            _sse({"type": "response.completed", "response": {"id": "resp_2"}}),
+        ]
+    )
+    pm = _FakeProcessManager(harness_client)
+    server_client = _HistoryFileServerClient(fail_file_fetch=True)
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        server_client=server_client,  # type: ignore[arg-type]
+    )
+
+    session_id = "conv_hist_dedup"
+    _runner_app._logged_file_fetch_failures.pop(session_id, None)
+
+    async with _runner_client(app) as client:
+        with caplog.at_level(logging.WARNING, logger="omnigent.runner.app"):
+            for _ in range(2):
+                await client.post(
+                    f"/v1/sessions/{session_id}/events",
+                    json={
+                        "type": "message",
+                        "role": "user",
+                        "agent_id": "ag_abc",
+                        "model": "test-agent",
+                        "content": [{"type": "input_text", "text": "still?"}],
+                    },
+                )
+
+    records = [
+        r
+        for r in caplog.records
+        if getattr(r, "event_name", None) == "runner_file_id_fetch_failed"
+    ]
+    # Exactly one log across both turns despite the same file failing twice.
+    assert len(records) == 1
+
+
+@pytest.mark.asyncio
+async def test_delete_session_evicts_file_fetch_failure_dedup_entries(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Deleting a session evicts its dedup entries so a fresh session logs again.
+
+    Without eviction, a recreated session with the same id would silently
+    swallow the diagnostic warning for the first failure of the new session.
+    """
+    import omnigent.runner.app as _runner_app
+
+    harness_client = _ScriptedHarnessClient(
+        [
+            _sse({"type": "response.completed", "response": {"id": "resp_1"}}),
+            _sse({"type": "response.completed", "response": {"id": "resp_2"}}),
+        ]
+    )
+    pm = _FakeProcessManager(harness_client)
+    server_client = _HistoryFileServerClient(fail_file_fetch=True)
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        server_client=server_client,  # type: ignore[arg-type]
+    )
+
+    session_id = "conv_evict_dedup"
+    _runner_app._logged_file_fetch_failures.pop(session_id, None)
+
+    async with _runner_client(app) as client:
+        # First turn: file fetch fails and is logged, dedup entry recorded.
+        with caplog.at_level(logging.WARNING, logger="omnigent.runner.app"):
+            await client.post(
+                f"/v1/sessions/{session_id}/events",
+                json={
+                    "type": "message",
+                    "role": "user",
+                    "agent_id": "ag_abc",
+                    "model": "test-agent",
+                    "content": [{"type": "input_text", "text": "first"}],
+                },
+            )
+        records_before = [
+            r
+            for r in caplog.records
+            if getattr(r, "event_name", None) == "runner_file_id_fetch_failed"
+        ]
+        assert len(records_before) == 1
+        assert session_id in _runner_app._logged_file_fetch_failures
+
+        # Delete the session: entries for this session must be evicted.
+        del_resp = await client.delete(f"/v1/sessions/{session_id}")
+        assert del_resp.status_code == 200
+        assert session_id not in _runner_app._logged_file_fetch_failures
+
+        # New turn on the same session_id: the warning must fire again.
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger="omnigent.runner.app"):
+            await client.post(
+                f"/v1/sessions/{session_id}/events",
+                json={
+                    "type": "message",
+                    "role": "user",
+                    "agent_id": "ag_abc",
+                    "model": "test-agent",
+                    "content": [{"type": "input_text", "text": "second"}],
+                },
+            )
+        records_after = [
+            r
+            for r in caplog.records
+            if getattr(r, "event_name", None) == "runner_file_id_fetch_failed"
+        ]
+        assert len(records_after) == 1
+
+
+@pytest.mark.asyncio
 async def test_runner_session_tool_schemas_use_resolved_bundle_workdir(tmp_path: Path) -> None:
     bundle_dir = tmp_path / "bundle"
     tool_dir = bundle_dir / "tools" / "python"
