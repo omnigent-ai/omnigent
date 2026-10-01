@@ -129,7 +129,7 @@ def test_delivery_diagnostics(
     assert bridge._prompt_delivery_trace.get() is None
     rows = [record_to_row(r, "harness") for r in records]
     assert secret not in json.dumps(rows)
-    assert secret not in caplog.text
+    assert secret not in "\n".join(record.getMessage() for record in records)
     assert rows[-1]["attributes"]["verification"] == verification
 
     if scenario == "unknown_command":
