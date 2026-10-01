@@ -3339,10 +3339,11 @@ function registerIpc() {
     log(`$ ${omnigentCli.cliCommandParts(cliCommand).displayName} host --server ${target}`);
     log("Signing in to the server if needed…");
     const auth = await serverManager.ensureServerAuth(cliCommand, target, {
-      onLogin: () => log("Finish signing in in your browser, then come back here."),
+      onLogin: () => log("If a browser window opens, finish signing in there."),
     });
     if (!auth.ok) return { ok: false, error: auth.error };
-    log("Connecting this laptop to the server…");
+    // Close out the sign-in lines so the log never ends on a stale prompt.
+    log("Signed in. Connecting this laptop to the server…");
     const result = await serverManager.ensureHostConnected(cliCommand, target);
     broadcastHostStatus();
     if (result.ok) {

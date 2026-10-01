@@ -18,13 +18,14 @@ under the suite's mock LLM.
 
 from __future__ import annotations
 
-import json
 import os
 from pathlib import Path
 
 import httpx
 import pytest
 from playwright.sync_api import Page, expect
+
+from tests._helpers.session import post_session_bundle
 
 _CLAUDE_AGENT_YAML = """\
 name: skills_parity
@@ -90,10 +91,11 @@ def test_claude_menu_lists_only_terminal_loadable_skills(
         pytest.skip("export CLAUDE_CONFIG_DIR to a writable dir before pytest")
     _seed_skill(Path(cfg) / "skills", "user-cfg-skill", "user config-dir skill")
 
-    create = httpx.post(
+    create = post_session_bundle(
+        httpx.post,
         f"{live_server}/v1/sessions",
-        data={"metadata": json.dumps({"workspace": str(workspace)})},
-        files={"bundle": ("agent.tar.gz", _bundle(), "application/gzip")},
+        _bundle(),
+        metadata={"workspace": str(workspace)},
         timeout=30.0,
     )
     create.raise_for_status()

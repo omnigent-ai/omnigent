@@ -1,4 +1,5 @@
-// Desktop-shell recording lane: per-conversation browser-view cookie isolation.
+// Desktop-shell recording lane: shared cookies within a conversation, isolated
+// cookies between conversations.
 //
 // Journey: boot the shell connected to a local server → conversation A opens a
 // browser view on a site and "signs in" (sets an identity cookie) → conversation
@@ -25,7 +26,6 @@ const {
 } = require("./desktopHarness");
 
 const deps = desktopDepsAvailable();
-const RECORD_DIR = path.join(__dirname, "recordings", "desktop-cookie-isolation");
 
 // Drive the preload-exposed browser APIs from the shell renderer. Each helper
 // runs in the SPA window's context, where window.omnigentDesktop exists.
@@ -50,7 +50,26 @@ async function execInView(window, conversationId, js) {
 }
 
 async function setActive(window, conversationId) {
-  return window.evaluate((cid) => window.omnigentDesktop.browserSetActive(cid), conversationId);
+  const result = await window.evaluate(
+    (cid) => window.omnigentDesktop.browserSetActive(cid),
+    conversationId,
+  );
+  assert.equal(result.ok, true, `activate ${conversationId} failed: ${result.error}`);
+}
+
+// Cookie updates can reach sibling renderers after the writer returns.
+async function waitForIdentityCookie(window, conversationId, expected) {
+  await window.waitForFunction(
+    async ({ id, cookie }) => {
+      const result = await window.omnigentDesktop.browserExecute(id, "document.cookie");
+      const identity = String(result.result)
+        .split(/;\s*/)
+        .find((value) => value.startsWith("agent_identity="));
+      return result.ok && (identity ?? null) === cookie;
+    },
+    { id: conversationId, cookie: expected },
+    { timeout: 10_000 },
+  );
 }
 
 // Poll until the view has actually LANDED on the target origin — an execute
@@ -96,9 +115,13 @@ describe(
   () => {
     let tmpDir;
     let server;
+    let recordDir;
 
     before(async () => {
       tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "omni-desktop-e2e-"));
+      recordDir =
+        process.env.OMNIGENT_DESKTOP_RECORD_DIR ||
+        fs.mkdtempSync(path.join(os.tmpdir(), "desktop-cookie-isolation-"));
       server = await spawnServer(tmpDir);
     });
 
@@ -108,13 +131,14 @@ describe(
     });
 
     it(
-      "conversation B's view does not inherit conversation A's login cookie",
+      "tabs share login changes within conversation A while conversation B stays signed out",
       { timeout: 180_000 },
-      async () => {
+      async (t) => {
+        t.diagnostic(`Desktop recordings: ${recordDir}`);
         // Launch on the bundled setup page and connect interactively (the same
         // proven journey as desktop_connect.e2e.js), then drive the browser APIs.
         const { electronApp, window, userDataDir, stopDisplayCapture } = await launchDesktop({
-          recordDir: RECORD_DIR,
+          recordDir,
         });
         let saved;
         try {
@@ -150,6 +174,35 @@ describe(
           assert.match(String(signIn.result), /agent_identity=alice/);
           await window.waitForTimeout(2_500); // hold A's state on film
 
+          const firstTab = "browser-tab:conv_A:first";
+          const secondTab = "browser-tab:conv_A:second";
+          for (const tab of [firstTab, secondTab]) {
+            // oxlint-disable-next-line no-await-in-loop -- Drive each native tab sequentially.
+            const opened = await openView(window, tab, site);
+            assert.equal(opened.ok, true, `${tab} open failed: ${opened.error}`);
+            // oxlint-disable-next-line no-await-in-loop -- Wait for this tab's navigation.
+            await waitForViewOnOrigin(window, tab, server.serverUrl);
+            // oxlint-disable-next-line no-await-in-loop -- Read this tab's actual cookie jar.
+            await waitForIdentityCookie(window, tab, "agent_identity=alice");
+          }
+          await setActive(window, secondTab);
+          const changed = await execInView(
+            window,
+            secondTab,
+            'document.cookie = "agent_identity=bob; path=/"; document.cookie',
+          );
+          assert.equal(changed.ok, true, `cookie update failed: ${changed.error}`);
+          await waitForIdentityCookie(window, "conv_A", "agent_identity=bob");
+          const closed = await window.evaluate(
+            (id) => window.omnigentDesktop.browserClose(id),
+            firstTab,
+          );
+          assert.equal(closed.ok, true, `tab close failed: ${closed.error}`);
+          const reopened = await openView(window, firstTab, site);
+          assert.equal(reopened.ok, true, `tab reopen failed: ${reopened.error}`);
+          await waitForViewOnOrigin(window, firstTab, server.serverUrl);
+          await waitForIdentityCookie(window, firstTab, "agent_identity=bob");
+
           // Conversation B opens its own view on the same site.
           const openedB = await openView(window, "conv_B", site);
           assert.equal(openedB.ok, true, `conv_B open failed: ${openedB.error}`);
@@ -172,10 +225,17 @@ describe(
             !String(readB.result).includes("agent_identity"),
             `conv_B inherited conv_A's cookie — jars are shared: "${readB.result}"`,
           );
+          const loggedOut = await execInView(
+            window,
+            secondTab,
+            'document.cookie = "agent_identity=; max-age=0; path=/"; document.cookie',
+          );
+          assert.equal(loggedOut.ok, true, `logout failed: ${loggedOut.error}`);
+          await waitForIdentityCookie(window, "conv_A", null);
         } finally {
           await electronApp.close();
           await stopDisplayCapture();
-          saved = saveRecording(RECORD_DIR, "after-cookie-isolation");
+          saved = saveRecording(recordDir, "after-cookie-isolation");
           fs.rmSync(userDataDir, { recursive: true, force: true });
         }
         assert.ok(saved && saved.length > 0, "no desktop recording was produced");

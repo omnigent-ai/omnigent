@@ -33,6 +33,9 @@ and steers messages while the agent is busy.
   can be steered into the running turn.
 - `browser-pointer-queue`: desktop Design-mode instructions follow the same queue
   and always-steer preference, keeping their element screenshots.
+- `pi-compact`: `/compact` follows the normal queue/Always steer preference.
+  Send now interrupts the turn and compacts. During compaction, queued messages
+  wait in the web queue; immediate sends are retained by the Pi integration.
 - `draft-persistence`: unsent text survives arriving messages and prompts.
 - `mobile-labels`: on narrow screens labels collapse to icons without
   overlapping the stop button.
@@ -123,6 +126,12 @@ Tests under `tests/browser_ui/` stub every backend call and need no instance:
   Repeat in a fresh session with Always steer on: both entry points send while
   busy and the pointer popup says "Sent to agent." If older messages are already
   queued, new pointer instructions must join them even with Always steer on.
+- **`pi-compact`:** in a Pi session, start a long turn, type `/comp`, press Tab,
+  then Enter. With Always steer off, confirm `/compact` queues; use Send now to
+  interrupt and compact. With Always steer on and an empty queue, Enter should
+  compact immediately. During compaction, send a follow-up in each mode: normal
+  queue mode keeps its queue row; Always steer hands it to Pi. Both should run
+  once after compaction. Repeat the queued flow while viewing another session.
 - **`draft-persistence`:**
   `tests/e2e_ui/chat/test_draft_survives_incoming_messages.py::test_mid_typing_answer_survives_arriving_prompt`
 - **`mobile-labels`, new-session composer:**

@@ -18,6 +18,7 @@ from pathlib import Path
 
 import httpx
 
+from omnigent.debug_logging import debug_event
 from omnigent.entities.session_resources import terminal_resource_id
 from omnigent.harnesses.claude_native.bridge import (
     BRIDGE_ID_LABEL_KEY,
@@ -3491,9 +3492,12 @@ def _is_subagent_hook_record(
     Return whether a hook record originated from a Claude subagent.
 
     Primary: a session id absent from the set of ids ever pinned to
-    this bridge belongs to a background subagent process. Fallback:
-    the ``subagents/`` path component for synchronous subagents.
+    this bridge belongs to a background subagent process. In-process
+    subagents share the parent's session id and transcript path, so an
+    ``agent_id`` marks them. Fallback: the ``subagents/`` path component.
     """
+    if record.agent_id is not None:
+        return True
     # Primary: id not in any id the parent has ever held → subagent.
     if (
         parent_claude_session_ids
@@ -3823,6 +3827,25 @@ async def _forward_available_status_events(
             await _write_hook_state_async(bridge_dir, durable)
             continue
         if status is None:
+            if record.event_name == "UserPromptSubmit" and not _is_subagent_hook_record(
+                record, parent_claude_session_ids=parent_claude_session_ids
+            ):
+                with contextlib.suppress(Exception):
+                    # This proves Claude saw a submit; later hooks can still block the turn.
+                    _logger.info(
+                        "Claude UserPromptSubmit observed; "
+                        "session=%s hook_cursor=%s recorded_at=%s",
+                        session_id,
+                        record.event_cursor,
+                        record.recorded_at,
+                        extra=debug_event(
+                            "claude_native_prompt_submit_hook",
+                            session_id=session_id,
+                            claude_session_id=record.claude_session_id,
+                            hook_cursor=record.event_cursor,
+                            hook_recorded_at=record.recorded_at,
+                        ),
+                    )
             # Compaction boundary (PreCompact / SessionStart source=compact)
             # → forward as a compaction-status event so the web UI brackets
             # Claude's real terminal compaction with its spinner. Best-effort:

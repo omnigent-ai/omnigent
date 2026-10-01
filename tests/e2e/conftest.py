@@ -54,6 +54,7 @@ from tests._helpers.compat import (
     runner_executable,
     server_executable,
 )
+from tests._helpers.session import post_session_bundle
 from tests._model_pools import current_attempt, resolve_model
 from tests.e2e._harness_probes import skip_if_harness_cli_missing
 from tests.e2e.helpers import HEALTH_TIMEOUT_S, POLL_INTERVAL_S, lookup_databricks_host
@@ -991,21 +992,10 @@ def upload_agent(
         rewrite_model_for_databricks=rewrite_model_for_databricks,
         databricks_profile=databricks_profile,
     )
-    import json as _json
 
-    resp = client.post(
-        "/v1/sessions",
-        data={"metadata": _json.dumps({})},
-        files={
-            "bundle": (
-                "agent.tar.gz",
-                bundle,
-                "application/gzip",
-            ),
-        },
-        # First-party sentinel Origin so the multipart create passes the
-        # require_trusted_origin guard regardless of which client is passed.
-        headers={"Origin": OMNIGENT_INTERNAL_WS_ORIGIN},
+    # Announce the caller as first-party so trusted-Origin checks stay active.
+    resp = post_session_bundle(
+        client.post, "/v1/sessions", bundle, headers={"Origin": OMNIGENT_INTERNAL_WS_ORIGIN}
     )
     if resp.status_code == 409:
         return agent_dir.name
@@ -1054,7 +1044,6 @@ def register_inline_agent(
     :returns: The agent name (use the return value, not the *name*
         argument, they differ on rerun attempts).
     """
-    import json as _json
 
     attempt = current_attempt()
     if attempt > 0:
@@ -1095,13 +1084,9 @@ def register_inline_agent(
             tar.addfile(info, io.BytesIO(yaml_bytes))
         bundle = buf.getvalue()
 
-    resp = client.post(
-        "/v1/sessions",
-        data={"metadata": _json.dumps({})},
-        files={"bundle": ("agent.tar.gz", bundle, "application/gzip")},
-        # First-party sentinel Origin so the multipart create passes the
-        # require_trusted_origin guard regardless of which client is passed.
-        headers={"Origin": OMNIGENT_INTERNAL_WS_ORIGIN},
+    # Announce the caller as first-party so trusted-Origin checks stay active.
+    resp = post_session_bundle(
+        client.post, "/v1/sessions", bundle, headers={"Origin": OMNIGENT_INTERNAL_WS_ORIGIN}
     )
     # 409 = already registered by a prior parametrize row against the
     # same session-scoped server; treat as success. Explicit raise (not
@@ -1146,7 +1131,6 @@ def register_dir_agent_with_mock_llm(
     :param mock_llm_base_url: Mock server base URL including ``/v1``.
     :returns: The registered agent name (use the return value, not *name*).
     """
-    import json as _json
 
     attempt = current_attempt()
     if attempt > 0:
@@ -1176,11 +1160,8 @@ def register_dir_agent_with_mock_llm(
                 tar.add(str(entry), arcname=str(entry.relative_to(agent_dir)))
         bundle = buf.getvalue()
 
-    resp = client.post(
-        "/v1/sessions",
-        data={"metadata": _json.dumps({})},
-        files={"bundle": ("agent.tar.gz", bundle, "application/gzip")},
-        headers={"Origin": OMNIGENT_INTERNAL_WS_ORIGIN},
+    resp = post_session_bundle(
+        client.post, "/v1/sessions", bundle, headers={"Origin": OMNIGENT_INTERNAL_WS_ORIGIN}
     )
     if resp.status_code not in (200, 201, 409):
         raise RuntimeError(f"dir-agent register failed: {resp.status_code} {resp.text[:500]}")

@@ -250,7 +250,9 @@ def test_traceback_shows_exception_message_lines(data_dir: Path) -> None:
     assert 'in "<unicode string>"' in out
 
 
-def test_first_party_sdk_shown_even_in_site_packages(data_dir: Path, tmp_path: Path) -> None:
+def test_first_party_sdk_shown_even_in_site_packages(
+    data_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """A core SDK package installed into site-packages stays visible.
 
     In a shipped wheel the SDKs (``omnigent_client``, ``omnigent_ui_sdk``)
@@ -261,8 +263,11 @@ def test_first_party_sdk_shown_even_in_site_packages(data_dir: Path, tmp_path: P
     """
     import importlib.util
 
-    sp = crash_ui._site_packages_dir()
-    assert sp, "test requires a venv site-packages on sys.path"
+    # Keep the installed environment read-only, as it is in the test sandbox.
+    sp = tmp_path / "site-packages"
+    sp.mkdir()
+    monkeypatch.syspath_prepend(str(sp))
+    assert crash_ui._site_packages_dir() == str(sp)
     fake = os.path.join(sp, "omnigent_client")
     os.makedirs(fake, exist_ok=True)
     probe = os.path.join(fake, "_probe.py")
@@ -276,14 +281,8 @@ def test_first_party_sdk_shown_even_in_site_packages(data_dir: Path, tmp_path: P
     except Exception as e:
         exc, tb = e, e.__traceback__
     # cwd outside site-packages, as in a real install.
-    import os as _os
-
-    old = _os.getcwd()
-    _os.chdir(str(tmp_path))
-    try:
-        out = crash_ui.format_traceback(exc, tb, colored=False, unicode_ok=True)
-    finally:
-        _os.chdir(old)
+    monkeypatch.chdir(tmp_path)
+    out = crash_ui.format_traceback(exc, tb, colored=False, unicode_ok=True)
     assert "omnigent_client/_probe.py" in out  # shown, not collapsed
     assert "frames hidden in omnigent_client" not in out
     assert "sdk probe" in out
