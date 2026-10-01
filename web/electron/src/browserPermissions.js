@@ -8,6 +8,30 @@ const LOCAL_NETWORK_PERMISSIONS = new Set([
   "loopback-network",
 ]);
 
+const sessionPolicies = new WeakMap();
+
+// Electron installs handlers per storage partition, but consent and prompts
+// belong to the requesting tab, even when several tabs share that partition.
+function policiesForSession(session) {
+  const existing = sessionPolicies.get(session);
+  if (existing) return existing;
+  const policies = new Map();
+  session.setPermissionRequestHandler((contents, permission, callback, details) => {
+    const policy = policies.get(contents);
+    if (policy) policy.request(contents, permission, callback, details);
+    else callback(false);
+  });
+  session.setPermissionCheckHandler((contents, permission, origin, details) => {
+    // Context-free checks can only be attributed to the foreground tab.
+    const policy = contents
+      ? policies.get(contents)
+      : [...policies.values()].find((candidate) => candidate.canPrompt());
+    return policy?.check(contents, permission, origin, details) ?? false;
+  });
+  sessionPolicies.set(session, policies);
+  return policies;
+}
+
 function permissionOrigin(value) {
   try {
     const url = new URL(value);
@@ -47,6 +71,7 @@ function createBrowserPermissionStore({ loadSettings, saveSettings }) {
 
 /** Install before constructing the view, then attach its webContents. */
 function registerBrowserPermissions(session, { canPrompt, showPrompt, store }) {
+  const policies = policiesForSession(session);
   const visits = new Map();
   let contents = null;
   let generation = 0;
@@ -137,7 +162,7 @@ function registerBrowserPermissions(session, { canPrompt, showPrompt, store }) {
     return request.result;
   }
 
-  session.setPermissionRequestHandler((webContents, permission, callback, details = {}) => {
+  function handleRequest(webContents, permission, callback, details = {}) {
     if (!LOCAL_NETWORK_PERMISSIONS.has(permission)) {
       callback(false);
       return;
@@ -150,9 +175,9 @@ function registerBrowserPermissions(session, { canPrompt, showPrompt, store }) {
         // Chromium may have discarded the request during navigation/teardown.
       }
     });
-  });
+  }
 
-  session.setPermissionCheckHandler((webContents, permission, requestingOrigin, details = {}) => {
+  function handleCheck(webContents, permission, requestingOrigin, details = {}) {
     if (!LOCAL_NETWORK_PERMISSIONS.has(permission)) return false;
     const ctx = context(webContents, requestingOrigin, details, true);
     if (!ctx) return false;
@@ -162,11 +187,16 @@ function registerBrowserPermissions(session, { canPrompt, showPrompt, store }) {
     // flows need a reload after the user approves the request.
     void ask(ctx, true);
     return false;
-  });
+  }
 
   return {
     attach(webContents) {
       contents = webContents;
+      policies.set(contents, {
+        request: handleRequest,
+        check: handleCheck,
+        canPrompt: () => canPrompt(contents),
+      });
       contents.on("did-start-navigation", (_event, url, isInPlace, isMainFrame) => {
         if (!isMainFrame || isInPlace) return;
         generation++;
@@ -184,7 +214,10 @@ function registerBrowserPermissions(session, { canPrompt, showPrompt, store }) {
         visits.clear();
       };
       contents.on("render-process-gone", invalidateVisit);
-      contents.once("destroyed", invalidateVisit);
+      contents.once("destroyed", () => {
+        policies.delete(contents);
+        invalidateVisit();
+      });
     },
   };
 }
