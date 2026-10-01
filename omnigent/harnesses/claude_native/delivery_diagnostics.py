@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import functools
 import json
 import logging
@@ -11,10 +12,21 @@ from collections.abc import Callable
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, TypedDict, TypeVar, cast
+from typing import Any, ParamSpec, TypedDict, TypeVar, cast
 
 _logger = logging.getLogger(__name__)
 _InjectionFunction = TypeVar("_InjectionFunction", bound=Callable[..., Any])
+
+_Parameters = ParamSpec("_Parameters")
+
+
+def _best_effort(function: Callable[_Parameters, None]) -> Callable[_Parameters, None]:
+    @functools.wraps(function)
+    def wrapped(*args: _Parameters.args, **kwargs: _Parameters.kwargs) -> None:
+        with contextlib.suppress(Exception):
+            function(*args, **kwargs)
+
+    return wrapped
 
 
 @dataclass
@@ -28,6 +40,7 @@ class _PromptDeliveryTrace:
     attempts: list[dict[str, object]] = field(default_factory=list)
 
 
+@_best_effort
 def set_stage(stage: str) -> None:
     """Accumulate the previous stage duration and mark the next stage; no logging or I/O."""
     trace = _prompt_delivery_trace.get()
@@ -45,6 +58,7 @@ _prompt_delivery_trace: ContextVar[_PromptDeliveryTrace | None] = ContextVar(
 )
 
 
+@_best_effort
 def record_details(**attributes: object) -> None:
     trace = _prompt_delivery_trace.get()
     if trace is not None and trace.attempts:
@@ -145,7 +159,7 @@ class DraftObservation(TypedDict):
     pane_max_columns: int
 
 
-def draft_observation(pane: str, needle: str, *, prompt_glyph: str) -> DraftObservation:
+def _draft_observation(pane: str, needle: str, *, prompt_glyph: str) -> DraftObservation:
     """Summarize the last prompt row without retaining terminal or prompt text."""
     lines = pane.splitlines()
     prompt_rows = [index for index, line in enumerate(lines) if prompt_glyph in line]
@@ -161,20 +175,58 @@ def draft_observation(pane: str, needle: str, *, prompt_glyph: str) -> DraftObse
     }
 
 
+@_best_effort
 def start_attempt() -> None:
     trace = _prompt_delivery_trace.get()
     if trace is not None:
         trace.attempts.append({"verification": "not_started", "submit_sent": False, "retries": 0})
 
 
-def record_verification(
-    verification: str,
+@_best_effort
+def record_draft(
     *,
+    pane: str,
+    needle: str,
+    prompt_glyph: str,
+    draft_seen: bool,
+    start: float,
+    polls: int,
+    empty_captures: int,
+) -> None:
+    record_details(
+        draft_seen=draft_seen,
+        needle_available=bool(needle),
+        draft_wait_ms=round((time.monotonic() - start) * 1000),
+        draft_polls=polls,
+        draft_empty_captures=empty_captures,
+        **{
+            f"draft_{key}": value
+            for key, value in _draft_observation(pane, needle, prompt_glyph=prompt_glyph).items()
+        },
+    )
+
+
+@_best_effort
+def record_verification(
+    *,
+    draft_still_present: bool,
+    pane: str,
+    needle: str,
+    prompt_glyph: str,
     start: float,
     retries: int,
     polls: int,
-    observation: DraftObservation,
 ) -> None:
+    observation = _draft_observation(pane, needle, prompt_glyph=prompt_glyph)
+    verification = (
+        "draft_still_present"
+        if draft_still_present
+        else (
+            "inconclusive_capture"
+            if observation["capture_empty"] or not observation["prompt_glyph_visible"]
+            else "draft_absent"
+        )
+    )
     record_details(
         verification=verification,
         submit_wait_ms=round((time.monotonic() - start) * 1000),

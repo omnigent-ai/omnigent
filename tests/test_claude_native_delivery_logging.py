@@ -24,6 +24,7 @@ from omnigent.harnesses.claude_native import bridge, delivery_diagnostics
         ("empty_capture", "inconclusive_capture", "returned"),
         ("missing_glyph", "inconclusive_capture", "returned"),
         ("transport_error", "not_started", "error"),
+        ("observation_error", "not_started", "returned"),
         ("startup_error", "not_started", "error"),
         ("pending_before_paste", "not_started", "error"),
         ("pending_before_submit", "not_started", "error"),
@@ -51,6 +52,9 @@ def test_delivery_diagnostics(
         nonlocal pending_checks
         pending_checks += 1
         return pending_checks == (1 if scenario == "pending_before_paste" else 2)
+
+    def broken_observation(*args: object, **kwargs: object) -> None:
+        raise RuntimeError(secret)
 
     def sleep(seconds: float) -> None:
         nonlocal elapsed
@@ -94,6 +98,8 @@ def test_delivery_diagnostics(
     monkeypatch.setattr(bridge, "_wait_for_claude_prompt_ready", ready)
     monkeypatch.setattr(bridge, "_run_tmux", run_tmux)
     monkeypatch.setattr(bridge, "_capture_pane", lambda *_a, **_k: pane)
+    if scenario == "observation_error":
+        monkeypatch.setattr(delivery_diagnostics, "_draft_observation", broken_observation)
     if scenario.startswith("pending_"):
         monkeypatch.setattr(bridge, "has_pending_user_prompt", pending_prompt)
     if scenario == "unknown_command":
@@ -143,6 +149,10 @@ def test_delivery_diagnostics(
     assert row["attributes"]["verification"] == verification
     assert attrs["stage_waiting_for_prompt_ms"] == 20
 
+    if scenario == "observation_error":
+        assert enters == 1
+        assert pane == "❯ "
+        assert attrs["submit_sent"] is True
     if scenario == "unknown_command":
         assert enters == 2
         assert attrs["attempt"] == 2

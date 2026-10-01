@@ -1546,9 +1546,12 @@ async def test_forwarder_posts_web_injected_terminal_transcript_items(tmp_path: 
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("submit_log_fails", [False, True])
 async def test_forwarder_posts_idle_on_stop_and_ignores_user_prompt_submit(
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+    submit_log_fails: bool,
 ) -> None:
     """
     ``Stop`` → idle (the authoritative turn-end); ``UserPromptSubmit`` ignored.
@@ -1561,6 +1564,20 @@ async def test_forwarder_posts_idle_on_stop_and_ignores_user_prompt_submit(
     A ``running`` arriving first would mean ``UserPromptSubmit`` still maps.
     """
     caplog.set_level("INFO", logger="omnigent.harnesses.claude_native.forwarder")
+    from omnigent.harnesses.claude_native import forwarder
+
+    original_info = forwarder._logger.info
+    submit_log_attempts = 0
+
+    def log_info(message: object, *args: object, **kwargs: Any) -> None:
+        nonlocal submit_log_attempts
+        if kwargs.get("extra", {}).get("event_name") == "claude_native_prompt_submit_hook":
+            submit_log_attempts += 1
+            if submit_log_fails:
+                raise OSError("log destination unavailable")
+        original_info(message, *args, **kwargs)
+
+    monkeypatch.setattr(forwarder._logger, "info", log_info)
     bridge_dir = tmp_path / "bridge"
     transcript_path = tmp_path / "session.jsonl"
     transcript_path.write_text("", encoding="utf-8")
@@ -1625,12 +1642,16 @@ async def test_forwarder_posts_idle_on_stop_and_ignores_user_prompt_submit(
         for r in caplog.records
         if getattr(r, "event_name", None) == "claude_native_prompt_submit_hook"
     ]
-    assert len(submitted) == 1
-    assert submitted[0].session_id == "conv_abc"
-    assert submitted[0].attributes["claude_session_id"] == "claude-session"
-    assert submitted[0].attributes["hook_cursor"] == 2
+    assert submit_log_attempts == 1
     assert "private prompt" not in caplog.text
-    assert "private prompt" not in str(submitted[0].attributes)
+    if submit_log_fails:
+        assert submitted == []
+    else:
+        assert len(submitted) == 1
+        assert submitted[0].session_id == "conv_abc"
+        assert submitted[0].attributes["claude_session_id"] == "claude-session"
+        assert submitted[0].attributes["hook_cursor"] == 2
+        assert "private prompt" not in str(submitted[0].attributes)
 
 
 @pytest.mark.asyncio

@@ -4183,18 +4183,14 @@ def _paste_and_submit(
             draft_seen = True
             break
         time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
-    delivery_diagnostics.record_details(
+    delivery_diagnostics.record_draft(
+        pane=pane,
+        needle=needle,
+        prompt_glyph=_CLAUDE_PROMPT_GLYPH,
         draft_seen=draft_seen,
-        needle_available=bool(needle),
-        draft_wait_ms=round((time.monotonic() - paste_wait_started) * 1000),
-        draft_polls=polls,
-        draft_empty_captures=empty_captures,
-        **{
-            f"draft_{key}": value
-            for key, value in delivery_diagnostics.draft_observation(
-                pane, needle, prompt_glyph=_CLAUDE_PROMPT_GLYPH
-            ).items()
-        },
+        start=paste_wait_started,
+        polls=polls,
+        empty_captures=empty_captures,
     )
     time.sleep(_PASTE_SETTLE_S)
     delivery_diagnostics.set_stage("checking_pending_prompt")
@@ -4272,20 +4268,14 @@ def _verify_submit_accepted(
         pane = _capture_pane(socket_path, tmux_target)
         polls += 1
         if not _draft_in_input_box(pane, needle):
-            observation = delivery_diagnostics.draft_observation(
-                pane, needle, prompt_glyph=_CLAUDE_PROMPT_GLYPH
-            )
-            verification = (
-                "inconclusive_capture"
-                if observation["capture_empty"] or not observation["prompt_glyph_visible"]
-                else "draft_absent"
-            )
             delivery_diagnostics.record_verification(
-                verification,
+                draft_still_present=False,
+                pane=pane,
+                needle=needle,
+                prompt_glyph=_CLAUDE_PROMPT_GLYPH,
                 start=start,
                 retries=retries,
                 polls=polls,
-                observation=observation,
             )
             if warned:
                 _logger.info(
@@ -4312,13 +4302,13 @@ def _verify_submit_accepted(
             last_enter = now
             retry_interval = min(retry_interval * 2, _SUBMIT_RETRY_MAX_INTERVAL_S)
     delivery_diagnostics.record_verification(
-        "draft_still_present",
+        draft_still_present=True,
+        pane=pane,
+        needle=needle,
+        prompt_glyph=_CLAUDE_PROMPT_GLYPH,
         start=start,
         retries=retries,
         polls=polls,
-        observation=delivery_diagnostics.draft_observation(
-            pane, needle, prompt_glyph=_CLAUDE_PROMPT_GLYPH
-        ),
     )
     return False
 

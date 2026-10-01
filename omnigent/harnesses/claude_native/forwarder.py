@@ -3802,20 +3802,22 @@ async def _forward_available_status_events(
             if record.event_name == "UserPromptSubmit" and not _is_subagent_hook_record(
                 record, parent_claude_session_ids=parent_claude_session_ids
             ):
-                # This proves Claude saw a submit; later hooks can still block the turn.
-                _logger.info(
-                    "Claude UserPromptSubmit observed; session=%s hook_cursor=%s recorded_at=%s",
-                    session_id,
-                    record.event_cursor,
-                    record.recorded_at,
-                    extra=debug_event(
-                        "claude_native_prompt_submit_hook",
-                        session_id=session_id,
-                        claude_session_id=record.claude_session_id,
-                        hook_cursor=record.event_cursor,
-                        hook_recorded_at=record.recorded_at,
-                    ),
-                )
+                with contextlib.suppress(Exception):
+                    # This proves Claude saw a submit; later hooks can still block the turn.
+                    _logger.info(
+                        "Claude UserPromptSubmit observed; "
+                        "session=%s hook_cursor=%s recorded_at=%s",
+                        session_id,
+                        record.event_cursor,
+                        record.recorded_at,
+                        extra=debug_event(
+                            "claude_native_prompt_submit_hook",
+                            session_id=session_id,
+                            claude_session_id=record.claude_session_id,
+                            hook_cursor=record.event_cursor,
+                            hook_recorded_at=record.recorded_at,
+                        ),
+                    )
             # Compaction boundary (PreCompact / SessionStart source=compact)
             # → forward as a compaction-status event so the web UI brackets
             # Claude's real terminal compaction with its spinner. Best-effort:
