@@ -140,7 +140,10 @@ _FORWARD_LOOP_STALL_DEADLINE_S = 300.0
 _POST_TIMEOUT_S = 10.0
 _MAX_SEEN_SOURCE_IDS = 2000
 _SUBAGENT_FORWARD_CONCURRENCY = 8
-_SUBAGENT_ITEM_MAX_TRANSIENT_ATTEMPTS = 12
+# Transient budget for one sub-agent transcript post. With backoff capped at
+# 30 s this spans ≈15 minutes — enough to outlast routine AP rollout/outage
+# windows while still failing a sustained outage boundedly.
+_SUBAGENT_ITEM_MAX_TRANSIENT_ATTEMPTS = 35
 _CURSOR_FINGERPRINT_BYTES = 256
 _FORK_COMMAND_NAMES = frozenset({"/branch", "/fork"})
 _HTTP_POST_MAX_PERMANENT_FAILURES = 3
@@ -2182,65 +2185,19 @@ async def _forward_one_subagent(
                         extra={"session_id": parent_session_id},
                     )
                     break
-                if (
-                    not decision.permanent
-                    and not _is_subagent_delivery_not_confirmed(exc)
-                    and not _batch_response_never_received(exc)
-                ):
-                    _logger.error(
-                        "Dropping claude-native sub-agent transcript batch after "
-                        "transient delivery retries were exhausted; child=%s items=%s "
-                        "attempts=%s http_status=%s",
-                        entry.child_conversation_id,
-                        len(batch),
-                        decision.attempts,
-                        _http_status_for_log(exc),
-                        extra={
-                            "session_id": entry.child_conversation_id,
-                            "event_name": "claude_subagent_transcript_dropped",
-                            "attributes": {
-                                "parent_session_id": parent_session_id,
-                                "drop_reason": "transient_retries_exhausted",
-                                "item_count": len(batch),
-                                "http_status": _http_status_for_log(exc),
-                                "attempts": decision.attempts,
-                                "exception_type": type(exc).__name__,
-                            },
-                        },
-                    )
-                    for pending_item in batch:
-                        item = pending_item.item
-                        append_dead_letter(
-                            bridge_dir,
-                            session_id=entry.child_conversation_id,
-                            event_type="external_conversation_item",
-                            payload={
-                                "source_id": item.source_id,
-                                "item_type": item.item_type,
-                                "item_data": item.data,
-                                "response_id": item.response_id,
-                            },
-                            reason="transient HTTP failure after retries",
-                            delivered_ambiguous=False,
-                            http_status=_http_status_for_log(exc),
-                        )
-                    completed_items.extend(batch)
-                    new_entry = replace(
-                        new_entry,
-                        last_activity_ts=now,
-                        delivery_error=_SUBAGENT_DROPPED_ITEM_REASON,
-                    )
-                else:
-                    _logger.warning(
-                        "Re-driving claude-native sub-agent transcript batch individually "
-                        "after HTTP failures; child=%s items=%s attempts=%s http_status=%s",
-                        entry.child_conversation_id,
-                        len(batch),
-                        decision.attempts,
-                        _http_status_for_log(exc),
-                        extra={"session_id": parent_session_id},
-                    )
-                    retry_individually = True
+                # Never drop the whole batch: application server-side is not
+                # atomic, so re-drive per item to keep committed prefixes and
+                # isolate a poison entry on its own retry budget.
+                _logger.warning(
+                    "Re-driving claude-native sub-agent transcript batch individually "
+                    "after HTTP failures; child=%s items=%s attempts=%s http_status=%s",
+                    entry.child_conversation_id,
+                    len(batch),
+                    decision.attempts,
+                    _http_status_for_log(exc),
+                    extra={"session_id": parent_session_id},
+                )
+                retry_individually = True
             else:
                 completed_items.extend(batch)
                 delivered = True
@@ -6192,23 +6149,6 @@ def _http_status_for_log(exc: httpx.HTTPError) -> int | None:
     if isinstance(exc, httpx.HTTPStatusError):
         return exc.response.status_code
     return None
-
-
-def _batch_response_never_received(exc: httpx.HTTPError) -> bool:
-    """
-    Return whether ``exc`` failed before any response reached the client.
-
-    A transport failure (read/connect/write timeout, read error, protocol
-    error) means the server never rendered a verdict on the batch, so the
-    payload is unproven rather than rejected. Splitting the batch is then
-    strictly better than discarding it: a whole-batch read timeout is usually
-    the batch's own size against the flat post timeout, and single items fit
-    where 100 do not.
-
-    :param exc: HTTP exception raised while posting an Omnigent event.
-    :returns: ``True`` when no HTTP response was received.
-    """
-    return not isinstance(exc, httpx.HTTPStatusError)
 
 
 def _read_hook_state(bridge_dir: Path) -> HookForwardState | None:

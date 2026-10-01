@@ -7974,7 +7974,12 @@ async def test_persistent_subagent_502_ends_as_explicit_failure(
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """A child that exhausts 502 retries fails with recoverable dead letters."""
+    """A child that exhausts 502 retries fails with recoverable dead letters.
+
+    The exhausted batch is re-driven item by item (server-side batch
+    application is not atomic), so the explicit failure lands only after the
+    item's own retry budget is spent too.
+    """
     bridge_dir = tmp_path / "bridge"
     bridge_dir.mkdir()
     transcript_path = tmp_path / "session.jsonl"
@@ -8010,7 +8015,7 @@ async def test_persistent_subagent_502_ends_as_explicit_failure(
 
     def handler(request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content.decode("utf-8"))
-        if isinstance(body, list):
+        if isinstance(body, list) or body.get("type") == "external_conversation_item":
             return httpx.Response(502, text="bad gateway")
         if body.get("type") == "external_session_status":
             statuses.append(body["data"])
@@ -8023,7 +8028,7 @@ async def test_persistent_subagent_502_ends_as_explicit_failure(
     async with httpx.AsyncClient(
         transport=httpx.MockTransport(handler), base_url="http://ap"
     ) as client:
-        for _ in range(2):
+        for _ in range(3):
             state = await forwarder._forward_available_subagents(
                 client=client,
                 parent_session_id="conv_parent",
@@ -12123,3 +12128,92 @@ async def test_timed_out_batch_is_split_not_dropped(
     updated = checkpoint.state.subagents["split"]
     assert updated.byte_offset == 30
     assert updated.seen_source_ids == tuple(item.source_id for item in items)
+
+
+@pytest.mark.asyncio
+async def test_transient_5xx_batch_is_split_not_dropped(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A batch that exhausts transient 5xx retries is re-driven item by item.
+
+    Server-side batch application is not atomic, so a response-received
+    transient failure must not dead-letter the whole batch: earlier entries
+    may have committed, and a poison entry is isolated on its own budget.
+    """
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    subagents_dir = tmp_path / "subagents"
+    subagents_dir.mkdir()
+    (subagents_dir / "agent-split5xx.jsonl").write_text("{}\n", encoding="utf-8")
+    items = [
+        ClaudeTranscriptItem(
+            source_id=f"item-{index}",
+            item_type="message",
+            data={"role": "assistant", "content": [{"type": "text", "text": f"m{index}"}]},
+            response_id="resp-split-5xx",
+        )
+        for index in range(3)
+    ]
+    read_result = TranscriptReadResult(
+        line_cursor=1,
+        byte_offset=30,
+        current_response_id=None,
+        items=items,
+        record_items=(TranscriptRecordItems(next_byte_offset=30, items=tuple(items)),),
+    )
+    monkeypatch.setattr(
+        forwarder,
+        "read_transcript_items_from_offset",
+        lambda *args, **kwargs: read_result,
+    )
+    entry = forwarder.SubagentEntry(
+        subagent_id="split5xx",
+        child_conversation_id="conv_child_split_5xx",
+    )
+    checkpoint = forwarder._SubagentStateCheckpoint(
+        bridge_dir,
+        forwarder.SubagentForwardState(subagents={"split5xx": entry}),
+    )
+    batch_attempts = 0
+    individual_source_ids: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal batch_attempts
+        body = json.loads(request.content.decode("utf-8"))
+        if isinstance(body, list):
+            batch_attempts += 1
+            return httpx.Response(502, text="bad gateway")
+        if isinstance(body, dict) and body.get("type") == "external_conversation_item":
+            individual_source_ids.append(body["data"]["source_id"])
+        return httpx.Response(204)
+
+    retry_tracker = forwarder._PostRetryTracker(
+        base_delay_s=0.0,
+        max_transient_attempts=2,
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://ap"
+    ) as client:
+        for _ in range(3):
+            await forwarder._forward_one_subagent(
+                client=client,
+                parent_session_id="conv_parent",
+                bridge_dir=bridge_dir,
+                subagents_dir=subagents_dir,
+                entry=checkpoint.state.subagents["split5xx"],
+                agent_name="claude-native-ui",
+                checkpoint=checkpoint,
+                item_retry_tracker=retry_tracker,
+                status_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+                batch_capability=forwarder._SessionEventBatchCapability(),
+                status_capability=forwarder._SubagentStatusCapability(),
+            )
+
+    assert batch_attempts == 2
+    assert individual_source_ids == [item.source_id for item in items]
+    assert not (bridge_dir / "dead_letter.jsonl").exists()
+    updated = checkpoint.state.subagents["split5xx"]
+    assert updated.byte_offset == 30
+    assert updated.seen_source_ids == tuple(item.source_id for item in items)
+    assert updated.delivery_error is None
