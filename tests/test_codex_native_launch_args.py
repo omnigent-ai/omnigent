@@ -380,6 +380,15 @@ def test_effective_mcp_servers_rejects_invalid_inventory_and_missing_profile(
     with pytest.raises(ValueError, match="mcp_servers configuration must be a table"):
         effective_codex_mcp_servers(source, None, codex_version=(0, 154, 0))
 
+    config.write_text('[mcp_servers]\nscalar = "invalid"\n', encoding="utf-8")
+    with pytest.raises(ValueError, match="mcp_servers entry 'scalar' must be a table"):
+        effective_codex_mcp_servers(source, None, codex_version=(0, 154, 0))
+
+    config.write_text("[mcp_servers", encoding="utf-8")
+    with pytest.raises(ValueError, match="Invalid Codex config") as malformed:
+        effective_codex_mcp_servers(source, None, codex_version=(0, 154, 0))
+    assert str(config) in str(malformed.value)
+
     config.write_text("", encoding="utf-8")
     with pytest.raises(FileNotFoundError):
         effective_codex_mcp_servers(source, "missing", codex_version=(0, 154, 0))

@@ -345,7 +345,14 @@ def effective_codex_mcp_servers(
     profile on every cold launch.
     """
     source_path = source_home / "config.toml"
-    source = tomlkit.parse(source_path.read_text()).unwrap() if source_path.exists() else {}
+    try:
+        source = (
+            tomlkit.parse(source_path.read_text(encoding="utf-8")).unwrap()
+            if source_path.exists()
+            else {}
+        )
+    except TOMLKitError as error:
+        raise ValueError(f"Invalid Codex config: {source_path}") from error
     merged = copy.deepcopy(source)
     if profile is not None:
         overlay = _resolve_profile_overlay(source, source_home, profile, codex_version)
@@ -353,6 +360,9 @@ def effective_codex_mcp_servers(
     servers = merged.get("mcp_servers", {})
     if not isinstance(servers, dict):
         raise ValueError("Codex mcp_servers configuration must be a table")
+    for name, definition in servers.items():
+        if not isinstance(definition, dict):
+            raise ValueError(f"Codex mcp_servers entry {name!r} must be a table")
     return copy.deepcopy(servers)
 
 
