@@ -4486,10 +4486,12 @@ describe("AppShell design-mode submission", () => {
     restoreGetState = () => getState.mockRestore();
     send.mockClear();
     enqueueMessage.mockClear();
+    // Model pending queue state; real-store and desktop tests cover draining.
     enqueueMessage.mockImplementation((text: string, files?: File[]) => {
+      if (chat.conversationId === null) throw new Error("Expected a bound test conversation");
       chat.queuedMessages.push({
         queueId: `queued_${chat.queuedMessages.length}`,
-        conversationId: chat.conversationId!,
+        conversationId: chat.conversationId,
         text,
         files,
       });
@@ -4615,5 +4617,18 @@ describe("AppShell design-mode submission", () => {
       ok: false,
       message: "Return to this session before sending.",
     });
+    chat.conversationId = "conv_design";
+    act(() => {
+      submit({
+        conversationId: "conv_design",
+        id: 2,
+        element: { tag: "input", id: "#period" },
+        prompt: "A later instruction without a new screenshot",
+      });
+    });
+    expect(enqueueMessage).toHaveBeenCalledWith(
+      expect.stringContaining("A later instruction without a new screenshot"),
+      undefined,
+    );
   });
 });

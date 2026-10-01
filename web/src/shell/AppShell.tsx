@@ -955,6 +955,7 @@ export function AppShell() {
         const file = dataUrlToFile(shot, `design-element-${submitId}.png`);
         const chat = useChatStore.getState();
         if (cid !== chat.conversationId) {
+          designShotRef.current.delete(cid);
           signal(false, "Return to this session before sending.");
           return;
         }
