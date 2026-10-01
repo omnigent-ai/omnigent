@@ -578,7 +578,8 @@ function toImportFailureRef(evt: Record<string, unknown>): ImportFailureRef {
  * callers list sessions live instead of waiting out the whole batch. A
  * mid-stream host failure, or a stream that closes before its terminal `done`
  * tally, throws after the sessions read so far have been delivered through
- * `onSession`. Against a server too old to have the streaming
+ * `onSession` (a by-ID import whose one session arrived resolves instead, since
+ * it has nothing left to do). Against a server too old to have the streaming
  * endpoint (404), it falls back to the buffered `POST /v1/imports/local`, which
  * returns the whole tally at once (`onSession` then fires for every session
  * together). Either way the resolved {@link LocalImportResult} carries the
@@ -669,15 +670,18 @@ export async function importLocalSessions(
   }
 
   if (errorMessage !== null) throw new Error(errorMessage);
-  // The body closed without the terminal `done` line (e.g. a proxy ended the
-  // response early), so the tally never arrived. Returning the zeroed counts
-  // would report "Imported 0" beside a list of sessions that did import, so
-  // fail like a mid-stream error instead, naming what landed. Re-running is
-  // safe: sessions already imported are skipped.
+  // No `done` tally arrived. A by-ID import that delivered its one session did finish;
+  // otherwise fail with what landed rather than report "Imported 0" beside listed sessions.
   if (!sawDone) {
+    if (sessionId !== undefined) {
+      if (sessions.length === 1) {
+        return { imported: 1, alreadyImported: 0, failed: 0, sessions, failures };
+      }
+      throw new Error("The import stopped before it could finish. Try importing it again.");
+    }
     const n = sessions.length;
     throw new Error(
-      `The import stopped before it finished. ${n} ${n === 1 ? "session was" : "sessions were"} ` +
+      `The import stopped before it could finish. ${n} ${n === 1 ? "session was" : "sessions were"} ` +
         "imported. Import again to pick up the rest.",
     );
   }

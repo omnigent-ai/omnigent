@@ -1778,7 +1778,7 @@ describe("importLocalSessions", () => {
 
     const seen: string[] = [];
     await expect(importLocalSessions("h", "all", 25, (s) => seen.push(s.id))).rejects.toThrow(
-      "The import stopped before it finished. 2 sessions were imported.",
+      "The import stopped before it could finish. 2 sessions were imported.",
     );
     expect(seen).toEqual(["c1", "c2"]);
   });
@@ -1787,7 +1787,32 @@ describe("importLocalSessions", () => {
     fetchMock.mockResolvedValueOnce(mockNdjsonResponse([]));
 
     await expect(importLocalSessions("h", "claude", 10)).rejects.toThrow(
-      "The import stopped before it finished. 0 sessions were imported.",
+      "The import stopped before it could finish. 0 sessions were imported.",
+    );
+  });
+
+  it("resolves a by-ID import whose session arrived even without done", async () => {
+    // The one requested session was saved before it streamed, so nothing is left to do.
+    fetchMock.mockResolvedValueOnce(
+      mockNdjsonResponse([JSON.stringify({ event: "session", session_id: "c1", title: "Exact" })]),
+    );
+
+    const result = await importLocalSessions("h", "codex", 25, undefined, "session-exact");
+
+    expect(result).toEqual({
+      imported: 1,
+      alreadyImported: 0,
+      failed: 0,
+      sessions: [{ id: "c1", title: "Exact" }],
+      failures: [],
+    });
+  });
+
+  it("throws a retry message when a by-ID import ends before done with nothing delivered", async () => {
+    fetchMock.mockResolvedValueOnce(mockNdjsonResponse([]));
+
+    await expect(importLocalSessions("h", "codex", 25, undefined, "session-exact")).rejects.toThrow(
+      "The import stopped before it could finish. Try importing it again.",
     );
   });
 

@@ -137,6 +137,30 @@ describe("ImportSessionsPanel", () => {
     await waitFor(() => expect(importLocalSessionsMock).toHaveBeenCalledTimes(1));
   });
 
+  it("keeps the streamed sessions listed when the import stops early", async () => {
+    useHostsMock.mockReturnValue({
+      data: [{ host_id: "host_1", name: "mac-laptop", owner: "alice", status: "online" }],
+    } as unknown as ReturnType<typeof useHosts>);
+    importLocalSessionsMock.mockImplementation(async (_host, _source, _limit, onSession) => {
+      onSession?.({ id: "c1", title: "First session" });
+      onSession?.({ id: "c2", title: "Second session" });
+      throw new Error(
+        "The import stopped before it could finish. 2 sessions were imported. " +
+          "Import again to pick up the rest.",
+      );
+    });
+
+    renderPanel();
+    fireEvent.click(screen.getByTestId("import-submit"));
+
+    await waitFor(() => expect(screen.getByTestId("import-error")).toBeInTheDocument());
+    expect(screen.getByTestId("import-error")).toHaveTextContent("2 sessions were imported");
+    expect(screen.getByTestId("import-result-link-c1")).toHaveTextContent("First session");
+    expect(screen.getByTestId("import-result-link-c2")).toHaveTextContent("Second session");
+    // No tally line, so nothing claims "Imported 0" beside the list.
+    expect(screen.queryByTestId("import-result")).toBeNull();
+  });
+
   it("imports one session by harness and ID without listing sessions", async () => {
     useHostsMock.mockReturnValue({
       data: [{ host_id: "host_1", name: "mac-laptop", owner: "alice", status: "online" }],
