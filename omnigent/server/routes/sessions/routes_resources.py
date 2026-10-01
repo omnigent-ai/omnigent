@@ -536,6 +536,8 @@ def register_resources_routes(
         :param op: Host-side op name — ``"list_or_read"`` / ``"changes"``
             / ``"diff"`` / ``"search"`` / ``"github_info"`` /
             ``"github_changes"`` / ``"github_diff"`` / ``"github_pr_diff"``.
+            The ``github_*`` ops serve every git provider; their names are
+            stable wire ids.
         :param host_params: Op-specific args for the host reader.
         :param runner_path: Runner-relative URL for the live path.
         :param runner_params: Optional query params for the runner path.

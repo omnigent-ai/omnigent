@@ -9,6 +9,7 @@ import { SessionStateBadge } from "@/components/SessionStateBadge";
 import type { Conversation } from "@/hooks/useConversations";
 import { getSessionState, type SessionState } from "@/hooks/useSessionState";
 import { useConversationReadState } from "@/hooks/useUnseenConversations";
+import { gitProviderCopy } from "@/lib/gitProviders";
 import { useOptimisticTitle } from "@/lib/optimisticTitles";
 import { cn } from "@/lib/utils";
 import { conversationDisplayLabel } from "@/shell/sidebarNav";
@@ -50,6 +51,7 @@ function SessionCardComponent({ data, selected }: NodeProps<SessionCardNode>) {
   const titleProvisional = !conversation.title && optimisticTitle !== undefined;
   const label = stateLabel(state, conversation.status);
   const workspace = conversation.workspace?.trim() || "No working directory";
+  const prNumberPrefix = gitProviderCopy(pullRequest?.provider).prNumberPrefix;
 
   const openFromKeyboard = (event: KeyboardEvent<HTMLDivElement>) => {
     if (event.key !== "Enter" && event.key !== " ") return;
@@ -117,13 +119,14 @@ function SessionCardComponent({ data, selected }: NodeProps<SessionCardNode>) {
           // `nodrag` keeps React Flow from turning a click on the link into a card drag.
           className="nodrag flex min-w-0 items-center gap-1.5 text-xs font-medium text-brand-accent hover:underline"
           title={`${pullRequest.title} (${pullRequest.state.toLowerCase()})`}
-          aria-label={`Open pull request #${pullRequest.number}`}
+          aria-label={`Open pull request ${prNumberPrefix}${pullRequest.number}`}
           onClick={stopCardEvents}
           onDoubleClick={stopCardEvents}
         >
           <GitPullRequestIcon aria-hidden className="size-3.5 shrink-0" />
           <span className="truncate">
-            #{pullRequest.number} {pullRequest.title}
+            {prNumberPrefix}
+            {pullRequest.number} {pullRequest.title}
           </span>
         </a>
       )}

@@ -5,13 +5,11 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import re
 import tempfile
 import time
 from collections.abc import Collection, Mapping, Sequence
 from pathlib import Path
 from typing import Literal
-from urllib.parse import urlsplit
 
 from filelock import FileLock
 from pydantic import BaseModel, Field
@@ -19,27 +17,11 @@ from pydantic import BaseModel, Field
 from omnigent.process_logging import data_dir
 
 
-def _valid_hostname(host: str) -> bool:
-    """Validate bounded ASCII DNS labels without hostname regex backtracking."""
-    if len(host) > 253 or not host.isascii():
-        return False
-    labels = host.split(".")
-    return (
-        len(labels) > 1
-        and all(
-            1 <= len(label) <= 63
-            and label[0].isalnum()
-            and label[-1].isalnum()
-            and label.replace("-", "").isalnum()
-            for label in labels
-        )
-        and labels[-1][0].isalpha()
-    )
-
-
 class PullRequestRef(BaseModel):
     """A PR belongs to its base repository, including for fork PRs."""
 
+    # Registry files written before git providers existed hold only GitHub PRs.
+    provider: str = "github"
     host: str
     repository: str
     number: int
@@ -47,36 +29,19 @@ class PullRequestRef(BaseModel):
 
     @classmethod
     def from_url(cls, value: str) -> PullRequestRef:
-        """Normalize a GitHub PR URL, rejecting non-PR and credential-bearing URLs."""
-        parsed = urlsplit(value.strip())
-        host = (parsed.hostname or "").lower()
-        match = re.fullmatch(
-            r"/([\w.-]+/[\w.-]+)/pull/([1-9][0-9]*)(?:/(?:files|commits|checks))?/?",
-            parsed.path,
-            flags=re.ASCII,
-        )
-        if (
-            parsed.scheme != "https"
-            or not _valid_hostname(host)
-            or parsed.netloc.lower() != host
-            or match is None
-        ):
-            raise ValueError("Expected an HTTPS GitHub pull request URL")
-        repository = match[1].lower()
-        if any(part in {".", ".."} for part in repository.split("/")):
-            raise ValueError("Invalid repository")
-        number = int(match[2])
-        return cls(
-            host=host,
-            repository=repository,
-            number=number,
-            url=f"https://{host}/{repository}/pull/{number}",
-        )
+        """Normalize a PR URL with the first registered git provider that recognizes it."""
+        from omnigent.git_providers import EnvInstances, resolve_pr_url
 
-    @property
-    def repo_argument(self) -> str:
-        """Explicit gh repository selector, including GitHub Enterprise host."""
-        return f"{self.host}/{self.repository}"
+        parsed = resolve_pr_url(value.strip(), EnvInstances())
+        if parsed is None:
+            raise ValueError("No registered git provider recognizes this pull request URL")
+        return cls(
+            provider=parsed.provider,
+            host=parsed.host,
+            repository=parsed.repository,
+            number=parsed.number,
+            url=parsed.url,
+        )
 
 
 class SessionPullRequest(PullRequestRef):

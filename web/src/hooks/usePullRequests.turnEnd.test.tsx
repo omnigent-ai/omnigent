@@ -18,7 +18,7 @@ vi.mock("@/store/chatStore", () => ({
 
 import { useSessionHostOnline, useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
 import { useChatStore } from "@/store/chatStore";
-import { useGithubInfo } from "./useGithub";
+import { usePullRequestInfo } from "./usePullRequests";
 
 const onlineMock = vi.mocked(useSessionRunnerOnline);
 const hostOnlineMock = vi.mocked(useSessionHostOnline);
@@ -38,7 +38,7 @@ function stubChatStore(conversationId: string | null, sessionStatus: StubStatus)
   });
 }
 
-function githubInfoResponse(): Response {
+function pullRequestInfoResponse(): Response {
   return {
     ok: true,
     status: 200,
@@ -48,13 +48,13 @@ function githubInfoResponse(): Response {
 }
 
 function Probe({ id }: { id: string | undefined }) {
-  useGithubInfo(id);
+  usePullRequestInfo(id);
   return null;
 }
 
 beforeEach(() => {
   fetchMock.mockReset();
-  fetchMock.mockResolvedValue(githubInfoResponse());
+  fetchMock.mockResolvedValue(pullRequestInfoResponse());
   vi.stubGlobal("fetch", fetchMock);
   onlineMock.mockReturnValue(true);
   hostOnlineMock.mockReturnValue(null);
@@ -66,7 +66,7 @@ afterEach(() => {
   vi.resetAllMocks();
 });
 
-describe("useGithubInfo turn-end invalidate", () => {
+describe("usePullRequestInfo turn-end invalidate", () => {
   it("refetches github info when the focused session goes running → idle", async () => {
     stubChatStore("conv_live", "running");
     const qc = new QueryClient({ defaultOptions: { queries: { retry: false, staleTime: 0 } } });

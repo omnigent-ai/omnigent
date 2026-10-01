@@ -14,7 +14,7 @@ import pytest
 from filelock import FileLock
 from filelock import Timeout as FileLockTimeout
 
-from omnigent.runner import create_runner_app
+from omnigent.runner import create_runner_app, pr_resource
 from omnigent.runner import github_resource as github
 from omnigent.runner.session_prs import PullRequestRef, SessionPrRegistry
 from tests.budgets import budget
@@ -56,6 +56,7 @@ def test_explicit_repo_is_used_for_all_pr_reads(
 
     monkeypatch.setattr(github, "_gh", gh)
     monkeypatch.setattr(github, "_git", forbidden_git)
+    monkeypatch.setattr(pr_resource, "_git_output", forbidden_git)
     info = github.github_info(tracked, session_id="session", pr_url=B)
     assert info["pr"]["title"] == "Second repository"
     assert {pr["url"] for pr in info["prs"]} == {A, B}
@@ -112,7 +113,8 @@ def test_titles_refresh_after_cache_expiry_and_keep_last_known_on_failure(
 ) -> None:
     registry = SessionPrRegistry("session")
     registry.update_titles(
-        {A: "First", B: "Second"}, timestamp=time.time() - github._PR_TITLE_CACHE_SECONDS - 1
+        {A: "First", B: "Second"},
+        timestamp=time.time() - pr_resource._PR_TITLE_CACHE_SECONDS - 1,
     )
     calls: list[list[str]] = []
 
@@ -197,14 +199,16 @@ def test_slow_title_lookups_preserve_metadata_and_leave_queued_prs_for_next_poll
     tracked: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     clock = 10.0
-    monkeypatch.setattr(github, "time", SimpleNamespace(monotonic=lambda: clock, time=time.time))
+    fake_time = SimpleNamespace(monotonic=lambda: clock, time=time.time)
+    monkeypatch.setattr(github, "time", fake_time)
+    monkeypatch.setattr(pr_resource, "time", fake_time)
     registry = SessionPrRegistry("session")
     registry.record(
         [PullRequestRef.from_url(A.replace("42", str(number))) for number in range(43, 49)],
         relationship="created",
         source="test",
     )
-    monkeypatch.setattr(github, "_PR_TITLE_LOOKUP_SECONDS", 0.2)
+    monkeypatch.setattr(pr_resource, "_PR_TITLE_LOOKUP_SECONDS", 0.2)
     attempted: list[str] = []
     title_lookups = Barrier(4, timeout=budget(5))
 
@@ -278,7 +282,7 @@ def test_title_retries_do_not_starve_queued_prs_after_backoff_expires(
         )
         if seen == pending_numbers:
             break
-        wall_clock += github._PR_TITLE_TIMEOUT_RETRY_SECONDS + 1
+        wall_clock += pr_resource._PR_TITLE_TIMEOUT_RETRY_SECONDS + 1
     assert seen == pending_numbers
 
 
@@ -335,7 +339,7 @@ def test_slow_selected_metadata_does_not_get_extra_title_work(
     def gh(args: list[str], **_kwargs: object) -> tuple[int, str, str]:
         nonlocal clock
         assert args[-1] != "title"
-        clock += github._PR_TITLE_REQUEST_SECONDS + 0.1
+        clock += pr_resource._PR_TITLE_REQUEST_SECONDS + 0.1
         return 0, '{"title": "Selected PR"}', ""
 
     monkeypatch.setattr(github, "_gh", gh)
@@ -376,7 +380,7 @@ def test_title_timeout_at_request_deadline_retries_after_short_backoff(
     assert entry.title_lookup_timed_out
     assert github._pr_title_timed_out.get() is False
 
-    wall_clock += github._PR_TITLE_TIMEOUT_RETRY_SECONDS - 0.1
+    wall_clock += pr_resource._PR_TITLE_TIMEOUT_RETRY_SECONDS - 0.1
     github.github_info(tracked, session_id="session", pr_url=B)
     assert timeouts == [1.5]
 
@@ -387,7 +391,7 @@ def test_title_timeout_at_request_deadline_retries_after_short_backoff(
     entry = next(entry for entry in registry.list() if entry.url == A)
     assert entry.title_checked_at == wall_clock
     assert entry.title_lookup_timed_out is False
-    wall_clock += github._PR_TITLE_TIMEOUT_RETRY_SECONDS
+    wall_clock += pr_resource._PR_TITLE_TIMEOUT_RETRY_SECONDS
     github.github_info(tracked, session_id="session", pr_url=B)
     assert timeouts == [1.5, 1.5]
 
@@ -423,11 +427,14 @@ def test_non_deadline_failures_keep_normal_title_cache(
     entry = next(entry for entry in SessionPrRegistry("session").list() if entry.url == A)
     assert entry.title_checked_at == wall_clock
     assert entry.title_lookup_timed_out is False
-    for elapsed in [github._PR_TITLE_TIMEOUT_RETRY_SECONDS, github._PR_TITLE_CACHE_SECONDS - 1]:
+    for elapsed in [
+        pr_resource._PR_TITLE_TIMEOUT_RETRY_SECONDS,
+        pr_resource._PR_TITLE_CACHE_SECONDS - 1,
+    ]:
         wall_clock = 1000.0 + elapsed
         github.github_info(tracked, session_id="session", pr_url=B)
         assert attempted == 1
-    wall_clock = 1000.0 + github._PR_TITLE_CACHE_SECONDS
+    wall_clock = 1000.0 + pr_resource._PR_TITLE_CACHE_SECONDS
     github.github_info(tracked, session_id="session", pr_url=B)
     assert attempted == 2
 

@@ -773,7 +773,7 @@ async def _drive_send_busy_spinner(base_url: str, session_id: str) -> None:
             await panel_toggle.click()
             workspace = page.get_by_role("complementary", name="Workspace")
             await expect(workspace).to_be_visible()
-            for tab_name in ("Files", "Changes", "GitHub", "Agents"):
+            for tab_name in ("Files", "Changes", "Pull Requests", "Agents"):
                 await expect(
                     workspace.get_by_role("tab", name=re.compile(tab_name))
                 ).to_be_disabled()
