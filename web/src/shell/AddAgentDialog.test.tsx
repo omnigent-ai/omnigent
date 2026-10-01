@@ -25,14 +25,11 @@ const useAvailableAgentsMock = vi.mocked(useAvailableAgents);
 const createSessionMock = vi.mocked(createSession);
 
 const AGENTS: AvailableAgent[] = [
-  {
-    id: "ag_claude",
-    name: "claude-native-ui",
+  testAgent("ag_claude", "claude-native-ui", {
     display_name: "Claude Code",
     description: "Claude Code agent",
     harness: "claude-native",
-    skills: [],
-  },
+  }),
   testAgent("ag_codex", "codex", { display_name: "codex", harness: "codex" }),
 ];
 
