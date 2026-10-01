@@ -296,9 +296,10 @@ def create_auth_router(
             "code": code,
             "redirect_uri": config.redirect_uri,
             "client_id": config.client_id,
-            "client_secret": config.client_secret,
             "code_verifier": code_verifier,
         }
+        if config.client_secret:
+            token_data["client_secret"] = config.client_secret
 
         async with httpx.AsyncClient() as client:
             # GitHub requires Accept: application/json to get JSON
@@ -881,7 +882,7 @@ def _validate_id_token(
         return jwt.decode(
             id_token,
             signing_key.key,
-            algorithms=["RS256", "RS384", "RS512", "ES256", "ES384", "ES512"],
+            algorithms=["RS256", "RS384", "RS512", "PS256", "ES256", "ES384", "ES512"],
             audience=config.client_id,
             issuer=config.issuer,
         )
