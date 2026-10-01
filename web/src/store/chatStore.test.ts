@@ -12120,6 +12120,83 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     await loop;
   });
 
+  it("marks a restored draft refused when the snapshot reports a runner rejection", async () => {
+    const stableId = "e".repeat(32);
+    const before = userMessage("rejected_pre", "before the gap");
+    seedSession("conv_draft_rejected", [before]);
+    const sinks = routeStreamOpens();
+    // The snapshot carries the server's record of the rejection: it marked the
+    // session failed before answering the POST, and that answer was lost.
+    const routed = fetchMock.getMockImplementation()!;
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      if (
+        String(input).split("?")[0] === "/v1/sessions/conv_draft_rejected" &&
+        (init?.method ?? "GET") === "GET"
+      ) {
+        return mockResponse({
+          id: "conv_draft_rejected",
+          agent_id: "agent_xyz",
+          status: "failed",
+          created_at: 0,
+          items: sessionSnapshots.get("conv_draft_rejected") ?? [],
+          last_task_error: {
+            code: "runner_rejected_event",
+            message: "Runner rejected the message: busy",
+          },
+        });
+      }
+      return routed(input, init);
+    });
+    const controller = new AbortController();
+    useChatStore.setState({
+      conversationId: "conv_draft_rejected",
+      abortController: controller,
+      blocks: itemsToBlocks([before]),
+      // The POST got no answer, so the client could not tell a lost refusal
+      // from a lost acknowledgement and restored the draft as merely ack-lost.
+      restoredSendDraft: {
+        conversationId: "conv_draft_rejected",
+        stableId,
+        text: "resend me",
+        files: [],
+        serverRefused: false,
+        delivered: false,
+      },
+      pendingRetryStableId: stableId,
+    });
+
+    const loop = startStreamPump("conv_draft_rejected", controller, setState, getState);
+    await drainAsync();
+    expect(sinks).toHaveLength(1);
+
+    // Persisted, then rejected by the runner: the item is in the snapshot but
+    // nothing ever ran it.
+    seedSessionItems("conv_draft_rejected", [
+      before,
+      { ...userMessage("rejected_gap", "resend me"), id: stableId },
+    ]);
+    sinks[0]!.error();
+    await drainAsync();
+    expect(sinks).toHaveLength(2);
+
+    // Not delivery evidence: the draft stays and is now known refused, so no
+    // later snapshot can retract it either; the retry id is kept for the resend.
+    const state = useChatStore.getState();
+    expect(state.restoredSendDraft).toMatchObject({
+      stableId,
+      delivered: false,
+      serverRefused: true,
+    });
+    expect(state.pendingRetryStableId).toBe(stableId);
+    expect(state.blocks.map((b) => b.ctx.itemId)).toEqual([before.id, stableId]);
+
+    const last = sinks[1]!;
+    last.push("data: [DONE]\n\n");
+    last.close();
+    await drainAsync(2);
+    await loop;
+  });
+
   it("clears the MCP startup band when its settle event fired into the reconnect gap", async () => {
     seedSession("conv_mcp_gap", []);
     sessionMcpStartup.set("conv_mcp_gap", { safe: { status: "starting", error: null } });

@@ -810,16 +810,14 @@ export interface ConversationState {
     stableId?: string;
     replyDraft?: StoredReplyDraft;
     /**
-     * `true` when the server answered the POST with an error of its own (an
-     * {@link ApiError} carrying an Omnigent error code, e.g. the runner
-     * rejected the forward). The message is then persisted but was never
-     * dispatched (the server persists before it forwards), so a snapshot that
-     * holds its item is not delivery evidence; only a live
-     * `session_input_consumed` is. `false` for a transport failure, where the
-     * item's presence proves the acknowledgement alone was lost. An untouched
-     * retry of a refused send that fails without a server answer inherits the
-     * refusal: the item already in the transcript is the refused attempt's
-     * trace, not the retry's.
+     * `true` when the send is known refused: the server answered the POST with
+     * an Omnigent error code (e.g. the runner rejected the forward), a
+     * reconnect snapshot reported that rejection after the answer was lost, or
+     * an untouched retry of such a send failed unanswered. Persistence precedes
+     * runner acceptance, so a refused send's item in the transcript is not
+     * delivery proof; only a live `session_input_consumed` retracts the draft.
+     * `false` for a transport failure, where the item's presence proves the
+     * acknowledgement alone was lost.
      */
     serverRefused?: boolean;
   } | null;
@@ -4930,9 +4928,9 @@ async function rehydrateWindowOnReconnect(
     );
     return {
       ...reconnectStatusPatch(session, s, launchBeforeFetch),
-      // Same persisted-item proof as the reconnect path: a rehydrated item
+      // Same persisted-item evidence as the reconnect path: a rehydrated item
       // can be a send whose POST died in the gap.
-      ...retractDeliveredSendDraft(s, freshItemIds, "persisted"),
+      ...reconcileSendDraftWithSnapshot(s, freshItemIds, session),
       blocks:
         reconcileElicitationBlocks(
           merged,
@@ -5078,10 +5076,10 @@ async function reconcileOnReconnect(
         : currentBlocks;
     const patch: Partial<ChatState> = {
       ...reconnectStatusPatch(session, s, launchBeforeFetch),
-      // A gap-committed item can be a send whose POST died in the gap — its
-      // presence in the snapshot proves delivery (unless the server refused
-      // the send outright; see `retractDeliveredSendDraft`), so retract it.
-      ...retractDeliveredSendDraft(s, snapshotItemIds, "persisted"),
+      // A gap-committed item can be a send whose POST died in the gap: it
+      // retracts the draft, or marks it refused when the snapshot says the
+      // runner rejected the forward (see `reconcileSendDraftWithSnapshot`).
+      ...reconcileSendDraftWithSnapshot(s, snapshotItemIds, session),
     };
     // `session.input.consumed` is not replayed, so recovered user blocks are
     // the durable equivalent of its FIFO acknowledgement.
@@ -6418,6 +6416,53 @@ function retractDeliveredSendDraft(
     const owner =
       s.restoredSendDraft?.stableId === retryId ? s.restoredSendDraft : { stableId: retryId };
     if (delivered(owner)) patch.pendingRetryStableId = null;
+  }
+  return patch;
+}
+
+/**
+ * Reconcile a failed-send draft against a reconnect snapshot.
+ *
+ * A snapshot item under the draft's stable id normally proves the send was
+ * delivered and only its acknowledgement lost (see `retractDeliveredSendDraft`).
+ * Not when the snapshot also reports that the runner rejected the last forward
+ * (`failed` with `runner_rejected_event`, persisted by the server before it
+ * answers the POST): the item is then the refused attempt's trace, and the
+ * refusal response may simply never have reached the client. The draft is
+ * flagged `serverRefused` instead, keeping its text and retry id until a live
+ * `session_input_consumed` proves a resend taken.
+ *
+ * @param s - The conversation's state.
+ * @param itemIds - Item ids the snapshot holds.
+ * @param session - The reconnect snapshot.
+ * @returns The state patch, empty when nothing matches.
+ */
+function reconcileSendDraftWithSnapshot(
+  s: ChatState,
+  itemIds: ReadonlySet<string>,
+  session: Session,
+): Partial<ChatState> {
+  const runnerRefused =
+    session.status === "failed" && session.lastTaskError?.code === "runner_rejected_event";
+  if (!runnerRefused) return retractDeliveredSendDraft(s, itemIds, "persisted");
+  const patch: Partial<ChatState> = {};
+  const failed = s.failedSendDraft;
+  if (
+    failed !== null &&
+    failed.stableId !== undefined &&
+    itemIds.has(failed.stableId) &&
+    failed.serverRefused !== true
+  ) {
+    patch.failedSendDraft = { ...failed, serverRefused: true };
+  }
+  const restored = s.restoredSendDraft;
+  if (
+    restored !== null &&
+    !restored.delivered &&
+    itemIds.has(restored.stableId) &&
+    restored.serverRefused !== true
+  ) {
+    patch.restoredSendDraft = { ...restored, serverRefused: true };
   }
   return patch;
 }
