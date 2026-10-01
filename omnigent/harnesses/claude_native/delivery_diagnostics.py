@@ -63,17 +63,20 @@ def trace_delivery(
 
         @functools.wraps(function)
         def wrapped(bridge_dir: Path, *, content: str, **kwargs: Any) -> Any:
-            # Hooks import this module on every invocation; keep the sink lazy.
-            from omnigent.debug_logging import current_session_id, debug_event
+            try:
+                # Hooks import this module on every invocation; keep the sink lazy.
+                from omnigent.debug_logging import current_session_id, debug_event
 
-            started = time.monotonic()
-            trace = _PromptDeliveryTrace(
-                delivery_id=secrets.token_hex(8),
-                session_id=current_session_id() or session_id_reader(bridge_dir),
-                started=started,
-                stage_started=started,
-            )
-            token = _prompt_delivery_trace.set(trace)
+                started = time.monotonic()
+                trace = _PromptDeliveryTrace(
+                    delivery_id=secrets.token_hex(8),
+                    session_id=current_session_id() or session_id_reader(bridge_dir),
+                    started=started,
+                    stage_started=started,
+                )
+                token = _prompt_delivery_trace.set(trace)
+            except Exception:  # noqa: BLE001 — trace setup must not prevent delivery
+                return function(bridge_dir, content=content, **kwargs)
             outcome = "returned"
             error_type = None
             try:

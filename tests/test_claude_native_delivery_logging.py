@@ -218,3 +218,33 @@ def test_summary_logging_failure_preserves_delivery_outcome(
             assert deliver(tmp_path, content="test prompt") == "delivered"
     assert log_calls == 1
     assert delivery_diagnostics._prompt_delivery_trace.get() is None
+
+
+@pytest.mark.parametrize("delivery_fails", [False, True])
+def test_trace_setup_failure_preserves_delivery_outcome(
+    delivery_fails: bool, tmp_path: Path
+) -> None:
+    delivered = False
+
+    def unreadable_session(bridge_dir: Path) -> str | None:
+        raise PermissionError("diagnostic session lookup failed")
+
+    @delivery_diagnostics.trace_delivery(
+        session_id_reader=unreadable_session,
+        cancelled_error=bridge.ClaudeInjectionCancelled,
+    )
+    def deliver(bridge_dir: Path, *, content: str) -> str:
+        nonlocal delivered
+        delivered = True
+        if delivery_fails:
+            raise RuntimeError("delivery failed")
+        return "delivered"
+
+    with current_session_id_scope(None):
+        if delivery_fails:
+            with pytest.raises(RuntimeError, match="delivery failed"):
+                deliver(tmp_path, content="test prompt")
+        else:
+            assert deliver(tmp_path, content="test prompt") == "delivered"
+    assert delivered
+    assert delivery_diagnostics._prompt_delivery_trace.get() is None
