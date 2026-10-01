@@ -1041,10 +1041,11 @@ def cmd_apply(args: argparse.Namespace) -> None:
                 # Collect warnings before rewriting (uses pre-compiled pattern).
                 warns = _find_warnings_with(source, path, dyn_re)
                 report.warnings.extend(warns)
-                # Step 4: AST import rewrite.
-                new_source = rewrite_absolute_imports(source, rename_map)
-                # Step 5: text rewrite.
-                new_source2 = finder.sub(callback, new_source)
+                # Text rewrite first, then the AST import rewrite: the AST step
+                # emits new names (``from pkg.cli import ui``) that can equal an
+                # old name (``pkg.cli``) and must not be rewritten again.
+                new_source = finder.sub(callback, source)
+                new_source2 = rewrite_absolute_imports(new_source, rename_map)
             else:
                 new_source2 = finder.sub(callback, source)
 
@@ -1131,10 +1132,9 @@ def cmd_rewrite(args: argparse.Namespace) -> None:
             new_source = convert_relative_imports(
                 source, path, repo, rename_map, convert_all=False
             )
-            # Step 4: AST import rewrite.
-            new_source = rewrite_absolute_imports(new_source, rename_map)
-            # Step 5: text rewrite.
+            # Text rewrite before the AST import rewrite (see cmd_apply).
             new_source = finder.sub(callback, new_source)
+            new_source = rewrite_absolute_imports(new_source, rename_map)
         else:
             new_source = finder.sub(callback, source)
 

@@ -1146,3 +1146,40 @@ def test_replacer_file_ext_dotted_not_matched():
     text = "see pkg.old.yaml for config"
     result = finder.sub(callback, text)
     assert "pkg.old.yaml" in result
+
+
+def test_apply_new_package_named_like_old_module_is_not_rewritten_twice(tmp_path):
+    """Imports the AST step emits for a package that replaces a same-named module stay put."""
+    root = make_repo(tmp_path)
+    write_file(root, "pkg/__init__.py", "")
+    write_file(root, "pkg/cli.py", "def main():\n    return 0\n")
+    write_file(root, "pkg/inner/__init__.py", "")
+    write_file(root, "pkg/inner/ui.py", "STYLE = 1\n")
+    write_file(
+        root,
+        "pkg/consumer.py",
+        "import pkg.cli\nfrom pkg import cli\nfrom pkg.inner import ui\n\npkg.cli.main()\n",
+    )
+    commit_all(root)
+    map_file = write_file(
+        root,
+        "map.toml",
+        """\
+        [[move]]
+        old = "pkg.cli"
+        new = "pkg.cli.commands"
+
+        [[move]]
+        old = "pkg.inner.ui"
+        new = "pkg.cli.ui"
+        """,
+    )
+
+    cmd_apply(make_args(map=str(map_file), repo=str(root)))
+
+    consumer = (root / "pkg" / "consumer.py").read_text()
+    assert "from pkg.cli import ui" in consumer
+    assert "from pkg.cli import commands as cli" in consumer
+    assert "import pkg.cli.commands" in consumer
+    assert "pkg.cli.commands.main()" in consumer
+    assert "pkg.cli.commands import ui" not in consumer

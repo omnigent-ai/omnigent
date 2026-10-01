@@ -697,6 +697,9 @@ removal = "0.19.0"
 [packages."omnigent.core"]
 doc = "Agent definition types and the executor contract; the library API re-exported by :mod:`omnigent`."
 
+[packages."omnigent.cli"]
+doc = "The omnigent command line."
+
 [packages."omnigent.observability"]
 doc = "Process logging, debug event sinks, OpenTelemetry tracing, and startup milestones."
 
