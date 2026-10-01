@@ -17,7 +17,7 @@ import httpx
 import pytest
 from click import ClickException
 
-from omnigent.harnesses.claude_native import bridge, forwarder
+from omnigent.harnesses.claude_native import bridge, diagnostics, forwarder
 from omnigent.harnesses.claude_native import main as claude_native
 from omnigent.process_logging import HARNESS_STDERR_ENABLED_ENV_VAR
 
@@ -25,6 +25,8 @@ from omnigent.process_logging import HARNESS_STDERR_ENABLED_ENV_VAR
 @pytest.fixture(autouse=True)
 def _isolated_bridge(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.delenv(HARNESS_STDERR_ENABLED_ENV_VAR, raising=False)
+    monkeypatch.delenv(diagnostics.STREAM_DIAGNOSTICS_ENABLED_ENV, raising=False)
+    monkeypatch.delenv(diagnostics.CLAUDE_STREAM_DIAGNOSTICS_ENV, raising=False)
     monkeypatch.setattr(bridge, "_TRUSTED_PARENT", tmp_path)
     monkeypatch.setattr(bridge, "_BRIDGE_ROOT", tmp_path)
 
@@ -49,6 +51,9 @@ def test_shared_and_cli_launch_arguments_opt_in_to_owned_debug_file(
             ("--resume", "claude-session"), command="claude", bridge_dir=bridge_dir
         )
         args = body["spec"]["args"]
+        stream_path = Path(body["spec"]["env"][diagnostics.CLAUDE_STREAM_DIAGNOSTICS_ENV])
+        assert stream_path.is_file()
+        assert stream_path.parent == bridge_dir
     else:
         args = bridge.augment_claude_args(("--resume", "claude-session"), bridge_dir=bridge_dir)
 
@@ -172,6 +177,7 @@ async def test_disabled_diagnostics_do_not_start_a_follower(
 ) -> None:
     hook_wait_started = asyncio.Event()
     hook_release = asyncio.Event()
+    monkeypatch.setenv(diagnostics.STREAM_DIAGNOSTICS_ENABLED_ENV, "0")
 
     async def wait_for_hook_state(*_args: object, **_kwargs: object) -> None:
         hook_wait_started.set()
@@ -461,3 +467,58 @@ async def test_direct_collector_cancellation_serializes_close_and_preserves_orig
     assert raised.value is original_error
     assert order == ["poll", "close"]
     follower.close.assert_called_once_with("cancel-inner")
+
+
+async def test_structured_failure_logs_without_debug_opt_in_or_transcript(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    no_network: None,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    bridge_dir = tmp_path / "bridge"
+    env = claude_native.build_native_claude_terminal_env(None, bridge_dir=bridge_dir)
+    path = Path(env[diagnostics.CLAUDE_STREAM_DIAGNOSTICS_ENV])
+    path.write_text(
+        json.dumps(
+            {
+                "event": "cli_stream_failed",
+                "data": {
+                    "error_class": "api_error",
+                    "api_error_type": "api_error",
+                    "stream": {"events_received": 2},
+                },
+            }
+        )
+        + "\n"
+    )
+    observed = asyncio.Event()
+    loop = asyncio.get_running_loop()
+
+    class ObserveFailure(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            if getattr(record, "event_name", None) == "claude_native_stream_failure":
+                loop.call_soon_threadsafe(observed.set)
+
+    async def blocked_hook(*_args: object, **_kwargs: object) -> None:
+        # Keep transcript discovery stalled while the independent collector runs.
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(forwarder, "_ensure_hook_state", blocked_hook)
+    handler = ObserveFailure()
+    diagnostics._logger.addHandler(handler)
+    task = asyncio.create_task(_forward(bridge_dir))
+    try:
+        await asyncio.wait_for(observed.wait(), timeout=2.0)
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        diagnostics._logger.removeHandler(handler)
+    rows = [
+        r
+        for r in caplog.records
+        if getattr(r, "event_name", None) == "claude_native_stream_failure"
+    ]
+    assert len(rows) == 1
+    assert rows[0].session_id == "original-session"
+    assert rows[0].attributes["api_error_type"] == "api_error"

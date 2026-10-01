@@ -1,4 +1,4 @@
-"""Opt-in, bounded forwarding of Claude's native diagnostic file."""
+"""Bounded forwarding of owned Claude debug and structured diagnostic files."""
 
 from __future__ import annotations
 
@@ -21,6 +21,11 @@ from omnigent.harnesses.diagnostics import (
 from omnigent.process_logging import harness_stderr_capture_enabled
 
 CLAUDE_DEBUG_LOG_MARKER = "claude-debug-active.json"
+CLAUDE_STREAM_DIAGNOSTICS_ENV = "CLAUDE_CODE_DIAGNOSTICS_FILE"
+STREAM_DIAGNOSTICS_ENABLED_ENV = "OMNIGENT_CLAUDE_STREAM_DIAGNOSTICS_ENABLED"
+_STREAM_MARKER = "claude-stream-active.json"
+_STREAM_PREFIX = "claude-stream"
+_STREAM_FILE_BYTES = 4 * 1024 * 1024
 _READ_BYTES = 64 * 1024
 _MAX_RECORD_BYTES = 1024 * 1024
 _CLOSE_READS = 4
@@ -53,9 +58,11 @@ def _open_file(directory_fd: int, filename: str) -> int:
     return fd
 
 
-def _read_capture(directory_fd: int) -> _Capture | None:
+def _read_capture(
+    directory_fd: int, *, marker: str = CLAUDE_DEBUG_LOG_MARKER, prefix: str = "claude-debug"
+) -> _Capture | None:
     try:
-        fd = _open_file(directory_fd, CLAUDE_DEBUG_LOG_MARKER)
+        fd = _open_file(directory_fd, marker)
     except FileNotFoundError:
         return None
     try:
@@ -70,19 +77,21 @@ def _read_capture(directory_fd: int) -> _Capture | None:
     launch_id = payload.get("launch_id")
     if not isinstance(launch_id, str) or _LAUNCH_ID.fullmatch(launch_id) is None:
         return None
-    filename = f"claude-debug-{launch_id}.log"
+    filename = f"{prefix}-{launch_id}.log"
     return _Capture(filename, launch_id) if payload.get("filename") == filename else None
 
 
-def _clear_capture(directory_fd: int) -> None:
+def _clear_capture(
+    directory_fd: int, *, marker: str = CLAUDE_DEBUG_LOG_MARKER, prefix: str = "claude-debug"
+) -> None:
     with contextlib.suppress(OSError, ValueError):
-        capture = _read_capture(directory_fd)
+        capture = _read_capture(directory_fd, marker=marker, prefix=prefix)
         if capture is not None:
             for filename in (capture.filename, capture.filename + ".1"):
                 with contextlib.suppress(FileNotFoundError):
                     os.unlink(filename, dir_fd=directory_fd)
     with contextlib.suppress(FileNotFoundError):
-        os.unlink(CLAUDE_DEBUG_LOG_MARKER, dir_fd=directory_fd)
+        os.unlink(marker, dir_fd=directory_fd)
 
 
 def augment_claude_debug_args(args: list[str], bridge_dir: Path) -> list[str]:
@@ -130,6 +139,12 @@ def augment_claude_debug_args(args: list[str], bridge_dir: Path) -> list[str]:
 class ClaudeDebugLogFollower:
     """Follow only the current owned file, with bounded reads and record buffering."""
 
+    _marker = CLAUDE_DEBUG_LOG_MARKER
+    _prefix = "claude-debug"
+
+    def _enabled(self) -> bool:
+        return harness_stderr_capture_enabled()
+
     def __init__(self, bridge_dir: Path) -> None:
         self._bridge_dir = bridge_dir
         self._capture: _Capture | None = None
@@ -153,7 +168,7 @@ class ClaudeDebugLogFollower:
         candidate: int | None = None
         omitted_bytes = 0
         try:
-            capture = _read_capture(directory_fd)
+            capture = _read_capture(directory_fd, marker=self._marker, prefix=self._prefix)
             if capture != self._capture:
                 self._reset_file()
                 self._capture = capture
@@ -234,7 +249,10 @@ class ClaudeDebugLogFollower:
         directory_fd = _open_directory(self._bridge_dir)
         candidate: int | None = None
         try:
-            if _read_capture(directory_fd) != self._capture:
+            if (
+                _read_capture(directory_fd, marker=self._marker, prefix=self._prefix)
+                != self._capture
+            ):
                 return remaining
             with contextlib.suppress(FileNotFoundError):
                 candidate = _open_file(directory_fd, self._capture.filename)
@@ -296,7 +314,7 @@ class ClaudeDebugLogFollower:
 
     def poll(self, session_id: str) -> None:
         """Export newly completed records without blocking on a pipe or unbounded input."""
-        if self._closed or not harness_stderr_capture_enabled():
+        if self._closed or not self._enabled():
             return
         try:
             raw, previous, predecessor_bytes = self._read()
@@ -312,7 +330,7 @@ class ClaudeDebugLogFollower:
         if self._closed:
             return
         try:
-            if harness_stderr_capture_enabled():
+            if self._enabled():
                 self._remaining_bytes(session_id, prefer_latest=True)
                 for _ in range(_CLOSE_READS):
                     self.poll(session_id)
@@ -330,3 +348,216 @@ class ClaudeDebugLogFollower:
             with contextlib.suppress(OSError):
                 self._reset_file()
             self._closed = True
+
+
+def stream_diagnostics_enabled() -> bool:
+    return os.environ.get(STREAM_DIAGNOSTICS_ENABLED_ENV, "1").lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }
+
+
+def prepare_claude_stream_diagnostics_env(bridge_dir: Path, env: dict[str, str]) -> dict[str, str]:
+    """Create a private per-launch capture without reading a user-supplied path."""
+    if not stream_diagnostics_enabled():
+        return env
+    directory_fd: int | None = None
+    created: Path | None = None
+    try:
+        from omnigent.harnesses.claude_native.bridge import _ensure_secure_dir, _write_json_file
+
+        _ensure_secure_dir(bridge_dir)
+        directory_fd = _open_directory(bridge_dir)
+        _clear_capture(directory_fd, marker=_STREAM_MARKER, prefix=_STREAM_PREFIX)
+        if env.get(CLAUDE_STREAM_DIAGNOSTICS_ENV) or os.environ.get(CLAUDE_STREAM_DIAGNOSTICS_ENV):
+            return env
+        launch_id = uuid.uuid4().hex
+        filename = f"{_STREAM_PREFIX}-{launch_id}.log"
+        fd = os.open(
+            filename,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            0o600,
+            dir_fd=directory_fd,
+        )
+        os.close(fd)
+        created = bridge_dir / filename
+        _write_json_file(
+            bridge_dir / _STREAM_MARKER, {"filename": filename, "launch_id": launch_id}
+        )
+        return {**env, CLAUDE_STREAM_DIAGNOSTICS_ENV: str(created)}
+    except Exception:  # noqa: BLE001 — diagnostics must never prevent a launch
+        if created is not None:
+            with contextlib.suppress(OSError):
+                created.unlink()
+        return env
+    finally:
+        if directory_fd is not None:
+            os.close(directory_fd)
+
+
+def _stream_failure_attributes(record: str) -> dict[str, object] | None:
+    try:
+        envelope = json.loads(record)
+    except (ValueError, RecursionError):
+        return None
+    if not isinstance(envelope, dict) or envelope.get("event") != "cli_stream_failed":
+        return None
+    data = envelope.get("data")
+    if not isinstance(data, dict):
+        return None
+    result: dict[str, object] = {}
+    # Never forward arbitrary strings, headers, or nested payloads from the CLI.
+    for key in ("error_class", "api_error_type", "connection_code", "fallback_cause"):
+        value = data.get(key)
+        if isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9_.-]{1,80}", value):
+            result[key] = value
+    timestamp = envelope.get("timestamp")
+    if isinstance(timestamp, str) and re.fullmatch(r"[0-9T:.+Z-]{1,40}", timestamp):
+        result["claude_record_timestamp"] = timestamp
+    stream = data.get("stream")
+    stream = stream if isinstance(stream, dict) else {}
+    response = data.get("response")
+    response = response if isinstance(response, dict) else {}
+    for prefix, source, fields in (
+        ("", data, ("watchdog_fired", "ssl_error")),
+        (
+            "stream_",
+            stream,
+            ("message_envelope_open", "stop_reason_received", "any_event_yielded"),
+        ),
+    ):
+        for key in fields:
+            value = source.get(key)
+            if isinstance(value, bool):
+                result[prefix + key] = value
+    for key in (
+        "events_received",
+        "ms_to_first_event",
+        "ms_since_last_event",
+        "content_blocks_completed",
+        "ms_since_request",
+        "ms_to_headers",
+        "stalls_over_30s",
+        "stall_ms_total",
+    ):
+        value = stream.get(key)
+        if isinstance(value, (int, float)) and not isinstance(value, bool) and 0 <= value <= 1e12:
+            result["stream_" + key] = value
+    for key in ("first_event_type", "last_event_type"):
+        value = stream.get(key)
+        if isinstance(value, str) and value in {
+            "message_start",
+            "message_delta",
+            "message_stop",
+            "content_block_start",
+            "content_block_delta",
+            "content_block_stop",
+            "ping",
+            "error",
+            "other",
+        }:
+            result["stream_" + key] = value
+    status = response.get("status")
+    if isinstance(status, int) and not isinstance(status, bool) and 100 <= status <= 599:
+        result["response_status"] = status
+    request_id = response.get("request_id")
+    if isinstance(request_id, str) and re.fullmatch(r"req_[A-Za-z0-9_-]{1,36}", request_id):
+        result["claude_request_id"] = request_id
+    result["claude_request_id_status"] = (
+        "present_in_diagnostics" if "claude_request_id" in result else "missing_in_diagnostics"
+    )
+    result["gateway_request_id_verified"] = "false"
+    return result
+
+
+class ClaudeStreamDiagnosticsFollower(ClaudeDebugLogFollower):
+    """Export only structured stream failures; raw diagnostic records stay local."""
+
+    _marker = _STREAM_MARKER
+    _prefix = _STREAM_PREFIX
+
+    def _enabled(self) -> bool:
+        return stream_diagnostics_enabled()
+
+    def _emit(
+        self, session_id: str, records: list[str], omitted_lines: int = 0, omitted_bytes: int = 0
+    ) -> None:
+        if self._capture is None:
+            return
+        for record in records:
+            attrs = _stream_failure_attributes(record)
+            if attrs is not None:
+                extra = debug_event("claude_native_stream_failure", session_id=session_id)
+                extra["attributes"] = {"launch_id": self._capture.launch_id, **attrs}
+                _logger.warning("Claude native response stream failed", extra=extra)
+        if omitted_lines or omitted_bytes:
+            _logger.info(
+                "Claude structured diagnostics omitted",
+                extra=debug_event(
+                    "claude_native_diagnostics_omitted",
+                    session_id=session_id,
+                    launch_id=self._capture.launch_id,
+                    lines_omitted=omitted_lines,
+                    bytes_omitted=omitted_bytes,
+                ),
+            )
+
+    def poll(self, session_id: str) -> None:
+        super().poll(session_id)
+        if self._closed or not self._enabled():
+            return
+        # The CLI reopens this append-only file for each write. Retain one
+        # predecessor; the base follower drains its open inode after rotation.
+        directory_fd: int | None = None
+        fd: int | None = None
+        try:
+            directory_fd = _open_directory(self._bridge_dir)
+            capture = _read_capture(directory_fd, marker=self._marker, prefix=self._prefix)
+            if capture is None:
+                return
+            fd = _open_file(directory_fd, capture.filename)
+            if os.fstat(fd).st_size <= _STREAM_FILE_BYTES:
+                return
+            with contextlib.suppress(FileNotFoundError):
+                previous = _open_file(directory_fd, capture.filename + ".1")
+                try:
+                    info = os.fstat(previous)
+                    active = os.fstat(self._fd) if self._fd is not None else None
+                    if active is None or (info.st_dev, info.st_ino) != (
+                        active.st_dev,
+                        active.st_ino,
+                    ):
+                        self._emit(session_id, [], omitted_bytes=info.st_size)
+                finally:
+                    os.close(previous)
+            os.replace(
+                capture.filename,
+                capture.filename + ".1",
+                src_dir_fd=directory_fd,
+                dst_dir_fd=directory_fd,
+            )
+            try:
+                replacement = os.open(
+                    capture.filename,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                    0o600,
+                    dir_fd=directory_fd,
+                )
+            except FileExistsError:
+                # The CLI may have reopened its append path already.
+                replacement = _open_file(directory_fd, capture.filename)
+                try:
+                    os.fchmod(replacement, 0o600)
+                finally:
+                    os.close(replacement)
+            else:
+                os.close(replacement)
+        except Exception:  # noqa: BLE001 — diagnostic rotation is best-effort
+            pass
+        finally:
+            if fd is not None:
+                os.close(fd)
+            if directory_fd is not None:
+                os.close(directory_fd)

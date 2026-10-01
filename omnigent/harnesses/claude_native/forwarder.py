@@ -12,7 +12,7 @@ import os
 import tempfile
 import threading
 import time
-from collections.abc import AsyncIterator, Callable, Collection, Mapping, Sequence
+from collections.abc import AsyncIterator, Collection, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
@@ -47,7 +47,11 @@ from omnigent.harnesses.claude_native.bridge import (
     url_component,
     write_active_session_id,
 )
-from omnigent.harnesses.claude_native.diagnostics import ClaudeDebugLogFollower
+from omnigent.harnesses.claude_native.diagnostics import (
+    ClaudeDebugLogFollower,
+    ClaudeStreamDiagnosticsFollower,
+    stream_diagnostics_enabled,
+)
 from omnigent.harnesses.claude_native.message_display_hook import MESSAGE_DELTAS_FILE
 from omnigent.harnesses.claude_native.status import sync_raw_status_context
 from omnigent.inner.hook_scripts.subagent_router import AGENT_TOOL_NAMES
@@ -1081,11 +1085,11 @@ async def _forward_claude_diagnostics(
     poll_interval_s: float,
 ) -> AsyncIterator[None]:
     """Follow diagnostics independently of transcript discovery and HTTP progress."""
-    if not harness_stderr_capture_enabled():
+    if not harness_stderr_capture_enabled() and not stream_diagnostics_enabled():
         yield
         return
 
-    follower = ClaudeDebugLogFollower(bridge_dir)
+    followers = [ClaudeDebugLogFollower(bridge_dir), ClaudeStreamDiagnosticsFollower(bridge_dir)]
 
     def active_session_id() -> str:
         try:
@@ -1096,20 +1100,23 @@ async def _forward_claude_diagnostics(
     stop = asyncio.Event()
     follower_lock = threading.Lock()
 
-    def run_serialized(operation: Callable[[str], None]) -> None:
+    def run_serialized(*, close: bool = False) -> None:
         # Cancelling an await cannot stop its worker thread.
         with follower_lock:
-            operation(active_session_id())
+            current_session = active_session_id()
+            for follower in followers:
+                operation = follower.close if close else follower.poll
+                operation(current_session)
 
     async def poll() -> None:
         try:
             while not stop.is_set():
-                await asyncio.to_thread(run_serialized, follower.poll)
+                await asyncio.to_thread(run_serialized)
                 with contextlib.suppress(TimeoutError):
                     await asyncio.wait_for(stop.wait(), timeout=poll_interval_s)
         finally:
             with contextlib.suppress(Exception):
-                await asyncio.shield(asyncio.to_thread(run_serialized, follower.close))
+                await asyncio.shield(asyncio.to_thread(run_serialized, close=True))
 
     task = asyncio.create_task(poll(), name=f"claude-diagnostics-{session_id}")
     try:

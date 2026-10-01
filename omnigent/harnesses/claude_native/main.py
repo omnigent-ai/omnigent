@@ -1500,6 +1500,8 @@ def claude_launch_catalog_is_stale(claude_config: ClaudeNativeUcodeConfig | None
 
 def build_native_claude_terminal_env(
     claude_config: ClaudeNativeUcodeConfig | None,
+    *,
+    bridge_dir: Path | None = None,
 ) -> dict[str, str]:
     """
     Build env overrides for a native Claude Code terminal process.
@@ -1514,6 +1516,7 @@ def build_native_claude_terminal_env(
     :param claude_config: Optional provider/ucode launch config, e.g.
         one carrying ``{"ANTHROPIC_BASE_URL": "https://example.com"}``.
         ``None`` means use Claude Code's own native auth.
+    :param bridge_dir: Owned bridge for real launches; omitted for model probes.
     :returns: Environment overrides for the terminal process, e.g.
         ``{"ENABLE_TOOL_SEARCH": "true"}``.
     """
@@ -1537,6 +1540,12 @@ def build_native_claude_terminal_env(
                 f"carries a raw {_ANTHROPIC_API_KEY_ENV}; the credential must reach "
                 "Claude Code via the helper, not the environment."
             )
+    if bridge_dir is not None:
+        from omnigent.harnesses.claude_native.diagnostics import (
+            prepare_claude_stream_diagnostics_env,
+        )
+
+        terminal_env = prepare_claude_stream_diagnostics_env(bridge_dir, terminal_env)
     return terminal_env
 
 
@@ -6256,7 +6265,10 @@ async def _launch_claude_terminal(
             )
         return terminal_id
     except (Exception, asyncio.CancelledError) as launch_error:
-        from omnigent.harnesses.claude_native.diagnostics import ClaudeDebugLogFollower
+        from omnigent.harnesses.claude_native.diagnostics import (
+            ClaudeDebugLogFollower,
+            ClaudeStreamDiagnosticsFollower,
+        )
 
         if not isinstance(launch_error, asyncio.CancelledError):
             _logger.exception(
@@ -6266,6 +6278,8 @@ async def _launch_claude_terminal(
             )
         with contextlib.suppress(Exception):
             await asyncio.to_thread(ClaudeDebugLogFollower(bridge_dir).close, session_id)
+        with contextlib.suppress(Exception):
+            await asyncio.to_thread(ClaudeStreamDiagnosticsFollower(bridge_dir).close, session_id)
         raise
 
 
@@ -6446,7 +6460,7 @@ def _claude_terminal_request(
         "cwd": str(Path.cwd().resolve()),
         "scrollback": _CLAUDE_TERMINAL_SCROLLBACK_LINES,
     }
-    spec["env"] = build_native_claude_terminal_env(claude_config)
+    spec["env"] = build_native_claude_terminal_env(claude_config, bridge_dir=bridge_dir)
     if claude_config is not None:
         # The runner's terminal layer inherits the parent process env.
         # Remove provider/session variables that can override the

@@ -8794,7 +8794,7 @@ async def _auto_create_claude_terminal(
         # Tool Search env plus ucode gateway env (ANTHROPIC_BASE_URL
         # etc.) when derived. Empty provider config still forces
         # ENABLE_TOOL_SEARCH=true so MCP schemas are loaded on demand.
-        env=build_native_claude_terminal_env(claude_config),
+        env=build_native_claude_terminal_env(claude_config, bridge_dir=bridge_dir),
         # Names to strip (see ``_claude_terminal_env_unset``). Dropping
         # ``DATABRICKS_CONFIG_PROFILE`` matters because Claude's MCP servers
         # inherit this env and several build ``WorkspaceClient`` without pinning
@@ -8845,10 +8845,15 @@ async def _auto_create_claude_terminal(
                 (time.monotonic() - started_at) * 1000,
                 extra={"session_id": session_id},
             )
-        from omnigent.harnesses.claude_native.diagnostics import ClaudeDebugLogFollower
+        from omnigent.harnesses.claude_native.diagnostics import (
+            ClaudeDebugLogFollower,
+            ClaudeStreamDiagnosticsFollower,
+        )
 
         with contextlib.suppress(Exception):
             await asyncio.to_thread(ClaudeDebugLogFollower(bridge_dir).close, session_id)
+        with contextlib.suppress(Exception):
+            await asyncio.to_thread(ClaudeStreamDiagnosticsFollower(bridge_dir).close, session_id)
         raise
     if reset_pick_after_launch:
         await _clear_session_model_override(session_id, server_client)

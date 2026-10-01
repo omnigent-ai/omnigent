@@ -22,6 +22,8 @@ pytestmark = pytest.mark.skipif(not IS_POSIX, reason="Native diagnostic files us
 @pytest.fixture(autouse=True)
 def clear_capture_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv(HARNESS_STDERR_ENABLED_ENV_VAR, raising=False)
+    monkeypatch.delenv(diagnostics.STREAM_DIAGNOSTICS_ENABLED_ENV, raising=False)
+    monkeypatch.delenv(diagnostics.CLAUDE_STREAM_DIAGNOSTICS_ENV, raising=False)
 
 
 @pytest.fixture
@@ -593,3 +595,137 @@ def test_invalid_marker_cannot_select_other_files(
     follower.poll("conv_test")
     follower.close("conv_test")
     assert not _events(caplog)
+
+
+def _stream_record(**changes: object) -> str:
+    payload = {
+        "timestamp": "2026-01-01T00:00:00.000Z",
+        "event": "cli_stream_failed",
+        "data": {
+            "error_class": "api_error",
+            "api_error_type": "api_error",
+            "connection_code": "ECONNRESET",
+            "watchdog_fired": False,
+            "error_message": "private error body",
+            "headers": {"authorization": "private credential"},
+            "response": {"status": 200, "request_id": "req_failed", "body": "private body"},
+            "stream": {
+                "events_received": 4,
+                "ms_to_first_event": 2.5,
+                "last_event_type": "content_block_delta",
+                "stop_reason_received": False,
+            },
+        },
+    }
+    payload.update(changes)
+    return json.dumps(payload) + "\n"
+
+
+def test_stream_capture_default_on_private_and_preserves_explicit_paths(
+    bridge_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env = diagnostics.prepare_claude_stream_diagnostics_env(bridge_dir, {})
+    path = Path(env[diagnostics.CLAUDE_STREAM_DIAGNOSTICS_ENV])
+    assert path.parent == bridge_dir
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    assert stat.S_IMODE(bridge_dir.stat().st_mode) == 0o700
+    explicit = {diagnostics.CLAUDE_STREAM_DIAGNOSTICS_ENV: str(bridge_dir / "user.jsonl")}
+    assert diagnostics.prepare_claude_stream_diagnostics_env(bridge_dir, explicit) is explicit
+    assert not (bridge_dir / diagnostics._STREAM_MARKER).exists()
+    assert not path.exists()
+    monkeypatch.setenv(diagnostics.CLAUDE_STREAM_DIAGNOSTICS_ENV, "/user/diagnostics.jsonl")
+    assert diagnostics.prepare_claude_stream_diagnostics_env(bridge_dir, {}) == {}
+    monkeypatch.delenv(diagnostics.CLAUDE_STREAM_DIAGNOSTICS_ENV)
+    monkeypatch.setenv(diagnostics.STREAM_DIAGNOSTICS_ENABLED_ENV, "0")
+    assert diagnostics.prepare_claude_stream_diagnostics_env(bridge_dir, {}) == {}
+
+
+def test_stream_capture_forwards_only_complete_allowlisted_failures(
+    bridge_dir: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    path = Path(
+        diagnostics.prepare_claude_stream_diagnostics_env(bridge_dir, {})[
+            diagnostics.CLAUDE_STREAM_DIAGNOSTICS_ENV
+        ]
+    )
+    follower = diagnostics.ClaudeStreamDiagnosticsFollower(bridge_dir)
+    raw = _stream_record()
+    path.write_text(_stream_record(event="other_event") + "not json\n" + raw[:50])
+    follower.poll("conv_stream")
+    assert not caplog.records
+    with path.open("a") as handle:
+        handle.write(raw[50:])
+    follower.poll("conv_stream")
+    follower.poll("conv_stream")
+    follower.close("conv_stream")
+    rows = [
+        record_to_row(r, source="runner")
+        for r in caplog.records
+        if getattr(r, "event_name", None) == "claude_native_stream_failure"
+    ]
+    assert len(rows) == 1
+    assert rows[0]["session_id"] == "conv_stream"
+    attrs = rows[0]["attributes"]
+    assert attrs["api_error_type"] == "api_error"
+    assert attrs["connection_code"] == "ECONNRESET"
+    assert attrs["stream_events_received"] == "4"
+    assert attrs["response_status"] == "200"
+    assert attrs["claude_request_id"] == "req_failed"
+    assert "private" not in json.dumps(rows)
+    assert "authorization" not in json.dumps(rows)
+
+
+def test_stream_capture_rejects_unsafe_files_and_rotates_owned_file(
+    bridge_dir: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    path = Path(
+        diagnostics.prepare_claude_stream_diagnostics_env(bridge_dir, {})[
+            diagnostics.CLAUDE_STREAM_DIAGNOSTICS_ENV
+        ]
+    )
+    outside = bridge_dir.parent / "outside.jsonl"
+    outside.write_text(_stream_record())
+    path.unlink()
+    path.symlink_to(outside)
+    follower = diagnostics.ClaudeStreamDiagnosticsFollower(bridge_dir)
+    follower.poll("conv_stream")
+    assert not caplog.records
+    assert outside.read_text() == _stream_record()
+    path.unlink()
+    path.write_text(_stream_record())
+    monkeypatch.setattr(diagnostics, "_STREAM_FILE_BYTES", 10)
+    follower.poll("conv_stream")
+    assert path.exists()
+    assert path.with_name(path.name + ".1").exists()
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    path.write_text(_stream_record())
+    follower.poll("conv_stream")
+    follower.close("conv_stream")
+    records = [
+        r
+        for r in caplog.records
+        if getattr(r, "event_name", None) == "claude_native_stream_failure"
+    ]
+    assert len(records) == 2
+
+
+def test_stream_failure_rejects_malformed_fields_without_exporting_payload() -> None:
+    attrs = diagnostics._stream_failure_attributes(
+        _stream_record(
+            data={
+                "error_class": "private\nerror",
+                "api_error_type": {"body": "private"},
+                "response": {"status": True, "request_id": "gateway-uuid"},
+                "stream": {
+                    "events_received": -1,
+                    "ms_to_first_event": float("inf"),
+                    "last_event_type": {"body": "private"},
+                },
+            }
+        )
+    )
+    assert attrs is not None
+    assert attrs["claude_request_id_status"] == "missing_in_diagnostics"
+    assert "private" not in json.dumps(attrs)
+    assert "response_status" not in attrs
+    assert not any(key.startswith("stream_") for key in attrs)

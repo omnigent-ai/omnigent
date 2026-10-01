@@ -111,7 +111,11 @@ def test_claude_terminal_request_pins_launch_cwd(tmp_path, monkeypatch) -> None:
     assert body["bridge_inject_dir"] is True
     spec = body["spec"]
     assert spec["command"] == "claude"
-    assert spec["env"] == {
+    terminal_env = dict(spec["env"])
+    diagnostic_path = Path(terminal_env.pop("CLAUDE_CODE_DIAGNOSTICS_FILE"))
+    assert diagnostic_path.is_file()
+    assert diagnostic_path.name.startswith("claude-stream-")
+    assert terminal_env == {
         "ENABLE_TOOL_SEARCH": "true",
         "CLAUDE_CODE_DISABLE_AGENT_VIEW": "1",
         "CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY": "1",
@@ -234,7 +238,11 @@ def test_claude_terminal_request_injects_claude_config(tmp_path, monkeypatch) ->
 
     spec = body["spec"]
     assert spec["command"] == "env"
-    assert spec["env"] == {
+    terminal_env = dict(spec["env"])
+    diagnostic_path = Path(terminal_env.pop("CLAUDE_CODE_DIAGNOSTICS_FILE"))
+    assert diagnostic_path.is_file()
+    assert diagnostic_path.name.startswith("claude-stream-")
+    assert terminal_env == {
         "ANTHROPIC_BASE_URL": "https://example.databricks.com/ai-gateway/anthropic",
         "CLAUDE_CODE_API_KEY_HELPER_TTL_MS": "900000",
         "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS": "1",
