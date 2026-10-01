@@ -816,7 +816,10 @@ export interface ConversationState {
      * dispatched (the server persists before it forwards), so a snapshot that
      * holds its item is not delivery evidence; only a live
      * `session_input_consumed` is. `false` for a transport failure, where the
-     * item's presence proves the acknowledgement alone was lost.
+     * item's presence proves the acknowledgement alone was lost. An untouched
+     * retry of a refused send that fails without a server answer inherits the
+     * refusal: the item already in the transcript is the refused attempt's
+     * trace, not the retry's.
      */
     serverRefused?: boolean;
   } | null;
@@ -2183,10 +2186,11 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     const pinnedSetter: typeof setActive = pinnedId === null ? setActive : setterFor(pinnedId);
     const pinnedState = pinnedId === null ? get() : setterForState(pinnedId);
     const retryId = pinnedState?.pendingRetryStableId ?? null;
+    const restoredDraft = pinnedState?.restoredSendDraft ?? null;
     // Submitting consumes what the composer held, a restored failed send
     // included: drop its tracker too, or delivery evidence for that send could
     // later retract a NEW draft that merely repeats the same text.
-    if (retryId !== null || (pinnedState?.restoredSendDraft ?? null) !== null) {
+    if (retryId !== null || restoredDraft !== null) {
       pinnedSetter({ pendingRetryStableId: null, restoredSendDraft: null });
     }
     // A restored failed send keeps its stable id only when resent untouched:
@@ -2194,15 +2198,17 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     // edited body under the old id would run without ever being persisted.
     const reusableRetryId =
       retryId !== null &&
-      restoredSendDraftUnchanged(
-        pinnedState?.restoredSendDraft ?? null,
-        retryId,
-        text,
-        files,
-        opts?.replyDraft,
-      )
+      restoredSendDraftUnchanged(restoredDraft, retryId, text, files, opts?.replyDraft)
         ? retryId
         : null;
+    // An untouched retry of a send the server refused goes out under the id of
+    // an item the transcript already holds, so that item cannot prove THIS
+    // attempt was delivered: the refusal stands until a live acknowledgement.
+    const retriesRefusedSend =
+      reusableRetryId !== null &&
+      restoredDraft !== null &&
+      restoredDraft.stableId === reusableRetryId &&
+      restoredDraft.serverRefused === true;
     const stableId = opts?.stableId ?? reusableRetryId ?? randomUUID().replace(/-/g, "");
     // Sending while a response is already streaming is allowed — the
     // session API queues item-typed events and the server delivers them
@@ -2480,8 +2486,10 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       // forward), so the item turning up in the transcript, now or in a later
       // snapshot, must not retract the draft. A transport failure or a
       // code-less proxy error leaves the send's fate unknown, and a persisted
-      // item then does prove delivery.
-      const serverRefused = err instanceof ApiError && err.code !== null;
+      // item then does prove delivery, unless this was the untouched retry of
+      // a refused send: its item predates the attempt (see `retriesRefusedSend`).
+      const answeredWithRefusal = err instanceof ApiError && err.code !== null;
+      const serverRefused = answeredWithRefusal || retriesRefusedSend;
       // A network failure can lose only the POST's response: if the message's
       // committed item already came back over the stream, the send was delivered
       // and restoring a draft would repopulate the composer with a sent prompt.

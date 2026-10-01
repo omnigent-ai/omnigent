@@ -5512,8 +5512,9 @@ describe("chatStore — delivered-but-unacked send", () => {
 
   function armRestoredDraft(
     stableId: string,
-    restored: { files?: File[]; replyDraft?: StoredReplyDraft } = {},
+    restored: { files?: File[]; replyDraft?: StoredReplyDraft; serverRefused?: boolean } = {},
   ): void {
+    const { serverRefused } = restored;
     useChatStore.setState({
       conversationId: "conv_existing",
       abortController: new AbortController(),
@@ -5523,6 +5524,7 @@ describe("chatStore — delivered-but-unacked send", () => {
         text: "resend me",
         files: restored.files ?? [],
         ...(restored.replyDraft ? { replyDraft: restored.replyDraft } : {}),
+        ...(serverRefused !== undefined ? { serverRefused } : {}),
         delivered: false,
       },
       pendingRetryStableId: stableId,
@@ -5538,6 +5540,33 @@ describe("chatStore — delivered-but-unacked send", () => {
     // Same body, same id: the server dedupes it to the item it already holds.
     expect(postedEvent().data.stable_id).toBe(stableId);
     expect(useChatStore.getState().pendingRetryStableId).toBeNull();
+  });
+
+  it("keeps a refused draft whose untouched retry fails before the server answers", async () => {
+    const stableId = "b".repeat(32);
+    armRestoredDraft(stableId, { serverRefused: true });
+    // The refused attempt's item is already in the transcript (the server
+    // persists before it forwards); the retry then dies on the network.
+    useChatStore.setState({
+      blocks: itemsToBlocks([{ ...userMessage("refused_first", "resend me"), id: stableId }]),
+    });
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input).endsWith("/v1/sessions/conv_existing/events") && init?.method === "POST") {
+        return Promise.reject(new TypeError("Failed to fetch"));
+      }
+      return defaultFetchHandler(input, init);
+    });
+
+    await useChatStore.getState().send("resend me", "agent_xyz");
+
+    // That item is the first attempt's trace, not proof this retry was taken:
+    // the draft comes back, still refused, under the same id.
+    expect(postedEvent().data.stable_id).toBe(stableId);
+    expect(useChatStore.getState().failedSendDraft).toMatchObject({
+      text: "resend me",
+      stableId,
+      serverRefused: true,
+    });
   });
 
   it("mints a fresh stable id when the restored draft was edited before the resend", async () => {
