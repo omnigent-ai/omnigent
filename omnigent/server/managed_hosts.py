@@ -207,6 +207,7 @@ _logger = logging.getLogger(__name__)
 SUPPORTED_SANDBOX_PROVIDERS: frozenset[str] = frozenset(
     {
         "lakebox",
+        "databricks",
         "modal",
         "daytona",
         "blaxel",
@@ -223,6 +224,7 @@ SUPPORTED_SANDBOX_PROVIDERS: frozenset[str] = frozenset(
 )
 PROVIDERS_WITH_MANAGED_LAUNCH: frozenset[str] = frozenset(
     {
+        "databricks",
         "modal",
         "daytona",
         "blaxel",
@@ -280,6 +282,9 @@ BOXLITE_MANAGED_TOKEN_TTL_S = 7 * 24 * 3600
 # The seven-day policy keeps live VMs reconnecting while stale tokens expire.
 # A relaunch mints a fresh token.
 MICROSANDBOX_MANAGED_TOKEN_TTL_S = 7 * 24 * 3600
+
+# Launch-token lifetime for the YAML databricks path (resumable sandboxes).
+DATABRICKS_MANAGED_TOKEN_TTL_S = 7 * 24 * 3600
 
 # Launch-token lifetime for the YAML islo path. Islo sandboxes are
 # deleted by managed-session teardown; use the same 7-day policy bound
@@ -1542,6 +1547,25 @@ def _parse_single_provider_sandbox_config(raw: dict[str, object]) -> ManagedSand
         # Derived from OMNIGENT_CWSANDBOX_MAX_LIFETIME_S so the token always
         # outlives the (operator-overridable) sandbox lifetime.
         token_ttl_s = managed_token_ttl_s()
+    elif provider == "databricks":
+        section = _parse_provider_section(raw, "databricks")
+        if section is not None:
+            _reject_unknown_keys(
+                section,
+                {"profile", "sandbox_id_prefix", "inactivity_timeout_s", "bootstrap_command"},
+                "sandbox.databricks",
+            )
+        launcher_factory = _databricks_launcher_factory(
+            profile=_parse_provider_string(raw, "databricks", "profile"),
+            sandbox_id_prefix=_parse_provider_string(raw, "databricks", "sandbox_id_prefix"),
+            inactivity_timeout_s=_parse_provider_positive_int(
+                raw, "databricks", "inactivity_timeout_s"
+            ),
+            bootstrap_command=_parse_provider_string(raw, "databricks", "bootstrap_command"),
+        )
+        # Sandboxes stop on idle and resume under the same id; the token must
+        # outlive an idle weekend. A wake re-arms a fresh token anyway.
+        token_ttl_s = DATABRICKS_MANAGED_TOKEN_TTL_S
     elif provider == "islo":
         launcher_factory = _islo_launcher_factory(
             image=_parse_provider_image(raw, "islo"),
@@ -2351,6 +2375,28 @@ def _parse_islo_idle_pause_after_s(raw: dict[str, object]) -> int | None:
             "server config 'sandbox.islo.idle_pause_after_s' must be a positive integer or null"
         )
     return value
+
+
+def _databricks_launcher_factory(
+    *,
+    profile: str | None,
+    sandbox_id_prefix: str | None,
+    inactivity_timeout_s: int | None,
+    bootstrap_command: str | None,
+) -> Callable[[], SandboxHostLauncher]:
+    """Build the launcher factory for the YAML ``provider: databricks`` path."""
+
+    def _build() -> SandboxHostLauncher:
+        from omnigent.onboarding.sandboxes.databricks_sandbox import DatabricksSandboxLauncher
+
+        return DatabricksSandboxLauncher(
+            profile=profile,
+            sandbox_id_prefix=sandbox_id_prefix,
+            inactivity_timeout_s=inactivity_timeout_s,
+            bootstrap_command=bootstrap_command,
+        )
+
+    return _build
 
 
 def _islo_launcher_factory(
