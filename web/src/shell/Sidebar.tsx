@@ -4110,10 +4110,16 @@ function SessionTooltipDetails({ conversation }: { conversation: Conversation })
   const owner = conversation.owner ?? null;
   const createdBy = owner !== null && isOwnedByViewer(conversation, viewerId) ? "You" : owner;
   const repo = github?.repo?.name_with_owner?.split("/").pop() ?? null;
+  // Prefer the resolved PR (carries state); fall back to the tracked association
+  // (number only) so the row still shows when gh can't resolve state — e.g. gh
+  // isn't authenticated on the host.
   const pr = github?.pr ?? null;
+  const association =
+    github?.prs?.find((p) => p.url === github.selected_pr_url) ?? github?.prs?.[0] ?? null;
+  const prNumber = pr?.number ?? association?.number ?? null;
   const prStatus = pr ? pullRequestStatus(pr) : null;
   const branch = conversation.git_branch ?? github?.branch ?? null;
-  if (createdBy === null && repo === null && pr === null && branch === null) return null;
+  if (createdBy === null && repo === null && prNumber === null && branch === null) return null;
   return (
     <div className="mt-2.5 flex flex-col gap-1 border-t border-border pt-2.5">
       {createdBy !== null && (
@@ -4130,9 +4136,14 @@ function SessionTooltipDetails({ conversation }: { conversation: Conversation })
           {repo}
         </SessionTooltipDetail>
       )}
-      {pr !== null && prStatus !== null && (
-        <SessionTooltipDetail label="PR" icon={prStatus.icon} testId="session-tooltip-pr">
-          #{pr.number} · {prStatus.label}
+      {prNumber !== null && (
+        <SessionTooltipDetail
+          label="PR"
+          icon={prStatus?.icon ?? GitPullRequestIcon}
+          testId="session-tooltip-pr"
+        >
+          #{prNumber}
+          {prStatus ? ` · ${prStatus.label}` : ""}
         </SessionTooltipDetail>
       )}
       {branch !== null && (
