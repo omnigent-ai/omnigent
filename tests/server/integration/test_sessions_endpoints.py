@@ -11569,6 +11569,54 @@ async def test_native_message_persisted_when_runner_offline(
     assert snap["status"] == "failed"
 
 
+async def test_runner_re_tunnelled_to_sibling_returns_wrong_replica(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """
+    A message is re-addressed (not failed) when the runner is live on a sibling.
+
+    Rollout repro: the bound runner has no local tunnel here, but its
+    ``runner_last_seen`` was stamped fresh by another replica it re-tunnelled to.
+    The dispatch path must raise ``WRONG_REPLICA`` (so the client re-addresses)
+    instead of persisting a ``runner_failed_to_start`` turn. This guards the
+    wiring: the stamp check must run *before* failure persistence.
+    """
+    import time
+
+    agent = await create_test_agent(client)
+    session = await _create_session(
+        client,
+        agent["id"],
+        labels={"omnigent.wrapper": "claude-code-native-ui"},
+    )
+    sid = session["id"]
+
+    # Bind a runner that has no tunnel on this replica, then stamp its liveness
+    # directly on the store — simulating a SIBLING replica stamping it on
+    # reconnect. This process's session_live_state never stamped it, so
+    # last_liveness_stamp() returns None and the stamp reads as another replica's.
+    store = SqlAlchemyConversationStore(db_uri)
+    assert store.set_runner_id(sid, "runner_sibling")
+    store.touch_runner_liveness(["runner_sibling"], int(time.time()))
+
+    resp = await client.post(
+        f"/v1/sessions/{sid}/events",
+        json={
+            "type": "message",
+            "data": {"role": "user", "content": [{"type": "input_text", "text": "hello"}]},
+        },
+    )
+    # WRONG_REPLICA → HTTP 400; the turn is NOT recorded as failed.
+    assert resp.status_code == 400, resp.text
+    assert "wrong_replica" in resp.text
+
+    items = (await client.get(f"/v1/sessions/{sid}/items")).json()["data"]
+    assert [i for i in items if i["type"] == "error"] == [], f"no failure item expected: {items}"
+    snap = (await client.get(f"/v1/sessions/{sid}")).json()
+    assert snap["status"] != "failed"
+
+
 async def test_non_native_message_still_raises_when_runner_offline(
     client: httpx.AsyncClient,
 ) -> None:

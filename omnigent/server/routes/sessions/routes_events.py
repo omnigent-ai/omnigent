@@ -429,25 +429,13 @@ async def _raise_if_runner_re_tunnelled_to_another_replica(
     """
     Re-address a rollout miss where the runner re-tunnelled to a sibling replica.
 
-    A server rollout closes the old pod's host and runner tunnels; both
-    reconnect to a new pod within seconds, and the replica they land on stamps
-    ``runner_last_seen`` in the shared store. A message that races onto a
-    *different* new pod finds no local tunnel and, past the connect grace,
-    would record a ``runner_failed_to_start`` turn even though the runner is
-    healthy on the sibling pod. A fresh re-read of the bound runner's stamp
-    distinguishes that case: a stamp still within the liveness TTL that this
-    process never wrote is a sibling replica's live tunnel, so raise
-    ``WRONG_REPLICA`` to make the client re-address instead of failing the turn.
-
-    The host-level :func:`_raise_if_runner_on_another_replica` can miss this
-    window because the host's own liveness has not re-settled when the message
-    lands; the runner stamp settles first.
-
-    The re-read confirms the row is still bound to *runner_id* before trusting
-    its stamp: a concurrent relaunch can rebind the row to a new runner without
-    clearing the old stamp, and that retained stamp must not be read as the old
-    runner being live elsewhere (mirrors the ``runner_id`` guard in
-    :func:`_runner_live_on_another_replica_from_conversations`).
+    Re-reads runner liveness after the connect waits and raises ``WRONG_REPLICA``
+    only when the row's binding is unchanged and its ``runner_last_seen`` is
+    fresh and newer than this process's own last write — i.e. a sibling replica
+    the runner reconnected to during a rollout. The host-level
+    :func:`_raise_if_runner_on_another_replica` can miss this window because the
+    host's liveness has not re-settled when the message lands; the runner stamp
+    settles first.
 
     Bounded worst case: if the replica that held the tunnel died ungracefully
     (no ``clear_runner_liveness``) and the runner did not reconnect anywhere,
