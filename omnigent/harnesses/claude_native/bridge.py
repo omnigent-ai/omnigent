@@ -54,19 +54,20 @@ import time
 import urllib.parse
 from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
 from contextvars import ContextVar
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
 from datetime import datetime
 from http import HTTPStatus
 from http.client import HTTPConnection, HTTPException
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, NamedTuple, TypedDict, TypeVar, cast
+from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar, cast
 from urllib import request
 
 from filelock import FileLock
 from filelock import Timeout as FileLockTimeout
 
 from omnigent._platform import IS_WINDOWS, is_wsl, stable_user_id
+from omnigent.harnesses.claude_native import delivery_diagnostics
 from omnigent.harnesses.claude_native.message_display_hook import MESSAGE_DELTAS_FILE
 from omnigent.harnesses.claude_native.status import CONTEXT_RAW_FILE
 from omnigent.harnesses.diagnostics import detect_sign_in_prompt, sign_in_next_step
@@ -3950,138 +3951,9 @@ def write_tmux_target(
     _write_json_file(bridge_dir / _TMUX_FILE, payload)
 
 
-@dataclass
-class _PromptDeliveryTrace:
-    delivery_id: str
-    session_id: str | None
-    started: float
-    stage_started: float
-    stage: str = "lock_wait"
-    stage_seconds: dict[str, float] = field(default_factory=dict)
-    attempts: list[dict[str, object]] = field(default_factory=list)
-
-
-def _delivery_stage(stage: str) -> None:
-    trace = _prompt_delivery_trace.get()
-    if trace is not None:
-        now = time.monotonic()
-        trace.stage_seconds[trace.stage] = (
-            trace.stage_seconds.get(trace.stage, 0.0) + now - trace.stage_started
-        )
-        trace.stage = stage
-        trace.stage_started = now
-
-
-_prompt_delivery_trace: ContextVar[_PromptDeliveryTrace | None] = ContextVar(
-    "claude_prompt_delivery_trace", default=None
+@delivery_diagnostics.trace_delivery(
+    session_id_reader=read_active_session_id, cancelled_error=ClaudeInjectionCancelled
 )
-
-
-def _delivery_details(**attributes: object) -> None:
-    trace = _prompt_delivery_trace.get()
-    if trace is not None and trace.attempts:
-        trace.attempts[-1].update(attributes)
-
-
-def _trace_user_message_delivery(function: _InjectionFunction) -> _InjectionFunction:
-    """Collect metadata in memory; emit one summary after the injection lock is released."""
-
-    @functools.wraps(function)
-    def wrapped(bridge_dir: Path, *, content: str, **kwargs: Any) -> Any:
-        # Hooks import this module on every invocation; keep the sink lazy.
-        from omnigent.debug_logging import current_session_id, debug_event
-
-        started = time.monotonic()
-        trace = _PromptDeliveryTrace(
-            delivery_id=secrets.token_hex(8),
-            session_id=current_session_id() or read_active_session_id(bridge_dir),
-            started=started,
-            stage_started=started,
-        )
-        token = _prompt_delivery_trace.set(trace)
-        outcome = "returned"
-        error_type = None
-        try:
-            return function(bridge_dir, content=content, **kwargs)
-        except BaseException as exc:
-            outcome = "interrupted" if isinstance(exc, ClaudeInjectionCancelled) else "error"
-            error_type = type(exc).__name__
-            raise
-        finally:
-            try:
-                _delivery_stage(trace.stage)
-                last_attempt = trace.attempts[-1] if trace.attempts else {}
-                verification = last_attempt.get("verification", "not_started")
-                uncertain = any(
-                    attempt.get("verification") != "draft_absent" for attempt in trace.attempts
-                )
-                level = logging.WARNING if outcome != "returned" or uncertain else logging.INFO
-                if _logger.isEnabledFor(level):
-                    normalized = content.replace("\r\n", "\n").replace("\r", "\n")
-                    fields = {
-                        "delivery_id": trace.delivery_id,
-                        "stage": trace.stage,
-                        "attempt": len(trace.attempts),
-                        "elapsed_ms": round((time.monotonic() - trace.started) * 1000),
-                        "content_bytes": len(content.encode("utf-8")),
-                        "newline_count": normalized.count("\n"),
-                        "leading_blank_line": bool(normalized)
-                        and not normalized.split("\n", 1)[0].strip(),
-                        "outcome": outcome,
-                        "verification": verification,
-                        **last_attempt,
-                        **{
-                            f"stage_{stage}_ms": round(seconds * 1000)
-                            for stage, seconds in trace.stage_seconds.items()
-                        },
-                    }
-                    if error_type is not None:
-                        fields["error_type"] = error_type
-                    if len(trace.attempts) > 1:
-                        fields["attempts"] = json.dumps(trace.attempts)
-                    extra = debug_event(
-                        "claude_native_delivery_finished", session_id=trace.session_id
-                    )
-                    extra["attributes"] = fields
-                    _logger.log(
-                        level,
-                        "claude_native_delivery_finished %s",
-                        json.dumps(fields),
-                        extra=extra,
-                    )
-            except Exception:  # noqa: BLE001 — diagnostics must not change delivery outcomes
-                pass
-            finally:
-                _prompt_delivery_trace.reset(token)
-
-    return cast(_InjectionFunction, wrapped)
-
-
-class _DraftObservation(TypedDict):
-    capture_empty: bool
-    prompt_glyph_visible: bool
-    needle_visible_below_prompt: bool
-    pane_rows: int
-    pane_max_columns: int
-
-
-def _draft_observation(pane: str, needle: str) -> _DraftObservation:
-    """Summarize the last prompt row without retaining terminal or prompt text."""
-    lines = pane.splitlines()
-    prompt_rows = [index for index, line in enumerate(lines) if _CLAUDE_PROMPT_GLYPH in line]
-    last_prompt = prompt_rows[-1] if prompt_rows else None
-    return {
-        "capture_empty": not pane.strip(),
-        "prompt_glyph_visible": last_prompt is not None,
-        "needle_visible_below_prompt": bool(needle)
-        and last_prompt is not None
-        and needle in "\n".join(lines[last_prompt + 1 :]),
-        "pane_rows": len(lines),
-        "pane_max_columns": max((len(line) for line in lines), default=0),
-    }
-
-
-@_trace_user_message_delivery
 @_serialize_bridge_injection
 def inject_user_message(
     bridge_dir: Path,
@@ -4147,9 +4019,9 @@ def inject_user_message(
         invocation fails, or if the draft never leaves the input box
         after repeated submit Enters (message not delivered).
     """
-    _delivery_stage("waiting_for_tmux")
+    delivery_diagnostics.set_stage("waiting_for_tmux")
     info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
-    _delivery_stage("restoring_input")
+    delivery_diagnostics.set_stage("restoring_input")
     # A surface left occupying the composer swallows everything typed
     # below — and hides the input box, wedging the readiness gate — so
     # reclaim the input box before waiting on it.
@@ -4157,7 +4029,7 @@ def inject_user_message(
     # tmux.json only means the tmux session exists; Claude Code's input
     # box mounts a few seconds later. Block until the prompt renders so
     # the first message isn't typed into a still-booting TUI and dropped.
-    _delivery_stage("waiting_for_prompt")
+    delivery_diagnostics.set_stage("waiting_for_prompt")
     _wait_for_claude_prompt_ready(
         info["socket_path"],
         info["tmux_target"],
@@ -4243,15 +4115,13 @@ def _paste_and_submit(
     :raises RuntimeError: If a ``tmux`` invocation fails, or if the draft
         never leaves the input box after repeated submit Enters.
     """
-    trace = _prompt_delivery_trace.get()
-    if trace is not None:
-        trace.attempts.append({"verification": "not_started", "submit_sent": False, "retries": 0})
-    _delivery_stage("checking_pending_prompt")
+    delivery_diagnostics.start_attempt()
+    delivery_diagnostics.set_stage("checking_pending_prompt")
     if has_pending_user_prompt(bridge_dir):
         raise ClaudeUserPromptPending(
             "Answer the pending Claude question or permission request before sending a message."
         )
-    _delivery_stage("pasting")
+    delivery_diagnostics.set_stage("pasting")
     # Clear any leftover text in Claude's input field before typing.
     # After Escape-cancel, Claude Code re-populates the prompt area
     # with the previous input for re-editing. Without this clear,
@@ -4298,7 +4168,7 @@ def _paste_and_submit(
     # when the draft never becomes identifiable (e.g. whitespace-only
     # first line, custom statusline containing the glyph), fall through
     # after the timeout and submit blind, matching the old behavior.
-    _delivery_stage("waiting_for_draft")
+    delivery_diagnostics.set_stage("waiting_for_draft")
     draft_seen = False
     pane = ""
     polls = 0
@@ -4313,25 +4183,30 @@ def _paste_and_submit(
             draft_seen = True
             break
         time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
-    _delivery_details(
+    delivery_diagnostics.record_details(
         draft_seen=draft_seen,
         needle_available=bool(needle),
         draft_wait_ms=round((time.monotonic() - paste_wait_started) * 1000),
         draft_polls=polls,
         draft_empty_captures=empty_captures,
-        **{f"draft_{key}": value for key, value in _draft_observation(pane, needle).items()},
+        **{
+            f"draft_{key}": value
+            for key, value in delivery_diagnostics.draft_observation(
+                pane, needle, prompt_glyph=_CLAUDE_PROMPT_GLYPH
+            ).items()
+        },
     )
     time.sleep(_PASTE_SETTLE_S)
-    _delivery_stage("checking_pending_prompt")
+    delivery_diagnostics.set_stage("checking_pending_prompt")
     if has_pending_user_prompt(bridge_dir):
         raise ClaudeUserPromptPending(
             "Claude is waiting for an explicit answer; message not sent."
         )
-    _delivery_stage("submitting")
+    delivery_diagnostics.set_stage("submitting")
     _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
-    _delivery_details(submit_sent=True)
+    delivery_diagnostics.record_details(submit_sent=True)
     if not draft_seen:
-        _delivery_details(verification="unverified")
+        delivery_diagnostics.record_details(verification="unverified")
         # The draft was never observed, so its absence proves nothing —
         # verification would trivially "pass". Submit blind as before.
         return
@@ -4341,7 +4216,7 @@ def _paste_and_submit(
     # after the burst, so it submits). Each Enter only fires while the
     # draft is verifiably still present, so a retry can never hit an
     # empty prompt or a permission dialog of the started turn.
-    _delivery_stage("verifying_submit")
+    delivery_diagnostics.set_stage("verifying_submit")
     if _verify_submit_accepted(
         socket_path,
         tmux_target,
@@ -4353,23 +4228,6 @@ def _paste_and_submit(
     raise RuntimeError(
         f"Claude Code did not accept the submitted message within {_SUBMIT_VERIFY_TIMEOUT_S}s "
         "(the draft is still in the input box). The message was not delivered."
-    )
-
-
-def _report_submit_verification(
-    verification: str,
-    *,
-    start: float,
-    retries: int,
-    polls: int,
-    observation: _DraftObservation,
-) -> None:
-    _delivery_details(
-        verification=verification,
-        submit_wait_ms=round((time.monotonic() - start) * 1000),
-        retries=retries,
-        submit_polls=polls,
-        **{f"submit_{key}": value for key, value in observation.items()},
     )
 
 
@@ -4414,13 +4272,15 @@ def _verify_submit_accepted(
         pane = _capture_pane(socket_path, tmux_target)
         polls += 1
         if not _draft_in_input_box(pane, needle):
-            observation = _draft_observation(pane, needle)
+            observation = delivery_diagnostics.draft_observation(
+                pane, needle, prompt_glyph=_CLAUDE_PROMPT_GLYPH
+            )
             verification = (
                 "inconclusive_capture"
                 if observation["capture_empty"] or not observation["prompt_glyph_visible"]
                 else "draft_absent"
             )
-            _report_submit_verification(
+            delivery_diagnostics.record_verification(
                 verification,
                 start=start,
                 retries=retries,
@@ -4448,15 +4308,17 @@ def _verify_submit_accepted(
             _raise_if_user_prompt_pending(bridge_dir, pane)
             _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
             retries += 1
-            _delivery_details(retries=retries)
+            delivery_diagnostics.record_details(retries=retries)
             last_enter = now
             retry_interval = min(retry_interval * 2, _SUBMIT_RETRY_MAX_INTERVAL_S)
-    _report_submit_verification(
+    delivery_diagnostics.record_verification(
         "draft_still_present",
         start=start,
         retries=retries,
         polls=polls,
-        observation=_draft_observation(pane, needle),
+        observation=delivery_diagnostics.draft_observation(
+            pane, needle, prompt_glyph=_CLAUDE_PROMPT_GLYPH
+        ),
     )
     return False
 

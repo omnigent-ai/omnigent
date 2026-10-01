@@ -9,7 +9,7 @@ from types import SimpleNamespace
 import pytest
 
 from omnigent.debug_logging import current_session_id_scope, record_to_row
-from omnigent.harnesses.claude_native import bridge
+from omnigent.harnesses.claude_native import bridge, delivery_diagnostics
 
 
 @pytest.mark.parametrize(
@@ -84,6 +84,7 @@ def test_delivery_diagnostics(
         "time",
         SimpleNamespace(monotonic=lambda: elapsed, sleep=sleep, time=lambda: elapsed),
     )
+    monkeypatch.setattr(delivery_diagnostics, "time", bridge.time)
     monkeypatch.setattr(
         bridge,
         "_wait_for_tmux_info",
@@ -109,7 +110,7 @@ def test_delivery_diagnostics(
         )
 
     with (
-        caplog.at_level("INFO", logger=bridge.__name__),
+        caplog.at_level("INFO", logger=delivery_diagnostics.__name__),
         current_session_id_scope(None if scenario == "session_fallback" else "child-session"),
     ):
         if outcome == "returned":
@@ -135,7 +136,7 @@ def test_delivery_diagnostics(
     )
     expected_session = "bridge-session" if scenario == "session_fallback" else "child-session"
     assert record.session_id == expected_session
-    assert bridge._prompt_delivery_trace.get() is None
+    assert delivery_diagnostics._prompt_delivery_trace.get() is None
     row = record_to_row(record, "harness")
     assert secret not in json.dumps(row)
     assert secret not in record.getMessage()
@@ -199,18 +200,21 @@ def test_summary_logging_failure_preserves_delivery_outcome(
         log_calls += 1
         raise OSError("log destination unavailable")
 
-    @bridge._trace_user_message_delivery
+    @delivery_diagnostics.trace_delivery(
+        session_id_reader=bridge.read_active_session_id,
+        cancelled_error=bridge.ClaudeInjectionCancelled,
+    )
     def deliver(bridge_dir: Path, *, content: str) -> str:
         if delivery_fails:
             raise RuntimeError("delivery failed")
         return "delivered"
 
-    monkeypatch.setattr(bridge._logger, "log", broken_log)
-    with caplog.at_level("INFO", logger=bridge.__name__):
+    monkeypatch.setattr(delivery_diagnostics._logger, "log", broken_log)
+    with caplog.at_level("INFO", logger=delivery_diagnostics.__name__):
         if delivery_fails:
             with pytest.raises(RuntimeError, match="delivery failed"):
                 deliver(tmp_path, content="test prompt")
         else:
             assert deliver(tmp_path, content="test prompt") == "delivered"
     assert log_calls == 1
-    assert bridge._prompt_delivery_trace.get() is None
+    assert delivery_diagnostics._prompt_delivery_trace.get() is None
