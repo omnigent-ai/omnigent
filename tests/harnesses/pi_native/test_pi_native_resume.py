@@ -197,6 +197,64 @@ def test_function_output_becomes_toolresult() -> None:
     assert msg["isError"] is False
 
 
+def test_dedup_duplicate_function_output_replays_first_result_once() -> None:
+    """Two outputs for one call_id rebuild as one toolResult, keeping the first:
+    Anthropic rejects a history with two tool_result blocks for one tool_use id.
+    """
+    items = [
+        _user_item("what time is it", item_id="u1"),
+        _function_call_item(name="get_time", call_id="c1", arguments="{}", item_id="fc1"),
+        _function_output_item(call_id="c1", output="12:00 (first mirror)", item_id="fo1"),
+        _function_output_item(call_id="c1", output="12:00 (second mirror)", item_id="fo2"),
+        _assistant_item("It is 12:00.", item_id="a1"),
+    ]
+    records = pi_session_records_from_session_items(
+        items,
+        session_id="conv_abc",
+        external_session_id=_EXTERNAL_ID,
+        cwd=Path("/repo"),
+    )
+    entries = records[1:]
+    assert [e["message"]["role"] for e in entries] == [
+        "user",
+        "assistant",
+        "toolResult",
+        "assistant",
+    ]
+    results = [e["message"] for e in entries if e["message"]["role"] == "toolResult"]
+    assert [r["toolCallId"] for r in results] == ["c1"]
+    assert results[0]["content"] == [{"type": "text", "text": "12:00 (first mirror)"}]
+    # Skipping the duplicate must not leave a hole in the parent chain.
+    assert entries[0]["parentId"] is None
+    for prev, cur in itertools.pairwise(entries):
+        assert cur["parentId"] == prev["id"]
+
+
+def test_dedup_is_scoped_per_call_id() -> None:
+    """Parallel calls keep one result each; only a repeat of the same id is dropped."""
+    items = [
+        _user_item("read both files", item_id="u1"),
+        _function_call_item(name="read", call_id="c1", arguments='{"path":"a"}', item_id="fc1"),
+        _function_call_item(name="read", call_id="c2", arguments='{"path":"b"}', item_id="fc2"),
+        _function_output_item(call_id="c1", output="A", item_id="fo1"),
+        _function_output_item(call_id="c2", output="B", item_id="fo2"),
+        _function_output_item(call_id="c2", output="B (again)", item_id="fo3"),
+        _assistant_item("Read both.", item_id="a1"),
+    ]
+    records = pi_session_records_from_session_items(
+        items,
+        session_id="conv_abc",
+        external_session_id=_EXTERNAL_ID,
+        cwd=Path("/repo"),
+    )
+    results = [
+        (e["message"]["toolCallId"], e["message"]["content"][0]["text"])
+        for e in records[1:]
+        if e["message"]["role"] == "toolResult"
+    ]
+    assert results == [("c1", "A"), ("c2", "B")]
+
+
 def test_full_tool_roundtrip_chains_correctly() -> None:
     items = [
         _user_item("run ls", item_id="u1"),

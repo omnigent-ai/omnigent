@@ -466,6 +466,12 @@ docker compose up -d        # restart to apply
 Your team signs in with their existing accounts, and there are no passwords
 for you to manage. Nothing else about the app changes.
 
+Generic OIDC also supports public PKCE clients without a client secret,
+PS256-signed identity tokens, and operator-configured authorization/token/JWKS
+endpoints. See [public clients and explicit endpoints](docker/README.md#public-pkce-clients-and-explicit-endpoints)
+for configuration and security considerations. Existing client-secret login
+remains the default.
+
 > [!TIP]
 > The only outside step is creating an app with your provider (e.g. Google
 > Cloud Console, or GitHub → Settings → Developer settings) to get the client
