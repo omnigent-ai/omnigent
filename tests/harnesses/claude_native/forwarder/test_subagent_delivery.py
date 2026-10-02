@@ -21,9 +21,6 @@ from omnigent.harnesses.claude_native.bridge import (
     TranscriptRecordItems,
     record_hook_event,
 )
-from omnigent.harnesses.claude_native.forwarder import (
-    forward_claude_transcript_to_session,
-)
 from tests.harnesses.claude_native.forwarder._support import (
     _get_recorded_request,
     _seed_subagent_on_disk,
@@ -98,7 +95,7 @@ async def test_subagent_watcher_forwards_transcript_items_to_child_session(
 
     server, _thread, base_url = _start_recording_server_with_responses(response_for)
     task = asyncio.create_task(
-        forward_claude_transcript_to_session(
+        forwarder.forward_claude_transcript_to_session(
             base_url=base_url,
             headers={},
             session_id="conv_parent",

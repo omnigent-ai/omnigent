@@ -13,9 +13,6 @@ import omnigent.harnesses.claude_native.forwarder as forwarder
 from omnigent.harnesses.claude_native.bridge import (
     record_hook_event,
 )
-from omnigent.harnesses.claude_native.forwarder import (
-    forward_claude_transcript_to_session,
-)
 from tests.harnesses.claude_native.forwarder._support import (
     _CapturedRequest,
     _get_recorded_request,
@@ -57,7 +54,7 @@ async def test_forwarder_posts_compaction_in_progress_on_precompact_hook(
     )
     server, thread, base_url = _start_recording_server()
     task = asyncio.create_task(
-        forward_claude_transcript_to_session(
+        forwarder.forward_claude_transcript_to_session(
             base_url=base_url,
             headers={},
             session_id="conv_abc",
@@ -154,7 +151,7 @@ async def test_compact_refusal_in_progress_precedes_failed_same_poll(
     )
     server, thread, base_url = _start_recording_server()
     task = asyncio.create_task(
-        forward_claude_transcript_to_session(
+        forwarder.forward_claude_transcript_to_session(
             base_url=base_url,
             headers={},
             session_id="conv_abc",
@@ -225,7 +222,7 @@ async def test_forwarder_posts_compaction_completed_on_compact_session_start(
     )
     server, thread, base_url = _start_recording_server()
     task = asyncio.create_task(
-        forward_claude_transcript_to_session(
+        forwarder.forward_claude_transcript_to_session(
             base_url=base_url,
             headers={},
             session_id="conv_abc",
@@ -292,7 +289,7 @@ async def test_forwarder_does_not_post_compaction_on_non_compact_session_start(
     )
     server, thread, base_url = _start_recording_server()
     task = asyncio.create_task(
-        forward_claude_transcript_to_session(
+        forwarder.forward_claude_transcript_to_session(
             base_url=base_url,
             headers={},
             session_id="conv_abc",

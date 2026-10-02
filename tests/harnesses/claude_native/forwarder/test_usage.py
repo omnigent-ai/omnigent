@@ -585,12 +585,11 @@ async def test_forward_session_cost_backs_off_after_rate_limit(
     )
     now = {"value": 100.0}
     monkeypatch.setattr(forwarder.time, "monotonic", lambda: now["value"])
-    calls = 0
+    requests: list[httpx.Request] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
-        nonlocal calls
-        calls += 1
-        if calls == 1:
+        requests.append(request)
+        if len(requests) == 1:
             return httpx.Response(429, headers={"retry-after": "5"}, request=request)
         return httpx.Response(200, json={}, request=request)
 
@@ -607,17 +606,18 @@ async def test_forward_session_cost_backs_off_after_rate_limit(
             "cost_cache": {},
         }
         await forwarder._forward_session_cost(**kwargs)
-        assert calls == 1
+        assert len(requests) == 1
         assert dedupe.cost_retry_failures == 1
         assert dedupe.cost_retry_not_before == pytest.approx(105.0)
 
+        before_retry = requests.copy()
         await forwarder._forward_session_cost(**kwargs)
-        assert calls == 1
+        assert requests == before_retry
 
         now["value"] = 105.0
         await forwarder._forward_session_cost(**kwargs)
 
-    assert calls == 2
+    assert len(requests) == 2
     assert dedupe.cost_retry_failures == 0
     assert dedupe.cost_retry_not_before == 0.0
     assert dedupe.posted_cost == pytest.approx(0.25)

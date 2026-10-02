@@ -14,9 +14,6 @@ import omnigent.harnesses.claude_native.forwarder as forwarder
 from omnigent.harnesses.claude_native.bridge import (
     record_hook_event,
 )
-from omnigent.harnesses.claude_native.forwarder import (
-    forward_claude_transcript_to_session,
-)
 from tests.harnesses.claude_native.forwarder._support import (
     _get_recorded_request,
     _start_recording_server,
@@ -88,7 +85,7 @@ async def test_forwarder_mirrors_interrupt_marker_for_ui(tmp_path: Path) -> None
     )
     server, thread, base_url = _start_recording_server()
     task = asyncio.create_task(
-        forward_claude_transcript_to_session(
+        forwarder.forward_claude_transcript_to_session(
             base_url=base_url,
             headers={},
             session_id="conv_abc",
@@ -188,7 +185,7 @@ async def test_forwarder_posts_idle_on_stop_and_ignores_user_prompt_submit(
     )
     server, thread, base_url = _start_recording_server()
     task = asyncio.create_task(
-        forward_claude_transcript_to_session(
+        forwarder.forward_claude_transcript_to_session(
             base_url=base_url,
             headers={},
             session_id="conv_abc",
@@ -263,7 +260,7 @@ async def test_forwarder_posts_external_session_status_on_stop_failure_hook(
     )
     server, thread, base_url = _start_recording_server()
     task = asyncio.create_task(
-        forward_claude_transcript_to_session(
+        forwarder.forward_claude_transcript_to_session(
             base_url=base_url,
             headers={},
             session_id="conv_abc",
@@ -331,7 +328,7 @@ async def test_forwarder_attaches_stop_failure_reason_to_failed_edge(
     )
     server, thread, base_url = _start_recording_server()
     task = asyncio.create_task(
-        forward_claude_transcript_to_session(
+        forwarder.forward_claude_transcript_to_session(
             base_url=base_url,
             headers={},
             session_id="conv_abc",
@@ -400,7 +397,7 @@ async def test_forwarder_posts_idle_with_count_when_stop_has_background_tasks(
     )
     server, thread, base_url = _start_recording_server()
     task = asyncio.create_task(
-        forward_claude_transcript_to_session(
+        forwarder.forward_claude_transcript_to_session(
             base_url=base_url,
             headers={},
             session_id="conv_abc",
@@ -591,7 +588,7 @@ async def test_forwarder_publishes_no_status_for_assistant_output(tmp_path: Path
     )
     server, thread, base_url = _start_recording_server()
     task = asyncio.create_task(
-        forward_claude_transcript_to_session(
+        forwarder.forward_claude_transcript_to_session(
             base_url=base_url,
             headers={},
             session_id="conv_abc",

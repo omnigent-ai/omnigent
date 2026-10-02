@@ -19,10 +19,6 @@ from omnigent.harnesses.claude_native.bridge import (
     ClaudeHookRecord,
     record_hook_event,
 )
-from omnigent.harnesses.claude_native.forwarder import (
-    _is_subagent_hook_record,
-    forward_claude_transcript_to_session,
-)
 from tests.harnesses.claude_native.forwarder._support import (
     _get_recorded_request,
     _seed_subagent_on_disk,
@@ -84,7 +80,7 @@ async def test_forwarder_ignores_subagent_stop_failure_hook(
 
     server, thread, base_url = _start_recording_server()
     task = asyncio.create_task(
-        forward_claude_transcript_to_session(
+        forwarder.forward_claude_transcript_to_session(
             base_url=base_url,
             headers={},
             session_id="conv_abc",
@@ -183,7 +179,7 @@ async def test_forwarder_ignores_subagent_stop_failure_without_subagents_path(
 
     server, thread, base_url = _start_recording_server()
     task = asyncio.create_task(
-        forward_claude_transcript_to_session(
+        forwarder.forward_claude_transcript_to_session(
             base_url=base_url,
             headers={},
             session_id="conv_abc",
@@ -244,7 +240,7 @@ async def test_forwarder_parent_stop_failure_not_affected_by_background_session_
 
     server, thread, base_url = _start_recording_server()
     task = asyncio.create_task(
-        forward_claude_transcript_to_session(
+        forwarder.forward_claude_transcript_to_session(
             base_url=base_url,
             headers={},
             session_id="conv_abc",
@@ -285,12 +281,12 @@ def test_is_subagent_hook_record_rotation_race(tmp_path: Path) -> None:
         transcript_path=tmp_path / "session.jsonl",
     )
     # Both old and new ids are seen — old is still a parent id.
-    assert not _is_subagent_hook_record(
+    assert not forwarder._is_subagent_hook_record(
         record, parent_claude_session_ids={"parent-old", "parent-new"}
     )
     # Only the new id is seen — old id would be wrongly dropped without
     # the seen set.
-    assert _is_subagent_hook_record(record, parent_claude_session_ids={"parent-new"})
+    assert forwarder._is_subagent_hook_record(record, parent_claude_session_ids={"parent-new"})
 
 
 def test_is_subagent_hook_record_empty_seen_set_uses_path(tmp_path: Path) -> None:
@@ -301,7 +297,7 @@ def test_is_subagent_hook_record_empty_seen_set_uses_path(tmp_path: Path) -> Non
     parent_path = tmp_path / "session.jsonl"
 
     # Subagent path → True (path check catches it).
-    assert _is_subagent_hook_record(
+    assert forwarder._is_subagent_hook_record(
         ClaudeHookRecord(
             event_cursor=1,
             byte_offset=50,
@@ -312,7 +308,7 @@ def test_is_subagent_hook_record_empty_seen_set_uses_path(tmp_path: Path) -> Non
         parent_claude_session_ids=set(),
     )
     # Non-subagent path → False (conservative).
-    assert not _is_subagent_hook_record(
+    assert not forwarder._is_subagent_hook_record(
         ClaudeHookRecord(
             event_cursor=2,
             byte_offset=100,
@@ -323,7 +319,7 @@ def test_is_subagent_hook_record_empty_seen_set_uses_path(tmp_path: Path) -> Non
         parent_claude_session_ids=set(),
     )
     # No path → False (conservative).
-    assert not _is_subagent_hook_record(
+    assert not forwarder._is_subagent_hook_record(
         ClaudeHookRecord(
             event_cursor=3,
             byte_offset=150,
@@ -386,7 +382,7 @@ async def test_forwarder_ignores_subagent_stop_hook(
 
     server, thread, base_url = _start_recording_server()
     task = asyncio.create_task(
-        forward_claude_transcript_to_session(
+        forwarder.forward_claude_transcript_to_session(
             base_url=base_url,
             headers={},
             session_id="conv_abc",
@@ -861,7 +857,7 @@ async def test_parent_output_forwards_while_child_history_is_blocked(
 
     monkeypatch.setattr("omnigent.cli_auth.open_server_client", open_mock_client)
     task = asyncio.create_task(
-        forward_claude_transcript_to_session(
+        forwarder.forward_claude_transcript_to_session(
             base_url="http://ap",
             headers={},
             session_id="conv_parent",

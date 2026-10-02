@@ -16,9 +16,6 @@ from omnigent.harnesses.claude_native.bridge import (
     ClaudeTranscriptItem,
     record_hook_event,
 )
-from omnigent.harnesses.claude_native.forwarder import (
-    forward_claude_transcript_to_session,
-)
 from tests.harnesses.claude_native.forwarder._support import (
     _get_recorded_request,
     _start_recording_server,
@@ -158,7 +155,7 @@ async def test_forwarder_uses_auth_to_refresh_token_per_request(tmp_path: Path) 
     auth = _CountingAuth()
     server, thread, base_url = _start_recording_server()
     task = asyncio.create_task(
-        forward_claude_transcript_to_session(
+        forwarder.forward_claude_transcript_to_session(
             base_url=base_url,
             headers={},
             session_id="conv_abc",

@@ -18,9 +18,6 @@ from omnigent.harnesses.claude_native.bridge import (
     record_hook_event,
     write_active_session_id,
 )
-from omnigent.harnesses.claude_native.forwarder import (
-    forward_claude_transcript_to_session,
-)
 from tests.harnesses.claude_native.forwarder._support import (
     _get_recorded_request,
     _start_recording_server,
@@ -847,7 +844,7 @@ async def test_forwarder_mirrors_external_session_id_after_hook_event(
     )
     server, thread, base_url = _start_recording_server()
     task = asyncio.create_task(
-        forward_claude_transcript_to_session(
+        forwarder.forward_claude_transcript_to_session(
             base_url=base_url,
             headers={},
             session_id="conv_abc",
@@ -942,7 +939,7 @@ async def test_forwarder_mirrors_external_session_id_at_most_once(
     )
     server, thread, base_url = _start_recording_server()
     task = asyncio.create_task(
-        forward_claude_transcript_to_session(
+        forwarder.forward_claude_transcript_to_session(
             base_url=base_url,
             headers={},
             session_id="conv_once",
@@ -1016,7 +1013,7 @@ async def test_forwarder_does_not_mirror_when_hook_payload_lacks_session_id(
 
     server, thread, base_url = _start_recording_server()
     task = asyncio.create_task(
-        forward_claude_transcript_to_session(
+        forwarder.forward_claude_transcript_to_session(
             base_url=base_url,
             headers={},
             session_id="conv_nopatch",

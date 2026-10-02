@@ -246,7 +246,7 @@ async def test_forwarder_mirrors_tui_rename_on_first_observation(tmp_path: Path)
 
     transport = httpx.MockTransport(_handle_request)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        state = await forwarder._forward_available_items(
+        await forwarder._forward_available_items(
             client=client,
             session_id="conv_abc",
             bridge_dir=bridge_dir,

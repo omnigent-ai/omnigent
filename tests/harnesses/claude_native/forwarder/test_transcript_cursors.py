@@ -19,9 +19,6 @@ from omnigent.harnesses.claude_native.bridge import (
     TranscriptReadResult,
     record_hook_event,
 )
-from omnigent.harnesses.claude_native.forwarder import (
-    forward_claude_transcript_to_session,
-)
 from tests.harnesses.claude_native.forwarder._support import (
     _get_recorded_item_request,
     _get_recorded_request,
@@ -106,7 +103,7 @@ async def test_forwarder_start_at_end_uses_byte_offset_for_new_lines(
 
     server, thread, base_url = _start_recording_server()
     task = asyncio.create_task(
-        forward_claude_transcript_to_session(
+        forwarder.forward_claude_transcript_to_session(
             base_url=base_url,
             headers={},
             session_id="conv_abc",
@@ -195,7 +192,7 @@ async def test_forwarder_migrates_line_cursor_state_to_byte_offset(tmp_path: Pat
 
     server, thread, base_url = _start_recording_server()
     task = asyncio.create_task(
-        forward_claude_transcript_to_session(
+        forwarder.forward_claude_transcript_to_session(
             base_url=base_url,
             headers={},
             session_id="conv_abc",
@@ -256,7 +253,7 @@ async def test_forwarder_waits_for_missing_fresh_transcript_without_warning(
 
     server, thread, base_url = _start_recording_server()
     task = asyncio.create_task(
-        forward_claude_transcript_to_session(
+        forwarder.forward_claude_transcript_to_session(
             base_url=base_url,
             headers={},
             session_id="conv_fresh",
@@ -835,7 +832,7 @@ async def test_forwarder_skips_to_end_on_stale_byte_cursor_state(tmp_path: Path)
 
     server, thread, base_url = _start_recording_server()
     task = asyncio.create_task(
-        forward_claude_transcript_to_session(
+        forwarder.forward_claude_transcript_to_session(
             base_url=base_url,
             headers={},
             session_id="conv_abc",
@@ -945,7 +942,7 @@ async def test_forwarder_skips_to_end_on_out_of_range_byte_cursor_without_finger
 
     server, thread, base_url = _start_recording_server()
     task = asyncio.create_task(
-        forward_claude_transcript_to_session(
+        forwarder.forward_claude_transcript_to_session(
             base_url=base_url,
             headers={},
             session_id="conv_abc",
@@ -1091,7 +1088,7 @@ async def test_forwarder_does_not_replay_after_compaction(tmp_path: Path) -> Non
 
     server, thread, base_url = _start_recording_server()
     task = asyncio.create_task(
-        forward_claude_transcript_to_session(
+        forwarder.forward_claude_transcript_to_session(
             base_url=base_url,
             headers={},
             session_id="conv_compaction_test",
@@ -1194,7 +1191,7 @@ async def test_forwarder_migrates_hook_cursor_state_to_byte_offset(tmp_path: Pat
 
     server, thread, base_url = _start_recording_server()
     task = asyncio.create_task(
-        forward_claude_transcript_to_session(
+        forwarder.forward_claude_transcript_to_session(
             base_url=base_url,
             headers={},
             session_id="conv_abc",

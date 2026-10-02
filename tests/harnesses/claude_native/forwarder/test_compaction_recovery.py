@@ -15,19 +15,6 @@ from omnigent.harnesses.claude_native.bridge import (
     ClaudeTranscriptItem,
     record_hook_event,
 )
-from omnigent.harnesses.claude_native.forwarder import (
-    CompactionForwardState,
-    _claim_standalone_completion,
-    _consume_pending_compaction,
-    _handle_compact_summary_item,
-    _note_precompact,
-    _persist_native_compaction_item,
-    _PostRetryTracker,
-    _prescan_precompact_edges,
-    _read_compaction_state,
-    _reset_compaction_skip_stats,
-    forward_claude_transcript_to_session,
-)
 from tests.harnesses.claude_native.forwarder._support import (
     _get_recorded_request,
     _start_recording_server,
@@ -77,7 +64,7 @@ async def test_persist_native_compaction_item_posts_compaction_event(tmp_path: P
             return_value=[fake_msg],
         ),
     ):
-        await _persist_native_compaction_item(
+        await forwarder._persist_native_compaction_item(
             client, session_id="conv_test", bridge_dir=bridge_dir
         )
 
@@ -129,7 +116,7 @@ async def test_persist_native_compaction_item_empty_items_uses_fallback(tmp_path
             return_value=None,
         ),
     ):
-        await _persist_native_compaction_item(
+        await forwarder._persist_native_compaction_item(
             client, session_id="conv_empty", bridge_dir=bridge_dir
         )
 
@@ -190,7 +177,7 @@ async def test_compaction_completed_triggers_persist(tmp_path: Path) -> None:
         persist_mock,
     ):
         task = asyncio.create_task(
-            forward_claude_transcript_to_session(
+            forwarder.forward_claude_transcript_to_session(
                 base_url=base_url,
                 headers={},
                 session_id="conv_persist",
@@ -264,7 +251,7 @@ async def test_compaction_in_progress_does_not_persist(tmp_path: Path) -> None:
         persist_mock,
     ):
         task = asyncio.create_task(
-            forward_claude_transcript_to_session(
+            forwarder.forward_claude_transcript_to_session(
                 base_url=base_url,
                 headers={},
                 session_id="conv_no_persist",
@@ -335,7 +322,7 @@ async def test_missing_compact_session_start_still_persists_from_transcript(
     """
     bridge_dir = tmp_path / "bridge"
     bridge_dir.mkdir()
-    await _note_precompact(
+    await forwarder._note_precompact(
         bridge_dir, claude_session_id="claude-1", transcript_path="/t/session.jsonl"
     )
 
@@ -343,12 +330,12 @@ async def test_missing_compact_session_start_still_persists_from_transcript(
     with patch(
         "omnigent.harnesses.claude_native.forwarder._persist_native_compaction_item", persist
     ):
-        handled = await _handle_compact_summary_item(
+        handled = await forwarder._handle_compact_summary_item(
             AsyncMock(),
             session_id="conv_missing_hook",
             bridge_dir=bridge_dir,
             item=_compact_summary_item("the summary"),
-            retry_tracker=_PostRetryTracker(),
+            retry_tracker=forwarder._PostRetryTracker(),
         )
 
     assert handled is True
@@ -356,7 +343,7 @@ async def test_missing_compact_session_start_still_persists_from_transcript(
     assert persist.call_args[1]["session_id"] == "conv_missing_hook"
     assert persist.call_args[1]["summary_override"] == "the summary"
     # Boundary marked persisted; pending cleared.
-    state = _read_compaction_state(bridge_dir)
+    state = forwarder._read_compaction_state(bridge_dir)
     assert state.pending is None
     assert 1 in state.persisted_seqs
 
@@ -373,24 +360,26 @@ async def test_normal_hook_after_transcript_does_not_double_persist(tmp_path: Pa
     """
     bridge_dir = tmp_path / "bridge"
     bridge_dir.mkdir()
-    await _note_precompact(bridge_dir, claude_session_id="claude-1", transcript_path=None)
+    await forwarder._note_precompact(
+        bridge_dir, claude_session_id="claude-1", transcript_path=None
+    )
 
     persist = _persist_mock()
     with patch(
         "omnigent.harnesses.claude_native.forwarder._persist_native_compaction_item", persist
     ):
         # Transcript path persists first.
-        await _handle_compact_summary_item(
+        await forwarder._handle_compact_summary_item(
             AsyncMock(),
             session_id="conv_dedupe",
             bridge_dir=bridge_dir,
             item=_compact_summary_item(),
-            retry_tracker=_PostRetryTracker(),
+            retry_tracker=forwarder._PostRetryTracker(),
         )
     assert persist.call_count == 1
 
     # Hook path arrives later — the token is already consumed.
-    seq = await _consume_pending_compaction(
+    seq = await forwarder._consume_pending_compaction(
         bridge_dir, claude_session_id="claude-1", transcript_path=None
     )
     assert seq is None
@@ -408,7 +397,9 @@ async def test_failed_boundary_post_is_retried_not_consumed(tmp_path: Path) -> N
     """
     bridge_dir = tmp_path / "bridge"
     bridge_dir.mkdir()
-    await _note_precompact(bridge_dir, claude_session_id="claude-1", transcript_path=None)
+    await forwarder._note_precompact(
+        bridge_dir, claude_session_id="claude-1", transcript_path=None
+    )
 
     # A definitively-permanent 400 (not an ambiguous/network failure).
     request = httpx.Request("POST", "http://x/events")
@@ -420,16 +411,16 @@ async def test_failed_boundary_post_is_retried_not_consumed(tmp_path: Path) -> N
     with patch(
         "omnigent.harnesses.claude_native.forwarder._persist_native_compaction_item", failing
     ):
-        handled = await _handle_compact_summary_item(
+        handled = await forwarder._handle_compact_summary_item(
             AsyncMock(),
             session_id="conv_retry",
             bridge_dir=bridge_dir,
             item=_compact_summary_item(),
-            retry_tracker=_PostRetryTracker(),
+            retry_tracker=forwarder._PostRetryTracker(),
         )
 
     assert handled is False
-    state = _read_compaction_state(bridge_dir)
+    state = forwarder._read_compaction_state(bridge_dir)
     # Pending still set, nothing persisted — the summary will be retried.
     assert state.pending is not None
     assert state.pending.seq == 1
@@ -451,15 +442,10 @@ async def test_restart_reattach_does_not_repersist_completed_boundary(tmp_path: 
     # Durable state as it would exist after a completed compaction: seq 1
     # persisted, but a stale pending token for the same seq lingers (e.g.
     # crash between POST success and mark). The persisted set must win.
-    from omnigent.harnesses.claude_native.forwarder import (
-        _PendingCompaction,
-        _write_compaction_state,
-    )
-
-    _write_compaction_state(
+    forwarder._write_compaction_state(
         bridge_dir,
-        CompactionForwardState(
-            pending=_PendingCompaction(seq=1, claude_session_id="claude-1"),
+        forwarder.CompactionForwardState(
+            pending=forwarder._PendingCompaction(seq=1, claude_session_id="claude-1"),
             last_seq=1,
             persisted_seqs=(1,),
         ),
@@ -469,12 +455,12 @@ async def test_restart_reattach_does_not_repersist_completed_boundary(tmp_path: 
     with patch(
         "omnigent.harnesses.claude_native.forwarder._persist_native_compaction_item", persist
     ):
-        handled = await _handle_compact_summary_item(
+        handled = await forwarder._handle_compact_summary_item(
             AsyncMock(),
             session_id="conv_restart",
             bridge_dir=bridge_dir,
             item=_compact_summary_item(),
-            retry_tracker=_PostRetryTracker(),
+            retry_tracker=forwarder._PostRetryTracker(),
         )
 
     assert handled is True
@@ -497,26 +483,30 @@ async def test_repeated_compactions_persist_distinct_boundaries(tmp_path: Path) 
         "omnigent.harnesses.claude_native.forwarder._persist_native_compaction_item", persist
     ):
         # First compaction.
-        await _note_precompact(bridge_dir, claude_session_id="claude-1", transcript_path=None)
-        await _handle_compact_summary_item(
+        await forwarder._note_precompact(
+            bridge_dir, claude_session_id="claude-1", transcript_path=None
+        )
+        await forwarder._handle_compact_summary_item(
             AsyncMock(),
             session_id="conv_repeat",
             bridge_dir=bridge_dir,
             item=_compact_summary_item("first"),
-            retry_tracker=_PostRetryTracker(),
+            retry_tracker=forwarder._PostRetryTracker(),
         )
         # Second compaction, later in the same session.
-        await _note_precompact(bridge_dir, claude_session_id="claude-1", transcript_path=None)
-        await _handle_compact_summary_item(
+        await forwarder._note_precompact(
+            bridge_dir, claude_session_id="claude-1", transcript_path=None
+        )
+        await forwarder._handle_compact_summary_item(
             AsyncMock(),
             session_id="conv_repeat",
             bridge_dir=bridge_dir,
             item=_compact_summary_item("second"),
-            retry_tracker=_PostRetryTracker(),
+            retry_tracker=forwarder._PostRetryTracker(),
         )
 
     assert persist.call_count == 2
-    state = _read_compaction_state(bridge_dir)
+    state = forwarder._read_compaction_state(bridge_dir)
     assert state.pending is None
     assert set(state.persisted_seqs) == {1, 2}
 
@@ -538,17 +528,17 @@ async def test_historical_summary_without_pending_is_skipped(tmp_path: Path) -> 
     with patch(
         "omnigent.harnesses.claude_native.forwarder._persist_native_compaction_item", persist
     ):
-        handled = await _handle_compact_summary_item(
+        handled = await forwarder._handle_compact_summary_item(
             AsyncMock(),
             session_id="conv_historical",
             bridge_dir=bridge_dir,
             item=_compact_summary_item(),
-            retry_tracker=_PostRetryTracker(),
+            retry_tracker=forwarder._PostRetryTracker(),
         )
 
     assert handled is True
     persist.assert_not_called()
-    assert _read_compaction_state(bridge_dir).persisted_seqs == ()
+    assert forwarder._read_compaction_state(bridge_dir).persisted_seqs == ()
 
 
 @pytest.mark.asyncio
@@ -563,7 +553,9 @@ async def test_ambiguous_boundary_post_marks_persisted(tmp_path: Path) -> None:
     """
     bridge_dir = tmp_path / "bridge"
     bridge_dir.mkdir()
-    await _note_precompact(bridge_dir, claude_session_id="claude-1", transcript_path=None)
+    await forwarder._note_precompact(
+        bridge_dir, claude_session_id="claude-1", transcript_path=None
+    )
 
     ambiguous = AsyncMock(side_effect=httpx.ReadError("connection dropped mid-response"))
 
@@ -576,16 +568,16 @@ async def test_ambiguous_boundary_post_marks_persisted(tmp_path: Path) -> None:
             return_value=True,
         ),
     ):
-        handled = await _handle_compact_summary_item(
+        handled = await forwarder._handle_compact_summary_item(
             AsyncMock(),
             session_id="conv_ambiguous",
             bridge_dir=bridge_dir,
             item=_compact_summary_item(),
-            retry_tracker=_PostRetryTracker(),
+            retry_tracker=forwarder._PostRetryTracker(),
         )
 
     assert handled is True
-    state = _read_compaction_state(bridge_dir)
+    state = forwarder._read_compaction_state(bridge_dir)
     assert 1 in state.persisted_seqs
     assert state.pending is None
 
@@ -616,11 +608,11 @@ async def test_precompact_and_summary_same_poll_persists_boundary(tmp_path: Path
     )
 
     # No pending token before the prescan.
-    assert _read_compaction_state(bridge_dir).pending is None
+    assert forwarder._read_compaction_state(bridge_dir).pending is None
 
     # Prescan mints the token BEFORE the transcript summary is processed.
-    await _prescan_precompact_edges(bridge_dir, hook_state)
-    state = _read_compaction_state(bridge_dir)
+    await forwarder._prescan_precompact_edges(bridge_dir, hook_state)
+    state = forwarder._read_compaction_state(bridge_dir)
     assert state.pending is not None
     assert state.pending.seq == 1
 
@@ -629,17 +621,17 @@ async def test_precompact_and_summary_same_poll_persists_boundary(tmp_path: Path
     with patch(
         "omnigent.harnesses.claude_native.forwarder._persist_native_compaction_item", persist
     ):
-        handled = await _handle_compact_summary_item(
+        handled = await forwarder._handle_compact_summary_item(
             AsyncMock(),
             session_id="conv_same_poll",
             bridge_dir=bridge_dir,
             item=_compact_summary_item("same-poll summary"),
-            retry_tracker=_PostRetryTracker(),
+            retry_tracker=forwarder._PostRetryTracker(),
         )
 
     assert handled is True
     persist.assert_called_once()
-    state = _read_compaction_state(bridge_dir)
+    state = forwarder._read_compaction_state(bridge_dir)
     assert 1 in state.persisted_seqs
     assert state.pending is None
 
@@ -665,25 +657,25 @@ async def test_prescan_is_idempotent_with_hook_phase(tmp_path: Path) -> None:
     )
 
     # Prescan mints seq 1.
-    await _prescan_precompact_edges(bridge_dir, hook_state)
-    first = _read_compaction_state(bridge_dir)
+    await forwarder._prescan_precompact_edges(bridge_dir, hook_state)
+    first = forwarder._read_compaction_state(bridge_dir)
     assert first.pending is not None and first.pending.seq == 1
     assert first.last_precompact_cursor == 1
 
     # The main hook phase would note the SAME edge (same event_cursor=1).
     # It must be a no-op: same seq, no second token.
-    await _note_precompact(
+    await forwarder._note_precompact(
         bridge_dir, claude_session_id="claude-1", transcript_path=None, event_cursor=1
     )
-    second = _read_compaction_state(bridge_dir)
+    second = forwarder._read_compaction_state(bridge_dir)
     assert second.pending is not None and second.pending.seq == 1
     assert second.last_seq == 1
 
     # A genuinely NEW PreCompact edge (higher cursor) mints the next seq.
-    await _note_precompact(
+    await forwarder._note_precompact(
         bridge_dir, claude_session_id="claude-1", transcript_path=None, event_cursor=2
     )
-    third = _read_compaction_state(bridge_dir)
+    third = forwarder._read_compaction_state(bridge_dir)
     assert third.pending is not None and third.pending.seq == 2
     assert third.last_precompact_cursor == 2
 
@@ -703,19 +695,17 @@ async def test_standalone_completion_hook_persists_without_pending(tmp_path: Pat
     bridge_dir = tmp_path / "bridge"
     bridge_dir.mkdir()
     # No _note_precompact, no persisted boundary — genuinely standalone.
-    seq = await _claim_standalone_completion(bridge_dir)
+    seq = await forwarder._claim_standalone_completion(bridge_dir)
     assert seq == 1
-    state = _read_compaction_state(bridge_dir)
+    state = forwarder._read_compaction_state(bridge_dir)
     # A pending token is installed so a later transcript summary reconciles
     # against the same sequence instead of double-persisting.
     assert state.pending is not None
     assert state.pending.seq == 1
 
     # After the caller persists and marks it done, the boundary is recorded.
-    from omnigent.harnesses.claude_native.forwarder import _mark_compaction_persisted
-
-    await _mark_compaction_persisted(bridge_dir, seq)
-    final = _read_compaction_state(bridge_dir)
+    await forwarder._mark_compaction_persisted(bridge_dir, seq)
+    final = forwarder._read_compaction_state(bridge_dir)
     assert 1 in final.persisted_seqs
     assert final.pending is None
 
@@ -734,32 +724,34 @@ async def test_completion_hook_after_transcript_persist_is_absorbed(tmp_path: Pa
     """
     bridge_dir = tmp_path / "bridge"
     bridge_dir.mkdir()
-    await _note_precompact(bridge_dir, claude_session_id="claude-1", transcript_path=None)
+    await forwarder._note_precompact(
+        bridge_dir, claude_session_id="claude-1", transcript_path=None
+    )
 
     persist = _persist_mock()
     with patch(
         "omnigent.harnesses.claude_native.forwarder._persist_native_compaction_item", persist
     ):
         # Transcript path persists the boundary; arms expect_completion_ack.
-        await _handle_compact_summary_item(
+        await forwarder._handle_compact_summary_item(
             AsyncMock(),
             session_id="conv_absorb",
             bridge_dir=bridge_dir,
             item=_compact_summary_item(),
-            retry_tracker=_PostRetryTracker(),
+            retry_tracker=forwarder._PostRetryTracker(),
         )
     assert persist.call_count == 1
-    armed = _read_compaction_state(bridge_dir)
+    armed = forwarder._read_compaction_state(bridge_dir)
     assert armed.expect_completion_ack is True
 
     # The trailing completion hook finds no pending token and is absorbed.
-    seq = await _consume_pending_compaction(
+    seq = await forwarder._consume_pending_compaction(
         bridge_dir, claude_session_id="claude-1", transcript_path=None
     )
     assert seq is None
-    seq = await _claim_standalone_completion(bridge_dir)
+    seq = await forwarder._claim_standalone_completion(bridge_dir)
     assert seq is None  # absorbed, NOT a new standalone boundary
-    after = _read_compaction_state(bridge_dir)
+    after = forwarder._read_compaction_state(bridge_dir)
     assert after.expect_completion_ack is False
     assert after.persisted_seqs == (1,)  # still exactly one boundary
 
@@ -775,7 +767,7 @@ async def test_precompact_miss_is_counted_and_warned(tmp_path: Path) -> None:
     that follows a persisted boundary is an expected replay/dedupe and bumps
     ``expected_skip`` instead.
     """
-    _reset_compaction_skip_stats()
+    forwarder._reset_compaction_skip_stats()
     bridge_dir = tmp_path / "bridge"
     bridge_dir.mkdir()  # no PreCompact, no persisted boundary
 
@@ -783,12 +775,12 @@ async def test_precompact_miss_is_counted_and_warned(tmp_path: Path) -> None:
     with patch(
         "omnigent.harnesses.claude_native.forwarder._persist_native_compaction_item", persist
     ):
-        handled = await _handle_compact_summary_item(
+        handled = await forwarder._handle_compact_summary_item(
             AsyncMock(),
             session_id="conv_miss",
             bridge_dir=bridge_dir,
             item=_compact_summary_item(),
-            retry_tracker=_PostRetryTracker(),
+            retry_tracker=forwarder._PostRetryTracker(),
         )
 
     assert handled is True
@@ -797,21 +789,19 @@ async def test_precompact_miss_is_counted_and_warned(tmp_path: Path) -> None:
     assert forwarder._compaction_skip_stats.expected_skip == 0
 
     # A skip AFTER a boundary was persisted is an expected replay, not a miss.
-    from omnigent.harnesses.claude_native.forwarder import _write_compaction_state
-
-    _write_compaction_state(
+    forwarder._write_compaction_state(
         bridge_dir,
-        CompactionForwardState(pending=None, last_seq=1, persisted_seqs=(1,)),
+        forwarder.CompactionForwardState(pending=None, last_seq=1, persisted_seqs=(1,)),
     )
     with patch(
         "omnigent.harnesses.claude_native.forwarder._persist_native_compaction_item", persist
     ):
-        await _handle_compact_summary_item(
+        await forwarder._handle_compact_summary_item(
             AsyncMock(),
             session_id="conv_miss",
             bridge_dir=bridge_dir,
             item=_compact_summary_item(),
-            retry_tracker=_PostRetryTracker(),
+            retry_tracker=forwarder._PostRetryTracker(),
         )
     assert forwarder._compaction_skip_stats.precompact_miss == 1  # unchanged
     assert forwarder._compaction_skip_stats.expected_skip == 1
@@ -838,38 +828,40 @@ async def test_stale_completion_ack_does_not_swallow_a_later_boundary(
     """
     bridge_dir = tmp_path / "bridge"
     bridge_dir.mkdir()
-    await _note_precompact(bridge_dir, claude_session_id="claude-1", transcript_path=None)
+    await forwarder._note_precompact(
+        bridge_dir, claude_session_id="claude-1", transcript_path=None
+    )
 
     persist = _persist_mock()
     with patch(
         "omnigent.harnesses.claude_native.forwarder._persist_native_compaction_item", persist
     ):
         # Compaction A persists via the transcript path → arms the ack for A's seq.
-        await _handle_compact_summary_item(
+        await forwarder._handle_compact_summary_item(
             AsyncMock(),
             session_id="conv_p21",
             bridge_dir=bridge_dir,
             item=_compact_summary_item(),
-            retry_tracker=_PostRetryTracker(),
+            retry_tracker=forwarder._PostRetryTracker(),
         )
-    armed = _read_compaction_state(bridge_dir)
+    armed = forwarder._read_compaction_state(bridge_dir)
     assert armed.expect_completion_ack is True
     assert armed.expect_completion_ack_seq == 1  # bound to A's seq, not a bare bool
     assert armed.persisted_seqs == (1,)
 
     # A's own trailing completion hook arrives late and is absorbed (one-shot).
-    absorbed = await _claim_standalone_completion(bridge_dir)
+    absorbed = await forwarder._claim_standalone_completion(bridge_dir)
     assert absorbed is None
-    after_absorb = _read_compaction_state(bridge_dir)
+    after_absorb = forwarder._read_compaction_state(bridge_dir)
     assert after_absorb.expect_completion_ack is False
     assert after_absorb.expect_completion_ack_seq == 0  # window closed
 
     # Compaction B: its PreCompact was dropped too, so B arrives as a
     # standalone completion hook with NO pending token and NO armed ack. It
     # must persist a fresh boundary, not be swallowed as A's stale ack.
-    b_seq = await _claim_standalone_completion(bridge_dir)
+    b_seq = await forwarder._claim_standalone_completion(bridge_dir)
     assert b_seq == 2, "B's boundary must be persisted, not lost to a stale ack"
-    final = _read_compaction_state(bridge_dir)
+    final = forwarder._read_compaction_state(bridge_dir)
     assert final.pending is not None
     assert final.pending.seq == 2
 
@@ -889,15 +881,13 @@ async def test_completion_ack_armed_for_unpersisted_seq_biases_to_persist(
     duplicate — so the path biases to persisting a fresh boundary rather than
     silently absorbing the hook.
     """
-    from omnigent.harnesses.claude_native.forwarder import _write_compaction_state
-
     bridge_dir = tmp_path / "bridge"
     bridge_dir.mkdir()
     # Legacy/corrupt shape: flag armed but the seq it points at is not in
     # persisted_seqs (here it reads back as 0, mimicking an old state file).
-    _write_compaction_state(
+    forwarder._write_compaction_state(
         bridge_dir,
-        CompactionForwardState(
+        forwarder.CompactionForwardState(
             pending=None,
             last_seq=1,
             persisted_seqs=(),
@@ -905,9 +895,9 @@ async def test_completion_ack_armed_for_unpersisted_seq_biases_to_persist(
             expect_completion_ack_seq=0,
         ),
     )
-    seq = await _claim_standalone_completion(bridge_dir)
+    seq = await forwarder._claim_standalone_completion(bridge_dir)
     assert seq == 2, "bias-to-safe: persist rather than absorb an unprovable ack"
-    state = _read_compaction_state(bridge_dir)
+    state = forwarder._read_compaction_state(bridge_dir)
     assert state.pending is not None
     assert state.pending.seq == 2
 
@@ -958,7 +948,7 @@ async def test_standalone_hook_persist_failure_holds_cursor_for_retry(
                 session_id="conv_p22",
                 bridge_dir=bridge_dir,
                 state=state,
-                retry_tracker=_PostRetryTracker(),
+                retry_tracker=forwarder._PostRetryTracker(),
                 dedupe=forwarder._ForwardDedupeState(),
                 task_subjects={},
                 task_statuses={},
@@ -973,7 +963,7 @@ async def test_standalone_hook_persist_failure_holds_cursor_for_retry(
         after_fail = await _run_once(start_state)
     assert failing.await_count == 1
     assert after_fail.event_cursor == start_state.event_cursor  # cursor held
-    held = _read_compaction_state(bridge_dir)
+    held = forwarder._read_compaction_state(bridge_dir)
     assert held.pending is not None  # token minted, awaiting a durable persist
     assert not held.persisted_seqs  # nothing marked persisted on failure
     minted_seq = held.pending.seq
@@ -984,7 +974,7 @@ async def test_standalone_hook_persist_failure_holds_cursor_for_retry(
     with patch("omnigent.harnesses.claude_native.forwarder._persist_native_compaction_item", ok):
         after_ok = await _run_once(after_fail)
     assert ok.await_count == 1
-    persisted = _read_compaction_state(bridge_dir)
+    persisted = forwarder._read_compaction_state(bridge_dir)
     assert persisted.persisted_seqs == (minted_seq,)  # exactly one boundary
     assert persisted.pending is None
     assert after_ok.event_cursor > after_fail.event_cursor  # cursor advanced

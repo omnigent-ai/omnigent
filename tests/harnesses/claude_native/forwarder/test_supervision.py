@@ -15,9 +15,6 @@ import omnigent.harnesses.claude_native.forwarder as forwarder
 from omnigent.harnesses.claude_native.bridge import (
     record_hook_event,
 )
-from omnigent.harnesses.claude_native.forwarder import (
-    forward_claude_transcript_to_session,
-)
 from tests.harnesses.claude_native.forwarder._support import (
     _get_recorded_item_request,
     _start_recording_server,
@@ -89,7 +86,7 @@ async def test_forwarder_survives_unhandled_loop_exceptions(
 
     server, thread, base_url = _start_recording_server()
     task = asyncio.create_task(
-        forward_claude_transcript_to_session(
+        forwarder.forward_claude_transcript_to_session(
             base_url=base_url,
             headers={},
             session_id="conv_abc",
@@ -551,7 +548,7 @@ async def test_forward_loop_deadline_unsticks_a_stalled_iteration(
 
     with caplog.at_level(logging.WARNING, logger="omnigent.harnesses.claude_native.forwarder"):
         task = asyncio.create_task(
-            forward_claude_transcript_to_session(
+            forwarder.forward_claude_transcript_to_session(
                 base_url="http://127.0.0.1:9",
                 headers={},
                 session_id="conv_stall",
