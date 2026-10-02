@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { MessagesSquareIcon, TriangleAlertIcon } from "lucide-react";
 import { toast } from "sonner";
 import { useQueryClient } from "@tanstack/react-query";
@@ -361,11 +361,18 @@ function SideChatComposer({
       setAutoSend(draft);
     }
   }, [pending, childId, clearSideChatDraft]);
+  // Re-read the labels so a side chat the server just sealed turns read-only.
+  const refreshLabels = useCallback(
+    () => void queryClient.invalidateQueries({ queryKey: ["session", childId] }),
+    [queryClient, childId],
+  );
   useEffect(() => {
     if (autoSend === null || agentId === null) return;
-    void send(autoSend, agentId, undefined, { pinnedConversationId: childId });
+    void send(autoSend, agentId, undefined, { pinnedConversationId: childId }).finally(
+      refreshLabels,
+    );
     setAutoSend(null);
-  }, [autoSend, agentId, send, childId]);
+  }, [autoSend, agentId, send, childId, refreshLabels]);
 
   const ready = pending ? !starting : agentId !== null;
   const canSend = text.trim().length > 0 || (!pending && files.length > 0);
@@ -393,10 +400,7 @@ function SideChatComposer({
     setFiles([]);
     void send(trimmed, agentId, outgoing.length > 0 ? outgoing : undefined, {
       pinnedConversationId: childId,
-    }).finally(() => {
-      // Re-read the labels so a side chat the server just sealed turns read-only.
-      void queryClient.invalidateQueries({ queryKey: ["session", childId] });
-    });
+    }).finally(refreshLabels);
   };
 
   return (

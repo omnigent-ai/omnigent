@@ -11215,6 +11215,33 @@ async def _codex_side_chat_fork_sealed(conv: Conversation, conv_store: Conversat
     return parent is not None and bool(parent.runner_id) and parent.runner_id != conv.runner_id
 
 
+async def _codex_side_chat_fork_lost(
+    conv: Conversation,
+    conv_store: ConversationStore,
+    runner_router: RunnerRouter | None,
+    host_registry: HostRegistry | None,
+) -> bool:
+    """Whether a side chat's ephemeral fork is provably gone with its runner."""
+    if await _codex_side_chat_fork_sealed(conv, conv_store):
+        return True
+    from omnigent.harnesses.codex_native.side_chat import is_side_chat_child
+    from omnigent.runner.routing import routing_host_id
+
+    if not _is_codex_native_subagent(conv) or not conv.runner_id or host_registry is None:
+        return False
+    if not is_side_chat_child(conv.labels) or (
+        runner_router is not None and runner_router.runner_is_online(conv.runner_id)
+    ):
+        return False
+    host_id = await asyncio.to_thread(routing_host_id, conv, conv_store)
+    host_conn = host_registry.get(host_id) if host_id is not None else None
+    if host_conn is None:
+        return False
+    # The host owns the process: "unknown" means it is not running there either.
+    status = await _query_host_runner_status(host_conn, host_registry, conv.runner_id)
+    return status in {"dead", "unknown"}
+
+
 def _resolve_harness_impl_is_acp(conv: Conversation, agent_store: AgentStore | None) -> bool:
     """Return whether *conv* runs a generic ``acp`` harness.
 

@@ -294,6 +294,21 @@ describe("side chat sealed by the server", () => {
     expect(screen.queryByTestId("side-chat-input")).toBeNull();
   });
 
+  it("re-reads the child's labels after the opening /side send settles", async () => {
+    const invalidate = vi.spyOn(queryClient, "invalidateQueries");
+    useChatStore.setState({ sideChatDrafts: { [childId]: "why?" } });
+    renderPane(<SideChatPane childId={childId} />);
+
+    await waitFor(() =>
+      expect(send).toHaveBeenCalledWith("why?", "agent_side", undefined, {
+        pinnedConversationId: childId,
+      }),
+    );
+    await waitFor(() =>
+      expect(invalidate).toHaveBeenCalledWith({ queryKey: ["session", childId] }),
+    );
+  });
+
   it("re-reads the child's labels after a send settles", async () => {
     const invalidate = vi.spyOn(queryClient, "invalidateQueries");
     act(() => conversationRegistry.acquire(childId).setState({ sessionStatus: "idle" }));

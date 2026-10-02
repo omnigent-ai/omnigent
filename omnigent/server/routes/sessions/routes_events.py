@@ -213,7 +213,7 @@ from omnigent.server.routes._sessions.helpers import (
 from omnigent.server.routes._sessions.orchestration import (
     _best_effort_stop,
     _child_session_summaries_from_conversations,
-    _codex_side_chat_fork_sealed,
+    _codex_side_chat_fork_lost,
     _dispatch_session_event_to_runner,
     _enrich_terminal_status_with_subagent_output,
     _ensure_native_terminal_ready,
@@ -277,6 +277,8 @@ from omnigent.telemetry.request_headers import (
 )
 from omnigent.tools.client_specified import parse_client_side_tool_specs
 from omnigent.util.session_lifecycle import (
+    CLOSED_LABEL_KEY,
+    CLOSED_LABEL_VALUE,
     is_session_closed,
 )
 
@@ -1017,6 +1019,24 @@ def register_events_routes(
         ):
             raise OmnigentError(
                 "Session is closed. Start a new sub-agent session to continue.",
+                code=ErrorCode.CONFLICT,
+            )
+        if (
+            body.type == "message"
+            and body.data.get("role") == "user"
+            and await _codex_side_chat_fork_lost(
+                conv,
+                conversation_store,
+                runner_router,
+                getattr(request.app.state, "host_registry", None),
+            )
+        ):
+            # The ephemeral fork died with its runner; keep the transcript read-only.
+            await asyncio.to_thread(
+                conversation_store.set_labels, conv.id, {CLOSED_LABEL_KEY: CLOSED_LABEL_VALUE}
+            )
+            raise OmnigentError(
+                "This side chat ended when its runner restarted and can't be continued.",
                 code=ErrorCode.CONFLICT,
             )
         if (
@@ -2195,12 +2215,6 @@ def register_events_routes(
                 # For SDK/non-native sub-agents the parent runner already
                 # holds the child's state — no re-initialization needed.
                 _runner_needs_session_init = _is_native_terminal_session(conv)
-            elif await _codex_side_chat_fork_sealed(conv, conversation_store):
-                # The parent moved to a new runner; the ephemeral fork died with the old one.
-                raise OmnigentError(
-                    "This side chat ended when its runner restarted and can't be continued.",
-                    code=ErrorCode.CONFLICT,
-                )
         # Track the host's launch verdict for the unavailable response below.
         relaunched_runner_id: str | None = None
         relaunched_launch_acknowledged = False
