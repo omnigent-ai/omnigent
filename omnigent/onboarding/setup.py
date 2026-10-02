@@ -325,7 +325,16 @@ def _login_profile(cli: str, spec: ProfileSpec, console: Console) -> bool:
         console.print(f"  [yellow]cancelled {spec.name}[/yellow]")
         return False
     if result.returncode != 0:
-        console.print(f"  [red]failed (exit {result.returncode})[/red]")
+        from omnigent.onboarding.databricks_config import (
+            _oauth_callback_port_holder,
+            _oauth_port_busy_message,
+        )
+
+        holder = _oauth_callback_port_holder()
+        if holder is not None:
+            console.print(f"  [red]{_oauth_port_busy_message(holder)}[/red]")
+        else:
+            console.print(f"  [red]failed (exit {result.returncode})[/red]")
         return False
     console.print(f"  [green]✓ {spec.name}[/green]")
     time.sleep(_OAUTH_BETWEEN_LOGIN_SLEEP_SECONDS)

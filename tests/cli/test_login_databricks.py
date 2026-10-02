@@ -576,6 +576,100 @@ def test_foreign_subprocess_calls_stay_out_of_the_login_recorder(
     assert b"git version" in probe.stdout
 
 
+# ── port-busy diagnostics ────────────────────────────────────────────
+
+
+def _patch_browser_login(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    exit_code: int = 1,
+) -> None:
+    """Patch the collaborators needed to exercise _run_databricks_browser_login.
+
+    Sets up a fake ``databricks`` binary on PATH and a fake ``subprocess.run``
+    that returns *exit_code* for the ``databricks auth login`` call.
+    """
+    monkeypatch.setattr(cli_mod.shutil, "which", lambda name: f"/usr/bin/{name}")
+
+    @dataclass
+    class _Done:
+        returncode: int = exit_code
+
+    real_run = cli_mod.subprocess.run
+
+    def _fake_run(argv: list[str], **kwargs: object) -> _Done:
+        if Path(argv[0]).name == "databricks":
+            return _Done()
+        return real_run(argv, **kwargs)  # type: ignore[return-value]
+
+    monkeypatch.setattr(cli_mod.subprocess, "run", _fake_run)
+
+
+def test_run_databricks_browser_login_port_free_old_message(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When port 8020 is free the existing VPN/IP-access-list message is raised."""
+    import click
+
+    from omnigent.onboarding import databricks_config as db_cfg_mod
+
+    _patch_browser_login(monkeypatch, exit_code=1)
+    monkeypatch.setattr(db_cfg_mod, "_oauth_callback_port_holder", lambda: None)
+
+    with pytest.raises(click.ClickException) as exc_info:
+        cli_mod._run_databricks_browser_login(_WORKSPACE)
+
+    msg = exc_info.value.format_message()
+    assert "VPN" in msg or "IP access" in msg or "unreachable" in msg
+    assert "8020" not in msg
+
+
+def test_run_databricks_browser_login_port_busy_names_port(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When port 8020 is busy the ClickException names the port, pid, and process."""
+    import click
+
+    from omnigent.onboarding import databricks_config as db_cfg_mod
+    from omnigent.onboarding.databricks_config import _OAuthPortHolder
+
+    holder = _OAuthPortHolder(pid=4242, name="arca-forwarder")
+    _patch_browser_login(monkeypatch, exit_code=1)
+    monkeypatch.setattr(db_cfg_mod, "_oauth_callback_port_holder", lambda: holder)
+
+    with pytest.raises(click.ClickException) as exc_info:
+        cli_mod._run_databricks_browser_login(_WORKSPACE)
+
+    msg = exc_info.value.format_message()
+    assert "8020" in msg
+    assert "4242" in msg
+    assert "arca-forwarder" in msg
+    assert "kill 4242" in msg
+    assert "retry" in msg
+
+
+def test_run_databricks_browser_login_port_busy_unknown_holder_lsof_hint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When the holder is unknown the lsof command is shown instead of kill."""
+    import click
+
+    from omnigent.onboarding import databricks_config as db_cfg_mod
+    from omnigent.onboarding.databricks_config import _OAuthPortHolder
+
+    holder = _OAuthPortHolder(pid=None, name=None)
+    _patch_browser_login(monkeypatch, exit_code=1)
+    monkeypatch.setattr(db_cfg_mod, "_oauth_callback_port_holder", lambda: holder)
+
+    with pytest.raises(click.ClickException) as exc_info:
+        cli_mod._run_databricks_browser_login(_WORKSPACE)
+
+    msg = exc_info.value.format_message()
+    assert "8020" in msg
+    assert "lsof" in msg
+    assert "retry" in msg
+
+
 # ── ?o= workspace selector ──────────────────────────────────────────
 
 _ORG_ID = "2850744067564480"

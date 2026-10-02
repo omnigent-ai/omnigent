@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import configparser
+import contextlib
 import importlib.util
 import logging
+from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -142,3 +144,76 @@ def get_workspace_url_for_profile(profile: str) -> str | None:
             if isinstance(host, str):
                 return host.rstrip("/")
     return None
+
+
+# ── OAuth callback port diagnostics ──────────────────────────────────────────
+
+# Fixed U2M OAuth callback port. Both the Databricks CLI redirect URI and the
+# Arca/arcaterm laptop-side forwarder are pinned here, so a port fallback is not viable.
+_DATABRICKS_OAUTH_CALLBACK_PORT = 8020
+
+
+@dataclass(frozen=True)
+class _OAuthPortHolder:
+    """Process info for the process holding the Databricks OAuth callback port."""
+
+    pid: int | None
+    name: str | None
+
+
+def _oauth_callback_port_holder() -> _OAuthPortHolder | None:
+    """Return info on what holds the Databricks OAuth callback port, or None.
+
+    Binds with ``SO_REUSEADDR`` (mirrors Go's ``net.Listen``) so TIME_WAIT
+    sockets are not false-positives. Best-effort psutil lookup; returns
+    ``None`` when the port is free.
+    """
+    import errno
+    import socket as _socket
+
+    # SO_REUSEADDR avoids TIME_WAIT false-positives.
+    port_busy = False
+    with _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM) as sock:
+        sock.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
+        try:
+            sock.bind(("127.0.0.1", _DATABRICKS_OAUTH_CALLBACK_PORT))
+        except OSError as exc:
+            if exc.errno == errno.EADDRINUSE:
+                port_busy = True
+
+    if not port_busy:
+        return None
+
+    # Port is busy; best-effort holder lookup (e.g. psutil.AccessDenied without root on macOS).
+    try:
+        import psutil
+
+        for conn in psutil.net_connections(kind="tcp"):
+            if conn.status == "LISTEN" and conn.laddr.port == _DATABRICKS_OAUTH_CALLBACK_PORT:  # type: ignore[union-attr]
+                pid = conn.pid
+                proc_name: str | None = None
+                if pid is not None:
+                    with contextlib.suppress(psutil.NoSuchProcess, psutil.AccessDenied):
+                        proc_name = psutil.Process(pid).name()
+                return _OAuthPortHolder(pid=pid, name=proc_name)
+    except Exception:
+        pass
+
+    return _OAuthPortHolder(pid=None, name=None)
+
+
+def _oauth_port_busy_message(holder: _OAuthPortHolder) -> str:
+    """Return a human-readable message for a busy OAuth callback port."""
+    port = _DATABRICKS_OAUTH_CALLBACK_PORT
+    pid, name = holder.pid, holder.name
+    if pid is not None:
+        who = f"pid {pid} ({name})" if name else f"pid {pid}"
+        free_hint = f"`kill {pid}`"
+    else:
+        who = "an unknown process"
+        free_hint = f"`lsof -nP -iTCP:{port} -sTCP:LISTEN`"
+    return (
+        f"The Databricks sign-in callback needs local port {port}, "
+        f"but it is already in use by {who}. "
+        f"Stop that process ({free_hint}) and retry."
+    )

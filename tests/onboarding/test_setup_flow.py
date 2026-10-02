@@ -254,6 +254,62 @@ def test_login_profile_handles_ctrl_c(monkeypatch: pytest.MonkeyPatch) -> None:
     assert "cancelled oss" in out.getvalue()
 
 
+def test_login_profile_port_free_keeps_old_vpn_message(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When port 8020 is free the existing VPN/access-list message is shown."""
+    from omnigent.onboarding import databricks_config as db_cfg_mod
+
+    monkeypatch.setattr(subprocess, "run", _run_returning(1, []))
+    monkeypatch.setattr(db_cfg_mod, "_oauth_callback_port_holder", lambda: None)
+    console, out = _console()
+
+    assert _login_profile(_CLI, _OSS, console) is False
+    assert "failed (exit 1)" in out.getvalue()
+
+
+def test_login_profile_port_busy_prints_hint_and_returns_false(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When port 8020 is occupied _login_profile prints the hint and returns False."""
+    from omnigent.onboarding import databricks_config as db_cfg_mod
+    from omnigent.onboarding.databricks_config import _OAuthPortHolder
+
+    holder = _OAuthPortHolder(pid=9999, name="arca-forwarder")
+    monkeypatch.setattr(subprocess, "run", _run_returning(1, []))
+    monkeypatch.setattr(db_cfg_mod, "_oauth_callback_port_holder", lambda: holder)
+    console, out = _console()
+
+    assert _login_profile(_CLI, _OSS, console) is False
+
+    msg = out.getvalue()
+    assert "8020" in msg
+    assert "9999" in msg
+    assert "arca-forwarder" in msg
+    assert "kill 9999" in msg
+    assert "retry" in msg
+
+
+def test_login_profile_port_busy_unknown_holder_uses_lsof_hint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When the holder pid is unknown, lsof is suggested and False is returned."""
+    from omnigent.onboarding import databricks_config as db_cfg_mod
+    from omnigent.onboarding.databricks_config import _OAuthPortHolder
+
+    holder = _OAuthPortHolder(pid=None, name=None)
+    monkeypatch.setattr(subprocess, "run", _run_returning(1, []))
+    monkeypatch.setattr(db_cfg_mod, "_oauth_callback_port_holder", lambda: holder)
+    console, out = _console()
+
+    assert _login_profile(_CLI, _OSS, console) is False
+
+    msg = out.getvalue()
+    assert "8020" in msg
+    assert "lsof" in msg
+    assert "retry" in msg
+
+
 # ── silent aliasing ──────────────────────────────────────────
 
 

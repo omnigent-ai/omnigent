@@ -3,12 +3,17 @@
 from __future__ import annotations
 
 import configparser
+import socket
 from pathlib import Path
 from unittest.mock import patch
 
 import pytest
 
+from omnigent.onboarding import databricks_config as db_cfg_mod
 from omnigent.onboarding.databricks_config import (
+    _oauth_callback_port_holder,
+    _oauth_port_busy_message,
+    _OAuthPortHolder,
     databricks_sdk_installed,
     get_workspace_url_for_profile,
     normalize_workspace_url,
@@ -168,3 +173,101 @@ def test_normalize_workspace_url_scheme_less_input_only_strips_trailing_slash() 
     prior ``rstrip("/")`` behavior — the wizard pre-adds ``https://`` before
     calling, so a scheme is present in practice."""
     assert normalize_workspace_url("my-ws.cloud.databricks.com/") == "my-ws.cloud.databricks.com"
+
+
+# ── OAuth callback port helpers ───────────────────────────────────────────────
+
+
+def test_oauth_callback_port_holder_returns_none_when_free(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Helper returns None when the port is not in use."""
+    # Use an ephemeral port so the real 8020 state doesn't matter.
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        probe.bind(("127.0.0.1", 0))
+        free_port = probe.getsockname()[1]
+    # Redirect the module's constant to the just-released ephemeral port.
+    monkeypatch.setattr(db_cfg_mod, "_DATABRICKS_OAUTH_CALLBACK_PORT", free_port)
+    assert _oauth_callback_port_holder() is None
+
+
+def test_oauth_callback_port_holder_detects_busy_port(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Helper returns an _OAuthPortHolder when the port is occupied."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        busy_port = listener.getsockname()[1]
+        monkeypatch.setattr(db_cfg_mod, "_DATABRICKS_OAUTH_CALLBACK_PORT", busy_port)
+        result = _oauth_callback_port_holder()
+
+    assert result is not None
+    assert isinstance(result, _OAuthPortHolder)
+    # psutil should identify our own process.
+    assert result.pid is not None
+
+
+def test_oauth_callback_port_holder_tolerates_psutil_access_denied(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """psutil AccessDenied during holder lookup still returns a bare _OAuthPortHolder."""
+    import psutil
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        busy_port = listener.getsockname()[1]
+        monkeypatch.setattr(db_cfg_mod, "_DATABRICKS_OAUTH_CALLBACK_PORT", busy_port)
+        monkeypatch.setattr(
+            psutil, "net_connections", lambda **kw: (_ for _ in ()).throw(psutil.AccessDenied())
+        )
+        result = _oauth_callback_port_holder()
+
+    assert result is not None
+    assert result.pid is None
+    assert result.name is None
+
+
+# ── _oauth_port_busy_message ──────────────────────────────────────────────────
+
+
+def test_oauth_port_busy_message_names_pid_and_process(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Message includes port, pid, process name, kill hint, and retry."""
+    monkeypatch.setattr(db_cfg_mod, "_DATABRICKS_OAUTH_CALLBACK_PORT", 8020)
+    holder = _OAuthPortHolder(pid=1234, name="forwarder")
+    msg = _oauth_port_busy_message(holder)
+    assert "8020" in msg
+    assert "1234" in msg
+    assert "forwarder" in msg
+    assert "kill 1234" in msg
+    assert "retry" in msg
+
+
+def test_oauth_port_busy_message_pid_without_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Message includes kill hint even when process name is unknown."""
+    monkeypatch.setattr(db_cfg_mod, "_DATABRICKS_OAUTH_CALLBACK_PORT", 8020)
+    holder = _OAuthPortHolder(pid=5678, name=None)
+    msg = _oauth_port_busy_message(holder)
+    assert "5678" in msg
+    assert "kill 5678" in msg
+    assert "retry" in msg
+
+
+def test_oauth_port_busy_message_unknown_holder_uses_lsof(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Message falls back to lsof when neither pid nor name is known."""
+    monkeypatch.setattr(db_cfg_mod, "_DATABRICKS_OAUTH_CALLBACK_PORT", 8020)
+    holder = _OAuthPortHolder(pid=None, name=None)
+    msg = _oauth_port_busy_message(holder)
+    assert "8020" in msg
+    assert "lsof" in msg
+    assert "retry" in msg
