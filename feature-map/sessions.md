@@ -114,7 +114,10 @@ plain `uv run pytest`, which starts a private server for the test.
   creates a custom-agent session, selects it as the target, and checks the
   copied transcript and bound agent. The header/custom-agent combination needs
   a manual drive: choose that target from the header's Fork dialog and check
-  that the full transcript and chosen agent survive in the new session.
+  that the full transcript and chosen agent survive in the new session. Record
+  the selection, navigation to a different session, transcript readback, and
+  the target agent returned by the session API. Repeat from a message with a
+  later turn present to distinguish message cutoff from the whole-session fork.
 - **`fork-access` (server integration, plain `uv run pytest`):**
   `tests/server/integration/test_sessions_permissions.py::test_fork_session_requires_read_access`,
   `tests/server/integration/test_sessions_permissions.py::test_fork_switch_binds_session_scoped_target_with_access`,

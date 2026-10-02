@@ -100,6 +100,15 @@ user-visible behavior. It then uses exactly these four H2 sections in order:
 - [Sessions](./sessions.md) covers the sidebar, whole-session and message forks,
   custom-agent targets, fork access checks, archive, reconnect, and resume.
 
+## Seed scope
+
+The five recipes above are the seed set. Completing this set means checking
+the listed entry points against current source and recording how to verify
+them, including explicit gaps. It does not mean that every recipe has been
+driven live or that the whole product is mapped. Keep the backlog below
+separate from a weekly correction pass; add another feature only as a separately
+scoped change.
+
 ## Not yet mapped
 
 These user-facing areas have no feature file yet, so this list is the checklist
@@ -164,9 +173,11 @@ budgets, MCP servers, sandbox providers, and smart routing.
 - **Every PR, advisory:** when a PR changes user-facing code, the Polly review
   adds a non-blocking note if the change adds or removes an entry point that the
   matching feature file does not reflect.
-- **Weekly:** Otto's feature-map upkeep job reads each feature file against the
-  source, runs its referenced tests through `verify-env`, and opens at most one
-  PR of proven corrections. It never edits product code; a real product
-  regression it finds is reported, not documented away.
+- **Weekly:** the feature-map upkeep workflow is being prepared to check the
+  seed files against source and run their referenced tests. Scheduled runs
+  start in report-only mode; opening a correction PR requires an explicit
+  apply run after validation. An incomplete or blocked pass must identify its
+  gaps and must not publish corrections. A real product regression is reported,
+  not documented away.
 - **After review:** when a reviewer says a change missed a surface, add that
   surface to the feature file in the same change.

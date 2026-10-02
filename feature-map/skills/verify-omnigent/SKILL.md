@@ -97,8 +97,11 @@ skipped variants, and unavailable credentials separately from behavior results.
 
 Everything under `$VERIFY_EVIDENCE` is the proof, one directory per feature.
 Instance logs, the database, and the mock model's recorded requests stay in
-`$VERIFY_ENV`. For each claim, record the feature file, the entry point ID, the
-command, and the resulting artifact. The proof standards are in the
+`$VERIFY_ENV`. For each claim, record the checkout commit, installed harness versions,
+feature file, entry point ID, command, and resulting artifact. Keep source
+review, component tests, real process checks, browser drives, and live provider
+checks distinct. A map contract pass verifies references and structure; it is
+not evidence that the journeys ran. The proof standards are in the
 [feature map README](../../README.md#proof-and-coverage). Mock runs prove
 Omnigent's integration with Claude and Codex, not a live vendor model.
 
