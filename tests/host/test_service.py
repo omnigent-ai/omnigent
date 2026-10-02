@@ -26,6 +26,140 @@ def _capture_runs(monkeypatch: pytest.MonkeyPatch) -> list[list[str]]:
     return calls
 
 
+def test_launchd_status_reports_target_pid_and_autostart(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "state"))
+    monkeypatch.setattr(service.platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(service.os, "getuid", lambda: 501)
+    installed = service._service_for_current_platform()
+    installed.path.parent.mkdir(parents=True)
+    installed.path.write_bytes(
+        service._launchd_payload(
+            installed,
+            command=[
+                "/opt/omnigent/bin/python",
+                "-m",
+                "omnigent.host.service_entry",
+                "--server",
+                "https://example.com",
+            ],
+            environment={},
+        )
+    )
+
+    def _run(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        if args[1] == "print":
+            return subprocess.CompletedProcess(args, 0, "state = running\n    pid = 4242\n", "")
+        assert args[1] == "print-disabled"
+        return subprocess.CompletedProcess(args, 0, '"ai.omnigent.host" => false\n', "")
+
+    monkeypatch.setattr(service.subprocess, "run", _run)
+
+    status = service.user_host_service_status()
+
+    assert status.installed is True
+    assert status.configured_target == "https://example.com"
+    assert status.executable == "/opt/omnigent/bin/python"
+    assert status.manager_state == "running"
+    assert status.manager_pid == 4242
+    assert status.enabled is True
+    assert status.definition_error is None
+
+
+def test_systemd_status_reports_failed_local_service(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / ".config"))
+    monkeypatch.setattr(service.platform, "system", lambda: "Linux")
+    installed = service._service_for_current_platform()
+    installed.path.parent.mkdir(parents=True)
+    installed.path.write_bytes(
+        service._systemd_unit(
+            command=[
+                "/opt/$tools/python",
+                "-m",
+                "omnigent.host.service_entry",
+                "--local",
+            ],
+            environment={},
+        )
+    )
+    show = "\n".join(
+        [
+            "LoadState=loaded",
+            "ActiveState=failed",
+            "SubState=failed",
+            "MainPID=0",
+            "UnitFileState=enabled",
+            "Result=exit-code",
+        ]
+    )
+    monkeypatch.setattr(
+        service.subprocess,
+        "run",
+        lambda args, **kwargs: subprocess.CompletedProcess(args, 0, show, ""),
+    )
+
+    status = service.user_host_service_status()
+
+    assert status.configured_target == "local"
+    assert status.executable == "/opt/$tools/python"
+    assert status.manager_state == "failed"
+    assert status.enabled is True
+    assert status.manager_error == "result: exit-code"
+    assert status.log == "journalctl --user -u omnigent-host.service"
+
+
+def test_service_status_degrades_on_foreign_definition(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(service.platform, "system", lambda: "Darwin")
+    path = tmp_path / "Library/LaunchAgents/ai.omnigent.host.plist"
+    path.parent.mkdir(parents=True)
+    path.write_text("not a plist")
+
+    status = service.user_host_service_status(probe_manager=False)
+
+    assert status.installed is True
+    assert status.configured_target is None
+    assert status.definition_error is not None
+
+
+def test_service_status_degrades_on_truncated_xml_plist(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(service.platform, "system", lambda: "Darwin")
+    path = tmp_path / "Library/LaunchAgents/ai.omnigent.host.plist"
+    path.parent.mkdir(parents=True)
+    path.write_bytes(
+        b'<?xml version="1.0" encoding="UTF-8"?>\n'
+        b'<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" '
+        b'"http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
+        b'<plist version="1.0"><dict><key>Label</key>'
+    )
+
+    status = service.user_host_service_status(probe_manager=False)
+
+    assert status.installed is True
+    assert status.configured_target is None
+    assert status.definition_error is not None
+
+
+def test_service_status_reports_unsupported_platform(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(service.platform, "system", lambda: "Windows")
+
+    status = service.user_host_service_status()
+
+    assert status.supported is False
+    assert status.manager_state == "unavailable"
+    assert "macOS and Linux" in (status.manager_error or "")
+
+
 def test_enable_launchd_user_service(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "state"))
