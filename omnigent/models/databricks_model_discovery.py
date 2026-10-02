@@ -32,9 +32,10 @@ _HTTP_TIMEOUT_S = 10.0
 _CATALOG_SPELLINGS: tuple[str, ...] = ("databricks-", _SYSTEM_MODEL_PREFIX)
 
 # DATABRICKS-PATCH(codex-live-model-discovery)
-#: ``gpt-5-6-sol`` → ``("gpt", "5", "6", "sol")``. Mirrors
+#: ``gpt-5-6-sol`` → ``("gpt", "5", "6", "sol")``; the minor is optional, so
+#: ``gpt-6-luna`` → ``("gpt", "6", None, "luna")``. Mirrors
 #: ``codex_model_vocabulary._GPT_ID_RE`` without reaching into its privates.
-_GPT_VERSIONED_ID_RE = re.compile(r"^(gpt|codex)-(\d+)-(\d+)(?:-([a-z0-9]+))?$")
+_GPT_VERSIONED_ID_RE = re.compile(r"^(gpt|codex)-(\d+)(?:-(\d+))?(?:-([a-z0-9]+))?$")
 
 
 def _bare_model_id(model_id: str) -> str:
@@ -410,7 +411,7 @@ def _codex_preference_rank(model_id: str) -> tuple[int, int, int, int, str]:
     if match is None:
         return (0, 0, 0, 0, bare)
     _family, major, minor, tier = match.groups()
-    return (1, int(major), int(minor), 0 if tier else 1, tier or "")
+    return (1, int(major), int(minor or 0), 0 if tier else 1, tier or "")
 
 
 def select_servable_model(requested: str, servable: Iterable[str]) -> str | None:
