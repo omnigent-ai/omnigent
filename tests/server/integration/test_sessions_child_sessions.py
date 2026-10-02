@@ -2066,6 +2066,39 @@ async def test_side_chat_message_seals_when_its_runner_is_gone(
     assert conv_store.list_items(child["id"]).data == []
 
 
+async def test_side_chat_retry_session_seals_when_runner_is_gone(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A codex /side child's retry_session seals it read-only when no runner is reachable.
+
+    After a host restart the ephemeral fork is gone. Clicking "Resume session"
+    triggers retry_session on the child. The child has no host_id of its own so
+    ensure_runner_connected returns None. The fix seals the session and returns
+    409 so the web shows "This side chat has ended" instead of the generic error.
+    """
+    child = await _create_native_child(client, name="retry-side-chat-sealed")
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    conv_store.set_labels(child["id"], {"omnigent.codex_native.agent_nickname": "Side chat"})
+
+    async def _none(*_args: Any, **_kwargs: Any) -> None:
+        return None
+
+    monkeypatch.setattr(routes_events_module, "_get_runner_client", _none)
+
+    resp = await client.post(
+        f"/v1/sessions/{child['id']}/events",
+        json={"type": "retry_session", "data": {}},
+    )
+
+    assert resp.status_code == 409, resp.text
+    sealed = conv_store.get_conversation(child["id"])
+    assert sealed is not None
+    assert sealed.labels.get(CLOSED_LABEL_KEY) == CLOSED_LABEL_VALUE
+
+
 async def test_non_subagent_session_not_healed_via_parent(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,

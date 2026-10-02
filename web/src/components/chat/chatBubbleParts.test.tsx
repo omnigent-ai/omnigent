@@ -361,6 +361,60 @@ describe("AssistantBubble error retry", () => {
     expect(url).toBe("/v1/sessions/conv_retry/events");
     expect(JSON.parse(init.body as string)).toEqual({ type: "retry_session", data: {} });
   });
+
+  it("invalidates the session query when resume returns 409 conflict (sealed side chat)", async () => {
+    const qc = new QueryClient();
+    const invalidate = vi.spyOn(qc, "invalidateQueries");
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse(
+        {
+          error: {
+            code: "conflict",
+            message: "This side chat ended when its runner restarted and can't be continued.",
+          },
+        },
+        409,
+      ),
+    );
+    render(
+      <QueryClientProvider client={qc}>
+        <BubbleView bubble={errorBubble("required_terminal_exited")} />
+      </QueryClientProvider>,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Resume session" }));
+
+    await waitFor(() =>
+      expect(screen.getByRole("status")).toHaveTextContent(
+        "Resume session failed: This side chat ended when its runner restarted and can't be continued.",
+      ),
+    );
+    expect(invalidate).toHaveBeenCalledWith({ queryKey: ["session", "conv_retry"] });
+  });
+
+  it("still surfaces the error when resume returns 409 conflict without a provider", async () => {
+    // No QueryClientProvider — invalidation is silently skipped; error still shown.
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse(
+        {
+          error: {
+            code: "conflict",
+            message: "This side chat ended when its runner restarted and can't be continued.",
+          },
+        },
+        409,
+      ),
+    );
+    render(<BubbleView bubble={errorBubble("required_terminal_exited")} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Resume session" }));
+
+    await waitFor(() =>
+      expect(screen.getByRole("status")).toHaveTextContent(
+        "Resume session failed: This side chat ended when its runner restarted and can't be continued.",
+      ),
+    );
+  });
 });
 
 describe("UserBubble long-prompt collapse", () => {

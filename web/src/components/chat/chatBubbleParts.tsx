@@ -63,7 +63,8 @@ import {
 } from "@/lib/blocks";
 import { type Bubble, type RenderItem, bubblesEqual } from "@/lib/renderItems";
 import { getCurrentAuthorId } from "@/lib/identity";
-import { retryRateLimitedTurn, retrySession } from "@/lib/sessionsApi";
+import { QueryClientContext } from "@tanstack/react-query";
+import { ApiError, retryRateLimitedTurn, retrySession } from "@/lib/sessionsApi";
 import { useChatStore, type PendingUserMessage } from "@/store/chatStore";
 import { conversationRegistry } from "@/store/conversationRegistry";
 import { useConversationEntryState } from "@/hooks/useConversationEntryState";
@@ -963,6 +964,8 @@ function AssistantBubble({
   const flashing = useChatStore((s) => s.flashItemId === bubble.responseId);
   // null outside AppShell's provider (isolated tests) → hide the action.
   const forkDialog = useForkDialog();
+  // undefined outside a QueryClientProvider — safe, used only in the catch below.
+  const queryClient = useContext(QueryClientContext);
   const handleRetryError = useCallback(
     async (item: Extract<RenderItem, { kind: "error" }>) => {
       if (!conversationId) throw new Error("Session is not available");
@@ -992,12 +995,21 @@ function AssistantBubble({
         await retryRateLimitedTurn(conversationId);
         return;
       }
-      const result = await retrySession(conversationId);
-      if (!result.recovered) {
-        throw new Error("The session is already connected; no recovery was performed");
+      try {
+        const result = await retrySession(conversationId);
+        if (!result.recovered) {
+          throw new Error("The session is already connected; no recovery was performed");
+        }
+      } catch (error) {
+        // A 409 conflict means the server sealed the side chat; re-read labels
+        // so the pane flips to "ended" without a manual reload.
+        if (error instanceof ApiError && error.code === "conflict") {
+          void queryClient?.invalidateQueries({ queryKey: ["session", conversationId] });
+        }
+        throw error;
       }
     },
-    [conversationId, scopedConversationId, isLastAssistant],
+    [conversationId, scopedConversationId, isLastAssistant, queryClient],
   );
 
   if (bubble.items.length === 0) return null;

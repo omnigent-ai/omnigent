@@ -497,6 +497,17 @@ async def _recover_retry_session(
             raise_host_refusal=True,
         )
         if runner_client is None:
+            if is_side_chat_child(conv.labels):
+                # The ephemeral fork lived only in that runner; seal it read-only.
+                await asyncio.to_thread(
+                    conversation_store.set_labels,
+                    session_id,
+                    {CLOSED_LABEL_KEY: CLOSED_LABEL_VALUE},
+                )
+                raise OmnigentError(
+                    "This side chat ended when its runner restarted and can't be continued.",
+                    code=ErrorCode.CONFLICT,
+                )
             raise OmnigentError(
                 "No runner is available to recover this session.",
                 code=ErrorCode.RUNNER_UNAVAILABLE,
