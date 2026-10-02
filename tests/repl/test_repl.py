@@ -1848,9 +1848,9 @@ def test_build_startup_header_creds_line_hints_first_available(tmp_path, monkeyp
         "    kind: databricks\n"
         "    profile: gtm-ws\n"
     )
-    # Hermetic: ignore a dev machine's ambient providers. A running local Ollama
-    # (TCP-probed at localhost:11434) serves openai and would outrank the
-    # Databricks fallback under test, so pin detection to none.
+    # Hermetic: ignore a dev machine's ambient providers. A running local
+    # OpenAI-compatible server (Ollama or llama-server) would serve openai and
+    # outrank the Databricks fallback under test, so pin detection to none.
     monkeypatch.setattr("omnigent.onboarding.detected.detect_providers", list)
     header = _build_startup_header(
         "claude-sdk", "Two-headed brainstorming partner.", ["anthropic", "openai"]
