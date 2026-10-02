@@ -284,7 +284,7 @@ export function SideChatPane({
             </div>
           )}
         </div>
-        <div className="shrink-0 p-3">
+        <div className="shrink-0 px-3 pt-3 pb-5">
           {readOnly ? (
             <p className="rounded-md border border-border bg-muted/40 px-3 py-2 text-center text-sm text-muted-foreground">
               This side chat has ended and can’t be continued.
