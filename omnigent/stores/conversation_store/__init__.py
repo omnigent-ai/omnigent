@@ -62,14 +62,6 @@ FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY = "omnigent.fork.source_external_session_
 # ``external_session_id`` is NULL).
 FORK_CARRY_HISTORY_LABEL_KEY = "omnigent.fork.carry_history"
 
-# Set by an in-place agent switch (``POST /v1/sessions/{id}/switch-agent``):
-# the BUILT-IN agent id the session was switched away from, so the UI can
-# offer a one-click "Switch back". A convenience pointer only — switching
-# back is a fresh re-clone of that built-in (a new session-scoped agent,
-# fresh harness), not a transactional undo. Persisted (not instance-scoped),
-# so it survives across turns and is overwritten by each subsequent switch.
-SWITCH_PREVIOUS_BUILTIN_LABEL_KEY = "omnigent.switch.previous_builtin_id"
-
 # Opt-in DANGEROUS launch directive for a codex-native session: when set to
 # ``"1"`` the runner launches Codex with
 # ``--dangerously-bypass-approvals-and-sandbox`` and puts the app-server
@@ -1865,75 +1857,6 @@ class ConversationStore(ABC):
             *source_conversation_id* exists.
         :raises ValueError: If *up_to_response_id* is set but no item in
             the source conversation has that ``response_id``.
-        """
-        ...
-
-    @abstractmethod
-    def switch_conversation_agent(
-        self,
-        conversation_id: str,
-        *,
-        new_agent_id: str,
-        new_agent_name: str,
-        new_agent_bundle_location: str,
-        new_agent_description: str | None,
-        copy_model_settings: bool,
-        carry_history_into_native: bool,
-        presentation_labels: dict[str, str],
-        previous_builtin_id: str | None,
-    ) -> Conversation:
-        """
-        Rebind a session in place to a different (cloned) agent.
-
-        Unlike :meth:`fork_conversation`, this mutates the SAME
-        conversation row — the transcript, comments, files, host,
-        and workspace are untouched; only the agent/harness changes.
-        In one transaction it: deletes the session's current
-        session-scoped agent (now unreferenced once ``agent_id`` is
-        repointed), creates a new session-scoped agent from the
-        supplied bundle, points ``agent_id`` at it, applies the
-        model-settings and label deltas below, and clears
-        ``external_session_id`` (the old harness's native runtime
-        state). The whole operation is atomic: any failure rolls back
-        and the session stays on its current agent.
-
-        The replacement agent's ``created_by`` is left unset, so it is
-        admin-only to mutate until a full switch implementation assigns
-        the session owner (the delete is also not yet reference-safe for
-        an agent shared via reuse or named sub-agents).
-
-        :param conversation_id: Session to switch, e.g.
-            ``"conv_abc123"``.
-        :param new_agent_id: Pre-generated id for the new
-            session-scoped agent, e.g. ``"ag_def456"``.
-        :param new_agent_name: Name for the new agent row, e.g.
-            ``"Codex (switch ag_def456)"``.
-        :param new_agent_bundle_location: Artifact-store key of the
-            target built-in's bundle to clone, e.g.
-            ``"ag_builtin/abcd1234"``.
-        :param new_agent_description: Optional description from the
-            target's spec. ``None`` leaves the column NULL.
-        :param copy_model_settings: When ``True``, keep the session's
-            existing ``model_override`` / ``reasoning_effort`` (the
-            switch stays in the same provider family). When ``False``,
-            both are reset to ``None`` so the new agent's defaults
-            apply (a cross-family switch — a model id is provider-bound).
-        :param carry_history_into_native: When ``True``, stamp
-            :data:`FORK_CARRY_HISTORY_LABEL_KEY` so a native target
-            rebuilds its transcript from this session's own AP items on
-            the next turn; when ``False``, that label is removed. Set by
-            the route only when the target is native AND same-family.
-        :param presentation_labels: Replace the session's
-            ``omnigent.ui`` / ``omnigent.wrapper`` labels with these so
-            the UI mode matches the TARGET harness (native →
-            ``{ui: terminal, wrapper: ...}``; SDK → ``{}`` → chat mode).
-        :param previous_builtin_id: Built-in agent id the session is
-            switching away from, stamped as
-            :data:`SWITCH_PREVIOUS_BUILTIN_LABEL_KEY` for a one-click
-            "Switch back". ``None`` leaves it unset.
-        :returns: The updated :class:`Conversation`.
-        :raises LookupError: If no conversation with *conversation_id*
-            exists.
         """
         ...
 

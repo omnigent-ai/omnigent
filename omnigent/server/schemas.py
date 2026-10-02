@@ -2683,25 +2683,6 @@ class ReadStatePutRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
-class SessionSwitchAgentRequest(BaseModel):
-    """
-    Request body for ``POST /v1/sessions/{id}/switch-agent``.
-
-    Rebinds an existing session in place to a different agent/harness,
-    keeping the same session (transcript, comments, files, workspace).
-    Unlike fork, no new session is created.
-
-    :param agent_id: Built-in agent to switch the session to, e.g.
-        ``"ag_builtin_codex"``. Must be a built-in agent (one listed by
-        ``GET /v1/agents``) and different from the session's current
-        agent.
-    """
-
-    agent_id: str
-
-    model_config = ConfigDict(extra="forbid")
-
-
 class SessionListItem(BaseModel):
     """
     Lightweight session summary for ``GET /v1/sessions`` list responses.
@@ -3331,28 +3312,19 @@ class SessionCodexApprovalModeEvent(_SSEEventBase):
 
 class SessionAgentChangedEvent(_SSEEventBase):
     """
-    Bound-agent change on a live session.
+    The session's bound agent changed.
 
-    Emitted by the switch-agent route after the session's agent binding
-    is rewritten in place. Connected clients re-derive their cached
-    session state (harness presentation labels, bound agent id/name)
-    from a fresh snapshot — the chat UI's native-vs-SDK message
-    lifecycle depends on those labels, so a stale cache drops the first
-    post-switch message (it reappears only when the transcript
-    round-trip lands).
+    Emitted after a session's MCP servers are edited (the agent's bundle
+    is rewritten). Connected clients re-derive their cached session state
+    (bound agent, harness presentation labels) from a fresh snapshot.
 
     :param type: Always ``"session.agent_changed"``.
     :param conversation_id: Session identifier, e.g. ``"conv_abc123"``.
-    :param agent_id: The session-scoped clone now bound to the session,
-        e.g. ``"ag_abc123"``.
-    :param agent_name: Display name of the agent the session now runs,
-        e.g. ``"claude-native-ui"``. Deliberately the clean target-agent
-        name — not the clone row's ``"… (switch ag_…)"`` disambiguation
-        name — because clients render it verbatim.
+    :param agent_id: The agent bound to the session, e.g. ``"ag_abc123"``.
+    :param agent_name: Display name of that agent, e.g. ``"claude-native-ui"``.
 
-    Category: **transient** (SSE-only). The switch is persisted on the
-    conversation row, so on reconnect clients read the new binding from
-    the session snapshot rather than from a replayed event.
+    Category: **transient** (SSE-only). The change is persisted, so on
+    reconnect clients read it from the session snapshot.
     """
 
     type: Literal["session.agent_changed"]

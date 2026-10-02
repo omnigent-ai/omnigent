@@ -4036,11 +4036,9 @@ function sessionBindingPatch(
  * Re-derive the agent-binding-dependent store state from a fresh session
  * snapshot, after a `session.agent_changed` SSE event.
  *
- * The switch-agent route mutates the session in place (new agent clone,
- * recomputed harness presentation labels) without a navigation, so the
- * URL-driven `switchTo`/`bindStream` path never re-runs — this is the
- * only thing that updates the store's binding state for an in-place
- * switch. Fetches through the shared `["session", id]` query key with
+ * The change happens without a navigation, so the URL-driven
+ * `switchTo`/`bindStream` path never re-runs; this is the only thing
+ * that updates the store's binding state. Fetches through the shared `["session", id]` query key with
  * `staleTime: 0` so the React-query consumers (header, pickers) get the
  * fresh snapshot too. No-op when the session changed mid-fetch or the
  * fetch fails (transient — any later rebind re-derives from scratch).
@@ -6993,8 +6991,7 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       applyToNamedConversation(event.conversationId, { viewers: event.viewers });
       return;
     case "session_agent_changed":
-      // The session's bound agent was switched in place (switch-agent
-      // route). Apply the binding the event itself carries immediately,
+      // The session's bound agent changed. Apply the binding the event itself carries immediately,
       // then re-derive the label-dependent state (most importantly
       // isNativeTerminalSession, which gates the optimistic-bubble
       // lifecycle) from a fresh snapshot — the event is the only signal

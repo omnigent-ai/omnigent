@@ -506,7 +506,6 @@ from omnigent.server.routes._sessions.helpers import (
     _require_external_status_forward as _require_external_status_forward,
     _require_host_conn_for_worktree as _require_host_conn_for_worktree,
     _require_permission_mode_forward as _require_permission_mode_forward,
-    _reset_runner_resources_after_switch_impl as _reset_runner_resources_after_switch_impl,
     _resolve_llm_model as _resolve_llm_model,
     _resolve_skill_meta_text_via_runner as _resolve_skill_meta_text_via_runner,
     _resolve_subagent_spec as _resolve_subagent_spec,
@@ -581,9 +580,6 @@ from omnigent.server.routes._sessions.helpers import (
 )
 from omnigent.server.routes._sessions.helpers import (
     _publish_sandbox_status_impl as _publish_sandbox_status,
-)
-from omnigent.server.routes._sessions.helpers import (
-    _reset_runner_resources_after_switch_impl as _reset_runner_resources_after_switch,
 )
 from omnigent.server.routes._sessions.helpers import (
     _resolve_harness_impl as _resolve_harness,
@@ -719,7 +715,6 @@ from omnigent.server.schemas import (
     SessionResourceObject,
     SessionResourcePaginatedList,
     SessionResponse,
-    SessionSwitchAgentRequest,
     SkillSummary,
     UpdateSessionRequest,
 )
@@ -768,7 +763,6 @@ if TYPE_CHECKING:
         "_presentation_labels_for_agent",
         "_publish_runner_recovered_status",
         "_publish_sandbox_status",
-        "_reset_runner_resources_after_switch",
         "_resolve_harness",
         "_same_provider_family",
         "_signal_terminal_resolved_harness_elicitation",

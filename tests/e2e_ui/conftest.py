@@ -273,10 +273,8 @@ def _build_hello_world_bundle() -> bytes:
 _HEALTH_TIMEOUT_S = 30.0
 _HEALTH_POLL_INTERVAL_S = 0.5
 
-# Switch-target built-ins for the Files-tab os_env-boundary test
-# (test_switch_agent_files_tab.py). The in-place switch dialog lists
-# BUILT-IN agents only (``session_id IS NULL`` — see
-# ``switch_session_agent``), and built-ins can only be seeded at server
+# Fork-into-another-agent target built-ins (test_fork_switch_agent.py).
+# Built-ins can only be seeded at server
 # startup via ``OMNIGENT_BUILTIN_AGENT_DIRS``, so ``live_server`` writes
 # these two specs to disk and threads them through that env var. Both run
 # the same openai-agents harness as ``hello_world`` (same provider family
