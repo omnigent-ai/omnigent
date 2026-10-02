@@ -190,7 +190,7 @@ def _run_extension_scenario(
     }
     return subprocess.run(
         ["node", str(script)],
-        cwd=Path(__file__).resolve().parents[1],
+        cwd=Path(__file__).resolve().parents[3],
         env=env,
         text=True,
         capture_output=True,

@@ -24,7 +24,7 @@ def test_delivery_cap_drops_followup_without_failed_session_status(
         pytest.skip("node is required for the pi-native extension e2e test")
 
     extension_path = (
-        Path(__file__).resolve().parents[1]
+        Path(__file__).resolve().parents[3]
         / "omnigent"
         / "resources"
         / "pi_native"
@@ -218,7 +218,7 @@ def test_message_end_posts_external_session_usage(tmp_path: Path) -> None:
     if node is None:
         pytest.skip("node is required for the pi-native extension e2e test")
     extension_path = (
-        Path(__file__).resolve().parents[1]
+        Path(__file__).resolve().parents[3]
         / "omnigent"
         / "resources"
         / "pi_native"
@@ -272,7 +272,7 @@ def test_usage_accumulates_and_dedupes_across_messages(tmp_path: Path) -> None:
     if node is None:
         pytest.skip("node is required for the pi-native extension e2e test")
     extension_path = (
-        Path(__file__).resolve().parents[1]
+        Path(__file__).resolve().parents[3]
         / "omnigent"
         / "resources"
         / "pi_native"
@@ -325,7 +325,7 @@ def test_no_usage_message_posts_nothing(tmp_path: Path) -> None:
     if node is None:
         pytest.skip("node is required for the pi-native extension e2e test")
     extension_path = (
-        Path(__file__).resolve().parents[1]
+        Path(__file__).resolve().parents[3]
         / "omnigent"
         / "resources"
         / "pi_native"
@@ -385,7 +385,7 @@ def test_distinct_messages_with_identical_usage_are_not_collapsed(
     if node is None:
         pytest.skip("node is required for the pi-native extension e2e test")
     extension_path = (
-        Path(__file__).resolve().parents[1]
+        Path(__file__).resolve().parents[3]
         / "omnigent"
         / "resources"
         / "pi_native"
@@ -447,7 +447,7 @@ def test_agent_end_dedupes_real_shaped_messages_by_timestamp(
     if node is None:
         pytest.skip("node is required for the pi-native extension e2e test")
     extension_path = (
-        Path(__file__).resolve().parents[1]
+        Path(__file__).resolve().parents[3]
         / "omnigent"
         / "resources"
         / "pi_native"
@@ -489,7 +489,7 @@ def test_agent_end_dedupes_real_shaped_messages_by_timestamp(
 
 def _extension_path() -> Path:
     return (
-        Path(__file__).resolve().parents[1]
+        Path(__file__).resolve().parents[3]
         / "omnigent"
         / "resources"
         / "pi_native"
@@ -817,7 +817,7 @@ def test_registers_omnigent_tools_and_execute_round_trips(tmp_path: Path) -> Non
         pytest.skip("node is required for the pi-native extension e2e test")
 
     extension_path = (
-        Path(__file__).resolve().parents[1]
+        Path(__file__).resolve().parents[3]
         / "omnigent"
         / "resources"
         / "pi_native"
@@ -963,7 +963,7 @@ def test_bridged_tool_call_skips_hook_policy_eval(tmp_path: Path) -> None:
         pytest.skip("node is required for the pi-native extension e2e test")
 
     extension_path = (
-        Path(__file__).resolve().parents[1]
+        Path(__file__).resolve().parents[3]
         / "omnigent"
         / "resources"
         / "pi_native"
@@ -1069,7 +1069,7 @@ def test_input_required_approve_round_trips_then_executes(tmp_path: Path) -> Non
         pytest.skip("node is required for the pi-native extension e2e test")
 
     extension_path = (
-        Path(__file__).resolve().parents[1]
+        Path(__file__).resolve().parents[3]
         / "omnigent"
         / "resources"
         / "pi_native"
@@ -1202,7 +1202,7 @@ def test_mcp_unreachable_fails_closed_without_throwing(tmp_path: Path) -> None:
         pytest.skip("node is required for the pi-native extension e2e test")
 
     extension_path = (
-        Path(__file__).resolve().parents[1]
+        Path(__file__).resolve().parents[3]
         / "omnigent"
         / "resources"
         / "pi_native"
@@ -1544,7 +1544,7 @@ def test_input_required_denied_fails_closed_not_false_success(tmp_path: Path) ->
         pytest.skip("node is required for the pi-native extension e2e test")
 
     extension_path = (
-        Path(__file__).resolve().parents[1]
+        Path(__file__).resolve().parents[3]
         / "omnigent"
         / "resources"
         / "pi_native"
@@ -1677,7 +1677,7 @@ def test_compact_payload_triggers_ctx_compact_and_brackets_spinner(
         pytest.skip("node is required for the pi-native extension e2e test")
 
     extension_path = (
-        Path(__file__).resolve().parents[1]
+        Path(__file__).resolve().parents[3]
         / "omnigent"
         / "resources"
         / "pi_native"
@@ -1930,7 +1930,7 @@ def test_compact_payload_without_ctx_compact_surfaces_error_and_consumes_file(
         pytest.skip("node is required for the pi-native extension e2e test")
 
     extension_path = (
-        Path(__file__).resolve().parents[1]
+        Path(__file__).resolve().parents[3]
         / "omnigent"
         / "resources"
         / "pi_native"
@@ -2061,7 +2061,7 @@ def test_compact_payload_synchronous_throw_dismisses_spinner(
         pytest.skip("node is required for the pi-native extension e2e test")
 
     extension_path = (
-        Path(__file__).resolve().parents[1]
+        Path(__file__).resolve().parents[3]
         / "omnigent"
         / "resources"
         / "pi_native"
@@ -2176,7 +2176,7 @@ def test_compact_payload_failure_dismisses_spinner(tmp_path: Path) -> None:
         pytest.skip("node is required for the pi-native extension e2e test")
 
     extension_path = (
-        Path(__file__).resolve().parents[1]
+        Path(__file__).resolve().parents[3]
         / "omnigent"
         / "resources"
         / "pi_native"
