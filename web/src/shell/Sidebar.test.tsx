@@ -3259,6 +3259,26 @@ describe("Sidebar view options", () => {
     ]);
   });
 
+  it("shows a managed-sandbox session's repo name from its label when Show → Repo is on", () => {
+    mockConversations([
+      conv("conv_sandbox", "Codex", {
+        status: "idle",
+        labels: { "omnigent.sandbox.repo.0": "https://github.com/omnigent-ai/omnigent#main" },
+      }),
+      conv("conv_local", "Codex", { status: "idle" }),
+    ]);
+    renderSidebar();
+
+    openViewSubmenu("session-show-menu");
+    fireEvent.click(screen.getByTestId("session-show-repo"));
+
+    const sandbox = screen.getByText("conv_sandbox").closest("li")!;
+    expect(within(sandbox).getByTestId("session-row-meta")).toHaveTextContent(/^omnigent$/);
+    // A session with no repo label omits the row entirely.
+    const local = screen.getByText("conv_local").closest("li")!;
+    expect(within(local).queryByTestId("session-row-meta")).toBeNull();
+  });
+
   it("adds the harness and on-demand repo, PR and branch to the session tooltip", async () => {
     usePullRequestInfoMock.mockReturnValue({
       data: {
@@ -3295,7 +3315,7 @@ describe("Sidebar view options", () => {
 
   it("shows the tracked PR number when gh can't resolve its state", async () => {
     // gh unauthenticated: `pr` is null, but the association carries the number.
-    useGithubInfoMock.mockReturnValue({
+    usePullRequestInfoMock.mockReturnValue({
       data: {
         object: "session.github.info",
         available: true,

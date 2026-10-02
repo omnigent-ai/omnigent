@@ -40,6 +40,7 @@ _ROWS = [
         updated_at=100,
         git_branch="fix/payment-retries",
         workspace="/tmp/sidebar-view-options",
+        labels={"omnigent.sandbox.repo.0": "https://github.com/omnigent-ai/omnigent#main"},
     ),
 ]
 
@@ -94,12 +95,14 @@ def test_status_grouping_and_show_toggles_persist_across_reload(
     idle_row = page.locator("li").filter(has=page.locator(f'a[href="/c/{_IDLE}"]'))
     expect(idle_row.get_by_test_id("session-row-meta")).to_have_count(0)
     _open_view_submenu(page, "session-show-menu")
-    # Checkbox items keep the menu open, so a second toggle needs no reopen.
+    # Checkbox items keep the menu open, so later toggles need no reopen.
     page.get_by_test_id("session-show-branch").click()
     page.get_by_test_id("session-show-environment").click()
+    page.get_by_test_id("session-show-repo").click()
     page.keyboard.press("Escape")
+    # Environment · Repo (from the sandbox label) · Branch.
     expect(idle_row.get_by_test_id("session-row-meta")).to_have_text(
-        "Local machine·fix/payment-retries"
+        "Local machine·omnigent·fix/payment-retries"
     )
 
     page.reload()
