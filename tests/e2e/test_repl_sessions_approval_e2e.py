@@ -169,9 +169,10 @@ def _clean_exit(child: Any) -> None:
     original_error = sys.exception()
     try:
         try:
-            with contextlib.suppress(pexpect.ExceptionPexpect, OSError):
-                child.sendcontrol("d")
-                child.expect(pexpect.EOF, timeout=10)
+            if child.isalive():
+                with contextlib.suppress(pexpect.ExceptionPexpect, OSError):
+                    child.sendcontrol("d")
+                    child.expect(pexpect.EOF, timeout=10)
             if child.isalive():
                 child.terminate(force=True)
         finally:
