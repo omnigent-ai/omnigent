@@ -31,7 +31,7 @@ from omnigent._wrapper_labels import (
     CURSOR_NATIVE_WRAPPER_VALUE,
     WRAPPER_LABEL_KEY,
 )
-from omnigent.runner import app as runner_app
+from omnigent.runner import subagent_work
 from omnigent.runner.tool_dispatch import execute_tool
 
 # ---------------------------------------------------------------------------
@@ -81,7 +81,7 @@ def _make_cancel_server(
     :param child_id: The child session id to intercept.
     :param events: Mutable list that receives every event body posted.
     :param stop_marks_terminal: When ``True``, the handler also calls
-        ``runner_app.mark_subagent_work_terminal`` to simulate the child
+        ``subagent_work.mark_subagent_work_terminal`` to simulate the child
         runner marking the entry cancelled on receipt of ``stop_session``.
     """
 
@@ -90,8 +90,8 @@ def _make_cancel_server(
             body = json.loads(request.content)
             events.append(body)
             if stop_marks_terminal and body.get("type") == "stop_session":
-                runner_app.mark_subagent_work_terminal(
-                    child_id, status="cancelled", output="[System: sub-agent stopped]"
+                subagent_work.mark_subagent_work_terminal(
+                    child_id, status="cancelled", output=None
                 )
             return httpx.Response(204)
         return httpx.Response(404, json={"error": str(request.url)})
@@ -119,7 +119,7 @@ async def test_cancel_active_uniform_stop_harness_sends_stop_session(
     """
     parent_id = f"conv_parent_cancel_active_{wrapper_label}"
     child_id = f"conv_child_cancel_active_{wrapper_label}"
-    runner_app.register_subagent_work(
+    subagent_work.register_subagent_work(
         parent_session_id=parent_id,
         child_session_id=child_id,
         agent="native_impl",
@@ -140,7 +140,7 @@ async def test_cancel_active_uniform_stop_harness_sends_stop_session(
                 session_async_tasks={},
             )
     finally:
-        runner_app.unregister_subagent_work(child_id)
+        subagent_work.unregister_subagent_work(child_id)
 
     result = json.loads(result_raw)
 
@@ -254,7 +254,7 @@ async def test_cancel_failed_uniform_stop_harness_sends_stop_session(
     monkeypatch.setattr("omnigent.runtime.get_terminal_registry", lambda: _LivePaneRegistry())
     parent_id = f"conv_parent_failed_{wrapper_label}"
     child_id = f"conv_child_failed_{wrapper_label}"
-    runner_app.register_subagent_work(
+    subagent_work.register_subagent_work(
         parent_session_id=parent_id,
         child_session_id=child_id,
         agent="native_impl",
@@ -262,7 +262,7 @@ async def test_cancel_failed_uniform_stop_harness_sends_stop_session(
         wrapper_label=wrapper_label,
     )
     # Transition to failed (process might still be alive).
-    runner_app.mark_subagent_work_terminal(
+    subagent_work.mark_subagent_work_terminal(
         child_id,
         status="failed",
         output="[System: native process crashed]",
@@ -282,7 +282,7 @@ async def test_cancel_failed_uniform_stop_harness_sends_stop_session(
                 session_async_tasks={},
             )
     finally:
-        runner_app.unregister_subagent_work(child_id)
+        subagent_work.unregister_subagent_work(child_id)
 
     result = json.loads(result_raw)
 
@@ -339,14 +339,14 @@ async def test_cancel_failed_live_pane_503_is_unconfirmed(
     monkeypatch.setattr("omnigent.runtime.get_terminal_registry", lambda: _LivePaneRegistry())
     parent_id = f"conv_parent_failed_503_{wrapper_label}"
     child_id = f"conv_child_failed_503_{wrapper_label}"
-    runner_app.register_subagent_work(
+    subagent_work.register_subagent_work(
         parent_session_id=parent_id,
         child_session_id=child_id,
         agent="native_impl",
         title="native-task",
         wrapper_label=wrapper_label,
     )
-    runner_app.mark_subagent_work_terminal(
+    subagent_work.mark_subagent_work_terminal(
         child_id,
         status="failed",
         output="[System: native process crashed]",
@@ -372,7 +372,7 @@ async def test_cancel_failed_live_pane_503_is_unconfirmed(
                 session_async_tasks={},
             )
     finally:
-        runner_app.unregister_subagent_work(child_id)
+        subagent_work.unregister_subagent_work(child_id)
 
     result = json.loads(result_raw)
     assert events == [{"type": "stop_session", "data": {}}]

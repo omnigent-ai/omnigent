@@ -8,6 +8,7 @@ name: Reopen Notice Test
 on:
   pull_request:
     paths:
+      - '.github/workflows/reopen-notice-test.yml'
       - .github/workflows/reopen-notice.js
       - .github/workflows/reopen-notice.test.js
   workflow_dispatch:

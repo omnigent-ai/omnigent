@@ -202,6 +202,45 @@ describe("useSessionErrors", () => {
     await waitFor(() => expect(hook.result.current).toEqual([false]));
   });
 
+  it("drops tail caches superseded by a newer updated_at", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      const { wrapper, client } = harness();
+      const hook = renderHook(({ updated_at }) => useSessionErrors([{ ...session, updated_at }]), {
+        wrapper,
+        initialProps: { updated_at: 100 },
+      });
+      for (let updated_at = 101; updated_at <= 105; updated_at++) {
+        hook.rerender({ updated_at });
+      }
+      await waitFor(() => expect(client.isFetching()).toBe(0));
+      act(() => vi.advanceTimersByTime(60_000));
+      const cached = client
+        .getQueryCache()
+        .findAll({ queryKey: ["session-latest-error", session.id] });
+      expect(cached.map((query) => query.queryKey[2])).toEqual([105]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("reuses the tail cache when the sidebar remounts within the gc window", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      fetchPage.mockResolvedValue(errorPage);
+      const { wrapper } = harness();
+      const first = renderHook(() => useSessionErrors([session]), { wrapper });
+      await waitFor(() => expect(first.result.current).toEqual([true]));
+      first.unmount();
+      act(() => vi.advanceTimersByTime(10_000));
+      const reopened = renderHook(() => useSessionErrors([session]), { wrapper });
+      expect(reopened.result.current).toEqual([true]);
+      expect(fetchPage).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("does not let an older tail request resurrect an error after a newer message", async () => {
     const old = deferredPage();
     fetchPage.mockReturnValueOnce(old.promise).mockResolvedValueOnce(normalPage);

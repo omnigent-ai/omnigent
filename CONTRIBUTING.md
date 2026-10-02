@@ -344,17 +344,21 @@ Two cross-cutting suites sit on top of these:
   reserve them for genuine end-to-end behaviour — but a PR that adds new
   user-facing functionality **must** include at least one e2e happy-path test
   (see `.github/copilot-instructions.md`).
+  Frontend-only changes follow the guidance below instead.
 
 ### Frontend (`web/`)
 
 Frontend changes follow the same expectation with a different toolchain:
 
-- Add or update a **colocated Vitest test** — a `*.test.ts`/`*.test.tsx` file
-  next to the component or module you changed — and run it with `pnpm test`.
-- A change to **user-facing UI behaviour** also needs a Playwright test under
-  `tests/e2e_ui/`. This one is enforced mechanically by the `E2E UI Required`
-  check, so a UI PR won't merge without a covering test (or a maintainer
-  waiver) — see `.github/workflows/e2e-ui-required.yml`.
+- Prefer a **colocated Vitest test** — a `*.test.ts`/`*.test.tsx` file next to
+  the component or module you changed — and run it with `pnpm test`.
+  Existing tests count when they already cover the changed behaviour; add or
+  update tests for concrete gaps.
+- Use Playwright tests under `tests/e2e_ui/` for browser behaviour or full user
+  flows that unit or component tests cannot adequately cover. Extend an existing
+  test where practical, and explain what the browser test uniquely verifies.
+  UI changes do not automatically require a new or modified E2E test. The
+  existing E2E UI suite continues to run in CI.
 - Styling/formatting-only changes, copy tweaks with no flow change, and
   refactors with no behaviour change are exempt, same as the backend.
 
@@ -385,6 +389,32 @@ request enforces this, so unsigned commits will block merging.
   "UI / frontend change" box and attach a **video or images** in the `Demo`
   section showing the new behaviour, so reviewers can see it without checking
   out the branch.
+- Under **Release notes**, choose exactly one Yes/No checkbox and keep both
+  rows. Choose Yes only for outstanding user-facing features, bug fixes, UX
+  changes, and breaking changes; write one line for users in **Changelog**.
+  Breaking changes must choose Yes and describe the compatibility impact.
+  Features behind a feature flag are eligible only once the flag is enabled for
+  users. Choose No for small fixes or improvements, features behind disabled
+  flags, and internal changes with no user impact, and delete the Changelog
+  section. The complete changelog still credits the PR using its title. This
+  records your recommendation; maintainers curate the release notes.
+
+### Database migration reviews
+
+Follow the [database best practices](docs/DATABASE_BEST_PRACTICES.md) when
+changing schemas, queries, transactions, or storage code. Polly uses this
+reference in its reviews and treats violations of mandatory requirements as
+blocking findings.
+
+Changes under `omnigent/db/migrations/`, to `omnigent/db/alembic.ini`, or to
+[`.github/CODEOWNERS`](.github/CODEOWNERS) require a GitHub approval from at
+least one of Edwin He (`@Edwinhe03`), Aravind Segu (`@aravind-segu`), Corey
+Zumar (`@dbczumar`), or Bryan Qiu (`@bbqiu`). The reviewer must be someone
+other than the PR author, including for maintainer-authored PRs.
+
+GitHub requests these reviews automatically. The `main-no-force-push` ruleset
+requires code-owner approval and dismisses stale approvals after changes are
+pushed. This requirement is enforced by GitHub alongside the CI checks.
 
 ### Every PR needs an issue
 

@@ -170,13 +170,13 @@ export function RegisterPage() {
 
   // v2: a valid invite shows the "Join your team" landing first (Accept →
   // form); a missing invite skips it. One shell across both steps so the panel
-  // isn't remounted (a fresh AnimatedOmnigentPanel re-inits its WebGL context).
+  // isn't remounted and its animation restarts between steps.
   if (loginV2) {
     const showLanding = !missingInvite && !accepted;
     return (
       <AuthCardShell panelHeight={showLanding ? 340 : undefined}>
         {showLanding ? (
-          <JoinTeamStep onAccept={() => setAccepted(true)} />
+          <JoinTeamStep onAccept={() => setAccepted(true)} serverUrl={window.location.host} />
         ) : (
           <div className="flex flex-col gap-6">{body}</div>
         )}

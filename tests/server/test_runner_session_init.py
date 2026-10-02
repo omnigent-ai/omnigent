@@ -385,3 +385,31 @@ async def test_init_logs_rejection_retry_and_cached_success_once() -> None:
     assert all(row["session_id"] == conversation.id for row in events)
     assert all(row["attributes"]["runner_id"] == conversation.runner_id for row in events)
     assert events[1]["attributes"]["status_code"] == "503"
+    # The init-started row says what the server asked the runner to do.
+    assert events[0]["attributes"]["resume_interrupted_turn"] == "False"
+    assert events[0]["attributes"]["suppress_recovery_turn"] == "False"
+    assert "recovery_id" not in events[0]["attributes"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "error",
+    [
+        ConnectionError("tunnel closed before request completed"),
+        httpx.ConnectError("runner 'runner_init' is offline"),
+    ],
+)
+async def test_init_attributes_dropped_tunnel_to_runner(error: Exception) -> None:
+    """Both shapes the tunnel transport raises for a vanished runner."""
+    from tests.debug_log_helpers import capture_debug_rows
+
+    class _DroppedTunnelClient(_Client):
+        async def post(self, _path: str, **kwargs: Any) -> httpx.Response:
+            raise error
+
+    initializer = RunnerSessionInitializer(_Registry(), server_version="test")  # type: ignore[arg-type]
+    with capture_debug_rows("server") as rows, pytest.raises(type(error)):
+        await initializer.initialize(_conversation(), _DroppedTunnelClient(), timeout=1)  # type: ignore[arg-type]
+    [failed] = [row for row in rows if row["event_name"] == "runner_session_init_failed"]
+    assert failed["attributes"]["error_category"] == "runner"
+    assert failed["attributes"]["error_impact"] == "transient"

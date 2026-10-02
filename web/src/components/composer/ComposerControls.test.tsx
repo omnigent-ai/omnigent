@@ -45,13 +45,7 @@ describe("shared composer controls", () => {
     );
 
     for (const trigger of screen.getAllByRole("button")) {
-      expect(trigger).toHaveClass(
-        "min-w-10",
-        "md:min-w-11",
-        "px-0.5",
-        "md:px-1",
-        "max-w-[calc(50%-0.25rem)]",
-      );
+      expect(trigger).toHaveClass("min-w-10", "md:min-w-11", "px-1", "max-w-[calc(50%-0.25rem)]");
       expect(trigger).not.toHaveClass("max-w-[180px]");
       expect(trigger.querySelector("span")).toHaveClass("min-w-0", "truncate");
       for (const icon of trigger.querySelectorAll("svg")) {

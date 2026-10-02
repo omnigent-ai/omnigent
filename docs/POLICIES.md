@@ -252,7 +252,7 @@ Forces a specific sandbox configuration on agent start.
 |-----------|------|---------|-------------|
 | `sandbox_type` | string | `"linux_bwrap"` | Sandbox backend (`linux_bwrap`, `darwin_seatbelt`, `none`) |
 | `allow_network` | boolean | `true` | Allow network access |
-| `write_paths` | string[] | `null` | Writable paths (null inherits agent config) |
+| `write_paths` | (string or object)[] | `null` | Writable paths; objects accept `path` and `copy_on_write` (null inherits agent config) |
 | `read_paths` | string[] | `null` | Read-only paths (null inherits agent config) |
 | `env_passthrough` | string[] | `null` | Env vars allowed through to the agent process (see below) |
 

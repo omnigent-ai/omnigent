@@ -370,6 +370,24 @@ describe("ChatHeader — conversation breadcrumb", () => {
     expect(screen.getByText("check-account-eligibility")).toBeInTheDocument();
   });
 
+  it.each([
+    ["claude-native-ui", "claude-code-native-ui", "Claude Code"],
+    ["claude-native-ui", null, "Claude Code"],
+    ["codex-native-ui", "codex-native-ui", "Codex"],
+  ] as const)("uses the product name for %s with wrapper %s", (name, wrapperLabel, displayName) => {
+    renderHeader({
+      sidebarOpen: true,
+      conversationId: "child-9",
+      isChildSession: true,
+      conversationTitle: "Fix the login bug",
+      titleLinkTo: "/c/parent-123",
+      boundAgent: { id: "a1", name },
+      wrapperLabel,
+    });
+    expect(screen.getByText(displayName)).toBeInTheDocument();
+    expect(screen.queryByText(name)).toBeNull();
+  });
+
   it("names the product, not the internal wrapper row, on a native sub-agent", () => {
     // A Claude Code Task child is bound to its parent's `claude-native-ui`
     // agent — an Omnigent internal the server hides everywhere else
@@ -587,7 +605,7 @@ describe("ChatHeader — floating mobile controls", () => {
     const trigger = screen.getByRole("button", { name: "Conversation actions" });
     expect(trigger.parentElement).not.toHaveClass("max-md:px-1", "max-md:py-1");
     expect(trigger).toHaveClass("size-10");
-    expect(toggle).toHaveClass("size-10");
+    expect(toggle).toHaveClass("size-6", "max-md:size-11");
   });
 
   it("folds the Chat/Terminal switch into the header kebab on mobile", () => {

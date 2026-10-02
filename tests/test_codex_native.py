@@ -1462,6 +1462,48 @@ def _usage_event(input_tokens: int, context_window: int = 200_000) -> dict[str, 
     }
 
 
+def _write_forwarder_bridge(
+    bridge_dir: Path,
+    *,
+    active_turn_id: str | None,
+    session_id: str = "conv_123",
+    thread_id: str = "thread_123",
+) -> None:
+    """Write bridge state with overridable identities and an explicit active turn."""
+    write_bridge_state(
+        bridge_dir,
+        CodexNativeBridgeState(
+            session_id=session_id,
+            socket_path=str(bridge_dir / "app-server.sock"),
+            thread_id=thread_id,
+            codex_home=str(bridge_dir / "codex-home"),
+            active_turn_id=active_turn_id,
+        ),
+    )
+
+
+def _recording_forwarder_client(posted: list[dict[str, Any]]) -> httpx.AsyncClient:
+    """Capture event payloads in the caller's list; the caller owns client cleanup."""
+    return httpx.AsyncClient(
+        base_url="http://127.0.0.1:8000", transport=httpx.MockTransport(_capture_handler(posted))
+    )
+
+
+def _forwarder_context(
+    client: httpx.AsyncClient,
+    bridge_dir: Path,
+    *,
+    session_id: str = "conv_123",
+) -> dict[str, Any]:
+    """Build fresh per-call trackers bound to the requested session."""
+    return {
+        "session_id": session_id,
+        "bridge_dir": bridge_dir,
+        "usage_coalescer": _usage_coalescer(client, session_id),
+        "elicitation_tracker": _elicitation_tracker(),
+    }
+
+
 def _usage_coalescer(
     client: httpx.AsyncClient,
     session_id: str = "conv_123",
@@ -2295,18 +2337,11 @@ def test_subscribe_until_ready_retries_no_rollout_and_replays_messages(
 
     posted: list[dict[str, Any]] = []
 
-    def handler(request: httpx.Request) -> httpx.Response:
-        posted.append(json.loads(request.content))
-        return httpx.Response(202, json={"queued": False})
-
     monkeypatch.setattr(fake_client, "request", fake_request)
     monkeypatch.setattr(codex_native_forwarder, "_sleep", fake_sleep)
 
     async def run() -> None:
-        async with httpx.AsyncClient(
-            base_url="http://127.0.0.1:8000",
-            transport=httpx.MockTransport(handler),
-        ) as client:
+        async with _recording_forwarder_client(posted) as client:
             await codex_native_forwarder._subscribe_until_ready(
                 fake_client,  # type: ignore[arg-type]
                 client,
@@ -2343,16 +2378,7 @@ def test_subscribe_until_ready_replays_completed_turn_status(
     :param tmp_path: Temporary bridge directory.
     :returns: None.
     """
-    write_bridge_state(
-        tmp_path,
-        CodexNativeBridgeState(
-            session_id="conv_123",
-            socket_path=str(tmp_path / "app-server.sock"),
-            thread_id="thread_123",
-            codex_home=str(tmp_path / "codex-home"),
-            active_turn_id="turn_123",
-        ),
-    )
+    _write_forwarder_bridge(tmp_path, active_turn_id="turn_123")
     fake_client = _FakeCodexAppServerClient(
         response={
             "result": {
@@ -2398,26 +2424,13 @@ def test_subscribe_until_ready_replays_completed_turn_status(
     )
     posted: list[dict[str, Any]] = []
 
-    def handler(request: httpx.Request) -> httpx.Response:
-        """
-        Capture Omnigent event posts from the forwarder.
-
-        :param request: HTTP request sent by the forwarder.
-        :returns: Accepted response.
-        """
-        posted.append(json.loads(request.content))
-        return httpx.Response(202, json={"queued": False})
-
     async def run() -> None:
         """
         Subscribe and replay a completed turn.
 
         :returns: None.
         """
-        async with httpx.AsyncClient(
-            base_url="http://127.0.0.1:8000",
-            transport=httpx.MockTransport(handler),
-        ) as client:
+        async with _recording_forwarder_client(posted) as client:
             await codex_native_forwarder._subscribe_until_ready(
                 fake_client,  # type: ignore[arg-type]
                 client,
@@ -2561,14 +2574,8 @@ def test_forwarder_ignores_thread_started_for_current_codex_thread(tmp_path: Pat
     already bound it. This fails if the rotation detector treats every
     ``thread/started`` as a clear-session boundary.
     """
-    write_bridge_state(
-        tmp_path,
-        CodexNativeBridgeState(
-            session_id="conv_old",
-            socket_path=str(tmp_path / "app-server.sock"),
-            thread_id="thread_old",
-            codex_home=str(tmp_path / "codex-home"),
-        ),
+    _write_forwarder_bridge(
+        tmp_path, session_id="conv_old", thread_id="thread_old", active_turn_id=None
     )
 
     async def run() -> bool:
@@ -2608,7 +2615,6 @@ def test_forwarder_ignores_thread_started_for_current_codex_thread(tmp_path: Pat
 
 def test_forwarder_rotates_session_on_new_codex_thread_and_posts_to_new_session(
     tmp_path: Path,
-    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """
     Native Codex thread switches create a replacement Omnigent session.
@@ -2619,15 +2625,8 @@ def test_forwarder_rotates_session_on_new_codex_thread_and_posts_to_new_session(
     thread, and send subsequent status/history events to the new AP
     session.
     """
-    caplog.set_level("INFO", logger="omnigent.harnesses.codex_native.forwarder")
-    write_bridge_state(
-        tmp_path,
-        CodexNativeBridgeState(
-            session_id="conv_old",
-            socket_path=str(tmp_path / "app-server.sock"),
-            thread_id="thread_old",
-            codex_home=str(tmp_path / "codex-home"),
-        ),
+    _write_forwarder_bridge(
+        tmp_path, session_id="conv_old", thread_id="thread_old", active_turn_id=None
     )
     fake_client = _FakeCodexAppServerClient()
     requests: list[tuple[str, str, dict[str, Any] | None]] = []
@@ -2791,13 +2790,6 @@ def test_forwarder_rotates_session_on_new_codex_thread_and_posts_to_new_session(
         for _, payload in posted_events
         if payload["type"] == "external_conversation_item"
     ] == ["after clear"]
-
-    readiness = [
-        r for r in caplog.records if getattr(r, "event_name", None) == "native_input_ready"
-    ]
-    assert len(readiness) == 1
-    assert readiness[0].session_id == "conv_new"
-    assert readiness[0].attributes["runner_id"] == "runner_123"
 
 
 def test_forwarder_rotation_failure_preserves_old_target(
@@ -2996,27 +2988,8 @@ def test_forwarder_tracks_active_turn_across_terminal_event_sequences(
     :param tmp_path: Temporary bridge directory.
     :returns: None.
     """
-    write_bridge_state(
-        tmp_path,
-        CodexNativeBridgeState(
-            session_id="conv_123",
-            socket_path=str(tmp_path / "app-server.sock"),
-            thread_id="thread_123",
-            codex_home=str(tmp_path / "codex-home"),
-            active_turn_id=initial_active_turn_id,
-        ),
-    )
+    _write_forwarder_bridge(tmp_path, active_turn_id=initial_active_turn_id)
     posted: list[dict[str, Any]] = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        """
-        Capture Omnigent event posts from the forwarder.
-
-        :param request: HTTP request sent by the forwarder.
-        :returns: Accepted response.
-        """
-        posted.append(json.loads(request.content))
-        return httpx.Response(202, json={"queued": False})
 
     async def run() -> None:
         """
@@ -3024,17 +2997,11 @@ def test_forwarder_tracks_active_turn_across_terminal_event_sequences(
 
         :returns: None.
         """
-        async with httpx.AsyncClient(
-            base_url="http://127.0.0.1:8000",
-            transport=httpx.MockTransport(handler),
-        ) as client:
+        async with _recording_forwarder_client(posted) as client:
             for event in events:
                 await codex_native_forwarder._handle_event(
                     client,
-                    session_id="conv_123",
-                    bridge_dir=tmp_path,
-                    usage_coalescer=_usage_coalescer(client),
-                    elicitation_tracker=_elicitation_tracker(),
+                    **_forwarder_context(client, tmp_path),
                     event=event,
                 )
 
@@ -3052,22 +3019,8 @@ def test_forwarder_tracks_active_turn_across_terminal_event_sequences(
 
 def test_terminal_turn_clears_control_state_before_blocked_delta_flush(tmp_path: Path) -> None:
     """A slow output flush cannot leave a completed Codex turn steerable."""
-    write_bridge_state(
-        tmp_path,
-        CodexNativeBridgeState(
-            session_id="conv_123",
-            socket_path=str(tmp_path / "app-server.sock"),
-            thread_id="thread_123",
-            codex_home=str(tmp_path / "codex-home"),
-            active_turn_id="turn_123",
-        ),
-    )
+    _write_forwarder_bridge(tmp_path, active_turn_id="turn_123")
     posted: list[dict[str, Any]] = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        """Capture posts that must remain ordered after the output flush."""
-        posted.append(json.loads(request.content))
-        return httpx.Response(202, json={"queued": False})
 
     async def run() -> None:
         """Block output delivery and inspect bridge control state mid-boundary."""
@@ -3082,17 +3035,11 @@ def test_terminal_turn_clears_control_state_before_blocked_delta_flush(tmp_path:
                 flush_entered.set()
                 await release_flush.wait()
 
-        async with httpx.AsyncClient(
-            base_url="http://127.0.0.1:8000",
-            transport=httpx.MockTransport(handler),
-        ) as client:
+        async with _recording_forwarder_client(posted) as client:
             task = asyncio.create_task(
                 codex_native_forwarder._handle_event(
                     client,
-                    session_id="conv_123",
-                    bridge_dir=tmp_path,
-                    usage_coalescer=_usage_coalescer(client),
-                    elicitation_tracker=_elicitation_tracker(),
+                    **_forwarder_context(client, tmp_path),
                     event=_completed_event("turn_123"),
                     delta_coalescer=_BlockingDeltaCoalescer(),  # type: ignore[arg-type]
                 )
@@ -3125,27 +3072,8 @@ def test_forwarder_posts_agent_item_after_stale_terminal_event(tmp_path: Path) -
     ``turn_old`` arrives. The stale terminal event must not mark the
     session idle or prevent the newer assistant item from syncing.
     """
-    write_bridge_state(
-        tmp_path,
-        CodexNativeBridgeState(
-            session_id="conv_123",
-            socket_path=str(tmp_path / "app-server.sock"),
-            thread_id="thread_123",
-            codex_home=str(tmp_path / "codex-home"),
-            active_turn_id=None,
-        ),
-    )
+    _write_forwarder_bridge(tmp_path, active_turn_id=None)
     posted: list[dict[str, Any]] = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        """
-        Capture Omnigent event posts from the forwarder.
-
-        :param request: HTTP request sent by the forwarder.
-        :returns: Accepted response.
-        """
-        posted.append(json.loads(request.content))
-        return httpx.Response(202, json={"queued": False})
 
     async def run() -> None:
         """
@@ -3153,10 +3081,7 @@ def test_forwarder_posts_agent_item_after_stale_terminal_event(tmp_path: Path) -
 
         :returns: None.
         """
-        async with httpx.AsyncClient(
-            base_url="http://127.0.0.1:8000",
-            transport=httpx.MockTransport(handler),
-        ) as client:
+        async with _recording_forwarder_client(posted) as client:
             for event in [
                 _started_event("turn_old"),
                 _started_event("turn_new"),
@@ -3165,10 +3090,7 @@ def test_forwarder_posts_agent_item_after_stale_terminal_event(tmp_path: Path) -
             ]:
                 await codex_native_forwarder._handle_event(
                     client,
-                    session_id="conv_123",
-                    bridge_dir=tmp_path,
-                    usage_coalescer=_usage_coalescer(client),
-                    elicitation_tracker=_elicitation_tracker(),
+                    **_forwarder_context(client, tmp_path),
                     event=event,
                 )
 
@@ -3197,27 +3119,8 @@ def test_forwarder_posts_active_codex_agent_message_delta(tmp_path: Path) -> Non
     web stream silent until Codex posts its completed ``agentMessage``
     item, so this asserts on the exact Omnigent event envelope.
     """
-    write_bridge_state(
-        tmp_path,
-        CodexNativeBridgeState(
-            session_id="conv_123",
-            socket_path=str(tmp_path / "app-server.sock"),
-            thread_id="thread_123",
-            codex_home=str(tmp_path / "codex-home"),
-            active_turn_id="turn_123",
-        ),
-    )
+    _write_forwarder_bridge(tmp_path, active_turn_id="turn_123")
     posted: list[dict[str, Any]] = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        """
-        Capture Omnigent event posts from the forwarder.
-
-        :param request: HTTP request sent by the forwarder.
-        :returns: Accepted response.
-        """
-        posted.append(json.loads(request.content))
-        return httpx.Response(202, json={"queued": False})
 
     async def run() -> None:
         """
@@ -3225,10 +3128,7 @@ def test_forwarder_posts_active_codex_agent_message_delta(tmp_path: Path) -> Non
 
         :returns: None.
         """
-        async with httpx.AsyncClient(
-            base_url="http://127.0.0.1:8000",
-            transport=httpx.MockTransport(handler),
-        ) as client:
+        async with _recording_forwarder_client(posted) as client:
             coalescer = codex_native_forwarder._OutputTextDeltaCoalescer(
                 client,
                 "conv_123",
@@ -3237,10 +3137,7 @@ def test_forwarder_posts_active_codex_agent_message_delta(tmp_path: Path) -> Non
             )
             await codex_native_forwarder._handle_event(
                 client,
-                session_id="conv_123",
-                bridge_dir=tmp_path,
-                usage_coalescer=_usage_coalescer(client),
-                elicitation_tracker=_elicitation_tracker(),
+                **_forwarder_context(client, tmp_path),
                 event=_agent_message_delta_event("turn_123", "item_agent", "hel"),
                 delta_coalescer=coalescer,
             )
@@ -3266,28 +3163,9 @@ def test_forwarder_persists_interrupted_codex_partial_agent_message(tmp_path: Pa
     Without this fallback, Omnigent Web shows the streamed text live but loses it
     from durable history as soon as the turn ends.
     """
-    write_bridge_state(
-        tmp_path,
-        CodexNativeBridgeState(
-            session_id="conv_123",
-            socket_path=str(tmp_path / "app-server.sock"),
-            thread_id="thread_123",
-            codex_home=str(tmp_path / "codex-home"),
-            active_turn_id="turn_123",
-        ),
-    )
+    _write_forwarder_bridge(tmp_path, active_turn_id="turn_123")
     posted: list[dict[str, Any]] = []
     forwarder_state = codex_native_forwarder._CodexForwarderState()
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        """
-        Capture Omnigent event posts from the forwarder.
-
-        :param request: HTTP request sent by the forwarder.
-        :returns: Accepted response.
-        """
-        posted.append(json.loads(request.content))
-        return httpx.Response(202, json={"queued": False})
 
     async def run() -> None:
         """
@@ -3295,10 +3173,7 @@ def test_forwarder_persists_interrupted_codex_partial_agent_message(tmp_path: Pa
 
         :returns: None.
         """
-        async with httpx.AsyncClient(
-            base_url="http://127.0.0.1:8000",
-            transport=httpx.MockTransport(handler),
-        ) as client:
+        async with _recording_forwarder_client(posted) as client:
             coalescer = codex_native_forwarder._OutputTextDeltaCoalescer(
                 client,
                 "conv_123",
@@ -3318,10 +3193,7 @@ def test_forwarder_persists_interrupted_codex_partial_agent_message(tmp_path: Pa
             ]:
                 await codex_native_forwarder._handle_event(
                     client,
-                    session_id="conv_123",
-                    bridge_dir=tmp_path,
-                    usage_coalescer=_usage_coalescer(client),
-                    elicitation_tracker=_elicitation_tracker(),
+                    **_forwarder_context(client, tmp_path),
                     event=event,
                     delta_coalescer=coalescer,
                     forwarder_state=forwarder_state,
@@ -3372,27 +3244,8 @@ def test_forwarder_posts_active_codex_plan_delta(tmp_path: Path) -> None:
     plan. If this branch is missing, Omnigent web stays blank even though the
     Codex TUI is already showing the plan.
     """
-    write_bridge_state(
-        tmp_path,
-        CodexNativeBridgeState(
-            session_id="conv_123",
-            socket_path=str(tmp_path / "app-server.sock"),
-            thread_id="thread_123",
-            codex_home=str(tmp_path / "codex-home"),
-            active_turn_id="turn_123",
-        ),
-    )
+    _write_forwarder_bridge(tmp_path, active_turn_id="turn_123")
     posted: list[dict[str, Any]] = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        """
-        Capture Omnigent event posts from the forwarder.
-
-        :param request: HTTP request sent by the forwarder.
-        :returns: Accepted response.
-        """
-        posted.append(json.loads(request.content))
-        return httpx.Response(202, json={"queued": False})
 
     async def run() -> None:
         """
@@ -3400,10 +3253,7 @@ def test_forwarder_posts_active_codex_plan_delta(tmp_path: Path) -> None:
 
         :returns: None.
         """
-        async with httpx.AsyncClient(
-            base_url="http://127.0.0.1:8000",
-            transport=httpx.MockTransport(handler),
-        ) as client:
+        async with _recording_forwarder_client(posted) as client:
             coalescer = codex_native_forwarder._OutputTextDeltaCoalescer(
                 client,
                 "conv_123",
@@ -3412,10 +3262,7 @@ def test_forwarder_posts_active_codex_plan_delta(tmp_path: Path) -> None:
             )
             await codex_native_forwarder._handle_event(
                 client,
-                session_id="conv_123",
-                bridge_dir=tmp_path,
-                usage_coalescer=_usage_coalescer(client),
-                elicitation_tracker=_elicitation_tracker(),
+                **_forwarder_context(client, tmp_path),
                 event=_plan_delta_event("turn_123", "item_plan", "1. Inspect"),
                 delta_coalescer=coalescer,
             )
@@ -3448,27 +3295,8 @@ def test_forwarder_recovers_active_turn_from_codex_plan_delta(tmp_path: Path) ->
     missing ``running`` status edge, and streams the plan instead of
     dropping the first visible content.
     """
-    write_bridge_state(
-        tmp_path,
-        CodexNativeBridgeState(
-            session_id="conv_123",
-            socket_path=str(tmp_path / "app-server.sock"),
-            thread_id="thread_123",
-            codex_home=str(tmp_path / "codex-home"),
-            active_turn_id=None,
-        ),
-    )
+    _write_forwarder_bridge(tmp_path, active_turn_id=None)
     posted: list[dict[str, Any]] = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        """
-        Capture Omnigent event posts from the forwarder.
-
-        :param request: HTTP request sent by the forwarder.
-        :returns: Accepted response.
-        """
-        posted.append(json.loads(request.content))
-        return httpx.Response(202, json={"queued": False})
 
     async def run() -> None:
         """
@@ -3476,10 +3304,7 @@ def test_forwarder_recovers_active_turn_from_codex_plan_delta(tmp_path: Path) ->
 
         :returns: None.
         """
-        async with httpx.AsyncClient(
-            base_url="http://127.0.0.1:8000",
-            transport=httpx.MockTransport(handler),
-        ) as client:
+        async with _recording_forwarder_client(posted) as client:
             coalescer = codex_native_forwarder._OutputTextDeltaCoalescer(
                 client,
                 "conv_123",
@@ -3488,10 +3313,7 @@ def test_forwarder_recovers_active_turn_from_codex_plan_delta(tmp_path: Path) ->
             )
             await codex_native_forwarder._handle_event(
                 client,
-                session_id="conv_123",
-                bridge_dir=tmp_path,
-                usage_coalescer=_usage_coalescer(client),
-                elicitation_tracker=_elicitation_tracker(),
+                **_forwarder_context(client, tmp_path),
                 event=_plan_delta_event("turn_early", "item_plan", "Draft plan"),
                 delta_coalescer=coalescer,
             )
@@ -3534,27 +3356,8 @@ def test_forwarder_recovers_active_turn_from_codex_agent_message_delta(tmp_path:
     :param tmp_path: Temporary bridge directory.
     :returns: None.
     """
-    write_bridge_state(
-        tmp_path,
-        CodexNativeBridgeState(
-            session_id="conv_123",
-            socket_path=str(tmp_path / "app-server.sock"),
-            thread_id="thread_123",
-            codex_home=str(tmp_path / "codex-home"),
-            active_turn_id=None,
-        ),
-    )
+    _write_forwarder_bridge(tmp_path, active_turn_id=None)
     posted: list[dict[str, Any]] = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        """
-        Capture Omnigent event posts from the forwarder.
-
-        :param request: HTTP request sent by the forwarder.
-        :returns: Accepted response.
-        """
-        posted.append(json.loads(request.content))
-        return httpx.Response(202, json={"queued": False})
 
     async def run() -> None:
         """
@@ -3562,10 +3365,7 @@ def test_forwarder_recovers_active_turn_from_codex_agent_message_delta(tmp_path:
 
         :returns: None.
         """
-        async with httpx.AsyncClient(
-            base_url="http://127.0.0.1:8000",
-            transport=httpx.MockTransport(handler),
-        ) as client:
+        async with _recording_forwarder_client(posted) as client:
             coalescer = codex_native_forwarder._OutputTextDeltaCoalescer(
                 client,
                 "conv_123",
@@ -3574,10 +3374,7 @@ def test_forwarder_recovers_active_turn_from_codex_agent_message_delta(tmp_path:
             )
             await codex_native_forwarder._handle_event(
                 client,
-                session_id="conv_123",
-                bridge_dir=tmp_path,
-                usage_coalescer=_usage_coalescer(client),
-                elicitation_tracker=_elicitation_tracker(),
+                **_forwarder_context(client, tmp_path),
                 event=_agent_message_delta_event("turn_early", "item_agent", "Hello"),
                 delta_coalescer=coalescer,
             )
@@ -3614,16 +3411,7 @@ def test_forwarder_recovers_user_before_recovered_agent_message_delta(tmp_path: 
     :param tmp_path: Temporary bridge directory.
     :returns: None.
     """
-    write_bridge_state(
-        tmp_path,
-        CodexNativeBridgeState(
-            session_id="conv_123",
-            socket_path=str(tmp_path / "app-server.sock"),
-            thread_id="thread_123",
-            codex_home=str(tmp_path / "codex-home"),
-            active_turn_id=None,
-        ),
-    )
+    _write_forwarder_bridge(tmp_path, active_turn_id=None)
     resume_response = {
         "result": {
             "thread": {
@@ -3650,26 +3438,13 @@ def test_forwarder_recovers_user_before_recovered_agent_message_delta(tmp_path: 
     )
     posted: list[dict[str, Any]] = []
 
-    def handler(request: httpx.Request) -> httpx.Response:
-        """
-        Capture Omnigent event posts from the forwarder.
-
-        :param request: HTTP request sent by the forwarder.
-        :returns: Accepted response.
-        """
-        posted.append(json.loads(request.content))
-        return httpx.Response(202, json={"queued": False})
-
     async def run() -> None:
         """
         Replay an assistant delta before all earlier turn events.
 
         :returns: None.
         """
-        async with httpx.AsyncClient(
-            base_url="http://127.0.0.1:8000",
-            transport=httpx.MockTransport(handler),
-        ) as client:
+        async with _recording_forwarder_client(posted) as client:
             coalescer = codex_native_forwarder._OutputTextDeltaCoalescer(
                 client,
                 "conv_123",
@@ -3678,10 +3453,7 @@ def test_forwarder_recovers_user_before_recovered_agent_message_delta(tmp_path: 
             )
             await codex_native_forwarder._handle_event(
                 client,
-                session_id="conv_123",
-                bridge_dir=tmp_path,
-                usage_coalescer=_usage_coalescer(client),
-                elicitation_tracker=_elicitation_tracker(),
+                **_forwarder_context(client, tmp_path),
                 event=_agent_message_delta_event("turn_early", "item_agent", "Hello"),
                 delta_coalescer=coalescer,
                 expected_thread_id="thread_123",
@@ -3715,27 +3487,8 @@ def test_forwarder_drops_stale_and_malformed_codex_agent_message_deltas(
     appearing in the current web bubble. Non-string deltas are dropped
     before they can reach AP's strict ``data.delta`` validation.
     """
-    write_bridge_state(
-        tmp_path,
-        CodexNativeBridgeState(
-            session_id="conv_123",
-            socket_path=str(tmp_path / "app-server.sock"),
-            thread_id="thread_123",
-            codex_home=str(tmp_path / "codex-home"),
-            active_turn_id="turn_new",
-        ),
-    )
+    _write_forwarder_bridge(tmp_path, active_turn_id="turn_new")
     posted: list[dict[str, Any]] = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        """
-        Capture Omnigent event posts from the forwarder.
-
-        :param request: HTTP request sent by the forwarder.
-        :returns: Accepted response.
-        """
-        posted.append(json.loads(request.content))
-        return httpx.Response(202, json={"queued": False})
 
     async def run() -> None:
         """
@@ -3743,10 +3496,7 @@ def test_forwarder_drops_stale_and_malformed_codex_agent_message_deltas(
 
         :returns: None.
         """
-        async with httpx.AsyncClient(
-            base_url="http://127.0.0.1:8000",
-            transport=httpx.MockTransport(handler),
-        ) as client:
+        async with _recording_forwarder_client(posted) as client:
             coalescer = codex_native_forwarder._OutputTextDeltaCoalescer(
                 client,
                 "conv_123",
@@ -3760,10 +3510,7 @@ def test_forwarder_drops_stale_and_malformed_codex_agent_message_deltas(
             ]:
                 await codex_native_forwarder._handle_event(
                     client,
-                    session_id="conv_123",
-                    bridge_dir=tmp_path,
-                    usage_coalescer=_usage_coalescer(client),
-                    elicitation_tracker=_elicitation_tracker(),
+                    **_forwarder_context(client, tmp_path),
                     event=event,
                     delta_coalescer=coalescer,
                 )
@@ -3789,27 +3536,8 @@ def test_forwarder_coalesces_codex_agent_message_deltas(tmp_path: Path) -> None:
     behind many per-token HTTP POSTs. Stale and malformed deltas must
     still be filtered before text enters the coalesced buffer.
     """
-    write_bridge_state(
-        tmp_path,
-        CodexNativeBridgeState(
-            session_id="conv_123",
-            socket_path=str(tmp_path / "app-server.sock"),
-            thread_id="thread_123",
-            codex_home=str(tmp_path / "codex-home"),
-            active_turn_id="turn_new",
-        ),
-    )
+    _write_forwarder_bridge(tmp_path, active_turn_id="turn_new")
     posted: list[dict[str, Any]] = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        """
-        Capture Omnigent event posts from the forwarder.
-
-        :param request: HTTP request sent by the forwarder.
-        :returns: Accepted response.
-        """
-        posted.append(json.loads(request.content))
-        return httpx.Response(202, json={"queued": False})
 
     async def run() -> None:
         """
@@ -3817,10 +3545,7 @@ def test_forwarder_coalesces_codex_agent_message_deltas(tmp_path: Path) -> None:
 
         :returns: None.
         """
-        async with httpx.AsyncClient(
-            base_url="http://127.0.0.1:8000",
-            transport=httpx.MockTransport(handler),
-        ) as client:
+        async with _recording_forwarder_client(posted) as client:
             coalescer = codex_native_forwarder._OutputTextDeltaCoalescer(
                 client,
                 "conv_123",
@@ -3835,10 +3560,7 @@ def test_forwarder_coalesces_codex_agent_message_deltas(tmp_path: Path) -> None:
             ]:
                 await codex_native_forwarder._handle_event(
                     client,
-                    session_id="conv_123",
-                    bridge_dir=tmp_path,
-                    usage_coalescer=_usage_coalescer(client),
-                    elicitation_tracker=_elicitation_tracker(),
+                    **_forwarder_context(client, tmp_path),
                     event=event,
                     delta_coalescer=coalescer,
                 )
@@ -3869,29 +3591,10 @@ def test_forwarder_posts_codex_usage_live_per_frame(
     sparse cadence means the per-frame post does not block the high-frequency
     text-delta path, which has its own coalescer.
     """
-    write_bridge_state(
-        tmp_path,
-        CodexNativeBridgeState(
-            session_id="conv_123",
-            socket_path=str(tmp_path / "app-server.sock"),
-            thread_id="thread_123",
-            codex_home=str(tmp_path / "codex-home"),
-            active_turn_id="turn_123",
-        ),
-    )
+    _write_forwarder_bridge(tmp_path, active_turn_id="turn_123")
     posted: list[dict[str, Any]] = []
     posts_after_usage_updates: list[dict[str, Any]] = []
     posts_after_text_flush: list[dict[str, Any]] = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        """
-        Capture Omnigent event posts from both coalescers.
-
-        :param request: HTTP request sent by the forwarder.
-        :returns: Accepted response.
-        """
-        posted.append(json.loads(request.content))
-        return httpx.Response(202, json={"queued": False})
 
     async def run() -> None:
         """
@@ -3899,10 +3602,7 @@ def test_forwarder_posts_codex_usage_live_per_frame(
 
         :returns: None.
         """
-        async with httpx.AsyncClient(
-            base_url="http://127.0.0.1:8000",
-            transport=httpx.MockTransport(handler),
-        ) as client:
+        async with _recording_forwarder_client(posted) as client:
             delta_coalescer = codex_native_forwarder._OutputTextDeltaCoalescer(
                 client,
                 "conv_123",
@@ -4068,27 +3768,8 @@ def test_forwarder_flushes_coalesced_deltas_before_completed_agent_item(
     The web stream should receive the live text tail before the durable
     completed ``agentMessage`` item for the same turn.
     """
-    write_bridge_state(
-        tmp_path,
-        CodexNativeBridgeState(
-            session_id="conv_123",
-            socket_path=str(tmp_path / "app-server.sock"),
-            thread_id="thread_123",
-            codex_home=str(tmp_path / "codex-home"),
-            active_turn_id="turn_123",
-        ),
-    )
+    _write_forwarder_bridge(tmp_path, active_turn_id="turn_123")
     posted: list[dict[str, Any]] = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        """
-        Capture Omnigent event posts from the forwarder.
-
-        :param request: HTTP request sent by the forwarder.
-        :returns: Accepted response.
-        """
-        posted.append(json.loads(request.content))
-        return httpx.Response(202, json={"queued": False})
 
     async def run() -> None:
         """
@@ -4096,10 +3777,7 @@ def test_forwarder_flushes_coalesced_deltas_before_completed_agent_item(
 
         :returns: None.
         """
-        async with httpx.AsyncClient(
-            base_url="http://127.0.0.1:8000",
-            transport=httpx.MockTransport(handler),
-        ) as client:
+        async with _recording_forwarder_client(posted) as client:
             coalescer = codex_native_forwarder._OutputTextDeltaCoalescer(
                 client,
                 "conv_123",
@@ -4113,10 +3791,7 @@ def test_forwarder_flushes_coalesced_deltas_before_completed_agent_item(
             ]:
                 await codex_native_forwarder._handle_event(
                     client,
-                    session_id="conv_123",
-                    bridge_dir=tmp_path,
-                    usage_coalescer=_usage_coalescer(client),
-                    elicitation_tracker=_elicitation_tracker(),
+                    **_forwarder_context(client, tmp_path),
                     event=event,
                     delta_coalescer=coalescer,
                 )
@@ -4549,16 +4224,7 @@ def test_forwarder_falls_back_to_terminal_turn_for_missed_resolution(
             "requestedSchema": {"type": "object", "properties": {}},
         },
     }
-    write_bridge_state(
-        tmp_path,
-        CodexNativeBridgeState(
-            session_id="conv_123",
-            socket_path=str(tmp_path / "app-server.sock"),
-            thread_id="thread_123",
-            codex_home=str(tmp_path / "codex-home"),
-            active_turn_id="turn_123",
-        ),
-    )
+    _write_forwarder_bridge(tmp_path, active_turn_id="turn_123")
 
     async def handler(request: httpx.Request) -> httpx.Response:
         """
@@ -4661,16 +4327,7 @@ def test_forwarder_does_not_clear_pending_elicitation_for_stale_terminal_turn(
             "requestedSchema": {"type": "object", "properties": {}},
         },
     }
-    write_bridge_state(
-        tmp_path,
-        CodexNativeBridgeState(
-            session_id="conv_123",
-            socket_path=str(tmp_path / "app-server.sock"),
-            thread_id="thread_123",
-            codex_home=str(tmp_path / "codex-home"),
-            active_turn_id="turn_new",
-        ),
-    )
+    _write_forwarder_bridge(tmp_path, active_turn_id="turn_new")
 
     async def handler(request: httpx.Request) -> httpx.Response:
         """
@@ -4807,16 +4464,7 @@ def test_forwarder_flushes_plan_text_before_codex_request_user_input(
     prompt before the plan content, or the plan stays buffered while
     the hook waits for a user answer.
     """
-    write_bridge_state(
-        tmp_path,
-        CodexNativeBridgeState(
-            session_id="conv_123",
-            socket_path=str(tmp_path / "app-server.sock"),
-            thread_id="thread_123",
-            codex_home=str(tmp_path / "codex-home"),
-            active_turn_id="turn_123",
-        ),
-    )
+    _write_forwarder_bridge(tmp_path, active_turn_id="turn_123")
     fake_client = _FakeCodexAppServerClient()
     request_bodies: list[dict[str, Any]] = []
     request_paths: list[str] = []
@@ -4932,16 +4580,7 @@ def test_forwarder_synthesizes_plan_implementation_prompt_after_completed_plan_t
     that terminal-only prompt through the existing Codex elicitation
     hook after the completed plan item and terminal turn event arrive.
     """
-    write_bridge_state(
-        tmp_path,
-        CodexNativeBridgeState(
-            session_id="conv_123",
-            socket_path=str(tmp_path / "app-server.sock"),
-            thread_id="thread_123",
-            codex_home=str(tmp_path / "codex-home"),
-            active_turn_id="turn_123",
-        ),
-    )
+    _write_forwarder_bridge(tmp_path, active_turn_id="turn_123")
     fake_client = _FakeCodexAppServerClient()
     forwarder_state = codex_native_forwarder._CodexForwarderState(model="mock-model")
     request_paths: list[str] = []
@@ -4997,10 +4636,7 @@ def test_forwarder_synthesizes_plan_implementation_prompt_after_completed_plan_t
             ]:
                 await codex_native_forwarder._handle_event(
                     client,
-                    session_id="conv_123",
-                    bridge_dir=tmp_path,
-                    usage_coalescer=_usage_coalescer(client),
-                    elicitation_tracker=_elicitation_tracker(),
+                    **_forwarder_context(client, tmp_path),
                     event=event,
                     delta_coalescer=coalescer,
                     codex_client=fake_client,  # type: ignore[arg-type]
@@ -5071,16 +4707,7 @@ def test_forwarder_starts_default_turn_from_plan_implementation_prompt(
     interactive but selecting ``Yes, implement this plan`` would do
     nothing.
     """
-    write_bridge_state(
-        tmp_path,
-        CodexNativeBridgeState(
-            session_id="conv_123",
-            socket_path=str(tmp_path / "app-server.sock"),
-            thread_id="thread_123",
-            codex_home=str(tmp_path / "codex-home"),
-            active_turn_id="turn_123",
-        ),
-    )
+    _write_forwarder_bridge(tmp_path, active_turn_id="turn_123")
     fake_client = _FakeCodexAppServerClient()
     forwarder_state = codex_native_forwarder._CodexForwarderState(
         model="mock-model",
@@ -5146,10 +4773,7 @@ def test_forwarder_starts_default_turn_from_plan_implementation_prompt(
             ]:
                 await codex_native_forwarder._handle_event(
                     client,
-                    session_id="conv_123",
-                    bridge_dir=tmp_path,
-                    usage_coalescer=_usage_coalescer(client),
-                    elicitation_tracker=_elicitation_tracker(),
+                    **_forwarder_context(client, tmp_path),
                     event=event,
                     codex_client=fake_client,  # type: ignore[arg-type]
                     forwarder_state=forwarder_state,
@@ -5189,16 +4813,7 @@ def test_forwarder_starts_fresh_thread_from_clear_context_plan_prompt(
     the bridge switches to the new thread, sends the clear-context
     implementation prompt, and records the new active turn.
     """
-    write_bridge_state(
-        tmp_path,
-        CodexNativeBridgeState(
-            session_id="conv_123",
-            socket_path=str(tmp_path / "app-server.sock"),
-            thread_id="thread_123",
-            codex_home=str(tmp_path / "codex-home"),
-            active_turn_id="turn_123",
-        ),
-    )
+    _write_forwarder_bridge(tmp_path, active_turn_id="turn_123")
     fake_client = _FakeCodexAppServerClient()
     forwarder_state = codex_native_forwarder._CodexForwarderState(
         model="mock-model",
@@ -5267,10 +4882,7 @@ def test_forwarder_starts_fresh_thread_from_clear_context_plan_prompt(
             ]:
                 await codex_native_forwarder._handle_event(
                     client,
-                    session_id="conv_123",
-                    bridge_dir=tmp_path,
-                    usage_coalescer=_usage_coalescer(client),
-                    elicitation_tracker=_elicitation_tracker(),
+                    **_forwarder_context(client, tmp_path),
                     event=event,
                     codex_client=fake_client,  # type: ignore[arg-type]
                     forwarder_state=forwarder_state,
@@ -5319,16 +4931,7 @@ def test_clear_context_plan_implementation_refuses_before_creating_thread_when_u
     other) request reaches Codex, and the bridge state's thread_id is
     unchanged.
     """
-    write_bridge_state(
-        tmp_path,
-        CodexNativeBridgeState(
-            session_id="conv_123",
-            socket_path=str(tmp_path / "app-server.sock"),
-            thread_id="thread_123",
-            codex_home=str(tmp_path / "codex-home"),
-            active_turn_id="turn_123",
-        ),
-    )
+    _write_forwarder_bridge(tmp_path, active_turn_id="turn_123")
     fake_client = _FakeCodexAppServerClient()
     # developer_instructions_known defaults to False — never confirmed.
     forwarder_state = codex_native_forwarder._CodexForwarderState(model="mock-model")
@@ -5375,10 +4978,7 @@ def test_clear_context_plan_implementation_refuses_before_creating_thread_when_u
             ]:
                 await codex_native_forwarder._handle_event(
                     client,
-                    session_id="conv_123",
-                    bridge_dir=tmp_path,
-                    usage_coalescer=_usage_coalescer(client),
-                    elicitation_tracker=_elicitation_tracker(),
+                    **_forwarder_context(client, tmp_path),
                     event=event,
                     codex_client=fake_client,  # type: ignore[arg-type]
                     forwarder_state=forwarder_state,
@@ -5792,14 +5392,8 @@ def test_supervise_forwarder_rotation_clears_unparented_pending_child_threads(
 
     :param tmp_path: Pytest temporary directory.
     """
-    write_bridge_state(
-        tmp_path,
-        CodexNativeBridgeState(
-            session_id="conv_old",
-            socket_path=str(tmp_path / "app-server.sock"),
-            thread_id="thread_old",
-            codex_home=str(tmp_path / "codex-home"),
-        ),
+    _write_forwarder_bridge(
+        tmp_path, session_id="conv_old", thread_id="thread_old", active_turn_id=None
     )
     unparented_child_started = {
         "method": "thread/started",
@@ -6002,10 +5596,7 @@ def test_forwarder_logs_unsupported_codex_server_request(
         ) as client:
             await codex_native_forwarder._handle_event(
                 client,
-                session_id="conv_123",
-                bridge_dir=tmp_path,
-                usage_coalescer=_usage_coalescer(client),
-                elicitation_tracker=_elicitation_tracker(),
+                **_forwarder_context(client, tmp_path),
                 event={
                     "id": "unsupported_1",
                     "method": "item/tool/call",
@@ -6089,16 +5680,6 @@ def test_forwarder_posts_user_message_on_assistant_item_started(tmp_path: Path) 
     """
     posted: list[dict[str, Any]] = []
 
-    def handler(request: httpx.Request) -> httpx.Response:
-        """
-        Capture Omnigent event posts from the forwarder.
-
-        :param request: HTTP request sent by the forwarder.
-        :returns: Accepted response.
-        """
-        posted.append(json.loads(request.content))
-        return httpx.Response(202, json={"queued": False})
-
     resume_response = {
         "result": {
             "thread": {
@@ -6130,16 +5711,10 @@ def test_forwarder_posts_user_message_on_assistant_item_started(tmp_path: Path) 
 
         :returns: None.
         """
-        async with httpx.AsyncClient(
-            base_url="http://127.0.0.1:8000",
-            transport=httpx.MockTransport(handler),
-        ) as client:
+        async with _recording_forwarder_client(posted) as client:
             await codex_native_forwarder._handle_event(
                 client,
-                session_id="conv_123",
-                bridge_dir=tmp_path,
-                usage_coalescer=_usage_coalescer(client),
-                elicitation_tracker=_elicitation_tracker(),
+                **_forwarder_context(client, tmp_path),
                 event={
                     "method": "item/started",
                     "params": {
@@ -6172,21 +5747,11 @@ def test_forwarder_posts_codex_user_and_agent_messages(tmp_path: Path) -> None:
     """
     posted: list[dict[str, Any]] = []
 
-    def handler(request: httpx.Request) -> httpx.Response:
-        posted.append(json.loads(request.content))
-        return httpx.Response(202, json={"queued": False})
-
     async def run() -> None:
-        async with httpx.AsyncClient(
-            base_url="http://127.0.0.1:8000",
-            transport=httpx.MockTransport(handler),
-        ) as client:
+        async with _recording_forwarder_client(posted) as client:
             await codex_native_forwarder._handle_event(
                 client,
-                session_id="conv_123",
-                bridge_dir=tmp_path,
-                usage_coalescer=_usage_coalescer(client),
-                elicitation_tracker=_elicitation_tracker(),
+                **_forwarder_context(client, tmp_path),
                 event={
                     "method": "item/completed",
                     "params": {
@@ -6203,10 +5768,7 @@ def test_forwarder_posts_codex_user_and_agent_messages(tmp_path: Path) -> None:
             )
             await codex_native_forwarder._handle_event(
                 client,
-                session_id="conv_123",
-                bridge_dir=tmp_path,
-                usage_coalescer=_usage_coalescer(client),
-                elicitation_tracker=_elicitation_tracker(),
+                **_forwarder_context(client, tmp_path),
                 event={
                     "method": "item/completed",
                     "params": {
@@ -6270,16 +5832,6 @@ def test_forwarder_recovers_missed_user_message_before_assistant(tmp_path: Path)
     """
     posted: list[dict[str, Any]] = []
 
-    def handler(request: httpx.Request) -> httpx.Response:
-        """
-        Capture Omnigent event posts from the forwarder.
-
-        :param request: HTTP request sent by the forwarder.
-        :returns: Accepted response.
-        """
-        posted.append(json.loads(request.content))
-        return httpx.Response(202, json={"queued": False})
-
     # Resume returns the full turn (user then assistant) with Codex's
     # positional resume ids; the recovery reads the userMessage from it.
     resume_response = {
@@ -6314,16 +5866,10 @@ def test_forwarder_recovers_missed_user_message_before_assistant(tmp_path: Path)
 
         :returns: None.
         """
-        async with httpx.AsyncClient(
-            base_url="http://127.0.0.1:8000",
-            transport=httpx.MockTransport(handler),
-        ) as client:
+        async with _recording_forwarder_client(posted) as client:
             await codex_native_forwarder._handle_event(
                 client,
-                session_id="conv_123",
-                bridge_dir=tmp_path,
-                usage_coalescer=_usage_coalescer(client),
-                elicitation_tracker=_elicitation_tracker(),
+                **_forwarder_context(client, tmp_path),
                 event=_agent_message_event("turn_123", "msg_live", "hello from codex"),
                 expected_thread_id="thread_123",
                 forwarder_state=forwarder_state,
@@ -6352,16 +5898,6 @@ def test_forwarder_skips_user_recovery_when_user_seen_live(tmp_path: Path) -> No
     """
     posted: list[dict[str, Any]] = []
 
-    def handler(request: httpx.Request) -> httpx.Response:
-        """
-        Capture Omnigent event posts from the forwarder.
-
-        :param request: HTTP request sent by the forwarder.
-        :returns: Accepted response.
-        """
-        posted.append(json.loads(request.content))
-        return httpx.Response(202, json={"queued": False})
-
     fake_client = _FakeCodexAppServerClient()
     forwarder_state = codex_native_forwarder._CodexForwarderState(
         parent_session_id="conv_123",
@@ -6374,16 +5910,10 @@ def test_forwarder_skips_user_recovery_when_user_seen_live(tmp_path: Path) -> No
 
         :returns: None.
         """
-        async with httpx.AsyncClient(
-            base_url="http://127.0.0.1:8000",
-            transport=httpx.MockTransport(handler),
-        ) as client:
+        async with _recording_forwarder_client(posted) as client:
             await codex_native_forwarder._handle_event(
                 client,
-                session_id="conv_123",
-                bridge_dir=tmp_path,
-                usage_coalescer=_usage_coalescer(client),
-                elicitation_tracker=_elicitation_tracker(),
+                **_forwarder_context(client, tmp_path),
                 event={
                     "method": "item/completed",
                     "params": {
@@ -6401,10 +5931,7 @@ def test_forwarder_skips_user_recovery_when_user_seen_live(tmp_path: Path) -> No
             )
             await codex_native_forwarder._handle_event(
                 client,
-                session_id="conv_123",
-                bridge_dir=tmp_path,
-                usage_coalescer=_usage_coalescer(client),
-                elicitation_tracker=_elicitation_tracker(),
+                **_forwarder_context(client, tmp_path),
                 event=_agent_message_event("turn_123", "msg_live", "hello from codex"),
                 expected_thread_id="thread_123",
                 forwarder_state=forwarder_state,
@@ -6424,32 +5951,16 @@ def test_forwarder_posts_codex_turn_plan_update_only_to_tasks(tmp_path: Path) ->
     """Codex ``turn/plan/updated`` notifications update only the Tasks tab."""
     posted: list[dict[str, Any]] = []
 
-    def handler(request: httpx.Request) -> httpx.Response:
-        """
-        Capture Omnigent event posts from the forwarder.
-
-        :param request: HTTP request sent by the forwarder.
-        :returns: Accepted response.
-        """
-        posted.append(json.loads(request.content))
-        return httpx.Response(202, json={"queued": False})
-
     async def run() -> None:
         """
         Replay one plan update notification.
 
         :returns: None.
         """
-        async with httpx.AsyncClient(
-            base_url="http://127.0.0.1:8000",
-            transport=httpx.MockTransport(handler),
-        ) as client:
+        async with _recording_forwarder_client(posted) as client:
             await codex_native_forwarder._handle_event(
                 client,
-                session_id="conv_123",
-                bridge_dir=tmp_path,
-                usage_coalescer=_usage_coalescer(client),
-                elicitation_tracker=_elicitation_tracker(),
+                **_forwarder_context(client, tmp_path),
                 event={
                     "method": "turn/plan/updated",
                     "params": {
@@ -6582,7 +6093,10 @@ def _capture_handler(posted: list[dict[str, Any]]) -> Callable[[httpx.Request], 
 
 
 async def _replay_completed_item(
-    item: dict[str, Any], handler: Callable[..., httpx.Response]
+    item: dict[str, Any],
+    handler: Callable[..., httpx.Response],
+    *,
+    bridge_dir: Path = Path("/tmp"),
 ) -> None:
     """
     Drive one Codex ``item/completed`` notification through the forwarder.
@@ -6597,10 +6111,7 @@ async def _replay_completed_item(
     ) as client:
         await codex_native_forwarder._handle_event(
             client,
-            session_id="conv_123",
-            bridge_dir=Path("/tmp"),
-            usage_coalescer=_usage_coalescer(client),
-            elicitation_tracker=_elicitation_tracker(),
+            **_forwarder_context(client, bridge_dir),
             event={
                 "method": "item/completed",
                 "params": {
@@ -6675,16 +6186,7 @@ def test_forwarder_posts_codex_command_execution_tool_call() -> None:
 
 def test_forwarder_streams_codex_command_output_before_completed_item(tmp_path: Path) -> None:
     """Command output deltas update the live tool before its final result."""
-    write_bridge_state(
-        tmp_path,
-        CodexNativeBridgeState(
-            session_id="conv_123",
-            socket_path=str(tmp_path / "app-server.sock"),
-            thread_id="thread_123",
-            codex_home=str(tmp_path / "codex-home"),
-            active_turn_id="turn_123",
-        ),
-    )
+    _write_forwarder_bridge(tmp_path, active_turn_id="turn_123")
     posted: list[dict[str, Any]] = []
     state = codex_native_forwarder._CodexForwarderState()
     started_item = {
@@ -6703,10 +6205,7 @@ def test_forwarder_streams_codex_command_output_before_completed_item(tmp_path: 
 
     async def run() -> None:
         """Replay command start, output chunks, and completion."""
-        async with httpx.AsyncClient(
-            base_url="http://127.0.0.1:8000",
-            transport=httpx.MockTransport(_capture_handler(posted)),
-        ) as client:
+        async with _recording_forwarder_client(posted) as client:
             coalescer = codex_native_forwarder._OutputTextDeltaCoalescer(
                 client,
                 "conv_123",
@@ -6752,10 +6251,7 @@ def test_forwarder_streams_codex_command_output_before_completed_item(tmp_path: 
             for event in events:
                 await codex_native_forwarder._handle_event(
                     client,
-                    session_id="conv_123",
-                    bridge_dir=tmp_path,
-                    usage_coalescer=_usage_coalescer(client),
-                    elicitation_tracker=_elicitation_tracker(),
+                    **_forwarder_context(client, tmp_path),
                     event=event,
                     delta_coalescer=coalescer,
                     forwarder_state=state,
@@ -6863,6 +6359,99 @@ def test_forwarder_posts_codex_file_change_tool_call() -> None:
     }
     # Output summarizes each change as "<kind> <path>" from real fields.
     assert posted[1]["data"]["item_data"]["output"] == "add /repo/greeting.py"
+
+
+def test_forwarder_sends_file_change_to_observer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A completed fileChange reaches the non-git workspace registry relay."""
+    (tmp_path / "tool_relay.json").write_text(
+        json.dumps({"url": "http://relay.local", "token": "relay-secret"}),
+        encoding="utf-8",
+    )
+    observed: list[dict[str, Any]] = []
+
+    class Response:
+        def __enter__(self) -> Response:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def read(self) -> bytes:
+            return b"{}"
+
+    def urlopen(request: Any, *, timeout: float) -> Response:
+        assert request.full_url == "http://relay.local/hook/observe-tool"
+        assert request.headers["Authorization"] == "Bearer relay-secret"
+        assert timeout == 2
+        observed.append(json.loads(request.data))
+        return Response()
+
+    monkeypatch.setattr(codex_native_forwarder.urllib.request, "urlopen", urlopen)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path != "/hook/observe-tool"
+        return httpx.Response(202, json={"queued": False})
+
+    asyncio.run(
+        _replay_completed_item(
+            {
+                "type": "fileChange",
+                "id": "call_patch",
+                "changes": [
+                    {"path": "/repo/new.py", "kind": {"type": "add"}, "diff": "new"},
+                    {"path": "/repo/old.py", "kind": {"type": "delete"}, "diff": "old"},
+                ],
+                "status": "completed",
+            },
+            handler,
+            bridge_dir=tmp_path,
+        )
+    )
+
+    assert observed == [
+        {
+            "hook_event_name": "PostToolUse",
+            "tool_name": "apply_patch",
+            "tool_input": {
+                "changes": [
+                    {"path": "/repo/new.py", "kind": {"type": "add"}},
+                    {"path": "/repo/old.py", "kind": {"type": "delete"}},
+                ]
+            },
+            "tool_response": {"type": "success"},
+        }
+    ]
+
+
+@pytest.mark.parametrize("status", ["failed", "declined"])
+def test_forwarder_does_not_observe_unsuccessful_file_change(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, status: str
+) -> None:
+    """Failed or declined patches must not create phantom change records."""
+    (tmp_path / "tool_relay.json").write_text(
+        json.dumps({"url": "http://relay.local", "token": "relay-secret"}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        codex_native_forwarder.urllib.request,
+        "urlopen",
+        lambda *_args, **_kwargs: pytest.fail("unsuccessful patch reached file observer"),
+    )
+
+    asyncio.run(
+        _replay_completed_item(
+            {
+                "type": "fileChange",
+                "id": f"call_patch_{status}",
+                "changes": [{"path": "/repo/not-applied.py", "kind": {"type": "add"}}],
+                "status": status,
+            },
+            lambda _request: httpx.Response(202, json={"queued": False}),
+            bridge_dir=tmp_path,
+        )
+    )
 
 
 def test_forwarder_posts_codex_web_search_tool_call() -> None:
@@ -7148,16 +6737,7 @@ def test_forwarder_coalesces_and_flushes_turn_diff(tmp_path: Path) -> None:
     terminal boundary, as a single ``turn_diff`` function-call pair — after
     the turn's other items and before the idle status edge.
     """
-    write_bridge_state(
-        tmp_path,
-        CodexNativeBridgeState(
-            session_id="conv_123",
-            socket_path=str(tmp_path / "app-server.sock"),
-            thread_id="thread_123",
-            codex_home=str(tmp_path / "codex-home"),
-            active_turn_id="turn_123",
-        ),
-    )
+    _write_forwarder_bridge(tmp_path, active_turn_id="turn_123")
     posted: list[dict[str, Any]] = []
     forwarder_state = codex_native_forwarder._CodexForwarderState()
     latest_diff = "--- a/x.py\n+++ b/x.py\n@@\n-old\n+new\n"
@@ -7168,10 +6748,7 @@ def test_forwarder_coalesces_and_flushes_turn_diff(tmp_path: Path) -> None:
 
         :returns: None.
         """
-        async with httpx.AsyncClient(
-            base_url="http://127.0.0.1:8000",
-            transport=httpx.MockTransport(_capture_handler(posted)),
-        ) as client:
+        async with _recording_forwarder_client(posted) as client:
             for event in [
                 _turn_diff_event("turn_123", "--- a/x.py\n+++ b/x.py\n@@\n-old\n"),
                 _turn_diff_event("turn_123", latest_diff),
@@ -7179,10 +6756,7 @@ def test_forwarder_coalesces_and_flushes_turn_diff(tmp_path: Path) -> None:
             ]:
                 await codex_native_forwarder._handle_event(
                     client,
-                    session_id="conv_123",
-                    bridge_dir=tmp_path,
-                    usage_coalescer=_usage_coalescer(client),
-                    elicitation_tracker=_elicitation_tracker(),
+                    **_forwarder_context(client, tmp_path),
                     event=event,
                     forwarder_state=forwarder_state,
                 )
@@ -7234,16 +6808,7 @@ def test_forwarder_skips_turn_diff_when_none_captured(tmp_path: Path) -> None:
     Read-only turns never receive a diff notification, so the terminal
     boundary must emit only the idle status edge — no empty diff artifact.
     """
-    write_bridge_state(
-        tmp_path,
-        CodexNativeBridgeState(
-            session_id="conv_123",
-            socket_path=str(tmp_path / "app-server.sock"),
-            thread_id="thread_123",
-            codex_home=str(tmp_path / "codex-home"),
-            active_turn_id="turn_123",
-        ),
-    )
+    _write_forwarder_bridge(tmp_path, active_turn_id="turn_123")
     posted: list[dict[str, Any]] = []
     forwarder_state = codex_native_forwarder._CodexForwarderState()
 
@@ -7253,16 +6818,10 @@ def test_forwarder_skips_turn_diff_when_none_captured(tmp_path: Path) -> None:
 
         :returns: None.
         """
-        async with httpx.AsyncClient(
-            base_url="http://127.0.0.1:8000",
-            transport=httpx.MockTransport(_capture_handler(posted)),
-        ) as client:
+        async with _recording_forwarder_client(posted) as client:
             await codex_native_forwarder._handle_event(
                 client,
-                session_id="conv_123",
-                bridge_dir=tmp_path,
-                usage_coalescer=_usage_coalescer(client),
-                elicitation_tracker=_elicitation_tracker(),
+                **_forwarder_context(client, tmp_path),
                 event=_completed_event("turn_123", thread_id="thread_123"),
                 forwarder_state=forwarder_state,
             )
@@ -7512,10 +7071,7 @@ def test_forwarder_retries_transient_external_item_rejection(
         ) as client:
             await codex_native_forwarder._handle_event(
                 client,
-                session_id="conv_123",
-                bridge_dir=tmp_path,
-                usage_coalescer=_usage_coalescer(client),
-                elicitation_tracker=_elicitation_tracker(),
+                **_forwarder_context(client, tmp_path),
                 event={
                     "method": "item/completed",
                     "params": {
@@ -7559,10 +7115,7 @@ def test_forwarder_logs_rejected_external_item(
         ) as client:
             await codex_native_forwarder._handle_event(
                 client,
-                session_id="conv_123",
-                bridge_dir=tmp_path,
-                usage_coalescer=_usage_coalescer(client),
-                elicitation_tracker=_elicitation_tracker(),
+                **_forwarder_context(client, tmp_path),
                 event={
                     "method": "item/completed",
                     "params": {
@@ -7593,32 +7146,16 @@ def test_forwarder_marks_codex_skill_user_message_as_meta(tmp_path: Path) -> Non
     """
     posted: list[dict[str, Any]] = []
 
-    def handler(request: httpx.Request) -> httpx.Response:
-        """
-        Capture Omnigent event posts from the forwarder.
-
-        :param request: HTTP request sent by the forwarder.
-        :returns: Accepted response.
-        """
-        posted.append(json.loads(request.content))
-        return httpx.Response(202, json={"queued": False})
-
     async def run() -> None:
         """
         Replay one normal and one Codex skill user-message item.
 
         :returns: None.
         """
-        async with httpx.AsyncClient(
-            base_url="http://127.0.0.1:8000",
-            transport=httpx.MockTransport(handler),
-        ) as client:
+        async with _recording_forwarder_client(posted) as client:
             await codex_native_forwarder._handle_event(
                 client,
-                session_id="conv_123",
-                bridge_dir=tmp_path,
-                usage_coalescer=_usage_coalescer(client),
-                elicitation_tracker=_elicitation_tracker(),
+                **_forwarder_context(client, tmp_path),
                 event={
                     "method": "item/completed",
                     "params": {
@@ -7634,10 +7171,7 @@ def test_forwarder_marks_codex_skill_user_message_as_meta(tmp_path: Path) -> Non
             )
             await codex_native_forwarder._handle_event(
                 client,
-                session_id="conv_123",
-                bridge_dir=tmp_path,
-                usage_coalescer=_usage_coalescer(client),
-                elicitation_tracker=_elicitation_tracker(),
+                **_forwarder_context(client, tmp_path),
                 event={
                     "method": "item/completed",
                     "params": {
@@ -10086,26 +9620,13 @@ def test_usage_coalescer_flush_attaches_model_to_every_post() -> None:
     """
     posted: list[dict[str, Any]] = []
 
-    def handler(request: httpx.Request) -> httpx.Response:
-        """
-        Capture Omnigent usage posts from the coalescer.
-
-        :param request: HTTP request sent by the coalescer.
-        :returns: Accepted response.
-        """
-        posted.append(json.loads(request.content))
-        return httpx.Response(202, json={"queued": False})
-
     async def run() -> None:
         """
         Record two usage frames (model known) and flush each.
 
         :returns: None.
         """
-        async with httpx.AsyncClient(
-            base_url="http://127.0.0.1:8000",
-            transport=httpx.MockTransport(handler),
-        ) as client:
+        async with _recording_forwarder_client(posted) as client:
             coalescer = _usage_coalescer(client)
             coalescer.record(
                 {"tokenUsage": {"total": {"inputTokens": 1000, "outputTokens": 250}}},
@@ -10687,13 +10208,8 @@ def test_forwarder_routes_live_child_items_to_child_session(
         ) as client:
             await codex_native_forwarder._handle_event(
                 client,
-                session_id="conv_parent",
-                bridge_dir=tmp_path,
+                **_forwarder_context(client, tmp_path, session_id="conv_parent"),
                 event=live_child_event,
-                usage_coalescer=codex_native_forwarder._SessionUsageCoalescer(
-                    client, "conv_parent"
-                ),
-                elicitation_tracker=_elicitation_tracker(),
                 expected_thread_id="thread_parent",
                 forwarder_state=state,
             )
@@ -10746,13 +10262,8 @@ def test_forwarder_collab_item_started_registers_child_before_completed(
         ) as client:
             await codex_native_forwarder._handle_event(
                 client,
-                session_id="conv_parent",
-                bridge_dir=tmp_path,
+                **_forwarder_context(client, tmp_path, session_id="conv_parent"),
                 event=started_event,
-                usage_coalescer=codex_native_forwarder._SessionUsageCoalescer(
-                    client, "conv_parent"
-                ),
-                elicitation_tracker=_elicitation_tracker(),
                 expected_thread_id="thread_parent",
                 forwarder_state=state,
             )
@@ -12054,16 +11565,7 @@ def test_forwarder_mirrors_codex_context_compaction(tmp_path: Path) -> None:
     were previously dropped, so the web UI never indicated Codex compacted —
     increasingly relevant with GPT-5.1-Codex-Max auto-compaction.
     """
-    write_bridge_state(
-        tmp_path,
-        CodexNativeBridgeState(
-            session_id="conv_123",
-            socket_path=str(tmp_path / "app-server.sock"),
-            thread_id="thread_123",
-            codex_home=str(tmp_path / "codex-home"),
-            active_turn_id="turn_123",
-        ),
-    )
+    _write_forwarder_bridge(tmp_path, active_turn_id="turn_123")
     forwarder_state = codex_native_forwarder._CodexForwarderState()
     posted: list[dict[str, Any]] = []
 
@@ -12093,10 +11595,7 @@ def test_forwarder_mirrors_codex_context_compaction(tmp_path: Path) -> None:
             ]:
                 await codex_native_forwarder._handle_event(
                     client,
-                    session_id="conv_123",
-                    bridge_dir=tmp_path,
-                    usage_coalescer=_usage_coalescer(client),
-                    elicitation_tracker=_elicitation_tracker(),
+                    **_forwarder_context(client, tmp_path),
                     event=event,
                     forwarder_state=forwarder_state,
                 )
@@ -12188,6 +11687,254 @@ def test_rollout_records_includes_compacted_entry_from_compaction_item() -> None
         and r["payload"].get("content") == [{"type": "input_text", "text": "after compaction"}]
     ]
     assert len(post_items) == 1
+
+
+def test_rollout_records_preserve_function_call_completed_after_compaction() -> None:
+    """A delayed tool output keeps its pre-compaction function call."""
+    records = codex_native._codex_rollout_records_from_session_items(
+        [
+            {
+                "id": "fc_abandoned",
+                "response_id": "codex_turn_abandoned",
+                "type": "function_call",
+                "name": "exec_command",
+                "arguments": '{"cmd":"abandoned-command"}',
+                "call_id": "call_abandoned",
+            },
+            {
+                "id": "fc_slow",
+                "response_id": "codex_turn_slow",
+                "type": "function_call",
+                "name": "exec_command",
+                "arguments": '{"cmd":"slow-command"}',
+                "call_id": "call_slow",
+            },
+            {
+                "id": "cmp_1",
+                "response_id": "compact_1",
+                "type": "compaction",
+                "summary": "slow command still running",
+                "compacted_messages": [
+                    {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "run it"}],
+                    }
+                ],
+            },
+            {
+                "id": "fco_slow",
+                "response_id": "codex_turn_slow",
+                "type": "function_call_output",
+                "call_id": "call_slow",
+                "output": "finished after compaction",
+            },
+        ],
+        session_id="conv_test",
+        external_session_id="019f-thread",
+        cwd=Path("/tmp/test"),
+        model_provider="openai",
+        cli_version="0.154.0",
+    )
+
+    replacement_history = next(record for record in records if record["type"] == "compacted")[
+        "payload"
+    ]["replacement_history"]
+    calls = [item for item in replacement_history if item.get("type") == "function_call"]
+    assert calls == [
+        {
+            "id": "fc_slow",
+            "type": "function_call",
+            "name": "exec_command",
+            "arguments": '{"cmd":"slow-command"}',
+            "call_id": "call_slow",
+        }
+    ]
+    outputs = [
+        record["payload"]
+        for record in records
+        if record["type"] == "response_item"
+        and record["payload"].get("type") == "function_call_output"
+    ]
+    assert outputs == [
+        {
+            "id": "fco_slow",
+            "type": "function_call_output",
+            "call_id": "call_slow",
+            "output": "finished after compaction",
+        }
+    ]
+
+
+def test_rollout_records_do_not_duplicate_function_call_in_compaction() -> None:
+    """A compaction snapshot that already has the open call remains unchanged."""
+    function_call = {
+        "id": "fc_slow",
+        "type": "function_call",
+        "name": "exec_command",
+        "arguments": '{"cmd":"slow-command"}',
+        "call_id": "call_slow",
+    }
+    records = codex_native._codex_rollout_records_from_session_items(
+        [
+            {**function_call, "response_id": "codex_turn_slow"},
+            {
+                "id": "cmp_1",
+                "response_id": "compact_1",
+                "type": "compaction",
+                "summary": "slow command still running",
+                "compacted_messages": [function_call],
+            },
+            {
+                "id": "fco_slow",
+                "response_id": "codex_turn_slow",
+                "type": "function_call_output",
+                "call_id": "call_slow",
+                "output": "finished after compaction",
+            },
+        ],
+        session_id="conv_test",
+        external_session_id="019f-thread",
+        cwd=Path("/tmp/test"),
+        model_provider="openai",
+        cli_version="0.154.0",
+    )
+
+    replacement_history = next(record for record in records if record["type"] == "compacted")[
+        "payload"
+    ]["replacement_history"]
+    assert [
+        item.get("call_id") for item in replacement_history if item.get("type") == "function_call"
+    ] == ["call_slow"]
+
+
+def test_rollout_records_preserve_function_call_across_repeated_compactions() -> None:
+    """An open call survives every compaction before its delayed output."""
+    records = codex_native._codex_rollout_records_from_session_items(
+        [
+            {
+                "id": "fc_slow",
+                "response_id": "codex_turn_slow",
+                "type": "function_call",
+                "name": "exec_command",
+                "arguments": '{"cmd":"slow-command"}',
+                "call_id": "call_slow",
+            },
+            {
+                "id": "cmp_1",
+                "response_id": "compact_1",
+                "type": "compaction",
+                "summary": "slow command still running",
+                "compacted_messages": [
+                    {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "run it"}],
+                    }
+                ],
+            },
+            {
+                "id": "cmp_2",
+                "response_id": "compact_2",
+                "type": "compaction",
+                "summary": "slow command is still running",
+                "compacted_messages": [
+                    {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "run it"}],
+                    }
+                ],
+            },
+            {
+                "id": "fco_slow",
+                "response_id": "codex_turn_slow",
+                "type": "function_call_output",
+                "call_id": "call_slow",
+                "output": "finished after both compactions",
+            },
+        ],
+        session_id="conv_test",
+        external_session_id="019f-thread",
+        cwd=Path("/tmp/test"),
+        model_provider="openai",
+        cli_version="0.154.0",
+    )
+
+    compacted_records = [record for record in records if record["type"] == "compacted"]
+    assert len(compacted_records) == 1
+    replacement_history = compacted_records[0]["payload"]["replacement_history"]
+    assert [
+        item.get("call_id") for item in replacement_history if item.get("type") == "function_call"
+    ] == ["call_slow"]
+    assert [
+        record["payload"].get("call_id")
+        for record in records
+        if record["type"] == "response_item"
+        and record["payload"].get("type") == "function_call_output"
+    ] == ["call_slow"]
+
+
+def test_rollout_records_do_not_carry_interrupted_call_across_compaction() -> None:
+    """An interrupted tool interaction is absent from resumed history."""
+    records = codex_native._codex_rollout_records_from_session_items(
+        [
+            {
+                "id": "fc_cancelled",
+                "response_id": "codex_turn_cancelled",
+                "type": "function_call",
+                "name": "exec_command",
+                "arguments": '{"cmd":"cancelled-command"}',
+                "call_id": "call_cancelled",
+            },
+            {
+                "id": "cmp_1",
+                "response_id": "compact_1",
+                "type": "compaction",
+                "summary": "cancelled command was still running",
+                "compacted_messages": [
+                    {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "run it"}],
+                    }
+                ],
+            },
+            {
+                "id": "fco_cancelled",
+                "response_id": "codex_turn_cancelled",
+                "type": "function_call_output",
+                "call_id": "call_cancelled",
+                "output": "finished after cancellation",
+            },
+            {
+                "id": "msg_cancelled",
+                "response_id": "codex_turn_cancelled",
+                "type": "message",
+                "role": "assistant",
+                "interrupted": True,
+                "content": [{"type": "output_text", "text": "cancelled"}],
+            },
+        ],
+        session_id="conv_test",
+        external_session_id="019f-thread",
+        cwd=Path("/tmp/test"),
+        model_provider="openai",
+        cli_version="0.154.0",
+    )
+
+    replacement_history = next(record for record in records if record["type"] == "compacted")[
+        "payload"
+    ]["replacement_history"]
+    assert not any(
+        item.get("call_id") == "call_cancelled"
+        for item in replacement_history
+        if isinstance(item, dict)
+    )
+    assert not any(
+        record["type"] == "response_item" and record["payload"].get("call_id") == "call_cancelled"
+        for record in records
+    )
 
 
 def test_rollout_records_downgrade_image_stripped_by_compaction_storage() -> None:

@@ -1,5 +1,6 @@
 import { useQuery, type QueryClient } from "@tanstack/react-query";
 import { authenticatedFetch } from "@/lib/identity";
+import { setSessionParent } from "@/lib/sessionHost";
 import { isTempConvId } from "@/lib/tempConversationId";
 
 /**
@@ -180,6 +181,10 @@ export async function fetchChildSessions(sessionId: string): Promise<ChildSessio
   );
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
   const json = (await res.json()) as ChildSessionsResponse;
+  // Children run on this session's runner: record the link so their
+  // session-scoped requests key by this session's host before their own
+  // snapshot loads.
+  for (const row of json.data) setSessionParent(row.id, sessionId);
   return json.data.map((row) => ({
     id: row.id,
     title: row.title,

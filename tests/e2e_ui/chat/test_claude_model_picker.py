@@ -29,7 +29,9 @@ _EXPECTED_ROWS = [
 def _finish_snapshot_routes(page: Page) -> Iterator[None]:
     """Drain snapshot response handlers before Playwright disposes the page."""
     yield
-    page.unroute_all(behavior="wait")
+    # A recording run closes the page when the test body ends.
+    if not page.is_closed():
+        page.unroute_all(behavior="wait")
 
 
 _MODEL_OPTIONS = [

@@ -16,35 +16,17 @@ from __future__ import annotations
 import asyncio
 import json
 import re
-import threading
-from collections.abc import Coroutine
 from typing import Any
 
 from playwright.async_api import Route, async_playwright, expect
 
+from tests._helpers.async_thread import run_in_fresh_loop as _run_in_fresh_loop
 from tests.e2e_ui.start_session.helpers import stub_empty_host_picker_data
 
 # Stubbed host the composer auto-selects.
 _HOST_ID = "host_e2e"
 # Bare create endpoint — intercepts POST but lets GET through.
 _SESSIONS_RE = re.compile(r"/v1/sessions(\?.*)?$")
-
-
-def _run_in_fresh_loop(coro: Coroutine[Any, Any, None]) -> None:
-    """Run *coro* in a dedicated thread with its own event loop."""
-    captured: dict[str, Exception] = {}
-
-    def _worker() -> None:
-        try:
-            asyncio.run(coro)
-        except Exception as exc:
-            captured["error"] = exc
-
-    thread = threading.Thread(target=_worker)
-    thread.start()
-    thread.join()
-    if "error" in captured:
-        raise captured["error"]
 
 
 async def _wait_until(predicate, *, timeout_s: float = 15.0) -> None:
@@ -133,7 +115,7 @@ async def _register_routes(
         # Neutralize agent discovery so only the stubbed Claude agent feeds the
         # picker. On the shared e2e_ui server, sessions other tests left behind
         # would otherwise leak in as discovered custom agents — flipping the
-        # picker's "Custom agents" group on and folding "Create custom agent"
+        # picker's custom-agent "Other..." group on and folding "Create custom agent"
         # into a submenu, so the top-level create row this test clicks is absent.
         await route.fulfill(
             status=200,
@@ -167,7 +149,7 @@ async def _open_create_agent(page) -> None:
     """Open the agent picker and click "Create custom agent".
 
     With no custom agents registered, the create action is a top-level row in
-    the picker (it only folds into a "Custom agents" submenu once custom agents
+    the picker (it only folds into an "Other..." submenu once custom agents
     exist), so open the dropdown and click the create item directly.
     """
     await page.get_by_test_id("new-chat-landing-agent-select").click()

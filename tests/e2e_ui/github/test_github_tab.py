@@ -363,10 +363,18 @@ def test_composer_pr_link_opens_github_tab(
     for name, pair_gap in pair_gaps.items():
         assert pair_gap == pytest.approx(4, abs=0.1), (name, pair_gaps)
     for name, painted_gap in painted_gaps.items():
-        assert painted_gap == pytest.approx(4, abs=0.1), (name, painted_gaps)
-    worktree_bounds = page.get_by_test_id("composer-git-branch").bounding_box()
-    assert worktree_bounds is not None
-    assert context_bounds["x"] >= worktree_bounds["x"] + worktree_bounds["width"]
+        assert painted_gap == pytest.approx(7.5, abs=0.1), (name, painted_gaps)
+    directory_bounds = page.get_by_test_id("composer-workspace-dir").bounding_box()
+    branch_bounds = page.get_by_test_id("composer-git-branch").bounding_box()
+    assert directory_bounds is not None and branch_bounds is not None
+    selector_gaps = (
+        branch_bounds["x"] - directory_bounds["x"] - directory_bounds["width"],
+        pr_bounds["x"] - branch_bounds["x"] - branch_bounds["width"],
+    )
+    expected_selector_gap = 2 if is_mobile else 8
+    for gap in selector_gaps:
+        assert gap == pytest.approx(expected_selector_gap, abs=0.1), selector_gaps
+    assert context_bounds["x"] >= pr_bounds["x"] + pr_bounds["width"]
     assert group_gap > 0
 
 

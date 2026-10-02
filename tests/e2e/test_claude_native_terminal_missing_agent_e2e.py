@@ -63,22 +63,22 @@ Run::
 from __future__ import annotations
 
 import contextlib
-import io
 import json
 import os
 import re
 import secrets
 import shutil
-import signal
-import socket
 import subprocess
 import sys
-import tarfile
 import time
 from pathlib import Path
 
 import httpx
 import pytest
+
+from tests._helpers.live_server import find_free_port, terminate_process
+from tests._helpers.native_session import create_native_session
+from tests._helpers.session import bundle_files, post_session_bundle
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -116,13 +116,6 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def _find_free_port() -> int:
-    """Grab an ephemeral port for the spawned server."""
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        return int(sock.getsockname()[1])
-
-
 def _localhost_env(extra: dict[str, str]) -> dict[str, str]:
     """Subprocess env with worktree imports, no proxy, and no leaked runner ctx.
 
@@ -155,18 +148,6 @@ def _localhost_env(extra: dict[str, str]) -> dict[str, str]:
             env.pop(name, None)
     env.update(extra)
     return env
-
-
-def _terminate(proc: subprocess.Popen[bytes] | None) -> None:
-    """Best-effort SIGTERM -> SIGKILL teardown for a spawned process."""
-    if proc is None or proc.poll() is not None:
-        return
-    proc.send_signal(signal.SIGTERM)
-    try:
-        proc.wait(timeout=10)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        proc.wait(timeout=5)
 
 
 def _wait_http_ok(url: str, deadline: float) -> None:
@@ -208,24 +189,15 @@ def _create_session_with_scoped_agent(base_url: str) -> tuple[str, str]:
             "",
         ]
     )
-    buf = io.BytesIO()
-    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
-        data = yaml_text.encode()
-        # Non-config.yaml arcname routes through the omnigent compat translator.
-        info = tarfile.TarInfo("missing-agent-fixture.yaml")
-        info.size = len(data)
-        tar.addfile(info, io.BytesIO(data))
+    # Non-config.yaml arcname routes through the omnigent compat translator.
+    data = yaml_text.encode()
+    bundle_bytes = bundle_files({"missing-agent-fixture.yaml": data})
 
-    create = _http.post(
+    create = post_session_bundle(
+        _http.post,
         f"{base_url}/v1/sessions",
-        data={"metadata": json.dumps({})},
-        files={
-            "bundle": (
-                "missing-agent-fixture.tar.gz",
-                buf.getvalue(),
-                "application/gzip",
-            )
-        },
+        bundle_bytes,
+        filename="missing-agent-fixture.tar.gz",
         headers={"Origin": OMNIGENT_INTERNAL_WS_ORIGIN},
         timeout=30.0,
     )
@@ -263,7 +235,7 @@ def test_native_claude_terminal_ensure_fails_when_agent_missing(
 
     :param tmp_path: Per-test temp dir (server DB, stub claude, runner HOME).
     """
-    port = _find_free_port()
+    port = find_free_port()
     base_url = f"http://127.0.0.1:{port}"
     db_path = tmp_path / "chat.db"
     database_uri = f"sqlite:///{db_path}"
@@ -464,67 +436,10 @@ def test_native_claude_terminal_ensure_fails_when_agent_missing(
         # The client-safe message must NOT leak the raw agent id / cause.
         assert "session spec resolver" not in message, message
     finally:
-        _terminate(runner_proc)
-        _terminate(server_proc)
+        terminate_process(runner_proc)
+        terminate_process(server_proc)
         server_log.close()
         runner_log.close()
-
-
-def _create_claude_native_session_with_agent(base_url: str) -> tuple[str, str]:
-    """Create a claude-native wrapper session exactly like ``omnigent claude``.
-
-    Reuses the production spec materializer and stamps the same wrapper /
-    terminal-first labels the CLI writes, so the server treats the session as
-    a native-terminal session (``_is_native_terminal_session`` is True) and a
-    plain user message drives the native Claude terminal ensure at turn
-    dispatch.
-
-    :param base_url: Spawned server base URL.
-    :returns: ``(session_id, agent_id)`` for the new claude-native session and
-        its session-scoped agent.
-    """
-    import tempfile
-
-    from omnigent._wrapper_labels import (
-        CLAUDE_NATIVE_WRAPPER_VALUE,
-        UI_MODE_LABEL_KEY,
-        UI_MODE_TERMINAL_VALUE,
-        WRAPPER_LABEL_KEY,
-    )
-    from omnigent.harnesses.claude_native.main import _materialize_claude_agent_spec
-
-    with tempfile.TemporaryDirectory() as tmp:
-        yaml_text = _materialize_claude_agent_spec(Path(tmp)).read_text()
-
-    buf = io.BytesIO()
-    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
-        data = yaml_text.encode()
-        # Non-config.yaml arcname routes through the omnigent compat translator
-        # (the wrapper spec carries no ``spec_version``).
-        info = tarfile.TarInfo("claude-native-ui.yaml")
-        info.size = len(data)
-        tar.addfile(info, io.BytesIO(data))
-
-    labels = {
-        UI_MODE_LABEL_KEY: UI_MODE_TERMINAL_VALUE,
-        WRAPPER_LABEL_KEY: CLAUDE_NATIVE_WRAPPER_VALUE,
-    }
-    create = _http.post(
-        f"{base_url}/v1/sessions",
-        data={"metadata": json.dumps({"labels": labels})},
-        files={
-            "bundle": (
-                "claude-native-ui.tar.gz",
-                buf.getvalue(),
-                "application/gzip",
-            )
-        },
-        headers={"Origin": OMNIGENT_INTERNAL_WS_ORIGIN},
-        timeout=30.0,
-    )
-    create.raise_for_status()
-    body = create.json()
-    return str(body["session_id"]), str(body["agent_id"])
 
 
 def test_native_claude_turn_fails_when_agent_missing(tmp_path: Path) -> None:
@@ -559,7 +474,7 @@ def test_native_claude_turn_fails_when_agent_missing(tmp_path: Path) -> None:
 
     :param tmp_path: Per-test temp dir (server DB, stub claude, HOMEs).
     """
-    port = _find_free_port()
+    port = find_free_port()
     base_url = f"http://127.0.0.1:{port}"
     db_path = tmp_path / "chat.db"
     database_uri = f"sqlite:///{db_path}"
@@ -648,7 +563,10 @@ def test_native_claude_turn_fails_when_agent_missing(tmp_path: Path) -> None:
         )
 
         # A launched claude-native session bound to a real agent.
-        session_id, agent_id = _create_claude_native_session_with_agent(base_url)
+        body = create_native_session(
+            _http, base_url, harness="claude", headers={"Origin": OMNIGENT_INTERNAL_WS_ORIGIN}
+        )
+        session_id, agent_id = str(body["session_id"]), str(body["agent_id"])
 
         # PRECONDITION (the reported state): the bound agent is gone from the
         # store before the terminal ever comes up, so the turn's ensure must
@@ -779,7 +697,7 @@ def test_native_claude_turn_fails_when_agent_missing(tmp_path: Path) -> None:
             f"{server_log_text[-3000:]}"
         )
     finally:
-        _terminate(runner_proc)
-        _terminate(server_proc)
+        terminate_process(runner_proc)
+        terminate_process(server_proc)
         server_log.close()
         runner_log.close()

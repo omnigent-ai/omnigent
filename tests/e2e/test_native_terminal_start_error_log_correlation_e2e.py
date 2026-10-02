@@ -36,7 +36,6 @@ from __future__ import annotations
 
 import contextlib
 import http.server
-import io
 import json
 import os
 import re
@@ -47,7 +46,6 @@ import signal
 import socket
 import subprocess
 import sys
-import tarfile
 import threading
 import time
 from dataclasses import dataclass
@@ -55,6 +53,8 @@ from pathlib import Path
 
 import httpx
 import pytest
+
+from tests._helpers.session import bundle_files, post_session_bundle
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -162,18 +162,15 @@ def _create_session_with_scoped_agent(base_url: str, name: str) -> tuple[str, st
             "",
         ]
     )
-    buf = io.BytesIO()
-    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
-        data = yaml_text.encode()
-        # Non-config.yaml arcname routes through the omnigent compat translator.
-        info = tarfile.TarInfo(f"{name}.yaml")
-        info.size = len(data)
-        tar.addfile(info, io.BytesIO(data))
+    # Non-config.yaml arcname routes through the omnigent compat translator.
+    data = yaml_text.encode()
+    bundle_bytes = bundle_files({f"{name}.yaml": data})
 
-    create = _http.post(
+    create = post_session_bundle(
+        _http.post,
         f"{base_url}/v1/sessions",
-        data={"metadata": json.dumps({})},
-        files={"bundle": (f"{name}.tar.gz", buf.getvalue(), "application/gzip")},
+        bundle_bytes,
+        filename=f"{name}.tar.gz",
         headers={"Origin": OMNIGENT_INTERNAL_WS_ORIGIN},
         timeout=30.0,
     )

@@ -48,13 +48,39 @@ class _FakeResourceRegistry:
 
 def _make_runner(**overrides: Any) -> tuple[NativeInterruptRunner, dict[str, Any]]:
     """Build a runner with recording fakes; return it plus a capture dict."""
-    captured: dict[str, Any] = {"published": [], "wakes": []}
+    captured: dict[str, Any] = {
+        "published": [],
+        "wakes": [],
+        "wake_calls": [],
+        "superseded": [],
+        # The work_id the runner's ``subagent_work_id_for_session`` callback
+        # reports; flip it to simulate a newer send replacing the dispatch.
+        "current_work_id": None,
+    }
 
     def _publish(conv_id: str, event: dict[str, Any]) -> None:
         captured["published"].append((conv_id, event))
 
-    def _mark_and_wake(child_session_id: str, *, status: str, output: str | None) -> _FakeAck:
+    def _mark_and_wake(
+        child_session_id: str,
+        *,
+        status: str,
+        output: str | None,
+        only_if_work_id: str | None = None,
+    ) -> _FakeAck:
+        if only_if_work_id is not None and only_if_work_id != captured["current_work_id"]:
+            # A newer dispatch replaced the entry: drop the delayed op untouched.
+            captured["superseded"].append((child_session_id, status, only_if_work_id))
+            return _FakeAck(delivered=False, reason="superseded_dispatch")
         captured["wakes"].append((child_session_id, status, output))
+        captured["wake_calls"].append(
+            {
+                "child_session_id": child_session_id,
+                "status": status,
+                "output": output,
+                "only_if_work_id": only_if_work_id,
+            }
+        )
         return _FakeAck()
 
     async def _codex_bridge_state(conv_id: str, *, action: str, **_kw: Any) -> Any | None:
@@ -62,6 +88,9 @@ def _make_runner(**overrides: Any) -> tuple[NativeInterruptRunner, dict[str, Any
 
     def _client_safe(exc: BaseException, *, context: str) -> str:
         return f"safe:{context}"
+
+    def _work_id_for_session(conv_id: str) -> str | None:
+        return captured["current_work_id"]
 
     kwargs: dict[str, Any] = {
         "server_client": SimpleNamespace(),
@@ -72,6 +101,7 @@ def _make_runner(**overrides: Any) -> tuple[NativeInterruptRunner, dict[str, Any
         "codex_bridge_state_for_session": _codex_bridge_state,
         "client_safe_error_detail": _client_safe,
         "logger": logging.getLogger("test.interrupt"),
+        "subagent_work_id_for_session": _work_id_for_session,
     }
     kwargs.update(overrides)
     return NativeInterruptRunner(**kwargs), captured
@@ -108,10 +138,15 @@ async def test_no_handler_harnesses_return_none(harness: str | None) -> None:
 
 
 @pytest.mark.asyncio
-async def test_uniform_interrupt_injects_and_wakes_parent(
+async def test_uniform_interrupt_defers_parent_wake_until_outcome_known(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A uniform interrupt calls the bridge inject fn and wakes the parent."""
+    """An interrupt injects the Escape but must not report a terminal status yet.
+
+    Injecting an Escape does not confirm the agent stopped, so no ``cancelled``
+    may be delivered until the harness's terminal edge or the grace timer
+    resolves the outcome.
+    """
     import omnigent.harnesses.goose_native.bridge as goose_bridge
 
     calls: list[Any] = []
@@ -127,7 +162,186 @@ async def test_uniform_interrupt_injects_and_wakes_parent(
 
     assert isinstance(resp, Response) and resp.status_code == 204
     assert calls == [("dir/conv_g", 1.0)]
-    assert captured["wakes"] == [("conv_g", "cancelled", "[System: sub-agent interrupted]")]
+    assert captured["wakes"] == []
+    assert runner.take_pending_interrupt("conv_g")[0] is True
+    # Consumed: a second take finds nothing and the grace timer is disarmed.
+    assert runner.take_pending_interrupt("conv_g")[0] is False
+
+
+@pytest.mark.asyncio
+async def test_interrupt_grace_timer_delivers_unconfirmed_cancel(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With no terminal edge after the interrupt, the grace timer reports cancelled."""
+    import asyncio
+
+    import omnigent.harnesses.goose_native.bridge as goose_bridge
+    from omnigent.runner.native import interrupt as interrupt_mod
+
+    monkeypatch.setattr(goose_bridge, "bridge_dir_for_session_id", lambda conv: f"dir/{conv}")
+    monkeypatch.setattr(goose_bridge, "inject_interrupt", lambda bridge_dir, *, timeout_s: None)
+    monkeypatch.setattr(interrupt_mod, "_NATIVE_INTERRUPT_CANCEL_GRACE_S", 0.02)
+
+    runner, captured = _make_runner()
+    captured["current_work_id"] = "work_g"  # a live dispatch to bind the cancel to
+    resp = await runner.interrupt("goose-native", "conv_g")
+    assert isinstance(resp, Response) and resp.status_code == 204
+    assert captured["wakes"] == []
+
+    await asyncio.sleep(0.1)
+    assert captured["wakes"] == [("conv_g", "cancelled", None)]
+    assert runner.take_pending_interrupt("conv_g")[0] is False
+
+
+@pytest.mark.asyncio
+async def test_grace_timer_does_not_cancel_superseded_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An old interrupt's grace timer must not cancel a newer dispatch.
+
+    Interrupt turn A, then a new send registers turn B on the same child before
+    A's timer fires. The timer is bound to A's ``work_id``, so when it fires the
+    newer dispatch B is left untouched and can still complete — instead of B
+    being cancelled and its result lost.
+    """
+    import asyncio
+
+    import omnigent.harnesses.goose_native.bridge as goose_bridge
+    from omnigent.runner.native import interrupt as interrupt_mod
+
+    monkeypatch.setattr(goose_bridge, "bridge_dir_for_session_id", lambda conv: f"dir/{conv}")
+    monkeypatch.setattr(goose_bridge, "inject_interrupt", lambda bridge_dir, *, timeout_s: None)
+    monkeypatch.setattr(interrupt_mod, "_NATIVE_INTERRUPT_CANCEL_GRACE_S", 0.02)
+
+    runner, captured = _make_runner()
+    captured["current_work_id"] = "work_A"
+    await runner.interrupt("goose-native", "conv_g")  # defers, bound to work_A
+    # A new send reuses the child session before the timer fires.
+    captured["current_work_id"] = "work_B"
+
+    await asyncio.sleep(0.1)
+    assert captured["wakes"] == [], "the newer dispatch must not be cancelled"
+    assert captured["superseded"] == [("conv_g", "cancelled", "work_A")]
+
+
+@pytest.mark.asyncio
+async def test_resolve_pending_interrupt_only_consumes_matching_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A pending interrupt resolves only for its own dispatch, else is dropped.
+
+    An idle for a NEWER dispatch (the interrupted one exited or was superseded)
+    must not consume the stale pending — for a legacy harness that idle is the
+    new dispatch's completion. ``resolve_pending_interrupt`` reports pending
+    only on a work_id match; otherwise it drops the stale record and reports
+    not-pending so the caller handles the idle normally.
+    """
+    import omnigent.harnesses.goose_native.bridge as goose_bridge
+
+    monkeypatch.setattr(goose_bridge, "bridge_dir_for_session_id", lambda conv: f"dir/{conv}")
+    monkeypatch.setattr(goose_bridge, "inject_interrupt", lambda bridge_dir, *, timeout_s: None)
+
+    runner, captured = _make_runner()
+    captured["current_work_id"] = "work_A"
+    await runner.interrupt("goose-native", "conv_g")  # pending bound to work_A
+
+    # An idle arrives for a NEWER dispatch: the pending is stale and must be
+    # dropped, letting the idle be handled as work_B's own outcome.
+    resolved, work_id = runner.resolve_pending_interrupt("conv_g", "work_B")
+    assert (resolved, work_id) == (False, None)
+    assert runner.take_pending_interrupt("conv_g")[0] is False  # stale record dropped
+
+    # A matching dispatch's idle DOES resolve its interrupt.
+    captured["current_work_id"] = "work_C"
+    await runner.interrupt("goose-native", "conv_h")
+    resolved, work_id = runner.resolve_pending_interrupt("conv_h", "work_C")
+    assert (resolved, work_id) == (True, "work_C")
+
+
+@pytest.mark.asyncio
+async def test_repeated_interrupt_on_reused_child_gives_new_dispatch_its_cancel(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stale pending interrupt must not deny a new dispatch its cancellation.
+
+    Interrupt A and leave its pending record (its launch was reaped before the
+    timer fired). Reuse the child for B and interrupt it: B must get its OWN
+    pending record and grace timer — the earlier record for A is replaced, not
+    dedup-suppressed — so B still has a cancellation fallback and its parent is
+    not left waiting indefinitely.
+    """
+    import asyncio
+
+    import omnigent.harnesses.goose_native.bridge as goose_bridge
+    from omnigent.runner.native import interrupt as interrupt_mod
+
+    monkeypatch.setattr(goose_bridge, "bridge_dir_for_session_id", lambda conv: f"dir/{conv}")
+    monkeypatch.setattr(goose_bridge, "inject_interrupt", lambda bridge_dir, *, timeout_s: None)
+    monkeypatch.setattr(interrupt_mod, "_NATIVE_INTERRUPT_CANCEL_GRACE_S", 0.05)
+
+    runner, captured = _make_runner()
+    captured["current_work_id"] = "work_A"
+    await runner.interrupt("goose-native", "conv_g")  # A's pending (work_A) lingers
+    # The child is reused for dispatch B and interrupted before A's timer fires.
+    captured["current_work_id"] = "work_B"
+    await runner.interrupt("goose-native", "conv_g")  # must replace A with work_B
+
+    await asyncio.sleep(0.2)
+    # B receives its OWN grace-period cancellation (bound to work_B, delivered),
+    # rather than being suppressed by A's stale record.
+    assert captured["wakes"] == [("conv_g", "cancelled", None)]
+    assert captured["superseded"] == []
+
+
+@pytest.mark.asyncio
+async def test_grace_timer_skips_cancel_when_dispatch_unbound(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An interrupt with no bound dispatch must not cancel anything on timeout.
+
+    If no work entry existed when the interrupt fired (e.g. a runner restart had
+    not recovered it), the timer captures ``None`` and cannot bind. Delivering a
+    cancel then could settle a newer send that reused the child, so the timer
+    must skip entirely — the restart recovery scan owns unbound children.
+    """
+    import asyncio
+
+    import omnigent.harnesses.goose_native.bridge as goose_bridge
+    from omnigent.runner.native import interrupt as interrupt_mod
+
+    monkeypatch.setattr(goose_bridge, "bridge_dir_for_session_id", lambda conv: f"dir/{conv}")
+    monkeypatch.setattr(goose_bridge, "inject_interrupt", lambda bridge_dir, *, timeout_s: None)
+    monkeypatch.setattr(interrupt_mod, "_NATIVE_INTERRUPT_CANCEL_GRACE_S", 0.02)
+
+    runner, captured = _make_runner()
+    captured["current_work_id"] = None  # no dispatch to bind to
+    await runner.interrupt("goose-native", "conv_g")
+
+    await asyncio.sleep(0.1)
+    assert captured["wakes"] == [], "an unbound interrupt must deliver no cancel"
+    assert captured["superseded"] == []
+
+
+@pytest.mark.asyncio
+async def test_resolved_interrupt_disarms_grace_timer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A terminal edge that consumed the pending interrupt silences the timer."""
+    import asyncio
+
+    import omnigent.harnesses.goose_native.bridge as goose_bridge
+    from omnigent.runner.native import interrupt as interrupt_mod
+
+    monkeypatch.setattr(goose_bridge, "bridge_dir_for_session_id", lambda conv: f"dir/{conv}")
+    monkeypatch.setattr(goose_bridge, "inject_interrupt", lambda bridge_dir, *, timeout_s: None)
+    monkeypatch.setattr(interrupt_mod, "_NATIVE_INTERRUPT_CANCEL_GRACE_S", 0.02)
+
+    runner, captured = _make_runner()
+    await runner.interrupt("goose-native", "conv_g")
+    assert runner.take_pending_interrupt("conv_g")[0] is True
+
+    await asyncio.sleep(0.1)
+    assert captured["wakes"] == []
 
 
 @pytest.mark.asyncio
@@ -192,13 +406,17 @@ async def test_uniform_stop_kills_tears_down_and_goes_idle(
     )
 
     runner, captured = _make_runner()
+    # A stop that follows an unresolved interrupt settles it: the kill is
+    # confirmed, so no grace-timer cancel may fire later.
+    runner._pending_interrupts["conv_c"] = 0.0
     resp = await runner.stop("cursor-native", "conv_c")
 
     assert isinstance(resp, Response) and resp.status_code == 204
+    assert runner.take_pending_interrupt("conv_c")[0] is False
     assert killed == [("dir/conv_c", 1.0)]
     idle = [e for _, e in captured["published"] if e.get("status") == "idle"]
     assert idle == [{"type": "session.status", "status": "idle"}]
-    assert captured["wakes"] == [("conv_c", "cancelled", "[System: sub-agent stopped]")]
+    assert captured["wakes"] == [("conv_c", "cancelled", None)]
 
 
 @pytest.mark.asyncio
@@ -277,7 +495,7 @@ async def test_claude_stop_is_idempotent_without_advertised_tmux(
     resp = await runner.stop("claude-native", "conv_cn")
 
     assert isinstance(resp, Response) and resp.status_code == 204
-    assert captured["wakes"] == [("conv_cn", "cancelled", "[System: sub-agent stopped]")]
+    assert captured["wakes"] == [("conv_cn", "cancelled", None)]
 
 
 @pytest.mark.asyncio
@@ -315,7 +533,7 @@ async def test_claude_stop_kill_failure_returns_503_without_idle(
 async def test_claude_interrupt_resolves_bridge_id_and_injects(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """claude interrupt resolves the bridge id, injects, and wakes the parent."""
+    """claude interrupt resolves the bridge id and injects, deferring the wake."""
     import omnigent.harnesses.claude_native.bridge as claude_bridge
     from omnigent.runner.native import interrupt as interrupt_mod
 
@@ -336,4 +554,6 @@ async def test_claude_interrupt_resolves_bridge_id_and_injects(
 
     assert isinstance(resp, Response) and resp.status_code == 204
     assert injected == [("dir/bid-conv_cl", 1.0)]
-    assert captured["wakes"] == [("conv_cl", "cancelled", "[System: sub-agent interrupted]")]
+    # No optimistic 'cancelled': the outcome is unknown until an edge lands.
+    assert captured["wakes"] == []
+    assert runner.take_pending_interrupt("conv_cl")[0] is True

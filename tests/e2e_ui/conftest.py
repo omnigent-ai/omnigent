@@ -35,6 +35,8 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import math
+import mimetypes
 import os
 import re
 import shutil
@@ -42,9 +44,8 @@ import signal
 import socket
 import subprocess
 import sys
-import tarfile
-import textwrap
 import time
+import warnings
 from collections.abc import Callable, Generator, Iterator
 from dataclasses import dataclass
 from pathlib import Path
@@ -53,28 +54,49 @@ from typing import Any
 import filelock
 import httpx
 import pytest
-from packaging.version import InvalidVersion, Version
 from playwright.sync_api import APIResponse, Error, Locator, Page, Route, expect
 
 from tests._helpers.compat import (
-    COMPAT_SERVER_VERSION_ENV,
     apply_server_env,
     compat_server_cwd,
-    meets_min_server_version,
-    resolve_server_version,
     server_executable,
 )
+from tests._helpers.native_session import create_native_session
+from tests._helpers.session import bind_session_runner, bundle_files, post_session_bundle
 from tests.codex_parity.helpers import ev_assistant_message, ev_completed, ev_response_created
 from tests.codex_parity.sidecar_harness import (
     CodexResponsesSidecar,
     build_sidecar_bin,
     start_codex_responses_sidecar,
 )
-from tests.e2e_ui import timings
-from tests.e2e_ui.url_safety import DEV_PORTS, unsafe_ui_base_url_reason
+from tests.helpers import ui_timings as timings
+from tests.helpers.ui_configuration import (
+    _ALLOW_DEV_BASE_URL_ENV,
+    ServerState,
+    prepared_repro_environment,
+)
+from tests.helpers.ui_configuration import (
+    _CLAUDE_MOCK_MODEL as _CLAUDE_MOCK_MODEL,
+)
+from tests.helpers.ui_configuration import (
+    _CODEX_MOCK_MODEL as _CODEX_MOCK_MODEL,
+)
+from tests.helpers.ui_configuration import (
+    pytest_configure as pytest_configure,
+)
+from tests.helpers.ui_configuration import (
+    temp_omnigent_mock_config as _temp_omnigent_mock_config,
+)
+from tests.helpers.ui_server_compat import (
+    _enforce_min_server_version as _enforce_min_server_version,
+)
+from tests.helpers.ui_server_compat import (
+    server_version as server_version,
+)
+from tests.helpers.ui_url_safety import DEV_PORTS
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
-_ALLOW_DEV_BASE_URL_ENV = "OMNIGENT_E2E_ALLOW_DEV_BASE_URL"
+_RECORD_DIR_ENV = "OMNIGENT_E2E_RECORD_DIR"
 _CODEX_GOAL_MIN_VERSION = (0, 139, 0)
 _PUBLIC_LOOPBACK_HOST = "omnigent-e2e-public.test"
 
@@ -169,39 +191,8 @@ def switch_markdown_view_mode(page: Page, file_viewer: Locator, mode: str) -> No
     page.get_by_role("menuitem", name=mode, exact=True).click()
 
 
-# Populated by ``live_server`` so test-scoped fixtures can access the
-# server PID and runner id without changing ``live_server``'s return
-# type (which other tests depend on).
-class _ServerState(dict[str, object]):
-    def __missing__(self, key: str) -> object:
-        if self.get("workflow_owned") and key in {
-            "pid",
-            "runner_pid",
-            "database_uri",
-            "restart_server",
-            "binding_token",
-        }:
-            raise RuntimeError(
-                f"Workflow-owned reproduction does not expose {key!r} to test fixtures. "
-                "Use the product HTTP API, or run this process/database test in a "
-                "separate fixture-owned environment outside dev.repro_env exec."
-            )
-        raise KeyError(key)
-
-
-_server_state: dict[str, object] = _ServerState()
-
-
-def _prepared_repro_environment() -> dict[str, str]:
-    keys = ("OMNIGENT_REPRO_SERVER_URL", "OMNIGENT_REPRO_MODEL_URL", "OMNIGENT_REPRO_RUNNER_ID")
-    values = {key: os.environ.get(key, "") for key in keys}
-    if any(values.values()) and not all(values.values()):
-        missing = ", ".join(key for key, value in values.items() if not value)
-        raise RuntimeError(
-            f"Incomplete prepared reproduction environment: missing {missing}. "
-            "Launch tests via python -m dev.repro_env exec -- ..."
-        )
-    return values
+# Populated by live_server for fixtures that need the server PID or runner ID.
+_server_state: dict[str, object] = ServerState()
 
 
 _WEB_DIR = _REPO_ROOT / "web"
@@ -361,52 +352,6 @@ def pytest_addoption(parser: pytest.Parser) -> None:
     )
 
 
-def pytest_configure(config: pytest.Config) -> None:
-    """Fail fast on unsafe e2e-ui harness options.
-
-    :param config: Pytest config with repo and pytest-playwright options.
-    """
-    timings.pytest_configure(config)
-    base_url = config.getoption("--ui-base-url")
-    if base_url:
-        _validate_ui_base_url(base_url)
-
-    if os.environ.get("CI") and config.getoption("--headed", default=False):
-        raise pytest.UsageError(
-            "tests/e2e_ui must run headless in CI. Remove --headed; headed "
-            "browser windows are only allowed for local debugging."
-        )
-
-
-@pytest.fixture(scope="session")
-def server_version(live_server: str) -> str:
-    """Read the live version once and cross-check any pinned compat server."""
-    return resolve_server_version(live_server)
-
-
-@pytest.fixture(autouse=True)
-def _enforce_min_server_version(request: pytest.FixtureRequest) -> None:
-    """Skip unsupported features without hiding a shadowed compat server."""
-    marker = request.node.get_closest_marker("min_server_version")
-    if marker is None and not os.environ.get(COMPAT_SERVER_VERSION_ENV):
-        return
-
-    required = None
-    if marker is not None:
-        if len(marker.args) != 1 or marker.kwargs or not isinstance(marker.args[0], str):
-            raise pytest.UsageError("min_server_version marker requires one version string")
-        required = marker.args[0]
-        try:
-            Version(required)
-        except InvalidVersion as exc:
-            raise pytest.UsageError(f"invalid min_server_version marker: {required!r}") from exc
-
-    # Resolve even unmarked compat tests so a worktree-shadowed server fails.
-    server_ver = request.getfixturevalue("server_version")
-    if required is not None and not meets_min_server_version(server_ver, required):
-        pytest.skip(f"requires server >= {required}; running {server_ver}")
-
-
 @pytest.fixture(scope="session")
 def browser_type_launch_args(
     browser_type_launch_args: dict[str, Any],
@@ -452,23 +397,15 @@ def browser_context_args(
     pytest-playwright already creates a fresh context for its function-scoped
     ``context`` and ``page`` fixtures. Keeping this wrapper function-scoped
     makes that contract explicit and prevents accidental mutable option reuse.
+    When ``OMNIGENT_E2E_RECORD_DIR`` is set, those fixtures record their video
+    there unless ``--video`` already chose a directory.
     """
-    return {**browser_context_args}
-
-
-def _validate_ui_base_url(base_url: str) -> None:
-    reason = unsafe_ui_base_url_reason(base_url)
-    if reason is None or os.environ.get(_ALLOW_DEV_BASE_URL_ENV) == "1":
-        return
-    dev_ports = ", ".join(str(port) for port in sorted(DEV_PORTS))
-    raise pytest.UsageError(
-        f"Refusing --ui-base-url={base_url!r}: {reason}. Reusing a dev or "
-        "production-like server is unsafe because e2e UI tests share that "
-        "server's database, artifacts, and runner state. Omit --ui-base-url "
-        "to let the fixture spawn an isolated server on a random port. If "
-        "you intentionally want to reuse this server for local debugging, "
-        f"set {_ALLOW_DEV_BASE_URL_ENV}=1. Refused dev ports: {dev_ports}."
-    )
+    context_args = {**browser_context_args}
+    record_dir = os.environ.get(_RECORD_DIR_ENV)
+    if record_dir:
+        Path(record_dir).mkdir(parents=True, exist_ok=True)
+        context_args.setdefault("record_video_dir", record_dir)
+    return context_args
 
 
 @pytest.hookimpl(trylast=True)
@@ -520,21 +457,11 @@ def _register_agent_yaml(
     Returns the new agent id on 201, or None on 409 (already registered against
     a long-lived ``--ui-base-url`` server).
     """
-    import json as _json
 
     yaml_bytes = yaml_text.encode()
-    buf = io.BytesIO()
-    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
-        info = tarfile.TarInfo(arcname)
-        info.size = len(yaml_bytes)
-        tar.addfile(info, io.BytesIO(yaml_bytes))
+    bundle_bytes = bundle_files({arcname: yaml_bytes})
 
-    resp = httpx.post(
-        f"{base_url}/v1/sessions",
-        data={"metadata": _json.dumps({})},
-        files={"bundle": ("agent.tar.gz", buf.getvalue(), "application/gzip")},
-        timeout=10.0,
-    )
+    resp = post_session_bundle(httpx.post, f"{base_url}/v1/sessions", bundle_bytes, timeout=10.0)
     if resp.status_code == 409:
         return None
     resp.raise_for_status()
@@ -598,7 +525,7 @@ def mock_llm_server_url(
     :param tmp_path_factory: Pytest temp path factory for logs.
     :returns: The mock server base URL, e.g. ``"http://127.0.0.1:51235"``.
     """
-    if url := _prepared_repro_environment()["OMNIGENT_REPRO_MODEL_URL"]:
+    if url := prepared_repro_environment()["OMNIGENT_REPRO_MODEL_URL"]:
         yield url
         return
     mock_port = _find_free_port()
@@ -652,8 +579,9 @@ def configure_mock_llm(
     mock_url: str,
     responses: list[dict[str, Any]],
     *,
-    key: str = "default",
+    key: str | None = None,
     match: str | None = None,
+    required_tools: list[str] | None = None,
 ) -> None:
     """Configure a keyed response queue on the mock LLM server.
 
@@ -671,12 +599,22 @@ def configure_mock_llm(
         completion event — a mid-stream fault for exercising the SPA's
         stream error/recovery UI).
     :param key: Queue key — typically the model name baked into the
-        agent spec. Defaults to ``"default"`` (matches any model
-        not assigned to a more specific queue).
+        agent spec. Omitting it allocates an independent content queue when
+        ``match`` is supplied, otherwise uses ``"default"``. Explicit keys replace
+        existing queues. The helper in ``tests/e2e/conftest.py`` instead uses
+        the match token as its explicit key and has no ``required_tools`` parameter.
     :param match: Optional substring to match against the user text for
         content-based routing (in addition to model-name routing).
+    :param required_tools: Only consume responses when these tools are advertised.
+        Use this to exclude title-generation requests containing the same nonce.
+        When omitted, the next scripted tool call requires a request with any
+        tools. Pass an empty list to allow calls even on requests without tools.
     """
-    body: dict[str, Any] = {"key": key, "responses": responses}
+    body: dict[str, Any] = {"responses": responses}
+    if key is not None:
+        body["key"] = key
+    if required_tools is not None:
+        body["required_tools"] = required_tools
     if match is not None:
         body["match"] = match
     resp = httpx.post(
@@ -870,7 +808,7 @@ def built_spa(request: pytest.FixtureRequest) -> None:
         ``--ui-skip-build``.
     :returns: ``None``. Side effect is the populated build dir.
     """
-    if _prepared_repro_environment()["OMNIGENT_REPRO_SERVER_URL"] or request.config.getoption(
+    if prepared_repro_environment()["OMNIGENT_REPRO_SERVER_URL"] or request.config.getoption(
         "--ui-base-url"
     ):
         return
@@ -1041,7 +979,7 @@ def live_server(
         the expected local runner does not report online within
         :data:`_HEALTH_TIMEOUT_S` seconds.
     """
-    prepared = _prepared_repro_environment()
+    prepared = prepared_repro_environment()
     if base_url := prepared["OMNIGENT_REPRO_SERVER_URL"]:
         _server_state.update(
             runner_id=prepared["OMNIGENT_REPRO_RUNNER_ID"],
@@ -1359,7 +1297,6 @@ def seeded_session(
     :returns: ``(base_url, session_id)``. Tests typically navigate to
         ``f"{base_url}/c/{session_id}"``.
     """
-    import json as _json
 
     respawned_runner = _ensure_runner_online(live_server, tmp_path_factory)
     runner_id = str(_server_state["runner_id"])
@@ -1367,21 +1304,13 @@ def seeded_session(
     # pre-registered the agent via --agent, but since /api/agents is
     # removed we create a fresh session-scoped agent via multipart.
     bundle = _build_hello_world_bundle()
-    create_resp = httpx.post(
-        f"{live_server}/v1/sessions",
-        data={"metadata": _json.dumps({})},
-        files={"bundle": ("agent.tar.gz", bundle, "application/gzip")},
-        timeout=30.0,
+    create_resp = post_session_bundle(
+        httpx.post, f"{live_server}/v1/sessions", bundle, timeout=30.0
     )
     create_resp.raise_for_status()
     session_id = create_resp.json()["session_id"]
 
-    patch_resp = httpx.patch(
-        f"{live_server}/v1/sessions/{session_id}",
-        json={"runner_id": runner_id},
-        timeout=10.0,
-    )
-    patch_resp.raise_for_status()
+    bind_session_runner(httpx.patch, live_server, session_id, runner_id, timeout=10.0)
 
     try:
         yield (live_server, session_id)
@@ -1410,24 +1339,13 @@ def _create_runner_bound_session(base_url: str, runner_id: str) -> str:
         e.g. ``"runner_token_abc123"``.
     :returns: The new session/conversation id, e.g. ``"conv_abc123"``.
     """
-    import json as _json
 
     bundle = _build_hello_world_bundle()
-    create_resp = httpx.post(
-        f"{base_url}/v1/sessions",
-        data={"metadata": _json.dumps({})},
-        files={"bundle": ("agent.tar.gz", bundle, "application/gzip")},
-        timeout=30.0,
-    )
+    create_resp = post_session_bundle(httpx.post, f"{base_url}/v1/sessions", bundle, timeout=30.0)
     create_resp.raise_for_status()
     session_id = create_resp.json()["session_id"]
 
-    patch_resp = httpx.patch(
-        f"{base_url}/v1/sessions/{session_id}",
-        json={"runner_id": runner_id},
-        timeout=10.0,
-    )
-    patch_resp.raise_for_status()
+    bind_session_runner(httpx.patch, base_url, session_id, runner_id, timeout=10.0)
     return session_id
 
 
@@ -1745,21 +1663,13 @@ def terminal_session(
         info = tarfile.TarInfo(name=f"{_TERMINAL_AGENT_NAME}.yaml")
         info.size = len(data)
         tar.addfile(info, io.BytesIO(data))
-    create_resp = httpx.post(
-        f"{live_server}/v1/sessions",
-        data={"metadata": _json.dumps({})},
-        files={"bundle": ("agent.tar.gz", buf.getvalue(), "application/gzip")},
-        timeout=10.0,
+    create_resp = post_session_bundle(
+        httpx.post, f"{live_server}/v1/sessions", buf.getvalue(), timeout=10.0
     )
     create_resp.raise_for_status()
     session_id = create_resp.json()["session_id"]
 
-    patch_resp = httpx.patch(
-        f"{live_server}/v1/sessions/{session_id}",
-        json={"runner_id": runner_id},
-        timeout=10.0,
-    )
-    patch_resp.raise_for_status()
+    bind_session_runner(httpx.patch, live_server, session_id, runner_id, timeout=10.0)
 
     try:
         yield (live_server, session_id)
@@ -1899,7 +1809,6 @@ def two_agent_chat_session(
     :param tmp_path_factory: Pytest temp path factory (for a respawn log).
     :returns: A :class:`TwoAgentChatSession` handle.
     """
-    import json as _json
     import uuid
 
     verification_code = f"vogon-{uuid.uuid4().hex[:10]}"
@@ -1968,29 +1877,17 @@ def two_agent_chat_session(
     runner_id = str(_server_state["runner_id"])
 
     yaml_bytes = yaml_text.encode()
-    buf = io.BytesIO()
-    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
-        # Non-config.yaml arcname routes the bundle through the omnigent
-        # compat adapter, whose loader parses the inline `type: agent`
-        # tool. The spec_version:1 parser does not accept this shorthand.
-        info = tarfile.TarInfo(name=f"{_TWO_AGENT_PARENT_NAME}.yaml")
-        info.size = len(yaml_bytes)
-        tar.addfile(info, io.BytesIO(yaml_bytes))
-    create_resp = httpx.post(
-        f"{live_server}/v1/sessions",
-        data={"metadata": _json.dumps({})},
-        files={"bundle": ("agent.tar.gz", buf.getvalue(), "application/gzip")},
-        timeout=10.0,
+    # Non-config.yaml arcname routes the bundle through the omnigent
+    # compat adapter, whose loader parses the inline `type: agent`
+    # tool. The spec_version:1 parser does not accept this shorthand.
+    bundle_bytes = bundle_files({f"{_TWO_AGENT_PARENT_NAME}.yaml": yaml_bytes})
+    create_resp = post_session_bundle(
+        httpx.post, f"{live_server}/v1/sessions", bundle_bytes, timeout=10.0
     )
     create_resp.raise_for_status()
     session_id = create_resp.json()["session_id"]
 
-    patch_resp = httpx.patch(
-        f"{live_server}/v1/sessions/{session_id}",
-        json={"runner_id": runner_id},
-        timeout=10.0,
-    )
-    patch_resp.raise_for_status()
+    bind_session_runner(httpx.patch, live_server, session_id, runner_id, timeout=10.0)
 
     try:
         yield TwoAgentChatSession(
@@ -2132,28 +2029,16 @@ def approval_session(
     runner_id = str(_server_state["runner_id"])
 
     yaml_bytes = agent_yaml_text.encode()
-    buf = io.BytesIO()
-    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
-        # Strict path: arcname config.yaml keeps it on the spec_version:1
-        # parser, which is the one that honors `guardrails`.
-        info = tarfile.TarInfo(name="config.yaml")
-        info.size = len(yaml_bytes)
-        tar.addfile(info, io.BytesIO(yaml_bytes))
-    create_resp = httpx.post(
-        f"{live_server}/v1/sessions",
-        data={"metadata": _json.dumps({})},
-        files={"bundle": ("agent.tar.gz", buf.getvalue(), "application/gzip")},
-        timeout=30.0,
+    # Strict path: arcname config.yaml keeps it on the spec_version:1
+    # parser, which is the one that honors `guardrails`.
+    bundle_bytes = bundle_files({"config.yaml": yaml_bytes})
+    create_resp = post_session_bundle(
+        httpx.post, f"{live_server}/v1/sessions", bundle_bytes, timeout=30.0
     )
     create_resp.raise_for_status()
     session_id = create_resp.json()["session_id"]
 
-    patch_resp = httpx.patch(
-        f"{live_server}/v1/sessions/{session_id}",
-        json={"runner_id": runner_id},
-        timeout=10.0,
-    )
-    patch_resp.raise_for_status()
+    bind_session_runner(httpx.patch, live_server, session_id, runner_id, timeout=10.0)
 
     try:
         yield (live_server, session_id)
@@ -2358,33 +2243,17 @@ def _workspace_panel_test_baseline(request: pytest.FixtureRequest) -> None:
     page.add_init_script("window.localStorage.setItem('omnigent:default-workspace-panel', 'open')")
 
 
-@pytest.fixture(autouse=True)
-def _record_video(
-    monkeypatch: pytest.MonkeyPatch,
-) -> Iterator[None]:
-    """Capture a screen recording of the journey when recording is requested.
-
-    Most e2e_ui tests drive Playwright through ``async_playwright()`` directly
-    (``browser.new_page()`` / ``browser.new_context()``), not the
-    pytest-playwright ``page`` fixture, so ``pytest --video`` records nothing for
-    them. When ``OMNIGENT_E2E_RECORD_DIR`` is set, patch the async ``Browser``
-    methods to inject ``record_video_dir`` into every page/context they open, so
-    the rendered journey lands as a ``.webm`` regardless of how the test opened
-    the browser. A caller that already passes ``record_video_dir`` is left alone.
-    Playwright writes the file (a random hash name) when the context closes;
-    callers/harnesses pick it up from the directory. No-op when the env var is
-    unset, so ordinary runs are unaffected.
-    """
-    record_dir = os.environ.get("OMNIGENT_E2E_RECORD_DIR")
-    if not record_dir:
-        yield
-        return
-
+def _install_record_video_patches(monkeypatch: pytest.MonkeyPatch, record_dir: str) -> None:
+    """Inject ``record_video_dir`` into every page/context a ``Browser`` opens,
+    on both the async and sync Playwright APIs. A caller that already passes
+    ``record_video_dir`` is left alone."""
     from playwright.async_api import Browser as _AsyncBrowser
+    from playwright.sync_api import Browser as _SyncBrowser
 
-    Path(record_dir).mkdir(parents=True, exist_ok=True)
     _orig_new_page = _AsyncBrowser.new_page
     _orig_new_context = _AsyncBrowser.new_context
+    _orig_sync_new_page = _SyncBrowser.new_page
+    _orig_sync_new_context = _SyncBrowser.new_context
 
     async def _new_page(self: Any, *args: Any, **kwargs: Any) -> Any:
         kwargs.setdefault("record_video_dir", record_dir)
@@ -2394,9 +2263,199 @@ def _record_video(
         kwargs.setdefault("record_video_dir", record_dir)
         return await _orig_new_context(self, *args, **kwargs)
 
+    def _sync_new_page(self: Any, *args: Any, **kwargs: Any) -> Any:
+        kwargs.setdefault("record_video_dir", record_dir)
+        return _orig_sync_new_page(self, *args, **kwargs)
+
+    def _sync_new_context(self: Any, *args: Any, **kwargs: Any) -> Any:
+        kwargs.setdefault("record_video_dir", record_dir)
+        return _orig_sync_new_context(self, *args, **kwargs)
+
     monkeypatch.setattr(_AsyncBrowser, "new_page", _new_page)
     monkeypatch.setattr(_AsyncBrowser, "new_context", _new_context)
+    monkeypatch.setattr(_SyncBrowser, "new_page", _sync_new_page)
+    monkeypatch.setattr(_SyncBrowser, "new_context", _sync_new_context)
+
+
+@pytest.fixture(autouse=True)
+def _record_video(
+    monkeypatch: pytest.MonkeyPatch,
+) -> Iterator[None]:
+    """Record async and sync browser journeys when OMNIGENT_E2E_RECORD_DIR is set.
+
+    Patch Browser methods for direct calls; browser_context_args covers sync
+    fixtures. Preserve explicit recording paths. Playwright writes the video
+    when the context closes; an unset environment variable leaves recording off."""
+    record_dir = os.environ.get(_RECORD_DIR_ENV)
+    if not record_dir:
+        yield
+        return
+
+    Path(record_dir).mkdir(parents=True, exist_ok=True)
+    _install_record_video_patches(monkeypatch, record_dir)
     yield
+
+
+def _recording_requested(item: pytest.Item) -> bool:
+    """True when this test films the journey: env var, ``--video``, or a recording context."""
+    if os.environ.get(_RECORD_DIR_ENV):
+        return True
+    if item.config.getoption("--video", default="off") not in (None, "off"):
+        return True
+    # Authored reproductions sometimes hard-code ``record_video_dir`` themselves.
+    context_args = getattr(item, "funcargs", {}).get("browser_context_args") or {}
+    if context_args.get("record_video_dir"):
+        return True
+    marker = item.get_closest_marker("browser_context_args")
+    return marker is not None and bool(marker.kwargs.get("record_video_dir"))
+
+
+def _stop_recorded_context(item: pytest.Item) -> None:
+    """Close the pytest-playwright context so its video ends on the test's final state."""
+    context = getattr(item, "funcargs", {}).get("context")
+    # No open page means the test closed it and the video is already finalized.
+    if context is None or not context.pages:
+        return
+    # pytest-playwright's close wrapper still takes its screenshots and traces.
+    try:
+        context.close()
+    except Error as exc:
+        # A diagnostic from the report hook must not replace the test result,
+        # even when the suite promotes warnings to errors.
+        with warnings.catch_warnings():
+            warnings.simplefilter("always", pytest.PytestWarning)
+            item.warn(
+                pytest.PytestWarning(f"Could not finalize recording for {item.nodeid}: {exc}")
+            )
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_makereport(
+    item: pytest.Item, call: pytest.CallInfo[None]
+) -> Generator[None, None, None]:
+    """Stop the recording when the test body ends, before later fixtures tear down.
+
+    The ``context`` behind ``page`` otherwise outlives the session fixtures' teardown."""
+    yield
+    if call.when == "call" and _recording_requested(item):
+        _stop_recorded_context(item)
+
+
+# Screenshot kwargs that describe the clipped result rather than the
+# full-viewport capture it is cropped from.
+_CLIP_RESULT_KEYS = frozenset({"clip", "path", "type", "quality"})
+
+
+def _recorded_clip_format(kwargs: dict[str, Any]) -> str | None:
+    """Resolve supported output formats without bypassing native path validation."""
+    kind = kwargs.get("type")
+    if kind is None:
+        path = kwargs.get("path")
+        if path is None:
+            return "png"
+        if not isinstance(path, (str, Path)):
+            return None
+        kind = {"image/png": "png", "image/jpeg": "jpeg"}.get(mimetypes.guess_type(path)[0])
+    return kind if kind in ("png", "jpeg") else None
+
+
+def _recorded_clip_capture(page: Any, kwargs: dict[str, Any]) -> dict[str, Any] | None:
+    """Full-viewport screenshot kwargs for a clip of a video-recorded page, or
+    ``None`` when Playwright's native clip path is fine (no clip, ``full_page``,
+    or a page whose context is not recording video)."""
+    if kwargs.get("clip") is None or kwargs.get("full_page") or page.video is None:
+        return None
+    browser = page.context.browser
+    if browser is not None and browser.browser_type.name != "chromium":
+        return None
+    # Keep malformed options on Playwright's native path so it owns validation
+    # and raises the same errors before attempting a clipped capture.
+    kind = _recorded_clip_format(kwargs)
+    if kind is None:
+        return None
+    quality = kwargs.get("quality")
+    if quality is not None and (
+        kind != "jpeg"
+        or type(quality) not in (int, float)
+        or not 0 <= quality <= 100
+        or quality != int(quality)
+    ):
+        return None
+    clip = kwargs["clip"]
+    if not isinstance(clip, dict) or any(
+        type(clip.get(key)) not in (int, float) or not math.isfinite(clip[key])
+        for key in ("x", "y", "width", "height")
+    ):
+        return None
+    if clip["width"] <= 0 or clip["height"] <= 0:
+        return None
+    return {**{k: v for k, v in kwargs.items() if k not in _CLIP_RESULT_KEYS}, "type": "png"}
+
+
+def _crop_recorded_clip(png: bytes, page: Any, kwargs: dict[str, Any]) -> bytes:
+    """Cut ``kwargs["clip"]`` out of a full-viewport PNG, encoding and saving it
+    the way the clipped screenshot would have been."""
+    from PIL import Image
+
+    clip = kwargs["clip"]
+    image = Image.open(io.BytesIO(png))
+    viewport = page.viewport_size
+    # CSS pixels to image pixels; covers device_scale_factor and scale="css".
+    factor = image.width / viewport["width"] if viewport else 1.0
+    x = max(0, clip["x"])
+    y = max(0, clip["y"])
+    width = min(image.width / factor, clip["x"] + clip["width"]) - x
+    height = min(image.height / factor, clip["y"] + clip["height"]) - y
+    # Chromium rounds the origin to device pixels and truncates the CSS size.
+    left = math.floor(x * factor + 0.5)
+    top = math.floor(y * factor + 0.5)
+    right = min(image.width, left + math.floor(math.floor(width + 1e-3) * factor + 0.5))
+    bottom = min(image.height, top + math.floor(math.floor(height + 1e-3) * factor + 0.5))
+    if right <= left or bottom <= top:
+        raise Error("Clipped area is either empty or outside the resulting image")
+    cropped = image.crop((left, top, right, bottom))
+
+    path = kwargs.get("path")
+    kind = _recorded_clip_format(kwargs)
+    encoded = io.BytesIO()
+    if kind == "jpeg":
+        quality = kwargs.get("quality")
+        cropped.convert("RGB").save(
+            encoded, "JPEG", quality=80 if quality is None else int(quality)
+        )
+    else:
+        cropped.save(encoded, "PNG")
+    data = encoded.getvalue()
+    if path:
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        Path(path).write_bytes(data)
+    return data
+
+
+@pytest.fixture(autouse=True)
+def _undistorted_clip_screenshots(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep ``page.screenshot(clip=...)`` from distorting a page's video recording:
+    Chromium resizes the view to the clip for the capture and the screencast films
+    that, so a recorded page gets a full-viewport capture cropped to the clip."""
+    from playwright.async_api import Page as _AsyncPage
+
+    orig_sync = Page.screenshot
+    orig_async = _AsyncPage.screenshot
+
+    def sync_screenshot(self: Page, **kwargs: Any) -> bytes:
+        viewport_kwargs = _recorded_clip_capture(self, kwargs)
+        if viewport_kwargs is None:
+            return orig_sync(self, **kwargs)
+        return _crop_recorded_clip(orig_sync(self, **viewport_kwargs), self, kwargs)
+
+    async def async_screenshot(self: Any, **kwargs: Any) -> bytes:
+        viewport_kwargs = _recorded_clip_capture(self, kwargs)
+        if viewport_kwargs is None:
+            return await orig_async(self, **kwargs)
+        return _crop_recorded_clip(await orig_async(self, **viewport_kwargs), self, kwargs)
+
+    monkeypatch.setattr(Page, "screenshot", sync_screenshot)
+    monkeypatch.setattr(_AsyncPage, "screenshot", async_screenshot)
 
 
 @pytest.fixture
@@ -2463,8 +2522,6 @@ def server_pid(live_server: str) -> int:
 _CUSTOM_AGENT_NAME = "echo_probe"
 # A separate mock model keeps the empty parity fallback away from other tests.
 _CUSTOM_AGENT_MODEL = "render-parity-probe"
-_CLAUDE_MOCK_MODEL = "claude-sonnet-4-20250514"
-_CODEX_MOCK_MODEL = "gpt-4o"
 _CUSTOM_AGENT_YAML = f"""\
 spec_version: 1
 name: {_CUSTOM_AGENT_NAME}
@@ -2487,12 +2544,7 @@ def _bind_session_runner(base_url: str, session_id: str, runner_id: str) -> None
     :param session_id: The session/conversation id to bind.
     :param runner_id: The token-bound runner id the session dispatches to.
     """
-    patch = httpx.patch(
-        f"{base_url}/v1/sessions/{session_id}",
-        json={"runner_id": runner_id},
-        timeout=10.0,
-    )
-    patch.raise_for_status()
+    bind_session_runner(httpx.patch, base_url, session_id, runner_id, timeout=10.0)
 
 
 def _create_bundled_session(base_url: str, runner_id: str, yaml_text: str) -> str:
@@ -2507,21 +2559,11 @@ def _create_bundled_session(base_url: str, runner_id: str, yaml_text: str) -> st
     :param yaml_text: The agent spec body.
     :returns: The new session/conversation id.
     """
-    import json as _json
 
-    buf = io.BytesIO()
-    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
-        data = yaml_text.encode()
-        info = tarfile.TarInfo("config.yaml")
-        info.size = len(data)
-        tar.addfile(info, io.BytesIO(data))
+    data = yaml_text.encode()
+    bundle_bytes = bundle_files({"config.yaml": data})
 
-    create = httpx.post(
-        f"{base_url}/v1/sessions",
-        data={"metadata": _json.dumps({})},
-        files={"bundle": ("agent.tar.gz", buf.getvalue(), "application/gzip")},
-        timeout=30.0,
-    )
+    create = post_session_bundle(httpx.post, f"{base_url}/v1/sessions", bundle_bytes, timeout=30.0)
     create.raise_for_status()
     session_id = str(create.json()["session_id"])
     _bind_session_runner(base_url, session_id, runner_id)
@@ -2584,45 +2626,11 @@ def _create_native_claude_session(
         launches with the production defaults.
     :returns: The new session/conversation id.
     """
-    import json as _json
-    import tempfile
-
-    from omnigent._wrapper_labels import (
-        CLAUDE_NATIVE_WRAPPER_VALUE,
-        UI_MODE_LABEL_KEY,
-        UI_MODE_TERMINAL_VALUE,
-        WRAPPER_LABEL_KEY,
-    )
-    from omnigent.harnesses.claude_native.main import _materialize_claude_agent_spec
-
-    with tempfile.TemporaryDirectory() as _tmp:
-        spec_path = _materialize_claude_agent_spec(Path(_tmp))
-        yaml_text = spec_path.read_text()
-
-    buf = io.BytesIO()
-    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
-        data = yaml_text.encode()
-        # Non-config.yaml arcname → omnigent compat translator (the spec has
-        # no spec_version), matching the terminal_session fixture.
-        info = tarfile.TarInfo("claude-native-ui.yaml")
-        info.size = len(data)
-        tar.addfile(info, io.BytesIO(data))
-
-    labels = {
-        UI_MODE_LABEL_KEY: UI_MODE_TERMINAL_VALUE,
-        WRAPPER_LABEL_KEY: CLAUDE_NATIVE_WRAPPER_VALUE,
-    }
-    metadata: dict[str, object] = {"labels": labels}
+    metadata: dict[str, object] = {}
     if terminal_launch_args:
         metadata["terminal_launch_args"] = terminal_launch_args
-    create = httpx.post(
-        f"{base_url}/v1/sessions",
-        data={"metadata": _json.dumps(metadata)},
-        files={"bundle": ("claude-native-ui.tar.gz", buf.getvalue(), "application/gzip")},
-        timeout=30.0,
-    )
-    create.raise_for_status()
-    session_id = str(create.json()["session_id"])
+    created = create_native_session(httpx, base_url, harness="claude", metadata=metadata)
+    session_id = str(created["session_id"])
     _bind_session_runner(base_url, session_id, runner_id)
     return session_id
 
@@ -2752,52 +2760,15 @@ def _create_native_codex_session(
     :param model: Optional Codex model to pin in the wrapper spec.
     :returns: The new session/conversation id.
     """
-    import json as _json
-    import tempfile
-
-    from omnigent._wrapper_labels import (
-        CODEX_NATIVE_WRAPPER_VALUE,
-        UI_MODE_LABEL_KEY,
-        UI_MODE_TERMINAL_VALUE,
-        WRAPPER_LABEL_KEY,
+    # Keep workspace session-local; runner-wide cwd changes other file surfaces.
+    created = create_native_session(
+        httpx,
+        base_url,
+        harness="codex",
+        model=model,
+        metadata={"workspace": str(_REPO_ROOT)},
     )
-    from omnigent.harnesses.codex_native.main import _materialize_codex_agent_spec
-
-    with tempfile.TemporaryDirectory() as _tmp:
-        spec_path = _materialize_codex_agent_spec(Path(_tmp), model=model)
-        yaml_text = spec_path.read_text()
-
-    buf = io.BytesIO()
-    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
-        data = yaml_text.encode()
-        # Non-config.yaml arcname → omnigent compat translator (the spec has
-        # no spec_version), matching the terminal_session fixture.
-        info = tarfile.TarInfo("codex-native-ui.yaml")
-        info.size = len(data)
-        tar.addfile(info, io.BytesIO(data))
-
-    labels = {
-        UI_MODE_LABEL_KEY: UI_MODE_TERMINAL_VALUE,
-        WRAPPER_LABEL_KEY: CODEX_NATIVE_WRAPPER_VALUE,
-    }
-    # Runner-owned Codex terminals hard-require a workspace: unlike the
-    # claude-native path (which falls back to Path.cwd()),
-    # _codex_session_workspace raises if neither the session's stored
-    # ``workspace`` nor OMNIGENT_RUNNER_WORKSPACE is set. Pin it on THIS
-    # session only (via metadata.workspace) rather than exporting
-    # OMNIGENT_RUNNER_WORKSPACE on the shared runner — a runner-wide value
-    # changes file-surface advertisement for every other session on the runner
-    # (it regressed the mobile file-drawer suite). The repo root is the same cwd
-    # claude falls back to, and is a valid dir on the runner's filesystem.
-    metadata = {"labels": labels, "workspace": str(_REPO_ROOT)}
-    create = httpx.post(
-        f"{base_url}/v1/sessions",
-        data={"metadata": _json.dumps(metadata)},
-        files={"bundle": ("codex-native-ui.tar.gz", buf.getvalue(), "application/gzip")},
-        timeout=30.0,
-    )
-    create.raise_for_status()
-    session_id = str(create.json()["session_id"])
+    session_id = str(created["session_id"])
     _bind_session_runner(base_url, session_id, runner_id)
     return session_id
 
@@ -2837,76 +2808,6 @@ def native_codex_session(
                 respawned.wait(timeout=5)
 
 
-@contextlib.contextmanager
-def _temp_omnigent_mock_config(
-    mock_llm_server_url: str, harness: str
-) -> Generator[None, None, None]:
-    """Temporarily write a mock provider config in the selected config home.
-
-    Native credential helpers may read provider configuration on every turn,
-    so the mock config stays in place for the fixture's full lifetime.
-    Restores the original file (or removes it) on exit.
-
-    :param mock_llm_server_url: Base URL of the mock LLM server, e.g.
-        ``"http://127.0.0.1:51235"``.
-    :param harness: ``"claude"`` or ``"codex"``.
-    """
-    from omnigent.config import global_config_path
-
-    # Back up and restore the target without replacing a user's config symlink.
-    config_path = global_config_path().resolve()
-    config_dir = config_path.parent
-    config_dir.mkdir(parents=True, exist_ok=True)
-    backup = config_path.with_name(config_path.name + ".e2e-backup")
-    if backup.exists():
-        raise RuntimeError(
-            f"Unrestored mock-provider backup at {backup}; "
-            "recover the original config before retrying"
-        )
-    original = config_path.read_bytes() if config_path.exists() else None
-
-    if harness == "claude":
-        mock_config = textwrap.dedent(f"""\
-            providers:
-              mock-claude:
-                kind: key
-                default: [anthropic]
-                anthropic:
-                  base_url: "{mock_llm_server_url}"
-                  api_key: "mock-key"
-                  models:
-                    default: {_CLAUDE_MOCK_MODEL}
-            """)
-    else:  # codex
-        mock_config = textwrap.dedent(f"""\
-            providers:
-              mock-codex:
-                kind: key
-                default: [openai]
-                openai:
-                  base_url: "{mock_llm_server_url}/v1"
-                  api_key: "mock-key"
-                  wire_api: responses
-                  models:
-                    default: {_CODEX_MOCK_MODEL}
-            """)
-
-    if original is not None:
-        fd = os.open(backup, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        with os.fdopen(fd, "wb") as handle:
-            handle.write(original)
-            handle.flush()
-            os.fsync(handle.fileno())
-    try:
-        config_path.write_text(mock_config)
-        yield
-    finally:
-        if original is not None:
-            backup.replace(config_path)
-        else:
-            config_path.unlink(missing_ok=True)
-
-
 @pytest.fixture
 def native_claude_mock_session(
     live_server: str,
@@ -2920,12 +2821,9 @@ def native_claude_mock_session(
     """
     respawned = _ensure_runner_online(live_server, tmp_path_factory)
     runner_id = str(_server_state["runner_id"])
-    use_mock = not _server_state.get("workflow_owned")
-    if use_mock:
-        ctx: Any = _temp_omnigent_mock_config(mock_llm_server_url, "claude")
-    else:
-        ctx = contextlib.nullcontext()
-    with ctx:
+    with _temp_omnigent_mock_config(
+        mock_llm_server_url, "claude", workflow_owned=bool(_server_state.get("workflow_owned"))
+    ):
         session_id = _create_native_claude_session(live_server, runner_id)
         try:
             yield (live_server, session_id)
@@ -2953,12 +2851,9 @@ def native_codex_mock_session(
     """
     respawned = _ensure_runner_online(live_server, tmp_path_factory)
     runner_id = str(_server_state["runner_id"])
-    use_mock = not _server_state.get("workflow_owned")
-    if use_mock:
-        ctx: Any = _temp_omnigent_mock_config(mock_llm_server_url, "codex")
-    else:
-        ctx = contextlib.nullcontext()
-    with ctx:
+    with _temp_omnigent_mock_config(
+        mock_llm_server_url, "codex", workflow_owned=bool(_server_state.get("workflow_owned"))
+    ):
         session_id = _create_native_codex_session(live_server, runner_id)
         try:
             yield (live_server, session_id)
@@ -3301,56 +3196,14 @@ def _create_native_cursor_session(
     :param runner_id: The token-bound runner id to bind.
     :returns: The new session/conversation id.
     """
-    import json as _json
-    import tempfile
-
-    from omnigent._wrapper_labels import (
-        CURSOR_NATIVE_WRAPPER_VALUE,
-        UI_MODE_LABEL_KEY,
-        UI_MODE_TERMINAL_VALUE,
-        WRAPPER_LABEL_KEY,
+    # An empty launch_args enables approval prompts; the default trusts the workspace.
+    created = create_native_session(
+        httpx,
+        base_url,
+        harness="cursor",
+        metadata={"workspace": str(_REPO_ROOT), "terminal_launch_args": list(launch_args)},
     )
-    from omnigent.harnesses.cursor_native.main import _materialize_cursor_agent_spec
-
-    with tempfile.TemporaryDirectory() as _tmp:
-        spec_path = _materialize_cursor_agent_spec(Path(_tmp))
-        yaml_text = spec_path.read_text()
-
-    buf = io.BytesIO()
-    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
-        data = yaml_text.encode()
-        # Non-config.yaml arcname → omnigent compat translator (the spec has
-        # no spec_version), matching the terminal_session fixture.
-        info = tarfile.TarInfo("cursor-native-ui.yaml")
-        info.size = len(data)
-        tar.addfile(info, io.BytesIO(data))
-
-    labels = {
-        UI_MODE_LABEL_KEY: UI_MODE_TERMINAL_VALUE,
-        WRAPPER_LABEL_KEY: CURSOR_NATIVE_WRAPPER_VALUE,
-    }
-    # Pin a real workspace on THIS session (like the codex fixture): the
-    # forwarder keys cursor's chat store by ``md5(cwd)``, so the TUI needs a
-    # concrete launch cwd. The repo root is a valid dir on the runner's
-    # filesystem. ``-f`` trusts that dir + auto-approves tools so the
-    # unattended pane never hangs on an approval prompt.
-    metadata = {
-        "labels": labels,
-        "workspace": str(_REPO_ROOT),
-        # ``-f`` (the default) trusts the dir + auto-approves tools so the
-        # unattended pane never hangs. The approval-mirror test passes
-        # ``launch_args=()`` so cursor's per-tool prompts fire and surface as
-        # web elicitation cards.
-        "terminal_launch_args": list(launch_args),
-    }
-    create = httpx.post(
-        f"{base_url}/v1/sessions",
-        data={"metadata": _json.dumps(metadata)},
-        files={"bundle": ("cursor-native-ui.tar.gz", buf.getvalue(), "application/gzip")},
-        timeout=30.0,
-    )
-    create.raise_for_status()
-    session_id = str(create.json()["session_id"])
+    session_id = str(created["session_id"])
     _bind_session_runner(base_url, session_id, runner_id)
     return session_id
 
@@ -3372,44 +3225,13 @@ def _create_native_goose_session(base_url: str, runner_id: str) -> str:
     :param runner_id: The token-bound runner id to bind.
     :returns: The new session/conversation id.
     """
-    import json as _json
-    import tempfile
-
-    from omnigent._wrapper_labels import (
-        GOOSE_NATIVE_WRAPPER_VALUE,
-        UI_MODE_LABEL_KEY,
-        UI_MODE_TERMINAL_VALUE,
-        WRAPPER_LABEL_KEY,
+    created = create_native_session(
+        httpx,
+        base_url,
+        harness="goose",
+        metadata={"workspace": str(_REPO_ROOT)},
     )
-    from omnigent.harnesses.goose_native.main import _materialize_goose_agent_spec
-
-    with tempfile.TemporaryDirectory() as _tmp:
-        spec_path = _materialize_goose_agent_spec(Path(_tmp))
-        yaml_text = spec_path.read_text()
-
-    buf = io.BytesIO()
-    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
-        data = yaml_text.encode()
-        info = tarfile.TarInfo("goose-native-ui.yaml")
-        info.size = len(data)
-        tar.addfile(info, io.BytesIO(data))
-
-    labels = {
-        UI_MODE_LABEL_KEY: UI_MODE_TERMINAL_VALUE,
-        WRAPPER_LABEL_KEY: GOOSE_NATIVE_WRAPPER_VALUE,
-    }
-    metadata = {
-        "labels": labels,
-        "workspace": str(_REPO_ROOT),
-    }
-    create = httpx.post(
-        f"{base_url}/v1/sessions",
-        data={"metadata": _json.dumps(metadata)},
-        files={"bundle": ("goose-native-ui.tar.gz", buf.getvalue(), "application/gzip")},
-        timeout=30.0,
-    )
-    create.raise_for_status()
-    session_id = str(create.json()["session_id"])
+    session_id = str(created["session_id"])
     _bind_session_runner(base_url, session_id, runner_id)
     return session_id
 
@@ -3461,44 +3283,13 @@ def _create_native_kiro_session(base_url: str, runner_id: str) -> str:
     :param runner_id: The token-bound runner id to bind.
     :returns: The new session/conversation id.
     """
-    import json as _json
-    import tempfile
-
-    from omnigent._wrapper_labels import (
-        KIRO_NATIVE_WRAPPER_VALUE,
-        UI_MODE_LABEL_KEY,
-        UI_MODE_TERMINAL_VALUE,
-        WRAPPER_LABEL_KEY,
+    created = create_native_session(
+        httpx,
+        base_url,
+        harness="kiro",
+        metadata={"workspace": str(_REPO_ROOT)},
     )
-    from omnigent.harnesses.kiro_native.main import _materialize_kiro_agent_spec
-
-    with tempfile.TemporaryDirectory() as _tmp:
-        spec_path = _materialize_kiro_agent_spec(Path(_tmp), model=None)
-        yaml_text = spec_path.read_text()
-
-    buf = io.BytesIO()
-    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
-        data = yaml_text.encode()
-        info = tarfile.TarInfo("kiro-native-ui.yaml")
-        info.size = len(data)
-        tar.addfile(info, io.BytesIO(data))
-
-    labels = {
-        UI_MODE_LABEL_KEY: UI_MODE_TERMINAL_VALUE,
-        WRAPPER_LABEL_KEY: KIRO_NATIVE_WRAPPER_VALUE,
-    }
-    metadata = {
-        "labels": labels,
-        "workspace": str(_REPO_ROOT),
-    }
-    create = httpx.post(
-        f"{base_url}/v1/sessions",
-        data={"metadata": _json.dumps(metadata)},
-        files={"bundle": ("kiro-native-ui.tar.gz", buf.getvalue(), "application/gzip")},
-        timeout=30.0,
-    )
-    create.raise_for_status()
-    session_id = str(create.json()["session_id"])
+    session_id = str(created["session_id"])
     _bind_session_runner(base_url, session_id, runner_id)
     return session_id
 
@@ -3550,44 +3341,13 @@ def _create_native_hermes_session(base_url: str, runner_id: str) -> str:
     :param runner_id: The token-bound runner id to bind.
     :returns: The new session/conversation id.
     """
-    import json as _json
-    import tempfile
-
-    from omnigent._wrapper_labels import (
-        HERMES_NATIVE_WRAPPER_VALUE,
-        UI_MODE_LABEL_KEY,
-        UI_MODE_TERMINAL_VALUE,
-        WRAPPER_LABEL_KEY,
+    created = create_native_session(
+        httpx,
+        base_url,
+        harness="hermes",
+        metadata={"workspace": str(_REPO_ROOT)},
     )
-    from omnigent.harnesses.hermes_native.main import _materialize_hermes_agent_spec
-
-    with tempfile.TemporaryDirectory() as _tmp:
-        spec_path = _materialize_hermes_agent_spec(Path(_tmp))
-        yaml_text = spec_path.read_text()
-
-    buf = io.BytesIO()
-    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
-        data = yaml_text.encode()
-        info = tarfile.TarInfo("hermes-native-ui.yaml")
-        info.size = len(data)
-        tar.addfile(info, io.BytesIO(data))
-
-    labels = {
-        UI_MODE_LABEL_KEY: UI_MODE_TERMINAL_VALUE,
-        WRAPPER_LABEL_KEY: HERMES_NATIVE_WRAPPER_VALUE,
-    }
-    metadata = {
-        "labels": labels,
-        "workspace": str(_REPO_ROOT),
-    }
-    create = httpx.post(
-        f"{base_url}/v1/sessions",
-        data={"metadata": _json.dumps(metadata)},
-        files={"bundle": ("hermes-native-ui.tar.gz", buf.getvalue(), "application/gzip")},
-        timeout=30.0,
-    )
-    create.raise_for_status()
-    session_id = str(create.json()["session_id"])
+    session_id = str(created["session_id"])
     _bind_session_runner(base_url, session_id, runner_id)
     return session_id
 

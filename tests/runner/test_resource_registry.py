@@ -385,8 +385,77 @@ async def test_auxiliary_terminal_exit_publishes_resource_exit_only(
     assert record.attributes["terminal_instance_id"] == instance.diagnostic_id
     assert record.attributes["session_status_before_exit"] == "unknown"
     assert record.attributes["superseded"] is False
+    # A non-Codex terminal keeps the guarantee: no pane contents, no cwd in
+    # the lifecycle-event attributes.
+    assert record.attributes["terminal_last_output"] is None
     assert "startup failed" not in str(record.attributes)
     assert str(tmp_path) not in str(record.attributes)
+
+
+@pytest.mark.asyncio
+async def test_auxiliary_codex_exit_persists_redacted_final_screen(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A Codex (auxiliary) exit records a redacted final-screen excerpt on the event.
+
+    The exit publisher drops ``last_output`` for auxiliary terminals, so the
+    ``terminal_exit_observed`` debug event is the only durable path to the final
+    screen; it must carry a credential-redacted excerpt.
+    """
+    caplog.set_level(logging.INFO, logger="omnigent.runner.resource_registry")
+    terminal_registry = TerminalRegistry()
+    registry = SessionResourceRegistry(terminal_registry=terminal_registry)
+    instance = make_test_terminal_instance("codex", "main", tmp_path)
+    instance._remember_pane_snapshot(
+        "gateway ready\napi_key=sk-supersecretvalue1234\n> Ask Codex to do anything"
+    )
+    terminal_registry._by_conversation.setdefault("conv_codex", {})[("codex", "main")] = instance
+    exits: list[TerminalExitEvent] = []
+    exit_published = asyncio.Event()
+    callbacks: dict[str, object] = {}
+
+    def _publish_exit(event: TerminalExitEvent) -> None:
+        exits.append(event)
+        exit_published.set()
+
+    def _capture_watcher(
+        on_idle: object | None = None,
+        *,
+        on_activity: object | None = None,
+        on_exit: object | None = None,
+        on_tick: object | None = None,
+        idle_threshold_s: float | None = None,
+        poll_interval_s: float | None = None,
+        replace: bool = False,
+    ) -> None:
+        del on_idle, on_activity, on_tick, idle_threshold_s, poll_interval_s, replace
+        callbacks["on_exit"] = on_exit
+
+    instance.start_idle_watcher_thread = _capture_watcher  # type: ignore[method-assign]
+    registry.set_terminal_exit_publisher(_publish_exit)
+
+    await registry.observe_auxiliary_terminal(
+        "conv_codex", "codex", "main", instance, resource_role=CODEX_NATIVE_TERMINAL_ROLE
+    )
+    on_exit = callbacks["on_exit"]
+    assert callable(on_exit)
+    on_exit()
+    await asyncio.wait_for(exit_published.wait(), timeout=1.0)
+
+    # The published event is dropped for auxiliary terminals and still carries
+    # the raw screen; the persisted debug event must carry a redacted excerpt.
+    assert exits[0].lifecycle == TerminalLifecycle.AUXILIARY
+    assert "sk-supersecretvalue1234" in (exits[0].last_output or "")
+    record = next(
+        record
+        for record in caplog.records
+        if getattr(record, "event_name", None) == "terminal_exit_observed"
+    )
+    excerpt = record.attributes["terminal_last_output"]
+    assert "gateway ready" in excerpt
+    assert "Ask Codex to do anything" in excerpt
+    assert "sk-supersecretvalue1234" not in excerpt
+    assert "[REDACTED]" in excerpt
 
 
 async def _observe_native_agent_terminal_and_capture(
@@ -818,30 +887,39 @@ async def test_required_terminal_exit_while_running_is_failure(
     assert record.attributes["session_status_before_exit"] == "running"
 
 
-def test_trim_terminal_output_drops_whole_leading_lines() -> None:
-    # Over the char budget: the first surviving line must be a WHOLE line, never
-    # a mid-word fragment (the "rity reasons" cut). The final line — the one that
-    # matters — stays intact.
-    filler = "\n".join(f"line {i} " + "x" * 80 for i in range(200))
+def test_trim_terminal_output_keeps_character_tail() -> None:
+    # Over the char budget: keep the last N characters, marked as truncated.
+    filler = "\n".join(f"line {i} " + "x" * 150 for i in range(30))
     text = filler + "\n--dangerously-skip-permissions cannot be run for security reasons"
     trimmed = trim_terminal_output(text)
     assert trimmed is not None
-    assert len(trimmed) <= _TERMINAL_EXIT_OUTPUT_MAX_CHARS + 60  # + the omitted-lines marker
-    assert trimmed.startswith("... omitted ")
-    # The last line survived whole (not clipped mid-word).
-    assert trimmed.endswith("for security reasons")
-    # The first content line after the marker is a complete line.
-    first_content = trimmed.splitlines()[1]
-    assert first_content.startswith("line ")
+    marker, body = trimmed.split("\n", 1)
+    assert marker.startswith("... omitted ") and marker.endswith(" earlier character(s) ...")
+    assert len(body) == _TERMINAL_EXIT_OUTPUT_MAX_CHARS
+    assert body.endswith("for security reasons")
+
+
+def test_trim_terminal_output_keeps_long_line_before_final_line() -> None:
+    # A long error line followed by tmux's short "pane is dead" line must not be
+    # dropped wholesale, leaving only the pane-dead line.
+    usage = "Usage: codex [OPTIONS] " + "z" * (_TERMINAL_EXIT_OUTPUT_MAX_CHARS + 1000)
+    trimmed = trim_terminal_output(f"a\nb\n{usage}\npane is dead (status 2)")
+    assert trimmed is not None
+    assert trimmed.endswith("z\npane is dead (status 2)")
+    assert len(trimmed.split("\n", 1)[1]) == _TERMINAL_EXIT_OUTPUT_MAX_CHARS
 
 
 def test_trim_terminal_output_hard_clips_single_overlong_line() -> None:
-    # A single line longer than the budget has no line boundary to snap to, so
-    # it's clipped from the tail as a last resort.
     line = "y" * (_TERMINAL_EXIT_OUTPUT_MAX_CHARS + 500)
     trimmed = trim_terminal_output(line)
-    assert trimmed is not None
-    assert len(trimmed) == _TERMINAL_EXIT_OUTPUT_MAX_CHARS
+    assert (
+        trimmed
+        == f"... omitted 500 earlier character(s) ...\n{'y' * _TERMINAL_EXIT_OUTPUT_MAX_CHARS}"
+    )
+
+
+def test_trim_terminal_output_leaves_short_output_untouched() -> None:
+    assert trim_terminal_output("  boom\r\nexit 1\n") == "boom\nexit 1"
 
 
 def test_terminal_exit_diagnostics_reads_exit_status(tmp_path: Path) -> None:
@@ -1680,6 +1758,132 @@ _AUTO_MODE_BILLING_NOTICE_PANE = """──────────────�
   https://code.claude.com/docs/en/auto-mode-classifier-billing
   Enter to continue · Esc to cancel
 """
+
+
+async def _observe_native_capturing_tick(
+    tmp_path: Path,
+    session_id: str,
+    terminal_name: str,
+    resource_role: str,
+    env: dict[str, str],
+) -> tuple[object, TerminalInstance]:
+    """Observe a native terminal and return its watcher ``on_tick`` callback.
+
+    :returns: ``(on_tick, instance)`` for driving the input-ready probe.
+    """
+    terminal_registry = TerminalRegistry()
+    registry = SessionResourceRegistry(terminal_registry=terminal_registry)
+    registry.set_session_status_publisher(lambda *_args: None)
+    registry.set_terminal_exit_publisher(lambda *_args: None)
+    instance = make_test_terminal_instance(terminal_name, "main", tmp_path)
+    instance.env = env
+    terminal_registry._by_conversation.setdefault(session_id, {})[(terminal_name, "main")] = (
+        instance
+    )
+    callbacks: dict[str, object] = {}
+
+    def _capture_watcher(*_args: object, on_tick: object | None = None, **_kwargs: object) -> None:
+        callbacks["on_tick"] = on_tick
+
+    instance.start_idle_watcher_thread = _capture_watcher  # type: ignore[method-assign]
+    await registry.observe_required_terminal(
+        session_id, terminal_name, "main", instance, resource_role=resource_role
+    )
+    assert callable(callbacks["on_tick"])
+    return callbacks["on_tick"], instance
+
+
+def _input_ready_events(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    return [r for r in caplog.records if getattr(r, "event_name", None) == "native_input_ready"]
+
+
+@pytest.mark.asyncio
+async def test_pi_native_logs_input_ready_once_extension_marks_it(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    from omnigent.harnesses.pi_native import bridge as pi_bridge
+
+    caplog.set_level(logging.INFO, logger="omnigent.runner.resource_registry")
+    bridge_dir = tmp_path / "pi-bridge"
+    bridge_dir.mkdir()
+    # A marker from the previous Pi process must not survive the relaunch.
+    (bridge_dir / "input_ready").write_text("", encoding="utf-8")
+    _extension, config = pi_bridge.write_extension_files(
+        bridge_dir,
+        session_id="conv_pi",
+        server_url="http://ap.example",
+        conversation_url="http://ap.example/c/conv_pi",
+    )
+    on_tick, instance = await _observe_native_capturing_tick(
+        tmp_path,
+        "conv_pi",
+        "pi",
+        PI_NATIVE_TERMINAL_ROLE,
+        {pi_bridge.PI_NATIVE_CONFIG_ENV_VAR: str(config)},
+    )
+
+    on_tick()  # type: ignore[operator]
+    assert _input_ready_events(caplog) == []
+
+    # What the extension's session_start writes once its inbox poller is armed.
+    (bridge_dir / "input_ready").write_text("", encoding="utf-8")
+    on_tick()  # type: ignore[operator]
+    on_tick()  # type: ignore[operator]
+
+    events = _input_ready_events(caplog)
+    assert len(events) == 1
+    assert events[0].session_id == "conv_pi"
+    assert events[0].attributes["harness"] == "pi-native"
+    assert events[0].attributes["terminal_instance_id"] == instance.diagnostic_id
+
+
+@pytest.mark.asyncio
+async def test_codex_native_logs_input_ready_once_thread_is_bound_to_session(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    from omnigent.harnesses.codex_native import bridge as codex_bridge
+
+    caplog.set_level(logging.INFO, logger="omnigent.runner.resource_registry")
+    bridge_dir = tmp_path / "codex-bridge"
+    bridge_dir.mkdir()
+    codex_home = codex_bridge.codex_home_for_bridge_dir(bridge_dir)
+
+    def _bind(session_id: str) -> None:
+        codex_bridge.write_bridge_state(
+            bridge_dir,
+            codex_bridge.CodexNativeBridgeState(
+                session_id=session_id,
+                socket_path="ws://127.0.0.1:1",
+                thread_id=f"thread_{session_id}",
+                codex_home=str(codex_home),
+            ),
+        )
+
+    # Thread-switch shape: the terminal moved to conv_new before the forwarder
+    # rebinds bridge state, so conv_old's thread must not count as ready.
+    _bind("conv_old")
+    on_tick, _instance = await _observe_native_capturing_tick(
+        tmp_path,
+        "conv_new",
+        "codex",
+        CODEX_NATIVE_TERMINAL_ROLE,
+        {"CODEX_HOME": str(codex_home)},
+    )
+    on_tick()  # type: ignore[operator]
+    assert _input_ready_events(caplog) == []
+
+    _bind("conv_new")
+    on_tick()  # type: ignore[operator]
+    on_tick()  # type: ignore[operator]
+
+    events = _input_ready_events(caplog)
+    assert len(events) == 1
+    assert events[0].session_id == "conv_new"
+    assert events[0].attributes["harness"] == "codex-native"
+
+
 _CLAUDE_READY_PANE = "────────────────────\n❯ \n────────────────────"
 
 

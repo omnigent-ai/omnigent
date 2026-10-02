@@ -183,6 +183,32 @@ final class DatabricksWorkspaceBootstrapTests: XCTestCase {
       ofTypes: WKWebsiteDataStore.allWebsiteDataTypes(), modifiedSince: .distantPast)
   }
 
+  func testCoordinatorDetachDefersPublishedCleanupUntilAfterTeardown() async throws {
+    let url = URL(string: "https://example.com")!
+    let model = WebViewModel()
+    let suite = "omnigent-test-\(UUID().uuidString)"
+    let defaults = UserDefaults(suiteName: suite)!
+    defer { defaults.removePersistentDomain(forName: suite) }
+    let parent = OmnigentWebView(
+      initialURL: url, model: model, settings: SettingsStore(defaults: defaults),
+      databricksInternalFeaturesEnabled: false, loadFailed: { _, _ in }, loadSucceeded: {},
+      pushServerPicker: {}, requestSwitchServer: { _ in }, openServerSetup: {})
+    let coordinator = parent.makeCoordinator()
+    let webView = WKWebView()
+    model.webView = webView
+    model.isAuthenticating = true
+    coordinator.attach(webView)
+
+    coordinator.detach()
+
+    XCTAssertTrue(model.isAuthenticating, "Teardown must not synchronously publish into SwiftUI")
+    XCTAssertNil(model.webView)
+    let mainQueueDrained = expectation(description: "deferred model cleanup")
+    DispatchQueue.main.async { mainQueueDrained.fulfill() }
+    await fulfillment(of: [mainQueueDrained], timeout: 1)
+    XCTAssertFalse(model.isAuthenticating)
+  }
+
   func testClearedGrantCannotInstallACompletedCookieExchange() async throws {
     let context = try webContext("https://workspace.databricks.com/omnigent?o=123")
     let credentials = MemoryDatabricksCredentialStore()

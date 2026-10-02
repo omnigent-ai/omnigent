@@ -641,3 +641,31 @@ async def test_opencode_direct_relaunch_rejects_pin_before_bridge_or_server(monk
             agent_spec=_spec("opencode-native", "obsolete-model"),
         )
     prepare.assert_not_called()
+def test_acp_override_uses_selected_agents_inference_binding(tmp_path: Path) -> None:
+    from omnigent.runner.app import _build_spawn_env_from_spec
+
+    (tmp_path / "config.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "acp": {
+                    "agents": [
+                        {"name": "Other", "command": "other acp"},
+                        {"name": "Custom", "command": "custom acp"},
+                    ]
+                }
+            }
+        )
+    )
+    spec = _spec("acp:other")
+    with inference_config_scope(_profile()):
+        env = _build_spawn_env_from_spec(spec, "acp:custom")
+        assert env is not None
+        assert env["HARNESS_ACP_COMMAND"] == "custom acp"
+        assert env["HARNESS_ACP_MODEL"] == "model-a"
+        assert env["HARNESS_ACP_MODEL_LIST"].split(",") == [
+            "model-a",
+            "databricks-literal/model-b",
+        ]
+        with pytest.raises(OmnigentError, match="configured model list"):
+            _build_spawn_env_from_spec(spec, "acp:custom", model_override="unlisted")
+    assert spec.executor.config["harness"] == "acp:other"

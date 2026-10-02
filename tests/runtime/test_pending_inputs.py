@@ -234,10 +234,12 @@ def test_resolve_removes_entry_idempotently() -> None:
     keep = pending_inputs.record("conv_a", [_text_block("keep")])
     drop = pending_inputs.record("conv_a", [_text_block("drop")])
 
-    pending_inputs.resolve("conv_a", drop)
+    dropped = pending_inputs.resolve("conv_a", drop)
+    assert dropped is not None
+    assert (dropped.pending_id, dropped.content) == (drop, [_text_block("drop")])
     assert [e["pending_id"] for e in pending_inputs.snapshot_for("conv_a")] == [keep]
-    # Idempotent — resolving an already-removed id does nothing.
-    pending_inputs.resolve("conv_a", drop)
+    # Idempotent — resolving an already-removed id does nothing and returns None.
+    assert pending_inputs.resolve("conv_a", drop) is None
     assert [e["pending_id"] for e in pending_inputs.snapshot_for("conv_a")] == [keep]
 
 
@@ -421,3 +423,182 @@ def test_stable_id_dedup_scoped_per_conversation() -> None:
     id_a = pending_inputs.record("conv_scope_a", [_text_block("x")], stable_id=stable)
     id_b = pending_inputs.record("conv_scope_b", [_text_block("x")], stable_id=stable)
     assert id_a != id_b
+
+
+def test_record_evicts_the_oldest_entry_beyond_the_per_conversation_cap() -> None:
+    """The queue is bounded: recording past the cap drops the oldest entry."""
+    cap = pending_inputs._MAX_ENTRIES_PER_CONVERSATION
+    ids = [pending_inputs.record("conv_a", [_text_block(f"m{i}")]) for i in range(cap + 2)]
+
+    snapshot = pending_inputs.snapshot_for("conv_a")
+
+    assert len(snapshot) == cap
+    assert [entry["pending_id"] for entry in snapshot] == ids[2:]
+
+
+def test_held_entries_keep_their_slot_while_the_queue_refills() -> None:
+    """A drain with ``hold`` leaves the entry in place; refilling evicts unheld ones only."""
+    cap = pending_inputs._MAX_ENTRIES_PER_CONVERSATION
+    ids = [pending_inputs.record("conv_a", [_text_block(f"m{i}")]) for i in range(cap)]
+
+    held = pending_inputs.resolve_oldest("conv_a", hold=True)
+    assert held is not None and held.pending_id == ids[0]
+    # Other drains skip the held entry.
+    assert pending_inputs.resolve_matching_text("conv_a", "m0").matched is None
+    newer = [pending_inputs.record("conv_a", [_text_block(f"n{i}")]) for i in range(2)]
+    # Only unheld entries count against the cap: one refill fits, the second
+    # evicts the oldest UNHELD entry; the held head is still first.
+    after_refill = [entry["pending_id"] for entry in pending_inputs.snapshot_for("conv_a")]
+    assert after_refill == [ids[0], *ids[2:], *newer]
+    assert len(after_refill) == cap + 1
+
+    pending_inputs.restore("conv_a", held)
+
+    restored = [entry["pending_id"] for entry in pending_inputs.snapshot_for("conv_a")]
+    assert restored == after_refill
+    assert pending_inputs.resolve_oldest("conv_a") is not None  # unheld again
+
+
+def test_release_drops_a_held_entry() -> None:
+    """Settling a held entry removes it; releasing twice is harmless."""
+    first = pending_inputs.record("conv_a", [_text_block("first")])
+    second = pending_inputs.record("conv_a", [_text_block("second")])
+
+    held = pending_inputs.resolve_matching_text("conv_a", "first", hold=True)
+    assert held.matched is not None and held.matched.pending_id == first
+    pending_inputs.release("conv_a", held.matched)
+    pending_inputs.release("conv_a", held.matched)
+
+    assert [entry["pending_id"] for entry in pending_inputs.snapshot_for("conv_a")] == [second]
+
+
+def test_resolve_matching_text_drops_only_generated_leading_markers() -> None:
+    """A message with a file block matches behind its generated marker; typed text is kept."""
+    with_image = pending_inputs.record(
+        "conv_a", [{"type": "input_image", "url": "img://1"}, _text_block("look at this")]
+    )
+    literal = pending_inputs.record("conv_a", [_text_block("explain [Attached: example]")])
+
+    first = pending_inputs.resolve_matching_text(
+        "conv_a", "[Attached: /tmp/x.png]\n\nlook at this"
+    )
+    second = pending_inputs.resolve_matching_text("conv_a", "explain [Attached: example]")
+
+    assert first.matched is not None and first.matched.pending_id == with_image
+    assert first.skipped == []
+    assert second.matched is not None and second.matched.pending_id == literal
+    assert second.skipped == []
+    assert pending_inputs.snapshot_for("conv_a") == []
+
+
+def test_record_keeps_a_new_entry_when_every_other_entry_is_held() -> None:
+    """A fresh record is never the eviction victim, even with the whole cap held."""
+    cap = pending_inputs._MAX_ENTRIES_PER_CONVERSATION
+    ids = [pending_inputs.record("conv_a", [_text_block(f"m{i}")]) for i in range(cap)]
+    held = pending_inputs.resolve_matching_text("conv_a", f"m{cap - 1}", hold=True)
+    assert held.matched is not None and len(held.skipped) == cap - 1
+
+    newest = pending_inputs.record("conv_a", [_text_block("newest")])
+
+    assert [entry["pending_id"] for entry in pending_inputs.snapshot_for("conv_a")] == [
+        *ids,
+        newest,
+    ]
+    found = pending_inputs.resolve_matching_text("conv_a", "newest")
+    assert found.matched is not None and found.matched.pending_id == newest
+
+
+def test_resolve_matching_text_prefers_an_exact_match_over_marker_stripping() -> None:
+    """Two messages differing only in a typed leading marker stay distinct."""
+    first = pending_inputs.record("conv_a", [_text_block("[Attached: literal-a] same")])
+    second = pending_inputs.record("conv_a", [_text_block("[Attached: literal-b] same")])
+
+    drained = pending_inputs.resolve_matching_text("conv_a", "[Attached: literal-b] same")
+
+    assert drained.matched is not None and drained.matched.pending_id == second
+    assert [entry.pending_id for entry in drained.skipped] == [first]
+
+
+def test_resolve_matching_text_keeps_a_typed_marker_distinct_from_a_generated_one() -> None:
+    """A typed ``[Attached: …]`` phrase never stands in for the executor's marker line."""
+    typed = pending_inputs.record("conv_a", [_text_block("[Attached: literal] same")])
+    with_image = pending_inputs.record(
+        "conv_a", [{"type": "input_image", "url": "img://1"}, _text_block("same")]
+    )
+
+    drained = pending_inputs.resolve_matching_text("conv_a", "[Attached: /tmp/x.png]\n\nsame")
+
+    assert drained.matched is not None and drained.matched.pending_id == with_image
+    assert [entry.pending_id for entry in drained.skipped] == [typed]
+
+
+def test_resolve_matching_text_identical_texts_drain_in_queue_order() -> None:
+    """Identical texts are indistinguishable, so the oldest one takes the mirror."""
+    first = pending_inputs.record("conv_a", [_text_block("yes")])
+    second = pending_inputs.record("conv_a", [_text_block("yes")])
+
+    drained = pending_inputs.resolve_matching_text("conv_a", "yes")
+
+    assert drained.matched is not None and drained.matched.pending_id == first
+    assert drained.skipped == []
+    assert [entry["pending_id"] for entry in pending_inputs.snapshot_for("conv_a")] == [second]
+
+
+def test_resolve_matching_text_reports_at_most_a_cap_of_skipped_entries() -> None:
+    """A drain surfaces at most a cap's worth of skipped entries and leaves the rest queued."""
+    cap = pending_inputs._MAX_ENTRIES_PER_CONVERSATION
+    first_wave = [pending_inputs.record("conv_a", [_text_block(f"a{i}")]) for i in range(cap)]
+    held = pending_inputs.resolve_matching_text("conv_a", f"a{cap - 1}", hold=True)
+    assert held.matched is not None
+    second_wave = [pending_inputs.record("conv_a", [_text_block(f"b{i}")]) for i in range(cap)]
+    # The append failed: everything is unheld again, twice the cap in queue order.
+    for entry in [*held.skipped, held.matched]:
+        pending_inputs.restore("conv_a", entry)
+    assert len(pending_inputs.snapshot_for("conv_a")) == 2 * cap
+
+    drained = pending_inputs.resolve_matching_text("conv_a", f"b{cap - 1}")
+
+    assert drained.matched is not None and drained.matched.pending_id == second_wave[-1]
+    assert [entry.pending_id for entry in drained.skipped] == first_wave
+    remaining = [entry["pending_id"] for entry in pending_inputs.snapshot_for("conv_a")]
+    assert remaining == second_wave[:-1]
+
+
+def test_pending_id_for_stable_id_finds_only_live_entries() -> None:
+    """
+    A queued entry is found by the web client's stable id so a resend can be
+    answered without a second forward; a settled or unknown id finds nothing.
+    """
+    stable_id = "7f3a9c1e5b2d4f6a8c0e1d2b3a4f5c6d"
+    content = [{"type": "input_text", "text": "hello"}]
+    assert pending_inputs.pending_id_for_stable_id("conv_a", stable_id) is None
+
+    pending_id = pending_inputs.record("conv_a", content, stable_id=stable_id)
+    assert pending_inputs.pending_id_for_stable_id("conv_a", stable_id) == pending_id
+    # Scoped to the conversation and to entries that carry a stable id.
+    assert pending_inputs.pending_id_for_stable_id("conv_b", stable_id) is None
+    pending_inputs.record("conv_a", content)
+    assert pending_inputs.pending_id_for_stable_id("conv_a", stable_id) == pending_id
+
+    pending_inputs.resolve("conv_a", pending_id)
+    assert pending_inputs.pending_id_for_stable_id("conv_a", stable_id) is None
+
+
+def test_mark_uncertain_keeps_jumped_over_entries_out_of_the_undelivered_set() -> None:
+    """Entries queued during a positional drain are later drained as uncertain, not skipped."""
+    first = pending_inputs.record("conv_a", [_text_block("first")])
+    second = pending_inputs.record("conv_a", [_text_block("second")])
+
+    # A reformatted mirror matched nothing and drained the oldest entry.
+    drained = pending_inputs.resolve_oldest("conv_a", hold=True)
+    assert drained is not None and drained.pending_id == first
+    pending_inputs.mark_uncertain("conv_a")
+    pending_inputs.release("conv_a", drained)
+    third = pending_inputs.record("conv_a", [_text_block("third")])
+
+    matched = pending_inputs.resolve_matching_text("conv_a", "third")
+
+    assert matched.matched is not None and matched.matched.pending_id == third
+    assert matched.skipped == []
+    assert [entry.pending_id for entry in matched.uncertain] == [second]
+    assert pending_inputs.snapshot_for("conv_a") == []

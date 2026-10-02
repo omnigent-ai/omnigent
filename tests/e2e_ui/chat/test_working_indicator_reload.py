@@ -264,6 +264,7 @@ def _seed_item(
     resp.raise_for_status()
 
 
+@pytest.mark.compat_smoke
 def test_bare_idle_finalizes_turn_and_folds(
     page: Page,
     seeded_session: tuple[str, str],
@@ -331,11 +332,14 @@ def test_bare_idle_finalizes_turn_and_folds(
     # Turn is live (running + streaming lifecycle) — the trace must be
     # expanded, no fold yet.
     expect(bubble.locator('[data-testid="turn-worked-fold"]')).to_have_count(0)
+    working = page.get_by_test_id("working-indicator")
+    expect(working).to_be_visible(timeout=15_000)
 
     # The bare terminal edge: no response_id, like the PTY-activity relay.
     _publish_status(base_url, session_id, "idle")
 
     # The fold must appear IN PLACE — no reload between publish and assert.
+    expect(working).to_have_count(0, timeout=15_000)
     expect(bubble.locator('[data-testid="turn-worked-fold"]').first).to_be_visible(timeout=15_000)
 
 

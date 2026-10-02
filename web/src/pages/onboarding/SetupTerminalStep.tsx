@@ -1,30 +1,56 @@
-// Onboarding step: start the local server, shown as a small terminal-styled
-// status log. The local server daemonizes (omnigent server --background); the
-// shell tails its logfile and streams the real startup lines here via
-// onSetupLog. We frame those streamed lines with a phase heading + progress bar
-// and the real start → ready/failed lifecycle, not fabricated install steps.
-// When no stream is available (older shell / browser preview) the log shows a
-// single "Starting…" line until ready. On success the window navigates to the
-// server and this page is replaced, so "Ready" is only ever briefly visible.
+// Onboarding step: run the install + start/connect sequence, shown as a small
+// terminal-styled status log. When the CLI isn't installed yet, an install
+// phase runs first (streaming install_oss.sh output via onInstallLog); on
+// success the main action runs — start the local server (omnigent server
+// --background, streaming its boot log via onSetupLog) or connect to a remote
+// server. On success the window navigates away and this page is replaced.
+//
+// No stream available (older shell / browser preview) → a single phase line.
 
 import { useEffect, useRef, useState } from "react";
+import { RotateCw } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import type { ConnectProgress } from "@/pages/onboarding/ServerSelectorV2";
+import { ConnectStatus } from "@/pages/onboarding/primitives";
 
-type Phase = "starting" | "ready" | "failed";
+type Phase = "installing" | "running" | "ready" | "failed";
+
+// Empty-terminal beat before the first install commands stream in, so the
+// install step doesn't flash straight from empty into output.
+export const WARMUP_MS = 600;
 
 export function SetupTerminalStep({
-  onStartLocal,
+  onInstallCli,
+  onInstallLog,
+  onRun,
   onSetupLog,
   onBack,
+  runningLabel = "Starting Omnigent",
+  runningHint = "Starting the local server…",
+  connection = null,
+  onCancelConnect,
 }: {
-  onStartLocal: () => Promise<{ ok: boolean; error?: string }>;
+  /** Install the CLI first (when missing). Absent → skip straight to onRun. */
+  onInstallCli?: () => Promise<{ ok: boolean; error?: string }>;
+  /** Subscribe to the installer's output lines; returns an unsubscribe. */
+  onInstallLog?: (cb: (line: string) => void) => () => void;
+  /** The main action after install: start the local server or connect. */
+  onRun: () => Promise<{ ok: boolean; error?: string }>;
+  /** Subscribe to the run action's log lines (server boot); returns unsubscribe. */
   onSetupLog?: (cb: (line: string) => void) => () => void;
   onBack: () => void;
+  /** Heading + verb for the run phase ("Starting Omnigent" / "Connecting…"). */
+  runningLabel?: string;
+  /** Placeholder log line for the run phase until its first line streams. */
+  runningHint?: string;
+  /** Progress of the run phase's server connect (null when not connecting). */
+  connection?: ConnectProgress | null;
+  onCancelConnect?: () => void;
 }) {
-  const [phase, setPhase] = useState<Phase>("starting");
+  const [phase, setPhase] = useState<Phase>(onInstallCli ? "installing" : "running");
   const [error, setError] = useState<string | undefined>();
   const [lines, setLines] = useState<string[]>([]);
-  // Bump to re-run the start effect on retry.
+  // Bump to re-run the sequence on retry.
   const [attempt, setAttempt] = useState(0);
   // Guard against a resolve landing after unmount (window navigated away).
   const alive = useRef(true);
@@ -36,51 +62,118 @@ export function SetupTerminalStep({
     [],
   );
 
-  // Subscribe to the streamed startup log lines (if the shell exposes them).
+  // Stream install lines while installing, server lines once running. Keyed on
+  // the stream source (installing vs not) so a later ready/failed transition
+  // doesn't needlessly resubscribe.
+  const installing = phase === "installing";
   useEffect(() => {
-    if (!onSetupLog) return;
-    setLines([]);
-    const unsubscribe = onSetupLog((line) => {
+    const subscribe = installing ? onInstallLog : onSetupLog;
+    if (!subscribe) return;
+    const unsubscribe = subscribe((line) => {
       if (alive.current) setLines((prev) => [...prev, line]);
     });
     return unsubscribe;
-  }, [onSetupLog, attempt]);
+  }, [onInstallLog, onSetupLog, installing]);
 
   // Keep the newest line in view as the stream grows.
   useEffect(() => {
     if (logBox.current) logBox.current.scrollTop = logBox.current.scrollHeight;
   }, [lines]);
 
+  // Read the latest callbacks without keying the sequence effect on their
+  // identity: the parent re-creates onInstallCli/onRun every render, and a
+  // deferred server-list update landing mid-install would otherwise restart the
+  // effect and launch a SECOND install. The sequence runs once per attempt.
+  const onInstallCliRef = useRef(onInstallCli);
+  const onRunRef = useRef(onRun);
+  const onInstallLogRef = useRef(onInstallLog);
+  onInstallCliRef.current = onInstallCli;
+  onRunRef.current = onRun;
+  onInstallLogRef.current = onInstallLog;
+
+  // Install (if needed) → run, once per attempt (retry bumps `attempt`).
   useEffect(() => {
-    setPhase("starting");
+    let canceled = false;
     setError(undefined);
-    onStartLocal().then((result) => {
-      if (!alive.current) return;
+    setLines([]);
+    (async () => {
+      const install = onInstallCliRef.current;
+      if (install) {
+        setPhase("installing");
+        // Hold the empty loader + terminal for a beat before the first install
+        // commands stream in — only when there's a stream to show it against.
+        if (onInstallLogRef.current) {
+          await new Promise((resolve) => {
+            setTimeout(resolve, WARMUP_MS);
+          });
+          if (canceled || !alive.current) return;
+        }
+        const res = await install();
+        if (canceled || !alive.current) return;
+        if (!res.ok) {
+          setPhase("failed");
+          setError(res.error ?? "Couldn't install the Omnigent CLI.");
+          return;
+        }
+        setLines([]);
+      }
+      setPhase("running");
+      const result = await onRunRef.current();
+      if (canceled || !alive.current) return;
       if (result.ok) setPhase("ready");
       else {
         setPhase("failed");
         setError(result.error);
       }
-    });
-  }, [onStartLocal, attempt]);
+    })();
+    return () => {
+      canceled = true;
+    };
+  }, [attempt]);
+
+  // Cycle "." → ".." → "..." on the in-progress title so a slow install/start
+  // still reads as alive.
+  const inProgress = phase === "installing" || phase === "running";
+  const [dots, setDots] = useState(1);
+  useEffect(() => {
+    if (!inProgress) return;
+    setDots(1);
+    const timer = setInterval(() => setDots((n) => (n % 3) + 1), 400);
+    return () => clearInterval(timer);
+  }, [inProgress]);
 
   const streamed = lines.length > 0;
-  const phaseLabel =
+  const baseLabel =
     phase === "ready"
       ? "Omnigent is ready"
       : phase === "failed"
-        ? "Couldn't start Omnigent"
-        : "Starting Omnigent";
+        ? "Couldn't set up Omnigent"
+        : phase === "installing"
+          ? "Installing the Omnigent CLI"
+          : runningLabel;
+  const phaseLabel = inProgress ? `${baseLabel}${".".repeat(dots)}` : baseLabel;
+  const pendingHint = phase === "installing" ? "Installing the CLI…" : runningHint;
+  // Coarse progress over real milestones: warmup → install output → server
+  // starting → done; without an install, the run's first output and the server
+  // open fill those steps. Holds within a step (streaming log + pulse show liveness).
+  const progress =
+    phase === "ready" || phase === "failed"
+      ? 100
+      : phase === "running" && (onInstallCli || connection !== null)
+        ? 70
+        : streamed
+          ? 35
+          : 10;
 
   return (
-    <div className="flex h-full flex-col px-2 pb-1 pt-1">
+    <div className="flex h-full flex-col px-2 pb-1 pt-4">
       <div className="mb-2 text-sm font-medium text-foreground">{phaseLabel}</div>
       <div className="mb-3 h-[6px] w-full overflow-hidden rounded-full bg-foreground/[0.06]">
         <div
           className={`h-full rounded-full transition-all duration-300 ease-linear ${
             phase === "failed" ? "bg-destructive/60" : "bg-foreground/25"
-          } ${phase === "starting" ? "animate-pulse" : ""}`}
-          style={{ width: phase === "starting" ? "60%" : "100%" }}
+          } ${inProgress ? "animate-pulse" : ""}`}
+          style={{ width: `${progress}%` }}
         />
       </div>
 
@@ -96,7 +189,7 @@ export function SetupTerminalStep({
             <LogLine key={i} text={line} />
           ))
         ) : (
-          <div className="text-foreground/25">Starting the local server…</div>
+          <div className="text-foreground/25">{pendingHint}</div>
         )}
         {phase === "ready" && (
           <div className="text-[rgb(34,197,94)]">
@@ -105,10 +198,12 @@ export function SetupTerminalStep({
         )}
         {phase === "failed" && (
           <div className="text-destructive">
-            <span className="select-none">✕</span> {error ?? "Could not start the local server."}
+            <span className="select-none">✕</span> {error ?? "Could not set up Omnigent."}
           </div>
         )}
       </div>
+
+      <ConnectStatus connection={connection} onCancel={onCancelConnect} />
 
       {phase === "failed" && (
         <div className="mt-3 flex gap-2">
@@ -116,6 +211,7 @@ export function SetupTerminalStep({
             Back
           </Button>
           <Button className="flex-1" onClick={() => setAttempt((n) => n + 1)}>
+            <RotateCw className="size-4" aria-hidden />
             Retry
           </Button>
         </div>
@@ -133,7 +229,7 @@ function LogLine({ text }: { text: string }) {
     ? "text-destructive"
     : /\b(warn|warning)\b/i.test(t)
       ? "text-[rgb(180,120,0)]"
-      : /\b(ready|complete|listening|running on|started)\b/i.test(t)
+      : /\b(ready|complete|listening|running on|started|installed)\b/i.test(t)
         ? "text-[rgb(34,197,94)]"
         : "text-foreground/80";
   return <div className={`whitespace-pre-wrap break-words ${color}`}>{text}</div>;

@@ -1,8 +1,8 @@
 /**
  * Per-conversation WebContentsView registry.
  *
- * Keyed by `conversationId` for Omnigent's session model. Each entry owns its
- * own bounds controller so per-conversation state never cross-contaminates.
+ * Keyed by the agent's conversation ID or a user tab's view ID. Each entry owns
+ * its bounds and navigation; tabs in one conversation share storage.
  *
  * Pure factory — no Electron imports at module scope. All deps are injected
  * so a unit test can drive create/swap/close/closeAll/cap behavior with a
@@ -22,8 +22,8 @@ const { isAgentNavigationAllowed } = require("./browserUrlPolicy");
 const DEFAULT_CAP = 10;
 
 /**
- * Storage partition for one conversation's browser view. Every view MUST get
- * its own partition: with none, Electron places the view on
+ * Storage partition shared by one conversation's browser views. Without an
+ * explicit partition, Electron places the view on
  * `session.defaultSession`, sharing one cookie/localStorage/cache store across
  * all agents and the main window (agent A's login bleeds into agent B's view).
  * Deliberately NOT `persist:`-prefixed — an in-memory partition keeps
@@ -36,14 +36,22 @@ const DEFAULT_CAP = 10;
  * server — two windows connected to different servers could carry the same
  * conversationId and would otherwise share a cookie jar.
  *
- * `conversationId` is interpolated raw. Production ids are opaque 32-character
- * UUID hex strings; encode them if that contract ever loosens.
- *
  * @param {string} scope Registry-unique namespace (one per shell window).
- * @param {string} conversationId
+ * @param {string} viewId Conversation ID or encoded browser-tab view ID.
  * @returns {string}
  */
-function agentPartition(scope, conversationId) {
+function agentPartition(scope, viewId) {
+  let conversationId = viewId;
+  // Session IDs are UUID hex strings; tab keys follow browserViewId in
+  // web/src/hooks/useBrowserTabs.ts. Only storage uses the owning session ID.
+  const tab = /^browser-tab:([^:]+):[^:]+$/.exec(viewId);
+  if (tab) {
+    try {
+      conversationId = decodeURIComponent(tab[1]);
+    } catch {
+      // An invalid tab key keeps its own isolated partition.
+    }
+  }
   return `omnigent-agent-${scope}-${conversationId}`;
 }
 
@@ -65,6 +73,7 @@ function createBrowserViewRegistry({
   openUrlExternal = () => {}, // (url) => shell.openExternal(url)
   copyTextToClipboard = () => {}, // (text) => clipboard.writeText(text)
   showContextMenu = () => {}, // (items) => Menu.buildFromTemplate(items).popup(...)
+  onSuppressionChange = () => {}, // dismiss shell-owned UI when an overlay hides the pane
   cap = DEFAULT_CAP,
   // Partition namespace for this registry's views — see agentPartition.
   // Injectable so tests can pin it; defaults to a per-instance unique value.
@@ -93,6 +102,7 @@ function createBrowserViewRegistry({
   function setSuppressed(suppressed) {
     overlaySuppressed = !!suppressed;
     applyActiveVisibility();
+    onSuppressionChange(overlaySuppressed);
     return { ok: true };
   }
 

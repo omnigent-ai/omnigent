@@ -19,7 +19,7 @@ from typing import Any
 
 import pytest
 
-from omnigent.runner import create_runner_app
+from omnigent.runner import create_runner_app, subagent_work
 from tests.runner.conftest import (
     _drain_session_event_queue,
     _FakeProcessManager,
@@ -61,15 +61,15 @@ async def test_trailing_idle_must_not_launder_failed_child_status() -> None:
 
     runner_app._session_event_queues_ref.pop(parent_id, None)
     runner_app._session_event_queues_ref.pop(child_id, None)
-    runner_app._session_inboxes_ref[parent_id] = session_inbox
-    runner_app.register_child_session(
+    subagent_work._session_inboxes_ref[parent_id] = session_inbox
+    subagent_work.register_child_session(
         child_id,
         parent_session_id=parent_id,
         title="claude:impl",
         tool="claude",
         session_name="impl",
     )
-    runner_app.register_subagent_work(
+    subagent_work.register_subagent_work(
         parent_session_id=parent_id,
         child_session_id=child_id,
         agent="claude-native",
@@ -94,9 +94,9 @@ async def test_trailing_idle_must_not_launder_failed_child_status() -> None:
 
         events = _drain_session_event_queue(runner_app._session_event_queues_ref.get(parent_id))
     finally:
-        runner_app.unregister_subagent_work(child_id)
-        runner_app.unregister_child_session(child_id)
-        runner_app._session_inboxes_ref.pop(parent_id, None)
+        subagent_work.unregister_subagent_work(child_id)
+        subagent_work.unregister_child_session(child_id)
+        subagent_work._session_inboxes_ref.pop(parent_id, None)
         runner_app._session_event_queues_ref.pop(parent_id, None)
         runner_app._session_event_queues_ref.pop(child_id, None)
 
@@ -126,7 +126,6 @@ async def test_late_failed_report_must_not_be_discarded_by_delivered_completed()
     silently dropped. The parent (and any orchestrator reading child status)
     is left believing the turn succeeded.
     """
-    from omnigent.runner import app as runner_app
 
     parent_id = uuid.uuid4().hex
     child_id = uuid.uuid4().hex
@@ -137,8 +136,8 @@ async def test_late_failed_report_must_not_be_discarded_by_delivered_completed()
         server_client=NullServerClient(),  # type: ignore[arg-type]
     )
 
-    runner_app._session_inboxes_ref[parent_id] = session_inbox
-    runner_app.register_subagent_work(
+    subagent_work._session_inboxes_ref[parent_id] = session_inbox
+    subagent_work.register_subagent_work(
         parent_session_id=parent_id,
         child_session_id=child_id,
         agent="claude-native",
@@ -168,10 +167,10 @@ async def test_late_failed_report_must_not_be_discarded_by_delivered_completed()
             )
             assert failed_resp.status_code == 204, failed_resp.text
 
-            entry = runner_app.get_subagent_work(child_id)
+            entry = subagent_work.get_subagent_work(child_id)
     finally:
-        runner_app.unregister_subagent_work(child_id)
-        runner_app._session_inboxes_ref.pop(parent_id, None)
+        subagent_work.unregister_subagent_work(child_id)
+        subagent_work._session_inboxes_ref.pop(parent_id, None)
 
     assert entry is not None
     assert entry.status == "failed", (
@@ -205,13 +204,12 @@ async def test_wedged_launching_dispatch_fails_loudly_to_parent() -> None:
     the parent inbox, so the send is run-or-failed — never accepted and
     dropped in silence.
     """
-    from omnigent.runner import app as runner_app
 
     parent_id = uuid.uuid4().hex
     child_id = uuid.uuid4().hex
     inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
-    runner_app._session_inboxes_ref[parent_id] = inbox
-    entry = runner_app.register_subagent_work(
+    subagent_work._session_inboxes_ref[parent_id] = inbox
+    entry = subagent_work.register_subagent_work(
         parent_session_id=parent_id,
         child_session_id=child_id,
         agent="claude-native",
@@ -222,7 +220,7 @@ async def test_wedged_launching_dispatch_fails_loudly_to_parent() -> None:
         # Absent on an unguarded runner: without the sweep, the wedged
         # dispatch simply stays "launching" and the behavioral asserts
         # below observe the silent loss directly.
-        reap = getattr(runner_app, "reap_stalled_subagent_launches", None)
+        reap = getattr(subagent_work, "reap_stalled_subagent_launches", None)
         if reap is not None:
             # Within the budget: the dispatch is left alone (still launching).
             assert reap(now=entry.created_at + 10.0, timeout_s=180.0) == []
@@ -239,12 +237,12 @@ async def test_wedged_launching_dispatch_fails_loudly_to_parent() -> None:
         )
         payload = inbox.get_nowait()
         assert payload["status"] == "failed", payload
-        assert "never started" in str(payload["output"]), (
+        assert "no start acknowledgment" in str(payload["output"]), (
             f"the parent must receive an explanatory failure, got {payload['output']!r}"
         )
     finally:
-        runner_app.unregister_subagent_work(child_id)
-        runner_app._session_inboxes_ref.pop(parent_id, None)
+        subagent_work.unregister_subagent_work(child_id)
+        subagent_work._session_inboxes_ref.pop(parent_id, None)
 
 
 @pytest.mark.asyncio
@@ -255,13 +253,12 @@ async def test_started_dispatch_is_not_reaped_by_launch_liveness() -> None:
     Once the child has reported ``running`` (the launch proof), the liveness
     budget no longer applies — a long-running healthy child is not a wedge.
     """
-    from omnigent.runner import app as runner_app
 
     parent_id = uuid.uuid4().hex
     child_id = uuid.uuid4().hex
     inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
-    runner_app._session_inboxes_ref[parent_id] = inbox
-    entry = runner_app.register_subagent_work(
+    subagent_work._session_inboxes_ref[parent_id] = inbox
+    entry = subagent_work.register_subagent_work(
         parent_session_id=parent_id,
         child_session_id=child_id,
         agent="claude-native",
@@ -269,17 +266,17 @@ async def test_started_dispatch_is_not_reaped_by_launch_liveness() -> None:
     )
 
     try:
-        runner_app.mark_subagent_work_started(child_id)
+        subagent_work.mark_subagent_work_started(child_id)
         assert entry.status == "running"
-        reaped = runner_app.reap_stalled_subagent_launches(
+        reaped = subagent_work.reap_stalled_subagent_launches(
             now=entry.created_at + 10_000.0, timeout_s=180.0
         )
         assert reaped == []
         assert entry.status == "running"
         assert inbox.empty()
     finally:
-        runner_app.unregister_subagent_work(child_id)
-        runner_app._session_inboxes_ref.pop(parent_id, None)
+        subagent_work.unregister_subagent_work(child_id)
+        subagent_work._session_inboxes_ref.pop(parent_id, None)
 
 
 @pytest.mark.asyncio
@@ -293,7 +290,6 @@ async def test_reaped_dispatch_wakes_parent_not_just_inbox() -> None:
     failure into the inbox without the wake leaves the parent hanging exactly
     as before — the failure is recorded where nobody will ever read it.
     """
-    from omnigent.runner import app as runner_app
 
     parent_id = uuid.uuid4().hex
     child_id = uuid.uuid4().hex
@@ -315,8 +311,8 @@ async def test_reaped_dispatch_wakes_parent_not_just_inbox() -> None:
         server_client=_WakeRecordingServerClient(),  # type: ignore[arg-type]
     )
 
-    runner_app._session_inboxes_ref[parent_id] = inbox
-    entry = runner_app.register_subagent_work(
+    subagent_work._session_inboxes_ref[parent_id] = inbox
+    entry = subagent_work.register_subagent_work(
         parent_session_id=parent_id,
         child_session_id=child_id,
         agent="claude-native",
@@ -324,7 +320,7 @@ async def test_reaped_dispatch_wakes_parent_not_just_inbox() -> None:
     )
 
     try:
-        reaped = runner_app.reap_stalled_subagent_launches(
+        reaped = subagent_work.reap_stalled_subagent_launches(
             now=entry.created_at + 200.0,
             timeout_s=180.0,
             mark_terminal=app.state.mark_subagent_terminal_and_wake,
@@ -336,8 +332,8 @@ async def test_reaped_dispatch_wakes_parent_not_just_inbox() -> None:
 
         await asyncio.wait_for(wake_seen.wait(), timeout=5.0)
     finally:
-        runner_app.unregister_subagent_work(child_id)
-        runner_app._session_inboxes_ref.pop(parent_id, None)
+        subagent_work.unregister_subagent_work(child_id)
+        subagent_work._session_inboxes_ref.pop(parent_id, None)
 
     notice = wake_bodies[0]["data"]["content"][0]["text"]
     assert "finished (failed)" in notice, (
@@ -356,16 +352,15 @@ def test_launch_timeout_resolver_rejects_non_finite(
     without the explicit ``<= 0`` "disabled" intent. Non-finite values are
     rejected like non-numeric ones, falling back to the default.
     """
-    from omnigent.runner import app as runner_app
 
-    default = runner_app._DEFAULT_SUBAGENT_LAUNCH_TIMEOUT_S
+    default = subagent_work._DEFAULT_SUBAGENT_LAUNCH_TIMEOUT_S
     for bad in ("nan", "inf", "-inf", "+inf", "bogus"):
         monkeypatch.setenv("OMNIGENT_SUBAGENT_LAUNCH_TIMEOUT_S", bad)
-        assert runner_app.resolve_subagent_launch_timeout_s() == default, bad
+        assert subagent_work.resolve_subagent_launch_timeout_s() == default, bad
     # Explicit disable and a valid override still work.
     monkeypatch.setenv("OMNIGENT_SUBAGENT_LAUNCH_TIMEOUT_S", "0")
-    assert runner_app.resolve_subagent_launch_timeout_s() == 0.0
+    assert subagent_work.resolve_subagent_launch_timeout_s() == 0.0
     monkeypatch.setenv("OMNIGENT_SUBAGENT_LAUNCH_TIMEOUT_S", "45.5")
-    assert runner_app.resolve_subagent_launch_timeout_s() == 45.5
+    assert subagent_work.resolve_subagent_launch_timeout_s() == 45.5
     monkeypatch.delenv("OMNIGENT_SUBAGENT_LAUNCH_TIMEOUT_S")
-    assert runner_app.resolve_subagent_launch_timeout_s() == default
+    assert subagent_work.resolve_subagent_launch_timeout_s() == default

@@ -62,25 +62,52 @@ describe("normalizeUrl", () => {
   it("preserves an explicit scheme (even http to a remote host)", () => {
     assert.equal(normalizeUrl("http://localhost:6767"), "http://localhost:6767/");
     assert.equal(normalizeUrl("https://example.com"), "https://example.com/");
-    assert.equal(normalizeUrl("http://example.databricks.com"), "http://example.databricks.com/");
+    assert.equal(normalizeUrl("http://example.com"), "http://example.com/");
+  });
+
+  it("upgrades HTTP workspace URLs before discovery and origin pinning", () => {
+    assert.equal(
+      normalizeUrl("http://workspace.cloud.databricks.com/omnigent?o=123"),
+      "https://workspace.cloud.databricks.com/?o=123",
+    );
+    assert.equal(normalizeUrl("http://ws.azuredatabricks.net"), "https://ws.azuredatabricks.net/");
+    assert.equal(normalizeUrl("http://notdatabricks.com"), "http://notdatabricks.com/");
+  });
+
+  it("preserves custom-port HTTP workspaces across connection, restore, and warning", () => {
+    for (const port of [8080, 443]) {
+      const origin = `http://ws.databricks.com:${port}`;
+      const saved = `${origin}/omnigent?o=123`;
+      assert.equal(normalizeUrl(saved), `${origin}/?o=123`);
+      assert.equal(normalizeSavedServerUrl(saved), saved);
+      assert.equal(normalizeSavedServerUrl(`${origin}/api/2.0/omnigent?o=123`), saved);
+      assert.equal(isPlainHttpRemote(saved), true);
+    }
+  });
+
+  it("still upgrades an explicit default HTTP port", () => {
+    const input = "http://workspace.cloud.databricks.com:80/omnigent?o=123";
+    assert.equal(normalizeUrl(input), "https://workspace.cloud.databricks.com/?o=123");
+    assert.equal(
+      normalizeSavedServerUrl(input),
+      "https://workspace.cloud.databricks.com/omnigent?o=123",
+    );
+    assert.equal(isPlainHttpRemote(input), false);
   });
 
   it("preserves the Databricks organization while removing other URL state", () => {
     assert.equal(
       normalizeUrl(
-        "  https://isaac.databricks.com/omnigent/c/123?view=chat&o=1965859176160743#latest  ",
+        "  https://workspace.cloud.databricks.com/omnigent/c/123?view=chat&o=123#latest  ",
       ),
-      "https://isaac.databricks.com/?o=1965859176160743",
+      "https://workspace.cloud.databricks.com/?o=123",
     );
   });
 
   it("removes every query parameter for non-Databricks hosts", () => {
+    assert.equal(normalizeUrl("example.com/path?o=123&view=chat#latest"), "https://example.com/");
     assert.equal(
-      normalizeUrl("example.com/path?o=1965859176160743&view=chat#latest"),
-      "https://example.com/",
-    );
-    assert.equal(
-      normalizeUrl("https://my-app.aws.databricksapps.com/?o=1965859176160743"),
+      normalizeUrl("https://my-app.aws.databricksapps.com/?o=123"),
       "https://my-app.aws.databricksapps.com/",
     );
   });
@@ -110,13 +137,14 @@ describe("normalizeRecentServers", () => {
   it("shows root URLs, preserves organizations, and deduplicates", () => {
     assert.deepEqual(
       normalizeRecentServers([
-        "https://isaac.databricks.com/omnigent?o=1965859176160743",
-        "https://isaac.databricks.com/c/123?ignored=yes&o=1965859176160743",
+        "https://workspace.cloud.databricks.com/omnigent?o=123",
+        "http://workspace.cloud.databricks.com/omnigent?o=123",
+        "https://workspace.cloud.databricks.com/c/123?ignored=yes&o=123",
         "http://localhost:6767/conversation/123",
         "not a URL",
         null,
       ]),
-      ["https://isaac.databricks.com/?o=1965859176160743", "http://localhost:6767/"],
+      ["https://workspace.cloud.databricks.com/?o=123", "http://localhost:6767/"],
     );
   });
 
@@ -128,8 +156,8 @@ describe("normalizeRecentServers", () => {
 describe("serverDisplayLabel", () => {
   it("shows only the host and optional Databricks organization", () => {
     assert.equal(
-      serverDisplayLabel("https://isaac.databricks.com/omnigent?o=1965859176160743"),
-      "isaac.databricks.com/?o=1965859176160743",
+      serverDisplayLabel("https://workspace.cloud.databricks.com/omnigent?o=123"),
+      "workspace.cloud.databricks.com/?o=123",
     );
     assert.equal(serverDisplayLabel("http://localhost:6767/sessions"), "localhost:6767");
   });
@@ -177,7 +205,11 @@ describe("isPlainHttpRemote", () => {
   });
 
   it("warns for an explicit http:// to a remote host", () => {
-    assert.equal(isPlainHttpRemote("http://example.databricks.com"), true);
+    assert.equal(isPlainHttpRemote("http://example.com"), true);
+  });
+
+  it("does not warn for workspace URLs that connect over HTTPS", () => {
+    assert.equal(isPlainHttpRemote("http://workspace.cloud.databricks.com/omnigent?o=123"), false);
   });
 
   it("does not warn for loopback hosts", () => {
@@ -194,6 +226,16 @@ describe("isPlainHttpRemote", () => {
 });
 
 describe("normalizeSavedServerUrl", () => {
+  it("upgrades saved HTTP workspaces while preserving their paths and organization", () => {
+    for (const path of ["/", "/omnigent", "/omnigent/c/123"]) {
+      assert.equal(
+        normalizeSavedServerUrl(`http://workspace.cloud.databricks.com${path}?o=123#state`),
+        `https://workspace.cloud.databricks.com${path}?o=123#state`,
+      );
+    }
+    assert.equal(normalizeSavedServerUrl("http://localhost:6767/"), "http://localhost:6767/");
+  });
+
   it("maps the current Databricks API mount to the UI mount", () => {
     assert.equal(
       normalizeSavedServerUrl("https://ws.cloud.databricks.com/api/2.0/omnigent"),
