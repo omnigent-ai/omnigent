@@ -166,15 +166,21 @@ def _read_pending(child: Any, seconds: float = 0.3) -> str:
 
 def _clean_exit(child: Any) -> None:
     """Best-effort clean exit of the REPL."""
+    original_error = sys.exception()
     try:
-        child.sendcontrol("d")
-        child.expect(pexpect.EOF, timeout=10)
-    except pexpect.ExceptionPexpect:
-        pass
-    if child.isalive():
-        child.terminate(force=True)
-    if child.logfile_read is not None:
-        child.logfile_read.close()
+        try:
+            with contextlib.suppress(pexpect.ExceptionPexpect, OSError):
+                child.sendcontrol("d")
+                child.expect(pexpect.EOF, timeout=10)
+            if child.isalive():
+                child.terminate(force=True)
+        finally:
+            if child.logfile_read is not None:
+                child.logfile_read.close()
+    except (pexpect.ExceptionPexpect, OSError) as cleanup_error:
+        if original_error is None:
+            raise
+        original_error.add_note(f"REPL cleanup failed: {cleanup_error}")
 
 
 @pytest.fixture(scope="module")

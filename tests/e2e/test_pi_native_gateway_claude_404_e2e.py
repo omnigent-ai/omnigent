@@ -481,7 +481,7 @@ def test_facet_a_live_pi_cli_gateway_claude_404_journey(fake_gateway: str, tmp_p
                 lambda: _match_conv(_output()), timeout=160, what="conversation id", tail=_output
             )
         )
-        bridge = config_home / "pi-native" / pi_bridge_dir_for_session(conv).name
+        bridge = home / pi_bridge_dir_for_session(conv).relative_to(Path.home())
         models_path = bridge / "pi-agent" / "models.json"
 
         # 2. Wait for the runner to render the managed per-session models.json.

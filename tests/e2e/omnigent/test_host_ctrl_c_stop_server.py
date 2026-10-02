@@ -33,6 +33,7 @@ import contextlib
 import os
 import signal
 import subprocess
+import sys
 import threading
 import time
 from collections.abc import Mapping
@@ -212,9 +213,11 @@ def _force_stop_server(server: psutil.Process | int) -> None:
         server.terminate()
         if not _wait_for_server_exit(server, timeout=10):
             server.kill()
-            assert _wait_for_server_exit(server, timeout=5), (
-                f"server {server.pid} survived SIGKILL"
-            )
+            if not _wait_for_server_exit(server, timeout=5):
+                message = f"server {server.pid} survived SIGKILL"
+                if (error := sys.exception()) is None:
+                    raise AssertionError(message)
+                error.add_note(message)
 
 
 def _boot_connect_and_get_server(child: pexpect.spawn, home: Path) -> tuple[int, int]:
