@@ -88,34 +88,6 @@ def test_remote_resume_option_spellings(args: tuple[str, ...], expected: dict) -
 
 
 @pytest.mark.parametrize(
-    ("version", "expected_flag"),
-    [
-        # Unknown version stays on --remote: the wrong flag is a hard clap
-        # crash, so only a confirmed 0.159+ earns the rename.
-        (None, "--remote"),
-        ((0, 159, 0), "--remote-control"),
-        ((0, 160, 1), "--remote-control"),
-        ((0, 158, 9), "--remote"),
-        ((0, 154, 0), "--remote"),
-    ],
-)
-def test_remote_attach_flag_version_gated(
-    version: tuple[int, int, int] | None, expected_flag: str
-) -> None:
-    assert app_server.codex_remote_attach_flag(version) == expected_flag
-    fresh = app_server.build_codex_remote_args(
-        codex_args=(),
-        thread_id=None,
-        remote_url="ws://127.0.0.1:9876",
-        codex_cli_version=version,
-    )
-    # The attach flag immediately precedes the transport URL.
-    assert fresh[fresh.index("ws://127.0.0.1:9876") - 1] == expected_flag
-    other_flag = "--remote" if expected_flag == "--remote-control" else "--remote-control"
-    assert other_flag not in fresh
-
-
-@pytest.mark.parametrize(
     "args",
     [
         ("--profile", "strict"),

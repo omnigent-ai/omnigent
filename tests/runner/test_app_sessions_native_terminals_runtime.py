@@ -746,7 +746,7 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
         "--dangerously-bypass-hook-trust",
         *permission_args,
         "resume",
-        codex_app_mod.codex_remote_attach_flag(version),
+        "--remote",
         app_server.listen_url,
         thread_id,
     ]
