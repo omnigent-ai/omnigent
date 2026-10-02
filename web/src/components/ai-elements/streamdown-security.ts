@@ -33,7 +33,8 @@ export const STREAMDOWN_PLUGINS = {
 export const SECURE_STREAMDOWN_REHYPE_PLUGINS = createStreamdownRehypePlugins(false);
 export const FILE_LINK_STREAMDOWN_REHYPE_PLUGINS = createStreamdownRehypePlugins(true);
 
-// Attribute carrying the original, unhardened href of a workspace-file link.
+// Attribute carrying the workspace path a file link names, percent-decoded
+// from its (unhardened) href so it matches the real filename on disk.
 export const WORKSPACE_FILE_LINK_ATTR = "data-omnigent-file";
 
 // An href that can only be a protocol URL, a protocol-relative URL, or an
@@ -142,6 +143,11 @@ function fileUriToLocalPath(href: string): string | null {
  * unresolvable URL. Only hrefs that could name a real file are moved: a URL,
  * a `mailto:`/`javascript:` scheme, or anything carrying a query or fragment
  * is left for harden to judge exactly as before.
+ *
+ * The href is a markdown link destination, so its path is percent-encoded (a
+ * file named `My Notes.md` arrives as `My%20Notes.md`). It is decoded before
+ * being stored, because every consumer uses it as a filesystem path — an
+ * encoded one never matches the real file and the link reads as broken.
  */
 export function markWorkspaceFileLinks() {
   return (tree: HastElement) => {
@@ -155,10 +161,23 @@ export function markWorkspaceFileLinks() {
       node.properties = {
         ...node.properties,
         href: PARKED_FILE_HREF,
-        [WORKSPACE_FILE_LINK_ATTR]: href,
+        [WORKSPACE_FILE_LINK_ATTR]: decodeFileHref(href),
       };
     });
   };
+}
+
+/**
+ * Percent-decodes a file link's href into the path it names. Falls back to the
+ * raw href when it isn't valid percent-encoding (e.g. a lone `%`, itself a
+ * legal filename character), so a malformed sequence never drops the link.
+ */
+function decodeFileHref(href: string): string {
+  try {
+    return decodeURIComponent(href);
+  } catch {
+    return href;
+  }
 }
 
 function visitElements(node: HastElement, visitor: (node: HastElement) => void): void {
