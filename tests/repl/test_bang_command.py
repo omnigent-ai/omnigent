@@ -19,9 +19,9 @@ from omnigent.repl import _repl
 from omnigent.repl._repl import (
     _BANG_INPUT_STYLE,
     _bang_shell_argv,
-    _BangInputLexer,
     _build_bang_context,
     _clip_text,
+    _ComposerLexer,
     _resolve_cd,
     _run_bang_command,
     _write_bang_overflow,
@@ -198,7 +198,7 @@ def test_build_context_notes_overflow_path() -> None:
     assert "/tmp/x.log" in block and "full output" in block
 
 
-# ── _BangInputLexer (composer coloring) ─────────────────
+# ── _ComposerLexer (composer coloring) ──────────────────
 
 
 def test_bang_input_style_is_the_logo_green() -> None:
@@ -218,7 +218,7 @@ def test_bang_input_style_is_the_logo_green() -> None:
     ],
 )
 def test_bang_input_lexer_colors_only_bang_lines(text: str, colored: bool) -> None:
-    get_line = _BangInputLexer().lex_document(Document(text))
+    get_line = _ComposerLexer().lex_document(Document(text))
     style, rendered = get_line(0)[0]
     assert rendered == text
     assert (style == _BANG_INPUT_STYLE) is colored
