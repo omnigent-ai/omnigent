@@ -85,8 +85,8 @@ vi.mock("@/hooks/useConversations", async (importActual) => ({
 }));
 vi.mock("@/canvas/canvasSessions", () => ({ useCanvasSessions: vi.fn() }));
 vi.mock("@/hooks/useViewerId", () => ({ useViewerId: () => viewerIdRef.current }));
-vi.mock("@/hooks/useGithub", () => ({
-  fetchGithubInfo: vi.fn(async () => ({ object: "session.github.info", available: false })),
+vi.mock("@/hooks/usePullRequests", () => ({
+  fetchPullRequestInfo: vi.fn(async () => ({ object: "session.github.info", available: false })),
 }));
 vi.mock("@/shell/NewProjectButton", () => ({
   NewProjectButton: ({ onCreated }: { onCreated: (name: string) => void }) => (

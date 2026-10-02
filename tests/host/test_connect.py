@@ -8102,8 +8102,8 @@ async def test_handle_import_local_legacy_server_skips_only_unsafe_session(
 async def test_dispatch_fs_write_op_routes_github_set_preference(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The write dispatcher forwards to github_resource.set_github_preference."""
-    from omnigent.runner import github_resource
+    """The write dispatcher forwards to pr_resource.set_pr_preference."""
+    from omnigent.runner import pr_resource
 
     seen: dict[str, object] = {}
 
@@ -8111,7 +8111,7 @@ async def test_dispatch_fs_write_op_routes_github_set_preference(
         seen.update({"root": root, "account": account, "remote": remote})
         return {"object": "session.github.info", "ok": True}
 
-    monkeypatch.setattr(github_resource, "set_github_preference", fake_set)
+    monkeypatch.setattr(pr_resource, "set_pr_preference", fake_set)
     out = HostProcess._dispatch_fs_write_op(
         "/ws/omnigent",
         "github_set_preference",

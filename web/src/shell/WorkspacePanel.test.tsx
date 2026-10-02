@@ -198,10 +198,10 @@ describe("WorkspacePanel surface presentation", () => {
   });
 
   it.each([
-    ["files", ["Files", "Changes", "GitHub", "Agents 1", "Browser"]],
-    ["changes", ["Changes", "Files", "GitHub", "Agents 1", "Browser"]],
-    ["github", ["GitHub", "Files", "Changes", "Agents 1", "Browser"]],
-    ["subagents", ["Agents 1", "Files", "Changes", "GitHub", "Browser"]],
+    ["files", ["Files", "Changes", "Pull Requests", "Agents 1", "Browser"]],
+    ["changes", ["Changes", "Files", "Pull Requests", "Agents 1", "Browser"]],
+    ["github", ["Pull Requests", "Files", "Changes", "Agents 1", "Browser"]],
+    ["subagents", ["Agents 1", "Files", "Changes", "Pull Requests", "Browser"]],
   ] as const)("places the %s default first without reordering the remaining tabs", (tab, order) => {
     writeDefaultWorkspaceTab(tab);
     renderWorkspace({ showGithubTab: true, showBrowserTab: true, rightRailTab: "files" });
@@ -239,7 +239,7 @@ describe("WorkspacePanel surface presentation", () => {
   it("shows inert workspace chrome while a temporary session is pending", () => {
     renderWorkspace({ pending: true });
 
-    for (const name of ["Files", "Changes", "GitHub", "Agents"]) {
+    for (const name of ["Files", "Changes", "Pull Requests", "Agents"]) {
       expect(screen.getByRole("tab", { name: new RegExp(name) })).toBeDisabled();
     }
     expect(screen.getByText("Starting workspace…")).toBeInTheDocument();

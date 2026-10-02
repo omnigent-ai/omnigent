@@ -10525,12 +10525,11 @@ def create_runner_app(
             },
         )
 
-    # ── GitHub integration (read-only): PR metadata + the PR's files / diff ──
-    # The list and patch come from the ``gh`` CLI (the PR's "Files changed");
-    # only the per-file expand-context reader uses ``git show``. See
-    # omnigent.runner.github_resource. Each shells out synchronously, so it is
-    # offloaded to a thread like the changed-files / diff routes above (a blocked
-    # loop 503s the session).
+    # ── Pull request panel: PR metadata + the PR's files / diff ──
+    # omnigent.runner.pr_resource serves every git provider through its pull
+    # request facet; the ``github`` route paths are stable wire ids. Each call
+    # blocks on the provider's CLI or API, so it is offloaded to a thread like the
+    # changed-files / diff routes above (a blocked loop 503s the session).
 
     async def _github_workspace_root(session_id: str) -> str:
         """Resolve the workspace root for GitHub routes, or 404 when headless."""
@@ -10544,10 +10543,10 @@ def create_runner_app(
         return root
 
     async def _github_call(session_id: str, operation: str, **kwargs: Any) -> JSONResponse:
-        from omnigent.runner import github_resource
+        from omnigent.runner import pr_resource
 
         root = await _github_workspace_root(session_id)
-        function = getattr(github_resource, operation)
+        function = getattr(pr_resource, operation)
         try:
             result = await asyncio.to_thread(function, root, session_id=session_id, **kwargs)
         except ValueError as exc:
@@ -10556,15 +10555,15 @@ def create_runner_app(
 
     @app.get("/v1/sessions/{session_id}/resources/github")
     async def read_github_info(session_id: str, pr_url: str | None = None) -> JSONResponse:
-        return await _github_call(session_id, "github_info", pr_url=pr_url)
+        return await _github_call(session_id, "pr_info", pr_url=pr_url)
 
     @app.get("/v1/sessions/{session_id}/resources/github/changes")
     async def read_github_changes(session_id: str, pr_url: str | None = None) -> JSONResponse:
-        return await _github_call(session_id, "github_changed_files", pr_url=pr_url)
+        return await _github_call(session_id, "pr_changed_files", pr_url=pr_url)
 
     @app.get("/v1/sessions/{session_id}/resources/github/diff")
     async def read_github_pr_diff(session_id: str, pr_url: str | None = None) -> JSONResponse:
-        return await _github_call(session_id, "github_pr_diff", pr_url=pr_url)
+        return await _github_call(session_id, "pr_diff", pr_url=pr_url)
 
     @app.get("/v1/sessions/{session_id}/resources/github/diff/{relative_path:path}")
     async def read_github_file_diff(
@@ -10582,7 +10581,7 @@ def create_runner_app(
             raise HTTPException(status_code=400, detail="Invalid path")
         return await _github_call(
             session_id,
-            "github_file_diff",
+            "pr_file_diff",
             base=base or "",
             path=relative_path,
             pr_url=pr_url,
@@ -10605,7 +10604,7 @@ def create_runner_app(
         body = await request.json()
         return await _github_call(
             session_id,
-            "set_github_preference",
+            "set_pr_preference",
             account=body.get("account"),
             remote=body.get("remote"),
             pr_url=body.get("pr_url"),
