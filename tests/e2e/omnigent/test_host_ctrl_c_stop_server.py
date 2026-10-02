@@ -30,6 +30,8 @@ actually terminate the server — none of which a mock-based test would catch.
 from __future__ import annotations
 
 import contextlib
+import os
+import signal
 import subprocess
 import threading
 import time
@@ -195,13 +197,17 @@ def _wait_for_server_exit(server: psutil.Process, *, timeout: float) -> bool:
     return True
 
 
-def _force_stop_server(server: psutil.Process) -> None:
+def _force_stop_server(server: psutil.Process | int) -> None:
     """
-    Stop only the captured server process, escalating if graceful exit stalls.
+    Stop a captured process, or send best-effort SIGTERM to a legacy PID.
 
-    :param server: Process identity captured while the server was running.
+    :param server: Captured process identity, or PID from an existing caller.
     :returns: None.
     """
+    if isinstance(server, int):
+        with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
+            os.kill(server, signal.SIGTERM)
+        return
     with contextlib.suppress(psutil.NoSuchProcess, psutil.AccessDenied):
         server.terminate()
         if not _wait_for_server_exit(server, timeout=10):

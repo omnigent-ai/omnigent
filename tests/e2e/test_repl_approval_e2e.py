@@ -38,6 +38,7 @@ import os
 import re
 import shutil
 import sys
+import tempfile
 import time
 from collections.abc import Iterator
 from pathlib import Path
@@ -227,9 +228,16 @@ def repl_env(
 @pytest.fixture
 def repl_transcript(repl_env: dict[str, str], request: pytest.FixtureRequest) -> Iterator[TextIO]:
     """Retain the raw terminal stream alongside this module's runtime logs."""
-    log = Path(repl_env["OMNIGENT_DATA_DIR"]) / "logs" / "cli" / f"{request.node.name}.log"
-    log.parent.mkdir(parents=True, exist_ok=True)
-    with log.open("w", encoding="utf-8") as stream:
+    log_dir = Path(repl_env["OMNIGENT_DATA_DIR"]) / "logs" / "cli"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        dir=log_dir,
+        prefix=f"{request.node.name}-",
+        suffix=".log",
+        delete=False,
+    ) as stream:
         yield stream
 
 

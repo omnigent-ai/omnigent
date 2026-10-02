@@ -543,21 +543,28 @@ def test_facet_a_live_pi_cli_gateway_claude_404_journey(fake_gateway: str, tmp_p
             warning_surfaced = _warning_surfaced()
     finally:
         stop.set()
-        transcript = config_home / "logs" / "cli" / "gateway-journey-pty.log"
-        transcript.parent.mkdir(parents=True, exist_ok=True)
-        transcript.write_text(_output(), encoding="utf-8")
-        # Stop the CLI group, then only daemons/runners with this test's data dir.
-        with contextlib.suppress(ProcessLookupError, OSError):
-            os.killpg(os.getpgid(pid), signal.SIGKILL)
-        with contextlib.suppress(ProcessLookupError, OSError):
-            os.kill(pid, signal.SIGKILL)
-        with contextlib.suppress(Exception):
-            os.waitpid(pid, 0)
-        with contextlib.suppress(OSError):
-            os.close(fd)
-        _, survivors = reap_leaked_omnigent_processes(config_home)
-        if survivors and (error := sys.exception()) is not None:
-            error.add_note(f"test processes survived cleanup: {survivors}")
+        journey_error = sys.exception()
+        try:
+            transcript = config_home / "logs" / "cli" / "gateway-journey-pty.log"
+            transcript.parent.mkdir(parents=True, exist_ok=True)
+            transcript.write_text(_output(), encoding="utf-8")
+        except OSError as log_error:
+            if journey_error is None:
+                raise
+            journey_error.add_note(f"Could not save PTY transcript: {log_error}")
+        finally:
+            # Stop the CLI group, then only daemons/runners with this test's data dir.
+            with contextlib.suppress(ProcessLookupError, OSError):
+                os.killpg(os.getpgid(pid), signal.SIGKILL)
+            with contextlib.suppress(ProcessLookupError, OSError):
+                os.kill(pid, signal.SIGKILL)
+            with contextlib.suppress(Exception):
+                os.waitpid(pid, 0)
+            with contextlib.suppress(OSError):
+                os.close(fd)
+            _, survivors = reap_leaked_omnigent_processes(config_home)
+            if survivors and (error := sys.exception()) is not None:
+                error.add_note(f"test processes survived cleanup: {survivors}")
 
     assert not survivors, f"test processes survived cleanup: {survivors}"
     silently_openai = "openai-completions" in rendered_apis
