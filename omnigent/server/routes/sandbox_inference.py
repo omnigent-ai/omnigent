@@ -16,8 +16,9 @@ from omnigent.inference_config import (
     parse_inference_config,
     resolve_bound_provider,
 )
-from omnigent.server.auth import LEVEL_READ, AuthProvider
-from omnigent.server.routes._auth_helpers import require_access_and_level, require_user
+from omnigent.server.auth import AuthProvider
+from omnigent.server.routes._auth_helpers import require_user
+from omnigent.server.routes._session_create_validation import validate_session_agent
 
 
 def inference_service(request: Request) -> Any:
@@ -168,13 +169,18 @@ def create_sandbox_inference_router(
         user_id = require_user(request, auth_provider)
         auth = None
         if agent_id is not None:
-            agent = await asyncio.to_thread(agent_store.get, agent_id)
-            if agent is None:
+            # Clients read a missing agent's 404 from ``detail``; keep that shape.
+            if await asyncio.to_thread(agent_store.get, agent_id) is None:
                 raise HTTPException(status_code=404, detail="Agent not found")
-            if agent.session_id:
-                await require_access_and_level(
-                    user_id, agent.session_id, LEVEL_READ, permission_store, conversation_store
-                )
+            # The same check as binding the agent: its owner, or READ on any
+            # session that shares the agent row.
+            agent = await validate_session_agent(
+                user_id=user_id,
+                agent_id=agent_id,
+                agent_store=agent_store,
+                permission_store=permission_store,
+                conversation_store=conversation_store,
+            )
             spec = (
                 await asyncio.to_thread(
                     agent_cache.load,

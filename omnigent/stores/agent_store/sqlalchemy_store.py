@@ -86,16 +86,13 @@ class SqlAlchemyAgentStore(AgentStore):
         and grants on the root's ACL — so any conversation in the tree
         authorizes identically.
 
-        That is what makes this a single bounded query. Named ``sys_session_send``
-        children are created bound to the *same* ``agent_id`` as their mint, so
-        several conversation rows can share it — but they all carry the SAME
-        ``root_conversation_id`` (children inherit their parent's root, and the
-        mint's own root when it is itself a child). So selecting the root from
-        *any one* of them (an unordered ``LIMIT 1``) is unambiguous and O(1):
-        there is no "wrong row" to return. It also sidesteps read-replica lag —
-        the root is the oldest node in the tree, never a just-written child that
-        a replica has not caught up to. ``conversations`` lives on the AP DB, so
-        this runs on the conversation engine.
+        A single bounded query: an unordered ``LIMIT 1``. Named
+        ``sys_session_send`` children share their tree's root, but forks of the
+        owner's sessions share the agent row too, so several roots can use it and
+        this returns any one of them. ``validate_session_agent`` therefore accepts
+        READ on any root using the agent (``list_session_roots_for_agent``).
+        ``conversations`` lives on the AP DB, so this runs on the conversation
+        engine.
 
         This lookup is NOT used to authorize agent-code mutation: a legacy
         (``created_by`` NULL) agent may be referenced by several unrelated roots
