@@ -1,0 +1,10 @@
+sandbox:
+  provider: opensandbox
+  server_url: https://omnigent.example.com
+  opensandbox:
+    # image and snapshot_id are mutually exclusive.
+    image: ghcr.io/omnigent-ai/omnigent-host:latest
+    # snapshot_id: snap_...
+    env: [OPENAI_API_KEY, GIT_TOKEN]
+    max_lifetime_s: 86400
+    ready_timeout_s: 300
