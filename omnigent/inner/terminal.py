@@ -735,6 +735,28 @@ def _apply_utf8_locale_default(env: dict[str, str]) -> None:
     env["LC_ALL"] = "C.UTF-8"
 
 
+# COLORFGBG values keyed by the client's resolved terminal theme. The value is
+# "<fg>;<bg>" with the background field last: 0 is the dark palette entry,
+# 15 the light one — the heuristic Vim uses to pick `background=`.
+_COLORFGBG_BY_TERMINAL_THEME = {"dark": "15;0", "light": "0;15"}
+
+
+def terminal_theme_env_hint(theme: object) -> dict[str, str]:
+    """Return a ``COLORFGBG`` hint for a resolved light/dark theme, else ``{}``.
+
+    :param theme: ``"light"`` or ``"dark"`` from the create request. Anything
+        else (missing field, an unresolved ``"auto"``, junk) yields no hint
+        rather than a guess.
+    :returns: ``{"COLORFGBG": ...}`` for a recognized theme, else ``{}``.
+    """
+    if not isinstance(theme, str):
+        return {}
+    value = _COLORFGBG_BY_TERMINAL_THEME.get(theme)
+    if value is None:
+        return {}
+    return {"COLORFGBG": value}
+
+
 def _tmux_available() -> bool:
     """Check if tmux is installed."""
     return shutil.which("tmux") is not None

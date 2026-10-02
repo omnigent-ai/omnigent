@@ -1,5 +1,6 @@
 """E2E: the Settings → Appearance terminal-theme picker themes a live terminal
-independently of the app theme, and persists.
+independently of the app theme, persists, and tells the pane's process which
+background it is rendered on.
 
 The terminal-theme control lives on the Settings page (``pages/SettingsPage.tsx``,
 ``TerminalThemeControl``): three radio cards — Match app / Light / Dark — under a
@@ -15,22 +16,51 @@ xterm paints to a WebGL canvas (see ``shells/test_new_shell.py`` for why termina
 pixels aren't asserted). ``auto`` follows the app; ``light``/``dark`` pin the
 terminal regardless of the app theme.
 
-This is exactly the pair the feature exists for: a light terminal under a dark
-app, and a dark terminal under a light app. The shell is user-launched (no LLM
-turn) via the tab strip's "+" → Shell menu, mirroring
-``shells/test_new_shell.py``.
+Painting the canvas is only half of it: the program inside the pane picks its
+own ANSI colors, so a TUI that assumes a light background paints near-black text
+that vanishes on a dark pane unless the process is told what it is rendered on.
+The conventional hint is ``COLORFGBG`` (``<fg>;<bg>``, ``15;0`` for a dark
+background, ``0;15`` for a light one). The shell tests below read the hint back
+from the pane output the browser receives on the terminal-attach WebSocket,
+because xterm's glyphs never reach the DOM.
+
+The shell is user-launched (no LLM turn) via the tab strip's "+" → Shell menu,
+mirroring ``shells/test_new_shell.py``.
 """
 
 from __future__ import annotations
 
+import os
 import re
+import time
 
-from playwright.sync_api import Page, expect
+import pytest
+from playwright.sync_api import Locator, Page, WebSocket, expect
 
 from tests.e2e_ui.conftest import open_right_rail
 
 TERMINAL_THEME_KEY = "omnigent:terminal-theme"
 APP_THEME_KEY = "web-theme"
+# The e2e conftest films the journey when this is set; only then is the probe
+# result held on screen long enough to read.
+_RECORDING = bool(os.environ.get("OMNIGENT_E2E_RECORD_DIR"))
+
+# What a TUI that assumes a light background emits (ANSI black text), followed
+# by the background hint the shell actually received. The marker is split in
+# the typed command so the shell's echo of the command line never contains it.
+_PANE_BACKGROUND_PROBE = (
+    "printf '\\e[30m  LIGHT-TUI DEMO: a light-background TUI paints this near-black  \\e[0m\\n'; "
+    "printf 'PTY''BG=%s\\n' \"${COLORFGBG-UNSET}\""
+)
+# The trailing newline keeps the match atomic when the PTY output arrives
+# split across WebSocket frames.
+_PANE_HINT_RE = re.compile(r"PTYBG=([0-9A-Za-z;]+)\r?\n")
+_ANSI_RE = re.compile(
+    r"\x1b\[[0-9;?]*[ -/]*[@-~]"  # CSI sequences (colors, cursor moves, modes)
+    r"|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)"  # OSC sequences (titles, clipboard)
+    r"|\x1b[()][A-Za-z0-9]"  # charset designations
+    r"|\x1b[=>78]"  # keypad / cursor save-restore
+)
 
 
 def _html_has_dark(page: Page) -> bool:
@@ -87,15 +117,104 @@ def _connected_main_terminal(page: Page):
     return terminal_view
 
 
-def test_light_terminal_under_dark_app(page: Page, terminal_session: tuple[str, str]) -> None:
-    """A "Light" terminal stays light while the app runs Dark.
+def _capture_pane_output(page: Page) -> list[bytes]:
+    """Collect the pane bytes the page receives on every terminal-attach socket.
+
+    Register before navigating: the attach socket opens asynchronously once a
+    shell's xterm mounts, and the client may re-dial onto the runner's direct
+    loopback socket, so every ``/attach`` URL is tracked.
+    """
+    frames: list[bytes] = []
+
+    def _on_frame(payload: str | bytes) -> None:
+        frames.append(payload if isinstance(payload, bytes) else payload.encode())
+
+    def _on_ws(ws: WebSocket) -> None:
+        if "/attach" in ws.url:
+            ws.on("framereceived", _on_frame)
+
+    page.on("websocket", _on_ws)
+    return frames
+
+
+def _pane_background_hint(page: Page, terminal_view: Locator, frames: list[bytes]) -> str:
+    """Type the probe into the connected shell and return the hint it printed.
+
+    Returns the ``COLORFGBG`` value the shell received, or ``"UNSET"`` when the
+    pane's process was never told its background.
+    """
+    terminal_view.locator("textarea.xterm-helper-textarea").focus()
+    page.keyboard.type(_PANE_BACKGROUND_PROBE)
+    page.keyboard.press("Enter")
+
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline:
+        screen = _ANSI_RE.sub("", b"".join(frames).decode("utf-8", "replace"))
+        if match := _PANE_HINT_RE.search(screen):
+            if _RECORDING:
+                page.wait_for_timeout(2_000)
+            return match.group(1)
+        page.wait_for_timeout(500)
+    raise AssertionError("the shell never echoed the PTYBG probe line")
+
+
+def _journey_page(request: pytest.FixtureRequest) -> Page:
+    """Open the browser page only now, after ``terminal_session`` is set up.
+
+    Taking ``page`` as a test parameter would create it (and start filming
+    it) before the server, agent and session fixtures run, so a recording
+    would open on setup instead of on the journey.
+    """
+    return request.getfixturevalue("page")
+
+
+def test_match_app_terminal_under_dark_app_tells_pty_background(
+    request: pytest.FixtureRequest, terminal_session: tuple[str, str]
+) -> None:
+    """Under a Dark app with the default "Match app", the pane's process learns it is dark.
+
+    The pane is painted with the dark palette (``data-terminal-theme=dark``),
+    so a TUI that assumes a light background would paint near-black text on a
+    near-black canvas. The shell spawned into that pane must therefore carry a
+    dark-background ``COLORFGBG`` hint; a shell that reports no hint at all
+    leaves the TUI guessing and the text unreadable.
+    """
+    base_url, session_id = terminal_session
+    page = _journey_page(request)
+    frames = _capture_pane_output(page)
+
+    _open_appearance(page, base_url)
+    _pick_app_theme(page, "dark")
+    expect(page.get_by_test_id("terminal-theme-auto")).to_have_attribute("aria-checked", "true")
+    assert _stored_terminal_theme(page) is None, "Match app must be the untouched default"
+
+    page.goto(f"{base_url}/c/{session_id}")
+    _open_new_shell(page)
+    terminal_view = _connected_main_terminal(page)
+    expect(terminal_view).to_have_attribute("data-terminal-theme", "dark")
+
+    hint = _pane_background_hint(page, terminal_view, frames)
+    assert hint.rsplit(";", 1)[-1] == "0", (
+        f"pane renders dark but its shell was told COLORFGBG={hint}; "
+        "a light-assuming TUI has no way to know it is painting on a dark background"
+    )
+
+
+def test_light_terminal_under_dark_app(
+    request: pytest.FixtureRequest, terminal_session: tuple[str, str]
+) -> None:
+    """A "Light" terminal stays light while the app runs Dark, and its shell is told so.
 
     Pins the app to Dark and the terminal to Light in Settings, then launches a
     shell: the mounted terminal resolves to light (``data-terminal-theme=light``)
     even though ``<html>`` carries the ``dark`` class. This is the "light terminal
-    with a dark theme" case.
+    with a dark theme" case. The pinned theme must reach the freshly spawned
+    shell too — a light-background ``COLORFGBG`` hint — rather than only
+    repainting the browser canvas.
     """
     base_url, session_id = terminal_session
+    page = _journey_page(request)
+    frames = _capture_pane_output(page)
 
     _open_appearance(page, base_url)
     _pick_app_theme(page, "dark")
@@ -112,15 +231,26 @@ def test_light_terminal_under_dark_app(page: Page, terminal_session: tuple[str, 
     expect(terminal_view).to_have_attribute("data-terminal-theme", "light")
     assert _html_has_dark(page), "app theme must stay dark while the terminal is light"
 
+    hint = _pane_background_hint(page, terminal_view, frames)
+    assert hint.rsplit(";", 1)[-1] == "15", (
+        f"pane was pinned light but its shell was told COLORFGBG={hint}; "
+        "the setting restyled only the canvas"
+    )
 
-def test_dark_terminal_under_light_app(page: Page, terminal_session: tuple[str, str]) -> None:
-    """A "Dark" terminal stays dark while the app runs Light.
+
+def test_dark_terminal_under_light_app(
+    request: pytest.FixtureRequest, terminal_session: tuple[str, str]
+) -> None:
+    """A "Dark" terminal stays dark while the app runs Light, and its shell is told so.
 
     The mirror of the light-on-dark case: pin the app to Light and the terminal to
     Dark, launch a shell, and confirm the terminal resolves to dark
-    (``data-terminal-theme=dark``) with no ``dark`` class on ``<html>``.
+    (``data-terminal-theme=dark``) with no ``dark`` class on ``<html>``, and that
+    the shell carries a dark-background ``COLORFGBG`` hint.
     """
     base_url, session_id = terminal_session
+    page = _journey_page(request)
+    frames = _capture_pane_output(page)
 
     _open_appearance(page, base_url)
     _pick_app_theme(page, "light")
@@ -134,6 +264,12 @@ def test_dark_terminal_under_light_app(page: Page, terminal_session: tuple[str, 
 
     expect(terminal_view).to_have_attribute("data-terminal-theme", "dark")
     assert not _html_has_dark(page), "app theme must stay light while the terminal is dark"
+
+    hint = _pane_background_hint(page, terminal_view, frames)
+    assert hint.rsplit(";", 1)[-1] == "0", (
+        f"pane was pinned dark but its shell was told COLORFGBG={hint}; "
+        "the setting restyled only the canvas"
+    )
 
 
 def test_terminal_theme_control_defaults_and_persists(page: Page, live_server: str) -> None:
