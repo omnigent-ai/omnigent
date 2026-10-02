@@ -3145,7 +3145,6 @@ function ComposerImpl(
     allowOpen: inputFocused && draft.quotes.length === 0 && files.length === 0,
     onSelect: applyMenuSelection,
     onTabComplete: completeMenuSelection,
-    clearText: () => setValue(""),
   });
 
   // Auto-grow the textarea from 1 row up to 10 rows, then let it scroll.

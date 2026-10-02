@@ -328,6 +328,15 @@ describe("Composer Escape interrupt", () => {
     expect(props.onStop).toHaveBeenCalledTimes(1);
   });
 
+  it("keeps the slash token when Esc dismisses the menu", () => {
+    render(<Composer {...composerProps()} />);
+    fireEvent.change(textarea(), { target: { value: "/" } });
+    expect(activeRow()).not.toBeNull(); // menu open
+    fireEvent.keyDown(textarea(), { key: "Escape" });
+    expect(textarea()).toHaveValue("/"); // draft text preserved
+    expect(activeRow()).toBeNull(); // menu dismissed
+  });
+
   it("leaves Escape to active IME composition", () => {
     const props = composerProps({ isWorking: true });
     render(<Composer {...props} />);
@@ -390,6 +399,19 @@ describe("Composer session drafts", () => {
     // ...and switching back re-arms the saved attachment as a chip.
     act(() => useChatStore.setState({ conversationId: "conv_draft" }));
     await waitFor(() => expect(screen.getByText("notes.txt")).toBeTruthy());
+  });
+
+  it("restores unsent text after unmount/remount (view switch)", async () => {
+    const { unmount } = render(<Composer {...composerProps()} />);
+    fireEvent.change(textarea(), { target: { value: "unsent prompt" } });
+    await waitFor(() => expect(getSessionDraft("conv_draft")?.text).toBe("unsent prompt"));
+
+    // Simulate switching to the terminal view (unmounts the composer).
+    unmount();
+
+    // Simulate switching back to the chat view (remounts the composer).
+    render(<Composer {...composerProps()} />);
+    await waitFor(() => expect(textarea()).toHaveValue("unsent prompt"));
   });
 });
 
@@ -3127,14 +3149,18 @@ describe("Composer asynchronous skills", () => {
     expect(screen.getByText("Couldn’t load skills.")).toBeVisible();
   });
 
-  it("dismisses a loading-only menu before interrupting a running session", () => {
+  it("dismisses a loading-only menu before interrupting, preserving the draft", () => {
     const props = composerProps({ isWorking: true });
     render(<Composer {...props} />);
     fireEvent.change(textarea(), { target: { value: "/review" } });
     fireEvent.keyDown(textarea(), { key: "Escape" });
     expect(props.onStop).not.toHaveBeenCalled();
-    expect(textarea()).toHaveValue("");
+    expect(textarea()).toHaveValue("/review");
     expect(screen.queryByText("Loading skills…")).toBeNull();
+    // Second Esc interrupts the turn without losing the draft.
+    fireEvent.keyDown(textarea(), { key: "Escape" });
+    expect(props.onStop).toHaveBeenCalledOnce();
+    expect(textarea()).toHaveValue("/review");
   });
 
   it("retries the host catalog directly", () => {

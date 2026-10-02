@@ -1,8 +1,8 @@
 // The slash-completion menu mechanics shared by the landing and in-session
 // composers: when the draft reads as a lone command token, the hook derives
 // the open menu's query/matches/highlight and consumes the keys that
-// navigate or complete it. Surface differences (mobile Enter, Escape
-// clearing) are explicit options, not harmonized defaults.
+// navigate or complete it. Surface differences (mobile Enter, Escape gating)
+// are explicit options, not harmonized defaults.
 
 import { act, renderHook } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
@@ -19,7 +19,6 @@ type Options = Parameters<typeof useSlashCompletion>[0];
 
 function setup(overrides: Partial<Options> = {}) {
   const onSelect = vi.fn();
-  const clearText = vi.fn();
   const props: Options = {
     text: "/",
     commands: COMMANDS,
@@ -31,11 +30,10 @@ function setup(overrides: Partial<Options> = {}) {
     escapeClearsOnlyWithContent: false,
     allowOpen: true,
     onSelect,
-    clearText,
     ...overrides,
   };
   const view = renderHook((p: Options) => useSlashCompletion(p), { initialProps: props });
-  return { view, props, onSelect, clearText };
+  return { view, props, onSelect };
 }
 
 /** A minimal key event shaped like the textarea's React keydown. */
@@ -92,7 +90,7 @@ describe("useSlashCompletion open condition", () => {
   });
 
   it("stays closed while allowOpen is false, ignoring every key", () => {
-    const { view, onSelect, clearText } = setup({ text: "/rev", allowOpen: false });
+    const { view, onSelect } = setup({ text: "/rev", allowOpen: false });
     expect(view.result.current.open).toBe(false);
     expect(view.result.current.query).toBe("");
     expect(view.result.current.matches).toEqual([]);
@@ -100,7 +98,6 @@ describe("useSlashCompletion open condition", () => {
       expect(view.result.current.handleKey(keyEvent(key), NO_PREFERENCE)).toBe(false);
     }
     expect(onSelect).not.toHaveBeenCalled();
-    expect(clearText).not.toHaveBeenCalled();
   });
 
   it.each(["/", "$"] as const)(
@@ -372,54 +369,55 @@ describe("useSlashCompletion loading swallow", () => {
 });
 
 describe("useSlashCompletion Escape", () => {
-  it("clears whenever the menu is open for a clear-on-escape surface", () => {
-    const { view, clearText } = setup({
+  it("dismisses the menu without clearing text", () => {
+    const { view } = setup({
       text: "/zzz",
       escapeClearsOnlyWithContent: false,
     });
     const event = keyEvent("Escape");
-    expect(view.result.current.handleKey(event, NO_PREFERENCE)).toBe(true);
+    act(() => {
+      expect(view.result.current.handleKey(event, NO_PREFERENCE)).toBe(true);
+    });
     expect(event.preventDefault).toHaveBeenCalled();
-    expect(clearText).toHaveBeenCalledOnce();
+    expect(view.result.current.open).toBe(false);
   });
 
   it("ignores Escape on a content-gated surface with no matches and no status", () => {
-    const { view, clearText } = setup({
+    const { view } = setup({
       text: "/zzz",
       escapeClearsOnlyWithContent: true,
       status: null,
     });
     expect(view.result.current.handleKey(keyEvent("Escape"), NO_PREFERENCE)).toBe(false);
-    expect(clearText).not.toHaveBeenCalled();
+    expect(view.result.current.open).toBe(true);
   });
 
-  it("clears a content-gated surface while discovery is in flight", () => {
-    const { view, clearText } = setup({
+  it("dismisses a content-gated surface while discovery is in flight", () => {
+    const { view } = setup({
       text: "/zzz",
       escapeClearsOnlyWithContent: true,
       status: "loading",
     });
-    expect(view.result.current.handleKey(keyEvent("Escape"), NO_PREFERENCE)).toBe(true);
-    expect(clearText).toHaveBeenCalledOnce();
+    act(() => {
+      expect(view.result.current.handleKey(keyEvent("Escape"), NO_PREFERENCE)).toBe(true);
+    });
+    expect(view.result.current.open).toBe(false);
   });
 
-  it("clears a content-gated surface when matches exist", () => {
-    const { view, clearText } = setup({
+  it("dismisses a content-gated surface when matches exist", () => {
+    const { view } = setup({
       text: "/rev",
       escapeClearsOnlyWithContent: true,
     });
-    let consumed = false;
     act(() => {
-      consumed = view.result.current.handleKey(keyEvent("Escape"), NO_PREFERENCE);
+      expect(view.result.current.handleKey(keyEvent("Escape"), NO_PREFERENCE)).toBe(true);
     });
-    expect(consumed).toBe(true);
-    expect(clearText).toHaveBeenCalledOnce();
+    expect(view.result.current.open).toBe(false);
   });
 
   it("ignores Escape while the menu is closed", () => {
-    const { view, clearText } = setup({ text: "hello" });
+    const { view } = setup({ text: "hello" });
     expect(view.result.current.handleKey(keyEvent("Escape"), NO_PREFERENCE)).toBe(false);
-    expect(clearText).not.toHaveBeenCalled();
   });
 });
 
@@ -613,7 +611,7 @@ describe("inline skill completion", () => {
   });
 
   it("keeps inline loading suggestions from blocking explicit submission", () => {
-    const { view, clearText } = setup({
+    const { view } = setup({
       text: "please /rev",
       commands: {},
       skills: {},
@@ -627,13 +625,11 @@ describe("inline skill completion", () => {
     act(() => view.result.current.handleKey(keyEvent("Escape"), NO_PREFERENCE));
     expect(view.result.current.open).toBe(false);
     expect(view.result.current.pendingCompletion).toBe(false);
-    expect(clearText).not.toHaveBeenCalled();
   });
 
   it("dismisses inline suggestions without clearing text and reopens after editing", () => {
-    const { view, props, clearText } = setup({ text: "please /rev" });
+    const { view, props } = setup({ text: "please /rev" });
     act(() => view.result.current.handleKey(keyEvent("Escape"), NO_PREFERENCE));
-    expect(clearText).not.toHaveBeenCalled();
     expect(view.result.current.open).toBe(false);
     view.rerender({ ...props, text: "please /revi" });
     expect(view.result.current.open).toBe(true);

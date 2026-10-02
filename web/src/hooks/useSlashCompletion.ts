@@ -57,10 +57,10 @@ export interface UseSlashCompletionOptions {
    */
   mobileEnterCompletes: boolean;
   /**
-   * Inline Escape dismisses without changing text. For a lone command token,
-   * when true, Escape clears the draft only if the menu has content (matches,
-   * or discovery still in flight), so an idle Escape can fall through to
-   * other handlers. When false, Escape always clears while the menu is open.
+   * When true, Escape only dismisses the menu if it has content (matches or
+   * discovery in flight), so a menu with no suggestions lets Esc fall through
+   * to other handlers. When false, Escape always dismisses while the menu is
+   * open. Either way the draft text is preserved; only the menu closes.
    */
   escapeClearsOnlyWithContent: boolean;
   /** Surface-level gate ANDed with the token shape (focus, attachments). */
@@ -69,8 +69,6 @@ export interface UseSlashCompletionOptions {
   onSelect: (cmd: string) => void;
   /** Tab only fills the draft when selecting a command would execute it. */
   onTabComplete?: (cmd: string) => void;
-  /** Clears the composer draft (Escape semantics). */
-  clearText: () => void;
 }
 
 export interface UseSlashCompletionResult {
@@ -115,7 +113,6 @@ export function useSlashCompletion({
   allowOpen,
   onSelect,
   onTabComplete = onSelect,
-  clearText,
 }: UseSlashCompletionOptions): UseSlashCompletionResult {
   const [selection, setSelection] = useState<{ text: string; start: number; end: number } | null>(
     null,
@@ -190,8 +187,7 @@ export function useSlashCompletion({
       (!escapeClearsOnlyWithContent || matches.length > 0 || status != null)
     ) {
       e.preventDefault();
-      if (inline) setDismissed({ text, start, end });
-      else clearText();
+      setDismissed({ text, start, end });
       setIndex(-1);
       return true;
     }

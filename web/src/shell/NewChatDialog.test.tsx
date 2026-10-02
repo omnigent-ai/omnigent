@@ -7290,12 +7290,12 @@ describe("NewChatLandingScreen skills menu", () => {
     expect(screen.getByText("No skills available")).toBeInTheDocument();
   });
 
-  it("dismisses a loading-only menu with Escape", () => {
+  it("dismisses a loading-only menu with Escape and keeps the draft", () => {
     mockSkills({ skillsStatus: "loading" });
     renderLanding();
     typeMessage("/");
     fireEvent.keyDown(screen.getByTestId("new-chat-landing-input"), { key: "Escape" });
-    expect(screen.getByTestId("new-chat-landing-input")).toHaveValue("");
+    expect(screen.getByTestId("new-chat-landing-input")).toHaveValue("/");
     expect(screen.queryByText("Loading skills…")).not.toBeInTheDocument();
   });
 

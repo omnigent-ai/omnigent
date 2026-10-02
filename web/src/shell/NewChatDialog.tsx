@@ -4633,7 +4633,6 @@ export function NewChatLandingScreen() {
     escapeClearsOnlyWithContent: false,
     allowOpen: inputFocused,
     onSelect: applySlashSelection,
-    clearText: () => setMessage(""),
   });
   const pendingSkillCompletion = slashCompletion.pendingCompletion;
 
