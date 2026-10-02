@@ -9,7 +9,14 @@ from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, TypeAlias, overload
 
+import httpx
+
 from omnigent.debug_logging import runner_primary_session_id
+from omnigent.inner.native_attachments import (
+    framework_notice_block,
+    has_unresolved_file_id,
+    resolve_file_id_block,
+)
 from omnigent.process_logging import process_log_reference
 from omnigent.runner.native import ResolvedSpec
 from omnigent.spec.types import AgentSpec
@@ -137,3 +144,40 @@ def _require_full_native_lock_coverage(
             f"native terminal lock dispatch is missing built-in harness(es): {sorted(missing)}"
         )
     return dispatch
+
+
+async def _resolve_forwarded_message_content(
+    content: list[_JsonObject],
+    *,
+    session_id: str,
+    server_client: httpx.AsyncClient,
+) -> list[_JsonObject]:
+    """Resolve server-uploaded ``file_id`` blocks inside the runner.
+
+    Remote Omnigent servers can forward session messages with raw file IDs
+    because their file store is not available to the out-of-process
+    runner. The runner can still fetch bytes through the session-scoped
+    file resource endpoint and inline them before handing content to a
+    harness. Blocks already resolved by the server pass through.
+    """
+    if not any(isinstance(block, dict) and has_unresolved_file_id(block) for block in content):
+        return content
+
+    resolved: list[_JsonObject] = []
+    changed = False
+    for block in content:
+        result = None
+        if isinstance(block, dict) and has_unresolved_file_id(block):
+            result = await resolve_file_id_block(
+                block, session_id=session_id, client=server_client
+            )
+        if result is None:
+            resolved.append(block)
+        else:
+            new_block, notice = result
+            resolved.append(new_block)
+            if notice is not None:
+                resolved.append(framework_notice_block(notice))
+            changed = True
+
+    return resolved if changed else content
