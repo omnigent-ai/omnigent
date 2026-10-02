@@ -2,7 +2,12 @@ import { act, cleanup, renderHook } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { emitBrowserActionRequest } from "@/lib/browserActionBus";
 import { readSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
-import { AGENT_BROWSER_TAB_ID, browserViewId, useBrowserTabs } from "./useBrowserTabs";
+import {
+  AGENT_BROWSER_TAB_ID,
+  browserViewId,
+  openAgentBrowserTab,
+  useBrowserTabs,
+} from "./useBrowserTabs";
 
 afterEach(() => {
   cleanup();
@@ -192,5 +197,43 @@ describe("browser soft tabs", () => {
 
     expect(result.current.tabs).toEqual([AGENT_BROWSER_TAB_ID]);
     expect(result.current.selected).toBe(AGENT_BROWSER_TAB_ID);
+  });
+
+  it("keeps newer background navigation after switching sessions during a close", async () => {
+    let finishClose!: (value: { ok: boolean }) => void;
+    const browserClose = vi.fn(
+      () =>
+        new Promise<{ ok: boolean }>((resolve) => {
+          finishClose = resolve;
+        }),
+    );
+    Object.assign(window, { omnigentDesktop: { browserClose } });
+    const hook = renderHook(({ conversationId }) => useBrowserTabs(conversationId), {
+      initialProps: { conversationId: "session-a" },
+    });
+
+    act(() =>
+      emitBrowserActionRequest(
+        {
+          type: "browser_action_request",
+          actionId: "navigate-a-1",
+          action: "navigate",
+          args: {},
+        },
+        "session-a",
+      ),
+    );
+    const pendingClose = hook.result.current.close(AGENT_BROWSER_TAB_ID);
+    hook.rerender({ conversationId: "session-b" });
+    act(() => openAgentBrowserTab("session-a"));
+    await act(async () => {
+      finishClose({ ok: true });
+      await pendingClose;
+    });
+
+    expect(readSessionWorkspaceState("session-a")).toMatchObject({
+      openBrowsers: [AGENT_BROWSER_TAB_ID],
+      selectedBrowserId: AGENT_BROWSER_TAB_ID,
+    });
   });
 });

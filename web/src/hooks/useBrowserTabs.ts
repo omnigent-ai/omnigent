@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { onBrowserActionRequest } from "@/lib/browserActionBus";
 import { onInAppLinkOpen } from "@/lib/openLinkInApp";
 import { readSessionWorkspaceState, writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
@@ -15,6 +15,12 @@ export function browserViewId(conversationId: string, tabId: string): string {
 interface BrowserTabsState {
   tabs: string[];
   selected: string | null;
+}
+
+const agentNavigationEpochs = new Map<string, number>();
+
+function agentNavigationEpoch(conversationId: string): number {
+  return agentNavigationEpochs.get(conversationId) ?? 0;
 }
 
 function readBrowserTabsState(conversationId: string): BrowserTabsState {
@@ -37,6 +43,7 @@ function withAgentBrowserSelected(current: BrowserTabsState): BrowserTabsState {
 
 /** Persist the agent/link browser as a selected soft tab for a session. */
 export function openAgentBrowserTab(conversationId: string): BrowserTabsState {
+  agentNavigationEpochs.set(conversationId, agentNavigationEpoch(conversationId) + 1);
   const next = withAgentBrowserSelected(readBrowserTabsState(conversationId));
   writeSessionWorkspaceState(conversationId, {
     openBrowsers: next.tabs,
@@ -47,7 +54,6 @@ export function openAgentBrowserTab(conversationId: string): BrowserTabsState {
 
 export function useBrowserTabs(conversationId: string) {
   const [state, setState] = useState(() => readBrowserTabsState(conversationId));
-  const agentNavigationEpochRef = useRef(0);
   useEffect(() => {
     setState(readBrowserTabsState(conversationId));
   }, [conversationId]);
@@ -71,7 +77,6 @@ export function useBrowserTabs(conversationId: string) {
   useEffect(() => {
     const selectAgentBrowser = (sourceConversationId: string) => {
       if (sourceConversationId === conversationId) {
-        agentNavigationEpochRef.current += 1;
         setState(openAgentBrowserTab(conversationId));
       }
     };
@@ -93,7 +98,7 @@ export function useBrowserTabs(conversationId: string) {
   };
 
   const close = async (tabId: string): Promise<boolean> => {
-    const agentNavigationEpoch = agentNavigationEpochRef.current;
+    const navigationEpoch = agentNavigationEpoch(conversationId);
     const desktop = (
       window as unknown as {
         omnigentDesktop?: {
@@ -109,7 +114,7 @@ export function useBrowserTabs(conversationId: string) {
     // agent view. Keep the recreated tab selected when the close resolves late.
     if (
       tabId === AGENT_BROWSER_TAB_ID &&
-      agentNavigationEpochRef.current !== agentNavigationEpoch
+      agentNavigationEpoch(conversationId) !== navigationEpoch
     ) {
       return true;
     }
