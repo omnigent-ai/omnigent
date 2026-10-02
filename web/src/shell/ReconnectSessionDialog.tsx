@@ -15,6 +15,7 @@ import { ForkSessionForm } from "./ForkSessionDialog";
 import { SwitchHostDialog } from "./SwitchHostDialog";
 
 import { nativeCodingAgentForHarness, nativeCodingAgentForWrapper } from "@/lib/nativeCodingAgents";
+import { useServerInfo } from "@/lib/CapabilitiesContext";
 
 const HOST_OWNER_DESCRIPTION =
   "This session's host is offline. Run the command below from the host machine to reconnect.";
@@ -70,18 +71,22 @@ export function buildReconnectCommand({
   wrapper,
   harness,
   state,
+  prefix = "omnigent",
 }: {
   conversationId: string;
   serverUrl: string;
   wrapper?: string | null;
   harness?: string | null;
   state: ReconnectState;
+  // How this deployment's CLI is invoked: "omnigent" (OSS) or "isaac omni"
+  // (Databricks). Defaults to "omnigent".
+  prefix?: string;
 }): string {
   // Backslash-continued so the command stays readable inside a narrow
   // dialog AND remains valid when pasted into a shell.
   const quotedServerUrl = quoteShellArgument(serverUrl);
   if (state === "host_offline") {
-    return ["omnigent host \\", `  --server ${quotedServerUrl}`].join("\n");
+    return [`${prefix} host \\`, `  --server ${quotedServerUrl}`].join("\n");
   }
   // Every native TUI wrapper resumes through its own verb (`omnigent devin
   // --resume …`), and the verb is the registry key — the generic
@@ -91,13 +96,13 @@ export function buildReconnectCommand({
   const nativeAgent = nativeCodingAgentForWrapper(wrapper) ?? nativeCodingAgentForHarness(harness);
   if (nativeAgent !== undefined) {
     return [
-      `omnigent ${nativeAgent.key} \\`,
+      `${prefix} ${nativeAgent.key} \\`,
       `  --resume ${conversationId} \\`,
       `  --server ${quotedServerUrl}`,
     ].join("\n");
   }
   return [
-    "omnigent run path/to/agent.yaml \\",
+    `${prefix} run path/to/agent.yaml \\`,
     `  --resume ${conversationId} \\`,
     `  --server ${quotedServerUrl}`,
   ].join("\n");
@@ -179,7 +184,18 @@ export function ReconnectSessionDialog({
   // CLI command is useless to them. Owners of both states, and anyone
   // on a local_stranded session, get a command.
   const showCommand = isOwner || !isHostReconnect;
-  const command = buildReconnectCommand({ conversationId, serverUrl, wrapper, harness, state });
+  // Reconnect commands get pasted into a terminal, so they must name the CLI the
+  // way this deployment is invoked: `isaac omni` on Databricks, else `omnigent`.
+  const info = useServerInfo();
+  const cliPrefix = info !== "loading" && info.databricks_features ? "isaac omni" : "omnigent";
+  const command = buildReconnectCommand({
+    conversationId,
+    serverUrl,
+    wrapper,
+    harness,
+    state,
+    prefix: cliPrefix,
+  });
   // Titles mirror the unreachable banner's wording ("Host is offline —
   // click to reconnect" / "Agent disconnected — click to reconnect").
   const title = isHostReconnect ? "Host is offline" : "Agent disconnected";

@@ -29,6 +29,7 @@ import { useDirectorySessions } from "@/hooks/useDirectorySessions";
 import { useRunnerHealthRegistration } from "@/hooks/RunnerHealthProvider";
 import { useRecentWorkspaces } from "@/hooks/useRecentWorkspaces";
 import { getSessionSlim, launchRunner } from "@/lib/sessionsApi";
+import { useServerInfo } from "@/lib/CapabilitiesContext";
 
 /**
  * Dialog that binds an *unbound* session to a host + directory in-app via
@@ -86,6 +87,11 @@ export function ResumeWithDirectoryDialog({
   onBound?: () => void;
 }) {
   const queryClient = useQueryClient();
+
+  // Terminal commands shown here must name the CLI the way this deployment is
+  // invoked: `isaac omni` on Databricks, else `omnigent`.
+  const info = useServerInfo();
+  const cliPrefix = info !== "loading" && info.databricks_features ? "isaac omni" : "omnigent";
 
   // A fork clone prefills from its source session; a host-less session has no
   // source and prefills from its own recorded fields instead.
@@ -278,8 +284,8 @@ export function ResumeWithDirectoryDialog({
         ) : noOnlineHosts ? (
           <p className="text-sm text-muted-foreground" data-testid="resume-dir-no-hosts">
             None of your machines are online. Start one with{" "}
-            <code className="rounded bg-muted px-1 py-0.5 font-mono">omnigent host</code> from your
-            terminal, then reopen this dialog.
+            <code className="rounded bg-muted px-1 py-0.5 font-mono">{cliPrefix} host</code> from
+            your terminal, then reopen this dialog.
           </p>
         ) : showCliFallback ? (
           <div className="flex flex-col gap-2" data-testid="resume-dir-cli-fallback">
@@ -293,6 +299,7 @@ export function ResumeWithDirectoryDialog({
                 serverUrl,
                 wrapper,
                 harness,
+                prefix: cliPrefix,
                 // The source's host is offline here. With a host binding the
                 // owner re-registers the host (`omnigent host`); without one
                 // the runner is relaunched directly via the wrapper's resume
