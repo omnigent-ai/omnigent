@@ -63,7 +63,12 @@ from filelock import Timeout as FileLockTimeout
 
 from omnigent import config as _config
 from omnigent.errors import ErrorCode, OmnigentError
-from omnigent.runner.session_prs import PullRequestRef, SessionPrRegistry, SessionPullRequest
+from omnigent.runner.session_prs import (
+    PullRequestRef,
+    SessionPrRegistry,
+    SessionPullRequest,
+    pr_state_priority,
+)
 from omnigent.runtime.filesystem_registry import _git_timeout_seconds
 
 _logger = logging.getLogger(__name__)
@@ -783,8 +788,10 @@ def _session_prs_with_titles(
 
     now = time.time()
     titles: dict[str, str | None] = {}
+    states: dict[str, str | None] = {}
     timed_out_urls: set[str] = set()
     pending: list[SessionPullRequest] = []
+    selected_url = info.get("selected_pr_url")
     for entry in entries:
         cache_seconds = (
             _PR_TITLE_TIMEOUT_RETRY_SECONDS
@@ -792,10 +799,13 @@ def _session_prs_with_titles(
             else _PR_TITLE_CACHE_SECONDS
         )
         stale = now - entry.title_checked_at >= cache_seconds
-        if entry.url == info.get("selected_pr_url"):
+        if entry.url == selected_url:
             title = _pr_title(info.get("pr"))
             if stale or (title is not None and title != entry.title):
                 titles[entry.url] = title
+            # Selected PR's state is already known from the _reference_info call.
+            if pr_s := (info.get("pr") or {}).get("state"):
+                states[entry.url] = pr_s
         elif stale:
             pending.append(entry)
 
@@ -803,14 +813,17 @@ def _session_prs_with_titles(
     pending.sort(key=lambda entry: entry.title_checked_at)
     deadline = min(request_deadline, time.monotonic() + _PR_TITLE_LOOKUP_SECONDS)
 
-    def fetch_title(entry: SessionPullRequest) -> tuple[str, str | None, bool] | None:
+    def fetch_title(entry: SessionPullRequest) -> tuple[str, str | None, str | None, bool] | None:
         if time.monotonic() >= deadline:
             return None
         token = _pr_title_deadline.set(deadline)
         timeout_token = _pr_title_timed_out.set(False)
         try:
-            data = _pr_json(root, entry, "title")
-            return entry.url, _pr_title(data), data is None and _pr_title_timed_out.get()
+            data = _pr_json(root, entry, "title,state")
+            timed_out = data is None and _pr_title_timed_out.get()
+            title = _pr_title(data)
+            pr_s = str(data.get("state") or "").upper() or None if data else None
+            return entry.url, title, pr_s, timed_out
         finally:
             _pr_title_timed_out.reset(timeout_token)
             _pr_title_deadline.reset(token)
@@ -820,18 +833,28 @@ def _session_prs_with_titles(
         with ThreadPoolExecutor(max_workers=min(4, len(pending))) as executor:
             for result in executor.map(fetch_title, pending):
                 if result is not None:
-                    url, title, timed_out = result
+                    url, title, pr_s, timed_out = result
                     titles[url] = title
+                    if pr_s is not None:
+                        states[url] = pr_s
                     if timed_out:
                         timed_out_urls.add(url)
-    if titles and may_cache:
+    if (titles or states) and may_cache:
         try:
-            registry.update_titles(titles, timestamp=now, timed_out_urls=timed_out_urls)
+            registry.update_titles(
+                titles, timestamp=now, timed_out_urls=timed_out_urls, states=states
+            )
         except (OSError, ValueError, FileLockTimeout):
             _logger.debug("Could not cache session PR titles", exc_info=True)
 
     return [
-        {**entry.model_dump(), "title": titles.get(entry.url) or entry.title} for entry in entries
+        {
+            **entry.model_dump(),
+            "title": titles.get(entry.url) or entry.title,
+            # Expose the freshly-fetched state if available, else the cached value.
+            "state": states.get(entry.url) or entry.state,
+        }
+        for entry in entries
     ]
 
 
@@ -847,7 +870,28 @@ def github_info(
     if pr_url:
         info = _reference_info(root, _selected_pr(session_id, pr_url))
     elif entries:
-        info = _reference_info(root, entries[0])
+        # entries is sorted by cached state; prefer an unprobed PR over a cached
+        # CLOSED/MERGED head. States are fetched below, so the next poll sorts fully.
+        best_entry = entries[0]
+        cached_state = (best_entry.state or "").upper()
+        if cached_state in ("CLOSED", "MERGED"):
+            # Use already-cached states to find a better entry — no extra API calls.
+            for entry in entries[1:]:
+                entry_state = (entry.state or "").upper()
+                if not entry_state or entry_state == "OPEN":
+                    best_entry = entry
+                    break
+                if pr_state_priority(entry.state) < pr_state_priority(best_entry.state):
+                    best_entry = entry
+        info = _reference_info(root, best_entry)
+        state_updates: dict[str, str | None] = {}
+        if pr_s := (info.get("pr") or {}).get("state"):
+            state_updates[best_entry.url] = pr_s
+        if state_updates:
+            try:
+                registry.update_titles({}, states=state_updates)
+            except (OSError, ValueError, FileLockTimeout):
+                _logger.debug("Could not cache session PR states", exc_info=True)
     else:
         info = _workspace_github_info(root)
         pr = info.get("pr")

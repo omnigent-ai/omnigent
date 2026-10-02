@@ -68,7 +68,15 @@ def test_explicit_repo_is_used_for_all_pr_reads(
         == "second-repo-patch"
     )
     assert calls[0][calls[0].index("-R") + 1] == "github.com/example/two"
-    assert calls[1] == ["pr", "view", "42", "-R", "github.com/example/one", "--json", "title"]
+    assert calls[1] == [
+        "pr",
+        "view",
+        "42",
+        "-R",
+        "github.com/example/one",
+        "--json",
+        "title,state",
+    ]
     assert calls[2][-1] == "repos/example/two/pulls/42/files?per_page=100"
     assert calls[3][-2:] == ["-R", "github.com/example/two"]
 
@@ -91,7 +99,7 @@ def test_titles_include_unselected_prs_and_are_cached_between_polls(
     }
     assert [call[-1] for call in calls] == [
         github._PR_VIEW_FIELDS + ",headRefOid,baseRefOid",
-        "title",
+        "title,state",
     ]
     registry = SessionPrRegistry("session")
     assert {pr.url: pr.title for pr in registry.list()} == {A: "First repository", B: "Second"}
@@ -210,7 +218,7 @@ def test_slow_title_lookups_preserve_metadata_and_leave_queued_prs_for_next_poll
 
     def run(argv: list[str], *, timeout: float, **_kwargs: object) -> tuple[int | None, str, str]:
         nonlocal clock
-        if argv[-1] != "title":
+        if argv[-1] != "title,state":
             assert github._pr_title_deadline.get() is None
             assert timeout == github._gh_timeout_seconds()
             return 0, '{"title": "Selected PR"}', ""
@@ -256,7 +264,7 @@ def test_title_retries_do_not_starve_queued_prs_after_backoff_expires(
 
     def run(argv: list[str], *, timeout: float, **_kwargs: object) -> tuple[int | None, str, str]:
         nonlocal clock
-        if argv[-1] != "title":
+        if argv[-1] != "title,state":
             return 0, '{"title": "Selected PR"}', ""
         attempted.append(argv[3])
         clock += timeout
@@ -358,7 +366,7 @@ def test_title_timeout_at_request_deadline_retries_after_short_backoff(
 
     def run(argv: list[str], *, timeout: float, **_kwargs: object) -> tuple[int | None, str, str]:
         nonlocal clock
-        if argv[-1] != "title":
+        if argv[-1] != "title,state":
             clock += 6.5
             return 0, '{"title": "Selected PR"}', ""
         timeouts.append(timeout)
@@ -412,7 +420,7 @@ def test_non_deadline_failures_keep_normal_title_cache(
 
     def run(argv: list[str], **_kwargs: object) -> tuple[int | None, str, str]:
         nonlocal clock, attempted
-        if argv[-1] != "title":
+        if argv[-1] != "title,state":
             return 0, '{"title": "Selected PR"}', ""
         attempted += 1
         clock += command_seconds
@@ -650,11 +658,18 @@ def test_manual_attach_and_exclusion(tracked: str, monkeypatch: pytest.MonkeyPat
 def test_default_selection_matches_metadata_and_all_pages(
     tracked: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # Pre-cache states so the ordering is deterministic: A=OPEN wins over B=MERGED.
+    # Without pre-caching, the first call would use A (alphabetically first / same
+    # timestamp), but subsequent calls might change once states are fetched.
+    # Pre-caching ensures all three calls below consistently use A (OPEN).
+    SessionPrRegistry("session").update_titles({}, states={A: "OPEN", B: "MERGED"})
+
     def gh(args: list[str], **_kwargs: object) -> tuple[int, str, str]:
         if args[:2] == ["pr", "view"]:
-            if args[-1] == "title":
+            if args[-1] == "title,state":
+                # Title+state lookup for non-selected entries (B = example/two)
                 assert args[args.index("-R") + 1] == "github.com/example/two"
-                return 0, json.dumps({"title": "Second repository"}), ""
+                return 0, json.dumps({"title": "Second repository", "state": "MERGED"}), ""
             assert args[args.index("-R") + 1] == "github.com/example/one"
             return 0, json.dumps({"number": 42}), ""
         if args[:2] == ["pr", "diff"]:
@@ -696,3 +711,127 @@ def test_enterprise_without_auth_retains_selection(
     assert info["selected_pr_url"] == url
     assert info["pr"] is None
     assert len(info["prs"]) == 3
+
+
+# ── Default-PR ordering: OMNI-10446 / OMNI-10426 ─────────────────────────────
+
+
+def test_github_info_defaults_to_open_pr_when_states_cached(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When cached states show OPEN and MERGED, github_info picks the OPEN PR
+    as the default even if the MERGED PR was seen more recently.
+
+    State caching happens via _session_prs_with_titles on the first call
+    (title+state fetched for all stale entries). This test simulates
+    a post-first-call registry state to verify the server-side ordering.
+    """
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(github.shutil, "which", lambda _: "/bin/gh")
+    monkeypatch.setattr(github._config, "github_account_preference", lambda _: None)
+    monkeypatch.setattr(github, "_list_accounts", lambda _: (True, []))
+
+    registry = SessionPrRegistry("session")
+    # Merged PR seen most recently (timestamp=20); open PR seen earlier (timestamp=10)
+    registry.record(
+        [PullRequestRef.from_url(B)], relationship="created", source="test", timestamp=20
+    )
+    registry.record(
+        [PullRequestRef.from_url(A)], relationship="created", source="test", timestamp=10
+    )
+    # Simulate states already cached from a prior call
+    registry.update_titles({}, states={A: "OPEN", B: "MERGED"})
+
+    pr_data: dict[str, object] = {
+        A: {
+            "number": 42,
+            "title": "Open PR",
+            "state": "OPEN",
+            "url": A,
+            "isDraft": False,
+            "author": {"login": "u"},
+            "baseRefName": "main",
+            "headRefName": "feat",
+            "statusCheckRollup": [],
+            "headRefOid": "sha1",
+            "baseRefOid": "sha0",
+        },
+        B: {
+            "number": 42,
+            "title": "Merged PR",
+            "state": "MERGED",
+            "url": B,
+            "isDraft": False,
+            "author": {"login": "u"},
+            "baseRefName": "main",
+            "headRefName": "feat",
+            "statusCheckRollup": [],
+            "headRefOid": "sha1",
+            "baseRefOid": "sha0",
+        },
+    }
+
+    def gh(args: list[str], **_kwargs: object) -> tuple[int, str, str]:
+        repo = args[args.index("-R") + 1]
+        if args[:2] == ["pr", "view"] and "-R" in args:
+            url_key = A if "example/one" in repo else B
+            return 0, json.dumps(pr_data[url_key]), ""
+        return 1, "", "no stub"
+
+    monkeypatch.setattr(github, "_gh", gh)
+
+    # With states cached: list() puts A (OPEN) first, so server selects A
+    info = github.github_info(str(tmp_path), session_id="session")
+    assert info["pr"]["state"] == "OPEN"
+    assert info["selected_pr_url"] == A
+
+
+def test_github_info_prs_list_includes_state_after_first_call(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """On the first call (no cached states), _session_prs_with_titles fetches
+    state for non-selected entries so the prs list includes states immediately.
+    This lets the client pick the best default on the first render."""
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(github.shutil, "which", lambda _: "/bin/gh")
+    monkeypatch.setattr(github._config, "github_account_preference", lambda _: None)
+    monkeypatch.setattr(github, "_list_accounts", lambda _: (True, []))
+
+    registry = SessionPrRegistry("session")
+    # Merged PR seen most recently; neither has a cached state yet
+    registry.record(
+        [PullRequestRef.from_url(B)], relationship="created", source="test", timestamp=20
+    )
+    registry.record(
+        [PullRequestRef.from_url(A)], relationship="created", source="test", timestamp=10
+    )
+
+    def gh(args: list[str], **_kwargs: object) -> tuple[int, str, str]:
+        repo = args[args.index("-R") + 1]
+        if args[:2] == ["pr", "view"] and "-R" in args:
+            state_val = "OPEN" if "example/one" in repo else "MERGED"
+            data: dict[str, object] = {
+                "number": 42,
+                "title": "PR",
+                "state": state_val,
+                "url": A if "example/one" in repo else B,
+                "isDraft": False,
+                "author": {"login": "u"},
+                "baseRefName": "main",
+                "headRefName": "feat",
+                "statusCheckRollup": [],
+                "headRefOid": "sha1",
+                "baseRefOid": "sha0",
+            }
+            return 0, json.dumps(data), ""
+        return 1, "", "no stub"
+
+    monkeypatch.setattr(github, "_gh", gh)
+
+    info = github.github_info(str(tmp_path), session_id="session")
+    states = {pr["url"]: pr.get("state") for pr in info["prs"]}
+    # Both states appear in the prs list even on the first call
+    assert states[A] == "OPEN"
+    assert states[B] == "MERGED"
+    # After this call, states are cached — future list() puts A (OPEN) first
+    assert registry.list()[0].url == A
