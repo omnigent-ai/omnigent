@@ -1,9 +1,8 @@
 """Migration ``mm1a2b3c4d5e`` adds ``ix_agents_kind_owner_created``.
 
-The new-session picker lists "operator templates plus mine" on every open by
-walking each owner's templates in creation order, so this index must exist at
-head with ``kind`` leading, the full primary key as its suffix, and the
-downgrade must remove it.
+The new-session picker lists the caller's own agents newest first by walking
+this index (equality on kind and owner, order on created_at), so it must exist
+at head with the full primary key as its suffix, and the downgrade must remove it.
 """
 
 from __future__ import annotations

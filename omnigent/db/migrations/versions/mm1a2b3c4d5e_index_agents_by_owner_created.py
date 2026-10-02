@@ -5,15 +5,15 @@ Revises: ll1a2b3c4d5e
 Create Date: 2026-10-01 00:00:00.000000
 
 Adds ``ix_agents_kind_owner_created`` on ``(workspace_id, kind, created_by,
-created_at, id)`` so template agents can be listed per owner with bounded
-keyset pagination: one walk for operator templates (``created_by`` NULL) and
-one for the viewer's own. ``kind`` leads so the walk skips session-scoped rows,
-which outnumber templates by one per session.
+created_at, id)`` so a user's own agents (``kind`` = user, ``created_by`` = the
+user) can be listed newest first with bounded keyset pagination. ``kind`` and
+``created_by`` are equality columns, ``created_at`` gives the order, and ``id``
+(the primary-key suffix) breaks ties. See ``designs/REUSABLE_USER_AGENTS.md``.
 
 Deployment: additive; older application code ignores it. On PostgreSQL it
 builds ``CONCURRENTLY`` so writes to ``agents`` continue during the build.
-Create it before enabling the owner-filtered picker (including deployments
-that apply schema outside alembic). Roll back by downgrading this revision.
+Create it before enabling the "my agents" listing (including deployments that
+apply schema outside alembic). Roll back by downgrading this revision.
 """
 
 from __future__ import annotations
