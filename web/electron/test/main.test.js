@@ -152,6 +152,7 @@ function loadNavigationHarness({
   // A createWorkspaceNetwork() to run the real session module against.
   network = null,
   manifest = {},
+  notificationsSupported = false,
   oidc = {},
   acceptedSessions = new Set(),
 } = {}) {
@@ -257,6 +258,7 @@ function loadNavigationHarness({
     isDestroyed: () => false,
     isMaximized: () => false,
     isMinimized: () => false,
+    isFocused: () => true,
     restore: () => {},
     show: () => {},
     focus: () => {
@@ -340,7 +342,13 @@ function loadNavigationHarness({
       return electron.createWebContentsView(opts);
     },
     Menu: { buildFromTemplate: () => ({}), setApplicationMenu: () => {} },
-    Notification: { isSupported: () => false },
+    Notification: Object.assign(
+      function Notification(options) {
+        calls.notifications = [...(calls.notifications ?? []), options];
+        return { on: () => {}, show: () => {} };
+      },
+      { isSupported: () => notificationsSupported },
+    ),
     clipboard: { writeText: () => {} },
     dialog: {},
     ipcMain: { handle: (name, fn) => ipc.set(name, fn), on: (name, fn) => ipc.set(name, fn) },
@@ -3302,5 +3310,169 @@ describe("OIDC system-browser sign-in wiring", () => {
       assert.equal(h.api.windows.get(h.win).authKind, null, url);
     }
     /* oxlint-enable no-await-in-loop */
+  });
+});
+
+describe("server names from the manifest", () => {
+  const server = "https://omni.example";
+  const setupEvent = (h) => ({
+    sender: h.webContents,
+    senderFrame: { url: `file://${h.api.SETUP_PAGE}` },
+  });
+  const pageEvent = (h) => ({ sender: h.webContents, senderFrame: { url: server } });
+  const saved = (h) => JSON.parse(fs.readFileSync(h.settingsPath, "utf8"));
+  const plain = (value) => JSON.parse(JSON.stringify(value));
+
+  it("remembers the name after connecting and shares it with the setup page and picker", async (t) => {
+    const h = loadNavigationHarness({
+      serverUrl: server,
+      manifest: { manifestVersion: 1, serverName: "Acme Eng" },
+    });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    await h.ipc.get("omnigent:set-server-url")(setupEvent(h), server);
+    assert.deepEqual(saved(h).server_names, { [server]: "Acme Eng" });
+    assert.deepEqual(plain(await h.ipc.get("omnigent:get-server-names")(setupEvent(h))), {
+      [server]: "Acme Eng",
+    });
+    h.setUrl(server);
+    const picker = plain(await h.ipc.get("omnigent:get-server-picker")(pageEvent(h)));
+    assert.deepEqual(picker.serverNames, { [server]: "Acme Eng" });
+  });
+
+  it("clears a name the server no longer gives", async (t) => {
+    const h = loadNavigationHarness({
+      serverUrl: server,
+      manifest: { manifestVersion: 1, serverName: null },
+    });
+    t.after(h.cleanup);
+    fs.writeFileSync(h.settingsPath, JSON.stringify({ server_names: { [server]: "Old" } }));
+    await h.api.loadServerUrl(h.win, server);
+    assert.deepEqual(saved(h).server_names, {});
+  });
+
+  it("drops the name with its recent", async (t) => {
+    const h = loadNavigationHarness({ serverUrl: server });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    fs.writeFileSync(
+      h.settingsPath,
+      JSON.stringify({
+        recent_servers: [`${server}/`, "https://b.example/"],
+        server_names: { [server]: "Acme Eng", "https://b.example": "B" },
+      }),
+    );
+    await h.ipc.get("omnigent:forget-recent-server")(setupEvent(h), `${server}/`);
+    assert.deepEqual(saved(h).server_names, { "https://b.example": "B" });
+  });
+
+  it("names the server in the connect-screen message, the organization's name first", async (t) => {
+    const oidcManifest = {
+      manifestVersion: 1,
+      auth: { mode: "oidc", sessionCookie: "__Host-ap_session" },
+      serverName: "Acme Eng",
+    };
+    // A first connect that fails: the name comes from the manifest just read,
+    // and nothing is saved for a server that never loaded.
+    const h = loadNavigationHarness({ serverUrl: server, manifest: oidcManifest });
+    t.after(h.cleanup);
+    await assert.rejects(h.api.loadServerUrl(h.win, server));
+    assert.equal(fs.existsSync(h.settingsPath) ? saved(h).server_names : undefined, undefined);
+    await new Promise((resolve) => {
+      setTimeout(resolve, 5);
+    });
+    const query = new URLSearchParams(h.calls.loadFile.at(-1)[1].search);
+    assert.equal(
+      query.get("error"),
+      "Sign in to Acme Eng (omni.example) to continue. Select Connect to open your browser.",
+    );
+
+    const managed = loadNavigationHarness({
+      serverUrl: server,
+      manifest: oidcManifest,
+      managedServers: [`${server}/`],
+      managedServerNames: { [`${server}/`]: "Engineering" },
+    });
+    t.after(managed.cleanup);
+    fs.writeFileSync(
+      managed.settingsPath,
+      JSON.stringify({ server_names: { [server]: "Acme Eng" } }),
+    );
+    await assert.rejects(managed.api.loadServerUrl(managed.win, server));
+    await new Promise((resolve) => {
+      setTimeout(resolve, 5);
+    });
+    assert.match(
+      new URLSearchParams(managed.calls.loadFile.at(-1)[1].search).get("error"),
+      /^Sign in to Engineering to continue/,
+    );
+  });
+
+  it("keeps a saved name when the manifest couldn't be read", async (t) => {
+    const h = loadNavigationHarness({ serverUrl: server, manifest: {} });
+    t.after(h.cleanup);
+    fs.writeFileSync(h.settingsPath, JSON.stringify({ server_names: { [server]: "Acme Eng" } }));
+    await h.api.loadServerUrl(h.win, server);
+    assert.deepEqual(saved(h).server_names, { [server]: "Acme Eng" });
+  });
+
+  it("prefixes multi-server notifications with the name and the host", async (t) => {
+    const h = loadNavigationHarness({ serverUrl: server, notificationsSupported: true });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    fs.writeFileSync(h.settingsPath, JSON.stringify({ server_names: { [server]: "Production" } }));
+    h.api.windows.set({ isDestroyed: () => false }, { origin: "https://other.example" });
+    h.setUrl(server);
+    await h.ipc.get("omnigent:notify")(pageEvent(h), { title: "Done" });
+    assert.equal(h.calls.notifications.at(-1).title, "[Production (omni.example)] Done");
+  });
+
+  it("drops the name of a server that falls off the recents", async (t) => {
+    const h = loadNavigationHarness({ serverUrl: server });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    const recents = [1, 2, 3, 4, 5].map((i) => `https://s${i}.example/`);
+    fs.writeFileSync(
+      h.settingsPath,
+      JSON.stringify({
+        recent_servers: recents,
+        server_names: { "https://s1.example": "One", "https://s5.example": "Five" },
+      }),
+    );
+    await h.ipc.get("omnigent:set-server-url")(setupEvent(h), server);
+    assert.deepEqual(saved(h).server_names, { "https://s1.example": "One" });
+  });
+
+  it("only gives names to the setup page", async (t) => {
+    const h = loadNavigationHarness({ serverUrl: server });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    assert.throws(() => h.ipc.get("omnigent:get-server-names")(pageEvent(h)), /setup page/);
+  });
+
+  it("ignores malformed saved names", async (t) => {
+    const h = loadNavigationHarness({ serverUrl: server });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    fs.writeFileSync(
+      h.settingsPath,
+      JSON.stringify({
+        server_names: { [server]: "Acme\u202e", "not an origin": "X", "https://b.example": 7 },
+      }),
+    );
+    assert.deepEqual(plain(await h.ipc.get("omnigent:get-server-names")(setupEvent(h))), {
+      [server]: "Acme",
+    });
+  });
+
+  it("never persists names for a window that must not touch settings", async (t) => {
+    const h = loadNavigationHarness({
+      serverUrl: server,
+      manifest: { manifestVersion: 1, serverName: "Acme Eng" },
+    });
+    t.after(h.cleanup);
+    h.api.windows.get(h.win).ephemeral = true;
+    await h.api.loadServerUrl(h.win, server);
+    assert.equal(fs.existsSync(h.settingsPath) ? saved(h).server_names : undefined, undefined);
   });
 });

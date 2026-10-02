@@ -56,6 +56,7 @@ const {
   databricksWorkspaceUiUrl,
   PRE_MANIFEST_BASELINE,
   parseManifestAuth,
+  sanitizeServerName,
 } = require("./url");
 const { parseOmnigentDeepLink, chooseDeepLinkStrategy } = require("./deepLink");
 const { parseServerLabels, serverLabel, withConnectLabel } = require("./server_labels");
@@ -959,8 +960,8 @@ function usesOidcBrowserAuth(win) {
 }
 
 /** The connect-screen message for an OIDC session that can't continue. */
-function oidcSignInMessage(serverUrl, error) {
-  const server = originOf(serverUrl) ? new URL(serverUrl).host : serverUrl;
+function oidcSignInMessage(serverUrl, error, serverName) {
+  const server = serverDisplayName(serverUrl, serverName);
   switch (error?.code) {
     case "SIGNED_OUT":
       return `You're signed out of ${server}.`;
@@ -990,14 +991,14 @@ function oidcSignInMessage(serverUrl, error) {
 }
 
 /** Return an OIDC window to the connect screen, explaining why. */
-function showOidcAuthRequired(win, serverUrl, error) {
+function showOidcAuthRequired(win, serverUrl, error, serverName = null) {
   if (win.isDestroyed()) return;
   console.warn("[omnigent] oidc auth: connection requires sign-in", {
     origin: originOf(serverUrl),
     code: error?.code,
   });
   const params = new URLSearchParams({
-    error: oidcSignInMessage(serverUrl, error),
+    error: oidcSignInMessage(serverUrl, error, serverName),
     url: serverUrl,
   });
   if (windows.get(win)?.ephemeral) params.set("ephemeral", "1");
@@ -1667,6 +1668,67 @@ function rememberRecentServer(settings, url) {
     url,
     ...existing.filter((u) => typeof u === "string" && u !== url),
   ].slice(0, MAX_RECENT_SERVERS);
+  // A server that fell off the list takes its saved name with it.
+  if (settings.server_names !== undefined) {
+    const listed = new Set(settings.recent_servers.map(originOf));
+    settings.server_names = Object.fromEntries(
+      Object.entries(storedServerNames(settings)).filter(([origin]) => listed.has(origin)),
+    );
+  }
+}
+
+/**
+ * Display names servers give themselves in their manifest (`server_name`),
+ * persisted per origin as settings.server_names so lists can show them without
+ * reconnecting. Display only: a server can call itself anything, so trust
+ * prompts always show the host.
+ *
+ * @param {Record<string, unknown>} settings Settings object from loadSettings().
+ * @returns {Record<string, string>} origin → name
+ */
+function storedServerNames(settings) {
+  const raw = settings.server_names;
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
+  return Object.fromEntries(
+    Object.entries(raw).flatMap(([origin, name]) => {
+      const clean = sanitizeServerName(name);
+      return originOf(origin) === origin && clean ? [[origin, clean]] : [];
+    }),
+  );
+}
+
+/** Record (or clear) the name a server's manifest gives it. */
+function rememberServerName(serverUrl, rawName) {
+  const origin = originOf(serverUrl);
+  if (!origin) return;
+  const name = sanitizeServerName(rawName);
+  const settings = loadSettings();
+  const names = storedServerNames(settings);
+  if ((names[origin] ?? null) === (name ?? null)) return;
+  if (name) names[origin] = name;
+  else Reflect.deleteProperty(names, origin);
+  settings.server_names = names;
+  saveSettings(settings);
+}
+
+/**
+ * The name to show for a server outside trust prompts: the organization's
+ * (MDM) name, else the server's own beside its host, else its host.
+ *
+ * @param {string} serverUrl
+ * @param {string | null} [serverName] A name just read from the server's
+ *   manifest, used ahead of the saved one (which a failed connect never saves).
+ * @returns {string}
+ */
+function serverDisplayName(serverUrl, serverName = null) {
+  const origin = originOf(serverUrl);
+  if (!origin) return String(serverUrl);
+  const host = new URL(serverUrl).host;
+  const managed = Object.entries(managedServerNames()).find(([url]) => originOf(url) === origin);
+  if (managed) return managed[1];
+  const own = sanitizeServerName(serverName) ?? storedServerNames(loadSettings())[origin];
+  // The server chose its own name, so the host stays visible beside it.
+  return own ? `${own} (${host})` : host;
 }
 
 /**
@@ -1996,7 +2058,7 @@ async function loadServerUrl(
             if (error.name === "AbortError") {
               pinWindow(win, null);
               setWindowServerUrl(win, null);
-            } else showOidcAuthRequired(win, serverUrl, error);
+            } else showOidcAuthRequired(win, serverUrl, error, manifest.serverName);
           }
           throw error;
         }
@@ -2017,6 +2079,10 @@ async function loadServerUrl(
     assertCurrent();
     // Loaded: any reconnect this window was waiting on is over.
     cancelReconnect(win);
+    // Only a manifest that was actually read can say the name went away.
+    if (manifest?.manifestVersion >= 1 && !windowState?.ephemeral) {
+      rememberServerName(serverUrl, manifest.serverName);
+    }
     const arcaServerUrl = windowArcaServerUrl(win);
     void refreshArcaBinary().then(() => arcaAutoConnect.ensure(arcaServerUrl));
     return serverUrl;
@@ -3585,10 +3651,15 @@ function registerIpc() {
       (u) => u !== url && normalizeRecentServers([serverLabel(labels, u) ?? u])[0] !== url,
     );
     settings.recent_servers = remaining;
+    const listed = new Set(remaining.map(originOf));
     if (settings.server_labels !== undefined) {
-      const listed = new Set(remaining.map(originOf));
       settings.server_labels = Object.fromEntries(
         Object.entries(labels).filter(([origin]) => listed.has(origin)),
+      );
+    }
+    if (settings.server_names !== undefined) {
+      settings.server_names = Object.fromEntries(
+        Object.entries(storedServerNames(settings)).filter(([origin]) => listed.has(origin)),
       );
     }
     saveSettings(settings);
@@ -3648,6 +3719,14 @@ function registerIpc() {
       throw new Error("get-managed-servers is only available to the setup page");
     }
     return managedServerUrls();
+  });
+
+  // Setup page → names servers gave themselves (origin → name), display only.
+  ipcMain.handle("omnigent:get-server-names", (event) => {
+    if (!isSetupPageSender(event)) {
+      throw new Error("get-server-names is only available to the setup page");
+    }
+    return storedServerNames(loadSettings());
   });
 
   // Setup page → display names for those servers (server URL → name).
@@ -3763,6 +3842,8 @@ function registerIpc() {
       currentServer: serverLabel(labels, origin),
       managedServers,
       managedServerNames: managedServerNames(),
+      // Names servers gave themselves, origin → name. Display only.
+      serverNames: storedServerNames(settings),
       recentServers: recents,
       recentLabels: Object.fromEntries(
         recents.flatMap((url) => {
@@ -3906,7 +3987,7 @@ function registerIpc() {
     if (multipleServersActive()) {
       const origin = pinnedOrigin(BrowserWindow.fromWebContents(event.sender));
       // isPinnedOriginSender above guarantees a pinned, parseable origin.
-      title = `[${new URL(origin).host}] ${title}`;
+      title = `[${serverDisplayName(origin)}] ${title}`;
     }
     // On macOS we play the notification sound ourselves (afplay, after show())
     // so the alert is audible in the foreground too — macOS suppresses the
