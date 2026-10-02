@@ -68,6 +68,7 @@ import {
 } from "@/hooks/useChildSessions";
 import { useDebugMode } from "@/hooks/useDebugMode";
 import { useBrowserAgentRelay } from "@/hooks/useBrowserAgentRelay";
+import { openAgentBrowserTab } from "@/hooks/useBrowserTabs";
 import { resyncBrowserSuppression } from "@/hooks/useSuppressBrowserView";
 import {
   findAgentTerminal,
@@ -855,11 +856,9 @@ export function AppShell() {
         // GitHub tab: shares the Files/workspace gate. Non-git workspaces and
         // other unavailable reasons are shown as empty states in the panel.
         github: showFilesPanel,
-        // Browser tab: shown only when the desktop shell hosts the embedded
-        // WebContentsView. A plain web build has no embedded browser, and an
-        // older desktop build predates the `browser*` bridge — both hide the
-        // tab entirely (supportsBrowser() is constant per load) so we never
-        // surface a dead tab whose calls no-op.
+        // Browser soft tabs: available only when the shell hosts the embedded
+        // WebContentsView. Plain web and older desktop builds hide the "+"
+        // option entirely so they never surface a dead tab whose calls no-op.
         browser: supportsBrowser(),
         // Agents tab is unconditional: the panel always lists at least
         // the main agent (its "main" row), so there's never a dead end.
@@ -1101,6 +1100,18 @@ export function AppShell() {
     let nextTab: RightRailTab =
       persisted.rightRailTab ??
       (keepAgentsAcrossTreeNavigation ? "subagents" : readDefaultWorkspaceTab());
+    // Browser is a dynamic soft-tab mode, not a permanent nav destination.
+    // A stale pre-soft-tab selection (or a closed last tab) restores to the
+    // configured static default instead of showing an unselected rail.
+    const persistedBrowsers = persisted.openBrowsers ?? [];
+    if (
+      nextTab === "browser" &&
+      (persisted.selectedBrowserId === null ||
+        persisted.selectedBrowserId === undefined ||
+        !persistedBrowsers.includes(persisted.selectedBrowserId))
+    ) {
+      nextTab = readDefaultWorkspaceTab();
+    }
 
     // Restore the open file tabs from the per-session store, then merge the
     // URL ?file= param: a deep-link selects (and, if absent, opens) that file
@@ -1651,14 +1662,14 @@ export function AppShell() {
     [selectedFilePath, selectedTerminalKey, clearFileViewerUrl],
   );
 
-  // Auto-surface the Browser tab on a `navigate` action — agent-issued
+  // Auto-open a Browser soft tab on a `navigate` action — agent-issued
   // (browser_navigate) or a chat link the user routed in-app — so the load
   // never lands in a hidden pane, even behind an open file or shell tab.
   // Browser-capable shells only (neither source fires without the bridge).
   useEffect(() => {
     if (!supportsBrowser()) return;
     const surfaceBrowserTab = (sourceConversationId: string) => {
-      writeSessionWorkspaceState(sourceConversationId, { selectedBrowserId: null });
+      openAgentBrowserTab(sourceConversationId);
       if (sourceConversationId === conversationId) {
         handleRightRailTabChange("browser");
         setRightPanelOpen(true);

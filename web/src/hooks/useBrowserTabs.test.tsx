@@ -2,7 +2,7 @@ import { act, cleanup, renderHook } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { emitBrowserActionRequest } from "@/lib/browserActionBus";
 import { readSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
-import { browserViewId, useBrowserTabs } from "./useBrowserTabs";
+import { AGENT_BROWSER_TAB_ID, browserViewId, useBrowserTabs } from "./useBrowserTabs";
 
 afterEach(() => {
   cleanup();
@@ -69,7 +69,7 @@ describe("browser soft tabs", () => {
 
   it("creates independent views and restores the selection on remount", () => {
     const first = renderHook(() => useBrowserTabs("session-a"));
-    expect(first.result.current.viewId).toBe("session-a");
+    expect(first.result.current.viewId).toBeNull();
     act(() => first.result.current.add());
     const firstId = first.result.current.selected!;
     act(() => first.result.current.add());
@@ -85,7 +85,7 @@ describe("browser soft tabs", () => {
     expect(other.result.current.tabs).toEqual([]);
   });
 
-  it("closes only the target view and selects a neighbor, then the default", async () => {
+  it("closes only the target view and selects a neighbor, then no browser", async () => {
     const browserClose = vi.fn().mockResolvedValue({ ok: true });
     Object.assign(window, { omnigentDesktop: { browserClose } });
     const { result } = renderHook(() => useBrowserTabs("session-a"));
@@ -97,7 +97,7 @@ describe("browser soft tabs", () => {
     expect(browserClose).toHaveBeenCalledWith(browserViewId("session-a", secondId));
     expect(result.current.selected).toBe(firstId);
     await act(() => result.current.close(firstId));
-    expect(result.current.viewId).toBe("session-a");
+    expect(result.current.viewId).toBeNull();
     expect(readSessionWorkspaceState("session-a").openBrowsers).toEqual([]);
   });
 
@@ -120,7 +120,7 @@ describe("browser soft tabs", () => {
     expect(result.current.tabs).toEqual([secondId]);
   });
 
-  it("surfaces only the owning session's default browser for agent navigation", () => {
+  it("opens only the owning session's agent browser as a soft tab", () => {
     const { result } = renderHook(() => useBrowserTabs("session-a"));
     act(() => result.current.add());
     const selected = result.current.selected;
@@ -133,7 +133,31 @@ describe("browser soft tabs", () => {
     act(() => emitBrowserActionRequest(event, "session-b"));
     expect(result.current.selected).toBe(selected);
     act(() => emitBrowserActionRequest(event, "session-a"));
+    expect(result.current.selected).toBe(AGENT_BROWSER_TAB_ID);
+    expect(result.current.tabs).toEqual([selected, AGENT_BROWSER_TAB_ID]);
+    expect(result.current.viewId).toBe("session-a");
+    expect(result.current.agentBrowser).toBe(true);
+  });
+
+  it("closes and later recreates the agent browser soft tab", async () => {
+    const browserClose = vi.fn().mockResolvedValue({ ok: true });
+    Object.assign(window, { omnigentDesktop: { browserClose } });
+    const { result } = renderHook(() => useBrowserTabs("session-a"));
+    const event = {
+      type: "browser_action_request" as const,
+      actionId: "navigate-1",
+      action: "navigate",
+      args: {},
+    };
+
+    act(() => emitBrowserActionRequest(event, "session-a"));
+    await act(() => result.current.close(AGENT_BROWSER_TAB_ID));
+    expect(browserClose).toHaveBeenCalledWith("session-a");
+    expect(result.current.tabs).toEqual([]);
     expect(result.current.selected).toBeNull();
-    expect(result.current.tabs).toEqual([selected]);
+
+    act(() => emitBrowserActionRequest(event, "session-a"));
+    expect(result.current.tabs).toEqual([AGENT_BROWSER_TAB_ID]);
+    expect(result.current.selected).toBe(AGENT_BROWSER_TAB_ID);
   });
 });

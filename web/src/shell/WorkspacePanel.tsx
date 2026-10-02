@@ -616,8 +616,7 @@ interface WorkspacePanelProps {
   showFilesPanel: boolean;
   /** Whether the GitHub tab is available (same on-disk-workspace gate as Files). */
   showGithubTab: boolean;
-  /** Whether the Browser tab is available — Electron shell only (hidden in a
-   *  plain web build, which has no embedded WebContentsView). */
+  /** Whether Browser soft tabs are available — hidden without a browser bridge. */
   showBrowserTab: boolean;
   /** Count of changed files, shown as the Changes tab badge. */
   changedCount: number;
@@ -758,7 +757,10 @@ function WorkspacePanelImpl({
     activeBrowserRef.current?.scrollIntoView({ block: "nearest", inline: "nearest" });
   }, [browsers.selected, rightRailTab]);
   const browserSelected =
-    rightRailTab === "browser" && selectedFilePath === null && selectedTerminalKey === null;
+    rightRailTab === "browser" &&
+    browsers.selected !== null &&
+    selectedFilePath === null &&
+    selectedTerminalKey === null;
   const addBrowser = showBrowserTab
     ? () => {
         browsers.add();
@@ -917,6 +919,17 @@ function WorkspacePanelImpl({
     : handleProps;
   const defaultTab = readDefaultWorkspaceTab();
   const tabOrder = [defaultTab, ...defaultWorkspaceTabs.filter((tab) => tab !== defaultTab)];
+  const browserFallbackTab =
+    tabOrder.find((tab) => {
+      if (tab === "subagents") return true;
+      if (tab === "github") return showGithubTab;
+      return showFilesPanel;
+    }) ?? "subagents";
+  useEffect(() => {
+    if (rightRailTab === "browser" && browsers.selected === null) {
+      onRightRailTabChange(browserFallbackTab);
+    }
+  }, [rightRailTab, browsers.selected, browserFallbackTab, onRightRailTabChange]);
   const tabTriggers = {
     files: (pending || showFilesPanel) && (
       <WorkspaceTabTooltip key="files" label="Files">
@@ -1065,33 +1078,19 @@ function WorkspacePanelImpl({
               pending
                 ? "__pending__"
                 : selectedFilePath !== null ||
-                    (browserSelected && browsers.selected !== null) ||
+                    browserSelected ||
                     sideChatSelected ||
                     (selectedTerminalKey !== null && openTerminals.includes(selectedTerminalKey))
                   ? "__tab__"
                   : rightRailTab
             }
             onValueChange={(value) => {
-              if (value === "browser") browsers.select(null);
               onRightRailTabChange(value as RightRailTab);
             }}
             componentId="chat.right_rail.tabs"
           >
             <TabsList variant="pill" className="gap-1">
               {tabOrder.map((tab) => tabTriggers[tab])}
-              {showBrowserTab && (
-                <WorkspaceTabTooltip label="Browser">
-                  <TabsTrigger
-                    value="browser"
-                    aria-label="Browser"
-                    disabled={pending}
-                    className="size-6 shrink-0 p-0 hover:border-1 hover:border-muted rounded-md!"
-                  >
-                    <GlobeIcon />
-                    <span className="sr-only">Browser</span>
-                  </TabsTrigger>
-                </WorkspaceTabTooltip>
-              )}
             </TabsList>
           </Tabs>
           {/* 1px divider separating the static nav tabs from the open tabs.
@@ -1321,13 +1320,13 @@ function WorkspacePanelImpl({
                 !sideChatsStartedThisSession.has(sideChats.selected)
               }
             />
-          ) : rightRailTab === "browser" && showBrowserTab ? (
-            // Embedded browser (Electron only) — BrowserPane self-gates and
-            // measures this rail slot to position the native view over it.
+          ) : browserSelected && showBrowserTab ? (
+            // Browser soft tab — BrowserPane self-gates and measures this rail
+            // slot to position the native view over it.
             <BrowserPane
               key={browsers.viewId}
-              conversationId={browsers.viewId}
-              agentBrowser={browsers.selected === null}
+              conversationId={browsers.viewId!}
+              agentBrowser={browsers.agentBrowser}
               active={open}
               className="min-h-0 flex-1"
             />

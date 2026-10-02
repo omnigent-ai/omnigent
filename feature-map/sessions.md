@@ -25,8 +25,9 @@ the header menu), and each place is a separate entry point.
   dialog with the command to run; the desktop app can reconnect a local host
   itself. States: reconnecting (spinner), reconnect failed (retry), host offline.
 - `resume-imported`: an imported session can be resumed onto a chosen local host.
-- `browser-storage`: browser tabs, including the agent browser, share cookies
-  within a session; different sessions stay isolated. Navigation stays per-tab.
+- `browser-storage`: browser soft tabs, including one opened by the agent, share
+  cookies within a session; different sessions stay isolated. Navigation stays
+  per-tab.
 
 ## How to get to it (user POV)
 
@@ -52,8 +53,9 @@ when a local session is stranded). In the desktop app, reconnect acts directly.
 **Mobile:** the header menu and the sidebar drawer offer the same actions; touch
 devices fold some row controls into the menu.
 
-**Desktop browser:** select Browser or **+ → Browser** in the Workspace panel.
-Agent browser requests and chat links with in-app opening enabled use the pinned Browser.
+**Desktop browser:** choose **+ → Browser** in the Workspace panel. Agent
+browser requests and chat links with in-app opening enabled create or select a
+closable Browser soft tab automatically.
 
 ## Driving it with the repro environment
 

@@ -1,9 +1,13 @@
 import { useCallback, useEffect, useState } from "react";
 import { onBrowserActionRequest } from "@/lib/browserActionBus";
+import { onInAppLinkOpen } from "@/lib/openLinkInApp";
 import { readSessionWorkspaceState, writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
 
-export function browserViewId(conversationId: string, tabId: string | null): string {
-  return tabId === null
+/** Stable soft-tab id for the browser view driven by agents and opted-in links. */
+export const AGENT_BROWSER_TAB_ID = "agent-browser";
+
+export function browserViewId(conversationId: string, tabId: string): string {
+  return tabId === AGENT_BROWSER_TAB_ID
     ? conversationId
     : `browser-tab:${encodeURIComponent(conversationId)}:${tabId}`;
 }
@@ -22,8 +26,31 @@ function readBrowserTabsState(conversationId: string): BrowserTabsState {
   };
 }
 
+function withAgentBrowserSelected(current: BrowserTabsState): BrowserTabsState {
+  return {
+    tabs: current.tabs.includes(AGENT_BROWSER_TAB_ID)
+      ? current.tabs
+      : [...current.tabs, AGENT_BROWSER_TAB_ID],
+    selected: AGENT_BROWSER_TAB_ID,
+  };
+}
+
+/** Persist the agent/link browser as a selected soft tab for a session. */
+export function openAgentBrowserTab(conversationId: string): BrowserTabsState {
+  const next = withAgentBrowserSelected(readBrowserTabsState(conversationId));
+  writeSessionWorkspaceState(conversationId, {
+    openBrowsers: next.tabs,
+    selectedBrowserId: next.selected,
+  });
+  return next;
+}
+
 export function useBrowserTabs(conversationId: string) {
   const [state, setState] = useState(() => readBrowserTabsState(conversationId));
+  useEffect(() => {
+    setState(readBrowserTabsState(conversationId));
+  }, [conversationId]);
+
   const update = useCallback(
     (mutate: (current: BrowserTabsState) => BrowserTabsState) => {
       const next = mutate(readBrowserTabsState(conversationId));
@@ -40,15 +67,23 @@ export function useBrowserTabs(conversationId: string) {
     update((current) => ({ ...current, selected }));
   };
 
-  useEffect(
-    () =>
-      onBrowserActionRequest((event, sourceConversationId) => {
-        if (sourceConversationId === conversationId && event.action === "navigate") {
-          update((current) => ({ ...current, selected: null }));
-        }
-      }),
-    [conversationId, update],
-  );
+  useEffect(() => {
+    const selectAgentBrowser = (sourceConversationId: string) => {
+      if (sourceConversationId === conversationId) {
+        setState(openAgentBrowserTab(conversationId));
+      }
+    };
+    const unsubscribeAction = onBrowserActionRequest((event, sourceConversationId) => {
+      if (sourceConversationId === conversationId && event.action === "navigate") {
+        selectAgentBrowser(sourceConversationId);
+      }
+    });
+    const unsubscribeLink = onInAppLinkOpen(selectAgentBrowser);
+    return () => {
+      unsubscribeAction();
+      unsubscribeLink();
+    };
+  }, [conversationId]);
 
   const add = () => {
     const selected = crypto.randomUUID();
@@ -78,5 +113,12 @@ export function useBrowserTabs(conversationId: string) {
     return true;
   };
 
-  return { ...state, add, close, select, viewId: browserViewId(conversationId, state.selected) };
+  return {
+    ...state,
+    add,
+    close,
+    select,
+    viewId: state.selected === null ? null : browserViewId(conversationId, state.selected),
+    agentBrowser: state.selected === AGENT_BROWSER_TAB_ID,
+  };
 }
