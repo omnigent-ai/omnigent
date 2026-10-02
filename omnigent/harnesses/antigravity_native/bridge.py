@@ -1123,6 +1123,13 @@ _AGY_SEPARATOR_CHAR = "─"
 # corner/join glyphs (e.g. ``╭────╮``) is still detected, while ordinary text
 # (which carries non-box chars) never matches.
 _AGY_BOX_GLYPHS = frozenset("─━╌╍┄┅┈┉╭╮╰╯┌┐└┘├┤┬┴┼│║╔╗╚╝═╠╣╦╩╬╴╵╶╷")
+# Grace period after an interaction is resolved over RPC. agy 1.2.x usually
+# dismisses its attended permission/question modal itself; blindly typing the
+# legacy numbered fallback after that redraw lands "1" / "4" in the normal
+# composer and creates phantom user turns. Give the TUI a bounded chance to
+# return to its ordinary composer before using the old keystroke fallback.
+_AGY_INTERACTION_RPC_REDRAW_GRACE_S = 0.6
+_AGY_NUMBERED_OPTION_RE = re.compile(r"^\s*>?\s*\d+[.)]\s+\S", re.MULTILINE)
 
 
 def write_tmux_target(
@@ -1757,6 +1764,40 @@ def inject_user_message_via_tui(
         time.sleep(_VERIFY_RETRY_INTERVAL_S)
 
 
+def _agy_normal_composer_visible(pane: str) -> bool:
+    """Return whether *pane* is showing agy's ordinary composer, not a choice modal."""
+    if not pane:
+        return False
+    if _AGY_IDLE_MARKER not in pane and _AGY_ACTIVE_MARKER not in pane:
+        return False
+    region = _agy_input_region(pane)
+    # Permission / ask-question surfaces are numbered-choice widgets. A leading
+    # ">" can be their focused-row marker, so seeing ">" alone is not enough.
+    if len(_AGY_NUMBERED_OPTION_RE.findall(region)) >= 2:
+        return False
+    if "Do you want to proceed?" in region:
+        return False
+    for raw_line in region.splitlines():
+        stripped = raw_line.strip()
+        if stripped == ">" or stripped.startswith("> "):
+            return True
+    return False
+
+
+def _agy_interaction_modal_visible(pane: str) -> bool:
+    """Return whether *pane* positively shows agy's numbered interaction modal."""
+    if not pane:
+        return False
+    region = _agy_input_region(pane)
+    # Ask-question and permission surfaces are rendered as numbered choices.
+    # Require multiple options so ordinary transcript numbering cannot trigger
+    # a fallback keystroke into an ambiguous composer state.
+    return (
+        len(_AGY_NUMBERED_OPTION_RE.findall(region)) >= 2
+        or "Do you want to proceed?" in region
+    )
+
+
 def send_interaction_keys_via_tui(
     bridge_dir: Path,
     *keys: str,
@@ -1771,13 +1812,14 @@ def send_interaction_keys_via_tui(
     Omnigent web UI AND as agy's own numbered TUI prompt ("Do you want to
     proceed?", 1.Yes … 4.No). Delivering the verdict over
     :func:`omnigent.harnesses.antigravity_native.rpc.handle_user_interaction` flips the
-    backend trajectory step to DONE and the command runs, but the **TUI prompt
-    for that interaction can stay open** — and the next typed turn then lands in
-    that stale prompt's filter/amend buffer instead of starting a fresh turn
-    (live-verified; see ``docs/claude/antigravity-rpc-spike-notes.md`` §"attended
-    TUI"). So the bridge ALSO types the selection into the pane to dismiss the
-    prompt, mirroring cursor-native's
-    :func:`omnigent.harnesses.cursor_native.bridge.send_cursor_pane_keys`.
+    backend trajectory step to DONE and the command runs. Older agy builds can
+    leave the **TUI prompt for that interaction open**, so the bridge retains a
+    keystroke fallback for that case. Newer builds (observed on agy 1.2.14) can
+    redraw straight back to the ordinary composer as soon as the RPC verdict
+    lands; typing the old fallback after that redraw would submit a phantom
+    ``"1"`` / ``"4"`` user turn. The bridge therefore waits briefly for the
+    ordinary composer to reappear and sends selection keys only when the choice
+    surface still appears to be present.
 
     Each argument is a tmux ``send-keys`` key argument — a bare ``"1"`` / ``"4"``
     selects a numbered option, ``"Enter"`` confirms, ``"Escape"`` cancels — sent
@@ -1804,7 +1846,30 @@ def send_interaction_keys_via_tui(
         raise RuntimeError(
             "the agy terminal is no longer running (the TUI exited); restart the session"
         )
-    _run_tmux(socket_path, "send-keys", "-t", tmux_target, *keys)
+
+    deadline = time.monotonic() + _AGY_INTERACTION_RPC_REDRAW_GRACE_S
+    while True:
+        pane = _capture_pane(socket_path, tmux_target)
+        if _agy_normal_composer_visible(pane):
+            _logger.info(
+                "agy RPC interaction already returned TUI to normal composer; "
+                "skipping legacy selection keys=%r",
+                keys,
+            )
+            return
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(min(_TMUX_POLL_INTERVAL_S, 0.05))
+
+    if _agy_interaction_modal_visible(pane):
+        _run_tmux(socket_path, "send-keys", "-t", tmux_target, *keys)
+        return
+
+    _logger.warning(
+        "agy RPC interaction left TUI in an ambiguous state; "
+        "skipping legacy selection keys=%r to avoid a phantom user turn",
+        keys,
+    )
 
 
 def native_input_ready(session_id: str, instance: TerminalInstance) -> bool:
