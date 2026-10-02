@@ -4879,7 +4879,10 @@ async def test_post_external_session_status_failure_detail_keeps_native_code(
         f"/v1/sessions/{session['id']}/events",
         json={
             "type": "external_session_status",
-            "data": {"status": "failed", "failure_detail": "API Error: 500 Overloaded"},
+            "data": {
+                "status": "failed",
+                "failure_detail": "API Error: 400 The request was malformed.",
+            },
         },
     )
     assert resp.status_code == 202, resp.text
@@ -4888,7 +4891,7 @@ async def test_post_external_session_status_failure_detail_keeps_native_code(
     error = published[0][1]["error"]
     assert error is not None
     assert error["code"] == "native_turn_error"
-    assert error["message"] == "API Error: 500 Overloaded"
+    assert error["message"] == "API Error: 400 The request was malformed."
 
 
 async def test_post_external_session_status_carries_response_id(

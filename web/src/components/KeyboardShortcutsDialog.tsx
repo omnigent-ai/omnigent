@@ -9,7 +9,7 @@
 // (a window keydown for ⌘/Ctrl+/, plus a custom event so a menu entry can open
 // it without prop-drilling). Mount it once near the app shell.
 
-import { useEffect, useState } from "react";
+import { Fragment, useEffect, useState } from "react";
 
 import {
   ALT_KEY,
@@ -33,7 +33,7 @@ import { useIsCoarsePointer } from "@/hooks/useIsCoarsePointer";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { readSubmitWithModEnter } from "@/lib/composerSendShortcutPreferences";
 import { hasCommandModifier } from "@/lib/hotkeys";
-import { isNativeShell } from "@/lib/nativeBridge";
+import { isElectronShell, isNativeShell, supportsBrowser } from "@/lib/nativeBridge";
 
 // Custom event the dialog listens for, so non-adjacent surfaces (e.g. the
 // account menu) can open it without threading state through the tree.
@@ -56,6 +56,7 @@ interface Shortcut {
   /** Keys rendered left→right as chips. A chord (held together) or, for the
    *  arrow-pairs, the two interchangeable keys for that action. */
   keys: string[];
+  lastKeySeparator?: string;
 }
 
 interface ShortcutGroup {
@@ -71,9 +72,10 @@ const SHORTCUT_GROUPS: ShortcutGroup[] = [
   {
     title: "General",
     items: [
-      { label: "Start a new session", keys: [MOD_KEY, "N"] },
+      { label: "Start a new session", keys: [MOD_KEY, ALT_KEY, "N"] },
       { label: "Open command palette", keys: [MOD_KEY, "K"] },
       { label: "Find a session by name", keys: [MOD_KEY, ALT_KEY, "S"] },
+      { label: "Open Settings", keys: [MOD_KEY, ALT_KEY, ","] },
       { label: "Show keyboard shortcuts", keys: [MOD_KEY, "/"] },
     ],
   },
@@ -99,7 +101,13 @@ const SHORTCUT_GROUPS: ShortcutGroup[] = [
     title: "View",
     items: [
       { label: "Toggle conversations sidebar", keys: [MOD_KEY, ALT_KEY, "["] },
-      { label: "Toggle workspace sidebar", keys: [MOD_KEY, ALT_KEY, "]"] },
+      { label: "Focus or close workspace sidebar", keys: [MOD_KEY, ALT_KEY, "]"] },
+      {
+        label: "Select a workspace tab",
+        keys: [MOD_KEY, ALT_KEY, "]", "1…4"],
+        lastKeySeparator: "+",
+      },
+      { label: "Open a new browser tab", keys: [MOD_KEY, ALT_KEY, "B"] },
       { label: "Open a new shell", keys: [MOD_KEY, ALT_KEY, "T"] },
     ],
   },
@@ -128,6 +136,8 @@ function pinnedSessionShortcut(native: boolean): Shortcut {
 /** Shortcut groups for the current runtime and composer preference. */
 function shortcutGroupsFor(
   native: boolean,
+  electron: boolean,
+  browser: boolean,
   submitWithModEnter: boolean,
   preventsKeyboardSubmit: boolean,
 ): ShortcutGroup[] {
@@ -150,7 +160,20 @@ function shortcutGroupsFor(
       };
     }
     if (group.title === "Navigation") {
-      return { ...group, items: [...group.items, pinnedSessionShortcut(native)] };
+      return {
+        ...group,
+        items: [
+          ...(electron ? [{ label: "Switch recent sessions", keys: [CTRL_KEY, "Tab"] }] : []),
+          ...group.items,
+          pinnedSessionShortcut(native),
+        ],
+      };
+    }
+    if (group.title === "View" && !browser) {
+      return {
+        ...group,
+        items: group.items.filter((item) => item.label !== "Open a new browser tab"),
+      };
     }
     return group;
   });
@@ -172,6 +195,8 @@ export function KeyboardShortcutsList({
   const preventsKeyboardSubmit = isMobileViewport || isCoarsePointer;
   const groups = shortcutGroupsFor(
     isNativeShell(),
+    isElectronShell(),
+    supportsBrowser(),
     readSubmitWithModEnter(),
     preventsKeyboardSubmit,
   );
@@ -204,8 +229,15 @@ export function KeyboardShortcutsList({
               >
                 <span className="text-ui text-foreground">{item.label}</span>
                 <span className="flex shrink-0 items-center gap-1">
-                  {item.keys.map((key) => (
-                    <Kbd key={`${item.label}-${key}`}>{key}</Kbd>
+                  {item.keys.map((key, index) => (
+                    <Fragment key={`${item.label}-${key}`}>
+                      {index === item.keys.length - 1 && item.lastKeySeparator ? (
+                        <span aria-hidden="true" className="text-muted-foreground/70">
+                          {item.lastKeySeparator}
+                        </span>
+                      ) : null}
+                      <Kbd>{key}</Kbd>
+                    </Fragment>
                   ))}
                 </span>
               </li>

@@ -55,13 +55,16 @@ and steers messages while the agent is busy.
 
 **Desktop browser pointer** (open a session in the desktop app):
 
-- Open the Browser tab, navigate to a page, enable Design mode, and click an
-  element. Type an instruction in the floating popup and use Send or Enter.
+- Choose **+ → Browser** to open a Browser soft tab, navigate to a page, enable
+  Design mode, and click an element. Type an instruction in the floating popup
+  and use Send or Enter.
 - Change Settings → Always steer to choose whether busy-session follow-ups
   queue or send immediately. Existing queued messages retain FIFO ordering.
 
 **New-session composer** (landing page, or New session):
 
+- From any page, press ⌘/Ctrl+Alt+N to open and focus a clean new-session
+  composer.
 - Hover the model/effort pill to see the tooltip.
 - Pick a harness, then open its configuration for model, effort (Codex, Claude,
   Pi), and permission mode before the session exists.
@@ -134,6 +137,8 @@ Tests under `tests/browser_ui/` stub every backend call and need no instance:
   once after compaction. Repeat the queued flow while viewing another session.
 - **`draft-persistence`:**
   `tests/e2e_ui/chat/test_draft_survives_incoming_messages.py::test_mid_typing_answer_survives_arriving_prompt`
+- **`new-session-hotkey`:**
+  `tests/e2e_ui/sessions/test_new_session_hotkey.py::test_new_session_hotkey_from_focused_composer`
 - **`mobile-labels`, new-session composer:**
   `tests/e2e_ui/mobile/test_composer_model_label_stop_overlap.py::test_new_session_composer_collapses_labels_to_icons_on_mobile`
 

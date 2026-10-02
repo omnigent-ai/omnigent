@@ -71,7 +71,7 @@ def test_native_failure_names_the_fetched_agent_live_and_after_reload(
     failure_after_switch: bool,
 ) -> None:
     """A native status failure uses the API name and survives a fresh page."""
-    message = "API Error: 502 The upstream server returned an invalid response."
+    message = "API Error: 400 The request was malformed."
     response_id = "native_turn_named_error"
     with _named_session(live_server, agent_name, harness) as session_id:
         seed_committed_items(

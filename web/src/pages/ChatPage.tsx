@@ -89,6 +89,7 @@ import { createSideChat, retrySession } from "@/lib/sessionsApi";
 import { codexEffortLevelsForModel, findNativeModelOption } from "@/lib/codexNativeModels";
 import { modelConfigurationSourceRows } from "@/lib/modelConfigurationSource";
 import {
+  committedItemProvesDelivery,
   composerAttachmentKey,
   consumePendingInitialPrompt,
   isStaleTempConvId,
@@ -128,6 +129,7 @@ import {
 import { useMentionBrowser } from "@/hooks/useMentionBrowser";
 import { getSessionDraft, promoteSessionDraft, setSessionDraft } from "@/lib/sessionDrafts";
 import {
+  restoreReplyDraft,
   serializeReplyDraft,
   snapshotReplyDraft,
   type ComposerDraft,
@@ -2391,6 +2393,10 @@ function ComposerImpl(
   // Text + attachments handed back by a send that failed before the server
   // took ownership. Drained below so the message can be retried.
   const failedSendDraft = useChatStore((s) => s.failedSendDraft);
+  // A restored failed-send draft whose fate is still unknown — flips to
+  // `delivered` when the send turns out to have reached the server, so the
+  // retraction effect below can empty the composer.
+  const restoredSendDraft = useChatStore((s) => s.restoredSendDraft);
   const hasPendingInitialMessage = useChatStore((s) =>
     s.pendingUserMessages.some((message) => message.initialDraft !== undefined),
   );
@@ -2924,6 +2930,15 @@ function ComposerImpl(
     // conversation's draft and wrongly conclude the user is mid-sentence,
     // dropping the failed message on the way back to the session it failed in.
     if (settledConversationId !== conversationId) return;
+    // The send may have proven delivered since the render that scheduled this
+    // effect: its committed item landed under the send's stable id (see
+    // `retractDeliveredSendDraft`), so restoring now would prime a duplicate.
+    // Not so for a send the server refused: its item is persisted too, but the
+    // runner never took it, so the text must come back for a resend.
+    if (committedItemProvesDelivery(useChatStore.getState().blocks, failedSendDraft)) {
+      useChatStore.setState({ failedSendDraft: null });
+      return;
+    }
     useChatStore.setState({
       failedSendDraft: null,
       pendingRetryStableId: failedSendDraft.stableId ?? null,
@@ -2939,8 +2954,45 @@ function ComposerImpl(
     dirtyRef.current = true;
     if (failedSendDraft.files.length > 0)
       attachmentsRef.current.replaceFiles(failedSendDraft.files);
+    // Remember what was restored: if the "failed" send proves delivered (its
+    // stable id shows up as a committed item), the retraction effect below
+    // empties the composer instead of priming a duplicate send.
+    if (failedSendDraft.stableId) {
+      useChatStore.setState({
+        restoredSendDraft: {
+          conversationId: failedSendDraft.conversationId,
+          stableId: failedSendDraft.stableId,
+          text: failedSendDraft.text,
+          files: failedSendDraft.files,
+          replyDraft: failedSendDraft.replyDraft,
+          serverRefused: failedSendDraft.serverRefused,
+          delivered: false,
+        },
+      });
+    }
     if (!isMobileRef.current) textareaRef.current?.focus();
   }, [failedSendDraft, conversationId, settledConversationId, replaceText]);
+
+  // Retract a restored failed-send draft once its send proves delivered (its
+  // committed item arrived over the stream or a reconnect snapshot). Edits win:
+  // the text is cleared only while it is exactly what the restore put there.
+  useEffect(() => {
+    if (restoredSendDraft === null || !restoredSendDraft.delivered) return;
+    if (restoredSendDraft.conversationId !== conversationId) return;
+    if (settledConversationId !== conversationId) return;
+    useChatStore.setState({ restoredSendDraft: null });
+    const expected = serializeReplyDraft(
+      restoreReplyDraft(restoredSendDraft.text, restoredSendDraft.replyDraft),
+    );
+    const filesUnedited =
+      filesRef.current.length === restoredSendDraft.files.length &&
+      filesRef.current.every((f) => restoredSendDraft.files.includes(f));
+    if (valueRef.current !== expected || !filesUnedited) return;
+    replaceText("");
+    attachmentsRef.current.replaceFiles([]);
+    dirtyRef.current = false;
+    if (conversationId) setSessionDraft(conversationId, { text: "", files: [] });
+  }, [restoredSendDraft, conversationId, settledConversationId, replaceText]);
 
   /**
    * Execute a slash command by name + optional argument string.
