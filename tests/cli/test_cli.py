@@ -4647,6 +4647,7 @@ def test_run_with_agent_still_dispatches_existing_path(monkeypatch: pytest.Monke
         ],
         # Interactive ``run`` (no -p) defaults the browser-open ON.
         auto_open_conversation=True,
+        session_id_file=None,
     )
 
 
@@ -4692,6 +4693,7 @@ def test_run_resume_picker_forwards_to_run_chat(monkeypatch: pytest.MonkeyPatch)
         ],
         # Interactive ``run`` (no -p) defaults the browser-open ON.
         auto_open_conversation=True,
+        session_id_file=None,
     )
 
 
@@ -4734,6 +4736,7 @@ def test_run_resume_with_conversation_id_forwards_to_run_chat(
         resume_parts=["cli", "run", "examples/hello_world.yaml", "--log"],
         # Interactive ``run`` (no -p) defaults the browser-open ON.
         auto_open_conversation=True,
+        session_id_file=None,
     )
 
 
@@ -4817,6 +4820,7 @@ def test_resume_flags_with_prompt_dispatch_to_session_path(
         resume_picker=True,
         debug_events=False,
         auto_open_conversation=False,
+        session_id_file=None,
     )
 
 
@@ -4859,7 +4863,81 @@ def test_run_with_agent_prompt_dispatches_headlessly(monkeypatch: pytest.MonkeyP
         ephemeral=False,
         debug_events=False,
         auto_open_conversation=False,
+        session_id_file=None,
     )
+
+
+def test_run_session_id_file_forwarded_to_run_chat(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``--session-id-file PATH`` is forwarded as ``session_id_file`` to run_chat.
+
+    Automation wrappers pass this flag to receive the session id without
+    parsing stderr output.
+    """
+    monkeypatch.setattr("omnigent.cli._load_global_config", dict)
+    run_chat = Mock()
+    monkeypatch.setattr("omnigent.chat.run_chat", run_chat)
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "run",
+            "tests/resources/examples/hello_world.yaml",
+            "--session-id-file",
+            "/tmp/session.txt",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    call_kwargs = run_chat.call_args.kwargs
+    assert call_kwargs["session_id_file"] == "/tmp/session.txt"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "claude",
+        "codex",
+        "pi",
+        "opencode",
+        "cursor",
+        "devin",
+        "kiro",
+        "goose",
+        "hermes",
+        "antigravity",
+        "qwen",
+        "kimi",
+    ],
+)
+def test_native_command_forwards_session_id_file(
+    monkeypatch: pytest.MonkeyPatch, command: str
+) -> None:
+    """Every native shortcut hands ``--session-id-file`` to its harness launcher."""
+    captured: dict[str, object] = {}
+
+    def _capture(**kwargs: object) -> None:
+        captured.update(kwargs)
+
+    monkeypatch.setattr("omnigent.cli._load_effective_config", dict)
+    monkeypatch.setattr(f"omnigent.harnesses.{command}_native.main.run_{command}_native", _capture)
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            command,
+            "--server",
+            "https://example.com",
+            "--resume",
+            "conv_abc",
+            "--session-id-file",
+            "/tmp/session.txt",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert captured["session_id_file"] == "/tmp/session.txt"
 
 
 def test_dispatch_rejects_positional_server_url(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -4910,6 +4988,7 @@ def test_run_server_without_agent_dispatches_direct_server(
         # Interactive ``run --server`` (no -p) defaults the browser-open ON,
         # including for remote servers.
         auto_open_conversation=True,
+        session_id_file=None,
     )
 
 
@@ -7252,6 +7331,7 @@ def test_dispatch_native_terminal_harness_launches_registered_wrapper(
         "session_id": "conv_abc123",
         "resume_picker": False,
         "auto_open_conversation": True,
+        "session_id_file": None,
         **expected_extra,
     }
 
@@ -7289,6 +7369,7 @@ def test_dispatch_native_terminal_harness_cursor_launches_wrapper(
         "session_id": "conv_abc123",
         "resume_picker": False,
         "auto_open_conversation": True,
+        "session_id_file": None,
         "extra_args": ("--model", "composer-2.5"),
     }
 
@@ -7319,6 +7400,7 @@ def test_dispatch_native_terminal_harness_kiro_launches_wrapper(
         "session_id": None,
         "resume_picker": True,
         "auto_open_conversation": True,
+        "session_id_file": None,
         "extra_args": (),
         "model": "auto",
         "prompt": None,

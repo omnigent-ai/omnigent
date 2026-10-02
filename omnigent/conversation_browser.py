@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import contextlib
+import os
 import re
 import subprocess
 import sys
+import tempfile
 import urllib.parse
 import webbrowser
 from collections.abc import Callable
@@ -117,6 +120,30 @@ def open_conversation_url(url: str) -> bool:
 # the session exists — before the turn finishes — without polling the
 # sessions API. Keep this literal in sync with any log-scraping consumer.
 SESSION_URL_ANNOUNCE_PREFIX = "Omnigent session: "
+
+
+def write_session_id_file(path: str, session_id: str) -> None:
+    """Write *session_id* to *path* atomically (newline-terminated).
+
+    Automation wrappers pass ``--session-id-file`` so they can read the
+    created session id without parsing ``stderr`` output. The write is
+    atomic on POSIX (temp-file + ``os.replace``).
+
+    :param path: Destination file path, e.g. ``"/tmp/omnigent-session.txt"``.
+    :param session_id: Session id to write, e.g. ``"conv_abc123"``.
+    :raises OSError: If the file cannot be created or renamed.
+    """
+    dest = os.path.abspath(path)
+    dest_dir = os.path.dirname(dest) or "."
+    fd, tmp = tempfile.mkstemp(prefix=".omnigent-session-id-", dir=dest_dir)
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(session_id + "\n")
+        os.replace(tmp, dest)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
 
 
 def announce_conversation_url(

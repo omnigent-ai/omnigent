@@ -81,7 +81,13 @@ from omnigent._wrapper_labels import (
 )
 from omnigent.claude_launcher import resolve_claude_launch
 from omnigent.cli_invocation import cli_invocation
-from omnigent.conversation_browser import conversation_url, open_conversation_link_if_enabled
+from omnigent.conversation_browser import (
+    conversation_url,
+    open_conversation_link_if_enabled,
+)
+from omnigent.conversation_browser import (
+    write_session_id_file as _write_session_id_file,
+)
 from omnigent.entities.session_resources import terminal_resource_id
 from omnigent.harnesses.claude_native.bridge import (
     BRIDGE_ID_LABEL_KEY,
@@ -1578,6 +1584,7 @@ def run_claude_native(
     use_claude_config: bool = False,
     auto_open_conversation: bool = False,
     startup_profiler: StartupProfiler | None = None,
+    session_id_file: str | None = None,
 ) -> None:
     """
     Launch Claude Code in an Omnigent terminal and attach locally.
@@ -1663,6 +1670,7 @@ def run_claude_native(
                 claude_config=claude_config,
                 auto_open_conversation=auto_open_conversation,
                 startup_profiler=startup_profiler,
+                session_id_file=session_id_file,
             )
         else:
             # The daemon-spawned runner launches ``claude`` itself and
@@ -1676,6 +1684,7 @@ def run_claude_native(
                 claude_args=sanitized_args,
                 auto_open_conversation=auto_open_conversation,
                 startup_profiler=startup_profiler,
+                session_id_file=session_id_file,
             )
 
 
@@ -3599,6 +3608,7 @@ def _run_with_local_server(
     claude_config: ClaudeNativeUcodeConfig | None = None,
     auto_open_conversation: bool = False,
     startup_profiler: StartupProfiler | None = None,
+    session_id_file: str | None = None,
 ) -> None:
     """
     Start a local Omnigent server, launch Claude, and attach to it.
@@ -3705,6 +3715,8 @@ def _run_with_local_server(
             startup_profiler.mark("fresh session launch state recorded")
         click.echo(f"Web UI: {conversation_url(base_url, prepared.session_id)}", err=True)
         startup_profiler.mark("web ui url printed")
+        if session_id_file is not None:
+            _write_session_id_file(session_id_file, prepared.session_id)
         open_conversation_link_if_enabled(
             base_url=base_url,
             conversation_id=prepared.session_id,
@@ -4763,6 +4775,7 @@ def _run_with_remote_server(
     claude_args: tuple[str, ...],
     auto_open_conversation: bool = False,
     startup_profiler: StartupProfiler | None = None,
+    session_id_file: str | None = None,
 ) -> None:
     """
     Launch Claude on a remote Omnigent server via the connect daemon.
@@ -4908,6 +4921,8 @@ def _run_with_remote_server(
             startup_profiler.mark("fresh remote launch state recorded")
         click.echo(f"Web UI: {conversation_url(base_url, prepared.session_id)}", err=True)
         startup_profiler.mark("remote web ui url printed")
+        if session_id_file is not None:
+            _write_session_id_file(session_id_file, prepared.session_id)
         open_conversation_link_if_enabled(
             base_url=base_url,
             conversation_id=prepared.session_id,

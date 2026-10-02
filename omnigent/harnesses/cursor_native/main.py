@@ -35,7 +35,13 @@ from omnigent._platform import resolve_cli_binary
 from omnigent._runner_startup import RunnerStartupProgress, runner_startup_progress
 from omnigent._wrapper_labels import CURSOR_NATIVE_WRAPPER_VALUE as _WRAPPER_LABEL_VALUE
 from omnigent._wrapper_labels import WRAPPER_LABEL_KEY as _WRAPPER_LABEL_KEY
-from omnigent.conversation_browser import conversation_url, open_conversation_link_if_enabled
+from omnigent.conversation_browser import (
+    conversation_url,
+    open_conversation_link_if_enabled,
+)
+from omnigent.conversation_browser import (
+    write_session_id_file as _write_session_id_file,
+)
 from omnigent.entities.session_resources import terminal_resource_id
 from omnigent.host.daemon_launch import (
     error_text,
@@ -324,6 +330,7 @@ def run_cursor_native(
     model: str | None = None,
     auto_open_conversation: bool = False,
     mode: str | None = None,
+    session_id_file: str | None = None,
 ) -> None:
     """
     Launch the Cursor TUI in an Omnigent terminal.
@@ -361,6 +368,7 @@ def run_cursor_native(
             cursor_args=effective_cursor_args,
             model=model,
             auto_open_conversation=auto_open_conversation,
+            session_id_file=session_id_file,
         )
 
 
@@ -402,6 +410,7 @@ def _run_with_remote_server(
     cursor_args: tuple[str, ...],
     model: str | None = None,
     auto_open_conversation: bool = False,
+    session_id_file: str | None = None,
 ) -> None:
     """
     Launch Cursor on an Omnigent server via a daemon-spawned runner.
@@ -447,6 +456,8 @@ def _run_with_remote_server(
                     startup_progress=progress,
                 )
             click.echo(f"Web UI: {conversation_url(base_url, prepared.session_id)}", err=True)
+            if session_id_file is not None:
+                _write_session_id_file(session_id_file, prepared.session_id)
             open_conversation_link_if_enabled(
                 base_url=base_url,
                 conversation_id=prepared.session_id,

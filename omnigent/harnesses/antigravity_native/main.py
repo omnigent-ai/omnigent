@@ -89,7 +89,13 @@ from omnigent._wrapper_labels import (
 from omnigent._wrapper_labels import (
     WRAPPER_LABEL_KEY as _WRAPPER_LABEL_KEY,
 )
-from omnigent.conversation_browser import conversation_url, open_conversation_link_if_enabled
+from omnigent.conversation_browser import (
+    conversation_url,
+    open_conversation_link_if_enabled,
+)
+from omnigent.conversation_browser import (
+    write_session_id_file as _write_session_id_file,
+)
 from omnigent.entities.session_resources import terminal_resource_id
 from omnigent.harnesses.antigravity_native.bridge import (
     AGY_PLACEHOLDER_CONVERSATION_PREFIX,
@@ -218,6 +224,7 @@ def run_antigravity_native(
     model: str | None = None,
     permission_mode: str | None = None,
     auto_open_conversation: bool = False,
+    session_id_file: str | None = None,
 ) -> None:
     """
     Launch the Antigravity (agy) TUI in an Omnigent terminal and attach.
@@ -279,6 +286,7 @@ def run_antigravity_native(
                 permission_mode=permission_mode,
                 headless=headless,
                 auto_open_conversation=auto_open_conversation,
+                session_id_file=session_id_file,
             )
         else:
             _run_with_remote_server(
@@ -292,6 +300,7 @@ def run_antigravity_native(
                 permission_mode=permission_mode,
                 headless=headless,
                 auto_open_conversation=auto_open_conversation,
+                session_id_file=session_id_file,
             )
 
 
@@ -350,6 +359,7 @@ def _run_with_local_server(
     permission_mode: str | None = None,
     headless: bool = False,
     auto_open_conversation: bool = False,
+    session_id_file: str | None = None,
 ) -> None:
     """
     Start a local Omnigent server, launch agy, and attach to it.
@@ -414,6 +424,8 @@ def _run_with_local_server(
                     startup_progress=progress,
                 )
             click.echo(f"Web UI: {conversation_url(base_url, prepared.session_id)}", err=True)
+            if session_id_file is not None:
+                _write_session_id_file(session_id_file, prepared.session_id)
             open_conversation_link_if_enabled(
                 base_url=base_url,
                 conversation_id=prepared.session_id,
@@ -449,6 +461,7 @@ def _run_with_remote_server(
     permission_mode: str | None = None,
     headless: bool = False,
     auto_open_conversation: bool = False,
+    session_id_file: str | None = None,
 ) -> None:
     """
     Launch agy on a remote Omnigent server via a daemon-spawned runner.
@@ -519,6 +532,8 @@ def _run_with_remote_server(
                     startup_progress=progress,
                 )
             click.echo(f"Web UI: {conversation_url(base_url, prepared.session_id)}", err=True)
+            if session_id_file is not None:
+                _write_session_id_file(session_id_file, prepared.session_id)
             open_conversation_link_if_enabled(
                 base_url=base_url,
                 conversation_id=prepared.session_id,

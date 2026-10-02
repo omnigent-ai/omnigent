@@ -351,3 +351,41 @@ def test_announce_conversation_url_defaults_to_stderr(
     out, err = capsys.readouterr()
     assert out == ""
     assert err.strip() == f"{browser.SESSION_URL_ANNOUNCE_PREFIX}http://127.0.0.1:6767/c/x"
+
+
+def test_write_session_id_file_creates_file(tmp_path: pytest.TempPathFactory) -> None:
+    """write_session_id_file writes the session id and a trailing newline.
+
+    :param tmp_path: Pytest tmp_path fixture.
+    :returns: None.
+    """
+    dest = tmp_path / "session.txt"
+    browser.write_session_id_file(str(dest), "conv_abc123")
+    assert dest.read_text() == "conv_abc123\n"
+
+
+def test_write_session_id_file_is_atomic(tmp_path: pytest.TempPathFactory) -> None:
+    """write_session_id_file replaces the destination atomically (no partial read window).
+
+    :param tmp_path: Pytest tmp_path fixture.
+    :returns: None.
+    """
+    dest = tmp_path / "session.txt"
+    # Write once, then overwrite — both must produce the final value only.
+    browser.write_session_id_file(str(dest), "conv_first")
+    browser.write_session_id_file(str(dest), "conv_second")
+    assert dest.read_text() == "conv_second\n"
+
+
+def test_write_session_id_file_no_tempfiles_left_on_success(
+    tmp_path: pytest.TempPathFactory,
+) -> None:
+    """Successful write leaves no temporary files in the destination directory.
+
+    :param tmp_path: Pytest tmp_path fixture.
+    :returns: None.
+    """
+    dest = tmp_path / "session.txt"
+    browser.write_session_id_file(str(dest), "conv_abc123")
+    leftover = [p for p in tmp_path.iterdir() if p != dest]
+    assert leftover == [], f"Unexpected temp files: {leftover}"

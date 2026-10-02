@@ -7704,6 +7704,7 @@ def _dispatch_native_terminal_harness(
     fork_session_id: str | None,
     ephemeral: bool,
     auto_open_conversation: bool,
+    session_id_file: str | None = None,
 ) -> bool:
     """
     Launch a ``*-native`` terminal harness via its TUI wrapper directly.
@@ -7794,6 +7795,7 @@ def _dispatch_native_terminal_harness(
         "session_id": session_id,
         "resume_picker": resume_picker,
         "auto_open_conversation": auto_open_conversation,
+        "session_id_file": session_id_file,
     }
     launcher_kwargs: dict[str, object] = dict(common)
     if spec.model_strategy == "first_class":
@@ -7964,6 +7966,7 @@ def _dispatch_run(
     server_from_cli: bool = False,
     model_from_cli: bool = False,
     acp_agent: AcpAgentEntry | None = None,
+    session_id_file: str | None = None,
 ) -> None:
     """
     Route ``omnigent run`` to the right impl.
@@ -8094,6 +8097,7 @@ def _dispatch_run(
                 debug_events=debug_events,
                 resume_parts=resume_parts,
                 auto_open_conversation=auto_open_conversation,
+                session_id_file=session_id_file,
             )
             return
         if harness is None:
@@ -8118,6 +8122,7 @@ def _dispatch_run(
             fork_session_id=fork_session_id,
             ephemeral=ephemeral,
             auto_open_conversation=auto_open_conversation,
+            session_id_file=session_id_file,
         ):
             return
         if ephemeral:
@@ -8180,6 +8185,7 @@ def _dispatch_run(
                 resume_picker=resume_picker,
                 debug_events=debug_events,
                 auto_open_conversation=auto_open_conversation,
+                session_id_file=session_id_file,
             )
             return
         if log:
@@ -8207,6 +8213,7 @@ def _dispatch_run(
                 ephemeral=False,
                 debug_events=debug_events,
                 auto_open_conversation=auto_open_conversation,
+                session_id_file=session_id_file,
             )
             return
 
@@ -8242,6 +8249,7 @@ def _dispatch_run(
         debug_events=debug_events,
         resume_parts=resume_parts,
         auto_open_conversation=auto_open_conversation,
+        session_id_file=session_id_file,
     )
 
 
@@ -8497,6 +8505,17 @@ def attach(
         f"(inline equivalent of `{cli_invocation()} host`). Requires --server."
     ),
 )
+@click.option(
+    "--session-id-file",
+    "session_id_file",
+    default=None,
+    metavar="PATH",
+    help=(
+        "Write the session id to PATH once the session is created. "
+        "Useful for automation wrappers that need the id without parsing "
+        "stderr output, e.g. ``--session-id-file /tmp/omnigent-session.txt``."
+    ),
+)
 def run(
     target: str | None,
     tools: str | None,
@@ -8515,6 +8534,7 @@ def run(
     databricks_profile: str | None,
     debug_events: bool,
     register_host: bool,
+    session_id_file: str | None,
 ) -> None:
     """Start a session with an Omnigent agent.
 
@@ -8679,6 +8699,7 @@ def run(
         server_from_cli=server_from_cli,
         model_from_cli=model_from_cli,
         acp_agent=acp_agent,
+        session_id_file=session_id_file,
     )
 
 

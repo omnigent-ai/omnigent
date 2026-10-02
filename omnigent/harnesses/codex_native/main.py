@@ -30,7 +30,13 @@ from omnigent._wrapper_labels import (
     CODEX_NATIVE_WRAPPER_VALUE as _WRAPPER_LABEL_VALUE,
 )
 from omnigent._wrapper_labels import WRAPPER_LABEL_KEY as _WRAPPER_LABEL_KEY
-from omnigent.conversation_browser import conversation_url, open_conversation_link_if_enabled
+from omnigent.conversation_browser import (
+    conversation_url,
+    open_conversation_link_if_enabled,
+)
+from omnigent.conversation_browser import (
+    write_session_id_file as _write_session_id_file,
+)
 from omnigent.entities.session_resources import terminal_resource_id
 from omnigent.harness_availability import (
     HARNESS_BINARY_MISSING,
@@ -423,6 +429,7 @@ def run_codex_native(
     model: str | None = None,
     prompt: str | None = None,
     auto_open_conversation: bool = False,
+    session_id_file: str | None = None,
 ) -> None:
     """
     Launch Codex TUI in an Omnigent terminal.
@@ -464,6 +471,7 @@ def run_codex_native(
             model=model,
             prompt=prompt,
             auto_open_conversation=auto_open_conversation,
+            session_id_file=session_id_file,
         )
 
 
@@ -673,6 +681,7 @@ def _run_with_local_server(
     model: str | None,
     prompt: str | None,
     auto_open_conversation: bool = False,
+    session_id_file: str | None = None,
 ) -> None:
     """
     Start a local Omnigent server, launch Codex, and attach to it.
@@ -735,6 +744,8 @@ def _run_with_local_server(
             if resolved_session_id is None:
                 _record_launch_for_fresh_session(prepared.session_id)
             click.echo(f"Web UI: {conversation_url(base_url, prepared.session_id)}", err=True)
+            if session_id_file is not None:
+                _write_session_id_file(session_id_file, prepared.session_id)
             open_conversation_link_if_enabled(
                 base_url=base_url,
                 conversation_id=prepared.session_id,
@@ -774,6 +785,7 @@ def _run_with_remote_server(
     model: str | None,
     prompt: str | None,
     auto_open_conversation: bool = False,
+    session_id_file: str | None = None,
 ) -> None:
     """
     Launch Codex on an Omnigent server via a daemon-spawned runner.
@@ -836,6 +848,8 @@ def _run_with_remote_server(
             if resolved_session_id is None:
                 _record_launch_for_fresh_session(prepared.session_id)
             click.echo(f"Web UI: {conversation_url(base_url, prepared.session_id)}", err=True)
+            if session_id_file is not None:
+                _write_session_id_file(session_id_file, prepared.session_id)
             open_conversation_link_if_enabled(
                 base_url=base_url,
                 conversation_id=prepared.session_id,

@@ -50,6 +50,7 @@ from omnigent.cli_invocation import cli_invocation
 from omnigent.conversation_browser import (
     announce_conversation_url,
     open_conversation_link_if_enabled,
+    write_session_id_file,
 )
 from omnigent.errors import OmnigentError
 from omnigent.harness_aliases import canonicalize_harness
@@ -272,17 +273,20 @@ def _on_session_known(
     base_url: str,
     session_id: str,
     auto_open_conversation: bool,
+    session_id_file: str | None = None,
 ) -> None:
     """Announce (and optionally open) the conversation URL at session start.
 
     Called the moment the session id is known — before the turn runs — so a
     headless wrapper can surface the session link immediately. Always prints
     the stable ``Omnigent session: <url>`` line; additionally opens the
-    browser when the user opted in.
+    browser when the user opted in; writes the bare session id to
+    *session_id_file* when provided (for automation wrappers).
 
     :param base_url: Omnigent server base URL.
     :param session_id: The freshly created/resumed conversation id.
     :param auto_open_conversation: Whether to also open the browser link.
+    :param session_id_file: Optional path to write the session id to.
     """
     announce_conversation_url(
         base_url=base_url,
@@ -295,6 +299,8 @@ def _on_session_known(
         enabled=auto_open_conversation,
         warn=lambda message: click.echo(message, err=True),
     )
+    if session_id_file is not None:
+        write_session_id_file(session_id_file, session_id)
 
 
 def run_chat(
@@ -315,6 +321,7 @@ def run_chat(
     debug_events: bool = False,
     resume_parts: list[str] | None = None,
     auto_open_conversation: bool = False,
+    session_id_file: str | None = None,
 ) -> None:
     """
     Main entry point for ``omnigent run`` (and the ``attach`` client).
@@ -443,6 +450,7 @@ def run_chat(
             resume_parts=resume_parts,
             skills=host_skills or None,
             auto_open_conversation=auto_open_conversation,
+            session_id_file=session_id_file,
         )
     elif ephemeral:
         # ``--no-session`` keeps the legacy in-process ephemeral server: the
@@ -467,6 +475,7 @@ def run_chat(
             debug_events=debug_events,
             resume_parts=resume_parts,
             auto_open_conversation=auto_open_conversation,
+            session_id_file=session_id_file,
         )
     else:
         # Non-URL target → the host daemon is the backend. It connects to
@@ -492,6 +501,7 @@ def run_chat(
             debug_events=debug_events,
             resume_parts=resume_parts,
             auto_open_conversation=auto_open_conversation,
+            session_id_file=session_id_file,
         )
 
 
@@ -985,6 +995,7 @@ def _chat_with_server(
     progress: RunnerStartupProgress | None = None,
     attach_only: bool = False,
     attach_harness: str | None = None,
+    session_id_file: str | None = None,
 ) -> None:
     """
     Connect to a server URL and run a one-shot query or REPL.
@@ -1091,6 +1102,7 @@ def _chat_with_server(
             session_bundle_filename=session_bundle_filename,
             resume_conversation_id=resume_conversation_id,
             auto_open_conversation=auto_open_conversation,
+            session_id_file=session_id_file,
         )
         return
 
@@ -1116,6 +1128,7 @@ def _chat_with_server(
         auto_open_conversation=auto_open_conversation,
         attach_only=attach_only,
         attach_harness=attach_harness,
+        session_id_file=session_id_file,
     )
 
 
@@ -1770,6 +1783,7 @@ def _chat_via_daemon(
     debug_events: bool = False,
     resume_parts: list[str] | None = None,
     auto_open_conversation: bool = False,
+    session_id_file: str | None = None,
 ) -> None:
     """
     Run a local agent against a daemon-backed server with a daemon-owned runner.
@@ -1905,6 +1919,7 @@ def _chat_via_daemon(
                     skills=all_skills or None,
                     auto_open_conversation=auto_open_conversation,
                     progress=progress,
+                    session_id_file=session_id_file,
                 )
             finally:
                 # One-shot only: an interactive REPL session stays online for
@@ -2102,6 +2117,7 @@ def _chat_local(
     debug_events: bool = False,
     resume_parts: list[str] | None = None,
     auto_open_conversation: bool = False,
+    session_id_file: str | None = None,
 ) -> None:
     """
     Start a local server with the agent and open the REPL.
@@ -2206,6 +2222,7 @@ def _chat_local(
                 resume_parts=resume_parts,
                 skills=all_skills or None,
                 auto_open_conversation=auto_open_conversation,
+                session_id_file=session_id_file,
             )
         finally:
             _stop_local_server(server)
@@ -3957,6 +3974,7 @@ def _run_repl(
     auto_open_conversation: bool = False,
     attach_only: bool = False,
     attach_harness: str | None = None,
+    session_id_file: str | None = None,
 ) -> None:
     """
     Open the REPL connected to the server.
@@ -4021,6 +4039,8 @@ def _run_repl(
         ``None`` (default) means no skill commands are registered.
     :param auto_open_conversation: When ``True``, open the
         browser conversation URL when the session id becomes known.
+    :param session_id_file: Optional path to write the session id to
+        once known. Passed through to :func:`_on_session_known`.
     """
     from omnigent.repl import run_repl
     from omnigent.repl._session_log import DEFAULT_LOG_DIR
@@ -4151,6 +4171,7 @@ def _run_repl(
                         base_url=base_url,
                         session_id=session_id,
                         auto_open_conversation=auto_open_conversation,
+                        session_id_file=session_id_file,
                     )
                 ),
             )
@@ -4170,6 +4191,7 @@ def _run_one_shot(
     session_bundle_filename: str = "agent.tar.gz",
     resume_conversation_id: str | None = None,
     auto_open_conversation: bool = False,
+    session_id_file: str | None = None,
 ) -> None:
     """
     Send a single prompt to a remote server and print the final text.
@@ -4190,6 +4212,8 @@ def _run_one_shot(
         ``"conv_abc123"``. ``None`` creates a fresh session.
     :param auto_open_conversation: When ``True``, open the
         browser conversation URL after the session is created or resumed.
+    :param session_id_file: Optional path to write the session id to
+        once known. Passed through to :func:`_on_session_known`.
     :returns: None.
     """
 
@@ -4217,6 +4241,7 @@ def _run_one_shot(
                         base_url=base_url,
                         session_id=session_id,
                         auto_open_conversation=auto_open_conversation,
+                        session_id_file=session_id_file,
                     )
                 ),
             )

@@ -778,6 +778,7 @@ def test_chat_remote_prompt_uses_one_shot_not_repl(
         session_bundle_filename: str = "agent.tar.gz",
         resume_conversation_id: str | None = None,
         auto_open_conversation: bool = False,
+        session_id_file: str | None = None,
     ) -> None:
         """Record one-shot query inputs."""
         del (
@@ -785,6 +786,7 @@ def test_chat_remote_prompt_uses_one_shot_not_repl(
             session_bundle_filename,
             resume_conversation_id,
             auto_open_conversation,
+            session_id_file,
         )
         calls["one_shot"] = (
             base_url,
@@ -4671,3 +4673,56 @@ def test_cursor_native_resume_never_drives_an_omnigent_turn(
     )
 
     assert redirected["session_id"] == "conv_abc123"
+
+
+def test_on_session_known_writes_session_id_file(
+    tmp_path: pytest.TempPathFactory,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """_on_session_known writes the bare session id to session_id_file when set.
+
+    :param tmp_path: Pytest tmp_path fixture.
+    :param capsys: Pytest capture fixture.
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :returns: None.
+    """
+    from omnigent.chat import _on_session_known
+    from omnigent.host import local_server
+
+    monkeypatch.setattr(local_server, "_read_local_server_pid_file", lambda: None)
+
+    dest = tmp_path / "session.txt"
+    _on_session_known(
+        base_url="http://127.0.0.1:6767",
+        session_id="conv_abc123",
+        auto_open_conversation=False,
+        session_id_file=str(dest),
+    )
+    assert dest.read_text() == "conv_abc123\n"
+
+
+def test_on_session_known_no_file_when_none(
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """_on_session_known skips writing when session_id_file is None.
+
+    :param capsys: Pytest capture fixture.
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :returns: None.
+    """
+    from omnigent.chat import _on_session_known
+    from omnigent.host import local_server
+
+    monkeypatch.setattr(local_server, "_read_local_server_pid_file", lambda: None)
+    # No file path — must not raise.
+    _on_session_known(
+        base_url="http://127.0.0.1:6767",
+        session_id="conv_xyz",
+        auto_open_conversation=False,
+        session_id_file=None,
+    )
+    # The announcement still goes to stderr, but no file was created.
+    _, err = capsys.readouterr()
+    assert "conv_xyz" in err

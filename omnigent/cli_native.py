@@ -183,6 +183,16 @@ def register_native_commands(cli: click.Group) -> None:
             "you type in the TUI is what gets routed, so this takes no -p."
         ),
     )
+    @click.option(
+        "--session-id-file",
+        "session_id_file",
+        default=None,
+        metavar="PATH",
+        help=(
+            "Write the session id to PATH once the session is created. "
+            "Useful for automation that needs the id without parsing stderr."
+        ),
+    )
     @click.argument("claude_args", nargs=-1, type=click.UNPROCESSED)
     @observe_native_startup("claude-native")
     def claude(
@@ -196,6 +206,7 @@ def register_native_commands(cli: click.Group) -> None:
         prompt: str | None,
         smart_routing: bool,
         claude_args: tuple[str, ...],
+        session_id_file: str | None,
     ) -> None:
         # Param docs live in comments — Click uses the docstring for --help.
         # :param server: Remote Omnigent server URL, or None for local.
@@ -208,6 +219,7 @@ def register_native_commands(cli: click.Group) -> None:
         # :param smart_routing: When True, arm Smart Routing for the session so
         #     the first typed message picks the model.
         # :param claude_args: Pass-through args for ``claude``.
+        # :param session_id_file: Optional path to write the session id to.
         """Launch Claude Code with Omnigent.
 
         \b
@@ -310,6 +322,7 @@ def register_native_commands(cli: click.Group) -> None:
             auto_open_conversation=auto_open_conversation,
             startup_profiler=startup_profiler,
             command=resolved_command,
+            session_id_file=session_id_file,
         )
 
     @cli.command(
@@ -366,6 +379,16 @@ def register_native_commands(cli: click.Group) -> None:
             "you type in the TUI is what gets routed, so this takes no -p."
         ),
     )
+    @click.option(
+        "--session-id-file",
+        "session_id_file",
+        default=None,
+        metavar="PATH",
+        help=(
+            "Write the session id to PATH once the session is created. "
+            "Useful for automation that needs the id without parsing stderr."
+        ),
+    )
     @click.argument("codex_args", nargs=-1, type=click.UNPROCESSED)
     @observe_native_startup("codex-native")
     def codex(
@@ -376,6 +399,7 @@ def register_native_commands(cli: click.Group) -> None:
         prompt: str | None,
         smart_routing: bool,
         codex_args: tuple[str, ...],
+        session_id_file: str | None,
     ) -> None:
         # Param docs live in comments — Click uses the docstring for --help.
         # :param server: Remote Omnigent server URL, or None for local.
@@ -386,6 +410,7 @@ def register_native_commands(cli: click.Group) -> None:
         # :param smart_routing: When True, arm Smart Routing for the session so
         #     the first typed message picks the model.
         # :param codex_args: Pass-through args for ``codex`` before ``resume``.
+        # :param session_id_file: Optional path to write the session id to.
         """Launch Codex with Omnigent.
 
         \b
@@ -455,6 +480,7 @@ def register_native_commands(cli: click.Group) -> None:
             prompt=prompt,
             auto_open_conversation=auto_open_conversation,
             command=resolved_command,
+            session_id_file=session_id_file,
         )
 
     @cli.command(
@@ -495,6 +521,16 @@ def register_native_commands(cli: click.Group) -> None:
         help="Deprecated alias for ``--resume <id>``; kept for one release.",
     )
     @click.option("--model", default=None, help="OpenCode model to use for the native session.")
+    @click.option(
+        "--session-id-file",
+        "session_id_file",
+        default=None,
+        metavar="PATH",
+        help=(
+            "Write the session id to PATH once the session is created. "
+            "Useful for automation that needs the id without parsing stderr."
+        ),
+    )
     @click.argument("opencode_args", nargs=-1, type=click.UNPROCESSED)
     def opencode(
         server: str | None,
@@ -502,6 +538,7 @@ def register_native_commands(cli: click.Group) -> None:
         session_id: str | None,
         model: str | None,
         opencode_args: tuple[str, ...],
+        session_id_file: str | None,
     ) -> None:
         # :param server: Remote Omnigent server URL, or None for local.
         # :param resume: None, picker sentinel, or a conversation id.
@@ -558,6 +595,7 @@ def register_native_commands(cli: click.Group) -> None:
             extra_args=_resolve_harness_startup_args(cfg, "opencode-native", opencode_args),
             model=model,
             auto_open_conversation=auto_open_conversation,
+            session_id_file=session_id_file,
         )
 
     @cli.command(
@@ -597,12 +635,23 @@ def register_native_commands(cli: click.Group) -> None:
         hidden=True,
         help="Deprecated alias for ``--resume <id>``; kept for one release.",
     )
+    @click.option(
+        "--session-id-file",
+        "session_id_file",
+        default=None,
+        metavar="PATH",
+        help=(
+            "Write the session id to PATH once the session is created. "
+            "Useful for automation that needs the id without parsing stderr."
+        ),
+    )
     @click.argument("pi_args", nargs=-1, type=click.UNPROCESSED)
     def pi(
         server: str | None,
         resume: str | None,
         session_id: str | None,
         pi_args: tuple[str, ...],
+        session_id_file: str | None,
     ) -> None:
         """Launch Pi with Omnigent.
 
@@ -647,6 +696,7 @@ def register_native_commands(cli: click.Group) -> None:
             resume_picker=choice.picker,
             extra_args=_resolve_harness_startup_args(cfg, "pi-native", pi_args),
             auto_open_conversation=auto_open_conversation,
+            session_id_file=session_id_file,
         )
 
     @cli.command(
@@ -702,6 +752,16 @@ def register_native_commands(cli: click.Group) -> None:
         default=None,
         help="Cursor model id to use for the native TUI.",
     )
+    @click.option(
+        "--session-id-file",
+        "session_id_file",
+        default=None,
+        metavar="PATH",
+        help=(
+            "Write the session id to PATH once the session is created. "
+            "Useful for automation that needs the id without parsing stderr."
+        ),
+    )
     @click.argument("cursor_args", nargs=-1, type=click.UNPROCESSED)
     def cursor(
         server: str | None,
@@ -710,6 +770,7 @@ def register_native_commands(cli: click.Group) -> None:
         mode: str | None,
         model: str | None,
         cursor_args: tuple[str, ...],
+        session_id_file: str | None,
     ) -> None:
         # Param docs live in comments — Click uses the docstring for --help.
         # :param model: Cursor model id passed to cursor-agent as ``--model``.
@@ -764,6 +825,7 @@ def register_native_commands(cli: click.Group) -> None:
             model=model,
             auto_open_conversation=auto_open_conversation,
             mode=mode,
+            session_id_file=session_id_file,
         )
 
     @cli.command(
@@ -841,6 +903,16 @@ def register_native_commands(cli: click.Group) -> None:
         default=None,
         help="Send this as the initial Devin chat input when the TUI starts.",
     )
+    @click.option(
+        "--session-id-file",
+        "session_id_file",
+        default=None,
+        metavar="PATH",
+        help=(
+            "Write the session id to PATH once the session is created. "
+            "Useful for automation that needs the id without parsing stderr."
+        ),
+    )
     @click.argument("devin_args", nargs=-1, type=click.UNPROCESSED)
     def devin(
         server: str | None,
@@ -852,6 +924,7 @@ def register_native_commands(cli: click.Group) -> None:
         sandbox: bool,
         prompt: str | None,
         devin_args: tuple[str, ...],
+        session_id_file: str | None,
     ) -> None:
         """Launch Devin with Omnigent.
 
@@ -903,6 +976,7 @@ def register_native_commands(cli: click.Group) -> None:
             sandbox=sandbox,
             prompt=prompt,
             auto_open_conversation=auto_open_conversation,
+            session_id_file=session_id_file,
         )
 
     @cli.command(
@@ -966,6 +1040,16 @@ def register_native_commands(cli: click.Group) -> None:
         default=None,
         help="Send this as the initial Kiro chat input when the TUI starts.",
     )
+    @click.option(
+        "--session-id-file",
+        "session_id_file",
+        default=None,
+        metavar="PATH",
+        help=(
+            "Write the session id to PATH once the session is created. "
+            "Useful for automation that needs the id without parsing stderr."
+        ),
+    )
     @click.argument("kiro_args", nargs=-1, type=click.UNPROCESSED)
     def kiro(
         server: str | None,
@@ -978,6 +1062,7 @@ def register_native_commands(cli: click.Group) -> None:
         trust_all_tools: bool,
         prompt: str | None,
         kiro_args: tuple[str, ...],
+        session_id_file: str | None,
     ) -> None:
         """Launch Kiro with Omnigent.
 
@@ -1033,6 +1118,7 @@ def register_native_commands(cli: click.Group) -> None:
             model=model,
             prompt=prompt,
             auto_open_conversation=auto_open_conversation,
+            session_id_file=session_id_file,
         )
 
     @cli.command(
@@ -1072,12 +1158,23 @@ def register_native_commands(cli: click.Group) -> None:
         hidden=True,
         help="Deprecated alias for ``--resume <id>``; kept for one release.",
     )
+    @click.option(
+        "--session-id-file",
+        "session_id_file",
+        default=None,
+        metavar="PATH",
+        help=(
+            "Write the session id to PATH once the session is created. "
+            "Useful for automation that needs the id without parsing stderr."
+        ),
+    )
     @click.argument("goose_args", nargs=-1, type=click.UNPROCESSED)
     def goose(
         server: str | None,
         resume: str | None,
         session_id: str | None,
         goose_args: tuple[str, ...],
+        session_id_file: str | None,
     ) -> None:
         """Launch Goose with Omnigent.
 
@@ -1120,6 +1217,7 @@ def register_native_commands(cli: click.Group) -> None:
             resume_picker=choice.picker,
             extra_args=_resolve_harness_startup_args(cfg, "goose-native", goose_args),
             auto_open_conversation=auto_open_conversation,
+            session_id_file=session_id_file,
         )
 
     @cli.command(
@@ -1159,12 +1257,23 @@ def register_native_commands(cli: click.Group) -> None:
         hidden=True,
         help="Deprecated alias for ``--resume <id>``; kept for one release.",
     )
+    @click.option(
+        "--session-id-file",
+        "session_id_file",
+        default=None,
+        metavar="PATH",
+        help=(
+            "Write the session id to PATH once the session is created. "
+            "Useful for automation that needs the id without parsing stderr."
+        ),
+    )
     @click.argument("hermes_args", nargs=-1, type=click.UNPROCESSED)
     def hermes(
         server: str | None,
         resume: str | None,
         session_id: str | None,
         hermes_args: tuple[str, ...],
+        session_id_file: str | None,
     ) -> None:
         """Launch Hermes with Omnigent.
 
@@ -1207,6 +1316,7 @@ def register_native_commands(cli: click.Group) -> None:
             resume_picker=choice.picker,
             extra_args=_resolve_harness_startup_args(cfg, "hermes-native", hermes_args),
             auto_open_conversation=auto_open_conversation,
+            session_id_file=session_id_file,
         )
 
     @cli.command(
@@ -1247,6 +1357,16 @@ def register_native_commands(cli: click.Group) -> None:
         help="Deprecated alias for ``--resume <id>``; kept for one release.",
     )
     @click.option("--model", default=None, help="Antigravity (agy) model to use for the session.")
+    @click.option(
+        "--session-id-file",
+        "session_id_file",
+        default=None,
+        metavar="PATH",
+        help=(
+            "Write the session id to PATH once the session is created. "
+            "Useful for automation that needs the id without parsing stderr."
+        ),
+    )
     @click.argument("antigravity_args", nargs=-1, type=click.UNPROCESSED)
     def antigravity(
         server: str | None,
@@ -1254,6 +1374,7 @@ def register_native_commands(cli: click.Group) -> None:
         session_id: str | None,
         model: str | None,
         antigravity_args: tuple[str, ...],
+        session_id_file: str | None,
     ) -> None:
         """Launch Antigravity (agy) with Omnigent.
 
@@ -1308,6 +1429,7 @@ def register_native_commands(cli: click.Group) -> None:
             model=model,
             auto_open_conversation=auto_open_conversation,
             command=resolved_command or None,
+            session_id_file=session_id_file,
         )
 
     # Register ``agy`` CLI shortcut for parity with the upstream binary name.
@@ -1350,12 +1472,23 @@ def register_native_commands(cli: click.Group) -> None:
         hidden=True,
         help="Deprecated alias for ``--resume <id>``; kept for one release.",
     )
+    @click.option(
+        "--session-id-file",
+        "session_id_file",
+        default=None,
+        metavar="PATH",
+        help=(
+            "Write the session id to PATH once the session is created. "
+            "Useful for automation that needs the id without parsing stderr."
+        ),
+    )
     @click.argument("qwen_args", nargs=-1, type=click.UNPROCESSED)
     def qwen(
         server: str | None,
         resume: str | None,
         session_id: str | None,
         qwen_args: tuple[str, ...],
+        session_id_file: str | None,
     ) -> None:
         """Launch Qwen Code with Omnigent.
 
@@ -1398,6 +1531,7 @@ def register_native_commands(cli: click.Group) -> None:
             resume_picker=choice.picker,
             extra_args=_resolve_harness_startup_args(cfg, "qwen-native", qwen_args),
             auto_open_conversation=auto_open_conversation,
+            session_id_file=session_id_file,
         )
 
     @cli.command(
@@ -1437,12 +1571,23 @@ def register_native_commands(cli: click.Group) -> None:
         hidden=True,
         help="Deprecated alias for ``--resume <id>``; kept for one release.",
     )
+    @click.option(
+        "--session-id-file",
+        "session_id_file",
+        default=None,
+        metavar="PATH",
+        help=(
+            "Write the session id to PATH once the session is created. "
+            "Useful for automation that needs the id without parsing stderr."
+        ),
+    )
     @click.argument("kimi_args", nargs=-1, type=click.UNPROCESSED)
     def kimi(
         server: str | None,
         resume: str | None,
         session_id: str | None,
         kimi_args: tuple[str, ...],
+        session_id_file: str | None,
     ) -> None:
         """Launch Kimi Code with Omnigent.
 
@@ -1494,4 +1639,5 @@ def register_native_commands(cli: click.Group) -> None:
             resume_picker=choice.picker,
             extra_args=_resolve_harness_startup_args(cfg, "kimi-native", kimi_args),
             auto_open_conversation=auto_open_conversation,
+            session_id_file=session_id_file,
         )
