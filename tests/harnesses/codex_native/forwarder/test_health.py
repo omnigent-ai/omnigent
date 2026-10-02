@@ -12,6 +12,11 @@ from tests.harnesses.codex_native.forwarder._support import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _isolated_forward_health(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(fwd, "_forward_health", fwd._ForwardHealth())
+
+
 class _StatusClient:
     """httpx client stub whose ``post`` returns a fixed status code."""
 
@@ -35,7 +40,6 @@ def test_forward_failures_escalate_to_degraded_once() -> None:
     the latch turns a real outage into a single loud signal and does not
     re-fire per dropped item.
     """
-    fwd._reset_forward_health()
     result = fwd._PostResult(response=None, transport_error="ConnectError")
 
     for _ in range(fwd._FORWARD_DEGRADED_THRESHOLD - 1):
@@ -59,7 +63,6 @@ def test_forward_success_resets_degraded_state() -> None:
 
     Recovery must re-arm the indicator so a later outage escalates again.
     """
-    fwd._reset_forward_health()
     result = fwd._PostResult(response=None, transport_error="ConnectError")
     for _ in range(fwd._FORWARD_DEGRADED_THRESHOLD):
         fwd._note_forward_failure("external_session_usage", result, "conv_x")
@@ -79,8 +82,6 @@ async def test_post_session_event_tracks_success_and_failure() -> None:
     A 2xx clears the failure run; a permanent 4xx counts as a failure so a
     sustained outage can escalate.
     """
-    fwd._reset_forward_health()
-
     # A permanent 4xx is a failure.
     await fwd._post_session_event(
         _StatusClient(400), "conv_x", event_type="external_session_status", data={"status": "idle"}
@@ -100,7 +101,6 @@ async def test_degraded_log_records_post_failure_classification(
     failure: str, caplog: pytest.LogCaptureFixture
 ) -> None:
     """A degraded period records its latest delivery outcome without copying the payload."""
-    fwd._reset_forward_health()
     request = httpx.Request("POST", "https://example.test/events?secret=private")
     client = (
         _StatusClient(403)

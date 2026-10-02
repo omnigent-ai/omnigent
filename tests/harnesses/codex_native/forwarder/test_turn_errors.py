@@ -1,4 +1,8 @@
-"""Turn errors tests for Codex forwarder."""
+"""Turn errors for Codex forwarding.
+
+Failed turns surface their reason; authentication errors include a re-auth hint.
+Resume uses the same verdict. Empty turns warn and stay idle, as do clean turns.
+"""
 
 from __future__ import annotations
 
@@ -15,15 +19,6 @@ from omnigent.harnesses.codex_native.bridge import (
 from tests.harnesses.codex_native.forwarder._support import (
     _RecordingClient,
 )
-
-# ── #1108: turn-error "silent success" → surfaced failed ──────────────
-#
-# A failed Codex turn arrives as ``turn/completed`` (a clean success boundary)
-# with ``turn.status == "failed"`` and a ``turn.error`` object. These tests pin
-# the surface-only fix: such turns are forced to ``failed``, the reason is
-# surfaced as the status output, auth errors (codexErrorInfo / 401-403) carry a
-# re-auth hint, the resume path reaches the same verdict, an empty turn is idle
-# (+ WARN), and a genuinely clean turn still reports success.
 
 
 def _seed_active_turn(bridge_dir: Path, turn_id: str) -> None:

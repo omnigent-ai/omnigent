@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from copy import deepcopy
 
 import httpx
 import pytest
@@ -44,7 +45,7 @@ class _FlakyElicitationClient:
             with a JSON-RPC result body.
         :raises httpx.ReadError: During the transport-failure window.
         """
-        self.posts.append((url, json))
+        self.posts.append((url, deepcopy(json)))
         attempt = len(self.posts)
         if attempt <= self._transport_failures:
             raise httpx.ReadError(
