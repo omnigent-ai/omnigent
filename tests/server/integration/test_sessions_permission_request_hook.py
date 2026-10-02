@@ -2859,7 +2859,9 @@ async def test_codex_command_approval_hook_accepts_execpolicy_amendment(
             "startedAtMs": 1,
             "approvalId": None,
             "reason": "test command approval",
-            "command": ".venv/bin/python -m pytest tests/test_codex_native.py -q",
+            "command": (
+                ".venv/bin/python -m pytest tests/harnesses/codex_native/test_codex_native.py -q"
+            ),
             "cwd": "/tmp/workspace",
             "commandActions": [],
             "availableDecisions": [
@@ -2927,7 +2929,9 @@ async def test_codex_command_approval_hook_rejects_malformed_execpolicy_amendmen
             "startedAtMs": 1,
             "approvalId": None,
             "reason": "test command approval",
-            "command": ".venv/bin/python -m pytest tests/test_codex_native.py -q",
+            "command": (
+                ".venv/bin/python -m pytest tests/harnesses/codex_native/test_codex_native.py -q"
+            ),
             "cwd": "/tmp/workspace",
             "commandActions": [],
             "availableDecisions": [

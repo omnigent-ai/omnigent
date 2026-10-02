@@ -4,7 +4,8 @@
 native forwarder report a connectivity failure to the harness idle-turn
 watchdog (issue #1119). These cover its record / recency / clear contract; the
 writer (forwarder retry loops) and reader (watchdog) integrations are tested in
-``tests/test_native_post_delivery.py``, ``tests/test_codex_native_forwarder.py``,
+``tests/test_native_post_delivery.py``,
+``tests/harnesses/codex_native/test_codex_native_forwarder.py``,
 and ``tests/runtime/harnesses/test_scaffold.py``.
 """
 

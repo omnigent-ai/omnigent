@@ -62,7 +62,7 @@ class _RecordingClient:
     """
     Async ``httpx`` client stub that records POSTs and returns HTTP 200.
 
-    Mirrors the stub used by ``tests/test_codex_native_forwarder.py``: only
+    Mirrors the stub used by ``tests/harnesses/codex_native/test_codex_native_forwarder.py``: only
     ``post`` is exercised (by ``_post_session_event``), and every call is
     recorded so the test can assert exactly what the forwarder mirrored to the
     Omnigent server.

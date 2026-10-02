@@ -217,7 +217,7 @@ def test_refresh_model_from_config_updates_state(tmp_path: Path) -> None:
     to learn the user's ``/model`` selection: read config.toml (via the
     shared ``read_codex_config_model``) → set ``forwarder_state.model`` →
     ``_sync_model_change`` mirrors it to AP. The config.toml parsing itself
-    is covered in ``tests/test_codex_native_bridge.py``; this asserts the
+    is covered in ``tests/harnesses/codex_native/test_codex_native_bridge.py``; this asserts the
     forwarder wires the read into its state.
     """
     _write_codex_config(tmp_path, 'model = "gpt-5.4"\n')
