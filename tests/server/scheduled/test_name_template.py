@@ -143,10 +143,12 @@ def test_template_limit_counts_code_points(name: str) -> None:
         validate_name_template(name)
 
 
-def test_worst_case_template_stays_within_render_limit() -> None:
-    name = "{{MMMM}}" * 32
+@pytest.mark.parametrize("token, expected", [("MMMM", "September"), ("dddd", "Wednesday")])
+def test_worst_case_template_stays_within_render_limit(token: str, expected: str) -> None:
+    name = "{{" + " ".join([token] * 50) + "}}abc"
     assert len(name) == 256
     validate_name_template(name)
-    assert render_session_name(name, REFERENCE_EPOCH, TIMEZONE) == "October" * 32
     september = int(datetime(2026, 9, 30, tzinfo=UTC).timestamp())
-    assert len(render_session_name(name, september, "UTC")) == 288 <= 768
+    rendered = render_session_name(name, september, "UTC")
+    assert rendered == " ".join([expected] * 50) + "abc"
+    assert len(rendered) == 502 <= 768
