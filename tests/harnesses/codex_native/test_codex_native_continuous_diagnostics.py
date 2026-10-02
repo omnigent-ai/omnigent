@@ -32,14 +32,14 @@ class _Output(logging.Handler):
         super().__init__()
         self.records: queue.Queue[logging.LogRecord] = queue.Queue()
         self.entered = threading.Event()
-        self.release = threading.Event()
-        self.release.set()
+        self.allow_emit = threading.Event()
+        self.allow_emit.set()
         self.fail = False
         self.failed = threading.Event()
 
     def emit(self, record: logging.LogRecord) -> None:
         self.entered.set()
-        if not self.release.wait(10):
+        if not self.allow_emit.wait(10):
             raise TimeoutError("test did not release the logging handler")
         if self.fail:
             self.failed.set()
@@ -62,7 +62,7 @@ def output(monkeypatch: pytest.MonkeyPatch) -> Iterator[_Output]:
     try:
         yield handler
     finally:
-        handler.release.set()
+        handler.allow_emit.set()
         logger.removeHandler(handler)
         logger.setLevel(previous_level)
         logger.propagate = previous_propagate
@@ -200,7 +200,7 @@ async def test_worker_start_failure_keeps_draining_without_debug_fallback(
         SimpleNamespace(Thread=UnavailableThread, Lock=threading.Lock, Event=threading.Event),
     )
     if reporter == "blocked":
-        output.release.clear()
+        output.allow_emit.clear()
     # A fallback DEBUG write would contend with the blocked warning handler.
     app_server._logger.addHandler(output)
     try:
@@ -224,7 +224,7 @@ async def test_worker_start_failure_keeps_draining_without_debug_fallback(
             assert await asyncio.to_thread(output.entered.wait, 5)
             if reporter == "blocked":
                 assert output.records.empty()
-            output.release.set()
+            output.allow_emit.set()
             row = record_to_row(await output.next(), "runner")
             assert row["event_name"] == "harness_diagnostic_capture_failed"
             assert row["session_id"] == "child-session"
@@ -233,7 +233,7 @@ async def test_worker_start_failure_keeps_draining_without_debug_fallback(
             assert "synthetic-start-secret" not in json.dumps(row)
         assert output.records.empty()
     finally:
-        output.release.set()
+        output.allow_emit.set()
         app_server._logger.removeHandler(output)
         await server.close()
 
@@ -269,7 +269,7 @@ sys.stderr.buffer.flush()
 print('ready after flood', flush=True)
 sys.stdin.readline()
 """
-    output.release.clear()
+    output.allow_emit.clear()
     proc = await asyncio.create_subprocess_exec(
         sys.executable,
         "-c",
@@ -301,9 +301,9 @@ sys.stdin.readline()
             assert len(diagnostics._records) <= stderr_diagnostics._QUEUE_RECORDS
         # Still blocked in a real logging handler; close has a finite join budget.
         await asyncio.wait_for(server.close(), 3)
-        assert not output.release.is_set()
+        assert not output.allow_emit.is_set()
     finally:
-        output.release.set()
+        output.allow_emit.set()
         if proc.returncode is None:
             proc.kill()
         await asyncio.wait_for(proc.communicate(), 5)
@@ -344,7 +344,7 @@ async def test_tiny_record_flood_sheds_old_records_with_counts(
     server: app_server.CodexNativeAppServer, output: _Output
 ) -> None:
     stderr = _reader(server)
-    output.release.clear()
+    output.allow_emit.clear()
     try:
         stderr.feed_data(b"first\n")
         assert await asyncio.to_thread(output.entered.wait, 5)
@@ -352,7 +352,7 @@ async def test_tiny_record_flood_sheds_old_records_with_counts(
         stderr.feed_eof()
         await server.stderr_task
     finally:
-        output.release.set()
+        output.allow_emit.set()
         await server.close()
     await output.next()
     attrs = record_to_row(await output.next(), "runner")["attributes"]
