@@ -14,15 +14,8 @@ from omnigent.harnesses.codex_native.app_server import (
     CodexNativeAppServer,
 )
 
-# Spelled out per session class rather than derived from the constants under
-# test: a comprehension over ``_FRAMEWORK_APPROVED_TOOLS`` passes no matter what
-# is added to it, so it can never catch the approval surface growing.
-#
-# A plain codex session pre-approves exactly the one tool the framework calls
-# unprompted on any session. Any Smart Routing session — pinned harness or auto
-# — additionally pre-approves the four its routed spawns run on: discover the
-# agent, start the routed child, deliver the task, collect the result. Nobody is
-# watching for an approval prompt in the middle of a spawn.
+# Spell out expected approvals; deriving them from the production constant
+# would hide an unintended expansion of the approved tool surface.
 _PLAIN_TOOL_APPROVALS = {"sys_session_rename": {"approval_mode": "approve"}}
 
 

@@ -184,7 +184,9 @@ def test_resolve_databricks_codex_model_does_not_reuse_other_catalog(
     discovery.assert_called_once_with(host, "tok")
 
 
-def test_resolve_databricks_codex_model_matches_servable_ids() -> None:
+def test_resolve_databricks_codex_model_matches_servable_ids(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """The codex launch model resolves against what the workspace serves.
 
     An unset model takes the newest servable id; a legacy ``databricks-``
@@ -197,6 +199,8 @@ def test_resolve_databricks_codex_model_matches_servable_ids() -> None:
 
     from omnigent.harnesses.codex_native.app_server import _resolve_databricks_codex_model
 
+    monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(tmp_path / "databrickscfg"))
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
     servable = ("system.ai.gpt-5-6-sol", "system.ai.gpt-5-6-luna")
     with (
         patch(
@@ -226,12 +230,17 @@ def test_resolve_databricks_codex_model_matches_servable_ids() -> None:
 
 def test_resolve_databricks_codex_model_discovery_failure_warns_without_traceback(
     caplog: pytest.LogCaptureFixture,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The ucode-state fallback warns in one actionable line, frame-free."""
     import logging
     from unittest.mock import patch
 
     from omnigent.harnesses.codex_native.app_server import _resolve_databricks_codex_model
+
+    monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(tmp_path / "databrickscfg"))
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
 
     def _raise(profile: str | None) -> None:
         raise OSError(

@@ -29,6 +29,7 @@ from tests.harnesses.codex_native.app_server._support import (
 
 async def test_discover_codex_model_options_strips_secrets_and_stops_process(
     monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
 ) -> None:
     """Pre-launch discovery uses an empty home, no credentials, and clean teardown."""
     from omnigent.harnesses.codex_native import app_server as codex_native_app_server
@@ -127,6 +128,7 @@ async def test_discover_codex_model_options_strips_secrets_and_stops_process(
     )
     monkeypatch.setattr(codex_native_app_server, "_wait_for_discovery_listener", _fake_wait)
     monkeypatch.setattr(codex_native_app_server, "CodexAppServerClient", _FakeClient)
+    request.addfinalizer(_model_discovery_cache.clear)
     _model_discovery_cache.clear()
 
     options = await discover_codex_model_options(codex_path="/test/codex")
@@ -134,7 +136,6 @@ async def test_discover_codex_model_options_strips_secrets_and_stops_process(
     assert options == [{"id": "coding-model", "model": "coding-model", "isDefault": True}]
     assert captured_env == {"PATH": "/bin", "CODEX_HOME": captured_env["CODEX_HOME"]}
     assert process.terminated is True
-    _model_discovery_cache.clear()
 
 
 @pytest.mark.parametrize("gateway_rows", ["matching", "missing", "malformed", "current", None])

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import sys
 from pathlib import Path
@@ -182,8 +183,9 @@ async def test_codex_reprobed_launch_catalog_cancels_timed_out_probe_and_preserv
     from omnigent.models import model_catalog_store
 
     # Traceback rendering must not consume the probe cancellation deadline.
-    monkeypatch.setattr(codex_native_app_server._logger, "handlers", [caplog.handler])
-    monkeypatch.setattr(codex_native_app_server._logger, "propagate", False)
+    logger = logging.Logger(codex_native_app_server._logger.name)  # noqa: LOG001 — isolated test logger
+    logger.addHandler(caplog.handler)
+    monkeypatch.setattr(codex_native_app_server, "_logger", logger)
 
     fingerprint = codex_native_app_server.codex_catalog_fingerprint(_catalog_launch)
     stale = [{"id": "gpt-5.5", "isDefault": True}]
