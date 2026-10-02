@@ -29,8 +29,13 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { Input } from "@/components/ui/input";
-import type { ConnectResult, ServerCheckResult } from "@/pages/onboarding/ServerSelectorV2";
+import type {
+  ConnectProgress,
+  ConnectResult,
+  ServerCheckResult,
+} from "@/pages/onboarding/ServerSelectorV2";
 import {
+  ConnectStatus,
   InstallActionIcon,
   installActionLabel,
   OnboardingHeading,
@@ -142,6 +147,8 @@ export function ServerSelectStep({
   installed,
   onBack,
   onConnect,
+  connection = null,
+  onCancelConnect,
   onRemove,
   onCopy,
   onCheckServer,
@@ -159,6 +166,9 @@ export function ServerSelectStep({
   onBack: () => void;
   /** Connect to a URL; resolves `{error}` to show, else navigation is underway. */
   onConnect: (url: string) => Promise<ConnectResult>;
+  /** Progress of the in-flight onConnect (null when idle). */
+  connection?: ConnectProgress | null;
+  onCancelConnect?: () => void;
   /** Remove a recent server from the list, if the shell supports it. */
   onRemove?: (url: string) => void;
   /** Copy text to the clipboard (native shell bridge — file:// blocks navigator.clipboard). */
@@ -468,6 +478,8 @@ export function ServerSelectStep({
         </div>
       )}
 
+      <ConnectStatus connection={connection} onCancel={onCancelConnect} />
+
       <div className="mt-3 flex justify-between gap-2">
         {mode === "add" ? (
           <>
@@ -490,11 +502,16 @@ export function ServerSelectStep({
           </>
         ) : (
           <>
-            <Button variant="ghost" onClick={onBack} size="lg">
+            <Button variant="ghost" onClick={onBack} size="lg" disabled={connection !== null}>
               <ArrowLeft className="size-4" />
               Back
             </Button>
-            <Button disabled={selected === null} onClick={join} size="lg">
+            <Button
+              disabled={selected === null}
+              loading={connection !== null}
+              onClick={join}
+              size="lg"
+            >
               <InstallActionIcon installed={installed} startsLocal={startsLocal} />
               {installActionLabel(installed, startsLocal)}
             </Button>

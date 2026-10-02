@@ -6602,7 +6602,7 @@ def test_is_claude_native_conversation_returns_false_on_transport_error(
 #
 # These tests drive ``_align_working_directory_with_session``
 # directly. The state module's roundtrip / persistence is covered
-# in ``tests/test_claude_native_state.py``; here we exercise the
+# in ``tests/harnesses/claude_native/test_claude_native_state.py``; here we exercise the
 # decision-table behavior: matching cwd → no-op, mismatched +
 # switch → chdir, mismatched + move → transcript move,
 # mismatched + missing path → ClickException, legacy session →
@@ -8928,7 +8928,8 @@ def test_claude_transcript_records_handles_compaction_item() -> None:
     assert boundaries[0]["compactMetadata"]["postTokens"] == 4321
 
 
-def test_transcript_records_drop_adjacent_store_duplicates() -> None:
+@pytest.mark.parametrize("bare_duplicates", [False, True])
+def test_transcript_records_drop_adjacent_store_duplicates(bare_duplicates: bool) -> None:
     """Adjacent items identical apart from id/created_at collapse to one record.
 
     A forwarder retry re-post persists as an adjacent row that differs only
@@ -8962,6 +8963,13 @@ def test_transcript_records_drop_adjacent_store_duplicates() -> None:
             "response_id": "resp_1",
         },
     ]
+    if bare_duplicates:
+        duplicate = {
+            k: v for k, v in items[0].items() if k not in ("id", "created_at", "response_id")
+        }
+        items = [dict(duplicate) for _ in range(3)] + [items[-1]]
+    else:
+        items.insert(2, {**items[1], "id": "msg_retry", "created_at": 108})
     records = claude_native._claude_transcript_records_from_session_items(
         items,
         session_id="conv_test",

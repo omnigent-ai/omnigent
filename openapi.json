@@ -2568,6 +2568,18 @@
             "description": "The tool's string result.",
             "title": "Output",
             "type": "string"
+          },
+          "subagent_return_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Native task id of an explicitly completed child.",
+            "title": "Subagent Return Id"
           }
         },
         "required": [
@@ -3366,6 +3378,24 @@
             ],
             "description": "Native live-preview stream finalized by this assistant message. Persisted so reconnect snapshots can suppress delayed preview chunks after the authoritative item.",
             "title": "Stream Message Id"
+          },
+          "subagent_return_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Native task id of an explicitly completed child.",
+            "title": "Subagent Return Id"
+          },
+          "user_authored": {
+            "default": false,
+            "description": "Confirmed or conservatively preserved user input; prevents legacy content cleanup from hiding literal agent markup.",
+            "title": "User Authored",
+            "type": "boolean"
           }
         },
         "required": [

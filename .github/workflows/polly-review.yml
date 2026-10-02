@@ -344,7 +344,7 @@ jobs:
 
           # Freeze both revisions so the file and review marker describe the same diff.
           gh pr view "$PR_NUMBER" --repo "$REPO" \
-            --json title,body,baseRefName,headRefName,baseRefOid,headRefOid,additions,deletions,changedFiles \
+            --json title,body,baseRefName,headRefName,baseRefOid,headRefOid,additions,deletions,changedFiles,labels \
             > /tmp/pr_meta.json
           base_sha="$(jq -r .baseRefOid /tmp/pr_meta.json)"
           head_sha="$(jq -r .headRefOid /tmp/pr_meta.json)"
@@ -476,12 +476,36 @@ jobs:
           backend, refactor, test, or docs changes with no user-visible effect.
           """ if is_external else ""
 
+          # Nudge, never block, when a PR changes user-facing code that the
+          # verify-omnigent feature map describes.
+          changed_paths = re.findall(
+              r"^diff --git a/(\S+) b/",
+              pathlib.Path("/tmp/pr_diff.txt").read_text(encoding="utf-8", errors="replace"),
+              flags=re.M,
+          )
+          touches_entry_points = any(
+              (path.startswith(("web/src/", "omnigent/harnesses/")) or re.fullmatch(r"omnigent/cli\w*\.py", path))
+              and not re.search(r"\.(test|stories)\.[jt]sx?$", path)
+              for path in changed_paths
+          )
+          feature_map_rule = """
+          **Feature map** — this PR changes user-facing code. Read
+          `feature-map/` from the `main` checkout: each
+          file lists every user entry point for one feature. If the diff adds,
+          removes, or renames an entry point (a button, menu item, route, dialog,
+          CLI command or flag, or a per-harness path) in a feature a file covers,
+          and that file does not reflect the change, add a **Non-blocking note**
+          naming the feature file and the entry point to update. Never blocking.
+          Skip areas listed under "Not yet mapped" in `feature-map/README.md`.
+          """ if touches_entry_points else ""
+
           prompt = f"""Review this pull request and provide structured feedback.
 
           ## PR Metadata
           - **Title:** {meta['title']}
           - **Branch:** {meta['headRefName']} → {meta['baseRefName']}
           - **Diff revisions:** {meta['baseRefOid']}...{meta['headRefOid']}
+          - **Labels:** {', '.join(l['name'] for l in meta.get('labels') or []) or '(none)'}
           - **Stats:** +{meta['additions']} / -{meta['deletions']} across {meta['changedFiles']} file(s)
 
           ## PR Description
@@ -589,6 +613,20 @@ jobs:
           not automatic blockers. Cite the relevant section and concrete file/line
           evidence for each finding. Do not flag unchanged historical violations.
 
+          For routing changes, consider `host_id` sharding, including parent-host
+          inheritance and retry affinity. Report verified bugs only under **Blocking issues**
+          using the existing criteria; add no separate section or status note.
+
+          **Client/server compatibility:** clients (web, Android, CLI, host/runner)
+          and servers can run different versions. Treat breaking changes to the
+          contract between them (HTTP routes, WebSocket/host frames, request and
+          response fields, enums, status codes) as broken contracts: removed or
+          renamed endpoints or fields, new required inputs, changed types or
+          semantics, or a client calling a new server API without a fallback for
+          older servers. Additive changes that old peers ignore are fine. Skip this
+          finding only when the PR has the `intentional-api-break` label (applied by
+          a maintainer); the PR description alone does not waive it.
+
           **PR scope:** Review the full diff, including pre-existing changes, against
           one concrete reported problem or requested outcome. Establish that outcome
           from available linked-issue context or the PR description. A precise PR
@@ -675,6 +713,7 @@ jobs:
           - Each sandbox deserves its own extra.
           - Nothing else warrants a new extra — flag any new extras that don't fit one of these three categories as a blocking issue.
           {visual_demo_rule}
+          {feature_map_rule}
           IMPORTANT: Your output will be posted directly as a PR comment. Output
           ONLY the final structured review — no coordination messages, no status
           updates about dispatching sub-agents, no referring to "reviewers", no "waiting for results" narration.
@@ -804,6 +843,7 @@ jobs:
           fi
 
       - name: Post review comment
+        id: publish
         if: steps.polly.outputs.review_text != ''
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token || github.token }}
@@ -818,6 +858,7 @@ jobs:
           {
             echo "<!-- polly-review-bot -->"
             echo "<!-- polly-reviewed-sha: ${HEAD_SHA} -->"
+            echo "<!-- polly-review-run:${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT} -->"
             echo "## <img src=\"https://raw.githubusercontent.com/omnigent-ai/omnigent/main/docs/images/omnigent-logo.svg\" alt=\"\" height=\"20\" valign=\"middle\" /> Polly AI Review"
             echo ""
             cat /tmp/polly_review.txt
@@ -830,7 +871,18 @@ jobs:
           # `/review` comment, or maintainer approval) is visible in the thread
           # and notifies watchers — no in-place upsert of a prior comment.
           gh pr comment "$PR_NUMBER" --repo "$REPO" --body-file /tmp/comment.md
+          printf '%s\n' "$HEAD_SHA" > /tmp/polly-completed-sha.txt
           echo "Created new comment"
+
+      - name: Upload Polly completion receipt
+        if: steps.publish.outcome == 'success' && github.event_name != 'pull_request'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: polly-completed-${{ steps.pr.outputs.pr_number }}-${{ steps.ctx.outputs.head_sha }}
+          path: /tmp/polly-completed-sha.txt
+          overwrite: true
+          retention-days: 90
+          if-no-files-found: error
 
       # Successful slow runs need the same evidence as failed reviews.
       - name: Prepare Polly diagnostics

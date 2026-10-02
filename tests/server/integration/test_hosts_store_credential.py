@@ -43,6 +43,7 @@ from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
 from omnigent.stores.host_store import HostStore
+from tests.server.helpers import websocket_scope as _websocket_scope
 
 pytestmark = [
     pytest.mark.asyncio,
@@ -57,21 +58,6 @@ _HOST_NAME = "credential-test-laptop"
 def _enable_flag(monkeypatch: pytest.MonkeyPatch) -> None:
     """Enable the feature flag for every test except the flag-off case."""
     monkeypatch.setenv("OMNIGENT_FEATURES", "harness_install")
-
-
-def _websocket_scope(path: str) -> dict[str, object]:
-    return {
-        "type": "websocket",
-        "asgi": {"version": "3.0"},
-        "scheme": "ws",
-        "path": path,
-        "raw_path": path.encode("ascii"),
-        "query_string": b"",
-        "headers": [],
-        "client": ("127.0.0.1", 50000),
-        "server": ("testserver", 80),
-        "subprotocols": [],
-    }
 
 
 def _hello_text(name: str = _HOST_NAME) -> str:

@@ -591,8 +591,16 @@ pnpm run build:linux       # AppImage + .deb
 pnpm run build:win         # NSIS installer
 ```
 
-Output lands in `electron/dist/` (the DMG is named
-`Omnigent-<version>-<arch>.dmg`).
+Local packages use the `ai.omnigent.desktop-dev` app ID and the **Omnigent Dev**
+name; output lands in `electron/dist-dev/` (the DMG is named
+`Omnigent Dev-<version>-<arch>.dmg`). They keep their own app data and do not
+install production desktop updates. `build:mac:release` retains
+`ai.omnigent.desktop`, **Omnigent**, and `electron/dist/`.
+
+Unpackaged `pnpm start` / `just electron-dev` runs inside Electron's own macOS
+bundle, but reads local preferences from `ai.omnigent.desktop-dev` explicitly
+and stores settings in **Omnigent Dev** app data. To try a managed preference,
+use the packaged local build instead (see `docs/managed-preferences.md`).
 
 ## macOS code signing & notarization
 

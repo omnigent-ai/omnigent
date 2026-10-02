@@ -45,8 +45,11 @@ fallback from machine-oriented handoff fields.
 
 Any write to GitHub — `git push`, `gh pr create`, `gh pr edit --add-reviewer`,
 `gh pr comment`, `gh pr close` — needs the resolve-agent App installation token
-(`omni-resolve-agent[bot]`, `contents`+`pull_requests` write on
-`omnigent-ai/omnigent`). **Your shell does not inherit it in a usable env var**:
+(`omni-resolve-agent[bot]`, Contents and Pull requests: write;
+Actions: read and write on `omnigent-ai/omnigent`). Actions access is needed to
+read review runs and completion artifacts and dispatch both review workflows.
+
+**Your shell does not inherit it in a usable env var**:
 you run inside the session's runner process (a different process, often a
 different machine when hosted on `--server`), so `$GH_TOKEN` in your shell is
 empty and a bare `git push` fails with a 403 / permission error. This is **not**
@@ -93,11 +96,19 @@ gh auth setup-git   # route git pushes through gh's credential helper with this 
 
 Once the set is genuinely green:
 
-1. **Commit** the fix and the tests on the working branch (the fix builds on the
-   repro branch, so the reproduction test and the fix land in one reviewable
-   diff). Follow the repo's commit conventions.
-   **Never commit workspace artifacts.** The commit must contain only the fix and
-   its reproduction test — nothing else. In particular, **never** stage or commit
+1. **Commit** the fix and selected permanent regression tests on the working
+   branch. Reused unchanged tests need no new commit. Follow the repo's commit
+   conventions. Before omitting an investigative test introduced for this task,
+   retain its original paths, command, tested revision, result, and source under
+   `.omnigent/repro-evidence/`, or cite the intact CI repro baseline/bundle.
+   Follow the [evidence retention rules in 2B.4](../resolve-author-fix/SKILL.md#2b4--select-permanent-regression-coverage):
+   identify the CI run/artifact/path or verified persistent local copy, and
+   distinguish pending workflow upload from confirmed storage. A worktree-local
+   path alone is not durable; preserve that worktree if retention is unresolved.
+   Put selected committed tests in `tests` and the selection/evidence location in
+   `test_audit`; no reproduction-only source is required in the PR. This does not
+   authorize deleting existing repository tests solely to reduce LOC.
+   **Never commit workspace artifacts.** In particular, **never** stage or commit
    the `recordings/` clips or any `.omnigent/` handoff files (e.g.
    `.omnigent/repro-handoff.json`): recordings are workspace artifacts that ride
    in the PR's Demo section / CI artifact bundle, not in the diff (see
@@ -218,9 +229,9 @@ Once the set is genuinely green:
    with `pr_url` set and `outcome` at its current best assessment, *before* you
    start Step 4. This is what lets the workflow post the PR link to the Linear
    ticket promptly, rather than waiting the ~hour Step 4 can take. Leave the
-   not-yet-known Step-4 fields empty (`ci_status`, `polly_review`,
-   `maintainer_review`) — you refill them in the final handoff. Emit it as a
-   normal intermediate message (json block last in *that* message), then carry on.
+   not-yet-known Step-4 fields empty (`ci_status`, `polly_review`, `ocr_review`,
+   `maintainer_review`, with `review_cycle: {}`) — refill them in the final
+   handoff. Emit it as a normal intermediate message (json block last in *that* message), then carry on.
    **Before this handoff, do the two outward actions a mid-turn drop would
    otherwise strand:**
    - **Label your PR `ui-preview`** (author path) — `gh pr edit <pr> --add-label

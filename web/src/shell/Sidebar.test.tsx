@@ -83,86 +83,62 @@ vi.mock("@/hooks/useHosts", () => ({
 
 // Mutation hooks are only invoked on row actions; stub them. useConversations
 // is the data source under test, so it's a controllable mock.
-vi.mock("@/hooks/useConversations", () => ({
-  useConversations: vi.fn(),
-  useLeaveSession: () => ({ mutate: vi.fn(), isPending: false }),
-  useArchiveConversation: () => ({ mutate: vi.fn() }),
-  useBulkArchiveConversations: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  useBulkDeleteConversations: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  useBulkMoveToProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  useBulkStopSessions: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  useConnectedConversations: () => [],
-  useStopAndDeleteConversation: () => ({ mutate: vi.fn() }),
-  // Pins are server-authoritative now. Derive the pinned set from the seeded
-  // ref intersected with the loaded conversations, so tests that seed via
-  // `seedPins` exercise the Pinned section without a separate fixture.
-  usePinnedConversations: () => {
-    const idSet = new Set(pinnedIdsRef.current);
-    return {
-      data: {
-        conversations: conversationsRef.current.filter((c) => idSet.has(c.id)),
-        filterHonored: true,
-      },
-      isSuccess: true,
-    };
-  },
-  // Reflect the toggle into the seeded ref so a test that clicks quick-pin then
-  // re-renders sees the updated Pinned set.
-  useTogglePinnedConversation: () => ({
-    mutate: ({ id, pinned }: { id: string; pinned: boolean }) => {
-      const ids = pinnedIdsRef.current;
-      pinnedIdsRef.current = pinned
-        ? [id, ...ids.filter((x) => x !== id)]
-        : ids.filter((x) => x !== id);
+vi.mock("@/hooks/useConversations", async () => {
+  const { conversationHooksMock } = await import("@/test/sidebarMockHelpers");
+  return {
+    ...conversationHooksMock(),
+    usePinnedConversations: () => {
+      const idSet = new Set(pinnedIdsRef.current);
+      return {
+        data: {
+          conversations: conversationsRef.current.filter((c) => idSet.has(c.id)),
+          filterHonored: true,
+        },
+        isSuccess: true,
+      };
     },
-  }),
-  setConversationPinned: vi.fn(() => Promise.resolve({})),
-  PINNED_CONVERSATIONS_KEY: ["pinned-conversations"],
-  useRenameConversation: () => ({ mutate: vi.fn() }),
-  useStopSession: () => ({ mutate: vi.fn() }),
-  // Project feature: the sidebar reads the project list to build project
-  // sections, and rows fire useMoveToProject from the kebab menu. Both must
-  // be stubbed or the Sidebar throws on render.
-  // Tests push project NAMES into projectsMock; expose them as first-class
-  // {id, name} folders (synthetic id per name) to match useProjects' shape.
-  useProjects: () => ({
-    data: projectRowsRef.current ?? projectsMock.map((name: string) => ({ id: `p_${name}`, name })),
-  }),
-  // Each project folder fetches its own sessions (server-side ?project=). Derive
-  // them from the global-list fixture by label so existing tests keep seeding
-  // project sessions there. Single page, no pagination, in this mock.
-  useProjectSessions: (project: string, enabled: boolean) => {
-    const override = projectSessionsMock.current[project];
-    const rows = !enabled
-      ? []
-      : (override ??
-        conversationsRef.current.filter(
-          (c) => (c.labels?.omni_project ?? null) === project && c.archived !== true,
-        ));
-    return {
-      data: enabled
-        ? {
-            pages: [{ data: rows, first_id: null, last_id: null, has_more: false }],
-            pageParams: [undefined],
-          }
-        : undefined,
-      isLoading: false,
-      isError: false,
-      error: null,
-      fetchNextPage: vi.fn(),
-      hasNextPage: false,
-      isFetchingNextPage: false,
-    };
-  },
-  useMoveToProject: () => ({ mutate: moveToProjectSpy }),
-  useDeleteProject: () => ({ mutate: deleteProjectSpy, isPending: false, isError: false }),
-  useRenameProject: () => ({ mutate: renameProjectSpy, isPending: false, isError: false }),
-  useCreateProject: () => ({ mutate: createProjectSpy, isPending: false, isError: false }),
-  useProjectConfig: () => ({ data: undefined, isLoading: false }),
-  useUpdateProjectConfig: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  fetchProjectSessionIds: fetchProjectSessionIdsMock,
-  PROJECT_LABEL_KEY: "omni_project",
-}));
+    useTogglePinnedConversation: () => ({
+      mutate: ({ id, pinned }: { id: string; pinned: boolean }) => {
+        const ids = pinnedIdsRef.current;
+        pinnedIdsRef.current = pinned
+          ? [id, ...ids.filter((x) => x !== id)]
+          : ids.filter((x) => x !== id);
+      },
+    }),
+    useProjects: () => ({
+      data:
+        projectRowsRef.current ?? projectsMock.map((name: string) => ({ id: `p_${name}`, name })),
+    }),
+    useProjectSessions: (project: string, enabled: boolean) => {
+      const override = projectSessionsMock.current[project];
+      const rows = !enabled
+        ? []
+        : (override ??
+          conversationsRef.current.filter(
+            (c) => (c.labels?.omni_project ?? null) === project && c.archived !== true,
+          ));
+      return {
+        data: enabled
+          ? {
+              pages: [{ data: rows, first_id: null, last_id: null, has_more: false }],
+              pageParams: [undefined],
+            }
+          : undefined,
+        isLoading: false,
+        isError: false,
+        error: null,
+        fetchNextPage: vi.fn(),
+        hasNextPage: false,
+        isFetchingNextPage: false,
+      };
+    },
+    useMoveToProject: () => ({ mutate: moveToProjectSpy }),
+    useDeleteProject: () => ({ mutate: deleteProjectSpy, isPending: false, isError: false }),
+    useRenameProject: () => ({ mutate: renameProjectSpy, isPending: false, isError: false }),
+    useCreateProject: () => ({ mutate: createProjectSpy, isPending: false, isError: false }),
+    fetchProjectSessionIds: fetchProjectSessionIdsMock,
+  };
+});
 // Header / dialog children that pull their own context — stub to keep the
 // test scoped to the conversation list + funnel.
 vi.mock("@/components/PermissionsModal", () => ({ PermissionsModal: () => null }));

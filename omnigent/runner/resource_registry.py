@@ -202,21 +202,14 @@ def trim_terminal_output(text: str | None) -> str | None:
     if not stripped:
         return None
     lines = stripped.splitlines()
-    omitted_lines = 0
-    if len(lines) > _TERMINAL_EXIT_OUTPUT_MAX_LINES:
-        omitted_lines = len(lines) - _TERMINAL_EXIT_OUTPUT_MAX_LINES
-        lines = lines[-_TERMINAL_EXIT_OUTPUT_MAX_LINES:]
-    # Drop whole leading lines until the body fits the char budget, so the
-    # first surviving line is never a mid-word fragment (the "rity reasons"
-    # cut). One line longer than the budget is hard-clipped as a last resort.
-    while len(lines) > 1 and len("\n".join(lines)) > _TERMINAL_EXIT_OUTPUT_MAX_CHARS:
-        lines.pop(0)
-        omitted_lines += 1
-    if len(lines) == 1 and len(lines[0]) > _TERMINAL_EXIT_OUTPUT_MAX_CHARS:
-        lines[0] = lines[0][-_TERMINAL_EXIT_OUTPUT_MAX_CHARS:]
-    if omitted_lines:
-        lines.insert(0, f"... omitted {omitted_lines} earlier line(s) ...")
-    return "\n".join(lines)
+    full = "\n".join(lines)
+    body = "\n".join(lines[-_TERMINAL_EXIT_OUTPUT_MAX_LINES:])
+    # Keep the tail by characters: dropping whole lines would discard one long
+    # error line (a usage dump, a JSON error) and leave only "pane is dead".
+    body = body[-_TERMINAL_EXIT_OUTPUT_MAX_CHARS:]
+    if len(body) < len(full):
+        return f"... omitted {len(full) - len(body)} earlier character(s) ...\n{body}"
+    return body
 
 
 def _terminal_exit_diagnostics(

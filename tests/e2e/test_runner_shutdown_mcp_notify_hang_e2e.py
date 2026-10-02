@@ -33,14 +33,11 @@ readiness wait and the runner exits promptly.
 from __future__ import annotations
 
 import contextlib
-import io
-import json
 import os
 import secrets
 import signal
 import subprocess
 import sys
-import tarfile
 import textwrap
 import time
 from collections.abc import Iterator
@@ -48,6 +45,8 @@ from pathlib import Path
 
 import httpx
 import pytest
+
+from tests._helpers.session import bind_session_runner, bundle_files, post_session_bundle
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -131,29 +130,13 @@ def _create_hermes_session(base_url: str, runner_id: str) -> str:
         f"  model: stub-model\n"
         f"  harness: hermes\n"
     )
-    with io.BytesIO() as buf:
-        with tarfile.open(fileobj=buf, mode="w:gz") as tar:
-            payload = agent_yaml.encode()
-            info = tarfile.TarInfo(f"{agent_name}.yaml")
-            info.size = len(payload)
-            tar.addfile(info, io.BytesIO(payload))
-        bundle = buf.getvalue()
+    bundle = bundle_files({f"{agent_name}.yaml": agent_yaml.encode()})
 
-    create = _client.post(
-        f"{base_url}/v1/sessions",
-        data={"metadata": json.dumps({})},
-        files={"bundle": ("agent.tar.gz", bundle, "application/gzip")},
-        timeout=30.0,
-    )
+    create = post_session_bundle(_client.post, f"{base_url}/v1/sessions", bundle, timeout=30.0)
     create.raise_for_status()
     session_id = create.json()["session_id"]
 
-    patch = _client.patch(
-        f"{base_url}/v1/sessions/{session_id}",
-        json={"runner_id": runner_id},
-        timeout=10.0,
-    )
-    patch.raise_for_status()
+    bind_session_runner(_client.patch, base_url, session_id, runner_id, timeout=10.0)
     return session_id
 
 

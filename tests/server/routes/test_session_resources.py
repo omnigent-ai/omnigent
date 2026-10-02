@@ -5150,6 +5150,7 @@ async def test_claude_native_mirror_matches_text_behind_attachment_markers() -> 
         assert [item.type for item in store.appended_items] == ["message", "error", "message"]
         lost_user, _lost_error, matched_user = store.appended_items
         assert lost_user.data.content == [{"type": "input_text", "text": "lost"}]
+        assert lost_user.data.user_authored is True
         assert image in matched_user.data.content
         assert {"type": "input_text", "text": mirrored_text} in matched_user.data.content
         assert pending_inputs.snapshot_for(sid) == []
@@ -7051,6 +7052,7 @@ async def test_relay_settles_queued_native_message_on_failed_turn(
         ]
         assert [e.get("response_id") for e in failed_edges] == ["resp_fail"]
         message, error = store.appended_items
+        assert message.data.user_authored is True
         assert message.data.role == "user"
         assert "".join(b["text"] for b in message.data.content) == "set up the worktree"
         assert message.created_by == "alice@example.com"

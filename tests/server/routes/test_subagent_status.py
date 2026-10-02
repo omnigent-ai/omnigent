@@ -329,3 +329,52 @@ async def test_external_session_status_still_forwards_to_runner(
     assert body["type"] == "external_session_status"
     assert body["data"] == data
     assert route.telemetry.call_count == (0 if status == "running" else 1)
+
+
+@pytest.mark.parametrize(
+    ("harness", "status", "confirmation", "wrapper", "expected"),
+    [
+        ("claude-native", "idle", {}, None, None),
+        ("claude-native", "idle", {"turn_completed": True}, None, "completed"),
+        ("cursor-native", "idle", {"turn_outcome": "cancelled"}, None, "cancelled"),
+        ("cursor-native", "idle", {"turn_outcome": "failed"}, None, "failed"),
+        ("codex-native", "idle", {}, None, "completed"),
+        ("claude-native", "failed", {}, None, "failed"),
+        (
+            "claude-native",
+            "idle",
+            {"turn_completed": True},
+            "claude-code-native-ui-subagent",
+            None,
+        ),
+        ("claude-native", "failed", {}, "claude-code-native-ui-subagent", None),
+    ],
+)
+async def test_external_child_activity_uses_confirmed_outcome(
+    status_route: _StatusRoute,
+    monkeypatch: pytest.MonkeyPatch,
+    harness: str,
+    status: str,
+    confirmation: dict[str, Any],
+    wrapper: str | None,
+    expected: str | None,
+) -> None:
+    route = status_route
+    if wrapper is not None:
+        route.store.set_labels(route.child_id, {"omnigent.wrapper": wrapper})
+    monkeypatch.setattr(sessions, "_resolve_harness", lambda *args, **kwargs: harness)
+    response = await route.client.post(
+        f"/v1/sessions/{route.child_id}/events",
+        json={
+            "type": "external_session_status",
+            "data": {"status": status, "response_id": "child-turn", **confirmation},
+        },
+    )
+    assert response.status_code == 202, response.text
+    items = route.store.list_items(route.parent_id).data
+    if expected is None:
+        assert items == []
+    else:
+        assert len(items) == 1
+        assert items[0].data.event_type == "session.subagent.returned"
+        assert items[0].data.resource["status"] == expected

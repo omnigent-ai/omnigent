@@ -2006,6 +2006,27 @@ class ClaudeSDKExecutor(Executor):
         self._cancel_close_tasks.add(task)
         task.add_done_callback(self._cancel_close_tasks.discard)
 
+    async def _evict_terminated_client(self, session_key: str) -> None:
+        """Discard a cached client after its CLI child exits."""
+        state = self._clients.get(session_key)
+        if state is None:
+            return
+        transport = getattr(state.client, "_transport", None)
+        process = getattr(transport, "_process", None)
+        # A non-None returncode is exactly the reaped-corpse state the SDK's
+        # write() refuses; a missing transport/process reads as alive and is skipped.
+        returncode = getattr(process, "returncode", None)
+        if returncode is None:
+            return
+        logger.warning(
+            "Claude SDK CLI for session %s terminated between turns "
+            "(exit code: %s); discarding the dead client so this turn "
+            "rebuilds a fresh one.",
+            session_key,
+            returncode,
+        )
+        await self._close_live_client(session_key)
+
     async def close(self) -> None:
         session_keys = list(self._clients)
         for session_key in session_keys:
@@ -2489,6 +2510,7 @@ class ClaudeSDKExecutor(Executor):
                 )
             )
             return
+        await self._evict_terminated_client(session_key)
         resume_session = session_key in self._clients
         prompt = self._build_prompt(
             messages,
@@ -3511,6 +3533,19 @@ class ClaudeSDKExecutor(Executor):
         trailing: list[Message] = []
         for msg in reversed(messages):
             if msg.get("role") == "user":
+                content = msg.get("content")
+                if content == "/compact" or (
+                    isinstance(content, list)
+                    and len(content) == 1
+                    and isinstance(content[0], dict)
+                    and content[0].get("type") in {"text", "input_text"}
+                    and content[0].get("text") == "/compact"
+                ):
+                    # The runner dispatches earlier input before a compact control.
+                    # Compaction may emit no assistant text; keep it out of later prompts.
+                    if not trailing:
+                        return "/compact"
+                    break
                 trailing.append(msg)
             else:
                 break

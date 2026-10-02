@@ -168,4 +168,97 @@ describe("SidebarServerPicker", () => {
     // hand-edited settings file stays switchable instead of invisible.
     expect(await screen.findByText("also-not-a-url")).toBeInTheDocument();
   });
+
+  it("tells apart two workspaces behind one account host", async () => {
+    // Sign-in moved this window to workspace 1's own host; the shell names the pick.
+    getServerPicker.mockResolvedValue({
+      currentOrigin: "https://dbc-1.cloud.databricks.com",
+      currentServer: "https://accounts.example.com/omnigent?o=1",
+      recentServers: ["https://accounts.example.com/?o=1", "https://accounts.example.com/?o=2"],
+    });
+    renderPicker();
+    // The row names the picked host, not the workspace host sign-in moved to.
+    expect(await screen.findByText("accounts.example.com")).toBeInTheDocument();
+    await openMenu();
+    // Workspace 2 stays a switch target even though it shares the account origin.
+    const items = screen.getAllByRole("menuitem");
+    const other = items.find(
+      (item) =>
+        !item.hasAttribute("data-disabled") &&
+        /accounts\.example\.com/.test(item.textContent ?? ""),
+    );
+    expect(other).toBeDefined();
+    fireEvent.click(other!);
+    await waitFor(() =>
+      expect(switchServer).toHaveBeenCalledWith("https://accounts.example.com/?o=2"),
+    );
+  });
+
+  it("names a recent by the server the user picked for it", async () => {
+    getServerPicker.mockResolvedValue({
+      currentOrigin: "http://localhost:8000",
+      recentServers: ["http://localhost:8000/", "https://dbc-1.cloud.databricks.com/omnigent"],
+      recentLabels: {
+        "https://dbc-1.cloud.databricks.com/omnigent": "https://accounts.example.com/omnigent?o=1",
+      },
+    });
+    renderPicker();
+    await openMenu();
+    expect(screen.queryByText("dbc-1.cloud.databricks.com")).toBeNull();
+    fireEvent.click(await screen.findByText("accounts.example.com"));
+    // The switch still goes to the workspace host, where the sign-in is.
+    await waitFor(() =>
+      expect(switchServer).toHaveBeenCalledWith("https://dbc-1.cloud.databricks.com/omnigent"),
+    );
+  });
+
+  it("folds a recent into the managed server it was reached through", async () => {
+    getServerPicker.mockResolvedValue({
+      currentOrigin: "http://localhost:8000",
+      managedServers: ["https://accounts.example.com/omnigent?o=1"],
+      recentServers: ["http://localhost:8000/", "https://dbc-1.cloud.databricks.com/omnigent"],
+      recentLabels: {
+        "https://dbc-1.cloud.databricks.com/omnigent": "https://accounts.example.com/omnigent?o=1",
+      },
+    });
+    renderPicker();
+    await openMenu();
+    // Listed once, as managed; selecting it switches through the recent's host.
+    expect(screen.getAllByText("accounts.example.com")).toHaveLength(1);
+    fireEvent.click(screen.getByText("accounts.example.com"));
+    await waitFor(() =>
+      expect(switchServer).toHaveBeenCalledWith("https://dbc-1.cloud.databricks.com/omnigent"),
+    );
+  });
+
+  it("names managed servers from the organization's server names", async () => {
+    getServerPicker.mockResolvedValue({
+      currentOrigin: "https://dbc-1.cloud.databricks.com",
+      managedServers: ["https://dbc-1.cloud.databricks.com/?o=1", "https://two.example.com/"],
+      managedServerNames: { "https://dbc-1.cloud.databricks.com/?o=1": "Engineering" },
+      recentServers: [],
+    });
+    renderPicker();
+    // The row names the current, managed server by its name.
+    expect(await screen.findByText("Engineering")).toBeInTheDocument();
+    await openMenu();
+    expect(screen.getAllByText("Engineering").length).toBeGreaterThan(1);
+    // An unnamed one keeps its host.
+    expect(screen.getByText("two.example.com")).toBeInTheDocument();
+  });
+
+  it("doesn't offer the workspace host it moved to as another server", async () => {
+    getServerPicker.mockResolvedValue({
+      currentOrigin: "https://dbc-1.cloud.databricks.com",
+      currentServer: "https://accounts.example.com/omnigent?o=1",
+      managedServers: ["https://dbc-1.cloud.databricks.com/"],
+      recentServers: ["https://accounts.example.com/?o=1"],
+    });
+    renderPicker();
+    await openMenu();
+    const managedRow = screen
+      .getAllByRole("menuitem")
+      .find((item) => /dbc-1\.cloud\.databricks\.com/.test(item.textContent ?? ""));
+    expect(managedRow).toHaveAttribute("data-disabled");
+  });
 });

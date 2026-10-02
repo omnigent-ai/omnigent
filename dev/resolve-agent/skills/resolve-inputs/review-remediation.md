@@ -7,8 +7,8 @@ and candidate-PR discovery instructions below.
    existing head repository and branch. Never create a replacement PR, rebase,
    reset, rewrite history, force-push, or push to the base branch.
 2. Read the PR body, diff, all reviews, inline comments, unresolved threads,
-   current checks, Polly feedback, and recent failed job logs. Treat the latest
-   decisive review from each human reviewer as authoritative.
+   current checks, Polly and OCR feedback, and recent failed job logs. Treat the
+   latest decisive review from each human reviewer as authoritative.
 3. Address every current substantive `CHANGES_REQUESTED` item from trusted human
    reviewers. If a request is ambiguous, contradictory, unsafe, or requires
    product judgment, explain the blocker on the PR and stop.
@@ -18,9 +18,11 @@ and candidate-PR discovery instructions below.
    the workflow-provided push command. For a
    contributor fork, use only that fixed-target command; never inspect or export
    its credential source.
-5. Continue through Step 4.2 and Step 4.3 until current CI is green and Polly has
-   no actionable findings. Diagnose PR-caused failures, rerun clearly transient
-   failures, push conservative fixes, and wait for fresh checks after every push.
+5. Continue through Step 4.2 and Step 4.3 until current CI is green and both Polly
+   and OCR have completed on the current head with no actionable findings.
+   Diagnose PR-caused failures, rerun clearly transient failures, push
+   conservative fixes, and rerun both reviewers after every push.
+   Run the Step 4.3 live gate before a successful handoff.
 6. Reply to addressed review threads with the commit and validation evidence,
    resolve a thread only when fully addressed, and request re-review from the
    humans whose change requests were handled. Never approve, dismiss a human

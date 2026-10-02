@@ -42,6 +42,14 @@ function loadNavigationHarness({
   normalizeServer = (url) => url,
   expandWorkspace = async (url) => url,
   realBrowserRegistry = false,
+  arcaPath = null,
+  arcaResult = { ok: true, alreadyRunning: false },
+  loadServer = async () => {},
+  managedServers = [],
+  internalFeatures = false,
+  cliPath = null,
+  hostConnectResult = { ok: true },
+  managedServerNames = {},
 } = {}) {
   const userData = fs.mkdtempSync(path.join(os.tmpdir(), "omnigent-navigation-test-"));
   if (savedServerUrl) {
@@ -51,7 +59,16 @@ function loadNavigationHarness({
     );
   }
   const listeners = new Map();
-  const calls = { loadFile: [], loadURL: [], auth: [], manifests: [], progress: [], reloads: 0 };
+  const calls = {
+    loadFile: [],
+    loadURL: [],
+    auth: [],
+    manifests: [],
+    progress: [],
+    loading: [],
+    reloads: 0,
+    arcaConnects: [],
+  };
   const pickers = [];
   const ipc = new Map();
   const webRequest = {};
@@ -122,7 +139,7 @@ function loadNavigationHarness({
     },
     loadURL: (...args) => {
       calls.loadURL.push(args);
-      return Promise.resolve();
+      return loadServer(...args);
     },
   };
 
@@ -143,6 +160,7 @@ function loadNavigationHarness({
       isPackaged: false,
       getPath: () => userData,
       setName: () => {},
+      setPath: () => {},
       setBadgeCount: () => true,
       requestSingleInstanceLock: () => true,
       on: (eventName, listener) => appEvents.set(eventName, listener),
@@ -196,6 +214,12 @@ function loadNavigationHarness({
 
   const localRequires = {
     "./desktop_updater": { createDesktopUpdater },
+    "./connection_loading": {
+      createConnectionLoading: () => ({
+        show: (_win, attempt, label) => calls.loading.push({ action: "show", attempt, label }),
+        hide: (_win, attempt) => calls.loading.push({ action: "hide", attempt }),
+      }),
+    },
     "./update_overlay": {
       createUpdateOverlay: () => ({ ensureOverlay: () => {}, registerIpc: () => {} }),
     },
@@ -220,11 +244,29 @@ function loadNavigationHarness({
       },
       PRE_MANIFEST_BASELINE: {},
     },
+    "./managed_preferences": {
+      ...require("../src/managed_preferences"),
+      getManagedServerUrls: () => managedServers,
+      getDatabricksInternalFeaturesEnabled: () => internalFeatures,
+      getManagedServerNames: () => managedServerNames,
+    },
     "./deepLink": {
       parseOmnigentDeepLink: () => null,
       chooseDeepLinkStrategy: () => null,
     },
     "./workspace-chrome": { registerWorkspaceChromeHide: () => {} },
+    // Never probe for or spawn a real arca from tests.
+    "./arca": {
+      ...require("../src/arca"),
+      resolveArcaPath: () => arcaPath,
+      resolveArcaPathAsync: async () => arcaPath,
+      isExecutableFile: (p) => p === arcaPath,
+      startArcaConnect: (url) => {
+        calls.arcaConnects.push(url);
+        const result = typeof arcaResult === "function" ? arcaResult(url) : arcaResult;
+        return { command: "arca ssh", promise: Promise.resolve(result), cancel: () => {} };
+      },
+    },
     "./databricks-session": {
       ensureDatabricksSession: (...args) => {
         calls.auth.push(args);
@@ -274,7 +316,8 @@ function loadNavigationHarness({
     },
     "./omnigent_cli": {
       isExecutableFile: () => false,
-      resolveCliPath: () => null,
+      resolveCliPath: () => (cliPath ? { path: cliPath } : null),
+      cliCommandParts: require("../src/omnigent_cli").cliCommandParts,
       localHostId: () => "host_test",
       getCliStatus: () => ({ installed: false }),
     },
@@ -282,7 +325,7 @@ function loadNavigationHarness({
       shutdown: async () => {},
       onChange: () => {},
       ensureServerAuth: async () => ({ ok: true }),
-      ensureHostConnected: async () => ({ ok: true }),
+      ensureHostConnected: async () => hostConnectResult,
       restartHost: async () => ({ ok: true }),
       disconnectHost: async () => ({ ok: true }),
       startLocalServer: async () => ({ ok: false }),
@@ -354,6 +397,264 @@ function loadNavigationHarness({
     },
   };
 }
+
+describe("Arca auto-connect wiring", () => {
+  const workspace = "https://workspace.cloud.databricks.com/omnigent";
+  const arcaPath = "/usr/local/bin/arca";
+  const tick = () =>
+    new Promise((resolve) => {
+      setImmediate(resolve);
+    });
+  const enableFeature = (h) =>
+    fs.writeFileSync(h.settingsPath, JSON.stringify({ arca_auto_connect: true }));
+
+  it("connects Arca once per launch after loading a managed server", async (t) => {
+    const h = loadNavigationHarness({ serverUrl: workspace, databricksMode: "browser", arcaPath });
+    t.after(h.cleanup);
+    enableFeature(h);
+    await h.api.loadServerUrl(h.win, workspace);
+    await tick();
+    await h.api.loadServerUrl(h.win, workspace);
+    await tick();
+    assert.deepEqual(h.calls.arcaConnects, [workspace]);
+  });
+
+  it("keeps one Arca host for a pick whose sign-in moves to the workspace host", async (t) => {
+    const picked = "https://accounts.cloud.databricks.com/omnigent?o=123";
+    const workspaceOrigin = new URL(workspace).origin;
+    const options = {
+      databricksMode: "browser",
+      arcaPath: "/usr/local/bin/arca",
+      internalFeatures: true,
+      ensureSession: async () => workspaceOrigin,
+    };
+    const h = loadNavigationHarness({ ...options, serverUrl: picked });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    const setupEvent = {
+      sender: h.webContents,
+      senderFrame: { url: `file://${h.api.SETUP_PAGE}` },
+    };
+    // Onboarding connects Arca to the pick, then opens it; sign-in lands on the workspace host.
+    const setupPage = { send() {}, once() {}, removeListener() {}, isDestroyed: () => false };
+    const connected = await h.ipc.get("omnigent:connect-runner")(
+      { sender: setupPage, senderFrame: setupEvent.senderFrame },
+      picked,
+      "remote",
+    );
+    assert.equal(connected.ok, true);
+    assert.equal(JSON.parse(fs.readFileSync(h.settingsPath, "utf8")).arca_auto_connect, true);
+    await h.ipc.get("omnigent:set-server-url")(setupEvent, picked);
+    await tick();
+    assert.deepEqual(h.calls.arcaConnects, [picked]);
+
+    // Next launch opens the saved workspace host, and Arca still targets the pick.
+    const relaunched = loadNavigationHarness({ ...options, serverUrl: workspace });
+    t.after(relaunched.cleanup);
+    fs.copyFileSync(h.settingsPath, relaunched.settingsPath);
+    await relaunched.api.loadServerUrl(relaunched.win, workspace);
+    await tick();
+    assert.deepEqual(relaunched.calls.arcaConnects, [picked]);
+
+    // Connecting to the workspace host itself targets the host that was typed.
+    await h.ipc.get("omnigent:set-server-url")(setupEvent, workspace);
+    await tick();
+    assert.deepEqual(h.calls.arcaConnects, [picked, workspace]);
+  });
+
+  describe("onboarding connect", () => {
+    const setupFrame = (h) => ({ url: `file://${h.api.SETUP_PAGE}` });
+    // A setup page that closes after `openChecks` isDestroyed() checks.
+    const setupPage = (openChecks = Infinity) => {
+      let checks = 0;
+      return {
+        send() {},
+        once() {},
+        removeListener() {},
+        isDestroyed: () => ++checks > openChecks,
+      };
+    };
+    const saved = (h) =>
+      fs.existsSync(h.settingsPath) ? JSON.parse(fs.readFileSync(h.settingsPath, "utf8")) : {};
+    function harness(t, options = {}) {
+      const h = loadNavigationHarness({
+        serverUrl: workspace,
+        arcaPath,
+        internalFeatures: true,
+        ...options,
+      });
+      t.after(h.cleanup);
+      h.api.registerIpc();
+      return h;
+    }
+    const connect = (h, url = workspace, page = setupPage()) =>
+      h.ipc.get("omnigent:connect-runner")(
+        { sender: page, senderFrame: setupFrame(h) },
+        url,
+        "remote",
+      );
+    const failed = { ok: false, errorKind: "timeout", error: "timed out" };
+
+    it("keeps the auto-connect opt-in only when the connect succeeds", async (t) => {
+      const ok = harness(t);
+      assert.equal((await connect(ok)).ok, true);
+      assert.equal(saved(ok).arca_auto_connect, true);
+      for (const previous of [undefined, false, true]) {
+        const h = harness(t, { arcaResult: failed });
+        if (previous !== undefined) {
+          fs.writeFileSync(h.settingsPath, JSON.stringify({ arca_auto_connect: previous }));
+        }
+        // oxlint-disable-next-line no-await-in-loop -- Each case is its own app.
+        assert.equal((await connect(h)).ok, false);
+        assert.equal(saved(h).arca_auto_connect, previous);
+      }
+    });
+
+    it("retries a failed run on the next attempt", async (t) => {
+      let attempts = 0;
+      const h = harness(t, { arcaResult: () => (++attempts === 1 ? failed : { ok: true }) });
+      assert.equal((await connect(h)).ok, false);
+      assert.equal((await connect(h)).ok, true);
+      assert.equal(h.calls.arcaConnects.length, 2);
+    });
+
+    it("starts nothing when setup closes while arca is being looked up", async (t) => {
+      const h = harness(t);
+      // Open at the check after URL resolution, closed at the one after the lookup.
+      const result = await connect(h, workspace, setupPage(1));
+      assert.equal(result.canceled, true);
+      assert.deepEqual(h.calls.arcaConnects, []);
+      assert.equal(saved(h).arca_auto_connect, undefined);
+    });
+
+    it("never undoes another window's successful opt-in", async (t) => {
+      const other = "https://other.cloud.databricks.com/omnigent";
+      const finish = new Map();
+      const h = harness(t, {
+        arcaResult: (url) =>
+          new Promise((resolve) => {
+            finish.set(url, resolve);
+          }),
+      });
+      const failing = connect(h, workspace);
+      const succeeding = connect(h, other);
+      for (let i = 0; i < 100 && finish.size < 2; i++) {
+        // oxlint-disable-next-line no-await-in-loop -- Wait for both runs to start.
+        await tick();
+      }
+      finish.get(other)({ ok: true });
+      assert.equal((await succeeding).ok, true);
+      finish.get(workspace)(failed);
+      assert.equal((await failing).ok, false);
+      assert.equal(saved(h).arca_auto_connect, true);
+    });
+
+    it("restores the preference when overlapping attempts all fail", async (t) => {
+      let finishRun;
+      const h = harness(t, {
+        arcaResult: () =>
+          new Promise((resolve) => {
+            finishRun = resolve;
+          }),
+      });
+      // Two setup windows connect the same server; they share one run.
+      const first = connect(h);
+      const second = connect(h);
+      for (let i = 0; i < 20; i++) {
+        // oxlint-disable-next-line no-await-in-loop -- Let both attempts join the run.
+        await tick();
+      }
+      finishRun(failed);
+      assert.equal((await first).ok, false);
+      assert.equal((await second).ok, false);
+      assert.equal(h.calls.arcaConnects.length, 1);
+      assert.equal(saved(h).arca_auto_connect, undefined);
+    });
+
+    it("lets a started run finish, and keep the opt-in, after setup closes", async (t) => {
+      let finishRun;
+      const h = harness(t, {
+        arcaResult: () =>
+          new Promise((resolve) => {
+            finishRun = resolve;
+          }),
+      });
+      let closed = false;
+      const page = { send() {}, once() {}, removeListener() {}, isDestroyed: () => closed };
+      const attempt = connect(h, workspace, page);
+      for (let i = 0; i < 100 && h.calls.arcaConnects.length === 0; i++) {
+        // oxlint-disable-next-line no-await-in-loop -- Wait for the run to start.
+        await tick();
+      }
+      closed = true;
+      finishRun({ ok: true });
+      const result = await attempt;
+      assert.equal(result.ok, true);
+      assert.equal(result.canceled, undefined);
+      assert.equal(saved(h).arca_auto_connect, true);
+    });
+
+    it("keeps the manual connect on Databricks servers, even through a hand-edited label", async (t) => {
+      const h = harness(t);
+      fs.writeFileSync(
+        h.settingsPath,
+        JSON.stringify({
+          arca_auto_connect: true,
+          server_labels: { [new URL(workspace).origin]: "https://evil.example/" },
+        }),
+      );
+      await h.api.loadServerUrl(h.win, workspace);
+      await tick();
+      const result = await h.ipc.get("omnigent:arca-connect")({
+        sender: h.webContents,
+        senderFrame: { url: workspace },
+      });
+      assert.match(result.error, /Databricks-managed servers/);
+      assert.deepEqual(h.calls.arcaConnects, []);
+    });
+  });
+
+  it("stays off without the feature flag, even with arca installed", async (t) => {
+    const h = loadNavigationHarness({ serverUrl: workspace, databricksMode: "browser", arcaPath });
+    t.after(h.cleanup);
+    await h.api.loadServerUrl(h.win, workspace);
+    await tick();
+    assert.deepEqual(h.calls.arcaConnects, []);
+  });
+
+  it("turns on with OMNIGENT_ARCA_AUTO_CONNECT=1", async (t) => {
+    process.env.OMNIGENT_ARCA_AUTO_CONNECT = "1";
+    let h;
+    try {
+      h = loadNavigationHarness({ serverUrl: workspace, databricksMode: "browser", arcaPath });
+    } finally {
+      delete process.env.OMNIGENT_ARCA_AUTO_CONNECT;
+    }
+    t.after(h.cleanup);
+    await h.api.loadServerUrl(h.win, workspace);
+    await tick();
+    assert.deepEqual(h.calls.arcaConnects, [workspace]);
+  });
+
+  it("doesn't try without an installed arca CLI", async (t) => {
+    const h = loadNavigationHarness({ serverUrl: workspace, databricksMode: "browser" });
+    t.after(h.cleanup);
+    enableFeature(h);
+    await h.api.loadServerUrl(h.win, workspace);
+    await tick();
+    assert.deepEqual(h.calls.arcaConnects, []);
+  });
+
+  it("skips servers that aren't Databricks-managed", async (t) => {
+    const local = "http://localhost:6767";
+    const h = loadNavigationHarness({ serverUrl: local, arcaPath });
+    t.after(h.cleanup);
+    enableFeature(h);
+    await h.api.loadServerUrl(h.win, local);
+    await tick();
+    assert.deepEqual(h.calls.arcaConnects, []);
+  });
+});
 
 describe("Databricks auth mode wiring", () => {
   const workspace = "https://workspace.cloud.databricks.com/omnigent";
@@ -588,6 +889,116 @@ describe("Databricks auth mode wiring", () => {
     await tick();
     assert.equal(h.calls.auth.length, 2);
     assert.equal(h.calls.auth[1][2].interactive, false);
+  });
+
+  describe("server labels", () => {
+    const picked = "https://accounts.cloud.databricks.com/omnigent?o=123";
+    const pickedListed = "https://accounts.cloud.databricks.com/?o=123";
+    const workspaceOrigin = new URL(workspace).origin;
+    const setupEvent = (h) => ({
+      sender: h.webContents,
+      senderFrame: { url: `file://${h.api.SETUP_PAGE}` },
+    });
+    const pageEvent = (h) => ({ sender: h.webContents, senderFrame: { url: workspace } });
+    const saved = (h) => JSON.parse(fs.readFileSync(h.settingsPath, "utf8"));
+    // main.js runs in its own VM context: compare its values structurally.
+    const plain = (value) => JSON.parse(JSON.stringify(value));
+
+    // Sign-in at an account-level URL lands on the workspace's own host.
+    async function joinThroughAccount(t, options = {}) {
+      const h = loadNavigationHarness({
+        serverUrl: picked,
+        databricksMode: "browser",
+        ensureSession: async () => workspaceOrigin,
+        ...options,
+      });
+      t.after(h.cleanup);
+      h.api.registerIpc();
+      await h.ipc.get("omnigent:set-server-url")(setupEvent(h), picked);
+      h.setUrl(workspace);
+      return h;
+    }
+
+    it("keeps the workspace URL for sign-in, and shows the pick", async (t) => {
+      const h = await joinThroughAccount(t);
+      assert.equal(saved(h).server_url, workspace);
+      assert.deepEqual(saved(h).recent_servers, [workspace]);
+      assert.deepEqual(saved(h).server_labels, { [workspaceOrigin]: picked });
+      assert.deepEqual(plain(await h.ipc.get("omnigent:get-recent-servers")(setupEvent(h))), [
+        pickedListed,
+      ]);
+      assert.equal(await h.ipc.get("omnigent:get-server-url")(setupEvent(h)), picked);
+      const picker = plain(await h.ipc.get("omnigent:get-server-picker")(pageEvent(h)));
+      assert.equal(picker.currentOrigin, workspaceOrigin);
+      assert.equal(picker.currentServer, picked);
+      assert.deepEqual(picker.recentServers, [workspace]);
+      assert.deepEqual(picker.recentLabels, { [workspace]: picked });
+    });
+
+    it("folds the workspace into the organization's server on the setup page", async (t) => {
+      const h = await joinThroughAccount(t, { managedServers: [picked] });
+      assert.deepEqual(plain(await h.ipc.get("omnigent:get-recent-servers")(setupEvent(h))), []);
+    });
+
+    it("lists the workspace once when the organization provides the workspace URL itself", async (t) => {
+      const h = await joinThroughAccount(t, { managedServers: [`${workspaceOrigin}/`] });
+      assert.deepEqual(plain(await h.ipc.get("omnigent:get-recent-servers")(setupEvent(h))), []);
+    });
+
+    it("forgets without adding labels to settings that had none", async (t) => {
+      const h = loadNavigationHarness();
+      t.after(h.cleanup);
+      h.api.registerIpc();
+      fs.writeFileSync(
+        h.settingsPath,
+        JSON.stringify({ recent_servers: ["https://a.example.com/", "https://b.example.com/"] }),
+      );
+      await h.ipc.get("omnigent:forget-recent-server")(setupEvent(h), "https://a.example.com/");
+      assert.deepEqual(saved(h), { recent_servers: ["https://b.example.com/"] });
+    });
+
+    it("keeps the workspace listed next to another workspace on the same account host", async (t) => {
+      const h = await joinThroughAccount(t, {
+        managedServers: ["https://accounts.cloud.databricks.com/?o=456"],
+      });
+      assert.deepEqual(plain(await h.ipc.get("omnigent:get-recent-servers")(setupEvent(h))), [
+        pickedListed,
+      ]);
+    });
+
+    it("forgets the workspace through the pick it's listed as", async (t) => {
+      const h = await joinThroughAccount(t);
+      const remaining = await h.ipc.get("omnigent:forget-recent-server")(
+        setupEvent(h),
+        pickedListed,
+      );
+      assert.deepEqual(plain(remaining), []);
+      assert.deepEqual(saved(h).recent_servers, []);
+      assert.deepEqual(saved(h).server_labels, {});
+    });
+
+    it("drops the label when the workspace host is picked directly", async (t) => {
+      const h = await joinThroughAccount(t);
+      await h.ipc.get("omnigent:set-server-url")(setupEvent(h), workspace);
+      assert.deepEqual(saved(h).server_labels, {});
+      assert.deepEqual(plain(await h.ipc.get("omnigent:get-recent-servers")(setupEvent(h))), [
+        `${workspaceOrigin}/`,
+      ]);
+    });
+
+    it("records no label when the connect fails", async (t) => {
+      const h = loadNavigationHarness({
+        serverUrl: picked,
+        databricksMode: "browser",
+        ensureSession: async () => {
+          throw new Error("sign-in failed");
+        },
+      });
+      t.after(h.cleanup);
+      h.api.registerIpc();
+      await assert.rejects(h.ipc.get("omnigent:set-server-url")(setupEvent(h), picked));
+      assert.equal(saved(h).server_labels, undefined);
+    });
   });
 
   it("fetches the selected workspace's manifest after an account-first login", async (t) => {
@@ -864,28 +1275,27 @@ describe("managed server preference wiring", () => {
     );
   });
 
-  it("wires the onboarding connect's remote gate, cancel-on-close, and sign-in order", () => {
+  it("wires the onboarding connect to the page, and signs in before connecting a laptop", () => {
     assert.match(
       preloadSource,
       /connectRunner:\s*\(url, runner\)\s*=>\s*ipcRenderer\.invoke\("omnigent:connect-runner",\s*url,\s*runner\)/,
     );
-    // The harness can't observe these (its arca and host stubs are fixed), so
-    // they stay source checks; the gates and cancellation are exercised below.
+    // The harness's host stubs can't observe this order; the remote path's
+    // gates, opt-in and cancellation are exercised through the harness.
     const start = liveCode.indexOf('ipcMain.handle("omnigent:connect-runner"');
     const end = liveCode.indexOf('ipcMain.handle("omnigent:copy-setup-text"');
     assert.ok(start >= 0 && end > start, "connect-runner handler not found before copy-setup-text");
     const handler = liveCode.slice(start, end);
     assert.match(
       handler,
-      /runner === "remote"[\s\S]{0,80}!databricksInternalFeaturesEnabled\(\) \|\| !isDatabricksManagedServerUrl\(target\)[\s\S]{0,200}arca\.startArcaConnect\(target/,
+      /hostCliCommand\(target\)[\s\S]{0,500}serverManager\.ensureServerAuth\(cliCommand, target,[\s\S]{0,300}serverManager\.ensureHostConnected\(cliCommand, target\)/,
     );
+  });
+
+  it("exposes the onboarding runner handoff to the page", () => {
     assert.match(
-      handler,
-      /event\.sender\.once\("destroyed", cancel\);\s*const result = await run\.promise;\s*event\.sender\.removeListener\("destroyed", cancel\);/,
-    );
-    assert.match(
-      handler,
-      /hostCliCommand\(target\)[\s\S]{0,500}serverManager\.ensureServerAuth\(cliCommand, target\)[\s\S]{0,150}serverManager\.ensureHostConnected\(cliCommand, target\)/,
+      preloadSource,
+      /takeOnboardingRunner:\s*\(\)\s*=>\s*ipcRenderer\.invoke\("omnigent:take-onboarding-runner"\)/,
     );
   });
 
@@ -901,10 +1311,48 @@ describe("managed server preference wiring", () => {
   });
 
   it("returns managed choices in the connected-server picker", () => {
-    assert.match(
-      liveCode,
-      /ipcMain\.handle\("omnigent:get-server-picker"[\s\S]{0,500}managedServers[\s\S]{0,100}recentServers:\s*recents/,
-    );
+    const managed = "https://managed.example.com/";
+    const h = loadNavigationHarness({
+      serverUrl: "https://host.example/",
+      managedServers: [managed],
+      managedServerNames: { [managed]: "Team" },
+    });
+    try {
+      h.api.registerIpc();
+      fs.writeFileSync(
+        h.settingsPath,
+        JSON.stringify({ recent_servers: ["https://host.example/", `${managed}omnigent`] }),
+      );
+      const picker = h.ipc.get("omnigent:get-server-picker")({
+        sender: h.webContents,
+        senderFrame: { url: "https://host.example/" },
+      });
+      // JSON round trip: the handler's arrays come from the harness's VM realm.
+      const plain = JSON.parse(JSON.stringify(picker));
+      assert.deepEqual(plain.managedServers, [managed]);
+      assert.deepEqual(plain.managedServerNames, { [managed]: "Team" });
+      // A recent the organization already provides is listed once, as managed.
+      assert.deepEqual(plain.recentServers, ["https://host.example/"]);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it("serves managed server names to the setup page only", () => {
+    const managed = "https://managed.example.com/";
+    const h = loadNavigationHarness({ managedServerNames: { [managed]: "Team" } });
+    try {
+      h.api.registerIpc();
+      const names = h.ipc.get("omnigent:get-managed-server-names");
+      const setup = { sender: h.webContents, senderFrame: { url: `file://${h.api.SETUP_PAGE}` } };
+      assert.deepEqual(JSON.parse(JSON.stringify(names(setup))), { [managed]: "Team" });
+      assert.throws(
+        () => names({ sender: h.webContents, senderFrame: { url: "https://host.example/" } }),
+        /only available to the setup page/,
+      );
+    } finally {
+      h.cleanup();
+    }
   });
 
   it("allows switching only to a recent or currently managed target", () => {
@@ -1298,10 +1746,28 @@ describe("recent-server startup wiring (src/main.js)", () => {
   });
 
   it("normalizes persisted targets and excludes managed origins from setup recents", () => {
-    assert.match(
-      liveCode,
-      /ipcMain\.handle\("omnigent:get-recent-servers"[\s\S]{0,400}excludingManagedServers\(\s*normalizeRecentServers\(loadSettings\(\)\.recent_servers\),\s*managed/,
-    );
+    const h = loadNavigationHarness({ managedServers: ["https://managed.example.com/"] });
+    try {
+      h.api.registerIpc();
+      fs.writeFileSync(
+        h.settingsPath,
+        JSON.stringify({
+          recent_servers: [
+            "https://host.example/omnigent",
+            "https://host.example/",
+            "https://managed.example.com/omnigent",
+          ],
+        }),
+      );
+      const recents = h.ipc.get("omnigent:get-recent-servers")({
+        sender: h.webContents,
+        senderFrame: { url: `file://${h.api.SETUP_PAGE}` },
+      });
+      // JSON round trip: the handler's arrays come from the harness's VM realm.
+      assert.deepEqual(JSON.parse(JSON.stringify(recents)), ["https://host.example/"]);
+    } finally {
+      h.cleanup();
+    }
   });
 
   it("counts MDM presets toward the setup page's returning-user signal", () => {
@@ -1315,7 +1781,7 @@ describe("recent-server startup wiring (src/main.js)", () => {
   it("reports the local server as running only when start-local would reuse it", () => {
     assert.match(
       liveCode,
-      /ipcMain\.handle\("omnigent:get-cli-status"[\s\S]{0,900}localServerRunning:\s*\(await omnigentCli\.localServerHealthy\(\)\) !== null/,
+      /ipcMain\.handle\("omnigent:get-cli-status"[\s\S]{0,300}Promise\.all\(\[[\s\S]{0,120}omnigentCli\.localServerHealthy\(\),[\s\S]{0,600}localServerRunning:\s*localUrl !== null/,
     );
   });
 });
@@ -1677,6 +2143,42 @@ describe("onboarding runner IPC", () => {
     assert.match(result.error, /omnigent CLI was not found/);
   });
 
+  // Remote runs on a managed server behind the internal flag; local uses a laptop CLI.
+  const managedServer = "https://workspace.cloud.databricks.com/omnigent";
+  const connectCases = [
+    [
+      "remote",
+      managedServer,
+      { internalFeatures: true, arcaPath: "/usr/local/bin/arca" },
+      (ok) => ({ arcaResult: { ok } }),
+    ],
+    [
+      "local",
+      server,
+      { cliPath: "/usr/local/bin/omnigent" },
+      (ok) => ({ hostConnectResult: { ok } }),
+    ],
+  ];
+  for (const [runner, url, options, result] of connectCases) {
+    it(`records a ${runner} runner only after its connect succeeds`, async (t) => {
+      const recorded = (h) => JSON.parse(fs.readFileSync(h.settingsPath, "utf8")).onboarding_runner;
+      const failed = harness(t, { ...options, ...result(false) });
+      const event = (h) => ({ sender: setupSender(), senderFrame: setupFrame(h) });
+      assert.equal(
+        (await failed.ipc.get("omnigent:connect-runner")(event(failed), url, runner)).ok,
+        false,
+      );
+      assert.equal(fs.existsSync(failed.settingsPath) ? recorded(failed) : undefined, undefined);
+      const connected = harness(t, { ...options, ...result(true) });
+      assert.equal(
+        (await connected.ipc.get("omnigent:connect-runner")(event(connected), url, runner)).ok,
+        true,
+      );
+      assert.equal(recorded(connected).runner, runner);
+      assert.equal(recorded(connected).origin, new URL(url).origin);
+    });
+  }
+
   for (const runner of ["local", "remote"]) {
     it(`starts nothing for a ${runner} runner once setup closes during URL resolution`, async (t) => {
       let resolveTarget;
@@ -1697,4 +2199,83 @@ describe("onboarding runner IPC", () => {
       assert.deepEqual(plain(await pending), { ok: false, canceled: true });
     });
   }
+
+  describe("handing the runner to the server page", () => {
+    const pageEvent = (h) => ({ sender: h.webContents, senderFrame: { url: server } });
+    const settings = (h) => JSON.parse(fs.readFileSync(h.settingsPath, "utf8"));
+    const record = (h, entry) =>
+      fs.writeFileSync(h.settingsPath, JSON.stringify({ onboarding_runner: entry }));
+
+    it("hands a fresh choice to its own server once", (t) => {
+      const h = harness(t);
+      record(h, { origin: new URL(server).origin, runner: "remote", at: Date.now() });
+      const take = h.ipc.get("omnigent:take-onboarding-runner");
+      assert.equal(take(pageEvent(h)), "remote");
+      assert.equal(settings(h).onboarding_runner, undefined);
+      assert.equal(take(pageEvent(h)), null);
+    });
+
+    it("keeps another server's choice, and drops a stale one", (t) => {
+      const h = harness(t);
+      const take = h.ipc.get("omnigent:take-onboarding-runner");
+      record(h, { origin: "https://other.example", runner: "local", at: Date.now() });
+      assert.equal(take(pageEvent(h)), null);
+      assert.equal(settings(h).onboarding_runner.origin, "https://other.example");
+
+      record(h, {
+        origin: new URL(server).origin,
+        runner: "local",
+        at: Date.now() - 60 * 60 * 1000,
+      });
+      assert.equal(take(pageEvent(h)), null);
+      assert.equal(settings(h).onboarding_runner, undefined);
+    });
+  });
+});
+
+it("keeps native feedback through cold authentication and the server document load", async (t) => {
+  const tick = () =>
+    new Promise((resolve) => {
+      setImmediate(resolve);
+    });
+  let finishAuth, finishLoad;
+  const auth = new Promise((resolve) => {
+    finishAuth = resolve;
+  });
+  const load = new Promise((resolve) => {
+    finishLoad = resolve;
+  });
+  const target = "https://workspace.cloud.databricks.com/omnigent";
+  const h = loadNavigationHarness({
+    serverUrl: target,
+    databricksMode: "browser",
+    ensureSession: () => auth,
+    loadServer: () => load,
+  });
+  t.after(h.cleanup);
+  const pending = h.api.loadServerUrl(h.win, target);
+  await tick();
+  assert.equal(h.calls.loading.at(-1).label, "Signing in…");
+  assert.equal(h.calls.loadURL.length, 0);
+  finishAuth(new URL(target).origin);
+  await tick();
+  assert.equal(h.calls.loading.at(-1).label, "Opening Omnigent…");
+  assert.equal(h.calls.loadURL.length, 1);
+  const attempt = h.calls.loading.at(-1).attempt;
+  finishLoad();
+  await pending;
+  assert.deepEqual(h.calls.loading.at(-1), { action: "hide", attempt });
+});
+
+it("dismisses native loading feedback when the server document fails", async (t) => {
+  const h = loadNavigationHarness({
+    loadServer: async () => {
+      throw new Error("connection lost");
+    },
+  });
+  t.after(h.cleanup);
+  await assert.rejects(h.api.loadServerUrl(h.win, "https://example.com/"), /connection lost/);
+  const shown = h.calls.loading.find((call) => call.action === "show");
+  assert.equal(shown.label, "Opening Omnigent…");
+  assert.deepEqual(h.calls.loading.at(-1), { action: "hide", attempt: shown.attempt });
 });

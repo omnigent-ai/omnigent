@@ -412,6 +412,30 @@ describe("BlockRenderer dispatch", () => {
     expect(sections[1]!.querySelector("em")).toHaveTextContent("streaming");
   });
 
+  it("shows a non-persisted interruption notice only for a live native preview", () => {
+    const view = (item: RenderItem) => (
+      <FileViewerContext.Provider value={FILE_VIEWER_NOOP}>
+        <BlockRenderer items={[item]} sessionStatus="running" />
+      </FileViewerContext.Provider>
+    );
+    const { rerender } = render(
+      view({
+        kind: "text",
+        itemId: "live:m1",
+        text: "Earlier text",
+        final: true,
+        previewInterrupted: true,
+      }),
+    );
+    expect(screen.getByRole("status")).toHaveTextContent(
+      "Live output interrupted. Full response will appear when complete.",
+    );
+    expect(screen.getByTestId("assistant-text-section")).toHaveTextContent("Earlier text");
+
+    rerender(view({ kind: "text", itemId: "ci_1", text: "Complete answer", final: true }));
+    expect(screen.queryByTestId("stream-interruption-notice")).toBeNull();
+  });
+
   it("adds subtle separation between adjacent assistant text items", async () => {
     const items: RenderItem[] = [
       { kind: "text", itemId: "t1", text: "First message.", final: true },

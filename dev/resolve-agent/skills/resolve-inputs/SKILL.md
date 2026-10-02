@@ -103,7 +103,7 @@ Do all of this before Step 1:
    it is not a resolution failure. When `public` is absent or false (the default),
    skip this — do not call `sys_session_share`.
 2. **Recover the handoff** (above): the verdict, `facets`, `journey`, `bug_url`,
-   and the e2e test's content at `test_path`. In ticket-only mode there is no
+   and the reproduction test's content at `test_path`. In ticket-only mode there is no
    handoff: read the ticket instead, as "Ticket-only mode" describes.
    - **If the input carried a `bug_url`, that is the bug — authoritative.** Use
      the run only to recover the test/verdict/facets/journey. Cross-check: the

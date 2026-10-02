@@ -477,6 +477,8 @@ def _claude_import_item_data(item: ClaudeTranscriptItem) -> dict[str, object]:
     data = item.data
     if item.is_compact_summary and isinstance(data, dict) and not data.get("is_meta"):
         return {**data, "is_meta": True}
+    if item.agent_message_candidate and not data.get("user_authored"):
+        return {**data, "is_meta": True}
     return data
 
 
@@ -498,6 +500,7 @@ def load_claude_session(
         0,
         start_line=0,
         agent_name="claude-native-ui",
+        legacy_agent_messages=True,
     )
     # A large transcript has almost certainly compacted; import only what the
     # agent would still see (from the last compaction boundary). See

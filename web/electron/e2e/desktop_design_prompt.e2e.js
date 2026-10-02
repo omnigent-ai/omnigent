@@ -164,7 +164,8 @@ describe(
         if (await expand.isVisible()) await expand.click();
         const sidebar = window.getByRole("button", { name: "Close sidebar", exact: true });
         if (await sidebar.isVisible()) await sidebar.click();
-        await window.getByRole("tab", { name: "Browser", exact: true }).click();
+        await window.getByRole("button", { name: "Open new", exact: true }).click();
+        await window.getByRole("menuitem", { name: "Browser", exact: true }).click();
         if (process.env.OMNIGENT_DESKTOP_COMPOSITED_VIDEO === "1") {
           const resize = window.getByRole("separator", { name: "Resize panel", exact: true });
           for (let step = 0; step < 10; step += 1) {

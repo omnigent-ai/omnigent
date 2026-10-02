@@ -31,9 +31,21 @@ import { SetupTerminalStep } from "@/pages/onboarding/SetupTerminalStep";
 
 /**
  * Outcome of a connect attempt. `error` → the connect was rejected and the
- * message should be shown; otherwise navigation is underway.
+ * message should be shown; `cancelled` → the user backed out (Cancel, or closed
+ * the workspace picker); otherwise navigation is underway.
  */
 export interface ConnectResult {
+  error?: string;
+  cancelled?: boolean;
+}
+
+/** What an in-flight connect is waiting on: browser sign-in, or the server page. */
+export type ConnectPhase = "connecting" | "authenticating";
+
+/** An in-flight connect as the steps show it: its phase (or a pending Cancel),
+ *  and why a Cancel didn't take. */
+export interface ConnectProgress {
+  phase: ConnectPhase | "cancelling";
   error?: string;
 }
 
@@ -50,6 +62,8 @@ export interface ServerSelectorV2Setup {
   recentServers: string[];
   /** Organization-provided server URLs. */
   managedServers: string[];
+  /** Display names for managed servers, server URL → name (from the MDM URL). */
+  managedServerNames?: Record<string, string>;
   /** Whether the `omnigent` CLI is already installed. Drives the "Install" vs
    *  "Start"/"Open" action label and whether install runs first. */
   installed?: boolean;
@@ -65,8 +79,11 @@ export interface ServerSelectorV2Setup {
   mockInstall?: boolean;
   /** Persist + navigate to a server URL. Resolves `{error}` when the connect
    *  was rejected — so the step can show it rather than silently doing nothing.
-   *  Navigation on success replaces this page. */
-  onConnect: (url: string) => Promise<ConnectResult>;
+   *  Navigation on success replaces this page. `onPhase` reports progress. */
+  onConnect: (url: string, onPhase?: (phase: ConnectPhase) => void) => Promise<ConnectResult>;
+  /** Cancel the in-flight onConnect. Resolves whether the shell cancelled it
+   *  (onConnect then resolves `{cancelled}`); false → it's already finishing. */
+  onCancelConnect?: () => Promise<boolean>;
   /** Start (or reuse) the local server, then connect to it. Resolves the
    *  outcome so the terminal step can show ready/failed (on success the window
    *  navigates away, so it resolves only on failure in practice). */
@@ -183,6 +200,43 @@ export function ServerSelectorV2({ setup }: { setup: ServerSelectorV2Setup }) {
   const needsInstall =
     setup.mockInstall === true || (setup.installed === false && setup.onInstallCli != null);
 
+  // The shell's progress on an in-flight onConnect (null when idle), shown by
+  // whichever step started it so a long browser sign-in never looks frozen.
+  const [connection, setConnection] = useState<ConnectProgress | null>(null);
+  // One connect at a time: a second would supersede the first in the shell.
+  const connecting = useRef(false);
+  // The shell's latest phase, restored when a Cancel doesn't take.
+  const shellPhase = useRef<ConnectPhase>("connecting");
+  const connectToServer = async (url: string): Promise<ConnectResult> => {
+    if (connecting.current) return { cancelled: true };
+    connecting.current = true;
+    shellPhase.current = "connecting";
+    setConnection({ phase: "connecting" });
+    try {
+      return await setup.onConnect(url, (phase) => {
+        shellPhase.current = phase;
+        setConnection((c) => (c && c.phase !== "cancelling" ? { ...c, phase } : c));
+      });
+    } finally {
+      connecting.current = false;
+      setConnection(null);
+    }
+  };
+  // Cancel shows "Cancelling…" until the shell confirms; a refusal (the connect
+  // is already finishing) or failure restores the phase with the reason.
+  const cancelConnect = setup.onCancelConnect
+    ? async () => {
+        setConnection((c) => c && { phase: "cancelling" });
+        let error = "The connection is still finishing. Please try again.";
+        try {
+          if (await setup.onCancelConnect?.()) return;
+        } catch (e) {
+          error = e instanceof Error ? e.message : "Could not cancel the connection.";
+        }
+        setConnection((c) => c && { phase: shellPhase.current, error });
+      }
+    : undefined;
+
   // A server pick (list Join / runner step): install-then-connect when the CLI
   // is missing (route via terminal), else connect straight away. Resolves the
   // ConnectResult so the list can still show a connect error when connecting
@@ -199,7 +253,7 @@ export function ServerSelectorV2({ setup }: { setup: ServerSelectorV2Setup }) {
       setStep("terminal");
       return {};
     }
-    return setup.onConnect(url);
+    return connectToServer(url);
   };
   // MDM landing: a new user picks a runner first; a returning user just opens it.
   const joinFromLanding = async (url: string) => {
@@ -208,9 +262,11 @@ export function ServerSelectorV2({ setup }: { setup: ServerSelectorV2Setup }) {
     const result = await connect(url, "landing");
     if (result.error) setLandingError(result.error);
   };
-  // Connect from the terminal: success navigates away, a rejection shows there.
+  // Connect from the terminal: success navigates away, a rejection or cancel
+  // shows there (with Retry/Back) instead of a "ready" that never opens.
   const connectInTerminal = async (url: string) => {
-    const result = await setup.onConnect(url);
+    const result = await connectToServer(url);
+    if (result.cancelled) return { ok: false, error: "Connection cancelled." };
     return { ok: result.error === undefined, error: result.error };
   };
   // Checked at run time (Retry re-checks): a picked local install that's up opens
@@ -312,8 +368,11 @@ export function ServerSelectorV2({ setup }: { setup: ServerSelectorV2Setup }) {
         {step === "landing" && (
           <LandingStep
             managedServers={setup.managedServers}
+            managedServerNames={setup.managedServerNames}
             recentServers={setup.recentServers}
             error={landingError}
+            connection={connection}
+            onCancelConnect={cancelConnect}
             onGetStarted={() => setStep("local")}
             onJoinServer={() => setStep("server")}
             onJoinManaged={joinFromLanding}
@@ -334,8 +393,11 @@ export function ServerSelectorV2({ setup }: { setup: ServerSelectorV2Setup }) {
         {step === "runner" && runnerTarget !== null && (
           <RunnerStep
             remoteAvailable={runnerTarget.remote}
-            installed={setup.installed}
+            // A bundled host CLI skips the install, so the action only opens.
+            installed={setup.installed || runnerTarget.bundledCli}
             error={runnerError}
+            connection={connection}
+            onCancelConnect={cancelConnect}
             onBack={() => setStep("landing")}
             onInstall={async (runner) => {
               if (!setup.onConnectRunner) {
@@ -365,6 +427,8 @@ export function ServerSelectorV2({ setup }: { setup: ServerSelectorV2Setup }) {
             onBack={() => setStep(terminalTarget.back)}
             runningLabel={terminalCopy.label}
             runningHint={terminalCopy.hint}
+            connection={connection}
+            onCancelConnect={cancelConnect}
           />
         )}
         {step === "server" && (
@@ -376,6 +440,8 @@ export function ServerSelectorV2({ setup }: { setup: ServerSelectorV2Setup }) {
             installed={setup.installed}
             onBack={() => setStep("landing")}
             onConnect={connect}
+            connection={connection}
+            onCancelConnect={cancelConnect}
             onRemove={setup.onRemoveServer}
             onCopy={setup.onCopy}
             onCheckServer={setup.onCheckServer}

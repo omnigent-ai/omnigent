@@ -267,6 +267,57 @@ class _ScriptedRunnerClient:
         return _ScriptedStreamResponse(self._release, self._events)
 
 
+@pytest.mark.parametrize("outcome", ["completed", "failed", "cancelled"])
+@pytest.mark.asyncio
+async def test_subagent_activity_waits_for_final_idle_after_buffered_turns(
+    db_uri: str, outcome: str
+) -> None:
+    from omnigent.server.routes._sessions.orchestration import _relay_runner_stream_once
+
+    store = SqlAlchemyConversationStore(db_uri)
+    parent = store.create_conversation()
+    child = store.create_conversation(
+        parent_conversation_id=parent.id, title="researcher:Auth audit"
+    )
+    release = asyncio.Event()
+    release.set()
+    parent_events = [
+        {"type": "response.in_progress", "response": {"id": "parent-turn", "model": "test"}},
+        {"type": "response.output_text.delta", "delta": "I will ask a researcher."},
+        {"type": "session.created", "child_session_id": child.id},
+        {"type": "session.created", "child_session_id": child.id},
+    ]
+    await _relay_runner_stream_once(
+        parent.id,
+        _ScriptedRunnerClient(release, parent_events),
+        store,  # type: ignore[arg-type]
+    )
+    initial = store.list_items(parent.id).data
+    assert [item.type for item in initial] == ["message", "resource_event"]
+    assert initial[1].data.resource == {"title": "Auth audit"}
+
+    child_events = [
+        {"type": "response.in_progress", "response": {"id": "first", "model": "test"}},
+        {"type": "response.completed", "response": {"id": "first"}},
+        {"type": "response.in_progress", "response": {"id": "second", "model": "test"}},
+        {"type": "response.output_text.delta", "delta": "Finished the full task."},
+        {"type": f"response.{outcome}", "response": {"id": "second"}},
+        {"type": "session.status", "status": "failed" if outcome == "failed" else "idle"},
+        {"type": "session.status", "status": "failed" if outcome == "failed" else "idle"},
+    ]
+    await _relay_runner_stream_once(
+        child.id,
+        _ScriptedRunnerClient(release, child_events),
+        store,  # type: ignore[arg-type]
+    )
+    items = store.list_items(parent.id, type="resource_event").data
+    assert [item.data.event_type for item in items] == [
+        "session.subagent.delegated",
+        "session.subagent.returned",
+    ]
+    assert items[-1].data.resource["status"] == outcome
+
+
 @pytest.mark.asyncio
 async def test_relay_text_flush_publishes_persisted_item(db_uri: str) -> None:
     """
@@ -561,21 +612,21 @@ class _TunnelCloseRunnerClient:
         return _TunnelCloseStreamResponse(self._gate)
 
 
+@pytest.mark.parametrize("failure_path", ["relay", "sweep", "sweep_after_restart"])
+@pytest.mark.parametrize("terminal_response", [False, True])
 @pytest.mark.asyncio
 async def test_relay_publishes_failed_status_on_tunnel_close(
+    db_uri: str,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
+    failure_path: str,
+    terminal_response: bool,
 ) -> None:
-    """
-    A tunnel close mid-TURN publishes ``session.status`` "failed".
-
-    Regression test for #1114: before the fix the relay swallowed the
-    ``ConnectionError`` and exited silently, leaving the client's SSE
-    stream truncated with no error event. The reconnect grace is zeroed
-    so the drop is terminal on the first attempt.
-    """
+    """A confirmed disconnect persists one Failed notice even without child output."""
     from omnigent.runtime import session_stream
     from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.schemas import ErrorDetail
+    from omnigent.server.subagent_activity import record_subagent_activity
 
     monkeypatch.setattr(
         "omnigent.server.routes._sessions.orchestration.RUNNER_DISCONNECT_GRACE_S",
@@ -583,11 +634,19 @@ async def test_relay_publishes_failed_status_on_tunnel_close(
     )
     sessions_module._runner_relay_tasks.clear()
     gate = asyncio.Event()
-    fake_runner = _TunnelCloseRunnerClient(gate)
-    session_id = "03048a276e8a91fab748c87a77d638bf"
-    # A turn is in flight — the state #1114 is about. Only an interrupted
-    # turn is failed by the drop; an idle session stays quiet (see
-    # test_relay_stays_quiet_when_runner_leaves_an_idle_session).
+    events = [{"type": "response.in_progress", "response": {"id": "child-turn"}}]
+    if terminal_response:
+        events.append({"type": "response.completed", "response": {"id": "child-turn"}})
+    fake_runner = (
+        _ScriptedThenDropRunnerClient([f"data: {json.dumps(event)}\n\n" for event in events], gate)
+        if failure_path == "relay"
+        else _ScriptedRunnerClient(gate, events)
+    )
+    store = SqlAlchemyConversationStore(db_uri)
+    parent = store.create_conversation()
+    child = store.create_conversation(parent_conversation_id=parent.id, title="researcher:Audit")
+    session_id = child.id
+    await record_subagent_activity(session_id, "delegated", store)
     sessions_module._session_status_cache[session_id] = "running"
 
     collector = None
@@ -596,7 +655,7 @@ async def test_relay_publishes_failed_status_on_tunnel_close(
             session_id,
             "runner_tunnel_close",
             fake_runner,  # type: ignore[arg-type]
-            conversation_store=None,
+            conversation_store=store,
         )
         assert handle is not None
 
@@ -607,22 +666,44 @@ async def test_relay_publishes_failed_status_on_tunnel_close(
 
         # The relay task should finish quickly after the ConnectionError.
         await asyncio.wait_for(handle.task, timeout=_TASK_TIMEOUT_S)
+        if failure_path != "relay":
+            if failure_path == "sweep_after_restart":
+                sessions_module._session_active_response_cache.pop(session_id, None)
+            await sessions_module._mark_runner_sessions_offline(
+                [child], ErrorDetail(code="runner_disconnected", message="Disconnected"), store
+            )
 
         # Wait for the failed-status event to arrive at the collector.
         event = await asyncio.wait_for(collector.queue.get(), timeout=_TASK_TIMEOUT_S)
-        assert event.get("type") == "session.status"
+        while event.get("type") != "session.status":
+            event = await asyncio.wait_for(collector.queue.get(), timeout=_TASK_TIMEOUT_S)
         assert event.get("status") == "failed"
         assert event["error"]["code"] == "runner_disconnected"
-        record = next(
-            r
-            for r in caplog.records
-            if getattr(r, "event_name", None) == "runner_stream_disconnected"
+        items = store.list_items(parent.id).data
+        assert [item.data.event_type for item in items] == [
+            "session.subagent.delegated",
+            "session.subagent.returned",
+        ]
+        assert items[-1].data.resource == {"title": "Audit", "status": "failed"}
+        await record_subagent_activity(
+            session_id,
+            "returned",
+            store,
+            status="failed",
+            turn_id=child.id if failure_path == "sweep_after_restart" else "child-turn",
         )
-        assert record.session_id == session_id
-        assert record.attributes["intentional_stop"] is False
-        assert record.attributes["cached_session_status"] == "running"
-        assert record.attributes["decision"] == "failed_mid_turn"
-        assert record.exc_info is not None
+        assert len(store.list_items(parent.id).data) == 2
+        if failure_path == "relay":
+            record = next(
+                r
+                for r in caplog.records
+                if getattr(r, "event_name", None) == "runner_stream_disconnected"
+            )
+            assert record.session_id == session_id
+            assert record.attributes["intentional_stop"] is False
+            assert record.attributes["cached_session_status"] == "running"
+            assert record.attributes["decision"] == "failed_mid_turn"
+            assert record.exc_info is not None
     finally:
         gate.set()
         if collector is not None:
@@ -634,6 +715,7 @@ async def test_relay_publishes_failed_status_on_tunnel_close(
                 await asyncio.wait_for(handle.task, timeout=_TASK_TIMEOUT_S)
         sessions_module._runner_relay_tasks.clear()
         sessions_module._session_status_cache.pop(session_id, None)
+        sessions_module._session_active_response_cache.pop(session_id, None)
         session_stream.close(session_id)
 
 

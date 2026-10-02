@@ -474,7 +474,7 @@ def test_mid_turn_tunnel_blackout_recovers_without_failed_edge(
     reconnect_stack: _ReconnectStack,
     mock_llm_server_url: str,
 ) -> None:
-    """A 45-second ingress outage must not fail or discard the active turn."""
+    """A 45-second outage must recover without failure, lost output or relay polling."""
     stack = reconnect_stack
     proxy = stack.proxy
     assert proxy is not None
@@ -535,6 +535,20 @@ def test_mid_turn_tunnel_blackout_recovers_without_failed_edge(
         "turn completed. This reproduces the production false-fatal path.\n"
         f"Rejected reconnect handshakes: {proxy.rejected_connections}.\n"
         f"Server log tail:\n{server_log[-5000:]}"
+    )
+
+    # One transport-lost row proves the outage occurred; a polling relay then
+    # logs a retry per attempt. Count both in the server's own log file.
+    outages = server_log.count(f"Relay: runner transport lost for session={session_id} (")
+    assert outages >= 1, "the blackout never registered as a transport loss in the server log"
+    retry_lines = [
+        line
+        for line in server_log.splitlines()
+        if f"transport lost for session={session_id}; retrying" in line
+    ]
+    assert len(retry_lines) <= 1, (
+        f"The relay re-opened GET /stream {len(retry_lines)} times during a single "
+        f"{_BLACKOUT_S:.0f}s outage instead of waiting once for the runner to re-register."
     )
 
     # The failed edge is an SSE event that vanishes on reload; the durable
@@ -659,86 +673,3 @@ def test_reconnect_to_another_replica_does_not_fail_the_turn(
         assert "runner_disconnected" not in json.dumps(snapshot)
     finally:
         replica_b.teardown()
-
-
-def test_relay_waits_for_reconnect_instead_of_polling(
-    reconnect_stack: _ReconnectStack,
-    mock_llm_server_url: str,
-) -> None:
-    """The relay rides out an outage with one wait, not a stream open every 0.5 s.
-
-    On unchanged main the relay retries ``GET /stream`` every 0.5 s for the
-    whole lease, so a 45 s outage logs dozens of ``retrying`` lines and
-    stream opens per session (~100k give-up rows a week in managed). Waiting
-    on the runner's re-registration instead means a single attempt per
-    outage, resolved the instant the runner comes back.
-    """
-    stack = reconnect_stack
-    proxy = stack.proxy
-    assert proxy is not None
-    reset_mock_llm(mock_llm_server_url)
-    model = f"runner-relay-wait-{uuid.uuid4().hex[:8]}"
-    configure_mock_llm(
-        mock_llm_server_url,
-        [{"text": _ANSWER, "block": True}],
-        key=model,
-    )
-    agent_name = register_inline_agent(
-        stack.client,
-        name=f"runner-relay-wait-{uuid.uuid4().hex[:8]}",
-        harness="openai-agents",
-        model=model,
-        profile="",
-        prompt="Return the configured answer.",
-        mock_llm_base_url=f"{mock_llm_server_url}/v1",
-    )
-    session_id = create_runner_bound_session(
-        stack.client,
-        agent_name=agent_name,
-        runner_id=stack.runner_id,
-    )
-    _send_user_message(stack.client, session_id)
-    _poll_until(
-        lambda: _gate_pending(mock_llm_server_url),
-        timeout=60.0,
-        what="the real turn to block inside the mock LLM",
-    )
-
-    blackout_started = time.monotonic()
-    proxy.begin_blackout()
-    try:
-        _poll_until(
-            lambda: proxy.rejected_connections > 0,
-            timeout=10.0,
-            what="the real runner to attempt a reconnect through the 503 ingress",
-        )
-        remaining = _BLACKOUT_S - (time.monotonic() - blackout_started)
-        if remaining > 0:
-            time.sleep(remaining)
-    finally:
-        proxy.end_blackout()
-
-    stack.wait_runner_online()
-    release_mock_gate(mock_llm_server_url)
-    _poll_until(
-        lambda: _ANSWER in _session_blob(stack.client, session_id),
-        timeout=60.0,
-        what="the original in-flight turn to complete after runner reconnect",
-    )
-
-    # Read the server's own log file, not its captured stderr: stderr
-    # mirroring is env-dependent, so a count there could be zero and pass
-    # vacuously. One transport-lost row opens the outage; a polling relay
-    # then logs a retry line per attempt.
-    process_log = stack.process_log.read_text()
-    outages = process_log.count(f"Relay: runner transport lost for session={session_id} (")
-    assert outages >= 1, "the blackout never registered as a transport loss in the server log"
-    retry_lines = [
-        line
-        for line in process_log.splitlines()
-        if f"transport lost for session={session_id}; retrying" in line
-    ]
-    assert len(retry_lines) <= 1, (
-        f"The relay re-opened GET /stream {len(retry_lines)} times during a single "
-        f"{_BLACKOUT_S:.0f}s outage instead of waiting once for the runner to re-register."
-    )

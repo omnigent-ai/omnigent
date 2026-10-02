@@ -1,6 +1,6 @@
 // Route an opted-in chat link click into the conversation's embedded browser
-// (desktop only). AppShell listens via `onInAppLinkOpen` to surface the Browser
-// tab; if the view refuses the link, it reopens externally with a toast.
+// (desktop only). AppShell listens via `onInAppLinkOpen` to surface a Browser
+// soft tab; if the view refuses the link, it reopens externally with a toast.
 
 import { showToast } from "@/components/ui/toast";
 import { readOpenLinksInApp } from "./linkOpenPreferences";

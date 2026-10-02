@@ -66,6 +66,7 @@ from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
 from omnigent.stores.host_store import HostStore
 from tests.budgets import Deadline, budget
 from tests.server.helpers import create_test_agent
+from tests.server.helpers import websocket_scope as _websocket_scope
 
 pytestmark = pytest.mark.asyncio
 
@@ -132,26 +133,6 @@ def app(runtime_init: None, db_uri: str, tmp_path) -> FastAPI:
         comment_store=SqlAlchemyCommentStore(db_uri),
         host_store=HostStore(db_uri),
     )
-
-
-def _websocket_scope(path: str) -> dict[str, object]:
-    """Build a minimal ASGI WebSocket scope for the host tunnel.
-
-    :param path: WebSocket path, e.g. ``"/v1/hosts/<id>/tunnel"``.
-    :returns: ASGI WebSocket scope dict.
-    """
-    return {
-        "type": "websocket",
-        "asgi": {"version": "3.0"},
-        "scheme": "ws",
-        "path": path,
-        "raw_path": path.encode("ascii"),
-        "query_string": b"",
-        "headers": [],
-        "client": ("127.0.0.1", 50000),
-        "server": ("testserver", 80),
-        "subprotocols": [],
-    }
 
 
 async def _connect_host(app: FastAPI) -> ApplicationCommunicator:
@@ -857,6 +838,7 @@ async def test_message_relaunch_deterministic_failure_persists_error_turn(
     launch_error: str,
     expected_fragments: tuple[str, ...],
     wrapper_command: str | None,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """A deterministic host relaunch refusal persists user msg + error.
 
@@ -890,6 +872,7 @@ async def test_message_relaunch_deterministic_failure_persists_error_turn(
         "_HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S",
         0.0,
     )
+    caplog.set_level(logging.WARNING)
 
     comm = await _connect_host(app)
     agent = await create_test_agent(
@@ -930,6 +913,16 @@ async def test_message_relaunch_deterministic_failure_persists_error_turn(
     finally:
         await relaunch_responder
         set_runner_client(None)
+
+    [refusal] = [r for r in caplog.records if r.getMessage() == "Host refused runner launch"]
+    # Mapped codes carry their owner; uncoded or unmapped ones are left to the
+    # host's own row.
+    expected_category = {
+        HARNESS_NOT_CONFIGURED_ERROR_CODE: "config",
+        WORKSPACE_MISSING_ERROR_CODE: "user",
+    }.get(launch_error_code or "")
+    assert refusal.attributes.get("error_category") == expected_category
+    assert refusal.attributes["error_impact"] == "blocking"
 
     if expected_error_code is None:
         # Unknown host categories may contain arbitrary runner output and
@@ -1334,8 +1327,10 @@ async def test_message_relaunch_host_failure_uncategorized_reports_startup_failu
     client: httpx.AsyncClient,
     app: FastAPI,
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """Report an uncategorized host refusal as a failed start, not launch."""
+    caplog.set_level(logging.WARNING)
     from omnigent.runtime import set_runner_client
     from omnigent.server.routes import sessions as sessions_module
     from omnigent.server.routes.sessions import routes_events
@@ -1375,6 +1370,10 @@ async def test_message_relaunch_host_failure_uncategorized_reports_startup_failu
     assert "failed to spawn runner: boom" in error["message"], error["message"]
     assert "The host launched" not in error["message"], error["message"]
     assert "never connected" not in error["message"], error["message"]
+    [refusal] = [r for r in caplog.records if r.getMessage() == "Host refused runner launch"]
+    # Uncoded: the host's own row carries the category.
+    assert refusal.attributes.get("error_category") is None
+    assert refusal.attributes["error_impact"] == "blocking"
 
     # The refusal text must never enter RunnerExitReports: the session
     # snapshot reads that store UNscoped (last_task_error), so a record
@@ -1391,8 +1390,10 @@ async def test_message_relaunch_unacknowledged_launch_is_not_claimed_as_launched
     client: httpx.AsyncClient,
     app: FastAPI,
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """Do not claim a launch when the host never acknowledged it."""
+    caplog.set_level(logging.WARNING)
     from omnigent.runtime import set_runner_client
     from omnigent.server.routes import sessions as sessions_module
     from omnigent.server.routes._sessions import helpers as sessions_helpers
@@ -1454,6 +1455,11 @@ async def test_message_relaunch_unacknowledged_launch_is_not_claimed_as_launched
     assert "never confirmed the launch" in error["message"], error["message"]
     assert "The host was asked to launch runner" in error["message"], error["message"]
     assert "The host launched" not in error["message"], error["message"]
+    [timeout] = [
+        r for r in caplog.records if r.getMessage() == "Host launch acknowledgement timed out"
+    ]
+    assert timeout.attributes["error_category"] == "host"
+    assert timeout.attributes["error_impact"] == "transient"
 
 
 async def test_message_relaunch_pre_connect_exit_surfaces_report_when_visible(

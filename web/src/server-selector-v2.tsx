@@ -5,8 +5,9 @@
 // to the shell's `omnigentSetup` preload bridge (server URL, recent / managed
 // servers, connect, start-local). Theme follows the OS via index.css.
 
-import { type CSSProperties, useEffect, useState } from "react";
+import { type CSSProperties, useEffect, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
+import { Spinner } from "./components/ui/spinner";
 import type { Runner } from "./pages/onboarding/RunnerStep";
 import { ServerSelectorV2, type ServerSelectorV2Setup } from "./pages/onboarding/ServerSelectorV2";
 import { maybeMockSetup } from "./pages/onboarding/mockSetup";
@@ -18,8 +19,11 @@ const CLOUD_DOCS_URL = "https://omnigent.ai/docs/deploy/overview";
 /** The `omnigentSetup` preload bridge (see electron/src/preload.js). */
 interface OmnigentSetup {
   getServerUrl: () => Promise<string | null>;
-  setServerUrl: (url: string) => Promise<unknown>;
+  setServerUrl: (url: string, opts?: { requestId?: string }) => Promise<{ cancelled?: boolean }>;
+  cancelServerConnection?: (requestId: string) => Promise<boolean>;
+  onConnectionProgress?: (cb: (p: { requestId?: string; phase?: string }) => void) => () => void;
   getManagedServers: () => Promise<string[]>;
+  getManagedServerNames?: () => Promise<Record<string, string>>;
   getRecentServers: () => Promise<string[]>;
   forgetRecentServer?: (url: string) => Promise<string[]>;
   getRunnerOptions?: (url: string) => Promise<{ remote?: boolean; bundledCli?: boolean } | null>;
@@ -58,7 +62,7 @@ function SetupApp() {
   return <BridgeSetupApp />;
 }
 
-function BridgeSetupApp() {
+export function BridgeSetupApp() {
   const params = new URLSearchParams(window.location.search);
   const failedUrl = params.get("url");
   const error = params.get("error") ?? undefined;
@@ -73,6 +77,7 @@ function BridgeSetupApp() {
   const [initialUrl, setInitialUrl] = useState(failedUrl ?? DEFAULT_URL);
   const [recentServers, setRecentServers] = useState<string[]>([]);
   const [managedServers, setManagedServers] = useState<string[]>([]);
+  const [managedServerNames, setManagedServerNames] = useState<Record<string, string>>({});
   // Whether the `omnigent` CLI is installed — decides "Install" vs "Start"/"Open".
   // Undefined until the probe resolves.
   const [installed, setInstalled] = useState<boolean | undefined>(undefined);
@@ -93,6 +98,8 @@ function BridgeSetupApp() {
   // Hold the initial paint until the CLI probe resolves, so the wizard opens on
   // the correct step (welcome vs server list) instead of flashing the wrong one.
   const [ready, setReady] = useState(false);
+  // The in-flight connect's request ID; cleared by Cancel so its late result reads as cancelled.
+  const activeConnect = useRef<string | null>(null);
 
   useEffect(() => {
     const bridge = setupBridge();
@@ -112,6 +119,11 @@ function BridgeSetupApp() {
         : Promise.resolve();
     const recents = bridge.getRecentServers().then(setRecentServers);
     const managed = bridge.getManagedServers().then(setManagedServers);
+    // Names are cosmetic: don't hold the first paint for them.
+    void bridge.getManagedServerNames?.().then(
+      (names) => setManagedServerNames(names ?? {}),
+      () => {},
+    );
     const cli = bridge.getCliStatus().then((status) => {
       setInstalled(status?.installed === true);
       setInstallSupported(status?.installSupported === true);
@@ -156,10 +168,11 @@ function BridgeSetupApp() {
     error,
     recentServers,
     managedServers,
+    managedServerNames,
     installed,
     connectedBefore,
     localServerRunning,
-    onConnect: async (url) => {
+    onConnect: async (url, onPhase) => {
       // setServerUrl persists the URL and navigates the window to it; on success
       // the server's SPA takes over and this page goes away. A rejection (e.g.
       // main-side normalizeUrl rejects an input the renderer accepted) is
@@ -167,13 +180,35 @@ function BridgeSetupApp() {
       // silently does nothing.
       const bridge = setupBridge();
       if (!bridge) return { error: "The desktop shell is unavailable." };
+      // The request ID opts into the shell's connecting/authenticating phases and Cancel.
+      const requestId = crypto.randomUUID();
+      activeConnect.current = requestId;
+      const unsubscribe = bridge.onConnectionProgress?.((p) => {
+        if (p?.requestId !== requestId) return;
+        if (p.phase === "connecting" || p.phase === "authenticating") onPhase?.(p.phase);
+      });
       try {
-        await bridge.setServerUrl(url);
-        return {};
+        const result = await bridge.setServerUrl(url, { requestId });
+        return result?.cancelled || activeConnect.current !== requestId ? { cancelled: true } : {};
       } catch (e) {
+        if (activeConnect.current !== requestId) return { cancelled: true };
         return { error: e instanceof Error ? e.message : "Could not connect to that server." };
+      } finally {
+        unsubscribe?.();
+        if (activeConnect.current === requestId) activeConnect.current = null;
       }
     },
+    onCancelConnect: setupBridge()?.cancelServerConnection
+      ? async () => {
+          const requestId = activeConnect.current;
+          if (requestId === null) return false;
+          // Only a confirmed cancel drops the request: an unconfirmed one keeps
+          // the connect's real outcome (navigation or its error).
+          const cancelled = (await setupBridge()?.cancelServerConnection?.(requestId)) === true;
+          if (cancelled && activeConnect.current === requestId) activeConnect.current = null;
+          return cancelled;
+        }
+      : undefined,
     onStartLocal: async () => {
       // Start (or reuse) the local server, then navigate to it. Resolves the
       // outcome so the terminal step can show ready/failed. On success the
@@ -315,11 +350,14 @@ function BridgeSetupApp() {
         <ServerSelectorV2 setup={setup} />
       ) : (
         // Hold on the wizard background until the CLI probe resolves, so the
-        // flow opens on the correct step rather than flashing the wrong one.
+        // flow opens on the correct step rather than flashing the wrong one. The
+        // spinner fades in late, so a fast probe shows nothing.
         <div
-          className="min-h-screen"
+          className="grid min-h-screen place-items-center"
           style={{ background: "var(--onboarding-wizard-background)" }}
-        />
+        >
+          <Spinner className="size-6 text-muted-foreground animate-in fade-in delay-300 fill-mode-backwards" />
+        </div>
       )}
     </>
   );

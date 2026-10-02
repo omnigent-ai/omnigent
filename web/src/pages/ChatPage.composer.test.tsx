@@ -15,8 +15,9 @@ import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testi
 import userEvent from "@testing-library/user-event";
 import { createRef, StrictMode, type ComponentRef, type ReactElement } from "react";
 import { MemoryRouter } from "react-router-dom";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { useChatStore, type ChatState, type QueuedMessage } from "@/store/chatStore";
+import { toast } from "sonner";
+import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
+import { useChatStore, type ChatState } from "@/store/chatStore";
 import {
   clearSessionDrafts,
   getSessionDraft,
@@ -162,7 +163,8 @@ vi.mock("@/lib/goalApi", async (importOriginal) => ({
 import type { ElicitationBlock } from "@/lib/blocks";
 import { getGoal } from "@/lib/goalApi";
 import { TooltipProvider } from "@/components/ui/tooltip";
-import { Composer, computeIsWorking, shouldQueueSend } from "./ChatPage";
+import { Composer, computeIsWorking } from "./ChatPage";
+import { readAlwaysSteer, writeAlwaysSteer } from "@/lib/alwaysSteerPreferences";
 import { appendPromptHistoryEntry } from "@/hooks/usePromptHistory";
 import {
   BUILTIN_SLASH_COMMANDS,
@@ -851,6 +853,113 @@ describe("Composer slash-command menu", () => {
     fireEvent.keyDown(textarea(), { key: "Tab" });
     expect(textarea()).toHaveValue(command + " ");
     expect(screen.queryByText("No usage data yet — send a message first.")).toBeNull();
+  });
+
+  it.each([
+    ["claude-native", "/compact", "idle"],
+    ["claude-native", "/compact preserve decisions and TODOs", "idle"],
+    ["claude-sdk", "/compact", "idle"],
+    ["claude-sdk", "/compact", "running"],
+    ["claude-sdk", "/compact preserve decisions and TODOs", "idle"],
+    ["codex-native", "/compact", "idle"],
+    ["codex-native", "/compact", "running"],
+    ["codex-native", "/compact", "waiting"],
+    ["codex-native", "/compact extra arguments", "idle"],
+    ["pi-native", "/compact", "idle"],
+    ["pi-native", "/compact instructions", "idle"],
+    ["pi-native", "/compact", "running"],
+    ["opencode-native", "/compact", "idle"],
+  ] as const)("%s handles %s (status: %s)", (harness, command, turnStatus) => {
+    const { sessionHarness, status, sessionStatus } = useChatStore.getState();
+    onTestFinished(() => useChatStore.setState({ sessionHarness, status, sessionStatus }));
+    const previousAlwaysSteer = readAlwaysSteer();
+    onTestFinished(() => writeAlwaysSteer(previousAlwaysSteer));
+    writeAlwaysSteer(false);
+    useChatStore.setState({
+      sessionHarness: harness,
+      status: turnStatus === "running" ? "streaming" : "idle",
+      sessionStatus: turnStatus,
+    });
+    const compact = vi.spyOn(useChatStore.getState(), "compact").mockResolvedValue();
+    const error = vi.spyOn(toast, "error");
+    const props = composerProps({
+      isNativeWrapper: harness !== "claude-sdk",
+      isWorking: turnStatus !== "idle",
+    });
+    render(<Composer {...props} />);
+    fireEvent.change(textarea(), { target: { value: "/comp" } });
+    fireEvent.keyDown(textarea(), { key: "Tab" });
+    expect(textarea()).toHaveValue("/compact ");
+    expect(props.onSend).not.toHaveBeenCalled();
+    expect(compact).not.toHaveBeenCalled();
+
+    fireEvent.change(textarea(), { target: { value: command + " " } });
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+    if (
+      (harness === "codex-native" || harness === "claude-sdk" || harness === "pi-native") &&
+      command !== "/compact"
+    ) {
+      expect(textarea()).toHaveValue(command + " ");
+      const harnessName = {
+        "codex-native": "Codex",
+        "pi-native": "Pi",
+        "claude-sdk": "Claude SDK",
+      }[harness];
+      expect(
+        screen.getByText(`/compact does not accept arguments for ${harnessName}`),
+      ).toBeVisible();
+      expect(props.onSend).not.toHaveBeenCalled();
+      expect(compact).not.toHaveBeenCalled();
+      return;
+    }
+    expect(textarea()).toHaveValue("");
+    expect(error).not.toHaveBeenCalled();
+    if (harness === "opencode-native") {
+      expect(compact).toHaveBeenCalledOnce();
+      expect(props.onSend).not.toHaveBeenCalled();
+      return;
+    }
+    expect(props.onSend).toHaveBeenCalledExactlyOnceWith(command);
+    expect(compact).not.toHaveBeenCalled();
+    fireEvent.keyDown(textarea(), { key: "ArrowUp" });
+    expect(textarea()).toHaveValue(command);
+  });
+
+  it.each(["Enter", "click"])("shows a toast for busy Codex /compact via %s", (submit) => {
+    const { sessionHarness, status, sessionStatus, queuedMessages } = useChatStore.getState();
+    onTestFinished(() =>
+      useChatStore.setState({ sessionHarness, status, sessionStatus, queuedMessages }),
+    );
+    const previousAlwaysSteer = readAlwaysSteer();
+    writeAlwaysSteer(true);
+    onTestFinished(() => writeAlwaysSteer(previousAlwaysSteer));
+    useChatStore.setState({
+      sessionHarness: "codex-native",
+      status: "streaming",
+      sessionStatus: "running",
+      queuedMessages: [],
+    });
+    const compact = vi.spyOn(useChatStore.getState(), "compact").mockResolvedValue();
+    const error = vi.spyOn(toast, "error");
+    const props = composerProps({ isNativeWrapper: true, isWorking: true });
+    render(<Composer {...props} />);
+    fireEvent.change(textarea(), { target: { value: "/comp" } });
+    fireEvent.keyDown(textarea(), { key: "Tab" });
+    expect(error).not.toHaveBeenCalled();
+    if (submit === "Enter") {
+      fireEvent.keyDown(textarea(), { key: "Enter" });
+      expect(textarea()).toHaveValue("/compact ");
+    } else {
+      fireEvent.change(textarea(), { target: { value: "/comp" } });
+      fireEvent.click(activeRow()!);
+      expect(textarea()).toHaveValue("/comp");
+    }
+    expect(error).toHaveBeenCalledExactlyOnceWith(
+      "Compact is disabled while a chat is in progress",
+      { richColors: true },
+    );
+    expect(compact).not.toHaveBeenCalled();
+    expect(props.onSend).not.toHaveBeenCalled();
   });
 
   it("Tab completes a match found only mid-name (exercises menuMatches, not just the render filter)", () => {
@@ -2485,8 +2594,22 @@ describe("Composer shared visible controls", () => {
       .mockResolvedValue(undefined);
     renderWithTooltips(<Composer {...composerProps({ showCodexApprovalMode: true })} />);
     fireEvent.keyDown(screen.getByTestId("composer-permission-chip"), { key: "ArrowDown" });
-    fireEvent.click(screen.getByTestId("composer-permission-option-read-only"));
-    await waitFor(() => expect(setApproval).toHaveBeenCalledWith("read-only"));
+    fireEvent.click(screen.getByTestId("composer-permission-option-full-access"));
+    await waitFor(() => expect(setApproval).toHaveBeenCalledWith("full-access"));
+  });
+
+  it("doesn't offer Read Only as a codex runtime switch", () => {
+    useChatStore.setState({
+      conversationId: "codex-no-read-only",
+      codexApprovalMode: "read-only",
+    });
+    renderWithTooltips(<Composer {...composerProps({ showCodexApprovalMode: true })} />);
+    const chip = screen.getByTestId("composer-permission-chip");
+    // A session launched read-only still shows its live mode on the chip.
+    expect(chip).toHaveTextContent("Read Only");
+    fireEvent.keyDown(chip, { key: "ArrowDown" });
+    expect(screen.getByTestId("composer-permission-option-full-access")).toBeInTheDocument();
+    expect(screen.queryByTestId("composer-permission-option-read-only")).toBeNull();
   });
 });
 
@@ -2845,6 +2968,15 @@ describe("Composer native skill menu", () => {
   it("completes at the caret and preserves the suffix", async () => {
     render(<Composer {...composerProps({ isNativeWrapper: true })} />);
     fireEvent.change(textarea(), { target: { value: "please /rev this change" } });
+    fireEvent.select(textarea(), { target: { selectionStart: 11, selectionEnd: 11 } });
+    fireEvent.keyDown(textarea(), { key: "Tab" });
+    expect(textarea()).toHaveValue("please $review this change");
+    await waitFor(() => expect(textarea().selectionStart).toBe(15));
+  });
+
+  it("preserves adjacent prose after a partial inline skill", async () => {
+    render(<Composer {...composerProps({ isNativeWrapper: true })} />);
+    fireEvent.change(textarea(), { target: { value: "please /revthis change" } });
     fireEvent.select(textarea(), { target: { selectionStart: 11, selectionEnd: 11 } });
     fireEvent.keyDown(textarea(), { key: "Tab" });
     expect(textarea()).toHaveValue("please $review this change");
@@ -5519,65 +5651,6 @@ describe("Composer config gear", () => {
         expect(setModel).toHaveBeenCalledWith("sonnet", { expectConfirmation: true }),
       );
     });
-  });
-});
-
-describe("shouldQueueSend", () => {
-  const q = (conversationId: string): QueuedMessage => ({
-    queueId: `q_${conversationId}`,
-    text: "queued",
-    conversationId,
-  });
-
-  it("sends directly (no queue) for a brand-new chat with no conversation", () => {
-    expect(shouldQueueSend(null, "streaming", "running", [])).toBe(false);
-  });
-
-  it("queues while the session is busy (streaming or running)", () => {
-    expect(shouldQueueSend("conv_a", "streaming", "idle", [])).toBe(true);
-    expect(shouldQueueSend("conv_a", "idle", "running", [])).toBe(true);
-  });
-
-  it("sends directly when idle and nothing is queued for this conversation", () => {
-    expect(shouldQueueSend("conv_a", "idle", "idle", [])).toBe(false);
-  });
-
-  it("sends directly on `waiting` (turn ended, only background work remains)", () => {
-    // A background shell / still-running sub-agent keeps the session in
-    // `waiting`, but the server's turn gate is already free — a new message
-    // must start a fresh turn rather than stalling in the client queue.
-    expect(shouldQueueSend("conv_a", "idle", "waiting", [])).toBe(false);
-  });
-
-  it("queues when idle but this conversation already has a queued message", () => {
-    // The ordering fix: an idle flicker must not let a later send overtake the
-    // still-queued earlier one.
-    expect(shouldQueueSend("conv_a", "idle", "idle", [q("conv_a")])).toBe(true);
-  });
-
-  it("ignores queued messages belonging to a different conversation", () => {
-    expect(shouldQueueSend("conv_a", "idle", "idle", [q("conv_b")])).toBe(false);
-  });
-
-  it("sends directly while busy when alwaysSteer is on", () => {
-    // The whole point of the preference: a mid-turn follow-up is POSTed now
-    // (steered) instead of parking in the queue strip.
-    expect(shouldQueueSend("conv_a", "streaming", "idle", [], true)).toBe(false);
-    expect(shouldQueueSend("conv_a", "idle", "running", [], true)).toBe(false);
-  });
-
-  it("still queues under alwaysSteer when this conversation has a queued message", () => {
-    // The ordering guard outranks always-steer: draining must stay in order, so
-    // a direct send can't overtake a still-queued earlier one.
-    expect(shouldQueueSend("conv_a", "streaming", "running", [q("conv_a")], true)).toBe(true);
-  });
-
-  it("sends directly for a /side command even while busy or with a queued message", () => {
-    // A codex /side forks its own side chat and is non-interrupting — it must
-    // POST now while the parent turn runs, bypassing both the busy gate and the
-    // main-thread ordering guard.
-    expect(shouldQueueSend("conv_a", "streaming", "running", [], false, true)).toBe(false);
-    expect(shouldQueueSend("conv_a", "idle", "idle", [q("conv_a")], false, true)).toBe(false);
   });
 });
 

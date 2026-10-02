@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-import json
 import re
 
 import httpx
 import pytest
 from playwright.sync_api import Page, expect
 
+from tests._helpers.session import post_session_bundle
 from tests.e2e_ui.conftest import _build_hello_world_bundle
 
 STORAGE_KEY = "omnigent:default-workspace-tab"
@@ -98,10 +98,11 @@ def test_agents_tab_survives_return_to_unvisited_root(
 ) -> None:
     """A main-agent click keeps Agents selected when the root has no saved tab."""
     base_url, root_id = seeded_session
-    child_response = httpx.post(
+    child_response = post_session_bundle(
+        httpx.post,
         f"{base_url}/v1/sessions",
-        data={"metadata": json.dumps({"parent_session_id": root_id})},
-        files={"bundle": ("agent.tar.gz", _build_hello_world_bundle(), "application/gzip")},
+        _build_hello_world_bundle(),
+        metadata={"parent_session_id": root_id},
         timeout=30.0,
     )
     child_response.raise_for_status()

@@ -174,6 +174,8 @@ def test_workflow_inserts_computed_summary_before_secret_scan_and_publication(
                 "PATH": f"{tmp_path}{os.pathsep}{os.defpath}",
                 "HEAD_SHA": "abc",
                 "RUN_URL": "https://example.test/run",
+                "GITHUB_RUN_ID": "10",
+                "GITHUB_RUN_ATTEMPT": "1",
                 "PR_NUMBER": "1",
                 "REPO": "test/repo",
             },
@@ -188,3 +190,18 @@ def test_workflow_inserts_computed_summary_before_secret_scan_and_publication(
     ).replace("### Scope\n", "\n</details>\n\n### Scope\n")
     assert review.read_text() == expected
     assert expected in (tmp_path / "comment.md").read_text()
+
+    assert (tmp_path / "polly-completed-sha.txt").read_text().strip() == "abc"
+    receipt = next(step for step in steps if step["name"] == "Upload Polly completion receipt")
+    assert (
+        receipt["if"]
+        == "steps.publish.outcome == 'success' && github.event_name != 'pull_request'"
+    )
+    publish = next(step for step in steps if step["name"] == "Post review comment")
+    assert publish["id"] == "publish"
+    assert steps.index(publish) < steps.index(receipt)
+    assert receipt["with"]["path"] == "/tmp/polly-completed-sha.txt"
+    assert receipt["with"]["overwrite"] is True
+    assert receipt["with"]["name"] == (
+        "polly-completed-${{ steps.pr.outputs.pr_number }}-${{ steps.ctx.outputs.head_sha }}"
+    )
