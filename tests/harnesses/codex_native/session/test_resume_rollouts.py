@@ -125,12 +125,8 @@ def test_clone_codex_rollout_leaves_historical_cwd_untouched(
     assert source_cwd in tool_output, "historical tool output must be preserved"
     assert str(clone_cwd) not in developer_text, "clone cwd must not leak into message history"
     assert str(clone_cwd) not in tool_output, "clone cwd must not leak into tool output"
-    # Historical lines must be copied byte-for-byte — not re-serialized —
-    # so whitespace / key order / escaping are preserved exactly. The
-    # source fixture writes records with default (spaced) JSON separators;
-    # if the cloner re-serialized them they would lose those spaces and
-    # this byte comparison would fail. Indices 2 and 3 are the developer
-    # message and the function_call_output (both historical).
+    # Historical lines (indices 2-3) must be copied byte-for-byte. JSON
+    # re-serialization would lose the fixture's spaces and fail this check.
     source_lines = source_rollout.read_text().splitlines()
     clone_lines = result.read_text().splitlines()
     assert clone_lines[2] == source_lines[2], "historical message line must be byte-identical"
@@ -352,7 +348,6 @@ async def test_ensure_local_codex_resume_rollout_restores_a_zip_outside_the_work
             if attempt == 0:
                 expected.unlink()
 
-    expected = attachment_cache_dir(codex_home.parent) / "bundle.zip"
     assert expected.read_bytes() == zip_bytes
     records = [json.loads(line) for line in rollout.read_text(encoding="utf-8").splitlines()]
     user_item = next(r["payload"] for r in records if r["type"] == "response_item")

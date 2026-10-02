@@ -31,9 +31,11 @@ class _FakeCodexAppServerClient:
         error: Exception | None = None,
         events: list[dict[str, Any]] | None = None,
     ) -> None:
-        self.response = response or {"result": {"thread": {"id": "thread_123"}}}
+        self.response = (
+            response if response is not None else {"result": {"thread": {"id": "thread_123"}}}
+        )
         self.error = error
-        self.events = events or []
+        self.events = events if events is not None else []
         self.connected = False
         self.closed = False
         self.requests: list[tuple[str, dict[str, Any]]] = []
@@ -62,9 +64,9 @@ class _FakeCodexAppServerClient:
 
     async def iter_events(self) -> Any:
         """
-        Return an empty event stream.
+        Yield the configured event stream.
 
-        :returns: Async iterator with no events.
+        :returns: Async iterator over ``self.events``.
         """
         for event in self.events:
             yield event

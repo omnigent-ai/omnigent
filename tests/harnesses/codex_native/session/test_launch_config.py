@@ -89,16 +89,11 @@ def test_materialized_codex_agent_spec_loads_as_valid_omnigent_yaml(
     spec = load(spec_path)
 
     assert spec.executor.config["harness"] == "codex-native"
-    # The native wrapper opts into the spawn-write surface so the
-    # wrapped codex can author agent configs and launch them as child
-    # sessions; the bridge relay derives its tool set from this spec
-    # via ToolManager, so a dropped flag silently removes
-    # sys_session_create/send/close from the native CLI.
+    # The relay derives its tool set from this spec; a dropped spawn flag
+    # silently removes sys_session_create/send/close from the native CLI.
     assert spec.spawn is True
-    # The native wrapper declares one terminal per installed shell so the
-    # relay advertises the sys_terminal_* family to the wrapped codex (the
-    # relay gate is a non-empty ``terminals:`` block on this spec); a
-    # dropped block silently removes the terminal tools from the native CLI.
+    # A non-empty terminals block makes the relay advertise sys_terminal_*
+    # tools to the native CLI, with one terminal per installed shell.
     assert spec.terminals is not None
     assert spec.terminals["bash"].command == "bash"
 
@@ -133,11 +128,8 @@ def test_materialized_codex_agent_spec_loads_as_valid_omnigent_yaml(
             "ws://127.0.0.1:9876",
             [*_AUTO_REVIEW_ARGS, "--remote", "ws://127.0.0.1:9876"],
         ),
-        # Resume an existing thread over a loopback ws endpoint: the
-        # host-spawned runner path. The app-server listens on ws:// there
-        # (the codex CLI lacked unix:// listen support), so
-        # the auto-created terminal must attach over that same ws URL. A
-        # regression hardcoding ``unix://`` would break exactly this case.
+        # Resume over the host-spawned runner's ws:// endpoint; hardcoding
+        # unix:// would prevent the terminal from attaching to its server.
         (
             (),
             "thread_host",
@@ -265,10 +257,8 @@ def test_build_codex_remote_args_emits_config_overrides_before_subcommand(
         # ``--flag=value`` single token: dropped whole, consumes nothing after.
         (("--ask-for-approval=on-failure",), []),
         (("--sandbox=read-only", "--model", "gpt"), ["--model", "gpt"]),
-        # Short aliases: ``-a`` (== --ask-for-approval) triggers the SAME codex
-        # startup abort as the long form, so it must be stripped too; ``-s``
-        # (== --sandbox) is harmless but dropped for consistency. Both spellings
-        # (space-separated and ``=value``-joined) are handled.
+        # Strip short aliases -a/-s like their long forms, handling both
+        # space-separated and =value spellings; -a also aborts Codex startup.
         (("-a", "never"), []),
         (("-a=never",), []),
         (("-s", "read-only"), []),
@@ -346,10 +336,8 @@ def test_build_codex_remote_args_default_keeps_approval_flags_no_bypass() -> Non
                 "ws://127.0.0.1:9876",
             ],
         ),
-        # Conflicting approval-preset flags are stripped (flag + its value),
-        # unrelated args (model) survive, and the bypass flag is added once.
-        # codex aborts if the bypass flag is combined with --sandbox /
-        # --ask-for-approval, so leaving them in would break TUI startup.
+        # Codex aborts when approval-preset flags accompany the bypass flag.
+        # Strip each flag/value pair; preserve unrelated args and add bypass once.
         (
             ("--sandbox", "danger-full-access", "--ask-for-approval", "never", "--model", "gpt"),
             None,
