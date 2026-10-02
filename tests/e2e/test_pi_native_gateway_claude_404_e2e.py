@@ -556,8 +556,10 @@ def test_facet_a_live_pi_cli_gateway_claude_404_journey(fake_gateway: str, tmp_p
         with contextlib.suppress(OSError):
             os.close(fd)
         _, survivors = reap_leaked_omnigent_processes(config_home)
-        assert not survivors, f"test processes survived cleanup: {survivors}"
+        if survivors and (error := sys.exception()) is not None:
+            error.add_note(f"test processes survived cleanup: {survivors}")
 
+    assert not survivors, f"test processes survived cleanup: {survivors}"
     silently_openai = "openai-completions" in rendered_apis
     assert (not silently_openai) or warning_surfaced, (
         f"pi-native launched the Claude model {_CLAUDE_MODEL!r} on an openai-only "

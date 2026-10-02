@@ -1138,6 +1138,7 @@ def test_repl_label_driven_ask_approves(
         if isinstance(turn_one, bytes):
             turn_one = turn_one.decode("utf-8", errors="replace")
         turn_one = _strip_ansi(turn_one)
+        turn_one += _read_pending(child, seconds=1.0)
         # Turn 1 MUST NOT show an approval banner — the
         # taint label didn't exist when the condition was
         # checked.
@@ -1146,8 +1147,6 @@ def test_repl_label_driven_ask_approves(
             "condition gate is reading the post-write snapshot.\n"
             f"Turn 1:\n{turn_one[:1500]}"
         )
-
-        _read_pending(child, seconds=1.0)
 
         # Turn 2: label persists from the store → condition
         # matches → ASK fires.

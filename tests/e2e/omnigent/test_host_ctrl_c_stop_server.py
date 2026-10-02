@@ -40,6 +40,8 @@ import httpx
 import pexpect
 import psutil
 
+from omnigent.testing.process_reaper import reap_leaked_omnigent_processes
+
 # The host daemon's WS tunnel + local-server boot take the same path the
 # REPL lifecycle e2e exercises; 90s mirrors that suite's readiness budget so
 # a cold import + server start on a loaded CI box still settles.
@@ -200,7 +202,7 @@ def _force_stop_server(server: psutil.Process) -> None:
     :param server: Process identity captured while the server was running.
     :returns: None.
     """
-    with contextlib.suppress(psutil.NoSuchProcess):
+    with contextlib.suppress(psutil.NoSuchProcess, psutil.AccessDenied):
         server.terminate()
         if not _wait_for_server_exit(server, timeout=10):
             server.kill()
@@ -258,31 +260,28 @@ def _prespawn_persistent_server(
         "from omnigent.host.local_server import ensure_local_omnigent_server;"
         "print(ensure_local_omnigent_server().url)"
     )
-    proc = subprocess.run(
-        [str(omnigent_python), "-c", code],
-        env=dict(env),
-        cwd=str(repo_root),
-        capture_output=True,
-        text=True,
-        timeout=_BOOT_TIMEOUT,
-    )
     home = Path(env["HOME"])
-    # The subprocess detaches the server (start_new_session=True) before
-    # returning, so any failure past the spawn would otherwise leak a live
-    # server into later tests. Stop it via the pidfile before re-raising.
+    # A failed bootstrap can leave a detached server. Reap only this test's
+    # runtime; a stale pidfile may already point at an unrelated process.
     try:
+        proc = subprocess.run(
+            [str(omnigent_python), "-c", code],
+            env=dict(env),
+            cwd=str(repo_root),
+            capture_output=True,
+            text=True,
+            timeout=_BOOT_TIMEOUT,
+        )
         assert proc.returncode == 0, f"pre-spawn failed (rc={proc.returncode}):\n{proc.stderr}"
         pid, port = _read_local_server_record(home)
         assert _wait_for_health(port, expected=True, timeout=_HEALTH_POLL_TIMEOUT), (
             f"pre-spawned local server on port {port} never became healthy"
         )
         return pid, port
-    except BaseException:
-        with contextlib.suppress(
-            AssertionError, OSError, ValueError, IndexError, psutil.NoSuchProcess
-        ):
-            leaked_pid, _leaked_port = _read_local_server_record(home)
-            _force_stop_server(psutil.Process(leaked_pid))
+    except BaseException as exc:
+        _, survivors = reap_leaked_omnigent_processes(home / ".omnigent")
+        if survivors:
+            exc.add_note(f"pre-spawned server processes survived cleanup: {survivors}")
         raise
 
 

@@ -132,9 +132,15 @@ def _spawn_repl_with_args(
         timeout=timeout,
         dimensions=(40, 120),
     )
-    log_dir = Path(env["OMNIGENT_DATA_DIR"]) / "logs" / "cli"
-    log_dir.mkdir(parents=True, exist_ok=True)
-    child.logfile_read = (log_dir / f"sessions-repl-{child.pid}.log").open("w", encoding="utf-8")
+    try:
+        log_dir = Path(env["OMNIGENT_DATA_DIR"]) / "logs" / "cli"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        child.logfile_read = (log_dir / f"sessions-repl-{child.pid}.log").open(
+            "w", encoding="utf-8"
+        )
+    except BaseException:
+        child.close(force=True)
+        raise
     return child
 
 
