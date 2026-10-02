@@ -133,6 +133,7 @@ export type RenderItem =
       itemId: string | null;
       elicitationId: string;
       targetSessionId?: string | null;
+      targetSessionName?: string | null;
       message: string;
       phase: string;
       policyName: string;
@@ -1652,6 +1653,7 @@ function buildAssistantItems(
         itemId: b.ctx.itemId,
         elicitationId: b.elicitationId,
         targetSessionId: b.targetSessionId,
+        targetSessionName: b.targetSessionName,
         message: b.message,
         phase: b.phase,
         policyName: b.policyName,

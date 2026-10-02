@@ -174,7 +174,11 @@ async def test_permission_request_hook_allow_round_trip(
     )
 
     event = await drain_task
-    assert event["params"]["message"] == "Claude wants to call **Bash**"
+    # A session with the claude-native harness resolves the native agent spec and
+    # uses its display_name ("Claude Code"). A session with no harness metadata
+    # falls back to the hook's default vendor label ("Claude").
+    expected_agent_name = "Claude Code" if harness == "claude-native" else "Claude"
+    assert event["params"]["message"] == f"{expected_agent_name} wants to call **Bash**"
     assert event["params"]["policy_name"] == "claude_native_permission"
     verdict = await _post_approval(client, session_id, event["elicitation_id"], "accept")
     assert verdict.status_code == 202, verdict.text

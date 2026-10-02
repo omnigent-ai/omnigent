@@ -108,6 +108,10 @@ from omnigent.stores.permission_store import PermissionStore
 #: a card's glyph and name from the ``<vendor>_native_`` prefix.
 _NATIVE_POLICY_VENDORS: dict[str, str] = {"antigravity": "agy"}
 
+#: Product name for the "… wants to call …" approval text, matching the web's
+#: ``NATIVE_CODING_AGENTS`` ``displayName`` where it differs from ``display_name``.
+_APPROVAL_DISPLAY_NAMES: dict[str, str] = {"claude": "Claude Code"}
+
 
 def _create_route_decision_id(
     session_id: str,
@@ -353,7 +357,11 @@ def register_hooks_routes(
             and tool_input
         ):
             extras["exit_plan_mode"] = tool_input
-        asking_name = native_agent.display_name if native_agent is not None else hook_label
+        asking_name = (
+            _APPROVAL_DISPLAY_NAMES.get(native_agent.key, native_agent.display_name)
+            if native_agent is not None
+            else hook_label
+        )
         asking_vendor = (
             _NATIVE_POLICY_VENDORS.get(native_agent.key, native_agent.key)
             if native_agent is not None
