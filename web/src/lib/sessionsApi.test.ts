@@ -164,6 +164,7 @@ describe("createSession", () => {
       reasoningEffort: undefined,
       pendingElicitations: [],
       pendingInputs: [],
+      unconsumedInputIds: [],
       permissionLevel: null,
       parentSessionId: null,
       subAgentName: null,
@@ -333,6 +334,23 @@ describe("createSession", () => {
     expect(session.pendingInputs).toEqual([
       { pendingId: "pending_1", content: [{ type: "input_text", text: "queued" }] },
     ]);
+  });
+
+  it("maps unconsumed_input_ids (snake) to unconsumedInputIds (camel)", async () => {
+    // Steered messages the runner still buffers render pending after a reload.
+    fetchMock.mockResolvedValueOnce(
+      mockJsonResponse({
+        id: "conv_abc",
+        agent_id: "agent_xyz",
+        status: "running",
+        created_at: 1704067200,
+        items: [],
+        unconsumed_input_ids: ["msg_steered_1", "msg_steered_2"],
+      }),
+    );
+
+    const session = await createSession("agent_xyz");
+    expect(session.unconsumedInputIds).toEqual(["msg_steered_1", "msg_steered_2"]);
   });
 
   it("maps active_response_id (snake) to activeResponseId (camel)", async () => {

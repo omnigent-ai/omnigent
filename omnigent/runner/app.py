@@ -1675,6 +1675,15 @@ def create_runner_app(
                 _native_pane_status[session_id] = _status_value
         _fan_out_child_delta_to_parent(session_id, event_body)
 
+    def _publish_input_drained(session_id: str, message_body: Mapping[str, object]) -> None:
+        """Report that a buffered persisted message entered a turn."""
+        _pid = message_body.get("persisted_item_id")
+        if isinstance(_pid, str) and _pid:
+            _publish_event(
+                session_id,
+                {"type": "session.input.drained", "item_id": _pid},
+            )
+
     def _child_preview_from_status(
         session_id: str,
         *,
@@ -6775,6 +6784,7 @@ def create_runner_app(
                         "content": next_body.get("content", []),
                     }
                 )
+                _publish_input_drained(session_id, next_body)
             else:
                 all_bodies = list(buf)
                 buf.clear()
@@ -6788,6 +6798,7 @@ def create_runner_app(
                             "content": body.get("content", []),
                         }
                     )
+                    _publish_input_drained(session_id, body)
                 next_body = all_bodies[-1]
 
             if _is_sdk_compact_body(next_body):
@@ -8241,6 +8252,9 @@ def create_runner_app(
                                                     "content": _m.get("content", []),
                                                 }
                                             )
+                                            # Marker now rather than at turn end: the
+                                            # item already entered this turn.
+                                            _publish_input_drained(conv_id, _m)
                                     continue
                                 if _evt_type == "response.output_text.delta":
                                     delta = event.get("delta")
@@ -8829,6 +8843,9 @@ def create_runner_app(
                         status_code=202,
                         content={
                             "status": "buffered",
+                            # This runner reports `session.input.drained` when the
+                            # message enters a turn; older runners never do.
+                            "drain_marker": True,
                             "detail": ("Message buffered; active turn will process it."),
                         },
                     )

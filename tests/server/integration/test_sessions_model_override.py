@@ -380,6 +380,9 @@ class _CaptureClient:
             headers: dict[str, str] = {}
             text = ""
 
+            def json(self) -> dict[str, Any]:
+                return {"status": "accepted"}
+
         return _Resp()
 
     async def get(self, *_: Any, **__: Any) -> Any:

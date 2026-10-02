@@ -771,6 +771,16 @@ export interface SessionInputConsumedEvent {
   clearedPendingId?: string | null;
 }
 
+/** A persisted input item buffered by a running turn. */
+export interface SessionInputDeliveredEvent {
+  type: "session_input_delivered";
+  itemId: string;
+  itemType: string;
+  isMeta?: boolean;
+  createdBy?: string;
+  data: Record<string, unknown>;
+}
+
 /**
  * `session.interrupted` — user-triggered cancel reached the loop.
  *
@@ -1021,6 +1031,7 @@ export type StreamEvent =
   | SessionSandboxStatusEvent
   | SessionMcpStartupEvent
   | SessionInputConsumedEvent
+  | SessionInputDeliveredEvent
   | SessionInterruptedEvent
   | SessionCreatedEvent
   | SessionSupersededEvent

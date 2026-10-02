@@ -97,6 +97,7 @@ from omnigent.runtime import (
     inflight_text,
     pending_elicitations,
     pending_inputs,
+    unconsumed_inputs,
 )
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.runtime.policies.approval import (
@@ -296,6 +297,7 @@ from omnigent.server.routes._sessions.helpers import (
     _publish_error_event,
     _publish_external_conversation_item,
     _publish_input_consumed,
+    _publish_input_delivered,
     _publish_model_options,
     _publish_sandbox_status,
     _publish_status,
@@ -1312,6 +1314,8 @@ def _build_session_response(
         # hydrates the optimistic bubble. Empty for non-native sessions
         # (their message is already persisted into ``items``).
         pending_inputs=pending_inputs.snapshot_for(conv.id),
+        # Replay steered messages still awaiting harness consumption.
+        unconsumed_input_ids=unconsumed_inputs.snapshot_for(conv.id),
         workspace=conv.workspace,
         git_branch=conv.git_branch,
         archived=conv.archived,
@@ -6395,9 +6399,37 @@ async def _forward_event_to_runner(
                 f"Runner rejected the message: {_reject_detail}",
                 code=ErrorCode.RUNNER_UNAVAILABLE,
             )
-        # Publish input.consumed AFTER the forward succeeds —
-        # the runner has the message and will start the turn.
-        _publish_input_consumed(session_id, persisted_items[0])
+        # A buffered acknowledgment means delivery; accepted means consumption.
+        # Only a runner that reports drain markers may defer consumption:
+        # older runners also answer "buffered" but never send the marker.
+        _steer_buffered = False
+        if body.type == "message":
+            try:
+                _forward_ack = _forward_resp.json()
+            except ValueError:
+                # Older runners may return a non-JSON accepted response.
+                _forward_ack = None
+            _steer_buffered = (
+                isinstance(_forward_ack, dict)
+                and _forward_ack.get("status") == "buffered"
+                and _forward_ack.get("drain_marker") is True
+            )
+        _steer_item = persisted_items[0]
+        # Hidden context stays hidden, so it is never shown as pending.
+        _steer_is_meta = (
+            _steer_item.type == "message"
+            and isinstance(_steer_item.data, MessageData)
+            and _steer_item.data.is_meta
+        )
+        # A racing drain marker makes record() return false.
+        if (
+            _steer_buffered
+            and not _steer_is_meta
+            and unconsumed_inputs.record(session_id, _steer_item.id, _steer_item)
+        ):
+            _publish_input_delivered(session_id, _steer_item)
+        else:
+            _publish_input_consumed(session_id, _steer_item)
         _logger.info(
             "turn dispatched to runner for session=%s",
             session_id,
@@ -7681,6 +7713,23 @@ async def _relay_runner_stream_once(
                             session_id,
                             event.get("pending") is True,
                         )
+                        continue
+
+                    # Translate the runner-only marker to the canonical consumed event.
+                    if evt_type == "session.input.drained":
+                        _drained_id = event.get("item_id")
+                        if isinstance(_drained_id, str) and _drained_id:
+                            _drained_item = unconsumed_inputs.resolve(session_id, _drained_id)
+                            if _drained_item is not None:
+                                _publish_input_consumed(session_id, _drained_item)
+                            else:
+                                _logger.debug(
+                                    "Relay: drain marker for unknown item %s on "
+                                    "session=%s (already cleared)",
+                                    _drained_id,
+                                    session_id,
+                                    extra={"session_id": session_id},
+                                )
                         continue
 
                     # Track the turn's response_id from lifecycle

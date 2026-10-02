@@ -40,6 +40,7 @@ import type {
   SessionModelOptionsEvent,
   SessionCreatedEvent,
   SessionInputConsumedEvent,
+  SessionInputDeliveredEvent,
   SessionInterruptedEvent,
   SessionPresenceEvent,
   SessionResource,
@@ -389,6 +390,42 @@ export function parseBackgroundTasks(raw: unknown): BackgroundTaskInfo[] | undef
  * @returns A typed `StreamEvent`, or `null` for unknown types
  *   (forward-compatible — older clients ignore newer events).
  */
+/**
+ * Lift the nested input-item envelope shared by `session.input.consumed`
+ * and `session.input.delivered`: `{type, data: {item_id, type, data, …}}`.
+ */
+function parseInputItemEnvelope(data: Record<string, unknown>): {
+  itemId: string;
+  itemType: string;
+  payload: Record<string, unknown>;
+  createdBy?: string;
+  clearedPendingId: string | null;
+} | null {
+  const inner = data.data;
+  if (!inner || typeof inner !== "object" || Array.isArray(inner)) return null;
+  const p = inner as Record<string, unknown>;
+  const itemId = p.item_id;
+  const itemType = p.type;
+  const itemData = p.data;
+  if (typeof itemId !== "string" || !itemId) return null;
+  if (typeof itemType !== "string" || !itemType) return null;
+  const payload =
+    itemData && typeof itemData === "object" && !Array.isArray(itemData)
+      ? (itemData as Record<string, unknown>)
+      : {};
+  // created_by is at the payload level (beside item_id/type), not in
+  // the nested item data. Keep only a real string so null carries no author.
+  const createdBy = p.created_by;
+  const clearedPendingId = p.cleared_pending_id;
+  return {
+    itemId,
+    itemType,
+    payload,
+    ...(typeof createdBy === "string" ? { createdBy } : {}),
+    clearedPendingId: typeof clearedPendingId === "string" ? clearedPendingId : null,
+  };
+}
+
 export function parseEvent(rawType: string, data: Record<string, unknown>): StreamEvent | null {
   const eventType = normalizeEventType(rawType);
 
@@ -816,32 +853,31 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
     } satisfies SessionMcpStartupEvent;
   }
   if (eventType === "session.input.consumed") {
-    // Nested envelope: `{type, data: {item_id, type, data}}`.
-    const inner = data.data;
-    if (!inner || typeof inner !== "object" || Array.isArray(inner)) return null;
-    const p = inner as Record<string, unknown>;
-    const itemId = p.item_id;
-    const itemType = p.type;
-    const itemData = p.data;
-    if (typeof itemId !== "string" || !itemId) return null;
-    if (typeof itemType !== "string" || !itemType) return null;
-    const payload =
-      itemData && typeof itemData === "object" && !Array.isArray(itemData)
-        ? (itemData as Record<string, unknown>)
-        : {};
-    // created_by is at the payload level (beside item_id/type), not in
-    // the nested item data. Keep only a real string so null carries no author.
-    const createdBy = p.created_by;
-    const clearedPendingId = p.cleared_pending_id;
+    const envelope = parseInputItemEnvelope(data);
+    if (envelope === null) return null;
+    const { itemId, itemType, payload, createdBy, clearedPendingId } = envelope;
     return {
       type: "session_input_consumed",
       itemId,
       itemType,
       isMeta: payload.is_meta === true,
-      ...(typeof createdBy === "string" ? { createdBy } : {}),
+      ...(createdBy !== undefined ? { createdBy } : {}),
       data: payload,
-      clearedPendingId: typeof clearedPendingId === "string" ? clearedPendingId : null,
+      clearedPendingId,
     } satisfies SessionInputConsumedEvent;
+  }
+  if (eventType === "session.input.delivered") {
+    const envelope = parseInputItemEnvelope(data);
+    if (envelope === null) return null;
+    const { itemId, itemType, payload, createdBy } = envelope;
+    return {
+      type: "session_input_delivered",
+      itemId,
+      itemType,
+      isMeta: payload.is_meta === true,
+      ...(createdBy !== undefined ? { createdBy } : {}),
+      data: payload,
+    } satisfies SessionInputDeliveredEvent;
   }
   if (eventType === "session.interrupted") {
     // Nested envelope: `{type, data: {requested_at}}`.

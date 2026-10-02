@@ -263,6 +263,8 @@ let sessionPendingInputs: Map<
   string,
   { pending_id: string; content: unknown[]; created_by?: string }[]
 >;
+// Persisted user messages the runner still buffers, served on the snapshot.
+let sessionUnconsumedInputIds: Map<string, string[]>;
 // Per-session cost-control switch the snapshot/PATCH handlers serve;
 // absent key = unset (the wire field comes back null).
 let sessionCostControlOverrides: Map<string, "on" | "off">;
@@ -394,6 +396,7 @@ function defaultFetchHandler(input: RequestInfo | URL, init?: RequestInit): Resp
       labels: sessionLabels.get(sessionId) ?? {},
       pending_elicitations: sessionPendingElicitations.get(sessionId) ?? [],
       pending_inputs: sessionPendingInputs.get(sessionId) ?? [],
+      unconsumed_input_ids: sessionUnconsumedInputIds.get(sessionId) ?? [],
       cost_control_mode_override: sessionCostControlOverrides.get(sessionId) ?? null,
       subagent_routing_override: sessionSubagentRoutingOverrides.get(sessionId) ?? null,
       mcp_startup: sessionMcpStartup.get(sessionId) ?? null,
@@ -497,6 +500,7 @@ beforeEach(() => {
   sessionItems = new Map();
   sessionPendingElicitations = new Map();
   sessionPendingInputs = new Map();
+  sessionUnconsumedInputIds = new Map();
   sessionCostControlOverrides = new Map();
   sessionSubagentRoutingOverrides = new Map();
   sessionLabels = new Map();
@@ -578,6 +582,10 @@ function seedPendingInputs(
   inputs: { pending_id: string; content: unknown[]; created_by?: string }[],
 ): void {
   sessionPendingInputs.set(id, inputs);
+}
+
+function seedUnconsumedInputIds(id: string, itemIds: string[]): void {
+  sessionUnconsumedInputIds.set(id, itemIds);
 }
 
 describe("isTempConvId", () => {
@@ -7652,6 +7660,266 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
     });
   });
 
+  describe("session.input.delivered (steered message awaiting the harness)", () => {
+    it("stamps the oldest pending entry with the item id instead of promoting it", () => {
+      useChatStore.setState({
+        blocks: [],
+        pendingUserMessages: [
+          { tempId: "pend_steer", content: [{ type: "input_text", text: "steer me" }] },
+        ],
+      });
+
+      handleSessionEvent({
+        type: "session_input_delivered",
+        itemId: "msg_steered_1",
+        itemType: "message",
+        data: {
+          role: "user",
+          user_authored: true,
+          content: [{ type: "input_text", text: "steer me" }],
+        },
+      });
+
+      const state = useChatStore.getState();
+      expect(state.blocks).toEqual([]);
+      expect(state.pendingUserMessages).toHaveLength(1);
+      const entry = state.pendingUserMessages[0]!;
+      expect(entry.tempId).toBe("pend_steer");
+      expect(entry.deliveredItemId).toBe("msg_steered_1");
+      expect(entry.posted).toBe(true);
+    });
+
+    it("creates a delivered pending bubble for viewers with no local echo", () => {
+      useChatStore.setState({ blocks: [], pendingUserMessages: [] });
+
+      handleSessionEvent({
+        type: "session_input_delivered",
+        itemId: "msg_steered_2",
+        itemType: "message",
+        createdBy: "alice@example.com",
+        data: { role: "user", content: [{ type: "input_text", text: "from alice" }] },
+      });
+
+      const state = useChatStore.getState();
+      expect(state.blocks).toEqual([]);
+      expect(state.pendingUserMessages).toEqual([
+        {
+          tempId: "delivered:msg_steered_2",
+          content: [{ type: "input_text", text: "from alice" }],
+          posted: true,
+          deliveredItemId: "msg_steered_2",
+          author: "alice@example.com",
+        },
+      ]);
+    });
+
+    it("does not stamp another author's delivered event onto a local pending entry", () => {
+      useChatStore.setState({
+        blocks: [],
+        pendingUserMessages: [
+          {
+            tempId: "pend_bob",
+            content: [{ type: "input_text", text: "bob's draft" }],
+            author: "bob@example.com",
+          },
+        ],
+      });
+
+      handleSessionEvent({
+        type: "session_input_delivered",
+        itemId: "msg_alice_1",
+        itemType: "message",
+        createdBy: "alice@example.com",
+        data: { role: "user", content: [{ type: "input_text", text: "from alice" }] },
+      });
+
+      const state = useChatStore.getState();
+      expect(state.blocks).toEqual([]);
+      expect(state.pendingUserMessages).toHaveLength(2);
+      const bob = state.pendingUserMessages.find((p) => p.tempId === "pend_bob");
+      expect(bob?.deliveredItemId).toBeUndefined();
+      const alice = state.pendingUserMessages.find((p) => p.deliveredItemId === "msg_alice_1");
+      expect(alice?.content).toEqual([{ type: "input_text", text: "from alice" }]);
+      expect(alice?.author).toBe("alice@example.com");
+    });
+
+    it("does not let a delivered system notice claim a human echo or its attachments", () => {
+      // A sub-agent blocking notification is a non-meta `[System: …]` user
+      // message without an author; it must materialize on its own.
+      const humanContent = [
+        { type: "input_text" as const, text: "please review" },
+        { type: "input_image" as const, file_id: "file_shot_1" },
+      ];
+      useChatStore.setState({
+        blocks: [],
+        pendingUserMessages: [
+          { tempId: "pend_human", content: humanContent, author: "bob@example.com" },
+        ],
+      });
+
+      const notice = [{ type: "input_text", text: "[System: sub-agent worker is blocked]" }];
+      handleSessionEvent({
+        type: "session_input_delivered",
+        itemId: "msg_notice_1",
+        itemType: "message",
+        data: { role: "user", content: notice },
+      });
+
+      const delivered = useChatStore.getState();
+      expect(delivered.pendingUserMessages.map((p) => p.tempId)).toEqual([
+        "pend_human",
+        "delivered:msg_notice_1",
+      ]);
+      expect(delivered.pendingUserMessages[0]).toEqual({
+        tempId: "pend_human",
+        content: humanContent,
+        author: "bob@example.com",
+      });
+
+      handleSessionEvent({
+        type: "session_input_consumed",
+        itemId: "msg_notice_1",
+        itemType: "message",
+        clearedPendingId: null,
+        data: { role: "user", content: notice },
+      });
+
+      const consumed = useChatStore.getState();
+      expect(consumed.pendingUserMessages.map((p) => p.tempId)).toEqual(["pend_human"]);
+      expect(consumed.blocks).toHaveLength(1);
+      const committed = consumed.blocks[0] as UserMessageBlock;
+      expect(committed.ctx.itemId).toBe("msg_notice_1");
+      expect(committed.stableKey).toBe("delivered:msg_notice_1");
+      expect(committed.content).toEqual(notice);
+    });
+
+    it("is idempotent across an SSE replay of the same delivered event", () => {
+      useChatStore.setState({
+        blocks: [],
+        pendingUserMessages: [
+          { tempId: "pend_steer", content: [{ type: "input_text", text: "steer me" }] },
+        ],
+      });
+      const event = {
+        type: "session_input_delivered",
+        itemId: "msg_steered_1",
+        itemType: "message",
+        data: {
+          role: "user",
+          user_authored: true,
+          content: [{ type: "input_text", text: "steer me" }],
+        },
+      } as const;
+
+      handleSessionEvent(event);
+      handleSessionEvent(event);
+
+      const state = useChatStore.getState();
+      expect(state.pendingUserMessages).toHaveLength(1);
+      expect(state.pendingUserMessages[0]!.deliveredItemId).toBe("msg_steered_1");
+    });
+
+    it("consumed promotes the delivered entry by exact id, not FIFO position", () => {
+      useChatStore.setState({
+        blocks: [],
+        pendingUserMessages: [
+          { tempId: "pend_other", content: [{ type: "input_text", text: "other send" }] },
+          {
+            tempId: "pend_steer",
+            content: [{ type: "input_text", text: "steer me" }],
+            posted: true,
+            deliveredItemId: "msg_steered_1",
+          },
+        ],
+      });
+
+      handleSessionEvent({
+        type: "session_input_consumed",
+        itemId: "msg_steered_1",
+        itemType: "message",
+        clearedPendingId: null,
+        data: { role: "user", content: [{ type: "input_text", text: "steer me" }] },
+      });
+
+      const state = useChatStore.getState();
+      expect(state.blocks).toHaveLength(1);
+      const promoted = state.blocks[0] as UserMessageBlock;
+      expect(promoted.ctx.itemId).toBe("msg_steered_1");
+      expect(promoted.stableKey).toBe("pend_steer");
+      expect(state.pendingUserMessages).toEqual([
+        { tempId: "pend_other", content: [{ type: "input_text", text: "other send" }] },
+      ]);
+    });
+
+    it("keeps a delivered entry pending through failed and waiting, settling it on idle", () => {
+      // The runner publishes `failed` before draining the buffered
+      // continuation, and `waiting` can repeat while the buffer is non-empty.
+      useChatStore.setState({
+        blocks: [],
+        status: "idle",
+        pendingUserMessages: [
+          { tempId: "pend_plain", content: [{ type: "input_text", text: "plain send" }] },
+          {
+            tempId: "pend_steer",
+            content: [{ type: "input_text", text: "steer me" }],
+            posted: true,
+            deliveredItemId: "msg_steered_1",
+          },
+        ],
+      });
+
+      for (const status of ["failed", "waiting"] as const) {
+        handleSessionEvent({ type: "session_status", conversationId: "conv_abc", status });
+        const state = useChatStore.getState();
+        expect(state.blocks).toEqual([]);
+        expect(state.pendingUserMessages.map((p) => p.tempId)).toEqual(["pend_steer"]);
+      }
+
+      handleSessionEvent({ type: "session_status", conversationId: "conv_abc", status: "idle" });
+      const settled = useChatStore.getState();
+      expect(settled.pendingUserMessages).toEqual([]);
+      expect(settled.blocks.map((b) => b.ctx.itemId)).toEqual(["msg_steered_1"]);
+    });
+
+    it("demotes an already committed item when its delivered event arrives late", () => {
+      // A snapshot taken before the server tracked delivery committed the
+      // steered message; the delivered event must move it back to pending
+      // and the consumed event must promote it again.
+      const steered = userMessage("steer_late", "steer me");
+      useChatStore.setState({ blocks: itemsToBlocks([steered]), pendingUserMessages: [] });
+
+      handleSessionEvent({
+        type: "session_input_delivered",
+        itemId: steered.id,
+        itemType: "message",
+        data: { role: "user", content: [{ type: "input_text", text: "steer me" }] },
+      });
+
+      const pending = useChatStore.getState();
+      expect(pending.blocks).toEqual([]);
+      expect(pending.pendingUserMessages).toEqual([
+        {
+          tempId: `delivered:${steered.id}`,
+          content: [{ type: "input_text", text: "steer me" }],
+          posted: true,
+          deliveredItemId: steered.id,
+        },
+      ]);
+
+      handleSessionEvent({
+        type: "session_input_consumed",
+        itemId: steered.id,
+        itemType: "message",
+        clearedPendingId: null,
+        data: { role: "user", content: [{ type: "input_text", text: "steer me" }] },
+      });
+
+      const consumed = useChatStore.getState();
+      expect(consumed.pendingUserMessages).toEqual([]);
+      expect(consumed.blocks.map((b) => b.ctx.itemId)).toEqual([steered.id]);
+    });
+  });
+
   describe("slash_command (claude-native skill / surfaced command)", () => {
     it("pops the FIFO head of pendingUserMessages so the optimistic bubble clears", () => {
       // Claude-native skips `session.input.consumed` for slash invocations;
@@ -11733,6 +12001,129 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     await loop;
   });
 
+  it("keeps a backfilled item pending when the snapshot still lists it as unconsumed", async () => {
+    const before = userMessage("unc_pre", "before the gap");
+    seedSession("conv_reconnect_unconsumed", [before]);
+    const sinks = routeStreamOpens();
+    const controller = new AbortController();
+    useChatStore.setState({
+      conversationId: "conv_reconnect_unconsumed",
+      abortController: controller,
+      blocks: itemsToBlocks([before]),
+      pendingUserMessages: [
+        {
+          tempId: "pend_steer",
+          content: [{ type: "input_text", text: "steer me" }],
+          posted: true,
+        },
+      ],
+    });
+
+    const loop = startStreamPump("conv_reconnect_unconsumed", controller, setState, getState);
+    await drainAsync();
+    expect(sinks).toHaveLength(1);
+
+    // The steered message was persisted during the gap but the runner still
+    // buffers it, so the snapshot names it unconsumed.
+    const steered = userMessage("unc_gap", "steer me");
+    seedSessionItems("conv_reconnect_unconsumed", [before, steered]);
+    seedUnconsumedInputIds("conv_reconnect_unconsumed", [steered.id]);
+    sinks[0]!.error();
+    await drainAsync();
+    expect(sinks).toHaveLength(2);
+
+    const recovered = useChatStore.getState();
+    expect(recovered.blocks.map((b) => b.ctx.itemId)).toEqual([before.id]);
+    expect(recovered.pendingUserMessages).toEqual([
+      {
+        tempId: "pend_steer",
+        content: [{ type: "input_text", text: "steer me" }],
+        posted: true,
+        deliveredItemId: steered.id,
+      },
+    ]);
+
+    // Consumption promotes it by exact id, keeping the optimistic key.
+    const last = sinks[1]!;
+    last.push(
+      sse("session.input.consumed", {
+        type: "session.input.consumed",
+        data: {
+          item_id: steered.id,
+          type: "message",
+          data: { role: "user", content: [{ type: "input_text", text: "steer me" }] },
+        },
+      }),
+    );
+    await drainAsync(2);
+    const consumed = useChatStore.getState();
+    expect(consumed.pendingUserMessages).toEqual([]);
+    expect(consumed.blocks.map((b) => b.ctx.itemId)).toEqual([before.id, steered.id]);
+    expect((consumed.blocks[1] as UserMessageBlock).stableKey).toBe("pend_steer");
+
+    last.push("data: [DONE]\n\n");
+    last.close();
+    await drainAsync(2);
+    await loop;
+  });
+
+  it("does not let another author's unconsumed snapshot item claim a local echo", async () => {
+    const before = userMessage("xa_pre", "before the gap");
+    seedSession("conv_reconnect_cross_author", [before]);
+    const sinks = routeStreamOpens();
+    const controller = new AbortController();
+    useChatStore.setState({
+      conversationId: "conv_reconnect_cross_author",
+      abortController: controller,
+      blocks: itemsToBlocks([before]),
+      pendingUserMessages: [
+        {
+          tempId: "pend_bob",
+          content: [{ type: "input_text", text: "steer me" }],
+          posted: true,
+          author: "bob@example.com",
+        },
+      ],
+    });
+
+    const loop = startStreamPump("conv_reconnect_cross_author", controller, setState, getState);
+    await drainAsync();
+    expect(sinks).toHaveLength(1);
+
+    // Alice steered the same text during the gap; Bob's own delivery has not
+    // arrived yet, so his echo must stay his.
+    const alice = { ...userMessage("xa_gap", "steer me"), created_by: "alice@example.com" };
+    seedSessionItems("conv_reconnect_cross_author", [before, alice]);
+    seedUnconsumedInputIds("conv_reconnect_cross_author", [alice.id]);
+    sinks[0]!.error();
+    await drainAsync();
+    expect(sinks).toHaveLength(2);
+
+    const state = useChatStore.getState();
+    expect(state.blocks.map((b) => b.ctx.itemId)).toEqual([before.id]);
+    expect(state.pendingUserMessages).toEqual([
+      {
+        tempId: `delivered:${alice.id}`,
+        content: [{ type: "input_text", text: "steer me" }],
+        posted: true,
+        deliveredItemId: alice.id,
+        author: "alice@example.com",
+      },
+      {
+        tempId: "pend_bob",
+        content: [{ type: "input_text", text: "steer me" }],
+        posted: true,
+        author: "bob@example.com",
+      },
+    ]);
+
+    const last = sinks[1]!;
+    last.push("data: [DONE]\n\n");
+    last.close();
+    await drainAsync(2);
+    await loop;
+  });
+
   it("clears the MCP startup band when its settle event fired into the reconnect gap", async () => {
     seedSession("conv_mcp_gap", []);
     sessionMcpStartup.set("conv_mcp_gap", { safe: { status: "starting", error: null } });
@@ -12328,6 +12719,47 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     expect(useChatStore.getState().blocks.map((b) => b.ctx.itemId)).toEqual(
       [...preGap.slice(-SESSION_HISTORY_PAGE_SIZE), ...gap].map((item) => item.id),
     );
+
+    const last = sinks[1]!;
+    last.push("data: [DONE]\n\n");
+    last.close();
+    await drainAsync(2);
+    await loop;
+  });
+
+  it("re-hydrates an unconsumed gap item into the pending lane, not the window", async () => {
+    const preGap = Array.from({ length: 30 }, (_, i) => gapUser("upre", i));
+    const windowItems = preGap.slice(-SESSION_HISTORY_PAGE_SIZE);
+    seedSession("conv_bigap_unconsumed", preGap);
+    const sinks = routeStreamOpens();
+    const controller = new AbortController();
+    useChatStore.setState({
+      conversationId: "conv_bigap_unconsumed",
+      abortController: controller,
+      blocks: itemsToBlocks(windowItems),
+      hasMoreHistory: true,
+      oldestItemId: windowItems[0]!.id,
+    });
+
+    const loop = startStreamPump("conv_bigap_unconsumed", controller, setState, getState);
+    await drainAsync();
+    expect(sinks).toHaveLength(1);
+
+    // The gap outruns the backfill cap, so the window is fetched afresh; its
+    // newest item is a steered message the runner still buffers.
+    const gap = Array.from({ length: 100 }, (_, i) => gapUser("ugap", i));
+    const steered = gap.at(-1)!;
+    seedSessionItems("conv_bigap_unconsumed", [...preGap, ...gap]);
+    seedUnconsumedInputIds("conv_bigap_unconsumed", [steered.id]);
+    sinks[0]!.error();
+    await drainAsync();
+    expect(sinks).toHaveLength(2);
+
+    const state = useChatStore.getState();
+    expect(state.blocks.map((b) => b.ctx.itemId)).toEqual(
+      gap.slice(-INITIAL_WINDOW_ITEMS, -1).map((item) => item.id),
+    );
+    expect(state.pendingUserMessages.map((p) => p.deliveredItemId)).toEqual([steered.id]);
 
     const last = sinks[1]!;
     last.push("data: [DONE]\n\n");

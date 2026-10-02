@@ -523,3 +523,24 @@ describe("UserBubble @-mention attachment chips", () => {
     expect(screen.queryByText(/uploads\/image\.png/)).toBeNull();
   });
 });
+
+describe("UserBubble pending (delivered, not yet consumed) affordance", () => {
+  it("marks a pending bubble with data-pending and dims its content", () => {
+    renderBubble(userBubble("steered follow-up", { pending: true, awaitingConsumption: true }));
+    const bubble = screen.getByTestId("message-bubble");
+    expect(bubble.getAttribute("data-pending")).toBe("true");
+    // The entrance animation pins the outer element's opacity, so the dim
+    // lives on a descendant that wraps the message content.
+    expect(bubble.className).not.toContain("opacity-60");
+    const dimmed = bubble.querySelector(".opacity-60");
+    expect(dimmed).not.toBeNull();
+    expect(dimmed!.contains(screen.getByText("steered follow-up"))).toBe(true);
+  });
+
+  it("renders a committed bubble with no pending affordance", () => {
+    renderBubble(userBubble("normal message"));
+    const bubble = screen.getByTestId("message-bubble");
+    expect(bubble.getAttribute("data-pending")).toBeNull();
+    expect(bubble.querySelector(".opacity-60")).toBeNull();
+  });
+});

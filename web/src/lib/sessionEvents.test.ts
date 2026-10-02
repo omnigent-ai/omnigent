@@ -18,6 +18,7 @@ import type {
   SessionModelOptionsEvent,
   SessionCreatedEvent,
   SessionInputConsumedEvent,
+  SessionInputDeliveredEvent,
   SessionInterruptedEvent,
   SessionModelEvent,
   SessionPermissionModeEvent,
@@ -197,6 +198,32 @@ describe("session.input.consumed (NESTED envelope)", () => {
     });
     // null (not undefined) so the store's `if (cleared)` guard reads cleanly.
     expect((out[0] as SessionInputConsumedEvent).clearedPendingId).toBeNull();
+  });
+});
+
+describe("session.input.delivered (NESTED envelope)", () => {
+  it("lifts item_id, type, created_by and inner data from the nested payload", () => {
+    const out = parse("session.input.delivered", {
+      type: "session.input.delivered",
+      data: {
+        item_id: "item_steer",
+        type: "message",
+        created_by: "alice@example.com",
+        data: { role: "user", content: [{ type: "input_text", text: "steer" }] },
+      },
+    });
+    expect(out).toHaveLength(1);
+    const ev = out[0] as SessionInputDeliveredEvent;
+    expect(ev.type).toBe("session_input_delivered");
+    expect(ev.itemId).toBe("item_steer");
+    expect(ev.itemType).toBe("message");
+    expect(ev.createdBy).toBe("alice@example.com");
+    expect(ev.isMeta).toBe(false);
+    expect(ev.data).toEqual({ role: "user", content: [{ type: "input_text", text: "steer" }] });
+  });
+
+  it("rejects when nested envelope is absent", () => {
+    expect(parse("session.input.delivered", { type: "session.input.delivered" })).toEqual([]);
   });
 });
 

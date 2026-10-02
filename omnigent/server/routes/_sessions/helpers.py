@@ -92,6 +92,7 @@ from omnigent.runtime import (
     inflight_text,
     pending_elicitations,
     pending_inputs,
+    unconsumed_inputs,
 )
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.runtime.policies.engine import PolicyEngine
@@ -265,6 +266,7 @@ from omnigent.server.schemas import (
     SessionGitOptions,
     SessionInputConsumedEvent,
     SessionInputConsumedPayload,
+    SessionInputDeliveredEvent,
     SessionInterruptedEvent,
     SessionInterruptedPayload,
     SessionListItem,
@@ -1706,6 +1708,27 @@ def _publish_input_consumed(
             data=item.data.model_dump() if item.data is not None else {},
             created_by=item.created_by,
             cleared_pending_id=cleared_pending_id,
+        ),
+    )
+    session_stream.publish(session_id, event.model_dump())
+
+
+def _publish_input_delivered(
+    session_id: str,
+    item: ConversationItem,
+) -> None:
+    """Publish a persisted steered item that has not been consumed.
+
+    The caller decides what is tracked; hidden `is_meta` context is consumed
+    at once instead of being announced here.
+    """
+    event = SessionInputDeliveredEvent(
+        type="session.input.delivered",
+        data=SessionInputConsumedPayload(
+            item_id=item.id,
+            type=item.type,
+            data=item.data.model_dump() if item.data is not None else {},
+            created_by=item.created_by,
         ),
     )
     session_stream.publish(session_id, event.model_dump())
@@ -4797,6 +4820,13 @@ def _publish_status(
     # in-process flow performs a legitimate ``failed`` → ``idle``
     # transition (compaction failure publishes ``running`` → ``idle``, not
     # ``failed``), so this is a safe, harness-agnostic invariant.
+    if status == "idle":
+        # Only idle proves the turn buffer is empty: the runner publishes
+        # `failed` before draining a buffered continuation, and `waiting`
+        # can be re-announced while a message is still buffered. Anything
+        # still tracked lost its drain marker, so settle it for every client.
+        for drained_item in unconsumed_inputs.drain(session_id):
+            _publish_input_consumed(session_id, drained_item)
     if status == "idle" and _session_status_cache.get(session_id) == "failed":
         # Session stays ``failed`` (terminal); the turn is over, so drop any
         # tracked in-flight response id rather than leaving it for the
@@ -11598,6 +11628,7 @@ __all__ = [
     "_publish_external_output_text_delta",
     "_publish_external_tool_output_delta",
     "_publish_input_consumed",
+    "_publish_input_delivered",
     "_publish_input_deny_terminal",
     "_publish_interrupted",
     "_publish_mcp_startup",
