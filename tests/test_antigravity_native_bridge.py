@@ -2211,14 +2211,27 @@ def test_send_interaction_keys_via_tui_sends_one_send_keys_invocation(
     bridge_dir = tmp_path / "bridge"
     write_tmux_target(bridge_dir, socket_path=Path("/tmp/ex/tmux.sock"), tmux_target="main")
     captured: list[list[str]] = []
+    modal = (
+        "────────────────────────────────\n"
+        "Do you want to proceed?\n"
+        "  1. Yes\n"
+        "  2. Always allow\n"
+        "  3. Allow this command\n"
+        "> 4. No\n"
+        "────────────────────────────────\n"
+        "esc to cancel\n"
+    )
 
     def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
         del kwargs
         if "has-session" in cmd:
             return SimpleNamespace(returncode=0, stdout="", stderr="")
+        if "capture-pane" in cmd:
+            return SimpleNamespace(returncode=0, stdout=modal, stderr="")
         captured.append(cmd)
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
+    monkeypatch.setattr(_mod, "_AGY_INTERACTION_RPC_REDRAW_GRACE_S", 0.0)
     monkeypatch.setattr("subprocess.run", _fake_run)
     send_interaction_keys_via_tui(bridge_dir, "1", "Enter")
 
@@ -2235,20 +2248,89 @@ def test_send_interaction_keys_via_tui_reject_sequence(
     bridge_dir = tmp_path / "bridge"
     write_tmux_target(bridge_dir, socket_path=Path("/tmp/ex/tmux.sock"), tmux_target="main")
     captured: list[list[str]] = []
+    modal = (
+        "────────────────────────────────\n"
+        "Do you want to proceed?\n"
+        "  1. Yes\n"
+        "  2. Always allow\n"
+        "  3. Allow this command\n"
+        "> 4. No\n"
+        "────────────────────────────────\n"
+        "esc to cancel\n"
+    )
 
     def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
         del kwargs
         if "has-session" in cmd:
             return SimpleNamespace(returncode=0, stdout="", stderr="")
+        if "capture-pane" in cmd:
+            return SimpleNamespace(returncode=0, stdout=modal, stderr="")
         captured.append(cmd)
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
+    monkeypatch.setattr(_mod, "_AGY_INTERACTION_RPC_REDRAW_GRACE_S", 0.0)
     monkeypatch.setattr("subprocess.run", _fake_run)
     send_interaction_keys_via_tui(bridge_dir, "4", "Enter")
 
     assert captured == [
         ["tmux", "-S", "/tmp/ex/tmux.sock", "send-keys", "-t", "main", "4", "Enter"]
     ]
+
+
+def test_send_interaction_keys_via_tui_skips_when_rpc_restores_composer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """New agy redraws to the normal composer after RPC; no approval digit is typed."""
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(bridge_dir, socket_path=Path("/tmp/ex/tmux.sock"), tmux_target="main")
+    sent: list[list[str]] = []
+    composer = (
+        "────────────────────────────────\n"
+        ">\n"
+        "────────────────────────────────\n"
+        "? for shortcuts\n"
+    )
+
+    def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        del kwargs
+        if "has-session" in cmd:
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        if "capture-pane" in cmd:
+            return SimpleNamespace(returncode=0, stdout=composer, stderr="")
+        sent.append(cmd)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    send_interaction_keys_via_tui(bridge_dir, "1", "Enter")
+
+    assert sent == []
+
+
+def test_send_interaction_keys_via_tui_skips_ambiguous_pane(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Unknown post-RPC TUI state must not receive a literal approval digit."""
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(bridge_dir, socket_path=Path("/tmp/ex/tmux.sock"), tmux_target="main")
+    sent: list[list[str]] = []
+    ambiguous = "running tool...\nesc to cancel\n"
+
+    def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        del kwargs
+        if "has-session" in cmd:
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        if "capture-pane" in cmd:
+            return SimpleNamespace(returncode=0, stdout=ambiguous, stderr="")
+        sent.append(cmd)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(_mod, "_AGY_INTERACTION_RPC_REDRAW_GRACE_S", 0.0)
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    send_interaction_keys_via_tui(bridge_dir, "1", "Enter")
+
+    assert sent == []
 
 
 def test_send_interaction_keys_via_tui_raises_without_target(tmp_path: Path) -> None:
