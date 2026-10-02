@@ -300,6 +300,9 @@ def test_cold_resume_does_not_replay_duplicate_tool_result(tmp_path: Path) -> No
                     online = True
                     break
             except httpx.HTTPError:
+                # The server or runner is still starting up; transient connection
+                # and HTTP errors are expected here, so keep polling until the
+                # deadline instead of failing fast.
                 pass
             time.sleep(_POLL_S)
         assert online, (
