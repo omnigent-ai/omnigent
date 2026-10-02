@@ -600,7 +600,7 @@ async def test_session_name_uses_worker_start_in_task_timezone(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("failure", ["invalid", "timezone", "unexpected", "oversize"])
-async def test_session_name_failure_is_literal_and_warns(
+async def test_session_name_failure_is_literal_and_logs_once(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, failure: str
 ) -> None:
     monkeypatch.setattr(fire_mod.time, "time", lambda: 1790946300)
@@ -627,7 +627,12 @@ async def test_session_name_failure_is_literal_and_warns(
     assert conversations.created[0]["title"] == task.name
     assert store.runs[0]["status"] == "running"
     launch.assert_awaited_once()
-    assert any(task.id in record.message and "name" in record.message for record in caplog.records)
+    assert len(caplog.records) == 1
+    record = caplog.records[0]
+    assert record.levelno == (logging.ERROR if failure == "unexpected" else logging.WARNING)
+    assert record.name == fire_mod.__name__
+    assert task.id in record.message and "name" in record.message
+    assert (record.exc_info is not None) == (failure == "unexpected")
 
 
 @pytest.mark.asyncio
