@@ -776,16 +776,34 @@ function pullRequestLabel(pr: GithubPrAssociation): string {
   return title ? `${identity} — ${title}` : identity;
 }
 
+/** Pick the best default PR URL from a list based on state priority.
+ *  OPEN > CLOSED (not merged) > MERGED; within each state, preserve list order
+ *  (the server already sorts by most-recently-seen within each state group). */
+export function selectDefaultPr(prs: GithubPrAssociation[]): string | undefined {
+  const STATE_PRIORITY: Record<string, number> = { OPEN: 0, CLOSED: 1, MERGED: 2 };
+  const priority = (prState?: string | null) => STATE_PRIORITY[(prState ?? "").toUpperCase()] ?? 1;
+  let best: GithubPrAssociation | undefined;
+  for (const pr of prs) {
+    if (!best || priority(pr.state) < priority(best.state)) best = pr;
+    if (priority(best.state) === 0) break; // OPEN found; stop scanning
+  }
+  return best?.url;
+}
+
 export function GithubPanel({ conversationId }: { conversationId: string }) {
   const isMobileViewport = useIsMobileViewport();
-  const [selection, setSelection] = useState<{ sessionId: string; url?: string }>();
+  // Per-session explicit selection. The Map key is the session ID; the value is
+  // the selected PR URL, or undefined when the user explicitly cleared it.
+  // Sessions not yet in the Map fall back to the server's default.
+  const [selections, setSelections] = useState<Map<string, string | undefined>>(() => new Map());
   const [prPickerOpen, setPrPickerOpen] = useState(false);
   const [prPickerTooltipOpen, setPrPickerTooltipOpen] = useState(false);
   // Select focuses rows on both pointer hover and keyboard navigation.
   const [focusedPrUrl, setFocusedPrUrl] = useState<string>();
   const [linking, setLinking] = useState(false);
   const [url, setUrl] = useState("");
-  const selected = selection?.sessionId === conversationId ? selection.url : undefined;
+  // selected is undefined when the session hasn't been initialized yet (not in Map).
+  const selected = selections.get(conversationId);
   const info = useGithubInfo(conversationId, { poll: true, prUrl: selected });
   const [knownAssociations, setKnownAssociations] = useState<{
     sessionId: string;
@@ -806,11 +824,21 @@ export function GithubPanel({ conversationId }: { conversationId: string }) {
     (knownAssociations?.sessionId === conversationId ? knownAssociations.data : undefined);
   const update = useUpdateSessionPr(conversationId);
   useEffect(() => {
-    if (!selected && info.data?.selected_pr_url) {
-      setSelection({ sessionId: conversationId, url: info.data.selected_pr_url });
-    }
-  }, [conversationId, selected, info.data?.selected_pr_url]);
-  const changeSelection = (next?: string) => setSelection({ sessionId: conversationId, url: next });
+    // Only set a default the first time data arrives for a session (sessions already
+    // in the Map keep their stored selection even if the server's default changes).
+    const defaultUrl = info.data?.selected_pr_url;
+    if (!defaultUrl) return;
+    setSelections((prev) => {
+      if (prev.has(conversationId)) return prev; // explicit or previously-set selection wins
+      // Prefer the best PR by state; the server already returns the best as
+      // selected_pr_url, but the prs list may have fresher state data.
+      const prsList = info.data?.prs;
+      const chosenUrl = prsList?.length ? (selectDefaultPr(prsList) ?? defaultUrl) : defaultUrl;
+      return new Map(prev).set(conversationId, chosenUrl);
+    });
+  }, [conversationId, info.data?.selected_pr_url, info.data?.prs]);
+  const changeSelection = (next?: string) =>
+    setSelections((prev) => new Map(prev).set(conversationId, next));
   const prs = associations?.prs ?? [];
   const selectedPr = prs.find((pr) => pr.url === (selected ?? associations?.selected_pr_url));
   const linkInEmptyState = prs.length === 0 && deriveGithubPanelState(info).kind === "no-pr";

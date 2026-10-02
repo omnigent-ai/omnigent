@@ -618,6 +618,94 @@ def test_title_cache_preserves_newer_timeout_marker(
     assert store.list() == latest
 
 
+# ── State-based ordering (OMNI-10446) ────────────────────────────────────────
+
+
+def test_list_sorts_open_before_merged(tmp_path: Path) -> None:
+    """OPEN PR is placed first in list() regardless of last_seen_at order."""
+    store = SessionPrRegistry("conv_a", root=tmp_path)
+    # Record in order: A most recently, B older, then C oldest
+    store.record([PullRequestRef.from_url(A)], relationship="created", source="test", timestamp=30)
+    store.record([PullRequestRef.from_url(B)], relationship="created", source="test", timestamp=20)
+    # Cache states: A is MERGED (most recent), B is OPEN (older), C has no state
+    store.update_titles({}, states={A: "MERGED", B: "OPEN"})
+    result = store.list()
+    # B (OPEN, older) must come before A (MERGED, newer)
+    assert [e.url for e in result] == [B, A]
+
+
+@pytest.mark.parametrize(
+    "a_state,b_state,expected_order",
+    [
+        # OPEN beats every other state
+        ("OPEN", "MERGED", [A, B]),
+        ("OPEN", "CLOSED", [A, B]),
+        ("MERGED", "OPEN", [B, A]),
+        # CLOSED beats MERGED
+        ("CLOSED", "MERGED", [A, B]),
+        ("MERGED", "CLOSED", [B, A]),
+        # Same-state: most recently seen first (A seen at 30, B at 20)
+        ("OPEN", "OPEN", [A, B]),
+        ("MERGED", "MERGED", [A, B]),
+        # None (unknown) sorts like CLOSED — ahead of MERGED
+        (None, "MERGED", [A, B]),
+        ("MERGED", None, [B, A]),
+    ],
+)
+def test_list_state_priority_ordering(
+    tmp_path: Path, a_state: str | None, b_state: str | None, expected_order: list[str]
+) -> None:
+    store = SessionPrRegistry("conv_a", root=tmp_path)
+    store.record([PullRequestRef.from_url(A)], relationship="created", source="test", timestamp=30)
+    store.record([PullRequestRef.from_url(B)], relationship="created", source="test", timestamp=20)
+    states = {url: s for url, s in [(A, a_state), (B, b_state)] if s is not None}
+    if states:
+        store.update_titles({}, states=states)
+    assert [e.url for e in store.list()] == expected_order
+
+
+def test_update_titles_caches_state(tmp_path: Path) -> None:
+    """States passed to update_titles are persisted alongside titles."""
+    store = SessionPrRegistry("conv_a", root=tmp_path)
+    store.record([PullRequestRef.from_url(A)], relationship="created", source="test", timestamp=10)
+    store.record([PullRequestRef.from_url(B)], relationship="created", source="test", timestamp=20)
+    store.update_titles({A: "PR one"}, states={A: "OPEN", B: "MERGED"}, timestamp=30)
+    entries = {e.url: e for e in store.list()}
+    assert entries[A].state == "OPEN"
+    assert entries[A].title == "PR one"
+    assert entries[B].state == "MERGED"
+    # State update must not unset a non-None previous state unless explicitly changed
+    store.update_titles({}, states={A: "MERGED"}, timestamp=40)
+    assert store.list()[0].state == "MERGED"  # A state updated
+    # An empty states dict is a no-op; guard prevents unnecessary writes
+    before = store.list()
+    store.update_titles({})
+    assert store.list() == before
+
+
+def test_state_is_backward_compatible_with_old_registry(tmp_path: Path) -> None:
+    """Registry files written before the state field was added deserialize fine."""
+    store = SessionPrRegistry("conv_a", root=tmp_path)
+    store.path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "prs": [
+                    {
+                        **PullRequestRef.from_url(A).model_dump(),
+                        "relationship": "created",
+                        "source": "test",
+                        "first_seen_at": 10,
+                        "last_seen_at": 10,
+                    }
+                ],
+            }
+        )
+    )
+    entry = store.list()[0]
+    assert entry.state is None  # missing field defaults to None
+
+
 def test_concurrent_writers_preserve_all_prs(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

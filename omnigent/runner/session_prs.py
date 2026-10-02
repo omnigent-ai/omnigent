@@ -79,6 +79,16 @@ class PullRequestRef(BaseModel):
         return f"{self.host}/{self.repository}"
 
 
+# Default-selection rank by PR state; an unprobed PR ranks with CLOSED so it
+# isn't buried behind a known-merged one.
+_PR_STATE_PRIORITY = {"OPEN": 0, "CLOSED": 1, "MERGED": 2}
+
+
+def pr_state_priority(state: str | None) -> int:
+    """Return a PR state's default-selection rank (lower is preferred)."""
+    return _PR_STATE_PRIORITY.get((state or "").upper(), 1)
+
+
 class SessionPullRequest(PullRequestRef):
     relationship: Literal["created", "worked_on", "attached", "inferred"]
     source: str
@@ -87,6 +97,8 @@ class SessionPullRequest(PullRequestRef):
     title: str | None = None
     title_checked_at: float = 0
     title_lookup_timed_out: bool = False
+    # Cached PR state ("OPEN", "CLOSED", "MERGED"); None when not yet fetched.
+    state: str | None = None
 
 
 class _Registry(BaseModel):
@@ -111,8 +123,10 @@ class SessionPrRegistry:
             return _Registry()
 
     def list(self) -> list[SessionPullRequest]:
-        """Read an atomic snapshot; corruption is reported without overwriting it."""
-        return sorted(self._read().prs, key=lambda pr: pr.last_seen_at, reverse=True)
+        """Read an atomic snapshot, open PRs first, then most recently seen."""
+        return sorted(
+            self._read().prs, key=lambda pr: (pr_state_priority(pr.state), -pr.last_seen_at)
+        )
 
     def _write(self, state: _Registry) -> None:
         fd, temporary = tempfile.mkstemp(prefix=".session-prs-", dir=self.path.parent)
@@ -164,6 +178,7 @@ class SessionPrRegistry:
                     title=previous.title if previous else None,
                     title_checked_at=previous.title_checked_at if previous else 0,
                     title_lookup_timed_out=previous.title_lookup_timed_out if previous else False,
+                    state=previous.state if previous else None,
                 )
             state.prs = list(entries.values())
             if observation_id:
@@ -176,26 +191,35 @@ class SessionPrRegistry:
         *,
         timestamp: float | None = None,
         timed_out_urls: Collection[str] = (),
+        states: Mapping[str, str | None] | None = None,
     ) -> None:
-        """Cache title lookups without reordering or recreating removed associations."""
-        if not titles:
+        """Cache title (and optionally state) lookups without reordering or recreating
+        removed associations."""
+        if not titles and not states:
             return
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         with FileLock(str(self.path) + ".lock", timeout=1):
-            state = self._read()
+            registry = self._read()
             now = time.time() if timestamp is None else timestamp
             changed = False
-            for entry in state.prs:
-                if entry.url not in titles or entry.title_checked_at > now:
-                    continue
-                title = titles[entry.url]
-                if title is not None:
-                    entry.title = title
-                entry.title_checked_at = now
-                entry.title_lookup_timed_out = title is None and entry.url in timed_out_urls
-                changed = True
+            for entry in registry.prs:
+                if entry.url in (titles or {}):
+                    if entry.title_checked_at <= now:
+                        title = titles[entry.url]  # type: ignore[index]
+                        if title is not None:
+                            entry.title = title
+                        entry.title_checked_at = now
+                        entry.title_lookup_timed_out = (
+                            title is None and entry.url in timed_out_urls
+                        )
+                        changed = True
+                if states and entry.url in states:
+                    new_state = states[entry.url]
+                    if new_state is not None and entry.state != new_state:
+                        entry.state = new_state
+                        changed = True
             if changed:
-                self._write(state)
+                self._write(registry)
 
     def remove(self, url: str) -> None:
         """Remember removal so subsequent hook replay cannot attach the PR again."""

@@ -105,6 +105,8 @@ export interface GithubPrAssociation {
   number: number;
   title?: string | null;
   relationship: "created" | "worked_on" | "attached" | "inferred";
+  /** "OPEN" | "CLOSED" | "MERGED" once probed; null/undefined when not yet fetched. */
+  state?: string | null;
 }
 
 function prQuery(prUrl?: string): string {

@@ -74,7 +74,7 @@ vi.mock("@/components/ai-elements/message", () => ({
 
 import { useGithubInfo, useGithubChangedFiles } from "@/hooks/useGithub";
 
-import { GithubPanel, deriveGithubPanelState } from "./GithubPanel";
+import { GithubPanel, deriveGithubPanelState, selectDefaultPr } from "./GithubPanel";
 import { RunnerOfflineError } from "@/hooks/useWorkspaceChangedFiles";
 
 function file(
@@ -742,5 +742,152 @@ describe("session PR selection", () => {
     };
     renderPanel();
     expect(useGithubChangedFiles).toHaveBeenLastCalledWith("conv_1", true, url, "base:head");
+  });
+});
+
+describe("selectDefaultPr", () => {
+  const pr = (url: string, prState?: string | null) => ({
+    url,
+    host: "github.com",
+    repository: "example/repo",
+    number: 1,
+    relationship: "created" as const,
+    state: prState,
+  });
+
+  it("returns undefined for an empty list", () => {
+    expect(selectDefaultPr([])).toBeUndefined();
+  });
+
+  it("prefers OPEN over MERGED", () => {
+    const open = pr("https://github.com/a/b/pull/1", "OPEN");
+    const merged = pr("https://github.com/a/b/pull/2", "MERGED");
+    expect(selectDefaultPr([merged, open])).toBe(open.url);
+    expect(selectDefaultPr([open, merged])).toBe(open.url);
+  });
+
+  it("prefers OPEN over CLOSED", () => {
+    const open = pr("https://github.com/a/b/pull/1", "OPEN");
+    const closed = pr("https://github.com/a/b/pull/2", "CLOSED");
+    expect(selectDefaultPr([closed, open])).toBe(open.url);
+  });
+
+  it("prefers CLOSED over MERGED", () => {
+    const closed = pr("https://github.com/a/b/pull/1", "CLOSED");
+    const merged = pr("https://github.com/a/b/pull/2", "MERGED");
+    expect(selectDefaultPr([merged, closed])).toBe(closed.url);
+    expect(selectDefaultPr([closed, merged])).toBe(closed.url);
+  });
+
+  it("treats unknown/null state like CLOSED (ahead of MERGED)", () => {
+    const unknown = pr("https://github.com/a/b/pull/1", null);
+    const merged = pr("https://github.com/a/b/pull/2", "MERGED");
+    expect(selectDefaultPr([merged, unknown])).toBe(unknown.url);
+  });
+
+  it("returns first item when all states are equal", () => {
+    const a = pr("https://github.com/a/b/pull/1", "OPEN");
+    const b = pr("https://github.com/a/b/pull/2", "OPEN");
+    expect(selectDefaultPr([a, b])).toBe(a.url);
+  });
+
+  it("uses case-insensitive state comparison", () => {
+    const open = pr("https://github.com/a/b/pull/1", "open");
+    const merged = pr("https://github.com/a/b/pull/2", "merged");
+    expect(selectDefaultPr([merged, open])).toBe(open.url);
+  });
+});
+
+describe("session PR selection persistence (OMNI-10426)", () => {
+  const one = "https://github.com/example/one/pull/42";
+  const two = "https://github.com/example/two/pull/42";
+
+  /** Build a tracking info object using the test fixture's existing pr fields. */
+  function trackingInfo(selectedUrl: string, prs: { url: string; state?: string | null }[]) {
+    return {
+      isLoading: false,
+      error: null,
+      isFetching: false,
+      data: {
+        ...state.info!.data!,
+        tracking_available: true,
+        selected_pr_url: selectedUrl,
+        prs: prs.map(({ url, state: s }) => ({
+          url,
+          host: "github.com",
+          repository: url.replace("https://github.com/", "").split("/pull/")[0],
+          number: 42,
+          title: `PR from ${url.split("/pull/")[0].split("/").pop()}`,
+          relationship: "created" as const,
+          state: s ?? null,
+        })),
+        pr: {
+          ...state.info!.data!.pr!,
+          url: selectedUrl,
+          state: prs.find((p) => p.url === selectedUrl)?.state ?? "OPEN",
+        },
+      },
+    };
+  }
+
+  it("remembers the server default when switching sessions and back", () => {
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+
+    state.info = trackingInfo(one, [{ url: one, state: "OPEN" }]);
+    const { rerender } = render(<GithubPanel conversationId="session_a" />, {
+      wrapper: ({ children }) => (
+        <QueryClientProvider client={client}>{children}</QueryClientProvider>
+      ),
+    });
+    // After effect fires, session A's selection is stored as one (the OPEN PR)
+    expect(useGithubInfo).toHaveBeenLastCalledWith("session_a", { poll: true, prUrl: one });
+
+    // Switch to session B — effect fires and stores two
+    state.info = trackingInfo(two, [{ url: two, state: "MERGED" }]);
+    rerender(<GithubPanel conversationId="session_b" />);
+    expect(useGithubInfo).toHaveBeenLastCalledWith("session_b", { poll: true, prUrl: two });
+
+    // Switch back to session A — the Map already has one stored; NOT reset to merged
+    state.info = trackingInfo(one, [{ url: one, state: "OPEN" }]);
+    rerender(<GithubPanel conversationId="session_a" />);
+    // Session A's stored selection (one) is used, not session B's merged PR (two)
+    expect(useGithubInfo).toHaveBeenLastCalledWith("session_a", { poll: true, prUrl: one });
+  });
+
+  it("auto-selects the OPEN PR even when server selected_pr_url points to merged", () => {
+    // Server returns merged as selected_pr_url, but prs list has state info
+    // showing the other PR is OPEN — client uses selectDefaultPr to prefer it
+    state.info = trackingInfo(two, [
+      { url: two, state: "MERGED" },
+      { url: one, state: "OPEN" },
+    ]);
+    state.info.data!.selected_pr_url = two;
+    renderPanel();
+    // The panel should pick the OPEN PR via selectDefaultPr, not the merged one
+    expect(useGithubInfo).toHaveBeenLastCalledWith("conv_1", { poll: true, prUrl: one });
+  });
+
+  it("does not reset an explicit selection when data refreshes", async () => {
+    const user = userEvent.setup();
+    state.info = trackingInfo(one, [
+      { url: one, state: "OPEN" },
+      { url: two, state: "MERGED" },
+    ]);
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const { rerender } = render(<GithubPanel conversationId="conv_1" />, {
+      wrapper: ({ children }) => (
+        <QueryClientProvider client={client}>{children}</QueryClientProvider>
+      ),
+    });
+
+    // User explicitly picks the other (merged) PR via the dropdown
+    const picker = screen.getByRole("combobox", { name: "Session pull request" });
+    await user.click(picker);
+    await user.click(screen.getByRole("option", { name: /example\/two #42/ }));
+    expect(useGithubInfo).toHaveBeenLastCalledWith("conv_1", { poll: true, prUrl: two });
+
+    // Data refreshes with the same info — the explicit selection must not be overwritten
+    rerender(<GithubPanel conversationId="conv_1" />);
+    expect(useGithubInfo).toHaveBeenLastCalledWith("conv_1", { poll: true, prUrl: two });
   });
 });
