@@ -7,7 +7,7 @@ import {
 } from "@tanstack/react-query";
 import { useEffect, useLayoutEffect, useRef } from "react";
 import { authenticatedFetch } from "@/lib/identity";
-import { fetchWithTimeout } from "@/lib/fetchTimeout";
+import { ApiTimeoutError, fetchWithTimeout } from "@/lib/fetchTimeout";
 import type { NativeModelOption } from "@/lib/types";
 
 export interface Host {
@@ -99,8 +99,13 @@ async function fetchHostModelOptions(
   hostId: string,
   harness: string,
 ): Promise<NativeModelOption[]> {
-  const res = await authenticatedFetch(
-    `/v1/hosts/${encodeURIComponent(hostId)}/harnesses/${encodeURIComponent(harness)}/model-options`,
+  // Bounded like the other one-shot reads so a hung host can't keep the
+  // New Chat harness picker's loading spinner indefinitely.
+  const res = await fetchWithTimeout((signal) =>
+    authenticatedFetch(
+      `/v1/hosts/${encodeURIComponent(hostId)}/harnesses/${encodeURIComponent(harness)}/model-options`,
+      { signal },
+    ),
   );
   if (!res.ok) {
     let detail = `${res.status} ${res.statusText}`;
@@ -157,10 +162,13 @@ export function useHostModelOptions(
     staleTime: 15_000,
     refetchInterval: canRefresh ? 15_000 : false,
     ...(!poll && { refetchOnWindowFocus: false, refetchOnReconnect: false }),
-    // Retry boot-probe races while any picker uses this catalog. Persistent
-    // failures surface after bounded backoff (~22 s).
-    retry: (failureCount) =>
-      (modelCatalogPollers.get(queryClient)?.get(pollerKey) ?? 0) > 0 && failureCount < 6,
+    // Retry boot-probe races while any picker uses this catalog, but not a
+    // client timeout: a wedged host won't recover in seconds, and the 15 s
+    // refetchInterval picks it up later.
+    retry: (failureCount, error) =>
+      !(error instanceof ApiTimeoutError) &&
+      (modelCatalogPollers.get(queryClient)?.get(pollerKey) ?? 0) > 0 &&
+      failureCount < 6,
     retryDelay: (attempt) => Math.min(5_000, 1_000 * 2 ** attempt),
   });
   const previouslyRefreshing = useRef(canRefresh);

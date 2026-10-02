@@ -3,6 +3,8 @@ import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
 import { startTransition, Suspense, useState, type ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import { ApiTimeoutError, DEFAULT_API_TIMEOUT_MS } from "@/lib/fetchTimeout";
+
 import {
   useDetectedCredentials,
   useHostModelOptions,
@@ -397,6 +399,67 @@ describe("useHostModelOptions", () => {
     renderHook(() => useHostModelOptions(null, "claude-native"), { wrapper });
     await Promise.resolve();
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("passes an AbortSignal to bound the model-options fetch", async () => {
+    // A hung backend must not keep the harness picker loading forever — the
+    // AbortSignal lets the platform cancel the request after the deadline.
+    fetchMock.mockResolvedValueOnce(mockResponse({ models: [] }));
+    renderHook(() => useHostModelOptions("host_1", "claude-native"), { wrapper });
+    await waitFor(() => expect(fetchMock).toHaveBeenCalled());
+    const [_url, init] = fetchMock.mock.calls[0] as [string, RequestInit | undefined];
+    expect(init?.signal).toBeInstanceOf(AbortSignal);
+  });
+
+  it("settles to error (not loading) after a single timeout, no retries", async () => {
+    // A hung model-options probe must surface as an error promptly so the
+    // New Chat harness picker stops spinning. ApiTimeoutError bypasses the
+    // retry loop so only one 30 s wait occurs, not six.
+    vi.useFakeTimers();
+    try {
+      // Never-resolving mock: fetchWithTimeout's internal timer fires instead.
+      fetchMock.mockReturnValue(new Promise<Response>(() => {}));
+      // poll:false → no poller registered → the ApiTimeoutError branch still
+      // short-circuits, but this also rules out unrelated retry side-effects.
+      const { result } = renderHook(
+        () => useHostModelOptions("host_1", "claude-native", true, { poll: false }),
+        { wrapper },
+      );
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(DEFAULT_API_TIMEOUT_MS + 1);
+      });
+      expect(result.current.isError).toBe(true);
+      expect(result.current.error).toBeInstanceOf(ApiTimeoutError);
+      // One fetch only — no retries on timeout.
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("refetches on the poll interval even after a timeout error", async () => {
+    // refetchInterval fires on a 15 s cycle regardless of error state, so
+    // the picker recovers automatically once the host is healthy again.
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      // First call hangs (triggers timeout); second call succeeds.
+      fetchMock
+        .mockReturnValueOnce(new Promise<Response>(() => {}))
+        .mockResolvedValue(mockResponse({ models: [{ id: "sonnet", displayName: "Sonnet" }] }));
+
+      const { result } = renderHook(() => useHostModelOptions("host_1", "claude-native"), {
+        wrapper,
+      });
+      // Fire the timeout, flush React updates.
+      await vi.advanceTimersByTimeAsync(DEFAULT_API_TIMEOUT_MS + 1);
+      await waitFor(() => expect(result.current.isError).toBe(true));
+      // Advance past the poll interval — refetchInterval fires a new fetch.
+      await vi.advanceTimersByTimeAsync(15_000);
+      await waitFor(() => expect(result.current.isSuccess).toBe(true));
+      expect(result.current.data?.map((m) => m.displayName)).toEqual(["Sonnet"]);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("surfaces the host probe error from a non-OK response", async () => {
