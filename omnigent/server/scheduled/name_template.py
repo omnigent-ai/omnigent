@@ -7,7 +7,6 @@ from zoneinfo import ZoneInfo
 _TOKENS = ("YYYY", "MMMM", "MMM", "MM", "Mon", "DD", "dddd", "ddd", "HH", "mm")
 _SUPPORTED = "supported tokens: " + " ".join(_TOKENS)
 _RUNS = re.compile(r"[A-Za-z]+|[ /.:,_-]+")
-_COMPACT = re.compile(r"(?:" + "|".join(_TOKENS) + r"){2,}")
 _CLOCK_HINT = "mm is minutes and needs HH (e.g. {{HH:mm}}); MM is the month"
 _MONTHS = (
     "January",
@@ -56,6 +55,18 @@ class NameTemplateError(ValueError):
     """An automation name contains an invalid date placeholder."""
 
 
+def _can_segment_tokens(run: str) -> bool:
+    reachable = [False] * (len(run) + 1)
+    reachable[0] = True
+    for position in range(len(run)):
+        if not reachable[position]:
+            continue
+        for token in _TOKENS:
+            if run.startswith(token, position):
+                reachable[position + len(token)] = True
+    return reachable[-1]
+
+
 def _pattern(body: str) -> tuple[str, ...]:
     if "%" in body:
         raise NameTemplateError("strftime codes are not supported; " + _SUPPORTED)
@@ -66,7 +77,7 @@ def _pattern(body: str) -> tuple[str, ...]:
     for run in runs[::2]:
         if run not in _TOKENS:
             hint = _HINTS.get(run)
-            if hint is None and _COMPACT.fullmatch(run):
+            if hint is None and _can_segment_tokens(run):
                 hint = (
                     "separate the tokens or use adjacent placeholders, e.g. {{YYYY}}{{MM}}{{DD}}"
                 )

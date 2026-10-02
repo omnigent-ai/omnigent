@@ -152,3 +152,15 @@ def test_worst_case_template_stays_within_render_limit(token: str, expected: str
     rendered = render_session_name(name, september, "UTC")
     assert rendered == " ".join([expected] * 50) + "abc"
     assert len(rendered) == 502 <= 768
+
+
+@pytest.mark.timeout(2, method="signal")
+@pytest.mark.parametrize("render", [False, True], ids=["validate", "render"])
+def test_adversarial_letter_run_finishes_with_normal_error(render: bool) -> None:
+    name = "{{" + "M" * 251 + "X}}"
+    assert len(name) == 256
+    with pytest.raises(NameTemplateError, match=r"^supported tokens:"):
+        if render:
+            render_session_name(name, REFERENCE_EPOCH, TIMEZONE)
+        else:
+            validate_name_template(name)
