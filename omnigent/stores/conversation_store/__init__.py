@@ -241,6 +241,32 @@ class CreatedSession:
     agent: Agent
 
 
+# Newest compaction items a snapshot aggregate reads. Bounds the work per
+# snapshot however long a session has lived; ``count`` saturates here.
+COMPACTION_COUNT_CAP = 1000
+
+
+@dataclass(frozen=True)
+class CompactionStats:
+    """
+    Aggregate view of a conversation's persisted compaction items.
+
+    Returned by :meth:`ConversationStore.get_compaction_stats` so the
+    session snapshot can expose a metadata-level compaction signal
+    (``compaction_count`` / ``last_compaction_at``) without paging the
+    transcript.
+
+    :param count: Compaction items persisted to the conversation, e.g.
+        ``2``; ``0`` when none. Exact up to :data:`COMPACTION_COUNT_CAP`,
+        which longer histories report instead.
+    :param last_compaction_at: Unix epoch seconds of the most recent
+        compaction item, or ``None`` when ``count`` is ``0``.
+    """
+
+    count: int
+    last_compaction_at: int | None
+
+
 @dataclass(frozen=True)
 class SessionConnectivity:
     """
@@ -668,6 +694,24 @@ class ConversationStore(ABC):
             between two page fetches) — its position is unknowable, and an
             empty page would be indistinguishable from a completed
             enumeration.
+        """
+        ...
+
+    @abstractmethod
+    def get_compaction_stats(self, conversation_id: str) -> CompactionStats:
+        """
+        Return the compaction aggregate for one conversation.
+
+        Aggregates the newest :data:`COMPACTION_COUNT_CAP` compaction
+        items, so the session snapshot can carry ``compaction_count`` /
+        ``last_compaction_at`` without paging the transcript and with
+        bounded work per call.
+
+        :param conversation_id: Unique conversation identifier,
+            e.g. ``"conv_abc123"``.
+        :returns: A :class:`CompactionStats`; ``count=0`` with
+            ``last_compaction_at=None`` when the conversation has no
+            compaction items (or does not exist).
         """
         ...
 

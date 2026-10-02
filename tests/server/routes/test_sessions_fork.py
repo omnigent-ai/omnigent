@@ -33,7 +33,7 @@ from omnigent.server.managed_hosts import (
 )
 from omnigent.server.routes import _session_create_validation as create_validation
 from omnigent.server.routes.sessions import create_sessions_router, routes_core
-from omnigent.stores.conversation_store import _FORK_ONLY_DROPPED_LABEL_KEYS
+from omnigent.stores.conversation_store import _FORK_ONLY_DROPPED_LABEL_KEYS, CompactionStats
 
 # ── Minimal store stubs ──────────────────────────────────────────
 
@@ -117,15 +117,22 @@ class _ConversationStore:
         self,
         conversations: dict[str, Conversation],
         items_by_conv: dict[str, list[ConversationItem]] | None = None,
+        compaction_stats: CompactionStats | None = None,
     ) -> None:
         """
         Initialize the stub.
 
         :param conversations: Map from conversation ID to Conversation.
         :param items_by_conv: Map from conversation ID to items.
+        :param compaction_stats: Aggregate ``get_compaction_stats`` returns
+            for any conversation; the empty aggregate when omitted.
         """
         self._convs = conversations
         self._items = items_by_conv or {}
+        self.compaction_stats = compaction_stats or CompactionStats(
+            count=0, last_compaction_at=None
+        )
+        self.compaction_stats_calls: list[str] = []
         self.fork_calls: list[dict[str, Any]] = []
         self.label_writes: list[tuple[str, dict[str, str]]] = []
 
@@ -160,6 +167,16 @@ class _ConversationStore:
         :returns: The Conversation if found, else None.
         """
         return self._convs.get(conversation_id)
+
+    def get_compaction_stats(self, conversation_id: str) -> CompactionStats:
+        """
+        Return the configured compaction aggregate and record the lookup.
+
+        :param conversation_id: Conversation ID to aggregate.
+        :returns: The ``compaction_stats`` given at construction.
+        """
+        self.compaction_stats_calls.append(conversation_id)
+        return self.compaction_stats
 
     def fork_conversation(
         self,
@@ -620,6 +637,7 @@ async def test_fork_session_happy_path(monkeypatch: pytest.MonkeyPatch) -> None:
     conv_store = _ConversationStore(
         conversations={"e9f8f58523cec9a57d3bdf93be543e8c": conv},
         items_by_conv={"e9f8f58523cec9a57d3bdf93be543e8c": items},
+        compaction_stats=CompactionStats(count=2, last_compaction_at=1700000041),
     )
     agent_store = _AgentStore(
         agents={
@@ -672,6 +690,10 @@ async def test_fork_session_happy_path(monkeypatch: pytest.MonkeyPatch) -> None:
         f"Copied items should preserve content and order, got {item_texts}"
     )
     assert body["title"] == "My Fork"
+    # The fork's snapshot carries the aggregate computed for the new conversation.
+    assert body["compaction_count"] == 2
+    assert body["last_compaction_at"] == 1700000041
+    assert conv_store.compaction_stats_calls == [body["id"]]
     assert chokepoint_calls == 1
 
     # The agent clone is created INSIDE fork_conversation (atomically), not

@@ -2273,8 +2273,6 @@ def test_list_items_type_filter_returns_only_matching_type(
     list_items(type=...) returns only items of the specified type,
     while list_items() without a filter returns all types.
     """
-    from omnigent.entities import CompactionData
-
     conv = conversation_store.create_conversation()
 
     # Append a mix of message and compaction items
@@ -2349,8 +2347,6 @@ def test_list_items_type_filter_with_order_and_limit(
     list_items(type="compaction", order="desc", limit=1) returns only
     the most recently appended compaction item.
     """
-    from omnigent.entities import CompactionData
-
     conv = conversation_store.create_conversation()
 
     # Append two compaction items
@@ -2395,6 +2391,140 @@ def test_list_items_type_filter_with_order_and_limit(
         f"got: {result.data[0].data.summary!r}. "
         "Failure means order=desc with limit=1 did not return the newest item."
     )
+
+
+def test_get_compaction_stats_counts_compactions_and_tracks_latest(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """
+    get_compaction_stats aggregates only compaction items.
+
+    The session snapshot surfaces this aggregate as
+    ``compaction_count`` / ``last_compaction_at`` so an orchestrator
+    can spot a repeatedly-compacting stalled session from metadata
+    alone. Messages must not count, and the timestamp must follow the
+    newest compaction item.
+    """
+    conv = conversation_store.create_conversation()
+
+    # No items at all → zero aggregate, no timestamp.
+    empty = conversation_store.get_compaction_stats(conv.id)
+    assert empty.count == 0
+    assert empty.last_compaction_at is None
+
+    conversation_store.append(
+        conv.id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="resp_001",
+                data=MessageData(role="user", content=[{"type": "input_text", "text": "hi"}]),
+            ),
+        ],
+    )
+    # Messages alone must not register as compactions.
+    after_message = conversation_store.get_compaction_stats(conv.id)
+    assert after_message.count == 0
+    assert after_message.last_compaction_at is None
+
+    for ordinal in (1, 2):
+        conversation_store.append(
+            conv.id,
+            [
+                NewConversationItem(
+                    type="compaction",
+                    response_id=f"resp_compact_{ordinal}",
+                    data=CompactionData(
+                        summary=f"Summary {ordinal}",
+                        last_item_id="7ae6efab548a4e13ae0ac9efc56d841e",
+                        model="openai/gpt-4o",
+                        token_count=50,
+                    ),
+                ),
+            ],
+        )
+
+    stats = conversation_store.get_compaction_stats(conv.id)
+    assert stats.count == 2, (
+        f"Expected 2 compactions counted, got {stats.count}. Failure means "
+        "the aggregate missed persisted compaction items or counted messages."
+    )
+    latest = conversation_store.list_items(conv.id, type="compaction", order="desc", limit=1)
+    assert stats.last_compaction_at == latest.data[0].created_at, (
+        "last_compaction_at must equal the newest compaction item's created_at."
+    )
+
+
+def test_get_compaction_stats_is_scoped_per_conversation(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """
+    One conversation's compactions must never leak into another's stats.
+
+    If the aggregate dropped its conversation filter, every session
+    snapshot would report the workspace-wide compaction total and the
+    stall signal would fire on healthy sessions.
+    """
+    compacted = conversation_store.create_conversation()
+    quiet = conversation_store.create_conversation()
+
+    conversation_store.append(
+        compacted.id,
+        [
+            NewConversationItem(
+                type="compaction",
+                response_id="resp_compact",
+                data=CompactionData(
+                    summary="Condensed",
+                    last_item_id="cb01aedfa2199bc66feb77ba3b82f90a",
+                    model="openai/gpt-4o",
+                    token_count=64,
+                ),
+            ),
+        ],
+    )
+
+    assert conversation_store.get_compaction_stats(compacted.id).count == 1
+    other = conversation_store.get_compaction_stats(quiet.id)
+    assert other.count == 0
+    assert other.last_compaction_at is None
+
+
+def test_get_compaction_stats_reads_a_bounded_page(
+    conversation_store: SqlAlchemyConversationStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    The aggregate reads at most COMPACTION_COUNT_CAP newest compaction items.
+
+    Snapshot cost must not grow with a session's compaction history, so the
+    count saturates at the cap while the timestamp still follows the newest
+    item.
+    """
+    from omnigent.stores.conversation_store import sqlalchemy_store as store_module
+
+    monkeypatch.setattr(store_module, "COMPACTION_COUNT_CAP", 3)
+    conv = conversation_store.create_conversation()
+    conversation_store.append(
+        conv.id,
+        [
+            NewConversationItem(
+                type="compaction",
+                response_id=f"resp_compact_{ordinal}",
+                data=CompactionData(
+                    summary=f"Summary {ordinal}",
+                    last_item_id="7ae6efab548a4e13ae0ac9efc56d841e",
+                    model="openai/gpt-4o",
+                    token_count=50,
+                ),
+            )
+            for ordinal in range(5)
+        ],
+    )
+
+    stats = conversation_store.get_compaction_stats(conv.id)
+    assert stats.count == 3, f"count must saturate at the cap, got {stats.count}"
+    latest = conversation_store.list_items(conv.id, type="compaction", order="desc", limit=1)
+    assert stats.last_compaction_at == latest.data[0].created_at
 
 
 # ── Sub-agent conversation isolation ────────────────
@@ -4468,6 +4598,14 @@ def test_fork_remaps_compaction_boundary_to_copied_item(
     assert isinstance(fork_compaction.data, CompactionData)
     assert fork_compaction.data.last_item_id != boundary.id
     assert fork_compaction.data.last_item_id == fork_items[0].id
+    # The fork's aggregate counts the copied compaction; a cutoff before it copies none.
+    full_stats = conversation_store.get_compaction_stats(fork.id)
+    assert full_stats.count == 1
+    assert full_stats.last_compaction_at == fork_compaction.created_at
+    partial = conversation_store.fork_conversation(source.id, up_to_response_id="resp_001")
+    partial_stats = conversation_store.get_compaction_stats(partial.id)
+    assert partial_stats.count == 0
+    assert partial_stats.last_compaction_at is None
 
 
 def _count_encode_hooks(

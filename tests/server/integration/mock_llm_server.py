@@ -449,9 +449,10 @@ def anthropic_sse_text_response(
     ``message_delta``, ``message_stop``.
 
     :param usage: Optional prompt-usage overrides merged into the
-        ``message_start`` event's ``message.usage`` (e.g.
-        ``{"input_tokens": 50000}``), so tests can script the observed
-        context size. Defaults keep the historical fixed values.
+        ``message_start`` event's ``message.usage`` and repeated in the
+        final ``message_delta`` usage (e.g. ``{"input_tokens": 50000}``),
+        so tests can script the context size Claude Code observes.
+        Defaults keep the historical fixed values.
     """
     msg_id = f"msg_{_uuid_mod.uuid4().hex[:12]}"
     output_tokens = max(5, len(text.split()))
@@ -473,7 +474,7 @@ def anthropic_sse_text_response(
                 "model": model,
                 "stop_reason": None,
                 "stop_sequence": None,
-                "usage": {"input_tokens": 10, "output_tokens": 0, **(usage or {})},
+                "usage": {"input_tokens": 10, **(usage or {}), "output_tokens": 0},
             },
         },
     )
@@ -505,7 +506,9 @@ def anthropic_sse_text_response(
         {
             "type": "message_delta",
             "delta": {"stop_reason": "end_turn", "stop_sequence": None},
-            "usage": {"output_tokens": output_tokens},
+            # The real API repeats cumulative prompt usage here; Claude Code
+            # reads its context size from this final usage.
+            "usage": {**(usage or {}), "output_tokens": output_tokens},
         },
     )
     _evt("message_stop", {"type": "message_stop"})
@@ -551,7 +554,7 @@ def anthropic_sse_thinking_text_response(
                 "model": model,
                 "stop_reason": None,
                 "stop_sequence": None,
-                "usage": {"input_tokens": 10, "output_tokens": 0, **(usage or {})},
+                "usage": {"input_tokens": 10, **(usage or {}), "output_tokens": 0},
             },
         },
     )
@@ -609,7 +612,7 @@ def anthropic_sse_thinking_text_response(
         {
             "type": "message_delta",
             "delta": {"stop_reason": "end_turn", "stop_sequence": None},
-            "usage": {"output_tokens": output_tokens},
+            "usage": {**(usage or {}), "output_tokens": output_tokens},
         },
     )
     _evt("message_stop", {"type": "message_stop"})
@@ -619,8 +622,13 @@ def anthropic_sse_thinking_text_response(
 def anthropic_sse_tool_call_response(
     tool_calls: list[dict[str, str]],
     model: str = "mock-model",
+    usage: dict | None = None,
 ) -> str:
-    """Build Anthropic Messages API SSE stream for tool use blocks."""
+    """Build Anthropic Messages API SSE stream for tool use blocks.
+
+    :param usage: Optional prompt-usage overrides merged into
+        ``message_start`` (see :func:`anthropic_sse_text_response`).
+    """
     msg_id = f"msg_{_uuid_mod.uuid4().hex[:12]}"
     events: list[str] = []
 
@@ -639,7 +647,7 @@ def anthropic_sse_tool_call_response(
                 "model": model,
                 "stop_reason": None,
                 "stop_sequence": None,
-                "usage": {"input_tokens": 10, "output_tokens": 0},
+                "usage": {"input_tokens": 10, **(usage or {}), "output_tokens": 0},
             },
         },
     )
@@ -681,7 +689,7 @@ def anthropic_sse_tool_call_response(
         {
             "type": "message_delta",
             "delta": {"stop_reason": "tool_use", "stop_sequence": None},
-            "usage": {"output_tokens": 5},
+            "usage": {**(usage or {}), "output_tokens": 5},
         },
     )
     _evt("message_stop", {"type": "message_stop"})
@@ -1234,7 +1242,9 @@ async def create_message(
     if qr.refusal_category is not None:
         sse_body = anthropic_sse_refusal_response(model=echo_model, category=qr.refusal_category)
     elif qr.tool_calls:
-        sse_body = anthropic_sse_tool_call_response(qr.tool_calls, model=echo_model)
+        sse_body = anthropic_sse_tool_call_response(
+            qr.tool_calls, model=echo_model, usage=qr.usage
+        )
     elif qr.thinking:
         sse_body = anthropic_sse_thinking_text_response(
             qr.thinking, qr.text, model=echo_model, usage=qr.usage
