@@ -236,6 +236,47 @@ def test_genuine_reauth_codex_reauth_required_is_preserved() -> None:
     assert classify_native_turn_error("codex_reauth_required", message) == "codex_reauth_required"
 
 
+@pytest.mark.parametrize("code", ["native_turn_error", "codex_turn_error"])
+@pytest.mark.parametrize(
+    "message",
+    [
+        "API Error: Server error mid-response. The response above may be incomplete.",
+        "Connection lost mid-response. The response above may be incomplete.",
+        "connection lost mid-response",
+        "API Error: 503 Service Unavailable",
+        "HTTP 500 Internal Server Error",
+        "HTTP/1.1 502 Bad Gateway",
+        "status_code: 504 Gateway Timeout",
+        "API Error: 529",
+        "The model is overloaded. Please retry your request.",
+    ],
+)
+def test_classifies_transient_upstream_errors(code: str, message: str) -> None:
+    assert classify_native_turn_error(code, message) == "transient_upstream_error"
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        # Deterministic failures must keep the generic, non-retryable code.
+        "prompt is too long: 250000 tokens > 200000 maximum",
+        "API Error: 400 · context_length_exceeded: maximum context window reached",
+        "There's an issue with the selected model. It may not exist.",
+        "API Error: Request rejected (404) · model not found",
+        "API Error: Request rejected (401) · UNAUTHENTICATED",
+        "API Error: Request rejected (403) · PERMISSION_DENIED",
+    ],
+)
+def test_deterministic_native_errors_are_not_transient(message: str) -> None:
+    assert classify_native_turn_error("native_turn_error", message) == "native_turn_error"
+
+
+def test_429_still_classifies_as_rate_limit_not_transient() -> None:
+    assert (
+        classify_native_turn_error("native_turn_error", "API Error: 429") == "rate_limit_exceeded"
+    )
+
+
 @pytest.mark.parametrize(
     ("code", "expected_substring"),
     [
@@ -246,6 +287,7 @@ def test_genuine_reauth_codex_reauth_required_is_preserved() -> None:
         ("connection_error", "connection"),
         ("context_length_exceeded", "context window"),
         ("rate_limit_exceeded", "You can retry this turn"),
+        ("transient_upstream_error", "temporary error"),
         ("budget_exhausted", "budget"),
         ("databricks_sign_in_pending", "Databricks sign-in"),
         ("agent_startup_pending", "still starting"),

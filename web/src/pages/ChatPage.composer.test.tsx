@@ -866,7 +866,9 @@ describe("Composer slash-command menu", () => {
     ["codex-native", "/compact", "waiting"],
     ["codex-native", "/compact extra arguments", "idle"],
     ["pi-native", "/compact", "idle"],
+    ["pi-native", "/compact instructions", "idle"],
     ["pi-native", "/compact", "running"],
+    ["opencode-native", "/compact", "idle"],
   ] as const)("%s handles %s (status: %s)", (harness, command, turnStatus) => {
     const { sessionHarness, status, sessionStatus } = useChatStore.getState();
     onTestFinished(() => useChatStore.setState({ sessionHarness, status, sessionStatus }));
@@ -893,9 +895,16 @@ describe("Composer slash-command menu", () => {
 
     fireEvent.change(textarea(), { target: { value: command + " " } });
     fireEvent.keyDown(textarea(), { key: "Enter" });
-    if ((harness === "codex-native" || harness === "claude-sdk") && command !== "/compact") {
+    if (
+      (harness === "codex-native" || harness === "claude-sdk" || harness === "pi-native") &&
+      command !== "/compact"
+    ) {
       expect(textarea()).toHaveValue(command + " ");
-      const harnessName = harness === "codex-native" ? "Codex" : "Claude SDK";
+      const harnessName = {
+        "codex-native": "Codex",
+        "pi-native": "Pi",
+        "claude-sdk": "Claude SDK",
+      }[harness];
       expect(
         screen.getByText(`/compact does not accept arguments for ${harnessName}`),
       ).toBeVisible();
@@ -905,16 +914,15 @@ describe("Composer slash-command menu", () => {
     }
     expect(textarea()).toHaveValue("");
     expect(error).not.toHaveBeenCalled();
-    if (harness === "claude-native" || harness === "claude-sdk" || harness === "codex-native") {
-      const sent = harness === "codex-native" ? "/compact" : command;
-      expect(props.onSend).toHaveBeenCalledExactlyOnceWith(sent);
-      expect(compact).not.toHaveBeenCalled();
-      fireEvent.keyDown(textarea(), { key: "ArrowUp" });
-      expect(textarea()).toHaveValue(sent);
-    } else {
+    if (harness === "opencode-native") {
       expect(compact).toHaveBeenCalledOnce();
       expect(props.onSend).not.toHaveBeenCalled();
+      return;
     }
+    expect(props.onSend).toHaveBeenCalledExactlyOnceWith(command);
+    expect(compact).not.toHaveBeenCalled();
+    fireEvent.keyDown(textarea(), { key: "ArrowUp" });
+    expect(textarea()).toHaveValue(command);
   });
 
   it.each(["Enter", "click"])("shows a toast for busy Codex /compact via %s", (submit) => {
@@ -2960,6 +2968,15 @@ describe("Composer native skill menu", () => {
   it("completes at the caret and preserves the suffix", async () => {
     render(<Composer {...composerProps({ isNativeWrapper: true })} />);
     fireEvent.change(textarea(), { target: { value: "please /rev this change" } });
+    fireEvent.select(textarea(), { target: { selectionStart: 11, selectionEnd: 11 } });
+    fireEvent.keyDown(textarea(), { key: "Tab" });
+    expect(textarea()).toHaveValue("please $review this change");
+    await waitFor(() => expect(textarea().selectionStart).toBe(15));
+  });
+
+  it("preserves adjacent prose after a partial inline skill", async () => {
+    render(<Composer {...composerProps({ isNativeWrapper: true })} />);
+    fireEvent.change(textarea(), { target: { value: "please /revthis change" } });
     fireEvent.select(textarea(), { target: { selectionStart: 11, selectionEnd: 11 } });
     fireEvent.keyDown(textarea(), { key: "Tab" });
     expect(textarea()).toHaveValue("please $review this change");

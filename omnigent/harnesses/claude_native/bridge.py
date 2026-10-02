@@ -67,6 +67,7 @@ from filelock import FileLock
 from filelock import Timeout as FileLockTimeout
 
 from omnigent._platform import IS_WINDOWS, is_wsl, stable_user_id
+from omnigent.harnesses.claude_native import delivery_diagnostics
 from omnigent.harnesses.claude_native.message_display_hook import MESSAGE_DELTAS_FILE
 from omnigent.harnesses.claude_native.status import CONTEXT_RAW_FILE
 from omnigent.harnesses.diagnostics import detect_sign_in_prompt, sign_in_next_step
@@ -897,6 +898,9 @@ class ClaudeHookRecord:
     :param transcript_path: Claude transcript path from the hook
         payload, e.g. ``"/home/user/.claude/projects/x/session.jsonl"``,
         or ``None`` when absent.
+    :param agent_id: Claude subagent id from the hook payload, e.g.
+        ``"a4892977eed616593"``. Claude Code sets it only for hooks fired
+        inside a subagent; ``None`` for the parent process.
     :param previous_claude_session_id: Claude session id that was
         active immediately before this hook, e.g.
         ``"a1b2c3d4-1234-5678-9abc-def012345678"``, or ``None``
@@ -954,6 +958,7 @@ class ClaudeHookRecord:
     source: str | None = None
     claude_session_id: str | None = None
     transcript_path: Path | None = None
+    agent_id: str | None = None
     previous_claude_session_id: str | None = None
     claude_session_was_seen: bool | None = None
     clear_rotated_to: str | None = None
@@ -3585,9 +3590,9 @@ def stop_hook_seen_since(bridge_dir: Path, start_event_count: int) -> bool:
     Return whether Claude reported a stop event after a hook cursor.
 
     Only counts stop events from the parent Claude process — subagent
-    stop events (whose ``transcript_path`` contains a ``subagents/``
-    component) are ignored so a finishing subagent does not
-    prematurely signal the parent turn as complete.
+    stop events (carrying an ``agent_id``, or whose ``transcript_path``
+    contains a ``subagents/`` component) are ignored so a finishing
+    subagent does not prematurely signal the parent turn as complete.
 
     :param bridge_dir: Bridge directory path.
     :param start_event_count: Hook record count captured before a
@@ -3612,6 +3617,8 @@ def stop_hook_seen_since(bridge_dir: Path, start_event_count: int) -> bool:
                         payload.get("transcript_path") if isinstance(payload, dict) else None
                     )
                     if isinstance(transcript_path, str) and "/subagents/" in transcript_path:
+                        continue
+                    if isinstance(payload, dict) and payload.get("agent_id"):
                         continue
                     return True
     except FileNotFoundError:
@@ -3693,6 +3700,7 @@ def _hook_record_from_jsonl_record(record: _JsonlRecord) -> ClaudeHookRecord:
     raw_recorded_at = envelope.get("recorded_at") if isinstance(envelope, dict) else None
     raw_claude_session_id = payload.get("session_id") if isinstance(payload, dict) else None
     raw_transcript_path = payload.get("transcript_path") if isinstance(payload, dict) else None
+    raw_agent_id = payload.get("agent_id") if isinstance(payload, dict) else None
     raw_previous_claude_session_id = (
         payload.get("omnigent_previous_claude_session_id") if isinstance(payload, dict) else None
     )
@@ -3803,6 +3811,7 @@ def _hook_record_from_jsonl_record(record: _JsonlRecord) -> ClaudeHookRecord:
             if isinstance(raw_transcript_path, str) and raw_transcript_path
             else None
         ),
+        agent_id=raw_agent_id if isinstance(raw_agent_id, str) and raw_agent_id else None,
         previous_claude_session_id=(
             raw_previous_claude_session_id
             if isinstance(raw_previous_claude_session_id, str) and raw_previous_claude_session_id
@@ -3962,6 +3971,9 @@ def write_tmux_target(
     _write_json_file(bridge_dir / _TMUX_FILE, payload)
 
 
+@delivery_diagnostics.trace_delivery(
+    session_id_reader=read_active_session_id, cancelled_error=ClaudeInjectionCancelled
+)
 @_serialize_bridge_injection
 def inject_user_message(
     bridge_dir: Path,
@@ -4027,7 +4039,9 @@ def inject_user_message(
         invocation fails, or if the draft never leaves the input box
         after repeated submit Enters (message not delivered).
     """
+    delivery_diagnostics.set_stage("waiting_for_tmux")
     info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
+    delivery_diagnostics.set_stage("restoring_input")
     # A surface left occupying the composer swallows everything typed
     # below — and hides the input box, wedging the readiness gate — so
     # reclaim the input box before waiting on it.
@@ -4035,6 +4049,7 @@ def inject_user_message(
     # tmux.json only means the tmux session exists; Claude Code's input
     # box mounts a few seconds later. Block until the prompt renders so
     # the first message isn't typed into a still-booting TUI and dropped.
+    delivery_diagnostics.set_stage("waiting_for_prompt")
     _wait_for_claude_prompt_ready(
         info["socket_path"],
         info["tmux_target"],
@@ -4120,19 +4135,17 @@ def _paste_and_submit(
     :raises RuntimeError: If a ``tmux`` invocation fails, or if the draft
         never leaves the input box after repeated submit Enters.
     """
+    delivery_diagnostics.start_attempt()
+    delivery_diagnostics.set_stage("checking_pending_prompt")
     if has_pending_user_prompt(bridge_dir):
         raise ClaudeUserPromptPending(
             "Answer the pending Claude question or permission request before sending a message."
         )
-    # Clear any leftover text in Claude's input field before typing.
-    # After Escape-cancel, Claude Code re-populates the prompt area
-    # with the previous input for re-editing. Without this clear,
-    # the new message appends to the stale buffer (e.g.
-    # "old promptnew prompt" with no separator).
-    # Ctrl-A (Home) + Ctrl-K (kill-to-end) is the safest pair —
-    # Ctrl-U only clears backwards from cursor.
-    _run_tmux(socket_path, "send-keys", "-t", tmux_target, "C-a")
-    _run_tmux(socket_path, "send-keys", "-t", tmux_target, "C-k")
+    delivery_diagnostics.set_stage("pasting")
+    # Clear stale text first: raw controls can otherwise become pasted text.
+    # CSI-u sends Ctrl+A/Ctrl+K literally so Claude handles them as keys.
+    _run_tmux(socket_path, "send-keys", "-l", "-t", tmux_target, "\x1b[97;5u")
+    _run_tmux(socket_path, "send-keys", "-l", "-t", tmux_target, "\x1b[107;5u")
     # Trailing newline absorbs a trailing "\" so it can't escape the submit Enter.
     # Delivered through a tmux buffer, NOT ``send-keys`` argv: tmux caps one
     # client→server command at ~16KB, so per-byte hex argv blew up with
@@ -4170,20 +4183,41 @@ def _paste_and_submit(
     # when the draft never becomes identifiable (e.g. whitespace-only
     # first line, custom statusline containing the glyph), fall through
     # after the timeout and submit blind, matching the old behavior.
+    delivery_diagnostics.set_stage("waiting_for_draft")
     draft_seen = False
-    deadline = time.monotonic() + _PASTE_COMMIT_TIMEOUT_S
+    pane = ""
+    polls = 0
+    empty_captures = 0
+    paste_wait_started = time.monotonic()
+    deadline = paste_wait_started + _PASTE_COMMIT_TIMEOUT_S
     while time.monotonic() < deadline:
-        if _draft_in_input_box(_capture_pane(socket_path, tmux_target), needle):
+        pane = _capture_pane(socket_path, tmux_target)
+        polls += 1
+        empty_captures += not pane.strip()
+        if _draft_in_input_box(pane, needle):
             draft_seen = True
             break
         time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
+    delivery_diagnostics.record_draft(
+        pane=pane,
+        needle=needle,
+        prompt_glyph=_CLAUDE_PROMPT_GLYPH,
+        draft_seen=draft_seen,
+        start=paste_wait_started,
+        polls=polls,
+        empty_captures=empty_captures,
+    )
     time.sleep(_PASTE_SETTLE_S)
+    delivery_diagnostics.set_stage("checking_pending_prompt")
     if has_pending_user_prompt(bridge_dir):
         raise ClaudeUserPromptPending(
             "Claude is waiting for an explicit answer; message not sent."
         )
+    delivery_diagnostics.set_stage("submitting")
     _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
+    delivery_diagnostics.record_details(submit_sent=True)
     if not draft_seen:
+        delivery_diagnostics.record_details(verification="unverified")
         # The draft was never observed, so its absence proves nothing —
         # verification would trivially "pass". Submit blind as before.
         return
@@ -4193,6 +4227,7 @@ def _paste_and_submit(
     # after the burst, so it submits). Each Enter only fires while the
     # draft is verifiably still present, so a retry can never hit an
     # empty prompt or a permission dialog of the started turn.
+    delivery_diagnostics.set_stage("verifying_submit")
     if _verify_submit_accepted(
         socket_path,
         tmux_target,
@@ -4240,10 +4275,23 @@ def _verify_submit_accepted(
     last_enter = start
     retry_interval = _SUBMIT_RETRY_INTERVAL_S
     warned = False
+    retries = 0
+    polls = 0
+    pane = ""
     while time.monotonic() - start < _SUBMIT_VERIFY_TIMEOUT_S:
         time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
         pane = _capture_pane(socket_path, tmux_target)
+        polls += 1
         if not _draft_in_input_box(pane, needle):
+            delivery_diagnostics.record_verification(
+                draft_still_present=False,
+                pane=pane,
+                needle=needle,
+                prompt_glyph=_CLAUDE_PROMPT_GLYPH,
+                start=start,
+                retries=retries,
+                polls=polls,
+            )
             if warned:
                 _logger.info(
                     "claude-native: %s accepted after %.1fs of an unresponsive TUI",
@@ -4264,8 +4312,19 @@ def _verify_submit_accepted(
         if now - last_enter >= retry_interval:
             _raise_if_user_prompt_pending(bridge_dir, pane)
             _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
+            retries += 1
+            delivery_diagnostics.record_details(retries=retries)
             last_enter = now
             retry_interval = min(retry_interval * 2, _SUBMIT_RETRY_MAX_INTERVAL_S)
+    delivery_diagnostics.record_verification(
+        draft_still_present=True,
+        pane=pane,
+        needle=needle,
+        prompt_glyph=_CLAUDE_PROMPT_GLYPH,
+        start=start,
+        retries=retries,
+        polls=polls,
+    )
     return False
 
 

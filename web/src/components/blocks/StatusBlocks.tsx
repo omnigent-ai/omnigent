@@ -90,6 +90,8 @@ const FAILURE_CODE_DESCRIPTIONS: Record<string, string> = {
   native_turn_error: "The agent ran into an error during this turn.",
   native_prompt_not_recorded: "Message not delivered. Try sending it again.",
   rate_limit_exceeded: "The model's rate limit was reached. You can retry this turn.",
+  transient_upstream_error:
+    "The model service hit a temporary error mid-response; retrying usually continues the turn.",
   budget_exhausted:
     "The AI gateway refused this turn because a spending budget or usage limit is exhausted. Contact an admin to raise it, or use a different budget.",
 };
@@ -101,6 +103,15 @@ const RETRYABLE_ERROR_CODES = new Set([
   "runner_failed_to_start",
   "runner_unavailable",
   "rate_limit_exceeded",
+  "transient_upstream_error",
+]);
+
+// Failed turns the runner itself survived: the session is healthy, only the
+// upstream model call failed, so retry continues the turn in place instead of
+// resuming the runner.
+export const CONTINUE_TURN_ERROR_CODES = new Set([
+  "rate_limit_exceeded",
+  "transient_upstream_error",
 ]);
 
 interface ParsedErrorMessage {
@@ -284,7 +295,10 @@ export function ErrorBanner({
     ...relatedErrors,
   ].find((error) => RETRYABLE_ERROR_CODES.has(error.code));
   const retryable = onRetry !== undefined && actionableError !== undefined;
-  const retryLabel = actionableError?.code === "rate_limit_exceeded" ? "Retry" : "Resume session";
+  const retryLabel =
+    actionableError && CONTINUE_TURN_ERROR_CODES.has(actionableError.code)
+      ? "Retry"
+      : "Resume session";
 
   useEffect(() => () => window.clearTimeout(copyResetRef.current), []);
   useEffect(() => {

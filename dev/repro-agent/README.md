@@ -77,7 +77,10 @@ invocations below do not pause for registration or require those records.
 3. Identifies the smallest reliable regression coverage for the observed
    failure: an existing test, a small extension, a focused lower-level check,
    or a necessary e2e. It records the selection rationale and original evidence
-   so Resolve can decide which tests ship. Two new test layers are not required.
+   so Resolve can decide which tests ship. The final report cites test paths,
+   revisions, commands, results, and source locations instead of repeating full
+   test files. Complete files remain in the Repro worktree or CI bundle; uploads
+   are labeled pending until confirmed. Two new test layers are not required.
 4. Records each settled facet on its user-facing surface under `recordings/<slug>/`
    — a suitable journey driver with `OMNIGENT_E2E_RECORD_DIR` for web/terminal
    facets, a rendered VHS tape for CLI facets. The driver may be temporary and

@@ -273,6 +273,10 @@ describe("ErrorBanner", () => {
     ["databricks_sign_in_pending", "The agent is waiting for a Databricks sign-in."],
     ["agent_startup_pending", "The agent is still starting in the session terminal."],
     ["codex_thread_not_started", "Codex stopped before it could start, so this turn never ran."],
+    [
+      "transient_upstream_error",
+      "The model service hit a temporary error mid-response; retrying usually continues the turn.",
+    ],
   ])("describes a %s failure in plain English", (code, sentence) => {
     render(<ErrorBanner message="raw diagnostics" source="execution" code={code} />);
     expect(screen.getByText(sentence)).toBeInTheDocument();
@@ -688,6 +692,26 @@ describe("ErrorBanner", () => {
   it("does not offer rate-limit retry without a handler", () => {
     render(<ErrorBanner message={RATE_LIMIT_ERROR} source="llm" code="rate_limit_exceeded" />);
     expect(screen.queryByRole("button", { name: "Retry" })).toBeNull();
+  });
+
+  it("offers turn retry for a transient upstream failure", async () => {
+    const onRetry = vi.fn().mockResolvedValue(undefined);
+    render(
+      <ErrorBanner
+        message="API Error: Server error mid-response. The response above may be incomplete."
+        source="llm"
+        code="transient_upstream_error"
+        onRetry={onRetry}
+      />,
+    );
+
+    expect(screen.getByTestId("error-headline")).toHaveTextContent(
+      "The model service hit a temporary error mid-response; retrying usually continues the turn.",
+    );
+    // Turn retry, not a runner resume — the session itself is healthy.
+    expect(screen.queryByRole("button", { name: "Resume session" })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    await waitFor(() => expect(onRetry).toHaveBeenCalledTimes(1));
   });
 
   it.each(["native_turn_error", "codex_turn_error", "codex_reauth_required", "unauthorized"])(

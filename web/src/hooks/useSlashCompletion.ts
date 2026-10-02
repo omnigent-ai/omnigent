@@ -1,6 +1,22 @@
 import { useLayoutEffect, useRef, useState, type RefObject } from "react";
 import { rankedSlashCommandNames } from "@/components/SlashCommandMenu";
 
+function commandContinuationLength(token: string | undefined, tokenSuffix: string, cmd: string) {
+  if (!tokenSuffix || !token) return 0;
+
+  const tokenBody = token.slice(1).toLowerCase();
+  const commandBody = cmd.slice(1).toLowerCase();
+  if (!commandBody.startsWith(tokenBody)) return 0;
+
+  const continuation = commandBody.slice(tokenBody.length);
+  if (!continuation) return 0;
+
+  const suffix = tokenSuffix.toLowerCase();
+  if (continuation.startsWith(suffix)) return tokenSuffix.length;
+  if (suffix.startsWith(continuation)) return continuation.length;
+  return 0;
+}
+
 /** The slice of a textarea keydown the menu reads. */
 export interface SlashCompletionKeyEvent {
   key: string;
@@ -252,7 +268,8 @@ export function useSlashCompletion({
     builtinNames,
     onSelectionChange,
     complete: (cmd) => {
-      const suffix = text.slice(end);
+      const consumedContinuation = commandContinuationLength(token, tokenSuffix, cmd);
+      const suffix = text.slice(caret + consumedContinuation);
       const separator = /^\s/.test(suffix) ? "" : " ";
       const completedText = text.slice(0, start) + cmd + separator + suffix;
       // Leave existing newlines and tabs after the caret.

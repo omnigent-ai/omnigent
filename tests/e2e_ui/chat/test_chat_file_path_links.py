@@ -34,7 +34,6 @@ from __future__ import annotations
 
 import gzip
 import io
-import json
 import re
 import shutil
 import tarfile
@@ -45,6 +44,8 @@ from pathlib import Path
 import httpx
 import pytest
 from playwright.sync_api import Browser, Page, expect
+
+from tests._helpers.session import bind_session_runner, post_session_bundle
 
 _ROOT_FILE = "README.md"
 _README_CONTENT = "# Readme\n\nWorkspace-root file for the e2e link test.\n"
@@ -111,22 +112,14 @@ def linkify_session(
     ws = Path(tempfile.mkdtemp(prefix="omnigent-e2e-ui-links-", dir=Path.home()))
     (ws / _ROOT_FILE).write_text(_README_CONTENT)
 
-    create_resp = httpx.post(
-        f"{live_server}/v1/sessions",
-        data={"metadata": json.dumps({})},
-        files={"bundle": ("agent.tar.gz", _agent_bundle(str(ws)), "application/gzip")},
-        timeout=30.0,
+    create_resp = post_session_bundle(
+        httpx.post, f"{live_server}/v1/sessions", _agent_bundle(str(ws)), timeout=30.0
     )
     create_resp.raise_for_status()
     session_id = create_resp.json()["session_id"]
 
     try:
-        patch_resp = httpx.patch(
-            f"{live_server}/v1/sessions/{session_id}",
-            json={"runner_id": runner_id},
-            timeout=10.0,
-        )
-        patch_resp.raise_for_status()
+        bind_session_runner(httpx.patch, live_server, session_id, runner_id, timeout=10.0)
 
         env_resp = httpx.get(
             f"{live_server}/v1/sessions/{session_id}/resources/environments/default",

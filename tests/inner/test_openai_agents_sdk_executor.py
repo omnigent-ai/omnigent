@@ -12,6 +12,7 @@ from unittest.mock import patch
 
 import httpx
 import pytest
+from agents.usage import InputTokensDetails, Usage
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -109,17 +110,6 @@ class _FakeModelSettings:
 
 
 @dataclass
-class _FakePromptTokensDetails:
-    """
-    Minimal stand-in for OpenAI's ``prompt_tokens_details`` object.
-
-    :param cached_tokens: Number of tokens served from the prompt cache.
-    """
-
-    cached_tokens: int = 0
-
-
-@dataclass
 class _FakeUsage:
     """
     Minimal stand-in for the openai-agents SDK ModelResponse.usage object.
@@ -129,15 +119,27 @@ class _FakeUsage:
     :param total_tokens: Sum of input and output tokens for this call.
         ``0`` means the SDK did not report a total; the executor falls
         back to ``input_tokens + output_tokens``.
-    :param prompt_tokens_details: Optional breakdown of prompt tokens,
-        including ``cached_tokens``. ``None`` means the SDK did not
-        report cache details.
     """
 
     input_tokens: int = 0
     output_tokens: int = 0
     total_tokens: int = 0
-    prompt_tokens_details: _FakePromptTokensDetails | None = None
+
+
+def _sdk_usage(
+    *, input_tokens: int, output_tokens: int, total_tokens: int, cached_tokens: int = 0
+) -> Usage:
+    """
+    Build the real openai-agents ``Usage`` for one LLM call, so cache tests
+    pin the field the SDK actually populates (``input_tokens_details``).
+    """
+    return Usage(
+        requests=1,
+        input_tokens=input_tokens,
+        input_tokens_details=InputTokensDetails(cached_tokens=cached_tokens),
+        output_tokens=output_tokens,
+        total_tokens=total_tokens,
+    )
 
 
 @dataclass
@@ -148,7 +150,7 @@ class _FakeRawResponse:
     :param usage: Token usage for this LLM call.
     """
 
-    usage: _FakeUsage
+    usage: _FakeUsage | Usage
 
 
 class _FakeResult:
@@ -2555,8 +2557,8 @@ def test_policy_evaluator_allow_proceeds_to_run() -> None:
 
 def test_turn_usage_subtracts_cached_tokens_from_input() -> None:
     """
-    When ``prompt_tokens_details.cached_tokens`` is present, the
-    executor must subtract cached tokens from ``input_tokens`` and
+    When the SDK ``Usage`` reports ``input_tokens_details.cached_tokens``,
+    the executor must subtract cached tokens from ``input_tokens`` and
     report them as ``cache_read_input_tokens``.
 
     Without this, ``compute_llm_cost`` bills cached tokens at the
@@ -2568,11 +2570,8 @@ def test_turn_usage_subtracts_cached_tokens_from_input() -> None:
         result = _FakeResult(events=[], final_output="hello")
         result.raw_responses = [
             _FakeRawResponse(
-                usage=_FakeUsage(
-                    input_tokens=10000,
-                    output_tokens=500,
-                    total_tokens=10500,
-                    prompt_tokens_details=_FakePromptTokensDetails(cached_tokens=8000),
+                usage=_sdk_usage(
+                    input_tokens=10000, output_tokens=500, total_tokens=10500, cached_tokens=8000
                 )
             )
         ]
@@ -2610,8 +2609,8 @@ def test_turn_usage_subtracts_cached_tokens_from_input() -> None:
 
 def test_turn_usage_no_cached_tokens_omits_cache_key() -> None:
     """
-    When no ``prompt_tokens_details`` is present, the usage dict
-    must NOT contain ``cache_read_input_tokens`` — the executor
+    When the SDK ``Usage`` reports zero cached tokens (its default), the
+    usage dict must NOT contain ``cache_read_input_tokens`` — the executor
     degrades gracefully to the pre-cache behavior.
     """
 
@@ -2620,11 +2619,7 @@ def test_turn_usage_no_cached_tokens_omits_cache_key() -> None:
         result = _FakeResult(events=[], final_output="hello")
         result.raw_responses = [
             _FakeRawResponse(
-                usage=_FakeUsage(
-                    input_tokens=5000,
-                    output_tokens=300,
-                    total_tokens=5300,
-                )
+                usage=_sdk_usage(input_tokens=5000, output_tokens=300, total_tokens=5300)
             )
         ]
         _FakeRunner.next_result = result
@@ -2651,6 +2646,58 @@ def test_turn_usage_no_cached_tokens_omits_cache_key() -> None:
     _run(_t())
 
 
+def test_turn_usage_cached_tokens_clamped_to_input() -> None:
+    """
+    Malformed cached counts clamp per response to [0, input], so they neither
+    drive ``input_tokens`` negative nor absorb another response's uncached input.
+    """
+
+    async def _t() -> None:
+        _FakeRunner.last_calls = []
+        result = _FakeResult(events=[], final_output="hello")
+        result.raw_responses = [
+            _FakeRawResponse(
+                usage=_sdk_usage(
+                    input_tokens=1000, output_tokens=50, total_tokens=1050, cached_tokens=1500
+                )
+            ),
+            _FakeRawResponse(
+                usage=_sdk_usage(
+                    input_tokens=2000, output_tokens=100, total_tokens=2100, cached_tokens=500
+                )
+            ),
+            _FakeRawResponse(
+                usage=_sdk_usage(
+                    input_tokens=100, output_tokens=10, total_tokens=110, cached_tokens=-5
+                )
+            ),
+        ]
+        _FakeRunner.next_result = result
+        executor = OpenAIAgentsSDKExecutor(client=object())
+        with patch(
+            "omnigent.inner.openai_agents_sdk_executor._ensure_agents_sdk",
+            return_value=_fake_agents_sdk(),
+        ):
+            events = [
+                e
+                async for e in executor.run_turn(
+                    [{"role": "user", "content": "hi", "session_id": "s1"}],
+                    [],
+                    "",
+                )
+            ]
+
+        turn_complete = next(e for e in events if isinstance(e, TurnComplete))
+        usage = turn_complete.usage
+        assert usage is not None
+        # 1500 clamps to 1000, 500 is kept, -5 counts as 0: cached 1500 of 3100 input.
+        assert usage["cache_read_input_tokens"] == 1500
+        assert usage["input_tokens"] == 1600
+        assert usage["total_tokens"] == 3260
+
+    _run(_t())
+
+
 def test_turn_usage_cached_tokens_multi_call_sums_across_responses() -> None:
     """
     Across multiple raw responses in a single turn, cached tokens
@@ -2662,19 +2709,13 @@ def test_turn_usage_cached_tokens_multi_call_sums_across_responses() -> None:
         result = _FakeResult(events=[], final_output="done")
         result.raw_responses = [
             _FakeRawResponse(
-                usage=_FakeUsage(
-                    input_tokens=6000,
-                    output_tokens=100,
-                    total_tokens=6100,
-                    prompt_tokens_details=_FakePromptTokensDetails(cached_tokens=4000),
+                usage=_sdk_usage(
+                    input_tokens=6000, output_tokens=100, total_tokens=6100, cached_tokens=4000
                 )
             ),
             _FakeRawResponse(
-                usage=_FakeUsage(
-                    input_tokens=7000,
-                    output_tokens=200,
-                    total_tokens=7200,
-                    prompt_tokens_details=_FakePromptTokensDetails(cached_tokens=5000),
+                usage=_sdk_usage(
+                    input_tokens=7000, output_tokens=200, total_tokens=7200, cached_tokens=5000
                 )
             ),
         ]
