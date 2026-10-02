@@ -310,6 +310,47 @@ impl Supervisor {
                 Err(_) => self.event(format!("conversation prefill timed out for {file_name}")),
             }
         }
+
+        self.seed_sidebar_metadata(&marker_dir).await;
+    }
+
+    /// Spread the imported sessions' `updated_at` across day-buckets and tag a
+    /// few with a sandbox repo, so the sidebar's Updated grouping and Repo
+    /// toggle have varied data. `session import` can't carry either (it stamps
+    /// idle/now/no-labels), so the seeder rewrites the pod DB directly.
+    async fn seed_sidebar_metadata(&self, marker_dir: &std::path::Path) {
+        let marker = marker_dir.join("sidebar-metadata.done");
+        if marker.exists() {
+            return;
+        }
+        let script = self
+            .pod
+            .repo_root
+            .join("dev/omnidev/fixtures/seed_sidebar_metadata.py");
+        let db = self.pod.dir.join("data/omnigent/chat.db");
+        // Pure stdlib sqlite3 — no omnigent package or uv project env needed.
+        let mut command = Command::new("python3");
+        command
+            .arg(&script)
+            .arg(&db)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        match timeout(Duration::from_secs(30), command.output()).await {
+            Ok(Ok(output)) if output.status.success() => {
+                if std::fs::write(&marker, b"seeded\n").is_ok() {
+                    self.event("seeded sidebar grouping/repo metadata");
+                }
+            }
+            Ok(Ok(output)) => self.event(format!(
+                "could not seed sidebar metadata ({}): {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr).trim(),
+            )),
+            Ok(Err(error)) => self.event(format!("could not start sidebar metadata seed: {error}")),
+            Err(_) => self.event("sidebar metadata seed timed out"),
+        }
     }
 
     /// Restart server then host, gated on `/health`. Used by manual restart and
