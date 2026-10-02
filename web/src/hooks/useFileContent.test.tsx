@@ -403,11 +403,20 @@ describe("useFileContent gating", () => {
     );
   });
 
-  it("fetches when status is unknown (undefined)", async () => {
+  it("holds the fetch until runner liveness resolves, then fires", async () => {
     onlineMock.mockReturnValue(undefined);
     stubChatStore();
 
-    render(
+    const view = render(
+      <Wrap>
+        <Probe id="conv_unknown" path="src/a.txt" />
+      </Wrap>,
+    );
+    await flushMicrotasks();
+    expect(fetchMock).not.toHaveBeenCalled();
+
+    onlineMock.mockReturnValue(true);
+    view.rerender(
       <Wrap>
         <Probe id="conv_unknown" path="src/a.txt" />
       </Wrap>,
