@@ -18,6 +18,7 @@ unit-tested without a live host/runner.
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -557,6 +558,93 @@ def _task(**overrides: Any) -> ScheduledTask:
 
 
 # ── Tests ────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("target", ["connected_host", "managed_sandbox"])
+@pytest.mark.parametrize("run_now", [False, True])
+@pytest.mark.parametrize(
+    "epoch,expected", [(1790946300, "2026-10-02 09:05"), (1790998200, "2026-10-02 23:30")]
+)
+async def test_session_name_uses_worker_start_in_task_timezone(
+    monkeypatch: pytest.MonkeyPatch, target: str, run_now: bool, epoch: int, expected: str
+) -> None:
+    monkeypatch.setattr(fire_mod.time, "time", lambda: epoch)
+    task = _task(
+        name="Open PR Rebase - {{YYYY-MM-DD HH:mm}}",
+        prompt="Do not render {{YYYY}} in the prompt",
+        timezone="America/New_York",
+        execution_target=target,
+        state="paused" if run_now else "active",
+    )
+    store = FakeScheduledTaskStore(rows={task.id: task})
+    conversations = FakeConversationStore()
+    launched: list[ScheduledTask] = []
+
+    async def launch(conv: Any, effective: ScheduledTask) -> None:
+        launched.append(effective)
+
+    deps = _deps(
+        store,
+        conversation_store=conversations,
+        sandbox_config=_FakeSandboxConfig(),
+    )
+    callback = (build_run_now if run_now else build_on_fire)(deps, launch_dispatch=launch)
+    await callback(0, task.id)
+    await _drain()
+    assert conversations.created[0]["title"] == "Open PR Rebase - " + expected
+    assert store.runs[0]["scheduled_at"] == epoch
+    assert store.runs[0]["status"] == "running"
+    assert launched[0].prompt == task.prompt
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["invalid", "timezone", "unexpected", "oversize"])
+async def test_session_name_failure_is_literal_and_warns(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, failure: str
+) -> None:
+    monkeypatch.setattr(fire_mod.time, "time", lambda: 1790946300)
+    task = _task(name="Deploy {{env}} {{YYYY}}", timezone="America/New_York")
+    if failure == "timezone":
+        task = _task(name="Deploy {{YYYY}}", timezone="unknown/timezone")
+    elif failure == "unexpected":
+
+        def broken_render(*args: Any) -> str:
+            raise RuntimeError("renderer failed")
+
+        monkeypatch.setattr(fire_mod, "render_session_name", broken_render)
+    elif failure == "oversize":
+        monkeypatch.setattr(fire_mod, "render_session_name", lambda *args: "x" * 769)
+    store = FakeScheduledTaskStore(rows={task.id: task})
+    conversations = FakeConversationStore()
+    launch = AsyncMock()
+    callback = build_on_fire(
+        _deps(store, conversation_store=conversations), launch_dispatch=launch
+    )
+    with caplog.at_level(logging.WARNING, logger=fire_mod.__name__):
+        await callback(0, task.id)
+        await _drain()
+    assert conversations.created[0]["title"] == task.name
+    assert store.runs[0]["status"] == "running"
+    launch.assert_awaited_once()
+    assert any(task.id in record.message and "name" in record.message for record in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_session_name_plain_identity(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(fire_mod.time, "time", lambda: 1790946300)
+    conversations = FakeConversationStore()
+    store = FakeScheduledTaskStore(rows={"task_1": _task(name="nightly triage")})
+    callback = build_on_fire(
+        _deps(store, conversation_store=conversations), launch_dispatch=AsyncMock()
+    )
+    await callback(0, "task_1")
+    await _drain()
+    assert conversations.created[0]["title"] == "nightly triage"
+    store._rows["task_1"] = _task(name="nightly triage {{YYYY}}")
+    await callback(0, "task_1")
+    await _drain()
+    assert conversations.created[1]["title"] == "nightly triage 2026"
 
 
 async def _drain() -> None:

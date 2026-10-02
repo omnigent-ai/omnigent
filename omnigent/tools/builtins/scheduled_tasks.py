@@ -64,7 +64,14 @@ class SysScheduledTaskCreateTool(Tool):
                     "properties": {
                         "name": {
                             "type": "string",
-                            "description": "Human-readable task name, e.g. 'nightly triage'.",
+                            "description": (
+                                "Human-readable task name, e.g. 'nightly triage'. "
+                                "Date placeholders are filled in per run in the task timezone: "
+                                "'Nightly triage - {{YYYY-MM-DD}}' -> "
+                                "'Nightly triage - 2026-10-02'. "
+                                "Tokens: YYYY MMMM MMM (alias Mon) MM DD dddd ddd HH mm. "
+                                r"Write \{{ for a literal {{."
+                            ),
                         },
                         "prompt": {
                             "type": "string",
@@ -263,7 +270,17 @@ class SysScheduledTaskUpdateTool(Tool):
                             "type": "string",
                             "description": "The task to update (from sys_scheduled_task_list).",
                         },
-                        "name": {"type": "string", "description": "New task name."},
+                        "name": {
+                            "type": "string",
+                            "description": (
+                                "Human-readable task name, e.g. 'nightly triage'. "
+                                "Date placeholders are filled in per run in the task timezone: "
+                                "'Nightly triage - {{YYYY-MM-DD}}' -> "
+                                "'Nightly triage - 2026-10-02'. "
+                                "Tokens: YYYY MMMM MMM (alias Mon) MM DD dddd ddd HH mm. "
+                                r"Write \{{ for a literal {{."
+                            ),
+                        },
                         "prompt": {"type": "string", "description": "New prompt."},
                         "rrule": {"type": "string", "description": _RRULE_DESC},
                         "agent_id": {

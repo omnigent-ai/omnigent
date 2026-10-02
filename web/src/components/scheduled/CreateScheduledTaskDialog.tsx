@@ -940,11 +940,14 @@ export function CreateScheduledTaskDialog({
             <Input
               id="task-name"
               value={name}
-              placeholder="Name this automation"
+              placeholder="Open PR Rebase - {{YYYY-MM-DD}}"
               data-testid="task-name-input"
               className="text-ui focus-visible:ring-0"
               onChange={(e) => setName(e.target.value)}
             />
+            <p className="text-sm text-muted-foreground">
+              {"Add {{YYYY-MM-DD}} or {{MMM DD}} to put each run's date in its session name."}
+            </p>
           </div>
           {!isEdit && (
             <div className="flex flex-col gap-1.5">
