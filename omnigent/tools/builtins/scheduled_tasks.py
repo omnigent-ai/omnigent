@@ -49,6 +49,14 @@ _WORKFLOW_DETAILS_DESC = (
     "workflow, e.g. 'Only the upload tests'."
 )
 
+_NAME_DESC = (
+    "Human-readable task name, e.g. 'nightly triage'. "
+    "Date placeholders are filled in per run in the task timezone: "
+    "'Nightly triage - {{YYYY-MM-DD}}' -> 'Nightly triage - 2026-10-02'. "
+    "Tokens: YYYY MMMM MMM (alias Mon) MM DD dddd ddd HH mm. "
+    r"Write \{{ for a literal {{."
+)
+
 _RRULE_DESC = (
     "RFC 5545 recurrence rule, e.g. 'FREQ=DAILY;BYHOUR=9;BYMINUTE=0' (daily at "
     "9am) or 'FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR;BYHOUR=9;BYMINUTE=0' (weekday "
@@ -93,14 +101,7 @@ class SysScheduledTaskCreateTool(Tool):
                     "properties": {
                         "name": {
                             "type": "string",
-                            "description": (
-                                "Human-readable task name, e.g. 'nightly triage'. "
-                                "Date placeholders are filled in per run in the task timezone: "
-                                "'Nightly triage - {{YYYY-MM-DD}}' -> "
-                                "'Nightly triage - 2026-10-02'. "
-                                "Tokens: YYYY MMMM MMM (alias Mon) MM DD dddd ddd HH mm. "
-                                r"Write \{{ for a literal {{."
-                            ),
+                            "description": _NAME_DESC,
                         },
                         "prompt": {
                             "type": "string",
@@ -331,14 +332,7 @@ class SysScheduledTaskUpdateTool(Tool):
                         },
                         "name": {
                             "type": "string",
-                            "description": (
-                                "Human-readable task name, e.g. 'nightly triage'. "
-                                "Date placeholders are filled in per run in the task timezone: "
-                                "'Nightly triage - {{YYYY-MM-DD}}' -> "
-                                "'Nightly triage - 2026-10-02'. "
-                                "Tokens: YYYY MMMM MMM (alias Mon) MM DD dddd ddd HH mm. "
-                                r"Write \{{ for a literal {{."
-                            ),
+                            "description": _NAME_DESC,
                         },
                         "prompt": {
                             "type": "string",
