@@ -378,8 +378,8 @@ def test_claude_native_agent_addresses_comments_without_tool_guidance(
             "first-run onboarding/trust gates are version- and "
             "environment-dependent and block headless startup in CI; the relay "
             "wiring is covered by tests/runner/test_comment_relay.py and "
-            "tests/harnesses/claude_native/test_claude_native_bridge.py. Verified end-to-end locally "
-            "via --profile oss with this gate set."
+            "tests/harnesses/claude_native/test_claude_native_bridge.py. "
+            "Verified end-to-end locally via --profile oss with this gate set."
         )
     if shutil.which("claude") is None:
         pytest.skip("'claude' CLI is not on PATH. Install Claude Code to run this test.")
