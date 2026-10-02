@@ -864,7 +864,7 @@ jobs:
             cat /tmp/polly_review.txt
             echo ""
             echo "---"
-            echo "<sub>Automated review by Polly · [workflow run](${RUN_URL})</sub>"
+            echo "<sub>Automated review by Polly · [workflow run](${RUN_URL}) · Maintainers: comment \`/fix\` to have Polly fix the blocking issues above</sub>"
           } > /tmp/comment.md
 
           # Post a fresh comment for every review run, so each trigger (push,
