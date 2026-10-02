@@ -25,7 +25,8 @@ import { useFileViewer } from "./FileViewerContext";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { ServerInfo } from "@/lib/capabilities";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
-import { AGENT_BROWSER_TAB_ID } from "@/hooks/useBrowserTabs";
+import { AGENT_BROWSER_TAB_ID, browserViewId } from "@/hooks/useBrowserTabs";
+import { emitBrowserActionRequest } from "@/lib/browserActionBus";
 import { clearOptimisticTitles, recordOptimisticTitle } from "@/lib/optimisticTitles";
 import { readSessionWorkspaceState, writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
 import { writeWorkspacePanelDefault } from "@/lib/workspacePanelPreferences";
@@ -2643,6 +2644,46 @@ describe("Right workspace card visibility", () => {
     expect(screen.getByRole("button", { name: "Expand right panel" })).toBeInTheDocument();
   });
 
+  it("animates open and selects Browser when agent navigation arrives while collapsed", async () => {
+    vi.stubGlobal("omnigentDesktop", {
+      kind: "electron",
+      browserOpenOrNavigate: vi.fn().mockResolvedValue({ ok: true }),
+      setBadgeCount: vi.fn(),
+    });
+    try {
+      writeSessionWorkspaceState("conv_browser_closed", { open: false });
+      useEnvironmentMock.mockReturnValue({
+        data: { available: false, root: null, home: null },
+        isLoading: false,
+      } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
+      mockConversations([{ id: "conv_browser_closed", permission_level: null }]);
+      renderShell("/c/conv_browser_closed");
+
+      act(() =>
+        emitBrowserActionRequest(
+          {
+            type: "browser_action_request",
+            actionId: "navigate-closed",
+            action: "navigate",
+            args: { url: "https://example.com" },
+          },
+          "conv_browser_closed",
+        ),
+      );
+
+      const panel = await screen.findByRole("complementary", { name: "Workspace" });
+      expect(panel).toHaveAttribute("data-state", "open");
+      expect(panel).toHaveAttribute("data-animate-visibility", "true");
+      expect(screen.getByRole("tab", { name: "Browser 1" })).toHaveAttribute(
+        "aria-selected",
+        "true",
+      );
+    } finally {
+      cleanup();
+      vi.unstubAllGlobals();
+    }
+  });
+
   it("starts open for a fresh session when Appearance default is open", () => {
     // The Appearance setting only seeds sessions with no saved open-state.
     writeWorkspacePanelDefault("open");
@@ -2865,6 +2906,26 @@ describe("Right workspace card visibility", () => {
       cleanup();
       vi.unstubAllGlobals();
     }
+  });
+
+  it("falls back to Files when a remembered Browser tab is unsupported", async () => {
+    writeSessionWorkspaceState("conv_unsupported_browser", {
+      rightRailTab: "browser",
+      openBrowsers: ["browser-1"],
+      selectedBrowserId: "browser-1",
+    });
+    useEnvironmentMock.mockReturnValue({
+      data: { available: true, root: null, home: null },
+      isLoading: false,
+    } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
+    mockConversations([{ id: "conv_unsupported_browser", permission_level: null }]);
+
+    renderShell("/c/conv_unsupported_browser");
+
+    expect(screen.queryByRole("tab", { name: /Browser/i })).toBeNull();
+    await waitFor(() =>
+      expect(screen.getByRole("tab", { name: /Files/i })).toHaveAttribute("aria-selected", "true"),
+    );
   });
 
   it("keeps an active file and its URL when the last background browser closes", async () => {
@@ -4366,11 +4427,11 @@ describe("AppShell design-mode submission", () => {
     restoreGetState();
   });
 
-  function submitInstruction(prompt = "Use a week picker.") {
+  function submitInstruction(prompt = "Use a week picker.", viewId = "conv_design") {
     act(() => {
-      select({ conversationId: "conv_design", screenshot: "data:image/png;base64,AQID" });
+      select({ conversationId: viewId, screenshot: "data:image/png;base64,AQID" });
       submit({
-        conversationId: "conv_design",
+        conversationId: viewId,
         id: 1,
         element: { tag: "input", id: "#period" },
         prompt,
@@ -4414,6 +4475,23 @@ describe("AppShell design-mode submission", () => {
     );
   });
 
+  it("routes a user-created Browser tab through its owning session", () => {
+    const viewId = browserViewId("conv_design", "tab-one");
+    renderShell("/c/conv_design");
+
+    submitInstruction("Use a month picker.", viewId);
+
+    expect(enqueueMessage).toHaveBeenCalledWith(
+      expect.stringContaining("Use a month picker."),
+      expect.any(Array),
+    );
+    expect(signal).toHaveBeenCalledWith(viewId, {
+      id: 1,
+      ok: true,
+      message: "Queued for agent.",
+    });
+  });
+
   it("reads a changed always-steer preference at submission without remounting", () => {
     localStorage.setItem("omnigent:always-steer", "true");
     renderShell("/c/conv_design");
@@ -4443,10 +4521,11 @@ describe("AppShell design-mode submission", () => {
   it("rejects a late pointer submission after switching to another session", () => {
     renderShell("/c/conv_design");
     chat.conversationId = "conv_other";
-    submitInstruction();
+    const foreignViewId = browserViewId("conv_design", "tab-one");
+    submitInstruction("Use a week picker.", foreignViewId);
     expect(enqueueMessage).not.toHaveBeenCalled();
     expect(send).not.toHaveBeenCalled();
-    expect(signal).toHaveBeenCalledWith("conv_design", {
+    expect(signal).toHaveBeenCalledWith(foreignViewId, {
       id: 1,
       ok: false,
       message: "Return to this session before sending.",

@@ -4,6 +4,7 @@ import { emitBrowserActionRequest } from "@/lib/browserActionBus";
 import { readSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
 import {
   AGENT_BROWSER_TAB_ID,
+  browserOwnerConversationId,
   browserViewId,
   openAgentBrowserTab,
   useBrowserTabs,
@@ -16,6 +17,13 @@ afterEach(() => {
 });
 
 describe("browser soft tabs", () => {
+  it("resolves both agent and user-created views to their owning session", () => {
+    expect(browserOwnerConversationId("session-a")).toBe("session-a");
+    expect(browserOwnerConversationId(browserViewId("session:encoded", "tab-one"))).toBe(
+      "session:encoded",
+    );
+  });
+
   it("persists a pending close even if the workspace unmounts", async () => {
     let finishClose!: (value: { ok: boolean }) => void;
     const browserClose = vi.fn(

@@ -100,6 +100,7 @@ def test_browser_is_soft_tab_only_and_opens_pane(
 
     # (3) The soft tab is selected and mounts the browser content region.
     expect(browser_tab).to_have_attribute("aria-selected", "true")
+    expect(rail.get_by_role("textbox", name="Address bar", exact=True)).to_be_visible()
 
 
 def test_no_browser_tab_in_plain_browser(

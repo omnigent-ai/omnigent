@@ -5,11 +5,24 @@ import { readSessionWorkspaceState, writeSessionWorkspaceState } from "@/lib/ses
 
 /** Stable soft-tab id for the browser view driven by agents and opted-in links. */
 export const AGENT_BROWSER_TAB_ID = "agent-browser";
+const BROWSER_VIEW_PREFIX = "browser-tab:";
 
 export function browserViewId(conversationId: string, tabId: string): string {
   return tabId === AGENT_BROWSER_TAB_ID
     ? conversationId
-    : `browser-tab:${encodeURIComponent(conversationId)}:${tabId}`;
+    : `${BROWSER_VIEW_PREFIX}${encodeURIComponent(conversationId)}:${tabId}`;
+}
+
+/** Resolve a native Browser view id to the chat session that owns it. */
+export function browserOwnerConversationId(viewId: string): string {
+  if (!viewId.startsWith(BROWSER_VIEW_PREFIX)) return viewId;
+  const encodedOwner = viewId.slice(BROWSER_VIEW_PREFIX.length).split(":", 1)[0];
+  if (!encodedOwner) return viewId;
+  try {
+    return decodeURIComponent(encodedOwner);
+  } catch {
+    return viewId;
+  }
 }
 
 interface BrowserTabsState {
