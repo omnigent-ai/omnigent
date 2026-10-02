@@ -6,6 +6,10 @@ Integrations → Connect GitHub**, and their managed sandboxes then authenticate
 `git` / `gh` as them (clone private repos, push branches, open PRs) using a
 short-lived token minted from that user's authorization — never a shared PAT.
 
+The GitHub App is GitHub's connection facet in the git provider layer.
+[Git providers](GIT_PROVIDERS.md) describes how the server loads it and vends
+its token to sandboxes.
+
 > **Screenshots** are from GitHub's **Settings → Developer settings → GitHub
 > Apps** flow, walked with the example values below. The App ID / Client ID
 > shown are non-secret identifiers from a throwaway example app; the client
@@ -191,7 +195,8 @@ nor `OMNIGENT_DOMAIN`), the feature logs a warning and **stays disabled**.
 
 1. Sign in to Omnigent as a real user, open **Settings → Sandbox Integrations**.
    The **Connect GitHub** control appears (the nav link only shows when the App
-   is configured — driven by `github_app_enabled` in `/v1/info`).
+   is configured: `enabled_connections` in `/v1/info` includes `"github"`, and
+   the `git_providers` entry for `github` has `connection: true`).
 2. Click **Connect GitHub** → GitHub's authorize screen → back to Omnigent with
    `?github=connected`. The panel now shows **Connected as `<login>`**.
 3. Start a sandbox session on a **private** repo owned by an account where the

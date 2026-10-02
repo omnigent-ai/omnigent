@@ -1,7 +1,7 @@
 """Point a managed sandbox's Databricks auth at the owner's per-user broker.
 
 Called by ``omnigent host`` at startup (executor-agnostic, like
-:func:`omnigent.git_credential_github.configure_host_git`). When the owner has
+:func:`omnigent.git_credential.configure_host_credentials`). When the owner has
 linked a Databricks workspace via the OAuth U2M connect flow, the host writes a
 host-only ``[omnigent]`` ``~/.databrickscfg`` profile (workspace ``host`` only,
 **no token**), exports ``DATABRICKS_CONFIG_PROFILE``, and drops a private

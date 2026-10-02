@@ -1,11 +1,10 @@
-"""Registry of per-user connection providers (GitHub, Databricks, ...).
+"""Registry of per-user connection providers (git providers, Databricks).
 
-Wiring a new provider into the server is a single entry here plus its
-:class:`~omnigent.server.routes.connections_base.ConnectionHooks` adapter —
-not another hand-copied block in :func:`create_app`. ``create_app`` iterates
-:func:`connection_providers` to set ``app.state.<name>_{config,store,client}``
-and mount the provider's router whenever it is configured (both its config and
-its connection store are present).
+Each git provider whose ``connection`` facet loads contributes one entry (see
+:mod:`omnigent.server.git_providers`), in provider registration order;
+Databricks follows. ``create_app`` iterates :func:`connection_providers` to set
+``app.state.<name>_{config,store,client}`` and mount the provider's router
+whenever it is configured (both its config and its connection store are present).
 """
 
 from __future__ import annotations
@@ -29,38 +28,43 @@ class ConnectionProvider:
         to vend this provider's secret to a sandbox. ``None`` when the provider
         has no broker endpoint (connect-only, or on-demand delivery not built
         yet), in which case ``/hosts/{id}/credentials/{name}`` returns ``404``.
+    :param repo_browser: Whether the router lists the user's repositories for
+        the new-chat picker.
     """
 
     name: str
     client_factory: Callable[[Any], Any]
     router_factory: Callable[..., Any]
     credential_resolver: Callable[..., Awaitable[dict[str, Any] | None]] | None = None
+    repo_browser: bool = False
 
 
 def connection_providers() -> list[ConnectionProvider]:
     """The connection providers this build knows how to wire, in a stable order.
 
-    Imports are deferred so importing this module stays cheap and free of import
-    cycles through the route modules.
+    Git provider connection facets come first, in provider registration order,
+    then Databricks. Imports are deferred so importing this module stays cheap
+    and free of import cycles through the route modules.
     """
     from omnigent.server.databricks_app_client import DatabricksAppClient
     from omnigent.server.databricks_identity import resolve_databricks_credential
-    from omnigent.server.github_app_client import GitHubAppClient
-    from omnigent.server.github_identity import resolve_github_credential
+    from omnigent.server.git_providers import connection_facets
     from omnigent.server.routes.connections_databricks import (
         create_connections_databricks_router,
     )
-    from omnigent.server.routes.connections_github import (
-        create_connections_github_router,
-    )
 
-    return [
+    git_connections = [
         ConnectionProvider(
-            name="github",
-            client_factory=GitHubAppClient,
-            router_factory=create_connections_github_router,
-            credential_resolver=resolve_github_credential,
-        ),
+            name=provider_id,
+            client_factory=facet.make_client,
+            router_factory=facet.make_router,
+            credential_resolver=facet.resolve_credential,
+            repo_browser=facet.repo_browser,
+        )
+        for provider_id, facet in connection_facets()
+    ]
+    return [
+        *git_connections,
         ConnectionProvider(
             name="databricks",
             client_factory=DatabricksAppClient,

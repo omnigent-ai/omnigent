@@ -37,7 +37,7 @@ import {
   ComposerSendButton,
 } from "@/components/composer/ChatComposer";
 import { ComposerMentionChips } from "@/components/composer/ComposerMentionChips";
-import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   MonitorCloudIcon,
   CircleHelpIcon,
@@ -89,7 +89,12 @@ import { MenuItem } from "@/components/ui/menu-item";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import { authenticatedFetch, getCurrentUserId, resolveIdentity } from "@/lib/identity";
 import { backgroundSessionTitlesRequestHeaders } from "@/lib/backgroundSessionTitlesPreferences";
-import { fetchGithubBranches, fetchGithubRepos, type GithubRepo } from "@/lib/githubIntegration";
+import {
+  fetchConnectionBranches,
+  fetchConnectionRepos,
+  type ConnectionRepo,
+} from "@/lib/connectionsApi";
+import { gitProviderCopy } from "@/lib/gitProviders";
 import { composerContextToLabels } from "@/lib/composerContextAdapters";
 import { randomUUID } from "@/lib/randomUUID";
 import { readSubmitWithModEnter } from "@/lib/composerSendShortcutPreferences";
@@ -118,7 +123,12 @@ import {
 
 // Re-exported for tests that import the readiness helpers from this module.
 export { harnessUnavailableReasonOnHost, harnessUnconfiguredOnHost, harnessWarningBadgeText };
-import { isFeatureEnabled, sandboxOptionLabel, sandboxProviderOptions } from "@/lib/capabilities";
+import {
+  gitProviders,
+  isFeatureEnabled,
+  sandboxOptionLabel,
+  sandboxProviderOptions,
+} from "@/lib/capabilities";
 import { useHeading, usePoweredBy } from "@/lib/branding";
 import { isSlashCommandText, SlashCommandMenu } from "@/components/SlashCommandMenu";
 import {
@@ -1012,8 +1022,42 @@ export function deriveRepoName(url: string): string | null {
 const COMBOBOX_TRIGGER_CLASS =
   "flex w-full items-center gap-2 rounded-md border border-input bg-background px-3 py-2 text-xs outline-none transition-colors hover:border-ring/60 focus-visible:border-ring";
 
+/** A repo the picker offers, with its clone URL resolved. */
+interface SandboxPickerRepo extends ConnectionRepo {
+  clone_url: string;
+}
+
+/** One git provider's repo picker: its list state and the repos it can clone. */
+interface SandboxRepoSource {
+  providerId: string;
+  /** The server's display name for the provider, e.g. "GitHub". */
+  label: string;
+  /** The caller has linked this provider's account. */
+  connected: boolean;
+  /** The repo list failed to load. */
+  errored: boolean;
+  /** More repos exist than the list returned. */
+  truncated: boolean;
+  /** The listed repos (none until connected). */
+  repos: SandboxPickerRepo[];
+}
+
 /**
- * Searchable combobox for picking one of the caller's GitHub repos.
+ * The repos from one provider's list that the picker can add. A repo with no
+ * `clone_url` takes the provider's URL pattern; one the provider has no
+ * pattern for is skipped.
+ */
+function pickerRepos(providerId: string, repos: ConnectionRepo[]): SandboxPickerRepo[] {
+  const { cloneUrlFor } = gitProviderCopy(providerId);
+  return repos.flatMap((repo) => {
+    const cloneUrl = repo.clone_url ?? cloneUrlFor?.(repo.full_name);
+    return cloneUrl ? [{ ...repo, clone_url: cloneUrl }] : [];
+  });
+}
+
+/**
+ * Searchable combobox for picking one of the caller's repos on a connected
+ * git provider.
  *
  * A trigger button opens a `cmdk` search list (repos are filtered as you
  * type on ``owner/name``), which scales to accounts with many repos far
@@ -1021,18 +1065,21 @@ const COMBOBOX_TRIGGER_CLASS =
  * URL/branch state the free-text inputs drive; the empty value shows the
  * "Choose a repository…" placeholder.
  *
+ * @param providerLabel The provider's name, e.g. ``"GitHub"``, for the accessible label.
  * @param repos The caller's accessible repos (newest-first from the API).
  * @param value The selected repo's ``owner/name`` ("" = none).
  * @param onSelect Called with the chosen repo (or ``null`` to clear).
  */
 function SandboxRepoCombobox({
+  providerLabel,
   repos,
   value,
   onSelect,
 }: {
-  repos: GithubRepo[];
+  providerLabel: string;
+  repos: SandboxPickerRepo[];
   value: string;
-  onSelect: (repo: GithubRepo | null) => void;
+  onSelect: (repo: SandboxPickerRepo | null) => void;
 }): ReactNode {
   const [open, setOpen] = useState(false);
   const selected = repos.find((r) => r.full_name === value) ?? null;
@@ -1043,7 +1090,7 @@ function SandboxRepoCombobox({
           type="button"
           role="combobox"
           aria-expanded={open}
-          aria-label="GitHub repository"
+          aria-label={`${providerLabel} repository`}
           className={COMBOBOX_TRIGGER_CLASS}
           data-testid="new-chat-landing-repo-select"
         >
@@ -1088,24 +1135,27 @@ function SandboxRepoCombobox({
 }
 
 /**
- * Searchable branch combobox for the connected-GitHub repo picker.
+ * Searchable branch combobox for the connected-provider repo picker.
  *
  * Lazily fetches the chosen repo's branches and filters them as you type.
  * The empty value is the "default branch" sentinel: leaving it selected
  * appends no ``#branch`` fragment, so the server clones the repo's default
  * branch.
  *
+ * @param providerId The provider whose connection lists the repo, e.g. ``"github"``.
  * @param fullName The chosen repo's ``owner/name``.
  * @param value The currently selected branch ("" = default).
  * @param defaultBranch The repo's default branch, for the sentinel label.
  * @param onChange Called with the newly selected branch.
  */
 function SandboxRepoBranchSelect({
+  providerId,
   fullName,
   value,
   defaultBranch,
   onChange,
 }: {
+  providerId: string;
   fullName: string;
   value: string;
   defaultBranch: string | null;
@@ -1113,8 +1163,8 @@ function SandboxRepoBranchSelect({
 }): ReactNode {
   const [open, setOpen] = useState(false);
   const { data, isPending } = useQuery({
-    queryKey: ["github-branches", fullName],
-    queryFn: () => fetchGithubBranches(fullName),
+    queryKey: ["connection-branches", providerId, fullName],
+    queryFn: () => fetchConnectionBranches(providerId, fullName),
     staleTime: 5 * 60_000,
   });
   const branches = data?.connected ? data.branches : [];
@@ -2445,22 +2495,36 @@ export function NewChatLandingScreen() {
   }, []);
   // Free-text URL being typed into the "paste a URL" adder (not yet added).
   const [pendingRepoUrl, setPendingRepoUrl] = useState<string>("");
-  // When the server advertises the GitHub App and the caller has connected
-  // their account, offer a picker over their repos instead of only the
-  // free-text URL. The /repos endpoint returns `connected: false` when the
-  // account isn't linked, so gating the query on `enabled_connections` and
-  // reading `connected` off the payload doubles as the connection check.
-  const githubReposEnabled =
-    info !== "loading" && (info.enabled_connections ?? []).includes("github");
-  const { data: sandboxRepoData, isError: sandboxReposErrored } = useQuery({
-    queryKey: ["github-repos"],
-    queryFn: fetchGithubRepos,
-    enabled: githubReposEnabled,
-    staleTime: 5 * 60_000,
+  // One repo picker per provider whose connection can list repositories;
+  // /repos answers `connected: false` for an unlinked account, which hides it.
+  const repoBrowserProviders = useMemo(
+    () =>
+      info === "loading"
+        ? []
+        : gitProviders(info).filter(
+            (provider) => provider.capabilities.connection && provider.capabilities.repo_browser,
+          ),
+    [info],
+  );
+  const repoListQueries = useQueries({
+    queries: repoBrowserProviders.map((provider) => ({
+      queryKey: ["connection-repos", provider.id],
+      queryFn: () => fetchConnectionRepos(provider.id),
+      staleTime: 5 * 60_000,
+    })),
   });
-  const sandboxRepoPickerConnected = sandboxRepoData?.connected ?? false;
-  const sandboxRepos = sandboxRepoPickerConnected ? (sandboxRepoData?.repos ?? []) : [];
-  const sandboxReposTruncated = sandboxRepoData?.truncated ?? false;
+  const sandboxRepoSources: SandboxRepoSource[] = repoBrowserProviders.map((provider, i) => {
+    const { data, isError } = repoListQueries[i];
+    const connected = data?.connected ?? false;
+    return {
+      providerId: provider.id,
+      label: provider.display_name.trim() || provider.id,
+      connected,
+      errored: isError,
+      truncated: data?.truncated ?? false,
+      repos: connected ? pickerRepos(provider.id, data?.repos ?? []) : [],
+    };
+  });
   const [workspace, setWorkspace] = useState<string>(() => restoredDraft?.workspace ?? "");
   // Source tracking for the create's field-omission contract: true while the
   // slot's value is the untouched seed the project-prefill effect wrote from
@@ -4879,22 +4943,19 @@ export function NewChatLandingScreen() {
     workspaceIsGit &&
     (branchName.trim() !== "" ||
       (worktreesEnabled && (hostWorktrees === undefined || hostWorktrees.length > 0)));
-  const showGithubRepoPicker = githubReposEnabled && sandboxRepoPickerConnected;
-  // The connected-GitHub repo (if any) a selection URL names, so its row can
-  // offer that repo's branch list. Repos not in the picker (pasted URLs, or a
-  // repo the account lost access to) resolve to undefined and fall back to a
-  // free-text branch input.
-  const repoForUrl = (url: string): GithubRepo | undefined =>
-    sandboxRepos.find(
-      (r) => (r.clone_url ?? `https://github.com/${r.full_name}.git`) === url.trim(),
-    );
-  // The clone URL of a connected repo, matching the server's derivation.
-  const repoCloneUrl = (r: GithubRepo): string =>
-    r.clone_url ?? `https://github.com/${r.full_name}.git`;
-  // Repos not yet selected — the "Add repository" combobox offers only these.
-  const unselectedRepos = sandboxRepos.filter(
-    (r) => !sandboxRepoSelections.some((s) => s.url === repoCloneUrl(r)),
-  );
+  const connectedRepoSources = sandboxRepoSources.filter((source) => source.connected);
+  // The listed repo a selection URL names, for its branch list. A pasted URL,
+  // or a repo the account lost, is unlisted and gets a free-text branch input.
+  const repoForUrl = (url: string): { providerId: string; repo: SandboxPickerRepo } | undefined => {
+    for (const source of connectedRepoSources) {
+      const repo = source.repos.find((r) => r.clone_url === url.trim());
+      if (repo) return { providerId: source.providerId, repo };
+    }
+    return undefined;
+  };
+  // Repos not yet selected — an "Add repository" combobox offers only these.
+  const unselectedRepos = (source: SandboxRepoSource): SandboxPickerRepo[] =>
+    source.repos.filter((r) => !sandboxRepoSelections.some((s) => s.url === r.clone_url));
   // Sandbox repository chip label: the single repo's name[#branch] (server's
   // clone-dir rule), a count when several, or a placeholder when none.
   const sandboxRepoLabel =
@@ -5914,8 +5975,8 @@ export function NewChatLandingScreen() {
                   A connected repo gets its branch combobox; a pasted URL a
                   free-text branch. The remove button drops it. */}
                     {sandboxRepoSelections.map((sel) => {
-                      const repo = repoForUrl(sel.url);
-                      const name = repo?.full_name ?? deriveRepoName(sel.url) ?? sel.url;
+                      const listed = repoForUrl(sel.url);
+                      const name = listed?.repo.full_name ?? deriveRepoName(sel.url) ?? sel.url;
                       return (
                         <div
                           key={sel.url}
@@ -5925,12 +5986,13 @@ export function NewChatLandingScreen() {
                           <span className="min-w-0 flex-1 truncate text-sm" title={sel.url}>
                             {name}
                           </span>
-                          {repo ? (
+                          {listed ? (
                             <div className="w-36 shrink-0">
                               <SandboxRepoBranchSelect
-                                fullName={repo.full_name}
+                                providerId={listed.providerId}
+                                fullName={listed.repo.full_name}
                                 value={sel.branch}
-                                defaultBranch={repo.default_branch}
+                                defaultBranch={listed.repo.default_branch}
                                 onChange={(b) => setSandboxRepoBranch(sel.url, b)}
                               />
                             </div>
@@ -5964,45 +6026,57 @@ export function NewChatLandingScreen() {
                   slot and no multi-repo affordance. */}
                     {sandboxRepoSelections.length < maxSandboxRepos && (
                       <>
-                        {/* Add from the connected account's repos (only those
-                      not already picked); the free-text URL below is the
-                      fallback for a repo not in the list or no GitHub link. */}
-                        {showGithubRepoPicker && (
-                          <>
-                            <SandboxRepoCombobox
-                              repos={unselectedRepos}
-                              value=""
-                              onSelect={(repo) => {
-                                if (repo) {
-                                  addSandboxRepo(
-                                    repo.clone_url ?? `https://github.com/${repo.full_name}.git`,
-                                  );
-                                }
-                              }}
-                            />
-                            {sandboxReposTruncated && (
-                              <p
-                                className="text-sm text-muted-foreground"
-                                data-testid="new-chat-landing-repo-truncated"
-                              >
-                                Showing your most recently pushed repositories. Don't see one? Paste
-                                its URL below.
-                              </p>
-                            )}
-                            <p className="text-sm text-muted-foreground">
-                              or paste a repository URL:
-                            </p>
-                          </>
-                        )}
-                        {/* Connected but the repo list failed to load: say so
-                      explicitly, so a transient error isn't mistaken for
-                      "GitHub not connected" (the picker just wouldn't render). */}
-                        {githubReposEnabled && sandboxReposErrored && !showGithubRepoPicker && (
-                          <p
-                            className="text-sm text-destructive"
-                            data-testid="new-chat-landing-repo-error"
-                          >
-                            Couldn't load your GitHub repositories. Paste a repository URL below.
+                        {/* One section per provider: its picker of repos not yet picked,
+                      or a note when its list failed, so that isn't read as "not connected". */}
+                        {sandboxRepoSources.map((source) => {
+                          const showError = source.errored && !source.connected;
+                          if (!source.connected && !showError) return null;
+                          return (
+                            <div
+                              key={source.providerId}
+                              className="flex flex-col gap-2"
+                              data-testid={`new-chat-landing-repo-picker-${source.providerId}`}
+                            >
+                              {showError ? (
+                                <p
+                                  className="text-sm text-destructive"
+                                  data-testid="new-chat-landing-repo-error"
+                                >
+                                  Couldn't load your {source.label} repositories. Paste a repository
+                                  URL below.
+                                </p>
+                              ) : (
+                                <>
+                                  {connectedRepoSources.length > 1 && (
+                                    <span className="text-xs text-muted-foreground">
+                                      {source.label}
+                                    </span>
+                                  )}
+                                  <SandboxRepoCombobox
+                                    providerLabel={source.label}
+                                    repos={unselectedRepos(source)}
+                                    value=""
+                                    onSelect={(repo) => {
+                                      if (repo) addSandboxRepo(repo.clone_url);
+                                    }}
+                                  />
+                                  {source.truncated && (
+                                    <p
+                                      className="text-sm text-muted-foreground"
+                                      data-testid="new-chat-landing-repo-truncated"
+                                    >
+                                      Showing your most recently pushed repositories. Don't see one?
+                                      Paste its URL below.
+                                    </p>
+                                  )}
+                                </>
+                              )}
+                            </div>
+                          );
+                        })}
+                        {connectedRepoSources.length > 0 && (
+                          <p className="text-sm text-muted-foreground">
+                            or paste a repository URL:
                           </p>
                         )}
                         <div className="flex items-center gap-2">

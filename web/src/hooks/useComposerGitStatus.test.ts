@@ -6,7 +6,7 @@ import type { SessionWorktreesResult } from "@/hooks/useSessionWorktrees";
 import { useComposerGitStatus } from "./useComposerGitStatus";
 
 const useSessionWorktreesMock = vi.fn();
-const useGithubInfoMock = vi.fn();
+const usePullRequestInfoMock = vi.fn();
 
 vi.mock("@/hooks/useSessionWorktrees", () => ({
   useSessionWorktrees: (
@@ -15,8 +15,8 @@ vi.mock("@/hooks/useSessionWorktrees", () => ({
     workspace: string | null,
   ) => useSessionWorktreesMock(sessionId, hostId, workspace),
 }));
-vi.mock("@/hooks/useGithub", () => ({
-  useGithubInfo: (id: string | undefined) => useGithubInfoMock(id),
+vi.mock("@/hooks/usePullRequests", () => ({
+  usePullRequestInfo: (id: string | undefined) => usePullRequestInfoMock(id),
 }));
 
 function wt(overrides: Partial<HostWorktree>): HostWorktree {
@@ -43,7 +43,7 @@ function setWorktrees(
   });
 }
 function setGithub(data: Record<string, unknown> | undefined) {
-  useGithubInfoMock.mockReturnValue({ data, isFetching: false, refetch: vi.fn() });
+  usePullRequestInfoMock.mockReturnValue({ data, isFetching: false, refetch: vi.fn() });
 }
 
 function run(args: Partial<Parameters<typeof useComposerGitStatus>[0]> = {}) {
@@ -60,7 +60,7 @@ function run(args: Partial<Parameters<typeof useComposerGitStatus>[0]> = {}) {
 
 afterEach(() => {
   useSessionWorktreesMock.mockReset();
-  useGithubInfoMock.mockReset();
+  usePullRequestInfoMock.mockReset();
 });
 
 describe("useComposerGitStatus", () => {
@@ -205,6 +205,44 @@ describe("useComposerGitStatus", () => {
     expect(result.current.prNumber).toBe(7);
   });
 
+  it("styles the PR number by the primary PR's provider, then the session's", () => {
+    setWorktrees({ status: "ok", worktrees: [wt({ branch: "main" })] });
+    const pr = (over: Record<string, unknown> = {}) => ({
+      url: "u",
+      host: "dev.azure.com",
+      repository: "org/project/repo",
+      number: 7,
+      relationship: "created",
+      ...over,
+    });
+    const prefix = () => run().result.current.prNumberPrefix;
+
+    // The PR's own provider wins over the session's.
+    setGithub({ provider: "github", prs: [pr({ provider: "azure_devops" })] });
+    expect(prefix()).toBe("!");
+    setGithub({ provider: "azure_devops", prs: [pr({ provider: "github" })] });
+    expect(prefix()).toBe("#");
+    // Without one, the session's provider decides, for tracked and untracked PRs.
+    setGithub({ provider: "azure_devops", prs: [pr()] });
+    expect(prefix()).toBe("!");
+    setGithub({ provider: "azure_devops", pr: { number: 7 } });
+    expect(prefix()).toBe("!");
+    expect(run().result.current.prNumber).toBe(7);
+  });
+
+  it("uses the # prefix when no provider marks the PR", () => {
+    setWorktrees({ status: "ok", worktrees: [wt({ branch: "main" })] });
+    const prefix = () => run().result.current.prNumberPrefix;
+    // A host that predates the provider field serves GitHub.
+    setGithub({ prs: [{ url: "u", host: "github.com", repository: "o/r", number: 7 }] });
+    expect(prefix()).toBe("#");
+    // No provider serves the workspace, and there is nothing loaded yet.
+    setGithub({ provider: null, pr: { number: 7 } });
+    expect(prefix()).toBe("#");
+    setGithub(undefined);
+    expect(prefix()).toBe("#");
+  });
+
   it("refresh() refetches both sources and surfaces fetching", () => {
     const wtRefetch = vi.fn();
     const ghRefetch = vi.fn();
@@ -212,7 +250,11 @@ describe("useComposerGitStatus", () => {
       { status: "ok", worktrees: [wt({ branch: "main" })] },
       { isFetching: true, refetch: wtRefetch },
     );
-    useGithubInfoMock.mockReturnValue({ data: undefined, isFetching: false, refetch: ghRefetch });
+    usePullRequestInfoMock.mockReturnValue({
+      data: undefined,
+      isFetching: false,
+      refetch: ghRefetch,
+    });
     const { result } = run();
     expect(result.current.refreshing).toBe(true);
     result.current.refresh();

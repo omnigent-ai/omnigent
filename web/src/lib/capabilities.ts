@@ -62,6 +62,27 @@ export type FeatureKey = "usage_page" | "harness_install" | "canvas" | "customiz
 /** Deployment-wide release-feature values advertised by the server. */
 export type FeatureValues = Record<string, boolean>;
 
+/** What one git provider offers on this deploy. */
+export interface GitProviderCapabilities {
+  /** The provider's pull requests are readable. */
+  pull_requests: boolean;
+  /** The deploy has this provider's connection configured. */
+  connection: boolean;
+  /** The connection can list repositories. */
+  repo_browser: boolean;
+  /** The server hands the provider's credentials to sandboxes. */
+  credential_broker: boolean;
+}
+
+/** One entry of ``git_providers`` in ``GET /v1/info``. */
+export interface GitProviderInfo {
+  /** Provider id, e.g. ``"github"``; the ``/v1/connections/{id}`` path segment. */
+  id: string;
+  /** The server's display name, e.g. ``"GitHub"``. */
+  display_name: string;
+  capabilities: GitProviderCapabilities;
+}
+
 /** Shape of the response from ``GET /v1/info``. */
 export interface ServerInfo {
   accounts_enabled: boolean;
@@ -131,6 +152,12 @@ export interface ServerInfo {
    * CONNECTION_PANELS. Adding a provider adds a string here, not a new flag.
    */
   enabled_connections: string[];
+  /**
+   * Git providers the server knows, each with what it offers on this deploy.
+   * Absent on a server that predates the field; read via :func:`gitProviders`,
+   * which falls back to ``enabled_connections``.
+   */
+  git_providers?: GitProviderInfo[];
   /**
    * Server session-sharing policy. Drives whether the SPA shows the
    * Share control (``"on"``), restricts it to read-only invites
@@ -286,6 +313,40 @@ function parseFeatures(raw: unknown, harnessInstallEnabled: boolean): FeatureVal
   return parsed;
 }
 
+/**
+ * Read ``git_providers`` off the probe payload.
+ *
+ * Returns ``undefined`` when the field is missing or not a list (a server that
+ * predates it), so :func:`gitProviders` can fall back to ``enabled_connections``.
+ * Entries without an id, a display name, or a capabilities object are dropped,
+ * as are repeats of an id; a capability counts only when it is ``true``.
+ */
+function parseGitProviders(raw: unknown): GitProviderInfo[] | undefined {
+  if (!Array.isArray(raw)) return undefined;
+  const providers: GitProviderInfo[] = [];
+  for (const entry of raw) {
+    if (typeof entry !== "object" || entry === null) continue;
+    const { id, display_name, capabilities } = entry as Record<string, unknown>;
+    if (typeof id !== "string" || id === "" || typeof display_name !== "string") continue;
+    if (typeof capabilities !== "object" || capabilities === null || Array.isArray(capabilities)) {
+      continue;
+    }
+    if (providers.some((provider) => provider.id === id)) continue;
+    const flags = capabilities as Partial<Record<keyof GitProviderCapabilities, unknown>>;
+    providers.push({
+      id,
+      display_name,
+      capabilities: {
+        pull_requests: flags.pull_requests === true,
+        connection: flags.connection === true,
+        repo_browser: flags.repo_browser === true,
+        credential_broker: flags.credential_broker === true,
+      },
+    });
+  }
+  return providers;
+}
+
 /** Return whether a known release feature is enabled; missing/loading is off. */
 export function isFeatureEnabled(info: ServerInfo | "loading", feature: FeatureKey): boolean {
   return info !== "loading" && info.features?.[feature] === true;
@@ -338,6 +399,7 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
           enabled_connections: Array.isArray(data.enabled_connections)
             ? data.enabled_connections.filter((p): p is string => typeof p === "string")
             : [],
+          git_providers: parseGitProviders(data.git_providers),
           sharing_mode: SHARING_MODES.includes(data.sharing_mode as SharingMode)
             ? (data.sharing_mode as SharingMode)
             : "on",
@@ -432,4 +494,29 @@ export function sandboxProviderOptions(info: ServerInfo): (string | null)[] {
   const offered = info.sandbox_providers;
   if (Array.isArray(offered) && offered.length > 0) return offered;
   return [info.sandbox_provider];
+}
+
+/** The GitHub entry an older server implies by listing ``github`` in ``enabled_connections``. */
+const ENABLED_CONNECTION_GITHUB: GitProviderInfo = {
+  id: "github",
+  display_name: "GitHub",
+  capabilities: {
+    pull_requests: true,
+    connection: true,
+    repo_browser: true,
+    credential_broker: true,
+  },
+};
+
+/**
+ * The git providers this server offers, with what each can do.
+ *
+ * A server that predates ``git_providers`` has GitHub's connection configured
+ * exactly when ``enabled_connections`` names it, so that case yields one
+ * GitHub entry that can browse repos; otherwise the list is empty. Tolerates a
+ * hand-built ServerInfo that omits ``enabled_connections``.
+ */
+export function gitProviders(info: ServerInfo): GitProviderInfo[] {
+  if (Array.isArray(info.git_providers)) return info.git_providers;
+  return (info.enabled_connections ?? []).includes("github") ? [ENABLED_CONNECTION_GITHUB] : [];
 }

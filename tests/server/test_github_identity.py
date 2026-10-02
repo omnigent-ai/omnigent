@@ -122,3 +122,47 @@ def test_persist_failure_still_returns_refreshed_token() -> None:
     store = _Store(_Conn("ghu_old", "ghr", now_epoch() + 60))
     store.raise_on_update = True
     assert _resolve(store, _Client(result=_fresh("ghu_new"))) == "ghu_new"
+
+
+def _credential(store: _Store, client: _Client) -> dict[str, object] | None:
+    return asyncio.run(gi.resolve_github_credential("u@example.com", store=store, client=client))  # type: ignore[arg-type]
+
+
+def test_credential_payload_names_the_token_expiry_and_hosts() -> None:
+    expires_at = now_epoch() + 10_000
+    payload = _credential(_Store(_Conn("ghu_live", "ghr", expires_at)), _Client())
+    assert payload == {
+        "username": "x-access-token",
+        "token": "ghu_live",
+        "login": "octocat",
+        "expires_at": expires_at,
+        "hosts": ["github.com"],
+    }
+
+
+def test_credential_expiry_is_null_for_a_non_expiring_token() -> None:
+    payload = _credential(_Store(_Conn("ghu_live", None, None)), _Client())
+    assert payload is not None
+    assert payload["expires_at"] is None
+
+
+def test_credential_expiry_follows_a_refreshed_token() -> None:
+    # The stored expiry can lag (a failed persist), so report the vended token's own.
+    store = _Store(_Conn("ghu_old", "ghr", now_epoch() + 60))
+    store.raise_on_update = True
+    fresh = _fresh("ghu_new")
+    payload = _credential(store, _Client(result=fresh))
+    assert payload is not None
+    assert (payload["token"], payload["expires_at"]) == ("ghu_new", fresh.expires_at)
+
+
+def test_credential_keeps_the_current_expiry_when_refresh_fails() -> None:
+    expires_at = now_epoch() + 120
+    store = _Store(_Conn("ghu_old", "ghr", expires_at))
+    payload = _credential(store, _Client(exc=GitHubAppError("bad refresh")))
+    assert payload is not None
+    assert (payload["token"], payload["expires_at"]) == ("ghu_old", expires_at)
+
+
+def test_credential_is_none_without_a_connection() -> None:
+    assert _credential(_Store(None), _Client()) is None

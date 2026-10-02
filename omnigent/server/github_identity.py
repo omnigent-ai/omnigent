@@ -13,7 +13,7 @@ import httpx
 
 from omnigent.connections.github import GithubConnectionStore
 from omnigent.db.utils import now_epoch
-from omnigent.server.github_app import GitHubAppError
+from omnigent.server.github_app import GitHubAppError, GitHubTokenSet
 from omnigent.server.github_app_client import GitHubAppClient
 
 _logger = logging.getLogger(__name__)
@@ -25,6 +25,9 @@ _REFRESH_MARGIN_S = 300
 # The username git uses with a token over HTTPS (``https://<user>:<token>@…``);
 # GitHub ignores the value but requires a non-empty one.
 _GIT_TOKEN_USERNAME = "x-access-token"
+
+# The GitHub App's user tokens authenticate to github.com only.
+_GITHUB_HOSTS = ("github.com",)
 
 
 async def resolve_access_token(
@@ -46,21 +49,36 @@ async def resolve_access_token(
     :param client: The GitHub App client.
     :returns: A usable access token, or ``None``.
     """
+    resolved = await _resolve_token(user_id, store=store, client=client)
+    return resolved[0] if resolved is not None else None
+
+
+async def _resolve_token(
+    user_id: str,
+    *,
+    store: GithubConnectionStore,
+    client: GitHubAppClient,
+) -> tuple[str, int | None] | None:
+    """Resolve ``(access_token, expires_at)`` as :func:`resolve_access_token` does.
+
+    ``expires_at`` is the returned token's expiry in epoch seconds, or ``None`` for
+    a token that does not expire.
+    """
     connection = await _run_sync(store.get, user_id, with_tokens=True)
     if connection is None or not connection.access_token:
         return None
     expires_at = connection.token_expires_at
     # Non-expiring, or comfortably ahead of the margin: use as-is.
     if expires_at is None or expires_at > now_epoch() + _REFRESH_MARGIN_S:
-        return connection.access_token
+        return connection.access_token, expires_at
     refreshed = await _try_refresh(user_id, connection.refresh_token, store=store, client=client)
     if refreshed is not None:
-        return refreshed
+        return refreshed.access_token, refreshed.expires_at
     # Refresh could not produce a new token; the current one is still usable
     # until it actually lapses (up to the margin remains), so prefer it and only
     # give up once it has truly expired.
     if expires_at > now_epoch():
-        return connection.access_token
+        return connection.access_token, expires_at
     return None
 
 
@@ -70,7 +88,7 @@ async def _try_refresh(
     *,
     store: GithubConnectionStore,
     client: GitHubAppClient,
-) -> str | None:
+) -> GitHubTokenSet | None:
     """Refresh and persist the user's token; ``None`` on any failure.
 
     Catches every expected failure so the caller never sees an exception: no
@@ -90,7 +108,7 @@ async def _try_refresh(
         await _run_sync(store.update_tokens, user_id, refreshed)
     except Exception as exc:  # noqa: BLE001 - a persist error must not drop a minted token
         _logger.warning("GitHub token refresh could not be persisted for %s: %s", user_id, exc)
-    return refreshed.access_token
+    return refreshed
 
 
 async def resolve_github_credential(
@@ -106,15 +124,21 @@ async def resolve_github_credential(
     token plus the attribution metadata git needs (``username``/``login``), or
     ``None`` when the owner has not linked GitHub. The ``owner``/``login`` let
     the host attribute commits to the human, decoupled from the push credential.
+    ``expires_at`` is the vended token's expiry (epoch seconds, or ``None`` when
+    it does not expire), and ``hosts`` lists the lower-cased git hosts it
+    authenticates to (``["github.com"]``).
     """
-    token = await resolve_access_token(user_id, store=store, client=client)
-    if token is None:
+    resolved = await _resolve_token(user_id, store=store, client=client)
+    if resolved is None:
         return None
+    token, expires_at = resolved
     connection = await _run_sync(store.get, user_id)
     return {
         "username": _GIT_TOKEN_USERNAME,
         "token": token,
         "login": connection.github_login if connection is not None else None,
+        "expires_at": expires_at,
+        "hosts": list(_GITHUB_HOSTS),
     }
 
 

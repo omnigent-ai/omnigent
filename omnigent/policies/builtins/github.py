@@ -1276,9 +1276,12 @@ def _worse(
 
 # ── Registry ───────────────────────────────────────────────────────────────────
 
+# The GitHub provider's policy facet: the handler path the registry lists below.
+POLICY = "omnigent.policies.builtins.github.github_policy"
+
 POLICY_REGISTRY: list[dict[str, Any]] = [  # type: ignore[explicit-any]
     {
-        "handler": "omnigent.policies.builtins.github.github_policy",
+        "handler": POLICY,
         "kind": "factory",
         "name": "GitHub Repo & Branch Access",
         "description": (

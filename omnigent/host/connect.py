@@ -3498,9 +3498,11 @@ class HostProcess:
         """Serve a workspace-mutating op from the host (runner-offline fallback).
 
         Mirrors :meth:`_handle_fs_request` but for the small set of writes the
-        host can serve — currently the GitHub account/base preference, which
-        touches the host's ``~/.omnigent/config.yaml`` and runs ``gh``/``git`` in
-        the workspace. Called inside a worker thread by the dispatcher.
+        host can serve — currently the pull request panel's account/base
+        preference and PR attach/remove, which touch the host's
+        ``~/.omnigent/config.yaml`` and the session's PR registry and run the git
+        provider's CLI and ``git`` in the workspace. Called inside a worker
+        thread by the dispatcher.
 
         :param frame: The write frame (op + workspace + params).
         :returns: A result frame with the refreshed payload, or an error frame.
@@ -3552,17 +3554,17 @@ class HostProcess:
         op: str,
         params: dict[str, object],
     ) -> dict[str, object]:
-        """Route a write op to its handler. Writes call ``github_resource``
+        """Route a write op to its handler. Writes call ``pr_resource``
         directly (not the read-only ``WorkspaceReader``).
 
         :raises ValueError: On an unknown op.
         """
         from typing import cast
 
-        from omnigent.runner import github_resource
+        from omnigent.runner import pr_resource
 
         if op == "github_set_preference":
-            return github_resource.set_github_preference(
+            return pr_resource.set_pr_preference(
                 workspace,
                 account=cast("str | None", params.get("account")),
                 remote=cast("str | None", params.get("remote")),
@@ -3570,7 +3572,7 @@ class HostProcess:
                 pr_url=cast("str | None", params.get("pr_url")),
             )
         if op == "github_prs_update":
-            return github_resource.update_session_pr(
+            return pr_resource.update_session_pr(
                 workspace,
                 str(params["session_id"]),
                 str(params["url"]),
@@ -4898,26 +4900,14 @@ def run_host_process(
     if _cli_log is not None and _cli_log != host_log_path:
         print(f"CLI diagnostics: {display_log_path(_cli_log)}")
 
-    # Executor-agnostic GitHub setup: point git at the server's credential
-    # broker and attribute commits to the owner. Best-effort; the host runs in
-    # every executor and holds the launch token, so no launcher needs to inject
-    # anything GitHub-specific.
-    from omnigent.git_credential_github import (
-        configure_host_gh,
-        configure_host_git,
-        start_host_gh_refresh,
-    )
+    # Executor-agnostic git provider setup: point git at the server's credential
+    # broker, attribute commits to the owner, and write each provider CLI's config
+    # (gh's hosts.yml). Best-effort, and a no-op outside a managed sandbox.
+    from omnigent.git_credential import configure_host_credentials, start_credential_refresh
 
-    configure_host_git(server_url, identity.host_id)
-    # gh CLI ignores git's credential.helper for its own API calls, so also
-    # materialize the owner's brokered token into gh's hosts.yml, then keep it
-    # fresh: git re-fetches per op via the broker, but gh reads a static
-    # hosts.yml, so a background thread re-writes it before the GitHub token
-    # expires (~8h). All three are no-ops outside a managed sandbox; the refresher
-    # runs regardless of the startup write (its ticks re-fetch, so a transient
-    # broker blip at startup can't strand a connected owner for the whole session).
-    configure_host_gh(server_url, identity.host_id)
-    start_host_gh_refresh(server_url, identity.host_id)
+    configure_host_credentials(server_url, identity.host_id)
+    # CLIs such as gh read a static config, so re-write it before the token expires.
+    start_credential_refresh(server_url, identity.host_id)
 
     # Executor-agnostic Databricks setup: when the owner has linked a workspace,
     # materialize their per-user token as a ``~/.databrickscfg`` profile so the

@@ -1,5 +1,5 @@
-// Unit tests for `capabilities.ts` — the `/v1/info` probe's defensive parse
-// and the sandbox-provider option helpers.
+// Unit tests for `capabilities.ts` — the `/v1/info` probe's defensive parse,
+// the sandbox-provider option helpers, and the git-provider list.
 //
 // `capabilities.ts` caches the probe result at module scope, so each test calls
 // `vi.resetModules()` and re-imports to start from a clean slate.
@@ -7,8 +7,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 // resolveServerInfo is imported dynamically inside each probe (below) so every
 // test starts from a fresh module cache; only the pure helpers are static.
-import { sandboxOptionLabel, sandboxProviderOptions } from "./capabilities";
-import type { ServerInfo } from "./capabilities";
+import { gitProviders, sandboxOptionLabel, sandboxProviderOptions } from "./capabilities";
+import type { GitProviderInfo, ServerInfo } from "./capabilities";
 
 /** A ServerInfo with only the sandbox fields a test cares about set. */
 function info(overrides: Partial<ServerInfo>): ServerInfo {
@@ -221,5 +221,174 @@ describe("resolveServerInfo branding", () => {
     vi.resetModules();
     const malformed = await probe({ branding: "Acme" });
     expect(malformed.branding).toBeNull();
+  });
+});
+
+/** A `git_providers` entry as `/v1/info` serves it; `capabilities` override the defaults. */
+function gitProvider(
+  id: string,
+  displayName: string,
+  capabilities: Partial<GitProviderInfo["capabilities"]> = {},
+): GitProviderInfo {
+  return {
+    id,
+    display_name: displayName,
+    capabilities: {
+      pull_requests: true,
+      connection: false,
+      repo_browser: false,
+      credential_broker: false,
+      ...capabilities,
+    },
+  };
+}
+
+const GITHUB_PROVIDER = gitProvider("github", "GitHub", {
+  connection: true,
+  repo_browser: true,
+  credential_broker: true,
+});
+const AZURE_DEVOPS_PROVIDER = gitProvider("azure_devops", "Azure DevOps");
+
+describe("resolveServerInfo git_providers", () => {
+  it("keeps the entries the server lists, in order", async () => {
+    // The probe rebuilds ServerInfo field by field, so a forgotten field is
+    // dropped before any component sees it.
+    const parsed = await probe({
+      git_providers: [GITHUB_PROVIDER, AZURE_DEVOPS_PROVIDER],
+      enabled_connections: ["github"],
+    });
+    expect(parsed.git_providers).toEqual([GITHUB_PROVIDER, AZURE_DEVOPS_PROVIDER]);
+    expect(parsed.enabled_connections).toEqual(["github"]);
+  });
+
+  it("keeps an empty list as the server's word that it has none", async () => {
+    const parsed = await probe({ git_providers: [] });
+    expect(parsed.git_providers).toEqual([]);
+  });
+
+  // A server that predates the field says nothing, so gitProviders() must be
+  // able to tell "absent" from "empty".
+  it.each([
+    ["the field is absent", {}],
+    ["the field is null", { git_providers: null }],
+    ["the field is a string", { git_providers: "github" }],
+    ["the field is an object", { git_providers: { id: "github" } }],
+  ] as const)("leaves the list unset when %s", async (_case, extra) => {
+    const parsed = await probe({ enabled_connections: ["github"], ...extra });
+    expect(parsed.git_providers).toBeUndefined();
+  });
+
+  it("drops entries that are malformed", async () => {
+    const parsed = await probe({
+      git_providers: [
+        null,
+        "github",
+        7,
+        [],
+        { display_name: "No id", capabilities: {} },
+        { id: "", display_name: "Empty id", capabilities: {} },
+        { id: 3, display_name: "Numeric id", capabilities: {} },
+        { id: "no_name", capabilities: {} },
+        { id: "named_badly", display_name: 5, capabilities: {} },
+        { id: "no_caps", display_name: "No capabilities" },
+        { id: "caps_null", display_name: "Null capabilities", capabilities: null },
+        { id: "caps_string", display_name: "String capabilities", capabilities: "all" },
+        { id: "caps_list", display_name: "List capabilities", capabilities: [true] },
+        AZURE_DEVOPS_PROVIDER,
+      ],
+    });
+    expect(parsed.git_providers).toEqual([AZURE_DEVOPS_PROVIDER]);
+  });
+
+  it("counts a capability only when it is exactly true", async () => {
+    const parsed = await probe({
+      git_providers: [
+        {
+          id: "github",
+          display_name: "GitHub",
+          capabilities: { pull_requests: true, connection: "yes", repo_browser: 1 },
+        },
+      ],
+    });
+    expect(parsed.git_providers).toEqual([
+      gitProvider("github", "GitHub", {
+        pull_requests: true,
+        connection: false,
+        repo_browser: false,
+        credential_broker: false,
+      }),
+    ]);
+  });
+
+  it("keeps the first entry when an id repeats", async () => {
+    const parsed = await probe({
+      git_providers: [GITHUB_PROVIDER, gitProvider("github", "Imposter")],
+    });
+    expect(parsed.git_providers).toEqual([GITHUB_PROVIDER]);
+  });
+
+  it("leaves the list unset on a failed probe, so nothing is offered", async () => {
+    fetchMock.mockRejectedValueOnce(new Error("offline"));
+    const { resolveServerInfo } = await import("./capabilities");
+    const parsed = await resolveServerInfo();
+    expect(parsed.git_providers).toBeUndefined();
+    expect(gitProviders(parsed)).toEqual([]);
+  });
+});
+
+describe("gitProviders", () => {
+  it("returns the list the server sent", () => {
+    const listed = [GITHUB_PROVIDER, AZURE_DEVOPS_PROVIDER];
+    expect(gitProviders(info({ git_providers: listed }))).toEqual(listed);
+  });
+
+  it("takes an empty list at the server's word, whatever enabled_connections says", () => {
+    expect(gitProviders(info({ git_providers: [], enabled_connections: ["github"] }))).toEqual([]);
+  });
+
+  it("does not add GitHub to a list that omits it", () => {
+    expect(
+      gitProviders(
+        info({ git_providers: [AZURE_DEVOPS_PROVIDER], enabled_connections: ["github"] }),
+      ),
+    ).toEqual([AZURE_DEVOPS_PROVIDER]);
+  });
+
+  it("synthesizes GitHub for an older server whose connection is enabled", () => {
+    // An older server lists GitHub in enabled_connections exactly when its
+    // connection is configured, and that connection can list repos.
+    expect(gitProviders(info({ enabled_connections: ["github"] }))).toEqual([
+      {
+        id: "github",
+        display_name: "GitHub",
+        capabilities: {
+          pull_requests: true,
+          connection: true,
+          repo_browser: true,
+          credential_broker: true,
+        },
+      },
+    ]);
+    expect(gitProviders(info({ enabled_connections: ["databricks", "github"] }))).toHaveLength(1);
+  });
+
+  it.each([
+    ["no connection is enabled", []],
+    ["only another connection is enabled", ["databricks"]],
+  ])("offers none to an older server when %s", (_case, enabledConnections) => {
+    expect(gitProviders(info({ enabled_connections: enabledConnections }))).toEqual([]);
+  });
+
+  it("offers none when a hand-built info omits enabled_connections", () => {
+    const bare = info({});
+    delete (bare as Partial<ServerInfo>).enabled_connections;
+    expect(gitProviders(bare)).toEqual([]);
+  });
+
+  it("synthesizes GitHub from a probe of an older server", async () => {
+    const parsed = await probe({ enabled_connections: ["github"] });
+    expect(parsed.git_providers).toBeUndefined();
+    expect(gitProviders(parsed).map((provider) => provider.id)).toEqual(["github"]);
   });
 });

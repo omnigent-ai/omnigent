@@ -4550,27 +4550,12 @@ def server(
     except ValueError as exc:
         raise click.ClickException(str(exc)) from exc
 
-    # GitHub App integration (per-user "Connect GitHub"). Enabled only
-    # when OMNIGENT_GITHUB_APP_* env supplies a client id/secret + a
-    # resolvable redirect URI; otherwise both stay None and the feature
-    # is inert (see docs/GITHUB_APP_SETUP.md).
-    from omnigent.server.github_app import GitHubAppConfig
+    # Git provider connections (per-user "Connect GitHub", ...). Each provider's
+    # connection facet reads its own env and stays inert without it; GitHub reads
+    # OMNIGENT_GITHUB_APP_* (see docs/GITHUB_APP_SETUP.md).
+    from omnigent.server.git_providers import connections_from_env
 
-    github_config = GitHubAppConfig.from_env()
-    github_store = None
-    if github_config is not None:
-        from omnigent.stores.credential_store import build_secret_cipher
-
-        cipher = build_secret_cipher()
-        if cipher is None:
-            logging.getLogger(__name__).error(
-                "GitHub App is configured but disabled: set OMNIGENT_CREDENTIAL_ENC_KEY "
-                "(the credential store's encryption key) to enable it."
-            )
-        else:
-            from omnigent.connections.github import GithubConnectionStore
-
-            github_store = GithubConnectionStore(db_uri, cipher)
+    connections = connections_from_env(db_uri)
 
     # Databricks Connect (per-user OAuth U2M). Shares the credential store's
     # cipher; inert unless OMNIGENT_DATABRICKS_CLIENT_ID/_SECRET are set.
@@ -4659,8 +4644,7 @@ def server(
         admins=config_str_list(cfg.get("admins")),
         allowed_domains=config_str_list(cfg.get("allowed_domains")),
         sandbox_config=sandbox_config,
-        github_config=github_config,
-        github_store=github_store,
+        connections=connections,
         databricks_config=databricks_config,
         databricks_store=databricks_store,
         server_config=title_server_config,
