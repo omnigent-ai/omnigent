@@ -1552,7 +1552,13 @@ def _parse_single_provider_sandbox_config(raw: dict[str, object]) -> ManagedSand
         if section is not None:
             _reject_unknown_keys(
                 section,
-                {"profile", "sandbox_id_prefix", "inactivity_timeout_s", "bootstrap_command"},
+                {
+                    "profile",
+                    "sandbox_id_prefix",
+                    "inactivity_timeout_s",
+                    "bootstrap_command",
+                    "proxy_bearer",
+                },
                 "sandbox.databricks",
             )
         launcher_factory = _databricks_launcher_factory(
@@ -1562,6 +1568,7 @@ def _parse_single_provider_sandbox_config(raw: dict[str, object]) -> ManagedSand
                 raw, "databricks", "inactivity_timeout_s"
             ),
             bootstrap_command=_parse_provider_string(raw, "databricks", "bootstrap_command"),
+            proxy_bearer=bool(_parse_provider_bool(raw, "databricks", "proxy_bearer")),
         )
         # Sandboxes stop on idle and resume under the same id; the token must
         # outlive an idle weekend. A wake re-arms a fresh token anyway.
@@ -2383,6 +2390,7 @@ def _databricks_launcher_factory(
     sandbox_id_prefix: str | None,
     inactivity_timeout_s: int | None,
     bootstrap_command: str | None,
+    proxy_bearer: bool = False,
 ) -> Callable[[], SandboxHostLauncher]:
     """Build the launcher factory for the YAML ``provider: databricks`` path."""
 
@@ -2394,6 +2402,7 @@ def _databricks_launcher_factory(
             sandbox_id_prefix=sandbox_id_prefix,
             inactivity_timeout_s=inactivity_timeout_s,
             bootstrap_command=bootstrap_command,
+            proxy_bearer=proxy_bearer,
         )
 
     return _build

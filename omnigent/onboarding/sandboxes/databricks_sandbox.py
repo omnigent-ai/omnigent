@@ -57,6 +57,7 @@ from omnigent.onboarding.sandboxes.base import (
     supervise_host_command,
 )
 from omnigent.onboarding.sandboxes.types import SandboxCapabilities, clone_dir_names
+from omnigent.util.proxy_bearer import PROXY_BEARER_FILE_ENV_VAR
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
@@ -124,6 +125,12 @@ class DatabricksSandboxLauncher(SandboxLauncher):
         launch and every resume), e.g. a ``uv tool install`` that pins the
         in-sandbox omnigent to the server's version. ``None`` runs the
         image's baked ``omnigent``.
+    :param proxy_bearer: Provision the launcher's own short-lived OAuth bearer
+        into the sandbox (``~/.omnigent/proxy-bearer``, mode 600) and point the
+        host at it (:data:`~omnigent.util.proxy_bearer.PROXY_BEARER_FILE_ENV_VAR`).
+        Required when the server sits behind the Databricks Apps OAuth proxy,
+        which rejects the sandbox's own PAT. Refreshed on every start, resume,
+        and keepalive.
     """
 
     provider: ClassVar[str] = "databricks"
@@ -137,8 +144,10 @@ class DatabricksSandboxLauncher(SandboxLauncher):
         sandbox_id_prefix: str | None = None,
         inactivity_timeout_s: int | None = None,
         bootstrap_command: str | None = None,
+        proxy_bearer: bool = False,
     ) -> None:
         self._profile = profile
+        self._proxy_bearer = proxy_bearer
         self._prefix = sandbox_id_prefix or "omnigent"
         self._inactivity_timeout_s = inactivity_timeout_s
         self._bootstrap_command = bootstrap_command
@@ -361,6 +370,48 @@ class DatabricksSandboxLauncher(SandboxLauncher):
             )
         return RemoteCommandResult(returncode=returncode, stdout=stdout, stderr=stderr)
 
+    # ── Front-door bearer (Databricks Apps OAuth proxy) ──
+
+    def _current_bearer(self) -> str:
+        """Return the launcher identity's current OAuth access token."""
+        self._api()
+        header = self._client.config.authenticate().get("Authorization", "")
+        token = header.removeprefix("Bearer ").strip()
+        if not token:
+            raise click.ClickException("could not mint a bearer for the sandbox host")
+        return token
+
+    def _write_proxy_bearer(self, sandbox_id: str) -> str:
+        """Atomically (re)write the proxy bearer file; return its absolute path."""
+        result = self.run(
+            sandbox_id,
+            'umask 077; mkdir -p "$HOME/.omnigent" && '
+            'printf %s "$OG_PROXY_BEARER" > "$HOME/.omnigent/proxy-bearer.tmp" && '
+            'mv -f "$HOME/.omnigent/proxy-bearer.tmp" "$HOME/.omnigent/proxy-bearer" && '
+            'printf %s "$HOME/.omnigent/proxy-bearer"',
+            envs={"OG_PROXY_BEARER": self._current_bearer()},
+        )
+        return result.stdout.strip()
+
+    def keep_alive(self, sandbox_id: str) -> bool | None:
+        """
+        Refresh the proxy bearer on a RUNNING sandbox (no-op otherwise).
+
+        Never execs into a stopped sandbox: exec-sync auto-starts it, which
+        would defeat the platform's idle stop. A stopped host is revived by the
+        wake path, whose :meth:`start_host` writes a fresh bearer anyway.
+        """
+        if not self._proxy_bearer:
+            return None
+        try:
+            if _state_of(self._get(sandbox_id)) != _RUNNING:
+                return None
+            self._write_proxy_bearer(sandbox_id)
+        except (click.ClickException, SandboxGoneError) as exc:
+            click.echo(f"  → warning: could not refresh proxy bearer on {sandbox_id}: {exc}")
+            return False
+        return True
+
     def start_host(
         self,
         sandbox_id: str,
@@ -389,6 +440,9 @@ class DatabricksSandboxLauncher(SandboxLauncher):
             "pkill -f '[o]mnigent host' >/dev/null 2>&1; sleep 1; true",
             check=False,
         )
+        launch_envs: dict[str, str] = {}
+        if self._proxy_bearer:
+            launch_envs[PROXY_BEARER_FILE_ENV_VAR] = self._write_proxy_bearer(sandbox_id)
         if self._bootstrap_command:
             if on_stage is not None:
                 on_stage("starting")
@@ -413,6 +467,7 @@ class DatabricksSandboxLauncher(SandboxLauncher):
                 HOST_TOKEN_ENV_VAR: token,
                 HOST_ID_ENV_VAR: host_id,
                 HOST_NAME_ENV_VAR: host_name,
+                **launch_envs,
             },
         )
         return workspace

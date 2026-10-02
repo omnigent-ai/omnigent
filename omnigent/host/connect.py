@@ -694,6 +694,8 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         # NAMES, not secrets, so allowlisting it leaks nothing on its own.
         # (Literal, not RUNNER_ENV_PASSTHROUGH_ENV_VAR, which is defined below.)
         "OMNIGENT_RUNNER_ENV_PASSTHROUGH",
+        # Path (not a secret) to the launcher-refreshed front-door bearer.
+        "OMNIGENT_PROXY_BEARER_FILE",
         # Executable selection must survive CLI -> daemon -> runner. The
         # passthrough list is only applied at the second boundary.
         "OMNIGENT_CODEX_PATH",
@@ -4354,6 +4356,14 @@ class HostProcess:
         managed_token = os.environ.get(HOST_TOKEN_ENV_VAR)
         if managed_token:
             headers[MANAGED_HOST_TOKEN_HEADER] = managed_token
+            # Behind an authenticating front door (Databricks Apps OAuth proxy)
+            # the launch token alone never reaches the server; the launcher-
+            # provisioned proxy bearer gets the request through the proxy.
+            from omnigent.util.proxy_bearer import read_proxy_bearer
+
+            proxy_bearer = read_proxy_bearer()
+            if proxy_bearer:
+                headers["Authorization"] = f"Bearer {proxy_bearer}"
             return headers
         token = self._current_auth_token()
         if token:
@@ -4376,7 +4386,9 @@ class HostProcess:
         from omnigent.host.identity import HOST_TOKEN_ENV_VAR
 
         if os.environ.get(HOST_TOKEN_ENV_VAR):
-            return None
+            from omnigent.util.proxy_bearer import read_proxy_bearer
+
+            return read_proxy_bearer()
         try:
             if not self._auth_token_factory_resolved:
                 if not initialize:
