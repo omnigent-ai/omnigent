@@ -10,6 +10,7 @@ Run the adapter family with retries disabled:
 uv run --no-sync pytest tests/harnesses/codex_native --reruns 0 -n 4 --dist loadfile
 ```
 
-Existing filenames and test names are retained from `tests/test_codex_native*.py`.
-To find an old failure, search its test name here. This directory adds no shared
-fixtures; module-local fixtures retain their existing scope.
+The adapter family originally lived at `tests/test_codex_native*.py`. Existing
+test names are retained.
+To find an old failure, search its test name here. Fixtures stay beside the behavior they apply to; splitting a suite must preserve
+their reach.
