@@ -755,6 +755,9 @@ class _TokenSource:
 DebugLogRow = dict[str, object]
 DebugLogSend = Callable[[list[DebugLogRow]], None]
 
+# Queued by DebugLogHandler.close() to wake its worker; never sent.
+_CLOSE_WAKEUP: DebugLogRow = {}
+
 
 class DebugLogHandler(logging.Handler):
     """Non-blocking handler that queues rows and sends them in batches.
@@ -840,9 +843,9 @@ class DebugLogHandler(logging.Handler):
                     # self-heal only revives a *stopped* thread, so a crash would
                     # silently end delivery for the process. Drop and continue.
                     time.sleep(0.1)
-            # Best-effort drain of whatever is left on shutdown.
-            remaining = self._collect_batch(0.0)
-            if remaining:
+            # Best-effort drain of everything left on shutdown, batch by batch;
+            # close()'s join timeout bounds how long this may run.
+            while remaining := self._collect_batch(0.0):
                 self._send(remaining)
         except Exception:  # noqa: BLE001 — shutdown drain is best-effort
             pass
@@ -852,17 +855,25 @@ class DebugLogHandler(logging.Handler):
     def _collect_batch(self, wait: float) -> list[DebugLogRow]:
         batch: list[DebugLogRow] = []
         try:
-            batch.append(self._queue.get(timeout=wait) if wait else self._queue.get_nowait())
+            first = self._queue.get(timeout=wait) if wait else self._queue.get_nowait()
         except queue.Empty:
             return batch
+        if first is not _CLOSE_WAKEUP:
+            batch.append(first)
         while len(batch) < _BATCH_MAX_RECORDS:
             try:
-                batch.append(self._queue.get_nowait())
+                item = self._queue.get_nowait()
             except queue.Empty:
                 break
+            if item is not _CLOSE_WAKEUP:
+                batch.append(item)
         return batch
 
-    def close(self) -> None:
+    def close(self, timeout: float = 5.0) -> None:
+        """Stop the sender thread after it drains queued rows.
+
+        :param timeout: Max seconds to wait for the final drain, e.g. ``5.0``.
+        """
         if self._closed:
             return
         # Capture the worker being stopped: a concurrent emit() can revive the
@@ -870,7 +881,11 @@ class DebugLogHandler(logging.Handler):
         stop, thread = self._stop, self._thread
         self._closed = True
         stop.set()
-        thread.join(timeout=5.0)
+        # Wake a worker blocked waiting for rows so the timeout is spent on the
+        # drain, not on the idle wait. A full queue means it is not blocked.
+        with contextlib.suppress(queue.Full):
+            self._queue.put_nowait(_CLOSE_WAKEUP)
+        thread.join(timeout=timeout)
         super().close()
 
 
@@ -1252,6 +1267,19 @@ def debug_sink_enabled() -> bool:
     # GIL, and this is a best-effort gate — a stale read only mis-times one
     # record around enable/close, never corrupts state.
     return _active_sink is not None and not _active_sink.closed
+
+
+def close_debug_log_sink(timeout: float = 5.0) -> None:
+    """Drain and close the active debug-log sink, if any.
+
+    For processes that leave via ``os._exit`` (zygote-forked children), which
+    skips the ``atexit`` drain and would drop the final batch.
+
+    :param timeout: Max seconds to wait for the drain, e.g. ``2.0``.
+    """
+    sink = _active_sink
+    if sink is not None:
+        sink.close(timeout=timeout)
 
 
 def sse_event_logger() -> logging.Logger:
