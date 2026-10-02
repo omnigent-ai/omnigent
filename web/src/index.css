@@ -1298,10 +1298,11 @@ aside[aria-label="Workspace"][data-maximized] {
 [data-streamdown="code-block-body"] {
   font-size: 0.875em;
 }
-/* Fallback mono fonts (e.g. JetBrains Mono) ship ligatures that can visually
- * swallow spaces in CLI flags like `-c --markdown`; code must render literally. */
+/* Mono fonts in the code stack ship ligatures (calt) that visually merge
+ * adjacent tokens: `>-`, `->`, `--`, `<=`. Suppress on all code surfaces. */
 [data-streamdown="inline-code"],
-[data-streamdown="code-block-body"] {
+[data-streamdown="code-block-body"],
+[data-language] code {
   font-variant-ligatures: none;
   font-feature-settings:
     "liga" 0,

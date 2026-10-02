@@ -1209,6 +1209,41 @@ describe("index.css native safe-area insets for mobile overlays", () => {
   });
 });
 
+/* Regression test for overlapping glyphs in code snippets.
+ *
+ * Geist Mono Variable and JetBrains Mono both carry a calt feature that
+ * merges adjacent characters like >-, ->, --, and <= into a single visual
+ * glyph. Both the Streamdown markdown renderer (data-streamdown selectors)
+ * and the Shiki-based CodeBlock component (data-language selector) must
+ * suppress ligatures and contextual alternates so code renders literally.
+ */
+describe("index.css code block ligature suppression", () => {
+  const ligatureRules = cssBlocks
+    .map(([block]) => block)
+    .filter((block) => /font-variant-ligatures\s*:\s*none/.test(block));
+
+  const coveredSelectors = ligatureRules.map(selectorOf).join("\n");
+
+  it("has at least one ligature-suppression rule", () => {
+    expect(ligatureRules.length, "no font-variant-ligatures: none rule found").toBeGreaterThan(0);
+  });
+
+  it.each([
+    '[data-streamdown="inline-code"]',
+    '[data-streamdown="code-block-body"]',
+    "[data-language] code",
+  ])("disables ligatures on %s", (selector) => {
+    expect(coveredSelectors).toContain(selector);
+  });
+
+  it("disables both liga and calt feature axes", () => {
+    const rule = ligatureRules.find((block) => block.includes("[data-language] code"));
+    expect(rule, "the [data-language] code ligature rule is gone from index.css").toBeDefined();
+    expect(rule).toMatch(/"liga"\s*0/);
+    expect(rule).toMatch(/"calt"\s*0/);
+  });
+});
+
 /**
  * Slice the native safe-area inset rule out of the CSS source.
  *
