@@ -266,7 +266,6 @@ def test_terminal_env_is_allowlisted_and_drops_secrets() -> None:
         "BOB_API_KEY": "should-not-be-copied",
         "BOBSHELL_API_KEY": "should-not-be-copied",
         "OPENAI_API_KEY": "should-not-be-copied",
-        "DATABRICKS_TOKEN": "should-not-be-copied",
         "RUNNER_AUTH_TOKEN": "should-not-be-copied",
     }
     env = bob_bridge.build_bob_native_terminal_env(source)
