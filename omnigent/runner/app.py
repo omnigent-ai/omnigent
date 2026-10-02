@@ -149,6 +149,7 @@ from omnigent.runner.session_init_protocol import (
     RunnerSessionInitEnvelope,
     parse_runner_session_init_envelope,
 )
+from omnigent.runner.subagent_recovery import build_subagent_recovery
 from omnigent.runner.subagent_routing import (
     PLAIN_SESSION,
     SessionRoutingClass,
@@ -164,11 +165,8 @@ from omnigent.runner.subagent_work import (
     _WAKE_POST_MAX_ATTEMPTS,
     _child_session_parents,
     _ChildParentMeta,
-    _deliver_subagent_completion,
     _deliver_subagent_wake_post,
-    _drained_delivered_subagent_children,
     _format_subagent_wake_notice,
-    _recover_subagent_results_from_server,
     _session_inboxes_ref,
     _session_status_to_task_status,
     _subagent_delivery_not_confirmed_response,
@@ -177,7 +175,6 @@ from omnigent.runner.subagent_work import (
     _subagent_work_by_child,
     _subagent_work_by_parent,
     _SubagentDeliveryAck,
-    _SubagentRecoveryReadError,
     _SubagentWorkEntry,
     _truncate_child_preview,
     get_subagent_work,
@@ -185,7 +182,6 @@ from omnigent.runner.subagent_work import (
     list_subagent_work,
     mark_subagent_work_started,
     mark_subagent_work_terminal,
-    register_subagent_work,
     unregister_child_session,
     unregister_subagent_work_for_session,
 )
@@ -3508,184 +3504,6 @@ def create_runner_app(
                     extra={"session_id": conv_id},
                 )
 
-    async def _recover_sub_agent_name(conv_id: str) -> str | None:
-        cached = _session_sub_agent_names.get(conv_id)
-        if cached:
-            return cached
-        try:
-            snapshot = await _session_snapshot(conv_id)
-        except Exception:  # noqa: BLE001 — best-effort recovery
-            return None
-        name = snapshot.sub_agent_name if snapshot is not None else None
-        if name:
-            _session_sub_agent_names[conv_id] = name
-        return name
-
-    async def _ensure_subagent_work_entry(conv_id: str) -> _SubagentWorkEntry | None:
-        existing = get_subagent_work(conv_id)
-        if existing is not None:
-            return existing
-        if conv_id in _drained_delivered_subagent_children:
-            return None
-        try:
-            snapshot = await _session_snapshot(conv_id)
-        except Exception:  # noqa: BLE001 — best-effort recovery
-            return None
-        parent_id = snapshot.parent_session_id
-        if not parent_id or parent_id == conv_id:
-            return None
-        agent = snapshot.sub_agent_name or snapshot.agent_name or "sub-agent"
-        return register_subagent_work(
-            parent_session_id=parent_id,
-            child_session_id=conv_id,
-            agent=agent,
-            title=snapshot.sub_agent_name or "",
-        )
-
-    async def _parent_is_nested_subagent(entry: _SubagentWorkEntry) -> bool:
-        """
-        Return whether an undelivered result's parent is itself a sub-agent.
-
-        A mirrored claude-native sub-agent never runs on this runner, so its
-        inbox never exists here and retrying its children's terminal status
-        every 30 s buys nothing. The inbox record is redundant for that
-        topology: the child's result reaches the parent natively inside the
-        Claude process. The status is acknowledged and the entry kept, so a
-        sub-agent parent that does run here later still receives it when its
-        inbox is created (``_deliver_retained_subagent_results``). An unreadable
-        parent snapshot reads as a top-level parent, so the retry contract still
-        covers a parent that lives elsewhere or is re-initializing after a
-        restart.
-
-        :param entry: Terminal work entry whose parent inbox was missing.
-        :returns: ``True`` when the parent's snapshot names its own parent.
-        """
-        snapshot = await _session_snapshot(entry.parent_session_id)
-        return snapshot.ok and snapshot.parent_session_id is not None
-
-    def _deliver_retained_subagent_results(parent_id: str) -> None:
-        """
-        Hand over results acknowledged while ``parent_id`` had no inbox here.
-
-        A terminal child whose sub-agent parent had no inbox here is
-        acknowledged with its entry kept undelivered. If that parent later
-        runs on this runner, creating its inbox delivers those entries and
-        wakes it, as the forwarder's pending retry used to the moment the inbox
-        appeared. A parent that never runs here keeps the entry undelivered;
-        for a claude-native mirror the result already reached it natively.
-        Idempotent: delivered entries are skipped.
-
-        :param parent_id: Parent whose inbox now exists, e.g. ``"conv_parent123"``.
-        :returns: None.
-        """
-        for entry in list_subagent_work(parent_id):
-            if entry.status not in _SUBAGENT_TERMINAL_STATUSES or entry.delivered:
-                continue
-            if _deliver_subagent_completion(entry).delivered_now:
-                _schedule_subagent_wake(entry)
-
-    async def _run_subagent_recovery(parent_id: str) -> None:
-        """
-        Re-queue terminal child results lost with a runner process restart.
-
-        The parent inbox is a process-local queue, so a result queued before
-        a restart but not yet drained would otherwise vanish. Runs once per
-        parent per process; pending recovered work is refreshed by the periodic
-        sweep. A failed server read is retried before the next ``sys_read_inbox``
-        drain. The inbox is created here when missing: after a reconnect the
-        server can dispatch a pending message before it re-initializes the session,
-        and that turn's drain
-        must still see the recovered results. Results acknowledged while this
-        parent had no inbox here are handed over first, on every call.
-
-        :param parent_id: Parent session whose inbox was recreated, e.g.
-            ``"conv_parent123"``.
-        :returns: None.
-        """
-        _session_inboxes.setdefault(parent_id, asyncio.Queue())
-        _deliver_retained_subagent_results(parent_id)
-        if parent_id in _subagent_recovery_done:
-            return
-        lock = _subagent_recovery_locks.setdefault(parent_id, asyncio.Lock())
-        async with lock:
-            if parent_id in _subagent_recovery_done:
-                return
-            try:
-                await _recover_subagent_results_from_server(
-                    server_client=server_client,
-                    parent_id=parent_id,
-                    schedule_wake=_schedule_subagent_wake,
-                )
-            except (httpx.HTTPError, _SubagentRecoveryReadError, ValueError):
-                _logger.warning(
-                    "Failed to recover undrained sub-agent results for %s",
-                    parent_id,
-                    exc_info=True,
-                    extra={"session_id": parent_id},
-                )
-                return
-            _subagent_recovery_done.add(parent_id)
-
-    def _start_subagent_recovery(parent_id: str) -> asyncio.Task[None]:
-        """Return the session-owned single-flight restart recovery task."""
-        task = _subagent_recovery_tasks.get(parent_id)
-        if task is not None and not task.done():
-            return task
-        _subagent_recovery_tasks.pop(parent_id, None)
-        task = asyncio.create_task(
-            _run_subagent_recovery(parent_id),
-            name=f"subagent-recovery:{parent_id}",
-        )
-        _subagent_recovery_tasks[parent_id] = task
-        _background_tasks.add(task)
-
-        def _drop_completed_recovery(done: asyncio.Task[None]) -> None:
-            _background_tasks.discard(done)
-            if _subagent_recovery_tasks.get(parent_id) is done:
-                _subagent_recovery_tasks.pop(parent_id, None)
-
-        task.add_done_callback(_drop_completed_recovery)
-        return task
-
-    async def _cancel_subagent_recovery(parent_id: str) -> None:
-        """Stop recovery before deleting its session-local inbox and markers."""
-        task = _subagent_recovery_tasks.pop(parent_id, None)
-        if task is None:
-            return
-        task.cancel()
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
-        except Exception:  # noqa: BLE001 - recovery failure must not block session deletion
-            _logger.warning(
-                "Sub-agent recovery failed while deleting session %s",
-                parent_id,
-                exc_info=True,
-                extra={"session_id": parent_id},
-            )
-
-    async def _recover_undrained_subagent_results(parent_id: str) -> None:
-        """Await the session-owned single-flight restart recovery task."""
-        await asyncio.shield(_start_subagent_recovery(parent_id))
-
-    app.state.recover_undrained_subagent_results = _recover_undrained_subagent_results
-
-    async def _reconcile_pending_subagent_results() -> None:
-        """Refresh only recovered work with no local execution or completion edge."""
-        parents = {
-            entry.parent_session_id
-            for entry in list(_subagent_work_by_child.values())
-            if entry.status == "waiting"
-        }
-        for parent_id in parents:
-            if not any(entry.status == "waiting" for entry in list_subagent_work(parent_id)):
-                continue
-            _subagent_recovery_done.discard(parent_id)
-            await _recover_undrained_subagent_results(parent_id)
-
-    app.state.reconcile_pending_subagent_results = _reconcile_pending_subagent_results
-
     def _note_session_harness_override(conv_id: str, harness_override: str | None) -> None:
         """Record the harness a session was forwarded, so reads match the run.
 
@@ -4707,6 +4525,24 @@ def create_runner_app(
     # Seam for the entrypoint's launch reaper (and tests): terminal delivery
     # that also schedules the parent wake POST, not just the inbox insert.
     app.state.mark_subagent_terminal_and_wake = _mark_subagent_terminal_and_wake
+
+    _subagent_recovery = build_subagent_recovery(
+        app,
+        _background_tasks=_background_tasks,
+        _schedule_subagent_wake=_schedule_subagent_wake,
+        _session_inboxes=_session_inboxes,
+        _session_snapshot=_session_snapshot,
+        _session_sub_agent_names=_session_sub_agent_names,
+        _subagent_recovery_tasks=_subagent_recovery_tasks,
+        server_client=server_client,
+    )
+    _cancel_subagent_recovery = _subagent_recovery.cancel_subagent_recovery
+    _deliver_retained_subagent_results = _subagent_recovery.deliver_retained_subagent_results
+    _ensure_subagent_work_entry = _subagent_recovery.ensure_subagent_work_entry
+    _parent_is_nested_subagent = _subagent_recovery.parent_is_nested_subagent
+    _recover_sub_agent_name = _subagent_recovery.recover_sub_agent_name
+    _recover_undrained_subagent_results = _subagent_recovery.recover_undrained_subagent_results
+    _start_subagent_recovery = _subagent_recovery.start_subagent_recovery
 
     def _subagent_work_id_for_session(conv_id: str) -> str | None:
         entry = get_subagent_work(conv_id)
