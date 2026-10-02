@@ -208,3 +208,71 @@ def test_normalize_extra_args_extra_args_wins_over_legacy_with_warning() -> None
             extra_args=("--new",), legacy_args=("--old",), legacy_param="pi_args"
         )
     assert result == ("--new",)
+
+
+@pytest.mark.asyncio
+async def test_bind_session_runner_retries_transient_429_then_succeeds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A transient 429 on the bind PATCH is retried instead of aborting startup.
+
+    A regression here makes native startup fail on the first throttle from
+    the server/ingress even though the same PATCH would succeed moments later.
+    """
+    from omnigent.native import transient_429
+
+    sleeps: list[float] = []
+
+    async def _sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    monkeypatch.setattr(transient_429, "_sleep", _sleep)
+    calls: list[str] = []
+
+    async def _handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.method)
+        if len(calls) == 1:
+            return httpx.Response(429, headers={"Retry-After": "1"}, request=request)
+        return httpx.Response(200, json={}, request=request)
+
+    async with httpx.AsyncClient(
+        base_url="https://example.databricks.com",
+        transport=httpx.MockTransport(_handler),
+    ) as client:
+        await native_terminal.bind_session_runner(client, "conv_abc", "runner_abc")
+
+    assert calls == ["PATCH", "PATCH"], "the throttled PATCH must be re-sent"
+    assert sleeps == [1.0]
+
+
+@pytest.mark.asyncio
+async def test_bind_session_runner_surfaces_429_once_retry_budget_spent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A persistent 429 still fails with the existing user-facing error, bounded.
+    """
+    from omnigent.native import transient_429
+
+    clock = {"t": 0.0}
+    monkeypatch.setattr(transient_429, "_monotonic", lambda: clock["t"])
+
+    async def _sleep(seconds: float) -> None:
+        clock["t"] += seconds
+
+    monkeypatch.setattr(transient_429, "_sleep", _sleep)
+    calls: list[str] = []
+
+    async def _handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.method)
+        return httpx.Response(429, json={"error_code": "RESOURCE_EXHAUSTED"}, request=request)
+
+    async with httpx.AsyncClient(
+        base_url="https://example.databricks.com",
+        transport=httpx.MockTransport(_handler),
+    ) as client:
+        with pytest.raises(click.ClickException, match=r"bind failed \(429\)"):
+            await native_terminal.bind_session_runner(client, "conv_abc", "runner_abc")
+
+    assert len(calls) >= 2, "the 429 must be retried before failing"

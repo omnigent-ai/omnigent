@@ -31,7 +31,9 @@ from typing import NotRequired, TypedDict
 
 import httpx
 
-# How long to keep retrying transient 5xx / connect errors on the
+from omnigent.native.transient_429 import retry_after_hint_s
+
+# How long to keep retrying transient 429 / 5xx / connect errors on the
 # policy evaluate POST before failing closed. Keeps the pre-execution
 # gate from blocking long on a sick server while still absorbing brief
 # DB hiccups on a hosted deployment. A gateway-severed held poll resets
@@ -592,7 +594,8 @@ def post_evaluate_with_retry(
     """
     POST to the Omnigent policy evaluate endpoint, retrying on transient errors.
 
-    Retries on 5xx HTTP responses and connection-level errors
+    Retries on explicit 429 throttles (honouring a bounded ``Retry-After``
+    hint), 5xx HTTP responses, and connection-level errors
     (:class:`httpx.ConnectError`, :class:`httpx.ConnectTimeout`) within
     :data:`_EVALUATE_POLICY_RETRY_BUDGET_S`. Returns the successful response,
     or ``None`` if the budget is exhausted or a non-retryable error occurs.
@@ -614,7 +617,8 @@ def post_evaluate_with_retry(
     second approval card from appearing when the first was already
     published before the error.
 
-    4xx responses are final — a bad request won't succeed on retry. A
+    4xx responses other than 429 are final — a bad request won't succeed
+    on retry. A
     :class:`httpx.ReadTimeout` is final too: it fires only after the server
     held the poll for the whole read budget, i.e. the ask itself timed out.
     The caller is responsible for fail-closed handling on ``None``.
@@ -706,25 +710,36 @@ def post_evaluate_with_retry(
             last_error = f"server returned {status}" + (
                 f": {body_preview}" if body_preview else ""
             )
-            if status < 500:
+            if status == httpx.codes.TOO_MANY_REQUESTS:
+                # An explicit throttle is transient by definition: retry
+                # within the normal budget, honouring a bounded Retry-After.
+                hint = retry_after_hint_s(exc.response)
+                if hint is not None:
+                    backoff_s = min(max(backoff_s, hint), _EVALUATE_POLICY_RETRY_MAX_BACKOFF_S)
+                print(
+                    f"omnigent {hook_label}: Omnigent returned {status}; retrying",
+                    file=sys.stderr,
+                )
+            elif status < 500:
                 print(
                     f"omnigent {hook_label}: Omnigent returned {status}"
                     + (f": {body_preview}" if body_preview else ""),
                     file=sys.stderr,
                 )
                 return None, last_error
-            held_poll_severed = (
-                time.monotonic() - attempt_started >= _EVALUATE_POLICY_HELD_POLL_FLOOR_S
-            )
-            print(
-                f"omnigent {hook_label}: Omnigent returned {status}"
-                + (
-                    " after a held poll (gateway sever); re-parking"
-                    if held_poll_severed
-                    else "; retrying"
-                ),
-                file=sys.stderr,
-            )
+            else:
+                held_poll_severed = (
+                    time.monotonic() - attempt_started >= _EVALUATE_POLICY_HELD_POLL_FLOOR_S
+                )
+                print(
+                    f"omnigent {hook_label}: Omnigent returned {status}"
+                    + (
+                        " after a held poll (gateway sever); re-parking"
+                        if held_poll_severed
+                        else "; retrying"
+                    ),
+                    file=sys.stderr,
+                )
         except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
             last_error = f"connection error: {exc}"
             print(
