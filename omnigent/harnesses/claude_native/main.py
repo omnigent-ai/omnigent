@@ -236,6 +236,10 @@ _CLAUDE_CODE_DISABLE_AGENT_VIEW_ENV = "CLAUDE_CODE_DISABLE_AGENT_VIEW"
 # only in the pane, so a web-driven session shows an unanswerable prompt —
 # often with nobody attached to the terminal at all.
 _CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY_ENV = "CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY"
+# Kill-switch for Claude Code's server-side advisor tool. The Databricks AI
+# gateway rejects it ("tool type 'advisor_20260301' is not supported for this
+# model"), failing every turn that attaches it.
+_CLAUDE_CODE_DISABLE_ADVISOR_TOOL_ENV = "CLAUDE_CODE_DISABLE_ADVISOR_TOOL"
 # Claude Code env vars that pin each model-tier alias to a provider-specific
 # model ID.  When set, the /model picker shows these IDs as options rather
 # than normalising to canonical Anthropic names (which the Databricks gateway
@@ -1506,10 +1510,11 @@ def build_native_claude_terminal_env(
 
     Forces MCP Tool Search on so Claude defers MCP tool schemas and
     loads them on demand, disables Claude Code's agent view so the
-    terminal stays pinned to the session the Omnigent UI is showing, and
-    disables the in-TUI feedback surveys, which a web-driven session
-    cannot see or answer (see
-    :data:`_CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY_ENV`).
+    terminal stays pinned to the session the Omnigent UI is showing,
+    disables the in-TUI feedback surveys (a web-driven session cannot
+    see or answer them), and disables the advisor tool when routing
+    through a non-Anthropic gateway (which rejects
+    ``advisor_20260301``).
 
     :param claude_config: Optional provider/ucode launch config, e.g.
         one carrying ``{"ANTHROPIC_BASE_URL": "https://example.com"}``.
@@ -1527,6 +1532,13 @@ def build_native_claude_terminal_env(
         terminal_env[_CLAUDE_CODE_ENABLE_TOOL_SEARCH_ENV] = "true"
         terminal_env[_CLAUDE_CODE_DISABLE_AGENT_VIEW_ENV] = "1"
         terminal_env[_CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY_ENV] = "1"
+    # A non-Anthropic endpoint may not implement the advisor tool (the Databricks
+    # AI gateway fails the turn on it). An explicit user value always wins.
+    is_gateway_routed = (
+        claude_config is not None and not _serves_canonical_anthropic_ids(claude_config)
+    ) or (claude_config is None and _ambient_env_is_non_anthropic_gateway())
+    if is_gateway_routed and _CLAUDE_CODE_DISABLE_ADVISOR_TOOL_ENV not in os.environ:
+        terminal_env[_CLAUDE_CODE_DISABLE_ADVISOR_TOOL_ENV] = "1"
     # On the apiKeyHelper path the credential reaches Claude Code via the
     # helper; a raw ANTHROPIC_API_KEY here re-triggers Claude Code's "Detected a
     # custom API key" menu, which hangs tmux delivery. Fail loud if one leaks.

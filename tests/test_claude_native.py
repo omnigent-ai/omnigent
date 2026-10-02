@@ -97,6 +97,9 @@ def test_claude_terminal_request_pins_launch_cwd(tmp_path, monkeypatch) -> None:
     Channels flag is not snuck in.
     """
     monkeypatch.chdir(tmp_path)
+    # Isolate from ambient ANTHROPIC_BASE_URL so the no-config path is
+    # treated as Anthropic-direct regardless of the host environment.
+    monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
     bridge_dir = _test_bridge_dir(tmp_path, monkeypatch)
     body = claude_native._claude_terminal_request(
         ("--resume", "claude-session", "-p", "hi"),
@@ -215,6 +218,9 @@ def test_claude_terminal_request_injects_claude_config(tmp_path, monkeypatch) ->
     Databricks gateway values to the terminal resource would leave
     Claude Code on its default provider path.
     """
+    # Let the advisor kill-switch be set by the gateway detection, not by
+    # an ambient user override that would suppress it.
+    monkeypatch.delenv("CLAUDE_CODE_DISABLE_ADVISOR_TOOL", raising=False)
     config = claude_native.ClaudeNativeUcodeConfig(
         env={
             "ANTHROPIC_BASE_URL": "https://example.databricks.com/ai-gateway/anthropic",
@@ -241,6 +247,8 @@ def test_claude_terminal_request_injects_claude_config(tmp_path, monkeypatch) ->
         "ENABLE_TOOL_SEARCH": "true",
         "CLAUDE_CODE_DISABLE_AGENT_VIEW": "1",
         "CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY": "1",
+        # Gateway rejects advisor_20260301; disable it for non-Anthropic endpoints.
+        "CLAUDE_CODE_DISABLE_ADVISOR_TOOL": "1",
     }
     args = spec["args"]
     assert args[:9] == [
