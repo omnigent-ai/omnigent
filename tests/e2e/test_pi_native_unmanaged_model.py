@@ -79,6 +79,13 @@ _WORKTREE = Path(__file__).resolve().parents[2]
 _PI_MODEL_ID = "claude-sonnet-4-5"
 _PINNED_SPEC_MODEL = f"anthropic/{_PI_MODEL_ID}"
 
+# A custom provider declared in Pi's own models.json. It carries its own
+# apiKey, so it never appears in auth.json or models-store.json, yet Pi lists
+# and drives it; the picker must offer it next to the logged-in catalog.
+_CUSTOM_PROVIDER_ID = "ollama"
+_CUSTOM_MODEL_ID = "llama3.1:8b"
+_CUSTOM_PICKER_MODEL = f"{_CUSTOM_PROVIDER_ID}/{_CUSTOM_MODEL_ID}"
+
 # Test-owned argv observer: a seeded Pi user extension records the real
 # process identity (pid, argv, cwd -- never environment) when the launched
 # CLI loads it. Mechanism details: the module docstring.
@@ -275,10 +282,11 @@ class _UnmanagedPiHost:
 def _seed_unmanaged_pi_home(home: Path) -> str:
     """Seed *home* with a logged-in-but-unmanaged Pi and a host config.
 
-    Writes ``.pi/agent/auth.json`` (an api-key login) and
-    ``.pi/agent/models-store.json`` (one usable model) so Pi itself has
-    models, while ``.omnigent/config.yaml`` carries only a host block and
-    NO provider setup -- exactly the state where
+    Writes ``.pi/agent/auth.json`` (an api-key login),
+    ``.pi/agent/models-store.json`` (one usable model) and
+    ``.pi/agent/models.json`` (one custom provider with its own key) so Pi
+    itself has models, while ``.omnigent/config.yaml`` carries only a host
+    block and NO provider setup -- exactly the state where
     ``resolve_pi_native_provider()`` returns ``None``. Also seeds
     ``.pi/agent/extensions/`` with the test-owned argv observer (see the
     module constants), which every real Pi launch under this HOME
@@ -321,6 +329,20 @@ def _seed_unmanaged_pi_home(home: Path) -> str:
                         }
                     ],
                     "checkedAt": 1750000000,
+                }
+            }
+        )
+    )
+    (pi_agent / "models.json").write_text(
+        json.dumps(
+            {
+                "providers": {
+                    _CUSTOM_PROVIDER_ID: {
+                        "baseUrl": "http://127.0.0.1:11434/v1",
+                        "api": "openai-completions",
+                        "apiKey": "ollama",
+                        "models": [{"id": _CUSTOM_MODEL_ID}],
+                    }
                 }
             }
         )
@@ -423,10 +445,11 @@ def test_facet1_prelaunch_model_options_offer_the_hosts_pi_models(
 ) -> None:
     """Facet 1: the pre-launch picker must list the host's usable Pi models.
 
-    A host with a logged-in Pi (one model in ``models-store.json``) but no
-    omnigent-managed provider must still surface that model to the
-    pre-launch picker. The buggy build returns ``{"models": []}`` (only
-    "Default" in the UI); the fix enumerates Pi's own models.
+    A host with a logged-in Pi (one model in ``models-store.json``, one
+    custom provider in ``models.json``) but no omnigent-managed provider
+    must still surface both models to the pre-launch picker. The buggy
+    build returns ``{"models": []}`` (only "Default" in the UI); the fix
+    enumerates every model Pi's own configuration can drive.
 
     :param unmanaged_pi_host: The spawned unmanaged-Pi host.
     :param http_client: HTTP client pointed at the server.
@@ -442,6 +465,11 @@ def test_facet1_prelaunch_model_options_offer_the_hosts_pi_models(
         f"host's Pi is logged in with {_PI_MODEL_ID!r} -- the Configure-Pi picker "
         "shows only 'Default'. pi_native_model_options() early-returns [] when "
         f"resolve_pi_native_provider() is None. Got: {resp.text}"
+    )
+    offered = {model.get("id") for model in models}
+    assert {_PINNED_SPEC_MODEL, _CUSTOM_PICKER_MODEL} <= offered, (
+        "pi-native pre-launch model-options must offer the logged-in catalog AND the "
+        f"custom provider declared in Pi's models.json; got {sorted(offered)}"
     )
 
 

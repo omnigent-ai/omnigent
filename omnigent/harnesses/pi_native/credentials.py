@@ -450,7 +450,10 @@ def pi_own_login_model_options(agent_dir: Path | None = None) -> list[dict[str, 
     When no omnigent-managed provider is configured, the launched Pi runs on
     its own credentials, so the pre-launch picker must offer the models that
     login can actually drive: Pi's ``models-store.json`` catalog filtered to
-    providers with an ``auth.json`` entry.
+    providers with an ``auth.json`` entry, plus the models declared in Pi's
+    ``models.json`` for the providers Pi activates there — logged-in ones and
+    custom endpoints carrying their own ``apiKey``, which never appear in
+    ``auth.json`` or ``models-store.json``.
 
     :param agent_dir: Pi agent dir override (tests); defaults to the host's
         own Pi agent dir.
@@ -460,11 +463,19 @@ def pi_own_login_model_options(agent_dir: Path | None = None) -> list[dict[str, 
     """
     root = agent_dir if agent_dir is not None else _global_pi_agent_dir()
     logged_in = set(_read_json_object(root / "auth.json"))
-    if not logged_in:
-        return []
+    catalogs: list[tuple[str, object]] = [
+        (provider_id, payload)
+        for provider_id, payload in _read_json_object(root / "models-store.json").items()
+        if provider_id in logged_in
+    ]
+    declared = _read_json_object(root / "models.json").get("providers")
+    for provider_id, payload in declared.items() if _is_str_object_dict(declared) else ():
+        api_key = payload.get("apiKey") if _is_str_object_dict(payload) else None
+        if provider_id in logged_in or (isinstance(api_key, str) and api_key):
+            catalogs.append((provider_id, payload))
     options: dict[str, dict[str, object]] = {}
-    for provider_id, payload in _read_json_object(root / "models-store.json").items():
-        if provider_id not in logged_in or not _is_str_object_dict(payload):
+    for provider_id, payload in catalogs:
+        if not _is_str_object_dict(payload):
             continue
         models = payload.get("models")
         for model in models if isinstance(models, list) else []:

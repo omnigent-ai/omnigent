@@ -3351,8 +3351,33 @@ def test_cli_config_pi_provider_discovery_failure_falls_back_to_catalog_default(
     )
 
 
+# Custom providers carry their own key in models.json, so they never appear in
+# auth.json or models-store.json even though Pi lists and drives them.
+_CUSTOM_PI_PROVIDERS = {
+    "providers": {
+        "ollama": {
+            "baseUrl": "http://localhost:11434/v1",
+            "api": "openai-completions",
+            "apiKey": "ollama",
+            "models": [
+                {"id": "llama3.1:8b"},
+                {"id": "qwen2.5-coder:7b", "name": "Qwen2.5 Coder 7B"},
+            ],
+        }
+    }
+}
+_CUSTOM_PI_OPTIONS = [
+    {"id": "ollama/llama3.1:8b", "model": "ollama/llama3.1:8b", "displayName": "llama3.1:8b"},
+    {
+        "id": "ollama/qwen2.5-coder:7b",
+        "model": "ollama/qwen2.5-coder:7b",
+        "displayName": "Qwen2.5 Coder 7B",
+    },
+]
+
+
 def _seed_pi_own_login(agent_dir: Path) -> None:
-    """Seed a Pi agent dir logged into anthropic, with an extra stale catalog."""
+    """Seed a Pi agent dir logged into anthropic, with a stale catalog and custom providers."""
     agent_dir.mkdir(parents=True, exist_ok=True)
     (agent_dir / "auth.json").write_text(
         json.dumps({"anthropic": {"type": "api_key", "key": "sk-own"}})
@@ -3373,16 +3398,18 @@ def _seed_pi_own_login(agent_dir: Path) -> None:
             }
         )
     )
+    (agent_dir / "models.json").write_text(json.dumps(_CUSTOM_PI_PROVIDERS))
 
 
 def test_model_options_fall_back_to_pi_own_login(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """With no managed provider, the picker offers Pi's own logged-in models.
+    """With no managed provider, the picker offers every model Pi's own login drives.
 
     The launched Pi runs on its own login in that state, so the pre-launch
-    catalog is Pi's ``models-store.json`` filtered to logged-in providers,
-    qualified ``provider/model`` (the form Pi's ``--model`` resolves).
+    catalog is Pi's ``models-store.json`` filtered to logged-in providers plus
+    the custom providers declared in ``models.json``, qualified
+    ``provider/model`` (the form Pi's ``--model`` resolves).
     """
     monkeypatch.setattr(creds, "resolve_pi_native_provider", lambda: None)
     monkeypatch.setenv(creds.PI_CODING_AGENT_DIR_ENV_VAR, str(tmp_path))
@@ -3399,11 +3426,68 @@ def test_model_options_fall_back_to_pi_own_login(
             "model": "anthropic/claude-sonnet-4-5",
             "displayName": "Claude Sonnet 4.5",
         },
+        *_CUSTOM_PI_OPTIONS,
+    ]
+
+
+def test_pi_own_login_options_list_custom_providers_without_login(tmp_path: Path) -> None:
+    """A host with only models.json providers has no auth.json yet still gets a catalog."""
+    (tmp_path / "models.json").write_text(json.dumps(_CUSTOM_PI_PROVIDERS))
+    assert creds.pi_own_login_model_options(agent_dir=tmp_path) == _CUSTOM_PI_OPTIONS
+
+
+def test_pi_own_login_options_skip_custom_providers_without_a_credential(
+    tmp_path: Path,
+) -> None:
+    """A models.json provider with neither a stored login nor its own apiKey is left out."""
+    (tmp_path / "models.json").write_text(
+        json.dumps(
+            {
+                "providers": {
+                    **_CUSTOM_PI_PROVIDERS["providers"],
+                    "keyless": {
+                        "baseUrl": "http://localhost:8080/v1",
+                        "api": "openai-completions",
+                        "models": [{"id": "local-model"}],
+                    },
+                }
+            }
+        )
+    )
+    assert creds.pi_own_login_model_options(agent_dir=tmp_path) == _CUSTOM_PI_OPTIONS
+
+
+def test_pi_own_login_options_merge_declared_models_of_a_logged_in_provider(
+    tmp_path: Path,
+) -> None:
+    """A logged-in provider's models.json entries extend its cached catalog; declared names win."""
+    (tmp_path / "auth.json").write_text(json.dumps({"openai": {"type": "api_key", "key": "sk"}}))
+    (tmp_path / "models-store.json").write_text(
+        json.dumps({"openai": {"models": [{"id": "gpt-5.2", "name": "GPT 5.2"}]}})
+    )
+    (tmp_path / "models.json").write_text(
+        json.dumps(
+            {
+                "providers": {
+                    "openai": {
+                        "baseUrl": "https://proxy.example.com/v1",
+                        "models": [
+                            {"id": "gpt-5.2", "name": "GPT 5.2 (proxy)"},
+                            {"id": "ft:gpt-5.2"},
+                        ],
+                    }
+                }
+            }
+        )
+    )
+    assert creds.pi_own_login_model_options(agent_dir=tmp_path) == [
+        {"id": "openai/ft:gpt-5.2", "model": "openai/ft:gpt-5.2", "displayName": "ft:gpt-5.2"},
+        {"id": "openai/gpt-5.2", "model": "openai/gpt-5.2", "displayName": "GPT 5.2 (proxy)"},
     ]
 
 
 def test_pi_own_login_options_empty_without_login(tmp_path: Path) -> None:
-    """No (or an empty) ``auth.json`` means nothing Pi can drive: empty catalog."""
+    """Without a login or declared custom providers nothing is drivable: empty catalog."""
     assert creds.pi_own_login_model_options(agent_dir=tmp_path) == []
     (tmp_path / "auth.json").write_text("{}")
     (tmp_path / "models-store.json").write_text(
@@ -3413,9 +3497,10 @@ def test_pi_own_login_options_empty_without_login(tmp_path: Path) -> None:
 
 
 def test_pi_own_login_options_tolerate_malformed_files(tmp_path: Path) -> None:
-    """Malformed auth/models-store files degrade to an empty catalog, never raise."""
+    """Malformed auth/models-store/models files degrade to an empty catalog, never raise."""
     (tmp_path / "auth.json").write_text("{not json")
     (tmp_path / "models-store.json").write_text("[]")
+    (tmp_path / "models.json").write_text(json.dumps({"providers": ["ollama"]}))
     assert creds.pi_own_login_model_options(agent_dir=tmp_path) == []
 
 
