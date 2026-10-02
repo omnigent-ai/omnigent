@@ -6512,7 +6512,7 @@ async def _list_all_conversation_items(
             continue
         except Exception:  # noqa: BLE001 — overlay builder: any other per-page error falls back to whatever was already fetched; partial sidebar beats no sidebar
             break
-        page: list[dict[str, object]] = list(raw_page) if raw_page else []
+        page: list[dict[str, object]] = raw_page.data
         if not page:
             break
         all_items.extend(page)
