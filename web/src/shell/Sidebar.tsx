@@ -13,6 +13,7 @@ import {
   type ReactNode,
   type RefObject,
   createContext,
+  Fragment,
   memo,
   useCallback,
   useContext,
@@ -263,6 +264,7 @@ import { SidebarServerPicker } from "./SidebarServerPicker";
 import { ComposerAgentIcon } from "@/components/ComposerAgentIcon";
 import { nativeCodingAgentForWrapper, WRAPPER_LABEL_KEY } from "@/lib/nativeCodingAgents";
 import { type PullRequest, usePullRequestInfo } from "@/hooks/usePullRequests";
+import { deriveRepoName, SANDBOX_REPO_LABEL_KEY } from "./NewChatDialog";
 import { ForkSessionDialog } from "./ForkSessionDialog";
 import { SessionActionMenuItem } from "@/components/SessionActionMenuItem";
 import { useSessionActionRestrictions } from "@/hooks/useSessionActionRestrictions";
@@ -3112,6 +3114,7 @@ const ORDERING_LABELS: Record<SidebarOrdering, string> = { updated: "Updated", s
 const SHOW_LABELS: Record<SidebarShowField, string> = {
   updated: "Updated",
   environment: "Environment",
+  repo: "Repo",
   branch: "Branch",
 };
 
@@ -4030,6 +4033,14 @@ function sessionLocationLabel(
     : (host?.name ?? conversation.host_id);
 }
 
+/** A managed-sandbox session's repo name from its first `omnigent.sandbox.repo` label; null otherwise. */
+function sessionRepoName(conversation: Conversation): string | null {
+  const labels = conversation.labels ?? {};
+  const workspace = labels[`${SANDBOX_REPO_LABEL_KEY}.0`] ?? labels[SANDBOX_REPO_LABEL_KEY];
+  // Label value is `<url>[#<branch>]`; the name is derived from the url part.
+  return workspace ? deriveRepoName(workspace.split("#")[0]!) : null;
+}
+
 // Its own component so only rows showing the timestamp subscribe to the shared clock.
 function SessionUpdatedLabel({ updatedAt }: { updatedAt: number }) {
   const now = useNow();
@@ -4039,30 +4050,33 @@ function SessionUpdatedLabel({ updatedAt }: { updatedAt: number }) {
 // A row's second line: the "Show" environment and branch, each omitted when empty.
 function SessionMetaLine({
   environment,
+  repo,
   branch,
 }: {
   environment: string | null;
+  repo: string | null;
   branch: string | null;
 }) {
-  if (environment === null && branch === null) return null;
+  const parts: { icon: LucideIcon; value: string }[] = [
+    environment !== null && { icon: LaptopIcon, value: environment },
+    repo !== null && { icon: FolderGit2Icon, value: repo },
+    branch !== null && { icon: GitBranchIcon, value: branch },
+  ].filter((p): p is { icon: LucideIcon; value: string } => p !== false);
+  if (parts.length === 0) return null;
   return (
     <span
       data-testid="session-row-meta"
       className="flex w-full min-w-0 items-center gap-1.5 text-sm text-muted-foreground"
     >
-      {environment !== null && (
-        <span className="flex min-w-0 items-center gap-1">
-          <LaptopIcon aria-hidden className="size-3.5 shrink-0" />
-          <span className="truncate">{environment}</span>
-        </span>
-      )}
-      {environment !== null && branch !== null && <span aria-hidden>·</span>}
-      {branch !== null && (
-        <span className="flex min-w-0 items-center gap-1">
-          <GitBranchIcon aria-hidden className="size-3.5 shrink-0" />
-          <span className="truncate">{branch}</span>
-        </span>
-      )}
+      {parts.map(({ icon: Icon, value }, i) => (
+        <Fragment key={value}>
+          {i > 0 && <span aria-hidden>·</span>}
+          <span className="flex min-w-0 items-center gap-1">
+            <Icon aria-hidden className="size-3.5 shrink-0" />
+            <span className="truncate">{value}</span>
+          </span>
+        </Fragment>
+      ))}
     </span>
   );
 }
@@ -4423,11 +4437,14 @@ function ConversationRowImpl({
   const metaEnvironment = show.includes("environment")
     ? sessionLocationLabel(conversation, hostsById)
     : null;
+  const metaRepo = show.includes("repo") ? sessionRepoName(conversation) : null;
   const metaBranch = show.includes("branch") ? gitBranch : null;
   // Overlays (checkbox, badges, controls; each also `-translate-y-1/2`) center on
   // the row, or on the title line — padding + half its 20px box — above a meta line.
   const overlayTop =
-    metaEnvironment !== null || metaBranch !== null ? "top-4 md:top-3.5" : "top-1/2";
+    metaEnvironment !== null || metaRepo !== null || metaBranch !== null
+      ? "top-4 md:top-3.5"
+      : "top-1/2";
 
   // Drag-and-drop: a row is grabbable when the viewer owns it (re-filing is
   // owner-only, like the Move-to-project kebab item), outside selection /
@@ -4711,7 +4728,7 @@ function ConversationRowImpl({
         </span>
       </div>
       {/* Row 2: the "Show" metadata, each part omitted when it has no value. */}
-      <SessionMetaLine environment={metaEnvironment} branch={metaBranch} />
+      <SessionMetaLine environment={metaEnvironment} repo={metaRepo} branch={metaBranch} />
     </Link>
   );
 
