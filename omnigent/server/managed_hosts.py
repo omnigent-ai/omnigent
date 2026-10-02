@@ -33,8 +33,8 @@ stores into ``create_app``):
    ``<data_dir>/config.yaml``)::
 
        sandbox:
-         # lakebox|modal|daytona|blaxel|boxlite|cwsandbox|islo|e2b|openshell|
-         # kubernetes|microsandbox|gensee
+         # lakebox|databricks|modal|daytona|blaxel|boxlite|cwsandbox|islo|
+         # e2b|openshell|kubernetes|microsandbox|gensee
          provider: modal
          server_url: https://omnigent.example.com
          # For SEVERAL providers, replace `provider:` with a `providers:`
@@ -142,7 +142,12 @@ stores into ``create_app``):
    or ``sandbox.openshell.cluster``), so the server process needs
    OpenShell gateway access. The microsandbox launcher needs no
    credentials at all: VMs run embedded on the server host itself
-   (Apple Silicon macOS / KVM Linux). Every provider except
+   (Apple Silicon macOS / KVM Linux). The ``databricks`` launcher uses
+   the workspace REST API through ``databricks-sdk`` credential resolution
+   (``sandbox.databricks.profile``, or ``DATABRICKS_*`` env such as a
+   Databricks App's service principal); behind the Databricks Apps OAuth
+   proxy set ``sandbox.databricks.proxy_bearer: true`` (see
+   :mod:`omnigent.util.proxy_bearer`). Every provider except
    ``lakebox`` has managed-launch support; ``lakebox`` parses but
    rejects at launch.
 

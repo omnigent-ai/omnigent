@@ -3,17 +3,21 @@ Databricks Sandbox launcher over the REST command-execution API.
 
 Implements :class:`~omnigent.onboarding.sandboxes.base.SandboxLauncher` for
 `Databricks Sandbox <https://docs.databricks.com/aws/en/compute/serverless/sandbox>`_
-using only the workspace REST API through ``databricks-sdk``
-(``w.sandbox.*``): ``create_sandbox`` / ``get_sandbox`` / ``start_sandbox`` /
-``delete_sandbox`` for lifecycle and ``execute_command_sync``
+using only the workspace REST API: ``/api/2.0/sandboxes`` (create / get /
+start / delete) for lifecycle and synchronous command execution
 (``POST /api/2.0/sandbox-exec/sandboxes/<id>/exec-sync``) for every remote
-command. There is no SSH, no CLI subprocess, and no gateway port to reach, so
-the server works anywhere that can call the workspace API over HTTPS
+command. Calls go through ``databricks-sdk``'s generic ``ApiClient.do`` rather
+than the generated ``w.sandbox`` service, so the provider works with any SDK
+the ``databricks`` extra already allows (the Sandbox service class only exists
+in much newer SDKs) while keeping the SDK's credential resolution.
+
+There is no SSH, no CLI subprocess, and no gateway port to reach, so the
+server works anywhere that can call the workspace API over HTTPS
 (including Databricks Apps compute, whose DNS stubs the SSH gateway).
 
 Platform behavior this launcher is built on (measured live, 2026-10-01):
 
-- ``create_sandbox`` returns ``PENDING`` and the box is ``RUNNING`` within a
+- Create returns ``PENDING`` and the box is ``RUNNING`` within a
   few seconds; the image already ships ``omnigent``, ``git``, ``tmux``,
   ``uv``, ``node``, and the ``databricks`` CLI, with a Databricks token for the
   creating identity pre-provisioned (``DATABRICKS_CONFIG_FILE``).
@@ -27,7 +31,7 @@ Platform behavior this launcher is built on (measured live, 2026-10-01):
   :meth:`~omnigent.onboarding.sandboxes.base.SandboxExecTransport.run_background`
   already emits.
 - ``execution_timeout`` is honored (``TIMED_OUT`` status, no exit code).
-- Stopping kills every process; ``start_sandbox`` does **not** restart the
+- Stopping kills every process; starting does **not** restart the
   host. The managed wake path (:func:`omnigent.server.managed_hosts.
   resume_managed_host`) calls :meth:`resume` and then re-runs
   :meth:`start_host`, which is exactly the re-bootstrap this provider needs.
@@ -92,13 +96,11 @@ _HOME_PRELUDE: str = (
 )
 
 
-def _state_of(sandbox: Any) -> str:
-    """Return the ``SANDBOX_STATE_*`` string of an SDK ``Sandbox``, or ``""``."""
-    status = getattr(sandbox, "status", None)
-    state = getattr(status, "state", None)
-    if state is None:
-        return ""
-    return str(getattr(state, "value", state))
+def _state_of(sandbox: dict[str, Any]) -> str:
+    """Return the ``SANDBOX_STATE_*`` string of a Sandbox resource, or ``""``."""
+    status = sandbox.get("status")
+    state = status.get("state") if isinstance(status, dict) else None
+    return state if isinstance(state, str) else ""
 
 
 def _is_not_found(exc: Exception) -> bool:
@@ -170,36 +172,45 @@ class DatabricksSandboxLauncher(SandboxLauncher):
 
     # ── SDK plumbing ────────────────────────────────────
 
-    def _api(self) -> Any:
-        """Return the SDK ``SandboxAPI`` (built lazily, cached)."""
+    def _workspace_client(self) -> Any:
+        """Return the SDK ``WorkspaceClient`` (built lazily, cached)."""
         if self._client is None:
             try:
                 from databricks.sdk import WorkspaceClient
                 from databricks.sdk.config import Config
             except ImportError as exc:  # pragma: no cover - extra not installed
                 raise click.ClickException(
-                    "the 'databricks' sandbox provider needs databricks-sdk>=0.143 "
+                    "the 'databricks' sandbox provider needs databricks-sdk "
                     "(pip install 'omnigent[databricks]')"
                 ) from exc
             kwargs: dict[str, Any] = {"http_timeout_seconds": _EXEC_HTTP_TIMEOUT_S}
             if self._profile:
                 kwargs["profile"] = self._profile
-            client = WorkspaceClient(config=Config(**kwargs))
-            if not hasattr(client, "sandbox"):
-                raise click.ClickException(
-                    "the installed databricks-sdk has no Sandbox API; upgrade to "
-                    "databricks-sdk>=0.143"
-                )
-            self._client = client
-        return self._client.sandbox
+            self._client = WorkspaceClient(config=Config(**kwargs))
+        return self._client
+
+    def _call(
+        self,
+        method: str,
+        path: str,
+        *,
+        body: dict[str, Any] | None = None,
+        query: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """One Sandbox REST call; returns the decoded JSON object (``{}`` if empty)."""
+        headers = {"Accept": "application/json", "Content-Type": "application/json"}
+        result = self._workspace_client().api_client.do(
+            method, path, query=query, body=body, headers=headers
+        )
+        return result if isinstance(result, dict) else {}
 
     @staticmethod
     def _resource(sandbox_id: str) -> str:
-        return f"sandboxes/{sandbox_id}"
+        return f"/api/2.0/sandboxes/{sandbox_id}"
 
-    def _get(self, sandbox_id: str) -> Any:
+    def _get(self, sandbox_id: str) -> dict[str, Any]:
         try:
-            return self._api().get_sandbox(self._resource(sandbox_id))
+            return self._call("GET", self._resource(sandbox_id))
         except Exception as exc:
             if _is_not_found(exc):
                 raise SandboxGoneError(
@@ -228,7 +239,7 @@ class DatabricksSandboxLauncher(SandboxLauncher):
     def prepare(self) -> None:
         """Fail fast when credentials or the SDK's Sandbox API are missing."""
         try:
-            next(iter(self._api().list_sandboxes(page_size=1)), None)
+            self._call("GET", "/api/2.0/sandboxes", query={"page_size": 1})
         except click.ClickException:
             raise
         except Exception as exc:
@@ -239,23 +250,13 @@ class DatabricksSandboxLauncher(SandboxLauncher):
 
     def provision(self, name: str) -> str:
         """Create a sandbox labelled *name* and wait for it to run."""
-        from databricks.sdk.service.sandbox import ComputeSpec, Sandbox, SandboxSpec
-
         sandbox_id = f"{self._prefix}-{secrets.token_hex(5)}"
-        spec = None
+        body: dict[str, Any] = {"display_name": name}
         if self._inactivity_timeout_s is not None:
-            from google.protobuf.duration_pb2 import Duration
-
-            spec = SandboxSpec(
-                compute=ComputeSpec(
-                    inactivity_timeout=Duration(seconds=self._inactivity_timeout_s)
-                )
-            )
+            body["spec"] = {"compute": {"inactivity_timeout": f"{self._inactivity_timeout_s}s"}}
         click.echo(f"▸ Creating Databricks Sandbox '{sandbox_id}' ({name})")
         try:
-            self._api().create_sandbox(
-                Sandbox(display_name=name, spec=spec), sandbox_id=sandbox_id
-            )
+            self._call("POST", "/api/2.0/sandboxes", query={"sandbox_id": sandbox_id}, body=body)
         except Exception as exc:
             raise click.ClickException(f"could not create a Databricks Sandbox: {exc}") from exc
         try:
@@ -277,7 +278,7 @@ class DatabricksSandboxLauncher(SandboxLauncher):
         if state == _STOPPED:
             click.echo(f"▸ Starting Databricks Sandbox '{sandbox_id}'")
             try:
-                self._api().start_sandbox(self._resource(sandbox_id))
+                self._call("POST", f"{self._resource(sandbox_id)}/start", body={})
             except Exception as exc:
                 if _is_not_found(exc):
                     raise SandboxGoneError(
@@ -307,7 +308,7 @@ class DatabricksSandboxLauncher(SandboxLauncher):
     def terminate(self, sandbox_id: str) -> None:
         """Delete the sandbox; an already-absent sandbox counts as success."""
         try:
-            self._api().delete_sandbox(self._resource(sandbox_id))
+            self._call("DELETE", self._resource(sandbox_id))
         except Exception as exc:
             if _is_not_found(exc):
                 return
@@ -332,15 +333,16 @@ class DatabricksSandboxLauncher(SandboxLauncher):
             API request body, so secrets passed here never appear in the
             sandbox's process argv (unlike an ``ENV=value cmd`` prefix).
         """
-        from google.protobuf.duration_pb2 import Duration
-
+        body: dict[str, Any] = {
+            "cmd": "/bin/bash",
+            "args": ["-c", _HOME_PRELUDE + command],
+            "execution_timeout": f"{_EXEC_TIMEOUT_S}s",
+        }
+        if envs:
+            body["envs"] = envs
         try:
-            response = self._api().execute_command_sync(
-                self._resource(sandbox_id),
-                "/bin/bash",
-                args=["-c", _HOME_PRELUDE + command],
-                envs=envs,
-                execution_timeout=Duration(seconds=_EXEC_TIMEOUT_S),
+            response = self._call(
+                "POST", f"/api/2.0/sandbox-exec/sandboxes/{sandbox_id}/exec-sync", body=body
             )
         except Exception as exc:
             if _is_not_found(exc):
@@ -350,18 +352,19 @@ class DatabricksSandboxLauncher(SandboxLauncher):
             raise click.ClickException(
                 f"command execution failed on Databricks Sandbox '{sandbox_id}': {exc}"
             ) from exc
-        status = str(getattr(response.status, "value", response.status) or "")
-        stdout = response.stdout or ""
-        stderr = response.stderr or ""
-        if response.truncated:
+        status = str(response.get("status") or "")
+        stdout = str(response.get("stdout") or "")
+        stderr = str(response.get("stderr") or "")
+        exit_code = response.get("exit_code")
+        if response.get("truncated"):
             stderr += "\n[omnigent: output truncated by the sandbox exec API]\n"
         if status.endswith("TIMED_OUT"):
             returncode = 124
             stderr += f"\n[omnigent: command timed out after {_EXEC_TIMEOUT_S}s]\n"
-        elif response.exit_code is None:
+        elif exit_code is None:
             returncode = 1 if status.endswith("FAILED") else 0
         else:
-            returncode = int(response.exit_code)
+            returncode = int(exit_code)
         if check and returncode != 0:
             detail = (stderr.strip() or stdout.strip())[-2000:]
             raise click.ClickException(
@@ -373,9 +376,8 @@ class DatabricksSandboxLauncher(SandboxLauncher):
     # ── Front-door bearer (Databricks Apps OAuth proxy) ──
 
     def _current_bearer(self) -> str:
-        """Return the launcher identity's current OAuth access token."""
-        self._api()
-        header = self._client.config.authenticate().get("Authorization", "")
+        """Return the launcher identity's current access token (from its SDK auth)."""
+        header = self._workspace_client().config.authenticate().get("Authorization", "")
         token = header.removeprefix("Bearer ").strip()
         if not token:
             raise click.ClickException("could not mint a bearer for the sandbox host")
@@ -386,10 +388,10 @@ class DatabricksSandboxLauncher(SandboxLauncher):
         result = self.run(
             sandbox_id,
             'umask 077; mkdir -p "$HOME/.omnigent" && '
-            'printf %s "$OG_PROXY_BEARER" > "$HOME/.omnigent/proxy-bearer.tmp" && '
+            'printf %s "$OMNIGENT_PROXY_BEARER_VALUE" > "$HOME/.omnigent/proxy-bearer.tmp" && '
             'mv -f "$HOME/.omnigent/proxy-bearer.tmp" "$HOME/.omnigent/proxy-bearer" && '
             'printf %s "$HOME/.omnigent/proxy-bearer"',
-            envs={"OG_PROXY_BEARER": self._current_bearer()},
+            envs={"OMNIGENT_PROXY_BEARER_VALUE": self._current_bearer()},
         )
         return result.stdout.strip()
 
