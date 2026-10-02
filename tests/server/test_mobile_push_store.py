@@ -239,7 +239,6 @@ def test_discovery_vm_work_is_independent_of_pending_backlog(push_store, session
             event.remove(store._engine, "checkin", checkin)
             event.remove(store._engine, "before_cursor_execute", observe)
         measurements.append((size * 3, steps[0], len(statements)))
-    print(f"DISCOVERY_VM due={due} rows_steps_statements={measurements}")
     assert measurements[1][1] <= measurements[0][1] + 100
     assert measurements[0][2] == measurements[1][2]
     assert measurements[1][2] <= 2 * 3 + 2
@@ -302,7 +301,6 @@ def test_every_retained_push_index_backs_an_executed_query(push_store, session_i
     used = {
         name for name in expected for statement, plan in plans if name in plan and "SEARCH" in plan
     }
-    print(f"INDEX_AUDIT retained={sorted(expected)} used={sorted(used)}")
     assert used == expected
 
 
