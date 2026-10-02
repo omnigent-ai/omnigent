@@ -12,7 +12,7 @@ from omnigent.server.routes._sessions.orchestration import (
     _persist_external_conversation_items,
 )
 from omnigent.server.schemas import SessionEventInput
-from omnigent.server.subagent_activity import record_subagent_activity
+from omnigent.server.subagent_activity import _title, record_subagent_activity
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 
 
@@ -201,3 +201,21 @@ async def test_claude_completion_survives_retries_and_late_child_discovery(
         "title": "Inspect authentication",
         **({"status": expected} if expected else {}),
     }
+
+
+def test_claude_child_title_prefers_the_agent_name(db_uri: str) -> None:
+    """A named teammate is announced by the name the user addresses it with."""
+    store = SqlAlchemyConversationStore(db_uri)
+    parent = store.create_conversation()
+    child = store.create_conversation(parent_conversation_id=parent.id, title="buddy:abuddy-1")
+    store.set_labels(
+        child.id,
+        {
+            "omnigent.wrapper": "claude-code-native-ui-subagent",
+            "omnigent.claude_native.subagent_name": "buddy",
+            "omnigent.claude_native.description": "Probe teammate",
+        },
+    )
+    named = store.get_conversation(child.id)
+    assert named is not None
+    assert _title(named) == "buddy"

@@ -152,7 +152,10 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _CLAUDE_NATIVE_READABLE_PERMISSION_MODES,
     _CLAUDE_NATIVE_REMEMBER_INELIGIBLE_TOOLS,
     _CLAUDE_NATIVE_SUBAGENT_ID_LABEL_KEY,
+    _CLAUDE_NATIVE_SUBAGENT_NAME_LABEL_KEY,
     _CLAUDE_NATIVE_SUBAGENT_WRAPPER_LABEL_VALUE,
+    _CLAUDE_NATIVE_TASK_KIND_LABEL_KEY,
+    _CLAUDE_NATIVE_TEAMMATE_TASK_KIND,
     _CLAUDE_NATIVE_TOOL_USE_ID_LABEL_KEY,
     _CLAUDE_NATIVE_UI_LABEL_KEY,
     _CLAUDE_NATIVE_UI_LABEL_VALUE,
@@ -3649,7 +3652,11 @@ async def _persist_external_subagent_start(
         ``subagent_id`` (Claude-side id, e.g. ``"a5c7eff..."``),
         ``agent_type`` (e.g. ``"Explore"``), ``description``
         (free-form, used in the title), ``tool_use_id``
-        (e.g. ``"toolu_..."``).
+        (e.g. ``"toolu_..."``; ignored for an in-process teammate, whose
+        spawn has no tool result — the forwarder sends a placeholder only
+        so older servers accept the row). Optional keys: ``name`` (the
+        name the lead gave the agent, e.g. ``"buddy"``) and ``task_kind``
+        (Claude's ``taskKind``, e.g. ``"in_process_teammate"``).
     :param conversation_store: Store used to read existing children
         (for idempotency) and create the new row.
     :returns: The child conversation id, e.g. ``"conv_child456"``.
@@ -3662,6 +3669,15 @@ async def _persist_external_subagent_start(
     agent_type = body.data.get("agent_type")
     description = body.data.get("description")
     tool_use_id = body.data.get("tool_use_id")
+    name = body.data.get("name")
+    task_kind = body.data.get("task_kind")
+    name = name.strip() if isinstance(name, str) else ""
+    task_kind = task_kind.strip() if isinstance(task_kind, str) else ""
+    teammate = task_kind == _CLAUDE_NATIVE_TEAMMATE_TASK_KIND
+    if teammate:
+        # No spawn result exists to correlate; any value sent is a placeholder
+        # for older servers, not a tool-use id worth storing.
+        tool_use_id = ""
     if not isinstance(subagent_id, str) or not subagent_id:
         raise OmnigentError(
             "external_subagent_start requires non-empty data.subagent_id",
@@ -3677,9 +3693,10 @@ async def _persist_external_subagent_start(
             "external_subagent_start requires data.description (string)",
             code=ErrorCode.INVALID_INPUT,
         )
-    if not isinstance(tool_use_id, str) or not tool_use_id:
+    if not isinstance(tool_use_id, str) or (not tool_use_id and not teammate):
         raise OmnigentError(
-            "external_subagent_start requires non-empty data.tool_use_id",
+            "external_subagent_start requires non-empty data.tool_use_id "
+            "unless data.task_kind is an in-process teammate",
             code=ErrorCode.INVALID_INPUT,
         )
     if parent_conv.agent_id is None:
@@ -3731,8 +3748,10 @@ async def _persist_external_subagent_start(
     labels = {
         _CLAUDE_NATIVE_WRAPPER_LABEL_KEY: _CLAUDE_NATIVE_SUBAGENT_WRAPPER_LABEL_VALUE,
         _CLAUDE_NATIVE_SUBAGENT_ID_LABEL_KEY: subagent_id,
-        _CLAUDE_NATIVE_TOOL_USE_ID_LABEL_KEY: tool_use_id,
+        **({_CLAUDE_NATIVE_TOOL_USE_ID_LABEL_KEY: tool_use_id} if tool_use_id else {}),
         _CLAUDE_NATIVE_DESCRIPTION_LABEL_KEY: description,
+        **({_CLAUDE_NATIVE_SUBAGENT_NAME_LABEL_KEY: name} if name else {}),
+        **({_CLAUDE_NATIVE_TASK_KIND_LABEL_KEY: task_kind} if task_kind else {}),
     }
 
     try:
@@ -3940,19 +3959,24 @@ def _claude_subagent_display_tool(conv: Conversation, labels: dict[str, str]) ->
     """
     Return the UI-facing label for a Claude Code sub-agent child.
 
-    The Task tool's free-form ``description`` ("wave-worker-696") is
-    the only part a human recognises, so it wins. Without one, fall
-    back to the agent type's trailing segment: plugin-namespaced types
-    arrive as ``"rpw-published:debug-lead"`` and only the agent name
-    carries meaning. The row's title is a uniqueness key built from the
-    opaque ``subagent_id``, so it is never a display candidate.
+    A named agent (an in-process teammate, or a background agent spawned
+    with ``name``) is addressed by that name, so it wins. Otherwise the
+    Task tool's free-form ``description`` ("wave-worker-696") is the only
+    part a human recognises. Without either, fall back to the agent
+    type's trailing segment: plugin-namespaced types arrive as
+    ``"rpw-published:debug-lead"`` and only the agent name carries
+    meaning. The row's title is a uniqueness key built from the opaque
+    ``subagent_id``, so it is never a display candidate.
 
     :param conv: Claude-native sub-agent child row; its
         ``sub_agent_name`` holds the Claude ``agentType``.
     :param labels: Conversation labels from that row.
-    :returns: Display label, e.g. ``"wave-worker-696"`` or
-        ``"debug-lead"``; ``None`` when the row carries neither.
+    :returns: Display label, e.g. ``"buddy"``, ``"wave-worker-696"`` or
+        ``"debug-lead"``; ``None`` when the row carries none of them.
     """
+    name = (labels.get(_CLAUDE_NATIVE_SUBAGENT_NAME_LABEL_KEY) or "").strip()
+    if name:
+        return name
     description = " ".join((labels.get(_CLAUDE_NATIVE_DESCRIPTION_LABEL_KEY) or "").split())
     if description:
         return description

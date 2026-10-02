@@ -61,6 +61,8 @@ const SubagentsGraphView = lazy(() =>
 );
 import {
   CLAUDE_NATIVE_SUBAGENT_WRAPPER,
+  CLAUDE_TEAMMATE_BADGE_LABEL,
+  isClaudeTeammateChild,
   nativeCodingAgentForWrapper,
   WRAPPER_LABEL_KEY,
 } from "@/lib/nativeCodingAgents";
@@ -652,6 +654,17 @@ function SubagentRow({
             )}
             <Icon className="size-3.5 shrink-0 text-muted-foreground" />
             <span className="shrink-0 truncate text-sm font-medium">{primary}</span>
+            {isClaudeTeammateChild(child.labels) && (
+              // An agent-teams teammate shares the lead's process: no runner,
+              // model row, or cost of its own, unlike a spawned child session.
+              <Badge
+                variant="outline"
+                data-testid="subagent-teammate-badge"
+                className="h-4 shrink-0 px-1 text-[10px] font-normal text-muted-foreground"
+              >
+                {CLAUDE_TEAMMATE_BADGE_LABEL}
+              </Badge>
+            )}
             {child.routed_model ? (
               // Model the intelligent router picked for this sub-agent — the
               // per-subagent half of routing visibility.

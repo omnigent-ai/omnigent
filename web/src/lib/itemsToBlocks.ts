@@ -20,6 +20,7 @@ import {
   type CompactionBlock,
   type ElicitationBlock,
   type ErrorBlock,
+  type MessageContentBlock,
   type NativeToolBlock,
   type ReasoningBlock,
   type RoutingDecisionBlock,
@@ -31,6 +32,7 @@ import {
   type ToolResultBlock,
   type UserMessageBlock,
   answeredElicitationItemId,
+  isTextBlock,
   slashCommandEchoItemId,
   slashCommandEchoText,
   structuredErrorFields,
@@ -61,7 +63,12 @@ import {
 } from "./conversationItems";
 import { nativePolicyNameForAgentName } from "./nativeCodingAgents";
 import { routingExtrasFromWire } from "./routingDecision";
-import { isClaudeAgentMessageContent, taskNotificationMarkerContent } from "./systemMessage";
+import {
+  isClaudeAgentMessageContent,
+  parseSystemMessage,
+  taskNotificationMarkerContent,
+  teammateDeliveryMarker,
+} from "./systemMessage";
 import { readSubagentActivity } from "./subagentActivity";
 
 // Claude built-ins whose call is a question TO the user rather than work
@@ -90,7 +97,7 @@ const ANSWER_SEPARATOR = '"="';
  * server's persistence path always sets one).
  */
 export function itemsToBlocks(items: ConversationItem[]): AnyBlock[] {
-  const blocks: AnyBlock[] = [];
+  let blocks: AnyBlock[] = [];
   const outputs = toolOutputsByCallId(items);
   const agents = agentNamesByResponseId(items);
   for (const item of items) {
@@ -104,9 +111,84 @@ export function itemsToBlocks(items: ConversationItem[]): AnyBlock[] {
       if (card !== null) blocks.push(card);
     }
     const block = itemToBlock(item, agents.get(item.response_id));
-    if (block !== null) blocks.push(block);
+    if (block === null) continue;
+    const folded = foldTeammateIdleMarker(block, blocks);
+    if (folded !== null) {
+      blocks = folded;
+      continue;
+    }
+    blocks.push(block);
   }
   return blocks;
+}
+
+// Blocks the lead emits while replying to a delivery. Anything else between a
+// prose message and an idle marker (a human message, another marker, a tool
+// call) starts new work, so the idle result is a fresh one and stays visible.
+const LEAD_REPLY_BLOCKS = new Set<AnyBlock["type"]>([
+  "response_start",
+  "response_end",
+  "text_chunk",
+  "text_done",
+  "reasoning_start",
+  "reasoning_chunk",
+  "reasoning_block",
+]);
+
+/**
+ * Fold a "teammate finished" marker into the prose delivery it follows from
+ * the same teammate (Claude sends an idle notification after every teammate
+ * turn) and return the updated block list; `null` when the marker stands on
+ * its own. The scan stops at the first block that is not the lead's own reply,
+ * so an idle result that answers later work stays visible, as does a one-shot
+ * idle result with no prose before it. A result the prose does not already
+ * state is appended to the card rather than dropped.
+ */
+export function foldTeammateIdleMarker(
+  block: AnyBlock,
+  previous: readonly AnyBlock[],
+): AnyBlock[] | null {
+  if (block.type !== "user_message") return null;
+  const marker = block.teammate;
+  if (marker?.kind !== "teammate_finished") return null;
+  for (let index = previous.length - 1; index >= 0; index -= 1) {
+    const candidate = previous[index]!;
+    if (candidate.type === "user_message") {
+      // Only a delivery the bridge marked internal carries `teammate`; human text never does.
+      const earlier = candidate.teammate;
+      if (earlier?.teammateId !== marker.teammateId || earlier.kind !== "teammate_message") {
+        return null;
+      }
+      return [
+        ...previous.slice(0, index),
+        withTeammateFinish(candidate, block, marker.teammateId),
+        ...previous.slice(index + 1),
+      ];
+    }
+    if (!LEAD_REPLY_BLOCKS.has(candidate.type)) return null;
+  }
+  return null;
+}
+
+function markerText(content: MessageContentBlock[]): string {
+  return content
+    .filter(isTextBlock)
+    .map((block) => block.text)
+    .join("\n");
+}
+
+function withTeammateFinish(
+  prose: UserMessageBlock,
+  finish: UserMessageBlock,
+  teammateId: string,
+): UserMessageBlock {
+  const result = parseSystemMessage(markerText(finish.content).trim())?.body.trim() ?? "";
+  const text = markerText(prose.content);
+  if (!result || text.includes(result)) return prose;
+  return {
+    ...prose,
+    content: [{ type: "input_text", text: `${text}\n\n@${teammateId} finished: ${result}` }],
+  };
 }
 
 function agentNamesByResponseId(items: ConversationItem[]): Map<string, string | null> {
@@ -253,6 +335,17 @@ function itemToBlock(item: ConversationItem, agentName?: string | null): AnyBloc
   if (isMessageItem(item) && item.role === "user") {
     if (!item.is_meta && (item.created_by || item.user_authored === true)) {
       return userMessageToBlock(item);
+    }
+    // An agent-teams delivery is hidden context that wakes the lead; show it
+    // as a readable teammate marker instead of the raw envelope.
+    const teammate = teammateDeliveryMarker(item.content);
+    if (teammate !== null) {
+      // Legacy deliveries persisted without is_meta render readably but never fold.
+      return {
+        ...userMessageToBlock(item),
+        content: teammate.content,
+        ...(item.is_meta === true ? { teammate: teammate.marker } : {}),
+      };
     }
     if (isClaudeAgentMessageContent(item.content)) return null;
     // Claude Code's background-task wake: the CLI injects a

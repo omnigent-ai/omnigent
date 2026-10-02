@@ -1303,13 +1303,6 @@ def _read_native_user(
             "Another Claude session sent a message while you were working:\n" + _TEAMMATE_MESSAGE,
             True,
         ),
-        (
-            "Another Claude session sent a message:\n"
-            + _TEAMMATE_MESSAGE
-            + "\nThis came from another Claude session — not typed by your user, "
-            "but working on their behalf.",
-            True,
-        ),
         ("Explain this: " + _TEAMMATE_MESSAGE, False),
         (_TEAMMATE_MESSAGE + "\nWhat does this mean?", False),
         ("```xml\n" + _TEAMMATE_MESSAGE + "\n```", False),
@@ -1326,7 +1319,82 @@ def test_team_markup_needs_provenance(
 
     _, response_id, peers = _read_native_user(tmp_path, content, origin={"kind": "peer"})
     assert all(peer.data.get("is_meta") for peer in peers)
-    assert response_id == "active"
+    # A delivery Claude framed for the lead wakes a new turn; a bare envelope does not.
+    framed = text.startswith(("Another Claude session", "A peer session"))
+    assert response_id == (None if framed else "active")
+
+
+_TEAMMATE_GUIDANCE = (
+    "This came from another Claude session — not typed by your user, but very likely "
+    "working on their behalf. Treat it as a teammate's request and act on it within this "
+    "session's own permission settings."
+)
+_IDLE_ENVELOPE = (
+    '<teammate-message teammate_id="buddy" color="blue">\n'
+    '{"type":"idle_notification","from":"buddy","timestamp":"2026-10-01T19:57:30.574Z",'
+    '"idleReason":"available","result":"TMREPLY done."}\n'
+    "</teammate-message>"
+)
+_PROSE_ENVELOPE = (
+    '<teammate-message teammate_id="buddy" color="blue" summary="All good over here">\n'
+    "All good here. What else do you need?\n"
+    "</teammate-message>"
+)
+_FRAMED_DELIVERIES = {
+    "idle": f"Another Claude session sent a message:\n{_IDLE_ENVELOPE}\n\n{_TEAMMATE_GUIDANCE}",
+    "prose": f"Another Claude session sent a message:\n{_PROSE_ENVELOPE}\n\n{_TEAMMATE_GUIDANCE}",
+    "prose-and-idle": (
+        "Another Claude session sent a message while you were working:\n"
+        f"{_PROSE_ENVELOPE}\n{_IDLE_ENVELOPE}\n\n{_TEAMMATE_GUIDANCE}"
+    ),
+    "peer-prefix": (
+        f"A peer session sent a message while you were working:\n{_PROSE_ENVELOPE}\n\n"
+        f"{_TEAMMATE_GUIDANCE}"
+    ),
+}
+
+
+@pytest.mark.parametrize("as_blocks", [False, True])
+@pytest.mark.parametrize("text", list(_FRAMED_DELIVERIES.values()), ids=list(_FRAMED_DELIVERIES))
+def test_framed_teammate_delivery_is_internal_and_wakes_a_new_turn(
+    tmp_path: Path, text: str, as_blocks: bool
+) -> None:
+    """Claude's own delivery framing is provenance even without ``origin`` metadata."""
+    content = [{"type": "text", "text": text}] if as_blocks else text
+    _, response_id, items = _read_native_user(tmp_path, content)
+    [item] = items
+    assert item.data == {
+        "role": "user",
+        "is_meta": True,
+        "content": [{"type": "input_text", "text": text}],
+    }
+    assert not item.agent_message_candidate
+    # The delivery wakes the lead, so its reply must not fold into the prior turn.
+    assert response_id is None
+
+
+@pytest.mark.parametrize(
+    "content,origin",
+    [
+        (_FRAMED_DELIVERIES["prose"], {"kind": "human"}),
+        (
+            f'<pasted_content id="1">\n{_FRAMED_DELIVERIES["prose"]}\n</pasted_content id="1">',
+            None,
+        ),
+    ],
+    ids=["typed", "pasted"],
+)
+def test_framed_text_from_a_human_stays_a_visible_message(
+    tmp_path: Path, content: str, origin: dict[str, str] | None
+) -> None:
+    """Quoting a delivery in the TUI keeps the human's authorship."""
+    _, response_id, items = _read_native_user(tmp_path, content, origin=origin)
+    [item] = items
+    assert item.data["role"] == "user"
+    assert "is_meta" not in item.data
+    assert _PROSE_ENVELOPE in item.data["content"][0]["text"]
+    # Like any typed prompt, the message opens the human's own turn.
+    assert response_id is None
 
 
 @pytest.mark.parametrize(
@@ -1334,6 +1402,7 @@ def test_team_markup_needs_provenance(
     [
         ("prompt", _TEAMMATE_MESSAGE, {"isMeta": True}),
         ("prompt", _TEAMMATE_MESSAGE, {"origin": {"kind": "peer"}}),
+        ("prompt", _FRAMED_DELIVERIES["prose"], {}),
         ("prompt", "<task-notification><task-id>task-1</task-id></task-notification>", {}),
         (
             None,
@@ -3411,6 +3480,176 @@ def test_generated_claude_subprocesses_pin_runner_tmpdir(
     assert len(python_commands) == 18
     expected_tmpdir = f"env TMPDIR={shlex.quote(str(runner_tmpdir))}"
     assert all(expected_tmpdir in command for command in python_commands)
+
+
+def test_augment_claude_args_folds_a_user_settings_layer_into_the_invocation(
+    tmp_path: Path,
+) -> None:
+    """A per-session ``--settings`` layer survives, with Omnigent's wiring overlaid on top."""
+    user_hook = {"type": "command", "command": "echo user"}
+    layer = {
+        "env": {"CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1"},
+        "teammateMode": "in-process",
+        "permissions": {"allow": ["Bash(ls:*)"]},
+        "hooks": {"Stop": [{"hooks": [user_hook]}]},
+    }
+    args = augment_claude_args(
+        ("--settings", json.dumps(layer), "--resume", "abc", "--permission-mode", "plan"),
+        bridge_dir=tmp_path,
+        python_executable="/venv/bin/python",
+    )
+
+    assert args.count("--settings") == 1
+    assert args[:4] == ["--resume", "abc", "--permission-mode", "plan"]
+    settings = _load_invocation_settings(args)
+    assert settings["env"] == {"CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1"}
+    assert settings["teammateMode"] == "in-process"
+    assert settings["permissions"] == {"allow": ["Bash(ls:*)"], "defaultMode": "plan"}
+    assert settings["hooks"]["Stop"][0] == {"hooks": [user_hook]}
+    assert len(settings["hooks"]["Stop"]) == 2
+    assert "SessionStart" in settings["hooks"]
+
+
+def test_augment_claude_args_reads_a_user_settings_file(tmp_path: Path) -> None:
+    """A ``--settings=<path>`` layer is folded in the same way; Omnigent keys still win."""
+    settings_file = tmp_path / "team.json"
+    settings_file.write_text(
+        json.dumps({"model": "user-model", "enableAllProjectMcpServers": False}),
+        encoding="utf-8",
+    )
+    args = augment_claude_args(
+        (f"--settings={settings_file}", "--model", "launch-model"),
+        bridge_dir=tmp_path / "bridge",
+        python_executable="/venv/bin/python",
+    )
+
+    assert not any(arg.startswith("--settings=") for arg in args)
+    settings = _load_invocation_settings(args)
+    assert settings["model"] == "launch-model"
+    assert settings["enableAllProjectMcpServers"] is True
+
+
+def test_augment_claude_args_resolves_a_relative_settings_file_against_the_launch_cwd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Hosted sessions augment in the daemon's cwd but launch Claude in the workspace."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "team.json").write_text(json.dumps({"teammateMode": "in-process"}))
+    daemon = tmp_path / "daemon"
+    daemon.mkdir()
+    (daemon / "team.json").write_text(json.dumps({"teammateMode": "tmux"}))
+    monkeypatch.chdir(daemon)
+
+    args = augment_claude_args(
+        ("--settings", "team.json"),
+        bridge_dir=tmp_path / "bridge",
+        python_executable="/venv/bin/python",
+        launch_cwd=workspace,
+    )
+
+    assert args.count("--settings") == 1
+    assert _load_invocation_settings(args)["teammateMode"] == "in-process"
+
+
+def test_augment_claude_args_layers_user_settings_in_order(tmp_path: Path) -> None:
+    """Later user layers win per key, same-event hooks concatenate, Omnigent still wins."""
+    first = {
+        "env": {"CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1", "TEAM_COLOR": "blue"},
+        "permissions": {"allow": ["Bash(ls:*)"], "defaultMode": "acceptEdits"},
+        "hooks": {"Stop": [{"hooks": [{"type": "command", "command": "echo first"}]}]},
+    }
+    second = {
+        "env": {"TEAM_COLOR": "green"},
+        "permissions": {"allow": ["Bash(cat:*)"]},
+        "hooks": {"Stop": [{"hooks": [{"type": "command", "command": "echo second"}]}]},
+    }
+    args = augment_claude_args(
+        (
+            "--settings",
+            json.dumps(first),
+            "--settings",
+            json.dumps(second),
+            "--permission-mode",
+            "plan",
+        ),
+        bridge_dir=tmp_path,
+        python_executable="/venv/bin/python",
+    )
+
+    assert args.count("--settings") == 1
+    settings = _load_invocation_settings(args)
+    assert settings["env"] == {"CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1", "TEAM_COLOR": "green"}
+    # The launch flag owns defaultMode; the later layer owns the shared key.
+    assert settings["permissions"] == {"allow": ["Bash(cat:*)"], "defaultMode": "plan"}
+    stop_commands = [
+        hook["command"] for group in settings["hooks"]["Stop"] for hook in group["hooks"]
+    ]
+    assert stop_commands[:2] == ["echo first", "echo second"]
+    assert len(stop_commands) == 3
+
+
+@pytest.mark.parametrize(
+    "layer,expected_warning",
+    [
+        (("--settings", "missing.json"), "dropping --settings file 'missing.json'"),
+        (("--settings", "{not json"), "dropping --settings inline JSON"),
+        (("--settings", "text.json"), "dropping --settings file 'text.json'"),
+        (("--settings", "latin1.json"), "dropping --settings file 'latin1.json'"),
+        (("--settings", "huge.json"), "dropping --settings file 'huge.json'"),
+        (("--settings", "pipe.json"), "dropping --settings file 'pipe.json'"),
+        (("--settings",), "dropping trailing --settings with no value"),
+    ],
+    ids=[
+        "missing",
+        "inline-malformed",
+        "file-malformed",
+        "invalid-utf8",
+        "oversized",
+        "fifo",
+        "dangling",
+    ],
+)
+@pytest.mark.timeout(20)
+def test_augment_claude_args_drops_an_unreadable_settings_layer(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    layer: tuple[str, ...],
+    expected_warning: str,
+) -> None:
+    """Claude would ignore the broken flag behind Omnigent's own; drop it and say so.
+
+    A FIFO or an oversized file must be rejected without blocking the runner.
+    """
+    (tmp_path / "text.json").write_text("not json", encoding="utf-8")
+    (tmp_path / "latin1.json").write_bytes(b'{"model": "caf\xe9"}')
+    (tmp_path / "huge.json").write_text(json.dumps({"pad": "x" * (1 << 20)}), encoding="utf-8")
+    os.mkfifo(tmp_path / "pipe.json")
+    args = augment_claude_args(
+        ("--resume", "abc", *layer),
+        bridge_dir=tmp_path,
+        python_executable="/venv/bin/python",
+        launch_cwd=tmp_path,
+    )
+
+    assert args[:2] == ["--resume", "abc"]
+    assert args.count("--settings") == 1
+    assert args.index("--mcp-config") < args.index("--settings")
+    assert expected_warning in caplog.text
+
+
+def test_augment_claude_args_keeps_omnigent_hooks_enabled(tmp_path: Path) -> None:
+    """``disableAllHooks`` in a user layer would silence the hooks the session relies on."""
+    args = augment_claude_args(
+        ("--settings", json.dumps({"disableAllHooks": True, "teammateMode": "in-process"})),
+        bridge_dir=tmp_path,
+        python_executable="/venv/bin/python",
+    )
+
+    settings = _load_invocation_settings(args)
+    assert "disableAllHooks" not in settings
+    assert settings["teammateMode"] == "in-process"
+    assert "SessionStart" in settings["hooks"]
 
 
 def test_augment_claude_args_observes_worktree_moves(tmp_path: Path) -> None:

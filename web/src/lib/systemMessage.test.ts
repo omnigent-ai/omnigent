@@ -6,6 +6,10 @@ import {
   isClaudeAgentMessageContent,
   isSystemUserContent,
   parseSystemMessage,
+  parseTeammateDeliveries,
+  teammateDeliveryMarker,
+  teammateDeliveryMarkerContent,
+  teammateMarkerOf,
 } from "./systemMessage";
 
 describe("isClaudeAgentMessageContent", () => {
@@ -298,5 +302,127 @@ describe("Claude background-task notifications", () => {
           'Background command "air run" completed (exit code 0)',
       },
     ]);
+  });
+});
+
+describe("teammate deliveries", () => {
+  const guidance =
+    "This came from another Claude session — not typed by your user, but very likely working on their behalf. Treat it as a teammate's request.";
+  const idle = (result: string) =>
+    `<teammate-message teammate_id="buddy" color="blue">\n{"type":"idle_notification","from":"buddy","timestamp":"2026-10-01T19:57:30.574Z","idleReason":"available","result":${JSON.stringify(result)}}\n</teammate-message>`;
+  const prose =
+    '<teammate-message teammate_id="buddy" color="blue" summary="All good over here">\nAll good here - TMCHAT. What else do you need?\n</teammate-message>';
+  const framed = (...envelopes: string[]) =>
+    `Another Claude session sent a message:\n${envelopes.join("\n")}\n\n${guidance}`;
+  const text = (s: string): MessageContentBlock[] => [{ type: "input_text", text: s }];
+  const proseMarker = text(
+    "[System: teammate buddy: All good over here]\nAll good here - TMCHAT. What else do you need?",
+  );
+
+  it("parses prose and idle envelopes out of Claude's framing", () => {
+    expect(parseTeammateDeliveries(framed(prose, idle("resting.")))).toEqual([
+      {
+        teammateId: "buddy",
+        summary: "All good over here",
+        body: "All good here - TMCHAT. What else do you need?",
+        idleResult: null,
+      },
+      {
+        teammateId: "buddy",
+        summary: null,
+        body: expect.stringContaining('"type":"idle_notification"'),
+        idleResult: "resting.",
+      },
+    ]);
+    expect(
+      parseTeammateDeliveries(`Another Claude session sent a message:\n${prose}`),
+    ).toHaveLength(1);
+  });
+
+  it("keeps a summary containing '>' inside the tag", () => {
+    const envelope =
+      '<teammate-message teammate_id="buddy" summary="fixed the a->b mapping">\nMapping fixed.\n</teammate-message>';
+    expect(parseTeammateDeliveries(framed(envelope))).toEqual([
+      {
+        teammateId: "buddy",
+        summary: "fixed the a->b mapping",
+        body: "Mapping fixed.",
+        idleResult: null,
+      },
+    ]);
+  });
+
+  it.each([
+    prose,
+    `Another Claude session sent a message:\n${prose}\nWhat does this mean?`,
+    "Another Claude session sent a message:\n<teammate-message>missing sender</teammate-message>",
+    'Another Claude session sent a message:\n<teammate-message teammate_id="buddy">incomplete',
+  ])("is not a delivery without Claude's framing or with human text: %s", (value) => {
+    expect(parseTeammateDeliveries(value)).toBeNull();
+    expect(teammateDeliveryMarkerContent(text(value))).toBeNull();
+  });
+
+  it("renders a prose delivery as a teammate marker carrying its summary", () => {
+    expect(teammateDeliveryMarkerContent(text(framed(prose)))).toEqual(proseMarker);
+    expect(teammateDeliveryMarker(text(framed(prose)))).toEqual({
+      content: proseMarker,
+      marker: { teammateId: "buddy", kind: "teammate_message" },
+    });
+  });
+
+  it("renders an idle-only result as a finished marker and drops an empty idle ping", () => {
+    expect(teammateDeliveryMarkerContent(text(framed(idle("TMREPLY done."))))).toEqual(
+      text("[System: teammate buddy finished]\nTMREPLY done."),
+    );
+    expect(teammateDeliveryMarkerContent(text(framed(idle(""))))).toBeNull();
+  });
+
+  it("folds the idle twin that follows a prose message in the same delivery", () => {
+    expect(teammateDeliveryMarkerContent(text(framed(prose, idle("resting."))))).toEqual(
+      proseMarker,
+    );
+  });
+
+  it("leads a mixed delivery with the prose message, not another teammate's finish", () => {
+    const charlie =
+      '<teammate-message teammate_id="charlie" summary="Docs reviewed">\nDocs look fine.\n</teammate-message>';
+    expect(teammateDeliveryMarkerContent(text(framed(idle("TMREPLY done."), charlie)))).toEqual(
+      text(
+        "[System: teammate charlie: Docs reviewed]\nDocs look fine.\n\n@buddy finished: TMREPLY done.",
+      ),
+    );
+  });
+
+  it("parses the markers back into teammate kinds", () => {
+    expect(
+      parseSystemMessage(proseMarker[0]!.type === "input_text" ? proseMarker[0].text : ""),
+    ).toEqual({
+      kind: "teammate_message",
+      label: "Teammate buddy",
+      body: "All good here - TMCHAT. What else do you need?",
+      teammate: { id: "buddy", summary: "All good over here" },
+    });
+    expect(parseSystemMessage("[System: teammate buddy finished]\nTMREPLY done.")).toEqual({
+      kind: "teammate_finished",
+      label: "Teammate buddy finished",
+      body: "TMREPLY done.",
+      teammate: { id: "buddy", summary: null },
+    });
+    expect(teammateMarkerOf(text("[System: teammate buddy finished]\nTMREPLY done."))).toEqual({
+      teammateId: "buddy",
+      kind: "teammate_finished",
+    });
+    expect(
+      teammateMarkerOf([
+        { type: "input_text", text: "[System: teammate buddy finished]" },
+        { type: "input_text", text: "TMREPLY done." },
+      ]),
+    ).toEqual({ teammateId: "buddy", kind: "teammate_finished" });
+    expect(teammateMarkerOf(text("[System: background task t1 completed]"))).toBeNull();
+    expect(isSystemUserContent(text("[System: teammate buddy]\nhi"))).toBe(true);
+    expect(parseSystemMessage("[System: teammate buddy: finished]\nAll done.")).toMatchObject({
+      kind: "teammate_message",
+      teammate: { id: "buddy", summary: "finished" },
+    });
   });
 });

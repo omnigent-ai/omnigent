@@ -2055,6 +2055,78 @@ async def test_external_subagent_start_falls_back_to_the_bare_agent_type(
     assert child["session_name"] == "a361e6a6aa05689cb"
 
 
+@pytest.mark.parametrize(
+    "tool_use_id", [None, "teammate:abuddy-9837bbf1d431dcca"], ids=["absent", "placeholder"]
+)
+async def test_external_subagent_start_registers_an_in_process_teammate(
+    client: httpx.AsyncClient, tool_use_id: str | None
+) -> None:
+    """A teammate spawn has no tool result; the row and notice carry its trimmed name.
+
+    The forwarder's ``teammate:<id>`` placeholder (sent for older servers) is
+    accepted but never stored as a tool-use id.
+    """
+    agent = await create_test_agent(client)
+    parent = await _create_session(
+        client, agent["id"], labels={"omnigent.wrapper": "claude-code-native-ui"}
+    )
+    resp = await client.post(
+        f"/v1/sessions/{parent['id']}/events",
+        json={
+            "type": "external_subagent_start",
+            "data": {
+                "subagent_id": "abuddy-9837bbf1d431dcca",
+                "agent_type": "buddy",
+                "description": "Probe teammate",
+                **({"tool_use_id": tool_use_id} if tool_use_id else {}),
+                "name": " buddy ",
+                "task_kind": "in_process_teammate",
+            },
+        },
+    )
+    assert resp.status_code in (200, 202), resp.text
+    child_id = resp.json()["child_session_id"]
+    children = (await client.get(f"/v1/sessions/{parent['id']}/child_sessions")).json()["data"]
+    child = next(c for c in children if c["id"] == child_id)
+    assert child["tool"] == "buddy"
+    assert child["labels"]["omnigent.claude_native.subagent_name"] == "buddy"
+    assert child["labels"]["omnigent.claude_native.task_kind"] == "in_process_teammate"
+    assert "omnigent.claude_native.tool_use_id" not in child["labels"]
+    items = (await client.get(f"/v1/sessions/{parent['id']}/items")).json()["data"]
+    notices = [item for item in items if item.get("event_type") == "session.subagent.delegated"]
+    assert [notice["resource"]["title"] for notice in notices] == ["buddy"]
+
+
+async def test_external_subagent_start_shows_a_named_background_agent_by_name(
+    client: httpx.AsyncClient,
+) -> None:
+    """``Agent({name})`` outside agent teams keeps its spawn id and reads as its name."""
+    agent = await create_test_agent(client)
+    parent = await _create_session(
+        client, agent["id"], labels={"omnigent.wrapper": "claude-code-native-ui"}
+    )
+    resp = await client.post(
+        f"/v1/sessions/{parent['id']}/events",
+        json={
+            "type": "external_subagent_start",
+            "data": {
+                "subagent_id": "a28957e08ad8fc7d2",
+                "agent_type": "general-purpose",
+                "description": "Probe teammate",
+                "tool_use_id": "toolu_named",
+                "name": "buddy",
+            },
+        },
+    )
+    assert resp.status_code in (200, 202), resp.text
+    child_id = resp.json()["child_session_id"]
+    children = (await client.get(f"/v1/sessions/{parent['id']}/child_sessions")).json()["data"]
+    child = next(c for c in children if c["id"] == child_id)
+    assert child["tool"] == "buddy"
+    assert child["labels"]["omnigent.claude_native.tool_use_id"] == "toolu_named"
+    assert "omnigent.claude_native.task_kind" not in child["labels"]
+
+
 async def test_external_subagent_start_is_idempotent_on_subagent_id(
     client: httpx.AsyncClient,
 ) -> None:

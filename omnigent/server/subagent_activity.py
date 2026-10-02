@@ -53,6 +53,7 @@ def native_subagent_terminal_status(
 def _title(child: Conversation) -> str:
     named = (
         child.task_summary
+        or child.labels.get("omnigent.claude_native.subagent_name")
         or child.labels.get("omnigent.claude_native.description")
         or child.labels.get("omnigent.codex_native.agent_nickname")
         or child.labels.get("omnigent.codex_native.agent_role")

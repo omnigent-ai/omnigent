@@ -209,16 +209,15 @@ describe("itemsToBlocks — flat shape", () => {
     }
   });
 
-  it("keeps legacy teammate handbacks out of the transcript while preserving user discussion", () => {
+  it("keeps bare legacy handbacks out of the transcript", () => {
     const envelope =
       '<teammate-message teammate_id="reviewer" summary="Review complete">Ready</teammate-message>';
     const blocks = itemsToBlocks([
       userMessage("resp_1", "Review this change", "msg_before"),
       userMessage("resp_2", envelope, "msg_teammate"),
       userMessage("resp_2", '<agent-message from="reviewer">Ready</agent-message>', "msg_report"),
-      userMessage("resp_3", `Another Claude session sent a message:\n${envelope}`, "msg_peer"),
-      assistantMessage("resp_3", "The review is complete."),
-      userMessage("resp_4", `What does ${envelope} mean?`, "msg_after"),
+      assistantMessage("resp_2", "The review is complete."),
+      userMessage("resp_3", `What does ${envelope} mean?`, "msg_after"),
     ]);
 
     expect(blocks.map((block) => block.ctx.itemId)).toEqual([
@@ -226,6 +225,166 @@ describe("itemsToBlocks — flat shape", () => {
       "msg_asst",
       "msg_after",
     ]);
+  });
+
+  describe("agent-teams deliveries", () => {
+    const guidance =
+      "This came from another Claude session — not typed by your user, but very likely working on their behalf.";
+    const framed = (envelope: string) =>
+      `Another Claude session sent a message:\n${envelope}\n\n${guidance}`;
+    const prose =
+      '<teammate-message teammate_id="buddy" color="blue" summary="All good over here">\nAll good here - TMCHAT.\n</teammate-message>';
+    const idle = (result: string) =>
+      `<teammate-message teammate_id="buddy" color="blue">\n{"type":"idle_notification","from":"buddy","idleReason":"available","result":${JSON.stringify(result)}}\n</teammate-message>`;
+    const delivery = (responseId: string, envelope: string, id: string): ConversationItem => ({
+      ...userMessage(responseId, framed(envelope), id),
+      is_meta: true,
+    });
+
+    it("renders a hidden teammate delivery as a readable marker, not a raw bubble", () => {
+      const blocks = itemsToBlocks([
+        delivery("resp_1", prose, "msg_prose"),
+        assistantMessage("resp_1", "CHAT-ACK"),
+      ]);
+
+      expect(blocks.map((block) => block.ctx.itemId)).toEqual(["msg_prose", "msg_asst"]);
+      expect((blocks[0] as UserMessageBlock).content).toEqual([
+        {
+          type: "input_text",
+          text: "[System: teammate buddy: All good over here]\nAll good here - TMCHAT.",
+        },
+      ]);
+    });
+
+    it("keeps a one-shot idle result visible and folds the idle twin after a prose message", () => {
+      const blocks = itemsToBlocks([
+        delivery("resp_1", idle("TMREPLY done."), "msg_idle_first"),
+        assistantMessage("resp_1", "IDLE-ACK", "msg_ack_1"),
+        delivery("resp_2", prose, "msg_prose"),
+        assistantMessage("resp_2", "CHAT-ACK", "msg_ack_2"),
+        delivery("resp_3", idle("resting."), "msg_idle_twin"),
+      ]);
+
+      expect(blocks.map((block) => block.ctx.itemId)).toEqual([
+        "msg_idle_first",
+        "msg_ack_1",
+        "msg_prose",
+        "msg_ack_2",
+      ]);
+      expect((blocks[0] as UserMessageBlock).content).toEqual([
+        { type: "input_text", text: "[System: teammate buddy finished]\nTMREPLY done." },
+      ]);
+      // The twin's result is kept on the prose card instead of becoming its own item.
+      expect((blocks[2] as UserMessageBlock).content).toEqual([
+        {
+          type: "input_text",
+          text: "[System: teammate buddy: All good over here]\nAll good here - TMCHAT.\n\n@buddy finished: resting.",
+        },
+      ]);
+    });
+
+    it("folds a twin that only restates the prose without repeating it", () => {
+      const blocks = itemsToBlocks([
+        delivery("resp_1", prose, "msg_prose"),
+        assistantMessage("resp_1", "CHAT-ACK", "msg_ack"),
+        delivery("resp_2", idle("All good here - TMCHAT."), "msg_idle_twin"),
+      ]);
+
+      expect(blocks.map((block) => block.ctx.itemId)).toEqual(["msg_prose", "msg_ack"]);
+      expect((blocks[0] as UserMessageBlock).content).toEqual([
+        {
+          type: "input_text",
+          text: "[System: teammate buddy: All good over here]\nAll good here - TMCHAT.",
+        },
+      ]);
+    });
+
+    it("keeps a final result that differs from a mid-turn status on the card", () => {
+      const status =
+        '<teammate-message teammate_id="buddy" color="blue" summary="Starting">\nStarting on the docs.\n</teammate-message>';
+      const blocks = itemsToBlocks([
+        delivery("resp_1", status, "msg_status"),
+        assistantMessage("resp_1", "Noted.", "msg_ack"),
+        delivery("resp_2", idle("Docs updated in 3 files."), "msg_idle_result"),
+      ]);
+
+      expect(blocks.map((block) => block.ctx.itemId)).toEqual(["msg_status", "msg_ack"]);
+      expect((blocks[0] as UserMessageBlock).content).toEqual([
+        {
+          type: "input_text",
+          text: "[System: teammate buddy: Starting]\nStarting on the docs.\n\n@buddy finished: Docs updated in 3 files.",
+        },
+      ]);
+    });
+
+    it("keeps an idle result that answers work assigned after the folded twin", () => {
+      const blocks = itemsToBlocks([
+        delivery("resp_1", prose, "msg_prose"),
+        assistantMessage("resp_1", "CHAT-ACK", "msg_ack_1"),
+        delivery("resp_2", idle("resting."), "msg_idle_twin"),
+        userMessage("resp_3", "give buddy another task", "msg_human"),
+        functionCall("resp_3", "call_send", "SendMessage", { to: "buddy", message: "task two" }),
+        functionCallOutput("resp_3", "call_send", "sent"),
+        assistantMessage("resp_3", "RELAY-SENT", "msg_ack_2"),
+        delivery("resp_4", idle("Task two done."), "msg_idle_result"),
+      ]);
+
+      const ids = blocks.map((block) => block.ctx.itemId);
+      expect(ids).not.toContain("msg_idle_twin");
+      expect(ids.slice(-2)).toEqual(["msg_ack_2", "msg_idle_result"]);
+      expect((blocks.at(-1) as UserMessageBlock).content).toEqual([
+        { type: "input_text", text: "[System: teammate buddy finished]\nTask two done." },
+      ]);
+    });
+
+    it("keeps an idle result once the lead has given the teammate new work", () => {
+      const blocks = itemsToBlocks([
+        delivery("resp_1", prose, "msg_prose"),
+        functionCall("resp_1", "call_send", "SendMessage", { to: "buddy", message: "task two" }),
+        functionCallOutput("resp_1", "call_send", "sent"),
+        assistantMessage("resp_1", "RELAY-SENT", "msg_ack"),
+        delivery("resp_2", idle("Task two done."), "msg_idle_result"),
+      ]);
+
+      expect(blocks.at(-1)?.ctx.itemId).toBe("msg_idle_result");
+    });
+
+    it("never lets human marker-shaped text fold a genuine finish", () => {
+      const human: ConversationItem = {
+        ...userMessage("resp_1", "[System: teammate buddy]\nhi", "msg_human"),
+        user_authored: true,
+      };
+      const blocks = itemsToBlocks([
+        human,
+        assistantMessage("resp_1", "ok", "msg_ack"),
+        delivery("resp_2", idle("Done."), "msg_idle_result"),
+      ]);
+
+      expect(blocks.map((block) => block.ctx.itemId)).toEqual([
+        "msg_human",
+        "msg_ack",
+        "msg_idle_result",
+      ]);
+      expect((blocks[0] as UserMessageBlock).teammate).toBeUndefined();
+      expect((blocks[2] as UserMessageBlock).teammate).toEqual({
+        teammateId: "buddy",
+        kind: "teammate_finished",
+      });
+    });
+
+    it("keeps a delivery a human submitted from the web as their own bubble", () => {
+      const human: ConversationItem = {
+        ...userMessage("resp_1", framed(prose), "msg_human"),
+        user_authored: true,
+      };
+
+      const [block] = itemsToBlocks([human]);
+
+      expect((block as UserMessageBlock).content[0]).toEqual({
+        type: "input_text",
+        text: framed(prose),
+      });
+    });
   });
 
   it("user + assistant items produce [UserMessageBlock, TextDone] in order", () => {

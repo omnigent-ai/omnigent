@@ -2554,6 +2554,7 @@ def augment_claude_args(
     allowed_tools: tuple[str, ...] = (),
     subagent_router_dir: Path | None = None,
     turn_routing: bool = False,
+    launch_cwd: Path | None = None,
 ) -> list[str]:
     """
     Return Claude CLI args with Omnigent MCP/hook/skill injection.
@@ -2606,6 +2607,8 @@ def augment_claude_args(
         Routing on, threaded to :func:`build_hook_settings` so the
         ``UserPromptSubmit`` first-message routing hook is registered.
         ``False`` keeps every prompt off the routing round trip.
+    :param launch_cwd: Directory Claude launches in; a relative ``--settings``
+        path resolves against it. ``None`` resolves against this process's cwd.
     :returns: Augmented argument list for the terminal resource.
     """
     mcp_config = build_mcp_config(bridge_dir, python_executable=python_executable)
@@ -2625,8 +2628,9 @@ def augment_claude_args(
     )
     args = _merge_disallowed_tools(list(claude_args), _OMNIGENT_DISALLOWED_TOOLS)
     args = _merge_allowed_tools(args, allowed_tools)
+    args, settings = _merge_launch_settings(args, hook_settings, launch_cwd=launch_cwd)
     settings_path = bridge_dir / _INVOCATION_SETTINGS_FILE
-    _write_json_file(settings_path, hook_settings)
+    _write_json_file(settings_path, settings)
     args.extend(
         [
             "--mcp-config",
@@ -2713,6 +2717,122 @@ def _merge_allowed_tools(args: list[str], extra: tuple[str, ...]) -> list[str]:
     existing = [tool for tool in args[value_idx].split(",") if tool]
     args[value_idx] = ",".join(dict.fromkeys([*existing, *extra]))
     return args
+
+
+# Largest ``--settings`` file folded into the invocation settings. The read runs
+# on the runner before Claude launches, so it must stay small and bounded.
+_SETTINGS_LAYER_MAX_BYTES = 1 << 20
+
+
+def _load_settings_layer(value: str, launch_cwd: Path | None) -> _JsonObject | None:
+    """Parse a ``--settings`` value: a JSON object literal or the path of one.
+
+    A relative path is taken from the directory Claude launches in, which on a
+    hosted session is the workspace rather than the runner daemon's cwd.
+    """
+    text = value.strip()
+    if not text.startswith("{"):
+        path = Path(value).expanduser()
+        if launch_cwd is not None and not path.is_absolute():
+            path = launch_cwd / path
+        try:
+            # A FIFO or device would block the runner; open without blocking and
+            # read only a regular file, checked on the descriptor itself.
+            fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+            try:
+                if not stat.S_ISREG(os.fstat(fd).st_mode):
+                    return None
+                with os.fdopen(fd, "rb") as handle:
+                    fd = -1
+                    data = handle.read(_SETTINGS_LAYER_MAX_BYTES + 1)
+            finally:
+                if fd >= 0:
+                    os.close(fd)
+        except OSError:
+            return None
+        if len(data) > _SETTINGS_LAYER_MAX_BYTES:
+            return None
+        try:
+            text = data.decode("utf-8")
+        except UnicodeDecodeError:
+            return None
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _overlay_settings(base: _JsonObject, top: _JsonObject) -> _JsonObject:
+    """Apply ``top`` over ``base``: hooks concatenate per event, env/permissions merge per key."""
+    merged = dict(base)
+    for key, value in top.items():
+        current = merged.get(key)
+        if key == "hooks" and isinstance(current, dict) and isinstance(value, dict):
+            hooks = dict(current)
+            for event, entries in value.items():
+                existing = hooks.get(event)
+                hooks[event] = (
+                    [*existing, *entries]
+                    if isinstance(existing, list) and isinstance(entries, list)
+                    else entries
+                )
+            merged[key] = hooks
+        elif (
+            key in ("env", "permissions") and isinstance(current, dict) and isinstance(value, dict)
+        ):
+            merged[key] = {**current, **value}
+        else:
+            merged[key] = value
+    return merged
+
+
+def _merge_launch_settings(
+    args: list[str], hook_settings: _JsonObject, *, launch_cwd: Path | None = None
+) -> tuple[list[str], _JsonObject]:
+    """
+    Fold user-supplied ``--settings`` layers into the invocation settings.
+
+    Claude keeps only the last ``--settings`` flag, so a per-session layer (e.g.
+    enabling agent teams) would otherwise be discarded by the hook settings
+    appended after it. User layers form the base, in order, with the Omnigent
+    wiring applied on top. An unreadable layer is dropped with a warning: left
+    in place, Claude would silently ignore it behind the appended flag.
+    """
+    remaining: list[str] = []
+    layers: list[_JsonObject] = []
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        if arg == "--settings" and index + 1 < len(args):
+            value, index = args[index + 1], index + 2
+        elif arg == "--settings":
+            # Left in place, the bare flag would swallow the --mcp-config appended later.
+            _logger.warning("claude-native: dropping trailing --settings with no value")
+            index += 1
+            continue
+        elif arg.startswith("--settings="):
+            value, index = arg.partition("=")[2], index + 1
+        else:
+            remaining.append(arg)
+            index += 1
+            continue
+        layer = _load_settings_layer(value, launch_cwd)
+        if layer is None:
+            # Inline JSON may carry env secrets; name the layer without echoing it.
+            source = "inline JSON" if value.lstrip().startswith("{") else f"file {value!r}"
+            _logger.warning(
+                "claude-native: dropping --settings %s: not a readable JSON object", source
+            )
+            continue
+        layers.append(layer)
+    merged: _JsonObject = {}
+    for layer in layers:
+        merged = _overlay_settings(merged, layer)
+    # Omnigent's status, approval and activity hooks ride this file; a user layer
+    # cannot switch them off wholesale.
+    merged.pop("disableAllHooks", None)
+    return remaining, _overlay_settings(merged, hook_settings)
 
 
 def _merge_disallowed_tools(args: list[str], extra: tuple[str, ...]) -> list[str]:
@@ -8252,9 +8372,62 @@ def _parse_slash_command_record(content: str) -> _SlashCommandPayload | None:
     return _SlashCommandPayload(name=name, arguments=arguments, output=output)
 
 
+def _split_teammate_envelopes(text: str) -> tuple[bool, str] | None:
+    """Strip Claude's optional delivery prefix and the teammate envelopes.
+
+    Returns whether the prefix was present and what follows the envelopes;
+    ``None`` when the text does not open with an envelope.
+    """
+    stripped = text.lstrip()
+    wrapped = False
+    for prefix in _TEAMMATE_MESSAGE_PREFIXES:
+        if stripped.startswith(prefix):
+            stripped = stripped[len(prefix) :].lstrip()
+            wrapped = True
+            break
+    if _TEAMMATE_MESSAGE_RE.match(stripped) is None:
+        return None
+    while match := _TEAMMATE_MESSAGE_RE.match(stripped):
+        stripped = stripped[match.end() :].lstrip()
+    return wrapped, stripped
+
+
+def _prefixed_teammate_envelopes(text: str) -> str | None:
+    """Return what follows Claude's delivery prefix and teammate envelopes, or ``None``."""
+    split = _split_teammate_envelopes(text)
+    return split[1] if split is not None and split[0] else None
+
+
+def _is_framed_teammate_delivery(text: str) -> bool:
+    """Claude's own delivery framing: prefix, envelopes, then its guidance paragraph.
+
+    Claude Code 2.1.x writes teammate deliveries without ``origin`` metadata, so
+    this framing is their provenance; callers still exclude a human ``origin``.
+    """
+    remainder = _prefixed_teammate_envelopes(text)
+    return remainder is not None and remainder.startswith(_TEAMMATE_DELIVERY_GUIDANCE)
+
+
+def _wakes_parent_turn(text: str) -> bool:
+    """Hidden input that starts a new lead turn: a task notification or a teammate delivery."""
+    if text.lstrip().startswith("<task-notification>"):
+        return True
+    remainder = _prefixed_teammate_envelopes(text)
+    return remainder is not None and (
+        not remainder or remainder.startswith(_TEAMMATE_DELIVERY_GUIDANCE)
+    )
+
+
+def _is_human_origin(origin: object) -> bool:
+    """Claude stamps prompts typed or pasted into its TUI with ``origin.kind == "human"``."""
+    return isinstance(origin, dict) and origin.get("kind") == "human"
+
+
 def _is_trusted_agent_notification_text(text: str, *, origin: object = None) -> bool:
-    """Honor native peer provenance and the existing task-notification boundary."""
+    """Honor peer provenance, Claude's delivery framing, and the task-notification boundary."""
     if isinstance(origin, dict) and origin.get("kind") == "peer":
+        return True
+    if _is_framed_teammate_delivery(text) and not _is_human_origin(origin):
         return True
     stripped = text.lstrip()
     return stripped.startswith("<task-notification>") and all(
@@ -8266,21 +8439,12 @@ def _is_agent_notification_text(text: str) -> bool:
     """Recognize possible agent context; text alone does not prove its origin."""
     if _is_trusted_agent_notification_text(text):
         return True
-    stripped = text.lstrip()
-    wrapped = False
-    for prefix in _TEAMMATE_MESSAGE_PREFIXES:
-        if stripped.startswith(prefix):
-            stripped = stripped[len(prefix) :].lstrip()
-            wrapped = True
-            break
-    if _TEAMMATE_MESSAGE_RE.match(stripped) is None:
+    split = _split_teammate_envelopes(text)
+    if split is None:
         return False
-    while match := _TEAMMATE_MESSAGE_RE.match(stripped):
-        stripped = stripped[match.end() :].lstrip()
-        if not stripped:
-            return True
+    wrapped, remainder = split
     # Wrapped peer messages can append Claude's own explanatory guidance.
-    return wrapped and stripped.startswith(_TEAMMATE_DELIVERY_GUIDANCE)
+    return not remainder or (wrapped and remainder.startswith(_TEAMMATE_DELIVERY_GUIDANCE))
 
 
 def _subagent_handback_id(origin: object) -> str | None:
@@ -8528,12 +8692,7 @@ def _user_transcript_items_from_entry(
                     subagent_return_id=return_id,
                 )
             )
-            return (
-                None
-                if content.lstrip().startswith("<task-notification>")
-                else current_response_id,
-                items,
-            )
+            return (None if _wakes_parent_turn(content) else current_response_id, items)
         stripped = content.lstrip()
         # Skill invocations with args ship the tag order
         # ``<command-message>…<command-name>…<command-args>…`` — i.e.
@@ -8638,7 +8797,7 @@ def _user_transcript_items_from_entry(
                     )
                 )
                 item_index += 1
-                saw_user_text = saw_user_text or text.lstrip().startswith("<task-notification>")
+                saw_user_text = saw_user_text or _wakes_parent_turn(text)
                 continue
             # Claude may emit CLI scaffolding as text blocks; never render it
             # as user input when the transcript shape changes.

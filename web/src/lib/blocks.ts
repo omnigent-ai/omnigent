@@ -245,6 +245,12 @@ export interface UserMessageBlock {
    * Absent on blocks hydrated from history (`items`), which mount fresh.
    */
   stableKey?: string;
+  /**
+   * Sender and kind of the agent-teams delivery this block re-labels. Set
+   * only for deliveries the bridge marked internal; human text never carries
+   * it, so idle folding can trust it.
+   */
+  teammate?: { teammateId: string; kind: "teammate_message" | "teammate_finished" };
 }
 
 // ── Tool calls ───────────────────────────────────────────

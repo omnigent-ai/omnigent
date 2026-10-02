@@ -50,7 +50,7 @@ function NodeStatusDot({ activity }: { activity: AgentActivity }) {
 }
 
 function AgentNodeComponent({ data }: NodeProps<Node<AgentNodeData>>) {
-  const { label, activity, statusLabel, isActive, preview } = data;
+  const { label, activity, statusLabel, isActive, preview, badge } = data;
   const tint = ACTIVITY_TINT[activity];
 
   return (
@@ -71,6 +71,15 @@ function AgentNodeComponent({ data }: NodeProps<Node<AgentNodeData>>) {
       >
         <div className="flex items-center gap-1.5">
           <span className="truncate text-sm font-medium leading-tight">{label}</span>
+          {badge && (
+            <Badge
+              variant="outline"
+              data-testid="subagent-node-badge"
+              className="h-4 shrink-0 px-1 text-[9px] font-normal text-muted-foreground"
+            >
+              {badge}
+            </Badge>
+          )}
           <span className="flex-1" />
           <NodeStatusDot activity={activity} />
         </div>

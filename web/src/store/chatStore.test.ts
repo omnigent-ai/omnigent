@@ -7461,6 +7461,91 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
       ]);
     });
 
+    it("renders a hidden teammate delivery as a readable marker and folds its idle twin", () => {
+      const guidance =
+        "This came from another Claude session — not typed by your user, but very likely working on their behalf.";
+      const framed = (envelope: string) =>
+        `Another Claude session sent a message:\n${envelope}\n\n${guidance}`;
+      const prose =
+        '<teammate-message teammate_id="buddy" color="blue" summary="All good over here">\nAll good here - TMCHAT.\n</teammate-message>';
+      const idle =
+        '<teammate-message teammate_id="buddy" color="blue">\n{"type":"idle_notification","from":"buddy","idleReason":"available","result":"resting."}\n</teammate-message>';
+      const pending = [
+        { tempId: "pend_1", content: [{ type: "input_text" as const, text: "visible pending" }] },
+      ];
+      useChatStore.setState({ blocks: [], pendingUserMessages: pending });
+      const deliver = (itemId: string, envelope: string) =>
+        handleSessionEvent({
+          type: "session_input_consumed",
+          itemId,
+          itemType: "message",
+          isMeta: true,
+          data: {
+            role: "user",
+            is_meta: true,
+            content: [{ type: "input_text", text: framed(envelope) }],
+          },
+        });
+
+      deliver("msg_prose", prose);
+      deliver("msg_idle", idle);
+
+      const after = useChatStore.getState();
+      expect(after.pendingUserMessages).toEqual(pending);
+      expect(after.blocks).toMatchObject([
+        {
+          type: "user_message",
+          ctx: { itemId: "msg_prose" },
+          content: [
+            {
+              type: "input_text",
+              text: "[System: teammate buddy: All good over here]\nAll good here - TMCHAT.\n\n@buddy finished: resting.",
+            },
+          ],
+          teammate: { teammateId: "buddy", kind: "teammate_message" },
+        },
+      ]);
+    });
+
+    it("never lets a human's marker-shaped message fold a genuine teammate finish", () => {
+      const guidance =
+        "This came from another Claude session — not typed by your user, but very likely working on their behalf.";
+      const idle =
+        '<teammate-message teammate_id="buddy" color="blue">\n{"type":"idle_notification","from":"buddy","idleReason":"available","result":"Done."}\n</teammate-message>';
+      useChatStore.setState({ blocks: [], pendingUserMessages: [] });
+
+      handleSessionEvent({
+        type: "session_input_consumed",
+        itemId: "msg_human",
+        itemType: "message",
+        data: {
+          role: "user",
+          user_authored: true,
+          content: [{ type: "input_text", text: "[System: teammate buddy]\nhi" }],
+        },
+      });
+      handleSessionEvent({
+        type: "session_input_consumed",
+        itemId: "msg_idle",
+        itemType: "message",
+        isMeta: true,
+        data: {
+          role: "user",
+          is_meta: true,
+          content: [
+            {
+              type: "input_text",
+              text: `Another Claude session sent a message:\n${idle}\n\n${guidance}`,
+            },
+          ],
+        },
+      });
+
+      const blocks = useChatStore.getState().blocks;
+      expect(blocks.map((block) => block.ctx.itemId)).toEqual(["msg_human", "msg_idle"]);
+      expect((blocks[0] as UserMessageBlock).teammate).toBeUndefined();
+    });
+
     const teamContent = [
       {
         type: "input_text" as const,

@@ -6076,10 +6076,11 @@ def _seed_subagent_on_disk(
     subagent_id: str,
     agent_type: str,
     description: str,
-    tool_use_id: str,
+    tool_use_id: str | None,
     transcript_records: list[dict[str, Any]] | None = None,
     spawn_transcript_path: Path | None = None,
     spawn_tool_name: str = "Agent",
+    meta_extras: dict[str, Any] | None = None,
 ) -> Path:
     """
     Create the ``.meta.json`` + ``.jsonl`` pair Claude Code would
@@ -6095,7 +6096,9 @@ def _seed_subagent_on_disk(
     :param agent_type: ``agentType`` value for the meta file,
         e.g. ``"Explore"``.
     :param description: ``description`` value for the meta file.
-    :param tool_use_id: ``toolUseId`` value for the meta file.
+    :param tool_use_id: ``toolUseId`` value for the meta file. ``None``
+        writes neither the key nor a spawn record, like an in-process
+        teammate's meta.
     :param transcript_records: Optional list of decoded transcript
         rows to seed into the sub-agent's ``.jsonl``. ``None`` /
         empty leaves the transcript empty (the common case when a
@@ -6104,32 +6107,35 @@ def _seed_subagent_on_disk(
         tool call. Defaults to the top-level transcript.
     :param spawn_tool_name: Name on the spawning ``tool_use`` block.
         Defaults to ``"Agent"``; pass ``"Task"`` to exercise the alias.
+    :param meta_extras: Extra meta keys Claude may stamp, e.g.
+        ``{"name": "buddy", "taskKind": "in_process_teammate"}``.
     :returns: Path to the sub-agent's ``.jsonl`` (handy for tests
         that append rows after the fact).
     """
     spawn_path = spawn_transcript_path or transcript_path
-    with spawn_path.open("a", encoding="utf-8") as handle:
-        handle.write(
-            json.dumps(
-                {
-                    "isSidechain": spawn_path != transcript_path,
-                    "type": "assistant",
-                    "uuid": f"spawn-{subagent_id}",
-                    "message": {
-                        "role": "assistant",
-                        "content": [
-                            {
-                                "type": "tool_use",
-                                "id": tool_use_id,
-                                "name": spawn_tool_name,
-                                "input": {"description": description},
-                            }
-                        ],
-                    },
-                }
+    if tool_use_id is not None:
+        with spawn_path.open("a", encoding="utf-8") as handle:
+            handle.write(
+                json.dumps(
+                    {
+                        "isSidechain": spawn_path != transcript_path,
+                        "type": "assistant",
+                        "uuid": f"spawn-{subagent_id}",
+                        "message": {
+                            "role": "assistant",
+                            "content": [
+                                {
+                                    "type": "tool_use",
+                                    "id": tool_use_id,
+                                    "name": spawn_tool_name,
+                                    "input": {"description": description},
+                                }
+                            ],
+                        },
+                    }
+                )
+                + "\n"
             )
-            + "\n"
-        )
     subagents_dir = transcript_path.parent / transcript_path.stem / "subagents"
     subagents_dir.mkdir(parents=True, exist_ok=True)
     meta_path = subagents_dir / f"agent-{subagent_id}.meta.json"
@@ -6138,7 +6144,8 @@ def _seed_subagent_on_disk(
             {
                 "agentType": agent_type,
                 "description": description,
-                "toolUseId": tool_use_id,
+                **({"toolUseId": tool_use_id} if tool_use_id is not None else {}),
+                **(meta_extras or {}),
             }
         ),
         encoding="utf-8",
@@ -6208,6 +6215,126 @@ async def test_subagent_watcher_registers_a_task_named_spawn(
     assert start_paths == {"a-worker": "/v1/sessions/conv_root/events"}
     assert state.subagents["a-worker"].child_conversation_id == "conv_a-worker"
     assert state.subagents["a-worker"].parent_subagent_id is None
+
+
+async def _register_subagents_once(
+    tmp_path: Path, transcript_path: Path
+) -> tuple[dict[str, dict[str, Any]], forwarder.SubagentForwardState]:
+    """Run one watcher tick against a mock server; return the start payloads by id."""
+    start_bodies: dict[str, dict[str, Any]] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        if body.get("type") != "external_subagent_start":
+            return httpx.Response(202, json={})
+        subagent_id = body["data"]["subagent_id"]
+        start_bodies[subagent_id] = body["data"]
+        return httpx.Response(
+            202, json={"queued": False, "child_session_id": f"conv_{subagent_id}"}
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://ap"
+    ) as client:
+        state = await forwarder._forward_available_subagents(
+            client=client,
+            parent_session_id="conv_root",
+            bridge_dir=tmp_path / "bridge",
+            transcript_path=transcript_path,
+            state=forwarder.SubagentForwardState(subagents={}),
+            agent_name="claude-native-ui",
+            start_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            item_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            status_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+        )
+    return start_bodies, state
+
+
+async def test_subagent_watcher_registers_an_in_process_teammate(tmp_path: Path) -> None:
+    """A teammate meta has no ``toolUseId`` (its spawn returns at once); it registers by name.
+
+    The ``teammate:<id>`` placeholder satisfies servers that still require a
+    non-empty ``tool_use_id``.
+    """
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text("", encoding="utf-8")
+    _seed_subagent_on_disk(
+        transcript_path=transcript_path,
+        subagent_id="abuddy-9837bbf1d431dcca",
+        agent_type="buddy",
+        description="Probe teammate",
+        tool_use_id=None,
+        meta_extras={
+            "name": "buddy",
+            "taskKind": "in_process_teammate",
+            "teamName": "session-c4753b9a",
+            "color": "blue",
+        },
+    )
+
+    start_bodies, state = await _register_subagents_once(tmp_path, transcript_path)
+
+    assert start_bodies == {
+        "abuddy-9837bbf1d431dcca": {
+            "subagent_id": "abuddy-9837bbf1d431dcca",
+            "agent_type": "buddy",
+            "description": "Probe teammate",
+            "tool_use_id": "teammate:abuddy-9837bbf1d431dcca",
+            "name": "buddy",
+            "task_kind": "in_process_teammate",
+        }
+    }
+    entry = state.subagents["abuddy-9837bbf1d431dcca"]
+    assert entry.child_conversation_id == "conv_abuddy-9837bbf1d431dcca"
+    assert entry.parent_subagent_id is None
+
+
+async def test_subagent_watcher_forwards_the_name_of_a_named_background_agent(
+    tmp_path: Path,
+) -> None:
+    """``Agent({name})`` outside agent teams keeps its spawn correlation and adds the name."""
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text("", encoding="utf-8")
+    _seed_subagent_on_disk(
+        transcript_path=transcript_path,
+        subagent_id="a28957e08ad8fc7d2",
+        agent_type="general-purpose",
+        description="Probe teammate",
+        tool_use_id="toolu_named",
+        meta_extras={"name": "buddy", "requestShape": "background"},
+    )
+
+    start_bodies, _state = await _register_subagents_once(tmp_path, transcript_path)
+
+    assert start_bodies == {
+        "a28957e08ad8fc7d2": {
+            "subagent_id": "a28957e08ad8fc7d2",
+            "agent_type": "general-purpose",
+            "description": "Probe teammate",
+            "tool_use_id": "toolu_named",
+            "name": "buddy",
+        }
+    }
+
+
+async def test_subagent_watcher_still_waits_for_a_task_meta_without_tool_use_id(
+    tmp_path: Path,
+) -> None:
+    """Only a teammate may lack ``toolUseId``; a Task meta without one is still mid-write."""
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text("", encoding="utf-8")
+    _seed_subagent_on_disk(
+        transcript_path=transcript_path,
+        subagent_id="a-partial",
+        agent_type="Explore",
+        description="Still being written",
+        tool_use_id=None,
+    )
+
+    start_bodies, state = await _register_subagents_once(tmp_path, transcript_path)
+
+    assert start_bodies == {}
+    assert state.subagents == {}
 
 
 async def test_subagent_watcher_posts_external_subagent_start_for_new_meta(
@@ -11229,10 +11356,24 @@ async def test_subagent_item_drop_writes_dead_letter(
     assert "lost" not in json.dumps(row["attributes"])
 
 
+@pytest.mark.parametrize(
+    "tool_use_id,meta_extras,expected_tool_use_id",
+    [
+        ("toolu_dlstart", None, "toolu_dlstart"),
+        (None, {"name": "buddy", "taskKind": "in_process_teammate"}, "teammate:dlstart1"),
+    ],
+    ids=["task", "teammate"],
+)
 @pytest.mark.asyncio
-async def test_subagent_start_drop_writes_dead_letter(tmp_path: Path) -> None:
+async def test_subagent_start_drop_writes_dead_letter(
+    tmp_path: Path,
+    tool_use_id: str | None,
+    meta_extras: dict[str, Any] | None,
+    expected_tool_use_id: str,
+) -> None:
     """
-    A permanently-rejected sub-agent START is dead-lettered (#1120).
+    A permanently-rejected sub-agent START is dead-lettered (#1120) with the
+    payload that was posted, so a teammate's placeholder and kind survive replay.
 
     :param tmp_path: Pytest temp dir for the bridge dir and transcript.
     """
@@ -11246,8 +11387,10 @@ async def test_subagent_start_drop_writes_dead_letter(tmp_path: Path) -> None:
         subagent_id="dlstart1",
         agent_type="Explore",
         description="dead-letter start flow",
-        tool_use_id="toolu_dlstart",
+        tool_use_id=tool_use_id,
+        meta_extras=meta_extras,
     )
+    posted: list[dict[str, Any]] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
         """Permanently reject the sub-agent start POST.
@@ -11255,6 +11398,7 @@ async def test_subagent_start_drop_writes_dead_letter(tmp_path: Path) -> None:
         :param request: Request issued by the forwarder.
         :returns: Canned Omnigent response.
         """
+        posted.append(json.loads(request.content)["data"])
         return httpx.Response(400, json={"error": "nope"})
 
     async with httpx.AsyncClient(
@@ -11284,6 +11428,8 @@ async def test_subagent_start_drop_writes_dead_letter(tmp_path: Path) -> None:
     assert record["event_type"] == "external_subagent_start"
     assert record["payload"]["subagent_id"] == "dlstart1"
     assert record["payload"]["agent_type"] == "Explore"
+    assert record["payload"]["tool_use_id"] == expected_tool_use_id
+    assert record["payload"] == {**posted[-1], "parent_subagent_id": None}
 
 
 @pytest.mark.asyncio

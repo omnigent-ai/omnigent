@@ -186,6 +186,15 @@ _CLAUDE_NATIVE_TOOL_USE_ID_LABEL_KEY = "omnigent.claude_native.tool_use_id"
 _CLAUDE_NATIVE_DESCRIPTION_LABEL_KEY = "omnigent.claude_native.description"
 
 
+_CLAUDE_NATIVE_SUBAGENT_NAME_LABEL_KEY = "omnigent.claude_native.subagent_name"
+
+
+_CLAUDE_NATIVE_TASK_KIND_LABEL_KEY = "omnigent.claude_native.task_kind"
+
+
+_CLAUDE_NATIVE_TEAMMATE_TASK_KIND = "in_process_teammate"
+
+
 _EXTERNAL_CODEX_SUBAGENT_START_TYPE: str = "external_codex_subagent_start"
 
 

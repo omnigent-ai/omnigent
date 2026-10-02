@@ -8,14 +8,30 @@ export const UI_MODE_TERMINAL_VALUE = "terminal";
 export const CLAUDE_NATIVE_SUBAGENT_WRAPPER = "claude-code-native-ui-subagent";
 /** Task-tool `description` forwarded onto that child row, e.g. `"wave-worker-696"`. */
 export const CLAUDE_NATIVE_DESCRIPTION_LABEL_KEY = "omnigent.claude_native.description";
+/** Name the lead gave the agent (`Agent({name})`), e.g. `"buddy"`; how the user addresses it. */
+export const CLAUDE_NATIVE_SUBAGENT_NAME_LABEL_KEY = "omnigent.claude_native.subagent_name";
+/** Claude's `taskKind` for the child; agent-teams teammates run in the lead's process. */
+export const CLAUDE_NATIVE_TASK_KIND_LABEL_KEY = "omnigent.claude_native.task_kind";
+export const CLAUDE_NATIVE_TEAMMATE_TASK_KIND = "in_process_teammate";
+/** Kind tag shown beside an in-process teammate in the Agents list and graph. */
+export const CLAUDE_TEAMMATE_BADGE_LABEL = "Teammate";
+
+/** Whether a child row tracks an in-process Claude agent-teams teammate. */
+export function isClaudeTeammateChild(labels: Record<string, string> | undefined): boolean {
+  return (
+    labels?.[WRAPPER_LABEL_KEY] === CLAUDE_NATIVE_SUBAGENT_WRAPPER &&
+    labels[CLAUDE_NATIVE_TASK_KIND_LABEL_KEY] === CLAUDE_NATIVE_TEAMMATE_TASK_KIND
+  );
+}
 
 /**
  * Human-readable label for a Claude Code sub-agent session.
  *
  * Its title is `"{agentType}:{subagentId}"` — a per-parent uniqueness key
- * ending in an opaque hex id, so neither half is worth rendering. The Task
- * description is what a human recognises; without one, the agent type's
- * trailing segment reads best, since plugin-namespaced types arrive as
+ * ending in an opaque hex id, so neither half is worth rendering. A named
+ * agent is addressed by that name, so it wins; otherwise the Task description
+ * is what a human recognises; without one, the agent type's trailing segment
+ * reads best, since plugin-namespaced types arrive as
  * `"rpw-published:debug-lead"`.
  *
  * @param labels - Session-scoped labels from the child row.
@@ -28,6 +44,8 @@ export function claudeNativeSubagentLabel(
   subAgentName: string | null | undefined,
 ): string | null {
   if (labels?.[WRAPPER_LABEL_KEY] !== CLAUDE_NATIVE_SUBAGENT_WRAPPER) return null;
+  const name = labels[CLAUDE_NATIVE_SUBAGENT_NAME_LABEL_KEY]?.trim();
+  if (name) return name;
   const description = labels[CLAUDE_NATIVE_DESCRIPTION_LABEL_KEY]?.trim();
   if (description) return description;
   const agentType = subAgentName?.trim();
