@@ -1,13 +1,15 @@
-import { renderHook } from "@testing-library/react";
+import { renderHook, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   STARTING_GRACE_S,
+  STOPPED_STALE_ONLINE_GRACE_S,
   type LivenessRow,
   livenessRowFromSession,
   useSessionLiveness,
 } from "./useSessionLiveness";
 import { useSessionHostOnline, useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
 import type { Session } from "@/lib/types";
+import { markSessionStopped, useStoppedSessions } from "@/store/stoppedSessions";
 
 // Drive the two split signals directly so the test pins the derivation
 // truth table, not the provider plumbing (covered by its own test).
@@ -57,6 +59,7 @@ function derive(
 describe("useSessionLiveness — derivation truth table", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    useStoppedSessions.setState({ stoppedAt: {} });
   });
 
   it("online whenever the runner tunnel is up, regardless of host", () => {
@@ -306,6 +309,84 @@ describe("useSessionLiveness — derivation truth table", () => {
       hostMock.mockReturnValue(false);
       rerender();
       expect(result.current).toEqual({ kind: "host_offline", isOwner: true });
+    });
+  });
+
+  describe('explicit stop (the kebab\'s confirmed "Stop session")', () => {
+    it("stopped — not the silent runner_asleep — once the stop is confirmed", () => {
+      markSessionStopped(SID);
+      expect(derive(false, true, conv({ host_id: "h1" }))).toEqual({ kind: "stopped" });
+    });
+
+    it("stopped wins over a stale-online poll read within the grace", () => {
+      markSessionStopped(SID);
+      expect(derive(true, true, conv({ host_id: "h1" }))).toEqual({ kind: "stopped" });
+    });
+
+    it("a genuine relaunch (online past the grace) clears the marker", async () => {
+      useStoppedSessions.setState({
+        stoppedAt: { [SID]: Date.now() - (STOPPED_STALE_ONLINE_GRACE_S + 1) * 1000 },
+      });
+      expect(derive(true, true, conv({ host_id: "h1" }))).toEqual({ kind: "online" });
+      await waitFor(() => expect(useStoppedSessions.getState().stoppedAt[SID]).toBeUndefined());
+    });
+
+    it("a just-sent turn upgrades stopped to starting (the relaunch is visible)", () => {
+      markSessionStopped(SID);
+      expect(derive(false, true, conv({ host_id: "h1" }), { turnActive: true })).toEqual({
+        kind: "starting",
+      });
+    });
+
+    it("a confirmed-dead host still outranks the stop marker", () => {
+      markSessionStopped(SID);
+      expect(derive(false, false, conv({ host_id: "h1" }))).toEqual({
+        kind: "host_offline",
+        isOwner: true,
+      });
+    });
+
+    it("the marker is per-session — other sessions are unaffected", () => {
+      markSessionStopped("some-other-session");
+      expect(derive(false, true, conv({ host_id: "h1" }))).toEqual({ kind: "runner_asleep" });
+    });
+
+    it("a fresh stop stays visible while its own turn is still streaming (turnActive does not clear it)", () => {
+      // The turn a user stops is itself `streaming`, so `turnActive` is true at
+      // the instant of the stop and the poll can still read stale-online. That
+      // must not be mistaken for a relaunch and erase the marker before the
+      // stopped banner renders.
+      markSessionStopped(SID);
+      expect(derive(true, true, conv({ host_id: "h1" }), { turnActive: true })).toEqual({
+        kind: "stopped",
+      });
+      expect(useStoppedSessions.getState().stoppedAt[SID]).toBeDefined();
+    });
+
+    it("a just-created session that was stopped reads stopped, not the cold-boot grace", () => {
+      markSessionStopped(SID);
+      expect(derive(false, true, conv({ host_id: "h1", created_at: freshCreatedAt() }))).toEqual({
+        kind: "stopped",
+      });
+    });
+
+    it("the cold-boot grace still applies to a fresh session with no stop marker", () => {
+      expect(derive(false, true, conv({ host_id: "h1", created_at: freshCreatedAt() }))).toEqual({
+        kind: "starting",
+      });
+    });
+
+    it("a stop marker outranks the host-switch launch grace", () => {
+      markSessionStopped(SID);
+      expect(derive(false, true, conv({ host_id: "h1" }), { launchedAt: Date.now() })).toEqual({
+        kind: "stopped",
+      });
+    });
+
+    it("the host-switch launch grace still applies with no stop marker", () => {
+      expect(derive(false, true, conv({ host_id: "h1" }), { launchedAt: Date.now() })).toEqual({
+        kind: "starting",
+      });
     });
   });
 
