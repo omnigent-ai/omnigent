@@ -183,6 +183,8 @@ class ServerInfoResponse(BaseModel):
     harness_install_enabled: bool
     installable_harnesses: list[str]
     dictation_available: bool
+    # The archive PATCH accepts ``delete_worktree``; older servers reject it.
+    archive_worktree_cleanup: bool = True
     branding: BrandingInfo
 
 
@@ -2976,6 +2978,7 @@ def create_app(
                 "harness_install_enabled": harness_install_enabled,
                 "installable_harnesses": installable_harnesses,
                 "dictation_available": dictation_available,
+                "archive_worktree_cleanup": True,
                 "branding": branding_snapshot.config(),
             }
         )

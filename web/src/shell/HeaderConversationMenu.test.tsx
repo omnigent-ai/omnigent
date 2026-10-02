@@ -8,6 +8,8 @@ import type * as UnseenConversationsModule from "@/hooks/useUnseenConversations"
 import type * as UseFileContentModule from "@/hooks/useFileContent";
 import type * as SessionsApiModule from "@/lib/sessionsApi";
 import { setOmnigentHostConfig } from "@/lib/host";
+import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
+import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
 import { USER_SESSION_TITLE_MAX_CHARS } from "@/lib/sessionTitles";
 import { DropdownMenuItem } from "@/components/ui/dropdown-menu";
 import { HeaderConversationMenu } from "./HeaderConversationMenu";
@@ -95,17 +97,19 @@ function menuTree(overrides: Partial<Parameters<typeof HeaderConversationMenu>[0
   const queryClient = new QueryClient();
   return (
     <QueryClientProvider client={queryClient}>
-      <MemoryRouter initialEntries={[`/c/${overrides.conversation?.id ?? CONVERSATION.id}`]}>
-        <HeaderConversationMenu
-          conversation={CONVERSATION}
-          currentProject={null}
-          canShare
-          canFork
-          onShare={() => {}}
-          onFork={mocks.fork}
-          {...overrides}
-        />
-      </MemoryRouter>
+      <CapabilitiesProvider info={{ ...FALLBACK_SERVER_INFO, archive_worktree_cleanup: true }}>
+        <MemoryRouter initialEntries={[`/c/${overrides.conversation?.id ?? CONVERSATION.id}`]}>
+          <HeaderConversationMenu
+            conversation={CONVERSATION}
+            currentProject={null}
+            canShare
+            canFork
+            onShare={() => {}}
+            onFork={mocks.fork}
+            {...overrides}
+          />
+        </MemoryRouter>
+      </CapabilitiesProvider>
     </QueryClientProvider>
   );
 }

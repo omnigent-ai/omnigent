@@ -4820,6 +4820,11 @@
             "title": "Accounts Enabled",
             "type": "boolean"
           },
+          "archive_worktree_cleanup": {
+            "default": true,
+            "title": "Archive Worktree Cleanup",
+            "type": "boolean"
+          },
           "branding": {
             "$ref": "#/components/schemas/BrandingInfo"
           },

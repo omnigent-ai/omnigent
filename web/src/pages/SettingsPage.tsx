@@ -1083,6 +1083,8 @@ function AppearanceSection() {
 
 /** Git behavior settings. */
 function GitSection() {
+  const info = useServerInfo();
+  const archiveWorktreeCleanup = info !== "loading" && info.archive_worktree_cleanup === true;
   return (
     <Section title="Git" description="Configure how Omnigent works with Git.">
       <div className="flex flex-col gap-3">
@@ -1092,9 +1094,11 @@ function GitSection() {
           <div className="mt-4 border-t border-border pt-4">
             <DefaultBaseBranchControl />
           </div>
-          <div className="mt-4 border-t border-border pt-4">
-            <DeleteWorktreesOnArchiveControl />
-          </div>
+          {archiveWorktreeCleanup && (
+            <div className="mt-4 border-t border-border pt-4">
+              <DeleteWorktreesOnArchiveControl />
+            </div>
+          )}
         </div>
       </div>
     </Section>

@@ -11,6 +11,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import type { Conversation } from "@/hooks/useConversations";
+import { useServerInfo } from "@/lib/CapabilitiesContext";
 import {
   readDeleteWorktreesOnArchive,
   writeDeleteWorktreesOnArchive,
@@ -29,20 +30,23 @@ interface PendingPrompt {
  *
  * `requestArchive` proceeds immediately when no session has a worktree or the
  * user has already chosen; otherwise it opens the returned `dialog`, which the
- * caller must render. Dismissing the dialog cancels the archive.
+ * caller must render. Dismissing the dialog cancels the archive. Servers that
+ * predate worktree cleanup always archive only.
  */
 export function useArchiveWorktreePrompt(): {
   requestArchive: (conversations: readonly Conversation[], proceed: ProceedFn) => void;
   dialog: ReactNode;
 } {
   const [pending, setPending] = useState<PendingPrompt | null>(null);
+  const serverInfo = useServerInfo();
+  const cleanupSupported = serverInfo !== "loading" && serverInfo.archive_worktree_cleanup === true;
 
   const requestArchive = useCallback(
     (conversations: readonly Conversation[], proceed: ProceedFn) => {
       const worktreeIds = new Set(
         conversations.filter((c) => c.git_branch != null).map((c) => c.id),
       );
-      if (worktreeIds.size === 0) {
+      if (!cleanupSupported || worktreeIds.size === 0) {
         proceed(new Set());
         return;
       }
@@ -56,7 +60,7 @@ export function useArchiveWorktreePrompt(): {
         choose: (deleteWorktrees) => proceed(deleteWorktrees ? worktreeIds : new Set()),
       });
     },
-    [],
+    [cleanupSupported],
   );
 
   const dialog = (
@@ -123,11 +127,13 @@ function ArchiveWorktreeDialog({
                 componentId="archive.worktree_prompt.remember"
               />
               <label htmlFor={checkboxId} className="cursor-pointer text-ui">
-                Don't show this again
+                Remember my choice
               </label>
             </div>
             <p className="pl-6 text-sm text-muted-foreground">
-              You can change this any time in Settings › Git.
+              {remember
+                ? "The button you pick becomes your setting. Change it any time in Settings › Git."
+                : "You can change this any time in Settings › Git."}
             </p>
           </div>
           <DialogFooter className="border-t-0 bg-transparent">

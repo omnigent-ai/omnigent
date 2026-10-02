@@ -24,6 +24,8 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { TooltipProvider } from "@/components/ui/tooltip";
+import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
+import { FALLBACK_SERVER_INFO, type ServerInfo } from "@/lib/capabilities";
 
 // Controllable archive + stop mutations, declared via vi.hoisted so the
 // vi.mock factory can reference them.
@@ -66,18 +68,22 @@ function mockConversations(conversations: Conversation[]) {
   useConvMock.mockImplementation(() => result);
 }
 
-function renderSidebar() {
+const CLEANUP_SERVER: ServerInfo = { ...FALLBACK_SERVER_INFO, archive_worktree_cleanup: true };
+
+function renderSidebar(serverInfo: ServerInfo = CLEANUP_SERVER) {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
     <QueryClientProvider client={qc}>
-      <SidebarDataProvider>
-        <TooltipProvider>
-          <MemoryRouter initialEntries={["/"]}>
-            <Sidebar open={true} onClose={vi.fn()} />
-            <Toaster />
-          </MemoryRouter>
-        </TooltipProvider>
-      </SidebarDataProvider>
+      <CapabilitiesProvider info={serverInfo}>
+        <SidebarDataProvider>
+          <TooltipProvider>
+            <MemoryRouter initialEntries={["/"]}>
+              <Sidebar open={true} onClose={vi.fn()} />
+              <Toaster />
+            </MemoryRouter>
+          </TooltipProvider>
+        </SidebarDataProvider>
+      </CapabilitiesProvider>
     </QueryClientProvider>,
   );
 }
@@ -205,7 +211,7 @@ describe("archive worktree prompt", () => {
       archived: true,
       deleteWorktree: true,
     });
-    // Without "Don't show this again" the choice isn't remembered.
+    // Without "Remember my choice" the answer isn't remembered.
     expect(localStorage.getItem(PREF_KEY)).toBeNull();
   });
 
@@ -236,6 +242,22 @@ describe("archive worktree prompt", () => {
 
     expect(screen.queryByTestId("archive-worktree-dialog")).not.toBeInTheDocument();
     expect(mocks.archive.mutate).not.toHaveBeenCalled();
+  });
+
+  it("archives only, without prompting, on a server without worktree cleanup", () => {
+    // Older servers reject the unknown `delete_worktree` field, so even a saved
+    // opt-in must not send it.
+    localStorage.setItem(PREF_KEY, "true");
+    mockConversations([WORKTREE_CONV]);
+    renderSidebar(FALLBACK_SERVER_INFO);
+    clickArchive();
+
+    expect(screen.queryByTestId("archive-worktree-dialog")).not.toBeInTheDocument();
+    expect(mocks.archive.mutate).toHaveBeenCalledWith({
+      id: "conv_1",
+      archived: true,
+      deleteWorktree: false,
+    });
   });
 
   it("applies a saved preference without prompting", () => {
