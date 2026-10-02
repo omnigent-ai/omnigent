@@ -280,6 +280,32 @@ def test_runner_env_preserves_claude_tool_search_flags() -> None:
     assert {name: env.get(name) for name in _CLAUDE_TOOL_SEARCH_ENV} == _CLAUDE_TOOL_SEARCH_ENV
 
 
+@pytest.mark.parametrize("server_url", [None, _REMOTE_SERVER_URL])
+def test_host_daemon_env_defaults_pythonutf8_on(
+    monkeypatch: pytest.MonkeyPatch,
+    server_url: str | None,
+) -> None:
+    """The host daemon defaults to UTF-8 for status output."""
+    monkeypatch.delenv("PYTHONUTF8", raising=False)
+
+    env = _build_host_daemon_env(server_url=server_url)
+
+    assert env.get("PYTHONUTF8") == "1"
+
+
+@pytest.mark.parametrize("server_url", [None, _REMOTE_SERVER_URL])
+def test_host_daemon_env_keeps_explicit_pythonutf8(
+    monkeypatch: pytest.MonkeyPatch,
+    server_url: str | None,
+) -> None:
+    """An explicit UTF-8 mode remains authoritative."""
+    monkeypatch.setenv("PYTHONUTF8", "0")
+
+    env = _build_host_daemon_env(server_url=server_url)
+
+    assert env.get("PYTHONUTF8") == "0"
+
+
 # The gcloud ADC auth selectors the Antigravity CLI (agy) reads. Non-secret
 # selectors/paths (the ADC file *contains* the credential; the vars just point
 # at it), so they ride the allowlists like KUBECONFIG rather than the

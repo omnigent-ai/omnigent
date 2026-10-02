@@ -423,3 +423,32 @@ def test_shell_command_does_not_see_omnigent_project_root(
     out = result.get("stdout", "")
     assert project_entry in out
     assert str(_project_root()) not in out
+
+
+def test_helper_windows_config_delivery_without_active_sandbox(tmp_path: Path) -> None:
+    """Windows config delivery must create its own scratch directory."""
+    from unittest import mock
+
+    from omnigent.inner import os_env as os_env_mod
+    from omnigent.inner.sandbox import resolve_sandbox
+
+    spec = OSEnvSpec(sandbox=OSEnvSandboxSpec(type="none"))
+    sandbox = resolve_sandbox(spec, tmp_path)
+    assert not sandbox.active
+
+    client = os_env_mod._HelperProcessClient(
+        cwd=tmp_path,
+        shell_path=shutil.which("sh") or "/bin/sh",
+        sandbox=sandbox,
+    )
+    try:
+        with mock.patch.object(os_env_mod, "IS_WINDOWS", True):
+            result = client.request({"op": "shell", "command": "echo tmpdir-ok", "timeout": 30})
+        assert not result.get("error"), result
+        assert "tmpdir-ok" in result.get("stdout", "")
+        created = client._tmpdir
+        assert created is not None and created.exists()
+    finally:
+        client.close()
+    assert client._tmpdir is None
+    assert not created.exists()
