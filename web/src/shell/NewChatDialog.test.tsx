@@ -6539,6 +6539,7 @@ describe("NewChatLandingScreen", () => {
     // connect-host proves the menu actually opened — without it, a closed
     // menu would make the absence assertion below pass vacuously.
     expect(screen.getByTestId("new-chat-landing-connect-host")).toBeTruthy();
+    expect(screen.getByText("My machines")).toBeTruthy();
     expect(screen.queryByTestId("new-chat-landing-sandbox-option")).toBeNull();
   });
 
