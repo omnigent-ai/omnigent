@@ -36,6 +36,7 @@ from omnigent.entities import Conversation
 from omnigent.host.connect import HostProcess
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
+    HOST_AUTH_EXPIRED_ERROR_CODE,
     WORKSPACE_MISSING_ERROR_CODE,
     HostHelloFrame,
     HostLaunchRunnerFrame,
@@ -721,6 +722,10 @@ _HARNESS_REFUSAL = (
     "harness 'codex' is not configured on host 'laptop' — run `omnigent setup` on that machine"
 )
 _WORKSPACE_MISSING_ERROR = "workspace path does not exist: /deleted/worktree"
+_HOST_AUTH_REFUSAL = (
+    "This host's sign-in to the server expired or was revoked, so it cannot start agents. "
+    "Run `omnigent login https://example.com` on the host machine, then send your message again."
+)
 
 
 async def test_inline_create_harness_not_configured_stays_lenient(
@@ -817,6 +822,13 @@ async def test_inline_create_harness_not_configured_stays_lenient(
             WORKSPACE_MISSING_ERROR_CODE,
             "workspace path does not exist: /work/repo",
             ("workspace path does not exist", "/work/repo"),
+            None,
+        ),
+        (
+            HOST_AUTH_EXPIRED_ERROR_CODE,
+            HOST_AUTH_EXPIRED_ERROR_CODE,
+            _HOST_AUTH_REFUSAL,
+            ("sign-in to the server expired", "omnigent login"),
             None,
         ),
         (
@@ -920,6 +932,7 @@ async def test_message_relaunch_deterministic_failure_persists_error_turn(
     expected_category = {
         HARNESS_NOT_CONFIGURED_ERROR_CODE: "config",
         WORKSPACE_MISSING_ERROR_CODE: "user",
+        HOST_AUTH_EXPIRED_ERROR_CODE: "config",
     }.get(launch_error_code or "")
     assert refusal.attributes.get("error_category") == expected_category
     assert refusal.attributes["error_impact"] == "blocking"
@@ -2877,6 +2890,7 @@ async def test_retry_session_single_flight_evicts_after_only_waiter_cancelled(
     [
         ("workspace_missing", _WORKSPACE_MISSING_ERROR, 410),
         ("harness_not_configured", _HARNESS_REFUSAL, 412),
+        ("host_auth_expired", _HOST_AUTH_REFUSAL, 412),
     ],
 )
 async def test_retry_session_host_refusal_is_typed_and_does_not_persist(

@@ -146,6 +146,23 @@ _GRACEFUL_SHUTDOWN_CLOSE_TIMEOUT_S = 5.0
 # cancelled — a stuck stream must not wedge shutdown forever.
 _GRACEFUL_SHUTDOWN_DRAIN_TIMEOUT_S = 5.0
 RUNNER_TUNNEL_REJECTION_PREFIX = "runner tunnel rejected by server "
+# The fatal credential rejections below (not the frame-protocol close-code one).
+_RUNNER_TUNNEL_AUTH_REJECTIONS = (
+    f"{RUNNER_TUNNEL_REJECTION_PREFIX}(HTTP 401",
+    f"{RUNNER_TUNNEL_REJECTION_PREFIX}(HTTP 403",
+    f"{RUNNER_TUNNEL_REJECTION_PREFIX}(redirect to non-WebSocket URL",
+)
+
+
+def is_runner_tunnel_auth_rejection(text: str) -> bool:
+    """Whether a runner's exit output names a fatal tunnel credential rejection.
+
+    :param text: Runner exit error or log tail, e.g. ``"... runner tunnel
+        rejected by server (HTTP 403 persisted across 3 attempts); ..."``.
+    :returns: ``True`` when the server refused the runner's credential.
+    """
+    return any(marker in text for marker in _RUNNER_TUNNEL_AUTH_REJECTIONS)
+
 
 # Schemes that, when surfaced through ``InvalidURI.uri``, indicate
 # the WebSocket upgrade request was redirected somewhere the

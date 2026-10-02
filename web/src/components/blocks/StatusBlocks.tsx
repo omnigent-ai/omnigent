@@ -76,6 +76,7 @@ const FAILURE_CODE_DESCRIPTIONS: Record<string, string> = {
   runner_error: "Something went wrong setting up the turn on the host.",
   runner_disconnected: "The connection to the host dropped unexpectedly.",
   runner_unavailable: "The session's runner isn't connected to the server.",
+  host_auth_expired: "The host's sign-in to the server expired, so it can't start the agent.",
   connection_error: "The connection to the agent dropped mid-turn.",
   context_length_exceeded: "The conversation grew past the model's context window.",
   executor_error: "The agent runtime hit an error while running the turn.",
@@ -102,6 +103,8 @@ const RETRYABLE_ERROR_CODES = new Set([
   "runner_disconnected",
   "runner_failed_to_start",
   "runner_unavailable",
+  // After signing in again on the host, a retry relaunches without a host restart.
+  "host_auth_expired",
   "rate_limit_exceeded",
   "transient_upstream_error",
 ]);

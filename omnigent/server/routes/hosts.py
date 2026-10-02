@@ -38,6 +38,7 @@ from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.harness_aliases import canonicalize_harness
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
+    HOST_AUTH_EXPIRED_ERROR_CODE,
     WORKSPACE_MISSING_ERROR_CODE,
     HostCreateDirFrame,
     HostDetectCredentialsFrame,
@@ -1109,6 +1110,13 @@ def create_hosts_router(
                 raise OmnigentError(
                     f"host failed to launch runner: {workspace_missing_message(workspace)}",
                     code=ErrorCode.WORKSPACE_MISSING,
+                )
+            if refusal_code == HOST_AUTH_EXPIRED_ERROR_CODE:
+                # The host's own sign-in was refused; its text is the remedy.
+                raise OmnigentError(
+                    "host failed to launch runner: "
+                    f"{result.get('error') or 'host sign-in expired'}",
+                    code=ErrorCode.HOST_AUTH_EXPIRED,
                 )
             raise HTTPException(
                 status_code=502,

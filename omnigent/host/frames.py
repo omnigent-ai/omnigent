@@ -43,6 +43,10 @@ HARNESS_NOT_CONFIGURED_ERROR_CODE = "harness_not_configured"
 # daemon (producer) and server (consumer) so both can handle it structurally.
 WORKSPACE_MISSING_ERROR_CODE = "workspace_missing"
 
+# when the host refuses a launch because the server rejected its own sign-in:
+# a spawned runner would inherit the dead credential and be refused too.
+HOST_AUTH_EXPIRED_ERROR_CODE = "host_auth_expired"
+
 # Capability tokens a host advertises in ``HostHelloFrame.capabilities``. A token
 # is present only in builds that have the feature, so the server gates on
 # presence — no host-version table to maintain, and a build that lacks the
@@ -90,13 +94,16 @@ def classify_launch_refusal(
     :param error: The host's human-readable failure text.
     :param workspace: The server's authorized workspace for the session.
     :returns: :data:`HARNESS_NOT_CONFIGURED_ERROR_CODE`,
-        :data:`WORKSPACE_MISSING_ERROR_CODE`, or ``None`` when the failure
+        :data:`WORKSPACE_MISSING_ERROR_CODE`,
+        :data:`HOST_AUTH_EXPIRED_ERROR_CODE`, or ``None`` when the failure
         is not a safe categorical refusal.
     """
     if error_code == HARNESS_NOT_CONFIGURED_ERROR_CODE:
         return HARNESS_NOT_CONFIGURED_ERROR_CODE
     if error_code == WORKSPACE_MISSING_ERROR_CODE:
         return WORKSPACE_MISSING_ERROR_CODE
+    if error_code == HOST_AUTH_EXPIRED_ERROR_CODE:
+        return HOST_AUTH_EXPIRED_ERROR_CODE
     # Rolling upgrade: an older host sends this exact categorical reason
     # with no error_code.
     if error_code is None and error == workspace_missing_message(workspace):

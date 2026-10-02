@@ -16,6 +16,7 @@ from httpx import ASGITransport, AsyncClient
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
+    HOST_AUTH_EXPIRED_ERROR_CODE,
     WORKSPACE_MISSING_ERROR_CODE,
     HostHelloFrame,
     HostLaunchRunnerResultFrame,
@@ -640,6 +641,13 @@ async def test_launch_runner_happy_path(
             410,
             WORKSPACE_MISSING_ERROR_CODE,
             "workspace path does not exist: /tmp/test-workspace",
+        ),
+        (
+            HOST_AUTH_EXPIRED_ERROR_CODE,
+            "This host's sign-in to the server expired — run `omnigent login`",
+            412,
+            HOST_AUTH_EXPIRED_ERROR_CODE,
+            "omnigent login",
         ),
     ],
 )

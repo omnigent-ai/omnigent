@@ -203,6 +203,10 @@ class ErrorCode:
         exists on the selected host (HTTP 410). Retrying cannot recreate
         deleted workspace state; the user must start a session in a valid
         workspace.
+    :cvar HOST_AUTH_EXPIRED: The selected host's own sign-in to the server
+        was rejected or can no longer be renewed, so no runner it spawns can
+        connect (HTTP 412). Retrying cannot succeed until the user signs in
+        again on the host machine.
     :cvar SESSION_AGENT_MISSING: The session's bound agent no longer
         resolves — its stored bundle was deleted or rebound out from under
         an active session (HTTP 410). A session-lifecycle condition, not a
@@ -242,6 +246,8 @@ class ErrorCode:
     # the host's wire error code passes through as the API error code.
     HARNESS_NOT_CONFIGURED = "harness_not_configured"
     WORKSPACE_MISSING = "workspace_missing"
+    # Keep the string equal to frames.HOST_AUTH_EXPIRED_ERROR_CODE.
+    HOST_AUTH_EXPIRED = "host_auth_expired"
     SESSION_AGENT_MISSING = "session_agent_missing"
     UPSTREAM_CANCELLED = "upstream_cancelled"
     STALE_CURSOR = "stale_cursor"
@@ -275,6 +281,10 @@ _CODE_TO_HTTP_STATUS: dict[str, int] = {
     # neither a 400 (input is fine) nor a 503 (a retry won't help).
     ErrorCode.HARNESS_NOT_CONFIGURED: 412,
     ErrorCode.WORKSPACE_MISSING: 410,
+    # 412, like HARNESS_NOT_CONFIGURED: the request is valid, but the host
+    # cannot serve it until the user signs in again there. Not 401, which
+    # would read as the caller's own session being unauthenticated.
+    ErrorCode.HOST_AUTH_EXPIRED: 412,
     # 410 Gone, like WORKSPACE_MISSING: a valid request whose bound agent was
     # deleted; a retry cannot recreate it.
     ErrorCode.SESSION_AGENT_MISSING: 410,
@@ -314,6 +324,8 @@ _CODE_TO_CATEGORY: dict[str, ErrorCategory] = {
     ErrorCode.HARNESS_NOT_CONFIGURED: ErrorCategory.CONFIG,
     # The human deleted their own workspace on the host.
     ErrorCode.WORKSPACE_MISSING: ErrorCategory.USER,
+    # The host machine's credential is expired or revoked.
+    ErrorCode.HOST_AUTH_EXPIRED: ErrorCategory.CONFIG,
     # The session's agent was deleted or rebound; the caller must recreate the
     # agent or start a new session. Not a runner/server fault.
     ErrorCode.SESSION_AGENT_MISSING: ErrorCategory.USER,
@@ -350,6 +362,7 @@ _CODE_TO_IMPACT: dict[str, ErrorImpact] = {
     ErrorCode.RUNNER_CAPABILITY_MISMATCH: ErrorImpact.BLOCKING,
     ErrorCode.HARNESS_NOT_CONFIGURED: ErrorImpact.BLOCKING,
     ErrorCode.WORKSPACE_MISSING: ErrorImpact.BLOCKING,
+    ErrorCode.HOST_AUTH_EXPIRED: ErrorImpact.BLOCKING,
     ErrorCode.SESSION_AGENT_MISSING: ErrorImpact.BLOCKING,
     # Self-healing: a session state that resumes on reconnect, a routing
     # artifact the client re-addresses, and an upstream cancellation a retry
@@ -395,6 +408,7 @@ _CODE_TO_PHASE: dict[str, ErrorPhase] = {
     ErrorCode.RUNNER_CAPABILITY_MISMATCH: ErrorPhase.RUNNER_LAUNCH,
     ErrorCode.HARNESS_NOT_CONFIGURED: ErrorPhase.HARNESS_SETUP,
     ErrorCode.WORKSPACE_MISSING: ErrorPhase.HARNESS_SETUP,
+    ErrorCode.HOST_AUTH_EXPIRED: ErrorPhase.RUNNER_LAUNCH,
     ErrorCode.SESSION_AGENT_MISSING: ErrorPhase.HARNESS_SETUP,
     ErrorCode.HARNESS_PROTOCOL_VIOLATION: ErrorPhase.TURN,
     ErrorCode.INTERNAL_ERROR: ErrorPhase.UNKNOWN,

@@ -8,6 +8,7 @@ import pytest
 
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
+    HOST_AUTH_EXPIRED_ERROR_CODE,
     WORKSPACE_MISSING_ERROR_CODE,
     HostConnectionErrorFrame,
     HostCreateDirFrame,
@@ -2238,6 +2239,7 @@ def test_fs_result_null_payload_round_trip() -> None:
     [
         (HARNESS_NOT_CONFIGURED_ERROR_CODE, "any text", HARNESS_NOT_CONFIGURED_ERROR_CODE),
         (WORKSPACE_MISSING_ERROR_CODE, "any text", WORKSPACE_MISSING_ERROR_CODE),
+        (HOST_AUTH_EXPIRED_ERROR_CODE, "any text", HOST_AUTH_EXPIRED_ERROR_CODE),
         # Rolling upgrade: an older host sends the reason with no code.
         (None, "workspace path does not exist: /w", WORKSPACE_MISSING_ERROR_CODE),
         # Uncategorized failures stay generic, however they are worded.
@@ -2250,7 +2252,7 @@ def test_fs_result_null_payload_round_trip() -> None:
 def test_classify_launch_refusal(
     error_code: str | None, error: str | None, expected: str | None
 ) -> None:
-    """Only the two categorical refusals classify; everything else is generic."""
+    """Only the categorical refusals classify; everything else is generic."""
     assert classify_launch_refusal(error_code, error, "/w") == expected
 
 

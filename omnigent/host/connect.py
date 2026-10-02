@@ -22,7 +22,7 @@ import threading
 import time
 from collections import OrderedDict
 from collections.abc import Callable, Iterable, Iterator, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, SupportsIndex, SupportsInt, TypeVar, cast
 
@@ -60,6 +60,7 @@ from omnigent.host import HOST_FATAL_EXIT_CODE
 from omnigent.host.daemon_lifecycle import DaemonLifecycleLock
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
+    HOST_AUTH_EXPIRED_ERROR_CODE,
     HOST_CAPABILITIES,
     WORKSPACE_MISSING_ERROR_CODE,
     HostConnectionErrorFrame,
@@ -384,6 +385,25 @@ def _runner_exit_error(exit_code: int | None, log_path: Path) -> str:
     return message
 
 
+def _credential_cache_stamp() -> tuple[float | None, ...]:
+    """Modification times of the credential caches a re-login rewrites.
+
+    Covers the stored ``omnigent login`` record and the Databricks CLI token
+    cache, which both the host and a separate ``databricks auth login`` share.
+
+    :returns: One mtime per cache, ``None`` for a missing file.
+    """
+    from omnigent.cli_auth import _token_file_path
+
+    stamps: list[float | None] = []
+    for path in (_token_file_path(), Path.home() / ".databricks" / "token-cache.json"):
+        try:
+            stamps.append(path.stat().st_mtime)
+        except OSError:
+            stamps.append(None)
+    return tuple(stamps)
+
+
 def _url_is_loopback(url: str) -> bool:
     """Whether ``url``'s host is loopback (``127.0.0.1`` / ``localhost`` / ``::1``).
 
@@ -453,6 +473,10 @@ _RECYCLE_PROMPT_MAX_STREAK = 10
 # Fresh hosts get a short auth-retry window for Databricks OAuth refreshes.
 # Established hosts retry auth failures indefinitely to preserve sessions.
 _MAX_CONSECUTIVE_AUTH_ERRORS = 3
+# After the server refuses the host's credential, re-read the shared
+# credential caches at most this often unless a cache file changes (a
+# re-login rewrites it, which triggers an immediate retry).
+_AUTH_RECOVERY_RETRY_S = 60.0
 # Consecutive connection-refused failures against a loopback server before the
 # host exits (~5 minutes at the backoff cap). Refused on loopback means no
 # process listens on the port — the local server is gone, not unreachable.
@@ -1058,6 +1082,8 @@ class _RunnerHandle:
         ``None`` disables the watchdog.
     :param stop_requested: Suppress diagnostics for intentional stops
         or superseded launches, even after the exit watcher pops them.
+    :param bootstrap_token: Host bearer injected into the runner, or
+        ``None``; marked rejected if the runner dies on a tunnel auth refusal.
     """
 
     proc: subprocess.Popen[bytes] | ZygoteRunnerProc
@@ -1065,6 +1091,7 @@ class _RunnerHandle:
     session_id: str | None = None
     connect_marker: Path | None = None
     stop_requested: bool = False
+    bootstrap_token: str | None = field(default=None, repr=False)
 
 
 class HostRetryableConnectionError(Exception):
@@ -1127,6 +1154,16 @@ class HostProcess:
         # to retry credential discovery.
         self._auth_token_factory: Callable[[], str | None] | None = None
         self._auth_token_factory_resolved = False
+        # Set once the server refused this host's credential (its own upgrade
+        # or a runner's): launches then re-resolve from the shared credential
+        # caches instead of handing runners the rejected bearer.
+        self._auth_expired = False
+        self._rejected_auth_token: str | None = None
+        self._last_connect_auth_token: str | None = None
+        self._auth_retry_after = 0.0
+        self._auth_cache_stamp: tuple[float | None, ...] = ()
+        # Launches (worker threads) and reconnects can re-resolve at once.
+        self._auth_reresolve_lock = threading.Lock()
         # This host's owning user, resolved once after the first accepted tunnel
         # upgrade (GET /v1/me). Injected into every runner it spawns and published
         # to OMNIGENT_USER_ID so host/runner debug-log rows carry it. None until
@@ -1548,6 +1585,7 @@ class HostProcess:
         if status == 404:
             return self._classify_transient_404()
         if status in (401, 403):
+            self._note_auth_rejected(self._last_connect_auth_token, source="host_tunnel")
             # Fresh hosts can race OAuth refresh; connected hosts preserve active sessions.
             self._auth_retry_streak += 1
             cause = f"Connection refused (HTTP {status}): the host tunnel was rejected."
@@ -1840,10 +1878,15 @@ class HostProcess:
             )
 
         runner_id = token_bound_runner_id(frame.binding_token)
-        initial_auth_token = await asyncio.to_thread(
-            self._current_auth_token,
-            initialize=False,
-        )
+        initial_auth_token, auth_usable = await asyncio.to_thread(self._launch_auth_token)
+        if not auth_usable:
+            # The runner would inherit the refused credential and die on its
+            # tunnel upgrade; say so instead of spawning it.
+            return self._launch_failed(
+                frame,
+                self._auth_expired_message(),
+                error_code=HOST_AUTH_EXPIRED_ERROR_CODE,
+            )
         env = _build_runner_env(
             os.environ,
             server_url=self._server_url,
@@ -1958,6 +2001,7 @@ class HostProcess:
             log_path=log_path,
             session_id=frame.session_id or None,
             connect_marker=_connect_marker_path(log_path),
+            bootstrap_token=initial_auth_token,
         )
         watcher = asyncio.create_task(self._watch_runner(runner_id))
         self._watcher_tasks.add(watcher)
@@ -2373,9 +2417,12 @@ class HostProcess:
             await self._report_runner_exit(runner_id, error)
             return
         error = _runner_exit_error(handle.proc.returncode, handle.log_path)
+        from omnigent.runner.transports.ws_tunnel.serve import is_runner_tunnel_auth_rejection
+
+        auth_rejected = is_runner_tunnel_auth_rejection(error)
         # A non-zero runner exit is a runner-process fault that blocks the
         # session; the specific cause lives in the unparsed log tail (lifecycle
-        # stage unknown).
+        # stage unknown) — unless the server refused the credential we gave it.
         _logger.warning(
             "Runner %s died unexpectedly: %s",
             runner_id,
@@ -2385,11 +2432,18 @@ class HostProcess:
                 session_id=handle.session_id,
                 stage="runner_process",
                 runner_id=runner_id,
-                error_category=ErrorCategory.RUNNER.value,
+                error_code=HOST_AUTH_EXPIRED_ERROR_CODE if auth_rejected else None,
+                error_category=(
+                    ErrorCategory.CONFIG.value if auth_rejected else ErrorCategory.RUNNER.value
+                ),
                 error_impact=ErrorImpact.BLOCKING.value,
-                error_phase=ErrorPhase.UNKNOWN.value,
+                error_phase=(
+                    ErrorPhase.RUNNER_LAUNCH.value if auth_rejected else ErrorPhase.UNKNOWN.value
+                ),
             ),
         )
+        if auth_rejected:
+            self._note_auth_rejected(handle.bootstrap_token, source="runner_tunnel")
         await self._report_runner_exit(runner_id, error)
 
     async def _watch_runner_connect(
@@ -4244,6 +4298,8 @@ class HostProcess:
         self._ever_connected = True
         self._login_redirect_streak = 0
         self._auth_retry_streak = 0
+        # The accepted upgrade proves the credential works.
+        self._clear_auth_expired()
         self._refused_streak = 0
         self._transient_404_streak = 0
         self._conn_upgrade_accepted = True
@@ -4355,7 +4411,13 @@ class HostProcess:
         if managed_token:
             headers[MANAGED_HOST_TOKEN_HEADER] = managed_token
             return headers
-        token = self._current_auth_token()
+        if self._auth_expired and self._auth_recovery_due():
+            # The cached context still holds the refused bearer; resolve again
+            # so a login done since then ends the reconnect loop.
+            token = self._reresolve_auth_token()
+        else:
+            token = self._current_auth_token()
+        self._last_connect_auth_token = token
         if token:
             headers["Authorization"] = f"Bearer {token}"
         return headers
@@ -4392,6 +4454,119 @@ class HostProcess:
         except Exception:  # noqa: BLE001
             _logger.debug("Could not obtain auth token", exc_info=True)
         return None
+
+    def _note_auth_rejected(self, token: str | None, *, source: str) -> None:
+        """Record that the server refused this host's credential.
+
+        :param token: The bearer the server refused, or ``None`` when the
+            refused connection carried none.
+        :param source: What was refused, ``"host_tunnel"`` or ``"runner_tunnel"``.
+        """
+        from omnigent.host.identity import HOST_TOKEN_ENV_VAR
+
+        if os.environ.get(HOST_TOKEN_ENV_VAR):
+            # Managed hosts authenticate with a launch token, not a user login.
+            return
+        first = not self._auth_expired
+        self._auth_expired = True
+        self._rejected_auth_token = token
+        self._auth_retry_after = time.monotonic() + _AUTH_RECOVERY_RETRY_S
+        self._auth_cache_stamp = _credential_cache_stamp()
+        if not first or source == "host_tunnel":
+            # A single upgrade 403 is often a VPN blip; the reconnect loop
+            # escalates its own warning if the refusals persist.
+            return
+        message = self._auth_expired_message()
+        _logger.warning(
+            "Server refused this host's credential (%s): %s",
+            source,
+            message,
+            extra=debug_event(
+                "host_auth_rejected",
+                stage=source,
+                error_code=HOST_AUTH_EXPIRED_ERROR_CODE,
+                error_category=ErrorCategory.CONFIG.value,
+                error_impact=ErrorImpact.BLOCKING.value,
+            ),
+        )
+        print(f"⚠ {message}", file=sys.stderr, flush=True)
+
+    def _clear_auth_expired(self) -> None:
+        """Forget a recorded credential refusal once a working bearer is back."""
+        if self._auth_expired:
+            _logger.info("Host credential works again; resuming runner launches")
+        self._auth_expired = False
+        self._rejected_auth_token = None
+
+    def _auth_recovery_due(self) -> bool:
+        """Whether to re-resolve credentials after a recorded refusal.
+
+        :returns: ``True`` once the retry interval passed or a credential
+            cache changed since the last attempt (a re-login elsewhere).
+        """
+        return (
+            time.monotonic() >= self._auth_retry_after
+            or _credential_cache_stamp() != self._auth_cache_stamp
+        )
+
+    def _reresolve_auth_token(self) -> str | None:
+        """Drop the cached auth context and resolve a bearer from scratch.
+
+        Blocking (may run the Databricks CLI), so call it off the event loop.
+        The new context reads the shared caches, so a login done in another
+        process is picked up without restarting the host.
+
+        :returns: The freshly resolved bearer, or ``None``.
+        """
+        with self._auth_reresolve_lock:
+            if not self._auth_recovery_due():
+                # Another thread re-resolved while this one waited.
+                return self._current_auth_token(initialize=False)
+            token: str | None = None
+            try:
+                from omnigent.runner._entry import _make_auth_token_factory
+
+                factory = _make_auth_token_factory(server_url=self._server_url)
+                # Swap in whole so a concurrent reader never sees an empty context.
+                self._auth_token_factory = factory
+                self._auth_token_factory_resolved = factory is not None
+                if factory is not None:
+                    token = factory()
+            except Exception:  # noqa: BLE001
+                _logger.debug("Could not re-resolve auth token", exc_info=True)
+            # Stamp after resolving: the resolution itself may rewrite a cache,
+            # which must not look like a new login on the next check.
+            self._auth_retry_after = time.monotonic() + _AUTH_RECOVERY_RETRY_S
+            self._auth_cache_stamp = _credential_cache_stamp()
+            return token
+
+    def _launch_auth_token(self) -> tuple[str | None, bool]:
+        """Resolve the bearer to hand a new runner; blocking, so call off-loop.
+
+        :returns: ``(token, usable)``. ``usable`` is ``False`` when the server
+            refused this host's credential and no different one is available,
+            so the launch must be refused instead of spawning a runner that
+            cannot connect.
+        """
+        token = self._current_auth_token(initialize=False)
+        if not self._auth_expired:
+            return token, True
+        if token is None or token == self._rejected_auth_token:
+            if not self._auth_recovery_due():
+                return None, False
+            token = self._reresolve_auth_token()
+        if token is None or token == self._rejected_auth_token:
+            return None, False
+        self._clear_auth_expired()
+        return token, True
+
+    def _auth_expired_message(self) -> str:
+        """The user-facing remedy for a refused host credential."""
+        return (
+            "This host's sign-in to the server expired or was revoked, so it cannot "
+            f"start agents. Run `{cli_invocation()} login {self._login_hint_url()}` on "
+            "the host machine, then send your message again."
+        )
 
     async def _serve_frames(self, ws: websockets.asyncio.client.ClientConnection) -> None:
         """Wait for bounded startup discovery, register, then service the connection."""

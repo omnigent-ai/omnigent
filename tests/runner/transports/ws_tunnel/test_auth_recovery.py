@@ -130,3 +130,27 @@ async def test_rejection_invalidates_off_loop_and_tolerates_refresh_failure(
     )
     assert attempts == 2
     assert provider.invalidations == 1
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        (
+            "runner exiting: runner tunnel rejected by server (HTTP 403 persisted across 3 "
+            "attempts); run `omnigent login https://ws.example.com/omnigent` to re-authenticate",
+            True,
+        ),
+        ("runner tunnel rejected by server (HTTP 401 persisted across 3 attempts)", True),
+        (
+            "runner tunnel rejected by server (redirect to non-WebSocket URL "
+            "https://login.example.com persisted across 3 attempts)",
+            True,
+        ),
+        # A frame-protocol refusal is not a credential problem.
+        ("runner tunnel rejected by server (close code 4400); check frame protocol", False),
+        ("runner process exited with code 1", False),
+    ],
+)
+def test_is_runner_tunnel_auth_rejection(text: str, expected: bool) -> None:
+    """The host recognizes a credential refusal from a dead runner's exit output."""
+    assert serve_module.is_runner_tunnel_auth_rejection(text) is expected

@@ -22,6 +22,7 @@ from websockets.http11 import Response
 
 from omnigent.host import HOST_FATAL_EXIT_CODE
 from omnigent.host.connect import (
+    _AUTH_RECOVERY_RETRY_S,
     HostConnectError,
     HostProcess,
     HostRetryableConnectionError,
@@ -33,6 +34,7 @@ from omnigent.host.connect import (
 )
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
+    HOST_AUTH_EXPIRED_ERROR_CODE,
     WORKSPACE_MISSING_ERROR_CODE,
     HostConnectionErrorFrame,
     HostCreateDirFrame,
@@ -84,6 +86,7 @@ from omnigent.runner.identity import (
     RUNNER_WORKSPACE_ENV_VAR,
     token_bound_runner_id,
 )
+from omnigent.runner.transports.ws_tunnel.serve import RUNNER_TUNNEL_REJECTION_PREFIX
 from omnigent.runtime.harnesses.paths import HARNESS_TMP_PARENT_ENV_VAR
 
 pytestmark = pytest.mark.asyncio
@@ -1629,6 +1632,51 @@ async def test_watch_runner_reports_unexpected_exit(
     assert "code 3" in report.error
     assert "tunnel rejected: crash-cause" in report.error
     assert maintenance_reasons == ["runner_exited"]
+
+
+async def test_watch_runner_records_a_tunnel_auth_rejection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A runner refused on its tunnel upgrade marks the bearer it was given as dead."""
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: tmp_path))
+    monkeypatch.setattr("omnigent.host.connect._RUNNER_WATCH_INTERVAL_S", 0.01)
+    monkeypatch.delenv("OMNIGENT_HOST_TOKEN", raising=False)
+    host = _make_host_process()
+    host._maintenance_janitor = SimpleNamespace(trigger=lambda _reason: None)  # type: ignore[assignment]
+    host._ws = _FakeTunnel()  # type: ignore[assignment] — duck-typed send
+    host._auth_token_factory = lambda: "bootstrap-token"
+    host._auth_token_factory_resolved = True
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    original_popen = subprocess.Popen
+
+    def _fake_popen(args: list[str], **kwargs: object) -> subprocess.Popen[bytes]:
+        """Spawn a runner that exits the way a refused tunnel upgrade does."""
+        return original_popen(
+            [
+                "sh",
+                "-c",
+                f"echo '{RUNNER_TUNNEL_REJECTION_PREFIX}(HTTP 403 persisted "
+                "across 3 attempts)' >&2; sleep 0.2; exit 1",
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=kwargs["stdout"],
+            stderr=kwargs["stderr"],
+        )
+
+    frame = HostLaunchRunnerFrame(
+        request_id="req_rejected",
+        binding_token="tok_rejected",
+        workspace=str(workspace),
+    )
+    with patch("omnigent.host.connect.subprocess.Popen", side_effect=_fake_popen):
+        result = await host._handle_launch(frame)
+    assert result.status == "launched", result.error
+    await asyncio.wait_for(asyncio.gather(*host._watcher_tasks), timeout=5.0)
+
+    assert host._auth_expired is True
+    assert host._rejected_auth_token == "bootstrap-token"
 
 
 def test_runner_exit_error_redacts_credential_values(tmp_path: Path) -> None:
@@ -5155,6 +5203,115 @@ def test_build_connect_headers_retains_auth_factory(
     assert launch_token == "warm-host-token"
     assert factory_builds == ["https://app.example.databricksapps.com"]
     assert token_calls == [1, 1, 1]
+
+
+def test_refused_host_credential_is_withheld_until_the_credential_cache_changes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A refused bearer is never re-injected; a re-login elsewhere is picked up.
+
+    The login rewrites a shared credential cache, which is the signal to
+    re-resolve without restarting the host.
+    """
+    import omnigent.runner._entry as entry_mod
+
+    tokens = iter(["stale-token", "fresh-token"])
+    factory_builds: list[str] = []
+
+    def _make_factory(*, server_url: str | None = None) -> object:
+        token = next(tokens)
+        factory_builds.append(token)
+        return lambda: token
+
+    stamp = [(1.0, None)]
+    monkeypatch.delenv("OMNIGENT_HOST_TOKEN", raising=False)
+    monkeypatch.setattr(entry_mod, "_make_auth_token_factory", _make_factory)
+    monkeypatch.setattr("omnigent.host.connect._credential_cache_stamp", lambda: stamp[0])
+
+    host = _host("https://app.example.databricksapps.com")
+    assert host._build_connect_headers()["Authorization"] == "Bearer stale-token"
+    host._note_auth_rejected("stale-token", source="runner_tunnel")
+
+    assert host._launch_auth_token() == (None, False)
+    assert factory_builds == ["stale-token"]
+
+    stamp[0] = (2.0, None)
+    assert host._launch_auth_token() == ("fresh-token", True)
+    assert factory_builds == ["stale-token", "fresh-token"]
+    assert host._auth_expired is False
+
+
+def test_refused_host_credential_is_retried_after_the_recovery_interval(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without a cache change, a launch re-resolves only once the interval passes."""
+    import omnigent.runner._entry as entry_mod
+
+    tokens = iter(["stale-token", "fresh-token"])
+    now = [1000.0]
+    monkeypatch.delenv("OMNIGENT_HOST_TOKEN", raising=False)
+    monkeypatch.setattr(
+        entry_mod, "_make_auth_token_factory", lambda **_: (lambda t: lambda: t)(next(tokens))
+    )
+    monkeypatch.setattr("omnigent.host.connect._credential_cache_stamp", lambda: (1.0, None))
+    monkeypatch.setattr("omnigent.host.connect.time.monotonic", lambda: now[0])
+
+    host = _host("https://app.example.databricksapps.com")
+    assert host._build_connect_headers()["Authorization"] == "Bearer stale-token"
+    host._note_auth_rejected("stale-token", source="runner_tunnel")
+    assert host._launch_auth_token() == (None, False)
+
+    now[0] += _AUTH_RECOVERY_RETRY_S
+    assert host._launch_auth_token() == ("fresh-token", True)
+
+
+def test_host_upgrade_rejection_re_resolves_on_the_next_connect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A 401/403 on the host's own upgrade stops re-sending the refused bearer."""
+    import omnigent.runner._entry as entry_mod
+
+    tokens = iter(["stale-token", "fresh-token"])
+    stamp = [(1.0, None)]
+    monkeypatch.delenv("OMNIGENT_HOST_TOKEN", raising=False)
+    monkeypatch.setattr(
+        entry_mod, "_make_auth_token_factory", lambda **_: (lambda t: lambda: t)(next(tokens))
+    )
+    monkeypatch.setattr("omnigent.host.connect._credential_cache_stamp", lambda: stamp[0])
+
+    host = _host("https://app.example.databricksapps.com")
+    host._ever_connected = True
+    assert host._build_connect_headers()["Authorization"] == "Bearer stale-token"
+    assert host._classify_http_status(403) is None
+    assert host._auth_expired is True
+
+    stamp[0] = (2.0, None)
+    assert host._build_connect_headers()["Authorization"] == "Bearer fresh-token"
+
+
+async def test_handle_launch_refuses_while_host_credential_is_refused(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """With no working credential the host refuses instead of spawning a doomed runner."""
+    monkeypatch.delenv("OMNIGENT_HOST_TOKEN", raising=False)
+    monkeypatch.setattr("omnigent.host.connect._credential_cache_stamp", lambda: (1.0, None))
+    host = _make_host_process()
+    host._note_auth_rejected(None, source="runner_tunnel")
+
+    result = await host._handle_launch(
+        HostLaunchRunnerFrame(
+            request_id="req_auth",
+            binding_token="token_auth",
+            workspace=str(tmp_path),
+            session_id="session_auth_expired",
+        )
+    )
+
+    assert result.status == "failed"
+    assert result.error_code == HOST_AUTH_EXPIRED_ERROR_CODE
+    assert "omnigent login http://localhost:8000" in (result.error or "")
+    assert host._runners == {}
 
 
 def test_build_connect_headers_slice_key_only_on_workspace_host(

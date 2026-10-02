@@ -18,6 +18,9 @@ from omnigent.harness_plugins import CODEX_NATIVE_CODING_AGENT
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE as _HARNESS_NOT_CONFIGURED_ERROR_CODE,
 )
+from omnigent.host.frames import (
+    HOST_AUTH_EXPIRED_ERROR_CODE as _HOST_AUTH_EXPIRED_ERROR_CODE,
+)
 from omnigent.runner.routing import RunnerRouter
 from omnigent.runner.transports.ws_tunnel.registry import TunnelRegistry
 from omnigent.server.auth import LEVEL_EDIT, LEVEL_READ, AuthProvider
@@ -230,7 +233,8 @@ async def _start_codex_goal_runner_on_bound_host(
     :returns: Runner id expected to connect, or ``None`` if no launch was
         possible.
     :raises OmnigentError: If the host reports a non-retryable harness
-        configuration failure or the session disappears.
+        configuration failure or an expired host sign-in, or the session
+        disappears.
     """
     host_registry = getattr(app_state, "host_registry", None)
     if host_registry is None:
@@ -247,6 +251,11 @@ async def _start_codex_goal_runner_on_bound_host(
             raise OmnigentError(
                 launch_attempt.error or "host failed to launch runner: harness not configured",
                 code=ErrorCode.HARNESS_NOT_CONFIGURED,
+            )
+        if launch_attempt.error_code == _HOST_AUTH_EXPIRED_ERROR_CODE:
+            raise OmnigentError(
+                launch_attempt.error or "host failed to launch runner: host sign-in expired",
+                code=ErrorCode.HOST_AUTH_EXPIRED,
             )
         return launch_attempt.runner_id
     if not await _maybe_relaunch_managed_sandbox(
