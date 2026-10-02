@@ -25,16 +25,22 @@ denied content.
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import logging
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
-from types import TracebackType
+from types import SimpleNamespace, TracebackType
 from typing import Any
 from unittest.mock import patch
 
 import pytest
 
 from omnigent.entities import Conversation, ConversationItem
+from omnigent.policies.types import PolicyAction, PolicyResult
 from omnigent.server.routes._sessions.common import _llm_response_denied_turns
 from omnigent.server.routes._sessions.helpers import _flush_relay_text
+from omnigent.spec import AgentSpec
+from omnigent.spec.types import GuardrailsSpec
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
@@ -99,6 +105,29 @@ def _persisted_texts(store: _FakeConversationStore) -> list[str]:
     return texts
 
 
+class _FakeEngine:
+    """Stand-in for a built ``PolicyEngine`` when the evaluator itself is faked."""
+
+
+async def _prepared_engine(*args: Any, **kwargs: Any) -> _FakeEngine:
+    del args, kwargs
+    return _FakeEngine()
+
+
+@contextlib.contextmanager
+def _relay_policy_pipeline(evaluate: Any) -> Iterator[None]:
+    """Fake the relay's RESPONSE-phase pipeline: a ready engine and a scripted evaluator."""
+    with (
+        patch("omnigent.runtime._globals._agent_store", object()),
+        patch(
+            "omnigent.server.routes._sessions.helpers._prepare_output_policy_engine",
+            _prepared_engine,
+        ),
+        patch("omnigent.server.routes._sessions.helpers._evaluate_output_policy", evaluate),
+    ):
+        yield
+
+
 # ── _flush_relay_text deny substitution ──────────────────────────────
 
 
@@ -150,17 +179,12 @@ async def test_flush_evaluates_response_phase_at_terminal() -> None:
         runner_router: Any,
         *,
         actor: Any = None,
+        engine: Any = None,
     ) -> dict[str, Any]:
         captured["text"] = body.data["content"][0]["text"]
         return {"verdict": "deny", "reason": "output gated", "_denied_body": None}
 
-    with (
-        patch(
-            "omnigent.server.routes._sessions.helpers._evaluate_output_policy",
-            _fake_output_policy,
-        ),
-        patch("omnigent.runtime._globals._agent_store", object()),
-    ):
+    with _relay_policy_pipeline(_fake_output_policy):
         await _flush_relay_text(
             store,  # type: ignore[arg-type]
             "conv_deny_2",
@@ -184,13 +208,7 @@ async def test_flush_response_phase_allow_persists_unmodified() -> None:
     async def _allow(*args: Any, **kwargs: Any) -> None:
         return None
 
-    with (
-        patch(
-            "omnigent.server.routes._sessions.helpers._evaluate_output_policy",
-            _allow,
-        ),
-        patch("omnigent.runtime._globals._agent_store", object()),
-    ):
+    with _relay_policy_pipeline(_allow):
         await _flush_relay_text(
             store,  # type: ignore[arg-type]
             "conv_allow_1",
@@ -210,17 +228,13 @@ async def test_flush_response_phase_failure_fails_open() -> None:
     advisory on evaluation error, matching the LLM phases' default).
     """
     store = _FakeConversationStore()
+    calls = {"n": 0}
 
     async def _boom(*args: Any, **kwargs: Any) -> None:
+        calls["n"] += 1
         raise RuntimeError("engine construction failed")
 
-    with (
-        patch(
-            "omnigent.server.routes._sessions.helpers._evaluate_output_policy",
-            _boom,
-        ),
-        patch("omnigent.runtime._globals._agent_store", object()),
-    ):
+    with _relay_policy_pipeline(_boom):
         await _flush_relay_text(
             store,  # type: ignore[arg-type]
             "conv_failopen_1",
@@ -231,6 +245,281 @@ async def test_flush_response_phase_failure_fails_open() -> None:
         )
 
     assert _persisted_texts(store) == ["survives engine failure"]
+    assert calls["n"] == 1, "a non-transient failure must not be retried"
+
+
+# ── RESPONSE-phase evaluation under an upstream request-limit throttle ──────
+
+
+class _ThrottledRpcError(Exception):
+    """gRPC-shaped ``RESOURCE_EXHAUSTED`` error; grpcio is not a test dependency."""
+
+    def code(self) -> Any:
+        return SimpleNamespace(name="RESOURCE_EXHAUSTED")
+
+    def __str__(self) -> str:
+        return (
+            "<_InactiveRpcError of RPC that terminated with:\n"
+            "\tstatus = StatusCode.RESOURCE_EXHAUSTED\n"
+            '\tdetails = "REQUEST_LIMIT_EXCEEDED: Workspace 1965859176160743 '
+            'exceeded the concurrent limit of 60 requests."\n>'
+        )
+
+
+class _Http429Error(Exception):
+    """HTTP-client-shaped rejection whose response carries a 429 status."""
+
+    def __init__(self) -> None:
+        super().__init__("Client error '429' for url 'https://gateway.example/evaluate'")
+        self.response = SimpleNamespace(status_code=429)
+
+
+_THROTTLE_ERRORS = [
+    pytest.param(_ThrottledRpcError(), id="grpc-resource-exhausted"),
+    pytest.param(_Http429Error(), id="http-429"),
+    pytest.param(
+        RuntimeError("REQUEST_LIMIT_EXCEEDED: workspace exceeded its concurrent limit"),
+        id="request-limit-text",
+    ),
+]
+
+
+@dataclass
+class _ThrottledConversationStore(_FakeConversationStore):
+    """Store whose first ``throttled_reads`` conversation lookups hit the request limit."""
+
+    throttled_reads: int = 1
+    reads: int = 0
+
+    def get_conversation(self, conversation_id: str) -> Conversation:
+        self.reads += 1
+        if self.reads <= self.throttled_reads:
+            raise _ThrottledRpcError()
+        return super().get_conversation(conversation_id)
+
+
+def _no_retry_pause() -> Any:
+    """Drop the real retry pauses so a throttled evaluation retries immediately."""
+    return patch(
+        "omnigent.server.routes._sessions.helpers._RESPONSE_POLICY_RETRY_DELAYS_S",
+        (0.0, 0.0),
+        create=True,
+    )
+
+
+# Seams of the preparation stage, patched on the facade the helpers proxy through.
+_LOADER_PATCH = "omnigent.server.routes.sessions._load_agent_spec_for_session"
+_BUILDER_PATCH = "omnigent.server.routes.sessions._build_policy_engine_from_spec"
+_GOVERNED_SPEC = AgentSpec(spec_version=1, name="test-agent", guardrails=GuardrailsSpec())
+
+
+class _ScriptedEngine:
+    """``PolicyEngine`` stand-in returning one scripted verdict."""
+
+    def __init__(self, result: PolicyResult) -> None:
+        self.result = result
+        self.evaluations = 0
+
+    async def evaluate(self, ctx: Any) -> PolicyResult:
+        del ctx
+        self.evaluations += 1
+        return self.result
+
+    def apply_label_writes(self, labels: dict[str, str]) -> None:
+        del labels
+
+
+def _deny_engine(reason: str) -> _ScriptedEngine:
+    return _ScriptedEngine(PolicyResult(action=PolicyAction.DENY, reason=reason))
+
+
+def _failing_then(
+    exc: BaseException, value: Any, *, failures: int = 1
+) -> tuple[Callable[..., Any], dict[str, int]]:
+    """Return a callable raising *exc* for its first *failures* calls, then returning *value*."""
+    calls = {"n": 0}
+
+    def _call(*args: Any, **kwargs: Any) -> Any:
+        del args, kwargs
+        calls["n"] += 1
+        if calls["n"] <= failures:
+            raise exc
+        return value
+
+    return _call, calls
+
+
+@contextlib.contextmanager
+def _governed_session(
+    build_engine: Callable[..., Any],
+    load_spec: Callable[..., Any] | None = None,
+) -> Iterator[None]:
+    """
+    Run the real RESPONSE-phase pipeline against a governed spec.
+
+    Only the preparation seams are scripted: *load_spec* replaces the spec
+    lookup and *build_engine* the engine build. The evaluation runs the real
+    ``_evaluate_output_policy`` over the engine *build_engine* returns.
+    """
+    with (
+        patch("omnigent.runtime._globals._agent_store", object()),
+        patch(_LOADER_PATCH, load_spec or (lambda conv, agent_store: _GOVERNED_SPEC)),
+        patch(_BUILDER_PATCH, build_engine),
+        patch("omnigent.server.routes._sessions.helpers._publish_policy_deny"),
+        _no_retry_pause(),
+    ):
+        yield
+
+
+def _fail_open_records(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [
+        record.getMessage()
+        for record in caplog.records
+        if record.levelno == logging.ERROR
+        and "persisting the text unmodified" in record.getMessage()
+    ]
+
+
+async def test_flush_response_phase_retries_throttled_conversation_read() -> None:
+    """A throttled conversation lookup is retried, so the retry's DENY still gates the text."""
+    store = _ThrottledConversationStore(throttled_reads=1)
+    engine = _deny_engine("gated after throttle")
+
+    with _governed_session(build_engine=lambda *args, **kwargs: engine):
+        await _flush_relay_text(
+            store,  # type: ignore[arg-type]
+            "conv_throttled_read_1",
+            [_DENIED_TEXT],
+            "resp_7",
+            "test-agent",
+            evaluate_response_phase=True,
+        )
+
+    texts = _persisted_texts(store)
+    assert texts == ["[Denied by policy: gated after throttle]"], (
+        f"a throttled lookup must not bypass the output policy, got {texts!r}"
+    )
+    assert store.reads == 2, "the throttled lookup must be retried"
+    assert engine.evaluations == 1
+
+
+@pytest.mark.parametrize("throttle", _THROTTLE_ERRORS)
+async def test_flush_response_phase_retries_throttled_spec_load(throttle: Exception) -> None:
+    """Every throttle shape on the spec lookup is retried; the retried DENY gates the text."""
+    store = _FakeConversationStore()
+    engine = _deny_engine("gated after throttle")
+    load_spec, loads = _failing_then(throttle, _GOVERNED_SPEC)
+
+    with _governed_session(build_engine=lambda *args, **kwargs: engine, load_spec=load_spec):
+        await _flush_relay_text(
+            store,  # type: ignore[arg-type]
+            "conv_throttled_spec_1",
+            [_DENIED_TEXT],
+            "resp_8",
+            "test-agent",
+            evaluate_response_phase=True,
+        )
+
+    texts = _persisted_texts(store)
+    assert texts == ["[Denied by policy: gated after throttle]"], (
+        f"a throttled spec lookup must not bypass the output policy, got {texts!r}"
+    )
+    assert loads["n"] == 2, "the throttled spec lookup must be retried"
+    assert engine.evaluations == 1
+
+
+async def test_flush_response_phase_retries_throttled_engine_build() -> None:
+    """A throttled engine build is retried; the rebuilt engine's DENY gates the text."""
+    store = _FakeConversationStore()
+    engine = _deny_engine("gated after throttle")
+    build_engine, builds = _failing_then(_ThrottledRpcError(), engine)
+
+    with _governed_session(build_engine=build_engine):
+        await _flush_relay_text(
+            store,  # type: ignore[arg-type]
+            "conv_throttled_build_1",
+            [_DENIED_TEXT],
+            "resp_9",
+            "test-agent",
+            evaluate_response_phase=True,
+        )
+
+    assert _persisted_texts(store) == ["[Denied by policy: gated after throttle]"]
+    assert builds["n"] == 2, "the throttled engine build must be retried"
+    assert engine.evaluations == 1
+
+
+async def test_flush_response_phase_persistent_throttle_fails_open_with_cause(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A persistent throttle still fails open, and the fail-open log line names the cause."""
+    store = _FakeConversationStore()
+    load_spec, loads = _failing_then(_ThrottledRpcError(), _GOVERNED_SPEC, failures=3)
+
+    caplog.set_level(logging.WARNING, logger="omnigent.server.routes.sessions")
+    with _governed_session(
+        build_engine=lambda *args, **kwargs: _deny_engine("unreached"), load_spec=load_spec
+    ):
+        await _flush_relay_text(
+            store,  # type: ignore[arg-type]
+            "conv_throttled_persist_1",
+            ["narration survives a long throttle"],
+            "resp_10",
+            "test-agent",
+            evaluate_response_phase=True,
+        )
+
+    assert _persisted_texts(store) == ["narration survives a long throttle"]
+    assert loads["n"] == 3, "one attempt per retry pause plus the initial attempt"
+    failures = _fail_open_records(caplog)
+    assert len(failures) == 1, f"expected one fail-open record, got {failures!r}"
+    assert "after 3 attempt(s)" in failures[0], failures[0]
+    assert "RESOURCE_EXHAUSTED" in failures[0] and "REQUEST_LIMIT_EXCEEDED" in failures[0], (
+        f"the fail-open line must name the upstream throttle, got {failures[0]!r}"
+    )
+
+
+async def test_flush_response_phase_never_retries_a_partially_applied_evaluation(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """
+    A throttle raised by the evaluation itself is not retried: the engine
+    commits session-state updates before its label writes, so a repeat would
+    double-apply an increment that already landed. The text still fails open
+    and the log names the cause.
+    """
+    store = _FakeConversationStore()
+
+    class _PartiallyCommittingEngine:
+        """DENY commits a counter increment, then its trailing label write is throttled."""
+
+        def __init__(self) -> None:
+            self.committed_increments = 0
+
+        async def evaluate(self, ctx: Any) -> PolicyResult:
+            del ctx
+            self.committed_increments += 1
+            raise _ThrottledRpcError()
+
+    engine = _PartiallyCommittingEngine()
+    caplog.set_level(logging.WARNING, logger="omnigent.server.routes.sessions")
+    with _governed_session(build_engine=lambda *args, **kwargs: engine):
+        await _flush_relay_text(
+            store,  # type: ignore[arg-type]
+            "conv_partial_write_1",
+            ["narration after a throttled label write"],
+            "resp_11",
+            "test-agent",
+            evaluate_response_phase=True,
+        )
+
+    assert _persisted_texts(store) == ["narration after a throttled label write"]
+    assert engine.committed_increments == 1, (
+        "an evaluation that may already have written must not be replayed"
+    )
+    failures = _fail_open_records(caplog)
+    assert len(failures) == 1, f"expected one fail-open record, got {failures!r}"
+    assert "not retried" in failures[0] and "RESOURCE_EXHAUSTED" in failures[0], failures[0]
 
 
 # ── Full relay loop: deny marker consumed at the terminal flush ──────
@@ -341,11 +630,7 @@ async def test_response_phase_deny_survives_persist_failure_retry() -> None:
     text_acc = [_DENIED_TEXT]
 
     with (
-        patch(
-            "omnigent.server.routes._sessions.helpers._evaluate_output_policy",
-            _deny_once_then_allow,
-        ),
-        patch("omnigent.runtime._globals._agent_store", object()),
+        _relay_policy_pipeline(_deny_once_then_allow),
         patch("omnigent.server.routes._sessions.helpers._publish_policy_deny"),
     ):
         # First flush: DENY computed, persist fails — buffer must now
@@ -391,11 +676,7 @@ async def test_mid_turn_boundary_flush_gates_response_phase() -> None:
         return {"verdict": "deny", "reason": "gated segment", "_denied_body": None}
 
     with (
-        patch(
-            "omnigent.server.routes._sessions.helpers._evaluate_output_policy",
-            _deny,
-        ),
-        patch("omnigent.runtime._globals._agent_store", object()),
+        _relay_policy_pipeline(_deny),
         patch("omnigent.server.routes._sessions.helpers._publish_policy_deny"),
     ):
         # Same call shape the relay's function_call-boundary flush uses.
