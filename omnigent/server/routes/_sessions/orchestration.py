@@ -16,7 +16,7 @@ import re
 import secrets
 import time
 import uuid
-from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from typing import Any, Literal, cast
 
 import httpx
@@ -6522,9 +6522,6 @@ async def _run_managed_wake(
                 return
         tracker.finish(session_id)
         _publish_sandbox_status(session_id, "ready")
-    except OmnigentError as exc:
-        tracker.fail(session_id, str(exc))
-        _publish_sandbox_status(session_id, "failed", str(exc))
     except HTTPException as exc:
         tracker.fail(session_id, str(exc.detail))
         _publish_sandbox_status(session_id, "failed", str(exc.detail))
@@ -7092,7 +7089,6 @@ def _build_native_terminal_message_event(
     body: SessionEventInput,
     model_override: str | None = None,
     input_delivery: Mapping[str, object] | None = None,
-    agent_revision: str | None = None,
 ) -> dict[str, Any]:
     """
     Build the runner event that delivers a web message to a native TUI.
@@ -7107,7 +7103,6 @@ def _build_native_terminal_message_event(
         message under one lock (no separate racing ``model_change``
         event). ``None`` when routing did not pick a model.
     :param input_delivery: Queued input identifiers and original enqueue time.
-    :param agent_revision: Effective spec revision used to invalidate runner caches.
     :returns: Harness ``MessageEvent`` body for the runner-local
         native terminal harness, including ``agent_id`` so the runner
         can resolve the harness spec on the first message.
@@ -7135,8 +7130,6 @@ def _build_native_terminal_message_event(
         # which always includes it.
         "agent_id": conv.agent_id,
     }
-    if agent_revision is not None:
-        event["agent_revision"] = agent_revision
     # The web's stable id for this message rides along so the runner can name
     # it on a turn that fails before the harness receives it; the relay then
     # settles exactly that queued entry (see _settle_undelivered_native_input).
@@ -7167,7 +7160,6 @@ async def _forward_native_terminal_message(
     artifact_store: ArtifactStore | None = None,
     model_override: str | None = None,
     input_delivery: Mapping[str, object] | None = None,
-    agent_revision: str | None = None,
     native_shell_authorized: bool = False,
 ) -> None:
     """
@@ -7193,7 +7185,6 @@ async def _forward_native_terminal_message(
         inject under one lock (no separate racing ``model_change``).
         ``None`` when routing did not pick a model.
     :param input_delivery: Queued input identifiers and original enqueue time.
-    :param agent_revision: Effective spec revision used to invalidate runner caches.
     :param native_shell_authorized: Owner authorization for this shell delivery.
     :returns: None.
     :raises HTTPException: 502 when the runner or harness rejects
@@ -7201,11 +7192,7 @@ async def _forward_native_terminal_message(
     """
     display_name, _, harness = _native_terminal_runtime(conv)
     event = _build_native_terminal_message_event(
-        conv,
-        body,
-        model_override=model_override,
-        input_delivery=input_delivery,
-        agent_revision=agent_revision,
+        conv, body, model_override=model_override, input_delivery=input_delivery
     )
     log_input_event(
         _logger,
@@ -7829,7 +7816,7 @@ async def _forward_event_to_runner(
     :param host_store: Host registrations, read only to learn whether this
         session's harness is AI-Gateway-backed (which router may route it).
         ``None`` reads as unknown, which counts as backed.
-    :param agent_revision: The agent's effective bundle and selection revision; the
+    :param agent_revision: The agent's current ``bundle_location``; the
         runner rebuilds the session's spec when it changes.
     :returns: The store-assigned id of the persisted item.
     """
@@ -8445,7 +8432,7 @@ async def _forward_event_to_runner(
             session_id,
             extra={"session_id": session_id},
         )
-        _publish_status(session_id, "idle")
+        _publish_status(session_id, "idle", push_eligible=False)
         raise OmnigentError(
             "Runner is unreachable; message was persisted but could not be delivered. "
             "The runner may be restarting — retry or spawn a new session.",
@@ -8806,8 +8793,8 @@ async def _dispatch_session_event_to_runner_impl(
         session's harness is AI-Gateway-backed (which router may route it).
         ``None`` reads as unknown, which counts as backed — the same posture
         an older host row gets.
-    :param agent_revision: The agent's effective bundle and selection revision, stamped on
-        both native and non-native forwards to invalidate runner caches.
+    :param agent_revision: The agent's current ``bundle_location``, stamped on
+        non-native forwards (see :func:`_forward_event_to_runner`).
     :returns: A :class:`_SessionEventDispatchResult` carrying the
         persisted item id (non-native) or the pending-input id
         (claude-native message bypass).
@@ -8816,6 +8803,10 @@ async def _dispatch_session_event_to_runner_impl(
         await asyncio.to_thread(runner_router.require_runtime_support, conv)
     if body.type == "message":
         disconnect_outcome.note_user_turn(conv.id)
+    if body.type == "message" and body.data.get("role") == "user":
+        from omnigent.server.mobile_push import observe_input
+
+        observe_input(session_id)
     if body.type == "message" and _codex_side_chat_thread_id(conv) is not None:
         # Codex /side follow-up: drive the child on its own Codex thread via the
         # parent's runner/bridge; do not persist AP-side (the forwarder mirrors
@@ -9087,7 +9078,6 @@ async def _dispatch_session_event_to_runner_impl(
                     _native_routed_model if _native_applied_model is not None else None
                 ),
                 input_delivery=input_delivery,
-                agent_revision=agent_revision,
                 native_shell_authorized=native_shell_authorized,
             )
             forwarded = True
@@ -9544,8 +9534,6 @@ async def _runner_disconnect_requires_failure(
             error_code=error_code,
             status_source=source,
             cached_session_status=cached,
-            # The cache retains positive counts only; absence is not an observed zero.
-            cached_background_task_count=_session_background_task_count_cache.get(session_id),
             persisted_session_status=persisted.live_status if persisted is not None else None,
             snapshot_session_status=fallback.live_status if fallback is not None else None,
             status_lookup=lookup,
@@ -9837,7 +9825,7 @@ async def _relay_runner_stream(
             if decision == "intentional_stop":
                 # An expected drop must not erase a real failure reported during
                 # teardown: preserve its labels when the sticky status stays failed.
-                _publish_status(session_id, "idle")
+                _publish_status(session_id, "idle", push_eligible=False)
                 if _session_status_cache.get(session_id) != "failed":
                     await _persist_session_status_error_labels(
                         session_id,
@@ -11420,9 +11408,7 @@ async def _wake_parent_for_blocked_child(
             file_store=None,
             artifact_store=None,
             runner_router=runner_router,
-            agent_revision=mcp_selection_revision(parent_agent.bundle_location, parent_conv.labels)
-            if parent_agent is not None
-            else None,
+            agent_revision=parent_agent.bundle_location if parent_agent is not None else None,
         )
     except (httpx.HTTPError, OmnigentError):
         _logger.warning(
@@ -11491,11 +11477,11 @@ def configure_subagent_block_notifier(
         wake_dispatch=_wake_dispatch,
         loop=loop,
     )
-    _pending_elicitations.set_elicitation_observer(notifier.observe)
+    remove_observer = _pending_elicitations.add_elicitation_observer(notifier.observe)
 
     def _uninstall() -> None:
         """Remove the observer and cancel any outstanding wake futures."""
-        _pending_elicitations.set_elicitation_observer(None)
+        remove_observer()
         notifier.close()
 
     return _uninstall
@@ -12748,25 +12734,13 @@ async def _create_session_from_existing_agent(
                 if runner_owner is not None and runner_owner != user_id:
                     inherited_runner_id = None
 
-    registry_labels: dict[str, str] = {}
-    if body.mcp_registry_services:
-        from omnigent.mcp_selection import registry_selection_labels
-        from omnigent.server.routes.session_mcp_servers import _require_registry_service
-
-        if body.sub_agent_name:
-            raise OmnigentError(
-                "Named sub-agents use their authored MCP services",
-                code=ErrorCode.INVALID_INPUT,
-            )
-        if selection_spec is None:
-            raise OmnigentError(
-                "Cannot load the agent's MCP configuration", code=ErrorCode.INVALID_INPUT
-            )
-        for service_id in body.mcp_registry_services:
-            _require_registry_service(request, service_id, user_id)
-        registry_labels = registry_selection_labels(selection_spec, body.mcp_registry_services)
-
-    # Validate the host workspace before creating a session or worktree.
+    # Workspace validation: if the caller is binding to a host,
+    # they must also pass a workspace, and the workspace must
+    # satisfy the agent's os_env.cwd boundary on that host (per
+    # designs/SESSION_WORKSPACE_SELECTION.md). Done before
+    # create_conversation so a bad workspace never produces a row.
+    # With git worktree creation, the validated path is the source
+    # repo; the worktree it produces becomes the stored workspace.
     canonical_workspace: str | None = body.workspace
     if body.host_id is not None:
         canonical_workspace = await _validate_session_workspace(
@@ -13352,7 +13326,7 @@ async def _create_session_from_existing_agent(
                     runner_router=runner_router,
                     host_store=getattr(request.app.state, "host_store", None),
                     background_titles_enabled=background_session_titles_enabled(request.headers),
-                    agent_revision=mcp_selection_revision(agent.bundle_location, conv.labels),
+                    agent_revision=agent.bundle_location,
                 )
                 if pending_background_title is not None:
                     pending_background_title.schedule(expected_seed_title=conv.title)
@@ -13574,8 +13548,6 @@ async def _handle_mcp_tools_call(
     *,
     actor: dict[str, str] | None = None,
     request: Request | None = None,
-    execute_tool: Callable[[dict[str, Any]], Awaitable[dict[str, Any]]] | None = None,
-    credential_user: str | None = None,
 ) -> Response:
     """
     Handle a ``tools/call`` JSON-RPC request for the MCP proxy endpoint.
@@ -13612,10 +13584,9 @@ async def _handle_mcp_tools_call(
     :param agent_store: Store for agent lookup.
     :param runner_router: Router used to get a tunneled client pointed at
         the session's runner. ``None`` returns an error response.
-    :param actor: Policy principal: initiating user for a verified runner,
-        authenticated caller for direct calls, or ``None`` when unknown.
-    :param credential_user: Authenticated caller whose registry grant is used;
-        independent of the initiating policy actor.
+    :param actor: Authenticated principal, e.g.
+        ``{"run_as": "alice@example.com"}``. ``None`` when
+        identity is unknown.
     :returns: A JSON-RPC 2.0 response carrying the tool result as MCP
         ``content`` blocks, an ``InputRequiredResult`` on ASK, or an
         error response when the call is denied, the runner is
@@ -13677,8 +13648,6 @@ async def _handle_mcp_tools_call(
             state = json.loads(request_state_str)  # type: ignore[arg-type]
         except Exception:  # noqa: BLE001
             return _mcp_error_response(rpc_id, -32000, "Invalid requestState: not valid JSON")
-        if not isinstance(state, dict):
-            return _mcp_error_response(rpc_id, -32000, "Invalid requestState")
         if state.get("session_id") != session_id:
             # Reject cross-session replay.
             return _mcp_error_response(rpc_id, -32000, "requestState session mismatch")
@@ -13725,11 +13694,7 @@ async def _handle_mcp_tools_call(
             approval = input_responses.get(elicitation_id_from_state) or {}
             if approval.get("action") != "accept":
                 return _mcp_error_response(rpc_id, -32000, "Tool call denied by user")
-            _pending = _pending_policy_ask_writes.get(elicitation_id_from_state)
-            identity = (session_id, namespaced_name, (actor or {}).get("run_as"), credential_user)
-            if _pending is not None and _pending.mcp_call_identity not in (None, identity):
-                return _mcp_error_response(rpc_id, -32000, "Approval does not match this call")
-            _pending_policy_ask_writes.pop(elicitation_id_from_state, None)
+            _pending = _pending_policy_ask_writes.pop(elicitation_id_from_state, None)
             # Approval applies to the stored call and its reviewed transform.
             # Older pending entries use the re-evaluated transform.
             if _pending is not None and _pending.reviewed_arguments is not None:
@@ -13805,12 +13770,6 @@ async def _handle_mcp_tools_call(
                 from_mcp=True,
                 reviewed_arguments=arguments,
                 transformed_arguments=cast("dict[str, object] | None", call_result.data),
-                mcp_call_identity=(
-                    session_id,
-                    namespaced_name,
-                    (actor or {}).get("run_as"),
-                    credential_user,
-                ),
             )
             # The client carries identifiers; reviewed arguments stay on the server.
             request_state_payload: dict[str, Any] = {
@@ -13846,71 +13805,45 @@ async def _handle_mcp_tools_call(
             runner_router=runner_router,
         )
 
-    from omnigent.runner.tool_dispatch import MCP_PROXY_FORWARD_TIMEOUT_S
+    # ── Execute on the runner via WS tunnel ──────────────────────────
+    # The runner owns stdio subprocess spawning (correct machine, cwd,
+    # and env). We call its /mcp/execute endpoint through the same WS
+    # tunnel the runner already opened to the Omnigent server at startup.
+    runner_client = await _get_runner_client(session_id, runner_router)
+    if runner_client is None:
+        from omnigent.runtime import get_runner_client
 
-    runner_client: httpx.AsyncClient | None = None
-    registry_config = None
-    if request is not None and getattr(request.app.state, "mcp_registry", None) is not None:
-        registry_config = next(
-            (
-                c
-                for c in spec.mcp_servers
-                if c.transport == "registry" and namespaced_name.startswith(c.name + "__")
+        runner_client = cast("httpx.AsyncClient | None", get_runner_client())
+    if runner_client is None:
+        return _mcp_error_response(rpc_id, -32000, f"No runner bound for session {session_id!r}")
+    try:
+        from omnigent.runner.tool_dispatch import MCP_PROXY_FORWARD_TIMEOUT_S
+
+        exec_resp = await runner_client.post(
+            f"/v1/sessions/{session_id}/mcp/execute",
+            json=_runner_execute_body(
+                {"name": namespaced_name, "arguments": arguments},
+                step="initial",
             ),
-            None,
+            # ``sys_session_send`` returns a launch handle immediately; this
+            # timeout now protects ordinary runner proxy hangs.
+            timeout=MCP_PROXY_FORWARD_TIMEOUT_S,
         )
-    if execute_tool is not None:
-        exec_data = await execute_tool(arguments)
-    elif registry_config is not None:
-        from omnigent.server.registry_gateway import execute_registry_tool
-
-        exec_data = await execute_registry_tool(
-            request,
-            conv,
-            registry_config,
-            namespaced_name,
-            arguments,
-            credential_user,
-        )
-    else:
-        # ── Execute on the runner via WS tunnel ──────────────────────────
-        # The runner owns stdio subprocess spawning (correct machine, cwd,
-        # and env). We call its /mcp/execute endpoint through the same WS
-        # tunnel the runner already opened to the Omnigent server at startup.
-        runner_client = await _get_runner_client(session_id, runner_router)
-        if runner_client is None:
-            from omnigent.runtime import get_runner_client
-
-            runner_client = cast("httpx.AsyncClient | None", get_runner_client())
-        if runner_client is None:
+        exec_resp.raise_for_status()
+        exec_data = exec_resp.json()
+    except ConnectionError as exc:
+        _logger.warning("Runner MCP execute detached: %s", exc, exc_info=True)
+        if operation_id is not None:
             return _mcp_error_response(
-                rpc_id, -32000, f"No runner bound for session {session_id!r}"
+                rpc_id,
+                RUNNER_MCP_EXECUTION_DETACHED_CODE,
+                RUNNER_MCP_EXECUTION_DETACHED_MESSAGE,
             )
-        try:
-            exec_resp = await runner_client.post(
-                f"/v1/sessions/{session_id}/mcp/execute",
-                json=_runner_execute_body(
-                    {"name": namespaced_name, "arguments": arguments},
-                    step="initial",
-                ),
-                # ``sys_session_send`` returns a launch handle immediately; this
-                # timeout now protects ordinary runner proxy hangs.
-                timeout=MCP_PROXY_FORWARD_TIMEOUT_S,
-            )
-            exec_resp.raise_for_status()
-            exec_data = exec_resp.json()
-        except ConnectionError as exc:
-            _logger.warning("Runner MCP execute detached: %s", exc, exc_info=True)
-            if operation_id is not None:
-                return _mcp_error_response(
-                    rpc_id,
-                    RUNNER_MCP_EXECUTION_DETACHED_CODE,
-                    RUNNER_MCP_EXECUTION_DETACHED_MESSAGE,
-                )
-            return _mcp_error_response(rpc_id, -32000, "Runner MCP execute failed.")
-        except Exception as exc:  # noqa: BLE001
-            _logger.warning("Runner MCP execute failed: %s", exc, exc_info=True)
-            return _mcp_error_response(rpc_id, -32000, "Runner MCP execute failed.")
+        return _mcp_error_response(rpc_id, -32000, "Runner MCP execute failed.")
+    except Exception as exc:  # noqa: BLE001
+        _logger.warning("Runner MCP execute failed: %s", exc, exc_info=True)
+        return _mcp_error_response(rpc_id, -32000, "Runner MCP execute failed.")
+
     if "error" in exec_data:
         err = exec_data["error"]
         return _mcp_error_response(
@@ -13957,9 +13890,6 @@ async def _handle_mcp_tools_call(
                 if elicit_result.content is not None:
                     resp_entry["content"] = elicit_result.content
                 elicitation_responses[eid] = resp_entry
-
-        if runner_client is None:
-            return _mcp_error_response(rpc_id, -32000, "Registry MCP elicitation is not supported")
 
         # Retry on the runner with the user's inputResponses.
         try:
@@ -14026,7 +13956,7 @@ async def _handle_mcp_tools_call(
         session_id, spec, conversation_store, conv, result_ctx
     )
 
-    if result_policy.set_labels and result_policy.action != PolicyAction.ASK:
+    if result_policy.set_labels:
         await asyncio.to_thread(engine.apply_label_writes, result_policy.set_labels)
 
     _logger.debug(
@@ -14038,11 +13968,7 @@ async def _handle_mcp_tools_call(
         extra={"session_id": session_id},
     )
 
-    if result_policy.action == PolicyAction.ASK and (
-        execute_tool is not None or registry_config is not None
-    ):
-        output = "[Result withheld: MCP gateway result-review approval is not supported]"
-    elif result_policy.action == PolicyAction.DENY:
+    if result_policy.action == PolicyAction.DENY:
         output = f"[Result suppressed by policy: {result_policy.reason or 'no reason given'}]"
     elif result_policy.data is not None:
         # Policy returned transformed output (e.g. PII-redacted content).
@@ -14058,10 +13984,10 @@ async def _handle_mcp_tools_call(
             result_policy.data if isinstance(result_policy.data, str) else str(result_policy.data)
         )
 
-    result: dict[str, Any] = {"content": [{"type": "text", "text": output}]}
-    if "isError" in exec_data:
-        result["isError"] = exec_data["isError"]
-    return _mcp_ok_response(rpc_id, result)
+    return _mcp_ok_response(
+        rpc_id,
+        {"content": [{"type": "text", "text": output}]},
+    )
 
 
 async def _fetch_model_options(

@@ -39,6 +39,7 @@ class Feature(StrEnum):
     CANVAS = "canvas"
     ARCA_SHUTDOWN_WARNINGS = "arca_shutdown_warnings"
     IMPORT_REVIEW = "import_review"
+    MOBILE_PUSH = "mobile_push"
     SIDEBAR_GROUPING_UI = "sidebar_grouping_ui"
     CLAUDE_OSC_STATUS = "claude_osc_status"
     WORKSPACE_CONTENT_SEARCH = "workspace_content_search"
@@ -132,6 +133,13 @@ FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
         description="Split the main terminal view into several shell panes",
         owner="web",
         review_by_release="0.22.0",
+    ),
+    FeatureDefinition(
+        feature=Feature.MOBILE_PUSH,
+        description="Opt-in FCM notifications for white-label mobile builds",
+        owner="server",
+        review_by_release="0.15.0",
+        frontend_visible=False,
     ),
     FeatureDefinition(
         feature=Feature.USAGE_PAGE,
