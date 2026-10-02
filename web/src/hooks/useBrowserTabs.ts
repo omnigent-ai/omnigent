@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { onBrowserActionRequest } from "@/lib/browserActionBus";
 import { onInAppLinkOpen } from "@/lib/openLinkInApp";
 import { readSessionWorkspaceState, writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
@@ -47,6 +47,7 @@ export function openAgentBrowserTab(conversationId: string): BrowserTabsState {
 
 export function useBrowserTabs(conversationId: string) {
   const [state, setState] = useState(() => readBrowserTabsState(conversationId));
+  const agentNavigationEpochRef = useRef(0);
   useEffect(() => {
     setState(readBrowserTabsState(conversationId));
   }, [conversationId]);
@@ -70,6 +71,7 @@ export function useBrowserTabs(conversationId: string) {
   useEffect(() => {
     const selectAgentBrowser = (sourceConversationId: string) => {
       if (sourceConversationId === conversationId) {
+        agentNavigationEpochRef.current += 1;
         setState(openAgentBrowserTab(conversationId));
       }
     };
@@ -91,6 +93,7 @@ export function useBrowserTabs(conversationId: string) {
   };
 
   const close = async (tabId: string): Promise<boolean> => {
+    const agentNavigationEpoch = agentNavigationEpochRef.current;
     const desktop = (
       window as unknown as {
         omnigentDesktop?: {
@@ -102,6 +105,14 @@ export function useBrowserTabs(conversationId: string) {
       ?.browserClose?.(browserViewId(conversationId, tabId))
       .catch(() => ({ ok: false }));
     if (result && !result.ok) return false;
+    // A fresh agent/link navigation supersedes an older close of the reserved
+    // agent view. Keep the recreated tab selected when the close resolves late.
+    if (
+      tabId === AGENT_BROWSER_TAB_ID &&
+      agentNavigationEpochRef.current !== agentNavigationEpoch
+    ) {
+      return true;
+    }
     update((previous) => {
       const index = previous.tabs.indexOf(tabId);
       if (index === -1) return previous;

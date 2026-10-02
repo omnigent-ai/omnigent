@@ -2867,6 +2867,56 @@ describe("Right workspace card visibility", () => {
     }
   });
 
+  it("keeps an active file and its URL when the last background browser closes", async () => {
+    vi.stubGlobal("omnigentDesktop", {
+      kind: "electron",
+      browserOpenOrNavigate: vi.fn(),
+      browserClose: vi.fn().mockResolvedValue({ ok: true }),
+      setBadgeCount: vi.fn(),
+    });
+    function FileOpenProbe() {
+      const openFile = useFileViewer();
+      return (
+        <>
+          <button type="button" onClick={() => openFile?.("README.md")}>
+            Open cited file
+          </button>
+          <LocationDisplay />
+        </>
+      );
+    }
+    try {
+      writeSessionWorkspaceState("conv_browser_file", {
+        open: true,
+        rightRailTab: "browser",
+        openBrowsers: ["browser-1"],
+        selectedBrowserId: "browser-1",
+      });
+      useEnvironmentMock.mockReturnValue({
+        data: { available: true, root: null, home: null },
+        isLoading: false,
+      } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
+      mockConversations([{ id: "conv_browser_file", permission_level: null }]);
+
+      const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+      render(sessionShellTree(qc, "/c/conv_browser_file", <FileOpenProbe />));
+      fireEvent.click(screen.getByRole("button", { name: "Open cited file" }));
+      expect(screen.getByTestId("file-viewer-inline")).toHaveAttribute("data-path", "README.md");
+      expect(screen.getByTestId("url-params")).toHaveTextContent("file=README.md");
+
+      fireEvent.click(screen.getByRole("button", { name: "Close Browser 1" }));
+
+      await waitFor(() =>
+        expect(screen.queryByRole("tab", { name: "Browser 1" })).not.toBeInTheDocument(),
+      );
+      expect(screen.getByTestId("file-viewer-inline")).toHaveAttribute("data-path", "README.md");
+      expect(screen.getByTestId("url-params")).toHaveTextContent("file=README.md");
+    } finally {
+      cleanup();
+      vi.unstubAllGlobals();
+    }
+  });
+
   it("falls back to Agents when the preferred tab and Files are unavailable", () => {
     localStorage.setItem("omnigent:default-workspace-tab", "changes");
     useEnvironmentMock.mockReturnValue({

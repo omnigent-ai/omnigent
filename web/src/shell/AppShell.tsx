@@ -1718,7 +1718,9 @@ export function AppShell() {
   useEffect(() => {
     if (!supportsBrowser()) return;
     const surfaceBrowserTab = (sourceConversationId: string) => {
-      openAgentBrowserTab(sourceConversationId);
+      // The mounted WorkspacePanel hook owns the active session's tab state.
+      // Persist here only for background sessions that have no mounted hook.
+      if (sourceConversationId !== conversationId) openAgentBrowserTab(sourceConversationId);
       if (sourceConversationId === conversationId) {
         handleRightRailTabChange("browser");
         setRightPanelOpenAnimated(true);

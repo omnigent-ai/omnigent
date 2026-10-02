@@ -160,4 +160,37 @@ describe("browser soft tabs", () => {
     expect(result.current.tabs).toEqual([AGENT_BROWSER_TAB_ID]);
     expect(result.current.selected).toBe(AGENT_BROWSER_TAB_ID);
   });
+
+  it("keeps a newer agent navigation when an earlier close resolves late", async () => {
+    let finishClose!: (value: { ok: boolean }) => void;
+    const browserClose = vi.fn(
+      () =>
+        new Promise<{ ok: boolean }>((resolve) => {
+          finishClose = resolve;
+        }),
+    );
+    Object.assign(window, { omnigentDesktop: { browserClose } });
+    const { result } = renderHook(() => useBrowserTabs("session-a"));
+    const navigate = (actionId: string) =>
+      emitBrowserActionRequest(
+        {
+          type: "browser_action_request",
+          actionId,
+          action: "navigate",
+          args: {},
+        },
+        "session-a",
+      );
+
+    act(() => navigate("navigate-1"));
+    const pendingClose = result.current.close(AGENT_BROWSER_TAB_ID);
+    act(() => navigate("navigate-2"));
+    await act(async () => {
+      finishClose({ ok: true });
+      await pendingClose;
+    });
+
+    expect(result.current.tabs).toEqual([AGENT_BROWSER_TAB_ID]);
+    expect(result.current.selected).toBe(AGENT_BROWSER_TAB_ID);
+  });
 });

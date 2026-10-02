@@ -929,10 +929,22 @@ function WorkspacePanelImpl({
       return showFilesPanel;
     }) ?? "subagents";
   useEffect(() => {
-    if (rightRailTab === "browser" && browsers.selected === null) {
+    if (
+      rightRailTab === "browser" &&
+      browsers.selected === null &&
+      selectedFilePath === null &&
+      selectedTerminalKey === null
+    ) {
       onRightRailTabChange(browserFallbackTab);
     }
-  }, [rightRailTab, browsers.selected, browserFallbackTab, onRightRailTabChange]);
+  }, [
+    rightRailTab,
+    browsers.selected,
+    selectedFilePath,
+    selectedTerminalKey,
+    browserFallbackTab,
+    onRightRailTabChange,
+  ]);
   const tabTriggers = {
     files: (pending || showFilesPanel) && (
       <WorkspaceTabTooltip key="files" label="Files">

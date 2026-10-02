@@ -482,6 +482,28 @@ describe("WorkspacePanel shell tabs", () => {
     // e.g. the Files tab never look selected at once.
     expect(screen.getByRole("tab", { name: /files/i })).toHaveAttribute("data-state", "inactive");
   });
+
+  it("keeps an active shell selected when the last background browser closes", async () => {
+    writeSessionWorkspaceState("conv_ws", {
+      openBrowsers: ["browser-1"],
+      selectedBrowserId: "browser-1",
+    });
+    useTerminalsMock.mockReturnValue({ terminals: [term], isLoading: false, error: null });
+    const { onRightRailTabChange } = renderWorkspace({
+      showBrowserTab: true,
+      rightRailTab: "browser",
+      openTerminals: [termKey],
+      selectedTerminalKey: termKey,
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "Close Browser 1" }));
+
+    await waitFor(() =>
+      expect(screen.queryByRole("tab", { name: "Browser 1" })).not.toBeInTheDocument(),
+    );
+    expect(onRightRailTabChange).not.toHaveBeenCalled();
+    expect(await screen.findByTestId("terminal-view-stub")).toHaveTextContent("terminal_zsh_s1");
+  });
 });
 
 describe('WorkspacePanel "+" new-tab menu', () => {
