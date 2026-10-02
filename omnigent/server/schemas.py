@@ -30,6 +30,7 @@ from omnigent.entities import (
     USER_SESSION_TITLE_MAX_CHARS,
     ConversationItem,
 )
+from omnigent.harness_availability import HarnessAvailability
 from omnigent.inner.native_attachments import reject_authored_framework_notices
 
 # ── Shared ──────────────────────────────────────────────────────
@@ -5115,3 +5116,46 @@ class UpdateProjectRequest(BaseModel):
         if len(trimmed) > 100:
             raise ValueError("name must be at most 100 characters")
         return trimmed
+
+
+class HostSummary(BaseModel):
+    """
+    One host in ``GET /v1/hosts``.
+
+    :param host_id: Host identifier, e.g. ``"host_a1b2c3d4..."``.
+    :param name: Human-readable host name, e.g. ``"corey-macbook"``.
+    :param owner: User id that owns the host, e.g. ``"alice@example.com"``
+        (``"local"`` on a single-user server).
+    :param status: ``"online"`` when the host was seen within the
+        liveness window, otherwise ``"offline"``.
+    :param sandbox_provider: Non-null marks a server-managed sandbox host,
+        e.g. ``"modal"``; clients hide these from manual host pickers.
+    :param configured_harnesses: Per-harness readiness from the host's last
+        handshake, e.g. ``{"claude-sdk": true, "codex": "needs-auth"}``.
+        ``None`` when the host never reported it (unknown, not "nothing
+        configured").
+    :param gateway_inference: Per-harness gateway-inference map the host
+        reported to this replica, or ``None`` when this replica has no report
+        yet (unknown, not "not gateway-backed").
+    :param interactive_shells: Ordered shell inventory the host reported,
+        e.g. ``["zsh", "bash"]``, or ``None`` when unreported.
+    """
+
+    host_id: str
+    name: str
+    owner: str
+    status: Literal["online", "offline"]
+    sandbox_provider: str | None
+    configured_harnesses: dict[str, HarnessAvailability] | None
+    gateway_inference: dict[str, bool] | None
+    interactive_shells: list[str] | None
+
+
+class HostList(BaseModel):
+    """
+    Response body for ``GET /v1/hosts``.
+
+    :param hosts: Hosts owned by the caller, online and offline.
+    """
+
+    hosts: list[HostSummary]

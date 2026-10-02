@@ -203,6 +203,71 @@ async def test_list_hosts_returns_connected_host(
     assert hosts[0]["sandbox_provider"] is None
 
 
+async def test_list_hosts_wire_shape_is_the_documented_host_summary(
+    host_api_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+) -> None:
+    """
+    Pin the exact ``GET /v1/hosts`` payload to the ``HostSummary`` fields.
+
+    The route returns a typed ``HostList`` (#8690). Every documented field
+    must be present, unreported values must stay ``null`` (clients tell
+    "unknown" from "none" by it), and nothing undocumented may leak.
+    """
+    app, registry, _hs, _cs = host_api_app
+    _comm = await _connect_host(
+        app,
+        registry,
+        configured_harnesses={"claude-sdk": True, "codex": "needs-auth"},
+        gateway_inference={"claude-native": True},
+    )
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.get("/v1/hosts")
+
+    assert resp.status_code == 200
+    assert resp.json() == {
+        "hosts": [
+            {
+                "host_id": _HOST_ID,
+                "name": "test-laptop",
+                "owner": "local",
+                "status": "online",
+                "sandbox_provider": None,
+                "configured_harnesses": {"claude-sdk": True, "codex": "needs-auth"},
+                "gateway_inference": {"claude-native": True},
+                "interactive_shells": None,
+            }
+        ]
+    }
+
+
+def test_list_hosts_openapi_documents_host_list(
+    host_api_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+) -> None:
+    """
+    ``GET /v1/hosts`` must document a typed ``HostList`` (#8690).
+
+    Before, the response was inferred from ``dict[str, list[dict[str, Any]]]``,
+    so generated clients saw untyped items and could not read ``host_id``,
+    ``status`` or ``owner``.
+    """
+    from omnigent.server.schemas import HostSummary
+
+    app, _reg, _hs, _cs = host_api_app
+    spec = app.openapi()
+    response = spec["paths"]["/v1/hosts"]["get"]["responses"]["200"]
+    assert response["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/HostList"
+    }
+    schemas = spec["components"]["schemas"]
+    assert schemas["HostList"]["properties"]["hosts"]["items"] == {
+        "$ref": "#/components/schemas/HostSummary"
+    }
+    summary = schemas["HostSummary"]
+    assert set(summary["properties"]) == set(HostSummary.model_fields)
+    assert summary["properties"]["status"]["enum"] == ["online", "offline"]
+
+
 async def test_list_hosts_reports_sandbox_provider_for_managed_host(
     host_api_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
 ) -> None:

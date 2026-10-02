@@ -2682,6 +2682,24 @@
         "title": "HeartbeatEvent",
         "type": "object"
       },
+      "HostList": {
+        "description": "Response body for `GET /v1/hosts`.",
+        "properties": {
+          "hosts": {
+            "description": "Hosts owned by the caller, online and offline.",
+            "items": {
+              "$ref": "#/components/schemas/HostSummary"
+            },
+            "title": "Hosts",
+            "type": "array"
+          }
+        },
+        "required": [
+          "hosts"
+        ],
+        "title": "HostList",
+        "type": "object"
+      },
       "HostModelOptionsResponse": {
         "description": "Pre-launch model choices resolved by a host harness.\n\n`error` carries the host's reason for an empty catalog \u2014 a probe that\nfailed on the host is not a transport failure, so the request still\nsucceeds and the picker can say WHY it is empty instead of a generic\n\"Models unavailable\".",
         "properties": {
@@ -2717,6 +2735,110 @@
           "routable_models"
         ],
         "title": "HostModelOptionsResponse",
+        "type": "object"
+      },
+      "HostSummary": {
+        "description": "One host in `GET /v1/hosts`.",
+        "properties": {
+          "configured_harnesses": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "enum": [
+                    true,
+                    false,
+                    "binary-missing",
+                    "needs-auth",
+                    "version-too-low"
+                  ]
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Per-harness readiness from the host's last handshake, e.g. `{\"claude-sdk\": true, \"codex\": \"needs-auth\"}`. `None` when the host never reported it (unknown, not \"nothing configured\").",
+            "title": "Configured Harnesses"
+          },
+          "gateway_inference": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "type": "boolean"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Per-harness gateway-inference map the host reported to this replica, or `None` when this replica has no report yet (unknown, not \"not gateway-backed\").",
+            "title": "Gateway Inference"
+          },
+          "host_id": {
+            "description": "Host identifier, e.g. `\"host_a1b2c3d4...\"`.",
+            "title": "Host Id",
+            "type": "string"
+          },
+          "interactive_shells": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Ordered shell inventory the host reported, e.g. `[\"zsh\", \"bash\"]`, or `None` when unreported.",
+            "title": "Interactive Shells"
+          },
+          "name": {
+            "description": "Human-readable host name, e.g. `\"corey-macbook\"`.",
+            "title": "Name",
+            "type": "string"
+          },
+          "owner": {
+            "description": "User id that owns the host, e.g. `\"alice@example.com\"` (`\"local\"` on a single-user server).",
+            "title": "Owner",
+            "type": "string"
+          },
+          "sandbox_provider": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Non-null marks a server-managed sandbox host, e.g. `\"modal\"`; clients hide these from manual host pickers.",
+            "title": "Sandbox Provider"
+          },
+          "status": {
+            "description": "`\"online\"` when the host was seen within the liveness window, otherwise `\"offline\"`.",
+            "enum": [
+              "online",
+              "offline"
+            ],
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "host_id",
+          "name",
+          "owner",
+          "status",
+          "sandbox_provider",
+          "configured_harnesses",
+          "gateway_inference",
+          "interactive_shells"
+        ],
+        "title": "HostSummary",
         "type": "object"
       },
       "ImportFailureRef": {
@@ -9485,22 +9607,14 @@
     },
     "/v1/hosts": {
       "get": {
-        "description": "List all hosts owned by the authenticated user.\n\nReturns both online and offline hosts, with live runner\ninformation for online hosts.\n\n**Returns:** `{\"hosts\": [...]}` with host details \u2014 `host_id`, `name`, `owner`, `status`, `sandbox_provider`, `configured_harnesses`, and `gateway_inference` (`None` when no connected host has reported it to this replica).",
+        "description": "List all hosts owned by the authenticated user.\n\nReturns both online and offline hosts, with live runner\ninformation for online hosts.\n\n**Returns:** A `HostList`; each `HostSummary` carries `host_id`, `name`, `owner`, `status`, `sandbox_provider`, `configured_harnesses`, `gateway_inference` and `interactive_shells` (the last two `None` when no connected host has reported them to this replica).",
         "operationId": "list_hosts_v1_hosts_get",
         "responses": {
           "200": {
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": {
-                    "items": {
-                      "additionalProperties": true,
-                      "type": "object"
-                    },
-                    "type": "array"
-                  },
-                  "title": "Response List Hosts V1 Hosts Get",
-                  "type": "object"
+                  "$ref": "#/components/schemas/HostList"
                 }
               }
             },
