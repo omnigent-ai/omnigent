@@ -23,7 +23,12 @@ const state = vi.hoisted(() => ({
   } | null,
   // Per-file diffs the stubbed parsePatchFiles yields (name + optional
   // rename fields), so tests can exercise renamed/pure-rename rendering.
-  parsedFiles: [] as { name: string; prevName?: string; type?: string }[],
+  parsedFiles: [] as {
+    name: string;
+    prevName?: string;
+    type?: string;
+    unifiedLineCount?: number;
+  }[],
 }));
 
 vi.mock("@/hooks/useGithub", () => ({
@@ -74,7 +79,7 @@ vi.mock("@/components/ai-elements/message", () => ({
 
 import { useGithubInfo, useGithubChangedFiles } from "@/hooks/useGithub";
 
-import { GithubPanel, deriveGithubPanelState } from "./GithubPanel";
+import { GithubPanel, deriveGithubPanelState, LARGE_DIFF_THRESHOLD } from "./GithubPanel";
 import { RunnerOfflineError } from "@/hooks/useWorkspaceChangedFiles";
 
 function file(
@@ -486,6 +491,52 @@ describe("GithubPanel", () => {
       key: "Escape",
     });
     expect(screen.queryByRole("textbox", { name: "Pull request URL" })).toBeNull();
+  });
+
+  it("shows the diff immediately when unifiedLineCount is at the threshold", async () => {
+    state.parsedFiles = [{ name: "hello.py", unifiedLineCount: LARGE_DIFF_THRESHOLD }];
+    state.changes = {
+      data: { available: true, data: [file("hello.py", "modified")] },
+      isLoading: false,
+      error: null,
+      isFetching: false,
+    };
+    renderChanges();
+    // Exactly at the threshold: diff renders, no affordance.
+    expect(await screen.findByTestId("diff")).toBeInTheDocument();
+    expect(screen.queryByText(/Large diff/)).toBeNull();
+  });
+
+  it("replaces a file's diff with a large-diff affordance when unifiedLineCount exceeds the threshold", async () => {
+    state.parsedFiles = [
+      { name: "hello.py", unifiedLineCount: LARGE_DIFF_THRESHOLD + 1 },
+      { name: "src/app.ts" },
+    ];
+    renderChanges();
+    // The oversized file shows the affordance; the normal file renders its diff.
+    expect(await screen.findByText(/Large diff/)).toBeInTheDocument();
+    expect(
+      screen.getByText(new RegExp(`${(LARGE_DIFF_THRESHOLD + 1).toLocaleString()}\\s*lines`)),
+    ).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Show diff" })).toBeInTheDocument();
+    const diffs = screen.getAllByTestId("diff");
+    expect(diffs).toHaveLength(1);
+    expect(diffs[0].getAttribute("data-path")).toBe("src/app.ts");
+  });
+
+  it("reveals the diff after clicking Show diff", async () => {
+    state.parsedFiles = [{ name: "hello.py", unifiedLineCount: LARGE_DIFF_THRESHOLD + 1 }];
+    state.changes = {
+      data: { available: true, data: [file("hello.py", "modified")] },
+      isLoading: false,
+      error: null,
+      isFetching: false,
+    };
+    renderChanges();
+    await screen.findByText(/Large diff/);
+    fireEvent.click(screen.getByRole("button", { name: "Show diff" }));
+    expect(await screen.findByTestId("diff")).toHaveAttribute("data-path", "hello.py");
+    expect(screen.queryByText(/Large diff/)).toBeNull();
   });
 });
 
