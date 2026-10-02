@@ -11,8 +11,8 @@ to stop "everything", the connect command now prompts on a clean stop:
 These tests drive the real CLI under a PTY, send a real SIGINT (Ctrl+C),
 and verify the branches against the *actual* server process:
 
-1. Answering ``y`` stops the detached server — its ``/health`` endpoint
-   stops responding.
+1. Answering ``y`` stops the detached server process, even if another
+   server subsequently binds the same port.
 2. Answering ``n`` leaves the server running — ``/health`` still answers
    200 after the host process has exited. The test then stops the
    stranded server itself so it does not leak past the test.
@@ -30,15 +30,15 @@ actually terminate the server — none of which a mock-based test would catch.
 from __future__ import annotations
 
 import contextlib
-import os
-import signal
 import subprocess
 import threading
+import time
 from collections.abc import Mapping
 from pathlib import Path
 
 import httpx
 import pexpect
+import psutil
 
 # The host daemon's WS tunnel + local-server boot take the same path the
 # REPL lifecycle e2e exercises; 90s mirrors that suite's readiness budget so
@@ -174,15 +174,39 @@ def _wait_for_health(port: int, *, expected: bool, timeout: float) -> bool:
     return _server_healthy(port) == expected
 
 
-def _force_stop_server(pid: int) -> None:
-    """
-    Best-effort SIGTERM the detached local server so it never leaks.
+def _server_running(server: psutil.Process) -> bool:
+    """Check the captured process identity, treating zombies as exited."""
+    try:
+        return server.is_running() and server.status() != psutil.STATUS_ZOMBIE
+    except psutil.NoSuchProcess:
+        return False
 
-    :param pid: Recorded server process id.
+
+def _wait_for_server_exit(server: psutil.Process, *, timeout: float) -> bool:
+    """Wait for our server to exit without confusing a reused port with it."""
+    deadline = time.monotonic() + timeout
+    while _server_running(server):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        _POLL_PAUSE.wait(min(0.25, remaining))
+    return True
+
+
+def _force_stop_server(server: psutil.Process) -> None:
+    """
+    Stop only the captured server process, escalating if graceful exit stalls.
+
+    :param server: Process identity captured while the server was running.
     :returns: None.
     """
-    with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
-        os.kill(pid, signal.SIGTERM)
+    with contextlib.suppress(psutil.NoSuchProcess):
+        server.terminate()
+        if not _wait_for_server_exit(server, timeout=10):
+            server.kill()
+            assert _wait_for_server_exit(server, timeout=5), (
+                f"server {server.pid} survived SIGKILL"
+            )
 
 
 def _boot_connect_and_get_server(child: pexpect.spawn, home: Path) -> tuple[int, int]:
@@ -254,9 +278,11 @@ def _prespawn_persistent_server(
         )
         return pid, port
     except BaseException:
-        with contextlib.suppress(AssertionError, OSError, ValueError, IndexError):
+        with contextlib.suppress(
+            AssertionError, OSError, ValueError, IndexError, psutil.NoSuchProcess
+        ):
             leaked_pid, _leaked_port = _read_local_server_record(home)
-            _force_stop_server(leaked_pid)
+            _force_stop_server(psutil.Process(leaked_pid))
         raise
 
 
@@ -278,9 +304,10 @@ def test_host_ctrl_c_yes_stops_local_server(
     home = tmp_path / "home"
     env = _connect_env(mock_credentials_env, home)
     child = _spawn_connect(omnigent_python, omnigent_repo_root, env)
-    server_pid = -1
+    server = None
     try:
         server_pid, port = _boot_connect_and_get_server(child, home)
+        server = psutil.Process(server_pid)
 
         # Real SIGINT to the foreground host process group. The detached
         # server runs in its own session (start_new_session=True) so it does
@@ -293,16 +320,15 @@ def test_host_ctrl_c_yes_stops_local_server(
         child.expect(_STOPPED_MARKER, timeout=_PROMPT_TIMEOUT)
         child.expect(pexpect.EOF, timeout=_EXIT_TIMEOUT)
 
-        # The decisive end-to-end assertion: the real server process actually
-        # went down. If the prompt's "yes" branch were wired wrong (or stop
-        # was a no-op), /health would keep answering 200 here.
-        assert _wait_for_health(port, expected=False, timeout=_HEALTH_POLL_TIMEOUT), (
-            f"local server on port {port} was still healthy after answering "
+        # Another worker can immediately reuse the released port. Check the
+        # process identity captured before Ctrl+C instead of that port's health.
+        assert _wait_for_server_exit(server, timeout=_HEALTH_POLL_TIMEOUT), (
+            f"local server pid {server_pid} on port {port} was still running after answering "
             f"'y' — the stop-server prompt did not actually stop it"
         )
     finally:
-        if server_pid > 0:
-            _force_stop_server(server_pid)
+        if server is not None:
+            _force_stop_server(server)
         if not child.closed:
             child.close(force=True)
 
@@ -329,9 +355,10 @@ def test_host_ctrl_c_no_leaves_local_server_running(
     home = tmp_path / "home"
     env = _connect_env(mock_credentials_env, home)
     child = _spawn_connect(omnigent_python, omnigent_repo_root, env)
-    server_pid = -1
+    server = None
     try:
         server_pid, port = _boot_connect_and_get_server(child, home)
+        server = psutil.Process(server_pid)
 
         child.sendcontrol("c")
         child.expect_exact(_PROMPT_MARKER, timeout=_PROMPT_TIMEOUT)
@@ -344,15 +371,15 @@ def test_host_ctrl_c_no_leaves_local_server_running(
         # The decisive end-to-end assertion: the real server is STILL up after
         # the host process exited. If "no" accidentally stopped it (or the
         # default were inverted), /health would fail here.
-        assert _server_healthy(port), (
+        assert _server_running(server) and _server_healthy(port), (
             f"local server on port {port} was stopped after answering 'n' — "
             f"declining the prompt must leave the detached server running"
         )
     finally:
         # The whole point of "no" is that the server survives the connect
         # process, so the test owns stopping it to avoid leaking a server.
-        if server_pid > 0:
-            _force_stop_server(server_pid)
+        if server is not None:
+            _force_stop_server(server)
         if not child.closed:
             child.close(force=True)
 
@@ -384,6 +411,7 @@ def test_host_ctrl_c_reused_server_shows_no_prompt(
     # Bring the server up first, independently of connect, with a config
     # signature that matches what connect will compute — so connect reuses it.
     server_pid, port = _prespawn_persistent_server(omnigent_python, omnigent_repo_root, env)
+    server = psutil.Process(server_pid)
     child: pexpect.spawn | None = None
     try:
         child = _spawn_connect(omnigent_python, omnigent_repo_root, env)
@@ -408,11 +436,11 @@ def test_host_ctrl_c_reused_server_shows_no_prompt(
         )
 
         # The reused server is untouched and still serving.
-        assert _server_healthy(port), (
+        assert _server_running(server) and _server_healthy(port), (
             f"reused local server on port {port} went down after connect exited "
             f"— connect must not stop a server it did not spawn"
         )
     finally:
-        _force_stop_server(server_pid)
+        _force_stop_server(server)
         if child is not None and not child.closed:
             child.close(force=True)
