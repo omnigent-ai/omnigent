@@ -19,6 +19,7 @@ from omnigent.inner.os_env import EditEntry, OpResult, OSEnvironment
 from omnigent.inner.terminal import TerminalInstance
 from omnigent.runner.resource_registry import (
     _TERMINAL_EXIT_OUTPUT_MAX_CHARS,
+    _TERMINAL_EXIT_OUTPUT_MAX_LINES,
     CLAUDE_NATIVE_TERMINAL_ROLE,
     CODEX_NATIVE_TERMINAL_ROLE,
     PI_NATIVE_TERMINAL_ROLE,
@@ -907,6 +908,14 @@ def test_trim_terminal_output_keeps_long_line_before_final_line() -> None:
     assert trimmed is not None
     assert trimmed.endswith("z\npane is dead (status 2)")
     assert len(trimmed.split("\n", 1)[1]) == _TERMINAL_EXIT_OUTPUT_MAX_CHARS
+
+
+def test_trim_terminal_output_skips_blank_pane_rows() -> None:
+    # A dead pane's capture has its output at the top, then blank rows down to
+    # tmux's "Pane is dead" line; the blank rows must not use up the line budget.
+    blank_rows = "\n" * (_TERMINAL_EXIT_OUTPUT_MAX_LINES + 10)
+    text = f"Error: failed to get token\n{blank_rows}Pane is dead (status 1)"
+    assert trim_terminal_output(text) == "Error: failed to get token\nPane is dead (status 1)"
 
 
 def test_trim_terminal_output_hard_clips_single_overlong_line() -> None:

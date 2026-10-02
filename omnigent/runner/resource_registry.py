@@ -201,7 +201,9 @@ def trim_terminal_output(text: str | None) -> str | None:
     stripped = text.strip()
     if not stripped:
         return None
-    lines = stripped.splitlines()
+    # A tmux capture pads the screen with blank rows; left in, they fill the
+    # line budget and push the real output out ahead of "pane is dead".
+    lines = [line for line in stripped.splitlines() if line.strip()]
     full = "\n".join(lines)
     body = "\n".join(lines[-_TERMINAL_EXIT_OUTPUT_MAX_LINES:])
     # Keep the tail by characters: dropping whole lines would discard one long
