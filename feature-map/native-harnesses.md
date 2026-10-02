@@ -99,10 +99,10 @@ Cross-harness journeys:
   deadline. `tests/e2e/test_codex_native_app_server_disconnect_e2e.py` covers
   pending requests, cancellation, and a reply arriving before disconnect.
   Both use real loopback WebSockets with a controlled peer.
-  `tests/test_codex_native_app_server_event_stream.py` adds multiple waiting
+  `tests/harnesses/codex_native/test_codex_native_app_server_event_stream.py` adds multiple waiting
   consumers and reconnecting the same client to receive fresh events.
 - **`disconnect`, Codex startup consumers (component tests):**
-  `tests/test_codex_native.py::test_wait_for_thread_started_fails_when_stream_ends`
+  `tests/harnesses/codex_native/session/test_subscription.py::test_wait_for_thread_started_fails_when_stream_ends`
   checks the CLI error with a fake client;
   `tests/runner/test_codex_startup_telemetry.py::test_startup_failure_is_visible_at_error_and_belongs_to_child`
   checks host-started failure reporting with stubbed discovery. Run these with
