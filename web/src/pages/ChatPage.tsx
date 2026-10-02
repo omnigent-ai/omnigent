@@ -256,7 +256,13 @@ import {
 import { isCodexNativeSession } from "@/lib/codexPlanMode";
 import { getCliServerUrl } from "@/lib/host";
 import { useOmnigentAnalytics } from "@/lib/analyticsEmit";
-import { GoalDialog, CommandGoalDialog, GoalStatusPill, useGoalState } from "@/components/goal";
+import {
+  GoalDialog,
+  CommandGoalDialog,
+  GoalStatusPill,
+  useGoalRefreshOnTurnChange,
+  useGoalState,
+} from "@/components/goal";
 import { useIsCoarsePointer } from "@/hooks/useIsCoarsePointer";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { ConnectionIndicator } from "./ChatIndicators";
@@ -2597,10 +2603,14 @@ function ComposerImpl(
     }
   };
   useEffect(() => setGoalDialogOpen(false), [conversationId]);
-  const { goal, setGoal: setGoalState } = useGoalState(
-    composerSessionId,
-    showGoalControl && runnerOnline === true,
-  );
+  const {
+    goal,
+    setGoal: setGoalState,
+    refresh: refreshGoalState,
+  } = useGoalState(composerSessionId, showGoalControl && runnerOnline === true);
+  // Refresh goal state as Codex-native turns start and end, so a typed /goal and
+  // its completion show up without a page reload.
+  useGoalRefreshOnTurnChange(composerSessionId, sessionStatus, showGoalControl, refreshGoalState);
   // "@"-file-mention is scoped to the native coding-agent harnesses: their
   // vendor CLIs run in the workspace and read an on-disk file from an
   // attachment marker the executor already emits. In-process SDK sessions
