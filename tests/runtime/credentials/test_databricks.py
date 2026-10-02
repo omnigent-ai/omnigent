@@ -7,6 +7,9 @@ from pathlib import Path
 
 import pytest
 
+# Bound at import time, before the autouse fixture stubs the module attribute.
+from databricks.sdk.config import Config as _RealSdkConfig
+
 from omnigent.runtime.credentials.databricks import (
     WorkspaceCreds,
     resolve_databricks_workspace,
@@ -104,6 +107,69 @@ def test_resolves_default_when_profile_is_none(
 
     # profile=None went straight to [DEFAULT] and pulled both values.
     assert creds == WorkspaceCreds(host="https://default.example.com", token="default-token")
+
+
+def test_duplicate_default_sections_resolve_instead_of_crashing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """
+    A ``.databrickscfg`` with a duplicate ``[DEFAULT]`` section (as written
+    by the Databricks VS Code extension) must resolve instead of raising
+    ``configparser.DuplicateOptionError``. Non-strict parsing keeps the
+    last value, matching the databricks-sdk and the executor's readers.
+    """
+    cfg = _write_cfg(
+        tmp_path,
+        (
+            "[DEFAULT]\n"
+            "host = https://first.example.com\n"
+            "token = first-token\n"
+            "\n"
+            "[DEFAULT]\n"
+            "host = https://second.example.com\n"
+            "token = second-token\n"
+        ),
+    )
+    monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(cfg))
+
+    creds = resolve_databricks_workspace(profile=None)
+
+    assert creds == WorkspaceCreds(host="https://second.example.com", token="second-token")
+
+
+def test_sdk_rejecting_duplicate_default_sections_falls_through_to_cfg(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # Re-enable the real SDK ``Config``: its strict parser raises
+    # ``configparser.DuplicateOptionError`` (not a ``ValueError``) on the
+    # duplicated ``[DEFAULT]``. The resolver must fall through to the
+    # tolerant cfg path instead of propagating the parse error.
+    monkeypatch.setattr("databricks.sdk.config.Config", _RealSdkConfig)
+    for var in (
+        "DATABRICKS_HOST",
+        "DATABRICKS_TOKEN",
+        "DATABRICKS_CLIENT_ID",
+        "DATABRICKS_CLIENT_SECRET",
+        "DATABRICKS_AUTH_TYPE",
+    ):
+        monkeypatch.delenv(var, raising=False)
+    cfg = _write_cfg(
+        tmp_path,
+        (
+            "[DEFAULT]\n"
+            "host = https://first.example.com\n"
+            "token = first-token\n"
+            "\n"
+            "[DEFAULT]\n"
+            "host = https://second.example.com\n"
+            "token = second-token\n"
+        ),
+    )
+    monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(cfg))
+
+    creds = resolve_databricks_workspace(profile=None)
+
+    assert creds == WorkspaceCreds(host="https://second.example.com", token="second-token")
 
 
 def test_named_profile_overrides_default(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

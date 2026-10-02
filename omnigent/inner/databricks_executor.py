@@ -135,6 +135,8 @@ def _read_databrickscfg(profile: str | None = None) -> DatabricksCredentials | N
        by non-executor callers that only need a one-shot credential
        check.
     """
+    import configparser
+
     try:
         from databricks.sdk.config import Config
     except ImportError:
@@ -147,11 +149,10 @@ def _read_databrickscfg(profile: str | None = None) -> DatabricksCredentials | N
     try:
         cfg = Config(profile=sdk_profile)
         headers = cfg.authenticate()
-    except ValueError as profile_exc:
-        # ValueError is what Config raises for every user-facing resolution
-        # failure (missing profile, malformed file, no credentials in env,
-        # unknown auth_type, etc.). Anything else (e.g. network errors
-        # fetching OAuth tokens) should propagate.
+    except (ValueError, configparser.Error) as profile_exc:
+        # Config raises ValueError for user-facing resolution failures; its
+        # strict ConfigParser raises configparser.Error on a duplicated section
+        # or key, which the file fallback tolerates. Anything else propagates.
         logger.debug(
             "databricks-sdk credential resolution failed for profile %r: %s",
             sdk_profile,
@@ -166,7 +167,7 @@ def _read_databrickscfg(profile: str | None = None) -> DatabricksCredentials | N
             try:
                 cfg = Config()
                 headers = cfg.authenticate()
-            except ValueError:
+            except (ValueError, configparser.Error):
                 return _read_databrickscfg_file_fallback(profile)
         else:
             return _read_databrickscfg_file_fallback(profile)
@@ -210,7 +211,9 @@ def _read_databrickscfg_file_fallback(profile: str | None = None) -> DatabricksC
     if not cfg_path.exists():
         return None
 
-    config = configparser.ConfigParser()
+    # strict=False: tolerate the duplicated [DEFAULT] some tools (e.g. the Databricks
+    # VS Code extension) leave in ~/.databrickscfg; the last value wins.
+    config = configparser.ConfigParser(strict=False)
     config.read(cfg_path)
 
     resolved_profile = profile or os.environ.get("DATABRICKS_CONFIG_PROFILE")
@@ -406,7 +409,8 @@ def _read_databrickscfg_host(profile: str | None = None) -> str | None:
     if not cfg_path.exists():
         return None
 
-    config = configparser.ConfigParser()
+    # strict=False: tolerate duplicate sections/keys in ~/.databrickscfg.
+    config = configparser.ConfigParser(strict=False)
     config.read(cfg_path)
 
     resolved_profile = profile or os.environ.get("DATABRICKS_CONFIG_PROFILE")
@@ -689,6 +693,8 @@ def _resolve_databricks_auth(
         installed.
     :raises ValueError: When both ``profile`` and ``host`` are given.
     """
+    import configparser
+
     try:
         from databricks.sdk.config import Config
     except ImportError as exc:
@@ -708,7 +714,9 @@ def _resolve_databricks_auth(
     try:
         cfg = Config(profile=sdk_profile)
         cfg.authenticate()
-    except ValueError:
+    except (ValueError, configparser.Error):
+        # configparser.Error: the SDK's strict parser rejected the config file
+        # (e.g. a duplicated [DEFAULT]); the file fallback below tolerates it.
         if profile is None and sdk_profile is not None:
             # Profile name came from the DATABRICKS_CONFIG_PROFILE env var,
             # not from an explicit profile argument.  Fall back to the
@@ -728,7 +736,7 @@ def _resolve_databricks_auth(
             try:
                 cfg = Config()
                 cfg.authenticate()
-            except ValueError:
+            except (ValueError, configparser.Error):
                 cfg = None
         else:
             cfg = None
@@ -1096,7 +1104,8 @@ def databrickscfg_workspace_id_for_host(host: str) -> str | None:
     cfg_path = Path(os.environ.get("DATABRICKS_CONFIG_FILE") or (Path.home() / ".databrickscfg"))
     if not cfg_path.exists():
         return None
-    config = configparser.ConfigParser()
+    # strict=False: tolerate duplicate sections/keys in ~/.databrickscfg.
+    config = configparser.ConfigParser(strict=False)
     try:
         config.read(cfg_path)
     except configparser.Error:
@@ -1117,7 +1126,8 @@ def databrickscfg_workspace_id_for_profile(profile: str) -> str | None:
     cfg_path = Path(os.environ.get("DATABRICKS_CONFIG_FILE") or (Path.home() / ".databrickscfg"))
     if not cfg_path.exists():
         return None
-    config = configparser.ConfigParser()
+    # strict=False: tolerate duplicate sections/keys in ~/.databrickscfg.
+    config = configparser.ConfigParser(strict=False)
     try:
         config.read(cfg_path)
     except configparser.Error:

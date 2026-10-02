@@ -2521,6 +2521,135 @@ def test_stream_ended_without_finish_reason_with_content_completes() -> None:
     _run(_t())
 
 
+def test_read_databrickscfg_fallback_tolerates_duplicate_default_section(
+    tmp_path: _Path, monkeypatch: pytest.MonkeyPatch, clean_databricks_env: None
+) -> None:
+    """
+    A ``~/.databrickscfg`` with a duplicate ``[DEFAULT]`` section (as written by
+    the Databricks VS Code extension) must not crash the file readers.
+
+    ``configparser.ConfigParser`` defaults to ``strict=True`` and raised
+    ``DuplicateOptionError`` on such files. The readers now parse in
+    non-strict mode, where the last value wins.
+    """
+    contents = textwrap.dedent(
+        """
+        [DEFAULT]
+        host = https://first.cloud.databricks.com
+        token = dapi-first
+
+        [DEFAULT]
+        host = https://second.cloud.databricks.com
+        token = dapi-second
+        """
+    ).lstrip()
+    cfg_path = tmp_path / "databrickscfg"
+    cfg_path.write_text(contents)
+    monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(cfg_path))
+
+    creds = _read_databrickscfg_file_fallback()
+    assert creds is not None
+    assert creds.host == "https://second.cloud.databricks.com"
+    assert creds.token == "dapi-second"
+
+    # The host-only reader must survive the same file too.
+    assert _read_databrickscfg_host() == "https://second.cloud.databricks.com"
+
+
+def test_workspace_id_for_profile_tolerates_duplicate_default_section(
+    tmp_path: _Path, monkeypatch: pytest.MonkeyPatch, clean_databricks_env: None
+) -> None:
+    """
+    The exact-profile ``workspace_id`` reader must survive a ``~/.databrickscfg``
+    with a duplicate ``[DEFAULT]`` section. Its ``configparser.Error`` guard used
+    to swallow the strict-mode parse failure and return ``None``, silently
+    losing the recorded workspace id. Non-strict parsing keeps the last value.
+    """
+    contents = textwrap.dedent(
+        """
+        [DEFAULT]
+        host = https://first.cloud.databricks.com
+        workspace_id = 1111111111111111
+
+        [DEFAULT]
+        host = https://second.cloud.databricks.com
+        workspace_id = 2222222222222222
+        """
+    ).lstrip()
+    cfg_path = tmp_path / "databrickscfg"
+    cfg_path.write_text(contents)
+    monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(cfg_path))
+
+    assert databrickscfg_workspace_id_for_profile("DEFAULT") == "2222222222222222"
+
+
+def _write_duplicate_default_cfg(tmp_path: _Path, monkeypatch: pytest.MonkeyPatch) -> _Path:
+    """Point ``DATABRICKS_CONFIG_FILE`` at a cfg whose ``[DEFAULT]`` block repeats."""
+    cfg_path = tmp_path / "databrickscfg"
+    cfg_path.write_text(
+        textwrap.dedent(
+            """
+            [DEFAULT]
+            host = https://first.cloud.databricks.com
+            token = dapi-first
+
+            [DEFAULT]
+            host = https://second.cloud.databricks.com
+            token = dapi-second
+            """
+        ).lstrip()
+    )
+    monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(cfg_path))
+    return cfg_path
+
+
+@pytest.mark.parametrize("profile", [None, "DEFAULT"], ids=["ambient", "explicit-default"])
+def test_read_databrickscfg_falls_back_when_sdk_rejects_duplicate_default_section(
+    profile: str | None,
+    tmp_path: _Path,
+    monkeypatch: pytest.MonkeyPatch,
+    clean_databricks_env: None,
+) -> None:
+    """
+    The real SDK ``Config`` parses ``~/.databrickscfg`` with a strict
+    ``ConfigParser`` and raises ``configparser.DuplicateOptionError`` (not a
+    ``ValueError``) on a duplicated ``[DEFAULT]``. The wrapper must treat that
+    like any other SDK resolution failure and fall through to the tolerant
+    file reader instead of letting the parse error escape to the caller.
+    """
+    _write_duplicate_default_cfg(tmp_path, monkeypatch)
+
+    creds = _read_databrickscfg(profile)
+
+    assert creds is not None
+    assert creds.host == "https://second.cloud.databricks.com"
+    assert creds.token == "dapi-second"
+
+
+def test_resolve_databricks_auth_uses_pat_when_sdk_rejects_duplicate_default_section(
+    tmp_path: _Path,
+    monkeypatch: pytest.MonkeyPatch,
+    clean_databricks_env: None,
+) -> None:
+    """
+    Same duplicated ``[DEFAULT]`` on the per-request auth path: the SDK's
+    parse error must fall through to the static-PAT fallback rather than
+    surface as a misleading "run databricks auth login" failure.
+    """
+    from omnigent.inner.databricks_executor import (
+        _DatabricksBearerAuth,
+        _resolve_databricks_auth,
+    )
+
+    _write_duplicate_default_cfg(tmp_path, monkeypatch)
+
+    auth, host = _resolve_databricks_auth()
+
+    assert isinstance(auth, _DatabricksBearerAuth)
+    assert host == "https://second.cloud.databricks.com"
+    assert auth.current_token() == "dapi-second"
+
+
 def test_databrickscfg_workspace_id_for_host_reads_matching_profile(
     tmp_path: _Path, monkeypatch: pytest.MonkeyPatch, clean_databricks_env: None
 ) -> None:
