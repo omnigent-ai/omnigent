@@ -344,7 +344,12 @@ class TunnelRegistry:
                 removed,
                 ConnectionError("tunnel closed before request completed"),
             )
-        _retire_session_writer(removed, code=4003, reason="tunnel closed")
+        # 1001 ("going away"), not 4003: it lands in the runner's existing
+        # tunnel-recycle path (serve.py's ``_TUNNEL_RECYCLE_CLOSE_CODES``) for a
+        # prompt, spread reconnect instead of an escalating backoff. Avoid 1012
+        # too — the server's own shutdown_state treats an observed 1012 as
+        # "this server is shutting down".
+        _retire_session_writer(removed, code=1001, reason="tunnel retired by server; reconnect")
         return removed
 
     @staticmethod

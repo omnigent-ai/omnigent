@@ -1,3 +1,4 @@
+import { conversationPage } from "@/test/sidebarMockHelpers";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("@/hooks/useScopeCache", () => import("@/test/mockScopeCache"));
@@ -31,40 +32,14 @@ const mocks = vi.hoisted(() => ({
   stop: { mutate: vi.fn() },
 }));
 
-vi.mock("@/hooks/useConversations", () => ({
-  useConversations: vi.fn(),
-  useConnectedConversations: () => [],
-  useStopAndDeleteConversation: () => ({
-    mutate: vi.fn(),
-    reset: vi.fn(),
-    isPending: false,
-    isError: false,
-  }),
-  usePinnedConversations: () => ({
-    data: { conversations: [], filterHonored: true },
-    isSuccess: true,
-  }),
-  useTogglePinnedConversation: () => ({ mutate: vi.fn() }),
-  setConversationPinned: vi.fn(() => Promise.resolve({})),
-  PINNED_CONVERSATIONS_KEY: ["pinned-conversations"],
-  useRenameConversation: () => ({ mutate: vi.fn() }),
-  useLeaveSession: () => ({ mutate: vi.fn(), isPending: false }),
-  useArchiveConversation: () => mocks.archive,
-  useBulkArchiveConversations: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  useBulkDeleteConversations: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  useBulkMoveToProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  useBulkStopSessions: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  useStopSession: () => mocks.stop,
-  useProjects: () => ({ data: [] }),
-  useMoveToProject: () => ({ mutate: vi.fn() }),
-  useDeleteProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  useRenameProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  useCreateProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  useProjectConfig: () => ({ data: undefined, isLoading: false }),
-  useUpdateProjectConfig: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  fetchProjectSessionIds: () => Promise.resolve([]),
-  PROJECT_LABEL_KEY: "omni_project",
-}));
+vi.mock("@/hooks/useConversations", async () => {
+  const { conversationHooksMock } = await import("@/test/sidebarMockHelpers");
+  return {
+    ...conversationHooksMock(),
+    useArchiveConversation: () => mocks.archive,
+    useStopSession: () => mocks.stop,
+  };
+});
 
 vi.mock("@/components/PermissionsModal", () => ({ PermissionsModal: () => null }));
 
@@ -87,28 +62,8 @@ const CONV: Conversation = {
 };
 
 function mockConversations(conversations: Conversation[]) {
-  const withData = {
-    data: {
-      pages: [
-        {
-          data: conversations,
-          first_id: conversations[0]?.id ?? null,
-          last_id: conversations.at(-1)?.id ?? null,
-          has_more: false,
-        },
-      ],
-      pageParams: [undefined],
-    },
-    isLoading: false,
-    isError: false,
-    error: null,
-    fetchNextPage: vi.fn(),
-    hasNextPage: false,
-    isFetchingNextPage: false,
-  } as unknown as ReturnType<typeof useConversations>;
-  // The sidebar fetches a single undifferentiated session list, so the
-  // mock returns the same data for the one query the component issues.
-  useConvMock.mockImplementation(() => withData);
+  const result = conversationPage(conversations);
+  useConvMock.mockImplementation(() => result);
 }
 
 function renderSidebar() {

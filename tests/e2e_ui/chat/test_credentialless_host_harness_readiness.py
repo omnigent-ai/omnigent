@@ -37,7 +37,6 @@ run in the session, pytest-asyncio can't start a loop on the main thread.
 
 from __future__ import annotations
 
-import asyncio
 import contextlib
 import json
 import os
@@ -45,10 +44,9 @@ import re
 import shutil
 import subprocess
 import sys
-import threading
 import time
 import uuid
-from collections.abc import Coroutine, Iterator
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -56,29 +54,13 @@ import httpx
 import pytest
 from playwright.async_api import async_playwright, expect
 
+from tests._helpers.async_thread import run_in_fresh_loop as _run_in_fresh_loop
 from tests.e2e_ui.conftest import _register_agent_yaml
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 
 _HOST_ONLINE_TIMEOUT_S = 180.0
 _FIRST_TURN_ERROR_TIMEOUT_MS = 240_000
-
-
-def _run_in_fresh_loop(coro: Coroutine[Any, Any, None]) -> None:
-    """Run *coro* to completion in a dedicated thread with its own event loop."""
-    captured: dict[str, Exception] = {}
-
-    def _worker() -> None:
-        try:
-            asyncio.run(coro)
-        except Exception as exc:
-            captured["error"] = exc
-
-    thread = threading.Thread(target=_worker)
-    thread.start()
-    thread.join()
-    if "error" in captured:
-        raise captured["error"]
 
 
 def _fetch_host_row(base_url: str, host_name: str) -> dict[str, Any] | None:

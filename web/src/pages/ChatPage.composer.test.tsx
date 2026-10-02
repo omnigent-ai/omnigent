@@ -15,8 +15,9 @@ import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testi
 import userEvent from "@testing-library/user-event";
 import { createRef, StrictMode, type ComponentRef, type ReactElement } from "react";
 import { MemoryRouter } from "react-router-dom";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { useChatStore, type ChatState, type QueuedMessage } from "@/store/chatStore";
+import { toast } from "sonner";
+import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
+import { handleSessionEvent, useChatStore, type ChatState } from "@/store/chatStore";
 import {
   clearSessionDrafts,
   getSessionDraft,
@@ -159,10 +160,11 @@ vi.mock("@/lib/goalApi", async (importOriginal) => ({
   ...(await importOriginal<typeof GoalApiModule>()),
   getGoal: vi.fn(),
 }));
-import type { ElicitationBlock } from "@/lib/blocks";
+import type { ElicitationBlock, UserMessageBlock } from "@/lib/blocks";
 import { getGoal } from "@/lib/goalApi";
 import { TooltipProvider } from "@/components/ui/tooltip";
-import { Composer, computeIsWorking, shouldQueueSend } from "./ChatPage";
+import { Composer, computeIsWorking } from "./ChatPage";
+import { readAlwaysSteer, writeAlwaysSteer } from "@/lib/alwaysSteerPreferences";
 import { appendPromptHistoryEntry } from "@/hooks/usePromptHistory";
 import {
   BUILTIN_SLASH_COMMANDS,
@@ -209,8 +211,8 @@ async function openSessionModels() {
 
 async function openSessionEfforts() {
   if (!screen.queryByTestId("composer-agent-menu")) openSessionConfig();
-  fireEvent.click(screen.getByTestId("composer-agent-effort-select"));
-  await screen.findByTestId("composer-agent-effort-menu");
+  fireEvent.click(screen.getByTestId("composer-agent-edit"));
+  await screen.findByTestId("composer-agent-efforts");
 }
 
 function openSessionConfig() {
@@ -843,6 +845,121 @@ describe("Composer slash-command menu", () => {
     fireEvent.keyDown(ta, { key: "Tab" });
     // Skills fill "/name " and keep focus so the user can append args.
     expect(ta.value).toBe("/deslop ");
+  });
+
+  it.each(["/context", "/help"])("Tab only fills the %s built-in", (command) => {
+    render(<Composer {...composerProps()} />);
+    fireEvent.change(textarea(), { target: { value: command } });
+    fireEvent.keyDown(textarea(), { key: "Tab" });
+    expect(textarea()).toHaveValue(command + " ");
+    expect(screen.queryByText("No usage data yet — send a message first.")).toBeNull();
+  });
+
+  it.each([
+    ["claude-native", "/compact", "idle"],
+    ["claude-native", "/compact preserve decisions and TODOs", "idle"],
+    ["claude-sdk", "/compact", "idle"],
+    ["claude-sdk", "/compact", "running"],
+    ["claude-sdk", "/compact preserve decisions and TODOs", "idle"],
+    ["codex-native", "/compact", "idle"],
+    ["codex-native", "/compact", "running"],
+    ["codex-native", "/compact", "waiting"],
+    ["codex-native", "/compact extra arguments", "idle"],
+    ["pi-native", "/compact", "idle"],
+    ["pi-native", "/compact instructions", "idle"],
+    ["pi-native", "/compact", "running"],
+    ["opencode-native", "/compact", "idle"],
+  ] as const)("%s handles %s (status: %s)", (harness, command, turnStatus) => {
+    const { sessionHarness, status, sessionStatus } = useChatStore.getState();
+    onTestFinished(() => useChatStore.setState({ sessionHarness, status, sessionStatus }));
+    const previousAlwaysSteer = readAlwaysSteer();
+    onTestFinished(() => writeAlwaysSteer(previousAlwaysSteer));
+    writeAlwaysSteer(false);
+    useChatStore.setState({
+      sessionHarness: harness,
+      status: turnStatus === "running" ? "streaming" : "idle",
+      sessionStatus: turnStatus,
+    });
+    const compact = vi.spyOn(useChatStore.getState(), "compact").mockResolvedValue();
+    const error = vi.spyOn(toast, "error");
+    const props = composerProps({
+      isNativeWrapper: harness !== "claude-sdk",
+      isWorking: turnStatus !== "idle",
+    });
+    render(<Composer {...props} />);
+    fireEvent.change(textarea(), { target: { value: "/comp" } });
+    fireEvent.keyDown(textarea(), { key: "Tab" });
+    expect(textarea()).toHaveValue("/compact ");
+    expect(props.onSend).not.toHaveBeenCalled();
+    expect(compact).not.toHaveBeenCalled();
+
+    fireEvent.change(textarea(), { target: { value: command + " " } });
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+    if (
+      (harness === "codex-native" || harness === "claude-sdk" || harness === "pi-native") &&
+      command !== "/compact"
+    ) {
+      expect(textarea()).toHaveValue(command + " ");
+      const harnessName = {
+        "codex-native": "Codex",
+        "pi-native": "Pi",
+        "claude-sdk": "Claude SDK",
+      }[harness];
+      expect(
+        screen.getByText(`/compact does not accept arguments for ${harnessName}`),
+      ).toBeVisible();
+      expect(props.onSend).not.toHaveBeenCalled();
+      expect(compact).not.toHaveBeenCalled();
+      return;
+    }
+    expect(textarea()).toHaveValue("");
+    expect(error).not.toHaveBeenCalled();
+    if (harness === "opencode-native") {
+      expect(compact).toHaveBeenCalledOnce();
+      expect(props.onSend).not.toHaveBeenCalled();
+      return;
+    }
+    expect(props.onSend).toHaveBeenCalledExactlyOnceWith(command);
+    expect(compact).not.toHaveBeenCalled();
+    fireEvent.keyDown(textarea(), { key: "ArrowUp" });
+    expect(textarea()).toHaveValue(command);
+  });
+
+  it.each(["Enter", "click"])("shows a toast for busy Codex /compact via %s", (submit) => {
+    const { sessionHarness, status, sessionStatus, queuedMessages } = useChatStore.getState();
+    onTestFinished(() =>
+      useChatStore.setState({ sessionHarness, status, sessionStatus, queuedMessages }),
+    );
+    const previousAlwaysSteer = readAlwaysSteer();
+    writeAlwaysSteer(true);
+    onTestFinished(() => writeAlwaysSteer(previousAlwaysSteer));
+    useChatStore.setState({
+      sessionHarness: "codex-native",
+      status: "streaming",
+      sessionStatus: "running",
+      queuedMessages: [],
+    });
+    const compact = vi.spyOn(useChatStore.getState(), "compact").mockResolvedValue();
+    const error = vi.spyOn(toast, "error");
+    const props = composerProps({ isNativeWrapper: true, isWorking: true });
+    render(<Composer {...props} />);
+    fireEvent.change(textarea(), { target: { value: "/comp" } });
+    fireEvent.keyDown(textarea(), { key: "Tab" });
+    expect(error).not.toHaveBeenCalled();
+    if (submit === "Enter") {
+      fireEvent.keyDown(textarea(), { key: "Enter" });
+      expect(textarea()).toHaveValue("/compact ");
+    } else {
+      fireEvent.change(textarea(), { target: { value: "/comp" } });
+      fireEvent.click(activeRow()!);
+      expect(textarea()).toHaveValue("/comp");
+    }
+    expect(error).toHaveBeenCalledExactlyOnceWith(
+      "Compact is disabled while a chat is in progress",
+      { richColors: true },
+    );
+    expect(compact).not.toHaveBeenCalled();
+    expect(props.onSend).not.toHaveBeenCalled();
   });
 
   it("Tab completes a match found only mid-name (exercises menuMatches, not just the render filter)", () => {
@@ -1722,7 +1839,7 @@ describe("Composer model/effort label", () => {
 
   const label = () => screen.getByTestId("composer-agent-config-value");
 
-  it("opens directly to Model and Effort rows under the session harness heading", () => {
+  it("opens directly to one config row whose submenu holds Models and Effort", () => {
     useChatStore.setState({
       llmModel: "system.ai.claude-opus-4-6",
       sessionHarness: "claude-native",
@@ -1742,17 +1859,16 @@ describe("Composer model/effort label", () => {
     expect(label()).toHaveTextContent("Opus");
     fireEvent.keyDown(screen.getByTestId("composer-config-gear"), { key: "ArrowDown" });
     const menu = within(screen.getByTestId("composer-agent-menu"));
-    expect(menu.getByText("Claude Code")).toBeVisible();
     expect(menu.queryByText("Harnesses")).toBeNull();
     expect(menu.queryByText("Edit")).toBeNull();
-    expect(menu.getAllByRole("menuitem")).toHaveLength(2);
-    const row = menu.getByRole("menuitem", { name: "Model: Opus" });
+    expect(menu.getAllByRole("menuitem")).toHaveLength(1);
+    const row = menu.getByRole("menuitem", { name: "Claude Code: Opus" });
     expect(within(row).getByText("Opus")).toHaveClass("text-right");
-    expect(menu.getByRole("menuitem", { name: "Effort: xHigh" })).toBeVisible();
     expect(screen.queryByRole("menuitemcheckbox")).toBeNull();
     fireEvent.keyDown(row, { key: "ArrowRight" });
     expect(screen.getByTestId("composer-agent-model-opus")).toHaveTextContent("Opus");
-    expect(screen.queryByTestId("composer-agent-efforts")).toBeNull();
+    expect(screen.getByTestId("composer-agent-efforts")).toBeVisible();
+    expect(screen.getByTestId("composer-agent-effort-high")).toBeVisible();
   });
 
   it("shows the model in the foreground and effort muted", () => {
@@ -2478,8 +2594,22 @@ describe("Composer shared visible controls", () => {
       .mockResolvedValue(undefined);
     renderWithTooltips(<Composer {...composerProps({ showCodexApprovalMode: true })} />);
     fireEvent.keyDown(screen.getByTestId("composer-permission-chip"), { key: "ArrowDown" });
-    fireEvent.click(screen.getByTestId("composer-permission-option-read-only"));
-    await waitFor(() => expect(setApproval).toHaveBeenCalledWith("read-only"));
+    fireEvent.click(screen.getByTestId("composer-permission-option-full-access"));
+    await waitFor(() => expect(setApproval).toHaveBeenCalledWith("full-access"));
+  });
+
+  it("doesn't offer Read Only as a codex runtime switch", () => {
+    useChatStore.setState({
+      conversationId: "codex-no-read-only",
+      codexApprovalMode: "read-only",
+    });
+    renderWithTooltips(<Composer {...composerProps({ showCodexApprovalMode: true })} />);
+    const chip = screen.getByTestId("composer-permission-chip");
+    // A session launched read-only still shows its live mode on the chip.
+    expect(chip).toHaveTextContent("Read Only");
+    fireEvent.keyDown(chip, { key: "ArrowDown" });
+    expect(screen.getByTestId("composer-permission-option-full-access")).toBeInTheDocument();
+    expect(screen.queryByTestId("composer-permission-option-read-only")).toBeNull();
   });
 });
 
@@ -2816,6 +2946,100 @@ describe("Composer native skill menu", () => {
     expect(overlay.querySelector(".text-brand-accent")?.textContent).toBe("$review");
     fireEvent.keyDown(textarea(), { key: "Enter" });
     expect(props.onSend).toHaveBeenCalledExactlyOnceWith("$review focus on tests", undefined);
+  });
+
+  it.each(["click", "Tab", "Enter"])(
+    "inserts an inline skill using %s without sending",
+    (method) => {
+      const props = composerProps({ isNativeWrapper: true });
+      render(<Composer {...props} />);
+      fireEvent.change(textarea(), { target: { value: "please /" } });
+      expect(screen.queryByTestId("slash-menu-item-help")).toBeNull();
+      expect(screen.getByTestId("slash-menu-item-review")).toHaveTextContent("$review");
+      if (method === "click") fireEvent.click(screen.getByTestId("slash-menu-item-review"));
+      else fireEvent.keyDown(textarea(), { key: method });
+      expect(textarea()).toHaveValue("please $review ");
+      expect(props.onSend).not.toHaveBeenCalled();
+      fireEvent.keyDown(textarea(), { key: "Enter" });
+      expect(props.onSend).toHaveBeenCalledExactlyOnceWith("please $review", undefined);
+    },
+  );
+
+  it("completes at the caret and preserves the suffix", async () => {
+    render(<Composer {...composerProps({ isNativeWrapper: true })} />);
+    fireEvent.change(textarea(), { target: { value: "please /rev this change" } });
+    fireEvent.select(textarea(), { target: { selectionStart: 11, selectionEnd: 11 } });
+    fireEvent.keyDown(textarea(), { key: "Tab" });
+    expect(textarea()).toHaveValue("please $review this change");
+    await waitFor(() => expect(textarea().selectionStart).toBe(15));
+  });
+
+  it("preserves adjacent prose after a partial inline skill", async () => {
+    render(<Composer {...composerProps({ isNativeWrapper: true })} />);
+    fireEvent.change(textarea(), { target: { value: "please /revthis change" } });
+    fireEvent.select(textarea(), { target: { selectionStart: 11, selectionEnd: 11 } });
+    fireEvent.keyDown(textarea(), { key: "Tab" });
+    expect(textarea()).toHaveValue("please $review this change");
+    await waitFor(() => expect(textarea().selectionStart).toBe(15));
+  });
+
+  it.each([" then /rev", "\nkeep this", "\tkeep this"])(
+    "keeps completion at the caret before %j",
+    async (suffix) => {
+      render(<Composer {...composerProps({ isNativeWrapper: true })} />);
+      fireEvent.change(textarea(), { target: { value: `please /rev${suffix}` } });
+      fireEvent.select(textarea(), { target: { selectionStart: 11, selectionEnd: 11 } });
+      fireEvent.keyDown(textarea(), { key: "Tab" });
+      expect(textarea()).toHaveValue(`please $review${suffix}`);
+      expect(screen.queryByTestId("slash-menu-item-review")).toBeNull();
+      await waitFor(() => expect(textarea().selectionStart).toBe(suffix.startsWith(" ") ? 15 : 14));
+    },
+  );
+
+  it("dismisses the inline menu without deleting the prompt", () => {
+    render(<Composer {...composerProps({ isNativeWrapper: true })} />);
+    fireEvent.change(textarea(), { target: { value: "please /rev" } });
+    fireEvent.keyDown(textarea(), { key: "Escape" });
+    expect(textarea()).toHaveValue("please /rev");
+    expect(screen.queryByTestId("slash-menu-item-review")).toBeNull();
+  });
+
+  it.each(["context", "help", "compact"])(
+    "offers the inline %s skill despite its built-in name",
+    (name) => {
+      setComposerState({
+        sessionHarness: "claude-sdk",
+        skills: [{ name, description: "Custom skill" }],
+      });
+      const props = composerProps();
+      render(<Composer {...props} />);
+      fireEvent.change(textarea(), { target: { value: "please /" } });
+      expect(screen.getByText("Skills")).toBeVisible();
+      expect(screen.queryByText("Commands")).toBeNull();
+      fireEvent.keyDown(textarea(), { key: "Tab" });
+      expect(textarea()).toHaveValue(`please /${name} `);
+      expect(props.onSend).not.toHaveBeenCalled();
+    },
+  );
+
+  it("keeps quote and tail selection separate when their text matches", async () => {
+    const ref = createRef<ComponentRef<typeof Composer>>();
+    render(<Composer {...composerProps()} ref={ref} />);
+    fireEvent.change(textarea(), { target: { value: "please /rev" } });
+    act(() => ref.current?.appendReplyQuote("Quoted text"));
+    fireEvent.change(textarea(), { target: { value: "please /rev" } });
+    const before = screen.getByLabelText("Reply text before quote 1");
+    await userEvent.click(before);
+    fireEvent.select(before, { target: { selectionStart: 9, selectionEnd: 9 } });
+    fireEvent.keyDown(before, { key: "Tab" });
+    expect(screen.queryByTestId("slash-menu-item-review")).toBeNull();
+    expect(textarea()).toHaveValue("please /rev");
+    expect(before).toHaveValue("please /rev");
+    fireEvent.change(before, { target: { value: "please /review" } });
+    fireEvent.select(before, { target: { selectionStart: 9, selectionEnd: 9 } });
+    expect(screen.queryByTestId("slash-menu-item-review")).toBeNull();
+    expect(textarea()).toHaveValue("please /rev");
+    expect(before).toHaveValue("please /review");
   });
 
   it("keeps built-in commands slash-prefixed when opened with a dollar sign", () => {
@@ -3299,6 +3523,8 @@ describe("Composer reply quotes", () => {
       skills: [],
       blocks: [],
       failedSendDraft: null,
+      restoredSendDraft: null,
+      pendingRetryStableId: null,
       queuedMessages: [],
     });
   });
@@ -3677,6 +3903,161 @@ describe("Composer reply quotes", () => {
     fireEvent.keyDown(textarea(), { key: "Enter" });
     expect(vi.mocked(props.onSend).mock.calls[0]?.[0]).toBe(text);
     if (structured) expect(vi.mocked(props.onSend).mock.calls[0]?.[2]).toEqual(replyDraft);
+  });
+
+  it("empties the composer when a restored failed send turns out delivered", () => {
+    const stableId = "c".repeat(32);
+    render(<Composer {...composerProps()} />);
+    act(() =>
+      useChatStore.setState({
+        failedSendDraft: {
+          conversationId: "conv_test",
+          text: "resend me",
+          files: [],
+          stableId,
+        },
+      }),
+    );
+    expect(textarea()).toHaveValue("resend me");
+    expect(useChatStore.getState().restoredSendDraft).toMatchObject({ stableId, delivered: false });
+
+    // The send's committed item arrived (see retractDeliveredSendDraft):
+    // the message was delivered, so the untouched restore must go away.
+    act(() =>
+      useChatStore.setState({
+        restoredSendDraft: {
+          conversationId: "conv_test",
+          stableId,
+          text: "resend me",
+          files: [],
+          delivered: true,
+        },
+      }),
+    );
+    expect(textarea()).toHaveValue("");
+    expect(useChatStore.getState().restoredSendDraft).toBeNull();
+    expect(getSessionDraft("conv_test")).toBeUndefined();
+  });
+
+  it("keeps the user's edits when the delivered retraction lands", () => {
+    const stableId = "d".repeat(32);
+    render(<Composer {...composerProps()} />);
+    act(() =>
+      useChatStore.setState({
+        failedSendDraft: {
+          conversationId: "conv_test",
+          text: "resend me",
+          files: [],
+          stableId,
+        },
+      }),
+    );
+    fireEvent.change(textarea(), { target: { value: "resend me, but edited" } });
+
+    act(() =>
+      useChatStore.setState({
+        restoredSendDraft: {
+          conversationId: "conv_test",
+          stableId,
+          text: "resend me",
+          files: [],
+          delivered: true,
+        },
+      }),
+    );
+    expect(textarea()).toHaveValue("resend me, but edited");
+    expect(useChatStore.getState().restoredSendDraft).toBeNull();
+  });
+
+  it("drops a failed-send draft whose message already committed under its stable id", () => {
+    const stableId = "e".repeat(32);
+    render(<Composer {...composerProps()} />);
+    const committed: UserMessageBlock = {
+      type: "user_message",
+      ctx: { agent: null, depth: 0, turn: 0, timestamp: 0, responseId: "", itemId: stableId },
+      content: [{ type: "input_text", text: "resend me" }],
+    };
+    // Delivery proof landed before the restore ran: only the acknowledgement
+    // was lost, so the stale draft must be dropped rather than restored.
+    act(() =>
+      useChatStore.setState({
+        blocks: [committed],
+        failedSendDraft: { conversationId: "conv_test", text: "resend me", files: [], stableId },
+      }),
+    );
+    expect(textarea()).toHaveValue("");
+    expect(useChatStore.getState().failedSendDraft).toBeNull();
+    expect(useChatStore.getState().restoredSendDraft).toBeNull();
+    expect(useChatStore.getState().pendingRetryStableId).toBeNull();
+    expect(getSessionDraft("conv_test")).toBeUndefined();
+  });
+
+  it("restores a server-refused draft even though its persisted item is in the transcript", () => {
+    const stableId = "9".repeat(32);
+    render(<Composer {...composerProps()} />);
+    const persisted: UserMessageBlock = {
+      type: "user_message",
+      ctx: { agent: null, depth: 0, turn: 0, timestamp: 0, responseId: "", itemId: stableId },
+      content: [{ type: "input_text", text: "resend me" }],
+    };
+    // The server persisted the message but refused to dispatch it, and a
+    // snapshot merge rendered the item before the user came back. That is not
+    // delivery: the text and its retry id must come back for a resend.
+    act(() =>
+      useChatStore.setState({
+        blocks: [persisted],
+        failedSendDraft: {
+          conversationId: "conv_test",
+          text: "resend me",
+          files: [],
+          stableId,
+          serverRefused: true,
+        },
+      }),
+    );
+    expect(textarea()).toHaveValue("resend me");
+    expect(useChatStore.getState().failedSendDraft).toBeNull();
+    expect(useChatStore.getState().pendingRetryStableId).toBe(stableId);
+    expect(useChatStore.getState().restoredSendDraft).toMatchObject({
+      stableId,
+      serverRefused: true,
+      delivered: false,
+    });
+  });
+
+  it("does not clear a new identical draft after submitting an edited restored send", async () => {
+    const stableId = "f".repeat(32);
+    // Submit through the store: the queued path is what a mid-turn Enter takes.
+    renderWithTooltips(
+      <Composer {...composerProps({ onSend: useChatStore.getState().enqueueMessage })} />,
+    );
+    act(() =>
+      useChatStore.setState({
+        failedSendDraft: { conversationId: "conv_test", text: "continue", files: [], stableId },
+      }),
+    );
+    expect(textarea()).toHaveValue("continue");
+
+    fireEvent.change(textarea(), { target: { value: "continue, but edited" } });
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+    expect(textarea()).toHaveValue("");
+    expect(useChatStore.getState().restoredSendDraft).toBeNull();
+    expect(useChatStore.getState().pendingRetryStableId).toBeNull();
+
+    // A NEW draft that merely repeats the old text...
+    fireEvent.change(textarea(), { target: { value: "continue" } });
+    await waitFor(() => expect(getSessionDraft("conv_test")?.text).toBe("continue"));
+    // ...must survive the old send's delivery evidence arriving late.
+    act(() =>
+      handleSessionEvent({
+        type: "session_input_consumed",
+        itemId: stableId,
+        itemType: "message",
+        data: { role: "user", content: [{ type: "input_text", text: "continue" }] },
+      }),
+    );
+    expect(textarea()).toHaveValue("continue");
+    expect(getSessionDraft("conv_test")?.text).toBe("continue");
   });
 
   it.each([false, true])(
@@ -4707,10 +5088,14 @@ describe("Composer config gear", () => {
         />,
       );
       openSessionConfig();
-      if (showModels) await openSessionModels();
+      const rootMenu = within(screen.getByTestId("composer-agent-menu"));
+      expect(rootMenu.queryByRole("separator")).toBeNull();
+      await openSessionModels();
       expect(screen.queryByRole("menuitem", { name: "Smart Routing" })).toBeNull();
-      expect(screen.queryByRole("separator")).toBeNull();
-      expect(screen.getByTestId("composer-agent-effort-select")).toBeVisible();
+      const configMenu = within(screen.getByTestId("composer-agent-config-menu"));
+      // Only the Models | Effort divider remains.
+      expect(configMenu.queryAllByRole("separator")).toHaveLength(showModels ? 1 : 0);
+      expect(configMenu.getByTestId("composer-agent-efforts")).toBeVisible();
     },
   );
 
@@ -4736,11 +5121,15 @@ describe("Composer config gear", () => {
       expect(menu.getByRole("menuitem", { name: "Smart Routing" })).not.toHaveAttribute(
         "data-disabled",
       );
-      expect(menu.getAllByRole("separator")).toHaveLength(1);
+      // Smart Routing | Models, then Models | Effort.
+      expect(menu.getAllByRole("separator")).toHaveLength(2);
       expect(useChatStore.getState().costControlModeOverride).toBe(costControlModeOverride);
       if (costControlModeOverride === "on") {
-        expect(screen.getByTestId("composer-agent-effort-select")).toHaveAttribute("data-disabled");
-        expect(screen.getByTestId("composer-agent-effort-select")).toHaveTextContent("Automatic");
+        for (const choice of menu.getAllByRole("menuitemcheckbox")) {
+          if (choice.getAttribute("data-effort-level")) {
+            expect(choice).toHaveAttribute("data-disabled");
+          }
+        }
       }
     },
   );
@@ -4755,11 +5144,11 @@ describe("Composer config gear", () => {
     expect(screen.queryByTestId("composer-advanced-settings")).toBeNull();
     expect(screen.queryByText("Advanced settings…")).toBeNull();
     const menu = screen.getByTestId("composer-agent-menu");
-    expect(menu.lastElementChild).toBe(screen.getByTestId("composer-agent-effort-select"));
+    expect(menu.lastElementChild).toBe(screen.getByTestId("composer-agent-edit"));
     expect(within(menu).queryByRole("separator")).toBeNull();
   });
 
-  it("switches between Model and Effort flyouts on hover and returns to typing on outside click", async () => {
+  it("opens the combined Model and Effort flyout on hover and returns to typing on outside click", async () => {
     const user = userEvent.setup();
     renderWithTooltips(
       <Composer {...composerProps({ showModels: true, modelPickerKind: "claude" })} />,
@@ -4767,15 +5156,13 @@ describe("Composer config gear", () => {
     await user.click(screen.getByTestId("composer-config-gear"));
     await user.hover(screen.getByTestId("composer-agent-edit"));
     expect(await screen.findByTestId("composer-agent-models")).toBeVisible();
-    await user.hover(screen.getByTestId("composer-agent-effort-select"));
-    expect(await screen.findByTestId("composer-agent-efforts")).toBeVisible();
-    expect(screen.queryByTestId("composer-agent-models")).toBeNull();
+    expect(screen.getByTestId("composer-agent-efforts")).toBeVisible();
     await user.click(textarea());
     expect(screen.queryByTestId("composer-agent-menu")).toBeNull();
     expect(textarea()).toHaveFocus();
   });
 
-  it("opens mobile model and effort settings in place with Back navigation", async () => {
+  it("opens mobile model and effort settings on one page with Back navigation", async () => {
     const originalMatchMedia = window.matchMedia;
     window.matchMedia = ((query: string) => ({
       ...originalMatchMedia(query),
@@ -4796,17 +5183,12 @@ describe("Composer config gear", () => {
       fireEvent.click(screen.getByTestId("composer-agent-edit"));
       const menu = await screen.findByTestId("composer-agent-menu");
       expect(within(menu).getByTestId("composer-agent-models")).toBeVisible();
-      expect(screen.queryByTestId("composer-agent-efforts")).toBeNull();
-      expect(screen.getAllByRole("menu")).toHaveLength(1);
-      fireEvent.click(screen.getByTestId("composer-agent-config-back"));
-      expect(screen.queryByTestId("composer-agent-models")).toBeNull();
-      fireEvent.click(screen.getByTestId("composer-agent-effort-select"));
       expect(within(menu).getByTestId("composer-agent-efforts")).toBeVisible();
       expect(screen.getAllByRole("menu")).toHaveLength(1);
       fireEvent.click(screen.getByTestId("composer-agent-config-back"));
+      expect(screen.queryByTestId("composer-agent-models")).toBeNull();
       expect(screen.queryByTestId("composer-agent-efforts")).toBeNull();
       expect(screen.getByTestId("composer-agent-edit")).toBeVisible();
-      expect(screen.getByTestId("composer-agent-effort-select")).toBeVisible();
     } finally {
       window.matchMedia = originalMatchMedia;
     }
@@ -4830,9 +5212,8 @@ describe("Composer config gear", () => {
       />,
     );
     fireEvent.keyDown(screen.getByTestId("composer-config-gear"), { key: "ArrowDown" });
-    fireEvent.keyDown(screen.getByTestId("composer-agent-effort-select"), { key: "ArrowRight" });
-    expect(screen.queryByTestId("composer-agent-models")).toBeNull();
-    expect(screen.queryByRole("separator")).toBeNull();
+    fireEvent.keyDown(screen.getByTestId("composer-agent-edit"), { key: "ArrowRight" });
+    expect(await screen.findByTestId("composer-agent-models")).toBeVisible();
     expect(await screen.findByTestId("composer-agent-effort-xhigh")).toHaveAttribute(
       "aria-checked",
       "true",
@@ -5187,10 +5568,11 @@ describe("Composer config gear", () => {
     fireEvent.click(
       document.querySelector('[data-testid="composer-agent-model-sonnet"]') as Element,
     );
-    const effortRow = screen.getByTestId("composer-agent-effort-select");
-    expect(effortRow).toHaveAttribute("data-disabled");
-    fireEvent.click(effortRow);
-    expect(screen.queryByTestId("composer-agent-efforts")).toBeNull();
+    const configRow = screen.getByTestId("composer-agent-edit");
+    expect(configRow).toHaveAttribute("data-disabled");
+    for (const choice of screen.queryAllByRole("menuitemcheckbox")) {
+      if (choice.getAttribute("data-effort-level")) expect(choice).toHaveAttribute("data-disabled");
+    }
     expect(setModel).toHaveBeenCalledTimes(1);
     expect(setEffort).not.toHaveBeenCalled();
 
@@ -5201,9 +5583,7 @@ describe("Composer config gear", () => {
     expect(setEffort).not.toHaveBeenCalled();
     resolveModel();
     await waitFor(() =>
-      expect(screen.getByTestId("composer-agent-effort-select")).not.toHaveAttribute(
-        "data-disabled",
-      ),
+      expect(screen.getByTestId("composer-agent-edit")).not.toHaveAttribute("data-disabled"),
     );
     await openSessionEfforts();
     fireEvent.click(screen.getByTestId("composer-agent-effort-low"));
@@ -5428,65 +5808,6 @@ describe("Composer config gear", () => {
         expect(setModel).toHaveBeenCalledWith("sonnet", { expectConfirmation: true }),
       );
     });
-  });
-});
-
-describe("shouldQueueSend", () => {
-  const q = (conversationId: string): QueuedMessage => ({
-    queueId: `q_${conversationId}`,
-    text: "queued",
-    conversationId,
-  });
-
-  it("sends directly (no queue) for a brand-new chat with no conversation", () => {
-    expect(shouldQueueSend(null, "streaming", "running", [])).toBe(false);
-  });
-
-  it("queues while the session is busy (streaming or running)", () => {
-    expect(shouldQueueSend("conv_a", "streaming", "idle", [])).toBe(true);
-    expect(shouldQueueSend("conv_a", "idle", "running", [])).toBe(true);
-  });
-
-  it("sends directly when idle and nothing is queued for this conversation", () => {
-    expect(shouldQueueSend("conv_a", "idle", "idle", [])).toBe(false);
-  });
-
-  it("sends directly on `waiting` (turn ended, only background work remains)", () => {
-    // A background shell / still-running sub-agent keeps the session in
-    // `waiting`, but the server's turn gate is already free — a new message
-    // must start a fresh turn rather than stalling in the client queue.
-    expect(shouldQueueSend("conv_a", "idle", "waiting", [])).toBe(false);
-  });
-
-  it("queues when idle but this conversation already has a queued message", () => {
-    // The ordering fix: an idle flicker must not let a later send overtake the
-    // still-queued earlier one.
-    expect(shouldQueueSend("conv_a", "idle", "idle", [q("conv_a")])).toBe(true);
-  });
-
-  it("ignores queued messages belonging to a different conversation", () => {
-    expect(shouldQueueSend("conv_a", "idle", "idle", [q("conv_b")])).toBe(false);
-  });
-
-  it("sends directly while busy when alwaysSteer is on", () => {
-    // The whole point of the preference: a mid-turn follow-up is POSTed now
-    // (steered) instead of parking in the queue strip.
-    expect(shouldQueueSend("conv_a", "streaming", "idle", [], true)).toBe(false);
-    expect(shouldQueueSend("conv_a", "idle", "running", [], true)).toBe(false);
-  });
-
-  it("still queues under alwaysSteer when this conversation has a queued message", () => {
-    // The ordering guard outranks always-steer: draining must stay in order, so
-    // a direct send can't overtake a still-queued earlier one.
-    expect(shouldQueueSend("conv_a", "streaming", "running", [q("conv_a")], true)).toBe(true);
-  });
-
-  it("sends directly for a /side command even while busy or with a queued message", () => {
-    // A codex /side forks its own side chat and is non-interrupting — it must
-    // POST now while the parent turn runs, bypassing both the busy gate and the
-    // main-thread ordering guard.
-    expect(shouldQueueSend("conv_a", "streaming", "running", [], false, true)).toBe(false);
-    expect(shouldQueueSend("conv_a", "idle", "idle", [q("conv_a")], false, true)).toBe(false);
   });
 });
 

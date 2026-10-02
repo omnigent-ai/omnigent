@@ -46,7 +46,13 @@ from omnigent.debug_logging import (
     debug_event,
     runner_log_scope,
 )
-from omnigent.errors import ErrorCategory, ErrorImpact, ErrorPhase
+from omnigent.errors import (
+    ErrorCategory,
+    ErrorImpact,
+    ErrorPhase,
+    category_for_code,
+    phase_for_code,
+)
 from omnigent.gateway_inference import gateway_inference_map
 from omnigent.harness_aliases import canonicalize_harness, is_claude_sdk_harness_name
 from omnigent.harness_availability import HARNESS_BINARY_MISSING, HarnessAvailability
@@ -72,7 +78,6 @@ from omnigent.host.frames import (
     HostImportLocalByIdFrame,
     HostImportLocalDoneFrame,
     HostImportLocalFrame,
-    HostImportLocalSessionFrame,
     HostInstallHarnessFrame,
     HostInstallHarnessResultFrame,
     HostLaunchRunnerFrame,
@@ -82,6 +87,8 @@ from omnigent.host.frames import (
     HostListDirResultFrame,
     HostListWorktreesFrame,
     HostListWorktreesResultFrame,
+    HostMcpServersFrame,
+    HostMcpServersResultFrame,
     HostModelOptionsFrame,
     HostModelOptionsResultFrame,
     HostRemoveWorktreeFrame,
@@ -97,8 +104,10 @@ from omnigent.host.frames import (
     HostStopRunnerResultFrame,
     HostStoreSecretFrame,
     HostStoreSecretResultFrame,
+    ImportSessionChunkingUnsupportedError,
     decode_host_frame,
     encode_host_frame,
+    encode_import_local_session_frames,
     workspace_missing_message,
 )
 from omnigent.host.git_worktree import (
@@ -563,14 +572,12 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         "OMNIGENT_LOG_LEVEL",
         "OMNIGENT_LOG_TO_STDERR",
         LOG_TTY_FD_ENV_VAR,
-        # Debug-log sink config + creds (OMNI-4198). The runner uploads its OWN
-        # process logs to the debug-logs table, so it needs these — including the
-        # service-principal secret. That is the one deliberate exception to the
-        # "no secrets" rule: it is the app's SP creds for log upload (not a user
-        # secret), and the runner is a trusted child. Without them the runner's
-        # sink never arms and runner logs never reach the table.
+        # Debug-log sink config. A secret-provider command is preferred because
+        # the uploader invokes it asynchronously and keeps its output in memory.
+        # The static secret remains supported for existing integrations.
         "OMNIGENT_DEBUG_LOG_CLIENT_ID",
         "OMNIGENT_DEBUG_LOG_CLIENT_SECRET",
+        "OMNIGENT_DEBUG_LOG_CLIENT_SECRET_COMMAND",
         "OMNIGENT_DEBUG_LOG_WORKSPACE_URL",
         "OMNIGENT_DEBUG_LOG_ENDPOINT",
         # Secret-store backend selector. The CLI's `configure harnesses` stores
@@ -1111,6 +1118,9 @@ class HostProcess:
         from omnigent.host.skills import HostSkillDiscovery
 
         self._skill_discovery = HostSkillDiscovery(self._fetch_skill_bundle)
+        from omnigent.host.mcp_inventory import HostMcpInventory
+
+        self._mcp_inventory = HostMcpInventory()
         # Retain the host's refreshable auth context after the first tunnel
         # handshake so runner launches can reuse its warm bearer. Failed or
         # unavailable resolution is not latched, allowing a later reconnect
@@ -1220,6 +1230,10 @@ class HostProcess:
         # Warms the zygote at daemon start so the first launch doesn't pay
         # its one-time import; see run().
         self._zygote_prestart_task: asyncio.Task[ZygoteManager | None] | None = None
+        # Warms the store-backed native model catalogs for this daemon's
+        # lifetime. A tunnel reconnect retains successful or in-flight work;
+        # a completed failed attempt may be retried.
+        self._model_options_prewarm_task: asyncio.Task[bool] | None = None
         # Discovery belongs to the daemon so connection retries share one
         # in-flight probe and registration waits for bounded discovery.
         self._capability_init_task: asyncio.Task[None] | None = None
@@ -1636,12 +1650,15 @@ class HostProcess:
         error: str,
         *,
         error_code: str | None = None,
+        error_category: ErrorCategory = ErrorCategory.HOST,
     ) -> HostLaunchRunnerResultFrame:
         """Report and return a failed runner launch.
 
         :param frame: Launch request that failed.
         :param error: Human-readable failure reason.
         :param error_code: Optional machine-readable failure category.
+        :param error_category: Fault attribution for an uncoded failure; a coded
+            preflight refusal uses its code's mapping instead.
         :returns: Failed result frame for the server.
         """
         session_id = frame.session_id or "<unknown>"
@@ -1663,6 +1680,13 @@ class HostProcess:
                 host_request_id=frame.request_id,
                 stage="runner_launch",
                 error_code=error_code or "runner_spawn_failed",
+                error_category=(
+                    category_for_code(error_code) if error_code else error_category
+                ).value,
+                error_impact=ErrorImpact.BLOCKING.value,
+                error_phase=(
+                    phase_for_code(error_code) if error_code else ErrorPhase.RUNNER_LAUNCH
+                ).value,
             ),
         )
         print(
@@ -1906,7 +1930,7 @@ class HostProcess:
             self._trigger_maintenance("runner_launch_failed")
             # The returned result retains the diagnostic tail, while
             # _launch_failed limits the host lifecycle line to its first line.
-            return self._launch_failed(frame, error)
+            return self._launch_failed(frame, error, error_category=ErrorCategory.RUNNER)
 
         # One live runner per session: the session's previous runner —
         # whose binding the server has already rotated away — is
@@ -2614,13 +2638,28 @@ class HostProcess:
                             }
                         )
                         continue
-                    await ws.send(
-                        encode_host_frame(
-                            HostImportLocalSessionFrame(
-                                request_id=frame.request_id, total=total, session=session
-                            )
-                        )
+                    # Oversized sessions are sliced into chunk frames; a single
+                    # whole-session frame past the tunnel's message cap would
+                    # drop the host connection and kill the rest of the batch.
+                    for text in encode_import_local_session_frames(
+                        frame.request_id,
+                        total,
+                        session,
+                        allow_chunks=frame.allow_session_chunks,
+                    ):
+                        await ws.send(text)
+                except ImportSessionChunkingUnsupportedError:
+                    failures.append(
+                        {
+                            "external_session_id": session_id,
+                            "source": source,
+                            "reason": (
+                                "This session is too large for the connected server. "
+                                "Upgrade the server and retry."
+                            ),
+                        }
                     )
+                    continue
                 except ConnectionClosed:
                     # Dead tunnel: abort the batch (recovery is owned upstream),
                     # never a per-session skip — nothing more can be sent.
@@ -3141,6 +3180,21 @@ class HostProcess:
                 error="skill discovery failed; see the host log",
             )
 
+    def _handle_mcp_servers(self, frame: HostMcpServersFrame) -> HostMcpServersResultFrame:
+        """List user-level MCP servers in a worker thread."""
+        try:
+            servers = self._mcp_inventory.discover()
+        except Exception:
+            _logger.exception("MCP inventory failed")
+            return HostMcpServersResultFrame(
+                request_id=frame.request_id,
+                status="failed",
+                error="MCP inventory failed; see the host log",
+            )
+        return HostMcpServersResultFrame(
+            request_id=frame.request_id, status="ok", mcp_servers=servers
+        )
+
     def _fetch_skill_bundle(self, frame: HostSkillsFrame) -> httpx.Response:
         """Read the bound session bundle using this host's existing credentials."""
         from urllib.parse import quote
@@ -3152,7 +3206,7 @@ class HostProcess:
             timeout=10.0,
         )
 
-    async def _prewarm_model_options(self) -> None:
+    async def _prewarm_model_options(self) -> bool:
         """
         Fill the on-disk model catalogs for the probing harnesses at boot.
 
@@ -3162,12 +3216,29 @@ class HostProcess:
         same single-flight probe through the shared store instead of
         starting a second one.
 
-        :returns: None. Probe failures are absorbed by the probe wrappers.
+        :returns: Whether both catalogs were available. Probe failures are
+            absorbed by the probe wrappers.
         """
-        await asyncio.gather(
+        results = await asyncio.gather(
             self._probed_codex_model_options(),
             self._probed_claude_model_options(),
             return_exceptions=True,
+        )
+        return all(
+            result is not None and not isinstance(result, BaseException) for result in results
+        )
+
+    def _ensure_model_options_prewarm(self) -> None:
+        """Start or retry the host-owned catalog prewarm when needed."""
+        task = self._model_options_prewarm_task
+        if task is not None:
+            if not task.done():
+                return
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                if task.result():
+                    return
+        self._model_options_prewarm_task = asyncio.create_task(
+            self._prewarm_model_options(), name="host-model-options-prewarm"
         )
 
     async def _probed_codex_model_options(self) -> ModelOptionsResult | None:
@@ -3252,7 +3323,10 @@ class HostProcess:
                 error="the codex model probe failed — see the host log",
             )
 
-        if harness == "pi-native":
+        if harness in ("pi-native", "pi"):
+            # ``pi`` is a canonical harness id (the gateway-wrapped headless
+            # Pi), not an alias of ``pi-native``; both share one configured
+            # inventory.
             try:
                 from omnigent.harnesses.pi_native.credentials import pi_native_model_options
 
@@ -3547,6 +3621,7 @@ class HostProcess:
             status="ok",
             worktree_path=created.worktree_path,
             branch=created.branch,
+            workspace=created.workspace,
         )
 
     async def _handle_remove_worktree(
@@ -3608,6 +3683,7 @@ class HostProcess:
                 worktrees = await asyncio.to_thread(
                     list_worktrees,
                     repo_path=frame.repo_path,
+                    for_cleanup=frame.for_cleanup,
                 )
         except WorktreeError as exc:
             return HostListWorktreesResultFrame(
@@ -3820,9 +3896,14 @@ class HostProcess:
                 asyncio.to_thread(self._ensure_zygote_started),
                 name="host-zygote-prestart",
             )
-        self._start_capability_discovery()
         backoff = _RECONNECT_BASE_S
         try:
+            # Warm the pre-launch model listings once for the host lifetime so a
+            # first picker or launch can use the shared store instead of waiting
+            # on a harness probe. This is independent of any one server tunnel:
+            # reconnecting must not discard useful cold-start work.
+            self._ensure_model_options_prewarm()
+            self._start_capability_discovery()
             while True:
                 if self._lifecycle_lost.is_set():
                     break
@@ -3988,15 +4069,27 @@ class HostProcess:
         except (KeyboardInterrupt, asyncio.CancelledError):
             pass
         finally:
+            model_options_prewarm_task = self._model_options_prewarm_task
+            if model_options_prewarm_task is not None:
+                model_options_prewarm_task.cancel()
             # Stop accepting lifecycle work before draining teardown tasks.
             # Cancelling an in-flight launch retains its shielded spawn in
             # _runner_stop_tasks, so quiescing frame handlers first closes the
             # race where shutdown took an incomplete snapshot of those tasks.
-            await self._quiesce_frame_tasks()
-            await self._drain_runner_stop_tasks()
-            if self._maintenance_janitor is not None:
-                await self._maintenance_janitor.shutdown()
-                self._maintenance_janitor = None
+            try:
+                await self._quiesce_frame_tasks()
+                await self._drain_runner_stop_tasks()
+                if self._maintenance_janitor is not None:
+                    await self._maintenance_janitor.shutdown()
+                    self._maintenance_janitor = None
+            finally:
+                if model_options_prewarm_task is not None:
+                    with contextlib.suppress(asyncio.CancelledError, Exception):
+                        await model_options_prewarm_task
+                self._model_options_prewarm_task = None
+                from omnigent.models.model_catalog_store import shutdown_catalog_probes
+
+                await shutdown_catalog_probes()
             if self._reaper_task is not None:
                 self._reaper_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError, Exception):
@@ -4017,9 +4110,6 @@ class HostProcess:
                 with contextlib.suppress(asyncio.CancelledError, Exception):
                     await self._capability_init_task
                 self._capability_init_task = None
-            from omnigent.models.model_catalog_store import shutdown_catalog_probes
-
-            await shutdown_catalog_probes()
             if self._zygote_prestart_task is not None:
                 self._zygote_prestart_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError, Exception):
@@ -4340,14 +4430,13 @@ class HostProcess:
         except Exception as exc:
             raise HostConnectError(f"Could not encode host.hello: {exc}") from exc
         await ws.send(encoded_hello)
+        # A completed failed boot probe gets another best-effort chance only
+        # after registration reaches the server. Keeping this out of the outer
+        # connection-attempt loop avoids repeatedly spawning native probes while
+        # the server is offline. Successful or in-flight work is retained.
+        self._ensure_model_options_prewarm()
         self._ws = ws
         readiness_task = asyncio.create_task(self._harness_readiness_loop(ws))
-        # Warm the pre-launch model listings once a server can actually ask
-        # for them, so the first picker open is served from cache instead of
-        # waiting on a harness probe. Cache-fresh reconnects are a no-op.
-        prewarm_task = asyncio.create_task(
-            self._prewarm_model_options(), name="host-model-options-prewarm"
-        )
         try:
             # Reports raised while disconnected must wait until registration;
             # the server cannot route them before this connection owns the host.
@@ -4385,9 +4474,6 @@ class HostProcess:
                     # _runner_lifecycle_lock in _dispatch_host_frame.
                     self._start_frame_task(ws, raw)
         finally:
-            prewarm_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await prewarm_task
             readiness_task.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await readiness_task
@@ -4642,6 +4728,9 @@ class HostProcess:
         elif isinstance(frame, HostSkillsFrame):
             skills_result = await asyncio.to_thread(self._handle_skills, frame)
             await ws.send(encode_host_frame(skills_result))
+        elif isinstance(frame, HostMcpServersFrame):
+            mcp_result = await asyncio.to_thread(self._handle_mcp_servers, frame)
+            await ws.send(encode_host_frame(mcp_result))
         elif isinstance(frame, HostModelOptionsFrame):
             # Every dispatched frame already runs on its own task (see
             # _start_frame_task), so a cold harness probe here cannot stall

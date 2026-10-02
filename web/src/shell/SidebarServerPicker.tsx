@@ -36,6 +36,16 @@ function originOf(url: string): string | null {
   }
 }
 
+/** Origin plus workspace selector, so two workspaces on one host stay apart. */
+function serverKey(url: string): string | null {
+  try {
+    const parsed = new URL(url);
+    return `${parsed.origin}?o=${parsed.searchParams.get("o") ?? ""}`;
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Server picker for the native shells (Electron desktop and iOS), pinned to
  * the sidebar's bottom.
@@ -78,14 +88,37 @@ export function SidebarServerPicker() {
 
   const managed = Array.isArray(info.managedServers) ? info.managedServers : [];
   const managedOrigins = new Set(managed.map(originOf).filter((origin) => origin !== null));
-  const currentIsManaged = managedOrigins.has(info.currentOrigin);
+  // When sign-in moved hosts, the shell names the server the user picked; match
+  // it by origin + workspace, since several workspaces can share that host.
+  const currentServer = info.currentServer ?? null;
+  const currentKey = currentServer === null ? null : serverKey(currentServer);
+  const isCurrent = (url: string) =>
+    originOf(url) === info.currentOrigin || (currentKey !== null && serverKey(url) === currentKey);
+  const currentIsManaged = managed.some(isCurrent);
+  const managedNames = new Map(Object.entries(info.managedServerNames ?? {}));
+  const managedLabel = (url: string) => managedNames.get(url) ?? hostOf(url);
+  const recentLabels = new Map(Object.entries(info.recentLabels ?? {}));
+  const shownAs = (url: string) => recentLabels.get(url) ?? url;
+  // A recent reached through a managed server's URL is that server: it's listed
+  // once, as managed, which switches through the recent, where its sign-in is.
+  const recentFor = (managedUrl: string) =>
+    info.recentServers.find(
+      (url) => recentLabels.has(url) && serverKey(shownAs(url)) === serverKey(managedUrl),
+    );
   // The current server leads its section even when settings were edited out
-  // from under us. Managed origins are not repeated under Recents.
+  // from under us. Managed servers are not repeated under Recents.
   const recentOthers = info.recentServers.filter((url) => {
     const origin = originOf(url);
-    return origin !== info.currentOrigin && (origin === null || !managedOrigins.has(origin));
+    return (
+      !isCurrent(url) &&
+      (origin === null || !managedOrigins.has(origin)) &&
+      !managed.some((managedUrl) => recentFor(managedUrl) === url)
+    );
   });
-  const currentHost = hostOf(info.currentOrigin);
+  const currentManaged = managed.find(isCurrent);
+  const currentHost =
+    (currentManaged !== undefined ? managedNames.get(currentManaged) : undefined) ??
+    hostOf(currentServer ?? info.currentOrigin);
 
   return (
     // shrink-0 keeps the row at its natural height so the scrolling session
@@ -136,21 +169,21 @@ export function SidebarServerPicker() {
                 Provided by your organization
               </DropdownMenuLabel>
               {managed.map((url) => {
-                const isCurrent = originOf(url) === info.currentOrigin;
+                const current = isCurrent(url);
                 return (
                   <DropdownMenuItem
                     key={url}
-                    disabled={isCurrent}
-                    className={cn("gap-2", isCurrent && "opacity-100")}
-                    onSelect={isCurrent ? undefined : () => void switchServer(url)}
+                    disabled={current}
+                    className={cn("gap-2", current && "opacity-100")}
+                    onSelect={current ? undefined : () => void switchServer(recentFor(url) ?? url)}
                   >
-                    {isCurrent ? (
+                    {current ? (
                       <CheckIcon className="size-4 shrink-0" />
                     ) : (
                       <span className="size-4 shrink-0" aria-hidden="true" />
                     )}
-                    <span className={cn("min-w-0 truncate", isCurrent && "font-medium")}>
-                      {hostOf(url)}
+                    <span className={cn("min-w-0 truncate", current && "font-medium")}>
+                      {managedLabel(url)}
                     </span>
                   </DropdownMenuItem>
                 );
@@ -174,7 +207,7 @@ export function SidebarServerPicker() {
                   onSelect={() => void switchServer(url)}
                 >
                   <span className="size-4 shrink-0" aria-hidden="true" />
-                  <span className="min-w-0 truncate">{hostOf(url)}</span>
+                  <span className="min-w-0 truncate">{hostOf(shownAs(url))}</span>
                 </DropdownMenuItem>
               ))}
             </>

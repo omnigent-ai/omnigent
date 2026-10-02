@@ -15,7 +15,6 @@ import functools
 import itertools
 import json
 import logging
-import math
 import mimetypes
 import os
 import re
@@ -40,7 +39,6 @@ if TYPE_CHECKING:
     from omnigent.terminals.registry import TerminalListEntry, TerminalRegistry
 
 import click
-import httpcore
 import httpx
 from fastapi import FastAPI, HTTPException, Query, Request, WebSocket
 from fastapi.responses import JSONResponse, Response, StreamingResponse
@@ -60,7 +58,7 @@ from omnigent.entities.session_resources import (
     session_resource_view_to_dict,
     terminal_resource_id,
 )
-from omnigent.errors import ErrorCode, ErrorPhase, OmnigentError
+from omnigent.errors import ErrorCategory, ErrorCode, ErrorImpact, ErrorPhase, OmnigentError
 from omnigent.harness_aliases import (
     canonicalize_harness,
     is_native_harness,
@@ -89,10 +87,16 @@ from omnigent.native.native_coding_agents import (
     native_coding_agent_for_harness,
     native_coding_agent_for_terminal_name,
 )
-from omnigent.policies.types import FAIL_CLOSED_PHASES
 from omnigent.process_logging import process_log_reference
 from omnigent.runner import native as _native
 from omnigent.runner import pending_approvals
+from omnigent.runner import subagent_work as _subagent_work
+from omnigent.runner.acp_subagent_sessions import (
+    _chain_acp_subagent_post,
+    _complete_acp_subagent_child,
+    _mint_acp_subagent_child,
+    _post_acp_subagent_tool_call,
+)
 from omnigent.runner.background_titles import (
     BackgroundTitleContext,
     BackgroundTitleHarnessError,
@@ -154,7 +158,8 @@ from omnigent.runner.native import (
     _unwrap_resolved_spec,
 )
 from omnigent.runner.native import orchestration as _native_runtime
-from omnigent.runner.native.interrupt import MarkSubagentTerminalAndWake, NativeInterruptRunner
+from omnigent.runner.native.interrupt import NativeInterruptRunner
+from omnigent.runner.policy_proxy import _evaluate_policy_via_omnigent
 from omnigent.runner.proxy_mcp_manager import ProxyMcpManager
 from omnigent.runner.resource_registry import (
     CLAUDE_NATIVE_TERMINAL_ROLE,
@@ -176,6 +181,38 @@ from omnigent.runner.subagent_routing import (
     remember_session_routing_class,
     routing_class_from_snapshot,
     session_routing_class,
+)
+from omnigent.runner.subagent_work import (
+    _CODEX_NATIVE_HARNESS,
+    _SUBAGENT_DELIVERY_MISSING_PARENT_INBOX,
+    _SUBAGENT_TERMINAL_STATUSES,
+    _WAKE_POST_MAX_ATTEMPTS,
+    _child_session_parents,
+    _ChildParentMeta,
+    _deliver_subagent_completion,
+    _deliver_subagent_wake_post,
+    _drained_delivered_subagent_children,
+    _format_subagent_wake_notice,
+    _recover_subagent_results_from_server,
+    _session_inboxes_ref,
+    _session_status_to_task_status,
+    _subagent_delivery_not_confirmed_response,
+    _subagent_recovery_done,
+    _subagent_recovery_locks,
+    _subagent_work_by_child,
+    _subagent_work_by_parent,
+    _SubagentDeliveryAck,
+    _SubagentRecoveryReadError,
+    _SubagentWorkEntry,
+    _truncate_child_preview,
+    get_subagent_work,
+    is_codex_native_subagent_wrapper,
+    list_subagent_work,
+    mark_subagent_work_started,
+    mark_subagent_work_terminal,
+    register_subagent_work,
+    unregister_child_session,
+    unregister_subagent_work_for_session,
 )
 from omnigent.runtime.harnesses.process_manager import HarnessProcessManager, NoLiveHarnessError
 from omnigent.runtime.prompt import (
@@ -246,9 +283,18 @@ _CODEX_POPUP_RENDER_S = 0.7
 
 # Budget for confirming an approval switch actually landed. Codex echoes
 # "Permissions updated to <label>" once the popup applies; we poll the pane for
-# it so a no-op (e.g. a preset this codex build's /permissions doesn't offer)
-# fails loud instead of the label claiming a mode the TUI never entered.
+# it so a keystroke that didn't apply (e.g. a slow-rendering popup) fails loud
+# instead of the label claiming a mode the TUI never entered.
 _CODEX_PERMISSION_CONFIRM_BUDGET_S = 4.0
+
+# Budget for the /permissions popup to render its option rows before we read
+# them to find the target preset's menu digit. The popup can be slow to draw
+# mid-session (a busy TUI, MCP still starting), so give it room; if it still
+# can't be read we fall back to the preset's conventional menu position rather
+# than failing the switch. Which rows the popup lists is codex-config-dependent
+# (Read Only appears only with a read-only permission profile), so the digit is
+# read from the live popup when possible rather than hardcoded.
+_CODEX_PERMISSION_MENU_BUDGET_S = 5.0
 
 
 def _warn_unresolved_sub_agent(session_id: str | None, sub_agent_name: str) -> None:
@@ -446,92 +492,16 @@ def _unwrap_spec_entry(entry: _SpecEntry | None) -> AgentSpec | None:
 
 
 _NO_BODY_STATUS_CODES = {204, 304}
-_SUBAGENT_TERMINAL_STATUSES = frozenset({"completed", "failed", "cancelled"})
-# Bound how long a sub-agent dispatch can wait for a start acknowledgment.
-# A timeout reports uncertain launch status, not proof that the process is dead.
-_SUBAGENT_LAUNCH_TIMEOUT_S_ENV = "OMNIGENT_SUBAGENT_LAUNCH_TIMEOUT_S"
-_DEFAULT_SUBAGENT_LAUNCH_TIMEOUT_S = 180.0
-# Interval for the background sweep in the runner entrypoint.
-SUBAGENT_LAUNCH_REAP_INTERVAL_S = 30.0
+# Native agents whose forwarder stamps ``turn_completed`` on the idle edges of
+# genuinely finished turns (claude: the ``Stop`` hook, which never fires on an
+# interrupt). For these, a bare quiescence ``idle`` is NOT a completion. Add a
+# key here only together with its forwarder's ``turn_completed`` plumbing,
+# or that harness's sub-agent completions stop reaching parent inboxes.
+_TURN_OUTCOME_CONFIRMING_NATIVE_AGENTS = frozenset({"claude"})
 
-
-def resolve_subagent_launch_timeout_s() -> float:
-    """
-    Resolve the sub-agent launch liveness budget in seconds.
-
-    Values ``<= 0`` disable the reaper. A non-numeric override is rejected
-    with a warning and falls back to the default.
-
-    :returns: The budget in seconds, e.g. ``180.0``.
-    """
-    raw = os.environ.get(_SUBAGENT_LAUNCH_TIMEOUT_S_ENV, "").strip()
-    if not raw:
-        return _DEFAULT_SUBAGENT_LAUNCH_TIMEOUT_S
-    try:
-        value = float(raw)
-    except ValueError:
-        value = None
-    # Non-finite values (nan/inf) would silently disable reaping without the
-    # explicit ``<= 0`` "disabled" intent — reject them like non-numeric input.
-    if value is None or not math.isfinite(value):
-        _logger.warning(
-            "Invalid %s=%r; using default %ss",
-            _SUBAGENT_LAUNCH_TIMEOUT_S_ENV,
-            raw,
-            _DEFAULT_SUBAGENT_LAUNCH_TIMEOUT_S,
-        )
-        return _DEFAULT_SUBAGENT_LAUNCH_TIMEOUT_S
-    return value
-
-
-_SUBAGENT_DELIVERY_DELIVERED = "delivered"
-_SUBAGENT_DELIVERY_ALREADY_DELIVERED = "already_delivered"
-_SUBAGENT_DELIVERY_UNTRACKED = "untracked"
-_SUBAGENT_DELIVERY_MISSING_WORK_ENTRY = "missing_work_entry"
-_SUBAGENT_DELIVERY_MISSING_PARENT_INBOX = "missing_parent_inbox"
-# Runner-owned labels on a child session that make sub-agent result delivery
-# durable across a runner restart. The dispatch id is stamped when a turn is
-# sent to the child; the delivered id is the receipt the parent's
-# ``sys_read_inbox`` drain writes once it has consumed that turn's result.
-SUBAGENT_DISPATCH_ID_LABEL_KEY = "omnigent.subagent.dispatch_id"
-SUBAGENT_DELIVERED_ID_LABEL_KEY = "omnigent.subagent.delivered_id"
-# Read budget for runner→server POSTs that can PARK behind a human-approval
-# ASK gate: policy evaluation (``_evaluate_policy_via_omnigent``) and sub-agent
-# wake-notice delivery (``_deliver_subagent_wake_post``). Both are gated at the
-# recipient's REQUEST/LLM/TOOL phase, which can hold for the deciding policy's
-# ``ask_timeout`` (default one day). Held at one day (86400s) — matching that
-# default — so the POST WAITS for the real verdict instead of severing the
-# parked gate at a short read timeout. A 30s cut previously fail-closed to DENY
-# (and the wake POST retried into duplicate approval cards). Fast connect (30s)
-# so an unreachable server still fails out promptly into the caller's
-# fail-open/retry path. Guarded by tests/test_ask_timeout_infinite.py.
-_ASK_GATE_DELIVERY_READ_TIMEOUT_S: float = 86400.0
-_ASK_GATE_DELIVERY_TIMEOUT = httpx.Timeout(_ASK_GATE_DELIVERY_READ_TIMEOUT_S, connect=30.0)
-
-# Transport errors that mean the harness channel is dead (subprocess killed,
-# connection reset, timeout). A dead channel can never resolve the harness's
-# parked policy future, so we signal recovery instead of log-and-swallow.
-_DEAD_HARNESS_CHANNEL_ERRORS: tuple[type[BaseException], ...] = (
-    httpx.RemoteProtocolError,
-    httpx.ReadError,
-    httpx.WriteError,
-    httpx.StreamClosed,
-    httpx.ConnectError,
-    httpx.TimeoutException,
-    httpcore.ReadError,
-    httpcore.ConnectError,
-    httpcore.TimeoutException,
-)
 
 # Not in the retryable-harness-error allowlist — desync is terminal, not transient.
 _RUNNER_TURN_CONTEXT_DESYNC_CODE = "runner_turn_context_desync"
-# Bounded retry budget for the sub-agent wake POST. The wake is the sole
-# delivery signal for the last child of a fan-out, and Omnigent routinely
-# returns a transient 503 RUNNER_UNAVAILABLE while the parent's runner tunnel
-# is reconnecting, so a single attempt can strand the parent silently.
-_WAKE_POST_MAX_ATTEMPTS = 3
-_WAKE_POST_RETRY_BASE_DELAY_S = 0.5
-_WAKE_POST_RETRY_MAX_DELAY_S = 4.0
 # Delays before each stranded-wake re-attempt round after a tunnel reconnect.
 # The reconnect callback fires BEFORE the new tunnel connection is established,
 # and the server 503s an injected parent event while the parent's runner is
@@ -540,9 +510,6 @@ _WAKE_POST_RETRY_MAX_DELAY_S = 4.0
 # final long round covers a server that is reachable but slow to become ready;
 # rounds cost nothing once no parent is stranded (the loop exits early).
 _STRANDED_WAKE_RETRY_DELAYS_S = (2.0, 5.0, 10.0, 30.0)
-# 4xx statuses that are transient and worth retrying (mirrors the forwarder's
-# classification): everything else in 4xx is a permanent client-side rejection.
-_WAKE_POST_TRANSIENT_4XX = frozenset({408, 409, 425, 429})
 
 # Cadence for ``session.heartbeat`` keepalive events on the runner's
 # ``GET /v1/sessions/{id}/stream`` endpoint. Between turns the event
@@ -602,469 +569,6 @@ def _encode_sse_event(event: Mapping[str, object]) -> bytes:
     import json as _json
 
     return f"data: {_json.dumps(event)}\n\n".encode()
-
-
-async def _evaluate_policy_via_omnigent(
-    *,
-    server_client: httpx.AsyncClient,
-    harness_client: httpx.AsyncClient,
-    conversation_id: str,
-    evaluation_id: str,
-    phase: str,
-    data: dict[str, Any],
-    on_delivery_failure: Callable[[str], Awaitable[None]] | None = None,
-) -> None:
-    """
-    Proxy a policy evaluation request from the harness to the Omnigent server.
-
-    Called by the runner's ``proxy_stream`` when it intercepts a
-    ``policy_evaluation.requested`` SSE event from the harness. Posts
-    the evaluation request to the Omnigent server's
-    ``POST /sessions/{id}/policies/evaluate`` endpoint, then delivers
-    the verdict back to the harness as a ``policy_verdict`` inbound
-    event.
-
-    On failure (AP unreachable, non-200, malformed response) the default
-    verdict is phase-aware:
-
-    - ``PHASE_LLM_REQUEST`` / ``PHASE_LLM_RESPONSE`` fail OPEN
-      (``POLICY_ACTION_ALLOW``) so a transient Omnigent outage does not
-      hang the turn — these gates are advisory.
-    - ``PHASE_TOOL_CALL`` fails CLOSED (``POLICY_ACTION_DENY``). For
-      connector-native MCP tools the harness ``can_use_tool`` callback
-      (which consumes this verdict) is the *only* enforcement point — the
-      call is never re-checked server-side — so a policy that cannot be
-      evaluated must not let the tool through.
-    - ``PHASE_TOOL_RESULT`` fails OPEN: by the result phase the tool has
-      already executed, so denying would only block an already-incurred
-      side effect.
-
-    :param server_client: HTTP client pointed at the Omnigent server.
-    :param harness_client: HTTP client pointed at the harness subprocess.
-    :param conversation_id: Session/conversation identifier,
-        e.g. ``"conv_abc123"``.
-    :param evaluation_id: Unique correlation id from the harness,
-        e.g. ``"poleval_abc123"``.
-    :param phase: Proto-style phase string, e.g.
-        ``"PHASE_LLM_REQUEST"``.
-    :param data: Event data dict for the policy engine.
-    :param on_delivery_failure: Called with *conversation_id* when the verdict
-        cannot be delivered after retry; wired by callers to cancel the wedged turn.
-    """
-    # Default verdict on error / non-200 / timeout. Phase-aware: TOOL_CALL
-    # fails CLOSED (this round-trip is the authoritative gate for
-    # connector-native tools), while advisory LLM phases and TOOL_RESULT
-    # (the tool already ran) fail OPEN so a transient outage never hangs
-    # the turn.
-    _fail_closed = phase in FAIL_CLOSED_PHASES
-    _default_action = "POLICY_ACTION_DENY" if _fail_closed else "POLICY_ACTION_ALLOW"
-    verdict_action = _default_action
-    verdict_reason: str | None = (
-        f"Omnigent policy evaluation unavailable; failing closed for {phase}."
-        if _fail_closed
-        else None
-    )
-    verdict_data: _JsonObject | None = None
-
-    try:
-        ap_resp = await server_client.post(
-            f"/v1/sessions/{conversation_id}/policies/evaluate",
-            json={
-                "event": {
-                    "type": phase,
-                    "data": data,
-                },
-            },
-            # A TOOL_CALL/LLM_REQUEST/REQUEST ASK parks server-side in
-            # ``_hold_native_ask_gate`` until a human resolves it (up to the
-            # deciding policy's ``ask_timeout``, default one day). A 30s read
-            # budget here severed that long-poll after 30s — the server saw an
-            # UPSTREAM DISCONNECT and failed the gate closed (DENY), so the
-            # main (claude-sdk) agent's approval card auto-resolved while
-            # native sub-agents (whose hooks already wait the full day) parked
-            # correctly. Hold the read budget at one day to match the native
-            # hooks' ``_EVALUATE_POLICY_TIMEOUT_S``; the server's ``ask_timeout``
-            # remains the single real cap. Fast connect so an unreachable
-            # server still fails out promptly into the fail-open path below.
-            timeout=_ASK_GATE_DELIVERY_TIMEOUT,
-        )
-        if ap_resp.status_code == 200:
-            result = ap_resp.json()
-            # A well-formed 200 carries "result"; a malformed body that
-            # omits it falls back to _default_action — i.e. DENY on a
-            # tool-call phase. That's deliberate: a 200 we can't read is
-            # an unevaluable verdict, which fails closed like any other.
-            verdict_action = result.get("result", _default_action)
-            verdict_reason = result.get("reason")
-            verdict_data = result.get("data")
-        else:
-            _logger.warning(
-                "AP policy evaluate returned %d for %s; defaulting to %s",
-                ap_resp.status_code,
-                evaluation_id,
-                _default_action,
-                extra={"session_id": conversation_id},
-            )
-    except Exception:  # noqa: BLE001 — fail-open (LLM phases) / fail-closed (tool phases)
-        _logger.warning(
-            "AP policy evaluate failed for %s; defaulting to %s",
-            evaluation_id,
-            _default_action,
-            exc_info=True,
-            extra={"session_id": conversation_id},
-        )
-
-    # Post the verdict back to the harness as a policy_verdict event.
-    verdict_body: dict[str, Any] = {
-        "type": "policy_verdict",
-        "evaluation_id": evaluation_id,
-        "action": verdict_action,
-    }
-    if verdict_reason is not None:
-        verdict_body["reason"] = verdict_reason
-    if verdict_data is not None:
-        verdict_body["data"] = verdict_data
-
-    # Retry once on dead-channel / timeout / non-2xx; any unacknowledged verdict
-    # eventually calls on_delivery_failure to cancel the wedged turn. Track the
-    # failure mode so the wrap-up log attributes the cause instead of lumping
-    # every mode into one unattributed record.
-    failure_reason = "unexpected"
-    for _attempt in range(2):
-        try:
-            resp = await harness_client.post(
-                f"/v1/sessions/{conversation_id}/events",
-                json=verdict_body,
-                timeout=30.0,
-            )
-        except _DEAD_HARNESS_CHANNEL_ERRORS as exc:
-            failure_reason = "dead_channel"
-            _logger.warning(
-                "Policy verdict %s delivery hit a dead harness channel (attempt %d/2): %s",
-                evaluation_id,
-                _attempt + 1,
-                exc,
-                extra={"session_id": conversation_id},
-            )
-            continue
-        except Exception:  # noqa: BLE001 — non-transport: no retry, but still signal
-            failure_reason = "unexpected"
-            _logger.warning(
-                "Failed to deliver policy verdict %s to harness (unexpected error)",
-                evaluation_id,
-                exc_info=True,
-                extra={"session_id": conversation_id},
-            )
-            break
-        if 200 <= resp.status_code < 300:
-            return
-        failure_reason = f"http_{resp.status_code}"
-        _logger.warning(
-            "Policy verdict %s delivery got HTTP %d — harness did not accept it (attempt %d/2)",
-            evaluation_id,
-            resp.status_code,
-            _attempt + 1,
-            extra={"session_id": conversation_id},
-        )
-
-    if failure_reason == "dead_channel":
-        # The harness channel died before the verdict could land — an upstream
-        # disconnect/teardown consequence whose primary failure (the harness
-        # death) is surfaced by stream teardown, not an Omnigent defect. Log at
-        # WARNING with a structured reason; the desync recovery still runs.
-        _logger.warning(
-            "Policy verdict %s undeliverable after retry: harness channel is dead "
-            "(upstream disconnect/teardown); signaling desync for %s",
-            evaluation_id,
-            conversation_id,
-            extra={
-                "session_id": conversation_id,
-                "delivery_failure_reason": "verdict_delivery_channel_dead",
-            },
-        )
-    else:
-        # A live harness refused the verdict (non-2xx) or delivery failed in an
-        # unforeseen way — potentially a real protocol defect, kept at ERROR.
-        _logger.error(
-            "Policy verdict %s delivery unacknowledged (%s) after retry; signaling desync for %s",
-            evaluation_id,
-            failure_reason,
-            conversation_id,
-            extra={
-                "session_id": conversation_id,
-                "delivery_failure_reason": failure_reason,
-            },
-        )
-    if on_delivery_failure is not None:
-        await on_delivery_failure(conversation_id)
-
-
-# Bounded wait for a sub-agent's start edge to mint its child session before the
-# completion edge records the outcome. The mint POST carries its own timeout, so
-# this only guards the unexpected case where the start task never resolves.
-_SUBAGENT_MINT_WAIT_S: float = 30.0
-
-
-async def _mint_acp_subagent_child(
-    client: httpx.AsyncClient,
-    *,
-    parent_id: str,
-    child_key: str,
-    title: str,
-    task: str,
-    child_id_future: asyncio.Future[str],
-) -> None:
-    """Mint a child session for a harness-reported sub-agent (the start edge).
-
-    POSTs ``external_acp_subagent_start`` — idempotent on ``child_key``
-    server-side — then seeds the child's transcript with the delegated task as a
-    user message, so opening the row shows what the sub-agent was asked to do
-    instead of an empty chat. Resolves ``child_id_future`` with the child id so
-    the completion edge can address it.
-
-    Deliberately NOT the native ``external_subagent_start`` path: that one stamps
-    a claude-native wrapper label, which makes the UI title the child "Claude
-    Code" regardless of the real harness. The ACP path leaves the wrapper unset so
-    the child inherits its parent's harness identity (e.g. Devin).
-
-    Best-effort: a failure resolves the future with the exception (so the
-    completion edge fails fast rather than hanging) and is logged, never raised
-    into the turn.
-
-    :param client: Omnigent HTTP client for the runner subprocess.
-    :param parent_id: The parent conversation the sub-agent belongs to.
-    :param child_key: Stable sub-agent id; the idempotency + correlation key.
-    :param title: Row label for the child, e.g. ``"mathutils"``.
-    :param task: The delegated instruction, seeded as the child's first message.
-    :param child_id_future: Resolved with the minted child session id.
-    """
-    try:
-        resp = await client.post(
-            f"/v1/sessions/{parent_id}/events",
-            json={
-                "type": "external_acp_subagent_start",
-                "data": {
-                    "subagent_id": child_key,
-                    "title": title or child_key,
-                    "description": task,
-                },
-            },
-        )
-        resp.raise_for_status()
-        payload = resp.json() if resp.content else {}
-        child_id = payload.get("child_session_id") if isinstance(payload, dict) else None
-        if not (isinstance(child_id, str) and child_id):
-            raise ValueError("external_acp_subagent_start returned no child_session_id")
-        if not child_id_future.done():
-            child_id_future.set_result(child_id)
-    except Exception as exc:  # noqa: BLE001 — surfacing a sub-agent must never break the turn
-        _logger.warning("acp sub-agent child mint failed (child_key=%s): %s", child_key, exc)
-        if not child_id_future.done():
-            child_id_future.set_exception(exc)
-        return
-    # Seed the child's chat with its task. Separate from the mint so a transcript
-    # failure still leaves a working row (the panel entry already exists).
-    if task:
-        await _post_acp_subagent_message(
-            client, child_id=child_id, child_key=child_key, role="user", text=task
-        )
-
-
-async def _post_acp_subagent_message(
-    client: httpx.AsyncClient,
-    *,
-    child_id: str,
-    child_key: str,
-    role: str,
-    text: str,
-    agent: str | None = None,
-) -> None:
-    """Append one message to an ACP sub-agent's child transcript.
-
-    Uses the existing ``external_conversation_item`` bridge (the same path the
-    native forwarders use for sub-agent transcripts), so the child conversation
-    renders normally when opened. Best-effort and never raised into the turn.
-
-    :param client: Omnigent HTTP client for the runner subprocess.
-    :param child_id: The child session to append to.
-    :param child_key: Sub-agent id, used for the response id and log context.
-    :param role: ``"user"`` (the delegated task) or ``"assistant"`` (its result).
-    :param text: Message text.
-    :param agent: Author name for an ``"assistant"`` message (ignored for
-        ``"user"``). ``MessageData`` requires a non-empty ``agent`` on assistant
-        messages, so this falls back to *child_key* when unset.
-    """
-    block_type = "input_text" if role == "user" else "output_text"
-    item_data: dict[str, object] = {
-        "role": role,
-        "content": [{"type": block_type, "text": text}],
-    }
-    if role == "assistant":
-        # MessageData rejects an assistant message with no ``agent`` (its
-        # ``check_agent_for_assistant`` validator), so an assistant item that
-        # omits it 400s and the summary silently never lands. Mirror codex's
-        # assistant transcript post, which sets ``agent`` for this exact reason.
-        item_data["agent"] = agent or child_key
-    try:
-        resp = await client.post(
-            f"/v1/sessions/{child_id}/events",
-            json={
-                "type": "external_conversation_item",
-                "data": {
-                    "item_type": "message",
-                    "item_data": item_data,
-                    "response_id": f"resp_acpsub_{child_key}",
-                },
-            },
-        )
-        resp.raise_for_status()
-    except Exception as exc:  # noqa: BLE001 — transcript is best-effort
-        _logger.warning("acp sub-agent %s message failed (child_key=%s): %s", role, child_key, exc)
-
-
-async def _complete_acp_subagent_child(
-    client: httpx.AsyncClient,
-    *,
-    child_key: str,
-    ok: bool,
-    summary: str,
-    child_id_future: asyncio.Future[str],
-    title: str = "",
-) -> None:
-    """Record a harness-reported sub-agent's outcome on its child session (end edge).
-
-    Waits (bounded) for the start edge to mint the child, then marks the child's
-    status (``idle`` on success, ``failed`` otherwise) with the summary attached
-    as its output. Best-effort: a missing or failed mint is logged and skipped,
-    never raised into the turn.
-
-    :param client: Omnigent HTTP client for the runner subprocess.
-    :param child_key: Stable sub-agent id, matching the start edge.
-    :param ok: Whether the sub-agent reported success.
-    :param summary: The sub-agent's closing summary, attached as the child output.
-    :param child_id_future: Future the start edge resolves with the child id.
-    :param title: The sub-agent's display name, used as the summary message's
-        author; falls back to *child_key* when empty.
-    """
-    from omnigent.native._native_post_delivery import post_external_session_status
-
-    try:
-        child_id = await asyncio.wait_for(
-            asyncio.shield(child_id_future), timeout=_SUBAGENT_MINT_WAIT_S
-        )
-    except Exception as exc:  # noqa: BLE001 — includes the start edge's own mint failure
-        _logger.warning(
-            "acp sub-agent child unavailable for completion (child_key=%s): %s", child_key, exc
-        )
-        return
-    # The sub-agent's closing summary is the only account of its work the agent
-    # reports, so it goes in the child's transcript, not just the status edge.
-    if summary:
-        await _post_acp_subagent_message(
-            client,
-            child_id=child_id,
-            child_key=child_key,
-            role="assistant",
-            text=summary,
-            agent=title or child_key,
-        )
-    try:
-        await post_external_session_status(
-            client,
-            session_id=child_id,
-            status="idle" if ok else "failed",
-            output=summary or None,
-        )
-    except Exception as exc:  # noqa: BLE001 — a status edge failure must not break the turn
-        _logger.warning(
-            "acp sub-agent completion status failed (child_key=%s): %s", child_key, exc
-        )
-
-
-async def _post_acp_subagent_tool_call(
-    client: httpx.AsyncClient,
-    *,
-    child_key: str,
-    call_id: str,
-    name: str,
-    arguments: str,
-    child_id_future: asyncio.Future[str],
-    title: str = "",
-) -> None:
-    """Append one of a sub-agent's own tool calls to its child transcript.
-
-    Renders as a ``function_call`` card in the child's chat (the same shape the
-    parent uses for an observed tool call), so opening a sub-agent shows the work
-    it did, not just the task and summary. Shares the ``response_id`` the task and
-    summary messages use, so the card groups into the same turn.
-
-    Waits (bounded) for the start edge to mint the child. Best-effort: a missing
-    or failed mint is logged and skipped, never raised into the turn.
-
-    :param client: Omnigent HTTP client for the runner subprocess.
-    :param child_key: Stable sub-agent id, matching the start edge.
-    :param call_id: The tool call's id (the child item's ``call_id``).
-    :param name: Human tool label, e.g. ``"Wrote mathutils.py"``.
-    :param arguments: JSON-encoded arguments string (the tool's raw input).
-    :param child_id_future: Future the start edge resolves with the child id.
-    :param title: The sub-agent's display name, used as the item's author; falls
-        back to *child_key* when empty.
-    """
-    try:
-        child_id = await asyncio.wait_for(
-            asyncio.shield(child_id_future), timeout=_SUBAGENT_MINT_WAIT_S
-        )
-    except Exception as exc:  # noqa: BLE001 — includes the start edge's own mint failure
-        _logger.warning(
-            "acp sub-agent child unavailable for tool call (child_key=%s): %s", child_key, exc
-        )
-        return
-    try:
-        resp = await client.post(
-            f"/v1/sessions/{child_id}/events",
-            json={
-                "type": "external_conversation_item",
-                "data": {
-                    "item_type": "function_call",
-                    "item_data": {
-                        # FunctionCallData.agent (validated by name, serialized as "model").
-                        "agent": title or child_key,
-                        "name": name,
-                        "arguments": arguments or "{}",
-                        "call_id": call_id,
-                    },
-                    "response_id": f"resp_acpsub_{child_key}",
-                },
-            },
-        )
-        resp.raise_for_status()
-    except Exception as exc:  # noqa: BLE001 — a transcript item must not break the turn
-        _logger.warning("acp sub-agent tool-call item failed (child_key=%s): %s", child_key, exc)
-
-
-def _chain_acp_subagent_post(
-    prev: asyncio.Task[object] | None, coro: Awaitable[None]
-) -> asyncio.Task[object]:
-    """Serialize a child's transcript posts so its items land in stream order.
-
-    The start/tool-call/completion edges for one sub-agent are dispatched as
-    independent tasks; without ordering, the summary could race ahead of a tool
-    card. Each post is chained after the child's previous one (mint → tool calls
-    → summary), and the stream is never blocked because chaining only schedules a
-    task. A failure in *prev* is suppressed so one bad post can't strand the rest.
-
-    :param prev: The child's previous post task, or ``None`` for the first.
-    :param coro: The post coroutine to run after *prev* completes.
-    :returns: The new tail task for this child.
-    """
-
-    async def _run() -> None:
-        if prev is not None:
-            with contextlib.suppress(Exception):
-                await prev
-        await coro
-
-    return asyncio.create_task(_run())
 
 
 def _response_body_preview(resp: object, *, limit: int = 500) -> str:
@@ -1589,345 +1093,6 @@ def _should_dispatch_tool_locally(
     return dispatch is not None or is_mcp or is_runner_builtin or is_spec_local
 
 
-@dataclasses.dataclass
-class _SubagentWorkEntry:
-    """
-    Runner-local state for one asynchronous ``sys_session_send`` dispatch.
-
-    :param parent_session_id: Parent session id that invoked
-        ``sys_session_send``, e.g. ``"conv_parent123"``.
-    :param child_session_id: Child session id used as the work handle,
-        e.g. ``"conv_child456"``.
-    :param work_id: Unique id for this dispatch to the child session,
-        e.g. ``"subagent_a1b2c3"``.
-    :param agent: Sub-agent name from the parent spec, e.g.
-        ``"researcher"``.
-    :param title: Caller-provided child instance title, e.g. ``"auth"``.
-    :param wrapper_label: Optional terminal wrapper label from the
-        child session, e.g. ``"codex-native-ui"`` for codex-native
-        native sub-agents.
-    :param created_by: Human actor that dispatched this child turn, if
-        known from the parent turn context.
-    :param status: Current work status, e.g. ``"launching"`` or
-        ``"running"``.
-    :param output: Terminal child output or error text. ``None``
-        while the work is still running.
-    :param created_at: Unix timestamp when the dispatch was registered.
-    :param completed_at: Unix timestamp when the dispatch reached a
-        terminal status, or ``None`` while running.
-    :param delivered: Whether the terminal payload has been pushed to
-        the parent's inbox.
-    """
-
-    parent_session_id: str
-    child_session_id: str
-    work_id: str
-    agent: str
-    title: str
-    wrapper_label: str | None = None
-    created_by: str | None = None
-    status: str = "launching"
-    output: str | None = None
-    created_at: float = dataclasses.field(default_factory=time.time)
-    completed_at: float | None = None
-    delivered: bool = False
-
-
-@dataclasses.dataclass(frozen=True)
-class _SubagentDeliveryAck:
-    """
-    Result of attempting to deliver a terminal sub-agent payload.
-
-    :param entry: Work entry whose delivery was attempted, or ``None``
-        when the child session is not tracked in the work registry.
-    :param delivered: Whether the payload is confirmed delivered to the
-        parent inbox. True for both first delivery and already-delivered
-        duplicate terminal reports.
-    :param delivered_now: Whether this attempt pushed a new payload into
-        the parent inbox.
-    :param reason: Machine-readable outcome, e.g. ``"delivered"`` or
-        ``"missing_parent_inbox"``.
-    """
-
-    entry: _SubagentWorkEntry | None
-    delivered: bool
-    delivered_now: bool
-    reason: str
-
-
-_subagent_work_by_child: dict[str, _SubagentWorkEntry] = {}
-_subagent_work_by_parent: dict[str, set[str]] = {}
-_drained_delivered_subagent_children: set[str] = set()
-# Parents whose restart-recovery scan completed in this process, plus a
-# per-parent lock so an init racing a sys_read_inbox drain cannot run two
-# scans that both pass the registry check and queue one result twice.
-_subagent_recovery_done: set[str] = set()
-_subagent_recovery_locks: dict[str, asyncio.Lock] = {}
-
-# Per-(parent, agent_type) monotonic ordinal counter for structured
-# sub-agent names (e.g. "researcher-1", "researcher-2").
-_subagent_ordinal_counters: dict[tuple[str, str], int] = {}
-
-
-def next_subagent_ordinal(parent_session_id: str, agent_type: str) -> int:
-    """Return the next ordinal for a (parent, agent_type) pair and bump the counter."""
-    key = (parent_session_id, agent_type)
-    ordinal = _subagent_ordinal_counters.get(key, 0) + 1
-    _subagent_ordinal_counters[key] = ordinal
-    return ordinal
-
-
-def recover_subagent_ordinals(
-    parent_session_id: str,
-    agent_type: str,
-    existing_children: list[dict[str, object]],
-) -> None:
-    """Set the ordinal high-water mark from existing children after a runner restart."""
-    import re
-
-    key = (parent_session_id, agent_type)
-    if key in _subagent_ordinal_counters:
-        return
-    pattern = re.compile(rf"^{re.escape(agent_type)}-(\d+)$")
-    max_ordinal = 0
-    for child in existing_children:
-        session_name = child.get("session_name")
-        if isinstance(session_name, str):
-            m = pattern.match(session_name)
-            if m:
-                max_ordinal = max(max_ordinal, int(m.group(1)))
-    _subagent_ordinal_counters[key] = max_ordinal
-
-
-def new_subagent_work_id() -> str:
-    """
-    Mint the id of one sub-agent dispatch, e.g. ``"subagent_a1b2c3d4e5f6"``.
-
-    :returns: A fresh dispatch id.
-    """
-    return f"subagent_{uuid.uuid4().hex[:12]}"
-
-
-# Per-child locks serializing the classify+register step of an in-flight
-# sub-agent send (see ``tool_dispatch._send_to_in_flight_child``), so two
-# concurrent sends to one child can't install divergent work entries. Co-located
-# with the work registries so it is torn down alongside them — otherwise a
-# long-lived runner would accumulate one lock per steered child forever.
-_in_flight_send_locks: dict[str, asyncio.Lock] = {}
-
-
-def in_flight_send_lock(child_session_id: str) -> asyncio.Lock:
-    """
-    Return (creating on first use) the per-child in-flight-send lock.
-
-    :param child_session_id: Child session id, e.g. ``"conv_child456"``.
-    :returns: The lock guarding that child's in-flight-send bookkeeping.
-    """
-    lock = _in_flight_send_locks.get(child_session_id)
-    if lock is None:
-        lock = asyncio.Lock()
-        _in_flight_send_locks[child_session_id] = lock
-    return lock
-
-
-def register_subagent_work(
-    *,
-    parent_session_id: str,
-    child_session_id: str,
-    agent: str,
-    title: str,
-    wrapper_label: str | None = None,
-    created_by: str | None = None,
-    work_id: str | None = None,
-) -> _SubagentWorkEntry:
-    """
-    Register one running sub-agent dispatch.
-
-    Re-registering the same child replaces the prior entry so a
-    repeated send to an existing child represents the latest turn.
-
-    :param parent_session_id: Parent session id, e.g.
-        ``"conv_parent123"``.
-    :param child_session_id: Child session id, e.g.
-        ``"conv_child456"``.
-    :param agent: Sub-agent name, e.g. ``"researcher"``.
-    :param title: Sub-agent instance title, e.g. ``"auth"``.
-    :param wrapper_label: Optional child ``omnigent.wrapper``
-        label, e.g. ``"claude-code-native-ui"``.
-    :param created_by: Human actor that dispatched this child turn, if
-        known from the parent turn context.
-    :param work_id: Dispatch id already stamped on the child session,
-        e.g. ``"subagent_a1b2c3d4e5f6"``; ``None`` mints a new one.
-    :returns: The registered work entry.
-    """
-    prior = _subagent_work_by_child.get(child_session_id)
-    if prior is not None:
-        children = _subagent_work_by_parent.get(prior.parent_session_id)
-        if children is not None:
-            children.discard(child_session_id)
-            if not children:
-                _subagent_work_by_parent.pop(prior.parent_session_id, None)
-
-    entry = _SubagentWorkEntry(
-        parent_session_id=parent_session_id,
-        child_session_id=child_session_id,
-        work_id=work_id or new_subagent_work_id(),
-        agent=agent,
-        title=title,
-        wrapper_label=wrapper_label,
-        created_by=created_by,
-    )
-    _drained_delivered_subagent_children.discard(child_session_id)
-    _subagent_work_by_child[child_session_id] = entry
-    _subagent_work_by_parent.setdefault(parent_session_id, set()).add(child_session_id)
-    return entry
-
-
-def get_subagent_work(child_session_id: str) -> _SubagentWorkEntry | None:
-    """
-    Return registered sub-agent work by child session id.
-
-    :param child_session_id: Child session id, e.g. ``"conv_child456"``.
-    :returns: The work entry, or ``None`` if the child is not tracked.
-    """
-    return _subagent_work_by_child.get(child_session_id)
-
-
-def mark_subagent_work_started(child_session_id: str) -> _SubagentWorkEntry | None:
-    """
-    Promote a sub-agent dispatch from launch bookkeeping to real execution.
-
-    ``sys_session_send`` creates the child session and registers work before
-    the child harness has proven it started. The first child
-    ``session.status:running`` / ``waiting`` edge is that proof.
-
-    :param child_session_id: Child session id, e.g. ``"conv_child456"``.
-    :returns: The updated work entry, or ``None`` if the child is untracked.
-    """
-    entry = _subagent_work_by_child.get(child_session_id)
-    if entry is None:
-        return None
-    if entry.status in {"launching", "waiting"}:
-        entry.status = "running"
-    return entry
-
-
-def unregister_subagent_work(
-    child_session_id: str,
-    *,
-    work_id: str | None = None,
-    remember_drained_delivery: bool = False,
-) -> None:
-    """
-    Remove sub-agent work tracking for a child session.
-
-    Used when the child-message POST fails before a handle has been
-    returned to the LLM.
-
-    :param child_session_id: Child session id, e.g. ``"conv_child456"``.
-    :param work_id: Optional dispatch id guard. When provided, the
-        current registry entry is removed only if it still belongs to
-        that dispatch.
-    :param remember_drained_delivery: Whether to remember a delivered
-        entry as drained so duplicate terminal status reports for the
-        same child are acknowledged as already delivered.
-    :returns: None.
-    """
-    entry = _subagent_work_by_child.get(child_session_id)
-    if entry is None:
-        return
-    if work_id is not None and entry.work_id != work_id:
-        return
-    if remember_drained_delivery and entry.delivered:
-        _drained_delivered_subagent_children.add(child_session_id)
-    _subagent_work_by_child.pop(child_session_id, None)
-    _in_flight_send_locks.pop(child_session_id, None)
-    children = _subagent_work_by_parent.get(entry.parent_session_id)
-    if children is None:
-        return
-    children.discard(child_session_id)
-    if not children:
-        _subagent_work_by_parent.pop(entry.parent_session_id, None)
-
-
-def unregister_subagent_work_for_session(session_id: str) -> None:
-    """
-    Remove sub-agent work associated with a deleted session.
-
-    A deleted session can be either the child work handle itself or
-    the parent that owns several child handles. Both indexes are
-    cleaned so runner-local state cannot outlive the session tree.
-
-    :param session_id: Session id being deleted, e.g.
-        ``"conv_parent123"`` or ``"conv_child456"``.
-    :returns: None.
-    """
-    unregister_subagent_work(session_id)
-    _drained_delivered_subagent_children.discard(session_id)
-    _in_flight_send_locks.pop(session_id, None)
-    for child_id in list(_subagent_work_by_parent.get(session_id, set())):
-        _subagent_work_by_child.pop(child_id, None)
-        _drained_delivered_subagent_children.discard(child_id)
-        _in_flight_send_locks.pop(child_id, None)
-    _subagent_work_by_parent.pop(session_id, None)
-
-
-def list_subagent_work(parent_session_id: str) -> list[_SubagentWorkEntry]:
-    """
-    List sub-agent work registered by a parent session.
-
-    :param parent_session_id: Parent session id, e.g.
-        ``"conv_parent123"``.
-    :returns: Work entries ordered by creation time.
-    """
-    child_ids = _subagent_work_by_parent.get(parent_session_id, set())
-    entries = [
-        entry
-        for child_id in child_ids
-        if (entry := _subagent_work_by_child.get(child_id)) is not None
-    ]
-    return sorted(entries, key=lambda entry: entry.created_at)
-
-
-# Harness whose sub-agents live as threads inside the parent's own app-server.
-_CODEX_NATIVE_HARNESS = "codex-native"
-
-
-def is_codex_native_subagent_wrapper(wrapper_label: str | None) -> bool:
-    """
-    Whether a child's wrapper label marks it a codex-native sub-agent.
-
-    Covers both a codex-spawned sub-agent and a ``/side`` side chat: each is a
-    thread inside the parent's own app-server, so codex consumes its result in
-    the thread tree and the parent is never waiting on the Omnigent inbox for it.
-
-    :param wrapper_label: The child's ``omnigent.wrapper`` label, or ``None``.
-    :returns: ``True`` when the child is a codex-native sub-agent.
-    """
-    if wrapper_label is None:
-        return False
-    agent = native_coding_agent_for_harness(_CODEX_NATIVE_HARNESS)
-    return agent is not None and wrapper_label == agent.subagent_wrapper_label
-
-
-def undelivered_subagent_dispatch_id(labels: Mapping[str, object]) -> str | None:
-    """
-    Return the dispatch id of a child turn whose result the parent never drained.
-
-    :param labels: Child session labels, e.g.
-        ``{"omnigent.subagent.dispatch_id": "subagent_a1b2c3d4e5f6"}``.
-    :returns: The dispatch id when the delivered-id receipt is missing or
-        names an earlier turn; ``None`` for a drained turn, or for a child
-        created before dispatch ids were stamped.
-    """
-    dispatch_id = labels.get(SUBAGENT_DISPATCH_ID_LABEL_KEY)
-    if not isinstance(dispatch_id, str) or not dispatch_id:
-        return None
-    if labels.get(SUBAGENT_DELIVERED_ID_LABEL_KEY) == dispatch_id:
-        return None
-    return dispatch_id
-
-
 def _side_chat_text_from_content(content: object) -> str:
     """
     Join user text from message content blocks for a Codex ``/side`` follow-up.
@@ -1947,672 +1112,6 @@ def _side_chat_text_from_content(content: object) -> str:
     return "\n".join(parts).strip()
 
 
-class _SubagentRecoveryReadError(Exception):
-    """A sessions API read needed by restart recovery returned a non-200."""
-
-
-async def _get_recovery_page(
-    server_client: httpx.AsyncClient, path: str, params: dict[str, str]
-) -> Any:
-    """
-    Read one page of a sessions API listing for restart recovery.
-
-    :param server_client: HTTP client connected to the Omnigent server.
-    :param path: Sessions API path, e.g. ``"/v1/sessions/conv_p/child_sessions"``.
-    :param params: Query parameters, e.g. ``{"limit": "1000"}``.
-    :returns: The decoded JSON page.
-    :raises _SubagentRecoveryReadError: When the server returns a non-200.
-    """
-    response = await server_client.get(path, params=params, timeout=10.0)
-    if response.status_code != 200:
-        raise _SubagentRecoveryReadError(f"{path} returned {response.status_code}")
-    return response.json()
-
-
-async def _list_child_sessions(
-    server_client: httpx.AsyncClient, parent_id: str
-) -> list[_JsonObject]:
-    """
-    Return every child-session summary of a parent, following pagination.
-
-    :param server_client: HTTP client connected to the Omnigent server.
-    :param parent_id: Parent session id, e.g. ``"conv_parent123"``.
-    :returns: Child summaries as returned by the sessions API.
-    :raises _SubagentRecoveryReadError: When a page read fails.
-    """
-    children: list[_JsonObject] = []
-    params: dict[str, str] = {"limit": "1000"}
-    while True:
-        page = await _get_recovery_page(
-            server_client, f"/v1/sessions/{parent_id}/child_sessions", params
-        )
-        children.extend(page.get("data", []))
-        if not page.get("has_more") or not page.get("last_id"):
-            return children
-        params["after"] = page["last_id"]
-
-
-async def _fetch_latest_assistant_text(
-    server_client: httpx.AsyncClient, session_id: str
-) -> str | None:
-    """
-    Return the newest assistant message text of a session, reading newest first.
-
-    :param server_client: HTTP client connected to the Omnigent server.
-    :param session_id: Session to read, e.g. ``"conv_child456"``.
-    :returns: Joined text blocks of the newest assistant message (empty when
-        that message carries no text, matching live delivery), or ``None``
-        when the transcript holds no assistant message.
-    :raises _SubagentRecoveryReadError: When a page read fails.
-    """
-    params: dict[str, str] = {"limit": "100", "order": "desc"}
-    while True:
-        page = await _get_recovery_page(server_client, f"/v1/sessions/{session_id}/items", params)
-        for item in page.get("data", []):
-            if item.get("type") != "message" or item.get("role") != "assistant":
-                continue
-            return "\n".join(
-                block["text"]
-                for block in item.get("content", [])
-                if block.get("type") in {"output_text", "text"} and block.get("text")
-            )
-        if not page.get("has_more") or not page.get("last_id"):
-            return None
-        params["after"] = page["last_id"]
-
-
-async def _recover_subagent_results_from_server(
-    *,
-    server_client: httpx.AsyncClient,
-    parent_id: str,
-    schedule_wake: Callable[[_SubagentWorkEntry], None],
-) -> None:
-    """
-    Re-queue terminal child results whose delivery receipt is missing.
-
-    A child turn is stamped with a dispatch id when it is sent, and the
-    parent's ``sys_read_inbox`` drain writes that id back as the delivered
-    id. A terminal child whose two ids differ was never drained, so its
-    result is rebuilt from the child transcript and queued again under the
-    same dispatch id, letting the eventual drain close the loop.
-
-    :param server_client: HTTP client connected to the Omnigent server.
-    :param parent_id: Parent session whose inbox was recreated, e.g.
-        ``"conv_parent123"``.
-    :param schedule_wake: Callback that posts the parent wake notice.
-    :raises _SubagentRecoveryReadError: When a server read returns a
-        non-200; the caller retries on the next drain.
-    """
-    for child in await _list_child_sessions(server_client, parent_id):
-        child_id = child.get("id")
-        status = child.get("current_task_status")
-        if not isinstance(child_id, str) or not isinstance(status, str):
-            continue
-        error = child.get("last_task_error")
-        interrupted = status == "in_progress" or (
-            status == "failed"
-            and isinstance(error, dict)
-            and error.get("code") in {"runner_disconnected", "runner_failed_to_start"}
-        )
-        if status not in _SUBAGENT_TERMINAL_STATUSES and not interrupted:
-            continue
-        existing = get_subagent_work(child_id)
-        if (existing is not None and existing.status != "waiting") or (
-            child_id in _drained_delivered_subagent_children
-        ):
-            continue
-        labels = child.get("labels")
-        dispatch_id = undelivered_subagent_dispatch_id(labels if isinstance(labels, dict) else {})
-        if dispatch_id is None or (existing is not None and existing.work_id != dispatch_id):
-            continue
-        output: str | None = None
-        if status == "failed":
-            error = child.get("last_task_error")
-            message = error.get("message") if isinstance(error, dict) else None
-            output = message if isinstance(message, str) else None
-        elif not interrupted:
-            output = await _fetch_latest_assistant_text(server_client, child_id)
-        # A forwarded completion or newer dispatch may arrive during the history read.
-        if (
-            get_subagent_work(child_id) is not existing
-            or (existing is not None and existing.status != "waiting")
-            or child_id in _drained_delivered_subagent_children
-        ):
-            continue
-        entry = existing or register_subagent_work(
-            parent_session_id=parent_id,
-            child_session_id=child_id,
-            agent=str(child.get("tool") or child.get("agent_name") or "sub-agent"),
-            title=str(child.get("session_name") or ""),
-            work_id=dispatch_id,
-        )
-        if interrupted:
-            # This dispatch already existed; a local launch timeout cannot judge it.
-            entry.status = "waiting"
-            continue
-        ack = mark_subagent_work_terminal(child_id, status=status, output=output)
-        if ack.delivered_now:
-            schedule_wake(entry)
-
-
-def mark_subagent_work_terminal(
-    child_session_id: str,
-    *,
-    status: str,
-    output: str | None,
-) -> _SubagentDeliveryAck:
-    """
-    Mark a sub-agent dispatch terminal and notify the parent inbox.
-
-    :param child_session_id: Child session id, e.g. ``"conv_child456"``.
-    :param status: Terminal status: ``"completed"``, ``"failed"``, or
-        ``"cancelled"``.
-    :param output: Child output or error text. ``None`` means the
-        completion had no assistant text to deliver.
-        If an earlier terminal report could not be delivered, a later
-        report for the same child replaces the undelivered status and
-        output before retrying parent inbox delivery.
-    :returns: Delivery acknowledgement for this terminal report.
-    :raises ValueError: If ``status`` is not terminal.
-    """
-    if status not in _SUBAGENT_TERMINAL_STATUSES:
-        raise ValueError(
-            f"sub-agent terminal status must be one of "
-            f"{sorted(_SUBAGENT_TERMINAL_STATUSES)}; got {status!r}"
-        )
-    entry = _subagent_work_by_child.get(child_session_id)
-    if entry is None:
-        if child_session_id in _drained_delivered_subagent_children:
-            return _SubagentDeliveryAck(
-                entry=None,
-                delivered=True,
-                delivered_now=False,
-                reason=_SUBAGENT_DELIVERY_ALREADY_DELIVERED,
-            )
-        return _SubagentDeliveryAck(
-            entry=None,
-            delivered=False,
-            delivered_now=False,
-            reason=_SUBAGENT_DELIVERY_UNTRACKED,
-        )
-    if entry.status in _SUBAGENT_TERMINAL_STATUSES:
-        # ``failed`` outranks ``completed``: a quiescence-derived ``completed``
-        # (the watcher's ``idle`` edge) can be recorded — and delivered — before
-        # the turn's real ``failed`` edge lands. The failure must replace it and
-        # be re-delivered, or the parent is left believing the turn succeeded
-        # and the error text is silently dropped. A parent may act on the false
-        # success before the re-delivery arrives — that window is inherent to
-        # the edge race; re-delivery is the mitigation, not a prevention.
-        if status == "failed" and entry.status == "completed":
-            entry.status = status
-            entry.output = output
-            entry.completed_at = time.time()
-            entry.delivered = False
-            return _deliver_subagent_completion(entry)
-        if entry.delivered:
-            return _SubagentDeliveryAck(
-                entry=entry,
-                delivered=True,
-                delivered_now=False,
-                reason=_SUBAGENT_DELIVERY_ALREADY_DELIVERED,
-            )
-        # A late stop_session-driven "cancelled" must not downgrade an
-        # already-recorded "completed"/"failed" still awaiting delivery, and a
-        # trailing quiescence "completed" must not launder a recorded "failed".
-        keep_recorded = (status == "cancelled" and entry.status != "cancelled") or (
-            status == "completed" and entry.status == "failed"
-        )
-        if not keep_recorded:
-            entry.status = status
-            entry.output = output
-            entry.completed_at = time.time()
-        return _deliver_subagent_completion(entry)
-    entry.status = status
-    entry.output = output
-    entry.completed_at = time.time()
-    return _deliver_subagent_completion(entry)
-
-
-def _deliver_subagent_completion(entry: _SubagentWorkEntry) -> _SubagentDeliveryAck:
-    """
-    Push a terminal sub-agent payload into the parent session inbox.
-
-    :param entry: Terminal sub-agent work entry to deliver.
-    :returns: Delivery acknowledgement describing whether the payload is
-        confirmed in the parent inbox.
-    """
-    if entry.delivered:
-        return _SubagentDeliveryAck(
-            entry=entry,
-            delivered=True,
-            delivered_now=False,
-            reason=_SUBAGENT_DELIVERY_ALREADY_DELIVERED,
-        )
-    inbox = _session_inboxes_ref.get(entry.parent_session_id)
-    if inbox is None:
-        _logger.warning(
-            "Sub-agent work completed but parent inbox is missing; parent=%s child=%s",
-            entry.parent_session_id,
-            entry.child_session_id,
-        )
-        return _SubagentDeliveryAck(
-            entry=entry,
-            delivered=False,
-            delivered_now=False,
-            reason=_SUBAGENT_DELIVERY_MISSING_PARENT_INBOX,
-        )
-    output = entry.output
-    if output is None:
-        output = "[System: sub-agent completed with no output]"
-    inbox.put_nowait(
-        {
-            "type": "sub_agent",
-            "work_id": entry.work_id,
-            "task_id": entry.child_session_id,
-            "handle_id": entry.child_session_id,
-            "conversation_id": entry.child_session_id,
-            "tool_name": entry.agent,
-            "agent": entry.agent,
-            "title": entry.title,
-            "status": entry.status,
-            "output": output,
-        }
-    )
-    entry.delivered = True
-    return _SubagentDeliveryAck(
-        entry=entry,
-        delivered=True,
-        delivered_now=True,
-        reason=_SUBAGENT_DELIVERY_DELIVERED,
-    )
-
-
-def reap_stalled_subagent_launches(
-    *,
-    now: float | None = None,
-    timeout_s: float | None = None,
-    mark_terminal: MarkSubagentTerminalAndWake | None = None,
-) -> list[_SubagentWorkEntry]:
-    """
-    Fail sub-agent dispatches stuck in ``launching`` beyond the liveness budget.
-
-    A dispatch with no running/waiting/terminal status acknowledgment can
-    otherwise remain pending forever. Missing acknowledgment does not prove
-    that the child process never started. Each reaped entry is
-    marked ``failed`` and its failure is delivered to the parent inbox through
-    ``mark_terminal``.
-
-    :param now: Clock override for tests, e.g. ``time.time()``.
-    :param timeout_s: Budget override for tests; defaults to
-        :func:`resolve_subagent_launch_timeout_s`.
-    :param mark_terminal: Terminal-delivery callback. Production passes the
-        app's ``mark_subagent_terminal_and_wake`` seam so the reaped failure
-        also schedules the parent wake POST — the sole signal that rouses an
-        idle parent to drain its inbox. Defaults to the inbox-only
-        :func:`mark_subagent_work_terminal`.
-    :returns: The entries that were failed by this sweep.
-    """
-    budget = resolve_subagent_launch_timeout_s() if timeout_s is None else timeout_s
-    if budget <= 0:
-        return []
-    deliver = mark_subagent_work_terminal if mark_terminal is None else mark_terminal
-    current = time.time() if now is None else now
-    reaped: list[_SubagentWorkEntry] = []
-    for entry in list(_subagent_work_by_child.values()):
-        if entry.status != "launching":
-            continue
-        if current - entry.created_at < budget:
-            continue
-        _logger.warning(
-            "Sub-agent dispatch stuck in launching for %.0fs; failing it: parent=%s child=%s",
-            current - entry.created_at,
-            entry.parent_session_id,
-            entry.child_session_id,
-        )
-        deliver(
-            entry.child_session_id,
-            status="failed",
-            output=(
-                f"Error: no start acknowledgment for sub-agent {entry.agent!r} "
-                f"title {entry.title!r} within {budget:.0f}s of dispatch. "
-                "The child may still be running; inspect its session before retrying."
-            ),
-        )
-        reaped.append(entry)
-    return reaped
-
-
-async def run_subagent_launch_reaper(
-    *,
-    interval_s: float = SUBAGENT_LAUNCH_REAP_INTERVAL_S,
-    mark_terminal: MarkSubagentTerminalAndWake | None = None,
-    reconcile_pending: Callable[[], Awaitable[None]] | None = None,
-) -> None:
-    """
-    Periodically sweep for sub-agent dispatches wedged in ``launching``.
-
-    Runs until cancelled; started by the runner entrypoint alongside the
-    process manager. Sweep errors are logged and never end the loop.
-
-    :param interval_s: Seconds between sweeps, e.g. ``30.0``.
-    :param mark_terminal: Terminal-delivery callback forwarded to each sweep;
-        the entrypoint passes the app's wake-scheduling seam so a reaped
-        failure wakes the parent, not just its inbox.
-    :param reconcile_pending: Refresh recovered work awaiting remote completion.
-    :returns: None.
-    """
-    while True:
-        await asyncio.sleep(interval_s)
-        try:
-            reap_stalled_subagent_launches(mark_terminal=mark_terminal)
-            if reconcile_pending is not None:
-                await reconcile_pending()
-        except Exception:  # noqa: BLE001 — the sweep is a backstop; never die.
-            _logger.warning("sub-agent launch reaper sweep failed", exc_info=True)
-
-
-async def _wake_retry_sleep(seconds: float) -> None:
-    """
-    Sleep between sub-agent wake-POST retries.
-
-    Indirection point so tests can stub the backoff without clobbering the
-    process-wide ``asyncio.sleep`` (the ``no-global-asyncio-patch`` lint
-    hook bans patching the module singleton).
-
-    :param seconds: Seconds to wait before the next retry, e.g. ``0.5``.
-    :returns: None.
-    """
-    await asyncio.sleep(seconds)
-
-
-def _wake_post_is_retryable(exc: httpx.HTTPError) -> bool:
-    """
-    Return whether a failed wake POST should be retried.
-
-    Transport-level failures (connect/read errors, timeouts) are always
-    retryable. A non-2xx response surfaces as :class:`httpx.HTTPStatusError`:
-    5xx statuses are transient (notably the 503 ``RUNNER_UNAVAILABLE`` that
-    Omnigent returns while the parent's runner tunnel is reconnecting), as
-    are a few 4xx codes; every other 4xx is a permanent client-side rejection
-    that retrying cannot fix.
-
-    :param exc: HTTP error raised by the wake POST or ``raise_for_status``,
-        e.g. an ``httpx.HTTPStatusError`` wrapping a 503 response.
-    :returns: ``True`` if a bounded retry is worthwhile, else ``False``.
-    """
-    if not isinstance(exc, httpx.HTTPStatusError):
-        # Transport failure — the POST may never have reached Omnigent.
-        return True
-    status_code = exc.response.status_code
-    if status_code >= 500:
-        return True
-    return status_code in _WAKE_POST_TRANSIENT_4XX
-
-
-async def _deliver_subagent_wake_post(
-    server_client: httpx.AsyncClient,
-    parent_id: str,
-    notice: str,
-    *,
-    created_by: str | None = None,
-) -> bool:
-    """
-    POST a sub-agent wake notice with a bounded retry on transient failure.
-
-    httpx does not raise on a non-2xx response, so a real 503
-    ``RUNNER_UNAVAILABLE`` JSON response (routine while the parent's runner
-    tunnel reconnects) would otherwise be treated as a successful delivery.
-    This calls ``raise_for_status`` to turn any non-2xx into a failure and
-    retries transient failures up to :data:`_WAKE_POST_MAX_ATTEMPTS` with
-    exponential backoff, because the wake is the sole delivery signal for
-    the last child of a fan-out. Permanent 4xx rejections stop immediately.
-
-    :param server_client: Omnigent HTTP client for the runner subprocess.
-    :param parent_id: Parent session to wake, e.g. ``"conv_parent123"``.
-    :param notice: The ``[System: ...]`` notice text to inject.
-    :param created_by: Human actor that dispatched the completed child
-        turn, if known.
-    :returns: ``True`` if a 2xx was confirmed, ``False`` if every attempt
-        failed (transport error, timeout, or non-2xx response).
-    """
-    attribution_created_by = created_by
-    for attempt in range(1, _WAKE_POST_MAX_ATTEMPTS + 1):
-        try:
-            resp = await server_client.post(
-                f"/v1/sessions/{parent_id}/events",
-                json={
-                    "type": "message",
-                    "data": {
-                        "role": "user",
-                        "content": [{"type": "input_text", "text": notice}],
-                    },
-                    **(
-                        {"created_by": attribution_created_by}
-                        if attribution_created_by is not None
-                        else {}
-                    ),
-                },
-                # The server gates this injected wake at the parent's REQUEST
-                # phase, which can PARK on a human ASK (e.g. session_cost_budget)
-                # for up to the deciding policy's ``ask_timeout`` (default one
-                # day). A 30s read budget severed that park after 30s → the
-                # TimeoutError below retried → each retry re-posted the notice
-                # and parked ANOTHER gate → duplicate approval cards, and the
-                # gate never cleanly blocked. Hold the read budget at one day so
-                # this POST waits for the real verdict (one held connection, one
-                # card); fast connect so an unreachable parent runner still
-                # fails out into the bounded retry below.
-                timeout=_ASK_GATE_DELIVERY_TIMEOUT,
-            )
-            # Treat a non-2xx RESPONSE (e.g. a genuine 503 JSONResponse) as a
-            # failure — httpx does not raise on status by itself.
-            resp.raise_for_status()
-            return True
-        except (httpx.HTTPError, asyncio.TimeoutError) as exc:
-            if (
-                attribution_created_by is not None
-                and isinstance(exc, httpx.HTTPStatusError)
-                and exc.response.status_code == 403
-            ):
-                _logger.debug(
-                    "Sub-agent wake POST attribution rejected for parent=%s; "
-                    "retrying without actor",
-                    parent_id,
-                    extra={"session_id": runner_primary_session_id()},
-                )
-                attribution_created_by = None
-                continue
-            last_attempt = attempt >= _WAKE_POST_MAX_ATTEMPTS
-            retryable = isinstance(exc, asyncio.TimeoutError) or _wake_post_is_retryable(exc)
-            _logger.debug(
-                "Sub-agent wake POST attempt %d/%d for parent=%s failed (retryable=%s): %r",
-                attempt,
-                _WAKE_POST_MAX_ATTEMPTS,
-                parent_id,
-                retryable,
-                exc,
-                extra={"session_id": runner_primary_session_id()},
-            )
-            if last_attempt or not retryable:
-                return False
-            delay_s = min(
-                _WAKE_POST_RETRY_BASE_DELAY_S * (2 ** (attempt - 1)),
-                _WAKE_POST_RETRY_MAX_DELAY_S,
-            )
-            await _wake_retry_sleep(delay_s)
-    return False
-
-
-def _subagent_delivery_not_confirmed_response(
-    ack: _SubagentDeliveryAck,
-    *,
-    is_runner_known_subagent: bool,
-) -> JSONResponse | None:
-    """
-    Build a 503 response when a known sub-agent result was not delivered.
-
-    Top-level sessions also post terminal status but have no parent inbox, so
-    an untracked status remains a no-op unless the runner knows this session
-    was created as a sub-agent. For known sub-agents, Omnigent must not receive a
-    2xx acknowledgement unless the terminal payload is confirmed in the
-    parent's inbox — except a tracked entry whose parent is itself a
-    sub-agent, which ``post_session_events`` acknowledges before calling here;
-    the entry is retained and delivered only if this runner ever creates that
-    parent's inbox.
-
-    :param ack: Delivery acknowledgement returned by
-        ``mark_subagent_work_terminal``.
-    :param is_runner_known_subagent: Whether runner session state identifies
-        the status sender as a sub-agent child.
-    :returns: A 503 JSON response when delivery is not confirmed, or ``None``
-        when the status can be acknowledged.
-    """
-    if ack.delivered:
-        return None
-    if ack.entry is None and not is_runner_known_subagent:
-        return None
-    reason = _SUBAGENT_DELIVERY_MISSING_WORK_ENTRY if ack.entry is None else ack.reason
-    detail_by_reason = {
-        _SUBAGENT_DELIVERY_MISSING_WORK_ENTRY: (
-            "Sub-agent terminal status arrived, but the runner has no "
-            "tracked work entry to deliver to the parent inbox."
-        ),
-        _SUBAGENT_DELIVERY_MISSING_PARENT_INBOX: (
-            "Sub-agent terminal status arrived, but the parent inbox is missing on this runner."
-        ),
-    }
-    detail = detail_by_reason[reason]
-    return JSONResponse(
-        status_code=503,
-        content={
-            "error": "subagent_delivery_not_confirmed",
-            "reason": reason,
-            "detail": detail,
-        },
-    )
-
-
-def _format_subagent_wake_notice(*, agent: str, title: str, status: str, pending: int) -> str:
-    """
-    Build the framework notice that wakes a parent after a child finishes.
-
-    :param agent: Sub-agent name from the parent spec, e.g. ``"researcher"``.
-    :param title: Child instance title supplied at dispatch, e.g. ``"auth"``.
-    :param status: Terminal child status, e.g. ``"completed"``, ``"failed"``,
-        or ``"cancelled"``.
-    :param pending: Number of undrained items in the parent inbox, e.g. ``3``.
-    :returns: A ``[System: ...]`` notice string, e.g. ``"[System: sub-agent
-        researcher/auth finished (completed) — 1 result waiting in inbox. Call
-        sys_read_inbox to collect.]"``.
-    """
-    noun = "result" if pending == 1 else "results"
-    return (
-        f"[System: sub-agent {agent}/{title} finished ({status}) — "
-        f"{pending} {noun} waiting in inbox. Call sys_read_inbox to collect.]"
-    )
-
-
-# Max length of a child message preview mirrored to the parent stream.
-# Matches the server-side ``_latest_message_preview`` truncation so the
-# live runner-pushed preview and the snapshot preview look the same.
-_CHILD_PREVIEW_MAX_CHARS = 150
-
-
-@dataclasses.dataclass
-class _ChildParentMeta:
-    """Fan-out metadata for one child sub-agent session.
-
-    Lets the runner mirror a child's status/preview deltas onto the
-    PARENT's SSE stream — the child's own relay isn't running when only
-    the parent is viewed, and the runner runs the child turn (affinity).
-
-    :param parent_id: Parent session id whose stream receives the deltas.
-    :param title: Child title ``"{tool}:{session_name}"`` — carried in
-        status deltas so even a cold update has a display name.
-    :param tool: Sub-agent type, e.g. ``"researcher"``.
-    :param session_name: Sub-agent instance name, e.g. ``"auth"``.
-    :param last_busy: Last busy value fanned out, used to coalesce
-        duplicate status deltas. ``None`` until first publish.
-    :param last_task_status: Last child-rail task status fanned out, e.g.
-        ``"completed"``. Tracked separately so ``idle`` → ``failed`` emits
-        even though both states are non-busy.
-    :param last_error: Last child failure detail fanned out, used to emit a
-        new parent update when only the error changes, and to clear stale
-        errors on a later running/waiting edge.
-    """
-
-    parent_id: str
-    title: str
-    tool: str
-    session_name: str
-    last_busy: bool | None = None
-    last_task_status: str | None = None
-    last_error: tuple[str, str] | None = None
-
-
-# child_session_id -> :class:`_ChildParentMeta`. Populated at spawn (see
-# tool_dispatch._execute_subagent_tool), dropped when the child ends.
-_child_session_parents: dict[str, _ChildParentMeta] = {}
-
-
-def register_child_session(
-    child_session_id: str,
-    *,
-    parent_session_id: str,
-    title: str,
-    tool: str,
-    session_name: str,
-) -> None:
-    """
-    Record a child→parent mapping for SSE status/preview fan-out.
-
-    :param child_session_id: Child session id, e.g. ``"conv_child123"``.
-    :param parent_session_id: Parent session id whose stream should
-        receive the child's deltas, e.g. ``"conv_parent987"``.
-    :param title: Child title, ``"{tool}:{session_name}"``.
-    :param tool: Sub-agent type, e.g. ``"researcher"``.
-    :param session_name: Sub-agent instance name, e.g. ``"auth"``.
-    """
-    _child_session_parents[child_session_id] = _ChildParentMeta(
-        parent_id=parent_session_id,
-        title=title,
-        tool=tool,
-        session_name=session_name,
-    )
-
-
-def unregister_child_session(child_session_id: str) -> None:
-    """
-    Drop a child→parent mapping when the child session ends.
-
-    :param child_session_id: Child session id to forget.
-    """
-    _child_session_parents.pop(child_session_id, None)
-
-
-def _session_status_to_task_status(status: object) -> str | None:
-    """
-    Map a ``session.status`` value to a child summary ``current_task_status``.
-
-    The two vocabularies differ (session status vs. task status); this
-    keeps the child rail's status text roughly in sync as ``busy`` flips.
-
-    :param status: A ``session.status`` value, e.g. ``"running"``.
-    :returns: ``"launching"`` / ``"in_progress"`` / ``"completed"`` /
-        ``"failed"``, or ``None`` for an unrecognized status (caller
-        omits the field).
-    """
-    if status == "launching":
-        return "launching"
-    if status in ("running", "waiting"):
-        return "in_progress"
-    if status == "idle":
-        return "completed"
-    if status == "failed":
-        return "failed"
-    return None
-
-
 def _normalize_turn_error(error: Mapping[str, object]) -> dict[str, str]:
     """
     Coerce a turn-failure ``error`` dict into a ``{code, message}`` shape.
@@ -2626,8 +1125,15 @@ def _normalize_turn_error(error: Mapping[str, object]) -> dict[str, str]:
     The result is what gets published on the ``failed`` status event
     and ultimately rendered as the REPL's terminal error line.
 
+    A harness ``response.failed`` error already names its failure in ``code``;
+    that code is kept so the failed status edge and the persisted error item
+    describe one failure the same way (the web UI de-duplicates them by code
+    and message). ``type`` is the legacy spelling; ``runner_error`` is the
+    fallback for setup failures that carry neither.
+
     :param error: Raw error dict from a ``_on_proxy_stream_end`` call,
-        e.g. ``{"message": "turn setup failed: ..."}`` or
+        e.g. ``{"message": "turn setup failed: ..."}``,
+        ``{"code": "agent_startup_pending", "message": "..."}`` or
         ``{"status": 502}``.
     :returns: A dict with ``code`` and ``message`` string keys, e.g.
         ``{"code": "runner_error", "message": "turn setup failed: ..."}``.
@@ -2640,8 +1146,12 @@ def _normalize_turn_error(error: Mapping[str, object]) -> dict[str, str]:
         message = f"turn failed (status {error['status']})"
     else:
         message = "turn failed"
-    raw_code = error.get("type")
-    code = raw_code if isinstance(raw_code, str) and raw_code else "runner_error"
+    code = "runner_error"
+    for key in ("code", "type"):
+        raw_code = error.get(key)
+        if isinstance(raw_code, str) and raw_code:
+            code = raw_code
+            break
     return {"code": code, "message": message}
 
 
@@ -2676,22 +1186,6 @@ def _harness_error_response_error(response: object) -> dict[str, str]:
         if code:
             return {"message": code}
     return {"message": text.strip()[:200] or "harness returned error response"}
-
-
-def _truncate_child_preview(text: str) -> str:
-    """
-    Truncate a child message preview to the cap with an ellipsis.
-
-    Matches the server-side ``_latest_message_preview`` truncation so the
-    live runner-pushed preview and the snapshot preview look the same.
-
-    :param text: The child's latest assistant reply text.
-    :returns: ``text`` truncated to :data:`_CHILD_PREVIEW_MAX_CHARS` with
-        a trailing ellipsis when longer, else ``text`` unchanged.
-    """
-    if len(text) > _CHILD_PREVIEW_MAX_CHARS:
-        return text[:_CHILD_PREVIEW_MAX_CHARS].rstrip() + "…"
-    return text
 
 
 # Per-session timer registry. Keyed by session_id → {timer_id → Task}.
@@ -2773,10 +1267,6 @@ _session_histories_ref: dict[str, list[_JsonObject]] = {}
 # ``/stream`` endpoint just to assert on emitted events).
 _session_event_queues_ref: dict[str, asyncio.Queue[_JsonObject | None]] = {}
 
-# Module-level ref to _session_inboxes. Populated inside create_runner_app;
-# used by the sub-agent work registry to deliver completions to the parent.
-_session_inboxes_ref: dict[str, asyncio.Queue[_JsonObject]] = {}
-
 
 def get_session_agent_id(session_id: str) -> str | None:
     """
@@ -2834,6 +1324,10 @@ def _require_full_native_lock_coverage(
             f"native terminal lock dispatch is missing built-in harness(es): {sorted(missing)}"
         )
     return dispatch
+
+
+# How often the pane behind a sign-in card is read for the sign-in to complete.
+_SIGN_IN_WATCH_INTERVAL_S = 3.0
 
 
 def create_runner_app(
@@ -3109,6 +1603,8 @@ def create_runner_app(
     _desync_terminalized: dict[str, int] = {}
     app.state.desync_terminalized = _desync_terminalized
     _background_tasks: set[asyncio.Task[Any]] = set()
+    # One watcher per session for a pending Databricks sign-in (see _start_sign_in_watch).
+    _sign_in_watchers: dict[str, asyncio.Task[None]] = {}
     _subagent_recovery_tasks: dict[str, asyncio.Task[None]] = {}
     _subagent_wake_pending: set[str] = set()
     _last_rewake_notice: dict[str, str] = {}
@@ -3245,13 +1741,9 @@ def create_runner_app(
     ) -> _JsonObject | None:
         if status in ("running", "waiting"):
             mark_subagent_work_started(session_id)
-        # ``failed`` is sticky against a trailing ``idle``, mirroring the
-        # server invariant (see ``omnigent/server/routes/_sessions/helpers.py``):
-        # a failed native turn's pane goes quiet, so the PTY-activity watcher
-        # emits a trailing ``idle`` ~1s later — republishing the child as
-        # ``completed`` would show a green child for a turn that died. A later
-        # ``running``/``waiting`` edge (new activity) clears it normally.
-        if status == "idle" and meta.last_task_status == "failed":
+        # A trailing pane-idle edge must not turn a failed or aborted task
+        # into success. A new running/waiting edge clears the terminal outcome.
+        if status == "idle" and meta.last_task_status in ("failed", "cancelled"):
             return None
         busy = status in ("running", "waiting")
         task_status = _session_status_to_task_status(status)
@@ -3399,20 +1891,19 @@ def create_runner_app(
             )
         return "\n".join(parts)
 
-    def _build_required_terminal_error(event: TerminalExitEvent) -> dict[str, str]:
+    def _build_required_terminal_error(
+        event: TerminalExitEvent, diagnosis: FailureDiagnosis | None
+    ) -> dict[str, str]:
         """Build the structured ``session.status`` error for a required-terminal exit.
 
         Always carries ``code`` + a fully-composed ``message`` (back-compat: the
         REPL and older clients render it verbatim). When the failure is
         recognized, also carries ``title`` / ``cause`` / ``remediation`` so the
         web UI can render a friendly card instead of the raw enum + blob.
+
+        :param event: The required terminal's exit event.
+        :param diagnosis: The exit's :func:`classify_terminal_failure` result.
         """
-        # Classify once; the message formatter reuses the same diagnosis.
-        diagnosis = classify_terminal_failure(
-            command=event.command,
-            exit_status=event.exit_status,
-            output=event.last_output,
-        )
         message = _format_required_terminal_exit_output(event, diagnosis)
         error: dict[str, str] = {"code": "required_terminal_exited", "message": message}
         if diagnosis is not None:
@@ -3520,7 +2011,13 @@ def create_runner_app(
         # Record the exit before releasing the harness: the release severs any
         # in-flight turn stream, whose failure handler then reports this exit
         # instead of the transport error the severed socket raises.
-        error = _build_required_terminal_error(event)
+        # Classify once; the error card and the failure log share the diagnosis.
+        diagnosis = classify_terminal_failure(
+            command=event.command,
+            exit_status=event.exit_status,
+            output=event.last_output,
+        )
+        error = _build_required_terminal_error(event, diagnosis)
         _required_terminal_exit_errors[event.session_id] = error
         # A dead required terminal cannot still be working a turn.
         _native_pane_status.pop(event.session_id, None)
@@ -3565,7 +2062,16 @@ def create_runner_app(
             event.terminal_name,
             event.session_id,
             error.get("message"),
-            extra={"session_id": event.session_id},
+            extra=debug_event(
+                "required_terminal_exited",
+                session_id=event.session_id,
+                terminal_name=event.terminal_name,
+                terminal_exit_status=event.exit_status,
+                error_code=error["code"],
+                # An unrecognized exit is the harness CLI dying under the runner.
+                error_category=(diagnosis.category if diagnosis else ErrorCategory.RUNNER).value,
+                error_impact=ErrorImpact.BLOCKING.value,
+            ),
         )
         _publish_event(
             event.session_id,
@@ -3575,6 +2081,11 @@ def create_runner_app(
                 "error": error,
             },
         )
+        # The turn is over (its terminal exited), so drop any interrupt still
+        # pending for it — otherwise its stale grace timer, or a reused child's
+        # next idle consuming that pending record, could mis-settle a later
+        # dispatch on this session.
+        _native_interrupt_runner.clear_pending_interrupt(event.session_id)
         _mark_subagent_terminal_and_wake(
             event.session_id,
             status="failed",
@@ -3926,6 +2437,7 @@ def create_runner_app(
         resolver_cwd = await _session_runtime_cwd(conversation_id)
         try:
             effective_harness, spawn_env = await _resolve_harness_config(
+                resource_registry=resource_registry,
                 agent_id=resolver_agent_id,
                 spec_resolver=spec_resolver,
                 session_id=conversation_id,
@@ -3940,6 +2452,7 @@ def create_runner_app(
             resolver_harness = generator_spec.resolver_harness or effective_harness
             if resolver_harness != effective_harness:
                 resolved_harness, spawn_env = await _resolve_harness_config(
+                    resource_registry=resource_registry,
                     agent_id=resolver_agent_id,
                     spec_resolver=spec_resolver,
                     session_id=conversation_id,
@@ -4210,6 +2723,7 @@ def create_runner_app(
                     cwd=await _session_runtime_cwd(session_id),
                     session_id=session_id,
                     model_override=_model_override,
+                    resource_registry=resource_registry,
                 )
             except OmnigentError as exc:
                 # The relay also needs the failure when init precedes the first turn.
@@ -4357,6 +2871,7 @@ def create_runner_app(
                 resource_registry=resource_registry,
                 publish_event=_publish_event,
                 server_client=server_client,
+                event_dispatcher=getattr(app.state, "runner_event_dispatcher", None),
                 ensure_comment_relay=_ensure_comment_relay_started,
             )
             _launch_pre: Callable[[bool], Awaitable[PreLaunchResult]] | None = None
@@ -4671,6 +3186,7 @@ def create_runner_app(
             or _turn_bind_epoch.get(session_id) != initial_turn_epoch
             or resource_registry.session_activity_epoch(session_id) != initial_native_activity
         )
+        recovery_turn = "none"
         if history and not execution_seen and session_id not in _active_turns:
             _session_histories[session_id] = history
             last = history[-1]
@@ -4687,6 +3203,7 @@ def create_runner_app(
                 and not _suppress_recovery
                 and session_id not in _active_turns
             ):
+                recovery_turn = "history_resume"
                 _begin_turn_slot(session_id)
                 _publish_turn_status(session_id, "running")
                 msg_body = {
@@ -4715,6 +3232,7 @@ def create_runner_app(
                 and session_id not in _active_turns
                 and not resource_registry.session_turn_is_active(session_id)
             ):
+                recovery_turn = "recovery_prompt"
                 if is_native_harness(harness_name):
                     _session_histories[session_id] = []
                 _begin_turn_slot(session_id)
@@ -4747,13 +3265,28 @@ def create_runner_app(
             _recovery_turn_ids.setdefault(session_id, set()).add(recovery_id)
 
         status = "running" if session_id in _active_turns else "idle"
+        # The recovery decision and its inputs, so a turn that restarted after a
+        # reconnect can be attributed to the history heuristic, the server's
+        # continuation request, or neither.
         _logger.info(
             "Runner session initialization finished",
             extra=debug_event(
                 "runner_session_initialized",
+                session_id=session_id,
                 stage="session_init",
                 status_code=201,
                 harness=harness_name,
+                status=status,
+                recovery_turn=recovery_turn,
+                recovery_id=recovery_id,
+                resume_interrupted_turn=(
+                    init_context.envelope is not None
+                    and init_context.envelope.resume_interrupted_turn
+                ),
+                suppress_recovery_turn=_suppress_recovery,
+                execution_seen=execution_seen,
+                history_len=len(history),
+                last_item_type=history[-1].get("type") if history else None,
             ),
         )
         return JSONResponse(
@@ -4989,6 +3522,7 @@ def create_runner_app(
         _desynced_sessions.discard(session_id)
         _required_terminal_exit_errors.pop(session_id, None)
         _native_pane_status.pop(session_id, None)
+        _native_interrupt_runner.clear_pending_interrupt(session_id)
         _ingest_next_seq.pop(session_id, None)
         _ingest_now_serving.pop(session_id, None)
         _ingest_cond.pop(session_id, None)
@@ -5015,10 +3549,10 @@ def create_runner_app(
         if queue is not None:
             queue.put_nowait(None)
 
-        await resource_registry.cleanup_session(session_id)
-
         if process_manager is not None:
             await process_manager.release(session_id)
+
+        await resource_registry.cleanup_session(session_id)
 
         await _delete_native_bridge_dirs(
             server_client=server_client,
@@ -5472,6 +4006,120 @@ def create_runner_app(
         _task.add_done_callback(_background_tasks.discard)
         _background_tasks.add(_task)
 
+    def _native_pane_names(conv_id: str) -> set[str]:
+        """
+        Return the terminal names that can carry a session's launcher sign-in prompt.
+
+        Only the native agent's own pane counts: a shell the person opened
+        alongside it (``gh auth login``, a docs page) must not supply the
+        sign-in address or hold back the "signed in" notice. With the harness
+        known this is its one pane; otherwise any native agent pane.
+        """
+        from omnigent.harness_plugins import native_agents
+
+        harness = _session_harness_name(conv_id)
+        names = {agent.terminal_name for agent in native_agents() if agent.harness == harness}
+        return names or {agent.terminal_name for agent in native_agents()}
+
+    def _start_sign_in_watch(conv_id: str) -> None:
+        """Watch the pane behind a sign-in card so the chat learns when the sign-in worked."""
+        existing = _sign_in_watchers.get(conv_id)
+        if existing is not None and not existing.done():
+            return
+        task = asyncio.get_running_loop().create_task(
+            _watch_sign_in_completion(conv_id), name=f"sign-in-watch-{conv_id}"
+        )
+        _sign_in_watchers[conv_id] = task
+        task.add_done_callback(_background_tasks.discard)
+        _background_tasks.add(task)
+
+    async def _watch_sign_in_completion(conv_id: str) -> None:
+        """
+        Post one "Signed in to Databricks" notice once the agent behind a sign-in card is ready.
+
+        A turn failed because the session's launcher was parked on a sign-in
+        prompt. This reads the session's running panes until no prompt is on
+        screen and the agent can take a message, then posts the notice. It ends
+        silently when no pane is running any more: the launcher exited, which
+        the next send reports on its own.
+
+        :param conv_id: Session whose turn failed with ``databricks_sign_in_pending``.
+        """
+        from omnigent.harnesses.diagnostics import detect_sign_in_prompt
+
+        harness = _session_harness_name(conv_id)
+        pane_names = _native_pane_names(conv_id)
+        while True:
+            await asyncio.sleep(_SIGN_IN_WATCH_INTERVAL_S)
+            registry = resource_registry.terminal_registry
+            entries = registry.list_for_conversation(conv_id) if registry is not None else []
+            screens: list[str] = []
+            for entry in entries:
+                if entry.terminal_name not in pane_names or not entry.instance.running:
+                    continue
+                result = await entry.instance.read(join_wrapped=True)
+                screen = result.get("screen") if isinstance(result, dict) else None
+                screens.append(screen if isinstance(screen, str) else "")
+            if not screens:
+                return
+            if any(detect_sign_in_prompt(screen) is not None for screen in screens):
+                continue
+            if _sign_in_agent_ready(conv_id, harness, screens):
+                await _post_sign_in_completed_notice(conv_id, harness)
+                return
+
+    def _sign_in_agent_ready(conv_id: str, harness: str | None, screens: list[str]) -> bool:
+        """Return whether the agent can take a message now that no sign-in prompt is on screen."""
+        if harness == "codex-native":
+            from omnigent.harnesses.codex_native.bridge import (
+                bridge_dir_for_bridge_id,
+                read_bridge_state,
+            )
+
+            # Thread discovery publishes the bridge state the moment the TUI starts a thread.
+            return read_bridge_state(bridge_dir_for_bridge_id(conv_id)) is not None
+        if harness == "claude-native":
+            from omnigent.harnesses.claude_native.bridge import _claude_prompt_rendered
+
+            return any(_claude_prompt_rendered(screen) for screen in screens)
+        return True
+
+    async def _post_sign_in_completed_notice(conv_id: str, harness: str | None) -> None:
+        """Append the neutral "Signed in to Databricks" notice to the session transcript."""
+        agent = {"codex-native": "Codex", "claude-native": "Claude Code"}.get(
+            harness or "", "The agent"
+        )
+        try:
+            resp = await server_client.post(
+                f"/v1/sessions/{conv_id}/events",
+                json={
+                    "type": "external_conversation_item",
+                    "data": {
+                        "item_type": "error",
+                        "item_data": {
+                            "source": "harness",
+                            "code": "databricks_sign_in_completed",
+                            "title": "Signed in to Databricks",
+                            "message": f"{agent} is ready. Send your message again.",
+                            "level": "info",
+                        },
+                    },
+                },
+                timeout=10.0,
+            )
+            resp.raise_for_status()
+        except (httpx.HTTPError, RuntimeError):
+            _logger.warning(
+                "Failed to post the sign-in completed notice for %s", conv_id, exc_info=True
+            )
+            return
+        _logger.info(
+            "Databricks sign-in completed for %s; %s is ready",
+            conv_id,
+            agent,
+            extra={"session_id": conv_id},
+        )
+
     async def _persist_cancellation_items(
         conv_id: str,
         items: list[_JsonObject],
@@ -5712,12 +4360,18 @@ def create_runner_app(
         h = spec.executor.config.get("harness") or spec.executor.type
         return canonicalize_harness(h) or h
 
+    def _native_turn_outcome_is_forwarder_confirmed(conv_id: str) -> bool:
+        """Whether this session's forwarder distinguishes finished from aborted turns."""
+        agent = native_coding_agent_for_harness(_session_harness_name(conv_id))
+        return agent is not None and agent.key in _TURN_OUTCOME_CONFIRMING_NATIVE_AGENTS
+
     def _publish_turn_status(
         conv_id: str,
         status: str,
         error: Mapping[str, object] | None = None,
         *,
         source_error: Mapping[str, object] | None = None,
+        response_id: str | None = None,
     ) -> None:
         if status == "waiting" and not (
             _server_version is not None and _version_supports_waiting_status(_server_version)
@@ -5740,6 +4394,11 @@ def create_runner_app(
         event: _JsonObject = {"type": "session.status", "status": status}
         if error is not None:
             event["error"] = error
+        if response_id is not None:
+            # Name the turn this edge closes. The web UI already rendered the
+            # response's own terminal error; the id lets it recognise this edge
+            # as the same failure instead of adding a second card.
+            event["response_id"] = response_id
         if status == "failed":
             source = source_error if source_error is not None else (error or {})
             dimensions: dict[str, str] = {}
@@ -6001,7 +4660,9 @@ def create_runner_app(
         # Codex switches approval stance through its own /permissions popup, not
         # thread/settings/update (that RPC drives model/effort but no-ops for
         # approval). So drive the popup by keystroke into the codex tmux pane —
-        # the same channel /compact uses — selecting the preset by its menu digit.
+        # the same channel /compact uses — reading the popup to find the preset's
+        # menu digit (row positions vary by codex build/platform, so we discover
+        # it rather than hardcode it) and confirming Codex echoed the switch.
         from omnigent.codex_approval_modes import codex_permission_preset
 
         preset = codex_permission_preset(mode)
@@ -6024,17 +4685,17 @@ def create_runner_app(
                 },
             )
         try:
-            await asyncio.to_thread(
+            offered = await asyncio.to_thread(
                 _inject_codex_permission_mode,
                 str(instance.socket_path),
                 instance.tmux_target,
-                menu_key=preset.menu_key,
+                label=preset.label,
                 needs_confirm=preset.needs_confirm,
             )
             # Confirm the switch landed before reporting success — the injection
-            # is otherwise fire-and-forget, so an unsupported preset (a menu row
-            # this codex build lacks) would silently no-op.
-            confirmed = await asyncio.to_thread(
+            # is otherwise fire-and-forget, so a slow-rendering popup would leave
+            # the label claiming a mode the TUI never entered.
+            confirmed = offered and await asyncio.to_thread(
                 _codex_permission_mode_confirmed,
                 str(instance.socket_path),
                 instance.tmux_target,
@@ -6050,14 +4711,36 @@ def create_runner_app(
                     ),
                 },
             )
+        if not offered:
+            # The popup was read but had no row for this preset. Codex lists Read
+            # Only only when the session runs with a read-only permission profile,
+            # so point the user at the reachable path instead of a phantom switch.
+            if preset.value == "read-only":
+                detail = (
+                    "Codex's /permissions popup doesn't offer Read Only on this "
+                    "platform — Codex lists it only on Windows or when a permission "
+                    "profile is active. To run read-only, start a new session in "
+                    "read-only mode."
+                )
+            else:
+                detail = (
+                    f"Codex's /permissions popup on this session doesn't offer {preset.label!r}."
+                )
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "codex_native_approval_mode_unsupported",
+                    "detail": detail,
+                },
+            )
         if not confirmed:
             return JSONResponse(
                 status_code=503,
                 content={
                     "error": "codex_native_approval_mode_failed",
                     "detail": (
-                        f"Codex did not confirm the switch to {preset.label!r}; this codex "
-                        "build's /permissions may not offer it."
+                        f"Codex didn't confirm the switch to {preset.label!r} within "
+                        f"{_CODEX_PERMISSION_CONFIRM_BUDGET_S:g}s; please try again."
                     ),
                 },
             )
@@ -7097,16 +5780,29 @@ def create_runner_app(
         socket_path: str,
         target: str,
         *,
-        menu_key: str,
+        label: str,
         needs_confirm: bool,
-    ) -> None:
-        # Drive Codex's /permissions popup: open it, then select the preset by
-        # its menu digit (position-independent, unlike arrow navigation). Full
-        # Access opens a "Yes, continue anyway" sub-dialog whose first option
-        # (digit 1) confirms. A settle pause between keystrokes is required — each
-        # screen draws asynchronously, and typing the command then pressing Enter
-        # back-to-back races the slash-menu so the command never submits.
-        from omnigent.harnesses.claude_native.bridge import _run_tmux
+    ) -> bool:
+        # Drive Codex's /permissions popup: open it, read its rows to find the
+        # digit that selects *label*, then press it. Which rows the popup lists
+        # depends on the session's codex config (Read Only shows only with a
+        # read-only permission profile) and their order can vary, so the digit is
+        # read from the live popup. If the popup can't be read in time (a busy
+        # TUI, a slow draw), fall back to the preset's conventional menu position
+        # rather than failing the switch. Full Access opens a "Yes, continue
+        # anyway" sub-dialog whose first option (digit 1) confirms. A settle pause
+        # between keystrokes is required — each screen draws asynchronously, and
+        # typing the command then pressing Enter back-to-back races the slash-menu
+        # so the command never submits.
+        #
+        # Returns True once a digit is pressed for *label* (from the live popup,
+        # or its conventional position on fallback); False when the popup was read
+        # but lists no row for *label*.
+        from omnigent.codex_approval_modes import (
+            CODEX_NATIVE_PERMISSION_PRESETS,
+            codex_permissions_menu,
+        )
+        from omnigent.harnesses.claude_native.bridge import _capture_pane, _run_tmux
 
         # Reset to a clean composer so the command submits: close any stray
         # menu/popup, then clear the line. C-u also wipes any text the TUI user
@@ -7116,26 +5812,67 @@ def create_runner_app(
         _run_tmux(socket_path, "send-keys", "-l", "-t", target, "/permissions")
         time.sleep(_CODEX_POPUP_RENDER_S)
         _run_tmux(socket_path, "send-keys", "-t", target, "Enter")
-        time.sleep(_CODEX_POPUP_RENDER_S)
-        _run_tmux(socket_path, "send-keys", "-l", "-t", target, menu_key)
+
+        # Wait for the popup to draw. Anchor on seeing at least two known preset
+        # rows (every popup variant lists Ask for approval and Full Access)
+        # rather than any numbered line, so a numbered list still visible in the
+        # transcript above can't be mistaken for the rendered popup.
+        known_labels = {preset.label for preset in CODEX_NATIVE_PERMISSION_PRESETS}
+
+        def _read_menu() -> dict[str, str]:
+            return codex_permissions_menu(_capture_pane(socket_path, target))
+
+        deadline = time.monotonic() + _CODEX_PERMISSION_MENU_BUDGET_S
+        options: dict[str, str] = {}
+        while True:
+            time.sleep(_CODEX_POPUP_RENDER_S)
+            options = _read_menu()
+            if len(options.keys() & known_labels) >= 2:
+                break
+            if time.monotonic() >= deadline:
+                options = {}
+                break
+
+        if options:
+            # The live popup was read: trust it. A missing row means this
+            # session's codex genuinely doesn't offer the preset (e.g. Read Only
+            # without a read-only permission profile). Re-read once to tolerate a
+            # partially-drawn popup before concluding the row is absent.
+            digit = options.get(label)
+            if digit is None:
+                time.sleep(_CODEX_POPUP_RENDER_S)
+                digit = _read_menu().get(label)
+            if digit is None:
+                # Close the popup so the TUI isn't stranded in it.
+                _run_tmux(socket_path, "send-keys", "-t", target, "Escape")
+                return False
+        else:
+            # The popup couldn't be read within the budget (a busy or slow TUI).
+            # Fall back to the preset's conventional menu position and let the
+            # confirmation echo gate correctness, rather than failing the switch.
+            digit = next(
+                (
+                    str(position)
+                    for position, preset in enumerate(CODEX_NATIVE_PERMISSION_PRESETS, start=1)
+                    if preset.label == label
+                ),
+                None,
+            )
+            if digit is None:
+                return False
+        _run_tmux(socket_path, "send-keys", "-l", "-t", target, digit)
         if needs_confirm:
             time.sleep(_CODEX_POPUP_RENDER_S)
             _run_tmux(socket_path, "send-keys", "-l", "-t", target, "1")
+        return True
 
     def _codex_permission_mode_confirmed(socket_path: str, target: str, label: str) -> bool:
-        # Codex echoes "Permissions updated to <label>" when a /permissions switch
-        # applies. Poll the pane and require the most-recent such line to match the
-        # target, so a keystroke that hit a non-existent menu row (a preset this
-        # codex build doesn't offer) is reported as not-applied rather than the
-        # label claiming a mode the TUI never entered.
+        from omnigent.codex_approval_modes import codex_permission_switch_confirmed
         from omnigent.harnesses.claude_native.bridge import _capture_pane
 
-        marker = "Permissions updated to "
         deadline = time.monotonic() + _CODEX_PERMISSION_CONFIRM_BUDGET_S
         while True:
-            pane = _capture_pane(socket_path, target)
-            updates = [line for line in pane.splitlines() if marker in line]
-            if updates and updates[-1].split(marker, 1)[1].strip() == label:
+            if codex_permission_switch_confirmed(_capture_pane(socket_path, target), label):
                 return True
             if time.monotonic() >= deadline:
                 return False
@@ -7589,10 +6326,17 @@ def create_runner_app(
             if not has_buffered and not _suppress_status:
                 _publish_turn_status(conv_id, "idle")
         elif error is not None:
+            normalized_error = _normalize_turn_error(error)
             if not _suppress_status:
                 _publish_turn_status(
-                    conv_id, "failed", error=_normalize_turn_error(error), source_error=error
+                    conv_id,
+                    "failed",
+                    error=normalized_error,
+                    source_error=error,
+                    response_id=owner_response_id,
                 )
+            if normalized_error.get("code") == "databricks_sign_in_pending":
+                _start_sign_in_watch(conv_id)
         else:
             if not has_buffered and not _suppress_status:
                 children = _subagent_work_by_parent.get(conv_id, set())
@@ -7618,7 +6362,7 @@ def create_runner_app(
                 _mark_subagent_terminal_and_wake(
                     conv_id,
                     status="cancelled",
-                    output="[System: sub-agent interrupted]",
+                    output=None,
                 )
         elif error is not None:
             _mark_subagent_terminal_and_wake(
@@ -7683,7 +6427,7 @@ def create_runner_app(
                 _mark_subagent_terminal_and_wake(
                     conv_id,
                     status="cancelled",
-                    output="[System: sub-agent interrupted]",
+                    output=None,
                 )
         return True
 
@@ -8184,7 +6928,7 @@ def create_runner_app(
         # a parent still failing after the last round stays stranded until the
         # NEXT tunnel reconnect or an explicit parent turn re-attempts it.
         for delay_s in _STRANDED_WAKE_RETRY_DELAYS_S:
-            await _wake_retry_sleep(delay_s)
+            await _subagent_work._wake_retry_sleep(delay_s)
             if not _stranded_wake_parents:
                 return
             for parent_id in list(_stranded_wake_parents):
@@ -8246,9 +6990,18 @@ def create_runner_app(
         _background_tasks.add(_retry_task)
 
     def _mark_subagent_terminal_and_wake(
-        child_session_id: str, *, status: str, output: str | None
+        child_session_id: str,
+        *,
+        status: str,
+        output: str | None,
+        only_if_work_id: str | None = None,
     ) -> _SubagentDeliveryAck:
-        ack = mark_subagent_work_terminal(child_session_id, status=status, output=output)
+        ack = mark_subagent_work_terminal(
+            child_session_id,
+            status=status,
+            output=output,
+            only_if_work_id=only_if_work_id,
+        )
         if ack.entry is not None and ack.delivered_now:
             _schedule_subagent_wake(ack.entry)
         return ack
@@ -8256,6 +7009,10 @@ def create_runner_app(
     # Seam for the entrypoint's launch reaper (and tests): terminal delivery
     # that also schedules the parent wake POST, not just the inbox insert.
     app.state.mark_subagent_terminal_and_wake = _mark_subagent_terminal_and_wake
+
+    def _subagent_work_id_for_session(conv_id: str) -> str | None:
+        entry = get_subagent_work(conv_id)
+        return entry.work_id if entry is not None else None
 
     _native_interrupt_runner = NativeInterruptRunner(
         server_client=server_client,
@@ -8266,6 +7023,7 @@ def create_runner_app(
         codex_bridge_state_for_session=_codex_native_bridge_state_for_session,
         client_safe_error_detail=_client_safe_error_detail,
         logger=_logger,
+        subagent_work_id_for_session=_subagent_work_id_for_session,
     )
 
     def _discard_comment_relay(session_id: str, relay: ClaudeNativeToolRelay) -> None:
@@ -8680,6 +7438,7 @@ def create_runner_app(
                 cwd=await _session_runtime_cwd(conv),
                 model_override=cast(str | None, msg_body.get("model_override")),
                 session_id=conv,
+                resource_registry=resource_registry,
             )
             # Gated harnesses use nullable to avoid the fallback literal.
             _authored_bg = raw_author_instructions(cached_spec) is not None
@@ -8743,6 +7502,11 @@ def create_runner_app(
         _model_override = msg_body.get("model_override")
         if isinstance(_model_override, str) and _model_override:
             harness_body["model_override"] = _model_override
+        # The web's stable id for this message: stamped on the turn's failure
+        # so the server can settle exactly this queued entry, not the oldest.
+        _stable_id = msg_body.get("stable_id")
+        if isinstance(_stable_id, str) and _stable_id:
+            harness_body["input_stable_id"] = _stable_id
             _logger.info(
                 "_run_turn_bg: conv=%s received model_override=%s (forwarding to harness)",
                 conv,
@@ -9045,6 +7809,7 @@ def create_runner_app(
             _sub_agent_name = await _recover_sub_agent_name(conv_id)
             try:
                 harness_name, spawn_env = await _resolve_harness_config(
+                    resource_registry=resource_registry,
                     agent_id=_agent_id,
                     spec_resolver=spec_resolver,
                     session_id=conv_id,
@@ -9067,6 +7832,49 @@ def create_runner_app(
                         "detail": _client_safe_error_detail(exc, context="spec resolve"),
                     },
                 )
+        from omnigent.sandbox.copy_on_write import (
+            SHARED_ENVIRONMENT_VAR,
+            export_shared_environment,
+            has_copy_on_write,
+            validate_copy_on_write_harness,
+        )
+
+        stream_spec = _unwrap_resolved_spec(_session_spec_cache.get(conv_id))
+        if stream_spec is None and _ds_agent_id and spec_resolver is not None:
+            try:
+                stream_spec = _unwrap_resolved_spec(await spec_resolver(_ds_agent_id, conv_id))
+            except (OmnigentError, httpx.HTTPError, RuntimeError):
+                stream_spec = None
+        if has_copy_on_write(
+            getattr(stream_spec, "os_env", None)
+        ) or resource_registry.uses_copy_on_write(conv_id):
+            if stream_spec is None:
+                return JSONResponse(
+                    status_code=503, content={"error": "copy_on_write session spec unavailable"}
+                )
+            try:
+                validate_copy_on_write_harness(stream_spec.os_env, harness_name)
+                environment = resource_registry.resolve_environment(
+                    conv_id, DEFAULT_ENVIRONMENT_ID, stream_spec
+                )
+                policy = getattr(environment, "sandbox", None)
+                if policy is None:
+                    raise ValueError("copy_on_write requires a local sandbox environment")
+                environment.prepare_sandbox(policy)
+                spawn_env = dict(spawn_env or {})
+                spawn_env[SHARED_ENVIRONMENT_VAR] = export_shared_environment(policy)
+            except ValueError as exc:
+                _logger.warning("copy_on_write setup failed for %s", conv_id, exc_info=True)
+                return JSONResponse(
+                    status_code=400,
+                    content={
+                        "error": "copy_on_write_setup_failed",
+                        "detail": _client_safe_error_detail(exc, context="copy_on_write setup"),
+                        "hint": "Use executor.harness=openai-agents; start a new session after "
+                        "changing copy_on_write paths.",
+                    },
+                )
+
         if spawn_env is None:
             spawn_env = await _resolve_native_spawn_env(
                 harness_name,
@@ -9719,6 +8527,10 @@ def create_runner_app(
                             if event is None:
                                 yield raw_sse_bytes
                                 continue
+                            if event.get("type") == "response.failed":
+                                _input_stable_id = body.get("input_stable_id")
+                                if isinstance(_input_stable_id, str):
+                                    event["input_stable_id"] = _input_stable_id
                             if not _defer_publish and event.get("type") != "response.created":
                                 _publish_event(conv_id, event)
                             if dispatch is not None and event.get(_RUNNER_DISPATCHED_FIELD):
@@ -9845,25 +8657,34 @@ def create_runner_app(
         )
         _side_thread_id = body.get("codex_side_thread_id") if isinstance(body, dict) else None
         if _side_thread_id:
-            # Codex /side follow-up: the server redirected a side-chat child's
-            # message here (this endpoint's conversation_id is the PARENT), tagged
-            # with the child Codex thread id. Drive it on that thread via the
-            # parent's bridge, isolated from the parent's turn buffer/active-turn
-            # state on purpose so the main conversation is untouched.
+            # Side-chat controls use the parent's bridge but target the child's
+            # thread, leaving the parent's turn and message buffer untouched.
             from omnigent.harnesses.codex_native import side_chat
             from omnigent.harnesses.codex_native.app_server import client_for_transport
 
-            _side_text = _side_chat_text_from_content(
-                body.get("content") if isinstance(body, dict) else None
-            )
-            if not _side_text:
-                return JSONResponse(
-                    status_code=400,
-                    content={
-                        "error": "invalid_request",
-                        "detail": "side chat message had no text",
-                    },
+            _side_turn_id = body.get("codex_side_turn_id")
+            _side_text = ""
+            if body_type == "interrupt":
+                if not isinstance(_side_turn_id, str) or not _side_turn_id:
+                    return JSONResponse(
+                        status_code=400,
+                        content={
+                            "error": "invalid_request",
+                            "detail": "Missing side-chat turn id.",
+                        },
+                    )
+            else:
+                _side_text = _side_chat_text_from_content(
+                    body.get("content") if isinstance(body, dict) else None
                 )
+                if not _side_text:
+                    return JSONResponse(
+                        status_code=400,
+                        content={
+                            "error": "invalid_request",
+                            "detail": "side chat message had no text",
+                        },
+                    )
             _side_state = await _codex_native_bridge_state_for_session(
                 conversation_id, action="side chat turn"
             )
@@ -9880,7 +8701,14 @@ def create_runner_app(
             )
             try:
                 await _side_client.connect()
-                await side_chat.submit_side_turn(_side_client, str(_side_thread_id), _side_text)
+                if body_type == "interrupt":
+                    await side_chat.interrupt_side_turn(
+                        _side_client, str(_side_thread_id), _side_turn_id
+                    )
+                else:
+                    await side_chat.submit_side_turn(
+                        _side_client, str(_side_thread_id), _side_text
+                    )
             finally:
                 await _side_client.close()
             return Response(status_code=202)
@@ -10108,31 +8936,120 @@ def create_runner_app(
             output = forwarded_output if isinstance(forwarded_output, str) else None
             delivery_ack: _SubagentDeliveryAck | None = None
             recovered_entry: _SubagentWorkEntry | None = None
+            terminal_status = None
+            if status in ("idle", "failed"):
+                recovered_entry = get_subagent_work(conversation_id)
+                turn_outcome = data.get("turn_outcome") if isinstance(data, dict) else None
+                if turn_outcome in ("completed", "cancelled", "failed"):
+                    recovered_entry = await _ensure_subagent_work_entry(conversation_id)
+                    terminal_status = turn_outcome
+                    if turn_outcome == "cancelled" and recovered_entry is not None:
+                        recovered_entry.cancellation_confirmed = True
+                elif (
+                    status == "idle"
+                    and recovered_entry is not None
+                    and recovered_entry.status == "cancelled"
+                    and recovered_entry.cancellation_confirmed
+                ):
+                    # A bare idle retry cannot overwrite a confirmed abort
+                    # while its parent inbox is still unavailable.
+                    terminal_status = "cancelled"
+                    output = recovered_entry.output
             if status in ("running", "waiting", "idle", "failed"):
                 # Forwarders report these edges straight to the server, so record
                 # them here too; the idle watchdog reads them for native turns.
                 _native_pane_status[conversation_id] = status
                 resource_registry.note_external_session_status(conversation_id, status)
+                child_status = (
+                    "idle" if terminal_status == "completed" else terminal_status or status
+                )
                 _fan_out_child_delta_to_parent(
                     conversation_id,
-                    {"type": "session.status", "status": status},
+                    {"type": "session.status", "status": child_status},
                     latest_assistant_text=output,
                     allow_history_preview_fallback=False,
                 )
-            if status in ("idle", "failed"):
-                recovered_entry = await _ensure_subagent_work_entry(conversation_id)
-            if status == "idle":
+            turn_completed = data.get("turn_completed") if isinstance(data, dict) else None
+            interrupt_pending = False
+            interrupt_work_id: str | None = None
+            if status == "idle" and terminal_status is None and turn_completed is not True:
+                # An unconfirmed idle following an interrupt settles the
+                # dispatch: the turn stopped early, so report ``cancelled``
+                # with whatever output the edge carried instead of guessing
+                # ``completed`` — or discarding a genuine result. Resolve the
+                # pending interrupt only when it belongs to the dispatch now
+                # registered: a stale record (its dispatch exited, or a new send
+                # reused this child) must not capture this idle — for a legacy
+                # harness that idle is the NEW dispatch's completion.
+                _current_entry = get_subagent_work(conversation_id)
+                interrupt_pending, interrupt_work_id = (
+                    _native_interrupt_runner.resolve_pending_interrupt(
+                        conversation_id,
+                        _current_entry.work_id if _current_entry is not None else None,
+                    )
+                )
+            ambiguous_idle = (
+                status == "idle"
+                and terminal_status is None
+                and turn_completed is not True
+                and not interrupt_pending
+                and _native_turn_outcome_is_forwarder_confirmed(conversation_id)
+            )
+            if terminal_status is not None:
+                _native_interrupt_runner.clear_pending_interrupt(conversation_id)
+                if terminal_status == "cancelled":
+                    output = output or "[System: sub-agent interrupted]"
+                elif terminal_status == "failed":
+                    output = output or "Error: native sub-agent turn failed"
                 delivery_ack = _mark_subagent_terminal_and_wake(
                     conversation_id,
-                    status="completed",
+                    status=terminal_status,
                     output=output if output is not None else "",
                 )
-            elif status == "failed":
+            elif ambiguous_idle:
+                # This harness's forwarder marks genuine turn completions
+                # (``turn_completed``), so a bare quiescence idle proves
+                # nothing about the turn's outcome: record the pane status
+                # above but settle no outcome. Mapping it to ``completed``
+                # reported aborted turns as successes.
+                entry = get_subagent_work(conversation_id)
+                if entry is None or entry.status not in _SUBAGENT_TERMINAL_STATUSES:
+                    return Response(status_code=204)
+                # An already-settled outcome may still await parent delivery
+                # (the forwarder's 503-retry contract); re-attempt it.
                 delivery_ack = _mark_subagent_terminal_and_wake(
                     conversation_id,
-                    status="failed",
-                    output=output or "Error: native sub-agent turn failed",
+                    status=entry.status,
+                    output=entry.output,
                 )
+            else:
+                if status in ("idle", "failed"):
+                    recovered_entry = await _ensure_subagent_work_entry(conversation_id)
+                if status == "idle" and interrupt_pending:
+                    # Interrupt with no confirming edge, resolved to the CURRENT
+                    # dispatch (``resolve_pending_interrupt`` only reports pending
+                    # when the recorded ``work_id`` matches). Bound to that
+                    # dispatch so it cannot cancel a newer send.
+                    delivery_ack = _mark_subagent_terminal_and_wake(
+                        conversation_id,
+                        status="cancelled",
+                        output=output,
+                        only_if_work_id=interrupt_work_id,
+                    )
+                elif status == "idle":
+                    _native_interrupt_runner.clear_pending_interrupt(conversation_id)
+                    delivery_ack = _mark_subagent_terminal_and_wake(
+                        conversation_id,
+                        status="completed",
+                        output=output if output is not None else "",
+                    )
+                elif status == "failed":
+                    _native_interrupt_runner.clear_pending_interrupt(conversation_id)
+                    delivery_ack = _mark_subagent_terminal_and_wake(
+                        conversation_id,
+                        status="failed",
+                        output=output or "Error: native sub-agent turn failed",
+                    )
             if delivery_ack is not None:
                 if (
                     delivery_ack.entry is not None
@@ -10713,6 +9630,7 @@ def create_runner_app(
                 resource_registry=resource_registry,
                 publish_event=_publish_ensure_event,
                 server_client=server_client,
+                event_dispatcher=getattr(app.state, "runner_event_dispatcher", None),
                 ensure_comment_relay=_ensure_comment_relay_started,
             )
             _ensure_build: (
@@ -11066,6 +9984,49 @@ def create_runner_app(
             status_code=200,
             content=session_resource_view_to_dict(resource),
         )
+
+    @app.get("/v1/sessions/{session_id}/sign-in-link")
+    async def get_session_sign_in_link(session_id: str) -> JSONResponse:
+        """
+        Return the sign-in prompt a session's terminal is showing right now, if any.
+
+        A launcher wrapper can park a native pane on a device-style sign-in
+        (an address to open, often with a code) before the agent runs. The
+        address is bound to that launcher process, so a link saved in an
+        earlier error card goes stale once the process moves on. The web asks
+        here at click time and opens whatever the pane shows now.
+
+        :param session_id: Session/conversation id.
+        Only the native agent's own pane is read (see ``_native_pane_names``):
+        another terminal in the session must not supply the address.
+
+        :returns: ``{"pending": true, "url", "code", "terminal_id"}`` when the
+            running agent pane shows a prompt; ``{"pending": false}`` otherwise.
+        """
+        from omnigent.harnesses.diagnostics import detect_sign_in_prompt
+
+        registry = resource_registry.terminal_registry
+        entries = registry.list_for_conversation(session_id) if registry is not None else []
+        pane_names = _native_pane_names(session_id)
+        for entry in entries:
+            if entry.terminal_name not in pane_names or not entry.instance.running:
+                continue
+            # Wrapped rows joined: the address is far wider than the pane.
+            result = await entry.instance.read(join_wrapped=True)
+            screen = result.get("screen") if isinstance(result, dict) else None
+            prompt = detect_sign_in_prompt(screen if isinstance(screen, str) else None)
+            if prompt is None:
+                continue
+            return JSONResponse(
+                status_code=200,
+                content={
+                    "pending": True,
+                    "url": prompt.url,
+                    "code": prompt.code,
+                    "terminal_id": terminal_resource_id(entry.terminal_name, entry.session_key),
+                },
+            )
+        return JSONResponse(status_code=200, content={"pending": False, "url": None, "code": None})
 
     @app.post("/v1/sessions/{session_id}/resources/terminals/{terminal_id}/transfer")
     async def transfer_session_terminal(
@@ -12565,6 +11526,8 @@ def create_runner_app(
         _kimi_terminal_ensure_locks.pop(session_id, None)
         _hermes_terminal_ensure_locks.pop(session_id, None)
         _repl_terminal_ensure_locks.pop(session_id, None)
+        if process_manager is not None:
+            await process_manager.release(session_id)
         await resource_registry.cleanup_session(session_id)
         await _delete_native_bridge_dirs(
             server_client=server_client,
@@ -12594,6 +11557,8 @@ def create_runner_app(
         _hermes_terminal_ensure_locks.pop(session_id, None)
         _repl_terminal_ensure_locks.pop(session_id, None)
         await _teardown_session_terminals(session_id)
+        if process_manager is not None:
+            await process_manager.release(session_id)
         await resource_registry.cleanup_session(session_id)
         _clear_session_agent_caches(session_id, _session_agent_ids.get(session_id))
         return JSONResponse(
@@ -13216,7 +12181,10 @@ def create_runner_app(
         and hasattr(_pane_reaper_registry, "native_panes")
     ):
         from omnigent.harnesses.claude_native.bridge import approval_wait_is_fresh
-        from omnigent.native.native_cost_popup import _list_tmux_clients, _tmux_window_activity_at
+        from omnigent.native.native_cost_popup import (
+            _tmux_last_client_input_at,
+            _tmux_window_activity_at,
+        )
         from omnigent.runner.tool_dispatch import _publish_terminal_deleted_event
         from omnigent.terminals.pane_reaper import (
             PANE_OUTPUT_BUSY_WINDOW_S,
@@ -13247,8 +12215,18 @@ def create_runner_app(
             # prompt and strands its approval card unanswerable.
             if approval_wait_is_fresh(conv_id):
                 return True
-            clients = await asyncio.to_thread(_list_tmux_clients, str(pane.socket_path), "main")
-            if clients:
+            # An attached viewer alone does not spare the pane (a tab left open
+            # overnight kept idle native stacks resident). Count it only when a
+            # human drove it recently: a CLI keypress, or any web-bridge event.
+            input_at = await asyncio.to_thread(
+                _tmux_last_client_input_at, str(pane.socket_path), "main"
+            )
+            if input_at is not None and time.time() - input_at < PANE_OUTPUT_BUSY_WINDOW_S:
+                return True
+            instance = _pane_reaper_registry.get(conv_id, pane.terminal_name, "main")
+            if instance is not None and instance.client_interaction_within(
+                PANE_OUTPUT_BUSY_WINDOW_S
+            ):
                 return True
             # Primary evidence: tmux stamps window_activity on every byte the
             # pane emits, so a producing terminal stays busy even when the
@@ -13336,6 +12314,7 @@ async def _resolve_harness_config(
     harness_override: str | None = None,
     sub_agent_name: str | None = None,
     cwd: Path | None = None,
+    resource_registry: SessionResourceRegistry | None = None,
 ) -> tuple[str, dict[str, str] | None]:
     """Resolve harness type + spawn-env from the agent spec.
 
@@ -13396,6 +12375,7 @@ async def _resolve_harness_config(
                 workdir=workdir,
                 model_override=model_override,
                 session_id=session_id,
+                resource_registry=resource_registry,
             )
             return harness, spawn_env
 
@@ -13512,6 +12492,7 @@ def _build_spawn_env_from_spec(
     workdir: Path | None = None,
     model_override: str | None = None,
     session_id: str | None = None,
+    resource_registry: SessionResourceRegistry | None = None,
 ) -> dict[str, str] | None:
     """Build spawn-env from spec — mirrors workflow.py's helpers.
 
@@ -13543,6 +12524,9 @@ def _build_spawn_env_from_spec(
                 spec.executor, config={**spec.executor.config, "harness": requested_harness}
             ),
         )
+    from omnigent.sandbox.copy_on_write import validate_copy_on_write_harness
+
+    validate_copy_on_write_harness(getattr(spec, "os_env", None), harness)
     effective_spec = spec
     from omnigent.inference_config import load_runtime_inference_config, parse_inference_config
 
@@ -13612,6 +12596,11 @@ def _build_spawn_env_from_spec(
             env = _build_claude_sdk_spawn_env(effective_spec, cwd=cwd, workdir=workdir)
         elif harness == "codex":
             env = _build_codex_spawn_env(effective_spec, cwd=cwd, workdir=workdir)
+            env["HARNESS_CODEX_SKILLS_DIR"] = (
+                str(resource_registry.codex_skills_dir(session_id))
+                if resource_registry is not None and session_id is not None
+                else ""
+            )
         elif harness == "pi":
             env = _build_pi_spawn_env(effective_spec, cwd=cwd, workdir=workdir)
         elif harness == "openai-agents":
@@ -13663,6 +12652,28 @@ def _build_spawn_env_from_spec(
 
         env = strip_desktop_session_env(env)
         env.update(desktop_session_passthrough(effective_spec.os_env))
+
+    if (
+        env is not None
+        and spec.os_env is not None
+        and spec.os_env.sandbox is not None
+        and any(p.copy_on_write for p in spec.os_env.sandbox.write_path_specs)
+    ):
+        if resource_registry is None or session_id is None:
+            raise ValueError("copy_on_write harnesses require a session resource registry")
+        from omnigent.sandbox.copy_on_write import (
+            SHARED_ENVIRONMENT_VAR,
+            export_shared_environment,
+        )
+
+        environment = resource_registry.resolve_environment(
+            session_id, DEFAULT_ENVIRONMENT_ID, spec
+        )
+        policy = getattr(environment, "sandbox", None)
+        if policy is None:
+            raise ValueError("copy_on_write requires a local sandbox environment")
+        environment.prepare_sandbox(policy)
+        env[SHARED_ENVIRONMENT_VAR] = export_shared_environment(policy)
 
     # Point the harness process at this session's subagent-routing endpoint
     # when one is running (started at session init). Scoped to *harness* so a

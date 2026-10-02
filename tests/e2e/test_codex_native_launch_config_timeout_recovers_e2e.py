@@ -43,12 +43,9 @@ Run::
 
 from __future__ import annotations
 
-import json
 import os
 import secrets
 import shutil
-import signal
-import socket
 import subprocess
 import sys
 import time
@@ -56,6 +53,9 @@ from pathlib import Path
 
 import httpx
 import pytest
+
+from tests._helpers.live_server import find_free_port, terminate_process
+from tests._helpers.native_session import create_native_session
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -134,13 +134,6 @@ pytestmark = [
 ]
 
 
-def _find_free_port() -> int:
-    """Grab an ephemeral port for the spawned server."""
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        return int(sock.getsockname()[1])
-
-
 def _localhost_env(extra: dict[str, str]) -> dict[str, str]:
     """Subprocess env with worktree imports and no proxy in the way.
 
@@ -159,18 +152,6 @@ def _localhost_env(extra: dict[str, str]) -> dict[str, str]:
     return env
 
 
-def _terminate(proc: subprocess.Popen[bytes] | None) -> None:
-    """Best-effort SIGTERM -> SIGKILL teardown for a spawned process."""
-    if proc is None or proc.poll() is not None:
-        return
-    proc.send_signal(signal.SIGTERM)
-    try:
-        proc.wait(timeout=10)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        proc.wait(timeout=5)
-
-
 def _wait_http_ok(url: str, deadline: float) -> None:
     """Poll *url* until it returns 200 or *deadline* (monotonic) passes."""
     last = "not polled"
@@ -183,58 +164,6 @@ def _wait_http_ok(url: str, deadline: float) -> None:
             last = f"{type(exc).__name__}: {exc}"
         time.sleep(_POLL_S)
     raise AssertionError(f"{url} never became healthy: {last}")
-
-
-def _create_codex_native_session(base_url: str) -> str:
-    """Create a codex-native wrapper session exactly like ``omnigent codex``.
-
-    Reuses the production spec materializer and stamps the same wrapper /
-    terminal-first labels the CLI writes, so the runner's codex-native
-    auto-bootstrap recognizes the session.
-
-    :param base_url: Spawned server base URL.
-    :returns: The new session/conversation id.
-    """
-    import io
-    import tarfile
-    import tempfile
-
-    from omnigent._wrapper_labels import (
-        CODEX_NATIVE_WRAPPER_VALUE,
-        UI_MODE_LABEL_KEY,
-        UI_MODE_TERMINAL_VALUE,
-        WRAPPER_LABEL_KEY,
-    )
-    from omnigent.harnesses.codex_native.main import _materialize_codex_agent_spec
-
-    with tempfile.TemporaryDirectory() as tmp:
-        yaml_text = _materialize_codex_agent_spec(Path(tmp), model=None).read_text()
-
-    buf = io.BytesIO()
-    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
-        data = yaml_text.encode()
-        info = tarfile.TarInfo("codex-native-ui.yaml")
-        info.size = len(data)
-        tar.addfile(info, io.BytesIO(data))
-
-    labels = {
-        UI_MODE_LABEL_KEY: UI_MODE_TERMINAL_VALUE,
-        WRAPPER_LABEL_KEY: CODEX_NATIVE_WRAPPER_VALUE,
-    }
-    create = _http.post(
-        f"{base_url}/v1/sessions",
-        data={"metadata": json.dumps({"labels": labels})},
-        files={
-            "bundle": (
-                "codex-native-ui.tar.gz",
-                buf.getvalue(),
-                "application/gzip",
-            )
-        },
-        timeout=30.0,
-    )
-    create.raise_for_status()
-    return str(create.json()["session_id"])
 
 
 def test_codex_native_launch_recovers_from_transient_config_fetch_timeout(
@@ -250,7 +179,7 @@ def test_codex_native_launch_recovers_from_transient_config_fetch_timeout(
 
     :param tmp_path: Per-test temp dir (server DB, runner HOME, workspace).
     """
-    port = _find_free_port()
+    port = find_free_port()
     base_url = f"http://127.0.0.1:{port}"
     db_path = tmp_path / "chat.db"
     database_uri = f"sqlite:///{db_path}"
@@ -327,7 +256,7 @@ def test_codex_native_launch_recovers_from_transient_config_fetch_timeout(
             time.sleep(_POLL_S)
         assert online, f"runner never came online; log:\n{_runner_log()[-3000:]}"
 
-        session_id = _create_codex_native_session(base_url)
+        session_id = str(create_native_session(_http, base_url, harness="codex")["session_id"])
 
         # ---- Launch path: binding the runner auto-creates the Codex terminal.
         # The first launch-config fetch times out; the retried read recovers and
@@ -390,7 +319,7 @@ def test_codex_native_launch_recovers_from_transient_config_fetch_timeout(
             f"runner log:\n{_runner_log()[-4000:]}"
         )
     finally:
-        _terminate(runner_proc)
-        _terminate(server_proc)
+        terminate_process(runner_proc)
+        terminate_process(server_proc)
         server_log.close()
         runner_stdout.close()

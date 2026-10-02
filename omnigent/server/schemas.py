@@ -253,8 +253,9 @@ class AgentObject(BaseModel):
         declares no MCP servers or when the bundle cannot be
         loaded.
     :param mcp_servers_editable: Whether the MCP list can be edited
-        through the session UI. Built-in template agents are read-only;
-        session-scoped uploaded agents are editable.
+        through the session UI by the authenticated caller. This requires
+        ownership of both the effective session and its session-scoped agent;
+        built-in template and native agents are read-only.
     :param policies: Guardrails policies declared on the agent.
         Each entry summarises the policy name, type, and
         phases. Empty list when the spec declares no policies
@@ -923,6 +924,9 @@ class ErrorDetail(BaseModel):
         Paired with ``title``.
     :param remediation: Optional concrete next step to fix it, e.g. a command
         to run. ``None`` when there is no single clear fix.
+    :param undelivered: ``True`` when the harness reports it never received the
+        message this turn carried (it failed before delivery), so the sender's
+        queued copy is the only record of it; absent otherwise.
     """
 
     code: str
@@ -930,6 +934,7 @@ class ErrorDetail(BaseModel):
     title: str | None = None
     cause: str | None = None
     remediation: str | None = None
+    undelivered: bool | None = None
 
 
 class ErrorResponse(BaseModel):
@@ -2086,7 +2091,10 @@ class SessionResponse(BaseModel):
         ``response.error`` SSE event (which may have been emitted
         before the web client subscribed). Format mirrors the
         ``RetryErrorDetail`` SSE shape:
-        ``{"code": "executor_error", "message": "..."}``.
+        ``{"code": "executor_error", "message": "..."}``. A
+        ``runner_rejected_event`` failure also carries ``item_id``, the
+        persisted item the runner refused, so a web client whose POST
+        answer was lost can match the refusal to its own send.
         ``None`` in all other cases.
     :param external_session_id: Runtime-native session id this
         conversation wraps, e.g. a Claude Code session uuid for

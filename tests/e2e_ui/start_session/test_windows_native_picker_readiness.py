@@ -10,9 +10,8 @@ import re
 import subprocess
 import sys
 import tempfile
-import threading
 import uuid
-from collections.abc import AsyncIterator, Coroutine
+from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
 
@@ -44,6 +43,7 @@ from omnigent.runner.transports.ws_tunnel.frames import (
     decode_frame,
     encode_frame,
 )
+from tests._helpers.async_thread import run_in_fresh_loop as _run_in_fresh_loop
 
 _AGENT_ID = "ag_claude_native_e2e"
 _HARNESS = "claude-native"
@@ -283,23 +283,6 @@ async def _reveal_claude_row(page: Any) -> Any:
             await more.click()
     await expect(row).to_be_visible(timeout=15_000)
     return row
-
-
-def _run_in_fresh_loop(coro: Coroutine[Any, Any, None]) -> None:
-    """Run after sync Playwright has occupied the main thread's event loop."""
-    captured: dict[str, Exception] = {}
-
-    def _worker() -> None:
-        try:
-            asyncio.run(coro)
-        except Exception as exc:
-            captured["error"] = exc
-
-    thread = threading.Thread(target=_worker)
-    thread.start()
-    thread.join()
-    if "error" in captured:
-        raise captured["error"]
 
 
 def test_windows_host_native_agent_carries_warning_badge(live_server: str) -> None:

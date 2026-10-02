@@ -25,6 +25,7 @@ import {
 import { createPortal } from "react-dom";
 import {
   ArchiveIcon,
+  ArrowUpDownIcon,
   ArchiveRestoreIcon,
   CheckIcon,
   CheckIcon as CheckMarkIcon,
@@ -999,7 +1000,10 @@ function SidebarImpl({
           brand mark is dropped and the actions slide left to sit beside the
           window controls (see the [data-electron-mac] rules in index.css).
           Inert in a browser and on other platforms, which keep the row below. */}
-            <div className="sidebar-header-row flex h-12 shrink-0 items-center justify-between pr-3 pl-4">
+            {/* h-14 below md matches the mobile chat header height so the
+            Search bubble shares a centerline with the overflow bubble in the
+            chat strip beside the open drawer. */}
+            <div className="sidebar-header-row flex h-14 shrink-0 items-center justify-between pr-3 pl-4 md:h-12">
               {/* Brand mark doubles as the "home" affordance: clicking it
             returns to `/`, the new-session composer. Without this there
             is no way back to the landing composer once you're inside a
@@ -1503,8 +1507,6 @@ function ProjectFolder({
             actions={orderedMenuActions}
           />
         }
-        // Touch exposes these actions through the header's long-press menu.
-        actionHoverOnly
         headerContextMenu={
           <ContextMenuContent className="min-w-40">
             <ProjectFolderMenuItems
@@ -2643,7 +2645,6 @@ function SectionHeader({
   marker,
   active = false,
   hasAction,
-  actionHoverOnly,
   hasPersistentAction,
   actionFocusVisible,
   collapsed,
@@ -2663,8 +2664,6 @@ function SectionHeader({
       full control column there; only at rest on hover-capable desktops do the
       badges return to the rows' badge column. */
   hasAction?: boolean;
-  /** Whether the header action is absent without a fine hover pointer. */
-  actionHoverOnly?: boolean;
   /** Whether an always-visible control sits at the header's right edge (the
       Sessions filter), which the collapsed badges must clear even at rest on
       hover-capable desktops. */
@@ -2680,21 +2679,8 @@ function SectionHeader({
   contextMenuDisabled?: boolean;
 }) {
   const showsMarker = collapsed && marker != null;
-  // Right-edge offset of the marker when no header control is painted: it
-  // matches the rows' badge slot (-mr-1 trims an icon folder's px-2 to the
-  // right-1 edge; mr-1 pushes a padless header out to it). One media condition
-  // governs the whole header-control matrix: overlays hide (and stop
-  // hit-testing) only on md+ displays whose PRIMARY pointer is a fine,
-  // hover-capable one — `hover:hover` alone is not enough, since a convertible
-  // with a coarse primary pointer can still report it, and its first tap would
-  // be captured by the header underneath before any hover state exists.
-  // Everywhere else the controls stay painted and clickable, so with
-  // `hasAction` the cluster reserves the full mr-14 control column, returning
-  // to this rest offset (or clearing the always-visible Sessions filter with
-  // mr-7) only under that same condition. Hover-only actions keep this rest
-  // offset at every capability. On fine-pointer touchscreen laptops a screen
-  // tap still hit-tests before hover applies, so the folder's menu keeps its
-  // "New session" fallback at every breakpoint.
+  // Touch and narrow layouts reserve space for the visible controls. On hover
+  // desktops the marker returns to the right edge until the controls appear.
   const clusterRestMargin = showsMarker ? (icon ? "-mr-1" : "mr-1") : "mr-2";
   const clusterHoverDesktopMargin = hasPersistentAction
     ? "[@media((hover:hover)_and_(pointer:fine))]:md:mr-7"
@@ -2703,22 +2689,11 @@ function SectionHeader({
         ? "[@media((hover:hover)_and_(pointer:fine))]:md:-mr-1"
         : "[@media((hover:hover)_and_(pointer:fine))]:md:mr-1"
       : "[@media((hover:hover)_and_(pointer:fine))]:md:mr-2";
-  const markerFade = actionHoverOnly
-    ? "[@media((hover:hover)_and_(pointer:fine))]:group-hover/section:opacity-0 [@media((hover:hover)_and_(pointer:fine))]:group-has-[[data-state=open]]/header:opacity-0"
-    : "[@media((hover:hover)_and_(pointer:fine))]:md:group-hover/section:opacity-0 [@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-state=open]]/header:opacity-0";
-  // The hover-only control's focus reveal (`focus-visible:not-sr-only`) is
-  // ungated by pointer type, so a coarse-pointer tablet with a keyboard can
-  // land focus on it. Its focus fade must therefore fire at every pointer type
-  // too — otherwise the focus-revealed kebab paints over a still-visible
-  // spinner/count. The hover-driven fades above stay pointer-gated (hover only
-  // exists on fine). Every other header keeps its width-gated focus fade.
+  const markerFade =
+    "[@media((hover:hover)_and_(pointer:fine))]:md:group-hover/section:opacity-0 [@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-state=open]]/header:opacity-0";
   const actionFocusFade = actionFocusVisible
-    ? actionHoverOnly
-      ? "group-has-[[data-header-controls]_:focus-visible]/header:opacity-0"
-      : "[@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-header-controls]_:focus-visible]/header:opacity-0"
-    : actionHoverOnly
-      ? "group-has-[[data-header-controls]:focus-within]/header:opacity-0"
-      : "[@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-header-controls]:focus-within]/header:opacity-0";
+    ? "[@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-header-controls]_:focus-visible]/header:opacity-0"
+    : "[@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-header-controls]:focus-within]/header:opacity-0";
   const button = (
     <button
       ref={
@@ -2758,6 +2733,9 @@ function SectionHeader({
               SIDEBAR_HOVER_HIGHLIGHT,
               contextMenu && SIDEBAR_OPEN_MENU_HIGHLIGHT,
               active && SIDEBAR_ACTIVE_HIGHLIGHT,
+              hasAction &&
+                !showsMarker &&
+                "pr-8 [@media((hover:hover)_and_(pointer:fine))]:pr-14 [@media((hover:hover)_and_(pointer:fine))]:md:pr-2 [@media((hover:hover)_and_(pointer:fine))]:md:group-hover/header:pr-14 [@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-header-controls]:focus-within]/header:pr-14 [@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-state=open]]/header:pr-14",
             )
           : "group flex h-7 w-full items-center gap-1 border-0 pr-0 pl-2 text-left text-sm font-normal text-muted-foreground transition-colors hover:text-foreground",
       )}
@@ -2799,8 +2777,12 @@ function SectionHeader({
         <span
           className={cn(
             "ml-auto flex shrink-0 items-center justify-center transition-opacity",
-            hasAction && !actionHoverOnly
-              ? cn("mr-14", clusterHoverDesktopMargin)
+            // Touch project rows have one menu; fine pointers also get a shortcut.
+            hasAction
+              ? cn(
+                  icon ? "mr-7 [@media((hover:hover)_and_(pointer:fine))]:mr-14" : "mr-14",
+                  clusterHoverDesktopMargin,
+                )
               : hasPersistentAction
                 ? "mr-7"
                 : clusterRestMargin,
@@ -3069,7 +3051,6 @@ function ConversationSection({
   emptyMessage,
   indentRows,
   headerAction,
-  actionHoverOnly,
   headerContextMenu,
   persistentHeaderAction,
   afterHeader,
@@ -3104,8 +3085,6 @@ function ConversationSection({
   indentRows?: boolean;
   /** Optional control overlaid at the header's right edge. */
   headerAction?: ReactNode;
-  /** Whether `headerAction` is absent without a fine hover pointer. */
-  actionHoverOnly?: boolean;
   /** Optional context-menu content opened from the header button. */
   headerContextMenu?: ReactNode;
   /** Optional control that remains visible at the header's right edge. */
@@ -3136,7 +3115,6 @@ function ConversationSection({
             marker={marker}
             active={active}
             hasAction={headerAction != null}
-            actionHoverOnly={actionHoverOnly}
             hasPersistentAction={persistentHeaderAction != null}
             collapsed={isCollapsed}
             onToggleCollapsed={onToggleCollapsed}
@@ -3160,14 +3138,8 @@ function ConversationSection({
               data-header-controls
               className={cn(
                 "-translate-y-1/2 absolute top-1/2 right-1 flex items-center gap-0.5",
-                // A hover-only action reveals at every width on a fine hover
-                // pointer (no `md:`), so the badge it overlays is protected from
-                // its at-rest hit target on narrow hover desktops too. Every
-                // other header keeps the width-gated reveal.
                 protectsCollapsedBadge &&
-                  (actionHoverOnly
-                    ? "[@media((hover:hover)_and_(pointer:fine))]:pointer-events-none [@media((hover:hover)_and_(pointer:fine))]:group-has-[[data-header-controls]:focus-within]/header:pointer-events-auto [@media((hover:hover)_and_(pointer:fine))]:group-hover/header:pointer-events-auto [@media((hover:hover)_and_(pointer:fine))]:group-has-[[data-state=open]]/header:pointer-events-auto [@media((hover:hover)_and_(pointer:fine))]:has-[[aria-expanded=true]]:pointer-events-auto"
-                    : "[@media((hover:hover)_and_(pointer:fine))]:md:pointer-events-none [@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-header-controls]:focus-within]/header:pointer-events-auto [@media((hover:hover)_and_(pointer:fine))]:md:group-hover/header:pointer-events-auto [@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-state=open]]/header:pointer-events-auto [@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-testid=session-filter][aria-expanded=true]]/header:pointer-events-auto [@media((hover:hover)_and_(pointer:fine))]:md:has-[[aria-expanded=true]]:pointer-events-auto"),
+                  "[@media((hover:hover)_and_(pointer:fine))]:md:pointer-events-none [@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-header-controls]:focus-within]/header:pointer-events-auto [@media((hover:hover)_and_(pointer:fine))]:md:group-hover/header:pointer-events-auto [@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-state=open]]/header:pointer-events-auto [@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-testid=session-filter][aria-expanded=true]]/header:pointer-events-auto [@media((hover:hover)_and_(pointer:fine))]:md:has-[[aria-expanded=true]]:pointer-events-auto",
               )}
             >
               {headerAction && (
@@ -3179,9 +3151,7 @@ function ConversationSection({
                 <div
                   className={cn(
                     "flex items-center rounded transition-opacity",
-                    actionHoverOnly
-                      ? "[@media((hover:hover)_and_(pointer:fine))]:opacity-0 [@media((hover:hover)_and_(pointer:fine))]:group-has-[[data-header-controls]:focus-within]/header:opacity-100 [@media((hover:hover)_and_(pointer:fine))]:group-hover/header:opacity-100 [@media((hover:hover)_and_(pointer:fine))]:group-has-[[data-state=open]]/header:opacity-100 [@media((hover:hover)_and_(pointer:fine))]:has-[[aria-expanded=true]]:opacity-100"
-                      : "[@media((hover:hover)_and_(pointer:fine))]:md:opacity-0 [@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-header-controls]:focus-within]/header:opacity-100 [@media((hover:hover)_and_(pointer:fine))]:md:group-hover/header:opacity-100 [@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-state=open]]/header:opacity-100 [@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-testid=session-filter][aria-expanded=true]]/header:opacity-100 [@media((hover:hover)_and_(pointer:fine))]:md:has-[[aria-expanded=true]]:opacity-100",
+                    "[@media((hover:hover)_and_(pointer:fine))]:md:opacity-0 [@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-header-controls]:focus-within]/header:opacity-100 [@media((hover:hover)_and_(pointer:fine))]:md:group-hover/header:opacity-100 [@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-state=open]]/header:opacity-100 [@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-testid=session-filter][aria-expanded=true]]/header:opacity-100 [@media((hover:hover)_and_(pointer:fine))]:md:has-[[aria-expanded=true]]:opacity-100",
                   )}
                 >
                   {headerAction}
@@ -4770,35 +4740,21 @@ function PinnedProjectFlyoutContent({
   );
 }
 
-// ── ProjectFolderActions ──────────────────────────────────────────────────────
-
-/** Fine-hover shortcuts for project actions and starting a pre-filed session. */
 function ProjectFolderActions({
   projectName,
   onNavigate,
   actions,
 }: {
   projectName: string;
-  /** Plain-left-click nav handler — closes the mobile overlay so the
-      pre-filed new-session page isn't left hidden behind the sidebar. */
   onNavigate: (e: MouseEvent<HTMLAnchorElement>) => void;
   actions: ProjectFolderMenuActions;
 }) {
   return (
-    // gap-0.5 (2px) between the pencil and kebab mirrors the session row's
-    // pin↔kebab spacing, so the two icon columns line up across row types.
     <div className="flex items-center gap-0.5">
-      {/* A redundant shortcut for the kebab's always-present "New session"
-          item, so it is genuinely absent (not just clipped) wherever no fine
-          hover pointer can reveal it: on touch, folding fully into the kebab
-          instead of leaving a duplicate focus stop for keyboard/AT users. On
-          hover+fine it is display-flex and revealed on hover or keyboard focus
-          by the overlay's opacity. */}
       <Tooltip>
         <TooltipTrigger asChild>
           <Button
             asChild
-            type="button"
             variant="ghost"
             size="icon-xs"
             aria-label={`New session in ${projectName}`}
@@ -4808,8 +4764,6 @@ function ProjectFolderActions({
             <Link
               to={`/?project=${encodeURIComponent(projectName)}`}
               onClick={(e) => {
-                // Keep the click off the folder's collapse toggle, then run the
-                // shared nav handler (closes the sidebar overlay on mobile).
                 e.stopPropagation();
                 onNavigate(e);
               }}
@@ -4833,11 +4787,13 @@ function ProjectFolderMenuItems({
   projectName,
   onNavigate,
   actions,
+  hideNewSessionOnDesktop = false,
 }: {
   components: MenuComponents;
   projectName: string;
   onNavigate: (e: MouseEvent<HTMLAnchorElement>) => void;
   actions: ProjectFolderMenuActions;
+  hideNewSessionOnDesktop?: boolean;
 }) {
   const { onMenuOpen, onMenuClose } = actions;
   useEffect(() => {
@@ -4847,7 +4803,13 @@ function ProjectFolderMenuItems({
 
   return (
     <>
-      <C.Item asChild data-testid="project-new-session-menu">
+      <C.Item
+        asChild
+        data-testid="project-new-session-menu"
+        className={
+          hideNewSessionOnDesktop ? "[@media((hover:hover)_and_(pointer:fine))]:hidden" : undefined
+        }
+      >
         <Link
           to={`/?project=${encodeURIComponent(projectName)}`}
           onClick={(e) => {
@@ -4868,27 +4830,32 @@ function ProjectFolderMenuItems({
         Project settings
       </C.Item>
       {actions.ordering && (
-        <>
-          <C.Separator />
-          {(["up", "down", "top", "bottom"] as const).map((destination) => (
-            <C.Item
-              key={destination}
-              disabled={
-                actions.ordering!.disabled ||
-                (destination === "up" || destination === "top"
-                  ? actions.ordering!.first
-                  : actions.ordering!.last)
-              }
-              onSelect={() => actions.ordering!.move(destination)}
-            >
-              {destination === "top" || destination === "bottom"
-                ? `Move to ${destination}`
-                : `Move ${destination}`}
-            </C.Item>
-          ))}
-          <C.Separator />
-        </>
+        <C.Sub>
+          <C.SubTrigger data-testid="move-project">
+            <ArrowUpDownIcon className="size-3.5" />
+            Move
+          </C.SubTrigger>
+          <C.SubContent>
+            {(["up", "down", "top", "bottom"] as const).map((destination) => (
+              <C.Item
+                key={destination}
+                disabled={
+                  actions.ordering!.disabled ||
+                  (destination === "up" || destination === "top"
+                    ? actions.ordering!.first
+                    : actions.ordering!.last)
+                }
+                onSelect={() => actions.ordering!.move(destination)}
+              >
+                {destination === "top" || destination === "bottom"
+                  ? `Move to ${destination}`
+                  : `Move ${destination}`}
+              </C.Item>
+            ))}
+          </C.SubContent>
+        </C.Sub>
       )}
+      <C.Separator />
       <C.Item data-testid="delete-project" variant="destructive" onSelect={actions.openDelete}>
         <Trash2Icon className="size-3.5" />
         Delete project
@@ -5225,21 +5192,13 @@ function ProjectFolderMenu({
   return (
     <DropdownMenu>
       <DropdownMenuTrigger asChild>
-        {/* Revealed on hover for fine hover pointers at any width; otherwise
-            sr-only so touch and assistive tech keep a focusable, announced
-            trigger for the same actions the long-press menu also opens. */}
         <Button
           type="button"
           variant="ghost"
           size="icon-xs"
           aria-label={`Project actions for ${projectName}`}
           data-testid="project-actions"
-          // sr-only keeps a focusable/announced trigger where no fine hover can
-          // reveal it (touch/AT). On reveal, not-sr-only zeroes width/height/
-          // padding, so restore the icon-xs box (size-6) — otherwise the ghost
-          // hover highlight collapses to the glyph and mismatches the session /
-          // project-list kebabs.
-          className="sr-only text-muted-foreground focus-visible:not-sr-only focus-visible:size-6 [@media((hover:hover)_and_(pointer:fine))]:not-sr-only [@media((hover:hover)_and_(pointer:fine))]:flex [@media((hover:hover)_and_(pointer:fine))]:size-6"
+          className="text-muted-foreground"
           onClick={(e) => e.stopPropagation()}
         >
           <MoreHorizontalIcon className="size-3.5" data-icon-size="14" />
@@ -5248,6 +5207,7 @@ function ProjectFolderMenu({
       <DropdownMenuContent align="end" className="min-w-40">
         <ProjectFolderMenuItems
           components={dropdownBundle}
+          hideNewSessionOnDesktop
           projectName={projectName}
           onNavigate={onNavigate}
           actions={actions}

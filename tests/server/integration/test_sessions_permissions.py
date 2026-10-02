@@ -25,7 +25,7 @@ import pytest_asyncio
 from fastapi import FastAPI
 
 from omnigent.host.frames import HostHelloFrame
-from omnigent.runtime import session_stream
+from omnigent.runtime import inflight_text, session_stream
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server import presence
 from omnigent.server.app import create_app
@@ -92,33 +92,6 @@ def auth_app(
         # the test runner can't flip the mode.
         auth_provider=UnifiedAuthProvider(source="header", local_single_user=False),
     )
-
-
-@pytest_asyncio.fixture()
-async def auth_client(
-    auth_app: FastAPI,
-    mock_llm: ControllableMockClient,
-    tmp_path: Path,
-) -> AsyncIterator[httpx.AsyncClient]:
-    """HTTP client wired to the auth-enabled FastAPI app.
-
-    Same lifecycle pattern as the shared ``client`` fixture from
-    ``conftest.py``: starts the harness process manager, yields the
-    client, then tears down DBOS on exit.
-    """
-    from omnigent.runtime import set_harness_process_manager
-    from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
-
-    pm = HarnessProcessManager(tmp_parent=tmp_path / "harness_pm")
-    await pm.start()
-    set_harness_process_manager(pm)
-
-    transport = httpx.ASGITransport(app=auth_app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
-        yield c
-    mock_llm.release_all()
-    set_harness_process_manager(None)
-    await pm.shutdown()
 
 
 @pytest.fixture()
@@ -1351,6 +1324,30 @@ async def test_non_manager_cannot_revoke_permissions(
 
 
 # ── Session creator auto-grant ───────────────────────────────
+
+
+async def test_session_creator_uses_authoritative_grant_result(
+    auth_client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Create must not read back a permission that grant already returned."""
+    from omnigent.server.routes.sessions import routes_core
+
+    owner = "owner@example.com"
+    agent = await create_test_agent(auth_client, user=owner)
+
+    async def fail_readback(*args: object, **kwargs: object) -> int | None:
+        raise AssertionError("create performed a redundant permission readback")
+
+    monkeypatch.setattr(routes_core, "_get_permission_level", fail_readback)
+    resp = await auth_client.post(
+        "/v1/sessions",
+        json={"agent_id": agent["id"]},
+        headers={"X-Forwarded-Email": owner},
+    )
+
+    assert resp.status_code == 201, resp.text
+    assert resp.json()["permission_level"] == LEVEL_OWNER
 
 
 async def test_session_creator_gets_manage_grant(
@@ -2730,6 +2727,64 @@ async def test_w7_2_session_scoped_agent_requires_owning_session_access(
     )
 
 
+async def test_fork_switch_binds_session_scoped_target_with_access(
+    auth_client: httpx.AsyncClient,
+) -> None:
+    """Forking into a session-scoped custom agent the caller can read succeeds.
+
+    ``POST /v1/sessions/{id}/fork`` runs ``body.agent_id`` through the same
+    ``validate_session_agent`` check as ``POST /v1/sessions``, so corey can
+    fork his own session into a custom agent he also owns.
+    """
+    agent = await create_test_agent(auth_client, name="corey-custom-agent", user="corey")
+    source = await _create_session_as(auth_client, "", "corey", title="corey-source")
+
+    resp = await auth_client.post(
+        f"/v1/sessions/{source['id']}/fork",
+        json={"agent_id": agent["id"]},
+        headers={"X-Forwarded-Email": "corey"},
+    )
+    assert resp.status_code == 201, (
+        f"Expected 201 when corey forks into his own custom agent, "
+        f"got {resp.status_code}: {resp.text}"
+    )
+    fork_id = resp.json()["id"]
+
+    agent_resp = await auth_client.get(
+        f"/v1/sessions/{fork_id}/agent",
+        headers={"X-Forwarded-Email": "corey"},
+    )
+    assert agent_resp.status_code == 200, agent_resp.text
+    assert agent_resp.json()["name"] == "corey-custom-agent"
+
+
+async def test_fork_switch_denies_session_scoped_target_without_access(
+    auth_client: httpx.AsyncClient,
+) -> None:
+    """Forking into a session-scoped custom agent the caller cannot read is denied.
+
+    Bryan owns the session that owns the custom agent. Corey forks his own
+    session and names Bryan's agent as the target with no grant on Bryan's
+    session, so ``validate_session_agent`` must reject the fork before it is
+    created.
+    """
+    agent = await create_test_agent(auth_client, name="bryan-custom-agent", user="bryan")
+    source = await _create_session_as(auth_client, "", "corey", title="corey-source")
+
+    resp = await auth_client.post(
+        f"/v1/sessions/{source['id']}/fork",
+        json={"agent_id": agent["id"]},
+        headers={"X-Forwarded-Email": "corey"},
+    )
+    assert resp.status_code in (403, 404), (
+        f"Expected 403/404 for a session-scoped target corey cannot read, "
+        f"got {resp.status_code}: {resp.text}"
+    )
+
+    corey_sessions = await _list_sessions_as(auth_client, "corey")
+    assert [s["id"] for s in corey_sessions] == [source["id"]]
+
+
 async def test_create_session_rejects_other_users_host(
     host_perm_app: FastAPI,
     host_perm_client: httpx.AsyncClient,
@@ -3201,6 +3256,7 @@ async def test_stream_local_single_user_not_tracked(
     try:
         resp = await _end_stream_via_close(session_id, task)
         assert resp.status_code == 200
+        assert resp.headers["x-omnigent-stream-epoch"] == inflight_text.stream_epoch()
         # The stream's own snapshot-on-connect ran AFTER any (buggy)
         # registration would have happened, so a "local" viewer in it
         # proves the attribution filter was dropped from the route.
@@ -3382,3 +3438,61 @@ async def test_leave_rejects_a_sub_agent_session(
     # The parent grant is untouched, so carol still sees the shared session.
     parent_ids = {s["id"] for s in await _list_sessions_as(auth_client, "carol")}
     assert parent["id"] in parent_ids, "a refused child leave must not touch the parent grant"
+
+
+@pytest.mark.parametrize("bundle_mode", [False, True])
+async def test_shared_parent_readiness_remains_private(
+    auth_client: httpx.AsyncClient,
+    auth_app: FastAPI,
+    db_uri: str,
+    bundle_mode: bool,
+) -> None:
+    """Read access to a parent does not expose the owner's host telemetry."""
+    from omnigent.stores.host_store import HostStore
+
+    parent = await _create_session_as(auth_client, "ignored", "alice", title="shared-parent")
+    grant = await _grant_permission(
+        auth_client,
+        parent["id"],
+        granter="alice",
+        target_user="bob",
+        level=LEVEL_READ,
+    )
+    assert grant.status_code == 200
+    store = SqlAlchemyConversationStore(db_uri)
+    host_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    store.set_host_id(parent["id"], host_id, workspace="/tmp/workspace")
+    store.set_runner_id(parent["id"], "offline-test-runner")
+    hosts = HostStore(db_uri)
+    hosts.upsert_on_connect(
+        host_id, "private-host", "alice", configured_harnesses={"jcode": False}
+    )
+    auth_app.state.host_store = hosts
+    if bundle_mode:
+        response = await auth_client.post(
+            "/v1/sessions",
+            data={"metadata": json.dumps({"parent_session_id": parent["id"]})},
+            files={
+                "bundle": (
+                    "agent.tar.gz",
+                    build_agent_bundle(
+                        name="worker",
+                        executor={"type": "omnigent", "config": {"harness": "jcode"}},
+                    ),
+                    "application/gzip",
+                )
+            },
+            headers={"X-Forwarded-Email": "bob"},
+        )
+    else:
+        response = await auth_client.post(
+            "/v1/sessions",
+            json={
+                "agent_id": parent["agent_id"],
+                "parent_session_id": parent["id"],
+                "harness_override": "jcode",
+            },
+            headers={"X-Forwarded-Email": "bob"},
+        )
+    assert response.status_code == 201, response.text
+    assert "harness_not_configured" not in response.text

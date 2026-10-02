@@ -305,6 +305,12 @@ _LAST_TASK_ERROR_CAUSE_LABEL_KEY: str = "omnigent.last_task_error_cause"
 _LAST_TASK_ERROR_REMEDIATION_LABEL_KEY: str = "omnigent.last_task_error_remediation"
 
 
+# The persisted item a ``runner_rejected_event`` failure refers to, so a client
+# whose POST answer was lost can tell its own refused send from another message's
+# rejection when the snapshot comes back. Empty for failures without an item.
+_LAST_TASK_ERROR_ITEM_ID_LABEL_KEY: str = "omnigent.last_task_error_item_id"
+
+
 _LABEL_VALUE_MAX_LEN: int = LABEL_VALUE_MAX_LEN
 
 
@@ -778,6 +784,13 @@ _llm_response_denied_turns: WorkspaceScopedCache[str, str] = WorkspaceScopedCach
 
 # custom-lint: disable-next=workspace-scoped-cache -- lock; collision only serializes
 _native_ask_gate_locks: weakref.WeakValueDictionary[tuple[str, str], asyncio.Lock] = (
+    weakref.WeakValueDictionary()
+)
+
+# Serializes native transcript mirrors per conversation so a retried mirror sees
+# the first attempt's commit before it touches the pending-input queue.
+# custom-lint: disable-next=workspace-scoped-cache -- lock; collision only serializes
+_native_mirror_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = (
     weakref.WeakValueDictionary()
 )
 

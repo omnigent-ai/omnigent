@@ -1,9 +1,8 @@
-// Post-setup "Your imports are ready" modal: reviews the credentials, MCP
-// servers, and skills Omnigent found in the user's existing harnesses. The
-// credentials are already adopted (read-only); MCPs and skills are opt-in
-// checkboxes, all selected by default, applied on Confirm.
+// Post-setup "Your imports are ready" modal: one tab per harness, showing the
+// credential Omnigent adopted and the MCP servers, skills, and plugins found
+// there. Review only: sessions already load these, so nothing is selected.
 
-import { useId, useState, type ReactNode } from "react";
+import type { ReactNode } from "react";
 import { ArrowRight, Check, XIcon } from "lucide-react";
 import omnigentLogo from "@/assets/omnigent-starfish-icon.png";
 import BlobGraphic from "@/components/onboarding/BlobGraphic";
@@ -15,7 +14,6 @@ import {
   harnessDisplayName,
 } from "@/components/onboarding/harnessBrand";
 import { Button } from "@/components/ui/button";
-import { Checkbox } from "@/components/ui/checkbox";
 import {
   Dialog,
   DialogClose,
@@ -23,41 +21,18 @@ import {
   DialogDescription,
   DialogTitle,
 } from "@/components/ui/dialog";
+import { Spinner } from "@/components/ui/spinner";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { cn } from "@/lib/utils";
+import {
+  INVENTORY_HARNESS_IDS,
+  type HarnessInventoryContext,
+  type HarnessInventoryStatus,
+  type InventoryAssetKind,
+} from "@/hooks/useHarnessInventory";
+import { skillInvocationPrefix } from "@/lib/harnessSetup";
 
 export type ImportHarness = BrandHarness;
-
-export interface ImportCredential {
-  harness: ImportHarness;
-  /** Where the harness's login comes from, e.g. "Databricks AI Gateway". */
-  source: string;
-}
-
-export interface ImportMcpServer {
-  id: string;
-  name: string;
-  harness: ImportHarness;
-  toolCount?: number;
-}
-
-export interface ImportSkill {
-  id: string;
-  name: string;
-  harness: ImportHarness;
-}
-
-export interface ImportContext {
-  credentials: ImportCredential[];
-  mcps: ImportMcpServer[];
-  skills: ImportSkill[];
-}
-
-/** Ids of the MCP servers and skills left checked when the user confirmed. */
-export interface ImportSelection {
-  mcps: string[];
-  skills: string[];
-}
+export type ImportContext = HarnessInventoryContext;
 
 /** Harness icons → Omnigent starfish, over the onboarding blob graphic. */
 function ImportBand() {
@@ -81,116 +56,202 @@ function ImportBand() {
   );
 }
 
-function EmptyTab({ label }: { label: string }) {
-  return <p className="py-6 text-center text-xs text-muted-foreground">No {label} detected</p>;
+function EmptyState({ children }: { children: ReactNode }) {
+  return <p className="py-6 text-center text-xs text-muted-foreground">{children}</p>;
 }
 
-/** Shared row chrome so credential and checkbox rows keep one divider/gap contract. */
-function ImportRow({ children, className }: { children: ReactNode; className?: string }) {
+/** One-line credential summary; the harness name is already on the tab. */
+function CredentialLine({ source }: { source: string }) {
   return (
-    <li className={cn("flex items-center gap-3 border-b border-border last:border-b-0", className)}>
-      {children}
-    </li>
+    <div className="flex items-center gap-2 py-3 text-xs">
+      <span className="shrink-0 text-muted-foreground">Credential</span>
+      <span className="min-w-0 flex-1 truncate font-medium text-foreground">{source}</span>
+      <span className="flex shrink-0 items-center gap-1 text-muted-foreground">
+        <Check className="size-3.5 text-success" aria-hidden="true" />
+        Imported
+      </span>
+    </div>
   );
 }
 
-function CredentialRows({ credentials }: { credentials: ImportCredential[] }) {
-  if (credentials.length === 0) return <EmptyTab label="credentials" />;
+type AssetKind = "mcps" | "skills" | "plugins";
+
+interface AssetRow {
+  id: string;
+  name: string;
+  metadata?: string;
+}
+
+interface AssetList {
+  kind: AssetKind;
+  label: string;
+  rows: AssetRow[];
+}
+
+function countLabel(count: number | undefined, noun: string): string | undefined {
+  if (count == null) return undefined;
+  return `${count} ${count === 1 ? noun : `${noun}s`}`;
+}
+
+/** The harness's non-empty asset lists, in MCPs → Skills → Plugins order. */
+function assetLists(context: ImportContext, harness: ImportHarness): AssetList[] {
+  const own = <T extends { harness: ImportHarness }>(items: T[]) =>
+    items.filter((item) => item.harness === harness);
+  const lists: AssetList[] = [
+    {
+      kind: "mcps",
+      label: "MCPs",
+      rows: own(context.mcps).map((mcp) => ({
+        id: mcp.id,
+        name: mcp.name,
+        metadata: mcp.detail,
+      })),
+    },
+    {
+      kind: "skills",
+      label: "Skills",
+      rows: own(context.skills).map((skill) => ({
+        id: skill.id,
+        name: `${skillInvocationPrefix(INVENTORY_HARNESS_IDS[harness])}${skill.name}`,
+      })),
+    },
+    {
+      kind: "plugins",
+      label: "Plugins",
+      rows: own(context.plugins).map((plugin) => ({
+        id: plugin.id,
+        name: plugin.name,
+        metadata: countLabel(plugin.skillCount, "skill"),
+      })),
+    },
+  ];
+  return lists.filter((list) => list.rows.length > 0);
+}
+
+/** Read-only list of one asset type. */
+function AssetRows({ list }: { list: AssetList }) {
   return (
-    <ul>
-      {credentials.map(({ harness, source }) => (
-        <ImportRow key={harness} className="py-3">
-          <span className="flex size-8 shrink-0 items-center justify-center rounded-lg bg-muted">
-            <HarnessBrandIcon harness={harness} size={16} />
+    <ul aria-label={list.label}>
+      {list.rows.map(({ id, name, metadata }) => (
+        <li
+          key={id}
+          className="flex items-center gap-3 border-b border-border py-2 last:border-b-0"
+        >
+          <span className="min-w-0 flex-1 truncate text-ui font-medium text-foreground">
+            {name}
           </span>
-          <span className="flex min-w-0 flex-1 flex-col">
-            <span className="truncate text-ui font-medium text-foreground">
-              {harnessDisplayName(harness)}
+          {metadata && (
+            <span className="max-w-[45%] shrink-0 truncate text-xs text-muted-foreground">
+              {metadata}
             </span>
-            <span className="truncate text-xs text-muted-foreground">{source}</span>
-          </span>
-          <span className="flex shrink-0 items-center gap-1 text-xs text-muted-foreground">
-            <Check className="size-3.5 text-success" aria-hidden="true" />
-            Imported
-          </span>
-        </ImportRow>
+          )}
+        </li>
       ))}
     </ul>
   );
 }
 
-interface SelectableRow {
-  id: string;
-  name: string;
-  metadata: string;
+const UNAVAILABLE_LABEL: Record<InventoryAssetKind, string> = {
+  mcps: "MCP servers",
+  skills: "skills and plugins",
+};
+
+/** Names the asset kinds the host couldn't report, e.g. "Couldn't read MCP servers". */
+function unavailableNotice(unavailable: InventoryAssetKind[]): string | null {
+  if (unavailable.length === 0) return null;
+  return `Couldn't read ${unavailable.map((kind) => UNAVAILABLE_LABEL[kind]).join(" or ")} from this machine.`;
 }
 
-function SelectableRows({
-  kind,
-  componentId,
-  rows,
-  selected,
-  onToggle,
-}: {
-  kind: string;
-  componentId: string;
-  rows: SelectableRow[];
-  selected: ReadonlySet<string>;
-  onToggle: (id: string, checked: boolean) => void;
-}) {
-  const idPrefix = useId();
-  if (rows.length === 0) return <EmptyTab label={kind} />;
-  return (
-    <ul>
-      {rows.map(({ id, name, metadata }, index) => {
-        const inputId = `${idPrefix}-${index}`;
-        return (
-          <ImportRow key={id} className="py-2">
-            <Checkbox
-              id={inputId}
-              componentId={componentId}
-              checked={selected.has(id)}
-              onCheckedChange={(checked) => onToggle(id, checked === true)}
-            />
-            <label
-              htmlFor={inputId}
-              className="min-w-0 flex-1 cursor-pointer truncate text-ui font-medium text-foreground"
-            >
-              {name}
-            </label>
-            <span className="shrink-0 text-xs text-muted-foreground">{metadata}</span>
-          </ImportRow>
-        );
-      })}
-    </ul>
+/** Harnesses with a credential or any asset, in the shared brand order. */
+function detectedHarnesses(context: ImportContext): ImportHarness[] {
+  const found = new Set<ImportHarness>(
+    [...context.credentials, ...context.mcps, ...context.skills, ...context.plugins].map(
+      (item) => item.harness,
+    ),
   );
+  return BRAND_HARNESSES.filter((harness) => found.has(harness));
 }
 
-function mcpMetadata({ harness, toolCount }: ImportMcpServer): string {
-  const label = harnessDisplayName(harness);
-  if (toolCount == null) return label;
-  return `${toolCount} ${toolCount === 1 ? "tool" : "tools"} · ${label}`;
-}
-
-function toggle(set: ReadonlySet<string>, id: string, checked: boolean): Set<string> {
-  const next = new Set(set);
-  if (checked) next.add(id);
-  else next.delete(id);
-  return next;
+/** A harness tab: credential line, MCPs / Skills / Plugins switcher, scrolling list. */
+function HarnessPanel({
+  context,
+  harness,
+  notice,
+}: {
+  context: ImportContext;
+  harness: ImportHarness;
+  notice: string | null;
+}) {
+  const credential = context.credentials.find((c) => c.harness === harness);
+  const lists = assetLists(context, harness);
+  return (
+    <div className="flex min-h-0 flex-1 flex-col">
+      {credential && <CredentialLine source={credential.source} />}
+      {notice && lists.length > 0 && (
+        <p role="status" className="pb-3 text-xs text-muted-foreground">
+          {notice}
+        </p>
+      )}
+      {lists.length === 0 ? (
+        <EmptyState>{notice ?? "No MCPs, skills, or plugins detected"}</EmptyState>
+      ) : (
+        <Tabs
+          defaultValue={lists[0].kind}
+          componentId="onboarding.import.assetTabs"
+          className="min-h-0 flex-1 gap-0 overflow-hidden rounded-lg border border-border"
+        >
+          {/* The pills head a bordered card so the list reads as their content. */}
+          <TabsList
+            aria-label="Asset type"
+            variant="pill"
+            className="w-full shrink-0 justify-start gap-1 rounded-none border-b border-border p-1.5"
+          >
+            {lists.map((list) => (
+              <TabsTrigger
+                key={list.kind}
+                value={list.kind}
+                className="h-7 flex-none gap-1 px-2.5 text-xs"
+              >
+                {list.label}{" "}
+                <span className="text-muted-foreground/70 tabular-nums">{list.rows.length}</span>
+              </TabsTrigger>
+            ))}
+          </TabsList>
+          {lists.map((list) => (
+            <TabsContent
+              key={list.kind}
+              value={list.kind}
+              className="no-scrollbar min-h-0 overflow-y-auto px-3"
+            >
+              <AssetRows list={list} />
+            </TabsContent>
+          ))}
+        </Tabs>
+      )}
+    </div>
+  );
 }
 
 export interface ImportContextModalProps {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   context: ImportContext;
-  onConfirm: (selection: ImportSelection) => void;
+  /** Called when the user confirms; closing with X or Escape doesn't call it. */
+  onConfirm: () => void;
+  status?: HarnessInventoryStatus;
+  /** Machine the harnesses run on; shown when the user has several. */
+  hostName?: string;
+  /** Asset kinds the host couldn't report. */
+  unavailable?: InventoryAssetKind[];
+  /** Replaces the default loading copy, e.g. while the host is still connecting. */
+  loadingMessage?: string;
 }
 
 export function ImportContextModal({
   open,
   onOpenChange,
-  context,
   onConfirm,
+  ...body
 }: ImportContextModalProps) {
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
@@ -198,12 +259,10 @@ export function ImportContextModal({
         showCloseButton={false}
         className="flex h-[640px] max-h-[85vh] flex-col gap-0 overflow-hidden rounded-[20px] p-0 sm:max-w-[560px]"
       >
-        {/* Content unmounts on close, so the selection resets to all-checked
-            each time the modal reopens. */}
         <ImportContextBody
-          context={context}
-          onConfirm={(selection) => {
-            onConfirm(selection);
+          {...body}
+          onConfirm={() => {
+            onConfirm();
             onOpenChange(false);
           }}
         />
@@ -212,23 +271,61 @@ export function ImportContextModal({
   );
 }
 
+const NONE_UNAVAILABLE: InventoryAssetKind[] = [];
+
 function ImportContextBody({
   context,
   onConfirm,
-}: Pick<ImportContextModalProps, "context" | "onConfirm">) {
-  const [selectedMcps, setSelectedMcps] = useState<ReadonlySet<string>>(
-    () => new Set(context.mcps.map((mcp) => mcp.id)),
-  );
-  const [selectedSkills, setSelectedSkills] = useState<ReadonlySet<string>>(
-    () => new Set(context.skills.map((skill) => skill.id)),
-  );
+  status = "ready",
+  hostName,
+  unavailable = NONE_UNAVAILABLE,
+  loadingMessage = "Checking your harnesses…",
+}: Omit<ImportContextModalProps, "open" | "onOpenChange">) {
+  const harnesses = detectedHarnesses(context);
+  const notice = unavailableNotice(unavailable);
+  const machine = hostName ?? "This machine";
 
-  const confirm = () => {
-    onConfirm({
-      mcps: context.mcps.filter((mcp) => selectedMcps.has(mcp.id)).map((mcp) => mcp.id),
-      skills: context.skills.filter((s) => selectedSkills.has(s.id)).map((s) => s.id),
-    });
-  };
+  let content: ReactNode;
+  if (status === "loading") {
+    content = (
+      <EmptyState>
+        <Spinner aria-hidden="true" className="mx-auto mb-2" />
+        {loadingMessage}
+      </EmptyState>
+    );
+  } else if (status === "offline") {
+    content = <EmptyState>{machine} is offline. Reconnect it to review its imports.</EmptyState>;
+  } else if (harnesses.length === 0) {
+    content = <EmptyState>{notice ?? "Nothing to import from your harnesses"}</EmptyState>;
+  } else {
+    content = (
+      <Tabs
+        defaultValue={harnesses[0]}
+        componentId="onboarding.import.tabs"
+        className="mt-5 min-h-48 flex-1 gap-0"
+      >
+        <TabsList
+          aria-label="Harness"
+          variant="line"
+          className="h-9 w-full shrink-0 justify-start gap-4 rounded-none border-b border-border p-0"
+        >
+          {harnesses.map((harness) => (
+            <TabsTrigger key={harness} value={harness} className="flex-none gap-1.5 px-0">
+              <span aria-hidden="true" className="flex">
+                <HarnessBrandIcon harness={harness} size={14} />
+              </span>
+              {harnessDisplayName(harness)}
+            </TabsTrigger>
+          ))}
+        </TabsList>
+        {harnesses.map((harness) => (
+          <TabsContent key={harness} value={harness} className="flex min-h-0 flex-col">
+            <HarnessPanel context={context} harness={harness} notice={notice} />
+          </TabsContent>
+        ))}
+      </Tabs>
+    );
+  }
 
   return (
     <>
@@ -241,67 +338,21 @@ function ImportContextBody({
       </DialogClose>
 
       {/* On short viewports the body scrolls so the Confirm footer stays reachable. */}
-      <div className="flex min-h-0 flex-1 flex-col overflow-y-auto px-5 pt-5">
+      <div className="no-scrollbar flex min-h-0 flex-1 flex-col overflow-y-auto px-5 pt-5">
         <div className="flex flex-col items-center gap-1 py-2 text-center">
           <DialogTitle className="min-h-0 pr-0 text-2xl leading-8 font-normal tracking-[-0.02em]">
             Your imports are ready
           </DialogTitle>
           <DialogDescription className="max-w-[480px] text-[14px] leading-5">
-            Review what Omnigent brought over from your harnesses.
+            {hostName ? `Found in your harnesses on ${hostName}.` : "Found in your harnesses."}{" "}
+            These carry over automatically.
           </DialogDescription>
         </div>
-
-        <Tabs
-          defaultValue="credentials"
-          componentId="onboarding.import.tabs"
-          className="mt-5 min-h-36 flex-1 gap-0"
-        >
-          <TabsList
-            variant="line"
-            className="h-9 w-full justify-start gap-4 rounded-none border-b border-border p-0"
-          >
-            <TabsTrigger value="credentials" className="flex-none px-0">
-              Credentials
-            </TabsTrigger>
-            <TabsTrigger value="mcps" className="flex-none px-0">
-              MCPs
-            </TabsTrigger>
-            <TabsTrigger value="skills" className="flex-none px-0">
-              Skills
-            </TabsTrigger>
-          </TabsList>
-          <div className="min-h-0 flex-1 overflow-y-auto pt-2">
-            <TabsContent value="credentials">
-              <CredentialRows credentials={context.credentials} />
-            </TabsContent>
-            <TabsContent value="mcps">
-              <SelectableRows
-                kind="MCPs"
-                componentId="onboarding.import.mcp"
-                rows={context.mcps.map((mcp) => ({ ...mcp, metadata: mcpMetadata(mcp) }))}
-                selected={selectedMcps}
-                onToggle={(id, checked) => setSelectedMcps((s) => toggle(s, id, checked))}
-              />
-            </TabsContent>
-            <TabsContent value="skills">
-              <SelectableRows
-                kind="skills"
-                componentId="onboarding.import.skill"
-                rows={context.skills.map((skill) => ({
-                  id: skill.id,
-                  name: `$${skill.name}`,
-                  metadata: harnessDisplayName(skill.harness),
-                }))}
-                selected={selectedSkills}
-                onToggle={(id, checked) => setSelectedSkills((s) => toggle(s, id, checked))}
-              />
-            </TabsContent>
-          </div>
-        </Tabs>
+        {content}
       </div>
 
       <div className="flex shrink-0 justify-end px-5 pt-4 pb-5">
-        <Button onClick={confirm} componentId="onboarding.import.confirm">
+        <Button onClick={onConfirm} componentId="onboarding.import.confirm">
           Confirm
         </Button>
       </div>

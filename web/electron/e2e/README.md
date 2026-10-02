@@ -69,7 +69,11 @@ right interpreter with `OMNIGENT_PYTHON` when your `omnigent` lives in a venv:
 OMNIGENT_PYTHON=/path/to/.venv/bin/python node --test e2e/desktop_connect.e2e.js
 ```
 
-The recorded video lands in `e2e/recordings/<slug>/`. Playwright writes one raw
+The recorded video normally lands in `e2e/recordings/<slug>/`.
+The cookie-isolation test instead uses `OMNIGENT_DESKTOP_RECORD_DIR`, or prints
+the temporary directory where it retains recordings when that variable is unset.
+
+Playwright writes one raw
 `page@<hash>.webm` per page context — the main shell window, plus any OAuth
 popup or in-window IdP view, which record separately. Call
 `saveRecording(recordDir, "<name>")` after `electronApp.close()` (as the

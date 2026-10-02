@@ -20,6 +20,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 from omnigent.cli_invocation import cli_invocation
+from omnigent.errors import ErrorCategory
 
 __all__ = [
     "FailureDiagnosis",
@@ -39,11 +40,13 @@ class FailureDiagnosis:
         the user can act on.
     :param remediation: The concrete next step, e.g. a command to run or a
         config to change. ``None`` when there is no single clear fix.
+    :param category: Fault attribution stamped on the failure's log row.
     """
 
     title: str
     cause: str
     remediation: str | None = None
+    category: ErrorCategory = ErrorCategory.CONFIG
 
 
 @dataclass(frozen=True)
@@ -103,6 +106,18 @@ _MISSING_MARKERS = (
     "executable file not found",
 )
 
+# --- CLI rejected its arguments -----------------------------------------------
+# Usage errors from the agent CLI or a wrapper around it, e.g. a flag added by a
+# host-side launcher that this CLI version (or Omnigent's env) does not allow.
+_REJECTED_ARGUMENT_MARKERS = (
+    "unknown option",
+    "unrecognized option",
+    "unexpected argument",
+    "is disabled by claude_code_",
+    "usage: claude",
+    "usage: codex",
+)
+
 
 # Ordered most-specific first: the root case also reads like a permission /
 # auth problem, so it must win over the broader rules below it.
@@ -143,6 +158,22 @@ _TERMINAL_EXIT_MATCHERS: tuple[_TerminalMatcher, ...] = (
             remediation=(
                 f"Sign the agent in on the host (e.g. run its `/login`, "
                 f"or `{cli_invocation()} login`)."
+            ),
+        ),
+    ),
+    _TerminalMatcher(
+        "rejected_arguments",
+        lambda s: s.output_contains_any(_REJECTED_ARGUMENT_MARKERS),
+        FailureDiagnosis(
+            title="Agent CLI rejected its launch arguments",
+            cause=(
+                "The agent CLI exited at startup because it did not accept the "
+                "arguments it was started with, often from a wrapper script, shell "
+                "alias, or extra launch arguments configured on the host."
+            ),
+            remediation=(
+                "Check the agent's launcher and any extra arguments configured on "
+                "the host, then retry."
             ),
         ),
     ),
@@ -191,14 +222,24 @@ _BUDGET_EXHAUSTED_FRAGMENTS = (
     "has reached its limit",
     "rate limit is set to 0",
 )
+# Mid-stream upstream failures the gateway usually recovers from on its own;
+# the runner itself stays healthy, so the turn can be continued by the user.
+_TRANSIENT_UPSTREAM_FRAGMENTS = (
+    "server error mid-response",
+    "connection lost mid-response",
+    "overloaded",
+)
+_TRANSIENT_UPSTREAM_STATUSES = {"500", "502", "503", "504", "529"}
 
 
 def classify_native_turn_error(code: str, message: str) -> str:
-    """Refine a native turn's generic code when its text identifies a rate limit.
+    """Refine a native turn's generic code when its text identifies the cause.
 
-    Also corrects ``codex_reauth_required`` when the message reveals that the
-    real cause is a budget/usage-limit exhaustion (older runners misclassify
-    the gateway's 403 as auth; the server fixes it on deploy).
+    Recognizes rate limits and transient upstream model-gateway failures so
+    the web UI can offer a one-click retry instead of a terminal error. Also
+    corrects ``codex_reauth_required`` when the message reveals that the real
+    cause is a budget/usage-limit exhaustion (older runners misclassify the
+    gateway's 403 as auth; the server fixes it on deploy).
 
     :param code: Existing error code; specific diagnoses are preserved.
     :param message: Native harness error text, from its status or transcript.
@@ -215,6 +256,10 @@ def classify_native_turn_error(code: str, message: str) -> str:
         return code
     if status == "429" or _RATE_LIMIT_ERROR.search(message):
         return "rate_limit_exceeded"
+    if status in _TRANSIENT_UPSTREAM_STATUSES or any(
+        fragment in lowered for fragment in _TRANSIENT_UPSTREAM_FRAGMENTS
+    ):
+        return "transient_upstream_error"
     return code
 
 
@@ -243,8 +288,16 @@ _FAILURE_CODE_DESCRIPTIONS: dict[str, str] = {
         "Codex hit an error reloading the earlier transcript, so it started a fresh thread."
     ),
     "codex_turn_error": "Codex ran into an error during this turn.",
+    "databricks_sign_in_pending": "The agent is waiting for a Databricks sign-in.",
+    "agent_startup_pending": "The agent is still starting in the session terminal.",
+    "databricks_sign_in_completed": "The Databricks sign-in completed and the agent is ready.",
+    "codex_thread_not_started": "Codex stopped before it could start, so this turn never ran.",
     "native_turn_error": "The agent ran into an error during this turn.",
     "rate_limit_exceeded": "The model's rate limit was reached. You can retry this turn.",
+    "transient_upstream_error": (
+        "The model service hit a temporary error mid-response; retrying usually "
+        "continues the turn."
+    ),
     "budget_exhausted": (
         "The AI gateway refused this turn because a spending budget or usage limit is "
         "exhausted. Contact an admin to raise it, or use a different budget."

@@ -13,6 +13,7 @@ import {
   CheckIcon,
   ChevronRightIcon,
   CopyIcon,
+  ExternalLinkIcon,
   Loader2Icon,
   RotateCcwIcon,
   RotateCwIcon,
@@ -21,6 +22,7 @@ import {
   XIcon,
 } from "lucide-react";
 import { useEffect, useId, useMemo, useRef, useState } from "react";
+import type { ReactNode } from "react";
 import { CodeBlock, CodeBlockHeader, CodeBlockTitle } from "@/components/ai-elements/code-block";
 import { DatabricksIcon } from "@/components/icons/DatabricksIcon";
 import { Badge } from "@/components/ui/badge";
@@ -30,6 +32,8 @@ import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { shortModelName } from "@/components/CostRoutingControl";
 import { copyText } from "@/lib/clipboard";
+import { getSessionSignInLink } from "@/lib/sessionsApi";
+import { useChatStore } from "@/store/chatStore";
 import type { RelatedRenderError, RenderErrorDetails } from "@/lib/renderItems";
 import {
   type RoutingDecisionExtras,
@@ -79,8 +83,15 @@ const FAILURE_CODE_DESCRIPTIONS: Record<string, string> = {
   codex_thread_reset:
     "Codex hit an error reloading the earlier transcript, so it started a fresh thread.",
   codex_turn_error: "Codex ran into an error during this turn.",
+  databricks_sign_in_pending: "The agent is waiting for a Databricks sign-in.",
+  agent_startup_pending: "The agent is still starting in the session terminal.",
+  databricks_sign_in_completed: "The Databricks sign-in completed and the agent is ready.",
+  codex_thread_not_started: "Codex stopped before it could start, so this turn never ran.",
   native_turn_error: "The agent ran into an error during this turn.",
+  native_prompt_not_recorded: "Message not delivered. Try sending it again.",
   rate_limit_exceeded: "The model's rate limit was reached. You can retry this turn.",
+  transient_upstream_error:
+    "The model service hit a temporary error mid-response; retrying usually continues the turn.",
   budget_exhausted:
     "The AI gateway refused this turn because a spending budget or usage limit is exhausted. Contact an admin to raise it, or use a different budget.",
 };
@@ -92,6 +103,15 @@ const RETRYABLE_ERROR_CODES = new Set([
   "runner_failed_to_start",
   "runner_unavailable",
   "rate_limit_exceeded",
+  "transient_upstream_error",
+]);
+
+// Failed turns the runner itself survived: the session is healthy, only the
+// upstream model call failed, so retry continues the turn in place instead of
+// resuming the runner.
+export const CONTINUE_TURN_ERROR_CODES = new Set([
+  "rate_limit_exceeded",
+  "transient_upstream_error",
 ]);
 
 interface ParsedErrorMessage {
@@ -112,6 +132,42 @@ function errorHeadline(error: RenderErrorDetails): string {
     FAILURE_CODE_DESCRIPTIONS[error.code] ||
     (error.level === "info" ? "Notice" : "Something went wrong")
   );
+}
+
+// An address the user can open, as printed by a launcher or a harness.
+const ADDRESS_PATTERN = /https?:\/\/[^\s<>"'`)\]]+/g;
+
+// Failures whose next step is a launcher sign-in. The card offers to open the
+// live link, fetched from the host on click: the link is a one-time URL bound
+// to the launcher process, so no copy of it is kept in the transcript.
+const SIGN_IN_PENDING_CODES = new Set(["databricks_sign_in_pending"]);
+// A sign-in that completed. Its one line of body shows without a click: the
+// headline alone ("Signed in to Databricks") does not say what to do next.
+const SIGN_IN_COMPLETED_CODES = new Set(["databricks_sign_in_completed"]);
+
+/** Render text with each address as a link that opens in a new tab. */
+function linkify(text: string): ReactNode[] {
+  const nodes: ReactNode[] = [];
+  let last = 0;
+  for (const match of text.matchAll(ADDRESS_PATTERN)) {
+    const start = match.index ?? 0;
+    const address = match[0].replace(/[.,;:]+$/, "");
+    if (start > last) nodes.push(text.slice(last, start));
+    nodes.push(
+      <a
+        key={`${start}:${address}`}
+        href={address}
+        target="_blank"
+        rel="noreferrer noopener"
+        className="underline underline-offset-2 hover:text-foreground"
+      >
+        {address}
+      </a>,
+    );
+    last = start + address.length;
+  }
+  if (last < text.length) nodes.push(text.slice(last));
+  return nodes;
 }
 
 function relatedErrorText(error: RenderErrorDetails): string {
@@ -205,6 +261,8 @@ export function ErrorBanner({
     if (parts.length === 0) parts.push(parsed.message || code || headline);
     return parts.join("\n\n");
   }, [cause, code, headline, parsed.message, remediation]);
+  const signIn = SIGN_IN_PENDING_CODES.has(code);
+  const signInComplete = notice && SIGN_IN_COMPLETED_CODES.has(code);
   const diagnostics = useMemo(
     () =>
       [
@@ -219,6 +277,11 @@ export function ErrorBanner({
   const [diagnosticsOpen, setDiagnosticsOpen] = useState(false);
   const [activeDiagnostics, setActiveDiagnostics] = useState(diagnostics[0]?.id ?? "terminal");
   const [copiedTarget, setCopiedTarget] = useState<string | null>(null);
+  // The card's saved link is bound to the launcher process that printed it, so
+  // the button asks the host for the live prompt at click time.
+  const [signInCode, setSignInCode] = useState<string | null>(null);
+  const [signInNote, setSignInNote] = useState<string | null>(null);
+  const [signInBusy, setSignInBusy] = useState(false);
   const [retrying, setRetrying] = useState(false);
   const [retryError, setRetryError] = useState<string | null>(null);
   const [dismissed, setDismissed] = useState(false);
@@ -232,7 +295,10 @@ export function ErrorBanner({
     ...relatedErrors,
   ].find((error) => RETRYABLE_ERROR_CODES.has(error.code));
   const retryable = onRetry !== undefined && actionableError !== undefined;
-  const retryLabel = actionableError?.code === "rate_limit_exceeded" ? "Retry" : "Resume session";
+  const retryLabel =
+    actionableError && CONTINUE_TURN_ERROR_CODES.has(actionableError.code)
+      ? "Retry"
+      : "Resume session";
 
   useEffect(() => () => window.clearTimeout(copyResetRef.current), []);
   useEffect(() => {
@@ -278,6 +344,44 @@ export function ErrorBanner({
     setCopiedTarget(target);
     window.clearTimeout(copyResetRef.current);
     copyResetRef.current = window.setTimeout(() => setCopiedTarget(null), 2000);
+  };
+
+  const openSignIn = async () => {
+    if (signInBusy) return;
+    const sessionId = useChatStore.getState().conversationId;
+    if (!sessionId) {
+      setSignInNote("Open this session to fetch the current sign-in link.");
+      return;
+    }
+    // Pre-open the tab in the click so the navigation after the round trip is
+    // not treated as a popup. Sever the opener so the sign-in page can never
+    // navigate this tab.
+    const tab = window.open("", "_blank");
+    if (tab) tab.opener = null;
+    setSignInBusy(true);
+    setSignInNote(null);
+    try {
+      const live = await getSessionSignInLink(sessionId);
+      if (live.pending && live.url) {
+        setSignInCode(live.code);
+        if (tab) tab.location.href = live.url;
+        else window.open(live.url, "_blank", "noopener,noreferrer");
+      } else {
+        tab?.close();
+        // A code fetched earlier belongs to a prompt that is gone.
+        setSignInCode(null);
+        setSignInNote(
+          "No sign-in is pending in the terminal any more. Try sending your message again.",
+        );
+      }
+    } catch (error) {
+      tab?.close();
+      setSignInNote(
+        `Could not reach the host for a fresh link: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    } finally {
+      setSignInBusy(false);
+    }
   };
 
   const retry = async () => {
@@ -384,6 +488,61 @@ export function ErrorBanner({
             <XIcon className="size-4" aria-hidden="true" />
           </Button>
         </div>
+        {signInComplete && parsed.message ? (
+          <p
+            data-testid="error-notice-body"
+            onClick={(event) => event.stopPropagation()}
+            className="mt-[2px] ml-[22px] cursor-auto text-sm leading-6 text-muted-foreground"
+          >
+            {parsed.message}
+          </p>
+        ) : null}
+        {signIn ? (
+          <div
+            data-testid="error-remediation-actions"
+            onClick={(event) => event.stopPropagation()}
+            className="mx-[4px] mt-[6px] flex flex-wrap items-center gap-[6px]"
+          >
+            <Button
+              type="button"
+              variant="outline"
+              size="xs"
+              disabled={signInBusy}
+              onClick={() => void openSignIn()}
+              style={{ fontSize: "var(--text-13, 13px)" }}
+              className="h-6 gap-1 rounded-[var(--control-radius,var(--radius-lg))] px-2 leading-5"
+            >
+              <ExternalLinkIcon className="size-3.5" aria-hidden="true" />
+              {signInBusy ? "Fetching link…" : "Open sign-in link"}
+            </Button>
+            {signInCode ? (
+              <Button
+                type="button"
+                variant="ghost"
+                size="xs"
+                onClick={() => void copy("code", signInCode)}
+                style={{ fontSize: "var(--text-13, 13px)" }}
+                className="h-6 gap-1 rounded-[var(--control-radius,var(--radius-lg))] px-2 leading-5 text-muted-foreground hover:bg-muted hover:text-foreground"
+              >
+                {copiedTarget === "code" ? (
+                  <CheckIcon className="size-3.5" aria-hidden="true" />
+                ) : (
+                  <CopyIcon className="size-3.5" aria-hidden="true" />
+                )}
+                {copiedTarget === "code" ? "Copied" : `Copy code ${signInCode}`}
+              </Button>
+            ) : null}
+            {signInNote ? (
+              <span
+                role="status"
+                data-testid="error-sign-in-note"
+                className="basis-full text-sm leading-5 text-muted-foreground"
+              >
+                {signInNote}
+              </span>
+            ) : null}
+          </div>
+        ) : null}
         {retryError ? (
           <div
             role="status"
@@ -409,29 +568,53 @@ export function ErrorBanner({
                 >
                   Message
                 </h4>
-                <Button
-                  type="button"
-                  variant="ghost"
-                  size="icon-xs"
-                  className="size-6 text-muted-foreground hover:bg-muted hover:text-foreground"
-                  aria-label={
-                    copiedTarget === "message" ? "Error message copied" : "Copy error message"
-                  }
-                  onClick={() => void copy("message", messageText)}
-                  componentId="diagnostics.status.copy"
-                >
-                  {copiedTarget === "message" ? (
-                    <CheckIcon className="size-3.5" aria-hidden="true" />
-                  ) : (
-                    <CopyIcon className="size-3.5" aria-hidden="true" />
-                  )}
-                </Button>
+                <div className="flex items-center gap-1">
+                  {code === "PROVIDER_AUTH_REQUIRED" && remediation ? (
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="xs"
+                      className="h-6 gap-1 text-muted-foreground hover:bg-muted hover:text-foreground"
+                      aria-label={
+                        copiedTarget === "recovery"
+                          ? "Recovery command copied"
+                          : "Copy recovery command"
+                      }
+                      onClick={() => void copy("recovery", remediation)}
+                      componentId="diagnostics.status.recovery_copy"
+                    >
+                      {copiedTarget === "recovery" ? (
+                        <CheckIcon className="size-3.5" aria-hidden="true" />
+                      ) : (
+                        <CopyIcon className="size-3.5" aria-hidden="true" />
+                      )}
+                      Copy command
+                    </Button>
+                  ) : null}
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="icon-xs"
+                    className="size-6 text-muted-foreground hover:bg-muted hover:text-foreground"
+                    aria-label={
+                      copiedTarget === "message" ? "Error message copied" : "Copy error message"
+                    }
+                    onClick={() => void copy("message", messageText)}
+                    componentId="diagnostics.status.copy"
+                  >
+                    {copiedTarget === "message" ? (
+                      <CheckIcon className="size-3.5" aria-hidden="true" />
+                    ) : (
+                      <CopyIcon className="size-3.5" aria-hidden="true" />
+                    )}
+                  </Button>
+                </div>
               </div>
               <div
                 data-testid="error-message-content"
                 className="mx-[4px] mt-[4px] max-w-full min-w-0 font-mono text-sm leading-6 break-words whitespace-pre-wrap text-foreground [overflow-wrap:anywhere] [text-wrap:wrap]"
               >
-                {messageText}
+                {linkify(messageText)}
               </div>
             </section>
             {relatedDetails.length > 0 ? (

@@ -38,7 +38,12 @@ from omnigent.db.account_authority import (
     current_account_user,
 )
 from omnigent.db.db_models import InvalidUuidError, current_workspace_id, uuid_to_bytes
-from omnigent.host.frames import CAP_CODEX_SIDE_CHAT, HostHelloFrame, HostSkillsResultFrame
+from omnigent.host.frames import (
+    CAP_CODEX_SIDE_CHAT,
+    HostHelloFrame,
+    HostMcpServersResultFrame,
+    HostSkillsResultFrame,
+)
 
 _logger = logging.getLogger(__name__)
 
@@ -80,6 +85,26 @@ def _canonical_host_id(host_id: str) -> str:
         return uuid_to_bytes(host_id).hex()
     except InvalidUuidError:
         return host_id
+
+
+def _fail_pending_imports(conn: HostConnection) -> None:
+    """Fail the connection's in-flight import streams immediately.
+
+    A dead tunnel can never deliver another session frame; without this
+    signal the import request only learns of the drop by waiting out its
+    per-frame timeout (60s of "Importing…" in the UI).
+    """
+    while conn.pending_import_local:
+        _request_id, queue = conn.pending_import_local.popitem()
+        queue.put_nowait(
+            (
+                "done",
+                {
+                    "status": "failed",
+                    "error": f"host '{conn.host_id}' disconnected mid-import",
+                },
+            )
+        )
 
 
 # How long a runner exit report stays answerable, and how many are kept.
@@ -282,6 +307,7 @@ class HostConnection:
     :param pending_model_options: Per-``request_id`` futures for pre-launch
         model catalogs resolved by the selected host.
     :param pending_skills: Per-``request_id`` futures for sessionless skill discovery.
+    :param pending_mcp_servers: Per-``request_id`` futures for MCP inventory requests.
     """
 
     workspace_id: int
@@ -293,6 +319,11 @@ class HostConnection:
     connected_at: float
     last_frame_at: float
     account_generation: str | None = None
+    # True when this tunnel authenticated with a valid managed-sandbox launch
+    # token, i.e. a server-provisioned sandbox proving itself on connect — not a
+    # user machine reusing a managed host's id under ordinary login. Read by the
+    # default-public policy so only genuine sandboxes count as managed.
+    registered_with_managed_token: bool = False
     pending_launches: dict[str, asyncio.Future[dict[str, str | None]]] = field(
         default_factory=dict,
     )
@@ -342,6 +373,9 @@ class HostConnection:
     pending_skills: dict[str, asyncio.Future[HostSkillsResultFrame]] = field(
         default_factory=dict,
     )
+    pending_mcp_servers: dict[str, asyncio.Future[HostMcpServersResultFrame]] = field(
+        default_factory=dict,
+    )
     # Import streams one session per frame, so the tunnel pushes each onto a
     # per-request queue the /imports/local handler drains (vs a single future).
     # Each item is a ("session", dict) or ("done", dict) tuple.
@@ -383,6 +417,7 @@ class HostRegistry:
         hello: HostHelloFrame,
         owner: str | None,
         workspace_id: int | None = None,
+        registered_with_managed_token: bool = False,
     ) -> HostConnection:
         """Register a host connection (newest wins).
 
@@ -406,6 +441,9 @@ class HostRegistry:
             (``0`` in single-tenant deployments); captured into the
             connection so ``send_text`` need not read request context
             from the sender loop.
+        :param registered_with_managed_token: ``True`` when the tunnel
+            authenticated with a valid managed-sandbox launch token, so
+            the default-public policy can treat it as a genuine sandbox.
         :returns: The new :class:`HostConnection`. Its ``host_id`` is
             the canonical form (see :func:`_canonical_host_id`).
         """
@@ -422,6 +460,7 @@ class HostRegistry:
             outbound_queue=asyncio.Queue(),
             connected_at=now,
             last_frame_at=now,
+            registered_with_managed_token=registered_with_managed_token,
         )
         with self._lock:
             key = (ws_id, host_id)
@@ -433,6 +472,7 @@ class HostRegistry:
                     host_id,
                 )
                 old.outbound_queue.put_nowait(None)
+                _fail_pending_imports(old)
             self._hosts[key] = conn
             if hello.interactive_shells is not None:
                 self._interactive_shells[host_id] = normalize_interactive_shells(
@@ -474,6 +514,7 @@ class HostRegistry:
         # Without this the route handler's loops keep running and its ping loop
         # keeps the host row online, even though the host is now unreachable.
         removed.outbound_queue.put_nowait(None)
+        _fail_pending_imports(removed)
         return True
 
     def mark_frame_seen(self, conn: HostConnection) -> bool:

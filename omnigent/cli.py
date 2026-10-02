@@ -1754,6 +1754,7 @@ _HARNESS_COMMANDS: frozenset[str] = frozenset(
         "antigravity",
         "claude",
         "codex",
+        "copilot",
         "cursor",
         "debby",
         "devin",
@@ -1791,9 +1792,11 @@ def _harness_extra_checks() -> dict[str, Callable[[], bool]]:
     The predicates use ``importlib.util.find_spec`` (no heavy import).
     Commands absent from this map are always listed.
     """
+    from omnigent.onboarding.copilot_auth import copilot_sdk_installed
     from omnigent.onboarding.cursor_auth import cursor_sdk_installed
 
     return {
+        "copilot": copilot_sdk_installed,
         "cursor": cursor_sdk_installed,
     }
 
@@ -2099,6 +2102,7 @@ _CLICK_SUBCOMMANDS: frozenset[str] = frozenset(
         "claude",
         "codex",
         "config",
+        "copilot",
         "cursor",
         "debby",
         "debug",
@@ -4724,9 +4728,8 @@ def server(
             # read that loss as ours, not as the runners dying.
             _shutdown_state.mark_server_shutting_down()
             _session_stream.shutdown_all()
-            # Yield to the event loop so generators can consume _DONE,
-            # flush their final "data: [DONE]\n\n" chunk, and exit before
-            # super().shutdown() calls connection.shutdown() / transport.close().
+            # Yield so streams consume _DONE and exit before transports close.
+            # No [DONE] reaches browsers: they must reconnect after restart.
             # Without this pause the generators write to an already-closing
             # transport, leaving connections open past the graceful window.
             await _asyncio.sleep(0)
@@ -6051,9 +6054,11 @@ def _resolve_bundle_env_vars(source: Path) -> dict[str, str]:
 
     - ``config.yaml``: ``llm.connection.*`` and
       ``executor.connection.*`` values, ``executor.auth``
-      ``api_key`` / ``base_url`` (when ``type: api_key``), and
-      ``tools.builtins[*]`` dict-entry values (except ``name``)
-    - ``tools/mcp/*.yaml``: ``headers.*`` and ``env.*`` values
+      ``api_key`` / ``base_url`` (when ``type: api_key``),
+      ``tools.builtins[*]`` dict-entry values (except ``name``), and
+      inline ``tools.<name>`` MCP servers' ``url``, ``headers.*`` and
+      ``env.*`` values
+    - ``tools/mcp/*.yaml``: ``url``, ``headers.*`` and ``env.*`` values
 
     These mirror the server-side parser's ``${VAR}`` expansion
     sites. Resolving here, against the client's own environment,
@@ -6083,24 +6088,13 @@ def _resolve_bundle_env_vars(source: Path) -> dict[str, str]:
                 )
 
     # ── tools/mcp/*.yaml ─────────────────────────────
-    # ``headers`` (HTTP transport auth) and ``env`` (stdio transport
-    # process env) are both secret-bearing and both expanded by the
-    # server-side parser, so resolve both client-side.
     mcp_dir = source / "tools" / "mcp"
     if mcp_dir.is_dir():
         for yaml_file in sorted(mcp_dir.glob("*.yaml")):
             raw = yaml.safe_load(yaml_file.read_text(encoding="utf-8"))
             if not isinstance(raw, dict):
                 continue
-            changed = False
-            for field in ("headers", "env"):
-                value = raw.get(field)
-                if isinstance(value, dict):
-                    raw[field] = expand_env_vars(
-                        {str(k): str(v) for k, v in value.items()},
-                    )
-                    changed = True
-            if changed:
+            if _expand_mcp_server_env_vars(raw, expand_env_vars):
                 arcname = str(yaml_file.relative_to(source))
                 resolved[arcname] = yaml.dump(
                     raw,
@@ -6217,6 +6211,8 @@ def _expand_config_env_vars(  # type: ignore[explicit-any]  # raw is parsed YAML
     - ``executor.auth`` — ``api_key`` / ``base_url`` when
       ``type == "api_key"``
     - ``tools.builtins[*]`` — dict-entry values except ``name``
+    - ``tools.<name>`` inline MCP servers — ``url``, ``headers`` and
+      ``env`` values
 
     :param raw: The parsed config.yaml dict (modified in-place).
     :param expand_fn: Callable that expands env var references
@@ -6261,6 +6257,81 @@ def _expand_config_env_vars(  # type: ignore[explicit-any]  # raw is parsed YAML
             or changed
         )
 
+    return _expand_inline_mcp_env_vars(raw.get("tools"), expand_fn) or changed
+
+
+def _expand_inline_mcp_env_vars(
+    raw_tools: object,
+    expand_fn: Callable[[dict[str, str]], dict[str, str]],
+) -> bool:
+    """
+    Expand ``${VAR}`` references in inline ``type: mcp`` entries of
+    config.yaml's ``tools:`` block, modifying them in-place.
+
+    Selects the same entries the parser's ``_parse_inline_mcp_servers``
+    expands: mappings with ``type: mcp`` under a non-reserved key that
+    declare a ``command`` or ``url``.
+
+    :param raw_tools: The raw ``tools:`` value from config.yaml, e.g.
+        ``{"search": {"type": "mcp", "url": "${SEARCH_URL}"}}``.
+        Non-dict values are ignored.
+    :param expand_fn: Callable that expands env var references
+        in a string-to-string dict.
+    :returns: ``True`` if any values were expanded.
+    """
+    from omnigent.spec.parser import _TOOLS_CONFIG_KEYS
+
+    if not isinstance(raw_tools, dict):
+        return False
+    changed = False
+    for key, entry in raw_tools.items():
+        if key in _TOOLS_CONFIG_KEYS or not isinstance(entry, dict):
+            continue
+        if str(entry.get("type", "")) != "mcp":
+            continue
+        if entry.get("command") is None and entry.get("url") is None:
+            continue
+        changed = _expand_mcp_server_env_vars(entry, expand_fn) or changed
+    return changed
+
+
+def _expand_mcp_server_env_vars(  # type: ignore[explicit-any]  # raw is parsed YAML
+    raw: dict[str, Any],
+    expand_fn: Callable[[dict[str, str]], dict[str, str]],
+) -> bool:
+    """
+    Expand ``${VAR}`` references in one MCP server declaration's
+    ``url``, ``headers`` and ``env``, modifying *raw* in-place.
+
+    These are the fields the parser expands for MCP servers. The
+    server re-parses uploaded bundles without expansion, so they are
+    resolved here from the uploading user's environment instead.
+
+    :param raw: One MCP server mapping from ``tools/mcp/*.yaml`` or an
+        inline ``tools.<name>`` entry, e.g.
+        ``{"url": "${MCP_URL}", "headers": {"Authorization": "Bearer ${TOKEN}"}}``.
+    :param expand_fn: Callable that expands env var references
+        in a string-to-string dict.
+    :returns: ``True`` if expansion changed any value; literal-only
+        fields are left untouched so the file can ship unmodified.
+    :raises OmnigentError: If a ``${VAR}`` reference cannot be
+        resolved from the environment.
+    """
+    changed = False
+    url = raw.get("url")
+    if url is not None:
+        expanded_url = expand_fn({"url": str(url)})["url"]
+        if expanded_url != str(url):
+            raw["url"] = expanded_url
+            changed = True
+    for field in ("headers", "env"):
+        value = raw.get(field)
+        if isinstance(value, dict):
+            original = {str(k): str(v) for k, v in value.items()}
+            expanded = expand_fn(original)
+            if expanded != original:
+                raw[field] = expanded
+                changed = True
     return changed
 
 
@@ -6348,6 +6419,20 @@ def debby(run_args: tuple[str, ...]) -> None:
       omnigent debby -p "name ideas for a CLI that runs agents"
     """
     _run_bundled_agent("debby", run_args)
+
+
+@cli.command(
+    context_settings={
+        "ignore_unknown_options": True,
+        "allow_extra_args": True,
+    }
+)
+@click.argument("run_args", nargs=-1, type=click.UNPROCESSED)
+def copilot(run_args: tuple[str, ...]) -> None:
+    """Launch GitHub Copilot with Omnigent.
+
+    Shorthand for ``omnigent run --harness copilot``; every ``run`` option is forwarded."""
+    _run_harness_shorthand("copilot", run_args)
 
 
 @cli.command()
@@ -13392,6 +13477,22 @@ def _run_bundled_agent(name: str, run_args: tuple[str, ...]) -> None:
     # matching the outer `cli(args=argv, standalone_mode=False)` dispatch.
     run.main(
         args=[_bundled_example_path(name), *extra_args, *run_args],
+        prog_name="omnigent run",
+        standalone_mode=False,
+    )
+
+
+def _run_harness_shorthand(harness: str, run_args: tuple[str, ...]) -> None:
+    """Forward a harness shorthand (``omnigent copilot``) to ``run --harness``, the
+    way :func:`_run_bundled_agent` forwards ``polly``; an explicit ``--harness`` in
+    *run_args* is a usage error rather than a silent override."""
+    if any(arg == "--harness" or arg.startswith("--harness=") for arg in run_args):
+        raise click.UsageError(
+            f"`{cli_invocation()} {harness}` always uses the {harness} harness; drop "
+            f"--harness, or use `{cli_invocation()} run --harness <name>` to pick another."
+        )
+    run.main(
+        args=["--harness", harness, *run_args],
         prog_name="omnigent run",
         standalone_mode=False,
     )

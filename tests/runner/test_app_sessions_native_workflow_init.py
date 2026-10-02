@@ -32,6 +32,7 @@ from omnigent.runner.resource_registry import (
 )
 from omnigent.spec.types import AgentSpec, ExecutorSpec, LocalToolInfo
 from tests.runner.conftest import (
+    _build_app_for_spec,
     _build_app_with_mcp_tool,
     _build_interrupt_app,
     _build_lifecycle_app,
@@ -743,6 +744,9 @@ async def test_ensure_native_terminal_builder_error_returns_500(
     # (the display name "Goose" identifies the runtime, not the raw cause).
     assert "requires the 'goose' CLI" not in body["error"]["message"]
     assert "Goose" in body["error"]["message"]
+    # The structured, non-sensitive cause (exception type only, here) still
+    # names the failure kind without the free-form message.
+    assert "(ImportError)" in body["error"]["message"]
 
 
 @pytest.mark.asyncio
@@ -2054,8 +2058,8 @@ async def test_create_session_threads_resolved_bundle_dir_to_codex_spawn_env(
         name="codex-bundle-agent",
         skills_filter=["codex_e2e_xyz_greet_a3f9c2"],
         executor=ExecutorSpec(
-            config={"harness": "codex", "profile": "test-profile"},
-            model="databricks-gpt-5-4-mini",
+            config={"harness": "codex"},
+            model="gpt-5.4-mini",
         ),
     )
     harness_client = _ScriptedHarnessClient([])
@@ -2107,17 +2111,8 @@ async def test_create_session_spawns_the_snapshot_harness_override() -> None:
         name="override-agent",
         executor=ExecutorSpec(config={"harness": "claude-sdk"}),
     )
-    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
 
-    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
-        del agent_id, session_id
-        return spec
-
-    app = create_runner_app(
-        process_manager=pm,  # type: ignore[arg-type]
-        spec_resolver=_resolver,
-        server_client=NullServerClient(),  # type: ignore[arg-type]
-    )
+    app, pm = await _build_app_for_spec(spec)
     session_id = "5b0c1f7a4d2e4c8fa1b3d6e9c0f2a4b6"
     agent_id = "9d3e2b1c7a504f6e8c2d1b0a3f5e7c9d"
     payload = {
@@ -2170,17 +2165,8 @@ async def test_message_turn_resolves_the_recorded_harness_override() -> None:
         name="override-agent",
         executor=ExecutorSpec(config={"harness": "claude-sdk"}),
     )
-    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
 
-    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
-        del agent_id, session_id
-        return spec
-
-    app = create_runner_app(
-        process_manager=pm,  # type: ignore[arg-type]
-        spec_resolver=_resolver,
-        server_client=NullServerClient(),  # type: ignore[arg-type]
-    )
+    app, pm = await _build_app_for_spec(spec)
     session_id = "6c1d2e8b5f3a4d9eb2c4e7fad1a3b5c7"
     agent_id = "8e4f3c2d1b6a05f79d3e2c1b4a6f8dae"
     payload = {

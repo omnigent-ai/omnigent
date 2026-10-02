@@ -20,14 +20,16 @@ see.
 from __future__ import annotations
 
 import json
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from enum import Enum
 from os import PathLike
-from typing import Any
+from typing import Any, NoReturn
 
 from omnigent.harness_availability import HarnessAvailability, is_harness_availability
 from omnigent.inner.native_attachments import CAP_FILESYSTEM_ATTACHMENTS
 from omnigent.util.json_types import JsonObject as _JsonObject
+from omnigent.util.tunnel_limits import RUNNER_TUNNEL_MAX_MESSAGE_BYTES
 
 # Structured error code carried in ``HostLaunchRunnerResultFrame.error_code``
 # when the host refuses a launch because the session's harness is not
@@ -47,9 +49,15 @@ WORKSPACE_MISSING_ERROR_CODE = "workspace_missing"
 # feature simply omits the token (older hosts send no ``capabilities`` at all).
 # The runner intercepts codex ``/side`` and forks an ephemeral side-chat thread:
 CAP_CODEX_SIDE_CHAT = "codex_side_chat"
+# The host answers ``host.mcp_servers`` with its user-level MCP inventory:
+CAP_MCP_INVENTORY = "mcp_inventory"
 
 # Every capability THIS build supports; reported verbatim in the hello frame.
-HOST_CAPABILITIES: list[str] = [CAP_CODEX_SIDE_CHAT, CAP_FILESYSTEM_ATTACHMENTS]
+HOST_CAPABILITIES: list[str] = [
+    CAP_CODEX_SIDE_CHAT,
+    CAP_FILESYSTEM_ATTACHMENTS,
+    CAP_MCP_INVENTORY,
+]
 
 
 def workspace_missing_message(workspace: str | PathLike[str] | None) -> str:
@@ -134,9 +142,12 @@ class HostFrameKind(str, Enum):
     MODEL_OPTIONS_RESULT = "host.model_options_result"
     SKILLS = "host.skills"
     SKILLS_RESULT = "host.skills_result"
+    MCP_SERVERS = "host.mcp_servers"
+    MCP_SERVERS_RESULT = "host.mcp_servers_result"
     IMPORT_LOCAL = "host.import_local"
     IMPORT_LOCAL_BY_ID = "host.import_local_by_id"
     IMPORT_LOCAL_SESSION = "host.import_local_session"
+    IMPORT_LOCAL_SESSION_CHUNK = "host.import_local_session_chunk"
     IMPORT_LOCAL_DONE = "host.import_local_done"
 
 
@@ -561,14 +572,14 @@ class HostCreateWorktreeResultFrame:
     :param request_id: Correlates to the
         :class:`HostCreateWorktreeFrame`, e.g. ``"req_wt_1"``.
     :param status: ``"ok"`` or ``"failed"``.
-    :param worktree_path: Created worktree directory (stored as the
-        session ``workspace``), e.g.
+    :param worktree_path: Created worktree root directory, e.g.
         ``"/Users/alice/myrepo-worktrees/feature-login"``. ``None``
         on failure.
     :param branch: Branch checked out, e.g. ``"feature/login"``.
         ``None`` on failure.
     :param error: Error message when ``status`` is ``"failed"``,
         e.g. ``"not a git repository"``. ``None`` on success.
+    :param workspace: Selected directory in the new worktree. Absent on older hosts.
     """
 
     request_id: str
@@ -576,6 +587,7 @@ class HostCreateWorktreeResultFrame:
     worktree_path: str | None = None
     branch: str | None = None
     error: str | None = None
+    workspace: str | None = None
 
 
 @dataclass
@@ -630,10 +642,12 @@ class HostListWorktreesFrame:
     :param request_id: Correlates the result, e.g. ``"req_wt_ls_1"``.
     :param repo_path: Absolute path inside the repo (the picked dir or
         a subdir), e.g. ``"/Users/alice/myrepo"``.
+    :param for_cleanup: Avoid replacement symlinks in a stored canonical workspace.
     """
 
     request_id: str
     repo_path: str
+    for_cleanup: bool = False
 
 
 @dataclass
@@ -1000,6 +1014,23 @@ class HostSkillsResultFrame:
 
 
 @dataclass
+class HostMcpServersFrame:
+    """Server → host: list the user-level MCP servers each harness loads."""
+
+    request_id: str
+
+
+@dataclass
+class HostMcpServersResultFrame:
+    """Host → server: MCP server names and metadata, never env, args, or URLs."""
+
+    request_id: str
+    status: str
+    mcp_servers: list[dict[str, str]] = field(default_factory=list)
+    error: str | None = None
+
+
+@dataclass
 class HostImportedLocalSession:
     """One local transcript the host read, normalized for import.
 
@@ -1031,11 +1062,15 @@ class HostImportLocalFrame:
     :param source: Harness whose local sessions to read, e.g. ``"claude"``, or
         ``"all"`` to read every supported harness on the host in one batch.
     :param limit: Maximum number of most-recent sessions to return per harness.
+    :param allow_session_chunks: Whether the requesting server understands
+        ``host.import_local_session_chunk``. Missing from older servers, so the
+        safe default is legacy whole-session framing.
     """
 
     request_id: str
     source: str
     limit: int = 10
+    allow_session_chunks: bool = False
 
 
 @dataclass
@@ -1045,11 +1080,14 @@ class HostImportLocalByIdFrame:
     :param request_id: Unique id for correlating the result.
     :param source: Harness namespace containing the session.
     :param session_id: Exact harness-native session id to load.
+    :param allow_session_chunks: Whether the requesting server understands
+        ``host.import_local_session_chunk``. Missing from older servers.
     """
 
     request_id: str
     source: str
     session_id: str
+    allow_session_chunks: bool = False
 
 
 @dataclass
@@ -1068,6 +1106,30 @@ class HostImportLocalSessionFrame:
     request_id: str
     total: int
     session: HostImportedLocalSession
+
+
+@dataclass
+class HostImportLocalSessionChunkFrame:
+    """Host → server: one ordered slice of an oversized streamed session.
+
+    A session whose single ``host.import_local_session`` frame would exceed
+    the tunnel's WebSocket message cap rides as consecutive slices of that
+    frame's ``session`` object JSON instead; the server reassembles them and
+    then treats the result exactly like a regular session frame. The host
+    streams sessions one at a time, so one session's slices are contiguous.
+
+    :param request_id: Correlates to the :class:`HostImportLocalFrame`.
+    :param total: Total sessions the host will stream for this request.
+    :param seq: 0-based position of this slice within its session.
+    :param last: ``True`` on the session's final slice.
+    :param data: This slice of the session-object JSON.
+    """
+
+    request_id: str
+    total: int
+    seq: int
+    last: bool
+    data: str
 
 
 @dataclass
@@ -1128,9 +1190,12 @@ HostFrame = (
     | HostModelOptionsResultFrame
     | HostSkillsFrame
     | HostSkillsResultFrame
+    | HostMcpServersFrame
+    | HostMcpServersResultFrame
     | HostImportLocalFrame
     | HostImportLocalByIdFrame
     | HostImportLocalSessionFrame
+    | HostImportLocalSessionChunkFrame
     | HostImportLocalDoneFrame
 )
 
@@ -1339,6 +1404,7 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "worktree_path": frame.worktree_path,
                 "branch": frame.branch,
                 "error": frame.error,
+                "workspace": frame.workspace,
             }
         )
     if isinstance(frame, HostRemoveWorktreeFrame):
@@ -1366,6 +1432,7 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "kind": HostFrameKind.LIST_WORKTREES.value,
                 "request_id": frame.request_id,
                 "repo_path": frame.repo_path,
+                "for_cleanup": frame.for_cleanup,
             }
         )
     if isinstance(frame, HostListWorktreesResultFrame):
@@ -1535,6 +1602,20 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "agent_id": frame.agent_id,
             }
         )
+    if isinstance(frame, HostMcpServersFrame):
+        return _encode_payload(
+            {"kind": HostFrameKind.MCP_SERVERS.value, "request_id": frame.request_id}
+        )
+    if isinstance(frame, HostMcpServersResultFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.MCP_SERVERS_RESULT.value,
+                "request_id": frame.request_id,
+                "status": frame.status,
+                "mcp_servers": frame.mcp_servers,
+                "error": frame.error,
+            }
+        )
     if isinstance(frame, HostImportLocalFrame):
         return _encode_payload(
             {
@@ -1542,6 +1623,7 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "request_id": frame.request_id,
                 "source": frame.source,
                 "limit": frame.limit,
+                "allow_session_chunks": frame.allow_session_chunks,
             }
         )
     if isinstance(frame, HostImportLocalByIdFrame):
@@ -1551,22 +1633,27 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "request_id": frame.request_id,
                 "source": frame.source,
                 "session_id": frame.session_id,
+                "allow_session_chunks": frame.allow_session_chunks,
             }
         )
     if isinstance(frame, HostImportLocalSessionFrame):
-        s = frame.session
         return _encode_payload(
             {
                 "kind": HostFrameKind.IMPORT_LOCAL_SESSION.value,
                 "request_id": frame.request_id,
                 "total": frame.total,
-                "session": {
-                    "external_session_id": s.external_session_id,
-                    "workspace": s.workspace,
-                    "items": s.items,
-                    "title": s.title,
-                    "source": s.source,
-                },
+                "session": _imported_local_session_payload(frame.session),
+            }
+        )
+    if isinstance(frame, HostImportLocalSessionChunkFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.IMPORT_LOCAL_SESSION_CHUNK.value,
+                "request_id": frame.request_id,
+                "total": frame.total,
+                "seq": frame.seq,
+                "last": frame.last,
+                "data": frame.data,
             }
         )
     if isinstance(frame, HostImportLocalDoneFrame):
@@ -1581,6 +1668,176 @@ def encode_host_frame(frame: HostFrame) -> str:
             }
         )
     raise TypeError(f"unknown host frame type: {type(frame).__name__}")
+
+
+def _imported_local_session_payload(session: HostImportedLocalSession) -> _JsonObject:
+    """Build the wire ``session`` object shared by whole and chunked frames."""
+    return {
+        "external_session_id": session.external_session_id,
+        "workspace": session.workspace,
+        "items": session.items,
+        "title": session.title,
+        "source": session.source,
+    }
+
+
+# Sessions whose JSON runs past this many characters are streamed as
+# ``host.import_local_session_chunk`` slices of this size instead of one
+# ``host.import_local_session`` frame, which would otherwise exceed the
+# tunnel's WebSocket message cap (RUNNER_TUNNEL_MAX_MESSAGE_BYTES, 100 MiB)
+# and drop the whole host connection. json.dumps output is ASCII, so an
+# encoded slice frame stays under ~2x this size even with worst-case JSON
+# string escaping.
+IMPORT_SESSION_CHUNK_CHARS = 8 * 1024 * 1024
+
+# Serialized reassembly cap for one chunked session, enforced server-side so a
+# buggy or hostile host cannot retain unbounded chunk text. Decoding and the
+# completed session object require additional transient memory.
+IMPORT_SESSION_MAX_REASSEMBLED_CHARS = 512 * 1024 * 1024
+
+# Bound all in-flight chunk buffers on one host connection. A host may serve
+# several concurrent import requests, so the per-session cap alone is not an
+# aggregate memory bound.
+IMPORT_SESSION_MAX_CONNECTION_REASSEMBLED_CHARS = 512 * 1024 * 1024
+
+
+class ImportSessionChunkingUnsupportedError(ValueError):
+    """A legacy server cannot safely accept one oversized session frame."""
+
+
+def encode_import_local_session_frames(
+    request_id: str,
+    total: int,
+    session: HostImportedLocalSession,
+    *,
+    allow_chunks: bool,
+) -> Iterator[str]:
+    """Encode one streamed session, slicing it into chunks when oversized.
+
+    Yields a single ``host.import_local_session`` frame when the session is
+    small. When the server explicitly negotiated chunk support, larger
+    sessions use consecutive ``host.import_local_session_chunk`` frames. An
+    older server gets legacy whole-session framing up to its WebSocket limit;
+    anything larger fails this session locally instead of dropping the tunnel.
+    """
+    session_json = json.dumps(_imported_local_session_payload(session))
+    if len(session_json) <= IMPORT_SESSION_CHUNK_CHARS or not allow_chunks:
+        whole_frame = encode_host_frame(
+            HostImportLocalSessionFrame(request_id=request_id, total=total, session=session)
+        )
+        if len(whole_frame.encode("utf-8")) > RUNNER_TUNNEL_MAX_MESSAGE_BYTES:
+            raise ImportSessionChunkingUnsupportedError(
+                "session exceeds the legacy host-tunnel message limit"
+            )
+        yield whole_frame
+        return
+    end = len(session_json)
+    for seq, start in enumerate(range(0, end, IMPORT_SESSION_CHUNK_CHARS)):
+        stop = start + IMPORT_SESSION_CHUNK_CHARS
+        yield encode_host_frame(
+            HostImportLocalSessionChunkFrame(
+                request_id=request_id,
+                total=total,
+                seq=seq,
+                last=stop >= end,
+                data=session_json[start:stop],
+            )
+        )
+
+
+class ImportLocalSessionChunkAssembler:
+    """Reassemble one import request's chunked sessions, in arrival order.
+
+    The host streams sessions sequentially and one session's slices
+    contiguously, so a single buffer per request suffices: ``seq == 0`` opens
+    a session and its ``last`` slice completes it. A session that turns out
+    unusable fails once, on the offending slice, and its remaining slices are
+    skipped so the next session still assembles. A session whose final slice
+    never arrives stays ``in_progress`` until the next session's first slice
+    or the request's done frame, where the caller counts it as failed.
+    """
+
+    def __init__(self, max_chars: int = IMPORT_SESSION_MAX_REASSEMBLED_CHARS) -> None:
+        self._max_chars = max_chars
+        self._parts: list[str] = []
+        self._chars = 0
+        self._next_seq = 0
+        # The current session already failed; ignore its remaining slices.
+        self._skipping = False
+
+    @property
+    def buffered_chars(self) -> int:
+        """Characters currently retained by this assembler."""
+        return self._chars
+
+    @property
+    def in_progress(self) -> bool:
+        """Whether a session started and has neither completed nor failed."""
+        return self._next_seq > 0 and not self._skipping
+
+    def opens_new_session(self, frame: HostImportLocalSessionChunkFrame) -> bool:
+        """Whether *frame* starts a session while the previous one is still incomplete."""
+        return frame.seq == 0 and self.in_progress
+
+    def _reset(self) -> None:
+        self._parts = []
+        self._chars = 0
+        self._next_seq = 0
+        self._skipping = False
+
+    def _fail(self, reason: str, frame: HostImportLocalSessionChunkFrame) -> NoReturn:
+        # Free the buffer now; skip the rest of this session unless this was its final slice.
+        if frame.last:
+            self._reset()
+        else:
+            self._parts = []
+            self._chars = 0
+            self._skipping = True
+        raise ValueError(reason)
+
+    def add(
+        self,
+        frame: HostImportLocalSessionChunkFrame,
+        *,
+        budget: int | None = None,
+    ) -> HostImportedLocalSession | None:
+        """Fold in one slice; return the session on its final slice.
+
+        :param budget: Characters this session may still buffer before the
+            connection-wide cap is reached; ``None`` applies only the
+            per-session cap.
+        :raises ValueError: Once per unusable session: on the slice that is
+            out of order, non-ASCII, or over a cap, or on the final slice when
+            the slices do not reassemble into a valid session object. The
+            caller counts one failed session and keeps the stream alive.
+        """
+        if frame.seq == 0:
+            self._reset()
+        elif self._skipping:
+            if frame.last:
+                self._reset()
+            return None
+        if frame.seq != self._next_seq:
+            self._fail(f"slice out of order (got seq {frame.seq}, want {self._next_seq})", frame)
+        # Slices are json.dumps output, so they are ASCII; anything else would let
+        # the character counts below understate the bytes buffered by up to 4x.
+        if not frame.data.isascii():
+            self._fail("slice contains non-ASCII text", frame)
+        limit = self._max_chars if budget is None else min(self._max_chars, budget)
+        if self._chars + len(frame.data) > limit:
+            self._fail(f"chunked session exceeds {limit} characters", frame)
+        self._next_seq += 1
+        self._chars += len(frame.data)
+        self._parts.append(frame.data)
+        if not frame.last:
+            return None
+        parts = self._parts
+        self._reset()
+        try:
+            raw = json.loads("".join(parts))
+        except (json.JSONDecodeError, RecursionError) as exc:
+            raise ValueError(f"chunked session is not valid JSON: {exc}") from exc
+        return _decode_imported_local_session(raw)
 
 
 def decode_host_frame(text: str) -> HostFrame:
@@ -1731,12 +1988,18 @@ def _decode_known_host_frame(
             )
         case HostFrameKind.SKILLS_RESULT:
             return _decode_skills_result(msg)
+        case HostFrameKind.MCP_SERVERS:
+            return HostMcpServersFrame(request_id=_required_str(msg, "request_id"))
+        case HostFrameKind.MCP_SERVERS_RESULT:
+            return _decode_mcp_servers_result(msg)
         case HostFrameKind.IMPORT_LOCAL:
             return _decode_import_local(msg)
         case HostFrameKind.IMPORT_LOCAL_BY_ID:
             return _decode_import_local_by_id(msg)
         case HostFrameKind.IMPORT_LOCAL_SESSION:
             return _decode_import_local_session(msg)
+        case HostFrameKind.IMPORT_LOCAL_SESSION_CHUNK:
+            return _decode_import_local_session_chunk(msg)
         case HostFrameKind.IMPORT_LOCAL_DONE:
             return _decode_import_local_done(msg)
     raise ValueError(f"unhandled host frame kind: {kind.value!r}")  # pragma: no cover
@@ -2012,6 +2275,7 @@ def _decode_create_worktree_result(
         worktree_path=_optional_nullable_str(msg, "worktree_path"),
         branch=_optional_nullable_str(msg, "branch"),
         error=_optional_nullable_str(msg, "error"),
+        workspace=_optional_nullable_str(msg, "workspace"),
     )
 
 
@@ -2056,6 +2320,7 @@ def _decode_list_worktrees(msg: _JsonObject) -> HostListWorktreesFrame:
     return HostListWorktreesFrame(
         request_id=_required_str(msg, "request_id"),
         repo_path=_required_str(msg, "repo_path"),
+        for_cleanup=msg.get("for_cleanup") is True,
     )
 
 
@@ -2315,12 +2580,42 @@ def _decode_skills_result(msg: _JsonObject) -> HostSkillsResultFrame:
     )
 
 
+_MCP_SERVER_FIELDS = ("name", "harness", "transport", "scope")
+_MCP_SERVER_OPTIONAL_FIELDS = ("plugin", "url_host")
+
+
+def _decode_mcp_servers_result(msg: _JsonObject) -> HostMcpServersResultFrame:
+    """Decode MCP summaries, keeping only the allow-listed metadata fields."""
+    raw_servers = msg.get("mcp_servers", [])
+    if not isinstance(raw_servers, list):
+        raise ValueError("frame field must be a list of MCP server summaries: 'mcp_servers'")
+    servers: list[dict[str, str]] = []
+    for server in raw_servers:
+        if not isinstance(server, dict):
+            raise ValueError("frame field must be a list of MCP server summaries: 'mcp_servers'")
+        summary = {key: _required_str(server, key) for key in _MCP_SERVER_FIELDS}
+        for key in _MCP_SERVER_OPTIONAL_FIELDS:
+            value = _optional_nullable_str(server, key)
+            if value is not None:
+                summary[key] = value
+        servers.append(summary)
+    return HostMcpServersResultFrame(
+        request_id=_required_str(msg, "request_id"),
+        status=_required_str(msg, "status"),
+        mcp_servers=servers,
+        error=_optional_nullable_str(msg, "error"),
+    )
+
+
 def _decode_import_local(msg: _JsonObject) -> HostImportLocalFrame:
     """Decode a host.import_local frame."""
     return HostImportLocalFrame(
         request_id=_required_str(msg, "request_id"),
         source=_required_str(msg, "source"),
         limit=_required_int(msg, "limit"),
+        allow_session_chunks=(
+            _required_bool(msg, "allow_session_chunks") if "allow_session_chunks" in msg else False
+        ),
     )
 
 
@@ -2330,6 +2625,9 @@ def _decode_import_local_by_id(msg: _JsonObject) -> HostImportLocalByIdFrame:
         request_id=_required_str(msg, "request_id"),
         source=_required_str(msg, "source"),
         session_id=_required_str(msg, "session_id"),
+        allow_session_chunks=(
+            _required_bool(msg, "allow_session_chunks") if "allow_session_chunks" in msg else False
+        ),
     )
 
 
@@ -2364,6 +2662,17 @@ def _decode_import_local_session(msg: _JsonObject) -> HostImportLocalSessionFram
         request_id=_required_str(msg, "request_id"),
         total=_required_int(msg, "total"),
         session=_decode_imported_local_session(msg.get("session")),
+    )
+
+
+def _decode_import_local_session_chunk(msg: _JsonObject) -> HostImportLocalSessionChunkFrame:
+    """Decode a host.import_local_session_chunk frame (one session slice)."""
+    return HostImportLocalSessionChunkFrame(
+        request_id=_required_str(msg, "request_id"),
+        total=_required_int(msg, "total"),
+        seq=_required_int(msg, "seq"),
+        last=_required_bool(msg, "last"),
+        data=_required_str(msg, "data"),
     )
 
 

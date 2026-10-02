@@ -268,8 +268,8 @@ defaults apply: **5 seconds** for the initial HTTP connection handshake and
 `timeout` overrides both values to the same number of seconds.
 
 **Security note — `${VAR}` is NOT expanded for uploaded bundles:**
-``${VAR}`` references in `headers`, `env`, and connection blocks are
-resolved against the spec author's *own* environment at the client /
+``${VAR}`` references in MCP `url`, `headers`, `env`, and connection blocks
+are resolved against the spec author's *own* environment at the client /
 registration boundary (`omnigent.cli._resolve_bundle_env_vars`), never
 at runtime by the server or runner for a tenant-uploaded
 (session-scoped) bundle. Expanding an uploaded spec's ``${VAR}`` against

@@ -133,9 +133,8 @@ export function settingsNavGroups(
     // on a deploy with sign-in.
     general.unshift({ id: "account", label: "Account", icon: UserCogIcon });
   }
-  const groups: SettingsNavGroup[] = [];
-  // Desktop (Local CLI) leads when present — it's the shell-specific section a
-  // desktop user is most likely here to change.
+  const groups: SettingsNavGroup[] = [{ title: "General", items: general }];
+  // Keep shell-specific settings directly after the cross-platform preferences.
   if (isDesktop) {
     groups.push({
       title: "Desktop",
@@ -145,7 +144,6 @@ export function settingsNavGroups(
       ],
     });
   }
-  groups.push({ title: "General", items: general });
   // Admin: server-wide management, admin-only. Nested here as sub-categories
   // (rather than links out of the Account section) so entering them stays
   // inside /settings — the sidebar keeps the settings nav instead of snapping

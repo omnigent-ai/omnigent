@@ -41,6 +41,7 @@ from omnigent.harnesses.codex_native.launch_args import (
     canonical_codex_launch_args,
     codex_config_profile,
     materialize_codex_config_profile,
+    read_codex_mcp_servers,
     validate_codex_config_profile_state,
     without_codex_config_profile,
 )
@@ -71,6 +72,7 @@ from omnigent.inner.codex_executor import (
     _populate_codex_home_config,
     _provider_codex_config_overrides,
     codex_extended_catalog_requested,
+    codex_minimal_config_requested,
     codex_router_bridge_dir,
     codex_router_hooks_settings,
     codex_router_session_id,
@@ -153,6 +155,10 @@ _MIN_POLICY_HOOK_CODEX_VERSION = (0, 129, 0)
 _MIN_BYPASS_HOOK_TRUST_CODEX_VERSION = (0, 131, 0)
 # Codex rejects permission flags on remote resume starting with this release.
 _MIN_REMOTE_RESUME_PERMISSION_GUARD_CODEX_VERSION = (0, 154, 0)
+# Codex renamed the app-server attach flag ``--remote`` -> ``--remote-control``
+# in this release; older binaries only know ``--remote``. Passing the wrong
+# name makes clap exit 2 at launch, so the flag name is version-gated.
+_MIN_REMOTE_CONTROL_FLAG_CODEX_VERSION = (0, 159, 0)
 _MODEL_MIGRATION_CATALOG_TIMEOUT_SECONDS = 3.0
 
 
@@ -190,57 +196,6 @@ def _format_codex_version(version: tuple[int, int, int] | None) -> str:
     if version is None:
         return "unknown"
     return ".".join(str(part) for part in version)
-
-
-def _toml_table_header_name(line: str) -> str | None:
-    """
-    Return the TOML table name declared by *line*, if any.
-
-    This intentionally recognizes only normal table headers because the
-    injected Codex MCP server config is a normal table. Array tables are
-    left untouched.
-
-    :param line: One config line, e.g.
-        ``"[mcp_servers.omnigent] # generated\n"``.
-    :returns: The table name, e.g. ``"mcp_servers.omnigent"``, or
-        ``None`` when *line* is not a normal table header.
-    """
-    stripped = line.strip()
-    if not stripped.startswith("["):
-        return None
-    if stripped.startswith("[["):
-        return None
-    end = stripped.find("]")
-    if end < 0:
-        return None
-    suffix = stripped[end + 1 :].strip()
-    if suffix and not suffix.startswith("#"):
-        return None
-    return stripped[1:end].strip()
-
-
-def _remove_toml_table(text: str, table_name: str) -> str:
-    """
-    Remove one TOML table and its subtables from a config document.
-
-    Used for generated private Codex config before appending the
-    Omnigent MCP server table. This avoids accumulating duplicate
-    ``[mcp_servers.omnigent]`` sections across terminal relaunches.
-
-    :param text: TOML document text.
-    :param table_name: Table name to remove, e.g.
-        ``"mcp_servers.omnigent"``.
-    :returns: TOML text with the target table block removed.
-    """
-    kept: list[str] = []
-    skipping = False
-    for line in text.splitlines(keepends=True):
-        header = _toml_table_header_name(line)
-        if header is not None:
-            skipping = header == table_name or header.startswith(f"{table_name}.")
-        if not skipping:
-            kept.append(line)
-    return "".join(kept).rstrip()
 
 
 #: Omnigent tools the framework calls on every session's behalf, pre-approved
@@ -807,10 +762,11 @@ def _inject_mcp_server_config(
     bridge_dir: Path,
     python_executable: str | None = None,
     *,
+    mcp_servers: _JsonObject,
     routed_spawns: bool = False,
 ) -> None:
     """
-    Upsert Omnigent MCP server config into ``config.toml``.
+    Refresh user MCPs and inject Omnigent's relay into the private config.
 
     Writes a ``[mcp_servers.omnigent]`` section that points Codex
     at the ``serve-mcp`` subprocess. This supplements the ``-c``
@@ -823,30 +779,28 @@ def _inject_mcp_server_config(
         and ``tool_relay.json``.
     :param python_executable: Python executable for serve-mcp.
         ``None`` uses :data:`sys.executable`.
+    :param mcp_servers: Current source-owned MCP inventory, including profile overrides.
     :param routed_spawns: ``True`` for an auto-harness Smart Routing session,
         which pre-approves the cross-harness redirect tools too.
     :returns: None.
     """
     config_path = codex_home / "config.toml"
-    # Materialize the symlink from _populate_codex_home_config before
-    # editing so the user's real config.toml stays untouched.
-    if config_path.is_symlink():
-        target = config_path.resolve()
-        config_path.unlink()
-        if target.is_file():
-            import shutil
-
-            shutil.copy2(target, config_path)
-    if config_path.exists():
-        existing = config_path.read_text(encoding="utf-8")
-    else:
-        existing = ""
-    updated = _remove_toml_table(existing, "mcp_servers.omnigent")
+    document = (
+        tomlkit.parse(config_path.read_text(encoding="utf-8"))
+        if config_path.exists()
+        else tomlkit.document()
+    )
+    # Replace, rather than merge, so deleted servers and fields do not survive.
+    servers = {name: config for name, config in mcp_servers.items() if name != "omnigent"}
+    document.pop("mcp_servers", None)
+    if servers:
+        document["mcp_servers"] = servers
+    updated = tomlkit.dumps(document).rstrip()
     section = _codex_mcp_server_config_section(
         bridge_dir, python_executable, routed_spawns=routed_spawns
     )
     rendered = f"{updated}\n\n{section}" if updated else section
-    config_path.write_text(rendered, encoding="utf-8")
+    _write_private_config(config_path, rendered)
 
 
 class CodexAppServerResponseError(RuntimeError):
@@ -863,6 +817,23 @@ class CodexAppServerResponseError(RuntimeError):
             self.code = code if isinstance(code, int) else None
             self.message = message if isinstance(message, str) else None
         super().__init__(str(error))
+
+
+def is_stale_active_turn_error(error: CodexAppServerResponseError) -> bool:
+    """Whether Codex rejected a turn id that ended or was replaced.
+
+    Codex 0.154.0 returns ``-32600`` with no ``data`` for these errors, so this
+    depends on its steer/interrupt message wording, including quoted turn ids.
+
+    :param error: Structured JSON-RPC response error.
+    :returns: ``True`` only for an ended or superseded active turn.
+    """
+    if error.code != -32600 or error.message is None:
+        return False
+    message = error.message.strip().casefold()
+    return message in {"no active turn to steer", "no active turn to interrupt"} or (
+        "expected active turn id" in message and "but found" in message
+    )
 
 
 #: JSON-RPC internal-error code codex returns when its thread-store fails.
@@ -928,7 +899,8 @@ class CodexAppServerClient:
         self._ws: ClientConnection | None = None
         self._reader_task: asyncio.Task[None] | None = None
         self._pending_requests: dict[int, asyncio.Future[CodexMessage]] = {}
-        self._events: asyncio.Queue[CodexMessage] = asyncio.Queue()
+        # ``None`` marks the end of the event stream (reader exited).
+        self._events: asyncio.Queue[CodexMessage | None] = asyncio.Queue()
         self._next_id = 1
 
     async def connect(self) -> None:
@@ -950,6 +922,9 @@ class CodexAppServerClient:
                 max_size=_MAX_WEBSOCKET_MESSAGE_SIZE_BYTES,
                 compression=None,
             )
+        # Fresh queue per connection so a previous stream's end marker
+        # cannot end this connection's consumers.
+        self._events = asyncio.Queue()
         self._reader_task = asyncio.create_task(
             self._reader_loop(),
             name="codex-native-app-server-reader",
@@ -1077,10 +1052,20 @@ class CodexAppServerClient:
         """
         Yield app-server notifications until the connection closes.
 
+        Delivers notifications buffered before the stream ended, then
+        terminates once the reader is gone (disconnect, reader failure,
+        or client close), so waiting consumers wake instead of blocking
+        forever on events that can no longer arrive.
+
         :returns: Async iterator of notification envelopes.
         """
         while True:
-            yield await self._events.get()
+            message = await self._events.get()
+            if message is None:
+                # Re-signal so every other waiting or future consumer ends too.
+                self._events.put_nowait(None)
+                return
+            yield message
 
     async def _reader_loop(self) -> None:
         """
@@ -1089,35 +1074,39 @@ class CodexAppServerClient:
         :returns: None.
         """
         assert self._ws is not None
-        async for raw in self._ws:
-            if not isinstance(raw, str):
-                continue
-            decoded: object = json.loads(raw)
-            message = _string_object_dict(decoded)
-            if message is None:
-                _logger.warning("Ignoring non-object Codex app-server message")
-                continue
-            if (
-                "id" in message
-                and "method" not in message
-                and ("result" in message or "error" in message)
-            ):
-                raw_id = message["id"]
-                request_id: int | None = None
-                if isinstance(raw_id, int):
-                    request_id = raw_id
-                elif isinstance(raw_id, str):
-                    with contextlib.suppress(ValueError):
-                        request_id = int(raw_id)
-                future = (
-                    self._pending_requests.pop(request_id, None)
-                    if request_id is not None
-                    else None
-                )
-                if future is not None and not future.done():
-                    future.set_result(message)
-                continue
-            await self._events.put(message)
+        try:
+            async for raw in self._ws:
+                if not isinstance(raw, str):
+                    continue
+                decoded: object = json.loads(raw)
+                message = _string_object_dict(decoded)
+                if message is None:
+                    _logger.warning("Ignoring non-object Codex app-server message")
+                    continue
+                if (
+                    "id" in message
+                    and "method" not in message
+                    and ("result" in message or "error" in message)
+                ):
+                    raw_id = message["id"]
+                    request_id: int | None = None
+                    if isinstance(raw_id, int):
+                        request_id = raw_id
+                    elif isinstance(raw_id, str):
+                        with contextlib.suppress(ValueError):
+                            request_id = int(raw_id)
+                    future = (
+                        self._pending_requests.pop(request_id, None)
+                        if request_id is not None
+                        else None
+                    )
+                    if future is not None and not future.done():
+                        future.set_result(message)
+                    continue
+                await self._events.put(message)
+        finally:
+            # Wake iter_events() consumers: no further events can arrive.
+            self._events.put_nowait(None)
 
 
 def _codex_rejects_request_field(exc: CodexAppServerResponseError, field: str) -> bool:
@@ -1848,6 +1837,12 @@ class CodexNativeAppServer:
 
         :returns: None.
         """
+        config_source = _codex_home_config_source_from_env()
+        if self.codex_home.resolve() == config_source.resolve():
+            raise ValueError(
+                "Omnigent could not isolate this session's Codex configuration. "
+                "Startup was stopped to protect your shared config. Please report this as a bug."
+            )
         self.codex_home.mkdir(mode=0o700, parents=True, exist_ok=True)
         os.chmod(self.codex_home, 0o700)
         if self.listen_url is None or self.listen_url.startswith("unix://"):
@@ -1885,7 +1880,13 @@ class CodexNativeAppServer:
                 router_bridge_dir = None
         self.router_hooks_registered = router_bridge_dir is not None and policy_hooks_supported
         routed_spawns = router_bridge_dir is not None
-        config_source = _codex_home_config_source_from_env()
+        minimal_config = codex_minimal_config_requested()
+        mcp_servers = read_codex_mcp_servers(
+            config_source,
+            self.config_profile,
+            codex_version=codex_version,
+            minimal_config=minimal_config,
+        )
         model_migration_target: str | None = None
         if self.trust_project and self.pinned_model:
             catalog: object = self.model_catalog_rows
@@ -1912,6 +1913,7 @@ class CodexNativeAppServer:
             inject_hooks=self.router_hooks_registered,
             extend_model_catalog=codex_extended_catalog_requested(self.env),
             supported_efforts=CODEX_NATIVE_EFFORTS,
+            minimal_config=minimal_config,
         )
         compose_profile_instructions = _materialize_codex_profile_for_start(
             self.codex_home,
@@ -1929,6 +1931,7 @@ class CodexNativeAppServer:
             self.codex_home,
             self.bridge_dir,
             self.python_executable,
+            mcp_servers=mcp_servers,
             routed_spawns=routed_spawns,
         )
         if self.pinned_model:
@@ -4383,6 +4386,24 @@ def codex_remote_resume_omits_permission_args(
     )
 
 
+def codex_remote_attach_flag(codex_cli_version: tuple[int, int, int] | None) -> str:
+    """App-server attach flag name for *codex_cli_version*.
+
+    ``--remote-control`` only when the probed version is known to be 0.159+;
+    ``--remote`` otherwise, including when the version is unknown. The wrong
+    flag name is a hard clap parse error (codex exits 2 before creating a
+    thread), so an unknown version stays on the long-standing ``--remote`` that
+    every older binary accepts rather than risk the rename on a binary that may
+    predate it.
+    """
+    if (
+        codex_cli_version is not None
+        and codex_cli_version >= _MIN_REMOTE_CONTROL_FLAG_CODEX_VERSION
+    ):
+        return "--remote-control"
+    return "--remote"
+
+
 def build_codex_remote_args(
     *,
     codex_args: tuple[str, ...],
@@ -4473,15 +4494,16 @@ def build_codex_remote_args(
     passthrough = without_codex_config_profile(passthrough)
     if bypass_hook_trust:
         passthrough = [_CODEX_BYPASS_HOOK_TRUST_FLAG, *passthrough]
+    remote_flag = codex_remote_attach_flag(codex_cli_version)
     if thread_id is None:
-        return [*override_args, *passthrough, "--remote", remote_url]
+        return [*override_args, *passthrough, remote_flag, remote_url]
     if not codex_remote_resume_omits_permission_args(codex_cli_version):
-        return [*override_args, *passthrough, "resume", "--remote", remote_url, thread_id]
+        return [*override_args, *passthrough, "resume", remote_flag, remote_url, thread_id]
     # Codex rejects explicit permission overrides on remote resume, even
     # when they match the app-server policy. config_overrides went to server
     # startup; codex_args went to preload's thread/resume call.
     resume_args = _strip_codex_resume_permission_args((*override_args, *passthrough))
-    return [*resume_args, "resume", "--remote", remote_url, thread_id]
+    return [*resume_args, "resume", remote_flag, remote_url, thread_id]
 
 
 def _terminate_process_tree(process: asyncio.subprocess.Process) -> None:

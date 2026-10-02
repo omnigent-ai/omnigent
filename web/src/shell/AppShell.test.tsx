@@ -1,3 +1,4 @@
+import type { ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("@/hooks/useScopeCache", () => import("@/test/mockScopeCache"));
@@ -24,6 +25,7 @@ import { useFileViewer } from "./FileViewerContext";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { ServerInfo } from "@/lib/capabilities";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
+import { AGENT_BROWSER_TAB_ID } from "@/hooks/useBrowserTabs";
 import { clearOptimisticTitles, recordOptimisticTitle } from "@/lib/optimisticTitles";
 import { readSessionWorkspaceState, writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
 import { writeWorkspacePanelDefault } from "@/lib/workspacePanelPreferences";
@@ -96,6 +98,7 @@ vi.mock("@/hooks/useAgents", () => ({
 }));
 
 vi.mock("./Sidebar", () => ({
+  isMobileViewport: () => !window.matchMedia("(min-width: 768px)").matches,
   // Reflect the open/peek props so tests can assert sidebar collapse/expand and
   // whether it is peeking (a floating hover card rather than a docked panel).
   // Rendered as aside.conversations-sidebar like the real one, so the
@@ -406,60 +409,81 @@ function serverInfo(overrides: Partial<ServerInfo> = {}): ServerInfo {
   };
 }
 
-function renderShell(path: string, info?: ServerInfo) {
-  const qc = new QueryClient({
-    defaultOptions: { queries: { retry: false } },
-  });
-  const tree = (
-    <QueryClientProvider client={qc}>
+function shellTree(client: QueryClient, path: string, routes: ReactNode) {
+  return (
+    <QueryClientProvider client={client}>
       <SidebarDataProvider>
         <TooltipProvider>
           <MemoryRouter initialEntries={[path]}>
             <Routes>
-              <Route element={<AppShell />}>
-                <Route
-                  index
-                  element={
-                    <>
-                      <div>home</div>
-                      <LocationDisplay />
-                    </>
-                  }
-                />
-                <Route
-                  path="c/:conversationId"
-                  element={
-                    <>
-                      <TerminalFirstViewProbe />
-                      <ForkDialogProbe />
-                      <NavProbe />
-                      <LocationDisplay />
-                    </>
-                  }
-                />
-                {/* The settings page itself renders inside the sidebar (its nav
-              replaces the session list), so the body here is irrelevant — what
-              matters is that the route is /settings, which is what AppShell
-              keys the sidebar pin off. The nav-* links stand in for the real
-              Settings button and the sidebar's Back row, both of which live in
-              components mocked out here. */}
-                <Route
-                  path="settings"
-                  element={
-                    <>
-                      <div>settings</div>
-                      <NavProbe />
-                      <LocationDisplay />
-                    </>
-                  }
-                />
-                <Route path="extensions/:extensionId/*" element={<div>extension page</div>} />
-              </Route>
+              <Route element={<AppShell />}>{routes}</Route>
             </Routes>
           </MemoryRouter>
         </TooltipProvider>
       </SidebarDataProvider>
     </QueryClientProvider>
+  );
+}
+
+function sessionShellTree(
+  client: QueryClient,
+  path: string,
+  content: ReactNode = (
+    <>
+      <TerminalFirstViewProbe />
+      <LocationDisplay />
+    </>
+  ),
+) {
+  return shellTree(client, path, <Route path="c/:conversationId" element={content} />);
+}
+
+function renderShell(path: string, info?: ServerInfo) {
+  const qc = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  });
+  const tree = shellTree(
+    qc,
+    path,
+    <>
+      <Route
+        index
+        element={
+          <>
+            <div>home</div>
+            <LocationDisplay />
+          </>
+        }
+      />
+      <Route
+        path="c/:conversationId"
+        element={
+          <>
+            <TerminalFirstViewProbe />
+            <ForkDialogProbe />
+            <NavProbe />
+            <LocationDisplay />
+          </>
+        }
+      />
+      {/* The settings page itself renders inside the sidebar (its nav
+              replaces the session list), so the body here is irrelevant — what
+              matters is that the route is /settings, which is what AppShell
+              keys the sidebar pin off. The nav-* links stand in for the real
+              Settings button and the sidebar's Back row, both of which live in
+              components mocked out here. */}
+      <Route
+        path="settings"
+        element={
+          <>
+            <div>settings</div>
+            <NavProbe />
+            <LocationDisplay />
+          </>
+        }
+      />
+      <Route path="extensions/:extensionId/*" element={<div>extension page</div>} />
+    </>,
   );
   // Without an explicit info the CapabilitiesContext default ("loading")
   // applies, matching production first paint and every pre-existing test.
@@ -811,29 +835,7 @@ describe("AppShell header", () => {
     });
 
     const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-    const makeTree = () => (
-      <QueryClientProvider client={qc}>
-        <SidebarDataProvider>
-          <TooltipProvider>
-            <MemoryRouter initialEntries={["/c/conv_terminal?view=terminal"]}>
-              <Routes>
-                <Route element={<AppShell />}>
-                  <Route
-                    path="c/:conversationId"
-                    element={
-                      <>
-                        <TerminalFirstViewProbe />
-                        <LocationDisplay />
-                      </>
-                    }
-                  />
-                </Route>
-              </Routes>
-            </MemoryRouter>
-          </TooltipProvider>
-        </SidebarDataProvider>
-      </QueryClientProvider>
-    );
+    const makeTree = () => sessionShellTree(qc, "/c/conv_terminal?view=terminal");
     const { rerender } = render(makeTree());
 
     expect(screen.getByTestId("view-probe")).toHaveAttribute("data-view", "chat");
@@ -910,29 +912,7 @@ describe("AppShell header", () => {
     useSessionMock.mockReturnValue({ session: null, isLoading: true, error: null });
 
     const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-    const makeTree = () => (
-      <QueryClientProvider client={qc}>
-        <SidebarDataProvider>
-          <TooltipProvider>
-            <MemoryRouter initialEntries={["/c/conv_fresh"]}>
-              <Routes>
-                <Route element={<AppShell />}>
-                  <Route
-                    path="c/:conversationId"
-                    element={
-                      <>
-                        <TerminalFirstViewProbe />
-                        <LocationDisplay />
-                      </>
-                    }
-                  />
-                </Route>
-              </Routes>
-            </MemoryRouter>
-          </TooltipProvider>
-        </SidebarDataProvider>
-      </QueryClientProvider>
-    );
+    const makeTree = () => sessionShellTree(qc, "/c/conv_fresh");
     const { rerender } = render(makeTree());
     expect(screen.getByTestId("view-probe")).toHaveAttribute("data-terminal-starting-up", "true");
 
@@ -1026,29 +1006,7 @@ describe("AppShell header", () => {
     // Stable QueryClient + fresh element per render so the rerender reads
     // the updated mock (React bails on an identical element reference).
     const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-    const makeTree = () => (
-      <QueryClientProvider client={qc}>
-        <SidebarDataProvider>
-          <TooltipProvider>
-            <MemoryRouter initialEntries={["/c/conv_fresh_deleted"]}>
-              <Routes>
-                <Route element={<AppShell />}>
-                  <Route
-                    path="c/:conversationId"
-                    element={
-                      <>
-                        <TerminalFirstViewProbe />
-                        <LocationDisplay />
-                      </>
-                    }
-                  />
-                </Route>
-              </Routes>
-            </MemoryRouter>
-          </TooltipProvider>
-        </SidebarDataProvider>
-      </QueryClientProvider>
-    );
+    const makeTree = () => sessionShellTree(qc, "/c/conv_fresh_deleted");
     const { rerender } = render(makeTree());
 
     // The PTY disappears (runner stopped / terminal deleted): startup
@@ -1086,27 +1044,14 @@ describe("AppShell header", () => {
 
     const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     render(
-      <QueryClientProvider client={qc}>
-        <SidebarDataProvider>
-          <TooltipProvider>
-            <MemoryRouter initialEntries={["/c/conv_lived"]}>
-              <Routes>
-                <Route element={<AppShell />}>
-                  <Route
-                    path="c/:conversationId"
-                    element={
-                      <>
-                        <TerminalFirstViewProbe />
-                        <SessionNavButton to="/c/conv_new" />
-                      </>
-                    }
-                  />
-                </Route>
-              </Routes>
-            </MemoryRouter>
-          </TooltipProvider>
-        </SidebarDataProvider>
-      </QueryClientProvider>,
+      sessionShellTree(
+        qc,
+        "/c/conv_lived",
+        <>
+          <TerminalFirstViewProbe />
+          <SessionNavButton to="/c/conv_new" />
+        </>,
+      ),
     );
 
     // Switch to the fresh session whose PTY has not arrived yet.
@@ -1375,29 +1320,7 @@ describe("TerminalFirstContext", () => {
     // Stable QueryClient + fresh element per render so the rerender reads the
     // updated mock (React bails on an identical element reference).
     const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-    const makeTree = () => (
-      <QueryClientProvider client={qc}>
-        <SidebarDataProvider>
-          <TooltipProvider>
-            <MemoryRouter initialEntries={["/c/conv_native"]}>
-              <Routes>
-                <Route element={<AppShell />}>
-                  <Route
-                    path="c/:conversationId"
-                    element={
-                      <>
-                        <TerminalFirstViewProbe />
-                        <LocationDisplay />
-                      </>
-                    }
-                  />
-                </Route>
-              </Routes>
-            </MemoryRouter>
-          </TooltipProvider>
-        </SidebarDataProvider>
-      </QueryClientProvider>
-    );
+    const makeTree = () => sessionShellTree(qc, "/c/conv_native");
     const { rerender } = render(makeTree());
 
     // Open the terminal view (a terminal is present).
@@ -1429,29 +1352,7 @@ describe("TerminalFirstContext", () => {
     });
 
     const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-    const makeTree = () => (
-      <QueryClientProvider client={qc}>
-        <SidebarDataProvider>
-          <TooltipProvider>
-            <MemoryRouter initialEntries={["/c/conv_native"]}>
-              <Routes>
-                <Route element={<AppShell />}>
-                  <Route
-                    path="c/:conversationId"
-                    element={
-                      <>
-                        <TerminalFirstViewProbe />
-                        <LocationDisplay />
-                      </>
-                    }
-                  />
-                </Route>
-              </Routes>
-            </MemoryRouter>
-          </TooltipProvider>
-        </SidebarDataProvider>
-      </QueryClientProvider>
-    );
+    const makeTree = () => sessionShellTree(qc, "/c/conv_native");
     const { rerender } = render(makeTree());
 
     fireEvent.click(screen.getByRole("button", { name: "Terminal" }));
@@ -2062,21 +1963,7 @@ describe("Workspace rail maximize", () => {
     ]);
 
     const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-    render(
-      <QueryClientProvider client={qc}>
-        <SidebarDataProvider>
-          <TooltipProvider>
-            <MemoryRouter initialEntries={["/c/conv_abc"]}>
-              <Routes>
-                <Route element={<AppShell />}>
-                  <Route path="c/:conversationId" element={<SessionNavButton to="/c/conv_xyz" />} />
-                </Route>
-              </Routes>
-            </MemoryRouter>
-          </TooltipProvider>
-        </SidebarDataProvider>
-      </QueryClientProvider>,
-    );
+    render(sessionShellTree(qc, "/c/conv_abc", <SessionNavButton to="/c/conv_xyz" />));
 
     // Open the sidebar, then maximize → sidebar collapses (state stashed).
     fireEvent.click(screen.getByRole("button", { name: /open sidebar/i }));
@@ -2307,29 +2194,7 @@ describe("Subagents tab", () => {
     });
 
     const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-    const makeTree = () => (
-      <QueryClientProvider client={qc}>
-        <SidebarDataProvider>
-          <TooltipProvider>
-            <MemoryRouter initialEntries={["/c/conv_abc"]}>
-              <Routes>
-                <Route element={<AppShell />}>
-                  <Route
-                    path="c/:conversationId"
-                    element={
-                      <>
-                        <TerminalFirstViewProbe />
-                        <LocationDisplay />
-                      </>
-                    }
-                  />
-                </Route>
-              </Routes>
-            </MemoryRouter>
-          </TooltipProvider>
-        </SidebarDataProvider>
-      </QueryClientProvider>
-    );
+    const makeTree = () => sessionShellTree(qc, "/c/conv_abc");
     const { rerender } = render(makeTree());
 
     // 2 = one child + the main agent.
@@ -2392,29 +2257,7 @@ describe("Subagents tab", () => {
     useChildSessionsMock.mockReturnValue({ children: [], isLoading: false, error: null });
 
     const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-    const makeTree = () => (
-      <QueryClientProvider client={qc}>
-        <SidebarDataProvider>
-          <TooltipProvider>
-            <MemoryRouter initialEntries={["/c/conv_abc"]}>
-              <Routes>
-                <Route element={<AppShell />}>
-                  <Route
-                    path="c/:conversationId"
-                    element={
-                      <>
-                        <TerminalFirstViewProbe />
-                        <LocationDisplay />
-                      </>
-                    }
-                  />
-                </Route>
-              </Routes>
-            </MemoryRouter>
-          </TooltipProvider>
-        </SidebarDataProvider>
-      </QueryClientProvider>
-    );
+    const makeTree = () => sessionShellTree(qc, "/c/conv_abc");
     const { rerender } = render(makeTree());
 
     useChildSessionsMock.mockReturnValue({
@@ -2659,21 +2502,7 @@ describe("FilesPanel visibility", () => {
     ]);
 
     const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-    render(
-      <QueryClientProvider client={qc}>
-        <SidebarDataProvider>
-          <TooltipProvider>
-            <MemoryRouter initialEntries={["/c/conv_abc"]}>
-              <Routes>
-                <Route element={<AppShell />}>
-                  <Route path="c/:conversationId" element={<SessionNavButton to="/c/conv_xyz" />} />
-                </Route>
-              </Routes>
-            </MemoryRouter>
-          </TooltipProvider>
-        </SidebarDataProvider>
-      </QueryClientProvider>,
-    );
+    render(sessionShellTree(qc, "/c/conv_abc", <SessionNavButton to="/c/conv_xyz" />));
 
     expect(screen.getByTestId("files-panel")).toHaveAttribute("data-show-hidden", "true");
 
@@ -2710,6 +2539,137 @@ describe("Extension pages own the header", () => {
 });
 
 describe("Right workspace card visibility", () => {
+  it("focuses the tab strip without replacing its selected soft tab", async () => {
+    writeWorkspacePanelDefault("collapsed");
+    useEnvironmentMock.mockReturnValue({
+      data: { available: true, root: null, home: null },
+      isLoading: false,
+    } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
+    mockConversations([{ id: "conv_hotkey", permission_level: null }]);
+
+    renderShell("/c/conv_hotkey");
+    expect(screen.queryByRole("complementary", { name: "Workspace" })).toBeNull();
+
+    fireEvent.keyDown(document, { code: "BracketRight", ctrlKey: true, altKey: true });
+
+    const filesTab = await screen.findByRole("tab", { name: "Files" });
+    await waitFor(() => expect(filesTab).toHaveFocus());
+    fireEvent.keyDown(filesTab, { key: "2" });
+    expect(screen.getByTestId("files-panel")).toHaveAttribute("data-flat-view", "true");
+
+    fireEvent.click(screen.getByRole("button", { name: "files: select README.md" }));
+    const fileTab = screen.getByTitle("README.md");
+    expect(screen.getByTestId("file-viewer-inline")).toHaveAttribute("data-path", "README.md");
+    expect(screen.getByTestId("url-params")).toHaveTextContent("file=README.md");
+
+    screen.getByRole("button", { name: "Collapse right panel" }).focus();
+    fireEvent.keyDown(document, { code: "BracketRight", ctrlKey: true, altKey: true });
+
+    expect(screen.getByRole("complementary", { name: "Workspace" })).toBeInTheDocument();
+    await waitFor(() => expect(fileTab).toHaveFocus());
+    expect(screen.getByTestId("file-viewer-inline")).toHaveAttribute("data-path", "README.md");
+    expect(screen.getByTestId("url-params")).toHaveTextContent("file=README.md");
+    expect(filesTab).toHaveAttribute("aria-selected", "false");
+
+    fireEvent.keyDown(document, { code: "BracketRight", ctrlKey: true, altKey: true });
+    expect(screen.queryByRole("complementary", { name: "Workspace" })).toBeNull();
+  });
+
+  it("reveals a collapsed workspace when the Browser hotkey opens a tab", async () => {
+    writeWorkspacePanelDefault("collapsed");
+    vi.stubGlobal("omnigentDesktop", {
+      kind: "electron",
+      browserOpenOrNavigate: vi.fn(),
+      setBadgeCount: vi.fn(),
+    });
+    useEnvironmentMock.mockReturnValue({
+      data: { available: true, root: null, home: null },
+      isLoading: false,
+    } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
+    mockConversations([{ id: "conv_browser_hotkey", permission_level: null }]);
+
+    try {
+      renderShell("/c/conv_browser_hotkey");
+      expect(screen.queryByRole("complementary", { name: "Workspace" })).toBeNull();
+
+      fireEvent.keyDown(window, { code: "KeyB", ctrlKey: true, altKey: true });
+
+      expect(await screen.findByRole("tab", { name: "Browser 1" })).toHaveAttribute(
+        "aria-selected",
+        "true",
+      );
+      expect(screen.getByRole("complementary", { name: "Workspace" })).toBeInTheDocument();
+    } finally {
+      cleanup();
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("reveals a Browser tab over an open Terminal panel", async () => {
+    vi.stubGlobal("omnigentDesktop", {
+      kind: "electron",
+      browserOpenOrNavigate: vi.fn(),
+      setBadgeCount: vi.fn(),
+    });
+    sessionStorage.setItem(
+      "omnigent.web.panel-key:conv_browser_terminal",
+      "terminal:terminal_main",
+    );
+    useEnvironmentMock.mockReturnValue({
+      data: { available: true, root: null, home: null },
+      isLoading: false,
+    } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
+    mockConversations([{ id: "conv_browser_terminal", permission_level: null }]);
+
+    try {
+      renderShell("/c/conv_browser_terminal");
+      expect(screen.getByTestId("terminals-panel")).toHaveAttribute("data-state", "open");
+      expect(screen.queryByRole("complementary", { name: "Workspace" })).toBeNull();
+
+      fireEvent.keyDown(window, { code: "KeyB", ctrlKey: true, altKey: true });
+
+      expect(screen.getByTestId("terminals-panel")).toHaveAttribute("data-state", "closed");
+      expect(await screen.findByRole("tab", { name: "Browser 1" })).toHaveAttribute(
+        "aria-selected",
+        "true",
+      );
+      expect(screen.getByRole("complementary", { name: "Workspace" })).toBeInTheDocument();
+    } finally {
+      cleanup();
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("reveals and focuses the workspace over an open Terminal panel", async () => {
+    sessionStorage.setItem(
+      "omnigent.web.panel-key:conv_workspace_terminal",
+      "terminal:terminal_main",
+    );
+    writeSessionWorkspaceState("conv_workspace_terminal", {
+      open: false,
+      openFiles: ["README.md"],
+      selectedFilePath: "README.md",
+    });
+    useEnvironmentMock.mockReturnValue({
+      data: { available: true, root: null, home: null },
+      isLoading: false,
+    } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
+    mockConversations([{ id: "conv_workspace_terminal", permission_level: null }]);
+
+    renderShell("/c/conv_workspace_terminal");
+    expect(screen.getByTestId("terminals-panel")).toHaveAttribute("data-state", "open");
+    expect(screen.queryByRole("complementary", { name: "Workspace" })).toBeNull();
+    expect(screen.getByTestId("url-params")).not.toHaveTextContent("file=");
+
+    fireEvent.keyDown(document, { code: "BracketRight", ctrlKey: true, altKey: true });
+
+    expect(screen.getByTestId("terminals-panel")).toHaveAttribute("data-state", "closed");
+    expect(screen.getByRole("complementary", { name: "Workspace" })).toBeInTheDocument();
+    expect(screen.getByTestId("file-viewer-inline")).toHaveAttribute("data-path", "README.md");
+    expect(screen.getByTestId("url-params")).toHaveTextContent("file=README.md");
+    await waitFor(() => expect(screen.getByTitle("README.md")).toHaveFocus());
+  });
+
   it("mounts an expandable pending card for a temporary session", () => {
     writeSessionWorkspaceState("temp:12345678", { open: true });
     mockConversations([{ id: "temp:12345678", permission_level: null, provisional: true }]);
@@ -2743,9 +2703,37 @@ describe("Right workspace card visibility", () => {
     const exiting = document.querySelector('aside[aria-label="Workspace"]');
     expect(exiting).not.toBeNull();
     expect(exiting).toHaveAttribute("data-state", "closed");
+    expect(exiting).toHaveAttribute("data-animate-visibility", "true");
     expect(exiting).toHaveClass("workspace-panel-motion", "md:overflow-hidden");
     expect(exiting).toHaveStyle({ width: "0px" });
+    expect(headerGroup).toHaveAttribute("data-workspace-panel-animate", "true");
     expect(headerGroup?.style.getPropertyValue("--workspace-panel-offset")).toBe("0px");
+  });
+
+  it("restores a different session width without visibility motion", () => {
+    useEnvironmentMock.mockReturnValue({
+      data: { available: false, root: null, home: null },
+      isLoading: false,
+    } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
+    writeSessionWorkspaceState("conv_narrow", { open: true, widthPx: 280 });
+    writeSessionWorkspaceState("conv_wide", { open: true, widthPx: 480 });
+    mockConversations([
+      { id: "conv_narrow", permission_level: null },
+      { id: "conv_wide", permission_level: null },
+    ]);
+
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(sessionShellTree(qc, "/c/conv_narrow", <SessionNavButton to="/c/conv_wide" />));
+    const first = screen.getByRole("complementary", { name: "Workspace" });
+    expect(first).toHaveStyle({ width: "280px" });
+    expect(first).not.toHaveAttribute("data-animate-visibility");
+
+    fireEvent.click(screen.getByTestId("nav-session"));
+
+    const second = screen.getByRole("complementary", { name: "Workspace" });
+    expect(second).toHaveStyle({ width: "480px" });
+    expect(second).not.toHaveAttribute("data-animate-visibility");
+    expect(second.parentElement).not.toHaveAttribute("data-workspace-panel-animate");
   });
 
   it("keeps the card mounted with Agents as the only tab for a minimal agent", () => {
@@ -2903,7 +2891,7 @@ describe("Right workspace card visibility", () => {
     expect(screen.getByRole("tab", { name: /Files/i })).toHaveAttribute("aria-selected", "false");
   });
 
-  it("preserves a remembered Browser tab when the outgoing Files tab becomes unavailable", () => {
+  it("preserves a remembered Browser soft tab when the outgoing Files tab becomes unavailable", () => {
     vi.stubGlobal("omnigentDesktop", {
       kind: "electron",
       browserOpenOrNavigate: vi.fn(),
@@ -2911,7 +2899,11 @@ describe("Right workspace card visibility", () => {
     });
     try {
       writeSessionWorkspaceState("conv_from", { rightRailTab: "files" });
-      writeSessionWorkspaceState("conv_to", { rightRailTab: "browser" });
+      writeSessionWorkspaceState("conv_to", {
+        rightRailTab: "browser",
+        openBrowsers: [AGENT_BROWSER_TAB_ID],
+        selectedBrowserId: AGENT_BROWSER_TAB_ID,
+      });
       useEnvironmentMock.mockImplementation(
         (id) =>
           ({
@@ -2924,24 +2916,7 @@ describe("Right workspace card visibility", () => {
         { id: "conv_to", permission_level: null },
       ]);
       const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-      render(
-        <QueryClientProvider client={qc}>
-          <SidebarDataProvider>
-            <TooltipProvider>
-              <MemoryRouter initialEntries={["/c/conv_from"]}>
-                <Routes>
-                  <Route element={<AppShell />}>
-                    <Route
-                      path="c/:conversationId"
-                      element={<SessionNavButton to="/c/conv_to" />}
-                    />
-                  </Route>
-                </Routes>
-              </MemoryRouter>
-            </TooltipProvider>
-          </SidebarDataProvider>
-        </QueryClientProvider>,
-      );
+      render(sessionShellTree(qc, "/c/conv_from", <SessionNavButton to="/c/conv_to" />));
       expect(screen.getByRole("tab", { name: /Files/i })).toHaveAttribute("aria-selected", "true");
 
       fireEvent.click(screen.getByTestId("nav-session"));
@@ -2985,24 +2960,7 @@ describe("Right workspace card visibility", () => {
     mockConversations([{ id: "conv_from", permission_level: null }]);
     const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     qc.setQueryData(["rootSessionId", "conv_child"], "conv_other_root");
-    render(
-      <QueryClientProvider client={qc}>
-        <SidebarDataProvider>
-          <TooltipProvider>
-            <MemoryRouter initialEntries={["/c/conv_from"]}>
-              <Routes>
-                <Route element={<AppShell />}>
-                  <Route
-                    path="c/:conversationId"
-                    element={<SessionNavButton to="/c/conv_child" />}
-                  />
-                </Route>
-              </Routes>
-            </MemoryRouter>
-          </TooltipProvider>
-        </SidebarDataProvider>
-      </QueryClientProvider>,
-    );
+    render(sessionShellTree(qc, "/c/conv_from", <SessionNavButton to="/c/conv_child" />));
     expect(screen.getByRole("tab", { name: /Agents/i })).toHaveAttribute("aria-selected", "true");
 
     fireEvent.click(screen.getByTestId("nav-session"));
@@ -3011,18 +2969,83 @@ describe("Right workspace card visibility", () => {
     expect(readSessionWorkspaceState("conv_child").rightRailTab).toBe("changes");
   });
 
-  it("falls back to Files when the remembered tab is unavailable", () => {
-    writeSessionWorkspaceState("conv_no_browser", { rightRailTab: "browser" });
-    useEnvironmentMock.mockReturnValue({
-      data: { available: true, root: null, home: null },
-      isLoading: false,
-    } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
-    mockConversations([{ id: "conv_no_browser", permission_level: null }]);
+  it("falls back to Files when Browser mode has no open soft tab", async () => {
+    vi.stubGlobal("omnigentDesktop", {
+      kind: "electron",
+      browserOpenOrNavigate: vi.fn(),
+      setBadgeCount: vi.fn(),
+    });
+    try {
+      writeSessionWorkspaceState("conv_no_browser", { rightRailTab: "browser" });
+      useEnvironmentMock.mockReturnValue({
+        data: { available: true, root: null, home: null },
+        isLoading: false,
+      } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
+      mockConversations([{ id: "conv_no_browser", permission_level: null }]);
 
-    renderShell("/c/conv_no_browser");
+      renderShell("/c/conv_no_browser");
 
-    expect(screen.queryByRole("tab", { name: /Browser/i })).toBeNull();
-    expect(screen.getByRole("tab", { name: /Files/i })).toHaveAttribute("aria-selected", "true");
+      expect(screen.queryByRole("tab", { name: /Browser/i })).toBeNull();
+      await waitFor(() =>
+        expect(screen.getByRole("tab", { name: /Files/i })).toHaveAttribute(
+          "aria-selected",
+          "true",
+        ),
+      );
+    } finally {
+      cleanup();
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("keeps an active file and its URL when the last background browser closes", async () => {
+    vi.stubGlobal("omnigentDesktop", {
+      kind: "electron",
+      browserOpenOrNavigate: vi.fn(),
+      browserClose: vi.fn().mockResolvedValue({ ok: true }),
+      setBadgeCount: vi.fn(),
+    });
+    function FileOpenProbe() {
+      const openFile = useFileViewer();
+      return (
+        <>
+          <button type="button" onClick={() => openFile?.("README.md")}>
+            Open cited file
+          </button>
+          <LocationDisplay />
+        </>
+      );
+    }
+    try {
+      writeSessionWorkspaceState("conv_browser_file", {
+        open: true,
+        rightRailTab: "browser",
+        openBrowsers: ["browser-1"],
+        selectedBrowserId: "browser-1",
+      });
+      useEnvironmentMock.mockReturnValue({
+        data: { available: true, root: null, home: null },
+        isLoading: false,
+      } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
+      mockConversations([{ id: "conv_browser_file", permission_level: null }]);
+
+      const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+      render(sessionShellTree(qc, "/c/conv_browser_file", <FileOpenProbe />));
+      fireEvent.click(screen.getByRole("button", { name: "Open cited file" }));
+      expect(screen.getByTestId("file-viewer-inline")).toHaveAttribute("data-path", "README.md");
+      expect(screen.getByTestId("url-params")).toHaveTextContent("file=README.md");
+
+      fireEvent.click(screen.getByRole("button", { name: "Close Browser 1" }));
+
+      await waitFor(() =>
+        expect(screen.queryByRole("tab", { name: "Browser 1" })).not.toBeInTheDocument(),
+      );
+      expect(screen.getByTestId("file-viewer-inline")).toHaveAttribute("data-path", "README.md");
+      expect(screen.getByTestId("url-params")).toHaveTextContent("file=README.md");
+    } finally {
+      cleanup();
+      vi.unstubAllGlobals();
+    }
   });
 
   it("falls back to Agents when the preferred tab and Files are unavailable", () => {
@@ -3038,6 +3061,28 @@ describe("Right workspace card visibility", () => {
     expect(screen.queryByRole("tab", { name: /Files/i })).toBeNull();
     expect(screen.queryByRole("tab", { name: /Changes/i })).toBeNull();
     expect(screen.getByRole("tab", { name: /Agents/i })).toHaveAttribute("aria-selected", "true");
+  });
+
+  it("reveals Agents from a sub-agent link even when the child's workspace was closed on a file", () => {
+    sessionStorage.setItem("omnigent.web.panel-key:conv_linked_child", "terminal_main");
+    writeSessionWorkspaceState("conv_linked_child", {
+      open: false,
+      rightRailTab: "files",
+      openFiles: ["README.md"],
+      selectedFilePath: "README.md",
+    });
+    useEnvironmentMock.mockReturnValue({
+      data: { available: true, root: null, home: null },
+      isLoading: false,
+    } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
+    mockConversations([{ id: "conv_linked_child", permission_level: null }]);
+
+    renderShell("/c/conv_linked_child?panel=agents");
+
+    expect(screen.getByRole("complementary", { name: "Workspace" })).toBeInTheDocument();
+    expect(screen.getByRole("tab", { name: /Agents/i })).toHaveAttribute("aria-selected", "true");
+    expect(screen.queryByTestId("file-viewer-inline")).toBeNull();
+    expect(screen.getByTestId("terminals-panel")).toHaveAttribute("data-state", "closed");
   });
 
   it("restores the open file tabs per session (independent of the ?file= param)", () => {
@@ -3131,29 +3176,7 @@ describe("Right workspace card visibility", () => {
     mockConversations([{ id: "conv_gone", permission_level: null }]);
 
     const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-    const makeTree = () => (
-      <QueryClientProvider client={qc}>
-        <SidebarDataProvider>
-          <TooltipProvider>
-            <MemoryRouter initialEntries={["/c/conv_gone"]}>
-              <Routes>
-                <Route element={<AppShell />}>
-                  <Route
-                    path="c/:conversationId"
-                    element={
-                      <>
-                        <TerminalFirstViewProbe />
-                        <LocationDisplay />
-                      </>
-                    }
-                  />
-                </Route>
-              </Routes>
-            </MemoryRouter>
-          </TooltipProvider>
-        </SidebarDataProvider>
-      </QueryClientProvider>
-    );
+    const makeTree = () => sessionShellTree(qc, "/c/conv_gone");
     const { rerender } = render(makeTree());
 
     // Present: the shell's tab and (since it was the selected key) its xterm.
@@ -3185,29 +3208,7 @@ describe("Right workspace card visibility", () => {
     mockConversations([{ id: "conv_load", permission_level: null }]);
 
     const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-    const makeTree = () => (
-      <QueryClientProvider client={qc}>
-        <SidebarDataProvider>
-          <TooltipProvider>
-            <MemoryRouter initialEntries={["/c/conv_load"]}>
-              <Routes>
-                <Route element={<AppShell />}>
-                  <Route
-                    path="c/:conversationId"
-                    element={
-                      <>
-                        <TerminalFirstViewProbe />
-                        <LocationDisplay />
-                      </>
-                    }
-                  />
-                </Route>
-              </Routes>
-            </MemoryRouter>
-          </TooltipProvider>
-        </SidebarDataProvider>
-      </QueryClientProvider>
-    );
+    const makeTree = () => sessionShellTree(qc, "/c/conv_load");
     const { rerender } = render(makeTree());
 
     // The list resolves with the terminal present — the restored selection was
@@ -3493,27 +3494,14 @@ describe("AppShell scope view — conversation redirect (stale-closure regressio
     // navigation — a remount would rebuild the callback and hide the bug.
     const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     render(
-      <QueryClientProvider client={qc}>
-        <SidebarDataProvider>
-          <TooltipProvider>
-            <MemoryRouter initialEntries={["/c/conv_abc"]}>
-              <Routes>
-                <Route element={<AppShell />}>
-                  <Route
-                    path="c/:conversationId"
-                    element={
-                      <>
-                        <SessionNavButton to="/c/conv_xyz" />
-                        <PathDisplay />
-                      </>
-                    }
-                  />
-                </Route>
-              </Routes>
-            </MemoryRouter>
-          </TooltipProvider>
-        </SidebarDataProvider>
-      </QueryClientProvider>,
+      sessionShellTree(
+        qc,
+        "/c/conv_abc",
+        <>
+          <SessionNavButton to="/c/conv_xyz" />
+          <PathDisplay />
+        </>,
+      ),
     );
 
     // First mount is conv_abc; switch in-app to conv_xyz (no remount).
@@ -4440,5 +4428,172 @@ describe("file navigation request precedence", () => {
     expect(screen.getByTestId("file-viewer-inline")).not.toHaveAttribute("data-line");
     expect(screen.getByTestId("url-params")).not.toHaveTextContent("line=");
     expect(screen.getByTestId("url-params")).not.toHaveTextContent("column=");
+  });
+});
+
+describe("AppShell design-mode submission", () => {
+  let submit: (payload: {
+    conversationId: string;
+    id: number;
+    element: { tag: string; id: string };
+    prompt: string;
+  }) => void;
+  let select: (payload: { conversationId: string; screenshot: string }) => void;
+  const send = vi.fn().mockResolvedValue(undefined);
+  const enqueueMessage = vi.fn();
+  const signal = vi.fn().mockResolvedValue({ ok: true });
+  let chat: ReturnType<typeof useChatStore.getState>;
+  let restoreGetState: () => void;
+
+  beforeEach(() => {
+    chat = { ...useChatStore.getState() };
+    const getState = vi.spyOn(useChatStore, "getState").mockImplementation(() => chat);
+    restoreGetState = () => getState.mockRestore();
+    send.mockClear();
+    enqueueMessage.mockClear();
+    // Model pending queue state; real-store and desktop tests cover draining.
+    enqueueMessage.mockImplementation((text: string, files?: File[]) => {
+      if (chat.conversationId === null) throw new Error("Expected a bound test conversation");
+      chat.queuedMessages.push({
+        queueId: `queued_${chat.queuedMessages.length}`,
+        conversationId: chat.conversationId,
+        text,
+        files,
+      });
+    });
+    signal.mockClear();
+    vi.stubGlobal("omnigentDesktop", {
+      kind: "electron",
+      browserOpenOrNavigate: vi.fn(),
+      setBadgeCount: vi.fn(),
+      onBrowserElementSelected: (cb: typeof select) => {
+        select = cb;
+        return () => {};
+      },
+      onBrowserElementPromptSubmit: (cb: typeof submit) => {
+        submit = cb;
+        return () => {};
+      },
+      browserSignalDesignResult: signal,
+    });
+    mockConversations([{ id: "conv_design", permission_level: null }]);
+    useSessionAgentMock.mockReturnValue({ data: { id: "agent_design" } } as ReturnType<
+      typeof useSessionAgent
+    >);
+    Object.assign(chat, {
+      conversationId: "conv_design",
+      boundAgentId: "agent_design",
+      queuedMessages: [],
+      status: "streaming",
+      sessionStatus: "running",
+      send,
+      enqueueMessage,
+    });
+  });
+
+  afterEach(() => {
+    cleanup();
+    vi.unstubAllGlobals();
+    restoreGetState();
+  });
+
+  function submitInstruction(prompt = "Use a week picker.") {
+    act(() => {
+      select({ conversationId: "conv_design", screenshot: "data:image/png;base64,AQID" });
+      submit({
+        conversationId: "conv_design",
+        id: 1,
+        element: { tag: "input", id: "#period" },
+        prompt,
+      });
+    });
+  }
+
+  it.each([
+    { preference: null, busy: true, backlog: false, queued: true },
+    { preference: "false", busy: true, backlog: false, queued: true },
+    { preference: "true", busy: true, backlog: false, queued: false },
+    { preference: "true", busy: true, backlog: true, queued: true },
+    { preference: null, busy: false, backlog: false, queued: false },
+  ])("routes with $preference always-steer, busy=$busy, backlog=$backlog", async (test) => {
+    if (test.preference !== null) localStorage.setItem("omnigent:always-steer", test.preference);
+    Object.assign(chat, {
+      status: test.busy ? "streaming" : "idle",
+      sessionStatus: test.busy ? "running" : "idle",
+      queuedMessages: test.backlog
+        ? [{ queueId: "earlier", conversationId: "conv_design", text: "Earlier change" }]
+        : [],
+    });
+    renderShell("/c/conv_design");
+    submitInstruction();
+
+    const dispatched = test.queued ? enqueueMessage : send;
+    expect(dispatched).toHaveBeenCalledTimes(1);
+    expect(test.queued ? send : enqueueMessage).not.toHaveBeenCalled();
+    const args = dispatched.mock.calls[0];
+    expect(args[0]).toContain("Use a week picker.");
+    expect(args[0]).toContain("CSS selector: #period");
+    const files = args[test.queued ? 1 : 2] as File[];
+    expect(files).toHaveLength(1);
+    expect(files[0]).toMatchObject({ name: "design-element-1.png", type: "image/png", size: 3 });
+    await waitFor(() =>
+      expect(signal).toHaveBeenCalledWith("conv_design", {
+        id: 1,
+        ok: true,
+        message: test.queued ? "Queued for agent." : "Sent to agent.",
+      }),
+    );
+  });
+
+  it("reads a changed always-steer preference at submission without remounting", () => {
+    localStorage.setItem("omnigent:always-steer", "true");
+    renderShell("/c/conv_design");
+    submitInstruction();
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(chat.queuedMessages).toHaveLength(0);
+    localStorage.setItem("omnigent:always-steer", "false");
+    submitInstruction();
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(enqueueMessage).toHaveBeenCalledTimes(1);
+    expect(chat.queuedMessages).toHaveLength(1);
+  });
+
+  it("preserves queued instructions when always-steer is enabled mid-session", () => {
+    renderShell("/c/conv_design");
+    submitInstruction("First change");
+    localStorage.setItem("omnigent:always-steer", "true");
+    submitInstruction("Second change");
+    expect(send).not.toHaveBeenCalled();
+    expect(enqueueMessage).toHaveBeenCalledTimes(2);
+    expect(chat.queuedMessages.map((message) => message.text.split("\n")[0])).toEqual([
+      "First change",
+      "Second change",
+    ]);
+  });
+
+  it("rejects a late pointer submission after switching to another session", () => {
+    renderShell("/c/conv_design");
+    chat.conversationId = "conv_other";
+    submitInstruction();
+    expect(enqueueMessage).not.toHaveBeenCalled();
+    expect(send).not.toHaveBeenCalled();
+    expect(signal).toHaveBeenCalledWith("conv_design", {
+      id: 1,
+      ok: false,
+      message: "Return to this session before sending.",
+    });
+    chat.conversationId = "conv_design";
+    act(() => {
+      submit({
+        conversationId: "conv_design",
+        id: 2,
+        element: { tag: "input", id: "#period" },
+        prompt: "A later instruction without a new screenshot",
+      });
+    });
+    expect(enqueueMessage).toHaveBeenCalledWith(
+      expect.stringContaining("A later instruction without a new screenshot"),
+      undefined,
+    );
   });
 });

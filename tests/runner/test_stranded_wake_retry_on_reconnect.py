@@ -18,7 +18,7 @@ from typing import Any
 import httpx
 import pytest
 
-from omnigent.runner import create_runner_app
+from omnigent.runner import create_runner_app, subagent_work
 from tests.runner.conftest import _FakeProcessManager, _runner_client, _ScriptedHarnessClient
 from tests.runner.helpers import NullServerClient
 
@@ -114,7 +114,6 @@ async def test_reconnect_redelivers_wake_stranded_by_server_outage(
     wake so the idle parent learns its child finished — without this, the
     completion is stranded until the next user message.
     """
-    from omnigent.runner import app as runner_app
 
     parent_id = "5f0d5a5f7f2a4be7b6a13f6a9f1c2d3e"
     child_id = "9a8b7c6d5e4f3a2b1c0d9e8f7a6b5c4d"
@@ -126,8 +125,8 @@ async def test_reconnect_redelivers_wake_stranded_by_server_outage(
         server_client=server_client,  # type: ignore[arg-type]
     )
 
-    runner_app._session_inboxes_ref[parent_id] = session_inbox
-    runner_app.register_subagent_work(
+    subagent_work._session_inboxes_ref[parent_id] = session_inbox
+    subagent_work.register_subagent_work(
         parent_session_id=parent_id,
         child_session_id=child_id,
         agent="researcher",
@@ -159,8 +158,8 @@ async def test_reconnect_redelivers_wake_stranded_by_server_outage(
                 f"Re-delivered POST is not a wake notice: {notice_text!r}"
             )
     finally:
-        runner_app.unregister_subagent_work(child_id)
-        runner_app._session_inboxes_ref.pop(parent_id, None)
+        subagent_work.unregister_subagent_work(child_id)
+        subagent_work._session_inboxes_ref.pop(parent_id, None)
 
 
 @pytest.mark.asyncio
@@ -173,7 +172,6 @@ async def test_reconnect_skips_stranded_wake_for_drained_inbox(
     (e.g. the user bumped it manually), a re-delivered wake would announce
     work that no longer exists; the catch-up scan must stay silent.
     """
-    from omnigent.runner import app as runner_app
 
     parent_id = "1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f"
     child_id = "6f5e4d3c2b1a0f9e8d7c6b5a4f3e2d1c"
@@ -185,8 +183,8 @@ async def test_reconnect_skips_stranded_wake_for_drained_inbox(
         server_client=server_client,  # type: ignore[arg-type]
     )
 
-    runner_app._session_inboxes_ref[parent_id] = session_inbox
-    runner_app.register_subagent_work(
+    subagent_work._session_inboxes_ref[parent_id] = session_inbox
+    subagent_work.register_subagent_work(
         parent_session_id=parent_id,
         child_session_id=child_id,
         agent="researcher",
@@ -209,5 +207,5 @@ async def test_reconnect_skips_stranded_wake_for_drained_inbox(
                 f"{server_client.delivered_posts}."
             )
     finally:
-        runner_app.unregister_subagent_work(child_id)
-        runner_app._session_inboxes_ref.pop(parent_id, None)
+        subagent_work.unregister_subagent_work(child_id)
+        subagent_work._session_inboxes_ref.pop(parent_id, None)

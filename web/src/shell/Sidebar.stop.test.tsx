@@ -1,7 +1,9 @@
+import { renderSidebar } from "@/test/sidebarTestHelpers";
+import { conversationPage } from "@/test/sidebarMockHelpers";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("@/hooks/useScopeCache", () => import("@/test/mockScopeCache"));
-import { SidebarDataProvider } from "@/hooks/useSidebarData";
+
 // Tests for the sidebar kebab's "Stop session" item (moved here from the
 // chat header). Contract: the item renders only for stoppable sessions
 // (isSessionStoppable: host-spawned or claude-native) whose runner isn't
@@ -11,10 +13,7 @@ import { SidebarDataProvider } from "@/hooks/useSidebarData";
 
 import type * as RunnerHealthProviderModule from "@/hooks/RunnerHealthProvider";
 
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
-import { MemoryRouter } from "react-router-dom";
-import { TooltipProvider } from "@/components/ui/tooltip";
+import { cleanup, fireEvent, screen } from "@testing-library/react";
 
 // Controllable stop mutation + runner-liveness lookup, declared via
 // vi.hoisted so the vi.mock factories can reference them. The dialog reads
@@ -25,40 +24,13 @@ const mocks = vi.hoisted(() => ({
   runnerOnline: vi.fn<(id: string | undefined) => boolean | undefined>(() => undefined),
 }));
 
-vi.mock("@/hooks/useConversations", () => ({
-  useConversations: vi.fn(),
-  useConnectedConversations: () => [],
-  useStopAndDeleteConversation: () => ({
-    mutate: vi.fn(),
-    reset: vi.fn(),
-    isPending: false,
-    isError: false,
-  }),
-  usePinnedConversations: () => ({
-    data: { conversations: [], filterHonored: true },
-    isSuccess: true,
-  }),
-  useTogglePinnedConversation: () => ({ mutate: vi.fn() }),
-  setConversationPinned: vi.fn(() => Promise.resolve({})),
-  PINNED_CONVERSATIONS_KEY: ["pinned-conversations"],
-  useRenameConversation: () => ({ mutate: vi.fn() }),
-  useLeaveSession: () => ({ mutate: vi.fn(), isPending: false }),
-  useArchiveConversation: () => ({ mutate: vi.fn() }),
-  useBulkArchiveConversations: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  useBulkDeleteConversations: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  useBulkMoveToProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  useBulkStopSessions: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  useStopSession: () => mocks.stop,
-  useProjects: () => ({ data: [] }),
-  useMoveToProject: () => ({ mutate: vi.fn() }),
-  useDeleteProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  useRenameProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  useCreateProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  useProjectConfig: () => ({ data: undefined, isLoading: false }),
-  useUpdateProjectConfig: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  fetchProjectSessionIds: () => Promise.resolve([]),
-  PROJECT_LABEL_KEY: "omni_project",
-}));
+vi.mock("@/hooks/useConversations", async () => {
+  const { conversationHooksMock } = await import("@/test/sidebarMockHelpers");
+  return {
+    ...conversationHooksMock(),
+    useStopSession: () => mocks.stop,
+  };
+});
 
 vi.mock("@/hooks/RunnerHealthProvider", async (importOriginal) => ({
   ...(await importOriginal<typeof RunnerHealthProviderModule>()),
@@ -72,7 +44,6 @@ vi.mock("@/components/PermissionsModal", () => ({ PermissionsModal: () => null }
 vi.mock("@/lib/serverOrigin", () => ({ isCurrentServerLocal: () => false }));
 
 import { type Conversation, useConversations } from "@/hooks/useConversations";
-import { Sidebar } from "./Sidebar";
 
 const useConvMock = vi.mocked(useConversations);
 
@@ -91,41 +62,8 @@ const HOST_SPAWNED: Conversation = {
 };
 
 function mockConversations(conversations: Conversation[]) {
-  const withData = {
-    data: {
-      pages: [
-        {
-          data: conversations,
-          first_id: conversations[0]?.id ?? null,
-          last_id: conversations.at(-1)?.id ?? null,
-          has_more: false,
-        },
-      ],
-      pageParams: [undefined],
-    },
-    isLoading: false,
-    isError: false,
-    error: null,
-    fetchNextPage: vi.fn(),
-    hasNextPage: false,
-    isFetchingNextPage: false,
-  } as unknown as ReturnType<typeof useConversations>;
+  const withData = conversationPage(conversations);
   useConvMock.mockImplementation(() => withData);
-}
-
-function renderSidebar() {
-  const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-  return render(
-    <QueryClientProvider client={qc}>
-      <SidebarDataProvider>
-        <TooltipProvider>
-          <MemoryRouter initialEntries={["/"]}>
-            <Sidebar open={true} onClose={vi.fn()} />
-          </MemoryRouter>
-        </TooltipProvider>
-      </SidebarDataProvider>
-    </QueryClientProvider>,
-  );
 }
 
 /** Open the row's action dropdown (Radix opens on pointerdown, not click). */

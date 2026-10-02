@@ -37,14 +37,12 @@ Usage::
 
 from __future__ import annotations
 
-import io
 import json
 import os
 import secrets
 import signal
 import subprocess
 import sys
-import tarfile
 import tempfile
 import time
 import uuid
@@ -56,6 +54,7 @@ import httpx
 import pytest
 import yaml
 
+from tests._helpers.session import bind_session_runner, bundle_files, post_session_bundle
 from tests.e2e.conftest import (
     configure_mock_llm,
     find_free_port,
@@ -291,12 +290,7 @@ def _build_mock_workspace_writer_bundle(mock_llm_base_url: str) -> bytes:
         "base_url": f"{mock_llm_base_url}/v1",
     }
     patched = yaml.dump(spec, sort_keys=False).encode()
-    buf = io.BytesIO()
-    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
-        info = tarfile.TarInfo(name="./workspace-file-writer.yaml")
-        info.size = len(patched)
-        tar.addfile(info, io.BytesIO(patched))
-    return buf.getvalue()
+    return bundle_files({"./workspace-file-writer.yaml": patched})
 
 
 def _create_session(
@@ -318,19 +312,11 @@ def _create_session(
     :returns: The new session id, e.g. ``"conv_abc123"``.
     """
     bundle = _build_mock_workspace_writer_bundle(mock_llm_server_url)
-    create_resp = client.post(
-        "/v1/sessions",
-        data={"metadata": json.dumps({})},
-        files={"bundle": ("agent.tar.gz", bundle, "application/gzip")},
-    )
+    create_resp = post_session_bundle(client.post, "/v1/sessions", bundle)
     create_resp.raise_for_status()
     session_id: str = create_resp.json()["session_id"]
 
-    bind_resp = client.patch(
-        f"/v1/sessions/{session_id}",
-        json={"runner_id": runner_id},
-    )
-    bind_resp.raise_for_status()
+    bind_session_runner(client.patch, "", session_id, runner_id)
     return session_id
 
 

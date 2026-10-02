@@ -840,34 +840,7 @@ function interruptActiveContext(ctx) {
   }
 }
 
-/**
- * Trigger Pi's own context compaction on the resident ExtensionContext.
- *
- * Pi owns its context window inside this TUI process, so explicit /compact
- * must run here (the Omnigent server's AP-side compaction would only
- * summarise the transcript mirror and desync the two). ctx.compact() is
- * fire-and-forget (returns void); Pi summarises older messages and appends a
- * CompactionEntry to the session. We bracket it with external_compaction_status
- * events the server republishes as response.compaction.* SSE, so the web UI's
- * "Compacting conversation…" spinner tracks Pi's real progress.
- *
- * The server raises the spinner on the in_progress SSE and dismisses it on
- * completed/failed, so a completed/failed that reaches the server before
- * in_progress strands the spinner. ctx.compact() may invoke its callbacks
- * synchronously, so in_progress is AWAITED before the call: the server then
- * holds the spinner-raising edge before any terminal edge can post.
- *
- * Async and self-contained: the poller discards the returned promise, so every
- * edge is published here, never by the caller. Three outcomes:
- *   - No resident compaction API (ctx missing or ctx.compact not a function):
- *     post a visible error item so a user's /compact does not silently vanish
- *     (the runner already returned 200, so the server runs no fallback), post
- *     no spinner edge, return false.
- *   - ctx.compact() threw synchronously: in_progress was already posted, so the
- *     catch posts failed to dismiss the spinner, return false.
- *   - Submitted: in_progress posted and awaited; completed/failed follows from
- *     Pi's onComplete/onError, return true.
- */
+/** Run Pi compaction through its callback API, publishing ordered progress events. */
 async function triggerCompaction(config, ctx, customInstructions) {
   if (!ctx || typeof ctx.compact !== "function") {
     await postEvent(config, {
@@ -887,29 +860,24 @@ async function triggerCompaction(config, ctx, customInstructions) {
     });
     return false;
   }
-  const options = {
-    onComplete: () => {
-      postEvent(config, {
-        type: "external_compaction_status",
-        data: { status: "completed" },
-      });
-    },
-    onError: (_error) => {
-      postEvent(config, {
-        type: "external_compaction_status",
-        data: { status: "failed" },
-      });
-    },
-  };
-  if (typeof customInstructions === "string" && customInstructions.trim()) {
-    options.customInstructions = customInstructions;
-  }
   try {
     await postEvent(config, {
       type: "external_compaction_status",
       data: { status: "in_progress" },
     });
-    ctx.compact(options);
+    await new Promise((resolve, reject) => {
+      ctx.compact({
+        onComplete: resolve,
+        onError: reject,
+        ...(typeof customInstructions === "string" && customInstructions.trim()
+          ? { customInstructions }
+          : {}),
+      });
+    });
+    await postEvent(config, {
+      type: "external_compaction_status",
+      data: { status: "completed" },
+    });
     return true;
   } catch (_err) {
     await postEvent(config, {
@@ -1117,6 +1085,21 @@ async function postModelOptions(config, ctx) {
   });
 }
 
+/**
+ * Tell the runner's terminal watcher that Pi now accepts input: the inbox
+ * poller is armed, so queued web messages will be delivered. The runner
+ * clears the marker before each launch and logs ``native_input_ready`` when
+ * it appears. Best-effort — readiness logging must never break the session.
+ */
+function markInputReady(config) {
+  if (!config || !config.bridgeDir) return;
+  try {
+    fs.writeFileSync(path.join(config.bridgeDir, "input_ready"), "");
+  } catch (_err) {
+    // Diagnostics only.
+  }
+}
+
 function startInboxPoller(
   pi,
   config,
@@ -1125,6 +1108,7 @@ function startInboxPoller(
   handleModelChange,
   handleThinkingLevelChange,
   isTurnActive,
+  isCompacting,
 ) {
   if (!config || !config.inboxDir || pi.__omnigentInboxPoller) return;
   // Bound the dedup set (FIFO eviction) — delivered files are unlinked, so a
@@ -1164,6 +1148,14 @@ function startInboxPoller(
         try {
           fs.unlinkSync(fullPath);
         } catch (_err) {}
+        continue;
+      }
+      // Pi's extension API cannot accept prompts during manual compaction.
+      // Leave them on disk, in order, until its completion callback fires.
+      if (
+        (payload.type === "user_message" || payload.type === "compact") &&
+        isCompacting()
+      ) {
         continue;
       }
       if (
@@ -1291,12 +1283,7 @@ module.exports = function (pi) {
   let turnOrdinal = 0;
   let activeResponseId = null;
   // Response id shared across a turn's ``running`` → ``idle`` status pair.
-  // The web store only clears its local "streaming" flag when an ``idle``
-  // edge's response_id matches the ``running`` edge that opened the turn; a
-  // fresh id per edge would leave the composer stuck in "queued" until a tab
-  // switch resets the store. Minted on agent_start, reused on agent_end.
-  // Must be separate from activeResponseId — turn_start overwrites that with a
-  // turn-level id between agent_start and agent_end.
+  // Kept separate from activeResponseId, which turn_start overwrites.
   let turnStatusResponseId = null;
   // Dedicated loop-state flag, set on agent_start / cleared on agent_end. Used
   // as the no-isIdle() fallback for requestInterrupt instead of
@@ -1305,6 +1292,7 @@ module.exports = function (pi) {
   // agent_start, before turn_start) would look idle by activeResponseId yet the
   // loop is genuinely running — agentRunning arms it correctly. See F18.
   let agentRunning = false;
+  let compacting = false;
   let latestContext = null;
   let pendingInterruptUntil = 0;
   const postedToolCalls = new Set();
@@ -1864,8 +1852,25 @@ module.exports = function (pi) {
       pi,
       config,
       () => requestInterrupt(latestContext),
-      (customInstructions) =>
-        triggerCompaction(config, latestContext, customInstructions),
+      async (customInstructions) => {
+        const responseId = turnStatusResponseId ?? newResponseId("compact");
+        compacting = true;
+        try {
+          await postEvent(config, {
+            type: "external_session_status",
+            data: { status: "running", response_id: responseId },
+          });
+          await triggerCompaction(config, latestContext, customInstructions);
+        } finally {
+          if (!agentRunning) {
+            await postEvent(config, {
+              type: "external_session_status",
+              data: { status: "idle", response_id: responseId },
+            });
+          }
+          compacting = false;
+        }
+      },
       (model) => applyModelChange(pi, config, latestContext, model),
       (level) => pi.setThinkingLevel(level),
       () => {
@@ -1875,7 +1880,9 @@ module.exports = function (pi) {
         const idle = safeIsIdle(latestContext);
         return idle === null ? agentRunning : !idle;
       },
+      () => compacting,
     );
+    markInputReady(config);
     const nativeSessionId =
       ctx && ctx.sessionManager && ctx.sessionManager.getSessionId
         ? ctx.sessionManager.getSessionId()
@@ -1946,10 +1953,7 @@ module.exports = function (pi) {
     streamedTextIndex.clear();
     finalizedTextBlocks.clear();
     streamingMessageOrdinal = 0;
-    // Pin the response_id for this agent loop. agent_end MUST emit the same id
-    // so the web client can match the idle edge to the running edge and clear
-    // the "streaming" status — which unblocks queued follow-up messages.
-    // Use a dedicated variable: activeResponseId is overwritten by turn_start.
+    // Pin the status response_id for this agent loop through agent_end.
     turnStatusResponseId = `pi-${Date.now()}-${++sequence}`;
     await postEvent(config, {
       type: "external_session_status",
@@ -1983,6 +1987,8 @@ module.exports = function (pi) {
     const endResponseId =
       turnStatusResponseId ?? `pi-${Date.now()}-${++sequence}`;
     turnStatusResponseId = null;
+    // Manual compact aborts the turn first; its own completion publishes idle.
+    if (compacting) return;
     await postEvent(config, {
       type: "external_session_status",
       data: { status: "idle", response_id: endResponseId },

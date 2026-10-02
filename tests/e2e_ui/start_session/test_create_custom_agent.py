@@ -16,35 +16,17 @@ from __future__ import annotations
 import asyncio
 import json
 import re
-import threading
-from collections.abc import Coroutine
 from typing import Any
 
 from playwright.async_api import Route, async_playwright, expect
 
+from tests._helpers.async_thread import run_in_fresh_loop as _run_in_fresh_loop
 from tests.e2e_ui.start_session.helpers import stub_empty_host_picker_data
 
 # Stubbed host the composer auto-selects.
 _HOST_ID = "host_e2e"
 # Bare create endpoint — intercepts POST but lets GET through.
 _SESSIONS_RE = re.compile(r"/v1/sessions(\?.*)?$")
-
-
-def _run_in_fresh_loop(coro: Coroutine[Any, Any, None]) -> None:
-    """Run *coro* in a dedicated thread with its own event loop."""
-    captured: dict[str, Exception] = {}
-
-    def _worker() -> None:
-        try:
-            asyncio.run(coro)
-        except Exception as exc:
-            captured["error"] = exc
-
-    thread = threading.Thread(target=_worker)
-    thread.start()
-    thread.join()
-    if "error" in captured:
-        raise captured["error"]
 
 
 async def _wait_until(predicate, *, timeout_s: float = 15.0) -> None:

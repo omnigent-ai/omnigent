@@ -11,6 +11,7 @@ import httpx
 
 from omnigent.debug_logging import debug_event, runner_log_scope
 from omnigent.entities import Conversation
+from omnigent.errors import ErrorCategory
 from omnigent.runner.session_init_protocol import build_runner_session_init_payload
 
 if TYPE_CHECKING:
@@ -85,16 +86,17 @@ class RunnerSessionInitializer:
         )
         task = self._tasks.get(key)
         if task is None:
+            recovery_id = (
+                self._recovery_ids.setdefault(key, uuid4().hex)
+                if resume_interrupted_turn
+                else None
+            )
             payload = build_runner_session_init_payload(
                 conversation,
                 server_version=self._server_version,
                 suppress_recovery_turn=suppress_recovery_turn,
                 resume_interrupted_turn=resume_interrupted_turn,
-                recovery_id=(
-                    self._recovery_ids.setdefault(key, uuid4().hex)
-                    if resume_interrupted_turn
-                    else None
-                ),
+                recovery_id=recovery_id,
             )
 
             async def post_session_init() -> httpx.Response:
@@ -123,6 +125,9 @@ class RunnerSessionInitializer:
                     runner_id=runner_id,
                     payload=payload,
                     timeout=timeout,
+                    resume_interrupted_turn=resume_interrupted_turn,
+                    suppress_recovery_turn=suppress_recovery_turn,
+                    recovery_id=recovery_id,
                 )
 
             task = asyncio.create_task(
@@ -178,11 +183,22 @@ class RunnerSessionInitializer:
         runner_id: str,
         payload: dict[str, object],
         timeout: float,
+        resume_interrupted_turn: bool,
+        suppress_recovery_turn: bool,
+        recovery_id: str | None,
     ) -> httpx.Response:
         with runner_log_scope(session_id, runner_id):
+            # The flags name the caller: neither set is the tunnel-reconnect
+            # hook, resume is a sub-agent restore, suppress is a message forward.
             _logger.info(
                 "Initializing runner session",
-                extra=debug_event("runner_session_init_started", stage="session_init"),
+                extra=debug_event(
+                    "runner_session_init_started",
+                    stage="session_init",
+                    resume_interrupted_turn=resume_interrupted_turn,
+                    suppress_recovery_turn=suppress_recovery_turn,
+                    recovery_id=recovery_id,
+                ),
             )
             try:
                 response = await runner_client.post(
@@ -190,10 +206,21 @@ class RunnerSessionInitializer:
                     json=payload,
                     timeout=timeout,
                 )
-            except Exception:
+            except Exception as exc:
                 _logger.exception(
                     "Runner session initialization failed",
-                    extra=debug_event("runner_session_init_failed", stage="session_init"),
+                    extra=debug_event(
+                        "runner_session_init_failed",
+                        stage="session_init",
+                        # The request rides the runner's tunnel: a closed tunnel
+                        # (ConnectionError) or offline runner (httpx.ConnectError)
+                        # is the runner going away, not an upstream.
+                        error_category=(
+                            ErrorCategory.RUNNER.value
+                            if isinstance(exc, (ConnectionError, httpx.TransportError))
+                            else None
+                        ),
+                    ),
                 )
                 raise
             failed = not 200 <= response.status_code < 300

@@ -150,6 +150,38 @@ def test_deregister_poisons_outbound_queue() -> None:
     assert conn.outbound_queue.get_nowait() is None
 
 
+def test_deregister_fails_pending_import_streams() -> None:
+    """Deregistering fails in-flight import streams instead of leaving them to
+    wait out their 60s per-frame timeout on a tunnel that can never answer."""
+    registry = HostRegistry()
+    conn = registry.register("host_imp", FakeWebSocket(), _make_hello(), owner="bob")
+    queue: asyncio.Queue[tuple[str, dict[str, object]]] = asyncio.Queue()
+    conn.pending_import_local["req_1"] = queue
+
+    assert registry.deregister("host_imp") is True
+
+    kind, data = queue.get_nowait()
+    assert kind == "done"
+    assert data["status"] == "failed"
+    assert "disconnected mid-import" in str(data["error"])
+    assert conn.pending_import_local == {}
+
+
+def test_register_replacement_fails_stale_pending_import_streams() -> None:
+    """A reconnect fails the replaced connection's import streams: the new
+    tunnel has no context for them, so no frame will ever land on their queues."""
+    registry = HostRegistry()
+    old = registry.register("host_imp2", FakeWebSocket(), _make_hello(), owner="bob")
+    queue: asyncio.Queue[tuple[str, dict[str, object]]] = asyncio.Queue()
+    old.pending_import_local["req_1"] = queue
+
+    registry.register("host_imp2", FakeWebSocket(), _make_hello(), owner="bob")
+
+    kind, data = queue.get_nowait()
+    assert kind == "done"
+    assert data["status"] == "failed"
+
+
 def test_deregister_returns_false_for_unknown() -> None:
     """
     Verify that deregister reports whether it removed an entry.

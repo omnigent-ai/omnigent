@@ -16,8 +16,8 @@ before sending:
 1. **Permission mode** — native permission/approval choices, in the
    hand dropdown. A non-default pick rides along as
    ``terminal_launch_args``.
-2. **Working directory** — the file-browser popover behind the working-
-   directory chip. Browsing into a folder sets the session's
+2. **Working directory** — the full-screen file-browser dialog behind the
+   working-directory chip. Confirming a browsed folder sets the session's
    ``workspace``.
 3. **Git worktree** — the branch chip's popover. Naming a branch attaches
    a ``git`` worktree spec to the create.
@@ -48,13 +48,12 @@ from __future__ import annotations
 import asyncio
 import json
 import re
-import threading
-from collections.abc import Coroutine
 from typing import Any
 
 import pytest
 from playwright.async_api import Request, Route, async_playwright, expect
 
+from tests._helpers.async_thread import run_in_fresh_loop as _run_in_fresh_loop
 from tests.e2e_ui.start_session.helpers import (
     commit_landing_workspace_picker,
     open_landing_workspace_picker,
@@ -77,33 +76,6 @@ _FILESYSTEM_RE = re.compile(r"/v1/hosts/[^/]+/filesystem")
 # The worktree-list endpoint the branch combobox queries for the picked repo.
 # Distinct ``/worktrees`` segment, so it never collides with ``/filesystem``.
 _WORKTREES_RE = re.compile(r"/v1/hosts/[^/]+/worktrees")
-
-
-def _run_in_fresh_loop(coro: Coroutine[Any, Any, None]) -> None:
-    """Run *coro* to completion in a dedicated thread with its own event loop.
-
-    The e2e_ui suite runs many pytest-playwright **sync** tests in the same
-    session; once one has run, pytest-asyncio can't start a loop on the main
-    thread. Running the coroutine from a fresh thread via :func:`asyncio.run`
-    sidesteps that. Any exception (including assertion failures) is captured
-    and re-raised on the calling thread so the test fails normally.
-
-    :param coro: The coroutine to run to completion.
-    :raises Exception: Whatever the coroutine raised, re-raised here.
-    """
-    captured: dict[str, Exception] = {}
-
-    def _worker() -> None:
-        try:
-            asyncio.run(coro)
-        except Exception as exc:
-            captured["error"] = exc
-
-    thread = threading.Thread(target=_worker)
-    thread.start()
-    thread.join()
-    if "error" in captured:
-        raise captured["error"]
 
 
 async def _wait_until(predicate, *, timeout_s: float = 15.0) -> None:
@@ -3061,11 +3033,21 @@ async def _drive_folder_selection(base_url: str, session_id: str) -> None:
                 "e2e"
             )
 
-            # Open the file browser and navigate into the "projects" folder.
+            # Every entry point uses the same viewport-safe full-screen browser.
             await open_landing_workspace_picker(page)
+            picker_dialog = page.get_by_test_id("workspace-picker-dialog")
+            await expect(picker_dialog).to_be_visible()
+            picker = page.get_by_test_id("workspace-picker")
+            await expect(picker).to_have_css("width", "800px")
+            await expect(picker).to_have_css("height", "600px")
+
+            # Navigate into "projects"; the landing chip remains unchanged
+            # until the explicit Confirm action commits the provisional path.
             await page.get_by_test_id("workspace-picker-entry-projects").click()
-            # The child listing confirms we navigated in.
             await expect(page.get_by_test_id("workspace-picker-entry-src")).to_be_visible()
+            await expect(page.get_by_test_id("new-chat-landing-workspace-chip")).to_contain_text(
+                "e2e"
+            )
             await commit_landing_workspace_picker(page)
 
             # The explicit Select action commits the navigated folder.
@@ -3440,9 +3422,7 @@ async def _drive_add_worktree(base_url: str, session_id: str) -> None:
             await page.get_by_test_id("new-chat-landing-input").wait_for(
                 state="visible", timeout=30_000
             )
-            await expect(page.get_by_test_id("new-chat-landing-branch-chip")).to_have_text(
-                "Choose"
-            )
+            await expect(page.get_by_test_id("new-chat-landing-branch-chip")).to_have_text("None")
 
             # Open the worktree chip and name a branch + base branch.
             await page.get_by_test_id("new-chat-landing-branch-chip").click()
@@ -3548,7 +3528,7 @@ async def _drive_select_existing_worktree(base_url: str, session_id: str) -> Non
                 0
             )
             await expect(page.get_by_test_id("new-chat-landing-branch-chip")).to_contain_text(
-                "feature/x"
+                "feature-x"
             )
 
             # Reopening keeps the existing row selected while reserving New

@@ -316,6 +316,12 @@ class BwrapSandboxBackend(SandboxBackend):
                 "Configure os_env.sandbox.type='none' on other OSes."
             )
         if shutil.which("bwrap") is None:
+            if any(grant.copy_on_write for grant in sandbox_spec.write_path_specs):
+                from omnigent.sandbox.copy_on_write import copy_on_write_startup_error
+
+                raise copy_on_write_startup_error(
+                    "bwrap was not found on PATH; install Bubblewrap 0.11+"
+                )
             raise OSError(
                 "linux_bwrap sandbox requires the 'bwrap' binary on PATH. "
                 "Install bubblewrap (e.g. `apt install bubblewrap` or "
@@ -331,14 +337,26 @@ class BwrapSandboxBackend(SandboxBackend):
         # Empty default honors the "no surprise writes" contract from
         # the design plan — agents that need an editable project tree
         # opt in via ``write_paths: ["."]``.
-        write_paths_config = (
-            sandbox_spec.write_paths if sandbox_spec.write_paths is not None else []
-        )
-        write_roots = [_resolve_root(cwd, root) for root in write_paths_config]
-
-        write_files: list[Path] = []
-        if sandbox_spec.write_files is not None:
-            write_files.extend(_resolve_root(cwd, path) for path in sandbox_spec.write_files)
+        write_grants = [
+            (_resolve_root(cwd, grant.path), grant.copy_on_write)
+            for grant in sandbox_spec.write_path_specs
+        ]
+        write_roots = [path for path, _ in write_grants]
+        write_files = [_resolve_root(cwd, path) for path in sandbox_spec.write_files or []]
+        copy_on_write_roots = sorted({path for path, disposable in write_grants if disposable})
+        for root in copy_on_write_roots:
+            if not root.is_dir():
+                raise ValueError(f"copy_on_write requires an existing directory: {root}")
+            for other, disposable in write_grants:
+                if not disposable and (other == root or root in other.parents):
+                    raise ValueError(
+                        f"Persistent write path {other} overlaps copy_on_write path {root}"
+                    )
+            if any(other != root and other in root.parents for other in copy_on_write_roots):
+                raise ValueError("Nested copy_on_write paths are not supported")
+            for file in write_files:
+                if file == root or root in file.parents:
+                    raise ValueError("write_files cannot override a copy_on_write path")
 
         cwd_allow_hidden = (
             list(sandbox_spec.cwd_allow_hidden)
@@ -353,6 +371,7 @@ class BwrapSandboxBackend(SandboxBackend):
         )
 
         return SandboxPolicy(
+            copy_on_write_roots=copy_on_write_roots or None,
             backend_type=self.type_name,
             active=True,
             read_roots=read_roots,
@@ -640,6 +659,10 @@ class BwrapSandboxBackend(SandboxBackend):
                 ):
                     raise ValueError("credential source must stay outside sandbox-visible mounts")
         bwrap_args.extend(argv)
+        if policy.copy_on_write_roots:
+            from omnigent.sandbox.copy_on_write import wrap_shared_namespace
+
+            return wrap_shared_namespace(bwrap_args, policy)
         return bwrap_args
 
     def activate(self, policy: SandboxPolicy) -> None:

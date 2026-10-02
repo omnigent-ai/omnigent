@@ -56,13 +56,7 @@ import {
   TriangleAlertIcon,
   XIcon,
 } from "lucide-react";
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogHeader,
-  DialogTitle,
-} from "@/components/ui/dialog";
+import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -91,6 +85,7 @@ import {
   DropdownMenuSubTrigger,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
+import { MenuItem } from "@/components/ui/menu-item";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import { authenticatedFetch, getCurrentUserId, resolveIdentity } from "@/lib/identity";
 import { backgroundSessionTitlesRequestHeaders } from "@/lib/backgroundSessionTitlesPreferences";
@@ -118,6 +113,7 @@ import {
   harnessWarningBadgeText,
   isCodexHarness,
   isNativeCursorHarness,
+  skillInvocationPrefix,
 } from "@/lib/harnessSetup";
 
 // Re-exported for tests that import the readiness helpers from this module.
@@ -138,12 +134,14 @@ import { useIsCoarsePointer } from "@/hooks/useIsCoarsePointer";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useModelPickerHotkey } from "@/hooks/useModelPickerHotkey";
 import { CliCommandBlock, renderTextWithInlineCode } from "./CliCommandBlock";
-import { WorkspacePicker, isNavigablePath } from "./WorkspacePicker";
+import { isHostAbsolutePath, isNavigablePath } from "./WorkspacePicker";
+import { WorkspacePickerDialog } from "./WorkspacePickerDialog";
 import { RecentWorkspaceList } from "./RecentWorkspaceList";
 import {
   WORKTREE_RADIO_SELECTOR_INPUT_CLASS,
   WORKTREE_RADIO_SELECTOR_ROW_CLASS,
   WorktreeRadioRow,
+  worktreeDisplayName,
 } from "./WorktreeRadioRow";
 import {
   initialPrefillState,
@@ -244,6 +242,7 @@ import {
 import { fetchHosts, useHostModelOptions, useHosts, type Host } from "@/hooks/useHosts";
 import { sandboxModelOptionsKey, useSandboxModelOptions } from "@/hooks/useSandboxModelOptions";
 import { useSkills } from "@/hooks/useSkills";
+import { useOnboardingRunnerHost } from "@/hooks/useOnboardingRunnerHost";
 import { readArcaHostId, writeArcaHostId } from "@/lib/arcaHost";
 import {
   connectArcaHost,
@@ -535,21 +534,11 @@ export function ConnectHostInstructions({
 }
 
 /**
- * Return true when ``workspace`` is acceptable to send to the backend.
- *
- * Per designs/SESSION_WORKSPACE_SELECTION.md: only fully-absolute
- * paths (starting with ``/``) are accepted. Tilde-prefixed and
- * relative paths are rejected because the server never expands ``~``
- * — that's the host's job, and the workspace request body must be
- * an unambiguous absolute path. Empty / whitespace-only input is
- * also rejected so the submit button is disabled until the user
- * has typed something usable.
- *
- * @param workspace Value the user typed in the workspace input.
- * @returns true when ``workspace.trim()`` starts with ``/``.
+ * Match session-create validation: accept absolute POSIX or drive-letter paths.
+ * The host must expand tilde and relative paths before submission.
  */
 export function isValidWorkspace(workspace: string): boolean {
-  return workspace.trim().startsWith("/");
+  return isHostAbsolutePath(workspace.trim());
 }
 
 /**
@@ -639,7 +628,7 @@ export function composerWorktreeHeaderState({
   if (!worktreesResolved) {
     return {
       repositoryLabel: selectedDirectoryLabel,
-      branchLabel: "Worktree",
+      branchLabel: "None",
       branchDescription: "Worktree status loading",
     };
   }
@@ -648,13 +637,13 @@ export function composerWorktreeHeaderState({
     if (selectedWorktree.detached || selectedWorktree.branch === null) {
       return {
         repositoryLabel,
-        branchLabel: "Detached HEAD",
+        branchLabel: worktreeDisplayName(selectedWorktree.path),
         branchDescription: `Existing detached worktree: ${selectedWorktree.path}`,
       };
     }
     return {
       repositoryLabel,
-      branchLabel: selectedWorktree.branch,
+      branchLabel: worktreeDisplayName(selectedWorktree.path),
       branchDescription: `Existing worktree branch: ${selectedWorktree.branch}`,
     };
   }
@@ -665,14 +654,14 @@ export function composerWorktreeHeaderState({
       : `main repository${selectedWorktree.branch ? ` branch: ${selectedWorktree.branch}` : ""}`;
     return {
       repositoryLabel,
-      branchLabel: "Choose",
+      branchLabel: "None",
       branchDescription: `Create or select a worktree from ${mainState}`,
     };
   }
 
   return {
     repositoryLabel,
-    branchLabel: "Worktree",
+    branchLabel: "None",
     branchDescription: "Create or select a worktree",
   };
 }
@@ -2388,6 +2377,10 @@ export function NewChatLandingScreen() {
   // Desktop-shell host status for THIS machine (null outside Electron), so the
   // picker can tag the current machine and offer to auto-connect it.
   const [desktopHost, setDesktopHost] = useState<HostIdentity | null>(null);
+  // The runner picked during desktop onboarding, preselected once it's online.
+  const onboardingHost = useOnboardingRunnerHost(hosts);
+  // Applied (or given up) once, after the first prefill; later resets use the usual defaults.
+  const onboardingHostSettled = useRef(false);
   const [connectingThisMachine, setConnectingThisMachine] = useState(false);
   // Error surfaced when "Run on this machine" fails (sign-in needed, enrollment
   // declined, server unreachable). Rendered in the composer body with a retry,
@@ -2784,6 +2777,15 @@ export function NewChatLandingScreen() {
   // overridden. Holds off while a project prefill is deciding.
   useEffect(() => {
     if (!prefillSettled) return;
+    if (!onboardingHostSettled.current) {
+      if (onboardingHost.pending) return;
+      onboardingHostSettled.current = true;
+      if (onboardingHost.hostId && !sandboxSelected && selectedHostId === null) {
+        writeLastHostChoice(onboardingHost.hostId);
+        setSelectedHostId(onboardingHost.hostId);
+        return;
+      }
+    }
     if (sandboxSelected) return;
     if (selectedHostId !== null) return;
 
@@ -2833,6 +2835,8 @@ export function NewChatLandingScreen() {
     info,
     prefillSettled,
     defaultSandboxProvider,
+    onboardingHost.pending,
+    onboardingHost.hostId,
   ]);
 
   // Fall back to the host's home directory when it has no recorded recents, so
@@ -3197,6 +3201,7 @@ export function NewChatLandingScreen() {
             id: option.id,
             model: option.model,
             displayName: nativeModelLabel(option),
+            isDefault: option.isDefault,
             source: option.source,
           })),
     [availablePiModels, sandboxSelected, sandboxCatalog],
@@ -3292,7 +3297,7 @@ export function NewChatLandingScreen() {
     if (supportsModelPicker && !supportsPermissionMode) {
       const modelValue =
         piModelOptions.find((model) => model.id === pickedModel)?.displayName ??
-        (sandboxInferenceConfigured ? defaultModelLabel(piModelOptions) : "Default");
+        defaultModelLabel(piModelOptions);
       const thinkingLevelValue = normalizeEffortLabel(pickedEffort);
       return [
         { label: "Model", value: modelValue },
@@ -4604,7 +4609,7 @@ export function NewChatLandingScreen() {
 
   // Pre-session suggestions contain skills; built-ins such as /model need a live session.
   const [inputFocused, setInputFocused] = useState(false);
-  const skillPrefix = skillsHarness === "codex-native" ? "$" : "/";
+  const skillPrefix = skillInvocationPrefix(skillsHarness);
   const skillCommands = useMemo(
     () =>
       Object.fromEntries(
@@ -4612,15 +4617,15 @@ export function NewChatLandingScreen() {
       ),
     [availableSkills, skillPrefix],
   );
-  // Selecting a skill fills "/name " and leaves the caret ready for the
-  // argument — skills never auto-execute from the menu.
+  // Insert the selected skill at the caret while preserving surrounding text.
   function applySlashSelection(cmd: string) {
-    setMessage(cmd + " ");
-    textareaRef.current?.focus();
+    setMessage(slashCompletion.complete(cmd).text);
   }
   const slashCompletion = useSlashCompletion({
     text: message,
     commands: skillCommands,
+    skills: skillCommands,
+    textareaRef,
     prefix: skillPrefix,
     status: skillsStatus,
     mobile: isMobileViewport,
@@ -5779,9 +5784,11 @@ export function NewChatLandingScreen() {
           : `Working directory: ${visibleWorkspace || "Not selected"}`
       }
       title={
-        noExecutionTargetSelected
-          ? "No host selected"
-          : visibleWorkspace || "Working directory not selected"
+        workspacePopoverOpen
+          ? undefined
+          : noExecutionTargetSelected
+            ? "No host selected"
+            : visibleWorkspace || "Working directory not selected"
       }
       disabled={noExecutionTargetSelected || workspaceLoading}
       aria-busy={workspaceLoading || undefined}
@@ -6086,24 +6093,26 @@ export function NewChatLandingScreen() {
                       <div className="my-1 h-px bg-border" />
                     </>
                   )}
-                  <button
-                    type="button"
-                    className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-sm hover:bg-muted"
-                    onClick={() => {
-                      setWorkspacePopoverOpen(false);
-                      setWorkspacePickerInitialPath(
-                        isNavigablePath(workspaceTrimmed) ? workspaceTrimmed : undefined,
-                      );
-                      setWorkspacePickerOpen(true);
-                    }}
-                    data-testid="new-chat-landing-workspace-open-folder"
-                  >
-                    <FolderOpenIcon
-                      className="size-4 shrink-0 text-muted-foreground"
-                      data-testid="new-chat-landing-workspace-open-folder-icon"
-                    />
-                    Open folder
-                  </button>
+                  <MenuItem asChild density="compact">
+                    <button
+                      type="button"
+                      className="w-full text-left"
+                      onClick={() => {
+                        setWorkspacePopoverOpen(false);
+                        setWorkspacePickerInitialPath(
+                          isNavigablePath(workspaceTrimmed) ? workspaceTrimmed : undefined,
+                        );
+                        setWorkspacePickerOpen(true);
+                      }}
+                      data-testid="new-chat-landing-workspace-open-folder"
+                    >
+                      <FolderOpenIcon
+                        className="size-4 shrink-0 text-muted-foreground"
+                        data-testid="new-chat-landing-workspace-open-folder-icon"
+                      />
+                      Open folder
+                    </button>
+                  </MenuItem>
                 </PopoverContent>
               </Popover>
               {/* Worktree selection stays a separate real action from the directory picker. */}
@@ -6124,11 +6133,13 @@ export function NewChatLandingScreen() {
                             : visibleWorktreeHeader.branchDescription
                         }
                         title={
-                          noExecutionTargetSelected
-                            ? "No host selected"
-                            : workspaceLoading || worktreeControlAvailable
-                              ? visibleWorktreeHeader.branchDescription
-                              : "Choose a Git working directory to use worktrees"
+                          worktreePopoverOpen
+                            ? undefined
+                            : noExecutionTargetSelected
+                              ? "No host selected"
+                              : workspaceLoading || worktreeControlAvailable
+                                ? visibleWorktreeHeader.branchDescription
+                                : "Choose a Git working directory to use worktrees"
                         }
                         disabled={
                           noExecutionTargetSelected || workspaceLoading || !worktreeControlAvailable
@@ -6149,34 +6160,36 @@ export function NewChatLandingScreen() {
                           role="radiogroup"
                           aria-label="Choose a worktree"
                         >
-                          <label
-                            className={cn(
-                              "flex cursor-pointer items-center gap-2 transition-colors hover:bg-muted focus-within:bg-muted",
-                              WORKTREE_RADIO_SELECTOR_ROW_CLASS,
-                              branchName.trim() === "" && activeWorktree === null && "bg-muted",
-                            )}
-                            data-testid="new-chat-landing-no-worktree-option"
+                          <MenuItem
+                            asChild
+                            active={branchName.trim() === "" && activeWorktree === null}
+                            density="compact"
                           >
-                            <input
-                              type="radio"
-                              name="new-chat-existing-worktree"
-                              checked={branchName.trim() === "" && activeWorktree === null}
-                              onChange={() => {
-                                workspaceFromConfigRef.current = false;
-                                if (activeWorktree !== null && mainWorktree !== null) {
-                                  setWorkspace(mainWorktree.path);
-                                }
-                                setBranchName("");
-                                setAutoSeededBranch("");
-                                setWorktreePopoverOpen(false);
-                              }}
-                              className={cn(
-                                "size-4 shrink-0 accent-primary",
-                                WORKTREE_RADIO_SELECTOR_INPUT_CLASS,
-                              )}
-                            />
-                            <span className="font-medium text-foreground">No worktree</span>
-                          </label>
+                            <label
+                              className={cn("cursor-pointer", WORKTREE_RADIO_SELECTOR_ROW_CLASS)}
+                              data-testid="new-chat-landing-no-worktree-option"
+                            >
+                              <input
+                                type="radio"
+                                name="new-chat-existing-worktree"
+                                checked={branchName.trim() === "" && activeWorktree === null}
+                                onChange={() => {
+                                  workspaceFromConfigRef.current = false;
+                                  if (activeWorktree !== null && mainWorktree !== null) {
+                                    setWorkspace(mainWorktree.path);
+                                  }
+                                  setBranchName("");
+                                  setAutoSeededBranch("");
+                                  setWorktreePopoverOpen(false);
+                                }}
+                                className={cn(
+                                  "size-4 shrink-0 accent-primary",
+                                  WORKTREE_RADIO_SELECTOR_INPUT_CLASS,
+                                )}
+                              />
+                              <span className="font-normal text-foreground">No worktree</span>
+                            </label>
+                          </MenuItem>
                           {linkedWorktrees.length > 0 && (
                             <>
                               <div className="my-1 h-px shrink-0 bg-border" />
@@ -6185,13 +6198,13 @@ export function NewChatLandingScreen() {
                                 data-testid="new-chat-landing-worktree-section"
                               >
                                 <span
-                                  className="shrink-0 px-2 py-1 text-sm leading-5 text-muted-foreground"
+                                  className="shrink-0 px-2 py-1 text-xs font-medium leading-4 text-muted-foreground"
                                   data-testid="new-chat-landing-worktree-heading"
                                 >
                                   Worktrees
                                 </span>
                                 <div
-                                  className="flex min-h-0 max-h-80 flex-1 flex-col overflow-y-auto [scrollbar-width:thin] [&::-webkit-scrollbar]:w-2 [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-thumb]:bg-border [&::-webkit-scrollbar-track]:bg-transparent"
+                                  className="flex min-h-0 max-h-80 flex-1 flex-col gap-px overflow-y-auto [scrollbar-width:thin] [&::-webkit-scrollbar]:w-2 [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-thumb]:bg-border [&::-webkit-scrollbar-track]:bg-transparent"
                                   data-testid="new-chat-landing-worktree-dropdown"
                                 >
                                   <TooltipProvider>
@@ -6298,7 +6311,9 @@ export function NewChatLandingScreen() {
               input={{
                 ref: textareaRef,
                 value: message,
+                onSelect: (e) => slashCompletion.onSelectionChange(e.currentTarget),
                 onChange: (e) => {
+                  slashCompletion.onSelectionChange(e.target);
                   setMessage(e.target.value);
                   // A rejected attachment is never added, so there's no chip to
                   // remove and nothing else would ever clear this. Left sticky it
@@ -6361,7 +6376,8 @@ export function NewChatLandingScreen() {
                         query={slashCompletion.query}
                         activeIndex={slashCompletion.index}
                         onSelect={applySlashSelection}
-                        commands={skillCommands}
+                        commands={slashCompletion.commands}
+                        builtinNames={slashCompletion.builtinNames}
                         skillsStatus={skillsStatus}
                         skillsUnavailableMessage={skillsUnavailableMessage}
                         onRetrySkills={() => void refreshSkills()}
@@ -6584,7 +6600,7 @@ export function NewChatLandingScreen() {
                         )}
                         {hasCloudOptions && <DropdownMenuSeparator />}
                         <div className="px-2 py-1 text-xs leading-[18px] text-muted-foreground/75">
-                          Local
+                          My machines
                         </div>
                         {allHosts.length === 0 && !showConnectThisMachine && (
                           <div className="px-2 py-1.5 text-sm text-muted-foreground">
@@ -6785,34 +6801,24 @@ export function NewChatLandingScreen() {
               }}
             />
           </form>
-          <Dialog open={workspacePickerOpen} onOpenChange={setWorkspacePickerOpen}>
-            <DialogContent
-              showCloseButton={false}
-              className="max-w-[min(64rem,calc(100vw-2rem))] border-0 bg-transparent p-0 shadow-none sm:max-w-[min(64rem,calc(100vw-2rem))]"
-            >
-              <DialogHeader className="sr-only">
-                <DialogTitle>Select working directory</DialogTitle>
-                <DialogDescription>Choose a folder for the new session.</DialogDescription>
-              </DialogHeader>
-              <WorkspacePicker
-                hostId={selectedHostId}
-                initialPath={workspacePickerInitialPath}
-                onSelect={(path) => {
-                  workspaceFromConfigRef.current = false;
-                  setWorkspace(path);
-                  addRecent(path);
-                  setWorkspacePickerOpen(false);
-                }}
-                onClose={() => setWorkspacePickerOpen(false)}
-                occupancyForPath={
-                  !shouldCreateWorktree
-                    ? (absolutePath) =>
-                        occupancyByDir.get(normalizeWorkspacePath(absolutePath) ?? "") ?? 0
-                    : undefined
-                }
-              />
-            </DialogContent>
-          </Dialog>
+          <WorkspacePickerDialog
+            open={workspacePickerOpen}
+            onOpenChange={setWorkspacePickerOpen}
+            hostId={selectedHostId}
+            initialPath={workspacePickerInitialPath}
+            description="Choose a folder for the new session."
+            onConfirm={(path) => {
+              workspaceFromConfigRef.current = false;
+              setWorkspace(path);
+              addRecent(path);
+            }}
+            occupancyForPath={
+              !shouldCreateWorktree
+                ? (absolutePath) =>
+                    occupancyByDir.get(normalizeWorkspacePath(absolutePath) ?? "") ?? 0
+                : undefined
+            }
+          />
         </div>
         <div className="mt-1 flex w-full flex-col gap-1" data-testid="new-chat-landing-notices">
           {supportsAgySkipPermissions &&

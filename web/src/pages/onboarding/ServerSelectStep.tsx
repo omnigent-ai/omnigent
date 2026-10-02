@@ -6,6 +6,7 @@
 import { type ComponentType, type ReactNode, useEffect, useState } from "react";
 import {
   ArrowLeft,
+  ArrowRight,
   ChevronDown,
   Cloudy,
   Copy,
@@ -28,8 +29,17 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { Input } from "@/components/ui/input";
-import type { ConnectResult, ServerCheckResult } from "@/pages/onboarding/ServerSelectorV2";
-import { installActionLabel, OnboardingHeading } from "@/pages/onboarding/primitives";
+import type {
+  ConnectProgress,
+  ConnectResult,
+  ServerCheckResult,
+} from "@/pages/onboarding/ServerSelectorV2";
+import {
+  ConnectStatus,
+  InstallActionIcon,
+  installActionLabel,
+  OnboardingHeading,
+} from "@/pages/onboarding/primitives";
 import { cn } from "@/lib/utils";
 
 const DEFAULT_LOCAL = "http://localhost:6767";
@@ -46,6 +56,17 @@ function displayName(url: string): string {
 
 function isLocal(url: string): boolean {
   return LOCAL_HOST_RE.test(url);
+}
+
+// The CLI's local-server port (omnigent/host/local_server.py _DEFAULT_LOCAL_PORT).
+const LOCAL_SERVER_PORT = "6767";
+
+/** The CLI-managed local install (plain-HTTP loopback root on its port), which
+ *  "Start Omnigent" boots. Any other loopback URL is an exact destination. */
+export function isLocalInstall(url: string): boolean {
+  if (!isLocal(url)) return false;
+  const u = new URL(url);
+  return u.protocol === "http:" && u.port === LOCAL_SERVER_PORT && u.pathname === "/";
 }
 
 /** Card title: local servers read as "Local installation (host)". */
@@ -126,6 +147,8 @@ export function ServerSelectStep({
   installed,
   onBack,
   onConnect,
+  connection = null,
+  onCancelConnect,
   onRemove,
   onCopy,
   onCheckServer,
@@ -135,7 +158,7 @@ export function ServerSelectStep({
   error?: string;
   recentServers: string[];
   managedServers: string[];
-  /** Returning user (CLI installed) → "Open Omnigent"; new → "Install Omnigent". */
+  /** CLI installed → "Open"/"Start Omnigent"; missing → "Install Omnigent". */
   installed?: boolean;
   /** Reports whether the URL-input ("add") view is showing, so the parent can
    *  swap the panel band (hero icons) for it. */
@@ -143,11 +166,14 @@ export function ServerSelectStep({
   onBack: () => void;
   /** Connect to a URL; resolves `{error}` to show, else navigation is underway. */
   onConnect: (url: string) => Promise<ConnectResult>;
+  /** Progress of the in-flight onConnect (null when idle). */
+  connection?: ConnectProgress | null;
+  onCancelConnect?: () => void;
   /** Remove a recent server from the list, if the shell supports it. */
   onRemove?: (url: string) => void;
   /** Copy text to the clipboard (native shell bridge — file:// blocks navigator.clipboard). */
   onCopy: (text: string) => void;
-  /** Advisory reachability probe for a just-added server. */
+  /** Advisory reachability probe for a just-added server or the local install. */
   onCheckServer: (url: string) => Promise<ServerCheckResult>;
 }) {
   // Servers the user added this session (prepended to the persisted recents;
@@ -168,13 +194,16 @@ export function ServerSelectStep({
   const [invalid, setInvalid] = useState(false);
   // Message from a rejected connect, so a failed Join shows something.
   const [connectError, setConnectError] = useState<string | null>(null);
-  // Advisory per-server reachability status (added servers only).
+  // Advisory per-server reachability status (added servers + the local install).
   const [checks, setChecks] = useState<Record<string, CheckStatus>>({});
   // The server whose detail accordion is expanded, or null (one at a time).
   const [expandedUrl, setExpandedUrl] = useState<string | null>(null);
   // "list": pick from existing servers (with an "Add server" button). "add":
   // the URL-input view (heading + input + benefits). Empty list → start in add.
   const [mode, setMode] = useState<"list" | "add">(listed.length === 0 ? "add" : "list");
+  // Back from the add view returns to the list only when it was opened from
+  // there; otherwise (empty list, or opened directly) it exits the step.
+  const [addFromList, setAddFromList] = useState(false);
 
   // Tell the parent when the add (URL-input) view is showing, so it can swap the
   // panel band to the hero icons.
@@ -191,6 +220,21 @@ export function ServerSelectStep({
     // typedUrl intentionally omitted: only seed once from the arriving list.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [firstListed]);
+
+  // Probe the local-install rows (localhost and 127.0.0.1 can both be listed):
+  // their action reads "Start" only when down.
+  const localRows = listed.filter(isLocalInstall);
+  const localRowsKey = localRows.join(" ");
+  useEffect(() => {
+    for (const url of localRows) {
+      setChecks((prev) => ({ ...prev, [url]: "checking" }));
+      onCheckServer(url)
+        .then((r) => setChecks((prev) => ({ ...prev, [url]: r.status })))
+        .catch(() => setChecks((prev) => ({ ...prev, [url]: "unreachable" })));
+    }
+    // Keyed on the URLs only: onCheckServer's identity changes every render.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [localRowsKey]);
 
   const clearInputState = () => {
     setInvalid(false);
@@ -240,6 +284,9 @@ export function ServerSelectStep({
 
   // Session-added servers are just recents the user hasn't connected to yet.
   const recentSection = [...addedServers, ...recentServers];
+  // Joining the local install while it's down boots it → "Start", not "Open".
+  const startsLocal =
+    selected !== null && isLocalInstall(selected) && checks[selected] === "unreachable";
 
   const renderRow = (url: string) => {
     const isSelected = selected === url;
@@ -287,14 +334,21 @@ export function ServerSelectStep({
                   </span>
                 )}
                 {check ? (
-                  <span className={cn("truncate", check === "unreachable" && "text-destructive")}>
+                  <span
+                    className={cn(
+                      "truncate",
+                      check === "unreachable" && !isLocalInstall(url) && "text-destructive",
+                    )}
+                  >
                     {check === "checking"
                       ? "Checking…"
                       : check === "ok"
                         ? "Omnigent server"
                         : check === "reachable"
                           ? "Reachable"
-                          : "Can't reach"}
+                          : isLocalInstall(url)
+                            ? "Not running"
+                            : "Can't reach"}
                   </span>
                 ) : (
                   <span className="truncate">{isLocal(url) ? "Local" : "Remote"}</span>
@@ -389,6 +443,7 @@ export function ServerSelectStep({
             </div>
             <Button type="button" disabled={typedUrl.trim().length === 0} onClick={addServer}>
               Join
+              <ArrowRight className="size-4" aria-hidden />
             </Button>
           </div>
         </div>
@@ -408,6 +463,7 @@ export function ServerSelectStep({
                   type="button"
                   onClick={() => {
                     setSelected(null);
+                    setAddFromList(true);
                     setMode("add");
                   }}
                   className="flex shrink-0 items-center gap-1 text-base text-muted-foreground hover:text-foreground"
@@ -422,15 +478,15 @@ export function ServerSelectStep({
         </div>
       )}
 
+      <ConnectStatus connection={connection} onCancel={onCancelConnect} />
+
       <div className="mt-3 flex justify-between gap-2">
         {mode === "add" ? (
           <>
             <Button
               variant="ghost"
               size="lg"
-              // Back returns to the list when there is one to return to; from
-              // the empty-list add view it exits the step.
-              onClick={() => (listed.length > 0 ? setMode("list") : onBack())}
+              onClick={() => (addFromList ? setMode("list") : onBack())}
             >
               <ArrowLeft className="size-4" />
               Back
@@ -446,12 +502,18 @@ export function ServerSelectStep({
           </>
         ) : (
           <>
-            <Button variant="ghost" onClick={onBack} size="lg">
+            <Button variant="ghost" onClick={onBack} size="lg" disabled={connection !== null}>
               <ArrowLeft className="size-4" />
               Back
             </Button>
-            <Button disabled={selected === null} onClick={join} size="lg">
-              {installActionLabel(installed)}
+            <Button
+              disabled={selected === null}
+              loading={connection !== null}
+              onClick={join}
+              size="lg"
+            >
+              <InstallActionIcon installed={installed} startsLocal={startsLocal} />
+              {installActionLabel(installed, startsLocal)}
             </Button>
           </>
         )}
