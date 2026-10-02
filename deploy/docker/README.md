@@ -261,6 +261,9 @@ discovery. Overrides also work with confidential clients; public-client mode
 also works with discovery. Overrides do not apply to GitHub's special OAuth
 login flow.
 
+Authorization URL query parameters (for example, `?p=policy`) are preserved.
+Omnigent-generated OAuth parameters take precedence on name collisions.
+
 Only trusted operators should configure these addresses: the token endpoint
 receives authorization codes and, for confidential clients, the client secret;
 the JWKS endpoint determines which signing keys are trusted. Overrides must

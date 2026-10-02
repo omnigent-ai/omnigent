@@ -128,6 +128,8 @@ def _build_app(
     ) -> HTMLResponse:
         if request.query_params.get("client_id") != client_id or code_challenge_method != "S256":
             return HTMLResponse("Invalid authorization request", status_code=400)
+        if endpoint_prefix and request.query_params.get("p") != "policy":
+            return HTMLResponse("Missing provider policy", status_code=400)
         code = secrets.token_urlsafe(32)
         codes[code] = (code_challenge, redirect_uri)
         continue_url = (

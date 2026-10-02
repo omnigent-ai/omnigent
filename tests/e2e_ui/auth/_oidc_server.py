@@ -119,6 +119,7 @@ def spawn_oidc_server(
                 server_env[f"OMNIGENT_OIDC_{setting}"] = (
                     f"{idp.base_url}{idp.endpoint_prefix}/{path}"
                 )
+            server_env["OMNIGENT_OIDC_AUTHORIZATION_ENDPOINT"] += "?p=policy"
 
         log_handle = open(log_path, "w")  # noqa: SIM115 — lives for the Popen; closed in finally
         proc = subprocess.Popen(

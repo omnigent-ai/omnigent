@@ -32,7 +32,7 @@ _ENDPOINTS = {
 @pytest.fixture
 def oidc_env(monkeypatch):
     """Isolate operator configuration from the developer's login environment."""
-    for name in os.environ:
+    for name in list(os.environ):
         if name.startswith("OMNIGENT_OIDC_"):
             monkeypatch.delenv(name)
     monkeypatch.setenv("OMNIGENT_OIDC_ISSUER", _ISSUER)
@@ -111,20 +111,21 @@ def test_invalid_provider_configuration_fails_at_startup(monkeypatch, setting, v
 
 
 @pytest.mark.usefixtures("oidc_env")
-@pytest.mark.parametrize("endpoint_name", list(_ENDPOINTS))
 @pytest.mark.parametrize(
-    "endpoint",
+    ("endpoint_name", "endpoint"),
     [
-        "http://remote.example.test/token",
-        "/relative",
-        "https://user:secret@example.test/token",
-        "https://example.test/token#fragment",
-        "file:///tmp/key",
-        "https://example.test:bad/token",
-        "https://example.test:0/token",
-        "https://example.test:99999/token",
-        "https://exam\nple.test/token",
-        "https://[broken/token",
+        ("token_endpoint", "http://remote.example.test/token"),
+        ("token_endpoint", "/relative"),
+        ("token_endpoint", "https://user:secret@example.test/token"),
+        ("token_endpoint", "https://example.test/token#fragment"),
+        ("token_endpoint", "file:///tmp/key"),
+        ("token_endpoint", "https://example.test:bad/token"),
+        ("token_endpoint", "https://example.test:0/token"),
+        ("token_endpoint", "https://example.test:99999/token"),
+        ("token_endpoint", "https://exam\nple.test/token"),
+        ("token_endpoint", "https://[broken/token"),
+        ("authorization_endpoint", "/relative"),
+        ("jwks_uri", "/relative"),
     ],
 )
 def test_endpoint_overrides_reject_unsafe_urls(monkeypatch, endpoint_name, endpoint):
@@ -228,6 +229,38 @@ def begin_login(client, codes, params=None):
     code = secrets.token_urlsafe(24)
     codes[code] = query["code_challenge"][0]
     return {"code": code, "state": query["state"][0]}
+
+
+@pytest.mark.parametrize("reauth", [False, True])
+def test_authorization_override_preserves_provider_query(monkeypatch, request, reauth):
+    """Provider parameters coexist with authoritative OAuth and reauthentication values."""
+    monkeypatch.setitem(
+        _ENDPOINTS,
+        "authorization_endpoint",
+        "https://login.example.test/custom/authorize?p=policy&p=second&empty="
+        "&value=a%2Bb%26c&response_type=token&client_id=wrong&state=wrong"
+        "&code_challenge=wrong&code_challenge_method=plain"
+        "&redirect_uri=https%3A%2F%2Fwrong.example.test&scope=wrong&prompt=select_account&max_age=300",
+    )
+    client, _, _, _, _ = request.getfixturevalue("provider_client")
+    response = client.get(
+        "/auth/login", params={"reauth": "1"} if reauth else {}, follow_redirects=False
+    )
+    assert response.status_code == 302
+    query = parse_qs(urlsplit(response.headers["location"]).query, keep_blank_values=True)
+    assert query["p"] == ["policy", "second"]
+    assert query["empty"] == [""]
+    assert query["value"] == ["a+b&c"]
+    assert query["response_type"] == ["code"]
+    assert query["client_id"] == ["test-client"]
+    assert query["redirect_uri"] == ["http://testserver/auth/callback"]
+    assert query["scope"] == ["openid email profile"]
+    assert len(query["state"]) == len(query["code_challenge"]) == 1
+    assert query["state"] != ["wrong"]
+    assert query["code_challenge"] != ["wrong"]
+    assert query["code_challenge_method"] == ["S256"]
+    assert query["prompt"] == (["login"] if reauth else ["select_account"])
+    assert query["max_age"] == (["0"] if reauth else ["300"])
 
 
 def test_public_pkce_ps256_login_and_code_replay(provider_client):

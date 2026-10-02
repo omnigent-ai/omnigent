@@ -17,7 +17,7 @@ import secrets
 import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, cast
-from urllib.parse import urlencode
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import httpx
 import jwt
@@ -223,7 +223,13 @@ def create_auth_router(
             # rather than silently reusing an existing IdP session.
             params["prompt"] = "login"
             params["max_age"] = "0"
-        auth_url = config.authorization_endpoint + "?" + urlencode(params)
+        endpoint = urlsplit(config.authorization_endpoint)
+        query = [
+            (name, value)
+            for name, value in parse_qsl(endpoint.query, keep_blank_values=True)
+            if name not in params
+        ]
+        auth_url = urlunsplit(endpoint._replace(query=urlencode(query + list(params.items()))))
 
         response = RedirectResponse(url=auth_url, status_code=302)
         response.set_cookie(
