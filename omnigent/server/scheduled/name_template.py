@@ -7,7 +7,7 @@ from zoneinfo import ZoneInfo
 _TOKENS = ("YYYY", "MMMM", "MMM", "MM", "Mon", "DD", "dddd", "ddd", "HH", "mm")
 _SUPPORTED = "supported tokens: " + " ".join(_TOKENS)
 _RUNS = re.compile(r"[A-Za-z]+|[ /.:,_-]+")
-_COMPACT = re.compile(r"(?:YYYY|MMMM|MMM|MM|Mon|DD|dddd|ddd|HH|mm){2,}")
+_COMPACT = re.compile(r"(?:" + "|".join(_TOKENS) + r"){2,}")
 _CLOCK_HINT = "mm is minutes and needs HH (e.g. {{HH:mm}}); MM is the month"
 _MONTHS = (
     "January",
@@ -63,9 +63,7 @@ def _pattern(body: str) -> tuple[str, ...]:
     runs = tuple(_RUNS.findall(body))
     if not runs or "".join(runs) != body:
         raise NameTemplateError(_SUPPORTED)
-    for index, run in enumerate(runs):
-        if index % 2:
-            continue
+    for run in runs[::2]:
         if run not in _TOKENS:
             hint = _HINTS.get(run)
             if hint is None and _COMPACT.fullmatch(run):
