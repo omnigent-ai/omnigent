@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import base64
 import concurrent.futures
 import contextlib
 import contextvars
 import copy
+import hashlib
 import json
 import logging
 import os
@@ -12710,14 +12712,38 @@ def login(server_url: str) -> None:
     from omnigent.cli_auth import store_token
 
     # Step 1: Request a CLI login ticket.
+    code_verifier = secrets.token_urlsafe(48)
+    code_challenge = (
+        base64.urlsafe_b64encode(hashlib.sha256(code_verifier.encode("ascii")).digest())
+        .rstrip(b"=")
+        .decode("ascii")
+    )
     try:
         resp = _httpx.post(
-            f"{server}/auth/cli-login", timeout=10.0, trust_env=_trust_env_for(server)
+            f"{server}/auth/cli-login",
+            json={"code_challenge": code_challenge, "code_challenge_method": "S256"},
+            timeout=10.0,
+            trust_env=_trust_env_for(server),
         )
-        resp.raise_for_status()
     except _httpx.HTTPError as exc:
         raise click.ClickException(
             f"Could not reach {server}/auth/cli-login: {exc}\n"
+            f"Is the server running with OMNIGENT_AUTH_PROVIDER=oidc?"
+            f"{_proxy_interference_hint(server)}"
+        ) from exc
+    if resp.status_code == 400:
+        try:
+            error = resp.json().get("error")
+        except (ValueError, AttributeError):
+            error = None
+        raise click.ClickException(
+            error if isinstance(error, str) else "Could not start CLI login."
+        )
+    try:
+        resp.raise_for_status()
+    except _httpx.HTTPError as exc:
+        raise click.ClickException(
+            f"Could not start CLI login: {exc}\n"
             f"Is the server running with OMNIGENT_AUTH_PROVIDER=oidc?"
             f"{_proxy_interference_hint(server)}"
         ) from exc
@@ -12728,18 +12754,26 @@ def login(server_url: str) -> None:
 
     # Step 2: Open the browser.
     click.echo(f"Opening browser for login: {login_url}")
+    if data.get("user_code"):
+        click.echo(f"Confirm this code in the browser: {data['user_code']}")
     click.echo("Waiting for authentication...")
     webbrowser.open(login_url)
 
     # Step 3: Poll until the ticket is fulfilled or expired.
-    poll_url = f"{server}/auth/cli-poll?ticket={ticket}"
+    poll_url = f"{server}/auth/cli-poll"
     import time as _time
 
     deadline = _time.time() + _CLI_LOGIN_TIMEOUT_SECONDS
     while _time.time() < deadline:
         _time.sleep(2)
         try:
-            poll_resp = _httpx.get(poll_url, timeout=10.0, trust_env=_trust_env_for(server))
+            poll_resp = _httpx.get(
+                poll_url,
+                params={"ticket": ticket},
+                headers={"X-Omnigent-Code-Verifier": code_verifier},
+                timeout=10.0,
+                trust_env=_trust_env_for(server),
+            )
         except _httpx.HTTPError:
             continue
 
@@ -12763,7 +12797,16 @@ def login(server_url: str) -> None:
             click.echo(f"Logged in as {user_id}")
             _remember_default_server(server)
             return
-        # 410 or other error — ticket expired.
+        if poll_resp.status_code in (400, 403, 410):
+            try:
+                error = poll_resp.json().get("error")
+            except (ValueError, AttributeError):
+                error = None
+            raise click.ClickException(
+                error
+                if isinstance(error, str)
+                else "Login ticket expired or was rejected. Please try again."
+            )
         raise click.ClickException("Login ticket expired or was rejected. Please try again.")
 
     raise click.ClickException(
