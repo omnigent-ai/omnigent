@@ -305,16 +305,17 @@ describe("Composer Escape interrupt", () => {
     },
   );
 
-  it.each([{ permissionLevel: 1 }, { readOnlyReason: "Session is read-only" }])(
-    "does not interrupt a read-only session: %j",
-    (overrides) => {
-      const props = composerProps({ status: "streaming", isWorking: true, ...overrides });
-      render(<Composer {...props} />);
-      expect(screen.getByRole("button", { name: "Interrupt" })).toBeDisabled();
-      fireEvent.keyDown(textarea(), { key: "Escape" });
-      expect(props.onStop).not.toHaveBeenCalled();
-    },
-  );
+  it.each([
+    { permissionLevel: 1 },
+    { permissionLevel: 5 },
+    { readOnlyReason: "Session is read-only" },
+  ])("does not interrupt a read-only session: %j", (overrides) => {
+    const props = composerProps({ status: "streaming", isWorking: true, ...overrides });
+    render(<Composer {...props} />);
+    expect(screen.getByRole("button", { name: "Interrupt" })).toBeDisabled();
+    fireEvent.keyDown(textarea(), { key: "Escape" });
+    expect(props.onStop).not.toHaveBeenCalled();
+  });
 
   it("dismisses slash suggestions before interrupting", () => {
     const props = composerProps({ isWorking: true });
@@ -3328,6 +3329,19 @@ describe("Composer placeholder", () => {
     fireEvent.keyDown(input, { key: "Enter" });
     expect(props.onSend).not.toHaveBeenCalled();
     expect(input).toHaveValue("queue this next");
+  });
+
+  it.each([
+    [1, "You have read-only access to this session"],
+    [5, "You have comment-only access to this session"],
+  ])("locks the composer for below-edit level %d", (permissionLevel, placeholder) => {
+    // Comment-only collaborators review files but must not message the agent.
+    const props = composerProps({ permissionLevel });
+    render(<Composer {...props} />);
+    expect(textarea().placeholder).toBe(placeholder);
+    fireEvent.change(textarea(), { target: { value: "hello agent" } });
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+    expect(props.onSend).not.toHaveBeenCalled();
   });
 
   it("a structural read-only reason wins over the normal placeholder", () => {

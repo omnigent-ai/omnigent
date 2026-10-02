@@ -24,7 +24,8 @@ from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
 import omnigent.server.routes.sessions as sessions_routes
-from omnigent.server.auth import LEVEL_OWNER, UnifiedAuthProvider
+from omnigent.server.auth import LEVEL_COMMENT, LEVEL_OWNER, LEVEL_READ, UnifiedAuthProvider
+from omnigent.server.client_capabilities import ClientCapabilitiesMiddleware
 from omnigent.server.routes.sessions import SessionLiveness, create_sessions_router
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.comment_store.sqlalchemy_store import SqlAlchemyCommentStore
@@ -886,3 +887,29 @@ def test_projects_changed_event_forwards_to_client(
         sessions_routes.user_session_stream.publish(ALICE, {"type": "projects_changed"})
         frame = _recv_until(ws, {"projects_changed"})
         assert frame["type"] == "projects_changed"
+
+
+@pytest.mark.parametrize(
+    "url, expected",
+    [
+        ("/v1/sessions/updates?omnigent_permission_levels=comment", LEVEL_COMMENT),
+        ("/v1/sessions/updates", LEVEL_READ),
+    ],
+)
+def test_snapshot_reports_comment_level_only_when_advertised(
+    app: FastAPI, stores, url: str, expected: int
+) -> None:
+    """Browsers can't set WebSocket headers, so the capability rides the query
+    string; without it a commenter's row must read as read, not edit/owner."""
+    app.add_middleware(ClientCapabilitiesMiddleware)
+    session_id = _seed_session(stores, owner=ALICE, title="shared")
+    permission_store = stores[2]
+    permission_store.ensure_user("carol@example.com")
+    permission_store.grant("carol@example.com", session_id, LEVEL_COMMENT)
+    with TestClient(app).websocket_connect(
+        url, headers={"X-Forwarded-Email": "carol@example.com"}
+    ) as ws:
+        ws.send_text(json.dumps({"type": "watch", "session_ids": [session_id]}))
+        snapshot = _recv_until(ws, {"snapshot"})
+        (item,) = snapshot["items"]  # type: ignore[misc]
+        assert item["permission_level"] == expected

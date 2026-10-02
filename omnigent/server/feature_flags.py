@@ -24,6 +24,7 @@ class Feature(StrEnum):
     HARNESS_INSTALL = "harness_install"
     CANVAS = "canvas"
     CUSTOMIZE = "customize"
+    COMMENT_SHARING = "comment_sharing"
 
 
 @dataclass(frozen=True)
@@ -61,6 +62,15 @@ FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
         description="Web Customize settings section (Harnesses & Skills)",
         owner="web",
         review_by_release="0.15.0",
+    ),
+    FeatureDefinition(
+        feature=Feature.COMMENT_SHARING,
+        description="Comment-only session sharing level",
+        owner="sharing",
+        review_by_release="0.19.0",
+        # Surfaced as /v1/info comment_sharing_enabled instead, which also
+        # reflects a per-request override passed to create_app.
+        frontend_visible=False,
     ),
 )
 

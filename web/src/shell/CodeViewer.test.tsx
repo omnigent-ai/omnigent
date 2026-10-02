@@ -8,7 +8,11 @@ import { HTML_PREVIEW_SANDBOX } from "./codeViewerHelpers";
 
 // ── Module mocks ──────────────────────────────────────────────────────────────
 
-vi.mock("@/hooks/usePermissions", () => ({ useCanEdit: vi.fn() }));
+vi.mock("@/hooks/usePermissions", () => {
+  const useCanEdit = vi.fn();
+  // A read-only viewer can't comment either; comment-only tests override this.
+  return { useCanEdit, useCanComment: vi.fn((id: string) => useCanEdit(id)) };
+});
 // Stub Shiki so the highlighting effect never fires an async callback that
 // would mutate state after the test cleans up.
 vi.mock("@/components/ai-elements/code-block", () => ({
@@ -144,6 +148,7 @@ function fireCopyEvent(): ReturnType<typeof vi.fn> {
 
 beforeEach(() => {
   vi.mocked(permissions.useCanEdit).mockReturnValue(true);
+  vi.mocked(permissions.useCanComment).mockImplementation((id) => permissions.useCanEdit(id));
 });
 
 afterEach(() => {
@@ -414,6 +419,13 @@ describe("CodeViewer markdown preview comment hint", () => {
     vi.mocked(permissions.useCanEdit).mockReturnValue(false);
     renderViewer("# doc", true, "notes.md", { viewMode: "preview", onRequestEditMode: () => {} });
     expect(screen.queryByRole("button", { name: /switch to edit mode/i })).toBeNull();
+  });
+
+  it("shows the hint to comment-only collaborators, who can comment but not edit", () => {
+    vi.mocked(permissions.useCanEdit).mockReturnValue(false);
+    vi.mocked(permissions.useCanComment).mockReturnValue(true);
+    renderViewer("# doc", true, "notes.md", { viewMode: "preview", onRequestEditMode: () => {} });
+    expect(screen.getByRole("button", { name: /switch to edit mode/i })).toBeInTheDocument();
   });
 
   it("shows no hint when the editor isn't reachable (no callback)", () => {

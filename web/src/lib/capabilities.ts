@@ -145,6 +145,12 @@ export interface ServerInfo {
    */
   public_sharing_enabled: boolean;
   /**
+   * Whether comment-level grants (``LEVEL_COMMENT``) may be created. Drives
+   * the Share modal's "Comment" option; the server rejects the grant when
+   * off. Fails closed to ``false`` — a missing field means an older server.
+   */
+  comment_sharing_enabled: boolean;
+  /**
    * Installed omnigent server version (same value as ``/api/version``),
    * e.g. ``"0.3.0.dev0"``. Shown in the session info popover's version
    * footer. ``null`` only when the probe failed (the OFF sentinel) — a
@@ -247,6 +253,7 @@ export const FALLBACK_SERVER_INFO: ServerInfo = {
   // not silently disable sharing, so the sentinel is the permissive "on".
   sharing_mode: "on",
   public_sharing_enabled: true,
+  comment_sharing_enabled: false,
   server_version: null,
   smart_routing_enabled: false,
   smart_routing_sources: { external: false, oss: false },
@@ -343,6 +350,7 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
             : "on",
           // Fail open: only an explicit false disables the public toggle.
           public_sharing_enabled: data.public_sharing_enabled !== false,
+          comment_sharing_enabled: data.comment_sharing_enabled === true,
           server_version: typeof data.server_version === "string" ? data.server_version : null,
           smart_routing_enabled: smartRoutingEnabled,
           smart_routing_sources: parseSmartRoutingSources(

@@ -9,7 +9,7 @@ from __future__ import annotations
 import httpx
 import pytest
 
-from omnigent.server.auth import LEVEL_EDIT, LEVEL_READ
+from omnigent.server.auth import LEVEL_COMMENT, LEVEL_EDIT, LEVEL_READ
 from omnigent.stores.comment_store.sqlalchemy_store import SqlAlchemyCommentStore
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
@@ -667,3 +667,124 @@ async def test_authorless_comment_editable_by_any_editor(
         f"An editor could not delete an authorless comment: {bob_delete.status_code} "
         f"{bob_delete.text}."
     )
+
+
+async def test_commenter_can_write_own_comments_but_not_drive_the_agent(
+    auth_client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """A comment-only collaborator can add, edit, and delete their own comments,
+    but cannot change a comment's status, touch others' or unattributed
+    comments, or send comments to the agent."""
+    session_id = _seed_session_with_grants(
+        db_uri,
+        {"alice@example.com": LEVEL_EDIT, "carol@example.com": LEVEL_COMMENT},
+    )
+    carol = {"X-Forwarded-Email": "carol@example.com"}
+    alice = {"X-Forwarded-Email": "alice@example.com"}
+    payload = {"path": "src/main.py", "start_index": 0, "end_index": 5}
+    # This server never enabled comment sharing for new grants; an existing
+    # comment grant keeps working regardless.
+
+    own = await auth_client.post(
+        f"/v1/sessions/{session_id}/comments", json={**payload, "body": "Carol"}, headers=carol
+    )
+    assert own.status_code == 200, own.text
+    own_id = own.json()["id"]
+    assert own.json()["created_by"] == "carol@example.com"
+
+    edited = await auth_client.patch(
+        f"/v1/sessions/{session_id}/comments/{own_id}", json={"body": "Carol v2"}, headers=carol
+    )
+    assert edited.status_code == 200, edited.text
+    assert edited.json()["body"] == "Carol v2"
+
+    status = await auth_client.patch(
+        f"/v1/sessions/{session_id}/comments/{own_id}",
+        json={"status": "addressed"},
+        headers=carol,
+    )
+    assert status.status_code == 403, status.text
+    combined = await auth_client.patch(
+        f"/v1/sessions/{session_id}/comments/{own_id}",
+        json={"body": "Carol v3", "status": "addressed"},
+        headers=carol,
+    )
+    assert combined.status_code == 403, combined.text
+
+    sent = await auth_client.post(
+        f"/v1/sessions/{session_id}/comments/send", json={"comment_ids": [own_id]}, headers=carol
+    )
+    assert sent.status_code == 403, sent.text
+
+    others = await auth_client.post(
+        f"/v1/sessions/{session_id}/comments", json={**payload, "body": "Alice"}, headers=alice
+    )
+    others_id = others.json()["id"]
+    legacy_id = (
+        SqlAlchemyCommentStore(db_uri)
+        .add(
+            conversation_id=session_id,
+            path="src/legacy.py",
+            body="Legacy note",
+            start_index=0,
+            end_index=4,
+            created_by=None,
+        )
+        .id
+    )
+    for comment_id in (others_id, legacy_id):
+        rewrite = await auth_client.patch(
+            f"/v1/sessions/{session_id}/comments/{comment_id}",
+            json={"body": "Carol was here"},
+            headers=carol,
+        )
+        assert rewrite.status_code == 403, rewrite.text
+        removed = await auth_client.delete(
+            f"/v1/sessions/{session_id}/comments/{comment_id}", headers=carol
+        )
+        assert removed.status_code == 403, removed.text
+
+    # An editor still owns the unattributed comment.
+    legacy_edit = await auth_client.patch(
+        f"/v1/sessions/{session_id}/comments/{legacy_id}",
+        json={"body": "Alice took it over"},
+        headers=alice,
+    )
+    assert legacy_edit.status_code == 200, legacy_edit.text
+
+    deleted = await auth_client.delete(
+        f"/v1/sessions/{session_id}/comments/{own_id}", headers=carol
+    )
+    assert deleted.status_code == 200, deleted.text
+
+
+async def test_empty_comment_patch_is_an_editor_no_op(
+    auth_client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """An empty PATCH keeps succeeding for editors and stays forbidden to commenters."""
+    session_id = _seed_session_with_grants(
+        db_uri, {"alice@example.com": LEVEL_EDIT, "carol@example.com": LEVEL_COMMENT}
+    )
+    alice = {"X-Forwarded-Email": "alice@example.com"}
+    created = await auth_client.post(
+        f"/v1/sessions/{session_id}/comments",
+        json={"path": "a.py", "body": "x", "start_index": 0, "end_index": 1},
+        headers=alice,
+    )
+    comment_id = created.json()["id"]
+
+    editor = await auth_client.patch(
+        f"/v1/sessions/{session_id}/comments/{comment_id}", json={}, headers=alice
+    )
+    assert editor.status_code == 200, editor.text
+    assert editor.json()["body"] == "x"
+    assert editor.json()["status"] == created.json()["status"]
+
+    commenter = await auth_client.patch(
+        f"/v1/sessions/{session_id}/comments/{comment_id}",
+        json={},
+        headers={"X-Forwarded-Email": "carol@example.com"},
+    )
+    assert commenter.status_code == 403, commenter.text

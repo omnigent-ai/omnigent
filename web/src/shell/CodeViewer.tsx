@@ -54,7 +54,7 @@ import {
   fileContentToBlob,
   type useFileContent,
 } from "@/hooks/useFileContent";
-import { useCanEdit } from "@/hooks/usePermissions";
+import { useCanComment, useCanEdit } from "@/hooks/usePermissions";
 import { cn } from "@/lib/utils";
 import { MarkdownRichTextViewer } from "./MarkdownRichTextViewer";
 import {
@@ -462,6 +462,7 @@ export function CodeViewer({
   onRequestEditMode,
 }: CodeViewerProps) {
   const canEdit = useCanEdit(conversationId);
+  const canComment = useCanComment(conversationId);
   const activeCommentId = activeSelection?.comment_id;
   const previewComments = useMemo(
     () => [...comments, ...addressedComments.filter((c) => c.id === activeCommentId)],
@@ -498,10 +499,10 @@ export function CodeViewer({
   useEffect(() => {
     onSetActiveSelectionRef.current = onSetActiveSelection;
   }, [onSetActiveSelection]);
-  const canEditRef = useRef(canEdit);
+  const canCommentRef = useRef(canComment);
   useEffect(() => {
-    canEditRef.current = canEdit;
-  }, [canEdit]);
+    canCommentRef.current = canComment;
+  }, [canComment]);
 
   const content = fileQuery.data?.content ?? "";
   // Server returns only a prefix for very large files. Editing + saving a
@@ -535,12 +536,14 @@ export function CodeViewer({
 
   // "Attach to agent" delivers a "[Attached: path:start-end]" marker the
   // composer reads — only the native coding-agent harnesses act on it, so
-  // gate the button to them (same set as the "@"-mention feature).
+  // gate the button to them (same set as the "@"-mention feature). Attaching
+  // feeds the agent, so comment-only collaborators don't get it.
   const sessionHarness = useChatStore((s) => s.sessionHarness);
   // ``!!path`` mirrors the Monaco hook's guard: without it an empty path would
   // emit a malformed ``[Attached: :start-end]`` marker. ``path`` is typed
   // non-optional here, but the guard keeps the two surfaces in lockstep.
-  const canAttachToAgent = !!path && nativeCodingAgentForHarness(sessionHarness) !== undefined;
+  const canAttachToAgent =
+    canEdit && !!path && nativeCodingAgentForHarness(sessionHarness) !== undefined;
 
   // Kick off Shiki highlighting whenever content or language changes.
   useEffect(() => {
@@ -682,7 +685,7 @@ export function CodeViewer({
       }
 
       // Non-collapsed selection — show the "Add Comment" button.
-      if (!canEditRef.current) return;
+      if (!canCommentRef.current) return;
       if (!container.contains(range.commonAncestorContainer)) return;
       const anchor_content = sel.toString();
       if (!anchor_content.trim()) return;

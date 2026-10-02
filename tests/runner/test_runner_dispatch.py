@@ -8155,6 +8155,51 @@ async def test_sys_session_share_maps_error_statuses(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "level_name,level",
+    [
+        pytest.param("read", 1, id="read"),
+        pytest.param("comment", 5, id="comment"),
+        pytest.param("edit", 2, id="edit"),
+        # No longer advertised, but older callers may still send it.
+        pytest.param("manage", 3, id="manage-alias"),
+    ],
+)
+async def test_sys_session_share_maps_level_names(level_name: str, level: int) -> None:
+    """Each friendly level name maps to the server's numeric level, including
+    comment (5, not between read and edit numerically)."""
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    bodies: list[dict[str, Any]] = []
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        bodies.append(json.loads(request.content))
+        return httpx.Response(200, json={})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        await execute_tool(
+            tool_name="sys_session_share",
+            arguments=json.dumps({"user_id": "alice@example.com", "level": level_name}),
+            server_client=server_client,
+            conversation_id="conv_caller",
+            agent_spec=AgentSpec(spec_version=1, agent_session_sharing=SharePolicy.NON_PUBLIC),
+        )
+
+    assert bodies == [{"user_id": "alice@example.com", "level": level}]
+
+
+def test_sys_session_share_schema_does_not_advertise_manage() -> None:
+    from omnigent.tools.builtins.spawn import SysSessionShareTool
+
+    schema = SysSessionShareTool(allow_public=False).get_schema()
+    level = schema["function"]["parameters"]["properties"]["level"]
+    assert level["enum"] == ["read", "comment", "edit"]
+
+
+@pytest.mark.asyncio
 async def test_sys_session_share_rejects_bad_level_without_calling_server() -> None:
     """
     An unknown ``level`` is rejected client-side before any PUT — so a

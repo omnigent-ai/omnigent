@@ -10,9 +10,16 @@ import type { Conversation } from "@/hooks/useConversations";
 import type { Session } from "@/lib/types";
 import * as identity from "./identity";
 import {
+  LEVEL_COMMENT,
+  LEVEL_EDIT,
+  LEVEL_MANAGE,
   LEVEL_OWNER,
+  LEVEL_READ,
+  canCommentLevel,
+  canReadLevel,
   derivePermissionLevel,
   grantPermission,
+  isEditorLevel,
   isOwnerLevel,
   listPermissions,
   revokePermission,
@@ -358,23 +365,56 @@ describe("derivePermissionLevel — resolution order", () => {
 });
 
 describe("isOwnerLevel — owner boundary", () => {
-  it("treats the owner level and above as owner", () => {
+  it("treats only the owner level as owner", () => {
     expect(isOwnerLevel(LEVEL_OWNER)).toBe(true);
-    expect(isOwnerLevel(LEVEL_OWNER + 1)).toBe(true);
   });
 
-  it("treats read / edit / manage (below owner) as non-owner", () => {
+  it("treats read / comment / edit / manage as non-owner", () => {
     // These are the collaborator levels that must NOT be allowed to
     // type into the shared terminal — they attach read-only instead.
-    expect(isOwnerLevel(1)).toBe(false);
-    expect(isOwnerLevel(2)).toBe(false);
-    expect(isOwnerLevel(3)).toBe(false);
+    // COMMENT is numerically above OWNER, so a `>=` check would leak here.
+    expect(isOwnerLevel(LEVEL_READ)).toBe(false);
+    expect(isOwnerLevel(LEVEL_COMMENT)).toBe(false);
+    expect(isOwnerLevel(LEVEL_EDIT)).toBe(false);
+    expect(isOwnerLevel(LEVEL_MANAGE)).toBe(false);
+  });
+
+  it("fails closed on an unknown level", () => {
+    expect(isOwnerLevel(99)).toBe(false);
   });
 
   it("treats null (single-user / unresolved) permissively as owner", () => {
     // Matches derivePermissionLevel/useCanEdit: a null level means
     // permissions are off or still loading, so don't lock the owner out.
     expect(isOwnerLevel(null)).toBe(true);
+  });
+});
+
+describe("level membership helpers", () => {
+  // COMMENT ranks between READ and EDIT but is numerically 5, so each helper
+  // is a fixed set — pinned here per level so a regression to `>=` fails.
+  it.each([
+    // level, isEditorLevel, canCommentLevel, canReadLevel
+    [LEVEL_READ, false, false, true],
+    [LEVEL_COMMENT, false, true, true],
+    [LEVEL_EDIT, true, true, true],
+    [LEVEL_MANAGE, true, true, true],
+    [LEVEL_OWNER, true, true, true],
+    [0, false, false, false],
+    [99, false, false, false],
+  ] as const)(
+    "level %d → editor %s, commenter %s, reader %s",
+    (level, editor, commenter, reader) => {
+      expect(isEditorLevel(level)).toBe(editor);
+      expect(canCommentLevel(level)).toBe(commenter);
+      expect(canReadLevel(level)).toBe(reader);
+    },
+  );
+
+  it("treats null (single-user / unresolved) permissively", () => {
+    expect(isEditorLevel(null)).toBe(true);
+    expect(canCommentLevel(null)).toBe(true);
+    expect(canReadLevel(null)).toBe(true);
   });
 });
 

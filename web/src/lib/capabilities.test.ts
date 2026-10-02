@@ -24,6 +24,7 @@ function info(overrides: Partial<ServerInfo>): ServerInfo {
     enabled_connections: [],
     sharing_mode: "on",
     public_sharing_enabled: true,
+    comment_sharing_enabled: false,
     server_version: null,
     smart_routing_enabled: false,
     smart_routing_sources: { external: false, oss: false },
@@ -118,6 +119,24 @@ describe("resolveServerInfo sandbox_providers", () => {
       sandbox_providers: ["modal", 7, null, "e2b"],
     });
     expect(resolved.sandbox_providers).toEqual(["modal", "e2b"]);
+  });
+});
+
+describe("resolveServerInfo comment_sharing_enabled", () => {
+  it("keeps an explicit true", async () => {
+    const resolved = await probe({ comment_sharing_enabled: true });
+    expect(resolved.comment_sharing_enabled).toBe(true);
+  });
+
+  it("fails closed when an older server omits the field", async () => {
+    // A missing field means the server can't accept comment grants.
+    const resolved = await probe({ sharing_mode: "on" });
+    expect(resolved.comment_sharing_enabled).toBe(false);
+  });
+
+  it("fails closed on a non-boolean value", async () => {
+    const resolved = await probe({ comment_sharing_enabled: "true" });
+    expect(resolved.comment_sharing_enabled).toBe(false);
   });
 });
 

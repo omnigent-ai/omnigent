@@ -398,6 +398,7 @@ function serverInfo(overrides: Partial<ServerInfo> = {}): ServerInfo {
     enabled_connections: [],
     sharing_mode: "on",
     public_sharing_enabled: true,
+    comment_sharing_enabled: false,
     server_version: null,
     smart_routing_enabled: false,
     smart_routing_sources: { external: false, oss: false },
@@ -4040,9 +4041,13 @@ describe("Mobile header actions menu", () => {
     });
   });
 
-  it("offers no Share to a read-only collaborator", () => {
-    // level 1 = read: can fork, but not share (needs ≥3).
-    mockConversations([{ id: "conv_shared", permission_level: 1 }]);
+  it.each([
+    [1, "read"],
+    [5, "comment"],
+  ])("offers no Share to a level-%d (%s) collaborator", (permissionLevel) => {
+    // Read and comment can fork but not share (manage or owner only). Comment
+    // (5) is numerically above owner, so a `>=` check would wrongly allow it.
+    mockConversations([{ id: "conv_shared", permission_level: permissionLevel }]);
 
     renderShell("/c/conv_shared");
     openActionsMenu();

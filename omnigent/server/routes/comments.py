@@ -16,7 +16,7 @@ from pydantic import BaseModel, model_validator
 from omnigent.db.enum_codecs import COMMENT_STATUS
 from omnigent.entities import Comment
 from omnigent.errors import ErrorCode, OmnigentError
-from omnigent.server.auth import LEVEL_EDIT, LEVEL_READ, AuthProvider
+from omnigent.server.auth import LEVEL_COMMENT, LEVEL_EDIT, LEVEL_READ, AuthProvider
 from omnigent.server.routes._auth_helpers import (
     attribution_user,
     get_user_id,
@@ -132,8 +132,9 @@ def create_comments_router(
 
     When both ``permission_store`` and ``conversation_store`` are provided
     (multi-user mode), every handler enforces session-level access:
-    read endpoints require ``LEVEL_READ``, mutating endpoints require
-    ``LEVEL_EDIT``.
+    read endpoints require ``LEVEL_READ``; writing, editing, and deleting
+    your own comments require ``LEVEL_COMMENT``; changing a comment's status
+    and sending comments to the agent require ``LEVEL_EDIT``.
 
     :param store: The shared :class:`CommentStore` instance.
     :param auth_provider: Auth provider used to identify the requesting
@@ -175,7 +176,7 @@ def create_comments_router(
 
         Used to gate the author-only operations — editing a comment's
         ``body`` and deleting a comment — on top of the session-level
-        ``LEVEL_EDIT`` gate, which callers MUST run first. A session
+        ``LEVEL_COMMENT`` gate, which callers MUST run first. A session
         collaborator with edit access can still mark *anyone's* comment
         addressed (a shared review-workflow action), but cannot rewrite or
         delete another user's comment.
@@ -183,9 +184,9 @@ def create_comments_router(
         Comments with no recorded author (``created_by is None`` — legacy
         comments created before per-user attribution, or single-user mode)
         remain editable/deletable by any editor, since there is no author to
-        protect. This helper is only invoked when permission enforcement is
-        active (``permission_store`` set), so single-user mode never reaches
-        it regardless.
+        protect — but not by a comment-only collaborator. This helper is only
+        invoked when permission enforcement is active (``permission_store``
+        set), so single-user mode never reaches it regardless.
 
         The synchronous store read is dispatched to a worker thread to keep
         the event loop unblocked, matching :func:`require_access`.
@@ -194,12 +195,21 @@ def create_comments_router(
         :param comment_id: The comment being mutated, e.g. ``"a1b2c3d4-..."``.
         :param session_id: The owning session, e.g. ``"conv_abc123"``.
         :raises OmnigentError: 404 if the comment is not found in this
-            session; 403 if the caller is not the comment's author.
+            session; 403 if the caller is not the comment's author, or the
+            comment is unattributed and the caller lacks edit access.
         """
         comment = await asyncio.to_thread(store.get, comment_id, session_id)
         if comment is None:
             raise OmnigentError("Comment not found", code=ErrorCode.NOT_FOUND)
-        if comment.created_by is not None and comment.created_by != user_id:
+        if comment.created_by is None:
+            if permission_store is None or conversation_store is None:
+                raise OmnigentError(
+                    "Permission checks are not configured", code=ErrorCode.INTERNAL_ERROR
+                )
+            await require_access(
+                user_id, session_id, LEVEL_EDIT, permission_store, conversation_store
+            )
+        elif comment.created_by != user_id:
             raise OmnigentError(
                 "Only the comment author can edit or delete this comment",
                 code=ErrorCode.FORBIDDEN,
@@ -213,17 +223,17 @@ def create_comments_router(
     ) -> dict[str, Any]:
         """Create a new review comment.
 
-        Requires ``LEVEL_EDIT`` on the session in multi-user mode.
+        Requires ``LEVEL_COMMENT`` on the session in multi-user mode.
 
         :param request: The incoming request, used to extract the user identity.
         :param session_id: The owning session, e.g. ``"conv_abc123"``.
         :param body: Comment payload including path, body text, and the
             two range fields (start_index, end_index).
         :returns: The created comment as a serialized dict.
-        :raises OmnigentError: 401/403/404 if the user lacks edit permission.
+        :raises OmnigentError: 401/403/404 if the user lacks comment permission.
         """
         user_id = get_user_id(request, auth_provider)
-        await _require_session_access(user_id, session_id, LEVEL_EDIT)
+        await _require_session_access(user_id, session_id, LEVEL_COMMENT)
         comment = store.add(
             conversation_id=session_id,
             path=body.path,
@@ -271,23 +281,28 @@ def create_comments_router(
     ) -> dict[str, Any]:
         """Update a comment's status and/or body text.
 
-        Requires ``LEVEL_EDIT`` on the session in multi-user mode.
-        Editing the ``body`` additionally requires the caller to be the
-        comment's author: rewriting another user's comment is forbidden,
-        while changing only the ``status`` (e.g. marking it ``"addressed"``)
-        stays open to any editor as a shared review-workflow action.
+        Editing the ``body`` requires ``LEVEL_COMMENT`` on the session in
+        multi-user mode and that the caller is the comment's author:
+        rewriting another user's comment is forbidden. Changing the
+        ``status`` (e.g. marking it ``"addressed"``) requires ``LEVEL_EDIT``
+        and stays open to any editor as a shared review-workflow action.
 
         :param request: The incoming request, used to extract the user identity.
         :param session_id: The owning session, e.g. ``"conv_abc123"``.
         :param comment_id: The comment to update, e.g. ``"a1b2c3d4-..."``.
         :param body: Fields to update; ``None`` fields are left unchanged.
         :returns: The updated serialized comment.
-        :raises OmnigentError: 401/403/404 if the user lacks edit permission,
-             403 if a body edit is attempted on another user's comment,
-            or 404 if the comment is not found.
+        :raises OmnigentError: 401/403/404 if the user lacks the required
+            permission, 403 if a body edit is attempted on another user's
+            comment, or 404 if the comment is not found.
         """
         user_id = get_user_id(request, auth_provider)
-        await _require_session_access(user_id, session_id, LEVEL_EDIT)
+        # Only a body-only edit is a commenter action. An empty update stays an
+        # editor action, which succeeds as a no-op.
+        body_only = body.body is not None and body.status is None
+        await _require_session_access(
+            user_id, session_id, LEVEL_COMMENT if body_only else LEVEL_EDIT
+        )
         if permission_store is not None:
             # Rewriting comment text is author-only; a status-only change is a
             # shared review-workflow action that any editor (and the agent's
@@ -319,7 +334,7 @@ def create_comments_router(
     ) -> dict[str, Any]:
         """Delete a comment.
 
-        Requires ``LEVEL_EDIT`` on the session in multi-user mode, and
+        Requires ``LEVEL_COMMENT`` on the session in multi-user mode, and
         additionally that the caller is the comment's author — one
         collaborator may not delete another user's comment.
 
@@ -327,12 +342,12 @@ def create_comments_router(
         :param session_id: The owning session, e.g. ``"conv_abc123"``.
         :param comment_id: The comment to delete, e.g. ``"a1b2c3d4-..."``.
         :returns: ``{"deleted": true}``.
-        :raises OmnigentError: 401/403/404 if the user lacks edit permission,
+        :raises OmnigentError: 401/403/404 if the user lacks comment permission,
             403 if the caller is not the comment's author, or 404 if the
             comment is not found or does not belong to this session.
         """
         user_id = get_user_id(request, auth_provider)
-        await _require_session_access(user_id, session_id, LEVEL_EDIT)
+        await _require_session_access(user_id, session_id, LEVEL_COMMENT)
         if permission_store is not None:
             await _require_comment_author(user_id, comment_id, session_id)
         deleted = store.delete(comment_id, session_id)

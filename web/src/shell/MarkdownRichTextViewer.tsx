@@ -26,7 +26,7 @@ import { ListItem, TaskItem, TaskList } from "@tiptap/extension-list";
 import { Markdown } from "@tiptap/markdown";
 import type { Comment } from "@/hooks/useComments";
 import type { ActiveSelection } from "./codeViewerHelpers";
-import { useCanEdit } from "@/hooks/usePermissions";
+import { useCanComment, useCanEdit } from "@/hooks/usePermissions";
 import { ToolbarPlugin } from "./MarkdownEditorToolbar";
 import { TableHandles } from "./TableBubbleMenu";
 import { TruncatedBanner } from "./TruncatedBanner";
@@ -123,6 +123,8 @@ export function MarkdownRichTextViewer({
 }: MarkdownRichTextViewerProps) {
   // A truncated buffer must never be editable, regardless of permission.
   const canEdit = useCanEdit(conversationId) && !truncated;
+  // Comment offsets must match the full file, so a truncated buffer can't be commented on either.
+  const canComment = useCanComment(conversationId) && !truncated;
 
   // Callback registered by the inner component once its TipTap editor is ready.
   // The sync hook calls this instead of remounting (setEditorKey) when an
@@ -163,6 +165,7 @@ export function MarkdownRichTextViewer({
       conversationId={conversationId}
       path={path}
       canEdit={canEdit}
+      canComment={canComment}
       truncated={truncated}
       isDirty={isDirty}
       setDirty={setDirty}
@@ -194,6 +197,7 @@ interface InnerProps {
   conversationId: string;
   path: string;
   canEdit: boolean;
+  canComment: boolean;
   truncated: boolean;
   isDirty: boolean;
   setDirty: (dirty: boolean) => void;
@@ -219,6 +223,7 @@ function MarkdownRichTextViewerInner({
   conversationId,
   path,
   canEdit,
+  canComment,
   truncated,
   isDirty,
   setDirty,
@@ -573,7 +578,7 @@ function MarkdownRichTextViewerInner({
         activeSelection={activeSelection}
         onSetActiveSelection={onSetActiveSelection}
         pendingBodyRef={pendingBodyRef}
-        canEdit={canEdit}
+        canComment={canComment}
       />
     </div>
   );

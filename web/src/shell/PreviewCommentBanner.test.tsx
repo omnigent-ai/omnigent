@@ -3,10 +3,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import * as permissions from "@/hooks/usePermissions";
 import { PreviewCommentBanner } from "./PreviewCommentBanner";
 
-vi.mock("@/hooks/usePermissions", () => ({ useCanEdit: vi.fn() }));
+vi.mock("@/hooks/usePermissions", () => ({ useCanComment: vi.fn() }));
 
 beforeEach(() => {
-  vi.mocked(permissions.useCanEdit).mockReturnValue(true);
+  vi.mocked(permissions.useCanComment).mockReturnValue(true);
 });
 
 afterEach(() => {
@@ -14,7 +14,7 @@ afterEach(() => {
 });
 
 describe("PreviewCommentBanner", () => {
-  it("renders a switch-to-edit action for editors", () => {
+  it("renders a switch-to-edit action for anyone who can comment", () => {
     render(<PreviewCommentBanner conversationId="conv_1" onSwitchToEdit={() => {}} />);
     expect(screen.getByRole("button", { name: /switch to edit mode/i })).toBeDefined();
   });
@@ -27,7 +27,7 @@ describe("PreviewCommentBanner", () => {
   });
 
   it("renders nothing for read-only viewers", () => {
-    vi.mocked(permissions.useCanEdit).mockReturnValue(false);
+    vi.mocked(permissions.useCanComment).mockReturnValue(false);
     const { container } = render(
       <PreviewCommentBanner conversationId="conv_1" onSwitchToEdit={() => {}} />,
     );

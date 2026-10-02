@@ -5131,12 +5131,13 @@ async def _session_share_via_rest(
             }
         )
     # Friendly level name -> the server's numeric permission level
-    # (GrantPermissionRequest accepts 1=read, 2=edit, 3=manage).
-    level_by_name = {"read": 1, "edit": 2, "manage": 3}
+    # (see GrantPermissionRequest; comment is 5, not between read and edit).
+    # "manage" is no longer advertised but still accepted from older callers.
+    level_by_name = {"read": 1, "edit": 2, "comment": 5, "manage": 3}
     level_name = args.get("level", "read")
     if level_name not in level_by_name:
         return json.dumps(
-            {"error": f"sys_session_share: level must be one of {sorted(level_by_name)}"}
+            {"error": "sys_session_share: level must be one of ['comment', 'edit', 'read']"}
         )
     try:
         resp = await server_client.put(

@@ -80,8 +80,10 @@ import { useAutoGrowTextarea } from "@/hooks/useAutoGrowTextarea";
 import { useDictationInsert } from "@/hooks/useDictationInsert";
 import {
   derivePermissionLevel,
+  isEditorLevel,
   isOwnerLevel,
   isSessionSharedWithOthers,
+  LEVEL_COMMENT,
 } from "@/lib/permissionsApi";
 import { getCurrentAuthorId } from "@/lib/identity";
 import { toast } from "sonner";
@@ -1970,9 +1972,8 @@ interface ComposerProps {
   permissionLevel: number | null;
   /**
    * When non-null, the composer is forced read-only and the string is
-   * shown as the textarea placeholder. Distinct from
-   * ``permissionLevel === 1`` (which means "user has read-only
-   * grant") — this captures the "this session structurally can't be
+   * shown as the textarea placeholder. Distinct from a below-edit
+   * ``permissionLevel`` (a read or comment grant) — this captures the "this session structurally can't be
    * interacted with" case: e.g. a claude-native sub-agent whose
    * transcript is mirrored from disk and has no input surface. ``null``
    * leaves the existing ``permissionLevel`` gate alone.
@@ -2443,12 +2444,13 @@ function ComposerImpl(
   const backdropRef = useRef<HTMLDivElement>(null);
   const isStreaming = status === "streaming";
 
-  // Read-only when either the user lacks a write grant OR the session
+  // Read-only when either the user lacks an edit grant (read and comment
+  // grants can't message the agent) OR the session
   // is structurally non-interactive (``readOnlyReason``). The
   // structural reason takes priority for the placeholder text since it
   // explains *why* this specific row can't receive input.
   const isReadOnly =
-    readOnlyReason !== null || (permissionLevel === 1 && sendDisabledReason === null);
+    readOnlyReason !== null || (!isEditorLevel(permissionLevel) && sendDisabledReason === null);
   // A pending elicitation addressed to this session parks the turn
   // server-side (the runner blocks on the verdict Future), so a message
   // sent now would sit queued and unread until the card is answered —
@@ -3253,6 +3255,7 @@ function ComposerImpl(
     if (
       (!trimmed && files.length === 0 && mentionedItems.length === 0) ||
       disabled ||
+      isReadOnly ||
       sendDisabledReason !== null ||
       hasPendingElicitation
     )
@@ -3683,7 +3686,9 @@ function ComposerImpl(
             : readOnlyReason !== null
               ? readOnlyReason
               : isReadOnly
-                ? "You have read-only access to this session"
+                ? permissionLevel === LEVEL_COMMENT
+                  ? "You have comment-only access to this session"
+                  : "You have read-only access to this session"
                 : unreachable && sendDisabledReason === null
                   ? "Session offline — reconnect below to continue"
                   : hasPendingElicitation

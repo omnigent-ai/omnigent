@@ -19,7 +19,7 @@ import "react-pdf/dist/Page/TextLayer.css";
 import { MessageSquarePlusIcon, MinusIcon, PlusIcon } from "lucide-react";
 import { fileContentToBlob, type FileContentResponse } from "@/hooks/useFileContent";
 import type { Comment } from "@/hooks/useComments";
-import { useCanEdit } from "@/hooks/usePermissions";
+import { useCanComment } from "@/hooks/usePermissions";
 import { Button } from "@/components/ui/button";
 import { getEmbedRoot } from "@/lib/host";
 import { cn } from "@/lib/utils";
@@ -133,7 +133,7 @@ export function PdfViewer({
   activeSelection = null,
   onSetActiveSelection,
 }: PdfViewerProps) {
-  const canEdit = useCanEdit(conversationId);
+  const canComment = useCanComment(conversationId);
   const [numPages, setNumPages] = useState(0);
   const [errored, setErrored] = useState(false);
   const [scale, setScale] = useState(1);
@@ -235,7 +235,7 @@ export function PdfViewer({
         return;
       }
 
-      if (!canEdit) return;
+      if (!canComment) return;
       if (!container.contains(range.commonAncestorContainer)) return;
       const text = sel.toString();
       if (!text.trim()) return;
@@ -272,7 +272,7 @@ export function PdfViewer({
 
     container.addEventListener("mouseup", handleMouseUp);
     return () => container.removeEventListener("mouseup", handleMouseUp);
-  }, [canEdit, onSetActiveSelection]);
+  }, [canComment, onSetActiveSelection]);
 
   // Dismiss the floating button on mousedown outside or scroll.
   useEffect(() => {
@@ -384,7 +384,7 @@ export function PdfViewer({
       </div>
 
       {floating &&
-        canEdit &&
+        canComment &&
         onSetActiveSelection &&
         createPortal(
           <button

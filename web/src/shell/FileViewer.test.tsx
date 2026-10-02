@@ -70,6 +70,8 @@ vi.mock("./CommentsPanel", () => ({
     comments,
     addressedComments,
     activeSelection,
+    canAddress,
+    canComment,
   }: {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     onClickComment?: (comment: any) => void;
@@ -79,8 +81,15 @@ vi.mock("./CommentsPanel", () => ({
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     addressedComments?: any[];
     activeSelection?: { comment_id?: string } | null;
+    canAddress?: boolean;
+    canComment?: boolean;
   }) => (
-    <div data-testid="comments-panel" data-active-comment-id={activeSelection?.comment_id ?? ""}>
+    <div
+      data-testid="comments-panel"
+      data-active-comment-id={activeSelection?.comment_id ?? ""}
+      data-can-address={String(!!canAddress)}
+      data-can-comment={String(canComment ?? true)}
+    >
       {[...(comments ?? []), ...(addressedComments ?? [])].map((c: { id: string }) => (
         <button
           key={c.id}
@@ -238,6 +247,7 @@ interface RenderProps {
   sort?: ChangedSort;
   /** Enables the prev/next nav header when provided. */
   onNavigateTo?: (path: string) => void;
+  permissionLevel?: number | null;
 }
 
 /**
@@ -256,6 +266,7 @@ function viewerTree({
   onClose = vi.fn(),
   sort,
   onNavigateTo,
+  permissionLevel,
 }: RenderProps = {}) {
   const url = initialSearch ? `/?${initialSearch}` : "/";
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
@@ -271,6 +282,7 @@ function viewerTree({
           onClose={onClose}
           sort={sort}
           onNavigateTo={onNavigateTo}
+          permissionLevel={permissionLevel}
         />
       </MemoryRouter>
     </QueryClientProvider>
@@ -923,6 +935,27 @@ describe("FileViewer addressed selection", () => {
 
     expect(mutate).toHaveBeenCalledWith({ comment_ids: ["c1"] });
     expect(screen.getByTestId("comments-panel")).toHaveAttribute("data-active-comment-id", "c1");
+  });
+});
+
+describe("FileViewer comment permissions", () => {
+  // Comment-only collaborators (level 5) may write comments but must never
+  // send them to the agent; read-only viewers may do neither.
+  it.each([
+    [1, "false", "false"],
+    [5, "true", "false"],
+    [2, "true", "true"],
+    [4, "true", "true"],
+  ])("level %d → canComment %s, canAddress %s", (level, canComment, canAddress) => {
+    useOptionalCommentSenderMock.mockReturnValue({ mutate: vi.fn(), isPending: false });
+    useCommentsMock.mockReturnValue(makeCommentsQuery([makeComment("c1")]));
+
+    renderViewer({ open: true, path: "file1.py", permissionLevel: level });
+    fireEvent.click(screen.getByRole("button", { name: "Show comments" }));
+
+    const panel = screen.getByTestId("comments-panel");
+    expect(panel).toHaveAttribute("data-can-comment", canComment);
+    expect(panel).toHaveAttribute("data-can-address", canAddress);
   });
 });
 

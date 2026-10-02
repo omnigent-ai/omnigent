@@ -2593,10 +2593,14 @@
         "description": "Request body for `PUT /v1/sessions/{id}/permissions`.",
         "properties": {
           "level": {
-            "description": "Numeric permission level: `1` = read, `2` = edit, `3` = manage.",
+            "description": "Numeric permission level: `1` = read, `2` = edit, `3` = manage, `5` = comment. `4` (owner) is never granted through this endpoint.",
+            "enum": [
+              1,
+              2,
+              3,
+              5
+            ],
             "format": "int64",
-            "maximum": 3.0,
-            "minimum": 1.0,
             "title": "Level",
             "type": "integer"
           },
@@ -3828,7 +3832,7 @@
             "type": "string"
           },
           "level": {
-            "description": "Numeric permission level (1=read, 2=edit, 3=manage).",
+            "description": "Numeric permission level (1=read, 2=edit, 3=manage, 4=owner, 5=comment). A comment grant reads as 1 to clients that don't advertise the comment level.",
             "format": "int64",
             "title": "Level",
             "type": "integer"
@@ -4780,6 +4784,10 @@
           "branding": {
             "$ref": "#/components/schemas/BrandingInfo"
           },
+          "comment_sharing_enabled": {
+            "title": "Comment Sharing Enabled",
+            "type": "boolean"
+          },
           "databricks_features": {
             "title": "Databricks Features",
             "type": "boolean"
@@ -4903,6 +4911,7 @@
           "enabled_connections",
           "sharing_mode",
           "public_sharing_enabled",
+          "comment_sharing_enabled",
           "server_version",
           "smart_routing_enabled",
           "smart_routing_sources",
@@ -6066,7 +6075,7 @@
                 "type": "null"
               }
             ],
-            "description": "The requesting user's numeric permission level on this session: `1` = read, `2` = edit, `3` = manage. `None` when permissions are disabled.",
+            "description": "The requesting user's numeric permission level on this session: `1` = read, `2` = edit, `3` = manage, `4` = owner, `5` = comment. `None` when permissions are disabled.",
             "title": "Permission Level"
           },
           "project_id": {
@@ -7004,7 +7013,7 @@
                 "type": "null"
               }
             ],
-            "description": "The requesting user's numeric permission level on this session: `1` = read, `2` = edit, `3` = manage. `None` when permissions are disabled (single-user mode without a permission store).",
+            "description": "The requesting user's numeric permission level on this session: `1` = read, `2` = edit, `3` = manage, `4` = owner, `5` = comment. `None` when permissions are disabled (single-user mode without a permission store).",
             "title": "Permission Level"
           },
           "project_id": {
@@ -12465,7 +12474,7 @@
         ]
       },
       "post": {
-        "description": "Create a new review comment.\n\nRequires `LEVEL_EDIT` on the session in multi-user mode.\n\n**Parameters**\n\n- `body` \u2014 Comment payload including path, body text, and the two range fields (start_index, end_index).\n\n**Returns:** The created comment as a serialized dict.\n\n**Raises**\n\n- `OmnigentError` \u2014 401/403/404 if the user lacks edit permission.",
+        "description": "Create a new review comment.\n\nRequires `LEVEL_COMMENT` on the session in multi-user mode.\n\n**Parameters**\n\n- `body` \u2014 Comment payload including path, body text, and the two range fields (start_index, end_index).\n\n**Returns:** The created comment as a serialized dict.\n\n**Raises**\n\n- `OmnigentError` \u2014 401/403/404 if the user lacks comment permission.",
         "operationId": "add_comment_v1_sessions__session_id__comments_post",
         "parameters": [
           {
@@ -12577,7 +12586,7 @@
     },
     "/v1/sessions/{session_id}/comments/{comment_id}": {
       "delete": {
-        "description": "Delete a comment.\n\nRequires `LEVEL_EDIT` on the session in multi-user mode, and\nadditionally that the caller is the comment's author \u2014 one\ncollaborator may not delete another user's comment.\n\n**Returns:** `{\"deleted\": true}`.\n\n**Raises**\n\n- `OmnigentError` \u2014 401/403/404 if the user lacks edit permission, 403 if the caller is not the comment's author, or 404 if the comment is not found or does not belong to this session.",
+        "description": "Delete a comment.\n\nRequires `LEVEL_COMMENT` on the session in multi-user mode, and\nadditionally that the caller is the comment's author \u2014 one\ncollaborator may not delete another user's comment.\n\n**Returns:** `{\"deleted\": true}`.\n\n**Raises**\n\n- `OmnigentError` \u2014 401/403/404 if the user lacks comment permission, 403 if the caller is not the comment's author, or 404 if the comment is not found or does not belong to this session.",
         "operationId": "delete_comment_v1_sessions__session_id__comments__comment_id__delete",
         "parameters": [
           {
@@ -12631,7 +12640,7 @@
         ]
       },
       "patch": {
-        "description": "Update a comment's status and/or body text.\n\nRequires `LEVEL_EDIT` on the session in multi-user mode.\nEditing the `body` additionally requires the caller to be the\ncomment's author: rewriting another user's comment is forbidden,\nwhile changing only the `status` (e.g. marking it `\"addressed\"`)\nstays open to any editor as a shared review-workflow action.\n\n**Parameters**\n\n- `body` \u2014 Fields to update; `None` fields are left unchanged.\n\n**Returns:** The updated serialized comment.\n\n**Raises**\n\n- `OmnigentError` \u2014 401/403/404 if the user lacks edit permission, 403 if a body edit is attempted on another user's comment, or 404 if the comment is not found.",
+        "description": "Update a comment's status and/or body text.\n\nEditing the `body` requires `LEVEL_COMMENT` on the session in\nmulti-user mode and that the caller is the comment's author:\nrewriting another user's comment is forbidden. Changing the\n`status` (e.g. marking it `\"addressed\"`) requires `LEVEL_EDIT`\nand stays open to any editor as a shared review-workflow action.\n\n**Parameters**\n\n- `body` \u2014 Fields to update; `None` fields are left unchanged.\n\n**Returns:** The updated serialized comment.\n\n**Raises**\n\n- `OmnigentError` \u2014 401/403/404 if the user lacks the required permission, 403 if a body edit is attempted on another user's comment, or 404 if the comment is not found.",
         "operationId": "update_comment_v1_sessions__session_id__comments__comment_id__patch",
         "parameters": [
           {

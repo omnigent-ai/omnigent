@@ -3,7 +3,7 @@
  *
  * Displays current grants, allows granting/revoking access, and
  * toggling public visibility. Only accessible to users with
- * manage-level (3) permission on the session.
+ * manage access on the session.
  */
 
 import {
@@ -48,7 +48,14 @@ import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { withBasePath } from "@/lib/basePath";
 import { updateSession } from "@/lib/sessionsApi";
 import { getOmnigentTransformShareLink, getOmnigentUserSearch } from "@/lib/host";
-import { workspaceSharingBlocked } from "@/lib/permissionsApi";
+import {
+  LEVEL_COMMENT,
+  LEVEL_EDIT,
+  LEVEL_MANAGE,
+  LEVEL_OWNER,
+  LEVEL_READ,
+  workspaceSharingBlocked,
+} from "@/lib/permissionsApi";
 import { useRebasePath } from "@/lib/routing";
 import { cn } from "@/lib/utils";
 
@@ -56,10 +63,11 @@ const PUBLIC_USER = "__public__";
 
 /** Numeric permission level → display label for fixed (non-editable) rows. */
 const LEVEL_LABELS: Record<number, string> = {
-  1: "Read",
-  2: "Edit",
-  3: "Manage",
-  4: "Owner",
+  [LEVEL_READ]: "Read",
+  [LEVEL_COMMENT]: "Comment",
+  [LEVEL_EDIT]: "Edit",
+  [LEVEL_MANAGE]: "Manage",
+  [LEVEL_OWNER]: "Owner",
 };
 
 interface PermissionsModalProps {
@@ -87,6 +95,9 @@ export function PermissionsModal({
   // Public (anyone-with-the-link) access is a separate server switch from the
   // sharing tiers; when off, hide the toggle (the server rejects the grant too).
   const publicSharingEnabled = info === "loading" ? true : info.public_sharing_enabled;
+  // Comment grants are opt-in per server; fail closed while the probe loads so
+  // the option never flashes in on a server that would reject it.
+  const commentSharingEnabled = info !== "loading" && info.comment_sharing_enabled;
   // In "off" mode never fetch the grant list — the modal short-circuits to a
   // notice below, so the request would be wasted (and the server rejects any
   // grant anyway).
@@ -95,7 +106,7 @@ export function PermissionsModal({
   const revoke = useRevokePermission(sessionId);
 
   const [newUserId, setNewUserId] = useState("");
-  const [newLevel, setNewLevel] = useState("1");
+  const [newLevel, setNewLevel] = useState(String(LEVEL_READ));
   const [error, setError] = useState<string | null>(null);
   const [showQr, setShowQr] = useState(false);
 
@@ -130,7 +141,7 @@ export function PermissionsModal({
       {
         onSuccess: () => {
           setNewUserId("");
-          setNewLevel("1");
+          setNewLevel(String(LEVEL_READ));
         },
         onError: (err) => setError(err.message),
       },
@@ -154,7 +165,10 @@ export function PermissionsModal({
     if (checked && workspaceBlocked) return;
     setError(null);
     if (checked) {
-      grant.mutate({ userId: PUBLIC_USER, level: 1 }, { onError: (err) => setError(err.message) });
+      grant.mutate(
+        { userId: PUBLIC_USER, level: LEVEL_READ },
+        { onError: (err) => setError(err.message) },
+      );
     } else {
       revoke.mutate(PUBLIC_USER, {
         onError: (err) => setError(err.message),
@@ -193,7 +207,9 @@ export function PermissionsModal({
             <div className="space-y-3">
               <p>
                 {sharingReadOnly
-                  ? "This server allows read-only sharing — invite others to view this session."
+                  ? commentSharingEnabled
+                    ? "This server allows read-only sharing — invite others to view or comment on this session."
+                    : "This server allows read-only sharing — invite others to view this session."
                   : "Invite others to view or collaborate on this session."}
               </p>
               {sharingReadOnly && (
@@ -278,6 +294,7 @@ export function PermissionsModal({
                     onChangeLevel={handleChangeLevel}
                     busy={grant.isPending || revoke.isPending}
                     readOnly={sharingReadOnly}
+                    commentSharingEnabled={commentSharingEnabled}
                   />
                 ))}
               </div>
@@ -307,9 +324,12 @@ export function PermissionsModal({
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>
-                <SelectItem value="1">Read</SelectItem>
-                {/* Read-only sharing caps new grants at view; hide Edit. */}
-                {!sharingReadOnly && <SelectItem value="2">Edit</SelectItem>}
+                <SelectItem value={String(LEVEL_READ)}>Read</SelectItem>
+                {commentSharingEnabled && (
+                  <SelectItem value={String(LEVEL_COMMENT)}>Comment</SelectItem>
+                )}
+                {/* Read-only sharing caps new grants at view/comment; hide Edit. */}
+                {!sharingReadOnly && <SelectItem value={String(LEVEL_EDIT)}>Edit</SelectItem>}
               </SelectContent>
             </Select>
           </div>
@@ -663,18 +683,20 @@ function GrantRow({
   onChangeLevel,
   busy,
   readOnly,
+  commentSharingEnabled,
 }: {
   permission: Permission;
   onRevoke: (userId: string) => void;
   onChangeLevel: (userId: string, level: number) => void;
   busy: boolean;
   readOnly: boolean;
+  commentSharingEnabled: boolean;
 }) {
-  const isOwner = permission.level === 4;
+  const isOwner = permission.level === LEVEL_OWNER;
   // Manage is not grantable from the UI, so a pre-existing manage grant
   // renders as a fixed label rather than a dropdown choice. Unlike the
   // owner row it can still be revoked.
-  const isManage = permission.level === 3;
+  const isManage = permission.level === LEVEL_MANAGE;
   // Read-only sharing mode: existing grants can't be re-leveled, so the level
   // shows as a fixed label (like owner/manage) — but the row stays revocable.
   const fixedLevel = isOwner || isManage || readOnly;
@@ -704,8 +726,13 @@ function GrantRow({
             <SelectValue />
           </SelectTrigger>
           <SelectContent>
-            <SelectItem value="1">Read</SelectItem>
-            <SelectItem value="2">Edit</SelectItem>
+            <SelectItem value={String(LEVEL_READ)}>Read</SelectItem>
+            {/* Keep an existing comment grant's value renderable even after the
+                server turns comment sharing off. */}
+            {(commentSharingEnabled || permission.level === LEVEL_COMMENT) && (
+              <SelectItem value={String(LEVEL_COMMENT)}>Comment</SelectItem>
+            )}
+            <SelectItem value={String(LEVEL_EDIT)}>Edit</SelectItem>
           </SelectContent>
         </Select>
       )}

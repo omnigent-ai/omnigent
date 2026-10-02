@@ -74,6 +74,15 @@ describe("sessionUpdatesSocket heartbeat watchdog", () => {
     vi.useRealTimers();
   });
 
+  it("advertises the comment permission level in the socket URL", () => {
+    // Browsers can't set WebSocket headers; without this the server reports
+    // commenters as read in snapshot/changed frames.
+    sessionUpdatesSocket.start();
+    const url = new URL(latestWs().url);
+    expect(url.pathname.endsWith("/v1/sessions/updates")).toBe(true);
+    expect(url.searchParams.get("omnigent_permission_levels")).toBe("comment");
+  });
+
   it("forces a reconnect after the watchdog window of total silence", () => {
     sessionUpdatesSocket.start();
     const ws = latestWs();

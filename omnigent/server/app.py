@@ -81,6 +81,7 @@ from omnigent.server.background_session_titles import (
     BackgroundSessionTitleCoordinator,
     RunnerBackgroundTitleGenerator,
 )
+from omnigent.server.client_capabilities import ClientCapabilitiesMiddleware
 from omnigent.server.feature_flags import Feature, FeatureFlags, resolve_feature_flags
 from omnigent.server.managed_hosts import ManagedSandboxDeployment
 from omnigent.server.managed_sandbox_reaper import ManagedSandboxReaper
@@ -176,6 +177,7 @@ class ServerInfoResponse(BaseModel):
     enabled_connections: list[str]
     sharing_mode: Literal["on", "read_only", "restricted_read_only", "off"]
     public_sharing_enabled: bool
+    comment_sharing_enabled: bool
     server_version: str
     smart_routing_enabled: bool
     smart_routing_sources: SmartRoutingSourcesInfo
@@ -1321,6 +1323,7 @@ def create_app(
     sharing_mode: SharingMode | Callable[[], SharingMode] | None = None,
     public_sharing: bool | Callable[[], bool] | None = None,
     default_public_sessions: str | Callable[[], str] | None = None,
+    comment_sharing: bool | Callable[[], bool] | None = None,
     server_config: dict[str, Any] | None = None,
     feature_flags: FeatureFlags | None = None,
     extension_state: ExtensionPluginState | None = None,
@@ -1448,6 +1451,13 @@ def create_app(
         ``None`` reads ``OMNIGENT_DEFAULT_PUBLIC_SESSIONS`` (default ``off``)
         with an admin-editable file override; a static value or callable is
         authoritative. Never grants past ``sharing_mode``/``public_sharing``.
+    :param comment_sharing: Whether comment-only (level 5) grants may be
+        created. When disabled, such grants are rejected (403) and the Share
+        modal hides the Comment option; existing comment grants keep working.
+        Accepts a static bool, a zero-arg callable resolved per request, or
+        ``None`` — which follows the ``comment_sharing`` release feature in
+        ``OMNIGENT_FEATURES``. Reported by ``GET /v1/info`` as
+        ``comment_sharing_enabled``.
     :param server_config: Resolved non-secret server settings. The optional
         ``session_title_instructions`` string augments the isolated automatic
         title prompt. ``None`` loads the standard server config.
@@ -1958,6 +1968,15 @@ def create_app(
         _default_public_static = DefaultPublicSessions.coerce(default_public_sessions)
         app.state.default_public_sessions = lambda: _default_public_static
         app.state.default_public_sessions_writable = False
+    if comment_sharing is None:
+        _comment_static = resolved_feature_flags.enabled(Feature.COMMENT_SHARING)
+        app.state.comment_sharing = lambda: _comment_static
+    elif callable(comment_sharing):
+        _comment_callable = comment_sharing
+        app.state.comment_sharing = lambda: bool(_comment_callable())
+    else:
+        _comment_static = bool(comment_sharing)
+        app.state.comment_sharing = lambda: _comment_static
     # Tracks in-flight background managed-host launches (POST
     # /v1/sessions returns before the sandbox exists) so a message
     # racing the provision can rendezvous instead of failing with
@@ -1969,6 +1988,9 @@ def create_app(
     app.state.server_metrics = server_metrics
     app.state.server_metrics_otel = server_metrics_otel
     app.add_middleware(_WebSocketMetricsMiddleware, metrics=server_metrics)
+    # Lets session responses show the comment level only to clients that
+    # advertise it (older bundles would read 5 as edit/owner).
+    app.add_middleware(ClientCapabilitiesMiddleware)
     # CSWSH guard: reject cross-origin WebSocket handshakes before any
     # route accepts them. Added after the metrics middleware so it is the
     # outermost WS middleware — a forbidden origin is closed without even
@@ -2911,6 +2933,9 @@ def create_app(
         # grant is allowed. Independent of sharing_mode — drives whether the
         # Share modal shows the "Public access" toggle.
         public_sharing_enabled = app.state.public_sharing()
+        # comment_sharing_enabled: whether comment-only grants may be created —
+        # drives whether the Share modal offers the Comment level.
+        comment_sharing_enabled = app.state.comment_sharing()
         # server_version is the installed omnigent package version (same
         # source as /api/version), surfaced so the web UI can show it in the
         # session info popover alongside the per-session host version.
@@ -2969,6 +2994,7 @@ def create_app(
                 "enabled_connections": enabled_connections,
                 "sharing_mode": sharing_mode.value,
                 "public_sharing_enabled": public_sharing_enabled,
+                "comment_sharing_enabled": comment_sharing_enabled,
                 "server_version": _server_version(),
                 "smart_routing_enabled": smart_routing_enabled,
                 "smart_routing_sources": smart_routing_sources,
