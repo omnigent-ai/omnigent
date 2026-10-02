@@ -266,7 +266,11 @@ async def test_name_template_create_echoes_raw(
 
 
 @pytest.mark.parametrize(
-    "name,hint", [("{{yyyy-MM-dd}}", "YYYY"), ("{{YYYY-mm-DD}}", "mm is minutes")]
+    "name,hint",
+    [
+        ("{{yyyy-MM-dd}}", "use YYYY"),
+        ("{{YYYY-mm-DD}}", "mm is minutes and needs HH (e.g. {{HH:mm}}); MM is the month"),
+    ],
 )
 async def test_name_template_create_invalid_hint(
     auth_client: httpx.AsyncClient, db_uri: str, name: str, hint: str
