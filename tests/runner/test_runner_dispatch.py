@@ -56,6 +56,7 @@ from fastapi.responses import JSONResponse, Response
 from fastapi.responses import StreamingResponse as _StreamingResponse
 
 import omnigent.runtime.harnesses._executor_adapter as _adapter_mod_recovery
+from omnigent.errors import SESSION_AGENT_MISSING_MESSAGE
 from omnigent.inner.executor import (
     Executor as _RecoveryExecutor,
 )
@@ -77,6 +78,7 @@ from omnigent.inner.executor import (
 from omnigent.runner import create_runner_app, sign_in_watch, subagent_work
 from omnigent.runner.app import (
     _RUNNER_TURN_CONTEXT_DESYNC_CODE,
+    SessionAgentMissingError,
     _build_spawn_env_from_spec,
     _forward_harness_response,
     _harness_error_response_error,
@@ -523,7 +525,9 @@ async def test_resolve_harness_config_raises_when_spec_resolver_returns_none() -
         """
         return None
 
-    with pytest.raises(RuntimeError, match="No agent spec found for agent_id="):
+    # A RuntimeError subclass, so existing handlers still catch it while the turn
+    # route reports it as session_agent_missing.
+    with pytest.raises(SessionAgentMissingError, match="No agent spec found for agent_id="):
         await _resolve_harness_config(
             agent_id="ag_missing",
             spec_resolver=_resolver_returning_none,
@@ -1415,6 +1419,40 @@ async def test_runner_cold_cache_uses_resolved_message_not_stored_file_id() -> N
 
 
 @pytest.mark.asyncio
+async def test_runner_post_reports_a_removed_agent_with_fork_guidance() -> None:
+    """A turn on a session whose agent no longer resolves (the server's agent read
+    404s, e.g. after ``omnigent agent remove``) reports ``session_agent_missing``."""
+
+    async def _resolver_for_removed_agent(
+        agent_id: str, session_id: str | None = None
+    ) -> AgentSpec | None:
+        return None
+
+    app = create_runner_app(
+        process_manager=cast(HarnessProcessManager, _FakeProcessManager()),
+        spec_resolver=_resolver_for_removed_agent,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    async with _runner_test_client(app) as http:
+        response = await http.post(
+            "/v1/sessions/conv_removed_agent/events?stream=true",
+            json={
+                "type": "message",
+                "role": "user",
+                "agent_id": "ag_removed",
+                "model": "x",
+                "content": [],
+            },
+        )
+
+    assert response.status_code == 410
+    assert response.json() == {
+        "error": "session_agent_missing",
+        "detail": SESSION_AGENT_MISSING_MESSAGE,
+    }
+
+
+@pytest.mark.asyncio
 async def test_runner_post_returns_503_when_spec_resolver_fails(
     caplog: pytest.LogCaptureFixture,
     pinned_runner_log: Path,
@@ -1597,6 +1635,17 @@ _SPAWN_LOG_DETAIL = "Request failed on the runner; see the runner log for detail
             JSONResponse(status_code=500, content=["not", "a", "dict"]),
             {"message": '["not","a","dict"]'},
             id="non-object-json-is-raw-text",
+        ),
+        pytest.param(
+            JSONResponse(
+                status_code=410,
+                content={
+                    "error": "session_agent_missing",
+                    "detail": SESSION_AGENT_MISSING_MESSAGE,
+                },
+            ),
+            {"code": "session_agent_missing", "message": SESSION_AGENT_MISSING_MESSAGE},
+            id="removed-agent-keeps-its-code-and-guidance",
         ),
     ],
 )
@@ -1816,7 +1865,7 @@ async def test_runner_background_spawn_failed_reaches_subscribers_with_detail(
 
 
 def test_direct_and_background_switch_sites_share_one_invalidation_routine() -> None:
-    """Both dispatch paths must call the shared `_invalidate_session_agent_state` helper."""
+    """Both dispatch paths must call the shared `_sync_session_agent` helper."""
     import inspect
 
     import omnigent.runner.app as runner_app_mod
@@ -1826,17 +1875,80 @@ def test_direct_and_background_switch_sites_share_one_invalidation_routine() -> 
     direct_stream_body = source[direct_stream_start : direct_stream_start + 4000]
     background_start = source.index("async def _run_turn_bg_setup_and_stream(")
     background_body = source[background_start : background_start + 4000]
+    sync_start = source.index("async def _sync_session_agent(")
+    sync_body = source[sync_start : sync_start + 3000]
 
-    assert "_invalidate_session_agent_state(" in direct_stream_body, (
-        "_stream_message_to_harness must call the shared "
-        "_invalidate_session_agent_state helper on its switch/provenance-"
-        "reject branch, not an inline cache-pop list of its own."
+    for name, body in (
+        ("_stream_message_to_harness", direct_stream_body),
+        ("_run_turn_bg_setup_and_stream", background_body),
+    ):
+        assert "_sync_session_agent(" in body, (
+            f"{name} must call the shared _sync_session_agent helper on an agent "
+            "change, not an inline cache-pop list of its own."
+        )
+    assert "_invalidate_session_agent_state(" in sync_body
+
+
+async def _resolves_after_each_turn(conv: str, revisions: tuple[str | None, ...]) -> list[int]:
+    """Send one turn per revision (``None`` sends none); return the resolve count after each."""
+    resolved: list[str] = []
+
+    async def _spec_resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del session_id
+        resolved.append(agent_id)
+        return AgentSpec(
+            spec_version=1,
+            name="orion",
+            executor=ExecutorSpec(type="omnigent", config={"harness": _TEST_HARNESS_NAME}),
+        )
+
+    app = create_runner_app(
+        process_manager=cast(
+            HarnessProcessManager,
+            _FakeProcessManager(_FakeHarnessClient(_INSTRUCTION_WARN_CHUNKS)),
+        ),
+        spec_resolver=_spec_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
     )
-    assert "_invalidate_session_agent_state(" in background_body, (
-        "_run_turn_bg_setup_and_stream must call the shared "
-        "_invalidate_session_agent_state helper on its switch/provenance-"
-        "reject branch, not an inline cache-pop list of its own."
+    calls_after: list[int] = []
+    async with _runner_test_client(app) as http:
+        for revision in revisions:
+            body: dict[str, Any] = {
+                "type": "message",
+                "role": "user",
+                "agent_id": "ag_orion",
+                "model": "x",
+                "content": [],
+            }
+            if revision is not None:
+                body["agent_revision"] = revision
+            response = await http.post(f"/v1/sessions/{conv}/events", json=body)
+            assert response.status_code == 202
+            await _await_bg_turn_task(conv)
+            calls_after.append(len(resolved))
+    return calls_after
+
+
+@pytest.mark.asyncio
+async def test_a_new_agent_revision_rebuilds_the_session_spec() -> None:
+    """A reinstall keeps the agent id, so the turn's revision tells the runner."""
+    first, same_revision, new_revision = await _resolves_after_each_turn(
+        "conv_agent_revision", ("ag_orion/aaa", "ag_orion/aaa", "ag_orion/bbb")
     )
+    assert first > 0
+    assert same_revision == first, "an unchanged revision must reuse the cached spec"
+    assert new_revision > same_revision, "a new revision must resolve the spec again"
+
+
+@pytest.mark.asyncio
+async def test_a_spec_cached_without_a_revision_is_rebuilt_once_one_arrives() -> None:
+    """A turn without a revision (an older server's kickoff) may have cached a stale spec."""
+    unstamped, stamped, same_revision = await _resolves_after_each_turn(
+        "conv_agent_revision_unstamped", (None, "ag_orion/bbb", "ag_orion/bbb")
+    )
+    assert unstamped > 0
+    assert stamped > unstamped, "the first revision must replace a spec cached without one"
+    assert same_revision == stamped, "the recorded revision is then trusted"
 
 
 def test_agent_cache_reset_clears_the_agent_id_marker_too() -> None:
@@ -11660,12 +11772,13 @@ def _contract_resolver_for(scenario: str, calls: list[str]) -> Any:
             {"status": 202, "terminal_status": "failed"},
             id="resolver_raises-background-async-failure",
         ),
-        # resolver returns None: treated the same as resolver_raises after #5505.
+        # resolver returns None: the server no longer has the session's agent (a
+        # 404), so the synchronous path reports that lifecycle condition.
         pytest.param(
             "resolver_none",
             "no_harness",
-            {"status": 503, "error": "spec_resolver_failed"},
-            id="resolver_none-no_harness-503",
+            {"status": 410, "error": "session_agent_missing"},
+            id="resolver_none-no_harness-410-agent-missing",
         ),
         pytest.param(
             "resolver_none",

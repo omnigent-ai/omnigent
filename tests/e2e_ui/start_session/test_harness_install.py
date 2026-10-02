@@ -16,6 +16,7 @@ import re
 from playwright.async_api import Route, async_playwright, expect
 
 from tests._helpers.async_thread import run_in_fresh_loop as _run_in_fresh_loop
+from tests._helpers.picker_routes import OWN_AGENTS
 from tests.e2e_ui.start_session.helpers import stub_empty_host_picker_data
 
 _HOST_ID = "host_e2e"
@@ -174,6 +175,7 @@ async def _register_routes(page, *, install_requests: list[str]) -> None:
     await page.route(
         re.compile(r"/v1/sessions\?(?!.*pinned=).*visibility=mine"), handle_agent_scan
     )
+    await page.route(OWN_AGENTS, lambda route: route.fulfill(json={"data": []}))
     await page.route("**/v1/harnesses", handle_harnesses)
     await page.route(f"**/v1/hosts/*/harnesses/{_HARNESS}/install", handle_install)
 

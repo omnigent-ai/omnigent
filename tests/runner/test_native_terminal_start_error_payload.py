@@ -52,7 +52,7 @@ def test_missing_session_agent_classified_as_lifecycle_condition() -> None:
     assert payload["code"] == ErrorCode.SESSION_AGENT_MISSING
     message = payload["message"]
     # Actionable, client-safe wording about the lifecycle condition.
-    assert "agent is no longer available" in message
+    assert "agent no longer exists" in message
     # Must NOT relabel the lifecycle event as a generic startup defect.
     assert "Native Claude terminal failed to start" not in message
     # Must NOT leak the internal resolver detail or the raw agent id.
@@ -79,7 +79,7 @@ def test_other_causes_keep_generic_startup_failure_code() -> None:
 
     assert payload["code"] == _NATIVE_TERMINAL_START_FAILED_CODE
     assert payload["code"] == "native_terminal_start_failed"
-    assert "agent is no longer available" not in payload["message"]
+    assert "agent no longer exists" not in payload["message"]
 
 
 @pytest.mark.parametrize(
@@ -246,7 +246,7 @@ def test_unrelated_omnigent_error_is_not_treated_as_missing_agent() -> None:
     payload = _native_terminal_start_error_payload(exc, "Claude", session_id="conv_1")
 
     assert payload["code"] == _NATIVE_TERMINAL_START_FAILED_CODE
-    assert "agent is no longer available" not in payload["message"]
+    assert "agent no longer exists" not in payload["message"]
 
 
 @pytest.mark.parametrize("missing_agent", [False, True])

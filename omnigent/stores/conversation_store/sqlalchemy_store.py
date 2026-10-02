@@ -401,7 +401,7 @@ def _new_session_agent_row(
         name=agent_name,
         bundle_location=agent_bundle_location,
         version=1,
-        kind=encode_agent_kind("session"),
+        kind=encode_agent_kind("user"),
         description=agent_description,
         created_by=created_by,
     )
@@ -4572,7 +4572,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         new_conv_id = conversation_id
         creating_clone = cloned_agent_bundle_location is not None
         encoded_default_kind = encode_conversation_kind("default")
-        encoded_session_agent_kind = encode_agent_kind("session")
+        encoded_session_agent_kind = encode_agent_kind("user")
 
         # Fetch source metadata (workspace, external_session_id, terminal_launch_args)
         # from the Omnigent DB before opening the AP session.
@@ -5005,6 +5005,20 @@ class SqlAlchemyConversationStore(ConversationStore):
                 after = rows[-1].id
         return list(roots)[:limit]
 
+    def count_sessions_for_agent(self, agent_id: str, cap: int) -> int:
+        """Unordered ``LIMIT`` over ``ix_conversations_agent_id``; reads at most *cap* rows."""
+        with self._conv_session("count_sessions_for_agent") as session:
+            rows = (
+                select(SqlConversation.id)
+                .where(
+                    SqlConversation.workspace_id == current_workspace_id(),
+                    SqlConversation.agent_id == agent_id,
+                )
+                .limit(cap)
+                .subquery()
+            )
+            return session.execute(select(func.count()).select_from(rows)).scalar_one()
+
     def has_other_live_session_in_workspace(
         self,
         *,
@@ -5104,9 +5118,10 @@ class SqlAlchemyConversationStore(ConversationStore):
         # Omnigent-side rows (metadata/comments/policies/permissions) are cleaned up
         # second. A failure of the second transaction leaves orphaned Omnigent rows
         # for a conversation that no longer exists — an acceptable best-effort tradeoff.
-        encoded_session_agent_kind = encode_agent_kind("session")
+        # Agent rows are never deleted here: agents outlive the sessions using them
+        # and only an explicit agent removal deletes one.
 
-        def delete_ap(ap_sess: Session) -> tuple[list[str], set[str]] | None:
+        def delete_ap(ap_sess: Session) -> list[str] | None:
             row = ap_sess.get(SqlConversation, (current_workspace_id(), conversation_id))
             if not row:
                 return None
@@ -5127,40 +5142,6 @@ class SqlAlchemyConversationStore(ConversationStore):
             subtree_ids = [
                 cast(str, result[0]) for result in ap_sess.execute(select(cte.c.id)).fetchall()
             ]
-            # Collect the subtree's agent bindings before their rows go, so
-            # the Omnigent transaction below can delete the session-scoped
-            # agent rows that backed these conversations. Only include agents
-            # with NO surviving reference outside the deleted subtree: a
-            # session-scoped agent may be referenced by multiple conversations
-            # (e.g. when POST /v1/sessions reuses an existing agent_id), and
-            # should only be removed when ALL its referrers are deleted.
-            candidate_agent_ids = {
-                cast(str, candidate_agent_id)
-                for candidate_agent_id in ap_sess.execute(
-                    select(SqlConversation.agent_id).where(
-                        SqlConversation.workspace_id == current_workspace_id(),
-                        SqlConversation.id.in_(subtree_ids),
-                        SqlConversation.agent_id.is_not(None),
-                    )
-                )
-                .scalars()
-                .all()
-                if candidate_agent_id is not None
-            }
-            # Keep only agents that have no remaining reference outside the
-            # subtree being deleted.
-            surviving_refs = set(
-                ap_sess.execute(
-                    select(SqlConversation.agent_id).where(
-                        SqlConversation.workspace_id == current_workspace_id(),
-                        SqlConversation.agent_id.in_(candidate_agent_ids),
-                        SqlConversation.id.not_in(subtree_ids),
-                    )
-                )
-                .scalars()
-                .all()
-            )
-            bound_agent_ids = candidate_agent_ids - surviving_refs
             delete_fts_by_conversation_ids(ap_sess, list(subtree_ids))
             ap_sess.execute(
                 delete(SqlConversationItem).where(
@@ -5182,7 +5163,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                 )
             )
             ap_sess.delete(row)
-            return subtree_ids, bound_agent_ids
+            return subtree_ids
 
         ap_result = run_write_transaction(
             self._conv_session_immediate,
@@ -5191,7 +5172,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         )
         if ap_result is None:
             return False
-        subtree_ids, bound_agent_ids = ap_result
+        subtree_ids = ap_result
 
         def delete_metadata(session: Session) -> None:
             session.execute(
@@ -5218,17 +5199,6 @@ class SqlAlchemyConversationStore(ConversationStore):
                     SqlConversationMetadata.id.in_(subtree_ids),
                 )
             )
-            if bound_agent_ids:
-                # No surviving conversation uses these agents (a fork of the
-                # same user's session shares its row, so it counts as a
-                # reference above). Server agents survive via the kind guard.
-                session.execute(
-                    delete(SqlAgent).where(
-                        SqlAgent.workspace_id == current_workspace_id(),
-                        SqlAgent.id.in_(bound_agent_ids),
-                        SqlAgent.kind == encoded_session_agent_kind,
-                    )
-                )
 
         run_write_transaction(
             self._session_immediate,

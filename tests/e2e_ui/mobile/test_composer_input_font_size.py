@@ -9,6 +9,7 @@ from typing import Any
 import pytest
 from playwright.sync_api import Locator, Page, expect
 
+from tests._helpers.picker_routes import OWN_AGENTS
 from tests.e2e_ui.conftest import seed_committed_turn
 from tests.e2e_ui.mobile.test_ios_ipad_safe_layout import _IOS_SHELL_INIT_SCRIPT
 from tests.e2e_ui.sessions.test_reply_quotes_session_switch import _reply_to
@@ -103,6 +104,7 @@ def test_composer_input_font_setting_and_alignment(
         ),
     )
     page.route(_AGENT_SCAN, lambda route: route.fulfill(json={"data": []}))
+    page.route(OWN_AGENTS, lambda route: route.fulfill(json={"data": []}))
     page.goto(f"{base_url}/")
     landing = page.get_by_test_id("new-chat-landing-input")
     hint = page.get_by_text("Describe a task, or try a skill", exact=True)
@@ -117,6 +119,7 @@ def test_composer_input_font_setting_and_alignment(
     page.screenshot(path=tmp_path / "landing-composer.png", animations="disabled")
     page.unroute("**/v1/agents")
     page.unroute(_AGENT_SCAN)
+    page.unroute(OWN_AGENTS)
 
     page.goto(f"{base_url}/c/{session_id}")
     if native:
