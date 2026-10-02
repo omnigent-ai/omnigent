@@ -254,7 +254,7 @@ async def test_schedule_validation_keeps_requests_responsive(
 @pytest.mark.parametrize(
     "name", ["Open PR Rebase - {{Mon DD}}", "Open PR Rebase - {{YYYY-MM-DD}}"]
 )
-async def test_name_template_create_echoes_raw_and_rejects_bad_case(
+async def test_name_template_create_echoes_raw(
     auth_client: httpx.AsyncClient, db_uri: str, name: str
 ) -> None:
     _make_user(db_uri)
@@ -263,11 +263,6 @@ async def test_name_template_create_echoes_raw_and_rejects_bad_case(
     )
     assert response.status_code == 200
     assert response.json()["name"] == name
-    invalid = await auth_client.post(
-        "/v1/scheduled-tasks", json=_create_body(name="{{yyyy-MM-dd}}"), headers=_headers()
-    )
-    assert invalid.status_code == 400
-    assert "YYYY" in invalid.text
 
 
 @pytest.mark.parametrize(

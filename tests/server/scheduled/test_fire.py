@@ -43,6 +43,7 @@ from omnigent.server.scheduled import fire as fire_mod
 from omnigent.server.scheduled.fire import FireDeps, build_on_fire, build_run_now
 from omnigent.server.scheduled.schedule import continued_sandbox_host_id
 from omnigent.server.schemas import SessionEventInput
+from omnigent.server.scheduled.name_template import NameTemplateError
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.artifact_store.local import LocalArtifactStore
 from omnigent.stores.conversation_store import CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY
@@ -614,7 +615,11 @@ async def test_session_name_failure_is_literal_and_logs_once(
 
         monkeypatch.setattr(fire_mod, "render_session_name", broken_render)
     elif failure == "oversize":
-        monkeypatch.setattr(fire_mod, "render_session_name", lambda *args: "x" * 769)
+
+        def oversized_render(*args: Any) -> str:
+            raise NameTemplateError("rendered names must be at most 768 Unicode code points")
+
+        monkeypatch.setattr(fire_mod, "render_session_name", oversized_render)
     store = FakeScheduledTaskStore(rows={task.id: task})
     conversations = FakeConversationStore()
     launch = AsyncMock()
@@ -650,6 +655,27 @@ async def test_session_name_plain_identity(monkeypatch: pytest.MonkeyPatch) -> N
     await callback(0, "task_1")
     await _drain()
     assert conversations.created[1]["title"] == "nightly triage 2026"
+
+
+@pytest.mark.asyncio
+async def test_session_name_plain_long_identity_without_warning(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setattr(fire_mod.time, "time", lambda: 1790946300)
+    name = "x" * 769
+    conversations = FakeConversationStore()
+    store = FakeScheduledTaskStore(rows={"task_1": _task(name=name)})
+    launch = AsyncMock()
+    callback = build_on_fire(
+        _deps(store, conversation_store=conversations), launch_dispatch=launch
+    )
+    with caplog.at_level(logging.WARNING, logger=fire_mod.__name__):
+        await callback(0, "task_1")
+        await _drain()
+    assert conversations.created[0]["title"] == name
+    assert store.runs[0]["status"] == "running"
+    launch.assert_awaited_once()
+    assert caplog.records == []
 
 
 async def _drain() -> None:

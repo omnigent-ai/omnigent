@@ -112,7 +112,7 @@ from omnigent.server.scheduled.harness_settings import (
     unattended_permission_mode_allowed,
     validate_scheduled_permission_mode,
 )
-from omnigent.server.scheduled.name_template import NameTemplateError, render_session_name
+from omnigent.server.scheduled.name_template import render_session_name
 from omnigent.server.scheduled.schedule import continued_sandbox_host_id
 from omnigent.server.scheduled.telemetry import (
     current_fire_stage,
@@ -1645,9 +1645,7 @@ async def _create_session_resources(
         labels[WORKTREE_ROOT_LABEL_KEY] = worktree_root_fingerprint(worktree.worktree_path)
     try:
         session_name = render_session_name(task.name, scheduled_at, task.timezone)
-        if len(session_name) > 768:
-            raise ValueError("rendered name exceeds 768 Unicode code points")
-    except (NameTemplateError, ZoneInfoNotFoundError, ValueError) as exc:
+    except (ValueError, ZoneInfoNotFoundError) as exc:
         session_name = task.name
         _logger.warning("scheduled fire: task %s name rendering failed: %.160s", task.id, exc)
     except Exception as exc:
