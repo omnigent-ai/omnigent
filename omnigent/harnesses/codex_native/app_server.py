@@ -835,11 +835,19 @@ def is_stale_active_turn_error(error: CodexAppServerResponseError) -> bool:
 #: JSON-RPC internal-error code codex returns when its thread-store fails.
 _CODEX_INTERNAL_ERROR_CODE = -32603
 
+#: JSON-RPC invalid-request code codex returns for protocol-level rejections.
+_CODEX_INVALID_REQUEST_CODE = -32600
+
 #: Substring in codex's ``-32603`` message when its thread-store cannot
 #: load/resume a thread's rollout — stable across the wrapper phrasings
 #: different codex versions use (``failed to read thread: …`` vs
 #: ``error resuming thread: …``).
 _CODEX_THREAD_STORE_ERROR = "thread-store internal error"
+
+#: Substring in codex's ``-32600`` message when a newer codex holds a
+#: paginated-history lineage whose source rollout was written by an older,
+#: non-paginated codex — permanent mismatch, retrying never helps.
+_CODEX_PAGINATED_LINEAGE_ERROR = "source rollout is not paginated"
 
 
 def is_unreadable_thread_error(exc: BaseException) -> bool:
@@ -850,20 +858,24 @@ def is_unreadable_thread_error(exc: BaseException) -> bool:
     cannot load or resume a thread's rollout JSONL — e.g. a large transcript
     whose multibyte character straddles a read-buffer boundary is rejected as
     invalid UTF-8 (``failed to read thread: …``), or a rollout record it
-    cannot resume (``error resuming thread: …``). Retrying never resumes such
-    a thread, unlike a refused resume (``-32600``, another writer holds the
-    thread) that clears once the holder exits.
+    cannot resume (``error resuming thread: …``). It also answers ``-32600``
+    with ``"source rollout is not paginated"`` when a paginated-history
+    lineage was written by an older non-paginated codex — a permanent
+    mismatch. Both cases require a fresh thread; retrying never helps.
+    A ``-32600`` for any other reason (e.g. ``"already has an active writer"``)
+    is transient and must keep re-raising.
 
     :param exc: The exception raised by the resume request, e.g. a
         :class:`CodexAppServerResponseError`.
     :returns: ``True`` when only a fresh thread can carry the session on.
     """
-    return (
-        isinstance(exc, CodexAppServerResponseError)
-        and exc.code == _CODEX_INTERNAL_ERROR_CODE
-        and exc.message is not None
-        and _CODEX_THREAD_STORE_ERROR in exc.message
-    )
+    if not isinstance(exc, CodexAppServerResponseError) or exc.message is None:
+        return False
+    if exc.code == _CODEX_INTERNAL_ERROR_CODE:
+        return _CODEX_THREAD_STORE_ERROR in exc.message
+    if exc.code == _CODEX_INVALID_REQUEST_CODE:
+        return _CODEX_PAGINATED_LINEAGE_ERROR in exc.message
+    return False
 
 
 class CodexAppServerClient:
