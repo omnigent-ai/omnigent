@@ -2974,6 +2974,15 @@ describe("Composer native skill menu", () => {
     await waitFor(() => expect(textarea().selectionStart).toBe(15));
   });
 
+  it("preserves adjacent prose after a partial inline skill", async () => {
+    render(<Composer {...composerProps({ isNativeWrapper: true })} />);
+    fireEvent.change(textarea(), { target: { value: "please /revthis change" } });
+    fireEvent.select(textarea(), { target: { selectionStart: 11, selectionEnd: 11 } });
+    fireEvent.keyDown(textarea(), { key: "Tab" });
+    expect(textarea()).toHaveValue("please $review this change");
+    await waitFor(() => expect(textarea().selectionStart).toBe(15));
+  });
+
   it.each([" then /rev", "\nkeep this", "\tkeep this"])(
     "keeps completion at the caret before %j",
     async (suffix) => {

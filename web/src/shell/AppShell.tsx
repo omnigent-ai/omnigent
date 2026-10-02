@@ -68,6 +68,7 @@ import {
 } from "@/hooks/useChildSessions";
 import { useDebugMode } from "@/hooks/useDebugMode";
 import { useBrowserAgentRelay } from "@/hooks/useBrowserAgentRelay";
+import { openAgentBrowserTab } from "@/hooks/useBrowserTabs";
 import { resyncBrowserSuppression } from "@/hooks/useSuppressBrowserView";
 import {
   findAgentTerminal,
@@ -449,6 +450,46 @@ export function AppShell() {
     conversationId
       ? (readSessionWorkspaceState(conversationId).open ?? readDefaultWorkspacePanelOpen())
       : false,
+  );
+  const rightPanelOpenRef = useRef(rightPanelOpen);
+  rightPanelOpenRef.current = rightPanelOpen;
+  const [rightPanelVisibilityAnimating, setRightPanelVisibilityAnimating] = useState(false);
+  const rightPanelMotionTimerRef = useRef<number | null>(null);
+  const cancelRightPanelVisibilityMotion = useCallback(() => {
+    if (rightPanelMotionTimerRef.current !== null) {
+      window.clearTimeout(rightPanelMotionTimerRef.current);
+      rightPanelMotionTimerRef.current = null;
+    }
+    setRightPanelVisibilityAnimating(false);
+  }, []);
+  const setRightPanelOpenImmediately = useCallback(
+    (open: boolean) => {
+      cancelRightPanelVisibilityMotion();
+      rightPanelOpenRef.current = open;
+      setRightPanelOpen(open);
+    },
+    [cancelRightPanelVisibilityMotion],
+  );
+  const setRightPanelOpenAnimated = useCallback((open: boolean) => {
+    if (rightPanelOpenRef.current === open) return;
+    rightPanelOpenRef.current = open;
+    if (rightPanelMotionTimerRef.current !== null) {
+      window.clearTimeout(rightPanelMotionTimerRef.current);
+    }
+    setRightPanelVisibilityAnimating(true);
+    setRightPanelOpen(open);
+    rightPanelMotionTimerRef.current = window.setTimeout(() => {
+      rightPanelMotionTimerRef.current = null;
+      setRightPanelVisibilityAnimating(false);
+    }, 350);
+  }, []);
+  useEffect(
+    () => () => {
+      if (rightPanelMotionTimerRef.current !== null) {
+        window.clearTimeout(rightPanelMotionTimerRef.current);
+      }
+    },
+    [],
   );
   const [shareOpen, setShareOpen] = useState(false);
   const [forkOpen, setForkOpen] = useState(false);
@@ -855,11 +896,9 @@ export function AppShell() {
         // GitHub tab: shares the Files/workspace gate. Non-git workspaces and
         // other unavailable reasons are shown as empty states in the panel.
         github: showFilesPanel,
-        // Browser tab: shown only when the desktop shell hosts the embedded
-        // WebContentsView. A plain web build has no embedded browser, and an
-        // older desktop build predates the `browser*` bridge — both hide the
-        // tab entirely (supportsBrowser() is constant per load) so we never
-        // surface a dead tab whose calls no-op.
+        // Browser soft tabs: available only when the shell hosts the embedded
+        // WebContentsView. Plain web and older desktop builds hide the "+"
+        // option entirely so they never surface a dead tab whose calls no-op.
         browser: supportsBrowser(),
         // Agents tab is unconditional: the panel always lists at least
         // the main agent (its "main" row), so there's never a dead end.
@@ -1062,7 +1101,7 @@ export function AppShell() {
     if (!conversationId) {
       // No session → no rail; false (not the open default) so rail-gated
       // effects stay quiet on non-session routes.
-      setRightPanelOpen(false);
+      setRightPanelOpenImmediately(false);
       setRightRailTab("files");
       setSelectedFilePath(null);
       setOpenFiles([]);
@@ -1101,6 +1140,18 @@ export function AppShell() {
     let nextTab: RightRailTab =
       persisted.rightRailTab ??
       (keepAgentsAcrossTreeNavigation ? "subagents" : readDefaultWorkspaceTab());
+    // Browser is a dynamic soft-tab mode, not a permanent nav destination.
+    // A stale pre-soft-tab selection (or a closed last tab) restores to the
+    // configured static default instead of showing an unselected rail.
+    const persistedBrowsers = persisted.openBrowsers ?? [];
+    if (
+      nextTab === "browser" &&
+      (persisted.selectedBrowserId === null ||
+        persisted.selectedBrowserId === undefined ||
+        !persistedBrowsers.includes(persisted.selectedBrowserId))
+    ) {
+      nextTab = readDefaultWorkspaceTab();
+    }
 
     // Restore the open file tabs from the per-session store, then merge the
     // URL ?file= param: a deep-link selects (and, if absent, opens) that file
@@ -1149,7 +1200,9 @@ export function AppShell() {
     const commentParam = searchParams.get("comment");
     const hasWorkspaceUrlSignal =
       showAgents || urlFile !== null || (commentParam !== null && commentParam !== "");
-    setRightPanelOpen((persisted.open ?? readDefaultWorkspacePanelOpen()) || hasWorkspaceUrlSignal);
+    setRightPanelOpenImmediately(
+      (persisted.open ?? readDefaultWorkspacePanelOpen()) || hasWorkspaceUrlSignal,
+    );
 
     stateConvRef.current = conversationId;
   }, [conversationId]); // eslint-disable-line react-hooks/exhaustive-deps
@@ -1211,9 +1264,9 @@ export function AppShell() {
     setShellsPanelOpen(false);
     setGithubPanelOpen(false);
     setRightRailTab("subagents");
-    setRightPanelOpen(true);
+    setRightPanelOpenImmediately(true);
     setSubagentsPanelOpen(isMobileViewport());
-  }, [conversationId, agentsPanelRequested]);
+  }, [conversationId, agentsPanelRequested, setRightPanelOpenImmediately]);
 
   // Persist the per-session rail tab + open file tabs whenever they change.
   // Keyed on the state (not conversationId) and targeted at the conversation
@@ -1276,7 +1329,7 @@ export function AppShell() {
       // would otherwise route the file into an invisible panel. Persist
       // open=true so the rail stays in sync with the open file on the next
       // visit (mirroring the header toggle's persistence).
-      setRightPanelOpen(true);
+      setRightPanelOpenAnimated(true);
       if (conversationId) writeSessionWorkspaceState(conversationId, { open: true });
       // Set URL in the callback (not a useEffect) to avoid racing with
       // FileViewer's diff-sync effect which can clobber it on mount.
@@ -1296,7 +1349,7 @@ export function AppShell() {
         { replace: true },
       );
     },
-    [setPanelInitialKey, terminalFirst, setSearchParams, conversationId],
+    [setPanelInitialKey, terminalFirst, setSearchParams, conversationId, setRightPanelOpenAnimated],
   );
 
   // Desktop and mobile viewers can both be mounted; each may own a draft.
@@ -1380,8 +1433,15 @@ export function AppShell() {
       // a workspace view a reload would re-open.
       clearFileViewerUrl();
     }
-    setRightPanelOpen(next);
-  }, [rightPanelOpen, conversationId, selectedFilePath, clearFileViewerUrl, setSearchParams]);
+    setRightPanelOpenAnimated(next);
+  }, [
+    rightPanelOpen,
+    conversationId,
+    selectedFilePath,
+    clearFileViewerUrl,
+    setSearchParams,
+    setRightPanelOpenAnimated,
+  ]);
 
   // The hotkey (⌘⌥[) and command-palette toggle for the left sidebar. A peeking
   // sidebar counts as open, so toggling collapses it; either way peek is
@@ -1651,17 +1711,19 @@ export function AppShell() {
     [selectedFilePath, selectedTerminalKey, clearFileViewerUrl],
   );
 
-  // Auto-surface the Browser tab on a `navigate` action — agent-issued
+  // Auto-open a Browser soft tab on a `navigate` action — agent-issued
   // (browser_navigate) or a chat link the user routed in-app — so the load
   // never lands in a hidden pane, even behind an open file or shell tab.
   // Browser-capable shells only (neither source fires without the bridge).
   useEffect(() => {
     if (!supportsBrowser()) return;
     const surfaceBrowserTab = (sourceConversationId: string) => {
-      writeSessionWorkspaceState(sourceConversationId, { selectedBrowserId: null });
+      // The mounted WorkspacePanel hook owns the active session's tab state.
+      // Persist here only for background sessions that have no mounted hook.
+      if (sourceConversationId !== conversationId) openAgentBrowserTab(sourceConversationId);
       if (sourceConversationId === conversationId) {
         handleRightRailTabChange("browser");
-        setRightPanelOpen(true);
+        setRightPanelOpenAnimated(true);
       }
     };
     const unsubscribeLink = onInAppLinkOpen(surfaceBrowserTab);
@@ -1673,7 +1735,7 @@ export function AppShell() {
       unsubscribeLink();
       unsubscribeAction();
     };
-  }, [conversationId, handleRightRailTabChange]);
+  }, [conversationId, handleRightRailTabChange, setRightPanelOpenAnimated]);
 
   // A side chat the user just opened must be visible: reveal the Workspace rail
   // so its soft tab shows. WorkspacePanel owns opening/selecting the tab and
@@ -1682,8 +1744,8 @@ export function AppShell() {
   const sideChatToOpen = useChatStore((s) => s.sideChatToOpen);
   useEffect(() => {
     if (sideChatToOpen === null) return;
-    setRightPanelOpen(true);
-  }, [sideChatToOpen]);
+    setRightPanelOpenAnimated(true);
+  }, [sideChatToOpen, setRightPanelOpenAnimated]);
 
   function openTerminalsPanel(key: string) {
     setSelectedFilePath(null); // close file viewer
@@ -1715,10 +1777,10 @@ export function AppShell() {
       setFilesPanelOpen(false);
       setSubagentsPanelOpen(false);
       setShellsPanelOpen(false);
-      setRightPanelOpen(true);
+      setRightPanelOpenAnimated(true);
       if (conversationId) writeSessionWorkspaceState(conversationId, { open: true });
     },
-    [clearFileViewerUrl, conversationId],
+    [clearFileViewerUrl, conversationId, setRightPanelOpenAnimated],
   );
 
   // ⌘⌥T (Ctrl+Alt+T) opens a new shell — the keyboard path for the tab-strip
@@ -1887,9 +1949,15 @@ export function AppShell() {
     setFilesPanelOpen(false);
     setSubagentsPanelOpen(false);
     setRightRailTab("github");
-    setRightPanelOpen(true);
+    setRightPanelOpenAnimated(true);
     if (conversationId) writeSessionWorkspaceState(conversationId, { open: true });
-  }, [conversationId, terminalFirst, setPanelInitialKey, openGithubPanel]);
+  }, [
+    conversationId,
+    terminalFirst,
+    setPanelInitialKey,
+    openGithubPanel,
+    setRightPanelOpenAnimated,
+  ]);
 
   function openMainExecutionLog() {
     // Mobile FAB → "Execution logs" jumps straight to the main thread.
@@ -2199,6 +2267,7 @@ export function AppShell() {
             workspace card stays visible alongside. */}
               <div
                 data-workspace-panel-resizing={inlinePanelResizing || undefined}
+                data-workspace-panel-animate={rightPanelVisibilityAnimating || undefined}
                 className={cn(
                   "relative flex min-h-0 min-w-0 flex-1",
                   panelOpen && !terminalFirst && "md:hidden",
@@ -2326,6 +2395,7 @@ export function AppShell() {
                     inert={!workspacePanelVisible || inlinePanelWidth === 0}
                     open={workspacePanelVisible}
                     resizing={inlinePanelResizing}
+                    animateVisibility={rightPanelVisibilityAnimating}
                     handleProps={inlinePanelHandleProps}
                     rightRailTab={rightRailTab}
                     onRightRailTabChange={handleRightRailTabChange}

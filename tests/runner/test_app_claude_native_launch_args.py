@@ -375,7 +375,7 @@ def bridge_dir(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
     ``augment_claude_args`` validates the bridge dir against the real
     ``$TMPDIR/omnigent-<uid>/claude-native`` root, so a raw ``tmp_path`` is
     rejected. Point the bridge root and its trusted parent at the test's temp
-    dir the way ``tests/test_claude_native_bridge.py`` does.
+    dir the way ``tests/harnesses/claude_native/test_claude_native_bridge.py`` does.
 
     :param monkeypatch: Pytest monkeypatch fixture.
     :param tmp_path: Per-test temp directory.

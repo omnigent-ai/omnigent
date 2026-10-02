@@ -551,11 +551,14 @@
   overflow: hidden;
   opacity: 0;
   transform: translateX(12px);
+  pointer-events: none;
+}
+
+.workspace-panel-motion[data-animate-visibility] {
   transition:
     width 300ms ease-in-out,
     opacity 300ms ease-in-out,
     transform 300ms ease-in-out;
-  pointer-events: none;
 }
 
 .workspace-panel-motion[data-state="open"] {
@@ -568,12 +571,16 @@
   transition: none;
 }
 
+[data-workspace-panel-animate] .chat-header {
+  transition: right 300ms ease-in-out;
+}
+
 [data-workspace-panel-resizing] .chat-header {
   transition: none;
 }
 
 @starting-style {
-  .workspace-panel-motion[data-state="open"] {
+  .workspace-panel-motion[data-state="open"][data-animate-visibility] {
     width: 0 !important;
     opacity: 0;
     transform: translateX(12px);
