@@ -26,6 +26,9 @@ import type { AgentBundleInput, MCPServerInput } from "@/lib/agentBundle";
  */
 const DEFAULT_HARNESS = Object.keys(BRAIN_HARNESS_LABELS)[0];
 
+/** The server's rule for agent names (`omnigent/spec/validator.py`). */
+const AGENT_NAME_PATTERN = /^[a-zA-Z0-9_-]+$/;
+
 /** A single MCP server row in the form. */
 interface MCPFormEntry {
   /** Stable key for React list rendering. */
@@ -180,7 +183,7 @@ export function CreateAgentDialog({
 
   function handleSubmit() {
     const trimmedName = name.trim();
-    if (!trimmedName) return;
+    if (!AGENT_NAME_PATTERN.test(trimmedName)) return;
 
     onCreate({
       name: trimmedName,
@@ -194,7 +197,8 @@ export function CreateAgentDialog({
     onOpenChange(false);
   }
 
-  const canSubmit = name.trim().length > 0 && model.trim().length > 0;
+  const nameInvalid = name.trim().length > 0 && !AGENT_NAME_PATTERN.test(name.trim());
+  const canSubmit = AGENT_NAME_PATTERN.test(name.trim()) && model.trim().length > 0;
 
   async function handleImport(bundle: File | undefined) {
     if (!bundle || !onImport) return;
@@ -240,8 +244,19 @@ export function CreateAgentDialog({
               value={name}
               onChange={(e) => setName(e.target.value)}
               placeholder="my-agent"
+              aria-invalid={nameInvalid || undefined}
+              aria-describedby={nameInvalid ? "create-agent-name-error" : undefined}
               autoFocus
             />
+            {nameInvalid && (
+              <p
+                id="create-agent-name-error"
+                data-testid="create-agent-name-error"
+                className="text-xs text-destructive"
+              >
+                Use only letters, numbers, hyphens, and underscores.
+              </p>
+            )}
           </div>
 
           {/* Description */}

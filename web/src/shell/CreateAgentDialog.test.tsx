@@ -34,6 +34,23 @@ describe("CreateAgentDialog", () => {
     expect(scrollRegion).toHaveClass("px-1", "-mx-1");
   });
 
+  it("accepts only names the server accepts", () => {
+    const onCreate = vi.fn();
+    renderDialog({ onCreate });
+    fireEvent.change(screen.getByTestId("create-agent-model"), { target: { value: "m" } });
+
+    fireEvent.change(screen.getByTestId("create-agent-name"), { target: { value: "Agent 1" } });
+    expect(screen.getByTestId("create-agent-name-error")).toHaveTextContent(
+      "Use only letters, numbers, hyphens, and underscores.",
+    );
+    expect(screen.getByTestId("create-agent-submit")).toBeDisabled();
+
+    fireEvent.change(screen.getByTestId("create-agent-name"), { target: { value: "agent-1" } });
+    expect(screen.queryByTestId("create-agent-name-error")).toBeNull();
+    fireEvent.click(screen.getByTestId("create-agent-submit"));
+    expect(onCreate).toHaveBeenCalledWith(expect.objectContaining({ name: "agent-1" }));
+  });
+
   it("hides Import bundle without an import handler", () => {
     renderDialog();
     expect(screen.queryByTestId("create-agent-import")).toBeNull();
