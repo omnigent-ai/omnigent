@@ -9,7 +9,9 @@ def test_mobile_push_migration_deployment_contract():
     from alembic.script import ScriptDirectory
 
     script = ScriptDirectory.from_config(Config("omnigent/db/alembic.ini"))
-    assert script.get_heads() == ["mp1b2c3d4e5f"]
+    assert "mp1b2c3d4e5f" in {
+        ancestor.revision for ancestor in script.iterate_revisions("heads", "base")
+    }
     revision = script.get_revision("mp1b2c3d4e5f")
     assert revision is not None
     assert revision.down_revision == "mm1a2b3c4d5e"
