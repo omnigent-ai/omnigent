@@ -1856,13 +1856,16 @@ export function CreateScheduledTaskDialog({
           <Input
             id="task-name"
             value={name}
-            placeholder="Name your automation"
+            placeholder="Open PR Rebase - {{YYYY-MM-DD}}"
             aria-label="Automation title"
             aria-required
             data-testid="task-name-input"
             className="h-9 px-3 font-heading text-[1.25em] font-[600] md:text-[1.25em]"
             onChange={(event) => setName(event.target.value)}
           />
+          <p className="text-sm text-muted-foreground">
+            {"Add {{YYYY-MM-DD}} or {{MMM DD}} to put each run's date in its session name."}
+          </p>
           <DialogDescription className="sr-only">
             {triggerMode
               ? "Starts an agent session for each matching item."
