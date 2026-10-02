@@ -1,6 +1,6 @@
 import { useMemo, useState } from "react";
-import { ChevronDownIcon, KeyRoundIcon, SearchIcon, SettingsIcon } from "lucide-react";
-import { Link } from "@/lib/routing";
+import { ChevronDownIcon, KeyRoundIcon, Plus, SearchIcon, SettingsIcon } from "lucide-react";
+import { Link, useNavigate } from "@/lib/routing";
 import { Button } from "@/components/ui/button";
 import {
   DropdownMenu,
@@ -24,7 +24,7 @@ import {
 } from "@/lib/harnessSetup";
 import { NATIVE_CODING_AGENTS } from "@/lib/nativeCodingAgents";
 import { BackButton, HarnessCatalog } from "./HarnessCatalog";
-import { notAvailableYet } from "./harnessCatalogMocks";
+import { useSettingsRoute } from "../../shell/settingsNav";
 
 interface HarnessEntry {
   /** Native harness slug (e.g. "claude-native") — the readiness/install key. */
@@ -75,7 +75,8 @@ const HARNESS_ENTRIES: HarnessEntry[] = [...NATIVE_CODING_AGENTS]
  * harness's details at /settings/harnesses/<harness>. An unknown slug shows the
  * grid. Host selection lives here so it survives grid ↔ details navigation.
  */
-export const SettingsHarnessesSection = ({ harness }: { harness?: string }) => {
+export const SettingsHarnessesSection = () => {
+  const { harness } = useSettingsRoute();
   const [query, setQuery] = useState("");
   const [installedOnly, setInstalledOnly] = useState(false);
   const info = useServerInfo();
@@ -155,7 +156,7 @@ export const SettingsHarnessesSection = ({ harness }: { harness?: string }) => {
               <TabsList>
                 <TabsTrigger value="all">All</TabsTrigger>
                 <TabsTrigger value="installed" data-testid="harness-filter-installed">
-                  Installed
+                  Configured
                 </TabsTrigger>
               </TabsList>
             </Tabs>
@@ -234,7 +235,7 @@ function HostSelect({
   if (hosts.length === 0) return null;
   return (
     <div className="flex items-center gap-2">
-      <span className="text-ui text-muted-foreground">Run on</span>
+      <span className="text-ui text-muted-foreground">Machine</span>
       <DropdownMenu>
         <DropdownMenuTrigger asChild>
           <Button
@@ -288,7 +289,7 @@ function harnessStatus(harness: string, host: Host | null) {
 
 function HarnessStatusText({ status }: { status: ReturnType<typeof harnessStatus> }) {
   if (status.ready) {
-    return <span className="text-xs text-green-600 dark:text-green-400">Installed</span>;
+    return <span className="text-xs text-green-600 dark:text-green-400">Configured</span>;
   }
   if (status.needsSetup) {
     return (
@@ -311,14 +312,16 @@ function HarnessIcon({ entry }: { entry: HarnessEntry }) {
 function SetupButton({ entry, onSetup }: { entry: HarnessEntry; onSetup: () => void }) {
   return (
     <Button
-      variant="outline"
-      size="sm"
-      className="h-7 shrink-0"
+      variant="ghost"
+      size="icon-sm"
+      className="shrink-0"
+      aria-label={`Set up ${entry.name}`}
       data-testid={`harness-action-${entry.harness}`}
       componentId="settings.harnesses.setup"
       onClick={onSetup}
     >
-      Set up
+      <Plus />
+      {/* Set up */}
     </Button>
   );
 }
@@ -336,6 +339,7 @@ function HarnessCard({
   onSetup: () => void;
 }) {
   const status = harnessStatus(entry.harness, host);
+  const navigate = useNavigate();
   const body = (
     <>
       <div className="flex items-start justify-between gap-2">
@@ -347,7 +351,20 @@ function HarnessCard({
           </div>
         </div>
         {status.ready && (
-          <SettingsIcon className="size-4 shrink-0 text-muted-foreground" aria-hidden />
+          <Button
+            size="icon-sm"
+            variant="ghost"
+            aria-label={`${entry.name} settings`}
+            data-testid={`harness-settings-${entry.harness}`}
+            componentId="settings.harnesses.open_settings"
+            onClick={(e) => {
+              // Inside the card's link: don't also follow it to the MCP servers tab.
+              e.preventDefault();
+              navigate(`/settings/harnesses/${entry.harness}?tab=settings`);
+            }}
+          >
+            <SettingsIcon className="size-4 shrink-0 text-muted-foreground" aria-hidden />
+          </Button>
         )}
         {status.needsSetup && canSetup && <SetupButton entry={entry} onSetup={onSetup} />}
       </div>
@@ -396,34 +413,29 @@ function HarnessDetail({
             <HarnessStatusText status={status} />
           </div>
         </div>
-        {status.ready ? (
-          <Button variant="outline" size="sm" onClick={notAvailableYet}>
-            Uninstall
-          </Button>
-        ) : (
-          status.needsSetup && canSetup && <SetupButton entry={entry} onSetup={onSetup} />
-        )}
+        {status.needsSetup && canSetup && <SetupButton entry={entry} onSetup={onSetup} />}
       </div>
-      {status.ready && (
-        <CredentialCard gateway={host?.gateway_inference?.[entry.harness] === true} />
-      )}
     </>
   );
+  const credential = <CredentialCard gateway={host?.gateway_inference?.[entry.harness] === true} />;
   // The host inventory only covers these families' MCP servers, skills, and plugins.
   const family = BRAND_HARNESSES.find((f) => INVENTORY_HARNESS_IDS[f] === entry.harness);
   if (status.ready && host && family) {
-    return <HarnessCatalog header={header} harnessName={entry.name} host={host} family={family} />;
+    return <HarnessCatalog header={header} settings={credential} host={host} family={family} />;
   }
   return (
     <>
       {header}
-      <div className="mt-6">
+      <div className="mt-6 flex flex-col gap-6">
         {!host ? (
           <NoHostNotice />
         ) : status.ready ? (
-          <p className="text-ui text-muted-foreground">
-            MCP servers, skills, and plugins aren't listed for {entry.name} yet.
-          </p>
+          <>
+            <p className="text-ui text-muted-foreground">
+              MCP servers, skills, and plugins aren't listed for {entry.name} yet.
+            </p>
+            {credential}
+          </>
         ) : (
           <p className="text-ui text-muted-foreground">
             Set up {entry.name} on {host.name} to manage its MCP servers, skills, and plugins.
@@ -434,19 +446,14 @@ function HarnessDetail({
   );
 }
 
-/** Where the harness's login comes from. Reconfiguring it is not wired yet. */
+/** Where the harness's login comes from. */
 function CredentialCard({ gateway }: { gateway: boolean }) {
   return (
-    <section className="mt-6 flex flex-col gap-2">
+    <section className="flex flex-col gap-2">
       <h2 className="text-xs font-medium tracking-wide text-muted-foreground uppercase">
         Credential
       </h2>
-      <button
-        type="button"
-        onClick={notAvailableYet}
-        aria-label="Reconfigure credential"
-        className="flex cursor-pointer items-center gap-3 rounded-xl border border-border p-3 text-left transition-colors hover:bg-muted/50"
-      >
+      <div className="flex items-center gap-3 rounded-xl border border-border p-3">
         <span className="flex size-8 shrink-0 items-center justify-center rounded-lg bg-muted">
           <KeyRoundIcon className="size-4 text-muted-foreground" />
         </span>
@@ -458,7 +465,7 @@ function CredentialCard({ gateway }: { gateway: boolean }) {
               : "Uses the harness's own login on this host"}
           </span>
         </span>
-      </button>
+      </div>
     </section>
   );
 }

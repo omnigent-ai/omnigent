@@ -56,7 +56,7 @@ vi.mock("@/hooks/useHarnessInventory", async (importActual) => ({
 // so drive that flag through the server-info mock.
 let harnessInstall = true;
 vi.mock("@/lib/CapabilitiesContext", () => ({
-  useServerInfo: () => ({ features: { harness_install: harnessInstall } }),
+  useServerInfo: () => ({ features: { harness_install: harnessInstall, harnesses: true } }),
 }));
 
 // The real ComposerAgentIcon pulls in the whole composer; stub it to a marker.
@@ -83,7 +83,7 @@ vi.mock("@/shell/HarnessSetupDialog", () => ({
 function renderHarnesses(harness?: string) {
   render(
     <MemoryRouter initialEntries={[`/settings/harnesses${harness ? `/${harness}` : ""}`]}>
-      <SettingsHarnessesSection harness={harness} />
+      <SettingsHarnessesSection />
     </MemoryRouter>,
   );
 }
@@ -119,7 +119,7 @@ describe("Harnesses grid", () => {
     renderHarnesses();
 
     // claude-native is ready → "Installed", no action button.
-    expect(within(card("claude-native")).getByText("Installed")).toBeTruthy();
+    expect(within(card("claude-native")).getByText("Configured")).toBeTruthy();
     expect(screen.queryByTestId("harness-action-claude-native")).toBeNull();
 
     // codex-native reports needs-auth → warning badge + a Set-up button.
@@ -186,7 +186,7 @@ describe("Harnesses grid", () => {
     hosts = [ONLINE];
     renderHarnesses();
 
-    selectTab("Installed");
+    selectTab("Configured");
 
     expect(card("claude-native")).toBeTruthy();
     expect(screen.queryByTestId("harness-card-codex-native")).toBeNull();
@@ -201,19 +201,43 @@ describe("Harnesses grid", () => {
   });
 });
 
+describe("Harness card navigation", () => {
+  const selected = (name: string) =>
+    screen.getByRole("tab", { name }).getAttribute("aria-selected");
+
+  it("opens the details on MCP servers from the card", () => {
+    hosts = [ONLINE];
+    renderHarnesses();
+
+    fireEvent.click(card("claude-native"));
+    expect(selected("MCP servers · 2")).toBe("true");
+  });
+
+  it("opens the details on Settings from the card's gear", () => {
+    hosts = [ONLINE];
+    renderHarnesses();
+
+    fireEvent.click(screen.getByTestId("harness-settings-claude-native"));
+    expect(selected("Settings")).toBe("true");
+  });
+});
+
 describe("Harness details", () => {
   it("shows the header, gateway credential, and catalog tabs for an installed harness", () => {
     hosts = [{ ...ONLINE, gateway_inference: { "claude-native": true } }];
     renderHarnesses("claude-native");
 
     expect(screen.getByRole("heading", { name: "Claude Code" })).toBeTruthy();
-    expect(screen.getByText("AI Gateway")).toBeTruthy();
     // Counts and rows cover this harness's family only.
     expect(screen.getByRole("tab", { name: "MCP servers · 2" })).toBeTruthy();
     expect(screen.getByRole("tab", { name: "Skills · 1" })).toBeTruthy();
     expect(screen.getByRole("tab", { name: "Plugins · 1" })).toBeTruthy();
     expect(screen.getByTestId("catalog-row-github")).toBeTruthy();
     expect(screen.queryByTestId("catalog-row-docs")).toBeNull();
+
+    // The credential lives under the Settings tab.
+    selectTab("Settings");
+    expect(screen.getByText("AI Gateway")).toBeTruthy();
   });
 
   it("opens a skill's page and returns to the Skills tab on Back", () => {
@@ -229,6 +253,16 @@ describe("Harness details", () => {
     expect(screen.getByRole("tab", { name: "Skills · 1" }).getAttribute("aria-selected")).toBe(
       "true",
     );
+  });
+
+  it("expands an MCP server in place to list its tools", () => {
+    hosts = [ONLINE];
+    renderHarnesses("claude-native");
+
+    expect(screen.queryByText("search_github")).toBeNull();
+    expect(within(screen.getByTestId("catalog-row-github")).getByText("· 5 tools")).toBeTruthy();
+    fireEvent.click(screen.getByTestId("catalog-row-github"));
+    expect(screen.getByText("search_github")).toBeTruthy();
   });
 
   it("shows a plugin's skills and bundled MCP servers", () => {

@@ -1,43 +1,13 @@
 // Placeholder content for the harness details page where there's no backend
-// yet: Discover catalogs, MCP tool lists, skill contents, and every action.
-// WIP behind the `harnesses` release feature.
-
-import { toast } from "sonner";
+// yet: MCP tool lists and skill contents. WIP behind the `harnesses` release
+// feature.
 
 export type CatalogKind = "mcps" | "skills" | "plugins";
-
-export interface DiscoverItem {
-  name: string;
-  description: string;
-}
-
-/** Stand-in for actions with no backend yet (install, remove, connect, …). */
-export function notAvailableYet() {
-  toast("Not available yet");
-}
 
 /** Sample tool names for an MCP server; the host doesn't report its tools. */
 export function mockTools(server: string): string[] {
   return ["search", "get", "create", "update", "list"].map((verb) => `${verb}_${server}`);
 }
-
-export const MOCK_DISCOVER: Record<CatalogKind, DiscoverItem[]> = {
-  mcps: [
-    { name: "notion", description: "Search and edit pages and databases." },
-    { name: "jira", description: "Read and update issues and sprints." },
-    { name: "google-drive", description: "Find and read documents and sheets." },
-  ],
-  skills: [
-    { name: "accessibility-audit", description: "Check UI against WCAG guidelines." },
-    { name: "incident-response", description: "Guide on-call through triage and mitigation." },
-    { name: "query-optimization", description: "Rewrite slow queries and add indexes." },
-  ],
-  plugins: [
-    { name: "security-toolkit", description: "Scanners, secrets checks, and policy gates." },
-    { name: "observability-suite", description: "Logs, metrics, and tracing helpers." },
-    { name: "release-manager", description: "Versioning, changelogs, and release gates." },
-  ],
-};
 
 /** Sample SKILL.md body; the host doesn't report skill contents. */
 export const MOCK_SKILL_CONTENT = `## Overview
