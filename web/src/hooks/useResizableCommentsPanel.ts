@@ -9,95 +9,146 @@
 // LEFT edge; dragging it leftward widens the panel and the flex-1 code
 // viewer (min-w-0) absorbs the difference.
 //
-// Width is kept in a module-level store so the chosen width survives
+// Under a narrow viewer row the panel stacks below the viewer and the same
+// handle moves to the panel's TOP edge, dragging its height instead
+// (`containerRef.bottom - clientY`).
+//
+// Sizes are kept in module-level stores so the chosen size survives
 // the panel unmounting when comments are toggled off or a different
 // file is opened, matching the other panel-resize hooks. Explicit user
-// resizes are also persisted so a full page reload restores the width.
+// resizes are also persisted so a full page reload restores them.
 
-import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
-import { readPanelSizePreference, writePanelSizePreference } from "@/lib/panelSizePreferences";
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+  useSyncExternalStore,
+} from "react";
+import {
+  readPanelSizePreference,
+  writePanelSizePreference,
+  type PanelSizePreferenceKey,
+} from "@/lib/panelSizePreferences";
 
-const DEFAULT_WIDTH_PX = 240; // matches the previous fixed `md:w-60`
-const MIN_WIDTH_PX = 200;
-const MAX_WIDTH_PX = 640;
-/** Keep at least this much room for the code/diff viewer beside the panel. */
-const MIN_VIEWER_PX = 240;
-/** Tailwind `md` breakpoint — must track the value in tailwind.config. */
-const MD_BREAKPOINT = 768;
+/** Matches the `@md/viewer` container breakpoint; resolved against the root font size. */
+const SIDE_BY_SIDE_MIN_REM = 28;
+const KEYBOARD_STEP_PX = 20;
+
+type Axis = "width" | "height";
 
 // ---------------------------------------------------------------------------
-// Module-level width store (shared across panel remounts within a session)
+// Module-level size stores (shared across panel remounts within a session)
 // ---------------------------------------------------------------------------
 
-// `preferredWidth` mirrors the persisted user choice; `storedWidth` is the
-// effective width after clamping to the available row space. Keeping the
-// preference in memory lets the resize handler re-derive the effective width
-// from it — restoring the larger choice when the row widens again.
-let preferredWidth: number | null = readPanelSizePreference("commentsPanelWidthPx");
-let storedWidth: number | null = preferredWidth;
-const listeners = new Set<() => void>();
+// `preferred` mirrors the persisted user choice; `stored` is the effective
+// size after clamping to the available row space. Keeping the preference in
+// memory lets the resize handler re-derive the effective size from it —
+// restoring the larger choice when the row grows again.
+function createSizeStore(key: PanelSizePreferenceKey) {
+  let preferred: number | null = readPanelSizePreference(key);
+  let stored: number | null = preferred;
+  const listeners = new Set<() => void>();
 
-function persistWidth(value: number | null) {
-  preferredWidth = value;
-  writePanelSizePreference("commentsPanelWidthPx", value);
-}
+  function persist(value: number | null) {
+    preferred = value;
+    writePanelSizePreference(key, value);
+  }
 
-function setStoredWidthRaw(value: number | null, persist = false) {
-  if (value === storedWidth) return;
-  storedWidth = value;
-  if (persist) persistWidth(value);
-  for (const l of listeners) l();
-}
+  function set(next: number | null | ((prev: number | null) => number | null), persistNow = false) {
+    const value = typeof next === "function" ? next(stored) : next;
+    if (value === stored) return;
+    stored = value;
+    if (persistNow) persist(value);
+    for (const l of listeners) l();
+  }
 
-function setStoredWidth(
-  next: number | null | ((prev: number | null) => number | null),
-  persist = false,
-) {
-  setStoredWidthRaw(typeof next === "function" ? next(storedWidth) : next, persist);
-}
-
-/** Snapshot the current width to storage (called once at drag end). */
-function persistStoredWidth() {
-  persistWidth(storedWidth);
-}
-
-function subscribe(cb: () => void): () => void {
-  listeners.add(cb);
-  return () => {
-    listeners.delete(cb);
+  return {
+    subscribe(cb: () => void): () => void {
+      listeners.add(cb);
+      return () => {
+        listeners.delete(cb);
+      };
+    },
+    getSnapshot: () => stored,
+    preferred: () => preferred,
+    set,
+    /** Snapshot the current size to storage (called once at drag end). */
+    persistStored: () => persist(stored),
+    /** Re-read the persisted preference. Only for tests. */
+    reset() {
+      preferred = readPanelSizePreference(key);
+      set(preferred);
+    },
   };
 }
 
-function getSnapshot(): number | null {
-  return storedWidth;
+interface AxisConfig {
+  min: number;
+  max: number;
+  fallback: number;
+  /** Room kept for the viewer on this axis so the panel can't swallow the row. */
+  viewerMin: number;
+  store: ReturnType<typeof createSizeStore>;
+  cursor: "col-resize" | "row-resize";
+  orientation: "vertical" | "horizontal";
 }
+
+const AXES: Record<Axis, AxisConfig> = {
+  // Beside the viewer: the handle is the panel's left edge.
+  width: {
+    min: 200,
+    max: 640,
+    fallback: 240, // matches the previous fixed `md:w-60`
+    viewerMin: 240,
+    store: createSizeStore("commentsPanelWidthPx"),
+    cursor: "col-resize",
+    orientation: "vertical",
+  },
+  // Stacked under a narrow row: the handle is the panel's top edge.
+  height: {
+    min: 160,
+    max: 640,
+    fallback: 256, // matches the previous fixed `h-64`
+    viewerMin: 160,
+    store: createSizeStore("commentsPanelHeightPx"),
+    cursor: "row-resize",
+    orientation: "horizontal",
+  },
+};
+
+const KEY_STEPS: Record<string, [Axis, number]> = {
+  ArrowLeft: ["width", KEYBOARD_STEP_PX],
+  ArrowRight: ["width", -KEYBOARD_STEP_PX],
+  ArrowUp: ["height", KEYBOARD_STEP_PX],
+  ArrowDown: ["height", -KEYBOARD_STEP_PX],
+};
 
 function getServerSnapshot(): number | null {
   return null;
 }
 
-/** Reset module-level width state from localStorage. Only for tests. */
-export function resetCommentsWidthStoreForTesting(): void {
-  preferredWidth = readPanelSizePreference("commentsPanelWidthPx");
-  setStoredWidthRaw(preferredWidth);
+function useAxisSize(axis: Axis): number {
+  const { store, min, max, fallback } = AXES[axis];
+  const raw = useSyncExternalStore(store.subscribe, store.getSnapshot, getServerSnapshot);
+  return Math.max(min, Math.min(raw ?? fallback, max));
+}
+
+/** Reset module-level size state from localStorage. Only for tests. */
+export function resetCommentsSizeStoreForTesting(): void {
+  AXES.width.store.reset();
+  AXES.height.store.reset();
 }
 
 /**
- * Makes the CommentsPanel resizable via a drag handle on its left edge.
- *
- * On desktop (`≥ md`) returns a pixel `width` to apply as an inline style
- * plus `handleProps` for the drag handle. On mobile (`< md`) the panel is
- * stacked full-width below the viewer, so `width` is `undefined` (the
- * `w-full` class wins) and the handle should not be rendered.
- *
- * `containerRef` must be attached to the panel root so drag math can anchor
- * to the panel's right edge, and the dynamic max can leave room for the
- * sibling viewer.
+ * Stack comments when the viewer row is too narrow for side-by-side panes.
+ * Attach `containerRef` to the panel to measure the row and anchor drag math.
  */
 export function useResizableCommentsPanel() {
-  const raw = useSyncExternalStore(subscribe, getSnapshot, getServerSnapshot);
-  const width = Math.max(MIN_WIDTH_PX, Math.min(raw ?? DEFAULT_WIDTH_PX, MAX_WIDTH_PX));
-  const dragging = useRef(false);
+  const width = useAxisSize("width");
+  const height = useAxisSize("height");
+  const dragging = useRef<Axis | null>(null);
   const containerRef = useRef<HTMLDivElement | null>(null);
   const overlayRef = useRef<HTMLDivElement | null>(null);
 
@@ -105,11 +156,10 @@ export function useResizableCommentsPanel() {
   // the pointer stream keeps reaching the parent document. Without it, dragging
   // over a cross-origin/sandboxed iframe (e.g. the HTML preview) routes mousemove
   // /mouseup into the frame, the parent never sees mouseup, and the drag sticks.
-  const addDragOverlay = useCallback(() => {
+  const addDragOverlay = useCallback((cursor: string) => {
     if (overlayRef.current || typeof document === "undefined") return;
     const el = document.createElement("div");
-    el.style.cssText =
-      "position:fixed;inset:0;z-index:2147483647;cursor:col-resize;background:transparent;";
+    el.style.cssText = `position:fixed;inset:0;z-index:2147483647;cursor:${cursor};background:transparent;`;
     document.body.appendChild(el);
     overlayRef.current = el;
   }, []);
@@ -119,65 +169,85 @@ export function useResizableCommentsPanel() {
     overlayRef.current = null;
   }, []);
 
-  const [isDesktop, setIsDesktop] = useState(
-    () => typeof window !== "undefined" && window.innerWidth >= MD_BREAKPOINT,
-  );
+  const [sideBySide, setSideBySide] = useState(false);
+  const axis: Axis = sideBySide ? "width" : "height";
 
-  useEffect(() => {
-    const mql = window.matchMedia(`(min-width: ${MD_BREAKPOINT}px)`);
-    const handler = (e: MediaQueryListEvent) => setIsDesktop(e.matches);
-    mql.addEventListener("change", handler);
-    return () => mql.removeEventListener("change", handler);
+  // Clamp a candidate size to [min, dynamic max], leaving `viewerMin` for the
+  // code/diff viewer beside (width) or above (height) the panel.
+  const clampSize = useCallback((target: Axis, candidate: number): number => {
+    const { min, max, viewerMin } = AXES[target];
+    const row = containerRef.current?.parentElement?.getBoundingClientRect();
+    const available =
+      target === "width" ? row?.width || window.innerWidth : row?.height || window.innerHeight;
+    const dynamicMax = Math.max(min, Math.min(max, available - viewerMin));
+    return Math.max(min, Math.min(candidate, dynamicMax));
   }, []);
 
-  // Clamp a candidate width to [MIN, dynamic max], leaving MIN_VIEWER_PX for
-  // the sibling code/diff viewer so the panel can't swallow the whole row.
-  const clampWidth = useCallback((candidate: number): number => {
-    const parent = containerRef.current?.parentElement;
-    const parentWidth = parent?.getBoundingClientRect().width ?? window.innerWidth;
-    const max = Math.max(MIN_WIDTH_PX, Math.min(MAX_WIDTH_PX, parentWidth - MIN_VIEWER_PX));
-    return Math.max(MIN_WIDTH_PX, Math.min(candidate, max));
-  }, []);
+  // A rail resize changes row size without resizing the window. The row spans
+  // the viewer's content box, the width the `@md/viewer` query measures.
+  useLayoutEffect(() => {
+    const row = containerRef.current?.parentElement;
+    if (!row) return;
+    const update = () => {
+      const rem = parseFloat(getComputedStyle(document.documentElement).fontSize) || 16;
+      setSideBySide(row.getBoundingClientRect().width >= SIDE_BY_SIDE_MIN_REM * rem);
+      // Restore the preferred sizes as space returns.
+      for (const target of ["width", "height"] as const) {
+        const { store, fallback } = AXES[target];
+        store.set(clampSize(target, store.preferred() ?? fallback));
+      }
+    };
+    update();
+    // Without ResizeObserver, fall back to re-measuring on window resizes.
+    if (typeof ResizeObserver === "undefined") {
+      window.addEventListener("resize", update);
+      return () => window.removeEventListener("resize", update);
+    }
+    const ro = new ResizeObserver(update);
+    ro.observe(row);
+    return () => ro.disconnect();
+  }, [clampSize]);
 
   const onMouseDown = useCallback(
     (e: React.MouseEvent) => {
       e.preventDefault();
-      dragging.current = true;
-      addDragOverlay();
-      document.body.style.cursor = "col-resize";
+      dragging.current = axis;
+      addDragOverlay(AXES[axis].cursor);
+      document.body.style.cursor = AXES[axis].cursor;
       document.body.style.userSelect = "none";
     },
-    [addDragOverlay],
+    [addDragOverlay, axis],
   );
 
-  // Keyboard resize: left/right arrows widen/narrow by 20px.
+  // Keyboard resize: left/right arrows change the width, up/down the height.
   const onKeyDown = useCallback(
     (e: React.KeyboardEvent) => {
-      const step = 20;
-      if (e.key === "ArrowLeft") {
-        e.preventDefault();
-        setStoredWidth((prev) => clampWidth((prev ?? DEFAULT_WIDTH_PX) + step), true);
-      } else if (e.key === "ArrowRight") {
-        e.preventDefault();
-        setStoredWidth((prev) => clampWidth((prev ?? DEFAULT_WIDTH_PX) - step), true);
-      }
+      const step = KEY_STEPS[e.key];
+      if (!step) return;
+      e.preventDefault();
+      const [target, delta] = step;
+      const { store, fallback } = AXES[target];
+      store.set((prev) => clampSize(target, (prev ?? fallback) + delta), true);
     },
-    [clampWidth],
+    [clampSize],
   );
 
   useEffect(() => {
     function onMouseMove(e: MouseEvent) {
-      if (!dragging.current || !containerRef.current) return;
-      const right = containerRef.current.getBoundingClientRect().right;
-      // Update the live width only; persist once on release to avoid a
+      const target = dragging.current;
+      if (!target || !containerRef.current) return;
+      const rect = containerRef.current.getBoundingClientRect();
+      const candidate = target === "width" ? rect.right - e.clientX : rect.bottom - e.clientY;
+      // Update the live size only; persist once on release to avoid a
       // synchronous localStorage write per mousemove.
-      setStoredWidth(clampWidth(right - e.clientX));
+      AXES[target].store.set(clampSize(target, candidate));
     }
     function onMouseUp() {
-      if (!dragging.current) return;
-      dragging.current = false;
+      const target = dragging.current;
+      if (!target) return;
+      dragging.current = null;
       removeDragOverlay();
-      persistStoredWidth();
+      AXES[target].store.persistStored();
       document.body.style.cursor = "";
       document.body.style.userSelect = "";
     }
@@ -187,42 +257,29 @@ export function useResizableCommentsPanel() {
       window.removeEventListener("mousemove", onMouseMove);
       window.removeEventListener("mouseup", onMouseUp);
       if (dragging.current) {
-        dragging.current = false;
+        dragging.current = null;
         document.body.style.cursor = "";
         document.body.style.userSelect = "";
       }
       removeDragOverlay();
     };
-  }, [clampWidth, removeDragOverlay]);
-
-  // Re-clamp the stored width when the viewport resizes so a width chosen on
-  // a wider layout doesn't crowd out the viewer after the window shrinks.
-  useEffect(() => {
-    function onResize() {
-      // Re-derive the effective width from the persisted preference so the
-      // panel widens back to the user's choice when the row regains space.
-      setStoredWidth((prev) => {
-        const base = preferredWidth ?? prev;
-        return base !== null ? clampWidth(base) : prev;
-      });
-    }
-    window.addEventListener("resize", onResize);
-    return () => window.removeEventListener("resize", onResize);
-  }, [clampWidth]);
+  }, [clampSize, removeDragOverlay]);
 
   return {
-    /** Pixel width to apply as an inline style (undefined on mobile). */
-    width: isDesktop ? width : undefined,
+    /** Side-by-side width in px; the panel applies it only beside the viewer. */
+    width,
+    /** Stacked height in px; the panel applies it only under a narrow row. */
+    height,
     /** Attach to the panel root to anchor drag math and the dynamic max. */
     containerRef,
-    /** Whether the resize handle should render (desktop only). */
-    isDesktop,
+    /** Whether the panel sits beside the viewer (width handle) or under it (height handle). */
+    sideBySide,
     /** Props to spread onto the resize handle element. */
     handleProps: {
       onMouseDown,
       onKeyDown,
       role: "separator" as const,
-      "aria-orientation": "vertical" as const,
+      "aria-orientation": AXES[axis].orientation,
       "aria-label": "Resize comments panel",
       tabIndex: 0,
     },

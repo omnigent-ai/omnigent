@@ -3,8 +3,20 @@
 // Receives the TipTap Editor instance as a prop and uses editor.chain() for
 // formatting commands, editor.isActive() for active-state badges, and
 // editor.storage.markdown.getMarkdown() for copy / save.
+//
+// The toolbar keeps to a single row: buttons that don't fit the available width
+// fold into a trailing "⋯" menu, lowest priority first (see useToolbarOverflow).
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import {
+  Fragment,
+  createContext,
+  useCallback,
+  useContext,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+} from "react";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { useEditorState } from "@tiptap/react";
 import {
@@ -15,6 +27,7 @@ import {
   Check,
   Code,
   Copy,
+  Ellipsis,
   Heading1,
   Heading2,
   Heading3,
@@ -44,6 +57,13 @@ import type {} from "@tiptap/extension-list";
 import { TableMap, cellAround, colCount, findTable, isInTable } from "@tiptap/pm/tables";
 import { cn } from "@/lib/utils";
 
+const TOOLBAR_BTN_CLASS = "min-w-[1.75rem] rounded px-1.5 py-0.5 text-sm transition-colors";
+const TOOLBAR_BTN_IDLE_CLASS = "text-muted-foreground hover:bg-muted hover:text-foreground";
+const TOOLBAR_BTN_ACTIVE_CLASS = "bg-accent text-accent-foreground";
+
+/** Closes the enclosing "⋯" menu once a folded tool has run. */
+const ToolbarMenuContext = createContext<(() => void) | null>(null);
+
 export function ToolbarBtn({
   children,
   active = false,
@@ -57,6 +77,7 @@ export function ToolbarBtn({
   onClick: () => void;
   className?: string;
 }) {
+  const closeMenu = useContext(ToolbarMenuContext);
   return (
     <button
       type="button"
@@ -64,12 +85,13 @@ export function ToolbarBtn({
       aria-label={title}
       // Prevent the mousedown from stealing focus away from the editor.
       onMouseDown={(e) => e.preventDefault()}
-      onClick={onClick}
+      onClick={() => {
+        onClick();
+        closeMenu?.();
+      }}
       className={cn(
-        "min-w-[1.75rem] rounded px-1.5 py-0.5 text-sm transition-colors",
-        active
-          ? "bg-accent text-accent-foreground"
-          : "text-muted-foreground hover:bg-muted hover:text-foreground",
+        TOOLBAR_BTN_CLASS,
+        active ? TOOLBAR_BTN_ACTIVE_CLASS : TOOLBAR_BTN_IDLE_CLASS,
         className,
       )}
     >
@@ -84,6 +106,7 @@ export function Divider() {
 
 function TableBtn({ editor }: { editor: Editor | null }) {
   const [open, setOpen] = useState(false);
+  const closeMenu = useContext(ToolbarMenuContext);
   const [hovered, setHovered] = useState({ rows: 0, cols: 0 });
   const MAX = 6;
 
@@ -94,7 +117,11 @@ function TableBtn({ editor }: { editor: Editor | null }) {
         aria-label="Insert table"
         disabled={!editor}
         onMouseDown={(e) => e.preventDefault()}
-        className="min-w-[1.75rem] rounded px-1.5 py-0.5 text-sm text-muted-foreground transition-colors hover:bg-muted hover:text-foreground disabled:pointer-events-none disabled:opacity-40"
+        className={cn(
+          TOOLBAR_BTN_CLASS,
+          TOOLBAR_BTN_IDLE_CLASS,
+          "disabled:pointer-events-none disabled:opacity-40",
+        )}
       >
         <Table2 className="size-3.5" />
       </PopoverTrigger>
@@ -129,6 +156,7 @@ function TableBtn({ editor }: { editor: Editor | null }) {
                       })
                       .run();
                     setOpen(false);
+                    closeMenu?.();
                   }}
                   className={cn(
                     "h-5 w-5 cursor-pointer rounded-sm border transition-colors",
@@ -222,6 +250,189 @@ function TableAlignControls({ editor }: { editor: Editor }) {
         <AlignRight className="size-3.5" />
       </ToolbarBtn>
     </>
+  );
+}
+
+type ToolbarGroup = "history" | "block" | "mark" | "list" | "table" | "copy";
+
+interface ToolbarItem {
+  key: string;
+  /** Adjacent inline items from different groups get a divider between them. */
+  group: ToolbarGroup;
+  /** Lower folds into the "⋯" menu first; ties fold right to left. */
+  priority: number;
+  node: React.ReactNode;
+}
+
+type ToolbarSlot = { kind: "item"; item: ToolbarItem } | { kind: "divider"; key: string };
+
+const MEASURE_DIVIDER = "divider";
+const MEASURE_MORE = "more";
+/** Tolerance for sub-pixel rounding in the measured widths. */
+const FIT_SLACK_PX = 2;
+
+/** The inline row's slots: visible items with a divider between adjacent groups. */
+function inlineSequence(items: readonly ToolbarItem[], hidden: ReadonlySet<string>): ToolbarSlot[] {
+  const slots: ToolbarSlot[] = [];
+  let lastGroup: ToolbarGroup | null = null;
+  for (const item of items) {
+    if (item.group === "copy" || hidden.has(item.key)) continue;
+    if (lastGroup !== null && lastGroup !== item.group) {
+      slots.push({ kind: "divider", key: `${item.key}-divider` });
+    }
+    slots.push({ kind: "item", item });
+    lastGroup = item.group;
+  }
+  return slots;
+}
+
+/**
+ * Fold items into a trailing "⋯" menu, lowest priority first, until the row
+ * fits. Widths come from an offscreen clone of every item plus the live status
+ * pill, so the decision never depends on which items are currently inline.
+ */
+function useToolbarOverflow(items: readonly ToolbarItem[]) {
+  const rowRef = useRef<HTMLDivElement | null>(null);
+  const measureRef = useRef<HTMLDivElement | null>(null);
+  const clusterRef = useRef<HTMLDivElement | null>(null);
+  const statusRef = useRef<HTMLButtonElement | null>(null);
+  const itemsRef = useRef(items);
+  const [folded, setFolded] = useState<ReadonlySet<string>>(() => new Set());
+  const itemsKey = items.map((item) => item.key).join(",");
+  // React 18 drops a boolean `inert` prop, so mark the clone inert as it mounts.
+  const setMeasureRef = useCallback((el: HTMLDivElement | null) => {
+    measureRef.current = el;
+    el?.setAttribute("inert", "");
+  }, []);
+
+  useLayoutEffect(() => {
+    itemsRef.current = items;
+  });
+
+  useLayoutEffect(() => {
+    const row = rowRef.current;
+    const measure = measureRef.current;
+    const cluster = clusterRef.current;
+    const status = statusRef.current;
+    if (!row || !measure || !cluster || !status) return;
+
+    const evaluate = () => {
+      const rowStyle = getComputedStyle(row);
+      const padding =
+        (parseFloat(rowStyle.paddingLeft) || 0) + (parseFloat(rowStyle.paddingRight) || 0);
+      const available = row.getBoundingClientRect().width - padding;
+      // Not laid out yet (or jsdom): keep the current fold state.
+      if (available <= 0) return;
+      const gap = parseFloat(rowStyle.columnGap) || 0;
+      const clusterGap = parseFloat(getComputedStyle(cluster).columnGap) || 0;
+      const widths = new Map<string, number>();
+      for (const el of measure.querySelectorAll<HTMLElement>("[data-measure]")) {
+        widths.set(el.dataset.measure ?? "", el.getBoundingClientRect().width);
+      }
+      const statusWidth = status.getBoundingClientRect().width;
+      const current = itemsRef.current;
+
+      const fits = (hidden: ReadonlySet<string>, withMore: boolean): boolean => {
+        const slots = inlineSequence(current, hidden);
+        let total = 0;
+        for (const slot of slots) {
+          total += widths.get(slot.kind === "item" ? slot.item.key : MEASURE_DIVIDER) ?? 0;
+        }
+        let children = slots.length + 1;
+        if (withMore) {
+          total += widths.get(MEASURE_MORE) ?? 0;
+          children += 1;
+        }
+        for (const item of current) {
+          if (item.group === "copy" && !hidden.has(item.key)) {
+            total += (widths.get(item.key) ?? 0) + clusterGap;
+          }
+        }
+        total += statusWidth + Math.max(0, children - 1) * gap;
+        return total + FIT_SLACK_PX <= available;
+      };
+
+      const hidden = new Set<string>();
+      if (!fits(hidden, false)) {
+        const foldOrder = current
+          .map((item, index) => ({ item, index }))
+          .sort((a, b) => a.item.priority - b.item.priority || b.index - a.index);
+        for (const { item } of foldOrder) {
+          hidden.add(item.key);
+          if (fits(hidden, true)) break;
+        }
+      }
+      setFolded((prev) =>
+        prev.size === hidden.size && [...hidden].every((key) => prev.has(key)) ? prev : hidden,
+      );
+    };
+
+    evaluate();
+    // Without ResizeObserver only window resizes re-evaluate the fold.
+    if (typeof ResizeObserver === "undefined") {
+      window.addEventListener("resize", evaluate);
+      return () => window.removeEventListener("resize", evaluate);
+    }
+    const ro = new ResizeObserver(evaluate);
+    ro.observe(row);
+    ro.observe(measure);
+    ro.observe(status);
+    return () => ro.disconnect();
+  }, [itemsKey]);
+
+  return { rowRef, measureRef: setMeasureRef, clusterRef, statusRef, folded };
+}
+
+function ToolbarOverflowMenu({
+  editor,
+  items,
+}: {
+  editor: Editor | null;
+  items: readonly ToolbarItem[];
+}) {
+  const [open, setOpen] = useState(false);
+  // The popover held focus while open; hand it back to the editor afterwards.
+  const close = useCallback(() => {
+    setOpen(false);
+    editor?.commands.focus();
+  }, [editor]);
+  const groups: ToolbarItem[][] = [];
+  for (const item of items) {
+    const last = groups[groups.length - 1];
+    if (last && last[0].group === item.group) last.push(item);
+    else groups.push([item]);
+  }
+
+  return (
+    <Popover open={open} onOpenChange={setOpen}>
+      <PopoverTrigger
+        title="More formatting"
+        aria-label="More formatting"
+        onMouseDown={(e) => e.preventDefault()}
+        className={cn(TOOLBAR_BTN_CLASS, open ? TOOLBAR_BTN_ACTIVE_CLASS : TOOLBAR_BTN_IDLE_CLASS)}
+      >
+        <Ellipsis className="size-3.5" />
+      </PopoverTrigger>
+      <PopoverContent
+        align="end"
+        aria-label="More formatting"
+        className="w-auto gap-1 p-1"
+        // A command refocuses the editor; don't pull focus back to the trigger.
+        onCloseAutoFocus={(e) => {
+          if (editor?.isFocused) e.preventDefault();
+        }}
+      >
+        <ToolbarMenuContext.Provider value={close}>
+          {groups.map((group) => (
+            <div key={group[0].key} role="group" className="flex items-center gap-0.5">
+              {group.map((item) => (
+                <Fragment key={item.key}>{item.node}</Fragment>
+              ))}
+            </div>
+          ))}
+        </ToolbarMenuContext.Provider>
+      </PopoverContent>
+    </Popover>
   );
 }
 
@@ -349,137 +560,301 @@ export function ToolbarPlugin({
   // while offline, mid-conflict, or when there's nothing to persist.
   const saveClickable = !saveDisabled && !hasExternalUpdate && isDirty;
 
-  return (
-    <div className="flex flex-wrap items-center gap-0.5 border-b border-border bg-card px-2 py-1 shrink-0">
-      <ToolbarBtn
-        title="Undo (⌘Z)"
-        onClick={() => editor?.chain().focus().undo().run()}
-        className={!canUndo ? "opacity-30 cursor-default" : ""}
-      >
-        <Undo2 className="size-3.5" />
-      </ToolbarBtn>
-      <ToolbarBtn
-        title="Redo (⌘⇧Z)"
-        onClick={() => editor?.chain().focus().redo().run()}
-        className={!canRedo ? "opacity-30 cursor-default" : ""}
-      >
-        <Redo2 className="size-3.5" />
-      </ToolbarBtn>
-      <Divider />
-      <ToolbarBtn
-        active={isParagraph}
-        title="Normal"
-        onClick={() => editor?.chain().focus().setParagraph().run()}
-      >
-        <Pilcrow className="size-3.5" />
-      </ToolbarBtn>
-      <ToolbarBtn
-        active={isH1}
-        title="Heading 1"
-        onClick={() => editor?.chain().focus().toggleHeading({ level: 1 }).run()}
-      >
-        <Heading1 className="size-3.5" />
-      </ToolbarBtn>
-      <ToolbarBtn
-        active={isH2}
-        title="Heading 2"
-        onClick={() => editor?.chain().focus().toggleHeading({ level: 2 }).run()}
-      >
-        <Heading2 className="size-3.5" />
-      </ToolbarBtn>
-      <ToolbarBtn
-        active={isH3}
-        title="Heading 3"
-        onClick={() => editor?.chain().focus().toggleHeading({ level: 3 }).run()}
-      >
-        <Heading3 className="size-3.5" />
-      </ToolbarBtn>
-      <ToolbarBtn
-        active={isBlockquote}
-        title="Quote"
-        onClick={() => editor?.chain().focus().toggleBlockquote().run()}
-      >
-        <Quote className="size-3.5" />
-      </ToolbarBtn>
-      <Divider />
-      <ToolbarBtn
-        active={isBold}
-        title="Bold (⌘B)"
-        onClick={() => editor?.chain().focus().toggleBold().run()}
-      >
-        <Bold className="size-3.5" />
-      </ToolbarBtn>
-      <ToolbarBtn
-        active={isItalic}
-        title="Italic (⌘I)"
-        onClick={() => editor?.chain().focus().toggleItalic().run()}
-      >
-        <Italic className="size-3.5" />
-      </ToolbarBtn>
-      <ToolbarBtn
-        active={isStrike}
-        title="Strikethrough"
-        onClick={() => editor?.chain().focus().toggleStrike().run()}
-      >
-        <Strikethrough className="size-3.5" />
-      </ToolbarBtn>
-      <ToolbarBtn
-        active={isCode}
-        title="Inline code"
-        onClick={() => editor?.chain().focus().toggleCode().run()}
-      >
-        <Code className="size-3.5" />
-      </ToolbarBtn>
-      <Divider />
-      <ToolbarBtn
-        title="Bullet list"
-        onClick={() => editor?.chain().focus().toggleBulletList().run()}
-      >
-        <List className="size-3.5" />
-      </ToolbarBtn>
-      <ToolbarBtn
-        title="Numbered list"
-        onClick={() => editor?.chain().focus().toggleOrderedList().run()}
-      >
-        <ListOrdered className="size-3.5" />
-      </ToolbarBtn>
-      <ToolbarBtn
-        active={isTaskList}
-        title="Task list"
-        onClick={() => editor?.chain().focus().toggleTaskList().run()}
-      >
-        <ListTodo className="size-3.5" />
-      </ToolbarBtn>
-      <Divider />
-      <TableBtn editor={editor} />
-      {editor && <TableAlignControls editor={editor} />}
-      <div className="ml-auto flex items-center gap-2">
+  // Fold order in a narrow row (lowest priority first): Copy, then the table,
+  // list and block tools, then undo/redo; the inline marks stay inline longest.
+  const items: ToolbarItem[] = [
+    {
+      key: "undo",
+      group: "history",
+      priority: 4,
+      node: (
+        <ToolbarBtn
+          title="Undo (⌘Z)"
+          onClick={() => editor?.chain().focus().undo().run()}
+          className={!canUndo ? "opacity-30 cursor-default" : ""}
+        >
+          <Undo2 className="size-3.5" />
+        </ToolbarBtn>
+      ),
+    },
+    {
+      key: "redo",
+      group: "history",
+      priority: 4,
+      node: (
+        <ToolbarBtn
+          title="Redo (⌘⇧Z)"
+          onClick={() => editor?.chain().focus().redo().run()}
+          className={!canRedo ? "opacity-30 cursor-default" : ""}
+        >
+          <Redo2 className="size-3.5" />
+        </ToolbarBtn>
+      ),
+    },
+    {
+      key: "paragraph",
+      group: "block",
+      priority: 3,
+      node: (
+        <ToolbarBtn
+          active={isParagraph}
+          title="Normal"
+          onClick={() => editor?.chain().focus().setParagraph().run()}
+        >
+          <Pilcrow className="size-3.5" />
+        </ToolbarBtn>
+      ),
+    },
+    {
+      key: "h1",
+      group: "block",
+      priority: 3,
+      node: (
+        <ToolbarBtn
+          active={isH1}
+          title="Heading 1"
+          onClick={() => editor?.chain().focus().toggleHeading({ level: 1 }).run()}
+        >
+          <Heading1 className="size-3.5" />
+        </ToolbarBtn>
+      ),
+    },
+    {
+      key: "h2",
+      group: "block",
+      priority: 3,
+      node: (
+        <ToolbarBtn
+          active={isH2}
+          title="Heading 2"
+          onClick={() => editor?.chain().focus().toggleHeading({ level: 2 }).run()}
+        >
+          <Heading2 className="size-3.5" />
+        </ToolbarBtn>
+      ),
+    },
+    {
+      key: "h3",
+      group: "block",
+      priority: 3,
+      node: (
+        <ToolbarBtn
+          active={isH3}
+          title="Heading 3"
+          onClick={() => editor?.chain().focus().toggleHeading({ level: 3 }).run()}
+        >
+          <Heading3 className="size-3.5" />
+        </ToolbarBtn>
+      ),
+    },
+    {
+      key: "quote",
+      group: "block",
+      priority: 3,
+      node: (
+        <ToolbarBtn
+          active={isBlockquote}
+          title="Quote"
+          onClick={() => editor?.chain().focus().toggleBlockquote().run()}
+        >
+          <Quote className="size-3.5" />
+        </ToolbarBtn>
+      ),
+    },
+    {
+      key: "bold",
+      group: "mark",
+      priority: 6,
+      node: (
+        <ToolbarBtn
+          active={isBold}
+          title="Bold (⌘B)"
+          onClick={() => editor?.chain().focus().toggleBold().run()}
+        >
+          <Bold className="size-3.5" />
+        </ToolbarBtn>
+      ),
+    },
+    {
+      key: "italic",
+      group: "mark",
+      priority: 6,
+      node: (
+        <ToolbarBtn
+          active={isItalic}
+          title="Italic (⌘I)"
+          onClick={() => editor?.chain().focus().toggleItalic().run()}
+        >
+          <Italic className="size-3.5" />
+        </ToolbarBtn>
+      ),
+    },
+    {
+      key: "strike",
+      group: "mark",
+      priority: 5,
+      node: (
+        <ToolbarBtn
+          active={isStrike}
+          title="Strikethrough"
+          onClick={() => editor?.chain().focus().toggleStrike().run()}
+        >
+          <Strikethrough className="size-3.5" />
+        </ToolbarBtn>
+      ),
+    },
+    {
+      key: "code",
+      group: "mark",
+      priority: 5,
+      node: (
+        <ToolbarBtn
+          active={isCode}
+          title="Inline code"
+          onClick={() => editor?.chain().focus().toggleCode().run()}
+        >
+          <Code className="size-3.5" />
+        </ToolbarBtn>
+      ),
+    },
+    {
+      key: "bullet-list",
+      group: "list",
+      priority: 2,
+      node: (
+        <ToolbarBtn
+          title="Bullet list"
+          onClick={() => editor?.chain().focus().toggleBulletList().run()}
+        >
+          <List className="size-3.5" />
+        </ToolbarBtn>
+      ),
+    },
+    {
+      key: "ordered-list",
+      group: "list",
+      priority: 2,
+      node: (
+        <ToolbarBtn
+          title="Numbered list"
+          onClick={() => editor?.chain().focus().toggleOrderedList().run()}
+        >
+          <ListOrdered className="size-3.5" />
+        </ToolbarBtn>
+      ),
+    },
+    {
+      key: "task-list",
+      group: "list",
+      priority: 2,
+      node: (
+        <ToolbarBtn
+          active={isTaskList}
+          title="Task list"
+          onClick={() => editor?.chain().focus().toggleTaskList().run()}
+        >
+          <ListTodo className="size-3.5" />
+        </ToolbarBtn>
+      ),
+    },
+    {
+      key: "table",
+      group: "table",
+      priority: 1,
+      node: (
+        <>
+          <TableBtn editor={editor} />
+          {editor && <TableAlignControls editor={editor} />}
+        </>
+      ),
+    },
+    {
+      key: "copy",
+      group: "copy",
+      priority: 0,
+      node: (
         <ToolbarBtn title="Copy" onClick={handleCopy}>
           {isCopied ? <Check className="size-3.5" /> : <Copy className="size-3.5" />}
         </ToolbarBtn>
-        <button
-          type="button"
-          title={saveStatus.title}
-          aria-label={saveStatus.title}
-          // Keep editor focus so a manual flush doesn't blur mid-edit.
-          onMouseDown={(e) => e.preventDefault()}
-          onClick={saveClickable ? handleSave : undefined}
-          disabled={!saveClickable}
-          className={cn(
-            "flex items-center gap-1 rounded px-2 py-0.5 text-sm transition-colors",
-            saveStatus.tone === "error" &&
-              "text-destructive hover:bg-destructive/10 cursor-pointer",
-            saveStatus.tone === "offline" && "text-warning cursor-default",
-            saveStatus.tone === "pending" &&
-              (saveClickable
-                ? "text-muted-foreground hover:bg-muted hover:text-foreground cursor-pointer"
-                : "text-muted-foreground cursor-default"),
-            saveStatus.tone === "saved" && "text-muted-foreground cursor-default",
-          )}
-        >
-          {saveStatus.tone === "saved" && <Check className="size-3.5" />}
-          {saveStatus.label}
-        </button>
+      ),
+    },
+  ];
+
+  const { rowRef, measureRef, clusterRef, statusRef, folded } = useToolbarOverflow(items);
+  const foldedItems = items.filter((item) => folded.has(item.key));
+  const clusterItems = items.filter((item) => item.group === "copy" && !folded.has(item.key));
+
+  return (
+    <div className="relative shrink-0 border-b border-border bg-card">
+      <div
+        ref={rowRef}
+        role="toolbar"
+        aria-label="Formatting"
+        className="flex flex-nowrap items-center gap-0.5 px-2 py-1"
+      >
+        {inlineSequence(items, folded).map((slot) =>
+          slot.kind === "divider" ? (
+            <Divider key={slot.key} />
+          ) : (
+            <Fragment key={slot.item.key}>{slot.item.node}</Fragment>
+          ),
+        )}
+        {foldedItems.length > 0 && <ToolbarOverflowMenu editor={editor} items={foldedItems} />}
+        <div ref={clusterRef} className="ml-auto flex items-center gap-2">
+          {clusterItems.map((item) => (
+            <Fragment key={item.key}>{item.node}</Fragment>
+          ))}
+          <button
+            ref={statusRef}
+            data-slot="save-status"
+            type="button"
+            title={saveStatus.title}
+            aria-label={saveStatus.title}
+            // Keep editor focus so a manual flush doesn't blur mid-edit.
+            onMouseDown={(e) => e.preventDefault()}
+            onClick={saveClickable ? handleSave : undefined}
+            disabled={!saveClickable}
+            className={cn(
+              "flex items-center gap-1 rounded px-2 py-0.5 text-sm transition-colors",
+              saveStatus.tone === "error" &&
+                "text-destructive hover:bg-destructive/10 cursor-pointer",
+              saveStatus.tone === "offline" && "text-warning cursor-default",
+              saveStatus.tone === "pending" &&
+                (saveClickable
+                  ? "text-muted-foreground hover:bg-muted hover:text-foreground cursor-pointer"
+                  : "text-muted-foreground cursor-default"),
+              saveStatus.tone === "saved" && "text-muted-foreground cursor-default",
+            )}
+          >
+            {saveStatus.tone === "saved" && <Check className="size-3.5" />}
+            {saveStatus.label}
+          </button>
+        </div>
+      </div>
+      {/* Offscreen, inert clone of every item: its widths drive the fold
+          decision independently of the live (state-dependent) row. */}
+      <div
+        ref={measureRef}
+        aria-hidden
+        className="pointer-events-none invisible absolute left-[-9999px] top-0 flex flex-nowrap items-center gap-0.5"
+      >
+        {items.map((item) => (
+          <span key={item.key} data-measure={item.key} className="inline-flex items-center gap-0.5">
+            {item.node}
+          </span>
+        ))}
+        <span data-measure={MEASURE_DIVIDER} className="inline-flex">
+          <Divider />
+        </span>
+        <span data-measure={MEASURE_MORE} className="inline-flex">
+          <button
+            type="button"
+            tabIndex={-1}
+            className={cn(TOOLBAR_BTN_CLASS, TOOLBAR_BTN_IDLE_CLASS)}
+          >
+            <Ellipsis className="size-3.5" />
+          </button>
+        </span>
       </div>
     </div>
   );
