@@ -224,6 +224,14 @@ _UNIFORM_INTERRUPT: dict[str, _UniformInterrupt] = {
         (RuntimeError,),
         True,
     ),
+    "bob": _UniformInterrupt(
+        "omnigent.harnesses.bob_native.bridge",
+        "inject_interrupt",
+        "bob_native_interrupt_failed",
+        "bob-native interrupt",
+        (RuntimeError,),
+        True,
+    ),
 }
 
 # The seven uniform stop harnesses (claude has a special stop; codex/pi have no
@@ -270,6 +278,12 @@ _UNIFORM_STOP: dict[str, _UniformStop] = {
         "devin_native_stop_failed",
         "devin-native stop",
         "Devin",
+    ),
+    "bob": _UniformStop(
+        "omnigent.harnesses.bob_native.bridge",
+        "bob_native_stop_failed",
+        "bob-native stop",
+        "IBM Bob",
     ),
 }
 

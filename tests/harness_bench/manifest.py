@@ -12,6 +12,7 @@ from omnigent.harness_plugins import (
     install_specs,
     model_env_keys,
 )
+from omnigent.models.model_override import harness_supports_model_override
 from omnigent.onboarding.harness_install import required_cli_for_harness
 from tests.e2e._harness_probes import HARNESS_PROBES, HarnessProbe
 from tests.harness_bench.profile import BenchProfile
@@ -40,6 +41,11 @@ _PROBE_ONLY_DECLARED: dict[str, Verdict] = {
 }
 
 
+# Harnesses whose tools run only inside the vendor TUI: Omnigent neither
+# dispatches nor policy-gates them, so tool calling / policy deny are not claimed.
+_NO_OMNIGENT_TOOL_GATE: frozenset[str] = frozenset({"bob-native"})
+
+
 def _implementation_prose(caps: HarnessCapabilities | None) -> str:
     if caps is None:
         return ""
@@ -55,6 +61,9 @@ def _auth_prose(caps: HarnessCapabilities | None) -> str:
 def _declared_from_capabilities(harness: str) -> dict[str, Verdict]:
     """Build declared verdicts, leaving unmodeled capabilities UNKNOWN."""
     declared: dict[str, Verdict] = dict(_PROBE_ONLY_DECLARED)
+    if harness in _NO_OMNIGENT_TOOL_GATE:
+        declared["tool_calling"] = Verdict.UNSUPPORTED
+        declared["policy_deny"] = Verdict.UNSUPPORTED
 
     caps = harness_capabilities().get(harness)
     if caps is not None:
@@ -70,8 +79,11 @@ def _declared_from_capabilities(harness: str) -> dict[str, Verdict]:
             if supported is not None:
                 declared[dimension] = Verdict.SUPPORTED if supported else Verdict.UNSUPPORTED
 
-    if harness in model_env_keys() or is_native_harness(harness):
+    if harness in model_env_keys() or harness_supports_model_override(harness):
         declared["model_override"] = Verdict.SUPPORTED
+    elif is_native_harness(harness):
+        # A native CLI with no launch-time model flag (e.g. bob-native).
+        declared["model_override"] = Verdict.UNSUPPORTED
 
     return declared
 

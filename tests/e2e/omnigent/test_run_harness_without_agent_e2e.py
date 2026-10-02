@@ -236,6 +236,10 @@ def test_run_harness_live_matrix_covers_registered_coding_harnesses() -> None:
     this matrix to drive. Its coverage is the dedicated devin-native
     bridge/forwarder/executor unit tests plus the Devin picker e2e_ui suite.
 
+    ``bob-native`` is excluded for the same reasons: a terminal-first TUI launched
+    via ``omni bob``, wrapping the own-auth ``bob`` CLI. Its coverage is
+    ``tests/test_bob_native.py`` plus the opt-in ``test_bob_native_cli_e2e.py``.
+
     Builtin ACP CLI harnesses (every row of ``ACP_CLI_HARNESSES``) are excluded
     for the same reason as ``goose``: each wraps an own-auth vendor CLI, so its
     spawn env carries no gateway/profile probe vars for this matrix to drive.
@@ -263,6 +267,7 @@ def test_run_harness_live_matrix_covers_registered_coding_harnesses() -> None:
         "hermes",
         "hermes-native",
         "devin-native",
+        "bob-native",
         *ACP_CLI_HARNESSES,
     }
     assert {probe.harness for probe in HARNESS_PROBES} == expected_live_harnesses

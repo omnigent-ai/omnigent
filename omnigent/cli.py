@@ -1752,6 +1752,7 @@ _HARNESS_COMMANDS: frozenset[str] = frozenset(
     {
         "agy",
         "antigravity",
+        "bob",
         "claude",
         "codex",
         "copilot",
@@ -2099,6 +2100,7 @@ _CLICK_SUBCOMMANDS: frozenset[str] = frozenset(
         "agy",
         "antigravity",
         "attach",
+        "bob",
         "claude",
         "codex",
         "config",
@@ -7283,7 +7285,8 @@ def session_import(input_path: str, title: str | None, server: str | None) -> No
 _HARNESS_CHOICES_HELP = (
     "'claude' (alias for 'claude-sdk'), 'claude-sdk', 'codex', "
     "'cursor', 'kimi', "
-    "'openai-agents', 'open-responses', 'pi', 'antigravity', 'qwen', 'goose', or 'copilot'"
+    "'openai-agents', 'open-responses', 'pi', 'antigravity', 'qwen', 'goose', 'copilot', "
+    "or 'bob' (alias for 'bob-native')"
 )
 _HARNESS_HELP = f"Harness to use for a local agent: {_HARNESS_CHOICES_HELP}."
 _RUN_HARNESS_HELP = (
@@ -7609,6 +7612,9 @@ class _NativeTerminalDispatchSpec:
     args_param: str
     model_strategy: Literal["passthrough", "first_class", "explicit_passthrough"] = "passthrough"
     prompt_param: str | None = None
+    # ``module:function`` called with the launcher's pass-through args before any
+    # backend starts; raises ``click.ClickException`` for args the CLI rejects.
+    preflight: str | None = None
 
 
 _NATIVE_TERMINAL_DISPATCH_SPECS: dict[str, _NativeTerminalDispatchSpec] = {
@@ -7683,6 +7689,15 @@ _NATIVE_TERMINAL_DISPATCH_SPECS: dict[str, _NativeTerminalDispatchSpec] = {
         function="run_hermes_native",
         args_param="extra_args",
         model_strategy="explicit_passthrough",
+    ),
+    # An explicit ``--model`` reaches Bob's argv allowlist, which rejects it
+    # with a pointer to Bob's in-app model choice (Bob 2.x has no model flag).
+    "bob": _NativeTerminalDispatchSpec(
+        module="omnigent.harnesses.bob_native.main",
+        function="run_bob_native",
+        args_param="extra_args",
+        model_strategy="explicit_passthrough",
+        preflight="omnigent.harnesses.bob_native.launch_args:preflight_bob_cli_args",
     ),
 }
 
@@ -7766,8 +7781,18 @@ def _dispatch_native_terminal_harness(
             f"the REPL-only option(s) {', '.join(unsupported)} have no effect there — remove them."
         )
 
-    server = _ensure_backend(server)
     passthrough = ("--model", model) if model else ()
+    if spec.model_strategy == "first_class":
+        launcher_args: tuple[str, ...] = ()
+    elif spec.model_strategy == "explicit_passthrough":
+        launcher_args = passthrough if model_from_cli else ()
+    else:
+        launcher_args = passthrough
+    if spec.preflight is not None:
+        module_name, _, function_name = spec.preflight.partition(":")
+        getattr(import_module(module_name), function_name)(launcher_args)
+
+    server = _ensure_backend(server)
 
     # Resolve --continue to a concrete conversation id (the wrappers take a
     # session id / picker, not a "latest" flag). Precedence matches the REPL:
@@ -7796,13 +7821,9 @@ def _dispatch_native_terminal_harness(
         "auto_open_conversation": auto_open_conversation,
     }
     launcher_kwargs: dict[str, object] = dict(common)
+    launcher_kwargs[spec.args_param] = launcher_args
     if spec.model_strategy == "first_class":
-        launcher_kwargs[spec.args_param] = ()
         launcher_kwargs["model"] = model
-    elif spec.model_strategy == "explicit_passthrough":
-        launcher_kwargs[spec.args_param] = passthrough if model_from_cli else ()
-    else:
-        launcher_kwargs[spec.args_param] = passthrough
     if spec.prompt_param is not None:
         launcher_kwargs[spec.prompt_param] = prompt
 

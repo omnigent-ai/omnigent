@@ -16,6 +16,7 @@ from typing import TypeVar, cast
 
 from omnigent._wrapper_labels import (
     ANTIGRAVITY_NATIVE_WRAPPER_VALUE,
+    BOB_NATIVE_WRAPPER_VALUE,
     CLAUDE_NATIVE_WRAPPER_VALUE,
     CODEX_NATIVE_WRAPPER_VALUE,
     CURSOR_NATIVE_WRAPPER_VALUE,
@@ -266,6 +267,15 @@ HERMES_NATIVE_CODING_AGENT = NativeCodingAgent(
     terminal_name="hermes",
 )
 
+BOB_NATIVE_CODING_AGENT = NativeCodingAgent(
+    key="bob",
+    display_name="IBM Bob",
+    agent_name="bob-native-ui",
+    harness="bob-native",
+    wrapper_label=BOB_NATIVE_WRAPPER_VALUE,
+    terminal_name="bob",
+)
+
 
 # Native harnesses whose spawn-env builder takes a ``bridge_id=`` resolved from
 # a session label. Their label key follows the uniform
@@ -324,6 +334,7 @@ _BUILTIN_NATIVE_PROVIDERS: tuple[NativeHarnessProvider, ...] = tuple(
         KIMI_NATIVE_CODING_AGENT,
         HERMES_NATIVE_CODING_AGENT,
         DEVIN_NATIVE_CODING_AGENT,
+        BOB_NATIVE_CODING_AGENT,
     )
 )
 
@@ -578,6 +589,28 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         shell_tool_prompt=_SHELL_PROMPT,
         instruction_delivery=_ID.NOT_DELIVERED,
     ),
+    # bob-native runs IBM Bob Shell's own TUI (`bob chat`) and mirrors only the
+    # terminal: Bob's approval dialog stays the sole tool gate (no Omnigent
+    # elicitation), Bob 2.x has no model flag, and no transcript is forwarded.
+    # Steering relies on Bob's composer staying open mid-turn ("Enter to steer"),
+    # observed on Bob 2.0.5; interrupt is Bob's documented Escape key.
+    "bob-native": _C(
+        _IM.NATIVE_TUI,
+        _EL.NONE,
+        _RS.WARM_REATTACH,
+        _EF.NONE,
+        _MF.MULTI,
+        _AU.OWN_AUTH,
+        subagents=False,
+        interrupt=True,
+        streaming=False,
+        steering=True,
+        live_queue=True,
+        fork_history=_FH.NONE,
+        shell_tool_name="execute_command",
+        shell_tool_prompt=_SHELL_PROMPT,
+        instruction_delivery=_ID.NOT_DELIVERED,
+    ),
     # SDK / subprocess harnesses (run the vendor model directly). The first four
     # are bench-verified interrupt=streaming=True.
     "claude-sdk": _C(
@@ -759,6 +792,7 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
             "acp",
             "antigravity",
             "antigravity-native",
+            "bob-native",
             "claude-native",
             "claude-sdk",
             "codex",
@@ -793,6 +827,7 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
         "devin-native": "omnigent.inner.devin_native_harness",
         "antigravity": "omnigent.inner.antigravity_harness",
         "antigravity-native": "omnigent.inner.antigravity_native_harness",
+        "bob-native": "omnigent.inner.bob_native_harness",
         "claude-native": "omnigent.inner.claude_native_harness",
         "claude-sdk": "omnigent.inner.claude_sdk_harness",
         "codex": "omnigent.inner.codex_harness",
@@ -818,6 +853,9 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
         **{alias: name for name, row in ACP_CLI_HARNESSES.items() for alias in row.aliases},
         "agy": "antigravity",
         "agy-native": "antigravity-native",
+        # IBM Bob Shell has only the native TUI wrap, so the bare vendor
+        # spelling resolves to it (as ``opencode`` -> ``opencode-native``).
+        "bob": "bob-native",
         "claude": "claude-sdk",
         # Both vendor spellings resolve to the native wrap, mirroring
         # ``opencode`` -> ``opencode-native``. ``devin-acp`` was the built-in ACP
@@ -834,6 +872,7 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
         "kimi-code": "kimi",
         "native-agy": "antigravity-native",
         "native-antigravity": "antigravity-native",
+        "native-bob": "bob-native",
         "native-devin": "devin-native",
         "native-goose": "goose-native",
         "native-hermes": "hermes-native",
@@ -850,6 +889,7 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
         {
             "agy-native",
             "antigravity-native",
+            "bob-native",
             "claude-native",
             "codex-native",
             "cursor-native",
@@ -860,6 +900,7 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
             "kiro-native",
             "native-agy",
             "native-antigravity",
+            "native-bob",
             "native-claude",
             "native-codex",
             "native-cursor",
@@ -889,6 +930,7 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
         KIMI_NATIVE_CODING_AGENT,
         HERMES_NATIVE_CODING_AGENT,
         DEVIN_NATIVE_CODING_AGENT,
+        BOB_NATIVE_CODING_AGENT,
     ),
     native_providers=_BUILTIN_NATIVE_PROVIDERS,
     # Catalog rows gate readiness on their vendor binary; the install spec also

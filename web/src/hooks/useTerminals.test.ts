@@ -796,6 +796,10 @@ describe("inventoryTerminals", () => {
     expect(isAgentTerminalKey("terminal:terminal_hermes_main")).toBe(true);
   });
 
+  it("treats the bob vendor pane as the agent terminal", () => {
+    expect(isAgentTerminalKey("terminal:terminal_bob_main")).toBe(true);
+  });
+
   it("drops the antigravity vendor pane for native Antigravity sessions", () => {
     // Regression (#1157): terminal_antigravity_main was missing from
     // AGENT_TERMINAL_IDS, so the agy TUI pane leaked into the Shells inventory
