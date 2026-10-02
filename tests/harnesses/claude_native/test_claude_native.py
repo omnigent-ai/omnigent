@@ -6602,7 +6602,7 @@ def test_is_claude_native_conversation_returns_false_on_transport_error(
 #
 # These tests drive ``_align_working_directory_with_session``
 # directly. The state module's roundtrip / persistence is covered
-# in ``tests/test_claude_native_state.py``; here we exercise the
+# in ``tests/harnesses/claude_native/test_claude_native_state.py``; here we exercise the
 # decision-table behavior: matching cwd → no-op, mismatched +
 # switch → chdir, mismatched + move → transcript move,
 # mismatched + missing path → ClickException, legacy session →

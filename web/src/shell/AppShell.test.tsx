@@ -25,6 +25,7 @@ import { useFileViewer } from "./FileViewerContext";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { ServerInfo } from "@/lib/capabilities";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
+import { AGENT_BROWSER_TAB_ID } from "@/hooks/useBrowserTabs";
 import { clearOptimisticTitles, recordOptimisticTitle } from "@/lib/optimisticTitles";
 import { readSessionWorkspaceState, writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
 import { writeWorkspacePanelDefault } from "@/lib/workspacePanelPreferences";
@@ -2571,9 +2572,37 @@ describe("Right workspace card visibility", () => {
     const exiting = document.querySelector('aside[aria-label="Workspace"]');
     expect(exiting).not.toBeNull();
     expect(exiting).toHaveAttribute("data-state", "closed");
+    expect(exiting).toHaveAttribute("data-animate-visibility", "true");
     expect(exiting).toHaveClass("workspace-panel-motion", "md:overflow-hidden");
     expect(exiting).toHaveStyle({ width: "0px" });
+    expect(headerGroup).toHaveAttribute("data-workspace-panel-animate", "true");
     expect(headerGroup?.style.getPropertyValue("--workspace-panel-offset")).toBe("0px");
+  });
+
+  it("restores a different session width without visibility motion", () => {
+    useEnvironmentMock.mockReturnValue({
+      data: { available: false, root: null, home: null },
+      isLoading: false,
+    } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
+    writeSessionWorkspaceState("conv_narrow", { open: true, widthPx: 280 });
+    writeSessionWorkspaceState("conv_wide", { open: true, widthPx: 480 });
+    mockConversations([
+      { id: "conv_narrow", permission_level: null },
+      { id: "conv_wide", permission_level: null },
+    ]);
+
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(sessionShellTree(qc, "/c/conv_narrow", <SessionNavButton to="/c/conv_wide" />));
+    const first = screen.getByRole("complementary", { name: "Workspace" });
+    expect(first).toHaveStyle({ width: "280px" });
+    expect(first).not.toHaveAttribute("data-animate-visibility");
+
+    fireEvent.click(screen.getByTestId("nav-session"));
+
+    const second = screen.getByRole("complementary", { name: "Workspace" });
+    expect(second).toHaveStyle({ width: "480px" });
+    expect(second).not.toHaveAttribute("data-animate-visibility");
+    expect(second.parentElement).not.toHaveAttribute("data-workspace-panel-animate");
   });
 
   it("keeps the card mounted with Agents as the only tab for a minimal agent", () => {
@@ -2731,7 +2760,7 @@ describe("Right workspace card visibility", () => {
     expect(screen.getByRole("tab", { name: /Files/i })).toHaveAttribute("aria-selected", "false");
   });
 
-  it("preserves a remembered Browser tab when the outgoing Files tab becomes unavailable", () => {
+  it("preserves a remembered Browser soft tab when the outgoing Files tab becomes unavailable", () => {
     vi.stubGlobal("omnigentDesktop", {
       kind: "electron",
       browserOpenOrNavigate: vi.fn(),
@@ -2739,7 +2768,11 @@ describe("Right workspace card visibility", () => {
     });
     try {
       writeSessionWorkspaceState("conv_from", { rightRailTab: "files" });
-      writeSessionWorkspaceState("conv_to", { rightRailTab: "browser" });
+      writeSessionWorkspaceState("conv_to", {
+        rightRailTab: "browser",
+        openBrowsers: [AGENT_BROWSER_TAB_ID],
+        selectedBrowserId: AGENT_BROWSER_TAB_ID,
+      });
       useEnvironmentMock.mockImplementation(
         (id) =>
           ({
@@ -2805,18 +2838,83 @@ describe("Right workspace card visibility", () => {
     expect(readSessionWorkspaceState("conv_child").rightRailTab).toBe("changes");
   });
 
-  it("falls back to Files when the remembered tab is unavailable", () => {
-    writeSessionWorkspaceState("conv_no_browser", { rightRailTab: "browser" });
-    useEnvironmentMock.mockReturnValue({
-      data: { available: true, root: null, home: null },
-      isLoading: false,
-    } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
-    mockConversations([{ id: "conv_no_browser", permission_level: null }]);
+  it("falls back to Files when Browser mode has no open soft tab", async () => {
+    vi.stubGlobal("omnigentDesktop", {
+      kind: "electron",
+      browserOpenOrNavigate: vi.fn(),
+      setBadgeCount: vi.fn(),
+    });
+    try {
+      writeSessionWorkspaceState("conv_no_browser", { rightRailTab: "browser" });
+      useEnvironmentMock.mockReturnValue({
+        data: { available: true, root: null, home: null },
+        isLoading: false,
+      } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
+      mockConversations([{ id: "conv_no_browser", permission_level: null }]);
 
-    renderShell("/c/conv_no_browser");
+      renderShell("/c/conv_no_browser");
 
-    expect(screen.queryByRole("tab", { name: /Browser/i })).toBeNull();
-    expect(screen.getByRole("tab", { name: /Files/i })).toHaveAttribute("aria-selected", "true");
+      expect(screen.queryByRole("tab", { name: /Browser/i })).toBeNull();
+      await waitFor(() =>
+        expect(screen.getByRole("tab", { name: /Files/i })).toHaveAttribute(
+          "aria-selected",
+          "true",
+        ),
+      );
+    } finally {
+      cleanup();
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("keeps an active file and its URL when the last background browser closes", async () => {
+    vi.stubGlobal("omnigentDesktop", {
+      kind: "electron",
+      browserOpenOrNavigate: vi.fn(),
+      browserClose: vi.fn().mockResolvedValue({ ok: true }),
+      setBadgeCount: vi.fn(),
+    });
+    function FileOpenProbe() {
+      const openFile = useFileViewer();
+      return (
+        <>
+          <button type="button" onClick={() => openFile?.("README.md")}>
+            Open cited file
+          </button>
+          <LocationDisplay />
+        </>
+      );
+    }
+    try {
+      writeSessionWorkspaceState("conv_browser_file", {
+        open: true,
+        rightRailTab: "browser",
+        openBrowsers: ["browser-1"],
+        selectedBrowserId: "browser-1",
+      });
+      useEnvironmentMock.mockReturnValue({
+        data: { available: true, root: null, home: null },
+        isLoading: false,
+      } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
+      mockConversations([{ id: "conv_browser_file", permission_level: null }]);
+
+      const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+      render(sessionShellTree(qc, "/c/conv_browser_file", <FileOpenProbe />));
+      fireEvent.click(screen.getByRole("button", { name: "Open cited file" }));
+      expect(screen.getByTestId("file-viewer-inline")).toHaveAttribute("data-path", "README.md");
+      expect(screen.getByTestId("url-params")).toHaveTextContent("file=README.md");
+
+      fireEvent.click(screen.getByRole("button", { name: "Close Browser 1" }));
+
+      await waitFor(() =>
+        expect(screen.queryByRole("tab", { name: "Browser 1" })).not.toBeInTheDocument(),
+      );
+      expect(screen.getByTestId("file-viewer-inline")).toHaveAttribute("data-path", "README.md");
+      expect(screen.getByTestId("url-params")).toHaveTextContent("file=README.md");
+    } finally {
+      cleanup();
+      vi.unstubAllGlobals();
+    }
   });
 
   it("falls back to Agents when the preferred tab and Files are unavailable", () => {

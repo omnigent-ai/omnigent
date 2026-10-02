@@ -6539,6 +6539,7 @@ describe("NewChatLandingScreen", () => {
     // connect-host proves the menu actually opened — without it, a closed
     // menu would make the absence assertion below pass vacuously.
     expect(screen.getByTestId("new-chat-landing-connect-host")).toBeTruthy();
+    expect(screen.getByText("My machines")).toBeTruthy();
     expect(screen.queryByTestId("new-chat-landing-sandbox-option")).toBeNull();
   });
 
@@ -7441,6 +7442,18 @@ describe("NewChatLandingScreen skills menu", () => {
       await waitFor(() => expect(input.selectionStart).toBe(18));
     },
   );
+
+  it("preserves adjacent prose after a partial inline skill", async () => {
+    mockAgents([skilledAgent()]);
+    renderLanding();
+    typeMessage("please /revthis change");
+    const input = screen.getByTestId("new-chat-landing-input") as HTMLTextAreaElement;
+    await userEvent.click(input);
+    fireEvent.select(input, { target: { selectionStart: 11, selectionEnd: 11 } });
+    fireEvent.keyDown(input, { key: "Tab" });
+    expect(input).toHaveValue("please /review-pr this change");
+    await waitFor(() => expect(input.selectionStart).toBe(18));
+  });
 
   it.each([" then /rev", "\nkeep this", "\tkeep this"])(
     "keeps completion at the caret before %j",

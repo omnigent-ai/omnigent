@@ -324,7 +324,7 @@ uv run --no-sync pytest -q tests/inner/test_terminal.py tests/runner/test_termin
 uv run --no-sync pytest -q tests/e2e/test_codex_continuous_diagnostics_e2e.py
 uv run --no-sync pytest -q tests/e2e/test_codex_native_runtime_diagnostics_e2e.py
 uv run --no-sync pytest -q tests/e2e_ui/chat/test_codex_early_tui_startup_error.py
-uv run --no-sync pytest -q tests/test_claude_native_diagnostics.py tests/test_claude_native_diagnostics_integration.py
+uv run --no-sync pytest -q tests/harnesses/claude_native/test_claude_native_diagnostics.py tests/harnesses/claude_native/test_claude_native_diagnostics_integration.py
 ```
 
 These tests inject a startup timeout and an ended event stream, inspect the
