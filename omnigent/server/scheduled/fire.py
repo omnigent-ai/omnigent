@@ -133,6 +133,7 @@ from omnigent.server.scheduled.harness_settings import (
     scheduled_agent_harness,
     validate_scheduled_permission_mode,
 )
+from omnigent.server.scheduled.name_template import render_session_name
 from omnigent.server.scheduled.rrule import is_one_time_rule
 from omnigent.server.scheduled.run_sharing import (
     delete_task_grants,
@@ -470,11 +471,14 @@ class _NewRunRecorder:
                 await self._deps.startup_inputs.record_launch_failure(conv.id, reason)
 
 
-def _scheduled_session_title(task: ScheduledTask) -> str:
+def _scheduled_session_title(task: ScheduledTask, session_name: str | None = None) -> str:
+    session_name = task.name if session_name is None else session_name
     if is_trigger_automation(task):
-        return f"[automation job] {task.name}"
-    if task.session_mode == "continue":
-        return task.name
+        return f"[automation job] {session_name}"
+    # A templated name already carries its date (or falls back to the literal
+    # template), so only plain names get the fire time appended.
+    if task.session_mode == "continue" or "{{" in task.name:
+        return session_name
     # Every run of a new-session task would otherwise share the task's name,
     # leaving the sidebar with a column of identical titles.
     return f"{task.name} ({format_run_time(time.time(), task_timezone(task))})"
@@ -791,13 +795,14 @@ async def _run_fire(
             )
             return
 
-        recorder = _NewRunRecorder(deps, task, int(time.time()))
+        scheduled_at = int(time.time())
+        recorder = _NewRunRecorder(deps, task, scheduled_at)
         try:
             with (
                 account_authority_scope(task.user_id, task.account_generation),
                 host_owner_scope(task.user_id, task.account_generation),
             ):
-                await _run_fire_for_task(deps, task, fire_dispatch, recorder)
+                await _run_fire_for_task(deps, task, fire_dispatch, recorder, scheduled_at)
         except Exception:
             _logger.exception("scheduled fire: task %s failed", task.id)
         finally:
@@ -810,6 +815,7 @@ async def _run_fire_for_task(
     task: ScheduledTask,
     fire_dispatch: _FireDispatch,
     recorder: _FireRecorder,
+    scheduled_at: int,
 ) -> None:
     """Run a task, routed by ``execution_target``, recording progress on *recorder*.
 
@@ -951,6 +957,7 @@ async def _run_fire_for_task(
                 SCHEDULED_TASK_INITIAL_RUN_LABEL_KEY: recorder.run_id,
             },
             workflow=workflow,
+            scheduled_at=scheduled_at,
         )
         log_session_created(conv.id)
     except _CannotLaunchScheduledFire as exc:
@@ -2085,10 +2092,13 @@ async def _create_session(
     *,
     labels: dict[str, str],
     workflow: Workflow | None,
+    scheduled_at: int,
 ) -> Conversation:
     # Host operations and database threads can commit after caller cancellation.
     creation = asyncio.create_task(
-        _create_session_resources(deps, task, labels=labels, workflow=workflow)
+        _create_session_resources(
+            deps, task, labels=labels, workflow=workflow, scheduled_at=scheduled_at
+        )
     )
     try:
         return await asyncio.shield(creation)
@@ -2116,6 +2126,7 @@ async def _create_session_resources(
     *,
     labels: dict[str, str],
     workflow: Workflow | None,
+    scheduled_at: int,
 ) -> Conversation:
     """Create a conversation bound to the task's agent, carrying the stored spec.
 
@@ -2164,6 +2175,15 @@ async def _create_session_resources(
         labels[SCHEDULED_TASK_WORKTREE_SOURCE_LABEL_KEY] = worktree_root_fingerprint(workspace)
         workspace = worktree.workspace or worktree.worktree_path
         labels[WORKTREE_ROOT_LABEL_KEY] = worktree_root_fingerprint(worktree.worktree_path)
+    session_name = task.name
+    try:
+        session_name = render_session_name(task.name, scheduled_at, task.timezone)
+        if len(session_name) > 768:
+            raise ValueError("rendered name exceeds 768 Unicode code points")
+    except Exception as exc:
+        session_name = task.name
+        _logger.exception("scheduled fire: task %s name renderer traceback", task.id)
+        _logger.warning("scheduled fire: task %s name rendering failed: %.160s", task.id, exc)
     conv: Conversation | None = None
     try:
         if task.source_session_id is not None:
@@ -2174,12 +2194,13 @@ async def _create_session_resources(
                 launch_args=launch_args,
                 workspace=workspace,
                 git_branch=worktree.branch if worktree else None,
+                session_name=session_name,
             )
         else:
             conv = await asyncio.to_thread(
                 deps.conversation_store.create_conversation,
                 agent_id=task.agent_id,
-                title=_scheduled_session_title(task),
+                title=_scheduled_session_title(task, session_name),
                 host_id=task.host_id,
                 workspace=workspace,
                 git_branch=worktree.branch if worktree else None,
@@ -2236,6 +2257,7 @@ async def _copy_source_session_for_run(
     launch_args: list[str] | None,
     workspace: str | None,
     git_branch: str | None,
+    session_name: str,
 ) -> Conversation:
     """Start a run's session as a copy of the task's source session.
 
@@ -2308,7 +2330,7 @@ async def _copy_source_session_for_run(
             file_store=deps.file_store,
             artifact_store=deps.artifact_store,
             source_id=task.source_session_id,
-            title=_scheduled_session_title(task),
+            title=_scheduled_session_title(task, session_name),
             agent_id=task.agent_id,
             created_by=task.user_id or RESERVED_USER_LOCAL,
             project_id=project_id,
@@ -3446,7 +3468,9 @@ class ClaimedRunExecutor:
                     self._fire_dispatch.reuse or _make_reuse_dispatch(self._deps),
                 )
                 return
-            await _run_fire_for_task(self._deps, task, self._fire_dispatch, recorder)
+            await _run_fire_for_task(
+                self._deps, task, self._fire_dispatch, recorder, lease.run.scheduled_at
+            )
 
     async def _fail_revoked_fire(self, task: ScheduledTask, recorder: _FireRecorder) -> None:
         # A deleted owner's identity is revoked too; disable the task as the
