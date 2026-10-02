@@ -154,9 +154,9 @@ def test_touch_records_stamp_and_clear_forwards_it_as_not_after(
     """``touch`` remembers its own stamp; ``clear`` forwards it as ``not_after``.
 
     The disconnect handler relies on this stamp surviving the clear itself
-    (never erased here — only :func:`session_live_state.configure` resets
-    it), so a later cross-replica check still has something to compare
-    against.
+    (only :func:`session_live_state.forget_liveness_stamp` or
+    :func:`session_live_state.configure` drops it), so a later cross-replica
+    check still has something to compare against.
     """
     assert session_live_state.last_liveness_stamp("runner_c") is None
 
@@ -171,6 +171,21 @@ def test_touch_records_stamp_and_clear_forwards_it_as_not_after(
 
     # The clear call itself never erases the process's own record of it.
     assert session_live_state.last_liveness_stamp("runner_c") == stamp
+
+
+@pytest.mark.usefixtures("recording_store")
+def test_forget_liveness_stamp_releases_reference_until_next_touch() -> None:
+    """``forget`` drops the process's own stamp; the next touch re-records it."""
+    session_live_state.forget_liveness_stamp("runner_d")  # never stamped: no-op
+
+    session_live_state.touch_runner_liveness(["runner_d"])
+    assert session_live_state.last_liveness_stamp("runner_d") is not None
+
+    session_live_state.forget_liveness_stamp("runner_d")
+    assert session_live_state.last_liveness_stamp("runner_d") is None
+
+    session_live_state.touch_runner_liveness(["runner_d"])
+    assert session_live_state.last_liveness_stamp("runner_d") is not None
 
 
 def test_unconfigured_module_is_a_no_op() -> None:

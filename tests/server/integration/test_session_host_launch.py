@@ -3223,3 +3223,38 @@ async def test_rider_of_a_refused_relaunch_surfaces_the_refusal(
             f"host refusal: {item!r}"
         )
         assert "omnigent setup" in item["message"], item
+
+
+async def test_runner_crash_report_releases_liveness_stamp_reference(
+    app: FastAPI,
+) -> None:
+    """A daemon crash report releases the liveness-stamp reference: it cancels the
+    grace timer that would otherwise release it."""
+    from omnigent.server import session_live_state
+
+    runner_id = "runner_crashed_after_connect"
+    # What the connect hook leaves behind for a runner that tunnelled in
+    # before dying.
+    session_live_state.touch_runner_liveness([runner_id])
+    assert session_live_state.last_liveness_stamp(runner_id) is not None
+
+    comm = await _connect_host(app)
+    try:
+        frame = HostRunnerExitedFrame(
+            runner_id=runner_id, error="runner process exited with code 1"
+        )
+        await comm.send_input({"type": "websocket.receive", "text": encode_host_frame(frame)})
+
+        deadline = Deadline(5.0)
+        while (
+            session_live_state.last_liveness_stamp(runner_id) is not None
+            and deadline.remaining() > 0
+        ):
+            await asyncio.sleep(0.01)
+        assert session_live_state.last_liveness_stamp(runner_id) is None, (
+            "liveness-stamp reference retained after the crash report cancelled "
+            "the disconnect-grace timer"
+        )
+    finally:
+        await comm.send_input({"type": "websocket.disconnect", "code": 1000})
+        await comm.wait(timeout=budget(5.0))

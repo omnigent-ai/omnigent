@@ -73,8 +73,9 @@ _executor: ThreadPoolExecutor | None = None
 _last_status: WorkspaceScopedCache[str, str] = WorkspaceScopedCache()
 # Last count persisted per session, for dedupe.
 _last_pending: WorkspaceScopedCache[str, int] = WorkspaceScopedCache()
-# This process's own last touch_runner_liveness() stamp per runner id.
-# Never erased by clear_runner_liveness — only configure() resets it.
+# This process's own last touch_runner_liveness() stamp per runner id. The
+# clear never erases an entry; forget_liveness_stamp() releases it once no
+# disconnect decision on this replica needs it, and configure() resets all.
 # custom-lint: disable-next=workspace-scoped-cache -- keyed by globally-unique runner_id
 _last_liveness_stamp: dict[str, int] = {}
 
@@ -325,9 +326,15 @@ def last_liveness_stamp(runner_id: str) -> int | None:
     :param runner_id: Runner id to look up.
     :returns: The epoch-second value from this process's most recent
         :func:`touch_runner_liveness` call naming *runner_id*, or
-        ``None`` if it never stamped one.
+        ``None`` if it never stamped one or the reference was released by
+        :func:`forget_liveness_stamp`.
     """
     return _last_liveness_stamp.get(runner_id)
+
+
+def forget_liveness_stamp(runner_id: str) -> None:
+    """Drop this process's stamp for a runner once no disconnect decision needs it."""
+    _last_liveness_stamp.pop(runner_id, None)
 
 
 def clear_runner_liveness(runner_id: str) -> None:
@@ -339,7 +346,10 @@ def clear_runner_liveness(runner_id: str) -> None:
     reaches this — the TTL self-corrects it. Passes this process's own
     last stamp as ``not_after``, so the clear can never erase a fresher
     stamp another replica already wrote for a runner that re-tunnelled
-    there before this disconnect was processed.
+    there before this disconnect was processed. A peer stamp written in
+    the same second as this process's own last stamp is indistinguishable
+    at second granularity and is cleared too; the peer's next heartbeat
+    restores it well inside the liveness lease.
 
     :param runner_id: The disconnected runner's id.
     """

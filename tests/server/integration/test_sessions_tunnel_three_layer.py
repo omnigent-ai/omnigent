@@ -1664,6 +1664,141 @@ async def test_runner_disconnect_grace_spares_runner_live_on_another_replica(
 
 @pytest.mark.asyncio
 @pytest.mark.usefixtures("_isolated_session_status_cache")
+@pytest.mark.parametrize("live_elsewhere", [False, True], ids=["turn_failed", "live_elsewhere"])
+async def test_disconnect_grace_resolution_releases_liveness_stamp_reference(
+    tunnel_three_layer_stack: _TunnelStack,
+    monkeypatch: pytest.MonkeyPatch,
+    live_elsewhere: bool,
+) -> None:
+    """A resolved disconnect grace releases this replica's liveness-stamp reference,
+    whether the turn is failed or the runner is found live on another replica."""
+    from omnigent.runtime import get_conversation_store
+    from omnigent.server import session_live_state
+    from omnigent.server.routes import sessions as sessions_module
+
+    ap_client = tunnel_three_layer_stack.ap_client
+    ap_app = tunnel_three_layer_stack.ap_app
+
+    grace = 0.4
+    monkeypatch.setattr("omnigent.server.routes.sessions.RUNNER_DISCONNECT_GRACE_S", grace)
+    _stub_connect_hook_for_pumpless_ws(ap_app, monkeypatch)
+
+    create_resp = await ap_client.post(
+        "/v1/sessions",
+        data={"metadata": json.dumps({})},
+        files={
+            "bundle": (
+                "agent.tar.gz",
+                _build_harness_agent_bundle(),
+                "application/gzip",
+            ),
+        },
+    )
+    assert create_resp.status_code == 201, create_resp.text
+    session_id = create_resp.json()["session_id"]
+    runner_id = "runner-liveness-reference"
+    store = get_conversation_store()
+    store.replace_runner_id(session_id, runner_id)
+
+    communicator = await _connect_runner_tunnel(ap_app, runner_id)
+    await _send_hello_and_wait(communicator, ap_app, runner_id, harnesses=[_TEST_HARNESS_NAME])
+    sessions_module._session_status_cache[session_id] = "running"
+
+    try:
+        own = session_live_state.last_liveness_stamp(runner_id)
+        assert own is not None, "the hello did not record this replica's own stamp"
+
+        # Graceful disconnect: clears liveness and arms the reconnect-grace timer.
+        await communicator.send_input({"type": "websocket.disconnect", "code": 1000})
+        await communicator.wait(timeout=budget(2.0))
+        if live_elsewhere:
+            # Let the disconnect-time clear land, then stamp the row the way
+            # the replica now holding the tunnel does.
+            await asyncio.sleep(0.1)
+            store.touch_runner_liveness([runner_id], own + 1)
+
+        # The timer resolves the seeded ``running`` either way: failed with
+        # the runner gone for good, or relinquished to the other replica.
+        async def _grace_resolved() -> None:
+            while sessions_module._session_status_cache.get(session_id) == "running":
+                await asyncio.sleep(0.02)
+
+        await asyncio.wait_for(_grace_resolved(), timeout=grace * 10)
+        cached = sessions_module._session_status_cache.get(session_id)
+        assert cached == (None if live_elsewhere else "failed"), cached
+        assert session_live_state.last_liveness_stamp(runner_id) is None, (
+            "liveness-stamp reference retained after the disconnect grace resolved"
+        )
+    finally:
+        sessions_module._session_status_cache.pop(session_id, None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("_isolated_session_status_cache")
+async def test_reconnect_within_grace_keeps_liveness_stamp_reference(
+    tunnel_three_layer_stack: _TunnelStack,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A runner that re-tunnels here inside the grace keeps its reference; the next
+    disconnect still passes it as ``not_after``."""
+    from omnigent.runtime import get_conversation_store
+    from omnigent.server import session_live_state
+    from omnigent.server.routes import sessions as sessions_module
+
+    ap_client = tunnel_three_layer_stack.ap_client
+    ap_app = tunnel_three_layer_stack.ap_app
+
+    grace = 0.4
+    monkeypatch.setattr("omnigent.server.routes.sessions.RUNNER_DISCONNECT_GRACE_S", grace)
+    _stub_connect_hook_for_pumpless_ws(ap_app, monkeypatch)
+
+    create_resp = await ap_client.post(
+        "/v1/sessions",
+        data={"metadata": json.dumps({})},
+        files={
+            "bundle": (
+                "agent.tar.gz",
+                _build_harness_agent_bundle(),
+                "application/gzip",
+            ),
+        },
+    )
+    assert create_resp.status_code == 201, create_resp.text
+    session_id = create_resp.json()["session_id"]
+    runner_id = "runner-liveness-reference-reconnect"
+    get_conversation_store().replace_runner_id(session_id, runner_id)
+
+    communicator = await _connect_runner_tunnel(ap_app, runner_id)
+    await _send_hello_and_wait(communicator, ap_app, runner_id, harnesses=[_TEST_HARNESS_NAME])
+    sessions_module._session_status_cache[session_id] = "running"
+
+    reconnect_communicator: ApplicationCommunicator | None = None
+    try:
+        await communicator.send_input({"type": "websocket.disconnect", "code": 1000})
+        await communicator.wait(timeout=budget(2.0))
+        reconnect_communicator = await _connect_runner_tunnel(ap_app, runner_id)
+        await _send_hello_and_wait(
+            reconnect_communicator, ap_app, runner_id, harnesses=[_TEST_HARNESS_NAME]
+        )
+        # Let the now-moot grace timer resolve with the runner back here.
+        await asyncio.sleep(grace * 2)
+        assert sessions_module._session_status_cache.get(session_id) != "failed"
+        assert session_live_state.last_liveness_stamp(runner_id) is not None, (
+            "reconnect inside the grace released the liveness-stamp reference"
+        )
+    finally:
+        if reconnect_communicator is not None:
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await reconnect_communicator.send_input(
+                    {"type": "websocket.disconnect", "code": 1000},
+                )
+            with contextlib.suppress(asyncio.TimeoutError, Exception):
+                await reconnect_communicator.wait(timeout=budget(2.0))
+        sessions_module._session_status_cache.pop(session_id, None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("_isolated_session_status_cache")
 async def test_server_initiated_close_never_fails_the_turn(
     tunnel_three_layer_stack: _TunnelStack,
     monkeypatch: pytest.MonkeyPatch,
