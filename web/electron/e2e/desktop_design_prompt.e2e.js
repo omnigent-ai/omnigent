@@ -445,5 +445,36 @@ describe(
         },
       );
     }
+
+    it(
+      "forwards recent-session switching from the focused embedded page",
+      { timeout: 60_000 },
+      async () => {
+        const page = await eventually(
+          () =>
+            electronApp
+              .context()
+              .pages()
+              .find((candidate) => candidate.url() === fixtures.radix.url),
+          "focused embedded fixture",
+        );
+        await page.locator("#scenario-period").click();
+        const switcher = window.getByRole("dialog", { name: "Recent sessions" });
+
+        await page.keyboard.down("Control");
+        await page.keyboard.press("Tab");
+        await switcher.waitFor();
+        await page.keyboard.press("Escape");
+        await switcher.waitFor({ state: "hidden" });
+        await page.keyboard.up("Control");
+        assert.equal(new URL(window.url()).pathname, `/c/${backend.sessionId}`);
+
+        await page.keyboard.down("Control");
+        await page.keyboard.press("Tab");
+        await switcher.waitFor();
+        await page.keyboard.up("Control");
+        await window.waitForURL(`${backend.serverUrl}/c/${backend.otherSessionId}`);
+      },
+    );
   },
 );

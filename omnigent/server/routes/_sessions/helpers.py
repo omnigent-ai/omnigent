@@ -187,6 +187,7 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _LAST_TASK_ERROR_AGENT_NAME_LABEL_KEY,
     _LAST_TASK_ERROR_CAUSE_LABEL_KEY,
     _LAST_TASK_ERROR_CODE_LABEL_KEY,
+    _LAST_TASK_ERROR_ITEM_ID_LABEL_KEY,
     _LAST_TASK_ERROR_MESSAGE_LABEL_KEY,
     _LAST_TASK_ERROR_REMEDIATION_LABEL_KEY,
     _LAST_TASK_ERROR_TITLE_LABEL_KEY,
@@ -4990,6 +4991,7 @@ async def _persist_session_status_error_labels(
     conversation_store: ConversationStore,
     *,
     agent_name: str | None = None,
+    item_id: str | None = None,
 ) -> None:
     """
     Persist or clear the reload-visible failure detail for a session status.
@@ -5005,6 +5007,8 @@ async def _persist_session_status_error_labels(
         ``None`` to clear stale error labels on subsequent activity.
     :param conversation_store: Store used to upsert labels.
     :param agent_name: Agent responsible for this failure, captured before a rebind.
+    :param item_id: Persisted item a ``runner_rejected_event`` failure refers to, so
+        a client whose POST answer was lost can match the refusal to its own send.
     """
     # Structured fields are optional (present only when the runner classified
     # the failure). Always write all keys — empty when absent — because the
@@ -5018,6 +5022,7 @@ async def _persist_session_status_error_labels(
             _LAST_TASK_ERROR_TITLE_LABEL_KEY: _truncate_label(error.title or ""),
             _LAST_TASK_ERROR_CAUSE_LABEL_KEY: _truncate_label(error.cause or ""),
             _LAST_TASK_ERROR_REMEDIATION_LABEL_KEY: _truncate_label(error.remediation or ""),
+            _LAST_TASK_ERROR_ITEM_ID_LABEL_KEY: _truncate_label(item_id or ""),
         }
         if error is not None
         else {
@@ -5027,6 +5032,7 @@ async def _persist_session_status_error_labels(
             _LAST_TASK_ERROR_TITLE_LABEL_KEY: "",
             _LAST_TASK_ERROR_CAUSE_LABEL_KEY: "",
             _LAST_TASK_ERROR_REMEDIATION_LABEL_KEY: "",
+            _LAST_TASK_ERROR_ITEM_ID_LABEL_KEY: "",
         }
     )
     try:
@@ -5049,8 +5055,9 @@ def _last_task_error_from_labels(labels: Mapping[str, str]) -> dict[str, str] | 
     become public ``last_task_error`` data for snapshots and child summaries.
 
     :param labels: Conversation labels, usually after closed-status projection.
-    :returns: ``{"code": "...", "message": "..."}``, or ``None`` when either
-        value is absent/cleared.
+    :returns: ``{"code": "...", "message": "..."}`` plus any recorded structured
+        field (``agent_name``, ``title``, ``cause``, ``remediation``, ``item_id``),
+        or ``None`` when either required value is absent/cleared.
     """
     raw_error_code = labels.get(_LAST_TASK_ERROR_CODE_LABEL_KEY)
     raw_error_message = labels.get(_LAST_TASK_ERROR_MESSAGE_LABEL_KEY)
@@ -5064,6 +5071,7 @@ def _last_task_error_from_labels(labels: Mapping[str, str]) -> dict[str, str] | 
             ("title", _LAST_TASK_ERROR_TITLE_LABEL_KEY),
             ("cause", _LAST_TASK_ERROR_CAUSE_LABEL_KEY),
             ("remediation", _LAST_TASK_ERROR_REMEDIATION_LABEL_KEY),
+            ("item_id", _LAST_TASK_ERROR_ITEM_ID_LABEL_KEY),
         ):
             value = labels.get(label)
             if value:
@@ -7060,6 +7068,8 @@ def _build_new_item(
     body: SessionEventInput,
     response_id: str,
     created_by: str | None = None,
+    *,
+    adopt_stable_id: bool = False,
 ) -> NewConversationItem:
     """
     Construct a :class:`NewConversationItem` from a POSTed event.
@@ -7084,6 +7094,10 @@ def _build_new_item(
     :param created_by: Authenticated identity of the actor posting
         the event, recorded for per-message attribution. ``None`` in
         single-user mode.
+    :param adopt_stable_id: Persist a web user message under the
+        client-minted ``stable_id`` it carries (see
+        :func:`_web_send_stable_id`). Off by default so seeded and
+        replayed items keep store-assigned ids.
     :returns: A :class:`NewConversationItem` ready for delivery
         or persistence.
     :raises OmnigentError: When ``body.data`` does not satisfy the
@@ -7103,7 +7117,60 @@ def _build_new_item(
         response_id=response_id,
         data=data,
         created_by=created_by,
+        stable_id=_web_send_stable_id(body) if adopt_stable_id else None,
     )
+
+
+def _web_send_stable_id(body: SessionEventInput) -> str | None:
+    """
+    Return the client-minted stable id of a web user-message send, if usable.
+
+    Persisting the send under its 32-hex ``stable_id`` makes the append idempotent
+    on retry and lets the client recognize its own send coming back after a lost
+    acknowledgement. Same shape gate as the native pending-input path.
+
+    :param body: Validated event input.
+    :returns: The stable id for a user message carrying a well-formed one, else ``None``.
+    """
+    raw_stable_id = body.data.get("stable_id")
+    if (
+        body.type == "message"
+        and body.data.get("role") == "user"
+        and isinstance(raw_stable_id, str)
+        and re.fullmatch(r"[0-9a-f]{32}", raw_stable_id)
+    ):
+        return raw_stable_id
+    return None
+
+
+def _stable_id_reuse_is_exact_retry(
+    persisted: ConversationItem, item: NewConversationItem
+) -> bool:
+    """
+    Tell whether a send deduplicated by its stable id is a retry of that item.
+
+    The store answers a repeated ``stable_id`` with the persisted item instead of
+    inserting, which is right for the retry of a send whose acknowledgement was
+    lost. A different body from the same author is not an error: web bundles
+    from before the server adopted client ids resend an edited restored draft
+    under the original id, and must keep working while such tabs stay open. The
+    caller persists that body under a store-assigned id. Another author reusing
+    a visible id is refused so a prompt can never run under someone else's item.
+
+    :param persisted: The item the store returned, flagged ``deduplicated``.
+    :param item: The item built from the request being persisted.
+    :returns: ``True`` for a byte-identical retry, ``False`` for another body
+        from the same author.
+    :raises OmnigentError: ``CONFLICT`` when the author differs.
+    """
+    if persisted.created_by != item.created_by:
+        raise OmnigentError(
+            f"stable_id {item.stable_id!r} already names another author's item in this session",
+            code=ErrorCode.CONFLICT,
+        )
+    persisted_payload = persisted.data.model_dump(mode="json", by_alias=True)
+    request_payload = item.data.model_dump(mode="json", by_alias=True)
+    return persisted.type == item.type and persisted_payload == request_payload
 
 
 def _parse_skill_slash_command(body: SessionEventInput) -> tuple[str, str]:

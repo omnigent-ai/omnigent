@@ -14,6 +14,33 @@ export const ALT_KEY = IS_MAC ? "⌥" : "Alt";
 export const ENTER_KEY = "↵";
 export const SHIFT_KEY = "⇧";
 
+export function CompactKbd({ children }: { children: ReactNode }) {
+  return (
+    <kbd
+      data-slot="kbd"
+      className="inline-flex size-4 items-center justify-center rounded border border-border/80 bg-muted px-1 text-10 font-medium text-muted-foreground"
+    >
+      {children}
+    </kbd>
+  );
+}
+
+export function CompactShortcutKeys({
+  keys,
+  className,
+}: {
+  keys: readonly string[];
+  className?: string;
+}) {
+  return (
+    <span aria-hidden="true" className={cn("flex items-center gap-1 whitespace-nowrap", className)}>
+      {keys.map((key) => (
+        <CompactKbd key={key}>{key}</CompactKbd>
+      ))}
+    </span>
+  );
+}
+
 export function composerSendShortcutKeys(submitWithModEnter: boolean): string[] {
   return submitWithModEnter ? [MOD_KEY, ENTER_KEY] : [ENTER_KEY];
 }

@@ -19,7 +19,7 @@ from omnigent.harnesses.claude_native.bridge import (
 from omnigent.harnesses.cursor_native import bridge as cursor_native_bridge
 from omnigent.harnesses.kiro_native import bridge as kiro_native_bridge
 from omnigent.harnesses.qwen_native import bridge as qwen_native_bridge
-from omnigent.runner import create_runner_app
+from omnigent.runner import create_runner_app, native_controls
 from omnigent.spec.types import AgentSpec, ExecutorSpec
 from omnigent.terminals import TerminalRegistry
 from tests.runner.conftest import (
@@ -573,7 +573,6 @@ async def test_events_compact_on_codex_native_types_settles_then_submits(
     import time as real_time
     from typing import Any as _Any
 
-    from omnigent.runner import app as runner_app
     from omnigent.runner.app import _session_event_queues_ref
     from tests.runner.helpers import make_test_terminal_instance
 
@@ -594,7 +593,7 @@ async def test_events_compact_on_codex_native_types_settles_then_submits(
             events.append(("sleep", seconds))
 
     monkeypatch.setattr(claude_native_bridge, "_run_tmux", _fake_run_tmux)
-    monkeypatch.setattr(runner_app, "time", _RecordingTime())
+    monkeypatch.setattr(native_controls, "time", _RecordingTime())
 
     codex_native_spec = _harness_spec("codex-native")
 
@@ -1712,7 +1711,6 @@ async def test_events_native_dispatch_resolves_bridge_id_via_label_lookup(
     directly. If the handler regresses to the conv_id-only path,
     the assertion fails.
     """
-    from omnigent.runner import app as runner_app_module
 
     captured_bridge_dir: list[Any] = []
 
@@ -1731,7 +1729,7 @@ async def test_events_native_dispatch_resolves_bridge_id_via_label_lookup(
         return sentinel_bridge_id
 
     monkeypatch.setattr(
-        runner_app_module,
+        native_controls,
         "_claude_native_bridge_id_for_session",
         _fake_bridge_id_lookup,
     )
@@ -1887,7 +1885,6 @@ async def _post_model_change_with_status_sequence(
 
     :returns: The ``/events`` HTTP response.
     """
-    from omnigent.runner import app as runner_app_module
 
     commands: list[str] = []
 
@@ -1941,8 +1938,8 @@ async def _post_model_change_with_status_sequence(
     # No tmux behind these tests: the in-loop dialog check must not spend a
     # real 1 s tmux-info wait per poll.
     monkeypatch.setattr(claude_native_bridge, "confirm_dialog_if_open", lambda _b, *, hint: False)
-    monkeypatch.setattr(runner_app_module, "_CLAUDE_MODEL_CONFIRM_TIMEOUT_S", 0.3)
-    monkeypatch.setattr(runner_app_module, "_CLAUDE_MODEL_CONFIRM_POLL_S", 0.01)
+    monkeypatch.setattr(native_controls, "_CLAUDE_MODEL_CONFIRM_TIMEOUT_S", 0.3)
+    monkeypatch.setattr(native_controls, "_CLAUDE_MODEL_CONFIRM_POLL_S", 0.01)
 
     native_spec = _harness_spec("claude-native")
 

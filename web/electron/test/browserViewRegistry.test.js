@@ -155,6 +155,149 @@ describe("browserViewRegistry — first-navigate activation signal", () => {
   });
 });
 
+function makeRecentSessionInputRegistry({
+  isHostFocused = () => true,
+  supportsRecentSessionSwitch = true,
+} = {}) {
+  const listeners = new Map();
+  const sent = [];
+  const webContents = {
+    loadURL() {},
+    close() {},
+    removeListener() {},
+    on(name, listener) {
+      listeners.set(name, listener);
+    },
+    setWindowOpenHandler() {},
+  };
+  const registry = createBrowserViewRegistry({
+    WebContentsViewCtor: () => ({ setBounds() {}, webContents }),
+    createBoundsController: createBrowserViewBoundsController,
+    attachToHost() {},
+    detachFromHost() {},
+    sendToRenderer: (channel, payload) => sent.push({ channel, payload }),
+    isHostFocused,
+  });
+  registry.openOrNavigate("conv_1", "https://example.com");
+  registry.setActive("conv_1");
+  registry.setRecentSessionSwitchSupported(supportsRecentSessionSwitch);
+  return { registry, listeners, sent };
+}
+
+describe("browserViewRegistry — recent-session input forwarding", () => {
+  it("leaves page shortcuts untouched until the renderer advertises support", () => {
+    const { listeners, sent } = makeRecentSessionInputRegistry({
+      supportsRecentSessionSwitch: false,
+    });
+    const forward = listeners.get("before-input-event");
+    const prevented = [];
+    const event = () => ({ preventDefault: () => prevented.push(true) });
+
+    forward(event(), { type: "keyDown", key: "Tab", code: "Tab", control: true });
+    forward(event(), { type: "keyDown", key: "Escape", code: "Escape", control: true });
+
+    assert.equal(prevented.length, 0);
+    assert.equal(sent.filter((item) => item.channel === "browser-recent-session-input").length, 0);
+  });
+
+  it("forwards Ctrl+Tab, Control release, and Escape from an embedded page", () => {
+    const { listeners, sent } = makeRecentSessionInputRegistry();
+    const forward = listeners.get("before-input-event");
+    const prevented = [];
+    const event = () => ({ preventDefault: () => prevented.push(true) });
+    forward(event(), { type: "keyDown", key: "Tab", code: "Tab", control: false });
+    forward(event(), {
+      type: "keyDown",
+      key: "Tab",
+      code: "Tab",
+      control: true,
+      shift: true,
+    });
+    forward(event(), {
+      type: "keyDown",
+      key: "Escape",
+      code: "Escape",
+      control: true,
+    });
+    forward(event(), {
+      type: "keyUp",
+      key: "Control",
+      code: "ControlLeft",
+      control: false,
+    });
+    forward(event(), { type: "keyDown", key: "Tab", code: "Tab", control: true });
+    forward(event(), {
+      type: "keyUp",
+      key: "Control",
+      code: "ControlLeft",
+      control: false,
+    });
+
+    const forwarded = sent.filter((item) => item.channel === "browser-recent-session-input");
+    assert.deepEqual(
+      forwarded.map((item) => [item.payload.type, item.payload.key, item.payload.shiftKey]),
+      [
+        ["keydown", "Tab", true],
+        ["keydown", "Escape", false],
+        ["keydown", "Tab", false],
+        ["keyup", "Control", false],
+      ],
+    );
+    assert.equal(prevented.length, 3, "claim Tab and Escape keydowns, not Control release");
+  });
+
+  it("clears a pending switch on focus loss without intercepting a later Escape", () => {
+    let hostFocused = true;
+    const { listeners, sent } = makeRecentSessionInputRegistry({
+      isHostFocused: () => hostFocused,
+    });
+    const forward = listeners.get("before-input-event");
+    const blur = listeners.get("blur");
+    const prevented = [];
+    const event = () => ({ preventDefault: () => prevented.push(true) });
+
+    forward(event(), { type: "keyDown", key: "Tab", code: "Tab", control: true });
+    hostFocused = false;
+    blur();
+    const countAfterBlur = sent.length;
+    forward(event(), { type: "keyDown", key: "Escape", code: "Escape", control: false });
+
+    assert.equal(prevented.length, 1, "only Ctrl+Tab is claimed");
+    assert.equal(sent.length, countAfterBlur, "ordinary Escape is not forwarded");
+    assert.equal(sent.at(-1).payload.key, "Escape", "focus loss cancels the renderer switcher");
+  });
+
+  it("leaves later page input alone when the renderer declines the switch", () => {
+    const { registry, listeners, sent } = makeRecentSessionInputRegistry();
+    const forward = listeners.get("before-input-event");
+    const prevented = [];
+    const event = () => ({ preventDefault: () => prevented.push(true) });
+
+    forward(event(), { type: "keyDown", key: "Tab", code: "Tab", control: true });
+    registry.cancelRecentSessionSwitch();
+    const countAfterCancellation = sent.length;
+    forward(event(), { type: "keyDown", key: "Escape", code: "Escape", control: false });
+
+    assert.equal(prevented.length, 1, "only Ctrl+Tab is claimed");
+    assert.equal(sent.length, countAfterCancellation, "ordinary Escape is not forwarded");
+  });
+
+  it("releases a pending switch when renderer support ends", () => {
+    const { registry, listeners, sent } = makeRecentSessionInputRegistry();
+    const forward = listeners.get("before-input-event");
+    const prevented = [];
+    const event = () => ({ preventDefault: () => prevented.push(true) });
+
+    forward(event(), { type: "keyDown", key: "Tab", code: "Tab", control: true });
+    registry.setRecentSessionSwitchSupported(false);
+    const countAfterUnsubscribe = sent.length;
+    forward(event(), { type: "keyDown", key: "Escape", code: "Escape", control: false });
+
+    assert.equal(prevented.length, 1, "only Ctrl+Tab is claimed");
+    assert.equal(sent.length, countAfterUnsubscribe, "ordinary Escape is not forwarded");
+  });
+});
+
 // Build a registry whose stub views record every loadURL call, so we can
 // assert the agent-navigation allowlist blocks BEFORE loadURL is reached.
 function makeLoadTrackingRegistry() {

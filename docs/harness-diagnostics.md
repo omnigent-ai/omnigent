@@ -317,9 +317,9 @@ or deleted.
 ## Verification
 
 ```sh
-uv run --no-sync pytest -q tests/test_codex_native_diagnostics.py tests/runner/test_codex_startup_telemetry.py tests/host/test_connect.py -k 'codex or harness_stderr'
-uv run --no-sync pytest -q tests/test_codex_native_continuous_diagnostics.py tests/test_codex_native_app_server_stderr.py
-uv run --no-sync pytest -q tests/test_codex_native_logging_env.py tests/test_harness_diagnostics.py
+uv run --no-sync pytest -q tests/harnesses/codex_native/test_codex_native_diagnostics.py tests/runner/test_codex_startup_telemetry.py tests/host/test_connect.py -k 'codex or harness_stderr'
+uv run --no-sync pytest -q tests/harnesses/codex_native/test_codex_native_continuous_diagnostics.py tests/harnesses/codex_native/test_codex_native_app_server_stderr.py
+uv run --no-sync pytest -q tests/harnesses/codex_native/test_codex_native_logging_env.py tests/test_harness_diagnostics.py
 uv run --no-sync pytest -q tests/inner/test_terminal.py tests/runner/test_terminal_startup_exit.py
 uv run --no-sync pytest -q tests/e2e/test_codex_continuous_diagnostics_e2e.py
 uv run --no-sync pytest -q tests/e2e/test_codex_native_runtime_diagnostics_e2e.py

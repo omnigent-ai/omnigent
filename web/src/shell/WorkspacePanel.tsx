@@ -16,7 +16,9 @@ import {
 import { toast } from "sonner";
 import {
   type CSSProperties,
+  type KeyboardEvent,
   type ReactElement,
+  type RefObject,
   lazy,
   memo,
   Suspense,
@@ -26,6 +28,7 @@ import {
   useState,
 } from "react";
 import { cn } from "@/lib/utils";
+import { ALT_KEY, CompactKbd, CompactShortcutKeys, MOD_KEY } from "@/components/KeyboardShortcut";
 import { defaultWorkspaceTabs, readDefaultWorkspaceTab } from "@/lib/workspaceTabPreferences";
 import { isEditorLevel, isOwnerLevel } from "@/lib/permissionsApi";
 import {
@@ -43,6 +46,7 @@ import { Spinner } from "@/components/ui/spinner";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { BrowserPane } from "@/components/BrowserPane/BrowserPane";
 import { useBrowserTabs } from "@/hooks/useBrowserTabs";
+import { useNewBrowserHotkey } from "@/hooks/useNewBrowserHotkey";
 import { useSideChats } from "@/hooks/useSideChats";
 import { SideChatPane } from "@/components/chat/SideChatPane";
 import { useChatStore } from "@/store/chatStore";
@@ -66,6 +70,19 @@ import { Button } from "../components/ui/button";
 const TerminalView = lazy(() =>
   import("@/components/blocks/TerminalView").then((m) => ({ default: m.TerminalView })),
 );
+const WORKSPACE_OPEN_KEYS = [MOD_KEY, ALT_KEY, "]"] as const;
+const NEW_BROWSER_KEYS = [MOD_KEY, ALT_KEY, "B"] as const;
+const NEW_SHELL_KEYS = [MOD_KEY, ALT_KEY, "T"] as const;
+
+function WorkspaceMenuShortcut({
+  keys,
+  className,
+}: {
+  keys: readonly string[];
+  className?: string;
+}) {
+  return <CompactShortcutKeys keys={keys} className={className} />;
+}
 
 // Side-chat child ids opened in THIS app session. Module scope, so it resets on
 // reload/restart. A Codex side chat is an ephemeral thread-fork of the parent's
@@ -76,10 +93,12 @@ const sideChatsStartedThisSession = new Set<string>();
 
 function WorkspaceTabTooltip({
   label,
+  shortcut,
   className,
   children,
 }: {
   label: string;
+  shortcut?: string;
   className?: string;
   children: ReactElement;
 }) {
@@ -88,7 +107,20 @@ function WorkspaceTabTooltip({
       <TooltipTrigger asChild>
         <span className={cn("inline-flex shrink-0", className)}>{children}</span>
       </TooltipTrigger>
-      <TooltipContent side="bottom">{label}</TooltipContent>
+      <TooltipContent side="bottom" className="flex items-center gap-1.5">
+        <span>{label}</span>
+        {shortcut && (
+          <span className="flex items-center gap-1 whitespace-nowrap">
+            {WORKSPACE_OPEN_KEYS.map((key) => (
+              <CompactKbd key={key}>{key}</CompactKbd>
+            ))}
+            <span aria-hidden="true" className="text-muted-foreground/70">
+              +
+            </span>
+            <CompactKbd>{shortcut}</CompactKbd>
+          </span>
+        )}
+      </TooltipContent>
     </Tooltip>
   );
 }
@@ -228,9 +260,12 @@ function NewTabMenu({
       <span className="whitespace-nowrap">
         {isReconnecting ? "Reconnecting…" : `Shell (${defaultShell})`}
       </span>
-      {connectState === "offline" && (
-        <span className="ml-auto pl-4 text-sm text-muted-foreground">Offline</span>
-      )}
+      <span className="ml-auto flex items-center gap-2 pl-4">
+        {connectState === "offline" && (
+          <span className="text-sm text-muted-foreground">Offline</span>
+        )}
+        <WorkspaceMenuShortcut keys={NEW_SHELL_KEYS} />
+      </span>
     </>
   );
 
@@ -253,7 +288,7 @@ function NewTabMenu({
           default min-w-32 tracks the 32px "+" trigger and clips it. */}
       <DropdownMenuContent
         align="start"
-        className="min-w-44"
+        className="min-w-56"
         // On close, Radix restores focus to the "+" trigger, which re-opens its
         // tooltip for a frame before blur dismisses it — a visible flash after a
         // shell launch. Suppress the focus restore to keep the tooltip closed.
@@ -267,6 +302,7 @@ function NewTabMenu({
           <DropdownMenuItem onSelect={onOpenBrowser} className="cursor-pointer">
             <GlobeIcon className="size-4" />
             Browser
+            <WorkspaceMenuShortcut keys={NEW_BROWSER_KEYS} className="ml-auto pl-4" />
           </DropdownMenuItem>
         )}
         {onOpenSideChat && (
@@ -609,6 +645,8 @@ interface WorkspacePanelProps {
   handleProps: React.HTMLAttributes<HTMLDivElement> & { tabIndex: number };
   /** Selected rail tab, e.g. ``"files"``. */
   rightRailTab: RightRailTab;
+  /** Tab-strip ref used to move focus into a keyboard-opened rail. */
+  tabListRef?: RefObject<HTMLDivElement | null>;
   /**
    * Switch rail tabs. AppShell owns the side effects (clearing any open
    * file + its comments + URL) so they can't drift from the tab state.
@@ -620,6 +658,8 @@ interface WorkspacePanelProps {
   showGithubTab: boolean;
   /** Whether Browser soft tabs are available — hidden without a browser bridge. */
   showBrowserTab: boolean;
+  /** Reveal the workspace after a Browser tab is opened by a global shortcut. */
+  onBrowserTabOpened?: () => void;
   /** Count of changed files, shown as the Changes tab badge. */
   changedCount: number;
   /** How many child agents are actively working (Agents tab badge). */
@@ -718,10 +758,12 @@ function WorkspacePanelImpl({
   animateVisibility = false,
   resizing = false,
   rightRailTab,
+  tabListRef,
   onRightRailTabChange,
   showFilesPanel,
   showGithubTab,
   showBrowserTab,
+  onBrowserTabOpened,
   changedCount,
   subagentsWorking,
   agentCount,
@@ -764,12 +806,12 @@ function WorkspacePanelImpl({
     browsers.selected !== null &&
     selectedFilePath === null &&
     selectedTerminalKey === null;
-  const addBrowser = showBrowserTab
-    ? () => {
-        browsers.add();
-        onRightRailTabChange("browser");
-      }
-    : undefined;
+  const addBrowser = () => {
+    browsers.add();
+    onRightRailTabChange("browser");
+    onBrowserTabOpened?.();
+  };
+  useNewBrowserHotkey(addBrowser, showBrowserTab && !pending);
 
   // ── Side chats: rail tabs backed by forked child conversations. ──────────
   const sideChats = useSideChats(conversationId);
@@ -922,6 +964,37 @@ function WorkspacePanelImpl({
     : handleProps;
   const defaultTab = readDefaultWorkspaceTab();
   const tabOrder = [defaultTab, ...defaultWorkspaceTabs.filter((tab) => tab !== defaultTab)];
+  const visiblePermanentTabs: RightRailTab[] = tabOrder.filter((tab) => {
+    if (tab === "subagents") return true;
+    if (tab === "github") return pending || showGithubTab;
+    return pending || showFilesPanel;
+  });
+  const shortcutFor = (tab: RightRailTab) => {
+    const index = visiblePermanentTabs.indexOf(tab);
+    return index === -1 ? undefined : String(index + 1);
+  };
+  const selectPermanentTab = (tab: RightRailTab) => {
+    onRightRailTabChange(tab);
+  };
+  const handlePermanentTabNumber = (event: KeyboardEvent<HTMLDivElement>) => {
+    if (
+      !event.currentTarget.contains(event.target as Node) ||
+      pending ||
+      event.repeat ||
+      event.shiftKey ||
+      event.metaKey ||
+      event.ctrlKey ||
+      event.altKey ||
+      !/^[1-9]$/.test(event.key)
+    ) {
+      return;
+    }
+    const tab = visiblePermanentTabs[Number(event.key) - 1];
+    if (!tab) return;
+    event.preventDefault();
+    event.stopPropagation();
+    selectPermanentTab(tab);
+  };
   const browserFallbackTab =
     tabOrder.find((tab) => {
       if (tab === "subagents") return true;
@@ -947,10 +1020,12 @@ function WorkspacePanelImpl({
   ]);
   const tabTriggers = {
     files: (pending || showFilesPanel) && (
-      <WorkspaceTabTooltip key="files" label="Files">
+      <WorkspaceTabTooltip key="files" label="Files" shortcut={shortcutFor("files")}>
         <TabsTrigger
           value="files"
           aria-label="Files"
+          aria-keyshortcuts={shortcutFor("files")}
+          data-workspace-tab="files"
           disabled={pending}
           className="size-6 shrink-0 p-0 hover:border-1 hover:border-muted rounded-md!"
         >
@@ -960,10 +1035,12 @@ function WorkspacePanelImpl({
       </WorkspaceTabTooltip>
     ),
     changes: (pending || showFilesPanel) && (
-      <WorkspaceTabTooltip key="changes" label="Changes">
+      <WorkspaceTabTooltip key="changes" label="Changes" shortcut={shortcutFor("changes")}>
         <TabsTrigger
           value="changes"
           aria-label={changedCount > 0 ? `Changes ${changedCount} changed` : "Changes"}
+          aria-keyshortcuts={shortcutFor("changes")}
+          data-workspace-tab="changes"
           disabled={pending}
           className="size-6 shrink-0 p-0 hover:border-1 hover:border-muted rounded-md!"
         >
@@ -974,10 +1051,12 @@ function WorkspacePanelImpl({
       </WorkspaceTabTooltip>
     ),
     github: (pending || showGithubTab) && (
-      <WorkspaceTabTooltip key="github" label="GitHub">
+      <WorkspaceTabTooltip key="github" label="GitHub" shortcut={shortcutFor("github")}>
         <TabsTrigger
           value="github"
           aria-label="GitHub"
+          aria-keyshortcuts={shortcutFor("github")}
+          data-workspace-tab="github"
           disabled={pending}
           className="size-6 shrink-0 p-0 hover:border-1 hover:border-muted rounded-md!"
         >
@@ -987,10 +1066,12 @@ function WorkspacePanelImpl({
       </WorkspaceTabTooltip>
     ),
     subagents: (
-      <WorkspaceTabTooltip key="subagents" label="Agents">
+      <WorkspaceTabTooltip key="subagents" label="Agents" shortcut={shortcutFor("subagents")}>
         <TabsTrigger
           value="subagents"
           disabled={pending}
+          aria-keyshortcuts={shortcutFor("subagents")}
+          data-workspace-tab="subagents"
           aria-label={
             subagentsWorking > 0
               ? `Agents ${subagentsWorking}/${agentCount}`
@@ -1077,7 +1158,14 @@ function WorkspacePanelImpl({
           horizontal scroller — see below). The outer row never scrolls
           (overflow-x-hidden), so the divider is a fixed boundary that doesn't
           drift when the tabs scroll. */}
-        <div className="workspace-tab-strip shrink-0 flex items-center overflow-x-hidden border-b border-border px-2 py-3">
+        <div
+          ref={tabListRef}
+          role="toolbar"
+          aria-label="Workspace tabs"
+          tabIndex={-1}
+          onKeyDown={handlePermanentTabNumber}
+          className="workspace-tab-strip shrink-0 flex items-center overflow-x-hidden border-b border-border px-2 py-3"
+        >
           <Tabs
             // Static group — never compresses (shrink-0) and stays anchored on
             // the LEFT whether or not tabs are open. The open tabs render to its
@@ -1100,9 +1188,7 @@ function WorkspacePanelImpl({
                   ? "__tab__"
                   : rightRailTab
             }
-            onValueChange={(value) => {
-              onRightRailTabChange(value as RightRailTab);
-            }}
+            onValueChange={(value) => selectPermanentTab(value as RightRailTab)}
             componentId="chat.right_rail.tabs"
           >
             <TabsList variant="pill" className="gap-1">
@@ -1232,7 +1318,7 @@ function WorkspacePanelImpl({
                 same gap the scroller's gap-0.5 gives between tabs. */}
               <NewTabMenu
                 conversationId={conversationId}
-                onOpenBrowser={addBrowser}
+                onOpenBrowser={showBrowserTab ? addBrowser : undefined}
                 onOpenSideChat={onNewSideChat}
                 onCreateError={onShellCreateFailed}
                 onOpenTerminal={openTerminalTab}
@@ -1249,7 +1335,7 @@ function WorkspacePanelImpl({
           {showEmptyNewTab && (
             <NewTabMenu
               conversationId={conversationId}
-              onOpenBrowser={addBrowser}
+              onOpenBrowser={showBrowserTab ? addBrowser : undefined}
               onOpenSideChat={onNewSideChat}
               onOpenTerminal={openTerminalTab}
               onCreateStart={onShellCreateStart}

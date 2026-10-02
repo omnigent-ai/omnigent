@@ -42,6 +42,7 @@ from omnigent.harnesses.codex_native.launch_args import (
     codex_config_profile,
     materialize_codex_config_profile,
     read_codex_mcp_servers,
+    reject_reserved_codex_transport_args,
     validate_codex_config_profile_state,
     without_codex_config_profile,
 )
@@ -4456,6 +4457,10 @@ def build_codex_remote_args(
         can accept hooks normally.
     :returns: Codex argv tail after the executable.
     """
+    # The runner owns the app-server and the TUI ``--remote`` attach it appends
+    # below; reject caller pass-through args that would re-select or re-attach
+    # that transport (e.g. ``codex app-server … --remote``, which clap rejects).
+    reject_reserved_codex_transport_args(codex_args)
     override_args: list[str] = []
     for override in config_overrides:
         if override.lstrip().startswith("model_providers."):

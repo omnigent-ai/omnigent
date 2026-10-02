@@ -21,10 +21,11 @@ Run all commands from the repository root. Put `scripts/` on your path or call
 
 ## Launch
 
-1. Install dependencies and build the web UI once per checkout:
+1. Install dependencies, Chromium, and build the web UI for the checkout:
 
    ```sh
-   uv sync --frozen --group test
+   uv sync --frozen --extra all --group test
+   uv run --no-sync playwright install --with-deps chromium
    pnpm install --frozen-lockfile --filter web && pnpm --filter web run build
    ```
 
@@ -42,6 +43,13 @@ Run all commands from the repository root. Put `scripts/` on your path or call
 Ready means the server answers, the runner reports online, and the mock model
 server answers. `start` fails with the environment's error and log path
 otherwise.
+
+Ready does not check browser launch. Use the Chromium version installed by
+this checkout's Playwright package; if the environment provides it through
+`PLAYWRIGHT_BROWSERS_PATH`, keep that path available to the test process.
+`--ui-skip-build` reuses the existing bundle, so rebuild after frontend edits.
+Native-terminal journeys also need the relevant CLI and terminal prerequisites
+(such as tmux); a browser installation alone does not provide them.
 
 In CI, the repro workflow already runs this environment. Use
 `python -m dev.repro_env exec -- ...` there instead of starting another.
@@ -69,19 +77,31 @@ instance runs old code: stop it and start a new one.
    Tests under `tests/browser_ui/` need no instance:
    `uv run pytest <test> --browser-ui-skip-build --video=on --output=...`.
    Tests the feature file marks "own environment" also run with plain
-   `uv run pytest`.
+   `uv run pytest`. Server/transport/component tests use plain pytest without
+   browser recording or build flags.
 3. For an entry point with no test, hand-drive it with Playwright against
    `OMNIGENT_REPRO_SERVER_URL` inside `verify-env run -- python <script>`, and
    script model replies with the mock helpers named in the feature map README.
 4. To reproduce a bug, run the same journey on the unfixed code first and keep
    that evidence; then run it again on the fix.
 
+A test that fails before reaching the user action has a setup failure, not a
+reproduction. Check its browser error and server/runner logs. When a test starts
+its own server or runner from inside an agent, check whether it inherited the
+parent's `OMNIGENT_RUNNER_*`, `RUNNER_SERVER_URL`, or
+`OMNIGENT_PROCESS_LOG_FILE`. Use an isolated child environment for that test;
+do not change the controlling agent's environment. Record setup failures,
+skipped variants, and unavailable credentials separately from behavior results.
+
 ## Evidence
 
 Everything under `$VERIFY_EVIDENCE` is the proof, one directory per feature.
 Instance logs, the database, and the mock model's recorded requests stay in
-`$VERIFY_ENV`. For each claim, record the feature file, the entry point ID, the
-command, and the resulting artifact. The proof standards are in the
+`$VERIFY_ENV`. For each claim, record the checkout commit, installed harness versions,
+feature file, entry point ID, command, and resulting artifact. Keep source
+review, component tests, real process checks, browser drives, and live provider
+checks distinct. A map contract pass verifies references and structure; it is
+not evidence that the journeys ran. The proof standards are in the
 [feature map README](../../README.md#proof-and-coverage). Mock runs prove
 Omnigent's integration with Claude and Codex, not a live vendor model.
 
