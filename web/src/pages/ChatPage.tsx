@@ -46,7 +46,10 @@ import {
 } from "@/components/composer/ChatComposer";
 import { ComposerMentionChips } from "@/components/composer/ComposerMentionChips";
 import { ComposerAddMenu } from "@/components/composer/ComposerAddMenu";
-import { BackgroundTaskIndicator } from "@/components/composer/BackgroundTaskIndicator";
+import {
+  BackgroundAgentIndicator,
+  BackgroundTaskIndicator,
+} from "@/components/composer/BackgroundTaskIndicator";
 import { SubagentTaskIndicator } from "@/components/composer/SubagentTaskIndicator";
 import { ReplyDraftBlocks } from "@/components/composer/ReplyDraftBlocks";
 import {
@@ -509,6 +512,7 @@ export function ChatPage() {
   // OR'd into "Working…" so cross-client turns surface a shimmer.
   const sessionStatus = useChatStore((s) => s.sessionStatus);
   const backgroundTaskCount = useChatStore((s) => s.backgroundTaskCount);
+  const backgroundAgentCount = useChatStore((s) => s.backgroundAgentCount);
   const loadingConversation = useChatStore((s) => s.loadingConversation);
   const activeConversationId = useChatStore((s) => s.conversationId);
   const conversationLoadError = useChatStore((s) => s.conversationLoadError);
@@ -696,6 +700,7 @@ export function ChatPage() {
     hasPendingElicitation,
     runnerOnline,
     backgroundTaskCount,
+    backgroundAgentCount,
     // Optimistic: light up the moment this client dispatches, without waiting
     // for the server's ``running``. The sidebar row already reads this same
     // flag (``isStartingUp`` in Sidebar.tsx), so the two agreed only once the
@@ -3639,6 +3644,7 @@ function ComposerImpl(
               className="flex items-center gap-0 empty:hidden"
             >
               <BackgroundTaskIndicator />
+              <BackgroundAgentIndicator />
               <SubagentTaskIndicator conversationId={conversationId} />
               {goal && <GoalStatusPill goal={goal} onOpen={() => setGoalDialogOpen(true)} />}
             </div>
@@ -4069,6 +4075,7 @@ export function computeShowsWorking(
     hasPendingElicitation: boolean;
     runnerOnline: boolean | undefined;
     backgroundTaskCount?: number;
+    backgroundAgentCount?: number;
     localSendInFlight?: boolean;
   },
 ): boolean {
@@ -4080,7 +4087,12 @@ export function computeShowsWorking(
   // tally on an idle session). An in-flight local send is the same kind of
   // proof — the user just dispatched — so it also survives the gate.
   if (options.runnerOnline === false && !isWorking && !options.localSendInFlight) return false;
-  return isWorking || options.localSendInFlight === true || (options.backgroundTaskCount ?? 0) > 0;
+  return (
+    isWorking ||
+    options.localSendInFlight === true ||
+    (options.backgroundTaskCount ?? 0) > 0 ||
+    (options.backgroundAgentCount ?? 0) > 0
+  );
 }
 
 /**

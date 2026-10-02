@@ -931,6 +931,18 @@ describe("computeShowsWorking", () => {
     expect(computeShowsWorking("idle", opts({ backgroundTaskCount: 0 }))).toBe(false);
   });
 
+  it("background agents keep the indicator lit after the turn settles to idle", () => {
+    // Same as shell case: Stop fires, turn is idle, but agents are still
+    // running; the chat pane must not look fully idle.
+    expect(computeShowsWorking("idle", opts({ backgroundAgentCount: 1 }))).toBe(true);
+  });
+
+  it("a zero agent count at idle stays idle when no shells either", () => {
+    expect(
+      computeShowsWorking("idle", opts({ backgroundTaskCount: 0, backgroundAgentCount: 0 })),
+    ).toBe(false);
+  });
+
   it("a known-offline runner suppresses the indicator for an idle session with background shells", () => {
     // For a session that is NOT actively working, known-offline beats a stale
     // shell count: a dead session must not keep spinning on a background tally.
@@ -1115,15 +1127,27 @@ describe("isBackgroundTasksOnly", () => {
     expect(isBackgroundTasksOnly(0, null, false)).toBe(false);
   });
 
+  it("is true when only background agents remain after the turn ends", () => {
+    // Same as shell-only case: turn ended, agents running → pill owns the state.
+    expect(isBackgroundTasksOnly(0, null, false, 1)).toBe(true);
+    expect(isBackgroundTasksOnly(0, null, false, 0)).toBe(false);
+  });
+
+  it("is true when both shells and agents remain after the turn ends", () => {
+    expect(isBackgroundTasksOnly(1, null, false, 2)).toBe(true);
+  });
+
   it("yields while the turn is still active so the shimmer shows too", () => {
     // running/waiting or a local send in flight: the agent's turn is live, so
     // the "Working…" shimmer wins and the pill sits alongside it.
     expect(isBackgroundTasksOnly(2, null, true)).toBe(false);
+    expect(isBackgroundTasksOnly(0, null, true, 1)).toBe(false);
   });
 
   it("yields to a parked dialog so the shimmer still shouts", () => {
     // blockedOn needs an action; it must never sit as a quiet pill.
     expect(isBackgroundTasksOnly(2, "permission prompt", false)).toBe(false);
+    expect(isBackgroundTasksOnly(0, "permission prompt", false, 1)).toBe(false);
   });
 });
 

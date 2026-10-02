@@ -383,15 +383,19 @@ export const WORKING_MESSAGES = [
 ] as const;
 
 /**
- * Busy only because background tasks outlive a FINISHED turn. While the turn
- * is still active (`agentWorking`) the shimmer wins.
+ * Busy only because background tasks or background agents outlive a FINISHED
+ * turn. While the turn is still active (`agentWorking`) the shimmer wins.
+ * When only background work remains, the shimmer is suppressed and the
+ * indicator pills (BackgroundTaskIndicator / BackgroundAgentIndicator) own the
+ * affordance.
  */
 export function isBackgroundTasksOnly(
   bgCount: number,
   blockedOn: string | null,
   agentWorking: boolean,
+  bgAgentCount = 0,
 ): boolean {
-  return !agentWorking && !blockedOn && bgCount > 0;
+  return !agentWorking && !blockedOn && (bgCount > 0 || bgAgentCount > 0);
 }
 
 /**
@@ -431,16 +435,18 @@ export function WorkingIndicator() {
   const rootBgCount = useChatStore((s) => s.backgroundTaskCount);
   const rootBlockedOn = useChatStore((s) => s.blockedOn);
   const rootAgentWorking = useAgentTurnActive();
+  const rootBgAgentCount = useChatStore((s) => s.backgroundAgentCount);
   const bgCount = scopedConversationId ? scopedState.backgroundTaskCount : rootBgCount;
   const blockedOn = scopedConversationId ? scopedState.blockedOn : rootBlockedOn;
   const agentWorking = scopedConversationId
     ? computeIsTurnActive(scopedState.sessionStatus, scopedState.status === "streaming")
     : rootAgentWorking;
+  const bgAgentCount = scopedConversationId ? scopedState.backgroundAgentCount : rootBgAgentCount;
   const tick = useWorkingLabelTick();
-  // Once the turn ends but background shells outlive it, BackgroundTaskPill owns
-  // the state and the shimmer stays off (it would misread as the agent still
-  // thinking). While the turn is active the shimmer shows, with the pill beside it.
-  if (isBackgroundTasksOnly(bgCount, blockedOn, agentWorking)) return null;
+  // Once the turn ends but only background work outlives it, the task/agent
+  // indicator pills own the affordance and the shimmer stays off — it would
+  // misread as the agent still thinking.
+  if (isBackgroundTasksOnly(bgCount, blockedOn, agentWorking, bgAgentCount)) return null;
   const label = workingIndicatorLabel(tick, blockedOn);
   return (
     <>

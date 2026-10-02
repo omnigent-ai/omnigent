@@ -144,6 +144,11 @@ interface SessionResponseWire {
    * it. Absent when none are tracked.
    */
   background_tasks?: BackgroundTaskInfo[] | null;
+  /**
+   * Background agents still running as of the last status edge. Absent/0 when
+   * none are tracked.
+   */
+  background_agent_count?: number | null;
   created_at: number;
   /**
    * Human-readable session title, e.g. ``"researcher:auth"`` for a
@@ -329,6 +334,7 @@ function sessionFromWire(wire: SessionResponseWire): Session {
     status: wire.status,
     backgroundTaskCount: wire.background_task_count ?? undefined,
     backgroundTasks: parseBackgroundTasks(wire.background_tasks),
+    backgroundAgentCount: wire.background_agent_count ?? undefined,
     createdAt: wire.created_at,
     title: wire.title ?? null,
     labels: wire.labels,

@@ -9807,6 +9807,100 @@ def test_hook_record_non_stop_event_has_no_background_task_detail() -> None:
     assert record.background_tasks is None
 
 
+# ── _hook_record_from_jsonl_record: background_agent_count ───────────────────
+
+
+def test_hook_record_stop_counts_running_background_agents() -> None:
+    """``Stop`` with agent-type tasks → ``background_agent_count`` reflects them.
+
+    Claude Code fires the Stop hook while background agents are still running.
+    The count drives the chat pane's "N background agent(s) running" badge so
+    users know work is in progress even though the turn has ended.
+    """
+    record = _hook_record_from_jsonl_record(
+        _make_jsonl_record(
+            {
+                "hook_event_name": "Stop",
+                "background_tasks": [
+                    {
+                        "id": "agent-1",
+                        "type": "agent",
+                        "status": "running",
+                        "description": "Review the change",
+                    },
+                    {
+                        "id": "agent-2",
+                        "type": "local_agent",
+                        "status": "running",
+                        "description": "Run tests",
+                    },
+                    # Shell task — should not count toward the agent tally.
+                    {
+                        "id": "shell-1",
+                        "type": "shell",
+                        "status": "running",
+                        "command": "sleep 60",
+                    },
+                ],
+            }
+        )
+    )
+    assert record.background_agent_count == 2
+    # Shell count is separate.
+    assert record.background_task_count == 1
+
+
+def test_hook_record_stop_excludes_terminal_background_agents() -> None:
+    """Completed/failed agents do not inflate the agent count."""
+    record = _hook_record_from_jsonl_record(
+        _make_jsonl_record(
+            {
+                "hook_event_name": "Stop",
+                "background_tasks": [
+                    {"id": "a", "type": "agent", "status": "running"},
+                    {"id": "b", "type": "agent", "status": "completed"},
+                    {"id": "c", "type": "local_agent", "status": "failed"},
+                    {"id": "d", "type": "subagent", "status": "stopped"},
+                    # Unknown status → counts as running.
+                    {"id": "e", "type": "agent", "status": "queued"},
+                ],
+            }
+        )
+    )
+    # running + queued = 2; completed/failed/stopped excluded.
+    assert record.background_agent_count == 2
+
+
+def test_hook_record_stop_zero_background_agents_when_all_terminal() -> None:
+    """All agent tasks finished → agent count is 0, clearing the indicator."""
+    record = _hook_record_from_jsonl_record(
+        _make_jsonl_record(
+            {
+                "hook_event_name": "Stop",
+                "background_tasks": [
+                    {"id": "a", "type": "agent", "status": "completed"},
+                    {"id": "b", "type": "local_agent", "status": "failed"},
+                ],
+            }
+        )
+    )
+    assert record.background_agent_count == 0
+
+
+def test_hook_record_non_stop_event_has_zero_background_agents() -> None:
+    """Non-Stop events always have ``background_agent_count == 0``."""
+    record = _hook_record_from_jsonl_record(
+        _make_jsonl_record({"hook_event_name": "PostToolUse", "tool_name": "Bash"})
+    )
+    assert record.background_agent_count == 0
+
+
+def test_hook_record_stop_without_background_tasks_has_zero_agents() -> None:
+    """``Stop`` without ``background_tasks`` → ``background_agent_count`` is 0."""
+    record = _hook_record_from_jsonl_record(_make_jsonl_record({"hook_event_name": "Stop"}))
+    assert record.background_agent_count == 0
+
+
 # ── /model switching + pane readiness ───────────────────────────────────
 
 #: Claude Code's interactive ``/model`` picker. Omnigent never drives it —

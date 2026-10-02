@@ -208,11 +208,16 @@ async def test_forwarder_posts_idle_on_stop_and_ignores_user_prompt_submit(
     # The first (and only) status POST is the Stop → idle. A ``running``
     # arriving first would mean UserPromptSubmit is still wrongly mapped.
     assert request["path"] == "/v1/sessions/conv_abc/events"
-    # The Stop hook carries its authoritative background-shell count (0 here,
-    # no background tasks) so a finished shell clears the indicator.
+    # The Stop hook carries both authoritative counts (0 here, no background
+    # tasks) so the indicators clear.
     assert request["body"] == {
         "type": "external_session_status",
-        "data": {"status": "idle", "background_task_count": 0, "turn_completed": True},
+        "data": {
+            "status": "idle",
+            "background_task_count": 0,
+            "background_agent_count": 0,
+            "turn_completed": True,
+        },
     }
 
     submitted = [
@@ -435,6 +440,82 @@ async def test_forwarder_posts_idle_with_count_when_stop_has_background_tasks(
                     "command": "sleep 120",
                 }
             ],
+            # No agent-type tasks in this payload.
+            "background_agent_count": 0,
+        },
+    }
+
+
+@pytest.mark.asyncio
+async def test_forwarder_posts_idle_with_agent_count_when_stop_has_agent_tasks(
+    tmp_path: Path,
+) -> None:
+    """
+    ``Stop`` with running agent-type tasks posts ``idle`` plus
+    ``background_agent_count``.
+
+    Claude Code fires Stop while background agents are still running; the chat
+    pane must show "N background agent(s) running" so users see activity even
+    though the turn has ended and the terminal is silent.
+    """
+    bridge_dir = tmp_path / "bridge"
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text("", encoding="utf-8")
+    record_hook_event(
+        bridge_dir,
+        {
+            "hook_event_name": "SessionStart",
+            "session_id": "claude-session",
+            "transcript_path": str(transcript_path),
+        },
+    )
+    record_hook_event(
+        bridge_dir,
+        {
+            "hook_event_name": "Stop",
+            "session_id": "claude-session",
+            "background_tasks": [
+                {
+                    "id": "agent-abc",
+                    "type": "local_agent",
+                    "status": "running",
+                    "description": "Review the change",
+                },
+            ],
+        },
+    )
+    server, thread, base_url = _start_recording_server()
+    task = asyncio.create_task(
+        forwarder.forward_claude_transcript_to_session(
+            base_url=base_url,
+            headers={},
+            session_id="conv_abc",
+            bridge_dir=bridge_dir,
+            agent_name="claude-native-ui",
+            start_at_end=False,
+            poll_interval_s=0.01,
+        )
+    )
+    try:
+        request = await _get_recorded_request(server)
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5.0)
+
+    assert request["path"] == "/v1/sessions/conv_abc/events"
+    assert request["body"] == {
+        "type": "external_session_status",
+        "data": {
+            "status": "idle",
+            "turn_completed": True,
+            # No shell tasks — shell count is 0.
+            "background_task_count": 0,
+            # One agent-type task is still running.
+            "background_agent_count": 1,
         },
     }
 
@@ -520,13 +601,14 @@ async def test_forward_status_events_stamps_response_id_on_idle(tmp_path: Path) 
     assert bodies == [
         {
             "type": "external_session_status",
-            # The Stop→idle edge carries the turn's response id AND the
-            # background-shell tally (0 here — no shells); the live-tool-card
-            # and background-task features share this one status edge.
+            # The Stop→idle edge carries the turn's response id AND both
+            # background tallies (0 each — no shells, no agents); the
+            # live-tool-card and background-task features share this edge.
             "data": {
                 "status": "idle",
                 "turn_completed": True,
                 "background_task_count": 0,
+                "background_agent_count": 0,
                 "response_id": "resp_turn_1",
             },
         }

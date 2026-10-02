@@ -565,6 +565,12 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
           ? data.background_task_count
           : undefined;
       const backgroundTasks = parseBackgroundTasks(data.background_tasks);
+      // Same semantics as backgroundTaskCount: undefined = no information,
+      // 0 = authoritative clear.
+      const backgroundAgentCount =
+        typeof data.background_agent_count === "number" && data.background_agent_count >= 0
+          ? data.background_agent_count
+          : undefined;
       const rawError = data.error;
       // Parse via parseErrorInfo so a classified failure's optional
       // title/cause/remediation flow through, but keep the guard that both
@@ -587,6 +593,7 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
         responseId,
         backgroundTaskCount,
         ...(backgroundTasks !== undefined ? { backgroundTasks } : {}),
+        ...(backgroundAgentCount !== undefined ? { backgroundAgentCount } : {}),
         ...(blockedOn !== undefined ? { blockedOn } : {}),
         ...(error !== undefined ? { error } : {}),
       } satisfies SessionStatusEvent;

@@ -526,6 +526,12 @@ export interface SessionStatusEvent {
    */
   backgroundTasks?: BackgroundTaskInfo[];
   /**
+   * Background agents (type in `_BACKGROUND_AGENT_TASK_TYPES`) still running
+   * after a claude-native `Stop`. `undefined` = no information (leave the
+   * sticky tally untouched); `0` = authoritative clear.
+   */
+  backgroundAgentCount?: number;
+  /**
    * Short phrase naming what a still-`running` session is parked on, e.g.
    * "permission prompt". Terminal-backed agents can block on a dialog the
    * web UI does not mirror; this says why nothing is moving. Absent when

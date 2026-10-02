@@ -175,6 +175,7 @@ async def post_external_session_status(
     output: str | None = None,
     background_task_count: int | None = None,
     background_tasks: list[dict[str, object]] | None = None,
+    background_agent_count: int | None = None,
     response_id: str | None = None,
     failure_detail: str | None = None,
     turn_completed: bool | None = None,
@@ -200,6 +201,9 @@ async def post_external_session_status(
         UI can name the individual shells. ``None`` omits the field — the default
         for edges with no detail; sent alongside a positive count by the
         claude-native ``Stop`` hook.
+    :param background_agent_count: Background agents (type in
+        ``_BACKGROUND_AGENT_TASK_TYPES``) still running at the edge. ``None``
+        omits the field; ``0`` is authoritative and clears the sticky tally.
     :param response_id: Optional id of the assistant turn this status edge
         belongs to. When set, the server attaches it to the ``session.status``
         SSE event so ap-web can drive the bubble's streaming lifecycle — that's
@@ -226,6 +230,8 @@ async def post_external_session_status(
         data["background_task_count"] = background_task_count
     if background_tasks is not None:
         data["background_tasks"] = background_tasks
+    if background_agent_count is not None:
+        data["background_agent_count"] = background_agent_count
     if response_id is not None:
         data["response_id"] = response_id
     if turn_completed is not None:

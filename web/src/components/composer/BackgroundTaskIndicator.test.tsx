@@ -4,7 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useChatStore } from "@/store/chatStore";
 import type { BackgroundTaskInfo } from "@/lib/types";
 
-import { BackgroundTaskIndicator } from "./BackgroundTaskIndicator";
+import { BackgroundAgentIndicator, BackgroundTaskIndicator } from "./BackgroundTaskIndicator";
 
 function setBackground(
   count: number,
@@ -664,4 +664,44 @@ describe("BackgroundTaskIndicator command previews", () => {
       expect(screen.getAllByText(longCommand, { normalizer: (text) => text })).toHaveLength(1);
     },
   );
+});
+
+describe("BackgroundAgentIndicator", () => {
+  it("renders nothing when backgroundAgentCount is 0", () => {
+    useChatStore.setState({ backgroundAgentCount: 0 });
+    const { container } = render(<BackgroundAgentIndicator />);
+    expect(container).toBeEmptyDOMElement();
+  });
+
+  it("renders a pill with the agent count", () => {
+    useChatStore.setState({ backgroundAgentCount: 2, conversationId: "conv-1" });
+    render(<BackgroundAgentIndicator />);
+    expect(
+      screen.getByRole("button", { name: /2 background agents? still running/i }),
+    ).toBeInTheDocument();
+  });
+
+  it("shows singular label for a single agent", () => {
+    useChatStore.setState({ backgroundAgentCount: 1, conversationId: "conv-1" });
+    render(<BackgroundAgentIndicator />);
+    expect(
+      screen.getByRole("button", { name: /1 background agent still running/i }),
+    ).toBeInTheDocument();
+  });
+
+  it("clears when count drops to zero", () => {
+    useChatStore.setState({ backgroundAgentCount: 3, conversationId: "conv-1" });
+    render(<BackgroundAgentIndicator />);
+    expect(screen.getByTestId("background-agent-pill")).toBeInTheDocument();
+    act(() => useChatStore.setState({ backgroundAgentCount: 0 }));
+    expect(screen.queryByTestId("background-agent-pill")).not.toBeInTheDocument();
+  });
+
+  it("opens a popover describing the agents", async () => {
+    useChatStore.setState({ backgroundAgentCount: 1, conversationId: "conv-1" });
+    const user = userEvent.setup();
+    render(<BackgroundAgentIndicator />);
+    await user.click(screen.getByTestId("background-agent-pill"));
+    expect(screen.getByText(/1 background agent running in the background/i)).toBeInTheDocument();
+  });
 });

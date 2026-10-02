@@ -610,6 +610,12 @@ _session_background_tasks_cache: WorkspaceScopedCache[str, list[BackgroundTaskIn
 )
 
 
+# Background agents (type in _BACKGROUND_AGENT_TASK_TYPES) still running after a
+# claude-native Stop. Kept sticky like the shell count so a reload re-shows the
+# indicator; cleared to 0 on the next Stop that reports 0, or on failure.
+_session_background_agent_count_cache: WorkspaceScopedCache[str, int] = WorkspaceScopedCache()
+
+
 _read_last_seen: WorkspaceScopedCache[str, dict[str, int]] = WorkspaceScopedCache()
 
 
@@ -1175,6 +1181,7 @@ __all__ = [
     "_server_host_registry",
     "_server_runner_router",
     "_session_active_response_cache",
+    "_session_background_agent_count_cache",
     "_session_background_task_count_cache",
     "_session_background_tasks_cache",
     "_session_mcp_startup_cache",

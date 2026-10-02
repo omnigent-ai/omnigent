@@ -49,11 +49,13 @@ def _clear_caches() -> None:
     _sessions_mod._session_status_cache.pop(_SID, None)
     _sessions_mod._session_background_task_count_cache.pop(_SID, None)
     _sessions_mod._session_background_tasks_cache.pop(_SID, None)
+    _sessions_mod._session_background_agent_count_cache.pop(_SID, None)
     _sessions_mod._session_active_response_cache.pop(_SID, None)
     yield
     _sessions_mod._session_status_cache.pop(_SID, None)
     _sessions_mod._session_background_task_count_cache.pop(_SID, None)
     _sessions_mod._session_background_tasks_cache.pop(_SID, None)
+    _sessions_mod._session_background_agent_count_cache.pop(_SID, None)
     _sessions_mod._session_active_response_cache.pop(_SID, None)
 
 
@@ -199,3 +201,62 @@ def test_codex_native_subagent_waiting_unchanged() -> None:
 def test_non_waiting_status_passes_through() -> None:
     assert _background_task_delivery_status("idle", 1, _conv("sub_agent")) == "idle"
     assert _background_task_delivery_status("failed", 1, _conv("sub_agent")) == "failed"
+
+
+# ── background-agent count cache (parallel to shell tally) ──────────────────
+
+
+def test_idle_with_positive_agent_count_sets_sticky_agent_cache() -> None:
+    # Stop hook while agents are running: agent count sticks in cache so
+    # the "N background agent(s) running" pill survives the trailing idle.
+    _publish_status(_SID, "idle", background_agent_count=2)
+    assert _sessions_mod._session_background_agent_count_cache.get(_SID) == 2
+
+
+def test_trailing_idle_without_agent_count_leaves_agent_cache_sticky() -> None:
+    # PTY-activity idle (None = no info) must NOT wipe the agent count the
+    # Stop hook set — same sticky semantics as the shell count.
+    _publish_status(_SID, "idle", background_agent_count=2)
+    _publish_status(_SID, "idle", background_agent_count=None)
+    assert _sessions_mod._session_background_agent_count_cache.get(_SID) == 2
+
+
+def test_authoritative_zero_agent_count_clears_agent_cache() -> None:
+    # The agents finished: the next Stop hook reports 0, which must clear the
+    # tally so the indicator goes out.
+    _publish_status(_SID, "idle", background_agent_count=2)
+    _publish_status(_SID, "idle", background_agent_count=0)
+    assert _SID not in _sessions_mod._session_background_agent_count_cache
+
+
+def test_failure_clears_agent_cache_even_when_count_is_none() -> None:
+    # A failed/dead session may never post another count. Failure is
+    # authoritative: clear the tally so a stale indicator never lingers.
+    _publish_status(_SID, "idle", background_agent_count=3)
+    _publish_status(_SID, "failed", background_agent_count=None)
+    assert _SID not in _sessions_mod._session_background_agent_count_cache
+
+
+def test_new_turn_running_keeps_agent_cache() -> None:
+    # Background agents outlive turn boundaries — a new running turn must not
+    # reset the count (it carries none). The pill stays lit alongside the shimmer.
+    _publish_status(_SID, "idle", background_agent_count=1)
+    _publish_status(_SID, "running")
+    assert _sessions_mod._session_background_agent_count_cache.get(_SID) == 1
+
+
+def test_shell_and_agent_caches_are_independent() -> None:
+    # Shells and agents are counted separately — they should not interfere.
+    _publish_status(
+        _SID,
+        "idle",
+        background_task_count=2,
+        background_tasks=_tasks("Watch tests"),
+        background_agent_count=3,
+    )
+    assert _sessions_mod._session_background_task_count_cache.get(_SID) == 2
+    assert _sessions_mod._session_background_agent_count_cache.get(_SID) == 3
+    # Clearing shells (count=0) must not touch the agent cache.
+    _publish_status(_SID, "idle", background_task_count=0)
+    assert _SID not in _sessions_mod._session_background_task_count_cache
+    assert _sessions_mod._session_background_agent_count_cache.get(_SID) == 3

@@ -661,6 +661,13 @@ export interface ConversationState {
    */
   backgroundTasks: BackgroundTaskInfo[];
   /**
+   * Background agents (claude-native task types "agent" / "local_agent" /
+   * "subagent") still running after the turn ended. `0` when none are
+   * tracked. Authoritative: a Stop hook's `0` clears it; a failure clears it;
+   * an absent SSE field leaves it untouched.
+   */
+  backgroundAgentCount: number;
+  /**
    * Why a still-`running` session is parked, e.g. "permission prompt".
    * Terminal-backed agents can block on a dialog the web UI does not
    * mirror, so the working indicator names it instead of shimmering with
@@ -1790,6 +1797,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   sessionStatus: "idle",
   backgroundTaskCount: 0,
   backgroundTasks: [],
+  backgroundAgentCount: 0,
   blockedOn: null,
   isNativeTerminalSession: false,
   nativeVendorOwnsModel: false,
@@ -2373,6 +2381,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
             patch.sessionStatus = "idle";
             patch.backgroundTaskCount = 0;
             patch.backgroundTasks = [];
+            patch.backgroundAgentCount = 0;
           }
           return patch;
         });
@@ -2474,6 +2483,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
           sessionStatus: "idle",
           backgroundTaskCount: 0,
           backgroundTasks: [],
+          backgroundAgentCount: 0,
         });
       } else {
         // Sent alongside an already-streaming turn (or a stranded latch): the
@@ -2571,6 +2581,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
             patch.sessionStatus = "idle";
             patch.backgroundTaskCount = 0;
             patch.backgroundTasks = [];
+            patch.backgroundAgentCount = 0;
           }
           return patch;
         });
@@ -2659,6 +2670,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         sessionStatus: "idle",
         backgroundTaskCount: 0,
         backgroundTasks: [],
+        backgroundAgentCount: 0,
         blockedOn: null,
       };
       if (s.activeResponse?.state === "streaming") {
@@ -4256,11 +4268,11 @@ async function bindStream(
               },
             }
           : {}),
-        // Re-show "N background tasks still running" after a reload/navigate-back: the
-        // live SSE edge that set this is long gone, so the count rides in on
-        // the snapshot (server keeps it sticky past the trailing PTY `idle`).
+        // Re-show "N background tasks/agents running" after reload/navigate-back:
+        // the live SSE edge is gone, so both counts ride in on the snapshot.
         backgroundTaskCount: session.backgroundTaskCount ?? 0,
         backgroundTasks: session.backgroundTasks ?? [],
+        backgroundAgentCount: session.backgroundAgentCount ?? 0,
         blockedOn: null,
         // This conversation's own effective effort, which is what a warm switch
         // back re-projects (it does not re-bind, so it cannot recompute it).
@@ -4494,10 +4506,11 @@ function reconnectStatusPatch(
     sessionStatus: session.status,
     ...mcpStartupSnapshotPatch(session, s, launchBeforeFetch),
   };
-  // Recover the background-shell tally across the gap too, so the spinner
-  // returns to "N background tasks still running" rather than vanishing on reconnect.
+  // Recover background-shell and background-agent tallies across the gap so
+  // both indicators return after reconnect.
   patch.backgroundTaskCount = session.backgroundTaskCount ?? 0;
   patch.backgroundTasks = session.backgroundTasks ?? [];
+  patch.backgroundAgentCount = session.backgroundAgentCount ?? 0;
   if (session.contextWindow != null) patch.contextWindow = session.contextWindow;
   if (session.lastTotalTokens != null) patch.tokensUsed = session.lastTotalTokens;
   if (session.totalCostUsd != null) patch.sessionCostUsd = session.totalCostUsd;
@@ -4604,6 +4617,7 @@ async function reconcileActiveSessionStatus(
     current.activeResponse !== stateBeforeFetch.activeResponse ||
     current.backgroundTaskCount !== stateBeforeFetch.backgroundTaskCount ||
     current.backgroundTasks !== stateBeforeFetch.backgroundTasks ||
+    current.backgroundAgentCount !== stateBeforeFetch.backgroundAgentCount ||
     current.mcpStartup !== stateBeforeFetch.mcpStartup ||
     current.contextWindow !== stateBeforeFetch.contextWindow ||
     current.tokensUsed !== stateBeforeFetch.tokensUsed ||
@@ -6812,6 +6826,12 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
         } else if (event.status === "failed") {
           patch.backgroundTaskCount = 0;
           patch.backgroundTasks = [];
+        }
+        // Background agents follow the same sticky-count semantics as shells.
+        if (event.backgroundAgentCount !== undefined) {
+          patch.backgroundAgentCount = event.backgroundAgentCount;
+        } else if (event.status === "failed") {
+          patch.backgroundAgentCount = 0;
         }
         if (event.status === "failed" && s.blocks.some(isLiveProvisionalBlock)) {
           patch.blocks = s.blocks.map((block) =>

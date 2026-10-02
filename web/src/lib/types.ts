@@ -311,6 +311,11 @@ export interface Session {
    * the count).
    */
   backgroundTasks?: BackgroundTaskInfo[];
+  /**
+   * Background agents (type in `_BACKGROUND_AGENT_TASK_TYPES`) still running
+   * after a claude-native `Stop`. Absent/0 when none are tracked.
+   */
+  backgroundAgentCount?: number;
   createdAt: number;
   /**
    * Human-readable session title, e.g. ``"researcher:auth"`` for a

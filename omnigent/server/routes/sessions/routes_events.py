@@ -1726,6 +1726,16 @@ def register_events_routes(
             # detail, and the server keeps it in lockstep with the tally (see
             # ``_publish_status``).
             bg_tasks = _parse_background_tasks(body.data.get("background_tasks"))
+            # Background agents counted separately from shells (same semantics:
+            # None = no information, 0 = authoritative clear).
+            raw_bg_agent_count = body.data.get("background_agent_count")
+            bg_agent_count = (
+                raw_bg_agent_count
+                if isinstance(raw_bg_agent_count, int)
+                and not isinstance(raw_bg_agent_count, bool)
+                and raw_bg_agent_count >= 0
+                else None
+            )
             # Why a still-running session is parked, e.g. a permission prompt
             # the web UI does not mirror. Absent or blank = not parked, so the
             # indicator falls back to its ordinary working label.
@@ -1742,6 +1752,7 @@ def register_events_routes(
                     response_id=response_id,
                     background_task_count=bg_count,
                     background_tasks=bg_tasks,
+                    background_agent_count=bg_agent_count,
                     blocked_on=blocked_on,
                 )
                 return {"queued": False}
@@ -1809,6 +1820,7 @@ def register_events_routes(
                 response_id=response_id,
                 background_task_count=bg_count,
                 background_tasks=bg_tasks,
+                background_agent_count=bg_agent_count,
                 blocked_on=blocked_on,
             )
             if (
