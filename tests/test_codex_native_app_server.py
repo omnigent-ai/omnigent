@@ -269,7 +269,19 @@ async def test_discover_codex_model_options_strips_secrets_and_stops_process(
             "OPENAI_BASE_URL": "https://example.invalid/v1",
             "DATABRICKS_BEARER": "databricks-secret",
             "DATABRICKS_CODEX_TOKEN": "databricks-secret",
+            # Service-principal secrets a gateway auth command may consume;
+            # discovery has no auth command and must drop them.
+            "DATABRICKS_CLIENT_ID": "sp-client-id",
+            "DATABRICKS_CLIENT_SECRET": "sp-client-secret",
+            # Forwarded to real launches because the user's config.toml declares
+            # it via env_key; discovery must still drop it.
+            "MYPROXY_API_KEY": "proxy-secret",
         },
+    )
+    monkeypatch.setattr(
+        codex_native_app_server,
+        "codex_config_declared_env_key_allowance",
+        lambda: ("MYPROXY_API_KEY",),
     )
     monkeypatch.setattr(
         codex_native_app_server,

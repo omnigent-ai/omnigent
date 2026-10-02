@@ -3573,7 +3573,10 @@ def _build_host_daemon_env(
     but unrelated shell secrets are not inherited merely because the daemon
     runs on the user's machine. Runners launched by the daemon still pass
     through :func:`omnigent.host.connect._build_runner_env`, so these
-    local-server credentials do not leak into runner subprocesses.
+    local-server credentials do not leak into runner subprocesses. Both modes
+    also carry the variable Codex's own ``config.toml`` declares via
+    ``env_key``: the runner forwards it to Codex launches, so it has to
+    survive this hop first.
 
     :param server_url: Omnigent server URL for remote mode, e.g.
         ``"https://example.databricksapps.com"``, or a falsey value
@@ -3583,6 +3586,7 @@ def _build_host_daemon_env(
     from omnigent.host.connect import (
         _RUNNER_ENV_ALLOWLIST,
         _RUNNER_ENV_ALLOWLIST_PREFIXES,
+        codex_config_declared_env_vars,
     )
     from omnigent.host.identity import (
         HOST_ID_ENV_VAR,
@@ -3598,6 +3602,7 @@ def _build_host_daemon_env(
         }
     )
 
+    codex_env_vars = codex_config_declared_env_vars()
     if not server_url:
         daemon_env_prefixes = (*_RUNNER_ENV_ALLOWLIST_PREFIXES, *_LOCAL_DAEMON_ENV_PREFIXES)
         env = {
@@ -3607,6 +3612,7 @@ def _build_host_daemon_env(
             or key in _LOCAL_DAEMON_ENV_ALLOWLIST
             or key in _HOST_DAEMON_PROXY_ENV_ALLOWLIST
             or key in identity_env_vars
+            or key in codex_env_vars
             or key.startswith(daemon_env_prefixes)
         }
     else:
@@ -3621,6 +3627,7 @@ def _build_host_daemon_env(
             if key in _RUNNER_ENV_ALLOWLIST
             or key in _HOST_DAEMON_PROXY_ENV_ALLOWLIST
             or key in identity_env_vars
+            or key in codex_env_vars
             or key.startswith(daemon_env_prefixes)
         }
     # The daemon outlives the dispatch that spawned it and is reused by later

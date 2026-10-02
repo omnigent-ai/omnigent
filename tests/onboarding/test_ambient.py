@@ -62,6 +62,9 @@ def clean_env(tmp_path, monkeypatch: pytest.MonkeyPatch):
     from omnigent.onboarding import harness_install
 
     monkeypatch.setenv("HOME", str(tmp_path))
+    # Pi detection honors this relocation var (mirroring pi's own resolution);
+    # a leaked value would bypass the tmp-HOME isolation.
+    monkeypatch.delenv("PI_CODING_AGENT_DIR", raising=False)
     for var in _PROVIDER_ENV_VARS:
         monkeypatch.delenv(var, raising=False)
     monkeypatch.setattr(ambient, "_ollama_reachable", lambda: False)
@@ -451,7 +454,7 @@ def test_ollama_detected_when_reachable(clean_env, monkeypatch: pytest.MonkeyPat
 
 
 def test_detection_priority_order(clean_env, monkeypatch: pytest.MonkeyPatch) -> None:
-    """All signals together are returned in env → claude → codex → ollama order.
+    """All signals together are returned in env → claude → codex → pi → ollama order.
 
     Failure means the stable ordering broke, so the setup UI would present
     detected providers in a non-deterministic / surprising order.
@@ -471,12 +474,17 @@ def test_detection_priority_order(clean_env, monkeypatch: pytest.MonkeyPatch) ->
     (codex_dir / "auth.json").write_text(
         '{"auth_mode": "apikey", "OPENAI_API_KEY": "sk-codex-real"}', encoding="utf-8"
     )
+    pi_dir = clean_env / ".pi" / "agent"
+    pi_dir.mkdir(parents=True)
+    (pi_dir / "auth.json").write_text(
+        '{"openai": {"type": "api_key", "key": "sk-pi-real"}}', encoding="utf-8"
+    )
     monkeypatch.setattr(ambient, "_ollama_reachable", lambda: True)
 
     detected = detect_providers()
     # Env keys first, in PROVIDER_ENV_VARS iteration order (openai precedes
-    # anthropic in that dict), then claude login, codex login, ollama.
-    assert [d.name for d in detected] == ["openai", "anthropic", "claude", "codex", "ollama"]
+    # anthropic in that dict), then claude login, codex login, pi login, ollama.
+    assert [d.name for d in detected] == ["openai", "anthropic", "claude", "codex", "pi", "ollama"]
 
 
 # ── Codex config.toml custom provider (cli-config) detection ───────────────
@@ -1015,3 +1023,83 @@ def test_claude_managed_model_picker_reads_replacement_options(tmp_path: Path) -
         ("gateway-opus", "Opus"),
         ("gateway-sonnet", "Sonnet"),
     )
+
+
+def _write_pi_auth(home: Path, body: str) -> None:
+    """Write a pi ``auth.json`` under *home*'s ``.pi/agent`` dir."""
+    agent_dir = home / ".pi" / "agent"
+    agent_dir.mkdir(parents=True)
+    (agent_dir / "auth.json").write_text(body, encoding="utf-8")
+
+
+@pytest.mark.parametrize(
+    "auth",
+    [
+        # OAuth entry with a refresh token (renewable — the normal login).
+        {"anthropic": {"type": "oauth", "access": "at-real", "refresh": "rt-real", "expires": 1}},
+        # OAuth entry without a refresh token but not yet expired.
+        {
+            "anthropic": {
+                "type": "oauth",
+                "access": "at-real",
+                "refresh": "",
+                "expires": 99999999999999,
+            }
+        },
+        # Stored provider API key.
+        {"openai": {"type": "api_key", "key": "sk-pi-real"}},
+        # A usable entry among unusable ones still counts.
+        {"a": {"type": "api_key", "key": ""}, "b": {"type": "api_key", "key": "k"}},
+    ],
+)
+def test_pi_cli_login_detected(clean_env, auth: dict[str, object]) -> None:
+    """A ``~/.pi/agent/auth.json`` carrying a credential is detected.
+
+    Failure means a natively signed-in pi (a bare ``pi`` runs) reads
+    "Not configured" in the setup overview: the user's own login is never
+    credited.
+    """
+    _write_pi_auth(clean_env, json.dumps(auth))
+    assert detect_providers() == [
+        DetectedProvider(
+            name="pi",
+            kind="subscription",
+            family="pi",
+            source="pi CLI login",
+        )
+    ]
+
+
+@pytest.mark.parametrize(
+    "auth_json",
+    [
+        "{}",  # empty object — logged out / never logged in
+        '{"anthropic": {"type": "oauth", "access": "", "refresh": "", "expires": 1}}',
+        '{"anthropic": {"type": "oauth", "access": "at", "refresh": "", "expires": 1}}',  # expired
+        '{"openai": {"type": "api_key", "key": ""}}',  # blank key
+        '{"openai": {"type": "api_key"}}',  # keyless entry
+        '{"anthropic": "raw-string"}',  # not the type-tagged shape
+        "not json at all",  # malformed
+        "[1, 2, 3]",  # valid JSON but not an object
+    ],
+)
+def test_pi_auth_without_credential_not_detected(clean_env, auth_json: str) -> None:
+    """A pi ``auth.json`` with no usable credential is NOT detected.
+
+    Mere existence must not count (mirrors the codex helper): a logged-out or
+    malformed file would otherwise plant a phantom "Pi original auth" provider
+    that strands pi at its own login screen.
+    """
+    _write_pi_auth(clean_env, auth_json)
+    assert detect_providers() == []
+
+
+def test_pi_auth_path_honors_agent_dir_env(clean_env, monkeypatch: pytest.MonkeyPatch) -> None:
+    """``PI_CODING_AGENT_DIR`` relocates the file read, mirroring pi itself."""
+    relocated = clean_env / "relocated-agent"
+    relocated.mkdir()
+    (relocated / "auth.json").write_text(
+        '{"openai": {"type": "api_key", "key": "sk-pi-real"}}', encoding="utf-8"
+    )
+    monkeypatch.setenv("PI_CODING_AGENT_DIR", str(relocated))
+    assert [d.name for d in detect_providers()] == ["pi"]

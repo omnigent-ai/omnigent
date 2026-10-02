@@ -3982,6 +3982,120 @@ def test_build_runner_env_passthrough_extends_forwarded_set() -> None:
     assert "UNLISTED_SECRET" not in env
 
 
+@pytest.mark.parametrize("harness", ["codex-native", "codex", "native-codex"])
+def test_build_runner_env_forwards_codex_config_declared_env_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, harness: str
+) -> None:
+    """The variable Codex's own config.toml names via ``env_key`` reaches a Codex runner.
+
+    A user whose ``~/.codex/config.toml`` selects a custom provider authenticated
+    from ``MYPROXY_API_KEY`` runs a bare ``codex`` fine; the runner launches Codex
+    with that same variable (see ``_clean_codex_env``), so the host→runner
+    allowlist must let exactly that declared name through and nothing else.
+    """
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    codex_dir = tmp_path / ".codex"
+    codex_dir.mkdir()
+    (codex_dir / "config.toml").write_text(
+        'model_provider = "myproxy"\n'
+        "[model_providers.myproxy]\n"
+        'base_url = "https://myproxy.example.com/v1"\n'
+        'env_key = "MYPROXY_API_KEY"\n',
+        encoding="utf-8",
+    )
+    base = {
+        "PATH": "/usr/bin",
+        "HOME": str(tmp_path),
+        "MYPROXY_API_KEY": "populated-proxy-token",
+        "UNLISTED_SECRET": "nope",
+    }
+
+    env = _build_runner_env(
+        base,
+        server_url="http://server",
+        runner_id="runner_abc",
+        binding_token="tok",
+        workspace="/ws",
+        parent_pid=42,
+        harness=harness,
+    )
+
+    assert env["MYPROXY_API_KEY"] == "populated-proxy-token"
+    assert "UNLISTED_SECRET" not in env
+
+
+@pytest.mark.parametrize("harness", ["claude-native", "pi-native", None])
+def test_build_runner_env_does_not_forward_codex_declared_key_to_non_codex_harness(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, harness: str | None
+) -> None:
+    """A Codex config declaration never grants another harness's runner the variable.
+
+    A Claude runner (and the CLI it launches, which inherits the runner env)
+    must not receive a host credential just because Codex's config names it.
+    """
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    codex_dir = tmp_path / ".codex"
+    codex_dir.mkdir()
+    (codex_dir / "config.toml").write_text(
+        'model_provider = "myproxy"\n'
+        "[model_providers.myproxy]\n"
+        'base_url = "https://myproxy.example.com/v1"\n'
+        'env_key = "MYPROXY_API_KEY"\n',
+        encoding="utf-8",
+    )
+    base = {"PATH": "/usr/bin", "HOME": str(tmp_path), "MYPROXY_API_KEY": "populated-proxy-token"}
+
+    env = _build_runner_env(
+        base,
+        server_url="http://server",
+        runner_id="runner_abc",
+        binding_token="tok",
+        workspace="/ws",
+        parent_pid=42,
+        harness=harness,
+    )
+
+    assert "MYPROXY_API_KEY" not in env
+
+
+@pytest.mark.parametrize("env_key", ["OMNIGENT_HOST_TOKEN", "DATABRICKS_TOKEN"])
+def test_build_runner_env_declared_env_key_cannot_forward_protected_names(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, env_key: str
+) -> None:
+    """A config.toml ``env_key`` naming the host token or a gated host secret does not
+    leak it to a Codex runner, whether or not an Omnigent provider routes the launch."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    codex_dir = tmp_path / ".codex"
+    codex_dir.mkdir()
+    (codex_dir / "config.toml").write_text(
+        'model_provider = "myproxy"\n'
+        "[model_providers.myproxy]\n"
+        'base_url = "https://myproxy.example.com/v1"\n'
+        f'env_key = "{env_key}"\n',
+        encoding="utf-8",
+    )
+    base = {
+        "PATH": "/usr/bin",
+        "HOME": str(tmp_path),
+        env_key: "protected-secret",
+    }
+
+    env = _build_runner_env(
+        base,
+        server_url="http://server",
+        runner_id="runner_abc",
+        binding_token="tok",
+        workspace="/ws",
+        parent_pid=42,
+        harness="codex-native",
+    )
+
+    assert env_key not in env
+
+
 def test_dispatch_trace_context_reaches_runner_but_not_daemon(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

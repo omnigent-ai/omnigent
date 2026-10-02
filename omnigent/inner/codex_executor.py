@@ -207,6 +207,25 @@ _BROKERED_CODEX_PROVIDER_NAME = "omnigent_brokered"
 # developer API key that would charge separately.
 _CODEX_ENV_DENY_EXACT: frozenset[str] = frozenset({"OPENAI_API_KEY"})
 
+# Names a config.toml ``env_key`` can never pull into a Codex launch: the deny
+# set plus host secrets that stay gated behind sandbox.env_passthrough.
+_CODEX_ENV_KEY_NEVER_FORWARDED: frozenset[str] = _CODEX_ENV_DENY_EXACT | {
+    "DATABRICKS_TOKEN",
+    "DATABRICKS_CONFIG_PROFILE",
+}
+
+# Provider credentials the Codex launch env carries for a gateway auth command
+# or an env_key provider; credential-free model discovery strips them again.
+_CODEX_PROVIDER_CREDENTIAL_ENV_VARS: tuple[str, ...] = (
+    "DATABRICKS_BEARER",  # explicit CI/integration bearer used by auth.command
+    "DATABRICKS_CODEX_TOKEN",  # env_key in ~/.codex/config.toml's DB provider
+    # Service-principal M2M credentials so a Databricks-gateway auth.command can
+    # mint an OAuth token; DATABRICKS_CONFIG_PROFILE / DATABRICKS_TOKEN stay host
+    # secrets gated behind env_passthrough.
+    "DATABRICKS_CLIENT_ID",
+    "DATABRICKS_CLIENT_SECRET",
+)
+
 # The codex CLI logs a rejected gateway request to stderr as
 # ``unexpected status <code> <reason>: {...}, url: <url>`` and precedes it with
 # ``Reconnecting... N/5`` retry lines. These parse that shape so the head can
@@ -661,6 +680,28 @@ async def _create_subprocess_exec(
     )
 
 
+def codex_config_declared_env_key_allowance() -> tuple[str, ...]:
+    """Return the env var codex's own config declares via ``env_key``, as an allowance.
+
+    The declared variable is the credential of the provider codex itself
+    resolves, so the scrubbed launch env carries it. Never names an Omnigent
+    control-plane variable or a :data:`_CODEX_ENV_KEY_NEVER_FORWARDED` entry
+    (the Codex deny set and host secrets gated behind ``env_passthrough``), and
+    never raises: env construction must survive a broken config.
+
+    :returns: A one-element tuple with the variable name, or empty.
+    """
+    from omnigent.onboarding.codex_auth_readiness import codex_config_declared_env_key
+
+    try:
+        env_key = codex_config_declared_env_key(
+            _codex_home_config_source_from_env() / "config.toml"
+        )
+    except Exception:  # noqa: BLE001 - env building must never fail on config reads.
+        return ()
+    return () if env_key is None or env_key in _CODEX_ENV_KEY_NEVER_FORWARDED else (env_key,)
+
+
 def _clean_codex_env(extra_allow: Iterable[str] = ()) -> dict[str, str]:
     """
     Build a filtered copy of ``os.environ`` for the codex subprocess.
@@ -670,7 +711,9 @@ def _clean_codex_env(extra_allow: Iterable[str] = ()) -> dict[str, str]:
     :data:`_CODEX_ENV_DENY_EXACT` are excluded even when their prefix matches;
     ``OPENAI_API_KEY`` is stripped so the codex CLI falls back to subscription
     auth (``auth.json``) rather than a developer API key that would charge
-    separately.
+    separately. A variable the user's own ``config.toml`` declares as its
+    effective provider's ``env_key`` credential is forwarded (see
+    :func:`codex_config_declared_env_key_allowance`).
 
     The filtered dict is also the executor's own view of its launch, not just
     the subprocess env: the app-server session reads Omnigent's per-session
@@ -688,17 +731,8 @@ def _clean_codex_env(extra_allow: Iterable[str] = ()) -> dict[str, str]:
         allow_exact=(
             "PYTHONUTF8",
             "OTEL_RESOURCE_ATTRIBUTES",
-            "DATABRICKS_BEARER",  # explicit CI/integration bearer used by auth.command
-            "DATABRICKS_CODEX_TOKEN",  # env_key in ~/.codex/config.toml's DB provider
-            # Service-principal M2M credentials, so a Databricks-gateway
-            # ``auth.command`` can mint an OAuth token from the SP on each
-            # refresh. Only DATABRICKS_BEARER survived before, forcing a
-            # pre-minted (expiring) token or an inlined secret; these let the
-            # standard client-credentials mint work on a non-interactive host.
-            # DATABRICKS_CONFIG_PROFILE / DATABRICKS_TOKEN are deliberately NOT
-            # here (they stay host secrets, gated behind env_passthrough).
-            "DATABRICKS_CLIENT_ID",
-            "DATABRICKS_CLIENT_SECRET",
+            *_CODEX_PROVIDER_CREDENTIAL_ENV_VARS,
+            *codex_config_declared_env_key_allowance(),
             *_CODEX_OMNIGENT_LAUNCH_ENV_VARS,
         ),
         deny_exact=_CODEX_ENV_DENY_EXACT,

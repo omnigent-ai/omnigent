@@ -105,6 +105,44 @@ def provider_table_has_self_contained_auth(table: dict[str, object]) -> bool:
     return False
 
 
+# Omnigent's own control-plane variables (host and runner tokens, launch
+# markers) are never a provider credential, whatever a config.toml declares.
+_FRAMEWORK_ENV_PREFIX = "OMNIGENT_"
+
+
+def codex_config_declared_env_key(config_path: Path) -> str | None:
+    """Return the env var codex's effective provider declares via ``env_key``.
+
+    A custom ``[model_providers.X]`` table may authenticate from an
+    environment variable it names in ``env_key``. That variable is the
+    provider's declared credential, so a scrubbed codex launch environment
+    must forward it (see ``_clean_codex_env``) for the provider codex itself
+    selects to authenticate — the launch-side counterpart of the
+    ``env_key`` branch in :func:`codex_config_effective_auth`.
+
+    :param config_path: Path to the Codex ``config.toml`` to inspect.
+    :returns: The declared variable name, e.g. ``\"MYPROXY_API_KEY\"``, or
+        ``None`` when the config is missing/malformed, the effective provider
+        is built-in or rides Codex login (``requires_openai_auth``), the
+        table declares no ``env_key``, or it names an Omnigent control-plane
+        variable (``OMNIGENT_*``), which is never forwarded as a credential.
+    """
+    config = load_codex_config(config_path)
+    if config is None:
+        return None
+    pair = effective_custom_provider_table(config)
+    if pair is None:
+        return None
+    _provider_id, table = pair
+    if table.get("requires_openai_auth") is True:
+        return None
+    env_key = table.get("env_key")
+    if not isinstance(env_key, str) or not env_key.strip():
+        return None
+    env_key = env_key.strip()
+    return None if env_key.startswith(_FRAMEWORK_ENV_PREFIX) else env_key
+
+
 def codex_config_effective_auth(
     config_path: Path,
     *,
@@ -117,7 +155,8 @@ def codex_config_effective_auth(
     * unset / built-in ``openai`` / ``requires_openai_auth = true`` →
       ``"codex-login"`` (inspect ``auth.json``);
     * non-OpenAI provider declaring ``env_key`` → ``"provider-ready"`` only
-      when the variable is non-empty, otherwise ``"provider-auth-missing"``;
+      when the variable is non-empty and not an Omnigent control-plane name
+      (``OMNIGENT_*``), otherwise ``"provider-auth-missing"``;
     * any other non-OpenAI provider → ``"provider-ready"`` because Codex
       considers provider-specific auth sufficient or unnecessary.
 
@@ -163,7 +202,12 @@ def codex_config_effective_auth(
     env_key = table.get("env_key")
     if not isinstance(env_key, str) or not env_key.strip():
         return "provider-ready"
-    value = (os.environ if env is None else env).get(env_key.strip())
+    env_key = env_key.strip()
+    # Never forwarded as a credential (see codex_config_declared_env_key), so
+    # the provider cannot be ready even when the host process has the value.
+    if env_key.startswith(_FRAMEWORK_ENV_PREFIX):
+        return "provider-auth-missing"
+    value = (os.environ if env is None else env).get(env_key)
     if isinstance(value, str) and value.strip():
         return "provider-ready"
     return "provider-auth-missing"

@@ -94,6 +94,10 @@ def isolated_config(tmp_path, monkeypatch):
     # Redirect CLI-detected credential homes so a developer's real
     # ~/.claude / ~/.codex logins don't leak into ambient detection.
     monkeypatch.setenv("HOME", str(tmp_path))
+    # The codex / pi detectors honor these relocation vars; a developer's
+    # shell value would bypass the tmp-HOME isolation.
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    monkeypatch.delenv("PI_CODING_AGENT_DIR", raising=False)
     # Stub out the two ambient-detection helpers that read real machine
     # state regardless of HOME / env-var isolation:
     # - _ollama_reachable: TCP-probes localhost:11434; a running Ollama
@@ -3700,3 +3704,322 @@ def test_render_listing_default_marker_survives_non_utf8_console(
     out = buffer.getvalue().decode("cp1252")
     assert "anthropic" in out
     assert "* default" in out
+
+
+# ── Codex configured by its own config.toml (env_key) ───────────────────────
+# An env_key custom provider is never adopted (its credential is an env var),
+# yet a bare `codex` resolves it provider-ready — so the overview credits it
+# via a row-level fallback instead of reading "Not configured".
+
+
+def _seed_codex_env_key_provider(home: str) -> None:
+    """Write a ``~/.codex/config.toml`` whose default provider authenticates via ``env_key``."""
+    from pathlib import Path
+
+    codex_dir = Path(home) / ".codex"
+    codex_dir.mkdir(parents=True)
+    (codex_dir / "config.toml").write_text(
+        'model_provider = "myproxy"\n'
+        "\n"
+        "[model_providers.myproxy]\n"
+        'name = "My Proxy"\n'
+        'base_url = "https://myproxy.example.com/v1"\n'
+        'env_key = "MYPROXY_API_KEY"\n'
+        'wire_api = "responses"\n'
+    )
+
+
+def _overview_status(options: list[str], selectable: list[bool], name: str) -> str:
+    from rich.text import Text
+
+    row = options[_overview_row_names(options, selectable).index(name)]
+    return Text.from_markup(row).plain
+
+
+def test_codex_own_config_status_credits_populated_env_key(isolated_config, monkeypatch) -> None:
+    """A populated env_key provider reads ready; an unpopulated one does not.
+
+    Mirrors codex's own resolution (``codex_config_effective_auth``): the
+    provider is ready exactly when its declared variable is populated in the
+    env the launch receives. Failure means setup disagrees with a bare
+    ``codex`` about the same config.
+    """
+    from omnigent.cli_config import _codex_own_config_status
+
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    _seed_codex_env_key_provider(isolated_config)
+
+    monkeypatch.setenv("MYPROXY_API_KEY", "populated-proxy-token")
+    assert _codex_own_config_status({}) == "My Proxy (Codex config)"
+
+    monkeypatch.delenv("MYPROXY_API_KEY")
+    assert _codex_own_config_status({}) is None
+
+
+def test_codex_own_config_status_respects_dismissal(isolated_config, monkeypatch) -> None:
+    """A Removed (dismissed) config provider must not resurface as ready.
+
+    After Remove, the launch pins codex's built-in openai provider, so the
+    config no longer routes; showing it ready would resurrect the credential
+    the user removed.
+    """
+    from omnigent.cli_config import _codex_own_config_status
+
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    _write_codex_config_toml(isolated_config)  # self-contained auth command
+
+    assert _codex_own_config_status({}) == "Databricks AI Gateway (Codex config)"
+    assert _codex_own_config_status({"dismissed_detections": ["codex-databricks"]}) is None
+
+
+def test_harness_overview_credits_codex_own_env_key_config(isolated_config, monkeypatch) -> None:
+    """The Codex row credits an env_key provider codex itself resolves as ready.
+
+    Codex configured only through its own ``~/.codex/config.toml`` (custom
+    provider + exported env_key token) is what a bare ``codex`` runs on, so the
+    Codex row must name that provider. No entry is adopted: the credential is
+    an env var, not a self-contained table.
+    """
+    _seed_codex_env_key_provider(isolated_config)
+    monkeypatch.setenv("MYPROXY_API_KEY", "populated-proxy-token")
+
+    options, selectable, _descriptions, _compact, _max_visible = _capture_setup_overview(
+        monkeypatch
+    )
+
+    status = _overview_status(options, selectable, "Codex")
+    assert "Not configured" not in status, status
+    assert "✓ My Proxy (Codex config)" in status, status
+    # Nothing was adopted — the ready state is a readout of codex's own config.
+    assert _config_yaml(isolated_config).get("providers", {}) == {}
+
+
+# ── Pi native login (Pi original auth) ──────────────────────────────────────
+
+
+def _rendered_row(output: str, name: str) -> str:
+    """Return the status text of the *name* row in a rendered (non-TTY) setup overview."""
+    import re
+
+    rows = [
+        line.strip()
+        for line in output.splitlines()
+        if re.search(rf"(^|\s){re.escape(name)}\s{{2,}}\S", line)
+    ]
+    assert rows, f"omnigent setup never rendered a {name} row:\n{output}"
+    return re.split(r"\s{2,}", rows[0], maxsplit=1)[1]
+
+
+def _seed_pi_native_login(home: str) -> None:
+    """Write the auth.json a completed ``pi`` login leaves under ``~/.pi/agent``."""
+    import json
+    import time
+    from pathlib import Path
+
+    agent_dir = Path(home) / ".pi" / "agent"
+    agent_dir.mkdir(parents=True)
+    (agent_dir / "auth.json").write_text(
+        json.dumps(
+            {
+                "anthropic": {
+                    "type": "oauth",
+                    "access": "fake-oauth-access-token",
+                    "refresh": "fake-oauth-refresh-token",
+                    "expires": int(time.time() * 1000) + 30 * 24 * 3600 * 1000,
+                }
+            }
+        )
+    )
+
+
+def test_harness_overview_credits_pi_native_login(isolated_config, monkeypatch) -> None:
+    """A natively signed-in pi is adopted and the Pi row reads Pi original auth.
+
+    A user signed in through ``pi``'s own ``~/.pi/agent/auth.json`` runs ``pi``
+    directly, so opening setup must adopt that login as the "Pi original auth"
+    subscription, default it for the pi scope, and name it in both the adoption
+    callout and the Pi row.
+    """
+    monkeypatch.delenv("PI_CODING_AGENT_DIR", raising=False)
+    _seed_pi_native_login(isolated_config)
+
+    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input="q\n")
+    assert result.exit_code == 0, result.output
+    # The one-time adoption callout names the credential it just configured.
+    assert "Found existing credentials" in result.output
+    assert "Pi original auth" in result.output
+    row = _rendered_row(result.output, "Pi")
+    assert "Not configured" not in row, row
+    assert "✓ Pi original auth" in row, row
+
+    cfg = _config_yaml(isolated_config)
+    entry = cfg["providers"]["pi"]
+    assert entry["kind"] == "subscription"
+    assert entry["cli"] == "pi"
+    # The gap-filling pi-scope default (nothing else serves pi here).
+    assert entry["default"] == "pi"
+
+
+def test_pi_login_adoption_preserves_existing_pi_routing(isolated_config, monkeypatch) -> None:
+    """Adoption must not flip pi off a configured key it already routes through.
+
+    With an explicit anthropic key serving pi via the cross-family fallback,
+    opening setup adopts the pi login as an ordinary entry but leaves the
+    routing (and so the Pi row) on the key — the gap-filler only fires when
+    nothing serves pi.
+    """
+    monkeypatch.delenv("PI_CODING_AGENT_DIR", raising=False)
+    _seed_pi_native_login(isolated_config)
+    config_path = os.path.join(isolated_config, "config.yaml")
+    with open(config_path, "w") as f:
+        yaml.safe_dump(
+            {
+                "providers": {
+                    "anthropic": {
+                        "kind": "key",
+                        "default": True,
+                        "anthropic": {"base_url": "https://api.anthropic.com", "api_key": "k"},
+                    }
+                }
+            },
+            f,
+        )
+
+    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input="q\n")
+    assert result.exit_code == 0, result.output
+
+    cfg = _config_yaml(isolated_config)
+    # Adopted as an ordinary entry, but the pi scope default stayed unset —
+    # the fallback keeps routing pi through the anthropic key.
+    assert cfg["providers"]["pi"] == {"kind": "subscription", "cli": "pi"}
+
+
+def test_remove_pi_subscription_dismisses_detection(isolated_config, monkeypatch) -> None:
+    """Removing the adopted pi login sticks across reopens (via a dismissal).
+
+    Pi has no logout command omnigent can drive, so removal cannot sign the
+    CLI out the way claude/codex removal does — without a recorded dismissal
+    the next ``setup`` open would silently re-adopt the unchanged
+    ``~/.pi/agent/auth.json`` and Remove would be a no-op.
+    """
+    monkeypatch.delenv("PI_CODING_AGENT_DIR", raising=False)
+    _seed_pi_native_login(isolated_config)
+
+    # Open 1: plain open auto-adopts the detected pi login.
+    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input="q\n")
+    assert result.exit_code == 0, result.output
+    assert "pi" in _config_yaml(isolated_config)["providers"]
+
+    # Open 2: L1 6=Pi → L2 1=the credential → L3 1=Remove (it is the pi
+    # default, so no "Make default" row precedes Remove) → confirm 1=Yes →
+    # L2 q → L1 q.
+    stdin = "\n".join(["6", "1", "1", "1", "q", "q"]) + "\n"
+    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
+    assert result.exit_code == 0, result.output
+    cfg = _config_yaml(isolated_config)
+    assert "pi" not in cfg.get("providers", {})
+    # The dismissal is what makes Remove stick — without it open 3 re-adopts.
+    assert cfg["dismissed_detections"] == ["pi"]
+
+    # Open 3: a plain reopen must NOT re-adopt the dismissed login.
+    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input="q\n")
+    assert result.exit_code == 0, result.output
+    assert "pi" not in _config_yaml(isolated_config).get("providers", {})
+
+    # Open 4: L1 6=Pi → L2 1=+ Add a credential → 3=Pi — original auth →
+    # L2 q → L1 q. Re-adding the login by hand is the user saying they want
+    # it after all, so the dismissal must go with it.
+    stdin = "\n".join(["6", "1", "3", "q", "q"]) + "\n"
+    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
+    assert result.exit_code == 0, result.output
+    cfg = _config_yaml(isolated_config)
+    assert cfg["providers"]["pi-subscription"] == {
+        "kind": "subscription",
+        "cli": "pi",
+        "default": "pi",
+    }
+    assert "pi" not in cfg.get("dismissed_detections", [])
+
+    # Open 5: with the explicit entry gone again (hand-edited away), a plain
+    # reopen auto-adopts the login once more — the stale dismissal is not
+    # left behind to block it.
+    cfg["providers"].pop("pi-subscription")
+    with open(os.path.join(isolated_config, "config.yaml"), "w") as f:
+        yaml.safe_dump(cfg, f)
+    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input="q\n")
+    assert result.exit_code == 0, result.output
+    assert "pi" in _config_yaml(isolated_config)["providers"]
+
+
+def test_remove_pi_subscription_with_unusable_login_still_dismisses(
+    isolated_config, monkeypatch
+) -> None:
+    """Removing Pi while its own login is unusable still records the dismissal.
+
+    Otherwise repairing ``auth.json`` later silently re-adopts the login the user
+    removed, contrary to the removal prompt's promise.
+    """
+    monkeypatch.delenv("PI_CODING_AGENT_DIR", raising=False)
+    _seed_pi_native_login(isolated_config)
+    auth_path = os.path.join(isolated_config, ".pi", "agent", "auth.json")
+
+    # Open 1: adopt the detected login.
+    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input="q\n")
+    assert result.exit_code == 0, result.output
+    assert "pi" in _config_yaml(isolated_config)["providers"]
+
+    # The login breaks (logged out / malformed), then the user removes the entry:
+    # L1 6=Pi → L2 1=the credential → L3 1=Remove → confirm 1=Yes → L2 q → L1 q.
+    with open(auth_path, "w") as f:
+        f.write("{}")
+    stdin = "\n".join(["6", "1", "1", "1", "q", "q"]) + "\n"
+    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
+    assert result.exit_code == 0, result.output
+    cfg = _config_yaml(isolated_config)
+    assert cfg.get("providers", {}) == {}
+    assert cfg["dismissed_detections"] == ["pi"]
+
+    # The login works again; a plain reopen must still not re-adopt it.
+    os.remove(auth_path)
+    os.rmdir(os.path.dirname(auth_path))
+    _seed_pi_native_login(isolated_config)
+    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input="q\n")
+    assert result.exit_code == 0, result.output
+    assert _config_yaml(isolated_config).get("providers", {}) == {}
+
+
+def test_remove_hand_named_pi_subscription_dismisses_by_detection_name(
+    isolated_config, monkeypatch
+) -> None:
+    """Declining keeps a hand-named Pi entry; confirming dismisses the ``pi`` detection.
+
+    The entry name ("pi-subscription") differs from the detection name ("pi"),
+    so the dismissal must be recorded under the detection or the next reopen
+    silently re-adopts the unchanged login.
+    """
+    monkeypatch.delenv("PI_CODING_AGENT_DIR", raising=False)
+    _seed_pi_native_login(isolated_config)
+    entry = {"kind": "subscription", "cli": "pi", "default": "pi"}
+    with open(os.path.join(isolated_config, "config.yaml"), "w") as f:
+        yaml.safe_dump({"providers": {"pi-subscription": entry}}, f)
+
+    # L1 6=Pi → L2 1=the credential → L3 1=Remove → confirm 2=No → L2 q → L1 q.
+    stdin = "\n".join(["6", "1", "1", "2", "q", "q"]) + "\n"
+    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
+    assert result.exit_code == 0, result.output
+    cfg = _config_yaml(isolated_config)
+    assert cfg["providers"] == {"pi-subscription": entry}
+    assert "dismissed_detections" not in cfg
+
+    # Same path, confirm 1=Yes.
+    stdin = "\n".join(["6", "1", "1", "1", "q", "q"]) + "\n"
+    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
+    assert result.exit_code == 0, result.output
+    cfg = _config_yaml(isolated_config)
+    assert cfg.get("providers", {}) == {}
+    assert cfg["dismissed_detections"] == ["pi"]
+
+    # A plain reopen must not re-adopt the dismissed login.
+    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input="q\n")
+    assert result.exit_code == 0, result.output
+    assert _config_yaml(isolated_config).get("providers", {}) == {}
