@@ -39,7 +39,11 @@ Discovery mirrors the forwarder's discipline — *poll until ready, never guess*
    ``agy_conv_*`` placeholder until the real id is discovered and persisted. The
    reader polls :func:`read_bridge_state` until ``conversation_id`` is present and
    is NOT a placeholder; that real id is the cascade id (agy uses one UUID for
-   both the conversation and the cascade).
+   both the conversation and the cascade). When the cold-start missed its
+   deadline and the placeholder is all there is, the loop also runs the
+   placeholder-recovery scan (:func:`_recover_placeholder_cascade`) that adopts
+   the TUI-minted cascade a typed turn creates, so discovery cannot deadlock on
+   a placeholder nothing else will ever replace.
 2. **RPC port.** The reader enumerates candidate agy connect-RPC ports
    (:func:`_candidate_agy_rpc_ports`) and binds the one that confirms it hosts the
    cascade id (:func:`_conversation_matches`). It keeps polling until a port
@@ -56,6 +60,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -67,8 +72,11 @@ from omnigent.entities.session_resources import terminal_resource_id
 from omnigent.harnesses.antigravity_native.bridge import (
     ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY,
     AntigravityNativeBridgeState,
+    agy_gemini_dir,
     is_placeholder_conversation_id,
     read_bridge_state,
+    read_tmux_info,
+    update_conversation_id,
     write_bridge_state,
 )
 from omnigent.harnesses.antigravity_native.rpc import (
@@ -78,6 +86,7 @@ from omnigent.harnesses.antigravity_native.rpc import (
     get_all_cascade_trajectories,
     get_available_models,
     get_trajectory_steps,
+    resolve_cold_start_agy_rpc_port,
     stream_agent_state_updates,
 )
 
@@ -131,6 +140,11 @@ _SUBAGENT_QUIESCENT_POLLS_MAX = 480
 # this off the hot path — far slower than the per-turn poll cadence so it does not
 # hammer the loopback RPC.
 _DEFAULT_ROTATION_INTERVAL_S = 3.0
+
+# Seconds between placeholder-recovery scans while discovery is parked on the
+# launcher placeholder. Coarse like the rotation interval: each scan does a
+# pane-scoped port resolve plus a ``GetAllCascadeTrajectories`` fetch.
+_PLACEHOLDER_RECOVERY_INTERVAL_S = 3.0
 
 # Backoff between connect-stream re-entries in :func:`_stream_loop`. In steady
 # state the re-opened stream blocks awaiting frames, so this delay is paid only
@@ -570,6 +584,33 @@ def _detect_rotated_cascade(summaries: dict[str, object], bound_cascade_id: str)
     return None
 
 
+def _typed_root_cascade(summaries: dict[str, object]) -> str | None:
+    """
+    Return the most recently typed-into root cascade id, or ``None``.
+
+    Root filters match rotation; requiring ``lastUserInputTime`` excludes the
+    headless cold-start phantom and bare ``/clear`` mints (never typed into).
+
+    :param summaries: ``trajectorySummaries`` from ``GetAllCascadeTrajectories``.
+    :returns: The typed-into root cascade id, or ``None`` when none exists yet.
+    """
+    best_id: str | None = None
+    best_input: datetime | None = None
+    for cascade_id, summary in summaries.items():
+        if not isinstance(summary, dict):
+            continue
+        if summary.get("trajectoryType") != _TRAJECTORY_TYPE_CASCADE:
+            continue
+        if _summary_is_child_trajectory(cascade_id, summary):
+            continue
+        typed = _parse_activity_timestamp(summary.get("lastUserInputTime"))
+        if typed is None:
+            continue
+        if best_input is None or typed > best_input:
+            best_id, best_input = cascade_id, typed
+    return best_id
+
+
 async def _sleep(seconds: float) -> None:
     """
     Stubbable indirection for the poll/backoff sleep.
@@ -793,19 +834,91 @@ def _resolve_rpc_port(cascade_id: str) -> int | None:
     return None
 
 
+def _recover_placeholder_cascade(bridge_dir: Path) -> str | None:
+    """
+    Adopt agy's TUI-minted cascade while bridge state still holds the placeholder.
+
+    Nothing else replaces a stale placeholder: discovery rejects it and the
+    rotation detector starts only after discovery binds. Safety mirrors the
+    cold-start — pane-scoped port (no local pane, no scan), typed-into root
+    cascades only, and the cascade's conversation db must exist under this
+    session's own Gemini dir (a foreign agy writes to its own).
+
+    :param bridge_dir: Native Antigravity bridge directory.
+    :returns: The adopted cascade id (persisted), or ``None`` this round.
+    """
+    state = read_bridge_state(bridge_dir)
+    if state is None or not is_placeholder_conversation_id(state.conversation_id):
+        return None
+    info = read_tmux_info(bridge_dir)
+    if info is None:
+        return None
+    socket_path = Path(info["socket_path"])
+    if not socket_path.exists():
+        # A socket that is not on this host cannot scope the scan (and its pane
+        # cannot have delivered a web turn from here); skip this round.
+        return None
+    port = resolve_cold_start_agy_rpc_port(socket_path, info["tmux_target"])
+    if port is None:
+        return None
+    try:
+        body = get_all_cascade_trajectories(port)
+    except (httpx.HTTPError, ValueError) as exc:
+        _logger.debug(
+            "agy placeholder recovery: GetAllCascadeTrajectories failed; retrying "
+            "next round: port=%s error=%r",
+            port,
+            exc,
+        )
+        return None
+    summaries = body.get("trajectorySummaries")
+    if not isinstance(summaries, dict):
+        return None
+    cascade_id = _typed_root_cascade(summaries)
+    if cascade_id is None:
+        return None
+    conversation_db = (
+        agy_gemini_dir(bridge_dir) / "antigravity-cli" / "conversations" / f"{cascade_id}.db"
+    )
+    if not conversation_db.is_file():
+        _logger.warning(
+            "agy placeholder recovery: typed cascade %s on port %s is NOT in this "
+            "session's Gemini dir (a foreign agy answered the scan); refusing to adopt.",
+            cascade_id,
+            port,
+        )
+        return None
+    if not update_conversation_id(bridge_dir, cascade_id):
+        return None
+    _logger.info(
+        "agy reader adopted the TUI-minted cascade past a stale placeholder "
+        "(cold-start never bound a real id): bridge_dir=%s cascade=%s",
+        bridge_dir,
+        cascade_id,
+    )
+    return cascade_id
+
+
 async def _discover(
     bridge_dir: Path,
     *,
     poll_interval_s: float,
     stop: StopPredicate,
-) -> tuple[str, int] | None:
+) -> tuple[str, int, bool] | None:
     """
-    Resolve ``(cascade_id, port)``, polling until ready or asked to stop.
+    Resolve ``(cascade_id, port, adopted)``, polling until ready or asked to stop.
 
     Two stages, each "poll until ready, never guess": first the real cascade id
     from bridge state (past the launcher placeholder), then the connect-RPC port
     that confirms ownership of that cascade. Discovery work (file read + blocking
     httpx TLS probes) runs in a worker thread so the event loop stays responsive.
+
+    While bridge state still holds the ``agy_conv_*`` placeholder — a cold-start
+    that missed its deadline, with nothing else ever writing the real id — the
+    loop additionally runs the placeholder-recovery scan
+    (:func:`_recover_placeholder_cascade`, throttled to
+    :data:`_PLACEHOLDER_RECOVERY_INTERVAL_S`) so the TUI-minted cascade a typed
+    turn creates is adopted in place instead of deadlocking discovery forever.
 
     Readiness is checked BEFORE ``stop`` each round, so a discovery that resolves
     immediately consumes none of the caller's poll budget — ``stop`` is a
@@ -816,11 +929,19 @@ async def _discover(
     :param poll_interval_s: Seconds to wait between discovery polls.
     :param stop: Predicate consulted only when a round did NOT resolve; when it
         returns ``True`` the discovery loop gives up (the runner owns restart).
-    :returns: ``(cascade_id, port)`` once both resolve, or ``None`` if ``stop``
-        fired before discovery completed.
+    :returns: ``(cascade_id, port, adopted)`` once both resolve — ``adopted`` is
+        ``True`` when the placeholder-recovery scan wrote the id (the caller then
+        records it as the session's external id, since no rotation-based first
+        adoption will run for it) — or ``None`` if ``stop`` fired first.
     """
+    adopted = False
+    next_recovery_at = 0.0
     while True:
         cascade_id = await asyncio.to_thread(_resolve_cascade_id, bridge_dir)
+        if cascade_id is None and time.monotonic() >= next_recovery_at:
+            next_recovery_at = time.monotonic() + _PLACEHOLDER_RECOVERY_INTERVAL_S
+            cascade_id = await asyncio.to_thread(_recover_placeholder_cascade, bridge_dir)
+            adopted = adopted or cascade_id is not None
         if cascade_id is not None:
             port = await asyncio.to_thread(_resolve_rpc_port, cascade_id)
             if port is not None:
@@ -830,7 +951,7 @@ async def _discover(
                     cascade_id,
                     port,
                 )
-                return cascade_id, port
+                return cascade_id, port, adopted
         if stop():
             return None
         await _sleep(poll_interval_s)
@@ -1023,7 +1144,12 @@ async def supervise_reader(
     discovered = await _discover(bridge_dir, poll_interval_s=poll_interval_s, stop=should_stop)
     if discovered is None:
         return None
-    cascade_id, port = discovered
+    cascade_id, port, adopted = discovered
+    if adopted:
+        # Placeholder recovery bound the TUI-minted conversation directly, so no
+        # rotation-based first adoption will run for it; record it for --resume
+        # here, exactly as run_reader_with_bridge does on that path.
+        await _record_external_session_id(client, session_id, cascade_id)
 
     # One set of cross-poll/cross-frame trackers per reader run, shared by BOTH
     # the stream path and the poll fallback so a fall-through after a partial
