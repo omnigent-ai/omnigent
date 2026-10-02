@@ -254,6 +254,8 @@ import {
   type HostIdentity,
 } from "@/lib/nativeBridge";
 import {
+  fetchUserAgents,
+  USER_AGENTS_QUERY_KEY,
   useAvailableAgents,
   prefetchAvailableAgentDetails,
   type AvailableAgent,
@@ -315,6 +317,7 @@ import {
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { CreateAgentDialog } from "./CreateAgentDialog";
 import { buildAgentBundle, type AgentBundleInput } from "@/lib/agentBundle";
+import { installAgentBundle } from "@/lib/agentsApi";
 import { createBundledSession, launchRunner } from "@/lib/sessionsApi";
 import { promoteSessionDraft, recoverFailedSessionDraft } from "@/lib/sessionDrafts";
 
@@ -7028,6 +7031,39 @@ export function NewChatLandingScreen() {
           setPendingAgent(input);
           handleSelectPending();
         }}
+        onImport={
+          info !== "loading" && info.agent_install === true
+            ? async (bundle) => {
+                const installed = await installAgentBundle(bundle);
+                try {
+                  const mine = await queryClient.fetchQuery({
+                    queryKey: USER_AGENTS_QUERY_KEY,
+                    queryFn: fetchUserAgents,
+                    staleTime: 0,
+                  });
+                  // The composer resolves its pick against the merged picker list, so
+                  // wait for it; while it still waits on sessions, your agents decide.
+                  await queryClient.invalidateQueries({ queryKey: ["available-agents"] });
+                  const lists = queryClient
+                    .getQueriesData<AvailableAgent[]>({ queryKey: ["available-agents"] })
+                    .flatMap(([, data]) => (data ? [data] : []));
+                  const agent = (lists.length > 0 ? lists.flat() : mine).find(
+                    (a) => a.id === installed.id,
+                  );
+                  if (!agent) throw new Error("it is not in the agent list");
+                  handleSelectAgent(agent);
+                } catch (err) {
+                  const reason = err instanceof Error ? err.message : String(err);
+                  throw new Error(
+                    `Installed ${installed.name}, but couldn't select it: ${reason}`,
+                    {
+                      cause: err,
+                    },
+                  );
+                }
+              }
+            : undefined
+        }
       />
     </div>
   );
