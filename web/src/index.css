@@ -1250,12 +1250,13 @@ aside[aria-label="Workspace"][data-maximized] {
 /* Mobile-specific sidebar geometry. The root remains at the global 16px so
  * rem-based typography and controls keep the same scale across viewports. */
 @media (width < 48rem) {
-  /* Mobile keeps its own touch-friendly base (14px at the default 13px
+  /* Mobile keeps its own touch-friendly base (16px at the default 13px
    * preference) but scales it off the Appearance value, so the setting
-   * applies on phones instead of being a dead store. The 14/13 factor maps
-   * the default preference exactly onto the historical 14px mobile base. */
+   * applies on phones instead of being a dead store. The 16/13 factor maps
+   * the default preference onto 16px, the size below which iOS zooms
+   * focused inputs. */
   :root {
-    --mobile-ui-font-size: calc(var(--desktop-ui-font-size) * (14 / 13));
+    --mobile-ui-font-size: calc(var(--desktop-ui-font-size) * (16 / 13));
     --text-sm: calc(var(--mobile-ui-font-size) * 0.9);
     --text-ui: var(--mobile-ui-font-size);
   }

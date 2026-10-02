@@ -795,22 +795,22 @@ describe("index.css body text tokens", () => {
    * set on <html> but never consumed below 48rem — saved but not applied. The
    * mobile base must scale off the preference. */
   describe("mobile branch consumes the font-size preference", () => {
-    const MOBILE_BASE_RATIO = 14 / 13;
+    const MOBILE_BASE_RATIO = 16 / 13;
 
     it("derives the mobile base from the preference, not a hard-coded px", () => {
       expect(mobileMap, "the mobile typography mapping is gone from index.css").toBeDefined();
-      // A literal `--mobile-ui-font-size: 14px` is the saved-but-not-applied
+      // A literal `--mobile-ui-font-size: 16px` is the saved-but-not-applied
       // bug: the preference would be a dead store below 48rem.
       expect(mobileMap).not.toMatch(/--mobile-ui-font-size:\s*\d/);
       expect(mobileMap).toContain(
-        "--mobile-ui-font-size: calc(var(--desktop-ui-font-size) * (14 / 13))",
+        "--mobile-ui-font-size: calc(var(--desktop-ui-font-size) * (16 / 13))",
       );
     });
 
-    it("keeps the historical 14px mobile base at the default preference", () => {
-      // The ratio must map the shipped default onto the long-standing mobile
-      // base exactly, so users who never touch the setting see no change.
-      expect(UI_FONT_SIZE_DEFAULT * MOBILE_BASE_RATIO).toBe(14);
+    it("renders 16px mobile default at the default preference", () => {
+      // 16px is the Apple HIG body-text baseline and the iOS input-focus zoom
+      // threshold; the ratio must map the default preference onto it exactly.
+      expect(UI_FONT_SIZE_DEFAULT * MOBILE_BASE_RATIO).toBeCloseTo(16, 5);
     });
 
     it.each([UI_FONT_SIZE_MIN, UI_FONT_SIZE_MAX])(
