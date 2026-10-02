@@ -38,7 +38,7 @@ from omnigent.harnesses.antigravity_native.steps import (
 # Fixture helpers
 # ---------------------------------------------------------------------------
 
-_FIXTURES = Path(__file__).parent / "fixtures" / "antigravity" / "steps"
+_FIXTURES = Path(__file__).parents[2] / "fixtures" / "antigravity" / "steps"
 _CID = "test-conversation-id"
 
 # Every recorded fixture belongs to this trajectory; tool-call ids are derived

@@ -53,8 +53,8 @@ def _stub_agy_binary(monkeypatch: pytest.MonkeyPatch) -> None:
 
     This is autouse for the whole module; the real resolution / missing-agy
     ``RuntimeError`` path is covered separately in
-    ``tests/test_antigravity_native_launch.py`` (which patches ``shutil.which``
-    directly), so nothing here needs the unstubbed binary lookup.
+    ``tests/harnesses/antigravity_native/test_antigravity_native_launch.py``
+    (which patches ``shutil.which`` directly), so nothing here needs the unstubbed binary lookup.
     """
     monkeypatch.setattr(
         "omnigent.harnesses.antigravity_native.launch.agy_binary_path", lambda: "agy"

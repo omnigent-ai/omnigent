@@ -67,7 +67,7 @@ from omnigent.harnesses.antigravity_native.steps import PendingInteraction
 # Fixtures + scaffolding
 # ---------------------------------------------------------------------------
 
-_FIXTURES = Path(__file__).parent / "fixtures" / "antigravity" / "steps"
+_FIXTURES = Path(__file__).parents[2] / "fixtures" / "antigravity" / "steps"
 _CASCADE_ID = "efb134b2-d69f-43de-bb54-c9ece346d8a3"
 _SESSION_ID = "conv_reader_test"
 _PORT = 52548
