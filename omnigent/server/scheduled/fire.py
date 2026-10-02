@@ -1642,7 +1642,6 @@ async def _create_session_resources(
         labels[SCHEDULED_TASK_WORKTREE_SOURCE_LABEL_KEY] = worktree_root_fingerprint(workspace)
         workspace = worktree.workspace or worktree.worktree_path
         labels[WORKTREE_ROOT_LABEL_KEY] = worktree_root_fingerprint(worktree.worktree_path)
-    session_name = task.name
     try:
         session_name = render_session_name(task.name, scheduled_at, task.timezone)
         if len(session_name) > 768:
