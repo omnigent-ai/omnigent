@@ -2572,9 +2572,37 @@ describe("Right workspace card visibility", () => {
     const exiting = document.querySelector('aside[aria-label="Workspace"]');
     expect(exiting).not.toBeNull();
     expect(exiting).toHaveAttribute("data-state", "closed");
+    expect(exiting).toHaveAttribute("data-animate-visibility", "true");
     expect(exiting).toHaveClass("workspace-panel-motion", "md:overflow-hidden");
     expect(exiting).toHaveStyle({ width: "0px" });
+    expect(headerGroup).toHaveAttribute("data-workspace-panel-animate", "true");
     expect(headerGroup?.style.getPropertyValue("--workspace-panel-offset")).toBe("0px");
+  });
+
+  it("restores a different session width without visibility motion", () => {
+    useEnvironmentMock.mockReturnValue({
+      data: { available: false, root: null, home: null },
+      isLoading: false,
+    } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
+    writeSessionWorkspaceState("conv_narrow", { open: true, widthPx: 280 });
+    writeSessionWorkspaceState("conv_wide", { open: true, widthPx: 480 });
+    mockConversations([
+      { id: "conv_narrow", permission_level: null },
+      { id: "conv_wide", permission_level: null },
+    ]);
+
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(sessionShellTree(qc, "/c/conv_narrow", <SessionNavButton to="/c/conv_wide" />));
+    const first = screen.getByRole("complementary", { name: "Workspace" });
+    expect(first).toHaveStyle({ width: "280px" });
+    expect(first).not.toHaveAttribute("data-animate-visibility");
+
+    fireEvent.click(screen.getByTestId("nav-session"));
+
+    const second = screen.getByRole("complementary", { name: "Workspace" });
+    expect(second).toHaveStyle({ width: "480px" });
+    expect(second).not.toHaveAttribute("data-animate-visibility");
+    expect(second.parentElement).not.toHaveAttribute("data-workspace-panel-animate");
   });
 
   it("keeps the card mounted with Agents as the only tab for a minimal agent", () => {

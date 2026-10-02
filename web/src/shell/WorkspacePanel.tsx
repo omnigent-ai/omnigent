@@ -596,8 +596,10 @@ interface WorkspacePanelProps {
   width: number;
   /** Whether the panel is closed/collapsed (hides it from keyboard nav + assistive tech). */
   inert?: boolean;
-  /** Visual presence state; false runs the 300ms exit transition. */
+  /** Visual presence state; false collapses the panel. */
   open?: boolean;
+  /** Animate this open/close transition; false keeps width changes immediate. */
+  animateVisibility?: boolean;
   /** Suppress motion while the resize handle is actively dragging. */
   resizing?: boolean;
   /**
@@ -713,6 +715,7 @@ function WorkspacePanelImpl({
   handleProps,
   inert,
   open = true,
+  animateVisibility = false,
   resizing = false,
   rightRailTab,
   onRightRailTabChange,
@@ -1023,6 +1026,7 @@ function WorkspacePanelImpl({
       // against.
       data-maximized={maximized || undefined}
       data-state={open ? "open" : "closed"}
+      data-animate-visibility={animateVisibility || undefined}
       data-resizing={resizing || undefined}
       className={cn(
         "workspace-panel-motion @container/rail relative z-40 hidden md:flex md:min-h-0 md:flex-col md:overflow-hidden md:border-l md:border-border md:bg-card",

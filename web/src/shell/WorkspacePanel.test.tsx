@@ -96,6 +96,7 @@ function renderWorkspace(
     liveness?: SessionLiveness;
     pending?: boolean;
     open?: boolean;
+    animateVisibility?: boolean;
     resizing?: boolean;
     inert?: boolean;
   } = {},
@@ -112,6 +113,7 @@ function renderWorkspace(
         conversationId="conv_ws"
         width={360}
         open={overrides.open}
+        animateVisibility={overrides.animateVisibility}
         resizing={overrides.resizing}
         inert={overrides.inert}
         handleProps={{
@@ -172,14 +174,16 @@ describe("WorkspacePanel surface presentation", () => {
     expect(panel).not.toHaveClass("md:m-2", "md:rounded-lg", "md:shadow-lg");
     expect(panel).toHaveClass("workspace-panel-motion", "md:overflow-hidden");
     expect(panel).toHaveAttribute("data-state", "open");
+    expect(panel).not.toHaveAttribute("data-animate-visibility");
   });
 
-  it("marks the exiting panel closed and disables motion while resizing", () => {
-    renderWorkspace({ open: false, resizing: true, inert: true });
+  it("marks explicit visibility motion separately from resizing", () => {
+    renderWorkspace({ open: false, animateVisibility: true, resizing: true, inert: true });
 
     const panel = document.querySelector('aside[aria-label="Workspace"]');
     expect(panel).not.toBeNull();
     expect(panel).toHaveAttribute("data-state", "closed");
+    expect(panel).toHaveAttribute("data-animate-visibility", "true");
     expect(panel).toHaveAttribute("data-resizing", "true");
     expect(panel).toHaveAttribute("aria-hidden", "true");
   });
