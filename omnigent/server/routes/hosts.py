@@ -24,6 +24,7 @@ import weakref
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query, Request
+from packaging.version import InvalidVersion, Version
 from pydantic import BaseModel
 
 from omnigent.db.utils import now_epoch
@@ -125,6 +126,59 @@ _INSTALL_HARNESS_TIMEOUT_S = 420.0
 # with the runner-launch and import paths; the one implementation lives in
 # ``_host_launch`` so the sites can't drift.
 _host_absent_error = host_absent_error
+
+
+# The harness-setup frames (install_harness, store_secret, detect_credentials,
+# model_options) first shipped in the 0.7.0 host daemon; older daemons drop them
+# without replying. ``_require_harness_setup_support`` explains the version floor.
+_HARNESS_SETUP_MIN_HOST_VERSION = (0, 7, 0)
+
+
+def _release_tuple(version: str) -> tuple[int, int, int] | None:
+    """Parse the release component of a reported version, PEP 440 style.
+
+    Handles every shape omnigent has shipped — ``"0.6.0"``, ``"0.6.0rc1"``,
+    ``"0.13.0.dev0"`` — so a prerelease of an old daemon is still judged
+    against the floor rather than falling through as unparseable.
+
+    :param version: Hello-reported version.
+    :returns: The release tuple padded to ``(major, minor, patch)``, or
+        ``None`` when the version isn't PEP 440 at all.
+    """
+    try:
+        release = Version(version).release
+    except InvalidVersion:
+        return None
+    padded = (*release, 0, 0, 0)[:3]
+    return (padded[0], padded[1], padded[2])
+
+
+def _require_harness_setup_support(host_conn: HostConnection, action: str) -> None:
+    """Reject fast when the daemon predates the harness-setup frames.
+
+    Pre-0.7.0 daemons have no handler for these frames and drop them without
+    replying, so forwarding one can only end in a timeout misread as an
+    unresponsive host. The floor is a version check, not a capability token:
+    the frames predate ``HostHelloFrame.capabilities``, and released
+    0.15.x/0.16.x daemons advertise tokens without a harness-setup entry while
+    serving them. Unparseable versions stay permissive.
+
+    :param host_conn: Live host connection (carries the hello).
+    :param action: Human phrase for the rejected action, e.g.
+        ``"storing harness credentials"``; lands in the error detail.
+    :raises HTTPException: 409 with an update-the-host hint when too old.
+    """
+    hello = host_conn.hello
+    release = _release_tuple(hello.version)
+    if release is None or release >= _HARNESS_SETUP_MIN_HOST_VERSION:
+        return
+    raise HTTPException(
+        status_code=409,
+        detail=(
+            f"host '{hello.name}' runs omnigent {hello.version}, which does not "
+            f"support {action} — update omnigent on the host and retry"
+        ),
+    )
 
 
 async def _proxy_model_options(
@@ -724,6 +778,10 @@ def create_hosts_router(
         A preview of the host's ambient default catalog, not a binding
         snapshot: launch re-resolves with the session's agent spec, and the
         in-session picker reflects that launch snapshot once the runner is up.
+
+        :raises HTTPException: 404 when the host is unknown, 403 when not the
+            owner, 409 when offline or the host daemon is too old to list model
+            options, 502 on host-side failure, 504 on timeout.
         """
         user_id = require_user(request, auth_provider)
         host = await asyncio.to_thread(host_store.get_host, host_id)
@@ -734,6 +792,7 @@ def create_hosts_router(
         conn = host_registry.get(host.host_id)
         if conn is None:
             raise _host_absent_error(host)
+        _require_harness_setup_support(conn, "pre-launch model listing")
 
         result = await _proxy_model_options(
             host_registry=host_registry,
@@ -1407,8 +1466,9 @@ def create_hosts_router(
             (``None`` when the host didn't report one).
         :raises HTTPException: 404 when the feature is disabled or the host is
             unknown, 400 when the harness is not UI-installable, 403 when the
-            caller is not the host owner, 409 when the host is offline, 502 on
-            a host-side install failure, 504 on host timeout.
+            caller is not the host owner, 409 when the host is offline or its
+            daemon is too old to install harnesses, 502 on a host-side install
+            failure, 504 on host timeout.
         """
         # A disabled route is indistinguishable from a non-existent one, so
         # the feature is fully dark until the deployment opts in.
@@ -1437,6 +1497,7 @@ def create_hosts_router(
         conn = host_registry.get(host.host_id)
         if conn is None:
             raise _host_absent_error(host)
+        _require_harness_setup_support(conn, "UI-driven harness installs")
 
         # Coalesce concurrent installs of the same harness FAMILY onto one
         # in-flight request so a double-click (or `codex` + `codex-native`, which
@@ -1523,8 +1584,8 @@ def create_hosts_router(
             the host didn't report one).
         :raises HTTPException: 404 when disabled or host unknown, 400 when the
             harness isn't UI-configurable or the body is invalid, 403 when not
-            the owner, 409 when offline, 502 on host-side failure, 504 on
-            timeout.
+            the owner, 409 when offline or the host daemon is too old to store
+            credentials, 502 on host-side failure, 504 on timeout.
         """
         if not flags.enabled(Feature.HARNESS_INSTALL):
             raise HTTPException(status_code=404, detail="not found")
@@ -1553,6 +1614,7 @@ def create_hosts_router(
         conn = host_registry.get(host.host_id)
         if conn is None:
             raise _host_absent_error(host)
+        _require_harness_setup_support(conn, "storing harness credentials")
 
         frame = HostStoreSecretFrame(
             request_id=secrets.token_hex(8),
@@ -1617,7 +1679,8 @@ def create_hosts_router(
         :param host_id: Host identifier.
         :returns: ``{"object": "detected_credentials", "credentials": [...]}``.
         :raises HTTPException: 404 when disabled or host unknown, 403 when not
-            the owner, 409 when offline, 502/504 on host failure/timeout.
+            the owner, 409 when offline or the host daemon is too old to detect
+            credentials, 502/504 on host failure/timeout.
         """
         if not flags.enabled(Feature.HARNESS_INSTALL):
             raise HTTPException(status_code=404, detail="not found")
@@ -1633,6 +1696,7 @@ def create_hosts_router(
         conn = host_registry.get(host.host_id)
         if conn is None:
             raise _host_absent_error(host)
+        _require_harness_setup_support(conn, "detecting existing credentials")
 
         result = await _proxy_detect_credentials(host_registry=host_registry, host_conn=conn)
         return {
