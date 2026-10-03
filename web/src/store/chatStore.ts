@@ -1763,6 +1763,8 @@ function scheduleWorkspaceFilesystemInvalidation(sessionId: string): void {
     queryClient?.invalidateQueries({
       queryKey: ["workspace-environment", sessionId],
     });
+    // The Design studio's open deck, so its live preview follows each write.
+    queryClient?.invalidateQueries({ queryKey: ["design-deck", sessionId] });
   }, WORKSPACE_INVALIDATION_DEBOUNCE_MS);
   workspaceInvalidationTimers.set(sessionId, timer);
 }
