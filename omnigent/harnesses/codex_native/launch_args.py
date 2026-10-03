@@ -300,6 +300,25 @@ def without_codex_add_dirs(args: Sequence[str]) -> list[str]:
     return stripped
 
 
+def without_codex_positional_prompt(args: Sequence[str]) -> list[str]:
+    """Drop the ``[PROMPT]`` positional and any ``--`` tail; options keep their values."""
+    canonical = canonical_codex_launch_args(args)
+    kept: list[str] = []
+    index = 0
+    while index < len(canonical):
+        arg = canonical[index]
+        if arg == "--":
+            break
+        if arg in _CODEX_VALUE_FLAGS:
+            kept.extend(canonical[index : index + 2])
+            index += 2
+            continue
+        if arg.startswith("-") and arg != "-":
+            kept.append(arg)
+        index += 1
+    return kept
+
+
 def _merge_tables(base: dict[str, Any], overlay: dict[str, Any]) -> None:
     for key, value in overlay.items():
         if isinstance(value, dict) and isinstance(base.get(key), dict):

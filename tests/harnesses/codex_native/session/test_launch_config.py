@@ -150,6 +150,20 @@ def test_materialized_codex_agent_spec_loads_as_valid_omnigent_yaml(
                 "thread_x",
             ],
         ),
+        # A fresh thread still submits the positional launch prompt once.
+        (
+            ("--model", "gpt-5.4-mini", "Reply with INITIAL_ONCE"),
+            None,
+            "ws://127.0.0.1:9876",
+            [
+                "--model",
+                "gpt-5.4-mini",
+                "Reply with INITIAL_ONCE",
+                *_AUTO_REVIEW_ARGS,
+                "--remote",
+                "ws://127.0.0.1:9876",
+            ],
+        ),
     ],
 )
 def test_build_codex_remote_args_passes_transport_verbatim(
@@ -243,6 +257,37 @@ def test_build_codex_remote_args_emits_config_overrides_before_subcommand(
         )
         == expected
     )
+
+
+# Pre- and post-0.154 remote resume keep or strip permission flags differently;
+# the positional launch prompt must be dropped on both paths.
+@pytest.mark.parametrize("codex_cli_version", [None, (0, 150, 0), (0, 154, 0), (0, 159, 2)])
+@pytest.mark.parametrize("bypass_sandbox", [False, True])
+def test_build_codex_remote_args_resume_omits_positional_launch_prompt(
+    codex_cli_version: tuple[int, int, int] | None,
+    bypass_sandbox: bool,
+) -> None:
+    """Resuming a thread must not resubmit the persisted positional launch prompt.
+
+    Codex parses a bare positional ahead of ``resume`` as a new ``[PROMPT]`` for
+    the resumed thread; only the reusable launch configuration may be forwarded.
+    """
+    launch_prompt = "Reply with INITIAL_ONCE"
+    args = codex_native_app_server.build_codex_remote_args(
+        codex_args=("--model", "gpt-5.4-mini", launch_prompt, "--sandbox", "read-only"),
+        thread_id="thread_existing",
+        remote_url="ws://127.0.0.1:9876",
+        config_overrides=('model_provider="omnigent"',),
+        codex_cli_version=codex_cli_version,
+        bypass_sandbox=bypass_sandbox,
+    )
+    assert args[-4:] == ["resume", "--remote", "ws://127.0.0.1:9876", "thread_existing"], args
+    assert launch_prompt not in args, (
+        "cold resume resubmits the original launch prompt instead of only the "
+        f"new input (argv={args})"
+    )
+    assert args[args.index("--model") + 1] == "gpt-5.4-mini", args
+    assert args[args.index("-c") + 1] == 'model_provider="omnigent"', args
 
 
 @pytest.mark.parametrize(

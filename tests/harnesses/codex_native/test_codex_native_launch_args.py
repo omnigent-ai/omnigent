@@ -15,6 +15,7 @@ from omnigent.harnesses.codex_native.launch_args import (
     codex_config_profile,
     materialize_codex_config_profile,
     redact_codex_launch_args,
+    without_codex_positional_prompt,
 )
 
 
@@ -112,6 +113,37 @@ def test_options_do_not_parse_values_or_prompt() -> None:
     args = ("-c", 'developer_instructions="--yolo -sread-only"', "--", "-pstrict", "--yolo")
     assert canonical_codex_launch_args(args) == list(args)
     assert codex_config_profile(args) is None
+
+
+@pytest.mark.parametrize(
+    ("args", "expected"),
+    [
+        (("Reply with INITIAL_ONCE",), []),
+        (("--model", "gpt-5.4-mini", "Reply with INITIAL_ONCE"), ["--model", "gpt-5.4-mini"]),
+        # Option values that look like prompts or subcommands are kept.
+        (("-m", "app-server", "fix the tests"), ["-m", "app-server"]),
+        (
+            ("--model=gpt-5.4-mini", "--search", "fix the tests"),
+            ["--model=gpt-5.4-mini", "--search"],
+        ),
+        (
+            ("-sread-only", "-c", 'model="gpt-5.4"', "fix it"),
+            ["-s", "read-only", "-c", 'model="gpt-5.4"'],
+        ),
+        (
+            ("--add-dir", "/tmp/shared", "--image", "shot.png", "describe"),
+            ["--add-dir", "/tmp/shared", "--image", "shot.png"],
+        ),
+        # Everything after ``--`` is prompt text, as is the ``-`` stdin marker.
+        (("-c", 'model="gpt-5.4"', "--", "--yolo", "fix it"), ["-c", 'model="gpt-5.4"']),
+        (("--model", "gpt-5.4-mini", "-"), ["--model", "gpt-5.4-mini"]),
+        ((), []),
+    ],
+)
+def test_without_codex_positional_prompt_keeps_options(
+    args: tuple[str, ...], expected: list[str]
+) -> None:
+    assert without_codex_positional_prompt(args) == expected
 
 
 @pytest.mark.parametrize("profile", ["../other", "/tmp/other", "", "two/parts"])
