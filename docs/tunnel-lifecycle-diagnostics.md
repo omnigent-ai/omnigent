@@ -42,6 +42,11 @@ both ends.
   code and reason differ from those sent on the socket. A stale receive or
   ping helper can end before the sender, so `ended_by` alone does not identify
   the close cause.
+
+  During a rollout, queries should accept both `closed` (older servers) and
+  `disconnected`, and allow missing close details on older `closed` rows.
+  Update queries that select only `closed` to use `disconnected` after the
+  server upgrade is complete.
 - `runner_ping_timeout`: `runner_id`, `connection_id`, `connection_age_s`,
   `silent_s`.
 - `runner_stream_transport_lost`: one row per outage when the relay first
