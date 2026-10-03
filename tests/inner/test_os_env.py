@@ -292,15 +292,22 @@ def test_read_impl_binary_cap_reads_only_the_cap(tmp_path: Path) -> None:
     assert peak < 10 * 1024 * 1024
 
 
-def test_read_impl_text_cap_bounds_memory_for_gigabyte_file(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize(
+    ("file_size", "byte_cap"),
+    [
+        pytest.param(11 * 1024**2, 10 * 1024**2, id="11MiB-10MiB-cap"),
+        pytest.param(1024**3, 64 * 1024, id="1GiB-64KiB-cap"),
+    ],
+)
+def test_read_impl_text_cap_does_not_read_entire_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, file_size: int, byte_cap: int
 ) -> None:
-    """A 1 GiB file, even with a huge first line, must only read a bounded prefix."""
-    path = tmp_path / "gigabyte.txt"
-    byte_cap = 64 * 1024
+    """Oversized files, even with a huge first line, only read a bounded prefix."""
+    path = tmp_path / "oversized.txt"
     with path.open("wb") as fh:
         fh.write(b"x" * (byte_cap + 1))
-        fh.truncate(1024**3)
+        fh.truncate(file_size)
+    assert path.stat().st_size == file_size
 
     reads: list[int] = []
     original_open = Path.open
@@ -331,7 +338,8 @@ def test_read_impl_text_cap_bounds_memory_for_gigabyte_file(
     assert result["truncated"] is True
     assert result["total_lines"] is None
     assert sum(reads) <= byte_cap + 1 + 8192
-    assert peak < 4 * 1024 * 1024
+    assert sum(reads) < file_size
+    assert peak < max(4 * 1024**2, 4 * byte_cap)
 
 
 @pytest.mark.parametrize(
