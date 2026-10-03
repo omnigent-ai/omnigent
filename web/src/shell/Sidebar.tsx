@@ -3289,7 +3289,6 @@ function ConversationMenuItems({
   onMarkRead,
   onProjectAssigned,
   moveToProject,
-  stopSession,
   setShareOpen,
   setForkOpen,
   setIsEditing,
@@ -3320,7 +3319,6 @@ function ConversationMenuItems({
   onMarkRead: () => void;
   onProjectAssigned?: (projectName: string) => void;
   moveToProject: ReturnType<typeof useMoveToProject>;
-  stopSession: ReturnType<typeof useStopSession>;
   setShareOpen: (open: boolean) => void;
   setForkOpen: (open: boolean) => void;
   setIsEditing: (editing: boolean) => void;
@@ -3538,14 +3536,7 @@ function ConversationMenuItems({
           <C.Item
             data-testid="stop-conversation"
             variant="destructive"
-            onSelect={() => {
-              // Clear any prior failure so a stale "couldn't stop"
-              // message doesn't greet the next attempt. Must happen
-              // here: Radix only fires the Dialog's onOpenChange for
-              // Radix-initiated changes, not this programmatic open.
-              stopSession.reset();
-              setStopOpen(true);
-            }}
+            onSelect={() => setStopOpen(true)}
           >
             <CircleStopIcon className="size-3.5" />
             Stop session
@@ -4049,7 +4040,6 @@ function ConversationRowImpl({
     onMarkRead: () => markConversationRead(conversation.id, conversation.updated_at),
     onProjectAssigned,
     moveToProject,
-    stopSession,
     setShareOpen,
     setForkOpen,
     setIsEditing,
@@ -4611,32 +4601,26 @@ function ConversationRowImpl({
                 and stops its runner. The conversation and its history are kept.
               </DialogDescription>
             </DialogHeader>
-            {stopSession.isError && (
-              <p className="text-ui text-destructive" role="alert">
-                Couldn't stop the session
-                {stopSession.error instanceof Error && stopSession.error.message
-                  ? `: ${stopSession.error.message}`
-                  : " — it may still be running"}
-                . Try again in a moment.
-              </p>
-            )}
             <DialogFooter>
-              <Button
-                type="button"
-                variant="ghost"
-                onClick={() => setStopOpen(false)}
-                disabled={stopSession.isPending}
-              >
+              <Button type="button" variant="ghost" onClick={() => setStopOpen(false)}>
                 Cancel
               </Button>
               <Button
                 type="button"
                 variant="destructive"
                 data-testid="stop-session-confirm"
-                onClick={() =>
-                  stopSession.mutate(conversation.id, { onSuccess: () => setStopOpen(false) })
-                }
-                loading={stopSession.isPending}
+                onClick={() => {
+                  // Close now and stop in the background — keeping the modal open
+                  // for the whole kill blocks the rest of the sidebar. A failure
+                  // surfaces as a toast since the dialog is already gone.
+                  setStopOpen(false);
+                  stopSession.mutate(conversation.id, {
+                    onError: (err) => {
+                      const detail = err instanceof Error && err.message ? `: ${err.message}` : "";
+                      showToast(`Couldn't stop the session${detail}`);
+                    },
+                  });
+                }}
                 componentId="sidebar.conversation.stop"
               >
                 Stop session
