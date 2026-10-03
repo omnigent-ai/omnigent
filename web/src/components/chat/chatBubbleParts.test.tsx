@@ -469,3 +469,49 @@ describe("UserBubble long-prompt collapse", () => {
     expect(bubble).toHaveTextContent("a".repeat(COLLAPSE_THRESHOLD - 1));
   });
 });
+
+describe("AssistantBubble copy", () => {
+  const MARKDOWN = "## Findings\n\nA **bold** claim and `code`.";
+
+  function assistantBubble(text: string): Extract<Bubble, { kind: "assistant" }> {
+    return {
+      kind: "assistant",
+      responseId: "resp_copy",
+      stableId: "copy_assistant",
+      lifecycle: "completed",
+      error: null,
+      items: [{ kind: "text", itemId: "copy_text", text, final: true }],
+      createdAtS: 1_700_000_000,
+    };
+  }
+
+  it("offers rendered HTML alongside the markdown so a rich-text paste keeps formatting", async () => {
+    const write = vi.fn().mockResolvedValue(undefined);
+    class FakeClipboardItem {
+      items: Record<string, Blob>;
+
+      constructor(items: Record<string, Blob>) {
+        this.items = items;
+      }
+    }
+
+    vi.stubGlobal("ClipboardItem", FakeClipboardItem);
+    vi.stubGlobal("navigator", { clipboard: { write } });
+
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <BubbleView bubble={assistantBubble(MARKDOWN)} isLastAssistant={false} />
+      </QueryClientProvider>,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: /^copy$/i }));
+
+    await waitFor(() => expect(write).toHaveBeenCalledTimes(1));
+
+    const [item] = write.mock.calls[0][0] as FakeClipboardItem[];
+    expect(await item.items["text/plain"].text()).toBe(MARKDOWN);
+    expect(await item.items["text/html"].text()).toBe(
+      "<h2>Findings</h2>\n<p>A <strong>bold</strong> claim and <code>code</code>.</p>",
+    );
+  });
+});

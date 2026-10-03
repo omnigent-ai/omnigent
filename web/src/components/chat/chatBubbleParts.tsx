@@ -80,6 +80,7 @@ import { useForkDialog } from "@/shell/ForkDialogContext";
 import { InlineImage, SessionImage } from "@/components/SessionImage";
 import { buildMessageDeepLink } from "@/lib/messageDeepLink";
 import { copyText } from "@/lib/clipboard";
+import { copyMarkdown } from "@/lib/copyMarkdown";
 import { showToast } from "@/components/ui/toast";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import type { SessionStatus } from "@/lib/types";
@@ -599,9 +600,14 @@ export const BubbleView = memo(
  * Copy-to-clipboard handler for a message bubble's "Copy" action.
  *
  * @param getText - Produces the text to copy at click time.
+ * @param copy - Clipboard writer; assistant bubbles pass {@link copyMarkdown}
+ *   so the paste keeps its formatting.
  * @returns `{ isCopied, handleCopy }` for the action button.
  */
-function useCopyMessage(getText: () => string): {
+function useCopyMessage(
+  getText: () => string,
+  copy: (value: string) => Promise<void> = copyText,
+): {
   isCopied: boolean;
   handleCopy: () => void;
 } {
@@ -615,7 +621,7 @@ function useCopyMessage(getText: () => string): {
     if (isCopied) return;
     const text = getText();
     if (!text) return;
-    copyText(text).then(
+    copy(text).then(
       () => {
         setIsCopied(true);
         window.clearTimeout(timeoutRef.current);
@@ -628,7 +634,7 @@ function useCopyMessage(getText: () => string): {
         console.warn("Failed to copy message", error);
       },
     );
-  }, [getText, isCopied, isMobile]);
+  }, [copy, getText, isCopied, isMobile]);
 
   return { isCopied, handleCopy };
 }
@@ -959,7 +965,10 @@ function AssistantBubble({
     ? scopedState.blocks.some((b) => b.type === "elicitation" && b.status === "pending")
     : rootHasPendingElicitation;
   // Getter computes the markdown lazily at click time.
-  const { isCopied, handleCopy } = useCopyMessage(() => collectBubbleMarkdown(bubble.items));
+  const { isCopied, handleCopy } = useCopyMessage(
+    () => collectBubbleMarkdown(bubble.items),
+    copyMarkdown,
+  );
   const { isLinkCopied, handleCopyLink } = useCopyMessageLink(bubble.responseId);
   const flashing = useChatStore((s) => s.flashItemId === bubble.responseId);
   // null outside AppShell's provider (isolated tests) → hide the action.
