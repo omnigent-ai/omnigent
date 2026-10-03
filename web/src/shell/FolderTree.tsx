@@ -1307,6 +1307,7 @@ const TreeNodeRow = memo(function TreeNodeRow({
     );
   }
 
+  const canonicalPath = joinBrowseLocation(browseLocation, node.path);
   const dirStatus = dirtyDirMap.get(node.path);
   const dirDotClass =
     dirStatus === "created"
@@ -1322,7 +1323,7 @@ const TreeNodeRow = memo(function TreeNodeRow({
     // toggle rather than nesting one button inside another.
     <FileRowActions
       name={node.name}
-      path={joinBrowseLocation(browseLocation, node.path)}
+      path={canonicalPath}
       revealPath={node.path}
       kind="folder"
       bytes={null}
@@ -1389,11 +1390,7 @@ const TreeNodeRow = memo(function TreeNodeRow({
           >
             <span className="absolute inset-0 flex items-center justify-end gap-px">
               <span className={cn("shrink-0", ROW_ACTION_SIZE_CLASS)} aria-hidden />
-              <CopyPathButton
-                path={joinBrowseLocation(browseLocation, node.path)}
-                label="Copy folder path"
-                revealOnHover
-              />
+              <CopyPathButton path={canonicalPath} label="Copy folder path" revealOnHover />
               {moreActions}
             </span>
           </span>
