@@ -20,12 +20,16 @@ import android.webkit.PermissionRequest
 import android.webkit.URLUtil
 import android.webkit.ValueCallback
 import android.webkit.WebView
+import android.widget.Button
 import android.widget.FrameLayout
+import android.widget.LinearLayout
 import android.widget.PopupMenu
+import android.widget.ProgressBar
 import android.widget.TextView
 import androidx.activity.OnBackPressedCallback
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
+import androidx.browser.auth.AuthTabIntent
 import androidx.core.content.ContextCompat
 import androidx.core.content.getSystemService
 import androidx.core.graphics.Insets
@@ -39,6 +43,9 @@ import androidx.webkit.WebViewCompat
 import androidx.webkit.WebViewFeature
 import org.json.JSONArray
 import org.json.JSONObject
+import java.net.URI
+import java.util.concurrent.CompletableFuture
+import java.util.concurrent.Executors
 
 /**
  * The single WebView host. Mirrors the iOS `WebShellView` + `OmnigentWebView`:
@@ -52,7 +59,25 @@ class MainActivity : AppCompatActivity() {
     private lateinit var webView: WebView
     private lateinit var notifications: NativeNotificationManager
     private lateinit var blobSaver: BlobSaver
-    private val loginManager = OidcLoginManager()
+    private val oidcLoginManager = OidcLoginManager()
+    private var databricksLoginManager: DatabricksLoginManager? = null
+    private val databricksCallbackHandoff by lazy {
+        DatabricksCallbackHandoff(applicationContext)
+    }
+    private var ignoreNextAuthTabCancellation = false
+    private val databricksAuthExecutor = Executors.newSingleThreadExecutor()
+    private val databricksAuthLauncher =
+        AuthTabIntent.registerActivityResultLauncher(this, ::handleDatabricksAuthResult)
+    private var workspaceCoordinator: DatabricksWorkspaceCoordinator? = null
+    private var workspaceContext: DatabricksWebContext? = null
+    private var workspaceProfile: DatabricksWebProfile? = null
+    private var workspaceSession: DatabricksWebSession? = null
+    private var workspaceFuture: CompletableFuture<DatabricksWebSession>? = null
+    private var workspaceGeneration = 0
+    private lateinit var connectionOverlay: LinearLayout
+    private lateinit var connectionMessage: TextView
+    private lateinit var connectionAction: Button
+    private lateinit var connectionCancel: Button
     private var pinnedOrigin: String? = null
 
     // Bridge-dependent work deferred until the page (and its injected emit
@@ -126,6 +151,24 @@ class MainActivity : AppCompatActivity() {
             return
         }
         val serverUrl = store.currentServerUrl()
+        val resolvedContext = runCatching { DatabricksWebContext.resolve(URI(serverUrl)) }
+        if (resolvedContext.isFailure) {
+            returnToSetup(serverUrl, resolvedContext.exceptionOrNull()?.message)
+            return
+        }
+        workspaceContext = resolvedContext.getOrNull()
+        workspaceProfile =
+            workspaceContext?.let { context ->
+                try {
+                    DatabricksWebProfile.open(context)
+                } catch (error: Throwable) {
+                    returnToSetup(serverUrl, error.message)
+                    return
+                }
+            }
+        workspaceContext?.let {
+            workspaceCoordinator = DatabricksWorkspaceCoordinator(applicationContext)
+        }
         pinnedOrigin = originOf(serverUrl)
 
         // Application context for the long-lived helpers so the WebView's bridge
@@ -138,7 +181,7 @@ class MainActivity : AppCompatActivity() {
 
         if (BuildConfig.DEBUG) WebView.setWebContentsDebuggingEnabled(true) // chrome://inspect
 
-        webView = buildWebView()
+        webView = buildWebView(workspaceProfile)
         // Wrap the WebView in a FrameLayout so the floating server-switcher
         // pill can sit on top of it. The pill uses the app's brand palette
         // (values/values-night colors.xml) so it adapts to light/dark mode.
@@ -174,6 +217,10 @@ class MainActivity : AppCompatActivity() {
                     topMargin = (8 * dp).toInt()
                 }
         container.addView(switchButton)
+        if (workspaceContext != null) {
+            connectionOverlay = buildConnectionOverlay()
+            container.addView(connectionOverlay)
+        }
         container.addOnLayoutChangeListener { _, left, _, right, _, oldLeft, _, oldRight, _ ->
             if (right - left != oldRight - oldLeft) updateServerSwitcherWidth(right - left)
         }
@@ -227,7 +274,257 @@ class MainActivity : AppCompatActivity() {
         )
 
         ensureNotificationPermission()
-        webView.loadUrl(serverUrl)
+        val context = workspaceContext
+        val profile = workspaceProfile
+        if (context != null && profile != null) {
+            beginWorkspaceConnection(
+                context,
+                profile,
+                allowInteractive = intent.getBooleanExtra(EXTRA_USER_INITIATED_CONNECT, false),
+            )
+        } else {
+            webView.loadUrl(serverUrl)
+        }
+    }
+
+    private fun handleDatabricksAuthResult(result: AuthTabIntent.AuthResult) {
+        val context = workspaceContext ?: return
+        val profile = workspaceProfile ?: return
+        val manager =
+            try {
+                databricksLoginManager ?: DatabricksLoginManager(applicationContext).also {
+                    databricksLoginManager = it
+                }
+            } catch (error: Throwable) {
+                returnToSetup(context.pageUri.toString(), error.message)
+                return
+            }
+        when (result.resultCode) {
+            AuthTabIntent.RESULT_CANCELED -> {
+                if (ignoreNextAuthTabCancellation || databricksCallbackHandoff.isInProgress()) {
+                    ignoreNextAuthTabCancellation = false
+                    return
+                }
+                manager.cancel()
+                cancelWorkspaceConnection()
+            }
+
+            AuthTabIntent.RESULT_OK -> {
+                val callback =
+                    result.resultUri?.toString()?.let {
+                        runCatching {
+                            URI(
+                                it,
+                            )
+                        }.getOrNull()
+                    }
+                if (callback == null) {
+                    manager.cancel()
+                    returnToSetup(
+                        context.pageUri.toString(),
+                        getString(R.string.oauth_verification_failed),
+                    )
+                    return
+                }
+                val generation = ++workspaceGeneration
+                connectionOverlay.visibility = View.VISIBLE
+                connectionMessage.text = getString(R.string.oauth_completing)
+                connectionAction.visibility = View.GONE
+                connectionCancel.visibility = View.VISIBLE
+                databricksAuthExecutor.execute {
+                    val error = runCatching { manager.complete(callback) }.exceptionOrNull()
+                    runOnUiThread {
+                        if (generation != workspaceGeneration || isFinishing || isDestroyed) {
+                            return@runOnUiThread
+                        }
+                        if (error == null) {
+                            beginWorkspaceConnection(context, profile, allowInteractive = false)
+                        } else {
+                            returnToSetup(context.pageUri.toString(), error.message)
+                        }
+                    }
+                }
+            }
+
+            AuthTabIntent.RESULT_VERIFICATION_FAILED,
+            AuthTabIntent.RESULT_VERIFICATION_TIMED_OUT,
+            AuthTabIntent.RESULT_UNKNOWN_CODE,
+            -> {
+                manager.cancel()
+                returnToSetup(
+                    context.pageUri.toString(),
+                    getString(R.string.oauth_verification_failed),
+                )
+            }
+
+            else -> {
+                manager.cancel()
+                returnToSetup(
+                    context.pageUri.toString(),
+                    getString(R.string.oauth_verification_failed),
+                )
+            }
+        }
+    }
+
+    private fun buildConnectionOverlay(): LinearLayout {
+        val dp = resources.displayMetrics.density
+        return LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER
+            setPadding((32 * dp).toInt(), (32 * dp).toInt(), (32 * dp).toInt(), (32 * dp).toInt())
+            setBackgroundColor(ContextCompat.getColor(this@MainActivity, R.color.brand_background))
+            layoutParams =
+                FrameLayout.LayoutParams(
+                    FrameLayout.LayoutParams.MATCH_PARENT,
+                    FrameLayout.LayoutParams.MATCH_PARENT,
+                )
+            addView(ProgressBar(this@MainActivity))
+            connectionMessage =
+                TextView(this@MainActivity).apply {
+                    text = getString(R.string.oauth_connecting)
+                    gravity = Gravity.CENTER
+                    setTextColor(
+                        ContextCompat.getColor(this@MainActivity, R.color.brand_foreground),
+                    )
+                    setPadding(0, (16 * dp).toInt(), 0, (16 * dp).toInt())
+                }
+            addView(connectionMessage)
+            connectionAction =
+                Button(this@MainActivity).apply {
+                    visibility = View.GONE
+                }
+            addView(connectionAction)
+            connectionCancel =
+                Button(this@MainActivity).apply {
+                    text = getString(R.string.oauth_cancel)
+                    setOnClickListener { cancelWorkspaceConnection() }
+                }
+            addView(connectionCancel)
+        }
+    }
+
+    private fun beginWorkspaceConnection(
+        context: DatabricksWebContext,
+        profile: DatabricksWebProfile,
+        allowInteractive: Boolean,
+    ) {
+        val generation = ++workspaceGeneration
+        connectionOverlay.visibility = View.VISIBLE
+        connectionMessage.text = getString(R.string.oauth_connecting)
+        connectionAction.visibility = View.GONE
+        connectionCancel.visibility = View.VISIBLE
+        val future = workspaceCoordinator!!.prepare(context, profile)
+        workspaceFuture = future
+        future.whenComplete { session, rawError ->
+            runOnUiThread {
+                if (generation != workspaceGeneration || isFinishing ||
+                    isDestroyed
+                ) {
+                    return@runOnUiThread
+                }
+                val error = unwrapCompletionError(rawError)
+                if (error == null && session != null) {
+                    workspaceSession = session
+                    pinnedOrigin = originOf(session.pageUri.toString())
+                    removeBridge()
+                    installBridge()
+                    connectionOverlay.visibility = View.GONE
+                    webView.loadUrl(session.pageUri.toString())
+                    return@runOnUiThread
+                }
+                if (error is DatabricksSessionException.ReauthenticationRequired) {
+                    if (allowInteractive) {
+                        beginInteractiveWorkspaceSignIn(context, profile)
+                    } else {
+                        connectionMessage.text = getString(R.string.oauth_sign_in_required)
+                        connectionAction.apply {
+                            text = getString(R.string.oauth_sign_in)
+                            visibility = View.VISIBLE
+                            setOnClickListener { beginInteractiveWorkspaceSignIn(context, profile) }
+                        }
+                    }
+                    return@runOnUiThread
+                }
+                returnToSetup(context.pageUri.toString(), error?.message)
+            }
+        }
+    }
+
+    private fun beginInteractiveWorkspaceSignIn(
+        context: DatabricksWebContext,
+        profile: DatabricksWebProfile,
+    ) {
+        val generation = ++workspaceGeneration
+        connectionMessage.text = getString(R.string.oauth_opening_browser)
+        connectionAction.visibility = View.GONE
+        profile.clear().whenComplete { _, rawError ->
+            runOnUiThread {
+                if (generation != workspaceGeneration || isFinishing ||
+                    isDestroyed
+                ) {
+                    return@runOnUiThread
+                }
+                val error = unwrapCompletionError(rawError)
+                if (error != null) {
+                    returnToSetup(context.pageUri.toString(), error.message)
+                    return@runOnUiThread
+                }
+                try {
+                    val manager = DatabricksLoginManager(applicationContext)
+                    databricksLoginManager = manager
+                    if (!manager.start(databricksAuthLauncher, context.pageUri)) {
+                        returnToSetup(
+                            context.pageUri.toString(),
+                            getString(R.string.oauth_browser_unavailable),
+                        )
+                    }
+                } catch (failure: Throwable) {
+                    returnToSetup(context.pageUri.toString(), failure.message)
+                }
+            }
+        }
+    }
+
+    private fun cancelWorkspaceConnection() {
+        workspaceGeneration++
+        workspaceFuture?.cancel(true)
+        databricksLoginManager?.cancel()
+        returnToSetup(workspaceContext?.pageUri?.toString(), null)
+    }
+
+    private fun handleWorkspaceSessionInvalid(status: Int?) {
+        val message =
+            if (status == 403) {
+                getString(R.string.oauth_permission_denied)
+            } else {
+                getString(R.string.oauth_session_expired)
+            }
+        returnToSetup(workspaceContext?.pageUri?.toString(), message)
+    }
+
+    private fun returnToSetup(
+        serverUrl: String?,
+        error: String?,
+    ) {
+        ServerStore(this).clearCurrent()
+        startActivity(
+            Intent(this, ConnectActivity::class.java).apply {
+                serverUrl?.let { putExtra(ConnectActivity.EXTRA_SERVER_URL, it) }
+                error?.let { putExtra(ConnectActivity.EXTRA_ERROR, it) }
+            },
+        )
+        finish()
+    }
+
+    private fun unwrapCompletionError(error: Throwable?): Throwable? {
+        var current = error
+        while (current is java.util.concurrent.CompletionException ||
+            current is java.util.concurrent.ExecutionException
+        ) {
+            current = current.cause
+        }
+        return current
     }
 
     /**
@@ -291,9 +588,25 @@ class MainActivity : AppCompatActivity() {
     private fun onSwitchServerRequested(url: String) {
         val store = ServerStore(this)
         if (url !in store.offeredServers()) return
+        switchToServer(url)
+    }
+
+    private fun switchToServer(url: String) {
+        val store = ServerStore(this)
         store.connect(url)
         val target = store.currentServerUrl()
-        originOf(target)?.let { reloadWithNewServer(target, it) }
+        val origin = originOf(target) ?: return
+        if (
+            workspaceContext != null ||
+            serverAuthentication(origin) == ServerAuthentication.DATABRICKS_WORKSPACE
+        ) {
+            setIntent(
+                Intent(this, MainActivity::class.java).putExtra(EXTRA_USER_INITIATED_CONNECT, true),
+            )
+            recreate()
+        } else {
+            reloadWithNewServer(target, origin)
+        }
     }
 
     /** "Connect to new server…" from the sidebar picker — manual URL entry. */
@@ -303,8 +616,9 @@ class MainActivity : AppCompatActivity() {
 
     /** Build a WebView wired with the shell's settings, clients, and listeners. */
     @SuppressLint("SetJavaScriptEnabled")
-    private fun buildWebView(): WebView =
+    private fun buildWebView(profile: DatabricksWebProfile? = null): WebView =
         WebView(this).apply {
+            profile?.bind(this)
             settings.javaScriptEnabled = true
             settings.domStorageEnabled = true
             settings.mediaPlaybackRequiresUserGesture = false
@@ -319,6 +633,8 @@ class MainActivity : AppCompatActivity() {
                     onNavigationStarted = ::armServerSwitcherWatchdog,
                     onLoginRequired = ::startLogin,
                     onRendererGone = ::recoverFromRendererDeath,
+                    workspaceSession = { workspaceSession },
+                    onWorkspaceSessionInvalid = ::handleWorkspaceSessionInvalid,
                 )
             webChromeClient =
                 OmnigentWebChromeClient(
@@ -416,7 +732,7 @@ class MainActivity : AppCompatActivity() {
         pageLoaded = false
         historyCleared = false
 
-        webView = buildWebView()
+        webView = buildWebView(workspaceProfile)
         parent?.addView(webView, index)
         attachInsetsListener(webView)
         installBridge()
@@ -488,7 +804,7 @@ class MainActivity : AppCompatActivity() {
 
     override fun onConfigurationChanged(newConfig: Configuration) {
         super.onConfigurationChanged(newConfig)
-        applySystemBarContrast()
+        applySystemBarContrast(newConfig)
         if (::webView.isInitialized) {
             // Notify matchMedia listeners without reloading the SPA.
             webView.dispatchConfigurationChanged(newConfig)
@@ -505,12 +821,13 @@ class MainActivity : AppCompatActivity() {
      */
     private fun installBridge() {
         val origin = pinnedOrigin ?: return
+        val allowedOrigins = workspaceSession?.allowedOrigins ?: setOf(origin)
         if (!WebViewFeature.isFeatureSupported(WebViewFeature.WEB_MESSAGE_LISTENER)) return
         try {
             WebViewCompat.addWebMessageListener(
                 webView,
                 OmnigentBridgeListener.JS_OBJECT_NAME,
-                setOf(origin),
+                allowedOrigins,
                 OmnigentBridgeListener(
                     notifications = notifications,
                     blobSaver = blobSaver,
@@ -530,7 +847,7 @@ class MainActivity : AppCompatActivity() {
                     WebViewCompat.addDocumentStartJavaScript(
                         webView,
                         NativeBridgeScript.source,
-                        setOf(origin),
+                        allowedOrigins,
                     )
             } catch (_: IllegalArgumentException) {
                 // Keep the transport; onPageFinished will inject the facade instead.
@@ -538,9 +855,9 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun applySystemBarContrast() {
+    private fun applySystemBarContrast(configuration: Configuration = resources.configuration) {
         val isLightMode =
-            resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK !=
+            configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK !=
                 Configuration.UI_MODE_NIGHT_YES
         WindowInsetsControllerCompat(window, window.decorView).apply {
             isAppearanceLightStatusBars = isLightMode
@@ -571,7 +888,7 @@ class MainActivity : AppCompatActivity() {
         // Count (and re-arm the history clear for) only a call that actually
         // launches a flow, so re-entrant redirects can't burn the retry budget
         // without ever relaunching and suppress a legitimate later retry.
-        if (!loginManager.start(this, origin, ::onSessionToken)) return
+        if (!oidcLoginManager.start(this, origin, ::onSessionToken)) return
         loginAttempts++
         // A re-login (session expired mid-use) bounces through the IdP again,
         // leaving a stopped off-origin entry + stale pre-expiry pages on the back
@@ -670,16 +987,19 @@ class MainActivity : AppCompatActivity() {
         val uri = Uri.parse(url)
         val host = uri.host ?: return url
         val port = uri.port
-        return if (port != -1 &&
-            !(
-                (uri.scheme?.lowercase() == "https" && port == 443) ||
-                    (uri.scheme?.lowercase() == "http" && port == 80)
-            )
-        ) {
-            "$host:$port"
-        } else {
-            host
-        }
+        val hostLabel =
+            if (port != -1 &&
+                !(
+                    (uri.scheme?.lowercase() == "https" && port == 443) ||
+                        (uri.scheme?.lowercase() == "http" && port == 80)
+                )
+            ) {
+                "$host:$port"
+            } else {
+                host
+            }
+        val workspaceId = uri.getQueryParameters("o").singleOrNull()
+        return workspaceId?.let { "$hostLabel · $it" } ?: hostLabel
     }
 
     override fun onDestroy() {
@@ -689,7 +1009,10 @@ class MainActivity : AppCompatActivity() {
         pendingFileCallback = null
         pendingMicRequest?.deny()
         pendingMicRequest = null
-        loginManager.shutdown()
+        oidcLoginManager.shutdown()
+        databricksAuthExecutor.shutdownNow()
+        workspaceFuture?.cancel(true)
+        workspaceCoordinator?.shutdown()
         if (::blobSaver.isInitialized) blobSaver.shutdown()
         if (::webView.isInitialized) {
             removeBridge()
@@ -702,6 +1025,22 @@ class MainActivity : AppCompatActivity() {
         super.onNewIntent(intent)
         setIntent(intent)
 
+        if (intent.getBooleanExtra(OAuthCallbackActivity.EXTRA_OAUTH_CALLBACK, false)) {
+            databricksCallbackHandoff.clear()
+            ignoreNextAuthTabCancellation = true
+            val error = intent.getStringExtra(OAuthCallbackActivity.EXTRA_OAUTH_ERROR)
+            if (error != null) {
+                returnToSetup(workspaceContext?.pageUri?.toString(), error)
+                return
+            }
+            val context = workspaceContext
+            val profile = workspaceProfile
+            if (context != null && profile != null) {
+                beginWorkspaceConnection(context, profile, allowInteractive = false)
+                return
+            }
+        }
+
         // Detect a server change: ConnectActivity re-enters us via
         // CLEAR_TOP|SINGLE_TOP after the user picks a different server. The
         // bridge is origin-allowlisted, so a server switch without re-registering
@@ -710,6 +1049,13 @@ class MainActivity : AppCompatActivity() {
         val newServerUrl = store.currentServerUrl()
         val newOrigin = originOf(newServerUrl)
         if (newOrigin != null && newOrigin != pinnedOrigin) {
+            if (
+                workspaceContext != null ||
+                serverAuthentication(newOrigin) == ServerAuthentication.DATABRICKS_WORKSPACE
+            ) {
+                recreate()
+                return
+            }
             reloadWithNewServer(newServerUrl, newOrigin)
         }
 
@@ -733,7 +1079,7 @@ class MainActivity : AppCompatActivity() {
         // against the old server and its token must never land on the new origin's
         // cookie store. cancel() also resets inFlight so the new server can start
         // its own login immediately rather than waiting up to 5 minutes.
-        loginManager.cancel()
+        oidcLoginManager.cancel()
         removeBridge()
         pinnedOrigin = newOrigin
         pageLoaded = false
@@ -775,7 +1121,8 @@ class MainActivity : AppCompatActivity() {
     private fun showServerSwitcherMenu(anchor: View) {
         val store = ServerStore(this)
         val currentUrl = store.currentServerUrl()
-        val otherServers = store.offeredServers().filter { originOf(it) != pinnedOrigin }
+        val currentIdentity = serverIdentity(currentUrl)
+        val otherServers = store.offeredServers().filter { serverIdentity(it) != currentIdentity }
 
         val popup = PopupMenu(this, anchor, Gravity.TOP)
         MenuCompat.setGroupDividerEnabled(popup.menu, true)
@@ -804,8 +1151,7 @@ class MainActivity : AppCompatActivity() {
 
                 in 100..Int.MAX_VALUE -> {
                     val url = otherServers[item.itemId - 100]
-                    store.connect(url)
-                    originOf(url)?.let { reloadWithNewServer(url, it) }
+                    switchToServer(url)
                     true
                 }
 
@@ -817,12 +1163,24 @@ class MainActivity : AppCompatActivity() {
         popup.show()
     }
 
+    private fun isWorkspacePage(url: String?): Boolean =
+        workspaceSession?.let { session ->
+            runCatching { url?.let(::URI)?.let(session::navigationUri) }.getOrNull() != null
+        } == true
+
+    private fun serverIdentity(url: String): String =
+        runCatching {
+            val configuration =
+                workspaceContext?.configuration ?: DatabricksOAuthConfiguration.fromBuildConfig()
+            DatabricksCredentialScope.from(URI(url), configuration).account
+        }.getOrElse { originOf(url) ?: url }
+
     /** Run bridge-dependent work once a pinned-origin page has finished loading. */
     private fun onPageReady(url: String?) {
         // Only a real pinned-origin load carries the injected facade — an error
         // page (chrome-error://) or a foreign redirect must NOT drain
         // pendingNavigatePath or push insets into a page that can't consume them.
-        if (originOf(url) != pinnedOrigin) return
+        if (!isWorkspacePage(url) && originOf(url) != pinnedOrigin) return
         // First authenticated app page: drop everything before it from the
         // back/forward list — the pre-auth root, any IdP pages, and the post-login
         // reload all bounce to login or show a blank if Back reaches them. After
@@ -844,7 +1202,7 @@ class MainActivity : AppCompatActivity() {
         // e.g. mid re-login — where the bridge facade doesn't exist, so emitting
         // would silently drop the path. Keep it pending; the next pinned-origin
         // onPageReady flushes it.
-        if (originOf(webView.url) != pinnedOrigin) return
+        if (!isWorkspacePage(webView.url) && originOf(webView.url) != pinnedOrigin) return
         emitNotificationActivation(pendingNavigatePath)
         pendingNavigatePath = null
     }
@@ -1002,24 +1360,25 @@ class MainActivity : AppCompatActivity() {
         getSystemService<DownloadManager>()?.enqueue(request)
     }
 
-    private companion object {
-        const val MAX_LOGIN_ATTEMPTS = 3
+    companion object {
+        const val EXTRA_USER_INITIATED_CONNECT = "ai.omnigent.android.USER_INITIATED_CONNECT"
+        private const val MAX_LOGIN_ATTEMPTS = 3
 
         // Back-press fallback: long enough that a healthy renderer's JS round-trip
         // (a few ms) always wins the race, short enough to not feel stuck if it
         // doesn't answer. Only the timer ever fires when the renderer is gone.
-        const val BACK_FALLBACK_MS = 600L
+        private const val BACK_FALLBACK_MS = 600L
 
         // Renderer-crash budget. A handful of rebuilds absorbs transient crashes;
         // beyond that within the window it's a crash loop, so stop auto-recovering
         // rather than churn forever. Window bounds "rolling" so long-separated
         // one-off crashes never accumulate.
-        const val MAX_RENDERER_CRASHES = 3
-        const val RENDERER_CRASH_WINDOW_MS = 60_000L
+        private const val MAX_RENDERER_CRASHES = 3
+        private const val RENDERER_CRASH_WINDOW_MS = 60_000L
 
         // How long after a navigation begins we wait for the page to speak the
         // server-selection protocol before revealing the pill as a recovery
         // path. Mirrors the iOS shell's bridgeLivenessTimeout.
-        const val SWITCHER_LIVENESS_TIMEOUT_MS = 6_000L
+        private const val SWITCHER_LIVENESS_TIMEOUT_MS = 6_000L
     }
 }
