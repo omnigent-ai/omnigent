@@ -1809,6 +1809,26 @@ def test_ensure_default_debby_agent_skips_when_bundle_absent(
     assert seed_stores.agent_store.get_by_name(server_app._DEBBY_AGENT_NAME) is None
 
 
+def test_ensure_default_superpowers_agent_seeds_card(seed_stores: _SeedStores) -> None:
+    """Seeding registers the shipped superpowers bundle as a built-in agent."""
+    server_app._ensure_default_superpowers_agent(
+        seed_stores.agent_store,
+        seed_stores.artifact_store,
+        seed_stores.agent_cache,
+    )
+
+    seeded = seed_stores.agent_store.get_by_name(server_app._SUPERPOWERS_AGENT_NAME)
+    assert seeded is not None, "superpowers was not registered"
+    assert seeded.name == "superpowers"
+    loaded = seed_stores.agent_cache.load(
+        seeded.id,
+        seeded.bundle_location,
+        expand_env=False,
+    )
+    assert len(loaded.spec.skills) == 15
+    assert seed_stores.artifact_store.get(seeded.bundle_location) is not None
+
+
 def _build_api_only_app(db_uri: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> FastAPI:
     """Build an app with the web UI bundle ABSENT (the API-only branch).
 

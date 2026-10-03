@@ -60,13 +60,13 @@ class _GenerateBuildInfo(build_py):
     def _bundle_examples(self) -> None:
         """Copy bundled example agents into the wheel as real directories.
 
-        ``omnigent/resources/examples/{polly,debby}`` may exist as symlinks
+        ``omnigent/resources/examples/{polly,debby,superpowers}`` may exist as symlinks
         into the top-level ``examples/`` tree (or not at all) depending on
         the checkout, and setuptools' ``package-data`` never materializes
         symlinks into the built wheel — a directory symlink is not walked.
         A plain ``pip install`` / ``uv tool install`` would then ship a
-        package whose ``omnigent.resources.examples`` has no ``polly`` /
-        ``debby`` subdir, and bare ``omnigent`` (first-run default → polly)
+        package whose ``omnigent.resources.examples`` has no shipped bundle
+        subdirs, and bare ``omnigent`` (first-run default → polly)
         dies with "Agent path not found".
 
         Fix: after ``build_py`` has populated ``build_lib``, copy the real
@@ -82,7 +82,7 @@ class _GenerateBuildInfo(build_py):
 
         root = Path(__file__).resolve().parent
         dest_root = Path(self.build_lib) / "omnigent" / "resources" / "examples"
-        for name in ("debby", "polly"):
+        for name in ("debby", "polly", "superpowers"):
             src = root / "examples" / name
             if not src.is_dir():
                 continue

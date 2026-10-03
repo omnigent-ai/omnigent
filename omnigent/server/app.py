@@ -481,6 +481,7 @@ WELL_KNOWN_MANIFEST_VERSION = 1
 _WEB_UI_GZIP_MINIMUM_SIZE = 1024
 _DEBBY_AGENT_NAME = "debby"
 _POLLY_AGENT_NAME = "polly"
+_SUPERPOWERS_AGENT_NAME = "superpowers"
 _UNMATCHED_ROUTE_TEMPLATE = "<unmatched>"
 _SESSION_PATH_RE = re.compile(r"/v1/sessions/([^/]+)")
 
@@ -537,7 +538,7 @@ def _error_audit_extra(
     )
 
 
-# polly's and debby's multi-file bundles are packaged under
+# polly's, debby's, and superpowers' multi-file bundles are packaged under
 # omnigent.resources.examples (see pyproject package-data), so they resolve
 # in both a repo checkout and an installed wheel. The presence check in each
 # seeder is a safety net.
@@ -545,6 +546,9 @@ def _error_audit_extra(
 # Windows checkout (where Git leaves it as a stub text file); a no-op elsewhere.
 _DEBBY_BUNDLE_SOURCE = resolve_repo_symlink(Path(_examples_resources.__file__).parent / "debby")
 _POLLY_BUNDLE_SOURCE = resolve_repo_symlink(Path(_examples_resources.__file__).parent / "polly")
+_SUPERPOWERS_BUNDLE_SOURCE = resolve_repo_symlink(
+    Path(_examples_resources.__file__).parent / "superpowers"
+)
 
 
 class _FastAPICallNext(Protocol):
@@ -909,6 +913,7 @@ def _ensure_default_agents(
     _ensure_default_acp_agents(agent_store, artifact_store, agent_cache)
     _ensure_default_debby_agent(agent_store, artifact_store, agent_cache)
     _ensure_default_polly_agent(agent_store, artifact_store, agent_cache)
+    _ensure_default_superpowers_agent(agent_store, artifact_store, agent_cache)
     _ensure_extra_builtin_agents(agent_store, artifact_store, agent_cache)
 
 
@@ -1290,6 +1295,39 @@ def _ensure_default_polly_agent(
         agent_cache,
         name=_POLLY_AGENT_NAME,
         bundle_bytes=_build_polly_bundle(),
+    )
+
+
+def _build_superpowers_bundle() -> bytes:
+    """Build a gzipped tarball of the ``examples/superpowers`` bundle."""
+    import tempfile
+
+    from omnigent.spec import materialize_bundle
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        bundle_dir = materialize_bundle(_SUPERPOWERS_BUNDLE_SOURCE, Path(tmpdir) / "bundle")
+        return _tar_gz_dir(bundle_dir)
+
+
+def _ensure_default_superpowers_agent(
+    agent_store: AgentStore,
+    artifact_store: ArtifactStore,
+    agent_cache: Any,
+) -> None:
+    """Register the native obra/superpowers example when its bundle ships."""
+    if not (_SUPERPOWERS_BUNDLE_SOURCE / "config.yaml").is_file():
+        _logger.debug(
+            "superpowers bundle not found at %s; skipping seed",
+            _SUPERPOWERS_BUNDLE_SOURCE,
+        )
+        return
+
+    _ensure_builtin_agent(
+        agent_store,
+        artifact_store,
+        agent_cache,
+        name=_SUPERPOWERS_AGENT_NAME,
+        bundle_bytes=_build_superpowers_bundle(),
     )
 
 

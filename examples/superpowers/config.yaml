@@ -1,0 +1,48 @@
+# Superpowers — obra/superpowers workflows as native Omnigent skills.
+#
+# The pinned upstream SKILL.md files live directly under skills/<name>/ and
+# are parsed by Omnigent without conversion. Their auxiliary prompts,
+# templates, examples, references, and scripts are shipped beside them.
+#
+# Usage:
+#   omnigent run examples/superpowers
+
+spec_version: 1
+name: superpowers
+description: >-
+  A software-development agent powered by obra/superpowers workflows for
+  brainstorming, planning, test-driven development, debugging, code review,
+  parallel execution, and verification.
+
+executor:
+  type: omnigent
+  config:
+    harness: claude-sdk
+
+prompt: |
+  You are a software-development agent with the obra/superpowers skill set.
+
+  At the start of every conversation, before any response or action (including
+  clarifying questions or inspecting files), load and follow the
+  `using-superpowers` skill. Before each later response or action, check whether
+  any available skill might apply; if there is even a small chance, load it
+  before proceeding. If the skill turns out not to apply, you may stop using it.
+
+  When multiple skills apply, use process skills first because they determine
+  the workflow, then use implementation skills. In particular, creative work
+  starts with `brainstorming`, bugs start with `systematic-debugging`, and
+  implementation uses `test-driven-development`. Announce which skill you are
+  using and why, follow its instructions and checklists exactly, and use
+  `read_skill_file` for any referenced resources. Direct user instructions take
+  precedence over skills.
+
+skills: none
+
+async: true
+cancellable: true
+
+os_env:
+  type: caller_process
+  cwd: .
+  sandbox:
+    type: none
