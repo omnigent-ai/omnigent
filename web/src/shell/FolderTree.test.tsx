@@ -3,8 +3,15 @@ import { act, cleanup, fireEvent, render, screen } from "@testing-library/react"
 import { useState } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-const { copyTextMock } = vi.hoisted(() => ({ copyTextMock: vi.fn(() => Promise.resolve()) }));
+const { copyTextMock, downloadMock } = vi.hoisted(() => ({
+  copyTextMock: vi.fn(() => Promise.resolve()),
+  downloadMock: vi.fn(() => Promise.resolve()),
+}));
 vi.mock("@/lib/clipboard", () => ({ copyText: copyTextMock }));
+vi.mock("@/hooks/useFileContent", async (importOriginal) => ({
+  ...(await importOriginal<typeof FileContentModule>()),
+  downloadWorkspaceFile: downloadMock,
+}));
 
 // Drive lazy-directory listings from a fixture so the tree's central
 // `useWorkspaceDirectories` controller resolves nested lazy dirs without a
@@ -33,6 +40,8 @@ vi.mock("@/hooks/useWorkspaceChangedFiles", async (importOriginal) => ({
 }));
 import { RunnerOfflineError, type WorkspaceFile } from "@/hooks/useWorkspaceChangedFiles";
 import type * as WorkspaceChangedFilesModule from "@/hooks/useWorkspaceChangedFiles";
+import type * as FileContentModule from "@/hooks/useFileContent";
+import userEvent from "@testing-library/user-event";
 import {
   ROW_ACTION_SIZE_CLASS,
   ROW_META_SLOT_CLASS,
@@ -115,6 +124,51 @@ describe("FolderTree runner-offline state", () => {
 
     expect(screen.getByText(/failed to load: 500 internal server error/i)).toBeInTheDocument();
     expect(screen.queryByText(/agent is asleep/i)).not.toBeInTheDocument();
+  });
+});
+
+describe("FolderTree row action paths", () => {
+  it("joins a rerooted tree path once for menu actions and Info", async () => {
+    const path = "src/same name # % ' Ω.ts";
+    const onOpenInfo = vi.fn();
+    renderTree({ files: [file(path)], browseLocation: "packages/app", onOpenInfo });
+
+    fireEvent.contextMenu(screen.getByText("same name # % ' Ω.ts"));
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Copy path" }));
+    expect(copyTextMock).toHaveBeenCalledWith(`packages/app/${path}`);
+
+    fireEvent.contextMenu(screen.getByText("same name # % ' Ω.ts"));
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Download" }));
+    expect(downloadMock).toHaveBeenCalledWith("conv_abc", `packages/app/${path}`);
+
+    fireEvent.contextMenu(screen.getByText("same name # % ' Ω.ts"));
+    fireEvent.click(await screen.findByRole("menuitem", { name: "File info" }));
+    expect(onOpenInfo).toHaveBeenCalledWith(
+      expect.objectContaining({ path: `packages/app/${path}`, name: "same name # % ' Ω.ts" }),
+      expect.any(HTMLElement),
+    );
+  });
+
+  it("keeps duplicate search basenames distinct and copies absolute outside paths", async () => {
+    const user = userEvent.setup();
+    const sameName = "same # % ' Ω.txt";
+    renderTree({
+      files: [],
+      searchQuery: "same",
+      searchResults: [file(`left/${sameName}`), file(`right/${sameName}`)],
+      browseLocation: "packages/app",
+    });
+    const kebabs = screen.getAllByRole("button", { name: `More actions for ${sameName}` });
+    expect(kebabs).toHaveLength(2);
+    await user.click(kebabs[1]);
+    await user.click(await screen.findByRole("menuitem", { name: "Copy path" }));
+    expect(copyTextMock).toHaveBeenCalledWith(`packages/app/right/${sameName}`);
+
+    cleanup();
+    copyTextMock.mockClear();
+    renderTree({ files: [file("deeper/report.txt")], browseLocation: "/tmp/outside" });
+    fireEvent.click(screen.getByRole("button", { name: "Copy path: report.txt" }));
+    expect(copyTextMock).toHaveBeenCalledWith("/tmp/outside/deeper/report.txt");
   });
 });
 
