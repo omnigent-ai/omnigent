@@ -309,6 +309,7 @@ from omnigent.server.routes._sessions.helpers import (
     _relay_persist_error_once,
     _remove_session_worktree_best_effort,
     _repl_terminal_ui_labels,
+    _report_launch_stage,
     _require_declared_subagent,
     _require_external_status_forward,
     _resolve_harness,
@@ -3824,7 +3825,7 @@ async def _bind_and_launch_managed_runner(
         await _note_workspace_reset_on_recreate(session_id, conversation_store)
     # Host bound; what remains is launching the runner and waiting
     # for its tunnel.
-    _publish_sandbox_status(session_id, "connecting")
+    _report_launch_stage(tracker, session_id, "connecting")
     runner_id: str | None = None
     if host_registry is not None:
         host_conn = host_registry.get(managed.host_id)
@@ -4574,10 +4575,10 @@ async def _run_managed_wake(
         Without it the wake shows the single ``"provisioning"`` band that
         ``_kick_managed_wake`` seeded for its whole duration, even while the host
         is already re-execing. resume_managed_host may invoke this from the
-        worker thread its ``start_host`` runs on; ``_publish_sandbox_status`` is
+        worker thread its ``start_host`` runs on; ``_report_launch_stage`` is
         thread-safe.
         """
-        _publish_sandbox_status(session_id, stage)
+        _report_launch_stage(tracker, session_id, stage)
 
     try:
         # Wake the same sandbox in place; resume_managed_host is single-flight
@@ -4637,7 +4638,7 @@ async def _run_managed_wake(
                 agent_id=agent_id,
             )
             return
-        _publish_sandbox_status(session_id, "connecting")
+        _report_launch_stage(tracker, session_id, "connecting")
         refreshed = await asyncio.to_thread(conversation_store.get_conversation, session_id)
         if refreshed is None:
             tracker.fail(session_id, "session not found after wake")

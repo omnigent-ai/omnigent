@@ -5987,6 +5987,13 @@ async def cancel_managed_launch_tasks() -> None:
     await asyncio.gather(*tasks, return_exceptions=True)
 
 
+def _report_launch_stage(tracker: ManagedLaunchTracker, session_id: str, stage: str) -> None:
+    """Relay an in-flight launch stage to the tracker and the progress surface.
+    Thread-safe, so the launch pipeline may call it from its worker thread."""
+    tracker.advance(session_id, stage)
+    _publish_sandbox_status(session_id, stage)
+
+
 async def _provision_managed_sandbox(
     *,
     session_id: str,
@@ -6028,15 +6035,15 @@ async def _provision_managed_sandbox(
 
     def _on_stage(stage: str) -> None:
         """
-        Relay a launch-pipeline stage to the session's progress surface.
+        Relay a launch-pipeline stage to the tracker and the progress surface.
 
         Passed into the launch helpers, which may invoke it from the
         worker thread their sandbox exec steps run on —
-        :func:`_publish_sandbox_status` is thread-safe.
+        :func:`_report_launch_stage` is thread-safe.
 
         :param stage: The stage just entered, e.g. ``"cloning"``.
         """
-        _publish_sandbox_status(session_id, stage)
+        _report_launch_stage(tracker, session_id, stage)
 
     try:
         if relaunch_host is not None:
@@ -6129,27 +6136,34 @@ async def _await_settled_managed_launch(launch: ManagedLaunch) -> None:
     Block until a managed launch settles, raising its failure.
 
     The rendezvous a message POST takes when it races a background
-    managed launch (create-time provisioning or a dead-sandbox
-    relaunch): resolve as soon as the launch settles, surface the
-    recorded reason when it failed, and give up with a clear retry
-    hint when the launch outlives the rendezvous budget.
+    managed launch (create-time provisioning, relaunch, or wake). It
+    resolves as soon as the launch settles and surfaces the recorded
+    reason on failure. The budget restarts at every reported stage, and
+    an open-ended stage (``MANAGED_LAUNCH_OPEN_ENDED_STAGES``, the clone)
+    is waited out entirely, so only a launch stuck in one bounded stage
+    for the whole budget is given up on.
 
     :param launch: The session's tracker entry.
-    :raises OmnigentError: 503 when the launch failed or is still
-        running at the timeout.
+    :raises OmnigentError: 503 when the launch failed or stalled.
     """
-    from omnigent.server.managed_hosts import MANAGED_LAUNCH_RENDEZVOUS_TIMEOUT_S
+    from omnigent.server import managed_hosts
 
-    try:
-        await asyncio.wait_for(
-            launch.settled.wait(),
-            timeout=MANAGED_LAUNCH_RENDEZVOUS_TIMEOUT_S,
-        )
-    except asyncio.TimeoutError:
-        raise OmnigentError(
-            "The session's managed sandbox is still provisioning; try again shortly",
-            code=ErrorCode.RUNNER_UNAVAILABLE,
-        ) from None
+    while not launch.settled.is_set():
+        wait_s = managed_hosts.MANAGED_LAUNCH_PROGRESS_POLL_S
+        if launch.stage not in managed_hosts.MANAGED_LAUNCH_OPEN_ENDED_STAGES:
+            remaining = (
+                launch.progressed_at
+                + managed_hosts.MANAGED_LAUNCH_RENDEZVOUS_TIMEOUT_S
+                - time.monotonic()
+            )
+            if remaining <= 0:
+                raise OmnigentError(
+                    "The session's managed sandbox is still provisioning; try again shortly",
+                    code=ErrorCode.RUNNER_UNAVAILABLE,
+                )
+            wait_s = min(wait_s, remaining)
+        with contextlib.suppress(asyncio.TimeoutError):
+            await asyncio.wait_for(launch.settled.wait(), timeout=wait_s)
     if launch.error is not None:
         raise OmnigentError(
             f"The session's managed sandbox failed to launch: {launch.error}",
@@ -11622,6 +11636,7 @@ __all__ = [
     "_remove_session_worktree_best_effort",
     "_repl_terminal_ui_labels",
     "_replace_text_in_message_body",
+    "_report_launch_stage",
     "_require_codex_approval_mode_forward",
     "_require_collaboration_mode_forward",
     "_require_cost_control_label_authority",

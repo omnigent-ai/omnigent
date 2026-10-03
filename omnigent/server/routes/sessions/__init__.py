@@ -500,6 +500,7 @@ from omnigent.server.routes._sessions.helpers import (
     _remove_session_worktree_best_effort as _remove_session_worktree_best_effort,
     _repl_terminal_ui_labels as _repl_terminal_ui_labels,
     _replace_text_in_message_body as _replace_text_in_message_body,
+    _report_launch_stage as _report_launch_stage,
     _require_collaboration_mode_forward as _require_collaboration_mode_forward,
     _require_cost_control_label_authority as _require_cost_control_label_authority,
     _require_declared_subagent as _require_declared_subagent,

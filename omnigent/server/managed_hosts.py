@@ -311,18 +311,19 @@ KUBERNETES_MANAGED_TOKEN_TTL_S = 7 * 24 * 3600
 # errors so an operator knows where to look inside the sandbox.
 _HOST_LOG_PATH = "/tmp/omnigent-host.log"
 
-# How long a message POST waits for an in-flight managed launch to
-# settle before giving up (see ManagedLaunchTracker). Covers the full
-# launch/wake pipeline ON TOP OF the host-registration wait
-# (MANAGED_HOST_ONLINE_TIMEOUT_S): the provider's provision/resume call
-# (StartSandbox has no fixed upper bound), the host-tunnel reconnect on
-# this replica, and the runner spawn/connect. The 120s slack must cover
-# all of those so a slow cold launch/wake doesn't time the parked message
-# out before the background launch settles — otherwise the first
-# post-dormancy turn is lost even though the wake later succeeds. The wait
-# resolves as soon as the launch settles, so this bound only bites a
-# genuinely slow launch.
+# How long a parked message POST tolerates an in-flight managed launch making
+# no progress (see ManagedLaunchTracker.advance). Counted per stage, so it bounds
+# a stalled step rather than the whole pipeline; slack covers host registration.
 MANAGED_LAUNCH_RENDEZVOUS_TIMEOUT_S = MANAGED_HOST_ONLINE_TIMEOUT_S + 120
+
+# Stages the rendezvous waits out for as long as they take: the clone runs
+# in the sandbox without a timeout, lasts as long as the repository is
+# large, and always ends in the next stage or a settled failure.
+MANAGED_LAUNCH_OPEN_ENDED_STAGES: frozenset[str] = frozenset({"cloning"})
+
+# Stages are reported from the worker thread the sandbox exec steps run
+# on, so the parked message polls the entry instead of being woken.
+MANAGED_LAUNCH_PROGRESS_POLL_S = 1.0
 
 # Server-internal sandbox lifecycle labels — currently the repository a relaunch
 # re-clones. A client seed would forge that reconstruction, so session
@@ -485,10 +486,18 @@ class ManagedLaunch:
     :param error: Failure detail once settled unsuccessfully, e.g.
         ``"managed sandbox launch failed: …"``. ``None`` while
         in flight and on success.
+    :param stage: The launch stage most recently reported through
+        :meth:`ManagedLaunchTracker.advance`, one of
+        :data:`omnigent.server.schemas.SandboxLaunchStage`; starts at
+        ``"provisioning"``.
+    :param progressed_at: ``time.monotonic()`` when *stage* was entered.
+        A waiter's rendezvous budget counts from here.
     """
 
     settled: asyncio.Event
     error: str | None = None
+    stage: str = "provisioning"
+    progressed_at: float = dataclass_field(default_factory=time.monotonic)
 
 
 class ManagedLaunchTracker:
@@ -534,6 +543,15 @@ class ManagedLaunchTracker:
             is in flight or recorded as failed for this session.
         """
         return self._by_session.get(session_id)
+
+    def advance(self, session_id: str, stage: str) -> None:
+        """Record that the in-flight launch entered *stage*, restarting a parked
+        message's rendezvous budget. Thread-safe; a no-op for unknown or settled entries."""
+        entry = self._by_session.get(session_id)
+        if entry is None or entry.settled.is_set():
+            return
+        entry.progressed_at = time.monotonic()
+        entry.stage = stage
 
     def finish(self, session_id: str) -> None:
         """
