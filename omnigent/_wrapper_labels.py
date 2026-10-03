@@ -70,6 +70,9 @@ GOOSE_NATIVE_WRAPPER_VALUE = "goose-native-ui"
 # ``conversations.labels[WRAPPER_LABEL_KEY]``.
 ANTIGRAVITY_NATIVE_WRAPPER_VALUE = "antigravity-native-ui"
 
+# Value stamped on mirrored Antigravity child sessions.
+ANTIGRAVITY_NATIVE_SUBAGENT_WRAPPER_VALUE = "antigravity-native-ui-subagent"
+
 # Value the ``omnigent qwen`` wrapper writes into
 # ``conversations.labels[WRAPPER_LABEL_KEY]``.
 QWEN_NATIVE_WRAPPER_VALUE = "qwen-native-ui"

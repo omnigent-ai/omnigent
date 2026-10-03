@@ -6,9 +6,14 @@ import contextlib
 import logging
 from collections.abc import Callable
 
+from omnigent._wrapper_labels import (
+    ANTIGRAVITY_NATIVE_SUBAGENT_WRAPPER_VALUE,
+    WRAPPER_LABEL_KEY,
+)
 from omnigent.debug_logging import debug_event, debug_sink_enabled
 from omnigent.entities import Conversation
 from omnigent.harness_aliases import canonicalize_harness
+from omnigent.harness_plugins import ANTIGRAVITY_NATIVE_CODING_AGENT
 from omnigent.native.native_coding_agents import (
     NATIVE_CODING_AGENTS,
     native_coding_agent_for_wrapper_label,
@@ -20,8 +25,10 @@ _NATIVE_SUBAGENT_HARNESSES = {
     for agent in NATIVE_CODING_AGENTS
     if agent.subagent_wrapper_label is not None
 }
-# Antigravity's mirrored child label is not yet part of its capability registry.
-_NATIVE_SUBAGENT_HARNESSES["antigravity-native-ui-subagent"] = "antigravity-native"
+# TODO: Remove the fallback when Antigravity declares subagent_wrapper_label.
+_NATIVE_SUBAGENT_HARNESSES.setdefault(
+    ANTIGRAVITY_NATIVE_SUBAGENT_WRAPPER_VALUE, ANTIGRAVITY_NATIVE_CODING_AGENT.harness
+)
 
 
 def harness_attributes(harness: str | None, *, source: str) -> dict[str, str | None]:
@@ -51,28 +58,24 @@ def log_session_metadata(
         return
     harness = None
     source = "agent_spec"
-    try:
-        wrapper = conv.labels.get("omnigent.wrapper")
-        native_agent = native_coding_agent_for_wrapper_label(wrapper)
-        if (
-            conv.kind == "sub_agent"
-            and wrapper is not None
-            and wrapper in _NATIVE_SUBAGENT_HARNESSES
-        ):
-            harness = _NATIVE_SUBAGENT_HARNESSES[wrapper]
-            source = "native_subagent"
-        elif conv.harness_override:
-            harness = conv.harness_override
-            source = "session_override"
-        elif native_agent is not None:
-            harness = native_agent.harness
-            source = "native_wrapper"
-        elif conv.agent_id is None:
-            source = "missing_agent"
-        else:
+    wrapper = conv.labels.get(WRAPPER_LABEL_KEY)
+    native_agent = native_coding_agent_for_wrapper_label(wrapper)
+    if conv.kind == "sub_agent" and wrapper is not None and wrapper in _NATIVE_SUBAGENT_HARNESSES:
+        harness = _NATIVE_SUBAGENT_HARNESSES[wrapper]
+        source = "native_subagent"
+    elif conv.harness_override:
+        harness = conv.harness_override
+        source = "session_override"
+    elif native_agent is not None:
+        harness = native_agent.harness
+        source = "native_wrapper"
+    elif conv.agent_id is None:
+        source = "missing_agent"
+    else:
+        try:
             harness = resolve_harness()
-    except Exception:  # noqa: BLE001 — optional telemetry must not break session execution
-        source = "lookup_failed"
+        except Exception:  # noqa: BLE001 — optional lookups must not break session execution
+            source = "lookup_failed"
     with contextlib.suppress(Exception):
         _logger.info(
             "Session metadata observed",

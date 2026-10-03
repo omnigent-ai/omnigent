@@ -19,6 +19,10 @@ import httpx
 from pydantic import TypeAdapter
 
 from omnigent._platform import normalize_interactive_shells
+from omnigent._wrapper_labels import (
+    ANTIGRAVITY_NATIVE_SUBAGENT_WRAPPER_VALUE,
+    WRAPPER_LABEL_KEY,
+)
 from omnigent.db.db_models import LABEL_VALUE_MAX_LEN
 from omnigent.db.workspace_cache import WorkspaceScopedCache, WorkspaceScopedSet
 from omnigent.entities.conversation import (
@@ -255,7 +259,7 @@ _CODEX_NATIVE_SUBAGENT_DISPLAY_FALLBACK = "Codex"
 _EXTERNAL_ANTIGRAVITY_SUBAGENT_START_TYPE: str = "external_antigravity_subagent_start"
 
 
-_ANTIGRAVITY_NATIVE_SUBAGENT_WRAPPER_LABEL_VALUE = "antigravity-native-ui-subagent"
+_ANTIGRAVITY_NATIVE_SUBAGENT_WRAPPER_LABEL_VALUE = ANTIGRAVITY_NATIVE_SUBAGENT_WRAPPER_VALUE
 
 
 _ANTIGRAVITY_NATIVE_SUBAGENT_CASCADE_ID_LABEL_KEY = (
@@ -317,7 +321,7 @@ _LABEL_VALUE_MAX_LEN: int = LABEL_VALUE_MAX_LEN
 _EXTERNAL_SESSION_TODOS_TYPE: str = "external_session_todos"
 
 
-_CLAUDE_NATIVE_WRAPPER_LABEL_KEY = "omnigent.wrapper"
+_CLAUDE_NATIVE_WRAPPER_LABEL_KEY = WRAPPER_LABEL_KEY
 
 
 _CLAUDE_NATIVE_WRAPPER_LABEL_VALUE = CLAUDE_NATIVE_CODING_AGENT.wrapper_label
