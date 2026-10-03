@@ -141,7 +141,9 @@ export function FileRowActions({ children, ...props }: FileRowActionsProps) {
           <MoreHorizontalIcon className="size-3.5" />
         </Button>
       </DropdownMenuTrigger>
-      <DropdownMenuContent align="end">{renderItems(DropdownMenuItem)}</DropdownMenuContent>
+      <DropdownMenuContent align="end" onEscapeKeyDown={(event) => event.stopPropagation()}>
+        {renderItems(DropdownMenuItem)}
+      </DropdownMenuContent>
     </DropdownMenu>
   );
 
@@ -149,6 +151,7 @@ export function FileRowActions({ children, ...props }: FileRowActionsProps) {
     <ContextMenu onOpenChange={setContextOpen}>
       <ContextMenuTrigger asChild>{children(kebab, rowRef)}</ContextMenuTrigger>
       <ContextMenuContent
+        onEscapeKeyDown={(event) => event.stopPropagation()}
         onCloseAutoFocus={(event) => {
           event.preventDefault();
           rowRef.current?.focus();
