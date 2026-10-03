@@ -29,6 +29,7 @@ import { ComposerAttachments } from "@/components/ComposerAttachments";
 import { Button } from "@/components/ui/button";
 import { useChatStore, ensureConversationStreamed } from "@/store/chatStore";
 import { useConversationEntryState } from "@/hooks/useConversationEntryState";
+import { useAutoGrowTextarea } from "@/hooks/useAutoGrowTextarea";
 import { useDictationInsert } from "@/hooks/useDictationInsert";
 import { useSession } from "@/hooks/useSession";
 import { usesNativeSideChatFork } from "@/lib/sideChat";
@@ -349,6 +350,7 @@ function SideChatComposer({
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const voiceSnapshotRef = useRef("");
   const dictation = useDictationInsert(text, setText, textareaRef);
+  useAutoGrowTextarea(textareaRef, text);
 
   // A `/side <question>` that opened this side chat seeds a draft to SEND (not
   // just populate). Consumed once on mount; the send waits until the child's
