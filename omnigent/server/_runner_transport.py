@@ -7,6 +7,8 @@ from typing import Any
 
 import httpx
 
+from omnigent.util.socket_teardown_guard import install_socket_teardown_guard
+
 # Type alias: callable returning an async context manager around a
 # connected websockets client. Kept ``Any`` because the actual return
 # type lives in :mod:`websockets.asyncio.client` and varies between
@@ -24,6 +26,7 @@ def build_uds_runner(uds_path: str) -> tuple[httpx.AsyncClient, RunnerWSFactory]
         ``ws://runner`` as cosmetic base hosts because the UDS
         transport ignores the host portion.
     """
+    install_socket_teardown_guard()
     client = httpx.AsyncClient(
         transport=httpx.AsyncHTTPTransport(uds=uds_path),
         base_url="http://runner",
