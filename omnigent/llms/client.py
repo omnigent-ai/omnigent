@@ -23,7 +23,12 @@ from omnigent.llms.errors import (
     PermanentLLMError,
     RetryableLLMError,
 )
-from omnigent.llms.routing import parse_model_string
+from omnigent.llms.reasoning_effort_support import (
+    accepts_reasoning_effort,
+    record_reasoning_effort_rejection,
+    strip_rejected_reasoning_effort,
+)
+from omnigent.llms.routing import PROVIDER_CONFIGS, parse_model_string
 from omnigent.llms.types import (
     Response,
     ResponseCompletedEvent,
@@ -57,6 +62,46 @@ async def _tee_stream_for_usage(
         if isinstance(event, ResponseCompletedEvent):
             _emit_usage_from_response(event.response)
         yield event
+
+
+async def _stream_with_reasoning_effort_fallback(
+    chunks: AsyncIterator[dict[str, Any]],
+    *,
+    adapter: Any,
+    messages: list[dict[str, Any]],
+    provider: str,
+    model: str,
+    endpoint: str,
+    tools: list[dict[str, Any]] | None,
+    extra: dict[str, Any],
+    connection_params: dict[str, str] | None,
+    timeout: int | None,
+) -> AsyncIterator[dict[str, Any]]:
+    """Retry a parameter rejection only if no chunks were yielded."""
+    yielded = False
+    try:
+        async for chunk in chunks:
+            yielded = True
+            yield chunk
+        return
+    except Exception as exc:
+        stripped = strip_rejected_reasoning_effort(extra, exc) if not yielded else None
+        if stripped is None:
+            raise
+    retry_chunks = await adapter.chat_completions(
+        messages,
+        model,
+        tools,
+        True,
+        stripped,
+        connection_params=connection_params,
+        timeout=timeout,
+    )
+    assert not isinstance(retry_chunks, dict)
+    async for chunk in retry_chunks:
+        yield chunk
+    # Learn only after the stripped stream completes.
+    record_reasoning_effort_rejection(provider, model, endpoint)
 
 
 class _ResponsesNamespace:
@@ -225,7 +270,11 @@ class _ResponsesNamespace:
                     "type": "json_schema",
                     "json_schema": {k: v for k, v in fmt.items() if k != "type"},
                 }
-        if reasoning:
+        # A learned rejection applies only at the endpoint that returned it.
+        endpoint = (connection_params or {}).get("base_url") or (
+            PROVIDER_CONFIGS.get(routed.provider) or ""
+        )
+        if reasoning and accepts_reasoning_effort(routed.provider, routed.model, endpoint):
             extra["reasoning_effort"] = reasoning.get("effort")
 
         if stream:
@@ -239,20 +288,50 @@ class _ResponsesNamespace:
                 timeout=timeout,
             )
             assert not isinstance(chunks, dict)
+            if "reasoning_effort" in extra:
+                chunks = _stream_with_reasoning_effort_fallback(
+                    chunks,
+                    adapter=adapter,
+                    messages=messages,
+                    provider=routed.provider,
+                    model=routed.model,
+                    endpoint=endpoint,
+                    tools=tools,
+                    extra=extra,
+                    connection_params=connection_params,
+                    timeout=timeout,
+                )
             return chat_stream_to_response_events(
                 chunks,
                 model=routed.model,
             )
 
-        result = await adapter.chat_completions(
-            messages,
-            routed.model,
-            tools,
-            False,
-            extra,
-            connection_params=connection_params,
-            timeout=timeout,
-        )
+        try:
+            result = await adapter.chat_completions(
+                messages,
+                routed.model,
+                tools,
+                False,
+                extra,
+                connection_params=connection_params,
+                timeout=timeout,
+            )
+        except Exception as exc:
+            stripped = strip_rejected_reasoning_effort(extra, exc)
+            if stripped is None:
+                raise
+            # Capability rejections are deterministic; retry without backoff.
+            result = await adapter.chat_completions(
+                messages,
+                routed.model,
+                tools,
+                False,
+                stripped,
+                connection_params=connection_params,
+                timeout=timeout,
+            )
+            # A failed stripped retry must not disable the parameter.
+            record_reasoning_effort_rejection(routed.provider, routed.model, endpoint)
         assert isinstance(result, dict)
         return chat_response_to_response(result)
 
