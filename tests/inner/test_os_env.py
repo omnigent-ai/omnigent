@@ -367,6 +367,22 @@ def test_read_impl_text_byte_cap_preserves_utf8(
     assert result["truncated"] is truncated
 
 
+def test_read_impl_invalid_utf8_after_sniff_falls_back_to_bounded_binary(tmp_path: Path) -> None:
+    """A text prefix followed by invalid UTF-8 retains the byte cap on fallback."""
+    path = tmp_path / "late-binary.dat"
+    raw = b"a" * 8192 + b"\xff" + b"b" * 128
+    byte_cap = 8192 + 64
+    path.write_bytes(raw)
+
+    result = _read_impl(path, offset=1, limit=None, max_bytes=byte_cap)
+
+    assert result["encoding"] == "base64"
+    assert base64.b64decode(result["content"]) == raw[:byte_cap]
+    assert result["returned_bytes"] == byte_cap
+    assert result["total_bytes"] == len(raw)
+    assert result["truncated"] is True
+
+
 def test_read_impl_multibyte_char_straddling_sniff_boundary_is_text(tmp_path: Path) -> None:
     """A multi-byte char split across the 8 KB sniff boundary stays text.
 
