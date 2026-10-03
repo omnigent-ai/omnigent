@@ -101,6 +101,12 @@ import { setPendingInitialPrompt } from "@/store/chatStore";
 import { clearSessionDrafts } from "@/lib/sessionDrafts";
 import { TooltipProvider } from "@/components/ui/tooltip";
 
+// Sandbox rows sit behind "See more" unless a sandbox is already picked.
+function revealSandboxRows() {
+  const more = screen.queryByTestId("new-chat-landing-sandbox-see-more");
+  if (more) fireEvent.click(more);
+}
+
 describe("ComposerAddMenu", () => {
   it("groups real actions and opens the existing attachment picker only after selection", () => {
     const onAttach = vi.fn();
@@ -6549,6 +6555,7 @@ describe("NewChatLandingScreen", () => {
     });
     renderLanding();
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
+    revealSandboxRows();
     const disabledRow = screen.getByTestId("new-chat-landing-sandbox-option-disabled");
     expect(disabledRow).toBeTruthy();
     // Disabled helper row replaces the clickable sandbox option.
@@ -6621,6 +6628,7 @@ describe("NewChatLandingScreen", () => {
       ),
     );
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
+    revealSandboxRows();
     // The sandbox option is pinned FIRST in the menu, above the host list —
     // DOCUMENT_POSITION_FOLLOWING means the host item comes after it.
     const sandboxOption = screen.getByTestId("new-chat-landing-sandbox-option");
@@ -6642,6 +6650,7 @@ describe("NewChatLandingScreen", () => {
     // And back: selecting the sandbox clears the host pick and swaps the
     // chips again. The auto-select effect must not override this either.
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
+    revealSandboxRows();
     fireEvent.click(screen.getByTestId("new-chat-landing-sandbox-option"));
     await waitFor(() =>
       expect(screen.getByTestId("new-chat-landing-host-chip").getAttribute("aria-label")).toContain(
@@ -6650,6 +6659,29 @@ describe("NewChatLandingScreen", () => {
     );
     expect(screen.queryByTestId("new-chat-landing-workspace-chip")).toBeNull();
     expect(screen.queryByTestId("new-chat-landing-branch-chip")).toBeNull();
+  });
+
+  it("keeps sandbox rows behind See more unless a sandbox is picked", async () => {
+    renderLanding({ managed_sandboxes_enabled: true });
+    const chip = () => screen.getByTestId("new-chat-landing-host-chip");
+    await waitFor(() => expect(chip().getAttribute("aria-label")).toContain("New Sandbox"));
+    // The picked sandbox stays visible.
+    fireEvent.pointerDown(chip(), { button: 0 });
+    expect(screen.getByTestId("new-chat-landing-sandbox-option")).toBeTruthy();
+    expect(screen.queryByTestId("new-chat-landing-sandbox-see-more")).toBeNull();
+    fireEvent.click(screen.getByTestId("new-chat-landing-host-host_1"));
+    await waitFor(() => expect(chip().getAttribute("aria-label")).not.toContain("Sandbox"));
+    // With a host picked, sandboxes wait behind "See more", which keeps the menu open.
+    fireEvent.pointerDown(chip(), { button: 0 });
+    expect(screen.queryByTestId("new-chat-landing-sandbox-option")).toBeNull();
+    fireEvent.click(screen.getByTestId("new-chat-landing-sandbox-see-more"));
+    expect(screen.getByTestId("new-chat-landing-sandbox-option")).toBeTruthy();
+    // Closing the menu collapses them again.
+    fireEvent.keyDown(screen.getByTestId("new-chat-landing-host-menu"), { key: "Escape" });
+    await waitFor(() => expect(screen.queryByTestId("new-chat-landing-host-menu")).toBeNull());
+    fireEvent.pointerDown(chip(), { button: 0 });
+    expect(screen.queryByTestId("new-chat-landing-sandbox-option")).toBeNull();
+    expect(screen.getByTestId("new-chat-landing-sandbox-see-more")).toBeTruthy();
   });
 
   it("adds a GitHub repo from the picker with a branch", async () => {
@@ -8475,6 +8507,7 @@ describe("NewChatLandingScreen custom-agent sandbox gating", () => {
     // Switch back to the sandbox: the pending pick can't run there, so the
     // selection falls back to a real agent and the pending row disappears.
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
+    revealSandboxRows();
     fireEvent.click(screen.getByTestId("new-chat-landing-sandbox-option"));
     await waitFor(() =>
       expect(screen.getByTestId("new-chat-landing-host-chip").getAttribute("aria-label")).toContain(

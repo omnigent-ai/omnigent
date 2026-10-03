@@ -2348,12 +2348,16 @@ export function NewChatLandingScreen() {
   // Sessions on the selected host — fetched only when a host is selected,
   // to avoid registering hundreds of sessions into the health poll at idle.
   const { data: directorySessions } = useDirectorySessions(selectedHostId !== null);
+  // Sandbox rows sit behind "See more" in the host menu unless one is picked.
+  const [showSandboxRows, setShowSandboxRows] = useState(false);
   // True when the user picked the sandbox option instead of a connected
   // host — the server provisions a sandbox host at create time
   // (host_type: "managed"), so no host_id or workspace is sent.
   const [sandboxSelected, setSandboxSelected] = useState(
     () => restoredDraft?.sandboxSelected ?? false,
   );
+  const sandboxRowsAvailable = managedSandboxesEnabled || showDisabledSandboxWithDocs;
+  const sandboxRowsShown = showSandboxRows || sandboxSelected;
   // Provider the sandbox pick launches on. Seeded to the sticky last pick (or
   // the first offered row) once the picker rows load; null both before that
   // seed and for a single-provider server that names no provider.
@@ -6479,6 +6483,8 @@ export function NewChatLandingScreen() {
                     {/* Host chip */}
                     <DropdownMenu
                       onOpenChange={(open) => {
+                        // "See more" starts collapsed each time the menu opens.
+                        if (!open) setShowSandboxRows(false);
                         // Run a requested "connect this machine" only once the menu
                         // has closed.
                         if (!open && pendingConnectRef.current) {
@@ -6522,7 +6528,23 @@ export function NewChatLandingScreen() {
                         {/* Server-provisioned sandbox — only advertised when
                     /v1/info reports managed_sandboxes_enabled. Pinned
                     first, above the connected-host list. */}
-                        {(managedSandboxesEnabled || showDisabledSandboxWithDocs) &&
+                        {sandboxRowsAvailable && !sandboxRowsShown && (
+                          <DropdownMenuItem
+                            onSelect={(e) => {
+                              e.preventDefault();
+                              setShowSandboxRows(true);
+                            }}
+                            className="text-sm text-muted-foreground"
+                            data-testid="new-chat-landing-sandbox-see-more"
+                          >
+                            <span className="flex size-4 shrink-0 items-center justify-center">
+                              <ChevronDownIcon className="size-3.5" />
+                            </span>
+                            See more
+                          </DropdownMenuItem>
+                        )}
+                        {sandboxRowsAvailable &&
+                          sandboxRowsShown &&
                           (managedSandboxesEnabled ? (
                             sandboxProviderRows.map((provider, index) => (
                               <DropdownMenuItem
