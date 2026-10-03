@@ -155,12 +155,6 @@ _PROVIDER_RESOLUTION_HARNESS: dict[str, _ProviderHarness] = {
     # models: map from the resolved entry (see acp_curated_models).
     "acp": "acp",
     "qwen": "qwen",
-    # The native agy TUI bridge resolves its provider via the SDK sibling,
-    # mirroring the claude-native -> claude-sdk rule above.
-    "antigravity-native": "antigravity",
-    "native-antigravity": "antigravity",
-    "agy-native": "antigravity",
-    "native-agy": "antigravity",
 }
 
 # cursor-agent always routes through its own stored login — there is no
@@ -174,6 +168,16 @@ _CURSOR_HARNESSES: frozenset[str] = frozenset({"cursor", "cursor-native", "nativ
 # models the account may use and the listing is a live CLI probe, not a
 # provider-config lookup.
 _DEVIN_HARNESSES: frozenset[str] = frozenset({"devin-native", "native-devin"})
+
+# The native agy TUI authenticates itself: it inherits the user's persisted
+# Google OAuth login (or an ambient GEMINI_API_KEY) from its own ~/.gemini, and
+# the launch seeds no Omnigent credential (``resolve_native_antigravity_launch``
+# returns "subscription" unconditionally) — so, like cursor/devin, resolution
+# short-circuits to a subscription readout instead of consulting provider
+# config for a credential the launch would never consume.
+_ANTIGRAVITY_NATIVE_HARNESSES: frozenset[str] = frozenset(
+    {"antigravity-native", "native-antigravity", "agy-native", "native-agy"}
+)
 
 # Preferred inline family per single-family harness (pi consumes both).
 _KEY_AUTH_FAMILY: dict[str, str] = {
@@ -620,6 +624,8 @@ def _resolve_model_provider_unsafe(spec: object, harness: str | None) -> Resolve
         )
     if (harness or "") in _DEVIN_HARNESSES:
         return ResolvedModelProvider(kind=SUBSCRIPTION_KIND, cli="devin", detail="devin CLI login")
+    if (canonical_harness or "") in _ANTIGRAVITY_NATIVE_HARNESSES:
+        return ResolvedModelProvider(kind=SUBSCRIPTION_KIND, cli="agy", detail="agy CLI login")
 
     harness_type = _PROVIDER_RESOLUTION_HARNESS.get(canonical_harness or "")
     if harness_type is None:
