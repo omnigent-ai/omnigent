@@ -96,6 +96,23 @@ describe("ToolCard rendering", () => {
     expect(screen.getAllByText("Output").length).toBeGreaterThan(0);
   });
 
+  it("mounts open when defaultOpen is set and reports toggles via onOpenChange", () => {
+    const onOpenChange = vi.fn();
+    const { container } = renderCard({
+      name: "my_tool",
+      argsSummary: "",
+      arguments: { a: 2 },
+      output: "the output text",
+      state: "output-available",
+      defaultOpen: true,
+      onOpenChange,
+    });
+    expect(screen.getAllByText("Parameters").length).toBeGreaterThan(0);
+    const trigger = container.querySelector<HTMLElement>('[data-slot="collapsible-trigger"]')!;
+    fireEvent.click(trigger);
+    expect(onOpenChange).toHaveBeenCalledWith(false);
+  });
+
   it("renders a pending output placeholder while input-available with no output", () => {
     // WHY: a running tool (input-available, output null) shows the
     // waiting-for-output indicator, not an empty/error panel.
