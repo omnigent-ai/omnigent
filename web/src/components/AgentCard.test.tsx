@@ -74,6 +74,8 @@ describe("AgentCard icon selection", () => {
     { name: "pi", harness: "pi", expected: "pi" },
     // The pi match is exact: a harness merely containing "pi" stays generic.
     { name: "spec-gen", harness: "openapi", expected: "bot" },
+    // IBM Bob has no licensed brand glyph, so it uses the generic fallback.
+    { name: "bob-native-ui", harness: "bob-native", expected: "bot" },
   ])("uses the $expected glyph for harness $harness", ({ name, harness, expected }) => {
     expect(chosenIcon(agent({ name, harness }))).toBe(expected);
   });

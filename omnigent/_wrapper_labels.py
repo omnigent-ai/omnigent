@@ -84,3 +84,7 @@ DEVIN_NATIVE_WRAPPER_VALUE = "devin-native-ui"
 # Value the ``omnigent hermes`` wrapper writes into
 # ``conversations.labels[WRAPPER_LABEL_KEY]``.
 HERMES_NATIVE_WRAPPER_VALUE = "hermes-native-ui"
+
+# Value the ``omnigent bob`` (IBM Bob Shell) wrapper writes into
+# ``conversations.labels[WRAPPER_LABEL_KEY]``.
+BOB_NATIVE_WRAPPER_VALUE = "bob-native-ui"

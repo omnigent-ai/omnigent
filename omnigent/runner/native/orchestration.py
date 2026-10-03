@@ -66,6 +66,7 @@ from omnigent.native.native_dispatch import resolve_hook
 from omnigent.process_logging import process_log_reference
 from omnigent.runner.resource_registry import (
     ANTIGRAVITY_NATIVE_TERMINAL_ROLE,
+    BOB_NATIVE_TERMINAL_ROLE,
     CLAUDE_NATIVE_TERMINAL_ROLE,
     CODEX_NATIVE_TERMINAL_ROLE,
     CURSOR_NATIVE_TERMINAL_ROLE,
@@ -3301,6 +3302,96 @@ async def _auto_create_goose_terminal(
         session_id,
         _forwarder_task.get_name(),
     )
+    return terminal_view
+
+
+async def _auto_create_bob_terminal(
+    session_id: str,
+    resource_registry: SessionResourceRegistry,
+    publish_event: Callable[[str, _JsonObject], None],
+    *,
+    server_client: httpx.AsyncClient | None,
+) -> SessionResourceView:
+    """
+    Auto-create the IBM Bob Shell TUI terminal for a bob-native session.
+
+    Launches ``bob chat [validated args]`` in a runner-owned tmux pane in the
+    session workspace, with an allowlisted environment rather than the runner's
+    (see :func:`~omnigent.harnesses.bob_native.bridge.build_bob_native_terminal_env`).
+    Bob owns auth, license acceptance and folder trust, so no Bob flag is added:
+    the user answers Bob's own prompts in this terminal. No transcript
+    forwarder runs; the web UI embeds the pane.
+
+    :param session_id: Session/conversation identifier.
+    :param resource_registry: Session resource registry for launching the terminal.
+    :param publish_event: Runner session event publisher.
+    :param server_client: Runner Omnigent server client.
+    :returns: Created terminal resource view.
+    :raises RuntimeError: If the persisted launch args are not on Bob's
+        allowlist, or a model/effort override is persisted.
+    """
+    from omnigent.harnesses.bob_native.bridge import (
+        bridge_dir_for_session_id,
+        build_bob_native_terminal_env,
+        write_tmux_target,
+    )
+    from omnigent.harnesses.bob_native.launch_args import BobLaunchArgsError, build_bob_chat_argv
+    from omnigent.harnesses.bob_native.main import resolve_bob_executable
+    from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
+
+    bridge_dir = bridge_dir_for_session_id(session_id)
+    # ``_pi_native_launch_config`` is a generic session-snapshot reader
+    # (workspace + terminal_launch_args); reused here, not Pi-specific.
+    launch_config = await _pi_native_launch_config(
+        session_id=session_id,
+        server_client=server_client,
+    )
+    workspace = os.path.realpath(str(launch_config.workspace))
+    if launch_config.model_override or launch_config.reasoning_effort:
+        # Bob Shell 2.x has no model/effort flag; refuse rather than drop it.
+        raise RuntimeError(
+            f"Bob session {session_id!r} has a model or effort override, but IBM Bob "
+            "Shell picks its model inside the TUI; clear the override and relaunch."
+        )
+    try:
+        bob_args = build_bob_chat_argv(launch_config.terminal_launch_args or [])
+    except BobLaunchArgsError as exc:
+        raise RuntimeError(f"Invalid Bob launch args for session {session_id!r}: {exc}") from exc
+    terminal_view = await resource_registry.launch_required_terminal(
+        session_id=session_id,
+        terminal_name="bob",
+        session_key="main",
+        resource_role=BOB_NATIVE_TERMINAL_ROLE,
+        spec=TerminalEnvSpec(
+            os_env=OSEnvSpec(type="caller_process", cwd=workspace),
+            command=resolve_bob_executable(),
+            args=bob_args,
+            env=build_bob_native_terminal_env(),
+            inherit_env=False,
+            scrollback=100_000,
+            tmux_allow_passthrough=True,
+            tmux_start_on_attach=False,
+        ),
+    )
+    # Advertise the tmux socket+target so the bob-native harness executor can
+    # deliver web-UI messages into this same pane.
+    terminal_registry = resource_registry.terminal_registry
+    if terminal_registry is not None:
+        instance = terminal_registry.get(session_id, "bob", "main")
+        if instance is not None and instance.running:
+            write_tmux_target(
+                bridge_dir,
+                socket_path=instance.socket_path,
+                tmux_target=instance.tmux_target,
+            )
+    publish_event(
+        session_id,
+        {
+            "type": "session.resource.created",
+            "resource": session_resource_view_to_dict(terminal_view),
+        },
+    )
+    _logger.info("Auto-created bob terminal for session %s", session_id)
     return terminal_view
 
 
@@ -9137,6 +9228,9 @@ async def _delete_native_bridge_dirs(
     from omnigent.harnesses.antigravity_native.bridge import (
         bridge_dir_for_bridge_id as antigravity_bridge_dir,
     )
+    from omnigent.harnesses.bob_native.bridge import (
+        bridge_dir_for_session_id as bob_bridge_dir,
+    )
     from omnigent.harnesses.claude_native.bridge import (
         BRIDGE_ID_LABEL_KEY,
     )
@@ -9188,6 +9282,7 @@ async def _delete_native_bridge_dirs(
     targets = {
         antigravity_bridge_dir(labels.get(ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY) or session_id),
         antigravity_bridge_dir(session_id),
+        bob_bridge_dir(session_id),
         claude_bridge_dir(labels.get(BRIDGE_ID_LABEL_KEY) or session_id),
         claude_bridge_dir(session_id),
         codex_bridge_dir(labels.get(CODEX_NATIVE_BRIDGE_ID_LABEL_KEY) or session_id),
@@ -9466,6 +9561,16 @@ async def _launch_goose(ctx: NativeLaunchContext) -> SessionResourceView:
         ctx.publish_event,
         server_client=ctx.server_client,
         ensure_comment_relay=ctx.ensure_comment_relay,
+    )
+
+
+async def _launch_bob(ctx: NativeLaunchContext) -> SessionResourceView:
+    """Adapter: build the bob-native terminal from a launch context."""
+    return await _auto_create_bob_terminal(
+        ctx.session_id,
+        ctx.resource_registry,
+        ctx.publish_event,
+        server_client=ctx.server_client,
     )
 
 

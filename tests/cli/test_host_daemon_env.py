@@ -72,6 +72,33 @@ def test_codex_executable_selection_survives_daemon_and_runner_boundaries(
 
 
 @pytest.mark.parametrize("server_url", [None, _REMOTE_SERVER_URL])
+def test_bob_executable_selection_survives_daemon_and_runner_boundaries(
+    monkeypatch: pytest.MonkeyPatch,
+    server_url: str | None,
+) -> None:
+    """``omnigent bob``'s configured binary reaches the runner; Bob's key does not."""
+    bob_path = "/selected install/bin/bob"
+    monkeypatch.delenv(RUNNER_ENV_PASSTHROUGH_ENV_VAR, raising=False)
+    monkeypatch.setenv("OMNIGENT_BOB_PATH", bob_path)
+    monkeypatch.setenv("BOB_API_KEY", "synthetic-secret")
+    monkeypatch.setattr("omnigent.onboarding.provider_config.load_config", dict)
+
+    daemon_env = _build_host_daemon_env(server_url=server_url)
+    runner_env = _build_runner_env(
+        daemon_env,
+        server_url=server_url or "http://localhost:6767",
+        runner_id="runner_bob_path",
+        binding_token="synthetic-binding-token",
+        workspace="/tmp/workspace",
+        parent_pid=12345,
+    )
+
+    for env in (daemon_env, runner_env):
+        assert env.get("OMNIGENT_BOB_PATH") == bob_path
+    assert "BOB_API_KEY" not in runner_env
+
+
+@pytest.mark.parametrize("server_url", [None, _REMOTE_SERVER_URL])
 def test_pi_env_denylist_reaches_runner_through_host_daemon(
     monkeypatch: pytest.MonkeyPatch,
     server_url: str | None,
