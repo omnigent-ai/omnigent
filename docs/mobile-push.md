@@ -52,6 +52,10 @@ collapse notifications by session and use the shared golden content fixture at
 
 **Rollback:** keep the migration and remove `mobile_push` from
 `OMNIGENT_FEATURES`. Routes return 404 and no Google calls are made.
+Existing device registrations are kept while the flag is off. Expired rows are
+filtered out but not deleted until the feature is re-enabled; downgrading the
+migration removes them as well. Deleting a user still erases that user's rows.
+Clients cannot unregister while the flag is off because the routes return 404.
 This flag-off roll-forward is the preferred rollback. The server automatically
 migrates at startup; deploy the schema release first, then the feature code. Additive
 tables are inert for running old replicas, but an old replica restarting after
