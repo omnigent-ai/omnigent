@@ -53,6 +53,26 @@ class _SuccessfulProcess:
         return b"", b""
 
 
+class _StalledProcess:
+    """Subprocess stand-in pinned on a stalled tmux server until it is killed."""
+
+    def __init__(self) -> None:
+        self.returncode: int | None = None
+        self._killed = asyncio.Event()
+
+    async def communicate(self) -> tuple[bytes, bytes]:
+        await self._killed.wait()
+        return b"", b""
+
+    def kill(self) -> None:
+        self.returncode = -9
+        self._killed.set()
+
+    async def wait(self) -> int:
+        await self._killed.wait()
+        return -9
+
+
 def contains_subsequence(values: list[str], expected: list[str]) -> bool:
     """
     Return whether *expected* appears contiguously in *values*.
@@ -656,11 +676,13 @@ def test_threaded_idle_watcher_uses_session_probe_to_confirm_capture_failure(
     assert instance.running is True
 
 
-def test_threaded_idle_watcher_treats_probe_start_failure_as_unknown(
+@pytest.mark.parametrize("probe_outcome", ["start_failure", "timeout"])
+def test_threaded_idle_watcher_treats_inconclusive_probe_as_unknown(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    probe_outcome: str,
 ) -> None:
-    """Process exhaustion must not be misclassified as terminal exit."""
+    """Process exhaustion or a stalled server must not be misclassified as exit."""
     instance = TerminalInstance(
         name="runtime",
         session_key="main",
@@ -672,15 +694,17 @@ def test_threaded_idle_watcher_treats_probe_start_failure_as_unknown(
     retried = threading.Event()
     attempts = 0
 
-    def _cannot_fork(*args: object, **kwargs: object) -> NoReturn:
+    def _inconclusive_probe(cmd: list[str], *args: object, **kwargs: object) -> NoReturn:
         del args, kwargs
         nonlocal attempts
         attempts += 1
         if attempts >= 3:
             retried.set()
-        raise BlockingIOError(errno.EAGAIN, "resource temporarily unavailable")
+        if probe_outcome == "start_failure":
+            raise BlockingIOError(errno.EAGAIN, "resource temporarily unavailable")
+        raise subprocess.TimeoutExpired(cmd, terminal_mod._TMUX_PROBE_TIMEOUT_SECONDS)
 
-    monkeypatch.setattr(terminal_mod.subprocess, "run", _cannot_fork)
+    monkeypatch.setattr(terminal_mod.subprocess, "run", _inconclusive_probe)
     monkeypatch.setattr(terminal_mod, "_TMUX_PROBE_START_FAILURE_BACKOFF_SECONDS", 0.01)
 
     instance.start_idle_watcher_thread(on_exit=exited.set, poll_interval_s=0.01)
@@ -826,12 +850,101 @@ def test_threaded_idle_watcher_exits_when_tmux_confirms_no_server(
     assert instance.running is False
 
 
-@pytest.mark.asyncio
-async def test_async_idle_watcher_treats_probe_start_failure_as_unknown(
+@pytest.mark.parametrize("blocked_probe", ["capture", "session", "pane", "exit_snapshot"])
+def test_replaced_threaded_watcher_discards_probe_that_outlived_its_stop(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    blocked_probe: str,
 ) -> None:
-    """The async capture path retries transient process-start failures."""
+    """A tmux command still in flight past the bounded join must not report to the old owner."""
+    instance = TerminalInstance(
+        name="runtime",
+        session_key="main",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path,
+        running=True,
+    )
+    monkeypatch.setattr(terminal_mod, "_IDLE_WATCHER_JOIN_TIMEOUT_S", 0.01)
+    entered = threading.Event()
+    release = threading.Event()
+    old_ticked = threading.Event()
+    old_exited = threading.Event()
+    new_ticked = threading.Event()
+    original: threading.Thread | None = None
+    missing_session_answers = 0
+
+    def _park() -> None:
+        entered.set()
+        assert release.wait(timeout=5.0)
+
+    def _is_original() -> bool:
+        nonlocal original
+        if original is None:
+            original = threading.current_thread()
+        return threading.current_thread() is original
+
+    def _capture() -> str | None:
+        if not _is_original():
+            return "healthy replacement"
+        if blocked_probe == "capture":
+            _park()
+            return "late snapshot"
+        return None if blocked_probe == "session" else "old snapshot"
+
+    def _session_exists() -> bool:
+        nonlocal missing_session_answers
+        missing_session_answers += 1
+        if missing_session_answers == terminal_mod._IDLE_EXIT_FAILURE_THRESHOLD:
+            _park()
+        return False
+
+    def _pane_is_dead() -> bool:
+        if not _is_original() or blocked_probe not in ("pane", "exit_snapshot"):
+            return False
+        if blocked_probe == "pane":
+            _park()
+        return True
+
+    def _capture_exit_snapshot() -> None:
+        if blocked_probe == "exit_snapshot":
+            _park()
+
+    instance._capture_pane_for_idle_or_none = _capture  # type: ignore[method-assign]
+    instance._tmux_session_exists_sync = _session_exists  # type: ignore[method-assign]
+    instance._pane_is_dead = _pane_is_dead  # type: ignore[method-assign]
+    instance._capture_exit_snapshot_sync = _capture_exit_snapshot  # type: ignore[method-assign]
+
+    instance.start_idle_watcher_thread(
+        on_exit=old_exited.set, on_tick=old_ticked.set, poll_interval_s=0.001
+    )
+    try:
+        assert entered.wait(timeout=2.0)
+        assert original is not None
+        instance.start_idle_watcher_thread(
+            on_exit=lambda: None, on_tick=new_ticked.set, poll_interval_s=0.001, replace=True
+        )
+        assert original.is_alive(), "bounded join should have expired with the probe parked"
+        assert new_ticked.wait(timeout=2.0)
+
+        release.set()
+        original.join(timeout=2.0)
+        assert not original.is_alive()
+        assert instance.running, "the replaced watcher marked the healthy terminal not running"
+        assert not old_exited.is_set(), "the replaced watcher fired its old owner's exit callback"
+        assert not old_ticked.is_set(), "the replaced watcher fired its old owner's tick callback"
+    finally:
+        release.set()
+        instance._stop_idle_watcher_thread()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("probe_outcome", ["start_failure", "timeout"])
+async def test_async_idle_watcher_treats_inconclusive_probe_as_unknown(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    probe_outcome: str,
+) -> None:
+    """The async capture path retries process-start failures and stalled probes."""
     instance = TerminalInstance(
         name="runtime",
         session_key="main",
@@ -843,17 +956,20 @@ async def test_async_idle_watcher_treats_probe_start_failure_as_unknown(
     retried = asyncio.Event()
     attempts = 0
 
-    async def _cannot_fork(*args: object, **kwargs: object) -> NoReturn:
+    async def _inconclusive_probe(*args: object, **kwargs: object) -> _StalledProcess:
         del args, kwargs
         nonlocal attempts
         attempts += 1
         if attempts >= 2:
             retried.set()
-        raise BlockingIOError(errno.EAGAIN, "resource temporarily unavailable")
+        if probe_outcome == "start_failure":
+            raise BlockingIOError(errno.EAGAIN, "resource temporarily unavailable")
+        return _StalledProcess()
 
-    monkeypatch.setattr(terminal_mod.asyncio, "create_subprocess_exec", _cannot_fork)
+    monkeypatch.setattr(terminal_mod.asyncio, "create_subprocess_exec", _inconclusive_probe)
     monkeypatch.setattr(terminal_mod, "_IDLE_POLL_INTERVAL_SECONDS", 0.01)
     monkeypatch.setattr(terminal_mod, "_TMUX_PROBE_START_FAILURE_BACKOFF_SECONDS", 0.01)
+    monkeypatch.setattr(terminal_mod, "_TMUX_PROBE_TIMEOUT_SECONDS", 0.01)
 
     instance.start_idle_watcher(lambda: None, on_exit=exited.set)
 
@@ -3422,6 +3538,31 @@ def test_apply_utf8_locale_default_noop_on_windows(
     _apply_utf8_locale_default(env)
     assert "LC_ALL" not in env
     assert env["LANG"] == ""
+
+
+async def test_read_keeps_terminal_running_when_tmux_times_out(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A stalled server makes ``read`` report an error, not a terminal exit."""
+    instance = TerminalInstance(
+        name="runtime",
+        session_key="main",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path,
+        running=True,
+    )
+
+    async def _stalled(*args: object, **kwargs: object) -> _StalledProcess:
+        del args, kwargs
+        return _StalledProcess()
+
+    monkeypatch.setattr(terminal_mod.asyncio, "create_subprocess_exec", _stalled)
+    monkeypatch.setattr(terminal_mod, "_TMUX_PROBE_TIMEOUT_SECONDS", 0.01)
+
+    result = await instance.read()
+
+    assert "did not respond" in str(result["error"])
+    assert instance.running is True
 
 
 @pytest.mark.asyncio
