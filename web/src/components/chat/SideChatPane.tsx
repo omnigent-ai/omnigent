@@ -95,17 +95,21 @@ const EMPTY_STATE_BODY = "Ask a question here without affecting the main convers
  *
  * @param childId The child conversation id, or a `pending:` placeholder.
  * @param onStart Create the fork from a pending tab's first message.
+ * @param fullHistory Show the whole transcript (a compact chat for a session,
+ *   not a fork), skipping the forked-in history filter.
  */
 export function SideChatPane({
   childId,
   onStart,
   readOnly: restoredReadOnly = false,
+  fullHistory = false,
 }: {
   childId: string;
   onStart?: (text: string) => Promise<void>;
   /** A dead, restored Codex side chat: show the transcript but no composer, and
    *  stop its session. Defaults to false (a live, sendable side chat). */
   readOnly?: boolean;
+  fullHistory?: boolean;
 }) {
   const pending = isPendingSideChat(childId);
   const [starting, setStarting] = useState(false);
@@ -147,7 +151,7 @@ export function SideChatPane({
   // GENERIC forks only — they copy the parent transcript. A native Codex child
   // already holds only its own turns (context lives in the native thread), so
   // filtering there would wrongly hide the side chat's first question.
-  const filterHistory = !usesNativeSideChatFork(sessionHarness);
+  const filterHistory = !fullHistory && !usesNativeSideChatFork(sessionHarness);
   // Load the persisted boundary when the child changes (mount / rekey); the
   // in-mount ref avoids re-reading storage every render and tracks whether we've
   // actually observed a load run, so we don't capture a boundary on the initial

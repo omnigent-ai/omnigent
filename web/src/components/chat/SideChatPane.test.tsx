@@ -463,3 +463,42 @@ describe("side chat sealed by the server", () => {
     );
   });
 });
+
+describe("side-chat history", () => {
+  const forkedIn = [
+    {
+      type: "user_message",
+      ctx: { itemId: "item_parent_question", responseId: "resp_parent" },
+      content: [{ type: "input_text", text: "Parent question" }],
+    },
+  ] as never;
+
+  function hydrate() {
+    act(() =>
+      conversationRegistry.acquire(childId).setState({
+        blocks: forkedIn,
+        loadingConversation: false,
+        sessionStatus: "idle",
+      }),
+    );
+  }
+
+  beforeEach(() => {
+    conversationRegistry.acquire(childId).setState({
+      sessionHarness: "claude-native",
+      loadingConversation: true,
+    });
+  });
+
+  it("hides the forked-in history by default", () => {
+    renderPane(<SideChatPane childId={childId} />);
+    hydrate();
+    expect(screen.queryByText("Parent question")).toBeNull();
+  });
+
+  it("shows the full history with fullHistory", () => {
+    renderPane(<SideChatPane childId={childId} fullHistory />);
+    hydrate();
+    expect(screen.getByText("Parent question")).toBeInTheDocument();
+  });
+});
