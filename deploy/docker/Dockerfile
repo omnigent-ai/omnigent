@@ -229,16 +229,23 @@ RUN groupadd -g 1000660000 sandbox \
  && useradd -m -d /sandbox -u 1000660000 -g sandbox sandbox
 
 # Git credential helper for private repositories over HTTPS: answers
-# `git credential get` from GIT_TOKEN / GIT_USERNAME in the
-# environment (injected via Modal secrets — see deploy/modal/README.md
-# "Git credentials"), so the managed launch's repository clone AND the
+# `git credential get` from GIT_TOKEN / GIT_USERNAME in the environment
+# (injected via Modal secrets — see deploy/modal/README.md "Git
+# credentials"), so the managed launch's repository clone AND the
 # agent's later fetch/push authenticate without writing credentials to
-# disk. Emits nothing when GIT_TOKEN is unset, leaving anonymous
-# clones of public repositories untouched. GIT_USERNAME defaults to
-# x-access-token (GitHub's token-auth username; GitLab users set
-# GIT_USERNAME=oauth2). --system so it applies to any sandbox user.
-RUN git config --system credential.helper \
-      '!f() { [ "$1" = get ] || return 0; [ -n "$GIT_TOKEN" ] || return 0; printf "username=%s\npassword=%s\n" "${GIT_USERNAME:-x-access-token}" "$GIT_TOKEN"; }; f'
+# disk. It resolves the token PER HOST — a host-specific GIT_TOKEN_<HOST>
+# / GIT_USERNAME_<HOST> pair when set (e.g. GIT_TOKEN_GIT_JOYFUL_HOUSE for
+# a self-hosted Forgejo), else the shared GIT_TOKEN / GIT_USERNAME — so a
+# sandbox that talks to more than one git host gives each its own token
+# instead of spraying one token at all of them. Emits nothing when no
+# token resolves, leaving anonymous clones of public repositories
+# untouched. GIT_USERNAME defaults to x-access-token (GitHub's token-auth
+# username; GitLab users set GIT_USERNAME=oauth2). --system so it applies
+# to any sandbox user. See deploy/docker/git-credential-omnigent for the
+# resolution rules.
+COPY deploy/docker/git-credential-omnigent /usr/local/bin/git-credential-omnigent
+RUN chmod 0755 /usr/local/bin/git-credential-omnigent \
+ && git config --system credential.helper '!/usr/local/bin/git-credential-omnigent'
 
 # Node runtime for the harness CLIs, copied from the official image
 # (same Debian base as python-slim, so the binary is ABI-compatible)
