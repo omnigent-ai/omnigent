@@ -296,6 +296,7 @@ export function TerminalView({
   // Abort handle for the outgoing attach's direct-upgrade probe, which
   // otherwise holds a loopback socket open for its full timeout.
   const upgradeCtlRef = useRef<AbortController | null>(null);
+  const mountedRef = useRef(false);
 
   useEffect(() => {
     clipboardMountedRef.current = true;
@@ -485,6 +486,15 @@ export function TerminalView({
     sessionRef.current = null;
   }, []);
 
+  useLayoutEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      upgradeCtlRef.current?.abort();
+      disposeActiveSession();
+    };
+  }, [disposeActiveSession]);
+
   const handleResume = useCallback(async () => {
     if (!onResume) return;
     setResumeError(null);
@@ -533,7 +543,8 @@ export function TerminalView({
       upgradeCtlRef.current = upgradeCtl;
       // Superseded by a later attach on this node? React 18 never calls
       // the ref cleanup, so `cancelled` alone can't catch that case.
-      const superseded = () => cancelled || attachGenerationRef.current !== generation;
+      const superseded = () =>
+        cancelled || attachGenerationRef.current !== generation || !mountedRef.current;
       void (async () => {
         // The awaited microtask preserves the StrictMode-collapse
         // behavior queueMicrotask provided; the URL resolution (when a

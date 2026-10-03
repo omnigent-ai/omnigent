@@ -9,7 +9,7 @@
 import type * as TerminalSessionModule from "./TerminalSession";
 
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
-import { act, useMemo } from "react";
+import { StrictMode, act, useMemo } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Toaster } from "@/components/ui/sonner";
 import { FileViewerContext, type OpenFileOptions } from "@/shell/FileViewerContext";
@@ -1167,6 +1167,36 @@ describe("hidden pre-warmed surface", () => {
     // No reveal edge — the session's own WS-open focus owns this case;
     // an extra explicit call would steal focus on every reconnect.
     expect(terminalSessionMock.instances[0].focus).not.toHaveBeenCalled();
+  });
+});
+
+describe("unmount", () => {
+  it("disposes the live session so its WebSocket closes", async () => {
+    const { unmount } = render(<TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" />);
+    await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
+    unmount();
+
+    expect(terminalSessionMock.instances[0].dispose).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not dial when it unmounts before the deferred attach runs", async () => {
+    const { unmount } = render(<TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" />);
+    unmount();
+    await act(async () => {});
+
+    expect(terminalSessionMock.instances).toHaveLength(0);
+  });
+
+  it("dials exactly once under StrictMode and keeps that session live", async () => {
+    render(
+      <StrictMode>
+        <TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" />
+      </StrictMode>,
+    );
+    await act(async () => {});
+
+    expect(terminalSessionMock.instances).toHaveLength(1);
+    expect(terminalSessionMock.instances[0].dispose).not.toHaveBeenCalled();
   });
 });
 
