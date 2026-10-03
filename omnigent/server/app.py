@@ -76,7 +76,7 @@ from omnigent.runtime import (
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
 from omnigent.server import managed_host_keepalive, session_live_state, shutdown_state
-from omnigent.server.auth import AuthProvider, SharingMode
+from omnigent.server.auth import AuthProvider, SharingMode, auth_mode
 from omnigent.server.background_session_titles import (
     BackgroundSessionTitleCoordinator,
     RunnerBackgroundTitleGenerator,
@@ -2781,6 +2781,14 @@ def create_app(
            version number: ``server_picker`` is ``"sidebar"`` on builds that
            dock the picker at the sidebar's bottom (it was ``"titlebar"``,
            centered in the macOS title-bar strip, before this).
+        5. ``auth`` tells a native client how this server signs users in,
+           before it loads anything. ``mode`` is ``"oidc"``, ``"accounts"``,
+           ``"header"``, ``"custom"`` (an embedding app's own provider), or
+           ``"none"``. ``"oidc"`` also promises the native loopback sign-in
+           (``/auth/login`` native parameters + ``POST /auth/native-token``).
+           ``session_cookie`` names the session cookie for ``oidc`` and
+           ``accounts`` and is ``null`` otherwise. A missing ``auth`` (older
+           servers) means "sign in as before".
 
         Unknown fields MUST be ignored, and a missing manifest (404 — every
         server older than this route) MUST be treated as the pre-manifest
@@ -2791,8 +2799,10 @@ def create_app(
         Authentication: intentionally UNAUTHED, like ``/v1/info``. A client
         must be able to read this before it holds a session cookie — the whole
         point is to consult it before loading the app. It exposes only the
-        version already public via ``/api/version`` plus coarse UI-shape
-        strings, so there is nothing here to leak.
+        version already public via ``/api/version``, coarse UI-shape
+        strings, and the sign-in mode and cookie name any visitor already
+        learns from ``/v1/info`` and the login redirect, so there is
+        nothing here to leak.
 
         Served under ``/.well-known/`` (RFC 8615) so it sits at a fixed,
         guessable path that never collides with an SPA client route.
@@ -2807,6 +2817,10 @@ def create_app(
             # key existing and exercise the "no floor" path from day one.
             "min_desktop_version": None,
             "ui": {"server_picker": "sidebar"},
+            "auth": {
+                "mode": auth_mode(auth_provider),
+                "session_cookie": getattr(auth_provider, "session_cookie_name", None),
+            },
         }
 
     @app.get("/v1/info", response_model=ServerInfoResponse)
@@ -2835,11 +2849,10 @@ def create_app(
         sandbox option with, and the installed
         ``server_version`` (already public via ``/api/version``).
         """
-        from omnigent.server.auth import UnifiedAuthProvider, local_single_user_enabled
+        from omnigent.server.auth import local_single_user_enabled
 
-        accounts_enabled = (
-            isinstance(auth_provider, UnifiedAuthProvider) and auth_provider._source == "accounts"
-        )
+        # Same helper as the manifest's auth.mode, so the two never disagree.
+        accounts_enabled = auth_mode(auth_provider) == "accounts"
         login_url = getattr(auth_provider, "login_url", None)
         # single_user marks the explicit single-user local runtime
         # (OMNIGENT_LOCAL_SINGLE_USER=1, set by the managed local spawn paths).
