@@ -377,6 +377,12 @@ export interface ServerPickerInfo {
   managedServers?: string[];
   /** Display names for managed servers, server URL → name. Absent on older shells. */
   managedServerNames?: Record<string, string>;
+  /**
+   * Names servers gave themselves in their manifest, origin → name. Display
+   * only (a server can call itself anything), so show the host alongside.
+   * Absent on older shells.
+   */
+  serverNames?: Record<string, string>;
   /** Recently-connected server URLs, most recent first. */
   recentServers: string[];
   /**

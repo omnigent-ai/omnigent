@@ -247,6 +247,59 @@ describe("SidebarServerPicker", () => {
     expect(screen.getByText("two.example.com")).toBeInTheDocument();
   });
 
+  it("shows names servers gave themselves, with their hosts", async () => {
+    getServerPicker.mockResolvedValue({
+      currentOrigin: "https://omni.example",
+      recentServers: [
+        "https://omni.example/",
+        "https://staging.example/",
+        "https://plain.example/",
+      ],
+      serverNames: {
+        "https://omni.example": "Acme Engineering",
+        "https://staging.example": "Acme Staging",
+      },
+    });
+    renderPicker();
+    const trigger = await openMenu();
+    expect(trigger).toHaveAttribute(
+      "aria-label",
+      "Server: Acme Engineering (omni.example). Switch server",
+    );
+    // The current entry and the other named recent both keep their host visible.
+    expect(screen.getAllByText("Acme Engineering").length).toBeGreaterThan(1);
+    expect(screen.getByText("omni.example")).toBeInTheDocument();
+    expect(screen.getByText("Acme Staging")).toBeInTheDocument();
+    expect(screen.getByText("staging.example")).toBeInTheDocument();
+    expect(screen.getByText("plain.example")).toBeInTheDocument();
+    fireEvent.click(screen.getByText("Acme Staging"));
+    await waitFor(() => expect(switchServer).toHaveBeenCalledWith("https://staging.example/"));
+  });
+
+  it("doesn't repeat a name that is just the host", async () => {
+    getServerPicker.mockResolvedValue({
+      currentOrigin: "https://omni.example",
+      recentServers: [],
+      serverNames: { "https://omni.example": "omni.example" },
+    });
+    renderPicker();
+    const trigger = await openMenu();
+    expect(trigger).toHaveAttribute("aria-label", "Server: omni.example. Switch server");
+  });
+
+  it("prefers the organization's name over the server's own", async () => {
+    getServerPicker.mockResolvedValue({
+      currentOrigin: "https://omni.example",
+      managedServers: ["https://omni.example/"],
+      managedServerNames: { "https://omni.example/": "Engineering" },
+      serverNames: { "https://omni.example": "Self-chosen" },
+      recentServers: [],
+    });
+    renderPicker();
+    expect(await screen.findByText("Engineering")).toBeInTheDocument();
+    expect(screen.queryByText("Self-chosen")).toBeNull();
+  });
+
   it("doesn't offer the workspace host it moved to as another server", async () => {
     getServerPicker.mockResolvedValue({
       currentOrigin: "https://dbc-1.cloud.databricks.com",
