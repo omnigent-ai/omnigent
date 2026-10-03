@@ -3161,6 +3161,10 @@ class ClaudeSDKExecutor(Executor):
                     elif isinstance(message, sdk.ResultMessage):
                         result_msg = cast(_ResultMessageObj, message)
                         claude_session_id = getattr(result_msg, "session_id", None)
+                        logger.info(
+                            "Claude CLI result received (is_error=%s)",
+                            getattr(result_msg, "is_error", None),
+                        )
                         if getattr(result_msg, "is_error", None):
                             # Harness-level failure (e.g. expired login). Surface
                             # as an executor error rather than assistant content.
@@ -3398,6 +3402,7 @@ class ClaudeSDKExecutor(Executor):
             if compaction_event is not None:
                 yield compaction_event
 
+        logger.info("ClaudeSDKExecutor: turn complete")
         yield TurnComplete(response=response_text, usage=turn_usage)
 
     @staticmethod
