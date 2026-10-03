@@ -48,10 +48,8 @@ interface FileRowActionItem {
   onSelect: () => void;
 }
 
-export const ROW_MENU_SLOT_CLASS =
-  "transition-[width] group-hover:w-20 group-focus-within:w-20 group-data-[state=open]:w-20 group-data-[actions-open=true]:w-20 pointer-coarse:w-20";
-export const ROW_MENU_SIZE_SLOT_CLASS =
-  "transition-[width] group-hover:w-20 group-focus-within:w-20 group-data-[state=open]:w-20 group-data-[actions-open=true]:w-20 pointer-coarse:w-[76px]";
+export const ROW_MENU_SLOT_CLASS = "w-20";
+export const ROW_MENU_SIZE_SLOT_CLASS = "w-20";
 
 export const FilesPanelFocusContext = createContext<RefObject<HTMLElement | null> | null>(null);
 
@@ -85,6 +83,7 @@ export function FileRowActions({ children, ...props }: FileRowActionsProps) {
   const kebabRef = useRef<HTMLButtonElement>(null);
   const focusReturnRef = useRef<HTMLElement | null>(null);
   const contextFocusRef = useRef<HTMLElement | null>(null);
+  const infoOpenedRef = useRef(false);
   const panelFocusRef = useContext(FilesPanelFocusContext);
   const [contextOpen, setContextOpen] = useState(false);
   const [dropdownOpen, setDropdownOpen] = useState(false);
@@ -130,6 +129,7 @@ export function FileRowActions({ children, ...props }: FileRowActionsProps) {
     icon: InfoIcon,
     onSelect: () => {
       const { name, path, kind, bytes, modifiedAt, status, linesAdded, linesRemoved } = props;
+      infoOpenedRef.current = true;
       props.onOpenInfo(
         {
           name,
@@ -154,6 +154,20 @@ export function FileRowActions({ children, ...props }: FileRowActionsProps) {
         {label}
       </Item>
     ));
+  const restoreFocusAfterMenuClose = (event: Event) => {
+    event.preventDefault();
+    if (infoOpenedRef.current) {
+      infoOpenedRef.current = false;
+      return;
+    }
+    const target = focusReturnRef.current;
+    const fallback = panelFocusRef?.current ?? null;
+    if (canReceiveFocus(target)) {
+      target.focus();
+    } else if (canReceiveFocus(fallback)) {
+      fallback.focus();
+    }
+  };
 
   const kebab = (
     <DropdownMenu
@@ -175,12 +189,17 @@ export function FileRowActions({ children, ...props }: FileRowActionsProps) {
             isCoarsePointer || contextOpen
               ? "opacity-100"
               : "opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 focus-visible:opacity-100 data-[state=open]:opacity-100",
+            "pointer-coarse:size-6",
           )}
         >
           <MoreHorizontalIcon className="size-3.5" />
         </Button>
       </DropdownMenuTrigger>
-      <DropdownMenuContent align="end" onEscapeKeyDown={(event) => event.stopPropagation()}>
+      <DropdownMenuContent
+        align="end"
+        onEscapeKeyDown={(event) => event.stopPropagation()}
+        onCloseAutoFocus={restoreFocusAfterMenuClose}
+      >
         {renderItems(DropdownMenuItem)}
       </DropdownMenuContent>
     </DropdownMenu>
@@ -226,16 +245,7 @@ export function FileRowActions({ children, ...props }: FileRowActionsProps) {
       </ContextMenuTrigger>
       <ContextMenuContent
         onEscapeKeyDown={(event) => event.stopPropagation()}
-        onCloseAutoFocus={(event) => {
-          event.preventDefault();
-          const target = focusReturnRef.current;
-          const fallback = panelFocusRef?.current ?? null;
-          if (canReceiveFocus(target)) {
-            target.focus();
-          } else if (canReceiveFocus(fallback)) {
-            fallback.focus();
-          }
-        }}
+        onCloseAutoFocus={restoreFocusAfterMenuClose}
       >
         {renderItems(ContextMenuItem)}
       </ContextMenuContent>
