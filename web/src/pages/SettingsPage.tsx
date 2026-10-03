@@ -77,6 +77,9 @@ import { PageScroll } from "@/components/PageScroll";
 import { ThemeColorPicker } from "@/components/theme/ThemeColorPicker";
 import { CardRadioGroup } from "@/components/theme/CardRadioGroup";
 import {
+  DARK_MODE_PREVIEW,
+  ExtraKeysPreview,
+  LIGHT_MODE_PREVIEW,
   ModePreview,
   PaletteChip,
   PaletteSwatchPreview,
@@ -167,6 +170,14 @@ import {
   writeCodeFontSizePx,
   writeCodeFontWeight,
 } from "@/lib/codeFontPreferences";
+import {
+  TERMINAL_EXTRA_KEYS_DEFAULT,
+  isTerminalExtraKeysMode,
+  readTerminalExtraKeysMode,
+  terminalExtraKeysModes,
+  writeTerminalExtraKeysMode,
+  type TerminalExtraKeysMode,
+} from "@/lib/terminalExtraKeysPreferences";
 import {
   readTerminalThemeMode,
   TERMINAL_THEME_DEFAULT,
@@ -340,16 +351,18 @@ function Section({
   title,
   description,
   descriptionClassName,
+  heading: Heading = "h1",
   children,
 }: {
   title: string;
   description?: string;
   descriptionClassName?: string;
+  heading?: "h1" | "h2";
   children: ReactNode;
 }) {
   return (
     <section>
-      <h1 className="text-2xl font-semibold">{title}</h1>
+      <Heading className="text-2xl font-semibold">{title}</Heading>
       {description && (
         <p className={cn("mt-1 text-muted-foreground", descriptionClassName ?? "text-ui")}>
           {description}
@@ -371,6 +384,12 @@ const terminalThemeCards: { mode: TerminalThemeMode; label: string; icon: typeof
   { mode: "light", label: "Light", icon: SunIcon },
   { mode: "dark", label: "Dark", icon: MoonIcon },
 ];
+
+const terminalExtraKeysLabels: Record<TerminalExtraKeysMode, string> = {
+  auto: "Auto (touch devices)",
+  on: "Always",
+  off: "Never",
+};
 
 const transcriptViewCards: {
   value: TranscriptViewDefault;
@@ -497,6 +516,65 @@ function TerminalThemeControl() {
         }))}
       />
     </ThemeSubsection>
+  );
+}
+
+/** Extra-keys row under the terminal on touch devices: a mode thumbnail beside its select. */
+function TerminalExtraKeysControl() {
+  const isDark = useResolvedThemeMode() === "dark";
+  const [mode, setMode] = useState(() => readTerminalExtraKeysMode());
+  const labelId = useId();
+  const choose = useCallback((next: TerminalExtraKeysMode) => {
+    setMode(next);
+    writeTerminalExtraKeysMode(next);
+  }, []);
+  return (
+    <div className="overflow-hidden rounded-xl border bg-card/55">
+      <div className="flex flex-col gap-3 bg-muted/30 p-4 sm:flex-row sm:items-center sm:justify-between">
+        <div className="flex min-w-0 items-center gap-3">
+          <div
+            data-testid="terminal-extra-keys-preview"
+            className="w-28 shrink-0 overflow-hidden rounded-lg shadow-sm"
+          >
+            <ExtraKeysPreview
+              mode={mode}
+              swatch={isDark ? DARK_MODE_PREVIEW : LIGHT_MODE_PREVIEW}
+            />
+          </div>
+          <div className="min-w-0">
+            <div id={labelId} className="text-ui font-medium">
+              Extra keys row
+            </div>
+            <div className="text-sm text-muted-foreground">
+              Adds Esc, Tab, Ctrl, Alt, Shift and arrow keys under the terminal on touch screens.
+            </div>
+          </div>
+        </div>
+        <Select
+          value={mode}
+          onValueChange={(next) => {
+            if (isTerminalExtraKeysMode(next)) choose(next);
+          }}
+          componentId="settings.appearance.terminal_extra_keys"
+          valueHasNoPii
+        >
+          <SelectTrigger
+            aria-labelledby={labelId}
+            data-testid="terminal-extra-keys-select"
+            className="w-full shrink-0 sm:w-48"
+          >
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            {terminalExtraKeysModes.map((value) => (
+              <SelectItem key={value} value={value} data-testid={`terminal-extra-keys-${value}`}>
+                {terminalExtraKeysLabels[value]}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+      </div>
+    </div>
   );
 }
 
@@ -827,6 +905,7 @@ function AppearanceSection() {
     setTheme("system");
 
     writeTerminalThemeMode(TERMINAL_THEME_DEFAULT);
+    writeTerminalExtraKeysMode(TERMINAL_EXTRA_KEYS_DEFAULT);
 
     writeThemePalette(DEFAULT_PALETTE);
     applyThemePalette(DEFAULT_PALETTE);
@@ -861,6 +940,7 @@ function AppearanceSection() {
           "omnigent:code-font-family",
           "omnigent:code-font-weight",
           "omnigent:terminal-theme",
+          "omnigent:terminal-extra-keys",
           "omnigent:ui-theme-palette",
           "omnigent:custom-theme",
           "omnigent:default-transcript-view",
@@ -967,6 +1047,19 @@ function AppearanceSection() {
         <UiCodeFontFamilyControl />
 
         <UiCodeFontWeightControl />
+
+        <div className="mt-4">
+          <Section
+            title="Touch & mobile"
+            heading="h2"
+            description="Settings for phones, tablets and other touch screens."
+            descriptionClassName="text-sm"
+          >
+            <div className="flex flex-col gap-8">
+              <TerminalExtraKeysControl />
+            </div>
+          </Section>
+        </div>
       </div>
 
       <div className="mt-8 flex items-center justify-end gap-2">
