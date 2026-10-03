@@ -4777,6 +4777,11 @@
             "title": "Accounts Enabled",
             "type": "boolean"
           },
+          "archive_worktree_cleanup": {
+            "default": true,
+            "title": "Archive Worktree Cleanup",
+            "type": "boolean"
+          },
           "branding": {
             "$ref": "#/components/schemas/BrandingInfo"
           },
@@ -8552,6 +8557,12 @@
             ],
             "description": "Per-session cost-control switch: `\"on\"` activates the spec's configured cost-control mode, `\"off\"` disables cost control for this session. Explicit JSON `null` clears the override back to the spec default; omitting the field leaves it unchanged (`\"off\"` is a real value here, so the field's *presence* \u2014 not a clear alias \u2014 is the clear signal, unlike `model_override`).",
             "title": "Cost Control Mode Override"
+          },
+          "delete_worktree": {
+            "default": false,
+            "description": "With `archived=True`, also remove the session's server-created git worktree directory once the archive teardown runs (after the Undo grace). The branch is kept. Ignored for sessions with no worktree; rejected (400) without `archived=True`.",
+            "title": "Delete Worktree",
+            "type": "boolean"
           },
           "external_session_id": {
             "anyOf": [

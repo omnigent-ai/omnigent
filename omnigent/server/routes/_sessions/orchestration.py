@@ -744,6 +744,8 @@ async def _archive_stop(
     conversation_store: ConversationStore,
     runner_router: Any,
     host_registry: Any,
+    *,
+    delete_worktree: bool = False,
 ) -> None:
     """
     Stop an archived session and tear down its host-launched runner.
@@ -772,6 +774,8 @@ async def _archive_stop(
         resolution, or ``None`` in tests / in-process setups.
     :param host_registry: The ``HostRegistry`` tracking live host
         tunnels, or ``None`` when host support is not wired.
+    :param delete_worktree: After the stop, also remove the session's
+        server-created worktree directory (the branch is kept).
     """
     # Resolve through the facade so a test's monkeypatch is honored here.
     from omnigent.server.routes import sessions as _facade
@@ -809,16 +813,58 @@ async def _archive_stop(
     _pending_archive_stops.pop(session_id, None)
 
     await _facade._best_effort_stop(session_id, conversation_store, runner_router)
-    if not conv.host_id or not conv.runner_id:
-        return
+    if conv.host_id and conv.runner_id:
+        await _archive_stop_host_runner(session_id, conv.host_id, conv.runner_id, host_registry)
+    # Runs after the runner teardown so the agent isn't left in a deleted cwd.
+    if delete_worktree and conv.git_branch and conv.workspace and conv.host_id:
+        from omnigent.server.routes._host_worktree import WORKTREE_ROOT_LABEL_KEY
+
+        try:
+            await _facade._remove_session_worktree_best_effort(
+                host_id=conv.host_id,
+                worktree_path=conv.workspace,
+                branch=conv.git_branch,
+                delete_branch=False,
+                host_registry=host_registry,
+                reason="session-archive",
+                expected_root_fingerprint=conv.labels.get(WORKTREE_ROOT_LABEL_KEY),
+                conversation_store=conversation_store,
+                exclude_conversation_id=session_id,
+            )
+        except Exception:  # noqa: BLE001
+            _logger.warning(
+                "Archive worktree cleanup failed for %s",
+                session_id,
+                exc_info=True,
+                extra={"session_id": session_id},
+            )
+
+
+async def _archive_stop_host_runner(
+    session_id: str,
+    host_id: str,
+    runner_id: str,
+    host_registry: Any,
+) -> None:
+    """
+    Tear down an archived session's host-launched runner, best-effort.
+
+    :param session_id: Session/conversation identifier.
+    :param host_id: Host that launched the runner.
+    :param runner_id: Runner bound to the session.
+    :param host_registry: The ``HostRegistry`` tracking live host
+        tunnels, or ``None`` when host support is not wired.
+    """
+    from omnigent.server.routes import sessions as _facade
+
     # Mark the tunnel drop intentional BEFORE tearing it down so the relay
     # renders a quiet stopped state rather than "runner_disconnected".
     _intentional_stop_sessions.add(session_id)
     try:
         delivered = await _facade._stop_session_host_runner(
             session_id,
-            conv.host_id,
-            conv.runner_id,
+            host_id,
+            runner_id,
             host_registry,
         )
     except Exception:  # noqa: BLE001
@@ -840,6 +886,8 @@ def _spawn_archive_stop(
     conversation_store: ConversationStore,
     runner_router: Any,
     host_registry: Any = None,
+    *,
+    delete_worktree: bool = False,
 ) -> None:
     """
     Defer :func:`_archive_stop` past the undo grace, as a retained task.
@@ -867,6 +915,7 @@ def _spawn_archive_stop(
         resolution, or ``None`` in tests / in-process setups.
     :param host_registry: The ``HostRegistry`` tracking live host
         tunnels, or ``None`` when host support is not wired.
+    :param delete_worktree: Forwarded to :func:`_archive_stop`.
     """
     # Replace any pending stop from an earlier archive of this session.
     _cancel_pending_archive_stop(session_id)
@@ -880,7 +929,13 @@ def _spawn_archive_stop(
             await asyncio.sleep(_facade._ARCHIVE_STOP_UNDO_GRACE_S)
         except asyncio.CancelledError:
             return
-        await _archive_stop(session_id, conversation_store, runner_router, host_registry)
+        await _archive_stop(
+            session_id,
+            conversation_store,
+            runner_router,
+            host_registry,
+            delete_worktree=delete_worktree,
+        )
 
     task = asyncio.create_task(_stop_after_grace())
     _pending_archive_stops[session_id] = task
@@ -10246,7 +10301,7 @@ async def _create_session_from_existing_agent(
                 # remove the directory but keep the user's branch (and its
                 # unpushed commits).
                 delete_branch=body.git is None or not body.git.existing_branch,
-                request=request,
+                host_registry=getattr(request.app.state, "host_registry", None),
                 reason="create-rollback",
             )
         raise OmnigentError(str(exc), code=ErrorCode.CONFLICT) from exc
@@ -10270,7 +10325,7 @@ async def _create_session_from_existing_agent(
                 # Same branch-preservation rule as the NameAlreadyExists
                 # rollback above: never -D a pre-existing branch.
                 delete_branch=body.git is None or not body.git.existing_branch,
-                request=request,
+                host_registry=getattr(request.app.state, "host_registry", None),
                 reason="create-rollback",
             )
         raise
