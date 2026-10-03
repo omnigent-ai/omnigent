@@ -1,6 +1,6 @@
 import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { useEffect, useState, type ReactNode } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 const { copyTextMock, downloadMock, revealMock } = vi.hoisted(() => ({
@@ -18,7 +18,7 @@ vi.mock("./RevealInFileManager", () => ({
     path && path !== "no-reveal" ? { hostId: "local", path: `/workspace/${path}` } : null,
 }));
 
-import { FileRowActions, type FileRowInfo } from "./FileRowActions";
+import { FileRowActions, FilesPanelFocusContext, type FileRowInfo } from "./FileRowActions";
 import { FileInfoDialog } from "./FileInfoDialog";
 
 afterEach(() => {
@@ -127,6 +127,46 @@ describe("FileRowActions", () => {
     await user.click(within(menu).getByRole("menuitem", { name: "Browse folder" }));
     expect(onBrowse).toHaveBeenCalledOnce();
     expect(downloadMock).not.toHaveBeenCalled();
+  });
+
+  it("returns focus to the Files panel when Browse unmounts its folder row", async () => {
+    const user = userEvent.setup();
+    function RerootingFolderHarness() {
+      const [browsingChild, setBrowsingChild] = useState(false);
+      const panelRef = useRef<HTMLDivElement>(null);
+      return (
+        <FilesPanelFocusContext.Provider value={panelRef}>
+          <div ref={panelRef} role="region" aria-label="Files" tabIndex={-1}>
+            {!browsingChild && (
+              <FileRowActions
+                name="folder"
+                path="folder"
+                kind="folder"
+                revealPath="no-reveal"
+                onBrowse={() => setBrowsingChild(true)}
+                onOpenInfo={vi.fn()}
+              >
+                {(moreActions, rowRef) => (
+                  <div ref={rowRef} data-testid="browsed-folder-row">
+                    <button type="button">folder</button>
+                    {moreActions}
+                  </div>
+                )}
+              </FileRowActions>
+            )}
+            {browsingChild && <div>Child folder contents</div>}
+          </div>
+        </FilesPanelFocusContext.Provider>
+      );
+    }
+
+    render(<RerootingFolderHarness />);
+    await user.click(screen.getByRole("button", { name: "More actions for folder" }));
+    await user.click(await screen.findByRole("menuitem", { name: "Browse folder" }));
+
+    expect(screen.queryByTestId("browsed-folder-row")).not.toBeInTheDocument();
+    expect(screen.getByText("Child folder contents")).toBeInTheDocument();
+    expect(screen.getByRole("region", { name: "Files" })).toHaveFocus();
   });
 
   it("limits last-known Changes rows to copy and Info", async () => {
