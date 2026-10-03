@@ -154,6 +154,50 @@
     return url.protocol === "http:" && !LOCAL_HOSTS.has(url.hostname);
   }
 
+  /** True when a server URL's host is the local machine. */
+  function isLoopbackServer(serverUrl) {
+    try {
+      return LOCAL_HOSTS.has(new URL(serverUrl).hostname);
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Join a route onto a server URL, keeping any mount path and a Databricks
+   * workspace's `?o=` selector, so API routes reach the same workspace.
+   *
+   * @param {string} serverUrl
+   * @param {string} routePath
+   * @param {{ fromOrigin?: boolean }} [options] Join at the origin, ignoring the mount.
+   * @returns {string}
+   */
+  function joinServerUrl(serverUrl, routePath, { fromOrigin = false } = {}) {
+    const server = new URL(serverUrl);
+    const route = new URL(routePath.startsWith("/") ? routePath : `/${routePath}`, server.origin);
+    const destination = new URL(server.origin);
+    const basePath = fromOrigin ? "" : server.pathname.replace(/\/+$/, "");
+    destination.pathname = `${basePath}${route.pathname}` || "/";
+
+    const organizations = new URLSearchParams();
+    if (isDatabricksWorkspaceHost(server.hostname)) {
+      for (const organization of server.searchParams.getAll("o")) {
+        organizations.append("o", organization);
+      }
+    }
+    const inherited = organizations.toString();
+    let routeQuery = route.search.slice(1);
+    if (inherited) {
+      routeQuery = routeQuery
+        .split("&")
+        .filter((part) => part && new URLSearchParams(part).keys().next().value !== "o")
+        .join("&");
+    }
+    destination.search = [inherited, routeQuery].filter(Boolean).join("&");
+    destination.hash = route.hash;
+    return destination.toString();
+  }
+
   /** Path where the Omnigent SPA is mounted in a Databricks workspace. */
   const WORKSPACE_UI_PATH = "/omnigent";
 
@@ -453,6 +497,9 @@
     normalizeRecentServers,
     serverDisplayLabel,
     isPlainHttpRemote,
+    isLoopbackServer,
+    joinServerUrl,
+    isDatabricksWorkspaceHost,
     normalizeSavedServerUrl,
     WORKSPACE_UI_PATH,
     WORKSPACE_PROBE_TIMEOUT_MS,

@@ -164,8 +164,11 @@ async def test_login_redirects_to_idp_with_pkce_params() -> None:
 # ── 2. CLI login ───────────────────────────────────────────────────
 
 
-async def test_cli_login_creates_ticket() -> None:
+async def test_cli_login_creates_ticket(monkeypatch: pytest.MonkeyPatch) -> None:
     """POST /auth/cli-login returns a ticket_id and login URL."""
+    monkeypatch.setattr(
+        "omnigent.server.routes.auth.secrets.token_urlsafe", lambda _size: "special /~!*"
+    )
     transport = _build_oidc_app()
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         resp = await client.post("/auth/cli-login")
@@ -174,7 +177,10 @@ async def test_cli_login_creates_ticket() -> None:
     body = resp.json()
     assert "ticket" in body
     assert "login_url" in body
-    assert body["login_url"].startswith("/auth/login?ticket=")
+    assert body == {
+        "ticket": "special /~!*",
+        "login_url": "/auth/login?ticket=special+%2F~%21%2A",
+    }
 
 
 # ── 3. CLI poll (pending) ─────────────────────────────────────────

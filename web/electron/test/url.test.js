@@ -12,6 +12,8 @@ const {
   normalizeRecentServers,
   serverDisplayLabel,
   isPlainHttpRemote,
+  isLoopbackServer,
+  joinServerUrl,
   normalizeSavedServerUrl,
   isDatabricksManagedServerUrl,
   databricksWorkspaceUiUrl,
@@ -619,6 +621,47 @@ describe("fetchServerManifest", () => {
         const m = await fetchServerManifest("https://ws.example.com/omnigent");
         assert.equal(m.manifestVersion, 1);
       },
+    );
+  });
+});
+
+describe("isLoopbackServer", () => {
+  it("is true only for the local machine", () => {
+    assert.equal(isLoopbackServer("http://localhost:8000"), true);
+    assert.equal(isLoopbackServer("http://127.0.0.1:8000/base"), true);
+    assert.equal(isLoopbackServer("http://[::1]:8000"), true);
+    assert.equal(isLoopbackServer("https://server.example"), false);
+    assert.equal(isLoopbackServer("not a url"), false);
+  });
+});
+
+describe("joinServerUrl", () => {
+  it("joins mounted routes before a normalized workspace selector", () => {
+    assert.equal(
+      joinServerUrl("https://dbc-a.cloud.databricks.com/omnigent?o=team%2fblue", "/v1/me"),
+      "https://dbc-a.cloud.databricks.com/omnigent/v1/me?o=team%2Fblue",
+    );
+    assert.equal(
+      joinServerUrl(
+        "https://dbc-a.cloud.databricks.com/omnigent?o=team%2Fblue",
+        "/auth/login?ticket=one-time&o=duplicate",
+      ),
+      "https://dbc-a.cloud.databricks.com/omnigent/auth/login?o=team%2Fblue&ticket=one-time",
+    );
+  });
+
+  it("can derive an origin-root route while preserving only Databricks o", () => {
+    assert.equal(
+      joinServerUrl(
+        "https://dbc-a.cloud.databricks.com/omnigent?o=team%2Fblue",
+        "/.well-known/omnigent.json",
+        { fromOrigin: true },
+      ),
+      "https://dbc-a.cloud.databricks.com/.well-known/omnigent.json?o=team%2Fblue",
+    );
+    assert.equal(
+      joinServerUrl("https://example.com/base?o=ignored", "/v1/me"),
+      "https://example.com/base/v1/me",
     );
   });
 });

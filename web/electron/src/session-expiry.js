@@ -8,8 +8,17 @@
 // Databricks browser-auth connections are excluded by the caller. Their cookie
 // lifecycle and request guard live in databricks-auth.js, never embedded SSO.
 //
-// Kept Electron-free at its core (isLoginRedirect) so the matching logic is
+// Self-hosted OIDC has a second expiry signal: the SPA sends the main frame to
+// the server's own `/auth/login` after an API 401. The shell stops that
+// navigation before it can reach a third-party IdP, signs in through the
+// system browser, and restores the page the user was on.
+//
+// Kept Electron-free at its core so the matching logic and event wiring are
 // unit-testable (test/session-expiry.test.js) without booting the app.
+
+"use strict";
+
+const { joinServerUrl } = require("./url");
 
 /**
  * Whether a webRequest redirect is the auth gate bouncing an expired session
@@ -72,7 +81,67 @@ function registerSessionExpiryReload(ses, isConnectedServerOrigin, reloadWindows
   });
 }
 
+/**
+ * Whether a main-frame destination is the connected server's OIDC login route:
+ * same origin and the server's (mount-aware) `/auth/login` path. Query
+ * parameters such as the SPA's `return_to` are allowed.
+ *
+ * @param {string} destinationUrl
+ * @param {string | null | undefined} serverUrl
+ * @returns {boolean}
+ */
+function isOidcLoginNavigation(destinationUrl, serverUrl) {
+  if (!serverUrl) return false;
+  try {
+    const destination = new URL(destinationUrl);
+    const expected = new URL(joinServerUrl(serverUrl, "/auth/login"));
+    return destination.origin === expected.origin && destination.pathname === expected.pathname;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Stop a live renderer's OIDC login navigation before the server can redirect
+ * the main frame to an IdP. The callback owns browser sign-in and restoring the
+ * route; repeated navigation events share one in-flight callback.
+ *
+ * @param {Electron.WebContents} webContents
+ * @param {() => string | null} serverUrlForWindow
+ * @param {(params: { serverUrl: string, returnUrl: string }) => Promise<void>} onExpired
+ */
+function registerOidcSessionExpiryHandoff(webContents, serverUrlForWindow, onExpired) {
+  let inFlight = null;
+  const intercept = (event, destinationUrl, isMainFrame = true) => {
+    if (isMainFrame === false) return;
+    const serverUrl = serverUrlForWindow();
+    if (!isOidcLoginNavigation(destinationUrl, serverUrl)) return;
+    event.preventDefault();
+    if (inFlight) return;
+
+    let returnUrl = serverUrl;
+    try {
+      const current = new URL(webContents.getURL());
+      if (current.origin === new URL(serverUrl).origin) returnUrl = current.toString();
+    } catch {
+      // Fall back to the server URL when the current page is unavailable.
+    }
+    inFlight = Promise.resolve(onExpired({ serverUrl, returnUrl }))
+      .catch(() => {})
+      .finally(() => {
+        inFlight = null;
+      });
+  };
+
+  webContents.on("will-navigate", (event, url) => intercept(event, url));
+  webContents.on("will-redirect", (event, url, _isInPlace, isMainFrame) =>
+    intercept(event, url, isMainFrame),
+  );
+}
+
 module.exports = {
   isLoginRedirect,
+  isOidcLoginNavigation,
   registerSessionExpiryReload,
+  registerOidcSessionExpiryHandoff,
 };

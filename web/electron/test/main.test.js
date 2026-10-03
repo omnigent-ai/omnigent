@@ -50,6 +50,8 @@ function loadNavigationHarness({
   cliPath = null,
   hostConnectResult = { ok: true },
   managedServerNames = {},
+  oidcAuth = require("../src/oidc_auth"),
+  oidcLoginDialog = require("../src/oidc_login_dialog"),
 } = {}) {
   const userData = fs.mkdtempSync(path.join(os.tmpdir(), "omnigent-navigation-test-"));
   if (savedServerUrl) {
@@ -309,6 +311,8 @@ function loadNavigationHarness({
         },
     "./browserIpc": { registerBrowserIpc: () => {} },
     "./session-expiry": require("../src/session-expiry"),
+    "./oidc_auth": oidcAuth,
+    "./oidc_login_dialog": oidcLoginDialog,
     "./popupPolicy": {
       decideWindowOpen: () => ({ kind: "ignore" }),
       stripCrossOriginOpenerHeaders: () => {},
@@ -386,6 +390,7 @@ function loadNavigationHarness({
     pickers,
     emit: (eventName, ...args) => webContents.emit(eventName, ...args),
     hasListener: (eventName) => listeners.has(eventName),
+    listenersFor: (eventName) => listeners.get(eventName) ?? [],
     setUrl: (url) => {
       currentUrl = url;
     },
@@ -2278,4 +2283,116 @@ it("dismisses native loading feedback when the server document fails", async (t)
   const shown = h.calls.loading.find((call) => call.action === "show");
   assert.equal(shown.label, "Opening Omnigent…");
   assert.deepEqual(h.calls.loading.at(-1), { action: "hide", attempt: shown.attempt });
+});
+
+describe("self-hosted OIDC system-browser sign-in wiring (src/main.js)", () => {
+  const server = "https://server.example";
+  const tick = () =>
+    new Promise((resolve) => {
+      setImmediate(resolve);
+    });
+  const oidcStub = (kind, probes = []) => ({
+    ...require("../src/oidc_auth"),
+    probeServerAuth: async (_ses, url) => {
+      probes.push(url);
+      return { kind, status: kind === "authenticated" ? 200 : 401 };
+    },
+  });
+  const dialogStub = (result, dialogs) => ({
+    runOidcLoginDialog: async (opts) => {
+      dialogs.push(opts.serverUrl);
+      return result;
+    },
+  });
+
+  it("signs in through the system browser before loading an OIDC server", async (t) => {
+    const dialogs = [];
+    const h = loadNavigationHarness({
+      serverUrl: server,
+      oidcAuth: oidcStub("oidc"),
+      oidcLoginDialog: dialogStub(true, dialogs),
+    });
+    t.after(h.cleanup);
+
+    await h.api.loadServerUrl(h.win, server);
+
+    assert.deepEqual(dialogs, [server]);
+    assert.deepEqual(h.calls.loadURL, [[server]]);
+  });
+
+  it("unpins the window and loads nothing when sign-in is cancelled", async (t) => {
+    const h = loadNavigationHarness({
+      serverUrl: server,
+      oidcAuth: oidcStub("oidc"),
+      oidcLoginDialog: dialogStub(false, []),
+    });
+    t.after(h.cleanup);
+
+    await assert.rejects(h.api.loadServerUrl(h.win, server), { name: "AbortError" });
+
+    assert.deepEqual(h.calls.loadURL, []);
+    assert.equal(h.api.windows.get(h.win).origin, null);
+  });
+
+  it("loads servers that are not OIDC without a handoff", async (t) => {
+    const dialogs = [];
+    const h = loadNavigationHarness({
+      serverUrl: server,
+      oidcAuth: oidcStub("authenticated"),
+      oidcLoginDialog: dialogStub(true, dialogs),
+    });
+    t.after(h.cleanup);
+
+    await h.api.loadServerUrl(h.win, server);
+
+    assert.deepEqual(dialogs, []);
+    assert.deepEqual(h.calls.loadURL, [[server]]);
+  });
+
+  it("never probes Databricks-managed servers", async (t) => {
+    const workspace = "https://workspace.cloud.databricks.com/omnigent";
+    const probes = [];
+    const h = loadNavigationHarness({
+      serverUrl: workspace,
+      oidcAuth: oidcStub("oidc", probes),
+      oidcLoginDialog: dialogStub(true, []),
+    });
+    t.after(h.cleanup);
+
+    await h.api.loadServerUrl(h.win, workspace);
+
+    assert.deepEqual(probes, []);
+  });
+
+  it("recovers the SPA's own /auth/login through the handoff and restores the page", async (t) => {
+    const dialogs = [];
+    const h = loadNavigationHarness({
+      serverUrl: server,
+      oidcAuth: oidcStub("oidc"),
+      oidcLoginDialog: dialogStub(true, dialogs),
+    });
+    t.after(h.cleanup);
+    h.api.createWindow(server);
+    await tick();
+    h.calls.loadURL.length = 0;
+    dialogs.length = 0;
+    h.setUrl(`${server}/c/current`);
+
+    const event = {
+      prevented: false,
+      preventDefault() {
+        this.prevented = true;
+      },
+    };
+
+    for (const listener of h.listenersFor("will-navigate")) {
+      listener(event, `${server}/auth/login?return_to=%2Fc%2Fcurrent`);
+    }
+    await tick();
+    await tick();
+
+    assert.equal(event.prevented, true);
+    assert.deepEqual(dialogs, [server]);
+    assert.deepEqual(h.calls.loadURL, [[`${server}/c/current`]]);
+  });
 });
