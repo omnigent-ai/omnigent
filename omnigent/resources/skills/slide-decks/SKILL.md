@@ -64,7 +64,10 @@ folder).
    point, and a closing slide. If the context is thin, confirm the outline
    with the user before building.
 2. Check for the design kit as above.
-3. Write the deck file.
+3. Write the deck file incrementally, so a live preview can show it as it
+   grows: first write a complete document with only the title slide first,
+   then add one complete top-level `<section>` per edit. Every edit leaves a
+   whole, valid document; never leave unclosed tags between edits.
 4. Tell the user the file path and how to view it: open it from the Files
    panel, step through with the arrow keys, and use "Print / Save as PDF" to
    export.

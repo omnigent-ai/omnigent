@@ -353,6 +353,18 @@ def test_framework_skill_listed_and_loaded_without_bundling(tool_ctx: ToolContex
     assert "## Deck format" in tool.invoke(json.dumps({"name": "slide-decks"}), tool_ctx)
 
 
+def test_slide_decks_workflow_writes_one_slide_per_edit(tool_ctx: ToolContext) -> None:
+    """The Workflow builds a deck incrementally so a live preview always parses."""
+    content = LoadSkillTool([], skills_filter="none").invoke(
+        json.dumps({"name": "slide-decks"}), tool_ctx
+    )
+    workflow = content.split("## Workflow", 1)[1].split("\n## ", 1)[0]
+
+    assert "complete document with only the title slide first" in workflow
+    assert "one complete top-level `<section>` per edit" in workflow
+    assert "never leave unclosed tags between edits" in workflow
+
+
 def test_bundled_skill_wins_over_framework_skill(tool_ctx: ToolContext) -> None:
     """A bundled skill of the same name replaces the framework copy, no duplicate."""
     own = SkillSpec(name="slide-decks", description="Mine.", content="Mine.")
