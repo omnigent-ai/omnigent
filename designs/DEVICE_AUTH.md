@@ -3,9 +3,10 @@
 > **IMPLEMENTED.**
 >
 > A generic, client-agnostic delegated-login mechanism. Slack is the first
-> consumer (`integrations/slack/`), but the server side carries no
-> Slack-specific concepts — the requesting application names itself with the
-> RFC 8628 `client_id` (a public string like `"slack"`; display/audit only).
+> consumer (`integrations/slack/`) and Discord the second
+> (`integrations/discord/`), but the server side carries no chat-platform
+> concepts — the requesting application names itself with the RFC 8628
+> `client_id` (a public string like `"slack"`; display/audit only).
 > It is a public OAuth client by default (no client secret), with an
 > **optional** shared secret (`OMNIGENT_DEVICE_CLIENT_SECRET`) that gates the
 > client-facing endpoints when set — see the phishing mitigations below.
@@ -40,9 +41,17 @@
 > (`app.py`: device auth is `oidc`/`accounts` only), so `start_login`
 > raises a clear error rather than firing a request the server would 404.
 >
-> Tests: `tests/server/test_device_auth.py`, and the Slack
+> **Discord.** `integrations/discord/` is a sibling consumer with the same
+> client code (`oauth.py`, `tokens.py`, `auth_manager.py`, `omnigent.py`),
+> keyed on the bare Discord user snowflake rather than a `(team, user)`
+> pair, and driven from the ephemeral `/omnigent config` message instead of
+> a modal. It supports the same accounts/oidc modes and likewise does not
+> support header/proxy mode.
+>
+> Tests: `tests/server/test_device_auth.py`, the Slack
 > `test_oauth.py` / `test_tokens.py` / `test_client_auth.py` /
-> `test_auth_manager.py`.
+> `test_auth_manager.py`, and the Discord `test_tokens.py` /
+> `test_omnigent.py` / `test_setup.py`.
 
 ## Problem
 

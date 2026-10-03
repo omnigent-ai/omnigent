@@ -4,7 +4,7 @@ import asyncio
 
 import httpx
 import respx
-from omnigent_slack.omnigent import ClientAuth, OmnigentClient, OmnigentClientPool
+from omnigent_bot_core.omnigent import ClientAuth, OmnigentClient, OmnigentClientPool
 
 _BASE = "http://omnigent.test"
 

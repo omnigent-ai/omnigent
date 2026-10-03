@@ -3,7 +3,7 @@ from __future__ import annotations
 import httpx
 import pytest
 import respx
-from omnigent_slack.oauth import (
+from omnigent_bot_core.oauth import (
     AuthMode,
     AuthorizationExpiredError,
     DeviceFlowClient,
@@ -140,7 +140,7 @@ async def test_device_poll_pending_then_success() -> None:
 
 @respx.mock
 async def test_device_poll_denied() -> None:
-    from omnigent_slack.oauth import AuthorizationDeniedError
+    from omnigent_bot_core.oauth import AuthorizationDeniedError
 
     respx.get(_ME).mock(return_value=httpx.Response(401, json={"login_url": "/login"}))
     respx.post(_BASE + "/oauth/device/authorize").mock(
@@ -193,7 +193,7 @@ async def test_oidc_poll_pending_then_session_jwt() -> None:
             httpx.Response(200, json={"token": "sess-jwt", "user_id": "a@x", "expires_in": 28800}),
         ]
     )
-    from omnigent_slack import oauth as _oauth
+    from omnigent_bot_core import oauth as _oauth
 
     client = httpx.AsyncClient(base_url=_BASE)
     try:
@@ -215,7 +215,7 @@ async def test_oidc_poll_malformed_200_raises_oauth_error() -> None:
     respx.get(_BASE + "/auth/cli-poll").mock(
         return_value=httpx.Response(200, json={"unexpected": "shape"})
     )
-    from omnigent_slack import oauth as _oauth
+    from omnigent_bot_core import oauth as _oauth
 
     client = httpx.AsyncClient(base_url=_BASE)
     try:
@@ -228,7 +228,7 @@ async def test_oidc_poll_malformed_200_raises_oauth_error() -> None:
 @respx.mock
 async def test_device_poll_malformed_200_raises_oauth_error() -> None:
     respx.post(_TOKEN).mock(return_value=httpx.Response(200, text="not json"))
-    from omnigent_slack import oauth as _oauth
+    from omnigent_bot_core import oauth as _oauth
 
     client = httpx.AsyncClient(base_url=_BASE)
     try:
@@ -241,7 +241,7 @@ async def test_device_poll_malformed_200_raises_oauth_error() -> None:
 @respx.mock
 async def test_oidc_poll_expired_ticket() -> None:
     respx.get(_BASE + "/auth/cli-poll").mock(return_value=httpx.Response(410, json={"error": "x"}))
-    from omnigent_slack import oauth as _oauth
+    from omnigent_bot_core import oauth as _oauth
 
     client = httpx.AsyncClient(base_url=_BASE)
     try:

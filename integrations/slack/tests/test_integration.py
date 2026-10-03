@@ -22,9 +22,9 @@ from pathlib import Path
 import respx
 from cryptography.fernet import Fernet
 from fakes import FakeOmnigentServer, RecordingSlackClient, sse_delta, sse_status
+from omnigent_bot_core.omnigent import OmnigentClientPool
 from omnigent_slack.auth_manager import AuthManager
 from omnigent_slack.models import UserConfig
-from omnigent_slack.omnigent import OmnigentClientPool
 from omnigent_slack.service import SlackOmnigentService
 from omnigent_slack.setup import SetupFlow
 from omnigent_slack.store import SQLiteStore
