@@ -97,6 +97,9 @@ class RunnerSession:
     :param in_flight: Per-req_id reassembly state. Each entry holds
         a head Future + body queue + end Event so the transport can
         await heads, iterate body chunks, and detect end.
+    :param close_code: First server-requested close code, recorded on
+        the WebSocket owner loop before stopping a helper task.
+    :param close_reason: Reason accompanying ``close_code``.
     """
 
     runner_id: str
@@ -112,6 +115,8 @@ class RunnerSession:
     # 8-char hex channel ids; values hold the inbound queue consumed
     # by whichever side terminated the attach.
     ws_channels: dict[str, WSChannelState] = field(default_factory=dict)
+    close_code: int | None = None
+    close_reason: str | None = None
 
 
 @dataclass
@@ -804,6 +809,9 @@ def _retire_session_writer(session: RunnerSession, *, code: int, reason: str) ->
 
     def _retire() -> None:
         """Run on the WebSocket owner loop."""
+        if session.close_code is None:
+            session.close_code = code
+            session.close_reason = reason
         session.outbound_queue.put_nowait(None)
         close = getattr(session.ws, "close", None)
         if close is not None:

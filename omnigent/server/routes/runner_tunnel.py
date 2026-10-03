@@ -629,14 +629,21 @@ def create_runner_tunnel_router(
                             ),
                         )
                     raise task_error
-                # Every finished helper ended cleanly: a server-side close (ping
-                # timeout, replaced generation) with no peer close yet, so no
-                # ``disconnected`` row follows. Record it.
+                # Server-initiated closes may end a helper without a peer reply.
+                # Emit the same event shape as the WebSocketDisconnect path.
                 _logger.info(
-                    "Runner %s tunnel closed (%s ended)",
+                    "Runner %s tunnel closed (%s ended; code=%s, reason=%r)",
                     runner_id,
                     ended_by,
-                    extra=debug_event("runner_tunnel", phase="closed", **_connection_attrs()),
+                    session.close_code,
+                    session.close_reason,
+                    extra=debug_event(
+                        "runner_tunnel",
+                        phase="disconnected",
+                        code=session.close_code,
+                        reason=session.close_reason,
+                        **_connection_attrs(),
+                    ),
                 )
             finally:
                 for task in (sender_task, ping_task, receive_task, keepalive_task):
@@ -955,7 +962,9 @@ async def _ping_loop(
                 ),
             )
             try:
-                await ws.close(code=4003, reason="ping timeout")
+                session.close_code = 4003
+                session.close_reason = "ping timeout"
+                await ws.close(code=session.close_code, reason=session.close_reason)
             except RuntimeError:
                 _logger.debug("Runner %s websocket already closed during ping timeout", runner_id)
             return
