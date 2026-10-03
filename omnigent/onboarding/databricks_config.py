@@ -6,6 +6,8 @@ import configparser
 import contextlib
 import importlib.util
 import logging
+import re
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlparse
@@ -146,11 +148,15 @@ def get_workspace_url_for_profile(profile: str) -> str | None:
     return None
 
 
-# ── OAuth callback port diagnostics ──────────────────────────────────────────
+# ── OAuth callback port preflight ────────────────────────────────────────────
 
-# Fixed U2M OAuth callback port. Both the Databricks CLI redirect URI and the
-# Arca/arcaterm laptop-side forwarder are pinned here, so a port fallback is not viable.
+# Default U2M OAuth callback port of ``databricks auth login``.
 _DATABRICKS_OAUTH_CALLBACK_PORT = 8020
+
+# Databricks CLI v0.265.0+ falls back through ports 8021-8040 when 8020 is taken.
+_DATABRICKS_CLI_PORT_FALLBACK_VERSION = (0, 265, 0)
+
+_CLI_VERSION_TIMEOUT_SECONDS = 10
 
 
 @dataclass(frozen=True)
@@ -161,30 +167,30 @@ class _OAuthPortHolder:
     name: str | None
 
 
-def _oauth_callback_port_holder() -> _OAuthPortHolder | None:
-    """Return info on what holds the Databricks OAuth callback port, or None.
+def _oauth_callback_port_busy() -> bool:
+    """Return whether the OAuth callback port is already bound on loopback.
 
     Binds with ``SO_REUSEADDR`` (mirrors Go's ``net.Listen``) so TIME_WAIT
-    sockets are not false-positives. Best-effort psutil lookup; returns
-    ``None`` when the port is free.
+    sockets are not false positives; only ``EADDRINUSE`` counts as busy.
     """
     import errno
     import socket as _socket
 
-    # SO_REUSEADDR avoids TIME_WAIT false-positives.
-    port_busy = False
     with _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM) as sock:
         sock.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
         try:
             sock.bind(("127.0.0.1", _DATABRICKS_OAUTH_CALLBACK_PORT))
         except OSError as exc:
-            if exc.errno == errno.EADDRINUSE:
-                port_busy = True
+            return exc.errno == errno.EADDRINUSE
+    return False
 
-    if not port_busy:
-        return None
 
-    # Port is busy; best-effort holder lookup (e.g. psutil.AccessDenied without root on macOS).
+def _oauth_callback_port_holder() -> _OAuthPortHolder:
+    """Best-effort lookup of the process listening on the OAuth callback port.
+
+    :returns: Holder info; both fields are ``None`` when it can't be
+        determined (e.g. ``psutil.AccessDenied`` without root on macOS).
+    """
     try:
         import psutil
 
@@ -198,22 +204,60 @@ def _oauth_callback_port_holder() -> _OAuthPortHolder | None:
                 return _OAuthPortHolder(pid=pid, name=proc_name)
     except Exception:
         pass
-
     return _OAuthPortHolder(pid=None, name=None)
 
 
-def _oauth_port_busy_message(holder: _OAuthPortHolder) -> str:
-    """Return a human-readable message for a busy OAuth callback port."""
+def _databricks_cli_version(databricks_bin: str) -> tuple[int, int, int] | None:
+    """Return the Databricks CLI version, or ``None`` when it can't be read.
+
+    :param databricks_bin: Path to the ``databricks`` binary.
+    :returns: ``(major, minor, patch)``; ``None`` on failure, unparseable
+        output, or a ``0.0.0`` dev build.
+    """
+    try:
+        result = subprocess.run(
+            [databricks_bin, "--version"],
+            capture_output=True,
+            text=True,
+            timeout=_CLI_VERSION_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    match = re.search(r"v?(\d+)\.(\d+)\.(\d+)", result.stdout or "")
+    if match is None:
+        return None
+    version = (int(match.group(1)), int(match.group(2)), int(match.group(3)))
+    return None if version == (0, 0, 0) else version
+
+
+def databricks_login_port_conflict(databricks_bin: str) -> str | None:
+    """Return a message when ``databricks auth login`` is known to fail on its port.
+
+    Older CLIs hardcode port 8020 for the OAuth callback and fail when it is
+    taken. Newer ones fall back to a free port, and an unknown version is
+    never treated as a conflict.
+
+    :param databricks_bin: Path to the ``databricks`` binary.
+    :returns: An actionable plain-text message, or ``None`` when login can proceed.
+    """
+    if not _oauth_callback_port_busy():
+        return None
+    version = _databricks_cli_version(databricks_bin)
+    if version is None or version >= _DATABRICKS_CLI_PORT_FALLBACK_VERSION:
+        return None
     port = _DATABRICKS_OAUTH_CALLBACK_PORT
-    pid, name = holder.pid, holder.name
-    if pid is not None:
-        who = f"pid {pid} ({name})" if name else f"pid {pid}"
-        free_hint = f"`kill {pid}`"
-    else:
-        who = "an unknown process"
-        free_hint = f"`lsof -nP -iTCP:{port} -sTCP:LISTEN`"
+    holder = _oauth_callback_port_holder()
+    who = ""
+    if holder.pid is not None:
+        who = f" by pid {holder.pid} ({holder.name})" if holder.name else f" by pid {holder.pid}"
     return (
-        f"The Databricks sign-in callback needs local port {port}, "
-        f"but it is already in use by {who}. "
-        f"Stop that process ({free_hint}) and retry."
+        f"Port {port}, which Databricks CLI v{'.'.join(map(str, version))} needs for the "
+        f"sign-in callback, is already in use{who}. "
+        "Upgrade the Databricks CLI to v0.265.0 or newer, which falls back to a free port "
+        "automatically (https://docs.databricks.com/dev-tools/cli/install.html), "
+        f"or free port {port} if nothing else needs it "
+        f"(`lsof -nP -iTCP:{port} -sTCP:LISTEN`)."
     )

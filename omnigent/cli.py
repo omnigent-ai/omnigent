@@ -12491,20 +12491,17 @@ def _run_databricks_browser_login(workspace_host: str, org_id: str | None = None
     split = urlsplit(workspace_host.rstrip("/"))
     host = split.hostname or split.netloc or split.path
     profile = host.split(".")[0]
+    from omnigent.onboarding.databricks_config import databricks_login_port_conflict
+
+    conflict = databricks_login_port_conflict(databricks_bin)
+    if conflict is not None:
+        raise click.ClickException(conflict)
     click.echo(f"Opening browser to log in to {login_host} (profile {profile}) ...")
     result = subprocess.run(
         [databricks_bin, "auth", "login", "--host", login_host, "--profile", profile],
         check=False,
     )
     if result.returncode != 0:
-        from omnigent.onboarding.databricks_config import (
-            _oauth_callback_port_holder,
-            _oauth_port_busy_message,
-        )
-
-        holder = _oauth_callback_port_holder()
-        if holder is not None:
-            raise click.ClickException(_oauth_port_busy_message(holder))
         raise click.ClickException(
             f"`databricks auth login --host {login_host} --profile {profile}` failed "
             f"(exit {result.returncode}). If the workspace is unreachable from "
