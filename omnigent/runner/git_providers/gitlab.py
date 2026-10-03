@@ -113,9 +113,12 @@ def _resolved(
     if reference is not None:
         client = _client(root, reference.host)
         return client, reference, _mr(client, reference)
-    branch, remotes = _branch(root), _remotes(root)
-    if not branch or not remotes:
-        return None
+    branch = _branch(root)
+    if not branch:
+        raise ValueError("Check out a branch or attach the intended merge request URL.")
+    remotes = _remotes(root)
+    if not remotes:
+        raise ValueError("Configure a GitLab remote or attach the intended merge request URL.")
     source = _source_remote(root, remotes)
     client = _client(root, source.host)
     project = client.object(f"projects/{quote(source.repository, safe='')}")

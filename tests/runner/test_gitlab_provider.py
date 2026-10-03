@@ -11,7 +11,6 @@ from unittest.mock import Mock
 import pytest
 
 from omnigent.git_providers import reset_for_tests
-from omnigent.runner.git_providers import PullRequestFacet
 from omnigent.runner.git_providers import gitlab as module
 from omnigent.runner.gitlab_client import GitLabClient, GitLabError
 from omnigent.runner.session_prs import PullRequestRef
@@ -157,8 +156,7 @@ def ref() -> PullRequestRef:
     return PullRequestRef.from_url(URL)
 
 
-def test_facet_contract_and_workspace_fork_mr(root: str, api: Mock) -> None:
-    assert isinstance(module.PULL_REQUESTS, PullRequestFacet)
+def test_workspace_fork_mr_keeps_target_identity_and_details(root: str, api: Mock) -> None:
     info = module.PULL_REQUESTS.workspace_info(root)
     assert info["provider"] == "gitlab" and info["auth"]["authenticated"]
     assert info["branch"] == "feature"
@@ -212,6 +210,87 @@ def test_no_current_mr_is_an_authenticated_empty_state(root: str, api: Mock) -> 
     api.pages.side_effect = None
     info = module.PULL_REQUESTS.workspace_info(root)
     assert info["auth"]["authenticated"] and info["pr"] is None and not info["warnings"]
+    api.object.assert_called_once_with("projects/fork%2Fsub%2Fproject")
+    assert [call.args[0] for call in api.pages.call_args_list] == [
+        "projects/fork%2Fsub%2Fproject/merge_requests",
+        "projects/team%2Fsub%2Fproject/merge_requests",
+    ]
+
+
+@pytest.fixture(params=["detached", "no_remotes", "foreign_remote"])
+def inference_error(root: str, request: pytest.FixtureRequest) -> str:
+    if request.param == "detached":
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                root,
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "core.hooksPath=/dev/null",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "Initial commit",
+            ],
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            ["git", "-C", root, "checkout", "--detach"], check=True, capture_output=True
+        )
+        return "Check out a branch"
+    args = (
+        ["remote", "remove", "origin"]
+        if request.param == "no_remotes"
+        else ["remote", "set-url", "origin", "https://github.com/example/project.git"]
+    )
+    subprocess.run(["git", "-C", root, *args], check=True)
+    return "Configure a GitLab remote"
+
+
+def test_failed_inference_preconditions_do_not_claim_authentication_or_call_api(
+    root: str, inference_error: str, api: Mock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client = Mock(side_effect=AssertionError("Inference must stop before opening a GitLab client"))
+    monkeypatch.setattr(module, "_client", client)
+    info = module.PULL_REQUESTS.workspace_info(root)
+    assert info["available"] and not info["auth"]["authenticated"] and info["pr"] is None
+    assert info["auth"]["hint"].startswith(inference_error)
+    assert info["warnings"] == [info["auth"]["hint"]]
+    for operation in (module.PULL_REQUESTS.changed_files, module.PULL_REQUESTS.pr_diff):
+        with pytest.raises(ValueError, match=inference_error):
+            operation(root, None)
+    with pytest.raises(ValueError, match=inference_error):
+        module.PULL_REQUESTS.file_diff(
+            root,
+            None,
+            "src/new.py",
+            base="main",
+            previous_path=None,
+            head_sha=None,
+            base_sha=None,
+        )
+    client.assert_not_called()
+    api.object.assert_not_called()
+    api.pages.assert_not_called()
+
+
+def test_explicit_reference_bypasses_unavailable_workspace_inference(
+    root: str, inference_error: str, api: Mock
+) -> None:
+    info = module.PULL_REQUESTS.reference_info(root, ref())
+    assert info["auth"]["authenticated"] and info["pr"]["url"] == URL and not info["warnings"]
+    api.object.assert_called_once_with("projects/team%2Fsub%2Fproject/merge_requests/7")
+    assert module.PULL_REQUESTS.changed_files(root, ref())["data"][0]["path"] == "src/new.py"
+    assert "@@" in module.PULL_REQUESTS.pr_diff(root, ref())["patch"]
+    assert file_diff(root)["after"] == "new\n"
+    assert not any(call.args[0].endswith("/merge_requests") for call in api.pages.call_args_list)
 
 
 def test_optional_failures_keep_mr_and_report_partial_data(root: str, api: Mock) -> None:
