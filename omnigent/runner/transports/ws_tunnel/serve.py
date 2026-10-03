@@ -1212,6 +1212,7 @@ async def _send_hello(
         pass
 
     from omnigent.inner.native_attachments import CAP_FILESYSTEM_ATTACHMENTS
+    from omnigent.inner.os_env import CAP_WORKSPACE_DELETE, SAFE_WORKSPACE_DELETE_SUPPORTED
 
     await send_text(
         encode_frame(
@@ -1220,6 +1221,7 @@ async def _send_hello(
                 frame_protocol_version=1,
                 capabilities=[
                     CAP_FILESYSTEM_ATTACHMENTS,
+                    *([CAP_WORKSPACE_DELETE] if SAFE_WORKSPACE_DELETE_SUPPORTED else []),
                     *([EVENT_INGEST_CAPABILITY] if event_dispatcher is not None else []),
                 ],
                 telemetry_opt_out=_tel_opt_out,

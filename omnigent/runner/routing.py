@@ -66,6 +66,7 @@ class RoutedRunner:
 
     runner_id: str
     client: httpx.AsyncClient
+    capabilities: tuple[str, ...] = ()
 
 
 def routing_host_id(
@@ -223,6 +224,7 @@ class RunnerRouter:
             return RoutedRunner(
                 runner_id=conv.runner_id,
                 client=self._client_for_runner(conv.runner_id),
+                capabilities=tuple(session.hello.capabilities),
             )
 
         raise OmnigentError(

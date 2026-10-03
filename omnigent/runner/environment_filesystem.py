@@ -28,6 +28,7 @@ from omnigent.entities.environment_filesystem import (
     FilesystemPathNotFound,
     InvalidPath,
     PathUnreachable,
+    ResourceError,
     TextEditRequest,
     WriteFileResult,
 )
@@ -36,6 +37,7 @@ from omnigent.inner._cwd_scan import _DEFAULT_DEPRIORITIZED_DIRS
 from omnigent.inner.async_utils import run_sync_on_thread
 from omnigent.inner.os_env import (
     _edit_impl,
+    _open_parent_beneath,
     _read_impl,
     _write_impl,
 )
@@ -59,6 +61,12 @@ _MAX_READ_BYTES = 10 * 1024 * 1024  # 10 MiB
 # the same answer, and sized to match the sandbox cwd scan budget.
 _SEARCH_SCAN_BUDGET = 50000
 _Params = ParamSpec("_Params")
+
+
+class WorkspaceRootChanged(ResourceError):
+    """The environment root changed after it was initialized."""
+
+    code = "workspace_root_changed"
 
 
 def _shell_quote(s: str) -> str:
@@ -201,7 +209,6 @@ def _lstat_beneath(root: Path, rel: str) -> os.stat_result | None:
     :returns: The leaf's own ``stat`` result, or ``None`` when any component
         is missing, is a symlink, or cannot be opened.
     """
-    parts = rel.split("/")
     if not _BENEATH_SUPPORTED:
         full = root / rel
         real_root = os.path.realpath(root)
@@ -213,19 +220,10 @@ def _lstat_beneath(root: Path, rel: str) -> os.stat_result | None:
         except OSError:
             return None
     try:
-        fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+        with _open_parent_beneath(root, rel) as (parent_descriptor, name):
+            return os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
     except OSError:
         return None
-    try:
-        for name in parts[:-1]:
-            nfd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY, dir_fd=fd)
-            os.close(fd)
-            fd = nfd
-        return os.stat(parts[-1], dir_fd=fd, follow_symlinks=False)
-    except OSError:
-        return None
-    finally:
-        os.close(fd)
 
 
 def search_indexed_paths(
@@ -1412,65 +1410,6 @@ print(json.dumps({'r': results, 't': truncated}))
             entry=entry,
         )
 
-    async def _stat_via_shell(self, validated: str) -> tuple[int, bool]:
-        """Stat a path via the sandboxed helper.
-
-        :param validated: Validated relative path.
-        :returns: Tuple of (size_bytes, is_directory).
-        :raises FilesystemPathNotFound: If the path does not exist.
-        """
-        import json as _json
-
-        # Embed the path as a Python literal via json.dumps and shell-quote
-        # the entire script so the caller-controlled path is never interpreted
-        # by the shell; see stat() for the full rationale.
-        _script = "\n".join(
-            [
-                "import os, json, stat as S",
-                f"p = {_json.dumps(validated)}",
-                "s = os.stat(p)",
-                "print(json.dumps({'s': s.st_size, 'd': S.S_ISDIR(s.st_mode)}))",
-            ]
-        )
-        result = await _run_os_env_async(
-            self._os_env.shell,
-            f"python3 -c {_shell_quote(_script)}",
-        )
-        if "error" in result or result.get("exit_code", 1) != 0:
-            raise FilesystemPathNotFound(f"Path {validated!r} not found")
-        try:
-            info = _json.loads(result.get("stdout", "{}"))
-        except _json.JSONDecodeError as exc:
-            raise FilesystemPathNotFound(
-                f"Path {validated!r} not found",
-            ) from exc
-        return info.get("s", 0), info.get("d", False)
-
-    async def _check_dir_empty(self, validated: str) -> bool:
-        """Check if a directory is empty via the sandboxed helper.
-
-        :param validated: Validated relative path.
-        :returns: ``True`` if the directory has children.
-        """
-        import json as _json
-
-        # Embed the path as a Python literal via json.dumps and shell-quote
-        # the entire script so the caller-controlled path is never interpreted
-        # by the shell; see stat() for the full rationale.
-        _script = "\n".join(
-            [
-                "import os",
-                f"p = {_json.dumps(validated)}",
-                "print(len(os.listdir(p)))",
-            ]
-        )
-        check = await _run_os_env_async(
-            self._os_env.shell,
-            f"python3 -c {_shell_quote(_script)}",
-        )
-        count = int(check.get("stdout", "0").strip() or "0")
-        return count > 0
-
     async def delete(
         self,
         path: str,
@@ -1485,28 +1424,38 @@ print(json.dumps({'r': results, 't': truncated}))
         :raises InvalidPath: If attempting to delete the root.
         :raises FilesystemPathNotFound: If the path does not exist.
         :raises DirectoryNotEmpty: If non-empty without recursive.
+        :raises WorkspaceRootChanged: If the initialized workspace root changed.
         """
         validated, _direct = self._write_route(path)
         if not validated:
             raise InvalidPath("Cannot delete the environment root")
 
-        size, is_dir = await self._stat_via_shell(validated)
-
-        if is_dir and not recursive and await self._check_dir_empty(validated):
-            raise DirectoryNotEmpty(
-                f"Directory {path!r} is not empty; use recursive=true to delete"
-            )
-
-        cmd = f"rm -rf {_shell_quote(validated)}" if is_dir else f"rm -f {_shell_quote(validated)}"
-        result = await _run_os_env_async(self._os_env.shell, cmd)
-        if "error" in result and result.get("exit_code", 0) != 0:
-            raise FilesystemPathNotFound(
-                result.get("error", f"Delete failed for {path!r}"),
-            )
+        try:
+            result = await _run_os_env_async(self._os_env.delete, validated, recursive=recursive)
+        except (TimeoutError, ConnectionError) as exc:
+            raise ResourceError(f"Delete completion was not confirmed for {path!r}") from exc
+        if "error" in result:
+            message = str(result["error"])
+            if result.get("code") == "not_found":
+                raise FilesystemPathNotFound(message)
+            if result.get("code") == "invalid_path":
+                raise InvalidPath(message)
+            if result.get("code") == "workspace_root_changed":
+                raise WorkspaceRootChanged(message)
+            if result.get("code") == "directory_not_empty":
+                raise DirectoryNotEmpty(message)
+            raise ResourceError(message)
+        if (
+            result.get("deleted") is not True
+            or result.get("exit_code") != 0
+            or result.get("type") not in ("file", "directory", "symlink", "other")
+            or "bytes_deleted" not in result
+        ):
+            raise ResourceError(f"Delete completion was not confirmed for {path!r}")
 
         return DeleteFilesystemResult(
             path=path,
             deleted=True,
-            type="directory" if is_dir else "file",
-            bytes_deleted=size if not is_dir else None,
+            type=result["type"],
+            bytes_deleted=result["bytes_deleted"],
         )

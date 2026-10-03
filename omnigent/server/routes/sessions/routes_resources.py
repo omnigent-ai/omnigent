@@ -953,10 +953,38 @@ def register_resources_routes(
             ) from exc
         return resp.status_code, resp.json()
 
+    async def _workspace_delete_target(
+        conversation: Conversation,
+    ) -> tuple[httpx.AsyncClient | None, dict[str, object]]:
+        """Resolve and inspect the same runner that would execute the delete."""
+        from omnigent.inner.os_env import CAP_WORKSPACE_DELETE, workspace_delete_metadata
+        from omnigent.runtime import get_runner_router
+
+        router = get_runner_router()
+        unavailable: dict[str, object] = {
+            "available": False,
+            "reason": "Connect an updated runner with safe workspace delete support",
+        }
+        if router is None:
+            client = await _get_runner_client_for_resource_access(
+                conversation.id, conversation=conversation
+            )
+            if client is None:
+                raise HTTPException(
+                    status_code=502, detail="no runner available for resource access"
+                )
+            return client, workspace_delete_metadata()
+        routed = router.client_for_session_resources(conversation.id, conversation=conversation)
+        if CAP_WORKSPACE_DELETE not in (getattr(routed, "capabilities", ()) or ()):
+            return None, unavailable
+        return routed.client, {"available": True}
+
     async def _proxy_delete_to_runner(
         session_id: str,
         path: str,
         conversation: Conversation,
+        *,
+        workspace_relative: bool = False,
     ) -> tuple[int, dict[str, Any]]:
         """Proxy a DELETE request to the runner and return status + JSON.
 
@@ -966,10 +994,16 @@ def register_resources_routes(
         :returns: Tuple of (status_code, parsed_json_body).
         :raises HTTPException: 502 on transport failure.
         """
-        runner_client = await _get_runner_client_for_resource_access(
-            session_id,
-            conversation=conversation,
-        )
+        if workspace_relative:
+            runner_client, availability = await _workspace_delete_target(conversation)
+            if availability["available"] is not True:
+                return 409, {
+                    "error": {"code": "runner_upgrade_required", "message": availability["reason"]}
+                }
+        else:
+            runner_client = await _get_runner_client_for_resource_access(
+                session_id, conversation=conversation
+            )
         if runner_client is None:
             raise HTTPException(
                 status_code=502,
@@ -1101,7 +1135,11 @@ def register_resources_routes(
         conv = await _validate_session(session_id, request, LEVEL_READ)
         path = f"/v1/sessions/{session_id}/resources/environments/{environment_id}"
         try:
-            return await _proxy_get_to_runner(session_id, path, conv)
+            content = await _proxy_get_to_runner(session_id, path, conv)
+            _, availability = await _workspace_delete_target(conv)
+            metadata = dict(content.get("metadata") or {})
+            metadata["workspace_delete"] = availability
+            return {**content, "metadata": metadata}
         except OmnigentError as exc:
             if exc.code != ErrorCode.RUNNER_UNAVAILABLE:
                 raise
@@ -1139,7 +1177,13 @@ def register_resources_routes(
 
         from omnigent.inner.sandbox import reach_payload
 
-        metadata: dict[str, Any] = {"root": conversation.workspace}
+        metadata: dict[str, Any] = {
+            "root": conversation.workspace,
+            "workspace_delete": {
+                "available": False,
+                "reason": "Connect an updated runner with safe workspace delete support",
+            },
+        }
         # Advertise the same reach the runner would. Without it the file
         # panel reads "nothing else reachable" and silently drops its
         # navigation affordance the moment the agent sleeps -- even though
@@ -2149,6 +2193,7 @@ def register_resources_routes(
         required_level: int = LEVEL_EDIT,
         environment_id: str = "default",
         publish_invalidation: bool = True,
+        workspace_relative: bool = True,
     ) -> Any:
         """Proxy a filesystem request to the runner.
 
@@ -2207,15 +2252,28 @@ def register_resources_routes(
                 conv,
             )
         elif method == "DELETE":
-            status, payload = await _proxy_delete_to_runner(
-                session_id,
-                path,
-                conv,
-            )
+            try:
+                status, payload = await _proxy_delete_to_runner(
+                    session_id,
+                    path,
+                    conv,
+                    workspace_relative=workspace_relative,
+                )
+            except ValueError as exc:
+                raise HTTPException(
+                    status_code=502, detail="Delete completion was not confirmed"
+                ) from exc
+            if not isinstance(payload, dict):
+                raise HTTPException(status_code=502, detail="Delete completion was not confirmed")
         else:
             raise HTTPException(status_code=405)
 
         if status >= 400:
+            if payload.get("error", {}).get("code") in (
+                "runner_upgrade_required",
+                "workspace_root_changed",
+            ):
+                return JSONResponse(status_code=status, content=payload)
             # Re-derive the typed session-lifecycle 410 (agent deleted or
             # rebound) with its client-safe message instead of forwarding
             # the runner's raw resolver text verbatim.
@@ -2225,6 +2283,14 @@ def register_resources_routes(
             if status == 404:
                 raise OmnigentError(message, code=ErrorCode.NOT_FOUND)
             raise HTTPException(status_code=status, detail=message)
+        if method == "DELETE" and (
+            "error" in payload
+            or payload.get("deleted") is not True
+            or payload.get("operation") != "delete"
+            or payload.get("type") not in ("file", "directory", "symlink", "other")
+            or "bytes_deleted" not in payload
+        ):
+            raise HTTPException(status_code=502, detail="Delete completion was not confirmed")
         if publish_invalidation:
             _publish_changed_files_invalidated(session_id, environment_id)
         return payload
@@ -2808,6 +2874,7 @@ def register_resources_routes(
             request=request,
             environment_id=environment_id,
             required_level=_browse_level(relative_path, within_workspace=LEVEL_EDIT),
+            workspace_relative=not relative_path.startswith("/"),
         )
 
     # ── Phase 5: environment shell proxy ─────────────────────────

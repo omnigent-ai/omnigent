@@ -2115,6 +2115,7 @@ def create_runner_app(
             PathUnreachable,
             UnsupportedMediaType,
         )
+        from omnigent.runner.environment_filesystem import WorkspaceRootChanged
 
         status = 500
         error: dict[str, object] = {"code": exc.code, "message": exc.message}
@@ -2128,7 +2129,7 @@ def create_runner_app(
             error["reachable_roots"] = exc.reachable_roots
         elif isinstance(exc, InvalidPath):
             status = 400
-        elif isinstance(exc, DirectoryNotEmpty):
+        elif isinstance(exc, (DirectoryNotEmpty, WorkspaceRootChanged)):
             status = 409
         elif isinstance(exc, FileTooLarge):
             status = 413
