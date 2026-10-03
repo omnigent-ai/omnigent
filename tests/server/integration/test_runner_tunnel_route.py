@@ -31,7 +31,7 @@ from omnigent.runner.transports.ws_tunnel.frames import (
     decode_frame,
     encode_frame,
 )
-from omnigent.runner.transports.ws_tunnel.registry import TunnelRegistry
+from omnigent.runner.transports.ws_tunnel.registry import RunnerSession, TunnelRegistry
 from omnigent.runner.transports.ws_tunnel.serve import dispatch_via_asgi
 from omnigent.runner.transports.ws_tunnel.transport import WSTunnelTransport
 from omnigent.server.auth import RESERVED_USER_LOCAL, AuthProvider
@@ -381,10 +381,16 @@ def _tunnel_end_events(caplog: pytest.LogCaptureFixture) -> list[dict[str, objec
     ]
 
 
-@pytest.mark.parametrize("from_thread", [False, True], ids=["route-loop", "other-thread"])
+@pytest.mark.parametrize(
+    ("from_thread", "delay_retirement"),
+    [(False, False), (True, False), (True, True)],
+    ids=["route-loop", "other-thread", "delayed-other-thread"],
+)
 async def test_server_retirement_logs_one_structured_disconnect(
+    monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
     from_thread: bool,
+    delay_retirement: bool,
 ) -> None:
     """Retiring a runner records the close even without a peer close reply."""
     caplog.set_level(logging.INFO, logger="omnigent.server.routes.runner_tunnel")
@@ -392,10 +398,30 @@ async def test_server_retirement_logs_one_structured_disconnect(
     communicator = await _connect_route(route_app.app, _TUNNEL_PATH)
     try:
         await _send_hello(communicator, route_app.registry, connection_id="conn-retired")
+        callbacks: list[Callable[[], None]] = []
+        if delay_retirement:
+
+            def defer_retirement(_session: RunnerSession, callback: Callable[[], None]) -> None:
+                callbacks.append(callback)
+
+            monkeypatch.setattr(
+                "omnigent.runner.transports.ws_tunnel.registry._call_session_soon_threadsafe",
+                defer_retirement,
+            )
         if from_thread:
             await asyncio.to_thread(route_app.registry.deregister, _RUNNER_ID)
         else:
             route_app.registry.deregister(_RUNNER_ID)
+
+        if delay_retirement:
+            # Let the receive helper observe the stale generation before the
+            # owner-loop retirement callback can stop the sender.
+            await communicator.send_input(
+                {"type": "websocket.receive", "text": encode_frame(PingFrame(ts=0))}
+            )
+            await asyncio.wait_for(communicator.future, timeout=budget(1.0))
+            assert len(callbacks) == 1
+            callbacks[0]()
 
         close = await communicator.receive_output(timeout=budget(1.0))
         assert close == {
@@ -415,7 +441,7 @@ async def test_server_retirement_logs_one_structured_disconnect(
     assert ends[0]["connection_id"] == "conn-retired"
     assert ends[0]["code"] == close["code"]
     assert ends[0]["reason"] == close["reason"]
-    assert ends[0]["ended_by"] == "tunnel-sender"
+    assert ends[0]["ended_by"] == ("tunnel-receive" if delay_retirement else "tunnel-sender")
     assert route_app.registry.get(_RUNNER_ID) is None
 
 
@@ -1807,9 +1833,11 @@ async def test_ping_loop_restamps_runner_liveness(
         session_live_state.configure(None)
 
 
+@pytest.mark.parametrize("retire_during_timeout", [False, True], ids=["timeout", "retire-race"])
 async def test_ping_timeout_closes_tunnel_and_names_the_connection(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
+    retire_during_timeout: bool,
 ) -> None:
     """A silent runner is closed by the server and both rows name the socket.
 
@@ -1821,6 +1849,7 @@ async def test_ping_timeout_closes_tunnel_and_names_the_connection(
 
     :param monkeypatch: Pytest monkeypatch fixture.
     :param caplog: Pytest log capture fixture.
+    :param retire_during_timeout: Retire after the ping loop observes a timeout.
     :returns: None.
     """
     import omnigent.server.routes.runner_tunnel as tunnel_mod
@@ -1829,6 +1858,28 @@ async def test_ping_timeout_closes_tunnel_and_names_the_connection(
     monkeypatch.setattr(tunnel_mod, "PING_MISS_THRESHOLD", 1)
     caplog.set_level(logging.INFO, logger="omnigent.server.routes.runner_tunnel")
     route_app = _tunnel_route_app()
+    if retire_during_timeout:
+        seconds_since_last_frame = route_app.registry.seconds_since_last_frame
+
+        def retire_after_timeout_check(session: RunnerSession) -> float | None:
+            elapsed = seconds_since_last_frame(session)
+            if elapsed is not None and elapsed > (
+                tunnel_mod.PING_INTERVAL_S * tunnel_mod.PING_MISS_THRESHOLD
+            ):
+                # Retire between the liveness check and the timeout close,
+                # while the owner loop cannot run the retirement callback.
+                thread = threading.Thread(
+                    target=route_app.registry.deregister,
+                    args=(_RUNNER_ID, session),
+                )
+                thread.start()
+                thread.join(timeout=budget(1.0))
+                assert not thread.is_alive(), "concurrent retirement did not finish"
+            return elapsed
+
+        monkeypatch.setattr(
+            route_app.registry, "seconds_since_last_frame", retire_after_timeout_check
+        )
     communicator = await _connect_route(route_app.app, _TUNNEL_PATH)
     try:
         await _send_hello(communicator, route_app.registry, connection_id="conn-silent-1")
@@ -1862,8 +1913,10 @@ async def test_ping_timeout_closes_tunnel_and_names_the_connection(
     assert ends[0]["connection_id"] == "conn-silent-1"
     assert "tunnel-ping" in ends[0]["ended_by"].split(",")
     assert ends[0]["connection_age_s"] >= 0
-    assert ends[0]["code"] == 4003
-    assert ends[0]["reason"] == "ping timeout"
+    assert ends[0]["code"] == (1001 if retire_during_timeout else 4003)
+    assert ends[0]["reason"] == (
+        "tunnel retired by server; reconnect" if retire_during_timeout else "ping timeout"
+    )
 
 
 async def test_keepalive_loop_fires_faster_than_the_ping_interval(
