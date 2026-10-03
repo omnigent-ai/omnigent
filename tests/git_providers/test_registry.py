@@ -211,7 +211,10 @@ def test_installed_distribution_contributes_a_provider(
     assert parsed is not None and parsed.provider == "example"
 
 
-def test_plugin_labels_are_optional() -> None:
+@pytest.mark.parametrize("label", [None, object(), 7])
+def test_plugin_labels_are_optional(monkeypatch: pytest.MonkeyPatch, label: object) -> None:
+    monkeypatch.setattr(FakeProvider, "request_name", label, raising=False)
+    monkeypatch.setattr(FakeProvider, "number_prefix", label, raising=False)
     _add_provider(FakeProvider("forge"))
     assert provider_display("forge") == {
         "id": "forge",

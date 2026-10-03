@@ -12,6 +12,7 @@ from typing import IO, Any
 
 import pytest
 
+import omnigent.git_providers as registry
 import omnigent.git_providers.github as github_module
 from omnigent.git_providers import (
     EnvInstances,
@@ -44,6 +45,7 @@ def gh_config_dir(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Iterator[P
     config_dir = tmp_path / "gh"
     config_dir.mkdir()
     monkeypatch.setenv("GH_CONFIG_DIR", str(config_dir))
+    monkeypatch.setattr(registry.importlib.metadata, "entry_points", lambda **_: ())
     reset_for_tests()
     yield config_dir
     reset_for_tests()
@@ -251,6 +253,7 @@ def test_hosts_file_falls_back_to_the_xdg_and_home_config_dirs(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, location: str
 ) -> None:
     monkeypatch.delenv("GH_CONFIG_DIR")
+    monkeypatch.delenv("APPDATA", raising=False)
     if location == "xdg":
         monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
         config_dir = tmp_path / "xdg" / "gh"

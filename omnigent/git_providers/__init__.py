@@ -222,11 +222,13 @@ def provider_display(provider_id: str) -> dict[str, str] | None:
     descriptor = provider(provider_id)
     if descriptor is None:
         return None
+    request_name = getattr(descriptor, "request_name", None)
+    number_prefix = getattr(descriptor, "number_prefix", None)
     return {
         "id": descriptor.id,
         "display_name": descriptor.display_name,
-        "request_name": getattr(descriptor, "request_name", "pull request"),
-        "number_prefix": getattr(descriptor, "number_prefix", "#"),
+        "request_name": request_name if isinstance(request_name, str) else "pull request",
+        "number_prefix": number_prefix if isinstance(number_prefix, str) else "#",
     }
 
 
