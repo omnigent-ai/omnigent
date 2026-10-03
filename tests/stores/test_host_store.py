@@ -955,6 +955,36 @@ def test_stale_completion_removes_host_deleted_after_detach(db_uri: str) -> None
         assert session.get(SqlHost, (0, host_id)) is None
 
 
+def test_replace_managed_host_sandbox_is_offline_until_new_host_connects(db_uri: str) -> None:
+    """A dead generation's ``online`` row must not read as the new host being live."""
+    store = HostStore(db_uri)
+    store.register_managed_host(
+        host_id="5d0c7f6f0e8a4f1c9a3b2e1d4c5b6a79",
+        name="managed-m4",
+        user_id="alice@example.com",
+        token="generation-1-token",
+        provider="modal",
+        sandbox_id="sb-gen1",
+        token_expires_at=now_epoch() + 3600,
+    )
+    store.upsert_on_connect(
+        host_id="5d0c7f6f0e8a4f1c9a3b2e1d4c5b6a79", name="managed-m4", user_id="alice@example.com"
+    )
+    assert store.is_online("5d0c7f6f0e8a4f1c9a3b2e1d4c5b6a79")
+
+    replaced = store.replace_managed_host_sandbox(
+        host_id="5d0c7f6f0e8a4f1c9a3b2e1d4c5b6a79",
+        user_id="alice@example.com",
+        token="generation-2-token",
+        provider="modal",
+        sandbox_id="sb-gen2",
+        token_expires_at=now_epoch() + 3600,
+    )
+
+    assert replaced is not None and replaced.status == "offline"
+    assert not store.is_online("5d0c7f6f0e8a4f1c9a3b2e1d4c5b6a79")
+
+
 def test_replace_managed_host_sandbox_cannot_recreate_missing_host(db_uri: str) -> None:
     store = HostStore(db_uri)
 
