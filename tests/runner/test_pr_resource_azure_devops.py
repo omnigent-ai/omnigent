@@ -21,6 +21,7 @@ import pytest
 from omnigent.git_providers import reset_for_tests
 from omnigent.runner import azure_devops_client, github_resource, pr_resource
 from omnigent.runner.azure_devops_client import AzureToken
+from omnigent.runner.git_providers import ProviderCapabilities
 from omnigent.runner.git_providers import azure_devops as azure_devops_facet
 from omnigent.runner.git_providers.azure_devops import AzureDevOpsPullRequests
 from omnigent.runner.pr_observer import observe_tool_completion
@@ -284,14 +285,14 @@ def test_a_tracked_pr_is_read_by_id_instead_of_by_branch(
     assert PULLS not in paths(ado_transport)
 
 
-def test_a_tracked_azure_devops_pr_is_served_by_azure_devops_in_a_github_workspace(
+def test_a_selected_azure_devops_pr_is_served_by_azure_devops_in_a_github_workspace(
     workspace: Path, ado_transport: RecordingTransport
 ) -> None:
     git(workspace, "remote", "set-url", "origin", "https://github.com/acme/tools.git")
     serve(ado_transport, pull_request())
     track(PR_URL)
 
-    info = pr_resource.pr_info(str(workspace), session_id=SESSION)
+    info = pr_resource.pr_info(str(workspace), session_id=SESSION, pr_url=PR_URL)
 
     assert (info["provider"], info["selected_pr_url"]) == ("azure_devops", PR_URL)
     assert info["repo"] == {"name_with_owner": "contoso/web/app"}
@@ -418,3 +419,79 @@ def test_a_pr_the_observer_recorded_is_read_from_its_own_repository(
     )
     assert info["repo"] == {"name_with_owner": "contoso/my web/my app"}
     assert paths(ado_transport)[0] == pull
+
+
+@pytest.mark.parametrize("origin_provider", ["github", "gitlab", "azure_devops"])
+@pytest.mark.parametrize("failed_provider", [None, "github", "gitlab", "azure_devops"])
+def test_all_remote_providers_are_discovered_without_configuration(
+    workspace: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    origin_provider: str,
+    failed_provider: str | None,
+) -> None:
+    remotes = {
+        "github": "https://github.com/acme/app.git",
+        "gitlab": "https://gitlab.com/acme/nested/app.git",
+        "azure_devops": ORIGIN,
+    }
+    urls = {
+        "github": "https://github.com/acme/app/pull/11",
+        "gitlab": "https://gitlab.com/acme/nested/app/-/merge_requests/22",
+        "azure_devops": PR_URL,
+    }
+    for name in ("OMNIGENT_GIT_PROVIDER_GITLAB_HOSTS", "GITLAB_HOST", "GLAB_HOST"):
+        monkeypatch.delenv(name, raising=False)
+    git(workspace, "remote", "set-url", "origin", remotes[origin_provider])
+    for provider_id, remote in remotes.items():
+        if provider_id != origin_provider:
+            git(workspace, "remote", "add", provider_id, remote)
+    visited: list[str] = []
+
+    class Facet:
+        capabilities = ProviderCapabilities(**NO_CAPABILITIES)
+
+        def __init__(self, provider_id: str) -> None:
+            self.provider_id = provider_id
+
+        def workspace_info(self, root: str) -> dict[str, Any]:
+            assert root == str(workspace)
+            visited.append(self.provider_id)
+            if self.provider_id == failed_provider:
+                raise ValueError("The forge is unavailable")
+            reference = PullRequestRef.from_url(urls[self.provider_id])
+            return {
+                "provider": self.provider_id,
+                "available": True,
+                "branch": "feat",
+                "repo": {"name_with_owner": reference.repository},
+                "pr": {
+                    "number": reference.number,
+                    "url": reference.url,
+                    "title": f"Change on {self.provider_id}",
+                },
+            }
+
+        def on_inferred_pr(self, root: str, reference: PullRequestRef) -> None:
+            pass
+
+        def titles_available(self, root: str) -> bool:
+            return False
+
+    facets = {provider_id: Facet(provider_id) for provider_id in remotes}
+    monkeypatch.setattr(pr_resource, "_facet", facets.get)
+
+    info = pr_resource.pr_info(str(workspace), session_id=SESSION)
+
+    expected = {
+        provider_id: url for provider_id, url in urls.items() if provider_id != failed_provider
+    }
+    assert set(visited) == set(remotes)
+    assert {entry.provider: entry.url for entry in SessionPrRegistry(SESSION).list()} == expected
+    assert {entry["provider"]: entry["url"] for entry in info["prs"]} == expected
+    assert all(entry.relationship == "inferred" for entry in SessionPrRegistry(SESSION).list())
+    if origin_provider != failed_provider:
+        assert info["selected_pr_url"] == urls[origin_provider]
+    else:
+        assert info["selected_pr_url"] in expected.values()
+    if failed_provider is not None:
+        assert any(failed_provider in warning for warning in info["warnings"])
