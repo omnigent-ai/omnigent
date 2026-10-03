@@ -11209,6 +11209,25 @@
             }
           },
           {
+            "description": "Filter by persisted host binding, including offline hosts.",
+            "in": "query",
+            "name": "host_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "format": "uuid",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Filter by persisted host binding, including offline hosts.",
+              "title": "Host Id"
+            }
+          },
+          {
             "description": "Sort direction, `\"desc\"` (newest-first) or `\"asc\"` (oldest-first).",
             "in": "query",
             "name": "order",

@@ -2727,6 +2727,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         pinned: bool = False,
         pinned_owner: str | None = None,
         title: str | None = None,
+        host_id: str | None = None,
     ) -> PagedList[Conversation]:
         """
         List conversations with cursor-based pagination.
@@ -2752,6 +2753,8 @@ class SqlAlchemyConversationStore(ConversationStore):
             agent row with this name. Unlike ``agent_id``, this
             intentionally matches session-scoped agents that share
             a user-authored name. ``None`` disables the filter.
+        :param host_id: Filter by persisted host binding, including offline
+            hosts. Accepts bare or hyphenated UUIDs; ``None`` disables filtering.
         :param has_agent_id: When ``True``, only return
             conversations whose ``agent_id`` column is not
             ``None``. Powers ``GET /v1/sessions`` — sessions
@@ -2983,6 +2986,27 @@ class SqlAlchemyConversationStore(ConversationStore):
                 # Conversations without an agent binding (legacy rows) correctly
                 # return no results: their agent_id column is NULL.
                 stmt = stmt.where(SqlConversation.agent_id == agent_id)
+            if host_id is not None:
+                host_sessions = select(SqlConversationMetadata.id).where(
+                    SqlConversationMetadata.workspace_id == current_workspace_id(),
+                    SqlConversationMetadata.host_id == host_id,
+                )
+                if self._conv_engine is self._engine:
+                    stmt = stmt.where(
+                        host_sessions.where(
+                            SqlConversationMetadata.id == SqlConversation.id,
+                        ).exists()
+                    )
+                else:
+                    # Metadata and conversations may live in different databases.
+                    # Keep host filtering before cursors and LIMIT in either layout.
+                    if qualifying_ids is not None:
+                        host_sessions = host_sessions.where(
+                            SqlConversationMetadata.id.in_(qualifying_ids)
+                        )
+                    with self._session("list_conversations") as meta_sess:
+                        host_session_ids = list(meta_sess.execute(host_sessions).scalars())
+                    stmt = stmt.where(SqlConversation.id.in_(host_session_ids))
             if title is not None:
                 stmt = stmt.where(SqlConversation.title == title)
             if search_query:

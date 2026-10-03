@@ -400,6 +400,50 @@ def test_sdk_session_list_preserves_host_id(cross_host_env: _CrossHostEnv) -> No
         )
 
 
+def test_session_list_filters_by_host(cross_host_env: _CrossHostEnv) -> None:
+    """``GET /v1/sessions?host_id=`` returns only that host's sessions.
+
+    Exercised over raw HTTP (bare and hyphenated UUIDs) and through the
+    Python SDK against two real registered hosts.
+    """
+    import asyncio
+
+    from omnigent_client import OmnigentClient
+
+    env = cross_host_env
+    url = env.server_url
+
+    def _rows(host_id: str) -> list[dict]:
+        with _client() as c:
+            resp = c.get(
+                f"{url}/v1/sessions",
+                params={"visibility": "all", "limit": 50, "host_id": host_id},
+            )
+        resp.raise_for_status()
+        return resp.json()["data"]
+
+    for own, own_host, other in (
+        (env.session_a, env.host_a_id, env.session_b),
+        (env.session_b, env.host_b_id, env.session_a),
+    ):
+        for host_param in (own_host, str(uuid.UUID(own_host))):
+            rows = _rows(host_param)
+            ids = {row["id"] for row in rows}
+            assert own in ids, f"host filter {host_param!r} dropped its own session {own}"
+            assert other not in ids, f"host filter {host_param!r} leaked session {other}"
+            assert {row["host_id"] for row in rows} == {own_host}
+
+    assert _rows(uuid.uuid4().hex) == []
+
+    async def _sdk_list() -> list:
+        async with OmnigentClient(base_url=url) as client:
+            return await client.sessions.list(visibility="all", limit=50, host_id=env.host_a_id)
+
+    sdk_ids = {row.id for row in asyncio.run(_sdk_list())}
+    assert env.session_a in sdk_ids
+    assert env.session_b not in sdk_ids
+
+
 def test_bare_resume_picker_excludes_other_hosts_sessions(
     cross_host_env: _CrossHostEnv,
 ) -> None:
