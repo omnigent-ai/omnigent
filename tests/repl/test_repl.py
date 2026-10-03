@@ -3306,3 +3306,292 @@ def test_describe_active_credential_declines_own_auth_acp_harnesses() -> None:
     # resolver: qwen consumes the openai family at spawn.
     qwen_cred = describe_active_credential(config, "qwen")
     assert qwen_cred is not None and qwen_cred.provider_name == "openai"
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Stream-gap reconciliation: /stream does not replay, so events a
+# proxy idle-cut drops must be recovered from REST on reconnect.
+# ─────────────────────────────────────────────────────────────────────
+
+
+def _gap_status(session_id: str, status: str) -> object:
+    from omnigent.server.schemas import SessionStatusEvent
+
+    return SessionStatusEvent(type="session.status", conversation_id=session_id, status=status)
+
+
+def _gap_item(item: dict[str, object]) -> object:
+    from omnigent.server.schemas import OutputItemDoneEvent
+
+    return OutputItemDoneEvent(type="response.output_item.done", item=item)
+
+
+def _gap_heartbeat() -> object:
+    from omnigent.server.schemas import SessionHeartbeatEvent
+
+    return SessionHeartbeatEvent(type="session.heartbeat")
+
+
+def _describe_gap_event(event: object) -> tuple[str, ...]:
+    from omnigent.server.schemas import (
+        OutputItemDoneEvent,
+        SessionHeartbeatEvent,
+        SessionStatusEvent,
+    )
+
+    if isinstance(event, SessionHeartbeatEvent):
+        return ("heartbeat",)
+    if isinstance(event, SessionStatusEvent):
+        return ("status", event.status)
+    assert isinstance(event, OutputItemDoneEvent)
+    return ("item", str(event.item["id"]))
+
+
+def _gap_adapter(
+    *, stream: object, list_items: object, get: object, rendered: list[object]
+) -> object:
+    """Bare adapter wired to fake ``sessions`` calls, as ``run_repl`` leaves it.
+
+    The bookkeeping starts out stale on purpose: a pump for a new session
+    must not reconcile from a previous session's cursor.
+    """
+    import asyncio
+    import types
+
+    from omnigent.repl._repl import _SessionsChatReplAdapter
+
+    adapter = object.__new__(_SessionsChatReplAdapter)
+    adapter._session_id = "conv_gap"
+    adapter._client = types.SimpleNamespace(
+        sessions=types.SimpleNamespace(stream=stream, list_items=list_items, get=get)
+    )
+    adapter._on_event = rendered.append
+    adapter._runner_recover = None
+    adapter._turn_done = asyncio.Event()
+    adapter._last_streamed_item_id = "item_from_previous_session"
+    adapter._last_streamed_status = "idle"
+    adapter._replayed_item_ids = {"item_from_previous_session"}
+    adapter._replayed_status = None
+    return adapter
+
+
+async def _run_gap_pump(adapter: object, settled: object) -> None:
+    import asyncio
+    import contextlib
+
+    pump = asyncio.create_task(adapter._stream_pump())  # type: ignore[attr-defined]
+    try:
+        await asyncio.wait_for(settled.wait(), timeout=10)  # type: ignore[attr-defined]
+        await asyncio.sleep(0)
+    finally:
+        pump.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await pump
+
+
+_GAP_M1 = {"id": "m1", "type": "message", "role": "assistant", "content": "hi"}
+_GAP_FINAL = {"id": "m2", "type": "message", "role": "assistant", "content": "done"}
+
+
+@pytest.mark.asyncio
+async def test_stream_pump_reconciles_output_and_status_missed_during_reconnect() -> None:
+    """A turn that ends while /stream is reconnecting still renders and ends.
+
+    Failure meaning: the REPL shows "streaming…" forever and never prints the
+    final answer when the server-side turn finished during a reconnect gap.
+    """
+    import asyncio
+    import types
+
+    import httpx
+
+    subscriptions = 0
+    rendered: list[object] = []
+    list_calls: list[dict[str, object]] = []
+    settled = asyncio.Event()
+
+    async def _stream(session_id: str):
+        nonlocal subscriptions
+        subscriptions += 1
+        yield _gap_heartbeat()
+        if subscriptions == 1:
+            yield _gap_status(session_id, "running")
+            yield _gap_item(_GAP_M1)
+            raise httpx.RemoteProtocolError("idle cut")
+        # Live copies of what reconciliation already delivered, then a new turn.
+        yield _gap_item(_GAP_FINAL)
+        yield _gap_status(session_id, "idle")
+        yield _gap_status(session_id, "running")
+        settled.set()
+        await asyncio.Event().wait()
+
+    async def _list_items(session_id: str, **kwargs: object):
+        list_calls.append(kwargs)
+        user = {"id": "u2", "type": "message", "role": "user", "content": "next"}
+        return [user, _GAP_FINAL]
+
+    async def _get(session_id: str):
+        return types.SimpleNamespace(status="idle")
+
+    adapter = _gap_adapter(stream=_stream, list_items=_list_items, get=_get, rendered=rendered)
+    await _run_gap_pump(adapter, settled)
+
+    assert [_describe_gap_event(e) for e in rendered] == [
+        ("heartbeat",),
+        ("status", "running"),
+        ("item", "m1"),
+        ("item", "m2"),
+        ("status", "idle"),
+        ("heartbeat",),
+        ("status", "running"),
+    ], "missed output renders once, user echo and live duplicates are skipped"
+    assert adapter._turn_done.is_set()  # type: ignore[attr-defined]
+    assert list_calls == [{"limit": 100, "after": "m1", "order": "asc"}]
+
+
+@pytest.mark.asyncio
+async def test_stream_pump_reconciles_a_turn_that_ends_while_resubscribing() -> None:
+    """REST is read only once the new live tail is registered.
+
+    Here the turn completes after the pump decides to resubscribe but before
+    the server sends the new stream's first event, so its idle status was
+    published to nobody. Reading REST before subscribing would still see the
+    turn running and lose it for good.
+    """
+    import asyncio
+    import types
+
+    import httpx
+
+    server: dict[str, object] = {"status": "running", "items": []}
+    subscriptions = 0
+    rendered: list[object] = []
+    settled = asyncio.Event()
+
+    async def _stream(session_id: str):
+        nonlocal subscriptions
+        subscriptions += 1
+        if subscriptions == 1:
+            yield _gap_heartbeat()
+            yield _gap_status(session_id, "running")
+            yield _gap_item(_GAP_M1)
+            raise httpx.RemoteProtocolError("idle cut")
+        server["status"] = "idle"
+        server["items"] = [_GAP_FINAL]
+        yield _gap_heartbeat()
+        settled.set()
+        await asyncio.Event().wait()
+
+    async def _list_items(session_id: str, **kwargs: object):
+        return list(server["items"])  # type: ignore[call-overload]
+
+    async def _get(session_id: str):
+        return types.SimpleNamespace(status=server["status"])
+
+    adapter = _gap_adapter(stream=_stream, list_items=_list_items, get=_get, rendered=rendered)
+    await _run_gap_pump(adapter, settled)
+
+    assert [_describe_gap_event(e) for e in rendered] == [
+        ("heartbeat",),
+        ("status", "running"),
+        ("item", "m1"),
+        ("item", "m2"),
+        ("status", "idle"),
+        ("heartbeat",),
+    ]
+    assert adapter._turn_done.is_set()  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_stream_gap_reconciliation_pages_through_a_long_gap() -> None:
+    """A gap holding more items than one page replays every item, in order."""
+    import asyncio
+    import types
+
+    import httpx
+
+    page_one = [
+        {"id": f"i{n:03d}", "type": "function_call_output", "call_id": f"c{n}", "output": "ok"}
+        for n in range(100)
+    ]
+    pages = {"m1": page_one, "i099": [_GAP_FINAL]}
+    cursors: list[object] = []
+    subscriptions = 0
+    rendered: list[object] = []
+    settled = asyncio.Event()
+
+    async def _stream(session_id: str):
+        nonlocal subscriptions
+        subscriptions += 1
+        yield _gap_heartbeat()
+        if subscriptions == 1:
+            yield _gap_status(session_id, "running")
+            yield _gap_item(_GAP_M1)
+            raise httpx.RemoteProtocolError("idle cut")
+        settled.set()
+        await asyncio.Event().wait()
+
+    async def _list_items(session_id: str, **kwargs: object):
+        cursors.append(kwargs["after"])
+        return pages[kwargs["after"]]  # type: ignore[index]
+
+    async def _get(session_id: str):
+        return types.SimpleNamespace(status="idle")
+
+    adapter = _gap_adapter(stream=_stream, list_items=_list_items, get=_get, rendered=rendered)
+    await _run_gap_pump(adapter, settled)
+
+    assert [_describe_gap_event(e) for e in rendered] == [
+        ("heartbeat",),
+        ("status", "running"),
+        ("item", "m1"),
+        *(("item", str(item["id"])) for item in page_one),
+        ("item", "m2"),
+        ("status", "idle"),
+        ("heartbeat",),
+    ]
+    assert cursors == ["m1", "i099"]
+
+
+@pytest.mark.asyncio
+async def test_stream_gap_reconciliation_survives_a_stale_cursor() -> None:
+    """A deleted cursor item still lets the status reconcile end the turn."""
+    import asyncio
+    import types
+
+    import httpx
+    from omnigent_client import StaleCursorError
+
+    subscriptions = 0
+    rendered: list[object] = []
+    settled = asyncio.Event()
+
+    async def _stream(session_id: str):
+        nonlocal subscriptions
+        subscriptions += 1
+        yield _gap_heartbeat()
+        if subscriptions == 1:
+            yield _gap_status(session_id, "running")
+            yield _gap_item(_GAP_M1)
+            raise httpx.RemoteProtocolError("idle cut")
+        settled.set()
+        await asyncio.Event().wait()
+
+    async def _list_items(session_id: str, **kwargs: object):
+        raise StaleCursorError(f"cursor {kwargs['after']!r} no longer exists", 400, "stale_cursor")
+
+    async def _get(session_id: str):
+        return types.SimpleNamespace(status="idle")
+
+    adapter = _gap_adapter(stream=_stream, list_items=_list_items, get=_get, rendered=rendered)
+    await _run_gap_pump(adapter, settled)
+
+    assert [_describe_gap_event(e) for e in rendered] == [
+        ("heartbeat",),
+        ("status", "running"),
+        ("item", "m1"),
+        ("status", "idle"),
+        ("heartbeat",),
+    ]
+    assert adapter._turn_done.is_set()  # type: ignore[attr-defined]
+    assert adapter._last_streamed_item_id is None  # type: ignore[attr-defined]
