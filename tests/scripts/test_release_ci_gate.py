@@ -29,8 +29,8 @@ def _run_gate(
     workflow = yaml.safe_load(_WORKFLOW.read_text())
     script = next(
         step["run"]
-        for step in workflow["jobs"]["plan"]["steps"]
-        if step["name"] == "Assert green CI on the base commit"
+        for step in workflow["jobs"]["release-plan"]["steps"]
+        if step["name"] == "Assert green CI on the approved branch head"
     )
     fixtures = {
         "checks": checks,

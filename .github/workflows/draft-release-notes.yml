@@ -1,5 +1,8 @@
 name: Draft release notes
 
+# Release preparation calls this before tagging: draft notes only, no CHANGELOG
+# PR. The tag-triggered run refreshes notes and opens the PR after approval.
+
 # At release CUT (a vX.Y.Z tag is pushed → the "GitHub Release" workflow creates
 # the draft), prepare everything the release coordinator needs before they hit
 # Publish:
@@ -20,9 +23,23 @@ name: Draft release notes
 #
 # The LLM machinery (creds gate, Claude Code CLI, provider config, secret-scan,
 # token-minted-after-agent, artifact redaction) mirrors doc-sync.yml. The agent
-# only ever sees already-merged, released history.
+# only ever sees already-merged history.
 
 on:
+  workflow_call:
+    inputs:
+      tag:
+        description: Final release tag to prepare, e.g. v0.3.0
+        required: true
+        type: string
+      source_ref:
+        description: Immutable release-branch commit to harvest before tagging
+        required: true
+        type: string
+      preparation:
+        description: Create draft notes only, without tagging or a CHANGELOG PR
+        type: boolean
+        default: false
   workflow_run:
     workflows: ["GitHub Release"]
     types: [completed]
@@ -67,7 +84,7 @@ jobs:
     name: Harvest CHANGELOG and draft release notes
     if: >-
       github.repository == 'omnigent-ai/omnigent' &&
-      (github.event_name == 'workflow_dispatch' ||
+      (inputs.preparation || github.event_name == 'workflow_dispatch' ||
        github.event.workflow_run.conclusion == 'success')
     runs-on: ubuntu-latest
     timeout-minutes: 40
@@ -83,6 +100,8 @@ jobs:
           INPUT_TAG: ${{ inputs.tag }}
           INPUT_BASE: ${{ inputs.base }}
           INPUT_DRY_RUN: ${{ inputs.dry_run }}
+          PREPARATION: ${{ inputs.preparation }}
+          SOURCE_REF: ${{ inputs.source_ref }}
         run: |
           set -euo pipefail
           tag="${INPUT_TAG:-$RUN_BRANCH}"
@@ -99,7 +118,13 @@ jobs:
             *rc[0-9]*|*dev[0-9]*|*pre[0-9]*) is_version=false ;;
           esac
 
-          if [ "$EVENT_NAME" = "workflow_run" ]; then
+          if [ "$PREPARATION" = "true" ]; then
+            if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || [[ ! "$SOURCE_REF" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "::error::Preparation requires a final vX.Y.Z tag and an immutable commit SHA."
+              exit 1
+            fi
+            proceed=true
+          elif [ "$EVENT_NAME" = "workflow_run" ]; then
             # Real release cut: strict — only a final version tag proceeds.
             [ "$is_version" = "true" ] && proceed=true
           else
@@ -155,6 +180,8 @@ jobs:
           TAG: ${{ steps.guard.outputs.tag }}
           BASE: ${{ steps.guard.outputs.base }}
           DRY_RUN: ${{ steps.guard.outputs.dry_run }}
+          PREPARATION: ${{ inputs.preparation }}
+          SOURCE_REF: ${{ inputs.source_ref }}
         run: |
           set -euo pipefail
           # generate.py orders CHANGELOG.md by PEP 440 (packaging). This step runs
@@ -166,8 +193,9 @@ jobs:
                 --credits-out /tmp/pr_credits.json
                 --section-out /tmp/section.md)
           [ -n "${BASE:-}" ] && args+=(--base "$BASE")
-          if [ "$DRY_RUN" = "true" ]; then
-            # Preview only — render, don't touch CHANGELOG.md.
+          [ -n "${SOURCE_REF:-}" ] && args+=(--source-ref "$SOURCE_REF")
+          if [ "$DRY_RUN" = "true" ] || [ "$PREPARATION" = "true" ]; then
+            # Preparation and previews leave CHANGELOG.md for the tagged release.
             args+=(--no-changelog-update)
           else
             args+=(--changelog-file CHANGELOG.md)
@@ -271,6 +299,12 @@ jobs:
           owner: ${{ github.repository_owner }}
           repositories: omnigent
 
+      - name: Require write access for preparation
+        if: inputs.preparation && steps.app-token.outputs.token == ''
+        run: |
+          echo "::error::Release preparation requires the Omnigent App token to create draft notes."
+          exit 1
+
       # Find the DRAFT release for this tag using the App token (push access) — a
       # read-only token can't see drafts. Match by tag_name over the release list:
       # GitHub's get-by-tag REST endpoint 404s on drafts (their tag isn't "real"
@@ -284,6 +318,8 @@ jobs:
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           TAG: ${{ steps.guard.outputs.tag }}
+          PREPARATION: ${{ inputs.preparation }}
+          SOURCE_REF: ${{ inputs.source_ref }}
         run: |
           set -euo pipefail
           # Read TAG via jq's `env`, not by interpolating it into the jq program —
@@ -296,6 +332,19 @@ jobs:
             is_draft="$(printf '%s' "$match" | jq -r '.draft')"
             release_id="$(printf '%s' "$match" | jq -r '.id')"
           fi
+          if [ "$PREPARATION" = "true" ]; then
+            if [ -z "$match" ]; then
+              gh api --method POST "repos/${SOURCE_REPO}/releases" \
+                --field tag_name="$TAG" --field target_commitish="$SOURCE_REF" \
+                --field name="$TAG" --field draft=true \
+                --field body=@/tmp/release_notes.md > /dev/null
+              echo "Prepared draft notes for ${TAG}; the tag is created only after approval." \
+                | tee -a "$GITHUB_STEP_SUMMARY"
+            else
+              echo "Release ${TAG} already exists; preserving its notes." | tee -a "$GITHUB_STEP_SUMMARY"
+            fi
+            exit 0
+          fi
           if [ "$is_draft" != "true" ]; then
             echo "::notice::No unpublished draft release found for ${TAG} — leaving release notes untouched (the CHANGELOG PR still runs)."
           fi
@@ -306,7 +355,7 @@ jobs:
 
       # --- 4) Open/update the CHANGELOG.md PR ---
       - name: Open or update the CHANGELOG.md PR
-        if: steps.guard.outputs.proceed == 'true' && steps.guard.outputs.dry_run != 'true' && steps.app-token.outputs.token != ''
+        if: steps.guard.outputs.proceed == 'true' && steps.guard.outputs.dry_run != 'true' && !inputs.preparation && steps.app-token.outputs.token != ''
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           SITE_TOKEN: ${{ steps.app-token.outputs.token }}

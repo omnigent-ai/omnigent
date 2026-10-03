@@ -5,6 +5,74 @@ finalize-release.yml, homebrew-tap-pr.yml, bump-version App token, branch-CI
 triggers, lockstep CI check, RELEASING.md rewrite). Secure-repo restructure and
 the tag ruleset are follow-ups. Owner: @dhruv0811.
 
+## Weekly preparation and approval
+
+`release.yml` starts every Monday at **4pm Pacific local time**, using
+`America/Los_Angeles` so it follows PST/PDT. Preparation targets the 5pm
+standup; GitHub scheduling and runner availability cannot guarantee that
+completion time. CI and benchmarks run after approval, outside that window.
+
+1. **Prepare:** derive `X.Y.Z` from the scheduled commit's `X.Y.Z.dev0` marker,
+   create `release/vX.Y.0` without a tag, generate preliminary GitHub draft
+   notes, and open main's next `.dev0` bump PR. The notes and bump workflows
+   must finish before approval becomes available. Existing branches are reused.
+2. **Review:** the `approve` job waits on the `release-approval` environment.
+   The team can merge backport PRs while it waits. GitHub can hold this approval
+   for up to 30 days without occupying a runner or blocking nightly releases.
+3. **Tag:** approval re-reads the release branch head, checks that commit's CI,
+   and runs the benchmarks. It then stamps the release version and atomically
+   pushes the branch and tag. If another backport lands during validation, the
+   push fails without creating a tag; rerun the whole Release workflow to
+   approve and validate the newer head.
+
+The tag triggers the existing CHANGELOG PR and refreshes the draft notes to
+include the backports. Preliminary notes are replaced by this refresh, so
+curate the final draft afterward. Docker images also publish only after the
+tag exists. PyPI publishing and `finalize-release.yml` remain coordinator
+steps; website, docs-publish, and Homebrew PRs still follow finalization.
+
+Merge the main bump PR before the next Monday so the next cycle has a new
+version. A rerun of the same scheduled run retains its original version even
+after main advances. Manual RC cuts remain available and do not need the
+final-release approval or preliminary notes.
+
+### Configure the approval gate
+
+Before enabling real releases, create **Settings → Environments →
+release-approval** and configure **Required reviewers** for the release
+coordinators. Naming an environment alone does not enable approval. The
+workflow checks that required reviewers exist and fails before preparation
+if they are missing. The approval is permission to tag the current release
+branch after validation, not a request to publish the GitHub release or PyPI.
+
+### Cherry-picking fixes before approval
+
+For a merged squash PR, use its merge commit to open a normal PR against the
+release branch (replace the version, PR number, and commit below):
+
+```bash
+git fetch origin
+git switch -c backport/PR_NUMBER origin/release/vX.Y.0
+git cherry-pick -x MERGE_COMMIT_SHA
+git push -u origin HEAD
+gh pr create --repo omnigent-ai/omnigent --base release/vX.Y.0 --web
+```
+
+Merge the backport PR, wait for release-branch CI, then approve the waiting
+Release run. No new version or retagging is needed during this review window.
+After a tag has been created, it remains immutable: further fixes need a new
+RC or patch version. An unchanged rerun is a no-op; the same version on an
+advanced branch fails rather than moving the tag.
+
+To preview names, branch selection, and CI without creating anything:
+
+```bash
+gh workflow run release.yml --repo omnigent-ai/omnigent \
+  -f version=X.Y.0 -f dry_run=true
+```
+
+## Original design
+
 Today a release is an LLM agent (or human) walking `RELEASING.md` step by step:
 ~15 CLI commands across two GitHub accounts, two repos, a hand-edited lockfile,
 and judgment calls interleaved with mechanical steps. Every step of that runbook

@@ -19,6 +19,17 @@ name: Bump Version
 # re-open the PR or push to it to kick CI.
 
 on:
+  workflow_call:
+    inputs:
+      mode:
+        required: true
+        type: string
+      new_version:
+        required: true
+        type: string
+      base_branch:
+        type: string
+        default: main
   workflow_dispatch:
     inputs:
       mode:
@@ -38,7 +49,7 @@ on:
         default: main
 
 concurrency:
-  group: bump-version-${{ github.event.inputs.new_version }}
+  group: bump-version-${{ inputs.new_version }}
   cancel-in-progress: false
 
 permissions:
@@ -52,7 +63,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
         with:
-          ref: ${{ github.event.inputs.base_branch }}
+          ref: ${{ inputs.base_branch }}
           fetch-depth: 0
 
       - name: Set up Python
@@ -69,8 +80,8 @@ jobs:
         env:
           # Bind untrusted inputs to env and validate before use; never
           # interpolate ${{ }} into the shell (mirrors e2e.yml hardening).
-          MODE: ${{ github.event.inputs.mode }}
-          NEW_VERSION: ${{ github.event.inputs.new_version }}
+          MODE: ${{ inputs.mode }}
+          NEW_VERSION: ${{ inputs.new_version }}
         run: |
           case "$MODE" in
             pre-release|post-release) ;;
@@ -109,9 +120,9 @@ jobs:
       - name: Open bump PR
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token || github.token }}
-          MODE: ${{ github.event.inputs.mode }}
-          NEW_VERSION: ${{ github.event.inputs.new_version }}
-          BASE: ${{ github.event.inputs.base_branch }}
+          MODE: ${{ inputs.mode }}
+          NEW_VERSION: ${{ inputs.new_version }}
+          BASE: ${{ inputs.base_branch }}
         run: |
           # The resolved version is what landed in the files (in post-release
           # mode it's the computed .dev0, not the input).

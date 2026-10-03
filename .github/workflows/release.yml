@@ -1,9 +1,8 @@
 # Cut or advance a release deterministically (designs/RELEASE-AUTOMATION.md):
 #
-#   dispatch with version=0.6.0rc1  ->  create release/v0.6.0 from `ref`, stamp the
-#   lockstep version (scripts/update_versions.py + `uv lock`), tag v0.6.0rc1,
-#   push branch + tag. Later dispatches (0.6.0rc2, 0.6.0, 0.6.1) reuse the
-#   existing release/v0.6.0 head and ignore `ref`.
+# Prepare release/vX.Y.0, draft notes, and main's next-version PR first.
+# Final releases wait for human approval, then re-read the branch head,
+# validate CI and benchmarks, stamp the lockstep version, and tag it.
 #
 # The branch + tag are pushed with the omnigent-ci App token, NOT GITHUB_TOKEN:
 # GITHUB_TOKEN-pushed tags trigger no workflows by GitHub policy, and the whole
@@ -18,9 +17,14 @@
 #
 # `dry_run` defaults TRUE (repo convention, same as the vscode release
 # workflows): the plan job prints exactly what would happen; nothing is pushed.
+# Monday preparation is untagged: backports can land before approval without
+# moving a tag or publishing Docker images.
 name: Release
 
 on:
+  schedule:
+    - cron: "0 16 * * 1"
+      timezone: America/Los_Angeles
   workflow_dispatch:
     inputs:
       version:
@@ -51,23 +55,23 @@ on:
 # Nothing here writes with GITHUB_TOKEN; pushes use the App token.
 permissions:
   contents: read
+  actions: read # Verify the approval environment has required reviewers.
 
-# Serialize all release runs: two concurrent cuts (even of different versions)
-# could race the same release/vX.Y.0 head.
+# Waiting for approval must not hold the nightly workflow's release lock.
+# The short branch/tag mutations below acquire that shared lock themselves.
 concurrency:
-  group: release
+  group: release-workflow-${{ inputs.version || 'weekly' }}
   cancel-in-progress: false
 
 jobs:
-  # Releases are maintainer-only. `workflow_dispatch` is open to anyone with
-  # write access, so gate on the dispatcher's actual repo role instead of a
-  # hand-kept list. `github.actor` on a dispatch is the dispatcher.
+  # Manual releases are maintainer-only; schedules run from the default branch.
   authorize:
     if: github.repository == 'omnigent-ai/omnigent'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - name: Require admin/maintain role
+        if: github.event_name == 'workflow_dispatch'
         env:
           GH_TOKEN: ${{ github.token }}
           ACTOR: ${{ github.actor }}
@@ -96,13 +100,28 @@ jobs:
       branch_exists: ${{ steps.state.outputs.branch_exists }}
       base_sha: ${{ steps.state.outputs.base_sha }}
       already_done: ${{ steps.state.outputs.already_done }}
+      bump_main: ${{ steps.main-bump.outputs.needed }}
     steps:
       - name: Validate version and derive names
         id: derive
         env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          SOURCE_SHA: ${{ github.sha }}
           VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
+          if [ "$EVENT_NAME" = "schedule" ]; then
+            # The event SHA stays fixed on reruns, even after main's bump PR merges.
+            main_version="$(gh api -H "Accept: application/vnd.github.raw+json" \
+              "repos/${GITHUB_REPOSITORY}/contents/pyproject.toml?ref=${SOURCE_SHA}" \
+              | python3 -c 'import sys, tomllib; print(tomllib.loads(sys.stdin.read())["project"]["version"])')"
+            if ! [[ "$main_version" =~ ^([0-9]+\.[0-9]+\.[0-9]+)\.dev0$ ]]; then
+              echo "::error::Expected X.Y.Z.dev0 on main; found ${main_version}."
+              exit 1
+            fi
+            VERSION="${BASH_REMATCH[1]}"
+          fi
           # Final X.Y.Z or a PEP 440 pre-release (rc). No dev/post/alpha/beta here.
           if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(rc[0-9]+)?$ ]]; then
             echo "::error::Invalid release version: ${VERSION} (expect 0.6.0 or 0.6.0rc1)"; exit 1
@@ -124,7 +143,8 @@ jobs:
           VERSION: ${{ steps.derive.outputs.version }}
           TAG: ${{ steps.derive.outputs.tag }}
           BRANCH: ${{ steps.derive.outputs.branch }}
-          REF: ${{ inputs.ref }}
+          REF: ${{ inputs.ref || 'main' }}
+          SOURCE_REF: ${{ github.event_name == 'schedule' && github.sha || inputs.ref || 'main' }}
         run: |
           set -euo pipefail
 
@@ -145,7 +165,7 @@ jobs:
             fi
           else
             branch_exists=false
-            base_sha="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${REF}" --jq .sha)"
+            base_sha="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${SOURCE_REF}" --jq .sha)"
           fi
 
           # Tag state: absent -> normal; at the converged release commit ->
@@ -175,12 +195,41 @@ jobs:
             echo "already_done=${already_done}"
           } >> "$GITHUB_OUTPUT"
 
+      - name: Check whether main needs its next-version PR
+        id: main-bump
+        if: ${{ !inputs.dry_run && steps.state.outputs.already_done != 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.derive.outputs.version }}
+        run: |
+          set -euo pipefail
+          MAIN_VERSION="$(gh api -H "Accept: application/vnd.github.raw+json" \
+            "repos/${GITHUB_REPOSITORY}/contents/pyproject.toml?ref=main" \
+            | sed -n 's/^version = "\(.*\)"$/\1/p' | head -1)"
+          export MAIN_VERSION
+          python3 -m pip install --quiet --disable-pip-version-check packaging
+          needed="$(python3 -c 'import os; from packaging.version import Version; print(str(Version(os.environ["VERSION"]) > Version(os.environ["MAIN_VERSION"])).lower())')"
+          echo "needed=${needed}" >> "$GITHUB_OUTPUT"
+
+      - name: Require a protected approval environment
+        if: ${{ !inputs.dry_run && steps.derive.outputs.prerelease != 'true' && steps.state.outputs.already_done != 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          reviewers="$(gh api "repos/${GITHUB_REPOSITORY}/environments/release-approval" \
+            --jq '[.protection_rules[] | select(.type == "required_reviewers") | .reviewers[]] | length')"
+          if ! [[ "$reviewers" =~ ^[1-9][0-9]*$ ]]; then
+            echo "::error::Configure required reviewers on the release-approval environment before preparing a release."
+            exit 1
+          fi
+
       - name: Assert green CI on the base commit
-        if: steps.state.outputs.already_done != 'true' && !inputs.skip_ci_check
+        if: inputs.dry_run && steps.state.outputs.already_done != 'true' && !inputs.skip_ci_check
         env:
           GH_TOKEN: ${{ github.token }}
           BASE_SHA: ${{ steps.state.outputs.base_sha }}
-        run: |
+        run: &assert-green-ci |
           set -euo pipefail
           # Release and PR-management jobs run from main without testing its code.
           # Exclude their workflow run IDs, preserving real CI with similar job names.
@@ -226,7 +275,7 @@ jobs:
 
       - name: Write the plan
         env:
-          DRY_RUN: ${{ inputs.dry_run }}
+          DRY_RUN: ${{ github.event_name != 'schedule' && inputs.dry_run }}
           VERSION: ${{ steps.derive.outputs.version }}
           TAG: ${{ steps.derive.outputs.tag }}
           BRANCH: ${{ steps.derive.outputs.branch }}
@@ -247,6 +296,93 @@ jobs:
             echo "| Mode | $([ "$DRY_RUN" = "true" ] && echo "DRY RUN — nothing pushed" || echo "EXECUTE") |"
           } >> "$GITHUB_STEP_SUMMARY"
 
+  prepare:
+    needs: [authorize, plan]
+    if: ${{ !inputs.dry_run && needs.plan.outputs.already_done != 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    concurrency:
+      group: release
+      cancel-in-progress: false
+    steps:
+      - name: Mint App token (omnigent)
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ vars.OMNIGENT_BOT_APP_ID }}
+          private-key: ${{ secrets.OMNIGENT_BOT_APP_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: omnigent
+
+      - name: Create the release branch without a tag
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          BRANCH: ${{ needs.plan.outputs.branch }}
+          BASE_SHA: ${{ needs.plan.outputs.base_sha }}
+          BRANCH_EXISTS: ${{ needs.plan.outputs.branch_exists }}
+        run: |
+          set -euo pipefail
+          if [ "$BRANCH_EXISTS" != "true" ]; then
+            gh api --method POST "repos/${GITHUB_REPOSITORY}/git/refs" \
+              -f "ref=refs/heads/${BRANCH}" -f "sha=${BASE_SHA}" > /dev/null
+          fi
+          echo "Prepared [${BRANCH}](https://github.com/${GITHUB_REPOSITORY}/tree/${BRANCH}). Merge backport PRs here before approving the release." \
+            | tee -a "$GITHUB_STEP_SUMMARY"
+
+  prepare-notes:
+    needs: [plan, prepare]
+    if: needs.plan.outputs.prerelease != 'true'
+    uses: ./.github/workflows/draft-release-notes.yml
+    with:
+      tag: ${{ needs.plan.outputs.tag }}
+      source_ref: ${{ needs.plan.outputs.base_sha }}
+      preparation: true
+    secrets: inherit
+
+  approve:
+    needs: [plan, prepare, prepare-notes, bump-main]
+    if: >-
+      ${{ !cancelled() && !failure() && needs.prepare.result == 'success' &&
+          needs.prepare-notes.result == 'success' &&
+          (needs.plan.outputs.bump_main != 'true' || needs.bump-main.result == 'success') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    environment:
+      name: release-approval
+      url: https://github.com/${{ github.repository }}/releases
+    steps:
+      - name: Release approved
+        run: echo "Approval received; resolve and validate the current release branch head next."
+
+  release-plan:
+    needs: [plan, prepare, approve]
+    if: >-
+      ${{ !cancelled() && !failure() && needs.prepare.result == 'success' &&
+          (needs.plan.outputs.prerelease == 'true' || needs.approve.result == 'success') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      base_sha: ${{ steps.head.outputs.sha }}
+    steps:
+      - name: Resolve the current release branch head
+        id: head
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BRANCH: ${{ needs.plan.outputs.branch }}
+        run: |
+          set -euo pipefail
+          sha="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/${BRANCH}" --jq .object.sha)"
+          echo "sha=${sha}" >> "$GITHUB_OUTPUT"
+          echo "Validating ${BRANCH} at ${sha} after approval, including merged backports." \
+            | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Assert green CI on the approved branch head
+        if: ${{ !inputs.skip_ci_check }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BASE_SHA: ${{ steps.head.outputs.sha }}
+        run: *assert-green-ci
+
   # Seed the corpus at the OLDER release's schema head so both servers can
   # boot: the baseline (older code) reads it natively, and the candidate (newer
   # code) auto-migrates it forward on startup. Migrations are forward-only, so
@@ -254,8 +390,8 @@ jobs:
   # The seeded bench.db is passed to baseline + candidate as an artifact so
   # they run in parallel on separate runners (each migrates/reads its own copy).
   benchmark-seed:
-    needs: [authorize, plan]
-    if: ${{ !inputs.dry_run && needs.plan.outputs.already_done != 'true' && !inputs.skip_benchmark }}
+    needs: [authorize, plan, release-plan]
+    if: ${{ !cancelled() && needs.release-plan.result == 'success' && !inputs.skip_benchmark }}
     outputs:
       prev_tag: ${{ steps.prev.outputs.tag }}
       has_prev: ${{ steps.prev.outputs.found }}
@@ -269,7 +405,7 @@ jobs:
       - name: Check out release base
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
-          ref: ${{ needs.plan.outputs.branch_exists == 'true' && needs.plan.outputs.branch || needs.plan.outputs.base_sha }}
+          ref: ${{ needs.release-plan.outputs.base_sha }}
           fetch-depth: 0
           persist-credentials: false
 
@@ -332,7 +468,7 @@ jobs:
   # Benchmark the previous release. Skipped on the first cut (no prev tag).
   benchmark-baseline:
     needs: [benchmark-seed]
-    if: ${{ needs.benchmark-seed.outputs.has_prev == 'true' }}
+    if: ${{ !cancelled() && needs.benchmark-seed.result == 'success' && needs.benchmark-seed.outputs.has_prev == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
@@ -383,8 +519,8 @@ jobs:
 
   # Benchmark the release candidate. Always runs (even on first cut, solo).
   benchmark-candidate:
-    needs: [authorize, plan, benchmark-seed]
-    if: ${{ !inputs.dry_run && needs.plan.outputs.already_done != 'true' && !inputs.skip_benchmark }}
+    needs: [authorize, plan, release-plan, benchmark-seed]
+    if: ${{ !cancelled() && needs.release-plan.result == 'success' && needs.benchmark-seed.result == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
@@ -395,7 +531,7 @@ jobs:
       - name: Check out release base
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
-          ref: ${{ needs.plan.outputs.branch_exists == 'true' && needs.plan.outputs.branch || needs.plan.outputs.base_sha }}
+          ref: ${{ needs.release-plan.outputs.base_sha }}
           persist-credentials: false
 
       - name: Download seeded corpus
@@ -447,8 +583,8 @@ jobs:
   # benchmark-approve job (requiring manual sign-off) rather than failing
   # outright. Skipped on the first cut (no baseline).
   benchmark:
-    needs: [authorize, plan, benchmark-seed, benchmark-baseline, benchmark-candidate]
-    if: ${{ !inputs.dry_run && needs.plan.outputs.already_done != 'true' && !inputs.skip_benchmark && needs.benchmark-seed.outputs.has_prev == 'true' }}
+    needs: [authorize, plan, release-plan, benchmark-seed, benchmark-baseline, benchmark-candidate]
+    if: ${{ !cancelled() && needs.benchmark-baseline.result == 'success' && needs.benchmark-candidate.result == 'success' }}
     outputs:
       regression: ${{ steps.compare.outputs.regression }}
     runs-on: ubuntu-latest
@@ -461,7 +597,7 @@ jobs:
       - name: Check out release base
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
-          ref: ${{ needs.plan.outputs.branch_exists == 'true' && needs.plan.outputs.branch || needs.plan.outputs.base_sha }}
+          ref: ${{ needs.release-plan.outputs.base_sha }}
           persist-credentials: false
 
       - name: Set up Python
@@ -534,9 +670,7 @@ jobs:
   benchmark-approve:
     needs: [authorize, plan, benchmark]
     if: |
-      !inputs.dry_run &&
-      needs.plan.outputs.already_done != 'true' &&
-      !inputs.skip_benchmark &&
+      !cancelled() &&
       needs.benchmark.result == 'success' &&
       needs.benchmark.outputs.regression == 'true'
     runs-on: ubuntu-latest
@@ -549,14 +683,21 @@ jobs:
 
   # Stamp + tag + push. Only reached on a real run that isn't already converged.
   cut:
-    needs: [authorize, plan, benchmark-candidate, benchmark, benchmark-approve]
+    needs: [authorize, plan, release-plan, benchmark-candidate, benchmark, benchmark-approve]
     # benchmark (compare) + benchmark-approve are skipped on the first cut (no
     # previous release to compare against); benchmark-candidate always runs and
-    # is the real gate. `!cancelled` lets the optional compare/approve jobs be
-    # skipped without blocking, while still failing the run if they actually fail.
-    if: ${{ !inputs.dry_run && needs.plan.outputs.already_done != 'true' && !cancelled() }}
+    # is the real gate. Allow optional skipped jobs, but never failed prerequisites.
+    if: >-
+      ${{ !cancelled() && !failure() && needs.authorize.result == 'success' &&
+          needs.plan.result == 'success' && needs.release-plan.result == 'success' && !inputs.dry_run &&
+          (inputs.skip_benchmark || needs.benchmark-candidate.result == 'success') &&
+          (needs.benchmark.outputs.regression != 'true' || needs.benchmark-approve.result == 'success') &&
+          needs.plan.outputs.already_done != 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    concurrency:
+      group: release
+      cancel-in-progress: false
     env:
       # Clean public resolution for `uv lock` — the committed lockfile must
       # reference https://pypi.org/simple (never a proxy).
@@ -575,8 +716,8 @@ jobs:
       - name: Checkout base
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
-          # Existing branch: its head. New branch: the resolved base commit.
-          ref: ${{ needs.plan.outputs.branch_exists == 'true' && needs.plan.outputs.branch || needs.plan.outputs.base_sha }}
+          # Build exactly the commit validated by the plan and benchmarks.
+          ref: ${{ needs.release-plan.outputs.base_sha }}
           persist-credentials: false
 
       - name: Set up Python
@@ -632,10 +773,10 @@ jobs:
           fi
 
           git tag "$TAG"
-          # One push for branch + tag, via the App token so the tag-push
-          # workflows fire. Non-fast-forward on the branch fails loudly.
+          # Publish branch + tag together; a concurrent cherry-pick rejects both.
+          # The App token ensures the tag-push workflows fire.
           push_url="https://x-access-token:${PUSH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
-          git push "$push_url" "HEAD:refs/heads/${BRANCH}" "refs/tags/${TAG}"
+          git push --atomic "$push_url" "HEAD:refs/heads/${BRANCH}" "refs/tags/${TAG}"
           echo "Pushed ${BRANCH} + ${TAG} at $(git rev-parse HEAD)." | tee -a "$GITHUB_STEP_SUMMARY"
 
       - name: Next steps
@@ -664,55 +805,16 @@ jobs:
             fi
           } >> "$GITHUB_STEP_SUMMARY"
 
-  # First cut of a cycle (rc1) immediately moves main to the next .dev0 so main
-  # never re-freezes and doc-sync keeps deriving the right X.Y-docs branch.
+  # Open main's next-version PR as soon as the release branch is prepared.
   bump-main:
-    needs: [authorize, plan, cut]
-    # The benchmark chain is skipped on most cuts, and a default `success()`
-    # gate inherits that skip through `cut`, so this job silently vanished on
-    # every cut but one. Depend on `cut` succeeding, not on the whole closure.
-    if: ${{ !cancelled() && needs.cut.result == 'success' }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
+    needs: [plan, prepare]
+    if: needs.plan.outputs.bump_main == 'true'
     permissions:
-      actions: write
-    steps:
-      - name: Dispatch the post-release main bump
-        env:
-          GH_TOKEN: ${{ github.token }}
-          VERSION: ${{ needs.plan.outputs.version }}
-          DRY_RUN: ${{ inputs.dry_run }}
-          BRANCH_EXISTS: ${{ needs.plan.outputs.branch_exists }}
-        run: |
-          set -euo pipefail
-          # Gate in shell, not a job-level `if`: a CLI/API dispatch delivers
-          # boolean inputs as the STRING "false", which is truthy in an
-          # expression, so `!inputs.dry_run` silently skipped this job at the
-          # v0.7.0 cut. Shell string comparison is dispatch-channel-proof and
-          # logs its decision instead of vanishing from the run.
-          if [ "$DRY_RUN" = "true" ]; then
-            echo "Dry run — not dispatching the main bump." | tee -a "$GITHUB_STEP_SUMMARY"
-            exit 0
-          fi
-          if [ "$BRANCH_EXISTS" != "false" ]; then
-            echo "Release branch pre-existed (not the first cut of this cycle) — main bump not needed." \
-              | tee -a "$GITHUB_STEP_SUMMARY"
-            exit 0
-          fi
-          # A cut below main's current line (a throwaway rehearsal rc, or
-          # resurrecting an old series for a backport) must not walk main's
-          # version backwards.
-          MAIN_VERSION="$(gh api -H "Accept: application/vnd.github.raw+json" \
-            "repos/${GITHUB_REPOSITORY}/contents/pyproject.toml?ref=main" \
-            | sed -n 's/^version = "\(.*\)"$/\1/p' | head -1)"
-          export MAIN_VERSION
-          python3 -m pip install --quiet --disable-pip-version-check packaging
-          if ! python3 -c 'import os, sys; from packaging.version import Version; sys.exit(0 if Version(os.environ["VERSION"]) > Version(os.environ["MAIN_VERSION"]) else 1)'; then
-            echo "Released ${VERSION} sorts below main's ${MAIN_VERSION} — skipping the main bump." \
-              | tee -a "$GITHUB_STEP_SUMMARY"
-            exit 0
-          fi
-          gh workflow run bump-version.yml --repo "$GITHUB_REPOSITORY" \
-            -f mode=post-release -f "new_version=${VERSION}" -f base_branch=main
-          echo "Dispatched bump-version.yml (post-release ${VERSION}) — review and merge the main bump PR." \
-            | tee -a "$GITHUB_STEP_SUMMARY"
+      contents: write
+      pull-requests: write
+    uses: ./.github/workflows/bump-version.yml
+    with:
+      mode: post-release
+      new_version: ${{ needs.plan.outputs.version }}
+      base_branch: main
+    secrets: inherit

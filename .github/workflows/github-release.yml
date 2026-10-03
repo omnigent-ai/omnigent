@@ -77,7 +77,9 @@ jobs:
           # Rerun-safe: if a release for this tag already exists (a rerun, a
           # deleted-and-re-pushed tag, or a manual release), skip instead of
           # failing the job. An `if` so this can't trip `set -e`.
-          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+          existing="$(gh api "repos/${GITHUB_REPOSITORY}/releases" --paginate \
+            --jq '.[] | select(.tag_name == env.TAG) | .id')"
+          if [ -n "$existing" ]; then
             echo "Release $TAG already exists — skipping." | tee -a "$GITHUB_STEP_SUMMARY"
             exit 0
           fi

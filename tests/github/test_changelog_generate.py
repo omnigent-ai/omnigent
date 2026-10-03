@@ -87,6 +87,39 @@ def test_cli_non_version_ref_without_base_errors(monkeypatch, capsys) -> None:
     assert "not a PEP 440 version" in capsys.readouterr().err
 
 
+def test_cli_prepares_notes_from_commit_before_tag_exists(monkeypatch, tmp_path) -> None:
+    source_ref = "a" * 40
+    _stub_io(monkeypatch, subjects=[], all_tags=["v0.2.0", "v0.3.0rc1"])
+    monkeypatch.setattr(
+        gen, "_tag_date", lambda ref: "2026-10-05" if ref == source_ref else "wrong"
+    )
+    section = tmp_path / "section.md"
+    changelog = tmp_path / "CHANGELOG.md"
+    changelog.write_text("existing changelog")
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "generate.py",
+            "--tag",
+            "v0.3.0",
+            "--source-ref",
+            source_ref,
+            "--repo",
+            "o/o",
+            "--section-out",
+            str(section),
+            "--changelog-file",
+            str(changelog),
+            "--no-changelog-update",
+        ],
+    )
+    assert gen.main() == 0
+    assert _stub_io.seen == [("v0.2.0", source_ref)]
+    assert section.read_text().startswith("## [v0.3.0] — 2026-10-05")
+    assert changelog.read_text() == "existing changelog"
+
+
 # --- pr_numbers_from_subjects ------------------------------------------------
 
 

@@ -341,16 +341,18 @@ def _gh_pr(repo: str, pr: int) -> dict:
 
 
 def collect(
-    tag: str, repo: str, base: str | None = None
+    tag: str, repo: str, base: str | None = None, source_ref: str | None = None
 ) -> tuple[str, list[HarvestResult], str | None]:
     """Return (rendered_section, results, previous_tag) for *tag*.
 
     *base* overrides the range start: when given, the harvest range is
     ``base..tag`` verbatim (any refs — for manual/preview runs). Otherwise the
-    start is the previous final ``vX.Y.Z`` tag, as at release time.
+    start is the previous final ``vX.Y.Z`` tag, as at release time. ``source_ref``
+    overrides the range end for drafts prepared before the release tag exists.
     """
     prev = base or previous_final_tag(tag, _all_tags())
-    subjects = _range_subjects(prev, tag)
+    source_ref = source_ref or tag
+    subjects = _range_subjects(prev, source_ref)
     titles = pr_titles_from_subjects(subjects)
     results = []
     for pr, title in titles.items():
@@ -372,7 +374,7 @@ def collect(
         result = harvest_pr(pr, metadata.get("body"), title, author.get("login", ""))
         result.author_url = author.get("html_url") or result.author_url
         results.append(result)
-    section = render_section(tag, _tag_date(tag), results, repo)
+    section = render_section(tag, _tag_date(source_ref), results, repo)
     return section, results, prev
 
 
@@ -382,6 +384,9 @@ def collect(
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--tag", required=True, help="release tag/ref (head of the range)")
+    parser.add_argument(
+        "--source-ref", help="range-end override when preparing an untagged release"
+    )
     parser.add_argument("--repo", required=True, help="GitHub owner/name for PR metadata")
     parser.add_argument(
         "--base",
@@ -428,7 +433,9 @@ def main() -> int:
             f"--tag {args.tag!r} is not a PEP 440 version; pass --base <ref> for its range"
         )
 
-    section, results, prev = collect(args.tag, args.repo, base=args.base)
+    section, results, prev = collect(
+        args.tag, args.repo, base=args.base, source_ref=args.source_ref
+    )
 
     if is_orderable and not args.no_changelog_update:
         path = Path(args.changelog_file)
@@ -448,7 +455,7 @@ def main() -> int:
         Path(args.pr_list_out).write_text(render_pr_list(results))
 
     included = [r.pr for r in results if r.status == "included"]
-    print(f"Range: {prev or '(start)'}..{args.tag}")
+    print(f"Range: {prev or '(start)'}..{args.source_ref or args.tag}")
     print(f"Credited all {len(results)} PR(s); {len(included)} have changelog descriptions.")
     print(f"Using PR titles for {len(results) - len(included)} PR(s).")
     return 0
