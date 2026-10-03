@@ -59,9 +59,12 @@ const DISPLAY_NAMES: Record<string, string> = {
   debby: "Debby",
 };
 
-function displayNameForAgent(name: string, harness?: string | null): string {
+function displayNameForAgent(name: string, harness?: string | null, builtin?: boolean): string {
+  // A user-registered template (builtin === false) wrapping a native harness
+  // keeps its own name; the vendor label would make it indistinguishable from
+  // the seeded built-in. Canonical wrapper names still resolve by name below.
   return (
-    nativeCodingAgentForHarness(harness)?.displayName ??
+    (builtin === false ? undefined : nativeCodingAgentForHarness(harness)?.displayName) ??
     nativeCodingAgentForAgentName(name)?.displayName ??
     DISPLAY_NAMES[name] ??
     capitalizeAgentName(name)
@@ -134,7 +137,7 @@ export async function fetchAgentCatalog(): Promise<AvailableAgent[]> {
   return rows.map((a) => ({
     id: a.id,
     name: a.name,
-    display_name: displayNameForAgent(a.name, a.harness),
+    display_name: displayNameForAgent(a.name, a.harness, a.builtin),
     description: a.description ?? null,
     harness: a.harness ?? null,
     skills: a.skills ?? [],
