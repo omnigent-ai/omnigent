@@ -677,10 +677,22 @@ def _workspace_github_info(root: str) -> dict[str, Any]:
     return payload
 
 
+def _repo_argument(ref: PullRequestRef) -> str:
+    """The ``gh -R`` selector, including a GitHub Enterprise host.
+
+    It is also the key of saved per-PR account preferences, so its format is fixed.
+    """
+    if ref.provider != "github":
+        raise ValueError("This resource supports only GitHub pull requests")
+    return f"{ref.host}/{ref.repository}"
+
+
 def _selected_pr(session_id: str, pr_url: str) -> PullRequestRef:
     reference = PullRequestRef.from_url(pr_url)
+    if reference.provider != "github":
+        raise ValueError("This resource supports only GitHub pull requests")
     for entry in SessionPrRegistry(session_id).list():
-        if entry.url == reference.url:
+        if entry.url == reference.url and entry.provider == "github":
             return entry
     raise ValueError("This pull request is not associated with the session")
 
@@ -690,14 +702,16 @@ def _default_pr(session_id: str | None, pr_url: str | None) -> PullRequestRef | 
         return None
     if pr_url:
         return _selected_pr(session_id, pr_url)
-    entries = SessionPrRegistry(session_id).list()
+    entries = [
+        entry for entry in SessionPrRegistry(session_id).list() if entry.provider == "github"
+    ]
     return entries[0] if entries else None
 
 
 def _pr_token(root: str, reference: PullRequestRef) -> str | None:
     if _in_sandbox():
         return None
-    login = _config.github_account_preference(reference.repo_argument)
+    login = _config.github_account_preference(_repo_argument(reference))
     if login:
         return _gh_auth_token(root, login, reference.host)
     return None
@@ -709,7 +723,7 @@ def _pr_json(root: str, reference: PullRequestRef, fields: str) -> dict[str, Any
         if reference.host not in {account.get("host") for account in accounts}:
             return None
     rc, out, _ = _gh(
-        ["pr", "view", str(reference.number), "-R", reference.repo_argument, "--json", fields],
+        ["pr", "view", str(reference.number), "-R", _repo_argument(reference), "--json", fields],
         cwd=root,
         token=_pr_token(root, reference),
     )
@@ -736,7 +750,8 @@ def _reference_info(root: str, reference: PullRequestRef) -> dict[str, Any]:
         return info
     _, accounts = _list_accounts(root)
     info["accounts"] = [a for a in accounts if a.get("host") == reference.host]
-    info["selected_account"] = _config.github_account_preference(reference.repo_argument) or next(
+    preferred = _config.github_account_preference(_repo_argument(reference))
+    info["selected_account"] = preferred or next(
         (a["login"] for a in info["accounts"] if a.get("active")), None
     )
     data = _pr_json(root, reference, _PR_VIEW_FIELDS + ",headRefOid,baseRefOid")
@@ -843,7 +858,7 @@ def github_info(
         return _workspace_github_info(root)
     request_deadline = time.monotonic() + _PR_TITLE_REQUEST_SECONDS
     registry = SessionPrRegistry(session_id)
-    entries = registry.list()
+    entries = [entry for entry in registry.list() if entry.provider == "github"]
     if pr_url:
         info = _reference_info(root, _selected_pr(session_id, pr_url))
     elif entries:
@@ -854,12 +869,12 @@ def github_info(
         if isinstance(pr, dict) and isinstance(pr.get("url"), str):
             reference = PullRequestRef.from_url(pr["url"])
             registry.record([reference], relationship="inferred", source="branch")
-            entries = registry.list()
+            entries = [entry for entry in registry.list() if entry.provider == "github"]
             if any(entry.url == reference.url for entry in entries):
                 key = _workspace_key(root)
                 account = _config.github_account_preference(key) if key else None
-                if account and not _config.github_account_preference(reference.repo_argument):
-                    _config.set_github_account_preference(reference.repo_argument, account)
+                if account and not _config.github_account_preference(_repo_argument(reference)):
+                    _config.set_github_account_preference(_repo_argument(reference), account)
                 info["selected_pr_url"] = reference.url
             else:
                 info["pr"] = None
@@ -871,6 +886,8 @@ def github_info(
 def update_session_pr(root: str, session_id: str, url: str, action: str) -> dict[str, Any]:
     """Attach a verified PR or persist an explicit exclusion."""
     reference = PullRequestRef.from_url(url)
+    if reference.provider != "github":
+        raise ValueError("This resource supports only GitHub pull requests")
     registry = SessionPrRegistry(session_id)
     try:
         if action == "attach":
@@ -913,7 +930,7 @@ def set_github_preference(
     if pr_url and session_id:
         reference = _selected_pr(session_id, pr_url)
         if account is not None:
-            _config.set_github_account_preference(reference.repo_argument, account or None)
+            _config.set_github_account_preference(_repo_argument(reference), account or None)
         return github_info(root, session_id=session_id, pr_url=pr_url)
     if remote:
         _gh(["repo", "set-default", remote], cwd=root)
@@ -1164,7 +1181,7 @@ def github_pr_diff(
         return empty
     if reference:
         _host_args(root, reference)
-    repo_args = ["-R", reference.repo_argument] if reference else []
+    repo_args = ["-R", _repo_argument(reference)] if reference else []
     rc, out, _ = _gh(["pr", "diff", str(number), *repo_args], cwd=root, token=token)
     return {"object": "session.github.pr_diff", "patch": out if rc == 0 else ""}
 
