@@ -1040,6 +1040,30 @@ def _with_model_configuration_source(
     return [{**model, "source": source} for model in models]
 
 
+def _check_ca_bundle() -> tuple[str, str, bool]:
+    """CA bundle path httpx would load, its source, and whether it exists.
+
+    Mirrors httpx's selection order: SSL_CERT_FILE env first, then
+    SSL_CERT_DIR, else certifi. Source is one of ``ssl_cert_file_env``,
+    ``ssl_cert_dir_env``, or ``certifi``.
+
+    :returns: ``(path, source, exists)`` for the selected CA bundle.
+    """
+    cert_file = os.environ.get("SSL_CERT_FILE")
+    if cert_file:
+        return cert_file, "ssl_cert_file_env", Path(cert_file).exists()
+    cert_dir = os.environ.get("SSL_CERT_DIR")
+    if cert_dir:
+        return cert_dir, "ssl_cert_dir_env", Path(cert_dir).exists()
+    try:
+        import certifi
+
+        bundle_path = certifi.where()
+    except (ImportError, OSError):
+        bundle_path = "<certifi unavailable>"
+    return bundle_path, "certifi", Path(bundle_path).exists()
+
+
 @dataclass
 class _RunnerHandle:
     """A spawned runner subprocess and where its output lands.
@@ -3171,7 +3195,35 @@ class HostProcess:
                 session_id=frame.session_id,
                 agent_id=frame.agent_id,
             )
-        except Exception:
+        except Exception as exc:
+            if isinstance(exc, OSError) and exc.filename is None:
+                ca_path, ca_source, ca_exists = _check_ca_bundle()
+                if not ca_exists:
+                    _logger.exception(
+                        "Skill discovery failed for %r: TLS CA bundle %s (from %s) is"
+                        " missing; the host install may have been replaced while"
+                        " running — restart the host",
+                        frame.harness,
+                        ca_path,
+                        ca_source,
+                        extra=debug_event(
+                            "host_ca_bundle_missing",
+                            harness=frame.harness,
+                            session_id=frame.session_id,
+                            ca_bundle=ca_path,
+                            ca_bundle_source=ca_source,
+                            install_present=Path(__file__).exists(),
+                        ),
+                    )
+                    return HostSkillsResultFrame(
+                        request_id=frame.request_id,
+                        status="failed",
+                        error_code="discovery_failed",
+                        error=(
+                            "skill discovery failed: TLS CA bundle is missing;"
+                            " restart the host — see the host log"
+                        ),
+                    )
             _logger.exception("Skill discovery failed for %r", frame.harness)
             return HostSkillsResultFrame(
                 request_id=frame.request_id,
