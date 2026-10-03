@@ -84,6 +84,12 @@ from omnigent.runner.identity import (
     RUNNER_WORKSPACE_ENV_VAR,
     token_bound_runner_id,
 )
+from omnigent.runner.transports.ws_tunnel.frames import (
+    PingFrame,
+    PongFrame,
+    decode_frame,
+    encode_frame,
+)
 from omnigent.runtime.harnesses.paths import HARNESS_TMP_PARENT_ENV_VAR
 
 pytestmark = pytest.mark.asyncio
@@ -2123,6 +2129,70 @@ async def test_fast_capability_discovery_is_included_in_hello(
     assert len(tunnel.sent) == 1
     assert hello.configured_harnesses == {"codex-native": True}
     assert hello.gateway_inference == {"codex-native": True}
+
+
+async def _pong_for(host: HostProcess, ping: PingFrame) -> PongFrame:
+    """Answer one server keepalive ping and return the host's only reply."""
+    ws = _RecordingWS()
+    # _RecordingWS stands in for the tunnel; the handler only calls ``send``.
+    await host._handle_raw_message(ws, encode_frame(ping))
+    assert len(ws.sent) == 1, "stats must ride on the pong, never add a frame"
+    pong = decode_frame(ws.sent[0])
+    assert isinstance(pong, PongFrame)
+    return pong
+
+
+async def test_keepalive_pong_carries_host_stats_when_requested() -> None:
+    """With the server's host_stats feature on, the snapshot rides on the pong."""
+    host = _make_host_process()
+
+    first = await _pong_for(host, PingFrame(ts=41, request_host_stats=True))
+    second = await _pong_for(host, PingFrame(ts=42, request_host_stats=True))
+
+    assert (first.ts, second.ts) == (41, 42)
+    assert first.host_stats is not None
+    assert {"memory_total_bytes", "memory_used_bytes"} <= first.host_stats.keys()
+    # The first requested sample is the CPU baseline; the next one reports it.
+    assert second.host_stats is not None
+    assert "cpu_percent" in second.host_stats
+    disk_read = host._host_stats._disk_task
+    if disk_read is not None:
+        await disk_read
+
+
+async def test_keepalive_pong_skips_sampling_without_a_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With the feature off the host never samples, and pongs keep their old shape."""
+    host = _make_host_process()
+
+    def _must_not_sample() -> None:
+        raise AssertionError("host sampled stats while host_stats is off")
+
+    monkeypatch.setattr(host._host_stats, "sample", _must_not_sample)
+
+    pong = await _pong_for(host, PingFrame(ts=7))
+
+    assert pong == PongFrame(ts=7)
+
+
+async def test_keepalive_pong_survives_an_unexpected_sampling_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Any sampling failure still sends the pong, so the server never ages the host out."""
+    host = _make_host_process()
+
+    def _broken() -> None:
+        raise TypeError("unexpected psutil shape")
+
+    monkeypatch.setattr("omnigent.host.stats.psutil.virtual_memory", _broken)
+
+    pong = await _pong_for(host, PingFrame(ts=9, request_host_stats=True))
+
+    assert pong == PongFrame(ts=9)
+    disk_read = host._host_stats._disk_task
+    if disk_read is not None:
+        await disk_read
 
 
 async def test_slow_capability_discovery_blocks_registration_and_frame_dispatch(

@@ -61,6 +61,7 @@ from omnigent.host.frames import (
     encode_host_frame,
 )
 from omnigent.host.identity import MANAGED_HOST_TOKEN_HEADER
+from omnigent.host.stats import parse_host_stats
 from omnigent.runner.transports.ws_tunnel.frames import (
     PingFrame,
     PongFrame,
@@ -68,6 +69,7 @@ from omnigent.runner.transports.ws_tunnel.frames import (
     encode_frame,
 )
 from omnigent.server.auth import RESERVED_USER_LOCAL, AuthProvider
+from omnigent.server.feature_flags import Feature, FeatureFlags, resolve_feature_flags
 from omnigent.server.host_registry import (
     HostConnection,
     HostRegistry,
@@ -134,6 +136,7 @@ def create_host_tunnel_router(
     on_runner_exited: RunnerExitedCallback | None = None,
     local_single_user: bool | None = None,
     runner_exit_reports: RunnerExitReports | None = None,
+    feature_flags: FeatureFlags | None = None,
 ) -> APIRouter:
     """Build the router hosting the ``/hosts/{id}/tunnel`` WS endpoint.
 
@@ -177,9 +180,14 @@ def create_host_tunnel_router(
     :param runner_exit_reports: Shared store for ``host.runner_exited``
         reports, read by the runner status endpoint. ``None`` (e.g.
         minimal test wiring) drops the reports.
+    :param feature_flags: Deployment release-feature snapshot; ``host_stats``
+        makes keepalive pings ask hosts for a resource snapshot. When omitted,
+        resolves ``OMNIGENT_FEATURES`` at router construction.
     :returns: A FastAPI router with the host tunnel endpoint.
     """
     from omnigent.server.auth import local_single_user_enabled
+
+    request_host_stats = (feature_flags or resolve_feature_flags()).enabled(Feature.HOST_STATS)
 
     allow_host_id_reown = (
         local_single_user if local_single_user is not None else local_single_user_enabled()
@@ -376,7 +384,7 @@ def create_host_tunnel_router(
                 name=f"host-sender:{host_id}",
             )
             ping_task = asyncio.create_task(
-                _ping_loop(ws, conn, host_id, host_store),
+                _ping_loop(ws, conn, host_id, host_store, request_host_stats=request_host_stats),
                 name=f"host-ping:{host_id}",
             )
             receive_task = asyncio.create_task(
@@ -583,8 +591,8 @@ async def _receive_loop(
     :param host_store: Persistent store receiving live readiness updates.
     :param host_registry: Live host registry, so a frame only refreshes
         liveness while ``conn`` is still the registered generation; it also
-        receives the reported gateway-inference map (held in memory, never
-        persisted).
+        receives the reported gateway-inference map and the keepalive
+        resource snapshot (both held in memory, never persisted).
     :param runner_exit_reports: Store for ``host.runner_exited``
         reports; ``None`` drops them.
     :param on_runner_exited: Callback fired with ``(host_id, runner_id,
@@ -638,6 +646,9 @@ async def _receive_loop(
                     host_id,
                     int(time.time() * 1000) - runner_frame.ts,
                 )
+                # Deliberately no on_host_update: clients read the snapshot on
+                # their existing hosts poll, so stats never add a refetch.
+                host_registry.record_host_stats(conn, parse_host_stats(runner_frame.host_stats))
                 continue
             _logger.warning(
                 "Host %s sent unexpected runner frame; dropping: kind=%s",
@@ -951,6 +962,8 @@ async def _ping_loop(
     conn: HostConnection,
     host_id: str,
     host_store: HostStore,
+    *,
+    request_host_stats: bool,
 ) -> None:
     """Send pings every PING_INTERVAL_S; declare dead after misses.
 
@@ -966,6 +979,8 @@ async def _ping_loop(
     :param conn: Host connection for timing checks.
     :param host_id: Host id for logging.
     :param host_store: Persistent host store the heartbeat is written to.
+    :param request_host_stats: Ask the host to answer each ping with a
+        resource snapshot (the ``host_stats`` release feature).
     """
     while True:
         await asyncio.sleep(PING_INTERVAL_S)
@@ -984,7 +999,9 @@ async def _ping_loop(
         # last-seen so the freshness gate keeps it in the online set.
         await asyncio.to_thread(host_store.heartbeat, host_id)
         try:
-            ping_text = encode_frame(PingFrame(ts=int(time.time() * 1000)))
+            ping_text = encode_frame(
+                PingFrame(ts=int(time.time() * 1000), request_host_stats=request_host_stats)
+            )
             conn.outbound_queue.put_nowait(ping_text)
         except Exception:  # noqa: BLE001
             return

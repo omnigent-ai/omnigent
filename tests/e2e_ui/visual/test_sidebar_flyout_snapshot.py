@@ -3,9 +3,9 @@
 The populated-sidebar baseline (``test_sidebar_snapshot.py``) captures every
 sidebar *row* type, but not the hover flyout that surfaces a pinned session's
 originating project — the card is portalled and only mounts on hover, so a
-restyle of it (surface, title clamp, folder + project-name line) sails through
-that gate. This baseline fills the gap: hover a pinned, project-owned row and
-capture the ``PinnedProjectFlyoutContent`` HoverCard.
+restyle of it (surface, title clamp, project line, session details) sails
+through that gate. This baseline fills the gap: hover a pinned, project-owned
+row and capture the ``SessionTooltipContent`` card it renders in a HoverCard.
 
 Same gate, renderer, and update flow as the other snapshots — see ``README.md``.
 
@@ -133,9 +133,9 @@ def test_pinned_project_flyout_matches_baseline(
     """Hovering a pinned, project-owned row opens a flyout that renders
     pixel-identical to the committed baseline.
 
-    Covers ``PinnedProjectFlyoutContent`` — the compact HoverCard (clamped title
-    + folder icon + project name) that the populated-sidebar baseline can't reach
-    because it only mounts on hover.
+    Covers ``SessionTooltipContent`` in its pinned HoverCard (clamped title,
+    project line, location and status) that the populated-sidebar baseline
+    can't reach because it only mounts on hover.
 
     :param snapshot_page: page pinned to a fixed viewport + light palette.
     :param live_server: base URL of the spawned server serving the built SPA.

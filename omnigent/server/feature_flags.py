@@ -24,6 +24,7 @@ class Feature(StrEnum):
     HARNESS_INSTALL = "harness_install"
     CANVAS = "canvas"
     CUSTOMIZE = "customize"
+    HOST_STATS = "host_stats"
 
 
 @dataclass(frozen=True)
@@ -61,6 +62,12 @@ FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
         description="Web Customize settings section (Harnesses & Skills)",
         owner="web",
         review_by_release="0.15.0",
+    ),
+    FeatureDefinition(
+        feature=Feature.HOST_STATS,
+        description="Host CPU, memory, disk and network stats in the sidebar session tooltip",
+        owner="hosts",
+        review_by_release="0.18.0",
     ),
 )
 
