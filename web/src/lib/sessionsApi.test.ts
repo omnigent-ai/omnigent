@@ -238,6 +238,27 @@ describe("createSession", () => {
     expect(new Headers(init.headers).get("X-Omnigent-Background-Session-Titles")).toBe("off");
   });
 
+  it("forwards host_id, workspace and labels for a host workspace session", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockJsonResponse({ id: "conv_host", agent_id: "agent_xyz", status: "idle", created_at: 1 }),
+    );
+
+    await createSession("agent_xyz", [], {
+      hostId: "host_a",
+      workspace: "/work/site",
+      labels: { "omnigent.ui": "terminal" },
+    });
+
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(JSON.parse(init.body as string)).toEqual({
+      agent_id: "agent_xyz",
+      initial_items: [],
+      host_id: "host_a",
+      workspace: "/work/site",
+      labels: { "omnigent.ui": "terminal" },
+    });
+  });
+
   it("forwards parent_session_id, sub_agent_name and title for the Add-agent path", async () => {
     fetchMock.mockResolvedValueOnce(
       mockJsonResponse({
