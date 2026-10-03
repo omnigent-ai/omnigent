@@ -961,8 +961,8 @@ async def _ping_loop(
                     error_phase=ErrorPhase.UNKNOWN.value,
                 ),
             )
+            registry.record_close(session, code=4003, reason="ping timeout")
             try:
-                registry.record_close(session, code=4003, reason="ping timeout")
                 await ws.close(code=4003, reason="ping timeout")
             except RuntimeError:
                 _logger.debug("Runner %s websocket already closed during ping timeout", runner_id)
