@@ -575,22 +575,28 @@ class SqlMobilePushDevice(OmnigentBase):
     __tablename__ = "mobile_push_devices"
 
     workspace_id: Mapped[int] = mapped_column(
-        BigInteger, primary_key=True, default=current_workspace_id, server_default="0"
+        BigInteger, primary_key=True, default=current_workspace_id
     )
     installation_id: Mapped[str] = mapped_column(String(128), primary_key=True)
     user_id: Mapped[str] = mapped_column(String(128), nullable=False)
-    platform: Mapped[str] = mapped_column(String(16), nullable=False)
-    fcm_token: Mapped[str] = mapped_column(Text, nullable=False)
+    platform: Mapped[int] = mapped_column(SmallInteger, nullable=False)
+    fcm_token: Mapped[str] = mapped_column(String(1024), nullable=False)
     token_hash: Mapped[str] = mapped_column(String(64), nullable=False)
-    generation: Mapped[str] = mapped_column(String(32), nullable=False)
+    generation: Mapped[str] = mapped_column(Uuid16(), nullable=False)
     account_generation: Mapped[str | None] = mapped_column(String(32), nullable=True)
     expires_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
 
     __table_args__ = (
         UniqueConstraint("workspace_id", "token_hash", name="uq_mobile_push_device_token"),
-        Index("ix_mobile_push_devices_user", "workspace_id", "user_id", "expires_at"),
+        Index(
+            "ix_mobile_push_devices_user",
+            "workspace_id",
+            "user_id",
+            "expires_at",
+            "installation_id",
+        ),
         Index("ix_mobile_push_devices_expiry", "expires_at", "workspace_id", "installation_id"),
-        CheckConstraint("platform IN ('android', 'ios')", name="ck_mobile_push_platform"),
+        CheckConstraint("platform IN (1, 2)", name="ck_mobile_push_platform"),
     )
 
 
@@ -598,18 +604,18 @@ class SqlMobilePushOutbox(OmnigentBase):
     __tablename__ = "mobile_push_outbox"
 
     workspace_id: Mapped[int] = mapped_column(
-        BigInteger, primary_key=True, default=current_workspace_id, server_default="0"
+        BigInteger, primary_key=True, default=current_workspace_id
     )
-    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
     session_id: Mapped[str] = mapped_column(Uuid16(), nullable=False)
     user_id: Mapped[str] = mapped_column(String(128), nullable=False)
     installation_id: Mapped[str] = mapped_column(String(128), nullable=False)
-    device_generation: Mapped[str] = mapped_column(String(32), nullable=False)
-    kind: Mapped[str] = mapped_column(String(16), nullable=False)
+    device_generation: Mapped[str] = mapped_column(Uuid16(), nullable=False)
+    kind: Mapped[int] = mapped_column(SmallInteger, nullable=False)
     reason: Mapped[str | None] = mapped_column(String(128), nullable=True)
     not_before: Mapped[int] = mapped_column(BigInteger, nullable=False)
     expires_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
-    lease: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    lease: Mapped[str | None] = mapped_column(Uuid16(), nullable=True)
     lease_until: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
     attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     delivered: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
@@ -625,15 +631,26 @@ class SqlMobilePushOutbox(OmnigentBase):
             name="uq_mobile_push_outbox_intent",
         ),
         Index(
-            "ix_mobile_push_outbox_due", "workspace_id", "delivered", "not_before", "lease_until"
+            "ix_mobile_push_outbox_due",
+            "workspace_id",
+            "delivered",
+            "not_before",
+            "lease_until",
+            "id",
         ),
         Index("ix_mobile_push_outbox_expiry", "expires_at", "workspace_id", "id"),
-        Index("ix_mobile_push_outbox_device", "workspace_id", "installation_id"),
-        Index("ix_mobile_push_outbox_user", "workspace_id", "user_id"),
-        Index("ix_mobile_push_outbox_tenants", "delivered", "workspace_id"),
-        CheckConstraint(
-            "kind IN ('completed', 'failed', 'needs_input')", name="ck_mobile_push_kind"
+        Index("ix_mobile_push_outbox_device", "workspace_id", "installation_id", "id"),
+        Index("ix_mobile_push_outbox_user", "workspace_id", "user_id", "id"),
+        Index(
+            "ix_mobile_push_outbox_activity",
+            "workspace_id",
+            "session_id",
+            "kind",
+            "delivered",
+            "id",
         ),
+        Index("ix_mobile_push_outbox_tenants", "delivered", "workspace_id", "id"),
+        CheckConstraint("kind IN (1, 2, 3)", name="ck_mobile_push_kind"),
     )
 
 
