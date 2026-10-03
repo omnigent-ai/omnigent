@@ -3403,8 +3403,9 @@ def test_bundle_upload_rewrites_mcp_file_only_when_a_value_expands(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
-    MCP files whose headers and env are all literal ship byte-for-byte
-    (comments and formatting kept); a ``${VAR}`` header is resolved.
+    MCP files whose url, headers and env are all literal ship byte-for-byte
+    (comments and formatting kept); a ``${VAR}`` header is resolved. Each
+    fixture is a valid declaration for its transport (``env`` is stdio-only).
     """
     monkeypatch.setenv("SIDECAR_MCP_TOKEN", "tok-sidecar")
     _write_upload_agent(
@@ -3419,17 +3420,25 @@ def test_bundle_upload_rewrites_mcp_file_only_when_a_value_expands(
     )
     mcp_dir = tmp_path / "tools" / "mcp"
     mcp_dir.mkdir(parents=True, exist_ok=True)
-    literal_text = (
+    literal_http_text = (
         "# Hand-written sidecar; keep this comment.\n"
-        "name: literal\n"
+        "name: literal-http\n"
         "transport: http\n"
         "url: http://localhost:9000/mcp\n"
         "headers:\n"
         "  Authorization: Bearer literal-token  # not a secret\n"
+    )
+    (mcp_dir / "literal-http.yaml").write_text(literal_http_text, encoding="utf-8")
+    literal_stdio_text = (
+        "# Local server; keep this comment.\n"
+        "name: literal-stdio\n"
+        "transport: stdio\n"
+        "command: node\n"
+        "args: [server.js]\n"
         "env:\n"
         "  LOG_LEVEL: debug\n"
     )
-    (mcp_dir / "literal.yaml").write_text(literal_text, encoding="utf-8")
+    (mcp_dir / "literal-stdio.yaml").write_text(literal_stdio_text, encoding="utf-8")
     (mcp_dir / "templated.yaml").write_text(
         "# Token comes from the uploader's environment.\n"
         "name: templated\n"
@@ -3444,11 +3453,19 @@ def test_bundle_upload_rewrites_mcp_file_only_when_a_value_expands(
     bundle_bytes = _bundle(tmp_path)
 
     assert "config.yaml" not in resolved
-    assert "tools/mcp/literal.yaml" not in resolved
-    assert _bundle_member_text(bundle_bytes, "tools/mcp/literal.yaml") == literal_text
+    for name, text in (
+        ("tools/mcp/literal-http.yaml", literal_http_text),
+        ("tools/mcp/literal-stdio.yaml", literal_stdio_text),
+    ):
+        assert name not in resolved
+        assert _bundle_member_text(bundle_bytes, name) == text
     assert "tools/mcp/templated.yaml" in resolved
     templated = _extract_yaml_from_bundle(bundle_bytes, "tools/mcp/templated.yaml")
     assert templated["headers"] == {"Authorization": "Bearer tok-sidecar"}
+    # The server accepts every declaration, so the fixtures are valid.
+    servers = _upload_and_parse(tmp_path)
+    assert {"inline", "literal-http", "literal-stdio", "templated"} <= set(servers)
+    assert servers["literal-stdio"].env == {"LOG_LEVEL": "debug"}
 
 
 def test_bundle_materializes_standalone_omnigent_yaml(tmp_path: Path) -> None:
