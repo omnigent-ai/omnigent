@@ -2487,9 +2487,13 @@ class SqlAlchemyConversationStore(ConversationStore):
                         if item.stable_id is not None
                     ]
 
-            # Bump updated_at on the conversation.
             conv_row = session.get(SqlConversation, (current_workspace_id(), conversation_id))
-            if conv_row is not None:
+            has_new_conversation_activity = any(
+                item.type != "resource_event"
+                and (item.stable_id is None or item.stable_id not in existing_by_id)
+                for item in items
+            )
+            if conv_row is not None and has_new_conversation_activity:
                 conv_row.updated_at = now
 
             # Allocate item positions from the conversation's maintained
