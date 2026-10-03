@@ -1,0 +1,105 @@
+"""S3: the host's network changes (Wi-Fi switch, VPN toggle) while Claude works.
+
+Everything on the host loses the network while its processes keep running:
+the daemon, runner, hooks and Claude Code's model calls. ``blackhole`` leaves
+connections half-open, as a silently dropped link does. ``reset`` kills them
+and refuses new ones, as a downed interface does. ``flap`` drops them for 2 s
+every 15 s for the whole window, as a marginal Wi-Fi does; every drop is a
+blip, so the session must never show a failure. The server and the user's
+browser are unaffected.
+"""
+
+from __future__ import annotations
+
+import time
+from collections.abc import Callable
+
+import pytest
+
+from tests.e2e.resilience.lab.driver import ClaudeDriver
+from tests.e2e.resilience.lab.lab import Lab
+from tests.e2e.resilience.lab.observe import SessionWatcher
+from tests.e2e.resilience.lab.proxy import Fault
+from tests.e2e.resilience.lab.report import ScenarioReport
+from tests.e2e.resilience.scenarios import _contract as contract
+
+_PHASES = [contract.IDLE, contract.TOOL_RUNNING, contract.APPROVAL_PENDING]
+
+
+_FLAP_UP_S = 15.0
+_FLAP_DOWN_S = 2.0
+_R6 = (
+    "R6: drops that each recover within seconds still add up to the 90s relay grace "
+    "and flash runner_disconnected over the running turn"
+)
+_KNOWN_GAPS_BY_MODE = {
+    "flap": {(contract.TOOL_RUNNING, 120): _R6, (contract.APPROVAL_PENDING, 120): _R6},
+    "reset": {
+        (contract.APPROVAL_PENDING, 45): (
+            "R1: refused re-POSTs back off to 30s, so the approval card returns late and an "
+            "approval in the gap is lost"
+        ),
+        (contract.APPROVAL_PENDING, 120): (
+            "R2: the permission hook gives up after 8 failed re-POSTs and moves the prompt "
+            "to the terminal"
+        ),
+    },
+}
+
+
+def _cut(lab: Lab, mode: str) -> list[Fault]:
+    links = (lab.proxies.host, lab.proxies.model)
+    if mode == "blackhole":
+        return [link.blackhole() for link in links]
+    if mode == "flap":
+        return [link.flap(up_s=_FLAP_UP_S, down_s=_FLAP_DOWN_S, mode="reset") for link in links]
+    faults = [link.refuse() for link in links]
+    for link in links:
+        link.reset()
+    return faults
+
+
+@pytest.mark.timeout(600)
+@pytest.mark.parametrize(
+    ("mode", "phase", "outage_s"),
+    [
+        pytest.param(mode, *case.values, marks=case.marks, id=f"{mode}-{case.id}")
+        for mode in ("blackhole", "reset", "flap")
+        for case in contract.cases(
+            _PHASES,
+            contract.outages([40], [120]) if mode == "flap" else contract.outages([10], [45, 120]),
+            _KNOWN_GAPS_BY_MODE.get(mode),
+        )
+    ],
+)
+def test_s3_host_network_change(
+    lab_factory: Callable[..., Lab], mode: str, phase: str, outage_s: int
+) -> None:
+    lab = lab_factory()
+    session_id = lab.create_claude_session()
+    driver = ClaudeDriver(lab, session_id)
+    report = ScenarioReport(
+        "S3 host network change", {"mode": mode, "phase": phase, "outage_s": outage_s}
+    )
+    with SessionWatcher(lab.server_url, session_id) as watcher:
+        entered = contract.enter(driver, phase, outage_s=outage_s)
+        started = time.time()
+        faults = _cut(lab, mode)
+        try:
+            time.sleep(outage_s)
+        finally:
+            for fault in faults:
+                fault.clear()
+        ended = time.time()
+        contract.finish(
+            report,
+            lab,
+            driver,
+            watcher,
+            entered,
+            fault_start=started,
+            fault_end=ended,
+            outage_s=_FLAP_DOWN_S if mode == "flap" else outage_s,
+        )
+    report.attach(watcher, lab.root)
+    report.require()

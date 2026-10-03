@@ -649,6 +649,9 @@ class Lab:
         env.update(
             {
                 "OMNIGENT_CONFIG_HOME": str(config_home),
+                # Keep host inventory (skills, credentials, imports) off the
+                # developer's real home directory.
+                "HOME": str(self._host_home()),
                 "TMPDIR": str(self._host_tmp),
                 # Harness HTTPS (model calls, telemetry) goes to the model proxy.
                 "HTTPS_PROXY": self.proxies.model.url,
@@ -658,6 +661,11 @@ class Lab:
             }
         )
         return env
+
+    def _host_home(self) -> Path:
+        home = self.root / "home"
+        home.mkdir(parents=True, exist_ok=True)
+        return home
 
     def _seed_claude_config(self) -> None:
         """Pre-accept Claude Code's onboarding and workspace-trust prompts."""

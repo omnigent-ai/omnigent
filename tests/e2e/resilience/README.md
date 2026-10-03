@@ -60,8 +60,18 @@ They are built from four pieces:
 - `lab_factory` (`conftest.py`) starts labs. It keeps the root of a failing
   run, or of every run with `OMNIGENT_RESILIENCE_KEEP=1`.
 
-Rows that break the contract today are `xfail(strict=True)` with the finding,
-so a fix that makes one pass must also delete its marker.
+`scenarios/_contract.py` holds the shared phases (idle, tool running, tool
+ending during the outage, approval pending) and the checks every scenario
+records once its fault clears.
+
+Rows that break the contract today are pinned to their finding in one of two
+ways. A row that breaks several checks is marked `xfail(strict=True)`. When a
+single check fails, it gets `report.check(..., known_gap="R5")` instead, so
+the row's other checks still guard against regressions. Either way, a fix that
+makes the row pass must also remove the marker.
+
+S6 drives a real page with Playwright's Chromium against the built web UI
+(`pnpm --filter web run build`). It is skipped when either is missing.
 
 ## Faults
 

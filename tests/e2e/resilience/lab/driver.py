@@ -95,11 +95,58 @@ class ClaudeDriver:
         )
         return turn, str(approval["elicitation_id"])
 
+    def start_streaming_turn(self, seconds: float, *, retries: int = 3) -> Turn:
+        """Start a text turn whose reply streams for about *seconds*; return once it streams.
+
+        The reply is queued *retries* extra times so a harness that retries a
+        dropped model stream still gets the same answer.
+
+        :param seconds: Streaming duration, e.g. ``8``.
+        :param retries: Extra copies of the reply for retried model calls.
+        :returns: The streaming turn.
+        """
+        turn = self._turn()
+        words = 40
+        text = " ".join(f"word{i}" for i in range(words)) + f" {turn.reply}"
+        reply = {"text": text, "chunk_delay": seconds / (words + 5)}
+        self.lab.script_turn(turn.marker, [reply] * (1 + retries))
+        self.send(turn)
+        wait_for(
+            lambda: True if self.model_calls(turn) else None,
+            timeout=_TURN_TIMEOUT_S,
+            what=f"the model call for {turn.marker}",
+        )
+        return turn
+
     def send(self, turn: Turn) -> httpx.Response:
         """Send the turn's user message through the client link."""
-        response = self.lab.send_message(self.session_id, f"Run the task for {turn.marker}")
+        response = self.send_raw(turn)
         assert response.status_code < 400, response.text
         return response
+
+    def send_raw(self, turn: Turn, *, timeout: float = 90.0) -> httpx.Response:
+        """Send the turn's user message and return the response, whatever it is."""
+        return self.lab.send_message(
+            self.session_id, f"Run the task for {turn.marker}", timeout=timeout
+        )
+
+    def text_turn(self) -> Turn:
+        """Script a text-only turn without sending it."""
+        turn = self._turn()
+        self.lab.script_turn(turn.marker, [{"text": turn.reply}])
+        return turn
+
+    def model_calls(self, turn: Turn) -> int:
+        """How many main-loop model requests have carried *turn*'s message so far."""
+        assert self.lab.model is not None
+        count = 0
+        for request in self.lab.model.requests():
+            tools = request.get("tools") if isinstance(request.get("tools"), list) else []
+            if any(isinstance(t, dict) and t.get("name") == "Bash" for t in tools) and (
+                turn.marker in json.dumps(request.get("messages", ""))
+            ):
+                count += 1
+        return count
 
     def pending_approval(self, turn: Turn) -> dict[str, Any] | None:
         """The pending approval prompt for *turn*, read directly from the server."""

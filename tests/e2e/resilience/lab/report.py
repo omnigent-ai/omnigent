@@ -30,11 +30,15 @@ class Check:
     :param name: Short stable name, e.g. ``"no_failed_status_during_outage"``.
     :param passed: Whether the expectation held.
     :param detail: Evidence, e.g. the offending observation.
+    :param known_gap: Finding id this check is known to fail on, e.g. ``"R5"``.
+        A failing known-gap check is reported but does not fail the run; a
+        passing one does, so the stale marker gets removed with the fix.
     """
 
     name: str
     passed: bool
     detail: str = ""
+    known_gap: str | None = None
 
 
 @dataclass
@@ -52,9 +56,14 @@ class ScenarioReport:
     lab_root: str = ""
     started: float = field(default_factory=time.time)
 
-    def check(self, name: str, passed: bool, detail: str = "") -> bool:
-        """Record one expectation; returns *passed* for chaining."""
-        self.checks.append(Check(name, bool(passed), detail))
+    def check(
+        self, name: str, passed: bool, detail: str = "", *, known_gap: str | None = None
+    ) -> bool:
+        """Record one expectation; returns *passed* for chaining.
+
+        :param known_gap: Finding id when this check is expected to fail today.
+        """
+        self.checks.append(Check(name, bool(passed), detail, known_gap))
         return bool(passed)
 
     def attach(self, watcher: SessionWatcher, lab_root: Path) -> None:
@@ -64,15 +73,29 @@ class ScenarioReport:
 
     @property
     def failures(self) -> list[Check]:
-        """Checks that did not hold."""
-        return [check for check in self.checks if not check.passed]
+        """Checks that did not hold, excluding known gaps."""
+        return [c for c in self.checks if not c.passed and c.known_gap is None]
+
+    @property
+    def gaps(self) -> list[Check]:
+        """Known-gap checks that still fail."""
+        return [c for c in self.checks if not c.passed and c.known_gap is not None]
+
+    @property
+    def stale_gaps(self) -> list[Check]:
+        """Known-gap checks that now pass; their markers must be removed."""
+        return [c for c in self.checks if c.passed and c.known_gap is not None]
 
     def markdown_row(self) -> str:
         """One matrix row: scenario, parameters, verdict, failed checks."""
         params = ", ".join(f"{key}={value}" for key, value in self.params.items())
-        verdict = "pass" if not self.failures else "FAIL"
-        failed = "; ".join(f"{c.name}: {c.detail}" for c in self.failures) or "—"
-        return f"| {self.scenario} | {params} | {verdict} | {failed} |"
+        broken = self.failures + self.stale_gaps
+        verdict = "FAIL" if broken else ("gap" if self.gaps else "pass")
+        failed = "; ".join(
+            f"{c.name}{f' [{c.known_gap}]' if c.known_gap else ''}: {c.detail}"
+            for c in broken + self.gaps
+        )
+        return f"| {self.scenario} | {params} | {verdict} | {failed or '—'} |"
 
     def write(self) -> Path:
         """Write ``<name>.json`` and ``<name>.md`` to the report directory."""
@@ -91,7 +114,8 @@ class ScenarioReport:
             "## Checks",
             "",
             *(
-                f"- {'✅' if c.passed else '❌'} `{c.name}` {c.detail}".rstrip()
+                f"- {'✅' if c.passed else ('⚠️' if c.known_gap else '❌')} `{c.name}`"
+                f"{f' (known gap {c.known_gap})' if c.known_gap else ''} {c.detail}".rstrip()
                 for c in self.checks
             ),
             "",
@@ -109,11 +133,16 @@ class ScenarioReport:
     def require(self) -> None:
         """Fail with every broken expectation and the timeline that explains it."""
         path = self.write()
-        if not self.failures:
+        broken = self.failures + self.stale_gaps
+        if not broken:
             return
-        listed = "\n".join(f"  - {c.name}: {c.detail}" for c in self.failures)
+        listed = "\n".join(
+            f"  - {c.name}: "
+            + (f"passes now; remove known_gap={c.known_gap!r}" if c.passed else c.detail)
+            for c in broken
+        )
         raise AssertionError(
-            f"{self.scenario} {self._param_slug()} broke {len(self.failures)} expectation(s):\n"
+            f"{self.scenario} {self._param_slug()} broke {len(broken)} expectation(s):\n"
             f"{listed}\nreport: {path}\ntimeline:\n{self.timeline}"
         )
 
