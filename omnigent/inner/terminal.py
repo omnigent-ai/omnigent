@@ -77,6 +77,11 @@ _TMUX_START_ON_ATTACH_CHANNEL = "omnigent-start-on-attach"
 # can reap tmux servers whose owner died without graceful shutdown
 # (``reap_orphaned_terminals``).
 _TERMINAL_DIR_PREFIX = "omnigent-terminal-"
+# Longest ``AF_UNIX`` path that binds on every supported platform: macOS caps
+# ``sun_path`` at 104 bytes including the NUL terminator (Linux allows 108).
+_MAX_UNIX_SOCKET_PATH_BYTES = 103
+# Parent for instance dirs when the configured temp dir is too long for that.
+_SHORT_TMP_ROOT = Path("/tmp")
 # Bound for each ``tmux kill-server`` in the orphan sweep; a wedged
 # tmux must not stall runner startup.
 _REAP_KILL_TIMEOUT_S = 10.0
@@ -795,15 +800,22 @@ def _process_alive(pid: int) -> bool:
 
 def _terminals_tmp_root() -> Path:
     """
-    Return the directory scanned for terminal instance dirs.
+    Return the parent of terminal instance dirs, for creation and the orphan sweep.
 
     Indirection point so tests can retarget the orphan sweep at a
     scratch directory without monkeypatching the process-wide
     ``tempfile`` module (see omnigent-testing rule 14).
 
-    :returns: The system temp directory, e.g. ``Path("/tmp")``.
+    :returns: The configured temp directory, e.g. ``Path("/tmp")``, or
+        ``/tmp`` when a control socket under it would exceed the
+        ``AF_UNIX`` path limit and tmux could not bind it.
     """
-    return Path(tempfile.gettempdir())
+    root = Path(tempfile.gettempdir())
+    # mkdtemp appends eight random characters; clip.sock is the same length.
+    probe = root / f"{_TERMINAL_DIR_PREFIX}{'x' * 8}" / "tmux.sock"
+    if len(os.fsencode(probe)) > _MAX_UNIX_SOCKET_PATH_BYTES:
+        return _SHORT_TMP_ROOT
+    return root
 
 
 def reap_orphaned_terminals() -> int:
@@ -2629,7 +2641,7 @@ def create_terminal_instance(
     _require_supported_tmux()
 
     # Create the instance's private directory.
-    private_dir = Path(tempfile.mkdtemp(prefix=_TERMINAL_DIR_PREFIX))
+    private_dir = Path(tempfile.mkdtemp(prefix=_TERMINAL_DIR_PREFIX, dir=_terminals_tmp_root()))
     socket_path = private_dir / "tmux.sock"
     # Record the owning process so a later startup can reap this tmux
     # server if we die without graceful shutdown (SIGKILL, harness
