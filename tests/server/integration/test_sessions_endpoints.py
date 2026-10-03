@@ -777,6 +777,77 @@ async def test_native_message_repeat_with_same_stable_id_forwards_once(
                 pending_inputs.resolve(session_id, pending["pending_id"])
 
 
+@pytest.mark.parametrize("init_in_flight", [True, False], ids=["init-in-flight", "init-done"])
+async def test_native_message_waits_for_in_flight_runner_init(
+    client: httpx.AsyncClient,
+    app: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    init_in_flight: bool,
+) -> None:
+    """
+    A native message that lands while the runner's session init is still running
+    waits for that init and sends no terminal ensure.
+
+    Otherwise the ensure races init to build the Claude terminal, and init tears
+    down the one the ensure built (a side chat posts its first message about a
+    second after its runner connects). Once init is done, the message path keeps
+    probing the terminal with an ensure as before.
+    """
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.routes._sessions import orchestration
+    from omnigent.server.routes.sessions import routes_events
+
+    pending_inputs.reset_for_tests()
+    ensure_terminal = AsyncMock(return_value=_NativeTerminalEnsureOutcome(error=None))
+    session_init = AsyncMock(return_value=True)
+    monkeypatch.setattr(orchestration, "_ensure_native_terminal_ready", ensure_terminal)
+    monkeypatch.setattr(routes_events, "_ensure_runner_session_initialized", session_init)
+    monkeypatch.setattr(
+        app.state.runner_session_initializer,
+        "init_in_flight",
+        lambda _conv, _client: init_in_flight,
+    )
+    message = {
+        "type": "message",
+        "data": {"role": "user", "content": [{"type": "input_text", "text": "side question"}]},
+    }
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _request: httpx.Response(202, json={})),
+        base_url="http://runner",
+    ) as runner:
+        monkeypatch.setattr(sessions_module, "_get_runner_client", AsyncMock(return_value=runner))
+        monkeypatch.setattr(
+            "omnigent.server.routes._sessions.orchestration._get_runner_client",
+            AsyncMock(return_value=runner),
+        )
+        agent = await create_test_agent(client, name="claude-native-ui")
+        created = await client.post(
+            "/v1/sessions",
+            json={
+                "agent_id": agent["id"],
+                "labels": {
+                    "omnigent.ui": "terminal",
+                    "omnigent.wrapper": "claude-code-native-ui",
+                },
+            },
+        )
+        assert created.status_code == 201, created.text
+        session_id = created.json()["id"]
+        try:
+            posted = await client.post(f"/v1/sessions/{session_id}/events", json=message)
+            assert posted.status_code == 202, posted.text
+            if init_in_flight:
+                assert session_init.await_count == 1
+                assert ensure_terminal.await_count == 0
+            else:
+                assert session_init.await_count == 0
+                assert ensure_terminal.await_count == 1
+        finally:
+            for pending in pending_inputs.snapshot_for(session_id):
+                pending_inputs.resolve(session_id, pending["pending_id"])
+
+
 async def test_native_user_item_respects_background_title_header_opt_out(
     client: httpx.AsyncClient,
     app: Any,
