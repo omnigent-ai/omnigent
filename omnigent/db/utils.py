@@ -1433,6 +1433,22 @@ def strip_nul_bytes(value: str) -> str:
     return value.replace("\x00", "")
 
 
+LIKE_ESCAPE_CHAR = "!"
+"""Escape character paired with :func:`substring_like_pattern` via ``escape=``."""
+
+
+def substring_like_pattern(query: str) -> str:
+    """Build a ``%query%`` ``LIKE`` pattern that matches ``query`` literally."""
+    # Pair with ``escape=LIKE_ESCAPE_CHAR``: that also makes backslash literal, so
+    # only the wildcards and the escape character itself need escaping.
+    escaped = (
+        query.replace(LIKE_ESCAPE_CHAR, LIKE_ESCAPE_CHAR * 2)
+        .replace("%", f"{LIKE_ESCAPE_CHAR}%")
+        .replace("_", f"{LIKE_ESCAPE_CHAR}_")
+    )
+    return f"%{escaped}%"
+
+
 def build_search_snippet(
     text: str,
     query: str,

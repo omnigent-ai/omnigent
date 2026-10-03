@@ -62,6 +62,7 @@ from omnigent.db.enum_codecs import (
 )
 from omnigent.db.query_context import query_name_scope
 from omnigent.db.utils import (
+    LIKE_ESCAPE_CHAR,
     _supports_fts5,
     build_search_snippet,
     delete_fts_by_conversation_ids,
@@ -78,6 +79,7 @@ from omnigent.db.utils import (
     run_write_transaction,
     shared_read_scope,
     strip_nul_bytes,
+    substring_like_pattern,
 )
 from omnigent.entities import (
     Conversation,
@@ -657,7 +659,9 @@ def _fetch_search_snippets(
     """
     if not conversation_ids or not query:
         return {}
-    pattern = f"%{query.lower()}%"
+    # Same literal pattern as the list predicate, so the item matched here is
+    # the one build_search_snippet can excerpt.
+    pattern = substring_like_pattern(query.lower())
     workspace_id = current_workspace_id()
     # workspace_id leads the (workspace_id, conversation_id, position) index.
     # Both the aggregate and the join-back below must include it or Postgres
@@ -669,7 +673,7 @@ def _fetch_search_snippets(
     match_pred = and_(
         SqlConversationItem.workspace_id == workspace_id,
         SqlConversationItem.conversation_id.in_(conversation_ids),
-        SqlConversationItem.search_text.ilike(pattern),
+        SqlConversationItem.search_text.ilike(pattern, escape=LIKE_ESCAPE_CHAR),
     )
     # Earliest matching position per conversation — a small (conv_id, position)
     # aggregate, no bodies materialized.
@@ -2762,12 +2766,13 @@ class SqlAlchemyConversationStore(ConversationStore):
         :param search_query: Case-insensitive substring filter on
             the session title OR conversation item content.
             ``None`` or empty string disables the filter;
-            otherwise matches conversations where
-            ``LOWER(title) LIKE %query%`` or any
-            ``conversation_items.search_text`` contains the
-            query. Implemented with the SQL ``LIKE`` operator
-            (no FTS) so it works against both SQLite and
-            Postgres without extra extensions.
+            otherwise matches conversations whose lowercased
+            title or any ``conversation_items.search_text``
+            contains the query. Implemented with the SQL
+            ``LIKE`` operator (no FTS) so it works against both
+            SQLite and Postgres without extra extensions; ``%``,
+            ``_`` and backslash in the query are matched
+            literally, never as wildcards.
         :param include_archived: When ``False`` (default), exclude
             rows where ``archived`` is true. When ``True``, include
             archived rows alongside non-archived ones.
@@ -2986,8 +2991,12 @@ class SqlAlchemyConversationStore(ConversationStore):
             if title is not None:
                 stmt = stmt.where(SqlConversation.title == title)
             if search_query:
-                pattern = f"%{search_query.lower()}%"
-                title_match = func.lower(SqlConversation.title).like(pattern)
+                # %, _ and backslash in the user's text are literal characters,
+                # not LIKE wildcards or the escape.
+                pattern = substring_like_pattern(search_query.lower())
+                title_match = func.lower(SqlConversation.title).like(
+                    pattern, escape=LIKE_ESCAPE_CHAR
+                )
                 # Correlated EXISTS rather than ``id IN (SELECT ...)``: the IN
                 # form is uncorrelated, so the match set is built for the WHOLE
                 # workspace before the outer query discards every row the caller
@@ -3007,7 +3016,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                     .where(
                         SqlConversationItem.workspace_id == current_workspace_id(),
                         SqlConversationItem.conversation_id == SqlConversation.id,
-                        SqlConversationItem.search_text.ilike(pattern),
+                        SqlConversationItem.search_text.ilike(pattern, escape=LIKE_ESCAPE_CHAR),
                     )
                     .exists()
                 )
