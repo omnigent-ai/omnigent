@@ -325,6 +325,12 @@ jobs:
         with:
           harness: codex
 
+      - name: Install Pi CLI
+        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+        uses: omnigent-ai/omnigent/.github/actions/setup-harness-cli@aa5736c38f5c1258ee29452c6825d75033b952d7
+        with:
+          harness: pi
+
       - name: Install Antigravity CLI
         uses: ./.github/actions/setup-agy
 
