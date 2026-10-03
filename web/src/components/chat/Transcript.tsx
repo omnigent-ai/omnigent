@@ -724,8 +724,6 @@ export function VirtualBubbleList({
   // continues the top turn renames it. Keep rendering it under the key its row
   // already has: React keeps the node (a remount replays the action row's hover
   // fade on every page) and react-virtual keeps the measured height.
-  // Only a prepend can rename a bubble, and a prepend always changes the first
-  // bubble's key, so the alias map is only rebuilt then.
   const firstBubbleKey = bubbles.length > 0 ? bubbleKey(bubbles[0]!) : undefined;
   if (
     renderedFirstKeyRef.current !== undefined &&
@@ -761,6 +759,27 @@ export function VirtualBubbleList({
     }
     for (const key of aliases.keys()) {
       if (!currentKeys.has(key)) aliases.delete(key);
+    }
+  }
+  // Committing streamed text replaces its temporary key with a saved item id.
+  // Keep the measured row: remounting resets its height and moves the reader.
+  if (!prependCommitRef.current && bubbles.length === renderedBubblesRef.current.length) {
+    for (let index = 0; index < bubbles.length; index += 1) {
+      const previous = renderedBubblesRef.current[index]!;
+      const current = bubbles[index]!;
+      if (
+        previous.kind === "assistant" &&
+        current.kind === "assistant" &&
+        previous.lifecycle === "streaming" &&
+        previous.responseId === current.responseId &&
+        previous.stableId !== current.stableId
+      ) {
+        const previousKey = bubbleKey(previous);
+        rowKeyAliasRef.current.set(
+          bubbleKey(current),
+          rowKeyAliasRef.current.get(previousKey) ?? previousKey,
+        );
+      }
     }
   }
   renderedFirstKeyRef.current = firstBubbleKey;
