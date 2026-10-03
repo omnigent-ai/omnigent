@@ -13,8 +13,10 @@ import {
   PrinterIcon,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { cn } from "@/lib/utils";
 import {
   HTML_PREVIEW_SANDBOX,
+  SLIDES_EDITABLE_SELECTOR,
   SLIDES_MSG_SOURCE,
   countSlideSections,
   prepareSlidesDoc,
@@ -27,6 +29,18 @@ const STAGE_H = 720;
 
 const PREV_KEYS = new Set(["ArrowLeft", "PageUp"]);
 const NEXT_KEYS = new Set(["ArrowRight", "PageDown"]);
+
+/** Same rule as the iframe script: leave modified keys and editable targets alone. */
+export function isIgnoredNavKey(e: {
+  defaultPrevented: boolean;
+  altKey: boolean;
+  metaKey: boolean;
+  ctrlKey: boolean;
+  target: EventTarget | null;
+}): boolean {
+  if (e.defaultPrevented || e.altKey || e.metaKey || e.ctrlKey) return true;
+  return e.target instanceof Element && !!e.target.closest(SLIDES_EDITABLE_SELECTOR);
+}
 
 export interface SlidesViewerProps {
   content: string;
@@ -43,16 +57,24 @@ export function SlidesViewer({
   const rootRef = useRef<HTMLDivElement>(null);
   const stageRef = useRef<HTMLDivElement>(null);
   const iframeRef = useRef<HTMLIFrameElement>(null);
-  const total = useMemo(() => countSlideSections(content), [content]);
+  const sourceTotal = useMemo(() => countSlideSections(content), [content]);
   const srcDoc = useMemo(() => prepareSlidesDoc(content), [content]);
+  // The iframe's runtime count wins once it reports for the current document.
+  const [runtime, setRuntime] = useState<{ srcDoc: string; total: number } | null>(null);
+  const total = runtime?.srcDoc === srcDoc ? runtime.total : sourceTotal;
   const [index, setIndex] = useState(0);
   const [scale, setScale] = useState(0);
   const [isFullscreen, setIsFullscreen] = useState(false);
   const fullscreenSupported = typeof document !== "undefined" && !!document.fullscreenEnabled;
 
   const current = Math.min(index, Math.max(0, total - 1));
+  // Step from the clamped index so a shrinking deck never eats a keypress.
   const step = useCallback(
-    (delta: number) => setIndex((i) => Math.max(0, Math.min(total - 1, i + delta))),
+    (delta: number) =>
+      setIndex((i) => {
+        const last = Math.max(0, total - 1);
+        return Math.max(0, Math.min(last, Math.min(i, last) + delta));
+      }),
     [total],
   );
 
@@ -62,18 +84,19 @@ export function SlidesViewer({
 
   useEffect(() => post({ type: "goto", index: current }), [current, post]);
 
-  // Keys pressed inside the iframe arrive as messages; trust only our iframe.
+  // Count reports and forwarded keys arrive as messages; trust only our iframe.
   useEffect(() => {
     const onMessage = (e: MessageEvent) => {
       const win = iframeRef.current?.contentWindow;
       if (!win || e.source !== win || e.data?.source !== SLIDES_MSG_SOURCE) return;
-      if (e.data.type !== "key") return;
-      if (PREV_KEYS.has(e.data.key)) step(-1);
-      else if (NEXT_KEYS.has(e.data.key)) step(1);
+      const { type, key, total: n } = e.data;
+      if (type === "count" && Number.isInteger(n) && n >= 0) setRuntime({ srcDoc, total: n });
+      else if (type === "key" && PREV_KEYS.has(key)) step(-1);
+      else if (type === "key" && NEXT_KEYS.has(key)) step(1);
     };
     window.addEventListener("message", onMessage);
     return () => window.removeEventListener("message", onMessage);
-  }, [step]);
+  }, [step, srcDoc]);
 
   // Scale the stage to fit the container, letterboxed (desktop rail and mobile).
   useEffect(() => {
@@ -85,7 +108,7 @@ export function SlidesViewer({
     const ro = new ResizeObserver(measure);
     ro.observe(el);
     return () => ro.disconnect();
-  }, [total]);
+  }, []);
 
   useEffect(() => {
     const onChange = () => setIsFullscreen(document.fullscreenElement === rootRef.current);
@@ -101,6 +124,7 @@ export function SlidesViewer({
   };
 
   const onKeyDown = (e: KeyboardEvent) => {
+    if (isIgnoredNavKey(e)) return;
     if (PREV_KEYS.has(e.key)) step(-1);
     else if (NEXT_KEYS.has(e.key)) step(1);
     else return;
@@ -122,17 +146,10 @@ export function SlidesViewer({
     </Button>
   );
 
-  if (total === 0) {
-    return (
-      <div className="flex h-full flex-col items-center justify-center gap-2 p-8 text-center text-ui text-muted-foreground">
-        <PresentationIcon className="size-6" />
-        <p className="font-medium text-foreground">No slides yet</p>
-        <p>Add a top-level &lt;section&gt; for each slide.</p>
-        {sourceButton}
-      </div>
-    );
-  }
+  const empty = total === 0;
 
+  // One tree for both states so the iframe stays mounted (hidden) while empty
+  // and can still report a runtime count.
   return (
     <div
       ref={rootRef}
@@ -144,9 +161,20 @@ export function SlidesViewer({
       className="flex h-full flex-col bg-background outline-none focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-ring"
     >
       {truncated && <TruncatedBanner />}
+      {empty && (
+        <div className="flex flex-1 flex-col items-center justify-center gap-2 p-8 text-center text-ui text-muted-foreground">
+          <PresentationIcon className="size-6" />
+          <p className="font-medium text-foreground">No slides yet</p>
+          <p>Add a top-level &lt;section&gt; for each slide.</p>
+          {sourceButton}
+        </div>
+      )}
       <div
         ref={stageRef}
-        className="relative flex min-h-0 flex-1 items-center justify-center overflow-hidden bg-muted"
+        className={cn(
+          "relative flex min-h-0 flex-1 items-center justify-center overflow-hidden bg-muted",
+          empty && "hidden",
+        )}
       >
         <div style={{ width: STAGE_W * scale, height: STAGE_H * scale }}>
           <iframe
@@ -160,67 +188,69 @@ export function SlidesViewer({
           />
         </div>
       </div>
-      <div className="flex shrink-0 items-center justify-between gap-2 border-t border-border px-2 py-1 text-ui text-muted-foreground">
-        <div className="flex items-center gap-1">
-          <Button
-            type="button"
-            variant="ghost"
-            size="icon"
-            aria-label="Previous slide"
-            disabled={current === 0}
-            onClick={() => step(-1)}
-            className="size-8"
-          >
-            <ChevronLeftIcon className="size-4" />
-          </Button>
-          <span aria-live="polite" className="min-w-12 text-center tabular-nums text-foreground">
-            {current + 1} / {total}
-          </span>
-          <Button
-            type="button"
-            variant="ghost"
-            size="icon"
-            aria-label="Next slide"
-            disabled={current === total - 1}
-            onClick={() => step(1)}
-            className="size-8"
-          >
-            <ChevronRightIcon className="size-4" />
-          </Button>
-        </div>
-        <div className="flex items-center gap-1">
-          <Button
-            type="button"
-            variant="ghost"
-            size="sm"
-            aria-label="Print / Save as PDF"
-            title="Print / Save as PDF"
-            onClick={() => post({ type: "print" })}
-            className="h-8 gap-1.5 px-2"
-          >
-            <PrinterIcon className="size-4" />
-            <span className="hidden sm:inline">Print / PDF</span>
-          </Button>
-          {sourceButton}
-          {fullscreenSupported && (
+      {!empty && (
+        <div className="flex shrink-0 items-center justify-between gap-2 border-t border-border px-2 py-1 text-ui text-muted-foreground">
+          <div className="flex items-center gap-1">
             <Button
               type="button"
               variant="ghost"
               size="icon"
-              aria-label={isFullscreen ? "Exit fullscreen" : "Enter fullscreen"}
-              title={isFullscreen ? "Exit fullscreen" : "Enter fullscreen"}
-              onClick={toggleFullscreen}
+              aria-label="Previous slide"
+              disabled={current === 0}
+              onClick={() => step(-1)}
               className="size-8"
             >
-              {isFullscreen ? (
-                <Minimize2Icon className="size-4" />
-              ) : (
-                <Maximize2Icon className="size-4" />
-              )}
+              <ChevronLeftIcon className="size-4" />
             </Button>
-          )}
+            <span aria-live="polite" className="min-w-12 text-center tabular-nums text-foreground">
+              {current + 1} / {total}
+            </span>
+            <Button
+              type="button"
+              variant="ghost"
+              size="icon"
+              aria-label="Next slide"
+              disabled={current === total - 1}
+              onClick={() => step(1)}
+              className="size-8"
+            >
+              <ChevronRightIcon className="size-4" />
+            </Button>
+          </div>
+          <div className="flex items-center gap-1">
+            <Button
+              type="button"
+              variant="ghost"
+              size="sm"
+              aria-label="Print / Save as PDF"
+              title="Print / Save as PDF"
+              onClick={() => post({ type: "print" })}
+              className="h-8 gap-1.5 px-2"
+            >
+              <PrinterIcon className="size-4" />
+              <span className="hidden sm:inline">Print / Save as PDF</span>
+            </Button>
+            {sourceButton}
+            {fullscreenSupported && (
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon"
+                aria-label={isFullscreen ? "Exit fullscreen" : "Enter fullscreen"}
+                title={isFullscreen ? "Exit fullscreen" : "Enter fullscreen"}
+                onClick={toggleFullscreen}
+                className="size-8"
+              >
+                {isFullscreen ? (
+                  <Minimize2Icon className="size-4" />
+                ) : (
+                  <Maximize2Icon className="size-4" />
+                )}
+              </Button>
+            )}
+          </div>
         </div>
-      </div>
+      )}
     </div>
   );
 }

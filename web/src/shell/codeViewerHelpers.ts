@@ -629,35 +629,59 @@ body>section:last-of-type{break-after:auto}
 }
 </style>`;
 
-// Only the embedding parent may drive the deck; keys are forwarded so
-// navigation still works while focus is inside the iframe.
+/** Navigation keys inside these targets belong to the control, not the deck. */
+export const SLIDES_EDITABLE_SELECTOR =
+  'input, textarea, select, [contenteditable]:not([contenteditable="false"])';
+
+// Only the embedding parent may drive the deck. The script reports the runtime
+// slide count (decks may build sections with JS) and forwards nav keys so they
+// work while focus is inside the iframe.
 const SLIDES_SCRIPT = `<script>
 (function(){
-var S="${SLIDES_MSG_SOURCE}";
-function show(i){var s=document.querySelectorAll("body > section");for(var k=0;k<s.length;k++)s[k].toggleAttribute("data-omnigent-active",k===i);}
+var S="${SLIDES_MSG_SOURCE}",E=${JSON.stringify(SLIDES_EDITABLE_SELECTOR)};
+var KEYS=["ArrowLeft","ArrowRight","PageUp","PageDown"];
+function all(){return document.querySelectorAll("body > section");}
+function show(i){var s=all();for(var k=0;k<s.length;k++)s[k].toggleAttribute("data-omnigent-active",k===i);}
+function count(){parent.postMessage({source:S,type:"count",total:all().length},"*");}
 show(0);
+count();
+addEventListener("load",count);
 addEventListener("message",function(e){
 if(e.source!==parent||!e.data||e.data.source!==S)return;
 if(e.data.type==="goto"&&typeof e.data.index==="number")show(e.data.index);
 else if(e.data.type==="print")print();
 });
 addEventListener("keydown",function(e){
-if(["ArrowLeft","ArrowRight","PageUp","PageDown"].indexOf(e.key)<0)return;
+if(e.defaultPrevented||e.altKey||e.metaKey||e.ctrlKey||KEYS.indexOf(e.key)<0)return;
+if(e.target&&e.target.closest&&e.target.closest(E))return;
 e.preventDefault();
 parent.postMessage({source:S,type:"key",key:e.key},"*");
 });
 })();
 </script>`;
 
+/** Index of the last `</body>` outside HTML comments, or -1. */
+function lastBodyCloseIndex(doc: string): number {
+  const comments = Array.from(doc.matchAll(/<!--[\s\S]*?(?:-->|$)/g), (m) => [
+    m.index,
+    m.index + m[0].length,
+  ]);
+  let at = -1;
+  for (const m of doc.matchAll(/<\/body\s*>/gi)) {
+    if (!comments.some(([s, e]) => m.index >= s && m.index < e)) at = m.index;
+  }
+  return at;
+}
+
 /**
  * Build the slide-deck srcdoc: the HTML preview doc plus injected CSS/script
- * placed before the last `</body>` (appended for fragments). The file on disk
- * is never modified.
+ * placed before the last real `</body>` (appended when there is none). The
+ * file on disk is never modified.
  */
 export function prepareSlidesDoc(html: string): string {
   const doc = prepareHtmlPreviewDoc(html);
   const injection = SLIDES_STYLE + SLIDES_SCRIPT;
-  const at = doc.toLowerCase().lastIndexOf("</body>");
+  const at = lastBodyCloseIndex(doc);
   return at === -1 ? doc + injection : doc.slice(0, at) + injection + doc.slice(at);
 }
 

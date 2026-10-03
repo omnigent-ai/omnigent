@@ -52,6 +52,8 @@ doctor`) and the built web UI.
 - Only `*.slides.html` routes to the deck viewer; `slides.html` or `.htm`
   files use the plain HTML preview.
 - Only sections that are direct children of the body count as slides.
+- A literal `</body>` in page text or `<noscript>` can shift where the viewer's
+  script is injected, and the counter may change once the deck loads.
 - The toolbar's "View source" and the deck's "View deck source" both reach the
   same code view.
 - Text-selection comments are available in the plain HTML preview, not in the
