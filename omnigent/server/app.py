@@ -2789,6 +2789,11 @@ def create_app(
            ``session_cookie`` names the session cookie for ``oidc`` and
            ``accounts`` and is ``null`` otherwise. A missing ``auth`` (older
            servers) means "sign in as before".
+        6. ``server_name`` (str | null) is the operator's display name for
+           this deployment (``branding.server_name``), for clients that list
+           several servers. Self-asserted by the server, so clients show it
+           for display only and keep the host in any trust decision. Null
+           when unset; it never falls back to ``branding.app_name``.
 
         Unknown fields MUST be ignored, and a missing manifest (404 — every
         server older than this route) MUST be treated as the pre-manifest
@@ -2821,6 +2826,7 @@ def create_app(
                 "mode": auth_mode(auth_provider),
                 "session_cookie": getattr(auth_provider, "session_cookie_name", None),
             },
+            "server_name": branding_snapshot.server_name,
         }
 
     @app.get("/v1/info", response_model=ServerInfoResponse)
