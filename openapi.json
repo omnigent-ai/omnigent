@@ -3049,7 +3049,7 @@
           "limit": {
             "default": 10,
             "format": "int64",
-            "maximum": 100.0,
+            "maximum": 1000.0,
             "minimum": 1.0,
             "title": "Limit",
             "type": "integer"
