@@ -17,7 +17,6 @@ import pytest
 
 from tests.e2e.resilience.lab.driver import SessionDriver
 from tests.e2e.resilience.lab.lab import Harness, Lab
-from tests.e2e.resilience.lab.observe import SessionWatcher
 from tests.e2e.resilience.lab.report import ScenarioReport
 from tests.e2e.resilience.scenarios import _contract as contract
 
@@ -40,12 +39,11 @@ def test_s1_ingress_recycle(
 ) -> None:
     lab = lab_factory()
     driver = SessionDriver.create(lab, harness)
-    session_id = driver.session_id
     report = ScenarioReport(
         "S1 ingress recycle",
         {"harness": harness, "phase": phase, "window_s": outage_s},
     )
-    with SessionWatcher(lab.server_url, session_id) as watcher:
+    with contract.observe(lab, driver, report) as watcher:
         entered = contract.enter(driver, phase, outage_s=outage_s)
         started = time.time()
         faults = [
@@ -82,5 +80,4 @@ def test_s1_ingress_recycle(
             fault_end=ended,
             outage_s=0,
         )
-    report.attach(watcher, lab.root)
     report.require()

@@ -107,9 +107,9 @@ reconnected, because passive recovery clears only `runner_disconnected`.
 
 Both harnesses. With no live tunnel the server finds no runner to stop. It
 treats the Stop as done and shows the session idle. The turn keeps running on
-the host and finishes once the host returns. With Claude, the next message is
-delivered while Claude is still busy with the "stopped" turn, and it never
-appears in Claude's transcript. With Codex, the next message is processed
+the host and finishes once the host returns. With Claude, the next message was in
+some runs delivered while Claude was still busy with the "stopped" turn, and
+it never appeared in Claude's transcript. With Codex, the next message is processed
 after the "stopped" turn completes.
 
 ### R5: The page never says it is offline
@@ -164,6 +164,10 @@ plus the blackhole and flap idle rows at 120 s.
   not yet a scenario row.
 
 ## Running and reading results
+
+Set `OMNIGENT_RESILIENCE_VIDEO=both` to record the user's view of every run,
+with each fault captioned on screen
+([how](../tests/e2e/resilience/README.md#recording-what-the-user-sees)).
 
 ```sh
 uv run --no-sync pytest tests/e2e/resilience/scenarios -v              # short outages

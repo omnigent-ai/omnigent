@@ -57,6 +57,7 @@ class ScenarioReport:
     checks: list[Check] = field(default_factory=list)
     timeline: str = ""
     lab_root: str = ""
+    videos: list[str] = field(default_factory=list)
     started: float = field(default_factory=time.time)
 
     def check(
@@ -113,7 +114,7 @@ class ScenarioReport:
         """Write ``<name>.json`` and ``<name>.md`` to the report directory."""
         directory = report_dir()
         directory.mkdir(parents=True, exist_ok=True)
-        stem = re.sub(r"[^A-Za-z0-9_.-]+", "-", f"{self.scenario}-{self._param_slug()}")
+        stem = self.file_stem()
         payload = {**asdict(self), "failures": [asdict(c) for c in self.failures]}
         (directory / f"{stem}.json").write_text(json.dumps(payload, indent=2) + "\n")
         lines = [
@@ -138,6 +139,13 @@ class ScenarioReport:
             "```",
             "",
         ]
+        if self.videos:
+            lines[-1:-1] = [
+                "## Videos",
+                "",
+                *(f"- [{Path(v).name}]({v})" for v in self.videos),
+                "",
+            ]
         path = directory / f"{stem}.md"
         path.write_text("\n".join(lines))
         return path
@@ -160,6 +168,24 @@ class ScenarioReport:
 
     def _param_slug(self) -> str:
         return ",".join(f"{key}={value}" for key, value in self.params.items())
+
+    def file_stem(self) -> str:
+        """File-name-safe stem shared by this run's report and videos."""
+        return re.sub(r"[^A-Za-z0-9_.-]+", "-", f"{self.scenario}-{self._param_slug()}")
+
+    def verdict_lines(self) -> list[str]:
+        """Short closing summary for a recording: verdict, then each broken check."""
+        broken = self.failures + self.stale_gaps
+        head = (
+            "✗ contract broken"
+            if broken
+            else ("⚠ known gap" if self.gaps else "✓ all checks passed")
+        )
+        lines = [f"{self.scenario}  ({self._param_slug()})", head]
+        for check in broken + self.gaps:
+            gap = f" [{check.known_gap}]" if check.known_gap else ""
+            lines.append(f"  ✗ {check.name}{gap}: {check.detail}"[:160])
+        return lines
 
 
 def report_dir() -> Path:
@@ -186,5 +212,65 @@ def matrix(directory: Path | None = None) -> str:
     return "\n".join(header + rows)
 
 
+def html_index(directory: Path | None = None) -> Path:
+    """Write ``index.html`` beside the reports: every run, its checks and videos.
+
+    :param directory: Report directory; defaults to :func:`report_dir`.
+    :returns: The written file.
+    """
+    import html
+
+    root = directory or report_dir()
+    sections = []
+    for path in sorted(root.glob("*.json")):
+        data = json.loads(path.read_text())
+        report = ScenarioReport(
+            data["scenario"],
+            data["params"],
+            checks=[Check(**check) for check in data["checks"]],
+            videos=data.get("videos", []),
+        )
+        broken = report.failures + report.stale_gaps
+        verdict = "FAIL" if broken else ("gap" if report.gaps else "pass")
+        items = "".join(
+            f"<li class={'ok' if c.passed else 'bad'}>{html.escape(c.name)}"
+            f"{html.escape(f' [{c.known_gap}]') if c.known_gap else ''} "
+            f"<small>{html.escape(c.detail)}</small></li>"
+            for c in report.checks
+        )
+        videos = "".join(
+            f'<figure><video controls preload=metadata src="{html.escape(_relative(v, root))}">'
+            f"</video><figcaption>{html.escape(Path(v).name)}</figcaption></figure>"
+            for v in report.videos
+        )
+        params = ", ".join(f"{k}={v}" for k, v in report.params.items())
+        sections.append(
+            f"<section class={verdict}><h2>{html.escape(report.scenario)} "
+            f"<small>{html.escape(params)}</small> <b>{verdict}</b></h2>"
+            f"<ul>{items}</ul><div class=videos>{videos}</div></section>"
+        )
+    page = (
+        "<!doctype html><meta charset=utf-8><title>Resilience runs</title><style>"
+        "body{font:14px system-ui;margin:24px} section{border:1px solid #ddd;border-radius:8px;"
+        "padding:8px 16px;margin:12px 0} section.FAIL{border-color:#b91c1c}"
+        " section.gap{border-color:#d97706}"
+        " .ok{color:#15803d} .bad{color:#b91c1c} .videos{display:flex;gap:12px;flex-wrap:wrap}"
+        " video{width:620px} small{color:#555}</style><h1>Resilience runs</h1>" + "".join(sections)
+    )
+    target = root / "index.html"
+    target.write_text(page)
+    return target
+
+
+def _relative(path: str, root: Path) -> str:
+    target = Path(path)
+    return target.relative_to(root).as_posix() if target.is_relative_to(root) else path
+
+
 if __name__ == "__main__":
-    print(matrix())
+    import sys
+
+    if "--html" in sys.argv[1:]:
+        print(html_index())
+    else:
+        print(matrix())

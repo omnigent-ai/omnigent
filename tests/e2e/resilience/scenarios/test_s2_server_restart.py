@@ -18,7 +18,6 @@ import pytest
 
 from tests.e2e.resilience.lab.driver import SessionDriver
 from tests.e2e.resilience.lab.lab import Harness, Lab
-from tests.e2e.resilience.lab.observe import SessionWatcher
 from tests.e2e.resilience.lab.report import ScenarioReport
 from tests.e2e.resilience.scenarios import _contract as contract
 
@@ -58,11 +57,10 @@ def test_s2_server_restart(
 ) -> None:
     lab = lab_factory()
     driver = SessionDriver.create(lab, harness)
-    session_id = driver.session_id
     report = ScenarioReport(
         "S2 server restart", {"harness": harness, "phase": phase, "outage_s": outage_s}
     )
-    with SessionWatcher(lab.server_url, session_id) as watcher:
+    with contract.observe(lab, driver, report) as watcher:
         entered = contract.enter(driver, phase, outage_s=outage_s)
         down_at = time.time()
         lab.restart_server(downtime_s=outage_s)
@@ -77,5 +75,4 @@ def test_s2_server_restart(
             fault_end=up_at,
             outage_s=outage_s,
         )
-    report.attach(watcher, lab.root)
     report.require()

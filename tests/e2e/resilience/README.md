@@ -73,6 +73,38 @@ makes the row pass must also remove the marker.
 S6 drives a real page with Playwright's Chromium against the built web UI
 (`pnpm --filter web run build`). It is skipped when either is missing.
 
+## Recording what the user sees
+
+Set `OMNIGENT_RESILIENCE_VIDEO=1` (chat view) or `=both` (chat and terminal
+views) to record every scenario. The video is taken from the user's side: a
+headless Chromium opens the session through `proxies.client`, as a real
+browser would. A client-link fault therefore cuts the recorder's own
+connection too.
+
+- Every fault, recovery and user action in the event log appears as a
+  timestamped caption at the top of the page. Red marks a fault, green a
+  recovery, and blue the user (for example "user: clicks Approve").
+- A corner badge names the scenario and its parameters and shows a running
+  clock.
+- The run ends on a verdict panel listing each broken check or known gap.
+
+Videos are written to `.omnigent/resilience/videos/` and linked from each
+report. `python -m tests.e2e.resilience.lab.report --html` writes
+`.omnigent/resilience/index.html`, with every run's checks next to its
+videos. Recording needs the built web UI (`pnpm --filter web run build`) and
+Playwright's Chromium. Without them it is skipped with a warning, and the
+scenario still runs.
+
+```sh
+OMNIGENT_RESILIENCE_VIDEO=both OMNIGENT_E2E_RESILIENCE_FULL=1 \
+  uv run --no-sync pytest "tests/e2e/resilience/scenarios/test_s2_server_restart.py::test_s2_server_restart[claude-approval_pending-60s]"
+uv run --no-sync python -m tests.e2e.resilience.lab.report --html
+```
+
+The terminal view shows the harness's own TUI. On a machine with Claude Code
+managed settings, it also shows that machine's managed hooks failing in the
+lab's isolated home. That noise is local, and CI does not have it.
+
 ## Faults
 
 | Call | Effect |

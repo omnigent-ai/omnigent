@@ -8,9 +8,12 @@ next turn works, the status settles, and no failure shows within the grace.
 
 from __future__ import annotations
 
+import contextlib
 import os
-from collections.abc import Callable, Iterable, Mapping
+import sys
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass
+from pathlib import Path
 
 import pytest
 
@@ -18,10 +21,14 @@ from omnigent.stores.conversation_store import RUNNER_LIVENESS_TTL_S
 from tests.e2e.resilience.lab.driver import SessionDriver, Turn
 from tests.e2e.resilience.lab.lab import Harness, Lab, wait_for
 from tests.e2e.resilience.lab.observe import SessionWatcher
-from tests.e2e.resilience.lab.report import ScenarioReport
+from tests.e2e.resilience.lab.recorder import UserViewRecorder
+from tests.e2e.resilience.lab.report import ScenarioReport, report_dir
 
 #: Long outages run only with ``OMNIGENT_E2E_RESILIENCE_FULL=1``.
 FULL = os.environ.get("OMNIGENT_E2E_RESILIENCE_FULL") == "1"
+#: ``1`` or ``chat`` records the chat view, ``both`` also the terminal view.
+VIDEO_ENV = "OMNIGENT_RESILIENCE_VIDEO"
+_WEB_UI = Path(__file__).resolve().parents[4] / "omnigent" / "server" / "static" / "web-ui"
 GRACE_S = float(RUNNER_LIVENESS_TTL_S)
 #: Time after recovery for reconnects and retried deliveries to settle.
 SETTLE_S = 15.0
@@ -244,4 +251,50 @@ def eventually_round_trip(driver: SessionDriver) -> Turn | None:
     try:
         return driver.round_trip(timeout=RECOVERY_S)
     except (AssertionError, TimeoutError):
+        return None
+
+
+@contextlib.contextmanager
+def observe(lab: Lab, driver: SessionDriver, report: ScenarioReport) -> Iterator[SessionWatcher]:
+    """Watch the session for the scenario's duration, recording it when asked.
+
+    Yields the :class:`SessionWatcher`. On exit the timeline is attached to
+    *report*. With ``OMNIGENT_RESILIENCE_VIDEO`` set, the user's view is also
+    recorded with every fault captioned, and the videos are attached.
+    """
+    watcher = SessionWatcher(lab.server_url, driver.session_id).start()
+    recorder = _start_recorder(lab, driver, report)
+    try:
+        yield watcher
+    finally:
+        watcher.stop()
+        report.attach(watcher, lab.root)
+        if recorder is not None:
+            broken = report.failures + report.stale_gaps
+            videos = recorder.stop(report.verdict_lines(), passed=not broken and not report.gaps)
+            report.videos = [str(path) for path in videos]
+
+
+def _start_recorder(
+    lab: Lab, driver: SessionDriver, report: ScenarioReport
+) -> UserViewRecorder | None:
+    mode = os.environ.get(VIDEO_ENV, "")
+    if mode not in ("1", "chat", "both"):
+        return None
+    if not (_WEB_UI / "index.html").is_file():
+        print("resilience video skipped: web UI is not built", file=sys.stderr)
+        return None
+    params = ", ".join(f"{key}={value}" for key, value in report.params.items())
+    recorder = UserViewRecorder(
+        f"{lab.proxies.client.url}/c/{driver.session_id}",
+        report_dir() / "videos",
+        stem=report.file_stem(),
+        title=f"{report.scenario} ({params})",
+        events=lab.events,
+        views=("chat", "terminal") if mode == "both" else ("chat",),
+    )
+    try:
+        return recorder.start()
+    except (RuntimeError, ImportError) as exc:
+        print(f"resilience video skipped: {exc}", file=sys.stderr)
         return None

@@ -16,7 +16,6 @@ import pytest
 
 from tests.e2e.resilience.lab.driver import SessionDriver, Turn
 from tests.e2e.resilience.lab.lab import Harness, Lab
-from tests.e2e.resilience.lab.observe import SessionWatcher
 from tests.e2e.resilience.lab.report import ScenarioReport
 from tests.e2e.resilience.scenarios import _contract as contract
 
@@ -42,7 +41,7 @@ def test_s7_model_loss(
         "S7 model loss", {"harness": harness, "phase": phase, "outage_s": outage_s}
     )
     model = lab.proxies.model
-    with SessionWatcher(lab.server_url, session_id) as watcher:
+    with contract.observe(lab, driver, report):
         driver.round_trip()
         if phase == "turn_start":
             fault = model.refuse()
@@ -85,7 +84,6 @@ def test_s7_model_loss(
             next_turn is not None,
             "" if next_turn else "a new message after recovery got no reply",
         )
-    report.attach(watcher, lab.root)
     report.require()
 
 

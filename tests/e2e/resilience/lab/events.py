@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -38,6 +40,7 @@ class EventLog:
         self._path = path
         self._lock = threading.Lock()
         self._events: list[LabEvent] = []
+        self._subscribers: list[Callable[[LabEvent], None]] = []
         if path is not None:
             path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -64,7 +67,26 @@ class EventLog:
             if self._path is not None:
                 with self._path.open("a", encoding="utf-8") as handle:
                     handle.write(line + "\n")
+            subscribers = list(self._subscribers)
+        for callback in subscribers:
+            with contextlib.suppress(Exception):  # an observer must never break the lab
+                callback(event)
         return event
+
+    def subscribe(self, callback: Callable[[LabEvent], None]) -> Callable[[], None]:
+        """Call *callback* with every later event, from whichever thread emits it.
+
+        :param callback: Receives each :class:`LabEvent`; must not block.
+        :returns: A function that unsubscribes.
+        """
+        with self._lock:
+            self._subscribers.append(callback)
+
+        def _unsubscribe() -> None:
+            with self._lock, contextlib.suppress(ValueError):
+                self._subscribers.remove(callback)
+
+        return _unsubscribe
 
     def events(self, *, source: str | None = None, kind: str | None = None) -> list[LabEvent]:
         """Return recorded events, optionally filtered.

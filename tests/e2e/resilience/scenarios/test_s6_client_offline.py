@@ -19,7 +19,6 @@ import pytest
 
 from tests.e2e.resilience.lab.driver import SessionDriver
 from tests.e2e.resilience.lab.lab import Harness, Lab
-from tests.e2e.resilience.lab.observe import SessionWatcher
 from tests.e2e.resilience.lab.proxy import Fault
 from tests.e2e.resilience.lab.report import ScenarioReport, report_dir
 from tests.e2e.resilience.scenarios import _contract as contract
@@ -83,7 +82,7 @@ def test_s6_client_offline(
     shots = report_dir() / "screenshots"
     shots.mkdir(parents=True, exist_ok=True)
     stem = f"S6-{mode}-{harness}-{phase}-{outage_s}s"
-    with SessionWatcher(lab.server_url, session_id) as watcher:
+    with contract.observe(lab, driver, report) as watcher:
         warmup = driver.round_trip()
         page.goto(f"{lab.proxies.client.url}/c/{session_id}")  # type: ignore[attr-defined]
         _chat_view(page)
@@ -117,6 +116,7 @@ def test_s6_client_offline(
             visible = _visible(lambda: expect(card).to_be_visible(timeout=_UI_TIMEOUT_MS))
             report.check("ui_approval_card_still_answerable", visible)
             if visible:
+                lab.events.emit("user", "approve", action="clicks Approve on the page")
                 card.get_by_role("button", name="Approve", exact=True).click()
         caught_up = _visible(
             lambda: expect(page.get_by_text(turn.reply)).to_be_visible(  # type: ignore[attr-defined]
@@ -132,6 +132,7 @@ def test_s6_client_offline(
         contract.check_turn_completes(report, driver, turn)
 
         follow = driver.text_turn()
+        lab.events.emit("user", "send", action=f"types a message ({follow.marker})")
         _send(page, f"Run the task for {follow.marker}")
         replied = _visible(
             lambda: expect(page.get_by_text(follow.reply)).to_be_visible(  # type: ignore[attr-defined]
@@ -141,7 +142,6 @@ def test_s6_client_offline(
         report.check("ui_next_message_round_trips", replied)
         contract.check_settled_idle(report, lab, session_id)
         contract.check_no_failure(report, watcher, started, ended + contract.SETTLE_S)
-    report.attach(watcher, lab.root)
     report.require()
 
 

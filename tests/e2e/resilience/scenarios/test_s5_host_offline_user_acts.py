@@ -17,7 +17,6 @@ import pytest
 
 from tests.e2e.resilience.lab.driver import SessionDriver
 from tests.e2e.resilience.lab.lab import Harness, Lab
-from tests.e2e.resilience.lab.observe import SessionWatcher
 from tests.e2e.resilience.lab.proxy import Fault
 from tests.e2e.resilience.lab.report import ScenarioReport
 from tests.e2e.resilience.scenarios import _contract as contract
@@ -42,7 +41,7 @@ _KNOWN_GAPS = {
     ),
     **contract.gaps(
         "R4: Stop with the host unreachable reports success and shows idle, but the turn "
-        "keeps running on the host and finishes once it returns (claude also loses the "
+        "keeps running on the host and finishes once it returns (claude can also lose the "
         "next message in the busy TUI)",
         [("stop", 20), ("stop", 150)],
         harnesses=("claude", "codex"),
@@ -74,7 +73,7 @@ def test_s5_host_offline_user_acts(
     report = ScenarioReport(
         "S5 host offline, user acts", {"harness": harness, "action": action, "outage_s": outage_s}
     )
-    with SessionWatcher(lab.server_url, session_id) as watcher:
+    with contract.observe(lab, driver, report) as watcher:
         entered = contract.enter(driver, _ACTIONS[action], outage_s=outage_s)
         started = time.time()
         faults = _host_offline(lab)
@@ -103,7 +102,6 @@ def test_s5_host_offline_user_acts(
         )
         if outage_s < contract.GRACE_S:
             contract.check_no_failure(report, watcher, started, ended + contract.SETTLE_S)
-    report.attach(watcher, lab.root)
     report.require()
 
 
@@ -120,6 +118,7 @@ def _act(
             response = driver.approve(entered.approval_id)
         else:
             assert driver.lab.client is not None
+            driver.lab.events.emit("user", "stop", action="clicks Stop")
             response = driver.lab.client.post(
                 f"/v1/sessions/{driver.session_id}/events",
                 json={"type": "stop_session", "data": {}},

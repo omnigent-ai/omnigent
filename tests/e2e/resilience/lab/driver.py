@@ -151,6 +151,7 @@ class SessionDriver:
 
     def send_raw(self, turn: Turn, *, timeout: float = 90.0) -> httpx.Response:
         """Send the turn's user message and return the response, whatever it is."""
+        self.lab.events.emit("user", "send", action=f"sends a message ({turn.marker})")
         return self.lab.send_message(
             self.session_id, f"Run the task for {turn.marker}", timeout=timeout
         )
@@ -166,6 +167,7 @@ class SessionDriver:
     def approve(self, elicitation_id: str) -> httpx.Response:
         """Accept an approval prompt through the client link, as the web UI does."""
         assert self.lab.client is not None
+        self.lab.events.emit("user", "approve", action="clicks Approve")
         return self.lab.client.post(
             f"/v1/sessions/{self.session_id}/elicitations/{elicitation_id}/resolve",
             json={"action": "accept"},

@@ -15,7 +15,6 @@ import pytest
 
 from tests.e2e.resilience.lab.driver import SessionDriver
 from tests.e2e.resilience.lab.lab import Harness, Lab
-from tests.e2e.resilience.lab.observe import SessionWatcher
 from tests.e2e.resilience.lab.report import ScenarioReport
 from tests.e2e.resilience.scenarios import _contract as contract
 
@@ -32,11 +31,10 @@ def test_s4_host_sleep(
 ) -> None:
     lab = lab_factory()
     driver = SessionDriver.create(lab, harness)
-    session_id = driver.session_id
     report = ScenarioReport(
         "S4 host sleep", {"harness": harness, "phase": phase, "outage_s": outage_s}
     )
-    with SessionWatcher(lab.server_url, session_id) as watcher:
+    with contract.observe(lab, driver, report) as watcher:
         entered = contract.enter(driver, phase, outage_s=outage_s)
         started = time.time()
         with lab.sleep_host(wake_network_delay_s=_WAKE_NETWORK_DELAY_S):
@@ -52,5 +50,4 @@ def test_s4_host_sleep(
             fault_end=ended,
             outage_s=outage_s,
         )
-    report.attach(watcher, lab.root)
     report.require()
