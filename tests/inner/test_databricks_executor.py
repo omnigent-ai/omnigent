@@ -1449,6 +1449,103 @@ def test_resolve_databricks_auth_explicit_profile_not_found_raises(
     )
 
 
+def test_resolve_databricks_auth_hanging_sdk_resolution_times_out(
+    monkeypatch,
+):
+    """A blocked SDK credential chain surfaces as an error, not a wedge.
+
+    With no profile anywhere, the SDK walks its ambient credential chain
+    (keyring, CLI, OAuth, host metadata) with no internal timeout and can
+    block forever. The resolver must bound that wait and raise
+    ``DatabricksAuthError`` promptly so callers such as the host daemon's
+    tunnel handshake fail instead of hanging.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    import time as _time
+
+    import pytest
+
+    import omnigent.inner.databricks_executor as db_exec
+    from omnigent.inner.databricks_executor import (
+        DatabricksAuthError,
+        _resolve_databricks_auth,
+    )
+
+    class _HangingConfig:
+        host = None
+
+        def __init__(self, **_kw):
+            pass
+
+        def authenticate(self):
+            # Runs on the resolver's daemon worker thread; abandoned when the
+            # timeout fires, so the sleep never blocks the test process.
+            _time.sleep(60)
+
+    monkeypatch.setattr(_sdk_config_mod, "Config", _HangingConfig)
+    monkeypatch.setattr(db_exec, "_read_databrickscfg", lambda _p: None)
+    monkeypatch.setattr(db_exec, "_SDK_AUTH_RESOLUTION_TIMEOUT_SECONDS", 0.5)
+    monkeypatch.delenv("DATABRICKS_CONFIG_PROFILE", raising=False)
+
+    start = _time.monotonic()
+    with pytest.raises(DatabricksAuthError, match="Databricks authentication failed"):
+        _resolve_databricks_auth()
+    elapsed = _time.monotonic() - start
+
+    assert elapsed < 10, f"Resolver blocked for {elapsed:.1f}s — the timeout guard did not fire"
+
+
+def test_resolve_databricks_auth_ambient_fallback_hang_also_bounded(
+    monkeypatch,
+):
+    """The ambient fallback after an env-profile miss is bounded too.
+
+    When ``DATABRICKS_CONFIG_PROFILE`` names a profile missing from
+    ``~/.databrickscfg``, the resolver retries with the ambient credential
+    chain. That retry can hang just like the primary resolution, so it must
+    also time out — falling through to the unauthenticated error rather than
+    wedging.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    import time as _time
+
+    import pytest
+
+    import omnigent.inner.databricks_executor as db_exec
+    from omnigent.inner.databricks_executor import (
+        DatabricksAuthError,
+        _resolve_databricks_auth,
+    )
+
+    def _config_factory(**kw):
+        if kw.get("profile") is not None:
+            raise ValueError("simulated: profile not found in ~/.databrickscfg")
+
+        class _HangingAmbientConfig:
+            host = None
+
+            def authenticate(self):
+                _time.sleep(60)
+
+        return _HangingAmbientConfig()
+
+    monkeypatch.setattr(_sdk_config_mod, "Config", _config_factory)
+    monkeypatch.setattr(db_exec, "_read_databrickscfg", lambda _p: None)
+    monkeypatch.setattr(db_exec, "_SDK_AUTH_RESOLUTION_TIMEOUT_SECONDS", 0.5)
+    monkeypatch.setenv("DATABRICKS_CONFIG_PROFILE", "missing-profile")
+
+    start = _time.monotonic()
+    with pytest.raises(DatabricksAuthError, match="is not authenticated"):
+        _resolve_databricks_auth()
+    elapsed = _time.monotonic() - start
+
+    assert elapsed < 10, (
+        f"Resolver blocked for {elapsed:.1f}s — the ambient-fallback timeout did not fire"
+    )
+
+
 def test_bearer_auth_injects_fresh_token_per_request():
     """``_DatabricksBearerAuth`` calls ``Config.authenticate()`` per request.
 

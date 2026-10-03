@@ -22,8 +22,9 @@ import os
 import shlex
 import shutil
 import subprocess
+import threading
 import time
-from collections.abc import AsyncIterator, Generator
+from collections.abc import AsyncIterator, Callable, Generator
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Protocol, TypeAlias
 
@@ -63,6 +64,11 @@ _API_CALL_TIMEOUT_SECONDS = 30.0
 _STREAM_IDLE_TIMEOUT_SECONDS = 60.0
 _CLI_TOKEN_REFRESH_MARGIN_SECONDS = 90.0
 _CLI_TOKEN_DEFAULT_TTL_SECONDS = 50 * 60.0
+# Bounds the databricks-sdk credential resolution below: with no explicit
+# profile the SDK walks its full ambient chain (env, keyring, CLI, OAuth,
+# host-metadata probing) with no internal timeout and can block forever,
+# wedging callers such as the host daemon's tunnel handshake.
+_SDK_AUTH_RESOLUTION_TIMEOUT_SECONDS = 15.0
 
 _SESSION_ONLY_EXECUTOR_EXTRA_KEYS = {
     "new_user_messages_flushed",
@@ -657,6 +663,44 @@ class _DatabricksBearerAuth(httpx.Auth):
         yield request
 
 
+def _run_sdk_auth_with_timeout(
+    resolve: Callable[[], Any],  # type: ignore[explicit-any]
+) -> Any:  # type: ignore[explicit-any]
+    """Run a blocking SDK credential resolution with a timeout.
+
+    The databricks-sdk's ambient credential chain has no internal timeout and
+    can block indefinitely, so the resolution runs on a daemon worker thread
+    with a bounded wait. On timeout the (unkillable) worker is abandoned and
+    a ``TimeoutError`` surfaces to the caller instead of a hang.
+
+    :param resolve: Callable performing the blocking SDK work.
+    :returns: Whatever ``resolve`` returns.
+    :raises TimeoutError: When resolution exceeds
+        ``_SDK_AUTH_RESOLUTION_TIMEOUT_SECONDS``.
+    """
+    outcome: list[Any] = []  # type: ignore[explicit-any]
+
+    def _target() -> None:
+        try:
+            outcome.append(resolve())
+        except BaseException as exc:  # noqa: BLE001 — re-raised on the caller thread
+            outcome.append(exc)
+
+    worker = threading.Thread(target=_target, daemon=True)
+    worker.start()
+    worker.join(_SDK_AUTH_RESOLUTION_TIMEOUT_SECONDS)
+    if worker.is_alive():
+        raise TimeoutError(
+            "Databricks credential resolution blocked for over "
+            f"{_SDK_AUTH_RESOLUTION_TIMEOUT_SECONDS:.0f}s in the SDK's ambient "
+            "credential chain (keyring/CLI/OAuth probing)"
+        )
+    result = outcome[0]
+    if isinstance(result, BaseException):
+        raise result
+    return result
+
+
 def _resolve_databricks_auth(
     profile: str | None = None,
     *,
@@ -705,9 +749,15 @@ def _resolve_databricks_auth(
     sdk_profile = profile or os.environ.get("DATABRICKS_CONFIG_PROFILE")
     cfg = None
 
+    def _construct_and_authenticate(**kwargs: str | None) -> Any:  # type: ignore[explicit-any]
+        sdk_cfg = Config(**kwargs)
+        sdk_cfg.authenticate()
+        return sdk_cfg
+
     try:
-        cfg = Config(profile=sdk_profile)
-        cfg.authenticate()
+        cfg = _run_sdk_auth_with_timeout(
+            lambda: _construct_and_authenticate(profile=sdk_profile)
+        )
     except ValueError:
         if profile is None and sdk_profile is not None:
             # Profile name came from the DATABRICKS_CONFIG_PROFILE env var,
@@ -726,9 +776,8 @@ def _resolve_databricks_auth(
                 sdk_profile,
             )
             try:
-                cfg = Config()
-                cfg.authenticate()
-            except ValueError:
+                cfg = _run_sdk_auth_with_timeout(_construct_and_authenticate)
+            except (ValueError, TimeoutError):
                 cfg = None
         else:
             cfg = None
