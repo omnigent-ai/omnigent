@@ -161,6 +161,17 @@ _SKIP_DIRS: frozenset[str] = frozenset(
     }
 )
 
+# Cursor plumbing Omnigent writes into ``<workspace>/.cursor`` at session launch
+# (cursor-agent reads project config only there). Session infrastructure, not
+# user edits; only these exact paths are hidden, other ``.cursor`` content shows.
+_CURSOR_PLUMBING_PATHS: frozenset[str] = frozenset(
+    {
+        ".cursor/hooks.json",
+        ".cursor/mcp.json",
+        ".cursor/omnigent-hook.sh",
+    }
+)
+
 
 def _is_ephemeral(path: str) -> bool:
     """Return ``True`` if the filename matches a known ephemeral artifact pattern.
@@ -173,6 +184,15 @@ def _is_ephemeral(path: str) -> bool:
     """
     filename = Path(path).name
     return any(fnmatch.fnmatch(filename, pat) for pat in _EPHEMERAL_PATTERNS)
+
+
+def _is_harness_plumbing(path: str) -> bool:
+    """Return ``True`` when *path* is Omnigent-written harness plumbing.
+
+    :param path: Workspace-relative path, e.g. ``".cursor/mcp.json"``.
+    :returns: ``True`` when the path is in :data:`_CURSOR_PLUMBING_PATHS`.
+    """
+    return Path(path).as_posix() in _CURSOR_PLUMBING_PATHS
 
 
 def _net_operation(first: str, last: str) -> str | None:
@@ -716,7 +736,7 @@ class AgentEditFilesystemRegistry(FilesystemRegistry):
         norm = _normalize_path(path, self._cwd)
         if norm is None:
             return
-        if _is_ephemeral(norm):
+        if _is_ephemeral(norm) or _is_harness_plumbing(norm):
             return
         bytes_: int | None = None
         modified_at: int | None = None
@@ -769,10 +789,10 @@ class AgentEditFilesystemRegistry(FilesystemRegistry):
         last_op: dict[str, str] = {}
         by_path: dict[str, _FileEvent] = {}
         for e in events:
-            # Ephemeral artifacts are filtered here as a second line of
-            # defence, primarily for events injected without going through
-            # record_change (e.g. in tests).
-            if _is_ephemeral(e.path):
+            # Ephemeral artifacts and harness plumbing are filtered here as a
+            # second line of defence, primarily for events injected without
+            # going through record_change (e.g. in tests).
+            if _is_ephemeral(e.path) or _is_harness_plumbing(e.path):
                 continue
             # Events are appended chronologically, so the last write wins for
             # metadata (bytes, modified_at) without any timestamp comparison.
@@ -1166,7 +1186,7 @@ class GitFilesystemRegistry(FilesystemRegistry):
             rel_path = self._git_to_rel(git_path)
             if rel_path is None:
                 continue
-            if _is_ephemeral(rel_path):
+            if _is_ephemeral(rel_path) or _is_harness_plumbing(rel_path):
                 continue
             # Skip runner-internal and build directories (e.g. terminals/,
             # node_modules/).  These are never agent-edited source files.
@@ -1198,7 +1218,7 @@ class GitFilesystemRegistry(FilesystemRegistry):
         norm = _normalize_path(path, self._cwd)
         if norm is None:
             return None
-        if _is_ephemeral(norm):
+        if _is_ephemeral(norm) or _is_harness_plumbing(norm):
             return None
         try:
             cwd_prefix = self._cwd.relative_to(self._git_root)
