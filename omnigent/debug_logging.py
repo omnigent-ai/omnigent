@@ -1254,6 +1254,20 @@ def debug_sink_enabled() -> bool:
     return _active_sink is not None and not _active_sink.closed
 
 
+def close_debug_log_sink(*, timeout_s: float) -> None:
+    """Drain and close the active debug-log sink, waiting at most *timeout_s*.
+
+    For exit paths that skip ``atexit`` (e.g. a process about to die by a
+    signal). Best-effort: a slow upload is abandoned after the timeout.
+    """
+    sink = _active_sink
+    if sink is None or sink.closed:
+        return
+    closer = threading.Thread(target=sink.close, name="omnigent-debug-log-close", daemon=True)
+    closer.start()
+    closer.join(timeout_s)
+
+
 def sse_event_logger() -> logging.Logger:
     """Return the table-only logger for SSE events (see :data:`SSE_LOGGER_NAME`).
 

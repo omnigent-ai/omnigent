@@ -3843,18 +3843,27 @@ class HostProcess:
             except OSError:
                 _logger.debug("lifecycle tunnel abort raised", exc_info=True)
 
+    @property
+    def lifecycle_lost(self) -> bool:
+        """Whether this daemon lost ownership of its registry record."""
+        return self._lifecycle_lost.is_set()
+
     async def run(self) -> None:
         """Run the host process with reconnection.
 
         Connects to the server, sends hello, and enters the
         receive loop. Reconnects with exponential backoff on
-        disconnect. Ctrl-C / SIGTERM exit cleanly.
+        disconnect. Ctrl-C exits cleanly; SIGTERM/SIGHUP are logged and end
+        the process (see :mod:`omnigent.host.crash_reporting`).
 
         :returns: None. Runs until the process is terminated.
         :raises HostConnectError: On a permanent failure — auth /
             authorization / outdated server, or a loopback server that
             kept refusing connections (the local server is gone).
         """
+        from omnigent.host.crash_reporting import host_asyncio_exception_handler
+
+        asyncio.get_running_loop().set_exception_handler(host_asyncio_exception_handler)
         # Reap orphaned harness/tool grandchildren that reparent here when a
         # runner dies (this host is PID 1 in a container, or a subreaper
         # otherwise). Without this they pile up as <defunct> zombies and can
@@ -4856,6 +4865,51 @@ def run_host_process(
         "host",
         log_to_stderr=should_log_to_stderr() or sys.stderr.isatty(),
     )
+    from omnigent.host import crash_reporting
+
+    crash_reporting.install_host_crash_hooks()
+    crash_reporting.set_host_exit_context(daemon_target=daemon_target)
+    # Report here rather than relying on sys.excepthook: the foreground CLI
+    # catches crashes itself, so the hook never sees them.
+    try:
+        lifecycle_lost = _serve_host_until_exit(
+            server_url,
+            config_path,
+            host_log_path=host_log_path,
+            daemon_target=daemon_target,
+            lifecycle_lock=lifecycle_lock,
+            interactive_shells=interactive_shells,
+        )
+    except KeyboardInterrupt:
+        crash_reporting.report_host_exit("interrupted")
+        raise
+    except SystemExit as exc:
+        code = exc.code if isinstance(exc.code, int) else 1
+        crash_reporting.report_host_exit("clean" if code == 0 else "exit", exit_code=code)
+        raise
+    except BaseException as exc:
+        crash_reporting.report_host_exit(
+            "uncaught", exit_code=1, exc_info=(type(exc), exc, exc.__traceback__)
+        )
+        raise
+    crash_reporting.report_host_exit("lifecycle_lost" if lifecycle_lost else "clean", exit_code=0)
+
+
+def _serve_host_until_exit(
+    server_url: str,
+    config_path: Path | None,
+    *,
+    host_log_path: Path,
+    daemon_target: str | None,
+    lifecycle_lock: DaemonLifecycleLock | None,
+    interactive_shells: list[str] | None,
+) -> bool:
+    """Run the host until it exits; see :func:`run_host_process`.
+
+    :returns: Whether the daemon exited because it lost its registry record.
+    """
+    from omnigent.host import crash_reporting
+
     # Initialize tracing so the host daemon exports its own spans
     # (e.g. handling launch_runner / stat / list_dir frames) into the
     # same distributed trace as the server that requested them. The
@@ -4870,12 +4924,17 @@ def run_host_process(
     try:
         identity = load_or_create_host_identity(path)
     except ValueError as exc:
+        crash_reporting.report_host_exit(
+            "identity_error", exit_code=HOST_FATAL_EXIT_CODE, error=str(exc)
+        )
         print(
             f"\n✗ Could not start host.\n{exc}",
             file=sys.stderr,
             flush=True,
         )
         raise SystemExit(HOST_FATAL_EXIT_CODE) from None
+    crash_reporting.set_host_exit_context(host_id=identity.host_id)
+    crash_reporting.log_host_started()
     if not path.exists():
         print(f"Auto-generated {path} ({identity.host_id}, name: {identity.name})")
     # User-facing: the display form (workspace /omnigent URL with ?o= when
@@ -4936,6 +4995,7 @@ def run_host_process(
         lifecycle_lock=lifecycle_lock,
         interactive_shells=interactive_shells,
     )
+    restore_signal_handlers = crash_reporting.install_host_signal_handlers()
     try:
         asyncio.run(host.run())
     except HostConnectError as exc:
@@ -4944,9 +5004,15 @@ def run_host_process(
         # instead of the old behavior of reconnecting silently forever.
         # The dedicated code (not a bare 1) tells a supervisor this can never
         # succeed, so it stops retrying instead of looping on a bad credential.
+        crash_reporting.report_host_exit(
+            "fatal_connect", exit_code=HOST_FATAL_EXIT_CODE, error=str(exc)
+        )
         print(
             f"\n✗ Could not connect to {display_server_url(server_url)}.\n{exc}",
             file=sys.stderr,
             flush=True,
         )
         raise SystemExit(HOST_FATAL_EXIT_CODE) from exc
+    finally:
+        restore_signal_handlers()
+    return host.lifecycle_lost

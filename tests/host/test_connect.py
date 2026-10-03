@@ -5992,6 +5992,65 @@ def test_run_host_process_exits_nonzero_on_fatal(
     assert "HTTP 403" in err
 
 
+def _host_exit_reasons(caplog: pytest.LogCaptureFixture) -> list[object]:
+    return [
+        r.attributes["reason"]  # type: ignore[attr-defined]
+        for r in caplog.records
+        if getattr(r, "event_name", None) == "host_exiting"
+    ]
+
+
+def test_run_host_process_logs_fatal_exit_event(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A fatal tunnel failure is logged, not only printed, so the sink sees it."""
+    caplog.set_level(logging.INFO, logger="omnigent.host.crash_reporting")
+    _patch_connect(monkeypatch, _ConnectSpy([_invalid_status(403)]))
+
+    with pytest.raises(SystemExit):
+        run_host_process(
+            server_url="https://app.example.databricks.com",
+            config_path=tmp_path / "config.yaml",
+        )
+
+    assert _host_exit_reasons(caplog) == ["fatal_connect"]
+    assert any(getattr(r, "event_name", None) == "host_started" for r in caplog.records)
+
+
+def test_run_host_process_logs_clean_exit_event(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.INFO, logger="omnigent.host.crash_reporting")
+    _patch_connect(monkeypatch, _ConnectSpy([asyncio.CancelledError()]))
+
+    run_host_process(
+        server_url="https://app.example.databricks.com",
+        config_path=tmp_path / "config.yaml",
+    )
+
+    assert _host_exit_reasons(caplog) == ["clean"]
+
+
+def test_run_host_process_logs_crash_during_setup(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A setup crash is reported even when the caller catches it before excepthook."""
+    caplog.set_level(logging.INFO, logger="omnigent.host.crash_reporting")
+
+    def _boom(*_args: object) -> None:
+        raise RuntimeError("setup exploded")
+
+    monkeypatch.setattr("omnigent.git_credential_github.configure_host_git", _boom)
+
+    with pytest.raises(RuntimeError, match="setup exploded"):
+        run_host_process(
+            server_url="https://app.example.databricks.com",
+            config_path=tmp_path / "config.yaml",
+        )
+
+    assert _host_exit_reasons(caplog) == ["uncaught"]
+
+
 async def test_run_host_process_invalid_host_id_exits_actionably(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
