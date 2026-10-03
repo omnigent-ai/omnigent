@@ -1650,7 +1650,8 @@ def register_resource_routes(
                 },
             )
 
-        content = await fs.read(path)
+        # File previews need every line within the byte cap.
+        content = await fs.read(path, limit=None)
         content_type_guess, _ = mimetypes.guess_type(path)
         payload: dict[str, object] = {
             "object": "session.environment.filesystem.file_content",

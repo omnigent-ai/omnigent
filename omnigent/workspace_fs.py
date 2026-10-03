@@ -148,7 +148,7 @@ class WorkspaceReader:
         resolved = self._resolve(path)
         if resolved.is_dir():
             return self._list_dir(path, resolved, limit, after, before, order)
-        return self._read_file(path, resolved)
+        return self._read_file(path, resolved, limit=None)
 
     def _list_dir(
         self,
