@@ -216,6 +216,24 @@ stop_processes() {
       esac
     done <"$sessions_file"
     rm -f "$sessions_file"
+    # Managed session terminals run on private per-instance sockets
+    # ($TMPDIR/omnigent-terminal-*/tmux.sock), so the default-socket sweep
+    # above never sees them; kill those servers and their instance dirs too.
+    for terminal_dir in "${TMPDIR:-/tmp}"/omnigent-terminal-*; do
+      [ -d "$terminal_dir" ] || continue
+      if [ "$DRY_RUN" = true ]; then
+        record_action tmux "$terminal_dir" stop reported "" "would kill managed terminal tmux server"
+        continue
+      fi
+      if [ -S "$terminal_dir/tmux.sock" ]; then
+        tmux -S "$terminal_dir/tmux.sock" kill-server 2>/dev/null || true
+      fi
+      if rm -rf "$terminal_dir" 2>/dev/null; then
+        record_action tmux "$terminal_dir" stop done "" "killed managed terminal tmux server"
+      else
+        record_action tmux "$terminal_dir" stop failed "" "failed to remove managed terminal dir"
+      fi
+    done
   fi
   rm -f "$pidfiles"
   if [ "$EXIT_CODE" = 2 ]; then

@@ -448,6 +448,31 @@ def test_stop_reports_untracked_orphan_server(monkeypatch: pytest.MonkeyPatch) -
     assert "Nothing to stop." not in result.output
 
 
+def test_stop_reaps_orphaned_terminals(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """``stop`` reaps a managed terminal whose owning runner died uncleanly.
+
+    A SIGKILL'd runner leaves its detached tmux terminal server with no owner
+    to reap it; the off-switch must sweep it and say so, not leave the server
+    and its harness child running.
+    """
+    monkeypatch.setattr("omnigent.cli._list_daemon_records", list)
+    monkeypatch.setattr("omnigent.cli.local_server_url_if_healthy", lambda: None)
+    monkeypatch.setattr("omnigent.cli.stop_local_omnigent_server", Mock())
+    monkeypatch.setattr("omnigent.cli.stop_untracked_local_server", lambda: None)
+    monkeypatch.setattr("omnigent.inner.terminal._tmux_available", lambda: True)
+    monkeypatch.setattr("omnigent.inner.terminal._terminals_tmp_root", lambda: tmp_path)
+    orphan = tmp_path / "omnigent-terminal-orphan"
+    orphan.mkdir()
+    # 2147483647 is not a real PID, so the instance's owner counts as dead.
+    (orphan / "owner.pid").write_text("2147483647")
+
+    result = CliRunner().invoke(cli, ["stop"])
+
+    assert result.exit_code == 0, result.output
+    assert "1 orphaned terminal(s)" in result.output
+    assert not orphan.exists()  # the leaked instance dir was swept
+
+
 def test_server_stop_finds_untracked_orphan_when_pidfile_lost(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

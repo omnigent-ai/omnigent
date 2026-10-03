@@ -4,7 +4,10 @@ import json
 import os
 import shutil
 import subprocess
+import tempfile
 from pathlib import Path
+
+import pytest
 
 from omnigent.install_ledger import sha256_text
 
@@ -659,3 +662,60 @@ def test_uninstall_script_rerun_is_idempotent(tmp_path: Path) -> None:
     assert first.returncode == 0, first.stderr
     assert second.returncode == 0, second.stderr
     assert "Omnigent installer" not in profile.read_text()
+
+
+@pytest.mark.skipif(shutil.which("tmux") is None, reason="needs tmux on PATH")
+def test_uninstall_script_kills_managed_private_socket_terminal(tmp_path: Path) -> None:
+    """The tmux sweep also kills managed terminals on private per-instance sockets.
+
+    Managed session terminals are detached tmux servers on
+    ``$TMPDIR/omnigent-terminal-*/tmux.sock`` (session ``main``), invisible to
+    the default-socket ``omnigent:*`` sweep; without a private-socket sweep
+    they outlive ``omnigent uninstall --purge``.
+    """
+    home = tmp_path / "home"
+    state = home / ".omnigent"
+    state.mkdir(parents=True)
+    (state / "installation_id").write_text("install-123\n")
+    # A short scratch TMPDIR: the deep pytest tmp_path overruns the ~108-char
+    # unix socket path limit, so tmux could not even create the server there.
+    scratch_tmp = Path(tempfile.mkdtemp(prefix="omnigent-un-"))
+    terminal_dir = scratch_tmp / "omnigent-terminal-test"
+    terminal_dir.mkdir(parents=True)
+    socket_path = terminal_dir / "tmux.sock"
+    subprocess.run(
+        ["tmux", "-S", str(socket_path), "new-session", "-d", "-s", "main", "sleep 300"],
+        check=True,
+        capture_output=True,
+    )
+
+    def _server_alive() -> bool:
+        return (
+            subprocess.run(
+                ["tmux", "-S", str(socket_path), "list-sessions"], capture_output=True
+            ).returncode
+            == 0
+        )
+
+    try:
+        assert _server_alive()
+        env_updates = {"TMPDIR": str(scratch_tmp)}
+
+        dry = _run_uninstall(home, "state", "--dry-run", "--json", env_updates=env_updates)
+        assert dry.returncode == 0, dry.stderr
+        assert _server_alive()  # dry-run only reports
+        assert terminal_dir.is_dir()
+
+        result = _run_uninstall(home, "state", "--yes", "--json", env_updates=env_updates)
+        assert result.returncode == 0, result.stderr
+        assert not _server_alive()  # the private-socket tmux server was killed
+        assert not terminal_dir.exists()  # and its instance dir removed
+        assert any(
+            action["artifact"] == "tmux"
+            and action["status"] == "done"
+            and "managed terminal" in action["detail"]
+            for action in json.loads(result.stdout)["actions"]
+        )
+    finally:
+        subprocess.run(["tmux", "-S", str(socket_path), "kill-server"], capture_output=True)
+        shutil.rmtree(scratch_tmp, ignore_errors=True)
