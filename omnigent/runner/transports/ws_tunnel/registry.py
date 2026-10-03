@@ -55,6 +55,10 @@ from omnigent.runner.transports.ws_tunnel.frames import (
 
 _logger = logging.getLogger(__name__)
 
+# Re-check interval for ``wait_for_runner`` callers past the waiter caps; they
+# hold no future for ``register`` to resolve, so they poll instead.
+_CONNECT_WAITER_OVERFLOW_POLL_S = 0.5
+
 
 class WebSocketLike(Protocol):
     """Minimal WebSocket protocol used by the registry + transport.
@@ -221,9 +225,9 @@ class TunnelRegistry:
         :param max_connect_waiters_per_runner: Maximum active
             ``wait_for_runner`` futures allowed for one runner id, e.g.
             ``1024``. Additional callers do not get registered as
-            event-driven waiters; they wait for their timeout and do one
-            final registry check instead, so the waiter map cannot grow
-            without bound under a burst.
+            event-driven waiters; they poll the registry at a bounded
+            interval until their timeout instead, so the waiter map
+            cannot grow without bound under a burst.
         :param max_connect_waiters_total: Maximum active
             ``wait_for_runner`` futures allowed across all runner ids,
             e.g. ``8192``. Additional callers use the same bounded
@@ -392,7 +396,10 @@ class TunnelRegistry:
         :meth:`get`. The waiter state is bounded and transient: each
         waiter is removed on timeout/cancellation, and ``register``
         removes the whole state for the runner id before resolving the
-        waiters.
+        waiters. A caller past either waiter cap falls back to polling
+        :meth:`get` every ``_CONNECT_WAITER_OVERFLOW_POLL_S`` seconds, so
+        it still observes a runner that reconnects well before the
+        timeout.
 
         :param runner_id: Runner id to wait for, e.g.
             ``"runner_0123456789abcdef"``.
@@ -424,15 +431,23 @@ class TunnelRegistry:
 
         if overflow_reason is not None:
             _logger.warning(
-                "%s connect waiter cap reached for runner %s; waiting %.1fs without "
-                "registering another waiter",
+                "%s connect waiter cap reached for runner %s; polling every %.1fs for up to "
+                "%.1fs without registering another waiter",
                 overflow_reason,
                 runner_id,
+                _CONNECT_WAITER_OVERFLOW_POLL_S,
                 timeout_s,
                 extra={"session_id": runner_primary_session_id()},
             )
-            await asyncio.sleep(timeout_s)
-            return self.get(runner_id)
+            deadline = loop.time() + timeout_s
+            while True:
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    return self.get(runner_id)
+                await asyncio.sleep(min(_CONNECT_WAITER_OVERFLOW_POLL_S, remaining))
+                current = self.get(runner_id)
+                if current is not None:
+                    return current
 
         try:
             return await asyncio.wait_for(future, timeout=timeout_s)

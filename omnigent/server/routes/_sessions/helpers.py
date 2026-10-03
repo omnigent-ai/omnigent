@@ -11583,6 +11583,7 @@ __all__ = [
     "_publish_and_persist_resource_event",
     "_publish_btw_sidechat",
     "_publish_changed_files_invalidated",
+    "_publish_child_status_to_parent",
     "_publish_codex_approval_mode",
     "_publish_collaboration_mode",
     "_publish_compaction_completed",

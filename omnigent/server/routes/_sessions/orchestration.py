@@ -290,6 +290,7 @@ from omnigent.server.routes._sessions.helpers import (
     _priced_cost_for_display,
     _provision_managed_sandbox,
     _prune_pre_resolved_harness_elicitations,
+    _publish_child_status_to_parent,
     _publish_elicitation_request_to_ancestors,
     _publish_elicitation_resolved,
     _publish_elicitation_resolved_to_ancestors,
@@ -3438,6 +3439,11 @@ async def _publish_runner_recovered_status_impl(
     reconnect, keeping the red "Failed" pill instead of silently flipping
     it back to idle and hiding the error.
 
+    This path bypasses :func:`_publish_status` (whose sticky-``failed``
+    guard would swallow the ``idle``), so it mirrors a sub-agent's
+    cleared status onto the parent's stream itself; otherwise an open
+    Agents rail keeps showing the child as failed until a refresh.
+
     :param session_id: Session/conversation identifier, e.g.
         ``"conv_abc123"``.
     :param conversation_store: Store used to read the persisted error
@@ -3472,6 +3478,9 @@ async def _publish_runner_recovered_status_impl(
     )
     session_stream.publish(session_id, event.model_dump())
     await _persist_session_status_error_labels(session_id, None, conversation_store)
+    # After the labels clear, so the parent's summary no longer carries the
+    # disconnect cause that would keep its rail entry rendered as failed.
+    _publish_child_status_to_parent(session_id, "idle")
 
 
 async def _mark_runner_sessions_offline_impl(
