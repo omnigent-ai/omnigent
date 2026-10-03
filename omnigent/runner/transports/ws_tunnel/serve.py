@@ -23,7 +23,7 @@ import time
 import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import TypeAlias
+from typing import Any, TypeAlias
 from urllib.parse import quote, urlsplit, urlunsplit
 
 from starlette.types import ASGIApp, Message, Scope
@@ -145,6 +145,9 @@ _GRACEFUL_SHUTDOWN_CLOSE_TIMEOUT_S = 5.0
 # end-of-stream sentinel is enqueued. A task still running past this is
 # cancelled — a stuck stream must not wedge shutdown forever.
 _GRACEFUL_SHUTDOWN_DRAIN_TIMEOUT_S = 5.0
+# WebSocket close-reason strings are limited to 123 bytes of UTF-8 by the
+# protocol (RFC 6455 §5.5.1: payload = 2-byte code + ≤123 bytes reason).
+_MAX_CLOSE_REASON_BYTES = 123
 RUNNER_TUNNEL_REJECTION_PREFIX = "runner tunnel rejected by server "
 
 # Schemes that, when surfaced through ``InvalidURI.uri``, indicate
@@ -309,6 +312,48 @@ async def dispatch_via_asgi(
         raise
 
 
+def _truncate_close_reason(reason: str) -> str:
+    """Truncate *reason* to fit within the 123-byte WebSocket close-reason limit.
+
+    :param reason: Human-readable close reason string.
+    :returns: The reason, truncated at a UTF-8 character boundary if needed.
+    """
+    encoded = reason.encode("utf-8")
+    if len(encoded) <= _MAX_CLOSE_REASON_BYTES:
+        return reason
+    return encoded[:_MAX_CLOSE_REASON_BYTES].decode("utf-8", errors="ignore")
+
+
+async def _close_with_reason(
+    ws: Any,
+    close_reason: Callable[[], str | None] | None,
+    *,
+    timeout: float | None = None,
+) -> None:
+    """Send a WebSocket close frame with the runner exit reason.
+
+    No-op when *close_reason* is ``None`` or returns an empty string. Errors
+    from ``ws.close`` are suppressed so a failed send never aborts shutdown.
+
+    :param ws: Active WebSocket connection.
+    :param close_reason: Optional callable returning the exit reason string.
+    :param timeout: If given, wraps the close coroutine in ``asyncio.wait_for``
+        with this timeout (seconds). Use on cancellation paths to avoid hanging.
+    :returns: None.
+    """
+    if close_reason is None:
+        return
+    reason = close_reason() or ""
+    if not reason:
+        return
+    close_coro = ws.close(1000, _truncate_close_reason(reason))
+    with contextlib.suppress(Exception):
+        if timeout is not None:
+            await asyncio.wait_for(close_coro, timeout=timeout)
+        else:
+            await close_coro
+
+
 async def serve_tunnel(
     app: _ASGIApp,
     *,
@@ -325,6 +370,7 @@ async def serve_tunnel(
     direct_attach_port: int | None = None,
     direct_attach_token: str | None = None,
     event_dispatcher: RunnerEventDispatcher | None = None,
+    close_reason: Callable[[], str | None] | None = None,
 ) -> None:
     """Keep a runner WebSocket tunnel connected to a server.
 
@@ -374,6 +420,11 @@ async def serve_tunnel(
         active connection, just before the graceful drain begins. Used to
         enqueue the ``[DONE]`` sentinel onto every session stream so the
         awaited dispatch tasks actually complete.
+    :param close_reason: Optional sync callable invoked on a graceful
+        shutdown to obtain the reason string for the WebSocket close
+        frame. ``None`` (default) omits the reason (empty string), which
+        preserves today's behaviour for callers that do not supply one.
+        The returned string is truncated to the 123-byte protocol limit.
     :returns: Returns when *shutdown_event* triggers a graceful shutdown;
         otherwise never returns during normal operation.
     """
@@ -468,6 +519,7 @@ async def serve_tunnel(
                 tunnel_token=tunnel_token,
                 shutdown_event=shutdown_event,
                 on_graceful_shutdown=on_graceful_shutdown,
+                close_reason=close_reason,
                 on_connected=_mark_connected,
                 on_ready=_notify_reconnected if reconnecting else None,
                 on_resume_note=_note_resume_from_suspend,
@@ -841,6 +893,7 @@ async def _serve_tunnel_once(
     on_activity: Callable[[], None] | None = None,
     shutdown_event: asyncio.Event | None = None,
     on_graceful_shutdown: Callable[[], None] | None = None,
+    close_reason: Callable[[], str | None] | None = None,
     on_connected: Callable[[], None] | None = None,
     on_ready: Callable[[], Awaitable[None]] | None = None,
     on_resume_note: Callable[[], None] | None = None,
@@ -875,6 +928,9 @@ async def _serve_tunnel_once(
         loop and triggers the graceful drain (see ``_graceful_drain``).
     :param on_graceful_shutdown: Optional sync callback fired once, before
         the drain, to enqueue end-of-stream sentinels onto session streams.
+    :param close_reason: Optional sync callable invoked after the graceful
+        drain to obtain the reason for the close frame. Mirrors the
+        parameter of the same name on ``serve_tunnel``.
     :param on_connected: Optional sync callback fired once the WS
         upgrade is accepted. ``serve_tunnel`` uses it to distinguish a
         runner that has authenticated from one that never has.
@@ -1081,6 +1137,7 @@ async def _serve_tunnel_once(
                                 dispatch_tasks,
                                 on_graceful_shutdown,
                             )
+                            await _close_with_reason(ws, close_reason)
                             break
                         try:
                             raw = recv_task.result()
@@ -1105,6 +1162,12 @@ async def _serve_tunnel_once(
                     shutdown_wait.cancel()
                     with contextlib.suppress(asyncio.CancelledError):
                         await shutdown_wait
+        except asyncio.CancelledError:
+            # Task cancelled (signal or parent death): send close reason if
+            # available so the server sees e.g. "runner exiting: received SIGTERM"
+            # instead of an empty reason. Always re-raises; errors are suppressed.
+            await _close_with_reason(ws, close_reason, timeout=_RUNNER_TUNNEL_CLOSE_TIMEOUT_S)
+            raise
         finally:
             if event_dispatcher is not None:
                 event_dispatcher.disconnected()

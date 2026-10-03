@@ -1807,6 +1807,7 @@ async def _run_tunnel_from_env() -> None:
             on_activity=_mark_activity,
             shutdown_event=tunnel_shutdown_event,
             on_graceful_shutdown=getattr(app.state, "drain_session_streams", None),
+            close_reason=lambda: f"runner exiting: {exit_reason}" if exit_reason else None,
             direct_attach_port=(
                 direct_attach_listener.port if direct_attach_listener is not None else None
             ),
