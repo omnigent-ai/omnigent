@@ -1301,6 +1301,15 @@ function visibleModelLabel(label: string): string {
 
 const EMPTY_HARNESS_TRIGGER_DETAILS: readonly { label: string; value: string }[] = [];
 
+// Harness icon kinds preferred for the picker's inline list, in display order.
+// A deployment that seeds none of these (OMNIGENT_SEEDED_AGENTS) backfills the
+// list from whatever is launchable rather than showing an empty group.
+const PRIMARY_HARNESS_ORDER: readonly string[] = ["claude", "cursor", "codex"];
+// Preferred order within the "Other..." submenu.
+const SECONDARY_HARNESS_ORDER: readonly string[] = ["opencode", "pi"];
+// How many rows the backfill promotes — matches the inline list's usual size.
+const INLINE_HARNESS_FALLBACK = PRIMARY_HARNESS_ORDER.length;
+
 function agentHasModelSettings(agent: AvailableAgent | undefined): boolean {
   return (
     nativeAgentHasCapability(agent, "modelPicker") ||
@@ -1668,27 +1677,44 @@ export function AgentHarnessPicker({
   const { readyHarnessEntries, moreHarnessEntries } = useMemo(() => {
     const ready: AvailableAgent[] = [];
     const more: AvailableAgent[] = [];
-    const primaryOrder = ["claude", "cursor", "codex"];
-    const secondaryOrder = ["opencode", "pi"];
     for (const agent of harnessEntries) {
       const selected = agent.id === effectiveAgentId;
       const readiness = harnessReadinessOnHost(agent.harness, host);
       const unavailable = !readiness.selectable && readiness.fallbackRelevant;
       if (!selected && hideUnconfigured && unavailable) continue;
       const key = nativeCodingAgentForAvailableAgent(agent)?.iconKind ?? "";
-      const primary = primaryOrder.includes(key) || agent.id === promotedHarnessId;
+      const primary = PRIMARY_HARNESS_ORDER.includes(key) || agent.id === promotedHarnessId;
       // Unavailable primaries demote to "Other..." — the main list stays
       // launch-ready; the selected harness always keeps its slot.
       if (primary && (selected || !unavailable)) {
         ready.push(agent);
       } else more.push(agent);
     }
-    const rank = (agent: AvailableAgent, order: string[]) => {
+    const rank = (agent: AvailableAgent, order: readonly string[]) => {
       const index = order.indexOf(nativeCodingAgentForAvailableAgent(agent)?.iconKind ?? "");
       return index < 0 ? order.length : index;
     };
-    ready.sort((first, second) => rank(first, primaryOrder) - rank(second, primaryOrder));
-    more.sort((first, second) => rank(first, secondaryOrder) - rank(second, secondaryOrder));
+    ready.sort(
+      (first, second) => rank(first, PRIMARY_HARNESS_ORDER) - rank(second, PRIMARY_HARNESS_ORDER),
+    );
+    more.sort(
+      (first, second) =>
+        rank(first, SECONDARY_HARNESS_ORDER) - rank(second, SECONDARY_HARNESS_ORDER),
+    );
+    // Nothing preferred survived, but something launchable did: pull the best
+    // of it inline. A deployment that trims to harnesses outside
+    // PRIMARY_HARNESS_ORDER would otherwise render an empty "Harnesses" list
+    // with its only choices buried in the "Other..." submenu.
+    if (ready.length === 0) {
+      const launchable = more.filter((agent) => {
+        const readiness = harnessReadinessOnHost(agent.harness, host);
+        return readiness.selectable || !readiness.fallbackRelevant;
+      });
+      for (const agent of launchable.slice(0, INLINE_HARNESS_FALLBACK)) {
+        ready.push(agent);
+        more.splice(more.indexOf(agent), 1);
+      }
+    }
     return { readyHarnessEntries: ready, moreHarnessEntries: more };
   }, [harnessEntries, host, hideUnconfigured, effectiveAgentId, promotedHarnessId]);
   const selectedOtherHarness = moreHarnessEntries.find((agent) => agent.id === effectiveAgentId);
@@ -1983,8 +2009,13 @@ export function AgentHarnessPicker({
               <DropdownMenuSeparator />
             </>
           )}
-          {/* Agents group — built-in bundle agents (Polly / Debby) inline. */}
-          <PickerSectionHeader>Agents</PickerSectionHeader>
+          {/* Agents group — built-in bundle agents (Polly / Debby) inline. The
+            header is conditional like "Harnesses" above: a deployment that
+            seeds no bundle agents and has no custom group would otherwise
+            render a heading with nothing under it. */}
+          {(bundleEntries.length > 0 || hasCustomGroup) && (
+            <PickerSectionHeader>Agents</PickerSectionHeader>
+          )}
           {bundleEntries.map(renderEntry)}
           {/* Existing custom agents fold into an "Other..." submenu (with
             the pending upload and the create action). With no custom agents the
