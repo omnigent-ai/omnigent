@@ -4,6 +4,7 @@ import android.app.Activity
 import android.os.Looper
 import com.sun.net.httpserver.HttpServer
 import org.junit.After
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
@@ -202,6 +203,97 @@ class OidcLoginManagerTest {
 
     private fun drainMainLooper() {
         shadowOf(Looper.getMainLooper()).idle()
+    }
+
+    // -- Redirect handling --
+    //
+    // HttpURLConnection follows same-protocol redirects by default, so a redirect
+    // from /auth/cli-login or /auth/cli-poll?ticket=... would carry the one-time
+    // ticket to whatever host the response named. Disable redirect following so
+    // a 3xx then fails like any other non-success status.
+
+    @Test
+    fun `ticket creation fails on a redirect instead of following it`() {
+        val (server, target, targetHits) = redirectingServer(302)
+        try {
+            val origin = "http://127.0.0.1:${server.address.port}"
+            assertNull(manager.requestTicket(origin))
+            assertEquals(0, targetHits.get())
+        } finally {
+            server.stop(0)
+            target.stop(0)
+        }
+    }
+
+    @Test
+    fun `polling fails on a redirect instead of sending the ticket elsewhere`() {
+        val (server, target, targetHits) = redirectingServer(302)
+        try {
+            val origin = "http://127.0.0.1:${server.address.port}"
+            assertNull(manager.pollForToken(origin, "t-1"))
+            assertEquals(0, targetHits.get())
+        } finally {
+            server.stop(0)
+            target.stop(0)
+        }
+    }
+
+    // An origin that redirects every request to a second local server (the
+    // stand-in for another host), whose hit count proves nothing followed.
+    private fun redirectingServer(
+        status: Int,
+    ): Triple<HttpServer, HttpServer, java.util.concurrent.atomic.AtomicInteger> {
+        val target = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0)
+        val targetHits =
+            java.util.concurrent.atomic
+                .AtomicInteger(0)
+        target.createContext("/") { exchange ->
+            targetHits.incrementAndGet()
+            val bytes = """{"ticket":"t","login_url":"/l","token":"leaked"}""".toByteArray()
+            exchange.sendResponseHeaders(200, bytes.size.toLong())
+            exchange.responseBody.use { it.write(bytes) }
+        }
+        target.start()
+        val origin = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0)
+        origin.createContext("/") { exchange ->
+            val location = "http://127.0.0.1:${target.address.port}${exchange.requestURI}"
+            exchange.responseHeaders.add("Location", location)
+            exchange.sendResponseHeaders(status, -1)
+            exchange.close()
+        }
+        origin.start()
+        return Triple(origin, target, targetHits)
+    }
+
+    // Helper methods to directly call private methods for testing
+    private fun OidcLoginManager.requestTicket(origin: String): Ticket? {
+        val method =
+            OidcLoginManager::class.java.getDeclaredMethod(
+                "requestTicket",
+                String::class.java,
+            )
+        method.isAccessible = true
+        @Suppress("UNCHECKED_CAST")
+        return method.invoke(this, origin) as Ticket?
+    }
+
+    private data class Ticket(
+        val id: String,
+        val loginUrl: String,
+    )
+
+    private fun OidcLoginManager.pollForToken(
+        origin: String,
+        ticket: String,
+    ): String? {
+        val method =
+            OidcLoginManager::class.java.getDeclaredMethod(
+                "pollForToken",
+                String::class.java,
+                String::class.java,
+            )
+        method.isAccessible = true
+        return method.invoke(this, origin, ticket) as String?
     }
 
     private companion object {
