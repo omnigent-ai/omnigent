@@ -525,13 +525,18 @@ export interface WorkspaceFileSearchResult {
   truncated: boolean;
 }
 
-async function fetchWorkspaceFileSearch(
+export interface WorkspaceFileSearchRequest {
+  query: string;
+  include?: string;
+  exclude?: string;
+  location?: string;
+}
+
+/** Send a `/search` request and return the raw response; callers decide how 404 and 503 read. */
+export function requestWorkspaceFileSearch(
   conversationId: string,
-  query: string,
-  include: string,
-  exclude: string,
-  location: string,
-): Promise<WorkspaceFileSearchResult> {
+  { query, include = "", exclude = "", location = "" }: WorkspaceFileSearchRequest,
+): Promise<Response> {
   const params = new URLSearchParams({ limit: "500" });
   if (query) params.set("q", query);
   if (include) params.set("include", include);
@@ -539,17 +544,40 @@ async function fetchWorkspaceFileSearch(
   const segment = browseLocationSegment(location);
   const base = browseLocationBase(location);
   if (base) params.set("base", base);
-  const res = await authenticatedFetch(
+  return authenticatedFetch(
     `/v1/sessions/${encodeURIComponent(conversationId)}/resources/environments/${DEFAULT_ENVIRONMENT_ID}/search${segment ? `/${segment}` : ""}?${params}`,
   );
+}
+
+/** Read a successful `/search` response into paths relative to `location`. */
+export async function readWorkspaceFileSearch(
+  res: Response,
+  location = "",
+): Promise<WorkspaceFileSearchResult> {
+  const json = (await res.json()) as FilesystemListResponse;
+  return { files: mapFilesystemEntries(json, location), truncated: !!json.truncated };
+}
+
+async function fetchWorkspaceFileSearch(
+  conversationId: string,
+  query: string,
+  include: string,
+  exclude: string,
+  location: string,
+): Promise<WorkspaceFileSearchResult> {
+  const res = await requestWorkspaceFileSearch(conversationId, {
+    query,
+    include,
+    exclude,
+    location,
+  });
   // 404 means the runner has no OS environment for this session (cloud-only
   // agent).  Mirror the behaviour of useWorkspaceAllFiles: return empty
   // results rather than surfacing an error.
   if (res.status === 404) return { files: [], truncated: false };
   if (await isRunnerUnavailable503(res)) return { files: [], truncated: false };
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
-  const json = (await res.json()) as FilesystemListResponse;
-  return { files: mapFilesystemEntries(json, location), truncated: !!json.truncated };
+  return readWorkspaceFileSearch(res, location);
 }
 
 /**

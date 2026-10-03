@@ -27,7 +27,9 @@ import {
   browseLocationSegment,
   isRunnerUnavailable503,
   looksLikeWorkspaceFilePath,
+  readWorkspaceFileSearch,
   relativizeToWorkspace,
+  requestWorkspaceFileSearch,
   resolveChatFilePath,
   runnerOfflineRetryDelay,
   shouldRetryRunnerOffline,
@@ -716,6 +718,45 @@ describe("useWorkspaceFileSearch truncation", () => {
     );
 
     await waitFor(() => expect(screen.getByTestId("truncated")).toHaveTextContent("true"));
+  });
+});
+
+describe("requestWorkspaceFileSearch", () => {
+  it("builds the hook's search URL and hands back the raw response", async () => {
+    fetchMock.mockResolvedValue(jsonResponse({ error: { code: "not_found" } }, 404));
+
+    const res = await requestWorkspaceFileSearch("conv_live", {
+      query: ".slides.html",
+      include: "**/*.slides.html",
+    });
+
+    expect(fetchMock.mock.calls[0][0]).toBe(
+      "/v1/sessions/conv_live/resources/environments/default/search?limit=500&q=.slides.html&include=**%2F*.slides.html",
+    );
+    expect(res.status).toBe(404);
+  });
+
+  it("reads matches and the truncated flag from a successful response", async () => {
+    const res = jsonResponse({
+      object: "list",
+      data: [
+        {
+          id: "1",
+          name: "q3.slides.html",
+          path: "decks/q3.slides.html",
+          type: "file",
+          bytes: 9,
+          modified_at: 1,
+        },
+      ],
+      has_more: false,
+      truncated: true,
+    });
+
+    const result = await readWorkspaceFileSearch(res);
+
+    expect(result.truncated).toBe(true);
+    expect(result.files.map((f) => [f.path, f.type])).toEqual([["decks/q3.slides.html", "file"]]);
   });
 });
 
