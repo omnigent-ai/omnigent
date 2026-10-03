@@ -26,6 +26,7 @@ Requires `claude` and `tmux` on `PATH`. Tests skip without them.
 
 ```sh
 uv run --no-sync pytest tests/e2e/resilience -v
+OMNIGENT_E2E_RESILIENCE_FULL=1 uv run --no-sync pytest tests/e2e/resilience/scenarios -n 2  # 60 s/120 s outages
 ```
 
 To poke at the UI by hand, start a lab with a fault console:
@@ -37,6 +38,30 @@ uv run --no-sync python -m tests.e2e.resilience.lab            # --mode runner, 
 The console prints a session URL behind `proxies.client`. Open it, chat, and
 type commands such as `restart-server 20`, `blackhole host 30 runner.tunnel`,
 `sleep-host 60`, `hold` / `release` or `conns host`. `help` lists them all.
+
+## Scenarios
+
+Scenario scripts live in `scenarios/`. Each one implements a row family of
+the matrix in [`docs/network-resilience.md`](../../../docs/network-resilience.md).
+They are built from four pieces:
+
+- `ClaudeDriver` (`lab/driver.py`) sends user turns through the client link.
+  It scripts Claude's replies by a unique marker and leaves marker-named files
+  in the workspace, so a scenario can tell which tool side effects ran.
+  `start_tool_turn`, `start_approval_turn` and `round_trip` put a session into
+  a known phase.
+- `SessionWatcher` (`lab/observe.py`) records every published `session.status`
+  edge and polls the snapshot directly on the server, building a timeline of
+  what the user saw.
+- `ScenarioReport` (`lab/report.py`) records each contract expectation as a
+  check. It writes JSON and Markdown to `.omnigent/resilience/`, then fails
+  with every broken check and the timeline. `python -m tests.e2e.resilience.lab.report`
+  prints the saved runs as one matrix.
+- `lab_factory` (`conftest.py`) starts labs. It keeps the root of a failing
+  run, or of every run with `OMNIGENT_RESILIENCE_KEEP=1`.
+
+Rows that break the contract today are `xfail(strict=True)` with the finding,
+so a fix that makes one pass must also delete its marker.
 
 ## Faults
 

@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import os
 import shutil
 from collections.abc import Callable, Generator, Iterator
 
 import pytest
 
 from tests.e2e.resilience.lab.lab import Lab, LabConfig, LabMode
+
+#: Set to ``1`` to keep every lab root, not only failing ones.
+KEEP_ENV = "OMNIGENT_RESILIENCE_KEEP"
 
 
 @pytest.hookimpl(hookwrapper=True)
@@ -29,7 +33,8 @@ def require_claude_native() -> None:
 def lab_factory(request: pytest.FixtureRequest) -> Iterator[Callable[..., Lab]]:
     """Start labs on demand; stop them after the test and delete passing runs.
 
-    A failing run keeps its root (logs, database, proxy events) and prints it.
+    A failing run (or any run with ``OMNIGENT_RESILIENCE_KEEP=1``) keeps its
+    root (logs, database, proxy events) and prints it.
     """
     labs: list[Lab] = []
 
@@ -44,9 +49,10 @@ def lab_factory(request: pytest.FixtureRequest) -> Iterator[Callable[..., Lab]]:
         getattr(getattr(request.node, f"_resilience_{when}", None), "failed", False)
         for when in ("setup", "call")
     )
+    keep = failed or os.environ.get(KEEP_ENV) == "1"
     for lab in labs:
         lab.stop()
-        if failed:
+        if keep:
             print(f"\nresilience lab kept for inspection:\n{lab.describe()}")
         else:
             lab.remove()
