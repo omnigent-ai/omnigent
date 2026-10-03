@@ -1976,6 +1976,100 @@ describe("Composer model/effort label", () => {
     expect(label()).not.toHaveTextContent("Sonnet 4.6");
   });
 
+  it("notices when the harness runs a model other than the selected one", async () => {
+    // A banned pick the gateway silently reroutes: the pick stays "fable"
+    // while the harness reports the model it actually runs. The chip and the
+    // checked row already show the report; the notice names both so the
+    // reroute can't pass as a pick the user made.
+    useChatStore.setState({
+      llmModel: "opus",
+      sessionModelOverride: "fable",
+      sessionModelSeeded: false,
+      pendingModelChange: null,
+      sessionReasoningEffort: null,
+    });
+    renderWithTooltips(
+      <Composer
+        {...composerProps({
+          modelPickerKind: "claude",
+          showModels: true,
+          codexModelOptions: CLAUDE_MODEL_OPTIONS,
+        })}
+      />,
+    );
+    expect(label()).toHaveTextContent("Opus");
+    fireEvent.focus(screen.getByTestId("composer-config-gear"));
+    const tooltip = await screen.findByTestId("composer-config-gear-tooltip");
+    expect(tooltip).toHaveTextContent("Opus (not the selected Fable)");
+    await openSessionModels();
+    expect(screen.getByTestId("composer-model-divergence-notice")).toHaveTextContent(
+      "Running Opus instead of the selected Fable.",
+    );
+    expect(screen.getByTestId("composer-agent-model-opus")).toHaveAttribute("aria-checked", "true");
+    expect(screen.getByTestId("composer-agent-model-fable")).toHaveAttribute(
+      "aria-checked",
+      "false",
+    );
+  });
+
+  it("hides the divergence notice when the report is the selected row under aliasing", async () => {
+    // The pick is the "opus" alias; the harness reports the pinned wire id —
+    // both resolve to the same catalog row, so no notice may render.
+    useChatStore.setState({
+      llmModel: "databricks-claude-opus-4-8[1m]",
+      sessionModelOverride: "opus",
+      sessionModelSeeded: false,
+      pendingModelChange: null,
+      sessionReasoningEffort: null,
+    });
+    renderWithTooltips(
+      <Composer
+        {...composerProps({
+          modelPickerKind: "claude",
+          showModels: true,
+          codexModelOptions: [
+            { id: "fable", displayName: "Fable" },
+            { id: "opus", model: "databricks-claude-opus-4-8[1m]", displayName: "Opus 4.8" },
+          ],
+        })}
+      />,
+    );
+    expect(label()).toHaveTextContent("Opus 4.8");
+    fireEvent.focus(screen.getByTestId("composer-config-gear"));
+    const tooltip = await screen.findByTestId("composer-config-gear-tooltip");
+    expect(tooltip).not.toHaveTextContent("not the selected");
+    await openSessionModels();
+    expect(screen.queryByTestId("composer-model-divergence-notice")).toBeNull();
+    expect(screen.getByTestId("composer-agent-model-opus")).toHaveAttribute("aria-checked", "true");
+  });
+
+  it("waits for a pending model switch before noticing a divergence", async () => {
+    // Mid-ask (pick sent, report not yet arrived) the old report still
+    // diverges from the new pick; the pending indicator owns that window —
+    // the config row is disabled while pending, so the tooltip is the
+    // surface that must stay quiet.
+    useChatStore.setState({
+      llmModel: "opus",
+      sessionModelOverride: "fable",
+      sessionModelSeeded: false,
+      pendingModelChange: "fable",
+      sessionReasoningEffort: null,
+    });
+    renderWithTooltips(
+      <Composer
+        {...composerProps({
+          modelPickerKind: "claude",
+          showModels: true,
+          codexModelOptions: CLAUDE_MODEL_OPTIONS,
+        })}
+      />,
+    );
+    fireEvent.focus(screen.getByTestId("composer-config-gear"));
+    const tooltip = await screen.findByTestId("composer-config-gear-tooltip");
+    expect(tooltip).toHaveTextContent("Opus");
+    expect(tooltip).not.toHaveTextContent("not the selected");
+  });
+
   it.each([
     ["claude", true],
     ["codex", true],
