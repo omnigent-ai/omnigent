@@ -1,5 +1,7 @@
 import asyncio
 import json
+from datetime import datetime, timedelta, timezone
+from email.utils import format_datetime
 from unittest.mock import Mock
 from urllib.parse import parse_qs
 
@@ -361,6 +363,109 @@ async def test_auth_failures_warn_status_only_and_back_off(
     assert len(warnings) == 1
     assert str(status) in warnings[0].message
     assert "sensitive" not in caplog.text
+
+
+@pytest.mark.parametrize(
+    "header_form,requested_delay,expected_delay",
+    [
+        pytest.param("delta_seconds", 300, 300, id="numeric"),
+        pytest.param("http_date", 300, 300, id="http-date"),
+        pytest.param("delta_seconds", 7200, 3600, id="numeric-clamped"),
+        pytest.param("http_date", 7200, 3600, id="http-date-clamped"),
+        pytest.param("delta_seconds", 17, 60, id="numeric-minimum"),
+        pytest.param("http_date", 17, 60, id="http-date-minimum"),
+        pytest.param("http_date", -300, 60, id="past-date-default"),
+        pytest.param("invalid", 0, 60, id="invalid-date-default"),
+    ],
+)
+async def test_permission_denied_retry_after_controls_outbox_and_shared_cooldown(
+    credentials, push_store, session_id, monkeypatch, header_form, requested_delay, expected_delay
+):
+    from omnigent.db.db_models import SqlMobilePushOutbox
+    from omnigent.server import mobile_push_sender
+    from omnigent.server.mobile_push import MobilePushService
+    from omnigent.server.mobile_push_config import FcmConfig
+
+    path, _ = credentials
+    config = FcmConfig.from_env(
+        resolve_feature_flags({"OMNIGENT_FEATURES": "mobile_push"}),
+        {"OMNIGENT_FCM_CREDENTIALS_FILE": str(path)},
+    )
+    assert config is not None
+    clock = [110.0]
+    wall_clock = datetime(2026, 10, 2, 12, 0, 0, 250000, tzinfo=timezone.utc)
+
+    class FrozenDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return wall_clock
+
+    monkeypatch.setattr(mobile_push_sender, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(mobile_push_sender, "datetime", FrozenDateTime)
+    retry_after = (
+        str(requested_delay)
+        if header_form == "delta_seconds"
+        else format_datetime(wall_clock + timedelta(seconds=requested_delay), usegmt=True)
+    )
+    if header_form == "invalid":
+        retry_after = "not a valid HTTP date"
+    calls = []
+
+    def google(request):
+        calls.append(request.url.host)
+        if request.url.host == "oauth2.googleapis.com":
+            return httpx.Response(200, json={"access_token": "access", "expires_in": 3600})
+        if calls.count("fcm.googleapis.com") == 1:
+            return httpx.Response(
+                403,
+                headers={"Retry-After": retry_after},
+                json={"error": {"status": "PERMISSION_DENIED"}},
+            )
+        return httpx.Response(200)
+
+    register(push_store)
+    push_store.enqueue(session_id, "completed", now=100)
+    first = push_store.claim(now=110)[0]
+    deadline = 110 + expected_delay
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(google)) as client:
+        sender = mobile_push_sender.FcmSender(config, client)
+        service = MobilePushService(push_store, Mock(), sender, preview=False)
+        await service._deliver(first, now=110)
+        with push_store._session("verify_permission_denied_retry_deadline") as transaction:
+            row = transaction.get(SqlMobilePushOutbox, (0, first.id))
+            assert row is not None and not row.delivered
+            assert row.not_before == deadline
+        assert calls == ["oauth2.googleapis.com", "fcm.googleapis.com"]
+
+        clock[0] = 140
+        register(push_store, user="reader", installation="reader-phone", token="reader-token")
+        push_store.enqueue(session_id, "completed", now=130)
+        second = push_store.claim(now=140)[0]
+        assert second.installation_id == "reader-phone"
+        await service._deliver(second, now=140)
+        with push_store._session("verify_shared_authorization_retry_deadline") as transaction:
+            row = transaction.get(SqlMobilePushOutbox, (0, second.id))
+            assert row is not None and not row.delivered
+            assert row.not_before == deadline
+        assert push_store.claim(now=deadline - 1) == []
+        for stamp in (140, deadline - 1, deadline - 0.25):
+            clock[0] = stamp
+            result = await sender.authorization()
+            assert isinstance(result, mobile_push_sender.SendResult)
+            assert result.outcome == "retry"
+            assert calls == ["oauth2.googleapis.com", "fcm.googleapis.com"]
+
+        clock[0] = deadline
+        token = await sender.authorization()
+        assert isinstance(token, str)
+        assert (await sender.post({"message": {"token": "device-token"}}, token)).outcome == "sent"
+        assert calls == [
+            "oauth2.googleapis.com",
+            "fcm.googleapis.com",
+            "oauth2.googleapis.com",
+            "fcm.googleapis.com",
+        ]
 
 
 @pytest.mark.parametrize("third_party", [True, False])

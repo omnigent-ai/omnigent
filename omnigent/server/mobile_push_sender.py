@@ -7,6 +7,7 @@ import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
+from math import ceil
 from time import monotonic
 from typing import Any, Literal
 
@@ -48,9 +49,9 @@ class FcmSender:
                 _logger.warning("Mobile push authorization failed: status=%s", status)
             self._warning_at[failure_class] = stamp
 
-    def _auth_failure(self, status: int) -> None:
+    def _auth_failure(self, status: int, retry_after: int = 60) -> None:
         stamp = monotonic()
-        self._blocked_until = stamp + 60
+        self._blocked_until = stamp + retry_after
         self._blocked_status = status
         self._cached_token = ""
         self.warn_auth_failure(status)
@@ -58,7 +59,7 @@ class FcmSender:
     async def access_token(self) -> str:
         async with self._lock:
             if monotonic() < self._blocked_until:
-                raise _OAuthFailure(self._blocked_status, 60)
+                raise _OAuthFailure(self._blocked_status, ceil(self._blocked_until - monotonic()))
             if self._cached_token and monotonic() < self._refresh_at:
                 return self._cached_token
             response = await self.client.post(
@@ -94,9 +95,14 @@ class FcmSender:
             return SendResult("retry")
         except _OAuthFailure as error:
             auth_error = error.status in {400, 401, 403}
+            minimum_delay = 60 if auth_error else 0
+            if auth_error:
+                remaining = ceil(self._blocked_until - monotonic())
+                if remaining > 0:
+                    minimum_delay = remaining
             return SendResult(
                 "retry" if auth_error or error.status == 429 or error.status >= 500 else "discard",
-                max(60 if auth_error else 0, error.retry_after),
+                max(minimum_delay, error.retry_after),
             )
         except (ValueError, TypeError, AttributeError):
             return SendResult("retry")
@@ -166,8 +172,9 @@ class FcmSender:
                     ):
                         return SendResult("prune")
         if response.status_code == 403 and provider_error.get("status") == "PERMISSION_DENIED":
-            self._auth_failure(403)
-            return SendResult("retry", 60)
+            retry_after = max(60, _retry_after(response))
+            self._auth_failure(403, retry_after)
+            return SendResult("retry", retry_after)
         return SendResult("discard")
 
 
@@ -187,7 +194,7 @@ def _retry_after(response: httpx.Response) -> int:
             retry_at = parsedate_to_datetime(value)
             if retry_at.tzinfo is None:
                 retry_at = retry_at.replace(tzinfo=timezone.utc)
-            delay = int((retry_at - datetime.now(timezone.utc)).total_seconds())
+            delay = ceil((retry_at - datetime.now(timezone.utc)).total_seconds())
         except (ValueError, TypeError, OverflowError):
             delay = 0
     return max(0, min(delay, 3600))
