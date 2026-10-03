@@ -75,6 +75,25 @@ describe("markWorkspaceFileLinks", () => {
     expectHandedOver(markHref(path), path);
   });
 
+  it("decodes a percent-encoded href so the stored path matches the file on disk", () => {
+    // A link to a file with spaces/`+` in its name arrives percent-encoded;
+    // left encoded, the FileViewer lookup can never match the real filename.
+    expectHandedOver(
+      markHref("customer-notes/SAP%20-%20MLflow%20Labeling%20+%20Review%20Queues.md"),
+      "customer-notes/SAP - MLflow Labeling + Review Queues.md",
+    );
+  });
+
+  it("decodes a percent-encoded path while preserving its line fragment", () => {
+    expectHandedOver(markHref("docs/My%20Notes.md#L12"), "docs/My Notes.md#L12");
+  });
+
+  it("keeps a malformed-encoding href rather than dropping the link", () => {
+    // A lone `%` is a legal filename character but invalid percent-encoding;
+    // decodeURIComponent throws on it, so the raw href is kept.
+    expectHandedOver(markHref("docs/50%-done.md"), "docs/50%-done.md");
+  });
+
   it.each([
     ["https://example.com/docs.md", "external URL"],
     ["http://localhost:3000/x.md", "plain http URL"],
