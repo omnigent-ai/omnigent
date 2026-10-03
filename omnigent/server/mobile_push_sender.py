@@ -124,9 +124,7 @@ class FcmSender:
                 json=payload,
                 follow_redirects=False,
             )
-        except httpx.HTTPError:
-            return SendResult("retry")
-        except (ValueError, TypeError, AttributeError):
+        except (httpx.HTTPError, ValueError, TypeError, AttributeError):
             return SendResult("retry")
         if response.is_success:
             return SendResult("sent")
