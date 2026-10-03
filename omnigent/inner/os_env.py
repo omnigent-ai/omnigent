@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, TypeAlias, TypedDict, cast
 from urllib.parse import urlparse, urlunparse
 
-from omnigent._platform import IS_WINDOWS, WINDOWS_ENV_PASSTHROUGH
+from omnigent._platform import IS_WINDOWS, WINDOWS_ENV_PASSTHROUGH, posix_shell_path
 from omnigent.runner.identity import (
     OMNIGENT_SESSION_ENV_VAR,
     strip_runner_auth_secrets,
@@ -1011,7 +1011,7 @@ def create_os_environment(
             "os_env.start_in_scratch requires an active sandbox; "
             f"resolved sandbox type {sandbox.backend_type!r} is inactive"
         )
-    shell_path = shutil.which("bash") or shutil.which("sh")
+    shell_path = posix_shell_path()
     if shell_path is None:
         # No POSIX shell on PATH. On Windows fall back to cmd.exe; elsewhere
         # keep the historical /bin/sh default.

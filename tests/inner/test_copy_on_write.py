@@ -86,7 +86,9 @@ def test_programmatic_configuration_cannot_bypass_backend_check(tmp_path: Path) 
 @pytest.fixture
 def backend(monkeypatch) -> BwrapSandboxBackend:
     monkeypatch.setattr("omnigent.inner.bwrap_sandbox.sys.platform", "linux")
-    monkeypatch.setattr("omnigent.inner.bwrap_sandbox.shutil.which", lambda _: "/usr/bin/bwrap")
+    monkeypatch.setattr(
+        "omnigent.inner.bwrap_sandbox.shutil.which", lambda _name, *_, **__: "/usr/bin/bwrap"
+    )
     return BwrapSandboxBackend()
 
 
