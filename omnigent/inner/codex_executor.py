@@ -150,6 +150,16 @@ _TURN_EVENT_WARN_SECONDS = 600.0
 # warning cadence is unchanged.
 _TURN_EVENT_POLL_SECONDS = 5.0
 _TURN_COMPLETED_DRAIN_SECONDS = 1.0
+# Pause/Stop budget. The ``turn/interrupt`` RPC round-trip gets its own short
+# slice; the app server then gets a real window to confirm the turn actually
+# stopped, instead of the turn being dropped on a fixed half-second hope. The
+# two sum to 2.0s so the confirm fits inside the executor adapter's
+# interrupt-event slice. close_session is not covered by that budget — it can
+# take seconds to reap the app server — so the adapter finishes it in the
+# background rather than cancelling the teardown mid-terminate.
+_INTERRUPT_REQUEST_SECONDS = 0.5
+_INTERRUPT_CONFIRM_SECONDS = 1.5
+_INTERRUPT_CONFIRM_POLL_SECONDS = 0.02
 # Wall-clock budget for the ``codex --version`` probe. A broken codex
 # build that blocks (e.g. on stdin) must not stall session startup — on
 # timeout the probe kills the process and reports the version as unknown.
@@ -2745,6 +2755,7 @@ class _CodexAppServerSession:
         self._native_progress_observed = False
         self._reader_started_turn: str | None = None
         self._reader_completed_turn: str | None = None
+        self._reader_failed_turn: str | None = None
         self._next_id = 1
         self._started = False
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -2813,6 +2824,7 @@ class _CodexAppServerSession:
         self._native_progress_observed = False
         self._reader_started_turn = None
         self._reader_completed_turn = None
+        self._reader_failed_turn = None
         self._events = asyncio.Queue()
         self._cleaned = False
         self._loop = asyncio.get_running_loop()
@@ -4103,16 +4115,71 @@ class _CodexAppServerSession:
             self.active_turn_id = turn_id
         return True
 
+    def live_turn_id(self) -> str | None:
+        """The turn the app server still has open, independent of the generator.
+
+        ``run_turn``'s teardown clears :attr:`active_turn_id` as soon as the
+        generator unwinds, which happens well before the app server stops
+        generating when a Pause tears the runner turn down first. Falling back
+        to the reader's started-but-not-ended turn keeps the interrupt aimed at
+        a turn that is genuinely still running.
+
+        :returns: The live turn id, or ``None`` when nothing is open.
+        """
+        if self.active_turn_id is not None:
+            return self.active_turn_id
+        started = self._reader_started_turn
+        if started is not None and started not in (
+            self._reader_completed_turn,
+            self._reader_failed_turn,
+        ):
+            return started
+        return None
+
     async def interrupt_turn(self) -> bool:
-        if self.thread_id is None or self.active_turn_id is None:
+        turn_id = self.live_turn_id()
+        if self.thread_id is None or turn_id is None:
             return False
         await self._request(
             "turn/interrupt",
             {
                 "threadId": self.thread_id,
-                "turnId": self.active_turn_id,
+                "turnId": turn_id,
             },
         )
+        return True
+
+    def turn_stopped(self, turn_id: str) -> bool:
+        """Whether *turn_id* has been observed to stop generating.
+
+        Read off the reader task's markers, not the turn generator's, so this
+        answers even while nothing is consuming ``run_turn`` — the case Pause
+        hits when the runner already tore its turn down.
+
+        :param turn_id: The turn asked to stop, e.g. ``"turn_abc123"``.
+        :returns: ``True`` once the app server ended the turn (completed or
+            terminally failed) or the transport died. The generator clearing
+            :attr:`active_turn_id` is deliberately NOT a stop — it unwinds
+            before the app server does, so treating it as one would confirm a
+            Pause while Codex was still generating.
+        """
+        if self._transport_error is not None or not self._started:
+            return True
+        return turn_id in (self._reader_completed_turn, self._reader_failed_turn)
+
+    async def await_turn_stopped(self, turn_id: str, *, timeout: float) -> bool:
+        """Wait up to *timeout* for the app server to confirm *turn_id* stopped.
+
+        :param turn_id: The turn asked to stop.
+        :param timeout: Seconds to wait before giving up.
+        :returns: ``True`` when the stop was confirmed, ``False`` on timeout —
+            the caller reports an unconfirmed stop rather than assuming one.
+        """
+        deadline = time.monotonic() + timeout
+        while not self.turn_stopped(turn_id):
+            if time.monotonic() >= deadline:
+                return False
+            await asyncio.sleep(_INTERRUPT_CONFIRM_POLL_SECONDS)
         return True
 
     async def _execute_dynamic_tool(
@@ -4219,6 +4286,15 @@ class _CodexAppServerSession:
             turn = params.get("turn", {})
             if isinstance(turn, dict) and isinstance(turn.get("id"), str):
                 self._reader_completed_turn = turn["id"]
+            self._native_progress_observed = True
+            return
+        if method == "turn/failed":
+            # A retrying failure keeps the turn alive (the app server starts it
+            # over), so it is not a stop — only a terminal one is.
+            turn = params.get("turn", {})
+            if params.get("willRetry") is not True and isinstance(turn, dict):
+                if isinstance(turn.get("id"), str):
+                    self._reader_failed_turn = turn["id"]
             self._native_progress_observed = True
             return
         if method in {
@@ -4688,30 +4764,66 @@ class CodexExecutor(Executor):
         return True
 
     async def interrupt_session(self, session_key: str) -> bool:
+        """Stop the in-flight turn, confirm it stopped, then drop the session.
+
+        The interrupt used to be a fixed half-second on the ``turn/interrupt``
+        round-trip, which proves only that the app server *received* the ask —
+        so a Pause could return while Codex was still generating. The
+        round-trip keeps its own short slice, and the turn is then given a real
+        window to be observed stopping
+        (:meth:`_CodexAppServerSession.await_turn_stopped`). An unconfirmed
+        stop is logged and returned as ``False`` so callers can report a Pause
+        that did not land instead of assuming one that did.
+
+        The session is always dropped afterwards (resetting ``thread_id``) so
+        the next turn starts a fresh thread and replays full history. A resumed
+        thread sends only the latest user message, which would bypass the
+        runner's "[System: interrupted]" marker and silently continue the
+        abandoned request. See claude_sdk_executor.interrupt_session for the
+        rationale, and the ``resume_after_pause`` capability Codex publishes.
+
+        :param session_key: The Omnigent session id to interrupt.
+        :returns: ``True`` when the turn was confirmed stopped and the session
+            closed; ``False`` when the stop could not be confirmed or the close
+            failed.
+        """
         state = self._session_states.get(session_key)
         if state is None or state.app_session is None:
             return False
-        # Best-effort interrupt to halt the in-flight turn; a failure just
-        # falls through to the close below.
+        app_session = state.app_session
+        # Ask the app session which turn it still has open rather than reading
+        # the generator's ``active_turn_id`` — Pause usually arrives after
+        # ``run_turn`` unwound and cleared that, while Codex is still
+        # generating, and keying off it would report a stop nobody asked for.
+        interrupted_turn_id = app_session.live_turn_id()
+        confirmed = interrupted_turn_id is None  # nothing open: nothing to stop
         try:
             await asyncio.wait_for(
-                state.app_session.interrupt_turn(),
-                timeout=0.5,
+                app_session.interrupt_turn(),
+                timeout=_INTERRUPT_REQUEST_SECONDS,
             )
-        except Exception as exc:  # noqa: BLE001 — interrupt is best-effort
+        except Exception as exc:  # noqa: BLE001 — the close below is the floor
             logger.warning(
                 "Codex turn interrupt failed for session %s: %s",
                 session_key,
                 exc,
             )
-        # Always drop the session (resets thread_id) so the next turn starts a
-        # fresh thread and replays full history. A resumed thread sends only
-        # the latest user message, which would bypass the runner's
-        # "[System: interrupted]" marker and silently continue the abandoned
-        # request. See claude_sdk_executor.interrupt_session for the rationale.
+        else:
+            if interrupted_turn_id is not None:
+                confirmed = await app_session.await_turn_stopped(
+                    interrupted_turn_id,
+                    timeout=_INTERRUPT_CONFIRM_SECONDS,
+                )
+                if not confirmed:
+                    logger.warning(
+                        "Codex did not confirm turn %s stopped within %.1fs for "
+                        "session %s; closing the session anyway",
+                        interrupted_turn_id,
+                        _INTERRUPT_CONFIRM_SECONDS,
+                        session_key,
+                    )
         try:
             await self.close_session(session_key)
-            return True
         except Exception as exc:  # noqa: BLE001 — close failures surface via False return
             logger.warning(
                 "Codex session close after interrupt failed for session %s: %s",
@@ -4719,6 +4831,7 @@ class CodexExecutor(Executor):
                 exc,
             )
             return False
+        return confirmed
 
     async def enqueue_session_message(
         self, session_key: str, content: CodexEnqueuedContent

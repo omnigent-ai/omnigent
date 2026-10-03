@@ -19,10 +19,10 @@ from collections import deque
 from collections.abc import Callable, Sequence
 from typing import Any
 
-from fastapi import Response
+from fastapi import Response, status
 
 from omnigent.debug_logging import phase_scope
-from omnigent.errors import ElicitationDeclinedError, ErrorPhase
+from omnigent.errors import ElicitationDeclinedError, ErrorCode, ErrorPhase, OmnigentError
 from omnigent.inner.executor import (
     CompactionComplete,
     CompactionStarted,
@@ -75,6 +75,10 @@ _MCP_TOOL_NAME_PREFIX = "mcp__"
 # slice never fires first and inject a CancelledError that bypasses the SIGKILL fallback.
 INTERRUPT_TIMEOUT_S = 3.0
 _INTERRUPT_SLICE_S = 3.0
+# A live Pause holds the runner's interrupt POST open, and that POST is bounded at
+# 3.0s. Stay under it so a slow teardown reports as a delivered interrupt rather than
+# a POST timeout: the stop is worth waiting for, the subprocess reap behind it is not.
+_INTERRUPT_EVENT_SLICE_S = 2.5
 
 # Interrupting an executor abandoned by an abnormal exit usually fails because the
 # harness is already gone -- that absence is what abandoned it. Its socket refuses or
@@ -433,11 +437,60 @@ class ExecutorAdapter(HarnessApp):
 
         Extends the base handler to also call ``interrupt_session`` — ensuring the in-flight
         generation stops even when the run loop is blocked awaiting the first token.
+
+        The base 404s when no turn is in flight, but an inner agent routinely outlives the
+        harness turn: a native TUI keeps generating after ``run_turn`` unwound, and Pause
+        arrives exactly then. Letting that 404 escape would skip ``interrupt_session`` and
+        leave the vendor running, so it is absorbed as long as there is an executor to stop;
+        with neither a turn nor an executor the 404 still surfaces.
         """
-        response = await super()._handle_interrupt_event()
-        if self._executor is not None:
-            await self._executor.interrupt_session(self._session_key)
+        interrupted_turn = True
+        try:
+            response = await super()._handle_interrupt_event()
+        except OmnigentError as exc:
+            if exc.code is not ErrorCode.NOT_FOUND or self._executor is None:
+                raise
+            interrupted_turn = False
+            response = Response(status_code=status.HTTP_204_NO_CONTENT)
+        await self._interrupt_inner_session(had_in_flight_turn=interrupted_turn)
         return response
+
+    async def _interrupt_inner_session(self, *, had_in_flight_turn: bool) -> None:
+        """Stop the inner session without holding the Pause response past its budget.
+
+        ``interrupt_session`` confirms the stop and then reaps the inner process; only the
+        confirm belongs on the response path. Past :data:`_INTERRUPT_EVENT_SLICE_S` the
+        teardown keeps running as a tracked background task rather than being cancelled
+        mid-terminate, which would strand the subprocess.
+
+        :param had_in_flight_turn: Whether the base handler found a turn to cancel; when it
+            did not, an executor reporting nothing to stop means the Pause found no agent.
+        """
+        executor = self._executor
+        if executor is None:
+            return
+        task = asyncio.ensure_future(executor.interrupt_session(self._session_key))
+        self._bg_tasks.add(task)
+        task.add_done_callback(self._bg_tasks.discard)
+        try:
+            stopped = await asyncio.wait_for(
+                asyncio.shield(task), timeout=_INTERRUPT_EVENT_SLICE_S
+            )
+        except TimeoutError:
+            _logger.warning(
+                "interrupt of inner session %s did not finish within %.1fs; "
+                "completing the teardown in the background",
+                self._session_key,
+                _INTERRUPT_EVENT_SLICE_S,
+            )
+            return
+        except Exception:  # best-effort: the runner floor does not depend on it
+            _logger.exception("interrupt of inner session %s failed", self._session_key)
+            return
+        if not stopped and not had_in_flight_turn:
+            _logger.warning(
+                "interrupt of inner session %s found no turn to stop", self._session_key
+            )
 
     async def _prepare_turn_retry(self) -> bool:
         """Wait for confirmed teardown without cancelling the background reap."""

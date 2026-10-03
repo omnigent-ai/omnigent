@@ -20,6 +20,8 @@ from omnigent.harness_capabilities import (
     InstructionDelivery,
     IntegrationMode,
     ModelFamily,
+    PauseResume,
+    PauseSemantics,
     Resume,
 )
 from omnigent.harness_plugins import (
@@ -109,6 +111,69 @@ def test_p0_bench_harnesses_declare_interrupt_and_streaming() -> None:
         assert caps[harness].streaming is True, harness
 
 
+def test_pause_is_unsupported_exactly_where_interrupt_is() -> None:
+    """Pause cannot end a run a harness has no way to interrupt.
+
+    ``pause`` is the client-facing spelling of what Pause does to the vendor
+    agent, so it must not claim ``ends-run`` for a harness whose interrupt never
+    reaches the vendor — nor ``unsupported`` for one whose interrupt works.
+    """
+    for harness, capability in harness_capabilities().items():
+        if capability.interrupt:
+            assert capability.pause is not PauseSemantics.UNSUPPORTED, harness
+        else:
+            assert capability.pause is PauseSemantics.UNSUPPORTED, harness
+
+
+def test_no_harness_claims_pause_suspends_a_turn() -> None:
+    """``suspends`` is reserved: no harness freezes a turn mid-step today.
+
+    Every harness stops and abandons the turn. Declaring otherwise would tell a
+    client the in-flight work survives Pause, which is the exact expectation
+    Omnigent has to stop breaking.
+    """
+    claiming = sorted(
+        harness
+        for harness, capability in harness_capabilities().items()
+        if capability.pause is PauseSemantics.SUSPENDS
+    )
+    assert not claiming, f"harnesses claiming Pause suspends a turn: {claiming}"
+
+
+def test_cancel_is_supported_everywhere() -> None:
+    """Cancel is a framework floor, not a per-vendor feature.
+
+    Omnigent's own turn teardown records the cancellation and its cause even
+    when the vendor ignores the interrupt, so no harness may publish otherwise.
+    """
+    for harness, capability in harness_capabilities().items():
+        assert capability.cancel is True, harness
+
+
+def test_native_harnesses_resume_the_same_vendor_thread_after_a_pause() -> None:
+    """A resident vendor TUI/server keeps its conversation across an interrupt.
+
+    That is what ``resume=warm-reattach`` already means for reconnects, so a
+    Pause on those harnesses must not advertise a rebuilt thread.
+    """
+    caps = harness_capabilities()
+    for agent in native_agents():
+        assert caps[agent.harness].resume_after_pause is PauseResume.SAME_THREAD, agent.harness
+
+
+def test_session_dropping_harnesses_declare_a_rebuilt_thread() -> None:
+    """Harnesses whose interrupt closes the vendor session must say so.
+
+    Each of these calls ``close_session()`` (or kills the CLI) from
+    ``interrupt_session``, so the next turn starts a fresh vendor session and
+    replays Omnigent's history. Declaring ``same-thread`` would promise callers
+    a continuation the harness cannot give.
+    """
+    caps = harness_capabilities()
+    for harness in ("claude-sdk", "codex", "copilot", "cursor", "pi", "kimi", "hermes"):
+        assert caps[harness].resume_after_pause is PauseResume.NEW_TURN, harness
+
+
 def test_pi_harnesses_declare_the_pi_effort_family() -> None:
     """Both pi harnesses advertise pi's 7-level ladder, not "no effort knob"."""
     from omnigent.util.reasoning_effort import EFFORT_VALUES, PI_EFFORTS
@@ -142,6 +207,11 @@ def test_optional_bench_capabilities_default_to_unknown() -> None:
     assert capability.shell_tool_name is None
     assert capability.shell_tool_prompt is None
     assert capability.instruction_delivery is InstructionDelivery.UNKNOWN
+    # Pause axes default to the conservative claim: an interrupt ends the run
+    # and the vendor thread does not survive it.
+    assert capability.pause is PauseSemantics.ENDS_RUN
+    assert capability.resume_after_pause is PauseResume.NEW_TURN
+    assert capability.cancel is True
     assert capability.as_dict() == {
         "integration_mode": "sdk-in-process",
         "elicitation": "none",
@@ -152,6 +222,9 @@ def test_optional_bench_capabilities_default_to_unknown() -> None:
         "subagents": False,
         "interrupt": True,
         "streaming": True,
+        "pause": "ends-run",
+        "resume_after_pause": "new-turn",
+        "cancel": True,
         "steering": None,
         "live_queue": None,
         "images": None,
