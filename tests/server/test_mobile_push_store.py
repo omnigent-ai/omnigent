@@ -139,10 +139,11 @@ def test_due_discovery_and_claim_are_bounded_and_index_backed(push_store, sessio
     }
 
 
-def seed_outbox_backlog(push_store, session_id, workspaces, count, *, due):
+def seed_outbox_backlog(push_store, session_id, workspaces, count, *, due, kind="completed"):
     from sqlalchemy import delete, insert
 
     from omnigent.db.db_models import SqlMobilePushOutbox
+    from omnigent.db.enum_codecs import encode_mobile_push_kind
 
     with push_store._engine.begin() as connection:
         connection.execute(delete(SqlMobilePushOutbox))
@@ -155,8 +156,8 @@ def seed_outbox_backlog(push_store, session_id, workspaces, count, *, due):
                     "session_id": session_id,
                     "user_id": "owner",
                     "installation_id": f"phone-{index}",
-                    "device_generation": "generation",
-                    "kind": "completed",
+                    "device_generation": uuid4().hex,
+                    "kind": encode_mobile_push_kind(kind),
                     "reason": None,
                     "not_before": 110 if due and index == 0 else 10000 + index,
                     "expires_at": 100000,
@@ -258,6 +259,7 @@ def test_every_retained_push_index_backs_an_executed_query(push_store, session_i
         "ix_mobile_push_outbox_device",
         "ix_mobile_push_outbox_user",
         "ix_mobile_push_outbox_tenants",
+        "ix_mobile_push_outbox_activity",
     }
     assert {
         index.name
@@ -294,6 +296,7 @@ def test_every_retained_push_index_backs_an_executed_query(push_store, session_i
         push_store.enqueue(session_id, "completed", now=110)
         assert push_store.delete_device("phone", "owner")
         push_store.purge_expired(now=120, limit=1)
+        push_store.cancel(session_id)
         assert accounts.delete_user("owner")
         push_store.purge_expired(now=100 + 30 * 86400, limit=1)
     finally:
@@ -302,6 +305,115 @@ def test_every_retained_push_index_backs_an_executed_query(push_store, session_i
         name for name in expected for statement, plan in plans if name in plan and "SEARCH" in plan
     }
     assert used == expected
+    assert any(
+        "ix_mobile_push_outbox_activity" in plan and "LIMIT" in statement
+        for statement, plan in plans
+    )
+
+
+@pytest.mark.parametrize("token", ["x" * 1025, "tökén", "token.with.dot", "token@host"])
+def test_store_rejects_unbounded_or_non_ascii_tokens(push_store, token):
+    from omnigent.errors import ErrorCode
+
+    with pytest.raises(OmnigentError) as rejected:
+        register(push_store, token=token)
+    assert rejected.value.code == ErrorCode.INVALID_INPUT
+    assert push_store.devices_for_user("owner", now=100) == []
+    assert register(push_store, token="A" * 1018 + "z09:_-").token == "A" * 1018 + "z09:_-"
+
+
+@pytest.mark.parametrize(
+    "field,name,code",
+    [
+        ("platform", "android", 1),
+        ("platform", "ios", 2),
+        ("kind", "completed", 1),
+        ("kind", "failed", 2),
+        ("kind", "needs_input", 3),
+    ],
+)
+def test_mobile_push_codecs_round_trip(field, name, code):
+    from omnigent.db import enum_codecs
+
+    encode = getattr(enum_codecs, f"encode_mobile_push_{field}")
+    decode = getattr(enum_codecs, f"decode_mobile_push_{field}")
+    assert encode(name) == code
+    assert decode(code) == name
+    with pytest.raises(ValueError, match="unknown"):
+        encode("unknown")
+    with pytest.raises(ValueError, match="unknown"):
+        decode(99)
+
+
+def test_activity_cancel_probe_work_is_bounded(push_store, session_id):
+    from sqlalchemy import event
+
+    measurements = []
+    for size in (16, 16384):
+        seed_outbox_backlog(push_store, session_id, [0], size, due=True, kind="needs_input")
+        steps = [0]
+
+        def progress(steps=steps):
+            steps[0] += 1
+            return 0
+
+        def checkout(connection, record, proxy, progress=progress):
+            connection.set_progress_handler(progress, 1)
+
+        def checkin(connection, record):
+            connection.set_progress_handler(None, 0)
+
+        event.listen(push_store._engine, "checkout", checkout)
+        event.listen(push_store._engine, "checkin", checkin)
+        try:
+            push_store.cancel(session_id, terminal_only=True)
+        finally:
+            event.remove(push_store._engine, "checkout", checkout)
+            event.remove(push_store._engine, "checkin", checkin)
+        measurements.append(steps[0])
+    assert measurements[1] <= measurements[0] + 50
+
+
+def test_device_and_delivery_use_compact_storage(push_store, session_id):
+    from sqlalchemy import text
+
+    device = register(push_store)
+    push_store.enqueue(session_id, "completed", now=100)
+    delivery = push_store.claim(now=110)[0]
+    assert device.platform == "android" and delivery.kind == "completed"
+    with push_store._engine.connect() as connection:
+        assert connection.execute(
+            text(
+                "SELECT platform, length(generation) FROM mobile_push_devices "
+                "WHERE installation_id = 'phone'"
+            )
+        ).one() == (1, 16)
+        assert connection.execute(
+            text(
+                "SELECT kind, length(id), length(device_generation), length(lease) "
+                "FROM mobile_push_outbox"
+            )
+        ).one() == (1, 16, 16, 16)
+
+
+@pytest.mark.parametrize("operation", ["enqueue", "cancel"])
+def test_stale_actor_cannot_lose_owner_attention(push_store, session_id, operation, db_uri):
+    from omnigent.db.account_authority import account_authority_scope, current_account_user
+    from omnigent.server.accounts_store import SqlAlchemyAccountStore
+
+    accounts = SqlAlchemyAccountStore(db_uri)
+    accounts.create_user_with_password("actor", "hash")
+    register(push_store)
+    if operation == "cancel":
+        push_store.enqueue(session_id, "completed", now=100)
+    with account_authority_scope("actor", uuid4().hex):
+        if operation == "enqueue":
+            push_store.enqueue(session_id, "completed", now=100)
+        else:
+            push_store.cancel(session_id)
+        assert current_account_user() == "actor"
+    deliveries = push_store.claim(now=110)
+    assert [item.user_id for item in deliveries] == (["owner"] if operation == "enqueue" else [])
 
 
 def test_expired_unpurged_intent_cannot_block_new_enqueue(push_store, session_id):
@@ -359,7 +471,7 @@ def test_user_outbox_delete_uses_workspace_user_index(push_store, session_id, db
     register(push_store)
     register(push_store, user="reader", installation="reader-phone", token="reader-token")
     push_store.enqueue(session_id, "completed", now=100)
-    columns = ("workspace_id", "user_id")
+    columns = ("workspace_id", "user_id", "id")
     assert any(
         tuple(column.name for column in index.columns) == columns
         for index in SqlMobilePushOutbox.__table__.indexes

@@ -13,6 +13,25 @@ from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissi
 from tests.server.test_mobile_push_config import credentials as credentials
 
 
+@pytest.mark.parametrize("token", ["x" * 1025, "tökén", "token.with.dot", "token@host"])
+async def test_device_api_enforces_bounded_ascii_token(push_app_factory, token):
+    app = push_app_factory()
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app), base_url="http://test"
+    ) as client:
+        body = {"platform": "android", "fcm_token": token, "firebase_project_id": "push-project"}
+        response = await client.put(
+            "/v1/mobile-push/devices/phone", headers={"X-Forwarded-Email": "alice"}, json=body
+        )
+        assert response.status_code == 422
+        assert app.state.mobile_push_store.devices_for_user("alice") == []
+        body["fcm_token"] = "A" * 1018 + "z09:_-"
+        response = await client.put(
+            "/v1/mobile-push/devices/phone", headers={"X-Forwarded-Email": "alice"}, json=body
+        )
+        assert response.status_code == 204
+
+
 @pytest.fixture
 def push_app_factory(db_uri, tmp_path, credentials, monkeypatch):
     from omnigent.server.app import create_app

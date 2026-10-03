@@ -11,14 +11,20 @@ from starlette.types import Receive, Scope, Send
 from omnigent.server.auth import RESERVED_USER_LOCAL, AuthProvider
 from omnigent.server.mobile_push_config import FcmConfig
 from omnigent.server.mobile_push_content import Platform
-from omnigent.server.mobile_push_store import MobilePushStore
+from omnigent.server.mobile_push_store import (
+    FCM_TOKEN_MAX_LENGTH,
+    FCM_TOKEN_PATTERN,
+    MobilePushStore,
+)
 from omnigent.server.routes._auth_helpers import require_user
 
 
 class DeviceRegistration(BaseModel):
     model_config = ConfigDict(extra="ignore")
     platform: Platform
-    fcm_token: str = Field(min_length=1, max_length=4096, pattern=r"^\S+$", repr=False)
+    fcm_token: str = Field(
+        min_length=1, max_length=FCM_TOKEN_MAX_LENGTH, pattern=FCM_TOKEN_PATTERN, repr=False
+    )
     firebase_project_id: str = Field(min_length=1, max_length=64)
 
 
