@@ -588,14 +588,15 @@ pnpm run build             # current platform
 pnpm run build:mac         # .dmg + .zip (signed if an identity is available, not notarized)
 pnpm run build:mac:release # .dmg + .zip; app and DMG signed + notarized (see below)
 pnpm run build:linux       # AppImage + .deb
-pnpm run build:win         # NSIS installer
+pnpm run build:win         # NSIS installer (signed if WIN_CSC_LINK is set, see below)
+pnpm run build:win:release # NSIS installer; aborts unless it is signed (see below)
 ```
 
 Local packages use the `ai.omnigent.desktop-dev` app ID and the **Omnigent Dev**
 name; output lands in `electron/dist-dev/` (the DMG is named
 `Omnigent Dev-<version>-<arch>.dmg`). They keep their own app data and do not
-install production desktop updates. `build:mac:release` retains
-`ai.omnigent.desktop`, **Omnigent**, and `electron/dist/`.
+install production desktop updates. `build:mac:release` and `build:win:release`
+retain `ai.omnigent.desktop`, **Omnigent**, and `electron/dist/`.
 
 Unpackaged `pnpm start` / `just electron-dev` runs inside Electron's own macOS
 bundle, but reads local preferences from `ai.omnigent.desktop-dev` explicitly
@@ -681,6 +682,46 @@ xcrun stapler validate -v dist/Omnigent-*-arm64.dmg
 `build:mac:release` **fails loudly** if signing or notarization credentials
 are missing, if Apple rejects a DMG, or if stapling fails. That's intentional,
 so a release artifact can't silently ship unsigned or unnotarized.
+
+## Windows code signing
+
+The Windows executable and NSIS installer are signed with **SHA-256
+Authenticode** whenever signing material is present. Like macOS, signing is
+driven entirely by what credentials are present — there are no code changes
+between a dev build and a release build:
+
+| Credentials present                | Result                                                                        |
+| ---------------------------------- | ----------------------------------------------------------------------------- |
+| none                               | unsigned installer; managed Windows devices that require signatures refuse it |
+| Authenticode cert (`WIN_CSC_LINK`) | executable + installer signed; installs cleanly on managed devices            |
+
+Export the certificate and private key as a password-protected `.pfx` and set:
+
+```bash
+export WIN_CSC_LINK=/path/to/authenticode.pfx   # or a base64 string / https URL
+export WIN_CSC_KEY_PASSWORD='the pfx password'
+```
+
+then:
+
+```bash
+pnpm run build:win          # Omnigent Dev package; signed if WIN_CSC_LINK is set, unsigned otherwise
+pnpm run build:win:release  # production package; aborts unless every artifact is signed
+```
+
+`build:win:release` sets `forceCodeSigning`, so a release build **fails
+loudly** when signing material is missing or signing fails — a release
+installer can't silently ship unsigned. On a non-Windows build host,
+electron-builder signs via its bundled osslsigncode; if the organization
+later adopts Azure Trusted Signing instead of a `.pfx`, swap
+`build.win.signtoolOptions` for `azureSignOptions`. Verify a signed
+installer with:
+
+```powershell
+Get-AuthenticodeSignature 'dist\Omnigent Setup <version>.exe'   # → Status: Valid
+```
+
+(or `signtool verify /pa /v <installer>.exe` from the Windows SDK).
 
 ## Getting a server to point at
 
