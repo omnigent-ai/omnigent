@@ -32,6 +32,74 @@ To provision a fresh sandbox per firing, set `execution_target: "managed_sandbox
 
 **Agent tools.** An agent can manage automations itself with `sys_scheduled_task_create`, `sys_scheduled_task_list`, `sys_scheduled_task_update`, and `sys_scheduled_task_delete` -- so an agent can schedule its own follow-up work. The create and update tools expose the same `permission_mode`, `max_cost_usd`, and `execution_target` controls.
 
+## Session names
+
+The automation's stored name stays visible in the Automations list. Each run's
+session name expands `{{FORMAT}}` date placeholders using the **worker start
+time** (also recorded as the run's `scheduled_at`), in the task's timezone.
+Month and weekday names are always English, independent of locale. The prompt
+is never expanded.
+
+For example, at 2026-10-02 09:05 in `America/New_York`:
+
+| Stored name | Session name |
+| --- | --- |
+| `Open PR Rebase - {{YYYY-MM-DD}}` | `Open PR Rebase - 2026-10-02` |
+| `Open PR Rebase - {{Mon DD}}` | `Open PR Rebase - Oct 02` |
+| `Open PR Rebase - {{MMM DD}}` | `Open PR Rebase - Oct 02` |
+| `Hourly check - {{YYYY-MM-DD HH:mm}}` | `Hourly check - 2026-10-02 09:05` |
+| `Weekly review - {{dddd}}, {{MMM DD}}` | `Weekly review - Friday, Oct 02` |
+| `{{YYYY}}{{MM}}{{DD}}` | `20261002` |
+
+Tokens are case-sensitive and must be whole letter runs. Separate tokens with
+spaces, `-`, `/`, `.`, `:`, `,`, or `_`, or put them in adjacent placeholders.
+Patterns must start and end with a token. Spaces and tabs at the edges of a
+placeholder are trimmed: `{{ MMM DD }}` works. Placeholders must close on the
+same line and cannot contain nested braces.
+
+| Token | Meaning | Example |
+| --- | --- | --- |
+| `YYYY` | Calendar year | `2026` |
+| `MMMM` | Full month name | `October` |
+| `MMM` / `Mon` | Short month name (`Mon` is a permanent alias) | `Oct` |
+| `MM` | Month, 01–12 | `10` |
+| `DD` | Day of month, 01–31 | `02` |
+| `dddd` | Full weekday name | `Friday` |
+| `ddd` | Short weekday name | `Fri` |
+| `HH` | Hour, 00–23 | `09` |
+| `mm` | Minute, 00–59; requires `HH` in the same placeholder | `05` |
+
+Write `\{{` for a literal `{{`: `Deploy \{{env}} - {{YYYY}}` becomes
+`Deploy {{env}} - 2026`. The escaped output is not parsed again. Lone braces,
+`}}`, and other backslashes remain literal. Names without `{{` are unchanged.
+
+Invalid templates return HTTP 400 on create or rename with these hints:
+
+| Input | Hint |
+| --- | --- |
+| `mon`, `MON` | Use `MMM` (or `Mon`) |
+| `Month` | Use `MMMM` |
+| `Day`, `Dy`, `EEE`, `EEEE` | Use `ddd` / `dddd` |
+| `yyyy`, `yy`, `YY` | Use `YYYY` |
+| `dd`, `d`, `D` | Use `DD` or `ddd` |
+| `DDD`, `DDDD` | Day of year is not supported |
+| `M` | Use `MM` |
+| `H`, `h`, `hh`, `A`, `a` | Use `HH:mm` (24-hour) |
+| `ss` | Seconds are not supported |
+| `date` | Use `{{YYYY-MM-DD}}` |
+| `time` | Use `{{HH:mm}}` |
+| Body containing `%` | strftime codes are not supported |
+| `YYYYMMDD`, `MonDD` | Separate tokens or use adjacent placeholders, e.g. `{{YYYY}}{{MM}}{{DD}}` |
+| `mm` without `HH`, or `HH:MM` | `mm` is minutes and needs `HH` (e.g. `{{HH:mm}}`); `MM` is the month |
+| Anything else | Lists the supported tokens |
+
+Reserved words such as `date`, `time`, `run`, `agent`, and `run.number` have no
+special meaning today and are rejected inside placeholders. Templated names
+(including escaped placeholders) are limited to 256 Unicode code points;
+rendered names are limited to 768. If a legacy stored name cannot render, the
+entire literal name is used and a warning is logged, without preventing the
+run. Unrelated edits that resend the same legacy name remain supported.
+
 ## Schedules are RRULEs, not cron
 
 A schedule is an [RFC 5545](https://datatracker.ietf.org/doc/html/rfc5545) recurrence rule evaluated in the task's IANA timezone.
@@ -61,7 +129,7 @@ Two timing caveats are worth knowing:
 
 1. **The row is re-read.** The armed timer is never trusted. A task deleted or paused between arming and firing is a no-op.
 2. **The launch target is resolved.** A `managed_sandbox` task checks that managed launches are available; its fresh sandbox is provisioned during launch. For `connected_host`, a task with no pinned `host_id` uses the owner's most-recently-active live host, chosen at fire time. A task with no pinned `workspace` starts the runner in that host's home directory, which is what makes chat-only, research, and MCP-only automations possible. A pinned host that is missing or offline -- or an owner with no live host at all -- records a **failed** run rather than a running one (`error_code` `host_offline`, `host_not_found`, or `no_online_host`).
-3. **A session is created**, bound to the task's agent and carrying any `model_override`, `reasoning_effort`, and supported `permission_mode`. Connected-host sessions carry the resolved workspace and host; managed-sandbox sessions are bound to their new sandbox during launch. If `max_cost_usd` is set, a per-session cost-budget policy is attached before the prompt is dispatched.
+3. **A session is created**, with date placeholders in its name rendered at worker start in the task's timezone, bound to the task's agent and carrying any `model_override`, `reasoning_effort`, and supported `permission_mode`. Connected-host sessions carry the resolved workspace and host; managed-sandbox sessions are bound to their new sandbox during launch. If `max_cost_usd` is set, a per-session cost-budget policy is attached before the prompt is dispatched.
 4. **Ownership is granted.** The new session gets a `LEVEL_OWNER` grant for the task's owner (a reserved local user in single-user and OSS deployments). Without the grant the run would be invisible.
 5. **The runner launches and the prompt is dispatched**, so the agent actually works. A seeded prompt with no launched runner would just sit in history.
 6. **The run is recorded** in `scheduled_task_runs`, and `last_run_at` and `last_run_conversation_id` are stamped on the task.

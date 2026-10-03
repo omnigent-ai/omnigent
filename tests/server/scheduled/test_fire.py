@@ -18,6 +18,7 @@ unit-tested without a live host/runner.
 from __future__ import annotations
 
 import asyncio
+import logging
 from dataclasses import dataclass, field
 from typing import Any
 from unittest.mock import AsyncMock
@@ -29,6 +30,7 @@ from omnigent.entities import ScheduledTask
 from omnigent.server.auth import LEVEL_OWNER, LEVEL_READ, RESERVED_USER_LOCAL, RESERVED_USER_PUBLIC
 from omnigent.server.scheduled import fire as fire_mod
 from omnigent.server.scheduled.fire import FireDeps, build_on_fire, build_run_now
+from omnigent.server.scheduled.name_template import NameTemplateError
 
 # ── Fakes ──────────────────────────────────────────────────────────────────
 
@@ -343,6 +345,123 @@ def _task(**overrides: Any) -> ScheduledTask:
 
 
 # ── Tests ────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("target", ["connected_host", "managed_sandbox"])
+@pytest.mark.parametrize("run_now", [False, True])
+@pytest.mark.parametrize(
+    "epoch,expected", [(1790946300, "2026-10-02 09:05"), (1790998200, "2026-10-02 23:30")]
+)
+async def test_session_name_uses_worker_start_in_task_timezone(
+    monkeypatch: pytest.MonkeyPatch, target: str, run_now: bool, epoch: int, expected: str
+) -> None:
+    monkeypatch.setattr(fire_mod.time, "time", lambda: epoch)
+    task = _task(
+        name="Open PR Rebase - {{YYYY-MM-DD HH:mm}}",
+        prompt="Do not render {{YYYY}} in the prompt",
+        timezone="America/New_York",
+        execution_target=target,
+        state="paused" if run_now else "active",
+    )
+    store = FakeScheduledTaskStore(rows={task.id: task})
+    conversations = FakeConversationStore()
+    launched: list[ScheduledTask] = []
+
+    async def launch(conv: Any, effective: ScheduledTask) -> None:
+        launched.append(effective)
+
+    deps = _deps(
+        store,
+        conversation_store=conversations,
+        sandbox_config=_FakeSandboxConfig(),
+    )
+    callback = (build_run_now if run_now else build_on_fire)(deps, launch_dispatch=launch)
+    await callback(0, task.id)
+    await _drain()
+    assert conversations.created[0]["title"] == "Open PR Rebase - " + expected
+    assert store.runs[0]["scheduled_at"] == epoch
+    assert store.runs[0]["status"] == "running"
+    assert launched[0].prompt == task.prompt
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["invalid", "timezone", "unexpected", "oversize"])
+async def test_session_name_failure_is_literal_and_logs_once(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, failure: str
+) -> None:
+    monkeypatch.setattr(fire_mod.time, "time", lambda: 1790946300)
+    task = _task(name="Deploy {{env}} {{YYYY}}", timezone="America/New_York")
+    if failure == "timezone":
+        task = _task(name="Deploy {{YYYY}}", timezone="unknown/timezone")
+    elif failure == "unexpected":
+
+        def broken_render(*args: Any) -> str:
+            raise RuntimeError("renderer failed")
+
+        monkeypatch.setattr(fire_mod, "render_session_name", broken_render)
+    elif failure == "oversize":
+
+        def oversized_render(*args: Any) -> str:
+            raise NameTemplateError("rendered names must be at most 768 Unicode code points")
+
+        monkeypatch.setattr(fire_mod, "render_session_name", oversized_render)
+    store = FakeScheduledTaskStore(rows={task.id: task})
+    conversations = FakeConversationStore()
+    launch = AsyncMock()
+    callback = build_on_fire(
+        _deps(store, conversation_store=conversations), launch_dispatch=launch
+    )
+    with caplog.at_level(logging.WARNING, logger=fire_mod.__name__):
+        await callback(0, task.id)
+        await _drain()
+    assert conversations.created[0]["title"] == task.name
+    assert store.runs[0]["status"] == "running"
+    launch.assert_awaited_once()
+    assert len(caplog.records) == 1
+    record = caplog.records[0]
+    assert record.levelno == (logging.ERROR if failure == "unexpected" else logging.WARNING)
+    assert record.name == fire_mod.__name__
+    assert task.id in record.message and "name" in record.message
+    assert (record.exc_info is not None) == (failure == "unexpected")
+
+
+@pytest.mark.asyncio
+async def test_session_name_plain_identity(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(fire_mod.time, "time", lambda: 1790946300)
+    conversations = FakeConversationStore()
+    store = FakeScheduledTaskStore(rows={"task_1": _task(name="nightly triage")})
+    callback = build_on_fire(
+        _deps(store, conversation_store=conversations), launch_dispatch=AsyncMock()
+    )
+    await callback(0, "task_1")
+    await _drain()
+    assert conversations.created[0]["title"] == "nightly triage"
+    store._rows["task_1"] = _task(name="nightly triage {{YYYY}}")
+    await callback(0, "task_1")
+    await _drain()
+    assert conversations.created[1]["title"] == "nightly triage 2026"
+
+
+@pytest.mark.asyncio
+async def test_session_name_plain_long_identity_without_warning(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setattr(fire_mod.time, "time", lambda: 1790946300)
+    name = "x" * 769
+    conversations = FakeConversationStore()
+    store = FakeScheduledTaskStore(rows={"task_1": _task(name=name)})
+    launch = AsyncMock()
+    callback = build_on_fire(
+        _deps(store, conversation_store=conversations), launch_dispatch=launch
+    )
+    with caplog.at_level(logging.WARNING, logger=fire_mod.__name__):
+        await callback(0, "task_1")
+        await _drain()
+    assert conversations.created[0]["title"] == name
+    assert store.runs[0]["status"] == "running"
+    launch.assert_awaited_once()
+    assert caplog.records == []
 
 
 async def _drain() -> None:
