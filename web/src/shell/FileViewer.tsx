@@ -753,6 +753,12 @@ function FileViewerBody({
     setPreviewableViewMode("editor");
   }, []);
 
+  const handleRequestSourceMode = useCallback(() => {
+    dismissFilePosition(position);
+    setDismissedPosition(position);
+    setPreviewableViewMode("source");
+  }, [position]);
+
   // Persist the global view preferences so they survive a refresh. commentsOpen
   // is intentionally excluded - it's contextual (per-open), not a sticky
   // preference. Idempotent on mount (writes back the seeded values).
@@ -1668,6 +1674,7 @@ function FileViewerBody({
               tocOpen={tocOpen}
               onTocToggle={() => setTocOpen((prev) => !prev)}
               onRequestEditMode={lang === "markdown" ? handleRequestEditMode : undefined}
+              onRequestSourceMode={handleRequestSourceMode}
             />
           )}
         </div>

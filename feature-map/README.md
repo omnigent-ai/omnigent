@@ -99,10 +99,12 @@ user-visible behavior. It then uses exactly these four H2 sections in order:
   authentication for project writes.
 - [Sessions](./sessions.md) covers the sidebar, whole-session and message forks,
   custom-agent targets, fork access checks, archive, reconnect, and resume.
+- [Slide decks](./slide-decks.md) covers the `*.slides.html` viewer in the file
+  viewer: navigation, fullscreen, printing, and the Source toggle.
 
 ## Seed scope
 
-The five recipes above are the seed set. Completing this set means checking
+The first five recipes above are the seed set. Completing this set means checking
 the listed entry points against current source and recording how to verify
 them, including explicit gaps. It does not mean that every recipe has been
 driven live or that the whole product is mapped. Keep the backlog below
@@ -123,6 +125,7 @@ map an area, remove it here in the same change.
   native edit-tool approvals are mapped)
 - Sub-agents and the agent info popover: `tests/e2e_ui/agents/`
 - Files and the workspace browser: `tests/e2e_ui/files/`, `tests/browser_ui/files/`
+  (only the slide-deck viewer is mapped)
 - Comments: `tests/e2e_ui/comments/`
 - Sharing and session permissions: `tests/e2e_ui/collaboration/`
 - GitHub integration: `tests/e2e_ui/github/`

@@ -105,6 +105,11 @@ export function isNotebookPath(path: string): boolean {
   return path.toLowerCase().endsWith(".ipynb");
 }
 
+/** Slide decks: `*.slides.html`, one top-level `<section>` per slide. */
+export function isSlidesFile(path: string): boolean {
+  return path.toLowerCase().endsWith(".slides.html");
+}
+
 // Image formats the browser can render directly via an <img> tag. SVG is
 // included but is only ever rendered through a blob URL (never inlined into
 // the DOM), so scripts embedded in it cannot execute.
@@ -600,6 +605,60 @@ export function prepareHtmlPreviewDoc(html: string): string {
   // wraps it in an implicit head, so leading head markup is safe.
   if (html.startsWith(HTML_PREVIEW_HEAD)) return html;
   return HTML_PREVIEW_HEAD + html;
+}
+
+/** Tags every postMessage between SlidesViewer and its deck iframe. */
+export const SLIDES_MSG_SOURCE = "omnigent-slides";
+
+/** Count the deck's slides (top-level `<section>`s). DOMParser documents are
+ * inert, so untrusted deck scripts never run here. */
+export function countSlideSections(html: string): number {
+  return new DOMParser().parseFromString(html, "text/html").querySelectorAll("body > section")
+    .length;
+}
+
+// Screen: show only the active section. Print: every section, one landscape page each.
+const SLIDES_STYLE = `<style>
+html,body{margin:0;width:100%;height:100%;overflow:hidden}
+@media screen{body>section:not([data-omnigent-active]){display:none!important}}
+@media print{
+@page{size:landscape;margin:0}
+html,body{height:auto;overflow:visible}
+body>section{break-after:page;break-inside:avoid}
+body>section:last-of-type{break-after:auto}
+}
+</style>`;
+
+// Only the embedding parent may drive the deck; keys are forwarded so
+// navigation still works while focus is inside the iframe.
+const SLIDES_SCRIPT = `<script>
+(function(){
+var S="${SLIDES_MSG_SOURCE}";
+function show(i){var s=document.querySelectorAll("body > section");for(var k=0;k<s.length;k++)s[k].toggleAttribute("data-omnigent-active",k===i);}
+show(0);
+addEventListener("message",function(e){
+if(e.source!==parent||!e.data||e.data.source!==S)return;
+if(e.data.type==="goto"&&typeof e.data.index==="number")show(e.data.index);
+else if(e.data.type==="print")print();
+});
+addEventListener("keydown",function(e){
+if(["ArrowLeft","ArrowRight","PageUp","PageDown"].indexOf(e.key)<0)return;
+e.preventDefault();
+parent.postMessage({source:S,type:"key",key:e.key},"*");
+});
+})();
+</script>`;
+
+/**
+ * Build the slide-deck srcdoc: the HTML preview doc plus injected CSS/script
+ * placed before the last `</body>` (appended for fragments). The file on disk
+ * is never modified.
+ */
+export function prepareSlidesDoc(html: string): string {
+  const doc = prepareHtmlPreviewDoc(html);
+  const injection = SLIDES_STYLE + SLIDES_SCRIPT;
+  const at = doc.toLowerCase().lastIndexOf("</body>");
+  return at === -1 ? doc + injection : doc.slice(0, at) + injection + doc.slice(at);
 }
 
 /**

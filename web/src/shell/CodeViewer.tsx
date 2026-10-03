@@ -68,6 +68,7 @@ import {
   isModelFile,
   isNotebookPath,
   isPdfFile,
+  isSlidesFile,
   lineOverlapsSelection,
 } from "./codeViewerHelpers";
 import { NotebookPreview } from "./NotebookPreview";
@@ -97,6 +98,10 @@ const PdfViewer = lazy(() => import("./PdfViewer").then((m) => ({ default: m.Pdf
 // model file is actually opened so it stays out of the main bundle (same
 // lazy strategy as Monaco).
 const ModelViewer = lazy(() => import("./ModelViewer").then((m) => ({ default: m.ModelViewer })));
+// Slide decks load their viewer on demand, like the other preview surfaces.
+const SlidesViewer = lazy(() =>
+  import("./SlidesViewer").then((m) => ({ default: m.SlidesViewer })),
+);
 
 // ---------------------------------------------------------------------------
 // MarkdownPreview - read-only render of Markdown content via react-markdown + GFM
@@ -438,6 +443,8 @@ export interface CodeViewerProps {
    * itself can't anchor text-selection comments).
    */
   onRequestEditMode?: () => void;
+  /** Switches an HTML file to its source view (used by the slide-deck viewer). */
+  onRequestSourceMode?: () => void;
 }
 
 export function CodeViewer({
@@ -460,6 +467,7 @@ export function CodeViewer({
   tocOpen = false,
   onTocToggle,
   onRequestEditMode,
+  onRequestSourceMode,
 }: CodeViewerProps) {
   const canEdit = useCanEdit(conversationId);
   const activeCommentId = activeSelection?.comment_id;
@@ -854,8 +862,26 @@ export function CodeViewer({
 
   // HTML preview gets its own comment-enabled viewer (selection capture +
   // highlights relayed over a bridge into the still-sandboxed iframe), so it
-  // owns the truncated banner internally.
+  // owns the truncated banner internally. Slide decks (*.slides.html) render
+  // in their own SlidesViewer.
   if (isHtmlPreview) {
+    if (isSlidesFile(path)) {
+      return (
+        <Suspense
+          fallback={
+            <div className="flex items-center justify-center p-8 text-muted-foreground text-ui">
+              Loading slides...
+            </div>
+          }
+        >
+          <SlidesViewer
+            content={content}
+            truncated={truncated}
+            onRequestSourceMode={onRequestSourceMode}
+          />
+        </Suspense>
+      );
+    }
     return (
       <HtmlCommentViewer
         conversationId={conversationId}
