@@ -24,12 +24,16 @@ DONE=0
 SKIPPED=0
 FAILED=0
 REPORTED=0
+KEYCHAIN_FAILED=0
 EXIT_CODE=0
 ACTIONS_FILE="$(mktemp "${TMPDIR:-/tmp}/omnigent-uninstall-actions.XXXXXX")" || exit 1
 BACKUPS_FILE="$(mktemp "${TMPDIR:-/tmp}/omnigent-uninstall-backups.XXXXXX")" || exit 1
+SECRETS_FILE="$(mktemp "${TMPDIR:-/tmp}/omnigent-uninstall-secrets.XXXXXX")" || exit 1
+HELPER_OUT="$(mktemp "${TMPDIR:-/tmp}/omnigent-uninstall-helper-out.XXXXXX")" || exit 1
+HELPER_ERR="$(mktemp "${TMPDIR:-/tmp}/omnigent-uninstall-helper-err.XXXXXX")" || exit 1
 
 cleanup() {
-  rm -f "$ACTIONS_FILE" "$BACKUPS_FILE"
+  rm -f "$ACTIONS_FILE" "$BACKUPS_FILE" "$SECRETS_FILE" "$HELPER_OUT" "$HELPER_ERR"
 }
 trap cleanup EXIT HUP INT TERM
 
@@ -38,7 +42,7 @@ usage() {
 Usage: uninstall_oss.sh [cli|state|desktop-data|all ...] [flags]
 
 Flags:
-  --purge                    Remove state data (backs up first)
+  --purge                    Remove state data and OS-keychain secrets (backs up state first)
   --purge-workspace          With --purge, also remove ~/omnigent non-interactively
   --dry-run                  Print planned actions only
   --yes                      Non-interactive for auto-removable artifacts
@@ -560,6 +564,7 @@ remove_tree() {
   artifact="$1"
   path="$2"
   gate="$3"
+  backed_up="${4:-}"
   if [ ! -e "$path" ]; then
     record_action "$artifact" "$path" remove skipped "" "already absent"
     return 0
@@ -573,7 +578,7 @@ remove_tree() {
     record_action "$artifact" "$path" remove reported "" "would remove $size"
     return 0
   fi
-  if backup_path "$path" && rm -rf "$path"; then
+  if { [ "$backed_up" = backed_up ] || backup_path "$path"; } && rm -rf "$path"; then
     record_action "$artifact" "$path" remove done "" "removed"
   else
     record_action "$artifact" "$path" remove failed "" "failed to remove"
@@ -597,8 +602,87 @@ desktop_paths() {
   esac
 }
 
+collect_keychain_secret_names() {
+  # Each line is "<name for the helper><TAB><name for display>": the manifest
+  # carries percent-encoded names; a standalone run (no CLI manifest) scans
+  # config.yaml before purge_state deletes it and can only report them.
+  if [ -n "${OMNIGENT_UNINSTALL_LEDGER_MANIFEST:-}" ] && [ -f "$OMNIGENT_UNINSTALL_LEDGER_MANIFEST" ]; then
+    while IFS="$TAB" read -r artifact name display rest; do
+      if [ "$artifact" = keychain_discovery_error ]; then
+        KEYCHAIN_FAILED=$((KEYCHAIN_FAILED + 1))
+        record_action keychain_secret config.yaml discover failed "" "could not read the config to discover keychain secrets: $name"
+        continue
+      fi
+      [ "$artifact" = keychain_secret ] || continue
+      [ -n "$name" ] || continue
+      printf '%s\t%s\n' "$name" "${display:-$name}" >>"$SECRETS_FILE"
+    done <"$OMNIGENT_UNINSTALL_LEDGER_MANIFEST"
+  elif [ -f "$(state_home)/config.yaml" ]; then
+    sed 's/#.*//' "$(state_home)/config.yaml" 2>/dev/null |
+      grep -oE "keychain:[^][:space:]\"'#,{}[]+" |
+      sed 's/^keychain://' | sort -u | awk '{ print $0 "\t" $0 }' >>"$SECRETS_FILE" || true
+  fi
+}
+
+purge_keychain_secrets() {
+  while IFS="$TAB" read -r name display; do
+    [ -n "$name" ] || continue
+    display="${display:-$name}"
+    if [ "$DRY_RUN" = true ]; then
+      record_action keychain_secret "$display" remove reported "" "would remove from the OS keychain (service omnigent)"
+    elif [ -z "${OMNIGENT_UNINSTALL_PYTHON:-}" ]; then
+      record_action keychain_secret "$display" remove reported "" "left in the OS keychain (service omnigent); remove it manually"
+    elif "$OMNIGENT_UNINSTALL_PYTHON" -m omnigent _internal delete-keychain-secret "$name" >"$HELPER_OUT" 2>"$HELPER_ERR"; then
+      # The helper prints exactly one result line on stdout; logging goes to stderr.
+      outcome="$(grep -m1 -E '^(removed|absent|file-only|unverified)( |$)' "$HELPER_OUT" || true)"
+      case "$outcome" in
+        removed*)
+          note="${outcome#removed}"
+          note="${note# }"
+          record_action keychain_secret "$display" remove done "" "removed from the OS keychain (service omnigent)${note:+; $note}"
+          ;;
+        absent)
+          record_action keychain_secret "$display" remove skipped "" "no entry in the OS keychain (service omnigent)"
+          ;;
+        file-only*)
+          record_action keychain_secret "$display" remove reported "" "removed the file-backed copy; the OS keychain (service omnigent) was inaccessible (${outcome#file-only }), check it manually"
+          ;;
+        unverified*)
+          record_action keychain_secret "$display" remove reported "" "no entry in the OS keychain (service omnigent); the file-backed store could not be read (${outcome#unverified }), check it manually"
+          ;;
+        *)
+          KEYCHAIN_FAILED=$((KEYCHAIN_FAILED + 1))
+          record_action keychain_secret "$display" remove failed "" "failed to remove from the OS keychain (service omnigent): helper returned no result"
+          ;;
+      esac
+    else
+      # Keep the helper's last error line so a locked keychain, a missing
+      # module, and a crash stay distinguishable in the report.
+      reason="$(awk 'NF { line=$0 } END { sub(/^Error: /, "", line); print line }' "$HELPER_ERR" | tr -d '\000-\037')"
+      KEYCHAIN_FAILED=$((KEYCHAIN_FAILED + 1))
+      record_action keychain_secret "$display" remove failed "" "failed to remove from the OS keychain (service omnigent)${reason:+: $reason}"
+    fi
+  done <"$SECRETS_FILE"
+}
+
 purge_state() {
-  remove_tree state "$(state_home)" ""
+  state_dir="$(state_home)"
+  collect_keychain_secret_names
+  # Archive the state before the irreversible keychain deletes so a failed
+  # backup leaves both in place. The deletes still precede the removal: the
+  # helper's CLI startup recreates log dirs under the state home.
+  if [ "$DRY_RUN" != true ] && [ -e "$state_dir" ] && ! backup_path "$state_dir"; then
+    record_action state "$state_dir" remove failed "" "backup failed; state and keychain secrets kept"
+    return 0
+  fi
+  purge_keychain_secrets
+  if [ "$KEYCHAIN_FAILED" -gt 0 ] && [ "$FORCE" != true ]; then
+    # config.yaml is the only durable list of keychain secrets; keep it so the
+    # failed deletions can be retried.
+    record_action state "$state_dir" remove skipped "--force" "kept so the failed keychain secrets can be retried; pass --force to remove it anyway"
+    return 0
+  fi
+  remove_tree state "$state_dir" "" backed_up
   workspace="$HOME/omnigent"
   if [ -e "$workspace" ]; then
     if [ "$PURGE_WORKSPACE" = true ]; then
