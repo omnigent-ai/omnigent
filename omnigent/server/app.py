@@ -321,6 +321,7 @@ _WEB_UI_ROUTE_PREFIXES = frozenset(
         "approve",
         "c",
         "canvas",
+        "design",
         "extensions",
         "inbox",
         "login",

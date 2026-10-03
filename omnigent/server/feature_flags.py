@@ -24,6 +24,7 @@ class Feature(StrEnum):
     HARNESS_INSTALL = "harness_install"
     CANVAS = "canvas"
     HARNESS_SETTINGS_UI = "harness_settings_ui"
+    DESIGN = "design"
 
 
 @dataclass(frozen=True)
@@ -61,6 +62,12 @@ FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
         description="Web Harnesses settings page with per-harness MCPs, skills, and plugins",
         owner="web",
         review_by_release="0.15.0",
+    ),
+    FeatureDefinition(
+        feature=Feature.DESIGN,
+        description="Web Design page: slide decks across recent sessions",
+        owner="web",
+        review_by_release="0.20.0",
     ),
 )
 

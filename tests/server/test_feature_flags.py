@@ -24,6 +24,7 @@ def test_features_default_off() -> None:
         "harness_install": False,
         "canvas": False,
         "harness_settings_ui": False,
+        "design": False,
     }
 
 
@@ -56,6 +57,14 @@ def test_canvas_is_a_frontend_visible_feature() -> None:
     assert flags.enabled(Feature.CANVAS)
     assert flags.frontend_dict()["canvas"] is True
     assert flags.enabled_names() == ("canvas",)
+
+
+def test_design_is_a_frontend_visible_feature() -> None:
+    flags = resolve_feature_flags({FEATURES_ENV_VAR: "design"})
+
+    assert flags.enabled(Feature.DESIGN)
+    assert flags.frontend_dict()["design"] is True
+    assert flags.enabled_names() == ("design",)
 
 
 def test_unknown_feature_fails_with_known_names() -> None:

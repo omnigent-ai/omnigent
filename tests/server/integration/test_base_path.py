@@ -66,6 +66,7 @@ def test_normalize_base_path(raw: str | None, expected: str) -> None:
         "/c/foo",  # reserved-namespace descendant
         "/login",  # reserved: collides with the SPA's own /login route
         "/settings",  # reserved: collides with the SPA's own /settings route
+        "/design",  # reserved: collides with the SPA's own /design route
         "/proxy/../app",  # "." / ".." segments a browser would normalize away
     ],
 )
