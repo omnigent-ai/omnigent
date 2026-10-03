@@ -15,6 +15,8 @@
     <string name="connect_action">Connect</string>
     <string name="connect_recents">Recent servers</string>
     <string name="connect_invalid">Enter a valid http(s) server URL</string>
+    <string name="oauth_completing">Completing Databricks sign-in…</string>
+    <string name="oauth_invalid_callback">Databricks returned an invalid sign-in callback.</string>
     <string name="menu_reload">Reload</string>
     <string name="menu_connect_new">Connect to New Server</string>
     <!-- Shown to IT admins in their EMM console, not to app users. -->
