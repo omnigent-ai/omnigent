@@ -7,6 +7,8 @@ of failing the first turn with "Codex is not signed in and no Omnigent provider
 routes the codex harness". The rig mirrors
 ``test_codex_native_headless_login_timeout.py``: a dedicated server + runner
 under a redirected ``HOME`` so nothing leaks into other tests.
+The real Codex CLI runs with empty AWS credential files and metadata discovery
+disabled; this verifies native launch without authenticating or running inference.
 """
 
 from __future__ import annotations
@@ -100,6 +102,30 @@ def _clean_env() -> dict[str, str]:
     return env
 
 
+def _write_isolated_codex_shim(work: Path, codex_path: str) -> Path:
+    """Disable AWS credential discovery after Omnigent filters subprocess env."""
+    aws_config = work / "empty-aws-config"
+    aws_config.write_text("", encoding="utf-8")
+    shim = work / "isolated-codex"
+    shim.write_text(
+        f"#!{sys.executable}\n"
+        "import os\n"
+        "import sys\n"
+        "for key in tuple(os.environ):\n"
+        "    if key.startswith('AWS_'):\n"
+        "        del os.environ[key]\n"
+        "os.environ.update({\n"
+        f"    'AWS_CONFIG_FILE': {str(aws_config)!r},\n"
+        f"    'AWS_SHARED_CREDENTIALS_FILE': {str(aws_config)!r},\n"
+        "    'AWS_EC2_METADATA_DISABLED': 'true',\n"
+        "})\n"
+        f"os.execv({codex_path!r}, [{codex_path!r}, *sys.argv[1:]])\n",
+        encoding="utf-8",
+    )
+    shim.chmod(0o755)
+    return shim
+
+
 def _codex_thread_started(bridge_root: Path, session_id: str) -> bool:
     """Whether the runner's bridge ``state.json`` records a started Codex thread."""
     for state_file in bridge_root.glob("*/state.json"):
@@ -140,6 +166,9 @@ def ambient_bedrock_codex_session(
         path.mkdir(parents=True, exist_ok=True)
 
     (codex_dir / "config.toml").write_text(_AMBIENT_BEDROCK_CONFIG, encoding="utf-8")
+    codex_path = shutil.which("codex")
+    assert codex_path is not None
+    codex_shim = _write_isolated_codex_shim(work, codex_path)
 
     port = _free_port()
     base_url = f"http://127.0.0.1:{port}"
@@ -154,6 +183,7 @@ def ambient_bedrock_codex_session(
         "PYTHONPATH": f"{_REPO_ROOT}{os.pathsep}{os.environ.get('PYTHONPATH', '')}",
         "OMNIGENT_CONFIG_HOME": str(config_home),
         "OMNIGENT_CODEX_NATIVE_STATE_DIR": str(state_dir),
+        "OMNIGENT_CODEX_PATH": str(codex_shim),
         "HOME": str(home_dir),
     }
     server_env = {**shared_env, "OMNIGENT_RUNNER_TUNNEL_TOKEN": binding_token}

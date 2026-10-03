@@ -11,6 +11,7 @@ parser; config + ambient are isolated so resolution is deterministic.
 from __future__ import annotations
 
 import shlex
+import sys
 from pathlib import Path
 
 import pytest
@@ -19,6 +20,7 @@ import yaml
 
 from omnigent.errors import OmnigentError
 from omnigent.harnesses.codex_native.app_server import (
+    build_codex_native_server,
     codex_session_meta_model_provider,
     resolve_native_codex_launch,
 )
@@ -1033,13 +1035,38 @@ def test_unknown_profile_does_not_pin_ambient_builtin(_isolated: Path) -> None:
     assert launch.login_required is True
 
 
-def test_malformed_profile_selector_defers_to_launch_arg_validation(_isolated: Path) -> None:
+@pytest.mark.parametrize(
+    ("args", "error"),
+    [
+        (("--profile",), "Codex requires exactly one value for --profile"),
+        (("--profile", "../invalid"), "Invalid Codex config profile name"),
+        (
+            ("--profile", "one", "--profile", "two"),
+            "Codex requires exactly one value for --profile",
+        ),
+    ],
+)
+def test_malformed_profile_selector_defers_to_launch_arg_validation(
+    _isolated: Path, args: tuple[str, ...], error: str
+) -> None:
     """A malformed ``--profile`` does not abort routing; start-up validation reports it."""
     _write_ambient_codex_config(_isolated, _AMBIENT_BEDROCK_CONFIG)
 
-    launch = resolve_native_codex_launch(model=None, terminal_launch_args=["--profile"])
+    launch = resolve_native_codex_launch(model=None, terminal_launch_args=args)
 
     assert launch.config_overrides == ['model_provider="amazon-bedrock"']
+    with pytest.raises(ValueError, match=error):
+        build_codex_native_server(
+            socket_path=_isolated / "codex.sock",
+            codex_home=_isolated / "private-codex-home",
+            cwd=_isolated,
+            model=launch.model,
+            profile=launch.profile,
+            bridge_dir=_isolated / "bridge",
+            codex_path=sys.executable,
+            extra_config_overrides=launch.config_overrides,
+            terminal_launch_args=args,
+        )
 
 
 def test_global_api_key_routes_without_model_or_cli_login(
