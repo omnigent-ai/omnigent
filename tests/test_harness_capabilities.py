@@ -214,6 +214,21 @@ def test_catalog_includes_hermes() -> None:
     assert "capabilities" in hermes
 
 
+def test_catalog_keeps_pi_alongside_omp() -> None:
+    """Adding a harness must not evict another from the picker catalog.
+
+    Regression: the omp entry was written *over* ``harness_labels["pi"]``, so
+    ``harness_catalog()`` — which iterates labels — silently dropped the Pi
+    row from ``GET /v1/harnesses`` even though ``pi`` stayed a valid harness.
+    """
+    rows = {row["id"]: row for row in harness_catalog()}
+    assert "pi" in rows, "pi missing from harness_catalog()"
+    assert rows["pi"]["label"] == "Pi"
+    assert "capabilities" in rows["pi"]
+    assert "omp" in rows, "omp missing from harness_catalog()"
+    assert rows["omp"]["label"] == "Oh My Pi"
+
+
 def test_hermes_picker_row_has_spawn_env_plumbing() -> None:
     """A picker row is only honest if the session's choices reach the harness.
 

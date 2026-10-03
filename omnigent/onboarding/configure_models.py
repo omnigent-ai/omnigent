@@ -41,6 +41,7 @@ from omnigent.onboarding.provider_config import (
     GEMINI_FAMILY,
     KEY_KIND,
     LOCAL_KIND,
+    OMP_SURFACE,
     OPENAI_FAMILY,
     PI_SURFACE,
     SUBSCRIPTION_KIND,
@@ -108,6 +109,7 @@ _FAMILY_LABEL: dict[str, str] = {
     OPENAI_FAMILY: "Codex",
     GEMINI_FAMILY: "Gemini",
     PI_SURFACE: "Pi",
+    OMP_SURFACE: "Omp",
 }
 
 # The concrete harness ids each surface powers, shown as a dim annotation
@@ -118,6 +120,7 @@ _FAMILY_HARNESS_IDS: dict[str, str] = {
     OPENAI_FAMILY: "codex, native-codex, openai-agents",
     GEMINI_FAMILY: "antigravity, antigravity-native",
     PI_SURFACE: "pi",
+    OMP_SURFACE: "omp",
 }
 
 
@@ -127,9 +130,9 @@ def family_label(family: str) -> str:
     Public accessor for :data:`_FAMILY_LABEL`, so the CLI tree renders the
     same brand names as the listing without importing the private map.
 
-    :param family: ``"anthropic"``, ``"openai"``, or ``"pi"``.
+    :param family: ``"anthropic"``, ``"openai"``, ``"pi"``, or ``"omp"``.
     :returns: ``"Claude"`` for anthropic, ``"Codex"`` for openai, ``"Pi"``
-        for pi; the family name itself for any other value.
+        for pi, ``"Omp"`` for omp; the family name itself for any other value.
     """
     return _FAMILY_LABEL.get(family, family)
 
@@ -137,7 +140,7 @@ def family_label(family: str) -> str:
 def family_harness_ids(family: str) -> str:
     """Return the dim harness-id annotation for a surface.
 
-    :param family: ``"anthropic"``, ``"openai"``, or ``"pi"``.
+    :param family: ``"anthropic"``, ``"openai"``, ``"pi"``, or ``"omp"``.
     :returns: A comma-separated harness-id string, e.g.
         ``"claude-sdk, native-claude"``; empty for an unknown surface.
     """
@@ -544,21 +547,21 @@ def _add_option_families(opt: AddOption) -> frozenset[str]:
     """Return the surfaces an add-menu *opt* can serve.
 
     Used to scope the add menu to the harness the user drilled into
-    (``configure harness`` → Claude / Codex / Gemini / Pi → "Add a
+    (``configure harness`` → Claude / Codex / Gemini / Pi / Omp → "Add a
     provider"): a Claude add should not offer an OpenAI-only key, and vice
-    versa. Gateways and Databricks serve the anthropic / openai / pi surfaces —
-    but NOT Gemini, which is key-only (the antigravity harness needs a real
-    GEMINI_API_KEY, not a proxy). An anthropic / openai API key can also drive
-    pi (it consumes both model families); a gemini key serves ONLY the Gemini
-    surface; subscriptions never drive pi (a CLI login is unusable outside its
-    own CLI).
+    versa. Gateways and Databricks serve the anthropic / openai / pi / omp
+    surfaces — but NOT Gemini, which is key-only (the antigravity harness
+    needs a real GEMINI_API_KEY, not a proxy). An anthropic / openai API key
+    can also drive pi/omp (they consume both model families); a gemini key
+    serves ONLY the Gemini surface; subscriptions never drive pi/omp (a CLI
+    login is unusable outside its own CLI).
 
     :param opt: One add-menu option.
     :returns: The surfaces this option can configure — a subset of
-        ``{"anthropic", "openai", "gemini", "pi"}``.
+        ``{"anthropic", "openai", "gemini", "pi", "omp"}``.
     """
     if opt.kind == GATEWAY_KIND or opt.kind == DATABRICKS_KIND:
-        return frozenset({ANTHROPIC_FAMILY, OPENAI_FAMILY, PI_SURFACE})
+        return frozenset({ANTHROPIC_FAMILY, OPENAI_FAMILY, PI_SURFACE, OMP_SURFACE})
     if opt.kind == BEDROCK_KIND:
         # Bedrock mode drives only the native Claude terminal (anthropic
         # family); codex/pi reject it, so it never serves their surfaces.
@@ -574,7 +577,7 @@ def _add_option_families(opt: AddOption) -> frozenset[str]:
     if opt.kind == KEY_KIND:
         if opt.other:
             # The catch-all tail (Groq, DeepSeek, …) are all openai-family.
-            return frozenset({OPENAI_FAMILY, PI_SURFACE})
+            return frozenset({OPENAI_FAMILY, PI_SURFACE, OMP_SURFACE})
         if opt.provider is not None:
             family = family_for_key_provider(opt.provider)
             # The Gemini surface (antigravity) is not a pi model family — pi
@@ -583,7 +586,7 @@ def _add_option_families(opt: AddOption) -> frozenset[str]:
             # pi.
             if family == GEMINI_FAMILY:
                 return frozenset({GEMINI_FAMILY})
-            return frozenset({family, PI_SURFACE})
+            return frozenset({family, PI_SURFACE, OMP_SURFACE})
     return frozenset()
 
 
@@ -648,7 +651,7 @@ def render_provider_listing_by_harness(
     if not providers:
         console.print("  [dim]none configured yet[/dim]")
         return
-    for family in (ANTHROPIC_FAMILY, OPENAI_FAMILY, GEMINI_FAMILY, PI_SURFACE):
+    for family in (ANTHROPIC_FAMILY, OPENAI_FAMILY, GEMINI_FAMILY, PI_SURFACE, OMP_SURFACE):
         console.print(f"  [bold]{_FAMILY_LABEL[family]}[/]")
         serving = [
             (name, entry)
@@ -675,19 +678,19 @@ def _provider_default_families(entry: ProviderEntry, config: dict[str, object]) 
 
     Cross-checks the per-surface default resolved from *config* against
     *entry* so the listing marks ``(default · Claude)`` / ``(default ·
-    Codex)`` / ``(default · Pi)`` only on the provider that actually wins
-    that surface. Pi resolves its *effective* default (explicit pi scope,
-    else the cross-family fallback), so the marker names the provider the
-    pi harness would really route through.
+    Codex)`` / ``(default · Pi)`` / ``(default · Omp)`` only on the provider
+    that actually wins that surface. Pi/omp resolve their *effective* default
+    (explicit scope, else the cross-family fallback), so the marker names the
+    provider the harness would really route through.
 
     :param entry: The provider entry being rendered.
     :param config: The parsed config mapping (``providers:`` block), used
         to resolve each surface's default.
     :returns: Surface names this entry is the default for, in
-        ``[anthropic, openai, gemini, pi]`` order, e.g. ``["anthropic", "pi"]``.
+        ``[anthropic, openai, gemini, pi, omp]`` order, e.g. ``["anthropic", "pi"]``.
     """
     result: list[str] = []
-    for family in (ANTHROPIC_FAMILY, OPENAI_FAMILY, GEMINI_FAMILY, PI_SURFACE):
+    for family in (ANTHROPIC_FAMILY, OPENAI_FAMILY, GEMINI_FAMILY, PI_SURFACE, OMP_SURFACE):
         default = surface_default_provider(config, family)
         if default is not None and default.name == entry.name:
             result.append(family)

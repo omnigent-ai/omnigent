@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 from alembic import command
-from sqlalchemy import Engine, inspect, text
+from sqlalchemy import Engine, LargeBinary, inspect, text
 
 from omnigent.db.cockroachdb import (
     _CRDB_BOOTSTRAP_MARKER_TABLE,
@@ -21,6 +21,8 @@ from omnigent.db.utils import (
     get_or_create_engine,
     is_cockroachdb,
 )
+
+_METADATA_TABLE = "omnigent_conversation_metadata"
 
 
 def _crdb_engine(db_uri: str) -> Engine:
@@ -74,6 +76,61 @@ def test_cockroachdb_upgrades_from_supported_baseline(db_uri: str) -> None:
     _initialize_or_verify_schema(engine, db_uri)
 
     assert _get_current_db_revision(engine) == head
+
+
+def test_cockroachdb_migration_replays_a_restarted_transaction(db_uri: str) -> None:
+    """A restart request part-way up the chain must not strand the schema."""
+    from sqlalchemy import event
+
+    engine = _crdb_engine(db_uri)
+    head = _get_head_db_revision(db_uri)
+    if head == CRDB_BASELINE_REVISION:
+        pytest.skip("requires a migration after the CRDB baseline")
+
+    config = _build_alembic_config(db_uri)
+    with engine.connect() as connection:
+        _prepare_crdb_schema_transaction(connection, _crdb_server_version(engine))
+        config.attributes["connection"] = connection
+        command.downgrade(config, CRDB_BASELINE_REVISION)
+        connection.commit()
+
+    attempts = 0
+
+    def restart_compression(conn, cursor, statement, parameters, context, executemany):
+        nonlocal attempts
+        # Inject on the DML copy loop, NOT on the step's DDL. CRDB commits
+        # schema changes eagerly, so a forced restart during ``ADD COLUMN``
+        # would leave the temporary column behind and the replay would then
+        # trip over a half-migrated table. A DML statement rolls back with
+        # its transaction, which is what a real 40001 on contended data
+        # looks like — the original CI failure was a COMMIT conflict here.
+        copying = (
+            "FROM omnigent_conversation_metadata" in statement and "workspace_id" in statement
+        )
+        if copying:
+            attempts += 1
+            if attempts == 1:
+                # Observed results prevent transparent server retries of a fresh
+                # transaction, which is what a contended migration looks like.
+                cursor.execute("SELECT id FROM users LIMIT 1")
+                cursor.fetchone()
+                return "SELECT crdb_internal.force_retry('100ms')", ()
+        return statement, parameters
+
+    event.listen(engine, "before_cursor_execute", restart_compression, retval=True)
+    try:
+        _initialize_or_verify_schema(engine, db_uri)
+    finally:
+        event.remove(engine, "before_cursor_execute", restart_compression)
+
+    assert attempts == 2
+    assert _get_current_db_revision(engine) == head
+    # The retried step finished the swap rather than leaving a half-named column.
+    columns = {c["name"]: c["type"] for c in inspect(engine).get_columns(_METADATA_TABLE)}
+    assert set(columns) & {"inference_snapshot", "_inference_snapshot_blob"} == {
+        "inference_snapshot"
+    }
+    assert isinstance(columns["inference_snapshot"], LargeBinary)
 
 
 def test_cockroachdb_resumes_empty_revision_and_repairs_indexes(db_uri: str) -> None:
