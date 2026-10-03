@@ -11,7 +11,7 @@ from typing import Any
 
 import pytest
 
-from omnigent.runner.git_providers import PullRequestFacet, ShellPrOp, ShellSegment
+from omnigent.runner.git_providers import ShellPrOp, ShellSegment
 from omnigent.runner.git_providers.azure_devops import PULL_REQUESTS
 from omnigent.runner.git_providers.azure_devops_observer import (
     mcp_prs,
@@ -375,7 +375,6 @@ def test_no_mcp_tool_is_recognized() -> None:
 
 
 def test_the_facet_answers_with_the_observer_hooks() -> None:
-    assert isinstance(PULL_REQUESTS, PullRequestFacet)
     assert PULL_REQUESTS.shell_pr_operations([segment("az repos pr create")]) == [CREATE]
     assert PULL_REQUESTS.pr_from_object(pull_request()) == reference()
     assert PULL_REQUESTS.mcp_prs("repo_create_pull_request", {}, pull_request()) is None

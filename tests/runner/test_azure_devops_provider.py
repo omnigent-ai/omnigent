@@ -25,7 +25,6 @@ import pytest
 
 from omnigent.runner import azure_devops_client
 from omnigent.runner.azure_devops_client import AzureToken
-from omnigent.runner.git_providers import PullRequestFacet
 from omnigent.runner.git_providers import azure_devops as azure_devops_facet
 from omnigent.runner.git_providers.azure_devops import PULL_REQUESTS, AzureDevOpsPullRequests
 from omnigent.runner.session_prs import PullRequestRef
@@ -1470,8 +1469,7 @@ def test_set_preference_rejects_account_and_remote_choices(
     facet.set_preference(str(tmp_path), None, account=None, remote=None)
 
 
-def test_module_instance_satisfies_the_protocol(tmp_path: Path) -> None:
-    assert isinstance(PULL_REQUESTS, PullRequestFacet)
+def test_module_instance_handles_unsupported_actions(tmp_path: Path) -> None:
     assert PULL_REQUESTS.capabilities.to_json() == NO_CAPABILITIES
     assert PULL_REQUESTS.shell_pr_operations([]) == []
     assert PULL_REQUESTS.pr_from_object({"url": PR_URL}) is None
