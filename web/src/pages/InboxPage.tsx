@@ -405,6 +405,7 @@ export function InboxPage() {
       {hasNextPage && (
         <Button
           variant="outline"
+          className="mt-4"
           disabled={conversationsQuery.isFetching}
           onClick={() => void fetchNextPage()}
           componentId="inbox.load_more"

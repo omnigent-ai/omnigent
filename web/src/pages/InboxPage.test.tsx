@@ -169,7 +169,7 @@ describe("InboxPage states", () => {
       conversationsStub([], { hasNextPage: true }),
     );
     renderPage();
-    expect(screen.getByRole("button", { name: "Load more sessions" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Load more sessions" })).toHaveClass("mt-4");
   });
 
   it("loads additional scope pages only after a click", async () => {
