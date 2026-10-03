@@ -163,7 +163,7 @@ async def _open_upstream(
     negotiated end-to-end with ``host`` over the CONNECT tunnel.
     """
     proxy = urllib.request.getproxies().get("https" if ssl_ctx else "http")
-    if not proxy or urllib.request.proxy_bypass_environment(host):
+    if not proxy or urllib.request.proxy_bypass(host):
         return await asyncio.open_connection(
             connect_host, port, ssl=ssl_ctx, server_hostname=host if ssl_ctx else None
         )
