@@ -55,7 +55,7 @@ export const ROW_MENU_SIZE_SLOT_CLASS =
 
 export const FilesPanelFocusContext = createContext<RefObject<HTMLElement | null> | null>(null);
 
-function canReceiveFocus(target: HTMLElement | null): target is HTMLElement {
+export function canReceiveFocus(target: HTMLElement | null): target is HTMLElement {
   return Boolean(
     target?.isConnected &&
     !target.matches(":disabled") &&

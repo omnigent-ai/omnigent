@@ -519,6 +519,8 @@ export function FilesPanel({
     <div
       ref={panelFocusRef}
       tabIndex={-1}
+      role="region"
+      aria-label="Files"
       className={cn(
         "@container/filespanel overflow-hidden bg-card",
         fillHeight ? "flex h-full min-h-0 flex-col" : "flex min-h-0 flex-col",
