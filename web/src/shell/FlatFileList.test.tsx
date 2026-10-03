@@ -1,4 +1,5 @@
 import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const { copyTextMock } = vi.hoisted(() => ({ copyTextMock: vi.fn(() => Promise.resolve()) }));
@@ -193,6 +194,30 @@ describe("FlatFileList line-change counter", () => {
 
     expect(screen.queryByText(/^\+/)).not.toBeInTheDocument();
     expect(screen.queryByText(/^−/)).not.toBeInTheDocument();
+  });
+});
+
+describe("FlatFileList canonical row actions", () => {
+  it("copies the root-relative Changes path from the shared actions menu", async () => {
+    const user = userEvent.setup();
+    const path = "nested/same name # % ' Ω.txt";
+    renderList({
+      files: [
+        {
+          path,
+          name: path.split("/").at(-1) ?? path,
+          status: "modified",
+          bytes: 12,
+          modified_at: 1_700_000_000,
+          lines_added: null,
+          lines_removed: null,
+        },
+      ],
+    });
+
+    fireEvent.contextMenu(screen.getByText(path.split("/").at(-1) ?? path));
+    await user.click(await screen.findByRole("menuitem", { name: "Copy path" }));
+    expect(copyTextMock).toHaveBeenCalledWith(path);
   });
 });
 
