@@ -113,8 +113,14 @@ async def _forward_terminal_to_ws(
     *,
     max_coalesce_bytes: int | Callable[[], int] = _WS_COALESCE_MAX_BYTES,
     send_lock: asyncio.Lock | None = None,
+    on_frame_sent: Callable[[], None] | None = None,
 ) -> None:
-    """Forward queued terminal output as bounded binary WebSocket frames."""
+    """Forward queued terminal output as bounded binary WebSocket frames.
+
+    :param on_frame_sent: Optional hook invoked after each frame is actually
+        sent, so a caller bounding an external wait on this coroutine can tell
+        a slow-but-progressing drain from one that has genuinely stalled.
+    """
     from fastapi import WebSocketDisconnect
 
     pending = bytearray()
@@ -150,6 +156,8 @@ async def _forward_terminal_to_ws(
                         await websocket.send_bytes(frame)
             except (RuntimeError, WebSocketDisconnect):
                 return
+            if on_frame_sent is not None:
+                on_frame_sent()
         if eof_seen:
             return
 

@@ -220,6 +220,33 @@ async def _kill_tmux(sock: Path) -> None:
     shutil.rmtree(sock.parent, ignore_errors=True)
 
 
+async def _capture_seed_until(
+    sock: Path, target: str, needle: bytes, *, budget_s: float = 5.0, poll_s: float = 0.05
+) -> bytes:
+    """Poll ``_run_tmux_capture`` until *needle* appears or the budget elapses.
+
+    tmux renders a pane program's writes into its grid asynchronously, so a
+    capture right after a fixed delay can race that reflow under load. Return
+    the last capture seen either way, so a caller that still misses *needle*
+    gets the actual pane content in its assertion message instead of a bare
+    timeout.
+    """
+    from omnigent.terminals.control_bridge import _run_tmux_capture
+
+    loop = asyncio.get_event_loop()
+    deadline = loop.time() + budget_s
+    seed = b""
+    while True:
+        captured = await _run_tmux_capture(str(sock), target)
+        if captured is not None:
+            seed = captured
+            if needle in seed:
+                return seed
+        if loop.time() >= deadline:
+            return seed
+        await asyncio.sleep(poll_s)
+
+
 async def _kill_and_join(sock: Path, task: asyncio.Task[None]) -> None:
     """Kill the tmux server and wind the bridge task down cleanly.
 
@@ -659,8 +686,6 @@ async def test_seed_alternate_screen_does_not_leak_primary_history() -> None:
     scrollback from before the app switched — lines that were never part of
     the app's UI. The bridge must capture the visible screen only there.
     """
-    from omnigent.terminals.control_bridge import _run_tmux_capture
-
     # 50 primary-screen "OLD" lines, then enter the alternate screen and draw.
     sock, target = await _new_private_tmux(
         "python3 -c 'import sys,time\n"
@@ -669,10 +694,11 @@ async def test_seed_alternate_screen_does_not_leak_primary_history() -> None:
         'for r in range(1,25): sys.stdout.write(f"\\x1b[{r};1HALT-row{r}")\n'
         "sys.stdout.flush(); time.sleep(30)'"
     )
-    await asyncio.sleep(0.5)
     try:
-        seed = await _run_tmux_capture(str(sock), target)
-        assert seed is not None
+        # Poll instead of a fixed sleep: the switch to the alternate screen and
+        # the row draws race tmux's own reflow under load, so wait for the last
+        # row rather than assuming a fixed delay covers the whole sequence.
+        seed = await _capture_seed_until(sock, target, b"ALT-row24")
         assert seed.count(b"OLD-") == 0, (
             f"alt-screen seed leaked {seed.count(b'OLD-')} stale primary-history lines"
         )
@@ -725,18 +751,19 @@ async def test_seed_rejoins_soft_wrapped_lines() -> None:
     insert a newline at each wrap point (xterm only rejoins rows it flagged
     as wrapped itself).
     """
-    from omnigent.terminals.control_bridge import _run_tmux_capture
-
     # 150 chars in an 80-col pane wraps across two rows.
     sock, target = await _new_private_tmux(
         'python3 -c \'import sys,time; sys.stdout.write("x" * 150); '
         "sys.stdout.flush(); time.sleep(30)'"
     )
-    await asyncio.sleep(0.5)
     try:
-        seed = await _run_tmux_capture(str(sock), target)
-        assert seed is not None
-        assert b"x" * 150 in seed, "soft-wrapped line was not rejoined in the seed"
+        # Poll instead of a fixed sleep: under load tmux may not have reflowed
+        # the pane by a single fixed delay, and a bare timeout can't tell that
+        # apart from a genuine rejoin bug — polling can, and reports what it
+        # actually captured either way.
+        needle = b"x" * 150
+        seed = await _capture_seed_until(sock, target, needle)
+        assert needle in seed, f"soft-wrapped line was not rejoined in the seed: {seed!r}"
     finally:
         await _kill_tmux(sock)
 
