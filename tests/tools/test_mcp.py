@@ -9,6 +9,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import timedelta
+from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -280,6 +281,14 @@ def test_cache_key_http_headers_and_profile_change_key() -> None:
     assert _cache_key(_http_config(databricks_profile="oss")) != _cache_key(
         _http_config(databricks_profile="prod")
     )
+
+
+def test_cache_key_http_oauth_changes_key() -> None:
+    """An OAuth-authenticated connection sees the server as a signed-in
+    user, so its tools/list must not be shared with an anonymous one."""
+    plain = MCPServerConfig(name="svc", url="https://mcp.example.com/mcp")
+    oauth = MCPServerConfig(name="svc", url="https://mcp.example.com/mcp", oauth=True)
+    assert _cache_key(plain) != _cache_key(oauth)
 
 
 def test_cache_key_stdio_and_http_do_not_collide() -> None:
@@ -1999,6 +2008,80 @@ async def test_http_connect_passes_none_headers_when_empty() -> None:
 
 
 @pytest.mark.asyncio()
+async def test_http_connect_passes_oauth_provider_when_configured(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """
+    HTTP ``connect()`` passes an ``OAuthClientProvider`` as ``auth=``
+    when ``config.oauth`` is set, so the MCP SDK's own PKCE/discovery/
+    refresh logic drives authentication instead of a static header.
+    """
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    monkeypatch.setenv("OMNIGENT_DISABLE_KEYRING", "1")
+
+    config = MCPServerConfig(
+        name="test-http-oauth",
+        url="http://localhost:9000/mcp",
+        oauth=True,
+    )
+
+    with _mock_http_transport() as captured:
+        conn = McpServerConnection(config=config)
+        await conn.connect()
+
+    from mcp.client.auth.oauth2 import OAuthClientProvider
+
+    assert isinstance(captured.transport_kwargs["auth"], OAuthClientProvider)
+    assert captured.transport_kwargs["auth"].context.server_url == "http://localhost:9000/mcp"
+
+    await conn.close()
+
+
+@pytest.mark.asyncio()
+async def test_http_connect_refuses_oauth_over_cleartext_http() -> None:
+    """
+    A config that bypassed the parser (built in code, or an env var
+    expanded later) still can't send OAuth tokens over plain http to a
+    non-loopback host: connect() fails before any request is made.
+    """
+    from omnigent.tools.mcp_oauth import McpOAuthError
+
+    config = MCPServerConfig(
+        name="test-http-oauth-cleartext",
+        url="http://mcp.example.com/mcp",
+        oauth=True,
+    )
+
+    with _mock_http_transport() as captured:
+        conn = McpServerConnection(config=config)
+        with pytest.raises(McpOAuthError, match="plain http"):
+            await conn.connect()
+
+    assert "auth" not in captured.transport_kwargs
+    await conn.close()
+
+
+@pytest.mark.asyncio()
+async def test_http_connect_passes_none_auth_when_oauth_not_configured() -> None:
+    """
+    HTTP ``connect()`` passes ``auth=None`` when ``config.oauth`` is not
+    set — the common case, unaffected by the OAuth wiring.
+    """
+    config = MCPServerConfig(
+        name="test-http-no-oauth",
+        url="http://localhost:9000/mcp",
+    )
+
+    with _mock_http_transport() as captured:
+        conn = McpServerConnection(config=config)
+        await conn.connect()
+
+    assert captured.transport_kwargs["auth"] is None
+
+    await conn.close()
+
+
+@pytest.mark.asyncio()
 async def test_http_falls_back_to_sse_when_streamable_fails() -> None:
     """
     When ``streamablehttp_client`` raises (e.g. the server only
@@ -2986,11 +3069,11 @@ async def test_open_http_transport_routes_sse_url_straight_to_sse() -> None:
     conn = McpServerConnection(config=MCPServerConfig(name="c", url="http://h:1/mcp/sse"))
     calls: list[str] = []
 
-    async def fake_sse(stack, timeout, headers):
+    async def fake_sse(stack, timeout, headers, auth=None):
         calls.append("sse")
         return ("r", "w")
 
-    async def fake_streamable(stack, timeout, headers):
+    async def fake_streamable(stack, timeout, headers, auth=None):
         calls.append("streamable")
         return ("r", "w")
 
@@ -3014,11 +3097,11 @@ async def test_open_http_transport_uses_streamable_for_non_sse_url() -> None:
     conn = McpServerConnection(config=MCPServerConfig(name="c", url="http://h:1/mcp"))
     calls: list[str] = []
 
-    async def fake_sse(stack, timeout, headers):
+    async def fake_sse(stack, timeout, headers, auth=None):
         calls.append("sse")
         return ("r", "w")
 
-    async def fake_streamable(stack, timeout, headers):
+    async def fake_streamable(stack, timeout, headers, auth=None):
         calls.append("streamable")
         return ("r", "w")
 
