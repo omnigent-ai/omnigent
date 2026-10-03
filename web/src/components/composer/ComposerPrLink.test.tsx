@@ -39,7 +39,7 @@ describe("ComposerPrLink", () => {
     expect(screen.getByText("#42")).not.toHaveClass("underline");
     expect(screen.getByText("#42")).toHaveClass("group-hover:underline");
     expect(screen.getByText("#42")).toHaveAttribute("title", "#42");
-    expect(link).toHaveAttribute("title", "View this PR in the GitHub tab");
+    expect(link).toHaveAttribute("title", "View this PR in the Pull Requests tab");
     expect(link).toHaveAccessibleName("#42");
     // A trigger for the bar's collapse, but never hidden by it.
     expect(screen.getByText("#42")).toHaveAttribute("data-workspace-collapse-label");
@@ -48,12 +48,52 @@ describe("ComposerPrLink", () => {
     expect(onOpen).toHaveBeenCalledTimes(1);
   });
 
+  it("marks the PR number with its provider's prefix", () => {
+    render(
+      <ComposerPrLink
+        state="ready"
+        prCount={1}
+        prNumber={7}
+        prNumberPrefix="!"
+        onOpen={() => {}}
+      />,
+    );
+    const link = screen.getByTestId("composer-pr-link");
+    expect(link).toHaveTextContent("!7");
+    expect(link).toHaveAccessibleName("!7");
+    expect(screen.getByText("!7")).toHaveAttribute("title", "!7");
+    expect(screen.queryByText("#7")).toBeNull();
+  });
+
+  it("leaves a count and the missing-number label without a prefix", () => {
+    const { rerender } = render(
+      <ComposerPrLink
+        state="ready"
+        prCount={2}
+        prNumber={7}
+        prNumberPrefix="!"
+        onOpen={() => {}}
+      />,
+    );
+    expect(screen.getByTestId("composer-pr-link")).toHaveTextContent(/^2 PRs$/);
+    rerender(
+      <ComposerPrLink
+        state="ready"
+        prCount={1}
+        prNumber={null}
+        prNumberPrefix="!"
+        onOpen={() => {}}
+      />,
+    );
+    expect(screen.getByTestId("composer-pr-link")).toHaveTextContent(/^1 PR$/);
+  });
+
   it("summarizes multiple PRs as a count", () => {
     render(<ComposerPrLink state="ready" prCount={3} prNumber={42} onOpen={() => {}} />);
     const link = screen.getByTestId("composer-pr-link");
     expect(link).toHaveTextContent("3 PRs");
     expect(link).toHaveClass("text-sm", "gap-1");
-    expect(link).toHaveAttribute("title", "View these PRs in the GitHub tab");
+    expect(link).toHaveAttribute("title", "View these PRs in the Pull Requests tab");
     expect(screen.getByText("3 PRs")).toHaveAttribute("title", "3 PRs");
   });
 

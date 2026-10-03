@@ -4,6 +4,7 @@ import {
   FileIcon,
   FolderTreeIcon,
   FileDiffIcon,
+  GitPullRequestIcon,
   GlobeIcon,
   Loader2Icon,
   MaximizeIcon,
@@ -59,11 +60,10 @@ import { useSessionAgent } from "@/hooks/useAgents";
 import type { SessionLiveness } from "@/hooks/useSessionLiveness";
 import { terminalTabKey, useCreateTerminal, useTerminals } from "@/hooks/useTerminals";
 import { SuppressBrowserView } from "@/hooks/useSuppressBrowserView";
-import GithubMono from "@lobehub/icons/es/Github/components/Mono";
 import { readPreferredShell, resolveDefaultShell, writePreferredShell } from "./preferredShell";
 import { FilesPanel } from "./FilesPanel";
 import { FileViewer } from "./FileViewer";
-import { GithubPanel } from "./GithubPanel";
+import { PullRequestPanel } from "./PullRequestPanel";
 import type { ChangedSort } from "./FlatFileList";
 import { SubagentsPanel } from "./SubagentsPanel";
 import { useTerminalStatuses } from "./useTerminalStatuses";
@@ -649,7 +649,7 @@ interface WorkspacePanelProps {
   onRightRailTabChange: (next: RightRailTab) => void;
   /** Whether the Files/Changes tabs are available (agent spec exposes an os_env). */
   showFilesPanel: boolean;
-  /** Whether the GitHub tab is available (same on-disk-workspace gate as Files). */
+  /** Whether the Pull Requests tab is available (same on-disk-workspace gate as Files). */
   showGithubTab: boolean;
   /** Whether Browser soft tabs are available — hidden without a browser bridge. */
   showBrowserTab: boolean;
@@ -1092,17 +1092,17 @@ function WorkspacePanelImpl({
       </WorkspaceTabTooltip>
     ),
     github: (pending || showGithubTab) && (
-      <WorkspaceTabTooltip key="github" label="GitHub" shortcut={shortcutFor("github")}>
+      <WorkspaceTabTooltip key="github" label="Pull Requests" shortcut={shortcutFor("github")}>
         <TabsTrigger
           value="github"
-          aria-label="GitHub"
+          aria-label="Pull Requests"
           aria-keyshortcuts={shortcutFor("github")}
           data-workspace-tab="github"
           disabled={pending}
           className="size-6 shrink-0 p-0 hover:border-1 hover:border-muted rounded-md!"
         >
-          <GithubMono size={16} />
-          <span className="sr-only">GitHub</span>
+          <GitPullRequestIcon />
+          <span className="sr-only">Pull Requests</span>
         </TabsTrigger>
       </WorkspaceTabTooltip>
     ),
@@ -1462,7 +1462,7 @@ function WorkspacePanelImpl({
               className="min-h-0 flex-1"
             />
           ) : rightRailTab === "github" && showGithubTab ? (
-            <GithubPanel conversationId={conversationId} />
+            <PullRequestPanel conversationId={conversationId} />
           ) : rightRailTab === "subagents" && rootSessionId ? (
             <SubagentsPanel conversationId={conversationId} rootSessionId={rootSessionId} />
           ) : (

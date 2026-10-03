@@ -1,6 +1,6 @@
-"""E2E: the read-only GitHub rail tab, driven entirely from stubbed responses.
+"""E2E: the read-only Pull Requests rail tab, driven entirely from stubbed responses.
 
-The GitHub tab's data comes from the runner-backed resource endpoints
+The tab's data comes from the runner-backed resource endpoints
 (``/v1/sessions/{id}/resources/github*``), which normally shell out to ``gh``
 and ``git`` in the workspace. Here every one of those endpoints is intercepted
 with ``page.route`` and answered with canned JSON, so the test exercises the
@@ -9,11 +9,11 @@ without a real ``gh``/``git`` (which a CI workspace has no PR for anyway).
 
 Three behaviours are pinned:
 
-1. Opening the GitHub rail tab renders the associated PR (title + number), its
+1. Opening the Pull Requests rail tab renders the associated PR (title + number), its
    CI checks as labeled pills, and the branch-vs-base file tree — with a
    single-child directory chain (``src`` → ``app``) compacted into one row.
 2. Composer metadata stays aligned and visually grouped, and its PR link opens
-   GitHub on desktop and mobile with one or several PRs at different text sizes.
+   the tab on desktop and mobile with one or several PRs at different text sizes.
 3. A host predating the ``/resources/github`` route 404s "Resource 'github'
    not found", which the panel renders as an actionable "update your host"
    empty state rather than the generic "unavailable" one.
@@ -167,14 +167,14 @@ def test_github_tab_shows_summary_checks_and_file_tree(
     page: Page,
     seeded_session: tuple[str, str],
 ) -> None:
-    """The GitHub tab lands on Summary; Changes shows the compacted file tree."""
+    """The Pull Requests tab lands on Summary; Changes shows the compacted file tree."""
     base_url, session_id = seeded_session
     _stub_github(page)
     page.goto(f"{base_url}/c/{session_id}")
 
     open_right_rail(page)
     rail = page.get_by_role("complementary", name="Workspace")
-    rail.get_by_role("tab", name="GitHub").click()
+    rail.get_by_role("tab", name="Pull Requests").click()
 
     # PR header (shared across both inner tabs): title, number, and state.
     expect(rail.get_by_text("Add the GitHub tab")).to_be_visible(timeout=30_000)
@@ -332,7 +332,7 @@ def test_composer_pr_link_opens_github_tab(
         if is_mobile:
             expect(panel).to_have_attribute("data-state", "open")
         else:
-            expect(panel.get_by_role("tab", name="GitHub")).to_have_attribute(
+            expect(panel.get_by_role("tab", name="Pull Requests")).to_have_attribute(
                 "aria-selected", "true"
             )
         expect(panel.get_by_text("Add the GitHub tab", exact=True)).to_be_visible(timeout=30_000)
@@ -408,7 +408,7 @@ def test_github_tab_prompts_to_update_outdated_host(
 
     Pins the full old-host chain end to end: the 404 body → ``githubNotFoundReason``
     → the ``host_outdated`` state → the actionable empty state, rather than the
-    generic "GitHub isn't available" one.
+    generic "Pull requests aren't available" one.
     """
     base_url, session_id = seeded_session
     _stub_github_outdated_host(page)
@@ -416,8 +416,10 @@ def test_github_tab_prompts_to_update_outdated_host(
 
     open_right_rail(page)
     rail = page.get_by_role("complementary", name="Workspace")
-    rail.get_by_role("tab", name="GitHub").click()
+    rail.get_by_role("tab", name="Pull Requests").click()
 
-    expect(rail.get_by_text("Update your host to use GitHub")).to_be_visible(timeout=30_000)
+    expect(rail.get_by_text("Update your host to use the Pull Requests tab")).to_be_visible(
+        timeout=30_000
+    )
     # The hint names the version floor so the user knows what to update to.
     expect(rail.get_by_text(re.compile(r"0\.13\.0 or later"))).to_be_visible()

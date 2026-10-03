@@ -118,7 +118,7 @@ class GitHubProvider:
     default_hosts = ("github.com",)
     request_name = "pull request"
     number_prefix = "#"
-    facets = FacetModules()
+    facets = FacetModules(pull_requests="omnigent.runner.git_providers.github")
 
     def matches_host(self, host: str, instances: Instances) -> bool:
         """Claim github.com, ``GH_HOST``, configured instances, and gh's signed-in hosts.
