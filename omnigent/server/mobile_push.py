@@ -129,7 +129,7 @@ class MobilePushService:
 
     def _preview(self, session_id: str) -> str | None:
         cursor = None
-        while True:
+        for _ in range(2):
             page = self.conversation_store.list_items(
                 session_id, limit=100, after=cursor, order="desc", type="message"
             )
@@ -145,6 +145,7 @@ class MobilePushService:
             if not page.has_more or not page.last_id:
                 return None
             cursor = page.last_id
+        return None
 
     async def deliver_once(self, *, now: int | None = None) -> int:
         if monotonic() >= self._purge_at:
@@ -165,7 +166,11 @@ class MobilePushService:
 
     async def _deliver_safely(self, delivery: Delivery, *, now: int | None) -> None:
         try:
-            await self._deliver(delivery, now=now)
+            remaining = delivery.lease_deadline - monotonic() - 1
+            if remaining <= 0:
+                raise TimeoutError
+            async with asyncio.timeout(remaining):
+                await self._deliver(delivery, now=now)
         except Exception as error:
             _logger.exception(
                 "Mobile push delivery failed; will retry",
@@ -205,7 +210,8 @@ class MobilePushService:
                 preview=preview,
             )
             # Authority can change in the irreducible final-check-to-POST window.
-            # At-least-once: crash after send can duplicate; before intent commit can lose.
+            # At-least-once: crash or lease expiry after send can duplicate;
+            # a crash before intent commit can lose the notification.
             result = await self.sender.post(payload, token)
             if result.outcome != "refresh":
                 break
