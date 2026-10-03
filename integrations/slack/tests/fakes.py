@@ -247,8 +247,8 @@ OMNIGENT_ENDPOINTS: list[tuple[str, str, bool]] = [
 OMNIGENT_RESPONSE_FIELDS: dict[str, tuple[str, ...]] = {
     # GET /v1/sessions/{session_id} → SessionResponse (get_session_info).
     "SessionResponse": ("harness", "agent_name"),
-    # GET /v1/agents → PaginatedList (list_agents reads .data).
-    "PaginatedList": ("data",),
+    # GET /v1/agents → AgentList (list_agents reads .data).
+    "AgentList": ("data",),
     # GET /v1/info → ServerInfoResponse (managed_host_support gates the setup
     # menu's managed-sandbox option on these two).
     "ServerInfoResponse": ("managed_sandboxes_enabled", "sandbox_provider"),
