@@ -319,18 +319,221 @@ from the user's chosen source.
 - Fixture: a small synthetic full design system in the test tree (manifest,
   CSS, one font stub, one SVG), never the user's real folder.
 
+### Phase 3 amendments
+
+- Full-mode reads of an outside folder only succeed for sessions without a
+  sandbox or with a read grant for that folder. When the read is refused,
+  the viewer shows "Design system folder is not readable from this session;
+  import it" instead of failing silently.
+- The pointer accepts a relative `path` from the start (import adds the
+  writer).
+- Design-system injection is kind-agnostic (tokens, fonts, and `ds:`
+  rewriting, no slide section rules) and returns `{ style, content }`, so
+  wireframes and the standalone export reuse it.
+
 ## Later phases
 
-1. **Import:** copy a design system's slide-relevant files (excluding
-   `uploads/`, `ui_kits/`, `preview/`) into the workspace so it works for
-   collaborators, managed sandboxes, and if the original folder moves.
-2. **Standalone export:** "Download standalone HTML" with every asset
-   embedded, for sharing outside Omnigent.
-3. **Adherence warnings:** flag raw hex colors, raw pixel sizes, and fonts
-   outside the design system's own allow-list.
-4. **Wireframes:** `*.wireframe.html` files in desktop, tablet, and phone
-   frames, on the same page.
-5. **Server index:** a per-session deck count or cross-session search so the
-   page stops scanning sessions and covers older ones.
-6. **Kits beyond a workspace:** user or org-level kits, building on the
-   operator branding config.
+Designed for the same `design` flag and pending approval. Each item is its
+own PR, in the build order at the end of this section.
+
+### Server deck index
+
+Lists every deck (and wireframe) across sessions from the database, so the
+page stops scanning recent sessions and covers older sessions and offline
+runners.
+
+- **Table `design_artifacts`** (one alembic revision): `workspace_id`,
+  `session_id`, `path`, `kind` (deck or wireframe), `updated_at`, `deleted`.
+  Primary key `(workspace_id, session_id, path)`, index
+  `(workspace_id, session_id)`, no database foreign key (same rule as other
+  session-scoped tables). Store methods live on the conversation store with
+  named sessions such as `record_design_artifact` and `list_design_artifacts`.
+- **Recording:** wherever the runner already records a file change with a
+  path (`sys_os_write`, `sys_os_edit`, the file PUT/PATCH/DELETE routes, and
+  native harness file hooks), a path ending in `.slides.html` or
+  `.wireframe.html` also emits a `session.design_artifact.changed` event. The
+  server relay upserts the row off the event loop, the same way the pending
+  approval count is persisted.
+- **Gap and reconcile:** shell writes and changes made outside the agent are
+  not recorded. When the page's existing per-workspace scan succeeds, it
+  sends the full path set for that session to
+  `PUT /v1/sessions/{id}/design-artifacts`, which replaces that session's
+  rows. Opening a deck that returns 404 marks its row deleted.
+- **List endpoint:** `GET /v1/design/artifacts?kind=deck|wireframe` returns
+  session id, path, kind, updated time, session title, and workspace for
+  sessions the caller can see, using the session list's visibility rules.
+  Behind the `design` flag. Opening a deck still reads through the existing
+  session file API, so file access rules are unchanged.
+- **Web:** the landing calls the index first and falls back to the phase 1
+  scan when the server does not have it. The scan then only reconciles
+  sessions with a live runner or host. Offline sessions are listed from the
+  index and marked "Unavailable" until their runner is back.
+- **Tests:** store and migration, recording from each write path, the list
+  endpoint's visibility (owner, shared, not shared), reconcile replace and
+  404 delete, and the web fallback.
+
+### Import a design system
+
+Copy a design system's slide-relevant files into the design's workspace, so
+it renders for collaborators, survives the original folder moving, and does
+not need outside-folder reads.
+
+- **Who copies:** the web client, through existing routes. It lists the
+  source with the host filesystem API, reads each file through the design
+  session's absolute read (owner only), and writes it with the workspace
+  write route to `.omnigent/design-system/<relative path>`.
+- **Runner fix:** the workspace write route's `encoding` field accepts
+  `base64` so fonts and images can be written (reads already return base64
+  for binary files). The web write helper passes the encoding. This changes an
+  existing contract and is called out for review.
+- **What is copied:** only `SKILL.md`, `README.md`, `_ds_manifest.json`,
+  `colors_and_type.css`, `fonts/`, `assets/`, `templates/`, and `slides/`, with
+  allowed extensions, skipping files over 2 MB and capping the total at 20 MB.
+  `uploads/`, `ui_kits/`, and `preview/` are never copied.
+- **Flow:** "Import" in the New design dialog's design-system field (and on a
+  pointed design) shows a confirm step with the file count, total size, and
+  skipped files; copies about four files at a time with progress and per-file
+  errors; and writes the pointer last, so a half-finished import is never
+  used.
+- **Pointer:** `.omnigent/design-system.json` gets
+  `"path": ".omnigent/design-system"` plus `"imported_from": "<absolute>"`. A
+  relative path means imported: reads use the normal workspace file read
+  (read access, not owner only), the owner-only notice is skipped, and
+  collaborators with shared workspace files see the branding. Deck and
+  wireframe search exclude `.omnigent/design-system/`.
+- **Known limit:** the host and runner listings resolve symlinks, so a
+  symlink inside the source cannot be detected and would be copied as its
+  target. The allowlist, extension filter, caps, and owner-only confirm step
+  narrow this; surfacing symlinks in listings is a separate decision.
+- **Managed sandboxes** are out of scope: they cannot see a laptop folder.
+  Committing `.omnigent/design-system/` to the repo (about 20 MB) is the
+  workaround.
+- **Tests:** the runner base64 write, the import plan (allowlist, extension
+  filter, caps, skip list), copy progress and errors, pointer written last,
+  relative pointer handling in the viewer, and the search exclusion.
+
+### Standalone HTML export
+
+A **Download HTML** button in the deck toolbar, next to Print, saves one
+self-contained file that opens in any browser.
+
+- **Built by** a helper next to `prepareSlidesDoc` that takes the deck and
+  exactly the style the viewer rendered (kit style, or the design-system
+  style with `ds:` references already rewritten), so the file matches the
+  preview and the same size caps hold. Phase 3's loader therefore returns
+  `{ style, content }` with content already rewritten, not only a srcDoc.
+- **Contents:** the deck, the print rules (one slide per landscape page),
+  the injected style, and a small standalone navigation script: arrow keys,
+  PageUp, PageDown, Space, click, and `#n` in the URL, ignoring keys typed in
+  form fields. The "show one slide" rule applies only once that script runs,
+  so with JavaScript off the file reads as a stacked, scrolling document.
+- **Left out:** the viewer's frame script and its message protocol, external
+  `@import` rules, and any design-system loader scripts.
+- **Disabled** when the content is truncated, or when the kit or design system
+  did not load (error or non-owner notice), so no file ships with unresolved
+  assets.
+- **Saved** with the existing browser download helper as `<deck>.html`. The
+  app never navigates to the generated document.
+- **Tests:** no frame script in the output, style injected, the stacked
+  fallback without the script, navigation keys, and the disabled states.
+
+### Wireframes
+
+`*.wireframe.html` files open in a wireframe viewer with device frames and
+appear on the Design page next to decks.
+
+- **Viewer:** a lazy `WireframeViewer` routed by file name next to the deck
+  viewer. A device picker offers Desktop 1440x900, Tablet 834x1194, and Phone
+  390x844. The frame is rendered at the device size, so the wireframe's media
+  queries respond to it, then scaled to fit, and it scrolls inside the frame.
+  It reuses the sandbox, the kit and design-system loading gate, and
+  fullscreen.
+- **Screens:** each top-level `<section data-screen="id" data-title="...">`
+  is a screen, chosen with a screen picker. A file with no sections is one
+  screen. Links to `#id` and elements with `data-goto="id"` switch screens
+  inside the frame (the preview's `<base target="_blank">` would otherwise
+  open a new tab).
+- **Branding:** wireframes get only fonts and tokens from a kit or design
+  system, not the deck section rules (no forced section background, no logo
+  on every screen). The kit style builder gains a flag for this, and Phase 3
+  injection is built kind-agnostic so wireframes reuse it.
+- **Design page:** search includes `**/*.wireframe.html`; items carry a kind
+  (slides or wireframe) with a badge on cards; the studio picks the viewer by
+  kind; the New design dialog gets a Slides | Wireframe toggle that writes to
+  `wireframes/<slug>.wireframe.html` and names the right skill.
+- **Skill:** a separate framework skill, `wireframes` (screens, `data-goto`
+  links, responsive CSS, grayscale first), shipped like slide-decks. The
+  "Using a design system" text lives in one shared place both skills point
+  to.
+- **Tests:** routing, device sizes and scaling, screen picker and links,
+  branding without section rules, Design page kind handling, and the dialog
+  toggle.
+
+### Kits per user or organization
+
+- **User default:** one per-user preference (key `design_default`) holding a
+  design-system reference (`host_id`, `path`, `name`, kind) or "none", read
+  and written with `GET` and `PUT /v1/me/preferences/design-default`, modeled
+  on the existing project order preference. The New design dialog offers
+  "Make this my default"; the stored default replaces the localStorage
+  default from phase 3 (recents stay local).
+- **Org kit:** an operator sets `design_kit:` in server config, pointing at
+  `{config_dir}/design-kit/` with a `kit.json` and its assets. It is validated
+  at startup with the branding asset checks (no path escape, no symlinks),
+  2 MB per asset and 20 MB total, advertised in `GET /v1/info` as
+  `design_kit: {name} | null`, and served to signed-in users from
+  `GET /v1/design-kit/{path}`. Config ships with each replica, so this works
+  on multi-replica and Databricks-hosted servers. An admin upload API is out
+  of scope until operators need it.
+- **Materialization:** when a design is created with the org kit, the page
+  copies the kit into the design folder's `.omnigent/design-kit/` through the
+  workspace write path. The agent and the viewer then see a normal workspace
+  kit, so decks render the same for every viewer.
+- **Precedence, applied once in the New design dialog:** the explicit
+  choice, then the folder's existing kit, then the user default, then the org
+  kit, then none. At render time the phase 3 rule is unchanged.
+- **Tests:** preference endpoints, config validation (escape, symlink, size),
+  the asset endpoint's auth, `/v1/info` advertising, dialog precedence, and
+  materialization.
+
+### Brand-rule warnings
+
+For full design systems only, the viewer flags raw hex colors, raw pixel
+sizes, and font families outside the system's allow-list.
+
+- **Rules and allow-list** come from the system's `_adherence.oxlintrc.json`:
+  the three patterns in its `no-restricted-syntax` rule and the token names
+  and `fontFamilies` in its `x-omelette` block. Omnigent does not run oxlint;
+  it reuses the patterns on CSS.
+- **Scope:** a pure function scans only `<style>` text and `style`
+  attributes, parsed inertly, never slide text. It runs once per content.
+- **Avoiding noise:** ignore custom property definitions, `var()` fallbacks,
+  `0px`, and `1px` borders and outlines; allow every property and value pair
+  that appears in the system's own `templates/*` CSS, so template CSS copied
+  verbatim is clean; count each distinct value once.
+- **UI:** a toolbar badge "N brand warnings" that opens a list of the value,
+  the property, and where it first appears. It never blocks rendering.
+  Kit decks and skill-only systems have no allow-list, so they show no badge.
+- **Skill:** the "Using a design system" section tells agents to use the
+  system's tokens and listed fonts.
+- **Tests:** each rule, each noise rule, the template baseline, and no badge
+  outside full mode.
+
+### Build order
+
+Two builders are available, so later work runs on two tracks, each PR
+reviewed by the other builder:
+
+| Order | PR | Depends on | New server surface |
+|---|---|---|---|
+| 6 | Studio (Phase 2) | PR 5 | none |
+| 7 | Design systems (Phase 3, with the amendments) | PR 6 | none |
+| 8 | Server deck index | PR 6 | `design_artifacts` table and migration, `GET /v1/design/artifacts`, `PUT /v1/sessions/{id}/design-artifacts`, a runner event |
+| 9 | Import | PR 7 | runner write accepts base64 |
+| 10 | Standalone HTML export | PR 7 | none |
+| 11 | Wireframes | PR 7 | none (new `wireframes` framework skill) |
+| 12 | Kits per user or organization | PR 9 | `GET`/`PUT /v1/me/preferences/design-default`, `GET /v1/design-kit/{path}`, `design_kit:` server config |
+| 13 | Brand-rule warnings | PR 7 | none |
+
+PR 8 runs in parallel with PR 7 on its own branch from PR 6; the two are
+rebased into one line before certification.
