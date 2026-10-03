@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from typing import TYPE_CHECKING
 from uuid import uuid4
 
@@ -56,6 +57,35 @@ class RunnerSessionInitializer:
             asyncio.Task[httpx.Response],
         ] = {}
         self._recovery_ids: dict[tuple[str, int, str, str, str | None, bool], str] = {}
+        # Sessions with an item dispatch in flight: (pending dispatches, monotonic expiry).
+        self._forwards: dict[str, tuple[int, float]] = {}
+
+    def expect_forward(self, session_id: str, *, ttl_s: float) -> None:
+        """Note an item dispatch to *session_id*, until ``forward_done`` or *ttl_s* seconds.
+
+        A message that relaunches a stopped runner races that runner's reconnect hook, which also
+        initializes the session, without ``suppress_recovery_turn``. The init the runner sees first
+        decides whether it starts a crash-recovery turn from history, and this class sends one init
+        per connection. So while a dispatch is pending, every init of the session suppresses the
+        recovery turn, and the dispatched item stays the turn's only trigger.
+        """
+        pending, _ = self._forwards.get(session_id, (0, 0.0))
+        self._forwards[session_id] = (pending + 1, time.monotonic() + ttl_s)
+
+    def forward_done(self, session_id: str) -> None:
+        """End one dispatch noted by ``expect_forward``."""
+        pending, expires = self._forwards.get(session_id, (0, 0.0))
+        if pending > 1:
+            self._forwards[session_id] = (pending - 1, expires)
+        else:
+            self._forwards.pop(session_id, None)
+
+    def _forward_pending(self, session_id: str) -> bool:
+        pending, expires = self._forwards.get(session_id, (0, 0.0))
+        if pending and expires > time.monotonic():
+            return True
+        self._forwards.pop(session_id, None)
+        return False
 
     async def initialize(
         self,
@@ -67,6 +97,7 @@ class RunnerSessionInitializer:
         resume_interrupted_turn: bool = False,
     ) -> httpx.Response:
         """Initialize once for the current connection and persisted snapshot."""
+        suppress_recovery_turn = suppress_recovery_turn or self._forward_pending(conversation.id)
         runner_id = conversation.runner_id
         agent_id = conversation.agent_id
         if runner_id is None or agent_id is None:

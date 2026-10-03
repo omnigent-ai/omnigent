@@ -2144,6 +2144,13 @@ def register_events_routes(
         # message, even if we reused the original binding instead of launching
         # a replacement.
         _runner_needs_session_init = False
+        # Until this item is forwarded, any init of the session suppresses the runner's recovery
+        # turn, including the reconnect hook's when a relaunched runner connects first.
+        _initializer = getattr(request.app.state, "runner_session_initializer", None)
+        if _initializer is not None:
+            _initializer.expect_forward(
+                session_id, ttl_s=2 * _HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S
+            )
         # Item event (message, function_call_output, etc.).
         if conv.host_id is not None and await _maybe_wake_stale_resumable_managed_sandbox(
             session_id=session_id,
@@ -2588,6 +2595,8 @@ def register_events_routes(
                 initializer=getattr(request.app.state, "runner_session_initializer", None),
                 suppress_recovery_turn=True,
             )
+        if _initializer is not None:
+            _initializer.forward_done(session_id)
         await _ensure_runner_relay_ready(
             session_id,
             conv.runner_id,

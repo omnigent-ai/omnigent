@@ -2163,6 +2163,115 @@ async def test_relaunch_posts_session_init_before_forwarding_message(
     )
 
 
+async def test_relaunch_suppresses_recovery_even_when_the_reconnect_init_runs_first(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A message that relaunches a stopped runner reaches it with the recovery turn suppressed.
+
+    The relaunched runner's tunnel connect fires ``_on_runner_connect``, which initializes the
+    session on the same connection without ``suppress_recovery_turn``.
+    ``RunnerSessionInitializer`` sends one init per connection, so when that init starts first, the
+    relaunch's suppressed init reuses it: the runner starts a crash-recovery turn from history, and
+    the forwarded message is buffered and answered after it.
+
+    Mutation check: drop the forward mark ``post_event`` sets before relaunching, and the only init
+    the runner receives carries ``suppress_recovery_turn: False``.
+    """
+    import dataclasses
+
+    from omnigent.runner.session_init_protocol import parse_runner_session_init_envelope
+    from omnigent.server.routes import sessions as sessions_module
+
+    monkeypatch.setattr(sessions_module, "_HOST_BOUND_RUNNER_CONNECT_GRACE_S", 0.0)
+    comm = await _connect_host(app)
+    session = await _inline_launch_session(client, comm)
+    session_id = session["id"]
+    init_bodies: list[dict[str, Any]] = []
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        """Record session inits and accept every runner POST.
+
+        :param request: Request the server sent to the relaunched runner.
+        :returns: A 2xx so the server proceeds past each step.
+        """
+        if request.method == "POST" and request.url.path == "/v1/sessions":
+            init_bodies.append(json.loads(request.content))
+        if request.url.path.endswith("/events"):
+            return httpx.Response(202, json={"queued": True})
+        return httpx.Response(200, json={})
+
+    fake_runner = httpx.AsyncClient(
+        transport=httpx.MockTransport(_handler), base_url="http://runner"
+    )
+
+    async def _offline(sid: str, router: object) -> httpx.AsyncClient | None:
+        """Report no runner, so the route takes the relaunch branch.
+
+        :param sid: Session id being routed (unused).
+        :param router: Real app runner router (unused).
+        :returns: ``None``.
+        """
+        del sid, router
+        return None
+
+    async def _reconnected(
+        session_id_arg: str, *args: Any, runner_id: str | None, **kwargs: Any
+    ) -> httpx.AsyncClient:
+        """The relaunched runner connects, and its reconnect hook initializes the session first.
+
+        :param session_id_arg: Session id being routed.
+        :param args: The router and tunnel registry (unused).
+        :param runner_id: The relaunched runner's id.
+        :param kwargs: The wait budget and exit reports (unused).
+        :returns: The recording fake runner client.
+        """
+        del args, kwargs
+        conv = SqlAlchemyConversationStore(db_uri).get_conversation(session_id_arg)
+        assert conv is not None and runner_id is not None
+        # What ``_on_runner_connect`` sends for a bound session: no suppression, no resume.
+        await app.state.runner_session_initializer.initialize(
+            dataclasses.replace(conv, runner_id=runner_id), fake_runner, timeout=10.0
+        )
+        return fake_runner
+
+    async def _noop_relay_ready(*args: Any, **kwargs: Any) -> None:
+        """Stand in for ``_ensure_runner_relay_ready``: a MockTransport never emits its heartbeat.
+
+        :param args: Ignored positional args.
+        :param kwargs: Ignored keyword args.
+        :returns: ``None``.
+        """
+        del args, kwargs
+
+    monkeypatch.setattr(sessions_module, "_get_runner_client", _offline)
+    monkeypatch.setattr(sessions_module, "_wait_for_runner_client", _reconnected)
+    monkeypatch.setattr(sessions_module, "_ensure_runner_relay_ready", _noop_relay_ready)
+    try:
+        resp = await client.post(
+            f"/v1/sessions/{session_id}/events",
+            json={
+                "type": "message",
+                "data": {"role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+            },
+        )
+    finally:
+        await fake_runner.aclose()
+
+    assert resp.status_code < 300, resp.text
+    assert init_bodies, "the relaunched runner should receive a session init"
+    envelopes = [parse_runner_session_init_envelope(body) for body in init_bodies]
+    assert all(
+        envelope is not None and envelope.suppress_recovery_turn for envelope in envelopes
+    ), (
+        "every init the relaunched runner receives while the message is dispatched must "
+        "suppress its recovery turn, so the message is the turn's only trigger; "
+        f"got {envelopes!r}"
+    )
+
+
 async def test_codex_goal_relaunch_posts_session_init_before_goal_event(
     client: httpx.AsyncClient,
     app: FastAPI,
