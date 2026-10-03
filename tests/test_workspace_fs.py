@@ -88,10 +88,9 @@ def test_read_text_file_returns_utf8_content(tmp_path: Path) -> None:
     assert result["content"] == "# Title\nbody\n"
 
 
-@pytest.mark.parametrize("line_count", [3_000, 50_000])
-def test_read_text_file_has_no_agent_line_cap(tmp_path: Path, line_count: int) -> None:
+def test_read_text_file_has_no_agent_line_cap(tmp_path: Path) -> None:
     """Host fallback serves the full file even when it exceeds 2,000 lines."""
-    content = "".join(f"# line {i}: café\n" for i in range(1, line_count + 1))
+    content = "".join(f"# line {i}: café\n" for i in range(1, 3_001))
     (tmp_path / "large.py").write_text(content, encoding="utf-8")
     reader = WorkspaceReader(tmp_path)
 

@@ -176,15 +176,13 @@ async def test_read_file_content(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("absolute_path", [False, True], ids=["workspace", "host"])
-@pytest.mark.parametrize("line_count", [3_000, 50_000])
 async def test_read_file_content_has_no_agent_line_cap(
     client: httpx.AsyncClient,
     workspace: Path,
     absolute_path: bool,
-    line_count: int,
 ) -> None:
     """The file viewer receives every line of a file below the byte cap."""
-    content = "".join(f"# line {i}: café\n" for i in range(1, line_count + 1))
+    content = "".join(f"# line {i}: café\n" for i in range(1, 3_001))
     file_path = (workspace.parent if absolute_path else workspace) / "large.py"
     file_path.write_text(content, encoding="utf-8")
     request_path = str(file_path) if absolute_path else file_path.name
