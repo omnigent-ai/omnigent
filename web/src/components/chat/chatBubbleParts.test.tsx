@@ -3,7 +3,9 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Bubble } from "@/lib/renderItems";
 import { useChatStore, type ChatState } from "@/store/chatStore";
+import { ForkDialogContextProvider } from "@/shell/ForkDialogContext";
 import { BubbleView, containsMermaidDiagram } from "./chatBubbleParts";
+import { ConversationScopeContext } from "./conversationScope";
 
 const fetchMock = vi.fn();
 const initialStoreState = useChatStore.getState();
@@ -86,6 +88,49 @@ describe("Mermaid diagram width", () => {
         { kind: "text", itemId: "prose", text: "A Mermaid diagram would help.", final: true },
       ]),
     ).toBe(false);
+  });
+});
+
+describe("AssistantBubble fork source", () => {
+  const bubble: Extract<Bubble, { kind: "assistant" }> = {
+    kind: "assistant",
+    responseId: "resp_side_reply",
+    stableId: "side_reply",
+    lifecycle: "completed",
+    error: null,
+    items: [{ kind: "text", itemId: "side_text", text: "Side reply", final: true }],
+  };
+
+  it.each([
+    {
+      name: "side chat",
+      scope: "conv_side_child",
+      expected: {
+        sourceSessionId: "conv_side_child",
+        upToResponseId: "resp_side_reply",
+      },
+    },
+    {
+      name: "main chat",
+      scope: null,
+      expected: { sourceSessionId: undefined, upToResponseId: "resp_side_reply" },
+    },
+  ])("opens from the $name session", ({ scope, expected }) => {
+    const openForkDialog = vi.fn();
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <ForkDialogContextProvider value={{ canFork: true, openForkDialog }}>
+          <ConversationScopeContext.Provider value={scope}>
+            <BubbleView bubble={bubble} isLastAssistant={false} />
+          </ConversationScopeContext.Provider>
+        </ForkDialogContextProvider>
+      </QueryClientProvider>,
+    );
+
+    fireEvent.click(screen.getByTestId("fork-from-response"));
+
+    expect(openForkDialog).toHaveBeenCalledOnce();
+    expect(openForkDialog).toHaveBeenCalledWith(expected);
   });
 });
 
