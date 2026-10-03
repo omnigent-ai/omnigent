@@ -1,4 +1,6 @@
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import type { ReactNode } from "react";
 import { toast } from "sonner";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import * as sessionsApi from "@/lib/sessionsApi";
@@ -14,13 +16,25 @@ vi.mock("@/store/chatStore", async (importOriginal) => ({
 
 vi.mock("@/components/composer/ComposerAddMenu", () => ({ ComposerAddMenu: () => null }));
 vi.mock("@/components/ComposerMicButton", () => ({ ComposerMicButton: () => null }));
+const sessionLabels = vi.hoisted(() => ({ current: {} as Record<string, string> }));
+vi.mock("@/hooks/useSession", () => ({
+  useSession: () => ({ session: { labels: sessionLabels.current }, isLoading: false, error: null }),
+}));
 vi.mock("@/hooks/useWorkingLabelTick", () => ({ useWorkingLabelTick: () => 0 }));
 
 const initialStoreState = useChatStore.getState();
 const send = vi.fn<ChatState["send"]>();
 const childId = "conv_side_child";
+const queryClient = new QueryClient();
+const renderPane = (ui: ReactNode) =>
+  render(ui, {
+    wrapper: ({ children }) => (
+      <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
+    ),
+  });
 
 beforeEach(() => {
+  sessionLabels.current = {};
   conversationRegistry.clear();
   send.mockReset().mockResolvedValue(undefined);
   vi.spyOn(sessionsApi, "interrupt").mockResolvedValue({ queued: true });
@@ -54,7 +68,7 @@ afterEach(() => {
 
 describe("side-chat working indicator", () => {
   it("shows progress before a native child's first transcript bubble arrives", () => {
-    render(<SideChatPane childId={childId} />);
+    renderPane(<SideChatPane childId={childId} />);
 
     expect(screen.getByTestId("working-indicator")).toHaveTextContent("Working…");
     expect(
@@ -74,13 +88,13 @@ describe("side-chat working indicator", () => {
     { blockedOn: null, backgroundTaskCount: 1 },
   ])("does not inherit the parent's blocked/background state: %o", (parentState) => {
     useChatStore.setState(parentState);
-    render(<SideChatPane childId={childId} />);
+    renderPane(<SideChatPane childId={childId} />);
 
     expect(screen.getByTestId("working-indicator")).toHaveTextContent("Working…");
   });
 
   it("updates the working label from the child's own blocked state", () => {
-    render(<SideChatPane childId={childId} />);
+    renderPane(<SideChatPane childId={childId} />);
 
     act(() =>
       conversationRegistry.acquire(childId).setState({
@@ -103,7 +117,7 @@ describe("side-chat working indicator", () => {
         }),
     );
     useChatStore.setState({ blockedOn: "dialog open", backgroundTaskCount: 1 });
-    render(<SideChatPane childId="pending:side" onStart={onStart} />);
+    renderPane(<SideChatPane childId="pending:side" onStart={onStart} />);
     const input = screen.getByTestId("side-chat-input");
     fireEvent.change(input, { target: { value: "Explain the approach" } });
     fireEvent.click(screen.getByRole("button", { name: "Send side question" }));
@@ -135,7 +149,7 @@ describe("side-chat interrupt", () => {
       status: "streaming",
       activeResponse: null,
     });
-    render(<SideChatPane childId={childId} />);
+    renderPane(<SideChatPane childId={childId} />);
 
     expect(screen.getByTestId("working-indicator")).toHaveTextContent("Working…");
     const interrupt = screen.getByRole("button", { name: "Interrupt side chat" });
@@ -162,7 +176,7 @@ describe("side-chat interrupt", () => {
       status: "streaming",
       activeResponse: null,
     });
-    render(<SideChatPane childId={childId} />);
+    renderPane(<SideChatPane childId={childId} />);
 
     expect(screen.getByTestId("working-indicator")).toHaveTextContent("Working…");
     const interrupt = screen.getByRole("button", { name: "Interrupt side chat" });
@@ -176,7 +190,7 @@ describe("side-chat interrupt", () => {
     conversationRegistry.acquire(childId).setState({
       activeResponse: { responseId: "codex_turn_side", state: "completed", error: null },
     });
-    render(<SideChatPane childId={childId} />);
+    renderPane(<SideChatPane childId={childId} />);
 
     const interrupt = screen.getByRole("button", { name: "Interrupt side chat" });
     expect(interrupt).toBeDisabled();
@@ -189,7 +203,7 @@ describe("side-chat interrupt", () => {
       sessionStatus: "running",
       activeResponse: { responseId: "resp_main", state: "streaming", error: null },
     });
-    render(<SideChatPane childId={childId} />);
+    renderPane(<SideChatPane childId={childId} />);
 
     fireEvent.click(screen.getByRole("button", { name: "Interrupt side chat" }));
 
@@ -209,7 +223,7 @@ describe("side-chat interrupt", () => {
         }),
     );
     useChatStore.setState({ sessionStatus: "running" });
-    render(<SideChatPane childId={childId} />);
+    renderPane(<SideChatPane childId={childId} />);
     const input = screen.getByTestId("side-chat-input");
     fireEvent.change(input, { target: { value: "Keep this follow-up" } });
     fireEvent.keyDown(input, { key: "Enter" });
@@ -237,7 +251,7 @@ describe("side-chat interrupt", () => {
 
   it("reports a failed interrupt and allows retry without clearing the draft", async () => {
     vi.mocked(sessionsApi.interrupt).mockRejectedValueOnce(new Error("Host unavailable"));
-    render(<SideChatPane childId={childId} />);
+    renderPane(<SideChatPane childId={childId} />);
     const input = screen.getByTestId("side-chat-input");
     fireEvent.change(input, { target: { value: "Keep this draft" } });
     fireEvent.click(screen.getByRole("button", { name: "Interrupt side chat" }));
@@ -262,9 +276,49 @@ describe("side-chat interrupt", () => {
     conversationRegistry.acquire(childId).setState({ sessionStatus });
     useChatStore.setState({ sessionStatus: "running" });
 
-    render(<SideChatPane childId={id} readOnly={readOnly} />);
+    renderPane(<SideChatPane childId={id} readOnly={readOnly} />);
 
     expect(screen.queryByTestId("side-chat-interrupt")).toBeNull();
     expect(sessionsApi.interrupt).not.toHaveBeenCalled();
+  });
+});
+
+describe("side chat sealed by the server", () => {
+  it("is read-only once the server marks the child closed", () => {
+    sessionLabels.current = { "omnigent.closed": "true" };
+    renderPane(<SideChatPane childId={childId} />);
+
+    expect(
+      screen.getByText("This side chat has ended and can’t be continued."),
+    ).toBeInTheDocument();
+    expect(screen.queryByTestId("side-chat-input")).toBeNull();
+  });
+
+  it("re-reads the child's labels after the opening /side send settles", async () => {
+    const invalidate = vi.spyOn(queryClient, "invalidateQueries");
+    useChatStore.setState({ sideChatDrafts: { [childId]: "why?" } });
+    renderPane(<SideChatPane childId={childId} />);
+
+    await waitFor(() =>
+      expect(send).toHaveBeenCalledWith("why?", "agent_side", undefined, {
+        pinnedConversationId: childId,
+      }),
+    );
+    await waitFor(() =>
+      expect(invalidate).toHaveBeenCalledWith({ queryKey: ["session", childId] }),
+    );
+  });
+
+  it("re-reads the child's labels after a send settles", async () => {
+    const invalidate = vi.spyOn(queryClient, "invalidateQueries");
+    act(() => conversationRegistry.acquire(childId).setState({ sessionStatus: "idle" }));
+    renderPane(<SideChatPane childId={childId} />);
+
+    fireEvent.change(screen.getByTestId("side-chat-input"), { target: { value: "hi" } });
+    fireEvent.keyDown(screen.getByTestId("side-chat-input"), { key: "Enter" });
+
+    await waitFor(() =>
+      expect(invalidate).toHaveBeenCalledWith({ queryKey: ["session", childId] }),
+    );
   });
 });

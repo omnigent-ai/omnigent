@@ -730,9 +730,29 @@ describe("ErrorBanner", () => {
       render(
         <ErrorBanner message="The turn failed." source="execution" code={code} onRetry={vi.fn()} />,
       );
-      expect(screen.queryByRole("button", { name: "Retry" })).toBeNull();
+      expect(screen.queryByRole("button", { name: "Resume session" })).toBeNull();
     },
   );
+
+  it("offers Retry (not Resume session) for a connection_error", async () => {
+    const onRetry = vi.fn(async () => {});
+    render(
+      <ErrorBanner
+        itemId="conn-err-1"
+        message="peer closed connection without sending complete message body (incomplete chunked read)"
+        source="harness"
+        code="connection_error"
+        onRetry={onRetry}
+      />,
+    );
+
+    expect(screen.queryByRole("button", { name: "Resume session" })).toBeNull();
+    const retryButton = screen.getByRole("button", { name: "Retry" });
+    fireEvent.click(retryButton);
+    await waitFor(() =>
+      expect(onRetry).toHaveBeenCalledWith(expect.objectContaining({ code: "connection_error" })),
+    );
+  });
 
   it("suppresses the runner's unavailable last-output diagnostics tab", () => {
     render(

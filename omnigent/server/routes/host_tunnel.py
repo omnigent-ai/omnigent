@@ -81,6 +81,47 @@ SUPPORTED_FRAME_PROTOCOL_MAJOR = 1
 PING_INTERVAL_S = 30.0
 PING_MISS_THRESHOLD = 3
 
+RunnerExitedCallback = Callable[[str, str, str], Awaitable[None]]
+"""Async ``(host_id, runner_id, error)`` hook for a ``host.runner_exited`` report."""
+
+
+def log_runner_exited(
+    host_id: str,
+    runner_id: str,
+    error: str,
+    *,
+    session_id: str | None = None,
+) -> None:
+    """Emit the ``runner_exited`` debug event for a host-reported runner death.
+
+    Callers that can resolve the runner's bound sessions emit one row per
+    session so each crash row is attributable; ``session_id=None`` is the
+    fallback when no session is bound or the lookup is unavailable.
+
+    :param host_id: Reporting host, e.g. ``"host_abc"``.
+    :param runner_id: The dead runner, e.g. ``"runner_abc123..."``.
+    :param error: Daemon-composed cause (exit code + log tail).
+    :param session_id: Session bound to the runner, if known.
+    :returns: None.
+    """
+    # A runner-process fault; the free-text cause is unparsed, and the runner
+    # may have died before or during a turn, so the lifecycle stage is unknown.
+    _logger.warning(
+        "Host %s reported runner %s exited: %s",
+        host_id,
+        runner_id,
+        error,
+        extra=debug_event(
+            "runner_exited",
+            session_id=session_id,
+            host_id=host_id,
+            runner_id=runner_id,
+            error_category=ErrorCategory.RUNNER.value,
+            error_impact=ErrorImpact.BLOCKING.value,
+            error_phase=ErrorPhase.UNKNOWN.value,
+        ),
+    )
+
 
 def create_host_tunnel_router(
     host_registry: HostRegistry,
@@ -90,7 +131,7 @@ def create_host_tunnel_router(
     on_host_connect: Callable[[str, str | None], Awaitable[None]] | None = None,
     on_host_disconnect: Callable[[str, str | None], Awaitable[None]] | None = None,
     on_host_update: Callable[[str, str | None], Awaitable[None]] | None = None,
-    on_runner_exited: Callable[[str, str], Awaitable[None]] | None = None,
+    on_runner_exited: RunnerExitedCallback | None = None,
     local_single_user: bool | None = None,
     runner_exit_reports: RunnerExitReports | None = None,
 ) -> APIRouter:
@@ -115,11 +156,13 @@ def create_host_tunnel_router(
         Used for reconnect reconciliation.
     :param on_runner_exited: Optional async callback fired when a host
         reports one of its spawned runners died unexpectedly
-        (``host.runner_exited``). Receives ``(runner_id, error)``.
+        (``host.runner_exited``). Receives ``(host_id, runner_id, error)``.
         The server wires this to mark the runner's session(s) failed
         and push the cause to the open view — the only failure signal
         for a runner that crashed before connecting its tunnel (so the
-        runner-tunnel ``on_runner_disconnect`` path never fires).
+        runner-tunnel ``on_runner_disconnect`` path never fires). When
+        set, it owns the ``runner_exited`` event (see
+        :func:`log_runner_exited`) so rows carry the bound session.
     :param on_host_disconnect: Optional async callback fired when
         a host's tunnel closes. Receives the ``host_id``.
     :param on_host_update: Optional async callback fired when a connected
@@ -529,7 +572,7 @@ async def _receive_loop(
     host_store: HostStore,
     host_registry: HostRegistry,
     runner_exit_reports: RunnerExitReports | None,
-    on_runner_exited: Callable[[str, str], Awaitable[None]] | None,
+    on_runner_exited: RunnerExitedCallback | None,
     on_host_update: Callable[[str, str | None], Awaitable[None]] | None,
 ) -> None:
     """Receive host frames and route results to pending futures.
@@ -544,8 +587,9 @@ async def _receive_loop(
         persisted).
     :param runner_exit_reports: Store for ``host.runner_exited``
         reports; ``None`` drops them.
-    :param on_runner_exited: Callback fired with ``(runner_id, error)``
-        when a ``host.runner_exited`` frame arrives; ``None`` skips it.
+    :param on_runner_exited: Callback fired with ``(host_id, runner_id,
+        error)`` when a ``host.runner_exited`` frame arrives; ``None``
+        logs the session-less ``runner_exited`` event here instead.
     :param on_host_update: Callback fired after readiness changes persist;
         ``None`` skips it.
     """
@@ -643,32 +687,20 @@ async def _receive_loop(
             # One-way report: a runner this host spawned died unexpectedly. Stash
             # the cause so the runner status endpoint can answer "offline, and
             # here is why" to the client still waiting for the runner to connect.
-            # A runner-process fault; the free-text cause is unparsed, so the
-            # lifecycle stage is unknown.
-            _logger.warning(
-                "Host %s reported runner %s exited: %s",
-                host_id,
-                frame.runner_id,
-                frame.error,
-                extra=debug_event(
-                    "runner_exited",
-                    host_id=host_id,
-                    runner_id=frame.runner_id,
-                    error_category=ErrorCategory.RUNNER.value,
-                    error_impact=ErrorImpact.BLOCKING.value,
-                    # The runner may have died before or during a turn; the host
-                    # can't tell from the exit alone.
-                    error_phase=ErrorPhase.UNKNOWN.value,
-                ),
-            )
             if runner_exit_reports is not None:
                 runner_exit_reports.record(frame.runner_id, frame.error, conn.owner)
-            if on_runner_exited is not None:
-                # Mark the runner's session(s) failed and push the cause
-                # to the open view. A runner that crashed before
-                # connecting its tunnel has no runner-tunnel disconnect
-                # event, so this report is the only failure signal.
-                await on_runner_exited(frame.runner_id, frame.error)
+            if on_runner_exited is None:
+                log_runner_exited(host_id, frame.runner_id, frame.error)
+            else:
+                # Only failure signal for a runner that crashed before connecting
+                # its tunnel; the callback resolves bound sessions and logs the event.
+                try:
+                    await on_runner_exited(host_id, frame.runner_id, frame.error)
+                except Exception:
+                    # One failed report must not tear down the tunnel for every runner.
+                    _logger.exception(
+                        "on_runner_exited callback failed for %s/%s", host_id, frame.runner_id
+                    )
             continue
 
         if isinstance(frame, HostRunnerStatusResultFrame):

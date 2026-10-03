@@ -5145,15 +5145,15 @@
         ]
       },
       "SessionAgentChangedEvent": {
-        "description": "Bound-agent change on a live session.\n\nEmitted by the switch-agent route after the session's agent binding\nis rewritten in place. Connected clients re-derive their cached\nsession state (harness presentation labels, bound agent id/name)\nfrom a fresh snapshot \u2014 the chat UI's native-vs-SDK message\nlifecycle depends on those labels, so a stale cache drops the first\npost-switch message (it reappears only when the transcript\nround-trip lands).",
+        "description": "The session's bound agent changed.\n\nEmitted after a session's MCP servers are edited (the agent's bundle\nis rewritten). Connected clients re-derive their cached session state\n(bound agent, harness presentation labels) from a fresh snapshot.",
         "properties": {
           "agent_id": {
-            "description": "The session-scoped clone now bound to the session, e.g. `\"ag_abc123\"`.",
+            "description": "The agent bound to the session, e.g. `\"ag_abc123\"`.",
             "title": "Agent Id",
             "type": "string"
           },
           "agent_name": {
-            "description": "Display name of the agent the session now runs, e.g. `\"claude-native-ui\"`. Deliberately the clean target-agent name \u2014 not the clone row's `\"\u2026 (switch ag_\u2026)\"` disambiguation name \u2014 because clients render it verbatim. Category: **transient** (SSE-only). The switch is persisted on the conversation row, so on reconnect clients read the new binding from the session snapshot rather than from a replayed event.",
+            "description": "Display name of that agent, e.g. `\"claude-native-ui\"`. Category: **transient** (SSE-only). The change is persisted, so on reconnect clients read it from the session snapshot.",
             "title": "Agent Name",
             "type": "string"
           },
@@ -6902,7 +6902,7 @@
                 "type": "null"
               }
             ],
-            "description": "Error details from the most recently failed task. Only present when `status == \"failed\"` and the task stored an error. Lets clients display the failure reason on historical load without relying on the transient `response.error` SSE event (which may have been emitted before the web client subscribed). Format mirrors the `RetryErrorDetail` SSE shape: `{\"code\": \"executor_error\", \"message\": \"...\"}`. `None` in all other cases.",
+            "description": "Error details from the most recently failed task. Only present when `status == \"failed\"` and the task stored an error. Lets clients display the failure reason on historical load without relying on the transient `response.error` SSE event (which may have been emitted before the web client subscribed). Format mirrors the `RetryErrorDetail` SSE shape: `{\"code\": \"executor_error\", \"message\": \"...\"}`. A `runner_rejected_event` failure also carries `item_id`, the persisted item the runner refused, so a web client whose POST answer was lost can match the refusal to its own send. `None` in all other cases.",
             "title": "Last Task Error"
           },
           "last_total_tokens": {
@@ -7453,22 +7453,6 @@
           "target_conversation_id"
         ],
         "title": "SessionSupersededEvent",
-        "type": "object"
-      },
-      "SessionSwitchAgentRequest": {
-        "additionalProperties": false,
-        "description": "Request body for `POST /v1/sessions/{id}/switch-agent`.\n\nRebinds an existing session in place to a different agent/harness,\nkeeping the same session (transcript, comments, files, workspace).\nUnlike fork, no new session is created.",
-        "properties": {
-          "agent_id": {
-            "description": "Built-in agent to switch the session to, e.g. `\"ag_builtin_codex\"`. Must be a built-in agent (one listed by `GET /v1/agents`) and different from the session's current agent.",
-            "title": "Agent Id",
-            "type": "string"
-          }
-        },
-        "required": [
-          "agent_id"
-        ],
-        "title": "SessionSwitchAgentRequest",
         "type": "object"
       },
       "SessionTerminalActivityEvent": {
@@ -15288,60 +15272,6 @@
           }
         },
         "summary": "Stream Session",
-        "tags": [
-          "sessions"
-        ]
-      }
-    },
-    "/v1/sessions/{session_id}/switch-agent": {
-      "post": {
-        "description": "Switch an existing session in place to a different agent/harness.\n\nUnlike fork, this keeps the SAME session \u2014 transcript, comments,\nfiles, host, and workspace are untouched; only the agent/harness\nchanges. The current session-scoped agent is replaced by a clone\nof the target built-in, model settings carry over only within the\nsame provider family (a model id is provider-bound), the native\nruntime session id is cleared, and the harness-presentation labels\nare recomputed for the target. The next turn cold-starts the new\nharness (rebuilding the native transcript from this session's own\nitems for a same-family native target). Only built-in agents are\nbindable, and only while the session is idle.\n\n**Parameters**\n\n- `body` \u2014 The validated `SessionSwitchAgentRequest`.\n\n**Returns:** A `SessionResponse` describing the session after the switch (status `\"idle\"`).\n\n**Raises**\n\n- `OmnigentError` \u2014 404 if the session or target agent does not exist or the target is not a bindable built-in; 403 if the caller lacks edit access; 400 if the session is a sub-agent, has no agent binding, or the target bundle can't be loaded; 409 if a turn is currently running.",
-        "operationId": "switch_session_agent_v1_sessions__session_id__switch_agent_post",
-        "parameters": [
-          {
-            "description": "Session/conversation identifier to switch, e.g. `\"conv_abc123\"`.",
-            "in": "path",
-            "name": "session_id",
-            "required": true,
-            "schema": {
-              "title": "Session Id",
-              "type": "string"
-            }
-          }
-        ],
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/SessionSwitchAgentRequest"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/SessionResponse"
-                }
-              }
-            },
-            "description": "Successful Response"
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            },
-            "description": "Validation Error"
-          }
-        },
-        "summary": "Switch Session Agent",
         "tags": [
           "sessions"
         ]

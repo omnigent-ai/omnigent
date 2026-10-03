@@ -175,6 +175,59 @@ async def test_read_file_content(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("absolute_path", [False, True], ids=["workspace", "host"])
+async def test_read_file_content_has_no_agent_line_cap(
+    client: httpx.AsyncClient,
+    workspace: Path,
+    absolute_path: bool,
+) -> None:
+    """The file viewer receives every line of a file below the byte cap."""
+    content = "".join(f"# line {i}: café\n" for i in range(1, 3_001))
+    file_path = (workspace.parent if absolute_path else workspace) / "large.py"
+    file_path.write_text(content, encoding="utf-8")
+    request_path = str(file_path) if absolute_path else file_path.name
+
+    resp = await client.get(
+        f"/v1/sessions/conv_test/resources/environments"
+        f"/{DEFAULT_ENVIRONMENT_ID}/filesystem/{request_path}"
+    )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["truncated"] is False
+    assert body["encoding"] == "utf-8"
+    assert body["content"] == content
+    assert body["bytes"] == len(content.encode("utf-8"))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("absolute_path", [False, True], ids=["workspace", "host"])
+async def test_read_file_content_retains_byte_cap(
+    client: httpx.AsyncClient,
+    workspace: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    absolute_path: bool,
+) -> None:
+    """Viewer reads still flag oversized text and preserve UTF-8 boundaries."""
+    monkeypatch.setattr("omnigent.runner.environment_filesystem._MAX_READ_BYTES", 4)
+    file_path = (workspace.parent if absolute_path else workspace) / "large.txt"
+    file_path.write_text("abcé\nlast line\n", encoding="utf-8")
+    request_path = str(file_path) if absolute_path else file_path.name
+
+    resp = await client.get(
+        f"/v1/sessions/conv_test/resources/environments"
+        f"/{DEFAULT_ENVIRONMENT_ID}/filesystem/{request_path}"
+    )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["truncated"] is True
+    assert body["encoding"] == "utf-8"
+    assert body["content"] == "abc"
+    assert body["bytes"] == 3
+
+
+@pytest.mark.asyncio
 async def test_read_binary_file_content(
     client: httpx.AsyncClient,
 ) -> None:

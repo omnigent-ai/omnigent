@@ -88,9 +88,11 @@ def _resolve_profile_paths(config: dict[str, Any], source_home: Path) -> None:
         resolve(config, path.split("."))
 
 
-def canonical_codex_launch_args(args: Sequence[str]) -> list[str]:
-    """Expand aliases and attached short values without interpreting option values."""
-    value_flags = {
+# Codex options that consume the following token as their value, so a reserved
+# token appearing as one of those values (e.g. ``--model app-server``) is NOT a
+# subcommand/flag and must not be rejected.
+_CODEX_VALUE_FLAGS = frozenset(
+    {
         "-c",
         "--config",
         "-s",
@@ -110,6 +112,51 @@ def canonical_codex_launch_args(args: Sequence[str]) -> list[str]:
         "--enable",
         "--disable",
     }
+)
+
+# App-server/transport tokens the runner owns: it starts the Codex app-server
+# (``codex app-server --listen``) and appends the TUI ``--remote`` attach
+# itself. A caller that passes any of these as pass-through args produces an
+# incoherent argv — e.g. ``codex app-server … --remote`` (app-server rejects
+# ``--remote`` on every codex version, clap exits 2) — so the thread never
+# starts. ``--remote-control`` is app-server-only and equally invalid on the TUI.
+_RESERVED_CODEX_TRANSPORT_TOKENS = frozenset(
+    {"app-server", "--listen", "--remote", "--remote-control"}
+)
+
+
+def reject_reserved_codex_transport_args(args: Sequence[str]) -> None:
+    """Reject pass-through Codex args that select or attach the runner-owned transport.
+
+    Scoped to Codex (the runner owns ``app-server``/``--listen``/``--remote``);
+    option *values* are never flagged (``--model app-server`` passes), and tokens
+    after a ``--`` prompt separator are left alone.
+
+    :param args: Caller pass-through Codex CLI args (``terminal_launch_args``).
+    :raises ValueError: when a reserved transport token appears as a standalone
+        flag or subcommand.
+    """
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        if arg == "--":
+            break
+        if arg.split("=", 1)[0] in _CODEX_VALUE_FLAGS:
+            # Skip the option and its value (an attached ``=`` form carries its own).
+            index += 1 if "=" in arg else 2
+            continue
+        if arg in _RESERVED_CODEX_TRANSPORT_TOKENS:
+            raise ValueError(
+                f"terminal_launch_args may not contain the runner-owned Codex transport "
+                f"token {arg!r}: the runner starts the app-server and appends the TUI "
+                "attach itself"
+            )
+        index += 1
+
+
+def canonical_codex_launch_args(args: Sequence[str]) -> list[str]:
+    """Expand aliases and attached short values without interpreting option values."""
+    value_flags = _CODEX_VALUE_FLAGS
     canonical: list[str] = []
     index = 0
     while index < len(args):

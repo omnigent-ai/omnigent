@@ -25,6 +25,9 @@ implements them separately, so a fix for one harness does not reach the others.
 - `chat-render`: the harness's output renders in chat like other harnesses.
 - `cleanup`: stopping, cancelling, or idling a session reaps the harness's
   helper processes and per-session files.
+- `disconnect`: startup waits and active operations settle when their native
+  connection ends; reconnect can receive fresh events. Distinguish a native
+  CLI disconnect, a runner going offline, and a browser stream reconnect.
 
 ## How to get to it (user POV)
 
@@ -34,6 +37,11 @@ view appear in the session.
 
 **CLI:** run `omnigent <name>` from the matrix below; add `--resume` with or
 without a session ID to resume.
+
+**Interrupted session:** observe startup before the first message, a running
+turn, and Stop separately. For an offline host use the reconnect paths in
+[sessions](./sessions.md); a detached terminal has its own paths in
+[terminals](./terminals.md).
 
 **Matrix.** "Mock" means the verification instance can drive the harness with
 the mock model; the others need their real CLI and vendor credentials. Test
@@ -85,6 +93,26 @@ Cross-harness journeys:
 - **`cleanup`:** no single cross-harness test. For each harness in scope, start
   a session, stop it (and separately cancel one during startup), then confirm
   no helper process from that session is still running.
+- **`disconnect`, Codex transport (plain `uv run pytest`, no vendor CLI):**
+  `tests/e2e/test_codex_native_event_stream_disconnect_e2e.py` covers waiting
+  consumers, buffered events, explicit close, and startup discovery without a
+  deadline. `tests/e2e/test_codex_native_app_server_disconnect_e2e.py` covers
+  pending requests, cancellation, and a reply arriving before disconnect.
+  Both use real loopback WebSockets with a controlled peer.
+  `tests/harnesses/codex_native/test_codex_native_app_server_event_stream.py` adds multiple waiting
+  consumers and reconnecting the same client to receive fresh events.
+- **`disconnect`, Codex startup consumers (component tests):**
+  `tests/harnesses/codex_native/session/test_subscription.py::test_wait_for_thread_started_fails_when_stream_ends`
+  checks the CLI error with a fake client;
+  `tests/runner/test_codex_startup_telemetry.py::test_startup_failure_is_visible_at_error_and_belongs_to_child`
+  checks host-started failure reporting with stubbed discovery. Run these with
+  plain `uv run pytest`. The ongoing chat forwarder also consumes native events;
+  these startup tests do not prove it stops or recovers after a live disconnect.
+- **`disconnect`, browser stream (own environment):**
+  `tests/e2e_ui/chat/test_stream_disconnect_stage_matrix.py::test_numbered_output_recovers_across_stream_stages`
+  checks output recovery across a real server restart and injected stream-open
+  failures. It supplies native-style events; it does not run a vendor CLI.
+  Run with plain `uv run pytest` and the browser prerequisites in the skill.
 
 ## Gotchas
 
@@ -100,5 +128,10 @@ Cross-harness journeys:
   Omnigent's managed setup; the managed and unmanaged paths behave differently.
 - The mock instance proves Omnigent's integration with Claude and Codex, not a
   live vendor model. A passing mock run is not evidence for another harness.
+- A transport check is not a full reconnect journey. To verify that claim,
+  use an isolated configured harness, interrupt only its test connection, then
+  resume and send another turn; check both terminal and chat for missing or
+  duplicate output. Record an unavailable live check explicitly. Codex checks
+  above do not cover other harnesses' transports or runner-tunnel recovery.
 - The harness registry declares which harness supports effort, approvals, and
   resume. Check it before assuming a column applies.

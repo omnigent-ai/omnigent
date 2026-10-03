@@ -323,6 +323,7 @@ from omnigent.server.routes._sessions.helpers import (
     _SessionEventDispatchResult,
     _signal_terminal_resolved_harness_elicitation,
     _spec_harness,
+    _stable_id_reuse_is_exact_retry,
     _stop_session_via_runner,
     _usage_by_model_for_display,
     _validate_session_workspace,
@@ -3287,6 +3288,11 @@ async def _heal_subagent_runner_binding_via_parent(
         return None
 
     if live_runner_id != child_conv.runner_id:
+        from omnigent.harnesses.codex_native.side_chat import is_side_chat_child
+
+        if is_side_chat_child(child_conv.labels):
+            # The side chat's ephemeral fork died with its runner; it can't move.
+            return None
         # Heal the divergence so this child's row matches the live runner: the
         # next forward resolves directly and a future ``_on_runner_connect``
         # (which rebinds by matching runner_id) can recover it.
@@ -5918,12 +5924,29 @@ async def _forward_event_to_runner(
     import uuid
 
     turn_id = f"turn_{uuid.uuid4().hex}"
-    item = _build_new_item(body, turn_id, created_by=created_by)
+    # A web send is persisted under its client stable id (see _web_send_stable_id).
+    item = _build_new_item(body, turn_id, created_by=created_by, adopt_stable_id=True)
     persisted_items = await asyncio.to_thread(
         conversation_store.append,
         session_id,
         [item],
     )
+    if (
+        item.stable_id is not None
+        and persisted_items[0].deduplicated
+        and not _stable_id_reuse_is_exact_retry(persisted_items[0], item)
+    ):
+        # A persisted retry may still need forwarding if the first attempt
+        # failed before reaching the runner. A different body under the id
+        # (a pre-adoption web bundle resending an edited restored draft) is a
+        # new message: give it a store-assigned id so it runs under the item
+        # that holds it.
+        item = _build_new_item(body, turn_id, created_by=created_by)
+        persisted_items = await asyncio.to_thread(
+            conversation_store.append,
+            session_id,
+            [item],
+        )
     await _seed_missing_title_from_user_message(
         conv,
         item,
@@ -6382,8 +6405,10 @@ async def _forward_event_to_runner(
             _reject_error = ErrorDetail(code="runner_rejected_event", message=_reject_detail)
             # Persist before publishing: a client that reloads on the ``failed``
             # edge must not race a snapshot that has no ``last_task_error`` yet.
+            # The item id lets a client whose 503 was lost match the refusal to
+            # its own send instead of to any message the snapshot holds.
             await _persist_session_status_error_labels(
-                session_id, _reject_error, conversation_store
+                session_id, _reject_error, conversation_store, item_id=persisted_items[0].id
             )
             _publish_status(
                 session_id,
@@ -7771,6 +7796,8 @@ async def _relay_runner_stream_once(
                             # call (the segment persists here, ahead of the
                             # terminal-flush evaluation).
                             evaluate_response_phase=_boundary_deny is None,
+                            # Progress text precedes more tool calls.
+                            turn_final=False,
                         )
                         # A failed append leaves text_acc for retry — re-arm
                         # the marker so the retry persists the sentinel.
@@ -7827,10 +7854,10 @@ async def _relay_runner_stream_once(
                             current_response_id,
                             _final_model,
                             deny_reason=_deny_reason,
-                            # Terminal flush is the only place the runner
-                            # topology can evaluate the spec's RESPONSE-phase
-                            # output policies over the final assistant text.
+                            # Gate any remaining text before persistence.
                             evaluate_response_phase=_deny_reason is None,
+                            # Only successful completion triggers final-response actions.
+                            turn_final=evt_type == "response.completed",
                         )
                         # A failed append leaves text_acc intact for a retry
                         # at a later flush — re-arm the marker so the retry
@@ -11165,9 +11192,6 @@ async def _fetch_model_options(
     return cached or []
 
 
-_SIDE_CHAT_NICKNAME = "Side chat"
-
-
 async def _codex_side_chat_fork_sealed(conv: Conversation, conv_store: ConversationStore) -> bool:
     """
     Whether a codex ``/side`` child's ephemeral fork is no longer reachable.
@@ -11180,20 +11204,44 @@ async def _codex_side_chat_fork_sealed(conv: Conversation, conv_store: Conversat
     the same live runner does not diverge, so a still-live side chat stays
     sendable.
     """
-    from omnigent.server.routes._sessions.common import (
-        _CODEX_NATIVE_SUBAGENT_NICKNAME_LABEL_KEY,
-    )
+    from omnigent.harnesses.codex_native.side_chat import is_side_chat_child
 
     if (
         not _is_codex_native_subagent(conv)
         or conv.parent_conversation_id is None
         or not conv.runner_id
-        or (conv.labels or {}).get(_CODEX_NATIVE_SUBAGENT_NICKNAME_LABEL_KEY)
-        != _SIDE_CHAT_NICKNAME
+        or not is_side_chat_child(conv.labels)
     ):
         return False
     parent = await asyncio.to_thread(conv_store.get_conversation, conv.parent_conversation_id)
     return parent is not None and bool(parent.runner_id) and parent.runner_id != conv.runner_id
+
+
+async def _codex_side_chat_fork_lost(
+    conv: Conversation,
+    conv_store: ConversationStore,
+    runner_router: RunnerRouter | None,
+    host_registry: HostRegistry | None,
+) -> bool:
+    """Whether a side chat's ephemeral fork is provably gone with its runner."""
+    if await _codex_side_chat_fork_sealed(conv, conv_store):
+        return True
+    from omnigent.harnesses.codex_native.side_chat import is_side_chat_child
+    from omnigent.runner.routing import routing_host_id
+
+    if not _is_codex_native_subagent(conv) or not conv.runner_id or host_registry is None:
+        return False
+    if not is_side_chat_child(conv.labels) or (
+        runner_router is not None and runner_router.runner_is_online(conv.runner_id)
+    ):
+        return False
+    host_id = await asyncio.to_thread(routing_host_id, conv, conv_store)
+    host_conn = host_registry.get(host_id) if host_id is not None else None
+    if host_conn is None:
+        return False
+    # The host owns the process: "unknown" means it is not running there either.
+    status = await _query_host_runner_status(host_conn, host_registry, conv.runner_id)
+    return status in {"dead", "unknown"}
 
 
 def _resolve_harness_impl_is_acp(conv: Conversation, agent_store: AgentStore | None) -> bool:

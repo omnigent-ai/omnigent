@@ -329,6 +329,12 @@ function splitPath(path: string): { dir: string; name: string } {
 type DiffOptions = React.ComponentProps<typeof FileDiff>["options"];
 
 /**
+ * Files with more unified diff lines than this wait for "Show diff": FileDiff
+ * tokenizes on the main thread (disableWorkerPool), so a huge file freezes the app.
+ */
+export const LARGE_DIFF_THRESHOLD = 2000;
+
+/**
  * One file's section in the stacked diff: a sticky grey header (chevron + status
  * + path + diffstat) and the file's rendered diff. Clicking the header toggles
  * the diff open/closed. The diff mounts lazily once the section nears the
@@ -353,6 +359,7 @@ function GithubFileSection({
 }) {
   const ref = useRef<HTMLDivElement>(null);
   const [seen, setSeen] = useState(false);
+  const [showLargeDiff, setShowLargeDiff] = useState(false);
 
   useEffect(() => {
     registerRef(file.path, ref.current);
@@ -418,6 +425,17 @@ function GithubFileSection({
         <div className="flex items-center justify-center gap-2 p-6 text-ui text-muted-foreground">
           <Loader2Icon className="size-4 animate-spin" />
           Loading diff…
+        </div>
+      ) : fileDiff && fileDiff.unifiedLineCount > LARGE_DIFF_THRESHOLD && !showLargeDiff ? (
+        <div className="flex items-center gap-3 p-4 text-ui text-muted-foreground">
+          Large diff — {fileDiff.unifiedLineCount.toLocaleString()} lines
+          <button
+            type="button"
+            className="text-foreground underline-offset-2 hover:underline"
+            onClick={() => setShowLargeDiff(true)}
+          >
+            Show diff
+          </button>
         </div>
       ) : fileDiff ? (
         <FileDiff fileDiff={fileDiff} options={options} disableWorkerPool />

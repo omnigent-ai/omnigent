@@ -27,6 +27,17 @@
  */
 export type SidebarDragPhase = "begin" | "move" | "open" | "close";
 
+export interface BrowserRecentSessionInput {
+  type: "keydown" | "keyup";
+  key: "Tab" | "Control" | "Escape";
+  code: string;
+  ctrlKey: boolean;
+  shiftKey: boolean;
+  altKey: boolean;
+  metaKey: boolean;
+  repeat: boolean;
+}
+
 /**
  * Extra hints for the badge on shells that render it as a tappable OS
  * notification. Android has no numeric icon badge, so the count is surfaced as
@@ -210,6 +221,16 @@ interface ElectronDesktopApi extends NativeShellApi {
    * predating the feature — callers must optional-chain.
    */
   browserSetSuppressed?: (suppressed: boolean) => Promise<{ ok: boolean; error?: string }>;
+  /** Forward the recent-session gesture from a focused embedded Browser page. */
+  onBrowserRecentSessionInput?: (
+    callback: (input: BrowserRecentSessionInput) => void,
+  ) => () => void;
+  /** Enable native input interception only while this renderer supports it. */
+  browserSetRecentSessionSwitchSupported?: (
+    supported: boolean,
+  ) => Promise<{ ok: boolean; error?: string }>;
+  /** Clear native key interception when the recent-session gesture was declined. */
+  browserCancelRecentSessionSwitch?: () => Promise<{ ok: boolean; error?: string }>;
 }
 
 /** A lifecycle action for the host daemon. */
@@ -472,6 +493,42 @@ export function updateBridge(): ElectronUpdateBridge | undefined {
  */
 export function supportsBrowser(): boolean {
   return typeof electronApi()?.browserOpenOrNavigate === "function";
+}
+
+/** Subscribe to recent-session key events forwarded from an embedded Browser page. */
+export function onBrowserRecentSessionInput(
+  callback: (input: BrowserRecentSessionInput) => void,
+): () => void {
+  const electron = electronApi();
+  if (!electron?.onBrowserRecentSessionInput) return () => {};
+  try {
+    return electron.onBrowserRecentSessionInput(callback);
+  } catch (err) {
+    console.warn("[nativeBridge] browser recent-session input subscription failed:", err);
+    return () => {};
+  }
+}
+
+/** Advertise whether this renderer can handle embedded-page Ctrl+Tab events. */
+export async function setBrowserRecentSessionSwitchSupported(supported: boolean): Promise<void> {
+  const electron = electronApi();
+  if (!electron?.browserSetRecentSessionSwitchSupported) return;
+  try {
+    await electron.browserSetRecentSessionSwitchSupported(supported);
+  } catch (err) {
+    console.warn("[nativeBridge] browser recent-session support update failed:", err);
+  }
+}
+
+/** Tell Electron that a forwarded Ctrl+Tab did not open the session switcher. */
+export async function cancelBrowserRecentSessionSwitch(): Promise<void> {
+  const electron = electronApi();
+  if (!electron?.browserCancelRecentSessionSwitch) return;
+  try {
+    await electron.browserCancelRecentSessionSwitch();
+  } catch (err) {
+    console.warn("[nativeBridge] browser recent-session cancellation failed:", err);
+  }
 }
 
 /**

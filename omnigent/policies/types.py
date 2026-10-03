@@ -204,6 +204,13 @@ class EvaluationContext:
     :param conversation_id: The conversation this evaluation belongs
         to. Surfaced as ``event["context"]["conversation_id"]``.
         ``None`` only in contexts with no engine.
+    :param turn_final: On ``RESPONSE``, the runner relay sets ``True`` for
+        the final text segment of a successful turn and ``False`` for
+        intermediate segments or failed, cancelled, and incomplete turns.
+        ``None`` on other phases and paths that don't distinguish; response
+        policies should skip only explicit ``False`` to preserve those
+        callers. The relay skips empty and whitespace-only segments.
+        Surfaced as ``event["context"]["turn_final"]``.
     """
 
     phase: Phase
@@ -220,6 +227,7 @@ class EvaluationContext:
     labels: dict[str, str] | None = None
     llm_client: PolicyLLMClient | None = None
     conversation_id: str | None = None
+    turn_final: bool | None = None
 
 
 @dataclass(frozen=True)

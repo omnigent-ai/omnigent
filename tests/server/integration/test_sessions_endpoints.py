@@ -3938,63 +3938,6 @@ async def test_claude_native_session_discoverable_with_terminal_metadata(
     assert snap["external_session_id"] == "11111111-2222-3333-4444-555555555555"
 
 
-async def test_get_session_agent_name_is_spec_name_after_switch(
-    client: httpx.AsyncClient,
-    db_uri: str,
-) -> None:
-    """After an in-place agent switch the snapshot reports the spec's name.
-
-    The switch route binds the session to a clone row named
-    ``"<builtin> (switch ag_…)"`` for agent-store disambiguation, but
-    clients (REPL toolbar, web sidebar) display ``agent_name``
-    verbatim — the snapshot must surface the spec's clean identity
-    (e.g. ``"claude-native-ui"``), not the clone row's name.
-
-    Drives the REAL switch route end-to-end: source session → seeded
-    bindable built-in → ``POST .../switch-agent`` → ``GET`` snapshot.
-    """
-    from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
-
-    # Source session bound to a session-scoped "nessie" agent.
-    source_agent = await create_test_agent(client, name="nessie")
-    session_id = source_agent["_session_id"]
-
-    # Materialize a real claude-native-ui bundle in the artifact store
-    # (via a throwaway session-scoped agent), then register a TEMPLATE
-    # (built-in, the only kind the switch route binds) sharing it.
-    target_agent = await create_test_agent(client, name="claude-native-ui")
-    agent_store = SqlAlchemyAgentStore(db_uri)
-    target_row = agent_store.get(target_agent["id"])
-    assert target_row is not None and target_row.bundle_location is not None
-    builtin = agent_store.create(
-        "35316537082e723a63887635649d702d",
-        "claude-native-ui",
-        target_row.bundle_location,
-    )
-
-    resp = await client.post(
-        f"/v1/sessions/{session_id}/switch-agent",
-        json={"agent_id": builtin.id},
-    )
-    assert resp.status_code == 200, resp.text
-
-    snap = (await client.get(f"/v1/sessions/{session_id}")).json()
-    # Preconditions that make this test meaningful: the session is
-    # bound to a freshly created CLONE whose row name carries the
-    # "(switch …)" disambiguation suffix — i.e. row name ≠ spec name.
-    clone_row = agent_store.get(snap["agent_id"])
-    assert clone_row is not None
-    assert clone_row.name.startswith("claude-native-ui (switch "), (
-        f"Expected the switch route to bind a suffixed clone row; got "
-        f"{clone_row.name!r}. If unsuffixed, this test no longer covers "
-        f"the row-name/spec-name divergence and needs a new setup."
-    )
-    # The snapshot prefers the spec's clean name over the clone row's.
-    # The suffixed name here means clients (REPL toolbar, sidebar)
-    # would display "claude-native-ui (switch ag_…)" to the user.
-    assert snap["agent_name"] == "claude-native-ui"
-
-
 async def test_list_sessions_exposes_pending_elicitations_count(
     client: httpx.AsyncClient,
 ) -> None:

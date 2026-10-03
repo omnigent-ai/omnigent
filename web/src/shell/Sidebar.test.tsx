@@ -14,6 +14,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { useEffect } from "react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
+import { ALT_KEY, ARIA_MOD_KEY, MOD_KEY } from "@/components/KeyboardShortcut";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { Conversation } from "@/hooks/useConversations";
 import {
@@ -1122,6 +1123,28 @@ describe("Sidebar session list", () => {
     );
     expect(scheduled.compareDocumentPosition(inbox) & Node.DOCUMENT_POSITION_FOLLOWING).toBe(
       Node.DOCUMENT_POSITION_FOLLOWING,
+    );
+  });
+
+  it("reveals the new-session shortcut within the row on hover or keyboard focus", () => {
+    mockConversations(THREE_TYPE_CONVERSATIONS);
+    renderSidebar();
+
+    const newSession = screen.getByTestId("new-chat-button");
+    const shortcut = newSession.querySelector<HTMLElement>('[data-slot="shortcut-keys"]');
+
+    expect(newSession).toHaveAttribute("aria-keyshortcuts", `${ARIA_MOD_KEY}+Alt+N`);
+    expect(
+      Array.from(newSession.querySelectorAll('[data-slot="kbd"]'), (key) => key.textContent),
+    ).toEqual([MOD_KEY, ALT_KEY, "N"]);
+    expect(shortcut).toHaveClass(
+      "absolute",
+      "top-1/2",
+      "right-2",
+      "-translate-y-1/2",
+      "opacity-0",
+      "group-focus-visible/new-session:opacity-100",
+      "[@media((hover:hover)_and_(pointer:fine))]:group-hover/new-session:opacity-100",
     );
   });
 

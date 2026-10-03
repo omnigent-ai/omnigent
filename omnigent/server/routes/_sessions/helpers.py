@@ -187,6 +187,7 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _LAST_TASK_ERROR_AGENT_NAME_LABEL_KEY,
     _LAST_TASK_ERROR_CAUSE_LABEL_KEY,
     _LAST_TASK_ERROR_CODE_LABEL_KEY,
+    _LAST_TASK_ERROR_ITEM_ID_LABEL_KEY,
     _LAST_TASK_ERROR_MESSAGE_LABEL_KEY,
     _LAST_TASK_ERROR_REMEDIATION_LABEL_KEY,
     _LAST_TASK_ERROR_TITLE_LABEL_KEY,
@@ -4990,6 +4991,7 @@ async def _persist_session_status_error_labels(
     conversation_store: ConversationStore,
     *,
     agent_name: str | None = None,
+    item_id: str | None = None,
 ) -> None:
     """
     Persist or clear the reload-visible failure detail for a session status.
@@ -5005,6 +5007,8 @@ async def _persist_session_status_error_labels(
         ``None`` to clear stale error labels on subsequent activity.
     :param conversation_store: Store used to upsert labels.
     :param agent_name: Agent responsible for this failure, captured before a rebind.
+    :param item_id: Persisted item a ``runner_rejected_event`` failure refers to, so
+        a client whose POST answer was lost can match the refusal to its own send.
     """
     # Structured fields are optional (present only when the runner classified
     # the failure). Always write all keys — empty when absent — because the
@@ -5018,6 +5022,7 @@ async def _persist_session_status_error_labels(
             _LAST_TASK_ERROR_TITLE_LABEL_KEY: _truncate_label(error.title or ""),
             _LAST_TASK_ERROR_CAUSE_LABEL_KEY: _truncate_label(error.cause or ""),
             _LAST_TASK_ERROR_REMEDIATION_LABEL_KEY: _truncate_label(error.remediation or ""),
+            _LAST_TASK_ERROR_ITEM_ID_LABEL_KEY: _truncate_label(item_id or ""),
         }
         if error is not None
         else {
@@ -5027,6 +5032,7 @@ async def _persist_session_status_error_labels(
             _LAST_TASK_ERROR_TITLE_LABEL_KEY: "",
             _LAST_TASK_ERROR_CAUSE_LABEL_KEY: "",
             _LAST_TASK_ERROR_REMEDIATION_LABEL_KEY: "",
+            _LAST_TASK_ERROR_ITEM_ID_LABEL_KEY: "",
         }
     )
     try:
@@ -5049,8 +5055,9 @@ def _last_task_error_from_labels(labels: Mapping[str, str]) -> dict[str, str] | 
     become public ``last_task_error`` data for snapshots and child summaries.
 
     :param labels: Conversation labels, usually after closed-status projection.
-    :returns: ``{"code": "...", "message": "..."}``, or ``None`` when either
-        value is absent/cleared.
+    :returns: ``{"code": "...", "message": "..."}`` plus any recorded structured
+        field (``agent_name``, ``title``, ``cause``, ``remediation``, ``item_id``),
+        or ``None`` when either required value is absent/cleared.
     """
     raw_error_code = labels.get(_LAST_TASK_ERROR_CODE_LABEL_KEY)
     raw_error_message = labels.get(_LAST_TASK_ERROR_MESSAGE_LABEL_KEY)
@@ -5064,6 +5071,7 @@ def _last_task_error_from_labels(labels: Mapping[str, str]) -> dict[str, str] | 
             ("title", _LAST_TASK_ERROR_TITLE_LABEL_KEY),
             ("cause", _LAST_TASK_ERROR_CAUSE_LABEL_KEY),
             ("remediation", _LAST_TASK_ERROR_REMEDIATION_LABEL_KEY),
+            ("item_id", _LAST_TASK_ERROR_ITEM_ID_LABEL_KEY),
         ):
             value = labels.get(label)
             if value:
@@ -6314,86 +6322,6 @@ async def _proxy_get_session_resources_to_runner(
         ) from exc
 
 
-async def _reset_runner_resources_after_switch(*args: Any, **kwargs: Any) -> None:
-    """Call-time proxy so a facade patch of this symbol is honored here."""
-    from omnigent.server.routes import sessions as _facade
-
-    return await _facade._reset_runner_resources_after_switch(*args, **kwargs)
-
-
-async def _reset_runner_resources_after_switch_impl(session_id: str) -> None:
-    """Best-effort reset of the session's runner-side state after a switch.
-
-    Run as a fire-and-forget background task by the switch-agent route. Calls
-    the runner's dedicated ``POST /v1/sessions/{id}/reset-state`` endpoint,
-    which closes the cached primary OSEnv + terminals AND drops the
-    spec-derived session caches. Two reasons:
-
-    1. **Sandbox correctness.** The primary OSEnv (which backs the web-UI
-       filesystem / shell endpoints) is materialized once per session from the
-       *original* agent's spec and cached. Closing it AND invalidating the
-       spec/snapshot caches forces the next access to re-resolve and
-       re-materialize from the NEW agent's spec, so those endpoints run
-       under the switched-to agent's ``os_env``/sandbox — not the old one.
-       (Agent ``sys_os_*`` tool calls already re-derive os_env per call, and
-       native terminals re-evaluate the sandbox gate on respawn; this closes
-       the remaining stale path.)
-    2. **Terminal rebuild.** A lingering native terminal would otherwise shadow
-       the switch-back transcript rebuild (auto-create skips while one exists).
-
-    A dedicated endpoint (rather than ``DELETE /resources``) keeps the
-    session-deletion contract untouched — deletion never needs the
-    switch-specific cache reset.
-
-    A switch only runs while the session is idle, so closing the env + terminal
-    here is safe — unlike doing it inside the next turn's dispatch, which wedges
-    that turn. cwd is re-derived from the runner's bound workspace, so the
-    working directory / git worktree is preserved (only the sandbox changes;
-    a ``fork``/``start_in_scratch`` agent gets a fresh scratch copy). The
-    claude-native auto-create gate remains the switch-back safety net if this
-    call is lost (runner offline, races).
-
-    :param session_id: Session/conversation id just switched, e.g.
-        ``"conv_abc123"``.
-    :returns: None.
-    """
-    try:
-        runner_client = await _get_runner_client_for_resource_access(session_id)
-        if runner_client is None:
-            return
-        reset_resp = await runner_client.post(
-            f"/v1/sessions/{urllib.parse.quote(session_id, safe='')}/reset-state",
-            timeout=15.0,
-        )
-        # httpx only raises on transport errors — a 4xx/5xx reset response
-        # still returns. A non-2xx means the runner did NOT close the old
-        # env, so it must take the failure path below (suppressing the
-        # invalidation publish); HTTPStatusError is an httpx.HTTPError.
-        reset_resp.raise_for_status()
-    except (httpx.HTTPError, HTTPException, OmnigentError, RuntimeError):
-        # Best-effort: a runner hiccup must not break the (already-committed)
-        # switch. OmnigentError covers the session-not-runner-bound / runner-
-        # offline case raised by _get_runner_client_for_resource_access. The
-        # auto-create gate rebuilds on switch-back regardless. No
-        # changed-files event on this path either: the runner's env cache is
-        # still the OLD agent's, so a triggered refetch would re-serve it —
-        # and a lost runner rebuilds from the new spec on relaunch anyway.
-        _logger.warning(
-            "post-switch runner-resource reset failed for session=%s",
-            session_id,
-            exc_info=True,
-            extra={"session_id": session_id},
-        )
-        return
-    # The old agent's cached OSEnv is now closed, so a refetch triggered by
-    # this event re-materializes filesystem state from the NEW agent's spec.
-    # This is what flips the web Files tab when the switch crosses an
-    # os_env boundary (none→some shows it, some→none hides it) — the
-    # session.agent_changed event fires before the reset and so cannot
-    # carry a trustworthy availability signal.
-    _publish_changed_files_invalidated(session_id)
-
-
 def _native_coding_agent_for_session(conv: Conversation) -> NativeCodingAgent | None:
     """
     Resolve native terminal metadata for a session, by wrapper label OR harness.
@@ -7060,6 +6988,8 @@ def _build_new_item(
     body: SessionEventInput,
     response_id: str,
     created_by: str | None = None,
+    *,
+    adopt_stable_id: bool = False,
 ) -> NewConversationItem:
     """
     Construct a :class:`NewConversationItem` from a POSTed event.
@@ -7084,6 +7014,10 @@ def _build_new_item(
     :param created_by: Authenticated identity of the actor posting
         the event, recorded for per-message attribution. ``None`` in
         single-user mode.
+    :param adopt_stable_id: Persist a web user message under the
+        client-minted ``stable_id`` it carries (see
+        :func:`_web_send_stable_id`). Off by default so seeded and
+        replayed items keep store-assigned ids.
     :returns: A :class:`NewConversationItem` ready for delivery
         or persistence.
     :raises OmnigentError: When ``body.data`` does not satisfy the
@@ -7103,7 +7037,60 @@ def _build_new_item(
         response_id=response_id,
         data=data,
         created_by=created_by,
+        stable_id=_web_send_stable_id(body) if adopt_stable_id else None,
     )
+
+
+def _web_send_stable_id(body: SessionEventInput) -> str | None:
+    """
+    Return the client-minted stable id of a web user-message send, if usable.
+
+    Persisting the send under its 32-hex ``stable_id`` makes the append idempotent
+    on retry and lets the client recognize its own send coming back after a lost
+    acknowledgement. Same shape gate as the native pending-input path.
+
+    :param body: Validated event input.
+    :returns: The stable id for a user message carrying a well-formed one, else ``None``.
+    """
+    raw_stable_id = body.data.get("stable_id")
+    if (
+        body.type == "message"
+        and body.data.get("role") == "user"
+        and isinstance(raw_stable_id, str)
+        and re.fullmatch(r"[0-9a-f]{32}", raw_stable_id)
+    ):
+        return raw_stable_id
+    return None
+
+
+def _stable_id_reuse_is_exact_retry(
+    persisted: ConversationItem, item: NewConversationItem
+) -> bool:
+    """
+    Tell whether a send deduplicated by its stable id is a retry of that item.
+
+    The store answers a repeated ``stable_id`` with the persisted item instead of
+    inserting, which is right for the retry of a send whose acknowledgement was
+    lost. A different body from the same author is not an error: web bundles
+    from before the server adopted client ids resend an edited restored draft
+    under the original id, and must keep working while such tabs stay open. The
+    caller persists that body under a store-assigned id. Another author reusing
+    a visible id is refused so a prompt can never run under someone else's item.
+
+    :param persisted: The item the store returned, flagged ``deduplicated``.
+    :param item: The item built from the request being persisted.
+    :returns: ``True`` for a byte-identical retry, ``False`` for another body
+        from the same author.
+    :raises OmnigentError: ``CONFLICT`` when the author differs.
+    """
+    if persisted.created_by != item.created_by:
+        raise OmnigentError(
+            f"stable_id {item.stable_id!r} already names another author's item in this session",
+            code=ErrorCode.CONFLICT,
+        )
+    persisted_payload = persisted.data.model_dump(mode="json", by_alias=True)
+    request_payload = item.data.model_dump(mode="json", by_alias=True)
+    return persisted.type == item.type and persisted_payload == request_payload
 
 
 def _parse_skill_slash_command(body: SessionEventInput) -> tuple[str, str]:
@@ -7986,17 +7973,17 @@ async def _relay_response_policy_deny_reason(
     conversation_store: ConversationStore,
     session_id: str,
     text: str,
+    *,
+    turn_final: bool,
 ) -> str | None:
     """
     Evaluate *text* against the session's OUTPUT (RESPONSE) phase policies.
 
     Runner-relayed (scaffold) harnesses never POST the assistant message
     back through ``POST /v1/sessions/{id}/events``, so the
-    ``Phase.RESPONSE`` evaluator there is unreachable for them. The relay's
-    terminal text flush is their single persist point, so this evaluates the
-    same output policies over the final assistant text right before it
-    becomes durable — making a spec's ``response``-phase policy enforceable
-    in the runner topology.
+    ``Phase.RESPONSE`` evaluator there is unreachable for them. The relay
+    evaluates these policies at each nonempty text flush, including
+    tool-call boundaries, before the segment becomes durable.
 
     Fails OPEN (returns ``None``) on any evaluation error, matching the LLM
     phases' advisory default: a policy-engine hiccup must not destroy the
@@ -8005,6 +7992,9 @@ async def _relay_response_policy_deny_reason(
     :param conversation_store: Store for the conversation/labels lookup.
     :param session_id: Session/conversation identifier.
     :param text: The joined assistant text segment about to persist.
+    :param turn_final: Whether ``text`` ends a successfully completed turn.
+        Forwarded as ``event["context"]["turn_final"]`` so completion
+        policies can skip intermediate and unsuccessful-turn segments.
     :returns: The deny reason when an output policy DENYs, else ``None``.
     """
     from omnigent.runtime._globals import _agent_store
@@ -8043,6 +8033,7 @@ async def _relay_response_policy_deny_reason(
             _agent_store,
             None,
             actor=_build_actor(turn_actor),
+            turn_final=turn_final,
         )
     except Exception:  # noqa: BLE001 — fail open: output phases are advisory on error
         _logger.exception(
@@ -8066,6 +8057,7 @@ async def _flush_relay_text(
     *,
     deny_reason: str | None = None,
     evaluate_response_phase: bool = False,
+    turn_final: bool = False,
 ) -> None:
     """
     Persist buffered assistant text as a message item and clear the buffer.
@@ -8123,9 +8115,13 @@ async def _flush_relay_text(
     :param model_id: Assistant agent label for the message.
     :param deny_reason: When set, an output policy already denied this
         turn's assistant text; persist the deny sentinel instead of it.
-    :param evaluate_response_phase: When ``True`` (terminal flush), gate
+    :param evaluate_response_phase: When ``True``, gate
         the text through the spec's RESPONSE-phase policies before
         persisting.
+    :param turn_final: Whether this segment ends a successfully completed
+        turn. Completion policies can use it to skip intermediate and
+        unsuccessful-turn segments. Content policies should check every
+        segment. Empty segments never invoke policies.
     """
     if not text_acc:
         return
@@ -8141,7 +8137,7 @@ async def _flush_relay_text(
         return
     if deny_reason is None and evaluate_response_phase:
         deny_reason = await _relay_response_policy_deny_reason(
-            conversation_store, session_id, text
+            conversation_store, session_id, text, turn_final=turn_final
         )
     if deny_reason is not None:
         # Substitute the sentinel for the denied content — same Option-B
@@ -8296,7 +8292,7 @@ def _agent_carries_native_fork_history_impl(agent: Agent) -> bool:
     claude-native / codex-native / pi-native each record a resumable native
     session file that the runner rebuilds from the copied Omnigent items on
     fork/resume, so a fork bound to one of them carries prior history into the
-    native CLI. Used by both fork and switch-agent. cursor-native is a native
+    native CLI. Used by fork. cursor-native is a native
     CLI but has no resumable session file to rebuild; it carries fork history a
     different way (a text preamble, fork-only — see
     :func:`_agent_carries_cursor_fork_history`), so stamping
@@ -8325,8 +8321,7 @@ def _agent_carries_cursor_fork_history(agent: Agent) -> bool:
     Cursor's conversation is server-backed and opencode has no history-import
     API, so neither can seed a local store for a rebuilt resume; instead the
     runner replays prior turns as a text preamble on the fork (cursor: the
-    first message; opencode: a ``noReply`` context message). Fork-only —
-    switch-agent does not call this, so switching into one still launches fresh.
+    first message; opencode: a ``noReply`` context message).
     Returns ``False`` when the bundle can't be loaded.
 
     :param agent: The agent whose harness to classify.
@@ -8508,8 +8503,8 @@ def _build_policy_engine_from_spec_impl(
         conversation_store=conversation_store,
         conversation=conversation,
         # The spec was resolved from this row's agent binding; the builder
-        # confirms it against its own fresh read and fails closed if a
-        # switch-agent landed in between.
+        # confirms it against its own fresh read and fails closed if the
+        # binding changed in between.
         expected_agent_id=conversation.agent_id if conversation is not None else None,
         default_policies=caps.default_policies,
         policy_store=get_policy_store(),
@@ -8955,6 +8950,7 @@ async def _evaluate_output_policy(
     _runner_router: RunnerRouter | None,
     *,
     actor: dict[str, str] | None = None,
+    turn_final: bool | None = None,
 ) -> dict[str, Any] | None:
     """
     Evaluate an assistant message against OUTPUT phase policies.
@@ -8976,6 +8972,9 @@ async def _evaluate_output_policy(
     :param actor: Authenticated principal, e.g.
         ``{"run_as": "alice@example.com"}``. ``None`` when
         identity is unknown.
+    :param turn_final: Whether this segment ends a successfully completed
+        turn. The relay passes ``False`` for intermediate or unsuccessful
+        segments. ``None`` when the calling path doesn't distinguish.
     :returns: ``None`` on ALLOW (fall through). Verdict dict
         with ``_denied_body`` on DENY.
     """
@@ -9001,6 +9000,7 @@ async def _evaluate_output_policy(
         content=assistant_text,
         tool_name=None,
         actor=actor,
+        turn_final=turn_final,
     )
     result = await engine.evaluate(ctx)
 
@@ -11630,8 +11630,6 @@ __all__ = [
     "_require_filesystem_attachment_harness",
     "_require_host_conn_for_worktree",
     "_require_permission_mode_forward",
-    "_reset_runner_resources_after_switch",
-    "_reset_runner_resources_after_switch_impl",
     "_resolve_harness",
     "_resolve_llm_model",
     "_resolve_skill_meta_text_via_runner",

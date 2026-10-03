@@ -19,6 +19,7 @@ import { useSidebarToggleHotkeys } from "@/hooks/useSidebarToggleHotkeys";
 import { useCommandPaletteHotkey } from "@/hooks/useCommandPaletteHotkey";
 import { useNewSessionHotkey } from "@/hooks/useNewSessionHotkey";
 import { useNewShellHotkey } from "@/hooks/useNewShellHotkey";
+import { useSettingsHotkey } from "@/hooks/useSettingsHotkey";
 import { useIsEmbedded } from "@/lib/embedded";
 import { AgentInfoContent, agentHasInfo } from "@/components/AgentInfo";
 import { useIdleNotifications } from "@/hooks/useIdleNotifications";
@@ -29,6 +30,7 @@ import { useOptimisticTitle } from "@/lib/optimisticTitles";
 import { derivePermissionLevel, isEditorLevel, isOwnerLevel } from "@/lib/permissionsApi";
 import {
   isAndroidShell,
+  isElectronShell,
   isIOSShell,
   isMacElectronShell,
   onNativeSidebarDrag,
@@ -128,6 +130,7 @@ import { PermissionsModal } from "@/components/PermissionsModal";
 import { KeyboardShortcutsDialog } from "@/components/KeyboardShortcutsDialog";
 import { ImportReviewGate } from "@/components/onboarding/HostImportReview";
 import { CommandPalette } from "./CommandPalette";
+import { RecentSessionsSwitcher } from "./RecentSessionsSwitcher";
 import { Toaster } from "@/components/ui/sonner";
 import { CloseShellDialog } from "./CloseShellDialog";
 import { ForkSessionDialog } from "./ForkSessionDialog";
@@ -451,6 +454,8 @@ export function AppShell() {
       ? (readSessionWorkspaceState(conversationId).open ?? readDefaultWorkspacePanelOpen())
       : false,
   );
+  const workspaceTabListRef = useRef<HTMLDivElement>(null);
+  const focusWorkspaceTabsOnOpenRef = useRef(false);
   const rightPanelOpenRef = useRef(rightPanelOpen);
   rightPanelOpenRef.current = rightPanelOpen;
   const [rightPanelVisibilityAnimating, setRightPanelVisibilityAnimating] = useState(false);
@@ -1391,6 +1396,17 @@ export function AppShell() {
       { replace: true },
     );
   }, [setSearchParams]);
+  const restoreSelectedFileUrl = useCallback(() => {
+    if (!selectedFilePath) return;
+    setSearchParams(
+      (prev) => {
+        const params = new URLSearchParams(prev);
+        params.set("file", selectedFilePath);
+        return params;
+      },
+      { replace: true },
+    );
+  }, [selectedFilePath, setSearchParams]);
 
   // Toggle the right (Workspace) sidebar — shared by the header's collapse
   // button and the ⌘⌥]/Ctrl+Alt+] hotkey so they can't drift. Beyond flipping the
@@ -1411,22 +1427,9 @@ export function AppShell() {
       writeDefaultWorkspacePanelOpen(next);
     }
     if (next) {
-      if (selectedFilePath) {
-        // Reopening lands back on the file remembered in per-session
-        // state, so re-add ?file= to keep the URL shareable. diff and
-        // comment are URL-only ephemerals (not remembered), so they
-        // intentionally don't rehydrate. Imperative (not an effect) to
-        // avoid the FileViewer diff-sync race documented in that effect.
-
-        setSearchParams(
-          (prev) => {
-            const params = new URLSearchParams(prev);
-            params.set("file", selectedFilePath);
-            return params;
-          },
-          { replace: true },
-        );
-      }
+      // Reopening lands back on the remembered file, so keep its URL shareable.
+      // URL-only diff/comment state intentionally stays cleared.
+      restoreSelectedFileUrl();
     } else {
       // Collapsing the rail hides the workspace, so strip the deep-
       // link params that point into it; otherwise the URL advertises
@@ -1437,10 +1440,65 @@ export function AppShell() {
   }, [
     rightPanelOpen,
     conversationId,
-    selectedFilePath,
     clearFileViewerUrl,
-    setSearchParams,
+    restoreSelectedFileUrl,
     setRightPanelOpenAnimated,
+  ]);
+  const focusWorkspaceTabs = useCallback(() => {
+    const tabList = workspaceTabListRef.current;
+    const selectedTab = tabList?.querySelector<HTMLElement>(
+      '[role="tab"][aria-selected="true"], [role="button"][aria-current="true"]',
+    );
+    (selectedTab ?? tabList)?.focus();
+  }, []);
+  const revealRightPanel = useCallback(() => {
+    if (!conversationId) return;
+    if (!terminalFirst) setPanelInitialKey(null);
+    setExecutionLogsKey(null);
+    setFilesPanelOpen(false);
+    if (rightPanelOpen) return;
+    writeSessionWorkspaceState(conversationId, { open: true });
+    writeDefaultWorkspacePanelOpen(true);
+    setRightPanelOpenAnimated(true);
+  }, [
+    conversationId,
+    rightPanelOpen,
+    setPanelInitialKey,
+    setRightPanelOpenAnimated,
+    terminalFirst,
+  ]);
+  const toggleRightPanelFromHotkey = useCallback(() => {
+    if (rightPanelOpen && workspaceTabListRef.current?.contains(document.activeElement)) {
+      focusWorkspaceTabsOnOpenRef.current = false;
+      toggleRightPanel();
+      return;
+    }
+    const hiddenByCompetingPanel =
+      (!terminalFirst && panelOpen) || executionLogsOpen || filesPanelOpen;
+    if (hiddenByCompetingPanel) {
+      focusWorkspaceTabsOnOpenRef.current = !!conversationId && hasRailContent;
+      restoreSelectedFileUrl();
+      revealRightPanel();
+      return;
+    }
+    if (rightPanelOpen) {
+      focusWorkspaceTabs();
+      return;
+    }
+    focusWorkspaceTabsOnOpenRef.current = !!conversationId && hasRailContent;
+    toggleRightPanel();
+  }, [
+    rightPanelOpen,
+    terminalFirst,
+    panelOpen,
+    executionLogsOpen,
+    filesPanelOpen,
+    conversationId,
+    hasRailContent,
+    restoreSelectedFileUrl,
+    revealRightPanel,
+    focusWorkspaceTabs,
+    toggleRightPanel,
   ]);
 
   // The hotkey (⌘⌥[) and command-palette toggle for the left sidebar. A peeking
@@ -1578,7 +1636,7 @@ export function AppShell() {
   // here where both panels' open-state lives.
   useSidebarToggleHotkeys({
     onToggleLeft: toggleLeftSidebar,
-    onToggleRight: toggleRightPanel,
+    onToggleRight: toggleRightPanelFromHotkey,
   });
 
   // ⌘K (Ctrl+K) toggles the command palette. Bound capture-phase, so in the
@@ -1615,6 +1673,7 @@ export function AppShell() {
     },
   );
   useNewSessionHotkey(!isEmbedded);
+  useSettingsHotkey();
 
   // Mobile back button: close the open file and return to the files/changes
   // list. On mobile the tab strip is hidden, so a "back" should fully drop the
@@ -2162,6 +2221,11 @@ export function AppShell() {
     !executionLogsOpen &&
     !filesPanelOpen,
   );
+  useEffect(() => {
+    if (!workspacePanelVisible || !focusWorkspaceTabsOnOpenRef.current) return;
+    focusWorkspaceTabsOnOpenRef.current = false;
+    focusWorkspaceTabs();
+  }, [workspacePanelVisible, focusWorkspaceTabs]);
 
   return (
     <FileViewerContext.Provider value={fileViewerContextValue}>
@@ -2398,10 +2462,12 @@ export function AppShell() {
                     animateVisibility={rightPanelVisibilityAnimating}
                     handleProps={inlinePanelHandleProps}
                     rightRailTab={rightRailTab}
+                    tabListRef={workspaceTabListRef}
                     onRightRailTabChange={handleRightRailTabChange}
                     showFilesPanel={showFilesPanel}
                     showGithubTab={railTabsAvailable.github}
                     showBrowserTab={railTabsAvailable.browser}
+                    onBrowserTabOpened={revealRightPanel}
                     changedCount={changedCount}
                     subagentsWorking={subagentsWorking}
                     agentCount={agentCount}
@@ -2611,6 +2677,11 @@ export function AppShell() {
             onOpenChange={setCommandPaletteOpen}
             onToggleLeftSidebar={toggleLeftSidebar}
             onToggleRightSidebar={toggleRightPanel}
+          />
+          <RecentSessionsSwitcher
+            conversations={allConversations}
+            activeSessionId={serverConversationId ?? null}
+            enabled={isElectronShell()}
           />
           {/* Transient toasts (e.g. "session archived"). Mounted once here so
               any surface can fire one via showToast(). */}

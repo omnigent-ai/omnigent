@@ -1011,13 +1011,10 @@ function AppearanceSection() {
             </DialogHeader>
             <DialogFooter>
               <DialogClose asChild>
-                <Button variant="outline" size="sm">
-                  Cancel
-                </Button>
+                <Button variant="outline">Cancel</Button>
               </DialogClose>
               <Button
                 variant="default"
-                size="sm"
                 onClick={confirmResetAppearance}
                 data-testid="reset-appearance-confirm"
                 componentId="settings.appearance.reset"
@@ -1060,13 +1057,10 @@ function AppearanceSection() {
           )}
           <DialogFooter>
             <DialogClose asChild>
-              <Button variant="outline" size="sm">
-                Cancel
-              </Button>
+              <Button variant="outline">Cancel</Button>
             </DialogClose>
             <Button
               variant="default"
-              size="sm"
               data-testid="import-settings-choose-file"
               onClick={() => fileInputRef.current?.click()}
             >

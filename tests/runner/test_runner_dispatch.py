@@ -74,7 +74,7 @@ from omnigent.inner.executor import (
 from omnigent.inner.executor import (
     TurnComplete as _RecoveryTurnComplete,
 )
-from omnigent.runner import create_runner_app, subagent_work
+from omnigent.runner import create_runner_app, sign_in_watch, subagent_work
 from omnigent.runner.app import (
     _RUNNER_TURN_CONTEXT_DESYNC_CODE,
     _build_spawn_env_from_spec,
@@ -12460,13 +12460,12 @@ async def test_sign_in_pending_failure_posts_a_notice_once_the_agent_is_ready(
     shows its composer), one neutral notice lands in the transcript so the
     person knows the sign-in worked and can resend.
     """
-    import omnigent.runner.app as runner_app
     from omnigent.harnesses.codex_native import bridge as codex_bridge
     from omnigent.terminals import TerminalRegistry
     from tests.runner.helpers import NullServerClient, make_test_terminal_instance
 
     conv = f"conv_signin_{harness.replace('-', '_')}"
-    monkeypatch.setattr(runner_app, "_SIGN_IN_WATCH_INTERVAL_S", 0.01)
+    monkeypatch.setattr(sign_in_watch, "_SIGN_IN_WATCH_INTERVAL_S", 0.01)
     monkeypatch.setattr(codex_bridge, "_BRIDGE_ROOT", tmp_path / "bridges")
 
     class _RecordingServerClient(NullServerClient):

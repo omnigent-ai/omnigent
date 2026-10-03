@@ -62,7 +62,6 @@ import pty
 import re
 import select
 import signal
-import subprocess
 import sys
 import tempfile
 import threading
@@ -79,6 +78,7 @@ from omnigent.harnesses.pi_native.credentials import (
     resolve_pi_native_provider,
 )
 from omnigent.harnesses.pi_native.main import pi_bridge_dir_for_session
+from omnigent.testing.process_reaper import reap_leaked_omnigent_processes
 from tests.e2e._harness_probes import cli_unavailable_reason
 from tests.e2e.helpers import POLL_INTERVAL_S
 
@@ -402,7 +402,7 @@ def _is_credential_warning(item: dict) -> bool:
     ),
 )
 @pytest.mark.timeout(_JOURNEY_TIMEOUT_S + 120)
-def test_facet_a_live_pi_cli_gateway_claude_404_journey(fake_gateway: str) -> None:
+def test_facet_a_live_pi_cli_gateway_claude_404_journey(fake_gateway: str, tmp_path: Path) -> None:
     """Drive the real ``omnigent pi`` CLI journey and observe the silent 404.
 
     Journey: configure an openai-only ``kind: gateway`` provider whose default
@@ -416,13 +416,18 @@ def test_facet_a_live_pi_cli_gateway_claude_404_journey(fake_gateway: str) -> No
     404); passes after a reroute fix (api changes) or a warn fix (a
     ``pi_credentials_unresolved`` banner is surfaced to the session).
     """
-    config_home = Path(tempfile.mkdtemp(prefix="pi-gw-config-"))
+    home = tmp_path / "home"
+    config_home = home / ".omnigent"
+    config_home.mkdir(parents=True)
     (config_home / "config.yaml").write_text(_config_yaml(base_url=fake_gateway), encoding="utf-8")
 
     env = dict(os.environ)
     for stale in _STALE_ENV_VARS:
         env.pop(stale, None)
+    env.pop("OMNIGENT_DATABASE_URI", None)
+    env["HOME"] = str(home)
     env["OMNIGENT_CONFIG_HOME"] = str(config_home)
+    env["OMNIGENT_DATA_DIR"] = str(config_home)
     env["PYTHONPATH"] = f"{_REPO_ROOT}{os.pathsep}{env.get('PYTHONPATH', '')}"
     env["TERM"] = "xterm-256color"
     env["LINES"] = str(_PTY_ROWS)
@@ -476,7 +481,7 @@ def test_facet_a_live_pi_cli_gateway_claude_404_journey(fake_gateway: str) -> No
                 lambda: _match_conv(_output()), timeout=160, what="conversation id", tail=_output
             )
         )
-        bridge = pi_bridge_dir_for_session(conv)
+        bridge = home / pi_bridge_dir_for_session(conv).relative_to(Path.home())
         models_path = bridge / "pi-agent" / "models.json"
 
         # 2. Wait for the runner to render the managed per-session models.json.
@@ -538,24 +543,30 @@ def test_facet_a_live_pi_cli_gateway_claude_404_journey(fake_gateway: str) -> No
             warning_surfaced = _warning_surfaced()
     finally:
         stop.set()
-        # Tear down the whole tree: the CLI's process group (CLI + tmux attach),
-        # then the auto-spawned managed server + local daemon + runner.
-        with contextlib.suppress(ProcessLookupError, OSError):
-            os.killpg(os.getpgid(pid), signal.SIGKILL)
-        with contextlib.suppress(ProcessLookupError, OSError):
-            os.kill(pid, signal.SIGKILL)
-        with contextlib.suppress(Exception):
-            os.waitpid(pid, 0)
-        with contextlib.suppress(OSError):
-            os.close(fd)
-        with contextlib.suppress(Exception):
-            subprocess.run(
-                [str(omnigent), "server", "stop"],
-                env=env,
-                capture_output=True,
-                timeout=60,
-            )
+        journey_error = sys.exception()
+        try:
+            transcript = config_home / "logs" / "cli" / "gateway-journey-pty.log"
+            transcript.parent.mkdir(parents=True, exist_ok=True)
+            transcript.write_text(_output(), encoding="utf-8")
+        except OSError as log_error:
+            if journey_error is None:
+                raise
+            journey_error.add_note(f"Could not save PTY transcript: {log_error}")
+        finally:
+            # Stop the CLI group, then only daemons/runners with this test's data dir.
+            with contextlib.suppress(ProcessLookupError, OSError):
+                os.killpg(os.getpgid(pid), signal.SIGKILL)
+            with contextlib.suppress(ProcessLookupError, OSError):
+                os.kill(pid, signal.SIGKILL)
+            with contextlib.suppress(Exception):
+                os.waitpid(pid, 0)
+            with contextlib.suppress(OSError):
+                os.close(fd)
+            _, survivors = reap_leaked_omnigent_processes(config_home)
+            if survivors and (error := sys.exception()) is not None:
+                error.add_note(f"test processes survived cleanup: {survivors}")
 
+    assert not survivors, f"test processes survived cleanup: {survivors}"
     silently_openai = "openai-completions" in rendered_apis
     assert (not silently_openai) or warning_surfaced, (
         f"pi-native launched the Claude model {_CLAUDE_MODEL!r} on an openai-only "

@@ -1383,6 +1383,7 @@ async def test_failed_connect_does_not_offline_another_users_host(
 
 async def test_runner_exited_report_surfaces_in_runner_status(
     db_uri: str,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """
     A ``host.runner_exited`` frame from the daemon reaches the runner
@@ -1418,6 +1419,7 @@ async def test_runner_exited_report_surfaces_in_runner_status(
         "runner process exited with code 1 (log on host: ~/x.log)\n"
         "--- runner log tail ---\nModuleNotFoundError: No module named 'claude_agent_sdk'"
     )
+    caplog.set_level("WARNING", logger="omnigent.server.routes.host_tunnel")
     _comm = await _connect_host(app, registry)
     await _comm.send_input(
         {
@@ -1445,13 +1447,21 @@ async def test_runner_exited_report_surfaces_in_runner_status(
     # the actual failure — is surfaced verbatim for the waiting client.
     assert body["error"] == daemon_error
 
+    # No callback wired, so the tunnel itself logs the session-less event.
+    events = [r for r in caplog.records if getattr(r, "event_name", None) == "runner_exited"]
+    assert len(events) == 1
+    assert getattr(events[0], "session_id", None) is None
+    assert events[0].attributes["host_id"] == _HOST_ID
+    assert events[0].attributes["runner_id"] == "runner_dead"
+
 
 async def test_runner_exited_invokes_callback_with_runner_and_error(
     db_uri: str,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """
     A ``host.runner_exited`` frame fires the ``on_runner_exited``
-    callback with ``(runner_id, error)``.
+    callback with ``(host_id, runner_id, error)``.
 
     This callback is how the server marks the crashed runner's
     session(s) failed and pushes the cause to the open view (the
@@ -1464,12 +1474,13 @@ async def test_runner_exited_invokes_callback_with_runner_and_error(
 
     registry = HostRegistry()
     host_store = HostStore(db_uri)
-    received: list[tuple[str, str]] = []
+    received: list[tuple[str, str, str]] = []
 
-    async def _record(runner_id: str, error: str) -> None:
-        received.append((runner_id, error))
+    async def _record(host_id: str, runner_id: str, error: str) -> None:
+        received.append((host_id, runner_id, error))
 
     app = FastAPI()
+    caplog.set_level("WARNING", logger="omnigent.server.routes.host_tunnel")
     app.include_router(
         create_host_tunnel_router(registry, host_store, on_runner_exited=_record),
         prefix="/v1",
@@ -1488,5 +1499,7 @@ async def test_runner_exited_invokes_callback_with_runner_and_error(
         while not received:
             await asyncio.sleep(0.01)
 
-    # The callback got the exact runner id and error string off the frame.
-    assert received == [("runner_x", "exited with code 1")]
+    # The callback got the reporting host plus the exact runner id and error.
+    assert received == [(_HOST_ID, "runner_x", "exited with code 1")]
+    # The callback owns the event; the tunnel must not log a session-less duplicate.
+    assert not [r for r in caplog.records if getattr(r, "event_name", None) == "runner_exited"]
