@@ -10,6 +10,7 @@ import {
   onNativeNotificationActivated,
   onNativeSidebarDrag,
   PRE_MANIFEST_BASELINE,
+  resetOnboardingRunnerForTests,
   type ServerManifest,
   serverManifestOf,
   setBadgeCount as bridgeSetBadge,
@@ -18,6 +19,7 @@ import {
   supportsNativeServerPicker,
   supportsBrowser,
   switchServer,
+  takeOnboardingRunner,
 } from "./nativeBridge";
 
 // The Electron preload bridge mock, installed on window.omnigentDesktop.
@@ -140,6 +142,41 @@ afterEach(() => {
   setElectron(false);
   setIOS(false);
   setAndroid(false);
+});
+
+describe("takeOnboardingRunner", () => {
+  const shellTake = vi.fn<() => Promise<"local" | "remote" | null>>();
+
+  beforeEach(() => {
+    resetOnboardingRunnerForTests();
+    // Like the shell, answer once and then report nothing.
+    shellTake.mockReset().mockResolvedValueOnce("remote").mockResolvedValue(null);
+    (window as unknown as Record<string, unknown>).omnigentDesktop = {
+      kind: "electron",
+      takeOnboardingRunner: () => shellTake(),
+    };
+  });
+
+  it("shares one shell read between consumers", async () => {
+    expect(await takeOnboardingRunner("hostPicker")).toBe("remote");
+    expect(await takeOnboardingRunner("importReview")).toBe("remote");
+    expect(shellTake).toHaveBeenCalledOnce();
+  });
+
+  it("hands each consumer the runner only once per page load", async () => {
+    expect(await takeOnboardingRunner("importReview")).toBe("remote");
+    expect(await takeOnboardingRunner("importReview")).toBeNull();
+    expect(await takeOnboardingRunner("hostPicker")).toBe("remote");
+    expect(await takeOnboardingRunner("hostPicker")).toBeNull();
+  });
+
+  it("resolves null when the shell read fails or there's no shell", async () => {
+    shellTake.mockReset().mockRejectedValue(new Error("ipc down"));
+    expect(await takeOnboardingRunner("hostPicker")).toBeNull();
+    resetOnboardingRunnerForTests();
+    setElectron(false);
+    expect(await takeOnboardingRunner("hostPicker")).toBeNull();
+  });
 });
 
 describe("isNativeShell / isElectronShell", () => {

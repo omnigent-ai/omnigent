@@ -44,6 +44,7 @@ const mocks = vi.hoisted(() => ({
   projectNames: [] as string[],
   hasNextPage: false,
   fetchNextPage: vi.fn(),
+  importReviewEnabled: false,
 }));
 
 vi.mock("next-themes", () => ({
@@ -55,6 +56,7 @@ vi.mock("@/lib/CapabilitiesContext", () => ({
     accounts_enabled: mocks.accountsEnabled,
     login_url: mocks.loginUrl,
     single_user: mocks.singleUser,
+    features: { import_review: mocks.importReviewEnabled },
   }),
 }));
 vi.mock("@/lib/accountsApi", () => ({
@@ -182,6 +184,12 @@ vi.mock("@/pages/MembersPage", () => ({
 vi.mock("@/pages/PoliciesPage", () => ({
   PoliciesPage: () => <div>policies-page-stub</div>,
 }));
+vi.mock("@/shell/ImportSessionsPanel", () => ({
+  ImportSessionsPanel: () => <div>import-sessions-stub</div>,
+}));
+vi.mock("@/components/onboarding/HostImportReview", () => ({
+  ReviewImportsPanel: () => <div>review-imports-stub</div>,
+}));
 
 import { SettingsPage } from "./SettingsPage";
 
@@ -230,6 +238,7 @@ beforeEach(() => {
   mocks.pages = undefined;
   mocks.projectNames = [];
   mocks.hasNextPage = false;
+  mocks.importReviewEnabled = false;
   delete (window as unknown as Record<string, unknown>).omnigentDesktop;
 });
 afterEach(() => {
@@ -289,6 +298,20 @@ function installUpdateBridge(config: UpdateConfig = DEFAULT_UPDATE_CONFIG) {
 }
 
 describe("SettingsPage", () => {
+  it("hides harness import review while the import_review feature is off", () => {
+    renderPage("/settings/import");
+    expect(screen.getByText("import-sessions-stub")).toBeTruthy();
+    expect(screen.queryByText("Harness imports")).toBeNull();
+    expect(screen.queryByText("review-imports-stub")).toBeNull();
+  });
+
+  it("shows harness import review when the import_review feature is on", () => {
+    mocks.importReviewEnabled = true;
+    renderPage("/settings/import");
+    expect(screen.getByText("Harness imports")).toBeTruthy();
+    expect(screen.getByText("review-imports-stub")).toBeTruthy();
+  });
+
   beforeEach(() => {
     localStorage.removeItem(BACKGROUND_SESSION_TITLES_STORAGE_KEY);
   });

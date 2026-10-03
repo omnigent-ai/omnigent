@@ -1,19 +1,9 @@
-// Which hosts' harness imports this device has already reviewed, so the
-// import modal opens on its own only the first time a host shows up.
+// Which hosts' harness imports this device has reviewed, and the host an
+// explicit caller (e.g. onboarding) wants the import modal opened for.
 
 import { useSyncExternalStore } from "react";
 
 const KEY_PREFIX = "omnigent:imports-reviewed:";
-
-export function importsReviewed(hostId: string): boolean {
-  if (typeof window === "undefined") return true;
-  try {
-    return window.localStorage.getItem(KEY_PREFIX + hostId) !== null;
-  } catch {
-    // Without storage, don't nag on every load.
-    return true;
-  }
-}
 
 export function markImportsReviewed(hostId: string): void {
   if (typeof window === "undefined") return;
@@ -24,12 +14,17 @@ export function markImportsReviewed(hostId: string): void {
   }
 }
 
-/** A host an explicit caller (e.g. onboarding's install step) wants reviewed. */
-export interface ImportReviewTarget {
-  hostId: string;
-  /** Where the host runs; words the loading copy until the host is listed. */
-  runner?: "remote" | "local";
-}
+/**
+ * A host an explicit caller wants reviewed: a known `hostId`, or only the
+ * `runner` onboarding picked, resolved to a host once it can be identified.
+ */
+export type ImportReviewTarget =
+  | {
+      hostId: string;
+      /** Where the host runs; words the loading copy until the host is listed. */
+      runner?: "remote" | "local";
+    }
+  | { hostId?: undefined; runner: "remote" | "local" };
 
 // While set, the gate shows only this host, waiting for it to connect.
 let requestedTarget: ImportReviewTarget | null = null;

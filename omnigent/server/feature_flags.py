@@ -24,6 +24,7 @@ class Feature(StrEnum):
     HARNESS_INSTALL = "harness_install"
     CANVAS = "canvas"
     CUSTOMIZE = "customize"
+    IMPORT_REVIEW = "import_review"
 
 
 @dataclass(frozen=True)
@@ -61,6 +62,12 @@ FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
         description="Web Customize settings section (Harnesses & Skills)",
         owner="web",
         review_by_release="0.15.0",
+    ),
+    FeatureDefinition(
+        feature=Feature.IMPORT_REVIEW,
+        description="Harness import review modal and its Settings entry",
+        owner="onboarding",
+        review_by_release="0.18.0",
     ),
 )
 

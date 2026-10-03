@@ -24,6 +24,7 @@ def test_features_default_off() -> None:
         "harness_install": False,
         "canvas": False,
         "customize": False,
+        "import_review": False,
     }
 
 
@@ -48,6 +49,14 @@ def test_removed_harness_install_variable_allows_explicit_off() -> None:
     flags = resolve_feature_flags({"OMNIGENT_HARNESS_INSTALL_ENABLED": "0"})
 
     assert not flags.enabled(Feature.HARNESS_INSTALL)
+
+
+def test_import_review_is_a_frontend_visible_feature() -> None:
+    flags = resolve_feature_flags({FEATURES_ENV_VAR: "import_review"})
+
+    assert flags.enabled(Feature.IMPORT_REVIEW)
+    assert flags.frontend_dict()["import_review"] is True
+    assert flags.enabled_names() == ("import_review",)
 
 
 def test_canvas_is_a_frontend_visible_feature() -> None:
