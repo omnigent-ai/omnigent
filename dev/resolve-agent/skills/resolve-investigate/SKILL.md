@@ -63,7 +63,8 @@ Apply the same distinction to an unverified cause. If a proposed fix is supporte
 only by a substitute configuration or canned failure, describe it as a hypothesis,
 use `partially_fixed`, and name the missing discriminator in `remaining_work`.
 When a reliable reproduction cannot be established, use the existing
-`needs_more_info` outcome. Passing component tests alone do not justify `fixed`.
+`needs_more_info` outcome. Passing tests that assume the cause do not justify
+`fixed`.
 
 Concrete blockers still apply: missing required inputs or credentials, unsafe
 evidence, an unrecoverable verification environment, conflicting authoritative
