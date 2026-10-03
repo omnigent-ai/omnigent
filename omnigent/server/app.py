@@ -17,6 +17,7 @@ from importlib import import_module
 from pathlib import Path
 from typing import Any, Literal, Protocol
 
+import httpx
 from fastapi import FastAPI, Query, Request
 from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
@@ -118,7 +119,10 @@ from omnigent.server.routes.sessions import (
 from omnigent.server.routes.sharing import create_sharing_router
 from omnigent.server.routes.terminal_attach import create_terminal_attach_router
 from omnigent.server.routes.usage import create_usage_router
-from omnigent.server.runner_session_init import RunnerSessionInitializer
+from omnigent.server.runner_session_init import (
+    RunnerSessionInitializer,
+    runner_response_error_body,
+)
 from omnigent.server.scheduled import ScheduledTaskScheduler
 from omnigent.server.ws_origin import WebSocketOriginMiddleware
 from omnigent.stores import (
@@ -3570,7 +3574,34 @@ def create_app(
                 )
                 try:
                     routed = runner_router.client_for_session_resources(conv.id)
-                except OmnigentError:
+                except OmnigentError as exc:
+                    if exc.code == ErrorCode.RUNNER_UNAVAILABLE:
+                        # The runner dropped again while we walked its sessions;
+                        # all remaining sessions share this runner_id so stop.
+                        _logger.warning(
+                            "Failed to resolve runner client for session %s on reconnect:"
+                            " runner %s is offline",
+                            conv.id,
+                            runner_id,
+                            extra=debug_event(
+                                "runner_reconnect_client_offline",
+                                runner_id=runner_id,
+                            ),
+                        )
+                        break
+                    _logger.warning(
+                        "Failed to resolve runner client for session %s on reconnect: %s",
+                        conv.id,
+                        exc,
+                        extra=debug_event(
+                            "runner_reconnect_client_failed",
+                            runner_id=runner_id,
+                            exc_type=type(exc).__name__,
+                            error_code=exc.code,
+                        ),
+                    )
+                    continue
+                except Exception:
                     _logger.exception(
                         "Failed to resolve runner client for session %s on reconnect",
                         conv.id,
@@ -3599,6 +3630,19 @@ def create_app(
                         init_response.raise_for_status()
                         await restore_active_children(
                             conv, routed.client, conversation_store, runner_session_initializer
+                        )
+                    except httpx.HTTPStatusError as exc:
+                        body = runner_response_error_body(exc.response)
+                        _logger.error(
+                            "Failed to re-assign session %s on reconnect: HTTP %d: %s",
+                            conv.id,
+                            exc.response.status_code,
+                            body,
+                            extra=debug_event(
+                                "runner_reconnect_reassign_rejected",
+                                status_code=exc.response.status_code,
+                                response_body=body,
+                            ),
                         )
                     except Exception:
                         _logger.exception(

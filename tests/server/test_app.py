@@ -2136,3 +2136,221 @@ async def test_missing_conversation_is_a_404_not_an_unhandled_error(
     # Traced, but not as a fault.
     assert records[0].levelno == logging.INFO
     assert not records[0].getMessage().startswith("Unhandled exception:")
+
+
+# ---------------------------------------------------------------------------
+# _on_runner_connect logging behaviour
+# ---------------------------------------------------------------------------
+
+
+def _build_minimal_app(
+    db_uri: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[FastAPI, dict[str, object]]:
+    """Create a minimal ``create_app`` instance and capture ``_on_runner_connect``.
+
+    Patches ``create_runner_tunnel_router`` to snag the callback before it is
+    buried in the tunnel route's closure, then calls ``create_app`` with real
+    SQLite stores. Returns the app and a dict with key ``"callback"`` set to
+    the captured async function.
+    """
+    import omnigent.server.app as app_module
+    from omnigent.server.app import create_app
+    from omnigent.server.routes.runner_tunnel import (
+        create_runner_tunnel_router as real_create_router,
+    )
+    from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
+
+    captured: dict[str, object] = {}
+
+    def _capture_router(*args: object, **kwargs: object) -> object:
+        captured["callback"] = kwargs.get("on_runner_connect")
+        return real_create_router(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(app_module, "create_runner_tunnel_router", _capture_router)
+
+    artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
+    app = create_app(
+        agent_store=SqlAlchemyAgentStore(db_uri),
+        file_store=SqlAlchemyFileStore(db_uri),
+        conversation_store=SqlAlchemyConversationStore(db_uri),
+        artifact_store=artifact_store,
+        agent_cache=AgentCache(artifact_store=artifact_store, cache_dir=tmp_path / "cache"),
+    )
+    return app, captured
+
+
+@pytest.mark.asyncio
+async def test_on_runner_connect_offline_runner_logs_warning_and_breaks(
+    db_uri: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Runner-offline OmnigentError downgrades to WARNING and stops the loop.
+
+    A runner that re-connected but dropped again before the loop completes
+    triggers ``RUNNER_UNAVAILABLE``; all remaining sessions share this runner
+    so there is no point continuing.
+    """
+    from omnigent.db.utils import generate_agent_id
+    from omnigent.errors import ErrorCode, OmnigentError
+    from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore as _AgentStore
+    from omnigent.stores.conversation_store.sqlalchemy_store import (
+        SqlAlchemyConversationStore as _ConvStore,
+    )
+    from tests.debug_log_helpers import capture_debug_rows
+
+    app, captured = _build_minimal_app(db_uri, tmp_path, monkeypatch)
+
+    # Create two sessions bound to the test runner so we can verify the loop stops.
+    agent_store = _AgentStore(db_uri)
+    conv_store = _ConvStore(db_uri)
+    runner_id = "runner_offline_test"
+    agent = agent_store.create(generate_agent_id(), "test", "loc")
+    conv1 = conv_store.create_conversation(agent_id=agent.id)
+    conv_store.set_runner_id(conv1.id, runner_id)
+    conv2 = conv_store.create_conversation(agent_id=agent.id)
+    conv_store.set_runner_id(conv2.id, runner_id)
+
+    def _raise_offline(conv_id: str) -> object:
+        raise OmnigentError(
+            f"runner {runner_id!r} is offline for conversation {conv_id!r}",
+            code=ErrorCode.RUNNER_UNAVAILABLE,
+        )
+
+    app.state.runner_router.client_for_session_resources = _raise_offline  # type: ignore[assignment]
+
+    on_runner_connect = captured["callback"]
+    with capture_debug_rows("server") as rows:
+        await on_runner_connect(runner_id)  # type: ignore[operator]
+
+    offline_rows = [r for r in rows if r["event_name"] == "runner_reconnect_client_offline"]
+    assert len(offline_rows) == 1, "expected exactly one offline warning (loop should break)"
+    row = offline_rows[0]
+    assert row["level"] == "WARNING"
+    assert row["stack_trace"] is None
+    assert row["attributes"]["runner_id"] == runner_id
+
+
+@pytest.mark.asyncio
+async def test_on_runner_connect_non_offline_omnigent_error_logs_warning_and_continues(
+    db_uri: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A non-RUNNER_UNAVAILABLE OmnigentError logs WARNING with error_code and continues.
+
+    E.g. NOT_FOUND means the session's conversation row is gone, which is
+    a different condition from the runner being offline. The loop should
+    skip that session but keep processing the remaining ones.
+    """
+    from omnigent.db.utils import generate_agent_id
+    from omnigent.errors import ErrorCode, OmnigentError
+    from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore as _AgentStore
+    from omnigent.stores.conversation_store.sqlalchemy_store import (
+        SqlAlchemyConversationStore as _ConvStore,
+    )
+    from tests.debug_log_helpers import capture_debug_rows
+
+    app, captured = _build_minimal_app(db_uri, tmp_path, monkeypatch)
+
+    agent_store = _AgentStore(db_uri)
+    conv_store = _ConvStore(db_uri)
+    runner_id = "runner_not_found_test"
+    agent = agent_store.create(generate_agent_id(), "test", "loc")
+    conv1 = conv_store.create_conversation(agent_id=agent.id)
+    conv_store.set_runner_id(conv1.id, runner_id)
+    conv2 = conv_store.create_conversation(agent_id=agent.id)
+    conv_store.set_runner_id(conv2.id, runner_id)
+
+    calls: list[str] = []
+
+    def _raise_not_found(conv_id: str) -> object:
+        calls.append(conv_id)
+        raise OmnigentError(
+            f"conversation {conv_id!r} not found",
+            code=ErrorCode.NOT_FOUND,
+        )
+
+    app.state.runner_router.client_for_session_resources = _raise_not_found  # type: ignore[assignment]
+
+    on_runner_connect = captured["callback"]
+    with capture_debug_rows("server") as rows:
+        await on_runner_connect(runner_id)  # type: ignore[operator]
+
+    failed_rows = [r for r in rows if r["event_name"] == "runner_reconnect_client_failed"]
+    # Both sessions should be attempted (loop continues, not breaks).
+    assert len(failed_rows) == 2, f"expected 2 warning rows, got {failed_rows}"
+    assert len(calls) == 2
+    for row in failed_rows:
+        assert row["level"] == "WARNING"
+        assert row["stack_trace"] is None
+        assert row["attributes"]["error_code"] == str(ErrorCode.NOT_FOUND)
+        assert row["attributes"]["runner_id"] == runner_id
+
+
+@pytest.mark.asyncio
+async def test_on_runner_connect_reassign_http_error_logs_status_and_body(
+    db_uri: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A 5xx from the runner on reconnect logs ERROR with status and body snippet."""
+    from omnigent.db.utils import generate_agent_id
+    from omnigent.runner.routing import RoutedRunner
+    from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore as _AgentStore
+    from omnigent.stores.conversation_store.sqlalchemy_store import (
+        SqlAlchemyConversationStore as _ConvStore,
+    )
+    from tests.debug_log_helpers import capture_debug_rows
+
+    app, captured = _build_minimal_app(db_uri, tmp_path, monkeypatch)
+
+    agent_store = _AgentStore(db_uri)
+    conv_store = _ConvStore(db_uri)
+    runner_id = "runner_http_error_test"
+    agent = agent_store.create(generate_agent_id(), "test", "loc")
+    conv = conv_store.create_conversation(agent_id=agent.id)
+    conv_store.set_runner_id(conv.id, runner_id)
+
+    # Fake RoutedRunner with a stub client.
+    class _StubClient:
+        pass
+
+    stub_routed = RoutedRunner(runner_id=runner_id, client=_StubClient())  # type: ignore[arg-type]
+    app.state.runner_router.client_for_session_resources = lambda _: stub_routed  # type: ignore[assignment]
+
+    # Initializer returns a 500 response with a JSON error body.
+    error_body = {"error": "runner crashed unexpectedly"}
+    error_response = httpx.Response(
+        500,
+        json=error_body,
+        request=httpx.Request("POST", "http://runner/v1/sessions"),
+    )
+
+    async def _fail_initialize(*_args: object, **_kwargs: object) -> httpx.Response:
+        return error_response
+
+    app.state.runner_session_initializer.initialize = _fail_initialize  # type: ignore[assignment]
+
+    # Stub out post-error relay calls so they don't fail against the mock client.
+    import omnigent.server.routes.sessions as sessions_routes
+
+    async def _noop_async(*_a: object, **_k: object) -> None:
+        return None
+
+    monkeypatch.setattr(sessions_routes, "_ensure_runner_relay", lambda *a, **k: None)
+    monkeypatch.setattr(sessions_routes, "prefetch_session_routing_catalogs", lambda *a, **k: None)
+    monkeypatch.setattr(sessions_routes, "_publish_runner_recovered_status", _noop_async)
+
+    on_runner_connect = captured["callback"]
+    with capture_debug_rows("server") as rows:
+        await on_runner_connect(runner_id)  # type: ignore[operator]
+
+    rejected_rows = [r for r in rows if r["event_name"] == "runner_reconnect_reassign_rejected"]
+    assert len(rejected_rows) == 1
+    row = rejected_rows[0]
+    assert row["level"] == "ERROR"
+    assert row["attributes"]["status_code"] == "500"
+    assert row["attributes"]["response_body"] == "runner crashed unexpectedly"
