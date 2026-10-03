@@ -22,8 +22,13 @@ vi.mock("@/hooks/useIsMobileViewport", () => ({ useIsMobileViewport: () => mobil
 vi.mock("@/hooks/useWorkingLabelTick", () => ({ useWorkingLabelTick: () => 0 }));
 vi.mock("@/hooks/useFileContent", () => ({ fetchFileContent: vi.fn() }));
 vi.mock("@/components/chat/SideChatPane", () => ({
-  SideChatPane: ({ childId, fullHistory }: { childId: string; fullHistory?: boolean }) => (
-    <div data-testid="side-chat" data-session={childId} data-full={String(fullHistory)} />
+  SideChatPane: (props: { childId: string; fullHistory?: boolean; placeholder?: string }) => (
+    <div
+      data-testid="side-chat"
+      data-session={props.childId}
+      data-full={String(props.fullHistory)}
+      data-placeholder={props.placeholder}
+    />
   ),
 }));
 vi.mock("@/shell/SlidesViewer", () => ({
@@ -94,6 +99,7 @@ describe("DesignStudio on desktop", () => {
     const chat = screen.getByTestId("side-chat");
     expect(chat).toHaveAttribute("data-session", SESSION);
     expect(chat).toHaveAttribute("data-full", "true");
+    expect(chat).toHaveAttribute("data-placeholder", "Ask for changes to this deck");
     expect(ensureConversationStreamed).toHaveBeenCalledWith(SESSION);
     expect(contentMock).toHaveBeenCalledWith(SESSION, PATH);
     expect(screen.getByRole("link", { name: "Open in session" })).toHaveAttribute(

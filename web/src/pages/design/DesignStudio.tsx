@@ -177,7 +177,11 @@ export function DesignStudio({
             aria-label="Design chat"
             className="flex min-h-0 w-full flex-col md:w-[380px] md:shrink-0 md:border-r md:border-border"
           >
-            <SideChatPane childId={sessionId} fullHistory />
+            <SideChatPane
+              childId={sessionId}
+              fullHistory
+              placeholder="Ask for changes to this deck"
+            />
           </aside>
         )}
         {showPreview && (

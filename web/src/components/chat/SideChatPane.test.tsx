@@ -496,6 +496,14 @@ describe("side-chat history", () => {
     expect(screen.queryByText("Parent question")).toBeNull();
   });
 
+  it("uses a custom composer placeholder", () => {
+    renderPane(<SideChatPane childId={childId} placeholder="Ask for changes to this deck" />);
+    expect(screen.getByTestId("side-chat-input")).toHaveAttribute(
+      "placeholder",
+      "Ask for changes to this deck",
+    );
+  });
+
   it("shows the full history with fullHistory", () => {
     renderPane(<SideChatPane childId={childId} fullHistory />);
     hydrate();

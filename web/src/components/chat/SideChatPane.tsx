@@ -97,12 +97,14 @@ const EMPTY_STATE_BODY = "Ask a question here without affecting the main convers
  * @param onStart Create the fork from a pending tab's first message.
  * @param fullHistory Show the whole transcript (a compact chat for a session,
  *   not a fork), skipping the forked-in history filter.
+ * @param placeholder Composer placeholder; defaults to the side-chat copy.
  */
 export function SideChatPane({
   childId,
   onStart,
   readOnly: restoredReadOnly = false,
   fullHistory = false,
+  placeholder,
 }: {
   childId: string;
   onStart?: (text: string) => Promise<void>;
@@ -110,6 +112,7 @@ export function SideChatPane({
    *  stop its session. Defaults to false (a live, sendable side chat). */
   readOnly?: boolean;
   fullHistory?: boolean;
+  placeholder?: string;
 }) {
   const pending = isPendingSideChat(childId);
   const [starting, setStarting] = useState(false);
@@ -317,6 +320,7 @@ export function SideChatPane({
               pending={pending}
               starting={starting}
               onStart={onStart ? startSideChat : undefined}
+              placeholder={placeholder}
             />
           )}
         </div>
@@ -341,6 +345,7 @@ function SideChatComposer({
   pending,
   starting,
   onStart,
+  placeholder = "Ask a side question...",
 }: {
   childId: string;
   agentId: string | null;
@@ -350,6 +355,7 @@ function SideChatComposer({
   pending: boolean;
   starting: boolean;
   onStart?: (text: string) => Promise<void>;
+  placeholder?: string;
 }) {
   const send = useChatStore((s) => s.send);
   const queryClient = useQueryClient();
@@ -461,7 +467,7 @@ function SideChatComposer({
           ref: textareaRef,
           value: text,
           onChange: (event) => setText(event.target.value),
-          placeholder: "Ask a side question...",
+          placeholder,
           disabled: !ready,
           "data-testid": "side-chat-input",
           onKeyDown: (event, intent) => {
