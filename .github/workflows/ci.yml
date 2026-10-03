@@ -101,6 +101,7 @@ jobs:
           - group: server-rest
             paths: tests/server --ignore=tests/server/integration tests/onboarding
             workers: "4"
+            extra: kubernetes
           - group: spec-llms
             paths: tests/spec tests/llms
           # Integration journey tests with mock LLM (no API key).
