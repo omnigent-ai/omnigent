@@ -3309,6 +3309,36 @@ def test_cleanup_runners_terminates_all(tmp_path: Path) -> None:
     assert host._runners == {}
 
 
+def test_cleanup_runners_total_wait_bounds_all_runners(tmp_path: Path) -> None:
+    """total_wait_s caps the TOTAL wait across all runners, not per-runner.
+
+    With total_wait_s=0.5 and three runners that never exit (sleep 60),
+    cleanup should kill them all and return within roughly that budget
+    instead of blocking N×5 s.  This is the signal-stop path.
+    """
+    host = _make_host_process()
+    procs = []
+    for name in ("runner_a", "runner_b", "runner_c"):
+        proc = subprocess.Popen(
+            ["sleep", "60"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        host._runners[name] = _RunnerHandle(proc=proc, log_path=tmp_path / f"{name}.log")
+        procs.append(proc)
+
+    start = time.monotonic()
+    host._cleanup_runners(total_wait_s=0.5)
+    elapsed = time.monotonic() - start
+
+    # All runners must be dead.
+    for proc in procs:
+        assert proc.poll() is not None, f"Runner pid={proc.pid} not killed"
+    # Total wait bounded — allow generous margin for slow CI.
+    assert elapsed < 3.0, f"Signal cleanup took {elapsed:.2f}s, expected < 3.0s"
+    assert host._runners == {}
+
+
 def test_reap_orphans_reaps_orphaned_children(tmp_path: Path) -> None:
     """Regression for #1782: orphaned children are reaped, not leaked.
 
@@ -6098,7 +6128,11 @@ async def test_run_starts_and_shuts_down_host_maintenance(
     monkeypatch.setattr(HostMaintenanceJanitor, "for_host", _for_host)
     host = _host()
     host._lifecycle_lock = _RecordingLifecycleLock()  # type: ignore[assignment]
-    monkeypatch.setattr(host, "_cleanup_runners", lambda: calls.append("cleanup_runners"))
+    monkeypatch.setattr(
+        host,
+        "_cleanup_runners",
+        lambda *, total_wait_s=None: calls.append("cleanup_runners"),
+    )
 
     await host.run()
 
@@ -8285,3 +8319,283 @@ def test_fs_reader_picks_up_a_repo_created_after_first_request(
 
     assert second.status == "ok", second
     assert [e["path"] for e in second.payload["data"]] == ["zzz/target.jsonnet"], second.payload
+
+
+# --- Host shutdown reason and structured log --------------------------------
+#
+# These tests cover the shutdown attribution and host_shutdown event that
+# were added to diagnose the production burst of runner_disconnected errors
+# caused by a host daemon silently shutting down.
+
+
+def test_shutdown_reason_first_cause_wins() -> None:
+    """_record_shutdown_reason stores the first cause and ignores later ones.
+
+    First-cause-wins lets the signal handler record 'received SIGTERM' even
+    when the resulting _lifecycle_lost break also tries to record 'lifecycle
+    lost' — the signal attribution survives.
+    """
+    host = _make_host_process()
+    host._record_shutdown_reason("received SIGTERM")
+    host._record_shutdown_reason("lifecycle lost")
+    assert host._shutdown_reason == "received SIGTERM"
+
+
+def test_late_signal_after_lifecycle_lost_does_not_set_signal_num() -> None:
+    """A late SIGTERM after lifecycle lost leaves _shutdown_signal_num None.
+
+    Scenario: the lifecycle monitor fires first (lifecycle lost), then a
+    SIGTERM arrives during teardown. The logged reason must stay 'lifecycle
+    lost' and run_host_process must NOT exit 143 — it should exit normally.
+    """
+    import signal as _signal
+
+    host = _make_host_process()
+    # First cause: lifecycle lost.
+    host._record_shutdown_reason("lifecycle lost")
+    # Late SIGTERM: simulate _on_shutdown_signal with the reason already set.
+    _was_first = host._shutdown_reason is None
+    host._record_shutdown_reason(f"received {_signal.Signals(_signal.SIGTERM).name}")
+    if _was_first:  # mirrors _on_shutdown_signal exactly
+        host._shutdown_signal_num = _signal.SIGTERM
+
+    assert host._shutdown_reason == "lifecycle lost"
+    assert host._shutdown_signal_num is None
+
+
+async def test_sigterm_handler_records_reason_and_runs_teardown(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """SIGTERM installs a handler that records the reason and runs _cleanup_runners.
+
+    Delivers a real SIGTERM to this process while the host's fake tunnel is
+    blocked in recv(). The asyncio signal handler fires, sets _lifecycle_lost,
+    and the main loop breaks — _cleanup_runners must still run via the
+    finally teardown.
+    """
+    import os
+    import signal
+
+    monkeypatch.setattr("omnigent.host.connect._RECONNECT_BASE_S", 0.0)
+    # Skip slow CLI probes so capability discovery completes quickly enough
+    # for _serve_frames to proceed past asyncio.shield(capability_init_task).
+    monkeypatch.setattr("omnigent.host.connect.configured_harness_map", dict)
+    monkeypatch.setattr("omnigent.host.connect.gateway_inference_map", dict)
+
+    connected = asyncio.Event()
+    cleanup_called: list[bool] = []
+
+    class _SigtermTunnel:
+        async def send(self, _data: object) -> None:
+            # hello frame sent — handler is installed and ready.
+            connected.set()
+
+        async def recv(self) -> str:
+            # Yield enough for the event loop to process the SIGTERM callback.
+            await asyncio.sleep(0.1)
+            raise ConnectionClosedError(None, None)
+
+    class _SigtermConnect:
+        async def __aenter__(self) -> _SigtermTunnel:
+            return _SigtermTunnel()
+
+        async def __aexit__(self, *_args: object) -> bool:
+            return False
+
+    import websockets.asyncio.client as ws_client
+
+    import omnigent.runner._entry as entry_mod
+
+    monkeypatch.setattr(entry_mod, "_make_auth_token_factory", lambda *, server_url=None: None)
+    monkeypatch.setattr(ws_client, "connect", lambda *_a, **_kw: _SigtermConnect())
+
+    original_cleanup = HostProcess._cleanup_runners
+
+    def _recording_cleanup(host_inst: HostProcess, *, total_wait_s: float | None = None) -> None:
+        cleanup_called.append(True)
+        original_cleanup(host_inst, total_wait_s=total_wait_s)
+
+    monkeypatch.setattr(HostProcess, "_cleanup_runners", _recording_cleanup)
+
+    host = _host()
+
+    async def _deliver_sigterm() -> None:
+        await connected.wait()
+        os.kill(os.getpid(), signal.SIGTERM)
+
+    await asyncio.gather(host.run(), _deliver_sigterm())
+
+    assert host._shutdown_reason == "received SIGTERM"
+    assert cleanup_called, "_cleanup_runners must run on SIGTERM teardown"
+
+
+def test_sigterm_run_host_process_exits_143(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """run_host_process exits 128+signum after a signal-initiated teardown.
+
+    SIGTERM (signum 15) -> 143 (HOST_SIGTERM_EXIT_CODE); SIGHUP (signum 1) ->
+    129. Both are computed from _shutdown_signal_num so no hard-coded string
+    comparison is needed. The test exercises the SIGTERM case (the common
+    one treated as a deliberate stop by omnigent/onboarding/sandboxes/base.py).
+    """
+    import signal as _signal
+
+    from omnigent.host import HOST_SIGTERM_EXIT_CODE
+
+    async def _fake_run(self: HostProcess) -> None:
+        self._shutdown_reason = "received SIGTERM"
+        self._shutdown_signal_num = _signal.SIGTERM
+
+    monkeypatch.setattr(HostProcess, "run", _fake_run)
+
+    with pytest.raises(SystemExit) as excinfo:
+        run_host_process(
+            server_url="https://app.example.databricks.com",
+            config_path=tmp_path / "config.yaml",
+        )
+
+    assert excinfo.value.code == 128 + _signal.SIGTERM
+    assert excinfo.value.code == HOST_SIGTERM_EXIT_CODE  # 143
+
+
+def test_sighup_run_host_process_exits_129(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """SIGHUP gives exit code 129 (128 + 1), not 143."""
+    import signal as _signal
+
+    if not hasattr(_signal, "SIGHUP"):
+        pytest.skip("SIGHUP not available on this platform")
+
+    async def _fake_run(self: HostProcess) -> None:
+        self._shutdown_reason = "received SIGHUP"
+        self._shutdown_signal_num = _signal.SIGHUP
+
+    monkeypatch.setattr(HostProcess, "run", _fake_run)
+
+    with pytest.raises(SystemExit) as excinfo:
+        run_host_process(
+            server_url="https://app.example.databricks.com",
+            config_path=tmp_path / "config.yaml",
+        )
+
+    assert excinfo.value.code == 128 + _signal.SIGHUP  # 129
+
+
+async def test_keyboard_interrupt_records_sigint_reason(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """KeyboardInterrupt (Ctrl-C / SIGINT) records 'received SIGINT'."""
+    monkeypatch.setattr("omnigent.host.connect._RECONNECT_BASE_S", 0.0)
+    _patch_connect(monkeypatch, _ConnectSpy([KeyboardInterrupt()]))
+    host = _host()
+
+    await host.run()
+
+    assert host._shutdown_reason == "received SIGINT"
+
+
+async def test_cancelled_error_records_task_cancelled_reason(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """asyncio.CancelledError records 'task cancelled' as the shutdown reason."""
+    monkeypatch.setattr("omnigent.host.connect._RECONNECT_BASE_S", 0.0)
+    _patch_connect(monkeypatch, _ConnectSpy([asyncio.CancelledError()]))
+    host = _host()
+
+    await host.run()
+
+    assert host._shutdown_reason == "task cancelled"
+
+
+async def test_lifecycle_lost_records_reason(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """_lifecycle_lost set before the loop enters records 'lifecycle lost'."""
+    monkeypatch.setattr("omnigent.host.connect._RECONNECT_BASE_S", 0.0)
+    host = _host()
+    # Pre-set the flag to simulate what _lifecycle_monitor_loop does.
+    host._lifecycle_lost.set()
+
+    await host.run()
+
+    assert host._shutdown_reason == "lifecycle lost"
+
+
+async def test_host_shutdown_event_logged_before_cleanup(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, tmp_path: Path
+) -> None:
+    """host_shutdown log row is emitted before any runner-termination lines.
+
+    Registers a real tracked runner (a short-lived subprocess) so that
+    _cleanup_runners emits at least one "Terminating runner" INFO line and the
+    ordering constraint can be verified directly in caplog.
+    """
+    monkeypatch.setattr("omnigent.host.connect._RECONNECT_BASE_S", 0.0)
+    _patch_connect(monkeypatch, _ConnectSpy([asyncio.CancelledError()]))
+    host = _host()
+
+    # Register a live runner before run() so _cleanup_runners has something to log.
+    proc = subprocess.Popen(["sleep", "60"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    host._runners["runner_ordering"] = _RunnerHandle(proc=proc, log_path=tmp_path / "ordering.log")
+
+    with caplog.at_level(logging.INFO, logger="omnigent.host.connect"):
+        await host.run()
+
+    messages = [r.getMessage() for r in caplog.records]
+    shutdown_idx = next((i for i, m in enumerate(messages) if "Host shutting down" in m), None)
+    terminating_indices = [i for i, m in enumerate(messages) if "Terminating runner" in m]
+    assert shutdown_idx is not None, "host_shutdown log row must be emitted"
+    assert terminating_indices, "expected at least one Terminating runner line"
+    assert shutdown_idx < terminating_indices[0], (
+        "host_shutdown row must precede Terminating runner lines"
+    )
+
+
+async def test_sigterm_handler_install_failure_degrades(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Handler registration failure degrades gracefully — run() still completes.
+
+    Simulates a wakeup fd error (observed with zygote-forked runners) by
+    replacing asyncio.get_running_loop on the first call so add_signal_handler
+    raises RuntimeError. The host must still tear down cleanly.
+    """
+    import omnigent.host.connect as host_connect_mod
+
+    monkeypatch.setattr("omnigent.host.connect._RECONNECT_BASE_S", 0.0)
+    _patch_connect(monkeypatch, _ConnectSpy([asyncio.CancelledError()]))
+
+    real_get_running_loop = asyncio.get_running_loop
+    _first = [True]
+
+    def _once_failing_get_running_loop() -> asyncio.AbstractEventLoop:
+        loop = real_get_running_loop()
+        if _first[0]:
+            _first[0] = False
+
+            class _FailAddSig:
+                def add_signal_handler(self, sig: int, *args: object) -> None:
+                    raise RuntimeError("fd not in non-blocking mode")
+
+                def remove_signal_handler(self, sig: int) -> None:
+                    pass
+
+                def __getattr__(self, name: str) -> object:
+                    return getattr(loop, name)
+
+            return _FailAddSig()  # type: ignore[return-value]
+        return loop
+
+    monkeypatch.setattr(
+        host_connect_mod.asyncio,
+        "get_running_loop",
+        _once_failing_get_running_loop,
+    )
+
+    host = _host()
+    await host.run()
+
+    # Completed without raising: degraded without crashing.
+    assert host._shutdown_reason == "task cancelled"
