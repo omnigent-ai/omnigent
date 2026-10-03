@@ -87,7 +87,7 @@ def test_threaded_idle_watcher_reports_terminal_exit(
     )
     exited = threading.Event()
 
-    instance._capture_pane_for_idle_or_none = lambda: None  # type: ignore[method-assign]
+    instance._capture_pane_state_or_none = lambda: None  # type: ignore[method-assign]
     instance._tmux_session_exists_sync = lambda: False  # type: ignore[method-assign]
 
     instance.start_idle_watcher_thread(
@@ -146,9 +146,7 @@ async def test_async_idle_watcher_logs_correlated_probe_diagnostics(
     assert str(tmp_path) not in str(attributes)
 
 
-def test_threaded_idle_watcher_keeps_last_pane_text_on_exit(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_threaded_idle_watcher_keeps_last_pane_text_on_exit(tmp_path: Path) -> None:
     """
     The exit callback can still report the last pane text after tmux disappears.
 
@@ -162,12 +160,10 @@ def test_threaded_idle_watcher_keeps_last_pane_text_on_exit(
         running=True,
     )
     exited = threading.Event()
-    snapshots = iter(["\x1b[31mstartup failed\x1b[0m\ntry config", None, None, None])
+    snapshots = iter([(False, "\x1b[31mstartup failed\x1b[0m\ntry config"), None, None, None])
 
-    instance._capture_pane_for_idle_or_none = lambda: next(snapshots)  # type: ignore[method-assign]
+    instance._capture_pane_state_or_none = lambda: next(snapshots)  # type: ignore[method-assign]
     instance._tmux_session_exists_sync = lambda: False  # type: ignore[method-assign]
-    # The initial synthetic capture is from a live pane; never probe real tmux.
-    monkeypatch.setattr(instance, "_pane_is_dead", lambda: False)
 
     instance.start_idle_watcher_thread(
         on_exit=exited.set,
@@ -593,13 +589,15 @@ def test_threaded_idle_watcher_resets_transient_capture_failures(tmp_path: Path)
         private_dir=tmp_path,
         running=True,
     )
-    captures = iter([None, None, "recovered once", None, None, "recovered twice"])
+    captures = iter(
+        [None, None, (False, "recovered once"), None, None, (False, "recovered twice")]
+    )
     exited = threading.Event()
     recovered_twice = threading.Event()
     successful_ticks = 0
 
-    def _capture() -> str | None:
-        return next(captures, "steady")
+    def _capture() -> tuple[bool, str] | None:
+        return next(captures, (False, "steady"))
 
     def _on_tick() -> None:
         nonlocal successful_ticks
@@ -607,9 +605,8 @@ def test_threaded_idle_watcher_resets_transient_capture_failures(tmp_path: Path)
         if successful_ticks >= 2:
             recovered_twice.set()
 
-    instance._capture_pane_for_idle_or_none = _capture  # type: ignore[method-assign]
+    instance._capture_pane_state_or_none = _capture  # type: ignore[method-assign]
     instance._tmux_session_exists_sync = lambda: False  # type: ignore[method-assign]
-    instance._pane_is_dead = lambda: False  # type: ignore[method-assign]
 
     instance.start_idle_watcher_thread(
         on_exit=exited.set,
@@ -645,7 +642,7 @@ def test_threaded_idle_watcher_uses_session_probe_to_confirm_capture_failure(
             confirmed.set()
         return True
 
-    instance._capture_pane_for_idle_or_none = lambda: None  # type: ignore[method-assign]
+    instance._capture_pane_state_or_none = lambda: None  # type: ignore[method-assign]
     instance._tmux_session_exists_sync = _confirm  # type: ignore[method-assign]
 
     instance.start_idle_watcher_thread(on_exit=exited.set, poll_interval_s=0.01)
@@ -715,7 +712,7 @@ def test_threaded_idle_watcher_treats_confirmation_start_failure_as_unknown(
             retried.set()
         raise BlockingIOError(errno.EAGAIN, "resource temporarily unavailable")
 
-    instance._capture_pane_for_idle_or_none = lambda: None  # type: ignore[method-assign]
+    instance._capture_pane_state_or_none = lambda: None  # type: ignore[method-assign]
     monkeypatch.setattr(terminal_mod.subprocess, "run", _cannot_fork)
     monkeypatch.setattr(terminal_mod, "_TMUX_PROBE_START_FAILURE_BACKOFF_SECONDS", 0.01)
 
@@ -959,7 +956,7 @@ def test_capture_probe_logs_command_return_code_and_stderr(
     )
 
     with caplog.at_level(logging.WARNING, logger=terminal_mod.__name__):
-        snapshot = instance._capture_pane_for_idle_or_none()
+        snapshot = instance._capture_pane_state_or_none()
 
     assert snapshot is None
     message = caplog.records[-1].getMessage()
@@ -968,11 +965,17 @@ def test_capture_probe_logs_command_return_code_and_stderr(
     payload = json.loads(message.split("(rc=17): ", 1)[1])
     assert payload == {
         "cmd": [
-            "tmux",
+            terminal_mod._tmux_executable(),
             "-S",
             str(instance.socket_path),
             "-f",
             terminal_mod._TMUX_CONFIG_PATH,
+            "list-panes",
+            "-t",
+            "main",
+            "-F",
+            "#{pane_dead} #{pane_dead_status}",
+            ";",
             "capture-pane",
             "-t",
             "main",
@@ -1000,8 +1003,7 @@ def test_threaded_idle_watcher_fires_on_tick_each_poll(tmp_path: Path) -> None:
         running=True,
     )
     # A steady, unchanging pane: no activity edges, but ticks still fire.
-    instance._capture_pane_for_idle_or_none = lambda: "steady frame"  # type: ignore[method-assign]
-    instance._pane_is_dead = lambda: False  # type: ignore[method-assign]
+    instance._capture_pane_state_or_none = lambda: (False, "steady frame")  # type: ignore[method-assign]
     ticks = threading.Event()
     count = {"n": 0}
 
@@ -1014,6 +1016,44 @@ def test_threaded_idle_watcher_fires_on_tick_each_poll(tmp_path: Path) -> None:
     assert ticks.wait(timeout=1.0)
     instance._stop_idle_watcher_thread()
     assert count["n"] >= 3
+
+
+def test_folded_pane_capture_remembers_exit_status_in_one_tmux_call(tmp_path: Path) -> None:
+    """
+    One tmux client per tick reports pane liveness, exit code, and the frame.
+    """
+    instance = TerminalInstance(
+        name="runtime",
+        session_key="main",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path,
+        running=True,
+    )
+    calls: list[tuple[str, ...]] = []
+
+    def _tmux_output(*args: str) -> str:
+        calls.append(args)
+        return "1 42\nfinal pane frame"
+
+    instance._tmux_output_sync = _tmux_output  # type: ignore[method-assign]
+
+    assert instance._capture_pane_state_or_none() == (True, "final pane frame")
+    assert instance.last_exit_status() == 42
+    assert calls == [
+        (
+            "list-panes",
+            "-t",
+            "main",
+            "-F",
+            "#{pane_dead} #{pane_dead_status}",
+            ";",
+            "capture-pane",
+            "-t",
+            "main",
+            "-p",
+            "-e",
+        )
+    ]
 
 
 def test_pane_pid_sync_returns_pane_process_pid(tmp_path: Path) -> None:
@@ -1037,6 +1077,34 @@ def test_pane_pid_sync_returns_pane_process_pid(tmp_path: Path) -> None:
 
     instance._tmux_output_sync = _raise  # type: ignore[method-assign]
     assert instance.pane_pid_sync() is None
+
+
+def test_tmux_executable_is_resolved_once_per_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Repeated tmux spawns reuse one ``which`` lookup until ``PATH`` changes.
+    """
+    calls: list[str] = []
+
+    def _which(command: str) -> str:
+        assert command == "tmux"
+        path = terminal_mod.os.environ["PATH"]
+        calls.append(path)
+        return f"{path}/tmux"
+
+    terminal_mod._tmux_executable_for_path.cache_clear()
+    monkeypatch.setattr(terminal_mod.shutil, "which", _which)
+    try:
+        monkeypatch.setenv("PATH", "/first")
+        assert terminal_mod._tmux_executable() == "/first/tmux"
+        assert terminal_mod._tmux_executable() == "/first/tmux"
+
+        monkeypatch.setenv("PATH", "/second")
+        assert terminal_mod._tmux_executable() == "/second/tmux"
+        assert calls == ["/first", "/second"]
+    finally:
+        terminal_mod._tmux_executable_for_path.cache_clear()
 
 
 @dataclass
@@ -1167,8 +1235,7 @@ def test_threaded_idle_watcher_reports_exit_on_dead_pane(tmp_path: Path) -> None
     )
     exited = threading.Event()
     # capture-pane still succeeds (server alive); the pane is dead.
-    instance._capture_pane_for_idle_or_none = lambda: "claude exited: boom\nbye"  # type: ignore[method-assign]
-    instance._pane_is_dead = lambda: True  # type: ignore[method-assign]
+    instance._capture_pane_state_or_none = lambda: (True, "claude exited: boom\nbye")  # type: ignore[method-assign]
 
     instance.start_idle_watcher_thread(on_exit=exited.set, poll_interval_s=0.01)
 
@@ -1181,7 +1248,7 @@ def test_threaded_idle_watcher_retries_unknown_pane_death(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A pane-death probe that cannot start backs off without reporting exit."""
+    """A pane probe that cannot start backs off without reporting exit."""
     instance = TerminalInstance(
         name="runtime",
         session_key="main",
@@ -1192,8 +1259,6 @@ def test_threaded_idle_watcher_retries_unknown_pane_death(
     exited = threading.Event()
     retried = threading.Event()
     attempts = 0
-
-    instance._capture_pane_for_idle_or_none = lambda: "steady frame"  # type: ignore[method-assign]
 
     def _cannot_probe(*args: str) -> NoReturn:
         del args
@@ -1931,7 +1996,10 @@ async def test_server_survives_inner_process_exit_real_tmux(
             "exit-empty/remain-on-exit were not applied: "
             f"{probe.stderr.decode().strip()!r}"
         )
-        assert instance._pane_is_dead() is True
+        capture = instance._capture_pane_state_or_none()
+        assert capture is not None, "pane probe reported tmux gone"
+        pane_dead, _snapshot = capture
+        assert pane_dead is True
         assert instance.last_exit_status() == exit_status
         final_frame = await instance._tmux_output(
             "capture-pane", "-t", instance.tmux_target, "-p", "-S", "-100"
