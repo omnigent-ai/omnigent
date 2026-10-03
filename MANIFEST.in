@@ -1,0 +1,8 @@
+# Files the sdist must carry beyond setuptools' defaults.
+#
+# scripts/uninstall_oss.sh is copied into omnigent/resources/scripts/ at
+# wheel build time by setup.py's _bundle_scripts; without it in the sdist,
+# wheels built from the sdist ship no uninstall script and
+# `omnigent uninstall` fails with "uninstall script is missing from this
+# installation".
+include scripts/uninstall_oss.sh

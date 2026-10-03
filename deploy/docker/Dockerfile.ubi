@@ -58,6 +58,9 @@ COPY LICENSE NOTICE ./
 COPY sdks/ ./sdks/
 COPY omnigent/ ./omnigent/
 COPY examples/ ./examples/
+# setup.py's _bundle_scripts copies this into omnigent/resources/scripts/
+# and aborts the build when it's absent (`omnigent uninstall` needs it).
+COPY scripts/uninstall_oss.sh ./scripts/uninstall_oss.sh
 
 RUN python -m venv /opt/venv
 ENV VIRTUAL_ENV=/opt/venv \
