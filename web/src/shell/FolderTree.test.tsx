@@ -1,13 +1,28 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
-import { useState } from "react";
+import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+import { useContext, useState } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-const { copyTextMock, downloadMock } = vi.hoisted(() => ({
+const { copyTextMock, downloadMock, revealMock } = vi.hoisted(() => ({
   copyTextMock: vi.fn(() => Promise.resolve()),
   downloadMock: vi.fn(() => Promise.resolve()),
+  revealMock: vi.fn(),
 }));
 vi.mock("@/lib/clipboard", () => ({ copyText: copyTextMock }));
+vi.mock("./RevealInFileManager", async (importOriginal) => {
+  const actual = await importOriginal<typeof RevealInFileManagerModule>();
+  return {
+    ...actual,
+    revealInFileManager: revealMock,
+    revealLabel: (directory: boolean) => (directory ? "Open in Finder" : "Show in Finder"),
+    useRevealTarget: function useRevealTarget(path: string | null) {
+      const base = useContext(actual.RevealBaseContext);
+      return path
+        ? { hostId: "local", path: `/workspace/${[base, path].filter(Boolean).join("/")}` }
+        : null;
+    },
+  };
+});
 vi.mock("@/hooks/useFileContent", async (importOriginal) => ({
   ...(await importOriginal<typeof FileContentModule>()),
   downloadWorkspaceFile: downloadMock,
@@ -41,6 +56,7 @@ vi.mock("@/hooks/useWorkspaceChangedFiles", async (importOriginal) => ({
 import { RunnerOfflineError, type WorkspaceFile } from "@/hooks/useWorkspaceChangedFiles";
 import type * as WorkspaceChangedFilesModule from "@/hooks/useWorkspaceChangedFiles";
 import type * as FileContentModule from "@/hooks/useFileContent";
+import type * as RevealInFileManagerModule from "./RevealInFileManager";
 import userEvent from "@testing-library/user-event";
 import {
   ROW_ACTION_SIZE_CLASS,
@@ -169,6 +185,52 @@ describe("FolderTree row action paths", () => {
     renderTree({ files: [file("deeper/report.txt")], browseLocation: "/tmp/outside" });
     fireEvent.click(screen.getByRole("button", { name: "Copy path: report.txt" }));
     expect(copyTextMock).toHaveBeenCalledWith("/tmp/outside/deeper/report.txt");
+  });
+
+  it("routes actions for same-named files at different depths to each full path", async () => {
+    const user = userEvent.setup();
+    const onOpenInfo = vi.fn();
+    const paths = ["packages/app/a/x.ts", "packages/app/a/b/x.ts"];
+    renderTree({
+      files: [],
+      searchQuery: "x.ts",
+      searchResults: [file("a/x.ts", 11), file("a/b/x.ts", 22)],
+      browseLocation: "packages/app",
+      onOpenInfo,
+    });
+    const actionRows = ["a/x.ts", "a/b/x.ts"].map((relativePath) => {
+      const label = screen.getByText(relativePath);
+      const row = label.closest('[data-slot="context-menu-trigger"]');
+      expect(row).not.toBeNull();
+      return row as HTMLElement;
+    });
+    expect(actionRows).toHaveLength(2);
+
+    const exerciseRow = async (index: number, path: string) => {
+      const kebab = within(actionRows[index]).getByRole("button", {
+        name: "More actions for x.ts",
+      });
+      await user.click(kebab);
+      await user.click(await screen.findByRole("menuitem", { name: "Copy path" }));
+      expect(copyTextMock).toHaveBeenLastCalledWith(path);
+
+      await user.click(kebab);
+      await user.click(await screen.findByRole("menuitem", { name: "Download" }));
+      expect(downloadMock).toHaveBeenLastCalledWith("conv_abc", path);
+
+      await user.click(kebab);
+      await user.click(await screen.findByRole("menuitem", { name: "File info" }));
+      expect(onOpenInfo).toHaveBeenLastCalledWith(
+        expect.objectContaining({ path, name: "x.ts" }),
+        expect.any(HTMLElement),
+      );
+
+      await user.click(kebab);
+      await user.click(await screen.findByRole("menuitem", { name: "Show in Finder" }));
+      expect(revealMock).toHaveBeenLastCalledWith({ hostId: "local", path: `/workspace/${path}` });
+    };
+    await exerciseRow(0, paths[0]);
+    await exerciseRow(1, paths[1]);
   });
 });
 

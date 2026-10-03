@@ -35,6 +35,7 @@ export function FileInfoDialog({
     <Dialog open={info !== null} onOpenChange={onOpenChange}>
       {info && (
         <DialogContent
+          onEscapeKeyDown={(event) => event.stopPropagation()}
           onCloseAutoFocus={(event) => {
             event.preventDefault();
             if (returnFocus?.isConnected) returnFocus.focus();

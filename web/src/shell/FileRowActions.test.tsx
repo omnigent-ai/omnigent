@@ -1,5 +1,6 @@
 import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import { useEffect, useState, type ReactNode } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 const { copyTextMock, downloadMock, revealMock } = vi.hoisted(() => ({
@@ -37,9 +38,30 @@ const file = {
   linesRemoved: 2,
 };
 
-function renderActions(props: Partial<Parameters<typeof FileRowActions>[0]> = {}) {
+function DrawerHarness({ children }: { children: ReactNode }) {
+  const [open, setOpen] = useState(true);
+
+  useEffect(() => {
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setOpen(false);
+    };
+    window.addEventListener("keydown", closeOnEscape);
+    return () => window.removeEventListener("keydown", closeOnEscape);
+  }, []);
+
+  return (
+    <div data-testid="drawer" data-state={open ? "open" : "closed"}>
+      {children}
+    </div>
+  );
+}
+
+function renderActions(
+  props: Partial<Parameters<typeof FileRowActions>[0]> = {},
+  inDrawer = false,
+) {
   const onOpenInfo = vi.fn();
-  render(
+  const actions = (
     <FileRowActions {...file} downloadable onOpenInfo={onOpenInfo} {...props}>
       {(moreActions, rowRef) => (
         <div ref={rowRef} data-testid="file-row" tabIndex={-1}>
@@ -47,8 +69,9 @@ function renderActions(props: Partial<Parameters<typeof FileRowActions>[0]> = {}
           {moreActions}
         </div>
       )}
-    </FileRowActions>,
+    </FileRowActions>
   );
+  render(inDrawer ? <DrawerHarness>{actions}</DrawerHarness> : actions);
   return { onOpenInfo };
 }
 
@@ -133,6 +156,29 @@ describe("FileRowActions", () => {
     await user.click(await screen.findByRole("menuitem", { name: "Download" }));
     expect(downloadMock).toHaveBeenCalledWith("session-1", "/tmp/duplicate #.txt");
   });
+
+  it.each(["context menu", "kebab"])(
+    "keeps the drawer open when Escape closes the %s",
+    async (entry) => {
+      const user = userEvent.setup();
+      renderActions({}, true);
+      const row = screen.getByTestId("file-row");
+      const kebab = screen.getByRole("button", { name: `More actions for ${file.name}` });
+
+      if (entry === "context menu") {
+        row.focus();
+        fireEvent.contextMenu(row);
+      } else {
+        kebab.focus();
+        await user.keyboard("{Enter}");
+      }
+      expect(await screen.findByRole("menu")).toBeInTheDocument();
+      await user.keyboard("{Escape}");
+
+      expect(screen.getByTestId("drawer")).toHaveAttribute("data-state", "open");
+      expect(entry === "context menu" ? row : kebab).toHaveFocus();
+    },
+  );
 
   it.each(["Enter", " "])("opens the kebab with %s and returns focus after Escape", async (key) => {
     const user = userEvent.setup();
