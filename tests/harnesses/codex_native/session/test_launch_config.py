@@ -267,11 +267,7 @@ def test_build_codex_remote_args_resume_omits_positional_launch_prompt(
     codex_cli_version: tuple[int, int, int] | None,
     bypass_sandbox: bool,
 ) -> None:
-    """Resuming a thread must not resubmit the persisted positional launch prompt.
-
-    Codex parses a bare positional ahead of ``resume`` as a new ``[PROMPT]`` for
-    the resumed thread; only the reusable launch configuration may be forwarded.
-    """
+    """Resuming forwards the launch configuration but not the persisted positional prompt."""
     launch_prompt = "Reply with INITIAL_ONCE"
     args = codex_native_app_server.build_codex_remote_args(
         codex_args=("--model", "gpt-5.4-mini", launch_prompt, "--sandbox", "read-only"),
