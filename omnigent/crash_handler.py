@@ -21,6 +21,9 @@ Design notes
   the saved report path and the issue link printed plainly.
 * **KeyboardInterrupt / SystemExit** are not crashes: they defer to the
   original hooks so Ctrl-C and normal exits behave exactly as before.
+* **A broken interpreter is not a crash either.** When a standard-library
+  module fails to import, the user gets a plain explanation and no bug
+  prompt (see :mod:`omnigent._interpreter_health`).
 """
 
 from __future__ import annotations
@@ -41,6 +44,7 @@ from pathlib import Path
 from types import TracebackType
 from typing import BinaryIO, TextIO, TypedDict
 
+from omnigent._interpreter_health import broken_stdlib_module, render_broken_stdlib_notice
 from omnigent.crash_ui import real_stderr, render_crash_screen
 from omnigent.process_logging import data_dir
 
@@ -241,6 +245,11 @@ def handle_crash(
     _HANDLING.on = True
     try:
         stream = real_stderr()
+        broken = broken_stdlib_module(exc, tb)
+        if broken is not None:
+            # A damaged interpreter is not an Omnigent crash: no report, no issue prompt.
+            render_broken_stdlib_notice(exc, broken, stream)
+            return
         # Full, unmodified traceback for the saved report (real paths, every
         # frame — what a developer needs to debug). The on-screen version is
         # a compacted view of the same exception (shortened paths, collapsed
