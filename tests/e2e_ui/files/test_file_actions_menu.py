@@ -155,6 +155,18 @@ def test_touch_scroll_hold_does_not_open_menu(touch_files_page: tuple[Page, Loca
     cdp = page.context.new_cdp_session(page)
     point = _touch_point(row)
     _assert_touch_point_hits(row, point)
+
+    cdp.send("Input.dispatchTouchEvent", {"type": "touchStart", "touchPoints": [point]})
+    try:
+        page.wait_for_timeout(900)
+        expect(page.get_by_role("menuitem", name="File info")).to_be_visible()
+    finally:
+        cdp.send("Input.dispatchTouchEvent", {"type": "touchEnd", "touchPoints": []})
+    page.keyboard.press("Escape")
+    expect(page.get_by_role("menuitem", name="File info")).to_have_count(0)
+
+    point = _touch_point(row)
+    _assert_touch_point_hits(row, point)
     cdp.send("Input.dispatchTouchEvent", {"type": "touchStart", "touchPoints": [point]})
     try:
         page.wait_for_timeout(100)

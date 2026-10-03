@@ -1,5 +1,6 @@
 import { cleanup, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { afterEach, expect, it, vi } from "vitest";
 
 const { copyTextMock } = vi.hoisted(() => ({ copyTextMock: vi.fn(() => Promise.resolve()) }));
@@ -7,6 +8,40 @@ vi.mock("@/lib/clipboard", () => ({ copyText: copyTextMock }));
 
 import { FileInfoDialog } from "./FileInfoDialog";
 import type { FileRowInfo } from "./FileRowActions";
+
+function EscapeDrawer({ info }: { info: FileRowInfo }) {
+  const [open, setOpen] = useState(true);
+  const [dialogOpen, setDialogOpen] = useState(true);
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  const [returnFocus, setReturnFocus] = useState<HTMLElement | null>(null);
+
+  useLayoutEffect(() => setReturnFocus(triggerRef.current), []);
+
+  useEffect(() => {
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setOpen(false);
+    };
+    window.addEventListener("keydown", closeOnEscape);
+    return () => window.removeEventListener("keydown", closeOnEscape);
+  }, []);
+
+  return (
+    <div data-testid="drawer" data-state={open ? "open" : "closed"}>
+      {open && (
+        <>
+          <button ref={triggerRef} type="button">
+            Open info
+          </button>
+          <FileInfoDialog
+            info={dialogOpen ? info : null}
+            onOpenChange={setDialogOpen}
+            returnFocus={returnFocus}
+          />
+        </>
+      )}
+    </div>
+  );
+}
 
 afterEach(() => {
   cleanup();
@@ -54,4 +89,16 @@ it("uses Not available for unknown folder metadata", () => {
   expect(screen.getByRole("dialog", { name: "Folder info" })).toBeInTheDocument();
   expect(screen.getAllByText("Not available")).toHaveLength(2);
   expect(screen.queryByText(/size/i)).not.toBeInTheDocument();
+});
+
+it("closes Info on Escape without dismissing its containing drawer", async () => {
+  const user = userEvent.setup();
+  render(<EscapeDrawer info={{ name: "notes.txt", path: "notes.txt", kind: "file", bytes: 1 }} />);
+
+  screen.getByRole("dialog").focus();
+  await user.keyboard("{Escape}");
+
+  expect(screen.getByTestId("drawer")).toHaveAttribute("data-state", "open");
+  expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "Open info" })).toHaveFocus();
 });
