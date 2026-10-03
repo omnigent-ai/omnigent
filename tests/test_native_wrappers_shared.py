@@ -1028,6 +1028,23 @@ def test_pi_supports_approve_from_version(
     assert pi.pi_supports_approve("/bin/pi") is supported
 
 
+@pytest.mark.parametrize(
+    ("version", "supported"),
+    [
+        ((0, 80, 4), True),
+        ((0, 84, 2), True),
+        ((0, 80, 3), False),
+        (None, False),
+    ],
+)
+def test_pi_supports_agent_settled_from_version(
+    pi: ModuleType, monkeypatch: pytest.MonkeyPatch, version: object, supported: bool
+) -> None:
+    monkeypatch.setattr(pi, "pi_version", lambda executable: version)
+
+    assert pi.pi_supports_agent_settled("/bin/pi") is supported
+
+
 def test_pi_bridge_dir_is_stable_per_session(pi: ModuleType) -> None:
     first = pi.pi_bridge_dir_for_session("conv_1")
 

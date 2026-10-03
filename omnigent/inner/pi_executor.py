@@ -1662,6 +1662,25 @@ def _resolve_pi_skill_args(
     return []
 
 
+def _last_assistant_error(
+    messages: list[dict],
+    *,
+    stop_reasons: frozenset[str] = frozenset({"error"}),
+    fallback: str | None = None,
+) -> str | None:
+    """Return the error text of the last assistant message if it stopped in *stop_reasons*.
+
+    Falls back to *fallback*, then the stop reason, when ``errorMessage`` is absent.
+    """
+    for msg in reversed(messages):
+        if isinstance(msg, dict) and msg.get("role") == "assistant":
+            stop = msg.get("stopReason")
+            if stop in stop_reasons:
+                return str(msg.get("errorMessage") or fallback or stop)
+            return None
+    return None
+
+
 def _extract_pi_turn_usage(
     message: object,
     fallback_model: str | None,
@@ -1920,7 +1939,12 @@ class PiExecutor(Executor):
         # off (they don't route through Omnigent policies / history and
         # can 400 against the Databricks Responses API), and the bridge
         # extension's tools are explicitly allowlisted.
-        from omnigent.harnesses.pi_native.main import pi_supports_approve
+        from omnigent.harnesses.pi_native.main import (
+            pi_supports_agent_settled,
+            pi_supports_approve,
+        )
+
+        self._settled_supported = pi_supports_agent_settled(self._pi_path)
 
         self._extra_args: list[str] = ["--no-tools"]
         if not context_files:
@@ -2580,9 +2604,10 @@ class PiExecutor(Executor):
             yield ExecutorError(message=f"Failed to send prompt to Pi: {exc}")
             return
 
-        # Read events until agent_end.
+        # Modern Pi settles after retries, compaction, and queued continuations.
         response_text = ""
         streamed_any = False
+        message_had_output = False
         # Per-LLM-call token usage captured from each assistant message pi
         # forwards (``message_end`` is the capture site; ``agent_end`` is a
         # fallback). Summed into a turn-level usage dict at completion so a
@@ -2592,17 +2617,19 @@ class PiExecutor(Executor):
         # Error reported by a ``message_end`` (stopReason=error); surfaced at
         # ``agent_end`` so the terminal event is consumed off the RPC stream.
         pending_error: str | None = None
+        retry_error: str | None = None
+        last_end_messages: list[dict] = []
+        saw_agent_end = False
 
         while True:
-            # After an errored message the only thing left to drain is the
-            # already-emitted agent_end, so don't wait the full idle budget.
+            # Modern Pi may back off or compact after an errored message.
             line = await rpc.read_line(
                 timeout=_TURN_STDOUT_IDLE_TIMEOUT_S
-                if pending_error is None
+                if self._settled_supported or pending_error is None
                 else _TURN_STDOUT_ERROR_DRAIN_TIMEOUT_S
             )
             if line is None:
-                if pending_error is None and not rpc.stdout_at_eof():
+                if (self._settled_supported or pending_error is None) and not rpc.stdout_at_eof():
                     # Idle timeout, not process death: pi's stdout reader is
                     # still running — e.g. a long tool call silent past the
                     # idle budget. Keep waiting; a dead pi process delivers
@@ -2610,8 +2637,16 @@ class PiExecutor(Executor):
                     # bounded by the harness-level idle watchdog.
                     logger.debug("PiExecutor: stdout idle past budget; pi still running, waiting")
                     continue
-                if pending_error is not None:
-                    yield ExecutorError(message=pending_error)
+                if self._settled_supported:
+                    with contextlib.suppress(Exception):
+                        await self.close_session(session_key)
+                    yield ExecutorError(
+                        message=pending_error
+                        or retry_error
+                        or "Pi process ended before agent_settled."
+                    )
+                elif pending_error is not None or retry_error is not None:
+                    yield ExecutorError(message=pending_error or retry_error or "Pi retry failed.")
                 elif not streamed_any and not response_text:
                     stderr = "\n".join(rpc._stderr_lines) if rpc._stderr_lines else ""
                     stderr_suffix = f" Stderr: {stderr}" if stderr else ""
@@ -2639,9 +2674,25 @@ class PiExecutor(Executor):
             # Skip the command-ack response.
             if event_type == "response":
                 if not event.get("success", True):
+                    with contextlib.suppress(Exception):
+                        await self.close_session(session_key)
                     yield ExecutorError(message=event.get("error", "Pi command failed"))
                     return
                 continue
+
+            # Threshold compaction never re-runs the interrupted message; retries
+            # and overflow compaction do.
+            retries_message = event_type == "auto_retry_start" or (
+                event_type == "compaction_start" and event.get("reason") != "threshold"
+            )
+            if retries_message and message_had_output:
+                # The failed message already reached an append-only consumer.
+                with contextlib.suppress(Exception):
+                    await self.close_session(session_key)
+                yield ExecutorError(
+                    message=pending_error or retry_error or "Pi continued after partial output."
+                )
+                return
 
             # Streaming text and thinking deltas.
             if event_type == "message_update":
@@ -2650,16 +2701,19 @@ class PiExecutor(Executor):
                 if ame_type == "text_delta":
                     raw_delta = ame.get("delta")
                     if isinstance(raw_delta, str) and raw_delta:
+                        message_had_output = True
                         yield TextChunk(text=raw_delta)
                         response_text += raw_delta
                         streamed_any = True
                 elif ame_type == "thinking_start":
                     # Anchors the "Thinking…" indicator before the first delta.
+                    message_had_output = True
                     yield ReasoningChunk(delta="", event_type="reasoning_started")
                 elif ame_type == "thinking_delta":
                     raw_delta = ame.get("delta")
                     if isinstance(raw_delta, str) and raw_delta:
                         # Reasoning stays out of response_text — it is not assistant text.
+                        message_had_output = True
                         yield ReasoningChunk(delta=raw_delta, event_type="reasoning_text")
                 continue
 
@@ -2756,12 +2810,77 @@ class PiExecutor(Executor):
                 )
                 continue
 
-            # Agent ended — the turn is complete.
+            if event_type == "auto_retry_end":
+                if event.get("success") is False and (
+                    self._settled_supported or retry_error is not None
+                ):
+                    pending_error = str(
+                        event.get("finalError")
+                        or retry_error
+                        or pending_error
+                        or "Pi retry failed."
+                    )
+                    if not self._settled_supported:
+                        yield ExecutorError(message=pending_error)
+                        return
+                if event.get("success") is True:
+                    retry_error = None
+                continue
+
+            # An internal run may end before Pi retries or compacts the prompt.
             if event_type == "agent_end":
+                saw_agent_end = True
+                end_messages = event.get("messages", [])
+                if isinstance(end_messages, list):
+                    last_end_messages = end_messages
+                if event.get("willRetry") is True:
+                    if message_had_output:
+                        # Append-only consumers cannot retract a failed message.
+                        # Stop Pi before releasing the active tool context.
+                        with contextlib.suppress(Exception):
+                            await self.close_session(session_key)
+                        yield ExecutorError(
+                            message=pending_error or "Pi retry after partial output."
+                        )
+                        return
+                    retry_error = (
+                        pending_error
+                        or _last_assistant_error(last_end_messages)
+                        or "Pi retry failed."
+                    )
+                    pending_error = None
+                    continue
+                if (
+                    pending_error is None
+                    and retry_error is not None
+                    and not self._settled_supported
+                ):
+                    pending_error = (
+                        _last_assistant_error(last_end_messages, fallback=retry_error)
+                        or retry_error
+                    )
+                if self._settled_supported:
+                    continue
                 if pending_error is not None:
                     yield ExecutorError(message=pending_error)
                     return
-                end_messages = event.get("messages", [])
+            elif event_type == "agent_settled" and self._settled_supported:
+                if not saw_agent_end:
+                    continue
+                end_messages = last_end_messages
+                pending_error = (
+                    pending_error
+                    or _last_assistant_error(
+                        end_messages, stop_reasons=frozenset({"error", "aborted"})
+                    )
+                    or retry_error
+                )
+                if pending_error is not None:
+                    yield ExecutorError(message=pending_error)
+                    return
+            else:
+                end_messages = None
+            if end_messages is not None:
                 if not response_text:
                     for m in reversed(end_messages):
                         if m.get("role") == "assistant":
@@ -2807,10 +2926,18 @@ class PiExecutor(Executor):
                         message_usages.append(captured)
                     raw_stop = msg.get("stopReason")
                     stop: str | None = raw_stop if isinstance(raw_stop, str) else None
+                    # A truncated ("length") message may be re-run after overflow compaction.
+                    if (
+                        stop not in {"error", "aborted", "length"}
+                        and msg.get("role", "assistant") == "assistant"
+                    ):
+                        message_had_output = False
                     if stop == "aborted":
                         err = msg.get("errorMessage", stop)
-                        yield ExecutorError(message=str(err))
-                        return
+                        pending_error = str(err)
+                        if not self._settled_supported:
+                            yield ExecutorError(message=pending_error)
+                            return
                     if stop == "error":
                         # Pi emits the turn-terminal ``agent_end`` after an
                         # errored LLM call; returning here would leave it
@@ -2818,6 +2945,8 @@ class PiExecutor(Executor):
                         # the stale event as its own end. Record the error
                         # and keep draining until ``agent_end``.
                         pending_error = str(msg.get("errorMessage", stop))
+                    elif stop != "aborted" and msg.get("role", "assistant") == "assistant":
+                        pending_error = None
                 continue
 
             logger.debug("PiExecutor: ignoring event type=%s", event_type)
