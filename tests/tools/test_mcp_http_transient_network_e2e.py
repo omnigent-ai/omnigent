@@ -39,6 +39,7 @@ import pytest
 
 from omnigent.spec.types import MCPServerConfig, RetryPolicy
 from omnigent.tools.mcp import McpServerConnection
+from tests.tools.net_helpers import free_port, wait_for_listen
 
 _ECHO_HTTP_SERVER = str(Path(__file__).parent / "fixtures" / "echo_http_mcp_server.py")
 
@@ -67,27 +68,6 @@ _SLOW_TOOL_S = 2.0
 # Plenty for a loopback POST to reach the server and start executing,
 # and well under _SLOW_TOOL_S so the response is still pending.
 _MID_CALL_FAULT_DELAY_S = 0.5
-
-
-def _free_port() -> int:
-    """Reserve an ephemeral localhost port and return it."""
-    s = socket.socket()
-    s.bind(("127.0.0.1", 0))
-    port = s.getsockname()[1]
-    s.close()
-    return port
-
-
-def _wait_for_listen(port: int, timeout_s: float = 30.0) -> None:
-    """Poll until ``127.0.0.1:port`` accepts a TCP connection."""
-    deadline = time.monotonic() + timeout_s
-    while time.monotonic() < deadline:
-        try:
-            socket.create_connection(("127.0.0.1", port), timeout=1).close()
-            return
-        except OSError:
-            time.sleep(0.1)
-    raise TimeoutError(f"nothing listening on 127.0.0.1:{port} after {timeout_s}s")
 
 
 # SO_LINGER(onoff=1, linger=0) → RST on close. struct-packed so the
@@ -206,27 +186,6 @@ class _BlipProxy:
 
 
 @pytest.fixture()
-def _no_env_proxy(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Keep loopback traffic direct, off any corporate HTTP(S) proxy.
-
-    CI sandboxes export ``HTTP_PROXY``/``HTTPS_PROXY``; httpx honors
-    them even for 127.0.0.1, which would route the MCP traffic (and
-    the injected blip) through the proxy and distort the failure mode.
-    """
-    for var in (
-        "HTTP_PROXY",
-        "HTTPS_PROXY",
-        "http_proxy",
-        "https_proxy",
-        "ALL_PROXY",
-        "all_proxy",
-    ):
-        monkeypatch.delenv(var, raising=False)
-    monkeypatch.setenv("NO_PROXY", "127.0.0.1,localhost")
-    monkeypatch.setenv("no_proxy", "127.0.0.1,localhost")
-
-
-@pytest.fixture()
 def flaky_http_mcp(_no_env_proxy: None) -> Iterator[tuple[MCPServerConfig, _BlipProxy]]:
     """A real HTTP MCP echo server reachable only through a blip proxy.
 
@@ -234,7 +193,7 @@ def flaky_http_mcp(_no_env_proxy: None) -> Iterator[tuple[MCPServerConfig, _Blip
     at the proxy's listen port, and the test triggers the outage via
     ``proxy.blip(seconds)``.
     """
-    server_port = _free_port()
+    server_port = free_port()
     server = subprocess.Popen(
         [sys.executable, _ECHO_HTTP_SERVER, str(server_port)],
         stdout=subprocess.DEVNULL,
@@ -242,7 +201,7 @@ def flaky_http_mcp(_no_env_proxy: None) -> Iterator[tuple[MCPServerConfig, _Blip
     )
     proxy: _BlipProxy | None = None
     try:
-        _wait_for_listen(server_port)
+        wait_for_listen(server_port)
         proxy = _BlipProxy(server_port)
         config = MCPServerConfig(
             name="flaky-http-echo",
