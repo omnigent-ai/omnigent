@@ -162,6 +162,9 @@ def _spawn_daemon_from_worktree(
     env = {
         **os.environ,
         "HOME": str(tmp_path),
+        # Host identity is data-dir-scoped; point the daemon's data dir at the
+        # dir carrying the pre-seeded config.yaml (isolated per test).
+        "OMNIGENT_DATA_DIR": str(omni_dir),
         "OPENAI_BASE_URL": f"{mock_llm_server_url}/v1",
         "OPENAI_API_KEY": "mock-key",
         PROCESS_LOG_FILE_ENV_VAR: str(daemon_log),
