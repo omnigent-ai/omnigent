@@ -733,6 +733,47 @@ def _use_runner_client(monkeypatch: pytest.MonkeyPatch, runner_client: object) -
 
 
 @pytest.mark.asyncio
+async def test_session_snapshot_skips_runner_status_probe_when_excluded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``include_live_status=False`` reports cached/persisted status without probing.
+
+    Runner-owned session reads pass the flag because the probe targets the
+    very runner waiting on this response.
+    """
+    from omnigent.server.routes import sessions as _mod
+
+    session_id = "3db1c2a4e5f60718293a4b5c6d7e8f90"
+    _mod._session_status_cache.pop(session_id, None)
+    _mod._runner_status_probe_backoff.pop(session_id, None)
+
+    class _RunningRunnerClient:
+        def __init__(self) -> None:
+            self.get_calls: list[str] = []
+
+        async def get(self, url: str, timeout: float = 5.0) -> Any:
+            self.get_calls.append(url)
+            return SimpleNamespace(status_code=200, json=lambda: {"status": "running"})
+
+    runner_client = _RunningRunnerClient()
+    _use_runner_client(monkeypatch, runner_client)
+    conv_store = _ConversationStore([_message_item("item_1", "hi")])
+
+    trimmed = await _get_session_snapshot(
+        conv_store,  # type: ignore[arg-type]
+        session_id,
+        include_live_status=False,
+    )
+    assert runner_client.get_calls == []
+    assert trimmed.status == "idle"
+
+    # Same cold cache without the flag: the probe fires and reports.
+    full = await _get_session_snapshot(conv_store, session_id)  # type: ignore[arg-type]
+    assert runner_client.get_calls == [f"/v1/sessions/{session_id}"]
+    assert full.status == "running"
+
+
+@pytest.mark.asyncio
 async def test_session_snapshot_status_probe_is_bounded_and_backed_off(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
