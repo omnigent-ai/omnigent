@@ -84,16 +84,27 @@ def test_native_session_metadata_survives_missing_agent_spec_without_a_lookup() 
     assert "parent_session_id" not in attrs
 
 
-def test_metadata_resolves_the_child_agent_and_canonicalizes_aliases() -> None:
+@pytest.mark.parametrize(
+    ("resolved", "canonical"), [("agy-native", "antigravity-native"), (None, None)]
+)
+def test_metadata_resolves_the_child_agent_harness(
+    resolved: str | None, canonical: str | None
+) -> None:
     conv = _child()
-    resolver = Mock(return_value="agy-native")
+    resolver = Mock(return_value=resolved)
     with capture_debug_rows("server") as rows:
         metadata.log_session_metadata(conv, observation="message", resolve_harness=resolver)
 
     resolver.assert_called_once_with()
     attrs = rows[0]["attributes"]
-    assert attrs["harness"] == "antigravity-native"
+    if canonical is None:
+        assert "harness" not in attrs
+        assert attrs["harness_resolution"] == "unknown"
+    else:
+        assert attrs["harness"] == canonical
+        assert attrs["harness_resolution"] == "resolved"
     assert attrs["harness_source"] == "agent_spec"
+    assert "harness_lookup_error_type" not in attrs
 
 
 def test_acp_mirror_does_not_resolve_its_copied_parent_agent() -> None:
