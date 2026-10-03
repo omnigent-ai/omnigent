@@ -7,6 +7,7 @@ const { copyTextMock } = vi.hoisted(() => ({ copyTextMock: vi.fn(() => Promise.r
 vi.mock("@/lib/clipboard", () => ({ copyText: copyTextMock }));
 
 import { FileInfoDialog } from "./FileInfoDialog";
+import { FilesPanelFocusContext } from "./FileRowActions";
 import type { FileRowInfo } from "./FileRowActions";
 
 function EscapeDrawer({ info }: { info: FileRowInfo }) {
@@ -52,31 +53,39 @@ function DetachedTriggerHarness() {
   });
   const [showTrigger, setShowTrigger] = useState(true);
   const triggerRef = useRef<HTMLButtonElement>(null);
+  const panelRef = useRef<HTMLDivElement>(null);
   const [returnFocus, setReturnFocus] = useState<HTMLElement | null>(null);
 
   useLayoutEffect(() => setReturnFocus(triggerRef.current), []);
 
   return (
-    <>
-      <button type="button" role="tab" aria-selected="true" tabIndex={0}>
-        Files
-      </button>
-      {showTrigger && (
-        <button ref={triggerRef} type="button">
-          Open info
+    <FilesPanelFocusContext.Provider value={panelRef}>
+      <nav data-testid="desktop-rail" role="tablist">
+        <button type="button" role="tab" aria-selected="true" tabIndex={0}>
+          Chat
         </button>
-      )}
-      <FileInfoDialog
-        info={info}
-        onOpenChange={(open) => {
-          if (!open) {
-            setInfo(null);
-            setShowTrigger(false);
-          }
-        }}
-        returnFocus={returnFocus}
-      />
-    </>
+      </nav>
+      <aside ref={panelRef} tabIndex={-1} data-testid="files-panel-drawer" data-state="open">
+        <button type="button" role="tab" aria-selected="true" tabIndex={0}>
+          Files
+        </button>
+        {showTrigger && (
+          <button ref={triggerRef} type="button">
+            Open info
+          </button>
+        )}
+        <FileInfoDialog
+          info={info}
+          onOpenChange={(open) => {
+            if (!open) {
+              setInfo(null);
+              setShowTrigger(false);
+            }
+          }}
+          returnFocus={returnFocus}
+        />
+      </aside>
+    </FilesPanelFocusContext.Provider>
   );
 }
 
@@ -140,11 +149,11 @@ it("closes Info on Escape without dismissing its containing drawer", async () =>
   expect(screen.getByRole("button", { name: "Open info" })).toHaveFocus();
 });
 
-it("returns focus to the Files tab when the Info opener has been removed", async () => {
+it("returns focus to its Files panel when opener is gone and other tabs are selected", async () => {
   const user = userEvent.setup();
   render(<DetachedTriggerHarness />);
 
   await user.click(screen.getByRole("button", { name: "Close" }));
 
-  expect(screen.getByRole("tab", { name: "Files" })).toHaveFocus();
+  expect(screen.getByTestId("files-panel-drawer")).toHaveFocus();
 });
