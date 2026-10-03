@@ -54,6 +54,9 @@ def log_session_metadata(
     Call from a worker thread: the resolver may load the session's agent spec.
     Native mirrors use their own wrapper identity, never the parent's current
     spec. Lookup and logging failures must not interrupt session execution.
+
+    A resolver returning ``None`` produces ``agent_spec/unknown``, including
+    failures it handles internally. Only escaping exceptions are ``lookup_failed``.
     """
     if not debug_sink_enabled():
         return

@@ -125,8 +125,13 @@ def test_acp_mirror_does_not_resolve_its_copied_parent_agent() -> None:
     assert attrs["parent_session_id"] == "parent"
 
 
-@pytest.mark.parametrize("selection", ["auto", "any"])
-def test_deferred_selection_stays_unknown_until_runtime_observes_a_harness(selection: str) -> None:
+@pytest.mark.parametrize(
+    ("selection", "harness", "resolution"),
+    [("auto", None, "deferred"), ("any", None, "deferred"), ("codex", "codex", "resolved")],
+)
+def test_session_override_skips_spec_resolution(
+    selection: str, harness: str | None, resolution: str
+) -> None:
     conv = _child(harness_override=selection)
     resolver = Mock(return_value="claude-native")
     with capture_debug_rows("server") as rows:
@@ -134,8 +139,8 @@ def test_deferred_selection_stays_unknown_until_runtime_observes_a_harness(selec
 
     resolver.assert_not_called()
     attrs = rows[0]["attributes"]
-    assert "harness" not in attrs
-    assert attrs["harness_resolution"] == "deferred"
+    assert attrs.get("harness") == harness
+    assert attrs["harness_resolution"] == resolution
     assert attrs["harness_source"] == "session_override"
 
 
