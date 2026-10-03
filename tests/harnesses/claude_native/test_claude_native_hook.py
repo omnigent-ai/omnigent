@@ -21,6 +21,7 @@ from omnigent.harnesses.claude_native.bridge import (
     approval_wait_marker_path,
     build_hook_settings,
     prepare_bridge_dir,
+    read_hook_events_from_offset,
     read_transcript_path,
     record_hook_event,
     validate_claude_hook_interpreter_compatibility,
@@ -1604,6 +1605,85 @@ def test_evaluate_policy_user_prompt_submit_fails_closed_on_error(
     result = json.loads(captured.out)
     assert result["decision"] == "block"
     assert result["reason"]
+
+
+def test_evaluate_policy_user_prompt_submit_block_records_ui_notice(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """
+    A blocked UserPromptSubmit records its reason for the web chat (OMNI-10430).
+
+    The block output reaches only Claude Code's own TUI, and a blocked prompt
+    never enters the transcript the forwarder mirrors — so without a recorded
+    marker the web chat sits idle with no turn. Even when the hook's own server
+    auth is dead (login redirect and the re-mint returns no token), the hook
+    must record a ``UserPromptSubmit`` marker whose parsed
+    ``prompt_block_reason`` matches the blocked reason so the forwarder can
+    surface it.
+    """
+
+    class _RedirectClient:
+        """Stub whose POSTs bounce to the OAuth login flow like a lapsed token."""
+
+        def __init__(self, *, headers: dict[str, str], timeout: object) -> None:
+            del headers, timeout
+
+        def __enter__(self) -> _RedirectClient:
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            del args
+
+        def post(self, url: str, *, json: object = None) -> httpx.Response:
+            del json
+            return httpx.Response(
+                302,
+                headers={"Location": "https://w.example.com/oidc/x"},
+                request=httpx.Request("POST", url),
+            )
+
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", _RedirectClient)
+    # The re-mint returns no token — the OMNI-10430 failure mode.
+    monkeypatch.setattr(
+        "omnigent.runner._entry._make_auth_token_factory",
+        lambda server_url=None: lambda: "",
+    )
+    monkeypatch.setattr(native_policy_hook, "_EVALUATE_POLICY_RETRY_BUDGET_S", 0.0)
+    bridge_dir = prepare_bridge_dir("conv_abc", bridge_id="bridge_shared", workspace=tmp_path)
+    write_active_session_id(bridge_dir, "conv_active")
+    build_hook_settings(bridge_dir, ap_server_url="https://omnigents.example.databricksapps.com")
+    monkeypatch.setattr(
+        sys,
+        "stdin",
+        io.StringIO(
+            json.dumps(
+                {
+                    "hook_event_name": "UserPromptSubmit",
+                    "prompt": "hello",
+                    "session_id": "claude-session",
+                    "transcript_path": str(tmp_path / "session.jsonl"),
+                }
+            )
+        ),
+    )
+
+    exit_code = claude_native_hook.main(["evaluate-policy", "--bridge-dir", str(bridge_dir)])
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    result = json.loads(captured.out)
+    assert result["decision"] == "block"
+    assert "login redirect" in result["reason"]
+
+    records = read_hook_events_from_offset(bridge_dir, 0, start_event_count=0).records
+    markers = [record for record in records if record.prompt_block_reason is not None]
+    assert len(markers) == 1, [record.event_name for record in records]
+    assert markers[0].event_name == "UserPromptSubmit"
+    # The surfaced reason is exactly what the hook told Claude Code.
+    assert markers[0].prompt_block_reason == result["reason"]
+    assert markers[0].claude_session_id == "claude-session"
 
 
 def test_evaluate_policy_post_tool_use_fails_open_on_error(

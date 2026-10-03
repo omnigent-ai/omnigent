@@ -3846,6 +3846,48 @@ async def _forward_available_status_events(
                             hook_recorded_at=record.recorded_at,
                         ),
                     )
+            if record.prompt_block_reason is not None and not _is_subagent_hook_record(
+                record, parent_claude_session_ids=parent_claude_session_ids
+            ):
+                # A blocked prompt never reaches Claude's transcript, so the
+                # web chat would otherwise sit idle with no turn (OMNI-10430).
+                # Surface the recorded reason as an error item; the stable
+                # ``source_id`` makes retries idempotent, so hold the hook
+                # cursor and retry like status posts, dropping only after the
+                # retry budget is exhausted.
+                retry_key = f"prompt-block:{record.event_cursor}"
+                if retry_tracker.retry_delay_s(retry_key) is None:
+                    try:
+                        await _post_prompt_block_notice(
+                            client, session_id=session_id, record=record
+                        )
+                    except httpx.HTTPError as exc:
+                        block_decision = retry_tracker.record_failure(
+                            retry_key, exc, session_id=session_id
+                        )
+                        if block_decision.exhausted:
+                            _logger.error(
+                                "Dropping prompt-block notice after permanent HTTP "
+                                "failures; session=%s event_cursor=%s attempts=%s "
+                                "http_status=%s",
+                                session_id,
+                                record.event_cursor,
+                                block_decision.attempts,
+                                _http_status_for_log(exc),
+                                extra={"session_id": session_id},
+                            )
+                        else:
+                            _logger.warning(
+                                "Failed to post prompt-block notice; session=%s "
+                                "event_cursor=%s attempt=%s next_retry_s=%.3f",
+                                session_id,
+                                record.event_cursor,
+                                block_decision.attempts,
+                                block_decision.delay_s,
+                                exc_info=True,
+                                extra={"session_id": session_id},
+                            )
+                            return durable
             # Compaction boundary (PreCompact / SessionStart source=compact)
             # → forward as a compaction-status event so the web UI brackets
             # Claude's real terminal compaction with its spinner. Best-effort:
@@ -5199,6 +5241,49 @@ async def _post_external_conversation_item(
             },
         )
         resp.raise_for_status()
+
+
+async def _post_prompt_block_notice(
+    client: httpx.AsyncClient,
+    *,
+    session_id: str,
+    record: ClaudeHookRecord,
+) -> None:
+    """
+    Post one blocked-prompt reason as a persisted error item.
+
+    A ``UserPromptSubmit`` the policy hook blocks never reaches Claude's
+    transcript, so the web chat shows no turn at all — the OMNI-10430 silent
+    hang. This mirrors the recorded block reason into an ``error``
+    conversation item through the same ``external_conversation_item``
+    channel transcript mirroring uses, so the chat renders a visible
+    "prompt blocked" notice instead. The ``source_id`` keys the item to the
+    hook record, so a re-post after an ambiguous failure is a server-side
+    no-op rather than a duplicate.
+
+    :param client: Omnigent HTTP client.
+    :param session_id: Omnigent session/conversation id.
+    :param record: Hook record carrying ``prompt_block_reason``.
+    :returns: None.
+    :raises httpx.HTTPError: If the Omnigent request fails or is rejected.
+    """
+    resp = await client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={
+            "type": "external_conversation_item",
+            "data": {
+                "item_type": "error",
+                "item_data": {
+                    "source": "harness",
+                    "code": "prompt_blocked_by_policy",
+                    "title": "Prompt blocked by Omnigent policy",
+                    "message": record.prompt_block_reason,
+                },
+                "source_id": f"claude-prompt-block:{session_id}:{record.event_cursor}",
+            },
+        },
+    )
+    resp.raise_for_status()
 
 
 async def _post_external_output_text_delta(

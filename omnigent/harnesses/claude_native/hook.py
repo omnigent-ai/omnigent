@@ -963,7 +963,9 @@ def _main_evaluate_policy(argv: list[str]) -> int:
     sessions (the server-level ``_evaluate_input_policy`` skips native
     message events). A DENY emits top-level ``decision: "block"``, which
     drops the prompt before the model sees it; ASK is resolved
-    server-side; ALLOW proceeds with no output.
+    server-side; ALLOW proceeds with no output. A block (verdict or
+    fail-closed) also records a marker hook event so the background
+    forwarder can surface the reason in the web chat.
 
     For ``PostToolUse``, policy denials are surfaced as
     ``additionalContext`` (Claude sees the warning but the tool result
@@ -1031,6 +1033,7 @@ def _main_evaluate_policy(argv: list[str]) -> int:
         out = fail_ask_hook_output(hook_event, detail)
         if out is not None:
             sys.stdout.write(json.dumps(out))
+            _record_prompt_block_for_ui(bridge_dir, payload, out)
         return 0
 
     # Prefer the relay; fall back to direct server call when relay not yet up.
@@ -1085,7 +1088,55 @@ def _main_evaluate_policy(argv: list[str]) -> int:
     hook_output = evaluation_response_to_hook_output(hook_event, eval_response)
     if hook_output is not None:
         sys.stdout.write(json.dumps(hook_output))
+        _record_prompt_block_for_ui(bridge_dir, payload, hook_output)
     return 0
+
+
+def _record_prompt_block_for_ui(
+    bridge_dir: Path,
+    payload: dict[str, object],
+    hook_output: dict[str, object],
+) -> None:
+    """
+    Record a blocked ``UserPromptSubmit`` so the web chat can show why.
+
+    The block output reaches only Claude Code's own TUI; a blocked prompt
+    never enters the transcript the forwarder mirrors, so the web chat
+    sits idle with no turn. Recording a marker hook event (the same
+    ``hooks.jsonl`` tail the forwarder already drains) lets it surface the
+    reason as an error item. Never raises: the notice is best-effort and
+    must not affect the block decision itself.
+
+    :param bridge_dir: Native Claude bridge directory.
+    :param payload: Hook payload read from Claude Code stdin.
+    :param hook_output: The hook output about to be printed; only a
+        top-level ``decision: "block"`` (the ``UserPromptSubmit`` shape)
+        is recorded.
+    :returns: None.
+    """
+    if hook_output.get("decision") != "block":
+        return
+    reason = hook_output.get("reason")
+    notice: dict[str, object] = {
+        "hook_event_name": "UserPromptSubmit",
+        "omnigent_prompt_block_reason": (
+            reason.strip() if isinstance(reason, str) and reason.strip() else "Denied by policy"
+        ),
+    }
+    # Subagent prompts inherit the parent's hook settings; carry their
+    # identity so the forwarder can keep a subagent block out of the
+    # parent's chat.
+    for key in ("session_id", "transcript_path", "agent_id"):
+        value = payload.get(key)
+        if isinstance(value, str) and value:
+            notice[key] = value
+    try:
+        record_hook_event(bridge_dir, notice)
+    except Exception as exc:  # noqa: BLE001 — the notice is best-effort
+        print(
+            f"omnigent evaluate-policy hook: failed to record prompt block notice: {exc}",
+            file=sys.stderr,
+        )
 
 
 def _parse_args(argv: list[str]) -> argparse.Namespace:

@@ -949,6 +949,10 @@ class ClaudeHookRecord:
     :param failure_message: ``StopFailure`` error text Claude Code rendered
         for the turn (the payload's ``last_assistant_message``), e.g.
         ``"API Error: 500 Internal server error"``. ``None`` when absent.
+    :param prompt_block_reason: Why the evaluate-policy hook blocked this
+        ``UserPromptSubmit`` (policy DENY or fail-closed), recorded so the
+        forwarder can surface it in the web chat. ``None`` for unblocked
+        prompts and other events.
     """
 
     event_cursor: int
@@ -972,6 +976,7 @@ class ClaudeHookRecord:
     background_tasks: list[_JsonObject] | None = None
     failure_category: str | None = None
     failure_message: str | None = None
+    prompt_block_reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -3793,6 +3798,13 @@ def _hook_record_from_jsonl_record(record: _JsonlRecord) -> ClaudeHookRecord:
         failure_message = (
             _display_text(raw_message, is_api_error=True) if raw_message is not None else None
         )
+    prompt_block_reason: str | None = None
+    if event_name == "UserPromptSubmit" and isinstance(payload, dict):
+        # Marker the evaluate-policy hook records when it blocks the prompt;
+        # the forwarder surfaces it in the web chat.
+        prompt_block_reason = _bounded_hook_text(
+            payload.get("omnigent_prompt_block_reason"), _PROMPT_BLOCK_REASON_MAX_CHARS
+        )
     return ClaudeHookRecord(
         event_cursor=record.line_number,
         byte_offset=record.next_byte_offset,
@@ -3839,12 +3851,15 @@ def _hook_record_from_jsonl_record(record: _JsonlRecord) -> ClaudeHookRecord:
         background_tasks=background_tasks,
         failure_category=failure_category,
         failure_message=failure_message,
+        prompt_block_reason=prompt_block_reason,
     )
 
 
 # Bounds on ``StopFailure`` text copied into the failed status edge.
 _FAILURE_CATEGORY_MAX_CHARS = 100
 _FAILURE_MESSAGE_MAX_CHARS = 4000
+# Bound on the blocked-prompt reason surfaced in the web chat.
+_PROMPT_BLOCK_REASON_MAX_CHARS = 2000
 
 
 def _bounded_hook_text(value: object, max_chars: int) -> str | None:
