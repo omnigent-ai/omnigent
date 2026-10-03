@@ -43,6 +43,43 @@ function EscapeDrawer({ info }: { info: FileRowInfo }) {
   );
 }
 
+function DetachedTriggerHarness() {
+  const [info, setInfo] = useState<FileRowInfo | null>({
+    name: "notes.txt",
+    path: "notes.txt",
+    kind: "file",
+    bytes: 1,
+  });
+  const [showTrigger, setShowTrigger] = useState(true);
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  const [returnFocus, setReturnFocus] = useState<HTMLElement | null>(null);
+
+  useLayoutEffect(() => setReturnFocus(triggerRef.current), []);
+
+  return (
+    <>
+      <button type="button" role="tab" aria-selected="true" tabIndex={0}>
+        Files
+      </button>
+      {showTrigger && (
+        <button ref={triggerRef} type="button">
+          Open info
+        </button>
+      )}
+      <FileInfoDialog
+        info={info}
+        onOpenChange={(open) => {
+          if (!open) {
+            setInfo(null);
+            setShowTrigger(false);
+          }
+        }}
+        returnFocus={returnFocus}
+      />
+    </>
+  );
+}
+
 afterEach(() => {
   cleanup();
   vi.clearAllMocks();
@@ -101,4 +138,13 @@ it("closes Info on Escape without dismissing its containing drawer", async () =>
   expect(screen.getByTestId("drawer")).toHaveAttribute("data-state", "open");
   expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
   expect(screen.getByRole("button", { name: "Open info" })).toHaveFocus();
+});
+
+it("returns focus to the Files tab when the Info opener has been removed", async () => {
+  const user = userEvent.setup();
+  render(<DetachedTriggerHarness />);
+
+  await user.click(screen.getByRole("button", { name: "Close" }));
+
+  expect(screen.getByRole("tab", { name: "Files" })).toHaveFocus();
 });

@@ -35,10 +35,19 @@ export function FileInfoDialog({
     <Dialog open={info !== null} onOpenChange={onOpenChange}>
       {info && (
         <DialogContent
+          aria-describedby={undefined}
           onEscapeKeyDown={(event) => event.stopPropagation()}
           onCloseAutoFocus={(event) => {
             event.preventDefault();
-            if (returnFocus?.isConnected) returnFocus.focus();
+            if (returnFocus?.isConnected) {
+              returnFocus.focus();
+            } else {
+              document
+                .querySelector<HTMLElement>(
+                  '[role="tab"][aria-selected="true"], [data-testid="files-panel-drawer"] button',
+                )
+                ?.focus();
+            }
           }}
         >
           <DialogHeader>
