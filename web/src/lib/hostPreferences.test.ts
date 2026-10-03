@@ -26,6 +26,17 @@ describe("hostPreferences", () => {
     expect(readLastHostChoice()).toBe("host_abc");
   });
 
+  it("normalizes a stored choice carrying the legacy host_ id prefix", () => {
+    const bareId = "9e03c5574ba040e6b79afa47fbd59946";
+    localStorage.setItem("omnigent:last-host-choice", `host_${bareId}`);
+    expect(readLastHostChoice()).toBe(bareId);
+  });
+
+  it("leaves a non-uuid value starting with host_ untouched", () => {
+    localStorage.setItem("omnigent:last-host-choice", "host_2");
+    expect(readLastHostChoice()).toBe("host_2");
+  });
+
   it("round-trips the sandbox sentinel", () => {
     // The sandbox option has no host id, so it persists as the reserved
     // sentinel; it must survive the round trip distinctly from any host id.
