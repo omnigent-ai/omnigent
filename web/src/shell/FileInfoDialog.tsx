@@ -1,4 +1,6 @@
+import { useContext } from "react";
 import type { FileRowInfo } from "./FileRowActions";
+import { FilesPanelFocusContext } from "./FileRowActions";
 import { CopyPathButton } from "./CopyPathButton";
 import { gitStatusLabel, formatBytes } from "./fileStatusUtils";
 import { TooltipProvider } from "@/components/ui/tooltip";
@@ -27,6 +29,7 @@ export function FileInfoDialog({
   onOpenChange: (open: boolean) => void;
   returnFocus: HTMLElement | null;
 }) {
+  const panelFocusRef = useContext(FilesPanelFocusContext);
   const title = info
     ? `${info.kind === "file" ? "File" : "Folder"} info${info.lastKnown ? " (last known)" : ""}`
     : "File info";
@@ -39,14 +42,19 @@ export function FileInfoDialog({
           onEscapeKeyDown={(event) => event.stopPropagation()}
           onCloseAutoFocus={(event) => {
             event.preventDefault();
-            if (returnFocus?.isConnected) {
+            const fallback = panelFocusRef?.current;
+            if (
+              returnFocus?.isConnected &&
+              !returnFocus.matches(":disabled") &&
+              !returnFocus.closest("[inert], [aria-hidden='true']")
+            ) {
               returnFocus.focus();
-            } else {
-              document
-                .querySelector<HTMLElement>(
-                  '[role="tab"][aria-selected="true"], [data-testid="files-panel-drawer"] button',
-                )
-                ?.focus();
+            } else if (
+              fallback?.isConnected &&
+              !fallback.matches(":disabled") &&
+              !fallback.closest("[inert], [aria-hidden='true']")
+            ) {
+              fallback.focus();
             }
           }}
         >

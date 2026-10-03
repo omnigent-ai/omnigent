@@ -19,6 +19,7 @@ vi.mock("./RevealInFileManager", () => ({
 }));
 
 import { FileRowActions, type FileRowInfo } from "./FileRowActions";
+import { FileInfoDialog } from "./FileInfoDialog";
 
 afterEach(() => {
   cleanup();
@@ -237,6 +238,64 @@ describe("FileRowActions", () => {
     await user.click(await screen.findByRole("menuitem", { name: "File info" }));
 
     expect(onOpenInfo.mock.calls[0]?.[1]).toBe(kebab);
+  });
+
+  it("returns focus to the kebab when a deleted row primary action is disabled", async () => {
+    const user = userEvent.setup();
+    function DeletedRowHarness() {
+      const [info, setInfo] = useState<FileRowInfo | null>(null);
+      const [returnFocus, setReturnFocus] = useState<HTMLElement | null>(null);
+      return (
+        <>
+          <FileRowActions
+            {...file}
+            isDeleted
+            downloadable={false}
+            revealPath={null}
+            onOpenInfo={(nextInfo, target) => {
+              setInfo(nextInfo);
+              setReturnFocus(target);
+            }}
+          >
+            {(moreActions, rowRef, primaryActionRef) => (
+              <div ref={rowRef} data-testid="deleted-row">
+                <button ref={primaryActionRef} type="button" disabled>
+                  Open {file.name}
+                </button>
+                {moreActions}
+              </div>
+            )}
+          </FileRowActions>
+          <FileInfoDialog
+            info={info}
+            onOpenChange={(open) => {
+              if (!open) setInfo(null);
+            }}
+            returnFocus={returnFocus}
+          />
+        </>
+      );
+    }
+
+    render(<DeletedRowHarness />);
+    const kebab = screen.getByRole("button", { name: `More actions for ${file.name}` });
+    fireEvent.contextMenu(screen.getByTestId("deleted-row"));
+    await user.click(await screen.findByRole("menuitem", { name: "File info (last known)" }));
+    await user.click(await screen.findByRole("button", { name: "Close" }));
+
+    expect(kebab).toHaveFocus();
+  });
+
+  it("returns context-menu focus to the active in-row control", async () => {
+    const user = userEvent.setup();
+    renderActions();
+    const kebab = screen.getByRole("button", { name: `More actions for ${file.name}` });
+    kebab.focus();
+    fireEvent.contextMenu(kebab);
+
+    expect(await screen.findByRole("menu")).toBeInTheDocument();
+    await user.keyboard("{Escape}");
+    expect(kebab).toHaveFocus();
   });
 
   it("omits Browse folder when no browse action is provided", async () => {

@@ -66,13 +66,13 @@ def test_file_row_context_menu_kebab_info_and_copy(
     info.get_by_role("button", name="Close").click()
     expect(panel.get_by_role("button", name=_FILE_NAME, exact=True)).to_be_focused()
 
-    row.focus()
-    row.press("ContextMenu")
+    kebab = panel.get_by_role("button", name=f"More actions for {_FILE_NAME}")
+    kebab.focus()
+    kebab.press("ContextMenu")
     expect(page.get_by_role("menuitem", name="File info")).to_be_visible()
     page.keyboard.press("Escape")
-    expect(panel.get_by_role("button", name=_FILE_NAME, exact=True)).to_be_focused()
+    expect(kebab).to_be_focused()
 
-    kebab = panel.get_by_role("button", name=f"More actions for {_FILE_NAME}")
     kebab.focus()
     kebab.press("Enter")
     expect(page.get_by_role("menuitem", name="Copy relative path")).to_be_visible()
@@ -272,13 +272,28 @@ def _assert_size_does_not_overlap_kebab(row: Locator) -> None:
     assert layout["visibility"] == "hidden" or not layout["overlap"], layout
 
 
-def test_coarse_pointer_idle_hides_size_under_kebab(
+def test_coarse_pointer_idle_keeps_size_visible_beside_kebab(
     touch_files_page: tuple[Page, Locator],
 ) -> None:
     """At rest on a coarse pointer, the visible kebab has clear space."""
     page, row = touch_files_page
     assert page.evaluate("() => matchMedia('(pointer: coarse)').matches")
-    _assert_size_does_not_overlap_kebab(row)
+    layout = row.evaluate(
+        """row => {
+          const kebab = row.querySelector('button[aria-label^="More actions for"]');
+          const size = [...row.querySelectorAll('span.text-sm.text-muted-foreground')]
+            .find(element => /\\d+(?:\\.\\d+)?\\s+[KMGT]?B/.test(element.textContent || ''));
+          if (!kebab || !size) return null;
+          const a = size.getBoundingClientRect();
+          const b = kebab.getBoundingClientRect();
+          return {
+            visibility: getComputedStyle(size).visibility,
+            overlap: a.left < b.right && a.right > b.left && a.top < b.bottom && a.bottom > b.top,
+          };
+        }"""
+    )
+    assert layout is not None, "expected a size label and row kebab"
+    assert layout["visibility"] == "visible" and not layout["overlap"], layout
 
 
 def test_touch_scroll_hold_does_not_open_menu(touch_files_page: tuple[Page, Locator]) -> None:

@@ -14,7 +14,7 @@ import {
 } from "./fileStatusUtils";
 import { CopyPathButton } from "./CopyPathButton";
 import { FileDownloadButton } from "./FileDownloadButton";
-import { FileRowActions, ROW_MENU_SLOT_CLASS, type FileRowInfo } from "./FileRowActions";
+import { FileRowActions, ROW_MENU_SIZE_SLOT_CLASS, type FileRowInfo } from "./FileRowActions";
 import { useCursorTooltip } from "./useCursorTooltip";
 import { WorkspaceFileIcon } from "./WorkspaceFileIcon";
 
@@ -194,13 +194,14 @@ function FileListItem({
               className={cn(
                 "relative flex shrink-0 items-center justify-end",
                 ROW_META_SLOT_CLASS,
-                ROW_MENU_SLOT_CLASS,
+                ROW_MENU_SIZE_SLOT_CLASS,
+                "pointer-coarse:justify-start",
               )}
             >
               {file.bytes !== null && !isDeleted && (
                 <span
                   className={cn(
-                    "text-muted-foreground text-sm group-hover:invisible group-focus-within:invisible",
+                    "w-14 shrink-0 text-right text-muted-foreground text-sm group-hover:invisible group-focus-within:invisible",
                     actionsOpen && "invisible",
                   )}
                 >
