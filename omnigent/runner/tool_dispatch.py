@@ -45,6 +45,7 @@ if TYPE_CHECKING:
     from omnigent.runtime.filesystem_registry import FilesystemRegistry
     from omnigent.spec.types import AgentSpec, SkillSpec
     from omnigent.terminals.registry import TerminalRegistry
+    from omnigent.tools.manager import ToolManager
 
 import httpx
 
@@ -512,7 +513,62 @@ def strip_browser_tool_schemas(schemas: list[_JsonObject]) -> list[_JsonObject]:
     return kept
 
 
-def build_native_relay_tool_schemas(spec: AgentSpec | None) -> list[_JsonObject]:
+def _resolved_declared_local_python_files(
+    spec: AgentSpec,
+    local_tool_workdir: Path | None,
+) -> frozenset[Path]:
+    """Absolute paths of spec-declared server Python tool modules."""
+    from omnigent.spec.types import ToolRuntime
+
+    if local_tool_workdir is None:
+        return frozenset()
+    paths: set[Path] = set()
+    for info in spec.local_tools or []:
+        if info.language != "python" or not info.path:
+            continue
+        if info.runtime in (ToolRuntime.CLIENT, ToolRuntime.UC_FUNCTION):
+            continue
+        rel = Path(info.path)
+        resolved = rel.resolve() if rel.is_absolute() else (local_tool_workdir / rel).resolve()
+        paths.add(resolved)
+    return frozenset(paths)
+
+
+def _native_relay_local_tool_names_from_manager(
+    spec: AgentSpec,
+    manager: ToolManager,
+    local_tool_workdir: Path | None,
+) -> frozenset[str]:
+    """``@tool`` function names loaded from spec-declared Python modules only."""
+    from omnigent.spec.types import ToolRuntime
+    from omnigent.tools.local import LocalPythonTool
+    from omnigent.tools.local_callable import LocalCallableTool
+
+    declared_files = _resolved_declared_local_python_files(spec, local_tool_workdir)
+    names: set[str] = set()
+    for tool_name in manager.get_tool_names():
+        tool = manager.get_tool(tool_name)
+        if isinstance(tool, LocalPythonTool):
+            if tool._module_path.resolve() in declared_files:
+                names.add(tool_name)
+        elif isinstance(tool, LocalCallableTool):
+            for info in spec.local_tools or []:
+                if (
+                    info.language == "omnigent-python-callable"
+                    and info.path
+                    and info.name == tool_name
+                    and info.runtime not in (ToolRuntime.CLIENT, ToolRuntime.UC_FUNCTION)
+                ):
+                    names.add(tool_name)
+                    break
+    return frozenset(names)
+
+
+def build_native_relay_tool_schemas(
+    spec: AgentSpec | None,
+    *,
+    local_tool_workdir: Path | None = None,
+) -> list[_JsonObject]:
     """Build the flat Omnigent tool surface for native harness bridges.
 
     Returns the same tool set the claude-native / codex-native relay advertises
@@ -520,7 +576,10 @@ def build_native_relay_tool_schemas(spec: AgentSpec | None) -> list[_JsonObject]
     surface (``_NATIVE_RELAY_BUILTIN_TOOLS`` — comment, session read/write,
     agent-discovery, policy, and terminal families) plus the ``sys_os_*`` tools,
     relayed unconditionally so they override any harness-static versions and get
-    centralized policy enforcement on the Omnigent server.
+    centralized policy enforcement on the Omnigent server. When the session has
+    a verified agent bundle workdir, spec-declared local Python tools that
+    successfully load from that bundle are included too (native harnesses have no
+    other surface for them).
 
     Each entry is a flat ``{"name", "description", "parameters"}`` dict (the
     ``"function"`` sub-dict of an OpenAI tool schema), which is exactly what
@@ -529,6 +588,9 @@ def build_native_relay_tool_schemas(spec: AgentSpec | None) -> list[_JsonObject]
     :param spec: The session's resolved agent spec. ``None`` falls back to the
         always-on read/discovery surface (never the opt-in spawn writes, whose
         gate can't be evaluated without the spec), mirroring the relay.
+    :param local_tool_workdir: Verified bundle directory for file-based local
+        tools. When required but missing, or when loading fails, local tools are
+        omitted rather than advertised without a callable backend.
     :returns: Flat tool schemas for native bridges.
     """
     from omnigent.tools.builtins.agents import (
@@ -564,12 +626,37 @@ def build_native_relay_tool_schemas(spec: AgentSpec | None) -> list[_JsonObject]
         )
 
     if spec is not None:
+        from omnigent.tools.local import LocalToolLoadError
         from omnigent.tools.manager import ToolManager
 
-        for schema in ToolManager(spec, os_env_schema_only=True).get_tool_schemas():
-            function = _string_object_dict(schema.get("function"))
-            if function is not None and function.get("name") in _NATIVE_RELAY_BUILTIN_TOOLS:
-                _append(function)
+        effective_workdir = _coerce_local_tool_workdir(local_tool_workdir)
+        manager: ToolManager | None = None
+        relay_local_names: frozenset[str] = frozenset()
+        try:
+            try:
+                manager = ToolManager(
+                    spec,
+                    workdir=effective_workdir,
+                    os_env_schema_only=True,
+                )
+            except LocalToolLoadError:
+                manager = ToolManager(spec, workdir=None, os_env_schema_only=True)
+            else:
+                relay_local_names = _native_relay_local_tool_names_from_manager(
+                    spec,
+                    manager,
+                    effective_workdir,
+                )
+            for schema in manager.get_tool_schemas():
+                function = _string_object_dict(schema.get("function"))
+                if function is None:
+                    continue
+                name = function.get("name")
+                if name in _NATIVE_RELAY_BUILTIN_TOOLS or name in relay_local_names:
+                    _append(function)
+        finally:
+            if manager is not None:
+                manager.shutdown()
     else:
         from omnigent.tools.builtins.policy import SysAddPolicyTool, SysPolicyRegistryTool
 
@@ -915,11 +1002,19 @@ def should_dispatch_locally(tool_name: str) -> bool:
     return tool_name in _ALL_LOCAL_TOOLS
 
 
+def _coerce_local_tool_workdir(workdir: Path | str | None) -> Path | None:
+    """Normalize bundle/workdir inputs for granted-surface and ToolManager paths."""
+    if workdir is None:
+        return None
+    return workdir if isinstance(workdir, Path) else Path(workdir)
+
+
 # Granted tool names per live AgentSpec + effective harness, keyed by
 # ``id(spec)`` because AgentSpec is an unhashable dataclass. The weakref
 # guards against id reuse after the spec is garbage-collected.
 _granted_tool_names_cache: dict[
-    tuple[int, str | None], tuple[weakref.ref[AgentSpec], frozenset[str]]
+    tuple[int, str | None, str | None],
+    tuple[weakref.ref[AgentSpec], frozenset[str]],
 ] = {}
 _GRANTED_TOOL_NAMES_CACHE_MAX = 256
 
@@ -944,32 +1039,56 @@ def _effective_harness_name(agent_spec: AgentSpec, effective_harness: str | None
     return canonicalize_harness(raw) or raw
 
 
-def _granted_tool_names(agent_spec: AgentSpec, harness: str | None = None) -> frozenset[str]:
+def _granted_tool_names(
+    agent_spec: AgentSpec,
+    harness: str | None = None,
+    *,
+    local_tool_workdir: Path | None = None,
+) -> frozenset[str]:
     """Return the non-MCP tool surface advertised for *agent_spec* on *harness*.
 
     Mirrors advertisement: the names ``ToolManager`` registers, spec-local
-    tools by declared name (no workdir load needed), and ``sys_os_*`` when the
-    session runs a native harness, whose relay advertises them unconditionally
-    (see :func:`build_native_relay_tool_schemas`). MCP tools are runner-owned
-    and resolved by the MCP manager, never by this set.
+    ``@tool`` functions loaded from the bundle when *local_tool_workdir* is set
+    (otherwise declared file stems only), and ``sys_os_*`` when the session runs
+    a native harness, whose relay advertises them unconditionally (see
+    :func:`build_native_relay_tool_schemas`). MCP tools are runner-owned and
+    resolved by the MCP manager, never by this set.
 
     :param agent_spec: The session's resolved agent spec.
     :param harness: Canonical harness the session runs, from
         :func:`_effective_harness_name`. Only the native/non-native split
         matters here.
+    :param local_tool_workdir: Verified agent bundle directory. When set, file-
+        based local tools are loaded so each ``@tool`` function name counts.
     :raises Exception: Propagates ``ToolManager`` construction failures so
         callers can fail closed instead of guessing at the surface.
     """
-    cache_key = (id(agent_spec), harness)
+    local_tool_workdir = _coerce_local_tool_workdir(local_tool_workdir)
+    workdir_key = str(local_tool_workdir.resolve()) if local_tool_workdir is not None else None
+    cache_key = (id(agent_spec), harness, workdir_key)
     cached = _granted_tool_names_cache.get(cache_key)
     if cached is not None and cached[0]() is agent_spec:
         return cached[1]
-    manager = ToolManager(agent_spec, os_env_schema_only=True)
+    from omnigent.tools.local import LocalToolLoadError
+    from omnigent.tools.manager import ToolManager
+
+    try:
+        manager = ToolManager(
+            agent_spec,
+            workdir=local_tool_workdir,
+            os_env_schema_only=True,
+        )
+    except LocalToolLoadError:
+        if local_tool_workdir is not None:
+            manager = ToolManager(agent_spec, workdir=None, os_env_schema_only=True)
+        else:
+            raise
     try:
         names = set(manager.get_tool_names())
     finally:
         manager.shutdown()
-    names.update(info.name for info in agent_spec.local_tools)
+    if local_tool_workdir is None:
+        names.update(info.name for info in agent_spec.local_tools)
     if is_native_harness(harness):
         names.update(_OS_ENV_TOOLS)
     granted = frozenset(names)
@@ -983,6 +1102,8 @@ def _ungranted_tool_reason(
     tool_name: str,
     agent_spec: AgentSpec | None,
     effective_harness: str | None = None,
+    *,
+    local_tool_workdir: Path | None = None,
 ) -> str | None:
     """Return why *tool_name* is refused for *agent_spec*, or ``None`` if allowed.
 
@@ -1003,7 +1124,9 @@ def _ungranted_tool_reason(
         return None
     try:
         granted = _granted_tool_names(
-            agent_spec, _effective_harness_name(agent_spec, effective_harness)
+            agent_spec,
+            _effective_harness_name(agent_spec, effective_harness),
+            local_tool_workdir=local_tool_workdir,
         )
     except Exception as exc:
         _logger.exception("granted tool surface unavailable for %s", tool_name)
@@ -1019,14 +1142,41 @@ def _ungranted_tool_reason(
     )
 
 
-def _is_spec_local_python_tool(tool_name: str, agent_spec: AgentSpec | None) -> bool:
-    local_tools = agent_spec.local_tools if agent_spec is not None else []
-    return any(
-        getattr(info, "name", None) == tool_name
-        and getattr(info, "language", None) == "python"
-        and getattr(info, "path", None)
-        for info in local_tools
-    )
+def _is_spec_local_python_tool(
+    tool_name: str,
+    agent_spec: AgentSpec | None,
+    *,
+    local_tool_workdir: Path | None = None,
+) -> bool:
+    if agent_spec is None:
+        return False
+    local_tool_workdir = _coerce_local_tool_workdir(local_tool_workdir)
+    local_tools = agent_spec.local_tools or []
+    if any(
+        info.name == tool_name and info.language == "python" and info.path for info in local_tools
+    ):
+        return True
+    if local_tool_workdir is None:
+        return False
+    from omnigent.tools.local import LocalToolLoadError
+    from omnigent.tools.manager import ToolManager
+
+    try:
+        manager = ToolManager(
+            agent_spec,
+            workdir=local_tool_workdir,
+            os_env_schema_only=True,
+        )
+    except LocalToolLoadError:
+        return False
+    try:
+        return tool_name in _native_relay_local_tool_names_from_manager(
+            agent_spec,
+            manager,
+            local_tool_workdir,
+        )
+    finally:
+        manager.shutdown()
 
 
 async def _execute_local_python_tool(
@@ -6499,8 +6649,18 @@ async def execute_tool(
     assert args is not None
     # MCP dispatch resolves the target against the spec inside the MCP
     # manager; every other branch is gated on the spec's granted surface.
+    resolved_local_workdir = (
+        _coerce_local_tool_workdir(runner_workspace)
+        if local_tool_workdir is _UNSET_LOCAL_TOOL_WORKDIR
+        else _coerce_local_tool_workdir(cast(Path | str | None, local_tool_workdir))
+    )
     if mcp_manager is None:
-        refusal = _ungranted_tool_reason(tool_name, agent_spec, effective_harness)
+        refusal = _ungranted_tool_reason(
+            tool_name,
+            agent_spec,
+            effective_harness,
+            local_tool_workdir=resolved_local_workdir,
+        )
         if refusal is not None:
             return json.dumps({"error": refusal})
     from omnigent.sandbox.copy_on_write import has_copy_on_write
@@ -6731,7 +6891,11 @@ async def execute_tool(
                 server_client=server_client,
                 conversation_id=conversation_id,
             )
-        elif _is_spec_local_python_tool(tool_name, agent_spec):
+        elif _is_spec_local_python_tool(
+            tool_name,
+            agent_spec,
+            local_tool_workdir=resolved_local_workdir,
+        ):
             output = await _execute_local_python_tool(
                 tool_name,
                 arguments,
@@ -6740,11 +6904,7 @@ async def execute_tool(
                 task_id=task_id,
                 agent_id=agent_id,
                 runner_workspace=runner_workspace,
-                local_tool_workdir=(
-                    runner_workspace
-                    if local_tool_workdir is _UNSET_LOCAL_TOOL_WORKDIR
-                    else cast(Path | None, local_tool_workdir)
-                ),
+                local_tool_workdir=resolved_local_workdir,
             )
         elif _is_uc_function_tool(tool_name, agent_spec):
             output = await _execute_uc_function_tool(tool_name, args, agent_spec=agent_spec)
