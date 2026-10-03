@@ -371,7 +371,7 @@ def lookup(elicitation_id: str) -> tuple[str, dict[str, Any]] | None:
 
 def reset_for_tests() -> None:
     """
-    Clear the entire index. For test isolation only.
+    Clear the index and every registered callback. For test isolation only.
 
     Tests that exercise the publish or dispatch paths can mutate
     the module-global state; this resets between tests so leak
@@ -379,7 +379,8 @@ def reset_for_tests() -> None:
     production callers — there is no legitimate use case for
     wiping the index at runtime.
     """
-    global _observer
+    global _observer, _count_persist_hook
     with _lock:
         _pending.clear()
     _observer = None
+    _count_persist_hook = None
