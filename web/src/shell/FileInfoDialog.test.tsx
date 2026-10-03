@@ -1,11 +1,65 @@
 import { cleanup, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import { MemoryRouter, Route, Routes } from "react-router-dom";
+import type * as WorkspaceChangedFilesHooks from "@/hooks/useWorkspaceChangedFiles";
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { afterEach, expect, it, vi } from "vitest";
 
 const { copyTextMock } = vi.hoisted(() => ({ copyTextMock: vi.fn(() => Promise.resolve()) }));
 vi.mock("@/lib/clipboard", () => ({ copyText: copyTextMock }));
+vi.mock("@/hooks/useWorkspaceChangedFiles", async (importOriginal) => ({
+  ...(await importOriginal<typeof WorkspaceChangedFilesHooks>()),
+  useWorkspaceAllFiles: () => ({ data: { available: true, data: [] }, isLoading: false }),
+  useWorkspaceChangedFiles: () => ({ data: { available: true, data: [] }, isLoading: false }),
+  useWorkspaceDirectory: () => ({ data: [], isLoading: false, isError: false }),
+  useWorkspaceDirectories: () => new Map(),
+  useWorkspaceEnvironment: () => ({
+    data: { available: true, root: null, home: null, reachable: null },
+    isLoading: false,
+    isError: false,
+  }),
+  useWorkspaceFileSearch: () => ({
+    data: { files: [], truncated: false },
+    isFetching: false,
+    isPlaceholderData: false,
+    isLoading: false,
+    isError: false,
+  }),
+}));
+vi.mock("@/hooks/useSession", () => ({ useSession: () => ({ session: null }) }));
+vi.mock("@/hooks/RunnerHealthProvider", () => ({
+  useSessionHostOnline: () => null,
+  useSessionRunnerOnline: () => true,
+}));
+vi.mock("@/components/ui/dropdown-menu", async () => {
+  const React = await import("react");
+  const passthrough = ({ children }: { children: React.ReactNode }) => children;
+  const trigger = React.forwardRef<
+    HTMLButtonElement,
+    React.ComponentPropsWithoutRef<"button"> & { asChild?: boolean }
+  >(function Trigger({ children, asChild, ...props }, ref) {
+    if (asChild) return children;
+    return (
+      <button ref={ref} type="button" {...props}>
+        {children}
+      </button>
+    );
+  });
+  return {
+    DropdownMenu: passthrough,
+    DropdownMenuTrigger: trigger,
+    DropdownMenuContent: passthrough,
+    DropdownMenuRadioGroup: passthrough,
+    DropdownMenuRadioItem: passthrough,
+  };
+});
+vi.mock("@/store/chatStore", () => ({
+  useChatStore: (
+    selector: (state: { conversationId: string | null; sessionStatus: string }) => unknown,
+  ) => selector({ conversationId: null, sessionStatus: "ready" }),
+}));
 
+import { FilesPanel } from "./FilesPanel";
 import { FileInfoDialog } from "./FileInfoDialog";
 import { FilesPanelFocusContext } from "./FileRowActions";
 import type { FileRowInfo } from "./FileRowActions";
@@ -156,4 +210,28 @@ it("returns focus to its Files panel when opener is gone and other tabs are sele
   await user.click(screen.getByRole("button", { name: "Close" }));
 
   expect(screen.getByTestId("files-panel-drawer")).toHaveFocus();
+});
+
+it("gives its focus fallback an accessible name", () => {
+  render(
+    <MemoryRouter initialEntries={["/c/files-panel-name"]}>
+      <Routes>
+        <Route
+          path="/c/:conversationId"
+          element={
+            <FilesPanel
+              sort="recent"
+              onSortChange={vi.fn()}
+              flatView={false}
+              onFileSelect={vi.fn()}
+              showHidden={false}
+              onShowHiddenChange={vi.fn()}
+            />
+          }
+        />
+      </Routes>
+    </MemoryRouter>,
+  );
+
+  expect(screen.getByRole("region", { name: "Files" })).toHaveAttribute("tabindex", "-1");
 });
