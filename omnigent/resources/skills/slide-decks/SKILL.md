@@ -48,8 +48,10 @@ folder).
   sample kit has `layout-title`, `layout-two-col`, and the `accent` text
   class). Do not invent layout classes the kit does not define.
 - No kit: style the deck yourself with a restrained palette, and tell the user
-  they can brand future decks by copying `examples/design-kits/sample` to
-  `.omnigent/design-kit/` and editing it.
+  they can brand future decks with a kit at `.omnigent/design-kit/kit.json`
+  (a `name`, plus optional `colors`, `fonts`, `logo`, and a `css` stylesheet
+  of layout classes). The Omnigent source repository has a copyable sample at
+  `examples/design-kits/sample`.
 - A "Design kit not applied: reason" notice means the kit could not be
   applied (an invalid `kit.json` or kit file, a failed read, or a timeout);
   the notice gives the reason. Report it to the user rather than
