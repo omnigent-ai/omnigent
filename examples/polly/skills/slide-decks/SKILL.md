@@ -8,50 +8,66 @@ description: Turn context the user provides into a slide deck that the Omnigent 
 Use when the user asks for slides, a deck, or a presentation built from
 context they gave you (notes, a doc, a PR, a conversation).
 
-Writing a deck is writing HTML and CSS, so polly delegates it: dispatch an
-`implement` sub-agent and paste the "Deck format" and "Design kit" sections
-below into its contract. The deliverable is the workspace file, not a PR,
-unless the user asks to commit the deck to a repo.
+## Delegating
+
+Writing a deck is writing HTML and CSS, so polly dispatches an `implement`
+sub-agent. A worktree does not contain the kit (`.omnigent/` is gitignored)
+and is not where the user looks for the deck, so the contract must give:
+
+- the absolute workspace root;
+- the absolute output path, e.g. `<root>/decks/<slug>.slides.html`;
+- the absolute kit folder `<root>/.omnigent/design-kit/`, to read from there
+  and not from the worktree;
+- "Write only this file. Do not commit, push, or open a PR." (unless the user
+  asked to commit the deck to a repo);
+- the "Deck format" and "Design kit" sections below, pasted in.
 
 ## Deck format
 
-- The file name must end in `.slides.html` (for example
-  `decks/q3-review.slides.html`). Any other name opens in the plain HTML
-  preview instead of the deck viewer.
+- The file name must end in `.slides.html`. Any other name opens in the plain
+  HTML preview instead of the deck viewer.
 - One self-contained HTML document. Each slide is a `<section>` that is a
   direct child of `<body>`. Nested sections are not slides.
-- Design each slide for a 16:9 stage (1280x720 works well). The viewer scales
-  it to the panel, letterboxes it on phones, and prints one landscape page per
-  slide.
+- The stage is fixed at 1280x720 and scaled to fit the panel, letterboxed on
+  phones, and printed one landscape page per slide. Size each top-level
+  `<section>` to fill it (e.g. `height: 100vh`).
 - Keep everything inline: CSS in `<style>`, images as `data:` URIs. The deck
   runs in a sandboxed iframe with no access to the app or to other workspace
   files, so relative links to other files do not load. Do not rely on
   external URLs either.
 - Do not handle arrow keys or build your own navigation; the viewer owns
   previous/next, the counter, fullscreen, and print.
-- Slides may be added by script, but only before the page finishes loading;
-  the counter does not pick up slides added later.
+- Put slides in the static HTML. Slides added by script are counted only
+  before the page finishes loading, and the first slide shows before then.
 
 ## Design kit
 
-Before writing, check for `.omnigent/design-kit/kit.json` at the workspace
-root. If it exists, read it and the stylesheet named in its `css` field.
+Before writing, check for `kit.json` in the kit folder. If it exists, read it
+and the stylesheet named in its `css` field (a path relative to the kit
+folder).
 
-- The viewer enforces the kit: section background and text color, heading and
-  body fonts, and the logo on every slide come from the kit, whatever the deck
-  says. Do not set those base styles and do not add your own logo.
-- Use the kit tokens for everything else: `var(--kit-primary)`,
-  `var(--kit-secondary)`, `var(--kit-accent)`, `var(--kit-background)`,
-  `var(--kit-text)`, `var(--kit-font-heading)`, `var(--kit-font-body)`.
+- The viewer enforces what the kit defines, with `!important` rules on
+  `body`, the top-level sections, and `h1`-`h6`: section background and text
+  color, heading and body fonts, and the logo on every slide. Do not set those
+  base styles and do not add your own logo. Rules on other inner elements keep
+  the deck's own styles, so style them with the kit tokens.
+- Tokens: `--kit-primary`, `--kit-secondary`, `--kit-accent`,
+  `--kit-background`, `--kit-text`, `--kit-font-heading`, `--kit-font-body`.
+  Each exists only if the kit sets it, so give a fallback, e.g.
+  `var(--kit-primary, #333)`.
+- The logo is drawn with `section::after` and forces `position: relative` on
+  sections. Do not use `section::after`, do not position sections absolutely,
+  and keep the logo corner (about 160x56) clear.
 - Use the layout classes the kit stylesheet defines on each `<section>` (the
   sample kit has `layout-title`, `layout-two-col`, and the `accent` text
   class). Do not invent layout classes the kit does not define.
 - No kit: style the deck yourself with a restrained palette, and tell the user
   they can brand future decks by copying `examples/design-kits/sample` to
   `.omnigent/design-kit/` and editing it.
-- A "Design kit not applied: reason" notice means `kit.json` is invalid. Fix
-  the kit, not the deck. The viewer reads the kit only when a deck opens, so
-  reopen the deck after editing the kit.
+- A "Design kit not applied: reason" notice means the kit (`kit.json` or one
+  of its files) is invalid, and the notice gives the reason. Fix the kit, not
+  the deck. The viewer reads the kit when a deck opens or its content
+  changes, so reopen the deck after editing only the kit.
 
 ## Workflow
 
