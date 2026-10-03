@@ -16,7 +16,7 @@ import asyncio
 import json
 import math
 import uuid
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Iterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -52,12 +52,38 @@ from omnigent.stores.conversation_store.sqlalchemy_store import (
 )
 from omnigent.stores.host_store import HostStore
 from omnigent.tools.builtins.load_skill import format_skill_meta_text
+from tests.debug_log_helpers import capture_debug_rows
 from tests.server.helpers import create_test_agent
 
 pytestmark = pytest.mark.asyncio
 
 
 # ── Helpers ──────────────────────────────────────────────
+
+
+@pytest.fixture
+def metadata_rows(monkeypatch: pytest.MonkeyPatch) -> Iterator[list[dict[str, object]]]:
+    from omnigent.server import session_metadata_logging
+    from omnigent.server.routes.sessions import routes_events
+
+    monkeypatch.setattr(routes_events, "debug_sink_enabled", lambda: True)
+    monkeypatch.setattr(session_metadata_logging, "debug_sink_enabled", lambda: True)
+    with capture_debug_rows("server") as rows:
+        yield rows
+
+
+def _assert_activity_metadata(
+    rows: list[dict[str, object]], session_id: str, observation: str
+) -> None:
+    observations = [row for row in rows if row["event_name"] == "session_metadata"]
+    assert len(observations) == 1
+    assert observations[0]["session_id"] == session_id
+    attrs = observations[0]["attributes"]
+    assert attrs["observation"] == observation
+    assert attrs["harness"] == "claude-sdk"
+    assert attrs["harness_source"] == "agent_spec"
+    assert attrs["harness_resolution"] == "resolved"
+    assert attrs["root_session_id"] == session_id
 
 
 @pytest.mark.parametrize("role", ["user", "assistant"])
@@ -241,6 +267,7 @@ async def test_first_message_schedules_background_semantic_title(
     client: httpx.AsyncClient,
     app: Any,
     monkeypatch: pytest.MonkeyPatch,
+    metadata_rows: list[dict[str, object]],
 ) -> None:
     """The first user turn returns normally while title generation runs separately."""
     agent = await create_test_agent(client)
@@ -292,6 +319,7 @@ async def test_first_message_schedules_background_semantic_title(
         await fake_runner.aclose()
 
     assert response.status_code == 202, response.text
+    _assert_activity_metadata(metadata_rows, session["id"], "message")
     # The events endpoint seeds the title synchronously before returning, so the
     # coordinator observes the expected seed and renames it. Writing our own seed
     # here would race that rename and clobber it, so rely on the endpoint's seed.
@@ -2270,6 +2298,7 @@ async def test_external_subagent_start_rejects_missing_required_keys(
 async def test_skill_slash_command_persists_visible_item_and_hidden_meta_message(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
+    metadata_rows: list[dict[str, object]],
 ) -> None:
     """
     Structured skill slash commands persist two durable records.
@@ -2344,6 +2373,7 @@ async def test_skill_slash_command_persists_visible_item_and_hidden_meta_message
         )
         assert resp.status_code == 202, resp.text
 
+    _assert_activity_metadata(metadata_rows, session["id"], "slash_command")
     assert resp.json()["queued"] is True
     assert len(resp.json()["item_id"]) == 32
 
@@ -9540,6 +9570,7 @@ async def test_stop_session_no_runner_lifts_stop_fence(
 async def test_retry_session_reports_live_runner_noop_without_mutating_history(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
+    metadata_rows: list[dict[str, object]],
 ) -> None:
     """A live non-native runner is not falsely reported as recovered."""
     from omnigent.server.routes.sessions import routes_events
@@ -9560,6 +9591,7 @@ async def test_retry_session_reports_live_runner_noop_without_mutating_history(
     )
 
     assert response.status_code == 202, response.text
+    _assert_activity_metadata(metadata_rows, session["id"], "retry_session")
     initialize.assert_awaited_once()
     assert initialize.await_args.kwargs["suppress_recovery_turn"] is True
     assert response.json() == {
