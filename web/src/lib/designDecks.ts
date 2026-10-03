@@ -166,6 +166,23 @@ export function buildDesignGroups(
   return groups;
 }
 
+/**
+ * Landing search: a group whose workspace label or session title matches keeps
+ * all its decks, otherwise only decks whose name matches. Non-ready groups have
+ * nothing to match and are dropped while searching.
+ */
+export function filterDesignGroups(groups: DesignGroup[], query: string): DesignGroup[] {
+  const q = query.trim().toLowerCase();
+  if (!q) return groups;
+  const has = (text: string) => text.toLowerCase().includes(q);
+  return groups.flatMap((group) => {
+    if (group.status !== "ready") return [];
+    if (has(group.workspace.label)) return [group];
+    const decks = group.decks.filter((deck) => has(deck.name) || has(deck.sessionTitle));
+    return decks.length > 0 ? [{ ...group, decks }] : [];
+  });
+}
+
 /** "No decks yet" shows only once the session list settled and nothing is left to show. */
 export function isDesignListEmpty(
   groups: readonly DesignGroup[],

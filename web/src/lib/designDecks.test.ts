@@ -5,6 +5,7 @@ import {
   DESIGN_SESSION_CAP,
   buildDesignGroups,
   deckName,
+  filterDesignGroups,
   isDeckPath,
   isDesignListEmpty,
   kitIndicator,
@@ -235,5 +236,40 @@ describe("isDesignListEmpty", () => {
       [],
     );
     expect(isDesignListEmpty([loading], true)).toBe(false);
+  });
+});
+
+describe("filterDesignGroups", () => {
+  const groups = buildDesignGroups(
+    selectDesignWorkspaces(
+      [row("a", 3, { title: "Quarterly review" }), row("b", 2), row("offline", 1)],
+      NO_PROJECTS,
+      null,
+    ),
+    [
+      { status: "ok", paths: ["decks/pitch.slides.html", "decks/roadmap.slides.html"] },
+      { status: "ok", paths: ["decks/launch.slides.html"] },
+      { status: "loading" },
+    ],
+    [],
+  );
+
+  it("returns every group for an empty query", () => {
+    expect(filterDesignGroups(groups, "  ")).toBe(groups);
+  });
+
+  it("matches deck names case-insensitively and drops other groups", () => {
+    const result = filterDesignGroups(groups, "PITCH");
+    expect(result.map((g) => g.workspace.label)).toEqual(["a"]);
+    expect(result[0].decks.map((d) => d.name)).toEqual(["pitch"]);
+  });
+
+  it("keeps all decks of a group whose workspace label or session title matches", () => {
+    expect(filterDesignGroups(groups, "b")[0].decks.map((d) => d.name)).toEqual(["launch"]);
+    expect(filterDesignGroups(groups, "quarterly")[0].decks).toHaveLength(2);
+  });
+
+  it("drops groups that are not ready while searching", () => {
+    expect(filterDesignGroups(groups, "offline")).toEqual([]);
   });
 });
