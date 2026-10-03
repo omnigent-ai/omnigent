@@ -46,6 +46,7 @@ from omnigent.cli import (
 from omnigent.cli import (
     cli as cli_group,
 )
+from omnigent.host.daemon_lifecycle import read_runner_env_manifest, write_runner_env_manifest
 from omnigent.host.local_server import LocalServerStartup
 
 
@@ -505,6 +506,106 @@ def test_ensure_host_daemon_reuses_healthy_background_daemon(
 
     assert "args" not in captured  # reused, not respawned
     assert torn_down == []  # healthy daemon not torn down
+
+
+def test_ensure_host_daemon_publishes_runner_env_manifest_on_spawn(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Spawn publishes the sanitized env: named passthrough vars in, DB URI and unlisted out."""
+    captured: dict[str, object] = {}
+    _patch_daemon_spawn(monkeypatch, tmp_path, captured)
+    monkeypatch.setenv("OMNIGENT_RUNNER_ENV_PASSTHROUGH", "MY_GATEWAY_URL")
+    monkeypatch.setenv("MY_GATEWAY_URL", "https://llm.example.test")
+    monkeypatch.setenv("OMNIGENT_DATABASE_URI", "postgresql://u:pw@h/db")
+    monkeypatch.setenv("UNRELATED_SECRET", "synthetic-secret")
+
+    _ensure_host_daemon(None)
+
+    env = captured["env"]
+    assert isinstance(env, dict)
+    assert env["MY_GATEWAY_URL"] == "https://llm.example.test"
+    assert env["OMNIGENT_DATABASE_URI"] == "postgresql://u:pw@h/db"
+    manifest = read_runner_env_manifest("local", base_dir=tmp_path)
+    assert manifest is not None
+    assert manifest["OMNIGENT_RUNNER_ENV_PASSTHROUGH"] == "MY_GATEWAY_URL"
+    assert manifest["MY_GATEWAY_URL"] == "https://llm.example.test"
+    assert "UNRELATED_SECRET" not in manifest
+    assert "OMNIGENT_DATABASE_URI" not in manifest
+
+
+def test_ensure_host_daemon_refreshes_runner_env_manifest_on_background_reuse(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A reused background daemon receives each later invocation's environment."""
+    captured: dict[str, object] = {}
+    _patch_daemon_spawn(monkeypatch, tmp_path, captured)
+    _write_daemon_registry_record(
+        tmp_path,
+        pid=4242,
+        target="local",
+        mode="local",
+        server_url=None,
+        log_path=str(tmp_path / "daemon.log"),
+        started_at=1_000_000,
+        config_sig=cli.server_config_signature(),
+        resolved_server_url="http://127.0.0.1:8123",
+    )
+    monkeypatch.setattr(cli, "_pid_is_recorded_daemon", lambda record: cli._pid_alive(record.pid))
+    monkeypatch.setattr(cli, "_pid_alive", lambda pid: True)
+    monkeypatch.setattr(cli.time, "time", lambda: 1_000_100.0)
+    monkeypatch.setattr(cli, "_daemon_host_online", lambda record, **_kw: True)
+    write_runner_env_manifest(
+        "local",
+        {"PATH": "/usr/bin", "OTEL_RESOURCE_ATTRIBUTES": "deployment.environment=first-launch"},
+        base_dir=tmp_path,
+    )
+    monkeypatch.setenv("CLAUDE_CODE_ENABLE_TELEMETRY", "1")
+    monkeypatch.setenv("OTEL_RESOURCE_ATTRIBUTES", "deployment.environment=second-launch")
+
+    _ensure_host_daemon(None)
+
+    assert "args" not in captured  # reused, not respawned
+    manifest = read_runner_env_manifest("local", base_dir=tmp_path)
+    assert manifest is not None
+    assert manifest["CLAUDE_CODE_ENABLE_TELEMETRY"] == "1"
+    assert manifest["OTEL_RESOURCE_ATTRIBUTES"] == "deployment.environment=second-launch"
+
+
+def test_ensure_host_daemon_publishes_no_manifest_for_foreground_reuse(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A foreground host launches runners from its own environment, so nothing is published."""
+    captured: dict[str, object] = {}
+    _patch_daemon_spawn(monkeypatch, tmp_path, captured)
+    (tmp_path / "host.pid").write_text("4242\nlocal\n")
+    monkeypatch.setattr(cli, "_pid_is_recorded_daemon", lambda record: cli._pid_alive(record.pid))
+    monkeypatch.setattr(cli, "_pid_alive", lambda pid: True)
+
+    _ensure_host_daemon(None)
+
+    assert "args" not in captured
+    assert read_runner_env_manifest("local", base_dir=tmp_path) is None
+
+
+def test_delete_daemon_record_removes_runner_env_manifest(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(cli, "_HOST_PID_PATH", tmp_path / "host.pid")
+    record = cli._HostDaemonRecord(
+        pid=4242,
+        target="local",
+        mode="local",
+        server_url=None,
+        log_path=str(tmp_path / "daemon.log"),
+        started_at=100,
+    )
+    cli._write_daemon_record(record)
+    write_runner_env_manifest("local", {"PATH": "/usr/bin"}, base_dir=tmp_path)
+
+    cli._delete_daemon_record(record)
+
+    assert cli._find_daemon_record("local") is None
+    assert read_runner_env_manifest("local", base_dir=tmp_path) is None
 
 
 def test_ensure_host_daemon_respawns_on_host_identity_change(

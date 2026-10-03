@@ -72,6 +72,39 @@ def test_codex_executable_selection_survives_daemon_and_runner_boundaries(
 
 
 @pytest.mark.parametrize("server_url", [None, _REMOTE_SERVER_URL])
+def test_passthrough_named_variables_survive_daemon_and_runner_boundaries(
+    monkeypatch: pytest.MonkeyPatch,
+    server_url: str | None,
+) -> None:
+    """Passthrough-named non-DATABRICKS_ vars cross both hops; an unnamed sibling does not."""
+    monkeypatch.setenv("PATH", "/usr/bin")
+    monkeypatch.setenv(
+        RUNNER_ENV_PASSTHROUGH_ENV_VAR, "ANTHROPIC_CUSTOM_HEADERS, HARNESS_CLAUDE_SDK_GATEWAY_URL"
+    )
+    monkeypatch.setenv("ANTHROPIC_CUSTOM_HEADERS", "X-Gateway-Tenant: acme")
+    monkeypatch.setenv("HARNESS_CLAUDE_SDK_GATEWAY_URL", "https://gateway.example.test/anthropic")
+    monkeypatch.setenv("HARNESS_CLAUDE_SDK_GATEWAY_TOKEN", "unnamed-synthetic-secret")
+    monkeypatch.setattr("omnigent.onboarding.provider_config.load_config", dict)
+
+    daemon_env = _build_host_daemon_env(server_url=server_url)
+    runner_env = _build_runner_env(
+        daemon_env,
+        server_url=server_url or "http://localhost:6767",
+        runner_id="runner_passthrough",
+        binding_token="synthetic-binding-token",
+        workspace="/tmp/workspace",
+        parent_pid=12345,
+    )
+
+    for env in (daemon_env, runner_env):
+        assert env.get("ANTHROPIC_CUSTOM_HEADERS") == "X-Gateway-Tenant: acme"
+        assert (
+            env.get("HARNESS_CLAUDE_SDK_GATEWAY_URL") == "https://gateway.example.test/anthropic"
+        )
+        assert "HARNESS_CLAUDE_SDK_GATEWAY_TOKEN" not in env
+
+
+@pytest.mark.parametrize("server_url", [None, _REMOTE_SERVER_URL])
 def test_pi_env_denylist_reaches_runner_through_host_daemon(
     monkeypatch: pytest.MonkeyPatch,
     server_url: str | None,

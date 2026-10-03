@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import stat
 import sys
 from pathlib import Path
 
@@ -16,8 +17,12 @@ from omnigent.host.daemon_lifecycle import (
     DaemonLifecycleLock,
     HostDaemonRecord,
     daemon_record_path,
+    delete_runner_env_manifest,
     normalize_daemon_target,
+    read_runner_env_manifest,
     record_flock_is_held,
+    runner_env_manifest_path,
+    write_runner_env_manifest,
 )
 from omnigent.host.identity import HostIdentity
 
@@ -236,9 +241,20 @@ def test_background_daemon_claims_record_before_connecting(
 
     connected: list[str] = []
 
-    def _run(*, server_url: str, daemon_target: str, lifecycle_lock: object) -> None:
+    def _run(
+        *,
+        server_url: str,
+        daemon_target: str,
+        lifecycle_lock: object,
+        runner_env_target: str,
+        launch_env: dict[str, str],
+    ) -> None:
         assert record_flock_is_held(daemon_record_path(target, base_dir=tmp_path)) is True
         assert lifecycle_lock is not None
+        # The background daemon launches runners from its target's manifest,
+        # overlaid with whatever it changed in its own environment since launch.
+        assert runner_env_target == daemon_target
+        assert launch_env["OMNIGENT_HOST_DAEMON_CONFIG_SIG"] == "config-signature"
         connected.append(f"{server_url}|{daemon_target}")
 
     monkeypatch.setattr("omnigent.host.connect.run_host_process", _run)
@@ -420,3 +436,99 @@ async def test_monitor_startup_grace_before_first_ownership(
         monitor.cancel()
         with pytest.raises(asyncio.CancelledError):
             await monitor
+
+
+def test_runner_env_manifest_roundtrip_is_owner_only(tmp_path: Path) -> None:
+    env = {
+        "PATH": "/usr/bin",
+        "OMNIGENT_RUNNER_ENV_PASSTHROUGH": "MY_GATEWAY_URL",
+        "MY_GATEWAY_URL": "https://llm.example.test",
+    }
+
+    path = write_runner_env_manifest("local", env, base_dir=tmp_path)
+
+    # Kept out of the registry directory itself, which is scanned as ``*.json``.
+    assert path.parent == daemon_record_path("local", base_dir=tmp_path).parent / "runner-env"
+    if os.name == "posix":
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    assert not list(path.parent.glob(".env-*")), "temp file left behind"
+    assert read_runner_env_manifest("local", base_dir=tmp_path) == env
+
+
+def test_runner_env_manifest_rewrite_replaces_previous_values(tmp_path: Path) -> None:
+    write_runner_env_manifest("local", {"A": "1", "B": "old"}, base_dir=tmp_path)
+    write_runner_env_manifest("local", {"B": "new"}, base_dir=tmp_path)
+
+    assert read_runner_env_manifest("local", base_dir=tmp_path) == {"B": "new"}
+
+
+def test_runner_env_manifest_missing_or_malformed_is_ignored(tmp_path: Path) -> None:
+    assert read_runner_env_manifest("local", base_dir=tmp_path) is None
+
+    path = runner_env_manifest_path("local", base_dir=tmp_path)
+    path.parent.mkdir(parents=True)
+    for payload in (
+        "{not json",
+        '{"version": 1, "env": ["PATH"]}',
+        '{"version": 2, "env": {"PATH": "/usr/bin"}}',
+        '{"version": 1, "env": {"PATH": 1}}',
+    ):
+        path.write_text(payload)
+        path.chmod(0o600)
+        assert read_runner_env_manifest("local", base_dir=tmp_path) is None, payload
+
+
+@pytest.mark.skipif(os.name != "posix", reason="file mode and symlink checks are POSIX-only")
+def test_runner_env_manifest_rejects_shared_or_indirect_files(tmp_path: Path) -> None:
+    """A manifest another user could have written never feeds runner launches."""
+    path = write_runner_env_manifest("local", {"PATH": "/usr/bin"}, base_dir=tmp_path)
+
+    path.chmod(0o644)
+    assert read_runner_env_manifest("local", base_dir=tmp_path) is None
+    path.chmod(0o600)
+    assert read_runner_env_manifest("local", base_dir=tmp_path) == {"PATH": "/usr/bin"}
+
+    target = tmp_path / "elsewhere.json"
+    path.rename(target)
+    path.symlink_to(target)
+    assert read_runner_env_manifest("local", base_dir=tmp_path) is None
+
+
+def test_delete_runner_env_manifest_is_idempotent(tmp_path: Path) -> None:
+    write_runner_env_manifest("local", {"PATH": "/usr/bin"}, base_dir=tmp_path)
+
+    delete_runner_env_manifest("local", base_dir=tmp_path)
+    delete_runner_env_manifest("local", base_dir=tmp_path)
+
+    assert read_runner_env_manifest("local", base_dir=tmp_path) is None
+
+
+def test_host_launches_runners_from_the_target_manifest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Background daemons launch from the manifest (host-set vars on top);
+    foreground hosts, or no manifest, use os.environ."""
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("OTEL_RESOURCE_ATTRIBUTES", "deployment.environment=first-launch")
+    monkeypatch.delenv("DATABRICKS_CONFIG_PROFILE", raising=False)
+    identity = HostIdentity(host_id="host_manifest", name="test")
+    background = HostProcess(
+        identity=identity,
+        server_url="http://localhost:8000",
+        runner_env_target="local",
+        launch_env=dict(os.environ),
+    )
+    foreground = HostProcess(identity=identity, server_url="http://localhost:8000")
+    # Host initialization materialized its own Databricks profile.
+    monkeypatch.setenv("DATABRICKS_CONFIG_PROFILE", "omnigent-host")
+
+    assert background._runner_launch_base_env() is os.environ
+
+    published = {"PATH": "/usr/bin", "OTEL_RESOURCE_ATTRIBUTES": "deployment.environment=later"}
+    write_runner_env_manifest("local", published)
+
+    assert background._runner_launch_base_env() == {
+        **published,
+        "DATABRICKS_CONFIG_PROFILE": "omnigent-host",
+    }
+    assert foreground._runner_launch_base_env() is os.environ
