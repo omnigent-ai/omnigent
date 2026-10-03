@@ -6,8 +6,10 @@ import asyncio
 import gzip
 import io
 import logging
+import os
 import tarfile
 import tempfile
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
@@ -400,6 +402,22 @@ def _summary_from_spec(spec: AgentSpec, name: str) -> MCPServerSummary:
     raise OmnigentError("MCP server was not saved", code=ErrorCode.INTERNAL_ERROR)
 
 
+def _atomic_write_yaml_mapping(path: Path, data: dict[str, Any]) -> None:
+    """Write a YAML mapping to *path* atomically via temp-file rename.
+
+    A plain ``write_text`` truncates first then writes, leaving a window
+    where a concurrent reader sees an empty file. Writing to a sibling temp
+    and ``os.replace``-ing into place keeps the file always complete.
+    """
+    tmp = path.with_name(f"{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        tmp.write_text(yaml.safe_dump(data, sort_keys=False))
+        os.replace(tmp, path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
 def _write_new_mcp_server(root: Path, body: UpsertMCPServerRequest) -> None:
     """Create an MCP declaration in the bundle."""
     inline_path = _single_yaml_path(root)
@@ -410,7 +428,7 @@ def _write_new_mcp_server(root: Path, body: UpsertMCPServerRequest) -> None:
     mcp_dir = root / "tools" / "mcp"
     mcp_dir.mkdir(parents=True, exist_ok=True)
     path = mcp_dir / f"{body.name}.yaml"
-    path.write_text(yaml.safe_dump(_body_to_file_yaml(body, {}), sort_keys=False))
+    _atomic_write_yaml_mapping(path, _body_to_file_yaml(body, {}))
 
 
 def _replace_mcp_server(
@@ -421,9 +439,7 @@ def _replace_mcp_server(
     """Replace an existing MCP declaration."""
     if location.source == "file":
         next_path = location.path.with_name(f"{body.name}.yaml")
-        next_path.write_text(
-            yaml.safe_dump(_body_to_file_yaml(body, location.raw), sort_keys=False)
-        )
+        _atomic_write_yaml_mapping(next_path, _body_to_file_yaml(body, location.raw))
         if next_path != location.path:
             location.path.unlink()
         return
@@ -440,7 +456,7 @@ def _delete_mcp_server(location: _McpLocation, target_name: str) -> None:
     tools = config.get("tools")
     if isinstance(tools, dict):
         tools.pop(target_name, None)
-    location.path.write_text(yaml.safe_dump(config, sort_keys=False))
+    _atomic_write_yaml_mapping(location.path, config)
 
 
 def _find_mcp_location(root: Path, name: str) -> _McpLocation | None:
@@ -493,7 +509,7 @@ def _write_inline_server(
     if old_name is not None and old_name != body.name:
         tools.pop(old_name, None)
     tools[body.name] = _body_to_inline_yaml(body, existing)
-    config_path.write_text(yaml.safe_dump(config, sort_keys=False))
+    _atomic_write_yaml_mapping(config_path, config)
 
 
 def _body_to_file_yaml(

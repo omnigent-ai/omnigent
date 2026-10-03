@@ -1096,7 +1096,14 @@ def _build_acp_bundle(*, harness: str, name: str) -> bytes:
     with tempfile.TemporaryDirectory() as tmpdir:
         source = Path(tmpdir) / "src"
         source.mkdir()
-        (source / "config.yaml").write_text(yaml.safe_dump(raw, sort_keys=False))
+        config_path = source / "config.yaml"
+        tmp_config = config_path.with_name(f"config.yaml.{uuid.uuid4().hex}.tmp")
+        try:
+            tmp_config.write_text(yaml.safe_dump(raw, sort_keys=False))
+            os.replace(tmp_config, config_path)
+        except BaseException:
+            tmp_config.unlink(missing_ok=True)
+            raise
         bundle_dir = materialize_bundle(source, Path(tmpdir) / "bundle")
         return _tar_gz_dir(bundle_dir)
 
