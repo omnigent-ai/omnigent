@@ -5,7 +5,7 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 
 function formatModifiedAt(modifiedAt: number | null | undefined): string {
-  if (modifiedAt === null || modifiedAt === undefined) return "Not available";
+  if (modifiedAt == null) return "Not available";
   const date = new Date(modifiedAt * 1000);
   return Number.isNaN(date.getTime())
     ? "Not available"
@@ -54,12 +54,12 @@ export function FileInfoDialog({
               </TooltipProvider>
             </dd>
             <dt className="text-muted-foreground">Kind</dt>
-            <dd>{info.kind === "folder" ? "folder" : "file"}</dd>
+            <dd>{info.kind}</dd>
             {info.kind === "file" && (
               <>
                 <dt className="text-muted-foreground">Size</dt>
                 <dd>
-                  {info.bytes === null || info.bytes === undefined || !Number.isFinite(info.bytes)
+                  {info.bytes == null || !Number.isFinite(info.bytes)
                     ? "Not available"
                     : formatBytes(info.bytes)}
                 </dd>
@@ -69,13 +69,13 @@ export function FileInfoDialog({
             <dd>{formatModifiedAt(info.modifiedAt)}</dd>
             <dt className="text-muted-foreground">Changes</dt>
             <dd>{changeStatus(info)}</dd>
-            {info.linesAdded !== null && info.linesAdded !== undefined && (
+            {info.linesAdded != null && (
               <>
                 <dt className="text-muted-foreground">Lines added</dt>
                 <dd>{info.linesAdded}</dd>
               </>
             )}
-            {info.linesRemoved !== null && info.linesRemoved !== undefined && (
+            {info.linesRemoved != null && (
               <>
                 <dt className="text-muted-foreground">Lines removed</dt>
                 <dd>{info.linesRemoved}</dd>
