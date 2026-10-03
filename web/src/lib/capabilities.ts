@@ -1,4 +1,4 @@
-/**
+﻿/**
  * Runtime capabilities probe.
  *
  * Hits ``GET /v1/info`` once at app boot to learn what the server
@@ -404,6 +404,7 @@ const SANDBOX_PROVIDER_NAMES: Record<string, string> = {
   lakebox: "Databricks",
   daytona: "Daytona",
   e2b: "E2B",
+  agent_sandbox: "Agent Sandbox",
 };
 
 /**
