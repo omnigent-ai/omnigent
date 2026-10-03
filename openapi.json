@@ -6200,7 +6200,7 @@
         "type": "object"
       },
       "SessionMcpStartupEvent": {
-        "description": "Per-MCP-server startup progress for a native harness session.\n\nA codex-native session brings up its configured MCP servers when its\nCodex thread starts; slow or failing servers previously left the web\nsession looking hung with no signal. The native forwarder mirrors\nCodex's `mcpServer/startupStatus/updated` notifications as\n`external_mcp_startup` posts, republished here so the web UI can\nshow which servers are still starting and which failed or were\ncancelled.",
+        "description": "Per-MCP-server startup state for a session.\n\nNative harnesses (codex-native) mirror their MCP startup progress as\n`external_mcp_startup` posts. SDK-harness sessions have no startup\nsequence, so the failures reported by the runner's per-turn\n`tools/list` are folded into this same event. The web UI renders\nboth on its MCP surfaces.",
         "properties": {
           "conversation_id": {
             "description": "Session identifier, e.g. `\"conv_abc123\"`.",
