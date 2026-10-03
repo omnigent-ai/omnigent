@@ -49,10 +49,16 @@ export const CLAUDE_NATIVE_PERMISSION_MODES: ClaudePermissionModeOption[] = [
   },
 ];
 
-/** Modes a running session can be switched to (shift+tab-reachable). */
+/**
+ * Modes a running session can be switched to (shift+tab-reachable).
+ *
+ * `auto` is launch-only here: it joins Claude Code's cycle only on accounts
+ * that have the mode, which the web cannot detect, so offering it would fail
+ * the switch for everyone else (same treatment as dontAsk/bypassPermissions).
+ */
 export const CLAUDE_NATIVE_SWITCHABLE_PERMISSION_MODES: ClaudePermissionModeOption[] =
   CLAUDE_NATIVE_PERMISSION_MODES.filter((mode) =>
-    ["default", "acceptEdits", "plan", "auto"].includes(mode.value),
+    ["default", "acceptEdits", "plan"].includes(mode.value),
   );
 
 export function isSwitchableClaudePermissionMode(mode: string | null | undefined): boolean {
