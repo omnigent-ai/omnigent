@@ -213,7 +213,7 @@ it("returns focus to its Files panel when opener is gone and other tabs are sele
 });
 
 it("gives its focus fallback an accessible name", () => {
-  render(
+  const panel = (flatView: boolean) => (
     <MemoryRouter initialEntries={["/c/files-panel-name"]}>
       <Routes>
         <Route
@@ -222,7 +222,7 @@ it("gives its focus fallback an accessible name", () => {
             <FilesPanel
               sort="recent"
               onSortChange={vi.fn()}
-              flatView={false}
+              flatView={flatView}
               onFileSelect={vi.fn()}
               showHidden={false}
               onShowHiddenChange={vi.fn()}
@@ -230,8 +230,13 @@ it("gives its focus fallback an accessible name", () => {
           }
         />
       </Routes>
-    </MemoryRouter>,
+    </MemoryRouter>
   );
+  const { rerender } = render(panel(false));
 
   expect(screen.getByRole("region", { name: "Files" })).toHaveAttribute("tabindex", "-1");
+
+  rerender(panel(true));
+
+  expect(screen.getByRole("region", { name: "Changes" })).toHaveAttribute("tabindex", "-1");
 });
