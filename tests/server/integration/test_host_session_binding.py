@@ -439,7 +439,7 @@ async def test_managed_session_create_end_to_end(
     # background task's runner-tunnel wait so it settles (and the
     # task finishes) within the test instead of lingering 30s.
     monkeypatch.setattr(
-        "omnigent.server.routes.sessions._HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S", 0.2
+        "omnigent.server.routes.sessions._HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S", budget(0.2)
     )
     loop = asyncio.get_running_loop()
     host_futures: list[asyncio.Future[ApplicationCommunicator]] = []
