@@ -16,6 +16,8 @@ const CLAUDE_SKILLS = [
   "dev-productivity-survey",
 ];
 const CODEX_SKILLS = ["code-review", "fix-lint", "ship"];
+const pluginSkills = (plugin: string, count: number) =>
+  Array.from({ length: count }, (_, i) => `${plugin}-skill-${i + 1}`);
 
 export const MOCK_IMPORT_CONTEXT: ImportContext = {
   credentials: [
@@ -46,8 +48,18 @@ export const MOCK_IMPORT_CONTEXT: ImportContext = {
     ...CODEX_SKILLS.map((name) => ({ id: `codex:${name}`, name, harness: "codex" as const })),
   ],
   plugins: [
-    { id: "claude:frontend-toolkit", name: "frontend-toolkit", harness: "claude", skillCount: 12 },
-    { id: "claude:dev-productivity", name: "dev-productivity", harness: "claude", skillCount: 8 },
-    { id: "claude:figma", name: "figma", harness: "claude", skillCount: 1 },
+    {
+      id: "claude:frontend-toolkit",
+      name: "frontend-toolkit",
+      harness: "claude",
+      skills: pluginSkills("frontend-toolkit", 12),
+    },
+    {
+      id: "claude:dev-productivity",
+      name: "dev-productivity",
+      harness: "claude",
+      skills: pluginSkills("dev-productivity", 8),
+    },
+    { id: "claude:figma", name: "figma", harness: "claude", skills: ["figma-use"] },
   ],
 };
