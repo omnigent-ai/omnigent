@@ -87,7 +87,7 @@ Single table with a `type` discriminator and a JSON `data` blob for type-specifi
 | position | Integer NOT NULL | Ordering within conversation |
 | type | String(32) NOT NULL | message, function_call, function_call_output, reasoning |
 | data | Text NOT NULL | JSON blob — type-specific fields (see below) |
-| search_text | Text NOT NULL | Extracted plain text for full-text search (see below) |
+| search_text | Text | Nullable — extracted plain text for full-text search (see below); NULL when the store cannot derive one from opaque `data`, and such rows are never matched by search |
 | created_by | String(128) | Nullable — identity of the human actor who authored the item; `None` for agent/tool/system items |
 
 **Indexes:** `ix_conversation_items_conversation_id_position` (composite), `ix_conversation_items_response_id`
@@ -182,6 +182,9 @@ Populated by `ConversationStore.append()` before inserting. Extraction by item t
 - **reasoning**: concatenate all `text` values from the `summary` array
 
 This is a shared code path — both backends populate the same `search_text` column.
+A store that holds `data` opaquely overrides `SqlAlchemyConversationStore._item_search_text`
+to return `None`; its rows are stored with a NULL `search_text`, get no FTS row, and are
+never matched by search.
 
 #### Backend-specific indexing
 
