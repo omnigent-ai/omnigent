@@ -288,9 +288,8 @@ export function ComposerChipRow({ className, ...props }: ComponentPropsWithoutRe
 }
 
 /**
- * One feedback line under the input (rejected attachments, slash-command
- * errors and /help output). The row's own border box sits on the shared
- * inset line, so it margins rather than pads.
+ * One feedback line under the input (for example, rejected attachments).
+ * Its border box sits on the shared inset line, so it uses margins.
  */
 export function ComposerFeedbackRow({
   tone = "muted",
