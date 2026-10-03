@@ -7,6 +7,7 @@ import {
   RunnerOfflineError,
   type WorkspaceChangedFile,
   type WorkspaceFile,
+  joinBrowseLocation,
   useWorkspaceDirectories,
 } from "@/hooks/useWorkspaceChangedFiles";
 import { cn } from "@/lib/utils";
@@ -23,7 +24,13 @@ import {
 } from "./fileStatusUtils";
 import { CopyPathButton } from "./CopyPathButton";
 import { FileDownloadButton } from "./FileDownloadButton";
-import { RevealBaseContext, useRevealMenu } from "./RevealInFileManager";
+import { RevealBaseContext } from "./RevealInFileManager";
+import {
+  FileRowActions,
+  ROW_MENU_SIZE_SLOT_CLASS,
+  ROW_MENU_SLOT_CLASS,
+  type FileRowInfo,
+} from "./FileRowActions";
 import { useCursorTooltip } from "./useCursorTooltip";
 import { WorkspaceFileIcon } from "./WorkspaceFileIcon";
 
@@ -425,6 +432,7 @@ function FolderTreeInner({
   browseLocation = "",
   onNavigateDir,
   onExitSearch,
+  onOpenInfo,
   scrollParentRef,
   refreshToken = 0,
 }: {
@@ -474,6 +482,8 @@ function FolderTreeInner({
    * in the tree: the panel drops back to the tree with that folder expanded.
    */
   onExitSearch?: () => void;
+  /** Opens the Files panel's client-side metadata dialog. */
+  onOpenInfo?: (info: FileRowInfo, returnFocus: HTMLElement | null) => void;
   /**
    * The scroll container the tree lives in (FilesPanel's `<section>`). When
    * provided, the virtualizer windows rows against THIS element so it shares
@@ -569,8 +579,8 @@ function FolderTreeInner({
   }, [cacheKey, treeFiles]);
 
   // Map from file path → change status, for file-level badges in the tree.
-  const changedFileMap = useMemo<Map<string, WorkspaceChangedFile["status"]>>(() => {
-    return new Map(scopedChangedFiles.map((f) => [f.path, f.status]));
+  const changedFileMap = useMemo<Map<string, WorkspaceChangedFile>>(() => {
+    return new Map(scopedChangedFiles.map((file) => [file.path, file]));
   }, [scopedChangedFiles]);
 
   // Map from directory path → highest-priority change status of any descendant.
@@ -815,8 +825,11 @@ function FolderTreeInner({
               file={file}
               onFileSelect={onFileSelect}
               onRevealDir={revealDirectory}
+              onNavigateDir={onNavigateDir}
               conversationId={conversationId}
               changedFileMap={changedFileMap}
+              browseLocation={browseLocation}
+              onOpenInfo={onOpenInfo}
             />
           ))}
         </ul>
@@ -900,6 +913,8 @@ function FolderTreeInner({
                   changedFileMap={changedFileMap}
                   dirtyDirMap={dirtyDirMap}
                   onNavigateDir={onNavigateDir}
+                  browseLocation={browseLocation}
+                  onOpenInfo={onOpenInfo}
                   highlighted={row.kind === "node" && row.key === revealedPath}
                 />
               )}
@@ -939,16 +954,21 @@ function FolderTreeInner({
  */
 function FileRowItem({
   path,
+  name,
   displayLabel,
   labelIsPath = false,
   depth = 0,
   fileStatus,
   bytes,
+  modifiedAt,
   onFileSelect,
   conversationId,
+  browseLocation,
+  onOpenInfo,
 }: {
-  /** Canonical workspace-relative path, used for the download button and title. */
+  /** Path relative to the current browse location. */
   path: string;
+  name: string;
   /** Text shown in the label span — full path for search results, filename for tree. */
   displayLabel: string;
   /** When true the label uses rtl truncation and wraps content in <bdi>. */
@@ -957,94 +977,129 @@ function FileRowItem({
    *  results pass 0 for a flat, guide-less list. The file icon sits in the
    *  same column as a folder's chevron at this depth. */
   depth?: number;
-  fileStatus: WorkspaceChangedFile["status"] | undefined;
+  fileStatus: WorkspaceChangedFile | undefined;
   bytes: number | null;
+  modifiedAt: number | null;
   onFileSelect: (path: string) => void;
   conversationId: string | undefined;
+  browseLocation: string;
+  onOpenInfo?: (info: FileRowInfo, returnFocus: HTMLElement | null) => void;
 }) {
-  const isDeleted = fileStatus === "deleted";
+  const canonicalPath = joinBrowseLocation(browseLocation, path);
+  const isDeleted = fileStatus?.status === "deleted";
   const fileColorClass =
-    fileStatus === "created"
+    fileStatus?.status === "created"
       ? "text-green-500 dark:text-green-400"
-      : fileStatus === "modified"
+      : fileStatus?.status === "modified"
         ? "text-amber-500 dark:text-amber-400"
         : undefined;
-  const { handlers, tooltip } = useCursorTooltip(path);
-  const reveal = useRevealMenu(isDeleted ? null : path);
+  const { handlers, tooltip } = useCursorTooltip(canonicalPath);
 
   return (
     <li className="list-none">
-      <div
-        onContextMenu={reveal.onContextMenu}
-        className={cn(
-          "group relative flex w-full min-w-0 items-center gap-1.5 rounded-md py-0.5 pr-1",
-          isDeleted ? "opacity-50" : "hover:bg-muted",
-        )}
-        style={{ paddingLeft: `${indentFor(depth)}px` }}
+      <FileRowActions
+        name={name}
+        actionName={labelIsPath ? displayLabel : name}
+        path={canonicalPath}
+        revealPath={isDeleted ? null : path}
+        kind="file"
+        conversationId={conversationId}
+        downloadable={!isDeleted && Boolean(conversationId)}
+        isDeleted={isDeleted}
+        bytes={bytes}
+        modifiedAt={modifiedAt}
+        status={fileStatus?.status}
+        linesAdded={fileStatus?.lines_added}
+        linesRemoved={fileStatus?.lines_removed}
+        onOpenInfo={onOpenInfo ?? (() => {})}
       >
-        <IndentGuides depth={depth} />
-        <button
-          type="button"
-          className="flex min-w-0 flex-1 cursor-pointer items-center gap-2 text-left"
-          onClick={() => !isDeleted && onFileSelect(path)}
-          disabled={isDeleted}
-        >
-          <WorkspaceFileIcon path={path} />
-          <span
+        {(moreActions, rowRef, primaryActionRef, actionsOpen) => (
+          <div
+            ref={rowRef}
+            data-actions-open={actionsOpen}
+            tabIndex={-1}
             className={cn(
-              "min-w-0 flex-1 truncate text-ui",
-              labelIsPath && "[direction:rtl]",
-              isDeleted && "line-through",
-              fileColorClass,
+              "group relative flex w-full min-w-0 select-none items-center gap-1.5 rounded-md py-0.5 pr-1 [-webkit-touch-callout:none]",
+              isDeleted ? "opacity-50" : "hover:bg-muted",
             )}
-            {...handlers}
+            style={{ paddingLeft: `${indentFor(depth)}px` }}
           >
-            {labelIsPath ? <bdi>{displayLabel}</bdi> : displayLabel}
-          </span>
-          {fileStatus && (
-            // Centred in the shared status column so the A/M/D badge lands in
-            // the same x as a directory row's dirty dot.
-            <span
-              className={cn("flex shrink-0 items-center justify-center", ROW_STATUS_SLOT_CLASS)}
+            <IndentGuides depth={depth} />
+            <button
+              ref={primaryActionRef}
+              type="button"
+              className="flex min-w-0 flex-1 cursor-pointer items-center gap-2 text-left"
+              onClick={() => !isDeleted && onFileSelect(path)}
+              disabled={isDeleted}
             >
+              <WorkspaceFileIcon path={path} />
               <span
                 className={cn(
-                  "rounded px-1 py-0.5 font-mono text-[10px]",
-                  isDeleted
-                    ? "bg-destructive/10 text-destructive"
-                    : fileStatus === "created"
-                      ? "bg-green-500/10 text-green-600 dark:text-green-400"
-                      : "bg-amber-500/10 text-amber-600 dark:text-amber-400",
+                  "min-w-0 flex-1 truncate text-ui",
+                  labelIsPath && "[direction:rtl]",
+                  isDeleted && "line-through",
+                  fileColorClass,
                 )}
-                title={gitStatusLabel(fileStatus)}
+                {...handlers}
               >
-                {gitStatusLetter(fileStatus)}
+                {labelIsPath ? <bdi>{displayLabel}</bdi> : displayLabel}
               </span>
-            </span>
-          )}
-        </button>
-        {/* One trailing column, always rendered so every row (directories
+              {fileStatus && (
+                // Centred in the shared status column so the A/M/D badge lands in
+                // the same x as a directory row's dirty dot.
+                <span
+                  className={cn("flex shrink-0 items-center justify-center", ROW_STATUS_SLOT_CLASS)}
+                >
+                  <span
+                    className={cn(
+                      "rounded px-1 py-0.5 font-mono text-[10px]",
+                      isDeleted
+                        ? "bg-destructive/10 text-destructive"
+                        : fileStatus.status === "created"
+                          ? "bg-green-500/10 text-green-600 dark:text-green-400"
+                          : "bg-amber-500/10 text-amber-600 dark:text-amber-400",
+                    )}
+                    title={gitStatusLabel(fileStatus.status)}
+                  >
+                    {gitStatusLetter(fileStatus.status)}
+                  </span>
+                </span>
+              )}
+            </button>
+            {/* One trailing column, always rendered so every row (directories
             included) shares it: metadata at rest, the copy/download pair on
             hover. */}
-        <span
-          className={cn("relative flex shrink-0 items-center justify-end", ROW_META_SLOT_CLASS)}
-        >
-          {bytes !== null && !isDeleted && (
-            <span className="text-muted-foreground text-sm group-hover:invisible">
-              {formatBytes(bytes)}
+            <span
+              className={cn(
+                "relative flex shrink-0 items-center justify-end",
+                ROW_META_SLOT_CLASS,
+                ROW_MENU_SIZE_SLOT_CLASS,
+                "pointer-coarse:justify-start",
+              )}
+            >
+              {bytes !== null && !isDeleted && (
+                <span
+                  className={cn(
+                    "mr-6 w-14 shrink-0 text-right text-muted-foreground text-sm group-hover:invisible group-has-[:focus-visible]:invisible",
+                    actionsOpen && "invisible",
+                  )}
+                >
+                  {formatBytes(bytes)}
+                </span>
+              )}
+              <span className="absolute inset-0 flex items-center justify-end gap-px">
+                {!isDeleted && conversationId ? (
+                  <FileDownloadButton conversationId={conversationId} path={canonicalPath} />
+                ) : (
+                  <span className={cn("shrink-0", ROW_ACTION_SIZE_CLASS)} aria-hidden />
+                )}
+                <CopyPathButton path={canonicalPath} revealOnHover />
+                {moreActions}
+              </span>
             </span>
-          )}
-          <span className="absolute inset-0 flex items-center justify-end gap-1">
-            {!isDeleted && conversationId ? (
-              <FileDownloadButton conversationId={conversationId} path={path} />
-            ) : (
-              <span className={cn("shrink-0", ROW_ACTION_SIZE_CLASS)} aria-hidden />
-            )}
-            <CopyPathButton path={path} revealOnHover />
-          </span>
-        </span>
-        {reveal.menu}
-      </div>
+          </div>
+        )}
+      </FileRowActions>
       {tooltip}
     </li>
   );
@@ -1058,28 +1113,46 @@ function SearchResultRow({
   file,
   onFileSelect,
   onRevealDir,
+  onNavigateDir,
   conversationId,
   changedFileMap,
+  browseLocation,
+  onOpenInfo,
 }: {
   file: WorkspaceFile;
   onFileSelect: (path: string) => void;
   /** Reveal a matched directory in the tree (expand it + ancestors). */
   onRevealDir: (path: string) => void;
+  onNavigateDir?: (path: string) => void;
   conversationId: string | undefined;
-  changedFileMap: Map<string, WorkspaceChangedFile["status"]>;
+  changedFileMap: Map<string, WorkspaceChangedFile>;
+  browseLocation: string;
+  onOpenInfo?: (info: FileRowInfo, returnFocus: HTMLElement | null) => void;
 }) {
   if (file.type === "directory") {
-    return <SearchDirRow file={file} onRevealDir={onRevealDir} />;
+    return (
+      <SearchDirRow
+        file={file}
+        onRevealDir={onRevealDir}
+        onNavigateDir={onNavigateDir}
+        browseLocation={browseLocation}
+        onOpenInfo={onOpenInfo}
+      />
+    );
   }
   return (
     <FileRowItem
       path={file.path}
+      name={file.name}
       displayLabel={file.path}
       labelIsPath={true}
       fileStatus={changedFileMap.get(file.path)}
       bytes={file.bytes}
+      modifiedAt={file.modified_at}
       onFileSelect={onFileSelect}
       conversationId={conversationId}
+      browseLocation={browseLocation}
+      onOpenInfo={onOpenInfo}
     />
   );
 }
@@ -1097,37 +1170,64 @@ function SearchResultRow({
 function SearchDirRow({
   file,
   onRevealDir,
+  onNavigateDir,
+  browseLocation,
+  onOpenInfo,
 }: {
   file: WorkspaceFile;
   onRevealDir: (path: string) => void;
+  onNavigateDir?: (path: string) => void;
+  browseLocation: string;
+  onOpenInfo?: (info: FileRowInfo, returnFocus: HTMLElement | null) => void;
 }) {
-  const reveal = useRevealMenu(file.path, true);
+  const canonicalPath = joinBrowseLocation(browseLocation, file.path);
   return (
     <li className="list-none">
-      <div
-        onContextMenu={reveal.onContextMenu}
-        className="group relative flex w-full min-w-0 items-center gap-1.5 rounded-md py-0.5 pr-1 pl-2 hover:bg-muted"
+      <FileRowActions
+        name={file.name}
+        actionName={file.path}
+        path={canonicalPath}
+        revealPath={file.path}
+        kind="folder"
+        bytes={null}
+        modifiedAt={file.modified_at}
+        onBrowse={() => (onNavigateDir ? onNavigateDir(file.path) : onRevealDir(file.path))}
+        onOpenInfo={onOpenInfo ?? (() => {})}
       >
-        <button
-          type="button"
-          className="flex min-w-0 flex-1 cursor-pointer items-center gap-2 text-left"
-          onClick={() => onRevealDir(file.path)}
-        >
-          <FolderIcon className="size-3.5 shrink-0 text-muted-foreground" />
-          <span className="min-w-0 flex-1 truncate text-ui [direction:rtl]">
-            <bdi>{file.path}/</bdi>
-          </span>
-        </button>
-        <span
-          className={cn("relative flex shrink-0 items-center justify-end", ROW_META_SLOT_CLASS)}
-        >
-          <span className="absolute inset-0 flex items-center justify-end gap-0.5">
-            <span className={cn("shrink-0", ROW_ACTION_SIZE_CLASS)} aria-hidden />
-            <CopyPathButton path={file.path} label="Copy folder path" revealOnHover />
-          </span>
-        </span>
-        {reveal.menu}
-      </div>
+        {(moreActions, rowRef, primaryActionRef, actionsOpen) => (
+          <div
+            ref={rowRef}
+            data-actions-open={actionsOpen}
+            tabIndex={-1}
+            className="group relative flex w-full min-w-0 select-none items-center gap-1.5 rounded-md py-0.5 pr-1 pl-2 hover:bg-muted [-webkit-touch-callout:none]"
+          >
+            <button
+              ref={primaryActionRef}
+              type="button"
+              className="flex min-w-0 flex-1 cursor-pointer items-center gap-2 text-left"
+              onClick={() => onRevealDir(file.path)}
+            >
+              <FolderIcon className="size-3.5 shrink-0 text-muted-foreground" />
+              <span className="min-w-0 flex-1 truncate text-ui [direction:rtl]">
+                <bdi>{file.path}/</bdi>
+              </span>
+            </button>
+            <span
+              className={cn(
+                "relative flex shrink-0 items-center justify-end",
+                ROW_META_SLOT_CLASS,
+                ROW_MENU_SLOT_CLASS,
+              )}
+            >
+              <span className="absolute inset-0 flex items-center justify-end gap-0">
+                <span className={cn("shrink-0", ROW_ACTION_SIZE_CLASS)} aria-hidden />
+                <CopyPathButton path={canonicalPath} label="Copy folder path" revealOnHover />
+                {moreActions}
+              </span>
+            </span>
+          </div>
+        )}
+      </FileRowActions>
     </li>
   );
 }
@@ -1142,22 +1242,30 @@ function TreeFileRow({
   onFileSelect,
   conversationId,
   fileStatus,
+  browseLocation,
+  onOpenInfo,
 }: {
   node: FileNode;
   depth: number;
   onFileSelect: (path: string) => void;
   conversationId: string | undefined;
-  fileStatus: WorkspaceChangedFile["status"] | undefined;
+  fileStatus: WorkspaceChangedFile | undefined;
+  browseLocation: string;
+  onOpenInfo?: (info: FileRowInfo, returnFocus: HTMLElement | null) => void;
 }) {
   return (
     <FileRowItem
       path={node.file.path}
+      name={node.name}
       displayLabel={node.name}
       depth={depth}
       fileStatus={fileStatus}
       bytes={node.file.bytes}
+      modifiedAt={node.file.modified_at}
       onFileSelect={onFileSelect}
       conversationId={conversationId}
+      browseLocation={browseLocation}
+      onOpenInfo={onOpenInfo}
     />
   );
 }
@@ -1183,6 +1291,8 @@ const TreeNodeRow = memo(function TreeNodeRow({
   changedFileMap,
   dirtyDirMap,
   onNavigateDir,
+  browseLocation,
+  onOpenInfo,
   highlighted = false,
 }: {
   node: TreeNode;
@@ -1192,13 +1302,14 @@ const TreeNodeRow = memo(function TreeNodeRow({
   onFileSelect: (path: string) => void;
   conversationId: string | undefined;
   onTogglePath: (path: string) => void;
-  changedFileMap: Map<string, WorkspaceChangedFile["status"]>;
+  changedFileMap: Map<string, WorkspaceChangedFile>;
   dirtyDirMap: Map<string, WorkspaceChangedFile["status"]>;
   onNavigateDir?: (relativePath: string) => void;
+  browseLocation: string;
+  onOpenInfo?: (info: FileRowInfo, returnFocus: HTMLElement | null) => void;
   /** Briefly flash this row — used when a folder is revealed from search. */
   highlighted?: boolean;
 }) {
-  const reveal = useRevealMenu(node.type === "file" ? null : node.path, true);
   if (node.type === "file") {
     return (
       <TreeFileRow
@@ -1207,10 +1318,13 @@ const TreeNodeRow = memo(function TreeNodeRow({
         onFileSelect={onFileSelect}
         conversationId={conversationId}
         fileStatus={changedFileMap.get(node.file.path)}
+        browseLocation={browseLocation}
+        onOpenInfo={onOpenInfo}
       />
     );
   }
 
+  const canonicalPath = joinBrowseLocation(browseLocation, node.path);
   const dirStatus = dirtyDirMap.get(node.path);
   const dirDotClass =
     dirStatus === "created"
@@ -1224,60 +1338,83 @@ const TreeNodeRow = memo(function TreeNodeRow({
   return (
     // The row is a div so the copy control can remain a sibling of the folder
     // toggle rather than nesting one button inside another.
-    <div
-      onContextMenu={reveal.onContextMenu}
-      className={cn(
-        "group relative flex w-full min-w-0 items-center gap-1.5 rounded-md py-0.5 pr-1 hover:bg-muted",
-        // Reveal flash: reuse the chat nav-jump ring pulse so a folder opened
-        // from search catches the eye briefly, then settles.
-        highlighted && "animate-user-msg-flash",
-      )}
-      style={{ paddingLeft: `${indentFor(depth)}px` }}
+    <FileRowActions
+      name={node.name}
+      path={canonicalPath}
+      revealPath={node.path}
+      kind="folder"
+      bytes={null}
+      modifiedAt={node.modifiedAt}
+      status={dirStatus}
+      onBrowse={onNavigateDir ? () => onNavigateDir(node.path) : undefined}
+      onOpenInfo={onOpenInfo ?? (() => {})}
     >
-      <IndentGuides depth={depth} />
-      <button
-        type="button"
-        className="group/folder flex min-w-0 flex-1 cursor-pointer items-center gap-2 text-left"
-        onClick={() => onTogglePath(node.path)}
-        onDoubleClick={onNavigateDir ? () => onNavigateDir(node.path) : undefined}
-        aria-expanded={open}
-      >
-        <span className="relative flex size-3.5 shrink-0 items-center justify-center">
-          <span className="flex transition-opacity group-hover/folder:opacity-0 group-focus-visible/folder:opacity-0">
-            {open ? (
-              <FolderOpenIcon className="size-3.5 text-muted-foreground" />
-            ) : (
-              <FolderIcon className="size-3.5 text-muted-foreground" />
-            )}
-          </span>
-          <ChevronRightIcon
-            className={cn(
-              "absolute size-3.5 text-muted-foreground opacity-0 transition-[transform,opacity] group-hover/folder:opacity-100 group-focus-visible/folder:opacity-100",
-              open && "rotate-90",
-            )}
-          />
-        </span>
-        <span className={cn("min-w-0 flex-1 truncate text-ui", dirDotClass)}>{node.name}/</span>
-        {dirStatus && (
-          <span
-            className={cn("flex shrink-0 items-center justify-center", ROW_STATUS_SLOT_CLASS)}
-            aria-hidden
+      {(moreActions, rowRef, primaryActionRef, actionsOpen) => (
+        <div
+          ref={rowRef}
+          data-actions-open={actionsOpen}
+          tabIndex={-1}
+          className={cn(
+            "group relative flex w-full min-w-0 select-none items-center gap-1.5 rounded-md py-0.5 pr-1 hover:bg-muted [-webkit-touch-callout:none]",
+            // Reveal flash: reuse the chat nav-jump ring pulse so a folder opened
+            // from search catches the eye briefly, then settles.
+            highlighted && "animate-user-msg-flash",
+          )}
+          style={{ paddingLeft: `${indentFor(depth)}px` }}
+        >
+          <IndentGuides depth={depth} />
+          <button
+            ref={primaryActionRef}
+            type="button"
+            className="group/folder flex min-w-0 flex-1 cursor-pointer items-center gap-2 text-left"
+            onClick={() => onTogglePath(node.path)}
+            onDoubleClick={onNavigateDir ? () => onNavigateDir(node.path) : undefined}
+            aria-expanded={open}
           >
-            <span className={cn("text-[8px] leading-none", dirDotClass)}>●</span>
-          </span>
-        )}
-      </button>
-      {/* The same trailing column as a file row. A folder has no size and
+            <span className="relative flex size-3.5 shrink-0 items-center justify-center">
+              <span className="flex transition-opacity group-hover/folder:opacity-0 group-focus-visible/folder:opacity-0">
+                {open ? (
+                  <FolderOpenIcon className="size-3.5 text-muted-foreground" />
+                ) : (
+                  <FolderIcon className="size-3.5 text-muted-foreground" />
+                )}
+              </span>
+              <ChevronRightIcon
+                className={cn(
+                  "absolute size-3.5 text-muted-foreground opacity-0 transition-[transform,opacity] group-hover/folder:opacity-100 group-focus-visible/folder:opacity-100",
+                  open && "rotate-90",
+                )}
+              />
+            </span>
+            <span className={cn("min-w-0 flex-1 truncate text-ui", dirDotClass)}>{node.name}/</span>
+            {dirStatus && (
+              <span
+                className={cn("flex shrink-0 items-center justify-center", ROW_STATUS_SLOT_CLASS)}
+                aria-hidden
+              >
+                <span className={cn("text-[8px] leading-none", dirDotClass)}>●</span>
+              </span>
+            )}
+          </button>
+          {/* The same trailing column as a file row. A folder has no size and
           nothing to download, so the column shows only the copy button — with
           the download's footprint reserved beside it so that button lands in
           the same x as every file row's. */}
-      <span className={cn("relative flex shrink-0 items-center justify-end", ROW_META_SLOT_CLASS)}>
-        <span className="absolute inset-0 flex items-center justify-end gap-1">
-          <span className={cn("shrink-0", ROW_ACTION_SIZE_CLASS)} aria-hidden />
-          <CopyPathButton path={node.path} label="Copy folder path" revealOnHover />
-        </span>
-      </span>
-      {reveal.menu}
-    </div>
+          <span
+            className={cn(
+              "relative flex shrink-0 items-center justify-end",
+              ROW_META_SLOT_CLASS,
+              ROW_MENU_SLOT_CLASS,
+            )}
+          >
+            <span className="absolute inset-0 flex items-center justify-end gap-px">
+              <span className={cn("shrink-0", ROW_ACTION_SIZE_CLASS)} aria-hidden />
+              <CopyPathButton path={canonicalPath} label="Copy folder path" revealOnHover />
+              {moreActions}
+            </span>
+          </span>
+        </div>
+      )}
+    </FileRowActions>
   );
 });

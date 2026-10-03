@@ -88,6 +88,7 @@ export function CopyPathButton({
           aria-label={`${label}: ${filename}`}
           className={cn(
             "transition-opacity",
+            revealOnHover && "pointer-coarse:pointer-events-none",
             copyError
               ? "text-destructive opacity-100"
               : copied

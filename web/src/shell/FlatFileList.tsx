@@ -12,7 +12,7 @@ import {
 } from "./fileStatusUtils";
 import { CopyPathButton } from "./CopyPathButton";
 import { FileDownloadButton } from "./FileDownloadButton";
-import { useRevealMenu } from "./RevealInFileManager";
+import { FileRowActions, ROW_MENU_SIZE_SLOT_CLASS, type FileRowInfo } from "./FileRowActions";
 import { useCursorTooltip } from "./useCursorTooltip";
 import { WorkspaceFileIcon } from "./WorkspaceFileIcon";
 
@@ -75,102 +75,136 @@ function FileListItem({
   isDeleted,
   onFileSelect,
   conversationId,
+  onOpenInfo,
 }: {
   file: WorkspaceChangedFile;
   isDeleted: boolean;
   onFileSelect: (path: string) => void;
   conversationId: string | undefined;
+  onOpenInfo?: (info: FileRowInfo, returnFocus: HTMLElement | null) => void;
 }) {
   const { handlers, tooltip } = useCursorTooltip(file.path);
-  const reveal = useRevealMenu(isDeleted ? null : file.path);
   const slash = file.path.lastIndexOf("/");
   const dir = slash > 0 ? file.path.slice(0, slash) : "";
   const hasDownload = !isDeleted && Boolean(conversationId);
 
   return (
     <li>
-      <div
-        onContextMenu={reveal.onContextMenu}
-        className={cn(
-          "group flex w-full min-w-0 items-center gap-2 rounded-md py-0.5 pr-1 pl-2",
-          isDeleted ? "opacity-50" : "hover:bg-muted",
-        )}
+      <FileRowActions
+        name={file.name}
+        path={file.path}
+        revealPath={isDeleted ? null : file.path}
+        kind="file"
+        conversationId={conversationId}
+        downloadable={hasDownload}
+        isDeleted={isDeleted}
+        bytes={file.bytes}
+        modifiedAt={file.modified_at}
+        status={file.status}
+        linesAdded={file.lines_added}
+        linesRemoved={file.lines_removed}
+        onOpenInfo={onOpenInfo ?? (() => {})}
       >
-        <button
-          type="button"
-          className={cn(
-            "flex min-w-0 flex-1 items-baseline gap-1.5 text-left",
-            isDeleted ? "cursor-default" : "cursor-pointer",
-          )}
-          onClick={() => !isDeleted && onFileSelect(file.path)}
-          disabled={isDeleted}
-        >
-          <WorkspaceFileIcon path={file.path} className="self-center" />
-          <span className={cn("truncate text-ui", isDeleted && "line-through")} {...handlers}>
-            {file.name}
-          </span>
-          {dir && <span className="truncate text-muted-foreground text-sm">{dir}</span>}
-        </button>
-        {/* Fixed-width and always rendered: a variable diffstat ("+7 −1" vs
+        {(moreActions, rowRef, primaryActionRef, actionsOpen) => (
+          <div
+            ref={rowRef}
+            data-actions-open={actionsOpen}
+            tabIndex={-1}
+            className={cn(
+              "group flex w-full min-w-0 select-none items-center gap-2 rounded-md py-0.5 pr-1 pl-2 [-webkit-touch-callout:none]",
+              isDeleted ? "opacity-50" : "hover:bg-muted",
+            )}
+          >
+            <button
+              ref={primaryActionRef}
+              type="button"
+              className={cn(
+                "flex min-w-0 flex-1 items-baseline gap-1.5 text-left",
+                isDeleted ? "cursor-default" : "cursor-pointer",
+              )}
+              onClick={() => !isDeleted && onFileSelect(file.path)}
+              disabled={isDeleted}
+            >
+              <WorkspaceFileIcon path={file.path} className="self-center" />
+              <span className={cn("truncate text-ui", isDeleted && "line-through")} {...handlers}>
+                {file.name}
+              </span>
+              {dir && <span className="truncate text-muted-foreground text-sm">{dir}</span>}
+            </button>
+            {/* Fixed-width and always rendered: a variable diffstat ("+7 −1" vs
             "+1204 −318") would otherwise shift the copy button and status
             letter to a different x on every row. */}
-        <span className={cn("flex shrink-0 items-center justify-end", ROW_META_SLOT_CLASS)}>
-          {((file.lines_added ?? 0) !== 0 || (file.lines_removed ?? 0) !== 0) && (
+            <span className={cn("flex shrink-0 items-center justify-end", ROW_META_SLOT_CLASS)}>
+              {((file.lines_added ?? 0) !== 0 || (file.lines_removed ?? 0) !== 0) && (
+                <span
+                  className="font-mono text-[10px]"
+                  aria-label={[
+                    file.lines_added !== null && `${file.lines_added} lines added`,
+                    file.lines_removed !== null && `${file.lines_removed} removed`,
+                  ]
+                    .filter(Boolean)
+                    .join(", ")}
+                >
+                  {file.lines_added !== null && (
+                    <span className="text-green-600 dark:text-green-400">+{file.lines_added}</span>
+                  )}
+                  {file.lines_added !== null && file.lines_removed !== null && " "}
+                  {file.lines_removed !== null && (
+                    <span className="text-destructive">&minus;{file.lines_removed}</span>
+                  )}
+                </span>
+              )}
+            </span>
             <span
-              className="font-mono text-[10px]"
-              aria-label={[
-                file.lines_added !== null && `${file.lines_added} lines added`,
-                file.lines_removed !== null && `${file.lines_removed} removed`,
-              ]
-                .filter(Boolean)
-                .join(", ")}
+              className={cn("flex shrink-0 items-center justify-center", ROW_STATUS_SLOT_CLASS)}
             >
-              {file.lines_added !== null && (
-                <span className="text-green-600 dark:text-green-400">+{file.lines_added}</span>
-              )}
-              {file.lines_added !== null && file.lines_removed !== null && " "}
-              {file.lines_removed !== null && (
-                <span className="text-destructive">&minus;{file.lines_removed}</span>
-              )}
+              <span
+                className={cn(
+                  "rounded px-1 py-0.5 font-mono text-[10px]",
+                  isDeleted
+                    ? "bg-destructive/10 text-destructive"
+                    : file.status === "created"
+                      ? "bg-green-500/10 text-green-600 dark:text-green-400"
+                      : "bg-amber-500/10 text-amber-600 dark:text-amber-400",
+                )}
+                title={gitStatusLabel(file.status)}
+              >
+                {gitStatusLetter(file.status)}
+              </span>
             </span>
-          )}
-        </span>
-        <span className={cn("flex shrink-0 items-center justify-center", ROW_STATUS_SLOT_CLASS)}>
-          <span
-            className={cn(
-              "rounded px-1 py-0.5 font-mono text-[10px]",
-              isDeleted
-                ? "bg-destructive/10 text-destructive"
-                : file.status === "created"
-                  ? "bg-green-500/10 text-green-600 dark:text-green-400"
-                  : "bg-amber-500/10 text-amber-600 dark:text-amber-400",
-            )}
-            title={gitStatusLabel(file.status)}
-          >
-            {gitStatusLetter(file.status)}
-          </span>
-        </span>
-        {/* File size at rest, replaced by copy/download actions on hover — the
+            {/* File size at rest, replaced by copy/download actions on hover — the
             same far-right slot used by the Files tree. */}
-        <span
-          className={cn("relative flex shrink-0 items-center justify-end", ROW_META_SLOT_CLASS)}
-        >
-          {file.bytes !== null && !isDeleted && (
-            <span className="text-muted-foreground text-sm group-hover:invisible">
-              {formatBytes(file.bytes)}
+            <span
+              className={cn(
+                "relative flex shrink-0 items-center justify-end",
+                ROW_META_SLOT_CLASS,
+                ROW_MENU_SIZE_SLOT_CLASS,
+                "pointer-coarse:justify-start",
+              )}
+            >
+              {file.bytes !== null && !isDeleted && (
+                <span
+                  className={cn(
+                    "mr-6 w-14 shrink-0 text-right text-muted-foreground text-sm group-hover:invisible group-has-[:focus-visible]:invisible",
+                    actionsOpen && "invisible",
+                  )}
+                >
+                  {formatBytes(file.bytes)}
+                </span>
+              )}
+              <span className="absolute inset-0 flex items-center justify-end gap-px">
+                {hasDownload && conversationId ? (
+                  <FileDownloadButton conversationId={conversationId} path={file.path} />
+                ) : (
+                  <span className={cn("shrink-0", ROW_ACTION_SIZE_CLASS)} aria-hidden />
+                )}
+                <CopyPathButton path={file.path} revealOnHover />
+                {moreActions}
+              </span>
             </span>
-          )}
-          <span className="absolute inset-0 flex items-center justify-end gap-1">
-            {hasDownload && conversationId ? (
-              <FileDownloadButton conversationId={conversationId} path={file.path} />
-            ) : (
-              <span className={cn("shrink-0", ROW_ACTION_SIZE_CLASS)} aria-hidden />
-            )}
-            <CopyPathButton path={file.path} revealOnHover />
-          </span>
-        </span>
-        {reveal.menu}
-      </div>
+          </div>
+        )}
+      </FileRowActions>
       {tooltip}
     </li>
   );
@@ -188,6 +222,7 @@ export function FlatFileList({
   sort,
   conversationId,
   runnerWentOffline = false,
+  onOpenInfo,
 }: {
   files: WorkspaceChangedFile[] | undefined;
   isLoading: boolean;
@@ -207,6 +242,7 @@ export function FlatFileList({
    * false and we fall through to the normal empty state instead.
    */
   runnerWentOffline?: boolean;
+  onOpenInfo?: (info: FileRowInfo, returnFocus: HTMLElement | null) => void;
 }) {
   if (isLoading) {
     return <p className="px-2 py-1 text-muted-foreground text-sm">Loading…</p>;
@@ -288,6 +324,7 @@ export function FlatFileList({
                 isDeleted={isDeleted}
                 onFileSelect={onFileSelect}
                 conversationId={conversationId}
+                onOpenInfo={onOpenInfo}
               />
             );
           })}
