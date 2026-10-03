@@ -74,11 +74,17 @@ def test_debby_debate_skill_present(debby_spec: AgentSpec) -> None:
 def test_debby_has_os_env(debby_spec: AgentSpec) -> None:
     """
     Debby carries an ``os_env`` block so the bridged ``sys_os_*`` tools register
-    for the brainstorming surface. The shipped sandbox is ``type: none`` so the
-    bundle loads on macOS too. Dropping ``os_env`` would leave the heads with no
-    file/shell tools at all.
+    for the brainstorming surface. Every OS environment uses the platform
+    sandbox so paths outside the workspace, including unrelated files under
+    ``$HOME``, remain hidden. Dropping ``os_env`` would leave the heads with no
+    file/shell tools; using ``type: none`` would expose the host filesystem.
     """
     assert debby_spec.os_env is not None
     assert debby_spec.os_env.type == "caller_process"
     assert debby_spec.os_env.sandbox is not None
-    assert debby_spec.os_env.sandbox.type == "none"
+    assert debby_spec.os_env.sandbox.type != "none"
+
+    for head in debby_spec.sub_agents:
+        assert head.os_env is not None, head.name
+        assert head.os_env.sandbox is not None, head.name
+        assert head.os_env.sandbox.type != "none", head.name
