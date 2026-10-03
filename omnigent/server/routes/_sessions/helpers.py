@@ -284,6 +284,7 @@ from omnigent.server.schemas import (
     SessionTodosEvent,
     ToolOutputDeltaEvent,
 )
+from omnigent.server.session_metadata_logging import harness_attributes
 from omnigent.spec.types import (
     AgentSpec,
     Phase,
@@ -3517,11 +3518,14 @@ async def _persist_external_acp_subagent_start(
             raise
         await asyncio.to_thread(conversation_store.set_labels, adopted.id, labels)
         await _publish_session_created(
-            parent_id, adopted.id, parent_conv.agent_id, conversation_store
+            parent_id, adopted.id, parent_conv.agent_id, conversation_store, harness=None
         )
         return adopted.id
     await asyncio.to_thread(conversation_store.set_labels, child.id, labels)
-    await _publish_session_created(parent_id, child.id, parent_conv.agent_id, conversation_store)
+    # The shared ACP event identifies a transport, not the concrete harness.
+    await _publish_session_created(
+        parent_id, child.id, parent_conv.agent_id, conversation_store, harness=None
+    )
     return child.id
 
 
@@ -3570,6 +3574,8 @@ async def _publish_session_created(
     child_session_id: str,
     agent_id: str | None,
     conversation_store: ConversationStore,
+    *,
+    harness: str | None,
 ) -> None:
     """
     Emit ``session.created`` on the parent's stream for a child session.
@@ -3585,6 +3591,7 @@ async def _publish_session_created(
         agent), e.g. ``"ag_abc123"``. ``None`` only for legacy parents
         without one.
     :param conversation_store: Store for the durable parent-chat activity link.
+    :param harness: The harness identified by the child event, or ``None`` when unknown.
     """
     event = SessionCreatedEvent(
         type="session.created",
@@ -3604,8 +3611,11 @@ async def _publish_session_created(
         extra=debug_event(
             "session_created",
             session_id=child_session_id,
+            agent_id=agent_id,
+            session_kind="sub_agent",
             parent_session_id=parent_id,
             creation_kind="child",
+            **harness_attributes(harness, source="subagent_event"),
         ),
     )
     from omnigent.server.subagent_activity import record_subagent_activity
@@ -3771,11 +3781,17 @@ async def _persist_external_subagent_start(
         # In the concurrent-race case the winner also published; a
         # duplicate event is a harmless extra cache invalidation.
         await _publish_session_created(
-            parent_id, adopted.id, parent_conv.agent_id, conversation_store
+            parent_id,
+            adopted.id,
+            parent_conv.agent_id,
+            conversation_store,
+            harness="claude-native",
         )
         return adopted.id
     await asyncio.to_thread(conversation_store.set_labels, child.id, labels)
-    await _publish_session_created(parent_id, child.id, parent_conv.agent_id, conversation_store)
+    await _publish_session_created(
+        parent_id, child.id, parent_conv.agent_id, conversation_store, harness="claude-native"
+    )
     return child.id
 
 
@@ -3872,11 +3888,17 @@ async def _create_and_publish_antigravity_child(
         # never heard about this child; a duplicate publish in the race case is a
         # harmless extra cache invalidation.
         await _publish_session_created(
-            parent_id, existing.id, parent_conv.agent_id, conversation_store
+            parent_id,
+            existing.id,
+            parent_conv.agent_id,
+            conversation_store,
+            harness="antigravity-native",
         )
         return existing.id
     await asyncio.to_thread(conversation_store.set_labels, child.id, labels)
-    await _publish_session_created(parent_id, child.id, parent_conv.agent_id, conversation_store)
+    await _publish_session_created(
+        parent_id, child.id, parent_conv.agent_id, conversation_store, harness="antigravity-native"
+    )
     return child.id
 
 
@@ -4155,12 +4177,18 @@ async def _create_and_publish_codex_child(
             # winner also published; the duplicate is a harmless extra
             # cache invalidation.
             await _publish_session_created(
-                parent_id, existing.id, parent_conv.agent_id, conversation_store
+                parent_id,
+                existing.id,
+                parent_conv.agent_id,
+                conversation_store,
+                harness="codex-native",
             )
             return existing.id
         raise
     await asyncio.to_thread(conversation_store.set_labels, child.id, labels)
-    await _publish_session_created(parent_id, child.id, parent_conv.agent_id, conversation_store)
+    await _publish_session_created(
+        parent_id, child.id, parent_conv.agent_id, conversation_store, harness="codex-native"
+    )
     return child.id
 
 
@@ -4257,12 +4285,18 @@ async def _create_and_publish_devin_child(
         if existing is not None:
             await asyncio.to_thread(conversation_store.set_labels, existing.id, labels)
             await _publish_session_created(
-                parent_id, existing.id, parent_conv.agent_id, conversation_store
+                parent_id,
+                existing.id,
+                parent_conv.agent_id,
+                conversation_store,
+                harness="devin-native",
             )
             return existing.id
         raise
     await asyncio.to_thread(conversation_store.set_labels, child.id, labels)
-    await _publish_session_created(parent_id, child.id, parent_conv.agent_id, conversation_store)
+    await _publish_session_created(
+        parent_id, child.id, parent_conv.agent_id, conversation_store, harness="devin-native"
+    )
     return child.id
 
 
