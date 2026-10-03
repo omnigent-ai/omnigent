@@ -54,3 +54,6 @@ load and asset errors through `doctor` or `/v1/extensions/diagnostics`.
 See [Extension manifest](extension_manifest.md),
 [Browser extensions](browser_extensions.md), and the
 [Hello Page example](../../examples/extensions/hello-page/README.md).
+
+Host-local background services use a separate interface. See
+[Host process extensions](host_extensions.md).

@@ -58,6 +58,7 @@ from omnigent.harness_aliases import canonicalize_harness, is_claude_sdk_harness
 from omnigent.harness_availability import HARNESS_BINARY_MISSING, HarnessAvailability
 from omnigent.host import HOST_FATAL_EXIT_CODE
 from omnigent.host.daemon_lifecycle import DaemonLifecycleLock
+from omnigent.host.extension import HostExtension, load_host_extension
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
     HOST_CAPABILITIES,
@@ -473,6 +474,10 @@ _SILENT_CONNECT_ESCALATE_ATTEMPTS = 10
 
 # Capability discovery is advisory and must not delay the host channel forever.
 _HOST_CAPABILITY_INIT_TIMEOUT_S = 15.0
+# An optional in-process extension must not hold up the host channel or keep a
+# replacement daemon waiting for the lifecycle lock during shutdown.
+_HOST_EXTENSION_START_TIMEOUT_S = 1.0
+_HOST_EXTENSION_STOP_TIMEOUT_S = 5.0
 
 # Host-environment variables a spawned runner is allowed to inherit.
 # Deliberately an allowlist (not ``{**os.environ}``): the host runs as the
@@ -552,6 +557,7 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         # cli._ensure_host_daemon), never to a (possibly hosted) runner.
         "OMNIGENT_CONFIG_HOME",
         "OMNIGENT_DATA_DIR",
+        "OMNIGENT_HARNESS_TMP_PARENT",
         # Auth provider selection. The env-unset default was flipped
         # to "accounts", so the whole CLI → daemon → local-server chain has
         # to agree on the mode. Without this, the daemon strips
@@ -1088,6 +1094,7 @@ class HostProcess:
         server_url: str,
         lifecycle_lock: DaemonLifecycleLock | None = None,
         interactive_shells: list[str] | None = None,
+        host_extension: HostExtension | None = None,
     ) -> None:
         """Initialize the host process.
 
@@ -1098,8 +1105,15 @@ class HostProcess:
             and self-terminates once the record is deleted or reassigned.
         :param interactive_shells: Optional shell inventory override for tests.
             By default the host discovers its installed shells once at startup.
+        :param host_extension: Optional host-local background service.
         """
         self._identity = identity
+        self._host_extension = host_extension
+        self._host_extension_start_task: asyncio.Task[None] | None = None
+        self._host_extension_stop_task: asyncio.Task[None] | None = None
+        self._host_extension_cleanup_task: asyncio.Task[None] | None = None
+        self._host_extension_stop_called = False
+        self._host_extension_stop_timed_out = False
         self._server_url = server_url.rstrip("/")
         # One reader per workspace, so its registry keeps state between
         # requests (the changed-files snapshot search reuses for untracked
@@ -1267,6 +1281,113 @@ class HostProcess:
         self._lifecycle_task: asyncio.Task[None] | None = None
         self._lifecycle_lost = asyncio.Event()
 
+    async def _start_host_extension(self) -> None:
+        extension = self._host_extension
+        if extension is None:
+            return
+        task = asyncio.create_task(extension.start(), name="host-extension-start")
+        self._host_extension_start_task = task
+        try:
+            done, _ = await asyncio.wait({task}, timeout=_HOST_EXTENSION_START_TIMEOUT_S)
+        except asyncio.CancelledError:
+            task.add_done_callback(self._finish_host_extension_start)
+            task.cancel()
+            raise
+        if not done:
+            _logger.warning(
+                "Optional host extension start exceeded %.1fs; continuing host connection",
+                _HOST_EXTENSION_START_TIMEOUT_S,
+            )
+            task.add_done_callback(self._finish_host_extension_start)
+            task.cancel()
+            return
+        self._host_extension_start_task = None
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            _logger.warning("Optional host extension cancelled its own start")
+            self._schedule_host_extension_cleanup()
+        except Exception:
+            _logger.exception("Optional host extension could not start")
+            self._schedule_host_extension_cleanup()
+
+    def _schedule_host_extension_cleanup(self) -> None:
+        if self._host_extension is None or self._host_extension_cleanup_task is not None:
+            return
+        cleanup = asyncio.create_task(self._stop_host_extension(), name="host-extension-cleanup")
+        self._host_extension_cleanup_task = cleanup
+        cleanup.add_done_callback(self._finish_host_extension_cleanup)
+
+    def _finish_host_extension_start(self, task: asyncio.Task[None]) -> None:
+        """Clean up a start that finished after its caller stopped waiting."""
+        if self._host_extension_start_task is not task:
+            return
+        self._host_extension_start_task = None
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            _logger.exception("Optional host extension failed after start timeout")
+        if self._host_extension is None:
+            return
+        if not self._host_extension_stop_called:
+            self._schedule_host_extension_cleanup()
+        elif self._host_extension_stop_task is None:
+            self._host_extension = None
+
+    def _finish_host_extension_cleanup(self, task: asyncio.Task[None]) -> None:
+        if self._host_extension_cleanup_task is task:
+            self._host_extension_cleanup_task = None
+        if not task.cancelled():
+            try:
+                task.result()
+            except Exception:
+                _logger.exception("Optional host extension cleanup failed")
+
+    def _finish_host_extension_stop(self, task: asyncio.Task[None]) -> None:
+        if self._host_extension_stop_task is not task:
+            return
+        self._host_extension_stop_task = None
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            _logger.exception("Optional host extension could not stop cleanly")
+        finally:
+            # A timed-out start may still be running. Keep its PID ownership
+            # until that task actually settles, even after stop() completes.
+            if self._host_extension_start_task is None:
+                self._host_extension = None
+
+    async def _stop_host_extension(self) -> None:
+        extension = self._host_extension
+        if extension is None:
+            return
+        start_task = self._host_extension_start_task
+        if start_task is not None and not start_task.done():
+            start_task.cancel()
+        if not self._host_extension_stop_called:
+            self._host_extension_stop_called = True
+            task = asyncio.create_task(extension.stop(), name="host-extension-stop")
+            self._host_extension_stop_task = task
+            task.add_done_callback(self._finish_host_extension_stop)
+        else:
+            task = self._host_extension_stop_task
+            if task is None or self._host_extension_stop_timed_out:
+                return
+        done, _ = await asyncio.wait({task}, timeout=_HOST_EXTENSION_STOP_TIMEOUT_S)
+        if not done:
+            self._host_extension_stop_timed_out = True
+            _logger.warning(
+                "Optional host extension stop exceeded %.1fs; continuing host shutdown",
+                _HOST_EXTENSION_STOP_TIMEOUT_S,
+            )
+            task.cancel()
+        else:
+            self._finish_host_extension_stop(task)
+
     def _tracked_runner_pids(self) -> set[int]:
         """Return child PIDs whose exit status still belongs to a process handle.
 
@@ -1285,6 +1406,8 @@ class HostProcess:
         zygote_pid = self._zygote.unreaped_pid if self._zygote is not None else None
         if zygote_pid is not None:
             pids.add(zygote_pid)
+        if self._host_extension is not None:
+            pids.update(self._host_extension.owned_pids)
         return pids
 
     @staticmethod
@@ -1330,7 +1453,13 @@ class HostProcess:
             return 0
         if child_pids is None:
             child_pids = self._orphan_child_pids()
-        tracked = self._tracked_runner_pids()
+        try:
+            tracked = self._tracked_runner_pids()
+        except Exception:
+            # An extension that cannot report its children must not let the
+            # orphan reaper consume exit statuses that it still owns.
+            _logger.exception("Could not identify host-owned child processes")
+            return 0
         reaped = 0
         for pid in child_pids:
             if pid in tracked:
@@ -1904,7 +2033,15 @@ class HostProcess:
         # the spawn land and then tear that runner down.
         with self._host_subprocess_op():
             spawn = asyncio.ensure_future(
-                asyncio.to_thread(self._spawn_runner_proc, env, _session_slug, workspace)
+                asyncio.to_thread(
+                    self._spawn_runner_with_extension,
+                    env,
+                    _session_slug,
+                    workspace,
+                    session_id=frame.session_id,
+                    harness=frame.harness,
+                    runner_id=runner_id,
+                )
             )
             try:
                 proc, log_path = await asyncio.shield(spawn)
@@ -2025,6 +2162,31 @@ class HostProcess:
             self._zygote_disabled = True
             return None
         return zygote
+
+    def _spawn_runner_with_extension(
+        self,
+        env: dict[str, str],
+        session_slug: str,
+        workspace: Path,
+        *,
+        session_id: str | None,
+        harness: str | None,
+        runner_id: str,
+    ) -> tuple[subprocess.Popen[bytes] | ZygoteRunnerProc, Path]:
+        """Prepare optional host-local state without delaying the event loop."""
+        extension = self._host_extension
+        if extension is not None:
+            try:
+                extension.before_runner_spawn(
+                    session_id=session_id,
+                    harness=harness,
+                    workspace=workspace,
+                    runner_id=runner_id,
+                    server_url=self._server_url,
+                )
+            except Exception:
+                _logger.exception("Optional host extension could not prepare runner launch")
+        return self._spawn_runner_proc(env, session_slug, workspace)
 
     def _spawn_runner_proc(
         self,
@@ -3848,7 +4010,8 @@ class HostProcess:
 
         Connects to the server, sends hello, and enters the
         receive loop. Reconnects with exponential backoff on
-        disconnect. Ctrl-C / SIGTERM exit cleanly.
+        disconnect. Ctrl-C and task cancellation enter the graceful cleanup
+        path; SIGTERM terminates the process without running that path.
 
         :returns: None. Runs until the process is terminated.
         :raises HostConnectError: On a permanent failure — auth /
@@ -3898,6 +4061,7 @@ class HostProcess:
             )
         backoff = _RECONNECT_BASE_S
         try:
+            await self._start_host_extension()
             # Warm the pre-launch model listings once for the host lifetime so a
             # first picker or launch can use the shared store instead of waiting
             # on a harness probe. This is independent of any one server tunnel:
@@ -4125,6 +4289,7 @@ class HostProcess:
             # runners via Popen, so any of their still-orphaned tool
             # grandchildren are now reapable and no tracked pid can be stolen.
             self._reap_orphans_once()
+            await self._stop_host_extension()
             # Stop the runner zygote last: its forked children were just
             # terminated above, and closing its control socket lets it exit.
             if self._zygote is not None:
@@ -4935,6 +5100,7 @@ def run_host_process(
         server_url,
         lifecycle_lock=lifecycle_lock,
         interactive_shells=interactive_shells,
+        host_extension=load_host_extension(),
     )
     try:
         asyncio.run(host.run())
