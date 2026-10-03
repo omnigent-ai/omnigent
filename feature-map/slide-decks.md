@@ -22,6 +22,11 @@ slide to PDF, and a Source toggle back to the code view.
   toolbar's "View preview" returns to the deck.
 - `deck-empty`: a deck with no top-level sections shows a "No slides yet" empty
   state.
+- `deck-design-kit`: a brand kit at `.omnigent/design-kit/kit.json` in the
+  workspace (colors, fonts, logo, layout stylesheet) brands every deck, even one
+  whose author ignored it. The toolbar shows the kit name; an invalid kit shows
+  a "Design kit not applied: reason" notice and the deck renders unbranded.
+  Format and a copyable sample: `examples/design-kits/sample/README.md`.
 
 ## How to get to it (user POV)
 
@@ -30,6 +35,10 @@ panel or a file link; it opens in the right-rail file viewer.
 
 **Phone (web or mobile app):** open the same file from the Files panel; it
 opens in the full-screen file viewer.
+
+**Design kit (any surface):** copy `examples/design-kits/sample` to
+`.omnigent/design-kit` at the workspace root (or have the agent write a kit
+there), then open or reopen a deck.
 
 ## Driving it with the repro environment
 
@@ -46,6 +55,15 @@ doctor`) and the built web UI.
   controls step through slides.
 - Print: no test (the print dialog is native). Choose "Print / Save as PDF" and
   check the preview shows one landscape page per slide.
+- Design kit applied over a deck's own colors, fonts, and layout class:
+  `tests/e2e_ui/files/test_slides_viewer.py::test_slides_viewer_applies_design_kit`
+  seeds the sample kit and checks computed styles inside the deck iframe.
+  Parsing, validation, injection, and the toolbar name and notice:
+  `cd web && pnpm exec vitest run src/shell/SlidesViewer.test.tsx`.
+- Design kit by hand: with the sample kit copied in, a deck shows the kit's
+  background, fonts, and logo in the bottom-right corner of every slide, in
+  fullscreen, and in the print preview. Change a color in `kit.json` to
+  `"red;}"` and reopen the deck to see the notice.
 
 ## Gotchas
 
@@ -58,3 +76,15 @@ doctor`) and the built web UI.
   same code view.
 - Text-selection comments are available in the plain HTML preview, not in the
   deck viewer.
+- The kit loads when a deck opens or its content refreshes; editing only the
+  kit needs the deck reopened.
+- Kit base rules use `!important` on the body, top-level sections, and
+  headings. Deck rules aimed at other inner elements keep their own font, and
+  kit layout classes that change a section's background or color need
+  `!important` too (see the sample `layouts.css`).
+- The kit forces `position: relative` on sections when it has a logo, and the
+  logo uses the section's `::after`.
+- Asset paths must be plain relative paths inside the kit folder (letters,
+  digits, `_`, `-`, `.`, `/`; no `..`, spaces, or URLs), each file at most 2 MB.
+  Fonts without `src` must be installed on the viewer's machine.
+- The deck iframe has an opaque origin, so assets are inlined as data URIs.

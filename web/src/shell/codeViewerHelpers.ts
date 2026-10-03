@@ -676,13 +676,310 @@ function lastBodyCloseIndex(doc: string): number {
 /**
  * Build the slide-deck srcdoc: the HTML preview doc plus injected CSS/script
  * placed before the last real `</body>` (appended when there is none). The
- * file on disk is never modified.
+ * file on disk is never modified. `kitStyle` (see `loadDesignKit`) is injected
+ * after the deck's own styles so the brand's base rules win.
  */
-export function prepareSlidesDoc(html: string): string {
+export function prepareSlidesDoc(html: string, kitStyle = ""): string {
   const doc = prepareHtmlPreviewDoc(html);
-  const injection = SLIDES_STYLE + SLIDES_SCRIPT;
+  const injection = SLIDES_STYLE + kitStyle + SLIDES_SCRIPT;
   const at = lastBodyCloseIndex(doc);
   return at === -1 ? doc + injection : doc.slice(0, at) + injection + doc.slice(at);
+}
+
+// ---------------------------------------------------------------------------
+// Slide-deck design kit: `.omnigent/design-kit/kit.json` plus assets beside it.
+// kit.json is untrusted: every value that reaches the injected <style> is
+// validated against a strict allowlist first.
+// ---------------------------------------------------------------------------
+
+export const DESIGN_KIT_DIR = ".omnigent/design-kit";
+export const DESIGN_KIT_MAX_BYTES = 2 * 1024 * 1024;
+
+const KIT_COLORS = ["primary", "secondary", "accent", "background", "text"] as const;
+const KIT_LOGO_POSITIONS = ["top-left", "top-right", "bottom-left", "bottom-right"] as const;
+type KitColor = (typeof KIT_COLORS)[number];
+type KitLogoPosition = (typeof KIT_LOGO_POSITIONS)[number];
+
+export interface DesignKitFont {
+  /** CSS font-family value, already sanitized and quoted. */
+  family: string;
+  src?: string;
+  weight?: string;
+}
+
+export interface DesignKit {
+  name: string;
+  colors: Partial<Record<KitColor, string>>;
+  fonts: { heading?: DesignKitFont; body?: DesignKitFont };
+  logo?: { src: string; position: KitLogoPosition };
+  css?: string;
+}
+
+export type DesignKitState =
+  | { status: "none" }
+  | { status: "error"; reason: string }
+  | { status: "ok"; name: string; style: string };
+
+const FONT_MIME: Record<string, string> = {
+  woff2: "font/woff2",
+  woff: "font/woff",
+  ttf: "font/ttf",
+  otf: "font/otf",
+};
+const IMAGE_MIME: Record<string, string> = {
+  svg: "image/svg+xml",
+  png: "image/png",
+  jpg: "image/jpeg",
+  jpeg: "image/jpeg",
+  webp: "image/webp",
+  gif: "image/gif",
+};
+const GENERIC_FAMILIES = new Set([
+  "serif",
+  "sans-serif",
+  "monospace",
+  "cursive",
+  "fantasy",
+  "system-ui",
+  "ui-serif",
+  "ui-sans-serif",
+  "ui-monospace",
+  "ui-rounded",
+  "emoji",
+  "math",
+  "fangsong",
+]);
+
+// No quotes, semicolons, braces, or angle brackets can pass these.
+const CSS_COLOR_RE =
+  /^(?:#(?:[0-9a-f]{3,4}|[0-9a-f]{6}|[0-9a-f]{8})|(?:rgba?|hsla?|hwb|lab|lch|oklab|oklch)\([\w\s.,%/+-]+\)|[a-z]+)$/i;
+const FAMILY_NAME_RE = /^[\p{L}\p{N} _-]{1,64}$/u;
+const KIT_PATH_RE = /^[\w.-]+(?:\/[\w.-]+)*$/;
+
+const isObject = (v: unknown): v is Record<string, unknown> =>
+  typeof v === "object" && v !== null && !Array.isArray(v);
+
+function kitColor(value: unknown, field: string): string {
+  const ok =
+    typeof value === "string" &&
+    CSS_COLOR_RE.test(value) &&
+    (typeof CSS === "undefined" ||
+      typeof CSS.supports !== "function" ||
+      CSS.supports("color", value));
+  if (!ok) throw new Error(`${field} is not a valid CSS color`);
+  return value as string;
+}
+
+/** Relative path inside the kit folder with an allowed extension. */
+function kitPath(value: unknown, field: string, mimes: Record<string, string>): string {
+  const segments = typeof value === "string" ? value.split("/") : [];
+  if (
+    typeof value !== "string" ||
+    !KIT_PATH_RE.test(value) ||
+    segments.some((s) => s === "." || s === "..")
+  ) {
+    throw new Error(`${field} must be a relative path inside ${DESIGN_KIT_DIR}`);
+  }
+  if (!mimes[extension(value)]) {
+    throw new Error(`${field} must be one of: ${Object.keys(mimes).join(", ")}`);
+  }
+  return value;
+}
+
+const extension = (path: string) => path.slice(path.lastIndexOf(".") + 1).toLowerCase();
+
+function kitFont(value: unknown, field: string): DesignKitFont | undefined {
+  if (value === undefined) return undefined;
+  if (!isObject(value)) throw new Error(`${field} must be an object`);
+  const names = typeof value.family === "string" ? value.family.split(",") : [];
+  const family = names
+    .map((n) => n.trim().replace(/^(["'])(.*)\1$/, "$2"))
+    .map((n) => {
+      if (!FAMILY_NAME_RE.test(n)) throw new Error(`${field}.family is not a valid font family`);
+      return GENERIC_FAMILIES.has(n.toLowerCase()) ? n : `"${n}"`;
+    })
+    .join(", ");
+  if (!family) throw new Error(`${field}.family is required`);
+  const font: DesignKitFont = { family };
+  if (value.src !== undefined) font.src = kitPath(value.src, `${field}.src`, FONT_MIME);
+  if (value.weight !== undefined) {
+    if (!/^(?:normal|bold|[1-9]00)$/.test(String(value.weight))) {
+      throw new Error(`${field}.weight must be normal, bold, or 100-900`);
+    }
+    font.weight = String(value.weight);
+  }
+  return font;
+}
+
+/** Parse and validate kit.json. Throws an Error whose message is user-facing. */
+export function parseDesignKit(text: string): DesignKit {
+  let raw: unknown;
+  try {
+    raw = JSON.parse(text);
+  } catch {
+    throw new Error("kit.json is not valid JSON");
+  }
+  if (!isObject(raw)) throw new Error("kit.json must be a JSON object");
+  const name = typeof raw.name === "string" ? raw.name.trim() : "";
+  if (!name) throw new Error('kit.json needs a "name"');
+  const kit: DesignKit = { name: name.slice(0, 80), colors: {}, fonts: {} };
+
+  if (raw.colors !== undefined) {
+    if (!isObject(raw.colors)) throw new Error("colors must be an object");
+    for (const key of KIT_COLORS) {
+      if (raw.colors[key] !== undefined)
+        kit.colors[key] = kitColor(raw.colors[key], `colors.${key}`);
+    }
+  }
+  if (raw.fonts !== undefined) {
+    if (!isObject(raw.fonts)) throw new Error("fonts must be an object");
+    kit.fonts.heading = kitFont(raw.fonts.heading, "fonts.heading");
+    kit.fonts.body = kitFont(raw.fonts.body, "fonts.body");
+  }
+  if (raw.logo !== undefined) {
+    if (!isObject(raw.logo)) throw new Error("logo must be an object");
+    const position = raw.logo.position ?? "bottom-right";
+    if (!KIT_LOGO_POSITIONS.includes(position as KitLogoPosition)) {
+      throw new Error(`logo.position must be one of: ${KIT_LOGO_POSITIONS.join(", ")}`);
+    }
+    kit.logo = {
+      src: kitPath(raw.logo.src, "logo.src", IMAGE_MIME),
+      position: position as KitLogoPosition,
+    };
+  }
+  if (raw.css !== undefined) kit.css = kitPath(raw.css, "css", { css: "text/css" });
+  return kit;
+}
+
+/** Minimal shape of a workspace file read (see `FileContentResponse`). */
+export interface KitFile {
+  encoding: "utf-8" | "base64";
+  content: string;
+  bytes: number;
+  truncated?: boolean;
+}
+
+function checkKitFile(file: KitFile, path: string): void {
+  if (file.truncated || file.bytes > DESIGN_KIT_MAX_BYTES) {
+    throw new Error(`${path} is larger than ${DESIGN_KIT_MAX_BYTES / 1024 / 1024} MB`);
+  }
+}
+
+function kitText(file: KitFile, path: string): string {
+  checkKitFile(file, path);
+  if (file.encoding !== "utf-8") throw new Error(`${path} is not a text file`);
+  return file.content;
+}
+
+function kitDataUri(file: KitFile, path: string, mime: string): string {
+  checkKitFile(file, path);
+  let b64 = file.content.replace(/\s/g, "");
+  if (file.encoding === "utf-8") {
+    const bytes = new TextEncoder().encode(file.content);
+    let bin = "";
+    for (let i = 0; i < bytes.length; i += 0x8000) {
+      bin += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+    }
+    b64 = btoa(bin);
+  } else if (!/^[A-Za-z0-9+/]*={0,2}$/.test(b64)) {
+    throw new Error(`${path} is not valid base64`);
+  }
+  return `data:${mime};base64,${b64}`;
+}
+
+const LOGO_INSET: Record<KitLogoPosition, string> = {
+  "top-left": "top:24px;left:24px;background-position:left top",
+  "top-right": "top:24px;right:24px;background-position:right top",
+  "bottom-left": "bottom:24px;left:24px;background-position:left bottom",
+  "bottom-right": "bottom:24px;right:24px;background-position:right bottom",
+};
+
+/**
+ * The injected kit <style>: @font-face and `--kit-*` tokens, then the kit
+ * stylesheet, then `!important` base rules so the brand beats the deck's own
+ * base styles on screen and in print. `assets` maps kit paths to data: URIs.
+ */
+export function buildDesignKitStyle(
+  kit: DesignKit,
+  assets: Record<string, string>,
+  css = "",
+): string {
+  const { heading, body } = kit.fonts;
+  const faces = [heading, body]
+    .filter((f): f is DesignKitFont & { src: string } => !!f?.src)
+    .map(
+      (f) =>
+        `@font-face{font-family:${f.family.split(",")[0]};src:url("${assets[f.src]}");` +
+        `${f.weight ? `font-weight:${f.weight};` : ""}font-display:block}`,
+    );
+  const vars = [
+    ...KIT_COLORS.filter((k) => kit.colors[k]).map((k) => `--kit-${k}:${kit.colors[k]}`),
+    ...(heading ? [`--kit-font-heading:${heading.family}`] : []),
+    ...(body ? [`--kit-font-body:${body.family}`] : []),
+  ];
+  const { background, text } = kit.colors;
+  const section = [
+    background && "background:var(--kit-background)!important",
+    text && "color:var(--kit-text)!important",
+    body && "font-family:var(--kit-font-body)!important",
+    kit.logo && "position:relative!important",
+    "-webkit-print-color-adjust:exact;print-color-adjust:exact",
+  ].filter(Boolean);
+  const rules = [
+    ...faces,
+    vars.length ? `:root{${vars.join(";")}}` : "",
+    css,
+    background ? "html,body{background:var(--kit-background)!important}" : "",
+    body ? "body{font-family:var(--kit-font-body)!important}" : "",
+    `body>section{${section.join(";")}}`,
+    heading
+      ? "body>section :is(h1,h2,h3,h4,h5,h6){font-family:var(--kit-font-heading)!important}"
+      : "",
+    kit.logo
+      ? `body>section::after{content:""!important;display:block!important;position:absolute!important;` +
+        `width:160px;height:56px;${LOGO_INSET[kit.logo.position]};` +
+        `background-image:url("${assets[kit.logo.src]}");background-repeat:no-repeat;` +
+        `background-size:contain;pointer-events:none;z-index:2147483647}`
+      : "",
+  ];
+  return `<style data-omnigent-kit>\n${rules.filter(Boolean).join("\n")}\n</style>`;
+}
+
+/**
+ * Load the workspace design kit through `read` (resolves `null` when a file
+ * does not exist). Never throws: any problem becomes `{ status: "error" }`
+ * so the deck still renders without the kit.
+ */
+export async function loadDesignKit(
+  read: (path: string) => Promise<KitFile | null>,
+): Promise<DesignKitState> {
+  try {
+    const kitFile = await read(`${DESIGN_KIT_DIR}/kit.json`);
+    if (!kitFile) return { status: "none" };
+    const kit = parseDesignKit(kitText(kitFile, "kit.json"));
+    const need = async (path: string) => {
+      const file = await read(`${DESIGN_KIT_DIR}/${path}`);
+      if (!file) throw new Error(`${path} not found in ${DESIGN_KIT_DIR}`);
+      return file;
+    };
+    const binaries = [
+      ...[kit.fonts.heading?.src, kit.fonts.body?.src].map(
+        (src) => src && { src, mimes: FONT_MIME },
+      ),
+      kit.logo && { src: kit.logo.src, mimes: IMAGE_MIME },
+    ].filter((a): a is { src: string; mimes: Record<string, string> } => !!a);
+    const assets: Record<string, string> = {};
+    await Promise.all(
+      binaries.map(async ({ src, mimes }) => {
+        assets[src] = kitDataUri(await need(src), src, mimes[extension(src)]);
+      }),
+    );
+    const css = kit.css ? kitText(await need(kit.css), kit.css) : "";
+    if (/<\/style/i.test(css)) throw new Error(`${kit.css} must not contain "</style"`);
+    return { status: "ok", name: kit.name, style: buildDesignKitStyle(kit, assets, css) };
+  } catch (e) {
+    return { status: "error", reason: e instanceof Error ? e.message : String(e) };
+  }
 }
 
 /**

@@ -9,17 +9,21 @@ import {
   CodeIcon,
   Maximize2Icon,
   Minimize2Icon,
+  PaletteIcon,
   PresentationIcon,
   PrinterIcon,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { fetchFileContent } from "@/hooks/useFileContent";
 import { cn } from "@/lib/utils";
 import {
   HTML_PREVIEW_SANDBOX,
   SLIDES_EDITABLE_SELECTOR,
   SLIDES_MSG_SOURCE,
   countSlideSections,
+  loadDesignKit,
   prepareSlidesDoc,
+  type DesignKitState,
 } from "./codeViewerHelpers";
 import { TruncatedBanner } from "./TruncatedBanner";
 
@@ -44,9 +48,21 @@ export function isIgnoredNavKey(e: {
   return e.target instanceof Element && !!e.target.closest(SLIDES_EDITABLE_SELECTOR);
 }
 
+/** Workspace file read for the kit loader; a 404 means "no such file". */
+async function readKitFile(conversationId: string, path: string) {
+  try {
+    return await fetchFileContent(conversationId, path);
+  } catch (e) {
+    if (e instanceof Error && e.message.startsWith("404")) return null;
+    throw e;
+  }
+}
+
 export interface SlidesViewerProps {
   content: string;
   truncated?: boolean;
+  /** Session whose workspace may hold `.omnigent/design-kit/`. */
+  conversationId?: string;
   /** Switches the file viewer to the existing source view. */
   onRequestSourceMode?: () => void;
 }
@@ -54,13 +70,31 @@ export interface SlidesViewerProps {
 export function SlidesViewer({
   content,
   truncated = false,
+  conversationId,
   onRequestSourceMode,
 }: SlidesViewerProps) {
   const rootRef = useRef<HTMLDivElement>(null);
   const stageRef = useRef<HTMLDivElement>(null);
   const iframeRef = useRef<HTMLIFrameElement>(null);
   const sourceTotal = useMemo(() => countSlideSections(content), [content]);
-  const srcDoc = useMemo(() => prepareSlidesDoc(content), [content]);
+  // Hold the deck blank until the kit resolves so it never flashes unbranded.
+  const [kit, setKit] = useState<DesignKitState | null>(conversationId ? null : { status: "none" });
+  useEffect(() => {
+    if (!conversationId) return;
+    let cancelled = false;
+    void loadDesignKit((p) => readKitFile(conversationId, p)).then((k) => {
+      if (!cancelled) setKit(k);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [conversationId, content]);
+  const kitReady = kit !== null;
+  const kitStyle = kit?.status === "ok" ? kit.style : "";
+  const srcDoc = useMemo(
+    () => (kitReady ? prepareSlidesDoc(content, kitStyle) : ""),
+    [content, kitReady, kitStyle],
+  );
   // The iframe's runtime count wins once it reports for the current document.
   const [runtime, setRuntime] = useState<{ srcDoc: string; total: number } | null>(null);
   const total = Math.min(runtime?.srcDoc === srcDoc ? runtime.total : sourceTotal, MAX_SLIDE_COUNT);
@@ -164,6 +198,15 @@ export function SlidesViewer({
       className="flex h-full flex-col bg-background outline-none focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-ring"
     >
       {truncated && <TruncatedBanner />}
+      {kit?.status === "error" && (
+        <div
+          role="status"
+          className="shrink-0 truncate border-b border-border bg-muted px-3 py-1 text-ui text-muted-foreground"
+          title={kit.reason}
+        >
+          Design kit not applied: {kit.reason}
+        </div>
+      )}
       {empty && (
         <div className="flex flex-1 flex-col items-center justify-center gap-2 p-8 text-center text-ui text-muted-foreground">
           <PresentationIcon className="size-6" />
@@ -220,7 +263,16 @@ export function SlidesViewer({
               <ChevronRightIcon className="size-4" />
             </Button>
           </div>
-          <div className="flex items-center gap-1">
+          <div className="flex min-w-0 items-center gap-1">
+            {kit?.status === "ok" && (
+              <span
+                className="flex min-w-0 items-center gap-1 px-1"
+                title={`Design kit: ${kit.name}`}
+              >
+                <PaletteIcon className="size-3.5 shrink-0" aria-hidden />
+                <span className="max-w-32 truncate max-sm:sr-only">{kit.name}</span>
+              </span>
+            )}
             <Button
               type="button"
               variant="ghost"

@@ -1,0 +1,16 @@
+{
+  "name": "Sample Kit",
+  "colors": {
+    "primary": "#3b2fc9",
+    "secondary": "#14b8a6",
+    "accent": "#f59e0b",
+    "background": "#f8fafc",
+    "text": "#0f172a"
+  },
+  "fonts": {
+    "heading": { "family": "Georgia, serif", "weight": "700" },
+    "body": { "family": "Helvetica Neue, Arial, sans-serif" }
+  },
+  "logo": { "src": "logo.svg", "position": "bottom-right" },
+  "css": "layouts.css"
+}

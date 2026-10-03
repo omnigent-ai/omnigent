@@ -4,15 +4,23 @@
 
 import { act, cleanup, createEvent, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { fetchFileContent, type FileContentResponse } from "@/hooks/useFileContent";
 import {
   HTML_PREVIEW_HEAD,
+  DESIGN_KIT_DIR,
   HTML_PREVIEW_SANDBOX,
   SLIDES_MSG_SOURCE,
+  buildDesignKitStyle,
   countSlideSections,
   isSlidesFile,
+  loadDesignKit,
+  parseDesignKit,
   prepareSlidesDoc,
+  type KitFile,
 } from "./codeViewerHelpers";
 import { MAX_SLIDE_COUNT, SlidesViewer, isIgnoredNavKey } from "./SlidesViewer";
+
+vi.mock("@/hooks/useFileContent", () => ({ fetchFileContent: vi.fn() }));
 
 const DECK = `<!DOCTYPE html>
 <html><head><title>Deck</title></head><body>
@@ -336,5 +344,248 @@ describe("SlidesViewer", () => {
       render(<SlidesViewer content={DECK} />);
       expect(screen.getByRole("button", { name: "Enter fullscreen" })).toBeInTheDocument();
     });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Design kit
+// ---------------------------------------------------------------------------
+
+const text = (content: string): KitFile => ({ encoding: "utf-8", content, bytes: content.length });
+const bin = (content: string, bytes = 3): KitFile => ({ encoding: "base64", content, bytes });
+const MB2 = 2 * 1024 * 1024;
+
+const FULL_KIT = {
+  name: "Acme",
+  colors: {
+    primary: "#ff0066",
+    secondary: "rgb(0, 0, 0)",
+    accent: "hsl(200 50% 50%)",
+    background: "#fafafa",
+    text: "navy",
+  },
+  fonts: {
+    heading: { family: "Acme Sans, sans-serif", src: "fonts/acme.woff2", weight: 700 },
+    body: { family: "'Georgia', serif" },
+  },
+  logo: { src: "logo.svg" },
+  css: "layouts.css",
+};
+
+const KIT_FILES: Record<string, KitFile> = {
+  "kit.json": text(JSON.stringify(FULL_KIT)),
+  "fonts/acme.woff2": bin("AAAA"),
+  "logo.svg": text("<svg/>"),
+  "layouts.css": text(".layout-title{text-align:center}"),
+};
+
+const kitReader = (files: Record<string, KitFile>) => async (path: string) =>
+  files[path.slice(DESIGN_KIT_DIR.length + 1)] ?? null;
+
+const kitJson = (patch: Record<string, unknown>) => JSON.stringify({ ...FULL_KIT, ...patch });
+
+describe("parseDesignKit", () => {
+  it("parses a full kit, quoting families and defaulting the logo position", () => {
+    const kit = parseDesignKit(JSON.stringify(FULL_KIT));
+    expect(kit.name).toBe("Acme");
+    expect(kit.colors).toEqual(FULL_KIT.colors);
+    expect(kit.fonts.heading).toEqual({
+      family: '"Acme Sans", sans-serif',
+      src: "fonts/acme.woff2",
+      weight: "700",
+    });
+    expect(kit.fonts.body).toEqual({ family: '"Georgia", serif' });
+    expect(kit.logo).toEqual({ src: "logo.svg", position: "bottom-right" });
+    expect(kit.css).toBe("layouts.css");
+  });
+
+  it("accepts a kit with only a name", () => {
+    expect(parseDesignKit('{"name":"Min"}')).toEqual({ name: "Min", colors: {}, fonts: {} });
+  });
+
+  it.each([
+    ["bad JSON", "{", /not valid JSON/],
+    ["a non-object", "[]", /must be a JSON object/],
+    ["a missing name", '{"colors":{}}', /needs a "name"/],
+    [
+      "a style breakout color",
+      kitJson({ colors: { primary: "red}</style><b>" } }),
+      /colors\.primary is not a valid CSS color/,
+    ],
+    [
+      "a malformed hex color",
+      kitJson({ colors: { text: "#12345" } }),
+      /colors\.text is not a valid CSS color/,
+    ],
+    [
+      "a breakout font family",
+      kitJson({ fonts: { body: { family: 'X";}body{' } } }),
+      /fonts\.body\.family is not a valid font family/,
+    ],
+    [
+      "a bad font weight",
+      kitJson({ fonts: { body: { family: "X", weight: "heavy" } } }),
+      /weight must be/,
+    ],
+    [
+      "a bad logo position",
+      kitJson({ logo: { src: "logo.svg", position: "center" } }),
+      /logo\.position/,
+    ],
+    [
+      "a non-font font src",
+      kitJson({ fonts: { body: { family: "X", src: "x.svg" } } }),
+      /fonts\.body\.src must be one of/,
+    ],
+    ["a non-css stylesheet", kitJson({ css: "layouts.js" }), /css must be one of/],
+  ])("rejects %s", (_label, json, reason) => {
+    expect(() => parseDesignKit(json)).toThrow(reason);
+  });
+
+  it.each([
+    "../logo.svg",
+    "a/../../logo.svg",
+    "./logo.svg",
+    "/etc/logo.svg",
+    "https://evil.example/logo.svg",
+    "//evil.example/logo.svg",
+    "C:\\logo.svg",
+    "logo.svg?x=1",
+    "",
+  ])("rejects the asset path %j", (src) => {
+    expect(() => parseDesignKit(kitJson({ logo: { src } }))).toThrow(/relative path inside/);
+  });
+});
+
+describe("loadDesignKit", () => {
+  it("is none when kit.json does not exist", async () => {
+    expect(await loadDesignKit(kitReader({}))).toEqual({ status: "none" });
+  });
+
+  it("embeds fonts, logo, tokens, kit CSS, then the enforced base rules", async () => {
+    const kit = await loadDesignKit(kitReader(KIT_FILES));
+    expect(kit.status).toBe("ok");
+    if (kit.status !== "ok") return;
+    const { name, style } = kit;
+    expect(name).toBe("Acme");
+    expect(style).toContain(
+      '@font-face{font-family:"Acme Sans";src:url("data:font/woff2;base64,AAAA");font-weight:700',
+    );
+    expect(style).toContain("--kit-primary:#ff0066;--kit-secondary:rgb(0, 0, 0)");
+    expect(style).toContain(
+      "--kit-accent:hsl(200 50% 50%);--kit-background:#fafafa;--kit-text:navy",
+    );
+    expect(style).toContain(
+      '--kit-font-heading:"Acme Sans", sans-serif;--kit-font-body:"Georgia", serif',
+    );
+    expect(style).toContain(`url("data:image/svg+xml;base64,${btoa("<svg/>")}")`);
+    expect(style).toContain("bottom:24px;right:24px");
+    expect(style).toContain("background:var(--kit-background)!important");
+    expect(style).toContain("font-family:var(--kit-font-heading)!important");
+    const order = ["@font-face", ":root{", ".layout-title", "body>section{", "body>section::after"];
+    const at = order.map((s) => style.indexOf(s));
+    expect(at.every((n) => n >= 0)).toBe(true);
+    expect([...at].sort((a, b) => a - b)).toEqual(at);
+  });
+
+  it("places the logo by position", () => {
+    const style = buildDesignKitStyle(
+      parseDesignKit(kitJson({ logo: { src: "logo.png", position: "top-left" } })),
+      { "logo.png": "data:image/png;base64,AA==" },
+    );
+    expect(style).toContain("top:24px;left:24px");
+  });
+
+  it.each([
+    [
+      "an oversize asset",
+      { "logo.svg": { ...text("<svg/>"), bytes: MB2 + 1 } },
+      /logo\.svg is larger than 2 MB/,
+    ],
+    [
+      "a truncated asset",
+      { "fonts/acme.woff2": { ...bin("AAAA"), truncated: true } },
+      /acme\.woff2 is larger than 2 MB/,
+    ],
+    [
+      "an oversize kit.json",
+      { "kit.json": { ...KIT_FILES["kit.json"], bytes: MB2 + 1 } },
+      /kit\.json is larger/,
+    ],
+    ["a missing asset", { "logo.svg": undefined }, /logo\.svg not found/],
+    [
+      "a stylesheet that closes <style>",
+      { "layouts.css": text("a{}</STYLE><script>") },
+      /must not contain/,
+    ],
+    ["bad base64", { "fonts/acme.woff2": bin('AA")}') }, /not valid base64/],
+    ["a binary kit.json", { "kit.json": bin("AAAA") }, /kit\.json is not a text file/],
+  ])("errors on %s", async (_label, patch, reason) => {
+    const files = { ...KIT_FILES, ...patch } as Record<string, KitFile>;
+    const kit = await loadDesignKit(kitReader(files));
+    expect(kit.status).toBe("error");
+    expect(kit.status === "error" && kit.reason).toMatch(reason);
+  });
+
+  it("errors when the read itself fails", async () => {
+    const kit = await loadDesignKit(() => Promise.reject(new Error("500 Server Error")));
+    expect(kit).toEqual({ status: "error", reason: "500 Server Error" });
+  });
+});
+
+describe("prepareSlidesDoc with a kit", () => {
+  it("injects the kit style after the deck's styles and before the deck script", () => {
+    const deck =
+      "<html><head><style>body{color:red}</style></head><body><section>a</section></body></html>";
+    const doc = prepareSlidesDoc(deck, "<style data-omnigent-kit>x</style>");
+    const kitAt = doc.indexOf("data-omnigent-kit");
+    expect(kitAt).toBeGreaterThan(doc.indexOf("body{color:red}"));
+    expect(kitAt).toBeLessThan(doc.indexOf("<script>"));
+    expect(kitAt).toBeLessThan(doc.indexOf("</body>"));
+  });
+});
+
+describe("SlidesViewer design kit", () => {
+  const response = (path: string, f: KitFile): FileContentResponse => ({
+    object: "session.environment.filesystem.file_content",
+    path,
+    content_type: null,
+    ...f,
+  });
+  const serve = (files: Record<string, KitFile>) =>
+    vi.mocked(fetchFileContent).mockImplementation(async (_id, path) => {
+      const f = files[path.slice(DESIGN_KIT_DIR.length + 1)];
+      if (!f) throw new Error("404 Not Found");
+      return response(path, f);
+    });
+  const srcdoc = () => deckFrame().getAttribute("srcdoc") ?? "";
+
+  it("applies the kit to the deck and shows its name", async () => {
+    serve(KIT_FILES);
+    render(<SlidesViewer content={DECK} conversationId="conv_1" />);
+    expect(await screen.findByTitle("Design kit: Acme")).toBeInTheDocument();
+    expect(fetchFileContent).toHaveBeenCalledWith("conv_1", `${DESIGN_KIT_DIR}/kit.json`);
+    expect(srcdoc()).toContain("--kit-primary:#ff0066");
+    expect(srcdoc()).toContain("<section><h1>Three</h1></section>");
+    expect(screen.queryByRole("status")).not.toBeInTheDocument();
+  });
+
+  it("renders the deck without the kit and names the reason when the kit is invalid", async () => {
+    serve({ "kit.json": text("{") });
+    render(<SlidesViewer content={DECK} conversationId="conv_1" />);
+    expect(await screen.findByRole("status")).toHaveTextContent(
+      "Design kit not applied: kit.json is not valid JSON",
+    );
+    expect(srcdoc()).toBe(prepareSlidesDoc(DECK));
+    expect(screen.getByText("1 / 3")).toBeInTheDocument();
+    expect(screen.queryByTitle(/Design kit:/)).not.toBeInTheDocument();
+  });
+
+  it("is unchanged when the workspace has no kit", async () => {
+    serve({});
+    render(<SlidesViewer content={DECK} conversationId="conv_1" />);
+    await vi.waitFor(() => expect(srcdoc()).toBe(prepareSlidesDoc(DECK)));
+    expect(screen.queryByRole("status")).not.toBeInTheDocument();
+    expect(screen.queryByTitle(/Design kit:/)).not.toBeInTheDocument();
   });
 });

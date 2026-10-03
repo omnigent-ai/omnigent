@@ -1,0 +1,42 @@
+/* Layout classes decks can put on a top-level <section>. */
+section {
+  box-sizing: border-box;
+  height: 100vh;
+  padding: 64px 80px;
+}
+
+section h1,
+section h2 {
+  color: var(--kit-primary);
+}
+
+/* The kit's base rules use !important, so overriding them needs it too. */
+.layout-title {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  align-items: center;
+  text-align: center;
+  background: var(--kit-primary) !important;
+  color: var(--kit-background) !important;
+}
+
+.layout-title h1,
+.layout-title h2 {
+  color: inherit;
+}
+
+.layout-two-col {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  grid-template-rows: auto 1fr;
+  column-gap: 48px;
+}
+
+.layout-two-col > :first-child {
+  grid-column: 1 / -1;
+}
+
+.accent {
+  color: var(--kit-accent);
+}

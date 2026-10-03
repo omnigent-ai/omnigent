@@ -102,3 +102,50 @@ def test_slides_viewer_steps_through_deck(page: Page, seeded_deck: tuple[str, st
     # Source returns to the existing code view.
     file_viewer.get_by_role("button", name="View deck source").click()
     expect(iframe_el).to_have_count(0)
+
+
+_SAMPLE_KIT = _REPO_ROOT / "examples" / "design-kits" / "sample"
+
+# The deck sets its own base colors; the kit must still win.
+_OFF_BRAND_DECK = """\
+<!DOCTYPE html>
+<html>
+  <head><style>section{background:#000;color:#fff;font-family:monospace}</style></head>
+  <body>
+    <section id="s1" class="layout-two-col"><h1>Off brand</h1><p>a</p><p>b</p></section>
+  </body>
+</html>
+"""
+
+
+def test_slides_viewer_applies_design_kit(page: Page, seeded_session: tuple[str, str]) -> None:
+    """The sample kit in ``.omnigent/design-kit/`` brands a deck that ignores it."""
+    base_url, session_id = seeded_session
+    fs = f"{base_url}/v1/sessions/{session_id}/resources/environments/default/filesystem"
+    files = {f".omnigent/design-kit/{p.name}": p.read_text() for p in _SAMPLE_KIT.iterdir()}
+    files[_DECK_PATH] = _OFF_BRAND_DECK
+    try:
+        for path, content in files.items():
+            httpx.put(
+                f"{fs}/{path}", json={"content": content, "encoding": "utf-8"}, timeout=10.0
+            ).raise_for_status()
+
+        page.set_viewport_size({"width": 1600, "height": 900})
+        page.goto(f"{base_url}/c/{session_id}?file={_DECK_PATH}")
+        file_viewer = page.locator('[data-testid="file-viewer"]:visible')
+        expect(file_viewer.get_by_title("Design kit: Sample Kit")).to_be_visible(timeout=10_000)
+
+        slide = file_viewer.frame_locator('iframe[title="Slide deck"]').locator("#s1")
+        expect(slide).to_be_visible()
+        expect(slide).to_have_css("background-color", "rgb(248, 250, 252)")
+        expect(slide).to_have_css("color", "rgb(15, 23, 42)")
+        expect(slide).to_have_css("display", "grid")
+        expect(slide.locator("h1")).to_have_css("font-family", "Georgia, serif")
+        assert (
+            slide.evaluate("el => getComputedStyle(el).getPropertyValue('--kit-primary').trim()")
+            == "#3b2fc9"
+        )
+        logo = slide.evaluate("el => getComputedStyle(el, '::after').backgroundImage")
+        assert logo.startswith('url("data:image/svg+xml;base64,')
+    finally:
+        shutil.rmtree(_REPO_ROOT / session_id, ignore_errors=True)
