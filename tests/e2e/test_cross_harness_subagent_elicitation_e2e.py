@@ -250,14 +250,15 @@ def cross_harness_rig(
             )
             deadline = min(cross_harness_deadline, time.monotonic() + 60)
             while time.monotonic() < deadline:
-                assert all(proc.poll() is None for proc in processes), "server/runner exited"
+                if any(proc.poll() is not None for proc in processes):
+                    pytest.fail(f"server/runner exited early:\n{_rig_log_tails(tmp_path)}")
                 with contextlib.suppress(httpx.HTTPError):
                     response = client.get(f"/v1/runners/{runner_id}/status", timeout=2)
                     if response.status_code == 200 and response.json().get("online"):
                         break
                 time.sleep(0.5)
             else:
-                pytest.fail("server/runner did not become ready")
+                pytest.fail(f"server/runner did not become ready:\n{_rig_log_tails(tmp_path)}")
             yield client, workspace, runner_id, mock_url
         finally:
             for proc in reversed(processes):
@@ -268,6 +269,18 @@ def cross_harness_rig(
                     except subprocess.TimeoutExpired:
                         proc.kill()
                         proc.wait(timeout=5)
+
+
+def _rig_log_tails(tmp_path: Path) -> str:
+    """Tail of the spawned server/runner logs, for a stall's diagnostics."""
+    tails = []
+    for name in ("server.log", "runner.log"):
+        path = tmp_path / name
+        try:
+            tails.append(f"{name}:\n{path.read_text()[-3000:]}")
+        except OSError as exc:
+            tails.append(f"{name}: unavailable ({exc})")
+    return "\n".join(tails)
 
 
 def _snapshot(client: httpx.Client, session_id: str) -> dict[str, Any]:
@@ -295,8 +308,14 @@ def _wait_for(
     session_ids: list[str],
     deadline: float,
     timeout: float | None = None,
+    tmp_path: Path | None = None,
 ) -> Any:
-    """Poll real processes and retain session diagnostics on timeout."""
+    """Poll real processes and retain session diagnostics on timeout.
+
+    :param tmp_path: When given, the failure message also includes the
+        spawned server/runner log tails — a crashed or wedged native CLI
+        subprocess shows up there, not in a session snapshot.
+    """
     if timeout is not None:
         deadline = min(deadline, time.monotonic() + timeout)
     while time.monotonic() < deadline:
@@ -313,7 +332,10 @@ def _wait_for(
             }
         except httpx.HTTPError as exc:
             diagnostics[session_id] = {"error": str(exc)}
-    pytest.fail(f"Timed out waiting for {description}: {json.dumps(diagnostics, default=str)}")
+    message = f"Timed out waiting for {description}: {json.dumps(diagnostics, default=str)}"
+    if tmp_path is not None:
+        message += f"\n{_rig_log_tails(tmp_path)}"
+    pytest.fail(message)
 
 
 @pytest.mark.parametrize("diagnostics_unavailable", [False, True])
@@ -511,6 +533,7 @@ def test_codex_parent_answers_real_claude_child_elicitation(
             deadline=cross_harness_deadline,
             client=client,
             session_ids=session_ids,
+            tmp_path=tmp_path,
         )
         child_id = child_row["id"]
         session_ids.append(child_id)
@@ -537,6 +560,7 @@ def test_codex_parent_answers_real_claude_child_elicitation(
             deadline=cross_harness_deadline,
             client=client,
             session_ids=session_ids,
+            tmp_path=tmp_path,
         )
         elicitation_id = event["elicitation_id"]
         params = event["params"]
@@ -571,6 +595,7 @@ def test_codex_parent_answers_real_claude_child_elicitation(
             deadline=cross_harness_deadline,
             client=client,
             session_ids=session_ids,
+            tmp_path=tmp_path,
         )
         _wait_for(
             lambda: any(
@@ -583,6 +608,7 @@ def test_codex_parent_answers_real_claude_child_elicitation(
             deadline=cross_harness_deadline,
             client=client,
             session_ids=session_ids,
+            tmp_path=tmp_path,
         )
         _wait_for(
             lambda: all(
@@ -597,6 +623,7 @@ def test_codex_parent_answers_real_claude_child_elicitation(
             client=client,
             session_ids=session_ids,
             timeout=30,
+            tmp_path=tmp_path,
         )
     finally:
         for sid in reversed(session_ids):
