@@ -173,6 +173,8 @@ let hostConfig: OmnigentHostConfig = {};
 let hostConfigGeneration = 0;
 let embedRoot: HTMLElement | null = null;
 let embedScopeRoot: HTMLElement | null = null;
+const HOST_SESSION_RECOVERY_KEY = "omnigent:host-session-recovery";
+let hostSessionRecoveryPending = false;
 
 export function getOmnigentServerIdentity(): string | null {
   if (hostConfig.serverIdentity?.trim()) return hostConfig.serverIdentity.trim();
@@ -300,15 +302,42 @@ export function getThemeRoots(): HTMLElement[] {
   return typeof document !== "undefined" ? [document.documentElement] : [];
 }
 
-/**
- * Single network choke point. Delegates to the host fetcher when embedded,
- * otherwise calls native `fetch` with the path unchanged (standalone).
- */
-export function hostFetch(path: string, init?: RequestInit): Promise<Response> {
+function recoverExpiredHostSession(error: unknown): void {
+  if (
+    hostSessionRecoveryPending ||
+    !(error instanceof Error) ||
+    !/^Fetch request failed due (?:to )?expired user session\.?$/i.test(error.message)
+  ) {
+    return;
+  }
+  try {
+    if (window.sessionStorage.getItem(HOST_SESSION_RECOVERY_KEY)) return;
+    window.sessionStorage.setItem(HOST_SESSION_RECOVERY_KEY, "1");
+    hostSessionRecoveryPending = true;
+    window.location.reload();
+  } catch {
+    return;
+  }
+}
+
+/** Route embedded requests through the host and standalone requests through the base path. */
+export async function hostFetch(path: string, init?: RequestInit): Promise<Response> {
   if (hostConfig.fetcher) {
-    // The host owns path rebasing (it proxies onto its own API surface), so
-    // the path is passed through untouched — `withBasePath` is standalone-only.
-    return hostConfig.fetcher(path, init);
+    // The host owns path rebasing; `withBasePath` is standalone-only.
+    try {
+      const response = await hostConfig.fetcher(path, init);
+      if (path === "/v1/me" && response.ok && !hostSessionRecoveryPending) {
+        try {
+          window.sessionStorage.removeItem(HOST_SESSION_RECOVERY_KEY);
+        } catch {
+          return response;
+        }
+      }
+      return response;
+    } catch (error) {
+      recoverExpiredHostSession(error);
+      throw error;
+    }
   }
   return fetch(withBasePath(path), init);
 }
