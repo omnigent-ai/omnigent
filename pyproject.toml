@@ -84,7 +84,9 @@ dependencies = [
     "pexpect>=4.9,<5; platform_system != 'Windows'",
     "pyte>=0.8,<1; platform_system != 'Windows'",
     "pydantic>=2.0,<3",
-    "sqlalchemy>=2.0,<3",
+    # SQLAlchemy 2.1.0 has invalid duplicate normalized extras in its sdist.
+    # Revisit <2.1 after a 2.1.x release has valid metadata and passes compatibility checks.
+    "sqlalchemy>=2.0,<2.1",
     # Client-side compression for opaque text columns (omnigent/db/compression.py),
     # so per-conversation JSON/text is stored uniformly compressed across SQLite,
     # PostgreSQL, and MySQL rather than depending on each backend's storage engine.
