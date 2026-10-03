@@ -22,7 +22,7 @@ from omnigent.harnesses.opencode_native.bridge import (
     update_active_message_id,
     update_last_event_id,
     update_model_override,
-    user_opencode_config_path,
+    user_opencode_config_paths,
     write_bridge_state,
     write_cost_popup_config,
     write_opencode_policy_plugin,
@@ -244,23 +244,23 @@ def test_seed_opencode_auth_noop_without_source(
     assert bridge.seed_opencode_auth(bridge_dir) is None
 
 
-def test_user_opencode_config_path_default_location(
+def test_user_opencode_config_paths_default_location(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """Without XDG_CONFIG_HOME, looks at ~/.config/opencode/opencode.jsonc."""
+    """Without XDG_CONFIG_HOME, looks under ~/.config/opencode."""
     monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
     fake_home = tmp_path / "fake_home"
     monkeypatch.setattr(Path, "home", lambda: fake_home)
-    # File does not exist → returns None.
-    assert user_opencode_config_path() is None
-    # Create the file and verify the path is as expected.
+    # No config files exist → empty list.
+    assert user_opencode_config_paths() == []
+    # Create a file and verify the path is as expected.
     (fake_home / ".config" / "opencode").mkdir(parents=True)
     (fake_home / ".config" / "opencode" / "opencode.jsonc").write_text("{}")
     expected = fake_home / ".config" / "opencode" / "opencode.jsonc"
-    assert user_opencode_config_path() == expected
+    assert user_opencode_config_paths() == [expected]
 
 
-def test_user_opencode_config_path_honors_xdg_config_home(
+def test_user_opencode_config_paths_honors_xdg_config_home(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """XDG_CONFIG_HOME env var redirects the lookup."""
@@ -268,34 +268,47 @@ def test_user_opencode_config_path_honors_xdg_config_home(
     cfg_dir.mkdir(parents=True)
     (cfg_dir / "opencode.jsonc").write_text("{}", encoding="utf-8")
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "my-config"))
-    path = user_opencode_config_path()
-    assert path is not None and path.exists()
-    assert path.name == "opencode.jsonc"
+    paths = user_opencode_config_paths()
+    assert [p.name for p in paths] == ["opencode.jsonc"]
+    assert all(p.exists() for p in paths)
 
 
-def test_user_opencode_config_path_falls_back_to_json(
+def test_user_opencode_config_paths_single_json(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """When only opencode.json exists (no .jsonc), returns the .json path."""
+    """When only opencode.json exists, it is the sole entry."""
     cfg_dir = tmp_path / "cfg" / "opencode"
     cfg_dir.mkdir(parents=True)
     (cfg_dir / "opencode.json").write_text("{}", encoding="utf-8")
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
-    path = user_opencode_config_path()
-    assert path is not None and path.name == "opencode.json"
+    assert [p.name for p in user_opencode_config_paths()] == ["opencode.json"]
 
 
-def test_user_opencode_config_path_prefers_jsonc(
+def test_user_opencode_config_paths_include_config_json(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """When both .jsonc and .json exist, .jsonc is preferred."""
+    """config.json is consulted too — opencode loads it first in its merge."""
+    cfg_dir = tmp_path / "legacy" / "opencode"
+    cfg_dir.mkdir(parents=True)
+    (cfg_dir / "config.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "legacy"))
+    assert [p.name for p in user_opencode_config_paths()] == ["config.json"]
+
+
+def test_user_opencode_config_paths_ordered_by_merge_precedence(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """All existing files are returned in opencode's merge order (later wins)."""
     cfg_dir = tmp_path / "pref" / "opencode"
     cfg_dir.mkdir(parents=True)
-    (cfg_dir / "opencode.jsonc").write_text("{}", encoding="utf-8")
-    (cfg_dir / "opencode.json").write_text("{}", encoding="utf-8")
+    for name in ("opencode.jsonc", "opencode.json", "config.json"):
+        (cfg_dir / name).write_text("{}", encoding="utf-8")
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "pref"))
-    path = user_opencode_config_path()
-    assert path is not None and path.name == "opencode.jsonc"
+    assert [p.name for p in user_opencode_config_paths()] == [
+        "config.json",
+        "opencode.json",
+        "opencode.jsonc",
+    ]
 
 
 def test_policy_plugin_merges_routing_headers(bridge_dir: Path) -> None:

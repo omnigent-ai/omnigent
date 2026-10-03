@@ -659,6 +659,87 @@ def test_merge_user_provider_config_handles_jsonc_trailing_commas(
     assert result["provider"]["my-openai"]["options"]["baseURL"] == "https://my-gw/v1"
 
 
+def test_merge_user_provider_config_reads_config_json(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A provider declared only in config.json reaches the merged config."""
+    cfg_dir = tmp_path / "cfg" / "opencode"
+    cfg_dir.mkdir(parents=True)
+    (cfg_dir / "config.json").write_text(
+        '{"provider": {"my-gw": {"options": {"baseURL": "https://my-gw/v1"}}}}',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
+
+    result = maybe_merge_user_provider_config({})
+    assert result["provider"]["my-gw"]["options"]["baseURL"] == "https://my-gw/v1"
+
+
+def test_merge_user_provider_config_merges_all_user_config_files(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A provider in opencode.json survives an opencode.jsonc that only pins a model."""
+    cfg_dir = tmp_path / "cfg" / "opencode"
+    cfg_dir.mkdir(parents=True)
+    (cfg_dir / "opencode.json").write_text(
+        '{"provider": {"my-gw": {"npm": "@ai-sdk/openai-compatible", '
+        '"options": {"baseURL": "https://my-gw/v1"}, '
+        '"models": {"gpt-4": {"name": "gpt-4"}}}}}',
+        encoding="utf-8",
+    )
+    (cfg_dir / "opencode.jsonc").write_text(
+        '{\n  // pin the default model\n  "model": "my-gw/gpt-4"\n}\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
+
+    result = maybe_merge_user_provider_config({})
+    assert result["provider"]["my-gw"]["models"] == {"gpt-4": {"name": "gpt-4"}}
+    assert result["model"] == "my-gw/gpt-4"
+
+
+def test_merge_user_provider_config_later_file_wins_deep(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Files merge per-key like opencode: later files override conflicting
+    values while non-conflicting keys from earlier files survive."""
+    cfg_dir = tmp_path / "cfg" / "opencode"
+    cfg_dir.mkdir(parents=True)
+    (cfg_dir / "config.json").write_text(
+        '{"provider": {"my-gw": {"options": {"baseURL": "https://old/v1", '
+        '"apiKey": "sk-user"}, "models": {"gpt-4": {"name": "gpt-4"}}}}}',
+        encoding="utf-8",
+    )
+    (cfg_dir / "opencode.jsonc").write_text(
+        '{"provider": {"my-gw": {"options": {"baseURL": "https://new/v1"}}}}',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
+
+    result = maybe_merge_user_provider_config({})
+    options = result["provider"]["my-gw"]["options"]
+    assert options["baseURL"] == "https://new/v1"
+    assert options["apiKey"] == "sk-user"
+    assert result["provider"]["my-gw"]["models"] == {"gpt-4": {"name": "gpt-4"}}
+
+
+def test_merge_user_provider_config_skips_unparseable_file_keeps_others(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A broken config file is ignored without dropping the parseable ones."""
+    cfg_dir = tmp_path / "cfg" / "opencode"
+    cfg_dir.mkdir(parents=True)
+    (cfg_dir / "config.json").write_text(
+        '{"provider": {"my-gw": {"options": {"baseURL": "https://my-gw/v1"}}}}',
+        encoding="utf-8",
+    )
+    (cfg_dir / "opencode.jsonc").write_text("{ not valid json", encoding="utf-8")
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
+
+    result = maybe_merge_user_provider_config({})
+    assert result["provider"]["my-gw"]["options"]["baseURL"] == "https://my-gw/v1"
+
+
 def test_build_mcp_block_preserves_custom_timeout() -> None:
     from types import SimpleNamespace as N
 
