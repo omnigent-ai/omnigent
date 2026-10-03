@@ -19,7 +19,9 @@ from omnigent.git_providers import (
 _HOSTS_YML_KEY = re.compile(r"^([A-Za-z0-9.-]+):\s*$")
 _SCP_REMOTE = re.compile(r"^[\w.\-]+@(?P<host>[\w.\-]+):(?P<path>.+)$")
 # URL-style remotes may name a port, e.g. ``ssh://git@ghe.example.com:7999/o/r.git``.
-_URL_REMOTE = re.compile(r"^\w+://(?:[^@/]+@)?(?P<host>[\w.\-]+)(?::\d+)?/(?P<path>.+)$")
+_URL_REMOTE = re.compile(
+    r"^(?:https?|ssh|git)://(?:[^@/]+@)?(?P<host>[\w.\-]+)(?::\d+)?/(?P<path>.+)$"
+)
 
 
 def _valid_hostname(host: str) -> bool:
@@ -136,13 +138,13 @@ class GitHubProvider:
         return host in _gh_signed_in_hosts()
 
     def parse_remote_url(self, url: str, instances: Instances) -> ParsedRemote | None:
-        """Parse an HTTPS, SSH, or scp-style remote on a GitHub host to ``owner/repo``."""
+        """Parse a GitHub HTTP(S), SSH, git, or scp-style remote to ``owner/repo``."""
         candidate = url.strip()
         match = _SCP_REMOTE.match(candidate) or _URL_REMOTE.match(candidate)
         if match is None:
             return None
         parts = match["path"].removesuffix(".git").strip("/").split("/")
-        if len(parts) < 2 or not parts[-1] or not parts[-2]:
+        if len(parts) != 2 or any(part in {"", ".", ".."} for part in parts):
             return None
         host = match["host"].lower()
         if not self.matches_host(host, instances):

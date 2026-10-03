@@ -682,13 +682,17 @@ def _repo_argument(ref: PullRequestRef) -> str:
 
     It is also the key of saved per-PR account preferences, so its format is fixed.
     """
+    if ref.provider != "github":
+        raise ValueError("This resource supports only GitHub pull requests")
     return f"{ref.host}/{ref.repository}"
 
 
 def _selected_pr(session_id: str, pr_url: str) -> PullRequestRef:
     reference = PullRequestRef.from_url(pr_url)
+    if reference.provider != "github":
+        raise ValueError("This resource supports only GitHub pull requests")
     for entry in SessionPrRegistry(session_id).list():
-        if entry.url == reference.url:
+        if entry.url == reference.url and entry.provider == "github":
             return entry
     raise ValueError("This pull request is not associated with the session")
 
@@ -698,7 +702,9 @@ def _default_pr(session_id: str | None, pr_url: str | None) -> PullRequestRef | 
         return None
     if pr_url:
         return _selected_pr(session_id, pr_url)
-    entries = SessionPrRegistry(session_id).list()
+    entries = [
+        entry for entry in SessionPrRegistry(session_id).list() if entry.provider == "github"
+    ]
     return entries[0] if entries else None
 
 
@@ -852,7 +858,7 @@ def github_info(
         return _workspace_github_info(root)
     request_deadline = time.monotonic() + _PR_TITLE_REQUEST_SECONDS
     registry = SessionPrRegistry(session_id)
-    entries = registry.list()
+    entries = [entry for entry in registry.list() if entry.provider == "github"]
     if pr_url:
         info = _reference_info(root, _selected_pr(session_id, pr_url))
     elif entries:
@@ -863,7 +869,7 @@ def github_info(
         if isinstance(pr, dict) and isinstance(pr.get("url"), str):
             reference = PullRequestRef.from_url(pr["url"])
             registry.record([reference], relationship="inferred", source="branch")
-            entries = registry.list()
+            entries = [entry for entry in registry.list() if entry.provider == "github"]
             if any(entry.url == reference.url for entry in entries):
                 key = _workspace_key(root)
                 account = _config.github_account_preference(key) if key else None
@@ -880,6 +886,8 @@ def github_info(
 def update_session_pr(root: str, session_id: str, url: str, action: str) -> dict[str, Any]:
     """Attach a verified PR or persist an explicit exclusion."""
     reference = PullRequestRef.from_url(url)
+    if reference.provider != "github":
+        raise ValueError("This resource supports only GitHub pull requests")
     registry = SessionPrRegistry(session_id)
     try:
         if action == "attach":

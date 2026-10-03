@@ -152,7 +152,14 @@ def test_rejected_pr_urls_stay_rejected(url: str) -> None:
 
 
 @pytest.mark.parametrize(
-    "url", ["https://github.com/o/r.git", "git@github.com:o/r.git", "ssh://git@github.com/o/r"]
+    "url",
+    [
+        "https://github.com/o/r.git",
+        "http://github.com/o/r.git",
+        "git://github.com/o/r.git",
+        "git@github.com:o/r.git",
+        "ssh://git@github.com/o/r",
+    ],
 )
 def test_github_remotes_parse(url: str) -> None:
     assert PROVIDER.parse_remote_url(url, EnvInstances()) == GITHUB_REMOTE
@@ -476,3 +483,23 @@ def test_registry_records_the_provider(tmp_path: Path) -> None:
     store.record([PullRequestRef.from_url(A)], relationship="created", source="test")
 
     assert json.loads(store.path.read_text())["prs"][0]["provider"] == "github"
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "ftp://github.com/o/r.git",
+        "file://github.com/o/r.git",
+        "custom://github.com/o/r.git",
+        "https://github.com/team/sub/project.git",
+        "git@github.com:team/sub/project.git",
+        "ssh://git@github.com/team/sub/project.git",
+        "https://github.com/./r.git",
+        "https://github.com/o/..",
+        "https://github.com/o",
+        "https://github.com/o//r.git",
+    ],
+)
+def test_non_git_schemes_and_non_github_project_paths_are_rejected(url: str) -> None:
+    assert PROVIDER.parse_remote_url(url, EnvInstances()) is None
+    assert resolve_remote(url) is None

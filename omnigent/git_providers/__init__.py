@@ -34,7 +34,7 @@ ENTRY_POINT_GROUP = "omnigent.git_providers"
 
 _FACET_KINDS = ("connection", "credential", "pull_requests", "policy")
 _SCP_REMOTE_HOST = re.compile(r"^[\w.\-]+@(?P<host>[\w.\-]+):")
-_URL_SCHEMES = frozenset({"http", "https", "ssh"})
+_URL_SCHEMES = frozenset({"http", "https", "ssh", "git"})
 
 
 @dataclass(frozen=True)
@@ -130,7 +130,7 @@ class GitProvider(Protocol):
 
 
 def host_of(url: str) -> str | None:
-    """Return the lower-cased host of an http(s), ssh, or scp-style remote URL.
+    """Return the lower-cased host of an HTTP(S), SSH, git, or scp-style remote URL.
 
     :param url: e.g. ``"https://github.com/o/r"``, ``"ssh://git@host/o/r"``, or
         ``"git@host:o/r.git"``.
@@ -300,7 +300,17 @@ def _claims(descriptor: GitProvider, host: str, instances: Instances) -> bool:
 def _parse_remote(descriptor: GitProvider, url: str, instances: Instances) -> ParsedRemote | None:
     """Return *descriptor*'s parse of a remote URL; one that raises parses nothing."""
     try:
-        return descriptor.parse_remote_url(url, instances)
+        parsed = descriptor.parse_remote_url(url, instances)
+        if parsed is not None and (
+            not isinstance(parsed, ParsedRemote)
+            or parsed.provider != descriptor.id
+            or not isinstance(parsed.host, str)
+            or not parsed.host
+            or not isinstance(parsed.repository, str)
+            or not parsed.repository
+        ):
+            raise ValueError("Invalid remote identity returned by git provider")
+        return parsed
     except Exception:  # noqa: BLE001 — a broken descriptor must not stop the other providers
         _log_descriptor_failure(descriptor, "parse_remote_url")
         return None
@@ -309,7 +319,21 @@ def _parse_remote(descriptor: GitProvider, url: str, instances: Instances) -> Pa
 def _parse_pr(descriptor: GitProvider, url: str, instances: Instances) -> ParsedPullRequest | None:
     """Return *descriptor*'s parse of a pull request URL; one that raises parses nothing."""
     try:
-        return descriptor.parse_pr_url(url, instances)
+        parsed = descriptor.parse_pr_url(url, instances)
+        if parsed is not None and (
+            not isinstance(parsed, ParsedPullRequest)
+            or parsed.provider != descriptor.id
+            or not isinstance(parsed.host, str)
+            or not parsed.host
+            or not isinstance(parsed.repository, str)
+            or not parsed.repository
+            or type(parsed.number) is not int
+            or parsed.number <= 0
+            or not isinstance(parsed.url, str)
+            or not parsed.url
+        ):
+            raise ValueError("Invalid pull request identity returned by git provider")
+        return parsed
     except Exception:  # noqa: BLE001 — a broken descriptor must not stop the other providers
         _log_descriptor_failure(descriptor, "parse_pr_url")
         return None

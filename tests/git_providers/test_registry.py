@@ -296,7 +296,7 @@ def test_load_facet_rejects_an_unknown_kind() -> None:
         ("ssh://git@Git.Example.Test:22/o/r.git", "git.example.test"),
         ("git@Git.Example.Test:o/r.git", "git.example.test"),
         ("  https://github.com/o/r\n", "github.com"),
-        ("git://github.com/o/r", None),
+        ("git://github.com/o/r", "github.com"),
         ("file:///srv/git/r.git", None),
         ("/srv/git/r.git", None),
         ("github.com/o/r", None),
@@ -560,3 +560,81 @@ def test_reset_for_tests_lets_the_next_failure_warn_again(
         logging.WARNING,
         logging.WARNING,
     ]
+
+
+def _add_malformed_parser(result: object, method: str) -> None:
+    descriptor = types.SimpleNamespace(
+        id="broken_result",
+        display_name="Broken result",
+        default_hosts=("git.example.test",),
+        facets=FacetModules(),
+        matches_host=lambda host, _instances: host == "git.example.test",
+        parse_remote_url=lambda *_: None,
+        parse_pr_url=lambda *_: None,
+    )
+    setattr(descriptor, method, lambda *_: result)
+    _add_provider(descriptor)
+    _add_provider(FakeProvider("healthy", default_hosts=("git.example.test",)))
+
+
+@pytest.mark.parametrize(
+    "result",
+    [
+        pytest.param({"provider": "broken_result"}, id="dictionary"),
+        pytest.param("not a remote", id="string"),
+        pytest.param(ParsedRemote("someone_else", "git.example.test", "o/r"), id="wrong-provider"),
+        pytest.param(ParsedRemote("broken_result", "", "o/r"), id="empty-host"),
+        pytest.param(ParsedRemote("broken_result", 17, "o/r"), id="invalid-host"),
+        pytest.param(ParsedRemote("broken_result", "git.example.test", ""), id="empty-repository"),
+        pytest.param(
+            ParsedRemote("broken_result", "git.example.test", []), id="invalid-repository"
+        ),
+    ],
+)
+def test_malformed_remote_result_does_not_hide_a_healthy_provider(
+    result: object, caplog: pytest.LogCaptureFixture
+) -> None:
+    _add_malformed_parser(result, "parse_remote_url")
+
+    parsed = resolve_remote("https://git.example.test/o/r.git")
+
+    assert parsed == ParsedRemote("healthy", "git.example.test", "fake/repo")
+    assert "broken_result failed in parse_remote_url" in caplog.text
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        pytest.param({"provider": "someone_else"}, id="wrong-provider"),
+        pytest.param({"host": ""}, id="empty-host"),
+        pytest.param({"host": []}, id="invalid-host"),
+        pytest.param({"repository": ""}, id="empty-repository"),
+        pytest.param({"repository": {}}, id="invalid-repository"),
+        pytest.param({"number": True}, id="boolean-number"),
+        pytest.param({"number": "7"}, id="string-number"),
+        pytest.param({"number": 0}, id="zero-number"),
+        pytest.param({"number": -1}, id="negative-number"),
+        pytest.param({"url": ""}, id="empty-url"),
+        pytest.param({"url": 7}, id="invalid-url"),
+        pytest.param(None, id="dictionary-result"),
+    ],
+)
+def test_malformed_pr_result_does_not_hide_a_healthy_provider(
+    fields: dict | None, caplog: pytest.LogCaptureFixture
+) -> None:
+    identity = {
+        "provider": "broken_result",
+        "host": "git.example.test",
+        "repository": "o/r",
+        "number": 7,
+        "url": GITHUB_SHAPED_PR,
+    }
+    result = ParsedPullRequest(**{**identity, **fields}) if fields is not None else identity
+    _add_malformed_parser(result, "parse_pr_url")
+
+    parsed = resolve_pr_url(GITHUB_SHAPED_PR)
+
+    assert parsed == ParsedPullRequest(
+        "healthy", "git.example.test", "fake/repo", 7, GITHUB_SHAPED_PR
+    )
+    assert "broken_result failed in parse_pr_url" in caplog.text
