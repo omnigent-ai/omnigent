@@ -106,10 +106,11 @@ def test_failed_session_matches_headline_red_and_survives_reading(
     expect(icon).to_have_css("width", "14px")
     expect(icon).to_have_css("height", "14px")
 
+    # The tooltip names the state, then shows the failure text the server kept.
     link.hover()
-    expect(page.get_by_test_id("session-tooltip-content")).to_contain_text(
-        "Latest message is an error"
-    )
+    tooltip = page.get_by_test_id("session-tooltip-content")
+    expect(tooltip.get_by_test_id("session-tooltip-status")).to_have_text("Error")
+    expect(tooltip.get_by_test_id("session-tooltip-error")).to_contain_text(_ERROR_MESSAGE)
     row.hover()
     row.get_by_test_id("conversation-actions").click()
     page.get_by_test_id("mark-unread-conversation").click()

@@ -1393,6 +1393,264 @@ describe("Sidebar session list", () => {
     });
   });
 
+  describe("session tooltip details", () => {
+    // Every non-spinner state draws one filled, token-coloured dot that falls
+    // back to the system text colour in forced-colors mode.
+    const HARD_CODED_COLOR =
+      /#[0-9a-f]{3,8}|rgba?\(|oklch\(|hsla?\(|-(?:gray|zinc|slate|neutral|stone|red|pink|rose|blue|green|white|black)(?:-\d|\b)/i;
+    function expectStatusDot(status: HTMLElement, token: string) {
+      expect(status.querySelector("svg")).toBeNull();
+      const dot = status.querySelector("span[aria-hidden] > span.rounded-full");
+      expect(dot).toHaveClass("size-2", token, "forced-colors:bg-[CanvasText]");
+      expect(dot?.className).not.toMatch(/\bborder\b/);
+      expect(dot?.className).not.toMatch(HARD_CODED_COLOR);
+    }
+
+    async function hoverTooltip(session: Conversation) {
+      mockConversations([session]);
+      renderSidebar();
+      fireEvent.pointerMove(screen.getByRole("link", { name: new RegExp(session.id) }), {
+        pointerType: "mouse",
+      });
+      return screen.findByTestId("session-tooltip-content");
+    }
+
+    it("widens the card while keeping the viewport clamp", async () => {
+      const tooltip = await hoverTooltip(conv("conv_width", "aria"));
+      expect(tooltip).toHaveClass("w-72", "max-w-[calc(100vw-2rem)]");
+    });
+
+    it("shows the agent name", async () => {
+      const tooltip = await hoverTooltip(conv("conv_agent", "aria"));
+      expect(within(tooltip).getAllByTestId("session-tooltip-agent")[0]).toHaveTextContent(
+        /^aria$/,
+      );
+    });
+
+    it("omits the agent line when the agent is unknown", async () => {
+      const tooltip = await hoverTooltip(
+        conv("conv_no_agent", "", { agent_name: null, workspace: "/srv/repo" }),
+      );
+      expect(within(tooltip).getByTestId("session-tooltip-cwd")).toBeInTheDocument();
+      expect(within(tooltip).queryByTestId("session-tooltip-agent")).toBeNull();
+    });
+
+    it("shows a short working directory in full", async () => {
+      const tooltip = await hoverTooltip(conv("conv_cwd", "aria", { workspace: "/srv/repo" }));
+      const cwd = within(tooltip).getAllByTestId("session-tooltip-cwd")[0];
+      expect(cwd.querySelector("[aria-hidden='true'].truncate")).toHaveTextContent(/^\/srv\/repo$/);
+    });
+
+    it("trims a long working directory from the left, keeping the last folder", async () => {
+      // jsdom has no layout: model an 8px-per-character line in a 120px box.
+      const scrollWidth = vi
+        .spyOn(HTMLElement.prototype, "scrollWidth", "get")
+        .mockImplementation(function (this: HTMLElement) {
+          return (this.textContent?.length ?? 0) * 8;
+        });
+      const clientWidth = vi
+        .spyOn(HTMLElement.prototype, "clientWidth", "get")
+        .mockReturnValue(120);
+      try {
+        const workspace = "/Users/me/omnigent-worktrees/fix-sse";
+        const tooltip = await hoverTooltip(conv("conv_long_cwd", "aria", { workspace }));
+        const cwd = within(tooltip).getAllByTestId("session-tooltip-cwd")[0];
+        await waitFor(() => {
+          expect(cwd.querySelector("[aria-hidden='true'].truncate")).toHaveTextContent(
+            /^…\/fix-sse$/,
+          );
+        });
+        // Assistive tech still gets the untrimmed path.
+        expect(cwd.querySelector(".sr-only")).toHaveTextContent(workspace);
+      } finally {
+        scrollWidth.mockRestore();
+        clientWidth.mockRestore();
+      }
+    });
+
+    it("omits the working-directory line when the workspace is unknown", async () => {
+      const tooltip = await hoverTooltip(conv("conv_no_cwd", "aria", { workspace: null }));
+      expect(within(tooltip).getByTestId("session-tooltip-agent")).toBeInTheDocument();
+      expect(within(tooltip).queryByTestId("session-tooltip-cwd")).toBeNull();
+    });
+
+    it.each([
+      {
+        name: "Working",
+        partial: { status: "running" as const },
+        state: "running",
+        key: "working",
+      },
+      { name: "Idle", partial: { status: "idle" as const }, state: "idle", key: "idle" },
+      { name: "Error", partial: { status: "failed" as const }, state: "error", key: "error" },
+      {
+        name: "Needs response",
+        partial: { status: "idle" as const, pending_elicitations_count: 1 },
+        state: "awaiting",
+        key: "needs-response",
+      },
+    ])("shows the $name status as the last line", async ({ name, partial, state, key }) => {
+      const tooltip = await hoverTooltip(conv(`conv_status_${state}`, "aria", partial));
+      const status = within(tooltip).getAllByTestId("session-tooltip-status")[0];
+      expect(status).toHaveTextContent(new RegExp(`^${name}$`));
+      expect(status).toHaveAttribute("data-state", key);
+      if (state === "error") {
+        expect(status).toHaveClass("text-destructive");
+        expect(status.nextElementSibling).toBe(
+          within(tooltip).getAllByTestId("session-tooltip-error")[0],
+        );
+      } else {
+        expect(status.nextElementSibling?.getAttribute("data-testid")).not.toBe(
+          "session-tooltip-error",
+        );
+      }
+    });
+
+    it("labels an unread session New messages, matching the row's unread dot", async () => {
+      const session = conv("conv_status_unseen", "aria", { status: "idle", updated_at: 200 });
+      seedReadState([{ id: session.id, viewer_last_seen: 199 }]);
+      const tooltip = await hoverTooltip(session);
+      const row = screen.getByRole("link", { name: /conv_status_unseen/ }).closest("li")!;
+      expect(within(row).getByTestId("session-state-badge")).toHaveAttribute(
+        "data-state",
+        "unseen",
+      );
+      const status = within(tooltip).getAllByTestId("session-tooltip-status")[0];
+      expect(status).toHaveTextContent(/^New messages$/);
+      expect(status).toHaveAttribute("data-state", "new-messages");
+    });
+
+    it("shows Host disconnected when the latest item is a runner disconnect", async () => {
+      const fetchPage = vi.spyOn(sessionsApi, "fetchSessionItemsPage").mockResolvedValue({
+        items: [
+          {
+            id: "disconnect1",
+            response_id: "response1",
+            type: "error",
+            status: "completed",
+            source: "execution",
+            code: "runner_disconnected",
+            message: "Runner disconnected unexpectedly.",
+          },
+        ],
+        hasMore: false,
+      });
+      try {
+        const tooltip = await hoverTooltip(
+          conv("conv_status_disconnected", "aria", { status: "idle" }),
+        );
+        await waitFor(() => {
+          const status = within(tooltip).getAllByTestId("session-tooltip-status")[0];
+          expect(status).toHaveTextContent(/^Host disconnected$/);
+          expect(status).toHaveAttribute("data-state", "disconnected");
+          expectStatusDot(status, "bg-muted-foreground");
+        });
+        expect(within(tooltip).queryByTestId("session-tooltip-error")).toBeNull();
+      } finally {
+        fetchPage.mockRestore();
+      }
+    });
+
+    it("shows Starting up while the bound session is waking", async () => {
+      useChatStore.setState({ conversationId: "conv_status_starting", status: "streaming" });
+      const tooltip = await hoverTooltip(
+        conv("conv_status_starting", "aria", { status: "failed" }),
+      );
+      const status = within(tooltip).getAllByTestId("session-tooltip-status")[0];
+      expect(status).toHaveTextContent(/^Starting up$/);
+      expect(within(tooltip).queryByTestId("session-tooltip-error")).toBeNull();
+    });
+
+    it("renders the persisted error message on its own line below Error", async () => {
+      const message = "Codex exited — 403 budget limit reached for this workspace";
+      const tooltip = await hoverTooltip(
+        conv("conv_error_message", "aria", {
+          status: "failed",
+          labels: { "omnigent.last_task_error_message": message },
+        }),
+      );
+      const status = within(tooltip).getAllByTestId("session-tooltip-status")[0];
+      const error = within(tooltip).getAllByTestId("session-tooltip-error")[0];
+      expect(status).toHaveTextContent(/^Error$/);
+      expect(status.nextElementSibling).toBe(error);
+      expect(error).toHaveTextContent(message);
+      expect(error).toHaveClass("text-destructive", "line-clamp-3");
+    });
+
+    it("falls back to the generic error text without a persisted message", async () => {
+      const tooltip = await hoverTooltip(conv("conv_error_fallback", "aria", { status: "failed" }));
+      expect(within(tooltip).getAllByTestId("session-tooltip-error")[0]).toHaveTextContent(
+        /^Latest message is an error$/,
+      );
+    });
+
+    it.each([
+      { state: "idle", partial: {}, token: "bg-popover-foreground/70" },
+      {
+        state: "needs-response",
+        partial: { pending_elicitations_count: 1 },
+        token: "bg-brand-accent",
+      },
+      { state: "error", partial: { status: "failed" as const }, token: "bg-destructive" },
+    ])("draws $state as a theme-token dot", async ({ state, partial, token }) => {
+      const tooltip = await hoverTooltip(conv(`conv_dot_${state}`, "aria", partial));
+      const status = within(tooltip).getByTestId("session-tooltip-status");
+      expect(status).toHaveAttribute("data-state", state);
+      expectStatusDot(status, token);
+    });
+
+    it("draws New messages as a brand-accent dot like the row's unread dot", async () => {
+      const session = conv("conv_dot_unseen", "aria", { status: "idle", updated_at: 200 });
+      seedReadState([{ id: session.id, viewer_last_seen: 199 }]);
+      const tooltip = await hoverTooltip(session);
+      expectStatusDot(within(tooltip).getByTestId("session-tooltip-status"), "bg-brand-accent");
+    });
+
+    it("keeps the spinner for Working", async () => {
+      const tooltip = await hoverTooltip(conv("conv_dot_working", "aria", { status: "running" }));
+      const status = within(tooltip).getByTestId("session-tooltip-status");
+      expect(within(status).getByTestId("running-dot")).toHaveClass("animate-spin");
+    });
+
+    it("shows the same details on a pinned, project-owned session", async () => {
+      projectsMock.push("Customer X");
+      seedPins(["conv_pinned_details"]);
+      mockConversations([
+        conv("conv_pinned_details", "aria", {
+          status: "running",
+          workspace: "/srv/repo",
+          labels: { omni_project: "Customer X" },
+        }),
+      ]);
+      renderSidebar();
+      fireEvent.focus(screen.getByRole("link", { name: /conv_pinned_details/ }));
+      const flyout = await screen.findByTestId("pinned-project-flyout");
+      expect(flyout).toHaveClass("w-72", "max-w-[calc(100vw-2rem)]");
+      expect(within(flyout).getByText("Customer X")).toBeInTheDocument();
+      expect(within(flyout).getByTestId("session-tooltip-agent")).toHaveTextContent(/^aria$/);
+      expect(within(flyout).getByTestId("session-tooltip-cwd")).toHaveTextContent("/srv/repo");
+      expect(within(flyout).getByTestId("session-tooltip-status")).toHaveTextContent(/^Working$/);
+    });
+
+    it("hides unknown lines on a pinned session instead of filling them in", async () => {
+      projectsMock.push("Customer X");
+      seedPins(["conv_pinned_sparse"]);
+      mockConversations([
+        conv("conv_pinned_sparse", "", {
+          agent_name: null,
+          workspace: null,
+          labels: { omni_project: "Customer X" },
+        }),
+      ]);
+      renderSidebar();
+      fireEvent.focus(screen.getByRole("link", { name: /conv_pinned_sparse/ }));
+      const flyout = await screen.findByTestId("pinned-project-flyout");
+      expect(within(flyout).queryByTestId("session-tooltip-agent")).toBeNull();
+      expect(within(flyout).queryByTestId("session-tooltip-cwd")).toBeNull();
+      expect(within(flyout).getByTestId("session-tooltip-status")).toHaveTextContent(/^Idle$/);
+    });
+  });
+
   it("shares one hosts observer across multiple ordinary session rows", () => {
     const observerMounted = vi.fn();
     useHostsMock.mockImplementation(() => {
@@ -1629,10 +1887,13 @@ describe("Sidebar failed session indicator", () => {
 
     it("explains the error through the row's existing hover surface", async () => {
       const content = await openExplanation("error");
-      expect(content).toHaveTextContent("Latest message is an error");
-      const hint = content.querySelector("p.text-destructive");
-      expect(hint).toHaveTextContent("Latest message is an error");
-      expect(hint?.querySelector("svg.lucide-circle-alert")).toHaveAttribute("aria-hidden", "true");
+      // Both surfaces label the state "Error" and explain it on the line below.
+      const status = within(content).getByTestId("session-tooltip-status");
+      expect(status).toHaveTextContent(/^Error$/);
+      expect(status).toHaveClass("text-destructive");
+      expect(status.querySelector("span.rounded-full")).toHaveClass("bg-destructive");
+      expect(status.nextElementSibling).toBe(within(content).getByTestId("session-tooltip-error"));
+      expect(status.nextElementSibling).toHaveTextContent("Latest message is an error");
     });
 
     it.each(["running", "awaiting", "starting"] as const)(
