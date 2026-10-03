@@ -18,7 +18,12 @@ import {
   prepareSlidesDoc,
   type KitFile,
 } from "./codeViewerHelpers";
-import { MAX_SLIDE_COUNT, SlidesViewer, isIgnoredNavKey } from "./SlidesViewer";
+import {
+  DESIGN_KIT_TIMEOUT_MS,
+  MAX_SLIDE_COUNT,
+  SlidesViewer,
+  isIgnoredNavKey,
+} from "./SlidesViewer";
 
 vi.mock("@/hooks/useFileContent", () => ({ fetchFileContent: vi.fn() }));
 
@@ -552,8 +557,9 @@ describe("SlidesViewer design kit", () => {
     content_type: null,
     ...f,
   });
-  const serve = (files: Record<string, KitFile>) =>
+  const serve = (files: Record<string, KitFile>, gate?: Promise<void>) =>
     vi.mocked(fetchFileContent).mockImplementation(async (_id, path) => {
+      await gate;
       const f = files[path.slice(DESIGN_KIT_DIR.length + 1)];
       if (!f) throw new Error("404 Not Found");
       return response(path, f);
@@ -587,5 +593,55 @@ describe("SlidesViewer design kit", () => {
     await vi.waitFor(() => expect(srcdoc()).toBe(prepareSlidesDoc(DECK)));
     expect(screen.queryByRole("status")).not.toBeInTheDocument();
     expect(screen.queryByTitle(/Design kit:/)).not.toBeInTheDocument();
+  });
+
+  it("renders the deck unbranded when the kit read hangs past the timeout", () => {
+    vi.useFakeTimers();
+    try {
+      vi.mocked(fetchFileContent).mockReturnValue(new Promise(() => {}));
+      render(<SlidesViewer content={DECK} conversationId="conv_1" />);
+      expect(srcdoc()).toBe("");
+      act(() => vi.advanceTimersByTime(DESIGN_KIT_TIMEOUT_MS + 1));
+      expect(srcdoc()).toBe(prepareSlidesDoc(DECK));
+      expect(screen.getByRole("status")).toHaveTextContent(
+        "Design kit not applied: design kit timed out",
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("drops the previous session's kit until the new one loads", async () => {
+    serve(KIT_FILES);
+    const { rerender } = render(<SlidesViewer content={DECK} conversationId="conv_1" />);
+    expect(await screen.findByTitle("Design kit: Acme")).toBeInTheDocument();
+
+    let release!: () => void;
+    serve(
+      { ...KIT_FILES, "kit.json": text(kitJson({ name: "Beta" })) },
+      new Promise((r) => {
+        release = r;
+      }),
+    );
+    rerender(<SlidesViewer content={DECK} conversationId="conv_2" />);
+    expect(screen.queryByTitle("Design kit: Acme")).not.toBeInTheDocument();
+    expect(srcdoc()).toBe("");
+    release();
+    expect(await screen.findByTitle("Design kit: Beta")).toBeInTheDocument();
+
+    rerender(<SlidesViewer content={DECK} />);
+    expect(screen.queryByTitle(/Design kit:/)).not.toBeInTheDocument();
+    expect(srcdoc()).toBe(prepareSlidesDoc(DECK));
+  });
+
+  it("keeps the kit on a content refresh of the same session", async () => {
+    serve(KIT_FILES);
+    const { rerender } = render(<SlidesViewer content={DECK} conversationId="conv_1" />);
+    expect(await screen.findByTitle("Design kit: Acme")).toBeInTheDocument();
+    const updated = DECK.replace("Three", "Four");
+    rerender(<SlidesViewer content={updated} conversationId="conv_1" />);
+    expect(screen.getByTitle("Design kit: Acme")).toBeInTheDocument();
+    expect(srcdoc()).toContain("--kit-primary:#ff0066");
+    expect(srcdoc()).toContain("<h1>Four</h1>");
   });
 });

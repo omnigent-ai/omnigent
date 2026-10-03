@@ -48,6 +48,11 @@ export function isIgnoredNavKey(e: {
   return e.target instanceof Element && !!e.target.closest(SLIDES_EDITABLE_SELECTOR);
 }
 
+// A stalled kit read must not leave the deck blank.
+export const DESIGN_KIT_TIMEOUT_MS = 2000;
+const NO_KIT: DesignKitState = { status: "none" };
+const KIT_TIMED_OUT: DesignKitState = { status: "error", reason: "design kit timed out" };
+
 /** Workspace file read for the kit loader; a 404 means "no such file". */
 async function readKitFile(conversationId: string, path: string) {
   try {
@@ -77,16 +82,23 @@ export function SlidesViewer({
   const stageRef = useRef<HTMLDivElement>(null);
   const iframeRef = useRef<HTMLIFrameElement>(null);
   const sourceTotal = useMemo(() => countSlideSections(content), [content]);
-  // Hold the deck blank until the kit resolves so it never flashes unbranded.
-  const [kit, setKit] = useState<DesignKitState | null>(conversationId ? null : { status: "none" });
+  // Hold the deck blank until this session's kit resolves so it never flashes
+  // unbranded; a kit loaded for another session counts as not loaded.
+  const [loaded, setLoaded] = useState<{ id: string; kit: DesignKitState } | null>(null);
+  const kit = !conversationId ? NO_KIT : loaded?.id === conversationId ? loaded.kit : null;
   useEffect(() => {
     if (!conversationId) return;
     let cancelled = false;
-    void loadDesignKit((p) => readKitFile(conversationId, p)).then((k) => {
-      if (!cancelled) setKit(k);
-    });
+    const finish = (k: DesignKitState) => {
+      if (cancelled) return;
+      cancelled = true;
+      setLoaded({ id: conversationId, kit: k });
+    };
+    const timer = setTimeout(() => finish(KIT_TIMED_OUT), DESIGN_KIT_TIMEOUT_MS);
+    void loadDesignKit((p) => readKitFile(conversationId, p)).then(finish);
     return () => {
       cancelled = true;
+      clearTimeout(timer);
     };
   }, [conversationId, content]);
   const kitReady = kit !== null;
