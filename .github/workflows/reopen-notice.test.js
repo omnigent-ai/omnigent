@@ -164,3 +164,16 @@ test("failed reads reject before any write", async () => {
     await assert.rejects(run({ author: otto, failRead }), /API unavailable/);
   }
 });
+
+test("hidden spans cannot manufacture an automated closure explanation", async () => {
+  for (const body of [
+    "not nee<!-- machine metadata -->ded",
+    "repla```machine output```cement #42",
+    "repla~~~machine output~~~cement #42",
+  ]) {
+    requested(await run({
+      author: otto,
+      existing: [{ body, user: { login: otto, type: "Bot" } }],
+    }));
+  }
+});

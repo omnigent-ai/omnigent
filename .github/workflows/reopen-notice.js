@@ -26,7 +26,8 @@ const feedbackRequest = (closer) =>
 
 function visibleText(body) {
   return String(body ?? "")
-    .replace(/<!--[\s\S]*?-->|```[\s\S]*?```|~~~[\s\S]*?~~~/g, "")
+    // Separate surrounding text so removing a hidden span cannot join tokens.
+    .replace(/<!--[\s\S]*?-->|```[\s\S]*?```|~~~[\s\S]*?~~~/g, " ")
     .split("\n")
     .filter((line) => !/^\s*(>|\/)/.test(line))
     .join(" ")
