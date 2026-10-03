@@ -7,6 +7,7 @@ import logging
 from collections.abc import Callable
 
 from omnigent._wrapper_labels import (
+    ACP_SUBAGENT_ID_LABEL_KEY,
     ANTIGRAVITY_NATIVE_SUBAGENT_WRAPPER_VALUE,
     WRAPPER_LABEL_KEY,
 )
@@ -58,11 +59,15 @@ def log_session_metadata(
         return
     harness = None
     source = "agent_spec"
+    lookup_error_type = None
     wrapper = conv.labels.get(WRAPPER_LABEL_KEY)
     native_agent = native_coding_agent_for_wrapper_label(wrapper)
     if conv.kind == "sub_agent" and wrapper is not None and wrapper in _NATIVE_SUBAGENT_HARNESSES:
         harness = _NATIVE_SUBAGENT_HARNESSES[wrapper]
         source = "native_subagent"
+    elif conv.kind == "sub_agent" and conv.labels.get(ACP_SUBAGENT_ID_LABEL_KEY):
+        # ACP mirrors share a parent agent ID without proving a concrete harness.
+        source = "acp_subagent"
     elif conv.harness_override:
         harness = conv.harness_override
         source = "session_override"
@@ -74,8 +79,9 @@ def log_session_metadata(
     else:
         try:
             harness = resolve_harness()
-        except Exception:  # noqa: BLE001 — optional lookups must not break session execution
+        except Exception as exc:  # noqa: BLE001 — optional lookups must not break execution
             source = "lookup_failed"
+            lookup_error_type = type(exc).__name__
     with contextlib.suppress(Exception):
         _logger.info(
             "Session metadata observed",
@@ -88,6 +94,7 @@ def log_session_metadata(
                 parent_session_id=conv.parent_conversation_id,
                 root_session_id=conv.root_conversation_id,
                 observation=observation,
+                harness_lookup_error_type=lookup_error_type,
                 **harness_attributes(harness, source=source),
             ),
         )

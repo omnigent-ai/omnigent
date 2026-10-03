@@ -308,6 +308,16 @@ _TRANSIENT_AUDIT_EVENT_TYPES = frozenset(
     }
 )
 
+_METADATA_OBSERVATION_EVENT_TYPES = frozenset(
+    {
+        "message",
+        _SLASH_COMMAND_TYPE,
+        _RETRY_SESSION_TYPE,
+        _EXTERNAL_SESSION_STATUS_TYPE,
+        _SUBAGENT_STATUS_TYPE,
+    }
+)
+
 
 def _is_batchable_external_item(event: SessionEventInput) -> bool:
     """
@@ -911,13 +921,7 @@ def register_events_routes(
         if body.type in _TRANSIENT_AUDIT_EVENT_TYPES:
             mark_request_audit_suppressed()
         # Refresh identity within the reporting window, including resumed sessions.
-        if debug_sink_enabled() and body.type in {
-            "message",
-            _SLASH_COMMAND_TYPE,
-            _RETRY_SESSION_TYPE,
-            _EXTERNAL_SESSION_STATUS_TYPE,
-            _SUBAGENT_STATUS_TYPE,
-        }:
+        if debug_sink_enabled() and body.type in _METADATA_OBSERVATION_EVENT_TYPES:
             await asyncio.to_thread(
                 log_session_metadata,
                 conv,

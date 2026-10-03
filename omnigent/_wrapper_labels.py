@@ -27,6 +27,9 @@ from __future__ import annotations
 # policy labels.
 WRAPPER_LABEL_KEY = "omnigent.wrapper"
 
+# Identifies parent-owned children reported over ACP.
+ACP_SUBAGENT_ID_LABEL_KEY = "omnigent.acp.subagent_id"
+
 # Label key + value that put the Web UI in terminal-first mode (the inline
 # native-CLI terminal renders as the main view; the Web UI gates on
 # ``labels["omnigent.ui"] == "terminal"``). Stamped at creation for the

@@ -96,6 +96,24 @@ def test_metadata_resolves_the_child_agent_and_canonicalizes_aliases() -> None:
     assert attrs["harness_source"] == "agent_spec"
 
 
+def test_acp_mirror_does_not_resolve_its_copied_parent_agent() -> None:
+    conv = _child(labels={"omnigent.acp.subagent_id": "worker"})
+    resolver = Mock(return_value="claude-native")
+
+    with capture_debug_rows("server") as rows:
+        metadata.log_session_metadata(
+            conv, observation="external_session_status", resolve_harness=resolver
+        )
+
+    resolver.assert_not_called()
+    assert rows[0]["session_id"] == "child"
+    attrs = rows[0]["attributes"]
+    assert "harness" not in attrs
+    assert attrs["harness_resolution"] == "unknown"
+    assert attrs["harness_source"] == "acp_subagent"
+    assert attrs["parent_session_id"] == "parent"
+
+
 @pytest.mark.parametrize("selection", ["auto", "any"])
 def test_deferred_selection_stays_unknown_until_runtime_observes_a_harness(selection: str) -> None:
     conv = _child(harness_override=selection)
@@ -122,6 +140,7 @@ def test_metadata_lookup_failure_is_explicit_and_does_not_fail_the_request() -> 
     assert "harness" not in attrs
     assert attrs["harness_resolution"] == "unknown"
     assert attrs["harness_source"] == "lookup_failed"
+    assert attrs["harness_lookup_error_type"] == "RuntimeError"
     assert "private backend details" not in repr(rows)
 
 

@@ -20,6 +20,7 @@ from pydantic import TypeAdapter
 
 from omnigent._platform import normalize_interactive_shells
 from omnigent._wrapper_labels import (
+    ACP_SUBAGENT_ID_LABEL_KEY,
     ANTIGRAVITY_NATIVE_SUBAGENT_WRAPPER_VALUE,
     WRAPPER_LABEL_KEY,
 )
@@ -172,7 +173,7 @@ _EXTERNAL_ACP_SUBAGENT_START_TYPE: str = "external_acp_subagent_start"
 # parent, so leaving the wrapper unset lets the child's harness resolve to the
 # parent's (e.g. ``devin``) and the UI label it accordingly, instead of
 # mislabeling it as another vendor.
-_ACP_SUBAGENT_ID_LABEL_KEY = "omnigent.acp.subagent_id"
+_ACP_SUBAGENT_ID_LABEL_KEY = ACP_SUBAGENT_ID_LABEL_KEY
 
 
 _ACP_SUBAGENT_DESCRIPTION_LABEL_KEY = "omnigent.acp.subagent_description"
