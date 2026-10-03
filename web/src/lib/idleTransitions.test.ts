@@ -173,6 +173,29 @@ describe("buildElicitationMap", () => {
     const map = buildElicitationMap([convE("a")]);
     expect(map.get("a")).toBe(0);
   });
+
+  it("keeps the last live count for a session whose runner is offline", () => {
+    // The server zeroes an offline runner's count; the prompt is still
+    // unanswered, so the baseline must not drop to 0 and re-fire on restore.
+    const previous = new Map([["a", 1]]);
+    const map = buildElicitationMap([{ ...convE("a", 0), runner_online: false }], previous);
+    expect(map.get("a")).toBe(1);
+  });
+
+  it("leaves a session never seen online unseeded while its runner is offline", () => {
+    // Only the zeroed count has been observed; seeding 0 would make the
+    // reconnect restore look like a new prompt.
+    const map = buildElicitationMap([{ ...convE("a", 0), runner_online: false }], new Map());
+    expect(map.has("a")).toBe(false);
+  });
+
+  it("reads the live count once the runner is back online", () => {
+    // A reconnect that comes back without the earlier prompt (the runner
+    // restarted) resets the baseline so the next ask can fire.
+    const previous = new Map([["a", 1]]);
+    const map = buildElicitationMap([{ ...convE("a", 0), runner_online: true }], previous);
+    expect(map.get("a")).toBe(0);
+  });
 });
 
 describe("computeUnreadBadgeIds", () => {
