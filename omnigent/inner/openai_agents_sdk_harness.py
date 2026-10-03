@@ -145,8 +145,8 @@ def _is_databricks_non_gpt_model(model: str | None) -> bool:
         ``"databricks-claude-sonnet-4-6"`` or
         ``"databricks/databricks-kimi-k2-6"``. ``None`` means no
         model was configured at harness construction.
-    :returns: ``True`` when *model* is a ``databricks-`` prefixed id
-        (case-insensitive, after stripping an optional leading
+    :returns: ``True`` when *model* is a ``databricks-`` or ``system.ai.``
+        prefixed id (case-insensitive, after stripping an optional leading
         ``"databricks/"`` provider prefix) that does NOT contain the
         ``"gpt"`` vendor token; ``False`` otherwise (including for
         non-Databricks models, whose endpoint default is unchanged).
@@ -156,7 +156,9 @@ def _is_databricks_non_gpt_model(model: str | None) -> bool:
     normalized = model.lower()
     if normalized.startswith("databricks/"):
         normalized = normalized.removeprefix("databricks/")
-    if not normalized.startswith("databricks-"):
+    # Unity Catalog model-service ids (``system.ai.gemini-3-8-flash``) are
+    # gateway-hosted the same way as ``databricks-`` endpoint names.
+    if not normalized.startswith(("databricks-", "system.ai.")):
         return False
     return "gpt" not in normalized
 

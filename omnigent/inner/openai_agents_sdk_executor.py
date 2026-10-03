@@ -19,6 +19,7 @@ import logging
 import os
 import subprocess
 import time
+import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Generator, Sequence
 from dataclasses import dataclass
 from types import ModuleType
@@ -479,7 +480,7 @@ def _get_openai_async_client(
             )
         host = host_override.rstrip("/")
         return AsyncOpenAI(
-            base_url=base_url_override,
+            base_url=_gateway_base_url_for_model(base_url_override, model),
             api_key=_OPENAI_KEY_PLACEHOLDER,
             http_client=httpx.AsyncClient(auth=_ShellCommandBearerAuth(databricks_auth_command)),
             **retry_kwargs,
@@ -523,7 +524,9 @@ def _get_openai_async_client(
         try:
             auth, host = _resolve_databricks_auth(profile)
             return AsyncOpenAI(
-                base_url=base_url_override or _databricks_openai_base_url(host),
+                base_url=_gateway_base_url_for_model(
+                    base_url_override or _databricks_openai_base_url(host), model
+                ),
                 api_key=_OPENAI_KEY_PLACEHOLDER,
                 http_client=httpx.AsyncClient(auth=auth),
                 **retry_kwargs,
@@ -587,11 +590,102 @@ def _get_openai_async_client(
             "OPENAI_API_KEY/OPENAI_BASE_URL for non-Databricks OpenAI access."
         ) from exc
     return AsyncOpenAI(
-        base_url=base_url_override or _databricks_openai_base_url(host),
+        base_url=_gateway_base_url_for_model(
+            base_url_override or _databricks_openai_base_url(host), model
+        ),
         api_key=_OPENAI_KEY_PLACEHOLDER,
         http_client=httpx.AsyncClient(auth=auth),
         **retry_kwargs,
     )
+
+
+# The gateway's codex/openai surfaces only proxy GPT's Responses API; Gemini is
+# served over chat completions on the MLflow surface of the same gateway.
+_GPT_GATEWAY_SUFFIXES = ("/ai-gateway/codex/v1", "/ai-gateway/openai/v1")
+_MLFLOW_GATEWAY_SUFFIX = "/ai-gateway/mlflow/v1"
+
+
+def _is_gemini_model(model: str | None) -> bool:
+    """Return whether *model* names a Gemini model, e.g. ``"system.ai.gemini-3-8-flash"``.
+
+    :param model: Model id, or ``None`` when unpinned.
+    :returns: ``True`` for Gemini ids.
+    """
+    return model is not None and "gemini" in model.lower()
+
+
+def _gateway_base_url_for_model(base_url: str, model: str | None) -> str:
+    """Point a Gemini model at the gateway's MLflow surface.
+
+    :param base_url: Resolved gateway base URL, e.g.
+        ``"https://example.databricks.com/ai-gateway/codex/v1"``.
+    :param model: Model id the client will call.
+    :returns: The MLflow-surface URL for Gemini on a GPT surface, else *base_url*.
+    """
+    if not _is_gemini_model(model):
+        return base_url
+    trimmed = base_url.rstrip("/")
+    for suffix in _GPT_GATEWAY_SUFFIXES:
+        if trimmed.endswith(suffix):
+            return trimmed[: -len(suffix)] + _MLFLOW_GATEWAY_SUFFIX
+    return base_url
+
+
+def _gateway_thought_signature_messages(messages: object) -> object:
+    """Copy the SDK's Google signature field to the gateway's ``thoughtSignature``.
+
+    Gemini 3 rejects a follow-up tool turn unless each function call carries the
+    signature it was issued with. The Agents SDK round-trips it as
+    ``tool_calls[].extra_content.google.thought_signature``; the Databricks
+    gateway only reads ``tool_calls[].thoughtSignature``.
+
+    :param messages: The ``messages`` argument for ``chat.completions.create``.
+    :returns: *messages*, with signed tool calls copied and rewritten.
+    """
+    if not isinstance(messages, list):
+        return messages
+    rewritten: list[object] = []
+    for message in messages:
+        tool_calls = message.get("tool_calls") if isinstance(message, dict) else None
+        if not isinstance(message, dict) or not isinstance(tool_calls, list):
+            rewritten.append(message)
+            continue
+        new_calls: list[object] = []
+        for tool_call in tool_calls:
+            extra = tool_call.get("extra_content") if isinstance(tool_call, dict) else None
+            google = extra.get("google") if isinstance(extra, dict) else None
+            signature = google.get("thought_signature") if isinstance(google, dict) else None
+            if signature and isinstance(tool_call, dict):
+                tool_call = {k: v for k, v in tool_call.items() if k != "extra_content"}
+                tool_call["thoughtSignature"] = signature
+            new_calls.append(tool_call)
+        rewritten.append({**message, "tool_calls": new_calls})
+    return rewritten
+
+
+def _expose_google_thought_signatures(message: object) -> None:
+    """Adapt gateway Gemini tool calls for the Agents SDK, in place.
+
+    Mirrors the gateway's ``thoughtSignature`` into the SDK's Google field, and
+    replaces a tool-call id that merely repeats the function name: the gateway
+    returns Gemini calls with ``id == name``, and the SDK collapses calls that
+    share an id, so every repeat of a tool would overwrite the previous one.
+
+    :param message: A chunk ``delta`` or completion ``message`` whose
+        ``tool_calls`` may carry the gateway's signature as an extra field.
+    """
+    for tool_call in getattr(message, "tool_calls", None) or []:
+        function = getattr(tool_call, "function", None)
+        call_id = getattr(tool_call, "id", None)
+        if call_id and call_id == getattr(function, "name", None):
+            object.__setattr__(tool_call, "id", f"call_{uuid.uuid4().hex[:24]}")
+        extras = getattr(tool_call, "model_extra", None) or {}
+        signature = extras.get("thoughtSignature")
+        if signature and not getattr(tool_call, "extra_content", None):
+            # Pydantic's __setattr__ rejects undeclared fields on these models.
+            object.__setattr__(
+                tool_call, "extra_content", {"google": {"thought_signature": signature}}
+            )
 
 
 class _ShellCommandBearerAuth(httpx.Auth):
@@ -869,6 +963,7 @@ class _ReasoningBlockFilterStream:
         """
         chunk = await self._stream.__anext__()
         for choice in chunk.choices:
+            _expose_google_thought_signatures(choice.delta)
             if isinstance(getattr(choice.delta, "content", None), list):
                 # Bypass Pydantic's __setattr__ validation — the field type
                 # in ChoiceDelta is ``str | None`` and the list value from
@@ -911,9 +1006,13 @@ class _ReasoningBlockFilterCompletions:
         :returns: A :class:`_ReasoningBlockFilterStream` when ``stream=True``,
             otherwise the raw ``ChatCompletion`` response.
         """
+        if "messages" in kwargs:
+            kwargs["messages"] = _gateway_thought_signature_messages(kwargs["messages"])
         result = await self._completions.create(**kwargs)
         if kwargs.get("stream") and hasattr(result, "__anext__"):
             return _ReasoningBlockFilterStream(result)
+        for choice in getattr(result, "choices", None) or []:
+            _expose_google_thought_signatures(getattr(choice, "message", None))
         return result
 
     def __getattr__(self, name: str) -> Any:  # type: ignore[explicit-any]
