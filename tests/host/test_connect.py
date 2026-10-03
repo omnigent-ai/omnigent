@@ -1631,6 +1631,212 @@ async def test_watch_runner_reports_unexpected_exit(
     assert maintenance_reasons == ["runner_exited"]
 
 
+async def test_watch_runner_died_structured_fields_positive_exit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """runner_died carries exit_code, signal_name, ever_connected, log_tail_present.
+
+    Positive exit code: signal_name is None; ever_connected is False
+    because the connect marker is never touched; log_tail_present is
+    True because the fake runner writes to stderr.
+    """
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: tmp_path))
+    monkeypatch.setattr("omnigent.host.connect._RUNNER_WATCH_INTERVAL_S", 0.01)
+    host = _make_host_process()
+    host._maintenance_janitor = SimpleNamespace(trigger=lambda _: None)  # type: ignore[assignment]
+    tunnel = _FakeTunnel()
+    host._ws = tunnel  # type: ignore[assignment]
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+
+    original_popen = subprocess.Popen
+
+    def _fake_popen(args: list[str], **kwargs: object) -> subprocess.Popen[bytes]:
+        """Exit with a positive code, writing a log line first."""
+        return original_popen(
+            ["sh", "-c", "echo 'boot failed: config missing' >&2; sleep 0.2; exit 5"],
+            stdin=subprocess.DEVNULL,
+            stdout=kwargs["stdout"],
+            stderr=kwargs["stderr"],
+        )
+
+    frame = HostLaunchRunnerFrame(
+        request_id="req_struct_pos",
+        binding_token="tok_struct_pos",
+        workspace=str(workspace),
+        session_id="conv_struct_pos",
+    )
+    with caplog.at_level(logging.WARNING, logger="omnigent.host.connect"):
+        with patch("omnigent.host.connect.subprocess.Popen", side_effect=_fake_popen):
+            result = await host._handle_launch(frame)
+        assert result.status == "launched", result.error
+        await asyncio.wait_for(asyncio.gather(*host._watcher_tasks), timeout=5.0)
+
+    died_records = [r for r in caplog.records if getattr(r, "event_name", None) == "runner_died"]
+    assert len(died_records) == 1, caplog.text
+    attrs = died_records[0].attributes
+    assert attrs["exit_code"] == 5
+    assert attrs["signal_name"] is None
+    assert attrs["ever_connected"] is False
+    assert attrs["log_tail_present"] is True
+
+
+async def test_watch_runner_died_structured_fields_signal_exit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """runner_died carries signal_name="SIGKILL" when the runner is killed -9."""
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: tmp_path))
+    monkeypatch.setattr("omnigent.host.connect._RUNNER_WATCH_INTERVAL_S", 0.01)
+    host = _make_host_process()
+    host._maintenance_janitor = SimpleNamespace(trigger=lambda _: None)  # type: ignore[assignment]
+    tunnel = _FakeTunnel()
+    host._ws = tunnel  # type: ignore[assignment]
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+
+    original_popen = subprocess.Popen
+
+    def _fake_popen(args: list[str], **kwargs: object) -> subprocess.Popen[bytes]:
+        """Sleep briefly then kill the shell itself via SIGKILL."""
+        return original_popen(
+            ["sh", "-c", "sleep 0.2; kill -9 $$"],
+            stdin=subprocess.DEVNULL,
+            stdout=kwargs["stdout"],
+            stderr=kwargs["stderr"],
+        )
+
+    frame = HostLaunchRunnerFrame(
+        request_id="req_struct_sig",
+        binding_token="tok_struct_sig",
+        workspace=str(workspace),
+        session_id="conv_struct_sig",
+    )
+    with caplog.at_level(logging.WARNING, logger="omnigent.host.connect"):
+        with patch("omnigent.host.connect.subprocess.Popen", side_effect=_fake_popen):
+            result = await host._handle_launch(frame)
+        assert result.status == "launched", result.error
+        await asyncio.wait_for(asyncio.gather(*host._watcher_tasks), timeout=5.0)
+
+    died_records = [r for r in caplog.records if getattr(r, "event_name", None) == "runner_died"]
+    assert len(died_records) == 1, caplog.text
+    attrs = died_records[0].attributes
+    assert attrs["exit_code"] == -9
+    assert attrs["signal_name"] == "SIGKILL"
+    assert attrs["ever_connected"] is False
+
+
+async def test_watch_runner_died_ever_connected_true(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """runner_died carries ever_connected=True when the marker exists at death."""
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: tmp_path))
+    monkeypatch.setattr("omnigent.host.connect._RUNNER_WATCH_INTERVAL_S", 0.01)
+    host = _make_host_process()
+    host._maintenance_janitor = SimpleNamespace(trigger=lambda _: None)  # type: ignore[assignment]
+    tunnel = _FakeTunnel()
+    host._ws = tunnel  # type: ignore[assignment]
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+
+    original_popen = subprocess.Popen
+
+    def _fake_popen(args: list[str], **kwargs: object) -> subprocess.Popen[bytes]:
+        """Exit with non-zero after a brief life."""
+        return original_popen(
+            ["sh", "-c", "sleep 0.2; exit 1"],
+            stdin=subprocess.DEVNULL,
+            stdout=kwargs["stdout"],
+            stderr=kwargs["stderr"],
+        )
+
+    frame = HostLaunchRunnerFrame(
+        request_id="req_struct_conn",
+        binding_token="tok_struct_conn",
+        workspace=str(workspace),
+        session_id="conv_struct_conn",
+    )
+    with caplog.at_level(logging.WARNING, logger="omnigent.host.connect"):
+        with patch("omnigent.host.connect.subprocess.Popen", side_effect=_fake_popen):
+            result = await host._handle_launch(frame)
+        assert result.status == "launched", result.error
+        # Touch the marker to simulate a runner that connected, then crashed.
+        runner_id = token_bound_runner_id("tok_struct_conn")
+        handle = host._runners[runner_id]
+        assert handle.connect_marker is not None
+        handle.connect_marker.touch()
+        await asyncio.wait_for(asyncio.gather(*host._watcher_tasks), timeout=5.0)
+
+    died_records = [r for r in caplog.records if getattr(r, "event_name", None) == "runner_died"]
+    assert len(died_records) == 1, caplog.text
+    assert died_records[0].attributes["ever_connected"] is True
+
+
+async def test_runner_never_connected_structured_fields(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """runner_never_connected carries ever_connected=False and exit_code."""
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: tmp_path))
+    monkeypatch.setattr("omnigent.host.connect._RUNNER_CONNECT_DEADLINE_S", 0.05)
+    host = _make_host_process()
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+
+    original_popen = subprocess.Popen
+
+    def _fake_popen(args: list[str], **kwargs: object) -> subprocess.Popen[bytes]:
+        """Stay alive past the connect deadline without creating the marker."""
+        return original_popen(
+            ["sleep", "60"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+    frame = HostLaunchRunnerFrame(
+        request_id="req_nc_struct",
+        binding_token="tok_nc_struct",
+        workspace=str(workspace),
+        session_id="conv_nc_struct",
+    )
+    with caplog.at_level(logging.ERROR, logger="omnigent.host.connect"):
+        with patch("omnigent.host.connect.subprocess.Popen", side_effect=_fake_popen):
+            result = await host._handle_launch(frame)
+        assert result.status == "launched", result.error
+        error_records = await _wait_for_error_record(caplog, timeout_s=5.0)
+
+    nc_records = [
+        r for r in error_records if getattr(r, "event_name", None) == "runner_never_connected"
+    ]
+    assert len(nc_records) == 1, caplog.text
+    attrs = nc_records[0].attributes
+    # Still alive past the deadline — no exit code yet.
+    assert attrs["exit_code"] is None
+    assert attrs["signal_name"] is None
+    assert attrs["ever_connected"] is False
+    _cleanup_host(host)
+
+
+def test_exit_signal_name_returns_signal_name_for_negative_code() -> None:
+    """_exit_signal_name maps a negative returncode to the signal name."""
+    from omnigent.host.connect import _exit_signal_name
+
+    assert _exit_signal_name(-9) == "SIGKILL"
+    assert _exit_signal_name(-2) == "SIGINT"
+    assert _exit_signal_name(0) is None
+    assert _exit_signal_name(1) is None
+    assert _exit_signal_name(None) is None
+    # Unrecognised signal number — guard against ValueError.
+    assert _exit_signal_name(-255) is None
+
+
 def test_runner_exit_error_redacts_credential_values(tmp_path: Path) -> None:
     """Redact credentials before exit reports reach the server or SPA."""
     log = tmp_path / "runner-x.log"
