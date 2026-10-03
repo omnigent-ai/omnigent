@@ -63,7 +63,7 @@ runs:
       run: uv sync --extra all
 
     - name: Install Claude Code CLI
-      uses: omnigent-ai/omnigent/.github/actions/setup-harness-cli@aa5736c38f5c1258ee29452c6825d75033b952d7
+      uses: omnigent-ai/omnigent/.github/actions/setup-harness-cli@5a890fcaa9632af5fefaa74a0177cfd1901785c0
       with:
         harness: claude
         version: ${{ inputs.claude-code-version }}

@@ -787,6 +787,34 @@ def test_configured_harness_map_reports_version_too_low_for_outdated_clis(
         )
 
 
+@pytest.mark.parametrize(
+    "claude_version,expected",
+    [
+        ("2.1.274 (Claude Code)", HARNESS_VERSION_TOO_LOW),
+        ("2.1.280 (Claude Code)", True),
+    ],
+)
+def test_claude_native_readiness_flags_a_cli_the_default_model_refuses(
+    monkeypatch: pytest.MonkeyPatch, claude_version: str, expected: object
+) -> None:
+    """Claude Code below 2.1.280 is ``version-too-low`` and not launchable because
+    Anthropic refuses its default-model turns; the first accepted release is
+    ready. Drives the real ``--version`` probe so the declared floor is tested."""
+    _all_clis_installed(monkeypatch)
+    other_clis = hi.subprocess.run
+
+    def _run(argv: list[str], **k: object) -> subprocess.CompletedProcess[str]:
+        if argv[0].endswith("claude") and argv[1:] == ["--version"]:
+            return subprocess.CompletedProcess(
+                args=argv, returncode=0, stdout=f"{claude_version}\n", stderr=""
+            )
+        return other_clis(argv, **k)
+
+    monkeypatch.setattr(hi.subprocess, "run", _run)
+    assert configured_harness_map()["claude-native"] == expected
+    assert harness_is_configured("claude-native") is (expected is True)
+
+
 def test_antigravity_native_requires_credential(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

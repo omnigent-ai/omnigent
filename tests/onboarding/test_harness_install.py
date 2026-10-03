@@ -1299,7 +1299,7 @@ def test_ui_setup_steps_generic_for_non_installable() -> None:
         (hi.OPENCODE_KEY, "1.17.7", "1.19.0"),
         (hi.CURSOR_KEY, "2026.06.02", None),
         (hi.KIMI_KEY, "0.7.0", None),
-        (ANTHROPIC_FAMILY, "2.1.161", None),
+        (ANTHROPIC_FAMILY, "2.1.280", None),
         (OPENAI_FAMILY, "0.137.0", None),
         (hi.PI_KEY, "0.84.2", None),
         (hi.QWEN_KEY, "0.18.1", None),
@@ -1401,6 +1401,34 @@ def test_the_codex_launch_floor_accepts_the_ci_pinned_cli(
 
     monkeypatch.setattr(hi.subprocess, "run", _run)
     assert hi.harness_cli_installed(OPENAI_FAMILY) is True
+
+
+@pytest.mark.parametrize(
+    "version,expected",
+    [
+        ("2.1.274 (Claude Code)", False),  # the stable channel the reporter ran
+        ("2.1.279 (Claude Code)", False),
+        ("2.1.280 (Claude Code)", True),  # the CI-pinned CLI
+        ("2.1.283 (Claude Code)", True),
+    ],
+)
+def test_the_claude_floor_tracks_the_default_models_cli_requirement(
+    monkeypatch: pytest.MonkeyPatch, version: str, expected: bool
+) -> None:
+    """Claude Code below 2.1.280 reads too low: Anthropic refuses its default-model
+    turns (``400 ... version 2.1.280 or newer is required``), so setup and the
+    picker must say "Needs upgrade" instead of launching into that error."""
+    monkeypatch.setattr(hi.shutil, "which", lambda name: f"/usr/bin/{name}")
+
+    def _run(argv: list[str], **k: object) -> subprocess.CompletedProcess[str]:
+        if len(argv) >= 2 and argv[1] == "--version":
+            return subprocess.CompletedProcess(
+                args=argv, returncode=0, stdout=f"{version}\n", stderr=""
+            )
+        raise AssertionError(f"unexpected subprocess: {argv!r}")
+
+    monkeypatch.setattr(hi.subprocess, "run", _run)
+    assert hi.harness_cli_installed(ANTHROPIC_FAMILY) is expected
 
 
 def test_the_kimi_floor_accepts_the_cli_this_spec_installs(

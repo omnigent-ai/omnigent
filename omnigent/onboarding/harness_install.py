@@ -100,9 +100,9 @@ KIRO_KEY = "kiro"
 #   (``omnigent/hermes_native_forwarder.py``).
 # - kiro: MCP config schema (``{"mcpServers": ...}``) verified on kiro-cli 2.10.0
 #   (``omnigent/kiro_native_bridge.py``).
-# - claude: `--mcp-config` (required by the native bridge) introduced long
-#   before 2026-06-01. The first Claude Code release after the cutoff is
-#   2.1.161, so use that as the supported floor.
+# - claude: Anthropic's API refuses default-model turns from Claude Code older
+#   than 2.1.280 (``400 ... version 2.1.280 or newer is required``); the
+#   ``--mcp-config`` flag the native bridge needs is far older than that.
 # - codex: native policy hook requires >= 0.129.0, but that shipped before
 #   2026-06-01. The first Codex release after the cutoff is 0.137.0. The
 #   subagent-router ``PreToolUse`` hook needs 0.145.0, but that is enforced
@@ -124,7 +124,7 @@ _QWEN_MIN_VERSION = "0.18.1"
 _GOOSE_MIN_VERSION = "1.38.0"
 _HERMES_MIN_VERSION = "0.17.0"
 _KIRO_MIN_VERSION = "2.10.0"
-_CLAUDE_MIN_VERSION = "2.1.161"
+_CLAUDE_MIN_VERSION = "2.1.280"
 _CURSOR_MIN_VERSION = "2026.06.02"
 _KIMI_MIN_VERSION = "0.7.0"
 _ANTIGRAVITY_MIN_VERSION = "1.1.13"

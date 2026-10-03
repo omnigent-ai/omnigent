@@ -124,7 +124,7 @@ def emit_current_model(alias):
 
 
 if "--version" in ARGS:
-    print("2.1.236 (Claude Code)")
+    print("2.1.280 (Claude Code)")
     raise SystemExit(0)
 
 if ARGS[:2] == ["auth", "status"]:
