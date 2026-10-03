@@ -576,6 +576,69 @@ def test_foreign_subprocess_calls_stay_out_of_the_login_recorder(
     assert b"git version" in probe.stdout
 
 
+# ── port-busy preflight ────────────────────────────────────────────
+
+
+def _patch_browser_login(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    conflict: str | None,
+    exit_code: int = 1,
+) -> list[list[str]]:
+    """Fake the ``databricks`` binary, the port preflight and ``subprocess.run``.
+
+    :returns: The argv list of each ``databricks`` invocation.
+    """
+    from omnigent.onboarding import databricks_config as db_cfg_mod
+
+    monkeypatch.setattr(cli_mod.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(db_cfg_mod, "databricks_login_port_conflict", lambda _bin: conflict)
+    calls: list[list[str]] = []
+
+    @dataclass
+    class _Done:
+        returncode: int = exit_code
+
+    real_run = cli_mod.subprocess.run
+
+    def _fake_run(argv: list[str], **kwargs: object) -> _Done:
+        if Path(argv[0]).name == "databricks":
+            calls.append(argv)
+            return _Done()
+        return real_run(argv, **kwargs)  # type: ignore[return-value]
+
+    monkeypatch.setattr(cli_mod.subprocess, "run", _fake_run)
+    return calls
+
+
+def test_run_databricks_browser_login_port_conflict_fails_before_login(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A reported port conflict raises its message and never launches the login."""
+    calls = _patch_browser_login(monkeypatch, conflict="Port 8020 is busy; upgrade.")
+
+    with pytest.raises(click.ClickException) as exc_info:
+        cli_mod._run_databricks_browser_login(_WORKSPACE)
+
+    assert exc_info.value.format_message() == "Port 8020 is busy; upgrade."
+    assert calls == []
+
+
+def test_run_databricks_browser_login_no_conflict_keeps_failure_message(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without a conflict the login runs and a failure keeps the VPN/IP-list message."""
+    calls = _patch_browser_login(monkeypatch, conflict=None, exit_code=1)
+
+    with pytest.raises(click.ClickException) as exc_info:
+        cli_mod._run_databricks_browser_login(_WORKSPACE)
+
+    assert len(calls) == 1
+    msg = exc_info.value.format_message()
+    assert "failed (exit 1)" in msg
+    assert "8020" not in msg
+
+
 # ── ?o= workspace selector ──────────────────────────────────────────
 
 _ORG_ID = "2850744067564480"
