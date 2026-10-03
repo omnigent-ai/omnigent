@@ -373,10 +373,13 @@ async def _observe_terminal_interactive(
     """Emit one semantic event when a native TUI can accept a message."""
     loop = asyncio.get_running_loop()
     deadline = loop.time() + timeout_s
+    last_screen = ""
     try:
         while True:
             result = await instance.read()
             screen = result.get("screen")
+            if isinstance(screen, str):
+                last_screen = screen
             if isinstance(screen, str) and is_interactive(screen):
                 _logger.info(
                     "Native terminal became interactive: session=%s harness=%s terminal_id=%s",
@@ -401,6 +404,9 @@ async def _observe_terminal_interactive(
     except asyncio.CancelledError:
         raise
     except Exception as exc:  # noqa: BLE001 — observer failure must not fail session creation
+        # A pane that never became interactive is otherwise only captured if it
+        # later exits; keep what the launcher was showing when the wait ended.
+        terminal_output = _startup_terminal_output(last_screen)
         _logger.warning(
             "Native terminal interactivity was not observed: session=%s harness=%s "
             "terminal_id=%s reason=%s",
@@ -416,6 +422,7 @@ async def _observe_terminal_interactive(
                 terminal_instance_id=instance.diagnostic_id,
                 readiness_signal=readiness_signal,
                 reason=type(exc).__name__,
+                **({"terminal_last_output": terminal_output} if terminal_output else {}),
             ),
         )
 
@@ -5519,15 +5526,20 @@ def _codex_terminal_exit_summary(instance: TerminalInstance, *, before_thread: b
     return f"Codex terminal exited{status_text} {stage}."
 
 
-def _codex_startup_terminal_output(instance: TerminalInstance) -> str | None:
-    """Apply the same capture gate and bounds to both startup-error paths."""
+def _startup_terminal_output(text: str) -> str | None:
+    """Apply the startup-diagnostic capture gate and bounds to pane text."""
     from omnigent.harnesses.diagnostics import sanitize_diagnostic_text
     from omnigent.process_logging import harness_stderr_capture_enabled
     from omnigent.runner.resource_registry import trim_terminal_output
 
     if not harness_stderr_capture_enabled():
         return None
-    return trim_terminal_output(sanitize_diagnostic_text(instance.last_exit_text() or ""))
+    return trim_terminal_output(sanitize_diagnostic_text(text))
+
+
+def _codex_startup_terminal_output(instance: TerminalInstance) -> str | None:
+    """Apply the same capture gate and bounds to both startup-error paths."""
+    return _startup_terminal_output(instance.last_exit_text() or "")
 
 
 class _CodexTerminalExited(RuntimeError):
