@@ -246,6 +246,39 @@ export const CMD_LEFT_LINE_START = "\x01"; // Ctrl-A: cursor to line start
 export const CMD_RIGHT_LINE_END = "\x05"; // Ctrl-E: cursor to line end
 
 /**
+ * True when an in-flight IME composition owns *event*'s printable key.
+ *
+ * Mid-composition, a printable key (a Shift-typed ASCII run, a kana, a
+ * candidate-cycling space) is preedit input: the IME integrates it into the
+ * conversion and fires no fresh ``compositionstart``. xterm's
+ * CompositionHelper instead finalizes the composition on any keydown that is
+ * not keyCode 229 or a modifier — its commit-before-Enter path — which sends
+ * the preedit to the PTY early and marks the composition over while the IME
+ * keeps composing. Every later keyCode-229 keydown then diffs a stale
+ * textarea and re-sends the committed prefix plus the growing preedit on
+ * each update. Claiming these keys away from xterm keeps the composition
+ * alive so it is committed exactly once, by ``compositionend``.
+ *
+ * Functional keys (Enter, Escape) and Ctrl/Meta/Alt chords stay on xterm's
+ * default path: finalizing before Enter acts is deliberate there, and
+ * keyCode 229 keeps xterm's own continue-composing handling.
+ *
+ * :param event: Browser keyboard event from xterm's custom key handler.
+ * :returns: ``true`` when the handler must claim the event for the IME
+ *     (return ``false`` to xterm without ``preventDefault``).
+ */
+export function compositionOwnsKeyEvent(event: KeyboardEvent): boolean {
+  return (
+    event.isComposing &&
+    event.keyCode !== 229 &&
+    event.key.length === 1 &&
+    !event.ctrlKey &&
+    !event.metaKey &&
+    !event.altKey
+  );
+}
+
+/**
  * Return the terminal bytes to send for a browser key event.
  *
  * Two key families need synthesized bytes because neither xterm.js nor the
@@ -842,6 +875,8 @@ export class TerminalSession {
     });
 
     this.term.attachCustomKeyEventHandler((e) => {
+      // No preventDefault: the IME must still receive the key it owns.
+      if (compositionOwnsKeyEvent(e)) return false;
       const payload = terminalKeyEventPayload(e);
       if (payload === null) return true;
       // xterm invokes this handler for keydown, keypress, and keyup.
