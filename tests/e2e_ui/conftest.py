@@ -595,7 +595,8 @@ def configure_mock_llm(
         ``error``, ``status_code``, ``delay``, ``truncate_after``
         (emit only N SSE events then end the stream, dropping the
         completion event — a mid-stream fault for exercising the SPA's
-        stream error/recovery UI).
+        stream error/recovery UI), ``response_headers`` (extra HTTP
+        response headers, e.g. a gateway's ``x-litellm-response-cost``).
     :param key: Queue key — typically the model name baked into the
         agent spec. Omitting it allocates an independent content queue when
         ``match`` is supplied, otherwise uses ``"default"``. Explicit keys replace

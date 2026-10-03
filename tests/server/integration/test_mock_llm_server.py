@@ -405,3 +405,35 @@ def test_reset_and_reconfigure_restore_inference(monkeypatch):
         response = client.post("/v1/responses", json={"input": "title"})
         assert "skill-call" not in response.text
         assert mock_llm_server._state.queues["default"].index == 0
+
+
+@pytest.mark.parametrize("stream", [True, False], ids=["stream", "json"])
+@pytest.mark.parametrize("endpoint", ["/v1/responses", "/v1/chat/completions"])
+def test_scripted_response_headers_ride_on_openai_endpoints(
+    monkeypatch: pytest.MonkeyPatch, endpoint: str, stream: bool
+) -> None:
+    """A scripted reply's extra headers reach the client; unscripted ones carry none."""
+    monkeypatch.setattr(mock_llm_server, "_state", MockState())
+    with TestClient(mock_llm_server.app) as client:
+        configured = client.post(
+            "/mock/configure",
+            json={
+                "key": "mock-model",
+                "responses": [
+                    {"text": "priced", "response_headers": {"x-litellm-response-cost": "0.0123"}},
+                    {"text": "unpriced"},
+                ],
+            },
+        )
+        assert configured.status_code == 200
+        body: dict[str, Any] = {"model": "mock-model", "stream": stream}
+        if endpoint == "/v1/chat/completions":
+            body["messages"] = [{"role": "user", "content": "hi"}]
+        else:
+            body["input"] = "hi"
+        priced = client.post(endpoint, json=body)
+        unpriced = client.post(endpoint, json=body)
+    assert priced.status_code == 200
+    assert priced.headers["x-litellm-response-cost"] == "0.0123"
+    assert unpriced.status_code == 200
+    assert "x-litellm-response-cost" not in unpriced.headers
