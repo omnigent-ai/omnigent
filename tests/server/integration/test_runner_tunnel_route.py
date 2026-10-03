@@ -346,13 +346,16 @@ async def test_ws_tunnel_status_reports_registration(
         offline = await client.get(f"/v1/runners/{_RUNNER_ID}/status")
 
         communicator = await _connect_route(app, _TUNNEL_PATH)
-        await _send_hello(communicator, registry, connection_id="conn-status-1")
         try:
+            await _send_hello(communicator, registry, connection_id="conn-status-1")
             online = await client.get(f"/v1/runners/{_RUNNER_ID}/status")
+            await communicator.send_input(
+                {"type": "websocket.disconnect", "code": 1000, "reason": "runner shutdown"}
+            )
+            await asyncio.wait_for(communicator.future, timeout=budget(1.0))
         finally:
-            await communicator.send_input({"type": "websocket.disconnect", "code": 1000})
-            with contextlib.suppress(asyncio.TimeoutError):
-                await communicator.wait(timeout=budget(1.0))
+            communicator.stop(exceptions=False)
+            await asyncio.gather(communicator.future, return_exceptions=True)
 
     assert offline.json() == {"runner_id": _RUNNER_ID, "online": False}
     assert online.json() == {"runner_id": _RUNNER_ID, "online": True}
@@ -364,11 +367,16 @@ async def test_ws_tunnel_status_reports_registration(
         if getattr(r, "event_name", None) == "runner_tunnel"
     }
     assert rows["connected"]["connection_id"] == "conn-status-1"
-    disconnected = rows["disconnected"]
+    ends = _tunnel_end_events(caplog)
+    assert len(ends) == 1
+    disconnected = ends[0]
+    assert disconnected["phase"] == "disconnected"
     assert disconnected["connection_id"] == "conn-status-1"
     assert disconnected["code"] == 1000
+    assert disconnected["reason"] == "runner shutdown"
     assert disconnected["ended_by"] == "tunnel-receive"
     assert disconnected["connection_age_s"] >= 0
+    assert registry.get(_RUNNER_ID) is None
 
 
 def _tunnel_end_events(caplog: pytest.LogCaptureFixture) -> list[dict[str, object]]:
@@ -445,11 +453,8 @@ async def test_server_retirement_logs_one_structured_disconnect(
     assert route_app.registry.get(_RUNNER_ID) is None
 
 
-@pytest.mark.parametrize("code,reason", [(1000, "runner shutdown"), (1006, "")])
-async def test_peer_disconnect_preserves_code_during_registry_cleanup(
+async def test_abnormal_peer_disconnect_preserves_code_during_registry_cleanup(
     caplog: pytest.LogCaptureFixture,
-    code: int,
-    reason: str,
 ) -> None:
     """Cleanup must not emit an extra retirement code for a peer disconnect."""
     caplog.set_level(logging.INFO, logger="omnigent.server.routes.runner_tunnel")
@@ -457,9 +462,7 @@ async def test_peer_disconnect_preserves_code_during_registry_cleanup(
     communicator = await _connect_route(route_app.app, _TUNNEL_PATH)
     try:
         await _send_hello(communicator, route_app.registry, connection_id="conn-peer")
-        await communicator.send_input(
-            {"type": "websocket.disconnect", "code": code, "reason": reason}
-        )
+        await communicator.send_input({"type": "websocket.disconnect", "code": 1006, "reason": ""})
         await asyncio.wait_for(communicator.future, timeout=budget(1.0))
     finally:
         communicator.stop(exceptions=False)
@@ -469,8 +472,8 @@ async def test_peer_disconnect_preserves_code_during_registry_cleanup(
     assert len(ends) == 1
     assert ends[0]["phase"] == "disconnected"
     assert ends[0]["connection_id"] == "conn-peer"
-    assert ends[0]["code"] == code
-    assert ends[0]["reason"] == reason
+    assert ends[0]["code"] == 1006
+    assert ends[0]["reason"] == ""
     assert route_app.registry.get(_RUNNER_ID) is None
 
 
