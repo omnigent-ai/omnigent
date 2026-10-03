@@ -8,6 +8,8 @@ import logging
 import os
 import shutil
 import tempfile
+import threading
+import weakref
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -42,6 +44,11 @@ class AgentCache:
     On cache miss the bundle is downloaded from the ArtifactStore,
     extracted to disk, parsed, validated, and stored in both tiers.
 
+    Operations on one agent id are serialized on a per-agent lock, so a
+    caller never receives a spec paired with a half-swapped or removed
+    work directory and concurrent misses extract a bundle once.
+    Unrelated agents proceed concurrently.
+
     This is an **execution** load path, so it loads with
     ``prune_invalid_sub_agents=True``: a sub-agent that fails
     validation here means this server is older than whatever produced
@@ -65,6 +72,20 @@ class AgentCache:
         self._artifact_store = artifact_store
         self._cache_dir = cache_dir
         self._specs: dict[str, AgentSpec] = {}
+        self._locks_guard = threading.Lock()
+        # Weak values drop idle locks; a ``with`` block keeps its lock alive while held.
+        self._agent_locks: weakref.WeakValueDictionary[str, threading.Lock] = (
+            weakref.WeakValueDictionary()
+        )
+
+    def _agent_lock(self, agent_id: str) -> threading.Lock:
+        """Return the lock serializing cache operations for one agent."""
+        with self._locks_guard:
+            lock = self._agent_locks.get(agent_id)
+            if lock is None:
+                lock = threading.Lock()
+                self._agent_locks[agent_id] = lock
+            return lock
 
     def _cache_path(self, agent_id: str) -> Path:
         """Return a direct child of the cache root for an agent id."""
@@ -103,7 +124,9 @@ class AgentCache:
         :param agent_id: Unique agent identifier,
             e.g. ``"ag_abc123"``.
         :param bundle_location: Artifact store key for the bundle,
-            e.g. ``"ag_abc123/a1b2c3d4e5f6..."``.
+            e.g. ``"ag_abc123/a1b2c3d4e5f6..."``. Read only on a cache
+            miss: a cached agent is returned regardless of the requested
+            location, and :meth:`replace` publishes a new bundle version.
         :param expand_env: Whether to expand ``${VAR}`` references in
             the spec against the server process environment. Defaults
             to ``False`` and MUST stay ``False`` for tenant-supplied
@@ -118,6 +141,12 @@ class AgentCache:
         :returns: A LoadedAgent with the parsed spec and the
             on-disk working directory.
         """
+        with self._agent_lock(agent_id):
+            return self._load_locked(agent_id, bundle_location, expand_env=expand_env)
+
+    def _load_locked(
+        self, agent_id: str, bundle_location: str, *, expand_env: bool
+    ) -> LoadedAgent:
         workdir = self._cache_path(agent_id)
 
         # Tier 1: in-memory spec. The cached spec was parsed with the
@@ -203,8 +232,8 @@ class AgentCache:
         replacing the disk directory and updating the in-memory spec.
         Restores the previous directory if publication fails; if rollback
         also fails, retains the backup path in the error's notes.
-        Callers must coordinate replacement with concurrent use of
-        this agent; the disk swap and memory update are not atomic.
+        Same-agent cache calls wait for the swap to finish; a workdir
+        returned earlier is not a snapshot and changes under its holder.
 
         :param agent_id: Unique agent identifier,
             e.g. ``"ag_abc123"``.
@@ -221,6 +250,19 @@ class AgentCache:
         :returns: A LoadedAgent with the new spec and working
             directory.
         """
+        with self._agent_lock(agent_id):
+            return self._replace_locked(
+                agent_id, bundle_location, bundle_bytes, expand_env=expand_env
+            )
+
+    def _replace_locked(
+        self,
+        agent_id: str,
+        bundle_location: str,
+        bundle_bytes: bytes,
+        *,
+        expand_env: bool,
+    ) -> LoadedAgent:
         workdir = self._cache_path(agent_id)
         with self._staging_dir() as staging_dir:
             spec = load_spec(
@@ -269,10 +311,11 @@ class AgentCache:
         :param agent_id: Unique agent identifier,
             e.g. ``"ag_abc123"``.
         """
-        workdir = self._cache_path(agent_id)
-        self._specs.pop(agent_id, None)
-        if workdir.is_dir():
-            shutil.rmtree(workdir)
+        with self._agent_lock(agent_id):
+            workdir = self._cache_path(agent_id)
+            self._specs.pop(agent_id, None)
+            if workdir.is_dir():
+                shutil.rmtree(workdir)
 
     def _staging_root(self) -> Path:
         """Return the reserved staging namespace on the cache filesystem."""
