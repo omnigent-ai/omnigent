@@ -23,6 +23,11 @@ from omnigent.runner.tool_dispatch import (
     _SCHEDULED_TASK_TOOLS,
     _execute_scheduled_task_tool,
 )
+from omnigent.tools.base import Tool
+from omnigent.tools.builtins.scheduled_tasks import (
+    SysScheduledTaskCreateTool,
+    SysScheduledTaskUpdateTool,
+)
 
 _ALL_NAMES = {
     "sys_scheduled_task_create",
@@ -81,6 +86,7 @@ async def test_create_posts_payload() -> None:
                 "prompt": "go",
                 "rrule": "FREQ=DAILY;BYHOUR=9;BYMINUTE=0",
                 "agent_id": "ag_1",
+                "max_cost_usd": 2.5,
                 "workspace": "/repo",
                 "host_id": "host_1",
                 "base_branch": "main",
@@ -96,6 +102,7 @@ async def test_create_posts_payload() -> None:
         "prompt": "go",
         "rrule": "FREQ=DAILY;BYHOUR=9;BYMINUTE=0",
         "agent_id": "ag_1",
+        "max_cost_usd": 2.5,
         "workspace": "/repo",
         "host_id": "host_1",
     }  # unknown fields filtered out
@@ -156,6 +163,47 @@ async def test_update_forwards_agent_switch_and_cost_cap() -> None:
     )
     _, _, body = client.calls[0]
     assert body == {"agent_id": "ag_pi", "max_cost_usd": 2.5}
+
+
+_SAMPLE_VALUES = {"string": "value", "number": 1.5, "integer": 1, "boolean": True}
+
+
+def _sample_arguments(tool: Tool) -> dict[str, object]:
+    """One accepted value for every property the tool schema advertises."""
+    properties = tool.get_schema()["function"]["parameters"]["properties"]
+    return {
+        name: spec["enum"][0] if "enum" in spec else _SAMPLE_VALUES[spec["type"]]
+        for name, spec in properties.items()
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("tool", "verb", "url", "path_args"),
+    [
+        (SysScheduledTaskCreateTool(), "POST", "/v1/scheduled-tasks", {}),
+        (
+            SysScheduledTaskUpdateTool(),
+            "PATCH",
+            f"/v1/scheduled-tasks/{_TASK_ID}",
+            {"scheduled_task_id": _TASK_ID},
+        ),
+    ],
+    ids=["create", "update"],
+)
+async def test_every_advertised_field_reaches_the_request(
+    tool: Tool, verb: str, url: str, path_args: dict[str, str]
+) -> None:
+    """Each field the tool schema advertises survives the dispatch allowlist.
+
+    An advertised field missing from the allowlist is dropped before the REST
+    call, so the agent's call reports success while the server never saw it.
+    """
+    args = {**_sample_arguments(tool), **path_args}
+    client = _RecordingClient()
+    await _execute_scheduled_task_tool(tool.name(), json.dumps(args), server_client=client)
+    body = {k: v for k, v in args.items() if k not in path_args}
+    assert client.calls[0] == (verb, url, body)
 
 
 @pytest.mark.asyncio
