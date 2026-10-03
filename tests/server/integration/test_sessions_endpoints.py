@@ -2363,6 +2363,8 @@ async def test_skill_slash_command_persists_visible_item_and_hidden_meta_message
     assert "<user_request>\nreview this rollout\n</user_request>" in text
     assert "Use the load_skill tool" not in text
 
+    # The bundle revision lets the runner notice a reinstall under the same id.
+    assert forwarded[0].pop("agent_revision").startswith(f"{agent['id']}/")
     assert forwarded == [
         {
             "type": "message",
@@ -2558,7 +2560,7 @@ async def test_skill_slash_command_missing_session_agent_returns_typed_410(
     message = body["error"]["message"]
     assert "session spec resolver" not in message
     assert "ag_gone" not in message
-    assert "no longer available" in message
+    assert "no longer exists" in message
 
 
 async def test_external_meta_user_message_persists_and_publishes_flagged_input_event(

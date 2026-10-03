@@ -183,6 +183,9 @@ class ServerInfoResponse(BaseModel):
     harness_install_enabled: bool
     installable_harnesses: list[str]
     dictation_available: bool
+    # User agents (`omnigent agent add`, GET /v1/agents?scope=user); absent on
+    # older servers, which clients treat as unsupported.
+    agent_install: bool = False
     branding: BrandingInfo
 
 
@@ -826,12 +829,10 @@ def _ensure_builtin_agent(
       bundle), evict the local cache so the next load re-fetches from
       ``bundle_location``, then return.
 
-    The evict on the matching-hash path matters because
-    :meth:`AgentCache.load` is keyed by ``agent_id`` and trusts its
-    in-memory / on-disk entry without checking ``bundle_location``: a
-    replica that boots with a cache lagging the (already-current) DB
-    row — or a prior boot whose ``replace`` failed after ``update``
-    succeeded — would otherwise keep serving the stale spec.
+    The evict on the matching-hash path is a cheap reset of this
+    process's entry; :meth:`AgentCache.load` itself rebuilds any entry
+    built from another ``bundle_location`` (a lagging replica's cache, or
+    a prior boot whose ``replace`` failed after ``update`` succeeded).
 
     This replaces the old seed-once behavior, which skipped on row
     existence and so served a stale spec after the wheel shipped a new
@@ -1623,6 +1624,7 @@ def create_app(
         _uninstall_subagent_block_notifier = configure_subagent_block_notifier(
             conversation_store,
             runner_router,
+            agent_store=agent_store,
         )
 
         from omnigent.runner.resource_registry import (
@@ -2976,6 +2978,7 @@ def create_app(
                 "harness_install_enabled": harness_install_enabled,
                 "installable_harnesses": installable_harnesses,
                 "dictation_available": dictation_available,
+                "agent_install": agent_store.supports_user_agents,
                 "branding": branding_snapshot.config(),
             }
         )
@@ -3127,13 +3130,14 @@ def create_app(
         prefix="/v1",
         tags=["usage"],
     )
-    # Read-only built-in agent discovery (designs/BUILTIN_AGENTS.md).
-    # Successor to the removed GET /api/agents list; lists only
-    # built-in (session_id IS NULL) agents for the new-session picker.
+    # Server agent discovery for the new-session picker
+    # (designs/BUILTIN_AGENTS.md), plus user agents (``omnigent agent add``).
     app.include_router(
         create_builtin_agents_router(
             agent_store,
             agent_cache,
+            artifact_store=artifact_store,
+            conversation_store=conversation_store,
             auth_provider=auth_provider,
         ),
         prefix="/v1",
@@ -3251,6 +3255,7 @@ def create_app(
                 permission_store=permission_store,
                 agent_cache=agent_cache,
                 auth_provider=auth_provider,
+                artifact_store=artifact_store,
             ),
             prefix="/v1",
             tags=["scheduled_tasks"],

@@ -196,6 +196,12 @@ export interface ServerInfo {
    * backend (Electron, Firefox/Chromium).
    */
   dictation_available: boolean;
+  /**
+   * True when the server stores user agents (``omnigent agent add``,
+   * ``GET /v1/agents?scope=user``). Gates the picker's "my agents" source
+   * and the Import bundle button. Absent on older servers (off).
+   */
+  agent_install?: boolean;
   /** Operator branding, or null when the built-in identity should be used. */
   branding?: Branding | null;
 }
@@ -355,6 +361,7 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
             ? data.installable_harnesses.filter((h): h is string => typeof h === "string")
             : [],
           dictation_available: data.dictation_available === true,
+          agent_install: data.agent_install === true,
           branding: parseBranding(data.branding),
         };
         return cachedServerInfo;

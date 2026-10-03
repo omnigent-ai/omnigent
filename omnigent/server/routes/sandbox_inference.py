@@ -186,7 +186,7 @@ def create_sandbox_inference_router(
                     agent_cache.load,
                     agent.id,
                     agent.bundle_location,
-                    expand_env=agent.session_id is None,
+                    expand_env=agent.operator_authored,
                 )
             ).spec
             harness = actual_harness(spec, harness)

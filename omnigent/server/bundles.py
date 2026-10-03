@@ -7,12 +7,14 @@ import tempfile
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import TYPE_CHECKING
 
+from omnigent.db.utils import generate_agent_id
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.inner.datamodel import OSEnvSpec
 from omnigent.spec import AgentSpec, ExtractionError, ToolRuntime, load
 
 if TYPE_CHECKING:
     from omnigent.entities import Agent
+    from omnigent.stores.agent_store import AgentStore
     from omnigent.stores.artifact_store import ArtifactStore
 
 
@@ -184,9 +186,7 @@ def agent_needs_own_copy(agent: Agent, user_id: str | None) -> bool:
     its owner can never change code that runs in the caller's sessions. Without
     auth (``user_id`` None) there is one user, so nothing is copied.
     """
-    if user_id is None:
-        return False
-    if agent.session_id is None and agent.created_by is None:
+    if user_id is None or agent.operator_authored:
         return False
     return agent.created_by != user_id
 
@@ -197,6 +197,31 @@ def copy_agent_bundle(artifact_store: ArtifactStore, location: str, new_agent_id
     new_location = bundle_location(new_agent_id, data)
     artifact_store.put(new_location, data)
     return new_location
+
+
+def agent_for_user(
+    agent_store: AgentStore,
+    artifact_store: ArtifactStore | None,
+    agent: Agent,
+    user_id: str | None,
+) -> Agent:
+    """Return the agent a new session or schedule of *user_id* binds: *agent* itself,
+    or a new copy *user_id* owns (see :func:`agent_needs_own_copy`).
+
+    Without an artifact store or user agent support there is nowhere to put a
+    copy, so *agent* is returned as is.
+    """
+    if (
+        artifact_store is None
+        or not agent_store.supports_user_agents
+        or not agent_needs_own_copy(agent, user_id)
+    ):
+        return agent
+    copy_id = generate_agent_id()
+    location = copy_agent_bundle(artifact_store, agent.bundle_location, copy_id)
+    return agent_store.create_user_agent(
+        copy_id, agent.name, location, owner=user_id, description=agent.description
+    )
 
 
 def bundle_location(agent_id: str, bundle_bytes: bytes) -> str:

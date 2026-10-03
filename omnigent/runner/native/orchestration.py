@@ -55,7 +55,14 @@ from omnigent.entities.session_resources import (
     session_resource_view_to_dict,
     terminal_resource_id,
 )
-from omnigent.errors import ErrorCategory, ErrorCode, ErrorImpact, ErrorPhase, OmnigentError
+from omnigent.errors import (
+    SESSION_AGENT_MISSING_MESSAGE,
+    ErrorCategory,
+    ErrorCode,
+    ErrorImpact,
+    ErrorPhase,
+    OmnigentError,
+)
 from omnigent.harness_plugins import native_provider_for_key
 from omnigent.models.model_override import validate_model_override
 from omnigent.native.native_coding_agents import (
@@ -7568,11 +7575,7 @@ def _native_terminal_start_error_payload(
         return {
             "code": ErrorCode.SESSION_AGENT_MISSING,
             "error_id": error_id,
-            "message": (
-                "This session's agent is no longer available; it was deleted "
-                "or replaced. Recreate the agent or start a new session, then "
-                f"retry. Error ID: {error_id}."
-            ),
+            "message": f"{SESSION_AGENT_MISSING_MESSAGE} Error ID: {error_id}.",
         }
     _logger.warning(
         "Native %s terminal start failed; error_id=%s: %s",

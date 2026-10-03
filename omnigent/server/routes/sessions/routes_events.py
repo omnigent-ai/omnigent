@@ -2670,6 +2670,7 @@ def register_events_routes(
             created_by=created_by,
             runner_router=runner_router,
             native_terminal_ready=native_terminal_ready,
+            agent_revision=_agent.bundle_location if _agent else None,
             background_titles_enabled=background_session_titles_enabled(request.headers),
             # Read only for the gateway-backing check that decides which router
             # serves this turn; absent, routing keeps its default posture.

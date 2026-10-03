@@ -1876,6 +1876,21 @@ class ConversationStore(ABC):
         del agent_id, limit
         return []
 
+    def count_sessions_for_agent(self, agent_id: str, cap: int) -> int:
+        """
+        Count sessions that use *agent_id*, reading at most *cap* of them.
+
+        Any kind, archived included. Default: one bounded conversation page.
+
+        :param agent_id: Agent id, e.g. ``"0f1a2b3c..."``.
+        :param cap: Most sessions to count, e.g. ``101``.
+        :returns: The count, at most *cap*.
+        """
+        page = self.list_conversations(
+            limit=cap, kind=None, agent_id=agent_id, include_archived=True
+        )
+        return len(page.data)
+
     @abstractmethod
     def has_other_live_session_in_workspace(
         self,

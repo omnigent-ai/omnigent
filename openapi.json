@@ -4777,6 +4777,11 @@
             "title": "Accounts Enabled",
             "type": "boolean"
           },
+          "agent_install": {
+            "default": false,
+            "title": "Agent Install",
+            "type": "boolean"
+          },
           "branding": {
             "$ref": "#/components/schemas/BrandingInfo"
           },
@@ -9124,11 +9129,11 @@
     },
     "/v1/agents": {
       "get": {
-        "description": "List built-in agents with cursor-based pagination.\n\nReturns only built-in agents \u2014 `agent_store.list()` filters\n`session_id IS NULL` \u2014 so session-scoped agents never appear.\n\n**Returns:** A `PaginatedList` of built-in agents.",
+        "description": "List server agents, or with `scope=user` the caller's own agents.\n\nServer agents come from `agent_store.list()`, which never returns\nuser agents. `scope=user` returns the caller's user agents newest\nfirst, at most 50 per page and paged with `after` only; `last_id`\nis the last row the server read, which may not be in `data`.\n\n**Returns:** A `PaginatedList` of agents.",
         "operationId": "list_builtin_agents_v1_agents_get",
         "parameters": [
           {
-            "description": "Maximum number of agents to return (1-1000).",
+            "description": "Maximum number of agents to return (1-1000; `scope=user` caps it at 50).",
             "in": "query",
             "name": "limit",
             "required": false,
@@ -9141,7 +9146,7 @@
             }
           },
           {
-            "description": "Cursor \u2014 return agents after this id.",
+            "description": "Cursor: return agents after this id.",
             "in": "query",
             "name": "after",
             "required": false,
@@ -9158,7 +9163,7 @@
             }
           },
           {
-            "description": "Cursor \u2014 return agents before this id.",
+            "description": "Cursor: return agents before this id (server agents only).",
             "in": "query",
             "name": "before",
             "required": false,
@@ -9175,7 +9180,7 @@
             }
           },
           {
-            "description": "Sort order, `\"asc\"` or `\"desc\"`.",
+            "description": "Sort order, `\"asc\"` or `\"desc\"` (server agents only).",
             "in": "query",
             "name": "order",
             "required": false,
@@ -9184,6 +9189,24 @@
               "pattern": "^(asc|desc)$",
               "title": "Order",
               "type": "string"
+            }
+          },
+          {
+            "description": "`\"user\"` to list the caller's own agents.",
+            "in": "query",
+            "name": "scope",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "pattern": "^user$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Scope"
             }
           }
         ],
@@ -9210,6 +9233,81 @@
           }
         },
         "summary": "List Builtin Agents",
+        "tags": [
+          "agents"
+        ]
+      },
+      "post": {
+        "description": "Install (or reinstall) the caller's user agent from a bundle.\n\nMultipart form with one `bundle` part: a gzipped tarball, the same\nshape multipart `POST /v1/sessions` accepts. The bundle is validated\nlike any tenant upload and never executed here.\n\n**Returns:** The installed agent as an `AgentObject`.",
+        "operationId": "install_agent_v1_agents_post",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AgentObject"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Install Agent",
+        "tags": [
+          "agents"
+        ]
+      }
+    },
+    "/v1/agents/{agent_id}": {
+      "delete": {
+        "description": "Remove one of the caller's user agents.\n\nSessions using it keep running while their runner holds the spec, then\nreport that the agent no longer exists, so while any exist this returns\n409 with `sessions_in_use` unless `force` is set. Server agents,\nother users' agents, and unowned rows all read as 404.\n\n**Returns:** `{\"id\": agent_id, \"deleted\": True}`, or the 409 response.",
+        "operationId": "remove_agent_v1_agents__agent_id__delete",
+        "parameters": [
+          {
+            "description": "User agent to remove.",
+            "in": "path",
+            "name": "agent_id",
+            "required": true,
+            "schema": {
+              "title": "Agent Id",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Remove even though sessions still use the agent.",
+            "in": "query",
+            "name": "force",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Force",
+              "type": "boolean"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "title": "Response Remove Agent V1 Agents  Agent Id  Delete"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Remove Agent",
         "tags": [
           "agents"
         ]

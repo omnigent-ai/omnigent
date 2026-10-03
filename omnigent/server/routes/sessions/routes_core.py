@@ -96,6 +96,7 @@ from omnigent.server.routes._content_type import (
 )
 from omnigent.server.routes._errors import (
     STALE_CURSOR_RESPONSE,
+    agent_removed,
 )
 from omnigent.server.routes._errors import session_not_found as _session_not_found
 from omnigent.server.routes._origin import require_trusted_origin
@@ -3064,19 +3065,17 @@ def register_core_routes(
                 )
 
         source_agent = await asyncio.to_thread(agent_store.get, source.agent_id)
-        if source_agent is None:
-            raise OmnigentError(
-                f"Source agent not found: {source.agent_id!r}",
-                code=ErrorCode.NOT_FOUND,
-            )
-
-        # By default the fork clones the source's agent (same harness). When
-        # ``body.agent_id`` names a different agent, the fork SWITCHES to it
-        # — e.g. fork a Claude-SDK session into Claude Code. A session-scoped
-        # target is bindable if the caller can read the session that owns it.
-        base_agent = source_agent
         target_agent_id = body.agent_id
         switching_agent = target_agent_id is not None and target_agent_id != source.agent_id
+        if source_agent is None and not switching_agent:
+            # The agent was removed: forking into another agent still works.
+            raise agent_removed()
+
+        # By default the fork uses the source's agent (same harness). When
+        # ``body.agent_id`` names a different agent, the fork SWITCHES to it
+        # (e.g. fork a Claude-SDK session into Claude Code). A target another
+        # session uses is bindable if the caller can read that session.
+        base_agent = source_agent
         if target_agent_id is not None and switching_agent:
             from omnigent.server.routes._session_create_validation import (
                 validate_session_agent,
@@ -3089,6 +3088,7 @@ def register_core_routes(
                 permission_store=permission_store,
                 conversation_store=conversation_store,
             )
+        assert base_agent is not None
 
         if source.inference_snapshot is not None and switching_agent:
             from omnigent.harness_aliases import canonicalize_harness
@@ -3152,7 +3152,7 @@ def register_core_routes(
         # family) resets them; same-agent forks always copy.
         copy_model_settings = True
         if switching_agent:
-            copy_model_settings = await asyncio.to_thread(
+            copy_model_settings = source_agent is not None and await asyncio.to_thread(
                 _same_provider_family, source_agent, base_agent
             )
 

@@ -1131,6 +1131,21 @@ def builtin_agent_id(name: str) -> str:
     return digest[:32]
 
 
+def installed_agent_id(owner: str | None, name: str) -> str:
+    """
+    Deterministic id for an installed user agent, derived from owner and name.
+
+    Makes "one install per owner and name" a primary-key invariant, so two
+    concurrent installs of the same agent collide instead of both inserting.
+
+    :param owner: Installing user, or ``None`` on an auth-less server.
+    :param name: The agent's name, e.g. ``"orion"``.
+    :returns: A deterministic bare 32-char hex id.
+    """
+    digest = hashlib.sha256(f"installed:{owner or ''}\0{name}".encode()).hexdigest()
+    return digest[:32]
+
+
 def generate_file_id() -> str:
     """
     Generate a unique file identifier.

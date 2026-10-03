@@ -151,6 +151,7 @@ map an area, remove it here in the same change.
   `omnigent import`
 - Bundled agents and the Copilot harness: `omnigent polly`, `omnigent debby`,
   `omnigent copilot`
+- Installing reusable agents: `omnigent agent`
 - Integrations, extensions, and remote sandboxes: `omnigent integration`,
   `omnigent extensions`, `omnigent sandbox`
 

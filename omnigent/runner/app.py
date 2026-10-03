@@ -51,7 +51,14 @@ from omnigent.entities.session_resources import (
     session_resource_view_to_dict,
     terminal_resource_id,
 )
-from omnigent.errors import ErrorCategory, ErrorCode, ErrorImpact, ErrorPhase, OmnigentError
+from omnigent.errors import (
+    SESSION_AGENT_MISSING_MESSAGE,
+    ErrorCategory,
+    ErrorCode,
+    ErrorImpact,
+    ErrorPhase,
+    OmnigentError,
+)
 from omnigent.harness_aliases import (
     canonicalize_harness,
     is_native_harness,
@@ -953,6 +960,9 @@ def _harness_error_response_error(response: object) -> dict[str, str]:
         raw_code = payload.get("error")
         detail = raw_detail.strip() if isinstance(raw_detail, str) else ""
         code = raw_code.strip() if isinstance(raw_code, str) else ""
+        if code == ErrorCode.SESSION_AGENT_MISSING:
+            # A lifecycle condition the web UI explains; keep its code and text.
+            return {"code": code, "message": detail or SESSION_AGENT_MISSING_MESSAGE}
         if code and detail:
             return {"message": f"{code}: {detail}"}
         if detail:
@@ -1169,6 +1179,8 @@ def create_runner_app(
     # every spec-derived read (native-vs-SDK checks above all) still answers
     # with the harness the spec declared, which a routed session is not on.
     _session_harness_overrides: dict[str, str] = {}
+    # session_id → revision of the agent bundle its caches were built from
+    _session_agent_revisions: dict[str, str] = {}
     _session_snapshot_cache: dict[str, _SessionSnapshot] = {}  # session_id → snapshot
     _session_snapshot_locks: dict[str, asyncio.Lock] = {}  # session_id → snapshot fetch lock
     _session_spec_locks: dict[str, asyncio.Lock] = {}  # session_id → spec resolution lock
@@ -4758,22 +4770,9 @@ def create_runner_app(
         conv: str,
     ) -> None:
         _dispatched_agent_id = cast(str | None, msg_body.get("agent_id"))
-        _prior_agent_id = _session_agent_ids.get(conv)
-        if (
-            _dispatched_agent_id
-            and _prior_agent_id is not None
-            and _prior_agent_id != _dispatched_agent_id
-        ):
-            _logger.info(
-                "agent switch detected for %s: %s -> %s; resetting session caches",
-                conv,
-                _prior_agent_id,
-                _dispatched_agent_id,
-                extra={"session_id": conv},
-            )
-            await _invalidate_session_agent_state(conv, _dispatched_agent_id)
-        if _dispatched_agent_id:
-            _session_agent_ids[conv] = _dispatched_agent_id
+        await _sync_session_agent(
+            conv, _dispatched_agent_id, cast(str | None, msg_body.get("agent_revision"))
+        )
 
         cached_spec_entry = _session_spec_cache.get(conv)
         cached_spec = _unwrap_resolved_spec(cached_spec_entry)
@@ -5222,13 +5221,13 @@ def create_runner_app(
             dispatch.spawn_env if dispatch else cast(dict[str, str] | None, body.get("spawn_env"))
         )
         _note_session_harness_override(conv_id, cast(str | None, body.get("harness_override")))
-        # Shared agent-switch invalidation for both dispatch paths.
+        # Shared agent-change invalidation for both dispatch paths.
         _ds_agent_id = dispatch.agent_id if dispatch else cast(str | None, body.get("agent_id"))
-        _ds_prior = _session_agent_ids.get(conv_id)
-        if _ds_agent_id and _ds_prior is not None and _ds_prior != _ds_agent_id:
-            await _invalidate_session_agent_state(conv_id, _ds_agent_id)
-        if _ds_agent_id:
-            _session_agent_ids[conv_id] = _ds_agent_id
+        await _sync_session_agent(
+            conv_id,
+            _ds_agent_id,
+            None if dispatch else cast(str | None, body.get("agent_revision")),
+        )
         startup_envelope = _fresh_session_init_envelope(conv_id)
         startup_labels = startup_envelope.snapshot.labels if startup_envelope is not None else None
         if not harness_name:
@@ -5250,6 +5249,14 @@ def create_runner_app(
                     ),
                     sub_agent_name=_sub_agent_name,
                     cwd=await _session_runtime_cwd(conv_id),
+                )
+            except SessionAgentMissingError:
+                return JSONResponse(
+                    status_code=410,
+                    content={
+                        "error": ErrorCode.SESSION_AGENT_MISSING,
+                        "detail": SESSION_AGENT_MISSING_MESSAGE,
+                    },
                 )
             except (httpx.HTTPError, RuntimeError) as exc:
                 return JSONResponse(
@@ -7134,6 +7141,7 @@ def create_runner_app(
     def _clear_session_agent_caches(session_id: str, agent_id: str | None = None) -> None:
         _session_spec_cache.pop(session_id, None)
         _session_agent_ids.pop(session_id, None)
+        _session_agent_revisions.pop(session_id, None)
         _session_harness_overrides.pop(session_id, None)
         # Bump so any in-flight fill discards its write rather than reinstating it.
         _session_cache_generations[session_id] = _session_cache_generations.get(session_id, 0) + 1
@@ -7159,6 +7167,54 @@ def create_runner_app(
         _clear_session_agent_caches(session_id, new_agent_id)
         if process_manager is not None:
             await process_manager.release(session_id)
+
+    async def _sync_session_agent(
+        session_id: str, agent_id: str | None, revision: str | None
+    ) -> None:
+        """Reset agent-derived state when a turn's agent or its bundle revision changed.
+
+        The server stamps ``agent_revision`` on each turn, so a reinstall or an
+        edit made through any server replica reaches this session's next turn. A
+        spec cached by a turn without a revision is rebuilt when one arrives.
+        """
+        prior_id = _session_agent_ids.get(session_id)
+        prior_revision = _session_agent_revisions.get(session_id)
+        if agent_id and prior_id is not None and prior_id != agent_id:
+            _logger.info(
+                "agent switch detected for %s: %s -> %s; resetting session caches",
+                session_id,
+                prior_id,
+                agent_id,
+                extra={"session_id": session_id},
+            )
+            await _invalidate_session_agent_state(session_id, agent_id)
+        # ponytail: distrusting a spec cached without a revision can drop a fresh shared
+        # per-agent spec (one extra resolve); track per-agent revisions if that shows up.
+        elif (
+            revision
+            and revision != prior_revision
+            and (
+                prior_revision is not None
+                or session_id in _session_spec_cache
+                or (agent_id is not None and agent_id in _spec_cache)
+            )
+        ):
+            _logger.info(
+                "agent %s changed for %s; resetting session caches",
+                agent_id,
+                session_id,
+                extra={"session_id": session_id},
+            )
+            # Same agent, new bundle: rebuild the spec like an MCP edit does,
+            # keeping the harness process and the harness the server pinned.
+            override = _session_harness_overrides.get(session_id)
+            _clear_session_agent_caches(session_id, agent_id)
+            if override is not None:
+                _session_harness_overrides[session_id] = override
+        if agent_id:
+            _session_agent_ids[session_id] = agent_id
+        if revision:
+            _session_agent_revisions[session_id] = revision
 
     @app.delete("/v1/sessions/{session_id}/resources")
     async def cleanup_session_resources(
@@ -7498,6 +7554,14 @@ def create_runner_app_from_env() -> FastAPI:
     return create_runner_app(server_client=server_client)
 
 
+class SessionAgentMissingError(RuntimeError):
+    """The session's agent no longer resolves (for example it was removed).
+
+    A ``RuntimeError`` so every existing spec-resolve handler still catches it;
+    the turn route reports it as ``session_agent_missing`` with fork guidance.
+    """
+
+
 async def _resolve_harness_config(
     *,
     agent_id: str | None,
@@ -7581,9 +7645,10 @@ async def _resolve_harness_config(
                 "Cannot select a harness: agent_id is missing and a spec_resolver "
                 "is configured. Ensure agent_id is forwarded in the turn body."
             )
-        raise RuntimeError(
-            f"No agent spec found for agent_id={agent_id!r}; cannot select a harness."
-        )
+        # With a session, the resolver returns None only when the server no
+        # longer has the session's agent (a 404, e.g. after the agent is removed).
+        missing = SessionAgentMissingError if session_id else RuntimeError
+        raise missing(f"No agent spec found for agent_id={agent_id!r}; cannot select a harness.")
 
     # Fallback for tests that register a custom harness in _HARNESS_MODULES
     # (spec_resolver is None in the test runner).

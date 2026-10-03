@@ -129,7 +129,7 @@ from omnigent.server.background_session_titles import (
     background_session_titles_enabled,
     prepare_background_session_title,
 )
-from omnigent.server.bundles import bundle_location, validate_agent_bundle
+from omnigent.server.bundles import agent_for_user, bundle_location, validate_agent_bundle
 from omnigent.server.creation_logging import creation_metadata, creation_stage, session_created
 from omnigent.server.host_registry import HostConnection, HostRegistry, RunnerExitReports
 from omnigent.server.managed_hosts import (
@@ -5888,6 +5888,7 @@ async def _forward_event_to_runner(
     has_mcp_servers: bool = False,
     created_by: str | None = None,
     host_store: HostStore | None = None,
+    agent_revision: str | None = None,
 ) -> str:
     """
     Persist a user event and forward it to the runner.
@@ -5919,6 +5920,8 @@ async def _forward_event_to_runner(
     :param host_store: Host registrations, read only to learn whether this
         session's harness is AI-Gateway-backed (which router may route it).
         ``None`` reads as unknown, which counts as backed.
+    :param agent_revision: The agent's current ``bundle_location``; the
+        runner rebuilds the session's spec when it changes.
     :returns: The store-assigned id of the persisted item.
     """
     import uuid
@@ -6033,6 +6036,8 @@ async def _forward_event_to_runner(
         # resolved copy — id-based dedup, not a role/content guess.
         "persisted_item_id": persisted_items[0].id,
     }
+    if agent_revision is not None:
+        runner_body["agent_revision"] = agent_revision
     # Persist the turn-initiating actor so /policies/evaluate and MCP
     # tools/call can read it back on any server replica.  Skip system-driven
     # forwards (sub-agent results, parent-wake carry created_by=None) — they
@@ -6735,6 +6740,7 @@ async def _dispatch_session_event_to_runner_impl(
     host_store: HostStore | None = None,
     host_registry: HostRegistry | None = None,
     background_titles_enabled: bool = True,
+    agent_revision: str | None = None,
 ) -> _SessionEventDispatchResult:
     """
     Forward an item-event to the runner with harness-aware dispatch.
@@ -6807,6 +6813,8 @@ async def _dispatch_session_event_to_runner_impl(
         session's harness is AI-Gateway-backed (which router may route it).
         ``None`` reads as unknown, which counts as backed — the same posture
         an older host row gets.
+    :param agent_revision: The agent's current ``bundle_location``, stamped on
+        non-native forwards (see :func:`_forward_event_to_runner`).
     :returns: A :class:`_SessionEventDispatchResult` carrying the
         persisted item id (non-native) or the pending-input id
         (claude-native message bypass).
@@ -7092,6 +7100,7 @@ async def _dispatch_session_event_to_runner_impl(
         has_mcp_servers=has_mcp_servers,
         created_by=created_by,
         host_store=host_store,
+        agent_revision=agent_revision,
     )
     return _SessionEventDispatchResult(item_id=item_id, pending_id=None)
 
@@ -8712,6 +8721,7 @@ async def _wake_parent_for_blocked_child(
     *,
     conversation_store: ConversationStore,
     runner_router: RunnerRouter | None,
+    agent_store: AgentStore | None = None,
 ) -> bool:
     """
     Deliver a parent-wake notice when a sub-agent blocks on an approval.
@@ -8734,6 +8744,8 @@ async def _wake_parent_for_blocked_child(
     :param runner_router: Router used to resolve the parent's bound
         runner. ``None`` in in-process setups (the runtime singleton is
         consulted as a fallback).
+    :param agent_store: Resolves the parent agent's current bundle, so a
+        reinstall since the parent's last turn reaches this wake turn too.
     :returns: ``True`` when the notice was dispatched to the parent's runner;
         ``False`` when delivery could not happen (parent gone, no runner bound,
         or the forward raised a transport error).
@@ -8772,6 +8784,11 @@ async def _wake_parent_for_blocked_child(
             "content": [{"type": "input_text", "text": notice}],
         },
     )
+    parent_agent = (
+        await asyncio.to_thread(agent_store.get, parent_conv.agent_id)
+        if agent_store is not None and parent_conv.agent_id
+        else None
+    )
     try:
         # None args: a system notice carries no agent/files/artifacts; the runner
         # recomputes has_mcp_servers from the parent's cached spec.
@@ -8785,6 +8802,7 @@ async def _wake_parent_for_blocked_child(
             file_store=None,
             artifact_store=None,
             runner_router=runner_router,
+            agent_revision=parent_agent.bundle_location if parent_agent is not None else None,
         )
     except (httpx.HTTPError, OmnigentError):
         _logger.warning(
@@ -8800,6 +8818,7 @@ async def _wake_parent_for_blocked_child(
 def configure_subagent_block_notifier(
     conversation_store: ConversationStore,
     runner_router: RunnerRouter | None,
+    agent_store: AgentStore | None = None,
 ) -> Callable[[], None]:
     """
     Install the parent-wake notifier on the elicitation publish path.
@@ -8818,6 +8837,7 @@ def configure_subagent_block_notifier(
         ``parent_conversation_id`` and to persist the wake message.
     :param runner_router: Router used by the wake to reach the parent's
         bound runner. ``None`` in in-process setups.
+    :param agent_store: Lets each wake name the parent agent's current bundle.
     :returns: A callable that uninstalls the observer and cancels any
         in-flight wake futures. Call from the lifespan teardown.
     """
@@ -8843,6 +8863,7 @@ def configure_subagent_block_notifier(
             notice,
             conversation_store=conversation_store,
             runner_router=runner_router,
+            agent_store=agent_store,
         )
 
     notifier = SubagentBlockNotifier(
@@ -9305,7 +9326,7 @@ def _create_resolved_harness(
         return None
     try:
         loaded = agent_cache.load(
-            agent.id, agent.bundle_location, expand_env=agent.session_id is None
+            agent.id, agent.bundle_location, expand_env=agent.operator_authored
         )
     except (KeyError, AttributeError, ValueError, ImportError, OSError):
         # An unloadable spec just means "harness unknown"; the create's own
@@ -9391,7 +9412,7 @@ def _spec_routes_its_own_harness(
         return False
     try:
         loaded = agent_cache.load(
-            agent.id, agent.bundle_location, expand_env=agent.session_id is None
+            agent.id, agent.bundle_location, expand_env=agent.operator_authored
         )
     except (KeyError, AttributeError, ValueError, ImportError, OSError):
         # An unloadable spec just means "no opt-in"; the create's own
@@ -9919,7 +9940,7 @@ async def _create_session_from_existing_agent(
                     agent_cache.load,
                     agent.id,
                     agent.bundle_location,
-                    expand_env=agent.session_id is None,
+                    expand_env=agent.operator_authored,
                 )
             ).spec
         except (KeyError, AttributeError, ValueError, ImportError, OSError):
@@ -10127,7 +10148,7 @@ async def _create_session_from_existing_agent(
                 agent_cache.load,
                 agent.id,
                 agent.bundle_location,
-                expand_env=agent.session_id is None,
+                expand_env=agent.operator_authored,
             )
             own_spec = own_loaded.spec if own_loaded is not None else None
         except (OSError, ValueError, RuntimeError, KeyError, AttributeError, ImportError):
@@ -10200,6 +10221,22 @@ async def _create_session_from_existing_agent(
     )
     from omnigent.stores.conversation_store.overrides import encode_session_overrides
 
+    # A new session from another user's agent runs on the caller's own copy, so
+    # that user can never change code running here. A child reusing its parent's
+    # agent stays on it: collaborators act in the owner's session.
+    own_copy: Agent | None = None
+    if _parent_for_routing is None or _parent_for_routing.agent_id != agent.id:
+        bound = await asyncio.to_thread(
+            agent_for_user, agent_store, artifact_store, agent, user_id
+        )
+        if bound.id != agent.id:
+            own_copy = agent = bound
+
+    def _drop_own_copy() -> None:
+        # The session was never created, so nothing uses the copy.
+        if own_copy is not None:
+            agent_store.delete(own_copy.id)
+
     try:
         # Include spec-seeded defaults before create; overflow must not leave a session.
         encode_session_overrides(
@@ -10233,6 +10270,7 @@ async def _create_session_from_existing_agent(
                 **snapshot_kwargs,
             )
     except NameAlreadyExistsError as exc:
+        _drop_own_copy()
         if (
             created_worktree_path is not None
             and body.host_id is not None
@@ -10258,6 +10296,7 @@ async def _create_session_from_existing_agent(
         # NOT git_branch: only a worktree Omnigent created here may be
         # force-removed. An existing worktree bound via workspace_branch
         # also sets git_branch but is the user's — never destroy it.
+        _drop_own_copy()
         if (
             created_worktree_path is not None
             and body.host_id is not None
@@ -10370,7 +10409,7 @@ async def _create_session_from_existing_agent(
                 _tel_loaded = agent_cache.load(
                     agent.id,
                     agent.bundle_location,
-                    expand_env=agent.session_id is None,
+                    expand_env=agent.operator_authored,
                 )
                 _tel_harness = _spec_harness(_tel_loaded.spec)
             else:
@@ -10448,6 +10487,7 @@ async def _create_session_from_existing_agent(
                     runner_router=runner_router,
                     host_store=getattr(request.app.state, "host_store", None),
                     background_titles_enabled=background_session_titles_enabled(request.headers),
+                    agent_revision=agent.bundle_location,
                 )
                 if pending_background_title is not None:
                     pending_background_title.schedule(expected_seed_title=conv.title)
@@ -11706,7 +11746,7 @@ async def _get_session_snapshot(
                         agent_cache.load,
                         agent.id,
                         agent.bundle_location,
-                        expand_env=agent.session_id is None,
+                        expand_env=agent.operator_authored,
                     )
                     resolved_spec: AgentSpec | None = loaded.spec
                     if conv.sub_agent_name:

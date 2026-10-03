@@ -184,6 +184,50 @@ def test_load_disk_cache_hit(
     assert second.workdir == first.workdir
 
 
+def test_load_follows_a_bundle_another_process_replaced(
+    artifact_store: LocalArtifactStore,
+    cache_dir: Path,
+) -> None:
+    """A reinstall keeps the agent id; a cache warm with the old bundle must not serve it."""
+    old_location, new_location = "agent-r/old", "agent-r/new"
+    _store_bundle(artifact_store, old_location)
+    new_bytes = _store_bundle(
+        artifact_store,
+        new_location,
+        {"config.yaml": _MINIMAL_CONFIG.replace("test-agent", "reinstalled")},
+    )
+    stale = AgentCache(artifact_store=artifact_store, cache_dir=cache_dir)
+    assert stale.load("agent-r", old_location).spec.name == "test-agent"
+
+    # The installing process swaps the shared disk entry; this one only sees the new row.
+    AgentCache(artifact_store, cache_dir).replace("agent-r", new_location, new_bytes)
+    assert stale.load("agent-r", new_location).spec.name == "reinstalled"
+
+    # A process with its own disk tier rebuilds from the artifact store.
+    separate = AgentCache(artifact_store, cache_dir.parent / "other-cache")
+    assert separate.load("agent-r", old_location).spec.name == "test-agent"
+    assert separate.load("agent-r", new_location).spec.name == "reinstalled"
+
+
+def test_load_rebuilds_a_disk_entry_without_a_location_marker(
+    artifact_store: LocalArtifactStore,
+    cache_dir: Path,
+) -> None:
+    """An entry extracted before markers existed may hold any bundle, so it is rebuilt."""
+    location = "agent-legacy/abc123"
+    _store_bundle(artifact_store, location)
+    legacy = cache_dir / "agent-legacy"
+    legacy.mkdir(parents=True)
+    (legacy / "config.yaml").write_text(_MINIMAL_CONFIG.replace("test-agent", "stale"))
+
+    loaded = AgentCache(artifact_store, cache_dir).load("agent-legacy", location)
+
+    assert loaded.spec.name == "test-agent"
+    assert AgentCache(artifact_store, cache_dir).load("agent-legacy", location).spec.name == (
+        "test-agent"
+    )
+
+
 def test_load_reextracts_when_disk_entry_lost_config(
     artifact_store: LocalArtifactStore,
     cache_dir: Path,
@@ -671,7 +715,8 @@ def test_concurrent_cold_loads_never_read_an_unpublished_directory(
     monkeypatch: pytest.MonkeyPatch,
     separate_instances: bool,
 ) -> None:
-    """Both loaders see complete bundles, including with separate caches."""
+    """Both loaders see complete bundles, each the one it asked for, including with
+    separate caches."""
     bundle_location = "agent-shared/abc123"
     _store_bundle(artifact_store, bundle_location)
     winner_location = "agent-shared/def456"
@@ -698,7 +743,7 @@ def test_concurrent_cold_loads_never_read_an_unpublished_directory(
             release_extraction.set()
         first_loaded = first.result()
 
-    assert first_loaded.spec.name == second_loaded.spec.name == "winner"
+    assert (first_loaded.spec.name, second_loaded.spec.name) == ("test-agent", "winner")
     assert first_loaded.workdir == second_loaded.workdir == cache_dir / "agent-shared"
     assert yaml.safe_load((first_loaded.workdir / "config.yaml").read_text())["name"] == "winner"
     assert not any((cache_dir / ".staging").iterdir())

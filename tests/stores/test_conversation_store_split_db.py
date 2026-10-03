@@ -593,12 +593,13 @@ def test_update_conversation_archives_without_metadata_row(
 # ── Session-scoped agent cleanup on conversation delete ───────────────
 
 
-def test_delete_conversation_deletes_session_scoped_agent(
+def test_delete_conversation_keeps_its_user_agent(
     omnigent_db: Path,
     conv_db: Path,
     store: SqlAlchemyConversationStore,
 ) -> None:
-    """Deleting a session deletes the session-scoped agent row backing it."""
+    """Deleting a session never deletes the agent it used: agents outlive their
+    sessions and only an explicit agent removal deletes one."""
     created = store.create_session_with_agent(
         agent_id="d6f21846ee961735d477aae06247b99c",
         agent_name="del-agent",
@@ -609,7 +610,7 @@ def test_delete_conversation_deletes_session_scoped_agent(
     assert _count(omnigent_db, "agents") == 1
 
     asyncio.run(store.delete_conversation(created.conversation.id))
-    assert _count(omnigent_db, "agents") == 0
+    assert _col(omnigent_db, "agents", "id") == ["d6f21846ee961735d477aae06247b99c"]
     assert _count(conv_db, "conversations") == 0
 
 

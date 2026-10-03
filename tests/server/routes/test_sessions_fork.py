@@ -1245,6 +1245,38 @@ async def test_fork_switch_binds_target_agent_bundle() -> None:
 
 
 @pytest.mark.asyncio
+async def test_fork_of_a_removed_agent_needs_another_agent() -> None:
+    """A plain fork has nothing to run once the agent is removed; forking into
+    another agent still works."""
+    conv = _make_conversation()
+    conv_store = _ConversationStore(
+        conversations={"e9f8f58523cec9a57d3bdf93be543e8c": conv},
+        items_by_conv={
+            "e9f8f58523cec9a57d3bdf93be543e8c": [
+                _make_item("9980c8a9248139f14f4165e5d53088aa", "Hello")
+            ]
+        },
+    )
+    agent_store = _switch_agent_store()
+    del agent_store._agents["087b7cb7ac30abf4debfaa578d052ec6"]
+    client = TestClient(_build_app(conv_store, agent_store=agent_store))
+
+    plain = client.post("/v1/sessions/e9f8f58523cec9a57d3bdf93be543e8c/fork", json={})
+    assert plain.status_code == 410, plain.text
+    error = plain.json()["error"]
+    assert error["code"] == "session_agent_missing"
+    assert "Fork this session into another agent to continue" in error["message"]
+    assert conv_store.fork_calls == []
+
+    into_codex = client.post(
+        "/v1/sessions/e9f8f58523cec9a57d3bdf93be543e8c/fork",
+        json={"agent_id": "44b4151dd6cdfed6ee19430832398e05"},
+    )
+    assert into_codex.status_code == 201, into_codex.text
+    assert conv_store.fork_calls[0]["agent_id"] == "44b4151dd6cdfed6ee19430832398e05"
+
+
+@pytest.mark.asyncio
 async def test_fork_switch_drops_claude_permission_mode_label() -> None:
     """An agent switch drops the source's claude-native permission-mode label.
 
