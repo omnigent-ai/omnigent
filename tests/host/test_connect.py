@@ -6612,6 +6612,7 @@ class _FakeZygote:
         :param running: Post-failure ``is_running()`` answer.
         """
         self._fail_at = fail_at
+        self._running_after_failure = running
         self._running = running
         self.start_calls = 0
         self.stop_calls = 0
@@ -6625,20 +6626,136 @@ class _FakeZygote:
         """Report the scripted liveness."""
         return self._running
 
+    def is_ready(self) -> bool:
+        """Report readiness for launch-at-request instrumentation."""
+        return self._running
+
     def start(self) -> None:
         """Raise when scripted to fail at start."""
         self.start_calls += 1
         if self._fail_at == "start":
             raise ZygoteUnavailable("scripted start failure")
+        self._running = True
 
     def fork_runner(self, env: dict[str, str], log_path: str, workspace: str) -> object:
         """Always raise — the fork channel is scripted broken."""
         del env, log_path, workspace
+        self._running = self._running_after_failure
         raise ZygoteUnavailable("scripted fork failure")
 
     def stop(self) -> None:
         """Record the reap."""
         self.stop_calls += 1
+
+
+async def test_runner_launch_event_reports_disabled_zygote_as_unready(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A disabled live zygote must not make direct launches look warm."""
+    host = _make_host_process()
+    host._zygote = _FakeZygote(fail_at="none", running=True)  # type: ignore[assignment]
+    host._zygote_disabled = True
+
+    async def _launch(frame: HostLaunchRunnerFrame) -> HostLaunchRunnerResultFrame:
+        return HostLaunchRunnerResultFrame(request_id=frame.request_id, status="launched")
+
+    monkeypatch.setattr(host, "_handle_launch_impl", _launch)
+    frame = HostLaunchRunnerFrame(
+        request_id="req_disabled_zygote",
+        binding_token="synthetic-binding-token",
+        workspace="/synthetic/workspace",
+    )
+
+    caplog.set_level(logging.INFO, logger="omnigent.host.connect")
+    await host._handle_launch(frame)
+
+    launch_record = next(
+        record
+        for record in caplog.records
+        if getattr(record, "event_name", None) == "runner_launch_started"
+    )
+    assert launch_record.attributes["zygote_ready"] is False
+
+
+def test_host_adopts_early_prestarted_zygote() -> None:
+    """HostProcess waits for and owns the daemon's exact zygote manager."""
+    zygote = _FakeZygote(fail_at="none", running=True)
+
+    class _Prestart:
+        manager = zygote
+
+        def __init__(self) -> None:
+            self.wait_calls = 0
+
+        def wait(self) -> _FakeZygote:
+            self.wait_calls += 1
+            return zygote
+
+    prestart = _Prestart()
+    host = HostProcess(
+        HostIdentity(host_id="host_test", name="test"),
+        "https://example.com",
+        interactive_shells=["bash"],
+        zygote_prestart=prestart,  # type: ignore[arg-type]
+    )
+
+    assert host._zygote is zygote
+    assert host._ensure_zygote_started() is zygote
+    assert prestart.wait_calls == 1
+    assert zygote.start_calls == 1
+    assert host._zygote_prestart is None
+
+
+def test_host_restarts_early_zygote_that_died_before_first_launch() -> None:
+    """The first request retains the warm path after a post-prestart crash."""
+    zygote = _FakeZygote(fail_at="none", running=False)
+
+    class _Prestart:
+        manager = zygote
+
+        def __init__(self) -> None:
+            self.wait_calls = 0
+
+        def wait(self) -> _FakeZygote:
+            self.wait_calls += 1
+            return zygote
+
+    prestart = _Prestart()
+    host = HostProcess(
+        HostIdentity(host_id="host_test", name="test"),
+        "https://example.com",
+        interactive_shells=["bash"],
+        zygote_prestart=prestart,  # type: ignore[arg-type]
+    )
+
+    assert host._ensure_zygote_started() is zygote
+    assert prestart.wait_calls == 1
+    assert zygote.start_calls == 1
+    assert zygote.is_running()
+    assert host._zygote_prestart is None
+
+
+def test_host_latches_early_prestart_failure_to_direct_spawn() -> None:
+    """An early import failure keeps the existing per-daemon fallback."""
+    zygote = _FakeZygote(fail_at="none", running=False)
+
+    class _Prestart:
+        manager = zygote
+
+        def wait(self) -> _FakeZygote:
+            raise ZygoteUnavailable("early import failed")
+
+    host = HostProcess(
+        HostIdentity(host_id="host_test", name="test"),
+        "https://example.com",
+        interactive_shells=["bash"],
+        zygote_prestart=_Prestart(),  # type: ignore[arg-type]
+    )
+
+    assert host._ensure_zygote_started() is None
+    assert host._zygote_disabled is True
+    assert zygote.start_calls == 0
 
 
 class _FakeSpawnedProc:
@@ -6708,6 +6825,99 @@ def test_dead_zygote_is_reaped_and_respawnable(
     assert host._zygote_disabled is False
     assert zygote.stop_calls == 1
     # This launch still succeeded, via the direct-spawn fallback.
+    assert len(popen_argvs) == 1
+
+
+def test_adopted_zygote_is_respawned_after_crash(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A consumed early handoff must not bypass crash recovery forever."""
+
+    class _RestartingZygote:
+        pid = 4242
+
+        def __init__(self) -> None:
+            self.running = True
+            self.start_calls = 0
+            self.stop_calls = 0
+            self.fork_calls = 0
+
+        def is_running(self) -> bool:
+            return self.running
+
+        def is_ready(self) -> bool:
+            return self.running
+
+        def start(self) -> None:
+            self.start_calls += 1
+            self.running = True
+
+        def fork_runner(
+            self, env: dict[str, str], log_path: str, workspace: str
+        ) -> _FakeSpawnedProc:
+            del env, log_path, workspace
+            self.fork_calls += 1
+            if self.fork_calls == 1:
+                self.running = False
+                raise ZygoteUnavailable("scripted zygote crash")
+            return _FakeSpawnedProc()
+
+        def stop(self) -> None:
+            self.stop_calls += 1
+            self.running = False
+
+    zygote = _RestartingZygote()
+
+    class _Prestart:
+        manager = zygote
+
+        def __init__(self) -> None:
+            self.wait_calls = 0
+
+        def wait(self) -> _RestartingZygote:
+            self.wait_calls += 1
+            return zygote
+
+    prestart = _Prestart()
+    host = HostProcess(
+        HostIdentity(host_id="host_test", name="test"),
+        "https://example.com",
+        interactive_shells=["bash"],
+        zygote_prestart=prestart,  # type: ignore[arg-type]
+    )
+    popen_argvs: list[list[str]] = []
+    log_path = tmp_path / "runner.log"
+
+    def _fake_open_log(
+        destination: str,
+        *,
+        root: object = None,
+        prefix: str | None = None,
+    ) -> tuple[Path, object]:
+        del destination, root, prefix
+        return log_path, open(log_path, "ab", buffering=0)
+
+    def _fake_popen(argv: list[str], **kwargs: object) -> _FakeSpawnedProc:
+        del kwargs
+        popen_argvs.append(list(argv))
+        return _FakeSpawnedProc()
+
+    monkeypatch.setattr("omnigent.host.connect.open_process_log_file", _fake_open_log)
+    monkeypatch.setattr("omnigent.host.connect.subprocess.Popen", _fake_popen)
+
+    first, _ = host._spawn_runner_proc({}, "first", tmp_path)
+    assert isinstance(first, _FakeSpawnedProc)
+    assert prestart.wait_calls == 1
+    assert zygote.start_calls == 1
+    assert zygote.stop_calls == 1
+    assert len(popen_argvs) == 1
+
+    second, _ = host._spawn_runner_proc({}, "second", tmp_path)
+    assert isinstance(second, _FakeSpawnedProc)
+    assert prestart.wait_calls == 1
+    assert zygote.start_calls == 2
+    assert zygote.fork_calls == 2
     assert len(popen_argvs) == 1
 
 

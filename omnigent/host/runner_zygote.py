@@ -39,9 +39,10 @@ import time
 from pathlib import Path
 from typing import BinaryIO
 
+from omnigent._platform import IS_POSIX
 from omnigent.inner import _proc
-from omnigent.process_logging import child_logging_popen_kwargs
-from omnigent.runner._zygote import ZYGOTE_CONTROL_FD_ENV_VAR
+from omnigent.process_logging import child_logging_popen_kwargs, env_truthy
+from omnigent.runner._zygote import ZYGOTE_CONTROL_FD_ENV_VAR, ZYGOTE_ENABLED_ENV_VAR
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +63,90 @@ class ZygoteUnavailable(RuntimeError):
 
     The daemon catches this and falls back to a direct ``Popen`` launch.
     """
+
+
+class ZygotePrestart:
+    """A runner zygote importing concurrently with host bootstrap.
+
+    The background daemon creates this immediately after it wins the lifecycle
+    claim, before importing the full host connection graph.  The later
+    :class:`~omnigent.host.connect.HostProcess` adopts :attr:`manager`; no
+    second zygote is created.
+
+    :param manager: Manager to start and later transfer to the host process.
+    """
+
+    def __init__(self, manager: ZygoteManager) -> None:
+        self.manager = manager
+        self._done = threading.Event()
+        self._error: ZygoteUnavailable | None = None
+        self._thread = threading.Thread(
+            target=self._run,
+            name="host-zygote-early-prestart",
+            daemon=True,
+        )
+
+    def start(self) -> None:
+        """Begin importing the zygote graph in the background."""
+        self._thread.start()
+
+    def wait(self) -> ZygoteManager:
+        """Wait for import readiness and return the adopted manager.
+
+        :returns: The ready manager.
+        :raises ZygoteUnavailable: If the background start failed.
+        """
+        self._done.wait()
+        if self._error is not None:
+            raise self._error
+        return self.manager
+
+    def stop(self) -> None:
+        """Wait for startup to settle, then stop the zygote."""
+        self._done.wait()
+        self.manager.stop()
+
+    def _run(self) -> None:
+        """Start the manager and retain a failure for the adopting host."""
+        try:
+            self.manager.start()
+        except ZygoteUnavailable as exc:
+            self._error = exc
+        except Exception as exc:  # noqa: BLE001 - preserve direct-spawn fallback
+            error = ZygoteUnavailable(f"unexpected early zygote start failure: {exc}")
+            error.__cause__ = exc
+            self._error = error
+        finally:
+            self._done.set()
+
+
+def begin_early_zygote_prestart() -> ZygotePrestart | None:
+    """Start the daemon's runner zygote before the full host graph imports.
+
+    The caller must already own the daemon lifecycle claim.  Returning ``None``
+    preserves the existing direct-spawn path on non-POSIX systems and when the
+    operator opts out.
+
+    :returns: An in-flight prestart to pass into ``run_host_process``, or
+        ``None`` when zygote use is disabled.
+    """
+    optout = os.environ.get(ZYGOTE_ENABLED_ENV_VAR)
+    if not IS_POSIX or (optout is not None and not env_truthy(optout)):
+        return None
+    prestart = ZygotePrestart(ZygoteManager(startup_origin="daemon_claim"))
+    try:
+        prestart.start()
+    except RuntimeError as exc:
+        # Thread creation itself can fail before ``_run`` gets a chance to
+        # capture startup errors or set ``_done``.  The prewarm is optional;
+        # leave its unstarted manager for collection and let HostProcess use
+        # the normal lazy-start/direct-spawn fallback path.
+        logger.warning(
+            "Runner zygote early prestart thread failed (%s); falling back to host startup",
+            exc,
+        )
+        return None
+    return prestart
 
 
 class ZygoteRunnerProc:
@@ -136,6 +221,8 @@ class ZygoteManager:
     :param python_executable: Interpreter to launch the zygote with; defaults
         to ``sys.executable``.
     :param log_path: Optional file for the zygote's own stdout/stderr.
+    :param startup_origin: Bootstrap phase that created this manager, recorded
+        on readiness events.
     """
 
     def __init__(
@@ -143,12 +230,15 @@ class ZygoteManager:
         *,
         python_executable: str | None = None,
         log_path: Path | None = None,
+        startup_origin: str = "host_run",
     ) -> None:
         self._python = python_executable or sys.executable
         self._log_path = log_path
+        self._startup_origin = startup_origin
         self._proc: subprocess.Popen[bytes] | None = None
         self._sock: socket.socket | None = None
         self._lock = threading.Lock()
+        self._ready = False
 
     @property
     def pid(self) -> int | None:
@@ -169,6 +259,10 @@ class ZygoteManager:
         """Whether the zygote process is started and has not exited."""
         return self._proc is not None and self._proc.poll() is None
 
+    def is_ready(self) -> bool:
+        """Whether the zygote completed its imports and answered the ping."""
+        return self._ready and self.is_running()
+
     def start(self) -> None:
         """Spawn the zygote if it is not already running.
 
@@ -182,6 +276,8 @@ class ZygoteManager:
         with self._lock:
             if self._proc is not None and self._proc.poll() is None:
                 return
+            started_ns = time.monotonic_ns()
+            self._ready = False
             parent_sock, child_sock = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
             try:
                 proc = self._spawn_zygote_process(child_sock.fileno())
@@ -194,6 +290,22 @@ class ZygoteManager:
             parent_sock.settimeout(_CONTROL_TIMEOUT_S)
             self._proc = proc
             self._sock = parent_sock
+            spawned_ns = time.monotonic_ns()
+            # Imported after spawning so debug-sink setup overlaps the child
+            # importing the runner graph instead of delaying early prestart.
+            from omnigent.debug_logging import debug_event
+
+            logger.info(
+                "Runner zygote spawned (pid=%s, origin=%s)",
+                proc.pid,
+                self._startup_origin,
+                extra=debug_event(
+                    "runner_zygote_spawned",
+                    zygote_pid=proc.pid,
+                    startup_origin=self._startup_origin,
+                    monotonic_ns=spawned_ns,
+                ),
+            )
 
         # Confirm the zygote is answering before the caller relies on it. Any
         # failure here (bad pong, or the exchange itself raising on a timeout /
@@ -208,6 +320,21 @@ class ZygoteManager:
         if not answered:
             self.stop()
             raise ZygoteUnavailable("runner zygote did not answer ping")
+        self._ready = True
+        ready_ns = time.monotonic_ns()
+        logger.info(
+            "Runner zygote import ready (pid=%s, origin=%s, duration_ms=%.1f)",
+            proc.pid,
+            self._startup_origin,
+            (ready_ns - started_ns) / 1_000_000,
+            extra=debug_event(
+                "runner_zygote_ready",
+                zygote_pid=proc.pid,
+                startup_origin=self._startup_origin,
+                monotonic_ns=ready_ns,
+                duration_ms=f"{(ready_ns - started_ns) / 1_000_000:.1f}",
+            ),
+        )
 
     def _spawn_zygote_process(self, child_fd: int) -> subprocess.Popen[bytes]:
         """Popen the zygote interpreter, handing it *child_fd* as its control fd.
@@ -264,6 +391,7 @@ class ZygoteManager:
         :returns: A :class:`ZygoteRunnerProc` for the forked runner.
         :raises ZygoteUnavailable: If the zygote is down or reports a fork error.
         """
+        started_ns = time.monotonic_ns()
         reply = self._exchange(
             {
                 "cmd": "fork",
@@ -277,6 +405,22 @@ class ZygoteManager:
         pid = reply.get("pid")
         if not isinstance(pid, int):
             raise ZygoteUnavailable(f"zygote returned no pid: {reply!r}")
+        completed_ns = time.monotonic_ns()
+        from omnigent.debug_logging import debug_event
+
+        logger.info(
+            "Runner zygote fork completed (zygote pid=%s, runner pid=%s, duration_ms=%.1f)",
+            self.pid,
+            pid,
+            (completed_ns - started_ns) / 1_000_000,
+            extra=debug_event(
+                "runner_zygote_fork_completed",
+                zygote_pid=self.pid,
+                runner_pid=pid,
+                monotonic_ns=completed_ns,
+                duration_ms=f"{(completed_ns - started_ns) / 1_000_000:.1f}",
+            ),
+        )
         return ZygoteRunnerProc(pid, self)
 
     def poll(self, pid: int) -> int | None:
@@ -305,6 +449,7 @@ class ZygoteManager:
         watchdog, so no runner is left stranded.
         """
         with self._lock:
+            self._ready = False
             if self._sock is not None:
                 try:
                     self._sock.close()

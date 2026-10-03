@@ -118,7 +118,12 @@ from omnigent.host.git_worktree import (
 )
 from omnigent.host.identity import HostIdentity, load_or_create_host_identity
 from omnigent.host.maintenance import HostMaintenanceJanitor
-from omnigent.host.runner_zygote import ZygoteManager, ZygoteRunnerProc, ZygoteUnavailable
+from omnigent.host.runner_zygote import (
+    ZygoteManager,
+    ZygotePrestart,
+    ZygoteRunnerProc,
+    ZygoteUnavailable,
+)
 from omnigent.inner import _proc
 from omnigent.onboarding.harness_auth import (
     adopt_env_credential,
@@ -1088,6 +1093,7 @@ class HostProcess:
         server_url: str,
         lifecycle_lock: DaemonLifecycleLock | None = None,
         interactive_shells: list[str] | None = None,
+        zygote_prestart: ZygotePrestart | None = None,
     ) -> None:
         """Initialize the host process.
 
@@ -1098,6 +1104,8 @@ class HostProcess:
             and self-terminates once the record is deleted or reassigned.
         :param interactive_shells: Optional shell inventory override for tests.
             By default the host discovers its installed shells once at startup.
+        :param zygote_prestart: Zygote import started by the elected background
+            daemon before this module loaded. The host adopts its manager.
         """
         self._identity = identity
         self._server_url = server_url.rstrip("/")
@@ -1225,7 +1233,12 @@ class HostProcess:
         self._zygote_enabled = IS_POSIX and not (
             _zygote_optout is not None and not env_truthy(_zygote_optout)
         )
-        self._zygote: ZygoteManager | None = ZygoteManager() if self._zygote_enabled else None
+        self._zygote_prestart = zygote_prestart
+        self._zygote: ZygoteManager | None = (
+            zygote_prestart.manager
+            if zygote_prestart is not None
+            else (ZygoteManager() if self._zygote_enabled else None)
+        )
         self._zygote_disabled = False
         # Warms the zygote at daemon start so the first launch doesn't pay
         # its one-time import; see run().
@@ -1777,6 +1790,11 @@ class HostProcess:
                     stage="runner_launch",
                     host_request_id=frame.request_id,
                     harness=frame.harness,
+                    zygote_ready=(
+                        self._zygote is not None
+                        and not self._zygote_disabled
+                        and self._zygote.is_ready()
+                    ),
                 ),
             )
             return await self._handle_launch_impl(frame)
@@ -2012,7 +2030,23 @@ class HostProcess:
         if zygote is None or self._zygote_disabled:
             return None
         try:
-            zygote.start()
+            prestart = self._zygote_prestart
+            if prestart is not None:
+                prestart.wait()
+                # Re-enter the manager's idempotent start path after the
+                # handoff.  Usually this is a no-op, but it respawns a zygote
+                # that completed prestart and then died before the first
+                # runner request instead of sacrificing that request to the
+                # direct-spawn fallback.
+                zygote.start()
+                # The early prestart is a one-time handoff, not an alternate
+                # lifecycle manager.  Consume it after adoption so a zygote
+                # that later dies reaches ``ZygoteManager.start()`` and can be
+                # respawned on the following launch.
+                if self._zygote_prestart is prestart:
+                    self._zygote_prestart = None
+            else:
+                zygote.start()
         except ZygoteUnavailable as exc:
             # Spawning the zygote itself is broken; retrying on every
             # launch would only add a doomed spawn to each, so disable
@@ -4247,6 +4281,15 @@ class HostProcess:
         self._refused_streak = 0
         self._transient_404_streak = 0
         self._conn_upgrade_accepted = True
+        _logger.info(
+            "Host tunnel WebSocket upgrade accepted",
+            extra=debug_event(
+                "host_tunnel_upgrade_accepted",
+                host_id=self._identity.host_id,
+                reconnect=reconnect,
+                monotonic_ns=time.monotonic_ns(),
+            ),
+        )
         # A completed upgrade proves the endpoint healthy — the next drop's
         # prompt reconnect is wanted again.
         self._recycle_streak = 0
@@ -4430,6 +4473,15 @@ class HostProcess:
         except Exception as exc:
             raise HostConnectError(f"Could not encode host.hello: {exc}") from exc
         await ws.send(encoded_hello)
+        _logger.info(
+            "Host hello sent",
+            extra=debug_event(
+                "host_hello_sent",
+                host_id=self._identity.host_id,
+                runner_count=len(hello.runners),
+                monotonic_ns=time.monotonic_ns(),
+            ),
+        )
         # A completed failed boot probe gets another best-effort chance only
         # after registration reaches the server. Keeping this out of the outer
         # connection-attempt loop avoids repeatedly spawning native probes while
@@ -4828,6 +4880,7 @@ def run_host_process(
     daemon_target: str | None = None,
     lifecycle_lock: DaemonLifecycleLock | None = None,
     interactive_shells: list[str] | None = None,
+    zygote_prestart: ZygotePrestart | None = None,
 ) -> None:
     """Entry point for ``omnigent host``.
 
@@ -4847,6 +4900,8 @@ def run_host_process(
         for the host process lifetime instead of acquiring another handle.
     :param interactive_shells: Optional shell inventory override for tests.
         By default the host discovers its installed shells once at startup.
+    :param zygote_prestart: Optional early zygote import owned by the elected
+        background daemon. The constructed host adopts the same manager.
     :raises SystemExit: With :data:`HOST_FATAL_EXIT_CODE` when the tunnel
         fails permanently (auth / authorization / outdated server, or a
         loopback server that is gone). The actionable cause is printed
@@ -4935,6 +4990,7 @@ def run_host_process(
         server_url,
         lifecycle_lock=lifecycle_lock,
         interactive_shells=interactive_shells,
+        zygote_prestart=zygote_prestart,
     )
     try:
         asyncio.run(host.run())
