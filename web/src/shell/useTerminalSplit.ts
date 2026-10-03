@@ -13,7 +13,7 @@ import { useTerminalStatuses } from "./useTerminalStatuses";
 // the runner, which could take the runner down. Unselected terminals now
 // derive their badge from the resource ``running`` flag alone (see
 // ``deriveTerminalStatus``).
-export function useTerminalSplit(conversationId: string) {
+export function useTerminalSplit(conversationId: string, splitEnabled: boolean) {
   const { terminals: allTerminals } = useTerminals(conversationId);
   // Inventory view: the agent's own terminal (SDK REPL / native vendor
   // pane) backs the pill's Terminal view and must not appear as a
@@ -34,7 +34,7 @@ export function useTerminalSplit(conversationId: string) {
     width: listWidth,
     containerRef: splitRef,
     handleProps: columnHandleProps,
-  } = useResizableColumn();
+  } = useResizableColumn(undefined, undefined, undefined, splitEnabled && activeTerminal !== null);
 
   // Clear activeKey if the selected terminal is removed. Do NOT
   // auto-select — null is the intentional "no terminal selected" state.
