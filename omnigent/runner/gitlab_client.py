@@ -21,6 +21,10 @@ class GitLabError(ValueError):
     """A CLI/API operation failed without exposing CLI output or credentials."""
 
 
+class GitLabTimeoutError(GitLabError):
+    """A request exhausted its shared deadline or timed out in glab."""
+
+
 class GitLabClient:
     """Host-scoped, read-only requests bounded by one panel request's deadline."""
 
@@ -38,7 +42,7 @@ class GitLabClient:
     def _run(self, args: list[str]) -> Any:
         remaining = self.deadline - time.monotonic()
         if remaining <= 0:
-            raise TimeoutError("GitLab request timed out. Refresh to retry.")
+            raise GitLabTimeoutError("GitLab request timed out. Refresh to retry.")
         try:
             result = subprocess.run(
                 ["glab", *args],
@@ -55,7 +59,7 @@ class GitLabClient:
                 },
             )
         except subprocess.TimeoutExpired as exc:
-            raise TimeoutError("GitLab request timed out. Refresh to retry.") from exc
+            raise GitLabTimeoutError("GitLab request timed out. Refresh to retry.") from exc
         except OSError as exc:
             raise GitLabError(
                 "Install glab on the execution host, then sign in to this GitLab instance."
@@ -98,7 +102,7 @@ class GitLabClient:
                     not isinstance(value, dict) for value in batch
                 ):
                     raise GitLabError("GitLab returned an invalid list response.")
-            except (GitLabError, TimeoutError):
+            except GitLabError:
                 if values:
                     return values, True
                 raise

@@ -16,6 +16,7 @@ from omnigent.runner.session_prs import PullRequestRef, SessionPrRegistry
 URL = "https://gitlab.com/team/sub/project/-/merge_requests/7"
 OTHER = "https://gitlab.com/team/sub/project/-/merge_requests/99"
 GH_URL = "https://github.com/team/project/pull/8"
+PRIVATE_URL = URL.replace("gitlab.com", "git.example.test:8443")
 
 
 def payload(url: str = URL, iid: int = 7) -> dict:
@@ -74,7 +75,7 @@ def test_create_tracks_successful_result_not_body_urls(command: str) -> None:
     ["update", "merge", "accept", "close", "reopen", "approve", "revoke", "rebase", "delete"],
 )
 def test_explicit_mutation_tracks_iid_without_requiring_output(action: str) -> None:
-    refs, created = shell(f"glab mr {action} 7 -R team/sub/project", "")
+    refs, created = shell(f"GITLAB_HOST=gitlab.com glab mr {action} 7 -R team/sub/project", "")
     assert [ref.url for ref in refs] == [URL] and not created
 
 
@@ -88,7 +89,10 @@ def test_explicit_mutation_tracks_iid_without_requiring_output(action: str) -> N
     ],
 )
 def test_cli_short_flags_repo_urls_and_api_writes(command: str) -> None:
-    assert shell(command, "") == ([PullRequestRef.from_url(URL)], False)
+    assert shell(f"GITLAB_HOST=gitlab.com {command}", "") == (
+        [PullRequestRef.from_url(URL)],
+        False,
+    )
 
 
 def test_private_authority_and_nested_namespace_are_preserved() -> None:
@@ -98,10 +102,116 @@ def test_private_authority_and_nested_namespace_are_preserved() -> None:
         False,
     )
     url = URL.replace("team/sub/project", "team.name/sub/project")
-    assert shell("glab mr update 7 -R team.name/sub/project", "") == (
+    assert shell("GITLAB_HOST=gitlab.com glab mr update 7 -R team.name/sub/project", "") == (
         [PullRequestRef.from_url(url)],
         False,
     )
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "GITLAB_HOST=gitlab.com glab mr update 7 -R team/sub/project "
+        "-d GITLAB_HOST=git.example.test:8443",
+        "GITLAB_HOST=gitlab.com glab mr update 7 -R team/sub/project "
+        "--description 'GLAB_HOST=git.example.test:8443'",
+        "GITLAB_HOST=gitlab.com glab mr update 7 -R team/sub/project "
+        "--title GITLAB_HOST=git.example.test:8443",
+        "env GLAB_NO_PROMPT=1 GITLAB_HOST=gitlab.com glab mr update 7 -R team/sub/project "
+        "-d GITLAB_HOST=git.example.test:8443",
+        "bash -lc 'GITLAB_HOST=gitlab.com glab mr update 7 -R team/sub/project "
+        "-d GITLAB_HOST=git.example.test:8443'",
+    ],
+)
+def test_assignment_text_in_arguments_does_not_change_host(command: str) -> None:
+    assert shell(command, "") == ([PullRequestRef.from_url(URL)], False)
+
+
+@pytest.mark.parametrize(
+    "prefix",
+    [
+        "GITLAB_HOST=git.example.test:8443",
+        "env GITLAB_HOST=git.example.test:8443",
+        "/usr/bin/env GLAB_NO_PROMPT=1 GITLAB_HOST=git.example.test:8443",
+    ],
+)
+def test_environment_prefix_sets_host_without_reading_description(prefix: str) -> None:
+    url = URL.replace("gitlab.com", "git.example.test:8443")
+    command = f"{prefix} glab mr update 7 -R team/sub/project -d GITLAB_HOST=gitlab.com"
+    assert shell(command, "") == ([PullRequestRef.from_url(url)], False)
+
+
+def test_hostname_flag_precedes_environment_prefix() -> None:
+    command = (
+        "GITLAB_HOST=git.example.test:8443 glab mr update 7 "
+        "-R team/sub/project --hostname gitlab.com"
+    )
+    assert shell(command, "") == ([PullRequestRef.from_url(URL)], False)
+
+
+@pytest.mark.parametrize(
+    ("prefix", "url"),
+    [
+        ("GITLAB_HOST=gitlab.com GITLAB_HOST=git.example.test:8443", PRIVATE_URL),
+        ("GITLAB_HOST=git.example.test:8443 GITLAB_HOST=gitlab.com", URL),
+        ("GLAB_HOST=git.example.test:8443 GITLAB_HOST=gitlab.com", URL),
+        ("GITLAB_HOST=gitlab.com GLAB_HOST=git.example.test:8443", URL),
+        ("env GITLAB_HOST=gitlab.com GITLAB_HOST=git.example.test:8443", PRIVATE_URL),
+    ],
+)
+def test_last_gitlab_host_assignment_controls_the_cli_target(prefix: str, url: str) -> None:
+    assert shell(f"{prefix} glab mr update 7 -R team/sub/project", "") == (
+        [PullRequestRef.from_url(url)],
+        False,
+    )
+
+
+@pytest.mark.parametrize(
+    ("prefix", "ambient"),
+    [
+        ("", None),
+        ("", "gitlab.com"),
+        ("GLAB_HOST=git.example.test:8443", None),
+        ("GITLAB_HOST=", "gitlab.com"),
+        ("env GITLAB_HOST=", "gitlab.com"),
+        ("env -i", "gitlab.com"),
+        ("env --ignore-environment", "gitlab.com"),
+        ("env -u GITLAB_HOST", "gitlab.com"),
+        ("env --unset=GITLAB_HOST", "gitlab.com"),
+        ("/usr/bin/env -u UNUSED", "gitlab.com"),
+    ],
+)
+@pytest.mark.parametrize(
+    "invocation",
+    [
+        "glab mr update 7 -R team/sub/project",
+        "glab api -XPUT projects/team%2Fsub%2Fproject/merge_requests/7 -f title=T",
+        "bash -lc 'glab mr update 7 -R team/sub/project'",
+    ],
+)
+def test_unknown_cli_host_requires_a_returned_identity(
+    prefix: str, ambient: str | None, invocation: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    if ambient:
+        monkeypatch.setenv("GITLAB_HOST", ambient)
+    monkeypatch.setenv("GLAB_HOST", "gitlab.com")
+    command = f"{prefix} {invocation}"
+    assert shell(command, "") == ([], False)
+    assert shell(command, payload(PRIVATE_URL)) == ([PullRequestRef.from_url(PRIVATE_URL)], False)
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        f"glab mr update {PRIVATE_URL}",
+        "glab mr update 7 -R https://git.example.test:8443/team/sub/project",
+        "glab mr update 7 -R git@git.example.test:team/sub/project.git",
+        "glab mr update 7 -R git.example.test:8443/team/sub/project",
+        "env -i glab mr update 7 -R team/sub/project --hostname git.example.test:8443",
+    ],
+)
+def test_explicit_authority_does_not_need_a_cli_host_default(command: str) -> None:
+    assert shell(command, "") == ([PullRequestRef.from_url(PRIVATE_URL)], False)
 
 
 @pytest.mark.parametrize(
@@ -153,7 +263,8 @@ def test_body_text_and_global_ids_never_become_mr_identity(output: object) -> No
 
 def test_mixed_read_write_output_only_records_explicit_write_target() -> None:
     assert shell(
-        "glab mr update 7 -R team/sub/project && glab mr view 99", payload(OTHER, 99)
+        "GITLAB_HOST=gitlab.com glab mr update 7 -R team/sub/project && glab mr view 99",
+        payload(OTHER, 99),
     ) == ([PullRequestRef.from_url(URL)], False)
     assert shell("glab mr create && gh pr view 8", {"url": GH_URL}) == ([], True)
     assert shell("gh pr create --title T --body B && glab mr view 7", payload()) == ([], True)
@@ -182,7 +293,7 @@ def test_mcp_create_uses_result_identity_and_checks_project() -> None:
 
 
 def test_mcp_update_and_nontracking_tools() -> None:
-    args = {"project_id": "team/sub/project", "merge_request_iid": 7}
+    args = {"project_id": "team/sub/project", "merge_request_iid": 7, "hostname": "gitlab.com"}
     assert extract_prs("mcp__gitlab__update_merge_request", args, {}) == (
         [PullRequestRef.from_url(URL)],
         False,
@@ -208,7 +319,9 @@ def test_observed_mr_persists_and_removal_survives_replay() -> None:
 
 
 def test_known_target_cannot_gain_an_unrelated_output_mr() -> None:
-    assert shell("glab mr update 7 -R team/sub/project", payload(OTHER, 99)) == (
+    assert shell(
+        "GITLAB_HOST=gitlab.com glab mr update 7 -R team/sub/project", payload(OTHER, 99)
+    ) == (
         [PullRequestRef.from_url(URL)],
         False,
     )
@@ -223,3 +336,48 @@ def test_mcp_fork_creation_uses_explicit_target_project() -> None:
     assert extract_prs(
         "mcp__gitlab__create_merge_request", {"project_id": 10, "target_project_id": 20}, result
     ) == ([PullRequestRef.from_url(URL)], True)
+
+
+@pytest.mark.parametrize("ambient", [None, "GITLAB_HOST", "GLAB_HOST"])
+@pytest.mark.parametrize("project", ["team/sub/project", 10])
+def test_mcp_host_comes_from_result_not_cli_defaults(
+    ambient: str | None, project: str | int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    if ambient:
+        monkeypatch.setenv(ambient, "gitlab.com")
+    args = {"project_id": project, "merge_request_iid": 7}
+    assert extract_prs("mcp__gitlab__update_merge_request", args, {}) == ([], False)
+    assert extract_prs("mcp__gitlab__update_merge_request", args, payload(PRIVATE_URL)) == (
+        [PullRequestRef.from_url(PRIVATE_URL)],
+        False,
+    )
+
+
+@pytest.mark.parametrize(
+    "authority",
+    [
+        {"hostname": "git.example.test:8443"},
+        {"host": "https://git.example.test:8443"},
+        {"project_id": "https://git.example.test:8443/team/sub/project"},
+    ],
+)
+def test_mcp_explicit_authority_supports_mutations_without_output(authority: dict) -> None:
+    args = {"project_id": "team/sub/project", "merge_request_iid": 7, **authority}
+    assert extract_prs("mcp__gitlab__update_merge_request", args, {}) == (
+        [PullRequestRef.from_url(PRIVATE_URL)],
+        False,
+    )
+
+
+@pytest.mark.parametrize(
+    "result",
+    [
+        payload(PRIVATE_URL, 8),
+        payload(PRIVATE_URL.replace("team/sub/project", "other/project")),
+        payload(PRIVATE_URL.replace("git.example.test:8443", "untrusted.example")),
+        {"description": PRIVATE_URL},
+    ],
+)
+def test_mcp_unknown_host_still_checks_project_iid_and_instance_trust(result: dict) -> None:
+    args = {"project_id": "team/sub/project", "merge_request_iid": 7}
+    assert extract_prs("mcp__gitlab__update_merge_request", args, result) == ([], False)

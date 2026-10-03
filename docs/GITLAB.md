@@ -23,9 +23,9 @@ GITLAB_HOST=git.example.com:8443 glab auth login --api-host git.example.com:8443
 ```
 
 The setting accepts comma-separated hostnames, hostnames with ports, or HTTPS
-origins. `GITLAB_HOST` and `GLAB_HOST` also identify a trusted instance.
-GitLab.com is supported by default. Nested groups and project-local MR numbers
-are preserved:
+origins. `GITLAB_HOST` also selects the instance used by `glab`; `GLAB_HOST`
+only identifies a trusted instance for Omnigent. GitLab.com is supported by
+default. Nested groups and project-local MR numbers are preserved:
 
 ```text
 https://git.example.com:8443/company/team/project.git
@@ -58,7 +58,10 @@ explicit target or result. Supported GitLab MCP mutation tools are tracked too.
 Read commands, comments, failed commands, and URLs quoted inside descriptions
 do not create associations. For MCP fork creation, supply `target_project_id`
 when the tool supports it; ambiguous source-project paths may require linking
-the resulting MR manually. Tracking does not make API calls.
+the resulting MR manually. Silent CLI commands should use a full MR or repository
+URL, or an inline `GITLAB_HOST` assignment. Tracking does not guess configured
+CLI or MCP hosts: without an explicit host, it needs the returned MR identity
+or manual linking. Tracking does not make API calls.
 
 ## Limits and verification
 

@@ -168,7 +168,7 @@ def _resolved(
             if mr.get("source_project_id") != source_id or mr.get("source_branch") != branch:
                 raise ValueError("The merge request changed. Refresh to retry.")
             return client, selected, mr
-        except (ValueError, TimeoutError) as exc:
+        except ValueError as exc:
             failure = exc
     if failure is not None:
         raise failure
@@ -205,7 +205,7 @@ def _optional_pages(
 ) -> tuple[list[dict[str, Any]], bool]:
     try:
         values, partial = client.pages(path, **query)
-    except (ValueError, TimeoutError):
+    except ValueError:
         values, partial = [], True
     if partial:
         warnings.append(f"GitLab {label} are incomplete. Refresh to retry.")
@@ -306,7 +306,7 @@ def _info(root: str, reference: PullRequestRef | None = None) -> dict[str, Any]:
             info.update(repo={"name_with_owner": ref.repository}, selected_pr_url=ref.url)
             info["pr"] = _pr_payload(client, ref, mr, info["warnings"])
             info["base_ref"] = info["pr"]["base_ref"]
-    except (ValueError, TimeoutError) as exc:
+    except ValueError as exc:
         info["auth"]["hint"] = str(exc)
         info["warnings"].append(str(exc))
     return info
@@ -382,10 +382,12 @@ class GitLabPullRequests:
     def pr_title(
         self, root: str, reference: PullRequestRef, deadline: float
     ) -> tuple[str | None, bool]:
+        from omnigent.runner.gitlab_client import GitLabTimeoutError
+
         try:
             title = _mr(_client(root, reference.host, deadline), reference).get("title")
             return (title.strip() or None if isinstance(title, str) else None), False
-        except TimeoutError:
+        except GitLabTimeoutError:
             return None, True
         except ValueError:
             return None, False

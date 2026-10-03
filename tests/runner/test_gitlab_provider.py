@@ -12,7 +12,7 @@ import pytest
 
 from omnigent.git_providers import reset_for_tests
 from omnigent.runner.git_providers import gitlab as module
-from omnigent.runner.gitlab_client import GitLabClient, GitLabError
+from omnigent.runner.gitlab_client import GitLabClient, GitLabError, GitLabTimeoutError
 from omnigent.runner.session_prs import PullRequestRef
 
 URL = "https://gitlab.com/team/sub/project/-/merge_requests/7"
@@ -294,7 +294,7 @@ def test_explicit_reference_bypasses_unavailable_workspace_inference(
 
 
 def test_optional_failures_keep_mr_and_report_partial_data(root: str, api: Mock) -> None:
-    api.pages.side_effect = TimeoutError("expired")
+    api.pages.side_effect = GitLabTimeoutError("expired")
     info = module.PULL_REQUESTS.reference_info(root, ref())
     assert info["auth"]["authenticated"] and info["pr"]["number"] == 7
     assert info["pr"]["comments_partial"] and info["pr"]["checks"]["partial"]
@@ -389,10 +389,32 @@ def test_file_access_failure_is_not_reported_as_deleted(root: str, api: Mock, mr
 
 
 def test_title_timeout_contract(root: str, api: Mock) -> None:
-    api.object.side_effect = TimeoutError()
+    api.object.side_effect = GitLabTimeoutError()
     assert module.PULL_REQUESTS.pr_title(root, ref(), time.monotonic()) == (None, True)
     api.object.side_effect = GitLabError("denied")
     assert module.PULL_REQUESTS.pr_title(root, ref(), time.monotonic()) == (None, False)
+
+
+@pytest.mark.parametrize("expired", [True, False], ids=["deadline", "subprocess"])
+@pytest.mark.parametrize(
+    "operation", ["verify_accessible", "changed_files", "pr_diff", "file_diff"]
+)
+def test_public_timeouts_are_actionable_and_titles_keep_timeout_signal(
+    root: str, monkeypatch: pytest.MonkeyPatch, operation: str, expired: bool
+) -> None:
+    from omnigent.runner import gitlab_client
+
+    monkeypatch.setattr(gitlab_client, "REQUEST_BUDGET_SECONDS", -1 if expired else 8)
+    run = Mock(side_effect=subprocess.TimeoutExpired(["glab"], 8))
+    monkeypatch.setattr(gitlab_client.subprocess, "run", run)
+    with pytest.raises(ValueError, match=r"GitLab request timed out\. Refresh to retry\."):
+        if operation == "file_diff":
+            file_diff(root)
+        else:
+            getattr(module.PULL_REQUESTS, operation)(root, ref())
+    deadline = time.monotonic() + (-1 if expired else 8)
+    assert module.PULL_REQUESTS.pr_title(root, ref(), deadline) == (None, True)
+    assert run.call_count == (0 if expired else 2)
 
 
 def test_outside_checkout_still_serves_manually_linked_mr(tmp_path: Path, api: Mock) -> None:

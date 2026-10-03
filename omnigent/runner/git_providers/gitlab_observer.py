@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 import re
 from collections.abc import Mapping, Sequence
 from pathlib import PurePath
@@ -141,7 +140,7 @@ def reference(value: object) -> PullRequestRef | None:
     return PullRequestRef(**vars(parsed)) if parsed else None
 
 
-def _target(project: object, iid: object, host: str) -> PullRequestRef | None:
+def _target(project: object, iid: object, host: str | None) -> PullRequestRef | None:
     if not isinstance(project, str) or not isinstance(iid, (str, int)) or isinstance(iid, bool):
         return None
     project = unquote(project).removesuffix(".git").strip("/")
@@ -152,7 +151,24 @@ def _target(project: object, iid: object, host: str) -> PullRequestRef | None:
         first, separator, rest = project.partition("/")
         if separator and GitLabProvider().matches_host(first, EnvInstances()):
             host, project = first, rest
+    if host is None:
+        return None
     return reference(f"https://{host}/{project}/-/merge_requests/{str(iid).lstrip('!')}")
+
+
+def _shell_host(segment: ShellSegment, hostname: str | None) -> str | None:
+    if hostname is not None:
+        return instance_authority(hostname)
+    host = ""
+    for token in segment.raw_tokens[: -len(segment.invocation_tokens)]:
+        if token.startswith("GITLAB_HOST="):
+            host = token.split("=", 1)[1]
+        elif re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", token) or PurePath(token).name == "env":
+            continue
+        else:
+            # Wrapper options may clear or replace the inherited environment.
+            return None
+    return instance_authority(host) if host else None
 
 
 def shell_pr_operations(segments: Sequence[ShellSegment]) -> list[ShellPrOp]:
@@ -169,15 +185,7 @@ def shell_pr_operations(segments: Sequence[ShellSegment]) -> list[ShellPrOp]:
         positional, flags = parsed
         if not positional or positional[0] not in {"mr", "api"}:
             continue
-        host = flags.get("--hostname") or next(
-            (
-                t.split("=", 1)[1]
-                for t in segment.raw_tokens
-                if t.startswith(("GITLAB_HOST=", "GLAB_HOST="))
-            ),
-            os.environ.get("GITLAB_HOST") or os.environ.get("GLAB_HOST") or "gitlab.com",
-        )
-        host = instance_authority(host) or ""
+        host = _shell_host(segment, flags.get("--hostname"))
         project = flags.get("--repo", flags.get("-R"))
         target, tracks, creates = None, False, False
         if positional[0] == "mr" and len(positional) > 1:
@@ -224,18 +232,15 @@ def mcp_prs(
     if name not in _MCP_WRITES:
         return None
     created = name == "create_merge_request"
-    configured_host = arguments.get("hostname", arguments.get("host")) or os.environ.get(
-        "GITLAB_HOST", os.environ.get("GLAB_HOST")
-    )
-    host = configured_host or "gitlab.com"
-    host = instance_authority(host) if isinstance(host, str) else None
-    if host is None:
+    configured_host = arguments.get("hostname", arguments.get("host"))
+    host = instance_authority(configured_host) if isinstance(configured_host, str) else None
+    if configured_host and host is None:
         return [], created
     project = arguments.get("project_id", arguments.get("project"))
     if created and arguments.get("target_project_id") is not None:
         project = arguments["target_project_id"]
     iid = arguments.get("merge_request_iid", arguments.get("iid"))
-    target = _target(project, iid, host) if host and not created else None
+    target = _target(project, iid, host) if not created else None
     references = []
     for obj in result_objects(result):
         for candidate in (obj, obj.get("merge_request")):

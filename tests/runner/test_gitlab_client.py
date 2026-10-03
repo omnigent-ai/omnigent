@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import subprocess
 import time
 from unittest.mock import Mock
@@ -9,7 +10,7 @@ from unittest.mock import Mock
 import pytest
 
 from omnigent.runner import gitlab_client as module
-from omnigent.runner.gitlab_client import GitLabClient, GitLabError
+from omnigent.runner.gitlab_client import GitLabClient, GitLabError, GitLabTimeoutError
 
 
 def test_api_command_preserves_host_port_and_escapes_query(
@@ -50,12 +51,16 @@ def test_untrusted_instance_is_rejected_before_cli() -> None:
         GitLabClient("/checkout", "other.test")
 
 
-def test_no_request_after_deadline(monkeypatch: pytest.MonkeyPatch) -> None:
-    run = Mock()
+@pytest.mark.parametrize("expired", [True, False], ids=["deadline", "subprocess"])
+def test_timeouts_are_public_errors_without_extra_requests(
+    monkeypatch: pytest.MonkeyPatch, expired: bool
+) -> None:
+    run = Mock(side_effect=subprocess.TimeoutExpired(["glab"], 8))
     monkeypatch.setattr(module.subprocess, "run", run)
-    with pytest.raises(TimeoutError):
-        GitLabClient("/checkout", "gitlab.com", deadline=time.monotonic() - 1).get("user")
-    run.assert_not_called()
+    deadline = time.monotonic() + (-1 if expired else 8)
+    with pytest.raises(ValueError, match=r"GitLab request timed out\. Refresh to retry\."):
+        GitLabClient("/checkout", "gitlab.com", deadline=deadline).get("user")
+    assert run.call_count == (0 if expired else 1)
 
 
 @pytest.mark.parametrize("code,body", [(1, b""), (0, b"<html>sign in</html>")])
@@ -81,7 +86,7 @@ def test_paginated_lists_are_complete_until_cap_or_later_error(
     values, partial = client.pages("projects/1/merge_requests/1/notes")
     assert len(values) == 101 and not partial
     assert [call.kwargs["page"] for call in get.call_args_list] == [1, 2]
-    get.side_effect = [[{"id": i} for i in range(100)], TimeoutError()]
+    get.side_effect = [[{"id": i} for i in range(100)], GitLabTimeoutError()]
     values, partial = client.pages("projects/1/merge_requests/1/notes")
     assert len(values) == 100 and partial
     monkeypatch.setattr(module, "_MAX_PAGES", 1)
@@ -94,3 +99,23 @@ def test_malformed_later_page_preserves_prior_items(monkeypatch: pytest.MonkeyPa
     first = [{"id": i} for i in range(100)]
     monkeypatch.setattr(client, "get", Mock(side_effect=[first, {"message": "invalid"}]))
     assert client.pages("projects/10/merge_requests/7/notes") == (first, True)
+
+
+@pytest.mark.parametrize("expired", [True, False], ids=["deadline", "subprocess"])
+def test_timeout_after_a_page_preserves_prior_items(
+    monkeypatch: pytest.MonkeyPatch, expired: bool
+) -> None:
+    client = GitLabClient("/checkout", "gitlab.com")
+    first = [{"id": i} for i in range(100)]
+
+    def first_page(*_args, **_kwargs):
+        if expired:
+            client.deadline = time.monotonic() - 1
+        run.side_effect = subprocess.TimeoutExpired(["glab"], 8)
+        return subprocess.CompletedProcess([], 0, json.dumps(first).encode(), b"")
+
+    run = Mock(side_effect=first_page)
+    monkeypatch.setattr(module.subprocess, "run", run)
+
+    assert client.pages("projects/10/merge_requests/7/notes") == (first, True)
+    assert run.call_count == (1 if expired else 2)
