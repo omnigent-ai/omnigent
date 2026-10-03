@@ -1,6 +1,6 @@
 // Tests for the Design page (`/design`). The session loader, projects, the
-// deck/kit reads, and the deck viewer are mocked at their seams; the list
-// builder and routing run for real.
+// deck/kit reads, the studio view, and the New design dialog are mocked at
+// their seams; the list builder, search, and routing run for real.
 
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
@@ -11,11 +11,8 @@ import type { CanvasSessions } from "@/canvas/canvasSessions";
 import { useCanvasSessions } from "@/canvas/canvasSessions";
 import type * as conversationsHook from "@/hooks/useConversations";
 import { useProjects, type Conversation } from "@/hooks/useConversations";
-import { fetchFileContent, type FileContentResponse } from "@/hooks/useFileContent";
 import { fetchDeckSearch, fetchKitIndicator } from "@/lib/designDeckApi";
 import { DesignPage } from "./DesignPage";
-
-const { mobileRef } = vi.hoisted(() => ({ mobileRef: { current: false } }));
 
 vi.mock("@/canvas/canvasSessions", async (importActual) => ({
   ...(await importActual<typeof canvasSessionsModule>()),
@@ -26,22 +23,55 @@ vi.mock("@/hooks/useConversations", async (importActual) => ({
   useProjects: vi.fn(),
 }));
 vi.mock("@/hooks/useViewerId", () => ({ useViewerId: () => "me" }));
-vi.mock("@/hooks/useIsMobileViewport", () => ({ useIsMobileViewport: () => mobileRef.current }));
-vi.mock("@/hooks/useFileContent", () => ({ fetchFileContent: vi.fn() }));
 vi.mock("@/lib/designDeckApi", () => ({ fetchDeckSearch: vi.fn(), fetchKitIndicator: vi.fn() }));
-vi.mock("@/shell/SlidesViewer", () => ({
-  SlidesViewer: ({ content, conversationId }: { content: string; conversationId?: string }) => (
-    <div data-testid="slides-viewer" data-session={conversationId}>
-      {content}
+vi.mock("./design/DesignStudio", () => ({
+  LIVE_QUERY: { staleTime: 0, refetchOnMount: true, refetchOnWindowFocus: true },
+  DesignStudio: (props: {
+    sessionId: string;
+    path: string;
+    view: string;
+    fresh: boolean;
+    onView: (view: string) => void;
+    onBack: () => void;
+  }) => (
+    <div
+      data-testid="studio"
+      data-session={props.sessionId}
+      data-path={props.path}
+      data-view={props.view}
+      data-fresh={String(props.fresh)}
+    >
+      <button type="button" onClick={() => props.onView("full")}>
+        studio-full
+      </button>
+      <button type="button" onClick={props.onBack}>
+        studio-back
+      </button>
     </div>
   ),
+}));
+vi.mock("./design/NewDesignDialog", () => ({
+  NewDesignDialog: (props: {
+    open: boolean;
+    initialPrompt?: string;
+    takenDeckNames: (folder: string) => readonly string[];
+    onCreated: (sessionId: string, path: string) => void;
+  }) =>
+    props.open ? (
+      <div role="dialog" aria-label="New design">
+        <span data-testid="dialog-prompt">{props.initialPrompt ?? ""}</span>
+        <span data-testid="dialog-taken">{props.takenDeckNames("/work/a/").join(",")}</span>
+        <button type="button" onClick={() => props.onCreated("conv_new", "decks/new.slides.html")}>
+          dialog-create
+        </button>
+      </div>
+    ) : null,
 }));
 
 const sessionsMock = vi.mocked(useCanvasSessions);
 const projectsMock = vi.mocked(useProjects);
 const searchMock = vi.mocked(fetchDeckSearch);
 const kitMock = vi.mocked(fetchKitIndicator);
-const contentMock = vi.mocked(fetchFileContent);
 const refreshMock = vi.fn(async () => {});
 
 function row(id: string, updatedAt: number, overrides: Partial<Conversation> = {}): Conversation {
@@ -71,20 +101,13 @@ function stubSessions(rows: Conversation[], overrides: Partial<CanvasSessions> =
   });
 }
 
-function deckFile(content: string): FileContentResponse {
-  return {
-    object: "session.environment.filesystem.file_content",
-    path: "deck.slides.html",
-    content_type: "text/html",
-    encoding: "utf-8",
-    content,
-    bytes: content.length,
-  };
-}
-
 function LocationProbe() {
   const location = useLocation();
   return <div data-testid="location">{`${location.pathname}${location.search}`}</div>;
+}
+
+function at(): string {
+  return screen.getByTestId("location").textContent ?? "";
 }
 
 function renderPage(path = "/design") {
@@ -107,10 +130,8 @@ function group(label: string): HTMLElement {
 }
 
 beforeEach(() => {
-  mobileRef.current = false;
   projectsMock.mockReturnValue({ data: [] } as unknown as ReturnType<typeof useProjects>);
   kitMock.mockResolvedValue({ status: "none" });
-  contentMock.mockResolvedValue(deckFile("<section>Slide</section>"));
   refreshMock.mockClear();
 });
 
@@ -269,89 +290,116 @@ describe("DesignPage list", () => {
   });
 });
 
-describe("DesignPage selection", () => {
+describe("DesignPage landing", () => {
   beforeEach(() => {
-    stubSessions([row("a", 1, { title: "Pitch session" })]);
-    searchMock.mockResolvedValue({
-      status: "ok",
-      paths: ["decks/pitch.slides.html"],
-      truncated: false,
-    });
+    stubSessions([row("a", 2, { title: "Pitch session" }), row("b", 1)]);
+    searchMock.mockImplementation((id) =>
+      Promise.resolve({
+        status: "ok",
+        paths: id === "a" ? ["decks/pitch.slides.html"] : ["roadmap.slides.html"],
+        truncated: false,
+      }),
+    );
   });
 
-  it("shows a hint until a deck is selected", async () => {
+  it("shows the header with its subtitle and New design", async () => {
     renderPage();
-    expect(await screen.findByText("Select a deck to view it here.")).toBeVisible();
-    expect(screen.queryByTestId("slides-viewer")).toBeNull();
+    expect(screen.getByRole("heading", { name: "Design", level: 1 })).toBeVisible();
+    expect(screen.getByText("Slides your agents made, on brand")).toBeVisible();
+    expect(screen.getByRole("button", { name: "New design" })).toBeEnabled();
+    expect(await within(group("a")).findByRole("link", { name: /pitch/ })).toBeVisible();
   });
 
-  it("selects a deck through the URL and renders it with its session", async () => {
-    contentMock.mockResolvedValue(deckFile("<section>Pitch</section>"));
+  it("filters cards by deck name, workspace, or session title", async () => {
     renderPage();
+    await within(group("b")).findByRole("link", { name: /roadmap/ });
+    const search = screen.getByRole("textbox", { name: "Search designs" });
 
-    fireEvent.click(await screen.findByRole("link", { name: /pitch/ }));
+    fireEvent.change(search, { target: { value: "ROAD" } });
+    expect(screen.queryByRole("region", { name: "a" })).toBeNull();
+    expect(within(group("b")).getByRole("link", { name: /roadmap/ })).toBeVisible();
 
-    expect(screen.getByTestId("location")).toHaveTextContent(
-      "/design?session=a&file=decks%2Fpitch.slides.html",
-    );
-    const viewer = await screen.findByTestId("slides-viewer");
-    expect(viewer).toHaveTextContent("<section>Pitch</section>");
-    expect(viewer).toHaveAttribute("data-session", "a");
-    expect(contentMock).toHaveBeenCalledWith("a", "decks/pitch.slides.html");
-    expect(screen.getByRole("link", { name: /pitch/ })).toHaveAttribute("aria-current", "true");
-    expect(screen.getByRole("link", { name: "Open in session" })).toHaveAttribute(
-      "href",
-      "/c/a?file=decks%2Fpitch.slides.html",
-    );
+    fireEvent.change(search, { target: { value: "pitch session" } });
+    expect(within(group("a")).getByRole("link", { name: /pitch/ })).toBeVisible();
+    expect(screen.queryByRole("region", { name: "b" })).toBeNull();
+
+    fireEvent.change(search, { target: { value: "nothing like this" } });
+    expect(screen.getByText("No designs match")).toBeVisible();
   });
 
-  it("opens a linked deck directly", async () => {
-    renderPage("/design?session=a&file=decks%2Fpitch.slides.html");
-    expect(await screen.findByTestId("slides-viewer")).toBeInTheDocument();
+  it("opens New design from the button and from a chip with the prompt", async () => {
+    renderPage();
+    await within(group("a")).findByRole("link", { name: /pitch/ });
+
+    fireEvent.click(screen.getByRole("button", { name: "Weekly status update" }));
+    expect(screen.getByTestId("dialog-prompt")).toHaveTextContent("Weekly status update");
+    expect(screen.getByTestId("dialog-taken")).toHaveTextContent("pitch");
   });
 
-  it("shows a failed deck read with the Open in session link", async () => {
-    contentMock.mockRejectedValue(new Error("403 Forbidden"));
-    renderPage("/design?session=a&file=decks%2Fpitch.slides.html");
+  it("shows chips in the empty state", async () => {
+    searchMock.mockResolvedValue({ status: "ok", paths: [] });
+    renderPage();
+    await screen.findByText(/No decks yet/);
+    fireEvent.click(screen.getByRole("button", { name: "Product launch" }));
+    expect(screen.getByTestId("dialog-prompt")).toHaveTextContent("Product launch");
+  });
 
-    expect(await screen.findByText(/403 Forbidden/, {}, { timeout: 4000 })).toBeVisible();
-    expect(screen.queryByTestId("slides-viewer")).toBeNull();
-    expect(screen.getByRole("link", { name: "Open in session" })).toHaveAttribute(
-      "href",
-      "/c/a?file=decks%2Fpitch.slides.html",
-    );
+  it("goes to the studio for a created design", async () => {
+    renderPage();
+    fireEvent.click(screen.getByRole("button", { name: "New design" }));
+    fireEvent.click(screen.getByRole("button", { name: "dialog-create" }));
+
+    expect(at()).toBe("/design?session=conv_new&file=decks%2Fnew.slides.html");
+    expect(screen.getByTestId("studio")).toHaveAttribute("data-fresh", "true");
+    expect(refreshMock).toHaveBeenCalled();
+  });
+
+  it("opens the studio for an existing deck card", async () => {
+    renderPage();
+    fireEvent.click(await within(group("a")).findByRole("link", { name: /pitch/ }));
+
+    expect(at()).toBe("/design?session=a&file=decks%2Fpitch.slides.html");
+    const studio = screen.getByTestId("studio");
+    expect(studio).toHaveAttribute("data-session", "a");
+    expect(studio).toHaveAttribute("data-path", "decks/pitch.slides.html");
+    expect(studio).toHaveAttribute("data-view", "preview");
+    expect(studio).toHaveAttribute("data-fresh", "false");
   });
 });
 
-describe("DesignPage on a phone", () => {
+describe("DesignPage studio routing", () => {
   beforeEach(() => {
-    mobileRef.current = true;
     stubSessions([row("a", 1)]);
     searchMock.mockResolvedValue({ status: "ok", paths: ["pitch.slides.html"], truncated: false });
   });
 
-  it("shows only the list until a deck is chosen, then only the viewer", async () => {
-    renderPage();
-
-    fireEvent.click(await screen.findByRole("link", { name: /pitch/ }));
-
-    expect(await screen.findByTestId("slides-viewer")).toBeInTheDocument();
-    expect(screen.queryByRole("region", { name: "a" })).toBeNull();
-    expect(screen.queryByText("Select a deck to view it here.")).toBeNull();
-
-    fireEvent.click(screen.getByRole("button", { name: "Back to decks" }));
-
-    expect(screen.getByTestId("location")).toHaveTextContent(/^\/design$/);
-    expect(await screen.findByRole("region", { name: "a" })).toBeInTheDocument();
-    expect(screen.queryByTestId("slides-viewer")).toBeNull();
+  it("opens a linked studio with its view", () => {
+    renderPage("/design?session=a&file=pitch.slides.html&view=full");
+    expect(screen.getByTestId("studio")).toHaveAttribute("data-view", "full");
+    expect(screen.queryByRole("heading", { name: "Design", level: 1 })).toBeNull();
   });
 
-  it("goes back to the list from a linked deck too", async () => {
+  it("keeps the view in the URL", () => {
     renderPage("/design?session=a&file=pitch.slides.html");
+    fireEvent.click(screen.getByRole("button", { name: "studio-full" }));
+    expect(at()).toBe("/design?session=a&file=pitch.slides.html&view=full");
+    expect(screen.getByTestId("studio")).toHaveAttribute("data-view", "full");
+  });
 
-    fireEvent.click(await screen.findByRole("button", { name: "Back to decks" }));
+  it("returns to the landing from a card, even after changing the view", async () => {
+    renderPage();
+    fireEvent.click(await screen.findByRole("link", { name: /pitch/ }));
+    fireEvent.click(screen.getByRole("button", { name: "studio-full" }));
+    fireEvent.click(screen.getByRole("button", { name: "studio-back" }));
 
-    expect(screen.getByTestId("location")).toHaveTextContent(/^\/design$/);
+    expect(at()).toBe("/design");
+    expect(await screen.findByRole("region", { name: "a" })).toBeInTheDocument();
+  });
+
+  it("returns to the landing from a linked studio", async () => {
+    renderPage("/design?session=a&file=pitch.slides.html");
+    fireEvent.click(screen.getByRole("button", { name: "studio-back" }));
+    expect(at()).toBe("/design");
     expect(await screen.findByRole("region", { name: "a" })).toBeInTheDocument();
   });
 });
