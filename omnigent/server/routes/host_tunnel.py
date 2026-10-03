@@ -25,11 +25,12 @@ from collections.abc import Awaitable, Callable
 from typing import Any
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+from sqlalchemy.exc import DataError, IntegrityError
 from starlette.websockets import WebSocketState
 
 from omnigent.db.db_models import InvalidUuidError, uuid_to_bytes
 from omnigent.debug_logging import debug_event, set_current_user_id
-from omnigent.errors import ErrorCategory, ErrorImpact, ErrorPhase
+from omnigent.errors import ErrorCategory, ErrorCode, ErrorImpact, ErrorPhase, OmnigentError
 from omnigent.host.frames import (
     IMPORT_SESSION_MAX_CONNECTION_REASSEMBLED_CHARS,
     HostConnectionErrorFrame,
@@ -469,12 +470,11 @@ def create_host_tunnel_router(
                 host_id,
                 extra=debug_event("host_tunnel", phase="error", host_id=host_id, stage=stage),
             )
-            retryable = stage in {"registration", "registry", "connected"}
             await _send_connection_error(
                 ws,
                 stage=stage,
                 error=str(exc),
-                retryable=retryable,
+                retryable=_connection_error_is_retryable(exc, stage),
             )
             with contextlib.suppress(Exception):
                 await ws.close(code=4005, reason="host connection failed")
@@ -485,6 +485,32 @@ def create_host_tunnel_router(
                 await asyncio.to_thread(host_store.set_offline, host_id)
 
     return router
+
+
+# Failures the server reproduces for the same hello on every connect: a name or
+# host_id collision, a registration the store rejects (deleted host, expired
+# managed launch token), or column data the database refuses.
+_DETERMINISTIC_HANDSHAKE_ERRORS: tuple[type[Exception], ...] = (
+    IntegrityError,
+    DataError,
+    ValueError,
+)
+
+
+def _connection_error_is_retryable(exc: Exception, stage: str) -> bool:
+    """Whether reconnecting can recover from *exc* failing the tunnel at *stage*."""
+    if stage == "connected":
+        # The server accepted this registration once; a later fault is a
+        # disconnect worth retrying.
+        return True
+    if isinstance(exc, _DETERMINISTIC_HANDSHAKE_ERRORS):
+        return False
+    if isinstance(exc, OmnigentError):
+        # A stale target generation is a retryable conflict; a revoked actor
+        # is refused the same way on every connect.
+        return exc.code == ErrorCode.CONFLICT
+    # Unclassified failures are assumed transient so outages keep retrying.
+    return True
 
 
 async def _send_connection_error(
