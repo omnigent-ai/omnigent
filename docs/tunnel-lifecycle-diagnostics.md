@@ -38,8 +38,10 @@ both ends.
   When a helper reports a peer disconnect, the event preserves its observed
   code and reason. Otherwise it records the first server-requested close,
   including retirement, replacement, or ping timeout, without implying that
-  the peer acknowledged it. A stale receive or ping helper can end before
-  the sender, so `ended_by` alone does not identify the close cause.
+  the peer acknowledged it. Concurrent close requests can make the recorded
+  code and reason differ from those sent on the socket. A stale receive or
+  ping helper can end before the sender, so `ended_by` alone does not identify
+  the close cause.
 - `runner_ping_timeout`: `runner_id`, `connection_id`, `connection_age_s`,
   `silent_s`.
 - `runner_stream_transport_lost`: one row per outage when the relay first
