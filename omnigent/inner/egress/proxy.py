@@ -33,13 +33,14 @@ import ipaddress
 import logging
 import socket
 import ssl
+import urllib.request
 from collections.abc import Callable
 from dataclasses import dataclass
 from email.message import Message
 from email.parser import BytesParser
 from pathlib import Path
 from typing import cast
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 from omnigent.inner.credential_proxy import (
     SYNTHETIC_CREDENTIAL_PREFIX,
@@ -151,6 +152,49 @@ _CLOUD_TRAP_NETWORKS: tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...] 
     # See: https://learn.microsoft.com/en-us/azure/virtual-network/what-is-ip-address-168-63-129-16
     ipaddress.ip_network("168.63.129.16/32"),
 )
+
+
+async def _open_upstream(
+    host: str, connect_host: str, port: int, ssl_ctx: ssl.SSLContext | None = None
+) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+    """Dial the destination, tunnelling via the ambient HTTP(S)_PROXY when set.
+
+    ``NO_PROXY`` hosts connect directly. TLS (when ``ssl_ctx`` is given) is
+    negotiated end-to-end with ``host`` over the CONNECT tunnel.
+    """
+    proxy = urllib.request.getproxies().get("https" if ssl_ctx else "http")
+    if not proxy or urllib.request.proxy_bypass_environment(host):
+        return await asyncio.open_connection(
+            connect_host, port, ssl=ssl_ctx, server_hostname=host if ssl_ctx else None
+        )
+    p = urlparse(proxy)
+    if not p.hostname:
+        raise OSError("invalid upstream proxy URL")
+    reader, writer = await asyncio.open_connection(
+        p.hostname,
+        p.port or 3128,
+        ssl=ssl.create_default_context() if p.scheme == "https" else None,
+    )
+    try:
+        auth = b""
+        if p.username:  # basic auth only; no NTLM/Kerberos
+            cred = f"{unquote(p.username)}:{unquote(p.password or '')}".encode()
+            auth = b"Proxy-Authorization: Basic " + base64.b64encode(cred) + b"\r\n"
+        target = (
+            f"{connect_host}:{port}" if ":" not in connect_host else f"[{connect_host}]:{port}"
+        )
+        writer.write(f"CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n".encode() + auth + b"\r\n")
+        await writer.drain()
+        head = await reader.readuntil(b"\r\n\r\n")
+        status_line = head.split(b"\r\n", 1)[0].decode(errors="replace")
+        if status_line.split(" ", 2)[1:2] != ["200"]:
+            raise OSError(f"upstream proxy refused CONNECT: {status_line}")
+        if ssl_ctx:
+            await writer.start_tls(ssl_ctx, server_hostname=host)
+    except BaseException:
+        writer.close()
+        raise
+    return reader, writer
 
 
 class EgressProxy:
@@ -748,12 +792,7 @@ class EgressProxy:
         connect_host = pinned_ip or host
         try:
             upstream_reader, upstream_writer = await asyncio.wait_for(
-                asyncio.open_connection(
-                    connect_host,
-                    port,
-                    ssl=self._upstream_h2_ssl_ctx,
-                    server_hostname=host,
-                ),
+                _open_upstream(host, connect_host, port, self._upstream_h2_ssl_ctx),
                 timeout=30,
             )
         except Exception as exc:  # noqa: BLE001 — closing the h2 stream signals failure
@@ -832,12 +871,7 @@ class EgressProxy:
         headers_raw = self._force_connection_close(rewrite.headers)
         try:
             upstream_reader, upstream_writer = await asyncio.wait_for(
-                asyncio.open_connection(
-                    connect_host,
-                    port,
-                    ssl=ssl_ctx,
-                    server_hostname=host,
-                ),
+                _open_upstream(host, connect_host, port, ssl_ctx),
                 timeout=30,
             )
         except Exception as exc:  # noqa: BLE001 — upstream connect failure maps to 502
@@ -997,7 +1031,7 @@ class EgressProxy:
         connect_host = pinned_ip or host
         try:
             upstream_reader, upstream_writer = await asyncio.wait_for(
-                asyncio.open_connection(connect_host, port),
+                _open_upstream(host, connect_host, port),
                 timeout=30,
             )
         except Exception as exc:  # noqa: BLE001 — upstream connect failure maps to 502
