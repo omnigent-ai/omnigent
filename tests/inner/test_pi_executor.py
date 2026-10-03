@@ -495,6 +495,13 @@ class TestBuildModelsJson(unittest.TestCase):
         self.assertIn("databricks-anthropic", providers)
         self.assertIn("databricks-completions", providers)
 
+    def test_anthropic_provider_forces_adaptive_thinking(self):
+        # Without this compat flag Pi sends ``thinking.type.enabled``, which
+        # Claude 4+/5 gateway models reject with 400 on the first turn.
+        result = _build_models_json("https://host.example.com", "tok123")
+        compat = result["providers"]["databricks-anthropic"].get("compat", {})
+        self.assertIs(compat.get("forceAdaptiveThinking"), True)
+
     def test_dynamic_model_declared_image_capable(self):
         # #515: a dynamically-registered model must advertise image input, or
         # Pi's transformMessages strips every image block ("model does not
