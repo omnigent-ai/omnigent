@@ -24,6 +24,7 @@ class Feature(StrEnum):
     HARNESS_INSTALL = "harness_install"
     CANVAS = "canvas"
     CUSTOMIZE = "customize"
+    CROSS_SESSION_MESSAGING = "cross_session_messaging"
 
 
 @dataclass(frozen=True)
@@ -61,6 +62,13 @@ FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
         description="Web Customize settings section (Harnesses & Skills)",
         owner="web",
         review_by_release="0.15.0",
+    ),
+    FeatureDefinition(
+        feature=Feature.CROSS_SESSION_MESSAGING,
+        description="Peer messaging between a user's own sessions (not parent/child)",
+        owner="runtime",
+        review_by_release="0.17.0",
+        frontend_visible=False,
     ),
 )
 

@@ -737,6 +737,84 @@ class SysSessionGetInfoTool(Tool):
         }
 
 
+class SysSessionMessageTool(Tool):
+    """
+    Send a message to another of the user's sessions (not a child).
+
+    Cross-session (peer) messaging: unlike ``sys_session_send`` — whose
+    by-``session_id`` mode drives only a direct child in the caller's own
+    spawn subtree — this delivers to **any session the caller can access**:
+    a sibling, a peer running on a different compute, or an unrelated
+    session. Access is bounded by the server's per-user permission model
+    (the same boundary as the read-only ``sys_session_*`` tools) and gated
+    by a deployment feature flag; both are enforced server-side.
+
+    Fire-and-forget: the target wakes and processes the message on its next
+    turn, but no reply is awaited and no task handle is returned — poll with
+    ``sys_session_get_history`` if you need the response. A runaway back-and-
+    forth is bounded: an exchange that ping-pongs many hops with no human
+    input is paused, asking you to check with your human before continuing.
+
+    Runner-dispatched: the runner posts the message to the target via the
+    ordinary event path. Returns a delivery acknowledgement, or
+    ``session_not_found`` / ``not_permitted`` when the id is unknown or the
+    server refuses (no access, or the feature is disabled on this deployment).
+    """
+
+    @classmethod
+    def name(cls) -> str:
+        """:returns: ``"sys_session_message"``."""
+        return "sys_session_message"
+
+    @classmethod
+    def description(cls) -> str:
+        """:returns: Human-readable description of the tool."""
+        return (
+            "Send a message to another of your sessions (a peer, not a "
+            "child): a sibling, a session on another compute, or any session "
+            "you can access. Unlike sys_session_send (child-only by id), this "
+            "targets any accessible session. Fire-and-forget — the target "
+            "processes it on its next turn; no reply is awaited (use "
+            "sys_session_get_history to read one). Get session_id from "
+            "sys_session_list. Returns a delivery ack, or session_not_found / "
+            "not_permitted."
+        )
+
+    def get_schema(self) -> dict[str, Any]:
+        """
+        Return the OpenAI-format tool schema.
+
+        :returns: Dict with ``"type": "function"`` and a ``"function"``
+            sub-dict; both ``session_id`` and ``message`` are required.
+        """
+        return {
+            "type": "function",
+            "function": {
+                "name": SysSessionMessageTool.name(),
+                "description": SysSessionMessageTool.description(),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "session_id": {
+                            "type": "string",
+                            "description": (
+                                "The session (conversation_id) to message, "
+                                "e.g. 'conv_abc123'. Get it from "
+                                "sys_session_list."
+                            ),
+                        },
+                        "message": {
+                            "type": "string",
+                            "description": "The message text to deliver to that session.",
+                        },
+                    },
+                    "required": ["session_id", "message"],
+                    "additionalProperties": False,
+                },
+            },
+        }
+
+
 class SysSessionShareTool(Tool):
     """
     Grant another user (or the public) access to a session.
